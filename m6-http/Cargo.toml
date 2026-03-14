@@ -19,6 +19,7 @@ serde_json     = "1"
 toml           = "0.8"
 anyhow         = "1"
 thiserror      = "1"
+m6-core        = { path = "../m6-core" }
 tracing        = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 jsonwebtoken   = "9"

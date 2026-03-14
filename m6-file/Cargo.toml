@@ -11,6 +11,7 @@ name = "m6_file_lib"
 path = "src/lib.rs"
 
 [dependencies]
+m6-core     = { path = "../m6-core" }
 toml        = "0.8"
 serde       = { version = "1", features = ["derive"] }
 anyhow      = "1"

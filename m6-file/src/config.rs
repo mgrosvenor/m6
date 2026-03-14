@@ -23,12 +23,19 @@ pub struct ThreadPoolConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
+pub struct LogConfig {
+    pub level: Option<String>,
+    pub format: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
     pub compression: HashMap<String, CompressionSettings>,
     #[serde(default)]
     pub route: Vec<RouteConfig>,
     pub thread_pool: Option<ThreadPoolConfig>,
+    pub log: Option<LogConfig>,
 }
 
 impl Config {

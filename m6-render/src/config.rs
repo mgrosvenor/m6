@@ -39,6 +39,13 @@ pub struct CompressionLevel {
     pub gzip: u32,
 }
 
+/// Log configuration from `[log]` in the renderer config file.
+#[derive(Debug, Clone)]
+pub struct LogConfig {
+    pub level:  Option<String>,
+    pub format: Option<String>,
+}
+
 /// Fully parsed renderer configuration.
 #[derive(Debug, Clone)]
 pub struct RendererConfig {
@@ -56,6 +63,8 @@ pub struct RendererConfig {
     pub compression: std::collections::HashMap<String, CompressionLevel>,
     /// Minification settings keyed by MIME type.
     pub minification: MinificationConfig,
+    /// Logging settings from `[log]` in the config file.
+    pub log: LogConfig,
 }
 
 /// Per-MIME-type minification enable flag.
@@ -224,6 +233,20 @@ fn parse_config(tv: toml::Value, _site_dir: &Path) -> anyhow::Result<RendererCon
         }
     }
 
+    // --- log ---
+    let log = LogConfig {
+        level: tv
+            .get("log")
+            .and_then(|l| l.get("level"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        format: tv
+            .get("log")
+            .and_then(|l| l.get("format"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+    };
+
     Ok(RendererConfig {
         user_config,
         global_params,
@@ -232,6 +255,7 @@ fn parse_config(tv: toml::Value, _site_dir: &Path) -> anyhow::Result<RendererCon
         params_cache: ParamsCacheConfig { size: pc_size },
         compression,
         minification,
+        log,
     })
 }
 

@@ -667,12 +667,10 @@ fn run_app_global<G: Send + Sync + 'static>(
     }
     let site_dir = PathBuf::from(&args[1]);
     let config_path = PathBuf::from(&args[2]);
-    let log_level = args
+    let cli_log_level = args
         .windows(2)
         .find(|w| w[0] == "--log-level")
-        .and_then(|w| Some(w[1].clone()))
-        .unwrap_or_else(|| "info".to_string());
-    init_tracing(&log_level);
+        .map(|w| w[1].clone());
 
     let config = crate::config::load(&config_path, &site_dir).unwrap_or_else(|e| {
         eprintln!("Config error: {e}");
@@ -710,7 +708,7 @@ fn run_app_global<G: Send + Sync + 'static>(
         b
     });
 
-    run_app_with_shutdown(code_routes, config_path, site_dir, on_shutdown, None)
+    run_app_with_shutdown(code_routes, config_path, site_dir, on_shutdown, None, cli_log_level)
 }
 
 /// Run with per-thread state only (no global).
@@ -726,12 +724,10 @@ fn run_app_thread_state<T: Any + Send + 'static>(
     }
     let site_dir = PathBuf::from(&args[1]);
     let config_path = PathBuf::from(&args[2]);
-    let log_level = args
+    let cli_log_level = args
         .windows(2)
         .find(|w| w[0] == "--log-level")
-        .and_then(|w| Some(w[1].clone()))
-        .unwrap_or_else(|| "info".to_string());
-    init_tracing(&log_level);
+        .map(|w| w[1].clone());
 
     let config = crate::config::load(&config_path, &site_dir).unwrap_or_else(|e| {
         eprintln!("Config error: {e}");
@@ -779,6 +775,7 @@ fn run_app_thread_state<T: Any + Send + 'static>(
         site_dir,
         None,
         Some(on_thread_exit),
+        cli_log_level,
     )
 }
 
@@ -797,12 +794,10 @@ fn run_app_state<G: Send + Sync + 'static, T: Any + Send + 'static>(
     }
     let site_dir = PathBuf::from(&args[1]);
     let config_path = PathBuf::from(&args[2]);
-    let log_level = args
+    let cli_log_level = args
         .windows(2)
         .find(|w| w[0] == "--log-level")
-        .and_then(|w| Some(w[1].clone()))
-        .unwrap_or_else(|| "info".to_string());
-    init_tracing(&log_level);
+        .map(|w| w[1].clone());
 
     let config = crate::config::load(&config_path, &site_dir).unwrap_or_else(|e| {
         eprintln!("Config error: {e}");
@@ -869,6 +864,7 @@ fn run_app_state<G: Send + Sync + 'static, T: Any + Send + 'static>(
         site_dir,
         on_shutdown,
         Some(on_thread_exit),
+        cli_log_level,
     )
 }
 
@@ -1489,13 +1485,11 @@ pub fn run_app(code_routes: Vec<CodeRoute>) -> Result<()> {
     }
     let site_dir = PathBuf::from(&args[1]);
     let config_path = PathBuf::from(&args[2]);
-    let log_level = args
+    let cli_log_level = args
         .windows(2)
         .find(|w| w[0] == "--log-level")
-        .and_then(|w| Some(w[1].clone()))
-        .unwrap_or_else(|| "info".to_string());
-    init_tracing(&log_level);
-    run_app_with_shutdown(code_routes, config_path, site_dir, None, None)
+        .map(|w| w[1].clone());
+    run_app_with_shutdown(code_routes, config_path, site_dir, None, None, cli_log_level)
 }
 
 fn run_app_with_shutdown(
@@ -1504,11 +1498,22 @@ fn run_app_with_shutdown(
     site_dir: PathBuf,
     on_shutdown: Option<Box<dyn FnOnce() + Send>>,
     on_thread_exit: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
+    cli_log_level: Option<String>,
 ) -> Result<()> {
     // Load config.
     let config = crate::config::load(&config_path, &site_dir).unwrap_or_else(|e| {
         eprintln!("Config error: {e}");
         std::process::exit(2);
+    });
+
+    // Init logging: site.toml base → renderer config [log] → CLI --log-level.
+    let (site_level, site_format) = m6_core::log::read_site_log_config(&site_dir);
+    let format = config.log.format.as_deref().unwrap_or(&site_format).to_string();
+    let cfg_level = config.log.level.as_deref().unwrap_or(&site_level).to_string();
+    let level = cli_log_level.as_deref().unwrap_or(&cfg_level).to_string();
+    let _log_guard = m6_core::log::init(&format, &level).unwrap_or_else(|e| {
+        eprintln!("logging init error: {e}");
+        std::process::exit(1);
     });
 
     let socket_path = if let Ok(override_path) = std::env::var("M6_SOCKET_OVERRIDE") {
@@ -1931,7 +1936,7 @@ fn handle_connection(
     }
 
     let latency = start.elapsed().as_micros();
-    info!(
+    tracing::debug!(
         path = raw.path(),
         method = raw.method(),
         status = resp.status,
@@ -1948,14 +1953,6 @@ fn ae_contains(header: &str, enc: &str) -> bool {
     header.as_bytes().windows(enc.len()).any(|w| w.eq_ignore_ascii_case(enc.as_bytes()))
 }
 
-fn init_tracing(level: &str) {
-    use tracing_subscriber::EnvFilter;
-    // Ignore error if already initialised (e.g. in tests).
-    let _ = tracing_subscriber::fmt()
-        .json()
-        .with_env_filter(EnvFilter::new(level))
-        .try_init();
-}
 
 // ---------------------------------------------------------------------------
 // Tests

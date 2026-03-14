@@ -23,6 +23,7 @@ comrak     = { version = "0.21", default-features = false }
 slug       = "0.1"
 anyhow     = "1"
 thiserror  = "1"
+m6-core    = { path = "../m6-core" }
 tracing    = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 nix        = { version = "0.27", features = ["signal", "poll"] }

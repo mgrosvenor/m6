@@ -460,7 +460,7 @@ fn handle_h3_request(
     if let Some(cached) = state.cache.get(lookup_key) {
         let elapsed_ns = start.elapsed().as_nanos() as u64;
         state.stats.record(elapsed_ns, true, false);
-        info!(
+        debug!(
             path = %path_str,
             status = cached.status,
             backend = "cache",
@@ -502,7 +502,7 @@ fn handle_h3_request(
     let elapsed_ns = start.elapsed().as_nanos() as u64;
     let is_backend_error = status >= 500;
     state.stats.record(elapsed_ns, false, is_backend_error);
-    info!(
+    debug!(
         path = %path,
         status,
         backend = %backend_name,
@@ -998,13 +998,6 @@ fn parse_args(args: &[String]) -> anyhow::Result<Cli> {
     })
 }
 
-fn init_tracing(level: &str) -> bool {
-    use tracing_subscriber::{fmt, EnvFilter};
-
-    let filter = EnvFilter::try_new(level).unwrap_or_else(|_| EnvFilter::new("info"));
-
-    fmt().json().with_env_filter(filter).try_init().is_ok()
-}
 
 /// Simple percent-encoding for path in redirect URLs.
 fn urlencoded(s: &str) -> String {
@@ -1043,11 +1036,7 @@ fn run(args: Vec<String>) -> i32 {
         }
     };
 
-    // Initialize tracing
-    let log_level = cli.log_level.as_deref().unwrap_or("info");
-    init_tracing(log_level);
-
-    // Load config
+    // Load config before initialising logging so we can read [log] from site.toml.
     let config = match config::load(&cli.site_dir, &cli.system_config) {
         Ok(c) => c,
         Err(e) => {
@@ -1056,12 +1045,17 @@ fn run(args: Vec<String>) -> i32 {
         }
     };
 
-    config::warn_system_config_extra_keys(&cli.system_config);
+    // CLI --log-level overrides site.toml [log].level; format always comes from config.
+    let log_level = cli.log_level.as_deref().unwrap_or(&config.log.level);
+    let _log_guard = match m6_core::log::init(&config.log.format, log_level) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("logging init error: {}", e);
+            return 1;
+        }
+    };
 
-    // Override log level from config if not overridden by CLI
-    if cli.log_level.is_none() {
-        let _ = init_tracing(&config.log.level);
-    }
+    config::warn_system_config_extra_keys(&cli.system_config);
 
     // --dump-config
     if cli.dump_config {
