@@ -26,7 +26,7 @@ thiserror  = "1"
 tracing    = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 nix        = { version = "0.27", features = ["signal", "poll"] }
-lru        = "0.12"
+lru        = "0.16"
 chrono     = { version = "0.4", features = ["serde"] }
 brotli     = "6"
 flate2     = "1"
