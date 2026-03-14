@@ -1,0 +1,55 @@
+[package]
+name    = "m6-render"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "m6_render"
+
+[features]
+default     = []
+email       = ["dep:lettre"]
+http-client = ["dep:ureq"]
+multipart   = ["dep:multer", "dep:tokio", "dep:bytes", "dep:futures-util"]
+flash       = ["dep:hmac", "dep:sha2"]
+csrf        = ["dep:rand"]
+
+[dependencies]
+tera       = "1"
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml       = "0.8"
+comrak     = { version = "0.21", default-features = false }
+slug       = "0.1"
+anyhow     = "1"
+thiserror  = "1"
+tracing    = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+nix        = { version = "0.27", features = ["signal", "poll"] }
+lru        = "0.12"
+chrono     = { version = "0.4", features = ["serde"] }
+brotli     = "6"
+flate2     = "1"
+base64     = "0.22"
+filetime   = "0.2"
+libc       = "0.2"
+minify-html = "0.15"
+minify-js   = "0.5"
+
+lettre        = { version = "0.11", optional = true, features = ["smtp-transport", "native-tls"] }
+ureq          = { version = "2",    optional = true, features = ["json"] }
+multer        = { version = "3",    optional = true }
+tokio         = { version = "1",    optional = true, features = ["rt", "macros"] }
+bytes         = { version = "1",    optional = true }
+futures-util  = { version = "0.3",  optional = true }
+hmac          = { version = "0.12", optional = true }
+sha2          = { version = "0.10", optional = true }
+rand          = { version = "0.8",  optional = true }
+
+[dev-dependencies]
+tempfile  = "3"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name    = "critical_path"
+harness = false

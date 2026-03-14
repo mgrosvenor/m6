@@ -1,0 +1,5 @@
+<!DOCTYPE html>
+<html><body>
+<h1>Posts</h1>
+{% for post in posts %}<a href="/blog/{{ post.stem }}">{{ post.title }}</a>{% endfor %}
+</body></html>

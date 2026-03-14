@@ -1,0 +1,18 @@
+[package]
+name    = "m6-auth"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "m6_auth"
+
+[dependencies]
+rusqlite    = { version = "0.31", features = ["bundled"] }
+bcrypt      = "0.15"
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+uuid        = { version = "1", features = ["v4"] }
+thiserror   = "1"
+
+[dev-dependencies]
+tempfile = "3"
