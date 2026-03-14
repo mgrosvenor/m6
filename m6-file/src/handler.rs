@@ -201,6 +201,121 @@ fn handle_tail<W: Write>(
     Ok(ResponseInfo { status: 200, bytes: body.len(), latency_us: start.elapsed().as_micros() })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Config, RouteConfig};
+    use crate::http::Request;
+    use crate::route::Route;
+    use std::io::Cursor;
+
+    fn make_tail_request(path: &str, offset: u64) -> Request {
+        let query = format!("offset={}", offset);
+        let raw = format!("GET {}?{} HTTP/1.1\r\nHost: localhost\r\n\r\n", path, query);
+        Request::read(Cursor::new(raw.into_bytes())).unwrap()
+    }
+
+    fn tail_route(url_path: &str, root: &str) -> Route {
+        Route::from_config(&RouteConfig {
+            path: url_path.to_string(),
+            root: root.to_string(),
+            tail: Some(true),
+        })
+    }
+
+    fn parse_response(buf: &[u8]) -> (u16, Vec<(String, String)>, Vec<u8>) {
+        let s = std::str::from_utf8(buf).unwrap();
+        let (head, body_str) = s.split_once("\r\n\r\n").unwrap();
+        let mut lines = head.lines();
+        let status_line = lines.next().unwrap();
+        let status: u16 = status_line.split_whitespace().nth(1).unwrap().parse().unwrap();
+        let headers: Vec<(String, String)> = lines
+            .filter_map(|l| l.split_once(": ").map(|(k, v)| (k.to_lowercase(), v.to_string())))
+            .collect();
+        (status, headers, body_str.as_bytes().to_vec())
+    }
+
+    #[test]
+    fn tail_from_zero_returns_full_content() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("app.log"), b"line1\nline2\n").unwrap();
+
+        let req = make_tail_request("/logs/tail/app.log", 0);
+        let route = tail_route("/logs/tail/{relpath}", "");
+        let routes = vec![route];
+        let config = Config::default();
+        let ctx = HandlerContext { routes: &routes, config: &config, site_dir: dir.path() };
+
+        let mut out = Vec::new();
+        let info = handle_request(&req, &ctx, &mut out).unwrap();
+
+        assert_eq!(info.status, 200);
+        let (status, headers, body) = parse_response(&out);
+        assert_eq!(status, 200);
+        assert_eq!(body, b"line1\nline2\n");
+        let end: u64 = headers.iter().find(|(k, _)| k == "x-log-end").unwrap().1.parse().unwrap();
+        assert_eq!(end, 12);
+        let cc = headers.iter().find(|(k, _)| k == "cache-control").unwrap();
+        assert_eq!(cc.1, "no-store");
+    }
+
+    #[test]
+    fn tail_from_mid_offset_returns_new_bytes_only() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("app.log"), b"line1\nline2\nline3\n").unwrap();
+
+        let req = make_tail_request("/logs/tail/app.log", 12); // skip "line1\nline2\n"
+        let route = tail_route("/logs/tail/{relpath}", "");
+        let routes = vec![route];
+        let config = Config::default();
+        let ctx = HandlerContext { routes: &routes, config: &config, site_dir: dir.path() };
+
+        let mut out = Vec::new();
+        handle_request(&req, &ctx, &mut out).unwrap();
+        let (_, headers, body) = parse_response(&out);
+
+        assert_eq!(body, b"line3\n");
+        let end: u64 = headers.iter().find(|(k, _)| k == "x-log-end").unwrap().1.parse().unwrap();
+        assert_eq!(end, 18);
+    }
+
+    #[test]
+    fn tail_beyond_eof_returns_empty_body() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("app.log"), b"abc").unwrap();
+
+        let req = make_tail_request("/logs/tail/app.log", 999);
+        let route = tail_route("/logs/tail/{relpath}", "");
+        let routes = vec![route];
+        let config = Config::default();
+        let ctx = HandlerContext { routes: &routes, config: &config, site_dir: dir.path() };
+
+        let mut out = Vec::new();
+        handle_request(&req, &ctx, &mut out).unwrap();
+        let (status, headers, body) = parse_response(&out);
+
+        assert_eq!(status, 200);
+        assert!(body.is_empty());
+        let end: u64 = headers.iter().find(|(k, _)| k == "x-log-end").unwrap().1.parse().unwrap();
+        assert_eq!(end, 3); // clamped to file size
+    }
+
+    #[test]
+    fn tail_missing_file_returns_404() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let req = make_tail_request("/logs/tail/missing.log", 0);
+        let route = tail_route("/logs/tail/{relpath}", "");
+        let routes = vec![route];
+        let config = Config::default();
+        let ctx = HandlerContext { routes: &routes, config: &config, site_dir: dir.path() };
+
+        let mut out = Vec::new();
+        let info = handle_request(&req, &ctx, &mut out).unwrap();
+        assert_eq!(info.status, 404);
+    }
+}
+
 enum FindRouteResult<'a> {
     Found(&'a Route, crate::route::Params),
     /// A route matched the prefix/structure but the param value was invalid.
