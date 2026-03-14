@@ -1,0 +1,12 @@
+[workspace]
+members = [
+    "m6-core",
+    "m6-auth",
+    "m6-auth-cli",
+    "m6-render",
+    "m6-file",
+    "m6-http",
+    "m6-html",
+    "m6-auth-server",
+]
+resolver = "2"

@@ -1,0 +1,35 @@
+[site]
+name   = "Test Site"
+domain = "test.example.com"
+
+[server]
+bind     = "127.0.0.1:18443"
+tls_cert = "cert.pem"
+tls_key  = "key.pem"
+
+[log]
+level  = "warn"
+format = "json"
+
+[errors]
+mode = "internal"
+
+[[backend]]
+name    = "m6-html"
+sockets = "/run/m6/m6-html-*.sock"
+
+[[backend]]
+name    = "remote-api"
+url     = "https://api.example.com"
+
+[[route]]
+path    = "/"
+backend = "m6-html"
+
+[[route]]
+path    = "/about"
+backend = "m6-html"
+
+[[route]]
+path    = "/admin/{page}"
+backend = "m6-html"

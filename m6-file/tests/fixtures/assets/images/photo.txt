@@ -1,0 +1,1 @@
+placeholder for image test - using txt to avoid binary issues

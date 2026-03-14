@@ -1,0 +1,18 @@
+[package]
+name    = "m6-auth-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "m6-auth-cli"
+
+[dependencies]
+m6-auth     = { path = "../m6-auth" }
+toml        = "0.8"
+anyhow      = "1"
+rpassword   = "7"
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+
+[dev-dependencies]
+tempfile = "3"

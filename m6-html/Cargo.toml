@@ -1,0 +1,15 @@
+[package]
+name    = "m6-html"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "m6-html"
+
+[dependencies]
+m6-render = { path = "../m6-render" }
+anyhow    = "1"
+
+[dev-dependencies]
+brotli  = "6"
+flate2  = "1"
