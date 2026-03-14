@@ -15,6 +15,9 @@ pub struct CompressionSettings {
 pub struct RouteConfig {
     pub path: String,
     pub root: String,
+    /// If true, serves the file from an optional `?offset=N` byte offset and
+    /// returns `Cache-Control: no-store`. Intended for log tailing.
+    pub tail: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

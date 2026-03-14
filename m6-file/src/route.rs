@@ -25,6 +25,8 @@ pub struct Route {
     pub segments: Vec<Segment>,
     /// Specificity score (higher = more specific).
     pub specificity: i64,
+    /// Whether this route uses tail mode (offset-based partial reads, no-store).
+    pub tail: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +46,7 @@ impl Route {
             raw_root: cfg.root.clone(),
             segments,
             specificity,
+            tail: cfg.tail.unwrap_or(false),
         }
     }
 
@@ -215,6 +218,7 @@ mod tests {
         let cfg = RouteConfig {
             path: "/assets/{relpath}".to_string(),
             root: "assets/".to_string(),
+            tail: None,
         };
         let route = Route::from_config(&cfg);
         let params = match route.match_path("/assets/css/main.css") {
@@ -230,6 +234,7 @@ mod tests {
         let cfg = RouteConfig {
             path: "/content/posts/{stem}/{filename}".to_string(),
             root: "content/posts/{stem}/".to_string(),
+            tail: None,
         };
         let route = Route::from_config(&cfg);
         let params = match route.match_path("/content/posts/hello/index.html") {
@@ -247,6 +252,7 @@ mod tests {
         let cfg = RouteConfig {
             path: "/assets/{relpath}".to_string(),
             root: "assets/".to_string(),
+            tail: None,
         };
         let route = Route::from_config(&cfg);
         // `..` in relpath → NoMatch → 404 (spec §l2: "../ traversal in URL → 404")
@@ -258,6 +264,7 @@ mod tests {
         let cfg = RouteConfig {
             path: "/assets/{relpath}".to_string(),
             root: "assets/".to_string(),
+            tail: None,
         };
         let route = Route::from_config(&cfg);
         assert_eq!(route.match_path("/other/path"), MatchResult::NoMatch);
@@ -268,6 +275,7 @@ mod tests {
         let cfg = RouteConfig {
             path: "/posts/{stem}".to_string(),
             root: "posts/".to_string(),
+            tail: None,
         };
         let route = Route::from_config(&cfg);
         // `..` inside a Param segment should yield InvalidParam.

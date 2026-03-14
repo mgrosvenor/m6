@@ -3,7 +3,7 @@ use crate::config::Config;
 use crate::http::{write_error, write_head_response, write_response, Request};
 use crate::route::{MatchResult, Route};
 use anyhow::Result;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::Instant;
 use tracing::debug;
@@ -51,6 +51,10 @@ pub fn handle_request<W: Write>(
             return Ok(ResponseInfo { status: 404, bytes: 0, latency_us: start.elapsed().as_micros() });
         }
     };
+
+    if route.tail {
+        return handle_tail(req, route, &params, ctx, stream, start);
+    }
 
     let fs_path = route.resolve_fs_path(&params, ctx.site_dir);
 
@@ -132,6 +136,69 @@ pub fn handle_request<W: Write>(
     };
 
     Ok(ResponseInfo { status: 200, bytes, latency_us: start.elapsed().as_micros() })
+}
+
+/// Serve a file from a byte offset (tail mode).
+///
+/// Reads `?offset=N` from the query string (default 0), reads from that byte
+/// offset to EOF, and returns the bytes with `Cache-Control: no-store` and an
+/// `X-Log-End` header containing the new end offset. Safe for log tailing:
+/// if the file has not grown since the last request, an empty body is returned.
+fn handle_tail<W: Write>(
+    req: &Request,
+    route: &Route,
+    params: &crate::route::Params,
+    ctx: &HandlerContext,
+    stream: &mut W,
+    start: Instant,
+) -> Result<ResponseInfo> {
+    let fs_path = route.resolve_fs_path(params, ctx.site_dir);
+
+    // Parse ?offset=N (default 0).
+    let offset: u64 = req
+        .query
+        .split('&')
+        .find(|p| p.starts_with("offset="))
+        .and_then(|p| p["offset=".len()..].parse().ok())
+        .unwrap_or(0);
+
+    let mut file = match std::fs::File::open(&fs_path) {
+        Ok(f) => f,
+        Err(_) => {
+            write_error(stream, 404, "Not Found")?;
+            return Ok(ResponseInfo { status: 404, bytes: 0, latency_us: start.elapsed().as_micros() });
+        }
+    };
+
+    // Seek to end to get file size, then seek to the requested offset.
+    let file_size = file.seek(SeekFrom::End(0))?;
+    let read_from = offset.min(file_size);
+    file.seek(SeekFrom::Start(read_from))?;
+
+    let mut body = Vec::new();
+    file.read_to_end(&mut body)?;
+
+    let end_offset = read_from + body.len() as u64;
+    let end_str = end_offset.to_string();
+
+    let mime = mime_guess::from_path(&fs_path)
+        .first()
+        .map(|m| m.to_string())
+        .unwrap_or_else(|| "text/plain".to_string());
+
+    write_response(
+        stream,
+        200,
+        "OK",
+        &[
+            ("Content-Type", mime.as_str()),
+            ("Cache-Control", "no-store"),
+            ("X-Log-End", end_str.as_str()),
+        ],
+        &body,
+    )?;
+
+    Ok(ResponseInfo { status: 200, bytes: body.len(), latency_us: start.elapsed().as_micros() })
 }
 
 enum FindRouteResult<'a> {
