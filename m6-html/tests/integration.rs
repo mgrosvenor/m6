@@ -82,7 +82,7 @@ fn spawn_server(id: &str) -> (ProcessGuard, PathBuf) {
 fn http_request(socket_path: &Path, request: &str) -> String {
     let mut stream = UnixStream::connect(socket_path)
         .unwrap_or_else(|e| panic!("connect to {:?}: {}", socket_path, e));
-    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok(); // macOS EINVAL under high concurrency; non-fatal
     stream.write_all(request.as_bytes()).unwrap();
     stream.shutdown(std::net::Shutdown::Write).ok();
 
@@ -95,7 +95,7 @@ fn http_request(socket_path: &Path, request: &str) -> String {
 fn http_request_bytes(socket_path: &Path, request: &str) -> Vec<u8> {
     let mut stream = UnixStream::connect(socket_path)
         .unwrap_or_else(|e| panic!("connect to {:?}: {}", socket_path, e));
-    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok(); // macOS EINVAL under high concurrency; non-fatal
     stream.write_all(request.as_bytes()).unwrap();
     stream.shutdown(std::net::Shutdown::Write).ok();
 

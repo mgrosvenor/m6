@@ -19,20 +19,58 @@ pub fn build_tera(site_dir: &Path) -> anyhow::Result<Tera> {
 }
 
 /// Build a Tera instance from explicit template paths (relative to site_dir).
+/// Also loads all *.html/*.txt/*.xml/*.json siblings in each referenced template's
+/// directory so that `{% extends %}` and `{% include %}` work correctly.
 pub fn build_tera_from_paths(
     site_dir: &Path,
     template_paths: &[String],
 ) -> anyhow::Result<Tera> {
-    let mut tera = Tera::default();
+    use std::collections::HashSet;
+
+    // Collect unique directories that contain route-referenced templates.
+    let mut dirs: HashSet<std::path::PathBuf> = HashSet::new();
     for rel_path in template_paths {
         let abs = site_dir.join(rel_path);
-        if abs.exists() {
-            let content = std::fs::read_to_string(&abs)
-                .with_context(|| format!("reading template {}", abs.display()))?;
-            tera.add_raw_template(rel_path, &content)
-                .with_context(|| format!("compiling template {}", rel_path))?;
+        if let Some(parent) = abs.parent() {
+            dirs.insert(parent.to_path_buf());
         }
     }
+
+    // Walk each directory and collect all template files.
+    let mut all_paths: Vec<String> = Vec::new();
+    for dir in &dirs {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                        if matches!(ext, "html" | "txt" | "xml" | "json") {
+                            if let Ok(rel) = path.strip_prefix(site_dir) {
+                                if let Some(s) = rel.to_str() {
+                                    all_paths.push(s.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Collect all (name, content) pairs and add as a batch so Tera can resolve
+    // `extends`/`include` chains regardless of insertion order.
+    let mut contents: Vec<(String, String)> = Vec::new();
+    for rel_path in &all_paths {
+        let abs = site_dir.join(rel_path);
+        let content = std::fs::read_to_string(&abs)
+            .with_context(|| format!("reading template {}", abs.display()))?;
+        contents.push((rel_path.clone(), content));
+    }
+
+    let mut tera = Tera::default();
+    let pairs: Vec<(&str, &str)> = contents.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    tera.add_raw_templates(pairs)
+        .context("compiling templates")?;
     register_filters(&mut tera);
     Ok(tera)
 }
