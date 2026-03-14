@@ -30,9 +30,11 @@ fn make_site() -> (TempDir, Config, Vec<Route>) {
         route: vec![RouteConfig {
             path: "/assets/{relpath}".to_string(),
             root: "assets".to_string(),
+            tail: None,
         }],
         compression: Default::default(),
         thread_pool: None,
+        log: None,
     };
 
     let mut routes: Vec<Route> = config.route.iter().map(Route::from_config).collect();
@@ -125,9 +127,11 @@ fn bench_socket_round_trip(c: &mut Criterion) {
             route: vec![RouteConfig {
                 path: "/assets/{relpath}".to_string(),
                 root: "assets".to_string(),
+                tail: None,
             }],
             compression: Default::default(),
             thread_pool: None,
+            log: None,
         };
         let mut routes: Vec<Route> = config.route.iter().map(Route::from_config).collect();
         sort_routes(&mut routes);
@@ -211,9 +215,11 @@ fn main() {
                 route: vec![RouteConfig {
                     path: "/assets/{relpath}".to_string(),
                     root: "assets".to_string(),
+                    tail: None,
                 }],
                 compression: Default::default(),
                 thread_pool: None,
+                log: None,
             };
             let mut routes: Vec<Route> = config.route.iter().map(Route::from_config).collect();
             sort_routes(&mut routes);
