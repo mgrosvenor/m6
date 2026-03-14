@@ -4,10 +4,17 @@ use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
+pub struct LogConfig {
+    pub level:  Option<String>,
+    pub format: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct RawConfig {
     storage: StorageConfig,
     tokens:  Option<TokensConfig>,
     keys:    KeysConfig,
+    log:     Option<LogConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -36,6 +43,7 @@ pub struct AuthConfig {
     pub issuer:          String,
     pub private_key_path: PathBuf,
     pub public_key_path:  PathBuf,
+    pub log:             Option<LogConfig>,
 }
 
 impl AuthConfig {
@@ -80,6 +88,7 @@ impl AuthConfig {
             issuer,
             private_key_path,
             public_key_path,
+            log: raw.log,
         })
     }
 }

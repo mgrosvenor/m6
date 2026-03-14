@@ -26,7 +26,7 @@ fn run() -> i32 {
     // Parse CLI: m6-file <site-dir> <config-path> [--log-level debug]
     let mut site_dir_str: Option<String> = None;
     let mut config_path_str: Option<String> = None;
-    let mut log_level = "info".to_string();
+    let mut log_level: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -34,7 +34,7 @@ fn run() -> i32 {
             "--log-level" => {
                 i += 1;
                 if i < args.len() {
-                    log_level = args[i].clone();
+                    log_level = Some(args[i].clone());
                 }
             }
             arg if !arg.starts_with('-') => {
@@ -64,28 +64,34 @@ fn run() -> i32 {
         }
     };
 
-    let level_filter = match log_level.as_str() {
-        "trace" => tracing::Level::TRACE,
-        "debug" => tracing::Level::DEBUG,
-        "info"  => tracing::Level::INFO,
-        "warn"  => tracing::Level::WARN,
-        "error" => tracing::Level::ERROR,
-        _       => tracing::Level::INFO,
-    };
-
-    tracing_subscriber::fmt()
-        .json()
-        .with_max_level(level_filter)
-        .init();
-
     let site_dir = PathBuf::from(&site_dir_str);
     let config_path = PathBuf::from(&config_path_str);
 
     let config = match Config::load(&config_path) {
         Ok(c) => c,
         Err(e) => {
-            error!(error = %e, "failed to load config");
+            eprintln!("failed to load config: {}", e);
             return 2;
+        }
+    };
+
+    // Resolve log settings: site.toml base → per-app [log] override → CLI --log-level.
+    let (site_level, site_format) = m6_core::log::read_site_log_config(&site_dir);
+    let format = config.log.as_ref()
+        .and_then(|l| l.format.as_deref())
+        .unwrap_or(&site_format)
+        .to_string();
+    let cfg_level = config.log.as_ref()
+        .and_then(|l| l.level.as_deref())
+        .unwrap_or(&site_level)
+        .to_string();
+    let level = log_level.as_deref().unwrap_or(&cfg_level).to_string();
+
+    let _log_guard = match m6_core::log::init(&format, &level) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("logging init error: {}", e);
+            return 1;
         }
     };
 
@@ -242,7 +248,7 @@ fn handle_connection(
 
     let info = handle_request(&req, &ctx, &mut stream).context("handling request")?;
 
-    info!(
+    debug!(
         path = req.path,
         method = req.method,
         status = info.status,
