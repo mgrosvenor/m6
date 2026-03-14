@@ -9,3 +9,4 @@ pub mod poller;
 pub mod router;
 pub mod stats;
 pub mod watcher;
+pub mod http11;

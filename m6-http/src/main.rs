@@ -28,11 +28,13 @@ use m6_http_lib::poller::{Poller, Token};
 use m6_http_lib::router::{self, RouteTable};
 use m6_http_lib::watcher::{FsEvent, FsEventKind, FsWatcher};
 use m6_http_lib::auth::PublicKey;
+use m6_http_lib::http11::{Http11Listener, make_tls_server_config};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
 const TOKEN_UDP: Token = Token(0);
 const TOKEN_INOTIFY: Token = Token(1);
+const TOKEN_TCP: Token = Token(2);
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
 // ── Shutdown flags ───────────────────────────────────────────────────────────
@@ -47,6 +49,8 @@ struct QuicConn {
     h3_conn: Option<quiche::h3::Connection>,
     /// Pending streams: stream_id -> accumulated request state
     pending: HashMap<u64, PendingRequest>,
+    /// Partial responses awaiting flow-control credit: stream_id -> (body, offset_written)
+    partial_responses: HashMap<u64, (Bytes, usize)>,
     client_addr: SocketAddr,
     /// When we last heard from this connection (for timeout tracking)
     last_active: Instant,
@@ -106,6 +110,10 @@ fn make_quiche_config(server_config: &config::ServerConfig) -> anyhow::Result<qu
     cfg.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
         .context("set alpn")?;
 
+    // Disable GREASE: removes the extra unidirectional and in-band GREASE frames
+    // that can confuse some client stacks (e.g. ngtcp2/nghttp3 in curl).
+    cfg.grease(false);
+
     // Performance tuning
     cfg.set_max_idle_timeout(30_000);              // 30 s idle timeout
     cfg.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
@@ -113,6 +121,7 @@ fn make_quiche_config(server_config: &config::ServerConfig) -> anyhow::Result<qu
     cfg.set_initial_max_data(10_000_000);
     cfg.set_initial_max_stream_data_bidi_local(1_000_000);
     cfg.set_initial_max_stream_data_bidi_remote(1_000_000);
+    cfg.set_initial_max_stream_data_uni(1_000_000);
     cfg.set_initial_max_streams_bidi(100);
     cfg.set_initial_max_streams_uni(100);
     cfg.set_disable_active_migration(true);
@@ -124,6 +133,7 @@ fn make_quiche_config(server_config: &config::ServerConfig) -> anyhow::Result<qu
 
 fn event_loop(
     udp: UdpSocket,
+    mut tcp: Option<Http11Listener>,
     mut watcher: Option<FsWatcher>,
     state: &mut ServerState,
     quiche_config: &mut quiche::Config,
@@ -139,6 +149,9 @@ fn event_loop(
     if let Err(e) = poller.add(udp.as_raw_fd(), TOKEN_UDP) {
         eprintln!("poller add UDP failed: {e}");
         return 2;
+    }
+    if let Some(ref t) = tcp {
+        let _ = poller.add(t.raw_fd(), TOKEN_TCP);
     }
     if let Some(ref w) = watcher {
         if let Some(fd) = w.raw_fd() {
@@ -167,6 +180,13 @@ fn event_loop(
     let mut connections: HashMap<Vec<u8>, QuicConn> = HashMap::new();
     let mut recv_buf = vec![0u8; 65536];
     let mut ev_buf = [Token(0); 64];
+
+    // When no filesystem watcher is available (e.g. macOS), rescan backend
+    // socket globs every 2 seconds so new workers are picked up automatically.
+    let rescan_interval = std::time::Duration::from_secs(2);
+    let mut last_rescan = std::time::Instant::now()
+        .checked_sub(rescan_interval)
+        .unwrap_or_else(std::time::Instant::now);
 
     loop {
         // Compute the soonest connection timeout
@@ -211,6 +231,11 @@ fn event_loop(
                         state,
                     );
                 }
+                TOKEN_TCP => {
+                    if let Some(ref mut t) = tcp {
+                        t.accept_pending();
+                    }
+                }
                 TOKEN_INOTIFY => {
                     if let Some(ref mut w) = watcher {
                         for event in w.read_events() {
@@ -222,6 +247,33 @@ fn event_loop(
             }
         }
 
+        // Drive HTTP/1.1 connections (runs every tick regardless of which fd fired)
+        if let Some(ref mut t) = tcp {
+            t.drive_all(|req, client_ip| {
+                let enc_str = req.headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("accept-encoding"))
+                    .map(|(_, v)| v.as_str())
+                    .unwrap_or("");
+                let start = std::time::Instant::now();
+                let (status, headers, body, backend_name) =
+                    handle_request(req, client_ip, enc_str, state);
+                let elapsed_ns = start.elapsed().as_nanos() as u64;
+                let is_backend_error = status >= 500;
+                state.stats.record(elapsed_ns, false, is_backend_error);
+                debug!(
+                    path = %req.path,
+                    status,
+                    version = "HTTP/1.1",
+                    backend = %backend_name,
+                    latency_us = elapsed_ns / 1_000,
+                    cache_hit = false,
+                    "request complete"
+                );
+                (status, headers, body, backend_name)
+            });
+        }
+
         // Drive connection timeouts and flush pending sends
         flush_all(&udp, &mut connections);
 
@@ -230,6 +282,14 @@ fn event_loop(
 
         // Emit periodic stats (cheap check every iteration: compares one Instant)
         state.stats.maybe_emit(state.pool_manager.total_active_members());
+
+        // Periodic rescan of backend socket globs to pick up newly started or
+        // removed workers. On Linux, inotify also fires per-socket events, but
+        // the rescan is a cheap belt-and-suspenders check for any missed events.
+        if last_rescan.elapsed() >= rescan_interval {
+            state.pool_manager.rescan_all();
+            last_rescan = std::time::Instant::now();
+        }
     }
 
     info!("m6-http shutdown complete");
@@ -296,6 +356,7 @@ fn drain_udp(
                     conn,
                     h3_conn: None,
                     pending: HashMap::new(),
+                    partial_responses: HashMap::new(),
                     client_addr: from,
                     last_active: Instant::now(),
                 },
@@ -356,7 +417,7 @@ fn process_h3(qconn: &mut QuicConn, _udp: &UdpSocket, state: &mut ServerState) {
         };
 
         match h3.poll(&mut qconn.conn) {
-            Ok((stream_id, quiche::h3::Event::Headers { list, has_body })) => {
+            Ok((stream_id, quiche::h3::Event::Headers { list, more_frames, .. })) => {
                 let entry = qconn.pending.entry(stream_id).or_insert_with(|| PendingRequest {
                     headers: Vec::new(),
                     body: Vec::new(),
@@ -364,7 +425,7 @@ fn process_h3(qconn: &mut QuicConn, _udp: &UdpSocket, state: &mut ServerState) {
                 });
                 entry.headers = list;
                 entry.headers_done = true;
-                if !has_body {
+                if !more_frames {
                     // No body — process immediately
                     handle_h3_request(stream_id, qconn, state);
                     // After handle_h3_request qconn may be mutated; restart loop
@@ -463,6 +524,7 @@ fn handle_h3_request(
         debug!(
             path = %path_str,
             status = cached.status,
+            version = "HTTP/3",
             backend = "cache",
             latency_us = elapsed_ns / 1_000,
             cache_hit = true,
@@ -505,6 +567,7 @@ fn handle_h3_request(
     debug!(
         path = %path,
         status,
+        version = "HTTP/3",
         backend = %backend_name,
         latency_us = elapsed_ns / 1_000,
         cache_hit = false,
@@ -566,8 +629,16 @@ fn send_h3_response(
         return;
     }
     if !body.is_empty() {
-        if let Err(e) = h3.send_body(&mut qconn.conn, stream_id, &body, true) {
-            warn!("h3 send_body error: {}", e);
+        match h3.send_body(&mut qconn.conn, stream_id, &body, true) {
+            Ok(written) if written == body.len() => {}
+            Ok(written) => {
+                // Partial write — store remainder, retry on conn.writable()
+                qconn.partial_responses.insert(stream_id, (body, written));
+            }
+            Err(quiche::h3::Error::Done) | Err(quiche::h3::Error::StreamBlocked) => {
+                qconn.partial_responses.insert(stream_id, (body, 0));
+            }
+            Err(e) => warn!("h3 send_body error: {}", e),
         }
     }
 }
@@ -867,7 +938,7 @@ fn flush_conn(udp: &UdpSocket, qconn: &mut QuicConn) {
                 break;
             }
         };
-        if let Err(e) = udp.send_to(&out[..written], send_info.to) {
+if let Err(e) = udp.send_to(&out[..written], send_info.to) {
             if e.kind() == std::io::ErrorKind::WouldBlock {
                 break;
             }
@@ -876,9 +947,38 @@ fn flush_conn(udp: &UdpSocket, qconn: &mut QuicConn) {
     }
 }
 
+/// Retry any partially-written response bodies on streams that have new flow-control credit.
+fn drain_writable(qconn: &mut QuicConn) {
+    if qconn.partial_responses.is_empty() { return; }
+    let h3 = match qconn.h3_conn.as_mut() { Some(h) => h, None => return };
+    let writable: Vec<u64> = qconn.conn.writable().collect();
+    for stream_id in writable {
+        let (body, offset) = match qconn.partial_responses.get(&stream_id) {
+            Some(r) => r,
+            None => continue,
+        };
+        let remaining = &body[*offset..];
+        match h3.send_body(&mut qconn.conn, stream_id, remaining, true) {
+            Ok(written) => {
+                let (body, offset) = qconn.partial_responses.get_mut(&stream_id).unwrap();
+                *offset += written;
+                if *offset >= body.len() {
+                    qconn.partial_responses.remove(&stream_id);
+                }
+            }
+            Err(quiche::h3::Error::Done) | Err(quiche::h3::Error::StreamBlocked) => {}
+            Err(e) => {
+                warn!("h3 drain_writable send_body error: {}", e);
+                qconn.partial_responses.remove(&stream_id);
+            }
+        }
+    }
+}
+
 fn flush_all(udp: &UdpSocket, connections: &mut HashMap<Vec<u8>, QuicConn>) {
     for qconn in connections.values_mut() {
         qconn.conn.on_timeout();
+        drain_writable(qconn);
         flush_conn(udp, qconn);
     }
 }
@@ -1137,10 +1237,31 @@ fn run(args: Vec<String>) -> i32 {
         }
     };
 
+    // Build TLS config for HTTP/1.1 and bind TCP listener on the same port
+    let tcp_listener = match make_tls_server_config(
+        &config.server.tls_cert,
+        &config.server.tls_key,
+    ) {
+        Ok(tls_cfg) => match Http11Listener::bind(&config.server.bind, tls_cfg) {
+            Ok(l) => {
+                info!(bind = %config.server.bind, "HTTP/1.1 over TLS listener started");
+                Some(l)
+            }
+            Err(e) => {
+                warn!(error = %e, "HTTP/1.1 TCP listener bind failed, HTTP/1.1 disabled");
+                None
+            }
+        },
+        Err(e) => {
+            warn!(error = %e, "HTTP/1.1 TLS config failed, HTTP/1.1 disabled");
+            None
+        }
+    };
+
     info!(
         bind = %config.server.bind,
         site = %config.site.name,
-        "m6-http started (HTTP/3 over QUIC, single-threaded epoll)"
+        "m6-http started (HTTP/3 over QUIC + HTTP/1.1 over TLS, single-threaded epoll)"
     );
 
     let mut state = ServerState {
@@ -1155,5 +1276,5 @@ fn run(args: Vec<String>) -> i32 {
         stats: Stats::new(),
     };
 
-    event_loop(udp, watcher, &mut state, &mut quiche_config)
+    event_loop(udp, tcp_listener, watcher, &mut state, &mut quiche_config)
 }
