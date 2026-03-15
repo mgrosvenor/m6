@@ -79,26 +79,31 @@ fn spawn_server(id: &str) -> (ProcessGuard, PathBuf) {
 }
 
 /// Send a raw HTTP/1.1 request and return the full response string.
+/// Returns empty string on any I/O error (connection refused, broken pipe, etc.)
+/// so callers can retry rather than panic.
 fn http_request(socket_path: &Path, request: &str) -> String {
-    let mut stream = UnixStream::connect(socket_path)
-        .unwrap_or_else(|e| panic!("connect to {:?}: {}", socket_path, e));
-    stream.set_read_timeout(Some(Duration::from_secs(5))).ok(); // macOS EINVAL under high concurrency; non-fatal
-    stream.write_all(request.as_bytes()).unwrap();
+    let mut stream = match UnixStream::connect(socket_path) {
+        Ok(s) => s,
+        Err(_) => return String::new(),
+    };
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    if stream.write_all(request.as_bytes()).is_err() { return String::new(); }
     stream.shutdown(std::net::Shutdown::Write).ok();
-
     let mut response = Vec::new();
     let _ = stream.read_to_end(&mut response);
     String::from_utf8_lossy(&response).into_owned()
 }
 
 /// Send a raw HTTP/1.1 request and return the full response as raw bytes.
+/// Returns empty vec on any I/O error.
 fn http_request_bytes(socket_path: &Path, request: &str) -> Vec<u8> {
-    let mut stream = UnixStream::connect(socket_path)
-        .unwrap_or_else(|e| panic!("connect to {:?}: {}", socket_path, e));
-    stream.set_read_timeout(Some(Duration::from_secs(5))).ok(); // macOS EINVAL under high concurrency; non-fatal
-    stream.write_all(request.as_bytes()).unwrap();
+    let mut stream = match UnixStream::connect(socket_path) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    if stream.write_all(request.as_bytes()).is_err() { return Vec::new(); }
     stream.shutdown(std::net::Shutdown::Write).ok();
-
     let mut response = Vec::new();
     let _ = stream.read_to_end(&mut response);
     response
