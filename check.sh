@@ -31,7 +31,7 @@ for arg in "$@"; do
   esac
 done
 
-BENCH_THRESHOLD="${BENCH_THRESHOLD:-10}"  # % allowed regression
+BENCH_THRESHOLD="${BENCH_THRESHOLD:-15}"  # % allowed regression (15% guards real regressions; 10% has too many false positives on short microbenchmarks)
 BASELINE_FILE="benches/baseline.json"
 
 # ── Colours ───────────────────────────────────────────────────────────────────

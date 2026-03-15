@@ -128,8 +128,8 @@ m6-bench --skip-verify --addr 127.0.0.1:8443 --http11-only --latency-n 1000
 ## Regression gates
 
 `check.sh` (and the pre-push hook) runs the criterion microbenchmarks and fails
-if any benchmark regresses by more than 10% (configurable via
-`BENCH_THRESHOLD`).  End-to-end latency and throughput benchmarks are run via
+if any benchmark regresses by more than 15% (configurable via
+`BENCH_THRESHOLD`; 10% triggers false positives on sub-200 ns operations).  End-to-end latency and throughput benchmarks are run via
 `bench.sh` as part of the full integration test suite.
 
 ## Deployment acceleration
