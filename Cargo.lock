@@ -1976,7 +1976,7 @@ dependencies = [
 [[package]]
 name = "octets"
 version = "0.3.5"
-source = "git+https://github.com/cloudflare/quiche?rev=6ab8d3c5#6ab8d3c598aa4d51b5414f38c1939c4e9d59e836"
+source = "git+https://github.com/cloudflare/quiche?tag=0.26.1#445292f46e05b72d56b9b957da77bfac3d24fc77"
 
 [[package]]
 name = "once_cell"
@@ -2356,7 +2356,7 @@ dependencies = [
 [[package]]
 name = "quiche"
 version = "0.26.1"
-source = "git+https://github.com/cloudflare/quiche?rev=6ab8d3c5#6ab8d3c598aa4d51b5414f38c1939c4e9d59e836"
+source = "git+https://github.com/cloudflare/quiche?tag=0.26.1#445292f46e05b72d56b9b957da77bfac3d24fc77"
 dependencies = [
  "cmake",
  "either",
