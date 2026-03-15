@@ -619,9 +619,17 @@ fn send_h3_response(
     let mut h3_headers: Vec<quiche::h3::Header> = Vec::with_capacity(headers.len() + 2);
     h3_headers.push(quiche::h3::Header::new(b":status", &status_buf));
     for (k, v) in headers {
+        // Omit content-length for non-empty bodies: quiche+ngtcp2 interop bug where
+        // nghttp3 prematurely signals body-complete when content-length is present
+        // alongside a separate DATA frame. Without it, nghttp3 reads until stream FIN.
+        if !body.is_empty() && k.eq_ignore_ascii_case("content-length") {
+            continue;
+        }
         h3_headers.push(quiche::h3::Header::new(k.as_bytes(), v.as_bytes()));
     }
-    h3_headers.push(quiche::h3::Header::new(b"content-length", cl_bytes));
+    if body.is_empty() {
+        h3_headers.push(quiche::h3::Header::new(b"content-length", cl_bytes));
+    }
 
     let fin = body.is_empty();
     if let Err(e) = h3.send_response(&mut qconn.conn, stream_id, &h3_headers, fin) {
@@ -938,7 +946,7 @@ fn flush_conn(udp: &UdpSocket, qconn: &mut QuicConn) {
                 break;
             }
         };
-if let Err(e) = udp.send_to(&out[..written], send_info.to) {
+        if let Err(e) = udp.send_to(&out[..written], send_info.to) {
             if e.kind() == std::io::ErrorKind::WouldBlock {
                 break;
             }
