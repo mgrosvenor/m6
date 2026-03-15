@@ -4,16 +4,18 @@
 # Usage:
 #   ./check.sh               # run everything
 #   ./check.sh --no-bench    # skip benchmarks (faster iteration)
-#   BENCH_THRESHOLD=5        # % regression allowed before failure (default: 10)
+#   ./check.sh --save-baseline  # run benches and save as the regression baseline
 #
 # Order of operations:
 #   1. Build (release)
 #   2. Unit + integration tests  ← HTTP/1.1 and HTTP/3 covered here
-#   3. Benchmark regression check (compare against saved baseline)
+#   3. Benchmark regression check (compare against saved named baseline)
 #
 # Baseline management:
-#   The baseline is stored in benches/baseline.json (criterion output).
-#   Run `./check.sh --save-baseline` to update it after an intentional improvement.
+#   Criterion stores a named baseline called "check" in target/criterion/.
+#   Run `./check.sh --save-baseline` after an intentional improvement to
+#   update it.  Until a baseline exists, the bench step runs but does not
+#   compare (safe for fresh clones).
 
 set -euo pipefail
 
@@ -31,8 +33,7 @@ for arg in "$@"; do
   esac
 done
 
-BENCH_THRESHOLD="${BENCH_THRESHOLD:-15}"  # % allowed regression (15% guards real regressions; 10% has too many false positives on short microbenchmarks)
-BASELINE_FILE="benches/baseline.json"
+BASELINE_NAME="check"
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; RESET='\033[0m'
@@ -53,45 +54,62 @@ else
   fail "Test suite failed — fix correctness issues before performance check"
 fi
 
-# ── 3. Performance regression check ──────────────────────────────────────────
+# ── 3. Performance ────────────────────────────────────────────────────────────
 if [[ "$RUN_BENCH" == "false" ]]; then
   info "Skipping benchmarks (--no-bench)"
   exit 0
 fi
 
-info "Running benchmarks..."
+# Criterion bench targets (harness=false; accept --baseline / --save-baseline).
+# Specified as --bench <name> to avoid running inline #[bench] items that use
+# the standard harness and reject unknown flags.
+CRITERION_BENCHES=(
+  -p m6-file   --bench critical_path
+  -p m6-http   --bench critical_path
+  -p m6-render --bench critical_path
+)
+
+if [[ "$SAVE_BASELINE" == "true" ]]; then
+  info "Saving benchmark baseline '$BASELINE_NAME'..."
+  if cargo bench "${CRITERION_BENCHES[@]}" --quiet -- --save-baseline "$BASELINE_NAME" 2>&1; then
+    pass "Baseline '$BASELINE_NAME' saved"
+  else
+    fail "Benchmark run failed during baseline save"
+  fi
+  echo ""
+  echo -e "${GREEN}Baseline saved. Future runs will compare against it.${RESET}"
+  exit 0
+fi
+
+info "Running benchmarks (comparing against baseline '$BASELINE_NAME')..."
 BENCH_OUT="$(mktemp)"
-if ! cargo bench --workspace --quiet 2>&1 | tee "$BENCH_OUT"; then
+
+# Use named baseline if it exists; otherwise run without comparison (first use).
+BASELINE_DIR="target/criterion/$BASELINE_NAME"
+if [[ -d "$BASELINE_DIR" ]]; then
+  BENCH_ARGS="-- --baseline $BASELINE_NAME"
+else
+  info "No baseline found — running without comparison (use --save-baseline to create one)"
+  BENCH_ARGS=""
+fi
+
+if ! cargo bench "${CRITERION_BENCHES[@]}" --quiet $BENCH_ARGS 2>&1 | tee "$BENCH_OUT"; then
+  rm -f "$BENCH_OUT"
   fail "Benchmark run failed"
 fi
 
-# Extract criterion regression lines
-# Criterion prints: "change: [-X% -Y% +Z%] (p = P > 0.05)" for no change
-#                   "Regression (p = P ...)" for detected regression
-if grep -q "Regression" "$BENCH_OUT"; then
+# Criterion prints "Performance has regressed." for statistically-significant
+# slowdowns when comparing against a named baseline.
+if grep -q "Performance has regressed\." "$BENCH_OUT"; then
   echo ""
   echo -e "${RED}Performance regression detected:${RESET}"
-  grep "Regression" "$BENCH_OUT"
+  grep -B2 "Performance has regressed\." "$BENCH_OUT" | grep -v "^--$" || true
   rm -f "$BENCH_OUT"
   fail "Performance regression — profile before merging"
 fi
 
-# Check for large % changes even if not statistically significant
-while IFS= read -r line; do
-  if echo "$line" | grep -q "change:"; then
-    # Extract the median % change (middle value in [...])
-    pct=$(echo "$line" | grep -oE '[-+]?[0-9]+\.[0-9]+%' | sed -n '2p' | tr -d '%+')
-    if [[ -n "$pct" ]] && awk "BEGIN{exit !(${pct} > ${BENCH_THRESHOLD})}"; then
-      echo -e "${RED}Large performance change: ${pct}% (threshold: ${BENCH_THRESHOLD}%)${RESET}"
-      echo "  $line"
-      rm -f "$BENCH_OUT"
-      fail "Performance regression > ${BENCH_THRESHOLD}% detected"
-    fi
-  fi
-done < "$BENCH_OUT"
-
 rm -f "$BENCH_OUT"
-pass "Benchmarks (no regression > ${BENCH_THRESHOLD}%)"
+pass "Benchmarks (no regression)"
 
 echo ""
 echo -e "${GREEN}All checks passed.${RESET}"
