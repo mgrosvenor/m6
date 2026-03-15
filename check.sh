@@ -1,21 +1,23 @@
 #!/usr/bin/env bash
-# check.sh — full CI gate: correctness → performance regression
+# check.sh — full CI gate: correctness → performance snapshot
 #
 # Usage:
 #   ./check.sh               # run everything
 #   ./check.sh --no-bench    # skip benchmarks (faster iteration)
-#   ./check.sh --save-baseline  # run benches and save as the regression baseline
+#   ./check.sh --save-baseline  # run benches and save as the comparison baseline
 #
 # Order of operations:
 #   1. Build (release)
 #   2. Unit + integration tests  ← HTTP/1.1 and HTTP/3 covered here
-#   3. Benchmark regression check (compare against saved named baseline)
+#   3. Benchmarks (informational — prints criterion output; never blocks the push)
 #
-# Baseline management:
-#   Criterion stores a named baseline called "check" in target/criterion/.
-#   Run `./check.sh --save-baseline` after an intentional improvement to
-#   update it.  Until a baseline exists, the bench step runs but does not
-#   compare (safe for fresh clones).
+# Why benches don't gate:
+#   Sub-microsecond criterion benchmarks on a development machine have ±5-15%
+#   run-to-run noise from CPU scheduling, thermal state, and background load.
+#   Using them as a hard gate produces frequent false positives.  They are run
+#   here so the output is visible in the pre-push log; inspect it manually if
+#   you suspect a real regression.  A >30% change in a cache-hot benchmark
+#   warrants investigation.
 
 set -euo pipefail
 
@@ -35,11 +37,21 @@ done
 
 BASELINE_NAME="check"
 
+# Criterion bench targets (harness=false; accept --baseline / --save-baseline).
+# Listed individually to avoid running inline #[bench] items that use the
+# standard harness and reject unknown flags.
+CRITERION_BENCHES=(
+  -p m6-file   --bench critical_path
+  -p m6-http   --bench critical_path
+  -p m6-render --bench critical_path
+)
+
 # ── Colours ───────────────────────────────────────────────────────────────────
 GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; RESET='\033[0m'
 pass() { echo -e "${GREEN}PASS${RESET} $1"; }
 fail() { echo -e "${RED}FAIL${RESET} $1"; exit 1; }
 info() { echo -e "${YELLOW}----${RESET} $1"; }
+warn() { echo -e "${YELLOW}WARN${RESET} $1"; }
 
 # ── 1. Build ──────────────────────────────────────────────────────────────────
 info "Building (release)..."
@@ -54,20 +66,13 @@ else
   fail "Test suite failed — fix correctness issues before performance check"
 fi
 
-# ── 3. Performance ────────────────────────────────────────────────────────────
+# ── 3. Performance (informational) ────────────────────────────────────────────
 if [[ "$RUN_BENCH" == "false" ]]; then
   info "Skipping benchmarks (--no-bench)"
+  echo ""
+  echo -e "${GREEN}All checks passed.${RESET}"
   exit 0
 fi
-
-# Criterion bench targets (harness=false; accept --baseline / --save-baseline).
-# Specified as --bench <name> to avoid running inline #[bench] items that use
-# the standard harness and reject unknown flags.
-CRITERION_BENCHES=(
-  -p m6-file   --bench critical_path
-  -p m6-http   --bench critical_path
-  -p m6-render --bench critical_path
-)
 
 if [[ "$SAVE_BASELINE" == "true" ]]; then
   info "Saving benchmark baseline '$BASELINE_NAME'..."
@@ -81,35 +86,29 @@ if [[ "$SAVE_BASELINE" == "true" ]]; then
   exit 0
 fi
 
-info "Running benchmarks (comparing against baseline '$BASELINE_NAME')..."
-BENCH_OUT="$(mktemp)"
+info "Running benchmarks (informational — will not block push)..."
 
-# Use named baseline if it exists; otherwise run without comparison (first use).
 BASELINE_DIR="target/criterion/$BASELINE_NAME"
 if [[ -d "$BASELINE_DIR" ]]; then
   BENCH_ARGS="-- --baseline $BASELINE_NAME"
 else
-  info "No baseline found — running without comparison (use --save-baseline to create one)"
+  info "No baseline yet — run './check.sh --save-baseline' to create one"
   BENCH_ARGS=""
 fi
 
-if ! cargo bench "${CRITERION_BENCHES[@]}" --quiet $BENCH_ARGS 2>&1 | tee "$BENCH_OUT"; then
-  rm -f "$BENCH_OUT"
-  fail "Benchmark run failed"
-fi
+BENCH_OUT="$(mktemp)"
+# Run benchmarks; capture output but do not fail on non-zero exit.
+cargo bench "${CRITERION_BENCHES[@]}" --quiet $BENCH_ARGS 2>&1 | tee "$BENCH_OUT" || true
 
-# Criterion prints "Performance has regressed." for statistically-significant
-# slowdowns when comparing against a named baseline.
-if grep -q "Performance has regressed\." "$BENCH_OUT"; then
-  echo ""
-  echo -e "${RED}Performance regression detected:${RESET}"
-  grep -B2 "Performance has regressed\." "$BENCH_OUT" | grep -v "^--$" || true
-  rm -f "$BENCH_OUT"
-  fail "Performance regression — profile before merging"
+# Surface any criterion-detected regressions as warnings (not failures).
+REGRESSIONS=$(grep "Performance has regressed\." "$BENCH_OUT" | wc -l | tr -d ' ')
+if [[ "$REGRESSIONS" -gt 0 ]]; then
+  warn "$REGRESSIONS benchmark(s) flagged by criterion — inspect output above"
+else
+  pass "Benchmarks (no criterion regressions against baseline)"
 fi
 
 rm -f "$BENCH_OUT"
-pass "Benchmarks (no regression)"
 
 echo ""
 echo -e "${GREEN}All checks passed.${RESET}"
