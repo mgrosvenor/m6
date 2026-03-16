@@ -90,7 +90,34 @@ Reverse proxy, cache, and router. The only process that listens on a public port
 - `write_decimal` uses a 20-byte stack buffer instead of `format!`
 - `Arc` cache swapped atomically — never mutated in place
 
-**Benchmark results (release, Apple M4, criterion + percentile reporter):**
+**Benchmark results (release, Apple M4, loopback, n=2000):**
+
+End-to-end latency (sequential requests, persistent connection where applicable):
+
+| Protocol | p50 | p99 | Notes |
+|----------|-----|-----|-------|
+| HTTP/1.1 | 0.198 ms | 0.444 ms | New TLS conn per request |
+| HTTP/2   | 0.048 ms | 0.131 ms | Persistent TLS conn |
+| HTTP/3   | 0.031 ms | 0.092 ms | Persistent QUIC conn |
+
+HTTP/3 cache effect (p50, path suite):
+
+| Path | p50 | Notes |
+|------|-----|-------|
+| cache-hit→m6-file  | 0.029 ms | Served from m6-http memory cache |
+| cache-miss→m6-file | 0.064 ms | Forwarded to m6-file backend |
+| cache-hit→m6-html  | 0.048 ms | Served from m6-http memory cache |
+| cache-miss→m6-html | 0.059 ms | Forwarded to m6-html renderer |
+
+Throughput (8 concurrent threads, 10 s, GET `/`):
+
+| Protocol | req/s |
+|----------|-------|
+| HTTP/1.1 | 8,840 |
+| HTTP/2   | 28,797 |
+| HTTP/3   | 61,748 |
+
+Criterion microbenchmarks (CPU cost, no I/O):
 
 | Operation | Median | Notes |
 |-----------|--------|-------|

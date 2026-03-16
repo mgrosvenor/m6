@@ -482,9 +482,9 @@ impl Http2Conn {
             }
         }
 
-        if let Some(s) = self.streams.get_mut(&stream_id) {
-            s.state = StreamState::Closed;
-        }
+        // Mark the stream closed, then immediately reap it so the HashMap
+        // does not grow unboundedly and trigger the MAX_CONCURRENT guard.
+        self.streams.remove(&stream_id);
     }
 
     // ── Frame encoding helpers ────────────────────────────────────────────────

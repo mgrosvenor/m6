@@ -14,8 +14,9 @@
 ///
 /// Output: one result line per suite; exits non-zero if any threshold exceeded.
 
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{TcpStream, UdpSocket};
+use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -30,13 +31,16 @@ struct Args {
     http11: bool,
     http2:  bool,
     http3:  bool,
-    skip_verify:  bool,
-    latency_n:    usize,
-    duration_s:   u64,
-    concurrency:  usize,
-    p99_limit_ms: f64,
-    rps_min:      f64,
-    addr:         String,
+    skip_verify:      bool,
+    latency_only:     bool,
+    throughput_only:  bool,
+    path_only:        bool,
+    latency_n:        usize,
+    duration_s:       u64,
+    concurrency:      usize,
+    p99_limit_ms:     f64,
+    rps_min:          f64,
+    addr:             String,
 }
 
 impl Args {
@@ -45,28 +49,34 @@ impl Args {
             http11: true,
             http2:  true,
             http3:  true,
-            skip_verify:  false,
-            latency_n:    2000,
-            duration_s:   10,
-            concurrency:  8,
-            p99_limit_ms: 50.0,
-            rps_min:      50.0,
+            skip_verify:     false,
+            latency_only:    false,
+            throughput_only: false,
+            path_only:       false,
+            latency_n:       2000,
+            duration_s:      10,
+            concurrency:     8,
+            p99_limit_ms:    50.0,
+            rps_min:         50.0,
             addr: "127.0.0.1:8443".into(),
         };
         let raw: Vec<String> = std::env::args().skip(1).collect();
         let mut i = 0;
         while i < raw.len() {
             match raw[i].as_str() {
-                "--http11-only"    => { a.http11 = true;  a.http2 = false; a.http3 = false; }
-                "--http2-only"     => { a.http11 = false; a.http2 = true;  a.http3 = false; }
-                "--http3-only"     => { a.http11 = false; a.http2 = false; a.http3 = true; }
-                "--skip-verify"    => a.skip_verify = true,
-                "--latency-n"      => { i += 1; a.latency_n   = raw[i].parse().expect("latency-n"); }
-                "--duration"       => { i += 1; a.duration_s  = raw[i].parse().expect("duration"); }
-                "--concurrency"    => { i += 1; a.concurrency  = raw[i].parse().expect("concurrency"); }
-                "--p99-limit-ms"   => { i += 1; a.p99_limit_ms = raw[i].parse().expect("p99-limit-ms"); }
-                "--rps-min"        => { i += 1; a.rps_min      = raw[i].parse().expect("rps-min"); }
-                "--addr"           => { i += 1; a.addr = raw[i].clone(); }
+                "--http11-only"      => { a.http11 = true;  a.http2 = false; a.http3 = false; }
+                "--http2-only"       => { a.http11 = false; a.http2 = true;  a.http3 = false; }
+                "--http3-only"       => { a.http11 = false; a.http2 = false; a.http3 = true; }
+                "--skip-verify"      => a.skip_verify = true,
+                "--latency-only"     => a.latency_only    = true,
+                "--throughput-only"  => a.throughput_only = true,
+                "--path-only"        => a.path_only       = true,
+                "--latency-n"        => { i += 1; a.latency_n    = raw[i].parse().expect("latency-n"); }
+                "--duration"         => { i += 1; a.duration_s   = raw[i].parse().expect("duration"); }
+                "--concurrency"      => { i += 1; a.concurrency  = raw[i].parse().expect("concurrency"); }
+                "--p99-limit-ms"     => { i += 1; a.p99_limit_ms = raw[i].parse().expect("p99-limit-ms"); }
+                "--rps-min"          => { i += 1; a.rps_min      = raw[i].parse().expect("rps-min"); }
+                "--addr"             => { i += 1; a.addr = raw[i].clone(); }
                 other => { eprintln!("Unknown flag: {other}"); std::process::exit(1); }
             }
             i += 1;
@@ -140,14 +150,18 @@ fn make_client_config(skip_verify: bool) -> Arc<ClientConfig> {
 // ── HTTP/1.1 helpers ──────────────────────────────────────────────────────────
 
 fn http11_get(addr: &str, tls_cfg: Arc<ClientConfig>) -> anyhow::Result<Vec<u8>> {
+    http11_get_path(addr, "/", tls_cfg)
+}
+
+fn http11_get_path(addr: &str, path: &str, tls_cfg: Arc<ClientConfig>) -> anyhow::Result<Vec<u8>> {
     let stream = TcpStream::connect(addr)?;
     stream.set_nodelay(true)?;
     let server_name: ServerName<'static> = "localhost".try_into().unwrap();
     let mut conn = rustls::ClientConnection::new(tls_cfg, server_name)?;
     let mut stream_ref = &stream;
     let mut tls = rustls::Stream::new(&mut conn, &mut stream_ref);
-    let req = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-    tls.write_all(req)?;
+    let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    tls.write_all(req.as_bytes())?;
     let mut resp = Vec::new();
     // m6-http closes with TCP FIN rather than TLS close_notify; allow that.
     match tls.read_to_end(&mut resp) {
@@ -177,19 +191,20 @@ fn percentile(mut v: Vec<f64>, pct: f64) -> f64 {
 // ── HTTP/1.1 latency ──────────────────────────────────────────────────────────
 
 fn bench_http11_latency(addr: &str, n: usize, tls_cfg: Arc<ClientConfig>) -> anyhow::Result<Vec<f64>> {
+    bench_http11_latency_path(addr, "/", n, tls_cfg)
+}
+
+fn bench_http11_latency_path(addr: &str, path: &str, n: usize, tls_cfg: Arc<ClientConfig>) -> anyhow::Result<Vec<f64>> {
     let mut latencies = Vec::with_capacity(n);
-    // Warmup
     for _ in 0..5 {
-        http11_get(addr, Arc::clone(&tls_cfg))?;
+        http11_get_path(addr, path, Arc::clone(&tls_cfg))?;
     }
     for _ in 0..n {
         let t0 = Instant::now();
-        let resp = http11_get(addr, Arc::clone(&tls_cfg))?;
+        let resp = http11_get_path(addr, path, Arc::clone(&tls_cfg))?;
         let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
         let status = parse_http11_status(&resp);
-        if status != 200 {
-            eprintln!("HTTP/1.1 non-200: {status}");
-        }
+        if status != 200 { eprintln!("HTTP/1.1 non-200 ({path}): {status}"); }
         latencies.push(elapsed);
     }
     Ok(latencies)
@@ -225,11 +240,34 @@ fn bench_http11_throughput(addr: &str, duration_s: u64, concurrency: usize, tls_
 
 const H2_CLIENT_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
-// HPACK static-table encoded: :method GET, :path /, :scheme https, :authority localhost
-const H2_HEADERS_GET_ROOT: &[u8] = &[
-    0x82, 0x84, 0x87,
-    0x41, 0x09, b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
-];
+/// Build a minimal HPACK block for `GET <path> https localhost`.
+///
+/// Uses HPACK static table entries where possible:
+///   0x82 = :method GET   (index 2)
+///   0x84 = :path /       (index 4, "/" only)
+///   0x87 = :scheme https (index 7)
+///   0x41 = :authority    (literal+index, name index 1)
+///
+/// For paths other than "/", the :path header is encoded as a literal with
+/// no dynamic-table indexing (format 0x04 = 0000 0100, name index 4).
+fn make_h2_get_headers(path: &str) -> Vec<u8> {
+    let mut h = Vec::with_capacity(32);
+    h.push(0x82); // :method GET
+    let pb = path.as_bytes();
+    if path == "/" {
+        h.push(0x84); // :path / (static table index 4)
+    } else {
+        h.push(0x04); // literal no-index, name = static[4] = :path
+        // 7-bit integer length (no Huffman); paths used here are all < 128 bytes
+        debug_assert!(pb.len() < 128, "path too long for simple HPACK length encoding");
+        h.push(pb.len() as u8);
+        h.extend_from_slice(pb);
+    }
+    h.push(0x87); // :scheme https
+    // :authority localhost — literal with incremental indexing, name index 1
+    h.extend_from_slice(&[0x41, 0x09, b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't']);
+    h
+}
 
 fn make_h2_frame(ftype: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
     let len = payload.len();
@@ -275,9 +313,14 @@ fn make_client_config_h2(skip_verify: bool) -> Arc<ClientConfig> {
     Arc::new(cfg)
 }
 
-/// Persistent HTTP/2 client over TLS — reuses one connection across many requests.
+/// Persistent HTTP/2 client over TLS.
+///
+/// Uses explicit read_tls/write_tls calls (same pattern as advance_tls in http11.rs)
+/// rather than rustls::StreamOwned, whose complete_io() skips reads on an established
+/// connection — causing indefinite blocking waits for server responses.
 struct H2Client {
-    tls:            rustls::StreamOwned<rustls::ClientConnection, TcpStream>,
+    conn:           rustls::ClientConnection,
+    stream:         TcpStream,
     recv_buf:       Vec<u8>,
     tmp:            [u8; 8192],
     next_stream_id: u32,
@@ -288,30 +331,129 @@ impl H2Client {
     fn connect(addr: &str, tls_cfg: Arc<ClientConfig>) -> anyhow::Result<Self> {
         let stream = TcpStream::connect(addr)?;
         stream.set_nodelay(true)?;
-        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        // Always non-blocking; deadline loops use io::ErrorKind::WouldBlock.
+        stream.set_nonblocking(true)?;
         let server_name: ServerName<'static> = "localhost".try_into().unwrap();
         let conn = rustls::ClientConnection::new(tls_cfg, server_name)?;
-        let mut tls = rustls::StreamOwned::new(conn, stream);
-        tls.write_all(H2_CLIENT_PREFACE)?;
-        tls.write_all(&make_h2_frame(0x4, 0x0, 0, &[]))?; // empty SETTINGS
-        tls.flush()?;
-        Ok(H2Client {
-            tls,
+
+        let mut c = H2Client {
+            conn, stream,
             recv_buf:       Vec::with_capacity(16_384),
             tmp:            [0u8; 8192],
             next_stream_id: 1,
             requests_done:  0,
-        })
+        };
+
+        // Queue preface + empty SETTINGS for sending alongside the TLS handshake.
+        c.conn.writer().write_all(H2_CLIENT_PREFACE)?;
+        c.conn.writer().write_all(&make_h2_frame(0x4, 0x0, 0, &[]))?;
+
+        // Drive TLS handshake: alternate writes and blocking reads until established.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            c.flush_write()?;
+            if !c.conn.is_handshaking() { break; }
+            c.fill_recv_deadline(deadline)?; // spin until next TLS record arrives
+        }
+        // Drain any buffered server data (SETTINGS, NewSessionTickets, etc.).
+        c.fill_recv_drain()?;
+        // Acknowledge the server's SETTINGS frame (RFC 9113 §6.5 requirement).
+        c.conn.writer().write_all(&make_h2_frame(0x4, 0x1, 0, &[]))?;
+        c.flush_write()?;
+        Ok(c)
     }
 
-    fn get(&mut self) -> anyhow::Result<Vec<u8>> {
+    /// Write all pending TLS output to the socket (non-blocking, with retry).
+    /// Returns the total number of TLS bytes written to the socket.
+    fn flush_write(&mut self) -> io::Result<usize> {
+        let mut total = 0;
+        loop {
+            let r = { let mut sr = &self.stream; self.conn.write_tls(&mut sr) };
+            match r {
+                Ok(0)  => break,
+                Ok(n)  => { total += n; }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(total)
+    }
+
+    /// Block until at least one TLS record arrives or the deadline passes.
+    /// Uses poll() to sleep until the socket is readable rather than spinning,
+    /// which prevents the client from starving the single-threaded server.
+    fn fill_recv_deadline(&mut self, deadline: Instant) -> io::Result<()> {
+        loop {
+            let r = { let mut sr = &self.stream; self.conn.read_tls(&mut sr) };
+            match r {
+                Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "closed")),
+                Ok(_) => {
+                    self.conn.process_new_packets()
+                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                    break; // got at least one TLS record
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(io::Error::new(io::ErrorKind::TimedOut, "deadline"));
+                    }
+                    // Flush any pending writes before sleeping so the server
+                    // has our request before we block waiting for its response.
+                    self.flush_write()?;
+                    let timeout_ms = remaining.as_millis().min(100) as i32;
+                    unsafe {
+                        let mut pfd = libc::pollfd {
+                            fd:      self.stream.as_raw_fd(),
+                            events:  libc::POLLIN,
+                            revents: 0,
+                        };
+                        libc::poll(&mut pfd, 1, timeout_ms);
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        self.drain_plaintext()
+    }
+
+    /// Drain whatever TLS records are already buffered (non-blocking).
+    fn fill_recv_drain(&mut self) -> io::Result<()> {
+        loop {
+            let r = { let mut sr = &self.stream; self.conn.read_tls(&mut sr) };
+            match r {
+                Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "closed")),
+                Ok(_) => {
+                    self.conn.process_new_packets()
+                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e),
+            }
+        }
+        self.drain_plaintext()
+    }
+
+    fn drain_plaintext(&mut self) -> io::Result<()> {
+        loop {
+            match self.conn.reader().read(&mut self.tmp) {
+                Ok(0)  => break,
+                Ok(n)  => self.recv_buf.extend_from_slice(&self.tmp[..n]),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    fn get(&mut self, path: &str) -> anyhow::Result<Vec<u8>> {
         let sid = self.next_stream_id;
         self.next_stream_id += 2;
         self.requests_done += 1;
 
         // END_STREAM | END_HEADERS = 0x05
-        self.tls.write_all(&make_h2_frame(0x1, 0x05, sid, H2_HEADERS_GET_ROOT))?;
-        self.tls.flush()?;
+        let headers = make_h2_get_headers(path);
+        self.conn.writer().write_all(&make_h2_frame(0x1, 0x05, sid, &headers))?;
+        self.flush_write()?;
 
         let mut body = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -329,27 +471,22 @@ impl H2Client {
                             if flags & 0x1 != 0 { return Ok(body); } // END_STREAM
                         }
                     }
-                    0x1 if fsid == sid && flags & 0x1 != 0 => {
-                        // HEADERS with END_STREAM (empty body response)
-                        return Ok(body);
+                    0x1 if fsid == sid => {
+                        if flags & 0x1 != 0 {
+                            return Ok(body); // HEADERS with END_STREAM (no body)
+                        }
+                        // HEADERS without END_STREAM: response headers only, body follows
                     }
+                    0x3 if fsid == sid => anyhow::bail!("server RST_STREAM on sid {sid}"),
                     0x7 => anyhow::bail!("server sent GOAWAY"),
-                    _ => {} // SETTINGS, SETTINGS-ACK, WINDOW_UPDATE, etc.
+                    _ => {} // SETTINGS, SETTINGS-ACK, WINDOW_UPDATE, PRIORITY, etc.
                 }
                 continue;
             }
 
-            let n = match self.tls.read(&mut self.tmp) {
-                Ok(0) => anyhow::bail!("H2 connection closed"),
-                Ok(n) => n,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
-                       || e.kind() == std::io::ErrorKind::TimedOut => {
-                    std::thread::sleep(Duration::from_millis(1));
-                    continue;
-                }
-                Err(e) => return Err(e.into()),
-            };
-            self.recv_buf.extend_from_slice(&self.tmp[..n]);
+            // Need more data — spin until the server sends something.
+            self.fill_recv_deadline(deadline)
+                .map_err(|e| anyhow::anyhow!("H2 read: {}", e))?;
         }
     }
 }
@@ -357,18 +494,22 @@ impl H2Client {
 const H2_MAX_REQUESTS_PER_CONN: usize = 1_000;
 
 fn bench_http2_latency(addr: &str, n: usize, skip_verify: bool) -> anyhow::Result<Vec<f64>> {
+    bench_http2_latency_path(addr, "/", n, skip_verify)
+}
+
+fn bench_http2_latency_path(addr: &str, path: &str, n: usize, skip_verify: bool) -> anyhow::Result<Vec<f64>> {
     let tls_cfg = make_client_config_h2(skip_verify);
     let mut latencies = Vec::with_capacity(n);
     let mut client = H2Client::connect(addr, Arc::clone(&tls_cfg))?;
 
-    for _ in 0..5 { client.get()?; } // warmup
+    for _ in 0..5 { client.get(path)?; } // warmup
 
     for _ in 0..n {
         if client.requests_done >= H2_MAX_REQUESTS_PER_CONN {
             client = H2Client::connect(addr, Arc::clone(&tls_cfg))?;
         }
         let t0 = Instant::now();
-        client.get()?;
+        client.get(path)?;
         latencies.push(t0.elapsed().as_secs_f64() * 1000.0);
     }
     Ok(latencies)
@@ -390,7 +531,7 @@ fn bench_http2_throughput(addr: &str, duration_s: u64, concurrency: usize, skip_
                     if client.requests_done >= H2_MAX_REQUESTS_PER_CONN {
                         client = H2Client::connect(&addr, Arc::clone(&tls_cfg))?;
                     }
-                    match client.get() {
+                    match client.get("/") {
                         Ok(_) => { count.fetch_add(1, Ordering::Relaxed); }
                         Err(e) => { eprintln!("h2 throughput error: {e}"); }
                     }
@@ -450,10 +591,11 @@ fn h3_get(
     conn: &mut quiche::Connection,
     h3: &mut quiche::h3::Connection,
     udp: &UdpSocket,
+    path: &[u8],
 ) -> anyhow::Result<Vec<u8>> {
     let req = vec![
         quiche::h3::Header::new(b":method", b"GET"),
-        quiche::h3::Header::new(b":path", b"/"),
+        quiche::h3::Header::new(b":path", path),
         quiche::h3::Header::new(b":scheme", b"https"),
         quiche::h3::Header::new(b":authority", b"localhost"),
     ];
@@ -581,7 +723,7 @@ fn bench_http3_latency(addr: &str, n: usize, skip_verify: bool) -> anyhow::Resul
             let (c, h, u) = h3_connect(addr, &mut cfg)?;
             conn = c; h3 = h; udp = u; reqs = 0;
         }
-        let _ = h3_get(&mut conn, &mut h3, &udp);
+        let _ = h3_get(&mut conn, &mut h3, &udp, b"/");
         reqs += 1;
     }
 
@@ -591,7 +733,7 @@ fn bench_http3_latency(addr: &str, n: usize, skip_verify: bool) -> anyhow::Resul
             conn = c; h3 = h; udp = u; reqs = 0;
         }
         let t0 = Instant::now();
-        h3_get(&mut conn, &mut h3, &udp)?;
+        h3_get(&mut conn, &mut h3, &udp, b"/")?;
         latencies.push(t0.elapsed().as_secs_f64() * 1000.0);
         reqs += 1;
     }
@@ -621,7 +763,7 @@ fn bench_http3_throughput(addr: &str, duration_s: u64, concurrency: usize, skip_
                         conn = c; h3 = h; udp = u; reqs = 0;
                     }
                     reqs += 1;
-                    match h3_get(&mut conn, &mut h3, &udp) {
+                    match h3_get(&mut conn, &mut h3, &udp, b"/") {
                         Ok(_) => { count.fetch_add(1, Ordering::Relaxed); }
                         Err(e) => { eprintln!("h3 throughput error: {e}"); }
                     }
@@ -643,40 +785,54 @@ fn bench_http3_throughput(addr: &str, duration_s: u64, concurrency: usize, skip_
 // ── Result reporter ───────────────────────────────────────────────────────────
 
 struct BenchResult {
-    name:     String,
-    p0_ms:    f64,
-    p1_ms:    f64,
-    p25_ms:   f64,
-    p50_ms:   f64,
-    p75_ms:   f64,
-    p90_ms:   f64,
-    p99_ms:   f64,
-    p999_ms:  f64,
-    p100_ms:  f64,
-    rps:      f64,
+    name:       String,
+    count:      usize,
+    p0_ms:      f64,
+    p1_ms:      f64,
+    p25_ms:     f64,
+    p50_ms:     f64,
+    p75_ms:     f64,
+    p99_ms:     f64,
+    p100_ms:    f64,
+    iqr_ms:     f64,
+    range_ms:   f64,
+    avg_ms:     f64,
+    std_dev_ms: f64,
+    rps:        f64,
 }
 
 impl BenchResult {
     fn from_latencies(name: impl Into<String>, lats: Vec<f64>) -> Self {
+        let count  = lats.len();
+        let p0     = percentile(lats.clone(),   0.0);
+        let p1     = percentile(lats.clone(),   1.0);
+        let p25    = percentile(lats.clone(),  25.0);
+        let p50    = percentile(lats.clone(),  50.0);
+        let p75    = percentile(lats.clone(),  75.0);
+        let p99    = percentile(lats.clone(),  99.0);
+        let p100   = percentile(lats.clone(), 100.0);
+        let iqr    = p75 - p25;
+        let range  = p100 - p0;
+        let avg    = if count > 0 { lats.iter().sum::<f64>() / count as f64 } else { 0.0 };
+        let std_dev = if count > 1 {
+            let var = lats.iter().map(|x| (x - avg).powi(2)).sum::<f64>() / (count - 1) as f64;
+            var.sqrt()
+        } else { 0.0 };
         BenchResult {
-            name:    name.into(),
-            p0_ms:   percentile(lats.clone(),   0.0),
-            p1_ms:   percentile(lats.clone(),   1.0),
-            p25_ms:  percentile(lats.clone(),  25.0),
-            p50_ms:  percentile(lats.clone(),  50.0),
-            p75_ms:  percentile(lats.clone(),  75.0),
-            p90_ms:  percentile(lats.clone(),  90.0),
-            p99_ms:  percentile(lats.clone(),  99.0),
-            p999_ms: percentile(lats.clone(),  99.9),
-            p100_ms: percentile(lats,         100.0),
-            rps:     0.0,
+            name: name.into(), count,
+            p0_ms: p0, p1_ms: p1, p25_ms: p25, p50_ms: p50, p75_ms: p75,
+            p99_ms: p99, p100_ms: p100,
+            iqr_ms: iqr, range_ms: range, avg_ms: avg, std_dev_ms: std_dev,
+            rps: 0.0,
         }
     }
     fn from_rps(name: impl Into<String>, rps: f64) -> Self {
         BenchResult {
-            name: name.into(),
+            name: name.into(), count: 0,
             p0_ms: 0.0, p1_ms: 0.0, p25_ms: 0.0, p50_ms: 0.0, p75_ms: 0.0,
-            p90_ms: 0.0, p99_ms: 0.0, p999_ms: 0.0, p100_ms: 0.0, rps,
+            p99_ms: 0.0, p100_ms: 0.0,
+            iqr_ms: 0.0, range_ms: 0.0, avg_ms: 0.0, std_dev_ms: 0.0,
+            rps,
         }
     }
 }
@@ -686,13 +842,13 @@ fn print_result(r: &BenchResult, p99_limit: f64, rps_min: f64) -> bool {
     let rps_ok = r.rps >= rps_min || r.rps == 0.0;
     let status = if p99_ok && rps_ok { "PASS" } else { "FAIL" };
     if r.rps > 0.0 {
-        println!("{:<6} {:<24}  {:.1} req/s", status, r.name, r.rps);
+        println!("{:<6} {:<30}  {:.1} req/s", status, r.name, r.rps);
     } else {
         println!(
-            "{:<6} {:<24}  p0={:6.3}  p1={:6.3}  p25={:6.3}  p50={:6.3}  p75={:6.3}  p90={:6.3}  p99={:6.3}  p99.9={:6.3}  p100={:6.3}  (ms)",
-            status, r.name,
+            "{:<6} {:<30}  n={:<5}  p0={:7.3}  p1={:7.3}  p25={:7.3}  p50={:7.3}  p75={:7.3}  p99={:7.3}  p100={:7.3}  IQR={:7.3}  range={:7.3}  avg={:7.3}  std={:7.3}  (ms)",
+            status, r.name, r.count,
             r.p0_ms, r.p1_ms, r.p25_ms, r.p50_ms, r.p75_ms,
-            r.p90_ms, r.p99_ms, r.p999_ms, r.p100_ms
+            r.p99_ms, r.p100_ms, r.iqr_ms, r.range_ms, r.avg_ms, r.std_dev_ms
         );
     }
     if !p99_ok {
@@ -704,73 +860,185 @@ fn print_result(r: &BenchResult, p99_limit: f64, rps_min: f64) -> bool {
     p99_ok && rps_ok
 }
 
+// ── Path benchmarks (all protocols) ──────────────────────────────────────────
+//
+// Four paths × three protocols = 12 measurements.
+//
+// Paths:
+//   cache-hit→html  GET /               m6-html, Cache-Control:public (default)
+//   cache-hit→file  GET /assets/hello.txt  m6-file, Cache-Control:public
+//   cache-miss→html GET /nocache/        m6-html, cache="no-store" in config
+//   cache-miss→file GET /tail/hello.txt  m6-file tail route, no-store
+//
+// The m6-http in-memory cache is only active on the HTTP/3 path; H1 and H2
+// always forward to the backend.  Comparing the same route across protocols
+// shows the cache savings directly.
+
+const PATH_HIT_HTML:  &str = "/";
+const PATH_HIT_FILE:  &str = "/assets/hello.txt";
+const PATH_MISS_HTML: &str = "/nocache/";
+const PATH_MISS_FILE: &str = "/tail/hello.txt";
+
+// ── HTTP/1.1 path helpers ─────────────────────────────────────────────────────
+
+fn bench_h1_path_latency(addr: &str, path: &str, n: usize, tls_cfg: Arc<ClientConfig>) -> anyhow::Result<Vec<f64>> {
+    bench_http11_latency_path(addr, path, n, tls_cfg)
+}
+
+// ── HTTP/2 path helpers ───────────────────────────────────────────────────────
+
+fn bench_h2_path_latency(addr: &str, path: &str, n: usize, skip_verify: bool) -> anyhow::Result<Vec<f64>> {
+    bench_http2_latency_path(addr, path, n, skip_verify)
+}
+
+// ── HTTP/3 path helpers ───────────────────────────────────────────────────────
+
+fn bench_h3_path_latency(
+    addr: &str,
+    path: &str,
+    n: usize,
+    skip_verify: bool,
+) -> anyhow::Result<Vec<f64>> {
+    const WARMUP: usize = 5;
+    let mut cfg = make_quiche_client_config(skip_verify);
+    let mut latencies = Vec::with_capacity(n);
+    let (mut conn, mut h3, mut udp) = h3_connect(addr, &mut cfg)?;
+    let mut reqs: usize = 0;
+    let pb = path.as_bytes();
+
+    for _ in 0..WARMUP {
+        if reqs >= H3_MAX_STREAMS_PER_CONN {
+            let (c, h, u) = h3_connect(addr, &mut cfg)?;
+            conn = c; h3 = h; udp = u; reqs = 0;
+        }
+        h3_get(&mut conn, &mut h3, &udp, pb)?;
+        reqs += 1;
+    }
+    for _ in 0..n {
+        if reqs >= H3_MAX_STREAMS_PER_CONN {
+            let (c, h, u) = h3_connect(addr, &mut cfg)?;
+            conn = c; h3 = h; udp = u; reqs = 0;
+        }
+        let t0 = Instant::now();
+        h3_get(&mut conn, &mut h3, &udp, pb)?;
+        latencies.push(t0.elapsed().as_secs_f64() * 1000.0);
+        reqs += 1;
+    }
+    Ok(latencies)
+}
+
+// ── run_path_benchmarks: called for H1, H2, or H3 ────────────────────────────
+
+fn run_path_benchmarks(
+    label: &str,
+    addr: &str,
+    n: usize,
+    skip_verify: bool,
+    proto: u8,           // 1=H1, 2=H2, 3=H3
+    tls_cfg: Option<Arc<ClientConfig>>,
+    all_pass: &mut bool,
+) {
+    println!("{:-<70}", "");
+    println!("Path benchmarks — {label} (n={n}):");
+
+    let paths = [
+        ("cache-hit→m6-html",  PATH_HIT_HTML),
+        ("cache-hit→m6-file",  PATH_HIT_FILE),
+        ("cache-miss→m6-html", PATH_MISS_HTML),
+        ("cache-miss→m6-file", PATH_MISS_FILE),
+    ];
+
+    for (name, path) in paths {
+        let result = match proto {
+            1 => bench_h1_path_latency(addr, path, n, Arc::clone(tls_cfg.as_ref().unwrap())),
+            2 => bench_h2_path_latency(addr, path, n, skip_verify),
+            3 => bench_h3_path_latency(addr, path, n, skip_verify),
+            _ => unreachable!(),
+        };
+        match result {
+            Ok(lats) => { print_result(&BenchResult::from_latencies(name, lats), f64::INFINITY, 0.0); }
+            Err(e) => { eprintln!("{name} error: {e}"); *all_pass = false; }
+        }
+    }
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
 
 fn main() {
     let args = Args::parse();
     let mut all_pass = true;
 
+    let run_latency    = !args.throughput_only && !args.path_only;
+    let run_path       = !args.latency_only    && !args.throughput_only;
+    let run_throughput = !args.latency_only    && !args.path_only;
+
     println!("m6-bench  target={}  skip-verify={}  http11={}  http2={}  http3={}",
              args.addr, args.skip_verify, args.http11, args.http2, args.http3);
     println!("{:-<70}", "");
 
-    if args.http11 {
-        let tls_cfg = make_client_config(args.skip_verify);
-
-        // Latency (serial: one new TLS connection per request).
-        // HTTP/1.1 connections are driven on each epoll tick (~100ms), so
-        // serial latency is ~200ms by design.  Report the numbers but do not
-        // apply a p99 limit here.
-        match bench_http11_latency(&args.addr, args.latency_n, Arc::clone(&tls_cfg)) {
-            Ok(lats) => {
-                let r = BenchResult::from_latencies("HTTP/1.1 latency", lats);
-                print_result(&r, f64::INFINITY, 0.0);
+    // ── Latency ───────────────────────────────────────────────────────────────
+    if run_latency {
+        if args.http11 {
+            let tls_cfg = make_client_config(args.skip_verify);
+            match bench_http11_latency(&args.addr, args.latency_n, Arc::clone(&tls_cfg)) {
+                Ok(lats) => { print_result(&BenchResult::from_latencies("HTTP/1.1 latency", lats), f64::INFINITY, 0.0); }
+                Err(e)   => { eprintln!("HTTP/1.1 latency error: {e}"); all_pass = false; }
             }
-            Err(e) => { eprintln!("HTTP/1.1 latency error: {e}"); all_pass = false; }
         }
-
-        // Throughput
-        match bench_http11_throughput(&args.addr, args.duration_s, args.concurrency, Arc::clone(&tls_cfg)) {
-            Ok(rps) => {
-                if !print_result(&BenchResult::from_rps("HTTP/1.1 throughput", rps), 0.0, args.rps_min) { all_pass = false; }
+        if args.http2 {
+            match bench_http2_latency(&args.addr, args.latency_n, args.skip_verify) {
+                Ok(lats) => { if !print_result(&BenchResult::from_latencies("HTTP/2 latency", lats), args.p99_limit_ms, 0.0) { all_pass = false; } }
+                Err(e)   => { eprintln!("HTTP/2 latency error: {e}"); all_pass = false; }
             }
-            Err(e) => { eprintln!("HTTP/1.1 throughput error: {e}"); all_pass = false; }
         }
-    }
-
-    if args.http2 {
-        match bench_http2_latency(&args.addr, args.latency_n, args.skip_verify) {
-            Ok(lats) => {
-                let r = BenchResult::from_latencies("HTTP/2 latency", lats);
-                if !print_result(&r, args.p99_limit_ms, 0.0) { all_pass = false; }
+        if args.http3 {
+            match bench_http3_latency(&args.addr, args.latency_n, args.skip_verify) {
+                Ok(lats) => { if !print_result(&BenchResult::from_latencies("HTTP/3 latency", lats), args.p99_limit_ms, 0.0) { all_pass = false; } }
+                Err(e)   => { eprintln!("HTTP/3 latency error: {e}"); all_pass = false; }
             }
-            Err(e) => { eprintln!("HTTP/2 latency error: {e}"); all_pass = false; }
-        }
-
-        match bench_http2_throughput(&args.addr, args.duration_s, args.concurrency, args.skip_verify) {
-            Ok(rps) => {
-                if !print_result(&BenchResult::from_rps("HTTP/2 throughput", rps), 0.0, args.rps_min) { all_pass = false; }
-            }
-            Err(e) => { eprintln!("HTTP/2 throughput error: {e}"); all_pass = false; }
         }
     }
 
-    if args.http3 {
-        // Latency
-        match bench_http3_latency(&args.addr, args.latency_n, args.skip_verify) {
-            Ok(lats) => {
-                let r = BenchResult::from_latencies("HTTP/3 latency", lats);
-                if !print_result(&r, args.p99_limit_ms, 0.0) { all_pass = false; }
-            }
-            Err(e) => { eprintln!("HTTP/3 latency error: {e}"); all_pass = false; }
+    // ── Path benchmarks ───────────────────────────────────────────────────────
+    // bench.sh restarts the server before each suite, so no stale-connection
+    // contamination.  Each protocol invocation is an independent fresh run.
+    if run_path {
+        if args.http11 {
+            let tls_cfg = make_client_config(args.skip_verify);
+            run_path_benchmarks("HTTP/1.1", &args.addr, args.latency_n,
+                args.skip_verify, 1, Some(Arc::clone(&tls_cfg)), &mut all_pass);
         }
+        if args.http2 {
+            run_path_benchmarks("HTTP/2", &args.addr, args.latency_n,
+                args.skip_verify, 2, None, &mut all_pass);
+        }
+        if args.http3 {
+            run_path_benchmarks("HTTP/3", &args.addr, args.latency_n,
+                args.skip_verify, 3, None, &mut all_pass);
+        }
+    }
 
-        // Throughput
-        match bench_http3_throughput(&args.addr, args.duration_s, args.concurrency, args.skip_verify) {
-            Ok(rps) => {
-                if !print_result(&BenchResult::from_rps("HTTP/3 throughput", rps), 0.0, args.rps_min) { all_pass = false; }
+    // ── Throughput ────────────────────────────────────────────────────────────
+    if run_throughput {
+        println!("{:-<70}", "");
+        if args.http11 {
+            let tls_cfg = make_client_config(args.skip_verify);
+            match bench_http11_throughput(&args.addr, args.duration_s, args.concurrency, Arc::clone(&tls_cfg)) {
+                Ok(rps) => { if !print_result(&BenchResult::from_rps("HTTP/1.1 throughput", rps), 0.0, args.rps_min) { all_pass = false; } }
+                Err(e)  => { eprintln!("HTTP/1.1 throughput error: {e}"); all_pass = false; }
             }
-            Err(e) => { eprintln!("HTTP/3 throughput error: {e}"); all_pass = false; }
+        }
+        if args.http2 {
+            match bench_http2_throughput(&args.addr, args.duration_s, args.concurrency, args.skip_verify) {
+                Ok(rps) => { if !print_result(&BenchResult::from_rps("HTTP/2 throughput", rps), 0.0, args.rps_min) { all_pass = false; } }
+                Err(e)  => { eprintln!("HTTP/2 throughput error: {e}"); all_pass = false; }
+            }
+        }
+        if args.http3 {
+            match bench_http3_throughput(&args.addr, args.duration_s, args.concurrency, args.skip_verify) {
+                Ok(rps) => { if !print_result(&BenchResult::from_rps("HTTP/3 throughput", rps), 0.0, args.rps_min) { all_pass = false; } }
+                Err(e)  => { eprintln!("HTTP/3 throughput error: {e}"); all_pass = false; }
+            }
         }
     }
 
