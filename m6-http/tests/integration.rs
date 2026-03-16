@@ -14,7 +14,10 @@ use std::time::Duration;
 
 use m6_http_lib::http11::{Http11Listener, make_tls_server_config};
 use m6_http_lib::forward::HttpRequest;
+use m6_http_lib::poller::{Poller, Token};
 use quiche::h3::NameValue as _;
+
+const TOKEN_TCP: Token = Token(1);
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -78,9 +81,10 @@ where
     let stop2 = Arc::clone(&stop);
 
     thread::spawn(move || {
+        let poller = Poller::new().expect("poller");
         while !stop2.load(Ordering::Relaxed) {
-            listener.accept_pending();
-            listener.drive_all(|req, client_ip| handler(req, client_ip));
+            listener.accept_pending(&poller, TOKEN_TCP);
+            listener.drive_all(|req, client_ip| handler(req, client_ip), &poller);
             thread::sleep(Duration::from_millis(2));
         }
     });
@@ -210,6 +214,177 @@ fn http11_version_field_is_http11() {
     stop.store(true, Ordering::Relaxed);
 
     assert!(response_str.ends_with("HTTP/1.1"), "expected version=HTTP/1.1 in body, got: {}", response_str);
+}
+
+// ── HTTP/2 Tests ──────────────────────────────────────────────────────────────
+//
+// Spins up Http11Listener (with ALPN h2) in-process, connects with a rustls
+// client that advertises h2, then manually exchanges H2 frames using the binary
+// framing layer (no external h2 crate needed).
+
+/// Build a rustls ClientConfig that trusts the given DER cert and advertises h2.
+fn make_h2_client_config(cert_der: &[u8]) -> Arc<rustls::ClientConfig> {
+    let cert = rustls::pki_types::CertificateDer::from(cert_der.to_vec());
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.add(cert).expect("add test cert");
+    let mut cfg = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    cfg.alpn_protocols = vec![b"h2".to_vec()];
+    Arc::new(cfg)
+}
+
+fn h2_frame(ftype: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
+    let len = payload.len();
+    let mut f = Vec::with_capacity(9 + len);
+    f.push((len >> 16) as u8);
+    f.push((len >> 8)  as u8);
+    f.push(len         as u8);
+    f.push(ftype);
+    f.push(flags);
+    f.extend_from_slice(&(stream_id & 0x7fff_ffff).to_be_bytes());
+    f.extend_from_slice(payload);
+    f
+}
+
+/// Parse frames from `buf` starting at `pos`. Returns `(frame_type, flags, stream_id, payload, new_pos)`.
+fn next_h2_frame(buf: &[u8], pos: usize) -> Option<(u8, u8, u32, Vec<u8>, usize)> {
+    if buf.len() < pos + 9 { return None; }
+    let length = ((buf[pos] as usize) << 16)
+               | ((buf[pos+1] as usize) << 8)
+               |  (buf[pos+2] as usize);
+    let ftype     = buf[pos+3];
+    let flags     = buf[pos+4];
+    let stream_id = u32::from_be_bytes(buf[pos+5..pos+9].try_into().unwrap()) & 0x7fff_ffff;
+    let end = pos + 9 + length;
+    if buf.len() < end { return None; }
+    Some((ftype, flags, stream_id, buf[pos+9..end].to_vec(), end))
+}
+
+// HPACK-encoded request headers for GET / https localhost using the static table:
+//   :method GET    → 0x82  (indexed, static entry 2)
+//   :path /        → 0x84  (indexed, static entry 4)
+//   :scheme https  → 0x87  (indexed, static entry 7)
+//   :authority     → 0x41 0x09 "localhost"  (literal+index, static entry 1)
+const H2_REQUEST_HEADERS: &[u8] = &[
+    0x82, 0x84, 0x87,
+    0x41, 0x09, b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
+];
+const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+#[test]
+fn http2_get_returns_200_with_body() {
+    let tc = generate_test_cert();
+    let (cert_file, key_file) = write_pem_files(&tc);
+    let client_cfg = make_h2_client_config(&tc.cert_der);
+
+    let (port, stop) = start_http11_server(
+        cert_file.path().to_str().unwrap(),
+        key_file.path().to_str().unwrap(),
+        |_req, _ip| {
+            (200,
+             vec![("content-type".to_string(), "text/plain".to_string())],
+             b"hello h2".to_vec(),
+             "test".to_string())
+        },
+    );
+    thread::sleep(Duration::from_millis(20));
+
+    let stream = TcpStream::connect(format!("127.0.0.1:{}", port)).expect("tcp connect");
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap().to_owned();
+    let mut conn = rustls::ClientConnection::new(client_cfg, server_name).unwrap();
+    let mut stream_ref = &stream;
+    let mut tls = rustls::Stream::new(&mut conn, &mut stream_ref);
+
+    // Send: client connection preface + empty SETTINGS + HEADERS(stream=1, GET /) + GOAWAY
+    const FLAG_END_STREAM:  u8 = 0x1;
+    const FLAG_END_HEADERS: u8 = 0x4;
+    tls.write_all(H2_PREFACE).unwrap();
+    tls.write_all(&h2_frame(0x4, 0x0, 0, &[])).unwrap();  // empty SETTINGS
+    tls.write_all(&h2_frame(0x1, FLAG_END_STREAM | FLAG_END_HEADERS, 1, H2_REQUEST_HEADERS)).unwrap();
+    // GOAWAY so server closes after responding (last_stream_id=1, error=NO_ERROR)
+    let goaway_payload = [0x00, 0x00, 0x00, 0x01,  0x00, 0x00, 0x00, 0x00];
+    tls.write_all(&h2_frame(0x7, 0x0, 0, &goaway_payload)).unwrap();
+    tls.flush().ok();
+
+    // Read until EOF (server will close after handling our GOAWAY).
+    let mut raw = Vec::new();
+    let _ = tls.read_to_end(&mut raw);
+
+    stop.store(true, Ordering::Relaxed);
+
+    // Walk frames; verify :status 200 in HEADERS and "hello h2" in DATA.
+    // Server sends server-SETTINGS, SETTINGS-ACK, response-HEADERS, response-DATA.
+    // `:status 200` is HPACK static entry 8 → encoded as 0x88.
+    let mut pos = 0;
+    let mut got_200  = false;
+    let mut got_body = false;
+    let mut body_bytes = Vec::new();
+    while let Some((ftype, _flags, _sid, payload, next)) = next_h2_frame(&raw, pos) {
+        pos = next;
+        match ftype {
+            0x1 => { // HEADERS: check for 0x88 = :status 200
+                if payload.contains(&0x88u8) { got_200 = true; }
+            }
+            0x0 => { // DATA
+                body_bytes.extend_from_slice(&payload);
+                if body_bytes.windows(8).any(|w| w == b"hello h2") { got_body = true; }
+            }
+            _ => {}
+        }
+    }
+
+    assert!(got_200,  "expected :status 200 (0x88) in response HEADERS; raw={:?}", &raw[..raw.len().min(64)]);
+    assert!(got_body, "expected body 'hello h2'; got {:?}", String::from_utf8_lossy(&body_bytes));
+}
+
+#[test]
+fn http2_version_field_is_http2() {
+    let tc = generate_test_cert();
+    let (cert_file, key_file) = write_pem_files(&tc);
+    let client_cfg = make_h2_client_config(&tc.cert_der);
+
+    let (port, stop) = start_http11_server(
+        cert_file.path().to_str().unwrap(),
+        key_file.path().to_str().unwrap(),
+        |req, _ip| {
+            let body = req.version.clone().into_bytes();
+            (200, vec![], body, "test".to_string())
+        },
+    );
+    thread::sleep(Duration::from_millis(20));
+
+    let stream = TcpStream::connect(format!("127.0.0.1:{}", port)).expect("tcp connect");
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap().to_owned();
+    let mut conn = rustls::ClientConnection::new(client_cfg, server_name).unwrap();
+    let mut stream_ref = &stream;
+    let mut tls = rustls::Stream::new(&mut conn, &mut stream_ref);
+
+    const FLAG_END_STREAM:  u8 = 0x1;
+    const FLAG_END_HEADERS: u8 = 0x4;
+    tls.write_all(H2_PREFACE).unwrap();
+    tls.write_all(&h2_frame(0x4, 0x0, 0, &[])).unwrap();
+    tls.write_all(&h2_frame(0x1, FLAG_END_STREAM | FLAG_END_HEADERS, 1, H2_REQUEST_HEADERS)).unwrap();
+    let goaway_payload = [0x00, 0x00, 0x00, 0x01,  0x00, 0x00, 0x00, 0x00];
+    tls.write_all(&h2_frame(0x7, 0x0, 0, &goaway_payload)).unwrap();
+    tls.flush().ok();
+
+    let mut raw = Vec::new();
+    let _ = tls.read_to_end(&mut raw);
+
+    stop.store(true, Ordering::Relaxed);
+
+    let mut body_bytes = Vec::new();
+    let mut pos = 0;
+    while let Some((ftype, _flags, _sid, payload, next)) = next_h2_frame(&raw, pos) {
+        pos = next;
+        if ftype == 0x0 { body_bytes.extend_from_slice(&payload); }
+    }
+    assert_eq!(body_bytes, b"HTTP/2", "expected version HTTP/2 in body, got {:?}", String::from_utf8_lossy(&body_bytes));
 }
 
 // ── HTTP/3 Tests ──────────────────────────────────────────────────────────────

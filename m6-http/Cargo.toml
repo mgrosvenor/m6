@@ -32,6 +32,7 @@ bytes          = "1"
 base64         = "0.22"
 sha2           = "0.10"
 httparse       = "1"
+hpack          = "0.3"
 ahash          = "0.8"
 libc           = "0.2"
 nix            = { version = "0.27", features = ["signal"] }
@@ -49,6 +50,9 @@ tempfile  = "3"
 anyhow    = "1"
 criterion = { version = "0.5", features = ["html_reports"] }
 rcgen     = "0.13"
+h2        = "0.4"
+tokio     = { version = "1", features = ["rt", "net", "io-util", "macros"] }
+http      = "1"
 
 [[bench]]
 name    = "critical_path"
