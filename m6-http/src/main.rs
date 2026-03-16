@@ -15,6 +15,7 @@ use std::time::Instant;
 use anyhow::Context;
 use bytes::Bytes;
 use quiche::h3::NameValue;
+use rand::{thread_rng, RngCore};
 use tracing::{debug, error, info, warn};
 
 use m6_http_lib::auth;
@@ -178,6 +179,13 @@ fn event_loop(
     };
 
     let mut connections: HashMap<Vec<u8>, QuicConn> = HashMap::new();
+    // Maps the client's original Initial DCID (may be shorter than MAX_CONN_ID_LEN)
+    // to the 20-byte SCID under which the connection is stored.  Needed because
+    // quiche generates a 16-byte random Initial DCID on the client side, but
+    // Header::from_slice for short-header 1-RTT packets always reads MAX_CONN_ID_LEN
+    // (20) bytes.  Using a fresh 20-byte server SCID ensures all subsequent packets
+    // (Handshake + 1-RTT) carry a 20-byte DCID that matches the stored key.
+    let mut conn_id_map: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
     let mut recv_buf = vec![0u8; 65536];
     let mut ev_buf = [Token(0); 64];
 
@@ -227,13 +235,14 @@ fn event_loop(
                         &udp,
                         &mut recv_buf,
                         &mut connections,
+                        &mut conn_id_map,
                         quiche_config,
                         state,
                     );
                 }
                 TOKEN_TCP => {
                     if let Some(ref mut t) = tcp {
-                        t.accept_pending();
+                        t.accept_pending(&poller, TOKEN_TCP);
                     }
                 }
                 TOKEN_INOTIFY => {
@@ -247,7 +256,8 @@ fn event_loop(
             }
         }
 
-        // Drive HTTP/1.1 connections (runs every tick regardless of which fd fired)
+        // Drive HTTP/1.1 connections. Per-connection fds are registered with TOKEN_TCP
+        // so this also runs on data-ready events, not only on the periodic tick.
         if let Some(ref mut t) = tcp {
             t.drive_all(|req, client_ip| {
                 let enc_str = req.headers
@@ -271,7 +281,7 @@ fn event_loop(
                     "request complete"
                 );
                 (status, headers, body, backend_name)
-            });
+            }, &poller);
         }
 
         // Drive connection timeouts and flush pending sends
@@ -302,6 +312,7 @@ fn drain_udp(
     udp: &UdpSocket,
     recv_buf: &mut Vec<u8>,
     connections: &mut HashMap<Vec<u8>, QuicConn>,
+    conn_id_map: &mut HashMap<Vec<u8>, Vec<u8>>,
     quiche_config: &mut quiche::Config,
     state: &mut ServerState,
 ) {
@@ -335,14 +346,20 @@ fn drain_udp(
 
         let conn_id = hdr.dcid.to_vec();
 
-        // Get or create connection
-        if !connections.contains_key(&conn_id) {
-            if hdr.ty != quiche::Type::Initial {
-                debug!("non-initial packet for unknown conn");
-                continue;
-            }
-            // New connection
-            let scid = quiche::ConnectionId::from_ref(&conn_id);
+        // Resolve the stored map key: direct hit, alias, or new connection.
+        // quiche::connect() generates a 16-byte Initial DCID.  The server stores
+        // connections under a fresh 20-byte SCID so that 1-RTT short-header
+        // packets (parsed with MAX_CONN_ID_LEN=20) always match the stored key.
+        let key: Vec<u8> = if connections.contains_key(&conn_id) {
+            conn_id.clone()
+        } else if let Some(k) = conn_id_map.get(&conn_id) {
+            k.clone()
+        } else if hdr.ty == quiche::Type::Initial {
+            // New connection: generate a fresh 20-byte SCID.
+            let mut scid_bytes = [0u8; quiche::MAX_CONN_ID_LEN];
+            rand::thread_rng().fill_bytes(&mut scid_bytes);
+            let key = scid_bytes.to_vec();
+            let scid = quiche::ConnectionId::from_vec(key.clone());
             let conn = match quiche::accept(&scid, None, local, from, quiche_config) {
                 Ok(c) => c,
                 Err(e) => {
@@ -351,7 +368,7 @@ fn drain_udp(
                 }
             };
             connections.insert(
-                conn_id.clone(),
+                key.clone(),
                 QuicConn {
                     conn,
                     h3_conn: None,
@@ -361,9 +378,17 @@ fn drain_udp(
                     last_active: Instant::now(),
                 },
             );
-        }
+            // Alias the client's Initial DCID → our 20-byte key for retransmits.
+            if conn_id != key {
+                conn_id_map.insert(conn_id.clone(), key.clone());
+            }
+            key
+        } else {
+            debug!("non-initial packet for unknown conn");
+            continue;
+        };
 
-        let qconn = match connections.get_mut(&conn_id) {
+        let qconn = match connections.get_mut(&key) {
             Some(c) => c,
             None => continue,
         };

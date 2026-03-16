@@ -21,6 +21,7 @@ use rustls::ServerConnection;
 use tracing::warn;
 
 use crate::forward::HttpRequest;
+use crate::poller::{Poller, Token};
 
 // ── Connection state machine ──────────────────────────────────────────────────
 
@@ -66,7 +67,10 @@ impl Http11Listener {
     }
 
     /// Call when the listener fd is readable — drain all pending `accept()` calls.
-    pub fn accept_pending(&mut self) {
+    /// Each new connection fd is registered with `poller` using `token` so that
+    /// incoming data wakes the event loop immediately instead of waiting for the
+    /// next tick.
+    pub fn accept_pending(&mut self, poller: &Poller, token: Token) {
         loop {
             match self.listener.accept() {
                 Ok((stream, peer)) => {
@@ -74,17 +78,29 @@ impl Http11Listener {
                         warn!("http11 set_nonblocking: {e}");
                         continue;
                     }
+                    // Disable Nagle: TLS handshake writes are small and must
+                    // not be coalesced with subsequent data.
+                    stream.set_nodelay(true).ok();
                     let tls = match ServerConnection::new(Arc::clone(&self.tls_config)) {
                         Ok(t) => t,
                         Err(e) => { warn!("http11 ServerConnection::new: {e}"); continue; }
                     };
-                    self.conns.push(Conn {
+                    poller.add(stream.as_raw_fd(), token).ok();
+                    let mut conn = Conn {
                         stream,
                         tls,
                         state: State::Handshake,
                         client_ip: peer.ip().to_string(),
                         created: Instant::now(),
-                    });
+                    };
+                    // Eagerly start the TLS handshake: on loopback the
+                    // ClientHello is already in the kernel buffer at accept
+                    // time, so we can send ServerHello immediately rather
+                    // than waiting for the next drive_all() tick.
+                    if advance_tls_io(&mut conn).is_ok() && !conn.tls.is_handshaking() {
+                        conn.state = State::Reading { buf: Vec::new() };
+                    }
+                    self.conns.push(conn);
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => { warn!("http11 accept: {e}"); break; }
@@ -94,7 +110,8 @@ impl Http11Listener {
 
     /// Drive all active connections one step forward.
     /// `on_request(req, client_ip) -> (status, headers, body, backend_name)`
-    pub fn drive_all<F>(&mut self, mut on_request: F)
+    /// Done connections are deregistered from `poller` before being dropped.
+    pub fn drive_all<F>(&mut self, mut on_request: F, poller: &Poller)
     where
         F: FnMut(&HttpRequest, &str) -> (u16, Vec<(String, String)>, Vec<u8>, String),
     {
@@ -109,6 +126,11 @@ impl Http11Listener {
             drive_conn(conn, &mut on_request);
         }
 
+        for conn in &self.conns {
+            if matches!(conn.state, State::Done) {
+                poller.delete(conn.stream.as_raw_fd()).ok();
+            }
+        }
         self.conns.retain(|c| !matches!(c.state, State::Done));
     }
 }
