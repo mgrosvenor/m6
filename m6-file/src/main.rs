@@ -10,10 +10,24 @@ use handler::{handle_request, HandlerContext};
 use http::Request;
 use route::Route;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, RwLock};
 use tracing::{debug, error, info, warn};
+
+// ---------------------------------------------------------------------------
+// Shared hot-reload state
+// ---------------------------------------------------------------------------
+
+struct FileState {
+    config: Arc<Config>,
+    routes: Arc<Vec<Route>>,
+}
+
+// ---------------------------------------------------------------------------
+// main / run
+// ---------------------------------------------------------------------------
 
 fn main() {
     let code = run();
@@ -146,6 +160,11 @@ fn run() -> i32 {
         warn!(error = %e, "failed to set socket permissions");
     }
 
+    if let Err(e) = listener.set_nonblocking(true) {
+        error!(error = %e, "failed to set listener non-blocking");
+        return 1;
+    }
+
     info!(socket = %socket_path.display(), "listening on Unix socket");
 
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -165,8 +184,12 @@ fn run() -> i32 {
 
     info!(threads = pool_size, "thread pool configured");
 
-    let routes = Arc::new(routes);
-    let config = Arc::new(config);
+    // Wrap shared hot-reload state in an RwLock.
+    let shared = Arc::new(RwLock::new(FileState {
+        config: Arc::new(config),
+        routes: Arc::new(routes),
+    }));
+
     let site_dir = Arc::new(site_dir);
 
     // In-flight counter for graceful drain: incremented before handing off a
@@ -178,8 +201,7 @@ fn run() -> i32 {
 
     for _ in 0..pool_size {
         let rx = Arc::clone(&rx);
-        let routes = Arc::clone(&routes);
-        let config = Arc::clone(&config);
+        let shared = Arc::clone(&shared);
         let site_dir = Arc::clone(&site_dir);
         let in_flight = Arc::clone(&in_flight);
 
@@ -189,29 +211,148 @@ fn run() -> i32 {
                     Ok(s) => s,
                     Err(_) => break,
                 };
+                // Acquire read lock only long enough to clone the two inner Arcs.
+                let (config, routes) = {
+                    let guard = shared.read().unwrap();
+                    (Arc::clone(&guard.config), Arc::clone(&guard.routes))
+                };
                 if let Err(e) = handle_connection(stream, &routes, &config, &site_dir) {
-                    debug!(error = %e, "connection error");
+                    debug!("connection error: {:#}", e);
                 }
                 in_flight.fetch_sub(1, Ordering::SeqCst);
             }
         });
     }
 
-    for stream in listener.incoming() {
+    // ── Hot-reload setup ──────────────────────────────────────────────────
+    let mut watcher = m6_core::ConfigWatcher::new(
+        &[&config_path, &site_dir.join("site.toml")]
+    ).ok();
+
+    // Mtime fallback: used when watcher.raw_fd() is None.
+    let mut last_config_mtime = std::fs::metadata(&config_path)
+        .and_then(|m| m.modified())
+        .ok();
+    // Countdown so we only check mtime every ~10 poll timeouts (≈1 s).
+    let mut reload_countdown: u32 = 10;
+
+    let listener_fd = listener.as_raw_fd();
+
+    // ── poll(2) accept + hot-reload loop ─────────────────────────────────
+    loop {
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
-        let stream = match stream {
-            Ok(s) => s,
-            Err(e) => {
-                if shutdown.load(Ordering::Relaxed) { break; }
-                error!(error = %e, "accept error");
-                continue;
-            }
+
+        let borrowed_listener =
+            unsafe { std::os::fd::BorrowedFd::borrow_raw(listener_fd) };
+        let mut pfd_listener = nix::poll::PollFd::new(
+            &borrowed_listener,
+            nix::poll::PollFlags::POLLIN,
+        );
+
+        let watcher_fd = watcher.as_ref().and_then(|w| w.raw_fd());
+
+        let (poll_result, listener_ready, watcher_fired) = if let Some(wfd) = watcher_fd {
+            let borrowed_w = unsafe { std::os::fd::BorrowedFd::borrow_raw(wfd) };
+            let pfd_w = nix::poll::PollFd::new(
+                &borrowed_w,
+                nix::poll::PollFlags::POLLIN,
+            );
+            let mut fds = [pfd_listener, pfd_w];
+            let r = nix::poll::poll(&mut fds, 100);
+            let l = fds[0]
+                .revents()
+                .map_or(false, |f| f.contains(nix::poll::PollFlags::POLLIN));
+            let w = fds[1]
+                .revents()
+                .map_or(false, |f| f.contains(nix::poll::PollFlags::POLLIN));
+            (r, l, w)
+        } else {
+            let r = nix::poll::poll(std::slice::from_mut(&mut pfd_listener), 100);
+            let l = pfd_listener
+                .revents()
+                .map_or(false, |f| f.contains(nix::poll::PollFlags::POLLIN));
+            (r, l, false)
         };
-        in_flight.fetch_add(1, Ordering::SeqCst);
-        if tx.send(stream).is_err() {
-            in_flight.fetch_sub(1, Ordering::SeqCst);
+
+        // ── Determine whether a reload is needed ─────────────────────────
+        let mut should_reload = false;
+
+        match poll_result {
+            Ok(0) | Err(_) => {
+                // Timeout or interrupted — check shutdown flag.
+                if shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+                // Mtime fallback: check every ~10 timeouts (≈1 s) when no watcher fd.
+                if watcher_fd.is_none() {
+                    reload_countdown = reload_countdown.saturating_sub(1);
+                    if reload_countdown == 0 {
+                        reload_countdown = 10;
+                        let new_mtime = std::fs::metadata(&config_path)
+                            .and_then(|m| m.modified())
+                            .ok();
+                        if new_mtime != last_config_mtime {
+                            last_config_mtime = new_mtime;
+                            should_reload = true;
+                        }
+                    }
+                }
+                if !should_reload {
+                    continue;
+                }
+            }
+            Ok(_) => {}
+        }
+
+        // Watcher fd fired — drain events and check for our config file.
+        if watcher_fired {
+            if let Some(ref mut w) = watcher {
+                let config_filename = config_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("");
+                should_reload = w.read_events(&[config_filename, "site.toml"]);
+            }
+        }
+
+        // ── Hot reload ────────────────────────────────────────────────────
+        if should_reload {
+            handle_reload(&config_path, &shared);
+        }
+
+        if !listener_ready {
+            continue;
+        }
+
+        // Drain all ready connections (non-blocking accept loop).
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    // On BSD/macOS, accepted sockets inherit O_NONBLOCK from the
+                    // listener.  Reset to blocking mode; our handlers use blocking I/O.
+                    if let Err(e) = stream.set_nonblocking(false) {
+                        warn!(error = %e, "failed to set accepted socket to blocking mode");
+                    }
+                    in_flight.fetch_add(1, Ordering::SeqCst);
+                    if tx.send(stream).is_err() {
+                        in_flight.fetch_sub(1, Ordering::SeqCst);
+                        break;
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => {
+                    if shutdown.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    error!(error = %e, "accept error");
+                    break;
+                }
+            }
+        }
+
+        if shutdown.load(Ordering::Relaxed) {
             break;
         }
     }
@@ -232,6 +373,29 @@ fn run() -> i32 {
     info!("m6-file shutdown complete");
     0
 }
+
+// ---------------------------------------------------------------------------
+// Hot-reload helper
+// ---------------------------------------------------------------------------
+
+fn handle_reload(config_path: &Path, shared: &RwLock<FileState>) {
+    match Config::load(config_path) {
+        Ok(new_config) => {
+            let mut new_routes: Vec<Route> =
+                new_config.route.iter().map(Route::from_config).collect();
+            route::sort_routes(&mut new_routes);
+            let mut w = shared.write().unwrap();
+            w.config = Arc::new(new_config);
+            w.routes = Arc::new(new_routes);
+            info!("config reloaded");
+        }
+        Err(e) => warn!(error = %e, "config reload failed, keeping current config"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Connection handler
+// ---------------------------------------------------------------------------
 
 fn handle_connection(
     mut stream: std::os::unix::net::UnixStream,
@@ -259,6 +423,10 @@ fn handle_connection(
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Signal handling
+// ---------------------------------------------------------------------------
 
 fn setup_signal_handlers(
     shutdown: Arc<AtomicBool>,
@@ -294,6 +462,10 @@ fn setup_signal_handlers(
         }
     });
 }
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 fn num_cpus() -> usize {
     match std::thread::available_parallelism() {

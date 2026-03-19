@@ -1,0 +1,18 @@
+[package]
+name    = "m6-md"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "m6-md"
+
+[dependencies]
+comrak     = { version = "0.21", default-features = false, features = ["shortcodes"] }
+toml       = "0.8"
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow     = "1"
+ctrlc      = "3"
+notify     = "6"
+tracing    = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }

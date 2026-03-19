@@ -17,6 +17,8 @@ pub struct RouteConfig {
     /// "public" | "no-store"
     pub cache: String,
     pub methods: Option<Vec<String>>,
+    /// Extra response headers as `[[key, value]]` pairs.
+    pub headers: Vec<(String, String)>,
 }
 
 /// Thread-pool configuration parsed from `[thread_pool]`.
@@ -72,6 +74,18 @@ pub struct RendererConfig {
 pub struct MinificationConfig {
     /// Which MIME types have minification enabled.
     pub enabled: std::collections::HashMap<String, bool>,
+    /// Whether to minify inline `<script>` blocks inside HTML responses.
+    ///
+    /// Defaults to `false`. The `minify-html` JS engine parses scripts as
+    /// ES modules (`TopLevelMode::Module`), which has different scoping
+    /// semantics from classic scripts and can silently corrupt valid inline
+    /// JS (e.g. rewriting string `'\n'` as template literal `'\\n'`,
+    /// making `var`-declared functions inaccessible from `onclick` attributes,
+    /// etc.). Enable only if all inline scripts in your templates are written
+    /// as self-contained ES modules.
+    ///
+    /// Set in config with `[minification] inline_js = true`.
+    pub inline_js: bool,
 }
 
 impl MinificationConfig {
@@ -86,11 +100,11 @@ fn default_minification() -> MinificationConfig {
     m.insert("text/html".to_string(), true);
     m.insert("text/css".to_string(), true);
     m.insert("application/json".to_string(), true);
-    // JS: on by default — parse-js engine handles modern ES syntax.
-    // Falls back to original bytes on parse failure.
+    // JS files: on by default — parse-js engine handles modern ES syntax
+    // and falls back to original bytes on parse failure.
     m.insert("application/javascript".to_string(), true);
     m.insert("text/javascript".to_string(), true);
-    MinificationConfig { enabled: m }
+    MinificationConfig { enabled: m, inline_js: false }
 }
 
 /// Framework-consumed top-level keys that must not appear in the request dict.
@@ -217,9 +231,12 @@ fn parse_config(tv: toml::Value, _site_dir: &Path) -> anyhow::Result<RendererCon
     // --- minification ---
     let mut minification = default_minification();
     if let Some(toml::Value::Table(tbl)) = tv.get("minification") {
-        for (mime, val) in tbl {
-            let enabled = val.as_bool().unwrap_or(false);
-            minification.enabled.insert(mime.clone(), enabled);
+        for (key, val) in tbl {
+            if key == "inline_js" {
+                minification.inline_js = val.as_bool().unwrap_or(false);
+            } else {
+                minification.enabled.insert(key.clone(), val.as_bool().unwrap_or(false));
+            }
         }
     }
 
@@ -303,7 +320,22 @@ fn parse_routes(val: Option<&toml::Value>) -> anyhow::Result<Vec<RouteConfig>> {
                 .collect()
         });
 
-        routes.push(RouteConfig { path, template, params, status, cache, methods });
+        let headers: Vec<(String, String)> = item
+            .get("headers")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|pair| {
+                        let a = pair.as_array()?;
+                        let k = a.first()?.as_str()?.to_string();
+                        let v = a.get(1)?.as_str()?.to_string();
+                        Some((k, v))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        routes.push(RouteConfig { path, template, params, status, cache, methods, headers });
     }
 
     Ok(routes)

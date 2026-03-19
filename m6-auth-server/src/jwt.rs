@@ -43,17 +43,22 @@ pub struct JwtEngine {
 
 impl JwtEngine {
     /// Create a new JwtEngine, detecting algorithm from the PEM content.
+    ///
+    /// Supports PKCS8 EC keys ("PRIVATE KEY" tag, as produced by
+    /// `openssl genpkey -algorithm EC`) and RSA keys. SEC1 "EC PRIVATE KEY"
+    /// is not supported by the jsonwebtoken crate (which requires PKCS8).
     pub fn new(private_pem: &str, public_pem: &str, issuer: String) -> Result<Self> {
-        // Detect algorithm by content
-        let is_ec = private_pem.contains("EC PRIVATE KEY") || private_pem.contains("EC PARAMETERS");
-        let algorithm = if is_ec { KeyAlgo::Es256 } else { KeyAlgo::Rs256 };
-
-        let encoding = match algorithm {
-            KeyAlgo::Es256 => EncodingKey::from_ec_pem(private_pem.as_bytes())
-                .map_err(|e| anyhow!("invalid EC private key: {}", e))?,
-            KeyAlgo::Rs256 => EncodingKey::from_rsa_pem(private_pem.as_bytes())
-                .map_err(|e| anyhow!("invalid RSA private key: {}", e))?,
-        };
+        // Try EC first; fall back to RSA. jsonwebtoken v9 requires PKCS8
+        // format for EC keys ("PRIVATE KEY" tag), so we cannot rely on
+        // "EC PRIVATE KEY" detection.
+        let (encoding, algorithm) =
+            if let Ok(k) = EncodingKey::from_ec_pem(private_pem.as_bytes()) {
+                (k, KeyAlgo::Es256)
+            } else {
+                let k = EncodingKey::from_rsa_pem(private_pem.as_bytes())
+                    .map_err(|e| anyhow!("invalid private key (tried EC and RSA): {}", e))?;
+                (k, KeyAlgo::Rs256)
+            };
 
         let decoding = match algorithm {
             KeyAlgo::Es256 => DecodingKey::from_ec_pem(public_pem.as_bytes())

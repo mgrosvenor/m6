@@ -8,5 +8,6 @@ members = [
     "m6-http",
     "m6-html",
     "m6-auth-server",
+    "m6-md",
 ]
 resolver = "2"

@@ -1480,7 +1480,7 @@ fn run_app_with_shutdown(
     let framework_state =
         FrameworkState::build(config, site_dir.clone(), &code_route_signatures)
             .unwrap_or_else(|e| {
-                eprintln!("Startup error: {e}");
+                eprintln!("Startup error: {e:#}");
                 std::process::exit(2);
             });
 
@@ -1854,7 +1854,7 @@ fn handle_connection(
 
         if minification.is_enabled(mime) {
             resp.body = match mime {
-                "text/html" => crate::minify::minify_html(&resp.body),
+                "text/html" => crate::minify::minify_html(&resp.body, minification.inline_js),
                 "text/css" => crate::minify::minify_css(&resp.body),
                 "application/json" => crate::minify::minify_json(&resp.body),
                 "application/javascript" | "text/javascript" => crate::minify::minify_js(&resp.body),
@@ -2066,14 +2066,18 @@ mod tests {
         use tempfile::NamedTempFile;
         use std::sync::RwLock;
 
+        let site_dir = tempfile::TempDir::new().unwrap();
+        // Create a minimal templates directory so Tera doesn't scan an
+        // unpredictable system directory (e.g. /tmp with stale root-owned dirs).
+        std::fs::create_dir(site_dir.path().join("templates")).unwrap();
+
         let mut f = NamedTempFile::new().unwrap();
         write!(f, "site_name = \"v1\"\n").unwrap();
-        let site_dir = std::path::Path::new("/tmp");
 
-        let cfg1 = crate::config::load(f.path(), site_dir).unwrap();
+        let cfg1 = crate::config::load(f.path(), site_dir.path()).unwrap();
         assert_eq!(cfg1.user_config["site_name"].as_str().unwrap(), "v1");
 
-        let state1 = FrameworkState::build(cfg1, site_dir.to_path_buf(), &[]).unwrap();
+        let state1 = FrameworkState::build(cfg1, site_dir.path().to_path_buf(), &[]).unwrap();
         let fs = Arc::new(RwLock::new(state1));
 
         // Verify initial state.
@@ -2083,8 +2087,8 @@ mod tests {
         let mut f2 = NamedTempFile::new().unwrap();
         write!(f2, "site_name = \"v2\"\n").unwrap();
 
-        let cfg2 = crate::config::load(f2.path(), site_dir).unwrap();
-        let state2 = FrameworkState::build(cfg2, site_dir.to_path_buf(), &[]).unwrap();
+        let cfg2 = crate::config::load(f2.path(), site_dir.path()).unwrap();
+        let state2 = FrameworkState::build(cfg2, site_dir.path().to_path_buf(), &[]).unwrap();
 
         // Atomic swap.
         *fs.write().unwrap() = state2;
@@ -2220,6 +2224,7 @@ mod tests {
                 m.insert("application/javascript".to_string(), false);
                 m
             },
+            inline_js: false,
         };
         assert!(cfg.is_enabled("text/html"));
         assert!(cfg.is_enabled("text/css"));

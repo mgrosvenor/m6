@@ -3,7 +3,7 @@
 #
 # Usage:
 #   ./bench.sh [--skip-verify] [--latency-n N] [--duration S] [--concurrency C]
-#              [--p99-limit-ms F] [--rps-min F] [--addr HOST:PORT]
+#              [--p99-limit-us F] [--rps-min F] [--addr HOST:PORT]
 #
 # All nine suites (H1/H2/H3 × latency/path/throughput) are run in sequence.
 # Servers are restarted between each suite to avoid stale-connection pollution.
@@ -24,8 +24,8 @@ HTTP_PID=""
 # ── Parse pass-through flags ──────────────────────────────────────────────────
 # Extract flags we forward to m6-bench; discard protocol/suite filters
 # (bench.sh controls those itself).
-BENCH_PASS=()
-SKIP_VERIFY=0
+BENCH_PASS=("--skip-verify")   # bench uses a self-signed cert; TLS validity is not the test
+SKIP_VERIFY=1
 i=0
 args=("$@")
 while [[ $i -lt ${#args[@]} ]]; do
@@ -35,7 +35,7 @@ while [[ $i -lt ${#args[@]} ]]; do
             BENCH_PASS+=("--skip-verify")
             SKIP_VERIFY=1
             ;;
-        --latency-n|--duration|--concurrency|--p99-limit-ms|--rps-min|--addr)
+        --latency-n|--duration|--concurrency|--p99-limit-us|--rps-min|--addr)
             BENCH_PASS+=("$arg" "${args[$((i+1))]}")
             i=$(( i + 1 ))
             ;;

@@ -66,6 +66,11 @@ struct H2Stream {
     body:         Vec<u8>,
     headers_done: bool,
     send_window:  i32,
+    // Buffered response body for flow-controlled delivery.
+    // None  = request not yet dispatched.
+    // Some  = response queued; resp_sent bytes already flushed.
+    resp_body:    Option<Vec<u8>>,
+    resp_sent:    usize,
 }
 
 impl H2Stream {
@@ -76,6 +81,8 @@ impl H2Stream {
             body: Vec::new(),
             headers_done: false,
             send_window: initial_send_window,
+            resp_body: None,
+            resp_sent: 0,
         }
     }
 }
@@ -91,7 +98,8 @@ pub struct Http2Conn {
     phase:    Phase,
     recv_buf: Vec<u8>,
     send_buf: Vec<u8>,
-    created:  Instant,
+    /// Updated on every received frame; drives the idle timeout.
+    last_active: Instant,
 
     streams:       HashMap<u32, H2Stream>,
     hpack_dec:     hpack::Decoder<'static>,
@@ -105,6 +113,12 @@ pub struct Http2Conn {
     peer_max_frame:      u32,
     conn_recv_window:    i32,
     conn_send_window:    i32,
+
+    /// Next server-initiated (push) stream ID.  Server-initiated streams are
+    /// even-numbered; starts at 2, incremented by 2 per push.
+    next_push_id: u32,
+    /// False when the client sends SETTINGS_ENABLE_PUSH=0.
+    enable_push:  bool,
 }
 
 impl Http2Conn {
@@ -113,7 +127,7 @@ impl Http2Conn {
             phase:    Phase::Preface,
             recv_buf: Vec::with_capacity(16_384),
             send_buf: Vec::with_capacity(16_384),
-            created:  Instant::now(),
+            last_active: Instant::now(),
             streams:  HashMap::new(),
             hpack_dec: hpack::Decoder::new(),
             hpack_enc: hpack::Encoder::new(),
@@ -124,6 +138,8 @@ impl Http2Conn {
             peer_max_frame:      DEFAULT_MAX_FRAME,
             conn_recv_window:    DEFAULT_WINDOW as i32,
             conn_send_window:    DEFAULT_WINDOW as i32,
+            next_push_id: 2,
+            enable_push:  true,
         }
     }
 
@@ -137,18 +153,22 @@ impl Http2Conn {
         on_request: &mut F,
     )
     where
-        F: FnMut(&HttpRequest, &str) -> (u16, Vec<(String, String)>, Vec<u8>, String),
+        F: FnMut(&HttpRequest, &str) -> (u16, Vec<(String, String)>, Vec<u8>, String, std::sync::Arc<Vec<String>>),
     {
         if self.phase == Phase::Done { return; }
 
-        if self.created.elapsed().as_secs() > crate::http11::READ_TIMEOUT_SECS {
+        // Idle timeout: kill only if no frames have arrived for H2_IDLE_TIMEOUT_SECS.
+        // H2 connections are long-lived (reused across many requests), so we
+        // reset the clock on every received frame rather than from creation time.
+        if self.last_active.elapsed().as_secs() > crate::http11::H2_IDLE_TIMEOUT_SECS {
             self.send_goaway(ERR_NO_ERROR);
             self.flush_tls(tls, stream).ok();
             self.phase = Phase::Done;
             return;
         }
 
-        if self.fill_recv(tls, stream).is_err() {
+        if let Err(e) = self.fill_recv(tls, stream) {
+            tracing::trace!("h2 fill_recv: {e}");
             self.phase = Phase::Done;
             return;
         }
@@ -166,7 +186,12 @@ impl Http2Conn {
             }
         }
 
-        if self.flush_tls(tls, stream).is_err() {
+        // Flush any response data that became unblocked this iteration
+        // (e.g. a WINDOW_UPDATE was processed inside the frame loop above).
+        self.flush_pending_streams();
+
+        if let Err(e) = self.flush_tls(tls, stream) {
+            tracing::trace!("h2 flush_tls: {e}");
             self.phase = Phase::Done;
         }
 
@@ -192,7 +217,10 @@ impl Http2Conn {
         loop {
             match tls.reader().read(&mut tmp) {
                 Ok(0)  => break,
-                Ok(n)  => self.recv_buf.extend_from_slice(&tmp[..n]),
+                Ok(n)  => {
+                    self.recv_buf.extend_from_slice(&tmp[..n]);
+                    self.last_active = Instant::now();
+                }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => return Err(e),
             }
@@ -201,10 +229,37 @@ impl Http2Conn {
     }
 
     fn flush_tls(&mut self, tls: &mut ServerConnection, stream: &TcpStream) -> io::Result<()> {
-        if !self.send_buf.is_empty() {
-            tls.writer().write_all(&self.send_buf)?;
-            self.send_buf.clear();
+        // Write send_buf to rustls in a loop, draining encrypted records to the
+        // socket between each chunk.  rustls has a default 64 KB internal buffer
+        // limit (DEFAULT_BUFFER_LIMIT); writing more than that in one shot causes
+        // writer().write() to return Ok(0) and write_all to fail.  By draining
+        // between chunks we keep the internal buffer well below the limit.
+        let mut pos = 0;
+        while pos < self.send_buf.len() {
+            // write() always returns Ok(n); n may be 0 if rustls buffer is full.
+            let n = tls.writer().write(&self.send_buf[pos..]).unwrap_or(0);
+            pos += n;
+
+            // Drain encrypted bytes to the socket before writing the next chunk.
+            let mut socket_full = false;
+            loop {
+                match tls.write_tls(&mut &*stream) {
+                    Ok(0)  => break,
+                    Ok(_)  => {}
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => { socket_full = true; break; }
+                    Err(e) => { self.send_buf.drain(..pos); return Err(e); }
+                }
+            }
+
+            if n == 0 && socket_full {
+                // Both rustls buffer and TCP socket buffer are full; give up and
+                // retry on the next drive() call (100 ms at most).
+                break;
+            }
         }
+        self.send_buf.drain(..pos);
+
+        // Final drain of any remaining encrypted records.
         loop {
             match tls.write_tls(&mut &*stream) {
                 Ok(0)  => break,
@@ -224,7 +279,7 @@ impl Http2Conn {
         peer_stream: &TcpStream,
     ) -> Result<bool, &'static str>
     where
-        F: FnMut(&HttpRequest, &str) -> (u16, Vec<(String, String)>, Vec<u8>, String),
+        F: FnMut(&HttpRequest, &str) -> (u16, Vec<(String, String)>, Vec<u8>, String, std::sync::Arc<Vec<String>>),
     {
         if self.phase == Phase::Preface {
             if self.recv_buf.len() < CLIENT_PREFACE.len() { return Ok(false); }
@@ -279,7 +334,10 @@ impl Http2Conn {
             let val = u32::from_be_bytes(payload[i+2..i+6].try_into().unwrap());
             match id {
                 SETTING_HEADER_TABLE_SIZE => { self.hpack_dec.set_max_table_size(val as usize); }
-                SETTING_ENABLE_PUSH       => { if val > 1 { return Err("invalid ENABLE_PUSH"); } }
+                SETTING_ENABLE_PUSH       => {
+                    if val > 1 { return Err("invalid ENABLE_PUSH"); }
+                    self.enable_push = val == 1;
+                }
                 SETTING_INITIAL_WINDOW_SIZE => {
                     if val > 0x7fff_ffff { return Err("INITIAL_WINDOW_SIZE overflow"); }
                     let delta = val as i32 - self.peer_initial_window;
@@ -313,6 +371,8 @@ impl Http2Conn {
         } else if let Some(s) = self.streams.get_mut(&stream_id) {
             s.send_window += inc as i32;
         }
+        // A larger window may unblock pending response data.
+        self.flush_pending_streams();
         Ok(())
     }
 
@@ -321,7 +381,7 @@ impl Http2Conn {
         on_request: &mut F, peer_stream: &TcpStream,
     ) -> Result<(), &'static str>
     where
-        F: FnMut(&HttpRequest, &str) -> (u16, Vec<(String, String)>, Vec<u8>, String),
+        F: FnMut(&HttpRequest, &str) -> (u16, Vec<(String, String)>, Vec<u8>, String, std::sync::Arc<Vec<String>>),
     {
         if stream_id == 0 { return Err("HEADERS on stream 0"); }
         if stream_id % 2 == 0 { return Err("client used even stream ID"); }
@@ -372,7 +432,7 @@ impl Http2Conn {
         on_request: &mut F, peer_stream: &TcpStream,
     ) -> Result<(), &'static str>
     where
-        F: FnMut(&HttpRequest, &str) -> (u16, Vec<(String, String)>, Vec<u8>, String),
+        F: FnMut(&HttpRequest, &str) -> (u16, Vec<(String, String)>, Vec<u8>, String, std::sync::Arc<Vec<String>>),
     {
         self.header_block_buf.extend_from_slice(payload);
         if flags & FLAG_END_HEADERS != 0 {
@@ -398,7 +458,7 @@ impl Http2Conn {
         on_request: &mut F, peer_stream: &TcpStream,
     ) -> Result<(), &'static str>
     where
-        F: FnMut(&HttpRequest, &str) -> (u16, Vec<(String, String)>, Vec<u8>, String),
+        F: FnMut(&HttpRequest, &str) -> (u16, Vec<(String, String)>, Vec<u8>, String, std::sync::Arc<Vec<String>>),
     {
         if stream_id == 0 { return Err("DATA on stream 0"); }
         let data = if flags & FLAG_PADDED != 0 && !payload.is_empty() {
@@ -440,13 +500,14 @@ impl Http2Conn {
 
     fn maybe_dispatch<F>(&mut self, stream_id: u32, on_request: &mut F, peer_stream: &TcpStream)
     where
-        F: FnMut(&HttpRequest, &str) -> (u16, Vec<(String, String)>, Vec<u8>, String),
+        F: FnMut(&HttpRequest, &str) -> (u16, Vec<(String, String)>, Vec<u8>, String, std::sync::Arc<Vec<String>>),
     {
         let ready = self.streams.get(&stream_id).map(|s| {
             s.headers_done
                 && (s.state == StreamState::HalfClosedRemote
                     || is_headersonly(&s.headers))
                 && s.state != StreamState::Closed
+                && s.resp_body.is_none()  // not already dispatched
         }).unwrap_or(false);
 
         if !ready { return; }
@@ -462,29 +523,164 @@ impl Http2Conn {
             .map(|a| a.ip().to_string())
             .unwrap_or_default();
 
-        let (status, resp_headers, resp_body, _) = on_request(&req, &client_ip);
+        let (status, resp_headers, resp_body, _, hints) = on_request(&req, &client_ip);
+
+        if !hints.is_empty() {
+            if self.enable_push {
+                // ── HTTP/2 Server Push ─────────────────────────────────────
+                // For each hinted asset that is already in the cache (returned
+                // as a 2xx by on_request), send:
+                //   1. PUSH_PROMISE on the request stream  (so the browser
+                //      knows not to request it separately)
+                //   2. HEADERS + DATA on a new server-initiated push stream
+                //
+                // Chrome 106+ removed push support; Firefox still honours it.
+                // Browsers that don't support push will send RST_STREAM on the
+                // push stream, which we ignore (the stream isn't in self.streams).
+                for hint_url in hints.iter() {
+                    // Bail early if the connection send window is exhausted.
+                    if self.conn_send_window <= 0 { break; }
+
+                    let push_req = HttpRequest {
+                        method:  "GET".to_string(),
+                        path:    hint_url.clone(),
+                        query:   None,
+                        version: "HTTP/2.0".to_string(),
+                        headers: vec![],
+                        body:    vec![],
+                    };
+                    let (ps, ph, pb, _, _) = on_request(&push_req, &client_ip);
+                    if ps < 200 || ps >= 300 { continue; }
+                    // Skip if the body exceeds the current connection send window.
+                    if pb.len() as i32 > self.conn_send_window { continue; }
+
+                    let push_stream_id = self.next_push_id;
+                    self.next_push_id += 2;
+
+                    // PUSH_PROMISE on the request stream.
+                    {
+                        let promised_id_bytes = (push_stream_id & 0x7fff_ffff).to_be_bytes();
+                        let hpack_req = self.hpack_enc.encode(vec![
+                            (b":method".as_ref(), b"GET".as_ref()),
+                            (b":path".as_ref(), hint_url.as_bytes()),
+                            (b":scheme".as_ref(), b"https".as_ref()),
+                        ]);
+                        let mut promise_payload = promised_id_bytes.to_vec();
+                        promise_payload.extend_from_slice(&hpack_req);
+                        self.push_frame(TYPE_PUSH_PROMISE, FLAG_END_HEADERS, stream_id, &promise_payload);
+                    }
+
+                    // HEADERS on the push stream.
+                    let push_hdr_block = self.encode_response_headers(ps, &ph, pb.len());
+                    self.push_frame(TYPE_HEADERS, FLAG_END_HEADERS, push_stream_id, &push_hdr_block);
+
+                    // DATA + END_STREAM on the push stream.
+                    self.push_frame(TYPE_DATA, FLAG_END_STREAM, push_stream_id, &pb);
+                    self.conn_send_window -= pb.len() as i32;
+                }
+            } else {
+                // Push disabled by client — fall back to 103 Early Hints.
+                let early_block = {
+                    let mut pairs: Vec<(&[u8], &[u8])> = vec![(b":status", b"103")];
+                    let link_values: Vec<String> = hints.iter()
+                        .map(|u| crate::hints::link_header(u))
+                        .collect();
+                    for lv in &link_values {
+                        pairs.push((b"link", lv.as_bytes()));
+                    }
+                    self.hpack_enc.encode(pairs)
+                };
+                self.push_frame(TYPE_HEADERS, FLAG_END_HEADERS, stream_id, &early_block);
+            }
+        }
 
         // Encode HPACK headers (needs &mut self.hpack_enc — no stream borrow active).
         let header_block = self.encode_response_headers(status, &resp_headers, resp_body.len());
         self.push_frame(TYPE_HEADERS, FLAG_END_HEADERS, stream_id, &header_block);
 
-        // DATA frames.
-        let max = self.peer_max_frame as usize;
-        if resp_body.is_empty() {
-            self.push_frame(TYPE_DATA, FLAG_END_STREAM, stream_id, &[]);
-        } else {
-            let mut pos = 0;
-            while pos < resp_body.len() {
-                let end   = (pos + max).min(resp_body.len());
-                let flags = if end == resp_body.len() { FLAG_END_STREAM } else { 0 };
-                self.push_frame(TYPE_DATA, flags, stream_id, &resp_body[pos..end]);
-                pos = end;
-            }
+        // Store response body for flow-controlled delivery.
+        if let Some(s) = self.streams.get_mut(&stream_id) {
+            s.resp_body = Some(resp_body);
+            s.resp_sent = 0;
         }
 
-        // Mark the stream closed, then immediately reap it so the HashMap
-        // does not grow unboundedly and trigger the MAX_CONCURRENT guard.
-        self.streams.remove(&stream_id);
+        // Flush as much as the current flow-control window allows.
+        self.flush_pending_streams();
+    }
+
+    // ── Flow-controlled response flusher ─────────────────────────────────────
+
+    /// Send buffered response DATA frames for all streams, respecting both the
+    /// connection-level and per-stream send windows.  Called after dispatching
+    /// a request and after every WINDOW_UPDATE.
+    fn flush_pending_streams(&mut self) {
+        let stream_ids: Vec<u32> = self.streams.keys().copied().collect();
+        let max = self.peer_max_frame as usize;
+
+        'outer: for stream_id in stream_ids {
+            loop {
+                // Determine how many bytes we can send right now.
+                let (to_send, is_last) = {
+                    let s = match self.streams.get(&stream_id) {
+                        Some(s) => s,
+                        None    => continue 'outer,
+                    };
+                    let body = match &s.resp_body {
+                        Some(b) => b,
+                        None    => continue 'outer,  // not dispatched yet
+                    };
+                    let remaining = body.len() - s.resp_sent;
+                    if remaining == 0 {
+                        // Body fully consumed (or empty); send END_STREAM and reap.
+                        (0usize, true)
+                    } else {
+                        if self.conn_send_window <= 0 || s.send_window <= 0 {
+                            tracing::trace!(
+                                "h2 stream {} blocked: conn_window={} stream_window={} remaining={}",
+                                stream_id, self.conn_send_window, s.send_window, remaining
+                            );
+                            continue 'outer;  // blocked; wait for WINDOW_UPDATE
+                        }
+                        let window = (self.conn_send_window.min(s.send_window) as usize)
+                            .min(max);
+                        let n = remaining.min(window);
+                        (n, s.resp_sent + n == body.len())
+                    }
+                };
+
+                if to_send == 0 && is_last {
+                    // Empty DATA + END_STREAM to close the stream.
+                    self.push_frame(TYPE_DATA, FLAG_END_STREAM, stream_id, &[]);
+                    self.streams.remove(&stream_id);
+                    continue 'outer;
+                }
+
+                // Clone the chunk to satisfy the borrow checker.
+                let chunk: Vec<u8> = {
+                    let s = &self.streams[&stream_id];
+                    let body = s.resp_body.as_ref().unwrap();
+                    body[s.resp_sent..s.resp_sent + to_send].to_vec()
+                };
+
+                let flags = if is_last { FLAG_END_STREAM } else { 0 };
+                self.push_frame(TYPE_DATA, flags, stream_id, &chunk);
+
+                // Debit both windows.
+                self.conn_send_window -= to_send as i32;
+                let s = self.streams.get_mut(&stream_id).unwrap();
+                s.send_window -= to_send as i32;
+                s.resp_sent   += to_send;
+
+                if is_last {
+                    self.streams.remove(&stream_id);
+                    continue 'outer;
+                }
+                // More data remains but the window may now be exhausted.
+                if self.conn_send_window <= 0 { break; }
+                let sw = self.streams.get(&stream_id).map(|s| s.send_window).unwrap_or(0);
+                if sw <= 0 { break; }
+            }
+        }
     }
 
     // ── Frame encoding helpers ────────────────────────────────────────────────

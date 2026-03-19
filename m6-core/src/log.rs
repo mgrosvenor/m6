@@ -2,45 +2,88 @@
 
 use anyhow::Result;
 use std::path::Path;
+use std::sync::Mutex;
 use tracing::Level;
-use tracing_subscriber::fmt;
+use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
+use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::prelude::*;
+use tracing_subscriber::{fmt, reload, Layer, Registry};
 
-pub use tracing_appender::non_blocking::WorkerGuard;
+type BoxedLayer = Box<dyn Layer<Registry> + Send + Sync + 'static>;
+
+/// Handle returned by [`init`] that allows runtime log level / format reloads.
+///
+/// Keep the handle alive for the lifetime of the process. Dropping it flushes
+/// and terminates the logging background thread.
+pub struct LogHandle {
+    handle: reload::Handle<BoxedLayer, Registry>,
+    guard:  Mutex<WorkerGuard>,
+}
+
+impl LogHandle {
+    /// Swap the active log layer for one built from `format` and `level`.
+    ///
+    /// On success the old `WorkerGuard` is replaced so that the previous
+    /// non-blocking writer is flushed and the new one takes over.
+    pub fn reload(&self, format: &str, level: &str) {
+        let lvl = parse_level(level);
+        let (writer, new_guard) = tracing_appender::non_blocking(std::io::stdout());
+        let new_layer = make_layer(format, lvl, writer);
+        match self.handle.modify(|l| *l = new_layer) {
+            Ok(()) => {
+                if let Ok(mut g) = self.guard.lock() {
+                    *g = new_guard;
+                }
+            }
+            Err(e) => {
+                tracing::warn!("log reload failed: {}", e);
+            }
+        }
+    }
+}
+
+fn make_layer(format: &str, level: Level, writer: NonBlocking) -> BoxedLayer {
+    let filter = LevelFilter::from_level(level);
+    match format {
+        "json" => Box::new(
+            fmt::layer()
+                .json()
+                .with_writer(writer)
+                .with_current_span(true)
+                .with_filter(filter),
+        ),
+        _ => Box::new(
+            fmt::layer()
+                .with_writer(writer)
+                .with_filter(filter),
+        ),
+    }
+}
 
 /// Initialize the tracing subscriber with a non-blocking stdout writer.
 ///
-/// Returns a `WorkerGuard` that must be kept alive for the lifetime of the
-/// process. Dropping it flushes and terminates the logging background thread.
+/// Returns a [`LogHandle`] that must be kept alive for the lifetime of the
+/// process. Call [`LogHandle::reload`] at any time to swap the log level or
+/// format without restarting.
 ///
 /// `format`:
 ///   - `"json"` → JSON output (production)
 ///   - anything else → human-readable text (development)
 ///
 /// `level`: `"debug"`, `"info"`, `"warn"`, `"error"` (defaults to `"info"`)
-pub fn init(format: &str, level: &str) -> Result<WorkerGuard> {
-    let level = parse_level(level);
-    let (non_blocking, guard) = tracing_appender::non_blocking(std::io::stdout());
-
-    match format {
-        "json" => {
-            fmt()
-                .json()
-                .with_max_level(level)
-                .with_writer(non_blocking)
-                .with_current_span(true)
-                .try_init()
-                .map_err(|e| anyhow::anyhow!("failed to install tracing subscriber: {}", e))?;
-        }
-        _ => {
-            fmt()
-                .with_max_level(level)
-                .with_writer(non_blocking)
-                .try_init()
-                .map_err(|e| anyhow::anyhow!("failed to install tracing subscriber: {}", e))?;
-        }
-    }
-
-    Ok(guard)
+pub fn init(format: &str, level: &str) -> Result<LogHandle> {
+    let lvl = parse_level(level);
+    let (writer, guard) = tracing_appender::non_blocking(std::io::stdout());
+    let layer = make_layer(format, lvl, writer);
+    let (reload_layer, handle) = reload::Layer::new(layer);
+    Registry::default()
+        .with(reload_layer)
+        .try_init()
+        .map_err(|e| anyhow::anyhow!("failed to install tracing subscriber: {}", e))?;
+    Ok(LogHandle {
+        handle,
+        guard: Mutex::new(guard),
+    })
 }
 
 /// Read `[log]` from `site_dir/site.toml`. Returns `(level, format)`.

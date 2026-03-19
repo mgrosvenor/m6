@@ -401,7 +401,7 @@ mod phase11 {
         let headers = vec![("cache-control".to_string(), "public, max-age=3600".to_string())];
         assert!(should_cache(200, &headers));
 
-        let resp = CachedResponse { status: 200, headers: std::sync::Arc::new(headers.clone()), body: bytes::Bytes::from_static(b"cached") };
+        let resp = CachedResponse { status: 200, headers: std::sync::Arc::new(headers.clone()), body: bytes::Bytes::from_static(b"cached"), hints: std::sync::Arc::new(vec![]) };
         cache.insert(key.clone(), resp);
         assert!(cache.get(&key).is_some());
     }
@@ -414,6 +414,7 @@ mod phase11 {
             status: 200,
             headers: std::sync::Arc::new(vec![("cache-control".to_string(), "public".to_string())]),
             body: bytes::Bytes::from_static(b"body"),
+            hints: std::sync::Arc::new(vec![]),
         };
         cache.insert(key.clone(), resp);
 
@@ -445,6 +446,7 @@ mod phase11 {
             status: 200,
             headers: std::sync::Arc::new(vec![("content-encoding".to_string(), "gzip".to_string())]),
             body: bytes::Bytes::from_static(b"gzip-body"),
+            hints: std::sync::Arc::new(vec![]),
         });
 
         assert!(cache.get(&key_gzip).is_some());
@@ -454,6 +456,7 @@ mod phase11 {
             status: 200,
             headers: std::sync::Arc::new(vec![("content-encoding".to_string(), "br".to_string())]),
             body: bytes::Bytes::from_static(b"br-body"),
+            hints: std::sync::Arc::new(vec![]),
         });
 
         assert_eq!(cache.get(&key_gzip).unwrap().body, b"gzip-body" as &[u8]);
@@ -479,6 +482,7 @@ mod phase11 {
             status: 200,
             headers: std::sync::Arc::new(vec![("cache-control".to_string(), "public".to_string())]),
             body: bytes::Bytes::from_static(b"hello world post"),
+            hints: std::sync::Arc::new(vec![]),
         });
 
         // Simulate: inotify fires on content/posts/hello-world.json

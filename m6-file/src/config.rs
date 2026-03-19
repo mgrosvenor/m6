@@ -11,13 +11,16 @@ pub struct CompressionSettings {
     pub gzip: u32,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct RouteConfig {
     pub path: String,
     pub root: String,
     /// If true, serves the file from an optional `?offset=N` byte offset and
     /// returns `Cache-Control: no-store`. Intended for log tailing.
     pub tail: Option<bool>,
+    /// Extra response headers as `[[key, value]]` pairs.
+    #[serde(default)]
+    pub headers: Vec<[String; 2]>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

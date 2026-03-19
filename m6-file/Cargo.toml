@@ -17,7 +17,7 @@ serde       = { version = "1", features = ["derive"] }
 anyhow      = "1"
 tracing     = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json"] }
-nix         = { version = "0.27", features = ["signal"] }
+nix         = { version = "0.27", features = ["signal", "poll"] }
 mime_guess  = "2"
 brotli      = "3"
 flate2      = "1"

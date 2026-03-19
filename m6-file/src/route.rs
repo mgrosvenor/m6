@@ -27,6 +27,8 @@ pub struct Route {
     pub specificity: i64,
     /// Whether this route uses tail mode (offset-based partial reads, no-store).
     pub tail: bool,
+    /// Extra response headers from config.
+    pub headers: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +49,7 @@ impl Route {
             segments,
             specificity,
             tail: cfg.tail.unwrap_or(false),
+            headers: cfg.headers.iter().map(|[k, v]| (k.clone(), v.clone())).collect(),
         }
     }
 
@@ -219,6 +222,7 @@ mod tests {
             path: "/assets/{relpath}".to_string(),
             root: "assets/".to_string(),
             tail: None,
+            headers: vec![],
         };
         let route = Route::from_config(&cfg);
         let params = match route.match_path("/assets/css/main.css") {
@@ -235,6 +239,7 @@ mod tests {
             path: "/content/posts/{stem}/{filename}".to_string(),
             root: "content/posts/{stem}/".to_string(),
             tail: None,
+            headers: vec![],
         };
         let route = Route::from_config(&cfg);
         let params = match route.match_path("/content/posts/hello/index.html") {
@@ -253,6 +258,7 @@ mod tests {
             path: "/assets/{relpath}".to_string(),
             root: "assets/".to_string(),
             tail: None,
+            headers: vec![],
         };
         let route = Route::from_config(&cfg);
         // `..` in relpath → NoMatch → 404 (spec §l2: "../ traversal in URL → 404")
@@ -265,6 +271,7 @@ mod tests {
             path: "/assets/{relpath}".to_string(),
             root: "assets/".to_string(),
             tail: None,
+            headers: vec![],
         };
         let route = Route::from_config(&cfg);
         assert_eq!(route.match_path("/other/path"), MatchResult::NoMatch);
@@ -276,6 +283,7 @@ mod tests {
             path: "/posts/{stem}".to_string(),
             root: "posts/".to_string(),
             tail: None,
+            headers: vec![],
         };
         let route = Route::from_config(&cfg);
         // `..` inside a Param segment should yield InvalidParam.

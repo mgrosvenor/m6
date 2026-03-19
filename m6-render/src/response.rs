@@ -12,6 +12,8 @@ pub struct Response {
     pub body: Vec<u8>,
     /// Template name, if this response came from template rendering.
     pub(crate) template_name: Option<String>,
+    /// Extra template context supplied by the handler via render_with.
+    pub(crate) template_dict: Option<Map<String, Value>>,
 }
 
 impl Response {
@@ -41,17 +43,15 @@ impl Response {
     /// Internal: render a template from a dict directly.
     pub(crate) fn render_dict(
         template: &str,
-        _dict: &Map<String, Value>,
+        dict: &Map<String, Value>,
         status: u16,
     ) -> Result<Self> {
-        // The actual Tera rendering happens in the framework using the shared Tera
-        // instance. We store the template name and dict, and the server renders it.
-        // For now, return a placeholder that the server layer fills in.
         Ok(Self {
             status,
             headers: vec![],
             body: vec![],
             template_name: Some(template.to_string()),
+            template_dict: Some(dict.clone()),
         })
     }
 
@@ -61,6 +61,7 @@ impl Response {
             headers: vec![("Location".to_string(), location.to_string())],
             body: vec![],
             template_name: None,
+            template_dict: None,
         }
     }
 
@@ -70,6 +71,7 @@ impl Response {
             headers: vec![("Location".to_string(), location.to_string())],
             body: vec![],
             template_name: None,
+            template_dict: None,
         }
     }
 
@@ -84,6 +86,7 @@ impl Response {
             headers: vec![("Content-Type".to_string(), "application/json".to_string())],
             body,
             template_name: None,
+            template_dict: None,
         }
     }
 
@@ -93,6 +96,7 @@ impl Response {
             headers: vec![("Content-Type".to_string(), "text/plain; charset=utf-8".to_string())],
             body: s.as_bytes().to_vec(),
             template_name: None,
+            template_dict: None,
         }
     }
 
@@ -102,6 +106,7 @@ impl Response {
             headers: vec![],
             body: vec![],
             template_name: None,
+            template_dict: None,
         }
     }
 

@@ -30,6 +30,7 @@ use m6_http_lib::router::{self, RouteTable};
 use m6_http_lib::watcher::{FsEvent, FsEventKind, FsWatcher};
 use m6_http_lib::auth::PublicKey;
 use m6_http_lib::http11::{Http11Listener, make_tls_server_config};
+use m6_http_lib::hints;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -76,6 +77,8 @@ struct ServerState {
     invalidation_map: HashMap<String, Vec<String>>,
     error_mode: ErrorMode,
     stats: Stats,
+    /// Paths queued for background prefetch into the cache.
+    prefetch_queue: std::collections::VecDeque<String>,
 }
 
 // ── Signal handling ───────────────────────────────────────────────────────────
@@ -138,6 +141,7 @@ fn event_loop(
     mut watcher: Option<FsWatcher>,
     state: &mut ServerState,
     quiche_config: &mut quiche::Config,
+    log_handle: &m6_core::log::LogHandle,
 ) -> i32 {
     let poller = match Poller::new() {
         Ok(p) => p,
@@ -177,6 +181,9 @@ fn event_loop(
         }
         unblocked
     };
+
+    // Port for Alt-Svc advertisement: same port for both QUIC/H3 (UDP) and TCP.
+    let quic_port = udp.local_addr().map(|a| a.port()).unwrap_or(8443);
 
     let mut connections: HashMap<Vec<u8>, QuicConn> = HashMap::new();
     // Maps the client's original Initial DCID (may be shorter than MAX_CONN_ID_LEN)
@@ -248,7 +255,7 @@ fn event_loop(
                 TOKEN_INOTIFY => {
                     if let Some(ref mut w) = watcher {
                         for event in w.read_events() {
-                            handle_fs_event(&event, state, quiche_config);
+                            handle_fs_event(&event, state, quiche_config, log_handle);
                         }
                     }
                 }
@@ -266,8 +273,53 @@ fn event_loop(
                     .map(|(_, v)| v.as_str())
                     .unwrap_or("");
                 let start = std::time::Instant::now();
-                let (status, headers, body, backend_name) =
+
+                // ── Cache lookup — check before forwarding to backend ──────────
+                let bypass_cache = req.query.as_deref().map_or(false, |q| {
+                    q.split('&').any(|p| p == "_nocache" || p.starts_with("_nocache="))
+                });
+                let mut key_buf = [0u8; 512];
+                let lookup_key = make_lookup_key(&req.path, enc_str, &mut key_buf);
+                if !bypass_cache { if let Some(cached) = state.cache.get(lookup_key) {
+                    let elapsed_ns = start.elapsed().as_nanos() as u64;
+                    state.stats.record(elapsed_ns, true, false);
+                    let mut headers: Vec<(String, String)> = (*cached.headers).clone();
+                    // Add Link: preload headers to the 200 response for clients/CDNs
+                    // that strip 1xx informational responses.
+                    for url in cached.hints.iter() {
+                        headers.push(("link".to_string(), hints::link_header(url)));
+                    }
+                    headers.push(("alt-svc".to_string(),
+                        format!("h3=\":{quic_port}\"; ma=86400")));
+                    debug!(
+                        path = %req.path,
+                        status = cached.status,
+                        version = "HTTP/1.1",
+                        backend = "cache",
+                        latency_us = elapsed_ns / 1_000,
+                        cache_hit = true,
+                        "request complete"
+                    );
+                    return (cached.status, headers, cached.body.to_vec(), "cache".to_string(), cached.hints.clone());
+                } } // end !bypass_cache
+
+                let (status, mut headers, body, backend_name) =
                     handle_request(req, client_ip, enc_str, state);
+                // Pick up hints that handle_request just stored in the cache.
+                let hints = {
+                    let mut kbuf = [0u8; 512];
+                    let lk = make_lookup_key(&req.path, enc_str, &mut kbuf);
+                    state.cache.get(lk)
+                        .map(|c| c.hints.clone())
+                        .unwrap_or_default()
+                };
+                // Add Link: preload headers to the response (fallback for proxies/CDNs).
+                for url in hints.iter() {
+                    headers.push(("link".to_string(), hints::link_header(url)));
+                }
+                // Advertise HTTP/3 (QUIC) on the same port so browsers upgrade.
+                headers.push(("alt-svc".to_string(),
+                    format!("h3=\":{quic_port}\"; ma=86400")));
                 let elapsed_ns = start.elapsed().as_nanos() as u64;
                 let is_backend_error = status >= 500;
                 state.stats.record(elapsed_ns, false, is_backend_error);
@@ -280,7 +332,7 @@ fn event_loop(
                     cache_hit = false,
                     "request complete"
                 );
-                (status, headers, body, backend_name)
+                (status, headers, body, backend_name, hints)
             }, &poller);
         }
 
@@ -292,6 +344,27 @@ fn event_loop(
 
         // Emit periodic stats (cheap check every iteration: compares one Instant)
         state.stats.maybe_emit(state.pool_manager.total_active_members());
+
+        // Drain one prefetch from the queue per loop iteration.  Each prefetch
+        // is a synthetic GET to a backend — fills the cache with hinted assets
+        // so they are ready when the browser requests them after receiving 103.
+        if let Some(path) = state.prefetch_queue.pop_front() {
+            let mut kbuf = [0u8; 512];
+            let lk = make_lookup_key(&path, "", &mut kbuf);
+            if state.cache.get(lk).is_none() {
+                // Build a minimal synthetic GET request.
+                let synth = forward::HttpRequest {
+                    method:  "GET".to_string(),
+                    path:    path.clone(),
+                    query:   None,
+                    version: "HTTP/1.1".to_string(),
+                    headers: vec![],
+                    body:    vec![],
+                };
+                handle_request(&synth, "127.0.0.1", "", state);
+                debug!(path = %path, "prefetch: warmed cache");
+            }
+        }
 
         // Periodic rescan of backend socket globs to pick up newly started or
         // removed workers. On Linux, inotify also fires per-socket events, but
@@ -540,9 +613,14 @@ fn handle_h3_request(
     let start = Instant::now();
 
     // ── Cache lookup — zero allocation ────────────────────────────────────────
+    let bypass_cache = query_bytes.map_or(false, |q| {
+        q.split(|&b| b == b'&').any(|p| p == b"_nocache" || p.starts_with(b"_nocache="))
+    });
+
     let mut key_buf = [0u8; 512];
     let lookup_key = make_lookup_key(path_str, enc_str, &mut key_buf);
 
+    if !bypass_cache {
     if let Some(cached) = state.cache.get(lookup_key) {
         let elapsed_ns = start.elapsed().as_nanos() as u64;
         state.stats.record(elapsed_ns, true, false);
@@ -555,9 +633,25 @@ fn handle_h3_request(
             cache_hit = true,
             "request complete"
         );
-        send_h3_response(stream_id, qconn, cached.status, &cached.headers, cached.body);
+        if !cached.hints.is_empty() {
+            send_h3_early_hints(stream_id, qconn, &cached.hints);
+        }
+        // Build headers with Link: preload entries appended (fallback for proxies/CDNs).
+        let headers_with_links: Vec<(String, String)>;
+        let resp_headers: &[(String, String)] = if cached.hints.is_empty() {
+            &cached.headers
+        } else {
+            let mut h = (*cached.headers).clone();
+            for url in cached.hints.iter() {
+                h.push(("link".to_string(), hints::link_header(url)));
+            }
+            headers_with_links = h;
+            &headers_with_links
+        };
+        send_h3_response(stream_id, qconn, cached.status, resp_headers, cached.body);
         return;
     }
+    } // end !bypass_cache
 
     // ── Phase 2: cache miss — allocate owned data for forwarding ──────────────
     let path    = path_str.to_string();
@@ -583,8 +677,18 @@ fn handle_h3_request(
         body: req.body,
     };
 
-    let (status, resp_headers, body, backend_name) =
+    let (status, mut resp_headers, body, backend_name) =
         handle_request(&http_req, &client_ip, enc_str, state);
+    // Pick up hints that handle_request just stored in the cache.
+    let hints = {
+        let mut kbuf = [0u8; 512];
+        let lk = make_lookup_key(&path, enc_str, &mut kbuf);
+        state.cache.get(lk).map(|c| c.hints.clone()).unwrap_or_default()
+    };
+    // Add Link: preload headers to the response (fallback for proxies/CDNs).
+    for url in hints.iter() {
+        resp_headers.push(("link".to_string(), hints::link_header(url)));
+    }
 
     let elapsed_ns = start.elapsed().as_nanos() as u64;
     let is_backend_error = status >= 500;
@@ -599,6 +703,9 @@ fn handle_h3_request(
         "request complete"
     );
 
+    if !hints.is_empty() {
+        send_h3_early_hints(stream_id, qconn, &hints);
+    }
     send_h3_response(stream_id, qconn, status, &resp_headers, Bytes::from(body));
 }
 
@@ -617,6 +724,22 @@ fn write_decimal(mut n: usize, buf: &mut [u8; 20]) -> &[u8] {
         n /= 10;
     }
     &buf[pos..]
+}
+
+fn send_h3_early_hints(stream_id: u64, qconn: &mut QuicConn, hint_urls: &[String]) {
+    let h3 = match qconn.h3_conn.as_mut() {
+        Some(h) => h,
+        None => return,
+    };
+    let link_values: Vec<String> = hint_urls.iter().map(|u| hints::link_header(u)).collect();
+    let mut h3_headers: Vec<quiche::h3::Header> = Vec::with_capacity(link_values.len() + 1);
+    h3_headers.push(quiche::h3::Header::new(b":status", b"103"));
+    for lv in &link_values {
+        h3_headers.push(quiche::h3::Header::new(b"link", lv.as_bytes()));
+    }
+    if let Err(e) = h3.send_response(&mut qconn.conn, stream_id, &h3_headers, false) {
+        warn!("h3 early hints send error: {}", e);
+    }
 }
 
 fn send_h3_response(
@@ -782,18 +905,38 @@ fn handle_request(
     };
 
     // Forward to backend
+    let bypass_cache = req.query.as_deref().map_or(false, |q| {
+        q.split('&').any(|p| p == "_nocache" || p.starts_with("_nocache="))
+    });
     let backend_name = route.backend.clone();
     let (status, resp_headers, body, used_backend) =
         match forward_to_backend(req, &backend_name, client_ip, state) {
             Ok(http_resp) => {
-                if should_cache(http_resp.status, &http_resp.headers) {
+                if !bypass_cache && should_cache(http_resp.status, &http_resp.headers) {
+                    // Extract early-hints from the response body (HTML only).
+                    // This is done ONLY on the cache-miss path to keep the
+                    // cache-hit path at <10 µs.
+                    let content_type = http_resp.headers.iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+                        .map(|(_, v)| v.as_str())
+                        .unwrap_or("");
+                    let hint_paths = hints::extract_hints(&http_resp.body, content_type);
+                    // Queue any hints not already in the cache for prefetch.
+                    for hp in &hint_paths {
+                        let mut kbuf = [0u8; 512];
+                        let lk = make_lookup_key(hp, "", &mut kbuf);
+                        if state.cache.get(lk).is_none() {
+                            state.prefetch_queue.push_back(hp.clone());
+                        }
+                    }
                     let key = CacheKey::new(&req.path, content_encoding);
                     state.cache.insert(
                         key,
                         CachedResponse {
-                            status: http_resp.status,
+                            status:  http_resp.status,
                             headers: std::sync::Arc::new(http_resp.headers.clone()),
-                            body: Bytes::from(http_resp.body.clone()),
+                            body:    Bytes::from(http_resp.body.clone()),
+                            hints:   std::sync::Arc::new(hint_paths),
                         },
                     );
                 }
@@ -1022,6 +1165,7 @@ fn handle_fs_event(
     event: &FsEvent,
     state: &mut ServerState,
     quiche_config: &mut quiche::Config,
+    log_handle: &m6_core::log::LogHandle,
 ) {
     match event.kind {
         FsEventKind::SocketCreated => {
@@ -1031,7 +1175,7 @@ fn handle_fs_event(
             state.pool_manager.socket_disappeared(&event.path);
         }
         FsEventKind::SiteTomlChanged => {
-            handle_site_reload(state);
+            handle_site_reload(state, log_handle);
         }
         FsEventKind::TlsCertChanged => {
             handle_tls_reload(state, quiche_config);
@@ -1039,7 +1183,7 @@ fn handle_fs_event(
     }
 }
 
-fn handle_site_reload(state: &mut ServerState) {
+fn handle_site_reload(state: &mut ServerState, log_handle: &m6_core::log::LogHandle) {
     info!("config reload: site.toml changed");
 
     match config::load(&state.config.site_dir, &state.system_config_path) {
@@ -1055,13 +1199,30 @@ fn handle_site_reload(state: &mut ServerState) {
             let new_inv_map = router::build_invalidation_map(&new_config);
             let new_error_mode = ErrorMode::from_config(&new_config.errors);
 
+            let new_public_key = match &new_config.auth {
+                Some(auth_cfg) => {
+                    let key_path = config::resolve_path(&new_config.site_dir, &auth_cfg.public_key);
+                    match PublicKey::from_pem_file(&key_path) {
+                        Ok(k) => Some(k),
+                        Err(e) => {
+                            warn!(error = %e, "config reload: auth key load failed, keeping current key");
+                            state.public_key.take()
+                        }
+                    }
+                }
+                None => None,
+            };
+
             state.route_table = new_route_table;
             state.pool_manager = new_pools;
             state.invalidation_map = new_inv_map;
             state.error_mode = new_error_mode;
+            state.public_key = new_public_key;
             state.config = new_config;
+            state.cache.clear();
 
-            info!("config reload: complete");
+            log_handle.reload(&state.config.log.format, &state.config.log.level);
+            info!("config reload: complete, cache cleared");
         }
         Err(e) => {
             warn!(error = %e, "config reload: failed, keeping current config");
@@ -1180,7 +1341,7 @@ fn run(args: Vec<String>) -> i32 {
 
     // CLI --log-level overrides site.toml [log].level; format always comes from config.
     let log_level = cli.log_level.as_deref().unwrap_or(&config.log.level);
-    let _log_guard = match m6_core::log::init(&config.log.format, log_level) {
+    let log_handle = match m6_core::log::init(&config.log.format, log_level) {
         Ok(g) => g,
         Err(e) => {
             eprintln!("logging init error: {}", e);
@@ -1307,7 +1468,8 @@ fn run(args: Vec<String>) -> i32 {
         invalidation_map,
         error_mode,
         stats: Stats::new(),
+        prefetch_queue: std::collections::VecDeque::new(),
     };
 
-    event_loop(udp, tcp_listener, watcher, &mut state, &mut quiche_config)
+    event_loop(udp, tcp_listener, watcher, &mut state, &mut quiche_config, &log_handle)
 }

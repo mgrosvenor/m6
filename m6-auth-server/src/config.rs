@@ -54,13 +54,22 @@ impl AuthConfig {
         let raw: RawConfig = toml::from_str(&text)
             .with_context(|| format!("parsing TOML: {}", config_path.display()))?;
 
-        // Validate db path
+        // Validate db path — resolve relative to the config file's directory
+        // (matching m6-auth-cli behaviour).
         let db_path_str = raw.storage.path
             .ok_or_else(|| anyhow!("[storage] path is required"))?;
         if db_path_str.is_empty() {
             return Err(anyhow!("[storage] path must not be empty"));
         }
-        let db_path = PathBuf::from(&db_path_str);
+        let db_path = {
+            let p = PathBuf::from(&db_path_str);
+            if p.is_absolute() {
+                p
+            } else {
+                let config_dir = config_path.parent().unwrap_or(Path::new("."));
+                config_dir.join(&p)
+            }
+        };
 
         let tokens = raw.tokens.unwrap_or(TokensConfig {
             access_ttl:  None,
@@ -78,8 +87,8 @@ impl AuthConfig {
                 try_issuer_from_site_toml(site_dir).unwrap_or_else(|| "localhost".to_string())
             });
 
-        let private_key_path = PathBuf::from(&raw.keys.private_key);
-        let public_key_path  = PathBuf::from(&raw.keys.public_key);
+        let private_key_path = site_dir.join(&raw.keys.private_key);
+        let public_key_path  = site_dir.join(&raw.keys.public_key);
 
         Ok(AuthConfig {
             db_path,

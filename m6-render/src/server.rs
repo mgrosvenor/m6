@@ -85,6 +85,7 @@ pub fn write_error_response(stream: &mut UnixStream, status: u16, body: &str) ->
         headers: vec![("Content-Type".to_string(), "text/plain".to_string())],
         body: body.as_bytes().to_vec(),
         template_name: None,
+            template_dict: None,
     };
     write_response(stream, &resp)
 }

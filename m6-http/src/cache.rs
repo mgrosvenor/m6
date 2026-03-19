@@ -4,13 +4,18 @@ use ahash::AHashMap;
 
 /// A cached HTTP response.
 ///
-/// `headers` is `Arc<Vec<...>>` so clone is a single atomic refcount bump —
-/// no string copies on the cache-hit hot path.
+/// `headers` and `hints` are `Arc<Vec<...>>` so clone is a single atomic
+/// refcount bump — no string copies on the cache-hit hot path.
+///
+/// `hints` contains absolute-path URLs extracted from the response body on the
+/// first (cache-miss) pass.  They are used to send `103 Early Hints` on every
+/// subsequent request, including cache hits, without re-scanning the body.
 #[derive(Debug, Clone)]
 pub struct CachedResponse {
     pub status: u16,
     pub headers: std::sync::Arc<Vec<(String, String)>>,
-    pub body: bytes::Bytes,
+    pub body:    bytes::Bytes,
+    pub hints:   std::sync::Arc<Vec<String>>,
 }
 
 /// Owned cache key stored in the HashMap.
@@ -247,6 +252,7 @@ mod tests {
             status: 200,
             headers: std::sync::Arc::new(vec![]),
             body: bytes::Bytes::from_static(b"world"),
+            hints: std::sync::Arc::new(vec![]),
         };
         cache.insert(key.clone(), resp);
 
@@ -268,7 +274,7 @@ mod tests {
         let k1 = CacheKey::new("/page", "gzip");
         let k2 = CacheKey::new("/page", "br");
         let k3 = CacheKey::new("/other", "");
-        let resp = CachedResponse { status: 200, headers: std::sync::Arc::new(vec![]), body: bytes::Bytes::new() };
+        let resp = CachedResponse { status: 200, headers: std::sync::Arc::new(vec![]), body: bytes::Bytes::new(), hints: std::sync::Arc::new(vec![]) };
         cache.insert(k1.clone(), resp.clone());
         cache.insert(k2.clone(), resp.clone());
         cache.insert(k3.clone(), resp.clone());
@@ -288,7 +294,7 @@ mod tests {
         let cache = Cache::new();
         // key stored with no query
         let k = CacheKey::new("/page", "");
-        let resp = CachedResponse { status: 200, headers: std::sync::Arc::new(vec![]), body: bytes::Bytes::new() };
+        let resp = CachedResponse { status: 200, headers: std::sync::Arc::new(vec![]), body: bytes::Bytes::new(), hints: std::sync::Arc::new(vec![]) };
         cache.insert(k.clone(), resp);
         // evict with query — should still evict
         cache.evict_path("/page?x=1");
@@ -307,6 +313,7 @@ mod tests {
             status: 200,
             headers: std::sync::Arc::new(vec![("cache-control".to_string(), "public".to_string())]),
             body: bytes::Bytes::from_static(b"cached body"),
+            hints: std::sync::Arc::new(vec![]),
         };
 
         // First: check miss

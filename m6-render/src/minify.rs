@@ -3,11 +3,18 @@
 /// Minification is applied BEFORE compression for better ratios.
 
 /// Minify HTML using the `minify-html` crate.
-/// Inline `<script>` blocks are minified via `minify-js` (same parse-js engine).
-pub fn minify_html(data: &[u8]) -> Vec<u8> {
+///
+/// `minify_inline_js` controls whether inline `<script>` blocks are
+/// minified. It defaults to `false` because `minify-html` parses scripts as
+/// ES modules (`TopLevelMode::Module`), which has different scoping semantics
+/// from classic scripts and silently corrupts valid inline JS (e.g.
+/// rewriting string `'\n'` as template literal `` `\\n` ``, making
+/// `var`-declared functions inaccessible from `onclick` attributes, etc.).
+/// CSS and whitespace minification are unaffected by this flag.
+pub fn minify_html(data: &[u8], minify_inline_js: bool) -> Vec<u8> {
     let mut cfg = minify_html::Cfg::new();
     cfg.minify_css = true;
-    cfg.minify_js = true;
+    cfg.minify_js = minify_inline_js;
     cfg.keep_comments = false;
     cfg.keep_closing_tags = true;
     minify_html::minify(data, &cfg)
@@ -134,7 +141,7 @@ mod tests {
     #[test]
     fn test_minify_html_removes_comments() {
         let html = b"<html><body><!-- comment --><p>Hello</p></body></html>";
-        let out = minify_html(html);
+        let out = minify_html(html, false);
         let s = std::str::from_utf8(&out).unwrap();
         assert!(s.contains("Hello"), "content missing: {}", s);
     }

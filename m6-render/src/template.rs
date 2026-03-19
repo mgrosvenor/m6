@@ -6,16 +6,48 @@ use anyhow::Context;
 use serde_json::Value;
 use tera::Tera;
 
-/// Initialise Tera with all templates under `site_dir` and register custom filters.
-/// Returns Err if any template has a syntax error (→ exit 2).
+/// Initialise Tera with all templates under `site_dir/templates/` and register custom filters.
+/// Templates are registered under paths relative to `site_dir` so that
+/// `Response::render_with("templates/foo.html", …)` resolves correctly.
 pub fn build_tera(site_dir: &Path) -> anyhow::Result<Tera> {
-    // Load all *.html and *.txt templates under site_dir.
-    let pattern = format!("{}/**/*.{{html,txt,xml,json}}", site_dir.display());
-    let mut tera = Tera::new(&pattern).context("compiling templates")?;
+    let mut contents: Vec<(String, String)> = Vec::new();
+    let templates_dir = site_dir.join("templates");
+    if templates_dir.is_dir() {
+        collect_templates(site_dir, &templates_dir, &mut contents)?;
+    }
 
-    // Also load plain HTML pattern for subdirectories.
+    let mut tera = Tera::default();
+    let pairs: Vec<(&str, &str)> = contents.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    tera.add_raw_templates(pairs).context("compiling templates")?;
     register_filters(&mut tera);
     Ok(tera)
+}
+
+/// Recursively collect all template files under `dir`, keyed by path relative to `site_dir`.
+fn collect_templates(
+    site_dir: &Path,
+    dir: &Path,
+    out: &mut Vec<(String, String)>,
+) -> anyhow::Result<()> {
+    let entries = std::fs::read_dir(dir)
+        .with_context(|| format!("reading template dir {}", dir.display()))?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_templates(site_dir, &path, out)?;
+        } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            if matches!(ext, "html" | "txt" | "xml" | "json") {
+                if let Ok(rel) = path.strip_prefix(site_dir) {
+                    if let Some(name) = rel.to_str() {
+                        let content = std::fs::read_to_string(&path)
+                            .with_context(|| format!("reading template {}", path.display()))?;
+                        out.push((name.to_string(), content));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Build a Tera instance from explicit template paths (relative to site_dir).

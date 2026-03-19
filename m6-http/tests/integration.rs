@@ -84,7 +84,10 @@ where
         let poller = Poller::new().expect("poller");
         while !stop2.load(Ordering::Relaxed) {
             listener.accept_pending(&poller, TOKEN_TCP);
-            listener.drive_all(|req, client_ip| handler(req, client_ip), &poller);
+            listener.drive_all(|req, client_ip| {
+                let (s, h, b, be) = handler(req, client_ip);
+                (s, h, b, be, std::sync::Arc::new(vec![]))
+            }, &poller);
             thread::sleep(Duration::from_millis(2));
         }
     });

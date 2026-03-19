@@ -8,7 +8,7 @@
 ///   --latency-n N       requests per latency run (default 2000)
 ///   --duration S        throughput run duration in seconds (default 10)
 ///   --concurrency C     parallel threads for throughput (default 8)
-///   --p99-limit-ms F    fail if p99 latency exceeds this (default 50)
+///   --p99-limit-us F    fail if p99 latency exceeds this in µs (default 50000)
 ///   --rps-min F         fail if throughput drops below this (default 50)
 ///   --addr HOST:PORT    target address (default 127.0.0.1:8443)
 ///
@@ -38,7 +38,7 @@ struct Args {
     latency_n:        usize,
     duration_s:       u64,
     concurrency:      usize,
-    p99_limit_ms:     f64,
+    p99_limit_us:     f64,
     rps_min:          f64,
     addr:             String,
 }
@@ -56,7 +56,7 @@ impl Args {
             latency_n:       2000,
             duration_s:      10,
             concurrency:     8,
-            p99_limit_ms:    50.0,
+            p99_limit_us:    50_000.0,
             rps_min:         50.0,
             addr: "127.0.0.1:8443".into(),
         };
@@ -74,7 +74,7 @@ impl Args {
                 "--latency-n"        => { i += 1; a.latency_n    = raw[i].parse().expect("latency-n"); }
                 "--duration"         => { i += 1; a.duration_s   = raw[i].parse().expect("duration"); }
                 "--concurrency"      => { i += 1; a.concurrency  = raw[i].parse().expect("concurrency"); }
-                "--p99-limit-ms"     => { i += 1; a.p99_limit_ms = raw[i].parse().expect("p99-limit-ms"); }
+                "--p99-limit-us"     => { i += 1; a.p99_limit_us = raw[i].parse().expect("p99-limit-us"); }
                 "--rps-min"          => { i += 1; a.rps_min      = raw[i].parse().expect("rps-min"); }
                 "--addr"             => { i += 1; a.addr = raw[i].clone(); }
                 other => { eprintln!("Unknown flag: {other}"); std::process::exit(1); }
@@ -202,7 +202,7 @@ fn bench_http11_latency_path(addr: &str, path: &str, n: usize, tls_cfg: Arc<Clie
     for _ in 0..n {
         let t0 = Instant::now();
         let resp = http11_get_path(addr, path, Arc::clone(&tls_cfg))?;
-        let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
+        let elapsed = t0.elapsed().as_secs_f64() * 1_000_000.0;
         let status = parse_http11_status(&resp);
         if status != 200 { eprintln!("HTTP/1.1 non-200 ({path}): {status}"); }
         latencies.push(elapsed);
@@ -510,7 +510,7 @@ fn bench_http2_latency_path(addr: &str, path: &str, n: usize, skip_verify: bool)
         }
         let t0 = Instant::now();
         client.get(path)?;
-        latencies.push(t0.elapsed().as_secs_f64() * 1000.0);
+        latencies.push(t0.elapsed().as_secs_f64() * 1_000_000.0);
     }
     Ok(latencies)
 }
@@ -734,7 +734,7 @@ fn bench_http3_latency(addr: &str, n: usize, skip_verify: bool) -> anyhow::Resul
         }
         let t0 = Instant::now();
         h3_get(&mut conn, &mut h3, &udp, b"/")?;
-        latencies.push(t0.elapsed().as_secs_f64() * 1000.0);
+        latencies.push(t0.elapsed().as_secs_f64() * 1_000_000.0);
         reqs += 1;
     }
     Ok(latencies)
@@ -787,17 +787,17 @@ fn bench_http3_throughput(addr: &str, duration_s: u64, concurrency: usize, skip_
 struct BenchResult {
     name:       String,
     count:      usize,
-    p0_ms:      f64,
-    p1_ms:      f64,
-    p25_ms:     f64,
-    p50_ms:     f64,
-    p75_ms:     f64,
-    p99_ms:     f64,
-    p100_ms:    f64,
-    iqr_ms:     f64,
-    range_ms:   f64,
-    avg_ms:     f64,
-    std_dev_ms: f64,
+    p0_us:      f64,
+    p1_us:      f64,
+    p25_us:     f64,
+    p50_us:     f64,
+    p75_us:     f64,
+    p99_us:     f64,
+    p100_us:    f64,
+    iqr_us:     f64,
+    range_us:   f64,
+    avg_us:     f64,
+    std_dev_us: f64,
     rps:        f64,
 }
 
@@ -820,39 +820,39 @@ impl BenchResult {
         } else { 0.0 };
         BenchResult {
             name: name.into(), count,
-            p0_ms: p0, p1_ms: p1, p25_ms: p25, p50_ms: p50, p75_ms: p75,
-            p99_ms: p99, p100_ms: p100,
-            iqr_ms: iqr, range_ms: range, avg_ms: avg, std_dev_ms: std_dev,
+            p0_us: p0, p1_us: p1, p25_us: p25, p50_us: p50, p75_us: p75,
+            p99_us: p99, p100_us: p100,
+            iqr_us: iqr, range_us: range, avg_us: avg, std_dev_us: std_dev,
             rps: 0.0,
         }
     }
     fn from_rps(name: impl Into<String>, rps: f64) -> Self {
         BenchResult {
             name: name.into(), count: 0,
-            p0_ms: 0.0, p1_ms: 0.0, p25_ms: 0.0, p50_ms: 0.0, p75_ms: 0.0,
-            p99_ms: 0.0, p100_ms: 0.0,
-            iqr_ms: 0.0, range_ms: 0.0, avg_ms: 0.0, std_dev_ms: 0.0,
+            p0_us: 0.0, p1_us: 0.0, p25_us: 0.0, p50_us: 0.0, p75_us: 0.0,
+            p99_us: 0.0, p100_us: 0.0,
+            iqr_us: 0.0, range_us: 0.0, avg_us: 0.0, std_dev_us: 0.0,
             rps,
         }
     }
 }
 
 fn print_result(r: &BenchResult, p99_limit: f64, rps_min: f64) -> bool {
-    let p99_ok = r.p99_ms <= p99_limit || r.p99_ms == 0.0;
+    let p99_ok = r.p99_us <= p99_limit || r.p99_us == 0.0;
     let rps_ok = r.rps >= rps_min || r.rps == 0.0;
     let status = if p99_ok && rps_ok { "PASS" } else { "FAIL" };
     if r.rps > 0.0 {
         println!("{:<6} {:<30}  {:.1} req/s", status, r.name, r.rps);
     } else {
         println!(
-            "{:<6} {:<30}  n={:<5}  p0={:7.3}  p1={:7.3}  p25={:7.3}  p50={:7.3}  p75={:7.3}  p99={:7.3}  p100={:7.3}  IQR={:7.3}  range={:7.3}  avg={:7.3}  std={:7.3}  (ms)",
+            "{:<6} {:<30}  n={:<5}  p0={:8.1}  p1={:8.1}  p25={:8.1}  p50={:8.1}  p75={:8.1}  p99={:8.1}  p100={:8.1}  IQR={:8.1}  range={:8.1}  avg={:8.1}  std={:8.1}  (µs)",
             status, r.name, r.count,
-            r.p0_ms, r.p1_ms, r.p25_ms, r.p50_ms, r.p75_ms,
-            r.p99_ms, r.p100_ms, r.iqr_ms, r.range_ms, r.avg_ms, r.std_dev_ms
+            r.p0_us, r.p1_us, r.p25_us, r.p50_us, r.p75_us,
+            r.p99_us, r.p100_us, r.iqr_us, r.range_us, r.avg_us, r.std_dev_us
         );
     }
     if !p99_ok {
-        println!("       p99 {:.3}ms exceeds limit {:.3}ms", r.p99_ms, p99_limit);
+        println!("       p99 {:.1}µs exceeds limit {:.1}µs", r.p99_us, p99_limit);
     }
     if !rps_ok {
         println!("       throughput {:.1} req/s below minimum {:.1}", r.rps, rps_min);
@@ -921,7 +921,7 @@ fn bench_h3_path_latency(
         }
         let t0 = Instant::now();
         h3_get(&mut conn, &mut h3, &udp, pb)?;
-        latencies.push(t0.elapsed().as_secs_f64() * 1000.0);
+        latencies.push(t0.elapsed().as_secs_f64() * 1_000_000.0);
         reqs += 1;
     }
     Ok(latencies)
@@ -987,13 +987,13 @@ fn main() {
         }
         if args.http2 {
             match bench_http2_latency(&args.addr, args.latency_n, args.skip_verify) {
-                Ok(lats) => { if !print_result(&BenchResult::from_latencies("HTTP/2 latency", lats), args.p99_limit_ms, 0.0) { all_pass = false; } }
+                Ok(lats) => { if !print_result(&BenchResult::from_latencies("HTTP/2 latency", lats), args.p99_limit_us, 0.0) { all_pass = false; } }
                 Err(e)   => { eprintln!("HTTP/2 latency error: {e}"); all_pass = false; }
             }
         }
         if args.http3 {
             match bench_http3_latency(&args.addr, args.latency_n, args.skip_verify) {
-                Ok(lats) => { if !print_result(&BenchResult::from_latencies("HTTP/3 latency", lats), args.p99_limit_ms, 0.0) { all_pass = false; } }
+                Ok(lats) => { if !print_result(&BenchResult::from_latencies("HTTP/3 latency", lats), args.p99_limit_us, 0.0) { all_pass = false; } }
                 Err(e)   => { eprintln!("HTTP/3 latency error: {e}"); all_pass = false; }
             }
         }

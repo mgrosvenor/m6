@@ -109,8 +109,8 @@ fn run() -> i32 {
         }
     };
 
-    // Open database
-    let db_path = site_dir.join(&cfg.db_path);
+    // Open database (db_path already resolved to absolute in config.rs)
+    let db_path = cfg.db_path.clone();
     if let Some(parent) = db_path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             error!(error = %e, "failed to create db directory");

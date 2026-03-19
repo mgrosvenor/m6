@@ -64,7 +64,10 @@ struct H1Conn {
     created:   Instant,
 }
 
+/// Per-request idle timeout for HTTP/1.1 (single request per connection).
 pub(crate) const READ_TIMEOUT_SECS: u64 = 30;
+/// Idle timeout for HTTP/2 connections (reused across many requests).
+pub(crate) const H2_IDLE_TIMEOUT_SECS: u64 = 300;
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -121,7 +124,7 @@ impl Http11Listener {
     /// Drive all active connections. Done connections are deregistered and dropped.
     pub fn drive_all<F>(&mut self, mut on_request: F, poller: &Poller)
     where
-        F: FnMut(&HttpRequest, &str) -> (u16, Vec<(String, String)>, Vec<u8>, String),
+        F: FnMut(&HttpRequest, &str) -> (u16, Vec<(String, String)>, Vec<u8>, String, std::sync::Arc<Vec<String>>),
     {
         for conn in &mut self.conns {
             drive_conn(conn, &mut on_request);
@@ -139,7 +142,7 @@ impl Http11Listener {
 
 fn drive_conn<F>(conn: &mut Conn, on_request: &mut F)
 where
-    F: FnMut(&HttpRequest, &str) -> (u16, Vec<(String, String)>, Vec<u8>, String),
+    F: FnMut(&HttpRequest, &str) -> (u16, Vec<(String, String)>, Vec<u8>, String, std::sync::Arc<Vec<String>>),
 {
     // HTTP/2: stream and tls are in conn; pass them by reference.
     if let ConnKind::Http2(h2) = &mut conn.kind {
@@ -194,7 +197,7 @@ fn drive_h1<F>(
     on_request: &mut F,
 )
 where
-    F: FnMut(&HttpRequest, &str) -> (u16, Vec<(String, String)>, Vec<u8>, String),
+    F: FnMut(&HttpRequest, &str) -> (u16, Vec<(String, String)>, Vec<u8>, String, std::sync::Arc<Vec<String>>),
 {
     if h1.created.elapsed().as_secs() > READ_TIMEOUT_SECS {
         h1.state = H1State::Done;
@@ -226,8 +229,20 @@ where
                         continue;
                     }
                     ParseResult::Complete(req) => {
-                        let (status, resp_headers, body, _) = on_request(&req, &h1.client_ip);
-                        h1.state = H1State::Writing { buf: build_response(status, &resp_headers, &body), pos: 0 };
+                        let (status, resp_headers, body, _, hints) = on_request(&req, &h1.client_ip);
+                        let mut buf = Vec::new();
+                        if !hints.is_empty() {
+                            buf.extend_from_slice(b"HTTP/1.1 103 Early Hints\r\n");
+                            for url in hints.iter() {
+                                let lh = crate::hints::link_header(url);
+                                buf.extend_from_slice(b"link: ");
+                                buf.extend_from_slice(lh.as_bytes());
+                                buf.extend_from_slice(b"\r\n");
+                            }
+                            buf.extend_from_slice(b"\r\n");
+                        }
+                        buf.extend_from_slice(&build_response(status, &resp_headers, &body));
+                        h1.state = H1State::Writing { buf, pos: 0 };
                         continue;
                     }
                 }

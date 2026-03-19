@@ -318,6 +318,9 @@ impl Drop for FsWatcher {
 // ── macOS/BSD kqueue watcher thread ──────────────────────────────────────────
 
 /// Watch `site_dir` for any file writes/creates/deletes using kqueue EVFILT_VNODE.
+/// Also watches `site.toml` directly so that `touch site.toml` (NOTE_ATTRIB on
+/// the file itself) triggers a reload — directory NOTE_WRITE only fires on
+/// entry creation/deletion, not mtime updates.
 /// Writes a byte to `pipe_write` on each event to wake the main thread.
 #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
 fn kqueue_watch_site_dir(site_dir: PathBuf, pipe_write: RawFd) {
@@ -326,7 +329,7 @@ fn kqueue_watch_site_dir(site_dir: PathBuf, pipe_write: RawFd) {
         return;
     }
 
-    let path = match std::ffi::CString::new(site_dir.as_os_str().as_encoded_bytes()) {
+    let dir_cstr = match std::ffi::CString::new(site_dir.as_os_str().as_encoded_bytes()) {
         Ok(s) => s,
         Err(_) => {
             unsafe { libc::close(kq) };
@@ -334,13 +337,14 @@ fn kqueue_watch_site_dir(site_dir: PathBuf, pipe_write: RawFd) {
         }
     };
 
-    let dir_fd = unsafe { libc::open(path.as_ptr(), libc::O_EVTONLY) };
+    let dir_fd = unsafe { libc::open(dir_cstr.as_ptr(), libc::O_EVTONLY) };
     if dir_fd < 0 {
         unsafe { libc::close(kq) };
         return;
     }
 
-    let ev = libc::kevent {
+    // Watch the site directory for file creation/deletion.
+    let ev_dir = libc::kevent {
         ident: dir_fd as libc::uintptr_t,
         filter: libc::EVFILT_VNODE,
         flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_CLEAR,
@@ -349,7 +353,32 @@ fn kqueue_watch_site_dir(site_dir: PathBuf, pipe_write: RawFd) {
         data: 0,
         udata: std::ptr::null_mut(),
     };
-    unsafe { libc::kevent(kq, &ev, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
+    unsafe { libc::kevent(kq, &ev_dir, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
+
+    // Also watch site.toml directly: NOTE_ATTRIB fires on `touch`, NOTE_WRITE
+    // fires on content writes, NOTE_RENAME/DELETE fires on atomic overwrites.
+    let site_toml_path = site_dir.join("site.toml");
+    let site_toml_cstr = std::ffi::CString::new(
+        site_toml_path.as_os_str().as_encoded_bytes()
+    );
+    let file_fd = match &site_toml_cstr {
+        Ok(cstr) => unsafe { libc::open(cstr.as_ptr(), libc::O_EVTONLY) },
+        Err(_) => -1,
+    };
+    if file_fd >= 0 {
+        let ev_file = libc::kevent {
+            ident: file_fd as libc::uintptr_t,
+            filter: libc::EVFILT_VNODE,
+            flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_CLEAR,
+            fflags: (libc::NOTE_WRITE
+                | libc::NOTE_ATTRIB
+                | libc::NOTE_RENAME
+                | libc::NOTE_DELETE) as u32,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        };
+        unsafe { libc::kevent(kq, &ev_file, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
+    }
 
     let timeout = libc::timespec { tv_sec: 1, tv_nsec: 0 };
     let mut out_ev = unsafe { std::mem::zeroed::<libc::kevent>() };
@@ -365,4 +394,5 @@ fn kqueue_watch_site_dir(site_dir: PathBuf, pipe_write: RawFd) {
             }
         }
     }
+
 }
