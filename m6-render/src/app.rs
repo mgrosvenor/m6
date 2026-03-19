@@ -21,7 +21,7 @@ use crate::request::{
     RawRequest, Request,
 };
 use crate::response::{error_to_response, Response};
-use crate::template::build_tera_from_paths;
+use crate::template::{build_tera, build_tera_from_paths};
 
 // ---------------------------------------------------------------------------
 // Per-thread state infrastructure
@@ -124,6 +124,7 @@ pub struct CompiledRoute {
     pub params_files: Vec<String>,
     pub status: u16,
     pub cache: String,
+    pub headers: Vec<(String, String)>,
     /// Specificity score: exact > parameterised, longer > shorter.
     pub specificity: i32,
 }
@@ -283,9 +284,16 @@ impl FrameworkState {
         let mut routes = Vec::new();
 
         // Add code-registered routes (they come first — higher priority for same pattern).
+        // Default cache to no-store: handler routes generate dynamic content.
+        // The config's [[route]] cache setting for the same path is inherited below.
         for (pattern, method) in code_routes {
             let segs = compile_pattern(pattern);
             let spec = route_specificity(&segs);
+            // Look for a matching config route to inherit its cache setting.
+            let cache = config.routes.iter()
+                .find(|r| r.path == *pattern)
+                .map(|r| r.cache.clone())
+                .unwrap_or_else(|| "no-store".to_string());
             routes.push(CompiledRoute {
                 pattern: pattern.clone(),
                 method: method.clone(),
@@ -293,7 +301,8 @@ impl FrameworkState {
                 template: None,
                 params_files: vec![],
                 status: 200,
-                cache: "public".to_string(),
+                cache,
+                headers: vec![],
                 specificity: spec,
             });
         }
@@ -326,6 +335,7 @@ impl FrameworkState {
                 params_files: rc.params.clone(),
                 status: rc.status,
                 cache: rc.cache.clone(),
+                headers: rc.headers.clone(),
                 specificity: spec,
             });
         }
@@ -338,8 +348,14 @@ impl FrameworkState {
             .collect();
 
         // Build Tera (exit 2 on syntax error, but here we return Err which caller turns to exit 2).
-        let tera = build_tera_from_paths(&site_dir, &template_paths)
-            .context("compiling templates")?;
+        // If no templates are listed in config routes (handler apps using render_with directly),
+        // fall back to loading all templates from site_dir.
+        let tera = if template_paths.is_empty() {
+            build_tera(&site_dir).context("compiling templates")?
+        } else {
+            build_tera_from_paths(&site_dir, &template_paths)
+                .context("compiling templates")?
+        };
 
         // Load global params.
         let mut global_params_data = Map::new();
@@ -484,10 +500,13 @@ impl FrameworkState {
             dict.insert(k.clone(), Value::String(v.clone()));
         }
 
-        // 5. Query params.
+        // 5. Query params — inserted at top level AND as a nested `query` map.
+        let mut query_map = Map::new();
         for (k, v) in parse_query_string(raw.query()) {
+            query_map.insert(k.clone(), Value::String(v.clone()));
             dict.insert(k, Value::String(v));
         }
+        dict.insert("query".to_string(), Value::Object(query_map));
 
         // 6. POST form fields.
         if raw.method() == "POST" {
@@ -562,8 +581,15 @@ impl FrameworkState {
     ) -> anyhow::Result<()> {
         if let Some(template_name) = resp.template_name.clone() {
             let mut ctx = tera::Context::new();
+            // Start with the framework dict (global params, path params, auth claims…)
             for (k, v) in dict {
                 ctx.insert(k.as_str(), v);
+            }
+            // Overlay the handler-supplied dict (render_with extra data)
+            if let Some(handler_dict) = &resp.template_dict {
+                for (k, v) in handler_dict {
+                    ctx.insert(k.as_str(), v);
+                }
             }
             let html = self
                 .tera
@@ -573,6 +599,7 @@ impl FrameworkState {
             resp.headers
                 .push(("Content-Type".to_string(), "text/html; charset=utf-8".to_string()));
             resp.template_name = None;
+            resp.template_dict = None;
         }
         Ok(())
     }
@@ -1399,84 +1426,6 @@ fn file_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(path).ok()?.modified().ok()
 }
 
-/// Set up an inotify fd watching the directories containing `config_path`
-/// and `site_toml_path` (IN_CLOSE_WRITE | IN_CREATE | IN_MOVED_TO).
-///
-/// Returns the fd on Linux (or -1 if init fails); always returns -1 on
-/// non-Linux platforms so the caller falls back to mtime polling.
-fn setup_config_watcher(
-    config_path: &std::path::Path,
-    site_toml_path: &std::path::Path,
-) -> std::os::unix::io::RawFd {
-    #[cfg(target_os = "linux")]
-    {
-        use std::ffi::CString;
-        let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
-        if fd < 0 {
-            return -1;
-        }
-        let mask = libc::IN_CLOSE_WRITE | libc::IN_CREATE | libc::IN_MOVED_TO;
-        let mut watched: std::collections::HashSet<std::path::PathBuf> =
-            std::collections::HashSet::new();
-        for path in &[config_path, site_toml_path] {
-            let dir = path.parent().unwrap_or(std::path::Path::new("/"));
-            if watched.insert(dir.to_path_buf()) {
-                if let Ok(s) = CString::new(dir.to_string_lossy().as_bytes()) {
-                    unsafe { libc::inotify_add_watch(fd, s.as_ptr(), mask) };
-                }
-            }
-        }
-        fd
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (config_path, site_toml_path);
-        -1
-    }
-}
-
-/// Read all pending inotify events from `fd` and return `true` if any
-/// event matches `config_filename` or `"site.toml"`.
-/// The fd must be in non-blocking mode (IN_NONBLOCK).
-#[cfg(target_os = "linux")]
-fn drain_inotify_events(fd: libc::c_int, config_filename: &str) -> bool {
-    let mut buf = [0u8; 4096];
-    let mut relevant = false;
-    loop {
-        let n = unsafe {
-            libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-        };
-        if n <= 0 {
-            break;
-        }
-        let n = n as usize;
-        let mut offset = 0usize;
-        while offset + std::mem::size_of::<libc::inotify_event>() <= n {
-            let event = unsafe {
-                &*(buf.as_ptr().add(offset) as *const libc::inotify_event)
-            };
-            let name_len = event.len as usize;
-            if name_len > 0 {
-                let name_start = offset + std::mem::size_of::<libc::inotify_event>();
-                let name_end = name_start + name_len;
-                if name_end <= n {
-                    let name = std::ffi::CStr::from_bytes_until_nul(
-                        &buf[name_start..name_end],
-                    )
-                    .ok()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("");
-                    if name == config_filename || name == "site.toml" {
-                        relevant = true;
-                    }
-                }
-            }
-            offset += std::mem::size_of::<libc::inotify_event>() + name_len;
-        }
-    }
-    relevant
-}
-
 pub fn run_app(code_routes: Vec<CodeRoute>) -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
@@ -1593,28 +1542,26 @@ fn run_app_with_shutdown(
     let pool = Arc::new(ThreadPool::new_with_exit(tp_size, tp_queue, on_thread_exit));
 
     // ── Hot-reload setup ──────────────────────────────────────────────────
-    // On Linux: inotify watches the directories containing config_path and
-    // site.toml; the inotify fd is added to the poll(2) call so reloads
-    // happen within milliseconds of a file write.
-    // On non-Linux (or when inotify_init fails): fall back to mtime polling
-    // at ~1-second intervals via the poll(2) timeout countdown.
+    // ConfigWatcher watches the directories containing config_path and
+    // site.toml; its fd is added to the poll(2) call so reloads happen
+    // within milliseconds of a file write when supported.
+    // When raw_fd() returns None (fallback platform or init failure): fall
+    // back to mtime polling at ~1-second intervals via the poll(2) timeout
+    // countdown.
     let site_toml_path = site_dir.join("site.toml");
-    let inotify_fd = setup_config_watcher(&config_path, &site_toml_path);
+    let mut watcher = m6_core::ConfigWatcher::new(&[&config_path, &site_toml_path]).ok();
 
-    // Mtime fallback state — only meaningful when inotify_fd < 0.
+    // Mtime fallback state — only meaningful when watcher.raw_fd() is None.
     let mut config_mtime    = file_mtime(&config_path);
     let mut site_toml_mtime = file_mtime(&site_toml_path);
     let mut reload_countdown: u8 = 10;
 
-    // Filename (not path) used to match inotify events (Linux only).
+    // Filename (not path) used to match watcher events.
     let config_filename = config_path
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_string();
-    // Suppress "unused variable" on non-Linux where inotify is not compiled in.
-    #[cfg(not(target_os = "linux"))]
-    let _ = &config_filename;
 
     use std::os::unix::io::AsRawFd;
     let listener_fd = listener.as_raw_fd();
@@ -1631,9 +1578,10 @@ fn run_app_with_shutdown(
             nix::poll::PollFlags::POLLIN,
         );
 
-        let (poll_result, listener_ready, inotify_fired) = if inotify_fd >= 0 {
+        let watcher_fd = watcher.as_ref().and_then(|w| w.raw_fd()).unwrap_or(-1);
+        let (poll_result, listener_ready, inotify_fired) = if watcher_fd >= 0 {
             let borrowed_ino =
-                unsafe { std::os::fd::BorrowedFd::borrow_raw(inotify_fd) };
+                unsafe { std::os::fd::BorrowedFd::borrow_raw(watcher_fd) };
             let pfd_ino = nix::poll::PollFd::new(
                 &borrowed_ino,
                 nix::poll::PollFlags::POLLIN,
@@ -1671,7 +1619,7 @@ fn run_app_with_shutdown(
                     break;
                 }
                 // Mtime fallback: check every ~10 timeouts (≈1 s).
-                if inotify_fd < 0 {
+                if watcher_fd < 0 {
                     reload_countdown = reload_countdown.saturating_sub(1);
                     if reload_countdown == 0 {
                         reload_countdown = 10;
@@ -1691,12 +1639,9 @@ fn run_app_with_shutdown(
             Ok(_) => {}
         }
 
-        // inotify fired — drain events and check for our watched files.
+        // Watcher fired — drain events and check for our watched files.
         if inotify_fired {
-            #[cfg(target_os = "linux")]
-            {
-                should_reload = drain_inotify_events(inotify_fd, &config_filename);
-            }
+            should_reload = watcher.as_mut().map_or(false, |w| w.read_events(&[&config_filename, "site.toml"]));
         }
 
         // ── Hot reload ───────────────────────────────────────────────────
@@ -1766,10 +1711,6 @@ fn run_app_with_shutdown(
         }
     }
 
-    if inotify_fd >= 0 {
-        unsafe { libc::close(inotify_fd) };
-    }
-
     Ok(())
 }
 
@@ -1824,10 +1765,19 @@ fn handle_connection(
             let req = Request::new(raw.clone(), dict.clone(), site_dir.clone());
 
             // Dispatch to code handler or template render.
-            let mut resp = if let Some(handler) = code_handlers.get(&route.pattern) {
-                match handler.call(&req) {
-                    Ok(r) => r,
-                    Err(e) => error_to_response(&e),
+            // A code handler is only used when the matched route is a code route
+            // (template is None). If the matched route has a template (config route),
+            // use the template even if a code handler exists for the same pattern
+            // — this ensures GET routes handled by config are not shadowed by POST
+            // code handlers registered on the same path.
+            let mut resp = if route.template.is_none() {
+                if let Some(handler) = code_handlers.get(&route.pattern) {
+                    match handler.call(&req) {
+                        Ok(r) => r,
+                        Err(e) => error_to_response(&e),
+                    }
+                } else {
+                    Response::not_found()
                 }
             } else if let Some(template) = &route.template {
                 match Response::render_dict(template, &dict, route.status) {
@@ -1841,7 +1791,7 @@ fn handle_connection(
             // Render template if needed.
             if resp.template_name.is_some() {
                 if let Err(e) = fs_r.render_response(&mut resp, &dict) {
-                    error!("Template render error: {e}");
+                    error!("Template render error: {e:#}");
                     resp = Response::status(500);
                 }
             }
@@ -1849,6 +1799,11 @@ fn handle_connection(
             // Add Cache-Control header.
             let cache = if route.cache == "no-store" { "no-store" } else { "public" };
             resp = resp.header("Cache-Control", cache);
+
+            // Add any extra per-route headers (e.g. COOP/COEP for cross-origin isolation).
+            for (k, v) in &route.headers {
+                resp.headers.push((k.clone(), v.clone()));
+            }
 
             resp
         }
@@ -1980,6 +1935,7 @@ mod tests {
             params_files: vec![],
             status: 200,
             cache: "public".to_string(),
+            headers: vec![],
             specificity: 3,
         };
         let segs: Vec<&str> = "/blog/hello-world".split('/').filter(|s| !s.is_empty()).collect();
@@ -2000,6 +1956,7 @@ mod tests {
             params_files: vec![],
             status: 200,
             cache: "public".to_string(),
+            headers: vec![],
             specificity: 3,
         };
         let segs_ab: Vec<&str> = "/blog/a/b".split('/').filter(|s| !s.is_empty()).collect();
@@ -2019,6 +1976,7 @@ mod tests {
                 params_files: vec![],
                 status: 200,
                 cache: "public".to_string(),
+                headers: vec![],
                 specificity: route_specificity(&compile_pattern("/blog/{stem}")),
             },
             CompiledRoute {
@@ -2029,6 +1987,7 @@ mod tests {
                 params_files: vec![],
                 status: 200,
                 cache: "public".to_string(),
+                headers: vec![],
                 specificity: route_specificity(&compile_pattern("/blog/about")),
             },
         ];
