@@ -233,6 +233,7 @@ fn http11_version_field_is_http11() {
 
 /// Build a rustls ClientConfig that trusts the given DER cert and advertises h2.
 fn make_h2_client_config(cert_der: &[u8]) -> Arc<rustls::ClientConfig> {
+    rustls::crypto::ring::default_provider().install_default().ok();
     let cert = rustls::pki_types::CertificateDer::from(cert_der.to_vec());
     let mut root_store = rustls::RootCertStore::empty();
     root_store.add(cert).expect("add test cert");
