@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::config::BackendConfig;
+use rustls_native_certs;
+use webpki_roots;
 
 /// State of a single backend socket member.
 #[derive(Debug)]
@@ -206,12 +208,96 @@ pub enum PoolError {
     ConnectFailed(std::io::Error),
 }
 
+/// A URL-based backend (remote HTTP/HTTPS upstream).
+struct UrlBackend {
+    name: String,
+    url: String,
+    /// TLS client config built once at startup (avoids per-request cert loading).
+    tls_config: std::sync::Arc<rustls::ClientConfig>,
+    skip_verify: bool,
+}
+
+fn build_tls_client_config_alpn(skip_verify: bool, alpn: &[u8]) -> rustls::ClientConfig {
+    if skip_verify {
+        // Danger: accept any certificate. Test/dev only.
+        let mut cfg = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(SkipVerifier))
+            .with_no_client_auth();
+        cfg.alpn_protocols = vec![alpn.to_vec()];
+        cfg
+    } else {
+        let mut root_store = rustls::RootCertStore::empty();
+        let native_roots = rustls_native_certs::load_native_certs();
+        for cert in native_roots.certs {
+            let _ = root_store.add(cert);
+        }
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let mut cfg = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        cfg.alpn_protocols = vec![alpn.to_vec()];
+        cfg
+    }
+}
+
+fn build_tls_client_config(skip_verify: bool) -> rustls::ClientConfig {
+    build_tls_client_config_alpn(skip_verify, b"http/1.1")
+}
+
+/// Build a TLS client config advertising HTTP/2 via ALPN.
+/// Used for `h2s://` backends.
+pub fn build_h2_tls_client_config(skip_verify: bool) -> rustls::ClientConfig {
+    build_tls_client_config_alpn(skip_verify, b"h2")
+}
+
+/// A no-op TLS certificate verifier for testing with self-signed certs.
+#[derive(Debug)]
+struct SkipVerifier;
+
+impl rustls::client::danger::ServerCertVerifier for SkipVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
 /// Manager for all backend pools.
 pub struct PoolManager {
     /// (name, pool) — linear scan; 2–5 entries in practice.
     pools: Vec<(String, BackendPool)>,
-    /// (name, url) — URL backends.
-    url_backends: Vec<(String, String)>,
+    /// URL backends — TLS config built once at startup.
+    url_backends: Vec<UrlBackend>,
 }
 
 impl PoolManager {
@@ -227,7 +313,18 @@ impl PoolManager {
                 pool.rescan();
                 mgr.pools.push((b.name.clone(), pool));
             } else if let Some(ref url) = b.url {
-                mgr.url_backends.push((b.name.clone(), url.clone()));
+                // h2s:// backends need ALPN "h2"; all others use "http/1.1".
+                let tls_config = if url.starts_with("h2s://") {
+                    std::sync::Arc::new(build_h2_tls_client_config(b.tls_skip_verify))
+                } else {
+                    std::sync::Arc::new(build_tls_client_config(b.tls_skip_verify))
+                };
+                mgr.url_backends.push(UrlBackend {
+                    name: b.name.clone(),
+                    url: url.clone(),
+                    tls_config,
+                    skip_verify: b.tls_skip_verify,
+                });
             }
         }
         mgr
@@ -242,7 +339,14 @@ impl PoolManager {
     }
 
     pub fn get_url(&self, name: &str) -> Option<&str> {
-        self.url_backends.iter().find(|(n, _)| n == name).map(|(_, u)| u.as_str())
+        self.url_backends.iter().find(|b| b.name == name).map(|b| b.url.as_str())
+    }
+
+    /// Returns (url, tls_config, skip_verify) for a URL backend.
+    pub fn get_url_info(&self, name: &str) -> Option<(&str, std::sync::Arc<rustls::ClientConfig>, bool)> {
+        self.url_backends.iter().find(|b| b.name == name).map(|b| {
+            (b.url.as_str(), b.tls_config.clone(), b.skip_verify)
+        })
     }
 
     /// Handle a socket appearing — add to matching pool.

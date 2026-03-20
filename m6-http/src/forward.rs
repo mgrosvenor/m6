@@ -344,10 +344,15 @@ pub fn parse_request(data: &[u8]) -> Result<HttpRequest, String> {
     Ok(HttpRequest { method, path, query, version, headers: parsed_headers, body })
 }
 
-/// Forward a request to a URL backend over HTTP/1.1 + TLS.
+/// Forward a request to a URL backend over HTTP/1.1.
 ///
-/// `base_url` must be `https://host[:port]`, `http://host[:port]`, or
-/// `h2c://host[:port]` (HTTP/2 cleartext).
+/// `base_url` must be `https://host[:port]` (HTTP/1.1 over TLS) or
+/// `http://host[:port]` (HTTP/1.1 plain).
+///
+/// `h2c://` and `h2s://` backends are dispatched via their respective
+/// persistent client pools (`H2cClientPool` / `H2sTlsClientPool`) and must
+/// NOT be passed to this function.
+///
 /// `tls_config` is a pre-built rustls ClientConfig (built once at startup by
 /// PoolManager — avoids expensive per-request native cert loading).
 ///
@@ -386,6 +391,11 @@ pub fn forward_url_request(
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "h2c:// backends must be dispatched via H2cClientPool, not forward_url_request",
+        ))
+    } else if scheme == "h2s" {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "h2s:// backends must be dispatched via H2sTlsClientPool, not forward_url_request",
         ))
     } else {
         use std::io::Write;

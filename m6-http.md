@@ -49,9 +49,11 @@ Each `[[backend]]` with `sockets` is a pool. m6-http discovers pool members by w
 
 **Load balancing:** least-connections across active pool members.
 
-**URL backends** are not pooled — single upstream. Currently only HTTP/1.1 is supported over `http://` and `https://` URLs; HTTP/2 ALPN negotiation is not yet implemented.
+**URL backends** (`http://`, `https://`) are not pooled — one HTTP/1.1 connection per request, run on a dedicated I/O thread.
 
 **H2C backends** use the `h2c://` scheme (e.g. `url = "h2c://10.0.0.2:8080"`). The connection is maintained persistently by an event-loop-driven `H2cClientPool` — no thread is spawned. Intended for inter-node requests over WireGuard tunnels, where TLS at the application layer is redundant.
+
+**H2S backends** use the `h2s://` scheme (e.g. `url = "h2s://api.example.com:443"`). Like H2C but over TLS — ALPN negotiates `h2` during the handshake; startup fails if the server does not support it. The connection is maintained persistently by an event-loop-driven `H2sTlsClientPool`. Intended for HTTP/2 forwarding to external TLS-terminating upstreams.
 
 ---
 
@@ -212,6 +214,25 @@ Outbound H2C connections are maintained persistently by `H2cClientPool`, driven 
 
 ---
 
+## H2S (HTTP/2 over TLS)
+
+**Outbound H2S** — use the `h2s://` scheme in a backend URL:
+
+```toml
+[[backend]]
+name = "api"
+url  = "h2s://api.example.com:443"
+
+[[backend]]
+name = "api-dev"
+url              = "h2s://dev.example.com:443"
+tls_skip_verify  = true   # dev/test only
+```
+
+m6-http performs TLS negotiation with ALPN `h2` at startup of the first request. If the server does not accept `h2` in ALPN, the connection attempt fails with a 502. The connection is maintained persistently by `H2sTlsClientPool`, event-loop driven — identical to `H2cClientPool` but with a TLS record layer. Multiple requests to the same upstream are multiplexed over the single persistent H2 connection.
+
+---
+
 ## Event Loop
 
 Single-threaded epoll. No Tokio.
@@ -221,7 +242,7 @@ Single-threaded epoll. No Tokio.
 - No blocking calls in event loop
 - Cache behind `Arc`, swapped atomically — never mutated in place
 - inotify fd in same epoll set as network fds
-- H2C client pool driven in the event loop alongside TLS/QUIC listeners
+- H2C and H2S client pools driven in the event loop alongside TLS/QUIC listeners
 
 ---
 

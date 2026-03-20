@@ -25,6 +25,7 @@ use m6_http_lib::config::{self, Config};
 use m6_http_lib::error::{self as error, make_error_response, ErrorMode};
 use m6_http_lib::forward::{self, HttpRequest, HttpResponse};
 use m6_http_lib::h2c_client::H2cClientPool;
+use m6_http_lib::h2s_client::H2sTlsClientPool;
 use m6_http_lib::pool::{self, PoolManager};
 use m6_http_lib::poller::{Poller, Token};
 use m6_http_lib::router::{self, RouteTable};
@@ -40,6 +41,7 @@ const TOKEN_INOTIFY: Token = Token(1);
 const TOKEN_TCP: Token = Token(2);
 const TOKEN_H2C: Token = Token(3);
 const TOKEN_H2C_CLIENT: Token = Token(4);
+const TOKEN_H2S_CLIENT: Token = Token(5);
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
 // ── Shutdown flags ───────────────────────────────────────────────────────────
@@ -86,6 +88,8 @@ struct ServerState {
     prefetch_queue: std::collections::VecDeque<String>,
     /// Persistent non-blocking H2C outbound client pool.
     h2c_pool: H2cClientPool,
+    /// Persistent non-blocking H2S (HTTP/2 over TLS) outbound client pool.
+    h2s_pool: H2sTlsClientPool,
 }
 
 // ── Signal handling ───────────────────────────────────────────────────────────
@@ -423,8 +427,9 @@ fn event_loop(
         // Drive connection timeouts and flush pending sends
         flush_all(&udp, &mut connections);
 
-        // Drive outbound H2C client connections.
+        // Drive outbound H2C and H2S client connections.
         state.h2c_pool.drive_all(&poller, TOKEN_H2C_CLIENT);
+        state.h2s_pool.drive_all(&poller, TOKEN_H2S_CLIENT);
 
         // Poll pending URL-backend responses for H3 streams.
         for qconn in connections.values_mut() {
@@ -1061,6 +1066,16 @@ fn handle_request(
                 Ok(rx) => rx,
                 Err(e) => {
                     warn!(backend = %backend_name, error = %e, "h2c dispatch failed");
+                    let (s, h, b) = make_error_response(502, &state.error_mode, &req.path);
+                    return RequestOutcome::Ready(s, h, b, "error".to_string(), std::sync::Arc::new(vec![]));
+                }
+            }
+        } else if url.starts_with("h2s://") {
+            // Persistent non-blocking H2S (HTTP/2 over TLS) client — event-loop managed.
+            match state.h2s_pool.dispatch(&url, req, client_ip, original_host, _tls_config) {
+                Ok(rx) => rx,
+                Err(e) => {
+                    warn!(backend = %backend_name, error = %e, "h2s dispatch failed");
                     let (s, h, b) = make_error_response(502, &state.error_mode, &req.path);
                     return RequestOutcome::Ready(s, h, b, "error".to_string(), std::sync::Arc::new(vec![]));
                 }
@@ -1724,6 +1739,7 @@ fn run(args: Vec<String>) -> i32 {
         stats: Stats::new(),
         prefetch_queue: std::collections::VecDeque::new(),
         h2c_pool: H2cClientPool::new(),
+        h2s_pool: H2sTlsClientPool::new(),
     };
 
     event_loop(udp, tcp_listener, h2c_listener, watcher, &mut state, &mut quiche_config, &log_handle)
