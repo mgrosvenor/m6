@@ -49,7 +49,7 @@ Each `[[backend]]` with `sockets` is a pool. m6-http discovers pool members by w
 
 **Load balancing:** least-connections across active pool members.
 
-**URL backends** are not pooled — single upstream, HTTP version negotiated via ALPN.
+**URL backends** are not pooled — single upstream. Currently only HTTP/1.1 is supported over `http://` and `https://` URLs; HTTP/2 ALPN negotiation is not yet implemented.
 
 **H2C backends** use the `h2c://` scheme (e.g. `url = "h2c://10.0.0.2:8080"`). The connection is maintained persistently by an event-loop-driven `H2cClientPool` — no thread is spawned. Intended for inter-node requests over WireGuard tunnels, where TLS at the application layer is redundant.
 
