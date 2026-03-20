@@ -5,7 +5,9 @@
 ///   --http2-only        only run HTTP/2 suites
 ///   --http3-only        only run HTTP/3 suites
 ///   --h2c-only          only run H2C suites (HTTP/2 cleartext, for WireGuard tunnels)
+///   --url-only          only run URL-backend suites (h2 inbound, http/https/h2c/h2s outbound)
 ///   --h2c               include H2C suites alongside the selected protocols
+///   --url               include URL-backend suites alongside the selected protocols
 ///   --skip-verify       skip TLS certificate verification
 ///   --latency-n N       requests per latency run (default 2000)
 ///   --duration S        throughput run duration in seconds (default 10)
@@ -35,6 +37,8 @@ struct Args {
     http2:  bool,
     http3:  bool,
     h2c:    bool,
+    /// Include URL-backend suites (http/https/h2c/h2s outbound via m6-http H2 inbound).
+    url:    bool,
     skip_verify:      bool,
     latency_only:     bool,
     throughput_only:  bool,
@@ -55,6 +59,7 @@ impl Args {
             http2:  true,
             http3:  true,
             h2c:    false,
+            url:    false,
             skip_verify:     false,
             latency_only:    false,
             throughput_only: false,
@@ -71,11 +76,13 @@ impl Args {
         let mut i = 0;
         while i < raw.len() {
             match raw[i].as_str() {
-                "--http11-only"      => { a.http11 = true;  a.http2 = false; a.http3 = false; a.h2c = false; }
-                "--http2-only"       => { a.http11 = false; a.http2 = true;  a.http3 = false; a.h2c = false; }
-                "--http3-only"       => { a.http11 = false; a.http2 = false; a.http3 = true;  a.h2c = false; }
-                "--h2c-only"         => { a.http11 = false; a.http2 = false; a.http3 = false; a.h2c = true; }
+                "--http11-only"      => { a.http11 = true;  a.http2 = false; a.http3 = false; a.h2c = false; a.url = false; }
+                "--http2-only"       => { a.http11 = false; a.http2 = true;  a.http3 = false; a.h2c = false; a.url = false; }
+                "--http3-only"       => { a.http11 = false; a.http2 = false; a.http3 = true;  a.h2c = false; a.url = false; }
+                "--h2c-only"         => { a.http11 = false; a.http2 = false; a.http3 = false; a.h2c = true;  a.url = false; }
+                "--url-only"         => { a.http11 = false; a.http2 = false; a.http3 = false; a.h2c = false; a.url = true; }
                 "--h2c"              => a.h2c = true,
+                "--url"              => a.url = true,
                 "--skip-verify"      => a.skip_verify = true,
                 "--latency-only"     => a.latency_only    = true,
                 "--throughput-only"  => a.throughput_only = true,
@@ -584,6 +591,69 @@ fn bench_http2_throughput(addr: &str, duration_s: u64, concurrency: usize, skip_
     Ok(completed as f64 / elapsed)
 }
 
+fn bench_http11_throughput_path(addr: &str, path: &str, duration_s: u64, concurrency: usize, tls_cfg: Arc<ClientConfig>) -> anyhow::Result<f64> {
+    let count    = Arc::new(AtomicUsize::new(0));
+    let deadline = Instant::now() + Duration::from_secs(duration_s);
+    let addr     = Arc::new(addr.to_string());
+    let path     = Arc::new(path.to_string());
+
+    let handles: Vec<_> = (0..concurrency).map(|_| {
+        let tls_cfg = Arc::clone(&tls_cfg);
+        let count   = Arc::clone(&count);
+        let addr    = Arc::clone(&addr);
+        let path    = Arc::clone(&path);
+        std::thread::spawn(move || {
+            while Instant::now() < deadline {
+                if http11_get_path(&addr, &path, Arc::clone(&tls_cfg)).is_ok() {
+                    count.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        })
+    }).collect();
+
+    let t0 = Instant::now();
+    for h in handles { h.join().ok(); }
+    let elapsed   = t0.elapsed().as_secs_f64();
+    let completed = count.load(Ordering::Relaxed);
+    Ok(completed as f64 / elapsed)
+}
+
+fn bench_http2_throughput_path(addr: &str, path: &str, duration_s: u64, concurrency: usize, skip_verify: bool) -> anyhow::Result<f64> {
+    let count    = Arc::new(AtomicUsize::new(0));
+    let deadline = Instant::now() + Duration::from_secs(duration_s);
+    let addr     = Arc::new(addr.to_string());
+    let path     = Arc::new(path.to_string());
+
+    let handles: Vec<_> = (0..concurrency).map(|_| {
+        let count = Arc::clone(&count);
+        let addr  = Arc::clone(&addr);
+        let path  = Arc::clone(&path);
+        std::thread::spawn(move || {
+            let tls_cfg = make_client_config_h2(skip_verify);
+            let result = (|| -> anyhow::Result<()> {
+                let mut client = H2Client::connect(&addr, Arc::clone(&tls_cfg))?;
+                while Instant::now() < deadline {
+                    if client.requests_done >= H2_MAX_REQUESTS_PER_CONN {
+                        client = H2Client::connect(&addr, Arc::clone(&tls_cfg))?;
+                    }
+                    match client.get(&path) {
+                        Ok(_) => { count.fetch_add(1, Ordering::Relaxed); }
+                        Err(e) => { eprintln!("h2 url throughput error: {e}"); }
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(e) = result { eprintln!("h2 url thread error: {e}"); }
+        })
+    }).collect();
+
+    let t0 = Instant::now();
+    for h in handles { h.join().ok(); }
+    let elapsed   = t0.elapsed().as_secs_f64();
+    let completed = count.load(Ordering::Relaxed);
+    Ok(completed as f64 / elapsed)
+}
+
 // ── H2C (HTTP/2 cleartext) helpers ────────────────────────────────────────────
 //
 // Mirrors H2Client but connects over plain TCP without TLS.
@@ -1017,6 +1087,82 @@ fn bench_http3_throughput(addr: &str, duration_s: u64, concurrency: usize, skip_
     Ok(completed as f64 / elapsed)
 }
 
+fn bench_h3_throughput_path(addr: &str, path: &str, duration_s: u64, concurrency: usize, skip_verify: bool) -> anyhow::Result<f64> {
+    let count    = Arc::new(AtomicUsize::new(0));
+    let deadline = Instant::now() + Duration::from_secs(duration_s);
+    let addr     = Arc::new(addr.to_string());
+    let path     = Arc::new(path.to_string());
+    let errors   = Arc::new(Mutex::new(Vec::<String>::new()));
+
+    let handles: Vec<_> = (0..concurrency).map(|_| {
+        let count  = Arc::clone(&count);
+        let addr   = Arc::clone(&addr);
+        let path   = Arc::clone(&path);
+        let errors = Arc::clone(&errors);
+        std::thread::spawn(move || {
+            let mut cfg = make_quiche_client_config(skip_verify);
+            let result = (|| -> anyhow::Result<()> {
+                let (mut conn, mut h3, mut udp) = h3_connect(&addr, &mut cfg)?;
+                let mut reqs: usize = 0;
+                while Instant::now() < deadline {
+                    if reqs >= H3_MAX_STREAMS_PER_CONN {
+                        let (c, h, u) = h3_connect(&addr, &mut cfg)?;
+                        conn = c; h3 = h; udp = u; reqs = 0;
+                    }
+                    reqs += 1;
+                    match h3_get(&mut conn, &mut h3, &udp, path.as_bytes()) {
+                        Ok(_) => { count.fetch_add(1, Ordering::Relaxed); }
+                        Err(e) => { eprintln!("h3 url throughput error: {e}"); }
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(e) = result { errors.lock().unwrap().push(e.to_string()); }
+        })
+    }).collect();
+
+    let t0 = Instant::now();
+    for h in handles { h.join().ok(); }
+    let elapsed   = t0.elapsed().as_secs_f64();
+    let completed = count.load(Ordering::Relaxed);
+    Ok(completed as f64 / elapsed)
+}
+
+fn bench_h2c_throughput_path(addr: &str, path: &str, duration_s: u64, concurrency: usize) -> anyhow::Result<f64> {
+    let count    = Arc::new(AtomicUsize::new(0));
+    let deadline = Instant::now() + Duration::from_secs(duration_s);
+    let addr     = Arc::new(addr.to_string());
+    let path     = Arc::new(path.to_string());
+
+    let handles: Vec<_> = (0..concurrency).map(|_| {
+        let count = Arc::clone(&count);
+        let addr  = Arc::clone(&addr);
+        let path  = Arc::clone(&path);
+        std::thread::spawn(move || {
+            let result = (|| -> anyhow::Result<()> {
+                let mut client = H2cClient::connect(&addr)?;
+                while Instant::now() < deadline {
+                    if client.requests_done >= H2C_MAX_REQUESTS_PER_CONN {
+                        client = H2cClient::connect(&addr)?;
+                    }
+                    match client.get(&path) {
+                        Ok(_) => { count.fetch_add(1, Ordering::Relaxed); }
+                        Err(e) => { eprintln!("h2c url throughput error: {e}"); }
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(e) = result { eprintln!("h2c url thread error: {e}"); }
+        })
+    }).collect();
+
+    let t0 = Instant::now();
+    for h in handles { h.join().ok(); }
+    let elapsed   = t0.elapsed().as_secs_f64();
+    let completed = count.load(Ordering::Relaxed);
+    Ok(completed as f64 / elapsed)
+}
+
 // ── Result reporter ───────────────────────────────────────────────────────────
 
 struct BenchResult {
@@ -1209,8 +1355,8 @@ fn main() {
     let run_path       = !args.latency_only    && !args.throughput_only;
     let run_throughput = !args.latency_only    && !args.path_only;
 
-    println!("m6-bench  target={}  h2c-target={}  skip-verify={}  http11={}  http2={}  http3={}  h2c={}",
-             args.addr, args.h2c_addr, args.skip_verify, args.http11, args.http2, args.http3, args.h2c);
+    println!("m6-bench  target={}  h2c-target={}  skip-verify={}  http11={}  http2={}  http3={}  h2c={}  url={}",
+             args.addr, args.h2c_addr, args.skip_verify, args.http11, args.http2, args.http3, args.h2c, args.url);
     println!("{:-<70}", "");
 
     // ── Latency ───────────────────────────────────────────────────────────────
@@ -1291,6 +1437,67 @@ fn main() {
             match bench_h2c_throughput(&args.h2c_addr, args.duration_s, args.concurrency) {
                 Ok(rps) => { if !print_result(&BenchResult::from_rps("H2C throughput", rps), 0.0, args.rps_min) { all_pass = false; } }
                 Err(e)  => { eprintln!("H2C throughput error: {e}"); all_pass = false; }
+            }
+        }
+    }
+
+    // ── URL-backend suites: all inbound × all URL outbound ───────────────────
+    // Produces a 4×4 matrix: (h1|h2|h3|h2c) inbound × (http|https|h2c|h2s) outbound.
+    // Routes /url/http/, /url/https/, /url/h2c/, /url/h2s/ must be in site.toml.
+    if args.url {
+        const URL_ROUTES: &[(&str, &str)] = &[
+            ("http",  "/url/http/"),
+            ("https", "/url/https/"),
+            ("h2c",   "/url/h2c/"),
+            ("h2s",   "/url/h2s/"),
+        ];
+        let tls_addr = args.addr.as_str();
+        let h2c_addr = args.h2c_addr.as_str();
+        // (label, addr, proto_id)  proto_id: 1=h1, 2=h2, 3=h3, 4=h2c
+        let inbounds: &[(&str, &str, u8)] = &[
+            ("h1",  tls_addr, 1),
+            ("h2",  tls_addr, 2),
+            ("h3",  tls_addr, 3),
+            ("h2c", h2c_addr, 4),
+        ];
+        if run_latency {
+            println!("{:-<70}", "");
+            for &(inbound, addr, proto) in inbounds {
+                for &(outbound, path) in URL_ROUTES {
+                    let name = format!("{inbound}→{outbound} latency");
+                    let result: anyhow::Result<Vec<f64>> = match proto {
+                        1 => { let cfg = make_client_config(args.skip_verify); bench_http11_latency_path(addr, path, args.latency_n, cfg) }
+                        2 => bench_http2_latency_path(addr, path, args.latency_n, args.skip_verify),
+                        3 => bench_h3_path_latency(addr, path, args.latency_n, args.skip_verify),
+                        4 => bench_h2c_latency_path(addr, path, args.latency_n),
+                        _ => unreachable!(),
+                    };
+                    match result {
+                        Ok(lats) => { if !print_result(&BenchResult::from_latencies(&name, lats), args.p99_limit_us, 0.0) { all_pass = false; } }
+                        Err(e)   => { eprintln!("{name} error: {e}"); all_pass = false; }
+                    }
+                }
+                println!(); // blank line between inbound groups
+            }
+        }
+        if run_throughput {
+            println!("{:-<70}", "");
+            for &(inbound, addr, proto) in inbounds {
+                for &(outbound, path) in URL_ROUTES {
+                    let name = format!("{inbound}→{outbound} throughput");
+                    let result: anyhow::Result<f64> = match proto {
+                        1 => { let cfg = make_client_config(args.skip_verify); bench_http11_throughput_path(addr, path, args.duration_s, args.concurrency, cfg) }
+                        2 => bench_http2_throughput_path(addr, path, args.duration_s, args.concurrency, args.skip_verify),
+                        3 => bench_h3_throughput_path(addr, path, args.duration_s, args.concurrency, args.skip_verify),
+                        4 => bench_h2c_throughput_path(addr, path, args.duration_s, args.concurrency),
+                        _ => unreachable!(),
+                    };
+                    match result {
+                        Ok(rps) => { if !print_result(&BenchResult::from_rps(&name, rps), 0.0, args.rps_min) { all_pass = false; } }
+                        Err(e)  => { eprintln!("{name} error: {e}"); all_pass = false; }
+                    }
+                }
+                println!(); // blank line between inbound groups
             }
         }
     }

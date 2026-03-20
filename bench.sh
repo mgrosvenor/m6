@@ -5,21 +5,37 @@
 #   ./bench.sh [--skip-verify] [--latency-n N] [--duration S] [--concurrency C]
 #              [--p99-limit-us F] [--rps-min F] [--addr HOST:PORT]
 #
-# All nine suites (H1/H2/H3 × latency/path/throughput) are run in sequence.
+# All suites (H1/H2/H3/H2C × socket latency/path/throughput + 4×4 URL matrix) are run.
 # Servers are restarted between each suite to avoid stale-connection pollution.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")" && pwd)"
 BENCH_PORT="${BENCH_PORT:-8443}"
 BENCH_ADDR="${BENCH_ADDR:-127.0.0.1:${BENCH_PORT}}"
+H2C_BENCH_PORT="${H2C_BENCH_PORT:-8080}"
+H2C_BENCH_ADDR="${H2C_BENCH_ADDR:-127.0.0.1:${H2C_BENCH_PORT}}"
 BENCH_DIR="/tmp/m6-bench"
 SITE_DIR="$BENCH_DIR/site"
 HTML_SOCK="$BENCH_DIR/m6-html-bench.sock"
 FILE_SOCK="$BENCH_DIR/m6-file-bench.sock"
 
+# URL backend ports (bench-url-backend instances that m6-http forwards to).
+URL_HTTP_PORT="${URL_HTTP_PORT:-18080}"
+URL_HTTPS_PORT="${URL_HTTPS_PORT:-18443}"
+URL_H2C_PORT="${URL_H2C_PORT:-18081}"
+URL_H2S_PORT="${URL_H2S_PORT:-18444}"
+URL_HTTP_ADDR="127.0.0.1:${URL_HTTP_PORT}"
+URL_HTTPS_ADDR="127.0.0.1:${URL_HTTPS_PORT}"
+URL_H2C_ADDR="127.0.0.1:${URL_H2C_PORT}"
+URL_H2S_ADDR="127.0.0.1:${URL_H2S_PORT}"
+
 HTML_PID=""
 FILE_PID=""
 HTTP_PID=""
+URL_HTTP_PID=""
+URL_HTTPS_PID=""
+URL_H2C_PID=""
+URL_H2S_PID=""
 
 # ── Parse pass-through flags ──────────────────────────────────────────────────
 # Extract flags we forward to m6-bench; discard protocol/suite filters
@@ -40,6 +56,7 @@ while [[ $i -lt ${#args[@]} ]]; do
             i=$(( i + 1 ))
             ;;
         --http11-only|--http2-only|--http3-only|\
+        --url-only|\
         --latency-only|--throughput-only|--path-only)
             # These are controlled by bench.sh; silently ignore if passed by user.
             ;;
@@ -56,16 +73,18 @@ echo "==> Building binaries..."
 cargo build --release \
     -p m6-http --bin m6-http \
     -p m6-http --bin m6-bench \
+    -p m6-http --bin bench-url-backend \
     -p m6-html \
     -p m6-file \
     2>&1 | grep -E "^(error|warning\[|Compiling|Finished)" || true
 
 M6_HTTP="$REPO/target/release/m6-http"
 M6_BENCH="$REPO/target/release/m6-bench"
+URL_BACKEND="$REPO/target/release/bench-url-backend"
 M6_HTML="$REPO/target/release/m6-html"
 M6_FILE="$REPO/target/release/m6-file"
 
-for bin in "$M6_HTTP" "$M6_BENCH" "$M6_HTML" "$M6_FILE"; do
+for bin in "$M6_HTTP" "$M6_BENCH" "$URL_BACKEND" "$M6_HTML" "$M6_FILE"; do
     if [[ ! -x "$bin" ]]; then
         echo "ERROR: $bin not found after build" >&2
         exit 1
@@ -128,12 +147,47 @@ backend = "m6-file"
 glob    = "tail/**/*"
 path    = "/tail/{relpath}"
 backend = "m6-file"
+
+[[backend]]
+name = "url-http"
+url  = "http://${URL_HTTP_ADDR}"
+
+[[backend]]
+name = "url-https"
+url             = "https://${URL_HTTPS_ADDR}"
+tls_skip_verify = true
+
+[[backend]]
+name = "url-h2c"
+url  = "h2c://${URL_H2C_ADDR}"
+
+[[backend]]
+name            = "url-h2s"
+url             = "h2s://${URL_H2S_ADDR}"
+tls_skip_verify = true
+
+[[route]]
+path    = "/url/http/"
+backend = "url-http"
+
+[[route]]
+path    = "/url/https/"
+backend = "url-https"
+
+[[route]]
+path    = "/url/h2c/"
+backend = "url-h2c"
+
+[[route]]
+path    = "/url/h2s/"
+backend = "url-h2s"
 EOF
 
-# system.toml — bind address and TLS.
+# system.toml — bind address, TLS, and H2C plain-TCP listener.
 cat > "$BENCH_DIR/system.toml" <<EOF
 [server]
 bind     = "$BENCH_ADDR"
+h2c_bind = "$H2C_BENCH_ADDR"
 tls_cert = "cert.pem"
 tls_key  = "key.pem"
 EOF
@@ -193,9 +247,13 @@ echo "    site ready."
 
 stop_all() {
     local pids=()
-    [[ -n "$HTML_PID" ]] && pids+=("$HTML_PID")
-    [[ -n "$FILE_PID" ]] && pids+=("$FILE_PID")
-    [[ -n "$HTTP_PID" ]] && pids+=("$HTTP_PID")
+    [[ -n "$HTML_PID"      ]] && pids+=("$HTML_PID")
+    [[ -n "$FILE_PID"      ]] && pids+=("$FILE_PID")
+    [[ -n "$HTTP_PID"      ]] && pids+=("$HTTP_PID")
+    [[ -n "$URL_HTTP_PID"  ]] && pids+=("$URL_HTTP_PID")
+    [[ -n "$URL_HTTPS_PID" ]] && pids+=("$URL_HTTPS_PID")
+    [[ -n "$URL_H2C_PID"   ]] && pids+=("$URL_H2C_PID")
+    [[ -n "$URL_H2S_PID"   ]] && pids+=("$URL_H2S_PID")
     if (( ${#pids[@]} > 0 )); then
         kill "${pids[@]}" 2>/dev/null || true
         wait "${pids[@]}" 2>/dev/null || true
@@ -204,6 +262,10 @@ stop_all() {
     HTML_PID=""
     FILE_PID=""
     HTTP_PID=""
+    URL_HTTP_PID=""
+    URL_HTTPS_PID=""
+    URL_H2C_PID=""
+    URL_H2S_PID=""
 }
 
 start_backends() {
@@ -231,6 +293,34 @@ start_backends() {
             exit 1
         fi
         sleep 0.2
+    done
+
+    echo "  -> Starting bench-url-backend instances..."
+    "$URL_BACKEND" --proto http  --addr "$URL_HTTP_ADDR"  \
+        >"$BENCH_DIR/url-http.log"  2>&1 &
+    URL_HTTP_PID=$!
+    "$URL_BACKEND" --proto https --addr "$URL_HTTPS_ADDR" \
+        --cert "$SITE_DIR/cert.pem" --key "$SITE_DIR/key.pem" \
+        >"$BENCH_DIR/url-https.log" 2>&1 &
+    URL_HTTPS_PID=$!
+    "$URL_BACKEND" --proto h2c  --addr "$URL_H2C_ADDR"  \
+        >"$BENCH_DIR/url-h2c.log"  2>&1 &
+    URL_H2C_PID=$!
+    "$URL_BACKEND" --proto h2s  --addr "$URL_H2S_ADDR"  \
+        --cert "$SITE_DIR/cert.pem" --key "$SITE_DIR/key.pem" \
+        >"$BENCH_DIR/url-h2s.log"  2>&1 &
+    URL_H2S_PID=$!
+
+    # Wait for all four URL backend TCP ports.
+    DEADLINE=$(( $(date +%s) + 10 ))
+    for port in "$URL_HTTP_PORT" "$URL_HTTPS_PORT" "$URL_H2C_PORT" "$URL_H2S_PORT"; do
+        while ! nc -z 127.0.0.1 "$port" 2>/dev/null; do
+            if (( $(date +%s) > DEADLINE )); then
+                echo "ERROR: bench-url-backend port $port did not open within 10 s." >&2
+                exit 1
+            fi
+            sleep 0.1
+        done
     done
 }
 
@@ -272,7 +362,8 @@ run_suite() {
     start_http
 
     "$M6_BENCH" \
-        --addr "$BENCH_ADDR" \
+        --addr     "$BENCH_ADDR" \
+        --h2c-addr "$H2C_BENCH_ADDR" \
         "$proto_flag" \
         "$suite_flag" \
         "${BENCH_PASS[@]}"
@@ -283,14 +374,22 @@ run_suite() {
 run_suite "HTTP/1.1 latency"    --http11-only --latency-only
 run_suite "HTTP/2  latency"     --http2-only  --latency-only
 run_suite "HTTP/3  latency"     --http3-only  --latency-only
+run_suite "H2C     latency"     --h2c-only    --latency-only
 
 run_suite "HTTP/1.1 path"       --http11-only --path-only
 run_suite "HTTP/2  path"        --http2-only  --path-only
 run_suite "HTTP/3  path"        --http3-only  --path-only
+run_suite "H2C     path"        --h2c-only    --path-only
 
 run_suite "HTTP/1.1 throughput" --http11-only --throughput-only
 run_suite "HTTP/2  throughput"  --http2-only  --throughput-only
 run_suite "HTTP/3  throughput"  --http3-only  --throughput-only
+run_suite "H2C     throughput"  --h2c-only    --throughput-only
+
+# ── URL-backend suites: 4×4 matrix (h1|h2|h3|h2c inbound × http|https|h2c|h2s outbound)
+# No path suite for URL backends (the fixed-body backend isn't wired to m6-html paths).
+run_suite "URL-backend latency"    --url-only --latency-only
+run_suite "URL-backend throughput" --url-only --throughput-only
 
 echo ""
 echo "======================================================================="
