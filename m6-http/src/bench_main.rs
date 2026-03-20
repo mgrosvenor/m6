@@ -4,13 +4,16 @@
 ///   --http11-only       only run HTTP/1.1 suites
 ///   --http2-only        only run HTTP/2 suites
 ///   --http3-only        only run HTTP/3 suites
+///   --h2c-only          only run H2C suites (HTTP/2 cleartext, for WireGuard tunnels)
+///   --h2c               include H2C suites alongside the selected protocols
 ///   --skip-verify       skip TLS certificate verification
 ///   --latency-n N       requests per latency run (default 2000)
 ///   --duration S        throughput run duration in seconds (default 10)
 ///   --concurrency C     parallel threads for throughput (default 8)
 ///   --p99-limit-us F    fail if p99 latency exceeds this in µs (default 50000)
 ///   --rps-min F         fail if throughput drops below this (default 50)
-///   --addr HOST:PORT    target address (default 127.0.0.1:8443)
+///   --addr HOST:PORT    target address for TLS protocols (default 127.0.0.1:8443)
+///   --h2c-addr HOST:PORT  target address for H2C (default 127.0.0.1:8080)
 ///
 /// Output: one result line per suite; exits non-zero if any threshold exceeded.
 
@@ -31,6 +34,7 @@ struct Args {
     http11: bool,
     http2:  bool,
     http3:  bool,
+    h2c:    bool,
     skip_verify:      bool,
     latency_only:     bool,
     throughput_only:  bool,
@@ -41,6 +45,7 @@ struct Args {
     p99_limit_us:     f64,
     rps_min:          f64,
     addr:             String,
+    h2c_addr:         String,
 }
 
 impl Args {
@@ -49,6 +54,7 @@ impl Args {
             http11: true,
             http2:  true,
             http3:  true,
+            h2c:    false,
             skip_verify:     false,
             latency_only:    false,
             throughput_only: false,
@@ -58,15 +64,18 @@ impl Args {
             concurrency:     8,
             p99_limit_us:    50_000.0,
             rps_min:         50.0,
-            addr: "127.0.0.1:8443".into(),
+            addr:     "127.0.0.1:8443".into(),
+            h2c_addr: "127.0.0.1:8080".into(),
         };
         let raw: Vec<String> = std::env::args().skip(1).collect();
         let mut i = 0;
         while i < raw.len() {
             match raw[i].as_str() {
-                "--http11-only"      => { a.http11 = true;  a.http2 = false; a.http3 = false; }
-                "--http2-only"       => { a.http11 = false; a.http2 = true;  a.http3 = false; }
-                "--http3-only"       => { a.http11 = false; a.http2 = false; a.http3 = true; }
+                "--http11-only"      => { a.http11 = true;  a.http2 = false; a.http3 = false; a.h2c = false; }
+                "--http2-only"       => { a.http11 = false; a.http2 = true;  a.http3 = false; a.h2c = false; }
+                "--http3-only"       => { a.http11 = false; a.http2 = false; a.http3 = true;  a.h2c = false; }
+                "--h2c-only"         => { a.http11 = false; a.http2 = false; a.http3 = false; a.h2c = true; }
+                "--h2c"              => a.h2c = true,
                 "--skip-verify"      => a.skip_verify = true,
                 "--latency-only"     => a.latency_only    = true,
                 "--throughput-only"  => a.throughput_only = true,
@@ -76,7 +85,8 @@ impl Args {
                 "--concurrency"      => { i += 1; a.concurrency  = raw[i].parse().expect("concurrency"); }
                 "--p99-limit-us"     => { i += 1; a.p99_limit_us = raw[i].parse().expect("p99-limit-us"); }
                 "--rps-min"          => { i += 1; a.rps_min      = raw[i].parse().expect("rps-min"); }
-                "--addr"             => { i += 1; a.addr = raw[i].clone(); }
+                "--addr"             => { i += 1; a.addr     = raw[i].clone(); }
+                "--h2c-addr"         => { i += 1; a.h2c_addr = raw[i].clone(); }
                 other => { eprintln!("Unknown flag: {other}"); std::process::exit(1); }
             }
             i += 1;
@@ -265,6 +275,24 @@ fn make_h2_get_headers(path: &str) -> Vec<u8> {
     }
     h.push(0x87); // :scheme https
     // :authority localhost — literal with incremental indexing, name index 1
+    h.extend_from_slice(&[0x41, 0x09, b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't']);
+    h
+}
+
+/// HPACK header block for H2C (`:scheme http`, not `https`).
+fn make_h2c_get_headers(path: &str) -> Vec<u8> {
+    let mut h = Vec::with_capacity(32);
+    h.push(0x82); // :method GET
+    let pb = path.as_bytes();
+    if path == "/" {
+        h.push(0x84); // :path /
+    } else {
+        h.push(0x04);
+        debug_assert!(pb.len() < 128, "path too long for simple HPACK length encoding");
+        h.push(pb.len() as u8);
+        h.extend_from_slice(pb);
+    }
+    h.push(0x86); // :scheme http (static table index 6; index 7 = https)
     h.extend_from_slice(&[0x41, 0x09, b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't']);
     h
 }
@@ -467,7 +495,14 @@ impl H2Client {
                 match ftype {
                     0x0 => { // DATA
                         if fsid == sid {
+                            let data_len = payload.len() as u32;
                             body.extend_from_slice(&payload);
+                            if data_len > 0 {
+                                // Send WINDOW_UPDATE for connection (sid=0) and stream
+                                self.conn.writer().write_all(&make_h2_frame(0x8, 0, 0, &data_len.to_be_bytes()))?;
+                                self.conn.writer().write_all(&make_h2_frame(0x8, 0, sid, &data_len.to_be_bytes()))?;
+                                self.flush_write()?;
+                            }
                             if flags & 0x1 != 0 { return Ok(body); } // END_STREAM
                         }
                     }
@@ -539,6 +574,206 @@ fn bench_http2_throughput(addr: &str, duration_s: u64, concurrency: usize, skip_
                 Ok(())
             })();
             if let Err(e) = result { eprintln!("h2 thread error: {e}"); }
+        })
+    }).collect();
+
+    let t0 = Instant::now();
+    for h in handles { h.join().ok(); }
+    let elapsed   = t0.elapsed().as_secs_f64();
+    let completed = count.load(Ordering::Relaxed);
+    Ok(completed as f64 / elapsed)
+}
+
+// ── H2C (HTTP/2 cleartext) helpers ────────────────────────────────────────────
+//
+// Mirrors H2Client but connects over plain TCP without TLS.
+// Intended for the h2c_bind port (e.g. 127.0.0.1:8080) used over WireGuard tunnels.
+
+/// Persistent HTTP/2 cleartext client over plain TCP.
+struct H2cClient {
+    stream:         TcpStream,
+    send_buf:       Vec<u8>,
+    recv_buf:       Vec<u8>,
+    tmp:            [u8; 8192],
+    next_stream_id: u32,
+    requests_done:  usize,
+}
+
+impl H2cClient {
+    fn connect(addr: &str) -> anyhow::Result<Self> {
+        // TCP connect — blocking during H2 setup phase.
+        let stream = TcpStream::connect(addr)?;
+        stream.set_nodelay(true)?;
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+
+        // Send client connection preface + empty SETTINGS.
+        (&stream).write_all(H2_CLIENT_PREFACE)?;
+        (&stream).write_all(&make_h2_frame(0x4, 0x0, 0, &[]))?;
+
+        // Read frames until we receive the server's SETTINGS (non-ACK).
+        let mut recv_buf: Vec<u8> = Vec::with_capacity(16_384);
+        let mut tmp = [0u8; 8192];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut got_settings = false;
+        while !got_settings {
+            if Instant::now() > deadline { anyhow::bail!("H2C setup timeout"); }
+            let n = (&stream).read(&mut tmp)?;
+            if n == 0 { anyhow::bail!("H2C: connection closed during setup"); }
+            recv_buf.extend_from_slice(&tmp[..n]);
+            while let Some((ftype, flags, _, total)) = try_parse_h2_frame(&recv_buf) {
+                if ftype == 0x4 && flags & 0x1 == 0 { got_settings = true; }
+                recv_buf.drain(..total);
+            }
+        }
+
+        // Acknowledge server SETTINGS.
+        (&stream).write_all(&make_h2_frame(0x4, 0x1, 0, &[]))?;
+
+        // Switch to non-blocking for all subsequent I/O.
+        stream.set_nonblocking(true)?;
+        stream.set_read_timeout(None)?;
+
+        Ok(H2cClient {
+            stream,
+            send_buf:       Vec::with_capacity(4096),
+            recv_buf,
+            tmp:            [0u8; 8192],
+            next_stream_id: 1,
+            requests_done:  0,
+        })
+    }
+
+    fn flush_write(&mut self) -> io::Result<()> {
+        loop {
+            if self.send_buf.is_empty() { break; }
+            match (&self.stream).write(&self.send_buf) {
+                Ok(0) => break,
+                Ok(n) => { self.send_buf.drain(..n); }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    fn fill_recv_deadline(&mut self, deadline: Instant) -> io::Result<()> {
+        loop {
+            match (&self.stream).read(&mut self.tmp) {
+                Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "closed")),
+                Ok(n) => { self.recv_buf.extend_from_slice(&self.tmp[..n]); break; }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(io::Error::new(io::ErrorKind::TimedOut, "deadline"));
+                    }
+                    self.flush_write()?;
+                    let timeout_ms = remaining.as_millis().min(100) as i32;
+                    unsafe {
+                        let mut pfd = libc::pollfd {
+                            fd: self.stream.as_raw_fd(), events: libc::POLLIN, revents: 0,
+                        };
+                        libc::poll(&mut pfd, 1, timeout_ms);
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    fn get(&mut self, path: &str) -> anyhow::Result<Vec<u8>> {
+        let sid = self.next_stream_id;
+        self.next_stream_id += 2;
+        self.requests_done += 1;
+
+        let headers = make_h2c_get_headers(path);
+        self.send_buf.extend_from_slice(&make_h2_frame(0x1, 0x05, sid, &headers));
+        self.flush_write()?;
+
+        let mut body = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+
+        loop {
+            if Instant::now() > deadline { anyhow::bail!("H2C response timeout"); }
+
+            if let Some((ftype, flags, fsid, total)) = try_parse_h2_frame(&self.recv_buf) {
+                let payload = self.recv_buf[9..total].to_vec();
+                self.recv_buf.drain(..total);
+                match ftype {
+                    0x0 => {
+                        if fsid == sid {
+                            let data_len = payload.len() as u32;
+                            body.extend_from_slice(&payload);
+                            if data_len > 0 {
+                                self.send_buf.extend_from_slice(&make_h2_frame(0x8, 0, 0, &data_len.to_be_bytes()));
+                                self.send_buf.extend_from_slice(&make_h2_frame(0x8, 0, sid, &data_len.to_be_bytes()));
+                                self.flush_write()?;
+                            }
+                            if flags & 0x1 != 0 { return Ok(body); }
+                        }
+                    }
+                    0x1 if fsid == sid => {
+                        if flags & 0x1 != 0 { return Ok(body); }
+                    }
+                    0x3 if fsid == sid => anyhow::bail!("server RST_STREAM on sid {sid}"),
+                    0x7 => anyhow::bail!("server sent GOAWAY"),
+                    _ => {}
+                }
+                continue;
+            }
+
+            self.fill_recv_deadline(deadline)
+                .map_err(|e| anyhow::anyhow!("H2C read: {}", e))?;
+        }
+    }
+}
+
+const H2C_MAX_REQUESTS_PER_CONN: usize = 1_000;
+
+fn bench_h2c_latency(addr: &str, n: usize) -> anyhow::Result<Vec<f64>> {
+    bench_h2c_latency_path(addr, "/", n)
+}
+
+fn bench_h2c_latency_path(addr: &str, path: &str, n: usize) -> anyhow::Result<Vec<f64>> {
+    let mut latencies = Vec::with_capacity(n);
+    let mut client = H2cClient::connect(addr)?;
+
+    for _ in 0..5 { client.get(path)?; } // warmup
+
+    for _ in 0..n {
+        if client.requests_done >= H2C_MAX_REQUESTS_PER_CONN {
+            client = H2cClient::connect(addr)?;
+        }
+        let t0 = Instant::now();
+        client.get(path)?;
+        latencies.push(t0.elapsed().as_secs_f64() * 1_000_000.0);
+    }
+    Ok(latencies)
+}
+
+fn bench_h2c_throughput(addr: &str, duration_s: u64, concurrency: usize) -> anyhow::Result<f64> {
+    let count    = Arc::new(AtomicUsize::new(0));
+    let deadline = Instant::now() + Duration::from_secs(duration_s);
+    let addr     = Arc::new(addr.to_string());
+
+    let handles: Vec<_> = (0..concurrency).map(|_| {
+        let count = Arc::clone(&count);
+        let addr  = Arc::clone(&addr);
+        std::thread::spawn(move || {
+            let result = (|| -> anyhow::Result<()> {
+                let mut client = H2cClient::connect(&addr)?;
+                while Instant::now() < deadline {
+                    if client.requests_done >= H2C_MAX_REQUESTS_PER_CONN {
+                        client = H2cClient::connect(&addr)?;
+                    }
+                    match client.get("/") {
+                        Ok(_) => { count.fetch_add(1, Ordering::Relaxed); }
+                        Err(e) => { eprintln!("h2c throughput error: {e}"); }
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(e) = result { eprintln!("h2c thread error: {e}"); }
         })
     }).collect();
 
@@ -934,7 +1169,7 @@ fn run_path_benchmarks(
     addr: &str,
     n: usize,
     skip_verify: bool,
-    proto: u8,           // 1=H1, 2=H2, 3=H3
+    proto: u8,           // 1=H1, 2=H2, 3=H3, 4=H2C
     tls_cfg: Option<Arc<ClientConfig>>,
     all_pass: &mut bool,
 ) {
@@ -953,6 +1188,7 @@ fn run_path_benchmarks(
             1 => bench_h1_path_latency(addr, path, n, Arc::clone(tls_cfg.as_ref().unwrap())),
             2 => bench_h2_path_latency(addr, path, n, skip_verify),
             3 => bench_h3_path_latency(addr, path, n, skip_verify),
+            4 => bench_h2c_latency_path(addr, path, n),
             _ => unreachable!(),
         };
         match result {
@@ -965,6 +1201,7 @@ fn run_path_benchmarks(
 // ── main ──────────────────────────────────────────────────────────────────────
 
 fn main() {
+    rustls::crypto::ring::default_provider().install_default().ok();
     let args = Args::parse();
     let mut all_pass = true;
 
@@ -972,8 +1209,8 @@ fn main() {
     let run_path       = !args.latency_only    && !args.throughput_only;
     let run_throughput = !args.latency_only    && !args.path_only;
 
-    println!("m6-bench  target={}  skip-verify={}  http11={}  http2={}  http3={}",
-             args.addr, args.skip_verify, args.http11, args.http2, args.http3);
+    println!("m6-bench  target={}  h2c-target={}  skip-verify={}  http11={}  http2={}  http3={}  h2c={}",
+             args.addr, args.h2c_addr, args.skip_verify, args.http11, args.http2, args.http3, args.h2c);
     println!("{:-<70}", "");
 
     // ── Latency ───────────────────────────────────────────────────────────────
@@ -997,6 +1234,12 @@ fn main() {
                 Err(e)   => { eprintln!("HTTP/3 latency error: {e}"); all_pass = false; }
             }
         }
+        if args.h2c {
+            match bench_h2c_latency(&args.h2c_addr, args.latency_n) {
+                Ok(lats) => { if !print_result(&BenchResult::from_latencies("H2C latency", lats), args.p99_limit_us, 0.0) { all_pass = false; } }
+                Err(e)   => { eprintln!("H2C latency error: {e}"); all_pass = false; }
+            }
+        }
     }
 
     // ── Path benchmarks ───────────────────────────────────────────────────────
@@ -1015,6 +1258,10 @@ fn main() {
         if args.http3 {
             run_path_benchmarks("HTTP/3", &args.addr, args.latency_n,
                 args.skip_verify, 3, None, &mut all_pass);
+        }
+        if args.h2c {
+            run_path_benchmarks("H2C", &args.h2c_addr, args.latency_n,
+                false, 4, None, &mut all_pass);
         }
     }
 
@@ -1038,6 +1285,12 @@ fn main() {
             match bench_http3_throughput(&args.addr, args.duration_s, args.concurrency, args.skip_verify) {
                 Ok(rps) => { if !print_result(&BenchResult::from_rps("HTTP/3 throughput", rps), 0.0, args.rps_min) { all_pass = false; } }
                 Err(e)  => { eprintln!("HTTP/3 throughput error: {e}"); all_pass = false; }
+            }
+        }
+        if args.h2c {
+            match bench_h2c_throughput(&args.h2c_addr, args.duration_s, args.concurrency) {
+                Ok(rps) => { if !print_result(&BenchResult::from_rps("H2C throughput", rps), 0.0, args.rps_min) { all_pass = false; } }
+                Err(e)  => { eprintln!("H2C throughput error: {e}"); all_pass = false; }
             }
         }
     }

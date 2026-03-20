@@ -19,9 +19,22 @@ use std::time::Instant;
 use rustls::ServerConnection;
 use tracing::warn;
 
-use crate::forward::HttpRequest;
-use crate::http2::Http2Conn;
+use crate::forward::{HttpRequest, HttpResponse, PendingUrlContext};
+use crate::http2::{Http2Conn, H2Io};
 use crate::poller::{Poller, Token};
+
+// ── Request outcome ───────────────────────────────────────────────────────────
+
+/// The result of dispatching a request to a backend.
+pub enum RequestOutcome {
+    /// Response is available immediately (cache hit, socket backend, auth error, etc.)
+    Ready(u16, Vec<(String, String)>, Vec<u8>, String, std::sync::Arc<Vec<String>>),
+    /// URL backend I/O dispatched to a thread; poll `rx` with `try_recv()`.
+    Pending {
+        rx:  std::sync::mpsc::Receiver<std::io::Result<HttpResponse>>,
+        ctx: PendingUrlContext,
+    },
+}
 
 // ── Per-connection state ──────────────────────────────────────────────────────
 
@@ -54,6 +67,10 @@ impl Conn {
 
 enum H1State {
     Reading { buf: Vec<u8> },
+    WaitingBackend {
+        rx:  std::sync::mpsc::Receiver<std::io::Result<HttpResponse>>,
+        ctx: PendingUrlContext,
+    },
     Writing { buf: Vec<u8>, pos: usize },
     Done,
 }
@@ -122,12 +139,14 @@ impl Http11Listener {
     }
 
     /// Drive all active connections. Done connections are deregistered and dropped.
-    pub fn drive_all<F>(&mut self, mut on_request: F, poller: &Poller)
+    pub fn drive_all<F, G>(&mut self, mut on_request: F, mut on_response: G, poller: &Poller)
     where
-        F: FnMut(&HttpRequest, &str) -> (u16, Vec<(String, String)>, Vec<u8>, String, std::sync::Arc<Vec<String>>),
+        F: FnMut(&HttpRequest, &str) -> RequestOutcome,
+        G: FnMut(std::io::Result<HttpResponse>, &PendingUrlContext)
+               -> (u16, Vec<(String, String)>, Vec<u8>, String, std::sync::Arc<Vec<String>>),
     {
         for conn in &mut self.conns {
-            drive_conn(conn, &mut on_request);
+            drive_conn(conn, &mut on_request, &mut on_response);
         }
         for conn in &self.conns {
             if conn.is_done() {
@@ -138,15 +157,95 @@ impl Http11Listener {
     }
 }
 
+// ── H2C (HTTP/2 cleartext) listener ──────────────────────────────────────────
+
+struct H2cPlainConn {
+    stream:    TcpStream,
+    h2:        Http2Conn,
+    client_ip: String,
+}
+
+pub struct H2cListener {
+    listener: TcpListener,
+    conns:    Vec<H2cPlainConn>,
+}
+
+impl H2cListener {
+    pub fn bind(addr: &str) -> anyhow::Result<Self> {
+        let listener = TcpListener::bind(addr)?;
+        listener.set_nonblocking(true)?;
+        Ok(H2cListener { listener, conns: Vec::new() })
+    }
+
+    pub fn raw_fd(&self) -> RawFd { self.listener.as_raw_fd() }
+
+    pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        self.listener.local_addr()
+    }
+
+    pub fn accept_pending(&mut self, poller: &Poller, token: Token) {
+        loop {
+            match self.listener.accept() {
+                Ok((stream, peer)) => {
+                    if let Err(e) = stream.set_nonblocking(true) {
+                        warn!("h2c set_nonblocking: {e}");
+                        continue;
+                    }
+                    stream.set_nodelay(true).ok();
+                    poller.add(stream.as_raw_fd(), token).ok();
+                    self.conns.push(H2cPlainConn {
+                        stream,
+                        h2: Http2Conn::new(),
+                        client_ip: peer.ip().to_string(),
+                    });
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => { warn!("h2c accept: {e}"); break; }
+            }
+        }
+    }
+
+    pub fn drive_all<F, G>(&mut self, mut on_request: F, mut on_response: G, poller: &Poller)
+    where
+        F: FnMut(&HttpRequest, &str) -> RequestOutcome,
+        G: FnMut(std::io::Result<HttpResponse>, &PendingUrlContext)
+               -> (u16, Vec<(String, String)>, Vec<u8>, String, std::sync::Arc<Vec<String>>),
+    {
+        for conn in &mut self.conns {
+            conn.h2.drive(
+                H2Io::Plain { stream: &conn.stream },
+                &conn.client_ip,
+                &mut on_request,
+                &mut on_response,
+            );
+        }
+        for conn in &self.conns {
+            if conn.h2.is_done() {
+                poller.delete(conn.stream.as_raw_fd()).ok();
+            }
+        }
+        self.conns.retain(|c| !c.h2.is_done());
+    }
+}
+
 // ── Per-connection driver ─────────────────────────────────────────────────────
 
-fn drive_conn<F>(conn: &mut Conn, on_request: &mut F)
+fn drive_conn<F, G>(conn: &mut Conn, on_request: &mut F, on_response: &mut G)
 where
-    F: FnMut(&HttpRequest, &str) -> (u16, Vec<(String, String)>, Vec<u8>, String, std::sync::Arc<Vec<String>>),
+    F: FnMut(&HttpRequest, &str) -> RequestOutcome,
+    G: FnMut(std::io::Result<HttpResponse>, &PendingUrlContext)
+           -> (u16, Vec<(String, String)>, Vec<u8>, String, std::sync::Arc<Vec<String>>),
 {
     // HTTP/2: stream and tls are in conn; pass them by reference.
     if let ConnKind::Http2(h2) = &mut conn.kind {
-        h2.drive(&mut conn.tls, &conn.stream, on_request);
+        let client_ip = conn.stream.peer_addr()
+            .map(|a| a.ip().to_string())
+            .unwrap_or_default();
+        h2.drive(
+            H2Io::Tls { tls: &mut conn.tls, stream: &conn.stream },
+            &client_ip,
+            on_request, on_response,
+        );
         return;
     }
 
@@ -174,7 +273,11 @@ where
             conn.kind = ConnKind::Http2(Http2Conn::new());
             // Drive immediately — client preface may already be buffered.
             let ConnKind::Http2(h2) = &mut conn.kind else { return };
-            h2.drive(&mut conn.tls, &conn.stream, on_request);
+            h2.drive(
+                H2Io::Tls { tls: &mut conn.tls, stream: &conn.stream },
+                &client_ip,
+                on_request, on_response,
+            );
             return;
         } else {
             conn.kind = ConnKind::Http1(H1Conn {
@@ -187,17 +290,20 @@ where
 
     // Drive HTTP/1.1 state machine.
     let ConnKind::Http1(h1) = &mut conn.kind else { return };
-    drive_h1(&mut conn.tls, &conn.stream, h1, on_request);
+    drive_h1(&mut conn.tls, &conn.stream, h1, on_request, on_response);
 }
 
-fn drive_h1<F>(
-    tls: &mut ServerConnection,
-    stream: &TcpStream,
-    h1: &mut H1Conn,
-    on_request: &mut F,
+fn drive_h1<F, G>(
+    tls:         &mut ServerConnection,
+    stream:      &TcpStream,
+    h1:          &mut H1Conn,
+    on_request:  &mut F,
+    on_response: &mut G,
 )
 where
-    F: FnMut(&HttpRequest, &str) -> (u16, Vec<(String, String)>, Vec<u8>, String, std::sync::Arc<Vec<String>>),
+    F: FnMut(&HttpRequest, &str) -> RequestOutcome,
+    G: FnMut(std::io::Result<HttpResponse>, &PendingUrlContext)
+           -> (u16, Vec<(String, String)>, Vec<u8>, String, std::sync::Arc<Vec<String>>),
 {
     if h1.created.elapsed().as_secs() > READ_TIMEOUT_SECS {
         h1.state = H1State::Done;
@@ -229,23 +335,63 @@ where
                         continue;
                     }
                     ParseResult::Complete(req) => {
-                        let (status, resp_headers, body, _, hints) = on_request(&req, &h1.client_ip);
-                        let mut buf = Vec::new();
-                        if !hints.is_empty() {
-                            buf.extend_from_slice(b"HTTP/1.1 103 Early Hints\r\n");
-                            for url in hints.iter() {
-                                let lh = crate::hints::link_header(url);
-                                buf.extend_from_slice(b"link: ");
-                                buf.extend_from_slice(lh.as_bytes());
-                                buf.extend_from_slice(b"\r\n");
+                        match on_request(&req, &h1.client_ip) {
+                            RequestOutcome::Ready(status, resp_headers, body, _, hints) => {
+                                let mut buf = Vec::new();
+                                if !hints.is_empty() {
+                                    buf.extend_from_slice(b"HTTP/1.1 103 Early Hints\r\n");
+                                    for url in hints.iter() {
+                                        let lh = crate::hints::link_header(url);
+                                        buf.extend_from_slice(b"link: ");
+                                        buf.extend_from_slice(lh.as_bytes());
+                                        buf.extend_from_slice(b"\r\n");
+                                    }
+                                    buf.extend_from_slice(b"\r\n");
+                                }
+                                buf.extend_from_slice(&build_response(status, &resp_headers, &body));
+                                h1.state = H1State::Writing { buf, pos: 0 };
+                                continue;
                             }
-                            buf.extend_from_slice(b"\r\n");
+                            RequestOutcome::Pending { rx, ctx } => {
+                                h1.state = H1State::WaitingBackend { rx, ctx };
+                                break; // nothing more to do; poll next iteration
+                            }
                         }
-                        buf.extend_from_slice(&build_response(status, &resp_headers, &body));
-                        h1.state = H1State::Writing { buf, pos: 0 };
-                        continue;
                     }
                 }
+            }
+            H1State::WaitingBackend { .. } => {
+                use std::sync::mpsc::TryRecvError;
+                // Move state out so we can destructure and replace.
+                let old = std::mem::replace(&mut h1.state, H1State::Done);
+                let H1State::WaitingBackend { rx, ctx } = old else { break };
+                let http_result = match rx.try_recv() {
+                    Ok(r)  => r,
+                    Err(TryRecvError::Empty) => {
+                        h1.state = H1State::WaitingBackend { rx, ctx }; // put back
+                        break;
+                    }
+                    Err(TryRecvError::Disconnected) => Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe, "url backend thread died",
+                    )),
+                };
+                let (status, resp_headers, body, _, hints) = on_response(http_result, &ctx);
+                let mut buf = Vec::new();
+                if !hints.is_empty() {
+                    buf.extend_from_slice(b"HTTP/1.1 103 Early Hints\r\n");
+                    for url in hints.iter() {
+                        let lh = crate::hints::link_header(url);
+                        buf.extend_from_slice(b"link: ");
+                        buf.extend_from_slice(lh.as_bytes());
+                        buf.extend_from_slice(b"\r\n");
+                    }
+                    buf.extend_from_slice(b"\r\n");
+                }
+                buf.extend_from_slice(&build_response(status, &resp_headers, &body));
+                h1.state = H1State::Writing { buf, pos: 0 };
+                // pump TLS to start sending immediately
+                if advance_tls(tls, stream).is_err() { h1.state = H1State::Done; return; }
+                continue; // fall through to Writing
             }
             H1State::Writing { buf, pos } => {
                 let remaining = &buf[*pos..];

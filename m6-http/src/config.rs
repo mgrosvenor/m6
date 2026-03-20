@@ -34,6 +34,10 @@ pub struct ServerConfig {
     /// Timeout in seconds for a backend call (connect + write + read). Default: 30.
     #[serde(default = "default_backend_timeout_secs")]
     pub backend_timeout_secs: u64,
+    /// Optional H2C (HTTP/2 cleartext) listener address.
+    /// Intended for use over WireGuard tunnels or trusted private networks.
+    #[serde(default)]
+    pub h2c_bind: Option<String>,
 }
 
 fn default_backend_timeout_secs() -> u64 {
@@ -91,6 +95,10 @@ pub struct BackendConfig {
     pub sockets: Option<String>,
     /// URL upstream, e.g. "https://api.example.com"
     pub url: Option<String>,
+    /// Skip TLS certificate verification for URL backends.
+    /// For testing with self-signed certs only — do not use in production.
+    #[serde(default)]
+    pub tls_skip_verify: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,6 +148,7 @@ struct RawServerSection {
     tls_cert: Option<String>,
     tls_key: Option<String>,
     backend_timeout_secs: Option<u64>,
+    h2c_bind: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -176,12 +185,14 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         tls_cert: None,
         tls_key: None,
         backend_timeout_secs: None,
+        h2c_bind: None,
     });
     let sys_server = system_parsed.server.unwrap_or(RawServerSection {
         bind: None,
         tls_cert: None,
         tls_key: None,
         backend_timeout_secs: None,
+        h2c_bind: None,
     });
 
     let bind = sys_server.bind.or(site_server.bind)
@@ -193,6 +204,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
     let backend_timeout_secs = sys_server.backend_timeout_secs
         .or(site_server.backend_timeout_secs)
         .unwrap_or(30);
+    let h2c_bind = sys_server.h2c_bind.or(site_server.h2c_bind);
 
     // Resolve TLS cert/key paths relative to site_dir if not absolute.
     let tls_cert_path = resolve_path(site_dir, &tls_cert);
@@ -210,6 +222,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         tls_cert: tls_cert_path.to_string_lossy().into_owned(),
         tls_key: tls_key_path.to_string_lossy().into_owned(),
         backend_timeout_secs,
+        h2c_bind,
     };
     let log = site_parsed.log.unwrap_or_default();
     let errors = site_parsed.errors.unwrap_or_default();

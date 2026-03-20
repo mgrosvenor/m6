@@ -4,6 +4,7 @@ pub mod cache;
 pub mod config;
 pub mod error;
 pub mod forward;
+pub mod h2c_client;
 pub mod pool;
 pub mod poller;
 pub mod router;

@@ -346,8 +346,10 @@ pub fn parse_request(data: &[u8]) -> Result<HttpRequest, String> {
 
 /// Forward a request to a URL backend over HTTP/1.1 + TLS.
 ///
-/// `base_url` must be `https://host[:port]` or `http://host[:port]`.
-/// ALPN is negotiated (h2 / http/1.1) but only HTTP/1.1 is spoken.
+/// `base_url` must be `https://host[:port]`, `http://host[:port]`, or
+/// `h2c://host[:port]` (HTTP/2 cleartext).
+/// `tls_config` is a pre-built rustls ClientConfig (built once at startup by
+/// PoolManager — avoids expensive per-request native cert loading).
 ///
 /// URL backends are not pooled — a new TCP connection is opened for every
 /// request. The `timeout` (if given) is applied as both read and write
@@ -358,11 +360,14 @@ pub fn forward_url_request(
     client_ip: &str,
     original_host: &str,
     timeout: Option<std::time::Duration>,
+    tls_config: std::sync::Arc<rustls::ClientConfig>,
 ) -> io::Result<HttpResponse> {
     // ── Parse URL ────────────────────────────────────────────────────────────
     let (scheme, authority) = parse_url_scheme_authority(base_url)?;
-    let use_tls = scheme == "https";
-    let (host, port) = split_host_port(&authority, if use_tls { 443 } else { 80 })?;
+    let (host, port) = split_host_port(&authority, match scheme.as_str() {
+        "https" => 443,
+        _ => 80, // http and h2c both default to 80
+    })?;
 
     // ── TCP connect ──────────────────────────────────────────────────────────
     use std::net::TcpStream;
@@ -373,19 +378,56 @@ pub fn forward_url_request(
         tcp.set_write_timeout(Some(dur))?;
     }
 
-    // ── Build request bytes (shared between TLS and plain) ───────────────────
-    let req_bytes = build_forwarded_request_bytes(req, &host, client_ip, original_host);
-
     // ── Send + receive ───────────────────────────────────────────────────────
-    if use_tls {
-        forward_over_tls(tcp, &host, req_bytes)
+    if scheme == "https" {
+        let req_bytes = build_forwarded_request_bytes(req, &host, client_ip, original_host);
+        forward_over_tls(tcp, &host, req_bytes, tls_config)
+    } else if scheme == "h2c" {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "h2c:// backends must be dispatched via H2cClientPool, not forward_url_request",
+        ))
     } else {
         use std::io::Write;
+        let req_bytes = build_forwarded_request_bytes(req, &host, client_ip, original_host);
         let mut stream = tcp;
         stream.write_all(&req_bytes)?;
         stream.flush()?;
         read_response(stream)
     }
+}
+
+/// Context carried alongside a pending URL-backend receiver so the event loop
+/// can finish processing (cache insertion, hints, error-mode) when the I/O
+/// thread returns.  All fields are cheaply cloneable.
+#[derive(Clone)]
+pub struct PendingUrlContext {
+    pub req:          HttpRequest,
+    pub client_ip:    String,
+    pub enc:          String,
+    pub backend_name: String,
+    pub bypass_cache: bool,
+}
+
+/// Dispatch a URL-backend request to a dedicated I/O thread.
+///
+/// Returns a one-shot channel.  The caller MUST poll with `try_recv()` inside
+/// the event loop — never block waiting on the receiver.
+pub fn dispatch_url_request(
+    base_url:      String,
+    req:           HttpRequest,
+    client_ip:     String,
+    original_host: String,
+    timeout:       Option<std::time::Duration>,
+    tls_config:    std::sync::Arc<rustls::ClientConfig>,
+) -> std::sync::mpsc::Receiver<std::io::Result<HttpResponse>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(forward_url_request(
+            &base_url, &req, &client_ip, &original_host, timeout, tls_config,
+        ));
+    });
+    rx
 }
 
 /// Build a forwarded HTTP/1.1 request byte buffer (no TLS framing).
@@ -490,34 +532,16 @@ fn split_host_port(authority: &str, default_port: u16) -> io::Result<(String, u1
 }
 
 /// Send `req_bytes` over a TLS-wrapped TCP stream to `host` and read back the response.
+/// `tls_config` is the pre-built ClientConfig from PoolManager (avoids per-request cert loading).
 fn forward_over_tls(
     tcp: std::net::TcpStream,
     host: &str,
     req_bytes: Vec<u8>,
+    tls_config: std::sync::Arc<rustls::ClientConfig>,
 ) -> io::Result<HttpResponse> {
     use std::io::Write;
-    use std::sync::Arc;
     use rustls::ClientConnection;
     use rustls::StreamOwned;
-
-    // Build TLS config with ALPN h2 + http/1.1.
-    let mut root_store = rustls::RootCertStore::empty();
-    // Load native system roots first.
-    let native_roots = rustls_native_certs::load_native_certs();
-    for cert in native_roots.certs {
-        let _ = root_store.add(cert);
-    }
-    // Also include webpki roots as fallback.
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-    let mut tls_config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-
-    // ALPN: prefer h2 then http/1.1 (we only speak http/1.1 but negotiate h2 to be compatible)
-    tls_config.alpn_protocols = vec![b"http/1.1".to_vec(), b"h2".to_vec()];
-
-    let tls_config = Arc::new(tls_config);
 
     let server_name = rustls::pki_types::ServerName::try_from(host.to_string()).map_err(|_| {
         io::Error::new(io::ErrorKind::InvalidInput, format!("invalid server name: {}", host))

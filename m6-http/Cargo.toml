@@ -11,6 +11,14 @@ path = "src/main.rs"
 name = "m6-bench"
 path = "src/bench_main.rs"
 
+[[bin]]
+name = "m6-bench-detail"
+path = "src/bench_detail.rs"
+
+[[bin]]
+name = "m6-bench-coldstart"
+path = "src/bench_coldstart.rs"
+
 [lib]
 name = "m6_http_lib"
 path = "src/lib.rs"
@@ -41,18 +49,19 @@ rustls-pemfile = "2"
 rustls-native-certs = "0.8"
 webpki-roots   = "0.26"
 rand           = "0.8"
+h2             = "0.4"
+tokio          = { version = "1", features = ["rt", "net", "io-util", "macros"] }
+tokio-rustls   = "0.26"
+http           = "1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 inotify = "0.10"
 
 [dev-dependencies]
-tempfile  = "3"
-anyhow    = "1"
-criterion = { version = "0.5", features = ["html_reports"] }
-rcgen     = "0.13"
-h2        = "0.4"
-tokio     = { version = "1", features = ["rt", "net", "io-util", "macros"] }
-http      = "1"
+tempfile      = "3"
+anyhow        = "1"
+criterion     = { version = "0.5", features = ["html_reports"] }
+rcgen         = "0.13"
 
 [[bench]]
 name    = "critical_path"

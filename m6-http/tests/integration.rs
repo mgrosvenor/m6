@@ -12,7 +12,7 @@ use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::thread;
 use std::time::Duration;
 
-use m6_http_lib::http11::{Http11Listener, make_tls_server_config};
+use m6_http_lib::http11::{Http11Listener, make_tls_server_config, RequestOutcome};
 use m6_http_lib::forward::HttpRequest;
 use m6_http_lib::poller::{Poller, Token};
 use quiche::h3::NameValue as _;
@@ -52,6 +52,7 @@ fn write_pem_files(tc: &TestCert) -> (tempfile::NamedTempFile, tempfile::NamedTe
 
 /// Build a rustls ClientConfig that trusts the given DER certificate.
 fn make_test_client_config(cert_der: &[u8]) -> Arc<rustls::ClientConfig> {
+    rustls::crypto::ring::default_provider().install_default().ok();
     let cert = rustls::pki_types::CertificateDer::from(cert_der.to_vec());
     let mut root_store = rustls::RootCertStore::empty();
     root_store.add(cert).expect("add test cert to root store");
@@ -74,6 +75,7 @@ fn start_http11_server<F>(
 where
     F: Fn(&HttpRequest, &str) -> (u16, Vec<(String, String)>, Vec<u8>, String) + Send + 'static,
 {
+    rustls::crypto::ring::default_provider().install_default().ok();
     let tls_cfg = make_tls_server_config(cert_path, key_path).expect("tls config");
     let mut listener = Http11Listener::bind("127.0.0.1:0", tls_cfg).expect("bind");
     let port = listener.local_addr().unwrap().port();
@@ -84,10 +86,14 @@ where
         let poller = Poller::new().expect("poller");
         while !stop2.load(Ordering::Relaxed) {
             listener.accept_pending(&poller, TOKEN_TCP);
-            listener.drive_all(|req, client_ip| {
-                let (s, h, b, be) = handler(req, client_ip);
-                (s, h, b, be, std::sync::Arc::new(vec![]))
-            }, &poller);
+            listener.drive_all(
+                |req, client_ip| {
+                    let (s, h, b, be) = handler(req, client_ip);
+                    RequestOutcome::Ready(s, h, b, be, std::sync::Arc::new(vec![]))
+                },
+                |_resp, _ctx| (503, vec![], vec![], "none".to_string(), std::sync::Arc::new(vec![])),
+                &poller,
+            );
             thread::sleep(Duration::from_millis(2));
         }
     });

@@ -11,12 +11,16 @@
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
 use std::time::Instant;
 
-use rustls::ServerConnection;
+use crate::forward::{HttpRequest, HttpResponse, PendingUrlContext};
+use crate::http11::RequestOutcome;
 
-use crate::forward::HttpRequest;
+/// I/O abstraction: TLS (HTTPS) or plain TCP (H2C over WireGuard).
+pub enum H2Io<'a> {
+    Tls { tls: &'a mut rustls::ServerConnection, stream: &'a std::net::TcpStream },
+    Plain { stream: &'a std::net::TcpStream },
+}
 
 // ── Frame type constants ──────────────────────────────────────────────────────
 
@@ -71,6 +75,8 @@ struct H2Stream {
     // Some  = response queued; resp_sent bytes already flushed.
     resp_body:    Option<Vec<u8>>,
     resp_sent:    usize,
+    /// Pending URL-backend request: set by maybe_dispatch when backend is async.
+    pending_rx:   Option<(std::sync::mpsc::Receiver<std::io::Result<HttpResponse>>, PendingUrlContext)>,
 }
 
 impl H2Stream {
@@ -83,6 +89,7 @@ impl H2Stream {
             send_window: initial_send_window,
             resp_body: None,
             resp_sent: 0,
+            pending_rx: None,
         }
     }
 }
@@ -145,36 +152,42 @@ impl Http2Conn {
 
     pub fn is_done(&self) -> bool { self.phase == Phase::Done }
 
-    /// Drive one step: pump TLS I/O, parse frames, dispatch requests.
-    pub fn drive<F>(
+    /// Drive one step: pump I/O, parse frames, dispatch requests.
+    pub fn drive<F, G>(
         &mut self,
-        tls:        &mut ServerConnection,
-        stream:     &TcpStream,
-        on_request: &mut F,
+        mut io:      H2Io<'_>,
+        client_ip:   &str,
+        on_request:  &mut F,
+        on_response: &mut G,
     )
     where
-        F: FnMut(&HttpRequest, &str) -> (u16, Vec<(String, String)>, Vec<u8>, String, std::sync::Arc<Vec<String>>),
+        F: FnMut(&HttpRequest, &str) -> RequestOutcome,
+        G: FnMut(std::io::Result<HttpResponse>, &PendingUrlContext)
+               -> (u16, Vec<(String, String)>, Vec<u8>, String, std::sync::Arc<Vec<String>>),
     {
         if self.phase == Phase::Done { return; }
+
+        // Poll any pending URL-backend receivers before processing new frames.
+        self.poll_pending_url(on_response);
 
         // Idle timeout: kill only if no frames have arrived for H2_IDLE_TIMEOUT_SECS.
         // H2 connections are long-lived (reused across many requests), so we
         // reset the clock on every received frame rather than from creation time.
         if self.last_active.elapsed().as_secs() > crate::http11::H2_IDLE_TIMEOUT_SECS {
             self.send_goaway(ERR_NO_ERROR);
-            self.flush_tls(tls, stream).ok();
+            self.flush_io(&mut io).ok();
             self.phase = Phase::Done;
             return;
         }
 
-        if let Err(e) = self.fill_recv(tls, stream) {
+        if let Err(e) = self.fill_recv(&mut io) {
             tracing::trace!("h2 fill_recv: {e}");
             self.phase = Phase::Done;
             return;
         }
 
         loop {
-            match self.process_frame(on_request, stream) {
+            match self.process_frame(on_request, client_ip) {
                 Ok(true)  => {}
                 Ok(false) => break,
                 Err(e)    => {
@@ -190,8 +203,8 @@ impl Http2Conn {
         // (e.g. a WINDOW_UPDATE was processed inside the frame loop above).
         self.flush_pending_streams();
 
-        if let Err(e) = self.flush_tls(tls, stream) {
-            tracing::trace!("h2 flush_tls: {e}");
+        if let Err(e) = self.flush_io(&mut io) {
+            tracing::trace!("h2 flush_io: {e}");
             self.phase = Phase::Done;
         }
 
@@ -204,71 +217,105 @@ impl Http2Conn {
 
     // ── TLS I/O ───────────────────────────────────────────────────────────────
 
-    fn fill_recv(&mut self, tls: &mut ServerConnection, stream: &TcpStream) -> io::Result<()> {
-        loop {
-            match tls.read_tls(&mut &*stream) {
-                Ok(0)  => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "closed")),
-                Ok(_)  => { tls.process_new_packets().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?; }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e) => return Err(e),
-            }
-        }
-        let mut tmp = [0u8; 8192];
-        loop {
-            match tls.reader().read(&mut tmp) {
-                Ok(0)  => break,
-                Ok(n)  => {
-                    self.recv_buf.extend_from_slice(&tmp[..n]);
-                    self.last_active = Instant::now();
+    fn fill_recv(&mut self, io: &mut H2Io<'_>) -> io::Result<()> {
+        match io {
+            H2Io::Tls { tls, stream } => {
+                loop {
+                    match tls.read_tls(&mut &**stream) {
+                        Ok(0)  => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "closed")),
+                        Ok(_)  => { tls.process_new_packets().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?; }
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(e) => return Err(e),
+                    }
                 }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e) => return Err(e),
+                let mut tmp = [0u8; 8192];
+                loop {
+                    match tls.reader().read(&mut tmp) {
+                        Ok(0)  => break,
+                        Ok(n)  => {
+                            self.recv_buf.extend_from_slice(&tmp[..n]);
+                            self.last_active = Instant::now();
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(e) => return Err(e),
+                    }
+                }
+                Ok(())
+            }
+            H2Io::Plain { stream } => {
+                let mut tmp = [0u8; 8192];
+                loop {
+                    match stream.read(&mut tmp) {
+                        Ok(0)  => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "closed")),
+                        Ok(n)  => { self.recv_buf.extend_from_slice(&tmp[..n]); self.last_active = Instant::now(); }
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(e) => return Err(e),
+                    }
+                }
+                Ok(())
             }
         }
-        Ok(())
     }
 
-    fn flush_tls(&mut self, tls: &mut ServerConnection, stream: &TcpStream) -> io::Result<()> {
-        // Write send_buf to rustls in a loop, draining encrypted records to the
-        // socket between each chunk.  rustls has a default 64 KB internal buffer
-        // limit (DEFAULT_BUFFER_LIMIT); writing more than that in one shot causes
-        // writer().write() to return Ok(0) and write_all to fail.  By draining
-        // between chunks we keep the internal buffer well below the limit.
-        let mut pos = 0;
-        while pos < self.send_buf.len() {
-            // write() always returns Ok(n); n may be 0 if rustls buffer is full.
-            let n = tls.writer().write(&self.send_buf[pos..]).unwrap_or(0);
-            pos += n;
+    fn flush_io(&mut self, io: &mut H2Io<'_>) -> io::Result<()> {
+        match io {
+            H2Io::Tls { tls, stream } => {
+                // Write send_buf to rustls in a loop, draining encrypted records to the
+                // socket between each chunk.  rustls has a default 64 KB internal buffer
+                // limit (DEFAULT_BUFFER_LIMIT); writing more than that in one shot causes
+                // writer().write() to return Ok(0) and write_all to fail.  By draining
+                // between chunks we keep the internal buffer well below the limit.
+                let mut pos = 0;
+                while pos < self.send_buf.len() {
+                    // write() always returns Ok(n); n may be 0 if rustls buffer is full.
+                    let n = tls.writer().write(&self.send_buf[pos..]).unwrap_or(0);
+                    pos += n;
 
-            // Drain encrypted bytes to the socket before writing the next chunk.
-            let mut socket_full = false;
-            loop {
-                match tls.write_tls(&mut &*stream) {
-                    Ok(0)  => break,
-                    Ok(_)  => {}
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => { socket_full = true; break; }
-                    Err(e) => { self.send_buf.drain(..pos); return Err(e); }
+                    // Drain encrypted bytes to the socket before writing the next chunk.
+                    let mut socket_full = false;
+                    loop {
+                        match tls.write_tls(&mut &**stream) {
+                            Ok(0)  => break,
+                            Ok(_)  => {}
+                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => { socket_full = true; break; }
+                            Err(e) => { self.send_buf.drain(..pos); return Err(e); }
+                        }
+                    }
+
+                    if n == 0 && socket_full {
+                        // Both rustls buffer and TCP socket buffer are full; give up and
+                        // retry on the next drive() call (100 ms at most).
+                        break;
+                    }
                 }
-            }
+                self.send_buf.drain(..pos);
 
-            if n == 0 && socket_full {
-                // Both rustls buffer and TCP socket buffer are full; give up and
-                // retry on the next drive() call (100 ms at most).
-                break;
+                // Final drain of any remaining encrypted records.
+                loop {
+                    match tls.write_tls(&mut &**stream) {
+                        Ok(0)  => break,
+                        Ok(_)  => {}
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(e) => return Err(e),
+                    }
+                }
+                Ok(())
+            }
+            H2Io::Plain { stream } => {
+                use std::io::Write;
+                let mut pos = 0;
+                while pos < self.send_buf.len() {
+                    match stream.write(&self.send_buf[pos..]) {
+                        Ok(0) => break,
+                        Ok(n) => { pos += n; }
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(e) => { self.send_buf.drain(..pos); return Err(e); }
+                    }
+                }
+                self.send_buf.drain(..pos);
+                Ok(())
             }
         }
-        self.send_buf.drain(..pos);
-
-        // Final drain of any remaining encrypted records.
-        loop {
-            match tls.write_tls(&mut &*stream) {
-                Ok(0)  => break,
-                Ok(_)  => {}
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(())
     }
 
     // ── Frame dispatch ────────────────────────────────────────────────────────
@@ -276,10 +323,10 @@ impl Http2Conn {
     fn process_frame<F>(
         &mut self,
         on_request: &mut F,
-        peer_stream: &TcpStream,
+        client_ip: &str,
     ) -> Result<bool, &'static str>
     where
-        F: FnMut(&HttpRequest, &str) -> (u16, Vec<(String, String)>, Vec<u8>, String, std::sync::Arc<Vec<String>>),
+        F: FnMut(&HttpRequest, &str) -> RequestOutcome,
     {
         if self.phase == Phase::Preface {
             if self.recv_buf.len() < CLIENT_PREFACE.len() { return Ok(false); }
@@ -308,8 +355,8 @@ impl Http2Conn {
         }
 
         match ftype {
-            TYPE_DATA          => self.handle_data(stream_id, flags, &payload, on_request, peer_stream)?,
-            TYPE_HEADERS       => self.handle_headers(stream_id, flags, &payload, on_request, peer_stream)?,
+            TYPE_DATA          => self.handle_data(stream_id, flags, &payload, on_request, client_ip)?,
+            TYPE_HEADERS       => self.handle_headers(stream_id, flags, &payload, on_request, client_ip)?,
             TYPE_PRIORITY      => {}
             TYPE_RST_STREAM    => { self.streams.remove(&stream_id); }
             TYPE_SETTINGS      => self.handle_settings(flags, &payload)?,
@@ -317,7 +364,7 @@ impl Http2Conn {
             TYPE_PING          => self.handle_ping(flags, &payload),
             TYPE_GOAWAY        => { self.phase = Phase::GoingAway; }
             TYPE_WINDOW_UPDATE => self.handle_window_update(stream_id, &payload)?,
-            TYPE_CONTINUATION  => self.handle_continuation(stream_id, flags, &payload, on_request, peer_stream)?,
+            TYPE_CONTINUATION  => self.handle_continuation(stream_id, flags, &payload, on_request, client_ip)?,
             _                  => {}
         }
         Ok(true)
@@ -378,10 +425,10 @@ impl Http2Conn {
 
     fn handle_headers<F>(
         &mut self, stream_id: u32, flags: u8, payload: &[u8],
-        on_request: &mut F, peer_stream: &TcpStream,
+        on_request: &mut F, client_ip: &str,
     ) -> Result<(), &'static str>
     where
-        F: FnMut(&HttpRequest, &str) -> (u16, Vec<(String, String)>, Vec<u8>, String, std::sync::Arc<Vec<String>>),
+        F: FnMut(&HttpRequest, &str) -> RequestOutcome,
     {
         if stream_id == 0 { return Err("HEADERS on stream 0"); }
         if stream_id % 2 == 0 { return Err("client used even stream ID"); }
@@ -423,16 +470,16 @@ impl Http2Conn {
             self.continuation_stream_id = Some(stream_id);
         }
 
-        self.maybe_dispatch(stream_id, on_request, peer_stream);
+        self.maybe_dispatch(stream_id, on_request, client_ip);
         Ok(())
     }
 
     fn handle_continuation<F>(
         &mut self, stream_id: u32, flags: u8, payload: &[u8],
-        on_request: &mut F, peer_stream: &TcpStream,
+        on_request: &mut F, client_ip: &str,
     ) -> Result<(), &'static str>
     where
-        F: FnMut(&HttpRequest, &str) -> (u16, Vec<(String, String)>, Vec<u8>, String, std::sync::Arc<Vec<String>>),
+        F: FnMut(&HttpRequest, &str) -> RequestOutcome,
     {
         self.header_block_buf.extend_from_slice(payload);
         if flags & FLAG_END_HEADERS != 0 {
@@ -448,17 +495,17 @@ impl Http2Conn {
                 stream.headers.extend(tmp);
                 stream.headers_done = true;
             }
-            self.maybe_dispatch(stream_id, on_request, peer_stream);
+            self.maybe_dispatch(stream_id, on_request, client_ip);
         }
         Ok(())
     }
 
     fn handle_data<F>(
         &mut self, stream_id: u32, flags: u8, payload: &[u8],
-        on_request: &mut F, peer_stream: &TcpStream,
+        on_request: &mut F, client_ip: &str,
     ) -> Result<(), &'static str>
     where
-        F: FnMut(&HttpRequest, &str) -> (u16, Vec<(String, String)>, Vec<u8>, String, std::sync::Arc<Vec<String>>),
+        F: FnMut(&HttpRequest, &str) -> RequestOutcome,
     {
         if stream_id == 0 { return Err("DATA on stream 0"); }
         let data = if flags & FLAG_PADDED != 0 && !payload.is_empty() {
@@ -491,16 +538,16 @@ impl Http2Conn {
         self.push_window_update(stream_id, data_len as u32);
 
         if should_dispatch {
-            self.maybe_dispatch(stream_id, on_request, peer_stream);
+            self.maybe_dispatch(stream_id, on_request, client_ip);
         }
         Ok(())
     }
 
     // ── Request dispatch ──────────────────────────────────────────────────────
 
-    fn maybe_dispatch<F>(&mut self, stream_id: u32, on_request: &mut F, peer_stream: &TcpStream)
+    fn maybe_dispatch<F>(&mut self, stream_id: u32, on_request: &mut F, client_ip: &str)
     where
-        F: FnMut(&HttpRequest, &str) -> (u16, Vec<(String, String)>, Vec<u8>, String, std::sync::Arc<Vec<String>>),
+        F: FnMut(&HttpRequest, &str) -> RequestOutcome,
     {
         let ready = self.streams.get(&stream_id).map(|s| {
             s.headers_done
@@ -508,6 +555,7 @@ impl Http2Conn {
                     || is_headersonly(&s.headers))
                 && s.state != StreamState::Closed
                 && s.resp_body.is_none()  // not already dispatched
+                && s.pending_rx.is_none() // not already waiting on async
         }).unwrap_or(false);
 
         if !ready { return; }
@@ -519,12 +567,34 @@ impl Http2Conn {
         };
 
         let req = build_request(&headers, body);
-        let client_ip = peer_stream.peer_addr()
-            .map(|a| a.ip().to_string())
-            .unwrap_or_default();
 
-        let (status, resp_headers, resp_body, _, hints) = on_request(&req, &client_ip);
+        match on_request(&req, client_ip) {
+            RequestOutcome::Ready(status, resp_headers, resp_body, _, hints) => {
+                self.dispatch_h2_response(stream_id, status, resp_headers, resp_body, hints, on_request, &client_ip);
+            }
+            RequestOutcome::Pending { rx, ctx } => {
+                if let Some(s) = self.streams.get_mut(&stream_id) {
+                    s.pending_rx = Some((rx, ctx));
+                }
+            }
+        }
+    }
 
+    /// Complete a synchronous (Ready) H2 response: send server push, encode headers,
+    /// store body, and flush.
+    fn dispatch_h2_response<F>(
+        &mut self,
+        stream_id:    u32,
+        status:       u16,
+        resp_headers: Vec<(String, String)>,
+        resp_body:    Vec<u8>,
+        hints:        std::sync::Arc<Vec<String>>,
+        on_request:   &mut F,
+        client_ip:    &str,
+    )
+    where
+        F: FnMut(&HttpRequest, &str) -> RequestOutcome,
+    {
         if !hints.is_empty() {
             if self.enable_push {
                 // ── HTTP/2 Server Push ─────────────────────────────────────
@@ -549,7 +619,10 @@ impl Http2Conn {
                         headers: vec![],
                         body:    vec![],
                     };
-                    let (ps, ph, pb, _, _) = on_request(&push_req, &client_ip);
+                    let (ps, ph, pb) = match on_request(&push_req, client_ip) {
+                        RequestOutcome::Ready(ps, ph, pb, _, _) => (ps, ph, pb),
+                        RequestOutcome::Pending { .. } => continue, // can't push async assets
+                    };
                     if ps < 200 || ps >= 300 { continue; }
                     // Skip if the body exceeds the current connection send window.
                     if pb.len() as i32 > self.conn_send_window { continue; }
@@ -606,6 +679,50 @@ impl Http2Conn {
 
         // Flush as much as the current flow-control window allows.
         self.flush_pending_streams();
+    }
+
+    /// Poll all streams that have a pending URL-backend receiver.
+    fn poll_pending_url<G>(&mut self, on_response: &mut G)
+    where
+        G: FnMut(std::io::Result<HttpResponse>, &PendingUrlContext)
+               -> (u16, Vec<(String, String)>, Vec<u8>, String, std::sync::Arc<Vec<String>>),
+    {
+        use std::sync::mpsc::TryRecvError;
+        let stream_ids: Vec<u32> = self.streams.keys().copied().collect();
+        for sid in stream_ids {
+            // Check without taking ownership first.
+            // rx sends io::Result<HttpResponse>, so try_recv() gives Result<io::Result<HttpResponse>, TryRecvError>.
+            let result: Option<std::io::Result<HttpResponse>> = match self.streams.get(&sid) {
+                Some(s) => match &s.pending_rx {
+                    Some((rx, _)) => match rx.try_recv() {
+                        Ok(r) => Some(r),  // r is already io::Result<HttpResponse>
+                        Err(TryRecvError::Empty) => None,
+                        Err(TryRecvError::Disconnected) => Some(Err(std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe, "url backend thread died",
+                        ))),
+                    },
+                    None => None,
+                },
+                None => None,
+            };
+            if let Some(http_result) = result {
+                // Move out the pending context.
+                let ctx = self.streams.get_mut(&sid)
+                    .and_then(|s| s.pending_rx.take())
+                    .map(|(_, ctx)| ctx);
+                if let Some(ctx) = ctx {
+                    let (status, resp_headers, resp_body, _, _hints) = on_response(http_result, &ctx);
+                    // No server push for async responses (hints only exist for cached assets which are Ready).
+                    let header_block = self.encode_response_headers(status, &resp_headers, resp_body.len());
+                    self.push_frame(TYPE_HEADERS, FLAG_END_HEADERS, sid, &header_block);
+                    if let Some(s) = self.streams.get_mut(&sid) {
+                        s.resp_body = Some(resp_body);
+                        s.resp_sent = 0;
+                    }
+                    self.flush_pending_streams();
+                }
+            }
+        }
     }
 
     // ── Flow-controlled response flusher ─────────────────────────────────────

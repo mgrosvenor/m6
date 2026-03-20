@@ -24,12 +24,13 @@ use m6_http_lib::stats::Stats;
 use m6_http_lib::config::{self, Config};
 use m6_http_lib::error::{self as error, make_error_response, ErrorMode};
 use m6_http_lib::forward::{self, HttpRequest, HttpResponse};
+use m6_http_lib::h2c_client::H2cClientPool;
 use m6_http_lib::pool::{self, PoolManager};
 use m6_http_lib::poller::{Poller, Token};
 use m6_http_lib::router::{self, RouteTable};
 use m6_http_lib::watcher::{FsEvent, FsEventKind, FsWatcher};
 use m6_http_lib::auth::PublicKey;
-use m6_http_lib::http11::{Http11Listener, make_tls_server_config};
+use m6_http_lib::http11::{Http11Listener, make_tls_server_config, RequestOutcome, H2cListener};
 use m6_http_lib::hints;
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -37,6 +38,8 @@ use m6_http_lib::hints;
 const TOKEN_UDP: Token = Token(0);
 const TOKEN_INOTIFY: Token = Token(1);
 const TOKEN_TCP: Token = Token(2);
+const TOKEN_H2C: Token = Token(3);
+const TOKEN_H2C_CLIENT: Token = Token(4);
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
 // ── Shutdown flags ───────────────────────────────────────────────────────────
@@ -53,6 +56,8 @@ struct QuicConn {
     pending: HashMap<u64, PendingRequest>,
     /// Partial responses awaiting flow-control credit: stream_id -> (body, offset_written)
     partial_responses: HashMap<u64, (Bytes, usize)>,
+    /// Pending URL-backend requests for H3 streams. Keyed by H3 stream_id.
+    pending_url: HashMap<u64, (std::sync::mpsc::Receiver<std::io::Result<forward::HttpResponse>>, forward::PendingUrlContext)>,
     client_addr: SocketAddr,
     /// When we last heard from this connection (for timeout tracking)
     last_active: Instant,
@@ -79,6 +84,8 @@ struct ServerState {
     stats: Stats,
     /// Paths queued for background prefetch into the cache.
     prefetch_queue: std::collections::VecDeque<String>,
+    /// Persistent non-blocking H2C outbound client pool.
+    h2c_pool: H2cClientPool,
 }
 
 // ── Signal handling ───────────────────────────────────────────────────────────
@@ -138,6 +145,7 @@ fn make_quiche_config(server_config: &config::ServerConfig) -> anyhow::Result<qu
 fn event_loop(
     udp: UdpSocket,
     mut tcp: Option<Http11Listener>,
+    mut h2c: Option<H2cListener>,
     mut watcher: Option<FsWatcher>,
     state: &mut ServerState,
     quiche_config: &mut quiche::Config,
@@ -157,6 +165,9 @@ fn event_loop(
     }
     if let Some(ref t) = tcp {
         let _ = poller.add(t.raw_fd(), TOKEN_TCP);
+    }
+    if let Some(ref h) = h2c {
+        let _ = poller.add(h.raw_fd(), TOKEN_H2C);
     }
     if let Some(ref w) = watcher {
         if let Some(fd) = w.raw_fd() {
@@ -245,11 +256,17 @@ fn event_loop(
                         &mut conn_id_map,
                         quiche_config,
                         state,
+                        quic_port,
                     );
                 }
                 TOKEN_TCP => {
                     if let Some(ref mut t) = tcp {
                         t.accept_pending(&poller, TOKEN_TCP);
+                    }
+                }
+                TOKEN_H2C => {
+                    if let Some(ref mut h) = h2c {
+                        h.accept_pending(&poller, TOKEN_H2C);
                     }
                 }
                 TOKEN_INOTIFY => {
@@ -266,78 +283,180 @@ fn event_loop(
         // Drive HTTP/1.1 connections. Per-connection fds are registered with TOKEN_TCP
         // so this also runs on data-ready events, not only on the periodic tick.
         if let Some(ref mut t) = tcp {
-            t.drive_all(|req, client_ip| {
-                let enc_str = req.headers
-                    .iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case("accept-encoding"))
-                    .map(|(_, v)| v.as_str())
-                    .unwrap_or("");
-                let start = std::time::Instant::now();
+            // Safety: on_request and on_response are called sequentially, never
+            // concurrently, so the two `&mut state` aliases never overlap.
+            let state_ptr = state as *mut ServerState;
+            t.drive_all(
+                |req, client_ip| {
+                    let state = unsafe { &mut *state_ptr };
+                    let enc_str = req.headers
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case("accept-encoding"))
+                        .map(|(_, v)| v.as_str())
+                        .unwrap_or("");
+                    let start = std::time::Instant::now();
 
-                // ── Cache lookup — check before forwarding to backend ──────────
-                let bypass_cache = req.query.as_deref().map_or(false, |q| {
-                    q.split('&').any(|p| p == "_nocache" || p.starts_with("_nocache="))
-                });
-                let mut key_buf = [0u8; 512];
-                let lookup_key = make_lookup_key(&req.path, enc_str, &mut key_buf);
-                if !bypass_cache { if let Some(cached) = state.cache.get(lookup_key) {
-                    let elapsed_ns = start.elapsed().as_nanos() as u64;
-                    state.stats.record(elapsed_ns, true, false);
-                    let mut headers: Vec<(String, String)> = (*cached.headers).clone();
-                    // Add Link: preload headers to the 200 response for clients/CDNs
-                    // that strip 1xx informational responses.
-                    for url in cached.hints.iter() {
+                    // ── Cache lookup — check before forwarding to backend ──────────
+                    let bypass_cache = req.query.as_deref().map_or(false, |q| {
+                        q.split('&').any(|p| p == "_nocache" || p.starts_with("_nocache="))
+                    });
+                    let mut key_buf = [0u8; 512];
+                    let lookup_key = make_lookup_key(&req.path, enc_str, &mut key_buf);
+                    if !bypass_cache { if let Some(cached) = state.cache.get(lookup_key) {
+                        let elapsed_ns = start.elapsed().as_nanos() as u64;
+                        state.stats.record(elapsed_ns, true, false);
+                        let mut headers: Vec<(String, String)> = (*cached.headers).clone();
+                        // Add Link: preload headers to the 200 response for clients/CDNs
+                        // that strip 1xx informational responses.
+                        for url in cached.hints.iter() {
+                            headers.push(("link".to_string(), hints::link_header(url)));
+                        }
+                        headers.push(("alt-svc".to_string(),
+                            format!("h3=\":{quic_port}\"; ma=86400")));
+                        debug!(
+                            path = %req.path,
+                            status = cached.status,
+                            version = "HTTP/1.1",
+                            backend = "cache",
+                            latency_us = elapsed_ns / 1_000,
+                            cache_hit = true,
+                            "request complete"
+                        );
+                        return RequestOutcome::Ready(cached.status, headers, cached.body.to_vec(), "cache".to_string(), cached.hints.clone());
+                    } } // end !bypass_cache
+
+                    handle_request(req, client_ip, enc_str, state)
+                },
+                |http_result, ctx| {
+                    let state = unsafe { &mut *state_ptr };
+                    let (status, mut headers, body, backend_name, hints) =
+                        finalize_url_response(http_result, ctx, quic_port, state);
+                    // Add Link: preload headers to the response (fallback for proxies/CDNs).
+                    for url in hints.iter() {
                         headers.push(("link".to_string(), hints::link_header(url)));
                     }
-                    headers.push(("alt-svc".to_string(),
-                        format!("h3=\":{quic_port}\"; ma=86400")));
+                    let elapsed_ns = 0u64; // timing not tracked for async responses
+                    let is_backend_error = status >= 500;
+                    state.stats.record(elapsed_ns, false, is_backend_error);
                     debug!(
-                        path = %req.path,
-                        status = cached.status,
+                        path = %ctx.req.path,
+                        status,
                         version = "HTTP/1.1",
-                        backend = "cache",
+                        backend = %backend_name,
                         latency_us = elapsed_ns / 1_000,
-                        cache_hit = true,
-                        "request complete"
+                        cache_hit = false,
+                        "request complete (async url backend)"
                     );
-                    return (cached.status, headers, cached.body.to_vec(), "cache".to_string(), cached.hints.clone());
-                } } // end !bypass_cache
+                    (status, headers, body, backend_name, hints)
+                },
+                &poller,
+            );
+        }
 
-                let (status, mut headers, body, backend_name) =
-                    handle_request(req, client_ip, enc_str, state);
-                // Pick up hints that handle_request just stored in the cache.
-                let hints = {
-                    let mut kbuf = [0u8; 512];
-                    let lk = make_lookup_key(&req.path, enc_str, &mut kbuf);
-                    state.cache.get(lk)
-                        .map(|c| c.hints.clone())
-                        .unwrap_or_default()
-                };
-                // Add Link: preload headers to the response (fallback for proxies/CDNs).
-                for url in hints.iter() {
-                    headers.push(("link".to_string(), hints::link_header(url)));
-                }
-                // Advertise HTTP/3 (QUIC) on the same port so browsers upgrade.
-                headers.push(("alt-svc".to_string(),
-                    format!("h3=\":{quic_port}\"; ma=86400")));
-                let elapsed_ns = start.elapsed().as_nanos() as u64;
-                let is_backend_error = status >= 500;
-                state.stats.record(elapsed_ns, false, is_backend_error);
-                debug!(
-                    path = %req.path,
-                    status,
-                    version = "HTTP/1.1",
-                    backend = %backend_name,
-                    latency_us = elapsed_ns / 1_000,
-                    cache_hit = false,
-                    "request complete"
-                );
-                (status, headers, body, backend_name, hints)
-            }, &poller);
+        // Drive H2C (HTTP/2 cleartext) connections.
+        if let Some(ref mut h) = h2c {
+            let state_ptr2 = state as *mut ServerState;
+            h.drive_all(
+                |req, client_ip| {
+                    let state = unsafe { &mut *state_ptr2 };
+                    let enc_str = req.headers
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case("accept-encoding"))
+                        .map(|(_, v)| v.as_str())
+                        .unwrap_or("");
+                    let start = std::time::Instant::now();
+
+                    // ── Cache lookup — check before forwarding to backend ──────────
+                    let bypass_cache = req.query.as_deref().map_or(false, |q| {
+                        q.split('&').any(|p| p == "_nocache" || p.starts_with("_nocache="))
+                    });
+                    let mut key_buf = [0u8; 512];
+                    let lookup_key = make_lookup_key(&req.path, enc_str, &mut key_buf);
+                    if !bypass_cache { if let Some(cached) = state.cache.get(lookup_key) {
+                        let elapsed_ns = start.elapsed().as_nanos() as u64;
+                        state.stats.record(elapsed_ns, true, false);
+                        let mut headers: Vec<(String, String)> = (*cached.headers).clone();
+                        for url in cached.hints.iter() {
+                            headers.push(("link".to_string(), hints::link_header(url)));
+                        }
+                        headers.push(("alt-svc".to_string(),
+                            format!("h3=\":{quic_port}\"; ma=86400")));
+                        debug!(
+                            path = %req.path,
+                            status = cached.status,
+                            version = "HTTP/2",
+                            backend = "cache",
+                            latency_us = elapsed_ns / 1_000,
+                            cache_hit = true,
+                            "request complete"
+                        );
+                        return RequestOutcome::Ready(cached.status, headers, cached.body.to_vec(), "cache".to_string(), cached.hints.clone());
+                    } } // end !bypass_cache
+
+                    handle_request(req, client_ip, enc_str, state)
+                },
+                |http_result, ctx| {
+                    let state = unsafe { &mut *state_ptr2 };
+                    let (status, mut headers, body, backend_name, hints) =
+                        finalize_url_response(http_result, ctx, quic_port, state);
+                    for url in hints.iter() {
+                        headers.push(("link".to_string(), hints::link_header(url)));
+                    }
+                    let elapsed_ns = 0u64;
+                    let is_backend_error = status >= 500;
+                    state.stats.record(elapsed_ns, false, is_backend_error);
+                    debug!(
+                        path = %ctx.req.path,
+                        status,
+                        version = "HTTP/2",
+                        backend = %backend_name,
+                        latency_us = elapsed_ns / 1_000,
+                        cache_hit = false,
+                        "request complete (async url backend)"
+                    );
+                    (status, headers, body, backend_name, hints)
+                },
+                &poller,
+            );
         }
 
         // Drive connection timeouts and flush pending sends
         flush_all(&udp, &mut connections);
+
+        // Drive outbound H2C client connections.
+        state.h2c_pool.drive_all(&poller, TOKEN_H2C_CLIENT);
+
+        // Poll pending URL-backend responses for H3 streams.
+        for qconn in connections.values_mut() {
+            let sids: Vec<u64> = qconn.pending_url.keys().copied().collect();
+            for sid in sids {
+                use std::sync::mpsc::TryRecvError;
+                // rx sends io::Result<HttpResponse>, so try_recv() gives Result<io::Result<HttpResponse>, TryRecvError>.
+                let result: Option<std::io::Result<forward::HttpResponse>> = match qconn.pending_url.get(&sid) {
+                    Some((rx, _)) => match rx.try_recv() {
+                        Ok(r) => Some(r),  // r is already io::Result<HttpResponse>
+                        Err(TryRecvError::Empty) => None,
+                        Err(TryRecvError::Disconnected) => Some(Err(std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe, "url backend thread died",
+                        ))),
+                    },
+                    None => None,
+                };
+                if let Some(http_result) = result {
+                    let (_, ctx) = qconn.pending_url.remove(&sid).unwrap();
+                    let (status, mut resp_headers, body, _, hints) =
+                        finalize_url_response(http_result, &ctx, quic_port, state);
+                    // Add Link: preload headers.
+                    for url in hints.iter() {
+                        resp_headers.push(("link".to_string(), hints::link_header(url)));
+                    }
+                    if !hints.is_empty() {
+                        send_h3_early_hints(sid, qconn, &hints);
+                    }
+                    send_h3_response(sid, qconn, status, &resp_headers, Bytes::from(body));
+                }
+            }
+        }
 
         // Remove closed/timed-out connections
         connections.retain(|_, c| !c.conn.is_closed());
@@ -388,6 +507,7 @@ fn drain_udp(
     conn_id_map: &mut HashMap<Vec<u8>, Vec<u8>>,
     quiche_config: &mut quiche::Config,
     state: &mut ServerState,
+    quic_port: u16,
 ) {
     loop {
         let (len, from) = match udp.recv_from(recv_buf) {
@@ -447,6 +567,7 @@ fn drain_udp(
                     h3_conn: None,
                     pending: HashMap::new(),
                     partial_responses: HashMap::new(),
+                    pending_url: HashMap::new(),
                     client_addr: from,
                     last_active: Instant::now(),
                 },
@@ -495,7 +616,7 @@ fn drain_udp(
 
         // Process H3 events
         if qconn.h3_conn.is_some() {
-            process_h3(qconn, udp, state);
+            process_h3(qconn, udp, state, quic_port);
         }
 
         // Send any pending QUIC packets
@@ -505,7 +626,7 @@ fn drain_udp(
 
 // ── H3 event processing ───────────────────────────────────────────────────────
 
-fn process_h3(qconn: &mut QuicConn, _udp: &UdpSocket, state: &mut ServerState) {
+fn process_h3(qconn: &mut QuicConn, _udp: &UdpSocket, state: &mut ServerState, quic_port: u16) {
     // client_ip is NOT computed here — deferred to cache-miss path in handle_h3_request.
 
     loop {
@@ -525,7 +646,7 @@ fn process_h3(qconn: &mut QuicConn, _udp: &UdpSocket, state: &mut ServerState) {
                 entry.headers_done = true;
                 if !more_frames {
                     // No body — process immediately
-                    handle_h3_request(stream_id, qconn, state);
+                    handle_h3_request(stream_id, qconn, state, quic_port);
                     // After handle_h3_request qconn may be mutated; restart loop
                     continue;
                 }
@@ -552,7 +673,7 @@ fn process_h3(qconn: &mut QuicConn, _udp: &UdpSocket, state: &mut ServerState) {
             Ok((stream_id, quiche::h3::Event::Finished)) => {
                 // Body fully received (or no body) — process
                 if qconn.pending.contains_key(&stream_id) {
-                    handle_h3_request(stream_id, qconn, state);
+                    handle_h3_request(stream_id, qconn, state, quic_port);
                     continue;
                 }
             }
@@ -579,6 +700,7 @@ fn handle_h3_request(
     stream_id: u64,
     qconn: &mut QuicConn,
     state: &mut ServerState,
+    quic_port: u16,
 ) {
     let req = match qconn.pending.remove(&stream_id) {
         Some(r) => r,
@@ -677,36 +799,39 @@ fn handle_h3_request(
         body: req.body,
     };
 
-    let (status, mut resp_headers, body, backend_name) =
-        handle_request(&http_req, &client_ip, enc_str, state);
-    // Pick up hints that handle_request just stored in the cache.
-    let hints = {
-        let mut kbuf = [0u8; 512];
-        let lk = make_lookup_key(&path, enc_str, &mut kbuf);
-        state.cache.get(lk).map(|c| c.hints.clone()).unwrap_or_default()
-    };
-    // Add Link: preload headers to the response (fallback for proxies/CDNs).
-    for url in hints.iter() {
-        resp_headers.push(("link".to_string(), hints::link_header(url)));
-    }
+    match handle_request(&http_req, &client_ip, enc_str, state) {
+        RequestOutcome::Ready(status, mut resp_headers, body, backend_name, hints) => {
+            // Add Link: preload headers to the response (fallback for proxies/CDNs).
+            for url in hints.iter() {
+                resp_headers.push(("link".to_string(), hints::link_header(url)));
+            }
+            // Add alt-svc header.
+            resp_headers.push(("alt-svc".to_string(),
+                format!("h3=\":{quic_port}\"; ma=86400")));
 
-    let elapsed_ns = start.elapsed().as_nanos() as u64;
-    let is_backend_error = status >= 500;
-    state.stats.record(elapsed_ns, false, is_backend_error);
-    debug!(
-        path = %path,
-        status,
-        version = "HTTP/3",
-        backend = %backend_name,
-        latency_us = elapsed_ns / 1_000,
-        cache_hit = false,
-        "request complete"
-    );
+            let elapsed_ns = start.elapsed().as_nanos() as u64;
+            let is_backend_error = status >= 500;
+            state.stats.record(elapsed_ns, false, is_backend_error);
+            debug!(
+                path = %path,
+                status,
+                version = "HTTP/3",
+                backend = %backend_name,
+                latency_us = elapsed_ns / 1_000,
+                cache_hit = false,
+                "request complete"
+            );
 
-    if !hints.is_empty() {
-        send_h3_early_hints(stream_id, qconn, &hints);
+            if !hints.is_empty() {
+                send_h3_early_hints(stream_id, qconn, &hints);
+            }
+            send_h3_response(stream_id, qconn, status, &resp_headers, Bytes::from(body));
+        }
+        RequestOutcome::Pending { rx, ctx } => {
+            // URL backend dispatched async — store and poll later.
+            qconn.pending_url.insert(stream_id, (rx, ctx));
+        }
     }
-    send_h3_response(stream_id, qconn, status, &resp_headers, Bytes::from(body));
 }
 
 /// Write `n` as ASCII decimal into `buf[20]` without heap allocation.
@@ -806,13 +931,13 @@ fn handle_request(
     client_ip: &str,
     content_encoding: &str,
     state: &mut ServerState,
-) -> (u16, Vec<(String, String)>, Vec<u8>, String) {
+) -> RequestOutcome {
     // Route lookup
     let route = match state.route_table.at(&req.path) {
         Some(r) => r.clone(),
         None => {
             let (s, h, b) = make_error_response(404, &state.error_mode, &req.path);
-            return (s, h, b, "none".to_string());
+            return RequestOutcome::Ready(s, h, b, "none".to_string(), std::sync::Arc::new(vec![]));
         }
     };
 
@@ -852,18 +977,18 @@ fn handle_request(
                             ("Location".to_string(), redirect_url),
                             ("Content-Type".to_string(), "text/html".to_string()),
                         ];
-                        return (302, headers, vec![], "auth".to_string());
+                        return RequestOutcome::Ready(302, headers, vec![], "auth".to_string(), std::sync::Arc::new(vec![]));
                     }
                     let (s, h, b) =
                         make_error_response(401, &state.error_mode, &req.path);
-                    return (s, h, b, "auth".to_string());
+                    return RequestOutcome::Ready(s, h, b, "auth".to_string(), std::sync::Arc::new(vec![]));
                 }
                 Some(token) => match pk.verify(token) {
                     Err(e) => {
                         warn!(path = %req.path, error = %e, "auth: token verification failed");
                         let (s, h, b) =
                             make_error_response(401, &state.error_mode, &req.path);
-                        return (s, h, b, "auth".to_string());
+                        return RequestOutcome::Ready(s, h, b, "auth".to_string(), std::sync::Arc::new(vec![]));
                     }
                     Ok(claims) => {
                         if !auth::check_require(&claims, require) {
@@ -874,7 +999,7 @@ fn handle_request(
                             );
                             let (s, h, b) =
                                 make_error_response(403, &state.error_mode, &req.path);
-                            return (s, h, b, "auth".to_string());
+                            return RequestOutcome::Ready(s, h, b, "auth".to_string(), std::sync::Arc::new(vec![]));
                         }
                         // Forward verified claims to backend as X-Auth-Claims header
                         // (base64-encoded JSON so renderers can inspect them).
@@ -909,6 +1034,47 @@ fn handle_request(
         q.split('&').any(|p| p == "_nocache" || p.starts_with("_nocache="))
     });
     let backend_name = route.backend.clone();
+
+    // Check if URL backend — dispatch async.
+    let original_host = req
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(":authority"))
+        .or_else(|| req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("host")))
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
+    let timeout = std::time::Duration::from_secs(state.config.server.backend_timeout_secs);
+
+    if let Some((url, _tls_config, _)) = state.pool_manager.get_url_info(&backend_name) {
+        let url = url.to_string();
+        let ctx = forward::PendingUrlContext {
+            req: req.clone(),
+            client_ip: client_ip.to_string(),
+            enc: content_encoding.to_string(),
+            backend_name: backend_name.clone(),
+            bypass_cache,
+        };
+
+        let rx = if url.starts_with("h2c://") {
+            // Persistent non-blocking H2C client — event-loop managed.
+            match state.h2c_pool.dispatch(&url, req, client_ip, original_host) {
+                Ok(rx) => rx,
+                Err(e) => {
+                    warn!(backend = %backend_name, error = %e, "h2c dispatch failed");
+                    let (s, h, b) = make_error_response(502, &state.error_mode, &req.path);
+                    return RequestOutcome::Ready(s, h, b, "error".to_string(), std::sync::Arc::new(vec![]));
+                }
+            }
+        } else {
+            forward::dispatch_url_request(
+                url, req.clone(), client_ip.to_string(), original_host.to_string(),
+                Some(timeout), _tls_config,
+            )
+        };
+        return RequestOutcome::Pending { rx, ctx };
+    }
+
+    // Socket backend — synchronous (local, sub-ms).
     let (status, resp_headers, body, used_backend) =
         match forward_to_backend(req, &backend_name, client_ip, state) {
             Ok(http_resp) => {
@@ -951,10 +1117,20 @@ fn handle_request(
     // If the response is an error (4xx/5xx) and not already an error response,
     // apply the error mode: status, internal, or custom.
     if status >= 400 {
-        return apply_error_mode(status, req, client_ip, state);
+        let (s, h, b, n) = apply_error_mode(status, req, client_ip, state);
+        return RequestOutcome::Ready(s, h, b, n, std::sync::Arc::new(vec![]));
     }
 
-    (status, resp_headers, body, used_backend)
+    // Retrieve hints from cache (populated above if cacheable).
+    let hints_arc = {
+        let mut kbuf = [0u8; 512];
+        let lk = make_lookup_key(&req.path, content_encoding, &mut kbuf);
+        state.cache.get(lk)
+            .map(|c| c.hints.clone())
+            .unwrap_or_else(|| std::sync::Arc::new(vec![]))
+    };
+
+    RequestOutcome::Ready(status, resp_headers, body, used_backend, hints_arc)
 }
 
 /// Apply the configured error mode for a given status code.
@@ -1093,12 +1269,71 @@ fn forward_to_backend(
             Err(pool::PoolError::Empty) => Err("pool empty".to_string()),
             Err(pool::PoolError::ConnectFailed(e)) => Err(e.to_string()),
         }
-    } else if let Some(url) = state.pool_manager.get_url(backend_name).map(str::to_string) {
-        forward::forward_url_request(&url, req, client_ip, original_host, Some(timeout))
-            .map_err(|e| e.to_string())
     } else {
         Err(format!("unknown backend: {}", backend_name))
     }
+}
+
+/// Called when a URL-backend I/O thread returns its result.  Handles cache
+/// insertion, hints extraction, alt-svc injection, and error mode application.
+fn finalize_url_response(
+    http_result: std::io::Result<forward::HttpResponse>,
+    ctx:         &forward::PendingUrlContext,
+    quic_port:   u16,
+    state:       &mut ServerState,
+) -> (u16, Vec<(String, String)>, Vec<u8>, String, std::sync::Arc<Vec<String>>) {
+    let req = &ctx.req;
+    let enc = &ctx.enc;
+
+    let (status, resp_headers, body, used_backend) = match http_result {
+        Ok(http_resp) => {
+            if !ctx.bypass_cache && should_cache(http_resp.status, &http_resp.headers) {
+                let content_type = http_resp.headers.iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+                    .map(|(_, v)| v.as_str()).unwrap_or("");
+                let hint_paths = hints::extract_hints(&http_resp.body, content_type);
+                for hp in &hint_paths {
+                    let mut kbuf = [0u8; 512];
+                    let lk = make_lookup_key(hp, "", &mut kbuf);
+                    if state.cache.get(lk).is_none() {
+                        state.prefetch_queue.push_back(hp.clone());
+                    }
+                }
+                let key = CacheKey::new(&req.path, enc);
+                state.cache.insert(key, CachedResponse {
+                    status:  http_resp.status,
+                    headers: std::sync::Arc::new(http_resp.headers.clone()),
+                    body:    Bytes::from(http_resp.body.clone()),
+                    hints:   std::sync::Arc::new(hint_paths),
+                });
+            }
+            (http_resp.status, http_resp.headers, http_resp.body, ctx.backend_name.clone())
+        }
+        Err(e) => {
+            warn!(backend = %ctx.backend_name, error = %e, "url backend error (async)");
+            (502u16, vec![], vec![], "error".to_string())
+        }
+    };
+
+    // If error, apply error mode.
+    if status >= 400 {
+        let (s, h, b, n) = apply_error_mode(status, req, &ctx.client_ip, state);
+        return (s, h, b, n, std::sync::Arc::new(vec![]));
+    }
+
+    // Retrieve hints from cache (populated above if cacheable).
+    let hints_arc = {
+        let mut kbuf = [0u8; 512];
+        let lk = make_lookup_key(&req.path, enc, &mut kbuf);
+        state.cache.get(lk).map(|c| c.hints.clone())
+            .unwrap_or_else(|| std::sync::Arc::new(vec![]))
+    };
+
+    let mut headers_with_altsvc = resp_headers;
+    headers_with_altsvc.push(("alt-svc".to_string(),
+        format!("h3=\":{quic_port}\"; ma=86400")));
+
+    (status, headers_with_altsvc, body, used_backend, hints_arc)
 }
 
 // ── QUIC packet flush helpers ─────────────────────────────────────────────────
@@ -1313,6 +1548,9 @@ fn urlencoded(s: &str) -> String {
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() {
+    // rustls requires an explicit CryptoProvider when multiple are available
+    // (ring + aws-lc-rs both get pulled in transitively). Install ring first.
+    rustls::crypto::ring::default_provider().install_default().ok();
     let args: Vec<String> = std::env::args().collect();
     std::process::exit(run(args));
 }
@@ -1452,10 +1690,26 @@ fn run(args: Vec<String>) -> i32 {
         }
     };
 
+    let h2c_listener = if let Some(ref h2c_bind) = config.server.h2c_bind {
+        match H2cListener::bind(h2c_bind) {
+            Ok(l) => {
+                info!(bind = %h2c_bind, "H2C (HTTP/2 cleartext) listener started");
+                Some(l)
+            }
+            Err(e) => {
+                warn!(error = %e, "H2C listener bind failed, H2C disabled");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     info!(
         bind = %config.server.bind,
+        h2c_bind = ?config.server.h2c_bind,
         site = %config.site.name,
-        "m6-http started (HTTP/3 over QUIC + HTTP/1.1 over TLS, single-threaded epoll)"
+        "m6-http started"
     );
 
     let mut state = ServerState {
@@ -1469,7 +1723,8 @@ fn run(args: Vec<String>) -> i32 {
         error_mode,
         stats: Stats::new(),
         prefetch_queue: std::collections::VecDeque::new(),
+        h2c_pool: H2cClientPool::new(),
     };
 
-    event_loop(udp, tcp_listener, watcher, &mut state, &mut quiche_config, &log_handle)
+    event_loop(udp, tcp_listener, h2c_listener, watcher, &mut state, &mut quiche_config, &log_handle)
 }
