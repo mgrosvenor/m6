@@ -22,7 +22,7 @@ use m6_http_lib::auth;
 use m6_http_lib::cache::{Cache, CacheKey, CachedResponse, make_lookup_key, should_cache};
 use m6_http_lib::stats::Stats;
 use m6_http_lib::config::{self, Config};
-use m6_http_lib::error::{self as error, make_error_response, ErrorMode};
+use m6_http_lib::error::{self as error, ErrorMode};
 use m6_http_lib::forward::{self, HttpRequest, HttpResponse};
 use m6_http_lib::h2c_client::H2cClientPool;
 use m6_http_lib::h2s_client::H2sTlsClientPool;
@@ -941,8 +941,8 @@ fn handle_request(
     let route = match state.route_table.at(&req.path) {
         Some(r) => r.clone(),
         None => {
-            let (s, h, b) = make_error_response(404, &state.error_mode, &req.path);
-            return RequestOutcome::Ready(s, h, b, "none".to_string(), std::sync::Arc::new(vec![]));
+            let (s, h, b, n) = apply_error_mode(404, req, client_ip, state);
+            return RequestOutcome::Ready(s, h, b, n, std::sync::Arc::new(vec![]));
         }
     };
 
@@ -984,16 +984,14 @@ fn handle_request(
                         ];
                         return RequestOutcome::Ready(302, headers, vec![], "auth".to_string(), std::sync::Arc::new(vec![]));
                     }
-                    let (s, h, b) =
-                        make_error_response(401, &state.error_mode, &req.path);
-                    return RequestOutcome::Ready(s, h, b, "auth".to_string(), std::sync::Arc::new(vec![]));
+                    let (s, h, b, n) = apply_error_mode(401, req, client_ip, state);
+                    return RequestOutcome::Ready(s, h, b, n, std::sync::Arc::new(vec![]));
                 }
                 Some(token) => match pk.verify(token) {
                     Err(e) => {
                         warn!(path = %req.path, error = %e, "auth: token verification failed");
-                        let (s, h, b) =
-                            make_error_response(401, &state.error_mode, &req.path);
-                        return RequestOutcome::Ready(s, h, b, "auth".to_string(), std::sync::Arc::new(vec![]));
+                        let (s, h, b, n) = apply_error_mode(401, req, client_ip, state);
+                        return RequestOutcome::Ready(s, h, b, n, std::sync::Arc::new(vec![]));
                     }
                     Ok(claims) => {
                         if !auth::check_require(&claims, require) {
@@ -1002,9 +1000,8 @@ fn handle_request(
                                 require = %require,
                                 "auth: insufficient claims"
                             );
-                            let (s, h, b) =
-                                make_error_response(403, &state.error_mode, &req.path);
-                            return RequestOutcome::Ready(s, h, b, "auth".to_string(), std::sync::Arc::new(vec![]));
+                            let (s, h, b, n) = apply_error_mode(403, req, client_ip, state);
+                            return RequestOutcome::Ready(s, h, b, n, std::sync::Arc::new(vec![]));
                         }
                         // Forward verified claims to backend as X-Auth-Claims header
                         // (base64-encoded JSON so renderers can inspect them).
@@ -1066,8 +1063,8 @@ fn handle_request(
                 Ok(rx) => rx,
                 Err(e) => {
                     warn!(backend = %backend_name, error = %e, "h2c dispatch failed");
-                    let (s, h, b) = make_error_response(502, &state.error_mode, &req.path);
-                    return RequestOutcome::Ready(s, h, b, "error".to_string(), std::sync::Arc::new(vec![]));
+                    let (s, h, b, n) = apply_error_mode(502, req, client_ip, state);
+                    return RequestOutcome::Ready(s, h, b, n, std::sync::Arc::new(vec![]));
                 }
             }
         } else if url.starts_with("h2s://") {
@@ -1076,8 +1073,8 @@ fn handle_request(
                 Ok(rx) => rx,
                 Err(e) => {
                     warn!(backend = %backend_name, error = %e, "h2s dispatch failed");
-                    let (s, h, b) = make_error_response(502, &state.error_mode, &req.path);
-                    return RequestOutcome::Ready(s, h, b, "error".to_string(), std::sync::Arc::new(vec![]));
+                    let (s, h, b, n) = apply_error_mode(502, req, client_ip, state);
+                    return RequestOutcome::Ready(s, h, b, n, std::sync::Arc::new(vec![]));
                 }
             }
         } else {
