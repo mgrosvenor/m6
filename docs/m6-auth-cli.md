@@ -43,6 +43,27 @@ m6-auth-cli <config> user roles <username> [--set <role>]... [--unset <role>]...
 ```
 Add or remove roles. `--set` and `--unset` may be repeated and combined in one command.
 
+### API Tokens
+
+API tokens are long-lived JWTs intended for scripts, CI pipelines, and service-to-service calls. They are passed as `Authorization: Bearer <token>` and verified by m6-http the same way session JWTs are — no special server configuration needed. The token is printed once on creation; it is never stored in plain text.
+
+```
+m6-auth-cli <config> token create <username> [--name <n>] [--ttl-days <d>]
+```
+Create an API token for a user. Prints the raw JWT to stdout. `--name` labels the token for listing purposes (default: `"api"`). `--ttl-days` sets the expiry (default: 30 days). The token carries the user's current roles at issuance time; role changes after issuance do not affect an outstanding token.
+
+```
+m6-auth-cli <config> token ls <username>
+```
+List active tokens for a user. Output: table of `id`, `name`, `created_at`, `expires_at`. Use `--json` for machine-readable output.
+
+```
+m6-auth-cli <config> token revoke <token-id>
+```
+Remove a token from the database. Because JWTs are stateless, the token may remain cryptographically valid until its `exp` claim is reached. Use short TTLs (`--ttl-days 1`) if immediate revocation is required.
+
+---
+
 ### Groups
 
 ```
@@ -82,6 +103,8 @@ Remove a user from a group.
 | Flag | Applies to | Notes |
 |---|---|---|
 | `--password <pw>` | `user add`, `user passwd` | Supply password non-interactively. Appears in shell history — use only in scripts where history is disabled. |
+| `--name <n>` | `token create` | Human-readable label for the token (default: `"api"`). |
+| `--ttl-days <d>` | `token create` | Token lifetime in days (default: 30). |
 | `--json` | all `ls` commands | Output JSON instead of table. |
 
 ---
