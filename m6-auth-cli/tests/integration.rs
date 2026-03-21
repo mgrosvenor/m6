@@ -16,6 +16,21 @@ fn binary_path() -> PathBuf {
     p
 }
 
+// ── Test EC P-256 key material (generated offline for tests only) ──────────────
+
+const TEST_PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
+REDACTED
+REDACTED
+REDACTED
+-----END PRIVATE KEY-----";
+
+const TEST_PUBLIC_KEY_PEM: &str = "-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEYPw7LhJaPWI0AMSmKUZIuF3vJxo2
+5SdJhIU/aqEJsCdBr8Q4RU24UYyHtFHEaJOELA2KdVUI0LgIWQ/GFDtSag==
+-----END PUBLIC KEY-----";
+
+// ── TestEnv ───────────────────────────────────────────────────────────────────
+
 struct TestEnv {
     dir: TempDir,
 }
@@ -29,6 +44,15 @@ impl TestEnv {
         let cfg = "[storage]\npath = \"data/auth.db\"\n\n[tokens]\naccess_ttl = 900\nrefresh_ttl = 2592000\nissuer = \"test\"\n\n[keys]\nprivate_key = \"keys/auth.pem\"\npublic_key = \"keys/auth.pub\"\n";
         std::fs::write(dir.path().join("m6-auth.conf"), cfg).expect("write config");
         TestEnv { dir }
+    }
+
+    /// Write embedded test keys to <tmpdir>/keys/. Required for token commands.
+    fn setup_keys(&self) {
+        std::fs::create_dir_all(self.dir.path().join("keys")).expect("mkdir keys");
+        std::fs::write(self.dir.path().join("keys/auth.pem"), TEST_PRIVATE_KEY_PEM)
+            .expect("write private key");
+        std::fs::write(self.dir.path().join("keys/auth.pub"), TEST_PUBLIC_KEY_PEM)
+            .expect("write public key");
     }
 
     fn config(&self) -> String {
@@ -321,6 +345,110 @@ fn test_user_del() {
     // Verify gone
     let out2 = env.run(&["user", "del", "tmp"]);
     assert_eq!(out2.status.code(), Some(1));
+}
+
+// ── token create / ls / revoke ────────────────────────────────────────────────
+
+#[test]
+fn test_token_create_prints_jwt() {
+    let env = TestEnv::new();
+    env.setup_keys();
+    env.run(&["user", "add", "alice", "--password", "pw"]);
+
+    let out = env.run(&["token", "create", "alice", "--name", "ci"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let body = stdout(&out);
+    // A JWT has three dot-separated base64url segments
+    assert!(body.trim().split('.').count() == 3, "expected JWT, got: {}", body);
+}
+
+#[test]
+fn test_token_create_unknown_user_exits_1() {
+    let env = TestEnv::new();
+    env.setup_keys();
+
+    let out = env.run(&["token", "create", "ghost", "--name", "ci"]);
+    assert_eq!(out.status.code(), Some(1), "stdout: {}", stdout(&out));
+}
+
+#[test]
+fn test_token_create_missing_keys_exits_1() {
+    let env = TestEnv::new();
+    // No setup_keys() call — keys dir doesn't exist
+    env.run(&["user", "add", "alice", "--password", "pw"]);
+
+    let out = env.run(&["token", "create", "alice"]);
+    assert_eq!(out.status.code(), Some(1), "stdout: {}", stdout(&out));
+    let err = stderr(&out);
+    assert!(
+        err.contains("key") || err.contains("not found") || err.contains("No such"),
+        "expected key error, got: {}", err
+    );
+}
+
+#[test]
+fn test_token_ls_shows_created_token() {
+    let env = TestEnv::new();
+    env.setup_keys();
+    env.run(&["user", "add", "alice", "--password", "pw"]);
+    env.run(&["token", "create", "alice", "--name", "mytoken"]);
+
+    let out = env.run(&["token", "ls", "alice"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let body = stdout(&out);
+    assert!(body.contains("mytoken"), "expected token name in: {}", body);
+}
+
+#[test]
+fn test_token_ls_json_is_valid_array() {
+    let env = TestEnv::new();
+    env.setup_keys();
+    env.run(&["user", "add", "alice", "--password", "pw"]);
+    env.run(&["token", "create", "alice", "--name", "t1"]);
+    env.run(&["token", "create", "alice", "--name", "t2"]);
+
+    let out = env.run(&["token", "ls", "alice", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let body = stdout(&out);
+    let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert!(parsed.is_array(), "expected array, got: {}", body);
+    let arr = parsed.as_array().unwrap();
+    assert_eq!(arr.len(), 2);
+    assert!(arr.iter().any(|t| t["name"] == "t1"), "t1 not found");
+    assert!(arr.iter().any(|t| t["name"] == "t2"), "t2 not found");
+}
+
+#[test]
+fn test_token_revoke_removes_token() {
+    let env = TestEnv::new();
+    env.setup_keys();
+    env.run(&["user", "add", "alice", "--password", "pw"]);
+    env.run(&["token", "create", "alice", "--name", "todel"]);
+
+    // Get the token ID from JSON listing
+    let out = env.run(&["token", "ls", "alice", "--json"]);
+    let body = stdout(&out);
+    let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    let arr = parsed.as_array().unwrap();
+    let token_id = arr[0]["id"].as_str().expect("id field").to_string();
+
+    // Revoke it
+    let out = env.run(&["token", "revoke", &token_id]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+
+    // Verify it's gone
+    let out = env.run(&["token", "ls", "alice", "--json"]);
+    let body = stdout(&out);
+    let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    let arr = parsed.as_array().unwrap();
+    assert!(arr.is_empty(), "expected empty list after revoke, got: {}", body);
+}
+
+#[test]
+fn test_token_revoke_unknown_exits_1() {
+    let env = TestEnv::new();
+    let out = env.run(&["token", "revoke", "nonexistent-id-xxxx"]);
+    assert_eq!(out.status.code(), Some(1), "stdout: {}", stdout(&out));
 }
 
 // ── group member del ──────────────────────────────────────────────────────────

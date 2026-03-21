@@ -1,6 +1,6 @@
 # m6 — User Guide
 
-Five examples, each building on the last. Clone the examples repo to follow along:
+Ten examples, each building on the last. Clone the examples repo to follow along:
 
 ```bash
 git clone https://github.com/m6/m6-examples
@@ -1678,4 +1678,122 @@ ssh server vim /var/www/my-blog/site.toml
 # Right — edit locally and deploy
 # Server-specific overrides belong in /etc/m6/my-blog.toml
 ```
+
+---
+
+## Example 08 — Log Viewer
+
+`examples/08-logviewer/`
+
+A real-time log viewer built into the site. m6-http writes JSON-format logs to disk. A browser UI polls a tail endpoint served by m6-file and renders incoming lines with filtering and search. Demonstrates `format = "json"` logging and m6-file's byte-range tail mode.
+
+```bash
+cd examples/08-logviewer
+./dev.sh
+# open https://localhost:8443/logs
+```
+
+---
+
+## Example 09 — Global Deployment
+
+`examples/09-global-deployment/`
+
+A multi-region Vultr deployment: an origin node runs the full m6 stack, and multiple cache nodes around the world run m6-http in pure proxy mode. A WireGuard mesh connects all nodes. Cache invalidation propagates from origin to all cache nodes on publish. Demonstrates horizontal scale-out across regions without a CDN.
+
+```bash
+cd examples/09-global-deployment
+# See setup-origin.sh and setup-cache-node.sh
+```
+
+---
+
+## Example 10 — API Tokens
+
+`examples/10-api-tokens/`
+
+Adds long-lived API tokens for scripts and services. Unlike session cookies (15-minute TTL, browser only), an API token is a JWT passed as `Authorization: Bearer <token>` and can be valid for days or months. m6-http verifies Bearer tokens the same way it verifies session cookies — same EC key, same `require` rules. No special server configuration is needed.
+
+```bash
+cd examples/10-api-tokens
+./dev.sh
+```
+
+### When to use API tokens
+
+| | Session cookie | API token |
+|---|---|---|
+| Caller | Browser | Script / service / CI |
+| Lifetime | 15 min (refreshes to 30 days) | Configurable (default 30 days) |
+| Transport | `Cookie: session=...` | `Authorization: Bearer ...` |
+| Issuance | `POST /auth/login` | `m6-auth-cli token create` |
+| Revocation | `POST /auth/logout` | `m6-auth-cli token revoke` |
+
+### Setup
+
+```bash
+# 1. Create a user with the roles your API needs
+m6-auth-cli configs/m6-auth.conf user add api --role api --role user --password secret
+
+# 2. Issue a token
+TOKEN=$(m6-auth-cli configs/m6-auth.conf token create api --name ci-pipeline --ttl-days 30)
+echo "$TOKEN"
+# eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9...
+
+# 3. Use it
+curl -sk https://localhost:8443/api/data \
+     -H "Authorization: Bearer $TOKEN"
+```
+
+### `site.toml` — protecting an API endpoint
+
+```toml
+# API endpoint — requires a valid Bearer token with role 'api'
+[[route]]
+path    = "/api/data"
+backend = "m6-html"
+require = "role:api"
+```
+
+`require = "role:api"` works for both session cookies and Bearer tokens. A browser user logged in with the `api` role can also access the route. For endpoints that should be machine-only, use a dedicated role name like `api` and never assign it to regular user accounts.
+
+### Token management
+
+```bash
+# List active tokens for a user
+m6-auth-cli configs/m6-auth.conf token ls api
+# NAME            ID                                    CREATED     EXPIRES
+# ci-pipeline     550e8400-e29b-41d4-a716-446655440000  2026-03-21  2026-04-20
+
+# List as JSON
+m6-auth-cli configs/m6-auth.conf token ls api --json
+
+# Revoke by ID
+m6-auth-cli configs/m6-auth.conf token revoke 550e8400-e29b-41d4-a716-446655440000
+```
+
+**Revocation note:** `token revoke` removes the token from the database and the listing. Because JWTs are stateless, a revoked token remains cryptographically valid until its `exp` claim. For immediate revocation, use `--ttl-days 1` so tokens expire quickly on their own.
+
+### Template variables in protected routes
+
+When a request carries a valid Bearer token, m6-html templates can access the caller's identity via the `auth` object — the same object available after browser login:
+
+```html
+<p>Caller: {{ auth.username }}</p>
+<p>Roles:  {{ auth.roles | join(sep=", ") }}</p>
+```
+
+### Functional tests
+
+`test.sh` in the example directory runs against a live server:
+
+```bash
+# In one terminal
+./dev.sh
+
+# In another
+./test.sh
+```
+
+Tests cover: public access, 401 on unauthenticated access, token create/list/revoke, role enforcement, and custom error pages.
 

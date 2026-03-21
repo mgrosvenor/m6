@@ -255,15 +255,19 @@ Shared library crate used by `m6-auth-server`, `m6-auth-cli`, and custom rendere
 Bootstrap and management CLI. Operates directly on SQLite — works whether the server is running or not.
 
 ```
-m6-auth-cli user add <username>
-m6-auth-cli user del <username>
-m6-auth-cli user passwd <username>
-m6-auth-cli user ls [--json]
-m6-auth-cli group add <group>
-m6-auth-cli group del <group>
-m6-auth-cli group member add <group> <user>
-m6-auth-cli group member del <group> <user>
-m6-auth-cli group ls [--json]
+m6-auth-cli <config> user add <username> [--role <role>]...
+m6-auth-cli <config> user del <username>
+m6-auth-cli <config> user passwd <username>
+m6-auth-cli <config> user roles <username> [--set <role>]... [--unset <role>]...
+m6-auth-cli <config> user ls [--json]
+m6-auth-cli <config> group add <group>
+m6-auth-cli <config> group del <group>
+m6-auth-cli <config> group member add <group> <user>
+m6-auth-cli <config> group member del <group> <user>
+m6-auth-cli <config> group ls [--json]
+m6-auth-cli <config> token create <username> [--name <n>] [--ttl-days <d>]
+m6-auth-cli <config> token ls <username> [--json]
+m6-auth-cli <config> token revoke <token-id>
 ```
 
 ---
@@ -475,7 +479,27 @@ tail latency (no lock convoys, no cross-core coherence); no external cache tier 
 **Where m6 doesn't win:** H1 throughput (nginx is more mature); multi-core scale
 within a single instance (one process = one core); large-file serving (no `sendfile`).
 
-See [`POSITIONING.md`](POSITIONING.md) for the full analysis and [`BENCHMARKS.md`](BENCHMARKS.md) for raw numbers.
+See [`docs/POSITIONING.md`](docs/POSITIONING.md) for the full analysis and [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for raw numbers.
+
+---
+
+## Documentation
+
+All detailed documentation lives in [`docs/`](docs/):
+
+| Document | Contents |
+|---|---|
+| [`docs/m6-user-guide.md`](docs/m6-user-guide.md) | Ten worked examples, start here |
+| [`docs/m6-site-toml.md`](docs/m6-site-toml.md) | `site.toml` reference |
+| [`docs/m6-http.md`](docs/m6-http.md) | m6-http internals |
+| [`docs/m6-auth.md`](docs/m6-auth.md) | m6-auth-server reference |
+| [`docs/m6-auth-cli.md`](docs/m6-auth-cli.md) | m6-auth-cli reference |
+| [`docs/m6-auth-lib.md`](docs/m6-auth-lib.md) | m6-auth library API |
+| [`docs/m6-render.md`](docs/m6-render.md) | m6-render custom renderer guide |
+| [`docs/m6-render-lib.md`](docs/m6-render-lib.md) | m6-render library API |
+| [`docs/m6-md.md`](docs/m6-md.md) | m6-md Markdown processor |
+| [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) | Raw benchmark numbers |
+| [`docs/POSITIONING.md`](docs/POSITIONING.md) | Competitive analysis |
 
 ---
 

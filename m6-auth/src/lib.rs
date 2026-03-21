@@ -915,4 +915,89 @@ mod tests {
         assert_eq!(list1.len(), 3);
         assert_eq!(list2.len(), 3);
     }
+
+    // ── API token ops ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_api_token_create_and_list() {
+        let (db, _f) = tmp_db();
+        let u = db.user_create("alice", "pass", &[]).expect("user");
+        let tok = db.api_token_create(&u.id, "alice", "ci-deploy", "hash1", i64::MAX)
+            .expect("create");
+        assert_eq!(tok.user_id, u.id);
+        assert_eq!(tok.username, "alice");
+        assert_eq!(tok.name, "ci-deploy");
+
+        let list = db.api_token_list("alice").expect("list");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, tok.id);
+        assert_eq!(list[0].name, "ci-deploy");
+    }
+
+    #[test]
+    fn test_api_token_list_multiple() {
+        let (db, _f) = tmp_db();
+        let u = db.user_create("bob", "pass", &[]).expect("user");
+        db.api_token_create(&u.id, "bob", "token-a", "hash_a", i64::MAX).expect("a");
+        db.api_token_create(&u.id, "bob", "token-b", "hash_b", i64::MAX).expect("b");
+        let list = db.api_token_list("bob").expect("list");
+        assert_eq!(list.len(), 2);
+        assert!(list.iter().any(|t| t.name == "token-a"));
+        assert!(list.iter().any(|t| t.name == "token-b"));
+    }
+
+    #[test]
+    fn test_api_token_list_empty() {
+        let (db, _f) = tmp_db();
+        db.user_create("carol", "pass", &[]).expect("user");
+        let list = db.api_token_list("carol").expect("list");
+        assert!(list.is_empty());
+    }
+
+    #[test]
+    fn test_api_token_list_unknown_user() {
+        let (db, _f) = tmp_db();
+        let err = db.api_token_list("ghost").expect_err("should fail");
+        assert!(matches!(err, AuthError::UserNotFound(_)));
+    }
+
+    #[test]
+    fn test_api_token_revoke() {
+        let (db, _f) = tmp_db();
+        let u = db.user_create("alice", "pass", &[]).expect("user");
+        let tok = db.api_token_create(&u.id, "alice", "my-token", "hashX", i64::MAX)
+            .expect("create");
+        db.api_token_revoke(&tok.id).expect("revoke");
+        let list = db.api_token_list("alice").expect("list");
+        assert!(list.is_empty());
+    }
+
+    #[test]
+    fn test_api_token_revoke_not_found() {
+        let (db, _f) = tmp_db();
+        let err = db.api_token_revoke("nonexistent-id").expect_err("should fail");
+        assert!(matches!(err, AuthError::ApiTokenNotFound(_)));
+    }
+
+    #[test]
+    fn test_api_token_cascade_on_user_delete() {
+        let (db, _f) = tmp_db();
+        let u = db.user_create("alice", "pass", &[]).expect("user");
+        db.api_token_create(&u.id, "alice", "tok", "hashY", i64::MAX).expect("create");
+        db.user_delete("alice").expect("delete");
+        // After user deletion, api_token_list errors with UserNotFound (user is gone)
+        let err = db.api_token_list("alice").expect_err("user gone");
+        assert!(matches!(err, AuthError::UserNotFound(_)));
+    }
+
+    #[test]
+    fn test_api_token_hash_unique() {
+        let (db, _f) = tmp_db();
+        let u = db.user_create("alice", "pass", &[]).expect("user");
+        db.api_token_create(&u.id, "alice", "tok-1", "same_hash", i64::MAX).expect("first");
+        // Same hash must fail (UNIQUE constraint on token_hash)
+        let err = db.api_token_create(&u.id, "alice", "tok-2", "same_hash", i64::MAX)
+            .expect_err("duplicate hash");
+        assert!(matches!(err, AuthError::Db(_)));
+    }
 }
