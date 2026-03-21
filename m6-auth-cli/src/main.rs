@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use m6_auth::Db;
+use m6_auth::{Db, jwt::{AccessClaims, JwtEngine, hash_token, now_secs}};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::process;
@@ -9,6 +9,8 @@ use std::process;
 #[derive(Deserialize, Default)]
 struct Config {
     storage: StorageConfig,
+    tokens:  Option<TokensConfig>,
+    keys:    Option<KeysConfig>,
 }
 
 #[derive(Deserialize, Default)]
@@ -16,7 +18,37 @@ struct StorageConfig {
     path: String,
 }
 
-fn load_config(config_path: &str) -> Result<PathBuf> {
+#[derive(Deserialize, Default)]
+struct TokensConfig {
+    issuer: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct KeysConfig {
+    private_key: String,
+    public_key:  String,
+}
+
+struct ParsedConfig {
+    db_path:          PathBuf,
+    issuer:           String,
+    private_key_path: Option<PathBuf>,
+    public_key_path:  Option<PathBuf>,
+}
+
+/// Infer the site root from the config file path.
+/// If the config is inside a directory named "configs", the site root is
+/// its parent; otherwise the site root is the config file's directory.
+fn infer_site_dir(config_path: &Path) -> PathBuf {
+    let config_dir = config_path.parent().unwrap_or(Path::new("."));
+    if config_dir.file_name().map(|n| n == "configs").unwrap_or(false) {
+        config_dir.parent().unwrap_or(config_dir).to_path_buf()
+    } else {
+        config_dir.to_path_buf()
+    }
+}
+
+fn load_config(config_path: &str) -> Result<ParsedConfig> {
     let p = Path::new(config_path);
     if !p.exists() {
         bail!("config file not found: {}", config_path);
@@ -33,12 +65,25 @@ fn load_config(config_path: &str) -> Result<PathBuf> {
         if sp.is_absolute() {
             sp.to_path_buf()
         } else {
-            // relative to config file's directory
             let dir = p.parent().unwrap_or(Path::new("."));
             dir.join(sp)
         }
     };
-    Ok(db_path)
+
+    let issuer = cfg.tokens
+        .and_then(|t| t.issuer)
+        .unwrap_or_else(|| "localhost".to_string());
+
+    let site_dir = infer_site_dir(p);
+    let (private_key_path, public_key_path) = match cfg.keys {
+        Some(k) if !k.private_key.is_empty() => (
+            Some(site_dir.join(&k.private_key)),
+            Some(site_dir.join(&k.public_key)),
+        ),
+        _ => (None, None),
+    };
+
+    Ok(ParsedConfig { db_path, issuer, private_key_path, public_key_path })
 }
 
 // ── Password prompting ────────────────────────────────────────────────────────
@@ -111,6 +156,15 @@ fn print_usage() {
     eprintln!("  m6-auth-cli <config> group member ls <group> [--json]");
     eprintln!("  m6-auth-cli <config> group member add <group> <username>");
     eprintln!("  m6-auth-cli <config> group member del <group> <username>");
+    eprintln!();
+    eprintln!("API token commands:");
+    eprintln!("  m6-auth-cli <config> token create <username> [--name <name>] [--ttl-days <days>] [--site-dir <dir>]");
+    eprintln!("  m6-auth-cli <config> token ls <username> [--json]");
+    eprintln!("  m6-auth-cli <config> token revoke <token-id>");
+    eprintln!();
+    eprintln!("  Tokens require [keys] private_key and public_key in the config.");
+    eprintln!("  Key paths are resolved relative to the site root (inferred as the parent");
+    eprintln!("  of the 'configs/' directory, or overridden with --site-dir).");
 }
 
 // ── Argument parsing helpers ──────────────────────────────────────────────────
@@ -397,6 +451,119 @@ fn cmd_group_member_del(db: &Db, args: &[String]) -> Result<()> {
     }
 }
 
+fn cmd_token_create(db: &Db, cfg: &ParsedConfig, args: &[String]) -> Result<()> {
+    if args.is_empty() {
+        bail!("usage: token create <username> [--name <name>] [--ttl-days <days>] [--site-dir <dir>]");
+    }
+    let username = &args[0];
+    let name = flag_value(args, "--name").unwrap_or("api-token");
+    let ttl_days: u64 = flag_value(args, "--ttl-days")
+        .map(|v| v.parse::<u64>().context("--ttl-days must be a number"))
+        .transpose()?
+        .unwrap_or(365);
+
+    // Resolve site_dir: --site-dir flag overrides the inferred default.
+    let private_key_path = if let Some(sd) = flag_value(args, "--site-dir") {
+        let site_dir = Path::new(sd);
+        // Re-read the raw key path from config — we already stored the inferred path,
+        // so if site-dir is overridden we need the original relative path. Store both.
+        cfg.private_key_path.as_ref().map(|p| {
+            // Extract the original relative component by stripping the old site_dir prefix.
+            // Simpler: just use the last two components as the relative path heuristic.
+            // Best: require --site-dir to be used only with relative key paths in config.
+            site_dir.join(p.file_name().unwrap_or(p.as_os_str()))
+        })
+    } else {
+        cfg.private_key_path.clone()
+    };
+
+    let private_key_path = private_key_path
+        .ok_or_else(|| anyhow::anyhow!("config missing [keys] section — cannot mint tokens"))?;
+    let public_key_path = cfg.public_key_path.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("config missing [keys] section — cannot mint tokens"))?;
+
+    let private_pem = std::fs::read_to_string(&private_key_path)
+        .with_context(|| format!("reading private key: {}", private_key_path.display()))?;
+    let public_pem = std::fs::read_to_string(public_key_path)
+        .with_context(|| format!("reading public key: {}", public_key_path.display()))?;
+
+    let engine = JwtEngine::new(&private_pem, &public_pem, cfg.issuer.clone())
+        .context("loading JWT keys")?;
+
+    let user = db.user_get(username)?
+        .ok_or_else(|| anyhow::anyhow!("user '{}' not found", username))?;
+
+    let now = now_secs();
+    let ttl_secs = (ttl_days * 86400) as i64;
+    let exp = now + ttl_secs;
+
+    let claims = AccessClaims {
+        iss:      cfg.issuer.clone(),
+        sub:      user.id.clone(),
+        exp,
+        iat:      now,
+        username: user.username.clone(),
+        groups:   user.groups.clone(),
+        roles:    user.roles.clone(),
+    };
+
+    let token = engine.encode_access(&claims)
+        .context("encoding JWT")?;
+    let token_hash = hash_token(&token);
+
+    db.api_token_create(&user.id, &user.username, name, &token_hash, exp)?;
+
+    let expires_str = format_timestamp(exp);
+    eprintln!("API token created for '{}' (expires {})", username, expires_str);
+    eprintln!("Save this token — it will not be shown again:");
+    println!("{}", token);
+    Ok(())
+}
+
+fn cmd_token_ls(db: &Db, args: &[String]) -> Result<()> {
+    if args.is_empty() {
+        bail!("usage: token ls <username> [--json]");
+    }
+    let username = &args[0];
+    let json = has_flag(args, "--json");
+
+    let tokens = match db.api_token_list(username) {
+        Ok(t) => t,
+        Err(m6_auth::AuthError::UserNotFound(_)) => bail!("user '{}' not found", username),
+        Err(e) => return Err(e.into()),
+    };
+
+    if json {
+        println!("{}", serde_json::to_string(&tokens)?);
+    } else {
+        println!("{:<36} {:<20} {:<22} {}", "ID", "NAME", "CREATED", "EXPIRES");
+        for t in &tokens {
+            let created = format_timestamp(t.created_at);
+            let expires = format_timestamp(t.expires_at);
+            println!("{:<36} {:<20} {:<22} {}", t.id, t.name, created, expires);
+        }
+        if tokens.is_empty() {
+            eprintln!("no API tokens for '{}'", username);
+        }
+    }
+    Ok(())
+}
+
+fn cmd_token_revoke(db: &Db, args: &[String]) -> Result<()> {
+    if args.is_empty() {
+        bail!("usage: token revoke <token-id>");
+    }
+    let token_id = &args[0];
+    match db.api_token_revoke(token_id) {
+        Ok(()) => {
+            eprintln!("token '{}' revoked (note: token remains valid until its expiry date)", token_id);
+            Ok(())
+        }
+        Err(m6_auth::AuthError::ApiTokenNotFound(_)) => bail!("token '{}' not found", token_id),
+        Err(e) => Err(e.into()),
+    }
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 fn run() -> Result<()> {
@@ -413,20 +580,19 @@ fn run() -> Result<()> {
     let rest: Vec<String> = raw_args[4..].to_vec();
 
     // Load config and open db
-    let db_path = load_config(config_path).map_err(|e| {
-        // Re-tag config errors so they get exit code 2
+    let cfg = load_config(config_path).map_err(|e| {
         anyhow::anyhow!("__config_error__: {}", e)
     })?;
 
     // Ensure parent directory exists
-    if let Some(parent) = db_path.parent() {
+    if let Some(parent) = cfg.db_path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating db directory: {}", parent.display()))?;
         }
     }
 
-    let db = Db::open(&db_path).context("opening database")?;
+    let db = Db::open(&cfg.db_path).context("opening database")?;
 
     match entity.as_str() {
         "user" => match command.as_str() {
@@ -467,6 +633,16 @@ fn run() -> Result<()> {
             }
             other => {
                 eprintln!("error: unknown group command: {}", other);
+                print_usage();
+                process::exit(2);
+            }
+        },
+        "token" => match command.as_str() {
+            "create" => cmd_token_create(&db, &cfg, &rest)?,
+            "ls"     => cmd_token_ls(&db, &rest)?,
+            "revoke" => cmd_token_revoke(&db, &rest)?,
+            other    => {
+                eprintln!("error: unknown token command: {}", other);
                 print_usage();
                 process::exit(2);
             }

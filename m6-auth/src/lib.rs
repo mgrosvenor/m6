@@ -1,3 +1,5 @@
+pub mod jwt;
+
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -21,6 +23,16 @@ pub struct Group {
     pub members: Vec<String>, // usernames, populated by queries that join memberships
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiToken {
+    pub id:         String,
+    pub user_id:    String,
+    pub username:   String,
+    pub name:       String,
+    pub created_at: i64,
+    pub expires_at: i64,
+}
+
 // ── Error type ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, thiserror::Error)]
@@ -36,6 +48,9 @@ pub enum AuthError {
 
     #[error("group already exists: {0}")]
     GroupExists(String),
+
+    #[error("api token not found: {0}")]
+    ApiTokenNotFound(String),
 
     #[error("database error: {0}")]
     Db(#[from] rusqlite::Error),
@@ -71,6 +86,15 @@ CREATE TABLE IF NOT EXISTS memberships (
 CREATE TABLE IF NOT EXISTS refresh_tokens (
     token_hash TEXT PRIMARY KEY,
     user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    expires_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS api_tokens (
+    id         TEXT PRIMARY KEY,
+    user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name       TEXT NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    created_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL
 );
 ";
@@ -458,6 +482,62 @@ impl Db {
             "DELETE FROM refresh_tokens WHERE user_id = ?1",
             params![user_id],
         )?;
+        Ok(())
+    }
+
+    // ── API token ops ────────────────────────────────────────────────────────
+
+    pub fn api_token_create(
+        &self,
+        user_id: &str,
+        username: &str,
+        name: &str,
+        token_hash: &str,
+        expires_at: i64,
+    ) -> Result<ApiToken> {
+        let id = Uuid::new_v4().to_string();
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        self.0.execute(
+            "INSERT INTO api_tokens (id, user_id, name, token_hash, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, user_id, name, token_hash, created_at, expires_at],
+        )?;
+        Ok(ApiToken { id, user_id: user_id.to_string(), username: username.to_string(), name: name.to_string(), created_at, expires_at })
+    }
+
+    pub fn api_token_list(&self, username: &str) -> Result<Vec<ApiToken>> {
+        let user_id = self.user_id_by_name(username)?;
+        let mut stmt = self.0.prepare(
+            "SELECT id, user_id, name, created_at, expires_at
+             FROM api_tokens WHERE user_id = ?1 ORDER BY created_at DESC",
+        )?;
+        let rows: std::result::Result<Vec<(String, String, String, i64, i64)>, rusqlite::Error> = stmt
+            .query_map(params![user_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })?
+            .collect();
+        Ok(rows?.into_iter().map(|(id, uid, name, ca, ea)| ApiToken {
+            id, user_id: uid, username: username.to_string(), name, created_at: ca, expires_at: ea,
+        }).collect())
+    }
+
+    pub fn api_token_revoke(&self, token_id: &str) -> Result<()> {
+        let n = self.0.execute(
+            "DELETE FROM api_tokens WHERE id = ?1",
+            params![token_id],
+        )?;
+        if n == 0 {
+            return Err(AuthError::ApiTokenNotFound(token_id.to_string()));
+        }
         Ok(())
     }
 
