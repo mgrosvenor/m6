@@ -160,6 +160,19 @@ pub fn route_specificity(segments: &[Segment]) -> i32 {
     score
 }
 
+/// Stable string key for a `RouteMethod` — used to disambiguate handlers
+/// registered on the same path with different HTTP methods.
+fn route_method_key(m: &RouteMethod) -> &'static str {
+    match m {
+        RouteMethod::Any    => "ANY",
+        RouteMethod::Get    => "GET",
+        RouteMethod::Post   => "POST",
+        RouteMethod::Put    => "PUT",
+        RouteMethod::Patch  => "PATCH",
+        RouteMethod::Delete => "DELETE",
+    }
+}
+
 /// Route params: at most a few captures; Vec beats HashMap for small N.
 pub type PathParams = Vec<(String, String)>;
 
@@ -1504,11 +1517,13 @@ fn run_app_with_shutdown(
     let fs: Arc<std::sync::RwLock<FrameworkState>> =
         Arc::new(std::sync::RwLock::new(framework_state));
 
-    // Build handler lookup map (pattern → handler).
+    // Build handler lookup map (pattern:METHOD → handler).
+    // Include the method in the key so GET and POST handlers registered on the
+    // same path are stored and looked up independently.
     let code_handlers: Arc<HashMap<String, Arc<BoxHandler>>> = Arc::new(
         code_routes
             .into_iter()
-            .map(|(p, _, h)| (p, h))
+            .map(|(p, m, h)| (format!("{}:{}", p, route_method_key(&m)), h))
             .collect(),
     );
 
@@ -1770,8 +1785,9 @@ fn handle_connection(
             // use the template even if a code handler exists for the same pattern
             // — this ensures GET routes handled by config are not shadowed by POST
             // code handlers registered on the same path.
+            let handler_key = format!("{}:{}", route.pattern, route_method_key(&route.method));
             let mut resp = if route.template.is_none() {
-                if let Some(handler) = code_handlers.get(&route.pattern) {
+                if let Some(handler) = code_handlers.get(&handler_key) {
                     match handler.call(&req) {
                         Ok(r) => r,
                         Err(e) => error_to_response(&e),

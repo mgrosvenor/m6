@@ -447,6 +447,38 @@ These are tracked gaps between the current implementation and the full spec:
 
 ---
 
+## Comparative positioning
+
+m6-http is a **single-threaded, in-process-cached, TLS-terminating reverse proxy**.
+The response cache is an `Arc<Bytes>` LRU in the same heap as the TLS stack — a
+cache hit is a hash lookup, a reference-count increment, and an AES-GCM seal. No
+IPC, no lock, no copy.
+
+**Measured single-core throughput (macOS loopback, TLS, warm cache, 8 concurrent connections):**
+
+| Protocol | req/s   | vs nginx (1 worker) |
+|----------|--------:|---------------------|
+| HTTP/1.1 |  11,857 | ~0.5–0.9× (nginx better; H1 not the primary path) |
+| HTTP/2   | 158,323 | ~3–9× faster |
+| HTTP/3   |  77,672 | no published baseline |
+
+**HTTP/2 context:** nginx single-worker H2 reaches ~17–59K req/s; LiteSpeed ~84K.
+m6-http at 158K is the result of correct H2 flow-control (`WINDOW_UPDATE`), stream
+multiplexing, and the in-process cache. H2O on Linux with kernel TLS reaches ~325K —
+the gap is `TCP_ULP` / KTLS offloading AES-GCM into the kernel, a Linux-only feature
+not yet integrated here. The profiler shows ~56% of H2 working time is in userspace
+AES-GCM; KTLS would eliminate most of it.
+
+**Where m6 wins:** H2/H3 single-core throughput; zero-IPC cache hits; deterministic
+tail latency (no lock convoys, no cross-core coherence); no external cache tier needed.
+
+**Where m6 doesn't win:** H1 throughput (nginx is more mature); multi-core scale
+within a single instance (one process = one core); large-file serving (no `sendfile`).
+
+See [`POSITIONING.md`](POSITIONING.md) for the full analysis and [`BENCHMARKS.md`](BENCHMARKS.md) for raw numbers.
+
+---
+
 ## Building
 
 ```sh
