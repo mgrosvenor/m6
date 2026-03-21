@@ -70,6 +70,10 @@ pub struct ErrorsConfig {
     #[serde(default = "default_errors_mode")]
     pub mode: String,
     pub path: Option<String>,
+    /// When true, internal fallback HTML includes descriptive detail and hints.
+    /// Recommended for dev; leave false in production.
+    #[serde(default)]
+    pub verbose_fallback: bool,
 }
 
 fn default_errors_mode() -> String {
@@ -78,7 +82,7 @@ fn default_errors_mode() -> String {
 
 impl Default for ErrorsConfig {
     fn default() -> Self {
-        ErrorsConfig { mode: default_errors_mode(), path: None }
+        ErrorsConfig { mode: default_errors_mode(), path: None, verbose_fallback: false }
     }
 }
 

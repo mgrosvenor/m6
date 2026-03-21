@@ -1155,13 +1155,14 @@ fn apply_error_mode(
     client_ip: &str,
     state: &mut ServerState,
 ) -> (u16, Vec<(String, String)>, Vec<u8>, String) {
+    let verbose = state.config.errors.verbose_fallback;
     match &state.error_mode {
         ErrorMode::Status => {
             (status, vec![("Content-Type".to_string(), "text/plain".to_string())], vec![], "error".to_string())
         }
         ErrorMode::Internal => {
             let reason = error::status_reason(status);
-            let body = error::internal_error_html(status, reason);
+            let body = error::internal_error_html(status, reason, verbose, &req.path);
             (
                 status,
                 vec![("Content-Type".to_string(), "text/html; charset=utf-8".to_string())],
@@ -1175,7 +1176,7 @@ fn apply_error_mode(
             // Anti-recursion: if the current request is already to the error path, fall back.
             if req.path == error_path {
                 let reason = error::status_reason(status);
-                let body = error::internal_error_html(status, reason);
+                let body = error::internal_error_html(status, reason, verbose, &req.path);
                 return (
                     status,
                     vec![("Content-Type".to_string(), "text/html; charset=utf-8".to_string())],
@@ -1207,7 +1208,7 @@ fn apply_error_mode(
                 None => {
                     warn!(error_path = %error_path, "custom error: no route for error path, falling back to internal");
                     let reason = error::status_reason(status);
-                    let body = error::internal_error_html(status, reason);
+                    let body = error::internal_error_html(status, reason, verbose, &req.path);
                     return (
                         status,
                         vec![("Content-Type".to_string(), "text/html; charset=utf-8".to_string())],
@@ -1225,7 +1226,7 @@ fn apply_error_mode(
                 Err(e) => {
                     warn!(error = %e, "custom error: error page fetch failed, falling back to internal");
                     let reason = error::status_reason(status);
-                    let body = error::internal_error_html(status, reason);
+                    let body = error::internal_error_html(status, reason, verbose, &req.path);
                     (
                         status,
                         vec![("Content-Type".to_string(), "text/html; charset=utf-8".to_string())],
