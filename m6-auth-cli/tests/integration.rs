@@ -16,19 +16,6 @@ fn binary_path() -> PathBuf {
     p
 }
 
-// ── Test EC P-256 key material (generated offline for tests only) ──────────────
-
-const TEST_PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
-REDACTED
-REDACTED
-REDACTED
------END PRIVATE KEY-----";
-
-const TEST_PUBLIC_KEY_PEM: &str = "-----BEGIN PUBLIC KEY-----
-MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEYPw7LhJaPWI0AMSmKUZIuF3vJxo2
-5SdJhIU/aqEJsCdBr8Q4RU24UYyHtFHEaJOELA2KdVUI0LgIWQ/GFDtSag==
------END PUBLIC KEY-----";
-
 // ── TestEnv ───────────────────────────────────────────────────────────────────
 
 struct TestEnv {
@@ -46,13 +33,29 @@ impl TestEnv {
         TestEnv { dir }
     }
 
-    /// Write embedded test keys to <tmpdir>/keys/. Required for token commands.
+    /// Generate a fresh EC P-256 key pair in <tmpdir>/keys/. Required for token commands.
     fn setup_keys(&self) {
-        std::fs::create_dir_all(self.dir.path().join("keys")).expect("mkdir keys");
-        std::fs::write(self.dir.path().join("keys/auth.pem"), TEST_PRIVATE_KEY_PEM)
-            .expect("write private key");
-        std::fs::write(self.dir.path().join("keys/auth.pub"), TEST_PUBLIC_KEY_PEM)
-            .expect("write public key");
+        let key_dir = self.dir.path().join("keys");
+        std::fs::create_dir_all(&key_dir).expect("mkdir keys");
+        let pem = key_dir.join("auth.pem");
+        let pub_ = key_dir.join("auth.pub");
+
+        let st = Command::new("openssl")
+            .args(["genpkey", "-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256",
+                   "-out"])
+            .arg(&pem)
+            .status()
+            .expect("openssl not found — install openssl to run token tests");
+        assert!(st.success(), "openssl genpkey failed");
+
+        let st = Command::new("openssl")
+            .args(["pkey", "-pubout", "-in"])
+            .arg(&pem)
+            .arg("-out")
+            .arg(&pub_)
+            .status()
+            .expect("openssl pkey failed");
+        assert!(st.success(), "openssl pkey (pubout) failed");
     }
 
     fn config(&self) -> String {
