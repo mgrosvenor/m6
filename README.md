@@ -489,7 +489,7 @@ All detailed documentation lives in [`docs/`](docs/):
 
 | Document | Contents |
 |---|---|
-| [`docs/m6-user-guide.md`](docs/m6-user-guide.md) | Ten worked examples, start here |
+| [`docs/m6-user-guide.md`](docs/m6-user-guide.md) | Eleven worked examples, start here |
 | [`docs/m6-site-toml.md`](docs/m6-site-toml.md) | `site.toml` reference |
 | [`docs/m6-http.md`](docs/m6-http.md) | m6-http internals |
 | [`docs/m6-auth.md`](docs/m6-auth.md) | m6-auth-server reference |
