@@ -1,6 +1,6 @@
 # m6 — User Guide
 
-Ten examples, each building on the last. Clone the examples repo to follow along:
+Eleven examples, each building on the last. Clone the examples repo to follow along:
 
 ```bash
 git clone https://github.com/m6/m6-examples
@@ -1797,3 +1797,189 @@ When a request carries a valid Bearer token, m6-html templates can access the ca
 
 Tests cover: public access, 401 on unauthenticated access, token create/list/revoke, role enforcement, and custom error pages.
 
+
+---
+
+## Example 11 — Admin Dashboard API
+
+`examples/11-admin-dashboard/`
+
+A self-hosting management API for m6 sites. All endpoints return a single JSON blob — one blob per "tab". Built as a custom renderer (`render-admin`) using `App::with_global`.
+
+All `/api/admin/*` routes are protected by `require = "role:admin"` in `site.toml`. Only requests carrying a valid Bearer token (or session cookie) with the `admin` role are accepted.
+
+```bash
+cd examples/11-admin-dashboard
+./setup.sh
+./dev.sh
+# open https://localhost:8444
+```
+
+### API endpoints
+
+| Method | Path | Returns |
+|--------|------|---------|
+| `GET` | `/api/admin/perf` | Last N "periodic stats" entries from m6-http log |
+| `GET` | `/api/admin/system` | CPU%, RAM, disk usage, uptime |
+| `GET` | `/api/admin/bench` | Bench targets auto-discovered from `site.toml` |
+| `POST` | `/api/admin/bench` | Start a bench job → `{ "job_id": "..." }` |
+| `GET` | `/api/admin/bench/{id}` | Poll job status and output |
+| `GET` | `/api/admin/logs` | Last N log lines as JSON array |
+| `GET` | `/api/admin/config` | site.toml parsed as a JSON object |
+| `PUT` | `/api/admin/config` | Write site.toml from a JSON object |
+| `POST` | `/api/admin/config/touch` | Touch site.toml → triggers m6-http hot reload |
+| `POST` | `/api/admin/cache/flush` | Alias for config/touch |
+| `POST` | `/api/admin/services/{name}/restart` | Send SIGTERM to a service via its PID file |
+
+### JSON blob shapes
+
+**`GET /api/admin/perf?n=60`**
+```json
+{
+  "history": [
+    {
+      "ts": "2026-03-22T10:00:00Z",
+      "rps_avg": 120, "rps_peak": 340,
+      "latency_p50_us": 480, "latency_p99_us": 1900,
+      "cache_hits": 85, "cache_misses": 15, "cache_hit_rate": 0.85,
+      "backend_errors": 0, "pool_members": 4
+    }
+  ]
+}
+```
+Each entry is one "periodic stats" log event (emitted every 10 s by m6-http). Pass `?n=N` to limit history length.
+
+**`GET /api/admin/system`**
+```json
+{
+  "uptime_secs": 86400,
+  "cpu_usage_pct": 14.2,
+  "memory": { "used_bytes": 512000000, "total_bytes": 8000000000, "used_pct": 6.4 },
+  "disks": [
+    { "mount": "/", "used_bytes": 10000000000, "total_bytes": 50000000000, "used_pct": 20.0 }
+  ]
+}
+```
+
+**`GET /api/admin/bench`**
+```json
+{
+  "targets": [
+    { "id": "h1",  "label": "HTTP/1.1 127.0.0.1:8443", "addr": "127.0.0.1:8443", "proto": "h1" },
+    { "id": "h2",  "label": "HTTP/2   127.0.0.1:8443", "addr": "127.0.0.1:8443", "proto": "h2" },
+    { "id": "h3",  "label": "HTTP/3   127.0.0.1:8443", "addr": "127.0.0.1:8443", "proto": "h3" },
+    { "id": "all", "label": "All      127.0.0.1:8443", "addr": "127.0.0.1:8443", "proto": "all" }
+  ]
+}
+```
+Targets are auto-discovered from `site.toml`'s `[server].bind` address — no manual configuration.
+
+**`POST /api/admin/bench`**
+```json
+// Request body:
+{ "addr": "127.0.0.1:8443", "proto": "h1", "duration_secs": 10, "concurrency": 50 }
+
+// Response:
+{ "job_id": "550e8400-e29b-41d4-a716-446655440000" }
+```
+
+**`GET /api/admin/bench/{id}`**
+```json
+{
+  "id": "550e8400-e29b-41d4-a716-446655440000",
+  "target": "127.0.0.1:8443 (h1)",
+  "status": "done",
+  "output": "Requests/sec: 42000\nLatency p50: 0.4ms ...",
+  "started_at": 1742641200,
+  "finished_at": 1742641210
+}
+```
+`status` is `"running"`, `"done"`, or `"failed"`.
+
+**`GET /api/admin/logs?n=100`**
+```json
+{ "lines": ["log line 1", "log line 2", ...], "total_lines": 5432 }
+```
+
+**`GET /api/admin/config`**
+```json
+{
+  "path": "/path/to/site.toml",
+  "config": {
+    "server": { "bind": "127.0.0.1:8444", "tls_cert": "...", "tls_key": "..." },
+    "backend": [{ "name": "render-admin", "socket": "/tmp/m6/render-admin.sock" }],
+    "route": [{ "path": "/api/admin/*", "backend": "render-admin", "require": "role:admin" }]
+  }
+}
+```
+The full site.toml is parsed and returned as a JSON object. All TOML types (strings, integers, arrays, nested tables) are preserved.
+
+**`PUT /api/admin/config`**
+```json
+// Request body: the "config" object from GET, with your modifications
+{
+  "server": { "bind": "127.0.0.1:8444", ... },
+  "route": [...]
+}
+```
+The JSON object is converted back to TOML, validated, and written atomically. Returns `{ "ok": true }` on success or `{ "error": "..." }` on validation failure. The original file is never modified if validation fails.
+
+**`POST /api/admin/services/{name}/restart`**
+```json
+{ "ok": true, "pid": 12345 }
+```
+Sends SIGTERM to the process whose PID is in the service's configured PID file.
+
+### Config: `render-admin.conf`
+
+The renderer reads its settings from the m6-render user config dict:
+
+```toml
+socket           = "/tmp/m6/render-admin.sock"
+log_file         = "/tmp/m6/m6-http-admin.log"
+site_toml        = "site.toml"
+perf_history     = 60
+log_tail_default = 100
+bench_bin        = "m6-bench"
+bench_duration_secs = 10
+bench_concurrency   = 50
+
+[[services]]
+name     = "m6-http"
+pid_file = "/tmp/m6/m6-http-admin.pid"
+
+[[services]]
+name     = "render-admin"
+pid_file = "/tmp/m6/render-admin.pid"
+```
+
+### Tests
+
+32 tests covering all five modules run on every `cargo test`:
+
+```bash
+cargo test -p render-admin
+
+# Output:
+# running 32 tests
+# test bench_tests::targets_discovered_from_site_toml ... ok
+# test ops_tests::config_write_json_blob_round_trips ... ok
+# ... (32 total)
+# test result: ok. 32 passed; 0 failed
+```
+
+Tests cover: perf log parsing, system metrics shape, bench target discovery, async job lifecycle, log tail, config read/write/touch round-trip, and service restart.
+
+### Functional tests
+
+`test.sh` tests against a live server:
+
+```bash
+# Terminal 1
+./dev.sh
+
+# Terminal 2
+./test.sh
+```
+
+Tests: unauthenticated 401, all GET endpoints return correct JSON keys, config touch/flush returns 200, unknown service returns 404.
