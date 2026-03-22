@@ -1804,15 +1804,17 @@ Tests cover: public access, 401 on unauthenticated access, token create/list/rev
 
 `examples/11-admin-dashboard/`
 
-A self-hosting management API for m6 sites. All endpoints return a single JSON blob — one blob per "tab". Built as a custom renderer (`render-admin`) using `App::with_global`.
+A self-hosting management API and AJAJ dashboard for m6 sites. All endpoints return a single JSON blob — one blob per "tab". Built as a custom renderer (`render-admin`) using `App::with_global`.
 
 All `/api/admin/*` routes are protected by `require = "role:admin"` in `site.toml`. Only requests carrying a valid Bearer token (or session cookie) with the `admin` role are accepted.
+
+The static AJAJ dashboard (`public/index.html`) is served by `m6-file` at `https://localhost:8444/`. It uses skeleton-loading (shimmer placeholders animate immediately; AJAX fills in real data) and auto-refreshes every 10 seconds. Six tabs: Perf, System, Bench, Logs, Routes, Config.
 
 ```bash
 cd examples/11-admin-dashboard
 ./setup.sh
 ./dev.sh
-# open https://localhost:8444
+# open https://localhost:8444/
 ```
 
 ### API endpoints
@@ -1820,6 +1822,7 @@ cd examples/11-admin-dashboard
 | Method | Path | Returns |
 |--------|------|---------|
 | `GET` | `/api/admin/perf` | Last N "periodic stats" entries from m6-http log |
+| `GET` | `/api/admin/routes` | Per-route request counts, cache rates, avg latency |
 | `GET` | `/api/admin/system` | CPU%, RAM, disk usage, uptime |
 | `GET` | `/api/admin/bench` | Bench targets auto-discovered from `site.toml` |
 | `POST` | `/api/admin/bench` | Start a bench job → `{ "job_id": "..." }` |
@@ -1896,6 +1899,19 @@ Targets are auto-discovered from `site.toml`'s `[server].bind` address — no ma
 ```
 `status` is `"running"`, `"done"`, or `"failed"`.
 
+**`GET /api/admin/routes?n=10000`**
+```json
+{
+  "sample_requests": 8234,
+  "sample_window_secs": 600,
+  "routes": [
+    { "path": "/", "requests": 4100, "cache_hits": 3900, "cache_misses": 200, "hit_rate": 0.951, "avg_latency_us": 120 },
+    { "path": "/blog", "requests": 2800, "cache_hits": 2650, "cache_misses": 150, "hit_rate": 0.946, "avg_latency_us": 180 }
+  ]
+}
+```
+Routes are sorted by request count descending. Pass `?n=N` to limit the sample window (number of "request complete" log entries examined). `sample_window_secs` is the approximate wall-clock span covered; `null` if timestamps are absent in the log.
+
 **`GET /api/admin/logs?n=100`**
 ```json
 { "lines": ["log line 1", "log line 2", ...], "total_lines": 5432 }
@@ -1939,6 +1955,7 @@ socket           = "/tmp/m6/render-admin.sock"
 log_file         = "/tmp/m6/m6-http-admin.log"
 site_toml        = "site.toml"
 perf_history     = 60
+routes_sample    = 10000
 log_tail_default = 100
 bench_bin        = "m6-bench"
 bench_duration_secs = 10
@@ -1955,20 +1972,21 @@ pid_file = "/tmp/m6/render-admin.pid"
 
 ### Tests
 
-32 tests covering all five modules run on every `cargo test`:
+44 tests covering all six modules run on every `cargo test`:
 
 ```bash
 cargo test -p render-admin
 
 # Output:
-# running 32 tests
+# running 44 tests
 # test bench_tests::targets_discovered_from_site_toml ... ok
+# test routes_tests::aggregates_per_path ... ok
 # test ops_tests::config_write_json_blob_round_trips ... ok
-# ... (32 total)
-# test result: ok. 32 passed; 0 failed
+# ... (44 total)
+# test result: ok. 44 passed; 0 failed
 ```
 
-Tests cover: perf log parsing, system metrics shape, bench target discovery, async job lifecycle, log tail, config read/write/touch round-trip, and service restart.
+Tests cover: perf log parsing (field completeness, N-limiting), per-route aggregation (hit rate, latency, sample window, sort order), system metrics shape, bench target discovery, async job lifecycle, log tail content, config read/write/touch round-trip, null rejection, and service restart.
 
 ### Functional tests
 
