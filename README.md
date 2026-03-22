@@ -1,47 +1,46 @@
 # m6
 
-A family of composable Unix processes for serving websites. Each process has one job. They communicate over Unix sockets and are wired together via `site.toml`.
+m6 is a platform for building and deploying fast websites — covering the full stack from auth to rendering to delivery. Start with a single `site.toml` and get TLS, routing, in-process caching, and JWT authentication out of the box. Add Tera templates, static files, or custom renderers in any language as your site grows. Deploy to a single machine, scale to multiple processes, or fan out to a global edge fleet. Either way, pages load in sub-millisecond time.
 
 ---
 
 ## System Architecture
 
 ```
-                         ┌─────────────────────────────────────────────┐
-  Browser / API client   │                  m6-http                    │
-─────────────────────►   │  - TLS termination (always-on)              │
-  HTTPS :443             │  - Routing (site.toml)                      │
-  HTTP/3 + HTTP/1.1      │  - Response cache (path × encoding)         │
-                         │  - JWT auth enforcement (local verify)       │
-                         │  - Backend pool management (least-conn)      │
-                         │  - inotify hot-reload (config + certs + keys)│
-                         └──────────┬───────────────────────────────────┘
-                                    │  Unix sockets  /run/m6/*.sock
-               ┌────────────────────┼──────────────────────────┐
-               ▼                    ▼                          ▼
-         ┌──────────┐        ┌──────────────┐          ┌─────────────┐
-         │ m6-html  │        │   m6-file    │          │  m6-auth    │
-         │          │        │              │          │  -server    │
-         │ Tera     │        │ Static files │          │             │
-         │ template │        │ Compression  │          │ JWT issue   │
-         │ renderer │        │ (br/gzip)    │          │ JWT refresh │
-         │          │        │ Route match  │          │ Login/logout│
-         │ Hot      │        │ Symlink guard│          │ Rate limit  │
-         │ reload   │        │              │          │ Key watch   │
-         └──────────┘        └──────────────┘          └──────┬──────┘
-               │                                              │
-               │  m6-render library (shared)                  │
-               └──────────────────────────────────────────────┘
-                                                              │
-                                                       ┌──────▼──────┐
-                                                       │  m6-auth    │
-                                                       │  (SQLite)   │
-                                                       │  WAL mode   │
-                                                       │  bcrypt pw  │
-                                                       └─────────────┘
-
-  User-supplied renderers (any language, declared as [[backend]] in site.toml)
-  are managed by systemd alongside m6-html, m6-file, m6-auth-server.
+                         ┌──────────────────────────────────────────────┐
+  Browser / API client   │                  m6-http                     │
+─────────────────────►   │  - TLS termination (HTTP/3 + HTTP/2 + H1.1) │
+  HTTPS (any port)       │  - Routing (site.toml)                       │
+                         │  - Response cache (path × encoding)          │
+                         │  - JWT auth enforcement (local verify)        │
+                         │  - Backend pool management (least-conn)       │
+                         │  - Hot-reload (config + certs + pools)        │
+                         └────┬──────────────┬──────────────┬───────────┘
+                              │              │              │
+                    Unix socket         Unix socket     URL backend
+                    (same host)         (same host)     http:// https://
+                    /run/m6/*.sock      /run/m6/*.sock  h2c:// h2s://
+                              │              │         (remote / edge node)
+          ┌───────────────────┼──────────────┘
+          ▼                   ▼                   ▼
+    ┌──────────┐       ┌────────────┐     ┌──────────────┐   ┌─────────────┐
+    │ m6-html  │       │  m6-file   │     │  m6-auth     │   │   custom    │
+    │          │       │            │     │  -server     │   │  renderer   │
+    │ Tera     │       │ Static     │     │              │   │  (any lang) │
+    │ template │       │ files      │     │ JWT issue    │   │             │
+    │ renderer │       │ Brotli/    │     │ JWT refresh  │   │ Rust:       │
+    │          │       │ gzip       │     │ Login/logout │   │ m6-render   │
+    │ Hot      │       │ Symlink    │     │ Rate limit   │   │ library     │
+    │ reload   │       │ guard      │     │ Key watch    │   │             │
+    └────┬─────┘       └────────────┘     └──────┬───────┘   └─────────────┘
+         │  m6-render library (Rust)             │  m6-auth library (Rust)
+         └───────────────────────────────────────┘
+                                                 │
+                                          ┌──────▼──────┐
+                                          │  SQLite DB  │
+                                          │  WAL mode   │
+                                          │  bcrypt pw  │
+                                          └─────────────┘
 ```
 
 ### Request Flow (cache miss)
@@ -51,7 +50,7 @@ Client → m6-http (epoll, single-thread)
            │
            ├─ JWT check (local RSA/EC verify, no network hop)
            │
-           ├─ Route → backend pool (least-connections over Unix sockets)
+           ├─ Route → backend pool (least-conn; Unix socket or URL)
            │
            ├─ Renderer handles request (thread pool, blocking I/O)
            │
@@ -64,7 +63,8 @@ Client → m6-http (epoll, single-thread)
 |------|-----------|---------|
 | 1 | m6-http + m6-html + m6-file | Static sites. No build step. Copy files to deploy. |
 | 2 | Tier 1 + external content tool (e.g. `m6-md`) | Generated static sites. m6 has no build step. |
-| 3 | Tier 2 + user renderers | Dynamic sites: forms, APIs, CMSes. Any language. |
+| 3 | Tier 2 + custom renderers | Dynamic sites: forms, APIs, CMSes. Any language. |
+| 4 | Tier 3 × N nodes + URL backends | Global edge fleet. Edge nodes proxy to origin via h2s://. |
 
 ---
 
@@ -76,10 +76,11 @@ Reverse proxy, cache, and router. The only process that listens on a public port
 
 **Architecture:**
 - Single-threaded `epoll` event loop (no Tokio, no async runtime)
-- HTTP/3 over QUIC (`quiche`) and HTTP/1.1 on the same port
+- HTTP/3 over QUIC (`quiche`) and HTTP/2 + HTTP/1.1 on the same port
 - Response cache keyed by `(path, content-encoding)` — each encoding variant cached independently
 - JWT verified locally with m6-auth's public key — no per-request network hop
-- Backend pools declared as Unix socket globs; inotify watches `/run/m6/` for pool membership changes
+- Backend pools: Unix socket globs (local) or URL backends (`http://`, `https://`, `h2c://`, `h2s://`)
+- inotify watches `/run/m6/` for pool membership changes (new sockets added without config reload)
 - `site.toml` and TLS cert/key watched via inotify — hot-reload with no restart
 - `Cache-Control: public` responses cached; `no-store` / `private` skipped
 - Error pages fetched from configured `[errors] path` backend on 4xx/5xx
@@ -206,7 +207,7 @@ Full minify → brotli-6 pipeline (one-time cost, result cached by m6-http):
 Static file server. Serves assets, downloads, and any file from the site directory.
 
 **Architecture:**
-- Fixed thread pool + bounded request queue (via m6-render framework)
+- Fixed thread pool + bounded request queue
 - Route matching with `{relpath}` (catchall) and `{stem}` (single segment) params
 - Param validation: alphanumeric + `-_.` for stem; subdirs allowed for relpath; `..` → 404
 - Fast symlink guard: `symlink_metadata` check only; `canonicalize` only called when a symlink is found (avoids ~15 µs syscall on every request for normal files)
@@ -240,7 +241,7 @@ Auth service. Issues and verifies JWTs, manages sessions.
 
 ### m6-auth (library)
 
-Shared library crate used by `m6-auth-server`, `m6-auth-cli`, and custom renderers.
+Shared library crate used by `m6-auth-server` and `m6-auth-cli`.
 
 - SQLite with WAL mode — multiple processes may open simultaneously
 - Automatic schema migration on `Db::open`
@@ -250,15 +251,36 @@ Shared library crate used by `m6-auth-server`, `m6-auth-cli`, and custom rendere
 
 ---
 
+### m6-render (library)
+
+Framework library for writing custom renderers in Rust. Used by `m6-html` and any Rust custom renderer crate.
+
+- `App::new()` / `App::with_global()` for stateful renderers
+- Request routing with path parameters (`{id}`, `{relpath}`)
+- `Request` / `Response` / `Error` types
+- Thread pool + bounded queue managed by the framework
+- Hot-reload triggered by config file mtime changes
+
+```rust
+fn main() {
+    App::with_global(init_global)
+        .route_get("/api/items",       handle_list)
+        .route_post("/api/items",      handle_create)
+        .route_get("/api/items/{id}",  handle_get)
+        .run().unwrap();
+}
+```
+
+---
+
 ### m6-auth-cli
 
 Bootstrap and management CLI. Operates directly on SQLite — works whether the server is running or not.
 
 ```
-m6-auth-cli <config> user add <username> [--role <role>]...
+m6-auth-cli <config> user add <username> [--role <role>]... [--password <pw>]
 m6-auth-cli <config> user del <username>
 m6-auth-cli <config> user passwd <username>
-m6-auth-cli <config> user roles <username> [--set <role>]... [--unset <role>]...
 m6-auth-cli <config> user ls [--json]
 m6-auth-cli <config> group add <group>
 m6-auth-cli <config> group del <group>
@@ -280,14 +302,14 @@ my-site/
 ├── configs/
 │   ├── m6-html.conf    ← template routes, global params, compression
 │   ├── m6-file.conf    ← file routes, compression levels
-│   └── system-dev.toml ← bind address and TLS paths (not version-controlled)
+│   └── m6-auth.conf    ← storage, token TTLs, key paths
 ├── templates/          ← Tera templates
 ├── assets/             ← static files (CSS, JS, images)
 ├── content/            ← pre-built JSON (populated by tool or renderer)
-└── data/               ← auxiliary data files
+└── data/               ← auxiliary data files (auth DB, etc.)
 ```
 
-No binaries, no `logs/` directory. All processes log structured JSON to stdout — systemd captures via journald.
+All processes log structured JSON to stdout — systemd captures via journald.
 
 ---
 
@@ -299,7 +321,9 @@ name   = "My Site"
 domain = "example.com"
 
 [server]
-# In system config (not here) — bind address and TLS paths
+bind     = "0.0.0.0:443"
+tls_cert = "/etc/m6/cert.pem"
+tls_key  = "/etc/m6/key.pem"
 
 [[backend]]
 name    = "m6-html"
@@ -308,6 +332,11 @@ sockets = "/run/m6/m6-html-*.sock"
 [[backend]]
 name    = "m6-file"
 sockets = "/run/m6/m6-file-*.sock"
+
+# URL backend: forward to a remote origin or edge node
+[[backend]]
+name = "origin"
+url  = "h2s://origin.example.com:443"
 
 [[route]]
 path    = "/"
@@ -334,18 +363,20 @@ public_key = "/run/m6/auth.pub"
 
 ## Process Management
 
-All processes are managed by systemd. m6-http does not start or monitor anything.
+All processes are independent. m6-http does not start or monitor anything.
 
-```
-# Development (shell script)
+```bash
+# Development (shell script, see m6-examples/m6-run-eg)
 m6-auth-server  $SITE_DIR $AUTH_CONF &
 m6-html         $SITE_DIR $HTML_CONF &
 m6-file         $SITE_DIR $FILE_CONF &
-m6-http         $SITE_DIR $SYSTEM_CONF &
+m6-http         $SITE_DIR $SITE_TOML &
 wait
 ```
 
-Scaling: start additional systemd instances (e.g. `m6-html-2.service`). The socket `/run/m6/m6-html-2.sock` appears; m6-http detects it via inotify and adds it to the pool automatically. No config change needed.
+**Scaling:** start additional instances (e.g. `m6-html-2.service`). The socket `/run/m6/m6-html-2.sock` appears; m6-http detects it via inotify and adds it to the pool. No config change needed.
+
+**Global deployment:** run m6-http at each edge location. Configure it with a `h2s://` URL backend pointing to the origin. Each edge node caches independently. See [Example 09](docs/m6-user-guide.md#example-09--global-deployment) and the Vultr multi-region deployment walkthrough.
 
 ---
 
@@ -384,9 +415,9 @@ Browser                  m6-http                  m6-auth-server
 |-----------|---------|-------------|
 | m6-http | `site.toml` changed (inotify) | Routes, backends, cache invalidation map |
 | m6-http | Socket appears/disappears in `/run/m6/` | Backend pool membership |
-| m6-http | TLS cert/key changed | TLS context |
+| m6-http | TLS cert/key changed (inotify) | TLS context (including QUIC) |
 | m6-auth-server | Key file changed (inotify) | JWT signing key |
-| m6-html / m6-file | Config file written (inotify, Linux); mtime poll fallback on non-Linux | FrameworkState (routes, templates, params) |
+| m6-html | Config file written (inotify on Linux, mtime poll on macOS) | Templates, routes, params |
 
 ---
 
@@ -406,7 +437,7 @@ Pool empty       →  status per [errors] mode:
 
 ## Security
 
-- TLS always required; m6-http terminates; Unix sockets between processes (no internal TLS)
+- TLS always required; m6-http terminates; internal communication over Unix sockets or TLS URL backends
 - JWT verified locally on every request — no per-request network hop to m6-auth
 - Path traversal: `..` in any URL path → 404; `..` in a route param → 400
 - Symlink guard: resolves symlinks at request time; symlinks escaping `site_dir` → 404
@@ -425,29 +456,22 @@ Pool empty       →  status per [errors] mode:
 
 ---
 
-## Known Limitations (v1)
-
-These are tracked gaps between the current implementation and the full spec:
+## Known Limitations
 
 **m6-http:**
-- URL backends (single-upstream HTTP/HTTPS with ALPN) are not yet implemented; only Unix socket backends are supported
-- TLS cert/key changes are detected via inotify but do not trigger a quiche TLS context reload at runtime
 - The cache invalidation map is built only from `[[route_group]]` globs; the second source (renderer config `params` declarations → affected route paths) is not yet parsed
-- No explicit timeout on backend Unix socket calls; a stalled backend blocks one event loop iteration
-
-**m6-html / m6-file:**
-- On non-Linux platforms, hot-reload falls back to mtime polling (~1 s); Linux uses inotify
+- No explicit timeout on backend calls; a stalled backend blocks one event loop iteration
 
 **m6-auth-server:**
 - Rate-limit state is in-memory per process; resets on restart and is not shared across multiple instances
-- When m6-auth sits behind m6-http over a Unix socket, rate limiting falls back to a single "unix" bucket if `X-Forwarded-For` / `X-Real-IP` headers are absent
+- When m6-auth sits behind m6-http, rate limiting falls back to a single "unix" bucket if `X-Forwarded-For` / `X-Real-IP` headers are absent
 
-**Out of scope for v1 (by design):**
+**Out of scope (by design):**
 - Windows
 - Rate limiting outside of m6-auth login
 - Built-in OAuth2 / OIDC provider
 - MFA / WebAuthn
-- Horizontal scaling of m6-http itself (scales vertically via caching)
+- Horizontal scaling of m6-http itself (scales vertically via caching; global scale via edge nodes)
 
 ---
 
@@ -509,6 +533,6 @@ All detailed documentation lives in [`docs/`](docs/):
 cargo build --release --workspace
 ```
 
-Requires Rust 1.75+. Linux only (epoll, inotify, Unix sockets).
+Requires Rust 1.75+. Production target: Linux (epoll, inotify). macOS supported for development.
 
 For development TLS: [mkcert](https://github.com/FiloSottile/mkcert).
