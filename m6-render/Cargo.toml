@@ -29,13 +29,9 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 nix        = { version = "0.27", features = ["signal", "poll"] }
 lru        = "0.16"
 chrono     = { version = "0.4", features = ["serde"] }
-brotli     = "6"
-flate2     = "1"
 base64     = "0.22"
 filetime   = "0.2"
 libc       = "0.2"
-minify-html = "0.15"
-minify-js   = "0.5"
 
 lettre        = { version = "0.11", optional = true, features = ["smtp-transport", "native-tls"] }
 ureq          = { version = "2",    optional = true, features = ["json"] }

@@ -1,20 +1,5 @@
 use crate::config::Config;
 use anyhow::Result;
-use brotli::CompressorWriter;
-use flate2::{write::GzEncoder, Compression};
-use std::io::Write;
-
-/// Default MIME types that should be compressed.
-const DEFAULT_COMPRESS: &[&str] = &[
-    "text/html",
-    "text/css",
-    "application/javascript",
-    "image/svg+xml",
-    "text/plain",
-    "application/json",
-    "application/xml",
-    "text/xml",
-];
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Encoding {
@@ -44,9 +29,9 @@ pub fn choose_encoding(
         return (Encoding::Identity, None);
     }
 
-    // Use defaults
-    let should_compress = DEFAULT_COMPRESS.iter().any(|m| *m == mime_base);
-    if !should_compress {
+    // Use defaults — the shared, already-tested MIME table in m6-core, not a
+    // locally maintained list that can drift out of sync with it.
+    if !m6_core::should_compress_default(mime_base) {
         return (Encoding::Identity, None);
     }
 
@@ -61,19 +46,12 @@ pub fn choose_encoding(
 
 /// Compress data with brotli.
 pub fn compress_brotli(data: &[u8], level: u32) -> Result<Vec<u8>> {
-    let mut output = Vec::with_capacity(data.len());
-    {
-        let mut writer = CompressorWriter::new(&mut output, 4096, level, 22);
-        writer.write_all(data)?;
-    }
-    Ok(output)
+    m6_core::compress::brotli_compress(data, level)
 }
 
 /// Compress data with gzip.
 pub fn compress_gzip(data: &[u8], level: u32) -> Result<Vec<u8>> {
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::new(level));
-    encoder.write_all(data)?;
-    Ok(encoder.finish()?)
+    m6_core::compress::gzip_compress(data, level)
 }
 
 #[cfg(test)]
@@ -85,6 +63,18 @@ mod tests {
     fn test_choose_encoding_default_compress() {
         let config = Config::default();
         let (enc, level) = choose_encoding("text/css", "br, gzip", &config);
+        assert_eq!(enc, Encoding::Brotli);
+        assert!(level.is_some());
+    }
+
+    #[test]
+    fn test_choose_encoding_js_mime_guess_string() {
+        // Regression: mime_guess resolves .js to "text/javascript" (RFC
+        // 9239), not "application/javascript" — this is the string that
+        // actually reaches choose_encoding from a real request, so it's the
+        // one that must match, not the deprecated form alone.
+        let config = Config::default();
+        let (enc, level) = choose_encoding("text/javascript", "br, gzip", &config);
         assert_eq!(enc, Encoding::Brotli);
         assert!(level.is_some());
     }

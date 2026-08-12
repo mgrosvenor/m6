@@ -13,10 +13,8 @@
 /// ```
 
 pub mod app;
-pub mod compress;
 pub mod config;
 pub mod error;
-pub mod minify;
 pub mod request;
 pub mod response;
 pub mod server;

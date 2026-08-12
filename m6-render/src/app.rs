@@ -1870,10 +1870,10 @@ fn handle_connection(
 
         if minification.is_enabled(mime) {
             resp.body = match mime {
-                "text/html" => crate::minify::minify_html(&resp.body, minification.inline_js),
-                "text/css" => crate::minify::minify_css(&resp.body),
-                "application/json" => crate::minify::minify_json(&resp.body),
-                "application/javascript" | "text/javascript" => crate::minify::minify_js(&resp.body),
+                "text/html" => m6_core::minify::minify_html(&resp.body, minification.inline_js),
+                "text/css" => m6_core::minify::minify_css(&resp.body),
+                "application/json" => m6_core::minify::minify_json(&resp.body),
+                "application/javascript" | "text/javascript" => m6_core::minify::minify_js(&resp.body),
                 _ => resp.body,
             };
         }
@@ -1893,12 +1893,12 @@ fn handle_connection(
         if let Some(level) = compression.get(mime) {
             // Use compression levels from config (not hardcoded 6).
             if ae_contains(accept_encoding, "br") && level.brotli > 0 {
-                if let Ok(compressed) = crate::compress::brotli_compress(&resp.body, level.brotli) {
+                if let Ok(compressed) = m6_core::compress::brotli_compress(&resp.body, level.brotli) {
                     resp.body = compressed;
                     resp.headers.push(("Content-Encoding".to_string(), "br".to_string()));
                 }
             } else if ae_contains(accept_encoding, "gzip") && level.gzip > 0 {
-                if let Ok(compressed) = crate::compress::gzip_compress(&resp.body, level.gzip) {
+                if let Ok(compressed) = m6_core::compress::gzip_compress(&resp.body, level.gzip) {
                     resp.body = compressed;
                     resp.headers.push(("Content-Encoding".to_string(), "gzip".to_string()));
                 }
@@ -2168,10 +2168,10 @@ mod tests {
         assert!(level.brotli > 0);
 
         let data = b"Hello, this is some HTML content to compress for testing purposes!";
-        let compressed = crate::compress::brotli_compress(data, level.brotli).unwrap();
+        let compressed = m6_core::compress::brotli_compress(data, level.brotli).unwrap();
         assert!(!compressed.is_empty());
 
-        let decompressed = crate::compress::brotli_decompress(&compressed).unwrap();
+        let decompressed = m6_core::compress::brotli_decompress(&compressed).unwrap();
         assert_eq!(decompressed, data);
     }
 

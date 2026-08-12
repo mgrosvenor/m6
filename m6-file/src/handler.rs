@@ -20,6 +20,24 @@ pub struct ResponseInfo {
     pub latency_us: u128,
 }
 
+/// True if `fs_path` is a symlink resolving outside `site_dir`.
+///
+/// Only pays the `canonicalize` cost when a symlink is actually present;
+/// regular files return immediately. A path that cannot be resolved at all is
+/// treated as escaping — it will 404 either way.
+fn escapes_site_dir(fs_path: &Path, site_dir: &Path) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(fs_path) else {
+        return false; // missing file — the normal 404 path handles it
+    };
+    if !meta.file_type().is_symlink() {
+        return false;
+    }
+    match (std::fs::canonicalize(fs_path), std::fs::canonicalize(site_dir)) {
+        (Ok(real), Ok(root)) => !real.starts_with(root),
+        _ => true,
+    }
+}
+
 /// Handle a single HTTP request.
 ///
 /// Route param validation in `route.rs` (no `..`, safe chars only) prevents
@@ -52,25 +70,21 @@ pub fn handle_request<W: Write>(
         }
     };
 
-    if route.tail {
-        return handle_tail(req, route, &params, ctx, stream, start);
-    }
-
     let fs_path = route.resolve_fs_path(&params, ctx.site_dir);
 
     // Fast symlink check: if the path is (or contains) a symlink that escapes
     // site_dir, return 404.  Regular files skip canonicalize entirely.
-    if let Ok(meta) = std::fs::symlink_metadata(&fs_path) {
-        if meta.file_type().is_symlink() {
-            // Only pay the canonicalize cost when a symlink is actually present.
-            match std::fs::canonicalize(&fs_path) {
-                Ok(real) if real.starts_with(ctx.site_dir) => {}
-                _ => {
-                    write_error(stream, 404, "Not Found")?;
-                    return Ok(ResponseInfo { status: 404, bytes: 0, latency_us: start.elapsed().as_micros() });
-                }
-            }
-        }
+    //
+    // Runs before the `tail` dispatch below — tail routes read the same
+    // filesystem through the same resolver, so exempting them just moved the
+    // escape one route type over.
+    if escapes_site_dir(&fs_path, ctx.site_dir) {
+        write_error(stream, 404, "Not Found")?;
+        return Ok(ResponseInfo { status: 404, bytes: 0, latency_us: start.elapsed().as_micros() });
+    }
+
+    if route.tail {
+        return handle_tail(req, route, &params, ctx, stream, start);
     }
 
     let data = match std::fs::read(&fs_path) {
@@ -83,6 +97,22 @@ pub fn handle_request<W: Write>(
     };
 
     let mime = mime_guess::from_path(&fs_path).first_or_octet_stream().to_string();
+    let mime_base = mime.split(';').next().unwrap_or(&mime);
+
+    // Minification is applied BEFORE compression, gated by content-type and
+    // config — mirroring m6-render's pipeline so a static asset gets the
+    // same treatment here as it would through the render path.
+    let data = if ctx.config.minification.is_enabled(mime_base) {
+        match mime_base {
+            "text/html" => m6_core::minify::minify_html(&data, ctx.config.minification.inline_js),
+            "text/css" => m6_core::minify::minify_css(&data),
+            "application/json" => m6_core::minify::minify_json(&data),
+            "application/javascript" | "text/javascript" => m6_core::minify::minify_js(&data),
+            _ => data,
+        }
+    } else {
+        data
+    };
 
     let accept_encoding = req.accept_encoding();
     let (encoding, level) = choose_encoding(&mime, accept_encoding, ctx.config);
@@ -411,6 +441,62 @@ mod tests {
         assert_eq!(body, b"d\n");
         let end: u64 = headers.iter().find(|(k, _)| k == "x-log-end").unwrap().1.parse().unwrap();
         assert_eq!(end, 8); // file size, not just the last-line offset
+    }
+
+    #[test]
+    fn static_html_is_minified_before_serving() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("index.html"),
+            b"<html>\n  <body>\n    <!-- comment -->\n    <p>Hi</p>\n  </body>\n</html>\n",
+        )
+        .unwrap();
+
+        let raw = "GET /index.html HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let req = Request::read(Cursor::new(raw.as_bytes().to_vec())).unwrap();
+        let route = Route::from_config(&RouteConfig {
+            path: "/{relpath}".to_string(),
+            root: "".to_string(),
+            tail: None,
+            headers: vec![],
+        });
+        let routes = vec![route];
+        let config = Config::default();
+        let ctx = HandlerContext { routes: &routes, config: &config, site_dir: dir.path() };
+
+        let mut out = Vec::new();
+        handle_request(&req, &ctx, &mut out).unwrap();
+        let (status, _headers, body) = parse_response(&out);
+
+        assert_eq!(status, 200);
+        let body_str = std::str::from_utf8(&body).unwrap();
+        assert!(!body_str.contains("<!-- comment -->"), "comment should be stripped: {}", body_str);
+        assert!(body_str.contains("Hi"), "content missing: {}", body_str);
+    }
+
+    #[test]
+    fn minification_disabled_for_mime_leaves_body_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("photo.svg"), b"<svg>   <!-- kept --> </svg>").unwrap();
+
+        let raw = "GET /photo.svg HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let req = Request::read(Cursor::new(raw.as_bytes().to_vec())).unwrap();
+        let route = Route::from_config(&RouteConfig {
+            path: "/{relpath}".to_string(),
+            root: "".to_string(),
+            tail: None,
+            headers: vec![],
+        });
+        let routes = vec![route];
+        let config = Config::default();
+        let ctx = HandlerContext { routes: &routes, config: &config, site_dir: dir.path() };
+
+        let mut out = Vec::new();
+        handle_request(&req, &ctx, &mut out).unwrap();
+        let (status, _headers, body) = parse_response(&out);
+
+        assert_eq!(status, 200);
+        assert_eq!(body, b"<svg>   <!-- kept --> </svg>");
     }
 
     #[test]
