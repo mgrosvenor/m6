@@ -11,6 +11,43 @@ pub struct CompressionSettings {
     pub gzip: u32,
 }
 
+/// Per-MIME-type minification enable flags, mirroring `m6-render`'s
+/// `MinificationConfig` so both backends honour the same `[minification]`
+/// TOML shape.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MinificationConfig {
+    #[serde(flatten, default = "default_minification_enabled")]
+    pub enabled: HashMap<String, bool>,
+    /// Whether to minify inline `<script>` blocks inside HTML files.
+    /// Off by default — see `m6-render`'s `MinificationConfig` for why.
+    #[serde(default)]
+    pub inline_js: bool,
+}
+
+impl Default for MinificationConfig {
+    fn default() -> Self {
+        MinificationConfig { enabled: default_minification_enabled(), inline_js: false }
+    }
+}
+
+impl MinificationConfig {
+    /// Returns true if minification is enabled for `mime`.
+    pub fn is_enabled(&self, mime: &str) -> bool {
+        let base = mime.split(';').next().unwrap_or(mime).trim();
+        *self.enabled.get(base).unwrap_or(&false)
+    }
+}
+
+fn default_minification_enabled() -> HashMap<String, bool> {
+    let mut m = HashMap::new();
+    m.insert("text/html".to_string(), true);
+    m.insert("text/css".to_string(), true);
+    m.insert("application/json".to_string(), true);
+    m.insert("application/javascript".to_string(), true);
+    m.insert("text/javascript".to_string(), true);
+    m
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct RouteConfig {
     pub path: String,
@@ -38,6 +75,8 @@ pub struct LogConfig {
 pub struct Config {
     #[serde(default)]
     pub compression: HashMap<String, CompressionSettings>,
+    #[serde(default)]
+    pub minification: MinificationConfig,
     #[serde(default)]
     pub route: Vec<RouteConfig>,
     pub thread_pool: Option<ThreadPoolConfig>,
