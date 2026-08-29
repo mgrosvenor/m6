@@ -9,9 +9,13 @@ use tracing::warn;
 #[derive(Debug, Clone, Serialize)]
 pub struct Config {
     pub site: SiteConfig,
+    pub node: NodeConfig,
     pub server: ServerConfig,
     pub log: LogConfig,
+    pub analytics: AnalyticsConfig,
+    pub rate_limit: RateLimitConfig,
     pub errors: ErrorsConfig,
+    pub security: SecurityConfig,
     pub auth: Option<AuthConfig>,
     pub backends: Vec<BackendConfig>,
     pub routes: Vec<RouteConfig>,
@@ -24,6 +28,16 @@ pub struct Config {
 pub struct SiteConfig {
     pub name: String,
     pub domain: String,
+}
+
+/// This deployment's node identity (e.g. "sydney", "london") — distinct from
+/// `[site].name`, which is the site's own display name and is identical
+/// across every node (they all serve the same site, from the same
+/// byte-for-byte site.toml). Comes from the per-node *system* config
+/// (`configs/cache-<city>.toml` / `configs/sydney.toml`) instead.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeConfig {
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +79,58 @@ impl Default for LogConfig {
     }
 }
 
+/// Per-request traffic logging (session cookie, referrer, UA, cache state,
+/// node identity, ...) — separate from operational `[log]` above. Written to
+/// its own file via `m6_core::log::init_with_analytics`, always JSON.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnalyticsConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Resolved relative to the process's current working directory (not
+    /// `site_dir`, which lives under a generated/rendered tree that gets
+    /// wiped on redeploy) unless absolute.
+    #[serde(default = "default_analytics_log_path")]
+    pub log_path: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_analytics_log_path() -> String {
+    "logs/analytics.ndjson".to_string()
+}
+
+impl Default for AnalyticsConfig {
+    fn default() -> Self {
+        AnalyticsConfig { enabled: default_true(), log_path: default_analytics_log_path() }
+    }
+}
+
+/// Per-IP request throttling at the edge, ahead of cache lookup and backend
+/// work. Fixed-window counter, in-memory, no external dependency.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimitConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Requests allowed per IP per rolling 60s window before a 429.
+    #[serde(default = "default_requests_per_min")]
+    pub requests_per_min: u32,
+}
+
+fn default_requests_per_min() -> u32 {
+    // Generous default for a personal site: a single page load already
+    // fires off a handful of asset requests from one IP in quick succession,
+    // and browsing a few pages in a session adds up fast. Tune down once
+    // real traffic patterns are visible in the dashboard.
+    300
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        RateLimitConfig { enabled: default_true(), requests_per_min: default_requests_per_min() }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorsConfig {
     #[serde(default = "default_errors_mode")]
@@ -83,6 +149,126 @@ fn default_errors_mode() -> String {
 impl Default for ErrorsConfig {
     fn default() -> Self {
         ErrorsConfig { mode: default_errors_mode(), path: None, verbose_fallback: false }
+    }
+}
+
+/// Security response headers added to every response by the edge.
+///
+/// Each field is the literal header value; setting one to `""` omits that
+/// header entirely. A backend that sets its own value for a given header
+/// always wins — these only fill in what is absent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecurityConfig {
+    /// `Strict-Transport-Security`. Default is one year. Only meaningful over
+    /// TLS, which m6-http always terminates.
+    #[serde(default = "default_hsts")]
+    pub hsts: String,
+    /// `X-Content-Type-Options` — stops MIME sniffing.
+    #[serde(default = "default_nosniff")]
+    pub x_content_type_options: String,
+    /// `X-Frame-Options` — clickjacking protection for older browsers.
+    /// Modern equivalent is `frame-ancestors` in the CSP below.
+    #[serde(default = "default_frame_options")]
+    pub x_frame_options: String,
+    /// `Referrer-Policy` — keeps paths and queries off cross-origin referers.
+    #[serde(default = "default_referrer_policy")]
+    pub referrer_policy: String,
+    /// `Content-Security-Policy`.
+    ///
+    /// The default locks down script/object/frame sources but allows inline
+    /// *styles* (`style-src 'self' 'unsafe-inline'`), which templated sites
+    /// commonly emit via `style="..."` attributes — that one is low-risk
+    /// since CSS can't execute arbitrary code. `script-src` deliberately has
+    /// no such exception: fix inline scripts/handlers at the template level
+    /// (external `.js` + `addEventListener`, or a nonce/hash if an inline
+    /// `<script>` block is unavoidable) rather than widening this policy —
+    /// `'unsafe-inline'` on `script-src` disables the one thing this header
+    /// exists to stop. Override this string only for a genuinely
+    /// site-specific *source* (e.g. a CDN the site loads scripts from), not
+    /// to work around a template that hasn't been fixed yet. Set `""` to
+    /// omit the header value entirely; see `csp_mode` to disable or
+    /// log-only the header as a whole instead of rewriting the policy.
+    #[serde(default = "default_csp")]
+    pub content_security_policy: String,
+    /// Controls whether `content_security_policy` is enforced, logged only,
+    /// or not sent at all — independent of what the policy string says.
+    /// Defaults to `enforce`. Use `report-only` to observe violations (via
+    /// browser devtools, or a `report-uri`/`report-to` clause added to the
+    /// policy string) before switching a new or tightened policy over to
+    /// enforcing, and `off` to omit CSP entirely.
+    #[serde(default)]
+    pub csp_mode: CspMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CspMode {
+    #[default]
+    Enforce,
+    ReportOnly,
+    Off,
+}
+
+fn default_hsts() -> String {
+    "max-age=31536000".to_string()
+}
+
+fn default_nosniff() -> String {
+    "nosniff".to_string()
+}
+
+fn default_frame_options() -> String {
+    "DENY".to_string()
+}
+
+fn default_referrer_policy() -> String {
+    "strict-origin-when-cross-origin".to_string()
+}
+
+fn default_csp() -> String {
+    "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; \
+     script-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'"
+        .to_string()
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        SecurityConfig {
+            hsts: default_hsts(),
+            x_content_type_options: default_nosniff(),
+            x_frame_options: default_frame_options(),
+            referrer_policy: default_referrer_policy(),
+            content_security_policy: default_csp(),
+            csp_mode: CspMode::default(),
+        }
+    }
+}
+
+impl SecurityConfig {
+    /// `(name, value)` pairs for every non-empty setting.
+    ///
+    /// The CSP pair's header *name* depends on `csp_mode`: `enforce` sends
+    /// `content-security-policy` (blocking), `report-only` sends
+    /// `content-security-policy-report-only` (same policy, browser reports
+    /// violations but does not block), `off` omits the pair regardless of
+    /// what `content_security_policy` contains.
+    pub fn resolved_headers(&self) -> Vec<(String, String)> {
+        let csp_header_name = match self.csp_mode {
+            CspMode::Enforce => "content-security-policy",
+            CspMode::ReportOnly => "content-security-policy-report-only",
+            CspMode::Off => "",
+        };
+        [
+            ("strict-transport-security", self.hsts.as_str()),
+            ("x-content-type-options", self.x_content_type_options.as_str()),
+            ("x-frame-options", self.x_frame_options.as_str()),
+            ("referrer-policy", self.referrer_policy.as_str()),
+            (csp_header_name, self.content_security_policy.as_str()),
+        ]
+        .into_iter()
+        .filter(|(k, v)| !k.is_empty() && !v.is_empty())
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
     }
 }
 
@@ -130,7 +316,10 @@ struct RawSiteToml {
     site: Option<RawSiteSection>,
     server: Option<RawServerSection>,
     log: Option<LogConfig>,
+    analytics: Option<AnalyticsConfig>,
+    rate_limit: Option<RateLimitConfig>,
     errors: Option<ErrorsConfig>,
+    security: Option<SecurityConfig>,
     auth: Option<AuthConfig>,
     #[serde(rename = "backend", default)]
     backends: Vec<BackendConfig>,
@@ -158,6 +347,7 @@ struct RawServerSection {
 #[derive(Debug, Deserialize)]
 struct RawSystemToml {
     server: Option<RawServerSection>,
+    node:   Option<NodeConfig>,
 }
 
 // ── Loading ─────────────────────────────────────────────────────────────────
@@ -180,7 +370,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
     // Warn on unexpected sections in system config (we only check for unknown
     // top-level keys by seeing if extra keys exist; toml parsing uses deny_unknown_fields
     // is opt-in, but the spec says warn and ignore instead of error).
-    // We rely on RawSystemToml only accepting `server`.
+    // We rely on RawSystemToml only accepting `server`/`node`.
 
     // Build merged server config:
     // site.toml [server] provides base values, system config [server] overrides.
@@ -221,6 +411,17 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
     let site_domain = raw_site.domain
         .ok_or_else(|| anyhow::anyhow!("config error: [site].domain is required"))?;
 
+    // Node identity comes from system config, not site.toml (see NodeConfig
+    // doc comment) — falls back to [site].name with a warning so an older
+    // system config without [node] still starts up instead of hard-failing.
+    let node = system_parsed.node.unwrap_or_else(|| {
+        warn!(
+            file = %system_config_path.display(),
+            "system config: no [node].name set, falling back to [site].name for node identity"
+        );
+        NodeConfig { name: site_name.clone() }
+    });
+
     let server = ServerConfig {
         bind,
         tls_cert: tls_cert_path.to_string_lossy().into_owned(),
@@ -229,7 +430,10 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         h2c_bind,
     };
     let log = site_parsed.log.unwrap_or_default();
+    let analytics = site_parsed.analytics.unwrap_or_default();
+    let rate_limit = site_parsed.rate_limit.unwrap_or_default();
     let errors = site_parsed.errors.unwrap_or_default();
+    let security = site_parsed.security.unwrap_or_default();
 
     // Validate TLS files exist
     if !tls_cert_path.exists() {
@@ -319,9 +523,13 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
 
     Ok(Config {
         site: SiteConfig { name: site_name, domain: site_domain },
+        node,
         server,
         log,
+        analytics,
+        rate_limit,
         errors,
+        security,
         auth,
         backends,
         routes,
@@ -347,11 +555,11 @@ pub fn warn_system_config_extra_keys(system_config_path: &Path) {
         if let Ok(val) = raw.parse::<toml::Value>() {
             if let toml::Value::Table(tbl) = val {
                 for key in tbl.keys() {
-                    if key != "server" {
+                    if key != "server" && key != "node" {
                         warn!(
                             key = %key,
                             file = %system_config_path.display(),
-                            "system config: ignoring non-[server] key"
+                            "system config: ignoring non-[server]/[node] key"
                         );
                     }
                 }
@@ -420,6 +628,56 @@ tls_key  = "key.pem"
         assert_eq!(cfg.site.name, "Test");
         assert_eq!(cfg.server.bind, "127.0.0.1:8443");
         assert_eq!(cfg.routes.len(), 1);
+    }
+
+    #[test]
+    fn test_security_csp_mode_defaults_to_enforce() {
+        let dir = make_test_dir();
+        setup_minimal(dir.path());
+        let cfg = load(dir.path(), &dir.path().join("system.toml")).unwrap();
+        assert_eq!(cfg.security.csp_mode, CspMode::Enforce);
+    }
+
+    #[test]
+    fn test_security_csp_mode_parses_report_only() {
+        let dir = make_test_dir();
+        let mut site = minimal_site_toml();
+        site.push_str("\n[security]\ncsp_mode = \"report-only\"\n");
+        write_file(dir.path(), "site.toml", &site);
+        write_file(dir.path(), "system.toml", &minimal_system_toml());
+        write_file(dir.path(), "cert.pem", "dummy");
+        write_file(dir.path(), "key.pem", "dummy");
+        let cfg = load(dir.path(), &dir.path().join("system.toml")).unwrap();
+        assert_eq!(cfg.security.csp_mode, CspMode::ReportOnly);
+    }
+
+    #[test]
+    fn test_security_csp_mode_parses_off() {
+        let dir = make_test_dir();
+        let mut site = minimal_site_toml();
+        site.push_str("\n[security]\ncsp_mode = \"off\"\n");
+        write_file(dir.path(), "site.toml", &site);
+        write_file(dir.path(), "system.toml", &minimal_system_toml());
+        write_file(dir.path(), "cert.pem", "dummy");
+        write_file(dir.path(), "key.pem", "dummy");
+        let cfg = load(dir.path(), &dir.path().join("system.toml")).unwrap();
+        assert_eq!(cfg.security.csp_mode, CspMode::Off);
+    }
+
+    #[test]
+    fn test_security_content_security_policy_string_still_overridable_alongside_mode() {
+        let dir = make_test_dir();
+        let mut site = minimal_site_toml();
+        site.push_str(
+            "\n[security]\ncsp_mode = \"report-only\"\ncontent_security_policy = \"default-src 'self'\"\n",
+        );
+        write_file(dir.path(), "site.toml", &site);
+        write_file(dir.path(), "system.toml", &minimal_system_toml());
+        write_file(dir.path(), "cert.pem", "dummy");
+        write_file(dir.path(), "key.pem", "dummy");
+        let cfg = load(dir.path(), &dir.path().join("system.toml")).unwrap();
+        assert_eq!(cfg.security.csp_mode, CspMode::ReportOnly);
+        assert_eq!(cfg.security.content_security_policy, "default-src 'self'");
     }
 
     #[test]

@@ -309,7 +309,7 @@ fn add_renderer_params_to_map(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BackendConfig, Config, ErrorsConfig, LogConfig, RouteConfig, ServerConfig, SiteConfig};
+    use crate::config::{AnalyticsConfig, BackendConfig, Config, ErrorsConfig, LogConfig, NodeConfig, RateLimitConfig, RouteConfig, SecurityConfig, ServerConfig, SiteConfig};
     use std::path::PathBuf;
 
     fn make_config(routes: Vec<RouteConfig>, backends: Vec<BackendConfig>) -> Config {
@@ -323,7 +323,11 @@ mod tests {
                 h2c_bind: None,
             },
             log: LogConfig::default(),
+            analytics: AnalyticsConfig::default(),
+            node: NodeConfig { name: "test-node".to_string() },
+            rate_limit: RateLimitConfig::default(),
             errors: ErrorsConfig::default(),
+            security: SecurityConfig::default(),
             auth: None,
             backends,
             routes,
@@ -455,7 +459,11 @@ params = ["data/home.json", "data/shared.json"]
                 h2c_bind: None,
             },
             log: LogConfig::default(),
+            analytics: AnalyticsConfig::default(),
+            node: NodeConfig { name: "test-node".to_string() },
+            rate_limit: RateLimitConfig::default(),
             errors: ErrorsConfig::default(),
+            security: SecurityConfig::default(),
             auth: None,
             backends: vec![BackendConfig {
                 name: "m6-html".to_string(),
@@ -514,7 +522,11 @@ params = ["content/posts/{stem}.json"]
                 h2c_bind: None,
             },
             log: LogConfig::default(),
+            analytics: AnalyticsConfig::default(),
+            node: NodeConfig { name: "test-node".to_string() },
+            rate_limit: RateLimitConfig::default(),
             errors: ErrorsConfig::default(),
+            security: SecurityConfig::default(),
             auth: None,
             backends: vec![BackendConfig {
                 name: "m6-html".to_string(),
@@ -555,7 +567,11 @@ params = ["content/posts/{stem}.json"]
                 h2c_bind: None,
             },
             log: LogConfig::default(),
+            analytics: AnalyticsConfig::default(),
+            node: NodeConfig { name: "test-node".to_string() },
+            rate_limit: RateLimitConfig::default(),
             errors: ErrorsConfig::default(),
+            security: SecurityConfig::default(),
             auth: None,
             backends: vec![BackendConfig {
                 name: "external".to_string(),
