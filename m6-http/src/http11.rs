@@ -85,7 +85,10 @@ struct H1Conn {
 pub(crate) const READ_TIMEOUT_SECS: u64 = 30;
 /// Idle timeout for HTTP/2 connections (reused across many requests).
 pub(crate) const H2_IDLE_TIMEOUT_SECS: u64 = 300;
-const MAX_REQUEST_BYTES: usize = 64 * 1024;
+/// 20 MiB — above m6-render's own 16 MiB multipart body cap, so oversized
+/// uploads get a clean rejection from the backend (which has read full,
+/// valid HTTP framing) rather than a mid-stream connection drop here.
+const MAX_REQUEST_BYTES: usize = 20 * 1024 * 1024;
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -123,6 +126,14 @@ impl Http11Listener {
                         Ok(t) => t,
                         Err(e) => { warn!("tls ServerConnection::new: {e}"); continue; }
                     };
+                    // Raises rustls' *outgoing* buffering caps (sendable_plaintext /
+                    // sendable_tls) to match MAX_REQUEST_BYTES, so a large response
+                    // written before the peer is ready to receive it doesn't get
+                    // truncated. The incoming side (received_plaintext, where large
+                    // request bodies land) is a separate, fixed 16 KiB buffer with no
+                    // public setter — see the comment on advance_tls's "buffer full"
+                    // handling for how that's dealt with instead.
+                    tls.set_buffer_limit(Some(MAX_REQUEST_BYTES));
                     poller.add(stream.as_raw_fd(), token).ok();
                     // Eagerly start handshake: ClientHello is already buffered on loopback.
                     let _ = advance_tls(&mut tls, &stream);
@@ -314,7 +325,13 @@ where
             H1State::Reading { .. } => {
                 let mut tmp = [0u8; 4096];
                 let n = match tls.reader().read(&mut tmp) {
-                    Ok(0)  => { h1.state = H1State::Done; return; }
+                    // rustls' plaintext reader can legitimately yield Ok(0) mid-stream
+                    // when a processed TLS record carries no application data (e.g. a
+                    // TLS 1.3 post-handshake NewSessionTicket) — this does NOT mean the
+                    // peer closed the connection. Genuine closure is already detected
+                    // one layer up in advance_tls (Err on raw socket EOF), so treat this
+                    // the same as WouldBlock: no plaintext ready this round, keep waiting.
+                    Ok(0)  => break,
                     Ok(n)  => n,
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                     Err(_) => { h1.state = H1State::Done; return; }
@@ -326,8 +343,20 @@ where
                     h1.state = H1State::Writing { buf: resp.to_vec(), pos: 0 };
                     continue;
                 }
-                let snap = buf.clone();
-                match parse_request(&snap) {
+                // Parse under an immutable borrow. `ParseResult` owns all of
+                // its data, so the borrow ends with this statement and
+                // `h1.state` can be reassigned below.
+                //
+                // This used to clone `buf` to release the mutable borrow
+                // above. That copied the whole accumulated request on *every*
+                // read event, so a body arriving in N chunks was copied O(N²)
+                // bytes in total — at the 20 MiB cap, tens of GB of memcpy for
+                // a single upload.
+                let parsed = match &h1.state {
+                    H1State::Reading { buf } => parse_request(buf),
+                    _ => break,
+                };
+                match parsed {
                     ParseResult::Incomplete => break,
                     ParseResult::Error => {
                         let resp = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
@@ -422,6 +451,18 @@ fn advance_tls(tls: &mut ServerConnection, stream: &TcpStream) -> io::Result<()>
             Ok(0)  => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "closed")),
             Ok(_)  => { tls.process_new_packets().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?; }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            // rustls caps its incoming-plaintext buffer at a fixed 16 KiB
+            // (not application-configurable — set_buffer_limit only covers
+            // the *outgoing* buffers) as backpressure: read_tls refuses to
+            // pull more ciphertext until the caller drains already-decoded
+            // plaintext via reader(). For any body over ~16 KiB this trips
+            // on every advance_tls call. It isn't a real error — stop
+            // pumping ciphertext for this round exactly like WouldBlock;
+            // drive_h1 drains the reader right after we return, and the
+            // next poller wakeup (level-triggered — more data is still
+            // sitting in the kernel socket buffer) resumes pumping.
+            Err(e) if e.kind() == io::ErrorKind::Other
+                && e.to_string().contains("received plaintext buffer full") => break,
             Err(e) => return Err(e),
         }
     }
