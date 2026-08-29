@@ -15,6 +15,75 @@ pub const HOP_BY_HOP: &[&str] = &[
     "proxy-connection",
 ];
 
+/// Headers the proxy generates itself and therefore must never accept from a
+/// client. Every one of these is a statement *about* the request that only the
+/// edge is in a position to make truthfully.
+///
+/// Without this, a client could simply send its own copy: backends resolve
+/// headers by first match (m6-render's `Request::header`, m6-core's
+/// `RawRequest::header`), and the proxy appends its values *after* the
+/// client's, so the forged copy is the one that wins. That made
+/// `x-auth-claims` an authentication bypass (any client could assert
+/// `{"groups":["admins"]}`) and `x-forwarded-for` a rate-limit bypass (rotate
+/// the value, never get throttled).
+///
+/// Stripped on ingress, before routing, on every protocol — so no downstream
+/// code has to remember to distrust them.
+pub const UNTRUSTED_INBOUND: &[&str] = &[
+    "x-auth-claims",
+    "x-forwarded-for",
+    "x-forwarded-proto",
+    "x-forwarded-host",
+    "x-real-ip",
+];
+
+/// True if `name` is a header a client is never allowed to supply.
+#[inline]
+pub fn is_untrusted_inbound(name: &str) -> bool {
+    UNTRUSTED_INBOUND.iter().any(|&h| name.eq_ignore_ascii_case(h))
+}
+
+/// Drop every client-supplied copy of a proxy-owned header.
+///
+/// Call on ingress for each protocol, immediately after parsing and before
+/// anything reads the header set.
+pub fn strip_untrusted_inbound(headers: &mut Vec<(String, String)>) {
+    headers.retain(|(name, _)| !is_untrusted_inbound(name));
+}
+
+/// True if the proxy — not the client — owns this header on a forwarded
+/// request, and therefore emits its own copy below.
+///
+/// Deliberately **not** the same set as [`UNTRUSTED_INBOUND`]. That set is
+/// dropped at ingress; by the time a request reaches here, an `x-auth-claims`
+/// header can only have been added by m6-http itself after verifying the JWT,
+/// and dropping it here would mean renderers never receive the verified
+/// identity at all.
+///
+/// `content-length` must describe the body *we* are about to write, and
+/// `x-forwarded-*` are re-emitted from the real connection below, so any
+/// surviving copy of either is discarded.
+#[inline]
+pub fn is_proxy_emitted_hop_header(name: &str) -> bool {
+    proxy_owned_request_header(name)
+}
+
+#[inline]
+fn proxy_owned_request_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("content-length")
+        || name.eq_ignore_ascii_case("x-forwarded-for")
+        || name.eq_ignore_ascii_case("x-forwarded-proto")
+        || name.eq_ignore_ascii_case("x-forwarded-host")
+        || name.eq_ignore_ascii_case("x-real-ip")
+}
+
+/// Headers that must not be copied verbatim onto a forwarded request.
+#[inline]
+fn skip_when_forwarding(name: &str) -> bool {
+    HOP_BY_HOP.iter().any(|&h| name.eq_ignore_ascii_case(h))
+        || proxy_owned_request_header(name)
+}
+
 /// A parsed HTTP request (simplified for forwarding).
 #[derive(Debug, Clone)]
 pub struct HttpRequest {
@@ -104,9 +173,9 @@ pub fn forward_request_timeout(
     }
     buf.extend_from_slice(b" HTTP/1.1\r\n");
 
-    // Forward headers, excluding hop-by-hop
+    // Forward headers, excluding hop-by-hop and anything the proxy owns.
     for (name, value) in &req.headers {
-        if HOP_BY_HOP.iter().any(|&h| name.eq_ignore_ascii_case(h)) {
+        if skip_when_forwarding(name) {
             continue;
         }
         buf.extend_from_slice(name.as_bytes());
@@ -465,9 +534,9 @@ fn build_forwarded_request_bytes(
     buf.extend_from_slice(host.as_bytes());
     buf.extend_from_slice(b"\r\n");
 
-    // Forward original headers (minus hop-by-hop and existing Host)
+    // Forward original headers (minus hop-by-hop, proxy-owned, and Host)
     for (name, value) in &req.headers {
-        if HOP_BY_HOP.iter().any(|&h| name.eq_ignore_ascii_case(h)) {
+        if skip_when_forwarding(name) {
             continue;
         }
         if name.eq_ignore_ascii_case("host") {
