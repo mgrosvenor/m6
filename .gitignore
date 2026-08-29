@@ -19,6 +19,9 @@ target
 *.crt
 **/certs/
 
+# Runtime output (analytics logs, etc.)
+logs/
+
 # macOS metadata
 .DS_Store
 
