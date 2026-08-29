@@ -921,6 +921,9 @@ fn build_request(headers: &[(String, String)], body: Vec<u8>) -> HttpRequest {
                 }
             }
             k if k.starts_with(':') => {}
+            // Strip proxy-owned headers on ingress — see
+            // `forward::UNTRUSTED_INBOUND`.
+            k if crate::forward::is_untrusted_inbound(k) => {}
             _ => fwd.push((k.clone(), v.clone())),
         }
     }

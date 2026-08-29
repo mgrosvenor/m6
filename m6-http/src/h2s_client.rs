@@ -203,6 +203,14 @@ impl H2sTlsClientConn {
                 if name.starts_with(':') {
                     return None;
                 }
+                // The proxy re-emits x-forwarded-* below from the real
+                // connection, and derives content-length from the body it
+                // actually sends. (x-auth-claims is NOT dropped here — by this
+                // point it can only have been set by m6-http after verifying
+                // the JWT; client copies were stripped at ingress.)
+                if crate::forward::is_proxy_emitted_hop_header(name) {
+                    return None;
+                }
                 Some((
                     name.to_ascii_lowercase().into_bytes(),
                     value.as_bytes().to_vec(),
