@@ -893,9 +893,17 @@ fn send_h3_response(
     let mut cl_buf = [0u8; 20];
     let cl_bytes = write_decimal(body.len(), &mut cl_buf);
 
-    // Pre-size: :status + response headers + content-length
-    let mut h3_headers: Vec<quiche::h3::Header> = Vec::with_capacity(headers.len() + 2);
+    // Pre-size: :status + response headers + content-length + security headers
+    let mut h3_headers: Vec<quiche::h3::Header> = Vec::with_capacity(headers.len() + 8);
     h3_headers.push(quiche::h3::Header::new(b":status", &status_buf));
+    // Applied here rather than at a shared choke point because H3 serialises
+    // its own header list; every protocol adds these at its serialisation
+    // boundary so no response path can miss them.
+    if let Some(guard) = m6_http_lib::security::read() {
+        for (k, v) in guard.absent_from(headers) {
+            h3_headers.push(quiche::h3::Header::new(k.as_bytes(), v.as_bytes()));
+        }
+    }
     for (k, v) in headers {
         // Omit content-length for non-empty bodies: quiche+ngtcp2 interop bug where
         // nghttp3 prematurely signals body-complete when content-length is present
@@ -1467,6 +1475,7 @@ fn handle_site_reload(state: &mut ServerState, log_handle: &m6_core::log::LogHan
             state.error_mode = new_error_mode;
             state.public_key = new_public_key;
             state.config = new_config;
+            m6_http_lib::security::configure(&state.config.security);
             state.cache.clear();
 
             log_handle.reload(&state.config.log.format, &state.config.log.level);
@@ -1629,6 +1638,9 @@ fn run(args: Vec<String>) -> i32 {
     } else {
         None
     };
+
+    // Install security response headers before anything can serve a response.
+    m6_http_lib::security::configure(&config.security);
 
     // Build route table
     let route_table = match RouteTable::from_config(&config) {

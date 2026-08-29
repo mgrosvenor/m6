@@ -825,6 +825,16 @@ impl Http2Conn {
         for (k, v) in &filtered {
             pairs.push((k.as_bytes(), v.as_bytes()));
         }
+        // Applied at serialisation so every response carries them regardless
+        // of which path produced it (cache hit, backend, error page). The
+        // guard is held across the encode so the header strings can be
+        // borrowed rather than copied.
+        let security = crate::security::read();
+        if let Some(ref guard) = security {
+            for (k, v) in guard.absent_from(&filtered) {
+                pairs.push((k.as_bytes(), v.as_bytes()));
+            }
+        }
         self.hpack_enc.encode(pairs)
     }
 
