@@ -107,11 +107,21 @@ pub fn build_tera_from_paths(
     Ok(tera)
 }
 
+/// Sentinel used by `not_found()` so the render-error handler can distinguish
+/// "this resource doesn't exist" from a genuine template bug.
+pub const NOT_FOUND_SENTINEL: &str = "__M6_NOT_FOUND__";
+
 fn register_filters(tera: &mut Tera) {
     tera.register_filter("slugify", filter_slugify);
     tera.register_filter("date_format", filter_date_format);
     tera.register_filter("markdown", filter_markdown);
     tera.register_filter("truncate_words", filter_truncate_words);
+
+    // `{{ not_found() }}` — call from a template when a lookup produces no result.
+    // Causes the render to fail with the NOT_FOUND sentinel; app.rs maps this to a 404.
+    tera.register_function("not_found", |_args: &HashMap<String, Value>| {
+        Err(tera::Error::msg(NOT_FOUND_SENTINEL))
+    });
 }
 
 /// `| slugify` — "Hello World" → "hello-world"

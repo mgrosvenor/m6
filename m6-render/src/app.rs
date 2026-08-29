@@ -1807,8 +1807,14 @@ fn handle_connection(
             // Render template if needed.
             if resp.template_name.is_some() {
                 if let Err(e) = fs_r.render_response(&mut resp, &dict) {
-                    error!("Template render error: {e:#}");
-                    resp = Response::status(500);
+                    let msg = format!("{e:#}");
+                    if msg.contains(crate::template::NOT_FOUND_SENTINEL) {
+                        warn!(path = raw.path(), "template signaled not_found");
+                        resp = Response::not_found();
+                    } else {
+                        error!("Template render error: {msg}");
+                        resp = Response::status(500);
+                    }
                 }
             }
 
