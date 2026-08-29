@@ -194,3 +194,47 @@ mod tests {
         assert!(text.ends_with("\r\n\r\n"));
     }
 }
+
+/// Whether `candidate` is safe to use as a redirect `Location` — that is, a
+/// path on *this* origin rather than a URL pointing somewhere else.
+///
+/// `starts_with('/')` alone is **not** sufficient. `//evil.com` is a
+/// protocol-relative URL, and browsers normalise `/\evil.com` to the same
+/// thing; both pass a naive prefix check and then navigate off-site. Used for
+/// post-login `?next=` targets and the `Referer`-derived redirect after a
+/// token refresh, either of which would otherwise be an open redirect usable
+/// to phish against our own login page.
+pub fn is_same_origin_path(candidate: &str) -> bool {
+    let b = candidate.as_bytes();
+    if b.first() != Some(&b'/') {
+        return false;
+    }
+    !matches!(b.get(1), Some(b'/') | Some(b'\\'))
+}
+
+#[cfg(test)]
+mod redirect_tests {
+    use super::is_same_origin_path;
+
+    #[test]
+    fn accepts_ordinary_same_origin_paths() {
+        assert!(is_same_origin_path("/"));
+        assert!(is_same_origin_path("/dashboard"));
+        assert!(is_same_origin_path("/a/b?c=d"));
+        assert!(is_same_origin_path("/path/with/slashes"));
+    }
+
+    #[test]
+    fn rejects_protocol_relative_and_backslash_forms() {
+        assert!(!is_same_origin_path("//evil.com"));
+        assert!(!is_same_origin_path("//evil.com/phish"));
+        assert!(!is_same_origin_path(r"/\evil.com"));
+    }
+
+    #[test]
+    fn rejects_absolute_urls_and_non_paths() {
+        assert!(!is_same_origin_path("https://evil.com"));
+        assert!(!is_same_origin_path("evil.com"));
+        assert!(!is_same_origin_path(""));
+    }
+}

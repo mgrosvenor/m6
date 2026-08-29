@@ -103,9 +103,11 @@ fn form_field<'a>(fields: &'a [(String, String)], key: &str) -> Option<&'a str> 
     fields.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
 }
 
+use m6_core::is_same_origin_path;
+
 fn validate_next(next: Option<&str>) -> String {
     match next {
-        Some(n) if n.starts_with('/') => n.to_string(),
+        Some(n) if is_same_origin_path(n) => n.to_string(),
         _ => "/".to_string(),
     }
 }
@@ -254,7 +256,7 @@ fn handle_refresh_browser(req: &RawRequest, state: &AppState) -> RawResponse {
         Ok((access_jwt, user_id)) => {
             info!(user_id = %user_id, "token refresh");
             let location = req.header("referer")
-                .filter(|r| r.starts_with('/'))
+                .filter(|r| is_same_origin_path(r))
                 .unwrap_or("/")
                 .to_string();
 
