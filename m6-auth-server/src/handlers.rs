@@ -158,11 +158,11 @@ fn handle_login_form(req: &RawRequest, state: &AppState, peer_ip: &str) -> RawRe
     info!(username = %user.username, ip = %peer_ip, "login success");
 
     let session_cookie = format!(
-        "session={}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age={}",
+        "session={}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age={}",
         access_jwt, state.access_ttl
     );
     let refresh_cookie = format!(
-        "refresh={}; HttpOnly; Secure; SameSite=Strict; Path=/auth/refresh; Max-Age={}",
+        "refresh={}; HttpOnly; Secure; SameSite=Lax; Path=/auth/refresh; Max-Age={}",
         refresh_jwt, state.refresh_ttl
     );
 
@@ -261,7 +261,7 @@ fn handle_refresh_browser(req: &RawRequest, state: &AppState) -> RawResponse {
                 .to_string();
 
             let session_cookie = format!(
-                "session={}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age={}",
+                "session={}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age={}",
                 access_jwt, state.access_ttl
             );
             RawResponse::new(302)
@@ -367,8 +367,8 @@ fn handle_logout_browser(req: &RawRequest, state: &AppState) -> RawResponse {
     }
     info!("logout (browser)");
 
-    let clear_session = "session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0";
-    let clear_refresh  = "refresh=; HttpOnly; Secure; SameSite=Strict; Path=/auth/refresh; Max-Age=0";
+    let clear_session = "session=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0";
+    let clear_refresh  = "refresh=; HttpOnly; Secure; SameSite=Lax; Path=/auth/refresh; Max-Age=0";
 
     RawResponse::new(302)
         .header("Location", "/")
