@@ -17,6 +17,7 @@ use std::path::Path;
 
 use base64::Engine;
 
+use m6_http_lib::cache::{make_lookup_key, should_cache, Cache, CacheKey, CachedResponse};
 use m6_http_lib::forward::{self, HttpRequest};
 use m6_http_lib::http11;
 
@@ -175,6 +176,61 @@ fn finding_2c_proxy_verified_claims_still_reach_backend() {
         header_values(&raw, "x-auth-claims"),
         vec![verified],
         "the renderer must receive exactly the proxy's verified claims:\n{raw}"
+    );
+}
+
+// ── Finding 5: cache key drops the query string; Vary ignored ────────────────
+
+/// `cache.rs:31` and `:65` truncate the key at `?`, so every query variant of a
+/// path shares one entry and the first request's body is replayed to everyone.
+///
+/// Property: a different query string must not read another query's entry.
+/// Fix-agnostic — satisfied either by including the query in the key or by
+/// declining to cache query-bearing responses.
+#[test]
+fn finding_5_distinct_query_strings_must_not_share_a_cache_entry() {
+    let cache = Cache::new();
+
+    // Attacker seeds the entry.
+    cache.insert(
+        CacheKey::new("/search", Some("q=attacker"), ""),
+        CachedResponse {
+            status: 200,
+            headers: std::sync::Arc::new(vec![(
+                "cache-control".to_string(),
+                "public".to_string(),
+            )]),
+            body: bytes::Bytes::from_static(b"ATTACKER CONTROLLED"),
+            hints: std::sync::Arc::new(vec![]),
+        },
+    );
+
+    // Victim asks for a different query.
+    let mut buf = [0u8; 512];
+    let victim_key = make_lookup_key("/search", Some("q=victim"), "", &mut buf);
+
+    assert!(
+        cache.get(victim_key).is_none(),
+        "the victim's lookup hit the attacker's cached entry for a different query"
+    );
+}
+
+/// `should_cache` (`cache.rs:172`) never inspects `Vary`, so a response that
+/// explicitly varies per user is cached under a key that ignores the header it
+/// varies on.
+///
+/// Property: a response varying on a per-user header must not be cached.
+#[test]
+fn finding_5b_responses_that_vary_per_user_must_not_be_cached() {
+    let varies_on_cookie = vec![
+        ("Cache-Control".to_string(), "public".to_string()),
+        ("Vary".to_string(), "Cookie".to_string()),
+    ];
+
+    assert!(
+        !should_cache(200, &varies_on_cookie),
+        "a response varying on Cookie was admitted to a cache keyed only on \
+         (path, encoding), so it will be replayed across users"
     );
 }
 

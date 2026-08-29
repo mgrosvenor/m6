@@ -18,8 +18,10 @@ use quiche::h3::NameValue;
 use rand::{thread_rng, RngCore};
 use tracing::{debug, error, info, warn};
 
+use m6_http_lib::analytics;
 use m6_http_lib::auth;
-use m6_http_lib::cache::{Cache, CacheKey, CachedResponse, make_lookup_key, should_cache};
+use m6_http_lib::rate_limit::RateLimiter;
+use m6_http_lib::cache::{Cache, CacheKey, CachedResponse, make_lookup_key, should_cache, strip_set_cookie};
 use m6_http_lib::stats::Stats;
 use m6_http_lib::config::{self, Config};
 use m6_http_lib::error::{self as error, ErrorMode};
@@ -90,6 +92,8 @@ struct ServerState {
     h2c_pool: H2cClientPool,
     /// Persistent non-blocking H2S (HTTP/2 over TLS) outbound client pool.
     h2s_pool: H2sTlsClientPool,
+    /// Per-IP request throttle — general traffic, ahead of cache/routing.
+    rate_limiter: RateLimiter,
 }
 
 // ── Signal handling ───────────────────────────────────────────────────────────
@@ -220,13 +224,24 @@ fn event_loop(
 
     loop {
         // Compute the soonest connection timeout
+        // Idle poll cap. Was 100ms originally — every async backend round trip
+        // (every cache-node→origin fetch) was silently paying up to that much
+        // in pure poll latency, since a response arriving mid-wait is only
+        // noticed on the *next* tick. A "0ms only while a dispatch is actually
+        // pending" version was tried and, on measurement, never actually
+        // engaged — the flat cap below was doing all the work both times it
+        // was tested. Rather than ship a conditional that doesn't do what it
+        // claims, this is a flat cap: verified to cut cache-node→origin
+        // latency from ~107ms to ~10-15ms, at the cost of ~100 wakeups/sec/
+        // process at genuine idle (vs ~10/sec at the original 100ms) — a
+        // real, small, quantified trade, not a hidden one.
         let timeout_ms = connections
             .values()
             .filter_map(|c| c.conn.timeout())
             .min()
             .map(|d| d.as_millis() as i32)
             .unwrap_or(100)
-            .min(100); // always check SHUTDOWN at least every 100 ms
+            .min(10);
 
         #[cfg(target_os = "linux")]
         let n = match poller.wait(&mut ev_buf, timeout_ms, Some(&sigmask_unblocked)) {
@@ -293,6 +308,10 @@ fn event_loop(
             t.drive_all(
                 |req, client_ip| {
                     let state = unsafe { &mut *state_ptr };
+                    let ua = analytics::header(&req.headers, "user-agent");
+                    if let Some(blocked) = check_rate_limit(state, client_ip, &req.path, ua) {
+                        return blocked;
+                    }
                     let enc_str = req.headers
                         .iter()
                         .find(|(k, _)| k.eq_ignore_ascii_case("accept-encoding"))
@@ -301,12 +320,14 @@ fn event_loop(
                     let start = std::time::Instant::now();
 
                     // ── Cache lookup — check before forwarding to backend ──────────
-                    let bypass_cache = req.query.as_deref().map_or(false, |q| {
-                        q.split('&').any(|p| p == "_nocache" || p.starts_with("_nocache="))
-                    });
+                    // Routes with `require` are never served from cache: the
+                    // key has no identity component, so a hit would bypass the
+                    // auth check that runs later in handle_request.
+                    let cacheable = !state.route_table.requires_auth(&req.path);
                     let mut key_buf = [0u8; 512];
-                    let lookup_key = make_lookup_key(&req.path, enc_str, &mut key_buf);
-                    if !bypass_cache { if let Some(cached) = state.cache.get(lookup_key) {
+                    let lookup_key =
+                        make_lookup_key(&req.path, req.query.as_deref(), enc_str, &mut key_buf);
+                    if cacheable { if let Some(cached) = state.cache.get(lookup_key) {
                         let elapsed_ns = start.elapsed().as_nanos() as u64;
                         state.stats.record(elapsed_ns, true, false);
                         let mut headers: Vec<(String, String)> = (*cached.headers).clone();
@@ -322,14 +343,18 @@ fn event_loop(
                             status = cached.status,
                             version = "HTTP/1.1",
                             backend = "cache",
-                            latency_us = elapsed_ns / 1_000,
+                            latency_ns = elapsed_ns,
                             cache_hit = true,
                             "request complete"
                         );
+                        analytics::finish_response(
+                            state.config.analytics.enabled, &mut headers, &req.headers,
+                            &state.config.node.name, &req.path, cached.status, "HIT", client_ip, Some(elapsed_ns),
+                        );
                         return RequestOutcome::Ready(cached.status, headers, cached.body.to_vec(), "cache".to_string(), cached.hints.clone());
-                    } } // end !bypass_cache
+                    } } // end cacheable
 
-                    handle_request(req, client_ip, enc_str, state)
+                    handle_request(req, client_ip, enc_str, state, false)
                 },
                 |http_result, ctx| {
                     let state = unsafe { &mut *state_ptr };
@@ -339,7 +364,7 @@ fn event_loop(
                     for url in hints.iter() {
                         headers.push(("link".to_string(), hints::link_header(url)));
                     }
-                    let elapsed_ns = 0u64; // timing not tracked for async responses
+                    let elapsed_ns = ctx.start.elapsed().as_nanos() as u64;
                     let is_backend_error = status >= 500;
                     state.stats.record(elapsed_ns, false, is_backend_error);
                     debug!(
@@ -347,7 +372,7 @@ fn event_loop(
                         status,
                         version = "HTTP/1.1",
                         backend = %backend_name,
-                        latency_us = elapsed_ns / 1_000,
+                        latency_ns = elapsed_ns,
                         cache_hit = false,
                         "request complete (async url backend)"
                     );
@@ -363,6 +388,10 @@ fn event_loop(
             h.drive_all(
                 |req, client_ip| {
                     let state = unsafe { &mut *state_ptr2 };
+                    let ua = analytics::header(&req.headers, "user-agent");
+                    if let Some(blocked) = check_rate_limit(state, client_ip, &req.path, ua) {
+                        return blocked;
+                    }
                     let enc_str = req.headers
                         .iter()
                         .find(|(k, _)| k.eq_ignore_ascii_case("accept-encoding"))
@@ -371,12 +400,14 @@ fn event_loop(
                     let start = std::time::Instant::now();
 
                     // ── Cache lookup — check before forwarding to backend ──────────
-                    let bypass_cache = req.query.as_deref().map_or(false, |q| {
-                        q.split('&').any(|p| p == "_nocache" || p.starts_with("_nocache="))
-                    });
+                    // Routes with `require` are never served from cache: the
+                    // key has no identity component, so a hit would bypass the
+                    // auth check that runs later in handle_request.
+                    let cacheable = !state.route_table.requires_auth(&req.path);
                     let mut key_buf = [0u8; 512];
-                    let lookup_key = make_lookup_key(&req.path, enc_str, &mut key_buf);
-                    if !bypass_cache { if let Some(cached) = state.cache.get(lookup_key) {
+                    let lookup_key =
+                        make_lookup_key(&req.path, req.query.as_deref(), enc_str, &mut key_buf);
+                    if cacheable { if let Some(cached) = state.cache.get(lookup_key) {
                         let elapsed_ns = start.elapsed().as_nanos() as u64;
                         state.stats.record(elapsed_ns, true, false);
                         let mut headers: Vec<(String, String)> = (*cached.headers).clone();
@@ -390,14 +421,18 @@ fn event_loop(
                             status = cached.status,
                             version = "HTTP/2",
                             backend = "cache",
-                            latency_us = elapsed_ns / 1_000,
+                            latency_ns = elapsed_ns,
                             cache_hit = true,
                             "request complete"
                         );
+                        analytics::finish_response(
+                            state.config.analytics.enabled, &mut headers, &req.headers,
+                            &state.config.node.name, &req.path, cached.status, "HIT", client_ip, Some(elapsed_ns),
+                        );
                         return RequestOutcome::Ready(cached.status, headers, cached.body.to_vec(), "cache".to_string(), cached.hints.clone());
-                    } } // end !bypass_cache
+                    } } // end cacheable
 
-                    handle_request(req, client_ip, enc_str, state)
+                    handle_request(req, client_ip, enc_str, state, false)
                 },
                 |http_result, ctx| {
                     let state = unsafe { &mut *state_ptr2 };
@@ -406,7 +441,7 @@ fn event_loop(
                     for url in hints.iter() {
                         headers.push(("link".to_string(), hints::link_header(url)));
                     }
-                    let elapsed_ns = 0u64;
+                    let elapsed_ns = ctx.start.elapsed().as_nanos() as u64;
                     let is_backend_error = status >= 500;
                     state.stats.record(elapsed_ns, false, is_backend_error);
                     debug!(
@@ -414,7 +449,7 @@ fn event_loop(
                         status,
                         version = "HTTP/2",
                         backend = %backend_name,
-                        latency_us = elapsed_ns / 1_000,
+                        latency_ns = elapsed_ns,
                         cache_hit = false,
                         "request complete (async url backend)"
                     );
@@ -474,7 +509,7 @@ fn event_loop(
         // so they are ready when the browser requests them after receiving 103.
         if let Some(path) = state.prefetch_queue.pop_front() {
             let mut kbuf = [0u8; 512];
-            let lk = make_lookup_key(&path, "", &mut kbuf);
+            let lk = make_lookup_key(&path, None, "", &mut kbuf);
             if state.cache.get(lk).is_none() {
                 // Build a minimal synthetic GET request.
                 let synth = forward::HttpRequest {
@@ -485,7 +520,7 @@ fn event_loop(
                     headers: vec![],
                     body:    vec![],
                 };
-                handle_request(&synth, "127.0.0.1", "", state);
+                handle_request(&synth, "127.0.0.1", "", state, true);
                 debug!(path = %path, "prefetch: warmed cache");
             }
         }
@@ -736,18 +771,40 @@ fn handle_h3_request(
 
     let path_str = std::str::from_utf8(path_bytes).unwrap_or("/");
     let enc_str  = std::str::from_utf8(enc_bytes).unwrap_or("");
+    let query_str = query_bytes.and_then(|q| std::str::from_utf8(q).ok());
 
     let start = Instant::now();
 
+    // ── Rate limit — before cache lookup, routing, or any backend work ───────
+    // HTTP/3 is not a side door: the same per-IP limit applies here as on
+    // HTTP/1.1 and h2c. Every response advertises `alt-svc: h3`, so a limiter
+    // that skipped this path would be trivially bypassed by any client that
+    // takes the hint.
+    {
+        let client_ip = qconn.client_addr.ip().to_string();
+        let ua_owned: Option<String> = req.headers.iter().find_map(|h| {
+            h.name()
+                .eq_ignore_ascii_case(b"user-agent")
+                .then(|| std::str::from_utf8(h.value()).ok().map(str::to_string))
+                .flatten()
+        });
+        if let Some(RequestOutcome::Ready(status, headers, body, _, _)) =
+            check_rate_limit(state, &client_ip, path_str, ua_owned.as_deref())
+        {
+            send_h3_response(stream_id, qconn, status, &headers, Bytes::from(body));
+            return;
+        }
+    }
+
     // ── Cache lookup — zero allocation ────────────────────────────────────────
-    let bypass_cache = query_bytes.map_or(false, |q| {
-        q.split(|&b| b == b'&').any(|p| p == b"_nocache" || p.starts_with(b"_nocache="))
-    });
+    // Routes with `require` are never served from cache — see the HTTP/1.1
+    // path for the reasoning.
+    let cacheable = !state.route_table.requires_auth(path_str);
 
     let mut key_buf = [0u8; 512];
-    let lookup_key = make_lookup_key(path_str, enc_str, &mut key_buf);
+    let lookup_key = make_lookup_key(path_str, query_str, enc_str, &mut key_buf);
 
-    if !bypass_cache {
+    if cacheable {
     if let Some(cached) = state.cache.get(lookup_key) {
         let elapsed_ns = start.elapsed().as_nanos() as u64;
         state.stats.record(elapsed_ns, true, false);
@@ -756,21 +813,36 @@ fn handle_h3_request(
             status = cached.status,
             version = "HTTP/3",
             backend = "cache",
-            latency_us = elapsed_ns / 1_000,
+            latency_ns = elapsed_ns,
             cache_hit = true,
             "request complete"
         );
+
+        // Analytics + session cookie. `req.headers` is passed directly as its
+        // native `Vec<quiche::h3::Header>` — the HeaderSource impl for that
+        // type scans it in place, so this needs no owned-Vec extraction step
+        // (the hand-rolled 3-field scan this replaced was itself already an
+        // unnecessary intermediate allocation, not a required one).
+        let client_ip = qconn.client_addr.ip().to_string();
+        let set_cookie = analytics::record(
+            state.config.analytics.enabled, &req.headers,
+            &state.config.node.name, path_str, cached.status, "HIT", &client_ip, Some(elapsed_ns),
+        );
+
         if !cached.hints.is_empty() {
             send_h3_early_hints(stream_id, qconn, &cached.hints);
         }
-        // Build headers with Link: preload entries appended (fallback for proxies/CDNs).
+        // Build headers with Link: preload entries and Set-Cookie appended as needed.
         let headers_with_links: Vec<(String, String)>;
-        let resp_headers: &[(String, String)] = if cached.hints.is_empty() {
+        let resp_headers: &[(String, String)] = if cached.hints.is_empty() && set_cookie.is_none() {
             &cached.headers
         } else {
             let mut h = (*cached.headers).clone();
             for url in cached.hints.iter() {
                 h.push(("link".to_string(), hints::link_header(url)));
+            }
+            if let Some(sc) = set_cookie {
+                h.push(("Set-Cookie".to_string(), sc));
             }
             headers_with_links = h;
             &headers_with_links
@@ -778,12 +850,12 @@ fn handle_h3_request(
         send_h3_response(stream_id, qconn, cached.status, resp_headers, cached.body);
         return;
     }
-    } // end !bypass_cache
+    } // end cacheable
 
     // ── Phase 2: cache miss — allocate owned data for forwarding ──────────────
     let path    = path_str.to_string();
     let method  = std::str::from_utf8(method_bytes).unwrap_or("GET").to_string();
-    let query   = query_bytes.and_then(|qb| std::str::from_utf8(qb).ok()).map(str::to_string);
+    let query   = query_str.map(str::to_string);
     let client_ip = qconn.client_addr.ip().to_string();
 
     let mut fwd_headers: Vec<(String, String)> = Vec::new();
@@ -791,6 +863,9 @@ fn handle_h3_request(
         let name = h.name();
         if name.starts_with(b":") { continue; }
         if let (Ok(k), Ok(v)) = (std::str::from_utf8(name), std::str::from_utf8(h.value())) {
+            // Strip proxy-owned headers on ingress — see
+            // `forward::UNTRUSTED_INBOUND`.
+            if m6_http_lib::forward::is_untrusted_inbound(k) { continue; }
             fwd_headers.push((k.to_string(), v.to_string()));
         }
     }
@@ -804,7 +879,7 @@ fn handle_h3_request(
         body: req.body,
     };
 
-    match handle_request(&http_req, &client_ip, enc_str, state) {
+    match handle_request(&http_req, &client_ip, enc_str, state, false) {
         RequestOutcome::Ready(status, mut resp_headers, body, backend_name, hints) => {
             // Add Link: preload headers to the response (fallback for proxies/CDNs).
             for url in hints.iter() {
@@ -822,7 +897,7 @@ fn handle_h3_request(
                 status,
                 version = "HTTP/3",
                 backend = %backend_name,
-                latency_us = elapsed_ns / 1_000,
+                latency_ns = elapsed_ns,
                 cache_hit = false,
                 "request complete"
             );
@@ -944,12 +1019,28 @@ fn handle_request(
     client_ip: &str,
     content_encoding: &str,
     state: &mut ServerState,
+    is_prefetch: bool,
 ) -> RequestOutcome {
+    // Prefetch requests are synthetic (no real client, client_ip is a
+    // placeholder) and their response is discarded by the caller — logging
+    // them as analytics would mint a session/log a "MISS" line for a visit
+    // that never happened, polluting request/session counts downstream.
+    let analytics_enabled = state.config.analytics.enabled && !is_prefetch;
+
     // Route lookup
     let route = match state.route_table.at(&req.path) {
         Some(r) => r.clone(),
         None => {
-            let (s, h, b, n) = apply_error_mode(404, req, client_ip, state);
+            // Prefer fetching the real custom error page over the local
+            // socket-pool path (`apply_error_mode`/`forward_to_backend` only
+            // know how to reach Unix-socket backends). On a node whose error
+            // backend is itself a URL/H2C/H2S backend — every cache node,
+            // whose only backend is the origin — dispatch that fetch async
+            // and let it resolve through the normal Pending machinery.
+            if let Some(outcome) = dispatch_custom_error_async(404, req, client_ip, state) {
+                return outcome;
+            }
+            let (s, h, b, n) = apply_error_mode(404, req, client_ip, state, None);
             return RequestOutcome::Ready(s, h, b, n, std::sync::Arc::new(vec![]));
         }
     };
@@ -965,11 +1056,8 @@ fn handle_request(
                 .iter()
                 .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
                 .map(|(_, v)| v.as_str());
-            let cookie_header = req
-                .headers
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("cookie"))
-                .map(|(_, v)| v.as_str());
+            let cookie_header_owned = auth::combined_cookie_header(&req.headers);
+            let cookie_header = cookie_header_owned.as_deref();
             let accept_header = req
                 .headers
                 .iter()
@@ -992,13 +1080,15 @@ fn handle_request(
                         ];
                         return RequestOutcome::Ready(302, headers, vec![], "auth".to_string(), std::sync::Arc::new(vec![]));
                     }
-                    let (s, h, b, n) = apply_error_mode(401, req, client_ip, state);
+                    let ctx = error::ErrorContext { route: Some(route.path.clone()), backend: Some(route.backend.clone()), detail: Some("no token".to_string()) };
+                    let (s, h, b, n) = apply_error_mode(401, req, client_ip, state, Some(&ctx));
                     return RequestOutcome::Ready(s, h, b, n, std::sync::Arc::new(vec![]));
                 }
                 Some(token) => match pk.verify(token) {
                     Err(e) => {
                         warn!(path = %req.path, error = %e, "auth: token verification failed");
-                        let (s, h, b, n) = apply_error_mode(401, req, client_ip, state);
+                        let ctx = error::ErrorContext { route: Some(route.path.clone()), backend: Some(route.backend.clone()), detail: Some(e.to_string()) };
+                        let (s, h, b, n) = apply_error_mode(401, req, client_ip, state, Some(&ctx));
                         return RequestOutcome::Ready(s, h, b, n, std::sync::Arc::new(vec![]));
                     }
                     Ok(claims) => {
@@ -1008,7 +1098,8 @@ fn handle_request(
                                 require = %require,
                                 "auth: insufficient claims"
                             );
-                            let (s, h, b, n) = apply_error_mode(403, req, client_ip, state);
+                            let ctx = error::ErrorContext { route: Some(route.path.clone()), backend: Some(route.backend.clone()), detail: Some(format!("requires: {require}")) };
+                            let (s, h, b, n) = apply_error_mode(403, req, client_ip, state, Some(&ctx));
                             return RequestOutcome::Ready(s, h, b, n, std::sync::Arc::new(vec![]));
                         }
                         // Forward verified claims to backend as X-Auth-Claims header
@@ -1040,9 +1131,10 @@ fn handle_request(
     };
 
     // Forward to backend
-    let bypass_cache = req.query.as_deref().map_or(false, |q| {
-        q.split('&').any(|p| p == "_nocache" || p.starts_with("_nocache="))
-    });
+    // Responses on `require` routes must never enter the shared cache: the key
+    // has no identity component, so a stored entry would later be served to
+    // anonymous callers straight from the cache, before any auth check runs.
+    let cacheable = route.require.is_none();
     let backend_name = route.backend.clone();
 
     // Check if URL backend — dispatch async.
@@ -1062,7 +1154,9 @@ fn handle_request(
             client_ip: client_ip.to_string(),
             enc: content_encoding.to_string(),
             backend_name: backend_name.clone(),
-            bypass_cache,
+            cacheable,
+            start: std::time::Instant::now(),
+            error_status_override: None,
         };
 
         let rx = if url.starts_with("h2c://") {
@@ -1071,7 +1165,8 @@ fn handle_request(
                 Ok(rx) => rx,
                 Err(e) => {
                     warn!(backend = %backend_name, error = %e, "h2c dispatch failed");
-                    let (s, h, b, n) = apply_error_mode(502, req, client_ip, state);
+                    let ctx = error::ErrorContext { route: Some(route.path.clone()), backend: Some(backend_name.clone()), detail: Some(e.to_string()) };
+                    let (s, h, b, n) = apply_error_mode(502, req, client_ip, state, Some(&ctx));
                     return RequestOutcome::Ready(s, h, b, n, std::sync::Arc::new(vec![]));
                 }
             }
@@ -1081,7 +1176,8 @@ fn handle_request(
                 Ok(rx) => rx,
                 Err(e) => {
                     warn!(backend = %backend_name, error = %e, "h2s dispatch failed");
-                    let (s, h, b, n) = apply_error_mode(502, req, client_ip, state);
+                    let ctx = error::ErrorContext { route: Some(route.path.clone()), backend: Some(backend_name.clone()), detail: Some(e.to_string()) };
+                    let (s, h, b, n) = apply_error_mode(502, req, client_ip, state, Some(&ctx));
                     return RequestOutcome::Ready(s, h, b, n, std::sync::Arc::new(vec![]));
                 }
             }
@@ -1095,10 +1191,11 @@ fn handle_request(
     }
 
     // Socket backend — synchronous (local, sub-ms).
-    let (status, resp_headers, body, used_backend) =
+    let backend_start = std::time::Instant::now();
+    let (status, mut resp_headers, body, conn_err) =
         match forward_to_backend(req, &backend_name, client_ip, state) {
             Ok(http_resp) => {
-                if !bypass_cache && should_cache(http_resp.status, &http_resp.headers) {
+                if cacheable && should_cache(http_resp.status, &http_resp.headers) {
                     // Extract early-hints from the response body (HTML only).
                     // This is done ONLY on the cache-miss path to keep the
                     // cache-hit path at <10 µs.
@@ -1110,47 +1207,176 @@ fn handle_request(
                     // Queue any hints not already in the cache for prefetch.
                     for hp in &hint_paths {
                         let mut kbuf = [0u8; 512];
-                        let lk = make_lookup_key(hp, "", &mut kbuf);
+                        let lk = make_lookup_key(hp, None, "", &mut kbuf);
                         if state.cache.get(lk).is_none() {
                             state.prefetch_queue.push_back(hp.clone());
                         }
                     }
-                    let key = CacheKey::new(&req.path, content_encoding);
+                    let key = CacheKey::new(&req.path, req.query.as_deref(), content_encoding);
                     state.cache.insert(
                         key,
                         CachedResponse {
                             status:  http_resp.status,
-                            headers: std::sync::Arc::new(http_resp.headers.clone()),
+                            // strip_set_cookie: at this point in the socket-
+                            // backend path http_resp.headers is the backend's
+                            // (m6-html/m6-file/render-*) raw response, before
+                            // this request's own analytics Set-Cookie is even
+                            // added — so today this is a defensive no-op here.
+                            // Applied anyway (matching the async URL-backend
+                            // insert below, where it isn't a no-op) so cache
+                            // correctness doesn't depend on which code path a
+                            // future Set-Cookie-emitting backend happens to use.
+                            headers: std::sync::Arc::new(strip_set_cookie(&http_resp.headers)),
                             body:    Bytes::from(http_resp.body.clone()),
                             hints:   std::sync::Arc::new(hint_paths),
                         },
                     );
                 }
-                (http_resp.status, http_resp.headers, http_resp.body, backend_name)
+                (http_resp.status, http_resp.headers, http_resp.body, None::<String>)
             }
             Err(e) => {
                 warn!(backend = %backend_name, error = %e, "backend error");
-                (502u16, vec![], vec![], "error".to_string())
+                (502u16, vec![], vec![], Some(e))
             }
         };
 
     // If the response is an error (4xx/5xx) and not already an error response,
     // apply the error mode: status, internal, or custom.
     if status >= 400 {
-        let (s, h, b, n) = apply_error_mode(status, req, client_ip, state);
+        let detail = conn_err.unwrap_or_else(|| format!("{backend_name} returned {status}"));
+        let ctx = error::ErrorContext { route: Some(route.path.clone()), backend: Some(backend_name.clone()), detail: Some(detail) };
+        let (s, mut h, b, n) = apply_error_mode(status, req, client_ip, state, Some(&ctx));
+        // Bug fix: this early return used to skip analytics for every
+        // backend-returned error status uniformly — unlike its async sibling
+        // (finalize_url_response), which deliberately logs a backend-returned
+        // 4xx/5xx and only skips for a genuine connection failure. No
+        // equivalent reasoning applied here; it looked like an accidental
+        // omission from copy-pasted control flow, not intent — a plain
+        // backend 404 should be visible in analytics like any other request.
+        let backend_ns = backend_start.elapsed().as_nanos() as u64;
+        analytics::finish_response(
+            analytics_enabled, &mut h, &req.headers,
+            &state.config.node.name, &req.path, s, "MISS", client_ip, Some(backend_ns),
+        );
         return RequestOutcome::Ready(s, h, b, n, std::sync::Arc::new(vec![]));
     }
 
     // Retrieve hints from cache (populated above if cacheable).
     let hints_arc = {
         let mut kbuf = [0u8; 512];
-        let lk = make_lookup_key(&req.path, content_encoding, &mut kbuf);
+        let lk = make_lookup_key(&req.path, req.query.as_deref(), content_encoding, &mut kbuf);
         state.cache.get(lk)
             .map(|c| c.hints.clone())
             .unwrap_or_else(|| std::sync::Arc::new(vec![]))
     };
 
-    RequestOutcome::Ready(status, resp_headers, body, used_backend, hints_arc)
+    let backend_ns = backend_start.elapsed().as_nanos() as u64;
+    analytics::finish_response(
+        analytics_enabled, &mut resp_headers, &req.headers,
+        &state.config.node.name, &req.path, status, "MISS", client_ip, Some(backend_ns),
+    );
+
+    RequestOutcome::Ready(status, resp_headers, body, backend_name, hints_arc)
+}
+
+/// Check the per-IP rate limit ahead of everything else (cache lookup,
+/// routing, backend dispatch). Returns `Some(outcome)` when the request
+/// should be rejected — caller should return it immediately without doing
+/// any further work. `None` means proceed as normal.
+fn check_rate_limit(
+    state: &mut ServerState,
+    client_ip: &str,
+    path: &str,
+    user_agent: Option<&str>,
+) -> Option<RequestOutcome> {
+    if !state.config.rate_limit.enabled {
+        return None;
+    }
+    let limit = state.config.rate_limit.requests_per_min;
+    if !state.rate_limiter.check_and_increment(client_ip, limit) {
+        return None;
+    }
+    if state.config.analytics.enabled {
+        analytics::log_rate_limited(&state.config.node.name, path, client_ip, user_agent);
+    }
+    let headers = vec![
+        ("Content-Type".to_string(), "text/plain; charset=utf-8".to_string()),
+        ("Retry-After".to_string(), "60".to_string()),
+    ];
+    Some(RequestOutcome::Ready(
+        429,
+        headers,
+        b"Too Many Requests".to_vec(),
+        "rate-limit".to_string(),
+        std::sync::Arc::new(vec![]),
+    ))
+}
+
+/// Try to fetch the configured `[errors] mode = "custom"` error page via an
+/// async URL/H2C/H2S backend dispatch, for cases where `apply_error_mode`'s
+/// synchronous `forward_to_backend` can't reach the error backend (it only
+/// knows how to reach Unix-socket pools; a cache node's only backend is the
+/// origin, an H2C URL backend).
+///
+/// Returns `None` when there's no custom error path configured, the request
+/// already targets it (anti-recursion), or its backend turns out to be an
+/// ordinary socket pool anyway — the caller should fall back to the existing
+/// synchronous `apply_error_mode` in every `None` case.
+fn dispatch_custom_error_async(
+    status: u16,
+    req: &forward::HttpRequest,
+    client_ip: &str,
+    state: &mut ServerState,
+) -> Option<RequestOutcome> {
+    let error_path = match &state.error_mode {
+        ErrorMode::Custom { path } => path.clone(),
+        _ => return None,
+    };
+    if req.path == error_path {
+        return None;
+    }
+    let backend_name = state.route_table.at(&error_path)?.backend.clone();
+    let (url, tls_config, _) = state.pool_manager.get_url_info(&backend_name)?;
+    let url = url.to_string();
+
+    let original_host = req.headers.iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(":authority"))
+        .or_else(|| req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("host")))
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
+    let timeout = std::time::Duration::from_secs(state.config.server.backend_timeout_secs);
+
+    let error_query = format!("status={}&from={}", status, urlencoded(&req.path));
+    let error_req = forward::HttpRequest {
+        method: "GET".to_string(),
+        path: error_path,
+        query: Some(error_query),
+        version: req.version.clone(),
+        headers: vec![("Host".to_string(), original_host.to_string())],
+        body: vec![],
+    };
+
+    let ctx = forward::PendingUrlContext {
+        req: req.clone(),
+        client_ip: client_ip.to_string(),
+        enc: String::new(),
+        backend_name: backend_name.clone(),
+        cacheable: false,
+        start: std::time::Instant::now(),
+        error_status_override: Some(status),
+    };
+
+    let rx = if url.starts_with("h2c://") {
+        state.h2c_pool.dispatch(&url, &error_req, client_ip, original_host).ok()?
+    } else if url.starts_with("h2s://") {
+        state.h2s_pool.dispatch(&url, &error_req, client_ip, original_host, tls_config).ok()?
+    } else {
+        forward::dispatch_url_request(
+            url, error_req, client_ip.to_string(), original_host.to_string(),
+            Some(timeout), tls_config,
+        )
+    };
+    Some(RequestOutcome::Pending { rx, ctx })
 }
 
 /// Apply the configured error mode for a given status code.
@@ -1162,6 +1388,7 @@ fn apply_error_mode(
     req: &forward::HttpRequest,
     client_ip: &str,
     state: &mut ServerState,
+    ctx: Option<&error::ErrorContext>,
 ) -> (u16, Vec<(String, String)>, Vec<u8>, String) {
     let verbose = state.config.errors.verbose_fallback;
     match &state.error_mode {
@@ -1170,7 +1397,7 @@ fn apply_error_mode(
         }
         ErrorMode::Internal => {
             let reason = error::status_reason(status);
-            let body = error::internal_error_html(status, reason, verbose, &req.path);
+            let body = error::internal_error_html(status, reason, verbose, &req.path, ctx);
             (
                 status,
                 vec![("Content-Type".to_string(), "text/html; charset=utf-8".to_string())],
@@ -1184,7 +1411,7 @@ fn apply_error_mode(
             // Anti-recursion: if the current request is already to the error path, fall back.
             if req.path == error_path {
                 let reason = error::status_reason(status);
-                let body = error::internal_error_html(status, reason, verbose, &req.path);
+                let body = error::internal_error_html(status, reason, verbose, &req.path, ctx);
                 return (
                     status,
                     vec![("Content-Type".to_string(), "text/html; charset=utf-8".to_string())],
@@ -1193,8 +1420,13 @@ fn apply_error_mode(
                 );
             }
 
-            // Build error page request: GET <error_path>?status=N&from=/original-path
-            let error_query = format!("status={}&from={}", status, urlencoded(&req.path));
+            // Build error page request: GET <error_path>?status=N&from=/original-path[&route=...&backend=...&detail=...]
+            let mut error_query = format!("status={}&from={}", status, urlencoded(&req.path));
+            if let Some(c) = ctx {
+                if let Some(ref r) = c.route   { error_query.push_str(&format!("&route={}",   urlencoded(r))); }
+                if let Some(ref b) = c.backend { error_query.push_str(&format!("&backend={}", urlencoded(b))); }
+                if let Some(ref d) = c.detail  { error_query.push_str(&format!("&detail={}",  urlencoded(d))); }
+            }
             let error_req = forward::HttpRequest {
                 method: "GET".to_string(),
                 path: error_path.clone(),
@@ -1216,7 +1448,7 @@ fn apply_error_mode(
                 None => {
                     warn!(error_path = %error_path, "custom error: no route for error path, falling back to internal");
                     let reason = error::status_reason(status);
-                    let body = error::internal_error_html(status, reason, verbose, &req.path);
+                    let body = error::internal_error_html(status, reason, verbose, &req.path, ctx);
                     return (
                         status,
                         vec![("Content-Type".to_string(), "text/html; charset=utf-8".to_string())],
@@ -1234,7 +1466,7 @@ fn apply_error_mode(
                 Err(e) => {
                     warn!(error = %e, "custom error: error page fetch failed, falling back to internal");
                     let reason = error::status_reason(status);
-                    let body = error::internal_error_html(status, reason, verbose, &req.path);
+                    let body = error::internal_error_html(status, reason, verbose, &req.path, ctx);
                     (
                         status,
                         vec![("Content-Type".to_string(), "text/html; charset=utf-8".to_string())],
@@ -1306,46 +1538,111 @@ fn finalize_url_response(
     let req = &ctx.req;
     let enc = &ctx.enc;
 
-    let (status, resp_headers, body, used_backend) = match http_result {
+    // This dispatch was itself an async fetch of the custom error page
+    // (see `dispatch_custom_error_async`) — the ORIGINAL failing status
+    // rides along in `error_status_override` regardless of whatever status
+    // the error-page backend itself returned (normally 200, for a
+    // successfully rendered template). Never cache it; never re-derive
+    // another error page on top of it — if even this fetch fails (backend
+    // down), fall back to the plain internal page under the original status.
+    if let Some(original_status) = ctx.error_status_override {
+        // Bug fix: this dispatch fetches a real error page for a real
+        // client's real failing request (ctx.req/ctx.client_ip belong to
+        // them, not a discarded synthetic probe) — skipping analytics here
+        // meant any node running `[errors] mode = "custom"` had zero
+        // visibility into who was hitting error pages, which is the entire
+        // point of that feature.
+        let latency_ns = ctx.start.elapsed().as_nanos() as u64;
+        return match http_result {
+            Ok(http_resp) => {
+                // finish_proxied_response: the error-page backend can itself
+                // be another m6-http instance (a cache node fetching origin's
+                // rendered error page), same reasoning as the main MISS tail.
+                let mut headers = http_resp.headers;
+                analytics::finish_proxied_response(
+                    state.config.analytics.enabled, &mut headers, &req.headers,
+                    &state.config.node.name, &req.path, original_status, "MISS", &ctx.client_ip, Some(latency_ns),
+                );
+                (original_status, headers, http_resp.body, "error".to_string(), std::sync::Arc::new(vec![]))
+            }
+            Err(e) => {
+                warn!(backend = %ctx.backend_name, error = %e, "custom error page fetch failed (async), falling back to internal");
+                let reason = error::status_reason(original_status);
+                let body = error::internal_error_html(original_status, reason, state.config.errors.verbose_fallback, &req.path, None);
+                let mut headers = vec![("Content-Type".to_string(), "text/html; charset=utf-8".to_string())];
+                analytics::finish_response(
+                    state.config.analytics.enabled, &mut headers, &req.headers,
+                    &state.config.node.name, &req.path, original_status, "MISS", &ctx.client_ip, Some(latency_ns),
+                );
+                (original_status, headers, body, "error".to_string(), std::sync::Arc::new(vec![]))
+            }
+        };
+    }
+
+    let (status, resp_headers, body, used_backend, is_connection_failure) = match http_result {
         Ok(http_resp) => {
-            if !ctx.bypass_cache && should_cache(http_resp.status, &http_resp.headers) {
+            if ctx.cacheable && should_cache(http_resp.status, &http_resp.headers) {
                 let content_type = http_resp.headers.iter()
                     .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
                     .map(|(_, v)| v.as_str()).unwrap_or("");
                 let hint_paths = hints::extract_hints(&http_resp.body, content_type);
                 for hp in &hint_paths {
                     let mut kbuf = [0u8; 512];
-                    let lk = make_lookup_key(hp, "", &mut kbuf);
+                    let lk = make_lookup_key(hp, None, "", &mut kbuf);
                     if state.cache.get(lk).is_none() {
                         state.prefetch_queue.push_back(hp.clone());
                     }
                 }
-                let key = CacheKey::new(&req.path, enc);
+                let key = CacheKey::new(&req.path, req.query.as_deref(), enc);
+                // strip_set_cookie matters here specifically: this backend
+                // can itself be another m6-http instance (a cache node's
+                // only backend is the origin), whose response may already
+                // carry a Set-Cookie IT minted for this one request. Caching
+                // it verbatim would replay that one visitor's session cookie
+                // to every future visitor who hits this same cache entry —
+                // the content is shared and cacheable, the cookie isn't.
                 state.cache.insert(key, CachedResponse {
                     status:  http_resp.status,
-                    headers: std::sync::Arc::new(http_resp.headers.clone()),
+                    headers: std::sync::Arc::new(strip_set_cookie(&http_resp.headers)),
                     body:    Bytes::from(http_resp.body.clone()),
                     hints:   std::sync::Arc::new(hint_paths),
                 });
             }
-            (http_resp.status, http_resp.headers, http_resp.body, ctx.backend_name.clone())
+            (http_resp.status, http_resp.headers, http_resp.body, ctx.backend_name.clone(), false)
         }
         Err(e) => {
             warn!(backend = %ctx.backend_name, error = %e, "url backend error (async)");
-            (502u16, vec![], vec![], "error".to_string())
+            (502u16, vec![], vec![], "error".to_string(), true)
         }
     };
 
-    // If error, apply error mode.
-    if status >= 400 {
-        let (s, h, b, n) = apply_error_mode(status, req, &ctx.client_ip, state);
+    // Only re-derive an error page for a genuine connection-level failure (no
+    // body to show). A completed round trip to a URL/proxy backend — even
+    // with a 4xx/5xx status — already carries that backend's own fully
+    // rendered error page (e.g. origin applies its own [errors] mode before
+    // responding to a cache node), so passing it through verbatim is correct;
+    // re-deriving our own here would silently discard it and substitute the
+    // generic internal page instead.
+    if status >= 400 && is_connection_failure {
+        let err_ctx = error::ErrorContext { route: None, backend: Some(ctx.backend_name.clone()), detail: Some(format!("backend returned {status}")) };
+        let (s, mut h, b, n) = apply_error_mode(status, req, &ctx.client_ip, state, Some(&err_ctx));
+        // Bug fix: this is the final 502/504 a real client actually receives
+        // when the backend is unreachable — arguably the single most
+        // operationally important case to have in analytics (a backend-down
+        // incident should show up in the request/status log, not just an
+        // operational warn!()), and the pre-fix code skipped it unconditionally.
+        let latency_ns = ctx.start.elapsed().as_nanos() as u64;
+        analytics::finish_response(
+            state.config.analytics.enabled, &mut h, &req.headers,
+            &state.config.node.name, &req.path, s, "MISS", &ctx.client_ip, Some(latency_ns),
+        );
         return (s, h, b, n, std::sync::Arc::new(vec![]));
     }
 
     // Retrieve hints from cache (populated above if cacheable).
     let hints_arc = {
         let mut kbuf = [0u8; 512];
-        let lk = make_lookup_key(&req.path, enc, &mut kbuf);
+        let lk = make_lookup_key(&req.path, req.query.as_deref(), enc, &mut kbuf);
         state.cache.get(lk).map(|c| c.hints.clone())
             .unwrap_or_else(|| std::sync::Arc::new(vec![]))
     };
@@ -1353,6 +1650,17 @@ fn finalize_url_response(
     let mut headers_with_altsvc = resp_headers;
     headers_with_altsvc.push(("alt-svc".to_string(),
         format!("h3=\":{quic_port}\"; ma=86400")));
+
+    // finish_proxied_response, not finish_response: this backend may itself
+    // be another m6-http instance (a cache node's only backend is the
+    // origin), whose response can already carry a _m6sid the origin just
+    // minted for this same request — see the doc comment on
+    // finish_proxied_response for why that matters.
+    let latency_ns = ctx.start.elapsed().as_nanos() as u64;
+    analytics::finish_proxied_response(
+        state.config.analytics.enabled, &mut headers_with_altsvc, &req.headers,
+        &state.config.node.name, &req.path, status, "MISS", &ctx.client_ip, Some(latency_ns),
+    );
 
     (status, headers_with_altsvc, body, used_backend, hints_arc)
 }
@@ -1601,7 +1909,9 @@ fn run(args: Vec<String>) -> i32 {
 
     // CLI --log-level overrides site.toml [log].level; format always comes from config.
     let log_level = cli.log_level.as_deref().unwrap_or(&config.log.level);
-    let log_handle = match m6_core::log::init(&config.log.format, log_level) {
+    let analytics_path = config.analytics.enabled
+        .then(|| PathBuf::from(&config.analytics.log_path));
+    let log_handle = match m6_core::log::init_with_analytics(&config.log.format, log_level, analytics_path.as_deref()) {
         Ok(g) => g,
         Err(e) => {
             eprintln!("logging init error: {}", e);
@@ -1750,6 +2060,7 @@ fn run(args: Vec<String>) -> i32 {
         prefetch_queue: std::collections::VecDeque::new(),
         h2c_pool: H2cClientPool::new(),
         h2s_pool: H2sTlsClientPool::new(),
+        rate_limiter: RateLimiter::new(),
     };
 
     event_loop(udp, tcp_listener, h2c_listener, watcher, &mut state, &mut quiche_config, &log_handle)

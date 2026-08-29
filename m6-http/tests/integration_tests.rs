@@ -397,7 +397,7 @@ mod phase11 {
     #[test]
     fn public_response_is_cached() {
         let cache = Cache::new();
-        let key = CacheKey::new("/page", "");
+        let key = CacheKey::new("/page", None, "");
         let headers = vec![("cache-control".to_string(), "public, max-age=3600".to_string())];
         assert!(should_cache(200, &headers));
 
@@ -409,7 +409,7 @@ mod phase11 {
     #[test]
     fn second_request_served_from_cache() {
         let cache = Cache::new();
-        let key = CacheKey::new("/page", "");
+        let key = CacheKey::new("/page", None, "");
         let resp = CachedResponse {
             status: 200,
             headers: std::sync::Arc::new(vec![("cache-control".to_string(), "public".to_string())]),
@@ -439,8 +439,8 @@ mod phase11 {
     #[test]
     fn gzip_and_br_cached_independently() {
         let cache = Cache::new();
-        let key_gzip = CacheKey::new("/page", "gzip");
-        let key_br = CacheKey::new("/page", "br");
+        let key_gzip = CacheKey::new("/page", None, "gzip");
+        let key_br = CacheKey::new("/page", None, "br");
 
         cache.insert(key_gzip.clone(), CachedResponse {
             status: 200,
@@ -463,13 +463,20 @@ mod phase11 {
         assert_eq!(cache.get(&key_br).unwrap().body, b"br-body" as &[u8]);
     }
 
+    /// The query is a *separate* key component. A `?` left inside the `path`
+    /// argument is defensively stripped, so it can never smuggle one request's
+    /// query into another request's key.
     #[test]
-    fn query_string_stripped_from_cache_key() {
-        let k1 = CacheKey::new("/blog?a=1", "");
-        let k2 = CacheKey::new("/blog?a=2", "");
-        let k3 = CacheKey::new("/blog", "");
-        assert_eq!(k1, k2);
-        assert_eq!(k1, k3);
+    fn query_string_is_part_of_cache_key() {
+        // Distinct queries must not collide.
+        let a = CacheKey::new("/blog", Some("a=1"), "");
+        let b = CacheKey::new("/blog", Some("a=2"), "");
+        let none = CacheKey::new("/blog", None, "");
+        assert_ne!(a, b);
+        assert_ne!(a, none);
+
+        // A `?` in the path argument is ignored, not treated as a query.
+        assert_eq!(CacheKey::new("/blog?a=1", None, ""), none);
     }
 
     #[test]
@@ -477,7 +484,7 @@ mod phase11 {
         let cache = Cache::new();
 
         // Pre-populate cache with the path that maps from a data file
-        let key = CacheKey::new("/blog/hello-world", "");
+        let key = CacheKey::new("/blog/hello-world", None, "");
         cache.insert(key.clone(), CachedResponse {
             status: 200,
             headers: std::sync::Arc::new(vec![("cache-control".to_string(), "public".to_string())]),
