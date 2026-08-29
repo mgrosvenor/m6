@@ -18,6 +18,7 @@ use std::path::Path;
 use base64::Engine;
 
 use m6_http_lib::forward::{self, HttpRequest};
+use m6_http_lib::http11;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -85,12 +86,79 @@ fn get_request(path: &str, headers: Vec<(String, String)>) -> HttpRequest {
     }
 }
 
-// ── Finding 2c: proxy-verified claims must still reach the backend ──────────
+// ── Finding 2: client-supplied X-Auth-Claims reaches the backend ─────────────
 
-/// The counterpart to stripping forged claims at ingress: once m6-http has
-/// verified a JWT it appends its *own* `X-Auth-Claims`, and that copy must
-/// reach the renderer — otherwise stripping would have broken authentication
-/// instead of securing it.
+/// Original defect: `main.rs` cloned the *client's* headers and appended the
+/// verified claims, and `forward.rs` wrote them all out unfiltered. The backend
+/// received two `X-Auth-Claims` headers with the attacker's first, and
+/// m6-render resolves the header with `.find()` (`m6-render/src/request.rs:39`)
+/// — first match wins, so `{"groups":["admins"]}` from the wire took effect.
+///
+/// The fix strips the header at ingress, so this asserts at that boundary: the
+/// parser is the last point where a client-supplied copy can still exist.
+///
+/// Property: a client-supplied `X-Auth-Claims` must not survive parsing.
+#[test]
+fn finding_2_forged_x_auth_claims_must_not_survive_ingress() {
+    let forged = b64(r#"{"sub":"admin","groups":["admins"],"roles":["admin"]}"#);
+    let raw = format!(
+        "GET /admin HTTP/1.1\r\nHost: example.com\r\nX-Auth-Claims: {forged}\r\n\r\n"
+    );
+
+    let req = match http11::parse_request(raw.as_bytes()) {
+        http11::ParseResult::Complete(r) => r,
+        _ => panic!("expected a complete parse of:\n{raw}"),
+    };
+
+    assert!(
+        !req.headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("x-auth-claims")),
+        "forged claims survived ingress: {:?}",
+        req.headers
+    );
+}
+
+/// Every proxy-owned header, not just claims — `x-forwarded-*` and `x-real-ip`
+/// are equally assertions only the edge can make truthfully.
+///
+/// Property: no client-supplied copy of any proxy-owned header survives.
+#[test]
+fn finding_2b_all_proxy_owned_headers_stripped_at_ingress() {
+    let raw = "GET /public HTTP/1.1\r\n\
+               Host: example.com\r\n\
+               X-Auth-Claims: forged\r\n\
+               X-Forwarded-For: 10.0.0.99\r\n\
+               X-Forwarded-Proto: http\r\n\
+               X-Forwarded-Host: evil.com\r\n\
+               X-Real-IP: 10.0.0.99\r\n\
+               User-Agent: probe\r\n\r\n";
+
+    let req = match http11::parse_request(raw.as_bytes()) {
+        http11::ParseResult::Complete(r) => r,
+        _ => panic!("expected a complete parse"),
+    };
+
+    for banned in forward::UNTRUSTED_INBOUND {
+        assert!(
+            !req.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(banned)),
+            "`{banned}` survived ingress: {:?}",
+            req.headers
+        );
+    }
+    // Ordinary headers must be untouched.
+    assert!(
+        req.headers
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("user-agent") && v == "probe"),
+        "stripping must not disturb ordinary headers: {:?}",
+        req.headers
+    );
+}
+
+/// The counterpart to the strip: once m6-http has verified a JWT it appends its
+/// *own* `X-Auth-Claims`, and that copy must reach the renderer — otherwise
+/// stripping would have broken authentication instead of securing it.
 ///
 /// Property: proxy-added claims are forwarded intact.
 #[test]
@@ -136,4 +204,91 @@ fn finding_6_forged_x_forwarded_for_must_not_reach_backend() {
         "per-IP rate limiting keys on attacker-controlled input. \
          Forwarded request:\n{raw}"
     );
+}
+
+// ── Finding 7: conflicting framing headers are relayed ───────────────────────
+
+/// The proxy forwards every client header verbatim, so a request carrying two
+/// conflicting `Content-Length` values reaches the backend with both intact.
+/// m6-http resolves the ambiguity by taking the first (`http11.rs:495`); a
+/// backend may resolve it differently.
+///
+/// Property: a request must never be relayed with ambiguous framing. (A fix
+/// that rejects such requests at the edge never reaches this code path, which
+/// also satisfies the assertion.)
+#[test]
+fn finding_7_conflicting_content_length_must_not_be_relayed() {
+    let req = get_request(
+        "/upload",
+        vec![
+            ("Content-Length".to_string(), "100".to_string()),
+            ("Content-Length".to_string(), "0".to_string()),
+        ],
+    );
+
+    let raw = forward_and_capture(&req, "203.0.113.9");
+    let values = header_values(&raw, "content-length");
+
+    assert!(
+        values.len() <= 1,
+        "backend received {} Content-Length headers ({:?}); conflicting framing \
+         should be rejected at the edge. Forwarded request:\n{raw}",
+        values.len(),
+        values
+    );
+}
+
+/// Defence in depth for the same finding, at the ingress boundary: ambiguous
+/// framing is refused outright rather than resolved by picking a winner and
+/// hoping the backend picks the same one.
+///
+/// Property: conflicting `Content-Length`, or `Content-Length` alongside
+/// `Transfer-Encoding`, must not parse.
+#[test]
+fn finding_7b_ambiguous_framing_must_be_rejected_at_ingress() {
+    let ambiguous = [
+        (
+            "conflicting content-length",
+            "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\nContent-Length: 0\r\n\r\n",
+        ),
+        (
+            "content-length + transfer-encoding",
+            "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\
+             Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        ),
+        (
+            "chunked body we never decode",
+            "POST /upload HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n\
+             5\r\nhello\r\n0\r\n\r\n",
+        ),
+    ];
+
+    for (label, raw) in ambiguous {
+        assert!(
+            matches!(http11::parse_request(raw.as_bytes()), http11::ParseResult::Error),
+            "{label}: should be rejected, but parsed"
+        );
+    }
+}
+
+/// Guards against over-correction: agreeing duplicate `Content-Length` headers
+/// are redundant but unambiguous, and a normal single-header request must of
+/// course still work.
+#[test]
+fn finding_7c_unambiguous_framing_still_accepted() {
+    let ok = [
+        "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello",
+        "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello",
+        "GET /page HTTP/1.1\r\nHost: x\r\n\r\n",
+    ];
+
+    for raw in ok {
+        assert!(
+            matches!(
+                http11::parse_request(raw.as_bytes()),
+                http11::ParseResult::Complete(_)
+            ),
+            "should parse cleanly:\n{raw}"
+        );
+    }
 }
