@@ -438,13 +438,15 @@ fn advance_tls(tls: &mut ServerConnection, stream: &TcpStream) -> io::Result<()>
 
 // ── HTTP/1.1 request parser ───────────────────────────────────────────────────
 
-enum ParseResult {
+/// Outcome of parsing a client request. Public so security tests can assert on
+/// what the ingress boundary accepts, rejects, and strips.
+pub enum ParseResult {
     Incomplete,
     Error,
     Complete(HttpRequest),
 }
 
-fn parse_request(buf: &[u8]) -> ParseResult {
+pub fn parse_request(buf: &[u8]) -> ParseResult {
     let mut headers = [httparse::EMPTY_HEADER; 64];
     let mut req = httparse::Request::new(&mut headers);
     let body_offset = match req.parse(buf) {
@@ -461,22 +463,66 @@ fn parse_request(buf: &[u8]) -> ParseResult {
         None => (raw_path.to_string(), None),
     };
 
-    // Extract what we need from req.headers before dropping req
+    // Extract what we need from req.headers before dropping req.
+    //
+    // One pass does three jobs — framing validation, ingress stripping, and
+    // materialisation — because this loop is the single hottest piece of
+    // per-request work in the proxy. It used to be two passes plus a
+    // `filter_map().collect()` whose size hint forced the Vec to grow.
     let nheaders = req.headers.len();
-    let content_length: usize = req.headers[..nheaders]
-        .iter()
-        .find(|h| h.name.eq_ignore_ascii_case("content-length"))
-        .and_then(|h| std::str::from_utf8(h.value).ok())
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(0);
 
-    let fwd_headers: Vec<(String, String)> = req.headers[..nheaders]
-        .iter()
-        .filter_map(|h| {
-            let v = std::str::from_utf8(h.value).ok()?;
-            Some((h.name.to_string(), v.to_string()))
-        })
-        .collect();
+    // Request framing must be unambiguous. Two disagreeing `Content-Length`
+    // values, or a `Content-Length` alongside a `Transfer-Encoding`, let two
+    // hops disagree about where this request ends and the next begins — the
+    // basis of request smuggling. We refuse such a request rather than pick a
+    // winner and hope the backend picks the same one.
+    let mut first_cl: Option<&str> = None;
+    let mut saw_cl = false;
+    let mut fwd_headers: Vec<(String, String)> = Vec::with_capacity(nheaders);
+
+    for h in &req.headers[..nheaders] {
+        if h.name.eq_ignore_ascii_case("transfer-encoding") {
+            // Chunked bodies are not decoded here; accepting one would mean
+            // forwarding a body we never read.
+            return ParseResult::Error;
+        }
+        if h.name.eq_ignore_ascii_case("content-length") {
+            let Ok(value) = std::str::from_utf8(h.value) else {
+                return ParseResult::Error;
+            };
+            let value = value.trim();
+            match first_cl {
+                // Duplicates are tolerable only when they agree.
+                Some(prev) if prev != value => return ParseResult::Error,
+                Some(_) => {}
+                None => first_cl = Some(value),
+            }
+            saw_cl = true;
+        }
+
+        // Strip proxy-owned headers on ingress — see
+        // `forward::UNTRUSTED_INBOUND`.
+        if crate::forward::is_untrusted_inbound(h.name) {
+            continue;
+        }
+        // A header value that is not UTF-8 is dropped rather than rejected
+        // (matching prior behaviour); `content-length` is the exception
+        // handled above, where it is a framing error.
+        let Ok(v) = std::str::from_utf8(h.value) else { continue };
+        fwd_headers.push((h.name.to_string(), v.to_string()));
+    }
+
+    let content_length: usize = match first_cl {
+        Some(v) => match v.parse() {
+            Ok(n) => n,
+            Err(_) => return ParseResult::Error,
+        },
+        // `saw_cl` without a value is unreachable (the loop sets both
+        // together), but keep the framing decision explicit rather than
+        // silently defaulting a malformed header to zero.
+        None if saw_cl => return ParseResult::Error,
+        None => 0,
+    };
 
     drop(req); // release borrow of `headers`
 
