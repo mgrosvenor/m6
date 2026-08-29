@@ -9,6 +9,7 @@ pub mod h2s_client;
 pub mod pool;
 pub mod poller;
 pub mod router;
+pub mod security;
 pub mod stats;
 pub mod watcher;
 pub mod hints;

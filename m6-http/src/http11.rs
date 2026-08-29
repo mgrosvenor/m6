@@ -508,6 +508,9 @@ fn build_response(status: u16, headers: &[(String, String)], body: &[u8]) -> Vec
     for (k, v) in headers {
         out.extend_from_slice(format!("{}: {}\r\n", k, v).as_bytes());
     }
+    // Applied at serialisation so every response carries them regardless of
+    // which path produced it (cache hit, backend, error page, 429).
+    crate::security::write_h1_headers(&mut out, headers);
     out.extend_from_slice(format!("content-length: {}\r\n", body.len()).as_bytes());
     out.extend_from_slice(b"connection: close\r\n\r\n");
     out.extend_from_slice(body);
