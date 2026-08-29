@@ -24,6 +24,20 @@ impl ErrorMode {
     }
 }
 
+/// Diagnostic context for verbose error pages.
+pub struct ErrorContext {
+    /// Matched route pattern (e.g. "/blog/{stem}"), or None if no route matched.
+    pub route: Option<String>,
+    /// Backend that was (or would have been) invoked (e.g. "m6-html").
+    pub backend: Option<String>,
+    /// Specific error detail (e.g. token parse error, require clause).
+    pub detail: Option<String>,
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
 /// (detail, hint) for verbose internal error pages.
 pub fn internal_error_detail(status: u16) -> (&'static str, Option<&'static str>) {
     match status {
@@ -41,19 +55,31 @@ pub fn internal_error_detail(status: u16) -> (&'static str, Option<&'static str>
 }
 
 /// Generate HTML for internal error mode.
-/// When `verbose` is true, includes descriptive detail, hints, and the request path.
-pub fn internal_error_html(status: u16, reason: &str, verbose: bool, path: &str) -> Vec<u8> {
+/// When `verbose` is true, includes descriptive detail, hints, request path, and diagnostic context.
+pub fn internal_error_html(status: u16, reason: &str, verbose: bool, path: &str, ctx: Option<&ErrorContext>) -> Vec<u8> {
     if verbose {
         let (detail, hint) = internal_error_detail(status);
         let hint_html = hint.map(|h| format!("<p><em>{h}</em></p>")).unwrap_or_default();
-        let path_html = if !path.is_empty() {
-            format!("<p><small>Path: <code>{path}</code></small></p>")
-        } else {
-            String::new()
+
+        let debug_html = {
+            let route   = ctx.and_then(|c| c.route.as_deref()).unwrap_or("—");
+            let backend = ctx.and_then(|c| c.backend.as_deref()).unwrap_or("—");
+            let err_det = ctx.and_then(|c| c.detail.as_deref()).unwrap_or("—");
+            format!(
+                "<hr><table style='font:13px monospace;border-collapse:collapse'>\
+                <tr><td style='padding:2px 12px 2px 0;color:#888'>path</td><td><code>{}</code></td></tr>\
+                <tr><td style='padding:2px 12px 2px 0;color:#888'>route</td><td><code>{}</code></td></tr>\
+                <tr><td style='padding:2px 12px 2px 0;color:#888'>backend</td><td><code>{}</code></td></tr>\
+                <tr><td style='padding:2px 12px 2px 0;color:#888'>cache</td><td><code>miss</code></td></tr>\
+                <tr><td style='padding:2px 12px 2px 0;color:#888'>detail</td><td><code>{}</code></td></tr>\
+                </table>",
+                html_escape(path), html_escape(route), html_escape(backend), html_escape(err_det)
+            )
         };
+
         format!(
             "<!DOCTYPE html><html><head><title>{status} {reason}</title></head>\
-            <body><h1>{status} {reason}</h1><p>{detail}</p>{hint_html}{path_html}</body></html>"
+            <body><h1>{status} {reason}</h1><p>{detail}</p>{hint_html}{debug_html}</body></html>"
         )
         .into_bytes()
     } else {
@@ -77,7 +103,7 @@ pub fn make_error_response(
         }
         ErrorMode::Internal => {
             let reason = status_reason(status);
-            let body = internal_error_html(status, reason, false, _from_path);
+            let body = internal_error_html(status, reason, false, _from_path, None);
             (
                 status,
                 vec![("Content-Type".to_string(), "text/html; charset=utf-8".to_string())],
@@ -177,7 +203,7 @@ mod tests {
 
     #[test]
     fn test_internal_error_html_contains_status_and_reason() {
-        let html = internal_error_html(503, "Service Unavailable", false, "/test");
+        let html = internal_error_html(503, "Service Unavailable", false, "/test", None);
         let s = std::str::from_utf8(&html).unwrap();
         assert!(s.contains("503"));
         assert!(s.contains("Service Unavailable"));

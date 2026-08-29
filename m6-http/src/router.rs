@@ -81,6 +81,13 @@ pub struct RouteTable {
     router: MatchitRouter<RouteEntry>,
     /// Ordered entries for specificity-based selection.
     entries: Vec<RouteEntry>,
+    /// Whether *any* route declares `require`.
+    ///
+    /// `requires_auth` runs before every cache lookup, on every protocol. When
+    /// a site has no protected routes at all — the common case — this lets it
+    /// answer without a route lookup, keeping the cache-hit path free of the
+    /// extra `matchit` traversal.
+    has_protected_routes: bool,
 }
 
 impl RouteTable {
@@ -150,12 +157,45 @@ impl RouteTable {
             }
         }
 
-        Ok(RouteTable { router, entries })
+        let has_protected_routes = entries.iter().any(|e| e.require.is_some());
+        Ok(RouteTable { router, entries, has_protected_routes })
     }
 
     /// Match a request path. Returns the matched RouteEntry if found.
     pub fn at<'a>(&'a self, path: &str) -> Option<&'a RouteEntry> {
         self.router.at(path).ok().map(|m| m.value)
+    }
+
+    /// Whether `path` maps to a route that requires authentication.
+    ///
+    /// Responses on such routes must never enter the shared cache: the cache
+    /// key is `(path, query, encoding)` with no identity component, so a
+    /// cached entry populated by an authorised user would otherwise be
+    /// replayed verbatim to anonymous callers — the cache lookup runs before
+    /// the auth check on every protocol.
+    ///
+    /// An unmatched path returns `false`; it will 404 before reaching a
+    /// backend, so there is nothing to protect.
+    pub fn requires_auth(&self, path: &str) -> bool {
+        self.has_protected_routes && self.at(path).is_some_and(|e| e.require.is_some())
+    }
+
+    /// Build a table directly from `(path, require)` pairs, for benchmarks.
+    #[doc(hidden)]
+    pub fn for_bench(routes: &[(&str, Option<&str>)]) -> Self {
+        let mut router = MatchitRouter::new();
+        let mut entries = Vec::new();
+        for (path, require) in routes {
+            let entry = RouteEntry {
+                path: path.to_string(),
+                backend: "bench".to_string(),
+                require: require.map(str::to_string),
+            };
+            router.insert(path.to_string(), entry.clone()).expect("bench route insert");
+            entries.push(entry);
+        }
+        let has_protected_routes = entries.iter().any(|e| e.require.is_some());
+        RouteTable { router, entries, has_protected_routes }
     }
 
     /// Number of routes.

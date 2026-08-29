@@ -1,5 +1,7 @@
 /// m6-http library: shared modules for testing and integration.
+pub mod analytics;
 pub mod auth;
+pub mod rate_limit;
 pub mod cache;
 pub mod config;
 pub mod error;

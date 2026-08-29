@@ -485,7 +485,17 @@ pub struct PendingUrlContext {
     pub client_ip:    String,
     pub enc:          String,
     pub backend_name: String,
-    pub bypass_cache: bool,
+    /// Whether the response may enter the shared cache. False for
+    /// `require`-protected routes (the cache key carries no identity, so a
+    /// stored entry would later be served to anonymous callers) and for
+    /// internal error-page fetches.
+    pub cacheable: bool,
+    pub start:        std::time::Instant,   // request arrival time for miss timing
+    /// Set when this dispatch is itself a `[errors] mode = "custom"` fetch of
+    /// the error page (rather than a normal routed request) — carries the
+    /// ORIGINAL failing status so the fetched body can be returned under it.
+    /// `None` for every ordinary request dispatch.
+    pub error_status_override: Option<u16>,
 }
 
 /// Dispatch a URL-backend request to a dedicated I/O thread.

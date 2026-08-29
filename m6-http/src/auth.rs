@@ -3,6 +3,25 @@ use base64::Engine;
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
 
+/// Reconstruct the logical `Cookie` header from a request's header list.
+///
+/// HTTP/2 (and HTTP/3) clients are RFC-compliant to send multiple separate
+/// `cookie` header *fields* instead of one combined `a=1; b=2` field (RFC
+/// 7540 §8.1.2.5 — it's specifically recommended for better HPACK/QPACK
+/// compression, since each crumb can then be referenced independently from
+/// the dynamic table). A `.find()` for "the cookie header" only ever sees
+/// the first such field and silently drops every cookie after it — the
+/// exact bug this was: `curl` always sends one pre-joined field so it never
+/// tripped this, but a browser splitting cookies across fields could make
+/// an auth cookie in a later field invisible to a naive single-field
+/// lookup. The spec requires the receiver to join multiple fields with
+/// `"; "` before treating it as a single logical header — that's this.
+pub fn combined_cookie_header(headers: &(impl crate::analytics::HeaderSource + ?Sized)) -> Option<String> {
+    let mut parts = headers.find_all("cookie").peekable();
+    parts.peek()?;
+    Some(parts.collect::<Vec<_>>().join("; "))
+}
+
 /// JWT claims we care about.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
@@ -148,6 +167,46 @@ mod tests {
     fn test_extract_token_from_bearer() {
         let token = extract_token(Some("Bearer mytoken123"), None);
         assert_eq!(token, Some("mytoken123"));
+    }
+
+    #[test]
+    fn test_combined_cookie_header_single_field() {
+        let headers = vec![("cookie".to_string(), "a=1; b=2".to_string())];
+        assert_eq!(combined_cookie_header(&headers), Some("a=1; b=2".to_string()));
+    }
+
+    #[test]
+    fn test_combined_cookie_header_split_across_fields() {
+        // What HTTP/2 clients are RFC-compliant to send: one cookie per
+        // field instead of one joined field. This is the exact shape that
+        // broke session-cookie auth — a naive single-field `.find()` only
+        // ever saw whichever crumb happened to be in the first field.
+        let headers = vec![
+            ("cookie".to_string(), "_m6sid=abc".to_string()),
+            ("cookie".to_string(), "session=xyz".to_string()),
+            ("cookie".to_string(), "refresh=def".to_string()),
+        ];
+        assert_eq!(
+            combined_cookie_header(&headers),
+            Some("_m6sid=abc; session=xyz; refresh=def".to_string())
+        );
+    }
+
+    #[test]
+    fn test_combined_cookie_header_absent() {
+        let headers = vec![("user-agent".to_string(), "test".to_string())];
+        assert_eq!(combined_cookie_header(&headers), None);
+    }
+
+    #[test]
+    fn test_extract_token_finds_session_when_cookies_split_across_fields() {
+        let headers = vec![
+            ("cookie".to_string(), "_m6sid=abc".to_string()),
+            ("cookie".to_string(), "session=realtoken".to_string()),
+        ];
+        let combined = combined_cookie_header(&headers);
+        let token = extract_token(None, combined.as_deref());
+        assert_eq!(token, Some("realtoken"));
     }
 
     #[test]
