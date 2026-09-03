@@ -296,6 +296,8 @@ struct AnalyticsLine {
     cache_state: String,
     session_id: String,
     session_new: bool,
+    // Parsed for completeness / debug output; no test currently asserts on it.
+    #[allow(dead_code)]
     client_ip: String,
     path: String,
 }

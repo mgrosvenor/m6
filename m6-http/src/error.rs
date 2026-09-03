@@ -152,7 +152,7 @@ mod tests {
     fn test_internal_mode_returns_html() {
         let errors = ErrorsConfig { mode: "internal".to_string(), path: None, verbose_fallback: false };
         let mode = ErrorMode::from_config(&errors);
-        let (status, headers, body) = make_error_response(404, &mode, "/missing");
+        let (status, _headers, body) = make_error_response(404, &mode, "/missing");
         assert_eq!(status, 404);
         let body_str = std::str::from_utf8(&body).unwrap();
         assert!(body_str.contains("404"));
@@ -181,7 +181,7 @@ mod tests {
         let errors = ErrorsConfig { mode: "custom".to_string(), path: None, verbose_fallback: false };
         let mode = ErrorMode::from_config(&errors);
         // Should behave like Internal
-        let (status, headers, body) = make_error_response(404, &mode, "/missing");
+        let (status, _headers, body) = make_error_response(404, &mode, "/missing");
         assert_eq!(status, 404);
         // Internal mode returns empty vec from make_error_response when custom path is set
         // (the actual fetch is done by apply_error_mode in main.rs); here path=None means Internal fallback

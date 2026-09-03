@@ -64,7 +64,7 @@ struct TestEnv {
     site_dir:    PathBuf,
     config_path: PathBuf,
     socket_path: PathBuf,
-    key_dir:     tempfile::TempDir,
+    _key_dir:    tempfile::TempDir,
 }
 
 fn setup_test_env(id: &str) -> TestEnv {
@@ -112,7 +112,7 @@ public_key  = "{}"
     std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
     let _ = std::fs::remove_file(&socket_path);
 
-    TestEnv { _temp: temp, site_dir, config_path, socket_path, key_dir }
+    TestEnv { _temp: temp, site_dir, config_path, socket_path, _key_dir: key_dir }
 }
 
 fn spawn_server(env: &TestEnv) -> ProcessGuard {
