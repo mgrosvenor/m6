@@ -1818,9 +1818,14 @@ fn handle_connection(
                 }
             }
 
-            // Add Cache-Control header.
-            let cache = if route.cache == "no-store" { "no-store" } else { "public" };
-            resp = resp.header("Cache-Control", cache);
+            // Add Cache-Control header. route.cache is a free-form string
+            // (config.rs parses it as-is, defaulting to "public") — this
+            // used to collapse anything that wasn't literally "no-store"
+            // down to a bare "public", silently discarding any max-age or
+            // other directive a site actually configured (e.g.
+            // "public, max-age=60, must-revalidate"). Pass it through as
+            // configured instead.
+            resp = resp.header("Cache-Control", &route.cache);
 
             // Add any extra per-route headers (e.g. COOP/COEP for cross-origin isolation).
             for (k, v) in &route.headers {
