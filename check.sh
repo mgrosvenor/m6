@@ -59,8 +59,13 @@ cargo build --workspace --release --quiet
 pass "Build"
 
 # ── 2. Correctness: unit + integration tests ──────────────────────────────────
+# --test-threads=1: several integration suites (m6-http's edge_proxy.rs,
+# security_e2e.rs, analytics_e2e.rs) spawn real m6-http/m6-html/m6-file
+# processes bound to fixed loopback ports. Run concurrently with each other,
+# their #[test] fns race for those ports and fail with spurious 502s that
+# have nothing to do with the code under test.
 info "Running correctness tests..."
-if cargo test --workspace --quiet 2>&1; then
+if cargo test --workspace --quiet -- --test-threads=1 2>&1; then
   pass "Unit + integration tests (HTTP/1.1 ✓  HTTP/3 ✓)"
 else
   fail "Test suite failed — fix correctness issues before performance check"
