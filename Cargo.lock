@@ -1829,6 +1829,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "criterion",
+ "httpdate",
  "m6-core",
  "mime_guess",
  "nix 0.27.1",
