@@ -465,7 +465,6 @@ mod tests {
     #[test]
     fn test_invalidation_map_renderer_config_static_params() {
         use tempfile::TempDir;
-        use std::io::Write;
 
         let dir = TempDir::new().unwrap();
         let site_dir = dir.path();

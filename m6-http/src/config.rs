@@ -571,7 +571,6 @@ pub fn warn_system_config_extra_keys(system_config_path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
     use tempfile::TempDir;
 
     fn make_test_dir() -> TempDir {
