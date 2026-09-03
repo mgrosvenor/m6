@@ -87,6 +87,59 @@ pub fn handle_request<W: Write>(
         return handle_tail(req, route, &params, ctx, stream, start);
     }
 
+    // Every static asset used to go out as bare `Cache-Control: public` with
+    // no ETag/Last-Modified at all — with no freshness info and no way to
+    // revalidate, a browser that had already cached a file had no reason to
+    // ever ask again, and a plain reload (not a hard refresh) couldn't
+    // discover a newer deploy either. mtime+size is cheap to read and stable
+    // across the minify/compress steps below (those transform the same
+    // source bytes deterministically), so it's computed once, up front,
+    // before doing any of that work — a conditional-GET hit skips reading,
+    // minifying, and compressing the file entirely, not just the transfer.
+    let metadata = match std::fs::metadata(&fs_path) {
+        Ok(m) => m,
+        Err(_) => {
+            debug!(path = %fs_path.display(), "file not found");
+            write_error(stream, 404, "Not Found")?;
+            return Ok(ResponseInfo { status: 404, bytes: 0, latency_us: start.elapsed().as_micros() });
+        }
+    };
+    let mtime = metadata.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    let mtime_secs = mtime.duration_since(std::time::SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs();
+    let etag = format!("\"{:x}-{:x}\"", mtime_secs, metadata.len());
+    let last_modified = httpdate::fmt_http_date(mtime);
+
+    let if_none_match = req.headers.iter().find(|(k, _)| k == "if-none-match").map(|(_, v)| v.as_str());
+    let not_modified = if let Some(inm) = if_none_match {
+        // A real client sends exactly one ETag here, but the If-None-Match
+        // grammar allows a comma-separated list (and "*"), so honor that.
+        inm == "*" || inm.split(',').any(|tag| tag.trim() == etag)
+    } else if let Some(ims) = req.headers.iter().find(|(k, _)| k == "if-modified-since").map(|(_, v)| v.as_str()) {
+        // HTTP-date has 1-second resolution; compare at that resolution too
+        // so a file that hasn't changed since the client's cached copy
+        // doesn't spuriously look "modified" from sub-second mtime noise.
+        httpdate::parse_http_date(ims)
+            .map(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs() >= mtime_secs)
+            .unwrap_or(false)
+    } else {
+        false
+    };
+
+    // Short max-age (fast repeat loads within it) plus must-revalidate (a
+    // stale cache entry always checks back rather than being reused past
+    // that window) — the conditional-GET machinery above is what makes
+    // "checks back" cheap: a 304 on an unchanged file, not a full refetch.
+    let cache_control = "public, max-age=60, must-revalidate";
+    if not_modified {
+        let hdrs: Vec<(&str, &str)> = vec![
+            ("Cache-Control", cache_control),
+            ("ETag", &etag),
+            ("Last-Modified", &last_modified),
+        ];
+        write_response(stream, 304, "Not Modified", &hdrs, &[])?;
+        return Ok(ResponseInfo { status: 304, bytes: 0, latency_us: start.elapsed().as_micros() });
+    }
+
     let data = match std::fs::read(&fs_path) {
         Ok(d) => d,
         Err(_) => {
@@ -133,7 +186,9 @@ pub fn handle_request<W: Write>(
 
     let mut hdrs: Vec<(&str, &str)> = vec![
         ("Content-Type", mime.as_str()),
-        ("Cache-Control", "public"),
+        ("Cache-Control", cache_control),
+        ("ETag", &etag),
+        ("Last-Modified", &last_modified),
     ];
     if let Some(enc) = content_encoding {
         hdrs.push(("Content-Encoding", enc));
