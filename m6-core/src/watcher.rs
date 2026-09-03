@@ -89,7 +89,7 @@ impl ConfigWatcher {
                     if name_end <= n {
                         let name = std::ffi::CStr::from_bytes_until_nul(&buf[name_start..name_end])
                             .ok()
-                            .and_then(|s| s.to_str())
+                            .and_then(|s| s.to_str().ok())
                             .unwrap_or("");
                         if filenames.iter().any(|f| *f == name) {
                             matched = true;
