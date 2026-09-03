@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use tempfile::TempDir;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -34,28 +34,51 @@ impl TestEnv {
     }
 
     /// Generate a fresh EC P-256 key pair in <tmpdir>/keys/. Required for token commands.
+    ///
+    /// Goes via a SEC1 intermediate rather than `openssl genpkey -algorithm EC`
+    /// directly into PKCS8: on this toolchain's LibreSSL, `genpkey`'s PKCS8
+    /// output omits the embedded public-key field (RFC 5958 optional [1] tag),
+    /// which loads fine but fails at actual ECDSA signing with `ring`
+    /// ("error: encoding JWT"). Generating SEC1 first always embeds the public
+    /// key, and converting that to PKCS8 preserves it. Same recipe as
+    /// dev.sh/setup-origin.sh use for the real auth signing keys.
     fn setup_keys(&self) {
         let key_dir = self.dir.path().join("keys");
         std::fs::create_dir_all(&key_dir).expect("mkdir keys");
+        let sec1 = key_dir.join("auth-sec1.pem");
         let pem = key_dir.join("auth.pem");
         let pub_ = key_dir.join("auth.pub");
 
         let st = Command::new("openssl")
-            .args(["genpkey", "-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256",
-                   "-out"])
-            .arg(&pem)
+            .args(["ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out"])
+            .arg(&sec1)
+            .stderr(Stdio::null())
             .status()
             .expect("openssl not found — install openssl to run token tests");
-        assert!(st.success(), "openssl genpkey failed");
+        assert!(st.success(), "openssl ecparam failed");
 
         let st = Command::new("openssl")
-            .args(["pkey", "-pubout", "-in"])
+            .args(["pkcs8", "-topk8", "-nocrypt", "-in"])
+            .arg(&sec1)
+            .arg("-out")
             .arg(&pem)
+            .stderr(Stdio::null())
+            .status()
+            .expect("openssl pkcs8 failed");
+        assert!(st.success(), "openssl pkcs8 (topk8) failed");
+
+        let st = Command::new("openssl")
+            .args(["ec", "-in"])
+            .arg(&sec1)
+            .arg("-pubout")
             .arg("-out")
             .arg(&pub_)
+            .stderr(Stdio::null())
             .status()
-            .expect("openssl pkey failed");
-        assert!(st.success(), "openssl pkey (pubout) failed");
+            .expect("openssl ec failed");
+        assert!(st.success(), "openssl ec (pubout) failed");
+
+        let _ = std::fs::remove_file(&sec1);
     }
 
     fn config(&self) -> String {
