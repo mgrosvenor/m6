@@ -58,8 +58,9 @@ struct QuicConn {
     h3_conn: Option<quiche::h3::Connection>,
     /// Pending streams: stream_id -> accumulated request state
     pending: HashMap<u64, PendingRequest>,
-    /// Partial responses awaiting flow-control credit: stream_id -> (body, offset_written)
-    partial_responses: HashMap<u64, (Bytes, usize)>,
+    /// Responses awaiting flow-control credit, retried by drain_writable() the
+    /// next time each stream reports writable.
+    partial_responses: HashMap<u64, PendingH3Response>,
     /// Pending URL-backend requests for H3 streams. Keyed by H3 stream_id.
     pending_url: HashMap<u64, (std::sync::mpsc::Receiver<std::io::Result<forward::HttpResponse>>, forward::PendingUrlContext)>,
     client_addr: SocketAddr,
@@ -71,6 +72,17 @@ struct PendingRequest {
     headers: Vec<quiche::h3::Header>,
     body: Vec<u8>,
     headers_done: bool,
+}
+
+/// A response that couldn't be fully written because the stream (or
+/// connection) ran out of flow-control credit, saved so drain_writable() can
+/// finish it once quiche reports the stream writable again.
+enum PendingH3Response {
+    /// The HEADERS frame itself was blocked — nothing has reached the client
+    /// yet, so both header and body still need sending.
+    Headers(Vec<quiche::h3::Header>, Bytes),
+    /// HEADERS already sent; body is blocked at the given offset.
+    Body(Bytes, usize),
 }
 
 // ── Server state ──────────────────────────────────────────────────────────────
@@ -993,19 +1005,34 @@ fn send_h3_response(
     }
 
     let fin = body.is_empty();
-    if let Err(e) = h3.send_response(&mut qconn.conn, stream_id, &h3_headers, fin) {
-        warn!("h3 send_response error: {}", e);
-        return;
+    match h3.send_response(&mut qconn.conn, stream_id, &h3_headers, fin) {
+        Ok(()) => {}
+        Err(quiche::h3::Error::StreamBlocked) => {
+            // Not an error, just no flow-control credit yet — previously this
+            // fell into the generic error arm below and `return`ed, silently
+            // dropping the response: the client's stream stayed open with no
+            // reply ever sent, which reads as "page never finishes loading".
+            // Firefox opens enough concurrent H3 streams per page load to hit
+            // this routinely; Chrome's more conservative concurrency mostly
+            // didn't. Save it and let drain_writable() retry once this stream
+            // reports writable again.
+            qconn.partial_responses.insert(stream_id, PendingH3Response::Headers(h3_headers, body));
+            return;
+        }
+        Err(e) => {
+            warn!("h3 send_response error: {}", e);
+            return;
+        }
     }
     if !body.is_empty() {
         match h3.send_body(&mut qconn.conn, stream_id, &body, true) {
             Ok(written) if written == body.len() => {}
             Ok(written) => {
                 // Partial write — store remainder, retry on conn.writable()
-                qconn.partial_responses.insert(stream_id, (body, written));
+                qconn.partial_responses.insert(stream_id, PendingH3Response::Body(body, written));
             }
             Err(quiche::h3::Error::Done) | Err(quiche::h3::Error::StreamBlocked) => {
-                qconn.partial_responses.insert(stream_id, (body, 0));
+                qconn.partial_responses.insert(stream_id, PendingH3Response::Body(body, 0));
             }
             Err(e) => warn!("h3 send_body error: {}", e),
         }
@@ -1687,29 +1714,61 @@ fn flush_conn(udp: &UdpSocket, qconn: &mut QuicConn) {
     }
 }
 
-/// Retry any partially-written response bodies on streams that have new flow-control credit.
+/// Retry any responses (headers and/or body) blocked on flow-control credit,
+/// for streams that now have some.
 fn drain_writable(qconn: &mut QuicConn) {
     if qconn.partial_responses.is_empty() { return; }
     let h3 = match qconn.h3_conn.as_mut() { Some(h) => h, None => return };
     let writable: Vec<u64> = qconn.conn.writable().collect();
     for stream_id in writable {
-        let (body, offset) = match qconn.partial_responses.get(&stream_id) {
-            Some(r) => r,
+        // Take ownership out of the map up front: both arms below need to
+        // call back into `qconn.conn`/`qconn.partial_responses`, so holding a
+        // borrow from the map across that call would conflict with it.
+        let pending = match qconn.partial_responses.remove(&stream_id) {
+            Some(p) => p,
             None => continue,
         };
-        let remaining = &body[*offset..];
-        match h3.send_body(&mut qconn.conn, stream_id, remaining, true) {
-            Ok(written) => {
-                let (body, offset) = qconn.partial_responses.get_mut(&stream_id).unwrap();
-                *offset += written;
-                if *offset >= body.len() {
-                    qconn.partial_responses.remove(&stream_id);
+        match pending {
+            PendingH3Response::Headers(headers, body) => {
+                let fin = body.is_empty();
+                match h3.send_response(&mut qconn.conn, stream_id, &headers, fin) {
+                    Ok(()) => {
+                        if !body.is_empty() {
+                            match h3.send_body(&mut qconn.conn, stream_id, &body, true) {
+                                Ok(written) if written == body.len() => {}
+                                Ok(written) => {
+                                    qconn.partial_responses.insert(stream_id, PendingH3Response::Body(body, written));
+                                }
+                                Err(quiche::h3::Error::Done) | Err(quiche::h3::Error::StreamBlocked) => {
+                                    qconn.partial_responses.insert(stream_id, PendingH3Response::Body(body, 0));
+                                }
+                                Err(e) => warn!("h3 drain_writable send_body error: {}", e),
+                            }
+                        }
+                    }
+                    Err(quiche::h3::Error::StreamBlocked) => {
+                        // Still no credit — put it back for the next writable report.
+                        qconn.partial_responses.insert(stream_id, PendingH3Response::Headers(headers, body));
+                    }
+                    Err(e) => warn!("h3 drain_writable send_response error: {}", e),
                 }
             }
-            Err(quiche::h3::Error::Done) | Err(quiche::h3::Error::StreamBlocked) => {}
-            Err(e) => {
-                warn!("h3 drain_writable send_body error: {}", e);
-                qconn.partial_responses.remove(&stream_id);
+            PendingH3Response::Body(body, offset) => {
+                let remaining = &body[offset..];
+                match h3.send_body(&mut qconn.conn, stream_id, remaining, true) {
+                    Ok(written) => {
+                        let new_offset = offset + written;
+                        if new_offset < body.len() {
+                            qconn.partial_responses.insert(stream_id, PendingH3Response::Body(body, new_offset));
+                        }
+                    }
+                    Err(quiche::h3::Error::Done) | Err(quiche::h3::Error::StreamBlocked) => {
+                        qconn.partial_responses.insert(stream_id, PendingH3Response::Body(body, offset));
+                    }
+                    Err(e) => {
+                        warn!("h3 drain_writable send_body error: {}", e);
+                    }
+                }
             }
         }
     }
