@@ -509,32 +509,9 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         }
     }
 
-    // `cache = "..."` is a real, honoured directive in m6-render's route
-    // tables, which makes it very natural to write here too — but m6-http
-    // takes its caching decision from the *response's* Cache-Control, never
-    // from the route table, so the line does exactly nothing. Silently
-    // dropping it is the trap: the config reads as though no-store is being
-    // enforced at the edge when nothing is enforcing it. Warn by name rather
-    // than bailing, so an existing node config can never be turned into a
-    // boot failure by a line that has always been inert.
-    for route in &routes {
-        if let Some(cache) = &route.cache {
-            tracing::warn!(
-                route = %route.path, value = %cache,
-                "config: `cache` on a route is ignored by m6-http (set Cache-Control on the backend response instead)"
-            );
-        }
-    }
-
     // Validate route_groups
     let route_groups = site_parsed.route_groups;
     for rg in &route_groups {
-        if let Some(cache) = &rg.cache {
-            tracing::warn!(
-                route_group = %rg.path, value = %cache,
-                "config: `cache` on a route_group is ignored by m6-http (set Cache-Control on the backend response instead)"
-            );
-        }
         if !backend_names.contains(rg.backend.as_str()) {
             anyhow::bail!(
                 "config error: route_group {} references unknown backend `{}`",
@@ -608,6 +585,41 @@ pub fn resolve_path(base: &Path, p: &str) -> PathBuf {
         pb.to_path_buf()
     } else {
         base.join(pb)
+    }
+}
+
+/// Warn about `cache = "..."` on routes, which m6-http ignores.
+///
+/// It is a real, honoured directive in m6-render's route tables, which makes
+/// it very natural to write here too — but m6-http takes its caching decision
+/// from the *response's* `Cache-Control`, never from the route table, so the
+/// line does exactly nothing. Silently dropping it is the trap: the config
+/// reads as though `no-store` is enforced at the edge when nothing enforces
+/// it.
+///
+/// Warns rather than bailing, so a config carrying a line that has always
+/// been inert can never be turned into a boot failure by this check.
+///
+/// Called from `main` *after* logging is initialised, not from `load()`:
+/// `load()` runs first (it supplies the log level), so a `warn!` inside it
+/// goes to a subscriber that does not exist yet and is silently dropped —
+/// which is exactly the failure mode this function exists to complain about.
+pub fn warn_ignored_route_cache_keys(config: &Config) {
+    for route in &config.routes {
+        if let Some(cache) = &route.cache {
+            warn!(
+                route = %route.path, value = %cache,
+                "site config: `cache` on a [[route]] is ignored by m6-http — set Cache-Control on the backend response instead"
+            );
+        }
+    }
+    for rg in &config.route_groups {
+        if let Some(cache) = &rg.cache {
+            warn!(
+                route_group = %rg.path, value = %cache,
+                "site config: `cache` on a [[route_group]] is ignored by m6-http — set Cache-Control on the backend response instead"
+            );
+        }
     }
 }
 
