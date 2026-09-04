@@ -224,7 +224,7 @@ pub enum CspMode {
 }
 
 fn default_hsts() -> String {
-    "max-age=31536000".to_string()
+    "max-age=31536000; includeSubDomains; preload".to_string()
 }
 
 fn default_nosniff() -> String {
