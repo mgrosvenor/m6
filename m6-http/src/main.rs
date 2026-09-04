@@ -1929,6 +1929,9 @@ fn handle_site_reload(state: &mut ServerState, log_handle: &m6_core::log::LogHan
 
     match config::load(&state.config.site_dir, &state.system_config_path) {
         Ok(new_config) => {
+            // A reload is the likeliest moment for an inert `cache` key to be
+            // introduced — someone editing site.toml on the node.
+            config::warn_ignored_route_cache_keys(&new_config);
             let new_route_table = match RouteTable::from_config(&new_config) {
                 Ok(t) => t,
                 Err(e) => {
@@ -2097,6 +2100,7 @@ fn run(args: Vec<String>) -> i32 {
     };
 
     config::warn_system_config_extra_keys(&cli.system_config);
+    config::warn_ignored_route_cache_keys(&config);
 
     // --dump-config
     if cli.dump_config {
