@@ -166,6 +166,28 @@ impl RouteTable {
         self.router.at(path).ok().map(|m| m.value)
     }
 
+    /// If `path` itself doesn't match but toggling its trailing slash would,
+    /// return the canonical (matching) path so the caller can 301 to it.
+    ///
+    /// Older `matchit` versions surfaced this as a hint on the `Err` variant
+    /// of `at()`; 0.8 dropped that (`MatchError` is now just a bare
+    /// `NotFound`), so this re-derives the same behavior by probing the
+    /// toggled path directly. `/` has no slash to toggle either way.
+    pub fn trailing_slash_redirect(&self, path: &str) -> Option<String> {
+        if path == "/" {
+            return None;
+        }
+        let toggled = match path.strip_suffix('/') {
+            Some(stripped) => stripped.to_string(),
+            None => format!("{path}/"),
+        };
+        if self.router.at(&toggled).is_ok() {
+            Some(toggled)
+        } else {
+            None
+        }
+    }
+
     /// Whether `path` maps to a route that requires authentication.
     ///
     /// Responses on such routes must never enter the shared cache: the cache

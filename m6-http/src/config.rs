@@ -198,6 +198,20 @@ pub struct SecurityConfig {
     /// enforcing, and `off` to omit CSP entirely.
     #[serde(default)]
     pub csp_mode: CspMode,
+    /// `Permissions-Policy` — disables browser features/APIs the site never
+    /// uses (camera, microphone, geolocation, etc.) so an XSS or a compromised
+    /// third-party script can't invoke them.
+    #[serde(default = "default_permissions_policy")]
+    pub permissions_policy: String,
+    /// `Cross-Origin-Opener-Policy` — isolates this site's browsing context
+    /// from cross-origin popups/openers, mitigating cross-window attacks
+    /// (e.g. Spectre-style side channels, `window.opener` reverse tabnabbing).
+    #[serde(default = "default_coop")]
+    pub cross_origin_opener_policy: String,
+    /// `Cross-Origin-Resource-Policy` — stops other origins from embedding
+    /// this site's responses (images, scripts, etc.) in their own pages.
+    #[serde(default = "default_corp")]
+    pub cross_origin_resource_policy: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -227,8 +241,23 @@ fn default_referrer_policy() -> String {
 
 fn default_csp() -> String {
     "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; \
-     script-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'"
+     script-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; \
+     form-action 'self'"
         .to_string()
+}
+
+fn default_permissions_policy() -> String {
+    "camera=(), microphone=(), geolocation=(), payment=(), usb=(), \
+     interest-cohort=()"
+        .to_string()
+}
+
+fn default_coop() -> String {
+    "same-origin".to_string()
+}
+
+fn default_corp() -> String {
+    "same-origin".to_string()
 }
 
 impl Default for SecurityConfig {
@@ -240,6 +269,9 @@ impl Default for SecurityConfig {
             referrer_policy: default_referrer_policy(),
             content_security_policy: default_csp(),
             csp_mode: CspMode::default(),
+            permissions_policy: default_permissions_policy(),
+            cross_origin_opener_policy: default_coop(),
+            cross_origin_resource_policy: default_corp(),
         }
     }
 }
@@ -263,6 +295,9 @@ impl SecurityConfig {
             ("x-content-type-options", self.x_content_type_options.as_str()),
             ("x-frame-options", self.x_frame_options.as_str()),
             ("referrer-policy", self.referrer_policy.as_str()),
+            ("permissions-policy", self.permissions_policy.as_str()),
+            ("cross-origin-opener-policy", self.cross_origin_opener_policy.as_str()),
+            ("cross-origin-resource-policy", self.cross_origin_resource_policy.as_str()),
             (csp_header_name, self.content_security_policy.as_str()),
         ]
         .into_iter()

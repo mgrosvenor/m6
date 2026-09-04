@@ -1864,6 +1864,7 @@ dependencies = [
  "hpack",
  "http",
  "httparse",
+ "httpdate",
  "inotify 0.10.2",
  "jsonwebtoken",
  "libc",

@@ -196,8 +196,23 @@ pub fn record(
     session_new.then(|| session_cookie_header_value(&session_id))
 }
 
+/// True if the response's `Content-Type` is HTML. The session cookie has no
+/// reason to exist on a CSS/JS/image response — a visitor's session identity
+/// is only ever read back on a page render, never on an asset fetch — so
+/// gating on this keeps `_m6sid` off the vast majority of responses a page
+/// load generates (every static asset it references) instead of writing a
+/// fresh `Set-Cookie` on each one.
+pub fn is_html_response(resp_headers: &[(String, String)]) -> bool {
+    resp_headers.iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+        .is_some_and(|(_, v)| v.to_ascii_lowercase().starts_with("text/html"))
+}
+
 /// Convenience veneer over [`record`] for call sites that already own a
 /// mutable outgoing-headers `Vec` and just want the cookie appended, if any.
+/// The session is still minted/logged for every request regardless of
+/// content type (so analytics stay accurate) — only the `Set-Cookie` write
+/// itself is scoped to HTML responses, per [`is_html_response`].
 #[allow(clippy::too_many_arguments)]
 pub fn finish_response(
     enabled: bool,
@@ -210,8 +225,11 @@ pub fn finish_response(
     client_ip: &str,
     latency_ns: Option<u64>,
 ) {
+    let html = is_html_response(resp_headers);
     if let Some(sc) = record(enabled, request_headers, node, path, status, cache_state, client_ip, latency_ns) {
-        resp_headers.push(("Set-Cookie".to_string(), sc));
+        if html {
+            resp_headers.push(("Set-Cookie".to_string(), sc));
+        }
     }
 }
 
@@ -508,11 +526,19 @@ mod tests {
 
     #[test]
     fn finish_response_appends_set_cookie_only_when_minted() {
-        let mut resp_headers = vec![("Content-Type".to_string(), "text/plain".to_string())];
+        let mut resp_headers = vec![("Content-Type".to_string(), "text/html; charset=utf-8".to_string())];
         let req_headers = Vec::<(String, String)>::new();
         finish_response(true, &mut resp_headers, &req_headers, "node", "/p", 200, "HIT", "1.2.3.4", None);
         assert_eq!(resp_headers.len(), 2, "expected exactly one Set-Cookie appended: {resp_headers:?}");
         assert_eq!(resp_headers[1].0, "Set-Cookie");
+    }
+
+    #[test]
+    fn finish_response_skips_set_cookie_for_non_html() {
+        let mut resp_headers = vec![("Content-Type".to_string(), "text/plain".to_string())];
+        let req_headers = Vec::<(String, String)>::new();
+        finish_response(true, &mut resp_headers, &req_headers, "node", "/p", 200, "HIT", "1.2.3.4", None);
+        assert_eq!(resp_headers.len(), 1, "non-HTML responses must not get a session cookie");
     }
 
     #[test]
