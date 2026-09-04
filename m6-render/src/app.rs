@@ -567,9 +567,17 @@ impl FrameworkState {
             }
         }
 
-        // 12. CSRF token: generate or reuse from cookie, inject into dict.
+        // 12. CSRF token: generate or reuse from cookie, inject into dict —
+        // but only as a default. Step 6 (POST form fields) may already have
+        // set dict["csrf_token"] to whatever the client actually submitted;
+        // verify_csrf() below compares that submitted value against the
+        // cookie, so overwriting it here unconditionally (the previous
+        // behavior) replaced the submitted token with the cookie's own
+        // value before the comparison ever ran — the two sides being
+        // compared were always identical, silently defeating the
+        // double-submit check for every request, pass or fail.
         #[cfg(feature = "csrf")]
-        {
+        if !dict.contains_key("csrf_token") {
             let token = if let Some(existing) = dict
                 .get("cookies")
                 .and_then(|c| c.get("_csrf"))
@@ -1758,6 +1766,14 @@ fn handle_connection(
         (route_match, site_dir, compression, minification)
     };
 
+    // Populated from `dict["csrf_token"]` inside the matched-route arm below
+    // (when the csrf feature is on) so the cookie set further down uses the
+    // exact same token the response body was rendered with — see the
+    // comment at that Set-Cookie site for why a second, independently
+    // generated token there was a real bug.
+    #[cfg(feature = "csrf")]
+    let mut csrf_token_for_cookie: Option<String> = None;
+
     let mut resp = match route_match {
         None => {
             warn!(path = raw.path(), "unmatched path");
@@ -1776,6 +1792,11 @@ fn handle_connection(
                     return;
                 }
             };
+
+            #[cfg(feature = "csrf")]
+            {
+                csrf_token_for_cookie = dict.get("csrf_token").and_then(|v| v.as_str()).map(str::to_string);
+            }
 
             let req = Request::new(raw.clone(), dict.clone(), site_dir.clone());
 
@@ -1839,18 +1860,24 @@ fn handle_connection(
     // ── CSRF: set _csrf cookie if not already present in the request.
     #[cfg(feature = "csrf")]
     {
-        // Check if the request already had a _csrf cookie (already in dict["cookies"]["_csrf"]).
-        // The dict was built in build_dict and the csrf_token is already there.
-        // We need to set the cookie in the response if absent.
-        // NOTE: we check the raw Cookie header for `_csrf=` to avoid depending on
-        // request dict here (we don't have it outside the route match arm).
         let has_csrf = raw.header("cookie")
             .map(|h| h.contains("_csrf="))
             .unwrap_or(false);
         if !has_csrf {
-            // Generate a fresh token and set it.
-            let token = generate_csrf_token();
-            let cookie = format!("_csrf={}; Path=/; SameSite=Strict", token);
+            // Reuse the exact token build_dict already put in dict["csrf_token"]
+            // (captured above as csrf_token_for_cookie) rather than generating
+            // a second, independent one here. Those used to be two unrelated
+            // random values: the page's hidden csrf_token field carried
+            // whatever build_dict generated, while the cookie actually sent
+            // to the browser carried a *different* token generated
+            // independently right here — so for any visitor without an
+            // existing _csrf cookie (i.e. every first-time visitor), the
+            // submitted field could never match the cookie and verify_csrf()
+            // would reject every legitimate submission. Falls back to a
+            // fresh token only for routes with no dict (e.g. an unmatched
+            // path's 404), where there's no rendered form to have carried one.
+            let token = csrf_token_for_cookie.unwrap_or_else(generate_csrf_token);
+            let cookie = format!("_csrf={}; Path=/; SameSite=Strict; Secure", token);
             resp.headers.push(("Set-Cookie".to_string(), cookie));
         }
     }
