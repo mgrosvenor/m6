@@ -21,7 +21,7 @@ use tracing::{debug, error, info, warn};
 use m6_http_lib::analytics;
 use m6_http_lib::auth;
 use m6_http_lib::rate_limit::RateLimiter;
-use m6_http_lib::cache::{Cache, CacheKey, CachedResponse, make_lookup_key, should_cache, strip_set_cookie};
+use m6_http_lib::cache::{Cache, CacheKey, CachedResponse, make_lookup_key, should_cache, strip_set_cookie, is_not_modified, not_modified_headers};
 use m6_http_lib::stats::Stats;
 use m6_http_lib::config::{self, Config};
 use m6_http_lib::error::{self as error, ErrorMode};
@@ -342,14 +342,33 @@ fn event_loop(
                     if cacheable { if let Some(cached) = state.cache.get(lookup_key) {
                         let elapsed_ns = start.elapsed().as_nanos() as u64;
                         state.stats.record(elapsed_ns, true, false);
+
+                        if is_not_modified(&cached.headers, &req.headers) {
+                            let mut headers = not_modified_headers(&cached.headers);
+                            debug!(
+                                path = %req.path,
+                                status = 304,
+                                version = "HTTP/1.1",
+                                backend = "cache",
+                                latency_ns = elapsed_ns,
+                                cache_hit = true,
+                                "request complete"
+                            );
+                            analytics::finish_response(
+                                state.config.analytics.enabled, &mut headers, &req.headers,
+                                &state.config.node.name, &req.path, 304, "HIT", client_ip, Some(elapsed_ns),
+                            );
+                            return RequestOutcome::Ready(304, headers, Vec::new(), "cache".to_string(), cached.hints.clone());
+                        }
+
                         let mut headers: Vec<(String, String)> = (*cached.headers).clone();
                         // Add Link: preload headers to the 200 response for clients/CDNs
                         // that strip 1xx informational responses.
                         for url in cached.hints.iter() {
                             headers.push(("link".to_string(), hints::link_header(url)));
                         }
-                        headers.push(("alt-svc".to_string(),
-                            format!("h3=\":{quic_port}\"; ma=86400")));
+                        set_alt_svc(&mut headers, quic_port);
+                        set_vary_accept_encoding(&mut headers);
                         debug!(
                             path = %req.path,
                             status = cached.status,
@@ -366,7 +385,11 @@ fn event_loop(
                         return RequestOutcome::Ready(cached.status, headers, cached.body.to_vec(), "cache".to_string(), cached.hints.clone());
                     } } // end cacheable
 
-                    handle_request(req, client_ip, enc_str, state, false)
+                    let mut outcome = handle_request(req, client_ip, enc_str, state, false);
+                    if let RequestOutcome::Ready(_, ref mut headers, ..) = outcome {
+                        set_alt_svc(headers, quic_port);
+                    }
+                    outcome
                 },
                 |http_result, ctx| {
                     let state = unsafe { &mut *state_ptr };
@@ -422,12 +445,31 @@ fn event_loop(
                     if cacheable { if let Some(cached) = state.cache.get(lookup_key) {
                         let elapsed_ns = start.elapsed().as_nanos() as u64;
                         state.stats.record(elapsed_ns, true, false);
+
+                        if is_not_modified(&cached.headers, &req.headers) {
+                            let mut headers = not_modified_headers(&cached.headers);
+                            debug!(
+                                path = %req.path,
+                                status = 304,
+                                version = "HTTP/2",
+                                backend = "cache",
+                                latency_ns = elapsed_ns,
+                                cache_hit = true,
+                                "request complete"
+                            );
+                            analytics::finish_response(
+                                state.config.analytics.enabled, &mut headers, &req.headers,
+                                &state.config.node.name, &req.path, 304, "HIT", client_ip, Some(elapsed_ns),
+                            );
+                            return RequestOutcome::Ready(304, headers, Vec::new(), "cache".to_string(), cached.hints.clone());
+                        }
+
                         let mut headers: Vec<(String, String)> = (*cached.headers).clone();
                         for url in cached.hints.iter() {
                             headers.push(("link".to_string(), hints::link_header(url)));
                         }
-                        headers.push(("alt-svc".to_string(),
-                            format!("h3=\":{quic_port}\"; ma=86400")));
+                        set_alt_svc(&mut headers, quic_port);
+                        set_vary_accept_encoding(&mut headers);
                         debug!(
                             path = %req.path,
                             status = cached.status,
@@ -444,7 +486,11 @@ fn event_loop(
                         return RequestOutcome::Ready(cached.status, headers, cached.body.to_vec(), "cache".to_string(), cached.hints.clone());
                     } } // end cacheable
 
-                    handle_request(req, client_ip, enc_str, state, false)
+                    let mut outcome = handle_request(req, client_ip, enc_str, state, false);
+                    if let RequestOutcome::Ready(_, ref mut headers, ..) = outcome {
+                        set_alt_svc(headers, quic_port);
+                    }
+                    outcome
                 },
                 |http_result, ctx| {
                     let state = unsafe { &mut *state_ptr2 };
@@ -820,6 +866,31 @@ fn handle_h3_request(
     if let Some(cached) = state.cache.get(lookup_key) {
         let elapsed_ns = start.elapsed().as_nanos() as u64;
         state.stats.record(elapsed_ns, true, false);
+
+        if is_not_modified(&cached.headers, &req.headers) {
+            let client_ip = qconn.client_addr.ip().to_string();
+            let set_cookie = analytics::record(
+                state.config.analytics.enabled, &req.headers,
+                &state.config.node.name, path_str, 304, "HIT", &client_ip, Some(elapsed_ns),
+            );
+            let html = analytics::is_html_response(&cached.headers);
+            let mut headers = not_modified_headers(&cached.headers);
+            if let (Some(sc), true) = (set_cookie, html) {
+                headers.push(("Set-Cookie".to_string(), sc));
+            }
+            debug!(
+                path = %path_str,
+                status = 304,
+                version = "HTTP/3",
+                backend = "cache",
+                latency_ns = elapsed_ns,
+                cache_hit = true,
+                "request complete"
+            );
+            send_h3_response(stream_id, qconn, 304, &headers, Bytes::new());
+            return;
+        }
+
         debug!(
             path = %path_str,
             status = cached.status,
@@ -844,21 +915,21 @@ fn handle_h3_request(
         if !cached.hints.is_empty() {
             send_h3_early_hints(stream_id, qconn, &cached.hints);
         }
-        // Build headers with Link: preload entries and Set-Cookie appended as needed.
-        let headers_with_links: Vec<(String, String)>;
-        let resp_headers: &[(String, String)] = if cached.hints.is_empty() && set_cookie.is_none() {
-            &cached.headers
-        } else {
-            let mut h = (*cached.headers).clone();
-            for url in cached.hints.iter() {
-                h.push(("link".to_string(), hints::link_header(url)));
-            }
-            if let Some(sc) = set_cookie {
-                h.push(("Set-Cookie".to_string(), sc));
-            }
-            headers_with_links = h;
-            &headers_with_links
-        };
+        // Build headers with Link: preload / Vary / Set-Cookie appended as
+        // needed. Vary is now always added on a cache hit (the cache key is
+        // already segmented by encoding, so this just documents that to
+        // downstream/shared caches), so this always takes the owned-Vec
+        // branch rather than reusing `&cached.headers` unmodified.
+        let mut headers_with_links: Vec<(String, String)> = (*cached.headers).clone();
+        for url in cached.hints.iter() {
+            headers_with_links.push(("link".to_string(), hints::link_header(url)));
+        }
+        set_vary_accept_encoding(&mut headers_with_links);
+        set_alt_svc(&mut headers_with_links, quic_port);
+        if let (Some(sc), true) = (set_cookie, analytics::is_html_response(&headers_with_links)) {
+            headers_with_links.push(("Set-Cookie".to_string(), sc));
+        }
+        let resp_headers: &[(String, String)] = &headers_with_links;
         send_h3_response(stream_id, qconn, cached.status, resp_headers, cached.body);
         return;
     }
@@ -898,8 +969,7 @@ fn handle_h3_request(
                 resp_headers.push(("link".to_string(), hints::link_header(url)));
             }
             // Add alt-svc header.
-            resp_headers.push(("alt-svc".to_string(),
-                format!("h3=\":{quic_port}\"; ma=86400")));
+            set_alt_svc(&mut resp_headers, quic_port);
 
             let elapsed_ns = start.elapsed().as_nanos() as u64;
             let is_backend_error = status >= 500;
@@ -1054,10 +1124,40 @@ fn handle_request(
     // that never happened, polluting request/session counts downstream.
     let analytics_enabled = state.config.analytics.enabled && !is_prefetch;
 
+    // The custom-error render route takes `status`/`from` (and optional
+    // `route`/`backend`/`detail`) straight from its query string and renders
+    // them into the page — safe when `dispatch_custom_error_async`/
+    // `apply_error_mode` build that query internally, but this route is also
+    // a normal, routable path. A direct external request to it would forward
+    // to the backend with client-controlled query params instead, letting
+    // any caller spoof an arbitrary status/from pair. Refuse it exactly like
+    // any other route miss.
+    if let ErrorMode::Custom { path: error_path } = &state.error_mode {
+        if req.path == *error_path {
+            let (s, h, b, n) = apply_error_mode(404, req, client_ip, state, None);
+            return RequestOutcome::Ready(s, h, b, n, std::sync::Arc::new(vec![]));
+        }
+    }
+
     // Route lookup
     let route = match state.route_table.at(&req.path) {
         Some(r) => r.clone(),
         None => {
+            // A path that only misses because of its trailing slash gets a
+            // 301 to the canonical form instead of a 404 — SEO/UX bug, not a
+            // real not-found, and cheap to catch before touching the error
+            // machinery below.
+            if let Some(canonical) = state.route_table.trailing_slash_redirect(&req.path) {
+                let location = match &req.query {
+                    Some(q) => format!("{canonical}?{q}"),
+                    None => canonical,
+                };
+                let headers = vec![
+                    ("Location".to_string(), location),
+                    ("Content-Type".to_string(), "text/html".to_string()),
+                ];
+                return RequestOutcome::Ready(301, headers, vec![], "redirect".to_string(), std::sync::Arc::new(vec![]));
+            }
             // Prefer fetching the real custom error page over the local
             // socket-pool path (`apply_error_mode`/`forward_to_backend` only
             // know how to reach Unix-socket backends). On a node whose error
@@ -1554,6 +1654,25 @@ fn forward_to_backend(
     }
 }
 
+/// Ensure exactly one `alt-svc` header advertising HTTP/3 is present, replacing
+/// any pre-existing one instead of appending a duplicate. A pre-existing entry
+/// shows up whenever the response body already passed through another m6-http
+/// instance (a cache node's backend is the origin, and the origin already
+/// advertised its own alt-svc before the cache node forwards or caches it).
+fn set_alt_svc(headers: &mut Vec<(String, String)>, quic_port: u16) {
+    headers.retain(|(k, _)| !k.eq_ignore_ascii_case("alt-svc"));
+    headers.push(("alt-svc".to_string(), format!("h3=\":{quic_port}\"; ma=86400")));
+}
+
+/// Same duplication hazard as `set_alt_svc`: a cache node's cached headers
+/// are whatever its own upstream (origin) sent, and origin adds this same
+/// header on its own cache hits — so a cache node replaying a cache hit of
+/// its own would otherwise double it up.
+fn set_vary_accept_encoding(headers: &mut Vec<(String, String)>) {
+    headers.retain(|(k, _)| !k.eq_ignore_ascii_case("vary"));
+    headers.push(("vary".to_string(), "Accept-Encoding".to_string()));
+}
+
 /// Called when a URL-backend I/O thread returns its result.  Handles cache
 /// insertion, hints extraction, alt-svc injection, and error mode application.
 fn finalize_url_response(
@@ -1675,8 +1794,7 @@ fn finalize_url_response(
     };
 
     let mut headers_with_altsvc = resp_headers;
-    headers_with_altsvc.push(("alt-svc".to_string(),
-        format!("h3=\":{quic_port}\"; ma=86400")));
+    set_alt_svc(&mut headers_with_altsvc, quic_port);
 
     // finish_proxied_response, not finish_response: this backend may itself
     // be another m6-http instance (a cache node's only backend is the

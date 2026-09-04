@@ -1,6 +1,7 @@
 /// In-memory response cache with atomic Arc swap.
 use std::borrow::Borrow;
 use ahash::AHashMap;
+use crate::analytics::{header, HeaderSource};
 
 /// A cached HTTP response.
 ///
@@ -16,6 +17,62 @@ pub struct CachedResponse {
     pub headers: std::sync::Arc<Vec<(String, String)>>,
     pub body:    bytes::Bytes,
     pub hints:   std::sync::Arc<Vec<String>>,
+}
+
+/// True if the incoming request's `If-None-Match`/`If-Modified-Since` shows
+/// the client's cached copy still matches this cached response's own
+/// `ETag`/`Last-Modified` — i.e. a bodyless 304 should be sent instead of
+/// replaying `body`. Mirrors the conditional-GET semantics already proven in
+/// `m6-file/src/handler.rs`'s static-asset handling; this is the same check
+/// for the proxy/cache layer, which previously replayed cached bodies
+/// unconditionally regardless of what the client already had.
+pub fn is_not_modified(
+    cached_headers: &[(String, String)],
+    req_headers: &(impl HeaderSource + ?Sized),
+) -> bool {
+    let etag = cached_headers.iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("etag"))
+        .map(|(_, v)| v.as_str());
+    let last_modified = cached_headers.iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("last-modified"))
+        .map(|(_, v)| v.as_str());
+
+    if let Some(inm) = header(req_headers, "if-none-match") {
+        // A real client sends exactly one ETag here, but the grammar allows
+        // a comma-separated list (and "*"), so honor that.
+        return match etag {
+            Some(etag) => inm == "*" || inm.split(',').any(|tag| tag.trim() == etag),
+            None => false,
+        };
+    }
+    if let (Some(ims), Some(lm)) = (header(req_headers, "if-modified-since"), last_modified) {
+        // HTTP-date has 1-second resolution; compare at that resolution too
+        // so a cached entry that hasn't changed since the client's copy
+        // doesn't spuriously look "modified" from sub-second noise.
+        if let (Ok(req_time), Ok(cached_time)) =
+            (httpdate::parse_http_date(ims), httpdate::parse_http_date(lm))
+        {
+            let secs = |t: std::time::SystemTime| {
+                t.duration_since(std::time::SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs()
+            };
+            return secs(req_time) >= secs(cached_time);
+        }
+    }
+    false
+}
+
+/// Build the minimal header set for a 304 response derived from a cached
+/// entry's headers — just the validators a client needs to keep using its
+/// cached copy, not the full header set (no Content-Type/Content-Encoding
+/// on a bodyless response).
+pub fn not_modified_headers(cached_headers: &[(String, String)]) -> Vec<(String, String)> {
+    cached_headers.iter()
+        .filter(|(k, _)| {
+            let k = k.to_ascii_lowercase();
+            k == "etag" || k == "last-modified" || k == "cache-control"
+        })
+        .cloned()
+        .collect()
 }
 
 /// Owned cache key stored in the HashMap.

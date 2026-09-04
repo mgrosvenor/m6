@@ -17,6 +17,8 @@ pub fn minify_html(data: &[u8], minify_inline_js: bool) -> Vec<u8> {
     cfg.minify_js = minify_inline_js;
     cfg.keep_comments = false;
     cfg.keep_closing_tags = true;
+    cfg.keep_spaces_between_attributes = true;
+    cfg.keep_html_and_head_opening_tags = true;
     minify_html::minify(data, &cfg)
 }
 
@@ -29,7 +31,10 @@ pub fn minify_js(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     match minify_js::minify(&session, minify_js::TopLevelMode::Module, data, &mut out) {
         Ok(()) => out,
-        Err(_) => data.to_vec(),
+        Err(e) => {
+            tracing::warn!(error = %e, "minify_js: parse failed, serving unminified source");
+            data.to_vec()
+        }
     }
 }
 

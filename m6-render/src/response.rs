@@ -183,9 +183,13 @@ impl Response {
         write!(w, "HTTP/1.1 {} {}\r\n", self.status, reason)?;
 
         let mut has_content_type = false;
+        let mut has_etag = false;
         for (k, v) in &self.headers {
             if k.eq_ignore_ascii_case("content-type") {
                 has_content_type = true;
+            }
+            if k.eq_ignore_ascii_case("etag") {
+                has_etag = true;
             }
             w.write_all(k.as_bytes())?;
             w.write_all(b": ")?;
@@ -196,10 +200,24 @@ impl Response {
         if !has_content_type && !self.body.is_empty() {
             w.write_all(b"Content-Type: text/html; charset=utf-8\r\n")?;
         }
+        // A rendered page has no filesystem mtime to hang a Last-Modified off
+        // of, but its body is a plain byte string — a content hash gives
+        // conditional-GET (see m6-http's cache-hit `is_not_modified` check) a
+        // real signal to compare against once this response is cached.
+        if !has_etag && !self.body.is_empty() {
+            write!(w, "ETag: \"{:x}\"\r\n", content_hash(&self.body))?;
+        }
         w.write_all(b"\r\n")?;
         w.write_all(&self.body)?;
         Ok(())
     }
+}
+
+fn content_hash(body: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    body.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn reason_phrase(status: u16) -> &'static str {
