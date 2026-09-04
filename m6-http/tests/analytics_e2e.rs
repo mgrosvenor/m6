@@ -363,6 +363,10 @@ fn start_server() -> Server {
     )
     .unwrap();
     std::fs::write(site.join("public/style.css"), b"body { color: red; }").unwrap();
+    // A second HTML page, referencing nothing — the session tests need a
+    // text/html response (only those mint a session, per the HTTP-06 fix) but
+    // must not drag page.html's prefetch hints into their own line counts.
+    std::fs::write(site.join("public/plain.html"), b"<!doctype html><title>hi</title>").unwrap();
 
     let sock = dir.path().join("m6-file-1.sock");
     let sock_glob = dir.path().join("m6-file-*.sock");
@@ -469,7 +473,7 @@ name = "test-node"
 fn session_cookie_minted_once_and_reused_h1() {
     let srv = start_server();
 
-    let first = https_get(srv.port, "/public/open.txt", &[], srv.tls());
+    let first = https_get(srv.port, "/public/plain.html", &[], srv.tls());
     assert_eq!(first.status, 200, "headers:\n{}", first.headers);
     let set_cookies = first.header_values("set-cookie");
     assert_eq!(
@@ -484,7 +488,7 @@ fn session_cookie_minted_once_and_reused_h1() {
     let session_id = cookie_value.split_once('=').unwrap().1;
 
     // Replay with that cookie: no new Set-Cookie, same session reused.
-    let second = https_get(srv.port, "/public/open.txt", &[("Cookie", cookie_value)], srv.tls());
+    let second = https_get(srv.port, "/public/plain.html", &[("Cookie", cookie_value)], srv.tls());
     assert_eq!(second.status, 200);
     assert!(
         second.header_values("set-cookie").is_empty(),
@@ -508,7 +512,7 @@ fn session_cookie_minted_once_and_reused_h1() {
 fn session_cookie_minted_once_and_reused_h3() {
     let srv = start_server();
 
-    let (status1, set_cookies1) = h3_get(srv.port, "/public/open.txt", None).expect("h3 request 1");
+    let (status1, set_cookies1) = h3_get(srv.port, "/public/plain.html", None).expect("h3 request 1");
     assert_eq!(status1, 200);
     assert_eq!(
         set_cookies1.len(),
@@ -520,7 +524,7 @@ fn session_cookie_minted_once_and_reused_h3() {
     let cookie_value = set_cookies1[0].split(';').next().unwrap();
     let session_id = cookie_value.split_once('=').unwrap().1;
 
-    let (status2, set_cookies2) = h3_get(srv.port, "/public/open.txt", Some(cookie_value)).expect("h3 request 2");
+    let (status2, set_cookies2) = h3_get(srv.port, "/public/plain.html", Some(cookie_value)).expect("h3 request 2");
     assert_eq!(status2, 200);
     assert!(
         set_cookies2.is_empty(),
@@ -902,7 +906,12 @@ fn edge_reuses_origin_session_instead_of_minting_a_second_one() {
     std::fs::write(origin_site.join("key.pem"), &origin_key_pem).unwrap();
     std::fs::create_dir_all(origin_site.join("public")).unwrap();
     std::fs::create_dir_all(origin_site.join("configs")).unwrap();
-    std::fs::write(origin_site.join("public/open.txt"), b"PUBLIC CONTENT").unwrap();
+    // HTML, not text: sessions are only minted on text/html responses (the
+    // HTTP-06 fix — a session cookie on every image and stylesheet was both
+    // noise and a needless per-asset identifier). A .txt fixture here would
+    // exercise the no-mint path and never see the bug this test guards.
+    std::fs::write(origin_site.join("public/page.html"), b"<!doctype html><title>x</title>")
+        .unwrap();
 
     let origin_sock = origin_dir.path().join("m6-file-1.sock");
     let origin_sock_glob = origin_dir.path().join("m6-file-*.sock");
@@ -1051,7 +1060,7 @@ backend = "origin"
 
     // ── The actual test: one request through the edge, no cookie yet ──────
     let edge_tls = tls_client_config(&edge_cert_der);
-    let resp = https_get(edge_port, "/public/open.txt", &[], edge_tls);
+    let resp = https_get(edge_port, "/public/page.html", &[], edge_tls);
     assert_eq!(resp.status, 200, "headers:\n{}", resp.headers);
 
     let set_cookies = resp.header_values("set-cookie");

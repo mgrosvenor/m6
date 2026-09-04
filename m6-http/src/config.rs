@@ -332,6 +332,9 @@ pub struct RouteConfig {
     pub backend: String,
     /// Auth requirement e.g. "group:editors" or "role:admin"
     pub require: Option<String>,
+    /// Captured only so `load()` can warn that m6-http ignores it — see
+    /// `warn_ignored_cache_key`. Deliberately not wired to anything.
+    pub cache: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -342,6 +345,8 @@ pub struct RouteGroupConfig {
     pub path: String,
     pub backend: String,
     pub require: Option<String>,
+    /// See `RouteConfig::cache` — captured to warn, not to act on.
+    pub cache: Option<String>,
 }
 
 // ── Raw serde types for parsing site.toml ──────────────────────────────────
@@ -504,9 +509,32 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         }
     }
 
+    // `cache = "..."` is a real, honoured directive in m6-render's route
+    // tables, which makes it very natural to write here too — but m6-http
+    // takes its caching decision from the *response's* Cache-Control, never
+    // from the route table, so the line does exactly nothing. Silently
+    // dropping it is the trap: the config reads as though no-store is being
+    // enforced at the edge when nothing is enforcing it. Warn by name rather
+    // than bailing, so an existing node config can never be turned into a
+    // boot failure by a line that has always been inert.
+    for route in &routes {
+        if let Some(cache) = &route.cache {
+            tracing::warn!(
+                route = %route.path, value = %cache,
+                "config: `cache` on a route is ignored by m6-http (set Cache-Control on the backend response instead)"
+            );
+        }
+    }
+
     // Validate route_groups
     let route_groups = site_parsed.route_groups;
     for rg in &route_groups {
+        if let Some(cache) = &rg.cache {
+            tracing::warn!(
+                route_group = %rg.path, value = %cache,
+                "config: `cache` on a route_group is ignored by m6-http (set Cache-Control on the backend response instead)"
+            );
+        }
         if !backend_names.contains(rg.backend.as_str()) {
             anyhow::bail!(
                 "config error: route_group {} references unknown backend `{}`",

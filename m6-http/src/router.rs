@@ -408,7 +408,7 @@ mod tests {
     }
 
     fn make_route(path: &str, backend: &str) -> RouteConfig {
-        RouteConfig { path: path.to_string(), backend: backend.to_string(), require: None }
+        RouteConfig { path: path.to_string(), backend: backend.to_string(), require: None, cache: None }
     }
 
     #[test]

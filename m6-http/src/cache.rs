@@ -162,7 +162,54 @@ pub fn make_lookup_key<'a>(
 }
 
 /// The inner cache map.
-type CacheMap = AHashMap<CacheKey, CachedResponse>;
+/// Freshness lifetime from a response's own `Cache-Control`, in seconds.
+///
+/// `s-maxage` wins over `max-age` when both are present: this is a shared
+/// cache, and that is exactly what `s-maxage` is for. `no-cache` means the
+/// response must be revalidated before every reuse — m6-http has no upstream
+/// revalidation path, so the honest equivalent is a zero lifetime (always a
+/// miss) rather than serving it unrevalidated.
+///
+/// `None` means no freshness lifetime was specified, which keeps the previous
+/// behaviour: the entry lives until an explicit invalidation. That is a
+/// deliberate CDN-style model (see `evict_path`/`clear` and
+/// deploy/invalidate-cache.sh), not an oversight — this only adds expiry for
+/// responses that actually asked for one.
+fn freshness_secs(headers: &[(String, String)]) -> Option<u64> {
+    let cc = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("cache-control"))?
+        .1
+        .to_ascii_lowercase();
+
+    if cc.split(',').any(|d| d.trim() == "no-cache") {
+        return Some(0);
+    }
+
+    // s-maxage first, then max-age.
+    for directive in ["s-maxage", "max-age"] {
+        for part in cc.split(',') {
+            let part = part.trim();
+            if let Some(v) = part.strip_prefix(directive).and_then(|r| r.strip_prefix('=')) {
+                if let Ok(secs) = v.trim().parse::<u64>() {
+                    return Some(secs);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// A stored entry: the response plus the instant it goes stale.
+///
+/// `expires_at == None` means "no freshness lifetime given" — lives until
+/// explicit invalidation.
+struct CacheEntry {
+    response: CachedResponse,
+    expires_at: Option<std::time::Instant>,
+}
+
+type CacheMap = AHashMap<CacheKey, CacheEntry>;
 
 use std::sync::{Arc, RwLock};
 
@@ -175,7 +222,7 @@ pub struct Cache {
 
 impl Cache {
     pub fn new() -> Self {
-        Cache { map: Arc::new(RwLock::new(AHashMap::<CacheKey, CachedResponse>::new())) }
+        Cache { map: Arc::new(RwLock::new(CacheMap::new())) }
     }
 
     /// Get a cached response.
@@ -183,18 +230,36 @@ impl Cache {
     /// Accepts any borrowed form of `CacheKey`:
     /// - `&str` — zero-allocation hot-path lookup via `make_lookup_key`
     /// - `&CacheKey` — legacy/test usage (blanket `Borrow<CacheKey>` impl)
+    ///
+    /// An entry past its freshness lifetime is treated as a miss. Expiry is
+    /// checked here, on read, rather than swept by a background task: a stale
+    /// entry costs nothing until someone asks for it, and the miss that
+    /// follows overwrites it. This keeps expiry off the write path entirely
+    /// and needs no timer thread.
     pub fn get<Q>(&self, key: &Q) -> Option<CachedResponse>
     where
         CacheKey: std::borrow::Borrow<Q>,
         Q: std::hash::Hash + Eq + ?Sized,
     {
-        self.map.read().ok()?.get(key).cloned()
+        let map = self.map.read().ok()?;
+        let entry = map.get(key)?;
+        match entry.expires_at {
+            // Checked before the clone, so an expired entry costs no copy.
+            Some(deadline) if std::time::Instant::now() >= deadline => None,
+            _ => Some(entry.response.clone()),
+        }
     }
 
     /// Store a response. Only call if the response should be cached.
+    ///
+    /// The freshness deadline is derived from the response's own
+    /// `Cache-Control` here rather than passed in, so every caller gets
+    /// correct expiry without having to know about it.
     pub fn insert(&self, key: CacheKey, response: CachedResponse) {
+        let expires_at = freshness_secs(&response.headers)
+            .map(|secs| std::time::Instant::now() + std::time::Duration::from_secs(secs));
         if let Ok(mut map) = self.map.write() {
-            map.insert(key, response);
+            map.insert(key, CacheEntry { response, expires_at });
         }
     }
 
@@ -251,7 +316,9 @@ impl Cache {
         }
     }
 
-    /// Number of entries.
+    /// Number of stored entries, including any that are past their freshness
+    /// lifetime but haven't been read (and so overwritten) since. This is a
+    /// memory-occupancy figure, not a count of servable entries.
     pub fn len(&self) -> usize {
         self.map.read().map(|m| m.len()).unwrap_or(0)
     }
@@ -406,6 +473,108 @@ mod tests {
         let mut buf2 = [0u8; 512];
         let lk2 = make_lookup_key("/hello", None, "", &mut buf2);
         assert!(cache.get(lk2).is_some());
+    }
+
+    /// Build a cacheable response carrying `cc` as its `Cache-Control`.
+    fn cached_with_cc(cc: &str) -> CachedResponse {
+        let headers = if cc.is_empty() {
+            vec![]
+        } else {
+            vec![("cache-control".to_string(), cc.to_string())]
+        };
+        CachedResponse {
+            status: 200,
+            headers: std::sync::Arc::new(headers),
+            body: bytes::Bytes::from_static(b"world"),
+            hints: std::sync::Arc::new(vec![]),
+        }
+    }
+
+    fn get_path(cache: &Cache, path: &str) -> Option<CachedResponse> {
+        let mut buf = [0u8; 512];
+        let lk = make_lookup_key(path, None, "", &mut buf);
+        cache.get(lk)
+    }
+
+    /// `max-age=0` is already stale the instant it lands, so it must read back
+    /// as a miss rather than being served once for free.
+    #[test]
+    fn test_cache_expires_at_zero_max_age() {
+        let cache = Cache::new();
+        cache.insert(
+            CacheKey::new("/hello", None, ""),
+            cached_with_cc("public, max-age=0"),
+        );
+        assert!(get_path(&cache, "/hello").is_none());
+    }
+
+    #[test]
+    fn test_cache_serves_within_max_age() {
+        let cache = Cache::new();
+        cache.insert(
+            CacheKey::new("/hello", None, ""),
+            cached_with_cc("public, max-age=3600"),
+        );
+        assert!(get_path(&cache, "/hello").is_some());
+    }
+
+    /// No freshness lifetime means the entry lives until it is explicitly
+    /// invalidated — the pre-existing behaviour, which the deploy pipeline's
+    /// invalidate-cache.sh depends on.
+    #[test]
+    fn test_cache_without_max_age_never_expires() {
+        let cache = Cache::new();
+        cache.insert(CacheKey::new("/hello", None, ""), cached_with_cc("public"));
+        assert!(get_path(&cache, "/hello").is_some());
+    }
+
+    /// This is a shared cache, so `s-maxage` overrides `max-age` when both are
+    /// present — even when it appears second.
+    #[test]
+    fn test_s_maxage_overrides_max_age() {
+        assert_eq!(
+            freshness_secs(&[(
+                "Cache-Control".to_string(),
+                "public, max-age=3600, s-maxage=0".to_string(),
+            )]),
+            Some(0)
+        );
+    }
+
+    /// `no-cache` means revalidate before every reuse. There is no upstream
+    /// revalidation path here, so it has to read as a miss every time.
+    #[test]
+    fn test_no_cache_is_immediately_stale() {
+        assert_eq!(
+            freshness_secs(&[(
+                "Cache-Control".to_string(),
+                "public, no-cache, max-age=600".to_string(),
+            )]),
+            Some(0)
+        );
+    }
+
+    /// `max-age` must not be matched inside `s-maxage` (or any other longer
+    /// token) when it is the only directive being looked for.
+    #[test]
+    fn test_s_maxage_alone_is_not_read_as_max_age() {
+        assert_eq!(
+            freshness_secs(&[("Cache-Control".to_string(), "s-maxage=42".to_string())]),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn test_freshness_absent_and_unparseable() {
+        assert_eq!(freshness_secs(&[]), None);
+        assert_eq!(
+            freshness_secs(&[("Cache-Control".to_string(), "public".to_string())]),
+            None
+        );
+        assert_eq!(
+            freshness_secs(&[("Cache-Control".to_string(), "max-age=abc".to_string())]),
+            None
+        );
     }
 
     #[test]
