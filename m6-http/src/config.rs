@@ -95,6 +95,27 @@ pub struct ServerConfig {
     /// cache, so `tls_cert`/`tls_key` may point nowhere.
     #[serde(default)]
     pub redirect_bind: Option<String>,
+    /// Request methods this server will serve. Anything else is answered 405
+    /// with an `Allow` header, before routing, cache lookup or backend
+    /// dispatch.
+    ///
+    /// Default is GET, HEAD, POST: everything this site actually does. POST is
+    /// present because the contact form needs it; it is never cached (see
+    /// `cache::method_may_write_cache`), only forwarded.
+    ///
+    /// Nothing validated the method before this existed, so every verb --
+    /// PUT, DELETE, TRACE, and entirely invented ones like FOO -- was answered
+    /// 200 with the cached page. TRACE especially should never be served: it
+    /// is a cross-site tracing vector and this site has no use for it.
+    ///
+    /// Configurable rather than hard-coded because the CMS routes (currently
+    /// disabled) need PUT and DELETE when they come back.
+    #[serde(default = "default_allowed_methods")]
+    pub allowed_methods: Vec<String>,
+}
+
+fn default_allowed_methods() -> Vec<String> {
+    vec!["GET".to_string(), "HEAD".to_string(), "POST".to_string()]
 }
 
 fn default_backend_timeout_secs() -> u64 {
@@ -428,6 +449,7 @@ struct RawServerSection {
     backend_timeout_secs: Option<u64>,
     h2c_bind: Option<String>,
     redirect_bind: Option<String>,
+    allowed_methods: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -467,6 +489,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         backend_timeout_secs: None,
         h2c_bind: None,
         redirect_bind: None,
+        allowed_methods: None,
     });
     let sys_server = system_parsed.server.unwrap_or(RawServerSection {
         bind: None,
@@ -475,6 +498,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         backend_timeout_secs: None,
         h2c_bind: None,
         redirect_bind: None,
+        allowed_methods: None,
     });
 
     // Resolved before `bind`, because in redirect mode it supplies the default.
@@ -534,6 +558,15 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         backend_timeout_secs,
         h2c_bind,
         redirect_bind: redirect_bind.clone(),
+        // Uppercased once at load so the hot-path check is a plain comparison
+        // rather than a case-insensitive one per request.
+        allowed_methods: sys_server.allowed_methods
+            .or(site_server.allowed_methods)
+            .unwrap_or_else(default_allowed_methods)
+            .iter()
+            .map(|m| m.trim().to_ascii_uppercase())
+            .filter(|m| !m.is_empty())
+            .collect(),
     };
     let log = site_parsed.log.unwrap_or_default();
     let analytics = site_parsed.analytics.unwrap_or_default();
