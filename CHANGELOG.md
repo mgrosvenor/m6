@@ -11,6 +11,36 @@ Deploy order is fixed: **test locally, commit, then deploy.** Never the reverse.
 
 ---
 
+## 2026-09-06 — `Link: rel="describedby"` on HTML responses
+
+New `[site].describedby` setting. When set (the site uses `/llms.txt`), every
+**HTML** response carries `Link: </llms.txt>; rel="describedby"`.
+
+The site already emits the equivalent `<link rel="describedby">` in `<head>`.
+The header is the better of the two and there is no reason to have only one:
+it arrives before the page is parsed, so anything inspecting response headers
+on its first request discovers the site's machine-facing layer without reading
+any markup. The markup link covers readers that only see the document.
+
+HTML only. `llms.txt` describes the *site*; a stylesheet or a PNG claiming to
+be described by it says nothing useful and would add a header to the majority
+of requests, which are assets.
+
+Applied at the same five places as `Vary`: the two miss-path wrappers and the
+three cache-hit replay sites. Empty by default, so a deployment with no such
+file does not advertise one.
+
+Two hazards, both covered by tests. A cache node's backend is the origin, which
+already added this header before the response was forwarded and cached, so the
+node would emit two without a dedupe. And `Link` is also carrying the preload
+hints — the dedupe matches on `rel="describedby"` specifically, so the preloads
+survive.
+
+529 workspace tests pass, zero warnings on both platforms. Verified locally on
+HTML for cache MISS and HIT, and verified absent on CSS and on llms.txt itself.
+
+---
+
 ## 2026-09-06 — HTTP caching correctness
 
 Three defects in the revalidation and caching headers, all raised from a live
