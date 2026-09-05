@@ -2268,6 +2268,25 @@ fn run(args: Vec<String>) -> i32 {
     config::warn_system_config_extra_keys(&cli.system_config);
     config::warn_ignored_route_cache_keys(&config);
 
+    // --dump-config
+    //
+    // Ahead of redirect mode below, because --dump-config must never bind a
+    // socket: it is how a deploy validates a config before cutting a node over
+    // to it, and a redirect config that started a listener instead of printing
+    // would hold :80 on the very node the deploy was still checking.
+    if cli.dump_config {
+        match serde_json::to_string_pretty(&config) {
+            Ok(s) => {
+                println!("{}", s);
+                return 0;
+            }
+            Err(e) => {
+                eprintln!("dump-config error: {}", e);
+                return 1;
+            }
+        }
+    }
+
     // Redirect mode: this process is the plain-HTTP :80 half of the pair, so
     // it returns here and never builds QUIC, TLS, backends, the cache or the
     // route table. Deliberately a separate process from the :443 instance
@@ -2280,20 +2299,6 @@ fn run(args: Vec<String>) -> i32 {
             return 1;
         }
         return 0;
-    }
-
-    // --dump-config
-    if cli.dump_config {
-        match serde_json::to_string_pretty(&config) {
-            Ok(s) => {
-                println!("{}", s);
-                return 0;
-            }
-            Err(e) => {
-                eprintln!("dump-config error: {}", e);
-                return 1;
-            }
-        }
     }
 
     // Load public key if auth declared
