@@ -77,7 +77,7 @@ impl FsWatcher {
             use inotify::{Inotify, WatchMask};
             use std::collections::HashSet;
 
-            let mut inotify = Inotify::init()?;
+            let inotify = Inotify::init()?;
 
             let site_dir = &config.site_dir;
             if site_dir.exists() {
