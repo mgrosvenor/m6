@@ -496,6 +496,40 @@ pub fn parse_request(buf: &[u8]) -> ParseResult {
         Err(_) => return ParseResult::Error,
     };
 
+    // Reject a bare LF anywhere in the header block.
+    //
+    // httparse accepts LF alone as a line terminator, which is lenient in the
+    // way most servers historically were. The consequence is that a header
+    // VALUE containing a raw \n is silently split into two headers:
+    //
+    //     X-Test: a\nX-Injected: yes   ->   X-Test: a  +  X-Injected: yes
+    //
+    // and the second one is then forwarded to the backend. Found by a raw
+    // socket test; no client library will send this, which is why it survived.
+    //
+    // Honest scope: this is not a demonstrated exploit against the current
+    // topology. Ingress stripping runs after the split, so proxy-owned headers
+    // are still removed, and m6-http re-serialises with CRLF, so its own
+    // cache-node-to-origin hop cannot desync with itself. The hazard is the
+    // classic one from RFC 9112 11.2 -- two hops disagreeing about where a
+    // header ends -- and it goes live the moment anything is placed in front
+    // of m6. Rejecting is what current hardened servers do, and it costs one
+    // scan of a small buffer on a path that has already parsed it once.
+    //
+    // Scanning `buf[..body_offset]` rather than the whole buffer keeps a body
+    // containing legitimate LF bytes out of it.
+    {
+        let head = &buf[..body_offset];
+        let mut i = 0;
+        while let Some(off) = head[i..].iter().position(|&c| c == b'\n') {
+            let at = i + off;
+            if at == 0 || head[at - 1] != b'\r' {
+                return ParseResult::Error;
+            }
+            i = at + 1;
+        }
+    }
+
     let method = req.method.unwrap_or("GET").to_string();
     let raw_path = req.path.unwrap_or("/");
 
@@ -754,6 +788,60 @@ mod head_framing_tests {
             let (head, body) = split(&raw);
             assert_eq!(body.len(), 0);
             assert!(head.contains("content-length: 0"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod line_ending_tests {
+    use super::*;
+
+    fn headers_of(raw: &[u8]) -> Option<Vec<(String, String)>> {
+        match parse_request(raw) {
+            ParseResult::Complete(r) => Some(r.headers),
+            _ => None,
+        }
+    }
+
+    /// Baseline: a normal CRLF request parses as expected.
+    #[test]
+    fn crlf_headers_parse() {
+        let h = headers_of(b"GET / HTTP/1.1\r\nHost: a\r\nX-One: 1\r\n\r\n").expect("parsed");
+        assert!(h.iter().any(|(k, v)| k.eq_ignore_ascii_case("x-one") && v == "1"));
+    }
+
+    /// The question this file exists to answer: does a **bare LF** inside the
+    /// header block terminate a header line?
+    ///
+    /// If it does, `X-Test: a\nX-Injected: yes` is two headers rather than one
+    /// with a control character in its value, and the injected one is
+    /// forwarded to the backend. That is header injection through a value the
+    /// caller controls, and the fact that the *response* looks clean is
+    /// precisely why it would go unnoticed.
+    #[test]
+    fn bare_lf_inside_a_header_value() {
+        let parsed = headers_of(b"GET / HTTP/1.1\r\nHost: a\r\nX-Test: a\nX-Injected: yes\r\n\r\n");
+        match parsed {
+            None => { /* rejected outright — the strict, safe outcome */ }
+            Some(h) => {
+                let injected = h.iter().any(|(k, _)| k.eq_ignore_ascii_case("x-injected"));
+                assert!(
+                    !injected,
+                    "a bare LF in a header value split it into a separate \
+                     `X-Injected` header, which is then forwarded to the backend. \
+                     Parsed headers: {h:?}"
+                );
+            }
+        }
+    }
+
+    /// The same shape, one layer up: a bare LF terminating the request line.
+    #[test]
+    fn bare_lf_after_the_request_line() {
+        let parsed = headers_of(b"GET / HTTP/1.1\nHost: a\nX-Injected: yes\n\n");
+        if let Some(h) = parsed {
+            let injected = h.iter().any(|(k, _)| k.eq_ignore_ascii_case("x-injected"));
+            assert!(!injected, "LF-only request framing accepted headers: {h:?}");
         }
     }
 }
