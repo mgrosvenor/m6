@@ -415,15 +415,15 @@ fn event_loop(
                     // latency purposes but the visitor got the previous
                     // generation of the content, and that difference has to be
                     // legible in the logs rather than hidden inside "HIT".
-                    let cache_state = if matches!(looked_up, m6_http_lib::cache::Lookup::Stale(_)) { "STALE" } else { "HIT" };
-                    if let m6_http_lib::cache::Lookup::Stale(_) = looked_up {
+                    let cache_state = if matches!(looked_up, m6_http_lib::cache::Lookup::Stale(..)) { "STALE" } else { "HIT" };
+                    if let m6_http_lib::cache::Lookup::Stale(..) = looked_up {
                         state.queue_refresh(Refresh {
                             path:  req.path.clone(),
                             query: req.query.clone(),
                             enc:   enc_str.to_string(),
                         });
                     }
-                    if let m6_http_lib::cache::Lookup::Fresh(cached) | m6_http_lib::cache::Lookup::Stale(cached) = looked_up {
+                    if let m6_http_lib::cache::Lookup::Fresh(cached, age) | m6_http_lib::cache::Lookup::Stale(cached, age) = looked_up {
                         let elapsed_ns = start.elapsed().as_nanos() as u64;
                         state.stats.record(elapsed_ns, true, false);
 
@@ -453,6 +453,7 @@ fn event_loop(
                         }
                         set_alt_svc(&mut headers, quic_port);
                         set_vary_accept_encoding(&mut headers);
+                        set_age(&mut headers, age);
                         set_describedby_link(&mut headers, &state.config.site.describedby);
                         debug!(
                             path = %req.path,
@@ -544,15 +545,15 @@ fn event_loop(
                     // latency purposes but the visitor got the previous
                     // generation of the content, and that difference has to be
                     // legible in the logs rather than hidden inside "HIT".
-                    let cache_state = if matches!(looked_up, m6_http_lib::cache::Lookup::Stale(_)) { "STALE" } else { "HIT" };
-                    if let m6_http_lib::cache::Lookup::Stale(_) = looked_up {
+                    let cache_state = if matches!(looked_up, m6_http_lib::cache::Lookup::Stale(..)) { "STALE" } else { "HIT" };
+                    if let m6_http_lib::cache::Lookup::Stale(..) = looked_up {
                         state.queue_refresh(Refresh {
                             path:  req.path.clone(),
                             query: req.query.clone(),
                             enc:   enc_str.to_string(),
                         });
                     }
-                    if let m6_http_lib::cache::Lookup::Fresh(cached) | m6_http_lib::cache::Lookup::Stale(cached) = looked_up {
+                    if let m6_http_lib::cache::Lookup::Fresh(cached, age) | m6_http_lib::cache::Lookup::Stale(cached, age) = looked_up {
                         let elapsed_ns = start.elapsed().as_nanos() as u64;
                         state.stats.record(elapsed_ns, true, false);
 
@@ -580,6 +581,7 @@ fn event_loop(
                         }
                         set_alt_svc(&mut headers, quic_port);
                         set_vary_accept_encoding(&mut headers);
+                        set_age(&mut headers, age);
                         set_describedby_link(&mut headers, &state.config.site.describedby);
                         debug!(
                             path = %req.path,
@@ -1063,15 +1065,15 @@ fn handle_h3_request(
     // Serve stale now, refresh behind the request — see the HTTP/1.1 path for
     // the reasoning.
     // See the HTTP/1.1 path: a stale serve is logged distinctly from a hit.
-    let cache_state = if matches!(looked_up, m6_http_lib::cache::Lookup::Stale(_)) { "STALE" } else { "HIT" };
-    if let m6_http_lib::cache::Lookup::Stale(_) = looked_up {
+    let cache_state = if matches!(looked_up, m6_http_lib::cache::Lookup::Stale(..)) { "STALE" } else { "HIT" };
+    if let m6_http_lib::cache::Lookup::Stale(..) = looked_up {
         state.queue_refresh(Refresh {
             path:  path_str.to_string(),
             query: query_str.map(str::to_string),
             enc:   enc_str.to_string(),
         });
     }
-    if let m6_http_lib::cache::Lookup::Fresh(cached) | m6_http_lib::cache::Lookup::Stale(cached) = looked_up {
+    if let m6_http_lib::cache::Lookup::Fresh(cached, age) | m6_http_lib::cache::Lookup::Stale(cached, age) = looked_up {
         let elapsed_ns = start.elapsed().as_nanos() as u64;
         state.stats.record(elapsed_ns, true, false);
 
@@ -1133,6 +1135,7 @@ fn handle_h3_request(
             headers_with_links.push(("link".to_string(), hints::link_header(url)));
         }
         set_vary_accept_encoding(&mut headers_with_links);
+        set_age(&mut headers_with_links, age);
         set_describedby_link(&mut headers_with_links, &state.config.site.describedby);
         set_alt_svc(&mut headers_with_links, quic_port);
         if let (Some(sc), true) = (set_cookie, analytics::is_html_response(&headers_with_links)) {
@@ -2141,6 +2144,22 @@ fn set_vary_accept_encoding(headers: &mut Vec<(String, String)>) {
 ///
 /// Matched case-sensitively: HTTP methods are case-sensitive tokens, so `get`
 /// is not GET and should not be dignified with a 405.
+/// Emit `Age` on a response served from cache (RFC 9111 5.1, MUST).
+///
+/// Nothing emitted it at all, so a downstream cache had no way to tell how old
+/// what we handed it already was and treated a minute-old response as newly
+/// generated. Combined with a shared cache chain, each hop restarted the clock.
+///
+/// Replaces any `Age` already present rather than appending: the stored value
+/// is whatever the origin declared when the entry was filled, and it is now
+/// stale by exactly the time we have held it. That upstream value is not
+/// discarded — it is folded into the age the cache computes (see
+/// `CacheEntry::upstream_age`) — but it must not also be emitted verbatim.
+fn set_age(headers: &mut Vec<(String, String)>, age: std::time::Duration) {
+    headers.retain(|(k, _)| !k.eq_ignore_ascii_case("age"));
+    headers.push(("age".to_string(), age.as_secs().to_string()));
+}
+
 /// Ceiling on a buffered HTTP/3 request body. Mirrors the HTTP/2 limit so the
 /// two protocols cannot disagree about what is acceptable to accept.
 const MAX_H3_BODY: usize = 20 * 1024 * 1024;

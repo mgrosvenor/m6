@@ -11,6 +11,39 @@ Deploy order is fixed: **test locally, commit, then deploy.** Never the reverse.
 
 ---
 
+## 2026-09-06 — `Age` on cache-served responses (F045, F046)
+
+RFC 9111 5.1 requires a shared cache to send `Age`. Nothing emitted it at all,
+so a downstream cache had no way to know how old what we handed it already was
+and treated a minute-old response as newly generated.
+
+Two halves, and the second is the one that matters in a chain:
+
+- **`Age` is now emitted** on every cache-served response, at all three
+  cache-hit sites. Verified live: absent on MISS, 3 after three seconds, 8
+  after eight, exactly one header.
+- **Upstream age carries forward** (F046). RFC 9111 4.2.3 defines age as time
+  since the response was *generated*, not since this cache happened to store
+  it. An entry that arrived already one hop old had its clock reset to zero,
+  so each hop in a chain made the content look fresher than it was. The `Age`
+  the origin declared is now folded into the stored entry and added to the
+  time held locally.
+
+The age travels on the `Lookup` result rather than being written into the
+stored headers: the value changes every second, the stored headers are shared
+behind an `Arc`, and the callers already build an owned header vector to add
+`Vary`/`alt-svc` — so this costs nothing on the cache-hit path.
+
+Four tests, including a malformed upstream `Age` being ignored rather than
+poisoning the calculation.
+
+Still open in this area: `Expires`/`Date`-based freshness (F047), bare `public`
+being fresh forever (F048), and unsafe-method invalidation (F058).
+
+594 workspace tests pass, zero warnings.
+
+---
+
 ## 2026-09-06 — 501 vs 405, case-sensitive methods, and two more allocation bounds
 
 ### An unrecognised method is 501, not 405 (F016)
