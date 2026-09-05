@@ -10,6 +10,7 @@ pub mod h2c_client;
 pub mod h2s_client;
 pub mod pool;
 pub mod poller;
+pub mod redirect;
 pub mod router;
 pub mod security;
 pub mod stats;

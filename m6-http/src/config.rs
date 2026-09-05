@@ -52,6 +52,17 @@ pub struct ServerConfig {
     /// Intended for use over WireGuard tunnels or trusted private networks.
     #[serde(default)]
     pub h2c_bind: Option<String>,
+    /// Run this process as a plain-HTTP redirector on this address instead of
+    /// a normal server: every request is answered 301 to https://<Host><path>.
+    ///
+    /// Meant for a **second m6-http process** alongside the real one, not for
+    /// the `:443` instance to also listen here. Different port, different
+    /// failure domain — a slow client on :80 cannot stall TLS serving because
+    /// it is not sharing that process's event loop. In this mode nothing else
+    /// in the config is read: no TLS, no QUIC, no backends, no routes, no
+    /// cache, so `tls_cert`/`tls_key` may point nowhere.
+    #[serde(default)]
+    pub redirect_bind: Option<String>,
 }
 
 fn default_backend_timeout_secs() -> u64 {
@@ -382,6 +393,7 @@ struct RawServerSection {
     tls_key: Option<String>,
     backend_timeout_secs: Option<u64>,
     h2c_bind: Option<String>,
+    redirect_bind: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -420,6 +432,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         tls_key: None,
         backend_timeout_secs: None,
         h2c_bind: None,
+        redirect_bind: None,
     });
     let sys_server = system_parsed.server.unwrap_or(RawServerSection {
         bind: None,
@@ -427,6 +440,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         tls_key: None,
         backend_timeout_secs: None,
         h2c_bind: None,
+        redirect_bind: None,
     });
 
     let bind = sys_server.bind.or(site_server.bind)
@@ -439,6 +453,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         .or(site_server.backend_timeout_secs)
         .unwrap_or(30);
     let h2c_bind = sys_server.h2c_bind.or(site_server.h2c_bind);
+    let redirect_bind = sys_server.redirect_bind.or(site_server.redirect_bind);
 
     // Resolve TLS cert/key paths relative to site_dir if not absolute.
     let tls_cert_path = resolve_path(site_dir, &tls_cert);
@@ -468,6 +483,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         tls_key: tls_key_path.to_string_lossy().into_owned(),
         backend_timeout_secs,
         h2c_bind,
+        redirect_bind: redirect_bind.clone(),
     };
     let log = site_parsed.log.unwrap_or_default();
     let analytics = site_parsed.analytics.unwrap_or_default();
@@ -475,12 +491,19 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
     let errors = site_parsed.errors.unwrap_or_default();
     let security = site_parsed.security.unwrap_or_default();
 
-    // Validate TLS files exist
-    if !tls_cert_path.exists() {
-        anyhow::bail!("config error: tls_cert file not found: {}", tls_cert_path.display());
-    }
-    if !tls_key_path.exists() {
-        anyhow::bail!("config error: tls_key file not found: {}", tls_key_path.display());
+    // Validate TLS files exist.
+    //
+    // Skipped entirely in redirect mode: that process terminates no TLS, so
+    // requiring a certificate would mean every :80 redirector needed a copy of
+    // one -- and would fail to start on a node whose cert had expired, taking
+    // out the plain-HTTP redirect for a reason that has nothing to do with it.
+    if redirect_bind.is_none() {
+        if !tls_cert_path.exists() {
+            anyhow::bail!("config error: tls_cert file not found: {}", tls_cert_path.display());
+        }
+        if !tls_key_path.exists() {
+            anyhow::bail!("config error: tls_key file not found: {}", tls_key_path.display());
+        }
     }
 
     // Validate backends

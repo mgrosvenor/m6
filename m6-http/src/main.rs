@@ -2261,6 +2261,20 @@ fn run(args: Vec<String>) -> i32 {
     config::warn_system_config_extra_keys(&cli.system_config);
     config::warn_ignored_route_cache_keys(&config);
 
+    // Redirect mode: this process is the plain-HTTP :80 half of the pair, so
+    // it returns here and never builds QUIC, TLS, backends, the cache or the
+    // route table. Deliberately a separate process from the :443 instance
+    // rather than an extra listener inside it — a slow client on :80 then
+    // cannot stall TLS serving, because it is not sharing that event loop.
+    if let Some(ref bind) = config.server.redirect_bind {
+        info!(bind = %bind, node = %config.node.name, "starting in HTTP->HTTPS redirect mode");
+        if let Err(e) = m6_http_lib::redirect::run(bind) {
+            error!(error = %e, "redirect listener failed");
+            return 1;
+        }
+        return 0;
+    }
+
     // --dump-config
     if cli.dump_config {
         match serde_json::to_string_pretty(&config) {
