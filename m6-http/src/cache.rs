@@ -228,48 +228,116 @@ struct Directives {
     no_cache: bool,
 }
 
+/// A parsed `Cache-Control` field, combining every field line.
+///
+/// Replaces substring matching over one field line at a time, which was wrong
+/// in two ways that both mattered:
+///
+///   * `contains("public")` returned true for `public-cache-extension`, and
+///     any unknown extension token containing the word.
+///   * The old loop returned on the FIRST field line that mentioned something
+///     it recognised, so `Cache-Control: public` followed by a separate
+///     `Cache-Control: no-store` line stored the response. RFC 9110 5.2 says
+///     multiple field lines of a list-based field are equivalent to one
+///     comma-joined line, so a directive anywhere must be seen.
+///
+/// Commas inside a quoted value (`no-cache="Set-Cookie"`, a legal form) do not
+/// split a directive.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct CacheControl {
+    pub no_store: bool,
+    pub no_cache: bool,
+    pub private: bool,
+    pub public: bool,
+    pub must_revalidate: bool,
+    pub max_age: Option<u64>,
+    pub s_maxage: Option<u64>,
+    pub stale_while_revalidate: Option<u64>,
+}
+
+impl CacheControl {
+    /// Parse every `Cache-Control` field line in `headers` as one directive list.
+    pub fn parse(headers: &[(String, String)]) -> Self {
+        let mut cc = CacheControl::default();
+        for (name, value) in headers {
+            if !name.eq_ignore_ascii_case("cache-control") {
+                continue;
+            }
+            for (dname, dval) in split_directives(value) {
+                let secs = || dval.as_deref().and_then(|v| v.trim().parse::<u64>().ok());
+                match dname.as_str() {
+                    "no-store"               => cc.no_store = true,
+                    "no-cache"               => cc.no_cache = true,
+                    "private"                => cc.private = true,
+                    "public"                 => cc.public = true,
+                    "must-revalidate"        => cc.must_revalidate = true,
+                    "max-age"                => cc.max_age = secs(),
+                    "s-maxage"               => cc.s_maxage = secs(),
+                    "stale-while-revalidate" => cc.stale_while_revalidate = secs(),
+                    _ => {}
+                }
+            }
+        }
+        cc
+    }
+
+    /// Freshness lifetime for a SHARED cache. `s-maxage` wins over `max-age`,
+    /// which is exactly what it is for. `no-cache` means zero.
+    pub fn shared_lifetime(&self) -> Option<std::time::Duration> {
+        if self.no_cache {
+            return Some(std::time::Duration::ZERO);
+        }
+        self.s_maxage.or(self.max_age).map(std::time::Duration::from_secs)
+    }
+}
+
+/// Split one `Cache-Control` field value into `(lowercased-name, value)` pairs,
+/// respecting quoted-string values so a comma inside quotes does not split.
+fn split_directives(value: &str) -> Vec<(String, Option<String>)> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    let mut escaped = false;
+    for ch in value.chars() {
+        match ch {
+            '\\' if in_quotes && !escaped => { escaped = true; cur.push(ch); }
+            '"' if !escaped => { in_quotes = !in_quotes; cur.push(ch); }
+            ',' if !in_quotes => { push_directive(&mut out, &cur); cur.clear(); }
+            _ => { escaped = false; cur.push(ch); }
+        }
+    }
+    push_directive(&mut out, &cur);
+    out
+}
+
+fn push_directive(out: &mut Vec<(String, Option<String>)>, raw: &str) {
+    let t = raw.trim();
+    if t.is_empty() {
+        return;
+    }
+    match t.split_once('=') {
+        Some((n, v)) => {
+            let v = v.trim();
+            let v = v.strip_prefix('"').and_then(|r| r.strip_suffix('"')).unwrap_or(v);
+            out.push((n.trim().to_ascii_lowercase(), Some(v.to_string())));
+        }
+        None => out.push((t.to_ascii_lowercase(), None)),
+    }
+}
+
 /// Parse the directives this cache acts on out of a response's `Cache-Control`.
 ///
 /// `s-maxage` wins over `max-age` when both are present: this is a shared
 /// cache, and that is exactly what `s-maxage` is for.
 fn directives(headers: &[(String, String)]) -> Directives {
-    let none = Directives {
-        lifetime: None,
-        stale_while_revalidate: std::time::Duration::ZERO,
-        no_cache: false,
-    };
-    let Some((_, cc)) = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("cache-control")) else {
-        return none;
-    };
-    let cc = cc.to_ascii_lowercase();
-
-    // Each name is matched anchored at the start of its own comma-separated
-    // token (`strip_prefix` on a trimmed part), so `max-age` cannot match
-    // inside `s-maxage` and neither can match inside `stale-while-revalidate`.
-    let secs = |name: &str| -> Option<u64> {
-        cc.split(',').find_map(|part| {
-            part.trim()
-                .strip_prefix(name)
-                .and_then(|r| r.strip_prefix('='))
-                .and_then(|v| v.trim().parse::<u64>().ok())
-        })
-    };
-
-    let no_cache = cc.split(',').any(|d| d.trim() == "no-cache");
-    let lifetime = if no_cache {
-        Some(std::time::Duration::ZERO)
-    } else {
-        secs("s-maxage")
-            .or_else(|| secs("max-age"))
-            .map(std::time::Duration::from_secs)
-    };
-
+    let cc = CacheControl::parse(headers);
     Directives {
-        lifetime,
-        stale_while_revalidate: secs("stale-while-revalidate")
+        lifetime: cc.shared_lifetime(),
+        stale_while_revalidate: cc
+            .stale_while_revalidate
             .map(std::time::Duration::from_secs)
             .unwrap_or(std::time::Duration::ZERO),
-        no_cache,
+        no_cache: cc.no_cache,
     }
 }
 
@@ -458,7 +526,7 @@ impl Cache {
 /// Determine whether a response should be cached.
 /// Returns true if Cache-Control: public and status is 2xx.
 pub fn should_cache(status: u16, headers: &[(String, String)]) -> bool {
-    if status < 200 || status >= 300 {
+    if !status_is_storable(status) {
         return false;
     }
 
@@ -480,18 +548,47 @@ pub fn should_cache(status: u16, headers: &[(String, String)]) -> bool {
         }
     }
 
-    for (name, value) in headers {
-        if name.eq_ignore_ascii_case("cache-control") {
-            let v = value.to_lowercase();
-            if v.contains("no-store") || v.contains("private") {
-                return false;
-            }
-            if v.contains("public") {
-                return true;
-            }
-        }
+    // Directive precedence, evaluated over ALL field lines at once rather than
+    // returning on whichever line was seen first. `no-store` and `private`
+    // forbid storage in a shared cache no matter where they appear, so a
+    // response carrying `public` on one line and `no-store` on another is
+    // refused -- the old loop stored it.
+    let cc = CacheControl::parse(headers);
+    if cc.no_store || cc.private {
+        return false;
     }
-    false
+    cc.public
+}
+
+/// A 206 must never be stored by this cache.
+///
+/// `should_cache` used to admit every 2xx. A 206 is a *partial* representation
+/// described by its `Content-Range`, and this cache has no range awareness: no
+/// range component in the key, no way to combine partials, and no way to
+/// answer a later full GET from one. Storing it means a subsequent request for
+/// the whole resource can be served a fragment as though it were complete.
+///
+/// Split out from the status range so the reason is stated where the decision
+/// is made, rather than being implicit in an inequality.
+fn status_is_storable(status: u16) -> bool {
+    if status == 206 {
+        return false;
+    }
+    (200..300).contains(&status)
+}
+
+/// Whether the REQUEST permits this response to be stored.
+///
+/// RFC 9111 5.2.1.5: a request carrying `Cache-Control: no-store` must not
+/// have its response written to cache. This was ignored entirely -- request
+/// directives were never parsed at all, so a client explicitly asking for its
+/// exchange not to be retained had that request stored and replayed to others.
+///
+/// Deliberately only `no-store`. `no-cache` on a *request* means "revalidate
+/// before reuse", not "do not store", and treating the two alike would throw
+/// away hit rate for no correctness gain.
+pub fn request_permits_storage(req_headers: &[(String, String)]) -> bool {
+    !CacheControl::parse(req_headers).no_store
 }
 
 /// Headers safe to store in a shared cache entry, with `Set-Cookie` removed.

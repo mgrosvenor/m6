@@ -723,6 +723,16 @@ fn diagnostic_show_actual_responses() {
          b"GET /public/open.txt HTTP/1.1\r\nHost: \r\nConnection: close\r\n\r\n".to_vec()),
         ("CONNECT",
          b"CONNECT localhost:443 HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec()),
+        ("Host absent (1.1)",
+         b"GET /public/open.txt HTTP/1.1\r\nConnection: close\r\n\r\n".to_vec()),
+        ("Host empty (1.1)",
+         b"GET /public/open.txt HTTP/1.1\r\nHost: \r\nConnection: close\r\n\r\n".to_vec()),
+        ("Host duplicated",
+         b"GET /public/open.txt HTTP/1.1\r\nHost: localhost\r\nHost: evil.example.com\r\nConnection: close\r\n\r\n".to_vec()),
+        ("Host absent (1.0)",
+         b"GET /public/open.txt HTTP/1.0\r\nConnection: close\r\n\r\n".to_vec()),
+        ("bare LF in value (fixed)",
+         b"GET /public/open.txt HTTP/1.1\r\nHost: localhost\r\nX-T: a\nX-Injected: yes\r\nConnection: close\r\n\r\n".to_vec()),
     ];
     println!("\n  {:<26} {:>6}  {}", "case", "bytes", "first line");
     for (name, req) in cases {
@@ -730,4 +740,69 @@ fn diagnostic_show_actual_responses() {
         let first = head_of(&resp).lines().next().unwrap_or("<empty>").to_string();
         println!("  {:<26} {:>6}  {}", name, resp.len(), first);
     }
+}
+
+// ── 6. Host header validation (RFC 9112 3.2) ──────────────────────────────────
+
+/// HTTP/1.1 requires exactly one `Host` with a usable value (RFC 9112 3.2):
+/// a server MUST answer 400 to a request that lacks one, carries more than
+/// one, or carries an invalid value. All three used to return 200.
+///
+/// More than one is the case with teeth: two hops can pick different Host
+/// values and disagree about which site, or which origin, the request is for.
+#[test]
+fn http11_requires_exactly_one_usable_host() {
+    let s = start_server();
+    let cases: [(&str, &[u8]); 4] = [
+        ("absent",     b"GET /public/open.txt HTTP/1.1\r\nConnection: close\r\n\r\n"),
+        ("empty",      b"GET /public/open.txt HTTP/1.1\r\nHost: \r\nConnection: close\r\n\r\n"),
+        ("whitespace", b"GET /public/open.txt HTTP/1.1\r\nHost:    \t \r\nConnection: close\r\n\r\n"),
+        ("duplicated", b"GET /public/open.txt HTTP/1.1\r\nHost: localhost\r\nHost: evil.example.com\r\nConnection: close\r\n\r\n"),
+    ];
+    for (name, req) in cases {
+        let resp = s.raw(req);
+        let head = head_of(&resp);
+        assert!(
+            resp.is_empty() || head.starts_with("HTTP/1.1 400"),
+            "Host {name}: expected 400, got:\n{head}"
+        );
+        assert_no_injected_header(&resp, "evil.example.com");
+        s.assert_still_healthy(name);
+    }
+}
+
+/// HTTP/1.0 predates `Host` and is permitted to omit it. Rejecting a 1.0
+/// request for a missing Host would break a client that is behaving
+/// correctly, so the rule above is gated on the version -- and that gate is
+/// worth a test of its own, because it is the part most likely to be
+/// "simplified" away later.
+#[test]
+fn http10_without_host_is_still_served() {
+    let s = start_server();
+    let resp = s.raw(b"GET /public/open.txt HTTP/1.0\r\nConnection: close\r\n\r\n");
+    let head = head_of(&resp);
+    assert!(
+        head.starts_with("HTTP/1.1 200"),
+        "HTTP/1.0 without Host must still be served, got:\n{head}"
+    );
+    s.assert_still_healthy("http/1.0 without host");
+}
+
+/// Two `Host` headers that disagree must not both be honoured. Asserted
+/// separately from the characterisation above because this one is a real
+/// requirement rather than a recorded observation.
+#[test]
+fn conflicting_host_headers_are_not_both_honoured() {
+    let s = start_server();
+    let resp = s.raw(
+        b"GET /public/open.txt HTTP/1.1\r\nHost: localhost\r\nHost: evil.example.com\r\n\
+          Connection: close\r\n\r\n",
+    );
+    assert_concluded(&resp, "duplicate host");
+    let head = head_of(&resp);
+    assert!(
+        !head.to_ascii_lowercase().contains("evil.example.com"),
+        "the forged second Host reached the response head:\n{head}"
+    );
+    s.assert_still_healthy("duplicate host");
 }

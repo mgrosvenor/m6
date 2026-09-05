@@ -578,11 +578,32 @@ impl FrameworkState {
         dict.insert("query".to_string(), Value::Object(query_map));
 
         // 6. POST form fields.
+        //
+        // Only `application/x-www-form-urlencoded` is decoded. Anything else --
+        // notably `multipart/form-data` -- yields NO fields.
+        //
+        // That silence cost real debugging time. A client switched to sending
+        // multipart (a `fetch` with a `FormData` body does this by default) and
+        // every field arrived empty. Downstream that looked like a failed
+        // CAPTCHA rather than an unparsed body, and there was nothing in any
+        // log to say the body had been skipped. Warn loudly instead: an empty
+        // dict on a POST that plainly carried a body is a bug somewhere, and
+        // the content type names it.
         if raw.method() == "POST" {
-            if let Some(ct) = raw.content_type() {
-                if ct.contains("application/x-www-form-urlencoded") {
+            match raw.content_type() {
+                Some(ct) if ct.contains("application/x-www-form-urlencoded") => {
                     for (k, v) in parse_form_body(&raw.body) {
                         dict.insert(k, Value::String(v));
+                    }
+                }
+                other => {
+                    if !raw.body.is_empty() {
+                        warn!(
+                            content_type = other.unwrap_or("<none>"),
+                            body_len = raw.body.len(),
+                            "POST body not decoded: only application/x-www-form-urlencoded \
+                             is supported, so no form fields are available to the handler"
+                        );
                     }
                 }
             }

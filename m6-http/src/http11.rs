@@ -553,6 +553,8 @@ pub fn parse_request(buf: &[u8]) -> ParseResult {
     // winner and hope the backend picks the same one.
     let mut first_cl: Option<&str> = None;
     let mut saw_cl = false;
+    let mut host_count = 0usize;
+    let mut host_empty = false;
     let mut fwd_headers: Vec<(String, String)> = Vec::with_capacity(nheaders);
 
     for h in &req.headers[..nheaders] {
@@ -575,6 +577,13 @@ pub fn parse_request(buf: &[u8]) -> ParseResult {
             saw_cl = true;
         }
 
+        if h.name.eq_ignore_ascii_case("host") {
+            host_count += 1;
+            host_empty = std::str::from_utf8(h.value)
+                .map(|v| v.trim().is_empty())
+                .unwrap_or(true);
+        }
+
         // Strip proxy-owned headers on ingress — see
         // `forward::UNTRUSTED_INBOUND`.
         if crate::forward::is_untrusted_inbound(h.name) {
@@ -585,6 +594,31 @@ pub fn parse_request(buf: &[u8]) -> ParseResult {
         // handled above, where it is a framing error.
         let Ok(v) = std::str::from_utf8(h.value) else { continue };
         fwd_headers.push((h.name.to_string(), v.to_string()));
+    }
+
+    // Host validation, RFC 9112 3.2: a server MUST answer 400 to an HTTP/1.1
+    // request that lacks a Host, carries more than one, or carries an invalid
+    // value. All three returned 200 before this.
+    //
+    // More than one is the one with teeth: two hops can pick different Host
+    // values and disagree about which site — or which origin — a request is
+    // for. Rejected regardless of version for that reason.
+    //
+    // The version gate matters. HTTP/1.0 predates Host and is allowed to omit
+    // it, so rejecting a 1.0 request for that would break clients that are
+    // behaving correctly. httparse reports `version` as the minor number, so
+    // 1 means HTTP/1.1.
+    //
+    // Note the H2C and HTTP/2 paths do not come through here (they build their
+    // request in http2.rs, where `:authority` is already translated to Host),
+    // and the synthetic refresh request is constructed directly rather than
+    // parsed — so neither is affected by this.
+    if host_count > 1 {
+        return ParseResult::Error;
+    }
+    let is_http11 = req.version == Some(1);
+    if is_http11 && (host_count == 0 || host_empty) {
+        return ParseResult::Error;
     }
 
     let content_length: usize = match first_cl {
