@@ -75,6 +75,26 @@ fn spawn_server(id: &str) -> (ProcessGuard, PathBuf) {
         socket_path
     );
 
+    // The socket FILE existing is not the same as the server accepting on it.
+    //
+    // Under a full workspace run the connect raced the listen backlog:
+    // `http_request` returns an empty string on any I/O error (its comment says
+    // "so callers can retry rather than panic" -- but no caller retries), so a
+    // test asserting `resp.contains("200 OK")` failed against `""`. It passed
+    // in isolation every time, which is what made it look like noise.
+    //
+    // Poll with a real request until the server actually answers.
+    let mut ready = false;
+    for _ in 0..200 {
+        let probe = http_request(&socket_path, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        if !probe.is_empty() {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(ready, "server at {:?} never answered a request", socket_path);
+
     (ProcessGuard(child), socket_path)
 }
 

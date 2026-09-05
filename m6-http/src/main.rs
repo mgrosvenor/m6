@@ -1458,9 +1458,10 @@ fn handle_request(
 ) -> RequestOutcome {
     let describedby = state.config.site.describedby.clone();
     let mut outcome = handle_request_inner(req, client_ip, content_encoding, state, is_prefetch);
-    if let RequestOutcome::Ready(_, ref mut headers, _, _, _) = outcome {
+    if let RequestOutcome::Ready(status, ref mut headers, _, _, _) = outcome {
         set_vary_accept_encoding(headers);
         set_describedby_link(headers, &describedby);
+        invalidate_after_unsafe_method(state, req, status, headers);
     }
     outcome
 }
@@ -2144,6 +2145,65 @@ fn set_vary_accept_encoding(headers: &mut Vec<(String, String)>) {
 ///
 /// Matched case-sensitively: HTTP methods are case-sensitive tokens, so `get`
 /// is not GET and should not be dignified with a 405.
+/// Invalidate cached entries for a URI after a state-changing request
+/// succeeds (RFC 9111 4.4, MUST).
+///
+/// A successful POST/PUT/DELETE means the stored representation of that URI is
+/// now wrong, and nothing invalidated it: the cache kept serving the old copy
+/// until it expired on its own. For this site that is a live concern the
+/// moment the CMS returns — edit a page, and the edge keeps serving the
+/// previous one.
+///
+/// "Non-error status" is the RFC's condition: a 4xx/5xx means the state change
+/// did not happen, so the cached copy is still correct and must be left alone.
+/// Invalidating on failure would hand an attacker a trivial way to flush the
+/// cache by spamming failing POSTs.
+///
+/// `Location` and `Content-Location` are invalidated too, but only when they
+/// point at this same origin — an off-site redirect target is not ours to
+/// evict, and following it blindly would let a backend clear arbitrary entries.
+fn invalidate_after_unsafe_method(
+    state: &ServerState,
+    req: &forward::HttpRequest,
+    status: u16,
+    headers: &[(String, String)],
+) {
+    // RFC 9110 9.2.1 safe methods change nothing, so there is nothing to
+    // invalidate. Everything else is state-changing as far as a cache is
+    // concerned, including methods this server does not itself implement.
+    if matches!(req.method.as_str(), "GET" | "HEAD" | "OPTIONS" | "TRACE") {
+        return;
+    }
+    if status >= 400 {
+        return;
+    }
+    state.cache.evict_path(&req.path);
+
+    for name in ["location", "content-location"] {
+        if let Some((_, v)) = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)) {
+            // Same-origin only. A bare path is ours by definition; an absolute
+            // URL is ours only if its authority matches the configured domain.
+            let path = if v.starts_with('/') {
+                Some(v.as_str())
+            } else {
+                v.split_once("://")
+                    .map(|(_, rest)| rest)
+                    .and_then(|rest| rest.split_once('/').map(|(host, p)| (host, p)))
+                    .filter(|(host, _)| {
+                        let host = host.split(':').next().unwrap_or(host);
+                        host == state.config.site.domain
+                            || host == format!("www.{}", state.config.site.domain)
+                    })
+                    .map(|(_, p)| p)
+            };
+            if let Some(p) = path {
+                let p = if p.starts_with('/') { p.to_string() } else { format!("/{p}") };
+                state.cache.evict_path(&p);
+            }
+        }
+    }
+}
+
 /// Emit `Age` on a response served from cache (RFC 9111 5.1, MUST).
 ///
 /// Nothing emitted it at all, so a downstream cache had no way to tell how old
@@ -2217,6 +2277,7 @@ fn finalize_url_response(
     let mut r = finalize_url_response_inner(http_result, ctx, quic_port, state);
     set_vary_accept_encoding(&mut r.1);
     set_describedby_link(&mut r.1, &describedby);
+    invalidate_after_unsafe_method(state, &ctx.req, r.0, &r.1);
     r
 }
 
