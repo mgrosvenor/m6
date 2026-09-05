@@ -54,10 +54,20 @@ const DEFAULT_WINDOW:       u32 = 65_535;
 const DEFAULT_MAX_FRAME:    u32 = 16_384;
 const MAX_CONCURRENT:       u32 = 100;
 
+/// Hard ceiling on a single buffered HTTP/2 request body.
+///
+/// Not an RFC requirement -- a robustness one. Request bodies were accumulated
+/// with no bound while flow-control credit was handed straight back, so a peer
+/// could stream indefinitely and grow the process until it was killed. Any cap
+/// removes that; this one is above the 16 MiB multipart limit the renderers
+/// already enforce, so it never trips before their own check does.
+const MAX_H2_BODY: usize = 20 * 1024 * 1024;
+
 const ERR_NO_ERROR:       u32 = 0x0;
 const ERR_PROTOCOL_ERROR: u32 = 0x1;
 const ERR_STREAM_CLOSED:  u32 = 0x5;
 const ERR_REFUSED_STREAM: u32 = 0x7;
+const ERR_FRAME_SIZE:     u32 = 0x6;
 
 // ── Stream state ──────────────────────────────────────────────────────────────
 
@@ -70,6 +80,11 @@ struct H2Stream {
     body:         Vec<u8>,
     headers_done: bool,
     send_window:  i32,
+    /// Per-stream RECEIVE window. RFC 9113 5.2 requires flow control to be
+    /// tracked per stream as well as per connection; only the connection
+    /// window existed, so one stream could consume the whole connection's
+    /// credit and no stream-level limit applied at all.
+    recv_window:  i32,
     // Buffered response body for flow-controlled delivery.
     // None  = request not yet dispatched.
     // Some  = response queued; resp_sent bytes already flushed.
@@ -87,6 +102,7 @@ impl H2Stream {
             body: Vec::new(),
             headers_done: false,
             send_window: initial_send_window,
+            recv_window: DEFAULT_WINDOW as i32,
             resp_body: None,
             resp_sent: 0,
             pending_rx: None,
@@ -442,15 +458,49 @@ impl Http2Conn {
         }
         self.last_stream_id = self.last_stream_id.max(stream_id);
 
-        let mut pos = 0;
+        // Flag-dependent prefixes, bounds-checked BEFORE slicing.
+        //
+        // `pos += 5; &payload[pos..]` used to run unguarded, so a HEADERS frame
+        // with PRIORITY set and a payload shorter than five bytes panicked on
+        // an out-of-range slice. That is a remotely reachable panic from a
+        // three-byte frame -- no handshake beyond the preface required.
+        // RFC 9113 6.2 says a HEADERS frame shorter than the fields its flags
+        // declare is a FRAME_SIZE_ERROR, so that is what it now is.
+        //
+        // Padding is also stripped from the END. It never was: the pad bytes
+        // were left on the header block and handed to the HPACK decoder as
+        // though they were field data.
+        let mut pos = 0usize;
+        let mut pad = 0usize;
         if flags & FLAG_PADDED != 0 {
-            if payload.is_empty() { return Err("HEADERS: missing pad length"); }
-            let pad = payload[0] as usize;
+            if payload.is_empty() {
+                return Err("HEADERS: PADDED set but no pad-length byte");
+            }
+            pad = payload[0] as usize;
             pos = 1;
-            if pad >= payload.len() - pos { return Err("HEADERS: excess padding"); }
         }
-        if flags & FLAG_PRIORITY != 0 { pos += 5; }
-        let header_block = &payload[pos..];
+        if flags & FLAG_PRIORITY != 0 {
+            // 4-byte stream dependency (with the E bit) + 1-byte weight.
+            if payload.len() < pos + 5 {
+                self.push_frame(TYPE_RST_STREAM, 0, stream_id, &ERR_FRAME_SIZE.to_be_bytes());
+                return Err("HEADERS: PRIORITY set but payload shorter than the priority fields");
+            }
+            // RFC 9113 5.3.1: a stream cannot depend on itself.
+            let dep = u32::from_be_bytes([
+                payload[pos] & 0x7f, payload[pos + 1], payload[pos + 2], payload[pos + 3],
+            ]);
+            if dep == stream_id {
+                self.push_frame(TYPE_RST_STREAM, 0, stream_id, &ERR_PROTOCOL_ERROR.to_be_bytes());
+                return Ok(());
+            }
+            pos += 5;
+        }
+        // Padding must fit in what is left after the prefixes, and the header
+        // block is what sits between them.
+        if pos + pad > payload.len() {
+            return Err("HEADERS: padding exceeds payload");
+        }
+        let header_block = &payload[pos..payload.len() - pad];
 
         let stream = self.streams.entry(stream_id)
             .or_insert_with(|| H2Stream::new(self.peer_initial_window));
@@ -508,34 +558,71 @@ impl Http2Conn {
         F: FnMut(&HttpRequest, &str) -> RequestOutcome,
     {
         if stream_id == 0 { return Err("DATA on stream 0"); }
-        let data = if flags & FLAG_PADDED != 0 && !payload.is_empty() {
+
+        // PADDED with an empty payload has nowhere to put the pad-length byte.
+        // This used to fall through and treat the frame as unpadded.
+        if flags & FLAG_PADDED != 0 && payload.is_empty() {
+            return Err("DATA: PADDED set but no pad-length byte");
+        }
+        let data = if flags & FLAG_PADDED != 0 {
             let pad = payload[0] as usize;
             if pad >= payload.len() { return Err("DATA: excess padding"); }
             &payload[1..payload.len() - pad]
         } else {
             payload
         };
-        let data_len = data.len() as i32;
 
-        self.conn_recv_window -= data_len;
+        // RFC 9113 6.9.1: the ENTIRE payload counts against flow control,
+        // padding and pad-length byte included -- not just the data. Charging
+        // only `data.len()` let a peer reclaim credit it never spent by padding
+        // heavily, so the two windows drifted apart from the peer's view.
+        let charged = payload.len() as i32;
+        let data_len = data.len();
+
+        self.conn_recv_window -= charged;
         if self.conn_recv_window < 0 { return Err("connection flow control exceeded"); }
         if self.conn_recv_window < DEFAULT_WINDOW as i32 / 2 {
             let inc = DEFAULT_WINDOW as i32 - self.conn_recv_window;
             self.conn_recv_window += inc;
-            self.push_window_update(0, inc as u32);
+            // An increment of 0 is itself a PROTOCOL_ERROR (RFC 9113 6.9), so
+            // never emit one -- an empty DATA frame used to produce exactly
+            // that.
+            if inc > 0 {
+                self.push_window_update(0, inc as u32);
+            }
         }
 
-        // Update stream state, then drop borrow before calling push_window_update / maybe_dispatch.
+        // Per-stream accounting, and the body cap.
+        let mut stream_inc = 0i32;
+        let mut over_cap = false;
         let should_dispatch = if let Some(s) = self.streams.get_mut(&stream_id) {
-            s.body.extend_from_slice(data);
-            if flags & FLAG_END_STREAM != 0 {
-                s.state = StreamState::HalfClosedRemote;
+            s.recv_window -= charged;
+            if s.recv_window < 0 { return Err("stream flow control exceeded"); }
+            if s.body.len() + data_len > MAX_H2_BODY {
+                over_cap = true;
+                false
+            } else {
+                s.body.extend_from_slice(data);
+                if flags & FLAG_END_STREAM != 0 {
+                    s.state = StreamState::HalfClosedRemote;
+                }
+                if s.recv_window < DEFAULT_WINDOW as i32 / 2 {
+                    stream_inc = DEFAULT_WINDOW as i32 - s.recv_window;
+                    s.recv_window += stream_inc;
+                }
+                flags & FLAG_END_STREAM != 0 && s.headers_done
             }
-            flags & FLAG_END_STREAM != 0 && s.headers_done
         } else {
             false
         };
-        self.push_window_update(stream_id, data_len as u32);
+        if over_cap {
+            self.streams.remove(&stream_id);
+            self.push_frame(TYPE_RST_STREAM, 0, stream_id, &ERR_PROTOCOL_ERROR.to_be_bytes());
+            return Ok(());
+        }
+        if stream_inc > 0 {
+            self.push_window_update(stream_id, stream_inc as u32);
+        }
 
         if should_dispatch {
             self.maybe_dispatch(stream_id, on_request, client_ip);
@@ -1020,5 +1107,143 @@ mod authority_tests {
         assert!(!req.headers.iter().any(|(k, _)| k.starts_with(':')), "{:?}", req.headers);
         assert_eq!(req.path, "/x");
         assert_eq!(req.query.as_deref(), Some("a=1"));
+    }
+}
+
+#[cfg(test)]
+mod frame_validation_tests {
+    use super::*;
+
+    /// Feed raw frames into a connection that is already past the preface, and
+    /// return the result of draining them.
+    ///
+    /// `process_frame` is private, which is the point: these test the parser at
+    /// the boundary a remote peer actually reaches, without a socket.
+    fn feed(frames: &[u8]) -> Result<(), &'static str> {
+        let mut c = Http2Conn::new();
+        c.phase = Phase::Active;
+        c.recv_buf.extend_from_slice(frames);
+        let mut on_request = |_: &HttpRequest, _: &str| -> RequestOutcome {
+            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string(),
+                                  std::sync::Arc::new(vec![]))
+        };
+        loop {
+            match c.process_frame(&mut on_request, "127.0.0.1") {
+                Ok(true) => continue,
+                Ok(false) => return Ok(()),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    fn frame(ftype: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        let len = payload.len();
+        v.push((len >> 16) as u8);
+        v.push((len >> 8) as u8);
+        v.push(len as u8);
+        v.push(ftype);
+        v.push(flags);
+        v.extend_from_slice(&(stream_id & 0x7fff_ffff).to_be_bytes());
+        v.extend_from_slice(payload);
+        v
+    }
+
+    /// The panic. A HEADERS frame declaring PRIORITY but carrying fewer than
+    /// the five bytes the priority fields require used to run
+    /// `&payload[pos..]` with `pos` past the end and abort the process.
+    ///
+    /// Reachable from a three-byte frame immediately after the preface, with no
+    /// other setup. Must be an error, never a panic.
+    #[test]
+    fn short_priority_headers_frame_does_not_panic() {
+        for short in 0..5usize {
+            let payload = vec![0u8; short];
+            let f = frame(TYPE_HEADERS, FLAG_PRIORITY, 1, &payload);
+            let r = feed(&f);
+            assert!(r.is_err(), "a {short}-byte PRIORITY HEADERS payload should be rejected");
+        }
+    }
+
+    /// Same shape with PADDED as well: the prefixes are 1 + 5 bytes.
+    #[test]
+    fn short_padded_priority_headers_frame_does_not_panic() {
+        for short in 0..6usize {
+            let payload = vec![0u8; short];
+            let f = frame(TYPE_HEADERS, FLAG_PADDED | FLAG_PRIORITY, 1, &payload);
+            let _ = feed(&f); // must not panic; either error or clean handling
+        }
+    }
+
+    /// RFC 9113 5.3.1: a stream cannot depend on itself.
+    #[test]
+    fn headers_priority_self_dependency_is_rejected() {
+        // 4-byte dependency == this stream id, then a weight byte.
+        let mut payload = 1u32.to_be_bytes().to_vec();
+        payload.push(0);
+        let f = frame(TYPE_HEADERS, FLAG_PRIORITY, 1, &payload);
+        // Handled as a stream error (RST_STREAM), not a connection error.
+        assert!(feed(&f).is_ok());
+    }
+
+    /// PADDED with an empty payload has nowhere to put the pad-length byte.
+    /// This used to be silently treated as an unpadded frame.
+    #[test]
+    fn padded_data_with_empty_payload_is_rejected() {
+        let f = frame(TYPE_DATA, FLAG_PADDED, 1, &[]);
+        assert!(feed(&f).is_err());
+    }
+
+    #[test]
+    fn data_with_excess_padding_is_rejected() {
+        // pad length 200 in a 4-byte payload.
+        let f = frame(TYPE_DATA, FLAG_PADDED, 1, &[200, 1, 2, 3]);
+        assert!(feed(&f).is_err());
+    }
+
+    /// An empty DATA frame used to make the server emit WINDOW_UPDATE with an
+    /// increment of zero, which is itself a PROTOCOL_ERROR (RFC 9113 6.9).
+    #[test]
+    fn empty_data_never_emits_a_zero_window_update() {
+        let mut c = Http2Conn::new();
+        c.phase = Phase::Active;
+        c.recv_buf.extend_from_slice(&frame(TYPE_DATA, 0, 1, &[]));
+        let mut on_request = |_: &HttpRequest, _: &str| -> RequestOutcome {
+            RequestOutcome::Ready(200, vec![], vec![], "t".to_string(), std::sync::Arc::new(vec![]))
+        };
+        let _ = c.process_frame(&mut on_request, "127.0.0.1");
+
+        // Walk the outgoing buffer for WINDOW_UPDATE frames and check each
+        // increment. A zero increment would be a protocol error we caused.
+        let buf = &c.send_buf;
+        let mut i = 0usize;
+        while i + FRAME_HDR <= buf.len() {
+            let len = ((buf[i] as usize) << 16) | ((buf[i + 1] as usize) << 8) | buf[i + 2] as usize;
+            let ftype = buf[i + 3];
+            let body = &buf[i + FRAME_HDR..(i + FRAME_HDR + len).min(buf.len())];
+            if ftype == TYPE_WINDOW_UPDATE && body.len() == 4 {
+                let inc = u32::from_be_bytes([body[0], body[1], body[2], body[3]]) & 0x7fff_ffff;
+                assert!(inc > 0, "emitted WINDOW_UPDATE with increment 0");
+            }
+            i += FRAME_HDR + len;
+        }
+    }
+
+    /// Garbage frames of every type and a spread of lengths must never panic.
+    /// This is the property that matters most here: a remote peer controls
+    /// every byte, so any panic is a remote kill.
+    #[test]
+    fn no_frame_shape_panics() {
+        for ftype in 0u8..=12 {
+            for flags in [0u8, 0x1, 0x4, 0x8, 0x20, 0x24, 0x28, 0xff] {
+                for len in [0usize, 1, 2, 3, 4, 5, 6, 7, 8, 9, 17] {
+                    let payload = vec![0xABu8; len];
+                    for sid in [0u32, 1, 2, 0x7fff_ffff] {
+                        let f = frame(ftype, flags, sid, &payload);
+                        let _ = feed(&f); // only requirement: it returns
+                    }
+                }
+            }
+        }
     }
 }
