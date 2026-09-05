@@ -140,7 +140,16 @@ impl Borrow<str> for CacheKey {
 /// requirement alone and nothing anywhere inspected the method: every verb
 /// including TRACE and invented ones like FOO was served the cached page.
 pub fn method_may_read_cache(method: &str) -> bool {
-    method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD")
+    // Case-SENSITIVE. RFC 9110 9.1: the method token is case-sensitive, so
+    // `get` is not GET.
+    //
+    // These were `eq_ignore_ascii_case`, and that disagreed with the
+    // configured allow-list, which compares exactly. The cache lookup runs
+    // BEFORE the method gate, so a request with method `get` matched here,
+    // was served from cache, and never reached the check that would have
+    // refused it -- the gate was bypassed entirely by changing the case.
+    // Two comparisons of the same thing must not disagree.
+    method == "GET" || method == "HEAD"
 }
 
 /// Whether a response to this method may be **stored in** the cache.
@@ -154,7 +163,8 @@ pub fn method_may_read_cache(method: &str) -> bool {
 /// the key a subsequent GET reads, turning a protocol violation into silent
 /// content loss. The two changes belong in the same commit.
 pub fn method_may_write_cache(method: &str) -> bool {
-    method.eq_ignore_ascii_case("GET")
+    // Case-sensitive, for the same reason as `method_may_read_cache`.
+    method == "GET"
 }
 
 /// Build a zero-allocation lookup key into a caller-supplied stack buffer.
@@ -1142,8 +1152,13 @@ mod method_gate_tests {
 
     #[test]
     fn only_get_and_head_may_read() {
-        for m in ["GET", "HEAD", "get", "head"] {
+        for m in ["GET", "HEAD"] {
             assert!(method_may_read_cache(m), "{m} should be able to read cache");
+        }
+        // Case-sensitive: `get` is a different (unregistered) method, and must
+        // not slip past the method gate by reaching the cache first.
+        for m in ["get", "head", "Get", "Head"] {
+            assert!(!method_may_read_cache(m), "{m} must not be treated as GET/HEAD");
         }
         // Every verb below was served the cached page before this gate existed,
         // including TRACE and an entirely invented method.
@@ -1158,7 +1173,7 @@ mod method_gate_tests {
     #[test]
     fn only_get_may_write() {
         assert!(method_may_write_cache("GET"));
-        assert!(method_may_write_cache("get"));
+        assert!(!method_may_write_cache("get"), "case-sensitive: `get` is not GET");
         for m in ["HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "TRACE", "FOO", ""] {
             assert!(!method_may_write_cache(m), "{m} must not write cache");
         }

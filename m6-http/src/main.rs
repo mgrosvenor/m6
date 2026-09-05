@@ -915,6 +915,26 @@ fn process_h3(qconn: &mut QuicConn, _udp: &UdpSocket, state: &mut ServerState, q
                         Ok(0) => break,
                         Ok(read) => {
                             if let Some(req) = qconn.pending.get_mut(&stream_id) {
+                                // Bounded, for the same reason the h2 path is:
+                                // bodies accumulated with no ceiling while the
+                                // transport kept granting credit, so a peer
+                                // could stream indefinitely and grow the
+                                // process until it was killed. Same limit as
+                                // h2 so the two protocols cannot disagree
+                                // about what is acceptable.
+                                if req.body.len() + read > MAX_H3_BODY {
+                                    warn!(
+                                        stream_id,
+                                        limit = MAX_H3_BODY,
+                                        "h3 request body exceeded the limit; resetting stream"
+                                    );
+                                    let _ = h3.send_response(
+                                        &mut qconn.conn, stream_id,
+                                        &[quiche::h3::Header::new(b":status", b"413")], true,
+                                    );
+                                    qconn.pending.remove(&stream_id);
+                                    break;
+                                }
                                 req.body.extend_from_slice(&buf[..read]);
                             }
                         }
@@ -1471,19 +1491,36 @@ fn handle_request_inner(
     // The cache is already closed to these verbs at every lookup site (see
     // `cache::method_may_read_cache`); this closes the backend to them too.
     if !state.config.server.allowed_methods.iter().any(|m| m == req.method.as_str()) {
-        let allow = state.config.server.allowed_methods.join(", ");
-        let headers = vec![
-            ("Allow".to_string(), allow),
+        // 405 and 501 are not interchangeable, and this returned 405 for both.
+        //
+        // RFC 9110 15.5.6: 405 means the method is KNOWN to the server but not
+        // supported by the target resource -- and it MUST carry `Allow`.
+        // RFC 9110 15.6.2: 501 is for a method the server does not recognise
+        // and could not support for any resource.
+        //
+        // Answering 405 to an invented verb claims to know it, and tells the
+        // client the resource is the problem when the method is. It also makes
+        // the response indistinguishable from a real method being disallowed,
+        // which is exactly the distinction a client uses to decide whether
+        // retrying elsewhere is worth it.
+        let known = is_registered_method(&req.method);
+        let status = if known { 405 } else { 501 };
+        let mut headers = vec![
             ("Content-Type".to_string(), "text/plain; charset=utf-8".to_string()),
             ("Cache-Control".to_string(), "no-store".to_string()),
         ];
+        // Required on 405. Included on 501 too: not mandated there, but it is
+        // the one useful thing we can tell a caller whose method we do not
+        // implement.
+        headers.push(("Allow".to_string(), state.config.server.allowed_methods.join(", ")));
         if analytics_enabled {
-            debug!(path = %req.path, method = %req.method, "method not allowed");
+            debug!(path = %req.path, method = %req.method, status, known, "method refused");
         }
+        let body: &[u8] = if known { b"Method Not Allowed" } else { b"Not Implemented" };
         return RequestOutcome::Ready(
-            405,
+            status,
             headers,
-            b"Method Not Allowed".to_vec(),
+            body.to_vec(),
             "method-check".to_string(),
             std::sync::Arc::new(vec![]),
         );
@@ -2091,6 +2128,28 @@ fn set_vary_accept_encoding(headers: &mut Vec<(String, String)>) {
     }
     headers.retain(|(k, _)| !k.eq_ignore_ascii_case("vary"));
     headers.push(("vary".to_string(), fields.join(", ")));
+}
+
+/// Whether this is a method the HTTP standards define, as opposed to one this
+/// server has simply not been configured to allow.
+///
+/// The distinction decides 405 vs 501 (RFC 9110 15.5.6 and 15.6.2). The list is
+/// the RFC 9110 methods plus PATCH (RFC 5789), which is registered and in wide
+/// use. Anything outside it -- `FOO`, a typo, a probe -- is a method this
+/// server genuinely does not implement, and saying so is more honest than
+/// implying the resource merely disallows it.
+///
+/// Matched case-sensitively: HTTP methods are case-sensitive tokens, so `get`
+/// is not GET and should not be dignified with a 405.
+/// Ceiling on a buffered HTTP/3 request body. Mirrors the HTTP/2 limit so the
+/// two protocols cannot disagree about what is acceptable to accept.
+const MAX_H3_BODY: usize = 20 * 1024 * 1024;
+
+fn is_registered_method(method: &str) -> bool {
+    matches!(
+        method,
+        "GET" | "HEAD" | "POST" | "PUT" | "DELETE" | "CONNECT" | "OPTIONS" | "TRACE" | "PATCH"
+    )
 }
 
 /// Advertise the site's machine-readable description on every HTML response:
@@ -3146,5 +3205,38 @@ mod describedby_tests {
         assert!(l.iter().any(|v| v.contains("style.css")));
         assert!(l.iter().any(|v| v.contains("m.woff2")));
         assert_eq!(l.iter().filter(|v| v.contains("describedby")).count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod method_status_tests {
+    use super::is_registered_method;
+
+    /// RFC 9110 15.5.6 vs 15.6.2. 405 says "I know this method, this resource
+    /// will not do it"; 501 says "I do not implement this method at all".
+    /// Returning 405 for an invented verb claims knowledge the server does not
+    /// have, and points the client at the resource when the method is the
+    /// problem.
+    #[test]
+    fn standard_methods_are_recognised() {
+        for m in ["GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH"] {
+            assert!(is_registered_method(m), "{m} is a registered method");
+        }
+    }
+
+    #[test]
+    fn invented_methods_are_not_recognised() {
+        for m in ["FOO", "BREW", "GETT", "", "GET ", "PROPFIND", "gEt"] {
+            assert!(!is_registered_method(m), "{m} should not be treated as registered");
+        }
+    }
+
+    /// HTTP methods are case-sensitive tokens, so a lowercase `get` is not GET
+    /// and should get 501 rather than being dignified with a 405.
+    #[test]
+    fn method_matching_is_case_sensitive() {
+        assert!(is_registered_method("GET"));
+        assert!(!is_registered_method("get"));
+        assert!(!is_registered_method("Get"));
     }
 }
