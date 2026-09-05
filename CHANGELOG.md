@@ -11,6 +11,59 @@ Deploy order is fixed: **test locally, commit, then deploy.** Never the reverse.
 
 ---
 
+## 2026-09-06 — Bounded heuristic freshness, and unsafe-method invalidation
+
+### `Cache-Control: public` no longer means fresh forever (F048)
+
+A response with no explicit lifetime stored with `expires_at = None` and stayed
+fresh indefinitely. That was the deliberate CDN-style model the deploy pipeline
+relies on — content lives until `invalidate-cache.sh` clears it — but
+"forever" is not a defensible reading of RFC 9111 4.2.2, which permits a
+*heuristic* freshness lifetime, not an unbounded one. An entry whose
+invalidation was missed for any reason would be served indefinitely.
+
+Bounded at 24 hours. The model is intact: deploys invalidate far more often
+than that, so in normal operation nothing expires that the pipeline was not
+going to clear anyway. What changes is that a missed invalidation is now a
+bounded fault rather than a permanent one. Nothing this site serves depends on
+it — every route and asset carries an explicit `max-age`.
+
+### A successful POST/PUT/DELETE now invalidates the cached URI (F058)
+
+RFC 9111 4.4 MUST. Nothing invalidated anything: after a successful
+state-changing request the cache kept serving the previous representation
+until it expired on its own. That is a live concern the moment the CMS returns
+— edit a page, and the edge keeps serving the old one.
+
+Two deliberate restrictions:
+
+- **Only on a non-error status.** A 4xx/5xx means the state change did not
+  happen, so the cached copy is still correct. Invalidating on failure would
+  also hand anyone a trivial way to flush the cache by spamming failing POSTs.
+- **`Location`/`Content-Location` only when same-origin.** An off-site redirect
+  target is not ours to evict, and following one blindly would let a backend
+  clear arbitrary entries.
+
+Safe methods (GET, HEAD, OPTIONS, TRACE, per RFC 9110 9.2.1) change nothing and
+are skipped; everything else counts as state-changing, including methods this
+server does not itself implement.
+
+### A third flaky test, same shape as the others
+
+`m6-html`'s `spawn_server` waited for the socket *file* to appear, which is not
+the same as the server accepting on it. Under a full run the connect raced the
+listen backlog, and `http_request` returns an empty string on I/O error — its
+comment says "so callers can retry rather than panic", but no caller retries —
+so an assertion on `"200 OK"` failed against `""`. Now polls with a real
+request until the server answers.
+
+That is the third instance of the same mistake in this codebase's tests:
+waiting for a proxy for readiness instead of readiness itself.
+
+596 workspace tests pass across three consecutive runs, zero warnings.
+
+---
+
 ## 2026-09-06 — `Age` on cache-served responses (F045, F046)
 
 RFC 9111 5.1 requires a shared cache to send `Age`. Nothing emitted it at all,

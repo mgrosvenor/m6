@@ -216,6 +216,23 @@ pub fn make_lookup_key<'a>(
 /// 59-second local lifetime on a 60-second refresh cycle.
 const REFRESH_MARGIN: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// Ceiling on an entry stored with no explicit freshness directive.
+///
+/// A response carrying bare `Cache-Control: public` used to produce
+/// `expires_at = None` and stay fresh **forever**. That is the deliberate
+/// CDN-style model the deploy pipeline relies on — content lives until
+/// `invalidate-cache.sh` clears it — but "forever" is not a defensible
+/// reading of RFC 9111 4.2.2, which permits a *heuristic* freshness lifetime,
+/// not an unbounded one. An entry whose invalidation is missed for any reason
+/// is then served indefinitely with no upper bound at all.
+///
+/// A day keeps the model intact — deploys invalidate far more often than
+/// this, so in normal operation it never expires anything the pipeline was not
+/// going to clear anyway — while making "the invalidation was missed" a
+/// bounded fault instead of a permanent one. Nothing this site serves relies
+/// on it: every route and asset carries an explicit `max-age`.
+const HEURISTIC_MAX_LIFETIME: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
 /// What a response's own `Cache-Control` asks this cache to do.
 struct Directives {
     /// Freshness lifetime. `None` = none specified: the entry lives until an
@@ -486,7 +503,12 @@ impl Cache {
             .unwrap_or_default();
         // The margin is why a max-age=60 response expires locally at 59s. It
         // saturates rather than wrapping, so a zero lifetime stays zero.
-        let expires_at = d.lifetime.map(|l| now + l.saturating_sub(REFRESH_MARGIN));
+        // No explicit freshness falls back to a bounded heuristic rather than
+        // living forever. See HEURISTIC_MAX_LIFETIME.
+        let expires_at = Some(match d.lifetime {
+            Some(l) => now + l.saturating_sub(REFRESH_MARGIN),
+            None => now + HEURISTIC_MAX_LIFETIME,
+        });
         // `no-cache` forbids a stale serve outright and outranks any
         // stale-while-revalidate the same response happens to carry —
         // otherwise the two together would produce exactly the unrevalidated
@@ -1436,5 +1458,48 @@ mod age_tests {
             Lookup::Fresh(_, age) => assert!(age.as_secs() >= 7),
             _ => panic!("expected Fresh"),
         }
+    }
+}
+
+#[cfg(test)]
+mod heuristic_freshness_tests {
+    use super::*;
+
+    fn resp(cc: &str) -> CachedResponse {
+        CachedResponse {
+            status: 200,
+            headers: std::sync::Arc::new(vec![("cache-control".into(), cc.into())]),
+            body: bytes::Bytes::from_static(b"x"),
+            hints: std::sync::Arc::new(vec![]),
+        }
+    }
+
+    /// A bare `public` used to store with `expires_at = None` and stay fresh
+    /// forever. It is still long-lived — the deploy pipeline's invalidation
+    /// model depends on that — but it now has an upper bound, so a missed
+    /// invalidation is a bounded fault rather than a permanent one.
+    #[test]
+    fn bare_public_is_bounded_not_eternal() {
+        let c = Cache::new();
+        c.insert(CacheKey::new("/p", None, ""), resp("public"));
+        // Still fresh now, which is the behaviour the deploy model relies on.
+        assert!(matches!(c.lookup("/p\u{1}\u{1}"), Lookup::Fresh(..)));
+        // But it has a finite deadline rather than none at all.
+        let map = c.map.read().unwrap();
+        let e = map.get("/p\u{1}\u{1}").expect("stored");
+        assert!(e.expires_at.is_some(), "bare `public` must not be fresh forever");
+    }
+
+    /// An explicit lifetime is still honoured exactly and is not replaced by
+    /// the heuristic.
+    #[test]
+    fn an_explicit_max_age_is_unaffected() {
+        let c = Cache::new();
+        c.insert(CacheKey::new("/q", None, ""), resp("public, max-age=60"));
+        let map = c.map.read().unwrap();
+        let e = map.get("/q\u{1}\u{1}").expect("stored");
+        let ttl = e.expires_at.unwrap().saturating_duration_since(std::time::Instant::now());
+        assert!(ttl.as_secs() <= 60, "explicit max-age was overridden: {ttl:?}");
+        assert!(ttl.as_secs() > 30, "explicit max-age was truncated: {ttl:?}");
     }
 }
