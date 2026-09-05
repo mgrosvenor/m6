@@ -121,6 +121,180 @@ fn build_asset_manifest(site_dir: &Path) -> HashMap<String, String> {
     out
 }
 
+/// Intrinsic pixel dimensions for every image under `assets/`, keyed the same
+/// way as the hash manifest.
+///
+/// Built once with Tera, like the hash manifest, so emitting `width`/`height`
+/// costs nothing per render. Read from the file headers rather than from a
+/// data file, so a replaced image cannot silently keep stale dimensions --
+/// which is the failure mode that matters here, since wrong dimensions are
+/// worse than none: they letterbox or stretch the image.
+fn build_image_dimensions(site_dir: &Path) -> HashMap<String, (u32, u32)> {
+    let mut out = HashMap::new();
+    let root = site_dir.join("assets");
+    if root.is_dir() {
+        collect_image_dimensions(&root, &root, &mut out);
+    }
+    out
+}
+
+fn collect_image_dimensions(root: &Path, dir: &Path, out: &mut HashMap<String, (u32, u32)>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_image_dimensions(root, &path, out);
+            continue;
+        }
+        let Ok(rel) = path.strip_prefix(root) else { continue };
+        let Ok(bytes) = std::fs::read(&path) else { continue };
+        if let Some(dims) = image_dimensions(&bytes) {
+            out.insert(rel.to_string_lossy().replace('\\', "/"), dims);
+        }
+    }
+}
+
+/// Intrinsic size of an image from its header bytes.
+///
+/// Hand-rolled for the four formats this site actually ships (PNG, JPEG,
+/// WebP, SVG) rather than pulling in an image crate: the alternative is a
+/// dependency and a pile of decoders for formats that are never used, in a
+/// platform where the whole point is having few moving parts. Returns None for
+/// anything unrecognised or truncated, and the caller then simply omits the
+/// attributes.
+fn image_dimensions(b: &[u8]) -> Option<(u32, u32)> {
+    // PNG: 8-byte signature, then an IHDR chunk whose width/height are the
+    // first two big-endian u32s of its payload.
+    if b.len() >= 24 && b.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]) {
+        return Some((be32(&b[16..20])?, be32(&b[20..24])?));
+    }
+
+    // GIF, cheap to support while we are here: little-endian u16s at byte 6.
+    if b.len() >= 10 && (b.starts_with(b"GIF87a") || b.starts_with(b"GIF89a")) {
+        return Some((
+            u16::from_le_bytes([b[6], b[7]]) as u32,
+            u16::from_le_bytes([b[8], b[9]]) as u32,
+        ));
+    }
+
+    if b.len() >= 30 && b.starts_with(b"RIFF") && &b[8..12] == b"WEBP" {
+        return webp_dimensions(b);
+    }
+
+    if b.len() >= 4 && b[0] == 0xFF && b[1] == 0xD8 {
+        return jpeg_dimensions(b);
+    }
+
+    // SVG is text; look at the root element's attributes.
+    let head = &b[..b.len().min(4096)];
+    if let Ok(text) = std::str::from_utf8(head) {
+        if text.contains("<svg") {
+            return svg_dimensions(text);
+        }
+    }
+    None
+}
+
+fn be32(b: &[u8]) -> Option<u32> {
+    Some(u32::from_be_bytes([*b.first()?, *b.get(1)?, *b.get(2)?, *b.get(3)?]))
+}
+
+/// WebP has three container flavours and they store the size differently.
+fn webp_dimensions(b: &[u8]) -> Option<(u32, u32)> {
+    match &b[12..16] {
+        // Lossy: 14-bit dimensions after the 3-byte start code and "\x9d\x01\x2a".
+        b"VP8 " => {
+            let w = u16::from_le_bytes([*b.get(26)?, *b.get(27)?]) & 0x3FFF;
+            let h = u16::from_le_bytes([*b.get(28)?, *b.get(29)?]) & 0x3FFF;
+            Some((w as u32, h as u32))
+        }
+        // Lossless: 14-bit each, packed across four bytes after the signature.
+        b"VP8L" => {
+            let n = u32::from_le_bytes([*b.get(21)?, *b.get(22)?, *b.get(23)?, *b.get(24)?]);
+            Some(((n & 0x3FFF) + 1, ((n >> 14) & 0x3FFF) + 1))
+        }
+        // Extended: 24-bit minus-one values in the VP8X chunk.
+        b"VP8X" => {
+            let w = u32::from_le_bytes([*b.get(24)?, *b.get(25)?, *b.get(26)?, 0]) + 1;
+            let h = u32::from_le_bytes([*b.get(27)?, *b.get(28)?, *b.get(29)?, 0]) + 1;
+            Some((w, h))
+        }
+        _ => None,
+    }
+}
+
+/// JPEG stores size in a Start-Of-Frame marker, which sits an arbitrary
+/// distance in behind any number of other segments, so the segment chain has
+/// to be walked.
+fn jpeg_dimensions(b: &[u8]) -> Option<(u32, u32)> {
+    let mut i = 2usize;
+    // `+ 9 <=`, not `+ 9 <`: the frame header needs bytes i..i+8 inclusive, so
+    // a SOF that ends exactly at the buffer's last byte is still readable. The
+    // stricter form silently skipped it -- harmless for real JPEGs, which
+    // always carry scan data afterwards, but wrong, and caught by a test whose
+    // fixture ends at the header.
+    while i + 9 <= b.len() {
+        if b[i] != 0xFF {
+            i += 1;
+            continue;
+        }
+        let marker = b[i + 1];
+        // SOF0..SOF15, excluding the four that are not frame headers.
+        if (0xC0..=0xCF).contains(&marker)
+            && marker != 0xC4 && marker != 0xC8 && marker != 0xCC
+        {
+            let h = u16::from_be_bytes([b[i + 5], b[i + 6]]) as u32;
+            let w = u16::from_be_bytes([b[i + 7], b[i + 8]]) as u32;
+            return Some((w, h));
+        }
+        let len = u16::from_be_bytes([*b.get(i + 2)?, *b.get(i + 3)?]) as usize;
+        if len < 2 { return None; }
+        i += 2 + len;
+    }
+    None
+}
+
+/// SVG: prefer explicit width/height, fall back to the viewBox extent. Values
+/// carrying units (`80px`) are accepted; percentages are not, since a
+/// percentage is not an intrinsic size.
+fn svg_dimensions(text: &str) -> Option<(u32, u32)> {
+    let svg = &text[text.find("<svg")?..];
+    let end = svg.find('>').unwrap_or(svg.len());
+    let tag = &svg[..end];
+
+    let attr = |name: &str| -> Option<f64> {
+        let pat = format!("{name}=\"");
+        let start = tag.find(&pat)? + pat.len();
+        let rest = &tag[start..];
+        let val = &rest[..rest.find('"')?];
+        if val.ends_with('%') { return None; }
+        val.trim_end_matches(|c: char| c.is_ascii_alphabetic())
+            .trim()
+            .parse::<f64>()
+            .ok()
+    };
+
+    if let (Some(w), Some(h)) = (attr("width"), attr("height")) {
+        if w > 0.0 && h > 0.0 {
+            return Some((w.round() as u32, h.round() as u32));
+        }
+    }
+
+    let pat = "viewBox=\"";
+    let start = tag.find(pat)? + pat.len();
+    let rest = &tag[start..];
+    let val = &rest[..rest.find('"')?];
+    let nums: Vec<f64> = val
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse::<f64>().ok())
+        .collect();
+    if nums.len() == 4 && nums[2] > 0.0 && nums[3] > 0.0 {
+        return Some((nums[2].round() as u32, nums[3].round() as u32));
+    }
+    None
+}
+
 fn collect_asset_hashes(root: &Path, dir: &Path, out: &mut HashMap<String, String>) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
@@ -155,6 +329,25 @@ fn asset_url(manifest: &HashMap<String, String>, raw: &str) -> String {
     }
 }
 
+/// Look up an image and render its dimensions as HTML attributes.
+///
+/// Accepts the same path shapes as `asset_url` — bare, `/assets/`-prefixed, or
+/// carrying a `?v=` cache-busting query, since callers often pass the already
+/// versioned URL.
+///
+/// Returns an empty string when the file is unknown or its header could not be
+/// read. Omitting the attributes costs some layout stability; guessing them
+/// would distort the image, which is worse.
+fn img_dims_attrs(dims: &HashMap<String, (u32, u32)>, raw: &str) -> String {
+    let no_query = raw.split('?').next().unwrap_or(raw);
+    let trimmed = no_query.trim_start_matches('/');
+    let rel = trimmed.strip_prefix("assets/").unwrap_or(trimmed);
+    match dims.get(rel) {
+        Some((w, h)) => format!(" width=\"{w}\" height=\"{h}\""),
+        None => String::new(),
+    }
+}
+
 /// Sentinel used by `not_found()` so the render-error handler can distinguish
 /// "this resource doesn't exist" from a genuine template bug.
 pub const NOT_FOUND_SENTINEL: &str = "__M6_NOT_FOUND__";
@@ -174,6 +367,22 @@ fn register_filters(tera: &mut Tera, site_dir: &Path) {
     let manifest = std::sync::Arc::new(build_asset_manifest(site_dir));
     tera.register_filter("asset", move |value: &Value, _args: &HashMap<String, Value>| {
         Ok(Value::String(asset_url(&manifest, value.as_str().unwrap_or(""))))
+    });
+
+    // `{{ img_dims(path=x) | safe }}` — ready-to-paste ` width="W" height="H"`.
+    //
+    // Emitted as one attribute pair rather than two separate filters so that a
+    // file with no readable dimensions produces *nothing*, never a half pair.
+    // A lone `width` is worse than neither: the HTML width/height attributes
+    // are presentational hints for BOTH axes, so one on its own distorts the
+    // image. That is exactly the bug that stretched the headline image
+    // earlier, and this shape makes it unrepresentable.
+    //
+    // Needs `| safe` at the call site because it returns markup, not text.
+    let dims = std::sync::Arc::new(build_image_dimensions(site_dir));
+    tera.register_function("img_dims", move |args: &HashMap<String, Value>| {
+        let raw = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+        Ok(Value::String(img_dims_attrs(&dims, raw)))
     });
 
     // `{{ not_found() }}` — call from a template when a lookup produces no result.
@@ -379,5 +588,108 @@ mod asset_filter_tests {
     fn empty_input_does_not_panic() {
         let m = HashMap::new();
         assert_eq!(asset_url(&m, ""), "/assets/");
+    }
+}
+
+#[cfg(test)]
+mod image_dimension_tests {
+    use super::{image_dimensions, img_dims_attrs, svg_dimensions};
+    use std::collections::HashMap;
+
+    /// Minimal but structurally real headers, so the parsers are exercised on
+    /// byte layout rather than on a fixture that happens to match.
+    fn png(w: u32, h: u32) -> Vec<u8> {
+        let mut v = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        v.extend_from_slice(&[0, 0, 0, 13]);        // IHDR length
+        v.extend_from_slice(b"IHDR");
+        v.extend_from_slice(&w.to_be_bytes());
+        v.extend_from_slice(&h.to_be_bytes());
+        v.extend_from_slice(&[8, 6, 0, 0, 0]);
+        v
+    }
+
+    fn jpeg(w: u16, h: u16) -> Vec<u8> {
+        let mut v = vec![0xFF, 0xD8];
+        // A JFIF APP0 segment first, so the SOF is genuinely not at the front
+        // and the segment walk has to do its job.
+        v.extend_from_slice(&[0xFF, 0xE0, 0x00, 0x10]);
+        v.extend_from_slice(b"JFIF\0");
+        v.extend_from_slice(&[0u8; 9]);
+        v.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x11, 0x08]);
+        v.extend_from_slice(&h.to_be_bytes());
+        v.extend_from_slice(&w.to_be_bytes());
+        v
+    }
+
+    fn webp_lossy(w: u16, h: u16) -> Vec<u8> {
+        let mut v = b"RIFF\0\0\0\0WEBPVP8 ".to_vec();
+        v.extend_from_slice(&[0u8; 10]);            // chunk size + start code
+        v.extend_from_slice(&w.to_le_bytes());
+        v.extend_from_slice(&h.to_le_bytes());
+        v
+    }
+
+    #[test]
+    fn reads_png_jpeg_and_webp_headers() {
+        assert_eq!(image_dimensions(&png(1300, 1476)), Some((1300, 1476)));
+        assert_eq!(image_dimensions(&jpeg(640, 480)), Some((640, 480)));
+        assert_eq!(image_dimensions(&webp_lossy(369, 246)), Some((369, 246)));
+    }
+
+    /// JPEG width and height are stored height-first; getting that backwards
+    /// silently transposes every photo on the site.
+    #[test]
+    fn jpeg_does_not_transpose_width_and_height() {
+        assert_eq!(image_dimensions(&jpeg(800, 200)), Some((800, 200)));
+    }
+
+    #[test]
+    fn svg_prefers_explicit_size_then_falls_back_to_viewbox() {
+        assert_eq!(svg_dimensions(r#"<svg width="39" height="39" viewBox="0 0 78 78">"#), Some((39, 39)));
+        assert_eq!(svg_dimensions(r#"<svg viewBox="0 0 24 24">"#), Some((24, 24)));
+        assert_eq!(svg_dimensions(r#"<svg width="80px" height="58px">"#), Some((80, 58)));
+    }
+
+    /// A percentage is not an intrinsic size. Emitting `width="100"` for
+    /// `width="100%"` would be actively wrong.
+    #[test]
+    fn svg_percentage_is_not_a_size() {
+        assert_eq!(svg_dimensions(r#"<svg width="100%" height="100%">"#), None);
+        // ...but a viewBox alongside it still is.
+        assert_eq!(svg_dimensions(r#"<svg width="100%" height="100%" viewBox="0 0 16 9">"#), Some((16, 9)));
+    }
+
+    #[test]
+    fn unrecognised_or_truncated_input_yields_nothing() {
+        assert_eq!(image_dimensions(b""), None);
+        assert_eq!(image_dimensions(b"not an image at all"), None);
+        assert_eq!(image_dimensions(&png(10, 10)[..12]), None);   // truncated PNG
+        assert_eq!(image_dimensions(&[0xFF, 0xD8]), None);        // JPEG with no SOF
+    }
+
+    /// The attribute pair is all-or-nothing: a lone `width` is a presentational
+    /// hint for both axes and would distort the image.
+    #[test]
+    fn attributes_are_emitted_as_a_pair_or_not_at_all() {
+        let mut m = HashMap::new();
+        m.insert("icons/logo.svg".to_string(), (80u32, 80u32));
+        assert_eq!(img_dims_attrs(&m, "icons/logo.svg"), r#" width="80" height="80""#);
+        assert_eq!(img_dims_attrs(&m, "icons/unknown.svg"), "");
+    }
+
+    /// Callers pass whatever they have: bare, /assets/-prefixed, or the already
+    /// versioned URL straight out of `| asset`.
+    #[test]
+    fn accepts_prefixed_and_versioned_paths() {
+        let mut m = HashMap::new();
+        m.insert("icons/logo.svg".to_string(), (80u32, 80u32));
+        for input in [
+            "icons/logo.svg",
+            "/assets/icons/logo.svg",
+            "assets/icons/logo.svg",
+            "/assets/icons/logo.svg?v=deadbeef",
+        ] {
+            assert_eq!(img_dims_attrs(&m, input), r#" width="80" height="80""#, "input {input:?}");
+        }
     }
 }
