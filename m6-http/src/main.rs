@@ -101,6 +101,20 @@ struct ServerState {
     /// Cache entries queued to be fetched in the background — hint-driven
     /// prefetches and stale-while-revalidate refreshes both land here.
     prefetch_queue: std::collections::VecDeque<Refresh>,
+    /// Background fetches dispatched to a URL backend and awaiting a reply.
+    ///
+    /// A real request parks its pending reply on its own connection, which
+    /// the event loop then polls. A background fetch has no connection, so
+    /// before this existed the returned receiver was simply dropped: on a
+    /// cache node -- whose only backend is origin over h2c, i.e. always the
+    /// async path -- every prefetch and every stale-while-revalidate refresh
+    /// was dispatched and then silently discarded, so nothing was ever
+    /// refilled. Origin was unaffected, its backends being unix sockets that
+    /// complete synchronously inside handle_request.
+    background_pending: Vec<(
+        std::sync::mpsc::Receiver<std::io::Result<forward::HttpResponse>>,
+        forward::PendingUrlContext,
+    )>,
     /// Persistent non-blocking H2C outbound client pool.
     h2c_pool: H2cClientPool,
     /// Persistent non-blocking H2S (HTTP/2 over TLS) outbound client pool.
@@ -630,6 +644,39 @@ fn event_loop(
         // Emit periodic stats (cheap check every iteration: compares one Instant)
         state.stats.maybe_emit(state.pool_manager.total_active_members());
 
+        // Complete any background fetch whose reply has arrived. Runs through
+        // the same finalize_url_response as a real request, so the cache
+        // insert, header handling and hint extraction are identical -- the
+        // only difference is that the response body is discarded, there being
+        // no client to send it to.
+        if !state.background_pending.is_empty() {
+            use std::sync::mpsc::TryRecvError;
+            let mut done: Vec<(std::io::Result<forward::HttpResponse>, forward::PendingUrlContext)> = Vec::new();
+            let mut idx = 0;
+            while idx < state.background_pending.len() {
+                let got = match state.background_pending[idx].0.try_recv() {
+                    Ok(r) => Some(r),
+                    Err(TryRecvError::Empty) => None,
+                    // Backend thread died; take the entry so it cannot leak.
+                    Err(TryRecvError::Disconnected) => Some(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe, "url backend thread died",
+                    ))),
+                };
+                match got {
+                    Some(result) => {
+                        let (_, ctx) = state.background_pending.remove(idx);
+                        done.push((result, ctx));
+                    }
+                    None => idx += 1,
+                }
+            }
+            for (result, ctx) in done {
+                let path = ctx.req.path.clone();
+                let _ = finalize_url_response(result, &ctx, quic_port, state);
+                debug!(path = %path, "background fetch: cache filled (async)");
+            }
+        }
+
         // Drain one background fetch per loop iteration. Each is a synthetic
         // GET to a backend, serving two purposes: warming hinted assets into
         // the cache so they are ready when the browser requests them after a
@@ -650,8 +697,20 @@ fn event_loop(
                     headers: vec![],
                     body:    vec![],
                 };
-                handle_request(&synth, "127.0.0.1", &r.enc, state, true);
-                debug!(path = %r.path, enc = %r.enc, "background fetch: cache filled");
+                match handle_request(&synth, "127.0.0.1", &r.enc, state, true) {
+                    // Socket backend: already completed and inserted inline.
+                    RequestOutcome::Ready(..) => {
+                        debug!(path = %r.path, enc = %r.enc, "background fetch: cache filled");
+                    }
+                    // URL backend: the reply lands later. Park it so the poll
+                    // below can finish it; dropping it here is what made this
+                    // a no-op on cache nodes.
+                    RequestOutcome::Pending { rx, ctx } => {
+                        if state.background_pending.len() < MAX_REFRESH_QUEUE {
+                            state.background_pending.push((rx, ctx));
+                        }
+                    }
+                }
             }
         }
 
@@ -1364,6 +1423,7 @@ fn handle_request(
             enc: content_encoding.to_string(),
             backend_name: backend_name.clone(),
             cacheable,
+            is_prefetch,
             start: std::time::Instant::now(),
             error_status_override: None,
         };
@@ -1575,6 +1635,9 @@ fn dispatch_custom_error_async(
         enc: String::new(),
         backend_name: backend_name.clone(),
         cacheable: false,
+        // A custom-error-page fetch on behalf of a real client, so it is not a
+        // background prefetch and its analytics line must still be written.
+        is_prefetch: false,
         start: std::time::Instant::now(),
         error_status_override: Some(status),
     };
@@ -1770,6 +1833,12 @@ fn finalize_url_response(
     let req = &ctx.req;
     let enc = &ctx.enc;
 
+    // A background fetch has no visitor behind it. Its client_ip is the
+    // 127.0.0.1 placeholder, so logging it would invent traffic and mint a
+    // throwaway session -- the synchronous path already suppresses this via
+    // handle_request's is_prefetch, and the async path has to match.
+    let analytics_on = state.config.analytics.enabled && !ctx.is_prefetch;
+
     // This dispatch was itself an async fetch of the custom error page
     // (see `dispatch_custom_error_async`) — the ORIGINAL failing status
     // rides along in `error_status_override` regardless of whatever status
@@ -1792,7 +1861,7 @@ fn finalize_url_response(
                 // rendered error page), same reasoning as the main MISS tail.
                 let mut headers = http_resp.headers;
                 analytics::finish_proxied_response(
-                    state.config.analytics.enabled, &mut headers, &req.headers,
+                    analytics_on, &mut headers, &req.headers,
                     &state.config.node.name, &req.path, original_status, "MISS", &ctx.client_ip, Some(latency_ns),
                 );
                 (original_status, headers, http_resp.body, "error".to_string(), std::sync::Arc::new(vec![]))
@@ -1803,7 +1872,7 @@ fn finalize_url_response(
                 let body = error::internal_error_html(original_status, reason, state.config.errors.verbose_fallback, &req.path, None);
                 let mut headers = vec![("Content-Type".to_string(), "text/html; charset=utf-8".to_string())];
                 analytics::finish_response(
-                    state.config.analytics.enabled, &mut headers, &req.headers,
+                    analytics_on, &mut headers, &req.headers,
                     &state.config.node.name, &req.path, original_status, "MISS", &ctx.client_ip, Some(latency_ns),
                 );
                 (original_status, headers, body, "error".to_string(), std::sync::Arc::new(vec![]))
@@ -1869,7 +1938,7 @@ fn finalize_url_response(
         // operational warn!()), and the pre-fix code skipped it unconditionally.
         let latency_ns = ctx.start.elapsed().as_nanos() as u64;
         analytics::finish_response(
-            state.config.analytics.enabled, &mut h, &req.headers,
+            analytics_on, &mut h, &req.headers,
             &state.config.node.name, &req.path, s, "MISS", &ctx.client_ip, Some(latency_ns),
         );
         return (s, h, b, n, std::sync::Arc::new(vec![]));
@@ -1893,7 +1962,7 @@ fn finalize_url_response(
     // finish_proxied_response for why that matters.
     let latency_ns = ctx.start.elapsed().as_nanos() as u64;
     analytics::finish_proxied_response(
-        state.config.analytics.enabled, &mut headers_with_altsvc, &req.headers,
+        analytics_on, &mut headers_with_altsvc, &req.headers,
         &state.config.node.name, &req.path, status, "MISS", &ctx.client_ip, Some(latency_ns),
     );
 
@@ -2329,6 +2398,7 @@ fn run(args: Vec<String>) -> i32 {
         error_mode,
         stats: Stats::new(),
         prefetch_queue: std::collections::VecDeque::new(),
+        background_pending: Vec::new(),
         h2c_pool: H2cClientPool::new(),
         h2s_pool: H2sTlsClientPool::new(),
         rate_limiter: RateLimiter::new(),

@@ -490,6 +490,13 @@ pub struct PendingUrlContext {
     /// stored entry would later be served to anonymous callers) and for
     /// internal error-page fetches.
     pub cacheable: bool,
+    /// This dispatch is a synthetic background fetch (a hint prefetch or a
+    /// stale-while-revalidate refresh), not a real visit. It exists only to
+    /// fill the cache; there is no client, and `client_ip` is a placeholder.
+    /// Analytics must skip it, exactly as the synchronous path already does
+    /// via `handle_request`'s `is_prefetch` -- otherwise every refresh logs
+    /// itself as a request from 127.0.0.1 and corrupts the visit counts.
+    pub is_prefetch: bool,
     pub start:        std::time::Instant,   // request arrival time for miss timing
     /// Set when this dispatch is itself a `[errors] mode = "custom"` fetch of
     /// the error page (rather than a normal routed request) — carries the
