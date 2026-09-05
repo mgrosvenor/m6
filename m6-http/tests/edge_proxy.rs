@@ -27,6 +27,9 @@ use std::time::{Duration, Instant};
 
 use rustls::StreamOwned;
 
+mod common;
+use common::{free_port, wait_for_path};
+
 // ── Test infrastructure ───────────────────────────────────────────────────────
 
 struct TestProcess(Child);
@@ -276,17 +279,12 @@ impl EdgeStack {
         let base = tmp.path();
 
         // ── Ports ─────────────────────────────────────────────────────────
-        // Use random high ports by binding to :0, then release and use.
-        let global_port: u16 = {
-            let s = TcpStream::connect("127.0.0.1:0").err().map(|_| ());
-            let _ = s;
-            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            l.local_addr().unwrap().port()
-        };
-        let edge_port: u16 = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            l.local_addr().unwrap().port()
-        };
+        // Ports come from the shared allocator, which claims each one across
+        // processes for the whole window between allocation and the server
+        // binding it. Binding to :0 and releasing raced with every other test
+        // binary cargo runs in parallel.
+        let global_port: u16 = free_port();
+        let edge_port: u16 = free_port();
 
         // ── Certs ─────────────────────────────────────────────────────────
         let (gc_pem, gk_pem, _gc_der) = generate_cert();
@@ -334,7 +332,23 @@ impl EdgeStack {
             .stdout(Stdio::null()).stderr(Stdio::null())
             .spawn().expect("spawn m6-file"));
 
-        std::thread::sleep(Duration::from_millis(300));
+        // Wait for the backend sockets to actually exist rather than guessing.
+        //
+        // This was `sleep(300ms)`. Alone that was enough; in a full workspace
+        // run it is not remotely — a dozen of these stacks start at once, each
+        // spawning four processes, and m6-http would come up with an empty
+        // backend pool. Every request then returned 502, which read as an
+        // assertion failure in whichever test happened to run first. m6-http
+        // also only rescans for backend sockets periodically, so a socket that
+        // appears late is not picked up promptly either.
+        assert!(
+            wait_for_path(&html_sock, Duration::from_secs(15)),
+            "m6-html socket never appeared at {}", html_sock.display()
+        );
+        assert!(
+            wait_for_path(&file_sock, Duration::from_secs(15)),
+            "m6-file socket never appeared at {}", file_sock.display()
+        );
 
         // ── Start global m6-http ──────────────────────────────────────────
         let global_proc = TestProcess(Command::new(binary("m6-http"))
@@ -357,6 +371,25 @@ impl EdgeStack {
             "edge m6-http did not start on port {edge_port}");
 
         let edge_tls = trusted_client_config(&ec_der);
+
+        // Listening on a port is not the same as being able to serve: the
+        // backend pool is populated by a periodic rescan, so there is a window
+        // where the port accepts and every request 502s. Poll until the stack
+        // actually answers, rather than assuming a fixed delay is enough. This
+        // is the difference between a suite that passes alone and one that
+        // passes under load.
+        let ready_deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let (status, _, _) = https_get(global_port, "/", &[], skip_verify_client_config());
+            if status_code(&status) == 200 {
+                break;
+            }
+            assert!(
+                Instant::now() < ready_deadline,
+                "global stack never became ready (last status: {status})"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
 
         EdgeStack {
             _global_html:   html_proc,
