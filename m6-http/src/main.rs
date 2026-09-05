@@ -382,6 +382,12 @@ fn event_loop(
                     if let Some(blocked) = check_rate_limit(state, client_ip, &req.path, ua) {
                         return blocked;
                     }
+                    // Ahead of the cache lookup below: the key has no host
+                    // component, so a warm apex entry would answer a www
+                    // request and this redirect would never run.
+                    if let Some(redirect) = www_redirect(&req, &state.config) {
+                        return redirect;
+                    }
                     let enc_str = req.headers
                         .iter()
                         .find(|(k, _)| k.eq_ignore_ascii_case("accept-encoding"))
@@ -500,6 +506,12 @@ fn event_loop(
                     let ua = analytics::header(&req.headers, "user-agent");
                     if let Some(blocked) = check_rate_limit(state, client_ip, &req.path, ua) {
                         return blocked;
+                    }
+                    // Ahead of the cache lookup below: the key has no host
+                    // component, so a warm apex entry would answer a www
+                    // request and this redirect would never run.
+                    if let Some(redirect) = www_redirect(&req, &state.config) {
+                        return redirect;
                     }
                     let enc_str = req.headers
                         .iter()
@@ -992,6 +1004,24 @@ fn handle_h3_request(
         }
     }
 
+    // www -> apex, before the cache lookup for the same reason as the other two
+    // paths: the key carries no host, so a warm apex entry would answer a www
+    // request. HTTP/3 carries the host in :authority rather than a Host header.
+    {
+        let authority: Option<String> = req.headers.iter().find_map(|h| {
+            h.name()
+                .eq_ignore_ascii_case(b":authority")
+                .then(|| std::str::from_utf8(h.value()).ok().map(str::to_string))
+                .flatten()
+        });
+        if let Some(location) =
+            www_redirect_location(authority.as_deref(), path_str, query_str, &state.config)
+        {
+            send_h3_response(stream_id, qconn, 301, &www_redirect_headers(location), Bytes::new());
+            return;
+        }
+    }
+
     // ── Cache lookup — zero allocation ────────────────────────────────────────
     // Routes with `require` are never served from cache — see the HTTP/1.1
     // path for the reasoning.
@@ -1258,6 +1288,74 @@ fn send_h3_response(
 }
 
 // ── Routing / auth / forwarding ───────────────────────────────────────────────
+
+/// 301 `www.<domain>` to the bare `<domain>`, preserving path and query.
+///
+/// **Must run before the cache lookup, not inside `handle_request`.** The cache
+/// key is (path, query, encoding) with no host component, so `www` and the apex
+/// share entries: a cached apex response would be replayed for a `www` request
+/// and the redirect would silently never happen on a warm cache. That is also
+/// why this is duplicated across the three protocol paths rather than living in
+/// one place further down.
+///
+/// Only the exact `www.` alias redirects. An arbitrary unrecognised Host is
+/// served normally, because node hostnames (`syd.mgrosvenor.com`) have to keep
+/// answering directly — per-node verification depends on reaching one specific
+/// node by name instead of through the GeoDNS-routed apex.
+fn www_redirect_location(
+    host: Option<&str>,
+    path: &str,
+    query: Option<&str>,
+    config: &config::Config,
+) -> Option<String> {
+    if !config.site.redirect_www {
+        return None;
+    }
+    let host = host?;
+    // Host may legitimately carry a port; the canonical form never does.
+    let host = host.split(':').next().unwrap_or(host);
+    // Case-insensitive: `WWW.` and `Www.` are the same host as `www.`.
+    let apex = host.get(4..).filter(|_| host.len() > 4 && host[..4].eq_ignore_ascii_case("www."))?;
+    if !apex.eq_ignore_ascii_case(&config.site.domain) {
+        return None;
+    }
+    // Build from the *configured* domain, never from the client-supplied host:
+    // echoing a request's own bytes back into a Location header is how open
+    // redirects and header injection get built.
+    let domain = &config.site.domain;
+    let unsafe_byte = |s: &str| s.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0);
+    if unsafe_byte(path) {
+        return None;
+    }
+    match query {
+        Some(q) if unsafe_byte(q) => None,
+        Some(q) => Some(format!("https://{domain}{path}?{q}")),
+        None => Some(format!("https://{domain}{path}")),
+    }
+}
+
+fn www_redirect_headers(location: String) -> Vec<(String, String)> {
+    vec![
+        ("Location".to_string(), location),
+        ("Content-Length".to_string(), "0".to_string()),
+    ]
+}
+
+fn www_redirect(req: &forward::HttpRequest, config: &config::Config) -> Option<RequestOutcome> {
+    let host = req
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("host"))
+        .map(|(_, v)| v.as_str());
+    let location = www_redirect_location(host, &req.path, req.query.as_deref(), config)?;
+    Some(RequestOutcome::Ready(
+        301,
+        www_redirect_headers(location),
+        vec![],
+        "www-redirect".to_string(),
+        std::sync::Arc::new(vec![]),
+    ))
+}
 
 fn handle_request(
     req: &forward::HttpRequest,
@@ -2437,4 +2535,144 @@ fn run(args: Vec<String>) -> i32 {
     };
 
     event_loop(udp, tcp_listener, h2c_listener, watcher, &mut state, &mut quiche_config, &log_handle)
+}
+
+#[cfg(test)]
+mod www_redirect_tests {
+    use super::*;
+
+    use m6_http_lib::config::{
+        AnalyticsConfig, Config, ErrorsConfig, LogConfig, NodeConfig, RateLimitConfig,
+        SecurityConfig, ServerConfig, SiteConfig,
+    };
+    use std::path::PathBuf;
+
+    fn cfg(domain: &str, redirect_www: bool) -> Config {
+        Config {
+            site: SiteConfig {
+                name: "Test".to_string(),
+                domain: domain.to_string(),
+                redirect_www,
+            },
+            server: ServerConfig {
+                bind: "127.0.0.1:8443".to_string(),
+                tls_cert: Some("/tmp/cert.pem".to_string()),
+                tls_key: Some("/tmp/key.pem".to_string()),
+                backend_timeout_secs: 30,
+                h2c_bind: None,
+                redirect_bind: None,
+            },
+            log: LogConfig::default(),
+            analytics: AnalyticsConfig::default(),
+            node: NodeConfig { name: "test-node".to_string() },
+            rate_limit: RateLimitConfig::default(),
+            errors: ErrorsConfig::default(),
+            security: SecurityConfig::default(),
+            auth: None,
+            backends: vec![],
+            routes: vec![],
+            route_groups: vec![],
+            site_dir: PathBuf::from("/tmp"),
+        }
+    }
+
+    #[test]
+    fn redirects_www_to_apex_preserving_path_and_query() {
+        let c = cfg("mgrosvenor.com", true);
+        assert_eq!(
+            www_redirect_location(Some("www.mgrosvenor.com"), "/capabilities", Some("a=1&b=2"), &c),
+            Some("https://mgrosvenor.com/capabilities?a=1&b=2".to_string())
+        );
+        assert_eq!(
+            www_redirect_location(Some("www.mgrosvenor.com"), "/", None, &c),
+            Some("https://mgrosvenor.com/".to_string())
+        );
+    }
+
+    #[test]
+    fn host_matching_is_case_insensitive_and_port_tolerant() {
+        let c = cfg("mgrosvenor.com", true);
+        for host in ["WWW.mgrosvenor.com", "Www.MGrosvenor.Com", "www.mgrosvenor.com:80"] {
+            assert_eq!(
+                www_redirect_location(Some(host), "/x", None, &c),
+                Some("https://mgrosvenor.com/x".to_string()),
+                "host {host} should redirect"
+            );
+        }
+    }
+
+    /// The apex itself must not redirect, or every request loops forever.
+    #[test]
+    fn apex_is_left_alone() {
+        let c = cfg("mgrosvenor.com", true);
+        assert_eq!(www_redirect_location(Some("mgrosvenor.com"), "/", None, &c), None);
+    }
+
+    /// Node hostnames have to keep serving directly: per-node verification
+    /// depends on reaching one specific node by name, not via the GeoDNS apex.
+    #[test]
+    fn other_hosts_are_left_alone() {
+        let c = cfg("mgrosvenor.com", true);
+        for host in ["syd.mgrosvenor.com", "lon.mgrosvenor.com", "evil.example", "www.evil.example"] {
+            assert_eq!(
+                www_redirect_location(Some(host), "/", None, &c),
+                None,
+                "host {host} must not redirect"
+            );
+        }
+    }
+
+    /// `www.` prefixing a *different* domain is not this site's www alias.
+    #[test]
+    fn www_of_another_domain_is_not_our_alias() {
+        let c = cfg("mgrosvenor.com", true);
+        assert_eq!(
+            www_redirect_location(Some("www.mgrosvenor.com.evil.example"), "/", None, &c),
+            None
+        );
+    }
+
+    /// Location is built from the configured domain, never the request's own
+    /// bytes -- otherwise this is an open redirect.
+    #[test]
+    fn never_echoes_the_client_supplied_host() {
+        let c = cfg("mgrosvenor.com", true);
+        let got = www_redirect_location(Some("www.mgrosvenor.com"), "/x", None, &c).unwrap();
+        assert!(got.starts_with("https://mgrosvenor.com/"), "got {got}");
+    }
+
+    #[test]
+    fn rejects_control_characters_rather_than_injecting_headers() {
+        let c = cfg("mgrosvenor.com", true);
+        assert_eq!(
+            www_redirect_location(Some("www.mgrosvenor.com"), "/x\r\nX-Injected: 1", None, &c),
+            None
+        );
+        assert_eq!(
+            www_redirect_location(Some("www.mgrosvenor.com"), "/x", Some("a=1\r\nX-I: 1"), &c),
+            None
+        );
+        assert_eq!(
+            www_redirect_location(Some("www.mgrosvenor.com"), "/x\0y", None, &c),
+            None
+        );
+    }
+
+    #[test]
+    fn disabled_by_config_and_absent_host() {
+        assert_eq!(
+            www_redirect_location(Some("www.mgrosvenor.com"), "/", None, &cfg("mgrosvenor.com", false)),
+            None
+        );
+        assert_eq!(www_redirect_location(None, "/", None, &cfg("mgrosvenor.com", true)), None);
+    }
+
+    /// A bare "www." with nothing after it must not panic or match.
+    #[test]
+    fn degenerate_hosts_do_not_panic() {
+        let c = cfg("mgrosvenor.com", true);
+        for host in ["www.", "www", "", ":80", "."] {
+            assert_eq!(www_redirect_location(Some(host), "/", None, &c), None, "host {host:?}");
+        }
+    }
 }

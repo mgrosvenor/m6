@@ -376,7 +376,7 @@ mod tests {
 
     fn make_config(routes: Vec<RouteConfig>, backends: Vec<BackendConfig>) -> Config {
         Config {
-            site: SiteConfig { name: "Test".to_string(), domain: "test.example.com".to_string() },
+            site: SiteConfig { name: "Test".to_string(), domain: "test.example.com".to_string(), redirect_www: true },
             server: ServerConfig {
                 bind: "127.0.0.1:8443".to_string(),
                 tls_cert: Some("/tmp/cert.pem".to_string()),
@@ -512,7 +512,7 @@ params = ["data/home.json", "data/shared.json"]
         std::fs::write(site_dir.join("key.pem"), "dummy").unwrap();
 
         let config = Config {
-            site: SiteConfig { name: "Test".to_string(), domain: "test.example.com".to_string() },
+            site: SiteConfig { name: "Test".to_string(), domain: "test.example.com".to_string(), redirect_www: true },
             server: ServerConfig {
                 bind: "127.0.0.1:8443".to_string(),
                 tls_cert: Some(site_dir.join("cert.pem").to_string_lossy().into_owned()),
@@ -576,7 +576,7 @@ params = ["content/posts/{stem}.json"]
         std::fs::write(site_dir.join("key.pem"), "dummy").unwrap();
 
         let config = Config {
-            site: SiteConfig { name: "Test".to_string(), domain: "test.example.com".to_string() },
+            site: SiteConfig { name: "Test".to_string(), domain: "test.example.com".to_string(), redirect_www: true },
             server: ServerConfig {
                 bind: "127.0.0.1:8443".to_string(),
                 tls_cert: Some(site_dir.join("cert.pem").to_string_lossy().into_owned()),
@@ -622,7 +622,7 @@ params = ["content/posts/{stem}.json"]
         std::fs::write(site_dir.join("key.pem"), "dummy").unwrap();
 
         let config = Config {
-            site: SiteConfig { name: "Test".to_string(), domain: "test.example.com".to_string() },
+            site: SiteConfig { name: "Test".to_string(), domain: "test.example.com".to_string(), redirect_www: true },
             server: ServerConfig {
                 bind: "127.0.0.1:8443".to_string(),
                 tls_cert: Some(site_dir.join("cert.pem").to_string_lossy().into_owned()),

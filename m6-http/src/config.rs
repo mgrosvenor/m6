@@ -28,6 +28,18 @@ pub struct Config {
 pub struct SiteConfig {
     pub name: String,
     pub domain: String,
+    /// 301 `www.<domain>` to the bare `<domain>`. Default true.
+    ///
+    /// Without it the two hostnames serve byte-identical pages, which is
+    /// duplicate content: search engines pick a canonical themselves and split
+    /// ranking signals across both until they do.
+    ///
+    /// Only the `www.` alias is redirected, never an arbitrary unrecognised
+    /// Host. Node hostnames (`syd.mgrosvenor.com`) must keep serving directly,
+    /// because per-node verification depends on reaching a specific node by
+    /// name rather than through the GeoDNS-routed apex.
+    #[serde(default = "default_true")]
+    pub redirect_www: bool,
 }
 
 /// This deployment's node identity (e.g. "sydney", "london") — distinct from
@@ -390,6 +402,7 @@ struct RawSiteToml {
 struct RawSiteSection {
     name: Option<String>,
     domain: Option<String>,
+    redirect_www: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -481,7 +494,8 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
     let tls_key_path = tls_key.as_deref().map(|k| resolve_path(site_dir, k));
 
     // Validate [site] required keys
-    let raw_site = site_parsed.site.unwrap_or(RawSiteSection { name: None, domain: None });
+    let raw_site = site_parsed.site
+        .unwrap_or(RawSiteSection { name: None, domain: None, redirect_www: None });
     let site_name = raw_site.name
         .ok_or_else(|| anyhow::anyhow!("config error: [site].name is required"))?;
     let site_domain = raw_site.domain
@@ -609,7 +623,11 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
     }
 
     Ok(Config {
-        site: SiteConfig { name: site_name, domain: site_domain },
+        site: SiteConfig {
+            name: site_name,
+            domain: site_domain,
+            redirect_www: raw_site.redirect_www.unwrap_or(true),
+        },
         node,
         server,
         log,
