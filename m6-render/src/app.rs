@@ -127,6 +127,23 @@ pub struct CompiledRoute {
     pub headers: Vec<(String, String)>,
     /// Specificity score: exact > parameterised, longer > shorter.
     pub specificity: i32,
+    /// When this route's rendered output last changed, for `Last-Modified`.
+    ///
+    /// A rendered page has no file of its own to stat, which is why it carried
+    /// no `Last-Modified` at all and every `If-Modified-Since` came back 200
+    /// with the whole page. It does have inputs, though, and their mtimes are a
+    /// truthful answer: the max over every template (partials are shared, so a
+    /// change to `_banner.html` genuinely can change any page) and this route's
+    /// own static params files.
+    ///
+    /// Computed once when the framework state is built, so it costs nothing per
+    /// request, and recomputed on reload.
+    ///
+    /// `None` for a route whose params path contains a `{placeholder}`: the
+    /// actual file depends on the request, so no honest value exists until one
+    /// arrives. Omitting the header is correct there — RFC 9110 lets a server
+    /// leave it out, and a wrong date is far worse than an absent one.
+    pub last_modified: Option<std::time::SystemTime>,
 }
 
 #[derive(Debug, Clone)]
@@ -317,6 +334,9 @@ impl FrameworkState {
                 cache,
                 headers: vec![],
                 specificity: spec,
+                // A code route renders whatever its handler decides at request
+                // time, so there is no input file whose mtime describes it.
+                last_modified: None,
             });
         }
 
@@ -350,7 +370,43 @@ impl FrameworkState {
                 cache: rc.cache.clone(),
                 headers: rc.headers.clone(),
                 specificity: spec,
+                last_modified: None, // filled in below, once templates_mtime is known
             });
+        }
+
+        // ── Per-route Last-Modified ─────────────────────────────────────────
+        // Rendered HTML had no `Last-Modified`, so a client validating by date
+        // got the entire page back every time -- 52 KB for `/`. m6-html emits an
+        // ETag, so `If-None-Match` already worked; this closes the other half.
+        //
+        // Templates are pooled deliberately. They include each other
+        // (`_head.html`, `_banner.html`, `_footer.html` are on every page), and
+        // resolving the transitive include set per route would be a lot of
+        // machinery to make one date slightly tighter. Taking the newest
+        // template as every page's floor is honest -- a change to a shared
+        // partial really can change any page -- and errs toward revalidating,
+        // which costs a request rather than serving something stale.
+        //
+        // Params are per route, which is where the precision actually pays:
+        // editing a publication should not make /capabilities look modified.
+        let templates_mtime = newest_mtime_under(&site_dir.join("templates"));
+        for route in &mut routes {
+            // A params path with a placeholder resolves per request, so no
+            // build-time value can be right. Leave the header off rather than
+            // publish a date that is wrong for most requests.
+            if route.params_files.iter().any(|p| p.contains('{')) {
+                continue;
+            }
+            let mut newest = templates_mtime;
+            for pf in &route.params_files {
+                if let Some(t) = file_mtime(&site_dir.join(pf)) {
+                    newest = match newest {
+                        Some(n) if n >= t => Some(n),
+                        _ => Some(t),
+                    };
+                }
+            }
+            route.last_modified = newest;
         }
 
         // Collect template paths from config routes.
@@ -1848,6 +1904,23 @@ fn handle_connection(
             // configured instead.
             resp = resp.header("Cache-Control", &route.cache);
 
+            // Last-Modified, from the route's own inputs (see CompiledRoute).
+            // Only on a success: attaching a validator to a 404 or a 500 would
+            // invite a client to keep revalidating an error as though it were
+            // content. Skipped when the route has no honest date -- a code
+            // route, or one whose params path is resolved per request.
+            //
+            // m6-http already honours If-Modified-Since against a cached
+            // entry's Last-Modified (cache::is_not_modified); it simply never
+            // had one to compare with for rendered HTML, so every date-based
+            // revalidation returned the whole page. Emitting the header here is
+            // the whole fix.
+            if resp.status < 300 {
+                if let Some(lm) = route.last_modified {
+                    resp = resp.header("Last-Modified", &httpdate::fmt_http_date(lm));
+                }
+            }
+
             // Add any extra per-route headers (e.g. COOP/COEP for cross-origin isolation).
             for (k, v) in &route.headers {
                 resp.headers.push((k.clone(), v.clone()));
@@ -1991,6 +2064,7 @@ mod tests {
             cache: "public".to_string(),
             headers: vec![],
             specificity: 3,
+            last_modified: None,
         };
         let segs: Vec<&str> = "/blog/hello-world".split('/').filter(|s| !s.is_empty()).collect();
         let m = match_route(&segs, &route);
@@ -2012,6 +2086,7 @@ mod tests {
             cache: "public".to_string(),
             headers: vec![],
             specificity: 3,
+            last_modified: None,
         };
         let segs_ab: Vec<&str> = "/blog/a/b".split('/').filter(|s| !s.is_empty()).collect();
         let segs_b: Vec<&str> = "/blog".split('/').filter(|s| !s.is_empty()).collect();
@@ -2032,6 +2107,7 @@ mod tests {
                 cache: "public".to_string(),
                 headers: vec![],
                 specificity: route_specificity(&compile_pattern("/blog/{stem}")),
+                last_modified: None,
             },
             CompiledRoute {
                 pattern: "/blog/about".to_string(),
@@ -2043,6 +2119,7 @@ mod tests {
                 cache: "public".to_string(),
                 headers: vec![],
                 specificity: route_specificity(&compile_pattern("/blog/about")),
+                last_modified: None,
             },
         ];
 
@@ -2379,5 +2456,107 @@ mod tests {
         };
         let req = Request::new(raw, dict, std::path::PathBuf::from("/tmp"));
         assert!(matches!(req.verify_csrf(), Err(Error::Forbidden)));
+    }
+}
+
+/// Newest mtime of any regular file beneath `dir`, or `None` for a missing or
+/// empty directory.
+///
+/// Walked once at load, never per request. Depth is bounded by `max_depth` so a
+/// symlink loop under the site directory cannot spin here -- templates are one
+/// or two levels deep in practice, and a runaway walk at startup would be a
+/// boot hang rather than a visible error.
+fn newest_mtime_under(dir: &std::path::Path) -> Option<std::time::SystemTime> {
+    fn walk(dir: &std::path::Path, depth: usize, newest: &mut Option<std::time::SystemTime>) {
+        if depth == 0 {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for e in entries.flatten() {
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_dir() {
+                walk(&e.path(), depth - 1, newest);
+            } else if ft.is_file() {
+                if let Some(t) = e.metadata().ok().and_then(|m| m.modified().ok()) {
+                    if newest.map_or(true, |n| t > n) {
+                        *newest = Some(t);
+                    }
+                }
+            }
+        }
+    }
+    let mut newest = None;
+    walk(dir, 8, &mut newest);
+    newest
+}
+
+#[cfg(test)]
+mod last_modified_tests {
+    use super::newest_mtime_under;
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn newest_mtime_is_none_for_a_missing_directory() {
+        assert!(newest_mtime_under(std::path::Path::new("/nonexistent/definitely")).is_none());
+    }
+
+    #[test]
+    fn newest_mtime_is_none_for_an_empty_directory() {
+        let d = tempfile::tempdir().unwrap();
+        assert!(newest_mtime_under(d.path()).is_none());
+    }
+
+    /// The value has to be the NEWEST file, not the first or last walked:
+    /// a page's rendering depends on every template, so the most recently
+    /// edited one is what dates the output.
+    #[test]
+    fn newest_mtime_picks_the_most_recent_file() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("old.html"), b"a").unwrap();
+        std::fs::write(d.path().join("new.html"), b"b").unwrap();
+
+        let past = SystemTime::now() - Duration::from_secs(3600);
+        let recent = SystemTime::now() - Duration::from_secs(60);
+        filetime::set_file_mtime(d.path().join("old.html"), filetime::FileTime::from(past)).unwrap();
+        filetime::set_file_mtime(d.path().join("new.html"), filetime::FileTime::from(recent)).unwrap();
+
+        let got = newest_mtime_under(d.path()).expect("some mtime");
+        let delta = got.duration_since(recent).unwrap_or_else(|e| e.duration());
+        assert!(delta < Duration::from_secs(2), "expected the newer file's mtime");
+    }
+
+    /// Partials commonly live in a subdirectory; a change to one of those must
+    /// still date the output.
+    #[test]
+    fn newest_mtime_descends_into_subdirectories() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("page.html"), b"a").unwrap();
+        std::fs::create_dir(d.path().join("partials")).unwrap();
+        std::fs::write(d.path().join("partials/_head.html"), b"b").unwrap();
+
+        let past = SystemTime::now() - Duration::from_secs(7200);
+        let recent = SystemTime::now() - Duration::from_secs(30);
+        filetime::set_file_mtime(d.path().join("page.html"), filetime::FileTime::from(past)).unwrap();
+        filetime::set_file_mtime(d.path().join("partials/_head.html"), filetime::FileTime::from(recent)).unwrap();
+
+        let got = newest_mtime_under(d.path()).expect("some mtime");
+        let delta = got.duration_since(recent).unwrap_or_else(|e| e.duration());
+        assert!(delta < Duration::from_secs(2), "a nested partial should date the output");
+    }
+
+    /// The walk is depth-bounded so a symlink loop under the site directory
+    /// cannot hang startup. Nothing legitimate is this deep.
+    #[test]
+    fn newest_mtime_walk_is_depth_bounded() {
+        let d = tempfile::tempdir().unwrap();
+        let mut p = d.path().to_path_buf();
+        for i in 0..20 {
+            p = p.join(format!("d{i}"));
+            std::fs::create_dir(&p).unwrap();
+        }
+        std::fs::write(p.join("deep.html"), b"x").unwrap();
+        // Returns rather than recursing forever; the too-deep file is simply
+        // not counted, which is the safe direction.
+        assert!(newest_mtime_under(d.path()).is_none());
     }
 }

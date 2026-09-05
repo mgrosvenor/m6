@@ -11,6 +11,56 @@ Deploy order is fixed: **test locally, commit, then deploy.** Never the reverse.
 
 ---
 
+## 2026-09-06 — `Last-Modified` on rendered HTML
+
+The last of the three caching defects from the owner's audit. m6-html emitted an
+`ETag`, so `If-None-Match` validated correctly, but there was no `Last-Modified`
+at all — so a client or tool validating by date got the entire page back every
+time. `/` is 52 KB, which is exactly the figure the audit reported.
+
+**The hard part was deciding what value is truthful, not where to put it.** A
+rendered page has no file of its own to stat. It does have inputs, and their
+mtimes are an honest answer:
+
+- **Templates, pooled.** They include each other — `_head.html`, `_banner.html`
+  and `_footer.html` are on every page — so the newest template dates every
+  route. Resolving the transitive include set per route would be a lot of
+  machinery to make one date slightly tighter, and pooling errs toward
+  revalidating, which costs a request rather than serving something stale.
+- **Params, per route.** This is where precision pays: editing a publication
+  should not make `/capabilities` look modified. Visible in the live output —
+  `/` reads its own `timeline.json` mtime while the other pages read the
+  template floor.
+
+Computed once when the framework state is built and recomputed on reload, so it
+costs nothing per request. Emitted only on a success: a validator on a 404 or a
+500 invites a client to revalidate an error as though it were content.
+
+**Omitted rather than guessed** in the two cases where no honest value exists: a
+code route, whose handler decides at request time, and a route whose params path
+carries a `{placeholder}`, which resolves per request. RFC 9110 permits omitting
+the header, and a wrong date is far worse than an absent one.
+
+No change was needed in m6-http: `cache::is_not_modified` already checked
+`If-Modified-Since` against a cached entry's `Last-Modified`. It simply never
+had one to compare against for rendered HTML.
+
+The directory walk is depth-bounded (8) so a symlink loop under the site
+directory cannot hang startup, and that bound is tested.
+
+544 workspace tests pass, zero warnings. Verified locally: header present on
+every page, `If-Modified-Since` with the exact value returns 304, with an epoch
+date returns 200 and the full 16,678 bytes.
+
+**Deploy note:** m6-render is a path dependency of **four** binaries — m6-html,
+render-contact, render-analytics and render-cms. `m6-html` was covered by
+neither deploy script (not `deploy-platform.sh`, and not `deploy.sh --binary`,
+whose loop is only the three site-repo renderers). That is the same multi-binary
+trap that took `/contact` down previously; `deploy-platform.sh` now builds,
+installs and restarts m6-html alongside m6-http and m6-file.
+
+---
+
 ## 2026-09-06 — Method validation and HEAD framing
 
 Two coupled defects from the owner's audit, fixed together because fixing
