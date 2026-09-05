@@ -11,6 +11,55 @@ Deploy order is fixed: **test locally, commit, then deploy.** Never the reverse.
 
 ---
 
+## 2026-09-06 — 501 vs 405, case-sensitive methods, and two more allocation bounds
+
+### An unrecognised method is 501, not 405 (F016)
+
+RFC 9110 15.5.6 vs 15.6.2: 405 means the method is *known* and the resource
+will not do it, and MUST carry `Allow`; 501 means the server does not implement
+the method at all. Everything got 405, which claims knowledge of an invented
+verb and points the client at the resource when the method is the problem.
+
+This one was mine — introduced with the method gate earlier the same day.
+
+### The method gate could be bypassed by changing case
+
+Found while testing the above, and the more serious of the two.
+
+`method_may_read_cache` compared with `eq_ignore_ascii_case`, while the
+configured allow-list compares exactly. The cache lookup runs **before** the
+method gate, so a request with method `get` matched the cache predicate, was
+served from cache, and never reached the check that would have refused it.
+
+RFC 9110 9.1 makes the method token case-sensitive, so `get` is simply not GET.
+Both cache predicates are now exact matches. The general lesson is the one
+worth keeping: two comparisons of the same thing, in different places, that
+disagree about case is a bypass waiting to be found.
+
+Verified on a raw socket: `get`, `Get` and `head` now return 501 where they
+previously returned 200 from cache.
+
+### `HTTP/1.1 501 Unknown`
+
+501 was missing from the reason-phrase table and fell through to the default,
+so the server emitted a real status with a phrase describing nothing. Added,
+along with 504.
+
+### Two more unbounded allocations (H003, H004)
+
+- **H003, the sharper one.** `vec![0u8; len]` allocated the backend's declared
+  `Content-Length` *before reading a byte*, so a backend declaring 4 GB
+  allocated 4 GB immediately. Now refused above 128 MiB — before allocating,
+  since the allocation is the damage. The bodyless read-to-EOF path was
+  unbounded the same way and is now capped too.
+- **H004.** H3 request bodies accumulated with no ceiling, the same defect
+  fixed for h2 earlier. Same 20 MiB limit so the two protocols cannot disagree
+  about what is acceptable; over-limit streams get a 413 and are reset.
+
+590 workspace tests pass across two consecutive runs, zero warnings.
+
+---
+
 ## 2026-09-06 — HTTP/2 frame validation: a remote panic, and flow-control accounting
 
 From the RFC audit, revision 1. The first item is the reason this jumped the queue.
