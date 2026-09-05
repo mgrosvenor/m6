@@ -449,6 +449,7 @@ fn event_loop(
                         }
                         set_alt_svc(&mut headers, quic_port);
                         set_vary_accept_encoding(&mut headers);
+                        set_describedby_link(&mut headers, &state.config.site.describedby);
                         debug!(
                             path = %req.path,
                             status = cached.status,
@@ -571,6 +572,7 @@ fn event_loop(
                         }
                         set_alt_svc(&mut headers, quic_port);
                         set_vary_accept_encoding(&mut headers);
+                        set_describedby_link(&mut headers, &state.config.site.describedby);
                         debug!(
                             path = %req.path,
                             status = cached.status,
@@ -1097,6 +1099,7 @@ fn handle_h3_request(
             headers_with_links.push(("link".to_string(), hints::link_header(url)));
         }
         set_vary_accept_encoding(&mut headers_with_links);
+        set_describedby_link(&mut headers_with_links, &state.config.site.describedby);
         set_alt_svc(&mut headers_with_links, quic_port);
         if let (Some(sc), true) = (set_cookie, analytics::is_html_response(&headers_with_links)) {
             headers_with_links.push(("Set-Cookie".to_string(), sc));
@@ -1404,9 +1407,11 @@ fn handle_request(
     state: &mut ServerState,
     is_prefetch: bool,
 ) -> RequestOutcome {
+    let describedby = state.config.site.describedby.clone();
     let mut outcome = handle_request_inner(req, client_ip, content_encoding, state, is_prefetch);
     if let RequestOutcome::Ready(_, ref mut headers, _, _, _) = outcome {
         set_vary_accept_encoding(headers);
+        set_describedby_link(headers, &describedby);
     }
     outcome
 }
@@ -2015,6 +2020,34 @@ fn set_vary_accept_encoding(headers: &mut Vec<(String, String)>) {
     headers.push(("vary".to_string(), fields.join(", ")));
 }
 
+/// Advertise the site's machine-readable description on every HTML response:
+/// `Link: </llms.txt>; rel="describedby"`.
+///
+/// Header rather than only `<link rel="describedby">` in `<head>` because it
+/// arrives before the page is parsed — anything inspecting response headers on
+/// its first request finds the machine-facing layer without reading markup.
+/// The site ships both; the markup one covers readers that only see the
+/// document.
+///
+/// HTML only. A `Link: rel="describedby"` on a stylesheet or a PNG would be
+/// noise: llms.txt describes the *site*, and every asset claiming to be
+/// described by it says nothing useful and inflates every asset response.
+///
+/// Same duplication hazard as `set_alt_svc`: a cache node's backend is the
+/// origin, which already added this header before the response was forwarded
+/// and cached, so the node would otherwise emit two. Existing `describedby`
+/// links are dropped first — and *only* those, because `Link` is also carrying
+/// the preload hints, which must survive untouched.
+fn set_describedby_link(headers: &mut Vec<(String, String)>, target: &str) {
+    if target.is_empty() || !analytics::is_html_response(headers) {
+        return;
+    }
+    headers.retain(|(k, v)| {
+        !(k.eq_ignore_ascii_case("link") && v.to_ascii_lowercase().contains("rel=\"describedby\""))
+    });
+    headers.push(("link".to_string(), format!("<{target}>; rel=\"describedby\"")));
+}
+
 /// Called when a URL-backend I/O thread returns its result.  Handles cache
 /// insertion, hints extraction, alt-svc injection, and error mode application.
 ///
@@ -2029,8 +2062,10 @@ fn finalize_url_response(
     quic_port:   u16,
     state:       &mut ServerState,
 ) -> (u16, Vec<(String, String)>, Vec<u8>, String, std::sync::Arc<Vec<String>>) {
+    let describedby = state.config.site.describedby.clone();
     let mut r = finalize_url_response_inner(http_result, ctx, quic_port, state);
     set_vary_accept_encoding(&mut r.1);
+    set_describedby_link(&mut r.1, &describedby);
     r
 }
 
@@ -2658,6 +2693,7 @@ mod www_redirect_tests {
                 name: "Test".to_string(),
                 domain: domain.to_string(),
                 redirect_www,
+                describedby: String::new(),
             },
             server: ServerConfig {
                 bind: "127.0.0.1:8443".to_string(),
@@ -2959,5 +2995,78 @@ mod vary_tests {
         let mut h = hdrs(&[("cache-control", "public"), ("content-type", "text/css")]);
         set_vary_accept_encoding(&mut h);
         assert!(should_cache(200, &h));
+    }
+}
+
+#[cfg(test)]
+mod describedby_tests {
+    use super::*;
+
+    fn hdrs(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    fn links(h: &[(String, String)]) -> Vec<&str> {
+        h.iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("link"))
+            .map(|(_, v)| v.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn html_gets_the_header() {
+        let mut h = hdrs(&[("content-type", "text/html; charset=utf-8")]);
+        set_describedby_link(&mut h, "/llms.txt");
+        assert_eq!(links(&h), vec!["</llms.txt>; rel=\"describedby\""]);
+    }
+
+    /// llms.txt describes the site, not a stylesheet. Attaching it to every
+    /// asset response would be noise on the majority of requests.
+    #[test]
+    fn non_html_does_not() {
+        for ct in ["text/css", "image/png", "application/json", "text/markdown"] {
+            let mut h = hdrs(&[("content-type", ct)]);
+            set_describedby_link(&mut h, "/llms.txt");
+            assert!(links(&h).is_empty(), "{ct} should not carry the header");
+        }
+    }
+
+    /// A deployment with no such file must not advertise one.
+    #[test]
+    fn empty_target_omits_it() {
+        let mut h = hdrs(&[("content-type", "text/html")]);
+        set_describedby_link(&mut h, "");
+        assert!(links(&h).is_empty());
+    }
+
+    /// A cache node's backend is the origin, which already added this before
+    /// the response was forwarded and cached. Without the dedupe the node
+    /// emits two.
+    #[test]
+    fn does_not_duplicate_what_the_origin_already_sent() {
+        let mut h = hdrs(&[
+            ("content-type", "text/html"),
+            ("link", "</llms.txt>; rel=\"describedby\""),
+        ]);
+        set_describedby_link(&mut h, "/llms.txt");
+        assert_eq!(links(&h).len(), 1);
+    }
+
+    /// The one that would be easy to break: `Link` also carries the preload
+    /// hints. Only the describedby entry may be replaced.
+    #[test]
+    fn preserves_preload_link_headers() {
+        let mut h = hdrs(&[
+            ("content-type", "text/html"),
+            ("link", "</assets/css/style.css>; rel=preload; as=style"),
+            ("link", "</llms.txt>; rel=\"describedby\""),
+            ("link", "</assets/fonts/m.woff2>; rel=preload; as=font"),
+        ]);
+        set_describedby_link(&mut h, "/llms.txt");
+        let l = links(&h);
+        assert_eq!(l.len(), 3, "expected two preloads plus one describedby, got {l:?}");
+        assert!(l.iter().any(|v| v.contains("style.css")));
+        assert!(l.iter().any(|v| v.contains("m.woff2")));
+        assert_eq!(l.iter().filter(|v| v.contains("describedby")).count(), 1);
     }
 }

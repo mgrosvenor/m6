@@ -40,6 +40,20 @@ pub struct SiteConfig {
     /// name rather than through the GeoDNS-routed apex.
     #[serde(default = "default_true")]
     pub redirect_www: bool,
+    /// Path to a machine-readable description of the site (conventionally
+    /// `/llms.txt`). When set, every **HTML** response carries
+    /// `Link: <path>; rel="describedby"`.
+    ///
+    /// The point of the header over the equivalent `<link rel="describedby">`
+    /// in `<head>` is that it arrives before the page is parsed, so anything
+    /// inspecting response headers on its first request discovers the site's
+    /// machine-facing layer without reading any markup. Both are worth having;
+    /// the markup one is the fallback for readers that only see the document.
+    ///
+    /// Empty (the default) omits the header, so a deployment without such a
+    /// file does not advertise one.
+    #[serde(default)]
+    pub describedby: String,
 }
 
 /// This deployment's node identity (e.g. "sydney", "london") — distinct from
@@ -403,6 +417,7 @@ struct RawSiteSection {
     name: Option<String>,
     domain: Option<String>,
     redirect_www: Option<bool>,
+    describedby: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -495,7 +510,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
 
     // Validate [site] required keys
     let raw_site = site_parsed.site
-        .unwrap_or(RawSiteSection { name: None, domain: None, redirect_www: None });
+        .unwrap_or(RawSiteSection { name: None, domain: None, redirect_www: None, describedby: None });
     let site_name = raw_site.name
         .ok_or_else(|| anyhow::anyhow!("config error: [site].name is required"))?;
     let site_domain = raw_site.domain
@@ -627,6 +642,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
             name: site_name,
             domain: site_domain,
             redirect_www: raw_site.redirect_www.unwrap_or(true),
+            describedby: raw_site.describedby.unwrap_or_default(),
         },
         node,
         server,
