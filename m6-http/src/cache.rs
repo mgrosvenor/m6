@@ -813,6 +813,108 @@ mod tests {
         assert_eq!(hit.unwrap().body, b"cached body" as &[u8]);
     }
 
+    // ── Encoding fidelity ────────────────────────────────────────────────
+    //
+    // A shared cache keyed partly on Accept-Encoding is only correct while the
+    // stored body is actually encoded the way its key implies. Getting that
+    // wrong does not surface as a miss -- it silently hands the wrong bytes to
+    // every client that shares the key. It happened: a background refresh
+    // fetched without Accept-Encoding, got an identity body, and stored it
+    // under the key for `gzip, deflate, br, zstd`, so browsers downloaded a
+    // 44KB stylesheet where 7KB brotli was advertised, refreshing itself back
+    // into that state every 60s.
+
+    fn encoded(enc: &str, body: &'static [u8]) -> CachedResponse {
+        let mut headers = vec![("content-type".to_string(), "text/css".to_string())];
+        if !enc.is_empty() {
+            headers.push(("content-encoding".to_string(), enc.to_string()));
+        }
+        CachedResponse {
+            status: 200,
+            headers: std::sync::Arc::new(headers),
+            body: bytes::Bytes::from_static(body),
+            hints: std::sync::Arc::new(vec![]),
+        }
+    }
+
+    fn content_encoding_of(r: &CachedResponse) -> Option<&str> {
+        r.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-encoding"))
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// Round-trip: whatever encoding went in comes back out. A cache that
+    /// dropped or rewrote Content-Encoding would leave clients unable to
+    /// decode the body at all.
+    #[test]
+    fn test_stored_content_encoding_survives_round_trip() {
+        let cache = Cache::new();
+        for (key_enc, resp_enc) in [
+            ("gzip, deflate, br, zstd", "br"),
+            ("gzip, deflate", "gzip"),
+            ("br", "br"),
+            ("", ""),
+        ] {
+            let key = CacheKey::new("/assets/css/style.css", None, key_enc);
+            cache.insert(key.clone(), encoded(resp_enc, b"body"));
+            let got = cache.get(&key).expect("just inserted");
+            assert_eq!(
+                content_encoding_of(&got),
+                if resp_enc.is_empty() { None } else { Some(resp_enc) },
+                "content-encoding must survive for key {key_enc:?}"
+            );
+        }
+    }
+
+    /// The exact live failure: an identity body written under the key a browser
+    /// uses. Distinct Accept-Encoding strings are distinct keys, so a correct
+    /// entry under `br` does nothing to protect the browser's key -- which is
+    /// precisely why hand-probing with `Accept-Encoding: br` looked healthy
+    /// while every real visitor got the uncompressed body.
+    #[test]
+    fn test_identity_body_under_a_browser_key_does_not_mask_itself() {
+        let cache = Cache::new();
+        let browser = CacheKey::new("/assets/css/style.css", None, "gzip, deflate, br, zstd");
+        let probe = CacheKey::new("/assets/css/style.css", None, "br");
+
+        cache.insert(probe.clone(), encoded("br", b"small"));
+        cache.insert(browser.clone(), encoded("", b"this-is-the-large-identity-body"));
+
+        // Probing the `br` key reports health it cannot vouch for.
+        assert_eq!(content_encoding_of(&cache.get(&probe).unwrap()), Some("br"));
+        // The key browsers actually use is the broken one.
+        assert_eq!(content_encoding_of(&cache.get(&browser).unwrap()), None);
+        assert_ne!(
+            cache.get(&probe).unwrap().body,
+            cache.get(&browser).unwrap().body,
+            "the two keys are independent -- one being correct proves nothing about the other"
+        );
+    }
+
+    /// A refresh overwriting an entry must not silently change its encoding.
+    /// This is the shape of the regression: same key, same URL, body that was
+    /// compressed yesterday and is not today.
+    #[test]
+    fn test_refresh_overwriting_with_a_different_encoding_is_observable() {
+        let cache = Cache::new();
+        let key = CacheKey::new("/assets/css/style.css", None, "gzip, deflate, br, zstd");
+
+        cache.insert(key.clone(), encoded("br", b"compressed"));
+        let before = content_encoding_of(&cache.get(&key).unwrap()).map(str::to_string);
+        assert_eq!(before.as_deref(), Some("br"));
+
+        // What the broken refresh did.
+        cache.insert(key.clone(), encoded("", b"identity-and-much-larger"));
+        let after = content_encoding_of(&cache.get(&key).unwrap()).map(str::to_string);
+
+        assert_ne!(
+            before, after,
+            "an encoding change across a refresh is exactly the corruption to catch"
+        );
+        assert_eq!(after, None);
+    }
+
     #[test]
     fn test_make_lookup_key_matches_cache_key() {
         let key = CacheKey::new("/foo/bar", None, "gzip");

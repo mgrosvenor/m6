@@ -2738,6 +2738,46 @@ mod refresh_request_tests {
         assert!(req.headers.is_empty());
     }
 
+    /// The coupling that actually broke: `handle_request` is told the encoding
+    /// separately (it becomes the cache-key component) while the backend only
+    /// learns it from the request's own `Accept-Encoding`. If those two ever
+    /// disagree, the cache stores a body encoded one way under a key promising
+    /// another, and every subsequent hit serves the wrong bytes. Assert they
+    /// describe the same thing rather than trusting two call sites to agree.
+    #[test]
+    fn requested_encoding_matches_the_key_it_is_stored_under() {
+        for enc in ["gzip, deflate, br, zstd", "br", "gzip", ""] {
+            let r = Refresh {
+                path: "/assets/css/style.css".to_string(),
+                query: Some("v=2".to_string()),
+                enc: enc.to_string(),
+            };
+            let req = synth_refresh_request(&r);
+            let sent = req
+                .headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("accept-encoding"))
+                .map(|(_, v)| v.as_str())
+                .unwrap_or("");
+
+            // What the backend is asked for...
+            assert_eq!(sent, enc, "Accept-Encoding sent must equal the refresh encoding");
+
+            // ...must be the same string the entry is keyed on. Both sides of
+            // the comparison are built the way the event loop builds them.
+            let mut a = [0u8; 512];
+            let mut b = [0u8; 512];
+            let key_from_refresh =
+                make_lookup_key(&r.path, r.query.as_deref(), &r.enc, &mut a);
+            let key_from_request =
+                make_lookup_key(&req.path, req.query.as_deref(), sent, &mut b);
+            assert_eq!(
+                key_from_refresh, key_from_request,
+                "refresh for enc {enc:?} would store under a different key than it requested"
+            );
+        }
+    }
+
     #[test]
     fn query_is_preserved_so_the_key_matches() {
         let r = Refresh {
