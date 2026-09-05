@@ -183,9 +183,16 @@ fn make_quiche_config(server_config: &config::ServerConfig) -> anyhow::Result<qu
     let mut cfg = quiche::Config::new(quiche::PROTOCOL_VERSION)
         .context("quiche::Config::new")?;
 
-    cfg.load_cert_chain_from_pem_file(&server_config.tls_cert)
+    // QUIC is never started in redirect mode, so both are Some by the time we
+    // get here; erroring rather than unwrapping keeps that a diagnosable
+    // config failure instead of a panic if the call ever moves.
+    let tls_cert = server_config.tls_cert.as_deref()
+        .context("[server].tls_cert is required to serve QUIC")?;
+    let tls_key = server_config.tls_key.as_deref()
+        .context("[server].tls_key is required to serve QUIC")?;
+    cfg.load_cert_chain_from_pem_file(tls_cert)
         .context("load cert chain")?;
-    cfg.load_priv_key_from_pem_file(&server_config.tls_key)
+    cfg.load_priv_key_from_pem_file(tls_key)
         .context("load private key")?;
 
     // ALPN: h3
@@ -2358,11 +2365,17 @@ fn run(args: Vec<String>) -> i32 {
         }
     };
 
-    // Build TLS config for HTTP/1.1 and bind TCP listener on the same port
-    let tcp_listener = match make_tls_server_config(
-        &config.server.tls_cert,
-        &config.server.tls_key,
-    ) {
+    // Build TLS config for HTTP/1.1 and bind TCP listener on the same port.
+    // Both are Some on this path: redirect mode returned above, and every other
+    // mode has them enforced as required keys by config::load().
+    let (tls_cert, tls_key) = match (&config.server.tls_cert, &config.server.tls_key) {
+        (Some(c), Some(k)) => (c, k),
+        _ => {
+            eprintln!("config error: [server].tls_cert and [server].tls_key are required to serve TLS");
+            return 2;
+        }
+    };
+    let tcp_listener = match make_tls_server_config(tls_cert, tls_key) {
         Ok(tls_cfg) => match Http11Listener::bind(&config.server.bind, tls_cfg) {
             Ok(l) => {
                 info!(bind = %config.server.bind, "HTTP/1.1 over TLS listener started");

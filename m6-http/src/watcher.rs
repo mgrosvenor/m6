@@ -107,7 +107,12 @@ impl FsWatcher {
             }
 
             let mut tls_filenames: Vec<String> = Vec::new();
-            let tls_paths = [&config.server.tls_cert, &config.server.tls_key];
+            // Empty in redirect mode, which has no certificate to watch.
+            let tls_paths: Vec<&String> =
+                [config.server.tls_cert.as_ref(), config.server.tls_key.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .collect();
             let mut watched_dirs: HashSet<std::path::PathBuf> = HashSet::new();
             for tls_path_str in &tls_paths {
                 let tls_path = std::path::Path::new(tls_path_str);

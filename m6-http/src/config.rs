@@ -43,8 +43,14 @@ pub struct NodeConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     pub bind: String,
-    pub tls_cert: String,
-    pub tls_key: String,
+    /// TLS certificate/key. `None` only in redirect mode (see `redirect_bind`),
+    /// which terminates no TLS — every serving path requires both, and `load()`
+    /// rejects a config that omits them outside that mode. Typed as `Option`
+    /// rather than defaulted to a dummy path so "no certificate here" is a
+    /// state the compiler knows about, not a convention a future reader has to
+    /// infer from an empty string.
+    pub tls_cert: Option<String>,
+    pub tls_key: Option<String>,
     /// Timeout in seconds for a backend call (connect + write + read). Default: 30.
     #[serde(default = "default_backend_timeout_secs")]
     pub backend_timeout_secs: u64,
@@ -443,21 +449,36 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         redirect_bind: None,
     });
 
-    let bind = sys_server.bind.or(site_server.bind)
-        .ok_or_else(|| anyhow::anyhow!("config error: [server].bind is required"))?;
-    let tls_cert = sys_server.tls_cert.or(site_server.tls_cert)
-        .ok_or_else(|| anyhow::anyhow!("config error: [server].tls_cert is required"))?;
-    let tls_key = sys_server.tls_key.or(site_server.tls_key)
-        .ok_or_else(|| anyhow::anyhow!("config error: [server].tls_key is required"))?;
+    // Resolved before `bind`, because in redirect mode it supplies the default.
+    let redirect_bind = sys_server.redirect_bind.or(site_server.redirect_bind);
+
+    // A redirector binds `redirect_bind` and nothing else, so requiring a
+    // separate `bind` there would mean every redirect config carried the same
+    // address twice, or carried a second one that was never listened on.
+    let bind = match sys_server.bind.or(site_server.bind) {
+        Some(b) => b,
+        None => redirect_bind.clone().ok_or_else(|| {
+            anyhow::anyhow!("config error: [server].bind is required")
+        })?,
+    };
+    let tls_cert = sys_server.tls_cert.or(site_server.tls_cert);
+    let tls_key = sys_server.tls_key.or(site_server.tls_key);
+    if redirect_bind.is_none() {
+        if tls_cert.is_none() {
+            anyhow::bail!("config error: [server].tls_cert is required");
+        }
+        if tls_key.is_none() {
+            anyhow::bail!("config error: [server].tls_key is required");
+        }
+    }
     let backend_timeout_secs = sys_server.backend_timeout_secs
         .or(site_server.backend_timeout_secs)
         .unwrap_or(30);
     let h2c_bind = sys_server.h2c_bind.or(site_server.h2c_bind);
-    let redirect_bind = sys_server.redirect_bind.or(site_server.redirect_bind);
 
     // Resolve TLS cert/key paths relative to site_dir if not absolute.
-    let tls_cert_path = resolve_path(site_dir, &tls_cert);
-    let tls_key_path = resolve_path(site_dir, &tls_key);
+    let tls_cert_path = tls_cert.as_deref().map(|c| resolve_path(site_dir, c));
+    let tls_key_path = tls_key.as_deref().map(|k| resolve_path(site_dir, k));
 
     // Validate [site] required keys
     let raw_site = site_parsed.site.unwrap_or(RawSiteSection { name: None, domain: None });
@@ -479,8 +500,8 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
 
     let server = ServerConfig {
         bind,
-        tls_cert: tls_cert_path.to_string_lossy().into_owned(),
-        tls_key: tls_key_path.to_string_lossy().into_owned(),
+        tls_cert: tls_cert_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+        tls_key: tls_key_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
         backend_timeout_secs,
         h2c_bind,
         redirect_bind: redirect_bind.clone(),
@@ -498,11 +519,14 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
     // one -- and would fail to start on a node whose cert had expired, taking
     // out the plain-HTTP redirect for a reason that has nothing to do with it.
     if redirect_bind.is_none() {
-        if !tls_cert_path.exists() {
-            anyhow::bail!("config error: tls_cert file not found: {}", tls_cert_path.display());
-        }
-        if !tls_key_path.exists() {
-            anyhow::bail!("config error: tls_key file not found: {}", tls_key_path.display());
+        for (label, path) in [("tls_cert", &tls_cert_path), ("tls_key", &tls_key_path)] {
+            // Both are Some here: the required-key check above rejects a
+            // non-redirect config that omits either.
+            if let Some(path) = path {
+                if !path.exists() {
+                    anyhow::bail!("config error: {} file not found: {}", label, path.display());
+                }
+            }
         }
     }
 
@@ -950,6 +974,54 @@ tls_key = "key.pem"
 "#);
         let cfg = load(dir.path(), &dir.path().join("system.toml")).unwrap();
         assert_eq!(cfg.server.bind, "0.0.0.0:443");
+    }
+
+    /// A :80 redirector terminates no TLS, so it must load with no certificate
+    /// named at all — not merely with one that is allowed to point nowhere.
+    /// This is what lets every node's redirect config be a two-line file, and
+    /// what stops an expired cert from taking the plain-HTTP redirect down
+    /// with it.
+    #[test]
+    fn test_redirect_mode_needs_no_tls() {
+        let dir = make_test_dir();
+        write_file(dir.path(), "site.toml", r#"
+[site]
+name   = "Test"
+domain = "test.example.com"
+[server]
+redirect_bind = "0.0.0.0:80"
+"#);
+        write_file(dir.path(), "system.toml", "");
+        let cfg = load(dir.path(), &dir.path().join("system.toml")).unwrap();
+        assert_eq!(cfg.server.redirect_bind.as_deref(), Some("0.0.0.0:80"));
+        assert!(cfg.server.tls_cert.is_none());
+        assert!(cfg.server.tls_key.is_none());
+        // `bind` falls back to the redirect address rather than being a second
+        // copy of it in the file.
+        assert_eq!(cfg.server.bind, "0.0.0.0:80");
+    }
+
+    /// The other half of the contract: outside redirect mode the certificate
+    /// is still mandatory, so making it optional cannot let a serving node
+    /// boot without TLS.
+    #[test]
+    fn test_tls_still_required_when_not_redirecting() {
+        let dir = make_test_dir();
+        write_file(dir.path(), "site.toml", r#"
+[site]
+name   = "Test"
+domain = "test.example.com"
+[server]
+bind = "0.0.0.0:443"
+[[backend]]
+name = "b"
+sockets = "/run/m6/*.sock"
+"#);
+        write_file(dir.path(), "system.toml", "");
+        let err = load(dir.path(), &dir.path().join("system.toml"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("tls_cert"), "unexpected error: {err}");
     }
 
     #[test]

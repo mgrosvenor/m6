@@ -379,8 +379,8 @@ mod tests {
             site: SiteConfig { name: "Test".to_string(), domain: "test.example.com".to_string() },
             server: ServerConfig {
                 bind: "127.0.0.1:8443".to_string(),
-                tls_cert: "/tmp/cert.pem".to_string(),
-                tls_key: "/tmp/key.pem".to_string(),
+                tls_cert: Some("/tmp/cert.pem".to_string()),
+                tls_key: Some("/tmp/key.pem".to_string()),
                 backend_timeout_secs: 30,
                 h2c_bind: None,
                 redirect_bind: None,
@@ -515,8 +515,8 @@ params = ["data/home.json", "data/shared.json"]
             site: SiteConfig { name: "Test".to_string(), domain: "test.example.com".to_string() },
             server: ServerConfig {
                 bind: "127.0.0.1:8443".to_string(),
-                tls_cert: site_dir.join("cert.pem").to_string_lossy().into_owned(),
-                tls_key: site_dir.join("key.pem").to_string_lossy().into_owned(),
+                tls_cert: Some(site_dir.join("cert.pem").to_string_lossy().into_owned()),
+                tls_key: Some(site_dir.join("key.pem").to_string_lossy().into_owned()),
                 backend_timeout_secs: 30,
                 h2c_bind: None,
                 redirect_bind: None,
@@ -579,8 +579,8 @@ params = ["content/posts/{stem}.json"]
             site: SiteConfig { name: "Test".to_string(), domain: "test.example.com".to_string() },
             server: ServerConfig {
                 bind: "127.0.0.1:8443".to_string(),
-                tls_cert: site_dir.join("cert.pem").to_string_lossy().into_owned(),
-                tls_key: site_dir.join("key.pem").to_string_lossy().into_owned(),
+                tls_cert: Some(site_dir.join("cert.pem").to_string_lossy().into_owned()),
+                tls_key: Some(site_dir.join("key.pem").to_string_lossy().into_owned()),
                 backend_timeout_secs: 30,
                 h2c_bind: None,
                 redirect_bind: None,
@@ -625,8 +625,8 @@ params = ["content/posts/{stem}.json"]
             site: SiteConfig { name: "Test".to_string(), domain: "test.example.com".to_string() },
             server: ServerConfig {
                 bind: "127.0.0.1:8443".to_string(),
-                tls_cert: site_dir.join("cert.pem").to_string_lossy().into_owned(),
-                tls_key: site_dir.join("key.pem").to_string_lossy().into_owned(),
+                tls_cert: Some(site_dir.join("cert.pem").to_string_lossy().into_owned()),
+                tls_key: Some(site_dir.join("key.pem").to_string_lossy().into_owned()),
                 backend_timeout_secs: 30,
                 h2c_bind: None,
                 redirect_bind: None,
