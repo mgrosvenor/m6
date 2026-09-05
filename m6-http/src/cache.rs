@@ -161,52 +161,108 @@ pub fn make_lookup_key<'a>(
     }
 }
 
-/// The inner cache map.
-/// Freshness lifetime from a response's own `Cache-Control`, in seconds.
+/// How far ahead of the advertised lifetime this cache refreshes an entry.
 ///
-/// `s-maxage` wins over `max-age` when both are present: this is a shared
-/// cache, and that is exactly what `s-maxage` is for. `no-cache` means the
-/// response must be revalidated before every reuse — m6-http has no upstream
-/// revalidation path, so the honest equivalent is a zero lifetime (always a
-/// miss) rather than serving it unrevalidated.
-///
-/// `None` means no freshness lifetime was specified, which keeps the previous
-/// behaviour: the entry lives until an explicit invalidation. That is a
-/// deliberate CDN-style model (see `evict_path`/`clear` and
-/// deploy/invalidate-cache.sh), not an oversight — this only adds expiry for
-/// responses that actually asked for one.
-fn freshness_secs(headers: &[(String, String)]) -> Option<u64> {
-    let cc = headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("cache-control"))?
-        .1
-        .to_ascii_lowercase();
+/// An edge that expires at exactly `max-age` is always refreshing one step
+/// behind whoever asked: the browser's own copy goes stale at the same instant
+/// ours does, so its revalidation arrives to find us stale too. Expiring one
+/// second early means the background refresh has already landed by the time
+/// anything downstream comes asking — a `max-age=60` response becomes a
+/// 59-second local lifetime on a 60-second refresh cycle.
+const REFRESH_MARGIN: std::time::Duration = std::time::Duration::from_secs(1);
 
-    if cc.split(',').any(|d| d.trim() == "no-cache") {
-        return Some(0);
-    }
-
-    // s-maxage first, then max-age.
-    for directive in ["s-maxage", "max-age"] {
-        for part in cc.split(',') {
-            let part = part.trim();
-            if let Some(v) = part.strip_prefix(directive).and_then(|r| r.strip_prefix('=')) {
-                if let Ok(secs) = v.trim().parse::<u64>() {
-                    return Some(secs);
-                }
-            }
-        }
-    }
-    None
+/// What a response's own `Cache-Control` asks this cache to do.
+struct Directives {
+    /// Freshness lifetime. `None` = none specified: the entry lives until an
+    /// explicit invalidation, which is the deliberate CDN-style model the
+    /// deploy pipeline relies on (see `evict_path`/`clear` and
+    /// deploy/invalidate-cache.sh), not an oversight.
+    lifetime: Option<std::time::Duration>,
+    /// How long past `lifetime` this entry may still be served while a
+    /// refresh runs in the background (RFC 5861 `stale-while-revalidate`).
+    /// Zero — the default when the directive is absent — means never serve
+    /// stale.
+    stale_while_revalidate: std::time::Duration,
+    /// `no-cache` was present: reuse requires revalidation first.
+    ///
+    /// Tracked separately from a zero `lifetime` rather than inferred from
+    /// one, because the two are genuinely different. `max-age=0` means "stale
+    /// immediately" and pairs perfectly sensibly with stale-while-revalidate
+    /// — it is the normal way to say "always refresh, never make anyone
+    /// wait". `no-cache` forbids unrevalidated reuse outright.
+    no_cache: bool,
 }
 
-/// A stored entry: the response plus the instant it goes stale.
+/// Parse the directives this cache acts on out of a response's `Cache-Control`.
+///
+/// `s-maxage` wins over `max-age` when both are present: this is a shared
+/// cache, and that is exactly what `s-maxage` is for.
+fn directives(headers: &[(String, String)]) -> Directives {
+    let none = Directives {
+        lifetime: None,
+        stale_while_revalidate: std::time::Duration::ZERO,
+        no_cache: false,
+    };
+    let Some((_, cc)) = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("cache-control")) else {
+        return none;
+    };
+    let cc = cc.to_ascii_lowercase();
+
+    // Each name is matched anchored at the start of its own comma-separated
+    // token (`strip_prefix` on a trimmed part), so `max-age` cannot match
+    // inside `s-maxage` and neither can match inside `stale-while-revalidate`.
+    let secs = |name: &str| -> Option<u64> {
+        cc.split(',').find_map(|part| {
+            part.trim()
+                .strip_prefix(name)
+                .and_then(|r| r.strip_prefix('='))
+                .and_then(|v| v.trim().parse::<u64>().ok())
+        })
+    };
+
+    let no_cache = cc.split(',').any(|d| d.trim() == "no-cache");
+    let lifetime = if no_cache {
+        Some(std::time::Duration::ZERO)
+    } else {
+        secs("s-maxage")
+            .or_else(|| secs("max-age"))
+            .map(std::time::Duration::from_secs)
+    };
+
+    Directives {
+        lifetime,
+        stale_while_revalidate: secs("stale-while-revalidate")
+            .map(std::time::Duration::from_secs)
+            .unwrap_or(std::time::Duration::ZERO),
+        no_cache,
+    }
+}
+
+/// A stored entry: the response, when it goes stale, and how long past that it
+/// may still be served while a background refresh runs.
 ///
 /// `expires_at == None` means "no freshness lifetime given" — lives until
 /// explicit invalidation.
 struct CacheEntry {
     response: CachedResponse,
     expires_at: Option<std::time::Instant>,
+    /// Instant past which even a stale serve is refused. Equal to
+    /// `expires_at` when the response did not permit stale serving at all.
+    serve_stale_until: Option<std::time::Instant>,
+}
+
+/// The result of a cache lookup.
+pub enum Lookup {
+    /// Inside its freshness lifetime — serve it, nothing else to do.
+    Fresh(CachedResponse),
+    /// Past freshness but inside the stale-while-revalidate window. Serve it
+    /// immediately — the whole point is that no visitor ever waits on an
+    /// origin round trip — and queue a background refresh so the *next*
+    /// request gets the new copy. Costs at most one stale serve per entry per
+    /// expiry.
+    Stale(CachedResponse),
+    /// Nothing usable: absent, or stale beyond what the response permits.
+    Miss,
 }
 
 type CacheMap = AHashMap<CacheKey, CacheEntry>;
@@ -231,35 +287,75 @@ impl Cache {
     /// - `&str` — zero-allocation hot-path lookup via `make_lookup_key`
     /// - `&CacheKey` — legacy/test usage (blanket `Borrow<CacheKey>` impl)
     ///
-    /// An entry past its freshness lifetime is treated as a miss. Expiry is
-    /// checked here, on read, rather than swept by a background task: a stale
-    /// entry costs nothing until someone asks for it, and the miss that
-    /// follows overwrites it. This keeps expiry off the write path entirely
-    /// and needs no timer thread.
+    /// Only a *fresh* entry — a stale one reads as absent. This is the right
+    /// question for "is this already cached?" callers (hint dedup, the
+    /// background-refresh guard), for which a stale entry is precisely one
+    /// that does still need fetching. Serving paths want `lookup` instead, so
+    /// they can serve stale rather than making a visitor wait.
     pub fn get<Q>(&self, key: &Q) -> Option<CachedResponse>
     where
         CacheKey: std::borrow::Borrow<Q>,
         Q: std::hash::Hash + Eq + ?Sized,
     {
-        let map = self.map.read().ok()?;
-        let entry = map.get(key)?;
-        match entry.expires_at {
-            // Checked before the clone, so an expired entry costs no copy.
-            Some(deadline) if std::time::Instant::now() >= deadline => None,
-            _ => Some(entry.response.clone()),
+        match self.lookup(key) {
+            Lookup::Fresh(r) => Some(r),
+            Lookup::Stale(_) | Lookup::Miss => None,
+        }
+    }
+
+    /// Look up an entry, distinguishing fresh from servable-but-stale.
+    ///
+    /// Expiry is evaluated here, on read, rather than swept by a background
+    /// task: a stale entry costs nothing until someone asks for it, and the
+    /// refresh it triggers overwrites it. That keeps expiry off the write path
+    /// entirely and needs no timer thread.
+    pub fn lookup<Q>(&self, key: &Q) -> Lookup
+    where
+        CacheKey: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
+        let Ok(map) = self.map.read() else { return Lookup::Miss };
+        let Some(entry) = map.get(key) else { return Lookup::Miss };
+        // Every branch decides before cloning, so a miss costs no copy.
+        let Some(expires_at) = entry.expires_at else {
+            return Lookup::Fresh(entry.response.clone());
+        };
+        let now = std::time::Instant::now();
+        if now < expires_at {
+            Lookup::Fresh(entry.response.clone())
+        } else if entry.serve_stale_until.is_some_and(|until| now < until) {
+            Lookup::Stale(entry.response.clone())
+        } else {
+            Lookup::Miss
         }
     }
 
     /// Store a response. Only call if the response should be cached.
     ///
-    /// The freshness deadline is derived from the response's own
-    /// `Cache-Control` here rather than passed in, so every caller gets
-    /// correct expiry without having to know about it.
+    /// Deadlines are derived from the response's own `Cache-Control` here
+    /// rather than passed in, so every caller gets correct expiry without
+    /// having to know about it.
     pub fn insert(&self, key: CacheKey, response: CachedResponse) {
-        let expires_at = freshness_secs(&response.headers)
-            .map(|secs| std::time::Instant::now() + std::time::Duration::from_secs(secs));
+        let d = directives(&response.headers);
+        let now = std::time::Instant::now();
+        // The margin is why a max-age=60 response expires locally at 59s. It
+        // saturates rather than wrapping, so a zero lifetime stays zero.
+        let expires_at = d.lifetime.map(|l| now + l.saturating_sub(REFRESH_MARGIN));
+        // `no-cache` forbids a stale serve outright and outranks any
+        // stale-while-revalidate the same response happens to carry —
+        // otherwise the two together would produce exactly the unrevalidated
+        // reuse `no-cache` exists to prevent. Note this is keyed on `no_cache`
+        // and not on a zero lifetime: `max-age=0, stale-while-revalidate=N` is
+        // the normal, valid way to say "always refresh, never make anyone
+        // wait", and must keep its stale window.
+        let stale_window = if d.no_cache {
+            std::time::Duration::ZERO
+        } else {
+            d.stale_while_revalidate
+        };
+        let serve_stale_until = expires_at.map(|e| e + stale_window);
         if let Ok(mut map) = self.map.write() {
-            map.insert(key, CacheEntry { response, expires_at });
+            map.insert(key, CacheEntry { response, expires_at, serve_stale_until });
         }
     }
 
@@ -496,6 +592,16 @@ mod tests {
         cache.get(lk)
     }
 
+    fn lookup_path(cache: &Cache, path: &str) -> Lookup {
+        let mut buf = [0u8; 512];
+        let lk = make_lookup_key(path, None, "", &mut buf);
+        cache.lookup(lk)
+    }
+
+    fn cc(v: &str) -> Vec<(String, String)> {
+        vec![("Cache-Control".to_string(), v.to_string())]
+    }
+
     /// `max-age=0` is already stale the instant it lands, so it must read back
     /// as a miss rather than being served once for free.
     #[test]
@@ -506,6 +612,7 @@ mod tests {
             cached_with_cc("public, max-age=0"),
         );
         assert!(get_path(&cache, "/hello").is_none());
+        assert!(matches!(lookup_path(&cache, "/hello"), Lookup::Miss));
     }
 
     #[test]
@@ -515,7 +622,7 @@ mod tests {
             CacheKey::new("/hello", None, ""),
             cached_with_cc("public, max-age=3600"),
         );
-        assert!(get_path(&cache, "/hello").is_some());
+        assert!(matches!(lookup_path(&cache, "/hello"), Lookup::Fresh(_)));
     }
 
     /// No freshness lifetime means the entry lives until it is explicitly
@@ -525,7 +632,76 @@ mod tests {
     fn test_cache_without_max_age_never_expires() {
         let cache = Cache::new();
         cache.insert(CacheKey::new("/hello", None, ""), cached_with_cc("public"));
-        assert!(get_path(&cache, "/hello").is_some());
+        assert!(matches!(lookup_path(&cache, "/hello"), Lookup::Fresh(_)));
+    }
+
+    /// The whole point of stale-while-revalidate: once past freshness the
+    /// entry is still served (so no visitor waits on origin), flagged so the
+    /// caller knows to refresh it in the background.
+    #[test]
+    fn test_expired_entry_is_served_stale_within_swr_window() {
+        let cache = Cache::new();
+        cache.insert(
+            CacheKey::new("/hello", None, ""),
+            cached_with_cc("public, max-age=0, stale-while-revalidate=3600"),
+        );
+        match lookup_path(&cache, "/hello") {
+            Lookup::Stale(r) => assert_eq!(r.body, b"world" as &[u8]),
+            _ => panic!("expected a stale serve, not a miss"),
+        }
+        // `get` is the fresh-only question, so it must still say no — that is
+        // what makes the background-refresh guard proceed for this entry.
+        assert!(get_path(&cache, "/hello").is_none());
+    }
+
+    /// Without the directive there is no stale window, so an expired entry is
+    /// a hard miss. Stale serving is opt-in per response, exactly like max-age.
+    #[test]
+    fn test_expired_without_swr_directive_is_a_miss() {
+        let cache = Cache::new();
+        cache.insert(
+            CacheKey::new("/hello", None, ""),
+            cached_with_cc("public, max-age=0"),
+        );
+        assert!(matches!(lookup_path(&cache, "/hello"), Lookup::Miss));
+    }
+
+    /// `no-cache` forbids reuse without revalidation. m6-http has no
+    /// revalidation path, so a stale-while-revalidate on the same response
+    /// must not talk it into serving stale anyway.
+    #[test]
+    fn test_no_cache_is_never_served_stale_even_with_swr() {
+        let cache = Cache::new();
+        cache.insert(
+            CacheKey::new("/hello", None, ""),
+            cached_with_cc("public, no-cache, stale-while-revalidate=3600"),
+        );
+        assert!(matches!(lookup_path(&cache, "/hello"), Lookup::Miss));
+    }
+
+    /// The refresh margin: a max-age=60 response is stored with a 59-second
+    /// lifetime, so the background refresh lands before anything downstream
+    /// considers its own copy stale.
+    #[test]
+    fn test_refresh_margin_shortens_lifetime() {
+        let d = directives(&cc("public, max-age=60"));
+        assert_eq!(d.lifetime, Some(std::time::Duration::from_secs(60)));
+        assert_eq!(
+            d.lifetime.unwrap() - REFRESH_MARGIN,
+            std::time::Duration::from_secs(59)
+        );
+    }
+
+    /// The margin saturates rather than wrapping — a zero lifetime must not
+    /// underflow into a near-infinite one.
+    #[test]
+    fn test_refresh_margin_saturates_at_zero() {
+        let cache = Cache::new();
+        cache.insert(
+            CacheKey::new("/hello", None, ""),
+            cached_with_cc("public, max-age=0"),
+        );
+        assert!(matches!(lookup_path(&cache, "/hello"), Lookup::Miss));
     }
 
     /// This is a shared cache, so `s-maxage` overrides `max-age` when both are
@@ -533,47 +709,43 @@ mod tests {
     #[test]
     fn test_s_maxage_overrides_max_age() {
         assert_eq!(
-            freshness_secs(&[(
-                "Cache-Control".to_string(),
-                "public, max-age=3600, s-maxage=0".to_string(),
-            )]),
-            Some(0)
+            directives(&cc("public, max-age=3600, s-maxage=0")).lifetime,
+            Some(std::time::Duration::ZERO)
         );
     }
 
     /// `no-cache` means revalidate before every reuse. There is no upstream
-    /// revalidation path here, so it has to read as a miss every time.
+    /// revalidation path here, so it has to read as a zero lifetime.
     #[test]
     fn test_no_cache_is_immediately_stale() {
         assert_eq!(
-            freshness_secs(&[(
-                "Cache-Control".to_string(),
-                "public, no-cache, max-age=600".to_string(),
-            )]),
-            Some(0)
+            directives(&cc("public, no-cache, max-age=600")).lifetime,
+            Some(std::time::Duration::ZERO)
         );
     }
 
-    /// `max-age` must not be matched inside `s-maxage` (or any other longer
-    /// token) when it is the only directive being looked for.
+    /// `max-age` must not be matched inside `s-maxage`, nor
+    /// `stale-while-revalidate` be read as either of them.
     #[test]
-    fn test_s_maxage_alone_is_not_read_as_max_age() {
+    fn test_directive_names_are_not_confused_for_each_other() {
         assert_eq!(
-            freshness_secs(&[("Cache-Control".to_string(), "s-maxage=42".to_string())]),
-            Some(42)
+            directives(&cc("s-maxage=42")).lifetime,
+            Some(std::time::Duration::from_secs(42))
         );
+        // stale-while-revalidate alone sets no lifetime.
+        let d = directives(&cc("public, stale-while-revalidate=99"));
+        assert_eq!(d.lifetime, None);
+        assert_eq!(d.stale_while_revalidate, std::time::Duration::from_secs(99));
     }
 
     #[test]
     fn test_freshness_absent_and_unparseable() {
-        assert_eq!(freshness_secs(&[]), None);
+        assert_eq!(directives(&[]).lifetime, None);
+        assert_eq!(directives(&cc("public")).lifetime, None);
+        assert_eq!(directives(&cc("max-age=abc")).lifetime, None);
         assert_eq!(
-            freshness_secs(&[("Cache-Control".to_string(), "public".to_string())]),
-            None
-        );
-        assert_eq!(
-            freshness_secs(&[("Cache-Control".to_string(), "max-age=abc".to_string())]),
-            None
+            directives(&cc("public")).stale_while_revalidate,
+            std::time::Duration::ZERO
         );
     }
 

@@ -98,14 +98,51 @@ struct ServerState {
     invalidation_map: HashMap<String, Vec<String>>,
     error_mode: ErrorMode,
     stats: Stats,
-    /// Paths queued for background prefetch into the cache.
-    prefetch_queue: std::collections::VecDeque<String>,
+    /// Cache entries queued to be fetched in the background — hint-driven
+    /// prefetches and stale-while-revalidate refreshes both land here.
+    prefetch_queue: std::collections::VecDeque<Refresh>,
     /// Persistent non-blocking H2C outbound client pool.
     h2c_pool: H2cClientPool,
     /// Persistent non-blocking H2S (HTTP/2 over TLS) outbound client pool.
     h2s_pool: H2sTlsClientPool,
     /// Per-IP request throttle — general traffic, ahead of cache/routing.
     rate_limiter: RateLimiter,
+}
+
+/// One cache entry to fetch in the background.
+///
+/// Carries the full cache key, not just the path: entries are keyed by
+/// path + query + content-encoding, so refreshing a stale `br` variant by
+/// fetching the identity one would leave the `br` entry stale forever and
+/// re-queue it on every single request.
+#[derive(Clone, PartialEq, Eq)]
+struct Refresh {
+    path: String,
+    query: Option<String>,
+    enc: String,
+}
+
+/// Cap on queued background fetches.
+///
+/// The queue drains one per event-loop iteration, so it only grows when
+/// entries go stale faster than the loop turns. Dropping the excess is right:
+/// a dropped refresh costs one more stale serve, and the next request for that
+/// key queues it again.
+const MAX_REFRESH_QUEUE: usize = 256;
+
+impl ServerState {
+    /// Queue a background fetch, skipping one already queued.
+    ///
+    /// Without the dedup every concurrent request for the same stale entry
+    /// would queue its own copy, and each would then be fetched in turn — a
+    /// stampede against origin for exactly the case this is meant to shield it
+    /// from.
+    fn queue_refresh(&mut self, r: Refresh) {
+        if self.prefetch_queue.len() >= MAX_REFRESH_QUEUE || self.prefetch_queue.contains(&r) {
+            return;
+        }
+        self.prefetch_queue.push_back(r);
+    }
 }
 
 // ── Signal handling ───────────────────────────────────────────────────────────
@@ -339,7 +376,23 @@ fn event_loop(
                     let mut key_buf = [0u8; 512];
                     let lookup_key =
                         make_lookup_key(&req.path, req.query.as_deref(), enc_str, &mut key_buf);
-                    if cacheable { if let Some(cached) = state.cache.get(lookup_key) {
+                    let looked_up = if cacheable { state.cache.lookup(lookup_key) } else { m6_http_lib::cache::Lookup::Miss };
+                    // Serve stale immediately and refresh behind the request:
+                    // making this visitor wait on an origin round trip is the
+                    // thing the cache exists to avoid. Costs one stale serve.
+                    // A stale serve logs as STALE, not HIT: it is a hit for
+                    // latency purposes but the visitor got the previous
+                    // generation of the content, and that difference has to be
+                    // legible in the logs rather than hidden inside "HIT".
+                    let cache_state = if matches!(looked_up, m6_http_lib::cache::Lookup::Stale(_)) { "STALE" } else { "HIT" };
+                    if let m6_http_lib::cache::Lookup::Stale(_) = looked_up {
+                        state.queue_refresh(Refresh {
+                            path:  req.path.clone(),
+                            query: req.query.clone(),
+                            enc:   enc_str.to_string(),
+                        });
+                    }
+                    if let m6_http_lib::cache::Lookup::Fresh(cached) | m6_http_lib::cache::Lookup::Stale(cached) = looked_up {
                         let elapsed_ns = start.elapsed().as_nanos() as u64;
                         state.stats.record(elapsed_ns, true, false);
 
@@ -356,7 +409,7 @@ fn event_loop(
                             );
                             analytics::finish_response(
                                 state.config.analytics.enabled, &mut headers, &req.headers,
-                                &state.config.node.name, &req.path, 304, "HIT", client_ip, Some(elapsed_ns),
+                                &state.config.node.name, &req.path, 304, cache_state, client_ip, Some(elapsed_ns),
                             );
                             return RequestOutcome::Ready(304, headers, Vec::new(), "cache".to_string(), cached.hints.clone());
                         }
@@ -380,10 +433,10 @@ fn event_loop(
                         );
                         analytics::finish_response(
                             state.config.analytics.enabled, &mut headers, &req.headers,
-                            &state.config.node.name, &req.path, cached.status, "HIT", client_ip, Some(elapsed_ns),
+                            &state.config.node.name, &req.path, cached.status, cache_state, client_ip, Some(elapsed_ns),
                         );
                         return RequestOutcome::Ready(cached.status, headers, cached.body.to_vec(), "cache".to_string(), cached.hints.clone());
-                    } } // end cacheable
+                    } // end cache hit
 
                     let mut outcome = handle_request(req, client_ip, enc_str, state, false);
                     if let RequestOutcome::Ready(_, ref mut headers, ..) = outcome {
@@ -442,7 +495,22 @@ fn event_loop(
                     let mut key_buf = [0u8; 512];
                     let lookup_key =
                         make_lookup_key(&req.path, req.query.as_deref(), enc_str, &mut key_buf);
-                    if cacheable { if let Some(cached) = state.cache.get(lookup_key) {
+                    let looked_up = if cacheable { state.cache.lookup(lookup_key) } else { m6_http_lib::cache::Lookup::Miss };
+                    // Serve stale now, refresh behind the request — see the
+                    // HTTP/1.1 path above for the reasoning.
+                    // A stale serve logs as STALE, not HIT: it is a hit for
+                    // latency purposes but the visitor got the previous
+                    // generation of the content, and that difference has to be
+                    // legible in the logs rather than hidden inside "HIT".
+                    let cache_state = if matches!(looked_up, m6_http_lib::cache::Lookup::Stale(_)) { "STALE" } else { "HIT" };
+                    if let m6_http_lib::cache::Lookup::Stale(_) = looked_up {
+                        state.queue_refresh(Refresh {
+                            path:  req.path.clone(),
+                            query: req.query.clone(),
+                            enc:   enc_str.to_string(),
+                        });
+                    }
+                    if let m6_http_lib::cache::Lookup::Fresh(cached) | m6_http_lib::cache::Lookup::Stale(cached) = looked_up {
                         let elapsed_ns = start.elapsed().as_nanos() as u64;
                         state.stats.record(elapsed_ns, true, false);
 
@@ -459,7 +527,7 @@ fn event_loop(
                             );
                             analytics::finish_response(
                                 state.config.analytics.enabled, &mut headers, &req.headers,
-                                &state.config.node.name, &req.path, 304, "HIT", client_ip, Some(elapsed_ns),
+                                &state.config.node.name, &req.path, 304, cache_state, client_ip, Some(elapsed_ns),
                             );
                             return RequestOutcome::Ready(304, headers, Vec::new(), "cache".to_string(), cached.hints.clone());
                         }
@@ -481,10 +549,10 @@ fn event_loop(
                         );
                         analytics::finish_response(
                             state.config.analytics.enabled, &mut headers, &req.headers,
-                            &state.config.node.name, &req.path, cached.status, "HIT", client_ip, Some(elapsed_ns),
+                            &state.config.node.name, &req.path, cached.status, cache_state, client_ip, Some(elapsed_ns),
                         );
                         return RequestOutcome::Ready(cached.status, headers, cached.body.to_vec(), "cache".to_string(), cached.hints.clone());
-                    } } // end cacheable
+                    } // end cache hit
 
                     let mut outcome = handle_request(req, client_ip, enc_str, state, false);
                     if let RequestOutcome::Ready(_, ref mut headers, ..) = outcome {
@@ -562,24 +630,28 @@ fn event_loop(
         // Emit periodic stats (cheap check every iteration: compares one Instant)
         state.stats.maybe_emit(state.pool_manager.total_active_members());
 
-        // Drain one prefetch from the queue per loop iteration.  Each prefetch
-        // is a synthetic GET to a backend — fills the cache with hinted assets
-        // so they are ready when the browser requests them after receiving 103.
-        if let Some(path) = state.prefetch_queue.pop_front() {
+        // Drain one background fetch per loop iteration. Each is a synthetic
+        // GET to a backend, serving two purposes: warming hinted assets into
+        // the cache so they are ready when the browser requests them after a
+        // 103, and refreshing entries that have gone stale (which were served
+        // stale once, so this is what makes the *next* request fresh).
+        if let Some(r) = state.prefetch_queue.pop_front() {
             let mut kbuf = [0u8; 512];
-            let lk = make_lookup_key(&path, None, "", &mut kbuf);
+            let lk = make_lookup_key(&r.path, r.query.as_deref(), &r.enc, &mut kbuf);
+            // `get` is fresh-only, so this skips entries some earlier fetch
+            // already refreshed and proceeds for stale ones — which is exactly
+            // the set still needing work.
             if state.cache.get(lk).is_none() {
-                // Build a minimal synthetic GET request.
                 let synth = forward::HttpRequest {
                     method:  "GET".to_string(),
-                    path:    path.clone(),
-                    query:   None,
+                    path:    r.path.clone(),
+                    query:   r.query.clone(),
                     version: "HTTP/1.1".to_string(),
                     headers: vec![],
                     body:    vec![],
                 };
-                handle_request(&synth, "127.0.0.1", "", state, true);
-                debug!(path = %path, "prefetch: warmed cache");
+                handle_request(&synth, "127.0.0.1", &r.enc, state, true);
+                debug!(path = %r.path, enc = %r.enc, "background fetch: cache filled");
             }
         }
 
@@ -862,8 +934,19 @@ fn handle_h3_request(
     let mut key_buf = [0u8; 512];
     let lookup_key = make_lookup_key(path_str, query_str, enc_str, &mut key_buf);
 
-    if cacheable {
-    if let Some(cached) = state.cache.get(lookup_key) {
+    let looked_up = if cacheable { state.cache.lookup(lookup_key) } else { m6_http_lib::cache::Lookup::Miss };
+    // Serve stale now, refresh behind the request — see the HTTP/1.1 path for
+    // the reasoning.
+    // See the HTTP/1.1 path: a stale serve is logged distinctly from a hit.
+    let cache_state = if matches!(looked_up, m6_http_lib::cache::Lookup::Stale(_)) { "STALE" } else { "HIT" };
+    if let m6_http_lib::cache::Lookup::Stale(_) = looked_up {
+        state.queue_refresh(Refresh {
+            path:  path_str.to_string(),
+            query: query_str.map(str::to_string),
+            enc:   enc_str.to_string(),
+        });
+    }
+    if let m6_http_lib::cache::Lookup::Fresh(cached) | m6_http_lib::cache::Lookup::Stale(cached) = looked_up {
         let elapsed_ns = start.elapsed().as_nanos() as u64;
         state.stats.record(elapsed_ns, true, false);
 
@@ -871,7 +954,7 @@ fn handle_h3_request(
             let client_ip = qconn.client_addr.ip().to_string();
             let set_cookie = analytics::record(
                 state.config.analytics.enabled, &req.headers,
-                &state.config.node.name, path_str, 304, "HIT", &client_ip, Some(elapsed_ns),
+                &state.config.node.name, path_str, 304, cache_state, &client_ip, Some(elapsed_ns),
             );
             let html = analytics::is_html_response(&cached.headers);
             let mut headers = not_modified_headers(&cached.headers);
@@ -909,7 +992,7 @@ fn handle_h3_request(
         let client_ip = qconn.client_addr.ip().to_string();
         let set_cookie = analytics::record(
             state.config.analytics.enabled, &req.headers,
-            &state.config.node.name, path_str, cached.status, "HIT", &client_ip, Some(elapsed_ns),
+            &state.config.node.name, path_str, cached.status, cache_state, &client_ip, Some(elapsed_ns),
         );
 
         if !cached.hints.is_empty() {
@@ -932,8 +1015,7 @@ fn handle_h3_request(
         let resp_headers: &[(String, String)] = &headers_with_links;
         send_h3_response(stream_id, qconn, cached.status, resp_headers, cached.body);
         return;
-    }
-    } // end cacheable
+    } // end cache hit
 
     // ── Phase 2: cache miss — allocate owned data for forwarding ──────────────
     let path    = path_str.to_string();
@@ -1336,7 +1418,11 @@ fn handle_request(
                         let mut kbuf = [0u8; 512];
                         let lk = make_lookup_key(hp, None, "", &mut kbuf);
                         if state.cache.get(lk).is_none() {
-                            state.prefetch_queue.push_back(hp.clone());
+                            state.queue_refresh(Refresh {
+                                path:  hp.clone(),
+                                query: None,
+                                enc:   String::new(),
+                            });
                         }
                     }
                     let key = CacheKey::new(&req.path, req.query.as_deref(), content_encoding);
@@ -1736,7 +1822,11 @@ fn finalize_url_response(
                     let mut kbuf = [0u8; 512];
                     let lk = make_lookup_key(hp, None, "", &mut kbuf);
                     if state.cache.get(lk).is_none() {
-                        state.prefetch_queue.push_back(hp.clone());
+                        state.queue_refresh(Refresh {
+                            path:  hp.clone(),
+                            query: None,
+                            enc:   String::new(),
+                        });
                     }
                 }
                 let key = CacheKey::new(&req.path, req.query.as_deref(), enc);
