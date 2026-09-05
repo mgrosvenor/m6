@@ -908,6 +908,7 @@ fn build_request(headers: &[(String, String)], body: Vec<u8>) -> HttpRequest {
     let mut path   = String::new();
     let mut query  = None;
     let mut fwd    = Vec::new();
+    let mut authority: Option<String> = None;
 
     for (k, v) in headers {
         match k.as_str() {
@@ -920,6 +921,7 @@ fn build_request(headers: &[(String, String)], body: Vec<u8>) -> HttpRequest {
                     path = v.clone();
                 }
             }
+            ":authority" => authority = Some(v.clone()),
             k if k.starts_with(':') => {}
             // Strip proxy-owned headers on ingress — see
             // `forward::UNTRUSTED_INBOUND`.
@@ -928,5 +930,83 @@ fn build_request(headers: &[(String, String)], body: Vec<u8>) -> HttpRequest {
         }
     }
 
+    // RFC 9113 8.3.1: :authority is HTTP/2's Host, and an intermediary
+    // translating to HTTP/1.1 must carry it across. Dropping it with the other
+    // pseudo-headers left every h2 request (which is most of them -- curl and
+    // every browser send :authority and no Host) looking hostless to
+    // everything downstream: host-dependent logic silently never fired, and
+    // requests forwarded to a backend carried no Host at all.
+    //
+    // A client that sent both wins with its own Host, which is only reachable
+    // from a non-conforming client; :authority fills in otherwise.
+    if let Some(authority) = authority {
+        if !fwd.iter().any(|(k, _)| k.eq_ignore_ascii_case("host")) {
+            fwd.push(("Host".to_string(), authority));
+        }
+    }
+
     HttpRequest { method, path, query, version: "HTTP/2".to_string(), headers: fwd, body }
+}
+
+#[cfg(test)]
+mod authority_tests {
+    use super::build_request;
+
+    fn h(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+    fn host_of(req: &crate::forward::HttpRequest) -> Option<&str> {
+        req.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("host"))
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// The case every browser and curl actually sends: :authority, no Host.
+    #[test]
+    fn authority_becomes_host() {
+        let req = build_request(
+            &h(&[(":method", "GET"), (":path", "/x"), (":authority", "www.example.com")]),
+            vec![],
+        );
+        assert_eq!(host_of(&req), Some("www.example.com"));
+    }
+
+    /// A client sending both is non-conforming; its explicit Host still wins,
+    /// and must not be duplicated.
+    #[test]
+    fn explicit_host_wins_and_is_not_duplicated() {
+        let req = build_request(
+            &h(&[
+                (":method", "GET"),
+                (":path", "/x"),
+                (":authority", "authority.example"),
+                ("host", "host.example"),
+            ]),
+            vec![],
+        );
+        assert_eq!(host_of(&req), Some("host.example"));
+        assert_eq!(
+            req.headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case("host")).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn no_authority_means_no_synthesized_host() {
+        let req = build_request(&h(&[(":method", "GET"), (":path", "/x")]), vec![]);
+        assert_eq!(host_of(&req), None);
+    }
+
+    /// Other pseudo-headers stay stripped -- they must never reach a backend.
+    #[test]
+    fn other_pseudo_headers_are_still_dropped() {
+        let req = build_request(
+            &h(&[(":method", "GET"), (":path", "/x?a=1"), (":scheme", "https"), (":authority", "e.example")]),
+            vec![],
+        );
+        assert!(!req.headers.iter().any(|(k, _)| k.starts_with(':')), "{:?}", req.headers);
+        assert_eq!(req.path, "/x");
+        assert_eq!(req.query.as_deref(), Some("a=1"));
+    }
 }
