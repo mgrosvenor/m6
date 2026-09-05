@@ -137,11 +137,19 @@ pub fn handle_request<W: Write>(
     // revalidation on every expiry is what the edge cache exists to avoid,
     // and one stale serve per minute per entry is the accepted price.
     //
-    // The 24h window only bites when origin is unreachable: it is how long
-    // the edge keeps a site up on stale content before giving up. Refreshes
-    // are attempted continuously throughout, so a healthy origin is picked up
-    // within a second of coming back.
-    let cache_control = "public, max-age=60, stale-while-revalidate=86400";
+    // The window is deliberately short. stale-while-revalidate is not a
+    // shared-cache-only directive: browsers honour it too, so a long window
+    // means a visitor keeps rendering the previous stylesheet for that long
+    // after a deploy, and invalidate-cache.sh cannot reach into their cache
+    // to help. 86400 was tried and made every CSS change invisible until a
+    // visitor's second page load. 60s bounds that to ~2 minutes worst case
+    // while still giving the edge what it actually needs -- a refresh takes
+    // about a second, so the herd never blocks on origin.
+    //
+    // The cost is origin-down grace: the edge now serves stale for a minute
+    // rather than a day. Raising it is safe once asset URLs are
+    // content-hashed, since a changed file would then be a new URL.
+    let cache_control = "public, max-age=60, stale-while-revalidate=60";
     if not_modified {
         let hdrs: Vec<(&str, &str)> = vec![
             ("Cache-Control", cache_control),
