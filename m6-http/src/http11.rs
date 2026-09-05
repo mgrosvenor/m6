@@ -709,8 +709,14 @@ fn status_reason(status: u16) -> &'static str {
         413 => "Payload Too Large",
         429 => "Too Many Requests",
         500 => "Internal Server Error",
+        501 => "Not Implemented",
         502 => "Bad Gateway",
         503 => "Service Unavailable",
+        504 => "Gateway Timeout",
+        // 501 used to fall through to "Unknown", so the server answered
+        // `HTTP/1.1 501 Unknown` -- a real status with a reason phrase that
+        // described nothing. Reason phrases are advisory, but an incorrect one
+        // is worse than a terse one.
         _ => "Unknown",
     }
 }

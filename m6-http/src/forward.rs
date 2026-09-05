@@ -29,6 +29,19 @@ pub const HOP_BY_HOP: &[&str] = &[
 ///
 /// Stripped on ingress, before routing, on every protocol — so no downstream
 /// code has to remember to distrust them.
+/// Ceiling on a backend response body.
+///
+/// `vec![0u8; len]` below allocates the backend's declared `Content-Length`
+/// up front, before a single byte is read -- so a backend (or anything able to
+/// impersonate one) declaring `Content-Length: 4000000000` allocated 4 GB
+/// immediately. The bodyless `read_to_end` path was unbounded in the same way,
+/// just more slowly.
+///
+/// 128 MiB is far above anything this serves -- the largest real asset is a
+/// few MB of PDF -- so it never trips in normal operation, while bounding what
+/// a misbehaving or hostile backend can cost.
+const MAX_BACKEND_BODY: usize = 128 * 1024 * 1024;
+
 pub const UNTRUSTED_INBOUND: &[&str] = &[
     "x-auth-claims",
     "x-forwarded-for",
@@ -282,6 +295,14 @@ pub fn read_response<R: Read>(mut reader: R) -> io::Result<HttpResponse> {
     let body = if chunked {
         read_chunked_body(&mut reader, body_prefix.to_vec())?
     } else if let Some(len) = content_length {
+        // Refuse before allocating, not after: the whole point is that the
+        // allocation is the damage.
+        if len > MAX_BACKEND_BODY {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("backend declared Content-Length {len}, above the {MAX_BACKEND_BODY} limit"),
+            ));
+        }
         let mut body = vec![0u8; len];
         let already = body_prefix.len().min(len);
         body[..already].copy_from_slice(&body_prefix[..already]);
@@ -290,8 +311,19 @@ pub fn read_response<R: Read>(mut reader: R) -> io::Result<HttpResponse> {
         }
         body
     } else {
+        // No declared length: read to EOF, but bounded. `take` caps it without
+        // needing to know the size in advance.
         let mut body = body_prefix.to_vec();
-        reader.read_to_end(&mut body)?;
+        let remaining = MAX_BACKEND_BODY.saturating_sub(body.len());
+        let read = std::io::Read::take(&mut reader, remaining as u64 + 1)
+            .read_to_end(&mut body)?;
+        let _ = read;
+        if body.len() > MAX_BACKEND_BODY {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("backend response body exceeded the {MAX_BACKEND_BODY} limit"),
+            ));
+        }
         body
     };
 
