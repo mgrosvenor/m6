@@ -21,7 +21,7 @@ use tracing::{debug, error, info, warn};
 use m6_http_lib::analytics;
 use m6_http_lib::auth;
 use m6_http_lib::rate_limit::RateLimiter;
-use m6_http_lib::cache::{Cache, CacheKey, CachedResponse, make_lookup_key, should_cache, strip_set_cookie, is_not_modified, not_modified_headers};
+use m6_http_lib::cache::{Cache, CacheKey, CachedResponse, make_lookup_key, should_cache, request_permits_storage, strip_set_cookie, is_not_modified, not_modified_headers};
 use m6_http_lib::stats::Stats;
 use m6_http_lib::config::{self, Config};
 use m6_http_lib::error::{self as error, ErrorMode};
@@ -1693,7 +1693,15 @@ fn handle_request_inner(
     let (status, mut resp_headers, body, conn_err) =
         match forward_to_backend(req, &backend_name, client_ip, state) {
             Ok(http_resp) => {
-                if cacheable && should_cache(http_resp.status, &http_resp.headers) {
+                // `request_permits_storage` is the request half of the
+                // decision (RFC 9111 5.2.1.5): a client that sent
+                // `Cache-Control: no-store` must not have its exchange
+                // retained and replayed to anyone else. Request directives
+                // were not parsed at all before this.
+                if cacheable
+                    && request_permits_storage(&req.headers)
+                    && should_cache(http_resp.status, &http_resp.headers)
+                {
                     // Extract early-hints from the response body (HTML only).
                     // This is done ONLY on the cache-miss path to keep the
                     // cache-hit path at <10 µs.
@@ -2192,7 +2200,11 @@ fn finalize_url_response_inner(
 
     let (status, resp_headers, body, used_backend, is_connection_failure) = match http_result {
         Ok(http_resp) => {
-            if ctx.cacheable && should_cache(http_resp.status, &http_resp.headers) {
+            // Same request-side gate as the synchronous path above.
+            if ctx.cacheable
+                && request_permits_storage(&ctx.req.headers)
+                && should_cache(http_resp.status, &http_resp.headers)
+            {
                 let content_type = http_resp.headers.iter()
                     .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
                     .map(|(_, v)| v.as_str()).unwrap_or("");
