@@ -11,6 +11,70 @@ Deploy order is fixed: **test locally, commit, then deploy.** Never the reverse.
 
 ---
 
+## 2026-09-06 — Reject a bare LF in the header block, and a raw-socket robustness suite
+
+### The defect
+
+`httparse` accepts a lone LF as a line terminator, so a header **value**
+containing a raw `\n` was silently split into two headers:
+
+```
+X-Test: a\nX-Injected: yes   ->   X-Test: a   +   X-Injected: yes
+```
+
+and the second was forwarded to the backend. No HTTP client will send this,
+which is why it survived: it is only reachable from a raw socket.
+
+**Honest scope.** This is not a demonstrated exploit against the current
+topology, and the CHANGELOG should not imply otherwise. Ingress stripping runs
+*after* the split, so proxy-owned headers (`X-Forwarded-For`, `X-Auth-Claims`)
+are still removed; and m6-http re-serialises with CRLF, so a cache node
+forwarding to the origin cannot desync with itself. The hazard is the classic
+one from RFC 9112 11.2 — two hops disagreeing where a header ends — and it goes
+live the moment anything is placed in front of m6. Current hardened servers
+reject it, so m6 now does too: one scan of the already-parsed header block,
+rejecting any LF not preceded by CR. The body is excluded, so legitimate LF
+bytes in a payload are unaffected.
+
+### The suite that found it
+
+`m6-http/tests/robustness.rs` — 17 tests over raw TLS sockets against a real
+`m6-http`, covering the gaps left by `security_regressions.rs` (function level)
+and `redirect.rs` (the `:80` listener):
+
+- **Framing/smuggling**: conflicting `Content-Length`, `CL` + `Transfer-Encoding`,
+  malformed lengths (negative, non-numeric, overflowing), space before the
+  header colon.
+- **Injection**: CR/LF/NUL in the request target, in header values, and in
+  `Host`; illegal header names; response-splitting assertions on every case.
+- **Bounds**: a 128 KB header value, 5,000 headers, a 64 KB request target.
+- **Incomplete input**: connect-and-send-nothing, a dribbled and abandoned
+  request, a declared body that never arrives, and eight concurrent half-open
+  connections which must not delay a normal request (the slowloris class the
+  old Python `:80` shim was vulnerable to).
+- **Malformed request lines**: ten shapes including absolute-form, CONNECT and
+  raw control bytes.
+- **Application injection**: SQLi/XSS/template/JNDI-shaped queries, overlong
+  UTF-8, double-encoding, and six path-traversal encodings.
+
+The tests assert properties rather than status codes — no smuggling, no
+injected header in the response head, no hang and no crash, with a
+known-good request after every case to prove the server is still healthy.
+A deliberate diagnostic test prints what the server actually returns, so a
+suite of vacuous passes (every reply empty) cannot masquerade as coverage;
+it shows 400 for every framing abuse, 404 for traversal, and 405 for CONNECT.
+
+### Also observed, not yet changed
+
+An empty `Host:` header is answered 200. RFC 9112 3.2 requires 400 for a
+missing or invalid `Host` in HTTP/1.1, and an empty value is arguably invalid.
+Left alone for now because the redirect path validates the host separately and
+nothing reflects it; recorded rather than silently passed over.
+
+544 workspace tests pass, zero warnings; the robustness suite is 17/17 serially.
+
+---
+
 ## 2026-09-06 — `Last-Modified` on rendered HTML
 
 The last of the three caching defects from the owner's audit. m6-html emitted an
