@@ -1918,6 +1918,7 @@ dependencies = [
  "filetime",
  "futures-util",
  "hmac",
+ "httpdate",
  "lettre",
  "libc",
  "lru",
