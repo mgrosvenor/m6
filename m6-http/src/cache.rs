@@ -216,6 +216,28 @@ pub fn make_lookup_key<'a>(
 /// 59-second local lifetime on a 60-second refresh cycle.
 const REFRESH_MARGIN: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// Freshness lifetime from `Expires`, relative to the response's own `Date`.
+///
+/// RFC 9111 4.2.1: when no `max-age`/`s-maxage` is present, the freshness
+/// lifetime is `Expires - Date`. Using our own clock instead of the
+/// response's `Date` would silently lengthen or shorten the lifetime by
+/// whatever the two servers' clocks disagree by.
+///
+/// A missing `Date` falls back to now, which is the best available reading
+/// and matches what a recipient is expected to do when one is absent. An
+/// `Expires` at or before `Date` means already stale, hence zero rather than
+/// a negative that would wrap.
+fn expires_lifetime(headers: &[(String, String)]) -> Option<std::time::Duration> {
+    let get = |name: &str| {
+        headers.iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .and_then(|(_, v)| httpdate::parse_http_date(v.trim()).ok())
+    };
+    let expires = get("expires")?;
+    let date = get("date").unwrap_or_else(std::time::SystemTime::now);
+    Some(expires.duration_since(date).unwrap_or(std::time::Duration::ZERO))
+}
+
 /// Ceiling on an entry stored with no explicit freshness directive.
 ///
 /// A response carrying bare `Cache-Control: public` used to produce
@@ -503,9 +525,22 @@ impl Cache {
             .unwrap_or_default();
         // The margin is why a max-age=60 response expires locally at 59s. It
         // saturates rather than wrapping, so a zero lifetime stays zero.
-        // No explicit freshness falls back to a bounded heuristic rather than
-        // living forever. See HEURISTIC_MAX_LIFETIME.
-        let expires_at = Some(match d.lifetime {
+        // Freshness, in the precedence RFC 9111 4.2.1 requires:
+        //   1. s-maxage   (shared caches; handled in shared_lifetime)
+        //   2. max-age
+        //   3. Expires minus Date
+        //   4. a heuristic
+        //
+        // `Expires` was not consulted at all, so a response using the older
+        // header -- still perfectly valid, and what a lot of software emits --
+        // fell straight through to "no freshness given" and was treated as
+        // fresh indefinitely. Exactly backwards: it carried an explicit
+        // expiry and we ignored it.
+        //
+        // Measured against the response's own `Date` rather than our clock,
+        // per 4.2.1, so a skewed server does not get a longer or shorter
+        // lifetime here than it asked for.
+        let expires_at = Some(match d.lifetime.or_else(|| expires_lifetime(&response.headers)) {
             Some(l) => now + l.saturating_sub(REFRESH_MARGIN),
             None => now + HEURISTIC_MAX_LIFETIME,
         });
@@ -1501,5 +1536,103 @@ mod heuristic_freshness_tests {
         let ttl = e.expires_at.unwrap().saturating_duration_since(std::time::Instant::now());
         assert!(ttl.as_secs() <= 60, "explicit max-age was overridden: {ttl:?}");
         assert!(ttl.as_secs() > 30, "explicit max-age was truncated: {ttl:?}");
+    }
+}
+
+#[cfg(test)]
+mod expires_tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    fn at(offset_secs: i64) -> String {
+        let t = if offset_secs >= 0 {
+            SystemTime::now() + Duration::from_secs(offset_secs as u64)
+        } else {
+            SystemTime::now() - Duration::from_secs((-offset_secs) as u64)
+        };
+        httpdate::fmt_http_date(t)
+    }
+
+    fn stored(headers: Vec<(String, String)>) -> Option<std::time::Instant> {
+        let c = Cache::new();
+        c.insert(CacheKey::new("/e", None, ""), CachedResponse {
+            status: 200,
+            headers: std::sync::Arc::new(headers),
+            body: bytes::Bytes::from_static(b"x"),
+            hints: std::sync::Arc::new(vec![]),
+        });
+        let map = c.map.read().unwrap();
+        map.get("/e\u{1}\u{1}").and_then(|e| e.expires_at)
+    }
+
+    /// `Expires` was ignored entirely, so a response carrying an explicit
+    /// expiry in the older header fell through to "no freshness given" and
+    /// was treated as fresh indefinitely — exactly backwards.
+    #[test]
+    fn expires_sets_the_lifetime() {
+        let e = stored(vec![
+            ("cache-control".into(), "public".into()),
+            ("date".into(), at(0)),
+            ("expires".into(), at(120)),
+        ])
+        .expect("stored with a deadline");
+        let ttl = e.saturating_duration_since(std::time::Instant::now());
+        assert!(ttl.as_secs() > 60 && ttl.as_secs() <= 120, "ttl was {ttl:?}, expected ~120s");
+    }
+
+    /// Measured against the response's own Date, not our clock, so clock skew
+    /// between servers does not change the lifetime it asked for.
+    #[test]
+    fn lifetime_is_relative_to_the_response_date() {
+        // A server an hour fast: Date and Expires are both shifted, but the
+        // interval between them is still 60s.
+        let e = stored(vec![
+            ("cache-control".into(), "public".into()),
+            ("date".into(), at(3600)),
+            ("expires".into(), at(3660)),
+        ])
+        .expect("stored");
+        let ttl = e.saturating_duration_since(std::time::Instant::now());
+        assert!(ttl.as_secs() <= 60, "skew leaked into the lifetime: {ttl:?}");
+    }
+
+    /// max-age outranks Expires (RFC 9111 4.2.1).
+    #[test]
+    fn max_age_wins_over_expires() {
+        let e = stored(vec![
+            ("cache-control".into(), "public, max-age=30".into()),
+            ("date".into(), at(0)),
+            ("expires".into(), at(86400)),
+        ])
+        .expect("stored");
+        let ttl = e.saturating_duration_since(std::time::Instant::now());
+        assert!(ttl.as_secs() <= 30, "Expires overrode max-age: {ttl:?}");
+    }
+
+    /// An Expires already in the past means stale, not a wrapped negative.
+    #[test]
+    fn a_past_expires_is_immediately_stale() {
+        let e = stored(vec![
+            ("cache-control".into(), "public".into()),
+            ("date".into(), at(0)),
+            ("expires".into(), at(-3600)),
+        ])
+        .expect("stored");
+        assert!(
+            e <= std::time::Instant::now() + Duration::from_secs(1),
+            "a past Expires should not produce a live deadline"
+        );
+    }
+
+    /// Garbage in Expires must not be mistaken for an expiry.
+    #[test]
+    fn an_unparseable_expires_falls_back_to_the_heuristic() {
+        let e = stored(vec![
+            ("cache-control".into(), "public".into()),
+            ("expires".into(), "not-a-date".into()),
+        ])
+        .expect("stored");
+        let ttl = e.saturating_duration_since(std::time::Instant::now());
+        assert!(ttl.as_secs() > 3600, "should have fallen back to the heuristic, got {ttl:?}");
     }
 }
