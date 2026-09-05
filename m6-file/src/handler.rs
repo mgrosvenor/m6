@@ -125,11 +125,23 @@ pub fn handle_request<W: Write>(
         false
     };
 
-    // Short max-age (fast repeat loads within it) plus must-revalidate (a
-    // stale cache entry always checks back rather than being reused past
-    // that window) — the conditional-GET machinery above is what makes
-    // "checks back" cheap: a 304 on an unchanged file, not a full refetch.
-    let cache_control = "public, max-age=60, must-revalidate";
+    // Short max-age (fast repeat loads within it) plus stale-while-revalidate
+    // (a shared cache past that window serves its stale copy immediately and
+    // refreshes behind the request, so no visitor ever waits on an origin
+    // round trip). The conditional-GET machinery above is what keeps that
+    // refresh cheap: a 304 on an unchanged file, not a full refetch.
+    //
+    // This replaced `must-revalidate`, which says the opposite — never reuse
+    // a stale entry without checking first — and so forbade exactly the
+    // behaviour above. The two cannot both be advertised; a blocking
+    // revalidation on every expiry is what the edge cache exists to avoid,
+    // and one stale serve per minute per entry is the accepted price.
+    //
+    // The 24h window only bites when origin is unreachable: it is how long
+    // the edge keeps a site up on stale content before giving up. Refreshes
+    // are attempted continuously throughout, so a healthy origin is picked up
+    // within a second of coming back.
+    let cache_control = "public, max-age=60, stale-while-revalidate=86400";
     if not_modified {
         let hdrs: Vec<(&str, &str)> = vec![
             ("Cache-Control", cache_control),
