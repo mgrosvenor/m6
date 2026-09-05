@@ -149,7 +149,27 @@ pub fn handle_request<W: Write>(
     // The cost is origin-down grace: the edge now serves stale for a minute
     // rather than a day. Raising it is safe once asset URLs are
     // content-hashed, since a changed file would then be a new URL.
-    let cache_control = "public, max-age=60, stale-while-revalidate=60";
+    // A request carrying `?v=<content-hash>` (emitted by the `| asset` template
+    // filter) addresses one exact version of the file: changed bytes produce a
+    // different hash and therefore a different URL, so this response can never
+    // go stale for that URL. `immutable` additionally tells the browser not to
+    // revalidate even on reload, which is the whole point -- otherwise every
+    // reload still costs a conditional request per asset.
+    //
+    // Everything else keeps the short window. An unversioned URL is exactly the
+    // case where a long max-age strands visitors on the previous file with no
+    // server-side way to reach them: no invalidation can touch a browser cache.
+    // Notably the webfont is still requested unversioned from inside
+    // style.css's @font-face, so it must stay on the short window.
+    let versioned = req
+        .query
+        .split('&')
+        .any(|p| p.starts_with("v=") && p.len() > 2);
+    let cache_control = if versioned {
+        "public, max-age=31536000, immutable"
+    } else {
+        "public, max-age=60, stale-while-revalidate=60"
+    };
     if not_modified {
         let hdrs: Vec<(&str, &str)> = vec![
             ("Cache-Control", cache_control),
@@ -610,5 +630,52 @@ fn find_route<'a>(url_path: &str, routes: &'a [Route]) -> FindRouteResult<'a> {
         FindRouteResult::InvalidParam
     } else {
         FindRouteResult::NotFound
+    }
+}
+
+#[cfg(test)]
+mod cache_control_tests {
+    use crate::http::Request;
+    use std::io::Cursor;
+
+    /// Mirrors the `versioned` test in handle_request. Kept as a helper here so
+    /// the rule is asserted directly rather than inferred from a full response.
+    fn is_versioned(query: &str) -> bool {
+        query.split('&').any(|p| p.starts_with("v=") && p.len() > 2)
+    }
+
+    fn query_of(url: &str) -> String {
+        let raw = format!("GET {url} HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        Request::read(Cursor::new(raw.into_bytes())).unwrap().query
+    }
+
+    /// A `?v=<hash>` URL addresses one exact version, so it can be cached hard.
+    #[test]
+    fn versioned_urls_are_treated_as_immutable() {
+        for url in [
+            "/assets/css/style.css?v=56de07f9",
+            "/assets/icons/logo.svg?v=abc123",
+            "/assets/x.js?foo=1&v=deadbeef",
+        ] {
+            assert!(is_versioned(&query_of(url)), "{url} should be versioned");
+        }
+    }
+
+    /// Everything else keeps the short window. The webfont matters most here:
+    /// it is requested unversioned from @font-face inside style.css, and
+    /// pinning it for a year would strand clients on an old file that no
+    /// server-side invalidation can reach.
+    #[test]
+    fn unversioned_and_malformed_urls_keep_the_short_window() {
+        for url in [
+            "/assets/fonts/montserrat-normal.woff2",
+            "/assets/css/style.css",
+            "/assets/css/style.css?v=",          // empty hash is not a version
+            "/assets/css/style.css?version=1",   // must not match on prefix
+            "/assets/css/style.css?vv=1",
+            "/assets/css/style.css?other=v=1",
+        ] {
+            assert!(!is_versioned(&query_of(url)), "{url} must NOT be treated as versioned");
+        }
     }
 }
