@@ -1200,3 +1200,118 @@ mod method_gate_tests {
         assert_eq!(&got.body[..], b"full GET body");
     }
 }
+
+#[cfg(test)]
+mod cache_control_tests {
+    use super::*;
+
+    fn h(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn parses_a_simple_list() {
+        let cc = CacheControl::parse(&h(&[("cache-control", "public, max-age=60")]));
+        assert!(cc.public);
+        assert_eq!(cc.max_age, Some(60));
+        assert!(!cc.no_store);
+    }
+
+    /// RFC 9110 5.2: several field lines of a list-based field are equivalent
+    /// to one comma-joined line. The old code returned on the FIRST line that
+    /// mentioned something it recognised, so this exact pairing was stored.
+    #[test]
+    fn no_store_on_a_later_field_line_still_wins() {
+        let hs = h(&[("cache-control", "public"), ("cache-control", "no-store")]);
+        assert!(CacheControl::parse(&hs).no_store);
+        assert!(!should_cache(200, &hs), "public on an earlier line must not beat a later no-store");
+    }
+
+    /// `contains("public")` matched any extension token containing the word.
+    #[test]
+    fn an_extension_token_containing_public_is_not_the_public_directive() {
+        let cc = CacheControl::parse(&h(&[("cache-control", "public-cache-extension")]));
+        assert!(!cc.public, "matched a directive named `public-cache-extension`");
+        assert!(!should_cache(200, &h(&[("cache-control", "public-cache-extension")])));
+    }
+
+    #[test]
+    fn private_and_no_store_both_forbid_storage() {
+        for v in ["private", "no-store", "public, private", "max-age=60, no-store"] {
+            assert!(!should_cache(200, &h(&[("cache-control", v)])), "{v} must not be stored");
+        }
+    }
+
+    /// A comma inside a quoted value must not split the directive list, and a
+    /// quoted delta-seconds must still parse.
+    #[test]
+    fn quoted_values_do_not_split_the_list() {
+        let cc = CacheControl::parse(&h(&[(
+            "cache-control",
+            "no-cache=\"Set-Cookie, X-Thing\", max-age=30, public",
+        )]));
+        assert!(cc.no_cache);
+        assert_eq!(cc.max_age, Some(30), "a comma inside quotes split the list");
+        assert!(cc.public);
+    }
+
+    #[test]
+    fn quoted_delta_seconds_parses() {
+        let cc = CacheControl::parse(&h(&[("cache-control", "max-age=\"60\"")]));
+        assert_eq!(cc.max_age, Some(60));
+    }
+
+    #[test]
+    fn directive_names_are_case_insensitive() {
+        let cc = CacheControl::parse(&h(&[("Cache-Control", "PUBLIC, Max-Age=15")]));
+        assert!(cc.public);
+        assert_eq!(cc.max_age, Some(15));
+    }
+
+    /// s-maxage is the shared-cache lifetime and outranks max-age.
+    #[test]
+    fn s_maxage_wins_for_a_shared_cache() {
+        let cc = CacheControl::parse(&h(&[("cache-control", "max-age=10, s-maxage=99")]));
+        assert_eq!(cc.shared_lifetime(), Some(std::time::Duration::from_secs(99)));
+    }
+
+    #[test]
+    fn no_cache_means_zero_lifetime() {
+        let cc = CacheControl::parse(&h(&[("cache-control", "public, max-age=600, no-cache")]));
+        assert_eq!(cc.shared_lifetime(), Some(std::time::Duration::ZERO));
+    }
+
+    /// A 206 describes a PARTIAL representation. This cache has no range
+    /// awareness, so storing one lets a later full GET be served a fragment as
+    /// though it were the whole resource.
+    #[test]
+    fn a_206_is_never_stored() {
+        assert!(!should_cache(206, &h(&[("cache-control", "public, max-age=60")])));
+    }
+
+    #[test]
+    fn ordinary_2xx_still_stored() {
+        for s in [200u16, 203, 204] {
+            assert!(should_cache(s, &h(&[("cache-control", "public")])), "{s} should store");
+        }
+        for s in [199u16, 300, 301, 404, 500] {
+            assert!(!should_cache(s, &h(&[("cache-control", "public")])), "{s} should not store");
+        }
+    }
+
+    /// RFC 9111 5.2.1.5: a request carrying no-store must not have its
+    /// response written to cache. Request directives were not parsed at all.
+    #[test]
+    fn request_no_store_forbids_storage() {
+        assert!(!request_permits_storage(&h(&[("cache-control", "no-store")])));
+        assert!(!request_permits_storage(&h(&[("Cache-Control", "No-Store")])));
+    }
+
+    /// Request `no-cache` means "revalidate before reuse", NOT "do not store".
+    /// Treating them alike would cost hit rate for no correctness gain.
+    #[test]
+    fn request_no_cache_does_not_forbid_storage() {
+        assert!(request_permits_storage(&h(&[("cache-control", "no-cache")])));
+        assert!(request_permits_storage(&h(&[])));
+    }
+}
