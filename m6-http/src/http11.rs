@@ -377,7 +377,7 @@ where
                                     }
                                     buf.extend_from_slice(b"\r\n");
                                 }
-                                buf.extend_from_slice(&build_response(status, &resp_headers, &body));
+                                buf.extend_from_slice(&build_response(status, &resp_headers, &body, &req.method));
                                 h1.state = H1State::Writing { buf, pos: 0 };
                                 continue;
                             }
@@ -416,7 +416,7 @@ where
                     }
                     buf.extend_from_slice(b"\r\n");
                 }
-                buf.extend_from_slice(&build_response(status, &resp_headers, &body));
+                buf.extend_from_slice(&build_response(status, &resp_headers, &body, &ctx.req.method));
                 h1.state = H1State::Writing { buf, pos: 0 };
                 // pump TLS to start sending immediately
                 if advance_tls(tls, stream).is_err() { h1.state = H1State::Done; return; }
@@ -586,9 +586,27 @@ pub fn parse_request(buf: &[u8]) -> ParseResult {
 
 // ── Response serialiser ───────────────────────────────────────────────────────
 
-fn build_response(status: u16, headers: &[(String, String)], body: &[u8]) -> Vec<u8> {
+/// Serialise a response. `method` is taken so HEAD can be framed correctly.
+///
+/// RFC 9110 9.3.2: a HEAD response carries the header fields a GET would --
+/// `Content-Length` included, describing the representation that GET *would*
+/// have returned -- and no body at all.
+///
+/// m6-http used to send the full body in response to a HEAD while advertising
+/// that same length, so the response was not merely over-sized, it was
+/// malformed: curl reported "transfer closed with N bytes remaining" (exit 18)
+/// and HTTP/2 aborted the stream with INTERNAL_ERROR. `curl -I` hides all of
+/// it, because it parses the response and discards the body -- every hand
+/// check looked clean, and only a raw socket read showed the truth. Health
+/// checks, link validators, crawlers and uptime monitors all use HEAD, so
+/// every one of them was either transferring the whole page or erroring.
+///
+/// The length is computed from `body` before it is dropped, which is why the
+/// caller passes the real body here rather than pre-emptying it.
+fn build_response(status: u16, headers: &[(String, String)], body: &[u8], method: &str) -> Vec<u8> {
+    let is_head = method.eq_ignore_ascii_case("HEAD");
     let reason = status_reason(status);
-    let mut out = Vec::with_capacity(256 + body.len());
+    let mut out = Vec::with_capacity(256 + if is_head { 0 } else { body.len() });
     out.extend_from_slice(
         format!("HTTP/1.1 {} {}\r\n", status, reason).as_bytes()
     );
@@ -600,7 +618,9 @@ fn build_response(status: u16, headers: &[(String, String)], body: &[u8]) -> Vec
     crate::security::write_h1_headers(&mut out, headers);
     out.extend_from_slice(format!("content-length: {}\r\n", body.len()).as_bytes());
     out.extend_from_slice(b"connection: close\r\n\r\n");
-    out.extend_from_slice(body);
+    if !is_head {
+        out.extend_from_slice(body);
+    }
     out
 }
 
@@ -659,4 +679,81 @@ pub fn make_tls_server_config(
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     Ok(Arc::new(config))
+}
+
+#[cfg(test)]
+mod head_framing_tests {
+    use super::*;
+
+    fn hdrs() -> Vec<(String, String)> {
+        vec![("content-type".to_string(), "text/html; charset=utf-8".to_string())]
+    }
+
+    fn split(raw: &[u8]) -> (String, &[u8]) {
+        let i = raw.windows(4).position(|w| w == b"\r\n\r\n").expect("header terminator");
+        (String::from_utf8_lossy(&raw[..i]).to_string(), &raw[i + 4..])
+    }
+
+    const BODY: &[u8] = b"<!doctype html><html><body>hello</body></html>";
+
+    #[test]
+    fn get_sends_the_body() {
+        let (head, body) = {
+            let raw = build_response(200, &hdrs(), BODY, "GET");
+            let (h, b) = split(&raw);
+            (h, b.to_vec())
+        };
+        assert!(head.contains(&format!("content-length: {}", BODY.len())));
+        assert_eq!(body, BODY);
+    }
+
+    /// The defect: HEAD advertised the GET representation's length and then
+    /// sent that many body bytes too. curl reported "transfer closed with N
+    /// bytes remaining" (exit 18); HTTP/2 aborted the stream. `curl -I` hides
+    /// it because it parses and discards the body, so every hand check passed.
+    #[test]
+    fn head_sends_zero_body_bytes() {
+        let raw = build_response(200, &hdrs(), BODY, "HEAD");
+        let (_, body) = split(&raw);
+        assert_eq!(body.len(), 0, "HEAD must send no body, got {} bytes", body.len());
+    }
+
+    /// RFC 9110 9.3.2: the headers are those a GET would have sent, so
+    /// Content-Length still describes the GET representation. Deriving it from
+    /// the emptied body instead would advertise 0 and make HEAD useless for
+    /// the size checks that are most of the reason to send one.
+    #[test]
+    fn head_still_advertises_the_get_length() {
+        let raw = build_response(200, &hdrs(), BODY, "HEAD");
+        let (head, _) = split(&raw);
+        assert!(head.contains(&format!("content-length: {}", BODY.len())),
+                "expected content-length {}, headers were:\n{head}", BODY.len());
+    }
+
+    /// A HEAD response must otherwise be indistinguishable from the GET's
+    /// header block — same status, same content-type, same everything.
+    #[test]
+    fn head_and_get_headers_match() {
+        let (gh, _) = { let r = build_response(200, &hdrs(), BODY, "GET"); let (h, _) = split(&r); (h, ()) };
+        let (hh, _) = { let r = build_response(200, &hdrs(), BODY, "HEAD"); let (h, _) = split(&r); (h, ()) };
+        assert_eq!(gh, hh, "HEAD headers differ from GET headers");
+    }
+
+    #[test]
+    fn method_match_is_case_insensitive() {
+        let raw = build_response(200, &hdrs(), BODY, "head");
+        let (_, body) = split(&raw);
+        assert_eq!(body.len(), 0);
+    }
+
+    /// An empty-bodied response is unaffected either way.
+    #[test]
+    fn empty_body_is_unchanged() {
+        for m in ["GET", "HEAD"] {
+            let raw = build_response(204, &hdrs(), b"", m);
+            let (head, body) = split(&raw);
+            assert_eq!(body.len(), 0);
+            assert!(head.contains("content-length: 0"));
+        }
+    }
 }

@@ -122,6 +122,41 @@ impl Borrow<str> for CacheKey {
     }
 }
 
+/// Whether a request with this method may be **answered from** the cache.
+///
+/// GET and HEAD only. A HEAD is deliberately answered from the GET entry with
+/// the body stripped at serialisation — that sharing is what makes HEAD cheap,
+/// and it is the reason the key carries no method component.
+///
+/// This pairing is the safety property that matters, so it is worth stating
+/// plainly. The key namespace holds GET representations and nothing else,
+/// because [`method_may_write_cache`] admits only GET. No unsafe or unknown
+/// method can therefore read a cached entry or store one, which is exactly
+/// what putting the method in the key would have bought — obtained by
+/// construction instead, and pinned by tests rather than left implicit in a
+/// string encoding.
+///
+/// Before this existed, `cacheable` was derived from the route's auth
+/// requirement alone and nothing anywhere inspected the method: every verb
+/// including TRACE and invented ones like FOO was served the cached page.
+pub fn method_may_read_cache(method: &str) -> bool {
+    method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD")
+}
+
+/// Whether a response to this method may be **stored in** the cache.
+///
+/// GET only — deliberately narrower than [`method_may_read_cache`].
+///
+/// HEAD must never store, and the ordering here is a real hazard rather than
+/// tidiness. While HEAD wrongly returned a full body, the entry a HEAD stored
+/// was byte-identical to a GET entry, so the shared key was harmless. Fix the
+/// HEAD body without this and a HEAD would store a *bodyless* response under
+/// the key a subsequent GET reads, turning a protocol violation into silent
+/// content loss. The two changes belong in the same commit.
+pub fn method_may_write_cache(method: &str) -> bool {
+    method.eq_ignore_ascii_case("GET")
+}
+
 /// Build a zero-allocation lookup key into a caller-supplied stack buffer.
 ///
 /// Returns a `&str` slice into `buf` that equals the `CacheKey` for the given
@@ -1001,5 +1036,70 @@ mod tests {
     fn strip_set_cookie_is_a_noop_when_absent() {
         let headers = vec![("Content-Type".to_string(), "text/plain".to_string())];
         assert_eq!(strip_set_cookie(&headers), headers);
+    }
+}
+
+#[cfg(test)]
+mod method_gate_tests {
+    use super::*;
+
+    #[test]
+    fn only_get_and_head_may_read() {
+        for m in ["GET", "HEAD", "get", "head"] {
+            assert!(method_may_read_cache(m), "{m} should be able to read cache");
+        }
+        // Every verb below was served the cached page before this gate existed,
+        // including TRACE and an entirely invented method.
+        for m in ["POST", "PUT", "DELETE", "PATCH", "OPTIONS", "TRACE", "CONNECT", "FOO", ""] {
+            assert!(!method_may_read_cache(m), "{m} must not read cache");
+        }
+    }
+
+    /// Narrower than the read gate, and deliberately so: a HEAD now produces a
+    /// bodyless response, so letting one store would put an empty body under
+    /// the key a later GET reads.
+    #[test]
+    fn only_get_may_write() {
+        assert!(method_may_write_cache("GET"));
+        assert!(method_may_write_cache("get"));
+        for m in ["HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "TRACE", "FOO", ""] {
+            assert!(!method_may_write_cache(m), "{m} must not write cache");
+        }
+    }
+
+    /// The safety property that replaces putting the method in the key: the
+    /// key namespace can only ever hold GET representations, because nothing
+    /// else is admitted to write. Anything that may read is therefore reading
+    /// a GET entry, which is exactly what HEAD wants and what no other method
+    /// is allowed to attempt.
+    #[test]
+    fn everything_that_may_write_may_also_read() {
+        for m in ["GET", "HEAD", "POST", "PUT", "DELETE", "TRACE", "FOO"] {
+            if method_may_write_cache(m) {
+                assert!(method_may_read_cache(m), "{m} can write but not read — key namespace would split");
+            }
+        }
+    }
+
+    /// A HEAD must not be able to displace the GET entry it shares a key with.
+    /// Constructed as the real code does it: the key ignores the method, so
+    /// this only holds because the write gate refuses HEAD.
+    #[test]
+    fn a_head_cannot_poison_the_get_entry() {
+        let cache = Cache::new();
+        cache.insert(CacheKey::new("/page", None, "br"), CachedResponse {
+            status: 200,
+            headers: std::sync::Arc::new(vec![]),
+            body: bytes::Bytes::from_static(b"full GET body"),
+            hints: std::sync::Arc::new(vec![]),
+        });
+
+        // What a HEAD would store if it were allowed to: same key, empty body.
+        assert!(!method_may_write_cache("HEAD"),
+                "if this ever becomes true, the entry below overwrites the GET body");
+
+        let mut b2 = [0u8; 512];
+        let got = cache.get(make_lookup_key("/page", None, "br", &mut b2)).expect("entry present");
+        assert_eq!(&got.body[..], b"full GET body");
     }
 }

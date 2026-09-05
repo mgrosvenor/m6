@@ -570,7 +570,8 @@ impl Http2Conn {
 
         match on_request(&req, client_ip) {
             RequestOutcome::Ready(status, resp_headers, resp_body, _, hints) => {
-                self.dispatch_h2_response(stream_id, status, resp_headers, resp_body, hints, on_request, &client_ip);
+                let method = req.method.clone();
+                self.dispatch_h2_response(stream_id, status, resp_headers, resp_body, hints, on_request, &client_ip, &method);
             }
             RequestOutcome::Pending { rx, ctx } => {
                 if let Some(s) = self.streams.get_mut(&stream_id) {
@@ -591,6 +592,7 @@ impl Http2Conn {
         hints:        std::sync::Arc<Vec<String>>,
         on_request:   &mut F,
         client_ip:    &str,
+        method:       &str,
     )
     where
         F: FnMut(&HttpRequest, &str) -> RequestOutcome,
@@ -668,10 +670,17 @@ impl Http2Conn {
         }
 
         // Encode HPACK headers (needs &mut self.hpack_enc — no stream borrow active).
-        let header_block = self.encode_response_headers(status, &resp_headers, resp_body.len());
+        // content-length still describes what a GET would have returned; the
+        // body itself is withheld for HEAD (RFC 9110 9.3.2). Sending it anyway
+        // is what made HTTP/2 abort the stream with INTERNAL_ERROR: the DATA
+        // frames disagreed with the framing the client had been promised.
+        let advertised_len = resp_body.len();
+        let resp_body = if method.eq_ignore_ascii_case("HEAD") { Vec::new() } else { resp_body };
+        let header_block = self.encode_response_headers(status, &resp_headers, advertised_len);
         self.push_frame(TYPE_HEADERS, FLAG_END_HEADERS, stream_id, &header_block);
 
-        // Store response body for flow-controlled delivery.
+        // Store response body for flow-controlled delivery. An empty body sends
+        // a bare DATA + END_STREAM, which closes the stream cleanly.
         if let Some(s) = self.streams.get_mut(&stream_id) {
             s.resp_body = Some(resp_body);
             s.resp_sent = 0;
@@ -713,7 +722,10 @@ impl Http2Conn {
                 if let Some(ctx) = ctx {
                     let (status, resp_headers, resp_body, _, _hints) = on_response(http_result, &ctx);
                     // No server push for async responses (hints only exist for cached assets which are Ready).
-                    let header_block = self.encode_response_headers(status, &resp_headers, resp_body.len());
+                    // Same HEAD framing as the sync path above.
+                    let advertised_len = resp_body.len();
+                    let resp_body = if ctx.req.method.eq_ignore_ascii_case("HEAD") { Vec::new() } else { resp_body };
+                    let header_block = self.encode_response_headers(status, &resp_headers, advertised_len);
                     self.push_frame(TYPE_HEADERS, FLAG_END_HEADERS, sid, &header_block);
                     if let Some(s) = self.streams.get_mut(&sid) {
                         s.resp_body = Some(resp_body);

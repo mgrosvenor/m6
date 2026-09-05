@@ -11,6 +11,79 @@ Deploy order is fixed: **test locally, commit, then deploy.** Never the reverse.
 
 ---
 
+## 2026-09-06 — Method validation and HEAD framing
+
+Two coupled defects from the owner's audit, fixed together because fixing
+either alone is worse than fixing neither.
+
+### Every method was served the cached page
+
+Verified live before the fix, warm and cold, on both protocols:
+
+```
+GET/HEAD/POST/PUT/DELETE/PATCH/OPTIONS/TRACE/FOO  ->  200, 54,361 bytes
+```
+
+Including TRACE, and including an entirely invented `FOO`. `cacheable` was
+derived from the route's auth requirement alone; `make_lookup_key` had no method
+component; and nothing downstream inspected the method either, so m6-html
+rendered whatever it was handed. `m6-file` returned 405 for non-GET/HEAD of its
+own accord, which is why only HTML routes were affected and why spot-checking
+an asset always looked fine.
+
+Now: `[server].allowed_methods` (default GET, HEAD, POST) is checked before
+routing, cache lookup or backend dispatch, and anything else gets 405 with an
+`Allow` header. POST is admitted because the contact form needs it, and is
+never cached. Configurable because the disabled CMS routes need PUT and DELETE
+when they return.
+
+**Deviation from the audit, stated deliberately.** It recommended including the
+method in the cache key. That would touch 30+ call sites and would stop HEAD
+sharing GET's entry — the sharing that makes HEAD cheap, and the shape the audit
+itself preferred. The same property is obtained by construction instead:
+`method_may_read_cache` admits GET and HEAD, `method_may_write_cache` admits
+GET alone, so the key namespace can only ever hold GET representations and no
+unsafe method can read or write one. Pinned by tests rather than left implicit
+in a string encoding.
+
+### HEAD responses were malformed, not merely bodied
+
+```
+HEAD /capabilities -> 200, Content-Length: 16738, and 16,738 body bytes
+```
+
+Not just oversized: the response advertised the GET representation's length and
+then mis-terminated, so curl reported *"transfer closed with N bytes
+remaining"* (exit 18) and HTTP/2 aborted the stream with `INTERNAL_ERROR`.
+Health checks, link validators, crawlers and uptime monitors all use HEAD, so
+every one of them was either transferring the whole page or erroring.
+
+`curl -I` hid all of it — it parses the response and discards the body, so every
+hand check looked clean. Only a raw socket read shows it. That is why the new
+tests assert on raw bytes.
+
+Fixed at all four serialisation points (h1 `build_response`, h2 sync and async
+dispatch, h3 `send_h3_response`): `Content-Length` still describes what a GET
+would have returned, and no body is sent.
+
+### Why the order mattered
+
+While HEAD wrongly returned a full body, the entry it stored was byte-identical
+to a GET entry, so the method-less key was harmless. Fixing the HEAD body alone
+would have stored a *bodyless* response under the key a later GET reads —
+turning a protocol violation into silent content loss. The write gate lands in
+the same commit.
+
+Verified against a local stack, on a raw socket, in the sequence that would
+expose it: cold GET full body; warm HEAD zero body with the correct
+Content-Length; warm GET still the full body; and separately a **cold HEAD
+followed by a GET**, which returns the full page rather than an empty one.
+
+539 workspace tests pass, zero warnings. `curl -I` now exits 0 on both
+protocols; POST still reaches the contact backend; all pages 200.
+
+---
+
 ## 2026-09-06 — `Link: rel="describedby"` on HTML responses
 
 New `[site].describedby` setting. When set (the site uses `/llms.txt`), every

@@ -399,7 +399,11 @@ fn event_loop(
                     // Routes with `require` are never served from cache: the
                     // key has no identity component, so a hit would bypass the
                     // auth check that runs later in handle_request.
-                    let cacheable = !state.route_table.requires_auth(&req.path);
+                    // Method gate as well as auth: only GET and HEAD may be
+                    // answered from cache, so an unsafe or unknown verb can
+                    // never be handed a cached entry.
+                    let cacheable = !state.route_table.requires_auth(&req.path)
+                        && m6_http_lib::cache::method_may_read_cache(&req.method);
                     let mut key_buf = [0u8; 512];
                     let lookup_key =
                         make_lookup_key(&req.path, req.query.as_deref(), enc_str, &mut key_buf);
@@ -525,7 +529,11 @@ fn event_loop(
                     // Routes with `require` are never served from cache: the
                     // key has no identity component, so a hit would bypass the
                     // auth check that runs later in handle_request.
-                    let cacheable = !state.route_table.requires_auth(&req.path);
+                    // Method gate as well as auth: only GET and HEAD may be
+                    // answered from cache, so an unsafe or unknown verb can
+                    // never be handed a cached entry.
+                    let cacheable = !state.route_table.requires_auth(&req.path)
+                        && m6_http_lib::cache::method_may_read_cache(&req.method);
                     let mut key_buf = [0u8; 512];
                     let lookup_key =
                         make_lookup_key(&req.path, req.query.as_deref(), enc_str, &mut key_buf);
@@ -654,7 +662,8 @@ fn event_loop(
                     if !hints.is_empty() {
                         send_h3_early_hints(sid, qconn, &hints);
                     }
-                    send_h3_response(sid, qconn, status, &resp_headers, Bytes::from(body));
+                    send_h3_response(sid, qconn, status, &resp_headers, Bytes::from(body),
+                        ctx.req.method.eq_ignore_ascii_case("HEAD"));
                 }
             }
         }
@@ -994,7 +1003,9 @@ fn handle_h3_request(
         if let Some(RequestOutcome::Ready(status, headers, body, _, _)) =
             check_rate_limit(state, &client_ip, path_str, ua_owned.as_deref())
         {
-            send_h3_response(stream_id, qconn, status, &headers, Bytes::from(body));
+            // Rate-limit rejection: tiny body, but a HEAD still must not carry one.
+            send_h3_response(stream_id, qconn, status, &headers, Bytes::from(body),
+                method_bytes.eq_ignore_ascii_case(b"HEAD"));
             return;
         }
     }
@@ -1012,7 +1023,7 @@ fn handle_h3_request(
         if let Some(location) =
             www_redirect_location(authority.as_deref(), path_str, query_str, &state.config)
         {
-            send_h3_response(stream_id, qconn, 301, &www_redirect_headers(location), Bytes::new());
+            send_h3_response(stream_id, qconn, 301, &www_redirect_headers(location), Bytes::new(), false);
             return;
         }
     }
@@ -1020,7 +1031,10 @@ fn handle_h3_request(
     // ── Cache lookup — zero allocation ────────────────────────────────────────
     // Routes with `require` are never served from cache — see the HTTP/1.1
     // path for the reasoning.
-    let cacheable = !state.route_table.requires_auth(path_str);
+    // Same method gate as the h1/h2 lookup sites above.
+    let method_str = std::str::from_utf8(method_bytes).unwrap_or("GET");
+    let cacheable = !state.route_table.requires_auth(path_str)
+        && m6_http_lib::cache::method_may_read_cache(method_str);
 
     let mut key_buf = [0u8; 512];
     let lookup_key = make_lookup_key(path_str, query_str, enc_str, &mut key_buf);
@@ -1061,7 +1075,7 @@ fn handle_h3_request(
                 cache_hit = true,
                 "request complete"
             );
-            send_h3_response(stream_id, qconn, 304, &headers, Bytes::new());
+            send_h3_response(stream_id, qconn, 304, &headers, Bytes::new(), false);
             return;
         }
 
@@ -1105,7 +1119,8 @@ fn handle_h3_request(
             headers_with_links.push(("Set-Cookie".to_string(), sc));
         }
         let resp_headers: &[(String, String)] = &headers_with_links;
-        send_h3_response(stream_id, qconn, cached.status, resp_headers, cached.body);
+        send_h3_response(stream_id, qconn, cached.status, resp_headers, cached.body,
+            method_str.eq_ignore_ascii_case("HEAD"));
         return;
     } // end cache hit
 
@@ -1161,7 +1176,8 @@ fn handle_h3_request(
             if !hints.is_empty() {
                 send_h3_early_hints(stream_id, qconn, &hints);
             }
-            send_h3_response(stream_id, qconn, status, &resp_headers, Bytes::from(body));
+            send_h3_response(stream_id, qconn, status, &resp_headers, Bytes::from(body),
+                http_req.method.eq_ignore_ascii_case("HEAD"));
         }
         RequestOutcome::Pending { rx, ctx } => {
             // URL backend dispatched async — store and poll later.
@@ -1209,11 +1225,21 @@ fn send_h3_response(
     status: u16,
     headers: &[(String, String)],
     body: Bytes,
+    is_head: bool,
 ) {
     let h3 = match qconn.h3_conn.as_mut() {
         Some(h) => h,
         None => return,
     };
+
+    // RFC 9110 9.3.2: a HEAD response advertises the length a GET would have
+    // returned and sends no body. Capture the length before dropping the body,
+    // and note this deliberately lands in the `body.is_empty()` branch below --
+    // which is the branch that emits an explicit content-length and sets FIN on
+    // the HEADERS frame, so the stream terminates cleanly with no DATA at all.
+    // Sending the body anyway is what made h2 and h3 clients abort the stream.
+    let advertised_len = body.len();
+    let body = if is_head { Bytes::new() } else { body };
 
     // Stack-allocated numeric buffers — no String heap allocation.
     let mut status_buf = [0u8; 3];
@@ -1222,7 +1248,7 @@ fn send_h3_response(
     status_buf[2] = b'0' + (status % 10) as u8;
 
     let mut cl_buf = [0u8; 20];
-    let cl_bytes = write_decimal(body.len(), &mut cl_buf);
+    let cl_bytes = write_decimal(advertised_len, &mut cl_buf);
 
     // Pre-size: :status + response headers + content-length + security headers
     let mut h3_headers: Vec<quiche::h3::Header> = Vec::with_capacity(headers.len() + 8);
@@ -1429,6 +1455,40 @@ fn handle_request_inner(
     // that never happened, polluting request/session counts downstream.
     let analytics_enabled = state.config.analytics.enabled && !is_prefetch;
 
+    // ── Method validation, ahead of routing and backend dispatch ────────────
+    // Nothing checked the method before this. Every verb was served the page:
+    // GET, HEAD, POST, PUT, DELETE, PATCH, OPTIONS, TRACE and an invented FOO
+    // all returned 200 with the full body. m6-file happened to 405 non-GET/HEAD
+    // of its own accord, which is why only the HTML routes were affected and
+    // why spot-checking an asset always looked correct.
+    //
+    // No cache poisoning was demonstrated — an unsafe method got the same bytes
+    // a GET would — but it is method confusion, and on any site where a read
+    // path and an action path share a URL that becomes a security problem
+    // rather than a correctness one. TRACE is the one worth naming: answering
+    // it at all is a cross-site tracing vector.
+    //
+    // The cache is already closed to these verbs at every lookup site (see
+    // `cache::method_may_read_cache`); this closes the backend to them too.
+    if !state.config.server.allowed_methods.iter().any(|m| m == req.method.as_str()) {
+        let allow = state.config.server.allowed_methods.join(", ");
+        let headers = vec![
+            ("Allow".to_string(), allow),
+            ("Content-Type".to_string(), "text/plain; charset=utf-8".to_string()),
+            ("Cache-Control".to_string(), "no-store".to_string()),
+        ];
+        if analytics_enabled {
+            debug!(path = %req.path, method = %req.method, "method not allowed");
+        }
+        return RequestOutcome::Ready(
+            405,
+            headers,
+            b"Method Not Allowed".to_vec(),
+            "method-check".to_string(),
+            std::sync::Arc::new(vec![]),
+        );
+    }
+
     // The custom-error render route takes `status`/`from` (and optional
     // `route`/`backend`/`detail`) straight from its query string and renders
     // them into the page — safe when `dispatch_custom_error_async`/
@@ -1566,7 +1626,12 @@ fn handle_request_inner(
     // Responses on `require` routes must never enter the shared cache: the key
     // has no identity component, so a stored entry would later be served to
     // anonymous callers straight from the cache, before any auth check runs.
-    let cacheable = route.require.is_none();
+    // Deliberately narrower than the read gate: GET only. A HEAD must never
+    // store, or the bodyless response it now produces would land under the key
+    // a later GET reads and serve an empty page. See
+    // `cache::method_may_write_cache`.
+    let cacheable = route.require.is_none()
+        && m6_http_lib::cache::method_may_write_cache(&req.method);
     let backend_name = route.backend.clone();
 
     // Check if URL backend — dispatch async.
@@ -2702,6 +2767,7 @@ mod www_redirect_tests {
                 backend_timeout_secs: 30,
                 h2c_bind: None,
                 redirect_bind: None,
+                allowed_methods: vec!["GET".into(), "HEAD".into(), "POST".into()],
             },
             log: LogConfig::default(),
             analytics: AnalyticsConfig::default(),
