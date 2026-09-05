@@ -6,7 +6,7 @@ use anyhow::Result;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::Instant;
-use tracing::debug;
+use tracing::{debug, warn};
 
 pub struct HandlerContext<'a> {
     pub routes: &'a [Route],
@@ -106,8 +106,34 @@ pub fn handle_request<W: Write>(
     };
     let mtime = metadata.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
     let mtime_secs = mtime.duration_since(std::time::SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs();
-    let etag = format!("\"{:x}-{:x}\"", mtime_secs, metadata.len());
     let last_modified = httpdate::fmt_http_date(mtime);
+
+    // Content negotiation is resolved HERE, before the ETag, because the ETag
+    // has to name the representation actually served.
+    //
+    // mtime+size alone gave brotli, gzip and identity of the same file one
+    // shared strong validator — three representations, three different byte
+    // strings, one tag asserting they are the same. RFC 9110 requires a strong
+    // validator to be unique per representation, and the practical consequence
+    // is not theoretical: a downstream shared cache holding the brotli entry
+    // can match that tag against a gzip-only client's request and hand it a
+    // brotli body it cannot decode. Folding the coding into the tag makes the
+    // three variants distinguishable.
+    //
+    // `mime_guess::from_path` and `choose_encoding` both work off the path and
+    // the request headers, never the file contents, so moving them above the
+    // conditional check costs nothing and still lets a 304 skip the read,
+    // minify and compress entirely.
+    let mime = mime_guess::from_path(&fs_path).first_or_octet_stream().to_string();
+    let mime_base = mime.split(';').next().unwrap_or(&mime).to_string();
+    let accept_encoding = req.accept_encoding();
+    let (encoding, level) = choose_encoding(&mime, accept_encoding, ctx.config);
+    let etag_suffix = match encoding {
+        Encoding::Identity => "",
+        Encoding::Brotli => "-br",
+        Encoding::Gzip => "-gz",
+    };
+    let mut etag = format!("\"{:x}-{:x}{}\"", mtime_secs, metadata.len(), etag_suffix);
 
     let if_none_match = req.headers.iter().find(|(k, _)| k == "if-none-match").map(|(_, v)| v.as_str());
     let not_modified = if let Some(inm) = if_none_match {
@@ -189,14 +215,11 @@ pub fn handle_request<W: Write>(
         }
     };
 
-    let mime = mime_guess::from_path(&fs_path).first_or_octet_stream().to_string();
-    let mime_base = mime.split(';').next().unwrap_or(&mime);
-
     // Minification is applied BEFORE compression, gated by content-type and
     // config — mirroring m6-render's pipeline so a static asset gets the
     // same treatment here as it would through the render path.
-    let data = if ctx.config.minification.is_enabled(mime_base) {
-        match mime_base {
+    let data = if ctx.config.minification.is_enabled(&mime_base) {
+        match mime_base.as_str() {
             "text/html" => m6_core::minify::minify_html(&data, ctx.config.minification.inline_js),
             "text/css" => m6_core::minify::minify_css(&data),
             "application/json" => m6_core::minify::minify_json(&data),
@@ -207,21 +230,30 @@ pub fn handle_request<W: Write>(
         data
     };
 
-    let accept_encoding = req.accept_encoding();
-    let (encoding, level) = choose_encoding(&mime, accept_encoding, ctx.config);
-
+    // On a compression failure this used to keep the `Content-Encoding: br`
+    // (or gzip) label while handing back the *uncompressed* bytes that
+    // `.unwrap_or(data)` fell through to — a body no client could decode,
+    // announced as one it could. Falling back has to drop the label with it,
+    // and the ETag's coding suffix has to come off too, or the identity bytes
+    // would go out tagged as the brotli representation.
     let (body, content_encoding): (Vec<u8>, Option<&str>) = match encoding {
         Encoding::Identity => (data, None),
-        Encoding::Brotli => {
-            let lvl = level.unwrap_or(6);
-            let compressed = compress_brotli(&data, lvl).unwrap_or(data);
-            (compressed, Some("br"))
-        }
-        Encoding::Gzip => {
-            let lvl = level.unwrap_or(6);
-            let compressed = compress_gzip(&data, lvl).unwrap_or(data);
-            (compressed, Some("gzip"))
-        }
+        Encoding::Brotli => match compress_brotli(&data, level.unwrap_or(6)) {
+            Ok(compressed) => (compressed, Some("br")),
+            Err(e) => {
+                warn!(path = %fs_path.display(), error = %e, "brotli compression failed, serving identity");
+                etag = format!("\"{:x}-{:x}\"", mtime_secs, metadata.len());
+                (data, None)
+            }
+        },
+        Encoding::Gzip => match compress_gzip(&data, level.unwrap_or(6)) {
+            Ok(compressed) => (compressed, Some("gzip")),
+            Err(e) => {
+                warn!(path = %fs_path.display(), error = %e, "gzip compression failed, serving identity");
+                etag = format!("\"{:x}-{:x}\"", mtime_secs, metadata.len());
+                (data, None)
+            }
+        },
     };
 
     let mut hdrs: Vec<(&str, &str)> = vec![
@@ -608,6 +640,142 @@ mod tests {
         let info = handle_request(&req, &ctx, &mut out).unwrap();
         assert_eq!(info.status, 404);
     }
+
+    /// `parse_response` above runs the whole buffer through `from_utf8`, which
+    /// is fine for the text bodies every other test sends but panics on a
+    /// brotli or gzip one. Split on the header terminator as bytes instead and
+    /// only decode the head.
+    fn parse_response_bytes(buf: &[u8]) -> (u16, Vec<(String, String)>, Vec<u8>) {
+        let sep = buf.windows(4).position(|w| w == b"\r\n\r\n").expect("header terminator");
+        let head = std::str::from_utf8(&buf[..sep]).expect("headers are ASCII");
+        let mut lines = head.lines();
+        let status: u16 = lines.next().unwrap().split_whitespace().nth(1).unwrap().parse().unwrap();
+        let headers = lines
+            .filter_map(|l| l.split_once(": ").map(|(k, v)| (k.to_lowercase(), v.to_string())))
+            .collect();
+        (status, headers, buf[sep + 4..].to_vec())
+    }
+
+    // ── Representation-specific ETags ────────────────────────────────────────
+
+    fn asset_route() -> Route {
+        Route::from_config(&RouteConfig {
+            path: "/assets/{relpath}".to_string(),
+            root: "assets/".to_string(),
+            tail: None,
+            headers: vec![],
+        })
+    }
+
+    /// Drive one GET for `/assets/<name>` with the given Accept-Encoding and
+    /// return (etag, content-encoding, body length).
+    fn fetch(dir: &std::path::Path, name: &str, accept_encoding: Option<&str>)
+        -> (String, Option<String>, usize)
+    {
+        let ae = match accept_encoding {
+            Some(v) => format!("Accept-Encoding: {}\r\n", v),
+            None => String::new(),
+        };
+        let raw = format!("GET /assets/{} HTTP/1.1\r\nHost: localhost\r\n{}\r\n", name, ae);
+        let req = Request::read(Cursor::new(raw.into_bytes())).unwrap();
+        let routes = vec![asset_route()];
+        let config = Config::default();
+        let ctx = HandlerContext { routes: &routes, config: &config, site_dir: dir };
+        let mut out = Vec::new();
+        handle_request(&req, &ctx, &mut out).unwrap();
+        let (status, headers, body) = parse_response_bytes(&out);
+        assert_eq!(status, 200, "expected 200 for {name}");
+        let etag = headers.iter().find(|(k, _)| k == "etag").expect("etag header").1.clone();
+        let ce = headers.iter().find(|(k, _)| k == "content-encoding").map(|(_, v)| v.clone());
+        (etag, ce, body.len())
+    }
+
+    /// A file with enough redundancy that brotli and gzip both actually
+    /// compress it, and compress it to different sizes.
+    fn compressible_css() -> Vec<u8> {
+        let mut s = String::new();
+        for i in 0..400 {
+            s.push_str(&format!(".selector-{} {{ color: #aabbcc; margin: 0 auto; }}\n", i));
+        }
+        s.into_bytes()
+    }
+
+    /// The defect: brotli, gzip and identity of the same file all carried one
+    /// strong validator. RFC 9110 requires a strong ETag to identify the
+    /// representation actually sent, and a downstream shared cache that
+    /// believes otherwise can hand a brotli body to a gzip-only client.
+    #[test]
+    fn each_content_coding_gets_its_own_etag() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        std::fs::write(dir.path().join("assets/style.css"), compressible_css()).unwrap();
+
+        let (e_br, ce_br, _)   = fetch(dir.path(), "style.css", Some("br"));
+        let (e_gz, ce_gz, _)   = fetch(dir.path(), "style.css", Some("gzip"));
+        let (e_id, ce_id, _)   = fetch(dir.path(), "style.css", None);
+
+        assert_eq!(ce_br.as_deref(), Some("br"));
+        assert_eq!(ce_gz.as_deref(), Some("gzip"));
+        assert_eq!(ce_id, None);
+
+        assert_ne!(e_br, e_gz, "brotli and gzip share an ETag");
+        assert_ne!(e_br, e_id, "brotli and identity share an ETag");
+        assert_ne!(e_gz, e_id, "gzip and identity share an ETag");
+    }
+
+    /// The identity tag keeps its historical `<mtime>-<size>` shape, so an
+    /// unversioned URL a client already cached does not spuriously miss.
+    #[test]
+    fn identity_keeps_the_unsuffixed_etag() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        std::fs::write(dir.path().join("assets/style.css"), compressible_css()).unwrap();
+
+        let (e_id, _, _) = fetch(dir.path(), "style.css", None);
+        assert!(!e_id.contains("-br"), "identity tag carries a coding suffix: {e_id}");
+        assert!(!e_id.contains("-gz"), "identity tag carries a coding suffix: {e_id}");
+    }
+
+    /// Two requests for the same representation must agree, or every reload
+    /// is a full transfer.
+    #[test]
+    fn the_same_representation_is_stable_across_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        std::fs::write(dir.path().join("assets/style.css"), compressible_css()).unwrap();
+
+        let (first, _, _)  = fetch(dir.path(), "style.css", Some("br"));
+        let (second, _, _) = fetch(dir.path(), "style.css", Some("br"));
+        assert_eq!(first, second);
+    }
+
+    /// A conditional request carrying the brotli tag must 304 for brotli, and
+    /// must NOT 304 for a client that can only take gzip -- that pairing is
+    /// exactly what the shared tag made indistinguishable.
+    #[test]
+    fn a_brotli_etag_does_not_validate_a_gzip_request() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        std::fs::write(dir.path().join("assets/style.css"), compressible_css()).unwrap();
+
+        let (e_br, _, _) = fetch(dir.path(), "style.css", Some("br"));
+
+        let cond = |ae: &str| -> u16 {
+            let raw = format!(
+                "GET /assets/style.css HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: {}\r\nIf-None-Match: {}\r\n\r\n",
+                ae, e_br);
+            let req = Request::read(Cursor::new(raw.into_bytes())).unwrap();
+            let routes = vec![asset_route()];
+            let config = Config::default();
+            let ctx = HandlerContext { routes: &routes, config: &config, site_dir: dir.path() };
+            let mut out = Vec::new();
+            handle_request(&req, &ctx, &mut out).unwrap();
+            parse_response_bytes(&out).0
+        };
+
+        assert_eq!(cond("br"), 304, "the brotli tag should validate a brotli request");
+        assert_eq!(cond("gzip"), 200, "the brotli tag must not validate a gzip request");
+    }
 }
 
 enum FindRouteResult<'a> {
@@ -678,4 +846,5 @@ mod cache_control_tests {
             assert!(!is_versioned(&query_of(url)), "{url} must NOT be treated as versioned");
         }
     }
+
 }

@@ -1381,7 +1381,37 @@ fn synth_refresh_request(r: &Refresh) -> forward::HttpRequest {
     }
 }
 
+/// Cache-miss entry point for every protocol path.
+///
+/// This wrapper exists for one reason: `Vary: Accept-Encoding` used to be
+/// emitted **only when replaying a cache hit**, so the very first client to ask
+/// for any URL — every fresh visitor, and every downstream shared cache
+/// populating itself — got a compressed body with nothing saying the body
+/// depends on `Accept-Encoding`. That is the worse of the two orderings.
+///
+/// The header belongs on all four server paths and on all eleven of
+/// `handle_request_inner`'s `Ready` returns, so it is applied once here rather
+/// than at each site, where a twelfth return would silently miss it.
+///
+/// Applying it *after* the inner call is deliberate. `handle_request_inner`
+/// inserts into the cache itself, so `should_cache` still inspects the exact
+/// `Vary` the backend sent, and a response varying on anything beyond encoding
+/// stays uncacheable.
 fn handle_request(
+    req: &forward::HttpRequest,
+    client_ip: &str,
+    content_encoding: &str,
+    state: &mut ServerState,
+    is_prefetch: bool,
+) -> RequestOutcome {
+    let mut outcome = handle_request_inner(req, client_ip, content_encoding, state, is_prefetch);
+    if let RequestOutcome::Ready(_, ref mut headers, _, _, _) = outcome {
+        set_vary_accept_encoding(headers);
+    }
+    outcome
+}
+
+fn handle_request_inner(
     req: &forward::HttpRequest,
     client_ip: &str,
     content_encoding: &str,
@@ -1942,18 +1972,69 @@ fn set_alt_svc(headers: &mut Vec<(String, String)>, quic_port: u16) {
     headers.push(("alt-svc".to_string(), format!("h3=\":{quic_port}\"; ma=86400")));
 }
 
-/// Same duplication hazard as `set_alt_svc`: a cache node's cached headers
-/// are whatever its own upstream (origin) sent, and origin adds this same
-/// header on its own cache hits — so a cache node replaying a cache hit of
-/// its own would otherwise double it up.
+/// Ensure `Accept-Encoding` appears exactly once in a single `Vary` header,
+/// **preserving any other field names the backend named**.
+///
+/// Same duplication hazard as `set_alt_svc`: a cache node's cached headers are
+/// whatever its own upstream (origin) sent, and origin adds this same header on
+/// its own cache hits — so a cache node replaying a cache hit of its own would
+/// otherwise double it up. Hence collapsing to one header rather than pushing.
+///
+/// This merges rather than overwrites, and that distinction is load-bearing.
+/// It previously dropped every existing `Vary` and wrote `Accept-Encoding` in
+/// its place, which was harmless only because it ran solely on the cache-hit
+/// path — where `should_cache` had already refused anything varying on more
+/// than encoding. It is now also called on the miss path, ahead of nothing:
+/// an overwriting version would rewrite a backend's `Vary: Cookie` to
+/// `Vary: Accept-Encoding`, `should_cache` would see a cacheable response, and
+/// one client's private variant would be stored and replayed to everyone.
+/// Preserving the other field names keeps that response uncacheable, which is
+/// the whole reason `should_cache` inspects `Vary` at all.
 fn set_vary_accept_encoding(headers: &mut Vec<(String, String)>) {
+    let mut fields: Vec<String> = Vec::new();
+    for (k, v) in headers.iter() {
+        if !k.eq_ignore_ascii_case("vary") {
+            continue;
+        }
+        // `Vary: *` means "unpredictable"; it cannot be narrowed by adding a
+        // field name to it, so leave such a response exactly as the backend
+        // wrote it.
+        if v.trim() == "*" {
+            return;
+        }
+        for f in v.split(',').map(str::trim).filter(|f| !f.is_empty()) {
+            if !fields.iter().any(|e| e.eq_ignore_ascii_case(f)) {
+                fields.push(f.to_string());
+            }
+        }
+    }
+    if !fields.iter().any(|f| f.eq_ignore_ascii_case("accept-encoding")) {
+        fields.push("Accept-Encoding".to_string());
+    }
     headers.retain(|(k, _)| !k.eq_ignore_ascii_case("vary"));
-    headers.push(("vary".to_string(), "Accept-Encoding".to_string()));
+    headers.push(("vary".to_string(), fields.join(", ")));
 }
 
 /// Called when a URL-backend I/O thread returns its result.  Handles cache
 /// insertion, hints extraction, alt-svc injection, and error mode application.
+///
+/// Wrapped for the same reason as `handle_request`: this is the async
+/// completion path, so it never passes through that wrapper, and a response
+/// forwarded from a URL backend needs `Vary: Accept-Encoding` exactly as much
+/// as a synchronous one. Applied after the inner call so `should_cache` still
+/// sees the backend's own `Vary`.
 fn finalize_url_response(
+    http_result: std::io::Result<forward::HttpResponse>,
+    ctx:         &forward::PendingUrlContext,
+    quic_port:   u16,
+    state:       &mut ServerState,
+) -> (u16, Vec<(String, String)>, Vec<u8>, String, std::sync::Arc<Vec<String>>) {
+    let mut r = finalize_url_response_inner(http_result, ctx, quic_port, state);
+    set_vary_accept_encoding(&mut r.1);
+    r
+}
+
+fn finalize_url_response_inner(
     http_result: std::io::Result<forward::HttpResponse>,
     ctx:         &forward::PendingUrlContext,
     quic_port:   u16,
@@ -2788,5 +2869,95 @@ mod refresh_request_tests {
         let req = synth_refresh_request(&r);
         assert_eq!(req.query.as_deref(), Some("a=1&b=2"));
         assert_eq!(enc_of(&req), Some("br"));
+    }
+}
+
+#[cfg(test)]
+mod vary_tests {
+    use super::*;
+
+    fn vary_of(h: &[(String, String)]) -> Vec<&str> {
+        h.iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("vary"))
+            .map(|(_, v)| v.as_str())
+            .collect()
+    }
+
+    fn hdrs(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn adds_the_header_when_the_backend_sent_none() {
+        // The actual reported defect: a cache MISS carried no Vary at all, so
+        // the first client to ask for any URL -- every fresh visitor -- got a
+        // negotiated body with nothing saying it was negotiated.
+        let mut h = hdrs(&[("content-type", "text/css")]);
+        set_vary_accept_encoding(&mut h);
+        assert_eq!(vary_of(&h), vec!["Accept-Encoding"]);
+    }
+
+    #[test]
+    fn does_not_duplicate_an_existing_one() {
+        // A cache node's upstream is the origin, which already added this on
+        // its own cache hit.
+        let mut h = hdrs(&[("vary", "Accept-Encoding")]);
+        set_vary_accept_encoding(&mut h);
+        assert_eq!(vary_of(&h), vec!["Accept-Encoding"]);
+    }
+
+    #[test]
+    fn matches_case_insensitively_rather_than_appending_a_variant() {
+        let mut h = hdrs(&[("Vary", "accept-encoding")]);
+        set_vary_accept_encoding(&mut h);
+        assert_eq!(vary_of(&h).len(), 1);
+        assert_eq!(vary_of(&h)[0].to_lowercase(), "accept-encoding");
+    }
+
+    /// The one that matters most. Overwriting instead of merging would strip
+    /// `Cookie` here, `should_cache` would then see a response varying only on
+    /// encoding, and one client's private variant would be cached and replayed
+    /// to everybody. This function is called on the miss path, ahead of that
+    /// decision, so the other field names have to survive it.
+    #[test]
+    fn preserves_other_field_names_so_the_response_stays_uncacheable() {
+        let mut h = hdrs(&[("vary", "Cookie")]);
+        set_vary_accept_encoding(&mut h);
+        assert_eq!(vary_of(&h).len(), 1);
+        let v = vary_of(&h)[0].to_lowercase();
+        assert!(v.contains("cookie"), "Cookie was dropped: {v}");
+        assert!(v.contains("accept-encoding"), "Accept-Encoding missing: {v}");
+        assert!(!should_cache(200, &h), "a Cookie-varying response must not be cacheable");
+    }
+
+    #[test]
+    fn collapses_several_vary_headers_into_one() {
+        let mut h = hdrs(&[("vary", "Cookie"), ("vary", "Accept-Language")]);
+        set_vary_accept_encoding(&mut h);
+        assert_eq!(vary_of(&h).len(), 1, "must emit exactly one Vary header");
+        let v = vary_of(&h)[0].to_lowercase();
+        for want in ["cookie", "accept-language", "accept-encoding"] {
+            assert!(v.contains(want), "{want} missing from {v}");
+        }
+    }
+
+    /// `Vary: *` means the response is unpredictable. Adding a field name to
+    /// it would narrow a claim the backend deliberately left open, so it is
+    /// passed through untouched -- and stays uncacheable.
+    #[test]
+    fn leaves_vary_star_alone() {
+        let mut h = hdrs(&[("vary", "*")]);
+        set_vary_accept_encoding(&mut h);
+        assert_eq!(vary_of(&h), vec!["*"]);
+        assert!(!should_cache(200, &h));
+    }
+
+    /// The encoding-only case must remain cacheable, or adding this header on
+    /// the miss path would silently disable the cache for every asset.
+    #[test]
+    fn an_encoding_only_vary_is_still_cacheable() {
+        let mut h = hdrs(&[("cache-control", "public"), ("content-type", "text/css")]);
+        set_vary_accept_encoding(&mut h);
+        assert!(should_cache(200, &h));
     }
 }
