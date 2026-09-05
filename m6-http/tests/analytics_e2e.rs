@@ -25,6 +25,9 @@ use std::time::{Duration, Instant};
 use quiche::h3::NameValue as _;
 use rustls::StreamOwned;
 
+mod common;
+use common::free_port;
+
 // ── Process management ────────────────────────────────────────────────────────
 
 struct TestProcess(Child);
@@ -49,10 +52,7 @@ fn binary(name: &str) -> PathBuf {
     p
 }
 
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
-}
+
 
 fn wait_for_tcp(port: u16, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
