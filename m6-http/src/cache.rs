@@ -358,6 +358,19 @@ fn directives(headers: &[(String, String)]) -> Directives {
 /// explicit invalidation.
 struct CacheEntry {
     response: CachedResponse,
+    /// When this entry was stored, and the age it already had on arrival.
+    ///
+    /// RFC 9111 5.1 requires a shared cache to send `Age` on a stored
+    /// response, and 4.2.3 defines it as time since the response was
+    /// *generated* -- not since we happened to store it. Neither existed:
+    /// nothing emitted `Age` at all, so a downstream cache had no way to know
+    /// how old what we handed it already was, and treated a minute-old
+    /// response as brand new.
+    ///
+    /// `upstream_age` captures the `Age` the origin already declared, so an
+    /// entry that arrived one hop old does not restart the clock here.
+    stored_at: std::time::Instant,
+    upstream_age: std::time::Duration,
     expires_at: Option<std::time::Instant>,
     /// Instant past which even a stale serve is refused. Equal to
     /// `expires_at` when the response did not permit stale serving at all.
@@ -367,13 +380,21 @@ struct CacheEntry {
 /// The result of a cache lookup.
 pub enum Lookup {
     /// Inside its freshness lifetime — serve it, nothing else to do.
-    Fresh(CachedResponse),
+    ///
+    /// The `Duration` is the response's current age (RFC 9111 4.2.3): time
+    /// since it was generated, which includes any `Age` it already carried
+    /// when it arrived here. The caller emits it as the `Age` header. It is
+    /// returned alongside rather than written into the stored headers because
+    /// the value changes every second, while the stored headers are shared
+    /// behind an `Arc` and cloned only where the caller is already building an
+    /// owned header vector — so this costs nothing on the hot path.
+    Fresh(CachedResponse, std::time::Duration),
     /// Past freshness but inside the stale-while-revalidate window. Serve it
     /// immediately — the whole point is that no visitor ever waits on an
     /// origin round trip — and queue a background refresh so the *next*
     /// request gets the new copy. Costs at most one stale serve per entry per
     /// expiry.
-    Stale(CachedResponse),
+    Stale(CachedResponse, std::time::Duration),
     /// Nothing usable: absent, or stale beyond what the response permits.
     Miss,
 }
@@ -411,8 +432,8 @@ impl Cache {
         Q: std::hash::Hash + Eq + ?Sized,
     {
         match self.lookup(key) {
-            Lookup::Fresh(r) => Some(r),
-            Lookup::Stale(_) | Lookup::Miss => None,
+            Lookup::Fresh(r, _) => Some(r),
+            Lookup::Stale(..) | Lookup::Miss => None,
         }
     }
 
@@ -429,15 +450,19 @@ impl Cache {
     {
         let Ok(map) = self.map.read() else { return Lookup::Miss };
         let Some(entry) = map.get(key) else { return Lookup::Miss };
+        let now = std::time::Instant::now();
+        // Current age: how long we have held it, plus whatever age it already
+        // had on arrival. Resetting to zero at each hop is what makes a chain
+        // of caches report content as fresher than it is.
+        let age = entry.upstream_age + now.saturating_duration_since(entry.stored_at);
         // Every branch decides before cloning, so a miss costs no copy.
         let Some(expires_at) = entry.expires_at else {
-            return Lookup::Fresh(entry.response.clone());
+            return Lookup::Fresh(entry.response.clone(), age);
         };
-        let now = std::time::Instant::now();
         if now < expires_at {
-            Lookup::Fresh(entry.response.clone())
+            Lookup::Fresh(entry.response.clone(), age)
         } else if entry.serve_stale_until.is_some_and(|until| now < until) {
-            Lookup::Stale(entry.response.clone())
+            Lookup::Stale(entry.response.clone(), age)
         } else {
             Lookup::Miss
         }
@@ -451,6 +476,14 @@ impl Cache {
     pub fn insert(&self, key: CacheKey, response: CachedResponse) {
         let d = directives(&response.headers);
         let now = std::time::Instant::now();
+        // Any `Age` the upstream already declared. A response that reached us
+        // one hop old must not have its age reset to zero here, or each hop
+        // would silently make the content look fresher than it is.
+        let upstream_age = response.headers.iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("age"))
+            .and_then(|(_, v)| v.trim().parse::<u64>().ok())
+            .map(std::time::Duration::from_secs)
+            .unwrap_or_default();
         // The margin is why a max-age=60 response expires locally at 59s. It
         // saturates rather than wrapping, so a zero lifetime stays zero.
         let expires_at = d.lifetime.map(|l| now + l.saturating_sub(REFRESH_MARGIN));
@@ -468,7 +501,9 @@ impl Cache {
         };
         let serve_stale_until = expires_at.map(|e| e + stale_window);
         if let Ok(mut map) = self.map.write() {
-            map.insert(key, CacheEntry { response, expires_at, serve_stale_until });
+            map.insert(key, CacheEntry {
+                response, stored_at: now, upstream_age, expires_at, serve_stale_until,
+            });
         }
     }
 
@@ -764,7 +799,7 @@ mod tests {
             CacheKey::new("/hello", None, ""),
             cached_with_cc("public, max-age=3600"),
         );
-        assert!(matches!(lookup_path(&cache, "/hello"), Lookup::Fresh(_)));
+        assert!(matches!(lookup_path(&cache, "/hello"), Lookup::Fresh(..)));
     }
 
     /// No freshness lifetime means the entry lives until it is explicitly
@@ -774,7 +809,7 @@ mod tests {
     fn test_cache_without_max_age_never_expires() {
         let cache = Cache::new();
         cache.insert(CacheKey::new("/hello", None, ""), cached_with_cc("public"));
-        assert!(matches!(lookup_path(&cache, "/hello"), Lookup::Fresh(_)));
+        assert!(matches!(lookup_path(&cache, "/hello"), Lookup::Fresh(..)));
     }
 
     /// The whole point of stale-while-revalidate: once past freshness the
@@ -788,7 +823,7 @@ mod tests {
             cached_with_cc("public, max-age=0, stale-while-revalidate=3600"),
         );
         match lookup_path(&cache, "/hello") {
-            Lookup::Stale(r) => assert_eq!(r.body, b"world" as &[u8]),
+            Lookup::Stale(r, _) => assert_eq!(r.body, b"world" as &[u8]),
             _ => panic!("expected a stale serve, not a miss"),
         }
         // `get` is the fresh-only question, so it must still say no — that is
@@ -1328,5 +1363,78 @@ mod cache_control_tests {
     fn request_no_cache_does_not_forbid_storage() {
         assert!(request_permits_storage(&h(&[("cache-control", "no-cache")])));
         assert!(request_permits_storage(&h(&[])));
+    }
+}
+
+#[cfg(test)]
+mod age_tests {
+    use super::*;
+
+    fn resp(headers: &[(&str, &str)]) -> CachedResponse {
+        CachedResponse {
+            status: 200,
+            headers: std::sync::Arc::new(
+                headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            ),
+            body: bytes::Bytes::from_static(b"x"),
+            hints: std::sync::Arc::new(vec![]),
+        }
+    }
+
+    /// A freshly stored entry is age ~0.
+    #[test]
+    fn a_fresh_entry_starts_at_about_zero() {
+        let c = Cache::new();
+        c.insert(CacheKey::new("/a", None, ""), resp(&[("cache-control", "public, max-age=60")]));
+        match c.lookup("/a\u{1}\u{1}") {
+            Lookup::Fresh(_, age) => assert!(age.as_secs() < 2, "age was {age:?}"),
+            other => panic!("expected Fresh, got {}", match other {
+                Lookup::Stale(..) => "Stale", _ => "Miss" }),
+        }
+    }
+
+    /// RFC 9111 4.2.3: age is time since the response was GENERATED, so an
+    /// `Age` the upstream already declared carries forward. Resetting it to
+    /// zero at each hop is what makes a chain of caches report stale content
+    /// as new.
+    #[test]
+    fn upstream_age_is_carried_forward() {
+        let c = Cache::new();
+        c.insert(
+            CacheKey::new("/b", None, ""),
+            resp(&[("cache-control", "public, max-age=600"), ("age", "120")]),
+        );
+        match c.lookup("/b\u{1}\u{1}") {
+            Lookup::Fresh(_, age) => {
+                assert!(age.as_secs() >= 120, "upstream Age was dropped; got {age:?}");
+                assert!(age.as_secs() < 125, "age inflated beyond the upstream value: {age:?}");
+            }
+            _ => panic!("expected Fresh"),
+        }
+    }
+
+    /// A malformed upstream Age must not poison the calculation.
+    #[test]
+    fn unparseable_upstream_age_is_ignored() {
+        let c = Cache::new();
+        c.insert(
+            CacheKey::new("/c", None, ""),
+            resp(&[("cache-control", "public, max-age=60"), ("age", "not-a-number")]),
+        );
+        match c.lookup("/c\u{1}\u{1}") {
+            Lookup::Fresh(_, age) => assert!(age.as_secs() < 2, "age was {age:?}"),
+            _ => panic!("expected Fresh"),
+        }
+    }
+
+    /// An entry with no freshness directive still reports an age.
+    #[test]
+    fn an_entry_without_a_lifetime_still_reports_age() {
+        let c = Cache::new();
+        c.insert(CacheKey::new("/d", None, ""), resp(&[("cache-control", "public"), ("age", "7")]));
+        match c.lookup("/d\u{1}\u{1}") {
+            Lookup::Fresh(_, age) => assert!(age.as_secs() >= 7),
+            _ => panic!("expected Fresh"),
+        }
     }
 }
