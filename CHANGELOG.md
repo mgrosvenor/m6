@@ -11,6 +11,68 @@ Deploy order is fixed: **test locally, commit, then deploy.** Never the reverse.
 
 ---
 
+## 2026-09-06 — HTTP/2 frame validation: a remote panic, and flow-control accounting
+
+From the RFC audit, revision 1. The first item is the reason this jumped the queue.
+
+### A three-byte frame could kill the process (F076)
+
+```rust
+if flags & FLAG_PRIORITY != 0 { pos += 5; }
+let header_block = &payload[pos..];        // panics when payload.len() < pos
+```
+
+A HEADERS frame declaring PRIORITY but carrying fewer than the five bytes the
+priority fields require sliced out of range and aborted. Reachable immediately
+after the connection preface, with no other setup and no valid request.
+
+Verified rather than assumed: restoring the original line makes the new test
+fail with `range start index 5 out of range for slice of length 0`. (A first
+attempt at that verification was itself wrong — a partial revert left the new
+padding bounds-check in place, which also guards the slice, so the test passed
+and looked vacuous. Reverting to the exact original line showed the panic.)
+
+Now a FRAME_SIZE_ERROR, per RFC 9113 6.2.
+
+### Padding was fed to the HPACK decoder (same six lines)
+
+`&payload[pos..]` ran to the end of the payload, so trailing pad bytes were
+passed to HPACK as though they were field data. The header block is now
+`payload[pos .. len - pad]`.
+
+### Flow-control accounting (F078-F081)
+
+- **RFC 9113 6.9.1: the whole payload counts against flow control**, padding
+  and pad-length byte included. Only `data.len()` was charged, so a peer padding
+  heavily reclaimed credit it never spent and the two ends' views of the window
+  drifted apart.
+- **No per-stream receive window existed at all** (F080) — only the connection
+  window, so a single stream could consume the entire connection's credit.
+  `H2Stream` now carries one.
+- **An empty DATA frame emitted `WINDOW_UPDATE` with increment 0**, which is
+  itself a PROTOCOL_ERROR (F081). Never emitted now.
+- **`PADDED` with an empty payload** was silently treated as unpadded (F078).
+
+### Request bodies were unbounded (H001)
+
+Not an RFC clause; a robustness finding the audit listed separately, and one of
+the two it rated Critical. Bodies accumulated with no ceiling while flow-control
+credit was returned, so a peer could stream indefinitely and grow the process
+until it was killed. Capped at 20 MiB — above the renderers' own 16 MiB
+multipart limit, so it never trips before their check does.
+
+### Tests
+
+Seven, including a sweep of every frame type against a spread of flag
+combinations, payload lengths and stream IDs, asserting only that nothing
+panics. That property is the one that matters here: a remote peer controls
+every byte, so any panic is a remote kill. It is also what the audit asked for
+under "fuzz targets for every frame parser".
+
+587 workspace tests pass, zero warnings.
+
+---
+
 ## 2026-09-06 — Reject a bare LF in the header block, and a raw-socket robustness suite
 
 ### The defect
