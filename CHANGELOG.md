@@ -11,6 +11,31 @@ Deploy order is fixed: **test locally, commit, then deploy.** Never the reverse.
 
 ---
 
+## 2026-09-06 — `Expires`-based freshness (F047)
+
+`Expires` was not consulted at all. A response using the older header — still
+perfectly valid, and what a great deal of software emits — fell straight
+through to "no freshness given" and was treated as fresh indefinitely. Exactly
+backwards: it carried an explicit expiry and the cache ignored it.
+
+Now implemented in the precedence RFC 9111 4.2.1 requires: `s-maxage`, then
+`max-age`, then `Expires - Date`, then the bounded heuristic.
+
+Measured against the **response's own `Date`**, not our clock. Using local time
+would silently lengthen or shorten the lifetime by however much the two
+servers' clocks disagree, which is a real effect on a cache sitting between two
+machines. A missing `Date` falls back to now; an `Expires` at or before `Date`
+means already stale, and yields zero rather than a duration that would wrap.
+
+Five tests, including clock skew (Date and Expires both shifted an hour, and
+the interval is still honoured), `max-age` outranking `Expires`, a past
+`Expires`, and unparseable garbage falling back to the heuristic rather than
+being mistaken for an expiry.
+
+601 workspace tests pass across two consecutive runs, zero warnings.
+
+---
+
 ## 2026-09-06 — Bounded heuristic freshness, and unsafe-method invalidation
 
 ### `Cache-Control: public` no longer means fresh forever (F048)
