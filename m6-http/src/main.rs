@@ -708,14 +708,7 @@ fn event_loop(
             // already refreshed and proceeds for stale ones — which is exactly
             // the set still needing work.
             if state.cache.get(lk).is_none() {
-                let synth = forward::HttpRequest {
-                    method:  "GET".to_string(),
-                    path:    r.path.clone(),
-                    query:   r.query.clone(),
-                    version: "HTTP/1.1".to_string(),
-                    headers: vec![],
-                    body:    vec![],
-                };
+                let synth = synth_refresh_request(&r);
                 match handle_request(&synth, "127.0.0.1", &r.enc, state, true) {
                     // Socket backend: already completed and inserted inline.
                     RequestOutcome::Ready(..) => {
@@ -1355,6 +1348,37 @@ fn www_redirect(req: &forward::HttpRequest, config: &config::Config) -> Option<R
         "www-redirect".to_string(),
         std::sync::Arc::new(vec![]),
     ))
+}
+
+/// Build the synthetic GET used for a background cache fill.
+///
+/// **The `Accept-Encoding` header is load-bearing.** The encoding is also
+/// passed separately to `handle_request` as the cache-key component, so
+/// omitting it here does not produce a miss -- it produces something worse: the
+/// backend, seeing no `Accept-Encoding`, returns an identity body, which is
+/// then stored under the key that promises the *encoded* variant. Every
+/// subsequent hit on that key serves an uncompressed body to a client that
+/// asked for a compressed one.
+///
+/// That was live: `style.css` was served to browsers at 44KB instead of 7KB
+/// brotli, and it re-poisoned itself every 60s, because each stale-while-
+/// revalidate refresh rewrote the entry with another identity body. Small
+/// assets hid it (identity and compressed sizes are close), so only the
+/// stylesheet showed the damage.
+fn synth_refresh_request(r: &Refresh) -> forward::HttpRequest {
+    let headers = if r.enc.is_empty() {
+        Vec::new()
+    } else {
+        vec![("Accept-Encoding".to_string(), r.enc.clone())]
+    };
+    forward::HttpRequest {
+        method:  "GET".to_string(),
+        path:    r.path.clone(),
+        query:   r.query.clone(),
+        version: "HTTP/1.1".to_string(),
+        headers,
+        body:    vec![],
+    }
 }
 
 fn handle_request(
@@ -2674,5 +2698,55 @@ mod www_redirect_tests {
         for host in ["www.", "www", "", ":80", "."] {
             assert_eq!(www_redirect_location(Some(host), "/", None, &c), None, "host {host:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod refresh_request_tests {
+    use super::*;
+
+    fn enc_of(req: &forward::HttpRequest) -> Option<&str> {
+        req.headers.iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("accept-encoding"))
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// The regression that mattered: without this header the backend replies
+    /// identity and the identity body is cached under the encoded key.
+    #[test]
+    fn refresh_asks_for_the_encoding_it_will_be_cached_under() {
+        let r = Refresh {
+            path: "/assets/css/style.css".to_string(),
+            query: None,
+            enc: "gzip, deflate, br, zstd".to_string(),
+        };
+        let req = synth_refresh_request(&r);
+        assert_eq!(enc_of(&req), Some("gzip, deflate, br, zstd"));
+        assert_eq!(req.method, "GET");
+        assert_eq!(req.path, "/assets/css/style.css");
+        assert!(req.body.is_empty());
+    }
+
+    /// An identity entry is keyed on the empty string; sending
+    /// `Accept-Encoding:` with an empty value would be a malformed request, so
+    /// the header is omitted entirely instead.
+    #[test]
+    fn identity_refresh_sends_no_accept_encoding() {
+        let r = Refresh { path: "/".to_string(), query: None, enc: String::new() };
+        let req = synth_refresh_request(&r);
+        assert_eq!(enc_of(&req), None);
+        assert!(req.headers.is_empty());
+    }
+
+    #[test]
+    fn query_is_preserved_so_the_key_matches() {
+        let r = Refresh {
+            path: "/x".to_string(),
+            query: Some("a=1&b=2".to_string()),
+            enc: "br".to_string(),
+        };
+        let req = synth_refresh_request(&r);
+        assert_eq!(req.query.as_deref(), Some("a=1&b=2"));
+        assert_eq!(enc_of(&req), Some("br"));
     }
 }
