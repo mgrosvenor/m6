@@ -67,7 +67,10 @@ fn handle_login(req: &RawRequest, state: &AppState, peer_ip: &str) -> RawRespons
 }
 
 fn parse_form_body(body: &[u8]) -> Vec<(String, String)> {
-    let s = std::str::from_utf8(body).unwrap_or("");
+    // Lossy, not `unwrap_or("")`: one invalid byte used to discard the entire
+    // body, producing a login attempt with no username and no password and no
+    // indication why. See `url_decode` below for the matching defect.
+    let s = String::from_utf8_lossy(body);
     s.split('&')
         .filter_map(|pair| {
             let mut it = pair.splitn(2, '=');
@@ -78,25 +81,59 @@ fn parse_form_body(body: &[u8]) -> Vec<(String, String)> {
         .collect()
 }
 
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Percent-decode into BYTES, then interpret the result as UTF-8.
+///
+/// This was a second copy of the same defect fixed in
+/// `m6-render/src/request.rs`: it decoded each `%XX` and did
+/// `out.push(byte as char)`, which in Rust means "the character at code point
+/// `byte`" -- Latin-1. A multi-byte UTF-8 sequence was split into one wrong
+/// character per byte, so any non-ASCII input was corrupted before it was used.
+///
+/// Here that lands on the login form. A password containing any non-ASCII
+/// character would be silently mangled and the comparison would fail, with the
+/// user seeing nothing but "invalid credentials" no matter how carefully they
+/// typed it -- and nothing in the logs to say why.
+///
+/// ASCII is a fixed point under the broken version (byte == code point below
+/// 0x80), which is why this survived: every test anyone wrote used ASCII.
 fn url_decode(s: &str) -> String {
-    let s = s.replace('+', " ");
-    let mut out = String::new();
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '%' {
-            let h1 = chars.next();
-            let h2 = chars.next();
-            if let (Some(h1), Some(h2)) = (h1, h2) {
-                let hex = format!("{}{}", h1, h2);
-                if let Ok(byte) = u8::from_str_radix(&hex, 16) {
-                    out.push(byte as char);
-                    continue;
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'+' {
+            out.push(b' ');
+            i += 1;
+        } else if bytes[i] == b'%' && i + 2 < bytes.len() {
+            // Parsed from the raw bytes, never by slicing the &str. `&s[i+1..i+3]`
+            // would panic if those offsets landed inside a multi-byte character,
+            // which a hostile client can arrange with a `%` before any non-ASCII
+            // byte -- a remote panic in the login handler.
+            match (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2])) {
+                (Some(h), Some(l)) => {
+                    out.push((h << 4) | l);
+                    i += 3;
+                }
+                _ => {
+                    out.push(b'%');
+                    i += 1;
                 }
             }
+        } else {
+            out.push(bytes[i]);
+            i += 1;
         }
-        out.push(c);
     }
-    out
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn form_field<'a>(fields: &'a [(String, String)], key: &str) -> Option<&'a str> {
@@ -474,4 +511,40 @@ fn internal_error() -> RawResponse {
     RawResponse::new(500)
         .content_type("application/json")
         .body(r#"{"error":"internal_error"}"#)
+}
+
+#[cfg(test)]
+mod url_decode_tests {
+    use super::{parse_form_body, url_decode};
+
+    /// The same defect that reached production through the contact form
+    /// (m6-render). A password is the worst place for it: the user sees only
+    /// "invalid credentials" and there is nothing to tell them their password
+    /// was corrupted rather than wrong.
+    #[test]
+    fn multibyte_utf8_survives() {
+        assert_eq!(url_decode("caf%C3%A9"), "caf\u{e9}");
+        assert_eq!(url_decode("I%E2%80%99m"), "I\u{2019}m");
+        assert_eq!(url_decode("%F0%9F%98%80"), "\u{1F600}");
+        assert_eq!(url_decode("p%C3%A4ssw%C3%B6rd+123"), "p\u{e4}ssw\u{f6}rd 123");
+        // ASCII unchanged — the case that always passed, broken or not.
+        assert_eq!(url_decode("plain%2Fascii"), "plain/ascii");
+    }
+
+    /// A `%` immediately before a multi-byte character. Slicing the &str by
+    /// byte offset here (`&s[i+1..i+3]`) panics on a non-char-boundary, which
+    /// would be a remote crash in the login handler.
+    #[test]
+    fn percent_before_multibyte_does_not_panic() {
+        for input in ["%\u{e9}", "%\u{1F600}x", "abc%\u{4e2d}\u{6587}", "%", "%A", "%ZZ"] {
+            let _ = url_decode(input);
+        }
+    }
+
+    #[test]
+    fn invalid_utf8_body_does_not_discard_every_field() {
+        let pairs = parse_form_body(b"username=admin&password=%FF%FE");
+        assert_eq!(pairs.len(), 2, "one bad byte must not empty the whole form");
+        assert_eq!(pairs[0], ("username".to_string(), "admin".to_string()));
+    }
 }
