@@ -11,6 +11,45 @@ Deploy order is fixed: **test locally, commit, then deploy.** Never the reverse.
 
 ---
 
+## Accept-Encoding q-values, Via, and Connection-nominated fields (F012-F014, F017-F019)
+
+**F012-F014 — content negotiation ignored q-values.** `choose_encoding` tested
+`accept_encoding.contains("br")`. Substring matching, so
+`Accept-Encoding: gzip, br;q=0` -- a client explicitly refusing brotli -- still
+matched, and the response went out brotli-encoded to something that had said it
+could not accept it. `q=0` means *not acceptable* (RFC 9110 12.4.2), not "least
+preferred". Preference was ignored too: `gzip;q=1.0, br;q=0.1` chose brotli
+simply because `br` was tested first.
+
+Replaced with a real parser: bare tokens default to q=1, `q=0` excludes, `*`
+supplies the quality for anything unnamed, an explicit mention overrides the
+wildcard in both directions, and the highest acceptable quality wins with ties
+falling to our own br-then-gzip preference. Identity remains the fallback even
+against `identity;q=0`, which RFC 9110 12.5.3 permits -- serving uncompressed
+beats a 406.
+
+**F017 — no `Via` on forwarded messages.** m6 forwarded everything
+anonymously, so a request that looped back was indistinguishable from a fresh
+one. Now appended, reporting the protocol the request was RECEIVED on (h2/h3
+say `2`/`3` even though they leave as HTTP/1.1, because Via describes the hop
+received). An upstream proxy's Via is preserved and extended, never replaced.
+
+The pseudonym is the fixed token `m6`, not the node hostname. RFC 9110 7.6.3
+allows a pseudonym precisely so an intermediary need not disclose its internal
+naming, and `syd`/`lon`/`chi` would hand every client a map of the topology for
+nothing. A test asserts Via leaks none of those names.
+
+**F018/F019 — `Connection`-nominated fields were forwarded.** `Connection`
+lists fields that apply to this hop only; the static hop-by-hop list covers the
+well-known ones, but a sender may nominate any field. Forwarding one on lets a
+client smuggle a header past an intermediary that believed it had consumed it --
+the same shape of confusion that makes request smuggling work. Now stripped in
+both serialisers. `close`/`keep-alive`/`upgrade` are recognised as connection
+options rather than field names.
+
+Thirteen tests. 673 workspace tests pass, zero warnings.
+
+
 ## m6-http: RFC 9110 13.2.2 preconditions (F003, F006, F008, F010)
 
 Only `If-None-Match` and `If-Modified-Since` were implemented -- steps 3 and 4

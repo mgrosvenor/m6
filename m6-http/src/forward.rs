@@ -97,6 +97,75 @@ fn skip_when_forwarding(name: &str) -> bool {
         || proxy_owned_request_header(name)
 }
 
+/// The pseudonym this proxy identifies itself by in `Via`.
+///
+/// Deliberately a fixed token rather than the node's hostname. RFC 9110 7.6.3
+/// allows a pseudonym precisely so an intermediary need not disclose its
+/// internal naming, and "syd"/"lon"/"chi" would hand every client a map of the
+/// topology for no benefit.
+const VIA_PSEUDONYM: &str = "m6";
+
+/// Field names nominated by a `Connection` header, which must be removed
+/// before forwarding (RFC 9110 7.6.1).
+///
+/// **F018/F019.** `Connection` lists the fields that apply to *this* hop only.
+/// The static [`HOP_BY_HOP`] list covers the well-known ones, but a sender may
+/// nominate any field -- `Connection: X-Session-Hint` means that header dies
+/// here. Forwarding it on is both a spec violation and a real hazard: it lets a
+/// client smuggle a header past an intermediary that believed it had been
+/// consumed, which is the same shape of confusion that makes request smuggling
+/// work.
+///
+/// Returns lowercase names so the caller can compare cheaply.
+fn connection_nominated(headers: &[(String, String)]) -> Vec<String> {
+    let mut out = Vec::new();
+    for (name, value) in headers {
+        if !name.eq_ignore_ascii_case("connection") {
+            continue;
+        }
+        for token in value.split(',') {
+            let token = token.trim();
+            // `close` and `keep-alive` are connection OPTIONS, not field names.
+            // Treating them as fields would be harmless but wrong, and would
+            // make the list confusing to read in a log.
+            if token.is_empty()
+                || token.eq_ignore_ascii_case("close")
+                || token.eq_ignore_ascii_case("keep-alive")
+                || token.eq_ignore_ascii_case("upgrade")
+            {
+                continue;
+            }
+            out.push(token.to_ascii_lowercase());
+        }
+    }
+    out
+}
+
+/// Build the `Via` value to append for a forwarded request (RFC 9110 7.6.3).
+///
+/// **F017.** A proxy must announce itself, and `Via` is how a loop is detected
+/// and how a response's path is explained. m6 forwarded everything anonymously,
+/// so a request that came back round to this proxy was indistinguishable from a
+/// fresh one.
+///
+/// `received-protocol` is the version the request arrived on -- HTTP/2 and
+/// HTTP/3 requests are reported as `2` and `3` even though they leave here as
+/// HTTP/1.1, because Via describes the hop that was received, not the one being
+/// sent. Any existing Via is preserved and this appends to it.
+fn via_value(existing: Option<&str>, received_version: &str) -> String {
+    let proto = match received_version {
+        v if v.eq_ignore_ascii_case("HTTP/2") || v == "2" => "2",
+        v if v.eq_ignore_ascii_case("HTTP/3") || v == "3" => "3",
+        v if v.eq_ignore_ascii_case("HTTP/1.0") => "1.0",
+        _ => "1.1",
+    };
+    let mine = format!("{proto} {VIA_PSEUDONYM}");
+    match existing {
+        Some(prev) if !prev.trim().is_empty() => format!("{}, {}", prev.trim(), mine),
+        _ => mine,
+    }
+}
+
 /// A parsed HTTP request (simplified for forwarding).
 #[derive(Debug, Clone)]
 pub struct HttpRequest {
@@ -283,9 +352,18 @@ pub fn forward_request_timeout(
     }
     buf.extend_from_slice(b" HTTP/1.1\r\n");
 
-    // Forward headers, excluding hop-by-hop and anything the proxy owns.
+    // Forward headers, excluding hop-by-hop, anything the proxy owns, and
+    // anything the client nominated in `Connection` (RFC 9110 7.6.1).
+    let nominated = connection_nominated(&req.headers);
+    let mut existing_via: Option<&str> = None;
     for (name, value) in &req.headers {
-        if skip_when_forwarding(name) {
+        if name.eq_ignore_ascii_case("via") {
+            existing_via = Some(value.as_str());
+            continue; // re-emitted below with our own hop appended
+        }
+        if skip_when_forwarding(name)
+            || nominated.iter().any(|n| name.eq_ignore_ascii_case(n))
+        {
             continue;
         }
         buf.extend_from_slice(name.as_bytes());
@@ -293,6 +371,9 @@ pub fn forward_request_timeout(
         buf.extend_from_slice(value.as_bytes());
         buf.extend_from_slice(b"\r\n");
     }
+    buf.extend_from_slice(b"Via: ");
+    buf.extend_from_slice(via_value(existing_via, &req.version).as_bytes());
+    buf.extend_from_slice(b"\r\n");
 
     // Add proxy headers
     buf.extend_from_slice(b"X-Forwarded-For: ");
@@ -875,9 +956,18 @@ fn build_forwarded_request_bytes(
     buf.extend_from_slice(host.as_bytes());
     buf.extend_from_slice(b"\r\n");
 
-    // Forward original headers (minus hop-by-hop, proxy-owned, and Host)
+    // Forward original headers (minus hop-by-hop, proxy-owned, Host, and
+    // anything the client nominated in `Connection` -- RFC 9110 7.6.1).
+    let nominated = connection_nominated(&req.headers);
+    let mut existing_via: Option<&str> = None;
     for (name, value) in &req.headers {
-        if skip_when_forwarding(name) {
+        if name.eq_ignore_ascii_case("via") {
+            existing_via = Some(value.as_str());
+            continue;
+        }
+        if skip_when_forwarding(name)
+            || nominated.iter().any(|n| name.eq_ignore_ascii_case(n))
+        {
             continue;
         }
         if name.eq_ignore_ascii_case("host") {
@@ -888,6 +978,9 @@ fn build_forwarded_request_bytes(
         buf.extend_from_slice(value.as_bytes());
         buf.extend_from_slice(b"\r\n");
     }
+    buf.extend_from_slice(b"Via: ");
+    buf.extend_from_slice(via_value(existing_via, &req.version).as_bytes());
+    buf.extend_from_slice(b"\r\n");
 
     // Proxy headers
     buf.extend_from_slice(b"X-Forwarded-For: ");
@@ -1474,5 +1567,110 @@ mod chunked_tests {
     fn short_chunk_data_is_refused() {
         let err = read_response(&resp("10\r\nhello\r\n0\r\n\r\n")[..]).unwrap_err();
         assert!(err.to_string().contains("shorter than declared"), "got: {err}");
+    }
+}
+
+#[cfg(test)]
+mod via_and_connection_tests {
+    use super::*;
+
+    fn req(headers: &[(&str, &str)], version: &str) -> HttpRequest {
+        HttpRequest {
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            query: None,
+            version: version.to_string(),
+            headers: headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            body: Vec::new(),
+        }
+    }
+
+    fn serialised(r: &HttpRequest) -> String {
+        String::from_utf8_lossy(
+            &build_forwarded_request_bytes(r, "backend.internal", "1.2.3.4", "example.com"),
+        )
+        .into_owned()
+    }
+
+    fn header_values(raw: &str, name: &str) -> Vec<String> {
+        raw.split("\r\n\r\n")
+            .next()
+            .unwrap_or("")
+            .lines()
+            .filter(|l| l.to_lowercase().starts_with(&format!("{}:", name.to_lowercase())))
+            .map(|l| l.split_once(':').unwrap().1.trim().to_string())
+            .collect()
+    }
+
+    /// F018/F019. `Connection` names the fields that apply to this hop only.
+    /// Forwarding one on lets a client smuggle a header past an intermediary
+    /// that believed it had been consumed.
+    #[test]
+    fn connection_nominated_fields_are_stripped() {
+        let r = req(
+            &[
+                ("Connection", "X-Session-Hint, X-Internal-Flag"),
+                ("X-Session-Hint", "smuggled"),
+                ("X-Internal-Flag", "also-smuggled"),
+                ("X-Legitimate", "kept"),
+            ],
+            "HTTP/1.1",
+        );
+        let out = serialised(&r);
+        assert!(header_values(&out, "x-session-hint").is_empty(), "nominated field forwarded:\n{out}");
+        assert!(header_values(&out, "x-internal-flag").is_empty(), "nominated field forwarded:\n{out}");
+        assert_eq!(header_values(&out, "x-legitimate"), vec!["kept"], "unrelated header dropped:\n{out}");
+    }
+
+    /// `close`/`keep-alive`/`upgrade` are connection OPTIONS, not field names.
+    /// Treating them as fields would be wrong, and a header legitimately called
+    /// `Close` must survive.
+    #[test]
+    fn connection_options_are_not_treated_as_field_names() {
+        let r = req(&[("Connection", "keep-alive, close"), ("X-Keep", "v")], "HTTP/1.1");
+        let out = serialised(&r);
+        assert_eq!(header_values(&out, "x-keep"), vec!["v"]);
+    }
+
+    /// F017. A proxy must announce itself so a loop is detectable.
+    #[test]
+    fn via_is_appended() {
+        let out = serialised(&req(&[], "HTTP/1.1"));
+        assert_eq!(header_values(&out, "via"), vec!["1.1 m6"], "\n{out}");
+    }
+
+    /// Via describes the protocol the request was RECEIVED on, not the one it
+    /// is being forwarded over -- h2/h3 requests all leave here as HTTP/1.1.
+    #[test]
+    fn via_reports_the_received_protocol() {
+        assert_eq!(header_values(&serialised(&req(&[], "HTTP/2")), "via"), vec!["2 m6"]);
+        assert_eq!(header_values(&serialised(&req(&[], "HTTP/3")), "via"), vec!["3 m6"]);
+        assert_eq!(header_values(&serialised(&req(&[], "HTTP/1.0")), "via"), vec!["1.0 m6"]);
+    }
+
+    /// An upstream proxy's Via must be preserved and appended to, not replaced
+    /// -- the whole point is the chain.
+    #[test]
+    fn existing_via_is_extended_not_replaced() {
+        let out = serialised(&req(&[("Via", "1.1 upstream-cache")], "HTTP/1.1"));
+        assert_eq!(header_values(&out, "via"), vec!["1.1 upstream-cache, 1.1 m6"], "\n{out}");
+    }
+
+    /// Exactly one Via, whatever the input. Two would be legal to merge but
+    /// suggests the header is being appended blindly.
+    #[test]
+    fn exactly_one_via_header() {
+        let out = serialised(&req(&[("Via", "1.1 a")], "HTTP/1.1"));
+        assert_eq!(header_values(&out, "via").len(), 1);
+    }
+
+    /// The pseudonym must not leak the node's real hostname.
+    #[test]
+    fn via_does_not_disclose_internal_topology() {
+        let out = serialised(&req(&[], "HTTP/1.1"));
+        let via = header_values(&out, "via").join(" ");
+        for leak in ["syd", "lon", "chi", "mgrosvenor", "backend.internal"] {
+            assert!(!via.contains(leak), "Via leaks {leak:?}: {via}");
+        }
     }
 }
