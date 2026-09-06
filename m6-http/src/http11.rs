@@ -678,13 +678,41 @@ fn build_response(status: u16, headers: &[(String, String)], body: &[u8], method
     out.extend_from_slice(
         format!("HTTP/1.1 {} {}\r\n", status, reason).as_bytes()
     );
+    // Any upstream copy of a header this function emits itself is dropped
+    // here, or the response goes out carrying both.
+    //
+    // Found by reading a live HEAD off a raw socket after deploying the HEAD
+    // work: an asset answered with `Content-Length: 16580` from the backend
+    // AND `content-length: 0` from the line below. Two Content-Length fields
+    // with different values is precisely the framing ambiguity this proxy now
+    // refuses to accept *from* a backend (F028) -- it was emitting it. On HTML
+    // the two agreed, so it looked like nothing more than a cosmetic duplicate;
+    // only the asset showed the conflict.
     for (k, v) in headers {
+        if k.eq_ignore_ascii_case("content-length") || k.eq_ignore_ascii_case("connection") {
+            continue;
+        }
         out.extend_from_slice(format!("{}: {}\r\n", k, v).as_bytes());
     }
     // Applied at serialisation so every response carries them regardless of
     // which path produced it (cache hit, backend, error page, 429).
     crate::security::write_h1_headers(&mut out, headers);
-    out.extend_from_slice(format!("content-length: {}\r\n", body.len()).as_bytes());
+
+    // RFC 9110 9.3.2: a HEAD response's Content-Length describes the
+    // representation a GET *would* have returned, not the zero bytes actually
+    // sent. Most callers hand us the real body and `body.len()` is that
+    // number -- but a backend that framed the HEAD itself returns an empty
+    // body, and then only its own header still knows the real length.
+    let cl = if is_head && body.is_empty() {
+        headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+            .and_then(|(_, v)| v.trim().parse::<usize>().ok())
+            .unwrap_or(0)
+    } else {
+        body.len()
+    };
+    out.extend_from_slice(format!("content-length: {}\r\n", cl).as_bytes());
     out.extend_from_slice(b"connection: close\r\n\r\n");
     if !is_head {
         out.extend_from_slice(body);
@@ -883,5 +911,84 @@ mod line_ending_tests {
             let injected = h.iter().any(|(k, _)| k.eq_ignore_ascii_case("x-injected"));
             assert!(!injected, "LF-only request framing accepted headers: {h:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod response_header_tests {
+    use super::build_response;
+
+    fn header_lines(raw: &[u8], name: &str) -> Vec<String> {
+        let text = String::from_utf8_lossy(raw);
+        let head = text.split("\r\n\r\n").next().unwrap_or("").to_string();
+        head.lines()
+            .filter(|l| l.to_lowercase().starts_with(&format!("{}:", name.to_lowercase())))
+            .map(|l| l.trim().to_string())
+            .collect()
+    }
+
+    /// Found on the live site, not in review: an asset HEAD went out with
+    /// `Content-Length: 16580` from the backend and `content-length: 0` from
+    /// the serialiser. Two Content-Length fields with different values is the
+    /// same framing ambiguity this proxy refuses to accept from a backend
+    /// (F028) -- it was producing it.
+    #[test]
+    fn exactly_one_content_length_even_when_upstream_sent_one() {
+        let upstream = vec![
+            ("Content-Length".to_string(), "16580".to_string()),
+            ("Content-Type".to_string(), "image/svg+xml".to_string()),
+        ];
+        for method in ["GET", "HEAD"] {
+            let raw = build_response(200, &upstream, b"", method);
+            let found = header_lines(&raw, "content-length");
+            assert_eq!(
+                found.len(),
+                1,
+                "{method} emitted {} Content-Length fields: {found:?}",
+                found.len()
+            );
+        }
+    }
+
+    /// RFC 9110 9.3.2. A backend that frames the HEAD itself returns no body,
+    /// and then only its own header still knows the GET representation's size.
+    /// Reporting 0 there tells a crawler the resource is empty.
+    #[test]
+    fn head_reports_the_get_representation_length() {
+        let upstream = vec![("Content-Length".to_string(), "16580".to_string())];
+        let raw = build_response(200, &upstream, b"", "HEAD");
+        assert_eq!(header_lines(&raw, "content-length"), vec!["content-length: 16580"]);
+        // ...and still no body.
+        let body = String::from_utf8_lossy(&raw).split("\r\n\r\n").nth(1).unwrap_or("").len();
+        assert_eq!(body, 0, "HEAD must send no body");
+    }
+
+    /// When the caller passes the real body, that is authoritative -- it may
+    /// have been compressed after the backend set its own length.
+    #[test]
+    fn body_length_wins_when_a_body_is_present() {
+        let upstream = vec![("Content-Length".to_string(), "99999".to_string())];
+        let raw = build_response(200, &upstream, b"hello", "GET");
+        assert_eq!(header_lines(&raw, "content-length"), vec!["content-length: 5"]);
+    }
+
+    /// Same duplication hazard: `connection: close` is written unconditionally.
+    #[test]
+    fn exactly_one_connection_header() {
+        let upstream = vec![("Connection".to_string(), "keep-alive".to_string())];
+        let raw = build_response(200, &upstream, b"x", "GET");
+        assert_eq!(header_lines(&raw, "connection").len(), 1);
+    }
+
+    /// Ordinary headers must still be forwarded; the filter is narrow.
+    #[test]
+    fn other_headers_are_preserved() {
+        let upstream = vec![
+            ("Content-Type".to_string(), "text/html".to_string()),
+            ("ETag".to_string(), "\"abc\"".to_string()),
+        ];
+        let raw = build_response(200, &upstream, b"x", "GET");
+        assert_eq!(header_lines(&raw, "content-type").len(), 1);
+        assert_eq!(header_lines(&raw, "etag").len(), 1);
     }
 }

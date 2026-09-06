@@ -11,6 +11,36 @@ Deploy order is fixed: **test locally, commit, then deploy.** Never the reverse.
 
 ---
 
+## m6-http: stop emitting two Content-Length headers
+
+Found by reading a live HEAD off a raw socket after deploying the response
+framing work -- not in review, and not by any test.
+
+`build_response` wrote every upstream header verbatim and then appended its own
+`content-length`. On an asset that produced:
+
+    Content-Length: 16580     <- from the backend
+    content-length: 0         <- from the serialiser
+
+Two Content-Length fields with **different values**: exactly the framing
+ambiguity this proxy had just been taught to refuse *from* a backend (F028),
+being emitted *by* the proxy. A downstream cache or browser picking the second
+would treat the body as empty. HTML responses carried the duplicate too, but
+with matching values, so it looked merely cosmetic there -- only the asset
+exposed the conflict.
+
+Now any upstream `content-length` or `connection` is dropped before the
+serialiser writes its own, and the value is chosen properly: `body.len()`
+normally (authoritative, since the body may have been compressed after the
+backend set its length), but for a HEAD whose body is already empty the
+upstream length is used, because RFC 9110 9.3.2 requires a HEAD to report the
+length a GET *would* have returned. Reporting 0 there tells a crawler the
+resource is empty.
+
+Five tests, including that a GET's real body length still wins over a
+contradicting upstream header, and that ordinary headers are untouched.
+
+
 ## m6-http: strict framing for backend HTTP/1.1 responses (F028-F031, F035)
 
 Message framing is the security boundary between this proxy and its backend: if
