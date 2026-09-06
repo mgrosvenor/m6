@@ -8,7 +8,70 @@ pub enum Encoding {
     Identity,
 }
 
+/// The q-value a client assigned to one content-coding (RFC 9110 12.5.3).
+///
+/// Returns `None` when the coding is not acceptable at all, otherwise its
+/// quality between 0.0 (exclusive) and 1.0.
+///
+/// **This replaced `accept_encoding.contains("br")`, which was wrong in a way
+/// that mattered.** `contains` finds the substring anywhere, so
+/// `Accept-Encoding: gzip, br;q=0` -- a client explicitly refusing brotli --
+/// still matched, and the response went out brotli-encoded to a client that
+/// said it could not accept it. `q=0` means "not acceptable" (RFC 9110
+/// 12.4.2), not "least preferred". It also ignored preference entirely:
+/// `gzip;q=1.0, br;q=0.1` picked brotli because `br` was tested first.
+///
+/// Rules implemented here:
+/// - a bare token defaults to `q=1`
+/// - `q=0` means unacceptable
+/// - `*` supplies the q-value for any coding not named explicitly
+/// - an explicitly named coding always beats `*`, whichever way it goes
+/// - `identity` is acceptable unless refused by name or by `*;q=0`
+fn coding_quality(accept_encoding: &str, coding: &str) -> Option<f32> {
+    let mut wildcard: Option<f32> = None;
+    let mut explicit: Option<f32> = None;
+
+    for part in accept_encoding.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let mut bits = part.split(';');
+        let name = bits.next().unwrap_or("").trim();
+        let mut q: f32 = 1.0;
+        for param in bits {
+            let param = param.trim();
+            if let Some(v) = param.strip_prefix("q=").or_else(|| param.strip_prefix("Q=")) {
+                // An unparseable q is treated as 1, per the general rule that a
+                // malformed parameter is ignored rather than made fatal.
+                q = v.trim().parse::<f32>().unwrap_or(1.0);
+            }
+        }
+        if name == "*" {
+            wildcard = Some(q);
+        } else if name.eq_ignore_ascii_case(coding) {
+            explicit = Some(q);
+        }
+    }
+
+    let q = match (explicit, wildcard) {
+        (Some(q), _) => q,
+        (None, Some(q)) => q,
+        // Not mentioned at all. identity is acceptable by default; a coding we
+        // would have to apply is not.
+        (None, None) => {
+            if coding.eq_ignore_ascii_case("identity") { 1.0 } else { return None }
+        }
+    };
+    if q > 0.0 { Some(q) } else { None }
+}
+
 /// Decide which encoding to use for a given MIME type and Accept-Encoding header.
+///
+/// Picks the highest-quality coding the client will actually accept, rather
+/// than the first one whose name appears somewhere in the header. Ties go to
+/// brotli then gzip, which is our own preference order and only consulted when
+/// the client expressed none.
 pub fn choose_encoding(
     mime_type: &str,
     accept_encoding: &str,
@@ -16,31 +79,39 @@ pub fn choose_encoding(
 ) -> (Encoding, Option<u32>) {
     let mime_base = mime_type.split(';').next().unwrap_or(mime_type).trim();
 
-    // Check config for explicit settings
-    if let Some(settings) = config.compression.get(mime_base) {
-        // Level 0 means no compression
-        if settings.brotli > 0 && accept_encoding.contains("br") {
-            return (Encoding::Brotli, Some(settings.brotli));
+    // Which codings are permitted for this MIME type, and at what level.
+    let (br_level, gz_level) = match config.compression.get(mime_base) {
+        Some(settings) => (
+            if settings.brotli > 0 { Some(settings.brotli) } else { None },
+            if settings.gzip > 0 { Some(settings.gzip) } else { None },
+        ),
+        None if m6_core::should_compress_default(mime_base) => (Some(6), Some(6)),
+        None => (None, None),
+    };
+
+    // Candidates we could produce, each with the client's stated quality.
+    // Ordered br, gzip so a tie resolves to brotli.
+    let mut best: Option<(Encoding, Option<u32>, f32)> = None;
+    let candidates = [
+        (Encoding::Brotli, br_level, "br"),
+        (Encoding::Gzip, gz_level, "gzip"),
+    ];
+    for (enc, level, name) in candidates {
+        let Some(level) = level else { continue };
+        let Some(q) = coding_quality(accept_encoding, name) else { continue };
+        if best.as_ref().is_none_or(|(_, _, bq)| q > *bq) {
+            best = Some((enc, Some(level), q));
         }
-        if settings.gzip > 0 && accept_encoding.contains("gzip") {
-            return (Encoding::Gzip, Some(settings.gzip));
-        }
-        // Level 0 for both, or no matching encoding
-        return (Encoding::Identity, None);
     }
 
-    // Use defaults — the shared, already-tested MIME table in m6-core, not a
-    // locally maintained list that can drift out of sync with it.
-    if !m6_core::should_compress_default(mime_base) {
-        return (Encoding::Identity, None);
-    }
-
-    if accept_encoding.contains("br") {
-        (Encoding::Brotli, Some(6))
-    } else if accept_encoding.contains("gzip") {
-        (Encoding::Gzip, Some(6))
-    } else {
-        (Encoding::Identity, None)
+    match best {
+        Some((enc, level, _)) => (enc, level),
+        // Nothing compressible was acceptable. Falling back to identity is
+        // right even when the client sent `identity;q=0`: refusing to serve a
+        // representation at all (a 406) is a worse outcome than sending an
+        // uncompressed one, and RFC 9110 12.5.3 explicitly permits ignoring
+        // that case.
+        None => (Encoding::Identity, None),
     }
 }
 
@@ -99,5 +170,77 @@ mod tests {
         let data = b"hello world, this is a test of compression";
         let compressed = compress_gzip(data, 6).unwrap();
         assert!(!compressed.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod q_value_tests {
+    use super::*;
+    use crate::config::Config;
+
+    fn pick(ae: &str) -> Encoding {
+        choose_encoding("text/css", ae, &Config::default()).0
+    }
+
+    /// The defect. `contains("br")` matched a client that had explicitly
+    /// refused brotli, and the response went out brotli-encoded to something
+    /// that said it could not accept it. RFC 9110 12.4.2: q=0 means NOT
+    /// ACCEPTABLE, not "least preferred".
+    #[test]
+    fn q_zero_means_refused_not_deprioritised() {
+        assert_eq!(pick("gzip, br;q=0"), Encoding::Gzip);
+        assert_eq!(pick("br;q=0"), Encoding::Identity);
+        assert_eq!(pick("br;q=0, gzip;q=0"), Encoding::Identity);
+        assert_eq!(pick("br;q=0.000"), Encoding::Identity);
+    }
+
+    /// The other half: preference was ignored entirely, because `br` was simply
+    /// tested first.
+    #[test]
+    fn highest_q_wins_not_first_match() {
+        assert_eq!(pick("gzip;q=1.0, br;q=0.1"), Encoding::Gzip);
+        assert_eq!(pick("gzip;q=0.1, br;q=1.0"), Encoding::Brotli);
+        assert_eq!(pick("br;q=0.5, gzip;q=0.9"), Encoding::Gzip);
+    }
+
+    /// A bare token is q=1, and ties fall to our own preference order.
+    #[test]
+    fn defaults_and_ties() {
+        assert_eq!(pick("gzip, br"), Encoding::Brotli);
+        assert_eq!(pick("br, gzip"), Encoding::Brotli);
+        assert_eq!(pick("gzip"), Encoding::Gzip);
+        assert_eq!(pick("gzip;q=1, br;q=1"), Encoding::Brotli);
+    }
+
+    /// `*` supplies a q-value for anything not named, and an explicit mention
+    /// overrides it in both directions.
+    #[test]
+    fn wildcard_handling() {
+        assert_eq!(pick("*"), Encoding::Brotli);
+        assert_eq!(pick("*;q=0"), Encoding::Identity);
+        // Explicit beats the wildcard even when the wildcard refuses.
+        assert_eq!(pick("*;q=0, gzip"), Encoding::Gzip);
+        // ...and even when the wildcard allows: br is refused by name, so the
+        // wildcard's q=1 applies to gzip and gzip wins.
+        assert_eq!(pick("*, br;q=0"), Encoding::Gzip);
+    }
+
+    /// A real browser's header, and the empty/absent cases.
+    #[test]
+    fn realistic_and_edge_headers() {
+        assert_eq!(pick("gzip, deflate, br, zstd"), Encoding::Brotli);
+        assert_eq!(pick(""), Encoding::Identity);
+        assert_eq!(pick("identity"), Encoding::Identity);
+        // Whitespace and case must not matter.
+        assert_eq!(pick("  GZIP ;  Q=0.9 ,  BR ; q=0.4 "), Encoding::Gzip);
+        // A malformed q is ignored rather than fatal.
+        assert_eq!(pick("br;q=notanumber"), Encoding::Brotli);
+    }
+
+    /// An uncompressible MIME type is identity regardless of what is offered.
+    #[test]
+    fn uncompressible_types_stay_identity() {
+        let c = Config::default();
+        assert_eq!(choose_encoding("image/png", "br, gzip", &c).0, Encoding::Identity);
     }
 }
