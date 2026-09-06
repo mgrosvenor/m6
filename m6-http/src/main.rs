@@ -1384,7 +1384,11 @@ fn send_h3_response(
         }
         h3_headers.push(quiche::h3::Header::new(k.as_bytes(), v.as_bytes()));
     }
-    if body.is_empty() {
+    // RFC 9110 8.6: never on a 1xx/204, and on a 304 only if it equals the
+    // 200's length. m6 emitted `content-length: 0` on every 304 across all
+    // three protocols, which is the value that actively misinforms -- it claims
+    // the representation is empty when it is not.
+    if body.is_empty() && m6_http_lib::http11::status_may_have_content_length(status) {
         h3_headers.push(quiche::h3::Header::new(b"content-length", cl_bytes));
     }
 

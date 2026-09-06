@@ -671,6 +671,27 @@ pub fn parse_request(buf: &[u8]) -> ParseResult {
 ///
 /// The length is computed from `body` before it is dropped, which is why the
 /// caller passes the real body here rather than pre-emptying it.
+/// May a response with this status carry `Content-Length` at all?
+///
+/// RFC 9110 8.6. A 1xx or 204 MUST NOT have one, and a 304 MUST NOT unless the
+/// value equals what the 200 would have sent.
+///
+/// m6 emitted `content-length: 0` on every 304, on all protocols. Zero is
+/// precisely the harmful value: the 200 for that resource is 16 KB, so the
+/// response was telling a client the representation is empty. A cache updating
+/// its stored entry from that 304 can conclude the body it holds is the wrong
+/// length.
+///
+/// The framing is unambiguous without it -- a 304 has no body by definition,
+/// and every protocol here signals end-of-message its own way (H1 closes or
+/// uses the next request boundary, H2/H3 use END_STREAM) -- so omitting it is
+/// both correct and safe. Emitting the *correct* non-zero length would also be
+/// legal, but it would mean carrying the stored body's length through the 304
+/// path for no benefit to any client.
+pub fn status_may_have_content_length(status: u16) -> bool {
+    !(status == 204 || status == 304 || (100..200).contains(&status))
+}
+
 fn build_response(status: u16, headers: &[(String, String)], body: &[u8], method: &str) -> Vec<u8> {
     let is_head = method.eq_ignore_ascii_case("HEAD");
     let reason = status_reason(status);
@@ -712,7 +733,9 @@ fn build_response(status: u16, headers: &[(String, String)], body: &[u8], method
     } else {
         body.len()
     };
-    out.extend_from_slice(format!("content-length: {}\r\n", cl).as_bytes());
+    if status_may_have_content_length(status) {
+        out.extend_from_slice(format!("content-length: {}\r\n", cl).as_bytes());
+    }
     out.extend_from_slice(b"connection: close\r\n\r\n");
     if !is_head {
         out.extend_from_slice(body);
@@ -848,14 +871,31 @@ mod head_framing_tests {
         assert_eq!(body.len(), 0);
     }
 
-    /// An empty-bodied response is unaffected either way.
+    /// An empty-bodied response is unaffected by the HEAD logic either way.
+    ///
+    /// This used to assert `content-length: 0` on a **204**, which encoded a
+    /// spec violation: RFC 9110 8.6 forbids Content-Length on a 204 entirely.
+    /// The test passed for as long as the bug existed and failed the moment it
+    /// was fixed -- a test can pin wrong behaviour just as firmly as right
+    /// behaviour, and this one did.
+    ///
+    /// Split so each status asserts what its own rule requires: 200 carries the
+    /// header, 204 must not.
     #[test]
     fn empty_body_is_unchanged() {
         for m in ["GET", "HEAD"] {
-            let raw = build_response(204, &hdrs(), b"", m);
-            let (head, body) = split(&raw);
+            let raw200 = build_response(200, &hdrs(), b"", m);
+            let (head, body) = split(&raw200);
             assert_eq!(body.len(), 0);
-            assert!(head.contains("content-length: 0"));
+            assert!(head.contains("content-length: 0"), "200 must state its length:\n{head}");
+
+            let raw204 = build_response(204, &hdrs(), b"", m);
+            let (head, body) = split(&raw204);
+            assert_eq!(body.len(), 0);
+            assert!(
+                !head.to_lowercase().contains("content-length"),
+                "204 must not carry Content-Length (RFC 9110 8.6):\n{head}"
+            );
         }
     }
 }
@@ -990,5 +1030,57 @@ mod response_header_tests {
         let raw = build_response(200, &upstream, b"x", "GET");
         assert_eq!(header_lines(&raw, "content-type").len(), 1);
         assert_eq!(header_lines(&raw, "etag").len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod bodyless_status_tests {
+    use super::{build_response, status_may_have_content_length};
+
+    fn head_of(status: u16) -> String {
+        let raw = build_response(status, &[("ETag".to_string(), "\"x\"".to_string())], b"", "GET");
+        String::from_utf8_lossy(&raw).split("\r\n\r\n").next().unwrap_or("").to_string()
+    }
+
+    /// RFC 9110 8.6. m6 sent `content-length: 0` on every 304, on all three
+    /// protocols. Zero is the value that actively misinforms: the 200 for that
+    /// resource is 16 KB, so the response claimed the representation was empty,
+    /// and a cache updating its stored entry from that 304 could conclude the
+    /// body it holds is the wrong length.
+    #[test]
+    fn bodyless_statuses_omit_content_length() {
+        for status in [204u16, 304, 100, 101, 199] {
+            assert!(
+                !status_may_have_content_length(status),
+                "{status} must not carry Content-Length"
+            );
+            let head = head_of(status);
+            assert!(
+                !head.to_lowercase().contains("content-length"),
+                "{status} emitted Content-Length:\n{head}"
+            );
+        }
+    }
+
+    /// ...and every other status still must, or the framing breaks.
+    #[test]
+    fn ordinary_statuses_still_carry_content_length() {
+        for status in [200u16, 201, 301, 400, 404, 412, 500, 502, 504] {
+            assert!(status_may_have_content_length(status), "{status}");
+            let head = head_of(status);
+            assert!(
+                head.to_lowercase().contains("content-length: 0"),
+                "{status} lost its Content-Length:\n{head}"
+            );
+        }
+    }
+
+    /// The validators a client needs must survive on a 304 -- omitting
+    /// Content-Length must not have been achieved by stripping the header block.
+    #[test]
+    fn a_304_keeps_its_validators() {
+        let head = head_of(304);
+        assert!(head.contains("ETag"), "304 lost its ETag:\n{head}");
+        assert!(head.starts_with("HTTP/1.1 304 Not Modified"), "{head}");
     }
 }

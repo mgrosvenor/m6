@@ -11,6 +11,35 @@ Deploy order is fixed: **test locally, commit, then deploy.** Never the reverse.
 
 ---
 
+## Content-Length on bodyless statuses (RFC 9110 8.6)
+
+m6 emitted `content-length: 0` on every 304, on **all three protocols**. Zero is
+the one value that actively misinforms: the 200 for that resource is 16 KB, so
+the response told a client the representation was empty. A cache updating its
+stored entry from that 304 could conclude the body it holds is the wrong length.
+
+RFC 9110 8.6: a 1xx or 204 must not carry Content-Length at all, and a 304 must
+not unless the value equals what the 200 would have sent. Now omitted for all of
+them, via one shared `status_may_have_content_length` used by the H1, H2 and H3
+serialisers so they cannot drift apart.
+
+Omitting is safe because a 304 has no body by definition and each protocol
+signals end-of-message its own way (H1 by connection close or the next request
+boundary, H2/H3 by END_STREAM). Emitting the *correct* non-zero length would
+also be legal but would mean carrying the stored body's length through the 304
+path for no benefit to any client.
+
+**A test was pinning the bug.** `empty_body_is_unchanged` asserted
+`content-length: 0` on a **204** -- it passed for as long as the violation
+existed and failed the moment it was fixed. It is now split so each status
+asserts its own rule: 200 carries the header, 204 must not. A test can pin wrong
+behaviour just as firmly as right behaviour, and this one did.
+
+Found by reading a 304 off a raw socket on production, not from the source.
+
+694 workspace tests pass. Zero warnings.
+
+
 ## Corrected initial age (RFC 9111 4.2.3)
 
 Age was taken from the `Age` header alone. That trusts an upstream to have set
