@@ -328,37 +328,68 @@ pub fn parse_query_string(query: &str) -> Vec<(String, String)> {
 }
 
 pub fn parse_form_body(body: &[u8]) -> Vec<(String, String)> {
-    let s = std::str::from_utf8(body).unwrap_or("");
-    parse_query_string(s)
+    // `from_utf8(..).unwrap_or("")` threw away the ENTIRE body on a single
+    // invalid byte, yielding a submission with no fields and no explanation --
+    // indistinguishable downstream from a genuinely empty form. A urlencoded
+    // body is ASCII by construction, so this only fires on malformed or
+    // hostile input, and losing one character is the right answer there rather
+    // than losing everything. `url_decode` does the real UTF-8 assembly after
+    // percent-decoding; this only guards the outer container.
+    let s = String::from_utf8_lossy(body);
+    parse_query_string(&s)
 }
 
 /// Minimal URL percent-decoding (+ → space, %XX → byte).
+///
+/// **Decodes into a byte buffer and interprets the whole thing as UTF-8 at the
+/// end.** That ordering is the entire point of this function.
+///
+/// It used to build a `String` directly with `out.push(byte as char)`. In Rust
+/// that cast means "the character whose code point is `byte`" -- Latin-1 -- so
+/// every multi-byte UTF-8 sequence was split into one wrong character per byte.
+/// Percent-encoding is defined over bytes; a byte only becomes a character once
+/// the full sequence is reassembled, which cannot be done one byte at a time.
+///
+/// This corrupted every non-ASCII character any visitor typed, in every form
+/// and every query string, before a handler ever saw it. It reached production
+/// via the contact form: a curly apostrophe (U+2019, sent as `%E2%80%99`)
+/// arrived as U+00E2 U+0080 U+0099, so "I'm not sure" was emailed as
+/// "Ia<80><99>m not sure". Emoji, being four bytes, came out as four wrong
+/// characters.
+///
+/// It went unnoticed for so long because ASCII is a fixed point: for any byte
+/// below 0x80 the code point and the byte are the same number, so every ASCII
+/// test passes against the broken version. Only non-ASCII input distinguishes
+/// them, and the one test here used `%2F`.
+///
+/// Invalid UTF-8 becomes U+FFFD rather than failing the decode. For a public
+/// form one mangled character is a far better outcome than discarding the
+/// submission, and a hostile client can always send invalid bytes.
 fn url_decode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+    let mut out: Vec<u8> = Vec::with_capacity(s.len());
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'+' {
-            out.push(' ');
+            out.push(b' ');
             i += 1;
         } else if bytes[i] == b'%' && i + 2 < bytes.len() {
             if let (Some(h), Some(l)) = (
                 hex_digit(bytes[i + 1]),
                 hex_digit(bytes[i + 2]),
             ) {
-                let byte = (h << 4) | l;
-                out.push(byte as char);
+                out.push((h << 4) | l);
                 i += 3;
             } else {
-                out.push('%');
+                out.push(b'%');
                 i += 1;
             }
         } else {
-            out.push(bytes[i] as char);
+            out.push(bytes[i]);
             i += 1;
         }
     }
-    out
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn hex_digit(b: u8) -> Option<u8> {
@@ -451,6 +482,84 @@ mod tests {
         assert_eq!(pairs[0], ("a".to_string(), "1".to_string()));
         assert_eq!(pairs[1], ("b".to_string(), "hello world".to_string()));
         assert_eq!(pairs[2], ("c".to_string(), "/".to_string()));
+    }
+
+    /// Percent-decoding must reassemble UTF-8 from BYTES, not map each byte to
+    /// a code point.
+    ///
+    /// `url_decode` used to do `out.push(byte as char)`, which in Rust means
+    /// "the character at code point `byte`" -- i.e. Latin-1. Every multi-byte
+    /// UTF-8 sequence was therefore split into one bogus character per byte,
+    /// and every non-ASCII character a visitor typed was corrupted on the way
+    /// in, before any handler saw it.
+    ///
+    /// It reached production through the contact form: a curly apostrophe
+    /// (U+2019, sent as `%E2%80%99`) became U+00E2 U+0080 U+0099, so "I'm not
+    /// sure" was emailed as "Ia<80><99>m not sure".
+    ///
+    /// The bug survived because the only test here used `%2F`. ASCII bytes and
+    /// their code points are numerically identical, so every ASCII case passes
+    /// against the broken implementation. Non-ASCII is the only input that can
+    /// tell the two apart.
+    #[test]
+    fn url_decode_reassembles_multibyte_utf8() {
+        let cases: &[(&str, &str)] = &[
+            // The exact production failure.
+            ("I%E2%80%99m", "I\u{2019}m"),
+            // 2-byte.
+            ("caf%C3%A9", "caf\u{e9}"),
+            // 3-byte.
+            ("%E2%82%AC20", "\u{20ac}20"),
+            // 4-byte: emoji. Astral plane, the case most likely to be typed on
+            // a phone and least likely to be tested.
+            ("%F0%9F%98%80", "\u{1F600}"),
+            // Emoji mixed with text and a `+` space.
+            ("hi+%F0%9F%91%8B+there", "hi \u{1F44B} there"),
+            // Non-Latin scripts.
+            ("%D0%9F%D1%80%D0%B8%D0%B2%D0%B5%D1%82", "\u{041f}\u{0440}\u{0438}\u{0432}\u{0435}\u{0442}"),
+            ("%E6%97%A5%E6%9C%AC%E8%AA%9E", "\u{65e5}\u{672c}\u{8a9e}"),
+            // Combining mark: must not be reordered or split.
+            ("e%CC%81", "e\u{0301}"),
+            // ASCII still works (this is what the old test covered).
+            ("a=1", "a=1"),
+            ("%2F", "/"),
+        ];
+        for (input, want) in cases {
+            assert_eq!(
+                url_decode(input),
+                *want,
+                "url_decode({input:?}) corrupted the text -- bytes were mapped \
+                 to code points instead of being decoded as UTF-8"
+            );
+        }
+    }
+
+    /// The same path a real submission takes.
+    #[test]
+    fn form_body_preserves_emoji_and_punctuation() {
+        let body = b"name=Ren%C3%A9&message=I%E2%80%99m+here+%F0%9F%8E%89";
+        let pairs = parse_form_body(body);
+        assert_eq!(pairs[0], ("name".to_string(), "Ren\u{e9}".to_string()));
+        assert_eq!(
+            pairs[1],
+            ("message".to_string(), "I\u{2019}m here \u{1F389}".to_string())
+        );
+    }
+
+    /// Invalid percent-encoded bytes must not take the whole form with them.
+    /// `String::from_utf8_lossy` substitutes U+FFFD for the bad sequence and
+    /// keeps everything else, which is the right trade for a public form: one
+    /// mangled character beats a silently empty submission.
+    #[test]
+    fn invalid_utf8_degrades_to_replacement_not_an_empty_form() {
+        let pairs = parse_form_body(b"a=%FF%FE&b=ok");
+        assert_eq!(pairs.len(), 2, "a bad byte must not drop the other fields");
+        assert_eq!(pairs[1], ("b".to_string(), "ok".to_string()));
+        assert!(
+            pairs[0].1.contains('\u{FFFD}'),
+            "expected replacement characters, got {:?}",
+            pairs[0].1
+        );
     }
 
     #[test]
