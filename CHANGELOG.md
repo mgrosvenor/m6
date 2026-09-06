@@ -11,6 +11,44 @@ Deploy order is fixed: **test locally, commit, then deploy.** Never the reverse.
 
 ---
 
+## m6-http: refuse to forward requests that would smuggle HTTP/1.1 framing (F036/F094)
+
+Decoded HTTP/2 and HTTP/3 header fields were written into HTTP/1.1 request
+syntax verbatim. H2 and H3 header fields are length-delimited, so a value may
+contain any byte; HTTP/1.1 is CRLF-delimited, so a CR or LF in that value stops
+being data and becomes framing. A client could therefore append arbitrary
+headers, or a whole second request, to what the backend received.
+
+This is the egress half of the bare-LF class fixed earlier on ingress, and the
+worse half: on ingress a malformed request is the client's problem, while here
+the proxy generates the malformed bytes itself and does so with the backend's
+trust behind it.
+
+`check_forwardable` now gates both forwarding paths (unix socket and URL
+upstream) before a connection is opened, and covers everything written into the
+request line and header block, not just the header loop:
+
+- field values: no CR, LF or NUL
+- field names: RFC 9110 5.6.2 tokens, so a colon or space cannot split a header
+- method: no space (a space forges the request line without any CR)
+- path and query: no CR, LF, NUL or space
+- `X-Forwarded-For` / `X-Forwarded-Host`, both derived from client-controlled
+  input and written by the proxy itself
+
+Refused, not sanitised: RFC 9113 8.2.1 makes such a message malformed, and
+silently rewriting a request before handing it to a backend hides an attack
+rather than stopping it. Hop-by-hop headers are exempt because they are dropped
+before serialisation and cannot reach the backend; that exemption is pinned by
+a test so the skip list and the check cannot drift into a hole.
+
+Six tests, verified failing with the check disabled -- five of the six fail,
+and the sixth (legitimate traffic still passes) correctly does not, which is
+what makes it worth keeping. obs-text is explicitly allowed, so the fix cannot
+regress into "reject anything non-ASCII".
+
+622 workspace tests pass. Zero warnings on Linux and macOS.
+
+
 ## m6-core: a config reload no longer silences logging
 
 `LogHandle::reload` rebuilt the whole layer -- new writer, new `fmt` layer, new
