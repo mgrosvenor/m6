@@ -758,11 +758,44 @@ impl Cache {
         // Any `Age` the upstream already declared. A response that reached us
         // one hop old must not have its age reset to zero here, or each hop
         // would silently make the content look fresher than it is.
-        let upstream_age = response.headers.iter()
+        // RFC 9111 4.2.3 -- corrected_initial_age.
+        //
+        // This used to be the `Age` header alone. That trusts an upstream to
+        // have set it, and an upstream cache that stores a response WITHOUT
+        // emitting Age makes an hour-old response look brand new to us, and
+        // then to everyone downstream of us. The spec's answer is to cross-check
+        // against `Date`: if the response says it was generated at 09:00 and it
+        // is now 09:30, it is at least thirty minutes old whatever Age claims.
+        //
+        //   apparent_age          = max(0, now - Date)
+        //   corrected_initial_age = max(apparent_age, age_value)
+        //
+        // Taking the MAX is the point -- it is the conservative choice in both
+        // directions. A missing or under-reported Age is corrected by Date, and
+        // a clock skewed such that Date is in the future yields a zero apparent
+        // age rather than a negative one, leaving Age to stand.
+        let age_value = response.headers.iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("age"))
             .and_then(|(_, v)| v.trim().parse::<u64>().ok())
             .map(std::time::Duration::from_secs)
             .unwrap_or_default();
+        let apparent_age = response.headers.iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("date"))
+            .and_then(|(_, v)| httpdate::parse_http_date(v).ok())
+            .and_then(|d| std::time::SystemTime::now().duration_since(d).ok())
+            .unwrap_or_default();
+        let upstream_age = age_value.max(apparent_age);
+        //
+        // `response_delay` (the request/response round trip, the third term in
+        // 4.2.3) is deliberately NOT included, and this is an approximation
+        // rather than an oversight. It would require threading the request's
+        // start time through every insert site. Measured, the backend round
+        // trip here is ~2ms against freshness lifetimes of 60s and 86400s --
+        // 0.003% of the shorter one, far below the one-second resolution the
+        // `Age` header can even express. It would matter for a cache fronting a
+        // slow or distant origin; it does not matter for this one. If m6 ever
+        // caches across a link where a round trip is a measurable fraction of a
+        // second, revisit this.
         // The margin is why a max-age=60 response expires locally at 59s. It
         // saturates rather than wrapping, so a zero lifetime stays zero.
         // Freshness, in the precedence RFC 9111 4.2.1 requires:
@@ -2272,5 +2305,106 @@ mod request_directive_tests {
         assert!(d.only_if_cached);
         // A hit is still a hit — the flag only matters on a miss.
         assert!(matches!(cache.lookup_with(&key, &d), Lookup::Fresh(..)));
+    }
+}
+
+#[cfg(test)]
+mod corrected_age_tests {
+    use super::*;
+
+    fn resp_with(headers: &[(&str, &str)]) -> CachedResponse {
+        CachedResponse {
+            status: 200,
+            headers: std::sync::Arc::new(
+                headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            ),
+            body: bytes::Bytes::from_static(b"x"),
+            hints: std::sync::Arc::new(vec![]),
+        }
+    }
+    fn http_date_ago(secs: u64) -> String {
+        httpdate::fmt_http_date(std::time::SystemTime::now() - std::time::Duration::from_secs(secs))
+    }
+    fn age_of(headers: &[(&str, &str)]) -> u64 {
+        let cache = Cache::new();
+        let key = CacheKey::new("/p", None, "");
+        cache.insert(key.clone(), resp_with(headers));
+        match cache.lookup(&key) {
+            Lookup::Fresh(_, age) | Lookup::Stale(_, age) => age.as_secs(),
+            Lookup::Miss => panic!("entry should be present"),
+        }
+    }
+
+    /// The defect. Trusting `Age` alone means an upstream cache that stores a
+    /// response WITHOUT emitting Age makes an hour-old response look brand new
+    /// to us, and to everyone downstream of us.
+    #[test]
+    fn date_supplies_age_when_the_header_is_missing() {
+        let d = http_date_ago(1800);
+        let age = age_of(&[("cache-control", "public, max-age=86400"), ("date", &d)]);
+        assert!(
+            (1795..=1805).contains(&age),
+            "expected ~1800s from Date, got {age}"
+        );
+    }
+
+    /// max(apparent, age_value): an under-reported Age is corrected upward.
+    #[test]
+    fn the_larger_of_date_and_age_wins() {
+        let d = http_date_ago(600);
+        let age = age_of(&[
+            ("cache-control", "public, max-age=86400"),
+            ("date", &d),
+            ("age", "5"), // upstream under-reports badly
+        ]);
+        assert!((595..=605).contains(&age), "Date should win at ~600s, got {age}");
+    }
+
+    /// ...and the other way round: a large Age with a recent Date must stand,
+    /// since Age is the upstream's own explicit statement.
+    #[test]
+    fn age_wins_when_it_is_the_larger() {
+        let d = http_date_ago(10);
+        let age = age_of(&[
+            ("cache-control", "public, max-age=86400"),
+            ("date", &d),
+            ("age", "900"),
+        ]);
+        assert!((895..=910).contains(&age), "Age should win at ~900s, got {age}");
+    }
+
+    /// A Date in the future (clock skew) must not produce a negative or
+    /// wrapped age. `duration_since` errors on a future instant, and the
+    /// default is zero, so Age is left to stand.
+    #[test]
+    fn future_date_does_not_wrap_or_go_negative() {
+        let future = httpdate::fmt_http_date(
+            std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
+        );
+        let age = age_of(&[
+            ("cache-control", "public, max-age=86400"),
+            ("date", &future),
+            ("age", "42"),
+        ]);
+        assert_eq!(age, 42, "skewed clock must fall back to Age, got {age}");
+    }
+
+    /// No Date and no Age is a genuinely fresh response: age starts at zero.
+    #[test]
+    fn no_validators_means_zero_age() {
+        assert_eq!(age_of(&[("cache-control", "public, max-age=86400")]), 0);
+    }
+
+    /// An unparseable Date is ignored rather than treated as epoch, which
+    /// would otherwise make every such response appear ~56 years old and
+    /// instantly stale.
+    #[test]
+    fn malformed_date_is_ignored() {
+        let age = age_of(&[
+            ("cache-control", "public, max-age=86400"),
+            ("date", "not-a-date"),
+            ("age", "7"),
+        ]);
+        assert_eq!(age, 7);
     }
 }
