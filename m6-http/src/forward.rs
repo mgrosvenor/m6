@@ -126,6 +126,94 @@ impl HttpResponse {
     }
 }
 
+/// Can this field value be written into HTTP/1.1 syntax without changing the
+/// shape of the message?
+///
+/// **F036/F094.** HTTP/1.1 delimits headers with CRLF, so a field value that
+/// contains CR or LF stops being a value and becomes framing. HTTP/2 and
+/// HTTP/3 do not: their header fields are length-delimited, so a decoded HPACK
+/// or QPACK value can legitimately carry any byte, CR and LF included. Writing
+/// one of those straight into an HTTP/1.1 request — which this proxy did —
+/// lets a client smuggle arbitrary extra headers, or an entire second request,
+/// into a backend that has no reason to distrust us.
+///
+/// This is the *egress* half of the bare-LF class fixed earlier on ingress, and
+/// it is the more serious half: on ingress a malformed request is the client's
+/// own problem, while here the proxy is the one producing the malformed bytes,
+/// and it does so with the backend's trust behind it.
+///
+/// NUL is refused with them: it terminates strings in a good deal of software
+/// a request may pass through, and no valid field value contains one.
+///
+/// RFC 9110 5.5 permits everything else, obs-text (0x80-0xFF) included, so
+/// nothing narrower is imposed here. This is a framing check, not a filter.
+pub fn h1_field_value_is_safe(v: &str) -> bool {
+    !v.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0)
+}
+
+/// Field names are tokens (RFC 9110 5.6.2). Anything outside that set could
+/// introduce a colon, a space or a line break and split one header into two.
+pub fn h1_field_name_is_safe(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*'
+                        | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+                )
+        })
+}
+
+/// Everything this proxy is about to write into a request line or header block.
+///
+/// Checked in one place, and checked for *every* ingress protocol rather than
+/// only the ones believed to be risky: the request line is assembled from a
+/// method, path and query that arrive by four different routes, and `client_ip`
+/// and `original_host` are derived from client-supplied data too. A check that
+/// covers only the header loop leaves the request line open.
+///
+/// Returns the offending component's name so a refusal can be logged with
+/// something actionable, rather than a generic "bad request".
+pub fn check_forwardable(
+    req: &HttpRequest,
+    client_ip: &str,
+    original_host: &str,
+) -> Result<(), String> {
+    // The method is written before the first space, so a space in it forges a
+    // request line on its own — no CR needed.
+    if req.method.is_empty() || !req.method.bytes().all(|b| b.is_ascii_graphic() && b != b'/') {
+        return Err(format!("method {:?}", req.method));
+    }
+    for (label, s) in [
+        ("path", req.path.as_str()),
+        ("query", req.query.as_deref().unwrap_or("")),
+    ] {
+        // A space here ends the request target and makes the remainder look
+        // like the HTTP version token.
+        if s.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0 || b == b' ') {
+            return Err(format!("request {label}"));
+        }
+    }
+    for (label, s) in [("X-Forwarded-For", client_ip), ("X-Forwarded-Host", original_host)] {
+        if !h1_field_value_is_safe(s) {
+            return Err(format!("proxy header {label}"));
+        }
+    }
+    for (name, value) in &req.headers {
+        if skip_when_forwarding(name) {
+            continue; // never reaches the backend, so it cannot inject
+        }
+        if !h1_field_name_is_safe(name) {
+            return Err(format!("header name {name:?}"));
+        }
+        if !h1_field_value_is_safe(value) {
+            return Err(format!("header {name} value"));
+        }
+    }
+    Ok(())
+}
+
 /// Write a usize as decimal into a stack buffer; return the filled slice.
 #[inline(always)]
 fn write_decimal(mut n: usize, buf: &mut [u8; 20]) -> &[u8] {
@@ -164,6 +252,15 @@ pub fn forward_request_timeout(
     original_host: &str,
     timeout: Option<std::time::Duration>,
 ) -> io::Result<HttpResponse> {
+    // Before the connection, not after: a request that cannot be safely
+    // serialised must never reach a backend socket at all.
+    if let Err(what) = check_forwardable(req, client_ip, original_host) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("refusing to forward: unsafe {what} would inject HTTP/1.1 framing"),
+        ));
+    }
+
     let mut stream = UnixStream::connect(socket_path)?;
 
     if let Some(dur) = timeout {
@@ -468,6 +565,16 @@ pub fn forward_url_request(
     timeout: Option<std::time::Duration>,
     tls_config: std::sync::Arc<rustls::ClientConfig>,
 ) -> io::Result<HttpResponse> {
+    // Same gate as the unix-socket path. Checked here rather than only inside
+    // `build_forwarded_request_bytes` so the refusal happens before a TCP
+    // connection is opened to the upstream.
+    if let Err(what) = check_forwardable(req, client_ip, original_host) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("refusing to forward: unsafe {what} would inject HTTP/1.1 framing"),
+        ));
+    }
+
     // ── Parse URL ────────────────────────────────────────────────────────────
     let (scheme, authority) = parse_url_scheme_authority(base_url)?;
     let (host, port) = split_host_port(&authority, match scheme.as_str() {
@@ -559,6 +666,15 @@ pub fn dispatch_url_request(
 }
 
 /// Build a forwarded HTTP/1.1 request byte buffer (no TLS framing).
+/// Serialise an HTTP/1.1 request for an upstream.
+///
+/// **Invariant: every caller must have run `check_forwardable` first.** This
+/// writes header names and values into CRLF-delimited syntax verbatim, so an
+/// unchecked CR or LF here is request smuggling (F036/F094). It cannot do the
+/// check itself because it returns bytes rather than a Result, and making it
+/// fallible would push the failure past the point where a connection has
+/// already been opened. Both current callers gate at the top of
+/// `forward_url_request`.
 fn build_forwarded_request_bytes(
     req: &HttpRequest,
     host: &str,
@@ -862,5 +978,125 @@ mod tests {
         let timeout = std::time::Duration::from_millis(100);
         let result = forward_request_timeout(path, &req, "127.0.0.1", "localhost", Some(timeout));
         assert!(result.is_err());
+    }
+}
+
+#[cfg(test)]
+mod smuggling_tests {
+    use super::*;
+
+    fn req_with(name: &str, value: &str) -> HttpRequest {
+        HttpRequest {
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            query: None,
+            version: "HTTP/1.1".to_string(),
+            headers: vec![(name.to_string(), value.to_string())],
+            body: Vec::new(),
+        }
+    }
+
+    /// F036/F094. HTTP/2 and HTTP/3 field values are length-delimited, so a
+    /// decoded value may contain any byte. HTTP/1.1 is CRLF-delimited, so
+    /// writing such a value out verbatim turns it into framing and smuggles a
+    /// request into a backend that trusts this proxy.
+    #[test]
+    fn crlf_in_a_header_value_is_refused() {
+        let attacks = [
+            "evil\r\nX-Injected: yes",
+            "evil\r\n\r\nGET /admin HTTP/1.1\r\nHost: internal",
+            "evil\nX-Injected: bare-lf",   // bare LF: many parsers accept it
+            "evil\rX-Injected: bare-cr",
+            "evil\0truncated",
+        ];
+        for a in attacks {
+            let r = req_with("X-Test", a);
+            assert!(
+                check_forwardable(&r, "1.2.3.4", "example.com").is_err(),
+                "value {a:?} must be refused"
+            );
+        }
+    }
+
+    /// A header the proxy strips can never reach the backend, so refusing on it
+    /// would reject traffic for no gain. Pinned so the skip list and the check
+    /// cannot drift apart into either a hole or a false refusal.
+    #[test]
+    fn hop_by_hop_headers_are_not_judged() {
+        let mut r = req_with("Connection", "keep-alive\r\nX-Injected: yes");
+        assert!(check_forwardable(&r, "1.2.3.4", "example.com").is_ok());
+        // ...but the same value on a forwarded header still fails.
+        r.headers = vec![("X-Real".to_string(), "v\r\nX-Injected: yes".to_string())];
+        assert!(check_forwardable(&r, "1.2.3.4", "example.com").is_err());
+    }
+
+    /// The request line is assembled from method, path and query. A space is as
+    /// dangerous as a CR there: it forges the next token.
+    #[test]
+    fn request_line_components_are_checked() {
+        let bad = [
+            ("GET /x HTTP/1.1\r\nX-I: 1", "/", None),
+            ("GET", "/a b", None),
+            ("GET", "/a\r\nX-I: 1", None),
+            ("GET", "/", Some("a=1 HTTP/1.1")),
+            ("GET", "/", Some("a=1\r\nX-I: 1")),
+            ("", "/", None),
+        ];
+        for (m, p, q) in bad {
+            let r = HttpRequest {
+                method: m.to_string(),
+                path: p.to_string(),
+                query: q.map(str::to_string),
+                version: "HTTP/1.1".to_string(),
+                headers: vec![],
+                body: Vec::new(),
+            };
+            assert!(
+                check_forwardable(&r, "1.2.3.4", "example.com").is_err(),
+                "method={m:?} path={p:?} query={q:?} must be refused"
+            );
+        }
+    }
+
+    /// Both are derived from client-controlled input and are written into
+    /// headers this proxy adds itself.
+    #[test]
+    fn proxy_added_headers_are_checked() {
+        let r = req_with("X-Test", "fine");
+        assert!(check_forwardable(&r, "1.2.3.4\r\nX-Injected: yes", "example.com").is_err());
+        assert!(check_forwardable(&r, "1.2.3.4", "example.com\r\nX-Injected: yes").is_err());
+    }
+
+    /// A field name must be a token: a colon or space in it splits one header
+    /// into two without needing a line break at all.
+    #[test]
+    fn malformed_field_names_are_refused() {
+        for n in ["X Test", "X:Test", "X\r\nY", "", "X\tY"] {
+            assert!(
+                check_forwardable(&req_with(n, "v"), "1.2.3.4", "example.com").is_err(),
+                "name {n:?} must be refused"
+            );
+        }
+    }
+
+    /// Ordinary traffic must still pass, including obs-text, which RFC 9110 5.5
+    /// permits in a field value. Guards against "fixing" this by rejecting
+    /// anything non-ASCII.
+    #[test]
+    fn legitimate_requests_still_pass() {
+        let r = HttpRequest {
+            method: "POST".to_string(),
+            path: "/contact".to_string(),
+            query: Some("v=1&x=%E2%80%99".to_string()),
+            version: "HTTP/1.1".to_string(),
+            headers: vec![
+                ("Content-Type".to_string(), "application/x-www-form-urlencoded".to_string()),
+                ("User-Agent".to_string(), "Mozilla/5.0 (Macintosh)".to_string()),
+                ("X-Obs-Text".to_string(), "caf\u{e9} \u{2014} fine".to_string()),
+                ("Accept".to_string(), "text/html;q=0.9, */*".to_string()),
+            ],
+            body: b"a=1".to_vec(),
+        };
+        assert_eq!(check_forwardable(&r, "203.0.113.7", "mgrosvenor.com"), Ok(()));
     }
 }
