@@ -11,6 +11,40 @@ Deploy order is fixed: **test locally, commit, then deploy.** Never the reverse.
 
 ---
 
+## m6-core: a config reload no longer silences logging
+
+`LogHandle::reload` rebuilt the whole layer -- new writer, new `fmt` layer, new
+`.with_filter(..)` -- and handed it to `reload::Handle::modify`. That is
+unsupported: `.with_filter(..)` produces a `Filtered` layer, per-layer filter
+ids are assigned when the subscriber is *constructed*, and a `Filtered` layer
+swapped in afterwards has no id and panics on the first event through it.
+
+In production the symptom was not a crash. m6-http kept serving traffic and
+reporting itself healthy while every log target except `analytics` went silent
+-- stats, pool events, warnings and errors all gone. `analytics` survived only
+because it is a separate layer with its own writer that reload never touches.
+Measured on one node across the same PID: stats 1788 -> 0, m6_http 124 -> 0,
+pool 74 -> 0, rustls 60 -> 0, analytics 954 -> 42. A deploy touches site.toml
+and that triggers a reload, so every deploy blinded the server to its own
+errors.
+
+Now only the FILTER is reloaded. The `Filtered` wrapper is built once at
+registration and keeps its id for the process lifetime; only the filter value
+inside it swaps. The stdout writer is likewise created once rather than per
+reload. Format cannot change this way (json and text are distinct layer types),
+so a reload requesting a different format keeps the current one and warns
+instead of pretending; the level, which is the knob that gets used, still
+applies. A failed reload now logs at ERROR rather than being swallowed.
+
+Test: `m6-core/tests/log_reload.rs`. The subscriber is process-global and
+cannot be torn down, so it re-executes the test binary as a child and inspects
+real stdout -- asserting a line before the reload (so a pass cannot be
+vacuous), then after one reload, then after a second. Asserting that `reload()`
+returned would prove nothing: it returned cleanly the whole time it was
+writing into a dead layer. Verified failing against the old code with the exact
+production panic, then passing.
+
+
 ## m6-file: lengthen only the shared-cache lifetime for unversioned assets
 
 Unversioned assets (the webfont, `manifest.json`, any asset requested without

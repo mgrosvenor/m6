@@ -2,14 +2,15 @@
 
 use anyhow::Result;
 use std::path::Path;
-use std::sync::Mutex;
 use tracing::Level;
 use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 use tracing_subscriber::filter::{filter_fn, FilterExt, LevelFilter};
+use tracing_subscriber::layer::Filter;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{fmt, reload, Layer, Registry};
 
 type BoxedLayer = Box<dyn Layer<Registry> + Send + Sync + 'static>;
+type BoxedFilter = Box<dyn Filter<Registry> + Send + Sync + 'static>;
 
 /// Events logged with `target: "analytics"` are routed only to the dedicated
 /// analytics file (see [`init_with_analytics`]) — the main dev/prod log layer
@@ -17,46 +18,93 @@ type BoxedLayer = Box<dyn Layer<Registry> + Send + Sync + 'static>;
 /// operational logging.
 const ANALYTICS_TARGET: &str = "analytics";
 
-/// Handle returned by [`init`] that allows runtime log level / format reloads.
+/// Handle returned by [`init`] that allows runtime log level reloads.
 ///
 /// Keep the handle alive for the lifetime of the process. Dropping it flushes
 /// and terminates the logging background thread.
 pub struct LogHandle {
-    handle: reload::Handle<BoxedLayer, Registry>,
-    guard:  Mutex<WorkerGuard>,
-    // Kept alive for the process lifetime so the analytics writer thread
-    // isn't torn down early; never read again after init.
+    /// Reloads the *filter*, never the layer. See [`LogHandle::reload`].
+    filter: reload::Handle<BoxedFilter, Registry>,
+    /// The format chosen at init. Recorded only so a reload asking for a
+    /// different one can say why it is being ignored.
+    format: String,
+    // The main stdout writer is created once and lives for the whole process.
+    // Its worker thread stops the moment this guard drops, and any writes
+    // after that are silently discarded.
+    _guard: WorkerGuard,
+    // Same, for the analytics writer; never read again after init.
     _analytics_guard: Option<WorkerGuard>,
 }
 
 impl LogHandle {
-    /// Swap the active log layer for one built from `format` and `level`.
+    /// Apply a new log level to the running process.
     ///
-    /// On success the old `WorkerGuard` is replaced so that the previous
-    /// non-blocking writer is flushed and the new one takes over.
+    /// **Only the filter is swapped, never the layer, and that is the whole
+    /// design.** An earlier version rebuilt the entire layer here — new writer,
+    /// new `fmt` layer, new `.with_filter(..)` — and handed it to
+    /// `reload::Handle::modify`. That is unsupported, and it took down logging
+    /// on all three production nodes on 2026-09-06.
+    ///
+    /// `.with_filter(..)` produces a `Filtered` layer, and per-layer filters
+    /// are assigned a `FilterId` when the subscriber is *constructed*. A
+    /// `Filtered` layer swapped in afterwards has no id, so the first event
+    /// through it panics with "a `Filtered` layer was used, but it had no
+    /// `FilterId`". The visible result was not a crash: m6-http kept serving
+    /// traffic and reporting itself healthy while every log target except
+    /// `analytics` (a separate layer, never touched by reload) went silent —
+    /// stats, pool events, warnings and errors all gone. Since a deploy
+    /// touches `site.toml` and that triggers a reload, every deploy blinded
+    /// the server to its own errors.
+    ///
+    /// Swapping the filter is the supported operation: the `Filtered` wrapper
+    /// is built once at registration and keeps its id forever, and only the
+    /// filter value inside it changes. Keeping the writer for the process
+    /// lifetime also removes the per-reload writer churn that made the old
+    /// version look plausible.
+    ///
+    /// Format cannot change this way — json and text are different layer types
+    /// — so a reload requesting a different format keeps the current one and
+    /// says so rather than pretending. In practice format is set once per
+    /// deployment and never toggled at runtime; the level is the useful knob.
     pub fn reload(&self, format: &str, level: &str) {
+        if format != self.format {
+            tracing::warn!(
+                current = %self.format,
+                requested = %format,
+                "log format cannot be changed without a restart; keeping the \
+                 current format (the new level is still applied)"
+            );
+        }
         let lvl = parse_level(level);
-        let (writer, new_guard) = tracing_appender::non_blocking(std::io::stdout());
-        let new_layer = make_layer(format, lvl, writer);
-        match self.handle.modify(|l| *l = new_layer) {
-            Ok(()) => {
-                if let Ok(mut g) = self.guard.lock() {
-                    *g = new_guard;
-                }
-            }
-            Err(e) => {
-                tracing::warn!("log reload failed: {}", e);
-            }
+        // Built inside the closure so the handle owns the only copy.
+        if let Err(e) = self.filter.modify(|f| *f = make_filter(lvl)) {
+            // Loud, and at error level: if this fails the process keeps the
+            // old level, which is recoverable — but silence here is what
+            // turned the original bug into an invisible one.
+            tracing::error!(error = %e, "log level reload failed; keeping the previous level");
         }
     }
 }
 
-/// The main layer always excludes `target: "analytics"` events — those are
-/// high-volume, per-request, and machine-read; routing them here as well
-/// would drown out ordinary operational logging (and double-write them when
-/// [`init_with_analytics`] is in use).
-fn make_layer(format: &str, level: Level, writer: NonBlocking) -> BoxedLayer {
-    let filter = LevelFilter::from_level(level).and(filter_fn(|meta| meta.target() != ANALYTICS_TARGET));
+/// The main layer's filter: a level gate, plus the exclusion of
+/// `target: "analytics"` events, which are high-volume, per-request and
+/// machine-read. Routing them here as well would drown out ordinary
+/// operational logging (and double-write them when [`init_with_analytics`]
+/// is in use).
+fn make_filter(level: Level) -> BoxedFilter {
+    Box::new(LevelFilter::from_level(level).and(filter_fn(|meta| meta.target() != ANALYTICS_TARGET)))
+}
+
+/// Build the main stdout layer around an already-registered reloadable filter.
+///
+/// The filter is passed in rather than built here so that the `Filtered`
+/// wrapper this produces is the one registered with the subscriber, and stays
+/// registered. Nothing about this layer is replaceable at runtime.
+fn make_main_layer(
+    format: &str,
+    writer: NonBlocking,
+    filter: reload::Layer<BoxedFilter, Registry>,
+) -> BoxedLayer {
     match format {
         "json" => Box::new(
             fmt::layer()
@@ -65,11 +113,7 @@ fn make_layer(format: &str, level: Level, writer: NonBlocking) -> BoxedLayer {
                 .with_current_span(true)
                 .with_filter(filter),
         ),
-        _ => Box::new(
-            fmt::layer()
-                .with_writer(writer)
-                .with_filter(filter),
-        ),
+        _ => Box::new(fmt::layer().with_writer(writer).with_filter(filter)),
     }
 }
 
@@ -97,8 +141,8 @@ fn make_analytics_layer(path: &Path) -> Result<(BoxedLayer, WorkerGuard)> {
 /// Initialize the tracing subscriber with a non-blocking stdout writer.
 ///
 /// Returns a [`LogHandle`] that must be kept alive for the lifetime of the
-/// process. Call [`LogHandle::reload`] at any time to swap the log level or
-/// format without restarting.
+/// process. Call [`LogHandle::reload`] to change the log level at runtime;
+/// the format is fixed for the life of the process.
 ///
 /// `format`:
 ///   - `"json"` → JSON output (production)
@@ -106,19 +150,7 @@ fn make_analytics_layer(path: &Path) -> Result<(BoxedLayer, WorkerGuard)> {
 ///
 /// `level`: `"debug"`, `"info"`, `"warn"`, `"error"` (defaults to `"info"`)
 pub fn init(format: &str, level: &str) -> Result<LogHandle> {
-    let lvl = parse_level(level);
-    let (writer, guard) = tracing_appender::non_blocking(std::io::stdout());
-    let layer = make_layer(format, lvl, writer);
-    let (reload_layer, handle) = reload::Layer::new(layer);
-    Registry::default()
-        .with(reload_layer)
-        .try_init()
-        .map_err(|e| anyhow::anyhow!("failed to install tracing subscriber: {}", e))?;
-    Ok(LogHandle {
-        handle,
-        guard: Mutex::new(guard),
-        _analytics_guard: None,
-    })
+    init_with_analytics(format, level, None)
 }
 
 /// Like [`init`], but also registers a second, always-JSON layer that
@@ -132,15 +164,18 @@ pub fn init(format: &str, level: &str) -> Result<LogHandle> {
 pub fn init_with_analytics(format: &str, level: &str, analytics_path: Option<&Path>) -> Result<LogHandle> {
     let lvl = parse_level(level);
     let (writer, guard) = tracing_appender::non_blocking(std::io::stdout());
-    let layer = make_layer(format, lvl, writer);
-    let (reload_layer, handle) = reload::Layer::new(layer);
+
+    // The reload handle is over the FILTER. Registering the `Filtered` layer
+    // that wraps it is what assigns the FilterId, and it is never replaced.
+    let (reload_filter, filter_handle) = reload::Layer::new(make_filter(lvl));
+    let main_layer = make_main_layer(format, writer, reload_filter);
 
     // Chaining multiple `.with(boxed_layer)` calls changes the subscriber
     // type at each step (S becomes `Layered<_, Registry>`), which a
     // `Box<dyn Layer<Registry>>` no longer satisfies. Collecting into a
     // `Vec<BoxedLayer>` and calling `.with()` once keeps every element's
     // trait object anchored to plain `Registry`.
-    let mut layers: Vec<BoxedLayer> = vec![Box::new(reload_layer)];
+    let mut layers: Vec<BoxedLayer> = vec![main_layer];
     let mut analytics_guard = None;
     if let Some(path) = analytics_path {
         let (l, g) = make_analytics_layer(path)?;
@@ -154,8 +189,9 @@ pub fn init_with_analytics(format: &str, level: &str, analytics_path: Option<&Pa
         .map_err(|e| anyhow::anyhow!("failed to install tracing subscriber: {}", e))?;
 
     Ok(LogHandle {
-        handle,
-        guard: Mutex::new(guard),
+        filter: filter_handle,
+        format: format.to_string(),
+        _guard: guard,
         _analytics_guard: analytics_guard,
     })
 }
