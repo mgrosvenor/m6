@@ -110,13 +110,21 @@ HTTP/3 cache effect (p50, path suite):
 | cache-hit→m6-html  | 0.048 ms | Served from m6-http memory cache |
 | cache-miss→m6-html | 0.059 ms | Forwarded to m6-html renderer |
 
-Throughput (8 concurrent threads, 10 s, GET `/`):
+Throughput, measured on a 4-vCPU Linux host with the load generator
+co-located over loopback, TLS 1.3, warm cache, **concurrency 2**, commit
+`0a68cda` (two consecutive runs, so the spread is visible):
 
 | Protocol | req/s |
 |----------|-------|
-| HTTP/1.1 | 8,840 |
-| HTTP/2   | 28,797 |
-| HTTP/3   | 61,748 |
+| HTTP/1.1 | 1,889 – 2,085 |
+| HTTP/2   | 6,711 – 7,154 |
+| HTTP/3   | 1,030 – 1,047 |
+
+Concurrency 2, not 8, is deliberate: on a 4-core box the load generator and the
+server share cores, and at 8 the client starves the server — two identical runs
+disagreed by 50×. Full conditions, command lines and per-percentile latencies
+are in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md). Numbers quoted without those
+conditions are not meaningful.
 
 Criterion microbenchmarks (CPU cost, no I/O):
 
@@ -456,6 +464,78 @@ Pool empty       →  status per [errors] mode:
 
 ---
 
+## RFC compliance
+
+m6 was audited clause-by-clause against RFC 9110/9111/9112/9113/9114 in
+September 2026: **180 checks, 38 passing, 119 failing, 23 ambiguous.** That
+result is published rather than summarised away, because a hand-written HTTP
+stack claiming compliance without an audit behind it is exactly the kind of
+claim this project should not make.
+
+Everything below has since been fixed, with tests, and verified against a
+running server rather than inferred from the source:
+
+**Message framing and smuggling**
+- Bare `LF` accepted as a line terminator on ingress (`httparse` permits it)
+- **H2/H3 header values written verbatim into backend HTTP/1.1** — CR/LF in a
+  decoded value could inject a whole request into a trusting backend (F036/F094)
+- Backend responses: conflicting `Content-Length` resolved by position rather
+  than rejected; `Transfer-Encoding` + `Content-Length` both accepted; only a
+  literal `chunked` recognised, so `gzip, chunked` was misframed; an invalid
+  length silently became read-to-EOF (F028–F031)
+- Chunked decoding: post-chunk CRLF optional; trailer section never validated;
+  chunk sizes accepted a leading `+`; **no body cap on the chunked path** at all
+- The proxy emitted **two conflicting `Content-Length` headers** of its own
+- `Host` validation, absolute-form targets, oversized headers
+
+**Semantics (RFC 9110)**
+- Method never validated — `TRACE`, `POST` and an invented `FOO` were all served
+  the cached homepage; 405 vs 501 not distinguished
+- HEAD returned a full body while advertising the GET length; curl reported
+  error 18 and HTTP/2 aborted the stream
+- Preconditions: `If-Match` and `If-Unmodified-Since` ignored entirely (so a
+  conditional write was applied unconditionally), `If-None-Match` used strong
+  instead of weak comparison, evaluation order not implemented (F003/F006/F008/F010)
+- `Accept-Encoding` matched by substring, so `br;q=0` — an explicit refusal —
+  still selected brotli; q-values and preference ignored (F012–F014)
+- No `Via` on forwarded messages (F017); `Connection`-nominated fields
+  forwarded rather than removed (F018/F019)
+
+**Caching (RFC 9111)**
+- No `Age`, no `Date`; freshness unbounded for a bare `public`
+- Age taken from the `Age` header alone, so an upstream that omits it restarted
+  the clock at every hop (4.2.3 corrected age)
+- Client directives entirely unimplemented — a browser reload could not force a
+  refresh (F053–F056)
+- 206 stored; unsafe methods not invalidating; 304 missing `Vary`/`Date`
+- Quoted directive values mis-split; `public` on one line beating a later
+  `no-store`
+
+**Denial of service**
+- Unbounded request bodies on H2 and H3; unbounded backend response allocation
+  driven by a backend-declared length; a HEADERS frame with PRIORITY and a
+  payload under five bytes sliced out of bounds and could panic the process
+
+### Still open
+
+- Most of the H2 frame/stream/flow-control cluster (F064–F098 beyond the
+  panics and flow-control fixes already made), H2 client behaviour
+  (F099–F109), H3 integration (F110–F114), auth extensions (F115–F119)
+- The cache key omits scheme and authority (F044). Verified safe for this
+  deployment rather than fixed: no response varies by Host, and `should_cache`
+  refuses to store anything whose `Vary` names a field other than
+  `Accept-Encoding`. It would not be safe for multi-tenant use.
+
+### The structural question
+
+The audit's own recommendation, and the honest position: either replace the
+hand-written HTTP/2 machinery with a maintained codec and keep m6's routing and
+cache around it, or commit to hand-written H2 as a project goal and build it
+out properly — a frame-validation table, complete stream state machine,
+connection and stream flow-control ledgers, HPACK directionality, fragmentation
+handling, fuzzing, and h2spec. Both are defensible; they are very different
+amounts of work. **This decision gates a 1.0 release.**
+
 ## Known Limitations
 
 **m6-http:**
@@ -482,23 +562,29 @@ The response cache is an `Arc<Bytes>` LRU in the same heap as the TLS stack — 
 cache hit is a hash lookup, a reference-count increment, and an AES-GCM seal. No
 IPC, no lock, no copy.
 
-**Measured single-core throughput (macOS loopback, TLS, warm cache, 8 concurrent connections):**
+**Throughput** — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for the measured
+figures, the hardware, and the exact commands. Summary: HTTP/2 is about 3×
+HTTP/1.1 on this hardware, on both latency and throughput.
 
-| Protocol | req/s   | vs nginx (1 worker) |
-|----------|--------:|---------------------|
-| HTTP/1.1 |  11,857 | ~0.5–0.9× (nginx better; H1 not the primary path) |
-| HTTP/2   | 158,323 | ~3–9× faster |
-| HTTP/3   |  77,672 | no published baseline |
+This section previously carried a second throughput table that contradicted the
+one above — 158,323 req/s for HTTP/2 against 28,797 — while claiming identical
+conditions. At least one was wrong and a reader had no way to tell which, so
+both were deleted and re-measured rather than reconciled. Neither recorded a
+commit, hardware, payload or command line.
 
-**HTTP/2 context:** nginx single-worker H2 reaches ~17–59K req/s; LiteSpeed ~84K.
-m6-http at 158K is the result of correct H2 flow-control (`WINDOW_UPDATE`), stream
-multiplexing, and the in-process cache. H2O on Linux with kernel TLS reaches ~325K —
-the gap is `TCP_ULP` / KTLS offloading AES-GCM into the kernel, a Linux-only feature
-not yet integrated here. The profiler shows ~56% of H2 working time is in userspace
-AES-GCM; KTLS would eliminate most of it.
+It also compared m6 against nginx, LiteSpeed and H2O using figures taken from
+elsewhere rather than run like-for-like. Those comparisons are gone too. A
+number produced on someone else's hardware, with another payload, is not a
+comparison, and presenting it as one was the least defensible thing in this
+file.
 
-**Where m6 wins:** H2/H3 single-core throughput; zero-IPC cache hits; deterministic
-tail latency (no lock convoys, no cross-core coherence); no external cache tier needed.
+**Two different quantities, both true, easily confused:** a cache hit costs
+**~2.2 µs** inside m6 (its own timer, confirmed on production), while an
+end-to-end HTTP/2 request on the benchmark host is **~230 µs** — TLS, loopback
+and the client included. Quoting the first as if it were the second is how the
+old numbers drifted.
+
+**Where m6 wins:** H2 over H1 on this hardware; zero-IPC cache hits; deterministic
 
 **Where m6 doesn't win:** H1 throughput (nginx is more mature); multi-core scale
 within a single instance (one process = one core); large-file serving (no `sendfile`).
