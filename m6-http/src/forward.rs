@@ -320,12 +320,48 @@ pub fn forward_request_timeout(
     stream.write_all(&buf)?;
     stream.flush()?;
 
-    // Read response
-    read_response(stream)
+    // Read response. The method matters: a HEAD response is bodyless whatever
+    // its Content-Length says, and without this the read blocks until timeout.
+    read_response_for(stream, &req.method)
 }
 
 /// Read an HTTP/1.1 response from a synchronous stream.
-pub fn read_response<R: Read>(mut reader: R) -> io::Result<HttpResponse> {
+///
+/// Kept for callers that genuinely cannot know the request method. Prefer
+/// [`read_response_for`]: without the method this cannot apply RFC 9112 6.3's
+/// first rule, and will wait for a body on a HEAD response that will never
+/// have one.
+pub fn read_response<R: Read>(reader: R) -> io::Result<HttpResponse> {
+    read_response_for(reader, "GET")
+}
+
+/// Read an HTTP/1.1 response, framing it according to RFC 9112 6.3.
+///
+/// Message framing is the security boundary between this proxy and its
+/// backend: if the two disagree about where a response ends, the leftover
+/// bytes become the start of the *next* response on a reused connection. That
+/// is response splitting, and it is why each of the rules below is a hard
+/// error rather than a best guess.
+///
+/// - **Responses to HEAD, and 1xx/204/304, never have a body** (F035). The
+///   reader previously did not know the method and would block waiting for
+///   `Content-Length` bytes that a correct backend will never send -- so a
+///   HEAD to a backend stalled until the read timeout.
+/// - **`Transfer-Encoding` is a comma-separated list** (F030). Only a value
+///   that was literally `chunked` was recognised, so a perfectly valid
+///   `gzip, chunked` was treated as unframed and the chunk envelope was handed
+///   back as if it were the body.
+/// - **`Transfer-Encoding` together with `Content-Length` is refused** (F029).
+///   RFC 9112 6.1 forbids sending both; a recipient that guesses which one to
+///   believe is the classic smuggling primitive, because the next hop may
+///   guess differently.
+/// - **Conflicting `Content-Length` values are refused** (F028). The parser
+///   kept the last one seen, so a backend emitting two different lengths
+///   silently framed the response by whichever came last.
+/// - **An unparseable `Content-Length` is refused** (F031). It used to become
+///   `None` via `.ok()` and fall through to read-to-EOF -- turning a malformed
+///   header into a silently different framing mode.
+pub fn read_response_for<R: Read>(mut reader: R, request_method: &str) -> io::Result<HttpResponse> {
     // 8 KiB on the stack — sufficient for all normal responses, no heap alloc.
     let mut header_buf = [0u8; 8192];
     let mut n_total = 0usize;
@@ -365,6 +401,7 @@ pub fn read_response<R: Read>(mut reader: R) -> io::Result<HttpResponse> {
 
     let mut headers: Vec<(String, String)> = Vec::with_capacity(16);
     let mut content_length: Option<usize> = None;
+    let mut te_present = false;
     let mut chunked = false;
 
     for line in lines {
@@ -375,15 +412,86 @@ pub fn read_response<R: Read>(mut reader: R) -> io::Result<HttpResponse> {
             let name = line[..colon].trim();
             let value = line[colon + 1..].trim();
             if name.eq_ignore_ascii_case("content-length") {
-                content_length = value.parse().ok();
+                // A single field may itself carry a comma-separated list, and
+                // the field may repeat. Every value present must agree; if any
+                // differ the framing is ambiguous and the message is refused
+                // rather than resolved by position (F028).
+                for part in value.split(',') {
+                    let part = part.trim();
+                    // `1*DIGIT` (RFC 9110 8.6), checked explicitly rather than
+                    // left to `str::parse`, which accepts a leading `+` -- so
+                    // `Content-Length: +5` was quietly read as 5. A hop that
+                    // rejects it while this one accepts it is a framing
+                    // disagreement, which is the whole hazard here.
+                    if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("backend sent an invalid Content-Length: {part:?}"),
+                        ));
+                    }
+                    let parsed: usize = part.parse().map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("backend sent an out-of-range Content-Length: {part:?}"),
+                        )
+                    })?;
+                    match content_length {
+                        Some(prev) if prev != parsed => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "backend sent conflicting Content-Length values \
+                                     ({prev} and {parsed}); refusing to guess the framing"
+                                ),
+                            ));
+                        }
+                        _ => content_length = Some(parsed),
+                    }
+                }
             }
-            if name.eq_ignore_ascii_case("transfer-encoding")
-                && value.eq_ignore_ascii_case("chunked")
-            {
-                chunked = true;
+            if name.eq_ignore_ascii_case("transfer-encoding") {
+                te_present = true;
+                // A list; only the FINAL coding decides the framing
+                // (RFC 9112 6.1). `gzip, chunked` is chunked.
+                if let Some(last) = value.split(',').next_back() {
+                    if last.trim().eq_ignore_ascii_case("chunked") {
+                        chunked = true;
+                    }
+                }
             }
             headers.push((name.to_owned(), value.to_owned()));
         }
+    }
+
+    // Both present: RFC 9112 6.1 forbids sending them together, and a
+    // recipient that picks one is the classic smuggling primitive -- the next
+    // hop may pick the other (F029).
+    if te_present && content_length.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "backend sent both Transfer-Encoding and Content-Length; refusing to guess the framing",
+        ));
+    }
+
+    // Transfer-Encoding present but not ending in `chunked`: the message has no
+    // self-delimiting framing at all. RFC 9112 6.1 says a server MUST NOT do
+    // this; treating it as read-to-EOF would leave the connection unusable.
+    if te_present && !chunked {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "backend sent a Transfer-Encoding not ending in chunked; response is unframed",
+        ));
+    }
+
+    // RFC 9112 6.3 rule 1: these responses never have a body, whatever their
+    // headers claim. Checked before any body read, so a HEAD does not block
+    // waiting for bytes a correct backend will never send (F035).
+    let bodyless = request_method.eq_ignore_ascii_case("HEAD")
+        || status == 204
+        || status == 304
+        || (100..200).contains(&status);
+    if bodyless {
+        return Ok(HttpResponse { status, reason, headers, body: Vec::new() });
     }
 
     // Body bytes that arrived in the same read as the headers — borrow from stack buffer.
@@ -594,7 +702,7 @@ pub fn forward_url_request(
     // ── Send + receive ───────────────────────────────────────────────────────
     if scheme == "https" {
         let req_bytes = build_forwarded_request_bytes(req, &host, client_ip, original_host);
-        forward_over_tls(tcp, &host, req_bytes, tls_config)
+        forward_over_tls(tcp, &host, req_bytes, tls_config, &req.method)
     } else if scheme == "h2c" {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -611,7 +719,7 @@ pub fn forward_url_request(
         let mut stream = tcp;
         stream.write_all(&req_bytes)?;
         stream.flush()?;
-        read_response(stream)
+        read_response_for(stream, &req.method)
     }
 }
 
@@ -782,6 +890,7 @@ fn forward_over_tls(
     host: &str,
     req_bytes: Vec<u8>,
     tls_config: std::sync::Arc<rustls::ClientConfig>,
+    request_method: &str,
 ) -> io::Result<HttpResponse> {
     use std::io::Write;
     use rustls::ClientConnection;
@@ -798,7 +907,7 @@ fn forward_over_tls(
     let mut tls_stream = StreamOwned::new(conn, tcp);
     tls_stream.write_all(&req_bytes)?;
     tls_stream.flush()?;
-    read_response(tls_stream)
+    read_response_for(tls_stream, request_method)
 }
 
 /// Build a simple HTTP response buffer (kept for tests).
@@ -1098,5 +1207,121 @@ mod smuggling_tests {
             body: b"a=1".to_vec(),
         };
         assert_eq!(check_forwardable(&r, "203.0.113.7", "mgrosvenor.com"), Ok(()));
+    }
+}
+
+#[cfg(test)]
+mod response_framing_tests {
+    use super::*;
+
+    /// F028. The parser kept the last `Content-Length` it saw, so a backend
+    /// emitting two different lengths framed the response by whichever came
+    /// last. If this hop and the next hop disagree about the length, the
+    /// remainder becomes the head of the following response on a reused
+    /// connection -- response splitting.
+    #[test]
+    fn conflicting_content_length_is_refused() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 10\r\n\r\nhello";
+        let err = read_response(&raw[..]).unwrap_err();
+        assert!(
+            err.to_string().contains("conflicting Content-Length"),
+            "got: {err}"
+        );
+    }
+
+    /// Repeated but identical values are unambiguous, so they must still work.
+    /// Without this the fix above would reject legitimate traffic.
+    #[test]
+    fn duplicate_but_equal_content_length_is_accepted() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello";
+        let r = read_response(&raw[..]).expect("equal duplicates are unambiguous");
+        assert_eq!(r.body, b"hello");
+    }
+
+    /// A single field carrying a list must be checked element-wise too.
+    #[test]
+    fn content_length_list_must_agree() {
+        assert!(read_response(&b"HTTP/1.1 200 OK\r\nContent-Length: 5, 6\r\n\r\nhello"[..]).is_err());
+        let r = read_response(&b"HTTP/1.1 200 OK\r\nContent-Length: 5, 5\r\n\r\nhello"[..]).unwrap();
+        assert_eq!(r.body, b"hello");
+    }
+
+    /// F029. RFC 9112 6.1 forbids sending both. A recipient that picks one is
+    /// the classic smuggling primitive because the next hop may pick the other.
+    #[test]
+    fn transfer_encoding_with_content_length_is_refused() {
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n0\r\n\r\n";
+        let err = read_response(&raw[..]).unwrap_err();
+        assert!(err.to_string().contains("both Transfer-Encoding and Content-Length"), "got: {err}");
+    }
+
+    /// F030. Transfer-Encoding is a list and only the FINAL coding frames the
+    /// message. `gzip, chunked` is chunked; the old check compared the whole
+    /// value to "chunked" and so treated this as unframed, handing the chunk
+    /// envelope back as though it were the body.
+    #[test]
+    fn transfer_encoding_list_ending_in_chunked_is_chunked() {
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+        let r = read_response(&raw[..]).expect("gzip, chunked is chunked");
+        assert_eq!(r.body, b"hello", "chunk envelope was not decoded");
+    }
+
+    /// The converse: a Transfer-Encoding NOT ending in chunked leaves the
+    /// message with no self-delimiting framing at all.
+    #[test]
+    fn transfer_encoding_not_ending_in_chunked_is_refused() {
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, gzip\r\n\r\nhello";
+        let err = read_response(&raw[..]).unwrap_err();
+        assert!(err.to_string().contains("not ending in chunked"), "got: {err}");
+    }
+
+    /// F031. An unparseable length used to become `None` via `.ok()` and fall
+    /// through to read-to-EOF, quietly switching framing mode on malformed
+    /// input instead of rejecting it.
+    #[test]
+    fn invalid_content_length_is_refused_not_read_to_eof() {
+        for bad in ["abc", "5x", "-1", "0x10", "+5", ""] {
+            let raw = format!("HTTP/1.1 200 OK\r\nContent-Length: {bad}\r\n\r\nhello");
+            let err = read_response(raw.as_bytes()).unwrap_err();
+            assert!(
+                err.to_string().contains("invalid Content-Length"),
+                "Content-Length {bad:?} should be refused, got: {err}"
+            );
+        }
+    }
+
+    /// F035. A response to HEAD carries the headers a GET would, Content-Length
+    /// included, but no body. Without the method the reader blocked waiting for
+    /// bytes a correct backend never sends, so every HEAD to a backend stalled
+    /// until the read timeout.
+    ///
+    /// The reader here yields EOF immediately after the headers: if the code
+    /// tries to read a body at all this fails, which is exactly the stall.
+    #[test]
+    fn head_response_is_bodyless_despite_content_length() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 16422\r\n\r\n";
+        let r = read_response_for(&raw[..], "HEAD").expect("HEAD must not wait for a body");
+        assert!(r.body.is_empty());
+        assert_eq!(r.header("content-length"), Some("16422"),
+            "the header must survive; only the body is absent");
+    }
+
+    /// Same rule, driven by status rather than method (RFC 9112 6.3).
+    #[test]
+    fn status_codes_that_never_have_a_body() {
+        for status in [204u16, 304, 100, 101] {
+            let raw = format!("HTTP/1.1 {status} X\r\nContent-Length: 99\r\n\r\n");
+            let r = read_response(raw.as_bytes())
+                .unwrap_or_else(|e| panic!("{status} must not wait for a body: {e}"));
+            assert!(r.body.is_empty(), "{status} must have no body");
+        }
+    }
+
+    /// A GET with the same headers still reads its body, so the bodyless rule
+    /// cannot have been implemented by ignoring bodies generally.
+    #[test]
+    fn get_still_reads_its_body() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+        assert_eq!(read_response_for(&raw[..], "GET").unwrap().body, b"hello");
     }
 }
