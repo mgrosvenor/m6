@@ -554,31 +554,65 @@ fn parse_status_line(line: &str) -> io::Result<(u16, String)> {
     Ok((status, reason))
 }
 
+/// Decode a chunked body (RFC 9112 7.1).
+///
+/// Every relaxation below was a way for this decoder and the next hop to
+/// disagree about where the body ends, which on a reused connection means the
+/// remainder is read as the start of the following response.
+///
+/// - **The CRLF after each chunk's data is now required** (F032). It used to be
+///   skipped only `if` it happened to be there, so a chunk whose data was
+///   followed by anything else silently resynchronised onto the wrong offset
+///   and the rest of the body was parsed as chunk headers.
+/// - **The trailer section is parsed rather than ignored** (F033/F034). The
+///   decoder stopped at the zero-size chunk and returned, never confirming the
+///   message actually terminated. A truncated trailer section now errors
+///   instead of passing as a complete body.
+/// - **Chunk sizes must be pure hex digits.** `usize::from_str_radix` accepts a
+///   leading `+`, so `+A` parsed as 10 -- the same trap that let
+///   `Content-Length: +5` through.
+/// - **The read is bounded.** `read_to_end` had no limit here, so while the
+///   `Content-Length` path refused to allocate above `MAX_BACKEND_BODY`, a
+///   chunked response could allocate without bound. That is the same memory
+///   exhaustion the length cap exists to prevent, reachable by simply choosing
+///   chunked framing.
 fn read_chunked_body<R: Read>(reader: &mut R, prefix: Vec<u8>) -> io::Result<Vec<u8>> {
     let mut body = Vec::new();
 
-    // Buffer that holds already-read but not-yet-consumed bytes
+    // Bounded: `take` caps the read without needing the size in advance. The
+    // +1 lets an over-limit body be detected rather than silently truncated to
+    // exactly the cap.
     let mut pending: Vec<u8> = prefix;
-
-    // Read all remaining bytes first (chunked bodies are typically small for backend responses)
+    let budget = MAX_BACKEND_BODY.saturating_sub(pending.len());
     let mut rest = Vec::new();
-    reader.read_to_end(&mut rest)?;
+    Read::take(reader, budget as u64 + 1).read_to_end(&mut rest)?;
     pending.extend_from_slice(&rest);
+    if pending.len() > MAX_BACKEND_BODY {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("chunked backend response exceeds the {MAX_BACKEND_BODY} byte limit"),
+        ));
+    }
 
-    // Now parse chunks from `pending`
     let mut pos = 0usize;
 
     loop {
-        // Find CRLF for chunk size line
         let crlf = find_crlf(&pending[pos..]).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "chunked: missing CRLF after size")
         })?;
         let size_line = std::str::from_utf8(&pending[pos..pos + crlf])
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "chunked: size not utf8"))?;
-        let size_str = size_line.trim().split(';').next().unwrap_or("").trim();
+        // chunk-ext (everything from the first ';') is permitted and ignored.
+        let size_str = size_line.split(';').next().unwrap_or("").trim();
+        if size_str.is_empty() || !size_str.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("chunked: invalid chunk size {size_str:?}"),
+            ));
+        }
         let size = usize::from_str_radix(size_str, 16)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid chunk size"))?;
-        pos += crlf + 2; // skip CRLF
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "chunked: chunk size out of range"))?;
+        pos += crlf + 2;
 
         if size == 0 {
             break;
@@ -594,10 +628,44 @@ fn read_chunked_body<R: Read>(reader: &mut R, prefix: Vec<u8>) -> io::Result<Vec
         body.extend_from_slice(&pending[pos..pos + size]);
         pos += size;
 
-        // Skip trailing CRLF after chunk data
-        if pos + 2 <= pending.len() && &pending[pos..pos + 2] == b"\r\n" {
-            pos += 2;
+        // Required, not optional. Anything else here means the declared size
+        // and the actual data disagree.
+        if pos + 2 > pending.len() || &pending[pos..pos + 2] != b"\r\n" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "chunked: chunk data not terminated by CRLF",
+            ));
         }
+        pos += 2;
+    }
+
+    // Trailer section: zero or more field lines, then a final CRLF. Previously
+    // the decoder returned at the zero chunk without looking, so a message that
+    // simply stopped mid-trailer was indistinguishable from a complete one.
+    loop {
+        let crlf = find_crlf(&pending[pos..]).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "chunked: body ended before the trailer section was terminated",
+            )
+        })?;
+        if crlf == 0 {
+            break; // the empty line that ends the message
+        }
+        let line = std::str::from_utf8(&pending[pos..pos + crlf])
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "chunked: trailer not utf8"))?;
+        // A trailer is an ordinary field line. Enforced so a malformed one is a
+        // parse error rather than being mistaken for the terminator.
+        match line.split_once(':') {
+            Some((name, _)) if h1_field_name_is_safe(name.trim()) => {}
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("chunked: malformed trailer field {line:?}"),
+                ))
+            }
+        }
+        pos += crlf + 2;
     }
 
     Ok(body)
@@ -1323,5 +1391,88 @@ mod response_framing_tests {
     fn get_still_reads_its_body() {
         let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
         assert_eq!(read_response_for(&raw[..], "GET").unwrap().body, b"hello");
+    }
+}
+
+#[cfg(test)]
+mod chunked_tests {
+    use super::read_response;
+
+    fn resp(body: &str) -> Vec<u8> {
+        format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{body}").into_bytes()
+    }
+
+    /// The happy path, including a trailer section, so the stricter parsing
+    /// cannot have been achieved by rejecting valid messages.
+    #[test]
+    fn well_formed_chunked_bodies_decode() {
+        for (body, want) in [
+            ("5\r\nhello\r\n0\r\n\r\n", "hello"),
+            ("5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n", "hello world"),
+            ("0\r\n\r\n", ""),
+            // chunk-ext is permitted and ignored
+            ("5;foo=bar\r\nhello\r\n0\r\n\r\n", "hello"),
+            // uppercase hex
+            ("A\r\n0123456789\r\n0\r\n\r\n", "0123456789"),
+            // trailers
+            ("5\r\nhello\r\n0\r\nX-Checksum: abc\r\n\r\n", "hello"),
+        ] {
+            let r = read_response(&resp(body)[..])
+                .unwrap_or_else(|e| panic!("{body:?} should decode: {e}"));
+            assert_eq!(String::from_utf8_lossy(&r.body), want, "for {body:?}");
+        }
+    }
+
+    /// F032. The CRLF after chunk data used to be skipped only if present, so a
+    /// chunk whose data was followed by anything else resynchronised onto the
+    /// wrong offset and the remainder was parsed as chunk headers.
+    #[test]
+    fn missing_crlf_after_chunk_data_is_refused() {
+        let err = read_response(&resp("5\r\nhelloXX0\r\n\r\n")[..]).unwrap_err();
+        assert!(err.to_string().contains("not terminated by CRLF"), "got: {err}");
+    }
+
+    /// F033/F034. The decoder returned at the zero chunk without confirming the
+    /// message actually ended, so a truncated trailer section was
+    /// indistinguishable from a complete body.
+    #[test]
+    fn truncated_trailer_section_is_refused() {
+        for body in ["5\r\nhello\r\n0\r\n", "5\r\nhello\r\n0\r\nX-Trailer: v\r\n"] {
+            let err = read_response(&resp(body)[..])
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("trailer section was terminated"),
+                "{body:?} should be refused, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_trailer_is_refused() {
+        let err = read_response(&resp("5\r\nhello\r\n0\r\nnot a header line\r\n\r\n")[..]).unwrap_err();
+        assert!(err.to_string().contains("malformed trailer"), "got: {err}");
+    }
+
+    /// `usize::from_str_radix` accepts a leading `+`, so `+A` parsed as 10 --
+    /// the same trap that let `Content-Length: +5` through.
+    #[test]
+    fn chunk_size_must_be_plain_hex() {
+        for bad in ["+A", "-5", "", " ", "0x5", "5g"] {
+            let body = format!("{bad}\r\nhello\r\n0\r\n\r\n");
+            let err = read_response(&resp(&body)[..]).unwrap_err();
+            assert!(
+                err.to_string().contains("invalid chunk size")
+                    || err.to_string().contains("missing CRLF"),
+                "chunk size {bad:?} should be refused, got: {err}"
+            );
+        }
+    }
+
+    /// A chunk claiming more data than was sent must not return a short body as
+    /// though it were complete.
+    #[test]
+    fn short_chunk_data_is_refused() {
+        let err = read_response(&resp("10\r\nhello\r\n0\r\n\r\n")[..]).unwrap_err();
+        assert!(err.to_string().contains("shorter than declared"), "got: {err}");
     }
 }
