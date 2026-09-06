@@ -21,7 +21,7 @@ use tracing::{debug, error, info, warn};
 use m6_http_lib::analytics;
 use m6_http_lib::auth;
 use m6_http_lib::rate_limit::RateLimiter;
-use m6_http_lib::cache::{Cache, CacheKey, CachedResponse, make_lookup_key, should_cache, request_permits_storage, strip_set_cookie, is_not_modified, not_modified_headers};
+use m6_http_lib::cache::{Cache, CacheKey, CachedResponse, make_lookup_key, should_cache, request_permits_storage, strip_set_cookie, evaluate_preconditions, Precondition, not_modified_headers};
 use m6_http_lib::stats::Stats;
 use m6_http_lib::config::{self, Config};
 use m6_http_lib::error::{self as error, ErrorMode};
@@ -427,7 +427,22 @@ fn event_loop(
                         let elapsed_ns = start.elapsed().as_nanos() as u64;
                         state.stats.record(elapsed_ns, true, false);
 
-                        if is_not_modified(&cached.headers, &req.headers) {
+                        let precond = evaluate_preconditions(&cached.headers, &req.headers, &req.method);
+                        if precond == Precondition::Failed {
+                            // RFC 9110 13.2.2 steps 1-2: the client asserted
+                            // something about the current representation that
+                            // is false (If-Match / If-Unmodified-Since), so the
+                            // request must not be applied and the cached copy
+                            // must not be served in its place.
+                            let mut headers: Vec<(String, String)> = Vec::new();
+                            set_date(&mut headers);
+                            analytics::finish_response(
+                                state.config.analytics.enabled, &mut headers, &req.headers,
+                                &state.config.node.name, &req.path, 412, cache_state, client_ip, Some(elapsed_ns),
+                            );
+                            return RequestOutcome::Ready(412, headers, Vec::new(), "cache".to_string(), cached.hints.clone());
+                        }
+                        if precond == Precondition::NotModified {
                             let mut headers = not_modified_headers(&cached.headers);
                             // Vary and Date are applied AFTER the cache insert
                             // (so `should_cache` sees the backend's own Vary),
@@ -568,7 +583,22 @@ fn event_loop(
                         let elapsed_ns = start.elapsed().as_nanos() as u64;
                         state.stats.record(elapsed_ns, true, false);
 
-                        if is_not_modified(&cached.headers, &req.headers) {
+                        let precond = evaluate_preconditions(&cached.headers, &req.headers, &req.method);
+                        if precond == Precondition::Failed {
+                            // RFC 9110 13.2.2 steps 1-2: the client asserted
+                            // something about the current representation that
+                            // is false (If-Match / If-Unmodified-Since), so the
+                            // request must not be applied and the cached copy
+                            // must not be served in its place.
+                            let mut headers: Vec<(String, String)> = Vec::new();
+                            set_date(&mut headers);
+                            analytics::finish_response(
+                                state.config.analytics.enabled, &mut headers, &req.headers,
+                                &state.config.node.name, &req.path, 412, cache_state, client_ip, Some(elapsed_ns),
+                            );
+                            return RequestOutcome::Ready(412, headers, Vec::new(), "cache".to_string(), cached.hints.clone());
+                        }
+                        if precond == Precondition::NotModified {
                             let mut headers = not_modified_headers(&cached.headers);
                             // Vary and Date are applied AFTER the cache insert
                             // (so `should_cache` sees the backend's own Vary),
@@ -1099,7 +1129,16 @@ fn handle_h3_request(
         let elapsed_ns = start.elapsed().as_nanos() as u64;
         state.stats.record(elapsed_ns, true, false);
 
-        if is_not_modified(&cached.headers, &req.headers) {
+        let method_str = std::str::from_utf8(method_bytes).unwrap_or("GET");
+        let precond = evaluate_preconditions(&cached.headers, &req.headers, method_str);
+        if precond == Precondition::Failed {
+            // Same rule as the h1/h2 paths; see the note there.
+            let mut headers: Vec<(String, String)> = Vec::new();
+            set_date(&mut headers);
+            send_h3_response(stream_id, qconn, 412, &headers, Bytes::new(), false);
+            return;
+        }
+        if precond == Precondition::NotModified {
             let client_ip = qconn.client_addr.ip().to_string();
             let set_cookie = analytics::record(
                 state.config.analytics.enabled, &req.headers,

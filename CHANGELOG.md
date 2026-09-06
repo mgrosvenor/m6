@@ -11,6 +11,45 @@ Deploy order is fixed: **test locally, commit, then deploy.** Never the reverse.
 
 ---
 
+## m6-http: RFC 9110 13.2.2 preconditions (F003, F006, F008, F010)
+
+Only `If-None-Match` and `If-Modified-Since` were implemented -- steps 3 and 4
+of the evaluation order. Steps 1 and 2 did not exist at all.
+
+- **F006 `If-Match` and `If-Unmodified-Since` were ignored.** That is not a
+  missing nicety: `If-Match` is precisely how a client avoids the lost-update
+  problem, so silently ignoring it turned every conditional write into an
+  unconditional one. The old return type was `bool`, which could express "304"
+  and "carry on" but had no way to say **412**, so the two headers could not
+  have been honoured without changing it.
+- **F003 `If-None-Match` used strong comparison.** RFC 9110 8.8.3.2 specifies
+  the *weak* function there, so `W/"abc"` must match `"abc"`. A client
+  returning the weak validator it had just been given never matched, and was
+  sent the entire body again.
+- **F008/F010 evaluation order** is now the specified one: If-Match, then
+  If-Unmodified-Since only when If-Match is absent, then If-None-Match, then
+  If-Modified-Since only when If-None-Match is absent and the method is
+  GET/HEAD. A matching `If-None-Match` on an unsafe method is 412, not 304 --
+  304 is meaningless as the answer to a state change.
+
+`If-Match` correctly uses *strong* comparison, so a weak validator does not
+authorise a write even though it names the same entity; there is a test for
+that asymmetry specifically. An unparseable date is ignored rather than treated
+as a failure (RFC 9110 13.1.4), or a malformed header would turn every request
+into a 412.
+
+Wired into all four server paths, with the HTTP/3 site taking the method from
+its `:method` pseudo-header. `is_not_modified` is kept as a wrapper for
+compatibility but documented as unable to express 412.
+
+Eleven tests. Note two of them initially failed for a reason worth recording:
+the fixtures used weekday names that did not match their dates ("Wed, 03 Sep
+2026" is a Thursday), `httpdate` rejected them, and the date-based tests were
+silently exercising the unparseable-date path instead of the one they named.
+
+654 workspace tests pass. Zero warnings on Linux and macOS.
+
+
 ## m6-http: strict chunked decoding (F032-F034), and a missing body cap
 
 Every relaxation here was a way for this decoder and the next hop to disagree
