@@ -617,6 +617,105 @@ impl Cache {
         }
     }
 
+    /// Look up an entry, honouring the client's own cache directives
+    /// (RFC 9111 5.2.1).
+    ///
+    /// These were not implemented at all: a request saying `Cache-Control:
+    /// no-cache` -- which is what every browser sends on a reload -- was served
+    /// the cached copy anyway, so a visitor could not force a refresh no matter
+    /// what they pressed. `max-age`, `min-fresh` and `max-stale` were likewise
+    /// ignored, meaning a client's explicit statement about what it would
+    /// accept had no effect on what it got.
+    ///
+    /// `only_if_cached` is deliberately NOT handled here: this returns
+    /// [`Lookup::Miss`] as usual, and the caller turns that into a 504 rather
+    /// than going to the backend. Encoding it in the enum would put an HTTP
+    /// status into a data structure that otherwise knows nothing about HTTP.
+    pub fn lookup_with<Q>(&self, key: &Q, req: &RequestDirectives) -> Lookup
+    where
+        CacheKey: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
+        // `no-cache` on a request forbids reuse without revalidation. m6 has no
+        // way to revalidate a stored entry in place, so the honest
+        // implementation is to miss and let the request reach the backend --
+        // which is revalidation, just without the conditional round trip.
+        if req.no_cache {
+            return Lookup::Miss;
+        }
+
+        let base = self.lookup(key);
+        let (resp, age, was_fresh) = match base {
+            Lookup::Fresh(r, a) => (r, a, true),
+            Lookup::Stale(r, a) => (r, a, false),
+            Lookup::Miss => return Lookup::Miss,
+        };
+
+        // max-age: the client will not accept a response older than this.
+        if let Some(max_age) = req.max_age {
+            if age.as_secs() > max_age {
+                return Lookup::Miss;
+            }
+        }
+
+        // min-fresh: it must still be fresh for at least this long. A response
+        // already stale trivially fails, whatever max-stale says -- the two
+        // directives are about different things and min-fresh is the stricter
+        // claim.
+        if let Some(min_fresh) = req.min_fresh {
+            let remaining = self.remaining_freshness(key).unwrap_or_default();
+            if remaining.as_secs() < min_fresh {
+                return Lookup::Miss;
+            }
+        }
+
+        if was_fresh {
+            return Lookup::Fresh(resp, age);
+        }
+
+        // Stale. Servable only if the client said it would take stale content,
+        // and within the bound it gave.
+        match req.max_stale {
+            Some(None) => Lookup::Stale(resp, age), // `max-stale` with no value: any
+            Some(Some(limit)) => {
+                let staleness = self.staleness(key).unwrap_or_default();
+                if staleness.as_secs() <= limit { Lookup::Stale(resp, age) } else { Lookup::Miss }
+            }
+            // No max-stale from the client. The stale-while-revalidate window
+            // is the ORIGIN's permission to serve stale, which is independent
+            // of the client's, so the existing behaviour stands.
+            None => Lookup::Stale(resp, age),
+        }
+    }
+
+    /// How much freshness an entry has left, or `None` if it is absent or
+    /// already stale.
+    fn remaining_freshness<Q>(&self, key: &Q) -> Option<std::time::Duration>
+    where
+        CacheKey: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
+        let map = self.map.read().ok()?;
+        let entry = map.get(key)?;
+        // No expiry at all means it never goes stale, so any min-fresh is met.
+        let Some(expires_at) = entry.expires_at else {
+            return Some(std::time::Duration::from_secs(u32::MAX as u64));
+        };
+        expires_at.checked_duration_since(std::time::Instant::now())
+    }
+
+    /// How long an entry has been stale, or `None` if absent or still fresh.
+    fn staleness<Q>(&self, key: &Q) -> Option<std::time::Duration>
+    where
+        CacheKey: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
+        let map = self.map.read().ok()?;
+        let entry = map.get(key)?;
+        let expires_at = entry.expires_at?;
+        std::time::Instant::now().checked_duration_since(expires_at)
+    }
+
     /// Look up an entry, distinguishing fresh from servable-but-stale.
     ///
     /// Expiry is evaluated here, on read, rather than swept by a background
@@ -830,6 +929,74 @@ fn status_is_storable(status: u16) -> bool {
 /// Deliberately only `no-store`. `no-cache` on a *request* means "revalidate
 /// before reuse", not "do not store", and treating the two alike would throw
 /// away hit rate for no correctness gain.
+/// What the CLIENT asked for, as opposed to what the origin permitted
+/// (RFC 9111 5.2.1).
+///
+/// None of these were honoured. The most visible consequence was that a browser
+/// reload -- which sends `Cache-Control: no-cache` -- got the cached copy back
+/// regardless, so a visitor had no way to force a refresh.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RequestDirectives {
+    /// Reuse requires revalidation first.
+    pub no_cache: bool,
+    /// Do not store the exchange.
+    pub no_store: bool,
+    /// Refuse a response older than this many seconds.
+    pub max_age: Option<u64>,
+    /// Accept a stale response. `Some(None)` is bare `max-stale` -- any
+    /// staleness; `Some(Some(n))` bounds it to n seconds.
+    pub max_stale: Option<Option<u64>>,
+    /// Require the response to stay fresh for at least this many seconds.
+    pub min_fresh: Option<u64>,
+    /// Answer from cache or not at all -- the caller returns 504 rather than
+    /// contacting the backend.
+    pub only_if_cached: bool,
+}
+
+impl RequestDirectives {
+    pub fn parse(req_headers: &[(String, String)]) -> Self {
+        let mut d = Self::default();
+        let mut saw_cache_control = false;
+        for (name, value) in req_headers {
+            if name.eq_ignore_ascii_case("cache-control") {
+                saw_cache_control = true;
+                // split_directives already handles quoted values and the
+                // commas that can appear inside them (`no-cache="Set-Cookie"`
+                // is legal), so this must not re-split on '='.
+                for (k, v) in split_directives(value) {
+                    let secs = || v.as_deref().and_then(|v| v.trim().parse::<u64>().ok());
+                    match k.to_ascii_lowercase().as_str() {
+                        "no-cache"       => d.no_cache = true,
+                        "no-store"       => d.no_store = true,
+                        "max-age"        => d.max_age = secs(),
+                        "min-fresh"      => d.min_fresh = secs(),
+                        // Bare `max-stale` means unlimited; with a value it is
+                        // bounded. The nested Option distinguishes them, which
+                        // a plain Option<u64> could not.
+                        "max-stale"      => d.max_stale = Some(secs()),
+                        "only-if-cached" => d.only_if_cached = true,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        // HTTP/1.0 clients, and a surprising number of current ones, send
+        // `Pragma: no-cache` instead. RFC 9111 5.4 says to honour it only when
+        // Cache-Control is absent, because Cache-Control is the authority when
+        // both are present.
+        if !saw_cache_control {
+            for (name, value) in req_headers {
+                if name.eq_ignore_ascii_case("pragma")
+                    && value.split(',').any(|t| t.trim().eq_ignore_ascii_case("no-cache"))
+                {
+                    d.no_cache = true;
+                }
+            }
+        }
+        d
+    }
+}
+
 pub fn request_permits_storage(req_headers: &[(String, String)]) -> bool {
     !CacheControl::parse(req_headers).no_store
 }
@@ -1973,5 +2140,137 @@ mod precondition_tests {
     fn no_preconditions_proceeds() {
         assert_eq!(eval(&[], "GET"), Precondition::Proceed);
         assert_eq!(eval(&[("accept", "text/html")], "GET"), Precondition::Proceed);
+    }
+}
+
+#[cfg(test)]
+mod request_directive_tests {
+    use super::*;
+
+    fn h(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+    fn parse(pairs: &[(&str, &str)]) -> RequestDirectives {
+        RequestDirectives::parse(&h(pairs))
+    }
+
+    /// The most visible consequence of not implementing these: a browser
+    /// reload sends `Cache-Control: no-cache`, and m6 served the cached copy
+    /// regardless, so a visitor had no way to force a refresh.
+    #[test]
+    fn no_cache_is_parsed() {
+        assert!(parse(&[("cache-control", "no-cache")]).no_cache);
+        assert!(parse(&[("Cache-Control", "No-Cache")]).no_cache);
+        assert!(!parse(&[("cache-control", "max-age=0")]).no_cache);
+    }
+
+    /// RFC 9111 5.4: honour Pragma only when Cache-Control is absent, because
+    /// Cache-Control is authoritative when both are present.
+    #[test]
+    fn pragma_is_the_fallback_not_an_override() {
+        assert!(parse(&[("pragma", "no-cache")]).no_cache);
+        // Cache-Control present and NOT saying no-cache: Pragma must not win.
+        assert!(!parse(&[("cache-control", "max-age=100"), ("pragma", "no-cache")]).no_cache);
+    }
+
+    #[test]
+    fn numeric_directives_are_parsed() {
+        let d = parse(&[("cache-control", "max-age=30, min-fresh=10")]);
+        assert_eq!(d.max_age, Some(30));
+        assert_eq!(d.min_fresh, Some(10));
+    }
+
+    /// Bare `max-stale` means unlimited staleness; with a value it is bounded.
+    /// A plain Option<u64> could not tell those apart, which is why the field
+    /// is nested.
+    #[test]
+    fn max_stale_distinguishes_bare_from_bounded() {
+        assert_eq!(parse(&[("cache-control", "max-stale")]).max_stale, Some(None));
+        assert_eq!(parse(&[("cache-control", "max-stale=60")]).max_stale, Some(Some(60)));
+        assert_eq!(parse(&[("cache-control", "max-age=5")]).max_stale, None);
+    }
+
+    #[test]
+    fn only_if_cached_and_no_store() {
+        assert!(parse(&[("cache-control", "only-if-cached")]).only_if_cached);
+        assert!(parse(&[("cache-control", "no-store")]).no_store);
+    }
+
+    /// A quoted value may contain a comma (`no-cache="Set-Cookie, X-Thing"` is
+    /// legal). Splitting naively on ',' would produce a bogus directive.
+    #[test]
+    fn quoted_values_do_not_split_the_directive_list() {
+        let d = parse(&[("cache-control", "no-cache=\"Set-Cookie, X-Thing\", max-age=30")]);
+        assert!(d.no_cache);
+        assert_eq!(d.max_age, Some(30));
+    }
+
+    /// An unparseable numeric value must not become a wrong number.
+    #[test]
+    fn malformed_numbers_are_ignored() {
+        assert_eq!(parse(&[("cache-control", "max-age=abc")]).max_age, None);
+        assert_eq!(parse(&[("cache-control", "min-fresh=")]).min_fresh, None);
+    }
+
+    #[test]
+    fn absent_means_all_defaults() {
+        let d = parse(&[("accept", "text/html")]);
+        assert_eq!(d, RequestDirectives::default());
+    }
+
+    // ── Behaviour against a real cache ───────────────────────────────────────
+
+    fn cache_with(cc: &str) -> (Cache, CacheKey) {
+        let cache = Cache::new();
+        let key = CacheKey::new("/p", None, "");
+        let resp = CachedResponse {
+            status: 200,
+            headers: std::sync::Arc::new(vec![("cache-control".into(), cc.into())]),
+            body: bytes::Bytes::from_static(b"body"),
+            hints: std::sync::Arc::new(vec![]),
+        };
+        cache.insert(key.clone(), resp);
+        (cache, key)
+    }
+
+    /// `no-cache` must force a miss so the request reaches the backend.
+    #[test]
+    fn no_cache_forces_a_miss_on_a_fresh_entry() {
+        let (cache, key) = cache_with("public, max-age=600");
+        assert!(matches!(cache.lookup(&key), Lookup::Fresh(..)), "precondition: normally a hit");
+        let d = parse(&[("cache-control", "no-cache")]);
+        assert!(matches!(cache.lookup_with(&key, &d), Lookup::Miss));
+    }
+
+    /// `max-age=0` means the client will accept nothing with any age, which in
+    /// practice forces revalidation on all but a same-instant hit.
+    #[test]
+    fn request_max_age_bounds_reuse() {
+        let (cache, key) = cache_with("public, max-age=600");
+        // Generous bound: still a hit.
+        let ok = parse(&[("cache-control", "max-age=600")]);
+        assert!(matches!(cache.lookup_with(&key, &ok), Lookup::Fresh(..)));
+    }
+
+    /// min-fresh larger than the remaining lifetime must miss.
+    #[test]
+    fn min_fresh_beyond_remaining_lifetime_misses() {
+        let (cache, key) = cache_with("public, max-age=60");
+        let d = parse(&[("cache-control", "min-fresh=3600")]);
+        assert!(matches!(cache.lookup_with(&key, &d), Lookup::Miss));
+        // ...and a modest requirement still hits.
+        let ok = parse(&[("cache-control", "min-fresh=5")]);
+        assert!(matches!(cache.lookup_with(&key, &ok), Lookup::Fresh(..)));
+    }
+
+    /// only-if-cached is not encoded in Lookup; the caller reads the flag and
+    /// returns 504. Asserted so the contract is pinned somewhere.
+    #[test]
+    fn only_if_cached_is_left_to_the_caller() {
+        let (cache, key) = cache_with("public, max-age=600");
+        let d = parse(&[("cache-control", "only-if-cached")]);
+        assert!(d.only_if_cached);
+        // A hit is still a hit — the flag only matters on a miss.
+        assert!(matches!(cache.lookup_with(&key, &d), Lookup::Fresh(..)));
     }
 }

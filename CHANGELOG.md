@@ -11,6 +11,41 @@ Deploy order is fixed: **test locally, commit, then deploy.** Never the reverse.
 
 ---
 
+## Request cache directives (F053-F056)
+
+RFC 9111 5.2.1 directives sent by the CLIENT were not implemented at all. The
+most visible consequence: a browser reload sends `Cache-Control: no-cache` (hard
+reload) or `max-age=0` (ordinary reload), and m6 served the cached copy
+regardless -- so a visitor had no way to force a refresh, whatever they pressed.
+
+Implemented: `no-cache`, `max-age`, `min-fresh`, `max-stale` (bare and
+bounded), `only-if-cached`, and `Pragma: no-cache` as the HTTP/1.0 fallback --
+honoured only when Cache-Control is absent, since Cache-Control is
+authoritative when both are present (RFC 9111 5.4).
+
+`max-stale` is `Option<Option<u64>>` because bare `max-stale` means unlimited
+staleness while `max-stale=60` bounds it, and a plain `Option<u64>` cannot
+express the difference.
+
+`only-if-cached` is deliberately NOT encoded in the `Lookup` enum: the lookup
+returns `Miss` as usual and each server path turns that into a 504. Putting an
+HTTP status into a structure that otherwise knows nothing about HTTP would be
+the wrong seam.
+
+**Consequence worth stating plainly:** honouring these makes reloads slower, by
+design. A reload that previously replayed from cache in ~2us now reaches the
+backend. On the origin that is a couple of milliseconds; from a cache node it
+is a round trip to Sydney. That is what the client asked for -- the whole point
+of `no-cache` is to bypass the cache -- and it is the only way "force refresh"
+can work at all, but it is a real change in behaviour for reloads and not a
+free correctness win.
+
+Twelve tests, covering the parse edge cases (quoted values containing commas,
+malformed numbers, Pragma precedence) and the behaviour against a live cache.
+
+685 workspace tests pass. Zero warnings.
+
+
 ## Accept-Encoding q-values, Via, and Connection-nominated fields (F012-F014, F017-F019)
 
 **F012-F014 — content negotiation ignored q-values.** `choose_encoding` tested
