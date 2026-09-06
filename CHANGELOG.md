@@ -11,6 +11,40 @@ Deploy order is fixed: **test locally, commit, then deploy.** Never the reverse.
 
 ---
 
+## m6-http: strict chunked decoding (F032-F034), and a missing body cap
+
+Every relaxation here was a way for this decoder and the next hop to disagree
+about where a body ends -- which on a reused connection means the remainder is
+read as the head of the following response.
+
+- **F032** the CRLF after each chunk's data is now required. It was skipped
+  only `if` it happened to be present, so a chunk whose data was followed by
+  anything else silently resynchronised onto the wrong offset and the rest of
+  the body was parsed as chunk headers.
+- **F033/F034** the trailer section is parsed instead of ignored. The decoder
+  returned at the zero-size chunk without confirming the message terminated, so
+  a body truncated mid-trailer was indistinguishable from a complete one.
+  Trailer field names are validated as tokens, so a malformed line is a parse
+  error rather than something mistaken for the terminator.
+
+Two further defects found while implementing, neither in the audit:
+
+- **Chunk sizes were not required to be plain hex.** `usize::from_str_radix`
+  accepts a leading `+`, so a chunk declared `+A` parsed as 10 -- the same trap
+  that had let `Content-Length: +5` through. Now checked digit by digit.
+- **The chunked path had no body cap.** `read_to_end` was unbounded, so while
+  the `Content-Length` path refused to allocate above `MAX_BACKEND_BODY`, a
+  chunked response could allocate without limit: the memory exhaustion that cap
+  exists to prevent, reachable by simply choosing chunked framing. Now bounded
+  by the same limit.
+
+Six tests. The first asserts that well-formed bodies -- including chunk-ext,
+uppercase hex, an empty body and a trailer section -- still decode, so the
+stricter parsing cannot have been achieved by rejecting valid messages.
+
+643 workspace tests pass. Zero warnings on Linux and macOS.
+
+
 ## m6-http: stop emitting two Content-Length headers
 
 Found by reading a live HEAD off a raw socket after deploying the response
