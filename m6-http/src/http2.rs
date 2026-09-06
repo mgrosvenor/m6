@@ -910,9 +910,15 @@ impl Http2Conn {
         let bodylen_str = body_len.to_string();
 
         let mut pairs: Vec<(&[u8], &[u8])> = vec![
-            (b":status",        status_str.as_bytes()),
-            (b"content-length", bodylen_str.as_bytes()),
+            (b":status", status_str.as_bytes()),
         ];
+        // RFC 9110 8.6: a 1xx/204 must not carry Content-Length, and a 304 must
+        // not unless it equals the 200's. m6 sent `content-length: 0` on every
+        // 304 -- the one value that actively misinforms, since it claims the
+        // representation is empty when it is not.
+        if crate::http11::status_may_have_content_length(status) {
+            pairs.push((b"content-length", bodylen_str.as_bytes()));
+        }
         let filtered: Vec<(String, String)> = headers.iter()
             .filter(|(k, _)| {
                 let kl = k.to_lowercase();
