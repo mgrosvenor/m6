@@ -11,6 +11,46 @@ Deploy order is fixed: **test locally, commit, then deploy.** Never the reverse.
 
 ---
 
+## m6-http: strict framing for backend HTTP/1.1 responses (F028-F031, F035)
+
+Message framing is the security boundary between this proxy and its backend: if
+the two disagree about where a response ends, the leftover bytes become the
+head of the next response on a reused connection. Each of these was a way to
+disagree, so each is now a hard error rather than a guess.
+
+- **F028** conflicting `Content-Length`. The parser kept the last value seen,
+  so a backend emitting two different lengths framed the response by whichever
+  came last. Now every value present -- across repeated fields and within a
+  comma-separated list -- must agree, or the response is refused. Repeated but
+  identical values still work; that is pinned by its own test so the fix cannot
+  reject legitimate traffic.
+- **F029** `Transfer-Encoding` together with `Content-Length` is refused. RFC
+  9112 6.1 forbids sending both, and a recipient that picks one is the classic
+  smuggling primitive because the next hop may pick the other.
+- **F030** `Transfer-Encoding` is a list and only the final coding frames the
+  message. Only a value that was literally `chunked` was recognised, so a valid
+  `gzip, chunked` was treated as unframed and the chunk envelope was returned
+  as though it were the body. A `Transfer-Encoding` not ending in `chunked`
+  now errors instead of falling back to read-to-EOF.
+- **F031** an unparseable `Content-Length` is refused. It became `None` via
+  `.ok()` and fell through to read-to-EOF, silently switching framing mode on
+  malformed input. Digits are now validated explicitly (`1*DIGIT`, RFC 9110
+  8.6) rather than left to `str::parse`, **which accepts a leading `+`** -- so
+  `Content-Length: +5` had been read as 5. That was caught by the test, not by
+  reading the code.
+- **F035** responses to HEAD, and 1xx/204/304, are bodyless whatever their
+  headers claim (RFC 9112 6.3). The reader did not know the request method and
+  blocked waiting for `Content-Length` bytes a correct backend never sends, so
+  every HEAD to a backend stalled until the read timeout. `read_response_for`
+  takes the method; `read_response` remains for callers that cannot know it.
+
+Ten tests. The bodyless rule is paired with a test that a GET with identical
+headers still reads its body, so it cannot have been implemented by ignoring
+bodies generally.
+
+632 workspace tests pass. Zero warnings on Linux and macOS.
+
+
 ## m6-http: refuse to forward requests that would smuggle HTTP/1.1 framing (F036/F094)
 
 Decoded HTTP/2 and HTTP/3 header fields were written into HTTP/1.1 request
