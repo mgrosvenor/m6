@@ -1,230 +1,153 @@
-# m6-http Benchmark Results
+# m6 benchmarks
 
-All benchmarks run on macOS (Darwin 24.6.0, Apple M4) against a loopback target.
-`127.0.0.1:8443` for TLS inbound, `127.0.0.1:8080` for H2C inbound.
-Each suite restarts all servers (m6-http, m6-html, m6-file, bench-url-backend) to avoid connection pollution.
-**n = 2000** requests per latency/path test; **10 s** window for throughput tests; **8 concurrent connections** for throughput.
+Every number here is reproducible from the command lines given. If a figure
+appears anywhere else in this repository without the conditions that produced
+it, treat the figure as wrong and this file as authoritative.
 
----
+## Why this file was rewritten (2026-09-06)
 
-## Socket-backend latency — GET `/` → Unix socket (µs)
+An external audit found the published throughput figures not credible, and it
+was right. The README carried **two tables claiming the same conditions** ("8
+concurrent connections, TLS, warm cache") with irreconcilable values:
 
-Single sequential connection, n=2000.
+| protocol | table A | table B | ratio |
+|---|---:|---:|---:|
+| HTTP/1.1 | 8,840 req/s | 11,857 req/s | 1.3× |
+| HTTP/2 | 28,797 req/s | 158,323 req/s | **5.5×** |
+| HTTP/3 | 61,748 req/s | 77,672 req/s | 1.3× |
 
-| Protocol | p0    | p25  | p50  | p75  | p99  | p100  | avg   | std  |
-|----------|------:|-----:|-----:|-----:|-----:|------:|------:|-----:|
-| HTTP/1.1 | 143.5 | 157.4| 164.0| 171.0| 264.2| 376.6 | 168.8 | 23.2 |
-| HTTP/2   |  15.2 |  18.6|  20.1|  25.5|  49.0| 148.9 |  24.8 | 10.2 |
-| HTTP/3   |  21.2 |  26.9|  28.5|  45.5|  67.1| 152.7 |  34.4 | 11.7 |
-| H2C      |  12.7 |  18.5|  21.3|  35.2|  58.0| 104.5 |  26.6 | 10.4 |
+At least one was wrong and a reader had no way to tell which. Neither recorded
+the commit, the hardware, the payload, or the command line, so neither could be
+checked. They have been deleted rather than reconciled.
 
-HTTP/2 and H2C are **~8× lower latency** at p50 than HTTP/1.1. H2C is marginally faster than
-HTTP/2 (21 µs vs 20 µs p50) — no TLS record framing on the hot path. The high p99/p100
-on H1 is macOS scheduler noise; the H2/H2C/H3 stacks amortise connection overhead across requests.
+**Measured on real hardware, they are both far too high** — see the results
+below. The most likely explanation is the methodology bug found while
+re-measuring, described next.
 
----
+## The methodology bug worth knowing about
 
-## Socket-backend path — cache-hit and cache-miss latency (µs)
+The harness defaults to `--concurrency 8`. On a 4-core machine the load
+generator and the server **share those cores**, so at concurrency 8 the client
+starves the server it is measuring. The symptom is not a plausible-looking
+lower number; it is instability. Two back-to-back runs of the identical command
+disagreed by **50×** on the same metric:
 
-Full dispatch path through m6-http → m6-html (template render) or m6-http → m6-file (static file).
+    cache-hit→m6-file (H2) p50:   89 µs   (run 1)
+                                4199 µs   (run 2)
 
-### HTTP/1.1
+At `--concurrency 2`, leaving cores for the server, the same metric reproduces
+within 15% and usually within 7%. **Every number below is at concurrency 2 for
+that reason.** A benchmark that cannot be repeated is not a measurement, and
+co-locating the load generator with the server is the constraint that makes
+this necessary — a separate load-generator host would allow higher concurrency
+and would report higher throughput.
 
-| Route                | p0    | p25   | p50   | p75   | p99   | avg   | std  |
-|----------------------|------:|------:|------:|------:|------:|------:|-----:|
-| cache-hit  → m6-html | 147.7 | 166.4 | 174.1 | 180.0 | 293.9 | 177.8 | 43.1 |
-| cache-hit  → m6-file | 134.7 | 163.4 | 170.9 | 176.5 | 198.9 | 169.6 | 12.5 |
-| cache-miss → m6-html | 158.4 | 193.7 | 199.6 | 204.9 | 234.1 | 200.5 | 31.3 |
-| cache-miss → m6-file | 186.8 | 200.2 | 206.1 | 212.5 | 430.2 | 215.3 |115.4 |
+Two other traps hit during the same session, both of which silently corrupt
+results:
 
-### HTTP/2
+- **The rate limiter counts.** The first run was full of `429`s because staging
+  inherits production's `requests_per_min = 1200`. It was measuring the rate
+  limiter, not the server. Raised for the run and restored afterwards.
+- **`/tail/hello.txt` 404s** on a normal site config; that suite is measuring an
+  error path unless the bench backend is running.
 
-| Route                | p0   | p25  | p50  | p75  | p99  | avg  | std  |
-|----------------------|-----:|-----:|-----:|-----:|-----:|-----:|-----:|
-| cache-hit  → m6-html | 15.1 | 20.3 | 22.6 | 33.2 | 60.8 | 26.6 |  9.7 |
-| cache-hit  → m6-file | 14.8 | 19.5 | 21.0 | 23.0 | 34.0 | 21.5 |  3.9 |
-| cache-miss → m6-html | 31.3 | 48.0 | 51.2 | 53.8 | 96.2 | 52.0 | 11.5 |
-| cache-miss → m6-file | 48.2 | 56.5 | 58.1 | 60.0 | 77.5 | 58.7 |  4.2 |
+## Conditions
 
-### HTTP/3
+| | |
+|---|---|
+| commit | `0a68cda` |
+| host | Vultr VPS, 4 vCPU Intel Xeon (Skylake, IBRS), 7 GB RAM |
+| OS | Ubuntu 26.04.1, kernel 7.0.0-30-generic |
+| toolchain | rustc 1.98.0, `cargo build --release` |
+| release profile | cargo defaults: `opt-level=3`, `lto=false`, `codegen-units=16`, `panic=unwind` |
+| TLS | rustls, TLS 1.3, self-signed cert, `--skip-verify` on the client |
+| topology | **client and server on the same host, over loopback** |
+| concurrency | 2 (see above) |
+| latency samples | 2000 per suite |
+| throughput window | 10 s |
+| CPU governor | not exposed on this VM — frequency scaling is not controlled |
 
-| Route                | p0   | p25  | p50  | p75  | p99  | avg  | std  |
-|----------------------|-----:|-----:|-----:|-----:|-----:|-----:|-----:|
-| cache-hit  → m6-html | 21.3 | 26.6 | 27.8 | 30.7 | 60.0 | 31.8 |  9.0 |
-| cache-hit  → m6-file | 19.5 | 26.2 | 27.8 | 31.2 | 51.8 | 29.2 |  5.5 |
-| cache-miss → m6-html | 35.5 | 53.5 | 56.6 | 60.1 | 89.0 | 57.6 |  8.8 |
-| cache-miss → m6-file | 49.3 | 60.2 | 62.0 | 64.8 | 95.6 | 64.0 |  6.8 |
+The server under test was the staging m6-http, serving the real
+mgrosvenor.com content, so the payloads are real pages rather than a synthetic
+fixture.
 
-### H2C (HTTP/2 cleartext — plain TCP, no TLS)
+    cargo build --release --bin m6-bench
+    ./target/release/m6-bench --skip-verify --addr 127.0.0.1:443 \
+        --concurrency 2 --duration 10
 
-| Route                | p0   | p25  | p50  | p75  | p99  | avg  | std  |
-|----------------------|-----:|-----:|-----:|-----:|-----:|-----:|-----:|
-| cache-hit  → m6-html | 13.9 | 21.3 | 23.6 | 28.7 | 47.1 | 26.6 |  7.8 |
-| cache-hit  → m6-file | 15.4 | 19.9 | 22.8 | 25.5 | 37.5 | 23.0 |  3.9 |
-| cache-miss → m6-html | 31.5 | 49.6 | 52.1 | 55.4 | 78.8 | 53.2 |  8.2 |
-| cache-miss → m6-file | 46.4 | 57.6 | 59.5 | 61.8 | 85.0 | 61.3 | 24.6 |
+## Results
 
-**Notes:**
-- m6-file cache-hit is consistently the fastest path at p50 (~21–23 µs H2/H2C).
-- H2C and HTTP/2 are essentially identical on cache misses — the backend socket RTT dominates
-  at ~52–58 µs, not the TLS framing cost.
-- H3 p75 on cache-hit paths has more variance than H2/H2C due to QUIC's UDP congestion control
-  and ACK coalescing, even on loopback.
+Two consecutive runs, both reported, so the spread is visible rather than
+averaged away.
 
----
+### Latency, µs (end-to-end, client-observed)
 
-## Socket-backend throughput — 8 parallel connections, 10 s
-
-| Protocol | req/s      |
-|----------|------------|
-| HTTP/1.1 |  11,739    |
-| HTTP/2   | 158,271    |
-| HTTP/3   |  73,960    |
-| H2C      | 118,554    |
-
-**Notes:**
-- **HTTP/2 is the throughput winner** at ~158 K req/s, benefiting from connection multiplexing
-  and `WINDOW_UPDATE` flow-control that allows continuous pipelining without stalling.
-- **H2C reaches ~119 K req/s** — H2 multiplexing without TLS encryption cost.
-- **HTTP/3 reaches ~74 K req/s**. QUIC's per-stream flow control and UDP processing overhead
-  through the quiche library reduce peak throughput relative to H2.
-- **HTTP/1.1 is limited to ~12 K req/s** — per-connection TLS handshake cost.
-
----
-
-## Protocol routing matrix — latency p50 (µs)
-
-Inbound protocol × outbound backend protocol. All 16 combinations measured.
-Outbound backends are `bench-url-backend` instances on loopback; m6-http forwards
-via persistent pooled connections (h2c/h2s) or per-request connections (http/https).
-n=2000, single sequential inbound connection.
-
-| Inbound ↓ \ Outbound → | http (h1) | https (h1+TLS) | h2c | h2s (h2+TLS) |
+| suite | p50 run 1 | p50 run 2 | p99 run 1 | p99 run 2 |
 |---|---:|---:|---:|---:|
-| **h1 (TLS)**  | 170 | 170 | 169 | 170 |
-| **h2 (TLS)**  |  19 |  19 |  19 |  19 |
-| **h3 (QUIC)** |  29 |  32 |  28 |  29 |
-| **h2c**       |  20 |  20 |  20 |  20 |
+| HTTP/1.1 cache-hit → m6-html | 687.8 | 679.1 | 1011.0 | 951.4 |
+| HTTP/1.1 cache-miss → m6-html | 4797.7 | 5063.1 | 6223.5 | 6526.4 |
+| **HTTP/2 cache-hit → m6-html** | **225.7** | **259.2** | 318.2 | 369.9 |
+| HTTP/2 cache-miss → m6-html | 4096.5 | 4159.8 | 5394.5 | 5321.6 |
+| HTTP/3 cache-hit → m6-html | 953.6 | 983.3 | 1344.5 | 1339.5 |
+| HTTP/3 cache-miss → m6-html | 4617.0 | 4329.3 | 5844.5 | 5525.9 |
 
-Full latency data (p0 / p25 / p50 / p75 / p99 µs):
+### Throughput, req/s
 
-| Suite             |   p0 |  p25 |  p50 |  p75 |  p99 |  avg |  std |
-|-------------------|-----:|-----:|-----:|-----:|-----:|-----:|-----:|
-| h1→http           |145.5 |166.9 |170.1 |174.0 |239.8 |172.4 | 14.1 |
-| h1→https          |148.9 |166.9 |170.0 |173.8 |189.0 |170.9 |  6.5 |
-| h1→h2c            |149.2 |166.3 |169.4 |173.2 |189.9 |172.7 |105.6 |
-| h1→h2s            |150.5 |167.3 |170.2 |173.8 |189.7 |171.1 |  7.1 |
-| h2→http           | 14.8 | 18.1 | 19.2 | 19.9 | 26.8 | 19.6 |  2.1 |
-| h2→https          | 14.2 | 18.1 | 19.1 | 19.9 | 27.0 | 19.6 |  2.3 |
-| h2→h2c            | 14.3 | 18.2 | 19.2 | 19.9 | 26.8 | 19.6 |  2.4 |
-| h2→h2s            | 14.5 | 18.1 | 19.1 | 20.0 | 26.5 | 19.6 |  2.3 |
-| h3→http           | 24.7 | 28.4 | 29.3 | 31.5 | 53.1 | 30.6 |  4.7 |
-| h3→https          | 23.1 | 29.0 | 31.5 | 33.2 | 52.8 | 31.7 |  4.8 |
-| h3→h2c            | 17.0 | 22.4 | 28.4 | 32.8 | 55.8 | 28.4 |  7.5 |
-| h3→h2s            | 21.1 | 26.6 | 28.6 | 31.0 | 54.1 | 29.6 |  5.5 |
-| h2c→http          | 14.4 | 19.7 | 20.3 | 20.9 | 26.5 | 20.5 |  2.3 |
-| h2c→https         | 14.7 | 19.8 | 20.4 | 21.0 | 30.1 | 22.6 | 91.7 |
-| h2c→h2c           | 15.5 | 19.6 | 20.2 | 20.9 | 30.3 | 20.5 |  2.8 |
-| h2c→h2s           | 15.7 | 19.5 | 20.2 | 20.7 | 27.2 | 20.3 |  2.0 |
+| protocol | run 1 | run 2 |
+|---|---:|---:|
+| HTTP/1.1 | 2085.1 | 1889.3 |
+| HTTP/2 | 7154.1 | 6711.2 |
+| HTTP/3 | 1030.3 | 1047.0 |
 
----
+## Reading these correctly
 
-## Protocol routing matrix — throughput (req/s)
+**The cache-hit latency here is not the same quantity as the "2.2 µs cache hit"
+measured in production, and conflating the two is probably how the original
+figures drifted.**
 
-8 concurrent inbound connections, 10 s window.
+- **~230 µs (H2 above)** is end-to-end, client-observed: TLS record processing
+  on both sides, loopback syscalls, the client's own work, and the server's.
+- **~2.2 µs** is m6's internal timer around the cache lookup and response
+  construction — reported by the running server as `hit_p50_ns` and confirmed
+  repeatedly on production.
 
-| Inbound ↓ \ Outbound → | http | https | h2c | h2s |
-|---|---:|---:|---:|---:|
-| **h1**  |  11,382 |  11,561 |  11,611 |  11,579 |
-| **h2**  | 165,169 | 160,637 | 158,858 | 154,497 |
-| **h3**  |  77,354 |  64,306 |  56,504 |  51,088 |
-| **h2c** | 116,583 | 177,032 | 176,310 | 163,046 |
+Both are true. The first is what a client experiences on this hardware; the
+second is what the cache costs. Quoting the second as though it were the first
+would be dishonest, and quoting the first as though it were the cache's cost
+understates it by two orders of magnitude.
 
-**Notes:**
-- **Outbound protocol does not affect h2/h2c latency** — at p50, h2→http, h2→https, h2→h2c,
-  and h2→h2s all measure 19 µs. The outbound connections are persistent and multiplexed;
-  forwarding cost is identical regardless of outbound TLS or framing overhead.
-- **h1 inbound is bottlenecked by new TLS connection per request** — all four outbound variants
-  sit at ~170 µs p50, matching h1→socket latency. The outbound backend is never the bottleneck.
-- **h3 throughput falls with TLS outbound backends** — h3→http: 77 K/s vs h3→h2s: 51 K/s.
-  QUIC's single-threaded event loop becomes CPU-bound when outbound TLS adds encryption work.
-- **h2c inbound beats h2 inbound on throughput** (177 K vs 165 K for http outbound) —
-  no inbound TLS record framing cost.
+**A cache miss costs ~4 ms**, dominated by the backend render, not by m6.
 
----
+**HTTP/2 is roughly 3× faster than HTTP/1.1** here on both latency and
+throughput, which is the one qualitative claim these numbers support well.
+HTTP/3 is the slowest on throughput in this environment; that is a real result
+on a loopback co-located test and should not be generalised to a real network,
+where QUIC's advantages are about loss and RTT rather than raw local
+throughput.
 
-## Event-loop utilisation — epoll idle vs. working
+## What is deliberately not claimed
 
-Measured using macOS `sample` (1 ms sampling interval, 5 s window) during the throughput
-tests. For this single-threaded server, `%CPU ≈ % time not blocked in kqueue/epoll_wait`.
+- **No comparison against nginx, H2O or LiteSpeed.** The previous README quoted
+  such comparisons without having run them like-for-like. Numbers taken from
+  other people's blog posts, on other hardware, with other payloads, are not a
+  comparison.
+- **No multi-core scaling figures.** Not measured.
+- **No claim about a real network.** Everything here is loopback.
+- **No "sub-millisecond" marketing claim.** The internal cache hit is
+  microseconds; what a visitor experiences over the internet is dominated by
+  RTT and is tens to hundreds of milliseconds. Both facts belong together or
+  neither should be quoted.
 
-| Protocol | Idle in kqueue | Working | Dominant cost |
-|----------|---------------:|--------:|---------------|
-| HTTP/1.1 | **18.5%** | **81.5%** | TLS handshake (HKDF/SHA-512) per new connection |
-| HTTP/2   |  **7.5%** | **92.5%** | TLS AES-GCM decrypt + encrypt (~56% combined) |
-| HTTP/3   |  **<0.1%** | **~100%** | UDP `sendto` (~24%) + QUIC packet build/encrypt (~30%) |
+## Criterion microbenchmarks
 
----
+Pure CPU cost, no I/O, and therefore stable and worth keeping:
 
-## Test configuration
+| operation | median |
+|---|---:|
+| `make_lookup_key` | 10.4 ns |
+| `cache_hit` | 21.5 ns |
+| `cache_miss` | 14.7 ns |
+| `stats_record` | 0.9 ns |
 
-### `system.toml`
-
-```toml
-[server]
-bind     = "127.0.0.1:8443"
-h2c_bind = "127.0.0.1:8080"
-tls_cert = "cert.pem"
-tls_key  = "key.pem"
-```
-
-### `site.toml` (routing + backends, abbreviated)
-
-```toml
-[[backend]]
-name    = "m6-html"
-sockets = "/tmp/m6-bench/m6-html-bench.sock"
-
-[[backend]]
-name    = "m6-file"
-sockets = "/tmp/m6-bench/m6-file-bench.sock"
-
-[[backend]]
-name = "url-http"
-url  = "http://127.0.0.1:18080"
-
-[[backend]]
-name            = "url-https"
-url             = "https://127.0.0.1:18443"
-tls_skip_verify = true
-
-[[backend]]
-name = "url-h2c"
-url  = "h2c://127.0.0.1:18081"
-
-[[backend]]
-name            = "url-h2s"
-url             = "h2s://127.0.0.1:18444"
-tls_skip_verify = true
-```
-
-Response body is ~107 bytes. TLS certificates are self-signed (rcgen), bench client uses
-`--skip-verify`. URL backends are `bench-url-backend` instances (all return a fixed 200 body
-with `Cache-Control: no-store`).
-
----
-
-## Environment
-
-| Item | Value |
-|------|-------|
-| Platform | macOS Darwin 24.6.0 (Apple M4) |
-| TLS target | `127.0.0.1:8443` (loopback) |
-| H2C target | `127.0.0.1:8080` (loopback, plain TCP) |
-| URL backends | `127.0.0.1:18080/18443/18081/18444` (loopback) |
-| TLS | rustls with ring provider |
-| HTTP/3 | quiche 0.26.1 (Cloudflare, boringssl-vendored) |
-| Socket backends | m6-html (m6-render), m6-file |
-| m6-http model | single-threaded epoll (kqueue on macOS) event loop |
-| bench concurrency | 8 parallel connections (throughput); 1 (latency/path) |
-| Date | 2026-03-20 |
+These were not re-measured in the 2026-09-06 pass; they are carried over and
+should be re-run on the build host before being quoted as current.
