@@ -429,6 +429,17 @@ fn event_loop(
 
                         if is_not_modified(&cached.headers, &req.headers) {
                             let mut headers = not_modified_headers(&cached.headers);
+                            // Vary and Date are applied AFTER the cache insert
+                            // (so `should_cache` sees the backend's own Vary),
+                            // which means the stored headers carry neither and
+                            // `not_modified_headers` has nothing to copy. Add
+                            // them here or the 304 goes out without the
+                            // metadata RFC 9110 15.4.5 requires -- and a client
+                            // updating its stored entry from it would lose the
+                            // knowledge that the response varies by encoding.
+                            set_vary_accept_encoding(&mut headers);
+                            set_age(&mut headers, age);
+                            set_date(&mut headers);
                             debug!(
                                 path = %req.path,
                                 status = 304,
@@ -559,6 +570,17 @@ fn event_loop(
 
                         if is_not_modified(&cached.headers, &req.headers) {
                             let mut headers = not_modified_headers(&cached.headers);
+                            // Vary and Date are applied AFTER the cache insert
+                            // (so `should_cache` sees the backend's own Vary),
+                            // which means the stored headers carry neither and
+                            // `not_modified_headers` has nothing to copy. Add
+                            // them here or the 304 goes out without the
+                            // metadata RFC 9110 15.4.5 requires -- and a client
+                            // updating its stored entry from it would lose the
+                            // knowledge that the response varies by encoding.
+                            set_vary_accept_encoding(&mut headers);
+                            set_age(&mut headers, age);
+                            set_date(&mut headers);
                             debug!(
                                 path = %req.path,
                                 status = 304,
@@ -1085,6 +1107,11 @@ fn handle_h3_request(
             );
             let html = analytics::is_html_response(&cached.headers);
             let mut headers = not_modified_headers(&cached.headers);
+            // Same as the h1/h2 304 paths: Vary and Date are added post-insert
+            // so the stored headers do not have them.
+            set_vary_accept_encoding(&mut headers);
+            set_age(&mut headers, age);
+            set_date(&mut headers);
             if let (Some(sc), true) = (set_cookie, html) {
                 headers.push(("Set-Cookie".to_string(), sc));
             }
@@ -1460,6 +1487,7 @@ fn handle_request(
     let mut outcome = handle_request_inner(req, client_ip, content_encoding, state, is_prefetch);
     if let RequestOutcome::Ready(status, ref mut headers, _, _, _) = outcome {
         set_vary_accept_encoding(headers);
+        set_date(headers);
         set_describedby_link(headers, &describedby);
         invalidate_after_unsafe_method(state, req, status, headers);
     }
@@ -1733,12 +1761,20 @@ fn handle_request_inner(
     let backend_start = std::time::Instant::now();
     let (status, mut resp_headers, body, conn_err) =
         match forward_to_backend(req, &backend_name, client_ip, state) {
-            Ok(http_resp) => {
+            Ok(mut http_resp) => {
                 // `request_permits_storage` is the request half of the
                 // decision (RFC 9111 5.2.1.5): a client that sent
                 // `Cache-Control: no-store` must not have its exchange
                 // retained and replayed to anyone else. Request directives
                 // were not parsed at all before this.
+                // Stamp Date BEFORE the cache decision so the STORED entry
+                // carries it. Applying it after the insert (as Vary is) meant
+                // a cache hit replayed headers with no Date at all, and adding
+                // a fresh one on the hit path would be worse: it would claim
+                // the response was generated just now while the Age header
+                // beside it said sixty seconds. Date is the generation time;
+                // it has to be captured at generation.
+                set_date(&mut http_resp.headers);
                 if cacheable
                     && request_permits_storage(&req.headers)
                     && should_cache(http_resp.status, &http_resp.headers)
@@ -2204,6 +2240,25 @@ fn invalidate_after_unsafe_method(
     }
 }
 
+/// Add `Date` if the response does not already carry one (RFC 9110 6.6.1, MUST).
+///
+/// m6 has a clock and generated no `Date` on anything. A recipient cannot
+/// compute a response's age without it, which is why `Age` alone is not
+/// enough: a downstream cache needs both to work out how stale something is.
+///
+/// Only ever added, never replaced. On the miss path this is the moment the
+/// response was generated, which is exactly what `Date` means; a cache HIT
+/// replays the stored headers and therefore carries the ORIGINAL date forward,
+/// which is required — restamping a cached response with the current time
+/// would make it look freshly generated and silently defeat the `Age` header
+/// sitting next to it.
+fn set_date(headers: &mut Vec<(String, String)>) {
+    if headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("date")) {
+        return;
+    }
+    headers.push(("date".to_string(), httpdate::fmt_http_date(std::time::SystemTime::now())));
+}
+
 /// Emit `Age` on a response served from cache (RFC 9111 5.1, MUST).
 ///
 /// Nothing emitted it at all, so a downstream cache had no way to tell how old
@@ -2276,6 +2331,7 @@ fn finalize_url_response(
     let describedby = state.config.site.describedby.clone();
     let mut r = finalize_url_response_inner(http_result, ctx, quic_port, state);
     set_vary_accept_encoding(&mut r.1);
+    set_date(&mut r.1);
     set_describedby_link(&mut r.1, &describedby);
     invalidate_after_unsafe_method(state, &ctx.req, r.0, &r.1);
     r
@@ -2338,8 +2394,11 @@ fn finalize_url_response_inner(
     }
 
     let (status, resp_headers, body, used_backend, is_connection_failure) = match http_result {
-        Ok(http_resp) => {
+        Ok(mut http_resp) => {
             // Same request-side gate as the synchronous path above.
+            // Same as the synchronous path: Date is stamped before the cache
+            // decision so the stored entry carries the generation time.
+            set_date(&mut http_resp.headers);
             if ctx.cacheable
                 && request_permits_storage(&ctx.req.headers)
                 && should_cache(http_resp.status, &http_resp.headers)

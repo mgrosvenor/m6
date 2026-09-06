@@ -11,6 +11,52 @@ Deploy order is fixed: **test locally, commit, then deploy.** Never the reverse.
 
 ---
 
+## 2026-09-06 — `Date` on every response, and complete 304 metadata
+
+### `Date` (F001)
+
+RFC 9110 6.6.1 MUST. m6 has a clock and generated no `Date` on anything. A
+recipient cannot compute a response's age without it, which is why the `Age`
+header added earlier was not sufficient on its own — the two are only useful
+together.
+
+**Stamped before the cache insert, not after.** This is the part worth
+recording. `Vary` is deliberately applied *after* the insert so `should_cache`
+sees the backend's own value; copying that pattern for `Date` produced a cache
+hit whose headers had no `Date` at all. Adding a fresh one on the hit path
+would have been worse still: it would claim the response was generated just now
+while the `Age` beside it said sixty seconds. `Date` means generation time, so
+it has to be captured at generation and stored.
+
+Verified end to end: MISS carries `Date` and no `Age`; a hit three seconds later
+carries the **same** `Date` and `Age: 3`.
+
+### 304 responses were missing their metadata (F004, F011, F062)
+
+RFC 9110 15.4.5: a 304 carries the metadata a 200 would have, so a client can
+update its stored response from it. m6 sent only `ETag`, `Last-Modified` and
+`Cache-Control`.
+
+`Vary` was the damaging omission: a client or shared cache updating its stored
+entry from such a 304 loses the knowledge that the response varies by
+`Accept-Encoding`, and can then reuse a brotli body for a gzip-only request.
+`Date` was missing too, leaving the recipient nothing to compute age from.
+
+Now carries `Vary`, `Date`, `Age`, `Expires` and `Content-Location` alongside
+the validators. `Content-Length` is deliberately **not** carried: RFC 9110 8.6
+permits it on a 304 only when it equals the 200's length, and getting that
+wrong is worse than omitting it.
+
+A second bug surfaced while fixing this and is worth naming: the 304 path reads
+from the *stored* headers, so it inherited the same gap — `Vary` and `Date`
+were absent there for the same reason. Adding them at the three 304
+construction sites was required as well as fixing the filter. A filter that
+copies fields correctly is no use when the source never had them.
+
+604 workspace tests pass across two consecutive runs, zero warnings.
+
+---
+
 ## 2026-09-06 — `Expires`-based freshness (F047)
 
 `Expires` was not consulted at all. A response using the older header — still

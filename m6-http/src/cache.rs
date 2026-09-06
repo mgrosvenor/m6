@@ -66,10 +66,30 @@ pub fn is_not_modified(
 /// cached copy, not the full header set (no Content-Type/Content-Encoding
 /// on a bodyless response).
 pub fn not_modified_headers(cached_headers: &[(String, String)]) -> Vec<(String, String)> {
+    // RFC 9110 15.4.5: a 304 carries the metadata a 200 would have sent, so a
+    // client can update its stored response from it.
+    //
+    // This kept only ETag, Last-Modified and Cache-Control. `Vary` in
+    // particular was dropped, which is the damaging one: a client or shared
+    // cache updating its stored entry from this 304 would lose the knowledge
+    // that the response varies by `Accept-Encoding` and could then reuse a
+    // brotli body for a gzip-only request. `Date` was missing too, so the
+    // recipient had nothing to compute age from.
+    //
+    // Content-Length is deliberately NOT carried: RFC 9110 8.6 allows it on a
+    // 304 only when it equals the 200's length, and getting that wrong is
+    // worse than omitting it. The serialisers set framing for a bodyless
+    // response themselves.
     cached_headers.iter()
         .filter(|(k, _)| {
             let k = k.to_ascii_lowercase();
-            k == "etag" || k == "last-modified" || k == "cache-control"
+            k == "etag"
+                || k == "last-modified"
+                || k == "cache-control"
+                || k == "vary"
+                || k == "date"
+                || k == "expires"
+                || k == "content-location"
         })
         .cloned()
         .collect()
@@ -1634,5 +1654,58 @@ mod expires_tests {
         .expect("stored");
         let ttl = e.saturating_duration_since(std::time::Instant::now());
         assert!(ttl.as_secs() > 3600, "should have fallen back to the heuristic, got {ttl:?}");
+    }
+}
+
+#[cfg(test)]
+mod not_modified_header_tests {
+    use super::*;
+
+    fn h(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    /// RFC 9110 15.4.5: a 304 carries the metadata a 200 would have, so the
+    /// client can update its stored response from it.
+    #[test]
+    fn a_304_carries_the_selected_representation_metadata() {
+        let out = not_modified_headers(&h(&[
+            ("etag", "\"abc\""),
+            ("last-modified", "Sat, 05 Sep 2026 12:00:00 GMT"),
+            ("cache-control", "public, max-age=60"),
+            ("vary", "Accept-Encoding"),
+            ("date", "Sat, 05 Sep 2026 12:00:01 GMT"),
+        ]));
+        let names: Vec<String> = out.iter().map(|(k, _)| k.to_ascii_lowercase()).collect();
+        for want in ["etag", "last-modified", "cache-control", "vary", "date"] {
+            assert!(names.contains(&want.to_string()), "304 dropped {want}");
+        }
+    }
+
+    /// The damaging omission. A client updating its stored entry from a 304
+    /// that lost `Vary` no longer knows the response varies by encoding, and
+    /// can then reuse a brotli body for a gzip-only request.
+    #[test]
+    fn vary_survives_onto_the_304() {
+        let out = not_modified_headers(&h(&[("vary", "Accept-Encoding"), ("etag", "\"x\"")]));
+        assert!(
+            out.iter().any(|(k, v)| k.eq_ignore_ascii_case("vary") && v == "Accept-Encoding"),
+            "Vary was dropped from the 304"
+        );
+    }
+
+    /// Content-bearing headers must not ride along on a bodyless response.
+    #[test]
+    fn content_headers_are_not_carried() {
+        let out = not_modified_headers(&h(&[
+            ("etag", "\"x\""),
+            ("content-length", "54361"),
+            ("content-type", "text/html"),
+            ("content-encoding", "br"),
+        ]));
+        let names: Vec<String> = out.iter().map(|(k, _)| k.to_ascii_lowercase()).collect();
+        for unwanted in ["content-length", "content-type", "content-encoding"] {
+            assert!(!names.contains(&unwanted.to_string()), "304 carried {unwanted}");
+        }
     }
 }
