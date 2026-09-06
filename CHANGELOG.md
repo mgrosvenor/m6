@@ -11,6 +11,41 @@ Deploy order is fixed: **test locally, commit, then deploy.** Never the reverse.
 
 ---
 
+## Corrected initial age (RFC 9111 4.2.3)
+
+Age was taken from the `Age` header alone. That trusts an upstream to have set
+it -- and an upstream cache that stores a response *without* emitting Age makes
+an hour-old response look brand new to us, and then to everyone downstream of
+us. Each hop that does this restarts the clock.
+
+The spec cross-checks against `Date`:
+
+    apparent_age          = max(0, now - Date)
+    corrected_initial_age = max(apparent_age, age_value)
+
+Taking the max is conservative in both directions: a missing or under-reported
+Age is corrected upward by Date, and a clock skewed so Date is in the future
+yields zero apparent age rather than a negative one, leaving Age to stand.
+
+`response_delay` (the third term in 4.2.3) is deliberately omitted, and that is
+an approximation rather than an oversight. Including it means threading each
+request's start time through all 31 insert sites. Measured, the backend round
+trip here is ~2ms against freshness lifetimes of 60s and 86400s -- 0.003% of
+the shorter one, and below the one-second resolution `Age` can express. It
+would matter for a cache fronting a slow or distant origin. It does not matter
+for this one, and the code says so and says when to revisit.
+
+Verified alongside `set_date`, which only adds a Date when absent, so a stored
+response keeps its original generation time and the age chain survives across
+hops -- the fix composes with what was already there rather than fighting it.
+
+Six tests, including the two directions of the max, clock skew, and a
+malformed Date (which must be ignored rather than read as the epoch, or every
+such response would appear ~56 years old and instantly stale).
+
+691 workspace tests pass. Zero warnings.
+
+
 ## Request cache directives (F053-F056)
 
 RFC 9111 5.2.1 directives sent by the CLIENT were not implemented at all. The
