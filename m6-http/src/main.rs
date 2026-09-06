@@ -407,7 +407,16 @@ fn event_loop(
                     let mut key_buf = [0u8; 512];
                     let lookup_key =
                         make_lookup_key(&req.path, req.query.as_deref(), enc_str, &mut key_buf);
-                    let looked_up = if cacheable { state.cache.lookup(lookup_key) } else { m6_http_lib::cache::Lookup::Miss };
+                    let req_cc = m6_http_lib::cache::RequestDirectives::parse(&req.headers);
+                    let looked_up = if cacheable { state.cache.lookup_with(lookup_key, &req_cc) } else { m6_http_lib::cache::Lookup::Miss };
+                    // RFC 9111 5.2.1.7: `only-if-cached` means answer from
+                    // cache or not at all. Going to the backend anyway would
+                    // defeat the one thing the client asked for.
+                    if req_cc.only_if_cached && matches!(looked_up, m6_http_lib::cache::Lookup::Miss) {
+                        let mut headers: Vec<(String, String)> = Vec::new();
+                        set_date(&mut headers);
+                        return RequestOutcome::Ready(504, headers, Vec::new(), "cache".to_string(), std::sync::Arc::new(vec![]));
+                    }
                     // Serve stale immediately and refresh behind the request:
                     // making this visitor wait on an origin round trip is the
                     // thing the cache exists to avoid. Costs one stale serve.
@@ -564,7 +573,16 @@ fn event_loop(
                     let mut key_buf = [0u8; 512];
                     let lookup_key =
                         make_lookup_key(&req.path, req.query.as_deref(), enc_str, &mut key_buf);
-                    let looked_up = if cacheable { state.cache.lookup(lookup_key) } else { m6_http_lib::cache::Lookup::Miss };
+                    let req_cc = m6_http_lib::cache::RequestDirectives::parse(&req.headers);
+                    let looked_up = if cacheable { state.cache.lookup_with(lookup_key, &req_cc) } else { m6_http_lib::cache::Lookup::Miss };
+                    // RFC 9111 5.2.1.7: `only-if-cached` means answer from
+                    // cache or not at all. Going to the backend anyway would
+                    // defeat the one thing the client asked for.
+                    if req_cc.only_if_cached && matches!(looked_up, m6_http_lib::cache::Lookup::Miss) {
+                        let mut headers: Vec<(String, String)> = Vec::new();
+                        set_date(&mut headers);
+                        return RequestOutcome::Ready(504, headers, Vec::new(), "cache".to_string(), std::sync::Arc::new(vec![]));
+                    }
                     // Serve stale now, refresh behind the request — see the
                     // HTTP/1.1 path above for the reasoning.
                     // A stale serve logs as STALE, not HIT: it is a hit for
@@ -1113,7 +1131,14 @@ fn handle_h3_request(
     let mut key_buf = [0u8; 512];
     let lookup_key = make_lookup_key(path_str, query_str, enc_str, &mut key_buf);
 
-    let looked_up = if cacheable { state.cache.lookup(lookup_key) } else { m6_http_lib::cache::Lookup::Miss };
+    let req_cc = m6_http_lib::cache::RequestDirectives::parse(&owned_headers_for_cc(&req.headers));
+    let looked_up = if cacheable { state.cache.lookup_with(lookup_key, &req_cc) } else { m6_http_lib::cache::Lookup::Miss };
+    if req_cc.only_if_cached && matches!(looked_up, m6_http_lib::cache::Lookup::Miss) {
+        let mut headers: Vec<(String, String)> = Vec::new();
+        set_date(&mut headers);
+        send_h3_response(stream_id, qconn, 504, &headers, Bytes::new(), false);
+        return;
+    }
     // Serve stale now, refresh behind the request — see the HTTP/1.1 path for
     // the reasoning.
     // See the HTTP/1.1 path: a stale serve is logged distinctly from a hit.
@@ -2317,6 +2342,27 @@ fn set_age(headers: &mut Vec<(String, String)>, age: std::time::Duration) {
 /// Ceiling on a buffered HTTP/3 request body. Mirrors the HTTP/2 limit so the
 /// two protocols cannot disagree about what is acceptable to accept.
 const MAX_H3_BODY: usize = 20 * 1024 * 1024;
+
+/// HTTP/3 carries its headers as `quiche::h3::Header`, while
+/// `RequestDirectives::parse` takes the `(String, String)` shape the other
+/// paths already use. Only the two directive-bearing headers are extracted, so
+/// this allocates a two-element vector at most rather than copying the whole
+/// header block on every request.
+fn owned_headers_for_cc(headers: &[quiche::h3::Header]) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter(|h| {
+            let n = h.name();
+            n.eq_ignore_ascii_case(b"cache-control") || n.eq_ignore_ascii_case(b"pragma")
+        })
+        .map(|h| {
+            (
+                String::from_utf8_lossy(h.name()).into_owned(),
+                String::from_utf8_lossy(h.value()).into_owned(),
+            )
+        })
+        .collect()
+}
 
 fn is_registered_method(method: &str) -> bool {
     matches!(
