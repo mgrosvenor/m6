@@ -11,6 +11,34 @@ Deploy order is fixed: **test locally, commit, then deploy.** Never the reverse.
 
 ---
 
+## m6-file: lengthen only the shared-cache lifetime for unversioned assets
+
+Unversioned assets (the webfont, `manifest.json`, any asset requested without
+its `?v=` hash) carried `max-age=60, stale-while-revalidate=60`. On a
+low-traffic origin the edge entry expired faster than requests arrived, so the
+cache re-fetched them from the backend roughly once a minute: measured at a 45%
+asset hit rate, with the webfont at 21 misses to 14 hits.
+
+Added `s-maxage=86400`. Deliberately **not** a longer `max-age` or
+`stale-while-revalidate`: both are honoured by browsers, and a browser cache
+cannot be invalidated, so raising either strands visitors on the previous file
+for a day. That was tried before and rolled back. `s-maxage` is defined for
+shared caches only (RFC 9110/9111 5.2.2.10) and is ignored by browsers, so it
+lengthens exactly the copy an operator can evict.
+
+Versioned `?v=<hash>` assets keep `max-age=31536000, immutable` and are
+unchanged.
+
+The rule moved into `cache_control_for()`. It had been an inline expression, and
+the tests asserted a *copy* of the condition pasted into the test module, so the
+emitted directives were never covered -- the browser-facing window could have
+been lengthened with every test still green. Tests now call the real function
+and assert the exact strings, plus the invariant that the long window appears
+only on `s-maxage`. Both were verified to fail against the previous directive
+and against the rolled-back mistake. 608 workspace tests pass; zero warnings on
+Linux and macOS.
+
+
 ## 2026-09-06 — `Date` on every response, and complete 304 metadata
 
 ### `Date` (F001)

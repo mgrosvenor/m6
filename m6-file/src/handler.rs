@@ -38,6 +38,35 @@ fn escapes_site_dir(fs_path: &Path, site_dir: &Path) -> bool {
     }
 }
 
+/// Pick the `Cache-Control` for an asset from its query string.
+///
+/// One function rather than an inline expression because the rule has two
+/// audiences that must not be conflated, and the tests need to assert the
+/// emitted strings rather than a re-implementation of the condition. The
+/// previous tests checked a `is_versioned` helper copied into the test module,
+/// so the directives themselves were never covered: the browser-facing window
+/// could have been lengthened without a single test failing.
+///
+/// A `?v=<hash>` URL addresses one exact version — changed bytes mean a changed
+/// hash and therefore a different URL — so it can be pinned for a year and
+/// marked `immutable`, which also stops a browser revalidating it on reload.
+///
+/// Everything else splits the two audiences deliberately:
+/// - `max-age=60` / `stale-while-revalidate=60` are honoured by BROWSERS, and
+///   no invalidation can reach a browser cache. They stay short so a deploy is
+///   visible promptly. Raising either one strands visitors on the old file.
+/// - `s-maxage=86400` is honoured ONLY by shared caches (RFC 9111 5.2.2.10).
+///   A browser ignores it. It lengthens just the edge's copy, which
+///   `invalidate-cache.sh` evicts on every deploy.
+fn cache_control_for(query: &str) -> &'static str {
+    let versioned = query.split('&').any(|p| p.starts_with("v=") && p.len() > 2);
+    if versioned {
+        "public, max-age=31536000, immutable"
+    } else {
+        "public, max-age=60, s-maxage=86400, stale-while-revalidate=60"
+    }
+}
+
 /// Handle a single HTTP request.
 ///
 /// Route param validation in `route.rs` (no `..`, safe chars only) prevents
@@ -187,15 +216,24 @@ pub fn handle_request<W: Write>(
     // server-side way to reach them: no invalidation can touch a browser cache.
     // Notably the webfont is still requested unversioned from inside
     // style.css's @font-face, so it must stay on the short window.
-    let versioned = req
-        .query
-        .split('&')
-        .any(|p| p.starts_with("v=") && p.len() > 2);
-    let cache_control = if versioned {
-        "public, max-age=31536000, immutable"
-    } else {
-        "public, max-age=60, stale-while-revalidate=60"
-    };
+    //
+    // `s-maxage=86400` is the exception, and the distinction is the whole point.
+    // The note above records that 86400 was tried and rolled back -- but what
+    // was raised then was `stale-while-revalidate`, which browsers honour, so it
+    // stranded visitors on the previous file for a day. `s-maxage` is defined
+    // for SHARED caches only (RFC 9111 5.2.2.10): a browser ignores it outright
+    // and keeps obeying the 60s `max-age` beside it. So this lengthens only the
+    // copy held by the edge -- the one copy `invalidate-cache.sh` can actually
+    // reach and evict on deploy.
+    //
+    // Without it the edge re-fetched every unversioned asset once a minute, and
+    // on a low-traffic site almost every visit arrived after expiry: measured at
+    // a 45% asset hit rate, with the webfont at 21 misses to 14 hits.
+    //
+    // This is only safe because a deploy evicts. deploy.sh invalidates by
+    // default for exactly this reason -- see the guard there before shortening
+    // that path.
+    let cache_control = cache_control_for(&req.query);
     if not_modified {
         let hdrs: Vec<(&str, &str)> = vec![
             ("Cache-Control", cache_control),
@@ -806,10 +844,13 @@ mod cache_control_tests {
     use crate::http::Request;
     use std::io::Cursor;
 
-    /// Mirrors the `versioned` test in handle_request. Kept as a helper here so
-    /// the rule is asserted directly rather than inferred from a full response.
+    use super::cache_control_for;
+
+    /// Was a copy of the rule living in the test module, so these tests passed
+    /// no matter what `handle_request` actually emitted. Now it calls the real
+    /// function.
     fn is_versioned(query: &str) -> bool {
-        query.split('&').any(|p| p.starts_with("v=") && p.len() > 2)
+        cache_control_for(query).contains("immutable")
     }
 
     fn query_of(url: &str) -> String {
@@ -847,4 +888,46 @@ mod cache_control_tests {
         }
     }
 
+    /// The exact strings, not just which branch was taken. These are the bytes
+    /// a browser and an edge cache each act on.
+    #[test]
+    fn emitted_directives_are_exact() {
+        assert_eq!(
+            cache_control_for(&query_of("/assets/css/style.css?v=56de07f9")),
+            "public, max-age=31536000, immutable"
+        );
+        assert_eq!(
+            cache_control_for(&query_of("/assets/fonts/montserrat-normal.woff2")),
+            "public, max-age=60, s-maxage=86400, stale-while-revalidate=60"
+        );
+    }
+
+    /// The load-bearing property of the unversioned directive, stated as its
+    /// own test so the reason survives.
+    ///
+    /// An edge cache can be emptied on deploy; a browser cache cannot be
+    /// reached at all. So the long window may only ever appear on `s-maxage`,
+    /// which browsers ignore. Raising `max-age` or `stale-while-revalidate` to
+    /// buy the same hit rate would instead strand every visitor on the previous
+    /// file for a day -- that was tried once and rolled back.
+    #[test]
+    fn unversioned_lengthens_only_the_edge_never_the_browser() {
+        let cc = cache_control_for(&query_of("/assets/css/style.css"));
+
+        assert!(cc.contains("s-maxage=86400"), "edge must hold it long: {cc}");
+        assert!(cc.contains("max-age=60"), "browser must stay short: {cc}");
+        assert!(
+            cc.contains("stale-while-revalidate=60"),
+            "browser-visible stale window must stay short: {cc}"
+        );
+
+        // The directive browsers obey must never carry the long value. Checked
+        // by stripping `s-maxage=86400` and asserting 86400 appears nowhere
+        // else -- a plain `contains` would be satisfied by s-maxage itself.
+        let browser_visible = cc.replace("s-maxage=86400", "");
+        assert!(
+            !browser_visible.contains("86400"),
+            "a browser-honoured directive carries the long window: {cc}"
+        );
+    }
 }
