@@ -75,7 +75,17 @@ verifiable. Phase 0 comes first because it converts the argument into a number.
 
 ## Measured: h2spec, 2026-09-09
 
-**146 tests, 97 passed, 49 failed** (h2spec v2.6.0 against staging, TLS,
+**Latest: 132 passed, 14 failed** (2026-09-09, after phases 1-2, the
+CONTINUATION fix and F-005). Sequence: 97 baseline, 114 pseudo-headers, 126
+state machine, 130 CONTINUATION unit fix, 132 F-005.
+
+Independent verification now runs alongside h2spec: nghttp2's `nghttp` client
+and `h2load` (200/200 succeeded, 0 errored), and `h3spec` for HTTP/3 at 33/49
+— of which 10 are in quiche rather than m6. h2spec alone proved insufficient
+in one direction too: it caught a CONTINUATION regression that every unit
+test missed.
+
+Original baseline: **146 tests, 97 passed, 49 failed** (h2spec v2.6.0 against staging, TLS,
 `-h 127.0.0.1 -p 443 -t -k`, 240s).
 
 Two-thirds pass with no conformance work ever done. The framing layer, HPACK
@@ -136,6 +146,50 @@ same trap invalidated the first benchmark run.
 Note when reading raw h2spec output: each failure line is emitted twice (the
 tool redraws it), so a naive `grep -c` reports exactly double. 98 counted means
 49 real.
+
+## External scan: F-005, 2026-09-09 — FIXED
+
+An external audit (an LLM-driven scan, run by a third party with the owner's
+knowledge) reported unbounded HTTP/2 header accumulation as High severity.
+Four defects, verified here against the real parser before touching anything.
+
+| # | defect | status when reported | now |
+|---|---|---|---|
+| 1 | No inbound `SETTINGS_MAX_FRAME_SIZE` check (RFC 9113 4.2) | live | fixed |
+| 2 | No cap on accumulated header block (CVE-2024-27316 class) | live | fixed |
+| 3 | Stray CONTINUATION accepted (6.10) | **already fixed** | fixed |
+| 4 | Flow-control window overflow (6.9.1) | live, worse than reported | fixed |
+
+**Verify before believing, in both directions.** The report's four PoCs were
+run verbatim first, each asserting the *buggy* behaviour. A and B passed,
+confirming both live. C failed — defect 3 had been closed hours earlier by
+the 5.1 state-machine work, and the scan was against a snapshot that
+predated it. D did not merely fail: it *panicked*, because the unchecked
+`+=` on an `i32` overflows in a debug build. That is a remotely reachable
+abort, which is worse than the "wraps and stalls" the report described.
+
+Neither accepting nor dismissing the report would have been right. One
+finding was stale, one was understated, two were exactly as described.
+
+**Why the flood mattered more than its class suggests.** Every other defence
+misses it. The per-IP rate limiter runs inside the request handler, and the
+handler is only reached once a request *completes*; a CONTINUATION sequence
+that never sets END_HEADERS never dispatches, so the limiter never counts it.
+The idle timeout is reset by each frame received, so a trickle holds the
+connection open while memory grows. One connection, unauthenticated, until
+the single-threaded server is OOM-killed. The cap is therefore checked on
+every CONTINUATION rather than at END_HEADERS — a check that only runs at the
+end of a block that never ends never runs at all.
+
+Seven regression guards, the PoCs inverted, plus two that a frame at exactly
+the limit and an ordinary WINDOW_UPDATE still work: a cap that breaks
+legitimate traffic is not a fix.
+
+**Still open from the same report:** Rapid Reset (CVE-2023-44487). Reset
+streams are removed from `streams`, and `MAX_CONCURRENT` is measured by map
+size, so the concurrency cap is bypassable. Partially mitigated — the
+`recently_reset` deque added with the state machine bounds reset *memory* at
+128 entries — but reset *rate* is still uncounted. Phase 6.
 
 ### Phase 0 — Measure (h2spec) — DONE, see above
 
