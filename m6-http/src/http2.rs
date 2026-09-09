@@ -63,11 +63,43 @@ const MAX_CONCURRENT:       u32 = 100;
 /// already enforce, so it never trips before their own check does.
 const MAX_H2_BODY: usize = 20 * 1024 * 1024;
 
+/// Largest inbound frame payload we will accept, RFC 9113 4.2.
+///
+/// The default is 16384 and applies unless the endpoint advertises a larger
+/// SETTINGS_MAX_FRAME_SIZE. We advertise exactly this, so the value is also
+/// what a conforming peer will honour.
+///
+/// Nothing checked this. `process_frame` read a 24-bit length and buffered
+/// whatever it named, so a single frame could be ~16 MiB -- a thousand times
+/// the limit we are obliged to enforce (F-005, defect 1).
+const MAX_FRAME_SIZE: usize = 16_384;
+
+/// Ceiling on one request's accumulated header block, across HEADERS plus
+/// every CONTINUATION that follows it.
+///
+/// This is the CONTINUATION-flood bound (CVE-2024-27316 class, F-005 defect
+/// 2). Header bytes accumulated with no limit at all: `MAX_H2_BODY` caps the
+/// request *body* and `MAX_REQUEST_BYTES` caps the HTTP/1.1 read buffer, and
+/// neither touches this buffer.
+///
+/// Why the flood evades every other defence: the per-IP rate limiter runs
+/// inside the request handler, and the handler is only reached once a request
+/// completes. A sequence that never sets END_HEADERS never dispatches, so the
+/// limiter never sees it, while the idle timeout is reset by each frame
+/// received. One connection, unauthenticated, grows memory until the process
+/// is OOM-killed.
+///
+/// 256 KiB is generous for real traffic (a large browser request is a few KiB)
+/// and matches the order other servers use.
+const MAX_HEADER_BLOCK: usize = 256 * 1024;
+
 const ERR_NO_ERROR:       u32 = 0x0;
 const ERR_PROTOCOL_ERROR: u32 = 0x1;
 const ERR_STREAM_CLOSED:  u32 = 0x5;
 const ERR_REFUSED_STREAM: u32 = 0x7;
 const ERR_FRAME_SIZE:     u32 = 0x6;
+const ERR_FLOW_CONTROL:   u32 = 0x3;
+const ERR_ENHANCE_YOUR_CALM: u32 = 0xb;
 
 /// How many recently-reset stream ids to remember. See `recently_reset`.
 const RESET_MEMORY: usize = 128;
@@ -422,6 +454,20 @@ impl Http2Conn {
         let flags     = self.recv_buf[4];
         let stream_id = u32::from_be_bytes(self.recv_buf[5..9].try_into().unwrap()) & 0x7fff_ffff;
 
+        // RFC 9113 4.2: a frame larger than the advertised SETTINGS_MAX_FRAME_SIZE
+        // is an error, and for HEADERS/CONTINUATION/SETTINGS/PUSH_PROMISE/
+        // WINDOW_UPDATE/RST_STREAM it MUST be a connection error, because a
+        // frame that cannot be parsed leaves the stream of frames itself
+        // unrecoverable.
+        //
+        // Checked BEFORE waiting for the payload, so an oversized frame is
+        // refused on its header rather than after buffering up to 16 MiB of it.
+        if length > MAX_FRAME_SIZE {
+            self.send_goaway(ERR_FRAME_SIZE);
+            self.phase = Phase::GoingAway;
+            return Err("frame exceeds SETTINGS_MAX_FRAME_SIZE");
+        }
+
         if self.recv_buf.len() < FRAME_HDR + length { return Ok(false); }
 
         let payload: Vec<u8> = self.recv_buf[FRAME_HDR..FRAME_HDR + length].to_vec();
@@ -650,9 +696,28 @@ impl Http2Conn {
         if payload.len() < 4 { return Err("WINDOW_UPDATE too short"); }
         let inc = u32::from_be_bytes(payload[0..4].try_into().unwrap()) & 0x7fff_ffff;
         if inc == 0 { return Err("zero WINDOW_UPDATE increment"); }
+        // RFC 9113 6.9.1: a flow-control window must not exceed 2^31-1. A
+        // WINDOW_UPDATE that would take it past that is a FLOW_CONTROL_ERROR --
+        // a connection error on stream 0, otherwise a stream error.
+        //
+        // This was an unchecked `+=` on an i32. In release it wrapped negative
+        // and silently stalled the stream forever; in debug it panicked on
+        // overflow, which is a remotely reachable abort.
+        const MAX_WINDOW: i64 = 0x7fff_ffff;
         if stream_id == 0 {
+            if self.conn_send_window as i64 + inc as i64 > MAX_WINDOW {
+                self.send_goaway(ERR_FLOW_CONTROL);
+                self.phase = Phase::GoingAway;
+                return Err("connection flow-control window overflow");
+            }
             self.conn_send_window += inc as i32;
         } else if let Some(s) = self.streams.get_mut(&stream_id) {
+            if s.send_window as i64 + inc as i64 > MAX_WINDOW {
+                self.push_frame(TYPE_RST_STREAM, 0, stream_id, &ERR_FLOW_CONTROL.to_be_bytes());
+                self.streams.remove(&stream_id);
+                self.note_reset(stream_id);
+                return Ok(());
+            }
             s.send_window += inc as i32;
         }
         // A larger window may unblock pending response data.
@@ -765,6 +830,11 @@ impl Http2Conn {
             stream.headers.extend(block);
             stream.headers_done = true;
         } else {
+            if self.header_block_buf.len() + header_block.len() > MAX_HEADER_BLOCK {
+                self.send_goaway(ERR_ENHANCE_YOUR_CALM);
+                self.phase = Phase::GoingAway;
+                return Err("header block exceeds MAX_HEADER_BLOCK");
+            }
             self.header_block_buf.extend_from_slice(header_block);
             self.continuation_stream_id = Some(stream_id);
         }
@@ -780,6 +850,14 @@ impl Http2Conn {
     where
         F: FnMut(&HttpRequest, &str) -> RequestOutcome,
     {
+        // The flood bound. Checked on every CONTINUATION, not merely at the end
+        // of the block: the whole point of the attack is that the block never
+        // ends, so a check that only runs at END_HEADERS never runs at all.
+        if self.header_block_buf.len() + payload.len() > MAX_HEADER_BLOCK {
+            self.send_goaway(ERR_ENHANCE_YOUR_CALM);
+            self.phase = Phase::GoingAway;
+            return Err("header block exceeds MAX_HEADER_BLOCK");
+        }
         self.header_block_buf.extend_from_slice(payload);
         if flags & FLAG_END_HEADERS != 0 {
             self.continuation_stream_id = None;
@@ -1259,6 +1337,9 @@ impl Http2Conn {
         let mut p = Vec::with_capacity(12);
         setting_bytes(&mut p, SETTING_MAX_CONCURRENT_STREAMS, MAX_CONCURRENT);
         setting_bytes(&mut p, SETTING_INITIAL_WINDOW_SIZE,    1_048_576);
+        // Advertised so the limit we enforce is the limit a conforming peer
+        // sends. Enforcing an unadvertised bound is how interop breaks.
+        setting_bytes(&mut p, SETTING_MAX_FRAME_SIZE,         MAX_FRAME_SIZE as u32);
         self.push_frame(TYPE_SETTINGS, 0, 0, &p);
     }
 
@@ -1991,5 +2072,125 @@ mod continuation_state_tests {
         f.extend(frame(TYPE_CONTINUATION, 0, 1, &[0x87]));
         f.extend(frame(TYPE_CONTINUATION, FLAG_END_HEADERS, 1, &[0x84]));
         assert!(feed(&f).is_ok(), "a multi-frame header block must be accepted");
+    }
+}
+
+#[cfg(test)]
+mod f005_regression {
+    //! F-005 regression guards. These are the report's own proofs-of-concept
+    //! with every assertion INVERTED: each one asserted the buggy behaviour and
+    //! passed against the vulnerable build, and each must now fail closed.
+    use super::*;
+    use super::frame_validation_tests::{frame, feed, open_stream};
+
+    fn drain_buf(c: &mut Http2Conn) -> Result<(), &'static str> {
+        let mut on_request = |_: &HttpRequest, _: &str| -> RequestOutcome {
+            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "t".to_string(),
+                                  std::sync::Arc::new(vec![]))
+        };
+        loop {
+            match c.process_frame(&mut on_request, "127.0.0.1") {
+                Ok(true) => continue,
+                Ok(false) => return Ok(()),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// F-005 defect 1. A 200 KB frame is twelve times the RFC 9113 4.2 default
+    /// of 16384, which applies because we advertise exactly that. It used to be
+    /// buffered in full; the length is a u24, so frames up to ~16 MiB were
+    /// accepted.
+    #[test]
+    fn oversized_frame_is_refused_before_buffering() {
+        let mut c = Http2Conn::new();
+        c.phase = Phase::Active;
+        c.recv_buf.extend_from_slice(&frame(TYPE_HEADERS, 0, 1, &vec![0u8; 200_000]));
+        assert!(drain_buf(&mut c).is_err(), "an oversized frame must be refused");
+        assert!(
+            c.header_block_buf.is_empty(),
+            "refused on its header: nothing may be buffered, found {} bytes",
+            c.header_block_buf.len()
+        );
+    }
+
+    /// A frame at exactly the limit is legal and must still work.
+    #[test]
+    fn a_frame_at_the_limit_is_still_accepted() {
+        let mut c = Http2Conn::new();
+        c.phase = Phase::Active;
+        c.recv_buf.extend_from_slice(&frame(TYPE_HEADERS, 0, 1, &vec![0u8; MAX_FRAME_SIZE]));
+        assert!(drain_buf(&mut c).is_ok(), "MAX_FRAME_SIZE exactly must be accepted");
+    }
+
+    /// F-005 defect 2, the CONTINUATION flood (CVE-2024-27316 class). The
+    /// original grew header_block_buf past 20 MiB without ever completing a
+    /// request, so the per-IP rate limiter -- which only runs once a request
+    /// dispatches -- never saw it.
+    #[test]
+    fn continuation_flood_is_bounded() {
+        let mut c = Http2Conn::new();
+        c.phase = Phase::Active;
+        c.recv_buf.extend_from_slice(&frame(TYPE_HEADERS, 0, 1, &[0u8; 16]));
+        let chunk = vec![0u8; 16_000];
+        for _ in 0..2000 {
+            c.recv_buf.extend_from_slice(&frame(TYPE_CONTINUATION, 0, 1, &chunk));
+        }
+        assert!(drain_buf(&mut c).is_err(), "the flood must be refused");
+        assert!(
+            c.header_block_buf.len() <= MAX_HEADER_BLOCK,
+            "buffer must never exceed the cap, reached {}",
+            c.header_block_buf.len()
+        );
+    }
+
+    /// F-005 defect 3. Already closed by the RFC 9113 5.1 state-machine work
+    /// earlier the same day; kept so it cannot silently reopen.
+    #[test]
+    fn stray_continuation_is_refused() {
+        let mut c = Http2Conn::new();
+        c.phase = Phase::Active;
+        for _ in 0..1000 {
+            c.recv_buf.extend_from_slice(&frame(TYPE_CONTINUATION, 0, 7, &[0u8; 16_000]));
+        }
+        assert!(drain_buf(&mut c).is_err(), "CONTINUATION with no open block must be refused");
+        assert!(c.header_block_buf.is_empty());
+    }
+
+    /// F-005 related observation. RFC 9113 6.9.1: a window over 2^31-1 is a
+    /// FLOW_CONTROL_ERROR. It was an unchecked `+=` on an i32 -- wrapping
+    /// negative in release (stalling the stream forever) and panicking in
+    /// debug, which is a remotely reachable abort.
+    #[test]
+    fn window_update_overflow_is_refused_not_wrapped() {
+        let mut f = open_stream(1);
+        for _ in 0..3 {
+            f.extend(frame(TYPE_WINDOW_UPDATE, 0, 1, &0x7fff_ffffu32.to_be_bytes()));
+        }
+        // Must not panic, and must not leave a negative window.
+        let _ = feed(&f);
+    }
+
+    #[test]
+    fn connection_window_overflow_is_a_connection_error() {
+        let mut c = Http2Conn::new();
+        c.phase = Phase::Active;
+        for _ in 0..3 {
+            c.recv_buf.extend_from_slice(
+                &frame(TYPE_WINDOW_UPDATE, 0, 0, &0x7fff_ffffu32.to_be_bytes()));
+        }
+        assert!(drain_buf(&mut c).is_err(), "connection window overflow must GOAWAY");
+        assert!(c.conn_send_window >= 0, "window must never wrap negative");
+    }
+
+    /// A normal WINDOW_UPDATE must keep working.
+    #[test]
+    fn ordinary_window_update_still_applies() {
+        let mut c = Http2Conn::new();
+        c.phase = Phase::Active;
+        let before = c.conn_send_window;
+        c.recv_buf.extend_from_slice(&frame(TYPE_WINDOW_UPDATE, 0, 0, &1000u32.to_be_bytes()));
+        assert!(drain_buf(&mut c).is_ok());
+        assert_eq!(c.conn_send_window, before + 1000);
     }
 }
