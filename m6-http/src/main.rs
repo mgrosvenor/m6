@@ -27,6 +27,7 @@ use m6_http_lib::config::{self, Config};
 use m6_http_lib::error::{self as error, ErrorMode};
 use m6_http_lib::forward::{self, HttpRequest, HttpResponse};
 use m6_http_lib::health;
+use m6_http_lib::stats::{Channel, Iface, Version as HttpVersion};
 use m6_http_lib::h2c_client::H2cClientPool;
 use m6_http_lib::h2s_client::H2sTlsClientPool;
 use m6_http_lib::pool::{self, PoolManager};
@@ -122,6 +123,13 @@ struct ServerState {
     h2s_pool: H2sTlsClientPool,
     /// Per-IP request throttle — general traffic, ahead of cache/routing.
     rate_limiter: RateLimiter,
+    /// Interface class of the public TLS/QUIC listener, and of the h2c
+    /// listener, computed once at startup from their bind addresses.
+    ///
+    /// Precomputed rather than derived per request: classification parses an
+    /// address, and this sits on the hot path for every single request.
+    tls_iface: Iface,
+    h2c_iface: Iface,
     /// When this process began serving, for the health endpoint's uptime.
     ///
     /// `Instant`, not `SystemTime`: it is monotonic, so a clock step (NTP
@@ -440,7 +448,10 @@ fn event_loop(
                     }
                     if let m6_http_lib::cache::Lookup::Fresh(cached, age) | m6_http_lib::cache::Lookup::Stale(cached, age) = looked_up {
                         let elapsed_ns = start.elapsed().as_nanos() as u64;
-                        state.stats.record(elapsed_ns, true, false);
+                        // Version from the REQUEST, not the listener: h1 and
+                        // h2 share this TLS listener via ALPN.
+                        let chan = Channel::new(HttpVersion::from_wire(&req.version), state.tls_iface);
+                        state.stats.record(elapsed_ns, true, false, chan);
 
                         let precond = evaluate_preconditions(&cached.headers, &req.headers, &req.method);
                         if precond == Precondition::Failed {
@@ -473,7 +484,7 @@ fn event_loop(
                             debug!(
                                 path = %req.path,
                                 status = 304,
-                                version = "HTTP/1.1",
+                                version = %req.version,
                                 backend = "cache",
                                 latency_ns = elapsed_ns,
                                 cache_hit = true,
@@ -499,7 +510,7 @@ fn event_loop(
                         debug!(
                             path = %req.path,
                             status = cached.status,
-                            version = "HTTP/1.1",
+                            version = %req.version,
                             backend = "cache",
                             latency_ns = elapsed_ns,
                             cache_hit = true,
@@ -545,7 +556,8 @@ fn event_loop(
                         // HTTP/3 already did this correctly, which is why the
                         // gap survived: any check of the h3 path looked fine.
                         let elapsed_ns = start.elapsed().as_nanos() as u64;
-                        state.stats.record(elapsed_ns, false, status >= 500);
+                        let chan = Channel::new(HttpVersion::from_wire(&req.version), state.tls_iface);
+                        state.stats.record(elapsed_ns, false, status >= 500, chan);
                     }
                     outcome
                 },
@@ -559,11 +571,12 @@ fn event_loop(
                     }
                     let elapsed_ns = ctx.start.elapsed().as_nanos() as u64;
                     let is_backend_error = status >= 500;
-                    state.stats.record(elapsed_ns, false, is_backend_error);
+                    let chan = Channel::new(HttpVersion::from_wire(&ctx.req.version), state.tls_iface);
+                    state.stats.record(elapsed_ns, false, is_backend_error, chan);
                     debug!(
                         path = %ctx.req.path,
                         status,
-                        version = "HTTP/1.1",
+                        version = %ctx.req.version,
                         backend = %backend_name,
                         latency_ns = elapsed_ns,
                         cache_hit = false,
@@ -636,7 +649,8 @@ fn event_loop(
                     }
                     if let m6_http_lib::cache::Lookup::Fresh(cached, age) | m6_http_lib::cache::Lookup::Stale(cached, age) = looked_up {
                         let elapsed_ns = start.elapsed().as_nanos() as u64;
-                        state.stats.record(elapsed_ns, true, false);
+                        let chan = Channel::new(HttpVersion::Http2, state.h2c_iface);
+                        state.stats.record(elapsed_ns, true, false, chan);
 
                         let precond = evaluate_preconditions(&cached.headers, &req.headers, &req.method);
                         if precond == Precondition::Failed {
@@ -739,7 +753,10 @@ fn event_loop(
                         // HTTP/3 already did this correctly, which is why the
                         // gap survived: any check of the h3 path looked fine.
                         let elapsed_ns = start.elapsed().as_nanos() as u64;
-                        state.stats.record(elapsed_ns, false, status >= 500);
+                        // h2c is HTTP/2 by definition; the interface class comes
+                        // from its bind address (the WireGuard tunnel here).
+                        let chan = Channel::new(HttpVersion::Http2, state.h2c_iface);
+                        state.stats.record(elapsed_ns, false, status >= 500, chan);
                     }
                     outcome
                 },
@@ -752,7 +769,8 @@ fn event_loop(
                     }
                     let elapsed_ns = ctx.start.elapsed().as_nanos() as u64;
                     let is_backend_error = status >= 500;
-                    state.stats.record(elapsed_ns, false, is_backend_error);
+                    let chan = Channel::new(HttpVersion::Http2, state.h2c_iface);
+                    state.stats.record(elapsed_ns, false, is_backend_error, chan);
                     debug!(
                         path = %ctx.req.path,
                         status,
@@ -1220,7 +1238,9 @@ fn handle_h3_request(
     }
     if let m6_http_lib::cache::Lookup::Fresh(cached, age) | m6_http_lib::cache::Lookup::Stale(cached, age) = looked_up {
         let elapsed_ns = start.elapsed().as_nanos() as u64;
-        state.stats.record(elapsed_ns, true, false);
+        // QUIC shares the public bind, so it is external like TLS.
+        let chan = Channel::new(HttpVersion::Http3, state.tls_iface);
+        state.stats.record(elapsed_ns, true, false, chan);
 
         let method_str = std::str::from_utf8(method_bytes).unwrap_or("GET");
         let precond = evaluate_preconditions(&cached.headers, &req.headers, method_str);
@@ -1344,7 +1364,8 @@ fn handle_h3_request(
 
             let elapsed_ns = start.elapsed().as_nanos() as u64;
             let is_backend_error = status >= 500;
-            state.stats.record(elapsed_ns, false, is_backend_error);
+            let chan = Channel::new(HttpVersion::Http3, state.tls_iface);
+            state.stats.record(elapsed_ns, false, is_backend_error, chan);
             debug!(
                 path = %path,
                 status,
@@ -3148,6 +3169,14 @@ fn run(args: Vec<String>) -> i32 {
         "m6-http started"
     );
 
+    // Classified before the struct literal, which moves `config`.
+    let tls_iface = Iface::for_bind(&config.server.bind);
+    let h2c_iface = config
+        .server
+        .h2c_bind
+        .as_deref()
+        .map(Iface::for_bind)
+        .unwrap_or(Iface::Internal);
     let mut state = ServerState {
         config,
         system_config_path: cli.system_config.clone(),
@@ -3162,6 +3191,8 @@ fn run(args: Vec<String>) -> i32 {
         background_pending: Vec::new(),
         h2c_pool: H2cClientPool::new(),
         h2s_pool: H2sTlsClientPool::new(),
+        tls_iface,
+        h2c_iface,
         rate_limiter: RateLimiter::new(),
         started: std::time::Instant::now(),
     };
