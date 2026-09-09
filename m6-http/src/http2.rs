@@ -513,7 +513,23 @@ impl Http2Conn {
             self.continuation_stream_id = None;
             let dec = &mut self.hpack_dec;
             let stream = self.streams.get_mut(&stream_id).unwrap();
-            decode_hpack(dec, &combined, &mut stream.headers)?;
+            // A second complete header block on a stream is a TRAILER section
+            // (RFC 9113 8.1). Decode it separately so it can be checked on its
+            // own: trailers carry no pseudo-headers, and merging first would
+            // make one indistinguishable from a legitimate leading field.
+            let is_trailers = stream.headers_done;
+            let mut block = Vec::new();
+            decode_hpack(dec, &combined, &mut block)?;
+            if is_trailers {
+                if let Some((name, _)) = block.iter().find(|(k, _)| k.starts_with(':')) {
+                    tracing::debug!(stream_id, field = %name, "h2: pseudo-header in trailers");
+                    self.push_frame(TYPE_RST_STREAM, 0, stream_id, &ERR_PROTOCOL_ERROR.to_be_bytes());
+                    self.streams.remove(&stream_id);
+                    return Ok(());
+                }
+            }
+            let stream = self.streams.get_mut(&stream_id).unwrap();
+            stream.headers.extend(block);
             stream.headers_done = true;
         } else {
             self.header_block_buf.extend_from_slice(header_block);
@@ -657,6 +673,24 @@ impl Http2Conn {
         // Stream error, not connection error: the fault is in this request's
         // header list, and the connection (and its HPACK dynamic table) stay
         // valid for other streams.
+        // RFC 9113 8.1.2.6: a declared content-length that disagrees with the
+        // DATA actually received is a malformed request. This is not only a
+        // conformance point -- a length mismatch between what a message claims
+        // and what it carries is the same class of ambiguity that makes request
+        // smuggling work, and here m6 is the one that would forward it on.
+        if let Some(declared) = headers.iter()
+            .find(|(k, _)| k == "content-length")
+            .and_then(|(_, v)| v.trim().parse::<usize>().ok())
+        {
+            if declared != body.len() {
+                tracing::debug!(stream_id, declared, actual = body.len(),
+                    "h2: content-length disagrees with DATA length");
+                self.push_frame(TYPE_RST_STREAM, 0, stream_id, &ERR_PROTOCOL_ERROR.to_be_bytes());
+                self.streams.remove(&stream_id);
+                return;
+            }
+        }
+
         if let Err(why) = validate_request_headers(&headers) {
             tracing::debug!(stream_id, reason = why, "h2: malformed request headers");
             self.push_frame(TYPE_RST_STREAM, 0, stream_id, &ERR_PROTOCOL_ERROR.to_be_bytes());
