@@ -82,6 +82,28 @@ use serde::Serialize;
 
 use crate::stats::StatsSnapshot;
 
+/// Backend name tagged onto a `/health` response.
+pub const HEALTH_BACKEND: &str = "health";
+/// Backend name tagged onto a `/perf` response.
+pub const PERF_BACKEND: &str = "perf";
+
+/// Whether a completed response came from the monitoring endpoints.
+///
+/// These must not be counted as site traffic. Both answer from local state
+/// and return `Ready`, so the cache-miss accounting on the serving paths
+/// would otherwise record every health check as a cache miss -- inflating
+/// requests_total with monitor polling, depressing the hit rate, and
+/// poisoning the miss latency percentiles with ~10us samples that never
+/// touched a backend.
+///
+/// That matters most for the signal the endpoint exists to give: if a
+/// 30-second monitor contributes to requests_total, then "the request count
+/// stopped moving" can no longer detect a traffic stall, because the monitor
+/// keeps it moving on its own.
+pub fn is_monitoring_endpoint(backend: &str) -> bool {
+    backend == HEALTH_BACKEND || backend == PERF_BACKEND
+}
+
 /// Compare a presented credential against the expected one without leaking
 /// the match position through timing.
 ///
@@ -515,5 +537,40 @@ mod token_file_tests {
             parsed.metrics_token, None,
             "an inline token must not be accepted from config"
         );
+    }
+}
+
+#[cfg(test)]
+mod monitoring_exclusion_tests {
+    use super::*;
+
+    /// Regression guard. The cache-miss accounting on the serving paths fires
+    /// on any `Ready` outcome, and /health and /perf both return Ready. Left
+    /// uncounted for, every health check was recorded as a cache miss: 10
+    /// checks moved requests_total by 11 on the live origin.
+    ///
+    /// That defeats the counter's purpose. A monitor polling every 30s would
+    /// keep requests_total rising through a total traffic stall, so "the
+    /// number stopped moving" would never fire.
+    #[test]
+    fn monitoring_endpoints_are_excluded_from_traffic_stats() {
+        assert!(is_monitoring_endpoint(HEALTH_BACKEND));
+        assert!(is_monitoring_endpoint(PERF_BACKEND));
+        assert!(is_monitoring_endpoint("health"));
+        assert!(is_monitoring_endpoint("perf"));
+    }
+
+    /// Real backends must still be counted. An over-broad match here would
+    /// silently stop recording actual site traffic, which is a worse failure
+    /// than the one above and much harder to notice.
+    #[test]
+    fn real_backends_are_still_counted() {
+        for backend in ["cache", "m6-html", "m6-file", "render-contact",
+                        "render-analytics", "origin", "method-check", ""] {
+            assert!(
+                !is_monitoring_endpoint(backend),
+                "{backend} is real traffic and must be counted"
+            );
+        }
     }
 }
