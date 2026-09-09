@@ -501,6 +501,24 @@ impl Http2Conn {
             return Err("CONTINUATION without a preceding HEADERS");
         }
 
+        // RFC 9113 6.x: is this frame the right SHAPE? Checked before the
+        // state machine, because a frame whose length or stream association is
+        // wrong cannot be reasoned about in any state.
+        match self.frame_shape_verdict(ftype, flags, stream_id, length) {
+            FrameVerdict::Allow => {}
+            FrameVerdict::ConnectionError(code) => {
+                self.send_goaway(code);
+                self.phase = Phase::GoingAway;
+                return Ok(true);
+            }
+            FrameVerdict::StreamError(code) => {
+                self.push_frame(TYPE_RST_STREAM, 0, stream_id, &code.to_be_bytes());
+                self.streams.remove(&stream_id);
+                self.note_reset(stream_id);
+                return Ok(true);
+            }
+        }
+
         // RFC 9113 5.1: is this frame legal on this stream, in this state?
         // Checked before dispatch so no handler has to re-derive it, and so
         // that a frame on an idle or closed stream never reaches code that
@@ -522,7 +540,19 @@ impl Http2Conn {
         match ftype {
             TYPE_DATA          => self.handle_data(stream_id, flags, &payload, on_request, client_ip)?,
             TYPE_HEADERS       => self.handle_headers(stream_id, flags, &payload, on_request, client_ip)?,
-            TYPE_PRIORITY      => {}
+            TYPE_PRIORITY      => {
+                // RFC 9113 5.3.1: "A stream cannot depend on itself. An
+                // endpoint MUST treat this as a stream error of type
+                // PROTOCOL_ERROR." Priority is deprecated in 9113 and the
+                // values are ignored, but the frame must still be validated
+                // rather than accepted and discarded.
+                let dep = u32::from_be_bytes(payload[0..4].try_into().unwrap()) & 0x7fff_ffff;
+                if dep == stream_id {
+                    self.push_frame(TYPE_RST_STREAM, 0, stream_id, &ERR_PROTOCOL_ERROR.to_be_bytes());
+                    self.streams.remove(&stream_id);
+                    self.note_reset(stream_id);
+                }
+            }
             TYPE_RST_STREAM    => {
                 // Marked Closed, then removed. Removal alone is not enough:
                 // `stream_state` derives Idle for any absent id above
@@ -557,6 +587,81 @@ impl Http2Conn {
 
     fn was_reset(&self, stream_id: u32) -> bool {
         self.recently_reset.contains(&stream_id)
+    }
+
+    /// Per-frame-type shape rules, RFC 9113 6.1-6.10.
+    ///
+    /// Each frame type declares whether it belongs to a stream or to the
+    /// connection, and several declare a fixed length. None of that was
+    /// checked: PRIORITY was accepted and discarded whatever it contained,
+    /// RST_STREAM and PING took any length, and SETTINGS took any stream id.
+    ///
+    /// One table rather than checks scattered through the handlers, so it can
+    /// be read against the RFC section by section -- and so a frame is
+    /// rejected before any handler sees a payload it cannot trust.
+    ///
+    /// Returns the verdict for the frame's SHAPE only. Stream state is a
+    /// separate question, answered by `frame_verdict`.
+    fn frame_shape_verdict(&self, ftype: u8, flags: u8, stream_id: u32, length: usize)
+        -> FrameVerdict
+    {
+        // Stream association. "MUST be associated with a stream" and its
+        // inverse are both connection errors of type PROTOCOL_ERROR: a frame
+        // on the wrong scope means the peer and we disagree about what the
+        // frame refers to, and nothing after it can be trusted.
+        let needs_stream = matches!(
+            ftype,
+            TYPE_DATA | TYPE_HEADERS | TYPE_PRIORITY | TYPE_RST_STREAM
+                | TYPE_PUSH_PROMISE | TYPE_CONTINUATION
+        );
+        let needs_connection = matches!(ftype, TYPE_SETTINGS | TYPE_PING | TYPE_GOAWAY);
+
+        if needs_stream && stream_id == 0 {
+            return FrameVerdict::ConnectionError(ERR_PROTOCOL_ERROR);
+        }
+        if needs_connection && stream_id != 0 {
+            return FrameVerdict::ConnectionError(ERR_PROTOCOL_ERROR);
+        }
+
+        // Fixed-length frames. 6.3 PRIORITY is 5 octets, 6.4 RST_STREAM is 4,
+        // 6.7 PING is 8, 6.9 WINDOW_UPDATE is 4.
+        //
+        // The error CLASS differs by type and the RFC is explicit about it:
+        // a malformed PRIORITY is a *stream* error (6.3) because the frame is
+        // self-contained and the stream can simply be reset, while a
+        // malformed RST_STREAM, PING or WINDOW_UPDATE is a *connection* error
+        // because the connection's shared state is what they act on.
+        let fixed: Option<(usize, bool)> = match ftype {
+            TYPE_PRIORITY     => Some((5, false)),  // stream error
+            TYPE_RST_STREAM   => Some((4, true)),
+            TYPE_PING         => Some((8, true)),
+            TYPE_WINDOW_UPDATE => Some((4, true)),
+            _ => None,
+        };
+        if let Some((want, connection_level)) = fixed {
+            if length != want {
+                return if connection_level {
+                    FrameVerdict::ConnectionError(ERR_FRAME_SIZE)
+                } else {
+                    FrameVerdict::StreamError(ERR_FRAME_SIZE)
+                };
+            }
+        }
+
+        // 6.5: SETTINGS length must be a multiple of 6, and an ACK must carry
+        // no payload at all. The multiple-of-6 rule was enforced inside the
+        // handler; the ACK rule was not enforced anywhere, because the
+        // handler returns early on ACK before looking at the length.
+        if ftype == TYPE_SETTINGS {
+            if flags & FLAG_ACK != 0 && length != 0 {
+                return FrameVerdict::ConnectionError(ERR_FRAME_SIZE);
+            }
+            if flags & FLAG_ACK == 0 && length % 6 != 0 {
+                return FrameVerdict::ConnectionError(ERR_FRAME_SIZE);
+            }
+        }
+
+        FrameVerdict::Allow
     }
 
     /// The state of a stream, including streams that are not in the map.
@@ -2192,5 +2297,105 @@ mod f005_regression {
         c.recv_buf.extend_from_slice(&frame(TYPE_WINDOW_UPDATE, 0, 0, &1000u32.to_be_bytes()));
         assert!(drain_buf(&mut c).is_ok());
         assert_eq!(c.conn_send_window, before + 1000);
+    }
+}
+
+#[cfg(test)]
+mod frame_shape_tests {
+    //! RFC 9113 6.1-6.10 frame shape rules. None of these were checked:
+    //! PRIORITY was accepted and discarded whatever it contained, RST_STREAM
+    //! and PING took any length, and SETTINGS took any stream id.
+    use super::*;
+    use super::frame_validation_tests::{frame, feed, open_stream};
+
+    fn verdict(ftype: u8, flags: u8, stream_id: u32, len: usize) -> FrameVerdict {
+        Http2Conn::new().frame_shape_verdict(ftype, flags, stream_id, len)
+    }
+
+    /// Frames that belong to a stream must not arrive on stream 0, and the
+    /// reverse. Both are connection errors: the peer and we disagree about
+    /// what the frame refers to, so nothing after it can be trusted.
+    #[test]
+    fn stream_association_is_enforced_both_ways() {
+        for ftype in [TYPE_DATA, TYPE_HEADERS, TYPE_PRIORITY, TYPE_RST_STREAM, TYPE_CONTINUATION] {
+            assert_eq!(
+                verdict(ftype, 0, 0, 5),
+                FrameVerdict::ConnectionError(ERR_PROTOCOL_ERROR),
+                "{ftype:#x} on stream 0 must be a connection error"
+            );
+        }
+        for ftype in [TYPE_SETTINGS, TYPE_PING, TYPE_GOAWAY] {
+            assert_eq!(
+                verdict(ftype, 0, 1, 8),
+                FrameVerdict::ConnectionError(ERR_PROTOCOL_ERROR),
+                "{ftype:#x} on a stream must be a connection error"
+            );
+        }
+    }
+
+    /// 6.3 PRIORITY is 5 octets and its error is a STREAM error, because the
+    /// frame is self-contained and the stream can simply be reset. 6.4/6.7/6.9
+    /// are connection errors, because they act on shared connection state.
+    #[test]
+    fn fixed_lengths_use_the_error_class_the_rfc_specifies() {
+        assert_eq!(verdict(TYPE_PRIORITY, 0, 1, 4), FrameVerdict::StreamError(ERR_FRAME_SIZE));
+        assert_eq!(verdict(TYPE_PRIORITY, 0, 1, 6), FrameVerdict::StreamError(ERR_FRAME_SIZE));
+        assert_eq!(verdict(TYPE_PRIORITY, 0, 1, 5), FrameVerdict::Allow);
+
+        for (ftype, want) in [(TYPE_RST_STREAM, 4usize), (TYPE_PING, 8), (TYPE_WINDOW_UPDATE, 4)] {
+            let sid = if ftype == TYPE_PING { 0 } else { 1 };
+            assert_eq!(
+                verdict(ftype, 0, sid, want + 1),
+                FrameVerdict::ConnectionError(ERR_FRAME_SIZE),
+                "{ftype:#x} with the wrong length is a connection error"
+            );
+            assert_eq!(verdict(ftype, 0, sid, want), FrameVerdict::Allow);
+        }
+    }
+
+    /// 6.5: a SETTINGS ACK carries no payload. The handler returns early on
+    /// ACK before looking at the length, so this was enforced nowhere.
+    #[test]
+    fn settings_ack_must_be_empty() {
+        assert_eq!(
+            verdict(TYPE_SETTINGS, FLAG_ACK, 0, 6),
+            FrameVerdict::ConnectionError(ERR_FRAME_SIZE)
+        );
+        assert_eq!(verdict(TYPE_SETTINGS, FLAG_ACK, 0, 0), FrameVerdict::Allow);
+    }
+
+    /// 6.5: a non-ACK SETTINGS payload is a whole number of 6-octet entries.
+    #[test]
+    fn settings_payload_is_a_multiple_of_six() {
+        assert_eq!(
+            verdict(TYPE_SETTINGS, 0, 0, 7),
+            FrameVerdict::ConnectionError(ERR_FRAME_SIZE)
+        );
+        for len in [0usize, 6, 12, 60] {
+            assert_eq!(verdict(TYPE_SETTINGS, 0, 0, len), FrameVerdict::Allow);
+        }
+    }
+
+    /// 5.3.1: a stream cannot depend on itself. PRIORITY is deprecated in
+    /// 9113 and its values are ignored, but the frame must still be validated
+    /// rather than accepted and discarded.
+    #[test]
+    fn a_stream_may_not_depend_on_itself() {
+        let mut f = open_stream(1);
+        let mut payload = 1u32.to_be_bytes().to_vec();   // depends on stream 1
+        payload.push(0);                                  // weight
+        f.extend(frame(TYPE_PRIORITY, 0, 1, &payload));
+        // Stream error, so the connection survives.
+        assert!(feed(&f).is_ok());
+    }
+
+    /// A well-formed PRIORITY on another stream stays legal.
+    #[test]
+    fn a_valid_priority_frame_is_accepted() {
+        let mut f = open_stream(1);
+        let mut payload = 3u32.to_be_bytes().to_vec();
+        payload.push(16);
+        f.extend(frame(TYPE_PRIORITY, 0, 1, &payload));
+        assert!(feed(&f).is_ok());
     }
 }
