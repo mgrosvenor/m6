@@ -129,6 +129,65 @@ impl Stats {
     }
 }
 
+/// A read-only view of the counters, for the health endpoint.
+///
+/// Cumulative fields are monotonic for the life of the process, which is what
+/// makes "the request count stopped increasing" a usable liveness signal.
+///
+/// The percentile fields are **not** cumulative. `maybe_emit` clears the
+/// latency reservoirs every 10 seconds, so these describe the current partial
+/// window only, which may hold very few samples or none. That is why
+/// `hit_samples`/`miss_samples` are reported alongside: a p99 drawn from three
+/// samples is noise, and a consumer that cannot see the sample count has no
+/// way to tell it apart from a real one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct StatsSnapshot {
+    pub requests_total: u64,
+    pub cache_hits_total: u64,
+    pub cache_misses_total: u64,
+    pub backend_errors_total: u64,
+    pub rps_peak: u64,
+    /// Samples backing the hit percentiles in the current window.
+    pub hit_samples: usize,
+    pub hit_p50_ns: u64,
+    pub hit_p99_ns: u64,
+    pub hit_max_ns: u64,
+    /// Samples backing the miss percentiles in the current window.
+    pub miss_samples: usize,
+    pub miss_p50_ns: u64,
+    pub miss_p99_ns: u64,
+    pub miss_max_ns: u64,
+}
+
+impl Stats {
+    /// Snapshot without mutating anything.
+    ///
+    /// Takes `&self` deliberately. `maybe_emit` both reports and resets; if
+    /// the health endpoint shared that path, every scrape would clear the
+    /// window and the periodic stats log would report only the traffic that
+    /// arrived between scrapes. A monitor polling every 30 seconds would
+    /// silently gut the operational logging it exists to complement.
+    pub fn snapshot(&self) -> StatsSnapshot {
+        let (_, hp50, hp99, hmax) = percentiles(&self.hit_samples, self.hit_count);
+        let (_, mp50, mp99, mmax) = percentiles(&self.miss_samples, self.miss_count);
+        StatsSnapshot {
+            requests_total: self.requests_total,
+            cache_hits_total: self.cache_hits_total,
+            cache_misses_total: self.cache_misses_total,
+            backend_errors_total: self.backend_errors_total,
+            rps_peak: self.rps_peak,
+            hit_samples: self.hit_count,
+            hit_p50_ns: hp50,
+            hit_p99_ns: hp99,
+            hit_max_ns: hmax,
+            miss_samples: self.miss_count,
+            miss_p50_ns: mp50,
+            miss_p99_ns: mp99,
+            miss_max_ns: mmax,
+        }
+    }
+}
+
 /// Sort the first `n` samples and return exact (p0, p50, p99, p100).
 fn percentiles(samples: &[u64; RESERVOIR], n: usize) -> (u64, u64, u64, u64) {
     if n == 0 { return (0, 0, 0, 0); }

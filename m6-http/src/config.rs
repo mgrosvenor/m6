@@ -184,6 +184,22 @@ pub struct HealthConfig {
     /// of being silently shadowed by it.
     #[serde(default = "default_health_path")]
     pub path: String,
+    /// Bearer token gating the metrics block (counters + latency
+    /// percentiles). `None` -- the default -- means metrics are never served,
+    /// so forgetting to configure it fails closed.
+    ///
+    /// A SECRET. It belongs in the per-node system config on the box, never
+    /// in a site.toml that is committed. Templates carry a placeholder only.
+    #[serde(default)]
+    pub metrics_token: Option<String>,
+    /// Path for the metrics endpoint. Separate from `path` on purpose: the
+    /// health check must stay constant-cost, and percentiles are not.
+    #[serde(default = "default_perf_path")]
+    pub perf_path: String,
+}
+
+fn default_perf_path() -> String {
+    "/perf".to_string()
 }
 
 fn default_health_path() -> String {
@@ -192,7 +208,12 @@ fn default_health_path() -> String {
 
 impl Default for HealthConfig {
     fn default() -> Self {
-        HealthConfig { enabled: default_true(), path: default_health_path() }
+        HealthConfig {
+            enabled: default_true(),
+            path: default_health_path(),
+            metrics_token: None,
+            perf_path: default_perf_path(),
+        }
     }
 }
 

@@ -1666,6 +1666,30 @@ fn handle_request_inner(
         );
     }
 
+    // ── Metrics endpoint, deliberately a separate path from /health ─────────
+    // Percentiles mean sorting a 4096-sample reservoir. Serving them from the
+    // health path behind a conditional would leave the expensive branch one
+    // misconfigured header away from being taken on every check forever, so
+    // the split is what keeps the health answer cheap. `snapshot` is passed
+    // as a closure and is not called until authorisation passes.
+    if state.config.health.enabled && req.path == state.config.health.perf_path {
+        let outcome = health::PerfReport::build(
+            &state.config.node.name,
+            state.started.elapsed().as_secs(),
+            &req.headers,
+            state.config.health.metrics_token.as_deref(),
+            || state.stats.snapshot(),
+        );
+        let (code, headers, body) = outcome.into_response();
+        return RequestOutcome::Ready(
+            code,
+            headers,
+            body,
+            "perf".to_string(),
+            std::sync::Arc::new(vec![]),
+        );
+    }
+
     // The custom-error render route takes `status`/`from` (and optional
     // `route`/`backend`/`detail`) straight from its query string and renders
     // them into the page — safe when `dispatch_custom_error_async`/
