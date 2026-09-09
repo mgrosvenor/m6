@@ -13,6 +13,21 @@ const RESERVOIR: usize = 4096;
 /// 384 KB to answer a question that a few hundred samples already answers.
 const CHANNEL_RESERVOIR: usize = 512;
 
+/// Whether a response was produced by m6-http itself rather than fetched
+/// from a backend.
+///
+/// These names are set at the point the response is constructed, so they are
+/// the authoritative signal that no backend was involved. `cache` is included
+/// deliberately: a replayed 5xx is a stored copy of an old backend failure,
+/// not a new one, and counting it again would inflate the total every time
+/// the entry is served.
+fn is_self_generated(backend: &str) -> bool {
+    matches!(
+        backend,
+        "cache" | "method-check" | "health" | "perf" | "error" | "error-local"
+    )
+}
+
 /// HTTP version actually used, taken from the request rather than assumed.
 ///
 /// It has to be per-request, not per-listener: HTTP/1.1 and HTTP/2 share the
@@ -280,8 +295,17 @@ impl Stats {
         cache_hit: bool,
         status: u16,
         channel: Channel,
+        backend: &str,
     ) {
-        let backend_error = status >= 500;
+        // A 5xx that m6-http generated itself is not a BACKEND error, and
+        // counting it as one makes the metric cry wolf.
+        //
+        // Observed for nine consecutive hours: a bot sending an unrecognised
+        // verb gets 501 Not Implemented from method validation, no backend is
+        // ever contacted, and `backend_errors_total` rose on all three nodes.
+        // An operator watching that counter would go looking for a failing
+        // renderer that was never involved.
+        let backend_error = status >= 500 && !is_self_generated(backend);
         // 100..=599. Anything outside is not a status this server emits;
         // counting it would mean trusting an index derived from it.
         if (100..600).contains(&status) {
@@ -496,9 +520,9 @@ mod tests {
     #[test]
     fn test_record_and_counts() {
         let mut s = Stats::new();
-        s.record(50, true, 200, Channel::new(Version::Http11, Iface::External));
-        s.record(200, false, 200, Channel::new(Version::Http11, Iface::External));
-        s.record(800, false, 200, Channel::new(Version::Http11, Iface::External));
+        s.record(50, true, 200, Channel::new(Version::Http11, Iface::External), "m6-html");
+        s.record(200, false, 200, Channel::new(Version::Http11, Iface::External), "m6-html");
+        s.record(800, false, 200, Channel::new(Version::Http11, Iface::External), "m6-html");
         assert_eq!(s.requests_total, 3);
         assert_eq!(s.cache_hits_total, 1);
         assert_eq!(s.cache_misses_total, 2);
@@ -513,7 +537,7 @@ mod tests {
     fn test_exact_percentiles() {
         let mut s = Stats::new();
         // 100 hit samples: 1..=100 ns
-        for i in 1u64..=100 { s.record(i, true, 200, Channel::new(Version::Http11, Iface::External)); }
+        for i in 1u64..=100 { s.record(i, true, 200, Channel::new(Version::Http11, Iface::External), "m6-html"); }
         let (p0, p50, p99, p100) = percentiles(&s.hit_samples, s.hit_count);
         assert_eq!(p0,   1);
         assert_eq!(p50,  50);
@@ -525,7 +549,7 @@ mod tests {
     fn test_record_overhead() {
         let mut s = Stats::new();
         let start = Instant::now();
-        for i in 1..=1000u64 { s.record(i, i % 2 == 0, 200, Channel::new(Version::Http11, Iface::External)); }
+        for i in 1..=1000u64 { s.record(i, i % 2 == 0, 200, Channel::new(Version::Http11, Iface::External), "m6-html"); }
         let elapsed = start.elapsed();
         #[cfg(debug_assertions)]
         let threshold_us = 1_000;
@@ -588,10 +612,10 @@ mod channel_tests {
         let tunnel_h2 = Channel::new(Version::Http2, Iface::Internal);
 
         // A fast public cache hit.
-        stats.record(3_000, true, 200, public_h2);
+        stats.record(3_000, true, 200, public_h2, "m6-html");
         // Two slow intercontinental misses over the tunnel.
-        stats.record(200_000_000, false, 200, tunnel_h2);
-        stats.record(210_000_000, false, 404, tunnel_h2);
+        stats.record(200_000_000, false, 200, tunnel_h2, "m6-html");
+        stats.record(210_000_000, false, 404, tunnel_h2, "m6-html");
 
         let snap = stats.snapshot();
         assert_eq!(snap.requests_total, 3);
@@ -616,7 +640,7 @@ mod channel_tests {
     fn backend_errors_are_attributed_to_their_channel() {
         let mut stats = Stats::new();
         let h1 = Channel::new(Version::Http11, Iface::External);
-        stats.record(1_000_000, false, 502, h1);
+        stats.record(1_000_000, false, 502, h1, "m6-html");
         let snap = stats.snapshot();
         assert_eq!(snap.backend_errors_total, 1);
         let c = snap.channels.iter().find(|c| c.channel == "http/1.1/external").unwrap();
@@ -626,7 +650,7 @@ mod channel_tests {
     #[test]
     fn silent_channels_are_omitted_not_zero_filled() {
         let mut stats = Stats::new();
-        stats.record(1_000, true, 200, Channel::new(Version::Http3, Iface::External));
+        stats.record(1_000, true, 200, Channel::new(Version::Http3, Iface::External), "m6-html");
         let snap = stats.snapshot();
         assert_eq!(snap.channels.len(), 1, "a node reports only what it serves");
         assert_eq!(snap.channels[0].channel, "http/3/external");
@@ -644,9 +668,9 @@ mod status_code_tests {
     #[test]
     fn only_codes_actually_emitted_are_reported() {
         let mut s = Stats::new();
-        for _ in 0..5 { s.record(1_000, true, 200, ch()); }
-        for _ in 0..3 { s.record(2_000, false, 404, ch()); }
-        s.record(3_000, true, 304, ch());
+        for _ in 0..5 { s.record(1_000, true, 200, ch(), "m6-html"); }
+        for _ in 0..3 { s.record(2_000, false, 404, ch(), "m6-html"); }
+        s.record(3_000, true, 304, ch(), "m6-html");
 
         let snap = s.snapshot();
         // Exactly the three codes seen -- not 500 rows of zeros around them.
@@ -662,11 +686,11 @@ mod status_code_tests {
     #[test]
     fn backend_errors_are_derived_from_the_status() {
         let mut s = Stats::new();
-        s.record(1_000, false, 200, ch());
-        s.record(1_000, false, 404, ch());
-        s.record(1_000, false, 499, ch());
-        s.record(1_000, false, 500, ch());
-        s.record(1_000, false, 503, ch());
+        s.record(1_000, false, 200, ch(), "m6-html");
+        s.record(1_000, false, 404, ch(), "m6-html");
+        s.record(1_000, false, 499, ch(), "m6-html");
+        s.record(1_000, false, 500, ch(), "m6-html");
+        s.record(1_000, false, 503, ch(), "m6-html");
         let snap = s.snapshot();
         assert_eq!(snap.backend_errors_total, 2, "only 5xx counts as a backend error");
         assert_eq!(snap.status_counts.get(&499), Some(&1));
@@ -677,10 +701,10 @@ mod status_code_tests {
     #[test]
     fn out_of_range_statuses_do_not_index_the_table() {
         let mut s = Stats::new();
-        s.record(1_000, false, 0, ch());
-        s.record(1_000, false, 99, ch());
-        s.record(1_000, false, 600, ch());
-        s.record(1_000, false, u16::MAX, ch());
+        s.record(1_000, false, 0, ch(), "m6-html");
+        s.record(1_000, false, 99, ch(), "m6-html");
+        s.record(1_000, false, 600, ch(), "m6-html");
+        s.record(1_000, false, u16::MAX, ch(), "m6-html");
         let snap = s.snapshot();
         assert!(snap.status_counts.is_empty(), "no bogus code may be counted");
         // The request itself is still counted; only the code is discarded.
@@ -690,10 +714,53 @@ mod status_code_tests {
     #[test]
     fn boundaries_are_inclusive_at_100_and_599() {
         let mut s = Stats::new();
-        s.record(1_000, false, 100, ch());
-        s.record(1_000, false, 599, ch());
+        s.record(1_000, false, 100, ch(), "m6-html");
+        s.record(1_000, false, 599, ch(), "m6-html");
         let snap = s.snapshot();
         assert_eq!(snap.status_counts.get(&100), Some(&1));
         assert_eq!(snap.status_counts.get(&599), Some(&1));
+    }
+}
+
+#[cfg(test)]
+mod backend_error_attribution_tests {
+    use super::*;
+
+    fn ch() -> Channel { Channel::new(Version::Http2, Iface::External) }
+
+    /// The regression this closes, seen on all three nodes for nine
+    /// consecutive hours: a bot sends an unrecognised verb, method validation
+    /// answers 501 without contacting anything, and backend_errors_total
+    /// rises. An operator watching that counter goes hunting for a failing
+    /// renderer that was never involved.
+    #[test]
+    fn self_generated_5xx_is_not_a_backend_error() {
+        let mut s = Stats::new();
+        s.record(1_000, false, 501, ch(), "method-check");
+        s.record(1_000, false, 500, ch(), "error-local");
+        s.record(1_000, false, 503, ch(), "health");
+        let snap = s.snapshot();
+        assert_eq!(snap.backend_errors_total, 0, "m6 generated these itself");
+        // The responses are still counted; only the attribution changes.
+        assert_eq!(snap.requests_total, 3);
+        assert_eq!(snap.status_counts.get(&501), Some(&1));
+    }
+
+    /// A real backend failure must still register.
+    #[test]
+    fn a_real_backend_5xx_still_counts() {
+        let mut s = Stats::new();
+        s.record(1_000, false, 502, ch(), "m6-html");
+        s.record(1_000, false, 500, ch(), "origin");
+        assert_eq!(s.snapshot().backend_errors_total, 2);
+    }
+
+    /// A replayed 5xx from cache is a stored copy of one old failure, not a
+    /// new one; counting it again would inflate the total on every hit.
+    #[test]
+    fn a_cached_5xx_is_not_recounted() {
+        let mut s = Stats::new();
+        for _ in 0..10 { s.record(1_000, true, 500, ch(), "cache"); }
+        assert_eq!(s.snapshot().backend_errors_total, 0);
     }
 }
