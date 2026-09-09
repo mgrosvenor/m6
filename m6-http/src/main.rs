@@ -2932,6 +2932,7 @@ fn run(args: Vec<String>) -> i32 {
     };
 
     config::warn_system_config_extra_keys(&cli.system_config);
+    config::warn_health_token(&config.health);
     config::warn_ignored_route_cache_keys(&config);
 
     // --dump-config
