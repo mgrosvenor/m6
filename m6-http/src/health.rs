@@ -46,15 +46,88 @@
 //! configured socket pool has at least one live member. That is checkable
 //! locally, cheaply, and without a network round trip that could itself hang.
 //!
-//! # What is deliberately not exposed
+//! # Two endpoints, because they have opposite requirements
 //!
-//! No version, build or commit string (it tells a scanner which
-//! vulnerabilities to try), and no request counts or cache statistics
-//! (traffic volume is not public information). Those belong behind
-//! authentication, alongside the richer metrics a dashboard would want. What
-//! is here is the minimum an uptime monitor needs and nothing more.
+//! `/health` answers up or down. `/perf` answers counters and latency
+//! percentiles. They are separate paths rather than one path with a richer
+//! response for authorised callers, and the reason is cost.
+//!
+//! **A health check has to be constant-cost by construction.** It is the most
+//! frequently hit path on the box, it runs when the machine is already in
+//! trouble, and it is the thing a monitor uses to decide whether the node is
+//! alive. Percentiles mean sorting a 4096-sample reservoir and serialising a
+//! larger payload. Put that behind a conditional on the same path and the
+//! expensive branch is one misconfigured header away from being taken on
+//! every check, on every node, forever. Splitting the paths makes the cheap
+//! answer cheap because there is no other answer it can give.
+//!
+//! **`/perf` is token-gated, and not out of modesty about traffic volume.**
+//! Live latency and error counters are a feedback channel for whoever is
+//! attacking you. An attacker probing for a resource-exhaustion path is
+//! normally blind: they cannot tell whether a request is expensive or whether
+//! their load is landing. Publishing hit and miss percentiles tells them
+//! exactly which requests cost 2.8us and which cost 7.8ms, about 2800 to 1 on
+//! this deployment, and `backend_errors_total` then confirms in real time
+//! when they have found something that hurts. That turns a blind probe into a
+//! tuning loop. Gating it also means an anonymous scrape loop can never reach
+//! the sort.
+//!
+//! No version or build string is exposed by either endpoint, at any tier:
+//! that only tells a scanner which vulnerabilities are worth trying.
+//!
+//! With no token configured `/perf` does not exist at all (404, not 401), so
+//! forgetting to configure it fails closed and does not advertise a door.
 
 use serde::Serialize;
+
+use crate::stats::StatsSnapshot;
+
+/// Compare a presented credential against the expected one without leaking
+/// the match position through timing.
+///
+/// A naive `==` on strings returns at the first differing byte, so response
+/// time reveals how many leading bytes were correct and the token can be
+/// recovered one byte at a time. Lengths are compared first and unequal
+/// lengths rejected outright, which does leak length; that is not
+/// recoverable-secret information in the way a prefix is.
+fn credential_matches(presented: &str, expected: &str) -> bool {
+    let (a, b) = (presented.as_bytes(), expected.as_bytes());
+    if a.len() != b.len() || expected.is_empty() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Whether this request may see metrics.
+///
+/// Expects `Authorization: Bearer <token>`. Returns false when no token is
+/// configured, so metrics are off unless deliberately switched on.
+pub fn metrics_authorised(
+    headers: &[(String, String)],
+    configured_token: Option<&str>,
+) -> bool {
+    let Some(expected) = configured_token.filter(|t| !t.is_empty()) else {
+        return false;
+    };
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+        .and_then(|(_, value)| {
+            // The scheme is case-insensitive per RFC 9110 11.1.
+            let rest = value.strip_prefix("Bearer ").or_else(|| {
+                value
+                    .get(..7)
+                    .filter(|p| p.eq_ignore_ascii_case("bearer "))
+                    .and_then(|_| value.get(7..))
+            })?;
+            Some(credential_matches(rest.trim(), expected))
+        })
+        .unwrap_or(false)
+}
 
 /// One socket-backed backend pool's occupancy.
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -101,6 +174,12 @@ impl HealthReport {
         // 503 is the honest code: the node is up enough to answer, but not
         // able to serve. A monitor treating any non-2xx as down is then
         // correct without needing to parse the body.
+        //
+        // Deliberately never derived from performance. A latency spike is a
+        // signal for a human or a dashboard to act on, not grounds for a node
+        // to declare itself down and be pulled from rotation while it is
+        // still serving every request correctly. That is also why the numbers
+        // live on `/perf` and not here.
         let code = if degraded { 503 } else { 200 };
         (code, HealthReport { status, node: node.to_string(), uptime_s, pools, url_backends })
     }
@@ -124,6 +203,79 @@ impl HealthReport {
             ("X-Robots-Tag".to_string(), "noindex, nofollow".to_string()),
         ];
         (code, headers, body)
+    }
+}
+
+/// The `/perf` payload: everything `/health` reports, plus the numbers.
+///
+/// Carries `node` and `uptime_s` as well so a dashboard scraping several
+/// nodes can attribute a sample without correlating two requests, and so a
+/// counter reset is distinguishable from a quiet node (uptime went
+/// backwards means the process restarted, not that traffic stopped).
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct PerfReport {
+    pub node: String,
+    pub uptime_s: u64,
+    pub metrics: StatsSnapshot,
+}
+
+/// Outcome of a `/perf` request.
+pub enum PerfOutcome {
+    /// No token configured: the endpoint is switched off and answers 404, so
+    /// it does not advertise a door that cannot be opened.
+    Disabled,
+    /// Configured, but the caller presented no or wrong credentials.
+    Unauthorised,
+    Ok(PerfReport),
+}
+
+impl PerfReport {
+    pub fn build(
+        node: &str,
+        uptime_s: u64,
+        headers: &[(String, String)],
+        configured_token: Option<&str>,
+        snapshot: impl FnOnce() -> StatsSnapshot,
+    ) -> PerfOutcome {
+        match configured_token.filter(|t| !t.is_empty()) {
+            None => PerfOutcome::Disabled,
+            Some(_) if !metrics_authorised(headers, configured_token) => {
+                PerfOutcome::Unauthorised
+            }
+            Some(_) => {
+                // `snapshot` is a closure so the reservoir sort happens only
+                // after authorisation passes, never for an anonymous caller.
+                PerfOutcome::Ok(PerfReport {
+                    node: node.to_string(),
+                    uptime_s,
+                    metrics: snapshot(),
+                })
+            }
+        }
+    }
+}
+
+impl PerfOutcome {
+    pub fn into_response(self) -> (u16, Vec<(String, String)>, Vec<u8>) {
+        let mut headers = vec![
+            ("Content-Type".to_string(), "application/json; charset=utf-8".to_string()),
+            ("Cache-Control".to_string(), "no-store".to_string()),
+            ("X-Robots-Tag".to_string(), "noindex, nofollow".to_string()),
+        ];
+        match self {
+            PerfOutcome::Disabled => (404, headers, br#"{"error":"not found"}"#.to_vec()),
+            PerfOutcome::Unauthorised => {
+                // RFC 9110 11.6.1: a 401 MUST carry WWW-Authenticate naming
+                // the scheme, otherwise a client cannot know how to retry.
+                headers.push(("WWW-Authenticate".to_string(), "Bearer".to_string()));
+                (401, headers, br#"{"error":"unauthorised"}"#.to_vec())
+            }
+            PerfOutcome::Ok(report) => {
+                let body = serde_json::to_vec(&report)
+                    .unwrap_or_else(|_| br#"{"error":"serialisation failed"}"#.to_vec());
+                (200, headers, body)
+            }
+        }
     }
 }
 
@@ -203,6 +355,114 @@ mod tests {
 
     /// Traffic volume and build identity are not public. If a future change
     /// adds them to the public payload, this fails.
+    fn auth(value: &str) -> Vec<(String, String)> {
+        vec![("Authorization".to_string(), value.to_string())]
+    }
+
+    #[test]
+    fn no_configured_token_means_metrics_are_never_served() {
+        // The secure default: forgetting to configure it fails closed, and no
+        // presented credential can talk its way past a token that is unset.
+        assert!(!metrics_authorised(&auth("Bearer anything"), None));
+        assert!(!metrics_authorised(&auth("Bearer anything"), Some("")));
+        assert!(!metrics_authorised(&[], None));
+    }
+
+    #[test]
+    fn correct_bearer_token_authorises() {
+        assert!(metrics_authorised(&auth("Bearer s3cret"), Some("s3cret")));
+        // RFC 9110 11.1: the auth scheme is case-insensitive.
+        assert!(metrics_authorised(&auth("bearer s3cret"), Some("s3cret")));
+        assert!(metrics_authorised(&auth("BEARER s3cret"), Some("s3cret")));
+        // Header field names are case-insensitive too.
+        assert!(metrics_authorised(
+            &[("authorization".to_string(), "Bearer s3cret".to_string())],
+            Some("s3cret")
+        ));
+    }
+
+    #[test]
+    fn wrong_or_malformed_credentials_are_refused() {
+        for value in [
+            "Bearer wrong",
+            "Bearer s3cre",       // prefix of the real token
+            "Bearer s3secret1",   // longer
+            "Basic s3cret",       // wrong scheme
+            "s3cret",             // no scheme
+            "Bearer",             // no token
+            "",
+        ] {
+            assert!(
+                !metrics_authorised(&auth(value), Some("s3cret")),
+                "must refuse {value:?}"
+            );
+        }
+        assert!(!metrics_authorised(&[], Some("s3cret")));
+    }
+
+    /// A prefix of the real token must not compare equal. This is the
+    /// property that a length check alone would give, but the comparison is
+    /// also constant-time so response latency cannot be used to recover the
+    /// token one byte at a time.
+    #[test]
+    fn credential_comparison_rejects_prefixes_and_empty() {
+        assert!(credential_matches("abc123", "abc123"));
+        assert!(!credential_matches("abc12", "abc123"));
+        assert!(!credential_matches("abc1234", "abc123"));
+        assert!(!credential_matches("", ""));
+        assert!(!credential_matches("", "abc123"));
+    }
+
+    fn snap() -> StatsSnapshot {
+        crate::stats::Stats::new().snapshot()
+    }
+
+    #[test]
+    fn perf_is_404_when_no_token_is_configured() {
+        // Off by default, and it does not advertise a door that cannot be
+        // opened: 404, not 401.
+        let out = PerfReport::build("sydney", 5, &auth("Bearer x"), None, snap);
+        let (code, _, body) = out.into_response();
+        assert_eq!(code, 404);
+        assert!(!String::from_utf8_lossy(&body).contains("unauthorised"));
+    }
+
+    #[test]
+    fn perf_is_401_with_a_scheme_hint_when_credentials_are_wrong() {
+        let out = PerfReport::build("sydney", 5, &auth("Bearer wrong"), Some("right"), snap);
+        let (code, headers, _) = out.into_response();
+        assert_eq!(code, 401);
+        assert!(headers
+            .iter()
+            .any(|(n, v)| n.eq_ignore_ascii_case("WWW-Authenticate") && v == "Bearer"));
+    }
+
+    /// The reservoir sort must never run for an unauthorised caller. If it
+    /// did, an anonymous scrape loop would be a cheap way to make the server
+    /// work.
+    #[test]
+    fn perf_does_not_snapshot_unless_authorised() {
+        let mut taken = false;
+        let counting = || {
+            taken = true;
+            snap()
+        };
+        let _ = PerfReport::build("sydney", 5, &[], Some("tok"), counting);
+        assert!(!taken, "snapshot must not be taken without authorisation");
+    }
+
+    #[test]
+    fn perf_returns_metrics_when_authorised() {
+        let out = PerfReport::build("sydney", 11, &auth("Bearer tok"), Some("tok"), snap);
+        let (code, _, body) = out.into_response();
+        assert_eq!(code, 200);
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["node"], "sydney");
+        assert_eq!(parsed["uptime_s"], 11);
+        assert_eq!(parsed["metrics"]["requests_total"], 0);
+        assert!(parsed["metrics"]["hit_samples"].is_number());
+    }
+
     #[test]
     fn payload_leaks_no_version_or_traffic_data() {
         let (code, report) = HealthReport::build(
@@ -212,6 +472,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let object = parsed.as_object().expect("object");
         let allowed = ["status", "node", "uptime_s", "pools", "url_backends"];
+        assert!(!object.contains_key("metrics"), "metrics must be absent without a token");
         for key in object.keys() {
             assert!(allowed.contains(&key.as_str()), "unexpected public field: {key}");
         }
