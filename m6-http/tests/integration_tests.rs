@@ -499,12 +499,18 @@ mod phase11 {
         assert!(cache.get(&key).is_none());
     }
 
+    /// Was `error_responses_never_cached`, which lumped 404 in with 5xx.
+    /// They are not the same thing: RFC 9111 3 lists 404 as heuristically
+    /// cacheable, while 5xx are transient failures that must never be stored
+    /// and replayed. Storing the 404 is what stops a cache node paying an
+    /// origin round trip for every unknown path.
     #[test]
-    fn error_responses_never_cached() {
-        let h4xx = vec![("cache-control".to_string(), "public".to_string())];
-        assert!(!should_cache(404, &h4xx));
-        assert!(!should_cache(500, &h4xx));
-        assert!(!should_cache(503, &h4xx));
+    fn server_errors_are_never_cached_but_a_404_may_be() {
+        let public = vec![("cache-control".to_string(), "public".to_string())];
+        assert!(should_cache(404, &public), "404 is storable per RFC 9111 3");
+        for s in [500u16, 502, 503, 504] {
+            assert!(!should_cache(s, &public), "{s} is a transient failure, never store it");
+        }
     }
 }
 
