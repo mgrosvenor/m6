@@ -490,6 +490,7 @@ fn event_loop(
                                 _ => cached.status,
                             },
                             chan,
+                            "cache",
                         );
                         if precond == Precondition::Failed {
                             // RFC 9110 13.2.2 steps 1-2: the client asserted
@@ -599,7 +600,7 @@ fn event_loop(
                         // gap survived: any check of the h3 path looked fine.
                         let elapsed_ns = start.elapsed().as_nanos() as u64;
                         let chan = Channel::new(HttpVersion::from_wire(&req.version), state.tls_iface);
-                        state.stats.record(elapsed_ns, false, status, chan);
+                        state.stats.record(elapsed_ns, false, status, chan, backend);
                         }
                     }
                     outcome
@@ -614,7 +615,7 @@ fn event_loop(
                     }
                     let elapsed_ns = ctx.start.elapsed().as_nanos() as u64;
                     let chan = Channel::new(HttpVersion::from_wire(&ctx.req.version), state.tls_iface);
-                    state.stats.record(elapsed_ns, false, status, chan);
+                    state.stats.record(elapsed_ns, false, status, chan, &ctx.backend_name);
                     debug!(
                         path = %ctx.req.path,
                         status,
@@ -699,7 +700,7 @@ fn event_loop(
                             Precondition::NotModified => 304,
                             _ => cached.status,
                         };
-                        state.stats.record(elapsed_ns, true, hit_status, chan);
+                        state.stats.record(elapsed_ns, true, hit_status, chan, "cache");
 
                         let precond = evaluate_preconditions(&cached.headers, &req.headers, &req.method);
                         if precond == Precondition::Failed {
@@ -810,7 +811,7 @@ fn event_loop(
                         // h2c is HTTP/2 by definition; the interface class comes
                         // from its bind address (the WireGuard tunnel here).
                         let chan = Channel::new(HttpVersion::Http2, state.h2c_iface);
-                        state.stats.record(elapsed_ns, false, status, chan);
+                        state.stats.record(elapsed_ns, false, status, chan, backend);
                         }
                     }
                     outcome
@@ -824,7 +825,7 @@ fn event_loop(
                     }
                     let elapsed_ns = ctx.start.elapsed().as_nanos() as u64;
                     let chan = Channel::new(HttpVersion::Http2, state.h2c_iface);
-                    state.stats.record(elapsed_ns, false, status, chan);
+                    state.stats.record(elapsed_ns, false, status, chan, &ctx.backend_name);
                     debug!(
                         path = %ctx.req.path,
                         status,
@@ -1308,6 +1309,7 @@ fn handle_h3_request(
                 _ => cached.status,
             },
             chan,
+            "cache",
         );
         if precond == Precondition::Failed {
             // Same rule as the h1/h2 paths; see the note there.
@@ -1432,7 +1434,7 @@ fn handle_h3_request(
             // site traffic and must not move these counters.
             if !health::is_monitoring_endpoint(&backend_name) {
                 let chan = Channel::new(HttpVersion::Http3, state.tls_iface);
-                state.stats.record(elapsed_ns, false, status, chan);
+                state.stats.record(elapsed_ns, false, status, chan, &backend_name);
             }
             debug!(
                 path = %path,

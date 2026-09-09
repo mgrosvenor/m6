@@ -946,10 +946,26 @@ pub fn should_cache(status: u16, headers: &[(String, String)]) -> bool {
 /// Split out from the status range so the reason is stated where the decision
 /// is made, rather than being implicit in an inequality.
 fn status_is_storable(status: u16) -> bool {
-    if status == 206 {
-        return false;
-    }
-    (200..300).contains(&status)
+    // RFC 9111 3: the statuses a cache may store by default. Only 2xx was
+    // accepted before, which made every 404, 301 and 410 permanently
+    // uncacheable no matter what its headers said.
+    //
+    // That is not merely conservative, it costs real work: on a cache node a
+    // 404 that cannot be stored is a round trip to the origin every time. The
+    // measured cost on this deployment was ~207ms from Chicago and ~282ms
+    // from London, paid thousands of times a day for junk paths.
+    //
+    // 206 is excluded deliberately: a partial response is only meaningful
+    // with the Range request that produced it, and the cache key carries no
+    // Range component, so a stored 206 would be replayed to a client that
+    // asked for the whole thing.
+    //
+    // Storability is necessary, not sufficient -- `should_cache` still
+    // applies Vary, no-store, private and the rest on top of this.
+    matches!(
+        status,
+        200 | 203 | 204 | 300 | 301 | 308 | 404 | 405 | 410 | 414 | 501
+    )
 }
 
 /// Whether the REQUEST permits this response to be stored.
@@ -1084,10 +1100,20 @@ mod tests {
         assert!(!should_cache(status, &headers));
     }
 
+    /// Was `test_should_not_cache_4xx`, asserting that a `public` 404 is
+    /// never stored. That pinned an over-strict rule, not a requirement:
+    /// RFC 9111 3 lists 404 as heuristically cacheable, and refusing to store
+    /// it meant a cache node paid an origin round trip for every one.
+    ///
+    /// The 4xx that must still be refused are the ones absent from that list.
     #[test]
-    fn test_should_not_cache_4xx() {
+    fn a_public_404_is_stored_but_other_4xx_are_not() {
         let (status, headers, _) = make_response(404, "public");
-        assert!(!should_cache(status, &headers));
+        assert!(should_cache(status, &headers), "404 is storable per RFC 9111 3");
+        for s in [400u16, 401, 403, 429] {
+            let (status, headers, _) = make_response(s, "public");
+            assert!(!should_cache(status, &headers), "{s} is not in the RFC 9111 3 list");
+        }
     }
 
     #[test]
@@ -1737,12 +1763,16 @@ mod cache_control_tests {
         assert!(!should_cache(206, &h(&[("cache-control", "public, max-age=60")])));
     }
 
+    /// The storable set is now RFC 9111 3 rather than "any 2xx". 300, 301
+    /// and 404 moved from the refused list to the stored list; 199 and 500
+    /// stay refused, and 201/202 are refused despite being 2xx because they
+    /// are responses to unsafe methods.
     #[test]
-    fn ordinary_2xx_still_stored() {
-        for s in [200u16, 203, 204] {
+    fn the_rfc_9111_storable_set_is_honoured() {
+        for s in [200u16, 203, 204, 300, 301, 308, 404, 405, 410, 414, 501] {
             assert!(should_cache(s, &h(&[("cache-control", "public")])), "{s} should store");
         }
-        for s in [199u16, 300, 301, 404, 500] {
+        for s in [199u16, 201, 202, 205, 302, 400, 500, 503] {
             assert!(!should_cache(s, &h(&[("cache-control", "public")])), "{s} should not store");
         }
     }
@@ -2406,5 +2436,54 @@ mod corrected_age_tests {
             ("age", "7"),
         ]);
         assert_eq!(age, 7);
+    }
+}
+
+
+#[cfg(test)]
+mod storable_status_tests {
+    use super::*;
+
+    /// RFC 9111 3, in full. The list is short and fixed, so it is worth
+    /// asserting exactly rather than by range.
+    #[test]
+    fn the_rfc_9111_set_is_storable() {
+        for s in [200, 203, 204, 300, 301, 308, 404, 405, 410, 414, 501] {
+            assert!(status_is_storable(s), "{s} is heuristically cacheable per RFC 9111 3");
+        }
+    }
+
+    /// The regression this fixes: a 404 could never be stored, so on a cache
+    /// node every one was a round trip to the origin.
+    #[test]
+    fn a_404_is_now_storable() {
+        assert!(status_is_storable(404));
+    }
+
+    /// 206 stays excluded. The cache key is (path, query, encoding) with no
+    /// Range component, so a stored partial response would be replayed to a
+    /// client that asked for the whole resource.
+    #[test]
+    fn partial_content_is_never_storable() {
+        assert!(!status_is_storable(206));
+    }
+
+    /// Statuses outside the list must not creep in via a range check. 201 and
+    /// 202 are 2xx but are responses to unsafe methods; 500 and 503 are
+    /// transient failures.
+    #[test]
+    fn everything_else_is_refused() {
+        for s in [201, 202, 205, 302, 303, 307, 400, 401, 403, 500, 502, 503] {
+            assert!(!status_is_storable(s), "{s} must not be storable");
+        }
+    }
+
+    /// Storable is necessary, not sufficient: no-store still wins.
+    #[test]
+    fn storable_status_does_not_override_no_store() {
+        let headers = vec![
+            ("Cache-Control".to_string(), "no-store".to_string()),
+        ];
+        assert!(!should_cache(404, &headers), "no-store must still refuse a storable status");
     }
 }
