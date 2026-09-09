@@ -149,11 +149,23 @@ pub fn handle_request<W: Write>(
     // brotli body it cannot decode. Folding the coding into the tag makes the
     // three variants distinguishable.
     //
-    // `mime_guess::from_path` and `choose_encoding` both work off the path and
+    // `mime_from_path` and `choose_encoding` both work off the path and
     // the request headers, never the file contents, so moving them above the
     // conditional check costs nothing and still lets a 304 skip the read,
     // minify and compress entirely.
-    let mime = mime_guess::from_path(&fs_path).first_or_octet_stream().to_string();
+    // m6-core's table, NOT the mime_guess crate.
+    //
+    // Two MIME implementations existed and the wrong one was serving. Every
+    // text type went out with no charset -- `text/markdown`, `text/plain`,
+    // `text/css`, `text/javascript` -- so a client fell back to Latin-1 and
+    // rendered UTF-8 as mojibake. An em dash (U+2014, bytes e2 80 94) came
+    // out as "a EUR --" in every .md file, in llms.txt and in llms-full.txt:
+    // the three documents that exist specifically to be machine-read.
+    //
+    // The bytes were always correct; only the label was missing. m6-core's
+    // table has carried `text/markdown; charset=utf-8` all along and simply
+    // was not consulted here.
+    let mime = m6_core::mime::mime_from_path(&fs_path).to_string();
     let mime_base = mime.split(';').next().unwrap_or(&mime).to_string();
     let accept_encoding = req.accept_encoding();
     let (encoding, level) = choose_encoding(&mime, accept_encoding, ctx.config);
@@ -417,10 +429,8 @@ fn handle_tail<W: Write>(
 
     let end_str = end_offset.to_string();
 
-    let mime = mime_guess::from_path(&fs_path)
-        .first()
-        .map(|m| m.to_string())
-        .unwrap_or_else(|| "text/plain".to_string());
+    // Same table as the main path above; see the note there.
+    let mime = m6_core::mime::mime_from_path(&fs_path).to_string();
 
     write_response(
         stream,
@@ -929,5 +939,56 @@ mod cache_control_tests {
             !browser_visible.contains("86400"),
             "a browser-honoured directive carries the long window: {cc}"
         );
+    }
+}
+
+#[cfg(test)]
+mod charset_tests {
+    use std::path::Path;
+
+    /// Every text type must declare UTF-8. Without it a client falls back to
+    /// Latin-1 and renders UTF-8 as mojibake: an em dash (U+2014, bytes
+    /// e2 80 94) came out as three garbage characters in every .md file, in
+    /// llms.txt and in llms-full.txt -- the documents that exist specifically
+    /// to be machine-read.
+    ///
+    /// The bytes on the wire were always correct. Only the label was missing,
+    /// because m6-file used the mime_guess crate instead of m6-core's table,
+    /// which has carried the charset all along.
+    #[test]
+    fn text_types_declare_utf8() {
+        for (file, want) in [
+            ("a.md", "text/markdown; charset=utf-8"),
+            ("llms.txt", "text/plain; charset=utf-8"),
+            ("style.css", "text/css; charset=utf-8"),
+            ("nav.js", "text/javascript; charset=utf-8"),
+            ("page.html", "text/html; charset=utf-8"),
+        ] {
+            assert_eq!(m6_core::mime::mime_from_path(Path::new(file)), want, "{file}");
+        }
+    }
+
+    /// Binary types must NOT carry a charset -- it is meaningless there, and
+    /// on application/json the parameter is undefined by RFC 8259.
+    #[test]
+    fn binary_and_json_carry_no_charset() {
+        for file in ["a.webp", "a.png", "a.woff2", "a.pdf", "a.json", "a.ico"] {
+            let m = m6_core::mime::mime_from_path(Path::new(file));
+            assert!(!m.contains("charset"), "{file} must not declare a charset, got {m}");
+        }
+    }
+
+    /// The table must cover every extension this site actually serves, or the
+    /// swap away from mime_guess would silently downgrade files to
+    /// application/octet-stream.
+    #[test]
+    fn every_extension_in_use_is_known() {
+        for file in [
+            "a.webp", "a.jpg", "a.png", "a.js", "a.svg", "a.pdf",
+            "a.md", "a.txt", "a.woff2", "a.css", "a.xml", "a.json", "a.ico",
+        ] {
+            let m = m6_core::mime::mime_from_path(Path::new(file));
+            assert_ne!(m, "application/octet-stream", "{file} fell through to the default");
+        }
     }
 }
