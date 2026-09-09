@@ -237,6 +237,12 @@ pub struct Stats {
     /// on the request path.
     channels: Vec<ChannelStats>,
 
+    /// Response codes 100..=599, indexed by `status - 100`. A dense 4 KB
+    /// array rather than a map: incrementing is one bounds-checked index with
+    /// no hashing and no allocation, on a path that runs for every response.
+    /// Only the non-zero entries are ever reported.
+    status_counts: Box<[u64; 500]>,
+
     // RPS
     pub rps_peak: u64,
     window_start: Instant,
@@ -254,18 +260,33 @@ impl Stats {
             miss_samples: Box::new([0u64; RESERVOIR]),
             miss_idx: 0, miss_count: 0,
             channels: (0..CHANNELS).map(|_| ChannelStats::new()).collect(),
+            status_counts: Box::new([0u64; 500]),
             rps_peak: 0, window_start: now, last_emit: now,
         }
     }
 
     #[inline(always)]
+    /// Record one completed response.
+    ///
+    /// Takes the FINAL status rather than a precomputed `backend_error` flag.
+    /// The flag was always `status >= 500` at every call site, so passing the
+    /// status removes a duplicated derivation and yields the response-code
+    /// breakdown for free. It also forced the cache-hit sites to be corrected:
+    /// they recorded before evaluating preconditions, so a conditional request
+    /// answered 304 or 412 would have been counted as the cached 200.
     pub fn record(
         &mut self,
         elapsed_ns: u64,
         cache_hit: bool,
-        backend_error: bool,
+        status: u16,
         channel: Channel,
     ) {
+        let backend_error = status >= 500;
+        // 100..=599. Anything outside is not a status this server emits;
+        // counting it would mean trusting an index derived from it.
+        if (100..600).contains(&status) {
+            self.status_counts[usize::from(status) - 100] += 1;
+        }
         self.channels[channel.index()].record(elapsed_ns, cache_hit, backend_error);
         self.requests_total  += 1;
         self.window_requests += 1;
@@ -376,6 +397,11 @@ pub struct StatsSnapshot {
     /// are omitted rather than reported as rows of zeros, so the list shows
     /// what this node actually serves.
     pub channels: Vec<ChannelSnapshot>,
+    /// Response codes actually emitted, keyed by code. Codes never returned
+    /// are omitted entirely: a fixed 100..599 table would be 500 rows of
+    /// zeros around the four that matter, and the useful signal here is
+    /// exactly which codes appeared.
+    pub status_counts: std::collections::BTreeMap<u16, u64>,
 }
 
 impl Stats {
@@ -403,6 +429,13 @@ impl Stats {
             miss_p50_ns: mp50,
             miss_p99_ns: mp99,
             miss_max_ns: mmax,
+            status_counts: self
+                .status_counts
+                .iter()
+                .enumerate()
+                .filter(|(_, &n)| n > 0)
+                .map(|(i, &n)| (i as u16 + 100, n))
+                .collect(),
             channels: self
                 .channels
                 .iter()
@@ -463,9 +496,9 @@ mod tests {
     #[test]
     fn test_record_and_counts() {
         let mut s = Stats::new();
-        s.record(50, true, false, Channel::new(Version::Http11, Iface::External));
-        s.record(200, false, false, Channel::new(Version::Http11, Iface::External));
-        s.record(800, false, false, Channel::new(Version::Http11, Iface::External));
+        s.record(50, true, 200, Channel::new(Version::Http11, Iface::External));
+        s.record(200, false, 200, Channel::new(Version::Http11, Iface::External));
+        s.record(800, false, 200, Channel::new(Version::Http11, Iface::External));
         assert_eq!(s.requests_total, 3);
         assert_eq!(s.cache_hits_total, 1);
         assert_eq!(s.cache_misses_total, 2);
@@ -480,7 +513,7 @@ mod tests {
     fn test_exact_percentiles() {
         let mut s = Stats::new();
         // 100 hit samples: 1..=100 ns
-        for i in 1u64..=100 { s.record(i, true, false, Channel::new(Version::Http11, Iface::External)); }
+        for i in 1u64..=100 { s.record(i, true, 200, Channel::new(Version::Http11, Iface::External)); }
         let (p0, p50, p99, p100) = percentiles(&s.hit_samples, s.hit_count);
         assert_eq!(p0,   1);
         assert_eq!(p50,  50);
@@ -492,7 +525,7 @@ mod tests {
     fn test_record_overhead() {
         let mut s = Stats::new();
         let start = Instant::now();
-        for i in 1..=1000u64 { s.record(i, i % 2 == 0, false, Channel::new(Version::Http11, Iface::External)); }
+        for i in 1..=1000u64 { s.record(i, i % 2 == 0, 200, Channel::new(Version::Http11, Iface::External)); }
         let elapsed = start.elapsed();
         #[cfg(debug_assertions)]
         let threshold_us = 1_000;
@@ -555,10 +588,10 @@ mod channel_tests {
         let tunnel_h2 = Channel::new(Version::Http2, Iface::Internal);
 
         // A fast public cache hit.
-        stats.record(3_000, true, false, public_h2);
+        stats.record(3_000, true, 200, public_h2);
         // Two slow intercontinental misses over the tunnel.
-        stats.record(200_000_000, false, false, tunnel_h2);
-        stats.record(210_000_000, false, false, tunnel_h2);
+        stats.record(200_000_000, false, 200, tunnel_h2);
+        stats.record(210_000_000, false, 404, tunnel_h2);
 
         let snap = stats.snapshot();
         assert_eq!(snap.requests_total, 3);
@@ -583,7 +616,7 @@ mod channel_tests {
     fn backend_errors_are_attributed_to_their_channel() {
         let mut stats = Stats::new();
         let h1 = Channel::new(Version::Http11, Iface::External);
-        stats.record(1_000_000, false, true, h1);
+        stats.record(1_000_000, false, 502, h1);
         let snap = stats.snapshot();
         assert_eq!(snap.backend_errors_total, 1);
         let c = snap.channels.iter().find(|c| c.channel == "http/1.1/external").unwrap();
@@ -593,9 +626,74 @@ mod channel_tests {
     #[test]
     fn silent_channels_are_omitted_not_zero_filled() {
         let mut stats = Stats::new();
-        stats.record(1_000, true, false, Channel::new(Version::Http3, Iface::External));
+        stats.record(1_000, true, 200, Channel::new(Version::Http3, Iface::External));
         let snap = stats.snapshot();
         assert_eq!(snap.channels.len(), 1, "a node reports only what it serves");
         assert_eq!(snap.channels[0].channel, "http/3/external");
+    }
+}
+
+#[cfg(test)]
+mod status_code_tests {
+    use super::*;
+
+    fn ch() -> Channel {
+        Channel::new(Version::Http2, Iface::External)
+    }
+
+    #[test]
+    fn only_codes_actually_emitted_are_reported() {
+        let mut s = Stats::new();
+        for _ in 0..5 { s.record(1_000, true, 200, ch()); }
+        for _ in 0..3 { s.record(2_000, false, 404, ch()); }
+        s.record(3_000, true, 304, ch());
+
+        let snap = s.snapshot();
+        // Exactly the three codes seen -- not 500 rows of zeros around them.
+        assert_eq!(snap.status_counts.len(), 3);
+        assert_eq!(snap.status_counts.get(&200), Some(&5));
+        assert_eq!(snap.status_counts.get(&404), Some(&3));
+        assert_eq!(snap.status_counts.get(&304), Some(&1));
+        assert_eq!(snap.status_counts.get(&500), None);
+    }
+
+    /// `backend_errors_total` used to be a separate bool argument that every
+    /// call site derived as `status >= 500`. It is now derived once, here.
+    #[test]
+    fn backend_errors_are_derived_from_the_status() {
+        let mut s = Stats::new();
+        s.record(1_000, false, 200, ch());
+        s.record(1_000, false, 404, ch());
+        s.record(1_000, false, 499, ch());
+        s.record(1_000, false, 500, ch());
+        s.record(1_000, false, 503, ch());
+        let snap = s.snapshot();
+        assert_eq!(snap.backend_errors_total, 2, "only 5xx counts as a backend error");
+        assert_eq!(snap.status_counts.get(&499), Some(&1));
+    }
+
+    /// The index is `status - 100`, so anything outside 100..=599 must be
+    /// rejected rather than trusted as an offset.
+    #[test]
+    fn out_of_range_statuses_do_not_index_the_table() {
+        let mut s = Stats::new();
+        s.record(1_000, false, 0, ch());
+        s.record(1_000, false, 99, ch());
+        s.record(1_000, false, 600, ch());
+        s.record(1_000, false, u16::MAX, ch());
+        let snap = s.snapshot();
+        assert!(snap.status_counts.is_empty(), "no bogus code may be counted");
+        // The request itself is still counted; only the code is discarded.
+        assert_eq!(snap.requests_total, 4);
+    }
+
+    #[test]
+    fn boundaries_are_inclusive_at_100_and_599() {
+        let mut s = Stats::new();
+        s.record(1_000, false, 100, ch());
+        s.record(1_000, false, 599, ch());
+        let snap = s.snapshot();
+        assert_eq!(snap.status_counts.get(&100), Some(&1));
+        assert_eq!(snap.status_counts.get(&599), Some(&1));
     }
 }
