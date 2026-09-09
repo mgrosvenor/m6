@@ -478,3 +478,42 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod token_file_tests {
+    use crate::config::HealthConfig;
+
+    /// `--dump-config` serialises the whole Config. The resolved token must
+    /// never appear in that output, or the secret ends up in any log or
+    /// paste of a config dump.
+    #[test]
+    fn resolved_token_is_never_serialised() {
+        let health = HealthConfig {
+            enabled: true,
+            path: "/health".to_string(),
+            perf_path: "/perf".to_string(),
+            metrics_token_file: Some("/etc/m6/perf-token".to_string()),
+            metrics_token: Some("super-secret-value".to_string()),
+        };
+        let dumped = serde_json::to_string(&health).expect("serialisable");
+        assert!(
+            !dumped.contains("super-secret-value"),
+            "token leaked into serialised config: {dumped}"
+        );
+        // The path is configuration and should still be visible.
+        assert!(dumped.contains("/etc/m6/perf-token"));
+    }
+
+    /// The file indirection has to be enforced, not advisory: a token written
+    /// inline in site.toml must not be honoured, because site.toml is
+    /// committed and shipped to every node.
+    #[test]
+    fn inline_token_in_toml_is_ignored() {
+        let parsed: HealthConfig =
+            toml::from_str("metrics_token = \"inline-secret\"").expect("parses");
+        assert_eq!(
+            parsed.metrics_token, None,
+            "an inline token must not be accepted from config"
+        );
+    }
+}

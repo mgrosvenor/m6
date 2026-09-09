@@ -188,9 +188,22 @@ pub struct HealthConfig {
     /// percentiles). `None` -- the default -- means metrics are never served,
     /// so forgetting to configure it fails closed.
     ///
-    /// A SECRET. It belongs in the per-node system config on the box, never
-    /// in a site.toml that is committed. Templates carry a placeholder only.
+    /// Path to a file whose contents are the bearer token.
+    ///
+    /// The *path* is configuration and belongs in git; the *contents* are a
+    /// secret and must not. site.toml is rendered from a committed template
+    /// and shipped byte-identically to every node, so a token written inline
+    /// there would be a secret in the repository. Same pattern as the ClouDNS
+    /// credentials at /etc/m6/cloudns.env: 0600, root-only, on the box.
     #[serde(default)]
+    pub metrics_token_file: Option<String>,
+    /// The resolved token, read from `metrics_token_file` at load.
+    ///
+    /// `serde(skip)` in both directions, deliberately. It must never be
+    /// printed by `--dump-config`, which serialises the whole Config, and it
+    /// must not be settable inline from TOML -- otherwise the file
+    /// indirection above is advisory rather than enforced.
+    #[serde(skip)]
     pub metrics_token: Option<String>,
     /// Path for the metrics endpoint. Separate from `path` on purpose: the
     /// health check must stay constant-cost, and percentiles are not.
@@ -211,6 +224,7 @@ impl Default for HealthConfig {
         HealthConfig {
             enabled: default_true(),
             path: default_health_path(),
+            metrics_token_file: None,
             metrics_token: None,
             perf_path: default_perf_path(),
         }
@@ -618,7 +632,20 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
     };
     let log = site_parsed.log.unwrap_or_default();
     let analytics = site_parsed.analytics.unwrap_or_default();
-    let health = site_parsed.health.unwrap_or_default();
+    let mut health = site_parsed.health.unwrap_or_default();
+    // Read the token here so the running server never touches the file on the
+    // request path. Failure is deliberately not fatal: a missing token file
+    // means /perf answers 404 (fails closed), and refusing to boot the whole
+    // server over a metrics credential would be disproportionate -- the same
+    // call made for the inert `cache =` route key. It is reported by
+    // `warn_health_token` from main, because warn! inside load() goes to a
+    // subscriber that does not exist yet (load supplies the log level).
+    if let Some(ref path) = health.metrics_token_file {
+        health.metrics_token = std::fs::read_to_string(path)
+            .ok()
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty());
+    }
     let rate_limit = site_parsed.rate_limit.unwrap_or_default();
     let errors = site_parsed.errors.unwrap_or_default();
     let security = site_parsed.security.unwrap_or_default();
@@ -789,6 +816,22 @@ pub fn warn_ignored_route_cache_keys(config: &Config) {
 
 /// Warn about any extra top-level keys in system config toml.
 /// We do this via raw parsing.
+/// Report a configured-but-unusable metrics token file.
+///
+/// Called from `main` after logging is initialised. Warning from inside
+/// `load()` would print nothing at all: `load()` runs before the subscriber
+/// exists, because it is what supplies the log level.
+pub fn warn_health_token(health: &HealthConfig) {
+    if let Some(ref path) = health.metrics_token_file {
+        if health.metrics_token.is_none() {
+            warn!(
+                file = %path,
+                "health: metrics token file missing or empty -- /perf will answer 404"
+            );
+        }
+    }
+}
+
 pub fn warn_system_config_extra_keys(system_config_path: &Path) {
     if let Ok(raw) = std::fs::read_to_string(system_config_path) {
         if let Ok(val) = raw.parse::<toml::Value>() {
