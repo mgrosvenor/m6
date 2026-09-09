@@ -427,6 +427,20 @@ impl Http2Conn {
         let payload: Vec<u8> = self.recv_buf[FRAME_HDR..FRAME_HDR + length].to_vec();
         self.recv_buf.drain(..FRAME_HDR + length);
 
+        // Is a header block still being assembled? RFC 9113 6.10: a HEADERS
+        // frame and the CONTINUATION frames that follow it are "a single
+        // logical unit". State transitions therefore apply to the completed
+        // unit, not to each frame in it -- which is why the 5.1 check below is
+        // skipped while one is outstanding.
+        //
+        // Getting this wrong broke a legal and common case: HEADERS with
+        // END_STREAM but *not* END_HEADERS, i.e. a request with no body whose
+        // header block is too large for one frame. END_STREAM half-closes the
+        // stream immediately, so the CONTINUATION that must follow was then
+        // rejected as a frame on a half-closed stream -- the server refusing
+        // to accept the rest of a header block it was itself waiting for.
+        let mid_header_block = self.continuation_stream_id.is_some();
+
         if let Some(cont) = self.continuation_stream_id {
             if ftype != TYPE_CONTINUATION || stream_id != cont {
                 return Err("expected CONTINUATION");
@@ -445,7 +459,7 @@ impl Http2Conn {
         // Checked before dispatch so no handler has to re-derive it, and so
         // that a frame on an idle or closed stream never reaches code that
         // would create the stream as a side effect of looking it up.
-        match self.frame_verdict(ftype, stream_id) {
+        match if mid_header_block { FrameVerdict::Allow } else { self.frame_verdict(ftype, stream_id) } {
             FrameVerdict::Allow => {}
             FrameVerdict::ConnectionError(code) => {
                 self.send_goaway(code);
@@ -1941,5 +1955,41 @@ mod stream_state_tests {
         };
         while let Ok(true) = c.process_frame(&mut on_request, "127.0.0.1") {}
         assert_eq!(c.phase, Phase::GoingAway, "a backwards stream id must GOAWAY");
+    }
+}
+
+#[cfg(test)]
+mod continuation_state_tests {
+    use super::*;
+    use super::frame_validation_tests::{feed, frame};
+
+    /// HEADERS with END_STREAM but WITHOUT END_HEADERS is legal: a request
+    /// with no body whose header block does not fit in one frame. END_STREAM
+    /// half-closes the stream immediately, so a naive 5.1 state check rejects
+    /// the CONTINUATION that must follow -- the server refusing the rest of a
+    /// header block it is itself waiting for.
+    ///
+    /// RFC 9113 6.10 makes HEADERS plus its CONTINUATIONs "a single logical
+    /// unit", so state applies to the completed unit, not to each frame.
+    #[test]
+    fn continuation_after_end_stream_headers_is_accepted() {
+        // HEADERS: END_STREAM, no END_HEADERS. Split ":method/:scheme" here
+        // and ":path" into the CONTINUATION.
+        let mut f = frame(TYPE_HEADERS, FLAG_END_STREAM, 1, &[0x82, 0x87]);
+        f.extend(frame(TYPE_CONTINUATION, FLAG_END_HEADERS, 1, &[0x84]));
+        assert!(
+            feed(&f).is_ok(),
+            "a CONTINUATION completing a header block on a half-closed stream must be accepted"
+        );
+    }
+
+    /// Several CONTINUATION frames in sequence are equally legal; only the
+    /// last carries END_HEADERS.
+    #[test]
+    fn multiple_continuations_are_accepted() {
+        let mut f = frame(TYPE_HEADERS, 0, 1, &[0x82]);
+        f.extend(frame(TYPE_CONTINUATION, 0, 1, &[0x87]));
+        f.extend(frame(TYPE_CONTINUATION, FLAG_END_HEADERS, 1, &[0x84]));
+        assert!(feed(&f).is_ok(), "a multi-frame header block must be accepted");
     }
 }
