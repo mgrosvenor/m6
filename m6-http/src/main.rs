@@ -524,8 +524,13 @@ fn event_loop(
                     } // end cache hit
 
                     let mut outcome = handle_request(req, client_ip, enc_str, state, false);
-                    if let RequestOutcome::Ready(status, ref mut headers, ..) = outcome {
+                    if let RequestOutcome::Ready(status, ref mut headers, _, ref backend, _) = outcome {
                         set_alt_svc(headers, quic_port);
+                        // /health and /perf answer from local state and are not
+                        // site traffic. Counting them would let a 30s monitor
+                        // keep requests_total moving through a total traffic
+                        // stall, which is the one thing that counter is for.
+                        if !health::is_monitoring_endpoint(backend) {
                         // Record the cache MISS.
                         //
                         // This was missing, and the omission was invisible
@@ -558,6 +563,7 @@ fn event_loop(
                         let elapsed_ns = start.elapsed().as_nanos() as u64;
                         let chan = Channel::new(HttpVersion::from_wire(&req.version), state.tls_iface);
                         state.stats.record(elapsed_ns, false, status >= 500, chan);
+                        }
                     }
                     outcome
                 },
@@ -721,8 +727,13 @@ fn event_loop(
                     } // end cache hit
 
                     let mut outcome = handle_request(req, client_ip, enc_str, state, false);
-                    if let RequestOutcome::Ready(status, ref mut headers, ..) = outcome {
+                    if let RequestOutcome::Ready(status, ref mut headers, _, ref backend, _) = outcome {
                         set_alt_svc(headers, quic_port);
+                        // /health and /perf answer from local state and are not
+                        // site traffic. Counting them would let a 30s monitor
+                        // keep requests_total moving through a total traffic
+                        // stall, which is the one thing that counter is for.
+                        if !health::is_monitoring_endpoint(backend) {
                         // Record the cache MISS.
                         //
                         // This was missing, and the omission was invisible
@@ -757,6 +768,7 @@ fn event_loop(
                         // from its bind address (the WireGuard tunnel here).
                         let chan = Channel::new(HttpVersion::Http2, state.h2c_iface);
                         state.stats.record(elapsed_ns, false, status >= 500, chan);
+                        }
                     }
                     outcome
                 },
@@ -1364,8 +1376,12 @@ fn handle_h3_request(
 
             let elapsed_ns = start.elapsed().as_nanos() as u64;
             let is_backend_error = status >= 500;
-            let chan = Channel::new(HttpVersion::Http3, state.tls_iface);
-            state.stats.record(elapsed_ns, false, is_backend_error, chan);
+            // Same exclusion as the h1/h2 paths: /health and /perf are not
+            // site traffic and must not move these counters.
+            if !health::is_monitoring_endpoint(&backend_name) {
+                let chan = Channel::new(HttpVersion::Http3, state.tls_iface);
+                state.stats.record(elapsed_ns, false, is_backend_error, chan);
+            }
             debug!(
                 path = %path,
                 status,
@@ -1744,7 +1760,7 @@ fn handle_request_inner(
             code,
             headers,
             body,
-            "health".to_string(),
+            health::HEALTH_BACKEND.to_string(),
             std::sync::Arc::new(vec![]),
         );
     }
@@ -1768,7 +1784,7 @@ fn handle_request_inner(
             code,
             headers,
             body,
-            "perf".to_string(),
+            health::PERF_BACKEND.to_string(),
             std::sync::Arc::new(vec![]),
         );
     }
