@@ -27,6 +27,11 @@ use m6_http_lib::config::{self, Config};
 use m6_http_lib::error::{self as error, ErrorMode};
 use m6_http_lib::forward::{self, HttpRequest, HttpResponse};
 use m6_http_lib::health;
+
+/// How long a fetched error document is reused before being re-fetched.
+/// Short enough that a redeployed error page appears promptly, long enough
+/// that a sustained sweep costs one fetch a minute rather than one per path.
+const ERROR_PAGE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 use m6_http_lib::stats::{Channel, Iface, Version as HttpVersion};
 use m6_http_lib::h2c_client::H2cClientPool;
 use m6_http_lib::h2s_client::H2sTlsClientPool;
@@ -130,6 +135,23 @@ struct ServerState {
     /// address, and this sits on the hot path for every single request.
     tls_iface: Iface,
     h2c_iface: Iface,
+    /// One rendered error document per status, held locally.
+    ///
+    /// A cache node routes `/_errors` to the origin, so before this every
+    /// route miss dispatched a fetch across the WireGuard link -- ~207ms from
+    /// Chicago, ~282ms from London -- to render a page that is byte-identical
+    /// every time. Measured 2026-09-09: four requests to nonexistent paths on
+    /// Chicago each took 0.86-1.07s, with no improvement on repeat.
+    ///
+    /// Caching that response by URL would not have helped. The cache key is
+    /// (path, query, encoding), so a wordlist of 647 unique junk paths is 647
+    /// unique keys and 647 origin fetches -- useless against exactly the
+    /// traffic that causes the problem. m6-http knows the site's route table,
+    /// so a path matching no route is knowably a 404 *locally*; it does not
+    /// need a response per path, it needs one error document.
+    ///
+    /// Keyed by status, so at most a handful of entries ever.
+    error_pages: HashMap<u16, (std::time::Instant, Vec<(String, String)>, Vec<u8>)>,
     /// When this process began serving, for the health endpoint's uptime.
     ///
     /// `Instant`, not `SystemTime`: it is monotonic, so a clock step (NTP
@@ -2183,6 +2205,54 @@ fn dispatch_custom_error_async(
     if req.path == error_path {
         return None;
     }
+
+    // Held copy first. The body is identical for every path that misses, so
+    // one fetch answers all of them -- which is the whole point: a wordlist
+    // sweep of hundreds of unique paths costs one origin round trip, not one
+    // per path.
+    //
+    // The ORIGINAL path is still what gets logged: analytics records
+    // `req.path` from the caller, not whatever this body was rendered for.
+    let served_locally = state
+        .error_pages
+        .get(&status)
+        .filter(|(fetched, _, _)| fetched.elapsed() < ERROR_PAGE_TTL)
+        .map(|(_, h, b)| (h.clone(), b.clone()));
+
+    if let Some((mut headers, body)) = served_locally {
+        // Logged here explicitly. Analytics for a route miss is recorded by
+        // the code around the dispatch, and returning early skips all of it --
+        // so without this, answering locally would have made every 404
+        // invisible in the request log. Trading origin round trips for
+        // blindness would be a bad bargain, and the visibility is the reason
+        // this shortcut is acceptable at all.
+        //
+        // `req.path` is the caller's real path, not whatever this body was
+        // rendered for, so the log still shows exactly what was asked for.
+        let latency_ns = std::time::Instant::now().elapsed().as_nanos() as u64;
+        analytics::finish_response(
+            state.config.analytics.enabled,
+            &mut headers,
+            &req.headers,
+            &state.config.node.name,
+            &req.path,
+            status,
+            // Neither HIT nor MISS: the response cache was not consulted and
+            // no backend was contacted. Labelling it either would corrupt the
+            // hit rate in both directions.
+            "LOCAL",
+            client_ip,
+            Some(latency_ns),
+        );
+        return Some(RequestOutcome::Ready(
+            status,
+            headers,
+            body,
+            "error-local".to_string(),
+            std::sync::Arc::new(vec![]),
+        ));
+    }
+
     let backend_name = state.route_table.at(&error_path)?.backend.clone();
     let (url, tls_config, _) = state.pool_manager.get_url_info(&backend_name)?;
     let url = url.to_string();
@@ -2655,6 +2725,18 @@ fn finalize_url_response_inner(
                 // be another m6-http instance (a cache node fetching origin's
                 // rendered error page), same reasoning as the main MISS tail.
                 let mut headers = http_resp.headers;
+                // Hold this document so the next route miss -- on any path --
+                // is answered locally instead of crossing the link again.
+                //
+                // Stored BEFORE analytics stamps per-request headers onto it:
+                // finish_proxied_response mints a Set-Cookie session id, and
+                // replaying one visitor's session cookie to every later 404
+                // would hand them all the same session. The held copy must be
+                // the document, not this exchange.
+                state.error_pages.insert(
+                    original_status,
+                    (std::time::Instant::now(), headers.clone(), http_resp.body.clone()),
+                );
                 analytics::finish_proxied_response(
                     analytics_on, &mut headers, &req.headers,
                     &state.config.node.name, &req.path, original_status, "MISS", &ctx.client_ip, Some(latency_ns),
@@ -3240,6 +3322,7 @@ fn run(args: Vec<String>) -> i32 {
         tls_iface,
         h2c_iface,
         rate_limiter: RateLimiter::new(),
+        error_pages: HashMap::new(),
         started: std::time::Instant::now(),
     };
 
@@ -3672,5 +3755,56 @@ mod method_status_tests {
         assert!(is_registered_method("GET"));
         assert!(!is_registered_method("get"));
         assert!(!is_registered_method("Get"));
+    }
+}
+
+#[cfg(test)]
+mod error_page_holder_tests {
+    use super::*;
+
+    /// The holder is keyed by status, so a sweep of hundreds of distinct junk
+    /// paths reuses one document. That is the whole point: caching the error
+    /// response by URL would not help, because the cache key is
+    /// (path, query, encoding) and every junk path is a distinct key.
+    #[test]
+    fn one_entry_serves_every_path() {
+        let mut pages: HashMap<u16, (std::time::Instant, Vec<(String, String)>, Vec<u8>)> =
+            HashMap::new();
+        pages.insert(404, (std::time::Instant::now(), vec![], b"not found".to_vec()));
+        for path in ["/.env", "/wp-admin", "/route53-health/index.php", "/yarn.lock"] {
+            let hit = pages.get(&404).is_some();
+            assert!(hit, "{path} must be answered from the single held document");
+        }
+        assert_eq!(pages.len(), 1, "one document, not one per path");
+    }
+
+    /// Different statuses hold different documents; a 404 must never be
+    /// served under a 500.
+    #[test]
+    fn statuses_do_not_share_a_document() {
+        let mut pages: HashMap<u16, (std::time::Instant, Vec<(String, String)>, Vec<u8>)> =
+            HashMap::new();
+        pages.insert(404, (std::time::Instant::now(), vec![], b"gone".to_vec()));
+        assert!(pages.get(&500).is_none(), "500 must not be answered by the 404 document");
+    }
+
+    /// A stale entry must be refetched rather than served forever, or a
+    /// redeployed error page would never reach the edges.
+    #[test]
+    fn a_stale_entry_is_not_served() {
+        let stale = std::time::Instant::now()
+            .checked_sub(ERROR_PAGE_TTL + std::time::Duration::from_secs(1))
+            .expect("clock");
+        let entry = (stale, Vec::<(String, String)>::new(), b"old".to_vec());
+        assert!(
+            entry.0.elapsed() >= ERROR_PAGE_TTL,
+            "past the TTL the held copy must be treated as stale"
+        );
+    }
+
+    #[test]
+    fn ttl_is_short_enough_to_pick_up_a_redeploy() {
+        assert!(ERROR_PAGE_TTL <= std::time::Duration::from_secs(300));
+        assert!(ERROR_PAGE_TTL >= std::time::Duration::from_secs(10));
     }
 }
