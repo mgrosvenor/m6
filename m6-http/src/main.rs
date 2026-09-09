@@ -451,9 +451,24 @@ fn event_loop(
                         // Version from the REQUEST, not the listener: h1 and
                         // h2 share this TLS listener via ALPN.
                         let chan = Channel::new(HttpVersion::from_wire(&req.version), state.tls_iface);
-                        state.stats.record(elapsed_ns, true, false, chan);
 
                         let precond = evaluate_preconditions(&cached.headers, &req.headers, &req.method);
+                        // Recorded here, not before the precondition check.
+                        // A conditional request answered 304 (or 412) would
+                        // otherwise be counted as the cached 200, which is the
+                        // opposite of what a response-code breakdown is for --
+                        // revalidation traffic would be invisible.
+                        // `evaluate_preconditions` is pure, so hoisting it is safe.
+                        state.stats.record(
+                            elapsed_ns,
+                            true,
+                            match precond {
+                                Precondition::Failed => 412,
+                                Precondition::NotModified => 304,
+                                _ => cached.status,
+                            },
+                            chan,
+                        );
                         if precond == Precondition::Failed {
                             // RFC 9110 13.2.2 steps 1-2: the client asserted
                             // something about the current representation that
@@ -562,7 +577,7 @@ fn event_loop(
                         // gap survived: any check of the h3 path looked fine.
                         let elapsed_ns = start.elapsed().as_nanos() as u64;
                         let chan = Channel::new(HttpVersion::from_wire(&req.version), state.tls_iface);
-                        state.stats.record(elapsed_ns, false, status >= 500, chan);
+                        state.stats.record(elapsed_ns, false, status, chan);
                         }
                     }
                     outcome
@@ -576,9 +591,8 @@ fn event_loop(
                         headers.push(("link".to_string(), hints::link_header(url)));
                     }
                     let elapsed_ns = ctx.start.elapsed().as_nanos() as u64;
-                    let is_backend_error = status >= 500;
                     let chan = Channel::new(HttpVersion::from_wire(&ctx.req.version), state.tls_iface);
-                    state.stats.record(elapsed_ns, false, is_backend_error, chan);
+                    state.stats.record(elapsed_ns, false, status, chan);
                     debug!(
                         path = %ctx.req.path,
                         status,
@@ -656,7 +670,14 @@ fn event_loop(
                     if let m6_http_lib::cache::Lookup::Fresh(cached, age) | m6_http_lib::cache::Lookup::Stale(cached, age) = looked_up {
                         let elapsed_ns = start.elapsed().as_nanos() as u64;
                         let chan = Channel::new(HttpVersion::Http2, state.h2c_iface);
-                        state.stats.record(elapsed_ns, true, false, chan);
+                        // See the TLS path: the status must be the one actually
+                        // sent, so preconditions are evaluated first.
+                        let hit_status = match evaluate_preconditions(&cached.headers, &req.headers, &req.method) {
+                            Precondition::Failed => 412,
+                            Precondition::NotModified => 304,
+                            _ => cached.status,
+                        };
+                        state.stats.record(elapsed_ns, true, hit_status, chan);
 
                         let precond = evaluate_preconditions(&cached.headers, &req.headers, &req.method);
                         if precond == Precondition::Failed {
@@ -767,7 +788,7 @@ fn event_loop(
                         // h2c is HTTP/2 by definition; the interface class comes
                         // from its bind address (the WireGuard tunnel here).
                         let chan = Channel::new(HttpVersion::Http2, state.h2c_iface);
-                        state.stats.record(elapsed_ns, false, status >= 500, chan);
+                        state.stats.record(elapsed_ns, false, status, chan);
                         }
                     }
                     outcome
@@ -780,9 +801,8 @@ fn event_loop(
                         headers.push(("link".to_string(), hints::link_header(url)));
                     }
                     let elapsed_ns = ctx.start.elapsed().as_nanos() as u64;
-                    let is_backend_error = status >= 500;
                     let chan = Channel::new(HttpVersion::Http2, state.h2c_iface);
-                    state.stats.record(elapsed_ns, false, is_backend_error, chan);
+                    state.stats.record(elapsed_ns, false, status, chan);
                     debug!(
                         path = %ctx.req.path,
                         status,
@@ -1252,10 +1272,21 @@ fn handle_h3_request(
         let elapsed_ns = start.elapsed().as_nanos() as u64;
         // QUIC shares the public bind, so it is external like TLS.
         let chan = Channel::new(HttpVersion::Http3, state.tls_iface);
-        state.stats.record(elapsed_ns, true, false, chan);
 
         let method_str = std::str::from_utf8(method_bytes).unwrap_or("GET");
         let precond = evaluate_preconditions(&cached.headers, &req.headers, method_str);
+        // See the h1/h2 paths: recorded after preconditions so a 304 is
+        // counted as a 304 and not as the cached 200.
+        state.stats.record(
+            elapsed_ns,
+            true,
+            match precond {
+                Precondition::Failed => 412,
+                Precondition::NotModified => 304,
+                _ => cached.status,
+            },
+            chan,
+        );
         if precond == Precondition::Failed {
             // Same rule as the h1/h2 paths; see the note there.
             let mut headers: Vec<(String, String)> = Vec::new();
@@ -1375,12 +1406,11 @@ fn handle_h3_request(
             set_alt_svc(&mut resp_headers, quic_port);
 
             let elapsed_ns = start.elapsed().as_nanos() as u64;
-            let is_backend_error = status >= 500;
             // Same exclusion as the h1/h2 paths: /health and /perf are not
             // site traffic and must not move these counters.
             if !health::is_monitoring_endpoint(&backend_name) {
                 let chan = Channel::new(HttpVersion::Http3, state.tls_iface);
-                state.stats.record(elapsed_ns, false, is_backend_error, chan);
+                state.stats.record(elapsed_ns, false, status, chan);
             }
             debug!(
                 path = %path,
