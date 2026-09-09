@@ -377,6 +377,29 @@ impl PoolManager {
         self.pools.iter().map(|(_, p)| p.active_count()).sum()
     }
 
+    /// Per-pool occupancy for the health endpoint.
+    ///
+    /// Deliberately per-pool rather than the summed `total_active_members()`
+    /// above: a node with a healthy m6-html and a dead render-contact sums to
+    /// a non-zero total and looks fine, when one of its backends cannot serve
+    /// at all. The sum answers "is anything alive"; health needs "is
+    /// everything alive".
+    pub fn pool_health(&self) -> Vec<(String, usize, usize)> {
+        self.pools
+            .iter()
+            .map(|(name, p)| (name.clone(), p.active_count(), p.total_count()))
+            .collect()
+    }
+
+    /// Names of URL backends (a cache node's origin, typically).
+    ///
+    /// Presence only. Proving one reachable means a network round trip, and a
+    /// health check that makes a network call is a health check that can hang
+    /// on exactly the outage it is meant to report.
+    pub fn url_backend_names(&self) -> Vec<String> {
+        self.url_backends.iter().map(|b| b.name.clone()).collect()
+    }
+
     /// Add a pool directly (used in tests).
     pub fn add_pool(&mut self, pool: BackendPool) {
         let name = pool.name.clone();

@@ -26,6 +26,7 @@ use m6_http_lib::stats::Stats;
 use m6_http_lib::config::{self, Config};
 use m6_http_lib::error::{self as error, ErrorMode};
 use m6_http_lib::forward::{self, HttpRequest, HttpResponse};
+use m6_http_lib::health;
 use m6_http_lib::h2c_client::H2cClientPool;
 use m6_http_lib::h2s_client::H2sTlsClientPool;
 use m6_http_lib::pool::{self, PoolManager};
@@ -121,6 +122,11 @@ struct ServerState {
     h2s_pool: H2sTlsClientPool,
     /// Per-IP request throttle — general traffic, ahead of cache/routing.
     rate_limiter: RateLimiter,
+    /// When this process began serving, for the health endpoint's uptime.
+    ///
+    /// `Instant`, not `SystemTime`: it is monotonic, so a clock step (NTP
+    /// correction, a VM resuming) cannot make uptime jump or go negative.
+    started: std::time::Instant,
 }
 
 /// One cache entry to fetch in the background.
@@ -1626,6 +1632,40 @@ fn handle_request_inner(
         );
     }
 
+    // ── Health endpoint, ahead of routing/cache/backends ────────────────────
+    // Placed here on purpose. Below this point a request touches the router,
+    // the cache and then a backend; the whole value of a health check is that
+    // it answers from local state without any of that. Rendering `/` costs
+    // ~6ms of Tera work on the origin and a monitor sending
+    // `Cache-Control: no-cache` pays it on every single check, which makes
+    // the monitor's latency graph a measure of template rendering rather than
+    // of whether the node is up.
+    //
+    // It sits *after* method validation so a health path still refuses PUT
+    // and friends like every other path, rather than becoming a hole in it.
+    if state.config.health.enabled && req.path == state.config.health.path {
+        let pools = state
+            .pool_manager
+            .pool_health()
+            .into_iter()
+            .map(|(name, active, total)| health::PoolHealth { name, active, total })
+            .collect();
+        let (code, report) = health::HealthReport::build(
+            &state.config.node.name,
+            state.started.elapsed().as_secs(),
+            pools,
+            state.pool_manager.url_backend_names(),
+        );
+        let (code, headers, body) = report.into_response(code);
+        return RequestOutcome::Ready(
+            code,
+            headers,
+            body,
+            "health".to_string(),
+            std::sync::Arc::new(vec![]),
+        );
+    }
+
     // The custom-error render route takes `status`/`from` (and optional
     // `route`/`backend`/`detail`) straight from its query string and renders
     // them into the page — safe when `dispatch_custom_error_async`/
@@ -3036,6 +3076,7 @@ fn run(args: Vec<String>) -> i32 {
         h2c_pool: H2cClientPool::new(),
         h2s_pool: H2sTlsClientPool::new(),
         rate_limiter: RateLimiter::new(),
+        started: std::time::Instant::now(),
     };
 
     event_loop(udp, tcp_listener, h2c_listener, watcher, &mut state, &mut quiche_config, &log_handle)
@@ -3070,6 +3111,7 @@ mod www_redirect_tests {
             },
             log: LogConfig::default(),
             analytics: AnalyticsConfig::default(),
+            health: Default::default(),
             node: NodeConfig { name: "test-node".to_string() },
             rate_limit: RateLimitConfig::default(),
             errors: ErrorsConfig::default(),
