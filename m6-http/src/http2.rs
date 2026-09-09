@@ -69,10 +69,57 @@ const ERR_STREAM_CLOSED:  u32 = 0x5;
 const ERR_REFUSED_STREAM: u32 = 0x7;
 const ERR_FRAME_SIZE:     u32 = 0x6;
 
+/// How many recently-reset stream ids to remember. See `recently_reset`.
+const RESET_MEMORY: usize = 128;
+
 // ── Stream state ──────────────────────────────────────────────────────────────
 
-#[derive(Debug, PartialEq)]
-enum StreamState { Open, HalfClosedRemote, Closed }
+/// RFC 9113 5.1. All seven states.
+///
+/// Three of these used to exist (`Open`, `HalfClosedRemote`, `Closed`) and the
+/// absence of the rest was the single largest source of conformance failures:
+/// without `Idle` there is no way to tell a frame arriving on a stream that
+/// was never opened from one on a live stream, and without `Closed` being
+/// *derivable* there is no way to reject a frame on a stream that has already
+/// finished.
+///
+/// `ReservedLocal`/`ReservedRemote` exist only via PUSH_PROMISE. This server
+/// never pushes and rejects a client PUSH_PROMISE outright, so neither is
+/// reachable today -- they are present because the transition table below is
+/// meant to be checkable against the RFC line by line, and a table missing two
+/// of its rows cannot be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "ReservedLocal/ReservedRemote are reachable only via PUSH_PROMISE, \
+              which this server never sends and rejects on receipt. They are \
+              present so the 5.1 transition table can be checked against the \
+              RFC in full; a table missing two of its seven rows cannot be."
+)]
+enum StreamState {
+    Idle,
+    ReservedLocal,
+    ReservedRemote,
+    Open,
+    HalfClosedLocal,
+    HalfClosedRemote,
+    Closed,
+}
+
+/// How a frame that is illegal in the current state must be answered.
+///
+/// The distinction is not cosmetic. RFC 9113 5.4.1: a connection error means
+/// GOAWAY and the connection ends; a stream error means RST_STREAM and the
+/// connection continues. Answering a connection error with a stream error
+/// leaves both peers disagreeing about whether the connection is still usable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameVerdict {
+    Allow,
+    /// GOAWAY with this error code.
+    ConnectionError(u32),
+    /// RST_STREAM on this stream with this error code.
+    StreamError(u32),
+}
 
 struct H2Stream {
     state:        StreamState,
@@ -113,6 +160,7 @@ impl H2Stream {
 // ── Connection phase ──────────────────────────────────────────────────────────
 
 #[derive(PartialEq)]
+#[derive(Debug)]
 enum Phase { Preface, Active, GoingAway, Done }
 
 // ── Public type ───────────────────────────────────────────────────────────────
@@ -129,6 +177,20 @@ pub struct Http2Conn {
     hpack_enc:     hpack::Encoder<'static>,
 
     last_stream_id:         u32,
+    /// Stream ids recently terminated by RST_STREAM, newest last.
+    ///
+    /// RFC 9113 5.1 treats a closed stream differently depending on HOW it
+    /// closed: a frame arriving after RST_STREAM is a *stream* error of type
+    /// STREAM_CLOSED, while a frame arriving after END_STREAM is a
+    /// *connection* error of the same type. Absence from `streams` cannot tell
+    /// the two apart, so the reset ids are remembered.
+    ///
+    /// Bounded at RESET_MEMORY and evicted oldest-first, deliberately. An
+    /// unbounded set here would be a memory-exhaustion vector a peer controls
+    /// by opening and resetting streams in a loop -- which is precisely the
+    /// shape of Rapid Reset (CVE-2023-44487). Forgetting an old reset only
+    /// costs a stricter-than-necessary error on a very stale frame.
+    recently_reset:         std::collections::VecDeque<u32>,
     continuation_stream_id: Option<u32>,
     header_block_buf:       Vec<u8>,
 
@@ -155,6 +217,7 @@ impl Http2Conn {
             hpack_dec: hpack::Decoder::new(),
             hpack_enc: hpack::Encoder::new(),
             last_stream_id: 0,
+            recently_reset: std::collections::VecDeque::new(),
             continuation_stream_id: None,
             header_block_buf: Vec::new(),
             peer_initial_window: DEFAULT_WINDOW as i32,
@@ -368,13 +431,49 @@ impl Http2Conn {
             if ftype != TYPE_CONTINUATION || stream_id != cont {
                 return Err("expected CONTINUATION");
             }
+        } else if ftype == TYPE_CONTINUATION {
+            // RFC 9113 6.10: CONTINUATION may only follow HEADERS or
+            // PUSH_PROMISE that did not carry END_HEADERS. Only the forward
+            // direction was checked -- that a CONTINUATION was *expected* and
+            // something else arrived. The reverse, a CONTINUATION arriving
+            // when none is outstanding, was accepted and processed as though
+            // it continued a header block that had already ended.
+            return Err("CONTINUATION without a preceding HEADERS");
+        }
+
+        // RFC 9113 5.1: is this frame legal on this stream, in this state?
+        // Checked before dispatch so no handler has to re-derive it, and so
+        // that a frame on an idle or closed stream never reaches code that
+        // would create the stream as a side effect of looking it up.
+        match self.frame_verdict(ftype, stream_id) {
+            FrameVerdict::Allow => {}
+            FrameVerdict::ConnectionError(code) => {
+                self.send_goaway(code);
+                self.phase = Phase::GoingAway;
+                return Ok(true);
+            }
+            FrameVerdict::StreamError(code) => {
+                self.push_frame(TYPE_RST_STREAM, 0, stream_id, &code.to_be_bytes());
+                self.streams.remove(&stream_id);
+                return Ok(true);
+            }
         }
 
         match ftype {
             TYPE_DATA          => self.handle_data(stream_id, flags, &payload, on_request, client_ip)?,
             TYPE_HEADERS       => self.handle_headers(stream_id, flags, &payload, on_request, client_ip)?,
             TYPE_PRIORITY      => {}
-            TYPE_RST_STREAM    => { self.streams.remove(&stream_id); }
+            TYPE_RST_STREAM    => {
+                // Marked Closed, then removed. Removal alone is not enough:
+                // `stream_state` derives Idle for any absent id above
+                // `last_stream_id`, so resetting the newest stream and then
+                // sending DATA on it would have read as idle -- a connection
+                // error -- instead of closed. Bumping last_stream_id keeps the
+                // derivation honest.
+                self.streams.remove(&stream_id);
+                self.last_stream_id = self.last_stream_id.max(stream_id);
+                self.note_reset(stream_id);
+            }
             TYPE_SETTINGS      => self.handle_settings(flags, &payload)?,
             TYPE_PUSH_PROMISE  => return Err("client sent PUSH_PROMISE"),
             TYPE_PING          => self.handle_ping(flags, &payload),
@@ -384,6 +483,114 @@ impl Http2Conn {
             _                  => {}
         }
         Ok(true)
+    }
+
+    // ── Stream state machine (RFC 9113 5.1) ───────────────────────────────────
+
+    /// Remember a stream terminated by RST_STREAM, evicting the oldest.
+    fn note_reset(&mut self, stream_id: u32) {
+        if self.recently_reset.len() >= RESET_MEMORY {
+            self.recently_reset.pop_front();
+        }
+        self.recently_reset.push_back(stream_id);
+    }
+
+    fn was_reset(&self, stream_id: u32) -> bool {
+        self.recently_reset.contains(&stream_id)
+    }
+
+    /// The state of a stream, including streams that are not in the map.
+    ///
+    /// This is the piece that was missing. `streams` only ever held *live*
+    /// streams, so a frame arriving on an id that was never opened and one
+    /// arriving on an id that has already finished were indistinguishable:
+    /// both were simply absent, and both were silently tolerated.
+    ///
+    /// Both are derivable from `last_stream_id` without storing anything:
+    /// a client-initiated id above the highest yet seen has never been opened
+    /// (idle); one at or below it has been and is gone (closed). That bound
+    /// matters -- remembering every closed stream id would be unbounded memory
+    /// that a peer controls simply by opening streams.
+    fn stream_state(&self, stream_id: u32) -> StreamState {
+        match self.streams.get(&stream_id) {
+            Some(s) => s.state,
+            None if stream_id > self.last_stream_id => StreamState::Idle,
+            None => StreamState::Closed,
+        }
+    }
+
+    /// Whether a frame type may be received on a stream in its current state.
+    ///
+    /// Written as one explicit table rather than scattered `if` checks so it
+    /// can be read against RFC 9113 5.1 line by line. Every arm cites the rule
+    /// it implements.
+    fn frame_verdict(&self, ftype: u8, stream_id: u32) -> FrameVerdict {
+        // Connection-level frames are not stream-scoped; their own handlers
+        // validate them. Stream 0 is likewise never a stream.
+        if stream_id == 0 {
+            return FrameVerdict::Allow;
+        }
+        match ftype {
+            // PRIORITY is permitted in every state, including idle and
+            // closed (5.1). Deprecated in 9113 but must still be accepted.
+            TYPE_PRIORITY => FrameVerdict::Allow,
+            // These are connection-scoped and never carry a real stream id
+            // here; handled elsewhere.
+            TYPE_SETTINGS | TYPE_PING | TYPE_GOAWAY => FrameVerdict::Allow,
+            _ => match self.stream_state(stream_id) {
+                // 5.1 idle: "Receiving any frame other than HEADERS or
+                // PRIORITY on a stream in this state MUST be treated as a
+                // connection error of type PROTOCOL_ERROR."
+                StreamState::Idle => match ftype {
+                    TYPE_HEADERS => FrameVerdict::Allow,
+                    _ => FrameVerdict::ConnectionError(ERR_PROTOCOL_ERROR),
+                },
+
+                // Fully open: anything the peer may send.
+                StreamState::Open => FrameVerdict::Allow,
+
+                // 5.1 half-closed (local): we have finished sending, the peer
+                // has not. Everything from the peer is still legal.
+                StreamState::HalfClosedLocal => FrameVerdict::Allow,
+
+                // 5.1 half-closed (remote): the peer sent END_STREAM. "If an
+                // endpoint receives additional frames, other than
+                // WINDOW_UPDATE, PRIORITY, or RST_STREAM, for a stream that is
+                // in this state, it MUST respond with a stream error of type
+                // STREAM_CLOSED."
+                StreamState::HalfClosedRemote => match ftype {
+                    TYPE_WINDOW_UPDATE | TYPE_RST_STREAM => FrameVerdict::Allow,
+                    _ => FrameVerdict::StreamError(ERR_STREAM_CLOSED),
+                },
+
+                // 5.1 closed, and the RFC splits this by *how* it closed:
+                //
+                //   "An endpoint that receives any frame other than PRIORITY
+                //    after receiving a RST_STREAM MUST treat that as a stream
+                //    error of type STREAM_CLOSED."
+                //   "An endpoint that receives any frames after receiving a
+                //    frame with the END_STREAM flag set MUST treat that as a
+                //    connection error of type STREAM_CLOSED."
+                //
+                // WINDOW_UPDATE and RST_STREAM are tolerated either way "for a
+                // short period", since they may already have been in flight.
+                StreamState::Closed => match ftype {
+                    TYPE_WINDOW_UPDATE | TYPE_RST_STREAM => FrameVerdict::Allow,
+                    _ if self.was_reset(stream_id) => {
+                        FrameVerdict::StreamError(ERR_STREAM_CLOSED)
+                    }
+                    _ => FrameVerdict::ConnectionError(ERR_STREAM_CLOSED),
+                },
+
+                // Reserved states are reachable only through PUSH_PROMISE.
+                // This server never pushes and rejects a client PUSH_PROMISE
+                // outright, so neither can occur; treat as protocol error
+                // rather than silently allowing an impossible state through.
+                StreamState::ReservedLocal | StreamState::ReservedRemote => {
+                    FrameVerdict::ConnectionError(ERR_PROTOCOL_ERROR)
+                }
+            },
+        }
     }
 
     // ── Frame handlers ────────────────────────────────────────────────────────
@@ -448,8 +655,20 @@ impl Http2Conn {
     {
         if stream_id == 0 { return Err("HEADERS on stream 0"); }
         if stream_id % 2 == 0 { return Err("client used even stream ID"); }
+        // RFC 9113 5.1.1: "The identifier of a newly established stream MUST
+        // be numerically greater than all streams that the initiating endpoint
+        // has opened or reserved. [...] An endpoint that receives an unexpected
+        // stream identifier MUST respond with a connection error of type
+        // PROTOCOL_ERROR."
+        //
+        // This answered RST_STREAM, which is a *stream* error and leaves the
+        // connection running. Going backwards in stream ids is not a
+        // recoverable per-stream mistake: the peer's numbering is broken, so
+        // nothing that follows on this connection can be trusted to refer to
+        // the stream either side thinks it does.
         if stream_id <= self.last_stream_id && !self.streams.contains_key(&stream_id) {
-            self.push_frame(TYPE_RST_STREAM, 0, stream_id, &ERR_STREAM_CLOSED.to_be_bytes());
+            self.send_goaway(ERR_PROTOCOL_ERROR);
+            self.phase = Phase::GoingAway;
             return Ok(());
         }
         if self.streams.len() >= MAX_CONCURRENT as usize {
@@ -933,7 +1152,26 @@ impl Http2Conn {
                 s.resp_sent   += to_send;
 
                 if is_last {
-                    self.streams.remove(&stream_id);
+                    // We have sent END_STREAM. RFC 9113 5.1: which state that
+                    // leaves the stream in depends on the peer.
+                    //
+                    // If the client already sent END_STREAM the stream is now
+                    // fully closed and can be reaped. If it has NOT, the
+                    // stream is half-closed (local): the client may still
+                    // legally send DATA, and dropping the stream here would
+                    // make `stream_state` derive Closed and reject frames the
+                    // RFC says must be accepted.
+                    let peer_done = self
+                        .streams
+                        .get(&stream_id)
+                        .map(|s| s.state == StreamState::HalfClosedRemote)
+                        .unwrap_or(true);
+                    if peer_done {
+                        self.streams.remove(&stream_id);
+                        self.last_stream_id = self.last_stream_id.max(stream_id);
+                    } else if let Some(s) = self.streams.get_mut(&stream_id) {
+                        s.state = StreamState::HalfClosedLocal;
+                    }
                     continue 'outer;
                 }
                 // More data remains but the window may now be exhausted.
@@ -1276,7 +1514,7 @@ mod frame_validation_tests {
     ///
     /// `process_frame` is private, which is the point: these test the parser at
     /// the boundary a remote peer actually reaches, without a socket.
-    fn feed(frames: &[u8]) -> Result<(), &'static str> {
+    pub(super) fn feed(frames: &[u8]) -> Result<(), &'static str> {
         let mut c = Http2Conn::new();
         c.phase = Phase::Active;
         c.recv_buf.extend_from_slice(frames);
@@ -1293,7 +1531,7 @@ mod frame_validation_tests {
         }
     }
 
-    fn frame(ftype: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
+    pub(super) fn frame(ftype: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
         let mut v = Vec::new();
         let len = payload.len();
         v.push((len >> 16) as u8);
@@ -1304,6 +1542,20 @@ mod frame_validation_tests {
         v.extend_from_slice(&(stream_id & 0x7fff_ffff).to_be_bytes());
         v.extend_from_slice(payload);
         v
+    }
+
+    /// A minimal HEADERS frame that opens `stream_id`, for tests that need a
+    /// stream in the `open` state before exercising a later frame.
+    ///
+    /// Needed since the RFC 9113 5.1 state machine landed: DATA on a stream
+    /// that was never opened is a connection error (PROTOCOL_ERROR) checked
+    /// BEFORE any frame-specific validation, so a test that sends DATA on a
+    /// bare stream id now measures the state machine rather than the thing it
+    /// meant to test.
+    pub(super) fn open_stream(stream_id: u32) -> Vec<u8> {
+        // ":method: GET" / ":scheme: https" / ":path: /" as HPACK static-table
+        // indexed fields (2, 7, 4) -- no dynamic table, no Huffman.
+        frame(TYPE_HEADERS, FLAG_END_HEADERS, stream_id, &[0x82, 0x87, 0x84])
     }
 
     /// The panic. A HEADERS frame declaring PRIORITY but carrying fewer than
@@ -1347,14 +1599,16 @@ mod frame_validation_tests {
     /// This used to be silently treated as an unpadded frame.
     #[test]
     fn padded_data_with_empty_payload_is_rejected() {
-        let f = frame(TYPE_DATA, FLAG_PADDED, 1, &[]);
+        let mut f = open_stream(1);
+        f.extend(frame(TYPE_DATA, FLAG_PADDED, 1, &[]));
         assert!(feed(&f).is_err());
     }
 
     #[test]
     fn data_with_excess_padding_is_rejected() {
         // pad length 200 in a 4-byte payload.
-        let f = frame(TYPE_DATA, FLAG_PADDED, 1, &[200, 1, 2, 3]);
+        let mut f = open_stream(1);
+        f.extend(frame(TYPE_DATA, FLAG_PADDED, 1, &[200, 1, 2, 3]));
         assert!(feed(&f).is_err());
     }
 
@@ -1512,5 +1766,180 @@ mod pseudo_header_tests {
     #[test]
     fn empty_field_name_is_rejected() {
         assert_eq!(bad(&[("", "x")]), "empty field name");
+    }
+}
+
+#[cfg(test)]
+mod stream_state_tests {
+    use super::*;
+    use super::frame_validation_tests::{feed, frame, open_stream};
+
+    /// RFC 9113 5.1 idle: "Receiving any frame other than HEADERS or PRIORITY
+    /// on a stream in this state MUST be treated as a connection error of
+    /// type PROTOCOL_ERROR."
+    ///
+    /// Before the state machine existed there was no notion of "idle" at all:
+    /// a frame on a stream that had never been opened was indistinguishable
+    /// from one on a stream that had finished, and both were tolerated.
+    #[test]
+    fn frames_on_an_idle_stream_are_refused() {
+        for ftype in [TYPE_DATA, TYPE_RST_STREAM, TYPE_WINDOW_UPDATE] {
+            let f = frame(ftype, 0, 7, &[0, 0, 0, 1]);
+            let mut c = Http2Conn::new();
+            c.phase = Phase::Active;
+            assert_eq!(
+                c.frame_verdict(ftype, 7),
+                FrameVerdict::ConnectionError(ERR_PROTOCOL_ERROR),
+                "frame type {ftype:#x} on an idle stream must be a connection error"
+            );
+            // And it must not panic or hang when actually fed.
+            let _ = feed(&f);
+        }
+    }
+
+    /// PRIORITY is legal in every state, including idle and closed (5.1).
+    /// Deprecated in 9113 but must still be accepted, not rejected.
+    #[test]
+    fn priority_is_allowed_in_every_state() {
+        let c = Http2Conn::new();
+        assert_eq!(c.frame_verdict(TYPE_PRIORITY, 1), FrameVerdict::Allow);
+        assert_eq!(c.frame_verdict(TYPE_PRIORITY, 99), FrameVerdict::Allow);
+    }
+
+    /// HEADERS is what takes a stream out of idle, so it must be allowed there.
+    #[test]
+    fn headers_opens_an_idle_stream() {
+        let c = Http2Conn::new();
+        assert_eq!(c.frame_verdict(TYPE_HEADERS, 1), FrameVerdict::Allow);
+    }
+
+    /// An absent stream id at or below the high-water mark has been used and
+    /// is gone; above it, it has never been opened. This derivation is what
+    /// makes "closed" detectable without remembering every stream forever.
+    #[test]
+    fn absent_streams_are_idle_above_the_watermark_and_closed_below() {
+        let mut c = Http2Conn::new();
+        c.last_stream_id = 5;
+        assert_eq!(c.stream_state(7), StreamState::Idle);
+        assert_eq!(c.stream_state(3), StreamState::Closed);
+        assert_eq!(c.stream_state(5), StreamState::Closed);
+    }
+
+    /// 5.1 half-closed (remote): everything except WINDOW_UPDATE, PRIORITY
+    /// and RST_STREAM is a stream error of type STREAM_CLOSED.
+    #[test]
+    fn half_closed_remote_refuses_data_but_allows_window_update() {
+        let mut c = Http2Conn::new();
+        let mut st = H2Stream::new(65535);
+        st.state = StreamState::HalfClosedRemote;
+        c.streams.insert(1, st);
+        assert_eq!(c.frame_verdict(TYPE_DATA, 1), FrameVerdict::StreamError(ERR_STREAM_CLOSED));
+        assert_eq!(c.frame_verdict(TYPE_HEADERS, 1), FrameVerdict::StreamError(ERR_STREAM_CLOSED));
+        assert_eq!(c.frame_verdict(TYPE_WINDOW_UPDATE, 1), FrameVerdict::Allow);
+        assert_eq!(c.frame_verdict(TYPE_RST_STREAM, 1), FrameVerdict::Allow);
+        assert_eq!(c.frame_verdict(TYPE_PRIORITY, 1), FrameVerdict::Allow);
+    }
+
+    /// 5.1 half-closed (local): we have finished sending; the peer has not,
+    /// so everything it sends is still legal. Reaping the stream when we
+    /// finish would wrongly make these look closed.
+    #[test]
+    fn half_closed_local_still_accepts_peer_frames() {
+        let mut c = Http2Conn::new();
+        let mut st = H2Stream::new(65535);
+        st.state = StreamState::HalfClosedLocal;
+        c.streams.insert(1, st);
+        assert_eq!(c.frame_verdict(TYPE_DATA, 1), FrameVerdict::Allow);
+        assert_eq!(c.frame_verdict(TYPE_WINDOW_UPDATE, 1), FrameVerdict::Allow);
+    }
+
+    /// 5.1 closed, both branches. The RFC splits this by HOW the stream
+    /// closed, and getting it wrong in either direction is a real fault: a
+    /// connection error where a stream error belongs kills a healthy
+    /// connection, and the reverse leaves a peer that has lost track of the
+    /// stream believing the connection is still coherent.
+    #[test]
+    fn closed_after_end_stream_is_a_connection_error() {
+        let mut c = Http2Conn::new();
+        c.last_stream_id = 9;                       // 3 is closed, never reset
+        for ftype in [TYPE_DATA, TYPE_HEADERS, TYPE_CONTINUATION] {
+            assert_eq!(
+                c.frame_verdict(ftype, 3),
+                FrameVerdict::ConnectionError(ERR_STREAM_CLOSED),
+                "{ftype:#x} after END_STREAM is a connection error"
+            );
+        }
+        // Possibly in flight when we closed; tolerated either way.
+        assert_eq!(c.frame_verdict(TYPE_WINDOW_UPDATE, 3), FrameVerdict::Allow);
+        assert_eq!(c.frame_verdict(TYPE_RST_STREAM, 3), FrameVerdict::Allow);
+    }
+
+    #[test]
+    fn closed_after_rst_stream_is_only_a_stream_error() {
+        let mut c = Http2Conn::new();
+        c.last_stream_id = 9;
+        c.note_reset(3);
+        for ftype in [TYPE_DATA, TYPE_HEADERS, TYPE_CONTINUATION] {
+            assert_eq!(
+                c.frame_verdict(ftype, 3),
+                FrameVerdict::StreamError(ERR_STREAM_CLOSED),
+                "{ftype:#x} after RST_STREAM is a stream error, not a connection error"
+            );
+        }
+    }
+
+    /// The reset memory must stay bounded. Unbounded, it is a
+    /// memory-exhaustion vector a peer drives by opening and resetting streams
+    /// in a loop -- the shape of Rapid Reset, CVE-2023-44487.
+    #[test]
+    fn reset_memory_is_bounded_and_evicts_oldest_first() {
+        let mut c = Http2Conn::new();
+        for id in 1..=(RESET_MEMORY as u32 + 50) {
+            c.note_reset(id);
+        }
+        assert_eq!(c.recently_reset.len(), RESET_MEMORY);
+        assert!(!c.was_reset(1), "oldest entries must be evicted");
+        assert!(c.was_reset(RESET_MEMORY as u32 + 50), "newest must be retained");
+    }
+
+    /// Stream 0 is the connection, not a stream. Its frames are validated by
+    /// their own handlers, and running them through the stream table would
+    /// classify the connection itself as idle.
+    #[test]
+    fn stream_zero_bypasses_the_stream_table() {
+        let c = Http2Conn::new();
+        for ftype in [TYPE_SETTINGS, TYPE_PING, TYPE_GOAWAY, TYPE_WINDOW_UPDATE] {
+            assert_eq!(c.frame_verdict(ftype, 0), FrameVerdict::Allow);
+        }
+    }
+
+    /// RFC 9113 6.10: CONTINUATION is only legal immediately after a HEADERS
+    /// or PUSH_PROMISE that lacked END_HEADERS. Only the forward direction was
+    /// checked -- a CONTINUATION arriving with none outstanding was accepted
+    /// and processed as though it continued a header block that had ended.
+    #[test]
+    fn continuation_without_a_preceding_headers_is_refused() {
+        let mut f = open_stream(1);          // carries END_HEADERS
+        f.extend(frame(TYPE_CONTINUATION, FLAG_END_HEADERS, 1, &[0x82]));
+        assert!(feed(&f).is_err(), "CONTINUATION after END_HEADERS must be refused");
+    }
+
+    /// RFC 9113 5.1.1: a new stream id must exceed every id already opened.
+    /// Going backwards was answered with RST_STREAM, a stream error that
+    /// leaves the connection running -- but the peer's numbering is broken, so
+    /// nothing after it can be trusted. It is a connection error.
+    #[test]
+    fn decreasing_stream_ids_end_the_connection() {
+        let mut f = open_stream(5);
+        f.extend(open_stream(3));
+        let mut c = Http2Conn::new();
+        c.phase = Phase::Active;
+        c.recv_buf.extend_from_slice(&f);
+        let mut on_request = |_: &HttpRequest, _: &str| -> RequestOutcome {
+            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "t".to_string(),
+                                  std::sync::Arc::new(vec![]))
+        };
+        while let Ok(true) = c.process_frame(&mut on_request, "127.0.0.1") {}
+        assert_eq!(c.phase, Phase::GoingAway, "a backwards stream id must GOAWAY");
     }
 }
