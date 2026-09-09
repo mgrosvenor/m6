@@ -438,20 +438,62 @@ fn test_basic_proxy() {
 fn test_cache_hit() {
     let stack = EdgeStack::start();
 
-    // First request — cache miss, goes to global.
+    // First request — cache miss, goes to global. Timed so the hit below can
+    // be compared against this same machine's own miss rather than against a
+    // constant that assumes an idle box.
+    let t_miss = Instant::now();
     let (s1, _, b1) = stack.get("/");
+    let miss_latency = t_miss.elapsed();
     assert_eq!(status_code(&s1), 200);
 
     // Second request — should be a cache hit at the edge.
     let t0 = Instant::now();
     let (s2, _, b2) = stack.get("/");
-    let hit_latency = t0.elapsed();
+    let first_hit = t0.elapsed();
     assert_eq!(status_code(&s2), 200);
     assert_eq!(b1, b2, "cache hit body must match cache miss body");
 
-    // On loopback the cache hit should be well under 5 ms.
-    assert!(hit_latency < Duration::from_millis(5),
-        "cache hit took {:?}, expected < 5ms", hit_latency);
+    // Timing is asserted as a RATIO against this stack's own cache miss, plus
+    // a generous absolute ceiling — not as a tight absolute bound.
+    //
+    // This previously asserted `hit < 5ms`. A cache hit is ~3us of server
+    // work, so a 5ms bound is ~1600x that and was really bounding process
+    // scheduling and the loopback round trip. On the 4-core build host that
+    // is unbounded: the test passed 5/5 alone and 4/4 with only its own
+    // binary running, and failed only under the full workspace suite, where
+    // many test binaries compete for the same cores. A wall-clock bound on a
+    // shared machine measures the machine.
+    //
+    // Same trap as the benchmark harness (see docs/BENCHMARKS.md): co-locating
+    // the load with the thing being measured produced a 50x spread between
+    // identical runs. A test that fails on a busy machine is not detecting a
+    // regression, it is detecting the other tests.
+    //
+    // Minimum of several samples is the right statistic for "how fast can
+    // this be": scheduling noise only ever adds time, so the floor is stable
+    // where the mean and the single sample are not.
+    let best_hit = (0..3)
+        .map(|_| {
+            let t = Instant::now();
+            let (s, _, _) = stack.get("/");
+            assert_eq!(status_code(&s), 200);
+            t.elapsed()
+        })
+        .chain(std::iter::once(first_hit))
+        .min()
+        .expect("at least one sample");
+
+    assert!(
+        best_hit < miss_latency,
+        "cache hit ({best_hit:?}) should beat the cache miss ({miss_latency:?})"
+    );
+    // Catches a pathological regression (a hit that goes to the backend
+    // anyway) without pretending to measure microseconds through a loopback
+    // socket on a contended box.
+    assert!(
+        best_hit < Duration::from_millis(50),
+        "cache hit took {best_hit:?}, far beyond any plausible hit"
+    );
 }
 
 /// 3. Cache miss — nocache path always forwards to global.
