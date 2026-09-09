@@ -13,6 +13,7 @@ pub struct Config {
     pub server: ServerConfig,
     pub log: LogConfig,
     pub analytics: AnalyticsConfig,
+    pub health: HealthConfig,
     pub rate_limit: RateLimitConfig,
     pub errors: ErrorsConfig,
     pub security: SecurityConfig,
@@ -167,6 +168,31 @@ fn default_analytics_log_path() -> String {
 impl Default for AnalyticsConfig {
     fn default() -> Self {
         AnalyticsConfig { enabled: default_true(), log_path: default_analytics_log_path() }
+    }
+}
+
+/// The per-node health endpoint (see `crate::health`).
+///
+/// Answered inside m6-http ahead of routing, the cache and every backend, so
+/// it costs a JSON serialisation rather than a page render.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Configurable rather than hardcoded so a site that legitimately wants
+    /// to serve its own `/health` page can move ours out of the way instead
+    /// of being silently shadowed by it.
+    #[serde(default = "default_health_path")]
+    pub path: String,
+}
+
+fn default_health_path() -> String {
+    "/health".to_string()
+}
+
+impl Default for HealthConfig {
+    fn default() -> Self {
+        HealthConfig { enabled: default_true(), path: default_health_path() }
     }
 }
 
@@ -421,6 +447,7 @@ struct RawSiteToml {
     server: Option<RawServerSection>,
     log: Option<LogConfig>,
     analytics: Option<AnalyticsConfig>,
+    health: Option<HealthConfig>,
     rate_limit: Option<RateLimitConfig>,
     errors: Option<ErrorsConfig>,
     security: Option<SecurityConfig>,
@@ -570,6 +597,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
     };
     let log = site_parsed.log.unwrap_or_default();
     let analytics = site_parsed.analytics.unwrap_or_default();
+    let health = site_parsed.health.unwrap_or_default();
     let rate_limit = site_parsed.rate_limit.unwrap_or_default();
     let errors = site_parsed.errors.unwrap_or_default();
     let security = site_parsed.security.unwrap_or_default();
@@ -681,6 +709,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         server,
         log,
         analytics,
+        health,
         rate_limit,
         errors,
         security,
