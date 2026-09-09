@@ -73,7 +73,71 @@ is no advertised bound, and a client has no way to know one exists.
 Ordered so that each phase is independently shippable and independently
 verifiable. Phase 0 comes first because it converts the argument into a number.
 
-### Phase 0 — Measure (h2spec)
+## Measured: h2spec, 2026-09-09
+
+**146 tests, 97 passed, 49 failed** (h2spec v2.6.0 against staging, TLS,
+`-h 127.0.0.1 -p 443 -t -k`, 240s).
+
+Two-thirds pass with no conformance work ever done. The framing layer, HPACK
+codec, SETTINGS negotiation and stream multiplexing foundations are sound — the
+failures are concentrated, not diffuse.
+
+**49 failures, five root causes:**
+
+| root cause | failures | RFC sections |
+|---|---:|---|
+| Pseudo-header validation | ~21 | 8.1, 8.1.2, 8.1.2.1/.2/.3/.6 |
+| Stream state machine | ~16 | 5.1, 5.1.1, 5.4.1, 6.4 |
+| Frame validation table | ~11 | 4.2, 6.1, 6.3, 6.5, 6.7, 6.10 |
+| HPACK error handling | ~2 | HPACK 4.2, 6.3 |
+| Flow control | ~2 | 6.9.1 |
+
+**This settles the build-vs-replace question in favour of building.** An earlier
+draft of this plan said "40+ failures means nghttp2 becomes the honest answer".
+That threshold was wrong: it treated *test count* as *bug count*. 49 failing
+tests over 5 well-specified defects is a different proposition from 49
+independent ones, and every one of the five is in a part of the RFC that
+prescribes the behaviour exactly.
+
+**nghttp2 is now off the table** unless something below proves far harder than
+it looks.
+
+### Re-ordered by measured payoff
+
+The original phase order put the state machine first because it looked like the
+root of everything. The measurement says otherwise: **pseudo-header validation
+is the single largest cluster AND the easiest work** — it is input validation on
+an already-decoded header list, with no state machine involvement at all.
+
+Representative failures, all currently answered with a 200 where the RFC
+requires PROTOCOL_ERROR:
+
+- "Sends a HEADERS frame that contains the header field name in uppercase letters"
+- "Sends a HEADERS frame that contains a unknown pseudo-header field"
+- "Sends a HEADERS frame with empty \":path\" pseudo-header field"
+
+That is one validation function over the decoded list, and it clears ~21 of 49.
+
+**Order: 1. pseudo-headers (~21) → 2. state machine (~16) → 3. frame validation
+table (~11) → 4. HPACK errors (~2) → 5. flow control (~2).**
+
+### Reproducing the measurement
+
+    ssh -p 4022 root@<build-host> \
+      "h2spec -h 127.0.0.1 -p 443 -t -k --timeout 5"
+
+**Against staging, never production.** h2spec deliberately sends malformed
+frames and this code has already had one remotely triggerable panic (F076).
+
+Raise `requests_per_min` on staging for the run and restore it afterwards —
+h2spec opens ~146 connections and would otherwise measure the rate limiter. The
+same trap invalidated the first benchmark run.
+
+Note when reading raw h2spec output: each failure line is emitted twice (the
+tool redraws it), so a naive `grep -c` reports exactly double. 98 counted means
+49 real.
+
+### Phase 0 — Measure (h2spec) — DONE, see above
 
 Run the conformance suite against **staging**, never production: h2spec
 deliberately sends malformed frames, and m6 has already had one remotely
