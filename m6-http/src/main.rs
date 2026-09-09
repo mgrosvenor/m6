@@ -513,8 +513,39 @@ fn event_loop(
                     } // end cache hit
 
                     let mut outcome = handle_request(req, client_ip, enc_str, state, false);
-                    if let RequestOutcome::Ready(_, ref mut headers, ..) = outcome {
+                    if let RequestOutcome::Ready(status, ref mut headers, ..) = outcome {
                         set_alt_svc(headers, quic_port);
+                        // Record the cache MISS.
+                        //
+                        // This was missing, and the omission was invisible
+                        // because of where the only other miss-recording site
+                        // sits: the async URL-backend callback below. A cache
+                        // node's backend is the origin over h2c, which is
+                        // always async, so misses were counted there. The
+                        // ORIGIN's backends are unix sockets that complete
+                        // synchronously inside handle_request and return
+                        // Ready, so that callback never fires and no miss was
+                        // ever recorded on the origin.
+                        //
+                        // Measured consequence on the live origin, every
+                        // window for days: cache_misses=0, miss_p50_ns=0, and
+                        // cache_hit_rate=1.0000 -- not a hit rate at all, but
+                        // "of the requests that were counted, all were hits",
+                        // because misses were never in the denominator.
+                        // requests_total undercounted by every miss, and
+                        // backend_errors_total could never rise on the origin
+                        // at all, since is_backend_error is only passed here
+                        // and in the async callback. A 500 from m6-html was
+                        // uncountable.
+                        //
+                        // Ready only. A Pending outcome is a URL backend whose
+                        // completion callback records it; recording here too
+                        // would double-count every edge miss.
+                        //
+                        // HTTP/3 already did this correctly, which is why the
+                        // gap survived: any check of the h3 path looked fine.
+                        let elapsed_ns = start.elapsed().as_nanos() as u64;
+                        state.stats.record(elapsed_ns, false, status >= 500);
                     }
                     outcome
                 },
@@ -676,8 +707,39 @@ fn event_loop(
                     } // end cache hit
 
                     let mut outcome = handle_request(req, client_ip, enc_str, state, false);
-                    if let RequestOutcome::Ready(_, ref mut headers, ..) = outcome {
+                    if let RequestOutcome::Ready(status, ref mut headers, ..) = outcome {
                         set_alt_svc(headers, quic_port);
+                        // Record the cache MISS.
+                        //
+                        // This was missing, and the omission was invisible
+                        // because of where the only other miss-recording site
+                        // sits: the async URL-backend callback below. A cache
+                        // node's backend is the origin over h2c, which is
+                        // always async, so misses were counted there. The
+                        // ORIGIN's backends are unix sockets that complete
+                        // synchronously inside handle_request and return
+                        // Ready, so that callback never fires and no miss was
+                        // ever recorded on the origin.
+                        //
+                        // Measured consequence on the live origin, every
+                        // window for days: cache_misses=0, miss_p50_ns=0, and
+                        // cache_hit_rate=1.0000 -- not a hit rate at all, but
+                        // "of the requests that were counted, all were hits",
+                        // because misses were never in the denominator.
+                        // requests_total undercounted by every miss, and
+                        // backend_errors_total could never rise on the origin
+                        // at all, since is_backend_error is only passed here
+                        // and in the async callback. A 500 from m6-html was
+                        // uncountable.
+                        //
+                        // Ready only. A Pending outcome is a URL backend whose
+                        // completion callback records it; recording here too
+                        // would double-count every edge miss.
+                        //
+                        // HTTP/3 already did this correctly, which is why the
+                        // gap survived: any check of the h3 path looked fine.
+                        let elapsed_ns = start.elapsed().as_nanos() as u64;
+                        state.stats.record(elapsed_ns, false, status >= 500);
                     }
                     outcome
                 },
