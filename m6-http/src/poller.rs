@@ -368,6 +368,15 @@ unsafe impl Send for WakeWriter {}
 unsafe impl Sync for WakeWriter {}
 
 impl WakeWriter {
+    /// The raw write end, for `m6_core::signal::Service::wake_fd`.
+    ///
+    /// The `WakeWriter` must outlive the signal thread, which it does: it is
+    /// owned by `run` for the life of the process.
+    #[inline]
+    pub fn as_raw_fd(&self) -> RawFd {
+        self.0
+    }
+
     /// Wake the poller. Ignores a full pipe: if bytes are already pending, the
     /// wake this one would have caused is already going to happen.
     #[inline]

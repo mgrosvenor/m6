@@ -183,19 +183,15 @@ fn run() -> i32 {
         warn!(error = %e, "failed to set socket permissions");
     }
 
-    info!(socket = %server.path().display(), issuer = %cfg.issuer, "m6-auth-server starting");
+    info!(issuer = %cfg.issuer, "auth config loaded");
 
-    // Signal handling
-    let _shutdown = ShutdownHandle::install();
-    let shutdown2 = _shutdown.clone();
-
-    // Spawn a thread that unblocks the accept loop after shutdown
-    let socket_path2 = socket_path.clone();
-    std::thread::spawn(move || {
-        shutdown2.wait();
-        // Wake the accept loop
-        let _ = std::os::unix::net::UnixStream::connect(&socket_path2);
-    });
+    // Shutdown. `socket` supplies both things this used to do by hand: the
+    // self-connect that returns the parked accept(), which cost a whole extra
+    // thread spinning on `shutdown.wait()` here, and the socket unlink on the
+    // way out, which this service did not do at all.
+    let _shutdown = ShutdownHandle::install(
+        m6_core::signal::Service::new("m6-auth-server").socket(socket_path.clone()),
+    );
 
     // Accept loop
     loop {
@@ -226,7 +222,7 @@ fn run() -> i32 {
         });
     }
 
-    info!("m6-auth-server shutdown complete");
+    _shutdown.complete();
     0
 }
 

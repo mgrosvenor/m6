@@ -132,7 +132,7 @@ fn run() -> i32 {
     info!(
         route_count = routes.len(),
         site_dir = %site_dir.display(),
-        "m6-file starting"
+        "routes loaded"
     );
 
     let socket_path = if let Ok(override_path) = std::env::var("M6_SOCKET_OVERRIDE") {
@@ -170,23 +170,12 @@ fn run() -> i32 {
         return 1;
     }
 
-    info!(socket = %socket_path.display(), "listening on Unix socket");
-
-    // Signal handling lives in m6-core. This crate's version was the best of
-    // the four in the workspace -- sigwait on a dedicated thread rather than a
-    // signal handler, plus a self-connect to wake the blocked accept() -- so
-    // core adopted that design rather than the reverse.
-    let wake_path = socket_path.clone();
-    let unlink_path = socket_path.clone();
-    let shutdown = m6_core::signal::ShutdownHandle::install_with_hooks(
-        move || {
-            // Unblock the accept() loop; it re-checks the flag on wake.
-            let _ = std::os::unix::net::UnixStream::connect(&wake_path);
-        },
-        move || {
-            // A socket left behind keeps a dead member in m6-http's pool.
-            let _ = std::fs::remove_file(&unlink_path);
-        },
+    // Shutdown lives entirely in m6-core: the self-connect that wakes the
+    // parked accept() and the socket unlink that keeps a dead member out of
+    // m6-http's pool are both what `socket` means, and they run identically
+    // for every service.
+    let shutdown = m6_core::signal::ShutdownHandle::install(
+        m6_core::signal::Service::new("m6-file").socket(socket_path.clone()),
     );
 
     let pool_size = config
@@ -382,8 +371,7 @@ fn run() -> i32 {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 
-    let _ = std::fs::remove_file(&socket_path);
-    info!("m6-file shutdown complete");
+    shutdown.complete();
     0
 }
 

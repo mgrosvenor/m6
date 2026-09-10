@@ -216,8 +216,14 @@ impl ServerState {
 // whatever timeout it was given, and the loop re-checks the flag. Two file
 // descriptors, created once.
 
-fn setup_signals(wake: WakeWriter) -> m6_core::signal::ShutdownHandle {
-    m6_core::signal::ShutdownHandle::install_with_wake(move || wake.wake())
+fn setup_signals(wake: &WakeWriter) -> m6_core::signal::ShutdownHandle {
+    // No `socket`: m6-http listens on TCP and UDP, not a unix socket, so there
+    // is nothing to unlink and nothing to self-connect to. It parks in
+    // epoll/kqueue rather than accept(), which is the one genuine difference
+    // in how an m6 service waits, so it hands core its wake pipe.
+    m6_core::signal::ShutdownHandle::install(
+        m6_core::signal::Service::new("m6-http").wake_fd(wake.as_raw_fd()),
+    )
 }
 
 // ── quiche TLS/QUIC config ────────────────────────────────────────────────────
@@ -356,7 +362,6 @@ fn event_loop(
         };
 
         if m6_core::signal::is_shutdown() {
-            info!("shutdown signal received");
             break;
         }
 
@@ -952,7 +957,6 @@ fn event_loop(
         }
     }
 
-    info!("m6-http shutdown complete");
     0
 }
 
@@ -3277,7 +3281,7 @@ fn run(args: Vec<String>) -> i32 {
             return 2;
         }
     };
-    let _shutdown = setup_signals(wake_writer);
+    let shutdown = setup_signals(&wake_writer);
 
     // Setup filesystem watcher
     let watcher = match FsWatcher::new(&config) {
@@ -3334,7 +3338,7 @@ fn run(args: Vec<String>) -> i32 {
         bind = %config.server.bind,
         h2c_bind = ?config.server.h2c_bind,
         site = %config.site.name,
-        "m6-http started"
+        "m6-http listeners bound"
     );
 
     // Classified before the struct literal, which moves `config`.
@@ -3366,7 +3370,18 @@ fn run(args: Vec<String>) -> i32 {
         started: std::time::Instant::now(),
     };
 
-    event_loop(udp, tcp_listener, h2c_listener, watcher, &mut state, &mut quiche_config, &log_handle, wake_reader)
+    let code = event_loop(
+        udp,
+        tcp_listener,
+        h2c_listener,
+        watcher,
+        &mut state,
+        &mut quiche_config,
+        &log_handle,
+        wake_reader,
+    );
+    shutdown.complete();
+    code
 }
 
 #[cfg(test)]
