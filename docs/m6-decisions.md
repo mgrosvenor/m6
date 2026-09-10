@@ -236,6 +236,31 @@ migration.
 - m6-http: drain in-flight, exit 0
 - Renderers: finish current request, close socket, exit 0
 
+**Mechanism: `sigwait` on a dedicated thread, never a signal handler.** No code
+runs in signal context, so async-signal-safety is not a constraint and the
+"handler" may allocate, log or take a lock. `m6_core::signal` owns this; no
+service implements its own.
+
+**`m6_core::signal::block()` is the first statement of `main`.** Not the first
+interesting statement, the first one, before logging and before anything that
+could spawn a thread. Blocking a signal is per-thread and threads inherit the
+mask at creation, so a single thread created before the block is enough to make
+the process die on SIGTERM instead of shutting down: the kernel delivers a
+process-directed signal to any thread that does not block it, and the default
+disposition for SIGTERM is death.
+
+This is written down because it already happened. Every service initialised
+logging first, and `tracing_appender::non_blocking` spawns a writer thread. That
+thread had SIGTERM unblocked, took every signal, and killed the process. m6-file
+ran that way in production for a month without shutting down once. systemd
+counts death by the signal it sent as a clean stop, so `systemctl stop` reported
+success the whole time, and the only symptoms were a missing shutdown log line,
+in-flight requests cut instead of drained, and a socket file left behind for
+m6-http to keep in its backend pool.
+
+`ShutdownHandle::install*` asserts the mask is already set and refuses to start
+otherwise, because nothing else about the failure is visible.
+
 ## Exit Codes
 
 - 0: success / clean shutdown

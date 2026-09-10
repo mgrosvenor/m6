@@ -137,21 +137,46 @@ restricts the character set.
 
 ---
 
-## Phase 2 — `m6_core::testkit`
+## Phase 2 — `m6_core::testkit` — **done**, commit `3b9b895`
 
 Everything after this needs it.
 
-Provides: socket and port claiming without a time-of-check-to-time-of-use race,
-service spawn and teardown, request builders, and a raw-socket client for
-framing-level tests (`tools/rapidreset.py` is the working prototype).
+Provides: port claiming without a time-of-check-to-time-of-use race, binary
+location, service spawn and teardown, readiness waits, and a byte-level HTTP
+client for framing tests. Behind the `testkit` feature, so no production binary
+links it.
 
-Then migrate the existing test files onto it. Four of eight in `m6-http/tests`
-carry their own port logic today.
+Migrated: all four `m6-http` suites that carried their own port logic, plus
+`m6-file` and `m6-html`, which each had their own copy of everything.
+`m6-http/tests/common/` is deleted.
+
+**What it found.** Two things worth more than the deduplication.
+
+*The known flake was never diagnosable.* All four suites piped a child's stderr
+and then never read it, which is two bugs at once: a child logging more than one
+pipe buffer blocks in `write` and stops serving, and a child that dies has its
+last words thrown away, so the test reports `ConnectionRefused` and nothing
+else. `Service` drains stderr continuously and prints it on any failed assertion
+about the service.
+
+*Every m6 service was dying on SIGTERM instead of shutting down.* Blocking a
+signal is per-thread and threads inherit the mask at creation; logging was
+initialised first, and `tracing_appender::non_blocking` spawns a writer thread,
+so by the time `main` blocked SIGTERM that thread had had it unblocked for a
+hundred lines. The kernel delivered every signal there and the default
+disposition killed the process. m6-file had not logged a shutdown in thirty days
+of production. See "Signal Handling" in `m6-decisions.md`; the fix is
+`m6_core::signal::block()` first in `main`, now asserted rather than documented.
+
+Two suites also had a shared-socket-path hazard: `m6-file` and `m6-html` put
+their sockets at a fixed `$TMPDIR/<id>.sock` and deleted whatever was there
+before spawning, so one run could unlink a socket a live server was using.
 
 **Gate:** full suite green, run **at least ten consecutive times**, because
 this phase exists partly to fix an intermittent failure and a single green run
-proves nothing. The known flake is `ConnectionRefused` at
-`robustness.rs:138` under full-suite parallelism.
+proves nothing. Plus `check.sh` on the Linux build box, which caught a
+Phase 1b leftover: `poller.rs` still referenced the removed `sigmask` in its
+`cfg(linux)` arm, so the tree did not compile on Linux at all.
 
 **Risk:** low for production, moderate for the suite. **Rollback:** the old
 helpers stay until the last file is migrated.
@@ -320,21 +345,22 @@ worth knowing.
 
 ## Summary
 
-| Phase | Changes the wire | Risk | Blocks |
-|---|---|---|---|
-| 0 Prerequisites | no | none | everything |
-| 1 Small consolidations | no | low | — |
-| 2 Testkit | no | low | 3, 4, 5, 8 |
-| 3 Semantics | no (fixes one bug) | moderate | 4 |
-| 4 HTTP/1.1 | yes | moderate-high | 5 |
-| 5 Service loop | no | high (size) | 6 |
-| 6 Consumer apps | no | low | 7, 8 |
-| 7 Decouple repos | no | low | — |
-| 8 Backend examples | no | low | — |
+| Phase | Changes the wire | Risk | Blocks | Status |
+|---|---|---|---|---|
+| 0 Prerequisites | no | none | everything | done |
+| 1 Small consolidations | no | low | — | done, `3780834` |
+| 2 Testkit | no | low | 3, 4, 5, 8 | done, `3b9b895` |
+| 3 Semantics | no (fixes one bug) | moderate | 4 | next |
+| 4 HTTP/1.1 | yes | moderate-high | 5 | |
+| 5 Service loop | no | high (size) | 6 | |
+| 6 Consumer apps | no | low | 7, 8 | |
+| 7 Decouple repos | no | low | — | |
+| 8 Backend examples | no | low | — | |
 
-Phases 1 and 2 can start immediately and are worth doing regardless of whether
-the rest proceeds: Phase 1 closes a security divergence, and Phase 2 probably
-closes the open test flake.
+Phases 1 and 2 were worth doing regardless of whether the rest proceeds, and
+that held: Phase 1 closed a security divergence, and Phase 2 closed the open
+test flake and found a production shutdown defect that had been live for a
+month. Nothing is deployed yet; the whole sequence ships at the end.
 
 **Stopping early is a valid outcome.** Phases 1 through 3 leave the codebase
 better with no architectural commitment. The commitment starts at Phase 5.
