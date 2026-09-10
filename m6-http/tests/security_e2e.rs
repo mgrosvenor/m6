@@ -326,6 +326,23 @@ impl Server {
         }
     }
 
+    /// Wait until a request actually reaches the backend.
+    ///
+    /// Listening on the port is not the same as being able to serve: m6-http
+    /// fills its backend pool from a periodic rescan, so there is a window
+    /// where every request is a 502. This was `sleep(2500)`, a number tuned on
+    /// a fast laptop, and it was not enough on the slower Linux build box.
+    fn wait_until_serving(&self) {
+        let ready = m6_core::testkit::wait::until(Duration::from_secs(30), || {
+            https_get(self, "/public/probe.txt", &[], self.tls()).status == 200
+        });
+        assert!(
+            ready,
+            "m6-http never served a backend request\n--- stderr ---\n{}",
+            self.http.borrow().stderr_text()
+        );
+    }
+
     /// Kill the m6-file backend. Afterwards only cache hits can be served —
     /// anything reaching the backend pool fails.
     fn kill_backend(&mut self) {
@@ -357,6 +374,8 @@ fn start_server(rate_limit_per_min: u32) -> Server {
     std::fs::create_dir_all(site.join("private")).unwrap();
     std::fs::create_dir_all(site.join("configs")).unwrap();
     std::fs::write(site.join("public/open.txt"), b"PUBLIC CONTENT").unwrap();
+    // Used only as the readiness probe, so no test's path is warmed by it.
+    std::fs::write(site.join("public/probe.txt"), b"PROBE").unwrap();
     std::fs::write(site.join("private/secret.txt"), b"TOP SECRET").unwrap();
 
     let sock = dir.path().join("m6-file-1.sock");
@@ -454,10 +473,8 @@ name = "test-node"
         Command::new(binary("m6-http")).arg(site).arg(site.join("system.toml")),
     );
     http_proc.wait_for_tcp(port, Duration::from_secs(10));
-    // m6-http discovers backend sockets by periodic rescan (2s interval).
-    std::thread::sleep(Duration::from_millis(2500));
 
-    Server {
+    let srv = Server {
         port,
         cert_der,
         admin_jwt,
@@ -465,7 +482,9 @@ name = "test-node"
         file: file_proc,
         _dir: dir,
         _port: claim,
-    }
+    };
+    srv.wait_until_serving();
+    srv
 }
 
 // ── Finding 1 (e2e): cache serves protected content to anonymous clients ─────

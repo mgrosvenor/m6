@@ -324,6 +324,31 @@ impl Server {
     fn get(&self, path: &str, extra: &[(&str, &str)]) -> HttpResponse {
         https_exchange(self.tcp(), self.port, path, extra, self.tls())
     }
+
+    /// Wait until a request actually reaches the backend, then clear the log.
+    ///
+    /// Listening on the port is not the same as being able to serve: m6-http
+    /// fills its backend pool from a periodic rescan, so there is a window
+    /// where every request is a 502. This was `sleep(2500)`, a number tuned on
+    /// a fast laptop, and on the slower Linux build box it was not enough:
+    /// five tests here failed with 502 against an empty pool.
+    ///
+    /// The probe requests are real, so they are logged. Every test in this file
+    /// counts analytics lines and assumes it starts from an empty log, so the
+    /// log is truncated once the server is ready. The settle is for
+    /// tracing-appender, which writes on its own thread.
+    fn wait_until_serving(&self) {
+        let ready = m6_core::testkit::wait::until(Duration::from_secs(30), || {
+            self.get("/public/probe.html", &[]).status == 200
+        });
+        assert!(
+            ready,
+            "m6-http never served a backend request\n--- stderr ---\n{}",
+            self.http.borrow().stderr_text()
+        );
+        std::thread::sleep(Duration::from_millis(250));
+        std::fs::write(&self.analytics_log, b"").expect("truncate analytics log");
+    }
 }
 
 /// Bring up `m6-file` + `m6-http` with analytics enabled (the default —
@@ -352,6 +377,10 @@ fn start_server() -> Server {
     // text/html response (only those mint a session, per the HTTP-06 fix) but
     // must not drag page.html's prefetch hints into their own line counts.
     std::fs::write(site.join("public/plain.html"), b"<!doctype html><title>hi</title>").unwrap();
+    // Used only as the readiness probe, so no test's path is warmed by it.
+    // Probing a path a test then asserts on turns its first request into a
+    // cache HIT, and `session_cookie_minted_once_and_reused_h3` asserts MISS.
+    std::fs::write(site.join("public/probe.html"), b"<!doctype html><title>probe</title>").unwrap();
 
     let sock = dir.path().join("m6-file-1.sock");
     let sock_glob = dir.path().join("m6-file-*.sock");
@@ -438,9 +467,8 @@ name = "test-node"
             .arg(site.join("system.toml")),
     );
     http_proc.wait_for_tcp(port, Duration::from_secs(10));
-    std::thread::sleep(Duration::from_millis(2500));
 
-    Server {
+    let srv = Server {
         port,
         cert_der,
         analytics_log,
@@ -448,7 +476,9 @@ name = "test-node"
         _file: file_proc,
         _dir: dir,
         _port: port_claim,
-    }
+    };
+    srv.wait_until_serving();
+    srv
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
@@ -746,9 +776,22 @@ name = "test-node"
             .arg(site.join("system.toml")),
     );
     _http_proc.wait_for_tcp(port, Duration::from_secs(10));
-    std::thread::sleep(Duration::from_millis(2500));
 
     let tls = tls_client_config(&cert_der);
+
+    // Wait until the backend pool is actually populated, then clear the log.
+    // See Server::wait_until_serving for why a fixed sleep is not enough; this
+    // stack has no Server, so the same poll is spelled out.
+    let ready = m6_core::testkit::wait::until(Duration::from_secs(30), || {
+        https_get(port, "/public/open.txt", &[], tls.clone()).status == 200
+    });
+    assert!(
+        ready,
+        "m6-http never served a backend request\n--- stderr ---\n{}",
+        _http_proc.stderr_text()
+    );
+    std::thread::sleep(Duration::from_millis(250));
+    std::fs::write(&analytics_log, b"").expect("truncate analytics log");
 
     // A 404 on a route with no match — dispatches the custom error page
     // fetch via dispatch_custom_error_async, exercising the exact branch
@@ -894,6 +937,13 @@ fn edge_reuses_origin_session_instead_of_minting_a_second_one() {
     // exercise the no-mint path and never see the bug this test guards.
     std::fs::write(origin_site.join("public/page.html"), b"<!doctype html><title>x</title>")
         .unwrap();
+    // A second asset used only as the readiness probe. It must not be the
+    // path under test: probing through the edge would populate the edge cache,
+    // the real request would then be a HIT, the origin would never see it, and
+    // the assertion that both nodes logged a line would fail for a reason that
+    // has nothing to do with sessions.
+    std::fs::write(origin_site.join("public/probe.html"), b"<!doctype html><title>probe</title>")
+        .unwrap();
 
     let origin_sock = origin_dir.path().join("m6-file-1.sock");
     let origin_sock_glob = origin_dir.path().join("m6-file-*.sock");
@@ -967,7 +1017,6 @@ backend = "m6-file"
             .arg(origin_site.join("system.toml")),
     );
     _origin_http_proc.wait_for_tcp(origin_port, Duration::from_secs(10));
-    std::thread::sleep(Duration::from_millis(1500));
 
     // ── Edge: its only backend IS the origin's m6-http ─────────────────────
     let edge_dir = tempfile::tempdir().unwrap();
@@ -1031,7 +1080,25 @@ backend = "origin"
             .arg(edge_site.join("system.toml")),
     );
     _edge_http_proc.wait_for_tcp(edge_port, Duration::from_secs(10));
-    std::thread::sleep(Duration::from_millis(1500));
+
+    // Both stacks must actually be serving, not merely listening: m6-http
+    // fills its backend pool from a periodic rescan. This was two
+    // `sleep(1500)`s and they were not enough on the Linux build box. Probing
+    // the edge exercises the whole chain, so it covers the origin too.
+    let probe_tls = tls_client_config(&edge_cert_der);
+    let ready = m6_core::testkit::wait::until(Duration::from_secs(30), || {
+        https_get(edge_port, "/public/probe.html", &[], probe_tls.clone()).status == 200
+    });
+    assert!(
+        ready,
+        "the edge never served a request through to the origin\n         --- edge stderr ---\n{}\n--- origin stderr ---\n{}",
+        _edge_http_proc.stderr_text(),
+        _origin_http_proc.stderr_text()
+    );
+    // The probes are logged like any other request, and this test counts lines.
+    std::thread::sleep(Duration::from_millis(250));
+    std::fs::write(&origin_analytics_log, b"").expect("truncate origin log");
+    std::fs::write(&edge_analytics_log, b"").expect("truncate edge log");
 
     // ── The actual test: one request through the edge, no cookie yet ──────
     let edge_tls = tls_client_config(&edge_cert_der);

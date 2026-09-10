@@ -38,33 +38,40 @@ pub fn test_profile() -> String {
 
 /// Path to a built workspace binary, for tests that spawn real services.
 ///
-/// **Why this searches two profiles.** `check.sh` builds the workspace with
-/// `--release` and then runs `cargo test` without it, so the test binary is a
-/// debug build while the services it spawns are release builds. Looking only
-/// in the test's own profile would fail in the standard CI path; looking only
-/// in `release` would fail for anyone running `cargo test` alone. So: the
-/// test's own profile first, then the other one.
+/// **Release first, always, whatever profile the test itself was built with.**
+/// `check.sh` builds the workspace with `--release` and then runs `cargo test`
+/// without it, so the test binary is a debug build while the services it is
+/// meant to exercise are release builds. `cargo test` also builds each
+/// package's `bin` targets in debug as a side effect, so a `target/debug/m6-file`
+/// exists whether or not anyone wanted one.
+///
+/// Preferring the test's own profile therefore silently swapped every spawned
+/// service for its debug build. On a fast laptop that only made the suite
+/// slower; on the Linux build box a debug `m6-file` started too slowly for
+/// `m6-http`'s backend rescan window and five `analytics_e2e` tests failed with
+/// 502. Debug binaries are also not the artefact being validated.
+///
+/// Debug remains the fallback for `cargo test` run on its own with no release
+/// build present.
 ///
 /// Panics with both paths and the build command to run, because "missing
-/// binary" is the single most common first-run failure and a bare
-/// `NotFound` says nothing about the fix.
+/// binary" is the single most common first-run failure and a bare `NotFound`
+/// says nothing about the fix.
 pub fn binary(name: &str) -> PathBuf {
     let target = target_dir();
-    let own = test_profile();
-    let other = if own == "release" { "debug" } else { "release" };
 
-    let first = target.join(&own).join(name);
-    if first.exists() {
-        return first;
+    let release = target.join("release").join(name);
+    if release.exists() {
+        return release;
     }
-    let second = target.join(other).join(name);
-    if second.exists() {
-        return second;
+    let fallback = target.join(test_profile()).join(name);
+    if fallback.exists() {
+        return fallback;
     }
     panic!(
         "missing binary {name:?}\n  looked in: {}\n  looked in: {}\n  \
          build it first: cargo build --workspace --release",
-        first.display(),
-        second.display(),
+        release.display(),
+        fallback.display(),
     );
 }
