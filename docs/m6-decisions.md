@@ -236,6 +236,35 @@ migration.
 - m6-http: drain in-flight, exit 0
 - Renderers: finish current request, close socket, exit 0
 
+**One sequence, in `m6_core::signal`, for every service.** There is a single
+entry point, `ShutdownHandle::install(Service)`. What a service supplies is
+data, not a different code path:
+
+| field | what it does |
+|---|---|
+| `name` | the name in every lifecycle line |
+| `socket` | self-connect to return a parked `accept()`; unlink the socket on every exit path, graceful and forced |
+| `wake_fd` | one byte to a poller's pipe, for a loop parked in epoll/kqueue |
+
+`wake_fd` is a file descriptor rather than a closure because writing a byte is
+all the difference amounts to. `m6-http` is the only service that parks in
+epoll/kqueue rather than `accept()`, and that is a genuine difference in how
+the loop waits; the sequence around it is not.
+
+**Core owns the lifecycle log lines.** `"<name> started"`, `"<name> shutdown
+signal received"`, and `"<name> shutdown complete"` or `"forced"`. Apps still
+log their own domain fields (route counts, thread pool size, bind address);
+those are data, not lifecycle. This is what makes
+`journalctl -u <unit> | grep shutdown` mean the same thing for every unit,
+which is the check that found the defect below.
+
+This is written down because the alternative was tried. Three install
+overloads meant three shutdown sequences with a shared signal thread, and the
+services diverged accordingly: one of five unlinked its socket, two of five
+logged a completion line, three of five logged a startup line, all three render
+apps logged `m6-render` rather than their own name, and `m6-md` logged nothing
+at all. None of that was demanded by anything the services do.
+
 **Mechanism: `sigwait` on a dedicated thread, never a signal handler.** No code
 runs in signal context, so async-signal-safety is not a constraint and the
 "handler" may allocate, log or take a lock. `m6_core::signal` owns this; no
