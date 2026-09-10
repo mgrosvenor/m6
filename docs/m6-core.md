@@ -66,16 +66,25 @@ Anything that would make a non-Rust backend a second class citizen belongs in
                         │  any language                │
                         └──────────────────────────────┘
 
-   m6-core is linked by m6-http and by Rust applications.
-   It is not a process and does not appear in the request path by itself.
+   m6-core is linked by m6-http, by the default apps, and OPTIONALLY by
+   consumer apps. It is not a process and does not appear in the request
+   path by itself. m6-render is one of the default apps, not a layer.
 ```
 
 `m6-core` sits beside both, not between them. `m6-http` links it for the
 protocol implementations and the semantics. A Rust application links it for
 the service scaffolding. The two use different features (§5).
 
-`m6-render` layers on top of `m6-core` for template driven applications and is
-documented separately.
+**`m6-render` is a default app, not a dependency for consumer apps.** It
+provides template rendering over `m6-core`, in the same way `m6-file` provides
+static files and `m6-auth-server` provides auth. A consumer app links
+`m6-core`, or nothing at all, and never `m6-render`.
+
+Duplicate dependencies are acceptable where coupling is not: an app that wants
+Tera declares Tera. It does not acquire a template engine as a side effect of
+wanting a server loop, which is the situation today, where three of the four
+`m6-render` consumers have zero template files and link it for `App`,
+`Request` and `Response`.
 
 ## 4. What belongs in m6-core
 
@@ -309,6 +318,9 @@ Measured against this document:
 the detail.
 
 ## 10. Sequence
+
+The step-by-step migration, with gates, risks and rollback per phase, is in
+**`m6-core-implementation-plan.md`**. Summary below.
 
 Ordered so each step ships on its own and makes the next cheaper. This is a
 re-verification exercise against a live system, not a refactor: the conformance
