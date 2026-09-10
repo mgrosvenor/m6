@@ -28,7 +28,7 @@ use m6_http_lib::config::{self, Config};
 use m6_http_lib::error::{self as error, ErrorMode};
 use m6_http_lib::forward::{self, HttpRequest, HttpResponse};
 use m6_http_lib::health;
-use m6_http_lib::http2::validate_request_header_bytes;
+use m6_http_lib::fields::validate_request_header_bytes;
 
 /// RFC 9114 8.1: H3_MESSAGE_ERROR, the stream error a server must raise for a
 /// malformed request. Named here rather than taken from quiche so the wire
