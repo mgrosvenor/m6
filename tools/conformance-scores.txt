@@ -5,5 +5,7 @@
 # Lowering one is a decision to accept a regression and must be argued for in
 # the commit message.
 #
-# target             floor  total
-h1:m6-file           15     32
+# target               floor  total
+h1:m6-file             15     32
+h1:m6-html             15     32
+h1:m6-http-redirect    26     32
