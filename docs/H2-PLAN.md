@@ -1,5 +1,15 @@
 # Completing the HTTP/2 implementation
 
+> **STATUS 2026-09-10 — DONE.** h2spec **146/146**, h3spec **37/49** (all 12
+> remaining failures inside quiche, none attributable to m6). All phases below
+> are complete, including Phase 6 (Rapid Reset), which is **deployed to the
+> fleet** (`m6 438bdb3`). The only H2 item not implemented is
+> `SETTINGS_MAX_HEADER_LIST_SIZE` (0x6) — see Phase 6's HPACK-bomb note. This
+> document is kept as the record of how it was done; everything from
+> "What is actually missing" down to the phase list is the **original
+> 2026-09-09 diagnosis**, present-tense as first written — read the "Measured"
+> section and the per-phase DONE markers for what is actually true now.
+
 **Decision taken 2026-09-09.** m6 keeps one concurrency model — the synchronous
 epoll loop — and HTTP/2 is a hard requirement. That rules out the `h2` crate
 (async, tokio-coupled) and rules out dropping H2. The remaining honest options
@@ -24,6 +34,10 @@ were a sans-io codec or finishing the hand-written implementation properly.
 - **Dropping H2** — rejected by the owner as a hard requirement.
 
 ## What is actually missing
+
+*(Original 2026-09-09 diagnosis, present-tense as first written. All of the
+items in this section are now DONE — see the phase markers and the "Measured"
+section. Kept for the reasoning, not as current state.)*
 
 Read out of `m6-http/src/http2.rs`, not inferred:
 
