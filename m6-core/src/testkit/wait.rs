@@ -42,6 +42,18 @@ pub fn for_unix(path: &Path, timeout: Duration) -> bool {
     })
 }
 
+/// Poll `ready` until it returns true or `timeout` elapses.
+///
+/// The general form, for readiness that only the caller can express. The
+/// specific case this exists for: a proxy accepting on its port does not mean
+/// it can serve, because its backend pool is filled by a periodic rescan and
+/// there is a window where every request is a 502. Suites used to cover that
+/// window with `sleep(2500)`, tuned on a fast laptop, and it was not enough on
+/// the slower build box.
+pub fn until(timeout: Duration, ready: impl FnMut() -> bool) -> bool {
+    poll_until(timeout, ready)
+}
+
 fn poll_until(timeout: Duration, mut ready: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
