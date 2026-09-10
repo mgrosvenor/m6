@@ -49,7 +49,10 @@ enum ConnKind {
 
 struct Conn {
     stream: TcpStream,
-    tls:    ServerConnection,
+    /// `None` on a plaintext listener. HTTP/2 already carried this
+    /// distinction (`H2Io::Tls` / `H2Io::Plain`); this gives HTTP/1.1 the same
+    /// one, so `:80` runs this code rather than a second implementation.
+    tls:    Option<ServerConnection>,
     kind:   ConnKind,
 }
 
@@ -94,12 +97,27 @@ const MAX_REQUEST_BYTES: usize = 20 * 1024 * 1024;
 
 pub struct Http11Listener {
     listener:   TcpListener,
-    tls_config: Arc<rustls::ServerConfig>,
+    /// `None` binds a plaintext listener. Only HTTP/1.1 is reachable then:
+    /// h2 needs ALPN, which needs TLS, and h3 needs QUIC, which mandates it.
+    /// A browser following an `http://` link speaks HTTP/1.1 and nothing else.
+    tls_config: Option<Arc<rustls::ServerConfig>>,
     conns:      Vec<Conn>,
 }
 
 impl Http11Listener {
     pub fn bind(addr: &str, tls_config: Arc<rustls::ServerConfig>) -> anyhow::Result<Self> {
+        Self::bind_maybe_tls(addr, Some(tls_config))
+    }
+
+    /// Bind a plaintext HTTP/1.1 listener, for the `:80` half of the pair.
+    pub fn bind_plain(addr: &str) -> anyhow::Result<Self> {
+        Self::bind_maybe_tls(addr, None)
+    }
+
+    fn bind_maybe_tls(
+        addr: &str,
+        tls_config: Option<Arc<rustls::ServerConfig>>,
+    ) -> anyhow::Result<Self> {
         let listener = TcpListener::bind(addr)?;
         listener.set_nonblocking(true)?;
         Ok(Http11Listener { listener, tls_config, conns: Vec::new() })
@@ -122,24 +140,40 @@ impl Http11Listener {
                         continue;
                     }
                     stream.set_nodelay(true).ok();
-                    let mut tls = match ServerConnection::new(Arc::clone(&self.tls_config)) {
-                        Ok(t) => t,
-                        Err(e) => { warn!("tls ServerConnection::new: {e}"); continue; }
+                    let tls = match &self.tls_config {
+                        Some(cfg) => {
+                            let mut tls = match ServerConnection::new(Arc::clone(cfg)) {
+                                Ok(t) => t,
+                                Err(e) => { warn!("tls ServerConnection::new: {e}"); continue; }
+                            };
+                            // Raises rustls' *outgoing* buffering caps (sendable_plaintext /
+                            // sendable_tls) to match MAX_REQUEST_BYTES, so a large response
+                            // written before the peer is ready to receive it doesn't get
+                            // truncated. The incoming side (received_plaintext, where large
+                            // request bodies land) is a separate, fixed 16 KiB buffer with no
+                            // public setter — see the comment on advance_tls's "buffer full"
+                            // handling for how that's dealt with instead.
+                            tls.set_buffer_limit(Some(MAX_REQUEST_BYTES));
+                            // Eagerly start handshake: ClientHello is already buffered on loopback.
+                            let _ = advance_tls(&mut tls, &stream);
+                            Some(tls)
+                        }
+                        // Plaintext: no handshake and no ALPN, so the connection
+                        // is HTTP/1.1 from its first byte.
+                        None => None,
                     };
-                    // Raises rustls' *outgoing* buffering caps (sendable_plaintext /
-                    // sendable_tls) to match MAX_REQUEST_BYTES, so a large response
-                    // written before the peer is ready to receive it doesn't get
-                    // truncated. The incoming side (received_plaintext, where large
-                    // request bodies land) is a separate, fixed 16 KiB buffer with no
-                    // public setter — see the comment on advance_tls's "buffer full"
-                    // handling for how that's dealt with instead.
-                    tls.set_buffer_limit(Some(MAX_REQUEST_BYTES));
                     poller.add(stream.as_raw_fd(), token).ok();
-                    // Eagerly start handshake: ClientHello is already buffered on loopback.
-                    let _ = advance_tls(&mut tls, &stream);
-                    let kind = ConnKind::Handshake {
-                        client_ip: peer.ip().to_string(),
-                        created:   Instant::now(),
+                    let kind = if tls.is_some() {
+                        ConnKind::Handshake {
+                            client_ip: peer.ip().to_string(),
+                            created:   Instant::now(),
+                        }
+                    } else {
+                        ConnKind::Http1(H1Conn {
+                            state:     H1State::Reading { buf: Vec::new() },
+                            client_ip: peer.ip().to_string(),
+                            created:   Instant::now(),
+                        })
                     };
                     self.conns.push(Conn { stream, tls, kind });
                 }
@@ -247,13 +281,28 @@ where
     G: FnMut(std::io::Result<HttpResponse>, &PendingUrlContext)
            -> (u16, Vec<(String, String)>, Vec<u8>, String, std::sync::Arc<Vec<String>>),
 {
+    // Plaintext connection: HTTP/1.1 only, straight to the state machine. No
+    // handshake to pump and no ALPN to dispatch on.
+    let Some(tls) = conn.tls.as_mut() else {
+        let ConnKind::Http1(h1) = &mut conn.kind else { return };
+        drive_h1(
+            &mut H1Io::Plain { stream: &conn.stream },
+            h1,
+            on_request,
+            on_response,
+        );
+        return;
+    };
+    // Borrow ends here; the TLS paths below re-borrow through `conn`.
+    let _ = tls;
+
     // HTTP/2: stream and tls are in conn; pass them by reference.
     if let ConnKind::Http2(h2) = &mut conn.kind {
         let client_ip = conn.stream.peer_addr()
             .map(|a| a.ip().to_string())
             .unwrap_or_default();
         h2.drive(
-            H2Io::Tls { tls: &mut conn.tls, stream: &conn.stream },
+            H2Io::Tls { tls: conn.tls.as_mut().expect("tls path"), stream: &conn.stream },
             &client_ip,
             on_request, on_response,
         );
@@ -261,7 +310,7 @@ where
     }
 
     // Pump TLS I/O for H1 / still-handshaking connections.
-    if advance_tls(&mut conn.tls, &conn.stream).is_err() {
+    if advance_tls(conn.tls.as_mut().expect("tls path"), &conn.stream).is_err() {
         conn.kind = ConnKind::Http1(H1Conn {
             state:     H1State::Done,
             client_ip: String::new(),
@@ -271,13 +320,13 @@ where
     }
 
     // If still handshaking, nothing more to do this tick.
-    if conn.tls.is_handshaking() {
+    if conn.tls.as_ref().expect("tls path").is_handshaking() {
         return;
     }
 
     // Handshake just completed — dispatch on ALPN.
     if let ConnKind::Handshake { client_ip, created } = &conn.kind {
-        let proto     = conn.tls.alpn_protocol().map(|p| p.to_vec());
+        let proto     = conn.tls.as_ref().expect("tls path").alpn_protocol().map(|p| p.to_vec());
         let client_ip = client_ip.clone();
         let created   = *created;
         if proto.as_deref() == Some(b"h2".as_slice()) {
@@ -285,7 +334,7 @@ where
             // Drive immediately — client preface may already be buffered.
             let ConnKind::Http2(h2) = &mut conn.kind else { return };
             h2.drive(
-                H2Io::Tls { tls: &mut conn.tls, stream: &conn.stream },
+                H2Io::Tls { tls: conn.tls.as_mut().expect("tls path"), stream: &conn.stream },
                 &client_ip,
                 on_request, on_response,
             );
@@ -301,12 +350,75 @@ where
 
     // Drive HTTP/1.1 state machine.
     let ConnKind::Http1(h1) = &mut conn.kind else { return };
-    drive_h1(&mut conn.tls, &conn.stream, h1, on_request, on_response);
+    drive_h1(
+        &mut H1Io::Tls { tls: conn.tls.as_mut().expect("tls path"), stream: &conn.stream },
+        h1,
+        on_request,
+        on_response,
+    );
+}
+
+/// Where an HTTP/1.1 connection's bytes come from and go to.
+///
+/// **HTTP/2 has had this since h2c existed** -- `H2Io { Tls, Plain }` in
+/// `http2.rs`, which is how the cleartext backbone reuses the h2 engine.
+/// HTTP/1.1 never got the same treatment, so the plaintext `:80` listener was
+/// written as a second, independent HTTP/1.1 implementation: `redirect.rs`,
+/// 325 lines with its own poll loop, parser and response writer.
+///
+/// That second implementation scored 5-7 of 32 on h1spec, varying run to run,
+/// while this one is exercised by the whole test suite. It dropped the request
+/// of any client that half-closed its write side after sending -- normal,
+/// RFC-conformant behaviour -- because it treated read()==0 as "peer gone" and
+/// skipped the parse-and-respond it had already buffered. 80% of such clients
+/// got no answer at all.
+///
+/// One implementation per protocol version. The plaintext listener is this
+/// same code with `Plain`, and the redirect is a response, not a server.
+enum H1Io<'a> {
+    Tls { tls: &'a mut ServerConnection, stream: &'a TcpStream },
+    Plain { stream: &'a TcpStream },
+}
+
+impl H1Io<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            // rustls' plaintext reader can legitimately yield Ok(0) mid-stream
+            // when a processed TLS record carries no application data (e.g. a
+            // TLS 1.3 post-handshake NewSessionTicket). That does NOT mean the
+            // peer closed; genuine closure is detected in `advance`.
+            H1Io::Tls { tls, .. } => tls.reader().read(buf),
+            H1Io::Plain { stream } => (&mut &**stream).read(buf),
+        }
+    }
+
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            H1Io::Tls { tls, .. } => tls.writer().write(buf),
+            H1Io::Plain { stream } => (&mut &**stream).write(buf),
+        }
+    }
+
+    /// Pump the transport. For TLS that is the record layer; for plaintext
+    /// there is nothing between the buffer and the socket, so it is a no-op.
+    fn advance(&mut self) -> io::Result<()> {
+        match self {
+            H1Io::Tls { tls, stream } => advance_tls(tls, stream),
+            H1Io::Plain { .. } => Ok(()),
+        }
+    }
+
+    /// Whether a `read` returning 0 means the peer is gone.
+    ///
+    /// For plaintext it does: a raw socket returns 0 only at EOF. For TLS it
+    /// does not, per the note in `read`.
+    fn zero_read_is_eof(&self) -> bool {
+        matches!(self, H1Io::Plain { .. })
+    }
 }
 
 fn drive_h1<F, G>(
-    tls:         &mut ServerConnection,
-    stream:      &TcpStream,
+    io:          &mut H1Io<'_>,
     h1:          &mut H1Conn,
     on_request:  &mut F,
     on_response: &mut G,
@@ -324,13 +436,18 @@ where
         match &h1.state {
             H1State::Reading { .. } => {
                 let mut tmp = [0u8; 4096];
-                let n = match tls.reader().read(&mut tmp) {
-                    // rustls' plaintext reader can legitimately yield Ok(0) mid-stream
-                    // when a processed TLS record carries no application data (e.g. a
-                    // TLS 1.3 post-handshake NewSessionTicket) — this does NOT mean the
-                    // peer closed the connection. Genuine closure is already detected
-                    // one layer up in advance_tls (Err on raw socket EOF), so treat this
-                    // the same as WouldBlock: no plaintext ready this round, keep waiting.
+                let n = match io.read(&mut tmp) {
+                    // Over TLS, Ok(0) does not mean the peer closed -- see
+                    // H1Io::read. Over plaintext it does, and the request
+                    // already buffered must still be answered: a client that
+                    // half-closes after sending is entitled to its response.
+                    // Falling through to the parse below is what `redirect.rs`
+                    // failed to do.
+                    Ok(0) if io.zero_read_is_eof() => {
+                        let H1State::Reading { buf } = &h1.state else { break };
+                        if buf.is_empty() { h1.state = H1State::Done; return; }
+                        break;
+                    }
                     Ok(0)  => break,
                     Ok(n)  => n,
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -419,13 +536,13 @@ where
                 buf.extend_from_slice(&build_response(status, &resp_headers, &body, &ctx.req.method));
                 h1.state = H1State::Writing { buf, pos: 0 };
                 // pump TLS to start sending immediately
-                if advance_tls(tls, stream).is_err() { h1.state = H1State::Done; return; }
+                if io.advance().is_err() { h1.state = H1State::Done; return; }
                 continue; // fall through to Writing
             }
             H1State::Writing { buf, pos } => {
                 let remaining = &buf[*pos..];
                 if remaining.is_empty() { h1.state = H1State::Done; return; }
-                match tls.writer().write(remaining) {
+                match io.write(remaining) {
                     Ok(0)      => { h1.state = H1State::Done; return; }
                     Ok(w)      => {
                         let H1State::Writing { pos, .. } = &mut h1.state else { break };
@@ -434,7 +551,7 @@ where
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                     Err(_) => { h1.state = H1State::Done; return; }
                 }
-                if advance_tls(tls, stream).is_err() { h1.state = H1State::Done; return; }
+                if io.advance().is_err() { h1.state = H1State::Done; return; }
                 let H1State::Writing { buf, pos } = &h1.state else { break };
                 if *pos >= buf.len() { h1.state = H1State::Done; return; }
                 break;
