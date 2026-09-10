@@ -9,55 +9,31 @@
 /// a handful of string operations, not a database/ruleset lookup.
 use quiche::h3::NameValue as _;
 
+pub use m6_core::http::{header, HeaderSource};
+
 pub const SESSION_COOKIE: &str = "_m6sid";
 
-/// Abstraction over "a scannable list of request headers," so the same
-/// scanning logic (single-header lookup, and multi-occurrence lookup for
-/// `Cookie`, which HTTP/2+ clients may split across several header fields)
-/// works identically whether the caller holds an owned `Vec<(String,String)>`
-/// (H1/H2/H2C, and the shared MISS-path code) or a raw `&[quiche::h3::Header]`
-/// (H3's cache-hit path, which deliberately avoids building an owned Vec on
-/// that path — see the comment at the H3 cache-hit call site in main.rs).
+/// `HeaderSource` for quiche's header type.
 ///
-/// Both concrete types are slices, so both impls can be scanned as many times
-/// as needed for free — there's no ownership/consumption cost to worry about,
-/// which is what makes a shared trait here strictly better than either (a)
-/// forcing H3 to materialize an owned Vec just to match H1/H2's shape, or (b)
-/// keeping H3's hand-rolled extraction as a permanent special case.
-pub trait HeaderSource {
-    fn find(&self, name: &str) -> Option<&str>;
-    fn find_all<'a>(&'a self, name: &str) -> impl Iterator<Item = &'a str>;
-}
+/// The trait lives in `m6_core::http`, where it belongs, and `quiche` is
+/// `m6-http`'s dependency alone: HTTP/2 and HTTP/3 terminate here and nowhere
+/// else. That leaves `impl m6_core::HeaderSource for [quiche::h3::Header]` as
+/// a foreign trait on a foreign type, which the orphan rule forbids, so the
+/// slice is wrapped.
+///
+/// The wrapper is what keeps H3's cache-hit path free of an owned `Vec`: it
+/// borrows quiche's headers and scans them in place. Materialising a
+/// `Vec<(String, String)>` just to read one header would be an allocation per
+/// request on the hottest path in the server.
+#[derive(Clone, Copy)]
+pub struct H3Headers<'a>(pub &'a [quiche::h3::Header]);
 
-impl HeaderSource for [(String, String)] {
-    fn find(&self, name: &str) -> Option<&str> {
-        self.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
-    }
-    fn find_all<'a>(&'a self, name: &str) -> impl Iterator<Item = &'a str> {
-        self.iter().filter(move |(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
-    }
-}
-
-// `&Vec<T>` does not itself satisfy a generic `impl HeaderSource` bound even
-// though it coerces to `&[T]` in ordinary (non-generic) call positions — trait
-// resolution for `impl Trait` arguments needs the concrete type to implement
-// the trait, and `Vec<T>` is a distinct type from `[T]`. Delegate rather than
-// touch every `&req.headers` call site's syntax.
-impl HeaderSource for Vec<(String, String)> {
-    fn find(&self, name: &str) -> Option<&str> {
-        self.as_slice().find(name)
-    }
-    fn find_all<'a>(&'a self, name: &str) -> impl Iterator<Item = &'a str> {
-        self.as_slice().find_all(name)
-    }
-}
-
-impl HeaderSource for [quiche::h3::Header] {
+impl HeaderSource for H3Headers<'_> {
     fn find(&self, name: &str) -> Option<&str> {
         self.find_all(name).next()
     }
     fn find_all<'a>(&'a self, name: &str) -> impl Iterator<Item = &'a str> {
-        self.iter().filter_map(move |h| {
+        self.0.iter().filter_map(move |h| {
             let n = std::str::from_utf8(h.name()).ok()?;
             if !n.eq_ignore_ascii_case(name) {
                 return None;
@@ -65,22 +41,6 @@ impl HeaderSource for [quiche::h3::Header] {
             std::str::from_utf8(h.value()).ok()
         })
     }
-}
-
-// H3's `PendingRequest.headers` field (main.rs) is `Vec<quiche::h3::Header>` —
-// same Vec-vs-slice coercion issue as above.
-impl HeaderSource for Vec<quiche::h3::Header> {
-    fn find(&self, name: &str) -> Option<&str> {
-        self.as_slice().find(name)
-    }
-    fn find_all<'a>(&'a self, name: &str) -> impl Iterator<Item = &'a str> {
-        self.as_slice().find_all(name)
-    }
-}
-
-/// Look up a header by case-insensitive name.
-pub fn header<'a>(headers: &'a (impl HeaderSource + ?Sized), name: &str) -> Option<&'a str> {
-    headers.find(name)
 }
 
 /// Extract `_m6sid` from a raw `Cookie` header value (e.g. `"a=1; _m6sid=xyz; b=2"`).
@@ -483,7 +443,8 @@ mod tests {
             ("Cookie".to_string(), "a=1".to_string()),
             ("User-Agent".to_string(), "test-ua".to_string()),
         ];
-        let h3_headers = quiche_headers(&[("cookie", "a=1"), ("user-agent", "test-ua")]);
+        let h3_raw = quiche_headers(&[("cookie", "a=1"), ("user-agent", "test-ua")]);
+        let h3_headers = H3Headers(&h3_raw);
 
         assert_eq!(vec_headers.find("user-agent"), h3_headers.find("user-agent"));
         assert_eq!(vec_headers.find("USER-AGENT"), Some("test-ua")); // case-insensitive
@@ -500,7 +461,8 @@ mod tests {
             ("cookie".to_string(), "a=1".to_string()),
             ("cookie".to_string(), "b=2".to_string()),
         ];
-        let h3_headers = quiche_headers(&[("cookie", "a=1"), ("cookie", "b=2")]);
+        let h3_raw = quiche_headers(&[("cookie", "a=1"), ("cookie", "b=2")]);
+        let h3_headers = H3Headers(&h3_raw);
 
         let vec_all: Vec<&str> = vec_headers.find_all("cookie").collect();
         let h3_all: Vec<&str> = h3_headers.find_all("cookie").collect();
@@ -514,7 +476,8 @@ mod tests {
             ("cookie".to_string(), "a=1".to_string()),
             ("cookie".to_string(), "b=2".to_string()),
         ];
-        let h3_headers = quiche_headers(&[("cookie", "a=1"), ("cookie", "b=2")]);
+        let h3_raw = quiche_headers(&[("cookie", "a=1"), ("cookie", "b=2")]);
+        let h3_headers = H3Headers(&h3_raw);
 
         assert_eq!(crate::auth::combined_cookie_header(&vec_headers).as_deref(), Some("a=1; b=2"));
         assert_eq!(crate::auth::combined_cookie_header(&h3_headers).as_deref(), Some("a=1; b=2"));
@@ -526,7 +489,7 @@ mod tests {
         // to find/find_all, same as `str::from_utf8` failing anywhere else in
         // this codebase's header handling.
         let bad = vec![quiche::h3::Header::new(b"user-agent", &[0xFF, 0xFE])];
-        assert_eq!(bad.as_slice().find("user-agent"), None);
+        assert_eq!(H3Headers(bad.as_slice()).find("user-agent"), None);
     }
 
     // ── record()/finish_response(): the actual chokepoint ───────────────────
@@ -558,7 +521,8 @@ mod tests {
         // The whole point of HeaderSource: identical logical input through
         // either representation must produce identical mint-or-reuse behavior.
         let vec_headers = vec![("Cookie".to_string(), "_m6sid=shared-id".to_string())];
-        let h3_headers = quiche_headers(&[("cookie", "_m6sid=shared-id")]);
+        let h3_raw = quiche_headers(&[("cookie", "_m6sid=shared-id")]);
+        let h3_headers = H3Headers(&h3_raw);
 
         let vec_sc = record(true, &vec_headers, "node", "/p", 200, "HIT", "1.2.3.4", None);
         let h3_sc = record(true, &h3_headers, "node", "/p", 200, "HIT", "1.2.3.4", None);

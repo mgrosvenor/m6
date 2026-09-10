@@ -21,6 +21,7 @@ use tracing::{debug, error, info, warn};
 use m6_http_lib::analytics;
 use m6_http_lib::auth;
 use m6_http_lib::rate_limit::RateLimiter;
+use m6_http_lib::analytics::H3Headers;
 use m6_http_lib::cache::{Cache, CacheKey, CachedResponse, make_lookup_key, should_cache, request_permits_storage, strip_set_cookie, evaluate_preconditions, Precondition, not_modified_headers};
 use m6_http_lib::stats::Stats;
 use m6_http_lib::config::{self, Config};
@@ -1315,7 +1316,8 @@ fn handle_h3_request(
         let chan = Channel::new(HttpVersion::Http3, state.tls_iface);
 
         let method_str = std::str::from_utf8(method_bytes).unwrap_or("GET");
-        let precond = evaluate_preconditions(&cached.headers, &req.headers, method_str);
+        let precond =
+            evaluate_preconditions(&cached.headers, &H3Headers(&req.headers), method_str);
         // See the h1/h2 paths: recorded after preconditions so a 304 is
         // counted as a 304 and not as the cached 200.
         state.stats.record(
@@ -1339,7 +1341,7 @@ fn handle_h3_request(
         if precond == Precondition::NotModified {
             let client_ip = qconn.client_addr.ip().to_string();
             let set_cookie = analytics::record(
-                state.config.analytics.enabled, &req.headers,
+                state.config.analytics.enabled, &H3Headers(&req.headers),
                 &state.config.node.name, path_str, 304, cache_state, &client_ip, Some(elapsed_ns),
             );
             let html = analytics::is_html_response(&cached.headers);
@@ -1382,7 +1384,7 @@ fn handle_h3_request(
         // unnecessary intermediate allocation, not a required one).
         let client_ip = qconn.client_addr.ip().to_string();
         let set_cookie = analytics::record(
-            state.config.analytics.enabled, &req.headers,
+            state.config.analytics.enabled, &H3Headers(&req.headers),
             &state.config.node.name, path_str, cached.status, cache_state, &client_ip, Some(elapsed_ns),
         );
 
