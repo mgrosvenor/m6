@@ -53,6 +53,11 @@ struct H2sStream {
     resp_body: Vec<u8>,
     headers_done: bool,
     tx: mpsc::Sender<io::Result<HttpResponse>>,
+    // Resumable request body and per-stream send credit. Same shape and same
+    // reasoning as `h2c_client`; see `pump_stream` there.
+    pending_body: Vec<u8>,
+    body_off: usize,
+    send_window: i32,
 }
 
 // ── H2sTlsClientConn (public) ─────────────────────────────────────────────────
@@ -236,26 +241,6 @@ impl H2sTlsClientConn {
         let headers_flags = FLAG_END_HEADERS | if has_body { 0 } else { FLAG_END_STREAM };
         self.push_frame(TYPE_HEADERS, headers_flags, stream_id, &header_block);
 
-        // Split the body to the peer's SETTINGS_MAX_FRAME_SIZE. Same defect and
-        // same fix as `h2c_client`: one oversized DATA frame per request, which
-        // the origin rejects with FRAME_SIZE_ERROR above 16 KiB. See the comment
-        // there. END_STREAM on the final chunk only.
-        if has_body {
-            let max = (self.peer_max_frame as usize).max(1);
-            let mut off = 0usize;
-            while off < req.body.len() {
-                let end = (off + max).min(req.body.len());
-                let last = end == req.body.len();
-                self.push_frame(
-                    TYPE_DATA,
-                    if last { FLAG_END_STREAM } else { 0 },
-                    stream_id,
-                    &req.body[off..end],
-                );
-                off = end;
-            }
-        }
-
         let (tx, rx) = mpsc::channel();
         self.streams.insert(
             stream_id,
@@ -265,10 +250,75 @@ impl H2sTlsClientConn {
                 resp_body: vec![],
                 headers_done: false,
                 tx,
+                pending_body: if has_body { req.body.clone() } else { Vec::new() },
+                body_off: 0,
+                send_window: self.peer_initial_window,
             },
         );
 
+        // Frame size alone is not permission to send. Same defect and same fix
+        // as `h2c_client` -- the chunking loop honoured SETTINGS_MAX_FRAME_SIZE
+        // but ignored `conn_send_window`, which was incremented on WINDOW_UPDATE
+        // and never read. See the long comment there for why neither skipping
+        // the write nor blocking in the loop is a legal alternative.
+        self.pump_stream(stream_id);
+
         Ok(rx)
+    }
+
+    /// Send as much of a stream's pending body as connection and stream credit
+    /// allow, in frames no larger than the peer's SETTINGS_MAX_FRAME_SIZE.
+    ///
+    /// See `h2c_client::pump_stream`. END_STREAM rides on the frame that drains
+    /// the body, so the bytes sent always match the advertised `content-length`.
+    fn pump_stream(&mut self, stream_id: u32) {
+        let max_frame = (self.peer_max_frame as usize).max(1);
+        loop {
+            let (chunk, last) = {
+                let Some(s) = self.streams.get_mut(&stream_id) else { return };
+                let remaining = s.pending_body.len() - s.body_off;
+                if remaining == 0 {
+                    return;
+                }
+                let credit = self.conn_send_window.min(s.send_window);
+                if credit <= 0 {
+                    return;
+                }
+                let n = remaining.min(max_frame).min(credit as usize);
+                let start = s.body_off;
+                s.body_off += n;
+                s.send_window -= n as i32;
+                let last = s.body_off == s.pending_body.len();
+                (s.pending_body[start..start + n].to_vec(), last)
+            };
+            self.conn_send_window -= chunk.len() as i32;
+            self.push_frame(
+                TYPE_DATA,
+                if last { FLAG_END_STREAM } else { 0 },
+                stream_id,
+                &chunk,
+            );
+            if last {
+                if let Some(s) = self.streams.get_mut(&stream_id) {
+                    s.pending_body = Vec::new();
+                    s.body_off = 0;
+                }
+                return;
+            }
+        }
+    }
+
+    /// Resume every stream that still owes the peer a body.
+    fn pump_all(&mut self) {
+        let ids: Vec<u32> = self
+            .streams
+            .iter()
+            .filter(|(_, s)| s.body_off < s.pending_body.len())
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            self.pump_stream(id);
+        }
     }
 
     /// Drive I/O: flush send buffer through TLS, read and decrypt incoming
@@ -337,11 +387,19 @@ impl H2sTlsClientConn {
         }
 
         // ── Read new TLS data from TCP, decrypt into recv_buf ────────────────
+        //
+        // EOF is deferred rather than acted on here, for the same reason as
+        // `h2c_client`: killing the connection the instant `read_tls` returns 0
+        // skipped the frame loop below and discarded any complete response
+        // already decrypted into `recv_buf`, failing the stream with BrokenPipe.
+        // A backend that answers and then closes is ordinary, and the edge
+        // turned it into a 502.
+        let mut eof: Option<String> = None;
         loop {
             match self.tls_conn.read_tls(&mut self.tcp) {
                 Ok(0) => {
-                    self.mark_dead("h2s: connection closed");
-                    return;
+                    eof = Some("h2s: connection closed".to_string());
+                    break;
                 }
                 Ok(_) => {
                     match self.tls_conn.process_new_packets() {
@@ -356,15 +414,15 @@ impl H2sTlsClientConn {
                             }
                         }
                         Err(e) => {
-                            self.mark_dead(&format!("h2s: TLS process error: {}", e));
-                            return;
+                            eof = Some(format!("h2s: TLS process error: {}", e));
+                            break;
                         }
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => {
-                    self.mark_dead(&format!("h2s: read error: {}", e));
-                    return;
+                    eof = Some(format!("h2s: read error: {}", e));
+                    break;
                 }
             }
         }
@@ -412,7 +470,20 @@ impl H2sTlsClientConn {
                                 | ((payload[pos + 4] as u32) << 8)
                                 | (payload[pos + 5] as u32);
                             match id {
-                                4 => self.peer_initial_window = val as i32,
+                                // 6.9.2: applies retroactively to open streams.
+                                4 if val <= i32::MAX as u32 => {
+                                    let delta = val as i32 - self.peer_initial_window;
+                                    self.peer_initial_window = val as i32;
+                                    if delta != 0 {
+                                        for s in self.streams.values_mut() {
+                                            s.send_window = s.send_window.saturating_add(delta);
+                                        }
+                                    }
+                                }
+                                4 => {
+                                    self.mark_dead("h2s: INITIAL_WINDOW_SIZE above 2^31-1");
+                                    return;
+                                }
                                 5 if val >= 16_384 && val <= 16_777_215 => {
                                     self.peer_max_frame = val
                                 }
@@ -421,6 +492,9 @@ impl H2sTlsClientConn {
                             pos += 6;
                         }
                         self.push_frame(TYPE_SETTINGS, FLAG_ACK, 0, &[]);
+                        // A raised window or max frame size may have unblocked
+                        // a body that is mid-flight.
+                        self.pump_all();
                     }
                 }
 
@@ -577,21 +651,89 @@ impl H2sTlsClientConn {
 
                 TYPE_WINDOW_UPDATE if stream_id == 0 => {
                     if payload.len() >= 4 {
-                        let inc = ((payload[0] as u32) << 24)
+                        // Reserved high bit ignored (6.9).
+                        let inc = (((payload[0] as u32) << 24)
                             | ((payload[1] as u32) << 16)
                             | ((payload[2] as u32) << 8)
-                            | (payload[3] as u32);
-                        self.conn_send_window += inc as i32;
+                            | (payload[3] as u32))
+                            & 0x7FFF_FFFF;
+                        if inc == 0 {
+                            self.mark_dead("h2s: WINDOW_UPDATE increment of 0 on stream 0");
+                            return;
+                        }
+                        // 6.9.1: above 2^31-1 is a FLOW_CONTROL_ERROR, not a
+                        // wrap. `+=` on an i32 panics here in a debug build.
+                        match self.conn_send_window.checked_add(inc as i32) {
+                            Some(w) => self.conn_send_window = w,
+                            None => {
+                                self.mark_dead("h2s: connection send window above 2^31-1");
+                                return;
+                            }
+                        }
+                        self.pump_all();
+                    }
+                }
+
+                // Per-stream credit. This arm did not exist: a stream-level
+                // WINDOW_UPDATE fell through to the catch-all and was discarded.
+                TYPE_WINDOW_UPDATE if stream_id > 0 => {
+                    if payload.len() >= 4 {
+                        let inc = (((payload[0] as u32) << 24)
+                            | ((payload[1] as u32) << 16)
+                            | ((payload[2] as u32) << 8)
+                            | (payload[3] as u32))
+                            & 0x7FFF_FFFF;
+                        if inc == 0 {
+                            self.push_frame(
+                                TYPE_RST_STREAM,
+                                0,
+                                stream_id,
+                                &1u32.to_be_bytes(), // PROTOCOL_ERROR
+                            );
+                            self.streams.remove(&stream_id);
+                        } else if let Some(s) = self.streams.get_mut(&stream_id) {
+                            match s.send_window.checked_add(inc as i32) {
+                                Some(w) => {
+                                    s.send_window = w;
+                                    self.pump_stream(stream_id);
+                                }
+                                None => {
+                                    self.push_frame(
+                                        TYPE_RST_STREAM,
+                                        0,
+                                        stream_id,
+                                        &3u32.to_be_bytes(), // FLOW_CONTROL_ERROR
+                                    );
+                                    self.streams.remove(&stream_id);
+                                }
+                            }
+                        }
                     }
                 }
 
                 _ => {}
             }
         }
+
+        // Everything already received has now been parsed and delivered, so the
+        // EOF can be honoured. Streams still open genuinely lost their response.
+        if let Some(reason) = eof {
+            self.mark_dead(&reason);
+        }
     }
 
     fn complete_stream(&mut self, stream_id: u32) {
         if let Some(s) = self.streams.remove(&stream_id) {
+            // Answered before we finished sending: cancel rather than leave the
+            // peer waiting on DATA that will never arrive.
+            if s.body_off < s.pending_body.len() {
+                self.push_frame(
+                    TYPE_RST_STREAM,
+                    0,
+                    stream_id,
+                    &8u32.to_be_bytes(), // CANCEL
+                );
+            }
             if s.headers_done {
                 let _ = s.tx.send(Ok(HttpResponse {
                     status: s.resp_status,

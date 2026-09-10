@@ -1,9 +1,24 @@
 # Completing the HTTP/2 implementation
 
-> **STATUS 2026-09-10 — DONE.** h2spec **146/146**, h3spec **37/49** (all 12
-> remaining failures inside quiche, none attributable to m6). All phases below
-> are complete, including Phase 6 (Rapid Reset), which is **deployed to the
-> fleet** (`m6 438bdb3`). The only H2 item not implemented is
+> **STATUS 2026-09-10 — DONE, with one addition since.** h2spec **146/146**,
+> h3spec **37/49** (all 12 remaining failures inside quiche, none attributable
+> to m6). All phases below are complete, including Phase 6 (Rapid Reset), which
+> is **deployed to the fleet** (`m6 438bdb3`).
+>
+> **Phase 7, added and completed 2026-09-10, NOT YET DEPLOYED: send-side flow
+> control on the backbone clients.** h2spec exercises m6 as a *server* and so
+> never covered `h2c_client`/`h2s_client`, which had no send-side flow control
+> at all — `conn_send_window` was incremented on WINDOW_UPDATE and never read,
+> there was no per-stream send window, and stream-level WINDOW_UPDATE frames
+> were discarded by a catch-all `match` arm. The request body is now resumable
+> state (`pending_body` + `stream_send_window`) pumped as credit allows, with
+> retroactive `SETTINGS_INITIAL_WINDOW_SIZE` handling per RFC 9113 6.9.2.
+> Guard: `m6-http/tests/backbone_flow_control.rs`, a stub origin that enforces
+> the window it advertises, verified red without the fix. Full write-up in
+> `~/dr-grosvenor-site/HANDOVER.md` §5a, and the EOF defect it uncovered in
+> §5c.
+>
+> The only H2 item not implemented is
 > `SETTINGS_MAX_HEADER_LIST_SIZE` (0x6) — see Phase 6's HPACK-bomb note. This
 > document is kept as the record of how it was done; everything from
 > "What is actually missing" down to the phase list is the **original
