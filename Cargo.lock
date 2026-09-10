@@ -1810,7 +1810,9 @@ dependencies = [
  "anyhow",
  "brotli",
  "flate2",
+ "m6-core",
  "m6-render",
+ "tempfile",
 ]
 
 [[package]]

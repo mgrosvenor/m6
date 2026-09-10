@@ -11,5 +11,7 @@ m6-render = { path = "../m6-render" }
 anyhow    = "1"
 
 [dev-dependencies]
+m6-core       = { path = "../m6-core", features = ["testkit"] }
+tempfile      = "3"
 brotli  = "6"
 flate2  = "1"

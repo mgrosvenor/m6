@@ -1,101 +1,79 @@
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::Command;
 use std::time::Duration;
+
+use m6_core::testkit::{binary, Service};
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Guard that kills the child process on drop.
-struct ProcessGuard(Child);
-
-impl Drop for ProcessGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-/// Absolute path to the m6-html binary.
-fn binary_path() -> PathBuf {
-    let mut p = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_path_buf();
-    if p.ends_with("deps") {
-        p = p.parent().unwrap().to_path_buf();
-    }
-    p.join("m6-html")
+/// A running `m6-html`, its socket, and the directory both live in.
+///
+/// Field order is drop order: the service is killed before the directory
+/// holding its socket is removed.
+struct Server {
+    svc: Service,
+    _dir: tempfile::TempDir,
 }
 
 fn fixtures_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures")
 }
 
 fn config_path() -> PathBuf {
     fixtures_dir().join("configs").join("m6-html.conf")
 }
 
-/// Spawn the server with a unique socket path via M6_SOCKET_OVERRIDE.
-fn spawn_server(id: &str) -> (ProcessGuard, PathBuf) {
-    let socket_dir = std::env::temp_dir().join("m6-html-sockets");
-    std::fs::create_dir_all(&socket_dir).unwrap();
-    let socket_path = socket_dir.join(format!("{}.sock", id));
+/// Spawn `m6-html` on a socket of its own and wait until it answers requests.
+///
+/// **The socket lives in a fresh temp directory, not a shared one.** This used
+/// to be `$TMPDIR/m6-html-sockets/<id>.sock`, a fixed path per test, and the
+/// spawn deleted whatever was already there first. Two runs of this suite at
+/// once, or one overlapping a killed run, meant a test unlinking a socket
+/// another live server was serving on, and the failure landed somewhere else.
+///
+/// **Readiness is a real answered request.** The socket file existing is not
+/// the same as the server accepting on it: `bind` creates the file, `listen`
+/// comes after, and the accept backlog is a third thing again. Under a full
+/// workspace run the connect raced all of that, `http_request` returned an
+/// empty string on the io error, and a test asserting `resp.contains("200 OK")`
+/// failed against `""`. It passed in isolation every time, which is what made
+/// it look like noise.
+fn spawn_server(id: &str) -> (Server, PathBuf) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // Short name: a unix socket path is capped near 104 bytes on macOS, and
+    // the temp directory already spends most of that.
+    let socket_path = dir.path().join(format!("{id}.sock"));
 
-    // Remove stale socket from a previous test run.
-    let _ = std::fs::remove_file(&socket_path);
-
-    let binary = binary_path();
-    let site_dir = fixtures_dir();
-    let config = config_path();
-
-    let child = Command::new(&binary)
-        .arg(&site_dir)
-        .arg(&config)
-        .env("M6_SOCKET_OVERRIDE", &socket_path)
-        .spawn()
-        .unwrap_or_else(|e| panic!("failed to spawn {}: {}", binary.display(), e));
-
-    // Wait for the socket to appear (up to 5 s).
-    for _ in 0..100 {
-        if socket_path.exists() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-
-    assert!(
-        socket_path.exists(),
-        "socket never appeared at {:?} — server may have crashed",
-        socket_path
+    let mut svc = Service::spawn(
+        "m6-html",
+        Command::new(binary("m6-html"))
+            .arg(fixtures_dir())
+            .arg(config_path())
+            .env("M6_SOCKET_OVERRIDE", &socket_path),
     );
+    svc.wait_for_path(&socket_path, Duration::from_secs(10));
 
-    // The socket FILE existing is not the same as the server accepting on it.
-    //
-    // Under a full workspace run the connect raced the listen backlog:
-    // `http_request` returns an empty string on any I/O error (its comment says
-    // "so callers can retry rather than panic" -- but no caller retries), so a
-    // test asserting `resp.contains("200 OK")` failed against `""`. It passed
-    // in isolation every time, which is what made it look like noise.
-    //
-    // Poll with a real request until the server actually answers.
     let mut ready = false;
     for _ in 0..200 {
-        let probe = http_request(&socket_path, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
-        if !probe.is_empty() {
+        if !http_request(&socket_path, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").is_empty() {
             ready = true;
             break;
         }
+        svc.assert_alive("waiting for the first answered request");
         std::thread::sleep(Duration::from_millis(25));
     }
-    assert!(ready, "server at {:?} never answered a request", socket_path);
+    assert!(
+        ready,
+        "m6-html at {} never answered a request\n--- stderr ---\n{}",
+        socket_path.display(),
+        svc.stderr_text()
+    );
 
-    (ProcessGuard(child), socket_path)
+    (Server { svc, _dir: dir }, socket_path)
 }
 
 /// Send a raw HTTP/1.1 request and return the full response string.
@@ -150,14 +128,6 @@ fn response_headers_str(raw: &[u8]) -> String {
     String::from_utf8_lossy(raw).to_string()
 }
 
-fn send_signal(pid: u32, sig: i32) {
-    Command::new("kill")
-        .arg(format!("-{}", sig))
-        .arg(pid.to_string())
-        .output()
-        .ok();
-}
-
 // ---------------------------------------------------------------------------
 // L1 — Start / Stop
 // ---------------------------------------------------------------------------
@@ -190,14 +160,17 @@ fn l1_sigterm_exits_zero() {
     let (guard, socket_path) = spawn_server("l1-sigterm");
     assert!(socket_path.exists(), "socket should appear");
 
-    let pid = guard.0.id();
-    send_signal(pid, 15 /* SIGTERM */);
-
-    // Give it time to drain and exit.
-    std::thread::sleep(Duration::from_millis(800));
-
-    // Drop guard (kills if still alive — benign if already dead).
-    drop(guard);
+    // The test is named for the exit status, so assert on it. The previous
+    // version signalled, slept, and dropped the guard without ever looking at
+    // what the process did, which passed whatever happened — including the
+    // process being killed outright by the signal.
+    let mut guard = guard;
+    let status = guard.svc.terminate(Duration::from_secs(5));
+    assert!(
+        status.success(),
+        "m6-html should exit 0 on SIGTERM, got {status}\n--- stderr ---\n{}",
+        guard.svc.stderr_text()
+    );
 }
 
 // ---------------------------------------------------------------------------

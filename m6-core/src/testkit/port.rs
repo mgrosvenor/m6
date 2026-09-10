@@ -1,12 +1,4 @@
-//! Shared helpers for the integration suites.
-//!
-//! Exists for one reason so far: making test startup deterministic, so a suite
-//! that passes alone also passes under a full workspace run.
-//!
-//! `dead_code` is allowed because Rust compiles this module separately into
-//! every test binary that declares it, and no single binary uses all of it.
-//! Without this, each binary warns about the helpers it happens not to call.
-#![allow(dead_code)]
+//! Claiming a TCP port that no concurrently running test will also use.
 
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -25,19 +17,46 @@ const STALE_AFTER: Duration = Duration::from_secs(600);
 
 static NEXT: AtomicU16 = AtomicU16::new(0);
 
+/// An exclusive claim on a loopback port, held until dropped.
+///
+/// **Hold this for as long as the server holds the port.** Dropping it
+/// releases the port back to other tests, so binding it to a local that goes
+/// out of scope before the service does reintroduces exactly the race this
+/// type exists to close. Store it beside the [`Service`](super::Service) it
+/// belongs to.
+#[must_use = "dropping the claim releases the port while the server is still using it"]
+pub struct PortClaim {
+    port: u16,
+    marker: PathBuf,
+}
+
+impl PortClaim {
+    /// The claimed port.
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// The claimed port as a loopback address, for formatting into a config.
+    pub fn addr(&self) -> String {
+        format!("127.0.0.1:{}", self.port)
+    }
+}
+
+impl Drop for PortClaim {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.marker);
+    }
+}
+
 fn claim_dir() -> PathBuf {
     // Beside the build output, so `cargo clean` disposes of it and it is never
     // shared between checkouts.
-    let d = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join("target")
-        .join("test-ports");
+    let d = super::paths::target_dir().join("test-ports");
     let _ = std::fs::create_dir_all(&d);
     d
 }
 
-/// Allocate a TCP port no other concurrently running test will also use.
+/// Claim a TCP port no other concurrently running test will also use.
 ///
 /// **Why this is not `TcpListener::bind(":0")`.** That was the previous
 /// implementation, in four copies:
@@ -47,29 +66,31 @@ fn claim_dir() -> PathBuf {
 /// l.local_addr().unwrap().port()      // listener dropped here — port released
 /// ```
 ///
-/// It is a time-of-check/time-of-use race. The port is released the moment the
-/// function returns, but the server does not bind it until seconds later, after
-/// a child process has been spawned and its socket waited for. Anything else
-/// asking the kernel for an ephemeral port in that window can be handed the
-/// same number — including another test, in another test binary, that cargo is
-/// running at the same moment.
+/// It is a time-of-check-to-time-of-use race. The port is released the moment
+/// the function returns, but the server does not bind it until seconds later,
+/// after a child process has been spawned and its socket waited for. Anything
+/// else asking the kernel for an ephemeral port in that window can be handed
+/// the same number, including another test, in another test binary, that cargo
+/// is running at the same moment.
 ///
 /// The result was a suite that passed alone and failed in a full run: two
 /// servers racing for one port, so one failed to start, or a client connected
-/// to the wrong server. It surfaced as `ConnectionReset` in `analytics_e2e` and
-/// as assorted wrong-response failures across `edge_proxy` — different symptoms,
-/// one cause. Retrying made it look intermittent rather than wrong.
+/// to the wrong server. It surfaced as `ConnectionReset` in `analytics_e2e`
+/// and as assorted wrong-response failures across `edge_proxy`, different
+/// symptoms with one cause. Retrying made it look intermittent rather than
+/// wrong.
 ///
 /// **What this does instead.** A candidate port is claimed by atomically
-/// creating a marker file for it (`create_new`, i.e. `O_EXCL`), which is a real
-/// mutex across processes, not just across threads. Only after the claim
-/// succeeds is the port probed to confirm nothing already holds it. The claim
-/// outlives this call deliberately: it must still be held while the caller
-/// spawns its server, which is precisely the window the old code left open.
+/// creating a marker file for it (`create_new`, meaning `O_EXCL`), which is a
+/// real mutex across processes and not just across threads. Only after the
+/// claim succeeds is the port probed to confirm nothing already holds it. The
+/// claim outlives this call deliberately: it must still be held while the
+/// caller spawns its server, which is precisely the window the old code left
+/// open. It is released when the returned [`PortClaim`] drops.
 ///
 /// A claim left behind by a killed run is reclaimed once it is older than
 /// `STALE_AFTER`, so a crashed suite cannot slowly poison the range.
-pub fn free_port() -> u16 {
+pub fn claim_port() -> PortClaim {
     let dir = claim_dir();
     // Start each process at a different offset so two binaries starting
     // together do not contend on the same first candidate.
@@ -108,7 +129,7 @@ pub fn free_port() -> u16 {
         match TcpListener::bind(("127.0.0.1", port)) {
             Ok(l) => {
                 drop(l);
-                return port;
+                return PortClaim { port, marker };
             }
             Err(_) => {
                 // Occupied by something we do not control; release the claim
@@ -120,19 +141,29 @@ pub fn free_port() -> u16 {
     panic!("no free port available in {PORT_LO}..={PORT_HI}");
 }
 
-/// Wait for a filesystem path to appear.
-///
-/// Backend readiness is a unix socket showing up, not a fixed delay. A
-/// `sleep(300ms)` in its place passed when a suite ran alone and failed under a
-/// full workspace run, where a dozen stacks start at once: the server came up
-/// with an empty backend pool and answered 502.
-pub fn wait_for_path(p: &std::path::Path, timeout: Duration) -> bool {
-    let deadline = std::time::Instant::now() + timeout;
-    while std::time::Instant::now() < deadline {
-        if p.exists() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(25));
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claims_are_distinct_and_bindable() {
+        let a = claim_port();
+        let b = claim_port();
+        assert_ne!(a.port(), b.port());
+        // Both must still be bindable: claiming must not itself occupy them.
+        let la = TcpListener::bind(("127.0.0.1", a.port())).expect("bind a");
+        let lb = TcpListener::bind(("127.0.0.1", b.port())).expect("bind b");
+        drop((la, lb));
     }
-    false
+
+    #[test]
+    fn dropping_a_claim_releases_it() {
+        let port = {
+            let c = claim_port();
+            c.port()
+        };
+        // The marker must be gone, so the same port can be claimed again.
+        let dir = claim_dir();
+        assert!(!dir.join(port.to_string()).exists(), "marker outlived the claim");
+    }
 }

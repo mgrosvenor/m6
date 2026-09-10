@@ -20,45 +20,15 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rustls::StreamOwned;
 
-mod common;
-use common::{free_port, wait_for_path};
+use m6_core::testkit::{binary, claim_port, PortClaim, Service};
 
 // ── Test infrastructure ───────────────────────────────────────────────────────
-
-struct TestProcess(Child);
-impl Drop for TestProcess {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
-}
-
-fn binary(name: &str) -> PathBuf {
-    repo_root().join("target").join("release").join(name)
-}
-
-/// Wait up to `timeout` for a TCP port to accept connections.
-fn wait_for_port(port: u16, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if TcpStream::connect(format!("127.0.0.1:{}", port)).is_ok() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    false
-}
 
 /// Generate a self-signed cert+key for 127.0.0.1 / localhost.
 /// Returns (cert_pem, key_pem, cert_der).
@@ -256,10 +226,12 @@ backend = "global"
 // ── Full stack fixture ────────────────────────────────────────────────────────
 
 struct EdgeStack {
-    _global_html:   TestProcess,
-    _global_file:   TestProcess,
-    _global_http:   TestProcess,
-    _edge_http:     TestProcess,
+    // Field order is drop order: the four services die before the temp dir
+    // they serve from is removed, and the port claims are released last.
+    _global_html:   Service,
+    _global_file:   Service,
+    _global_http:   Service,
+    _edge_http:     Service,
     global_port:    u16,
     edge_port:      u16,
     edge_tls:       Arc<rustls::ClientConfig>,
@@ -269,6 +241,8 @@ struct EdgeStack {
     _global_key_f:  tempfile::NamedTempFile,
     _edge_cert_f:   tempfile::NamedTempFile,
     _edge_key_f:    tempfile::NamedTempFile,
+    _global_claim:  PortClaim,
+    _edge_claim:    PortClaim,
 }
 
 impl EdgeStack {
@@ -283,8 +257,10 @@ impl EdgeStack {
         // processes for the whole window between allocation and the server
         // binding it. Binding to :0 and releasing raced with every other test
         // binary cargo runs in parallel.
-        let global_port: u16 = free_port();
-        let edge_port: u16 = free_port();
+        let global_claim = claim_port();
+        let edge_claim = claim_port();
+        let global_port: u16 = global_claim.port();
+        let edge_port: u16 = edge_claim.port();
 
         // ── Certs ─────────────────────────────────────────────────────────
         let (gc_pem, gk_pem, _gc_der) = generate_cert();
@@ -316,21 +292,23 @@ impl EdgeStack {
         )).unwrap();
 
         // ── Start global backends ─────────────────────────────────────────
-        let html_proc = TestProcess(Command::new(binary("m6-html"))
-            .args([global_site.to_str().unwrap(),
-                   global_site.join("configs/m6-html.conf").to_str().unwrap(),
-                   "--log-level", "warn"])
-            .env("M6_SOCKET_OVERRIDE", html_sock.to_str().unwrap())
-            .stdout(Stdio::null()).stderr(Stdio::null())
-            .spawn().expect("spawn m6-html"));
+        let mut html_proc = Service::spawn(
+            "m6-html",
+            Command::new(binary("m6-html"))
+                .args([global_site.to_str().unwrap(),
+                       global_site.join("configs/m6-html.conf").to_str().unwrap(),
+                       "--log-level", "warn"])
+                .env("M6_SOCKET_OVERRIDE", html_sock.to_str().unwrap()),
+        );
 
-        let file_proc = TestProcess(Command::new(binary("m6-file"))
-            .args([global_site.to_str().unwrap(),
-                   global_site.join("configs/m6-file.conf").to_str().unwrap(),
-                   "--log-level", "warn"])
-            .env("M6_SOCKET_OVERRIDE", file_sock.to_str().unwrap())
-            .stdout(Stdio::null()).stderr(Stdio::null())
-            .spawn().expect("spawn m6-file"));
+        let mut file_proc = Service::spawn(
+            "m6-file",
+            Command::new(binary("m6-file"))
+                .args([global_site.to_str().unwrap(),
+                       global_site.join("configs/m6-file.conf").to_str().unwrap(),
+                       "--log-level", "warn"])
+                .env("M6_SOCKET_OVERRIDE", file_sock.to_str().unwrap()),
+        );
 
         // Wait for the backend sockets to actually exist rather than guessing.
         //
@@ -341,34 +319,26 @@ impl EdgeStack {
         // assertion failure in whichever test happened to run first. m6-http
         // also only rescans for backend sockets periodically, so a socket that
         // appears late is not picked up promptly either.
-        assert!(
-            wait_for_path(&html_sock, Duration::from_secs(15)),
-            "m6-html socket never appeared at {}", html_sock.display()
-        );
-        assert!(
-            wait_for_path(&file_sock, Duration::from_secs(15)),
-            "m6-file socket never appeared at {}", file_sock.display()
-        );
+        html_proc.wait_for_path(&html_sock, Duration::from_secs(15));
+        file_proc.wait_for_path(&file_sock, Duration::from_secs(15));
 
         // ── Start global m6-http ──────────────────────────────────────────
-        let global_proc = TestProcess(Command::new(binary("m6-http"))
-            .args([global_site.to_str().unwrap(), global_sys.to_str().unwrap(),
-                   "--log-level", "warn"])
-            .stdout(Stdio::null()).stderr(Stdio::null())
-            .spawn().expect("spawn global m6-http"));
-
-        assert!(wait_for_port(global_port, Duration::from_secs(5)),
-            "global m6-http did not start on port {global_port}");
+        let mut global_proc = Service::spawn(
+            "global m6-http",
+            Command::new(binary("m6-http"))
+                .args([global_site.to_str().unwrap(), global_sys.to_str().unwrap(),
+                       "--log-level", "warn"]),
+        );
+        global_proc.wait_for_tcp(global_port, Duration::from_secs(5));
 
         // ── Start edge m6-http ────────────────────────────────────────────
-        let edge_proc = TestProcess(Command::new(binary("m6-http"))
-            .args([edge_site.to_str().unwrap(), edge_sys.to_str().unwrap(),
-                   "--log-level", "warn"])
-            .stdout(Stdio::null()).stderr(Stdio::null())
-            .spawn().expect("spawn edge m6-http"));
-
-        assert!(wait_for_port(edge_port, Duration::from_secs(5)),
-            "edge m6-http did not start on port {edge_port}");
+        let mut edge_proc = Service::spawn(
+            "edge m6-http",
+            Command::new(binary("m6-http"))
+                .args([edge_site.to_str().unwrap(), edge_sys.to_str().unwrap(),
+                       "--log-level", "warn"]),
+        );
+        edge_proc.wait_for_tcp(edge_port, Duration::from_secs(5));
 
         let edge_tls = trusted_client_config(&ec_der);
 
@@ -404,6 +374,8 @@ impl EdgeStack {
             _global_key_f:  gk_f,
             _edge_cert_f:   ec_f,
             _edge_key_f:    ek_f,
+            _global_claim:  global_claim,
+            _edge_claim:    edge_claim,
         }
     }
 

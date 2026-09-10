@@ -30,6 +30,11 @@ struct FileState {
 // ---------------------------------------------------------------------------
 
 fn main() {
+    // Block SIGTERM and SIGINT before anything else, including logging.
+    // The mask is inherited only by threads created after this point, and
+    // tracing-appender's writer thread would otherwise take the signal at its
+    // default disposition and kill the process. See m6_core::signal.
+    m6_core::signal::block();
     let code = run();
     std::process::exit(code);
 }
