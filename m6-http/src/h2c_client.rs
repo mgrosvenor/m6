@@ -42,6 +42,14 @@ struct H2cStream {
     resp_body: Vec<u8>,
     headers_done: bool,
     tx: mpsc::Sender<io::Result<HttpResponse>>,
+    // The request body still owed to the peer, and how much of it has gone out.
+    // The body is resumable state rather than a loop because credit arrives
+    // asynchronously: see `pump_stream`.
+    pending_body: Vec<u8>,
+    body_off: usize,
+    // RFC 9113 6.9.2: the per-stream send window starts at the peer's
+    // SETTINGS_INITIAL_WINDOW_SIZE, not at the 65 535 connection default.
+    send_window: i32,
 }
 
 // ── H2cClientConn (public) ────────────────────────────────────────────────────
@@ -195,35 +203,6 @@ impl H2cClientConn {
             FLAG_END_HEADERS | if has_body { 0 } else { FLAG_END_STREAM };
         self.push_frame(TYPE_HEADERS, headers_flags, stream_id, &header_block);
 
-        // Push the body, split to the peer's SETTINGS_MAX_FRAME_SIZE.
-        //
-        // RFC 9113 4.2: a DATA frame must not exceed what the peer advertised.
-        // The whole body used to go out as ONE frame regardless of size, so any
-        // request over 16 KiB (the default, and what the origin advertises) was
-        // answered with FRAME_SIZE_ERROR and the connection closed. The visitor
-        // saw a 502 from the edge; the origin logged "frame exceeds
-        // SETTINGS_MAX_FRAME_SIZE".
-        //
-        // `peer_max_frame` was already parsed from the peer's SETTINGS and then
-        // never used for anything. It is used now. END_STREAM goes on the final
-        // chunk only. `has_body` means the body is non-empty, so this always
-        // emits at least one frame and the stream always terminates.
-        if has_body {
-            let max = (self.peer_max_frame as usize).max(1);
-            let mut off = 0usize;
-            while off < req.body.len() {
-                let end = (off + max).min(req.body.len());
-                let last = end == req.body.len();
-                self.push_frame(
-                    TYPE_DATA,
-                    if last { FLAG_END_STREAM } else { 0 },
-                    stream_id,
-                    &req.body[off..end],
-                );
-                off = end;
-            }
-        }
-
         let (tx, rx) = mpsc::channel();
         self.streams.insert(
             stream_id,
@@ -233,10 +212,99 @@ impl H2cClientConn {
                 resp_body: vec![],
                 headers_done: false,
                 tx,
+                pending_body: if has_body { req.body.clone() } else { Vec::new() },
+                body_off: 0,
+                send_window: self.peer_initial_window,
             },
         );
 
+        // Hand the body to the flow-control pump rather than writing it here.
+        //
+        // It used to go out in one chunking loop that consulted only
+        // `peer_max_frame`, so the frames were the right SIZE but were sent
+        // regardless of whether the peer had granted CREDIT for them --
+        // `conn_send_window` was incremented on WINDOW_UPDATE and never read.
+        // RFC 9113 6.9 makes that a connection error at the receiver's
+        // discretion. It never bit because the only peer is m6's own origin,
+        // which advertises a 1 MiB initial window and tops its connection
+        // window up promptly; that is luck, not correctness, and it ends the
+        // moment a backbone client is pointed at a peer that is not m6.
+        //
+        // The loop could not simply skip a write it had no credit for: it would
+        // exit having sent fewer bytes than `content-length` promised, with
+        // END_STREAM on whatever chunk happened to be last. That is the
+        // request-smuggling primitive `validate_request_header_bytes` rejects on
+        // ingress, manufactured on egress. Blocking instead would stall every
+        // other connection this poller drives. So the remainder is kept as
+        // stream state and resumed when credit arrives.
+        self.pump_stream(stream_id);
+
         Ok(rx)
+    }
+
+    /// Send as much of a stream's pending body as connection and stream credit
+    /// allow, in frames no larger than the peer's SETTINGS_MAX_FRAME_SIZE.
+    ///
+    /// Safe to call at any time: it is a no-op for a stream that is finished,
+    /// gone, or currently out of credit. END_STREAM rides on the frame that
+    /// drains the body, never on a chunk chosen by a loop that ran out of room,
+    /// so the bytes sent always match the advertised `content-length`.
+    fn pump_stream(&mut self, stream_id: u32) {
+        let max_frame = (self.peer_max_frame as usize).max(1);
+        loop {
+            let (chunk, last) = {
+                let Some(s) = self.streams.get_mut(&stream_id) else { return };
+                let remaining = s.pending_body.len() - s.body_off;
+                if remaining == 0 {
+                    return;
+                }
+                // Either window can be negative: a SETTINGS_INITIAL_WINDOW_SIZE
+                // reduction applies retroactively (6.9.2) and legitimately
+                // overdraws an open stream.
+                let credit = self.conn_send_window.min(s.send_window);
+                if credit <= 0 {
+                    return;
+                }
+                let n = remaining.min(max_frame).min(credit as usize);
+                let start = s.body_off;
+                s.body_off += n;
+                s.send_window -= n as i32;
+                let last = s.body_off == s.pending_body.len();
+                (s.pending_body[start..start + n].to_vec(), last)
+            };
+            self.conn_send_window -= chunk.len() as i32;
+            self.push_frame(
+                TYPE_DATA,
+                if last { FLAG_END_STREAM } else { 0 },
+                stream_id,
+                &chunk,
+            );
+            if last {
+                // Release the buffer as soon as it is owed nothing; a 5 MiB
+                // upload should not sit in memory until the response lands.
+                if let Some(s) = self.streams.get_mut(&stream_id) {
+                    s.pending_body = Vec::new();
+                    s.body_off = 0;
+                }
+                return;
+            }
+        }
+    }
+
+    /// Resume every stream that still owes the peer a body.
+    ///
+    /// Used after connection-level credit or the initial window size changes,
+    /// where the credit is not attributable to one stream.
+    fn pump_all(&mut self) {
+        let ids: Vec<u32> = self
+            .streams
+            .iter()
+            .filter(|(_, s)| s.body_off < s.pending_body.len())
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            self.pump_stream(id);
+        }
     }
 
     /// Drive I/O: flush send buffer, read incoming data, parse frames.
@@ -268,18 +336,28 @@ impl H2cClientConn {
         }
 
         // ── Read incoming data ────────────────────────────────────────────────
+        //
+        // EOF is deferred, not acted on here. `mark_dead` used to run the
+        // instant `read` returned 0, with a `return` that skipped the frame loop
+        // below -- so a peer that sent a complete response and then closed had
+        // that response discarded out of `recv_buf`, and every in-flight stream
+        // was failed with BrokenPipe. Answer-then-close is legal and ordinary
+        // (a backend shutting down, or one that does not hold the connection
+        // open), and the edge turned it into a 502. Parse what already arrived
+        // first; the connection is still dead afterwards.
+        let mut eof: Option<String> = None;
         let mut tmp = [0u8; 16384];
         loop {
             match self.stream.read(&mut tmp) {
                 Ok(0) => {
-                    self.mark_dead("h2c: connection closed");
-                    return;
+                    eof = Some("h2c: connection closed".to_string());
+                    break;
                 }
                 Ok(n) => self.recv_buf.extend_from_slice(&tmp[..n]),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => {
-                    self.mark_dead(&format!("h2c: read error: {}", e));
-                    return;
+                    eof = Some(format!("h2c: read error: {}", e));
+                    break;
                 }
             }
         }
@@ -331,7 +409,23 @@ impl H2cClientConn {
                                 | ((payload[pos + 4] as u32) << 8)
                                 | (payload[pos + 5] as u32);
                             match id {
-                                4 => self.peer_initial_window = val as i32,
+                                // RFC 9113 6.9.2: a change to INITIAL_WINDOW_SIZE
+                                // applies retroactively to every open stream, by
+                                // the delta. Only new streams used to see it,
+                                // because the value was stored and never read.
+                                4 if val <= i32::MAX as u32 => {
+                                    let delta = val as i32 - self.peer_initial_window;
+                                    self.peer_initial_window = val as i32;
+                                    if delta != 0 {
+                                        for s in self.streams.values_mut() {
+                                            s.send_window = s.send_window.saturating_add(delta);
+                                        }
+                                    }
+                                }
+                                4 => {
+                                    self.mark_dead("h2c: INITIAL_WINDOW_SIZE above 2^31-1");
+                                    return;
+                                }
                                 5 if val >= 16_384 && val <= 16_777_215 => {
                                     self.peer_max_frame = val
                                 }
@@ -341,6 +435,9 @@ impl H2cClientConn {
                         }
                         // Send SETTINGS ACK
                         self.push_frame(TYPE_SETTINGS, FLAG_ACK, 0, &[]);
+                        // A raised window, or a raised max frame size, may have
+                        // unblocked a body that is mid-flight.
+                        self.pump_all();
                     }
                 }
 
@@ -501,11 +598,68 @@ impl H2cClientConn {
 
                 TYPE_WINDOW_UPDATE if stream_id == 0 => {
                     if payload.len() >= 4 {
-                        let inc = ((payload[0] as u32) << 24)
+                        // The reserved high bit is ignored (RFC 9113 6.9).
+                        let inc = (((payload[0] as u32) << 24)
                             | ((payload[1] as u32) << 16)
                             | ((payload[2] as u32) << 8)
-                            | (payload[3] as u32);
-                        self.conn_send_window += inc as i32;
+                            | (payload[3] as u32))
+                            & 0x7FFF_FFFF;
+                        if inc == 0 {
+                            self.mark_dead("h2c: WINDOW_UPDATE increment of 0 on stream 0");
+                            return;
+                        }
+                        // 6.9.1: a window above 2^31-1 is a FLOW_CONTROL_ERROR,
+                        // not a wrap. `+=` on an i32 used to overflow, which
+                        // panics in a debug build.
+                        match self.conn_send_window.checked_add(inc as i32) {
+                            Some(w) => self.conn_send_window = w,
+                            None => {
+                                self.mark_dead("h2c: connection send window above 2^31-1");
+                                return;
+                            }
+                        }
+                        self.pump_all();
+                    }
+                }
+
+                // Per-stream credit. This arm did not exist: a stream-level
+                // WINDOW_UPDATE fell through to the catch-all and was discarded,
+                // so a peer that granted credit per stream rather than per
+                // connection was never heard.
+                TYPE_WINDOW_UPDATE if stream_id > 0 => {
+                    if payload.len() >= 4 {
+                        let inc = (((payload[0] as u32) << 24)
+                            | ((payload[1] as u32) << 16)
+                            | ((payload[2] as u32) << 8)
+                            | (payload[3] as u32))
+                            & 0x7FFF_FFFF;
+                        if inc == 0 {
+                            // A zero increment is a stream error, not a
+                            // connection one (6.9).
+                            self.push_frame(
+                                TYPE_RST_STREAM,
+                                0,
+                                stream_id,
+                                &1u32.to_be_bytes(), // PROTOCOL_ERROR
+                            );
+                            self.streams.remove(&stream_id);
+                        } else if let Some(s) = self.streams.get_mut(&stream_id) {
+                            match s.send_window.checked_add(inc as i32) {
+                                Some(w) => {
+                                    s.send_window = w;
+                                    self.pump_stream(stream_id);
+                                }
+                                None => {
+                                    self.push_frame(
+                                        TYPE_RST_STREAM,
+                                        0,
+                                        stream_id,
+                                        &3u32.to_be_bytes(), // FLOW_CONTROL_ERROR
+                                    );
+                                    self.streams.remove(&stream_id);
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -514,11 +668,30 @@ impl H2cClientConn {
                 }
             }
         }
+
+        // Now that everything already received has been parsed and delivered,
+        // honour the EOF. Streams still open at this point genuinely lost their
+        // response.
+        if let Some(reason) = eof {
+            self.mark_dead(&reason);
+        }
     }
 
     /// Complete a stream: remove it and send the response (or an error) on tx.
     fn complete_stream(&mut self, stream_id: u32) {
         if let Some(s) = self.streams.remove(&stream_id) {
+            // A peer may answer before we have finished sending (an early error
+            // response is the common case). The request is then abandoned
+            // mid-body, so tell the peer rather than leaving a half-open stream
+            // waiting on DATA that will never arrive.
+            if s.body_off < s.pending_body.len() {
+                self.push_frame(
+                    TYPE_RST_STREAM,
+                    0,
+                    stream_id,
+                    &8u32.to_be_bytes(), // CANCEL
+                );
+            }
             if s.headers_done {
                 let _ = s.tx.send(Ok(HttpResponse {
                     status: s.resp_status,
