@@ -1,0 +1,9 @@
+# Conformance floors. A run below a floor fails; a run above it says so and
+# asks you to raise the floor deliberately, in the commit that earned it.
+#
+# Raising a floor is a claim that an improvement is real and permanent.
+# Lowering one is a decision to accept a regression and must be argued for in
+# the commit message.
+#
+# target             floor  total
+h1:m6-file           15     32
