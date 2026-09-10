@@ -62,12 +62,11 @@ mod imp {
         timeout_ms: i32,
     ) -> io::Result<usize> {
         let mut raw = [libc::epoll_event { events: 0, u64: 0 }; 64];
-        let n = match sigmask {
-            Some(mask) => unsafe {
-                libc::epoll_wait(imp.epfd, raw.as_mut_ptr(), 64, timeout_ms)
-            },
-            None => unsafe { libc::epoll_wait(imp.epfd, raw.as_mut_ptr(), 64, timeout_ms) },
-        };
+        // Plain `epoll_wait`, not `epoll_pwait`. Signals no longer unblock this
+        // loop: they are blocked process-wide and consumed by the `sigwait`
+        // thread, which pokes the wake pipe. That pipe is an ordinary readable
+        // fd here, so there is nothing for a signal mask to do.
+        let n = unsafe { libc::epoll_wait(imp.epfd, raw.as_mut_ptr(), 64, timeout_ms) };
         if n < 0 {
             let e = io::Error::last_os_error();
             if e.kind() == io::ErrorKind::Interrupted {
