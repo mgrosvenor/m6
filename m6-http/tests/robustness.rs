@@ -147,6 +147,26 @@ impl Server {
         out
     }
 
+    /// Wait until a request actually reaches the backend.
+    ///
+    /// Listening on the port is not the same as being able to serve: m6-http
+    /// fills its backend pool from a periodic rescan, so there is a window
+    /// where every request is a 502. This was `sleep(2500)`, a number tuned on
+    /// a fast laptop, and it was not enough on the slower Linux build box.
+    fn wait_until_serving(&self) {
+        let ready = m6_core::testkit::wait::until(Duration::from_secs(30), || {
+            self.raw(
+                b"GET /public/probe.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )
+            .starts_with(b"HTTP/1.1 200")
+        });
+        assert!(
+            ready,
+            "m6-http never served a backend request\n--- stderr ---\n{}",
+            self.http.borrow().stderr_text()
+        );
+    }
+
     /// A known-good request, used to prove the server is still healthy after
     /// each abuse case. This is the assertion that actually catches a crash or
     /// a wedged accept loop.
@@ -178,6 +198,8 @@ fn start_server() -> Server {
     std::fs::create_dir_all(site.join("public")).unwrap();
     std::fs::create_dir_all(site.join("configs")).unwrap();
     std::fs::write(site.join("public/open.txt"), b"PUBLIC CONTENT").unwrap();
+    // Used only as the readiness probe, so no test's path is warmed by it.
+    std::fs::write(site.join("public/probe.txt"), b"PROBE").unwrap();
 
     let sock = dir.path().join("m6-file-1.sock");
     let sock_glob = dir.path().join("m6-file-*.sock");
@@ -256,16 +278,17 @@ name = "robustness-node"
         Command::new(binary("m6-http")).arg(site).arg(site.join("system.toml")),
     );
     http_proc.wait_for_tcp(port, Duration::from_secs(10));
-    std::thread::sleep(Duration::from_millis(2500)); // backend socket rescan
 
-    Server {
+    let srv = Server {
         port,
         cert_der,
         http: std::cell::RefCell::new(http_proc),
         file: std::cell::RefCell::new(file_proc),
         _dir: dir,
         _port: claim,
-    }
+    };
+    srv.wait_until_serving();
+    srv
 }
 
 // ── Shared assertions ─────────────────────────────────────────────────────────
