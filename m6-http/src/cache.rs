@@ -364,6 +364,17 @@ struct CacheEntry {
     /// Instant past which even a stale serve is refused. Equal to
     /// `expires_at` when the response did not permit stale serving at all.
     serve_stale_until: Option<std::time::Instant>,
+    /// Roughly how many bytes this entry holds, for the capacity bound.
+    ///
+    /// Body plus header strings plus the key. Approximate on purpose: the
+    /// point is to bound growth, and the error is a small constant per entry
+    /// against bodies measured in kilobytes.
+    footprint: usize,
+    /// Monotonic tick of the last read, for eviction order.
+    ///
+    /// `AtomicU64` so `lookup` can record a read while holding only the shared
+    /// lock. One relaxed store per cache hit, no lock upgrade, no allocation.
+    last_read: std::sync::atomic::AtomicU64,
 }
 
 /// The result of a cache lookup.
@@ -390,6 +401,35 @@ pub enum Lookup {
 
 type CacheMap = AHashMap<CacheKey, CacheEntry>;
 
+/// Default ceiling on total cached bytes.
+///
+/// **The cache used to be unbounded, and a peer chose the key.** The key is
+/// `(path, query, encoding)` and `encoding` was the raw `Accept-Encoding`
+/// header, so `identity, x1`, `identity, x2` … is unlimited distinct entries
+/// for byte-identical content, each holding a full response body. Expiry does
+/// not help: `lookup` evaluates freshness on read and returns `Miss` for an
+/// expired entry, but leaves it in the map, and these keys are never asked for
+/// twice.
+///
+/// Measured: 10,000 such entries against `/` held ~518 MB, and nothing was
+/// evicted. The fleet nodes have 950 MB of RAM and around 600 MB free, so
+/// roughly 11,000 requests exhausted a node — about 36 minutes from a single
+/// IP inside the 300-per-minute rate limit, ending in the OOM killer choosing
+/// whichever process had grown the most.
+///
+/// 128 MB is a deliberate fraction of that headroom: large enough to hold the
+/// whole site many times over (every page and asset compressed is well under
+/// a megabyte), small enough that filling it is not an outage.
+///
+/// Normalising the key to `{identity, gzip, br}` removes the vector at source
+/// and is the better fix. This bound is the safety net that holds for any
+/// key-space explosion, including ones nobody has thought of.
+const DEFAULT_MAX_BYTES: usize = 128 * 1024 * 1024;
+
+/// Monotonic read counter, for eviction order. Wrapping is not a concern: at
+/// one tick per cache hit it would take centuries.
+static READ_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 use std::sync::{Arc, RwLock};
 
 /// Cache backed by Arc<RwLock<HashMap>> — swap the whole map atomically.
@@ -397,12 +437,31 @@ use std::sync::{Arc, RwLock};
 #[derive(Clone)]
 pub struct Cache {
     map: Arc<RwLock<CacheMap>>,
+    /// Total footprint of everything in `map`, maintained on insert and evict.
+    bytes: Arc<std::sync::atomic::AtomicUsize>,
+    max_bytes: usize,
 }
 
 impl Cache {
     pub fn new() -> Self {
-        Cache { map: Arc::new(RwLock::new(CacheMap::new())) }
+        Self::with_max_bytes(DEFAULT_MAX_BYTES)
     }
+
+    /// A cache bounded at `max_bytes` of total response footprint.
+    pub fn with_max_bytes(max_bytes: usize) -> Self {
+        Cache {
+            map: Arc::new(RwLock::new(CacheMap::new())),
+            bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            max_bytes,
+        }
+    }
+
+    /// Total bytes currently held.
+    pub fn bytes_held(&self) -> usize {
+        self.bytes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+
 
     /// A cache whose hasher is seeded deterministically. **Benchmarks only.**
     ///
@@ -427,7 +486,11 @@ impl Cache {
             0xa409_3822_299f_31d0,
             0x082e_fa98_ec4e_6c89,
         );
-        Cache { map: Arc::new(RwLock::new(CacheMap::with_hasher(hasher))) }
+        Cache {
+            map: Arc::new(RwLock::new(CacheMap::with_hasher(hasher))),
+            bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            max_bytes: DEFAULT_MAX_BYTES,
+        }
     }
 
     /// Get a cached response.
@@ -564,6 +627,15 @@ impl Cache {
     {
         let Ok(map) = self.map.read() else { return Lookup::Miss };
         let Some(entry) = map.get(key) else { return Lookup::Miss };
+        // One relaxed store, under the shared lock, so eviction can prefer
+        // entries nobody reads. No lock upgrade and no allocation: the
+        // attack this defends against is a flood of entries that are written
+        // once and never read, and without a read order the eviction would
+        // discard the hot ones instead.
+        entry.last_read.store(
+            READ_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let now = std::time::Instant::now();
         // Current age: how long we have held it, plus whatever age it already
         // had on arrival. Resetting to zero at each hop is what makes a chain
@@ -665,11 +737,68 @@ impl Cache {
             d.stale_while_revalidate
         };
         let serve_stale_until = expires_at.map(|e| e + stale_window);
+        let footprint = entry_footprint(&key, &response);
         if let Ok(mut map) = self.map.write() {
-            map.insert(key, CacheEntry {
-                response, stored_at: now, upstream_age, expires_at, serve_stale_until,
+            let replaced = map.insert(key, CacheEntry {
+                response,
+                stored_at: now,
+                upstream_age,
+                expires_at,
+                serve_stale_until,
+                footprint,
+                last_read: std::sync::atomic::AtomicU64::new(
+                    READ_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                ),
             });
+            let freed = replaced.map(|e| e.footprint).unwrap_or(0);
+            let held = self
+                .bytes
+                .fetch_add(footprint, std::sync::atomic::Ordering::Relaxed)
+                .saturating_sub(freed)
+                + footprint;
+            self.bytes.store(held, std::sync::atomic::Ordering::Relaxed);
+            if held > self.max_bytes {
+                self.evict_until_under(&mut map);
+            }
         }
+    }
+
+    /// Drop least-recently-read entries until the cache is inside its bound.
+    ///
+    /// Called only from `insert`, and only when the bound is exceeded, so the
+    /// O(n) scan is off the read path entirely. It costs far less than the
+    /// origin round trip that produced the entry which tipped it over.
+    ///
+    /// Least-recently-read rather than oldest-inserted on purpose: the flood
+    /// this defends against writes entries and never reads them again, so read
+    /// order is exactly the signal that separates an attacker's entries from
+    /// the site's own.
+    fn evict_until_under(&self, map: &mut CacheMap) {
+        let target = self.max_bytes - self.max_bytes / 8; // drop to 87.5%
+        let mut order: Vec<(u64, CacheKey)> = map
+            .iter()
+            .map(|(k, e)| (e.last_read.load(std::sync::atomic::Ordering::Relaxed), k.clone()))
+            .collect();
+        order.sort_unstable_by_key(|(tick, _)| *tick);
+
+        let mut held = self.bytes.load(std::sync::atomic::Ordering::Relaxed);
+        let mut dropped = 0usize;
+        for (_, key) in order {
+            if held <= target {
+                break;
+            }
+            if let Some(e) = map.remove(&key) {
+                held = held.saturating_sub(e.footprint);
+                dropped += 1;
+            }
+        }
+        self.bytes.store(held, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!(
+            dropped,
+            bytes_held = held,
+            max_bytes = self.max_bytes,
+            "cache: evicted to stay inside the byte bound"
+        );
     }
 
     /// Evict a specific path — every query and encoding variant of it.
@@ -731,6 +860,23 @@ impl Cache {
     pub fn len(&self) -> usize {
         self.map.read().map(|m| m.len()).unwrap_or(0)
     }
+}
+
+/// Roughly how many bytes an entry occupies.
+///
+/// Body, header strings, and the key. Approximate on purpose: the bound exists
+/// to stop unbounded growth, and a constant per-entry error is immaterial
+/// against bodies measured in kilobytes. Deliberately counts the body even
+/// though it is a `Bytes` that may share an allocation, because the
+/// conservative direction here is to over-count.
+fn entry_footprint(key: &CacheKey, response: &CachedResponse) -> usize {
+    let headers: usize = response
+        .headers
+        .iter()
+        .map(|(k, v)| k.len() + v.len() + 2)
+        .sum();
+    let hints: usize = response.hints.iter().map(|h| h.len()).sum();
+    key.0.len() + response.body.len() + headers + hints + std::mem::size_of::<CacheEntry>()
 }
 
 /// Determine whether a response should be cached.
@@ -2176,5 +2322,91 @@ mod storable_status_tests {
             ("Cache-Control".to_string(), "no-store".to_string()),
         ];
         assert!(!should_cache(404, &headers), "no-store must still refuse a storable status");
+    }
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::*;
+
+    fn resp(body_len: usize) -> CachedResponse {
+        CachedResponse {
+            status: 200,
+            headers: std::sync::Arc::new(vec![(
+                "cache-control".to_string(),
+                "public, max-age=86400".to_string(),
+            )]),
+            body: bytes::Bytes::from(vec![0u8; body_len]),
+            hints: std::sync::Arc::new(vec![]),
+        }
+    }
+
+    /// The vector this bound exists for: a peer varies one header and mints an
+    /// entry per variation, each holding a full response body.
+    ///
+    /// Before the bound, 10,000 such entries against `/` held ~518 MB and
+    /// nothing was evicted. The fleet nodes have 950 MB of RAM and about
+    /// 600 MB free, so roughly 11,000 requests exhausted a node: about 36
+    /// minutes from one IP inside the 300-per-minute rate limit.
+    #[test]
+    fn a_flood_of_distinct_encodings_cannot_grow_without_bound() {
+        let cap = 4 * 1024 * 1024;
+        let cache = Cache::with_max_bytes(cap);
+        for i in 0..2_000 {
+            cache.insert(
+                CacheKey::new("/", None, &format!("identity, x{i}")),
+                resp(54_361),
+            );
+        }
+        assert!(
+            cache.bytes_held() <= cap,
+            "held {} bytes against a {cap}-byte bound",
+            cache.bytes_held()
+        );
+        // 2,000 entries of 54 KB is ~108 MB of pressure against a 4 MB bound,
+        // so the great majority must be gone.
+        assert!(cache.len() < 200, "expected heavy eviction, {} entries remain", cache.len());
+    }
+
+    /// Eviction is least-recently-read, so an entry the site actually serves
+    /// survives a flood of write-once entries around it.
+    #[test]
+    fn a_repeatedly_read_entry_survives_a_flood() {
+        let cap = 2 * 1024 * 1024;
+        let cache = Cache::with_max_bytes(cap);
+        let hot = CacheKey::new("/", None, "gzip");
+        cache.insert(hot, resp(10_000));
+
+        for i in 0..500 {
+            // Read the hot entry between each insert, exactly as real traffic
+            // would while an attacker floods alongside it.
+            let mut buf = [0u8; 512];
+            let k = make_lookup_key("/", None, "gzip", &mut buf);
+            assert!(!matches!(cache.lookup(k), Lookup::Miss), "hot entry evicted at i={i}");
+            cache.insert(CacheKey::new("/", None, &format!("identity, x{i}")), resp(10_000));
+        }
+
+        let mut buf = [0u8; 512];
+        let k = make_lookup_key("/", None, "gzip", &mut buf);
+        assert!(
+            !matches!(cache.lookup(k), Lookup::Miss),
+            "the entry that was read on every iteration must outlive the flood"
+        );
+        assert!(cache.bytes_held() <= cap);
+    }
+
+    /// Replacing an entry must not double-count its bytes.
+    #[test]
+    fn overwriting_a_key_does_not_leak_accounting() {
+        let cache = Cache::with_max_bytes(64 * 1024 * 1024);
+        for _ in 0..50 {
+            cache.insert(CacheKey::new("/", None, "gzip"), resp(100_000));
+        }
+        assert_eq!(cache.len(), 1, "one key, one entry");
+        assert!(
+            cache.bytes_held() < 200_000,
+            "accounting drifted: {} bytes for a single 100 KB entry",
+            cache.bytes_held()
+        );
     }
 }
