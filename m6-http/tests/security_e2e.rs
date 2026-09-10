@@ -710,3 +710,122 @@ fn finding_10_e2e_security_headers_must_be_present() {
         resp.headers
     );
 }
+
+// ── HTTP/2 raw client: the RFC 9113 4.2 frame-size boundary ──────────────────
+
+const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+fn h2_frame(ftype: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
+    let n = payload.len();
+    let mut v = Vec::with_capacity(9 + n);
+    v.push((n >> 16) as u8);
+    v.push((n >> 8) as u8);
+    v.push(n as u8);
+    v.push(ftype);
+    v.push(flags);
+    v.extend_from_slice(&stream_id.to_be_bytes());
+    v.extend_from_slice(payload);
+    v
+}
+
+/// HPACK "literal header field without indexing", name taken from the static
+/// table, value as a raw (un-Huffman'd) string. Enough to build one request
+/// without pulling in an encoder. Values here are always shorter than 127
+/// bytes, so the length is a single octet.
+fn hpack_literal(static_index: u8, value: &str) -> Vec<u8> {
+    let mut v = vec![static_index & 0x0f];
+    v.push(value.len() as u8);
+    v.extend_from_slice(value.as_bytes());
+    v
+}
+
+fn tls_client_config_h2(cert_der: &[u8]) -> Arc<rustls::ClientConfig> {
+    rustls::crypto::ring::default_provider().install_default().ok();
+    let cert = rustls::pki_types::CertificateDer::from(cert_der.to_vec());
+    let mut store = rustls::RootCertStore::empty();
+    store.add(cert).unwrap();
+    let mut cfg = rustls::ClientConfig::builder()
+        .with_root_certificates(store)
+        .with_no_client_auth();
+    cfg.alpn_protocols = vec![b"h2".to_vec()];
+    Arc::new(cfg)
+}
+
+/// A DATA frame of exactly 2^14 octets must produce a response, not a dropped
+/// socket.
+///
+/// RFC 9113 4.2: every endpoint MUST receive and minimally process a frame up
+/// to 2^14 octets, and 2^14 is the SETTINGS_MAX_FRAME_SIZE m6 advertises.
+///
+/// The defect: rustls caps received plaintext at a fixed 16 KiB and signals
+/// backpressure by failing `read_tls` with "received plaintext buffer full".
+/// `fill_recv` in http2.rs mapped that onto a dead connection and went to
+/// `Phase::Done`, closing without even a GOAWAY. Every HTTP/2 request carrying
+/// a body of 2^14 bytes or more died mid-flight, and the peer got no reason
+/// why. `advance_tls` in http11.rs had handled this correctly for HTTP/1.1 all
+/// along; the fix was simply never ported across.
+///
+/// This lives here, not in http2.rs, because it needs real TLS: the parser-level
+/// test in http2.rs feeds `recv_buf` directly, never trips the plaintext cap,
+/// and passed happily throughout while h2spec http2/4.2/1 failed.
+#[test]
+fn h2_data_frame_at_max_frame_size_must_get_a_response() {
+    let srv = start_server(100_000);
+
+    let tcp = TcpStream::connect(("127.0.0.1", srv.port)).expect("tcp connect");
+    tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let name = rustls::pki_types::ServerName::try_from("127.0.0.1".to_string()).unwrap();
+    let conn =
+        rustls::ClientConnection::new(tls_client_config_h2(&srv.cert_der), name).unwrap();
+    let mut s = StreamOwned::new(conn, tcp);
+
+    let authority = format!("127.0.0.1:{}", srv.port);
+    // :method POST (static 3), :scheme https (static 7), then :authority and
+    // :path as literals. Pseudo-headers first, as RFC 9113 8.3 requires.
+    let mut block = vec![0x83, 0x87];
+    block.extend(hpack_literal(1, &authority));
+    block.extend(hpack_literal(4, "/public/open.txt"));
+
+    let mut out = Vec::new();
+    out.extend_from_slice(H2_PREFACE);
+    out.extend(h2_frame(0x04, 0, 0, &[]));                    // SETTINGS
+    out.extend(h2_frame(0x01, 0x04, 1, &block));              // HEADERS, END_HEADERS
+    out.extend(h2_frame(0x00, 0x01, 1, &vec![0u8; 16_384]));  // DATA 2^14, END_STREAM
+    s.write_all(&out).unwrap();
+    s.flush().unwrap();
+
+    // Read until a HEADERS frame (type 0x01) appears, or the peer goes away.
+    // Before the fix the socket just closed, which is exactly what this catches.
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 4096];
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut saw_headers = false;
+
+    while Instant::now() < deadline && !saw_headers {
+        match s.read(&mut tmp) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(_) => break,
+        }
+        let mut i = 0;
+        while i + 9 <= buf.len() {
+            let len =
+                ((buf[i] as usize) << 16) | ((buf[i + 1] as usize) << 8) | buf[i + 2] as usize;
+            if i + 9 + len > buf.len() {
+                break;
+            }
+            if buf[i + 3] == 0x01 {
+                saw_headers = true;
+            }
+            i += 9 + len;
+        }
+    }
+
+    assert!(
+        saw_headers,
+        "no HEADERS frame came back: the server dropped the connection on a legal \
+         2^14-octet DATA frame. RFC 9113 4.2 requires it to be accepted \
+         (h2spec http2/4.2/1)."
+    );
+}
