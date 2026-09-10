@@ -27,10 +27,12 @@ fn make_site() -> (TempDir, Config, Vec<Route>) {
     std::fs::write(assets.join("index.html"), MINIMAL_HTML).unwrap();
 
     let config = Config {
+        minification: Default::default(),
         route: vec![RouteConfig {
             path: "/assets/{relpath}".to_string(),
             root: "assets".to_string(),
             tail: None,
+            headers: Vec::new(),
         }],
         compression: Default::default(),
         thread_pool: None,
@@ -124,10 +126,12 @@ fn bench_socket_round_trip(c: &mut Criterion) {
 
     std::thread::spawn(move || {
         let config = Config {
-            route: vec![RouteConfig {
+            minification: Default::default(),
+        route: vec![RouteConfig {
                 path: "/assets/{relpath}".to_string(),
                 root: "assets".to_string(),
                 tail: None,
+            headers: Vec::new(),
             }],
             compression: Default::default(),
             thread_pool: None,
@@ -212,10 +216,12 @@ fn main() {
 
         std::thread::spawn(move || {
             let config = Config {
-                route: vec![RouteConfig {
+                minification: Default::default(),
+        route: vec![RouteConfig {
                     path: "/assets/{relpath}".to_string(),
                     root: "assets".to_string(),
                     tail: None,
+            headers: Vec::new(),
                 }],
                 compression: Default::default(),
                 thread_pool: None,
