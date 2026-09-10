@@ -11,7 +11,8 @@ in any language". Today that promise is written down and never exercised. Every
 backend in the tree is Rust, and most link `m6-render`, so nothing would fail
 if the multi-language contract quietly stopped being true.
 
-These examples make the promise **executable**. They are reference
+`m6-backend-protocol.md` now states the contract normatively. These examples
+make it **executable**. They are reference
 implementations of the backend wire contract in several languages, they live in
 the test suite, and they run in the gate. If a change to `m6-http` breaks a
 plain C backend, a test goes red rather than a document going stale.
@@ -19,51 +20,26 @@ plain C backend, a test goes red rather than a document going stale.
 They serve three audiences at once:
 
 - **Someone writing a backend.** A complete, working, minimal starting point in
-  their language.
+  their language, and a worked reading of the specification.
 - **The platform.** A regression guard on the contract itself.
 - **This documentation.** Executable examples cannot rot.
 
-## 2. The contract
+## 2. The contract lives elsewhere
 
-Everything a backend must do. There is no more than this.
+**`m6-backend-protocol.md` is normative. This document is not.**
 
-1. **Bind.** Remove any stale socket file, bind a Unix stream socket at the
-   path matching the pool's `sockets` glob in `site.toml`.
-2. **Permissions.** `chmod 0666` the socket. `m6-http` runs as user `m6` and
-   will not otherwise connect.
-3. **Accept.** One HTTP/1.1 request per connection. `m6-http` sends
-   `Connection: close` and does not reuse the connection.
-4. **Parse.** Request line and headers, plus a body when `Content-Length` says
-   there is one.
-5. **Respond.** A status line, headers, and an **accurate `Content-Length`**.
-   Framing errors are refused by `m6-http`, not forgiven: `Transfer-Encoding`
-   together with `Content-Length`, conflicting `Content-Length` values, and an
-   unparseable `Content-Length` are all rejected.
-6. **Close**, then wait for the next connection.
-7. **Shut down.** SIGTERM or SIGINT: finish the current request, remove the
-   socket, exit 0.
+Every example is written *from* that specification, and nothing about the
+contract is restated here. If an example and the specification disagree, the
+specification is right and the example is a bug.
 
-### Headers that arrive
+That ordering matters. An example that drifts from the spec is worse than no
+example, because it is the thing people copy. The tests in §6 assert the
+behaviour the specification requires, so an example that stops conforming fails
+the gate rather than quietly teaching the wrong shape.
 
-| Header | Meaning |
-|---|---|
-| `Host` | The public host, as the visitor sent it |
-| `Via` | The hop `m6-http` received, so `1.1`, `2` or `3` |
-| `X-Forwarded-For` | The real client address |
-| `X-Forwarded-Proto` | Always `https` in a normal deployment |
-| `X-Forwarded-Host` | The original public host |
-| `x-auth-claims` | Verified JWT claims, when the route requires auth |
-
-`x-auth-claims` is **stripped from client input** by `m6-http` before
-forwarding. A backend may trust it precisely because it can only have come from
-`m6-http`. A backend reachable by any other path must not.
-
-### What a backend does not do
-
-No TLS. No HTTP/2 or HTTP/3. No caching. No compression. No rate limiting. No
-authentication. `m6-http` terminates all of it and forwards plain HTTP/1.1 over
-a local socket, which is why the contract stays small enough to implement from
-scratch.
+The specification's §9 is a checklist of everything a backend MUST do. Each
+example is a direct realisation of that checklist and SHOULD be readable
+side by side with it.
 
 ## 3. What each example does
 

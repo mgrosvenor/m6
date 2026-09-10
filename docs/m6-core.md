@@ -35,9 +35,13 @@ See `m6-backend-examples.md`.
 
 That ordering is deliberate and load bearing:
 
-- The **wire contract is primary**. It is what a backend must satisfy. It is
+- The **wire contract is primary**. `m6-backend-protocol.md` is the platform's
+  interface specification, and it is language agnostic by construction. It is
   small enough to implement from scratch in any language in well under a
   hundred lines.
+- **`m6-core` MUST NOT be the only readable definition of any part of it.**
+  If behaviour a backend depends on exists only as Rust, the specification has
+  a hole. Fix the specification.
 - `m6-core` is a **convenience for Rust**. It makes the common case fast to
   build and hard to get wrong. It must never become the only viable path, or
   the multi-language promise dies quietly while still being written down.
