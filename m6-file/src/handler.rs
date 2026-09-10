@@ -176,21 +176,23 @@ pub fn handle_request<W: Write>(
     };
     let mut etag = format!("\"{:x}-{:x}{}\"", mtime_secs, metadata.len(), etag_suffix);
 
-    let if_none_match = req.headers.iter().find(|(k, _)| k == "if-none-match").map(|(_, v)| v.as_str());
-    let not_modified = if let Some(inm) = if_none_match {
-        // A real client sends exactly one ETag here, but the If-None-Match
-        // grammar allows a comma-separated list (and "*"), so honor that.
-        inm == "*" || inm.split(',').any(|tag| tag.trim() == etag)
-    } else if let Some(ims) = req.headers.iter().find(|(k, _)| k == "if-modified-since").map(|(_, v)| v.as_str()) {
-        // HTTP-date has 1-second resolution; compare at that resolution too
-        // so a file that hasn't changed since the client's cached copy
-        // doesn't spuriously look "modified" from sub-second mtime noise.
-        httpdate::parse_http_date(ims)
-            .map(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs() >= mtime_secs)
-            .unwrap_or(false)
-    } else {
-        false
-    };
+    // Preconditions come from m6-core, which implements all four steps of
+    // RFC 9110 13.2.2 in the required order. What was here did steps 3 and 4
+    // only, and step 3 with strong comparison:
+    //
+    //     inm == "*" || inm.split(',').any(|tag| tag.trim() == etag)
+    //
+    // Byte equality is *strong* comparison. `If-None-Match` requires weak
+    // (8.8.3.2), so a client returning the validator it had been given as
+    // `W/"..."` never matched and was sent the whole body again. `If-Match`
+    // and `If-Unmodified-Since` were not consulted at all, so a client could
+    // assert a precondition and have it silently ignored.
+    let validators = [
+        ("ETag".to_string(), etag.clone()),
+        ("Last-Modified".to_string(), last_modified.clone()),
+    ];
+    let precondition =
+        m6_core::evaluate_preconditions(&validators, &req.headers, &req.method);
 
     // Short max-age (fast repeat loads within it) plus stale-while-revalidate
     // (a shared cache past that window serves its stale copy immediately and
@@ -246,7 +248,21 @@ pub fn handle_request<W: Write>(
     // default for exactly this reason -- see the guard there before shortening
     // that path.
     let cache_control = cache_control_for(&req.query);
-    if not_modified {
+
+    // 412: a precondition the client asserted is false, and the request must
+    // not be applied. The previous `bool` could not express this outcome,
+    // which is why If-Match was ignored rather than honoured.
+    if precondition == m6_core::Precondition::Failed {
+        let hdrs: Vec<(&str, &str)> = vec![
+            ("Cache-Control", cache_control),
+            ("ETag", &etag),
+            ("Last-Modified", &last_modified),
+        ];
+        write_response(stream, 412, "Precondition Failed", &hdrs, &[])?;
+        return Ok(ResponseInfo { status: 412, bytes: 0, latency_us: start.elapsed().as_micros() });
+    }
+
+    if precondition == m6_core::Precondition::NotModified {
         let hdrs: Vec<(&str, &str)> = vec![
             ("Cache-Control", cache_control),
             ("ETag", &etag),
