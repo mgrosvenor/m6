@@ -8,7 +8,6 @@
 /// to the downstream ingester (render-analytics) so the hot path here stays
 /// a handful of string operations, not a database/ruleset lookup.
 use quiche::h3::NameValue as _;
-use rand::RngCore;
 
 pub const SESSION_COOKIE: &str = "_m6sid";
 
@@ -97,9 +96,7 @@ fn session_from_cookie_header(cookie_header: &str) -> Option<String> {
 /// cleared — it only ties together requests within one browser's lifetime
 /// of the cookie.
 fn generate_session_id() -> String {
-    let mut bytes = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    m6_core::random_hex_token::<16>()
 }
 
 /// Read the session id from the incoming request's `Cookie` header, or mint

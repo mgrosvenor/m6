@@ -280,7 +280,7 @@ where
         let proto     = conn.tls.alpn_protocol().map(|p| p.to_vec());
         let client_ip = client_ip.clone();
         let created   = *created;
-        if proto.as_deref() == Some(b"h2") {
+        if proto.as_deref() == Some(b"h2".as_slice()) {
             conn.kind = ConnKind::Http2(Http2Conn::new());
             // Drive immediately — client preface may already be buffered.
             let ConnKind::Http2(h2) = &mut conn.kind else { return };
