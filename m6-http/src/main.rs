@@ -570,11 +570,11 @@ fn event_loop(
                     let mut outcome = handle_request(req, client_ip, enc_str, state, false);
                     if let RequestOutcome::Ready(status, ref mut headers, _, ref backend, _) = outcome {
                         set_alt_svc(headers, quic_port);
-                        // /health and /perf answer from local state and are not
-                        // site traffic. Counting them would let a 30s monitor
-                        // keep requests_total moving through a total traffic
-                        // stall, which is the one thing that counter is for.
-                        if !health::is_monitoring_endpoint(backend) {
+                        // /health and /perf are separated inside
+                        // `Stats::record` now, not skipped here. See the
+                        // monitoring block in stats.rs: they are counted
+                        // apart from site traffic rather than discarded, so
+                        // requests_total is still a traffic-stall signal.
                         // Record the cache MISS.
                         //
                         // This was missing, and the omission was invisible
@@ -607,7 +607,6 @@ fn event_loop(
                         let elapsed_ns = start.elapsed().as_nanos() as u64;
                         let chan = Channel::new(HttpVersion::from_wire(&req.version), state.tls_iface);
                         state.stats.record(elapsed_ns, false, status, chan, backend);
-                        }
                     }
                     outcome
                 },
@@ -779,11 +778,11 @@ fn event_loop(
                     let mut outcome = handle_request(req, client_ip, enc_str, state, false);
                     if let RequestOutcome::Ready(status, ref mut headers, _, ref backend, _) = outcome {
                         set_alt_svc(headers, quic_port);
-                        // /health and /perf answer from local state and are not
-                        // site traffic. Counting them would let a 30s monitor
-                        // keep requests_total moving through a total traffic
-                        // stall, which is the one thing that counter is for.
-                        if !health::is_monitoring_endpoint(backend) {
+                        // /health and /perf are separated inside
+                        // `Stats::record` now, not skipped here. See the
+                        // monitoring block in stats.rs: they are counted
+                        // apart from site traffic rather than discarded, so
+                        // requests_total is still a traffic-stall signal.
                         // Record the cache MISS.
                         //
                         // This was missing, and the omission was invisible
@@ -818,7 +817,6 @@ fn event_loop(
                         // from its bind address (the WireGuard tunnel here).
                         let chan = Channel::new(HttpVersion::Http2, state.h2c_iface);
                         state.stats.record(elapsed_ns, false, status, chan, backend);
-                        }
                     }
                     outcome
                 },
@@ -1457,12 +1455,9 @@ fn handle_h3_request(
             set_alt_svc(&mut resp_headers, quic_port);
 
             let elapsed_ns = start.elapsed().as_nanos() as u64;
-            // Same exclusion as the h1/h2 paths: /health and /perf are not
-            // site traffic and must not move these counters.
-            if !health::is_monitoring_endpoint(&backend_name) {
-                let chan = Channel::new(HttpVersion::Http3, state.tls_iface);
-                state.stats.record(elapsed_ns, false, status, chan, &backend_name);
-            }
+            // /health and /perf are separated inside `Stats::record`.
+            let chan = Channel::new(HttpVersion::Http3, state.tls_iface);
+            state.stats.record(elapsed_ns, false, status, chan, &backend_name);
             debug!(
                 path = %path,
                 status,
@@ -1837,6 +1832,13 @@ fn handle_request_inner(
             state.pool_manager.url_backend_names(),
         );
         let (code, headers, body) = report.into_response(code);
+        // Recorded, not discarded. `message = "monitor"` keeps it out of the
+        // site-traffic rows every consumer already filters for, so an uptime
+        // check is observable without being counted as a visitor.
+        analytics::log_monitor(
+            state.config.analytics.enabled, &req.headers, &state.config.node.name,
+            &req.path, code, client_ip, None,
+        );
         return RequestOutcome::Ready(
             code,
             headers,
@@ -1861,6 +1863,12 @@ fn handle_request_inner(
             || state.stats.snapshot(),
         );
         let (code, headers, body) = outcome.into_response();
+        // Same treatment as /health above. A 401 here is worth seeing: it
+        // means something is probing the metrics endpoint without the token.
+        analytics::log_monitor(
+            state.config.analytics.enabled, &req.headers, &state.config.node.name,
+            &req.path, code, client_ip, None,
+        );
         return RequestOutcome::Ready(
             code,
             headers,

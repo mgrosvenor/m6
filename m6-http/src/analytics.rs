@@ -326,6 +326,51 @@ fn log_request(
     );
 }
 
+/// Record a poll of `/health` or `/perf`.
+///
+/// These used to appear nowhere at all. They short-circuit inside
+/// `handle_request` and return before the analytics call further down, so the
+/// request log had no row for them, and the stats counters skipped them at
+/// three separate call sites. That kept site traffic honest and made the
+/// monitoring itself invisible: a check that had silently stopped looked
+/// exactly like a check that was passing, and a flood aimed at `/health` was
+/// not recorded anywhere.
+///
+/// Emitted with `message = "monitor"` rather than `"request"`, which is what
+/// keeps it out of site traffic. Every existing consumer already filters on
+/// `message == "request"` (`node-summary.py` does), so none of them change
+/// behaviour and none needed editing, while a consumer that wants monitoring
+/// can now ask for it. The alternative, a `traffic_class` field on every row,
+/// would have meant plumbing a parameter through four call sites to say
+/// "site" in all but two of them.
+///
+/// No session is minted: a monitor is not a visitor, and issuing it a session
+/// cookie would put an unbounded number of one-request sessions into the data.
+pub fn log_monitor(
+    enabled: bool,
+    request_headers: &(impl HeaderSource + ?Sized),
+    node: &str,
+    path: &str,
+    status: u16,
+    client_ip: &str,
+    latency_ns: Option<u64>,
+) {
+    if !enabled {
+        return;
+    }
+    let features = extract_features(request_headers);
+    tracing::info!(
+        target: "analytics",
+        node = node,
+        path = path,
+        status = status,
+        client_ip = client_ip,
+        user_agent = features.user_agent.as_deref(),
+        latency_ns = latency_ns,
+        "monitor"
+    );
+}
+
 /// Log a request rejected by the per-IP rate limiter, before it ever reaches
 /// routing/cache lookup — a separate, lighter event from `log_request` since
 /// almost nothing about the request has been processed yet at that point.
