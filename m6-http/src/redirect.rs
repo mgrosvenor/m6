@@ -140,7 +140,7 @@ pub fn run(bind: &str) -> anyhow::Result<()> {
         // Wake on listener readability or any connection becoming readable.
         // The timeout also drives the header-deadline sweep below when idle,
         // so a stalled connection is still reaped on a silent listener.
-        if let Err(e) = poller.wait(&mut ev_buf, POLL_TIMEOUT_MS, None) {
+        if let Err(e) = poller.wait(&mut ev_buf, POLL_TIMEOUT_MS) {
             if e.kind() == ErrorKind::Interrupted {
                 continue;
             }

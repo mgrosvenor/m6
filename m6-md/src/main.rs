@@ -8,8 +8,6 @@
 /// Output: { "documents": [...] } sorted by date descending.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Map, Value};
@@ -233,7 +231,6 @@ fn parse_args(args: &[String]) -> Result<Cli> {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
-static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -270,15 +267,13 @@ fn run(args: Vec<String>) -> i32 {
 
     // ── Watch mode ────────────────────────────────────────────────────────────
 
-    // Install SIGTERM / SIGINT handler so the process exits cleanly.
-    let shutdown = Arc::new(AtomicBool::new(false));
-    {
-        let s = Arc::clone(&shutdown);
-        ctrlc::set_handler(move || {
-            s.store(true, Ordering::SeqCst);
-            SHUTDOWN.store(true, Ordering::SeqCst);
-        }).ok();
-    }
+    // Signal handling lives in m6-core, like every other m6 tool.
+    //
+    // This used the ctrlc crate and kept two flags, an Arc<AtomicBool> and a
+    // static, set together and read only through the static. It also had no
+    // second-signal exit, so it did not match what m6-decisions.md specifies
+    // for all tools: first signal clean, second immediate.
+    let _shutdown = m6_core::signal::ShutdownHandle::install();
 
     let (tx, rx) = std::sync::mpsc::channel();
 
@@ -303,7 +298,7 @@ fn run(args: Vec<String>) -> i32 {
     info!(dir = %cli.input_dir.display(), "watching for .md changes");
 
     loop {
-        if SHUTDOWN.load(Ordering::SeqCst) {
+        if m6_core::signal::is_shutdown() {
             info!("shutting down");
             break;
         }
@@ -327,7 +322,7 @@ fn run(args: Vec<String>) -> i32 {
         std::thread::sleep(std::time::Duration::from_millis(50));
         drain_channel(&rx);
 
-        if SHUTDOWN.load(Ordering::SeqCst) { break; }
+        if m6_core::signal::is_shutdown() { break; }
 
         debug!("md change detected, regenerating");
         match process(&cli) {
