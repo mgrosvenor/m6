@@ -17,10 +17,11 @@ it, label it, log it, take configuration, notice when configuration changes,
 and shut down cleanly. `m6-core` provides all of that as components. An
 application supplies only what is specific to it.
 
-It is also the **home of every RFC obligation in the platform.** HTTP/1.1,
-HTTP/2 and HTTP/3 live here, next to each other, sharing the version
-independent semantics they have in common. Conformance is a property of this
-crate.
+It is also the home of **HTTP semantics and HTTP/1.1**: the rules that do not
+depend on protocol version, plus the one wire format that both the proxy and
+every backend speak. HTTP/2 and HTTP/3 stay in `m6-http`, which is the only
+process that terminates them; §4.1 gives the reasoning and the measurement
+behind it.
 
 The test of success is that a new m6 application is small. `m6-html` is six
 lines today and serves every HTML page on mgrosvenor.com. That is the shape
@@ -83,27 +84,75 @@ answer, or every m6 service needs it, it belongs here.**
 
 ### 4.1 Protocol
 
-All three HTTP versions, together, because they share more than they differ.
+**Version-independent semantics, and HTTP/1.1. Not HTTP/2 or HTTP/3.**
 
-- **Semantics (RFC 9110)**, version independent: method and status meaning,
-  header field validation, conditional request preconditions and comparison,
-  content negotiation, `Via`, hop by hop field handling, trusted header rules.
+In core:
+
+- **Semantics (RFC 9110)**: method and status meaning, header field
+  validation, conditional request preconditions and comparison, content
+  negotiation, `Via`, hop-by-hop field handling, trusted header rules.
 - **Caching semantics (RFC 9111)**: storability, freshness, age calculation,
-  request and response directives, revalidation rules. The *rules*, not the
-  storage.
+  request and response directives, revalidation. The *rules*, not the storage.
 - **HTTP/1.1 (RFC 9112)**: request and response parse and serialise, chunked
   transfer coding, framing validation.
-- **HTTP/2 (RFC 9113)**: frame layer, stream state machine, HPACK, flow
-  control, connection and stream error taxonomy.
-- **HTTP/3 (RFC 9114)**: request and response mapping, QPACK integration.
 
-**Why together.** `validate_request_header_bytes` is already shared by the h2
-and h3 paths, because RFC 9114 §4.3 is RFC 9113 §8.3 restated. Today it lives
-inside `http2.rs` for want of a home. Before it was shared, HTTP/3 had no
-request validation at all: an uppercase field name or a duplicate `:method`
-was served a normal 200 over h3 while the identical request was correctly
-rejected over h2. Keeping the implementations adjacent is what prevents that
-class of divergence, and it has already been paid for once.
+Stays in `m6-http`:
+
+- **HTTP/2 (RFC 9113)**: frame layer, stream state machine, HPACK, flow
+  control, error taxonomy.
+- **HTTP/3 (RFC 9114)**: request and response mapping, QPACK, QUIC
+  integration.
+
+#### Why the line is drawn there
+
+The test is **how many consumers a thing has**, and the answer differs sharply.
+
+**Semantics have many.** The h1 path, the h2 path, the h3 path and every Rust
+backend all need the same answers about what a method means, whether a
+representation is fresh, and which header fields are legal. One implementation
+or they drift.
+
+**HTTP/1.1 has many.** It is the backend wire contract
+(`m6-backend-protocol.md`), so `m6-http` needs it to talk to backends and every
+Rust backend needs it to answer. `m6-core::parse` already exists and
+`m6-auth-server` already uses it.
+
+**HTTP/2 and HTTP/3 have exactly one, permanently.** `m6-http` is the only
+process that terminates a public connection; that is the architecture, not a
+current limitation. A library with one consumer is not a library, it is that
+consumer's code in another directory.
+
+#### The sharing argument, tested and withdrawn
+
+An earlier version of this document argued that all three versions belonged
+together because h2 and h3 share code. Measured, the H3 path imports **exactly
+one symbol** from `http2.rs`:
+
+```
+use m6_http_lib::http2::validate_request_header_bytes;
+```
+
+Nothing else. No frame layer, no HPACK, no stream state machine, no
+concurrency cap. HPACK and QPACK are different algorithms; h2 frames and QUIC
+streams are different transports. **The only thing h2 and h3 share is RFC 9110
+semantics**, which is in core under this design, so they still share it,
+without either wire format moving.
+
+That also disposes of the bug the earlier argument leaned on. HTTP/3 once had
+no request validation at all and served 200 to requests HTTP/2 correctly
+rejected. The fix is that the *rule* has one home. It does not require the
+frame layers to be neighbours.
+
+#### What this costs
+
+`m6-http` keeps the largest and most defect-dense body of code in the project,
+and conformance to RFC 9113 and 9114 remains its property rather than core's.
+That is accepted deliberately: the alternative is a feature matrix and a
+4,300-line migration against a live system, in exchange for an abstraction
+boundary that exactly one caller would ever cross.
+
+If a second consumer ever appears, a backend that needs to terminate h2 itself,
+this decision should be revisited rather than worked around.
 
 ### 4.2 Service scaffolding
 
@@ -157,29 +206,29 @@ that proves conformance. It is also the fix for a live problem: the scaffolding
 to start a service is currently reimplemented across many test files, and that
 duplication is the prime suspect for an intermittent full suite failure.
 
-## 5. Dependency weight, and features
+## 5. Dependency weight
 
 **Constraint: `m6-core` must remain linkable by a command line tool.** `m6-md`
-is a build time Markdown converter. It must not acquire a QUIC stack, a
+is a build-time Markdown converter. It must not acquire a QUIC stack, a
 BoringSSL toolchain requirement, or a TLS library because it depends on core.
 
-Feature gates, not separate crates:
+With HTTP/2 and HTTP/3 staying in `m6-http` (§4.1), this is satisfied by
+construction rather than by configuration. Nothing in core's scope needs
+`quiche`, `rustls`, `hpack` or `ring`. HTTP/1.1 parsing and serialisation, the
+semantics layer, the socket server, config, logging and the content modules are
+all dependency-light.
+
+**One feature gate:**
 
 | Feature | Adds | Consumers |
 |---|---|---|
-| *default* | semantics, HTTP/1.1, service scaffolding, config, content, safety, logging | applications, `m6-md`, `m6-render` |
-| `http2` | HTTP/2 frame layer, HPACK | `m6-http` |
-| `http3` | HTTP/3 mapping, QPACK, QUIC integration | `m6-http` |
-| `testkit` | harness, raw socket clients | dev dependency everywhere |
+| *default* | semantics, HTTP/1.1, service scaffolding, config, content, safety, logging | applications, `m6-md`, `m6-render`, `m6-http` |
+| `testkit` | harness, raw-socket clients | dev-dependency everywhere |
 
-This works because the heavy dependencies are already confined by protocol
-rather than smeared across the codebase, and because `m6-render` already uses
-feature gates for its optional extras. Applications take the default and get
-nothing heavier than they need.
-
-Separate crates were considered and rejected: the protocol versions share the
-semantics layer, and splitting them across crates would either duplicate that
-layer or require a fourth crate to hold it.
+An earlier version of this document proposed `http2` and `http3` features to
+keep the weight off `m6-md`. Those gates existed only to contain a problem that
+this design does not create, and a build matrix maintained for one consumer's
+benefit is a cost with no matching return.
 
 ## 6. What does not belong
 
@@ -194,6 +243,7 @@ decision**, not a specification.
 | Route table and matching policy | Which paths exist is site configuration |
 | Rate limiting | A policy choice about who to refuse |
 | Proxy and backend pool logic | Specific to being the front door |
+| HTTP/2 and HTTP/3 | Exactly one consumer, permanently. See §4.1 |
 
 The pattern: `m6-core` answers "what does the specification require", `m6-http`
 answers "what does this deployment do".
@@ -218,14 +268,17 @@ worse than ignoring it.
 
 ## 8. Consequences
 
-- **Conformance becomes a property of `m6-core`.** h2spec, h3spec and the
-  HTTP/1.1 corpus run against this crate. `m6-http` inherits the result rather
-  than owning it.
+- **Conformance splits along the same line.** The HTTP/1.1 corpus and the
+  semantics tests run against `m6-core`. h2spec and h3spec continue to run
+  against `m6-http`, which is where those protocols live. Neither suite changes
+  owner by accident.
 - **The public API becomes a compatibility surface at 1.0**, in the same way
   `site.toml` keys do. Regrettable names should be fixed before that, not
   after.
-- **`m6-http` gets smaller.** It becomes a listener, a cache, a router and a
-  set of policies over a correct protocol library.
+- **`m6-http` gets smaller, but stays the largest crate.** It sheds the
+  semantics layer, HTTP/1.1 and the service scaffolding, and keeps the h2 and
+  h3 implementations, the listener, the cache and the routing and rate-limiting
+  policy. That is the intended shape, not a failure to finish.
 - **Rust applications get shorter.** The scaffolding every service reimplements
   moves behind one dependency.
 
@@ -261,17 +314,22 @@ Ordered so each step ships on its own and makes the next cheaper. This is a
 re-verification exercise against a live system, not a refactor: the conformance
 suites and the fleet are the gate at every step.
 
-1. **The small consolidations.** Path validation, signals, header lookup,
-   token generation. Mechanical, and path validation is a security boundary
-   with three behaviours today.
-2. **The test kit.** Everything after this needs it, and moving protocol code
-   without a shared harness means writing the tests twice.
-3. **Semantics (RFC 9110 and 9111 rules).** Version independent, so it moves
+1. **The small consolidations.** Path validation, signals, header lookup, token
+   generation. Mechanical, and path validation is a security boundary with
+   three behaviours today.
+2. **The test kit.** Everything after this needs it, and moving code without a
+   shared harness means writing the tests twice.
+3. **Semantics (RFC 9110 and 9111 rules).** Version-independent, so it moves
    without touching any wire format. Conditional requests first: the rules
-   exist twice today and one copy is wrong.
-4. **HTTP/1.1.** The smallest wire format, and the one applications use.
-5. **HTTP/2, then HTTP/3.** Largest and last. One protocol per release, with
-   h2spec and h3spec green at every step before proceeding.
+   exist twice today and one copy is wrong. `validate_request_header_bytes`
+   moves here, which is what lets the h2 and h3 paths keep sharing it from
+   `m6-http`.
+4. **HTTP/1.1.** The last protocol move, and the only one. It is the backend
+   wire contract, so it is the piece that makes a Rust backend short.
 
-Step 1 can begin immediately. Nothing before step 3 changes what goes on the
-wire.
+There is no step 5. HTTP/2 and HTTP/3 stay where they are.
+
+Nothing before step 3 changes what goes on the wire, and nothing in the
+sequence touches the h2 or h3 implementations at all, which is the main
+practical argument for the boundary in §4.1: the highest-risk code in the
+project is not involved.
