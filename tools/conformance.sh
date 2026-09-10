@@ -37,6 +37,7 @@ WORK="${CONFORMANCE_WORK:-/tmp/m6-conformance}"
 TLS_PORT=10443
 H2C_PORT=18080
 BRIDGE_BASE=18090
+REDIRECT_PORT=18081
 
 UPDATE=false
 ONLY=""
@@ -66,6 +67,43 @@ cleanup() {
 trap cleanup EXIT
 
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# Wait for a port, but only accept it if OUR child is still the one alive.
+#
+# A bare connect check is not proof that the process just started is the one
+# listening. A leftover instance from an earlier run held the port, the new
+# child died with "Address already in use", the connect succeeded against the
+# stale process, and h1spec scored an abandoned binary -- twice, at 5/32 and
+# then 8/32, varying with whatever was there. That is the same failure as
+# measuring a stale staging binary, and as benchmarking against an orphaned
+# run: the harness reported a number for something other than what it built.
+wait_port_owned_by() {  # wait_port_owned_by <pid> <port> <what>
+  local pid="$1" port="$2" what="$3"
+  for _ in $(seq 1 100); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      fail "$what exited during startup; see the log in $WORK"
+      RESULT=1
+      return 1
+    fi
+    if (exec 3<>/dev/tcp/127.0.0.1/"$port") 2>/dev/null; then exec 3>&- 3<&-; return 0; fi
+    sleep 0.1
+  done
+  fail "$what never listened on $port"
+  RESULT=1
+  return 1
+}
+
+# Refuse to run at all if a target port is already taken: whatever is there is
+# not ours, and measuring it is worse than not measuring.
+require_free_port() {  # require_free_port <port> <what>
+  if (exec 3<>/dev/tcp/127.0.0.1/"$1") 2>/dev/null; then
+    exec 3>&- 3<&-
+    fail "port $1 is already in use; $2 would measure whatever is there, not this build"
+    RESULT=1
+    return 1
+  fi
+  return 0
+}
 
 floor_for() { awk -v k="$1" '$1==k {print $2}' "$SCORES" 2>/dev/null; }
 total_for() { awk -v k="$1" '$1==k {print $3}' "$SCORES" 2>/dev/null; }
@@ -122,16 +160,41 @@ start_edge() {
   if [[ -f "$site/site.toml" ]]; then
     sed -i.bak 's/^requests_per_min = .*/requests_per_min = 100000/' "$site/site.toml" 2>/dev/null || true
   fi
+  require_free_port "$TLS_PORT" "the loopback edge" || return 1
   $SETSID nohup "$ROOT/target/release/m6-http" "$site" "$WORK/conf.toml" \
     > "$WORK/edge.log" 2>&1 &
-  PIDS+=($!)
-  for _ in $(seq 1 100); do
-    if (exec 3<>/dev/tcp/127.0.0.1/$TLS_PORT) 2>/dev/null; then exec 3>&- 3<&-; return 0; fi
-    sleep 0.1
-  done
-  fail "loopback m6-http never listened on $TLS_PORT; see $WORK/edge.log"
-  RESULT=1
-  return 1
+  local pid=$!
+  PIDS+=($pid)
+  wait_port_owned_by "$pid" "$TLS_PORT" "the loopback edge"
+}
+
+start_redirect() {
+  # m6-http in redirect mode is a plaintext HTTP/1.1 server on :80, a separate
+  # process from the :443 instance, running on every production node. It is the
+  # only m6 HTTP/1.1 implementation that is public-facing *and* unencrypted, so
+  # a tester reaches it with no bridge and no TLS termination, and so does
+  # anyone else.
+  local site="$WORK/redir-site"
+  mkdir -p "$site"
+  cat > "$site/site.toml" <<TOML
+[site]
+name   = "conformance"
+domain = "localhost"
+TOML
+  cat > "$WORK/redirect.toml" <<TOML
+[server]
+bind          = "127.0.0.1:1"
+redirect_bind = "127.0.0.1:$REDIRECT_PORT"
+
+[node]
+name = "conformance"
+TOML
+  require_free_port "$REDIRECT_PORT" "the redirect listener" || return 1
+  $SETSID nohup "$ROOT/target/release/m6-http" "$site" "$WORK/redirect.toml" \
+    > "$WORK/redirect.log" 2>&1 &
+  local pid=$!
+  PIDS+=($pid)
+  wait_port_owned_by "$pid" "$REDIRECT_PORT" "the redirect listener"
 }
 
 start_backend() {  # start_backend <name> <bridge-port> <site-dir> <config>
@@ -143,9 +206,11 @@ start_backend() {  # start_backend <name> <bridge-port> <site-dir> <config>
   PIDS+=($!)
   for _ in $(seq 1 200); do [[ -S "$sock" ]] && break; sleep 0.05; done
   [[ -S "$sock" ]] || { fail "$name never created $sock; see $WORK/$name.log"; RESULT=1; return 1; }
+  require_free_port "$port" "the $name bridge" || return 1
   $SETSID nohup python3 "$HERE/unix_bridge.py" "$port" "$sock" > "$WORK/$name-bridge.log" 2>&1 &
-  PIDS+=($!)
-  sleep 0.5
+  local bpid=$!
+  PIDS+=($bpid)
+  wait_port_owned_by "$bpid" "$port" "the $name bridge"
 }
 
 # ── h1 ────────────────────────────────────────────────────────────────────────
@@ -162,14 +227,35 @@ run_h1() {
   # every m6 app implements, so they are the targets that matter most.
   start_backend m6-file "$BRIDGE_BASE" \
     "$ROOT/m6-file/tests/fixtures" "$ROOT/m6-file/tests/fixtures/m6-file-test.conf" || return 1
+  h1_against "h1:m6-file" "$BRIDGE_BASE"
+
+  # m6-html is a second backend with its own HTTP/1.1 parser.
+  if start_backend m6-html $((BRIDGE_BASE + 1)) \
+       "$ROOT/m6-html/tests/fixtures" "$ROOT/m6-html/tests/fixtures/configs/m6-html.conf"; then
+    h1_against "h1:m6-html" $((BRIDGE_BASE + 1))
+  fi
+
+  # The plaintext :80 redirect listener, which is public-facing in production.
+  if start_redirect; then
+    h1_against "h1:m6-http-redirect" "$REDIRECT_PORT"
+  fi
+}
+
+h1_against() {  # h1_against <score-key> <port>
+  local key="$1" port="$2"
   local out
-  out="$(uvx --from git+https://github.com/dropseed/h1spec h1spec 127.0.0.1:$BRIDGE_BASE 2>&1 \
+  out="$(uvx --from git+https://github.com/dropseed/h1spec h1spec 127.0.0.1:$port 2>&1 \
         | sed 's/\x1b\[[0-9;]*m//g')"
-  echo "$out" | grep -E '^\s+[✓✗]' || true
+  echo "$out" | grep -E '^\s+✗' || true
   local line got tot
   line="$(echo "$out" | grep -oE '[0-9]+/[0-9]+ passed' | tail -1)"
   got="${line%%/*}"; tot="${line#*/}"; tot="${tot%% *}"
-  [[ -n "$got" ]] && check "h1:m6-file" "$got" "$tot"
+  if [[ -n "$got" ]]; then
+    check "$key" "$got" "$tot"
+  else
+    fail "$key: h1spec produced no score"
+    RESULT=1
+  fi
 }
 
 # ── h2 and h3 ─────────────────────────────────────────────────────────────────
