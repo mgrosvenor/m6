@@ -12,6 +12,36 @@ Every design decision, flat. For rationale see `m6-design-discussion.md`.
 - All processes log to stdout — systemd captures via journald
 - `site.toml` is the single source of truth
 
+## Crate Boundaries
+
+Decided 2026-09-10. Previously undecided: `m6-core` appeared once in the whole
+documentation set, as a conditional aside in `m6-render-lib.md`, and the
+Architecture entry above names five processes without it.
+
+- **`m6-core` is a component library**, linked by `m6-http`, by the default
+  apps, and OPTIONALLY by consumer apps. Not a process.
+- **It owns HTTP semantics (RFC 9110), caching rules (RFC 9111) and
+  HTTP/1.1**, plus the service loop, HTTP types, config, signals, logging,
+  content handling, path safety and the test harness.
+- **HTTP/2 and HTTP/3 stay in `m6-http`.** They have exactly one consumer,
+  permanently, because `m6-http` is the only process that terminates a public
+  connection. Measured: the H3 path imports exactly one symbol from `http2.rs`,
+  and it is RFC 9110 semantics, not h2 wire format.
+- **`m6-render` is dissolved.** Its scaffolding moves to `m6-core` and its
+  templating to `m6-html`. It was 14% templating and 86% service loop, and
+  three of its four consumers had zero template files while linking Tera,
+  comrak, pest and fourteen other crates to obtain a server.
+- **Consumer apps link `m6-core`, or nothing.** Never a default app.
+- **Duplicate dependencies are acceptable where coupling is not.** An app that
+  wants Tera declares Tera. It does not acquire a template engine as a side
+  effect of wanting a server loop.
+- **The wire contract is primary.** `m6-backend-protocol.md` is the platform's
+  interface, and `m6-core` is a convenience for Rust that must never become the
+  only viable path.
+
+See `m6-core.md` for the design and `m6-core-implementation-plan.md` for the
+migration.
+
 ## Tiers
 
 - **Tier 1** — m6-http + m6-html + m6-file. Static sites. No build step. No custom renderers.

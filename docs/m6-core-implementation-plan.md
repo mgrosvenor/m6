@@ -21,19 +21,21 @@ the gate is green and the fleet is verified.
    m6-http        the edge. TLS, HTTP/2, HTTP/3, cache, routing, rate
                   limiting, proxy policy. Links m6-core.
 
-   m6-render      a DEFAULT APP. Template rendering over m6-core.
+   m6-html        a DEFAULT APP. Templating (Tera) over m6-core.
    m6-file        a DEFAULT APP. Static files over m6-core.
    m6-auth-server a DEFAULT APP. Auth over m6-core.
 
-   consumer apps  link m6-core, or nothing at all. Never m6-render.
+   m6-render      DELETED. Scaffolding to m6-core, templating to m6-html.
+
+   consumer apps  link m6-core, or nothing at all. Never a default app.
 ```
 
 Three decisions this plan implements, all already taken:
 
 1. **HTTP/2 and HTTP/3 stay in `m6-http`.** They have exactly one consumer,
    permanently. See `m6-core.md` §4.1.
-2. **`m6-render` becomes an app, not a library dependency.** Consumer apps
-   link `m6-core` only.
+2. **`m6-render` is dissolved.** Scaffolding to `m6-core`, templating to
+   `m6-html`, crate deleted. Consumer apps link `m6-core` only.
 3. **Duplicate dependencies are acceptable; coupling is not.** If
    `render-analytics` wants Tera it declares Tera. It does not acquire a
    template engine as a side effect of wanting a server loop.
@@ -58,24 +60,56 @@ writing the tests twice, once where the code is and once where it lands.
 
 No code. Settle two things that later phases assume.
 
-**0.1 Decide `m6-html`'s fate.** `m6-html` today is six lines calling
-`App::new().run()`, which is exactly what "`m6-render` as an app" describes.
-Either:
+**0.1 `m6-html`'s fate — DECIDED 2026-09-10.** `m6-render` is **dissolved**,
+not repackaged. Its service scaffolding moves into `m6-core` and its templating
+moves into `m6-html`. The crate is deleted.
 
-- `m6-render` gains a binary and replaces `m6-html`, with `m6-html` retired; or
-- `m6-html` remains the binary and `m6-render` remains a library that only
-  `m6-html` links.
+This is simpler than either option originally offered. There is no framework
+crate left to name, no library that only one binary links, and no cross-repo
+path dependency to pin, because nothing outside `m6-html` will link templating
+at all.
 
-These differ in naming and deployment, not in structure. The second is less
-disruptive and keeps `deploy-platform.sh` unchanged. **Recommend the second**
-unless the name `m6-html` is itself the problem.
+| `m6-render` module | Lines | Destination |
+|---|---|---|
+| `app.rs` (service loop, thread pool, routing, signals, compression) | 2,617 | `m6-core`, minus the render step |
+| `request.rs` | 643 | `m6-core` |
+| `response.rs` | 252 | `m6-core` |
+| `config.rs` | 452 | split: app config to `m6-core`, template config to `m6-html` |
+| `server.rs` | 152 | `m6-core` |
+| `multipart.rs` | 111 | `m6-core`, optional feature. It is request body parsing, not templating |
+| `util.rs` | 33 | `m6-core` |
+| `error.rs` | 18 | `m6-core` |
+| `template.rs` | 695 | **`m6-html`** |
 
-**0.2 Confirm the `m6-render` naming collision is being fixed or accepted.**
-`m6-render` is a framework while `render-contact`, `render-analytics` and
-`render-cms` are apps built on it. Crate names become a compatibility surface
-at 1.0.
+`m6-html` stops being six lines and becomes a real app: the Tera integration,
+template discovery and watching, and the render step, over `m6-core`. That is
+the right size for the one process whose job is rendering HTML.
 
-**Gate:** both recorded in `m6-decisions.md`.
+**0.2 Benchmark suite — DONE.** All three `critical_path` benches had stopped
+compiling and nothing noticed, because `run-tests.sh` passes `--no-bench`.
+Fixed in `5de80c7`. Latency is the metric this plan is judged on and it could
+not be measured. `run-tests.sh` should additionally *build* the benches so this
+cannot recur silently.
+
+**0.3 Baseline recorded**, `m6-http` critical path, 2026-09-10:
+
+| Bench | Baseline |
+|---|---|
+| `make_lookup_key` | 13.3 ns |
+| `cache_hit` | 56.2 ns |
+| `cache_miss` | 21.7 ns |
+| `stats_record` | 3.72 ns |
+| `h3_header_extract` | 7.39 ns |
+| `full_cache_hit_path` | 56.5 ns |
+
+Criterion's own comparison against its stored baseline is **not** usable: that
+baseline predates whenever the suite stopped compiling, so its age is unknown.
+These numbers are the reference from here.
+
+**Every phase re-runs this and reports the delta.** A phase that moves any of
+these materially without an explanation is not done.
+
+**Gate:** recorded in `m6-decisions.md` under Crate Boundaries. Done.
 
 ---
 
