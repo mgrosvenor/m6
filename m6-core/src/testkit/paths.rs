@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 /// Panics if the executable is not where cargo puts test binaries, because
 /// every caller here would otherwise go on to produce a confusing failure
 /// about a missing file.
-pub fn target_dir() -> PathBuf {
+pub(super) fn target_dir() -> PathBuf {
     let exe = std::env::current_exe().expect("current_exe");
     let deps = exe.parent().expect("test binary has no parent directory");
     debug_assert_eq!(deps.file_name().and_then(|s| s.to_str()), Some("deps"));
@@ -26,7 +26,7 @@ pub fn target_dir() -> PathBuf {
 
 /// The profile the running test was built with: `debug`, `release`, or a
 /// custom profile name.
-pub fn test_profile() -> String {
+fn test_profile() -> String {
     let exe = std::env::current_exe().expect("current_exe");
     exe.parent()
         .and_then(Path::parent)

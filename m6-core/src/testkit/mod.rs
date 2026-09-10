@@ -8,6 +8,11 @@
 //!
 //! # What this fixes, beyond removing copies
 //!
+//! What is here is what the suites use. A byte-level HTTP client was written
+//! for this module and then deleted: every suite that talks raw bytes does it
+//! over TLS, using its own helper, and none of them adopted it. It can come
+//! back when something actually needs it, shaped by that need.
+//!
 //! **Ports.** Four suites used `TcpListener::bind(":0")` and read the port back
 //! after dropping the listener, which is a time-of-check-to-time-of-use race:
 //! the port is free again the instant the helper returns, and the server does
@@ -40,11 +45,9 @@
 pub mod paths;
 pub mod port;
 pub mod process;
-pub mod raw;
 pub mod wait;
 
-pub use paths::{binary, target_dir};
+pub use paths::binary;
 pub use port::{claim_port, PortClaim};
 pub use process::{assert_lifecycle_logged, Service};
-pub use raw::RawConn;
 pub use wait::{for_path, for_tcp};
