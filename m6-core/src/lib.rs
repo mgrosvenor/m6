@@ -11,6 +11,11 @@ pub mod server;
 pub mod signal;
 pub mod watcher;
 
+/// Shared integration-test harness. Behind a feature so it is never compiled
+/// into a production binary; enable it in `dev-dependencies` only.
+#[cfg(feature = "testkit")]
+pub mod testkit;
+
 pub use compress::{brotli_compress, brotli_decompress, gzip_compress, gzip_decompress};
 pub use http::{is_same_origin_path, RawRequest, RawResponse};
 pub use mime::{mime_from_path, should_compress_default};

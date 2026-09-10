@@ -1,73 +1,63 @@
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::Command;
 use std::time::Duration;
 
-/// Guard that kills the process on drop.
-struct ProcessGuard(Child);
+use m6_core::testkit::{binary, wait, Service};
 
-impl Drop for ProcessGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-/// Path to the m6-file binary (built by cargo).
-fn binary_path() -> PathBuf {
-    // current_exe is something like target/debug/deps/integration-xxxx
-    // binary is at target/debug/m6-file
-    let mut p = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_path_buf();
-    if p.ends_with("deps") {
-        p = p.parent().unwrap().to_path_buf();
-    }
-    p.join("m6-file")
+/// A running `m6-file`, its socket, and the directory both live in.
+///
+/// Field order is drop order: the service is killed before the directory
+/// holding its socket is removed.
+struct Server {
+    svc: Service,
+    _dir: tempfile::TempDir,
 }
 
 fn fixtures_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures")
 }
 
 fn config_path() -> PathBuf {
     fixtures_dir().join("m6-file-test.conf")
 }
 
-/// Spawn the server with a unique socket path via M6_SOCKET_OVERRIDE.
-fn spawn_server(id: &str) -> (ProcessGuard, PathBuf) {
-    let socket_dir = std::env::temp_dir().join("m6-sockets");
-    std::fs::create_dir_all(&socket_dir).unwrap();
-    let socket_path = socket_dir.join(format!("{}.sock", id));
+/// Spawn `m6-file` on a socket of its own and wait until it is answering.
+///
+/// **The socket lives in a fresh temp directory, not a shared one.** This used
+/// to be `$TMPDIR/m6-sockets/<id>.sock`, a fixed path per test, and
+/// `spawn_server` deleted whatever was already there before starting. Two runs
+/// of this suite at once, or one run overlapping a killed one, meant a test
+/// unlinking a socket another live server was serving on. The failure surfaced
+/// somewhere else entirely, as a connect error in an unrelated test.
+///
+/// **Readiness is a successful connect, not an existing path.** The old loop
+/// polled `socket_path.exists()` and then carried on regardless of the answer,
+/// so a slow start became `connect: Connection refused` at the first request.
+/// `bind` creates the socket file, but the server does not accept until it has
+/// called `listen`, so the file appearing proves nothing.
+fn spawn_server(id: &str) -> (Server, PathBuf) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // Short name: a unix socket path is capped near 104 bytes on macOS, and
+    // the temp directory already spends most of that.
+    let socket_path = dir.path().join(format!("{id}.sock"));
 
-    // Remove stale socket from previous test run
-    let _ = std::fs::remove_file(&socket_path);
+    let mut svc = Service::spawn(
+        "m6-file",
+        Command::new(binary("m6-file"))
+            .arg(fixtures_dir())
+            .arg(config_path())
+            .env("M6_SOCKET_OVERRIDE", &socket_path),
+    );
+    svc.wait_for_path(&socket_path, Duration::from_secs(10));
+    assert!(
+        wait::for_unix(&socket_path, Duration::from_secs(10)),
+        "m6-file created {} but never accepted a connection",
+        socket_path.display()
+    );
 
-    let binary = binary_path();
-    let site_dir = fixtures_dir();
-    let config = config_path();
-
-    let child = Command::new(&binary)
-        .arg(&site_dir)
-        .arg(&config)
-        .env("M6_SOCKET_OVERRIDE", &socket_path)
-        .spawn()
-        .unwrap_or_else(|e| panic!("failed to spawn {}: {}", binary.display(), e));
-
-    // Wait for socket to appear (up to 5s)
-    for _ in 0..100 {
-        if socket_path.exists() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-
-    (ProcessGuard(child), socket_path)
+    (Server { svc, _dir: dir }, socket_path)
 }
 
 /// Send a raw HTTP request over a Unix socket and return the full response.
@@ -95,25 +85,16 @@ fn l1_sigterm_exits_zero() {
     let (guard, socket_path) = spawn_server("l1-sigterm");
     assert!(socket_path.exists(), "socket should appear");
 
-    // Send SIGTERM using the kill command
-    let pid = guard.0.id();
-    send_signal(pid as i32, 15 /* SIGTERM */);
-
-    // Give it time to shut down gracefully
-    std::thread::sleep(Duration::from_millis(800));
-
-    // Drop the guard (kills if still alive)
-    drop(guard);
-}
-
-fn send_signal(pid: i32, sig: i32) {
-    // Use the nix crate to send a signal to a process
-    use std::process::Command;
-    Command::new("kill")
-        .arg(format!("-{}", sig))
-        .arg(pid.to_string())
-        .output()
-        .ok();
+    // The test is named for the exit status, so assert on it. The previous
+    // version signalled, slept, and dropped the guard without ever looking at
+    // what the process did, which passed whatever happened.
+    let mut guard = guard;
+    let status = guard.svc.terminate(Duration::from_secs(5));
+    assert!(
+        status.success(),
+        "m6-file should exit 0 on SIGTERM, got {status}\n--- stderr ---\n{}",
+        guard.svc.stderr_text()
+    );
 }
 
 // ─── L2 Path Resolution ───────────────────────────────────────────────────────

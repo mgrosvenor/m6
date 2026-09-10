@@ -18,65 +18,14 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, UdpSocket};
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use quiche::h3::NameValue as _;
 use rustls::StreamOwned;
 
-mod common;
-use common::free_port;
-
-// ── Process management ────────────────────────────────────────────────────────
-
-struct TestProcess(Child);
-impl Drop for TestProcess {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
-}
-
-fn binary(name: &str) -> PathBuf {
-    let p = repo_root().join("target").join("release").join(name);
-    assert!(
-        p.exists(),
-        "missing {}: run `cargo build --workspace --release` first",
-        p.display()
-    );
-    p
-}
-
-/// Pick a free TCP port by binding to :0 and releasing it.
-
-
-fn wait_for_tcp(port: u16, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    false
-}
-
-fn wait_for_path(p: &Path, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if p.exists() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    false
-}
+use m6_core::testkit::{binary, claim_port, PortClaim, Service};
 
 // ── Crypto fixtures ───────────────────────────────────────────────────────────
 
@@ -158,12 +107,13 @@ impl HttpResponse {
 /// One HTTP/1.1-over-TLS GET. A fresh connection each call (the server sends
 /// `Connection: close`).
 fn https_get(
-    port: u16,
+    srv: &Server,
     path: &str,
     extra: &[(&str, &str)],
     tls: Arc<rustls::ClientConfig>,
 ) -> HttpResponse {
-    let tcp = TcpStream::connect(("127.0.0.1", port)).expect("tcp connect");
+    let port = srv.port;
+    let tcp = srv.tcp();
     tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     let name = rustls::pki_types::ServerName::try_from("127.0.0.1".to_string()).unwrap();
     let conn = rustls::ClientConnection::new(tls, name).unwrap();
@@ -350,9 +300,10 @@ struct Server {
     cert_der: Vec<u8>,
     /// JWT signed for a member of `admins`.
     admin_jwt: String,
+    http: std::cell::RefCell<Service>,
+    file: Service,
     _dir: tempfile::TempDir,
-    file: TestProcess,
-    _http: TestProcess,
+    _port: PortClaim,
 }
 
 impl Server {
@@ -360,11 +311,25 @@ impl Server {
         tls_client_config(&self.cert_der)
     }
 
+    /// Open a TCP connection to the server, or say why it could not be opened.
+    ///
+    /// `ConnectionRefused` means nothing is listening, which means m6-http
+    /// died since the last request. Asking the service reports its exit status
+    /// and its own last words instead of a bare io error that names neither.
+    fn tcp(&self) -> TcpStream {
+        match TcpStream::connect(("127.0.0.1", self.port)) {
+            Ok(s) => s,
+            Err(e) => {
+                self.http.borrow_mut().assert_alive("the client was connecting");
+                panic!("connect to 127.0.0.1:{} failed with m6-http alive: {e}", self.port);
+            }
+        }
+    }
+
     /// Kill the m6-file backend. Afterwards only cache hits can be served —
     /// anything reaching the backend pool fails.
     fn kill_backend(&mut self) {
-        let _ = self.file.0.kill();
-        let _ = self.file.0.wait();
+        self.file.kill();
         // Let m6-http notice the socket has gone (2s rescan interval).
         std::thread::sleep(Duration::from_millis(2500));
     }
@@ -455,7 +420,8 @@ root = "private/"
     )
     .unwrap();
 
-    let port = free_port();
+    let claim = claim_port();
+    let port = claim.port();
     std::fs::write(
         site.join("system.toml"),
         format!(
@@ -474,35 +440,20 @@ name = "test-node"
     )
     .unwrap();
 
-    let file_proc = TestProcess(
+    let mut file_proc = Service::spawn(
+        "m6-file",
         Command::new(binary("m6-file"))
             .arg(site)
             .arg(site.join("configs/m6-file.conf"))
-            .env("M6_SOCKET_OVERRIDE", &sock)
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn m6-file"),
+            .env("M6_SOCKET_OVERRIDE", &sock),
     );
-    assert!(
-        wait_for_path(&sock, Duration::from_secs(10)),
-        "m6-file socket never appeared at {}",
-        sock.display()
-    );
+    file_proc.wait_for_path(&sock, Duration::from_secs(10));
 
-    let http_proc = TestProcess(
-        Command::new(binary("m6-http"))
-            .arg(site)
-            .arg(site.join("system.toml"))
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn m6-http"),
+    let mut http_proc = Service::spawn(
+        "m6-http",
+        Command::new(binary("m6-http")).arg(site).arg(site.join("system.toml")),
     );
-    assert!(
-        wait_for_tcp(port, Duration::from_secs(10)),
-        "m6-http never listened on {port}"
-    );
+    http_proc.wait_for_tcp(port, Duration::from_secs(10));
     // m6-http discovers backend sockets by periodic rescan (2s interval).
     std::thread::sleep(Duration::from_millis(2500));
 
@@ -510,9 +461,10 @@ name = "test-node"
         port,
         cert_der,
         admin_jwt,
-        _dir: dir,
+        http: std::cell::RefCell::new(http_proc),
         file: file_proc,
-        _http: http_proc,
+        _dir: dir,
+        _port: claim,
     }
 }
 
@@ -534,7 +486,7 @@ fn finding_1_e2e_anonymous_client_must_not_read_protected_content_from_cache() {
     let srv = start_server(100_000);
 
     // Sanity: without a token the route is properly refused on a cold cache.
-    let cold = https_get(srv.port, "/private/secret.txt", &[], srv.tls());
+    let cold = https_get(&srv, "/private/secret.txt", &[], srv.tls());
     assert_ne!(
         cold.status, 200,
         "cold-cache anonymous request should never succeed (got {}), \
@@ -545,7 +497,7 @@ fn finding_1_e2e_anonymous_client_must_not_read_protected_content_from_cache() {
 
     // An authorised user fetches it, warming the cache.
     let authed = https_get(
-        srv.port,
+        &srv,
         "/private/secret.txt",
         &[("Cookie", &format!("session={}", srv.admin_jwt))],
         srv.tls(),
@@ -558,7 +510,7 @@ fn finding_1_e2e_anonymous_client_must_not_read_protected_content_from_cache() {
     assert_eq!(&authed.body[..], b"TOP SECRET");
 
     // The same anonymous request as before — now served from cache.
-    let anon = https_get(srv.port, "/private/secret.txt", &[], srv.tls());
+    let anon = https_get(&srv, "/private/secret.txt", &[], srv.tls());
 
     assert_ne!(
         &anon.body[..],
@@ -592,7 +544,7 @@ fn finding_3_e2e_rate_limit_must_apply_to_http3() {
     // Control: HTTP/1.1 is throttled.
     let mut h1_statuses = Vec::new();
     for _ in 0..requests {
-        h1_statuses.push(https_get(srv.port, "/public/open.txt", &[], srv.tls()).status);
+        h1_statuses.push(https_get(&srv, "/public/open.txt", &[], srv.tls()).status);
     }
     let h1_throttled = h1_statuses.iter().filter(|&&s| s == 429).count();
     assert!(
@@ -641,7 +593,7 @@ fn finding_4_e2e_nocache_query_param_is_not_privileged() {
     let mut srv = start_server(100_000);
 
     // Warm the cache for the bare path.
-    let first = https_get(srv.port, "/public/open.txt", &[], srv.tls());
+    let first = https_get(&srv, "/public/open.txt", &[], srv.tls());
     assert_eq!(first.status, 200, "headers:\n{}", first.headers);
     assert_eq!(&first.body[..], b"PUBLIC CONTENT");
 
@@ -649,7 +601,7 @@ fn finding_4_e2e_nocache_query_param_is_not_privileged() {
     srv.kill_backend();
 
     // The cached path is still served — there is no global cache-disable.
-    let cached = https_get(srv.port, "/public/open.txt", &[], srv.tls());
+    let cached = https_get(&srv, "/public/open.txt", &[], srv.tls());
     assert_eq!(
         cached.status, 200,
         "the cache should still serve this path with the backend down; \
@@ -659,8 +611,8 @@ fn finding_4_e2e_nocache_query_param_is_not_privileged() {
     assert_eq!(&cached.body[..], b"PUBLIC CONTENT");
 
     // `_nocache` must be indistinguishable from any other unknown parameter.
-    let magic = https_get(srv.port, "/public/open.txt?_nocache", &[], srv.tls());
-    let arbitrary = https_get(srv.port, "/public/open.txt?_zzz=1", &[], srv.tls());
+    let magic = https_get(&srv, "/public/open.txt?_nocache", &[], srv.tls());
+    let arbitrary = https_get(&srv, "/public/open.txt?_zzz=1", &[], srv.tls());
 
     assert_eq!(
         magic.status, arbitrary.status,
@@ -670,7 +622,7 @@ fn finding_4_e2e_nocache_query_param_is_not_privileged() {
     );
 
     // And the cached entry survives both — neither evicted nor poisoned it.
-    let after = https_get(srv.port, "/public/open.txt", &[], srv.tls());
+    let after = https_get(&srv, "/public/open.txt", &[], srv.tls());
     assert_eq!(after.status, 200, "headers:\n{}", after.headers);
     assert_eq!(
         &after.body[..],
@@ -690,7 +642,7 @@ fn finding_4_e2e_nocache_query_param_is_not_privileged() {
 #[test]
 fn finding_10_e2e_security_headers_must_be_present() {
     let srv = start_server(100_000);
-    let resp = https_get(srv.port, "/public/open.txt", &[], srv.tls());
+    let resp = https_get(&srv, "/public/open.txt", &[], srv.tls());
     assert_eq!(resp.status, 200, "headers:\n{}", resp.headers);
 
     let missing: Vec<&str> = [
@@ -772,7 +724,7 @@ fn tls_client_config_h2(cert_der: &[u8]) -> Arc<rustls::ClientConfig> {
 fn h2_data_frame_at_max_frame_size_must_get_a_response() {
     let srv = start_server(100_000);
 
-    let tcp = TcpStream::connect(("127.0.0.1", srv.port)).expect("tcp connect");
+    let tcp = srv.tcp();
     tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     let name = rustls::pki_types::ServerName::try_from("127.0.0.1".to_string()).unwrap();
     let conn =

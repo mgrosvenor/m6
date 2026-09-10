@@ -63,6 +63,7 @@ httpdate       = "1"
 inotify = "0.10"
 
 [dev-dependencies]
+m6-core       = { path = "../m6-core", features = ["testkit"] }
 tempfile      = "3"
 anyhow        = "1"
 criterion     = { version = "0.5", features = ["html_reports"] }

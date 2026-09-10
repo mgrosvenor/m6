@@ -6,6 +6,11 @@ edition = "2021"
 [lib]
 name = "m6_core"
 
+[features]
+# The shared integration-test harness. Off by default so no production binary
+# links it; enable it from a crate's [dev-dependencies] entry.
+testkit = []
+
 [dependencies]
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
