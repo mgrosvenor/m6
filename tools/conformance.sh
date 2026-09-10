@@ -38,6 +38,7 @@ TLS_PORT=10443
 H2C_PORT=18080
 BRIDGE_BASE=18090
 REDIRECT_PORT=18081
+EDGE_BRIDGE_PORT=18095
 
 UPDATE=false
 ONLY=""
@@ -145,27 +146,86 @@ check() {  # check <key> <passed> <total>
 # a stale binary, and measuring it reported pre-fix numbers as current.
 
 start_edge() {
-  local site="$WORK/site-origin"
-  mkdir -p "$site"
-  if [[ ! -f "$ROOT/target/release/m6-http" ]]; then
+  # Self-contained: builds its own site, cert and backend. The alternative is
+  # the manual one-time setup in the site HANDOVER, which is fine for a person
+  # and useless in CI, and which was once measured while pointing at a stale
+  # staging binary.
+  local site="$WORK/edge-site"
+  mkdir -p "$site/public" "$site/configs"
+
+  if [[ ! -x "$ROOT/target/release/m6-http" || ! -x "$ROOT/target/release/m6-file" ]]; then
     fail "no release build; run: cargo build --workspace --release"
-    exit 1
-  fi
-  if [[ ! -f "$WORK/conf.toml" ]]; then
-    info "no $WORK/conf.toml — skipping the edge; see 'Third-party conformance' in the site HANDOVER for the one-time setup"
+    RESULT=1
     return 1
   fi
-  # The rate limit must be raised for the run or the limiter is what gets
-  # measured rather than the protocol.
-  if [[ -f "$site/site.toml" ]]; then
-    sed -i.bak 's/^requests_per_min = .*/requests_per_min = 100000/' "$site/site.toml" 2>/dev/null || true
+
+  # rustls rejects an X.509 v1 certificate (UnsupportedCertVersion). `-addext`
+  # is what forces v3, and openssl gives no warning if you leave it out.
+  if [[ ! -f "$WORK/cert.pem" ]]; then
+    openssl req -x509 -newkey rsa:2048 -keyout "$WORK/key.pem" -out "$WORK/cert.pem" \
+      -days 2 -nodes -subj "/CN=localhost" \
+      -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" 2>/dev/null
   fi
+
+  printf 'PUBLIC CONTENT\n' > "$site/public/open.txt"
+  printf '[[route]]\npath = "/public/{relpath}"\nroot = "public/"\n' \
+    > "$site/configs/m6-file.conf"
+  cat > "$site/site.toml" <<TOML
+[site]
+name   = "conformance"
+domain = "localhost"
+
+[log]
+level  = "warn"
+format = "text"
+
+[analytics]
+enabled = false
+
+# The rate limit must be off, or the limiter is what gets measured rather than
+# the protocol.
+[rate_limit]
+enabled = false
+
+[[backend]]
+name    = "m6-file"
+sockets = "$WORK/edge-m6-file-*.sock"
+
+[[route]]
+path    = "/public/{relpath}"
+backend = "m6-file"
+TOML
+  cat > "$WORK/conf.toml" <<TOML
+[server]
+bind     = "127.0.0.1:$TLS_PORT"
+tls_cert = "$WORK/cert.pem"
+tls_key  = "$WORK/key.pem"
+
+[node]
+name = "conformance"
+TOML
+
+  # Backend first: m6-http discovers sockets by rescan, so a backend that
+  # appears late means an empty pool and 502 on every request.
+  local sock="$WORK/edge-m6-file-1.sock"
+  rm -f "$sock"
+  M6_SOCKET_OVERRIDE="$sock" $SETSID nohup "$ROOT/target/release/m6-file" \
+    "$site" "$site/configs/m6-file.conf" > "$WORK/edge-file.log" 2>&1 &
+  local fpid=$!
+  PIDS+=($fpid)
+  for _ in $(seq 1 300); do [[ -S "$sock" ]] && break; sleep 0.02; done
+  [[ -S "$sock" ]] || { fail "edge backend never created $sock"; RESULT=1; return 1; }
+
   require_free_port "$TLS_PORT" "the loopback edge" || return 1
   $SETSID nohup "$ROOT/target/release/m6-http" "$site" "$WORK/conf.toml" \
     > "$WORK/edge.log" 2>&1 &
   local pid=$!
   PIDS+=($pid)
-  wait_port_owned_by "$pid" "$TLS_PORT" "the loopback edge"
+  wait_port_owned_by "$pid" "$TLS_PORT" "the loopback edge" || return 1
+  # The backend pool is filled by a periodic rescan, so listening is not the
+  # same as being able to serve.
+  sleep 2.5
+  return 0
 }
 
 start_redirect() {
@@ -239,6 +299,66 @@ run_h1() {
   if start_redirect; then
     h1_against "h1:m6-http-redirect" "$REDIRECT_PORT"
   fi
+
+  # The :443 engine itself, serving real content. h1spec speaks cleartext, so a
+  # TLS bridge sits in front with ALPN pinned to http/1.1 -- without the pin the
+  # server negotiates h2 and none of the byte sequences mean anything.
+  if start_edge; then
+    require_free_port "$EDGE_BRIDGE_PORT" "the TLS bridge" || return 1
+    $SETSID nohup python3 "$HERE/tls_bridge.py" "$EDGE_BRIDGE_PORT" 127.0.0.1 "$TLS_PORT" \
+      > "$WORK/tls-bridge.log" 2>&1 &
+    local bpid=$!
+    PIDS+=($bpid)
+    if wait_port_owned_by "$bpid" "$EDGE_BRIDGE_PORT" "the TLS bridge"; then
+      bridge_sanity "$EDGE_BRIDGE_PORT" || return 1
+      h1_against "h1:m6-http-edge" "$EDGE_BRIDGE_PORT"
+    fi
+  fi
+}
+
+# Prove the bridge carries a known-good request UNDER THE TESTER'S OWN
+# CONDITIONS before believing any score through it.
+#
+# Three conformance scores in this project were harness artefacts, not
+# measurements: a unix bridge that closed both directions on EOF (11/32), a TLS
+# bridge that broke the session on half-close (6/32), and a run against a
+# leftover process still holding the port (5/32, then 8/32). Each looked exactly
+# like a catastrophic server. h1spec half-closes its write side after sending,
+# so that is the condition the sanity check has to use.
+bridge_sanity() {
+  local port="$1"
+  python3 - "$port" <<'PYEOF'
+import socket, sys
+port = int(sys.argv[1])
+def probe(half_close):
+    s = socket.create_connection(("127.0.0.1", port), timeout=8)
+    s.sendall(b"GET /public/open.txt HTTP/1.1\r\nHost: localhost\r\n\r\n")
+    if half_close:
+        s.shutdown(socket.SHUT_WR)
+    out = b""
+    try:
+        while True:
+            b = s.recv(4096)
+            if not b:
+                break
+            out += b
+    except OSError:
+        pass
+    s.close()
+    return out
+open_ok = probe(False).startswith(b"HTTP/")
+half_ok = probe(True).startswith(b"HTTP/")
+if open_ok and half_ok:
+    sys.exit(0)
+print(f"  bridge sanity FAILED: write-open={open_ok} half-closed={half_ok}")
+sys.exit(1)
+PYEOF
+  if [[ $? -ne 0 ]]; then
+    fail "the bridge on $port does not carry a known-good request; any score through it is meaningless"
+    RESULT=1
+    return 1
+  fi
+  return 0
 }
 
 h1_against() {  # h1_against <score-key> <port>
