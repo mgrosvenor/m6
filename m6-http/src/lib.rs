@@ -18,4 +18,5 @@ pub mod stats;
 pub mod watcher;
 pub mod hints;
 pub mod http11;
+pub mod fields;
 pub mod http2;

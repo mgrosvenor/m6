@@ -25,8 +25,23 @@ Architecture entry above names five processes without it.
   content handling, path safety and the test harness.
 - **HTTP/2 and HTTP/3 stay in `m6-http`.** They have exactly one consumer,
   permanently, because `m6-http` is the only process that terminates a public
-  connection. Measured: the H3 path imports exactly one symbol from `http2.rs`,
-  and it is RFC 9110 semantics, not h2 wire format.
+  connection. The H3 path imports exactly one symbol that h2 also uses,
+  `validate_request_header_bytes`.
+
+  **Correction, 2026-09-11.** This entry used to add "and it is RFC 9110
+  semantics, not h2 wire format". That is backwards, and the code says so:
+  every rule in that function is RFC 9113 8.2.1 (lowercase field names), 8.2.2
+  (connection-specific fields, `TE: trailers`), 8.3 (pseudo-header set,
+  ordering, at-most-once) or 8.3.1 (CONNECT, `:path`, `:authority`/`Host`),
+  restated by RFC 9114 4.3 for h3. HTTP/1.1 has none of those concepts: no
+  pseudo-headers, any field-name case, and `Connection` is required rather than
+  banned.
+
+  The conclusion is unchanged and in fact stronger. A function made entirely of
+  h2/h3 rules must not move to `m6-core`, which is protocol-version-
+  independent. It moved to `m6-http/src/fields.rs` instead, so both protocols
+  import it from a module named for what it is; the H3 path importing from a
+  file called `http2.rs` was a naming problem, not a layering one.
 - **`m6-render` is dissolved.** Its scaffolding moves to `m6-core` and its
   templating to `m6-html`. It was 14% templating and 86% service loop, and
   three of its four consumers had zero template files while linking Tera,
