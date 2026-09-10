@@ -321,8 +321,39 @@ unfixed code. One trap in doing that: forcing a miss by varying
 legitimately does not match and 200 is correct. Compare against the ETag for
 the variant the request will actually receive.
 
-**3.3 Caching semantics → `m6-core`.** Storability, freshness, age, request and
-response directives. The *rules*. Cache storage and eviction stay in `m6-http`.
+**3.3 Caching semantics → `m6-core`. DROPPED 2026-09-11.**
+
+Counted rather than assumed: **nothing outside `m6-http` parses or evaluates
+`Cache-Control`.** `m6-file` and `m6-render` only emit fixed strings. By the
+architecture nothing ever will, because m6-http *is* the cache and the backends
+exist behind it.
+
+So this would move ~2,000 lines of the highest-consequence code in the project
+across a crate boundary to serve no consumer, and the plan itself rates it
+"moderate risk... `cache.rs` carries the RFC 9111 behaviour the whole site
+depends on".
+
+It also contradicted a decision already taken. `m6-decisions.md` keeps h2 and h3
+in `m6-http` because "they have exactly one consumer, permanently". RFC 9111
+caching has exactly one consumer, permanently, for the same structural reason.
+
+**The rule this settles, which now covers 3.1 and 3.3 together:**
+
+> Code moves to `m6-core` when it has more than one consumer. Single-consumer
+> code stays with its consumer, however core-ish it looks.
+
+It reproduces every decision already taken. Counted 2026-09-11:
+
+| component | consumers | verdict |
+|---|---|---|
+| `signal` | 5 | core |
+| `log` | 4 | core |
+| `compress`, `validate_path_param` | 2 each | core |
+| preconditions | 2 | core, and the second was broken |
+| HTTP/1.1 | 4 parsers in 4 crates | **core — Phase 4** |
+| RFC 9111 caching | 1 | m6-http |
+| h2/h3 field validation | 1 | m6-http |
+| HTTP/2, HTTP/3 | 1 | m6-http |
 
 **Gate:** full suite green; h2spec 146/146; h3spec 37/49; the weak-ETag case
 returns 304 on the wire after deploy.
@@ -468,8 +499,8 @@ worth knowing.
 | 0 Prerequisites | no | none | everything | done |
 | 1 Small consolidations | no | low | — | done, `3780834` |
 | 2 Testkit | no | low | 3, 4, 5, 8 | done, `3b9b895` |
-| 3 Semantics | no (fixes one bug) | moderate | 4 | in progress |
-| 4 HTTP/1.1 | yes | moderate-high | 5 | |
+| 3 Semantics | no (fixes one bug) | moderate | 4 | done, `1ba5dfa`; 3.3 dropped |
+| 4 HTTP/1.1 | yes | moderate-high | 5 | in progress |
 | 5 Service loop | no | high (size) | 6 | |
 | 6 Consumer apps | no | low | 7, 8 | |
 | 7 Decouple repos | no | low | — | |
