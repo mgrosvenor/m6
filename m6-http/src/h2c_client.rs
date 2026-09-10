@@ -195,9 +195,33 @@ impl H2cClientConn {
             FLAG_END_HEADERS | if has_body { 0 } else { FLAG_END_STREAM };
         self.push_frame(TYPE_HEADERS, headers_flags, stream_id, &header_block);
 
-        // Push DATA frame if body present
+        // Push the body, split to the peer's SETTINGS_MAX_FRAME_SIZE.
+        //
+        // RFC 9113 4.2: a DATA frame must not exceed what the peer advertised.
+        // The whole body used to go out as ONE frame regardless of size, so any
+        // request over 16 KiB (the default, and what the origin advertises) was
+        // answered with FRAME_SIZE_ERROR and the connection closed. The visitor
+        // saw a 502 from the edge; the origin logged "frame exceeds
+        // SETTINGS_MAX_FRAME_SIZE".
+        //
+        // `peer_max_frame` was already parsed from the peer's SETTINGS and then
+        // never used for anything. It is used now. END_STREAM goes on the final
+        // chunk only. `has_body` means the body is non-empty, so this always
+        // emits at least one frame and the stream always terminates.
         if has_body {
-            self.push_frame(TYPE_DATA, FLAG_END_STREAM, stream_id, &req.body);
+            let max = (self.peer_max_frame as usize).max(1);
+            let mut off = 0usize;
+            while off < req.body.len() {
+                let end = (off + max).min(req.body.len());
+                let last = end == req.body.len();
+                self.push_frame(
+                    TYPE_DATA,
+                    if last { FLAG_END_STREAM } else { 0 },
+                    stream_id,
+                    &req.body[off..end],
+                );
+                off = end;
+            }
         }
 
         let (tx, rx) = mpsc::channel();

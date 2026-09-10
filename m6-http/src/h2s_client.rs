@@ -236,8 +236,24 @@ impl H2sTlsClientConn {
         let headers_flags = FLAG_END_HEADERS | if has_body { 0 } else { FLAG_END_STREAM };
         self.push_frame(TYPE_HEADERS, headers_flags, stream_id, &header_block);
 
+        // Split the body to the peer's SETTINGS_MAX_FRAME_SIZE. Same defect and
+        // same fix as `h2c_client`: one oversized DATA frame per request, which
+        // the origin rejects with FRAME_SIZE_ERROR above 16 KiB. See the comment
+        // there. END_STREAM on the final chunk only.
         if has_body {
-            self.push_frame(TYPE_DATA, FLAG_END_STREAM, stream_id, &req.body);
+            let max = (self.peer_max_frame as usize).max(1);
+            let mut off = 0usize;
+            while off < req.body.len() {
+                let end = (off + max).min(req.body.len());
+                let last = end == req.body.len();
+                self.push_frame(
+                    TYPE_DATA,
+                    if last { FLAG_END_STREAM } else { 0 },
+                    stream_id,
+                    &req.body[off..end],
+                );
+                off = end;
+            }
         }
 
         let (tx, rx) = mpsc::channel();
@@ -265,12 +281,31 @@ impl H2sTlsClientConn {
         }
 
         // ── Write pending H2 frames into the TLS send buffer ─────────────────
+        //
+        // A SHORT write here is normal, not an error. rustls caps its outgoing
+        // plaintext buffer (64 KiB by default) and its `Writer` returns however
+        // much it accepted, or 0 once the buffer is full. `write_all` turns
+        // that 0 into `ErrorKind::WriteZero`, which we reported as a TLS
+        // failure and killed the connection over -- so any request whose frames
+        // pushed `send_buf` past the limit died mid-flight. Measured boundary:
+        // a 49,152 byte body went through, 65,535 did not.
+        //
+        // Keep whatever was not accepted and let the TLS flush below drain the
+        // buffer into the socket; the next `drive()` continues from there.
+        // `h2c_client` already does the equivalent for its plain socket.
         if !self.send_buf.is_empty() {
-            if let Err(e) = self.tls_conn.writer().write_all(&self.send_buf) {
-                self.mark_dead(&format!("h2s: TLS writer error: {}", e));
-                return;
+            match self.tls_conn.writer().write(&self.send_buf) {
+                // Buffer full. Not an error: the flush below makes room.
+                Ok(0) => {}
+                Ok(n) => {
+                    self.send_buf.drain(..n);
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => {
+                    self.mark_dead(&format!("h2s: TLS writer error: {}", e));
+                    return;
+                }
             }
-            self.send_buf.clear();
         }
 
         // ── Flush encrypted TLS output to TCP ────────────────────────────────
