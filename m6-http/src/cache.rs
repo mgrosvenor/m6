@@ -775,27 +775,52 @@ impl Cache {
     /// the site's own.
     fn evict_until_under(&self, map: &mut CacheMap) {
         let target = self.max_bytes - self.max_bytes / 8; // drop to 87.5%
-        let mut order: Vec<(u64, CacheKey)> = map
-            .iter()
-            .map(|(k, e)| (e.last_read.load(std::sync::atomic::Ordering::Relaxed), k.clone()))
+
+        // One pass to collect `(last_read, footprint)`, sort by read order,
+        // and find the tick above which enough bytes survive. Then one
+        // `retain`.
+        //
+        // The obvious version collects `(tick, key.clone())` and sorts that,
+        // which clones every key in the map -- and a `CacheKey` is a
+        // `Box<str>`, so that is one heap allocation per entry, in a burst,
+        // while holding the write lock every reader needs. This is one `Vec`
+        // and no per-entry allocation.
+        //
+        // Ticks are unique: both `insert` and `lookup` take a fresh value from
+        // the global counter, so no two entries share one.
+        let mut entries: Vec<(u64, usize)> = map
+            .values()
+            .map(|e| (e.last_read.load(std::sync::atomic::Ordering::Relaxed), e.footprint))
             .collect();
-        order.sort_unstable_by_key(|(tick, _)| *tick);
+        entries.sort_unstable_by_key(|(tick, _)| *tick);
 
         let mut held = self.bytes.load(std::sync::atomic::Ordering::Relaxed);
-        let mut dropped = 0usize;
-        for (_, key) in order {
+        let mut cutoff = 0u64;
+        for (tick, footprint) in &entries {
             if held <= target {
                 break;
             }
-            if let Some(e) = map.remove(&key) {
-                held = held.saturating_sub(e.footprint);
-                dropped += 1;
-            }
+            held = held.saturating_sub(*footprint);
+            cutoff = *tick + 1;
         }
-        self.bytes.store(held, std::sync::atomic::Ordering::Relaxed);
+
+        let before = map.len();
+        let mut freed = 0usize;
+        map.retain(|_, e| {
+            let keep = e.last_read.load(std::sync::atomic::Ordering::Relaxed) >= cutoff;
+            if !keep {
+                freed += e.footprint;
+            }
+            keep
+        });
+        let now_held = self
+            .bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .saturating_sub(freed);
+        self.bytes.store(now_held, std::sync::atomic::Ordering::Relaxed);
         tracing::info!(
-            dropped,
-            bytes_held = held,
+            dropped = before - map.len(),
+            bytes_held = now_held,
             max_bytes = self.max_bytes,
             "cache: evicted to stay inside the byte bound"
         );
