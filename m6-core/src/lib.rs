@@ -17,7 +17,7 @@ pub mod watcher;
 pub mod testkit;
 
 pub use compress::{brotli_compress, brotli_decompress, gzip_compress, gzip_decompress};
-pub use http::{is_same_origin_path, RawRequest, RawResponse};
+pub use http::{header, is_same_origin_path, HeaderSource, RawRequest, RawResponse};
 pub use mime::{mime_from_path, should_compress_default};
 pub use negotiate::{canonical_coding, coding_quality, preferred_coding};
 pub use path::validate_path_param;

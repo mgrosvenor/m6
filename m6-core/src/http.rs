@@ -238,3 +238,85 @@ mod redirect_tests {
         assert!(!is_same_origin_path(""));
     }
 }
+
+/// A scannable list of request headers, whatever shape the caller holds them in.
+///
+/// The same lookup works for an owned `Vec<(String, String)>` (HTTP/1.1 and
+/// HTTP/2, and every backend) and for a protocol-native slice that a caller
+/// would otherwise have to copy into one just to read a header. Both are
+/// slices, so they can be scanned as many times as needed for free.
+///
+/// `find_all` exists for `Cookie`, which HTTP/2 and HTTP/3 clients may split
+/// across several header fields.
+///
+/// **Case-insensitive, so no caller has to know how its parser stored the
+/// names.** That is the point of putting this in core. There were four header
+/// parsers in the workspace with three different conventions: `m6-core`'s
+/// stores names as sent, `m6-file`'s and `m6-render`'s lowercase them at parse
+/// time, and their lookups compared with `k == "literal"` accordingly. Those
+/// comparisons are correct only under an invariant established in a different
+/// file and invisible at the call site; hand either one a request parsed by
+/// the other and every header lookup silently returns `None`. For conditional
+/// requests that means a conditional GET quietly stops working, which is a
+/// defect that hides for a long time.
+pub trait HeaderSource {
+    fn find(&self, name: &str) -> Option<&str>;
+    fn find_all<'a>(&'a self, name: &str) -> impl Iterator<Item = &'a str>;
+}
+
+impl HeaderSource for [(String, String)] {
+    fn find(&self, name: &str) -> Option<&str> {
+        self.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+    }
+    fn find_all<'a>(&'a self, name: &str) -> impl Iterator<Item = &'a str> {
+        self.iter().filter(move |(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+    }
+}
+
+// `&Vec<T>` does not itself satisfy a generic `impl HeaderSource` bound even
+// though it coerces to `&[T]` in ordinary (non-generic) call positions — trait
+// resolution for `impl Trait` arguments needs the concrete type to implement
+// the trait, and `Vec<T>` is a distinct type from `[T]`. Delegate rather than
+// touch every `&req.headers` call site's syntax.
+impl HeaderSource for Vec<(String, String)> {
+    fn find(&self, name: &str) -> Option<&str> {
+        self.as_slice().find(name)
+    }
+    fn find_all<'a>(&'a self, name: &str) -> impl Iterator<Item = &'a str> {
+        self.as_slice().find_all(name)
+    }
+}
+
+/// Look up a header by case-insensitive name.
+pub fn header<'a>(headers: &'a (impl HeaderSource + ?Sized), name: &str) -> Option<&'a str> {
+    headers.find(name)
+}
+
+#[cfg(test)]
+mod header_source_tests {
+    use super::*;
+
+    fn hdrs() -> Vec<(String, String)> {
+        vec![
+            ("Host".into(), "example.com".into()),
+            ("cookie".into(), "a=1".into()),
+            ("COOKIE".into(), "b=2".into()),
+        ]
+    }
+
+    #[test]
+    fn lookup_ignores_case_on_both_sides() {
+        let h = hdrs();
+        assert_eq!(header(&h, "host"), Some("example.com"));
+        assert_eq!(header(&h, "HOST"), Some("example.com"));
+        assert_eq!(header(&h, "Host"), Some("example.com"));
+        assert_eq!(header(&h, "absent"), None);
+    }
+
+    #[test]
+    fn find_all_returns_every_occurrence_in_order() {
+        let h = hdrs();
+        let got: Vec<&str> = h.find_all("Cookie").collect();
+        assert_eq!(got, vec!["a=1", "b=2"]);
+    }
+}
