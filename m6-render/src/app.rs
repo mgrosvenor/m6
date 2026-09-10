@@ -2023,17 +2023,56 @@ fn handle_connection(
         let mime = content_type.split(';').next().unwrap_or("").trim();
 
         if let Some(level) = compression.get(mime) {
-            // Use compression levels from config (not hardcoded 6).
-            if ae_contains(accept_encoding, "br") && level.brotli > 0 {
-                if let Ok(compressed) = m6_core::compress::brotli_compress(&resp.body, level.brotli) {
-                    resp.body = compressed;
-                    resp.headers.push(("Content-Encoding".to_string(), "br".to_string()));
+            // Ask the client what it will actually accept, rather than testing
+            // whether a coding name appears anywhere in the header.
+            //
+            // This used to be `ae_contains`, a raw substring match, and it was
+            // wrong three ways at once. Measured against production on
+            // 2026-09-10: `gzip, br;q=0` was served **br**, so a client that
+            // had explicitly refused brotli got brotli (RFC 9110 12.4.2 makes
+            // `q=0` "not acceptable", not "least preferred"); `notbr` was
+            // served **br**, matching the substring inside an unrelated token;
+            // and `gzip;q=1.0, br;q=0.1` was served **br**, because candidates
+            // were tested in our order and the first hit won, ignoring the
+            // client's stated preference entirely.
+            //
+            // m6-file had already found and fixed this for static assets and
+            // written the parser. m6-render never got it, which is why the fix
+            // now lives in m6-core and both call it: this is the second time
+            // the same rules diverged between two crates.
+            //
+            // Only codings the config actually permits are offered, so a level
+            // of 0 removes a candidate rather than producing an empty body.
+            let mut candidates: Vec<&str> = Vec::with_capacity(2);
+            if level.brotli > 0 {
+                candidates.push("br");
+            }
+            if level.gzip > 0 {
+                candidates.push("gzip");
+            }
+            match m6_core::preferred_coding(accept_encoding, &candidates) {
+                Some("br") => {
+                    if let Ok(compressed) =
+                        m6_core::compress::brotli_compress(&resp.body, level.brotli)
+                    {
+                        resp.body = compressed;
+                        resp.headers
+                            .push(("Content-Encoding".to_string(), "br".to_string()));
+                    }
                 }
-            } else if ae_contains(accept_encoding, "gzip") && level.gzip > 0 {
-                if let Ok(compressed) = m6_core::compress::gzip_compress(&resp.body, level.gzip) {
-                    resp.body = compressed;
-                    resp.headers.push(("Content-Encoding".to_string(), "gzip".to_string()));
+                Some("gzip") => {
+                    if let Ok(compressed) =
+                        m6_core::compress::gzip_compress(&resp.body, level.gzip)
+                    {
+                        resp.body = compressed;
+                        resp.headers
+                            .push(("Content-Encoding".to_string(), "gzip".to_string()));
+                    }
                 }
+                // Nothing acceptable: send identity rather than a 406. RFC 9110
+                // 12.5.3 permits that, and an uncompressed body is a better
+                // outcome than refusing to serve the resource.
+                _ => {}
             }
         }
     }
@@ -2050,11 +2089,6 @@ fn handle_connection(
     crate::server::write_response(stream, &resp).ok();
 }
 
-/// Check if an `Accept-Encoding` header value contains `enc` (case-insensitive, no allocation).
-#[inline]
-fn ae_contains(header: &str, enc: &str) -> bool {
-    header.as_bytes().windows(enc.len()).any(|w| w.eq_ignore_ascii_case(enc.as_bytes()))
-}
 
 
 // ---------------------------------------------------------------------------
