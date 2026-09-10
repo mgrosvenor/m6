@@ -186,24 +186,21 @@ fn match_segments(
 }
 
 /// Check that a single path param value is safe (no traversal).
+/// Is a single path segment safe to use as a parameter?
+///
+/// Delegates to `m6_core::validate_path_param`, which is the one
+/// implementation. The local copy allowed `a..b` inside a component and
+/// disagreed with the other two implementations on leading slashes; see that
+/// function's documentation.
+#[inline]
 fn is_safe_param(val: &str) -> bool {
-    if val.contains("..") {
-        return false;
-    }
-    val.chars().all(|c| c.is_alphanumeric() || "-_.".contains(c))
+    m6_core::validate_path_param(val, false).is_ok()
 }
 
-/// Check that a catch-all param value is safe.
+/// Is a catch-all value (which may contain `/`) safe?
+#[inline]
 fn is_safe_catchall(val: &str) -> bool {
-    for component in val.split('/') {
-        if component == ".." || component.starts_with("..") || component.ends_with("..") {
-            return false;
-        }
-        if !component.chars().all(|c| c.is_alphanumeric() || "-_./".contains(c)) {
-            return false;
-        }
-    }
-    true
+    m6_core::validate_path_param(val, true).is_ok()
 }
 
 /// Sort routes by specificity descending.

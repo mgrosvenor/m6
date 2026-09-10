@@ -444,30 +444,24 @@ pub fn parse_auth_claims(header: &str) -> Map<String, Value> {
 }
 
 /// Validate a path parameter value. Returns Err(BadRequest) if invalid.
+/// Validate a path parameter value.
+///
+/// Delegates to `m6_core::validate_path_param`, which is the one
+/// implementation.
+///
+/// The local copy this replaces had a name-based special case: a parameter
+/// called `relpath` was checked for `..` and then returned `Ok` with **no
+/// character validation at all**, accepting spaces, control characters and
+/// NUL. That branch was also unreachable in its intended sense, because this
+/// crate's router has no catch-all support: `Segment` is only `Literal` or
+/// `Param` and `match_route` requires an exact segment count, so a parameter
+/// here captures exactly one path segment and can never contain a slash.
+///
+/// Every parameter is therefore validated with `allow_slash = false`.
 pub fn validate_path_param(name: &str, value: &str) -> Result<()> {
-    // `{relpath}` may contain `/` and `.`
-    if name == "relpath" {
-        if value.contains("..") {
-            return Err(Error::BadRequest(format!(
-                "path param `{name}` contains `..`"
-            )));
-        }
-        return Ok(());
-    }
-
-    // Others: alphanumeric, hyphens, underscores, dots
-    if value.contains("..") {
-        return Err(Error::BadRequest(format!(
-            "path param `{name}` contains `..`"
-        )));
-    }
-    for ch in value.chars() {
-        if !ch.is_alphanumeric() && ch != '-' && ch != '_' && ch != '.' {
-            return Err(Error::BadRequest(format!(
-                "path param `{name}` contains invalid character `{ch}`"
-            )));
-        }
-    }
+    m6_core::validate_path_param(value, false).map_err(|e| {
+        Error::BadRequest(format!("path param `{name}` is invalid: {e}"))
+    })?;
     Ok(())
 }
 
@@ -572,10 +566,44 @@ mod tests {
     #[test]
     fn test_path_param_validation() {
         assert!(validate_path_param("stem", "hello-world").is_ok());
+        assert!(validate_path_param("stem", "style.css").is_ok());
         assert!(validate_path_param("stem", "hello..world").is_err());
         assert!(validate_path_param("stem", "hello/world").is_err());
-        assert!(validate_path_param("relpath", "a/b/c").is_ok());
         assert!(validate_path_param("relpath", "../etc/passwd").is_err());
+    }
+
+    /// `relpath` is not special here, and the assertion that it was has been
+    /// removed rather than relaxed.
+    ///
+    /// The old test asserted `validate_path_param("relpath", "a/b/c").is_ok()`,
+    /// pinning a name-based branch that skipped character validation entirely.
+    /// That branch accepted spaces, control characters and NUL.
+    ///
+    /// It was also unreachable in the sense it was written for. This crate's
+    /// router cannot produce a parameter containing a slash:
+    ///
+    ///   - `Segment` has only `Literal` and `Param`. There is no catch-all
+    ///     variant and `compile_pattern` never creates one.
+    ///   - `match_route` requires `path_segs.len() == route.segments.len()`.
+    ///   - `path_segs` comes from `path.split('/')`, so each element is one
+    ///     segment with no slash by construction.
+    ///   - `server.rs` does no percent-decoding of the path, so `%2F` stays
+    ///     literal and never becomes a separator before the split.
+    ///
+    /// `{relpath}` appears only in `m6-file` route configs, which does have a
+    /// catch-all and validates it with `allow_slash = true`.
+    ///
+    /// If this crate ever gains catch-all routing, this test should come back
+    /// as `validate_path_param(value, true)` at the call site rather than as a
+    /// name-based exemption.
+    #[test]
+    fn every_param_is_character_checked_regardless_of_name() {
+        for name in ["stem", "relpath", "anything"] {
+            assert!(validate_path_param(name, "a b").is_err(), "{name}: space");
+            assert!(validate_path_param(name, "a\u{0}b").is_err(), "{name}: NUL");
+            assert!(validate_path_param(name, "a/b/c").is_err(), "{name}: slash");
+            assert!(validate_path_param(name, "ok-1.txt").is_ok(), "{name}: valid");
+        }
     }
 
     #[test]
