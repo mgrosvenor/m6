@@ -28,36 +28,55 @@ pub enum ParseError {
 /// Handles: request line, headers, body (Content-Length based).
 /// Does not handle chunked transfer encoding.
 pub fn parse_request(stream: &mut impl Read) -> Result<RawRequest, ParseError> {
-    // Read headers section byte-by-byte until we see \r\n\r\n.
-    let mut header_buf: Vec<u8> = Vec::with_capacity(1024);
-    let mut single = [0u8; 1];
+    // Read the head in chunks until `\r\n\r\n`.
+    //
+    // This used to read **one byte per `read()` call**: 377 syscalls for a
+    // 377-byte request head from an ordinary browser, measured. Nothing
+    // buffered it either -- `m6_core::server::handle_connection` hands the raw
+    // `UnixStream` straight in -- so every one of those was a real syscall.
+    //
+    // A chunked read can overshoot the terminator and take the first bytes of
+    // the body with it, which is why the byte-at-a-time version existed. The
+    // overshoot is kept in `body` below rather than discarded, so nothing is
+    // lost and the body read starts from what was already pulled in.
+    let mut header_buf: Vec<u8> = Vec::with_capacity(2048);
+    let mut chunk = [0u8; 1024];
+    let mut head_len: Option<usize> = None;
 
-    loop {
-        match stream.read(&mut single) {
+    while head_len.is_none() {
+        // Rescan only from just before the tail already examined, so a
+        // terminator straddling two chunks is still found without rescanning
+        // the whole buffer each time.
+        let scan_from = header_buf.len().saturating_sub(3);
+        let n = match stream.read(&mut chunk) {
             Ok(0) => {
                 if header_buf.is_empty() {
                     return Err(ParseError::ConnectionClosed);
                 }
                 return Err(ParseError::InvalidRequestLine);
             }
-            Ok(_) => {}
+            Ok(n) => n,
             Err(e) => return Err(ParseError::Io(e)),
+        };
+        header_buf.extend_from_slice(&chunk[..n]);
+        if let Some(pos) = header_buf[scan_from..]
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+        {
+            head_len = Some(scan_from + pos + 4);
         }
-        header_buf.push(single[0]);
-        if header_buf.len() > MAX_HEADER_BYTES {
+        // The cap applies to the head, so check it against what the head could
+        // still be, not against the overshoot.
+        if head_len.is_none() && header_buf.len() > MAX_HEADER_BYTES {
             return Err(ParseError::RequestTooLarge);
         }
-        // Check for \r\n\r\n terminator.
-        let n = header_buf.len();
-        if n >= 4
-            && header_buf[n - 4] == b'\r'
-            && header_buf[n - 3] == b'\n'
-            && header_buf[n - 2] == b'\r'
-            && header_buf[n - 1] == b'\n'
-        {
-            break;
-        }
     }
+    let head_len = head_len.expect("loop exits only when set");
+    if head_len > MAX_HEADER_BYTES {
+        return Err(ParseError::RequestTooLarge);
+    }
+    // Anything past the terminator is the first of the body.
+    let body_prefix = header_buf.split_off(head_len);
 
     // Split into lines.
     let header_str = std::str::from_utf8(&header_buf)
@@ -119,15 +138,24 @@ pub fn parse_request(stream: &mut impl Read) -> Result<RawRequest, ParseError> {
         return Err(ParseError::RequestTooLarge);
     }
 
-    let mut body = vec![0u8; content_length];
-    if content_length > 0 {
-        stream.read_exact(&mut body).map_err(|e| {
+    // Start from whatever the chunked head read already pulled past the
+    // terminator, then read only the remainder. Discarding the overshoot would
+    // silently truncate every body that arrived in the same packet as its
+    // headers, which is the common case.
+    let mut body = body_prefix;
+    if body.len() > content_length {
+        body.truncate(content_length);
+    }
+    if body.len() < content_length {
+        let mut rest = vec![0u8; content_length - body.len()];
+        stream.read_exact(&mut rest).map_err(|e| {
             if e.kind() == std::io::ErrorKind::UnexpectedEof {
                 ParseError::ConnectionClosed
             } else {
                 ParseError::Io(e)
             }
         })?;
+        body.extend_from_slice(&rest);
     }
 
     Ok(RawRequest {
@@ -195,5 +223,124 @@ mod tests {
         let mut cursor = Cursor::new(raw);
         let req = parse_request(&mut cursor).unwrap();
         assert!(req.body.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod chunked_head_tests {
+    use super::*;
+    use std::io::Read;
+
+    /// A reader that counts `read` calls and can be told to hand over the
+    /// bytes in fixed-size pieces, so a terminator can be forced to straddle
+    /// a chunk boundary.
+    struct Chunked {
+        data: Vec<u8>,
+        at: usize,
+        piece: usize,
+        pub reads: usize,
+    }
+    impl Chunked {
+        fn new(data: &[u8], piece: usize) -> Self {
+            Chunked { data: data.to_vec(), at: 0, piece, reads: 0 }
+        }
+    }
+    impl Read for Chunked {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.reads += 1;
+            let n = self.piece.min(buf.len()).min(self.data.len() - self.at);
+            buf[..n].copy_from_slice(&self.data[self.at..self.at + n]);
+            self.at += n;
+            Ok(n)
+        }
+    }
+
+    fn browser_request() -> Vec<u8> {
+        b"GET /capabilities HTTP/1.1\r\n\
+Host: mgrosvenor.com\r\n\
+User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36\r\n\
+Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n\
+Accept-Encoding: gzip, deflate, br, zstd\r\n\
+Connection: keep-alive\r\n\r\n"
+            .to_vec()
+    }
+
+    /// The head is read in chunks, not one byte per syscall.
+    ///
+    /// It used to be one `read` per byte: 377 calls for a 377-byte head from
+    /// an ordinary browser, and nothing buffered it, so every one was a real
+    /// syscall. `m6_core::server` hands the raw `UnixStream` straight in.
+    #[test]
+    fn the_head_is_not_read_one_byte_at_a_time() {
+        let req = browser_request();
+        let mut r = Chunked::new(&req, 1024);
+        let parsed = parse_request(&mut r).expect("parse");
+        assert_eq!(parsed.headers.len(), 5);
+        assert!(
+            r.reads <= 4,
+            "{} read() calls for a {}-byte head; the byte-at-a-time version \
+             took one per byte",
+            r.reads,
+            req.len()
+        );
+    }
+
+    /// A chunked read can land the `\r\n\r\n` across a boundary. Finding it
+    /// requires rescanning the tail of what was already examined.
+    #[test]
+    fn a_terminator_split_across_chunks_is_still_found() {
+        let req = browser_request();
+        for piece in [1, 2, 3, 5, 7, 13, 64, 377] {
+            let mut r = Chunked::new(&req, piece);
+            let parsed = parse_request(&mut r)
+                .unwrap_or_else(|e| panic!("piece={piece}: {e}"));
+            assert_eq!(parsed.method, "GET", "piece={piece}");
+            assert_eq!(parsed.headers.len(), 5, "piece={piece}");
+        }
+    }
+
+    /// The head read overshoots into the body whenever both arrive together,
+    /// which is the common case. Discarding the overshoot would truncate the
+    /// body silently.
+    #[test]
+    fn a_body_arriving_with_its_headers_is_not_truncated() {
+        let mut req = b"POST /submit HTTP/1.1\r\nHost: x\r\nContent-Length: 17\r\n\r\n".to_vec();
+        req.extend_from_slice(b"name=alice&age=30");
+        for piece in [1, 8, 64, 4096] {
+            let mut r = Chunked::new(&req, piece);
+            let parsed = parse_request(&mut r)
+                .unwrap_or_else(|e| panic!("piece={piece}: {e}"));
+            assert_eq!(
+                parsed.body, b"name=alice&age=30",
+                "body truncated or corrupted at piece={piece}"
+            );
+        }
+    }
+
+    /// More bytes after the body than Content-Length claims must not leak into
+    /// it: a pipelined second request follows on the same connection.
+    #[test]
+    fn overshoot_past_content_length_does_not_join_the_body() {
+        let mut req = b"POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\n".to_vec();
+        req.extend_from_slice(b"HELLOGET /b HTTP/1.1\r\nHost: x\r\n\r\n");
+        let mut r = Chunked::new(&req, 4096);
+        let parsed = parse_request(&mut r).expect("parse");
+        assert_eq!(parsed.body, b"HELLO", "the next request bled into the body");
+    }
+
+    /// The size cap still applies to the head.
+    #[test]
+    fn an_oversized_head_is_still_refused() {
+        let mut req = b"GET / HTTP/1.1\r\n".to_vec();
+        for i in 0..600 {
+            req.extend_from_slice(format!("X-Pad-{i}: {}\r\n", "a".repeat(64)).as_bytes());
+        }
+        req.extend_from_slice(b"\r\n");
+        let mut r = Chunked::new(&req, 4096);
+        assert!(
+            matches!(parse_request(&mut r), Err(ParseError::RequestTooLarge)),
+            "an oversized head must be refused"
+        );
     }
 }
