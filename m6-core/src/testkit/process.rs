@@ -61,13 +61,8 @@ impl Service {
         Service { name: name.to_string(), child: Some(child), output, drains }
     }
 
-    /// The child's process id.
-    pub fn pid(&self) -> u32 {
-        self.child.as_ref().map(Child::id).unwrap_or(0)
-    }
-
     /// `Some(status)` once the child has exited, `None` while it runs.
-    pub fn exited(&mut self) -> Option<ExitStatus> {
+    fn exited(&mut self) -> Option<ExitStatus> {
         self.child.as_mut().and_then(|c| c.try_wait().ok().flatten())
     }
 
