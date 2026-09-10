@@ -5,7 +5,7 @@
 use criterion::{black_box, criterion_group, Criterion};
 
 use m6_http_lib::cache::{Cache, CacheKey, CachedResponse, make_lookup_key};
-use m6_http_lib::stats::Stats;
+use m6_http_lib::stats::{Channel, Iface, Stats, Version};
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
 
@@ -134,7 +134,13 @@ fn bench_stats_record(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let start = std::time::Instant::now();
             for _ in 0..iters {
-                stats.record(black_box(250), black_box(true), black_box(false));
+                stats.record(
+                    black_box(250),
+                    black_box(true),
+                    black_box(200),
+                    black_box(Channel::new(Version::Http2, Iface::External)),
+                    black_box("m6-html"),
+                );
             }
             start.elapsed()
         })
@@ -483,7 +489,13 @@ fn main() {
     {
         let mut stats = Stats::new();
         report_percentiles("stats_record", N, || {
-            stats.record(black_box(250), black_box(true), black_box(false));
+            stats.record(
+                    black_box(250),
+                    black_box(true),
+                    black_box(200),
+                    black_box(Channel::new(Version::Http2, Iface::External)),
+                    black_box("m6-html"),
+                );
         });
     }
 
