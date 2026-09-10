@@ -835,7 +835,13 @@ impl Cache {
                         "cache: evicted"
                     );
                 }
-                map.remove(k);
+                if let Some(e) = map.remove(k) {
+                    // Every removal path must return the bytes, or the counter
+                    // drifts up while the map shrinks and the cache evicts on
+                    // every insert forever. Deploys call this on every
+                    // invalidation, so the drift would be relentless.
+                    self.bytes.fetch_sub(e.footprint, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         }
     }
@@ -851,7 +857,20 @@ impl Cache {
     pub fn clear(&self) {
         if let Ok(mut map) = self.map.write() {
             map.clear();
+            self.bytes.store(0, std::sync::atomic::Ordering::Relaxed);
         }
+    }
+
+    /// Sum of the footprints actually in the map.
+    ///
+    /// The invariant `bytes_held() == footprint_sum()` must hold after every
+    /// operation. Exposed for tests: an accounting drift is invisible until
+    /// the counter crosses the bound, at which point the cache evicts on every
+    /// insert and the hit rate collapses, and nothing about that failure
+    /// points back at the arithmetic.
+    #[cfg(test)]
+    fn footprint_sum(&self) -> usize {
+        self.map.read().map(|m| m.values().map(|e| e.footprint).sum()).unwrap_or(0)
     }
 
     /// Number of stored entries, including any that are past their freshness
@@ -2408,5 +2427,80 @@ mod capacity_tests {
             "accounting drifted: {} bytes for a single 100 KB entry",
             cache.bytes_held()
         );
+    }
+}
+
+#[cfg(test)]
+mod capacity_accounting_tests {
+    use super::*;
+
+    fn resp(n: usize) -> CachedResponse {
+        CachedResponse {
+            status: 200,
+            headers: std::sync::Arc::new(vec![(
+                "cache-control".to_string(),
+                "public, max-age=86400".to_string(),
+            )]),
+            body: bytes::Bytes::from(vec![0u8; n]),
+            hints: std::sync::Arc::new(vec![]),
+        }
+    }
+
+    /// The byte counter must equal what is actually held, after every
+    /// operation that adds or removes an entry.
+    ///
+    /// `evict_path` and `clear` originally removed entries without returning
+    /// their bytes. Deploys call both on every invalidation, so the counter
+    /// would climb while the map shrank until it sat permanently above the
+    /// bound, at which point every insert triggers an eviction and the hit
+    /// rate collapses. Nothing about that symptom points at the arithmetic.
+    #[test]
+    fn every_removal_path_returns_its_bytes() {
+        let cache = Cache::with_max_bytes(64 * 1024 * 1024);
+
+        for i in 0..40 {
+            cache.insert(CacheKey::new(&format!("/p{i}"), None, "gzip"), resp(10_000));
+            cache.insert(CacheKey::new(&format!("/p{i}"), None, "br"), resp(4_000));
+        }
+        assert_eq!(cache.bytes_held(), cache.footprint_sum(), "after inserts");
+
+        cache.evict_path("/p0");
+        assert_eq!(cache.bytes_held(), cache.footprint_sum(), "after evict_path");
+
+        cache.evict_paths(&["/p1".to_string(), "/p2".to_string()]);
+        assert_eq!(cache.bytes_held(), cache.footprint_sum(), "after evict_paths");
+
+        // Overwrites, which replace rather than add.
+        for _ in 0..10 {
+            cache.insert(CacheKey::new("/p3", None, "gzip"), resp(20_000));
+        }
+        assert_eq!(cache.bytes_held(), cache.footprint_sum(), "after overwrites");
+
+        cache.clear();
+        assert_eq!(cache.bytes_held(), 0, "clear must zero the counter");
+        assert_eq!(cache.footprint_sum(), 0);
+    }
+
+    /// A deploy-shaped cycle must not leave the cache permanently over its
+    /// bound. This is the failure the drift would actually produce.
+    #[test]
+    fn repeated_invalidation_cycles_do_not_strand_the_counter() {
+        let cache = Cache::with_max_bytes(1024 * 1024);
+        for _cycle in 0..50 {
+            for i in 0..20 {
+                cache.insert(CacheKey::new(&format!("/page{i}"), None, "gzip"), resp(5_000));
+            }
+            for i in 0..20 {
+                cache.evict_path(&format!("/page{i}"));
+            }
+        }
+        assert_eq!(cache.bytes_held(), 0, "counter stranded after 50 deploy cycles");
+        assert_eq!(cache.len(), 0);
+
+        // And the cache still works afterwards.
+        cache.insert(CacheKey::new("/after", None, "gzip"), resp(5_000));
+        let mut buf = [0u8; 512];
+        let k = make_lookup_key("/after", None, "gzip", &mut buf);
+        assert!(!matches!(cache.lookup(k), Lookup::Miss), "cache unusable after cycles");
     }
 }
