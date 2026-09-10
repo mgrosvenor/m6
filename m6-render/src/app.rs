@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicUsize, Ordering},
     Arc, Mutex, OnceLock,
 };
 
@@ -1093,26 +1093,21 @@ impl ThreadPool {
 // Signal handling
 // ---------------------------------------------------------------------------
 
-static SHUTDOWN_FLAG: AtomicBool = AtomicBool::new(false);
-static SIGNAL_COUNT: AtomicUsize = AtomicUsize::new(0);
-
+/// Signal handling delegates to `m6-core`.
+///
+/// The local version used `signal()` rather than `sigaction()`, which differ
+/// in syscall-restart semantics, and ran the shutdown logic in signal context
+/// where almost nothing is legal. `m6-core` uses `sigwait` on a dedicated
+/// thread, so no code runs in signal context at all.
 pub fn install_signal_handler() {
-    use nix::sys::signal::{self, SigHandler, Signal};
-    extern "C" fn handler(_sig: libc::c_int) {
-        let count = SIGNAL_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
-        if count >= 2 {
-            std::process::exit(0);
-        }
-        SHUTDOWN_FLAG.store(true, Ordering::SeqCst);
-    }
-    unsafe {
-        let _ = signal::signal(Signal::SIGTERM, SigHandler::Handler(handler));
-        let _ = signal::signal(Signal::SIGINT, SigHandler::Handler(handler));
-    }
+    // The returned handle is dropped: this crate reads the flag through the
+    // free function below, and the flag is process-global.
+    let _ = m6_core::signal::ShutdownHandle::install();
 }
 
+#[inline]
 pub fn is_shutdown() -> bool {
-    SHUTDOWN_FLAG.load(Ordering::SeqCst)
+    m6_core::signal::is_shutdown()
 }
 
 // ---------------------------------------------------------------------------
