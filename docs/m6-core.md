@@ -68,17 +68,24 @@ Anything that would make a non-Rust backend a second class citizen belongs in
 
    m6-core is linked by m6-http, by the default apps, and OPTIONALLY by
    consumer apps. It is not a process and does not appear in the request
-   path by itself. m6-render is one of the default apps, not a layer.
+   path by itself. There is no framework layer: m6-render is dissolved.
 ```
 
 `m6-core` sits beside both, not between them. `m6-http` links it for the
 protocol implementations and the semantics. A Rust application links it for
 the service scaffolding. The two use different features (§5).
 
-**`m6-render` is a default app, not a dependency for consumer apps.** It
-provides template rendering over `m6-core`, in the same way `m6-file` provides
-static files and `m6-auth-server` provides auth. A consumer app links
-`m6-core`, or nothing at all, and never `m6-render`.
+**`m6-render` is dissolved** (decided 2026-09-10). Its service scaffolding
+moves into `m6-core` and its templating into `m6-html`; the crate is deleted.
+`m6-html` becomes the default templating app, in the same way `m6-file`
+provides static files and `m6-auth-server` provides auth. A consumer app links
+`m6-core`, or nothing at all, and never a default app.
+
+The measurement behind it: `m6-render` was **14% templating and 86% service
+scaffolding**, and three of its four consumers had **zero template files**
+while linking Tera, comrak, pest, chrono-tz and fourteen other crates in order
+to obtain `App`, `Request` and `Response`. The server loop was trapped inside a
+crate named after the one feature most of its users did not want.
 
 Duplicate dependencies are acceptable where coupling is not: an app that wants
 Tera declares Tera. It does not acquire a template engine as a side effect of
