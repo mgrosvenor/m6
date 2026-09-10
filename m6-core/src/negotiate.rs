@@ -111,6 +111,17 @@ pub fn preferred_coding<'a>(accept_encoding: &str, candidates: &[&'a str]) -> Op
 /// Canonicalise an `Accept-Encoding` header to the single coding that will
 /// actually be served.
 ///
+/// **Deliberately ahead of its caller.** Nothing uses this yet. It exists for
+/// handover open item 11: `m6-http` keys the response cache on the raw
+/// `Accept-Encoding` header text, so `gzip` and `gzip, deflate, br, zstd` are
+/// separate entries for one byte-identical response. Narrowing the header to
+/// one unambiguous token, both as the cache key and as what is sent upstream,
+/// is the fix, and it keeps the key and the backend's own negotiation in
+/// agreement by construction.
+///
+/// It is tested, so it is not untested dead weight, and it should not be
+/// removed by a dead-code sweep before item 11 lands.
+///
 /// Returns `""` for identity. The result is suitable both as a cache-key
 /// component and as the `Accept-Encoding` to send upstream: narrowing the
 /// header to one unambiguous token means a backend cannot negotiate something
