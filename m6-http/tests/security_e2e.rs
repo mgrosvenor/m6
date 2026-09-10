@@ -800,3 +800,70 @@ fn h2_data_frame_at_max_frame_size_must_get_a_response() {
          (h2spec http2/4.2/1)."
     );
 }
+
+// ── Conditional requests through the whole stack ──────────────────────────────
+
+/// A weak `If-None-Match` must get a 304 even when the request reaches the
+/// backend, not just when m6-http answers it from cache.
+///
+/// This is the deploy gate for the precondition move, and it has to be
+/// measured on a **cold cache key**. m6-http's own implementation was always
+/// correct, so a warm key returns 304 whether or not m6-file is fixed; only a
+/// miss reaches m6-file, which did strong comparison and answered 200 with the
+/// whole body. That is why the symptom came and went on production and read as
+/// noise.
+///
+/// The cold key here is a fresh query string. The cache key includes the
+/// query, so `?nonce=…` is a key nothing has populated, while m6-file's ETag
+/// is derived from mtime and size and is unaffected by it. (`?_nocache` would
+/// have been the obvious lever and is deliberately not available: it was an
+/// unauthenticated cache bypass, removed in finding 4 above.)
+#[test]
+fn weak_if_none_match_is_304_on_a_cache_miss() {
+    let srv = start_server(100_000);
+
+    // Warm key, and learn the validator the server hands out.
+    let first = https_get(&srv, "/public/open.txt", &[], srv.tls());
+    assert_eq!(first.status, 200, "headers:\n{}", first.headers);
+    let etag = first
+        .headers
+        .split("\r\n")
+        .find(|l| l.to_ascii_lowercase().starts_with("etag:"))
+        .and_then(|l| l.split_once(':'))
+        .map(|(_, v)| v.trim().to_string())
+        .expect("m6-file must send an ETag");
+
+    // Strong form on the warm key: m6-http answers this one, and always could.
+    let warm = https_get(
+        &srv,
+        "/public/open.txt",
+        &[("If-None-Match", &etag)],
+        srv.tls(),
+    );
+    assert_eq!(warm.status, 304, "warm key, strong tag\nheaders:\n{}", warm.headers);
+
+    // Cold key, weak form: this one has to travel to m6-file.
+    let weak = format!("W/{etag}");
+    let cold = https_get(
+        &srv,
+        "/public/open.txt?nonce=cold1",
+        &[("If-None-Match", &weak)],
+        srv.tls(),
+    );
+    assert_eq!(
+        cold.status, 304,
+        "a weak validator must match on a cache MISS too (RFC 9110 8.8.3.2). \
+         200 here means the backend is doing strong comparison again.\nheaders:\n{}",
+        cold.headers
+    );
+    assert!(cold.body.is_empty(), "a 304 must carry no body, got {} bytes", cold.body.len());
+
+    // And the strong form on a different cold key, for symmetry.
+    let cold_strong = https_get(
+        &srv,
+        "/public/open.txt?nonce=cold2",
+        &[("If-None-Match", &etag)],
+        srv.tls(),
+    );
+    assert_eq!(cold_strong.status, 304, "cold key, strong tag\nheaders:\n{}", cold_strong.headers);
+}
