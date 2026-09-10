@@ -8,8 +8,9 @@
 #
 # Order of operations:
 #   1. Build (release)
-#   2. Unit + integration tests  ← HTTP/1.1 and HTTP/3 covered here
-#   3. Benchmarks (informational — prints criterion output; never blocks the push)
+#   2. Unit + integration tests
+#   3. Conformance ratchet (h1spec / h2spec / h3spec) — BLOCKS the push
+#   4. Benchmarks (informational — prints criterion output; never blocks the push)
 #
 # Why benches don't gate:
 #   Sub-microsecond criterion benchmarks on a development machine have ±5-15%
@@ -71,7 +72,27 @@ else
   fail "Test suite failed — fix correctness issues before performance check"
 fi
 
-# ── 3. Performance (informational) ────────────────────────────────────────────
+# ── 3. Conformance: HTTP/1.1, HTTP/2, HTTP/3 ─────────────────────────────────
+# A ratchet against independent testers (h1spec, h2spec, h3spec). Floors live
+# in tools/conformance-scores.txt; a score below its floor fails the push.
+#
+# This gates because HTTP/1.1 went untested for the whole life of the project
+# while h2 and h3 were held at 146/146 and 37/49, and the divergence was
+# exactly what you would predict: four HTTP/1.1 parsers, three conventions for
+# header-name case, none checking Transfer-Encoding, and m6-file returning a
+# body on a HEAD that 404s -- a defect fixed in m6-http months earlier and
+# never applied to the other implementation, because nothing measured it.
+#
+# Testers that are not installed are skipped with a note rather than failing,
+# so a laptop without h2spec still gets the h1 gate.
+info "Running conformance (h1spec / h2spec / h3spec)..."
+if ./tools/conformance.sh 2>&1; then
+  pass "Conformance (nothing went backwards)"
+else
+  fail "Conformance regressed — see above, and tools/conformance-scores.txt"
+fi
+
+# ── 4. Performance (informational) ────────────────────────────────────────────
 if [[ "$RUN_BENCH" == "false" ]]; then
   info "Skipping benchmarks (--no-bench)"
   echo ""
