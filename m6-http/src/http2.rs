@@ -113,7 +113,45 @@ const ERR_COMPRESSION:    u32 = 0x9;
 const HPACK_MAX_TABLE_SIZE: usize = 4096;
 
 /// How many recently-reset stream ids to remember. See `recently_reset`.
+///
+/// Deliberately above `MAX_CONCURRENT`, because these entries are also what
+/// makes the concurrency cap bind against Rapid Reset (see `RESET_DECAY`). At
+/// or below the cap, a peer could evict its own reset records by resetting
+/// enough streams and win back the slots that way.
 const RESET_MEMORY: usize = 128;
+
+/// How long a stream terminated by RST_STREAM keeps occupying a concurrency
+/// slot. Rapid Reset, CVE-2023-44487.
+///
+/// The attack is not about memory, which `RESET_MEMORY` already bounds. It is
+/// that `MAX_CONCURRENT` was measured as `streams.len()`, and RST_STREAM
+/// removes the stream from that map immediately -- so a peer that opened a
+/// stream and reset it at once was back to a count of zero and could do it
+/// again without limit. The cap existed and never bound. Every one of those
+/// streams costs a full request: m6 dispatches inline from the HEADERS frame,
+/// so the work is already done by the time the RST_STREAM is even parsed.
+///
+/// Counting a reset stream as still-occupied for a short window is what makes
+/// the cap mean what it says: a peer may start at most `MAX_CONCURRENT`
+/// streams per window whether it finishes them or cancels them.
+///
+/// One second is chosen to stay clear of legitimate cancellation. A browser
+/// cancels on navigation, and can legitimately cancel every stream it has
+/// open -- but it cannot have more than `MAX_CONCURRENT` open to begin with,
+/// so a real client that cancels everything and starts over is at the edge of
+/// the budget, not past it. h2spec is unaffected: the accounting is per
+/// connection and h2spec opens a new one per test.
+const RESET_DECAY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Consecutive REFUSED_STREAM answers tolerated before the connection ends
+/// with ENHANCE_YOUR_CALM.
+///
+/// REFUSED_STREAM alone is only advice: it tells a well-behaved peer to slow
+/// down, and a flood ignores it and keeps sending HEADERS. Each one still
+/// costs a frame parse and an HPACK decode against the connection-wide
+/// dynamic table, so answering refusals forever is itself unbounded work.
+/// A peer that has been refused this many times in a row is not backing off.
+const MAX_REFUSED_STREAK: u32 = 50;
 
 // ── Stream state ──────────────────────────────────────────────────────────────
 
@@ -233,7 +271,18 @@ pub struct Http2Conn {
     /// by opening and resetting streams in a loop -- which is precisely the
     /// shape of Rapid Reset (CVE-2023-44487). Forgetting an old reset only
     /// costs a stricter-than-necessary error on a very stale frame.
-    recently_reset:         std::collections::VecDeque<u32>,
+    ///
+    /// Each entry carries the instant it was reset, because these records do
+    /// double duty: they also hold the stream's concurrency slot for
+    /// `RESET_DECAY`, which is what makes `MAX_CONCURRENT` bind against a
+    /// reset flood. See `active_streams`.
+    recently_reset:         std::collections::VecDeque<(u32, Instant)>,
+    /// Consecutive REFUSED_STREAM answers sent, cleared whenever a stream is
+    /// accepted. See `MAX_REFUSED_STREAK`.
+    refused_streak:         u32,
+    /// Whether a GOAWAY has already gone out, so the generic error path does
+    /// not overwrite a precise code with PROTOCOL_ERROR.
+    goaway_sent:            bool,
     continuation_stream_id: Option<u32>,
     header_block_buf:       Vec<u8>,
 
@@ -261,6 +310,8 @@ impl Http2Conn {
             hpack_enc: hpack::Encoder::new(),
             last_stream_id: 0,
             recently_reset: std::collections::VecDeque::new(),
+            refused_streak: 0,
+            goaway_sent: false,
             continuation_stream_id: None,
             header_block_buf: Vec::new(),
             peer_initial_window: DEFAULT_WINDOW as i32,
@@ -314,7 +365,20 @@ impl Http2Conn {
                 Ok(false) => break,
                 Err(e)    => {
                     tracing::warn!("http2 error: {e}");
-                    self.send_goaway(ERR_PROTOCOL_ERROR);
+                    // Only if nothing more specific has already been said.
+                    // Handlers that detect a connection error send their own
+                    // GOAWAY with the code the RFC names -- ENHANCE_YOUR_CALM
+                    // for a flood, COMPRESSION_ERROR for a poisoned HPACK
+                    // table -- and then return Err to stop the loop. This arm
+                    // used to append a second GOAWAY unconditionally, so the
+                    // last code the peer actually read was PROTOCOL_ERROR
+                    // every time and the precise one was never the final word.
+                    // RFC 9113 5.4.1 makes the code the whole content of a
+                    // connection error; overwriting it is worse than not
+                    // having it, because it reports the wrong cause.
+                    if !self.goaway_sent {
+                        self.send_goaway(ERR_PROTOCOL_ERROR);
+                    }
                     self.phase = Phase::Done;
                     break;
                 }
@@ -614,11 +678,35 @@ impl Http2Conn {
         if self.recently_reset.len() >= RESET_MEMORY {
             self.recently_reset.pop_front();
         }
-        self.recently_reset.push_back(stream_id);
+        self.recently_reset.push_back((stream_id, Instant::now()));
     }
 
     fn was_reset(&self, stream_id: u32) -> bool {
-        self.recently_reset.contains(&stream_id)
+        self.recently_reset.iter().any(|(id, _)| *id == stream_id)
+    }
+
+    /// Streams counted against `MAX_CONCURRENT`: those actually open, plus
+    /// those reset within the last `RESET_DECAY`.
+    ///
+    /// Rapid Reset (CVE-2023-44487) is precisely the gap between those two
+    /// numbers. `streams.len()` alone was the cap's only input, and RST_STREAM
+    /// removes a stream from that map, so cancelling immediately kept the count
+    /// at zero no matter how many streams the peer started.
+    ///
+    /// Only client-initiated (odd) streams are counted. An even id is one of
+    /// our own server pushes, and a RST_STREAM on it is the peer *declining* a
+    /// push -- it costs us nothing and saves us the body. Charging it to the
+    /// peer's budget would let a page with many push hints refuse its own
+    /// visitor. The exclusion cannot be abused: `handle_headers` rejects an
+    /// even stream id outright, so a peer cannot open one to be forgiven for.
+    ///
+    /// `now` is a parameter rather than read here so the decay is testable
+    /// without sleeping: a test that waits a real second is a test nobody runs.
+    fn active_streams(&self, now: Instant) -> usize {
+        let recent = self.recently_reset.iter()
+            .filter(|(id, at)| id % 2 == 1 && now.duration_since(*at) < RESET_DECAY)
+            .count();
+        self.streams.len() + recent
     }
 
     /// Per-frame-type shape rules, RFC 9113 6.1-6.10.
@@ -906,10 +994,43 @@ impl Http2Conn {
             self.phase = Phase::GoingAway;
             return Ok(());
         }
-        if self.streams.len() >= MAX_CONCURRENT as usize {
+        // Rapid Reset, CVE-2023-44487. `streams.len()` was the whole of this
+        // check, and RST_STREAM removes a stream from that map, so a peer that
+        // opened a stream and cancelled it immediately never registered against
+        // the cap at all -- it could start unbounded streams, each costing a
+        // full inline dispatch, while the count it was measured by stayed at
+        // zero. Recently-reset streams keep their slot for `RESET_DECAY` so the
+        // cap counts streams *started*, not streams still open.
+        if self.active_streams(Instant::now()) >= MAX_CONCURRENT as usize {
             self.push_frame(TYPE_RST_STREAM, 0, stream_id, &ERR_REFUSED_STREAM.to_be_bytes());
+            // Refusing a stream closes it *by RST_STREAM*, and it has to be
+            // recorded as such. The peer's own RST_STREAM for this id is very
+            // likely already in flight -- a client that cancels quickly is the
+            // whole reason we are here -- and an unrecorded id still derives as
+            // `Idle`, where RFC 9113 5.1 makes any frame but HEADERS/PRIORITY a
+            // *connection* error. So the crossing cancel tore the connection
+            // down with PROTOCOL_ERROR, once per refusal.
+            //
+            // Measured before this line existed: a 200-stream flood drew 50
+            // GOAWAY(PROTOCOL_ERROR) frames, one per refused stream, ahead of
+            // the single ENHANCE_YOUR_CALM that was the real answer. It also
+            // means a legitimate client that merely reaches the cap with a
+            // cancel in flight was answered a connection error.
+            self.last_stream_id = self.last_stream_id.max(stream_id);
+            self.note_reset(stream_id);
+            // REFUSED_STREAM is advice, and a flood ignores advice. Answering
+            // it forever is unbounded work of our own: every refused HEADERS
+            // still costs a frame parse and an HPACK decode against the
+            // connection-wide dynamic table.
+            self.refused_streak += 1;
+            if self.refused_streak >= MAX_REFUSED_STREAK {
+                self.send_goaway(ERR_ENHANCE_YOUR_CALM);
+                self.phase = Phase::GoingAway;
+                return Err("stream concurrency cap ignored: reset flood");
+            }
             return Ok(());
         }
+        self.refused_streak = 0;
         self.last_stream_id = self.last_stream_id.max(stream_id);
 
         // Flag-dependent prefixes, bounds-checked BEFORE slicing.
@@ -1537,6 +1658,7 @@ impl Http2Conn {
     }
 
     fn send_goaway(&mut self, code: u32) {
+        self.goaway_sent = true;
         let mut p = [0u8; 8];
         p[0..4].copy_from_slice(&(self.last_stream_id & 0x7fff_ffff).to_be_bytes());
         p[4..8].copy_from_slice(&code.to_be_bytes());
@@ -2365,6 +2487,253 @@ mod stream_state_tests {
         assert_eq!(c.recently_reset.len(), RESET_MEMORY);
         assert!(!c.was_reset(1), "oldest entries must be evicted");
         assert!(c.was_reset(RESET_MEMORY as u32 + 50), "newest must be retained");
+    }
+
+    // ── Rapid Reset, CVE-2023-44487 ───────────────────────────────────────────
+
+    /// Drive a connection over `bytes`, returning the driver's verdict.
+    fn run(c: &mut Http2Conn, bytes: &[u8]) -> Result<(), &'static str> {
+        c.recv_buf.extend_from_slice(bytes);
+        let mut on_request = |_: &HttpRequest, _: &str| -> RequestOutcome {
+            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string(),
+                                  std::sync::Arc::new(vec![]))
+        };
+        loop {
+            match c.process_frame(&mut on_request, "127.0.0.1") {
+                Ok(true) => continue,
+                Ok(false) => return Ok(()),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Every frame of `ftype` in the outgoing buffer, as (stream_id, payload).
+    fn sent_frames(buf: &[u8], ftype: u8) -> Vec<(u32, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i + FRAME_HDR <= buf.len() {
+            let len = ((buf[i] as usize) << 16) | ((buf[i + 1] as usize) << 8) | buf[i + 2] as usize;
+            let this = buf[i + 3];
+            let sid = u32::from_be_bytes([buf[i + 5], buf[i + 6], buf[i + 7], buf[i + 8]])
+                & 0x7fff_ffff;
+            let end = (i + FRAME_HDR + len).min(buf.len());
+            if this == ftype {
+                out.push((sid, buf[i + FRAME_HDR..end].to_vec()));
+            }
+            i += FRAME_HDR + len;
+        }
+        out
+    }
+
+    /// Open `stream_id` and cancel it immediately -- one unit of Rapid Reset.
+    fn open_and_reset(stream_id: u32) -> Vec<u8> {
+        let mut f = open_stream(stream_id);
+        f.extend(frame(TYPE_RST_STREAM, 0, stream_id, &ERR_NO_ERROR.to_be_bytes()));
+        f
+    }
+
+    /// The defect itself. `MAX_CONCURRENT` was measured as `streams.len()`, and
+    /// RST_STREAM removes the stream from that map, so a peer that cancelled
+    /// each stream the moment it opened it was measured at zero however many it
+    /// started. The cap was present and unreachable.
+    ///
+    /// Without the fix this test opens 100 streams, is measured at 0 the whole
+    /// way, and the 101st is served rather than refused.
+    #[test]
+    fn resetting_streams_does_not_free_concurrency_slots() {
+        let mut c = Http2Conn::new();
+        c.phase = Phase::Active;
+
+        for n in 0..MAX_CONCURRENT {
+            run(&mut c, &open_and_reset(1 + n * 2)).expect("cancelling is legal");
+        }
+
+        assert_eq!(c.streams.len(), 0, "every stream really was cancelled");
+        assert_eq!(
+            c.active_streams(Instant::now()), MAX_CONCURRENT as usize,
+            "cancelled streams must still hold their slots"
+        );
+
+        // The next stream is over the cap and must be refused.
+        c.send_buf.clear();
+        let next = 1 + MAX_CONCURRENT * 2;
+        run(&mut c, &open_stream(next)).expect("a refusal is not a connection error");
+
+        let refusals = sent_frames(&c.send_buf, TYPE_RST_STREAM);
+        assert_eq!(refusals.len(), 1, "expected exactly one RST_STREAM");
+        assert_eq!(refusals[0].0, next, "refusal must name the refused stream");
+        assert_eq!(
+            u32::from_be_bytes(refusals[0].1[..4].try_into().unwrap()),
+            ERR_REFUSED_STREAM,
+            "over the concurrency cap is REFUSED_STREAM"
+        );
+    }
+
+    /// REFUSED_STREAM is advice, and a flood ignores advice. A peer that keeps
+    /// sending HEADERS after being refused is answered with GOAWAY rather than
+    /// being refused indefinitely: each refused HEADERS still costs a frame
+    /// parse and an HPACK decode against the connection-wide dynamic table.
+    #[test]
+    fn a_reset_flood_that_ignores_refusals_ends_the_connection() {
+        let mut c = Http2Conn::new();
+        c.phase = Phase::Active;
+
+        let mut id = 1;
+        for _ in 0..MAX_CONCURRENT {
+            run(&mut c, &open_and_reset(id)).expect("filling the budget is legal");
+            id += 2;
+        }
+
+        // Keep going. Somewhere inside MAX_REFUSED_STREAK more attempts the
+        // connection must be torn down.
+        let mut ended = None;
+        for _ in 0..MAX_REFUSED_STREAK {
+            if let Err(why) = run(&mut c, &open_stream(id)) {
+                ended = Some(why);
+                break;
+            }
+            id += 2;
+        }
+
+        assert!(ended.is_some(), "a peer ignoring the cap must be disconnected");
+        assert_eq!(c.phase, Phase::GoingAway);
+
+        let goaways = sent_frames(&c.send_buf, TYPE_GOAWAY);
+        assert_eq!(goaways.len(), 1, "one connection error, one GOAWAY");
+        assert_eq!(
+            u32::from_be_bytes(goaways[0].1[4..8].try_into().unwrap()),
+            ERR_ENHANCE_YOUR_CALM,
+            "a flood is ENHANCE_YOUR_CALM, not PROTOCOL_ERROR: the frames are \
+             individually legal and it is the rate that is not"
+        );
+        assert!(c.goaway_sent, "the generic error path must not add a second");
+    }
+
+    /// The precise code must survive the driver's generic error handling.
+    ///
+    /// `drive()`'s `Err` arm used to append `GOAWAY(PROTOCOL_ERROR)` whatever
+    /// the handler had already sent, so ENHANCE_YOUR_CALM and
+    /// COMPRESSION_ERROR were both overwritten on the wire and the peer's last
+    /// word was always PROTOCOL_ERROR. The tests here could not see it: they
+    /// call `process_frame` directly and never reach that loop, which is
+    /// exactly why the flood above was measured against a real socket too.
+    /// This pins the flag that arm now consults.
+    #[test]
+    fn a_specific_goaway_marks_the_connection_as_already_told() {
+        let mut c = Http2Conn::new();
+        assert!(!c.goaway_sent);
+        c.send_goaway(ERR_ENHANCE_YOUR_CALM);
+        assert!(c.goaway_sent, "a sent GOAWAY must suppress the generic one");
+    }
+
+    /// The slots come back. Holding them forever would turn a burst of ordinary
+    /// cancellation into a permanently crippled connection.
+    #[test]
+    fn reset_slots_are_released_after_the_decay_window() {
+        let mut c = Http2Conn::new();
+        c.phase = Phase::Active;
+        for n in 0..MAX_CONCURRENT {
+            run(&mut c, &open_and_reset(1 + n * 2)).unwrap();
+        }
+
+        let now = Instant::now();
+        assert_eq!(c.active_streams(now), MAX_CONCURRENT as usize);
+        assert_eq!(
+            c.active_streams(now + RESET_DECAY * 2), 0,
+            "slots must be released once the decay window has passed"
+        );
+    }
+
+    /// A refused stream is closed by RST_STREAM, so the peer's own RST_STREAM
+    /// for it -- already in flight, since cancelling fast is what got us here --
+    /// must be tolerated. Left unrecorded, the id still derived as `Idle`,
+    /// where RFC 9113 5.1 makes RST_STREAM a *connection* error, so reaching
+    /// the cap with a cancel in flight killed the connection with
+    /// PROTOCOL_ERROR instead of refusing one stream.
+    #[test]
+    fn a_cancel_crossing_a_refusal_is_not_a_connection_error() {
+        let mut c = Http2Conn::new();
+        c.phase = Phase::Active;
+
+        let mut id = 1;
+        for _ in 0..MAX_CONCURRENT {
+            run(&mut c, &open_and_reset(id)).unwrap();
+            id += 2;
+        }
+
+        // This one is over the cap. The peer cancels it without waiting to be
+        // told, which is exactly what the frames of a real client look like.
+        run(&mut c, &open_and_reset(id))
+            .expect("a cancel crossing our refusal must not end the connection");
+        assert_eq!(c.phase, Phase::Active, "the connection must stay up");
+        assert!(
+            sent_frames(&c.send_buf, TYPE_GOAWAY).is_empty(),
+            "refusing one stream is not a connection error"
+        );
+    }
+
+    /// A peer declining server pushes must not spend its own request budget.
+    /// Push streams are server-initiated and even-numbered; RST_STREAM on one
+    /// means "I do not want this", which costs us nothing. Chrome 106+ dropped
+    /// push support, so a client that still negotiates it and then declines is
+    /// a real shape, and charging it here would let a page with many push
+    /// hints refuse its own visitor.
+    #[test]
+    fn declining_server_pushes_does_not_spend_the_reset_budget() {
+        let mut c = Http2Conn::new();
+        c.phase = Phase::Active;
+
+        // Every push stream we could have opened, all declined.
+        for push_id in (2..=(MAX_CONCURRENT * 2)).step_by(2) {
+            c.note_reset(push_id);
+        }
+        assert_eq!(
+            c.active_streams(Instant::now()), 0,
+            "declined pushes are not the peer's doing"
+        );
+
+        // A client-initiated cancellation on the same connection still counts.
+        c.note_reset(1);
+        assert_eq!(c.active_streams(Instant::now()), 1);
+    }
+
+    /// The budget must not punish a normal client. A page whose requests all
+    /// complete never enters the reset accounting at all, and the handful of
+    /// cancellations a browser really does make stay far inside the cap.
+    #[test]
+    fn ordinary_traffic_and_cancellation_are_not_treated_as_a_flood() {
+        let mut c = Http2Conn::new();
+        c.phase = Phase::Active;
+
+        let mut id = 1;
+        for _ in 0..200 {
+            run(&mut c, &open_stream(id)).expect("a completed request is not a flood");
+            id += 2;
+        }
+        // Nothing entered the reset accounting: these all completed. (One
+        // stream can still be in `streams` with its response in flight, which
+        // is an open stream and legitimately counted as one.)
+        assert!(
+            c.recently_reset.is_empty(),
+            "streams that completed normally must not occupy reset slots"
+        );
+        assert!(
+            c.active_streams(Instant::now()) < MAX_CONCURRENT as usize,
+            "200 completed requests must not approach the cap"
+        );
+
+        for _ in 0..10 {
+            run(&mut c, &open_and_reset(id)).expect("occasional cancellation is legal");
+            id += 2;
+        }
+        assert_eq!(c.recently_reset.len(), 10, "ten cancellations, ten slots");
+
+        c.send_buf.clear();
+        run(&mut c, &open_stream(id)).expect("still well inside the cap");
+        assert!(
+            sent_frames(&c.send_buf, TYPE_RST_STREAM).is_empty(),
+            "a client that cancels occasionally must not be refused"
+        );
     }
 
     /// Stream 0 is the connection, not a stream. Its frames are validated by

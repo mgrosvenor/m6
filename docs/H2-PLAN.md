@@ -219,11 +219,11 @@ Seven regression guards, the PoCs inverted, plus two that a frame at exactly
 the limit and an ordinary WINDOW_UPDATE still work: a cap that breaks
 legitimate traffic is not a fix.
 
-**Still open from the same report:** Rapid Reset (CVE-2023-44487). Reset
-streams are removed from `streams`, and `MAX_CONCURRENT` is measured by map
-size, so the concurrency cap is bypassable. Partially mitigated — the
-`recently_reset` deque added with the state machine bounds reset *memory* at
-128 entries — but reset *rate* is still uncounted. Phase 6.
+**Closed from the same report 2026-09-10:** Rapid Reset (CVE-2023-44487).
+Reset streams were removed from `streams` while `MAX_CONCURRENT` was measured
+by map size, so the concurrency cap was bypassable. The `recently_reset` deque
+added with the state machine bounded reset *memory* at 128 entries; reset
+*rate* was uncounted until now. See Phase 6 below.
 
 ### Phase 0 — Measure (h2spec) — DONE, see above
 
@@ -293,12 +293,64 @@ parse), and unknown frame types ignored rather than rejected.
 
 Named classes, each with a test:
 
-- **Rapid Reset (CVE-2023-44487)** — a client opens and immediately resets
-  streams, so concurrency limits never bind while the server keeps doing work.
-  Needs accounting of reset streams, not just open ones.
-- **CONTINUATION flood** — unbounded header fragments before END_HEADERS.
+- ~~**Rapid Reset (CVE-2023-44487)**~~ — **DONE 2026-09-10.** See below.
+- ~~**CONTINUATION flood**~~ — done with F-005; bounded by `MAX_HEADER_BLOCK`,
+  checked on every CONTINUATION rather than at END_HEADERS.
 - **HPACK bomb** — small compressed input expanding to a large header list.
+  Partly covered: the dynamic table is clamped to the advertised 4096 and
+  `MAX_HEADER_BLOCK` bounds one block. `SETTINGS_MAX_HEADER_LIST_SIZE` (0x6)
+  is still not implemented, so there is still no advertised bound.
 - **Settings flood** — unacknowledged SETTINGS forcing unbounded state.
+
+#### Rapid Reset — DONE 2026-09-10
+
+`MAX_CONCURRENT` was measured as `streams.len()`, and RST_STREAM removes the
+stream from that map, so a peer that cancelled each stream the instant it
+opened it was measured at zero however many it started. **The cap was present
+and unreachable.** Each of those streams costs a full request: m6 dispatches
+inline from the HEADERS frame, so the work is finished before the RST_STREAM is
+even parsed. h2spec does not test this, which is why 146/146 said nothing about
+it.
+
+Fix, in `http2.rs`:
+
+- `recently_reset` entries carry the instant of the reset, and `active_streams`
+  counts open streams **plus** those reset within `RESET_DECAY` (1 s). The cap
+  now counts streams *started*, not streams still open.
+- Only client-initiated (odd) ids count. An even id is one of our own pushes,
+  and a RST_STREAM on it is the peer declining a push -- it costs us nothing.
+  Not abusable: `handle_headers` already rejects an even client stream id.
+- `MAX_REFUSED_STREAK` (50) consecutive refusals end the connection with
+  ENHANCE_YOUR_CALM. REFUSED_STREAM alone is advice, and a flood ignores it;
+  each refused HEADERS still costs a frame parse and an HPACK decode.
+
+**Two defects found by measuring the fix on a real socket**, neither visible to
+the unit tests:
+
+1. A refused stream was never recorded, so the peer's own RST_STREAM for it --
+   already in flight, since cancelling fast is the whole point -- landed on an
+   id that still derived as `Idle`, where RFC 9113 5.1 makes it a *connection*
+   error. A 200-stream flood drew **50 GOAWAY(PROTOCOL_ERROR) frames**, one per
+   refusal. It also meant a legitimate client that merely reached the cap with
+   a cancel in flight was answered a connection error. Refusing now marks the
+   stream closed-by-reset.
+2. `drive()`'s `Err` arm appended `GOAWAY(PROTOCOL_ERROR)` unconditionally,
+   **overwriting every precise code** a handler had already sent -- so
+   ENHANCE_YOUR_CALM here, and COMPRESSION_ERROR on the HPACK path, were never
+   the peer's last word. Now guarded by `goaway_sent`. This one was pre-existing
+   and affects paths well outside this phase.
+
+Neither was reachable from the unit tests, which call `process_frame` directly
+and never enter `drive()`. **Both were found by pointing a raw-socket client at
+a running server and reading the frames that came back.**
+
+Measured after the fix: first refusal at stream **#101** of 200, exactly 50
+refusals, **one** GOAWAY carrying **0xb ENHANCE_YOUR_CALM**. h2load with 20
+concurrent streams still 200/200, h2spec still 146/146.
+
+Still open here: the reset budget is per connection, so a peer with many
+connections gets `MAX_CONCURRENT` streams per connection per second. The
+per-IP connection limit is what bounds that, and it is a separate mechanism.
 
 ### Phase 7 — Green and keep it green
 
