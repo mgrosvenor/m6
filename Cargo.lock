@@ -1771,6 +1771,7 @@ dependencies = [
  "anyhow",
  "brotli",
  "flate2",
+ "httpdate",
  "libc",
  "minify-html",
  "minify-js",

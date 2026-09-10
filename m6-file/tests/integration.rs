@@ -344,3 +344,102 @@ fn l5_concurrent_requests() {
         handle.join().unwrap();
     }
 }
+
+// ─── Conditional requests (RFC 9110 13.2.2) ───────────────────────────────────
+
+/// All four precondition steps, in order, against a real m6-file.
+///
+/// This is the guard for the defect that moved preconditions into
+/// `m6_core::conditional`. What was here did steps 3 and 4 only, and step 3
+/// with strong comparison:
+///
+/// ```ignore
+/// inm == "*" || inm.split(',').any(|tag| tag.trim() == etag)
+/// ```
+///
+/// Byte equality is *strong* comparison; `If-None-Match` requires weak
+/// (RFC 9110 8.8.3.2). A client returning the validator it had been given as
+/// `W/"..."` was sent the whole body again, and `If-Match` and
+/// `If-Unmodified-Since` were not consulted at all.
+///
+/// **These assertions go against the process, not the function.** The function
+/// was already unit-tested and already correct, in a different crate; what was
+/// wrong was what m6-file did on the wire. A unit test could not have caught
+/// that, and did not.
+#[test]
+fn conditional_requests_follow_rfc9110_precedence() {
+    let (_guard, socket_path) = spawn_server("preconditions");
+
+    let get = |extra: &str| -> String {
+        http_request(
+            &socket_path,
+            &format!(
+                "GET /assets/css/main.css HTTP/1.1\r\nHost: localhost\r\n\
+                 Accept-Encoding: identity\r\n{extra}\r\n"
+            ),
+        )
+    };
+    let status = |resp: &str| -> String {
+        resp.lines().next().unwrap_or("").trim().to_string()
+    };
+
+    let etag = get("")
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("etag:"))
+        .and_then(|l| l.split_once(':'))
+        .map(|(_, v)| v.trim().to_string())
+        .expect("m6-file must send an ETag");
+
+    // No preconditions.
+    assert!(status(&get("")).contains("200"), "unconditional GET");
+
+    // 1. If-Match uses STRONG comparison; a mismatch is 412, not 200.
+    assert!(
+        status(&get("If-Match: \"nope\"\r\n")).contains("412"),
+        "If-Match with a non-matching tag must be 412"
+    );
+    assert!(
+        status(&get(&format!("If-Match: {etag}\r\n"))).contains("200"),
+        "If-Match with the current tag must proceed"
+    );
+
+    // 2. If-Unmodified-Since, only consulted when If-Match is absent.
+    assert!(
+        status(&get("If-Unmodified-Since: Thu, 01 Jan 1970 00:00:00 GMT\r\n")).contains("412"),
+        "If-Unmodified-Since in the past must be 412"
+    );
+
+    // 3. If-None-Match uses WEAK comparison: W/"x" matches "x".
+    assert!(
+        status(&get(&format!("If-None-Match: {etag}\r\n"))).contains("304"),
+        "strong form of the current tag must be 304"
+    );
+    assert!(
+        status(&get(&format!("If-None-Match: W/{etag}\r\n"))).contains("304"),
+        "WEAK form of the current tag must also be 304 (RFC 9110 8.8.3.2) — \
+         this is the assertion that was failing"
+    );
+    assert!(status(&get("If-None-Match: *\r\n")).contains("304"), "If-None-Match: *");
+    assert!(
+        status(&get("If-None-Match: \"nope\"\r\n")).contains("200"),
+        "a non-matching If-None-Match must proceed"
+    );
+
+    // 4. If-Modified-Since, only when If-None-Match is absent.
+    assert!(
+        status(&get("If-Modified-Since: Thu, 23 Aug 2096 20:51:20 GMT\r\n")).contains("304"),
+        "a future If-Modified-Since must be 304"
+    );
+    assert!(
+        status(&get("If-Modified-Since: Thu, 01 Jan 1970 00:00:00 GMT\r\n")).contains("200"),
+        "an ancient If-Modified-Since must proceed"
+    );
+
+    // RFC 9110 13.1.4: an unparseable date is ignored, not a failure. The
+    // weekday here does not match the calendar date, which is what a strict
+    // parser rejects.
+    assert!(
+        status(&get("If-Modified-Since: Sun, 06 Nov 2099 08:49:37 GMT\r\n")).contains("200"),
+        "an unparseable date must be ignored, not turned into 412"
+    );
+}
