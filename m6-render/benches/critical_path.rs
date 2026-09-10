@@ -24,8 +24,8 @@ fn html_response(html: String) -> Response {
 use m6_render::app::{
     compile_pattern, find_route, match_route, route_specificity, CompiledRoute, RouteMethod,
 };
-use m6_render::compress::{brotli_compress, gzip_compress};
-use m6_render::minify::{minify_css, minify_html, minify_js, minify_json};
+use m6_core::compress::{brotli_compress, gzip_compress};
+use m6_core::minify::{minify_css, minify_html, minify_js, minify_json};
 use m6_render::request::{parse_cookies, parse_query_string};
 use m6_render::response::Response;
 use m6_render::server::write_response;
@@ -232,7 +232,9 @@ fn make_routes() -> Vec<CompiledRoute> {
                 params_files: vec![],
                 status: 200,
                 cache: "public".to_string(),
-                specificity: spec,
+                headers: Vec::new(),
+            last_modified: None,
+            specificity: spec,
             }
         })
         .collect();
@@ -319,7 +321,9 @@ fn bench_match_route(c: &mut Criterion) {
         params_files: vec![],
         status: 200,
         cache: "public".to_string(),
-        specificity: route_specificity(&segs),
+        headers: Vec::new(),
+            last_modified: None,
+            specificity: route_specificity(&segs),
     };
     let path_segs: Vec<&str> = "/blog/hello-world"
         .split('/')
@@ -470,7 +474,9 @@ size = 64
                     params_files: rc.params.clone(),
                     status: rc.status,
                     cache: rc.cache.clone(),
-                    specificity: spec,
+                    headers: Vec::new(),
+            last_modified: None,
+            specificity: spec,
                 }
             })
             .collect();
@@ -585,7 +591,7 @@ fn bench_compress(c: &mut Criterion) {
 fn bench_minify(c: &mut Criterion) {
     let mut group = c.benchmark_group("minify");
     group.sample_size(500);
-    group.bench_function("minify_html_2kb",   |b| b.iter(|| black_box(minify_html(black_box(HTML_2KB)))));
+    group.bench_function("minify_html_2kb",   |b| b.iter(|| black_box(minify_html(black_box(HTML_2KB), false))));
     group.bench_function("minify_css_8kb",    |b| b.iter(|| black_box(minify_css(black_box(CSS_8KB)))));
     group.bench_function("minify_json_1kb",   |b| b.iter(|| black_box(minify_json(black_box(JSON_1KB)))));
     group.bench_function("minify_js_3kb",     |b| b.iter(|| black_box(minify_js(black_box(JS_3KB)))));
@@ -599,7 +605,7 @@ fn bench_minify_then_compress(c: &mut Criterion) {
     group.sample_size(200);
     group.bench_function("html_minify_then_brotli6", |b| {
         b.iter(|| {
-            let minified = minify_html(black_box(HTML_2KB));
+            let minified = minify_html(black_box(HTML_2KB), false);
             black_box(brotli_compress(&minified, 6).unwrap())
         })
     });
@@ -672,6 +678,8 @@ fn main() {
             params_files: vec![],
             status: 200,
             cache: "public".to_string(),
+            headers: Vec::new(),
+            last_modified: None,
             specificity: route_specificity(&segs),
         };
         let path_segs: Vec<&str> = "/blog/hello-world"
@@ -772,7 +780,9 @@ size = 64
                         params_files: rc.params.clone(),
                         status: rc.status,
                         cache: rc.cache.clone(),
-                        specificity: spec,
+                        headers: Vec::new(),
+            last_modified: None,
+            specificity: spec,
                     }
                 })
                 .collect();
@@ -859,7 +869,7 @@ size = 64
     // ── Minification ─────────────────────────────────────────────────────────
     const N_MIN: usize = 5_000;
     println!("\n── Minification paths (n={N_MIN}) ───────────────────────────────────────────");
-    report_percentiles("minify html 2KB",  N_MIN, || { black_box(minify_html(black_box(HTML_2KB))); });
+    report_percentiles("minify html 2KB",  N_MIN, || { black_box(minify_html(black_box(HTML_2KB), false)); });
     report_percentiles("minify css 8KB",   N_MIN, || { black_box(minify_css(black_box(CSS_8KB))); });
     report_percentiles("minify json 1KB",  N_MIN, || { black_box(minify_json(black_box(JSON_1KB))); });
     report_percentiles("minify js 3KB",    N_MIN, || { black_box(minify_js(black_box(JS_3KB))); });
@@ -868,7 +878,7 @@ size = 64
     const N_PIPE: usize = 2_000;
     println!("\n── Minify+compress pipeline (n={N_PIPE}) ────────────────────────────────────");
     report_percentiles("html: minify → brotli-6", N_PIPE, || {
-        let m = minify_html(black_box(HTML_2KB));
+        let m = minify_html(black_box(HTML_2KB), false);
         black_box(brotli_compress(&m, 6).unwrap());
     });
     report_percentiles("css:  minify → brotli-6", N_PIPE, || {
