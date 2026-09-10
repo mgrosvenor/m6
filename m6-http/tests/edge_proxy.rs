@@ -236,7 +236,7 @@ format = "text"
 
 [[backend]]
 name           = "global"
-url            = "https://127.0.0.1:{global_port}"
+url            = "h2s://127.0.0.1:{global_port}"
 tls_skip_verify = true
 
 [[route]]
@@ -700,4 +700,86 @@ fn test_rtt_simulation() {
     println!("avg cache-miss (no artificial RTT): {:?}", miss_total / 10);
     println!("Note: in production with 5ms RTT, cache-miss adds ~10ms (TCP round-trip);");
     println!("      cache-hit serves from local Arc<Bytes> in <1ms regardless of RTT.");
+}
+
+/// One HTTP/1.1 POST to the edge with a body of `size` bytes.
+///
+/// The client leg is HTTP/1.1; the edge forwards to the origin over the h2
+/// backbone, which is the leg under test here.
+fn https_post(port: u16, path: &str, size: usize, tls: Arc<rustls::ClientConfig>) -> String {
+    let tcp = TcpStream::connect(format!("127.0.0.1:{}", port)).expect("tcp connect");
+    tcp.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+    let server_name = rustls::pki_types::ServerName::try_from("127.0.0.1".to_string()).unwrap();
+    let conn = rustls::ClientConnection::new(tls, server_name).unwrap();
+    let mut stream = StreamOwned::new(conn, tcp);
+
+    let body = vec![b'a'; size];
+    let req = format!(
+        "POST {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/octet-stream\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n",
+        path, port, size
+    );
+    stream.write_all(req.as_bytes()).unwrap();
+    stream.write_all(&body).unwrap();
+    stream.flush().unwrap();
+
+    let mut resp = Vec::new();
+    match stream.read_to_end(&mut resp) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
+        Err(e) => panic!("TLS read error: {e}"),
+    }
+    String::from_utf8_lossy(&resp)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// A request body larger than SETTINGS_MAX_FRAME_SIZE must survive the hop to
+/// the origin.
+///
+/// The backbone clients (`h2c_client`, `h2s_client`) emitted the entire body as
+/// ONE DATA frame regardless of size. RFC 9113 4.2 caps a frame at the peer's
+/// advertised SETTINGS_MAX_FRAME_SIZE, which the origin advertises as the 16384
+/// default and, since F-005, actually enforces. So every upload over 16 KiB
+/// routed through a cache node was answered FRAME_SIZE_ERROR by the origin and
+/// surfaced to the visitor as a 502. Both clients already parsed
+/// `peer_max_frame` from the peer's SETTINGS and then never used it.
+///
+/// 16 KiB is deliberately included: it is the last size that worked before the
+/// fix, so it pins the boundary from below as well as above.
+///
+/// Chunking alone was not enough, and the second defect was not the one the
+/// symptom suggested. With frames split correctly, bodies up to 49,152 bytes
+/// went through and 65,535 still failed. That was `h2s_client` calling
+/// `write_all` on rustls' `Writer`: rustls caps its outgoing plaintext buffer
+/// at 64 KiB and returns a short write, or 0, when full, and `write_all` turns
+/// that 0 into `WriteZero`, which the client reported as a TLS failure and
+/// killed the connection over. `h2c_client` already handled its plain socket's
+/// short writes correctly, which is why the two backbone clients failed at
+/// different sizes. Both are fixed; this test covers both.
+///
+/// Still latent, not asserted: `conn_send_window` is initialised and
+/// incremented on WINDOW_UPDATE but never decremented or consulted, so neither
+/// client enforces connection-level flow control on send. It does not bite at
+/// these sizes because the origin replenishes its receive window promptly, but
+/// it is a real gap against a peer that does not.
+#[test]
+fn a_body_larger_than_max_frame_size_survives_the_edge_hop() {
+    let stack = EdgeStack::start();
+
+    for size in [16_384usize, 32_768, 65_536, 262_144, 1_048_576] {
+        let status = https_post(stack.edge_port, "/", size, stack.edge_tls.clone());
+        let code = status_code(&status);
+        assert_ne!(
+            code, 502,
+            "{size} byte body got a 502 from the edge: the origin rejected an \
+             oversized DATA frame. status line: {status:?}"
+        );
+        assert!(
+            code > 0,
+            "{size} byte body produced no response at all: {status:?}"
+        );
+    }
 }
