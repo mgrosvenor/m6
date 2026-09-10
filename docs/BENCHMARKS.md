@@ -151,3 +151,64 @@ Pure CPU cost, no I/O, and therefore stable and worth keeping:
 
 These were not re-measured in the 2026-09-06 pass; they are carried over and
 should be re-run on the build host before being quoted as current.
+
+---
+
+## Where to run them, and why it matters
+
+**Diagnosed 2026-09-10.** The `critical_path` benches were producing a 19-26%
+spread between consecutive runs of the same commit, while criterion's
+confidence interval *within* each run was +/-0.08%. Internally precise,
+externally scattered: the signature of a per-process constant, not of noise.
+
+Two hypotheses were tested and one was wrong.
+
+**Wrong: the hash seed.** `Cache` uses `AHashMap`, and `ahash`'s `RandomState`
+is seeded from the OS once per process, so the same key lands in a different
+bucket every run. Plausible, and false. `Cache::with_fixed_seed_for_bench()`
+pins the seed; the spread was unchanged at 49-62 ns over five runs. The
+constructor was kept anyway, because determinism is worth having, but it fixed
+nothing.
+
+**Right: core scheduling on a loaded heterogeneous machine.**
+
+| Configuration | Result | Spread |
+|---|---|---|
+| Forced to efficiency cores (`taskpolicy -c background`) | 107.1, 108.0 ns | **+/-1%** |
+| Default QoS, mixed P/E | 49-62 ns | +/-13% |
+
+The development machine is an Apple M4: **4 performance cores and 6 efficiency
+cores**. Efficiency cores run this workload **2.1x slower**, and pinning to
+them is reproducible to +/-1%. The benchmark was never broken; the scheduling
+was the variable.
+
+The machine was also not idle when this was noticed. Load average was 89 rising
+to 151 on ten cores, with `spotlightknowledged` at 88.8% CPU and 112 Firefox
+`plugin-container` processes. Under that load macOS migrates a process across
+core classes, and a run lands anywhere between the P-core figure and the E-core
+figure depending on what share it happened to get.
+
+### The rule
+
+**Comparative benchmark numbers come from the build host**, which is a
+dedicated Linux VM with homogeneous cores, nothing else running, and the same
+OS as production. That is where a figure quoted as a regression check must come
+from.
+
+A developer machine is fine for a quick look, with two conditions:
+
+1. **Check the load first.** `uptime`. A load average above the core count
+   means the numbers are not comparable to anything.
+2. **If you must compare on a heterogeneous machine, pin the core class.**
+   `taskpolicy -c background` gives +/-1% reproducibility on an M-series Mac.
+   The absolute figure is then 2.1x the real one and must never be quoted, but
+   run-to-run comparison is valid, which is what regression detection needs.
+
+### The general lesson
+
+A benchmark whose consecutive runs of unchanged code disagree by more than a
+percent or two is not measuring the code. Diagnose it before quoting it. The
+tell here was the gap between the within-run interval (+/-0.08%) and the
+between-run spread (+/-13%): whatever varied was fixed for the life of a
+process and different between processes, which pointed at the environment
+rather than at the benchmark or the code.

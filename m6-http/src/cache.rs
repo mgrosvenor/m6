@@ -595,6 +595,32 @@ impl Cache {
         Cache { map: Arc::new(RwLock::new(CacheMap::new())) }
     }
 
+    /// A cache whose hasher is seeded deterministically. **Benchmarks only.**
+    ///
+    /// `ahash`'s `RandomState` is seeded from the OS once per process, so the
+    /// same key lands in a different bucket in every run. Production wants
+    /// exactly that: an unpredictable per-process seed is what makes
+    /// hash-collision denial of service impractical.
+    ///
+    /// For a benchmark it is one avoidable source of run-to-run difference, so
+    /// this pins it.
+    ///
+    /// **It is not, however, the reason the benchmark used to scatter.** That
+    /// was measured and disproven: pinning the seed left the spread unchanged
+    /// at 49-62 ns over five runs. The real cause was the machine, not the
+    /// code -- see `docs/BENCHMARKS.md`. This constructor is kept because
+    /// determinism is worth having, not because it fixed anything.
+    #[doc(hidden)]
+    pub fn with_fixed_seed_for_bench() -> Self {
+        let hasher = ahash::RandomState::with_seeds(
+            0x243f_6a88_85a3_08d3,
+            0x1319_8a2e_0370_7344,
+            0xa409_3822_299f_31d0,
+            0x082e_fa98_ec4e_6c89,
+        );
+        Cache { map: Arc::new(RwLock::new(CacheMap::with_hasher(hasher))) }
+    }
+
     /// Get a cached response.
     ///
     /// Accepts any borrowed form of `CacheKey`:

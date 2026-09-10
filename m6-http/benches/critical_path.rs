@@ -10,7 +10,7 @@ use m6_http_lib::stats::{Channel, Iface, Stats, Version};
 // ── Fixtures ──────────────────────────────────────────────────────────────────
 
 fn make_cache_with_entry() -> (Cache, &'static str, &'static str) {
-    let cache = Cache::new();
+    let cache = Cache::with_fixed_seed_for_bench();
     let path = "/blog/hello-world";
     let enc = "gzip";
     let key = CacheKey::new(path, None, enc);
