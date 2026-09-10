@@ -252,9 +252,24 @@ problem — `m6_core::http::RawRequest` reaches production only through
 `m6_core::server::UnixServer`, whose sole consumer is `m6-auth-server`, which
 is not in the fleet.
 
-**3.1 `validate_request_header_bytes` → `m6-core`.** Currently in `http2.rs`,
-imported by the H3 path. This is the single symbol h2 and h3 share; once it is
-in core they keep sharing it with neither wire format moving.
+**3.1 `validate_request_header_bytes` → `m6-http/src/fields.rs`, NOT
+`m6-core`. The plan was wrong here.**
+
+It was listed as a move to core on the strength of a claim in
+`m6-decisions.md` that the symbol is "RFC 9110 semantics, not h2 wire format".
+Checked against the code, every rule in it is RFC 9113 8.2.1, 8.2.2, 8.3 or
+8.3.1, restated by RFC 9114 4.3. HTTP/1.1 has no pseudo-headers, allows any
+field-name case, and requires `Connection` rather than banning it, so none of
+these rules mean anything outside h2 and h3.
+
+Moving it to core would put protocol-version-specific rules in the crate whose
+whole premise is version independence, and would have quietly undermined the
+boundary decision it was cited to support.
+
+The real problem was a name: the H3 path imported from a file called
+`http2.rs`, which looks like a layering violation and is not one. Both
+protocols now import from `fields.rs`. No crate boundary is crossed and nothing
+about the decision changes.
 
 **3.2 Conditional requests and preconditions → `m6-core`.** The full RFC 9110
 13.2.2 precedence with weak comparison, from `m6-http::cache`. Then **fix
