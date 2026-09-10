@@ -104,10 +104,18 @@ cannot recur silently.
 
 Criterion's own comparison against its stored baseline is **not** usable: that
 baseline predates whenever the suite stopped compiling, so its age is unknown.
-These numbers are the reference from here.
 
-**Every phase re-runs this and reports the delta.** A phase that moves any of
-these materially without an explanation is not done.
+**These numbers are laptop figures and are not comparable to build-host
+figures.** They were also taken as a single run per bench, which 2026-09-11
+measurement showed is not a comparative method on either machine: the same
+commit measured twice on the build host moved 14.2% on `full_cache_hit_path`.
+Use `tools/paired_bench.sh`, and see "Where to run them" in `BENCHMARKS.md`.
+Treat the table above as a record of scale, not as a regression gate.
+
+**Every phase re-runs this and reports the delta**, paired and interleaved. A
+phase that moves any of these materially without an explanation is not done —
+and a delta smaller than the host's own run-to-run drift is not a measurement,
+it is a coin toss with extra steps.
 
 **Gate:** recorded in `m6-decisions.md` under Crate Boundaries. Done.
 

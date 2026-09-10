@@ -188,12 +188,64 @@ to 151 on ten cores, with `spotlightknowledged` at 88.8% CPU and 112 Firefox
 core classes, and a run lands anywhere between the P-core figure and the E-core
 figure depending on what share it happened to get.
 
+### The rule, as first written, and why it was wrong
+
+It said: *comparative benchmark numbers come from the build host, which is a
+dedicated Linux VM with homogeneous cores, nothing else running, and the same
+OS as production.*
+
+**"Nothing else running" was asserted, not checked, and it is false.**
+Measured 2026-09-11, the build host is running:
+
+```
+m6-http-origin  m6-html  m6-file  render-contact  render-analytics
+fail2ban        auditd   snapd
+```
+
+A full m6 stack, a log-scanning daemon and an audit daemon, on **four cores**.
+It is the staging environment as well as the build box. The cores are
+homogeneous, which fixes the P/E problem above, and the machine is busy, which
+replaces it with a different one.
+
+The consequence, measured on the **same tree and the same commit** across two
+passes:
+
+| bench | pass 1 | pass 2 | swing |
+|---|---|---|---|
+| `h3_header_extract` | 21.961 ns | 20.408 ns | **7.1%** |
+| `full_cache_hit_path` | 320.66 ns | 366.24 ns | **14.2%** |
+
+Criterion's interval *within* each run was well under 1%, so each number looks
+authoritative in isolation. Anything smaller than ~14% measured as "all of A,
+then all of B" on this host is drift, not signal.
+
 ### The rule
 
-**Comparative benchmark numbers come from the build host**, which is a
-dedicated Linux VM with homogeneous cores, nothing else running, and the same
-OS as production. That is where a figure quoted as a regression check must come
-from.
+**A comparative number comes from a paired, interleaved run, and never from
+measuring all of A and then all of B.** Alternate the two trees round by round
+and report a confidence interval on the *paired difference*. Drift then lands
+in both arms equally and subtracts out, which works on a busy machine and needs
+no infrastructure change. `tools/paired_bench.sh` is the harness.
+
+An absolute number quoted on its own is only meaningful with the host and the
+date attached, and is not comparable to one taken on a different machine. The
+Phase 0 baseline table in `m6-core-implementation-plan.md` was taken on the
+laptop and must not be compared against build-host figures.
+
+### Two traps in the harness itself
+
+**`--sample-size` on the command line is silently ignored.** The bench source
+calls `group.sample_size(100_000)` in nine places, and criterion applies the
+group setting after the CLI config, so the code wins. A run requesting 30
+samples and a 3-second measurement still performs 100,000 samples, which is why
+a sixteen-measurement sweep took two hours rather than five minutes. The flag
+appears on the process command line and does nothing.
+
+**Do not run a benchmark against a tree you are still editing**, and check that
+a previous run has actually died before starting another. A first attempt at
+the A/B measured a tree being changed underneath it, and a second competed with
+an orphaned run that had survived being killed from the other end of an SSH
+session; both produced numbers that looked fine.
 
 A developer machine is fine for a quick look, with two conditions:
 
