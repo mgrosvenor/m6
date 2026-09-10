@@ -755,10 +755,7 @@ fn verify_flash_cookie(cookie_val: &str, secret: &[u8]) -> Option<String> {
 /// Generate a fresh CSRF token: 32 random bytes as hex.
 #[cfg(feature = "csrf")]
 fn generate_csrf_token() -> String {
-    use rand::RngCore;
-    let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    m6_core::random_hex_token::<32>()
 }
 
 // ---------------------------------------------------------------------------

@@ -131,7 +131,7 @@ impl H2sTlsClientConn {
         tls_stream.flush()?;
 
         // Verify ALPN negotiation.
-        if tls_stream.conn.alpn_protocol() != Some(b"h2") {
+        if tls_stream.conn.alpn_protocol() != Some(b"h2".as_slice()) {
             let got = tls_stream
                 .conn
                 .alpn_protocol()
