@@ -3127,6 +3127,12 @@ fn urlencoded(s: &str) -> String {
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() {
+    // Block SIGTERM and SIGINT before anything else, including logging.
+    // The mask is inherited only by threads created after this point, and
+    // tracing-appender's writer thread would otherwise take the signal at its
+    // default disposition and kill the process. See m6_core::signal.
+    m6_core::signal::block();
+
     // rustls requires an explicit CryptoProvider when multiple are available
     // (ring + aws-lc-rs both get pulled in transitively). Install ring first.
     rustls::crypto::ring::default_provider().install_default().ok();

@@ -38,63 +38,15 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rustls::StreamOwned;
 
-mod common;
-use common::free_port;
+use m6_core::testkit::{binary, claim_port, PortClaim, Service};
 
 // ── Harness ───────────────────────────────────────────────────────────────────
-
-struct TestProcess(Child);
-impl Drop for TestProcess {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
-}
-
-fn binary(name: &str) -> PathBuf {
-    let p = repo_root().join("target").join("release").join(name);
-    assert!(
-        p.exists(),
-        "missing {}: run `cargo build --workspace --release` first",
-        p.display()
-    );
-    p
-}
-
-
-
-fn wait_for_tcp(port: u16, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    false
-}
-
-fn wait_for_path(p: &Path, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if p.exists() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    false
-}
 
 fn generate_tls_cert() -> (String, String, Vec<u8>) {
     let ck = rcgen::generate_simple_self_signed(vec![
@@ -118,12 +70,22 @@ fn tls_client_config(cert_der: &[u8]) -> Arc<rustls::ClientConfig> {
     )
 }
 
+/// Field order is drop order, and it matters here. The services are killed
+/// first, then the site directory they were serving is removed, then the port
+/// claim is released. Reversing any of those means tearing the ground out from
+/// under a process that is still running, which produces shutdown errors that
+/// belong to the harness and not to the code under test.
+///
+/// The services are in `RefCell`s so that `connect`, which takes `&self`, can
+/// still ask a dead child what happened. That question is the whole reason
+/// this suite stopped reporting bare `ConnectionRefused`.
 struct Server {
     port: u16,
     cert_der: Vec<u8>,
+    http: std::cell::RefCell<Service>,
+    file: std::cell::RefCell<Service>,
     _dir: tempfile::TempDir,
-    _file: TestProcess,
-    _http: TestProcess,
+    _port: PortClaim,
 }
 
 impl Server {
@@ -135,7 +97,22 @@ impl Server {
         cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
         let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
         let conn = rustls::ClientConnection::new(Arc::new(cfg), name).unwrap();
-        let sock = TcpStream::connect(("127.0.0.1", self.port)).expect("tcp connect");
+        let sock = match TcpStream::connect(("127.0.0.1", self.port)) {
+            Ok(s) => s,
+            Err(e) => {
+                // Connection refused here means nothing is listening, which
+                // means a service died since the last request. These two calls
+                // panic with the exit status and the child's own last words;
+                // the fallthrough covers the case where both are somehow still
+                // alive, which would be a genuinely different bug.
+                self.http.borrow_mut().assert_alive("the client was reconnecting");
+                self.file.borrow_mut().assert_alive("the client was reconnecting");
+                panic!(
+                    "connect to 127.0.0.1:{} failed with both services alive: {e}",
+                    self.port
+                );
+            }
+        };
         sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         sock.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
         StreamOwned::new(conn, sock)
@@ -245,7 +222,8 @@ backend = "m6-file"
     )
     .unwrap();
 
-    let port = free_port();
+    let claim = claim_port();
+    let port = claim.port();
     std::fs::write(
         site.join("system.toml"),
         format!(
@@ -264,31 +242,30 @@ name = "robustness-node"
     )
     .unwrap();
 
-    let file_proc = TestProcess(
+    let mut file_proc = Service::spawn(
+        "m6-file",
         Command::new(binary("m6-file"))
             .arg(site)
             .arg(site.join("configs/m6-file.conf"))
-            .env("M6_SOCKET_OVERRIDE", &sock)
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn m6-file"),
+            .env("M6_SOCKET_OVERRIDE", &sock),
     );
-    assert!(wait_for_path(&sock, Duration::from_secs(10)), "m6-file socket never appeared");
+    file_proc.wait_for_path(&sock, Duration::from_secs(10));
 
-    let http_proc = TestProcess(
-        Command::new(binary("m6-http"))
-            .arg(site)
-            .arg(site.join("system.toml"))
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn m6-http"),
+    let mut http_proc = Service::spawn(
+        "m6-http",
+        Command::new(binary("m6-http")).arg(site).arg(site.join("system.toml")),
     );
-    assert!(wait_for_tcp(port, Duration::from_secs(10)), "m6-http never listened");
+    http_proc.wait_for_tcp(port, Duration::from_secs(10));
     std::thread::sleep(Duration::from_millis(2500)); // backend socket rescan
 
-    Server { port, cert_der, _dir: dir, _file: file_proc, _http: http_proc }
+    Server {
+        port,
+        cert_der,
+        http: std::cell::RefCell::new(http_proc),
+        file: std::cell::RefCell::new(file_proc),
+        _dir: dir,
+        _port: claim,
+    }
 }
 
 // ── Shared assertions ─────────────────────────────────────────────────────────
@@ -805,4 +782,41 @@ fn conflicting_host_headers_are_not_both_honoured() {
         "the forged second Host reached the response head:\n{head}"
     );
     s.assert_still_healthy("duplicate host");
+}
+
+// ── Shutdown ──────────────────────────────────────────────────────────────────
+
+/// SIGTERM must run m6-http's shutdown path, not kill it.
+///
+/// This is a regression test for a defect the migration to `sigwait`
+/// introduced and this suite caught. Blocking a signal is per-thread, and
+/// threads inherit the mask only at creation, so blocking SIGTERM in `main`
+/// after `tracing_appender` has already spawned its writer thread leaves that
+/// thread unblocked. The kernel then delivers every process-directed SIGTERM
+/// there, the default disposition kills the process, and the `sigwait` thread
+/// never sees a signal in its life.
+///
+/// What made it worth a test rather than a comment is how quiet the failure
+/// is. systemd counts death by the signal it sent as a clean stop, so
+/// `systemctl stop` reports success either way; the only visible difference is
+/// that no shutdown line is logged, in-flight requests are cut rather than
+/// drained, and unix-socket services leave their socket behind for the proxy
+/// to keep in its pool. `m6-file` shipped this way and nobody noticed for
+/// thirty days.
+///
+/// The fix is `m6_core::signal::block()` as the first statement of `main`;
+/// `install_with_hooks` now refuses to start without it.
+#[test]
+fn sigterm_shuts_down_rather_than_killing() {
+    let s = start_server();
+    s.assert_still_healthy("before shutdown");
+
+    let status = s.http.borrow_mut().terminate(Duration::from_secs(5));
+    assert!(
+        status.success(),
+        "m6-http should exit 0 on SIGTERM, got {status}. A signal exit status here \
+         means the process died at the default disposition instead of shutting down.\n\
+         --- stderr ---\n{}",
+        s.http.borrow().stderr_text()
+    );
 }

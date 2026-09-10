@@ -1517,6 +1517,14 @@ fn file_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
 }
 
 pub fn run_app(code_routes: Vec<CodeRoute>) -> Result<()> {
+    // Block SIGTERM and SIGINT before anything else, logging included. Apps
+    // built on this framework have a `main` that does nothing but call here,
+    // so this is the process's first statement in practice. The mask is
+    // inherited only by threads created afterwards, and tracing-appender's
+    // writer thread would otherwise take the signal at its default
+    // disposition and kill the process. See m6_core::signal.
+    m6_core::signal::block();
+
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
         eprintln!("Usage: {} <site-dir> <config-path>", args[0]);

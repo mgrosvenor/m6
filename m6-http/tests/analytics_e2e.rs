@@ -18,63 +18,14 @@
 use std::io::{Read, Write};
 use std::net::{TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use quiche::h3::NameValue as _;
 use rustls::StreamOwned;
 
-mod common;
-use common::free_port;
-
-// ── Process management ────────────────────────────────────────────────────────
-
-struct TestProcess(Child);
-impl Drop for TestProcess {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
-}
-
-fn binary(name: &str) -> PathBuf {
-    let p = repo_root().join("target").join("release").join(name);
-    assert!(
-        p.exists(),
-        "missing {}: run `cargo build --workspace --release` first",
-        p.display()
-    );
-    p
-}
-
-
-
-fn wait_for_tcp(port: u16, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    false
-}
-
-fn wait_for_path(p: &Path, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if p.exists() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    false
-}
+use m6_core::testkit::{binary, claim_port, PortClaim, Service};
 
 fn generate_tls_cert() -> (String, String, Vec<u8>) {
     let ck = rcgen::generate_simple_self_signed(vec![
@@ -118,8 +69,23 @@ impl HttpResponse {
     }
 }
 
+/// One HTTP/1.1-over-TLS GET against a bare port.
+///
+/// Three tests here build ad-hoc stacks that have no [`Server`], so the
+/// primitive takes a port. Tests that do have a `Server` should go through
+/// [`Server::get`], which reports a dead service instead of a bare io error.
 fn https_get(port: u16, path: &str, extra: &[(&str, &str)], tls: Arc<rustls::ClientConfig>) -> HttpResponse {
     let tcp = TcpStream::connect(("127.0.0.1", port)).expect("tcp connect");
+    https_exchange(tcp, port, path, extra, tls)
+}
+
+fn https_exchange(
+    tcp: TcpStream,
+    port: u16,
+    path: &str,
+    extra: &[(&str, &str)],
+    tls: Arc<rustls::ClientConfig>,
+) -> HttpResponse {
     tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     let name = rustls::pki_types::ServerName::try_from("127.0.0.1".to_string()).unwrap();
     let conn = rustls::ClientConnection::new(tls, name).unwrap();
@@ -330,14 +296,33 @@ struct Server {
     port: u16,
     cert_der: Vec<u8>,
     analytics_log: PathBuf,
+    http: std::cell::RefCell<Service>,
+    _file: Service,
     _dir: tempfile::TempDir,
-    _file: TestProcess,
-    _http: TestProcess,
+    _port: PortClaim,
 }
 
 impl Server {
     fn tls(&self) -> Arc<rustls::ClientConfig> {
         tls_client_config(&self.cert_der)
+    }
+
+    /// Open a TCP connection to the server, or say why it could not be opened.
+    /// See the same method in `security_e2e.rs`: a refused connect means the
+    /// server died, and the exit status and its last stderr are the answer.
+    fn tcp(&self) -> TcpStream {
+        match TcpStream::connect(("127.0.0.1", self.port)) {
+            Ok(s) => s,
+            Err(e) => {
+                self.http.borrow_mut().assert_alive("the client was connecting");
+                panic!("connect to 127.0.0.1:{} failed with m6-http alive: {e}", self.port);
+            }
+        }
+    }
+
+    /// One HTTP/1.1-over-TLS GET against this server.
+    fn get(&self, path: &str, extra: &[(&str, &str)]) -> HttpResponse {
+        https_exchange(self.tcp(), self.port, path, extra, self.tls())
     }
 }
 
@@ -417,7 +402,8 @@ root = "public/"
     )
     .unwrap();
 
-    let port = free_port();
+    let port_claim = claim_port();
+    let port = port_claim.port();
     std::fs::write(
         site.join("system.toml"),
         format!(
@@ -436,31 +422,33 @@ name = "test-node"
     )
     .unwrap();
 
-    let file_proc = TestProcess(
+    let mut file_proc = Service::spawn(
+        "m6-file",
         Command::new(binary("m6-file"))
             .arg(site)
             .arg(site.join("configs/m6-file.conf"))
-            .env("M6_SOCKET_OVERRIDE", &sock)
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn m6-file"),
+            .env("M6_SOCKET_OVERRIDE", &sock),
     );
-    assert!(wait_for_path(&sock, Duration::from_secs(10)), "m6-file socket never appeared");
+    file_proc.wait_for_path(&sock, Duration::from_secs(10));
 
-    let http_proc = TestProcess(
+    let mut http_proc = Service::spawn(
+        "m6-http",
         Command::new(binary("m6-http"))
             .arg(site)
-            .arg(site.join("system.toml"))
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn m6-http"),
+            .arg(site.join("system.toml")),
     );
-    assert!(wait_for_tcp(port, Duration::from_secs(10)), "m6-http never listened on {port}");
+    http_proc.wait_for_tcp(port, Duration::from_secs(10));
     std::thread::sleep(Duration::from_millis(2500));
 
-    Server { port, cert_der, analytics_log, _dir: dir, _file: file_proc, _http: http_proc }
+    Server {
+        port,
+        cert_der,
+        analytics_log,
+        http: std::cell::RefCell::new(http_proc),
+        _file: file_proc,
+        _dir: dir,
+        _port: port_claim,
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
@@ -473,7 +461,7 @@ name = "test-node"
 fn session_cookie_minted_once_and_reused_h1() {
     let srv = start_server();
 
-    let first = https_get(srv.port, "/public/plain.html", &[], srv.tls());
+    let first = srv.get("/public/plain.html", &[]);
     assert_eq!(first.status, 200, "headers:\n{}", first.headers);
     let set_cookies = first.header_values("set-cookie");
     assert_eq!(
@@ -488,7 +476,7 @@ fn session_cookie_minted_once_and_reused_h1() {
     let session_id = cookie_value.split_once('=').unwrap().1;
 
     // Replay with that cookie: no new Set-Cookie, same session reused.
-    let second = https_get(srv.port, "/public/plain.html", &[("Cookie", cookie_value)], srv.tls());
+    let second = srv.get("/public/plain.html", &[("Cookie", cookie_value)]);
     assert_eq!(second.status, 200);
     assert!(
         second.header_values("set-cookie").is_empty(),
@@ -551,7 +539,7 @@ fn session_cookie_minted_once_and_reused_h3() {
 fn prefetched_assets_are_not_logged_to_analytics() {
     let srv = start_server();
 
-    let page = https_get(srv.port, "/public/page.html", &[], srv.tls());
+    let page = srv.get("/public/page.html", &[]);
     assert_eq!(page.status, 200, "headers:\n{}", page.headers);
 
     // The prefetch queue drains one entry per event-loop iteration, but the
@@ -561,7 +549,7 @@ fn prefetched_assets_are_not_logged_to_analytics() {
     // guessing a fixed delay.
     let mut prefetch_ran = false;
     for _ in 0..20 {
-        let css = https_get(srv.port, "/public/style.css", &[], srv.tls());
+        let css = srv.get("/public/style.css", &[]);
         assert_eq!(css.status, 200);
         if css.status == 200 {
             prefetch_ran = true; // the file is servable either way; this loop exists to pump the event loop
@@ -609,7 +597,7 @@ fn prefetched_assets_are_not_logged_to_analytics() {
 fn backend_4xx_is_logged_to_analytics() {
     let srv = start_server();
 
-    let missing = https_get(srv.port, "/public/does-not-exist.txt", &[], srv.tls());
+    let missing = srv.get("/public/does-not-exist.txt", &[]);
     assert_eq!(missing.status, 404, "headers:\n{}", missing.headers);
 
     std::thread::sleep(Duration::from_millis(400));
@@ -722,7 +710,8 @@ root = "public/"
     )
     .unwrap();
 
-    let port = free_port();
+    let port_claim = claim_port();
+    let port = port_claim.port();
     std::fs::write(
         site.join("system.toml"),
         format!(
@@ -741,28 +730,22 @@ name = "test-node"
     )
     .unwrap();
 
-    let _file_proc = TestProcess(
+    let mut _file_proc = Service::spawn(
+        "m6-file",
         Command::new(binary("m6-file"))
             .arg(site)
             .arg(site.join("configs/m6-file.conf"))
-            .env("M6_SOCKET_OVERRIDE", &sock)
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn m6-file"),
+            .env("M6_SOCKET_OVERRIDE", &sock),
     );
-    assert!(wait_for_path(&sock, Duration::from_secs(10)), "m6-file socket never appeared");
+    _file_proc.wait_for_path(&sock, Duration::from_secs(10));
 
-    let _http_proc = TestProcess(
+    let mut _http_proc = Service::spawn(
+        "m6-http",
         Command::new(binary("m6-http"))
             .arg(site)
-            .arg(site.join("system.toml"))
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn m6-http"),
+            .arg(site.join("system.toml")),
     );
-    assert!(wait_for_tcp(port, Duration::from_secs(10)), "m6-http never listened on {port}");
+    _http_proc.wait_for_tcp(port, Duration::from_secs(10));
     std::thread::sleep(Duration::from_millis(2500));
 
     let tls = tls_client_config(&cert_der);
@@ -801,7 +784,8 @@ fn connection_failure_is_logged_to_analytics() {
 
     // A port nobody is listening on — bind-then-drop to get a free one that
     // will refuse connections deterministically.
-    let dead_port = free_port();
+    let dead_port_claim = claim_port();
+    let dead_port = dead_port_claim.port();
     let analytics_log = dir.path().join("analytics.ndjson");
 
     std::fs::write(
@@ -838,7 +822,8 @@ backend = "unreachable-backend"
     )
     .unwrap();
 
-    let port = free_port();
+    let port_claim = claim_port();
+    let port = port_claim.port();
     std::fs::write(
         site.join("system.toml"),
         format!(
@@ -857,16 +842,13 @@ name = "test-node"
     )
     .unwrap();
 
-    let _http_proc = TestProcess(
+    let mut _http_proc = Service::spawn(
+        "m6-http",
         Command::new(binary("m6-http"))
             .arg(site)
-            .arg(site.join("system.toml"))
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn m6-http"),
+            .arg(site.join("system.toml")),
     );
-    assert!(wait_for_tcp(port, Duration::from_secs(10)), "m6-http never listened on {port}");
+    _http_proc.wait_for_tcp(port, Duration::from_secs(10));
     std::thread::sleep(Duration::from_millis(1500));
 
     let tls = tls_client_config(&cert_der);
@@ -957,7 +939,8 @@ backend = "m6-file"
     )
     .unwrap();
 
-    let origin_port = free_port();
+    let origin_port_claim = claim_port();
+    let origin_port = origin_port_claim.port();
     std::fs::write(
         origin_site.join("system.toml"),
         format!(
@@ -968,28 +951,22 @@ backend = "m6-file"
     )
     .unwrap();
 
-    let _origin_file_proc = TestProcess(
+    let mut _origin_file_proc = Service::spawn(
+        "origin m6-file",
         Command::new(binary("m6-file"))
             .arg(origin_site)
             .arg(origin_site.join("configs/m6-file.conf"))
-            .env("M6_SOCKET_OVERRIDE", &origin_sock)
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn origin m6-file"),
+            .env("M6_SOCKET_OVERRIDE", &origin_sock),
     );
-    assert!(wait_for_path(&origin_sock, Duration::from_secs(10)), "origin m6-file socket never appeared");
+    _origin_file_proc.wait_for_path(&origin_sock, Duration::from_secs(10));
 
-    let _origin_http_proc = TestProcess(
+    let mut _origin_http_proc = Service::spawn(
+        "origin m6-http",
         Command::new(binary("m6-http"))
             .arg(origin_site)
-            .arg(origin_site.join("system.toml"))
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn origin m6-http"),
+            .arg(origin_site.join("system.toml")),
     );
-    assert!(wait_for_tcp(origin_port, Duration::from_secs(10)), "origin m6-http never listened");
+    _origin_http_proc.wait_for_tcp(origin_port, Duration::from_secs(10));
     std::thread::sleep(Duration::from_millis(1500));
 
     // ── Edge: its only backend IS the origin's m6-http ─────────────────────
@@ -1035,7 +1012,8 @@ backend = "origin"
     )
     .unwrap();
 
-    let edge_port = free_port();
+    let edge_port_claim = claim_port();
+    let edge_port = edge_port_claim.port();
     std::fs::write(
         edge_site.join("system.toml"),
         format!(
@@ -1046,16 +1024,13 @@ backend = "origin"
     )
     .unwrap();
 
-    let _edge_http_proc = TestProcess(
+    let mut _edge_http_proc = Service::spawn(
+        "edge m6-http",
         Command::new(binary("m6-http"))
             .arg(edge_site)
-            .arg(edge_site.join("system.toml"))
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn edge m6-http"),
+            .arg(edge_site.join("system.toml")),
     );
-    assert!(wait_for_tcp(edge_port, Duration::from_secs(10)), "edge m6-http never listened");
+    _edge_http_proc.wait_for_tcp(edge_port, Duration::from_secs(10));
     std::thread::sleep(Duration::from_millis(1500));
 
     // ── The actual test: one request through the edge, no cookie yet ──────
