@@ -1096,10 +1096,32 @@ impl ThreadPool {
 /// in syscall-restart semantics, and ran the shutdown logic in signal context
 /// where almost nothing is legal. `m6-core` uses `sigwait` on a dedicated
 /// thread, so no code runs in signal context at all.
-pub fn install_signal_handler() {
-    // The returned handle is dropped: this crate reads the flag through the
-    // free function below, and the flag is process-global.
-    let _ = m6_core::signal::ShutdownHandle::install();
+/// Install shutdown for the app hosted by this framework.
+///
+/// The name comes from `argv[0]` because one binary is not one service here:
+/// `m6-html`, `render-contact` and `render-analytics` are three processes over
+/// the same loop, and a hardcoded name would make all three log as the wrong
+/// thing.
+///
+/// `socket` is what gives this loop the two behaviours it did not have. The
+/// self-connect returns the parked `accept()` at once, instead of the 100 ms
+/// poll timeout it relied on before; and the socket is unlinked on the way out,
+/// which no render app did. The only `remove_file` in this file used to be at
+/// startup, clearing a stale socket before `bind`, which is the workaround for
+/// the missing cleanup rather than the cleanup.
+fn install_shutdown(socket_path: &std::path::Path) -> m6_core::signal::ShutdownHandle {
+    let name = std::env::args()
+        .next()
+        .and_then(|a| {
+            std::path::Path::new(&a)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "m6-render".to_string());
+    m6_core::signal::ShutdownHandle::install(
+        m6_core::signal::Service::new(name).socket(socket_path),
+    )
 }
 
 #[inline]
@@ -1615,8 +1637,6 @@ fn run_app_with_shutdown(
     // Wrap on_shutdown for call at most once (accept loop is single-threaded).
     let mut on_shutdown_cell = on_shutdown;
 
-    install_signal_handler();
-
     // Bind socket.
     if socket_path.exists() {
         std::fs::remove_file(&socket_path).ok();
@@ -1629,13 +1649,17 @@ fn run_app_with_shutdown(
         std::process::exit(2);
     });
 
+    // After the bind, not before: the wake connects to this socket, so it has
+    // to exist by the time a signal can arrive.
+    let shutdown = install_shutdown(&socket_path);
+
     {
         let fs_r = fs.read().unwrap();
         info!(
             routes = fs_r.routes.len(),
             threads = tp_size,
             socket = %socket_path.display(),
-            "m6-render started"
+            "routes loaded"
         );
     }
 
@@ -1801,16 +1825,15 @@ fn run_app_with_shutdown(
         }
 
         if is_shutdown() {
-            info!("Shutdown signal received, draining...");
             pool.drain();
             if let Some(f) = on_shutdown_cell.take() {
                 f();
             }
-            info!("Clean shutdown");
             break;
         }
     }
 
+    shutdown.complete();
     Ok(())
 }
 

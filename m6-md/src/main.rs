@@ -278,7 +278,11 @@ fn run(args: Vec<String>) -> i32 {
     // static, set together and read only through the static. It also had no
     // second-signal exit, so it did not match what m6-decisions.md specifies
     // for all tools: first signal clean, second immediate.
-    let _shutdown = m6_core::signal::ShutdownHandle::install();
+    // No socket and no custom wake: m6-md watches the filesystem and parks in
+    // a channel recv, which the shutdown flag is re-checked around.
+    let shutdown = m6_core::signal::ShutdownHandle::install(
+        m6_core::signal::Service::new("m6-md"),
+    );
 
     let (tx, rx) = std::sync::mpsc::channel();
 
@@ -346,6 +350,7 @@ fn run(args: Vec<String>) -> i32 {
         }
     }
 
+    shutdown.complete();
     0
 }
 

@@ -68,9 +68,9 @@ fn spawn_server(id: &str) -> (Server, PathBuf) {
     }
     assert!(
         ready,
-        "m6-html at {} never answered a request\n--- stderr ---\n{}",
+        "m6-html at {} never answered a request\n--- output ---\n{}",
         socket_path.display(),
-        svc.stderr_text()
+        svc.output()
     );
 
     (Server { svc, _dir: dir }, socket_path)
@@ -168,9 +168,20 @@ fn l1_sigterm_exits_zero() {
     let status = guard.svc.terminate(Duration::from_secs(5));
     assert!(
         status.success(),
-        "m6-html should exit 0 on SIGTERM, got {status}\n--- stderr ---\n{}",
-        guard.svc.stderr_text()
+        "m6-html should exit 0 on SIGTERM, got {status}. A signal exit status means the \
+         process died at the default disposition instead of shutting down.\n\
+         --- output ---\n{}",
+        guard.svc.output()
     );
+    // One shutdown sequence in m6_core::signal means every service that owns a
+    // socket removes it on the way out. A socket left behind keeps a dead
+    // member in m6-http's backend pool until the next rescan.
+    assert!(
+        !socket_path.exists(),
+        "the socket at {} outlived the process",
+        socket_path.display()
+    );
+    m6_core::testkit::assert_lifecycle_logged("m6-html", &guard.svc.output());
 }
 
 // ---------------------------------------------------------------------------

@@ -162,8 +162,8 @@ impl Server {
         });
         assert!(
             ready,
-            "m6-http never served a backend request\n--- stderr ---\n{}",
-            self.http.borrow().stderr_text()
+            "m6-http never served a backend request\n--- output ---\n{}",
+            self.http.borrow().output()
         );
     }
 
@@ -188,6 +188,12 @@ impl Server {
 }
 
 fn start_server() -> Server {
+    // `warn`: this suite sends a lot of deliberately malformed traffic and an
+    // info-level log of all of it buries the failure that matters.
+    start_server_at_log_level("warn")
+}
+
+fn start_server_at_log_level(level: &str) -> Server {
     let dir = tempfile::tempdir().unwrap();
     let site = dir.path();
 
@@ -213,7 +219,7 @@ name   = "robustness"
 domain = "localhost"
 
 [log]
-level  = "warn"
+level  = "{level}"
 format = "text"
 
 [errors]
@@ -234,6 +240,7 @@ path    = "/public/{{relpath}}"
 backend = "m6-file"
 "#,
             sock_glob = sock_glob.display(),
+            level = level,
         ),
     )
     .unwrap();
@@ -831,7 +838,9 @@ fn conflicting_host_headers_are_not_both_honoured() {
 /// `install_with_hooks` now refuses to start without it.
 #[test]
 fn sigterm_shuts_down_rather_than_killing() {
-    let s = start_server();
+    // Info level: the lifecycle lines this asserts on are INFO, and the
+    // suite's usual `warn` fixture filters them out.
+    let s = start_server_at_log_level("info");
     s.assert_still_healthy("before shutdown");
 
     let status = s.http.borrow_mut().terminate(Duration::from_secs(5));
@@ -839,7 +848,8 @@ fn sigterm_shuts_down_rather_than_killing() {
         status.success(),
         "m6-http should exit 0 on SIGTERM, got {status}. A signal exit status here \
          means the process died at the default disposition instead of shutting down.\n\
-         --- stderr ---\n{}",
-        s.http.borrow().stderr_text()
+         --- output ---\n{}",
+        s.http.borrow().output()
     );
+    m6_core::testkit::assert_lifecycle_logged("m6-http", &s.http.borrow().output());
 }
