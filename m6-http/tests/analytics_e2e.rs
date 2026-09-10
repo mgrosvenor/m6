@@ -343,8 +343,8 @@ impl Server {
         });
         assert!(
             ready,
-            "m6-http never served a backend request\n--- stderr ---\n{}",
-            self.http.borrow().stderr_text()
+            "m6-http never served a backend request\n--- output ---\n{}",
+            self.http.borrow().output()
         );
         std::thread::sleep(Duration::from_millis(250));
         std::fs::write(&self.analytics_log, b"").expect("truncate analytics log");
@@ -787,8 +787,8 @@ name = "test-node"
     });
     assert!(
         ready,
-        "m6-http never served a backend request\n--- stderr ---\n{}",
-        _http_proc.stderr_text()
+        "m6-http never served a backend request\n--- output ---\n{}",
+        _http_proc.output()
     );
     std::thread::sleep(Duration::from_millis(250));
     std::fs::write(&analytics_log, b"").expect("truncate analytics log");
@@ -1092,8 +1092,8 @@ backend = "origin"
     assert!(
         ready,
         "the edge never served a request through to the origin\n         --- edge stderr ---\n{}\n--- origin stderr ---\n{}",
-        _edge_http_proc.stderr_text(),
-        _origin_http_proc.stderr_text()
+        _edge_http_proc.output(),
+        _origin_http_proc.output()
     );
     // The probes are logged like any other request, and this test counts lines.
     std::thread::sleep(Duration::from_millis(250));

@@ -45,6 +45,6 @@ pub mod wait;
 
 pub use paths::{binary, target_dir};
 pub use port::{claim_port, PortClaim};
-pub use process::Service;
+pub use process::{assert_lifecycle_logged, Service};
 pub use raw::RawConn;
 pub use wait::{for_path, for_tcp};

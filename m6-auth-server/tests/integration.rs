@@ -1,33 +1,12 @@
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::Command;
 use std::time::Duration;
 
-// ─── ProcessGuard ─────────────────────────────────────────────────────────────
-
-struct ProcessGuard(Child);
-
-impl Drop for ProcessGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
+use m6_core::testkit::{binary, wait, Service};
 
 // ─── Test fixtures ────────────────────────────────────────────────────────────
-
-fn binary_path() -> PathBuf {
-    let mut p = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_path_buf();
-    if p.ends_with("deps") {
-        p = p.parent().unwrap().to_path_buf();
-    }
-    p.join("m6-auth-server")
-}
 
 /// Generate an RSA key pair (2048-bit) for testing.
 /// Returns (private_pem, public_pem).
@@ -105,35 +84,35 @@ public_key  = "{}"
     // Create data directory
     std::fs::create_dir_all(site_dir.join("data")).unwrap();
 
-    // Socket path in temp dir
-    let socket_path = std::env::temp_dir()
-        .join("m6-test-sockets")
-        .join(format!("{}.sock", id));
-    std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
-    let _ = std::fs::remove_file(&socket_path);
+    // The socket lives in this test's own temp directory, not a shared one.
+    // It used to be `$TMPDIR/m6-test-sockets/<id>.sock`, a fixed path per test
+    // that setup deleted before spawning, so two runs at once meant a test
+    // unlinking a socket another live server was serving on.
+    let socket_path = temp.path().join(format!("{id}.sock"));
 
     TestEnv { _temp: temp, site_dir, config_path, socket_path, _key_dir: key_dir }
 }
 
-fn spawn_server(env: &TestEnv) -> ProcessGuard {
-    let binary = binary_path();
-    let child = Command::new(&binary)
-        .arg(&env.site_dir)
-        .arg(&env.config_path)
-        .env("M6_SOCKET_OVERRIDE", &env.socket_path)
-        .spawn()
-        .unwrap_or_else(|e| panic!("spawn {}: {}", binary.display(), e));
-
-    // Wait for socket to appear (up to 10s)
-    for _ in 0..200 {
-        if env.socket_path.exists() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    assert!(env.socket_path.exists(), "socket did not appear at {:?}", env.socket_path);
-
-    ProcessGuard(child)
+/// Spawn `m6-auth-server` and wait until it accepts a connection.
+///
+/// Readiness is a successful connect, not an existing path: `bind` creates the
+/// socket file and `listen` comes after, so the file appearing proves nothing.
+fn spawn_server(env: &TestEnv) -> Service {
+    let mut svc = Service::spawn(
+        "m6-auth-server",
+        Command::new(binary("m6-auth-server"))
+            .arg(&env.site_dir)
+            .arg(&env.config_path)
+            .env("M6_SOCKET_OVERRIDE", &env.socket_path),
+    );
+    svc.wait_for_path(&env.socket_path, Duration::from_secs(10));
+    assert!(
+        wait::for_unix(&env.socket_path, Duration::from_secs(10)),
+        "m6-auth-server created {} but never accepted a connection\n--- output ---\n{}",
+        env.socket_path.display(),
+        svc.output()
+    );
+    svc
 }
 
 /// Create a test user via the database before the server starts.
@@ -452,4 +431,36 @@ fn t10_next_external_url_falls_back_to_root() {
     assert_eq!(parse_status(&resp), 302, "expected 302\n{}", resp);
     let location = get_header(&resp, "Location").unwrap_or("");
     assert_eq!(location, "/", "external URL should fall back to /, got: {}", location);
+}
+
+// ─── Shutdown ─────────────────────────────────────────────────────────────────
+
+/// SIGTERM must run the shutdown path, not kill the process, and the socket
+/// must be gone afterwards.
+///
+/// One shutdown sequence lives in `m6_core::signal`, so this test is the same
+/// in every service that has one: m6-file, m6-html, m6-http and here. Before
+/// that unification this service had neither behaviour. It was killed by the
+/// signal, and it left its socket file behind for m6-http to keep in its
+/// backend pool.
+#[test]
+fn sigterm_shuts_down_and_removes_the_socket() {
+    let env = setup_test_env("shutdown");
+    let mut svc = spawn_server(&env);
+
+    let status = svc.terminate(Duration::from_secs(5));
+    assert!(
+        status.success(),
+        "m6-auth-server should exit 0 on SIGTERM, got {status}. A signal exit status \
+         means the process died at the default disposition instead of shutting down.\n\
+         --- output ---\n{}",
+        svc.output()
+    );
+    assert!(
+        !env.socket_path.exists(),
+        "the socket at {} outlived the process; m6-http would keep it in its \
+         backend pool until the next rescan",
+        env.socket_path.display()
+    );
+    m6_core::testkit::assert_lifecycle_logged("m6-auth-server", &svc.output());
 }

@@ -338,8 +338,8 @@ impl Server {
         });
         assert!(
             ready,
-            "m6-http never served a backend request\n--- stderr ---\n{}",
-            self.http.borrow().stderr_text()
+            "m6-http never served a backend request\n--- output ---\n{}",
+            self.http.borrow().output()
         );
     }
 

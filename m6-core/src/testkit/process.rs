@@ -7,16 +7,16 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-/// How much of a child's stderr to keep. The tail is what matters when
+/// How much of a child's output to keep. The tail is what matters when
 /// diagnosing a death, so once the buffer is full the oldest bytes go.
-const STDERR_CAP: usize = 256 * 1024;
+const OUTPUT_CAP: usize = 256 * 1024;
 
 /// How long a terminating child gets to exit on SIGTERM before SIGKILL.
 const TERM_GRACE: Duration = Duration::from_secs(1);
 
 /// A child service process, killed when this value drops.
 ///
-/// **The stderr drain is not a convenience.** Every suite that predates this
+/// **The output drain is not a convenience.** Every suite that predates this
 /// type spawned children with `Stdio::piped()` stderr and never read the pipe.
 /// That is two bugs at once. A child that logs more than one pipe buffer
 /// (64 KiB on Linux, 16 KiB on macOS) blocks in `write` and stops serving,
@@ -24,13 +24,18 @@ const TERM_GRACE: Duration = Duration::from_secs(1);
 /// when a child dies, everything it said about why is discarded with the pipe,
 /// so the test reports `ConnectionRefused` and the cause is unrecoverable.
 ///
-/// Here a thread drains stderr continuously into a bounded buffer, and every
+/// Here a thread per stream drains into one bounded buffer, and every
 /// assertion this type makes about the service prints that buffer on failure.
+///
+/// **Both streams, because m6 services log to stdout.** `m6_core::log` builds
+/// its writer over `std::io::stdout()`. An earlier version of this type piped
+/// stderr and nulled stdout, which threw away every log line the services
+/// produce; the tests that assert on a service's own output caught it.
 pub struct Service {
     name: String,
     child: Option<Child>,
-    stderr: Arc<Mutex<Vec<u8>>>,
-    drain: Option<JoinHandle<()>>,
+    output: Arc<Mutex<Vec<u8>>>,
+    drains: Vec<JoinHandle<()>>,
 }
 
 impl Service {
@@ -41,20 +46,19 @@ impl Service {
     pub fn spawn(name: &str, cmd: &mut Command) -> Service {
         let mut child = cmd
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap_or_else(|e| panic!("spawn {name}: {e}"));
 
-        let stderr = Arc::new(Mutex::new(Vec::new()));
-        let pipe = child.stderr.take().expect("stderr was piped");
-        let sink = Arc::clone(&stderr);
-        let drain = std::thread::Builder::new()
-            .name(format!("{name}-stderr"))
-            .spawn(move || drain_stderr(pipe, sink))
-            .expect("spawn stderr drain");
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let mut drains = Vec::with_capacity(2);
+        let out = child.stdout.take().expect("stdout was piped");
+        drains.push(spawn_drain(name, "stdout", out, Arc::clone(&output)));
+        let err = child.stderr.take().expect("stderr was piped");
+        drains.push(spawn_drain(name, "stderr", err, Arc::clone(&output)));
 
-        Service { name: name.to_string(), child: Some(child), stderr, drain: Some(drain) }
+        Service { name: name.to_string(), child: Some(child), output, drains }
     }
 
     /// The child's process id.
@@ -96,18 +100,18 @@ impl Service {
                 let pid = child.id();
                 panic!(
                     "{} (pid {pid}) did not exit within {timeout:?} of SIGTERM\n\
-                     --- stderr ---\n{}",
+                     --- output ---\n{}",
                     self.name,
-                    tail(&self.stderr_text(), 40)
+                    tail(&self.output(), 40)
                 );
             }
             std::thread::sleep(Duration::from_millis(10));
         }
     }
 
-    /// Everything the child has written to stderr so far.
-    pub fn stderr_text(&self) -> String {
-        let buf = self.stderr.lock().unwrap_or_else(|e| e.into_inner());
+    /// Everything the child has written to stdout and stderr so far.
+    pub fn output(&self) -> String {
+        let buf = self.output.lock().unwrap_or_else(|e| e.into_inner());
         String::from_utf8_lossy(&buf).into_owned()
     }
 
@@ -137,9 +141,9 @@ impl Service {
             }
             if Instant::now() >= deadline {
                 panic!(
-                    "{} never listened on port {port} within {timeout:?}\n--- stderr ---\n{}",
+                    "{} never listened on port {port} within {timeout:?}\n--- output ---\n{}",
                     self.name,
-                    tail(&self.stderr_text(), 40)
+                    tail(&self.output(), 40)
                 );
             }
         }
@@ -165,10 +169,10 @@ impl Service {
             }
             if Instant::now() >= deadline {
                 panic!(
-                    "{} never created {} within {timeout:?}\n--- stderr ---\n{}",
+                    "{} never created {} within {timeout:?}\n--- output ---\n{}",
                     self.name,
                     path.display(),
-                    tail(&self.stderr_text(), 40)
+                    tail(&self.output(), 40)
                 );
             }
             std::thread::sleep(Duration::from_millis(25));
@@ -177,9 +181,9 @@ impl Service {
 
     fn death_report(&self, context: &str, status: ExitStatus) -> String {
         format!(
-            "{} exited while {context}: {status}\n--- stderr ---\n{}",
+            "{} exited while {context}: {status}\n--- output ---\n{}",
             self.name,
-            tail(&self.stderr_text(), 40)
+            tail(&self.output(), 40)
         )
     }
 }
@@ -202,30 +206,40 @@ impl Drop for Service {
             }
             let _ = child.wait();
         }
-        // The child is gone, so its end of the pipe is closed and the drain
-        // thread's read returns 0. Joining here keeps the thread from
-        // outliving the buffer it writes into.
-        if let Some(h) = self.drain.take() {
+        // The child is gone, so its ends of the pipes are closed and each
+        // drain thread's read returns 0. Joining here keeps them from
+        // outliving the buffer they write into.
+        for h in self.drains.drain(..) {
             let _ = h.join();
         }
     }
 }
 
-fn drain_stderr(mut pipe: std::process::ChildStderr, sink: Arc<Mutex<Vec<u8>>>) {
-    let mut buf = [0u8; 8192];
-    loop {
-        match pipe.read(&mut buf) {
-            Ok(0) | Err(_) => return,
-            Ok(n) => {
-                let mut out = sink.lock().unwrap_or_else(|e| e.into_inner());
-                out.extend_from_slice(&buf[..n]);
-                if out.len() > STDERR_CAP {
-                    let excess = out.len() - STDERR_CAP;
-                    out.drain(..excess);
+fn spawn_drain(
+    name: &str,
+    stream: &str,
+    mut pipe: impl Read + Send + 'static,
+    sink: Arc<Mutex<Vec<u8>>>,
+) -> JoinHandle<()> {
+    std::thread::Builder::new()
+        .name(format!("{name}-{stream}"))
+        .spawn(move || {
+            let mut buf = [0u8; 8192];
+            loop {
+                match pipe.read(&mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => {
+                        let mut out = sink.lock().unwrap_or_else(|e| e.into_inner());
+                        out.extend_from_slice(&buf[..n]);
+                        if out.len() > OUTPUT_CAP {
+                            let excess = out.len() - OUTPUT_CAP;
+                            out.drain(..excess);
+                        }
+                    }
                 }
             }
-        }
-    }
+        })
+        .expect("spawn output drain")
 }
 
 /// The last `n` lines of `s`, for a panic message that stays readable.
@@ -236,5 +250,29 @@ fn tail(s: &str, n: usize) -> String {
         s.to_string()
     } else {
         format!("({} earlier lines omitted)\n{}", start, lines[start..].join("\n"))
+    }
+}
+
+/// Assert a service logged the lifecycle lines `m6_core::signal` emits for
+/// every service.
+///
+/// The lines are core's, not the app's, so this is the same assertion
+/// everywhere and it is the guard against them drifting apart again. Startup
+/// and shutdown used to be logged unevenly: two of five services said
+/// "starting" and never "started", `m6-md` said nothing at all, and all three
+/// render apps logged `m6-render` rather than their own name.
+///
+/// `output` is [`Service::output`]; `name` is the service's own name, so a
+/// test also catches a service logging under the wrong one.
+pub fn assert_lifecycle_logged(name: &str, output: &str) {
+    for expected in [
+        format!("{name} started"),
+        format!("{name} shutdown signal received"),
+        format!("{name} shutdown complete"),
+    ] {
+        assert!(
+            output.contains(&expected),
+            "{name} never logged {expected:?}\n--- output ---\n{output}"
+        );
     }
 }
