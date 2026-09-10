@@ -10,61 +10,12 @@ pub enum Encoding {
 
 /// The q-value a client assigned to one content-coding (RFC 9110 12.5.3).
 ///
-/// Returns `None` when the coding is not acceptable at all, otherwise its
-/// quality between 0.0 (exclusive) and 1.0.
-///
-/// **This replaced `accept_encoding.contains("br")`, which was wrong in a way
-/// that mattered.** `contains` finds the substring anywhere, so
-/// `Accept-Encoding: gzip, br;q=0` -- a client explicitly refusing brotli --
-/// still matched, and the response went out brotli-encoded to a client that
-/// said it could not accept it. `q=0` means "not acceptable" (RFC 9110
-/// 12.4.2), not "least preferred". It also ignored preference entirely:
-/// `gzip;q=1.0, br;q=0.1` picked brotli because `br` was tested first.
-///
-/// Rules implemented here:
-/// - a bare token defaults to `q=1`
-/// - `q=0` means unacceptable
-/// - `*` supplies the q-value for any coding not named explicitly
-/// - an explicitly named coding always beats `*`, whichever way it goes
-/// - `identity` is acceptable unless refused by name or by `*;q=0`
-fn coding_quality(accept_encoding: &str, coding: &str) -> Option<f32> {
-    let mut wildcard: Option<f32> = None;
-    let mut explicit: Option<f32> = None;
-
-    for part in accept_encoding.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        let mut bits = part.split(';');
-        let name = bits.next().unwrap_or("").trim();
-        let mut q: f32 = 1.0;
-        for param in bits {
-            let param = param.trim();
-            if let Some(v) = param.strip_prefix("q=").or_else(|| param.strip_prefix("Q=")) {
-                // An unparseable q is treated as 1, per the general rule that a
-                // malformed parameter is ignored rather than made fatal.
-                q = v.trim().parse::<f32>().unwrap_or(1.0);
-            }
-        }
-        if name == "*" {
-            wildcard = Some(q);
-        } else if name.eq_ignore_ascii_case(coding) {
-            explicit = Some(q);
-        }
-    }
-
-    let q = match (explicit, wildcard) {
-        (Some(q), _) => q,
-        (None, Some(q)) => q,
-        // Not mentioned at all. identity is acceptable by default; a coding we
-        // would have to apply is not.
-        (None, None) => {
-            if coding.eq_ignore_ascii_case("identity") { 1.0 } else { return None }
-        }
-    };
-    if q > 0.0 { Some(q) } else { None }
-}
+/// Re-exported from `m6-core`, which is now the single implementation. It was
+/// written here first, to replace `accept_encoding.contains("br")`; m6-render
+/// carried the unfixed substring version for months afterwards because the
+/// rules lived in this crate rather than a shared one. Moving it removed that
+/// second copy. See `m6_core::negotiate` for the reasoning and the tests.
+use m6_core::coding_quality;
 
 /// Decide which encoding to use for a given MIME type and Accept-Encoding header.
 ///
