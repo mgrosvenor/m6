@@ -186,11 +186,20 @@ Two suites also had a shared-socket-path hazard: `m6-file` and `m6-html` put
 their sockets at a fixed `$TMPDIR/<id>.sock` and deleted whatever was there
 before spawning, so one run could unlink a socket a live server was using.
 
-**Gate:** full suite green, run **at least ten consecutive times**, because
-this phase exists partly to fix an intermittent failure and a single green run
-proves nothing. Plus `check.sh` on the Linux build box, which caught a
-Phase 1b leftover: `poller.rs` still referenced the removed `sigmask` in its
-`cfg(linux)` arm, so the tree did not compile on Linux at all.
+**Gate: MET.** Full suite green **10/10 consecutive runs** on `094965b`, plus
+`check.sh` on the Linux build box (build and full suite). Ten runs rather than
+one because this phase exists partly to fix an intermittent failure and a
+single green run proves nothing.
+
+The Linux box earned its place in the gate twice. It caught a Phase 1b
+leftover, `poller.rs` still referencing the removed `sigmask` in its
+`cfg(linux)` arm, so the tree did not compile on Linux at all. Then it caught
+two readiness defects that macOS could not: see the follow-up commit below.
+
+**Do not run the gate against a tree you are still editing.** A first attempt
+scored 4/10 because runs 5 through 10 compiled a working tree that was being
+changed underneath them. Those failures were the harness, not the code, and it
+took a moment to be sure of that. Finish, then gate.
 
 **Risk:** low for production, moderate for the suite. **Rollback:** the old
 helpers stay until the last file is migrated.
@@ -204,6 +213,45 @@ assertion set needs exactly this harness.
 
 Version-independent rules. Moves without touching any wire format.
 
+**3.0 `HeaderSource` and `header()` → `m6-core::http`. Do this first.** Both
+3.1 and 3.2 depend on it, and `Phase 1` deferred it. It lives in
+`m6-http/src/analytics.rs` today, which is the wrong home for a general HTTP
+abstraction.
+
+**There is an orphan-rule cost, and it is worth knowing before starting.**
+`HeaderSource` has impls for `[quiche::h3::Header]` and
+`Vec<quiche::h3::Header>`. Once the trait is in `m6-core`, those become
+`impl ForeignTrait for ForeignType` in `m6-http`, which Rust forbids, and
+`quiche` must not become an `m6-core` dependency because that would undo the
+decision that h2 and h3 stay in `m6-http`. The fix is one newtype in
+`m6-http` wrapping the quiche slice, and it touches six production call sites
+(`main.rs` 1318, 1342, 1385, 1933 and two more) plus four in tests. Small,
+mechanical, but it is not zero and it is invisible until the compiler says so.
+
+The alternative considered and rejected: have core's precondition function take
+a lookup closure instead of a trait, dodging the orphan rule with less code.
+Rejected because it leaves every consumer writing its own lookup, and `m6-file`
+— the crate whose defect this phase exists to fix — would get nothing shared.
+
+**There are four header parsers and four conventions**, which is the real
+duplication behind Phase 1's one-line "case-insensitive header lookup" entry:
+
+| crate | parser | name case at rest | lookup |
+|---|---|---|---|
+| `m6-core` | `parse.rs:104` | as sent | `RawRequest::header`, lowercases both sides, allocates per header scanned |
+| `m6-file` | `http.rs:45` | lowercased | `k == "if-none-match"` |
+| `m6-render` | `server.rs:47` | lowercased | `k == name` |
+| `m6-http` | h1/h2/h3 | as sent | `eq_ignore_ascii_case`, no allocation |
+
+`m6-file` and `m6-render` are correct at runtime because they normalise once at
+parse. The hazard is that `k == "literal"` is sound only under an invariant
+established in a different file and invisible at the call site: hand either one
+a `RawRequest` from `m6-core`'s parser and every conditional-request header
+silently stops matching. The allocating lookup is **not** a live latency
+problem — `m6_core::http::RawRequest` reaches production only through
+`m6_core::server::UnixServer`, whose sole consumer is `m6-auth-server`, which
+is not in the fleet.
+
 **3.1 `validate_request_header_bytes` → `m6-core`.** Currently in `http2.rs`,
 imported by the H3 path. This is the single symbol h2 and h3 share; once it is
 in core they keep sharing it with neither wire format moving.
@@ -213,9 +261,42 @@ in core they keep sharing it with neither wire format moving.
 `m6-file`**, which has its own inline version missing weak comparison and two
 of the four precedence steps.
 
-This one has a live defect to prove the move worked. Confirmed on production:
-`If-None-Match: W/"6a9c8db4-155f1"` against `/assets/css/style.css?v=…`
-returns **200 with 46,775 bytes** where RFC 9110 8.8.3.2 requires 304.
+This one has a live defect to prove the move worked, and its shape matters.
+Verified 2026-09-11 against the release binary in isolation, no production
+involved:
+
+| RFC 9110 13.2.2 step | `m6-file` | correct? |
+|---|---|---|
+| 1. `If-Match: "nope"` | 200 | ✗ 412 — not implemented |
+| 2. `If-Unmodified-Since: <past>` | 200 | ✗ 412 — not implemented |
+| 3. `If-None-Match: "<etag>"` | 304 | ✓ |
+| 3. `If-None-Match: W/"<etag>"` | **200** | ✗ 304 — strong comparison |
+| 3. `If-None-Match: *` | 304 | ✓ |
+| 4. `If-Modified-Since` | 304/200 correctly | ✓ |
+
+One line is responsible, `m6-file/src/handler.rs:183`:
+`inm == "*" || inm.split(',').any(|tag| tag.trim() == etag)`. Byte equality is
+*strong* comparison; `If-None-Match` requires weak (RFC 9110 8.8.3.2).
+
+**On the wire the symptom is intermittent, and that is the trap.** `m6-http`'s
+own implementation is correct and already deployed (`134c50c`, with
+`etag_weak_eq` and the full four-step precedence), so:
+
+| path | who answers | weak `If-None-Match` |
+|---|---|---|
+| cache **hit** | `m6-http::evaluate_preconditions` | 304, correct |
+| cache **miss** | `m6-file`, strict comparison | 200, wrong |
+
+Both were observed on production within minutes of each other, 200 then 304
+once the entry warmed (`age: 66`). A symptom that comes and goes with cache
+state is exactly what gets written off as noise.
+
+**So the gate must be measured on a cold cache key**, or it passes against
+unfixed code. One trap in doing that: forcing a miss by varying
+`Accept-Encoding` changes which *variant* is served, and `m6-file` appends
+`-br`/`-gz` to the ETag per variant, so the client's identity ETag then
+legitimately does not match and 200 is correct. Compare against the ETag for
+the variant the request will actually receive.
 
 **3.3 Caching semantics → `m6-core`.** Storability, freshness, age, request and
 response directives. The *rules*. Cache storage and eviction stay in `m6-http`.
@@ -364,7 +445,7 @@ worth knowing.
 | 0 Prerequisites | no | none | everything | done |
 | 1 Small consolidations | no | low | — | done, `3780834` |
 | 2 Testkit | no | low | 3, 4, 5, 8 | done, `3b9b895` |
-| 3 Semantics | no (fixes one bug) | moderate | 4 | next |
+| 3 Semantics | no (fixes one bug) | moderate | 4 | in progress |
 | 4 HTTP/1.1 | yes | moderate-high | 5 | |
 | 5 Service loop | no | high (size) | 6 | |
 | 6 Consumer apps | no | low | 7, 8 | |
