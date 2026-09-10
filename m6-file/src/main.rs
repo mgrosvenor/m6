@@ -12,7 +12,7 @@ use route::Route;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, RwLock};
 use tracing::{debug, error, info, warn};
 
@@ -167,13 +167,21 @@ fn run() -> i32 {
 
     info!(socket = %socket_path.display(), "listening on Unix socket");
 
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let signal_count = Arc::new(AtomicUsize::new(0));
-
-    setup_signal_handlers(
-        Arc::clone(&shutdown),
-        Arc::clone(&signal_count),
-        socket_path.clone(),
+    // Signal handling lives in m6-core. This crate's version was the best of
+    // the four in the workspace -- sigwait on a dedicated thread rather than a
+    // signal handler, plus a self-connect to wake the blocked accept() -- so
+    // core adopted that design rather than the reverse.
+    let wake_path = socket_path.clone();
+    let unlink_path = socket_path.clone();
+    let shutdown = m6_core::signal::ShutdownHandle::install_with_hooks(
+        move || {
+            // Unblock the accept() loop; it re-checks the flag on wake.
+            let _ = std::os::unix::net::UnixStream::connect(&wake_path);
+        },
+        move || {
+            // A socket left behind keeps a dead member in m6-http's pool.
+            let _ = std::fs::remove_file(&unlink_path);
+        },
     );
 
     let pool_size = config
@@ -240,7 +248,7 @@ fn run() -> i32 {
 
     // ── poll(2) accept + hot-reload loop ─────────────────────────────────
     loop {
-        if shutdown.load(Ordering::Relaxed) {
+        if shutdown.is_shutdown() {
             break;
         }
 
@@ -282,7 +290,7 @@ fn run() -> i32 {
         match poll_result {
             Ok(0) | Err(_) => {
                 // Timeout or interrupted — check shutdown flag.
-                if shutdown.load(Ordering::Relaxed) {
+                if shutdown.is_shutdown() {
                     break;
                 }
                 // Mtime fallback: check every ~10 timeouts (≈1 s) when no watcher fd.
@@ -343,7 +351,7 @@ fn run() -> i32 {
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(e) => {
-                    if shutdown.load(Ordering::Relaxed) {
+                    if shutdown.is_shutdown() {
                         break;
                     }
                     error!(error = %e, "accept error");
@@ -352,7 +360,7 @@ fn run() -> i32 {
             }
         }
 
-        if shutdown.load(Ordering::Relaxed) {
+        if shutdown.is_shutdown() {
             break;
         }
     }
@@ -428,40 +436,6 @@ fn handle_connection(
 // Signal handling
 // ---------------------------------------------------------------------------
 
-fn setup_signal_handlers(
-    shutdown: Arc<AtomicBool>,
-    signal_count: Arc<AtomicUsize>,
-    socket_path: PathBuf,
-) {
-    use nix::sys::signal::{SigSet, Signal};
-
-    let mut mask = SigSet::empty();
-    mask.add(Signal::SIGTERM);
-    mask.add(Signal::SIGINT);
-    let _ = mask.thread_block();
-
-    std::thread::spawn(move || {
-        let mut sig_mask = SigSet::empty();
-        sig_mask.add(Signal::SIGTERM);
-        sig_mask.add(Signal::SIGINT);
-        let _ = sig_mask.thread_block();
-
-        loop {
-            match sig_mask.wait() {
-                Ok(_sig) => {
-                    let count = signal_count.fetch_add(1, Ordering::SeqCst) + 1;
-                    if count >= 2 {
-                        let _ = std::fs::remove_file(&socket_path);
-                        std::process::exit(0);
-                    }
-                    shutdown.store(true, Ordering::SeqCst);
-                    let _ = std::os::unix::net::UnixStream::connect(&socket_path);
-                }
-                Err(_) => break,
-            }
-        }
-    });
-}
 
 // ---------------------------------------------------------------------------
 // Helpers

@@ -42,7 +42,7 @@ use m6_http_lib::stats::{Channel, Iface, Version as HttpVersion};
 use m6_http_lib::h2c_client::H2cClientPool;
 use m6_http_lib::h2s_client::H2sTlsClientPool;
 use m6_http_lib::pool::{self, PoolManager};
-use m6_http_lib::poller::{Poller, Token};
+use m6_http_lib::poller::{Poller, Token, WakeReader, WakeWriter};
 use m6_http_lib::router::{self, RouteTable};
 use m6_http_lib::watcher::{FsEvent, FsEventKind, FsWatcher};
 use m6_http_lib::auth::PublicKey;
@@ -57,12 +57,11 @@ const TOKEN_TCP: Token = Token(2);
 const TOKEN_H2C: Token = Token(3);
 const TOKEN_H2C_CLIENT: Token = Token(4);
 const TOKEN_H2S_CLIENT: Token = Token(5);
+const TOKEN_WAKE: Token = Token(6);
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
 // ── Shutdown flags ───────────────────────────────────────────────────────────
 
-static SHUTDOWN: AtomicBool = AtomicBool::new(false);
-static SHUTDOWN_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 // ── Per-connection state ──────────────────────────────────────────────────────
 
@@ -202,21 +201,23 @@ impl ServerState {
 }
 
 // ── Signal handling ───────────────────────────────────────────────────────────
+//
+// One mechanism, shared with every other m6 service: `m6-core` blocks the
+// signals and waits for them on a dedicated thread, so nothing runs in signal
+// context.
+//
+// The epoll loop still needs waking. It used to get that from `epoll_pwait`
+// with a signal mask, which closes the window between checking the shutdown
+// flag and sleeping -- but only on Linux, because the kqueue path ignores the
+// mask entirely, so the race it was meant to close was still open on macOS.
+//
+// A self-pipe registered with the poller does the same job on every platform:
+// the shutdown hook writes one byte, the next `wait()` returns immediately
+// whatever timeout it was given, and the loop re-checks the flag. Two file
+// descriptors, created once.
 
-extern "C" fn handle_signal(_: libc::c_int) {
-    let count = SHUTDOWN_COUNT.fetch_add(1, Ordering::SeqCst);
-    if count >= 1 {
-        std::process::exit(1); // second signal = immediate exit
-    }
-    SHUTDOWN.store(true, Ordering::SeqCst);
-}
-
-fn setup_signals() {
-    use nix::sys::signal::{signal, SigHandler, Signal};
-    unsafe {
-        let _ = signal(Signal::SIGTERM, SigHandler::Handler(handle_signal));
-        let _ = signal(Signal::SIGINT, SigHandler::Handler(handle_signal));
-    }
+fn setup_signals(wake: WakeWriter) -> m6_core::signal::ShutdownHandle {
+    m6_core::signal::ShutdownHandle::install_with_wake(move || wake.wake())
 }
 
 // ── quiche TLS/QUIC config ────────────────────────────────────────────────────
@@ -270,6 +271,7 @@ fn event_loop(
     state: &mut ServerState,
     quiche_config: &mut quiche::Config,
     log_handle: &m6_core::log::LogHandle,
+    wake_reader: WakeReader,
 ) -> i32 {
     let poller = match Poller::new() {
         Ok(p) => p,
@@ -295,23 +297,13 @@ fn event_loop(
         }
     }
 
-    // On Linux: block SIGTERM/SIGINT at thread level so epoll_pwait delivers
-    // them atomically, eliminating the TOCTOU race between checking SHUTDOWN
-    // and sleeping in epoll_wait.
-    #[cfg(target_os = "linux")]
-    let sigmask_unblocked: libc::sigset_t = {
-        let mut unblocked: libc::sigset_t = unsafe { std::mem::zeroed() };
-        unsafe { libc::sigemptyset(&mut unblocked) };
-        // Block SIGTERM and SIGINT at thread level
-        let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
-        unsafe {
-            libc::sigemptyset(&mut mask);
-            libc::sigaddset(&mut mask, libc::SIGTERM);
-            libc::sigaddset(&mut mask, libc::SIGINT);
-            libc::pthread_sigmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut());
-        }
-        unblocked
-    };
+    // Wake pipe: the shutdown hook writes to it so a blocked `wait()` returns
+    // at once. Created in `run` before signals were installed, so the first
+    // signal could never arrive with nowhere to write.
+    if let Err(e) = poller.add(wake_reader.as_raw_fd(), TOKEN_WAKE) {
+        error!(error = %e, "registering the shutdown wake pipe");
+        return 1;
+    }
 
     // Port for Alt-Svc advertisement: same port for both QUIC/H3 (UDP) and TCP.
     let quic_port = udp.local_addr().map(|a| a.port()).unwrap_or(8443);
@@ -355,16 +347,7 @@ fn event_loop(
             .unwrap_or(100)
             .min(10);
 
-        #[cfg(target_os = "linux")]
-        let n = match poller.wait(&mut ev_buf, timeout_ms, Some(&sigmask_unblocked)) {
-            Ok(n) => n,
-            Err(e) => {
-                error!(error = %e, "poller error");
-                return 1;
-            }
-        };
-        #[cfg(not(target_os = "linux"))]
-        let n = match poller.wait(&mut ev_buf, timeout_ms, None) {
+        let n = match poller.wait(&mut ev_buf, timeout_ms) {
             Ok(n) => n,
             Err(e) => {
                 error!(error = %e, "poller error");
@@ -372,13 +355,19 @@ fn event_loop(
             }
         };
 
-        if SHUTDOWN.load(Ordering::Relaxed) {
+        if m6_core::signal::is_shutdown() {
             info!("shutdown signal received");
             break;
         }
 
         for i in 0..n {
             match ev_buf[i] {
+                // Shutdown poke. Drained so one byte cannot spin the loop; the
+                // flag was already checked above, so there is nothing else to
+                // do here.
+                TOKEN_WAKE => {
+                    wake_reader.drain();
+                }
                 TOKEN_UDP => {
                     drain_udp(
                         &udp,
@@ -3273,8 +3262,16 @@ fn run(args: Vec<String>) -> i32 {
         return 2;
     }
 
-    // Setup signals
-    setup_signals();
+    // Wake pipe first, then signals: the shutdown hook needs somewhere to
+    // write before a signal can arrive.
+    let (wake_reader, wake_writer) = match Poller::wake_pipe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("wake pipe init failed: {e}");
+            return 2;
+        }
+    };
+    let _shutdown = setup_signals(wake_writer);
 
     // Setup filesystem watcher
     let watcher = match FsWatcher::new(&config) {
@@ -3363,7 +3360,7 @@ fn run(args: Vec<String>) -> i32 {
         started: std::time::Instant::now(),
     };
 
-    event_loop(udp, tcp_listener, h2c_listener, watcher, &mut state, &mut quiche_config, &log_handle)
+    event_loop(udp, tcp_listener, h2c_listener, watcher, &mut state, &mut quiche_config, &log_handle, wake_reader)
 }
 
 #[cfg(test)]
