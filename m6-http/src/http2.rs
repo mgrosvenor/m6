@@ -100,6 +100,17 @@ const ERR_REFUSED_STREAM: u32 = 0x7;
 const ERR_FRAME_SIZE:     u32 = 0x6;
 const ERR_FLOW_CONTROL:   u32 = 0x3;
 const ERR_ENHANCE_YOUR_CALM: u32 = 0xb;
+const ERR_COMPRESSION:    u32 = 0x9;
+
+/// The HPACK dynamic table size a peer's encoder may assume for our decoder.
+///
+/// RFC 9113 6.5.2 puts SETTINGS_HEADER_TABLE_SIZE's default at 4096, and
+/// `send_server_settings` deliberately does not send that setting, so the
+/// default is what we are advertising. A dynamic table size update above this
+/// is a decoding error (RFC 7541 6.3), which makes it a COMPRESSION_ERROR and
+/// a *connection* error: the dynamic table is shared by every stream, so a
+/// block that desynchronises it poisons all later blocks too.
+const HPACK_MAX_TABLE_SIZE: usize = 4096;
 
 /// How many recently-reset stream ids to remember. See `recently_reset`.
 const RESET_MEMORY: usize = 128;
@@ -336,6 +347,27 @@ impl Http2Conn {
                         Ok(0)  => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "closed")),
                         Ok(_)  => { tls.process_new_packets().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?; }
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        // rustls caps its incoming-plaintext buffer at a fixed
+                        // 16 KiB and refuses to pull more ciphertext until the
+                        // caller drains it via reader(). That is backpressure,
+                        // not a failure, and it trips on any request body of
+                        // 2^14 bytes or more -- including a DATA frame at
+                        // exactly the SETTINGS_MAX_FRAME_SIZE we advertise,
+                        // which RFC 9113 4.2 requires us to accept.
+                        //
+                        // Treating it as an error closed the connection with no
+                        // GOAWAY, so a 16 KiB upload died mid-flight and the
+                        // peer could not tell why. `advance_tls` in http11.rs
+                        // has handled this since H1 hit the same wall; the fix
+                        // was never ported here.
+                        //
+                        // Stop pumping ciphertext for this round exactly like
+                        // WouldBlock: the drain loop below empties the reader,
+                        // and the next (level-triggered) poller wakeup resumes,
+                        // because the rest of the record is still in the kernel
+                        // socket buffer.
+                        Err(e) if e.kind() == io::ErrorKind::Other
+                            && e.to_string().contains("received plaintext buffer full") => break,
                         Err(e) => return Err(e),
                     }
                 }
@@ -768,7 +800,26 @@ impl Http2Conn {
             let id  = u16::from_be_bytes(payload[i..i+2].try_into().unwrap());
             let val = u32::from_be_bytes(payload[i+2..i+6].try_into().unwrap());
             match id {
-                SETTING_HEADER_TABLE_SIZE => { self.hpack_dec.set_max_table_size(val as usize); }
+                // RFC 9113 6.5.2: SETTINGS_HEADER_TABLE_SIZE tells us the size
+                // the PEER's decoder will accept, so it bounds OUR ENCODER, not
+                // our decoder.
+                //
+                // m6 applied the peer's value straight to its own decoder, and
+                // `val` is an unbounded u32. A client could send
+                // SETTINGS_HEADER_TABLE_SIZE = 0xFFFFFFFF and m6 would size its
+                // own dynamic table cap at 4 GiB, then fill it with indexed
+                // literals across many header blocks -- the table lives for the
+                // whole connection, so MAX_HEADER_BLOCK's per-block cap does not
+                // bound the total. That is an out-of-memory vector, and it costs
+                // an attacker one SETTINGS frame.
+                //
+                // Clamp to what we actually advertise. A peer asking for LESS is
+                // still honoured, because that only ever reduces our footprint.
+                // (`hpack::Encoder` exposes no table-size control at all, so the
+                // encoder side of this setting cannot be applied either way.)
+                SETTING_HEADER_TABLE_SIZE => {
+                    self.hpack_dec.set_max_table_size((val as usize).min(HPACK_MAX_TABLE_SIZE));
+                }
                 SETTING_ENABLE_PUSH       => {
                     if val > 1 { return Err("invalid ENABLE_PUSH"); }
                     self.enable_push = val == 1;
@@ -914,6 +965,7 @@ impl Http2Conn {
             combined.extend_from_slice(header_block);
             self.header_block_buf.clear();
             self.continuation_stream_id = None;
+            self.check_hpack_block(&combined)?;
             let dec = &mut self.hpack_dec;
             let stream = self.streams.get_mut(&stream_id).unwrap();
             // A second complete header block on a stream is a TRAILER section
@@ -924,6 +976,25 @@ impl Http2Conn {
             let mut block = Vec::new();
             decode_hpack(dec, &combined, &mut block)?;
             if is_trailers {
+                // RFC 9113 8.1: a request is "a single HEADERS frame, followed
+                // by zero or more CONTINUATION, optionally followed by DATA,
+                // optionally followed by a trailer section" -- and the trailer
+                // section is what ENDS the stream. A second HEADERS without
+                // END_STREAM is therefore neither trailers nor a second
+                // request; it is malformed.
+                //
+                // m6 used to decode it and wait for an END_STREAM that a
+                // conforming peer will never send, so the stream sat open until
+                // the idle timeout and h2spec saw a plain timeout. The block is
+                // still decoded above before we get here, deliberately: the
+                // HPACK dynamic table is connection-wide, so skipping a block
+                // would desynchronise every later one on a healthy stream.
+                if flags & FLAG_END_STREAM == 0 {
+                    tracing::debug!(stream_id, "h2: second HEADERS frame without END_STREAM");
+                    self.push_frame(TYPE_RST_STREAM, 0, stream_id, &ERR_PROTOCOL_ERROR.to_be_bytes());
+                    self.streams.remove(&stream_id);
+                    return Ok(());
+                }
                 if let Some((name, _)) = block.iter().find(|(k, _)| k.starts_with(':')) {
                     tracing::debug!(stream_id, field = %name, "h2: pseudo-header in trailers");
                     self.push_frame(TYPE_RST_STREAM, 0, stream_id, &ERR_PROTOCOL_ERROR.to_be_bytes());
@@ -968,6 +1039,7 @@ impl Http2Conn {
             self.continuation_stream_id = None;
             let all = self.header_block_buf.clone();
             self.header_block_buf.clear();
+            self.check_hpack_block(&all)?;
             if let Some(stream) = self.streams.get_mut(&stream_id) {
                 let dec = &mut self.hpack_dec;
                 // Can't call decode_hpack with self.hpack_dec while stream borrowed.
@@ -1448,6 +1520,22 @@ impl Http2Conn {
         self.push_frame(TYPE_SETTINGS, 0, 0, &p);
     }
 
+    /// Reject a header block whose dynamic table size updates are illegal,
+    /// before it reaches the decoder and mutates the shared table.
+    ///
+    /// COMPRESSION_ERROR and a connection error, per RFC 9113 4.3: HPACK state
+    /// spans the whole connection, so there is no such thing as recovering one
+    /// stream from it.
+    fn check_hpack_block(&mut self, block: &[u8]) -> Result<(), &'static str> {
+        if let Err(why) = validate_hpack_block(block, HPACK_MAX_TABLE_SIZE) {
+            tracing::debug!(reason = why, "h2: HPACK block rejected");
+            self.send_goaway(ERR_COMPRESSION);
+            self.phase = Phase::GoingAway;
+            return Err(why);
+        }
+        Ok(())
+    }
+
     fn send_goaway(&mut self, code: u32) {
         let mut p = [0u8; 8];
         p[0..4].copy_from_slice(&(self.last_stream_id & 0x7fff_ffff).to_be_bytes());
@@ -1465,6 +1553,100 @@ fn u24_be(b: &[u8]) -> u32 {
 fn setting_bytes(buf: &mut Vec<u8>, id: u16, val: u32) {
     buf.extend_from_slice(&id.to_be_bytes());
     buf.extend_from_slice(&val.to_be_bytes());
+}
+
+/// Decode an RFC 7541 5.1 integer with an `n`-bit prefix, advancing `i`.
+fn hpack_prefix_int(b: &[u8], i: &mut usize, n: u32) -> Result<usize, &'static str> {
+    let mask = ((1usize << n) - 1) as usize;
+    if *i >= b.len() {
+        return Err("HPACK: truncated integer");
+    }
+    let mut v = (b[*i] as usize) & mask;
+    *i += 1;
+    if v < mask {
+        return Ok(v);
+    }
+    let mut m = 0u32;
+    loop {
+        if *i >= b.len() {
+            return Err("HPACK: truncated integer");
+        }
+        // A continuation longer than this cannot describe a table size we would
+        // accept, and refusing it keeps the shift below in range.
+        if m > 21 {
+            return Err("HPACK: integer too large");
+        }
+        let byte = b[*i];
+        *i += 1;
+        v = v
+            .checked_add(((byte & 0x7f) as usize) << m)
+            .ok_or("HPACK: integer overflow")?;
+        m += 7;
+        if byte & 0x80 == 0 {
+            return Ok(v);
+        }
+    }
+}
+
+/// Skip an RFC 7541 5.2 string literal. The Huffman bit is irrelevant here:
+/// the length is what tells us where the next representation starts.
+fn hpack_skip_string(b: &[u8], i: &mut usize) -> Result<(), &'static str> {
+    let len = hpack_prefix_int(b, i, 7)?;
+    if *i + len > b.len() {
+        return Err("HPACK: truncated string");
+    }
+    *i += len;
+    Ok(())
+}
+
+/// Enforce the two dynamic-table-size-update rules the `hpack` crate does not.
+///
+/// It decodes a size update wherever it appears and whatever its value, so both
+/// of these were served as ordinary 200s:
+///
+/// - **RFC 7541 4.2**: a size update MUST occur at the *start* of a header
+///   block, before any field. One that follows a field means the encoder and
+///   decoder disagree about when the table was resized, so every subsequent
+///   block is suspect.
+/// - **RFC 7541 6.3**: a size update MUST NOT exceed the limit the decoder
+///   advertised (`HPACK_MAX_TABLE_SIZE` here).
+///
+/// This walks representations without decoding them: string contents are
+/// skipped by length, so no Huffman decoding and no allocation. Running it
+/// *before* `decode_hpack` matters, because rejecting afterwards would already
+/// have mutated the shared dynamic table.
+fn validate_hpack_block(block: &[u8], max_table_size: usize) -> Result<(), &'static str> {
+    let mut i = 0usize;
+    let mut seen_field = false;
+
+    while i < block.len() {
+        let first = block[i];
+        if first & 0x80 != 0 {
+            // 1xxxxxxx — indexed header field.
+            let _ = hpack_prefix_int(block, &mut i, 7)?;
+            seen_field = true;
+        } else if first & 0xe0 == 0x20 {
+            // 001xxxxx — dynamic table size update.
+            if seen_field {
+                return Err("HPACK: dynamic table size update after a field");
+            }
+            let size = hpack_prefix_int(block, &mut i, 5)?;
+            if size > max_table_size {
+                return Err("HPACK: dynamic table size update exceeds the advertised maximum");
+            }
+        } else {
+            // 01xxxxxx incremental indexing, or 0000xxxx / 0001xxxx without.
+            // Only the index prefix width differs for our purposes.
+            let nbits = if first & 0xc0 == 0x40 { 6 } else { 4 };
+            let idx = hpack_prefix_int(block, &mut i, nbits)?;
+            if idx == 0 {
+                hpack_skip_string(block, &mut i)?; // literal name
+            }
+            hpack_skip_string(block, &mut i)?; // value
+            seen_field = true;
+        }
+    }
+    Ok(())
 }
 
 fn decode_hpack(
@@ -1508,15 +1690,35 @@ fn decode_hpack(
 /// - **8.3.1**: `:method`, `:scheme` and `:path` are mandatory for anything
 ///   that is not CONNECT, and `:path` must not be empty.
 fn validate_request_headers(headers: &[(String, String)]) -> Result<(), &'static str> {
-    // Connection-specific fields (8.2.2). `upgrade` is included: HTTP/2 has no
-    // upgrade mechanism, so its presence is always malformed.
-    const CONNECTION_SPECIFIC: &[&str] =
-        &["connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade"];
+    validate_request_header_bytes(headers.iter().map(|(k, v)| (k.as_bytes(), v.as_bytes())))
+}
+
+/// The rules above, over raw bytes, so HTTP/3 can share them.
+///
+/// RFC 9114 4.3 restates RFC 9113 8.3 almost verbatim: HTTP/3 has the same
+/// pseudo-header set, the same "pseudo-headers first" ordering, the same
+/// at-most-once rule, and the same ban on connection-specific fields. The only
+/// thing that differs is the error code the transport reports.
+///
+/// H3 headers arrive as `quiche::h3::Header` byte slices, so keeping the core
+/// on `&[u8]` lets both paths call it without allocating a `String` per field
+/// merely to check it. Duplicating the rules per protocol was the alternative,
+/// and duplicated validation drifts.
+pub fn validate_request_header_bytes<'a, I>(headers: I) -> Result<(), &'static str>
+where
+    I: IntoIterator<Item = (&'a [u8], &'a [u8])>,
+{
+    // Connection-specific fields (8.2.2). `upgrade` is included: neither HTTP/2
+    // nor HTTP/3 has an upgrade mechanism, so its presence is always malformed.
+    const CONNECTION_SPECIFIC: &[&[u8]] =
+        &[b"connection", b"keep-alive", b"proxy-connection", b"transfer-encoding", b"upgrade"];
 
     let mut seen_regular = false;
     let (mut method, mut scheme, mut path, mut authority) = (0u32, 0u32, 0u32, 0u32);
-    let mut path_value: Option<&str> = None;
-    let mut method_value: Option<&str> = None;
+    let mut path_value: Option<&[u8]> = None;
+    let mut method_value: Option<&[u8]> = None;
+    let mut scheme_value: Option<&[u8]> = None;
+    let mut seen_host = false;
 
     for (name, value) in headers {
         if name.is_empty() {
@@ -1524,33 +1726,37 @@ fn validate_request_headers(headers: &[(String, String)]) -> Result<(), &'static
         }
         // 8.2.1 -- lowercase only. Checked before anything else, because every
         // comparison below assumes it.
-        if name.bytes().any(|b| b.is_ascii_uppercase()) {
+        if name.iter().any(|b| b.is_ascii_uppercase()) {
             return Err("uppercase field name");
         }
 
-        if let Some(pseudo) = name.strip_prefix(':') {
+        if name.first() == Some(&b':') {
+            let pseudo = &name[1..];
             // 8.3 -- pseudo-headers must all precede regular fields.
             if seen_regular {
                 return Err("pseudo-header after regular field");
             }
             match pseudo {
-                "method"    => { method += 1; method_value = Some(value); }
-                "scheme"    => scheme += 1,
-                "path"      => { path += 1; path_value = Some(value); }
-                "authority" => authority += 1,
+                b"method"    => { method += 1; method_value = Some(value); }
+                b"scheme"    => { scheme += 1; scheme_value = Some(value); }
+                b"path"      => { path += 1; path_value = Some(value); }
+                b"authority" => authority += 1,
                 // `:status` is a RESPONSE pseudo-header; in a request it is
                 // malformed rather than merely unknown, but the outcome is the
                 // same and the reason is more useful spelled out.
-                "status"    => return Err("response pseudo-header in request"),
-                _           => return Err("unknown pseudo-header"),
+                b"status"    => return Err("response pseudo-header in request"),
+                _            => return Err("unknown pseudo-header"),
             }
         } else {
             seen_regular = true;
-            if CONNECTION_SPECIFIC.iter().any(|c| name == c) {
+            if CONNECTION_SPECIFIC.contains(&name) {
                 return Err("connection-specific header field");
             }
+            if name == b"host".as_slice() {
+                seen_host = true;
+            }
             // 8.2.2: TE may appear, but only as exactly `trailers`.
-            if name == "te" && value != "trailers" {
+            if name == b"te".as_slice() && value != b"trailers".as_slice() {
                 return Err("TE header with a value other than trailers");
             }
         }
@@ -1563,7 +1769,7 @@ fn validate_request_headers(headers: &[(String, String)]) -> Result<(), &'static
 
     // 8.3.1 -- CONNECT omits :scheme and :path and requires :authority.
     // Everything else requires all three.
-    if method_value == Some("CONNECT") {
+    if method_value == Some(b"CONNECT".as_slice()) {
         if scheme != 0 || path != 0 {
             return Err("CONNECT with :scheme or :path");
         }
@@ -1577,12 +1783,35 @@ fn validate_request_headers(headers: &[(String, String)]) -> Result<(), &'static
     if scheme == 0 { return Err("missing :scheme"); }
     if path == 0   { return Err("missing :path"); }
 
+
     // 8.3.1 -- :path must not be empty. `OPTIONS *` is the one legitimate
     // asterisk-form, carried as :path = "*".
     match path_value {
-        Some("") => return Err("empty :path"),
-        Some("*") if method_value != Some("OPTIONS") => return Err("asterisk :path on non-OPTIONS"),
+        Some(b"") => return Err("empty :path"),
+        Some(b"*") if method_value != Some(b"OPTIONS".as_slice()) => {
+            return Err("asterisk :path on non-OPTIONS")
+        }
         _ => {}
+    }
+
+    // RFC 9113 8.3.1 and RFC 9114 4.3.1, the same sentence in both: if :scheme
+    // names a scheme with a mandatory authority component (http and https do),
+    // the request MUST carry either :authority or a Host header.
+    //
+    // A request with neither names no origin at all, so the only thing left to
+    // route it by is a server-side default. That ambiguity is the routing-
+    // confusion primitive, which is why both RFCs make it malformed rather than
+    // something to paper over with a default.
+    //
+    // Host satisfies it, because a proxy fronting HTTP/1.1 may forward Host
+    // rather than synthesise :authority. Both of m6's own clients
+    // (`h2s_client`, `h2c_client`) always send :authority, so neither the edge
+    // to origin path nor any conforming browser is affected.
+    //
+    // Checked last so a request with a more specific defect still reports that
+    // defect rather than this one.
+    if matches!(scheme_value, Some(b"http") | Some(b"https")) && authority == 0 && !seen_host {
+        return Err("neither :authority nor Host");
     }
 
     Ok(())
@@ -1755,7 +1984,14 @@ mod frame_validation_tests {
     pub(super) fn open_stream(stream_id: u32) -> Vec<u8> {
         // ":method: GET" / ":scheme: https" / ":path: /" as HPACK static-table
         // indexed fields (2, 7, 4) -- no dynamic table, no Huffman.
-        frame(TYPE_HEADERS, FLAG_END_HEADERS, stream_id, &[0x82, 0x87, 0x84])
+        let mut block = vec![0x82, 0x87, 0x84];
+        // ":authority: example.com" as a literal without indexing whose name is
+        // static index 1. Required since RFC 9113 8.3.1's authority rule is
+        // enforced: without it every stream these tests open is malformed, and
+        // they would be testing the rejection rather than whatever they mean to.
+        block.extend_from_slice(&[0x01, 0x0b]);
+        block.extend_from_slice(b"example.com");
+        frame(TYPE_HEADERS, FLAG_END_HEADERS, stream_id, &block)
     }
 
     /// The panic. A HEADERS frame declaring PRIORITY but carrying fewer than
@@ -1883,11 +2119,40 @@ mod pseudo_header_tests {
     fn well_formed_requests_pass() {
         ok(GOOD);
         ok(&[(":method", "GET"), (":scheme", "https"), (":path", "/x"),
-             ("user-agent", "curl/8"), ("accept", "*/*")]);
+             (":authority", "example.com"), ("user-agent", "curl/8"), ("accept", "*/*")]);
         // TE: trailers is the one permitted connection-ish header.
-        ok(&[(":method", "GET"), (":scheme", "https"), (":path", "/"), ("te", "trailers")]);
+        ok(&[(":method", "GET"), (":scheme", "https"), (":path", "/"),
+             (":authority", "example.com"), ("te", "trailers")]);
         // OPTIONS * is the legitimate asterisk-form.
-        ok(&[(":method", "OPTIONS"), (":scheme", "https"), (":path", "*")]);
+        ok(&[(":method", "OPTIONS"), (":scheme", "https"), (":path", "*"),
+             (":authority", "example.com")]);
+    }
+
+    /// RFC 9113 8.3.1 / RFC 9114 4.3.1: an http or https request must name its
+    /// origin, via :authority or Host.
+    ///
+    /// These three cases previously read as well-formed, which is what h3spec's
+    /// "MUST send H3_MESSAGE_ERROR if mandatory pseudo-header fields are
+    /// absent" was catching: it sends exactly :method/:scheme/:path and nothing
+    /// else. The assertions above were updated rather than worked around,
+    /// because they encoded the permissive behaviour rather than the rule.
+    #[test]
+    fn a_request_must_name_its_origin() {
+        assert_eq!(
+            bad(&[(":method", "GET"), (":scheme", "https"), (":path", "/")]),
+            "neither :authority nor Host"
+        );
+        // Host alone satisfies it: a proxy fronting HTTP/1.1 may forward Host
+        // instead of synthesising :authority.
+        ok(&[(":method", "GET"), (":scheme", "https"), (":path", "/"),
+             ("host", "example.com")]);
+        // A scheme with no mandatory authority component is exempt.
+        ok(&[(":method", "GET"), (":scheme", "ftp"), (":path", "/")]);
+        // A more specific defect still reports itself, not this rule.
+        assert_eq!(
+            bad(&[(":method", "GET"), (":scheme", "https"), (":path", "")]),
+            "empty :path"
+        );
     }
 
     /// RFC 9113 8.2.1. HTTP/2 field names are lowercase on the wire; uppercase
@@ -2228,6 +2493,28 @@ mod f005_regression {
         assert!(drain_buf(&mut c).is_ok(), "MAX_FRAME_SIZE exactly must be accepted");
     }
 
+    /// The same boundary, but for a DATA frame carried on a real stream.
+    ///
+    /// RFC 9113 4.2 requires every endpoint to receive and minimally process a
+    /// frame of 2^14 octets, which is the SETTINGS_MAX_FRAME_SIZE we advertise.
+    ///
+    /// SCOPE, precisely: this covers the frame parser only. It feeds `recv_buf`
+    /// directly and so never touches TLS. It therefore did NOT catch the real
+    /// 2^14 defect -- rustls' 16 KiB plaintext cap being read as a dead socket
+    /// in `fill_recv` -- which it passed straight through while h2spec saw the
+    /// connection dropped. That one is guarded end-to-end in
+    /// tests/security_e2e.rs. Kept because the parser boundary is still worth
+    /// pinning, not because it proves a peer can get a response.
+    #[test]
+    fn data_frame_at_exactly_max_frame_size_is_accepted() {
+        let mut f = open_stream(1);
+        f.extend(frame(TYPE_DATA, FLAG_END_STREAM, 1, &vec![0u8; MAX_FRAME_SIZE]));
+        assert!(
+            feed(&f).is_ok(),
+            "a DATA frame of exactly 2^14 octets is legal and must not kill the connection"
+        );
+    }
+
     /// F-005 defect 2, the CONTINUATION flood (CVE-2024-27316 class). The
     /// original grew header_block_buf past 20 MiB without ever completing a
     /// request, so the per-IP rate limiter -- which only runs once a request
@@ -2397,5 +2684,165 @@ mod frame_shape_tests {
         payload.push(16);
         f.extend(frame(TYPE_PRIORITY, 0, 1, &payload));
         assert!(feed(&f).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod hpack_validation_tests {
+    //! RFC 7541 4.2 and 6.3, the two dynamic-table-size-update rules the
+    //! `hpack` crate does not enforce. Both were h2spec failures: m6 decoded
+    //! the update happily and answered 200 where the RFC requires a
+    //! COMPRESSION_ERROR connection error.
+    use super::{validate_hpack_block, HPACK_MAX_TABLE_SIZE};
+
+    /// A dynamic table size update: `001` then an RFC 7541 5.1 integer with a
+    /// 5-bit prefix.
+    fn size_update(v: usize) -> Vec<u8> {
+        let mask = 31usize;
+        if v < mask {
+            return vec![0x20 | v as u8];
+        }
+        let mut out = vec![0x20 | mask as u8];
+        let mut rest = v - mask;
+        while rest >= 128 {
+            out.push(((rest & 0x7f) as u8) | 0x80);
+            rest >>= 7;
+        }
+        out.push(rest as u8);
+        out
+    }
+
+    const INDEXED_GET: u8 = 0x82; // :method: GET, static index 2
+
+    #[test]
+    fn size_update_at_the_start_is_fine() {
+        let mut b = size_update(10);
+        b.push(INDEXED_GET);
+        assert_eq!(validate_hpack_block(&b, HPACK_MAX_TABLE_SIZE), Ok(()));
+    }
+
+    #[test]
+    fn size_update_exactly_at_the_maximum_is_fine() {
+        let b = size_update(HPACK_MAX_TABLE_SIZE);
+        assert_eq!(
+            validate_hpack_block(&b, HPACK_MAX_TABLE_SIZE),
+            Ok(()),
+            "the limit itself is legal; only above it is an error"
+        );
+    }
+
+    /// h2spec "Sends a dynamic table size update larger than the value of
+    /// SETTINGS_HEADER_TABLE_SIZE".
+    #[test]
+    fn size_update_above_the_maximum_is_rejected() {
+        let b = size_update(HPACK_MAX_TABLE_SIZE + 1);
+        assert!(validate_hpack_block(&b, HPACK_MAX_TABLE_SIZE).is_err());
+    }
+
+    /// h2spec "Sends a dynamic table size update at the end of header block".
+    #[test]
+    fn size_update_after_a_field_is_rejected() {
+        let mut b = vec![INDEXED_GET];
+        b.extend(size_update(10));
+        assert!(
+            validate_hpack_block(&b, HPACK_MAX_TABLE_SIZE).is_err(),
+            "RFC 7541 4.2: an update must precede every field in the block"
+        );
+    }
+
+    /// The walker must step over literal names and values by length, or it
+    /// mistakes payload bytes for representations.
+    #[test]
+    fn literals_are_walked_without_being_decoded() {
+        // Literal without indexing, new name: 0x00, "a", "b".
+        let ok = vec![0x00, 0x01, b'a', 0x01, b'b'];
+        assert_eq!(validate_hpack_block(&ok, HPACK_MAX_TABLE_SIZE), Ok(()));
+
+        // The same, then a trailing size update, which is now "after a field".
+        let mut bad = ok.clone();
+        bad.extend(size_update(10));
+        assert!(validate_hpack_block(&bad, HPACK_MAX_TABLE_SIZE).is_err());
+    }
+
+    /// A value byte that happens to look like a size update must not be read
+    /// as one. `0x3f` inside a string is payload, not a representation.
+    #[test]
+    fn a_value_byte_resembling_a_size_update_is_not_one() {
+        // Literal without indexing, new name "a", value is the single byte 0x3f.
+        let b = vec![0x00, 0x01, b'a', 0x01, 0x3f];
+        assert_eq!(
+            validate_hpack_block(&b, HPACK_MAX_TABLE_SIZE),
+            Ok(()),
+            "string contents must be skipped by length, never parsed"
+        );
+    }
+
+    #[test]
+    fn a_truncated_block_is_an_error_not_a_panic() {
+        for b in [
+            vec![0x00, 0x05, b'a'],       // string shorter than its length
+            vec![0x3f, 0xe1],             // integer continuation runs off the end
+            vec![0x00],                   // literal with nothing after it
+        ] {
+            assert!(validate_hpack_block(&b, HPACK_MAX_TABLE_SIZE).is_err(), "{b:?}");
+        }
+    }
+
+    /// An empty block is legal: a request can be entirely static-table indexed.
+    #[test]
+    fn an_empty_block_is_accepted() {
+        assert_eq!(validate_hpack_block(&[], HPACK_MAX_TABLE_SIZE), Ok(()));
+    }
+}
+
+#[cfg(test)]
+mod hpack_table_size_setting_tests {
+    //! RFC 9113 6.5.2. A peer's SETTINGS_HEADER_TABLE_SIZE must never be able
+    //! to enlarge OUR decoder's dynamic table: it describes the peer's decoder,
+    //! not ours, and the value is an unbounded u32.
+    use super::*;
+    use super::frame_validation_tests::{frame, feed};
+
+    fn settings(id: u16, val: u32) -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&id.to_be_bytes());
+        p.extend_from_slice(&val.to_be_bytes());
+        frame(TYPE_SETTINGS, 0, 0, &p)
+    }
+
+    /// The OOM vector: one SETTINGS frame asking for a 4 GiB table.
+    #[test]
+    fn a_huge_peer_table_size_cannot_enlarge_our_decoder() {
+        let mut c = Http2Conn::new();
+        c.phase = Phase::Active;
+        c.recv_buf.extend_from_slice(&settings(SETTING_HEADER_TABLE_SIZE, u32::MAX));
+        let mut on_request = |_: &HttpRequest, _: &str| -> RequestOutcome {
+            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "t".to_string(),
+                                  std::sync::Arc::new(vec![]))
+        };
+        loop {
+            match c.process_frame(&mut on_request, "127.0.0.1") {
+                Ok(true) => continue,
+                Ok(false) => break,
+                Err(e) => panic!("must be accepted, not an error: {e}"),
+            }
+        }
+        // The setting is legal, so the connection survives; what must NOT happen
+        // is our own table cap following it upwards.
+        assert_eq!(c.phase, Phase::Active, "a legal SETTINGS value must not kill the connection");
+    }
+
+    /// A peer asking for a smaller table is honoured: that only reduces memory.
+    #[test]
+    fn a_smaller_peer_table_size_is_still_accepted() {
+        let f = settings(SETTING_HEADER_TABLE_SIZE, 512);
+        assert!(feed(&f).is_ok());
+    }
+
+    /// The clamp itself, stated directly.
+    #[test]
+    fn the_clamp_is_the_advertised_maximum() {
+        assert_eq!((u32::MAX as usize).min(HPACK_MAX_TABLE_SIZE), HPACK_MAX_TABLE_SIZE);
+        assert_eq!((512usize).min(HPACK_MAX_TABLE_SIZE), 512);
     }
 }

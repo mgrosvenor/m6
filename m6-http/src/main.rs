@@ -27,6 +27,12 @@ use m6_http_lib::config::{self, Config};
 use m6_http_lib::error::{self as error, ErrorMode};
 use m6_http_lib::forward::{self, HttpRequest, HttpResponse};
 use m6_http_lib::health;
+use m6_http_lib::http2::validate_request_header_bytes;
+
+/// RFC 9114 8.1: H3_MESSAGE_ERROR, the stream error a server must raise for a
+/// malformed request. Named here rather than taken from quiche so the wire
+/// value is stated where it is used.
+const H3_MESSAGE_ERROR: u64 = 0x10e;
 
 /// How long a fetched error document is reused before being re-fetched.
 /// Short enough that a redeployed error page appears promptly, long enough
@@ -1191,6 +1197,27 @@ fn handle_h3_request(
         Some(r) => r,
         None => return,
     };
+
+    // ── Phase 0: malformed-request check ─────────────────────────────────────
+    // RFC 9114 4.1.2: a malformed request MUST be treated as a stream error of
+    // type H3_MESSAGE_ERROR. RFC 9114 4.3's rules are RFC 9113 8.3 restated
+    // almost word for word, so this calls the very validator the HTTP/2 path
+    // uses. Writing a second copy here was the alternative, and two copies of a
+    // rule set drift.
+    //
+    // m6 did none of this on H3: an uppercase field name, a `Connection:`
+    // header, a duplicate `:method`, a missing `:path` -- all were served a
+    // normal 200 over HTTP/3 while the identical request was correctly rejected
+    // over HTTP/2. The validator takes byte slices precisely so this stays
+    // allocation-free on the request path.
+    if let Err(why) =
+        validate_request_header_bytes(req.headers.iter().map(|h| (h.name(), h.value())))
+    {
+        debug!(stream_id, reason = why, "h3: malformed request headers");
+        let _ = qconn.conn.stream_shutdown(stream_id, quiche::Shutdown::Read, H3_MESSAGE_ERROR);
+        let _ = qconn.conn.stream_shutdown(stream_id, quiche::Shutdown::Write, H3_MESSAGE_ERROR);
+        return;
+    }
 
     // ── Phase 1: zero-alloc header scan for cache lookup ──────────────────────
     // Borrow directly from quiche::h3::Header byte slices; no String allocation.

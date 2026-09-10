@@ -73,17 +73,51 @@ is no advertised bound, and a client has no way to know one exists.
 Ordered so that each phase is independently shippable and independently
 verifiable. Phase 0 comes first because it converts the argument into a number.
 
-## Measured: h2spec, 2026-09-09
+## Measured: h2spec, 2026-09-10
 
-**Latest: 132 passed, 14 failed** (2026-09-09, after phases 1-2, the
-CONTINUATION fix and F-005). Sequence: 97 baseline, 114 pseudo-headers, 126
-state machine, 130 CONTINUATION unit fix, 132 F-005.
+**COMPLETE: 146 passed, 0 failed.**
 
-Independent verification now runs alongside h2spec: nghttp2's `nghttp` client
-and `h2load` (200/200 succeeded, 0 errored), and `h3spec` for HTTP/3 at 33/49
-— of which 10 are in quiche rather than m6. h2spec alone proved insufficient
-in one direction too: it caught a CONTINUATION regression that every unit
-test missed.
+Sequence: 97 baseline, 114 pseudo-headers, 126 state machine, 130 CONTINUATION
+unit fix, 132 F-005, 142 phase 3 frame-shape table, 143 rustls backpressure,
+145 HPACK size updates, 146 trailer END_STREAM.
+
+Note the 132 -> 142 step was never a change: it is what phase 3 was already
+worth. 132 was measured before phase 3 landed and then sat in the docs as if
+current. **Re-measure before quoting a number.**
+
+`h3spec` is at **37/49**, and all 12 remaining failures are inside quiche (10
+QUIC transport, 2 QPACK stream errors). No h3spec failure is attributable to
+m6 any more.
+
+Independent verification runs alongside both: nghttp2's `nghttp` client and
+`h2load` (200/200 succeeded, 0 errored). h2spec alone proved insufficient in
+one direction too: it caught a CONTINUATION regression that every unit test
+missed. And it is insufficient in the other direction as well -- see the
+rustls entry below, where a unit test at the same boundary passed throughout
+while h2spec failed, because the defect lived in TLS I/O and the unit test fed
+`recv_buf` directly.
+
+### 2026-09-10, the last four
+
+| # | Defect | Where |
+|---|---|---|
+| 1 | rustls 16 KiB plaintext backpressure read as a dead socket, so any body >= 2^14 killed the connection with no GOAWAY | `http2.rs::fill_recv` |
+| 2 | HPACK dynamic table size update accepted after a field, and above the advertised maximum | `http2.rs::validate_hpack_block` (new) |
+| 3 | Second HEADERS without END_STREAM left the stream open until idle timeout | `http2.rs::handle_headers` |
+| 4 | Neither `:authority` nor `Host` required, so a request need not name its origin | `validate_request_header_bytes` |
+
+(1) is the one that mattered off the scoreboard: it broke every HTTP/2 upload
+of 16 KiB or more in production. `http11.rs::advance_tls` had handled the same
+rustls behaviour since HTTP/1.1 hit it; the fix was simply never ported. When
+one protocol path grows a workaround, check the others.
+
+Found while fixing (2), unrelated to conformance: `SETTINGS_HEADER_TABLE_SIZE`
+from the peer was applied to **our** decoder rather than bounding our encoder,
+and the value is an unbounded u32. One SETTINGS frame sized m6's own HPACK
+dynamic table cap at 4 GiB, and the table lives for the whole connection so
+`MAX_HEADER_BLOCK` does not bound the total. Now clamped to the advertised
+4096. Conformance work is a good excuse to read the settings path; this was
+not a conformance failure and no spec suite would have caught it.
 
 Original baseline: **146 tests, 97 passed, 49 failed** (h2spec v2.6.0 against staging, TLS,
 `-h 127.0.0.1 -p 443 -t -k`, 240s).
