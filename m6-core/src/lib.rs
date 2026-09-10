@@ -1,5 +1,4 @@
 pub mod compress;
-pub mod config;
 pub mod http;
 pub mod log;
 pub mod mime;
@@ -13,11 +12,10 @@ pub mod signal;
 pub mod watcher;
 
 pub use compress::{brotli_compress, brotli_decompress, gzip_compress, gzip_decompress};
-pub use config::{load_toml, merge_maps};
 pub use http::{is_same_origin_path, RawRequest, RawResponse};
 pub use mime::{mime_from_path, should_compress_default};
 pub use negotiate::{canonical_coding, coding_quality, preferred_coding};
-pub use path::{safe_resolve, validate_path_param};
+pub use path::validate_path_param;
 pub use random::random_hex_token;
 pub use server::{socket_path_from_config, UnixServer};
 pub use signal::ShutdownHandle;
