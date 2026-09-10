@@ -137,7 +137,7 @@ restricts the character set.
 
 ---
 
-## Phase 2 — `m6_core::testkit` — **done**, commit `3b9b895`
+## Phase 2 — `m6_core::testkit` — **done**, commits `3b9b895`..`939831e`
 
 Everything after this needs it.
 
@@ -167,6 +167,20 @@ hundred lines. The kernel delivered every signal there and the default
 disposition killed the process. m6-file had not logged a shutdown in thirty days
 of production. See "Signal Handling" in `m6-decisions.md`; the fix is
 `m6_core::signal::block()` first in `main`, now asserted rather than documented.
+
+*Then the same argument applied to shutdown itself*, commit `939831e`. Phase 2
+unified the signal *mechanism* and left the *sequence* as five variants: three
+install overloads, three wake mechanisms, one of five services unlinking its
+socket, three of five logging a startup line, two of five logging a shutdown
+line, and all three render apps logging `m6-render` rather than their own name.
+None of that was demanded by anything the services do. There is now one entry
+point, `ShutdownHandle::install(Service)`, and the differences are data:
+`name`, `socket` and `wake_fd`. Core owns all four lifecycle log lines,
+asserted by `testkit::assert_lifecycle_logged` in four services.
+
+That work found one more testkit defect: `Service::spawn` piped stderr and
+nulled stdout, and m6 services log to **stdout**, so the harness had been
+discarding every log line it existed to capture. It drains both streams now.
 
 Two suites also had a shared-socket-path hazard: `m6-file` and `m6-html` put
 their sockets at a fixed `$TMPDIR/<id>.sock` and deleted whatever was there
