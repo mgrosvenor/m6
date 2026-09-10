@@ -247,6 +247,26 @@ pub struct Stats {
     miss_idx:     usize,
     miss_count:   usize,
 
+    // ── Monitoring endpoints, accounted separately ────────────────────────
+    //
+    // /health and /perf are not site traffic, but they are not nothing
+    // either. They used to be dropped on the floor at three call sites, which
+    // kept the traffic counters honest and made the monitor itself invisible:
+    // you could not tell a working uptime check from a monitor that had
+    // silently stopped, and a flood aimed at /health showed up nowhere at all.
+    //
+    // Counted here instead of discarded. Nothing that follows is mixed into
+    // requests_total, the hit rate, or the latency reservoirs above, so "the
+    // request count stopped moving" still detects a traffic stall even while a
+    // 30-second monitor keeps polling. That property is the whole reason the
+    // exclusion existed, and separate accounting preserves it without
+    // throwing the data away.
+    pub monitor_requests_total: u64,
+    window_monitor_requests:    u64,
+    monitor_samples: Box<[u64; RESERVOIR]>,
+    monitor_idx:     usize,
+    monitor_count:   usize,
+
     /// Per (version, interface) breakdown. Fixed-size dense table rather than
     /// a map: six entries, indexed arithmetically, no allocation and no hash
     /// on the request path.
@@ -274,6 +294,9 @@ impl Stats {
             hit_idx: 0, hit_count: 0,
             miss_samples: Box::new([0u64; RESERVOIR]),
             miss_idx: 0, miss_count: 0,
+            monitor_requests_total: 0, window_monitor_requests: 0,
+            monitor_samples: Box::new([0u64; RESERVOIR]),
+            monitor_idx: 0, monitor_count: 0,
             channels: (0..CHANNELS).map(|_| ChannelStats::new()).collect(),
             status_counts: Box::new([0u64; 500]),
             rps_peak: 0, window_start: now, last_emit: now,
@@ -297,6 +320,25 @@ impl Stats {
         channel: Channel,
         backend: &str,
     ) {
+        // /health and /perf are accounted separately and return here, so
+        // nothing below touches the traffic counters. The decision lives in
+        // this one place rather than at each call site: it used to be three
+        // `if !is_monitoring_endpoint(..)` guards in main.rs, one per protocol
+        // path, and the h3 one was added later precisely because a guard is
+        // easy to forget when a fourth call site appears.
+        if crate::health::is_monitoring_endpoint(backend) {
+            self.monitor_requests_total += 1;
+            self.window_monitor_requests += 1;
+            if elapsed_ns > 0 {
+                self.monitor_samples[self.monitor_idx] = elapsed_ns;
+                self.monitor_idx = (self.monitor_idx + 1) % RESERVOIR;
+                if self.monitor_count < RESERVOIR {
+                    self.monitor_count += 1;
+                }
+            }
+            return;
+        }
+
         // A 5xx that m6-http generated itself is not a BACKEND error, and
         // counting it as one makes the metric cry wolf.
         //
@@ -358,6 +400,7 @@ impl Stats {
 
         let (hp0, hp50, hp99, hp100) = percentiles(&self.hit_samples,  self.hit_count);
         let (mp0, mp50, mp99, mp100) = percentiles(&self.miss_samples, self.miss_count);
+        let (_, kp50, kp99, _)       = percentiles(&self.monitor_samples, self.monitor_count);
 
         tracing::info!(
             requests       = self.requests_total,
@@ -376,6 +419,13 @@ impl Stats {
             miss_p50_ns    = mp50,
             miss_p99_ns    = mp99,
             miss_max_ns    = mp100,
+            // Monitoring endpoints, deliberately outside every counter above.
+            // Reported so a monitor that stops polling, or one that starts
+            // flooding, is visible; a reader can tell those apart from a
+            // traffic change because these never move the traffic figures.
+            monitor_requests = self.window_monitor_requests,
+            monitor_p50_ns   = kp50,
+            monitor_p99_ns   = kp99,
             "periodic stats"
         );
 
@@ -384,6 +434,8 @@ impl Stats {
         self.window_cache_misses = 0; self.window_backend_errors = 0;
         self.hit_idx = 0; self.hit_count = 0;
         self.miss_idx = 0; self.miss_count = 0;
+        self.window_monitor_requests = 0;
+        self.monitor_idx = 0; self.monitor_count = 0;
         self.window_start = now;
         self.last_emit    = now;
     }
@@ -406,6 +458,14 @@ pub struct StatsSnapshot {
     pub cache_hits_total: u64,
     pub cache_misses_total: u64,
     pub backend_errors_total: u64,
+    /// /health and /perf polls. Cumulative, and deliberately excluded from
+    /// `requests_total` so a stalled site is still detectable while a monitor
+    /// keeps polling. Reported rather than discarded so the monitor itself is
+    /// observable: a check that stops, or one that floods, shows up here.
+    pub monitor_requests_total: u64,
+    pub monitor_samples: usize,
+    pub monitor_p50_ns: u64,
+    pub monitor_p99_ns: u64,
     pub rps_peak: u64,
     /// Samples backing the hit percentiles in the current window.
     pub hit_samples: usize,
@@ -439,11 +499,16 @@ impl Stats {
     pub fn snapshot(&self) -> StatsSnapshot {
         let (_, hp50, hp99, hmax) = percentiles(&self.hit_samples, self.hit_count);
         let (_, mp50, mp99, mmax) = percentiles(&self.miss_samples, self.miss_count);
+        let (_, kp50, kp99, _) = percentiles(&self.monitor_samples, self.monitor_count);
         StatsSnapshot {
             requests_total: self.requests_total,
             cache_hits_total: self.cache_hits_total,
             cache_misses_total: self.cache_misses_total,
             backend_errors_total: self.backend_errors_total,
+            monitor_requests_total: self.monitor_requests_total,
+            monitor_samples: self.monitor_count,
+            monitor_p50_ns: kp50,
+            monitor_p99_ns: kp99,
             rps_peak: self.rps_peak,
             hit_samples: self.hit_count,
             hit_p50_ns: hp50,
@@ -516,6 +581,59 @@ fn percentiles(samples: &[u64; RESERVOIR], n: usize) -> (u64, u64, u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Monitoring polls are counted, and counted APART.
+    ///
+    /// Both halves matter and each catches a different mistake. If they leak
+    /// into `requests_total`, a 30-second monitor keeps that counter rising
+    /// through a total traffic stall and "the number stopped moving" never
+    /// fires, which is the one thing it exists for. If they are dropped
+    /// instead, as they were until 2026-09-10, a check that has silently
+    /// stopped is indistinguishable from one that is passing, and a flood
+    /// aimed at /health is recorded nowhere.
+    ///
+    /// Delete the early return in `record` and the first assertion fails on
+    /// `requests_total`; delete the monitor counters and the second fails.
+    #[test]
+    fn monitor_polls_are_counted_separately_from_site_traffic() {
+        let mut s = Stats::new();
+        let ch = Channel::new(Version::Http11, Iface::External);
+        s.record(1_000, false, 200, ch, "m6-html");
+        for _ in 0..25 {
+            s.record(9_000, false, 200, ch, crate::health::HEALTH_BACKEND);
+            s.record(9_000, false, 200, ch, crate::health::PERF_BACKEND);
+        }
+
+        // Site traffic is untouched by 50 monitor polls.
+        assert_eq!(s.requests_total, 1, "monitor polls leaked into requests_total");
+        assert_eq!(s.cache_misses_total, 1, "monitor polls leaked into the miss count");
+        assert_eq!(s.backend_errors_total, 0);
+
+        // And the polls are not lost.
+        assert_eq!(s.monitor_requests_total, 50, "monitor polls were discarded");
+        let snap = s.snapshot();
+        assert_eq!(snap.monitor_requests_total, 50);
+        assert_eq!(snap.requests_total, 1);
+        assert!(snap.monitor_p50_ns > 0, "monitor latency not sampled");
+    }
+
+    /// A monitor 5xx is not a backend error: no backend was contacted. It also
+    /// must not reach `status_counts`, or the response-code table in the
+    /// hourly check reports codes the site never served.
+    #[test]
+    fn a_failing_monitor_poll_does_not_pollute_traffic_figures() {
+        let mut s = Stats::new();
+        let ch = Channel::new(Version::Http11, Iface::External);
+        s.record(500, false, 503, ch, crate::health::HEALTH_BACKEND);
+        s.record(400, false, 401, ch, crate::health::PERF_BACKEND);
+        assert_eq!(s.backend_errors_total, 0);
+        assert_eq!(s.requests_total, 0);
+        assert_eq!(s.monitor_requests_total, 2);
+        assert!(
+            s.snapshot().status_counts.is_empty(),
+            "monitor status codes leaked into the site response-code table"
+        );
+    }
 
     #[test]
     fn test_record_and_counts() {
@@ -738,7 +856,14 @@ mod backend_error_attribution_tests {
         let mut s = Stats::new();
         s.record(1_000, false, 501, ch(), "method-check");
         s.record(1_000, false, 500, ch(), "error-local");
-        s.record(1_000, false, 503, ch(), "health");
+        // Was `"health"`. Changed 2026-09-10, when /health and /perf stopped
+        // being ordinary self-generated responses and became separately
+        // accounted monitoring polls: they no longer reach `requests_total`
+        // at all, so using one here would assert the opposite of the intended
+        // behaviour. `error` is self-generated and is site traffic, which is
+        // what this test is actually about. The monitoring case is covered by
+        // `monitor_polls_are_counted_separately_from_site_traffic`.
+        s.record(1_000, false, 503, ch(), "error");
         let snap = s.snapshot();
         assert_eq!(snap.backend_errors_total, 0, "m6 generated these itself");
         // The responses are still counted; only the attribution changes.
