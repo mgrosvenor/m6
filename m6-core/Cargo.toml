@@ -11,6 +11,13 @@ name = "m6_core"
 # links it; enable it from a crate's [dev-dependencies] entry.
 testkit = []
 
+# Request/response extras, off by default so a binary links only what it uses.
+# These mirror the m6-render features they moved from, and m6-render forwards
+# its own to these during the Phase 5/6 transition.
+multipart = ["dep:multer", "dep:tokio", "dep:bytes", "dep:futures-util"]
+flash     = ["dep:hmac", "dep:sha2"]
+csrf      = []
+
 [dependencies]
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -29,6 +36,15 @@ minify-html = "0.15"
 minify-js   = "0.5"
 brotli      = "6"
 flate2      = "1"
+base64      = "0.22"
+filetime    = "0.2"
+
+multer        = { version = "3",    optional = true }
+tokio         = { version = "1",    optional = true, features = ["rt", "macros"] }
+bytes         = { version = "1",    optional = true }
+futures-util  = { version = "0.3",  optional = true }
+hmac          = { version = "0.12", optional = true }
+sha2          = { version = "0.10", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
