@@ -22,6 +22,30 @@ pub struct ConfigWatcher {
 }
 
 #[cfg(target_os = "linux")]
+const EVENT_BUF_LEN: usize = 4096;
+
+/// Read buffer for `inotify_event`, aligned.
+///
+/// `read_events` casts offsets into this buffer straight to
+/// `*const libc::inotify_event` and dereferences them. That struct begins with
+/// a `c_int`, so it needs 4-byte alignment, and a bare `[u8; N]` has alignment
+/// 1: nothing made the base address suitable. It worked because a 4096-byte
+/// stack array is almost always well aligned in practice, which is the kind of
+/// luck that holds until a compiler version or a stack layout changes.
+///
+/// The kernel pads each event's `len` so that the next one stays aligned
+/// relative to the start of the buffer, so aligning the base is sufficient.
+#[cfg(target_os = "linux")]
+#[repr(align(8))]
+struct EventBuf([u8; EVENT_BUF_LEN]);
+
+#[cfg(target_os = "linux")]
+const _: () = assert!(
+    std::mem::align_of::<libc::inotify_event>() <= 8,
+    "EventBuf must be at least as aligned as inotify_event"
+);
+
+#[cfg(target_os = "linux")]
 impl ConfigWatcher {
     pub fn new(paths: &[&Path]) -> anyhow::Result<Self> {
         use std::collections::HashSet;
@@ -68,11 +92,15 @@ impl ConfigWatcher {
     }
 
     pub fn read_events(&mut self, filenames: &[&str]) -> bool {
-        let mut buf = [0u8; 4096];
+        let mut buf = EventBuf([0u8; EVENT_BUF_LEN]);
         let mut matched = false;
         loop {
             let n = unsafe {
-                libc::read(self.inotify_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+                libc::read(
+                    self.inotify_fd,
+                    buf.0.as_mut_ptr() as *mut libc::c_void,
+                    buf.0.len(),
+                )
             };
             if n <= 0 {
                 break;
@@ -81,13 +109,13 @@ impl ConfigWatcher {
             let mut offset = 0usize;
             while offset + std::mem::size_of::<libc::inotify_event>() <= n {
                 let event =
-                    unsafe { &*(buf.as_ptr().add(offset) as *const libc::inotify_event) };
+                    unsafe { &*(buf.0.as_ptr().add(offset) as *const libc::inotify_event) };
                 let name_len = event.len as usize;
                 if name_len > 0 {
                     let name_start = offset + std::mem::size_of::<libc::inotify_event>();
                     let name_end = name_start + name_len;
                     if name_end <= n {
-                        let name = std::ffi::CStr::from_bytes_until_nul(&buf[name_start..name_end])
+                        let name = std::ffi::CStr::from_bytes_until_nul(&buf.0[name_start..name_end])
                             .ok()
                             .and_then(|s| s.to_str().ok())
                             .unwrap_or("");
