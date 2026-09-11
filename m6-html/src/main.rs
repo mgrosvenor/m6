@@ -1,4 +1,4 @@
-use m6_render::prelude::*;
+use m6_core::prelude::*;
 
 fn main() -> anyhow::Result<()> {
     App::new().run()?;

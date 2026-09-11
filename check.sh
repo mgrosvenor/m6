@@ -44,7 +44,7 @@ BASELINE_NAME="check"
 CRITERION_BENCHES=(
   -p m6-file   --bench critical_path
   -p m6-http   --bench critical_path
-  -p m6-render --bench critical_path
+  -p m6-core   --bench critical_path
 )
 
 # ── Colours ───────────────────────────────────────────────────────────────────

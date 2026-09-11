@@ -7,7 +7,7 @@ edition = "2021"
 name = "m6-html"
 
 [dependencies]
-m6-render = { path = "../m6-render" }
+m6-core   = { path = "../m6-core" }
 anyhow    = "1"
 
 [dev-dependencies]

@@ -7,6 +7,7 @@ edition = "2021"
 name = "m6_core"
 
 [features]
+default = ["templates"]
 # The shared integration-test harness. Off by default so no production binary
 # links it; enable it from a crate's [dev-dependencies] entry.
 testkit = []
@@ -15,8 +16,26 @@ testkit = []
 # These mirror the m6-render features they moved from, and m6-render forwards
 # its own to these during the Phase 5/6 transition.
 multipart = ["dep:multer", "dep:tokio", "dep:bytes", "dep:futures-util"]
+
+# Tera templating, on by default. m6-core is the box of blocks a service is
+# assembled from, and templating is one of the blocks: a service that renders
+# HTML should get it by depending on core, not by depending on a framework
+# crate that also happens to contain the service loop.
+#
+# On by default rather than off so that `cargo test` compiles it without a
+# flag. A feature that hides code from the default test run is how two csrf
+# tests stayed broken from Phase 4 to Phase 5. A binary that wants none of it
+# sets `default-features = false`.
+templates = ["dep:tera", "dep:comrak"]
 flash     = ["dep:hmac", "dep:sha2"]
 csrf      = []
+
+# Blocks a service assembles itself from. Off by default because not every
+# service sends mail or makes outbound requests, on by name when it does.
+# m6-core is meant to be the only crate a service links, so these live here
+# rather than being something each service rediscovers.
+email       = ["dep:lettre"]
+http-client = ["dep:ureq"]
 
 [dependencies]
 serde      = { version = "1", features = ["derive"] }
@@ -42,12 +61,21 @@ chrono      = { version = "0.4", features = ["serde"] }
 lru         = "0.16"
 slug        = "0.1"
 
+tera          = { version = "1",    optional = true }
+comrak        = { version = "0.21", optional = true, default-features = false }
 multer        = { version = "3",    optional = true }
 tokio         = { version = "1",    optional = true, features = ["rt", "macros"] }
 bytes         = { version = "1",    optional = true }
 futures-util  = { version = "0.3",  optional = true }
+lettre        = { version = "0.11", optional = true, features = ["smtp-transport", "native-tls"] }
+ureq          = { version = "2",    optional = true, features = ["json"] }
 hmac          = { version = "0.12", optional = true }
 sha2          = { version = "0.10", optional = true }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile  = "3"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name    = "critical_path"
+harness = false
