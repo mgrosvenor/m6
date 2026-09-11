@@ -1,4 +1,4 @@
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -130,8 +130,9 @@ fn http_request(socket_path: &Path, request: &str) -> String {
         .unwrap_or_else(|e| panic!("connect {:?}: {}", socket_path, e));
     stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     stream.write_all(request.as_bytes()).unwrap();
-    let mut resp = Vec::new();
-    let _ = stream.read_to_end(&mut resp);
+    // One response, not read-to-EOF: the connection stays open (RFC 9112 9.3).
+    let method = request.split(' ').next().unwrap_or("");
+    let resp = m6_core::testkit::read_one(&mut stream, method).expect("read one response");
     String::from_utf8_lossy(&resp).into_owned()
 }
 

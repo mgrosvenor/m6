@@ -405,38 +405,24 @@ fn handle_connection(
 ) -> Result<()> {
     stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
 
-    // A malformed request is answered, not dropped.
-    //
-    // This was `Request::read(stream_clone).context(...)?`, which returned the
-    // error to a caller that only logged it, so every unparseable request got
-    // a silent close. m6-auth-server had the identical bug, and it stayed
-    // invisible in both for the same reason: the old parser was lenient enough
-    // that almost nothing reached this path.
-    let mut stream_clone = stream.try_clone().context("cloning stream")?;
-    let req = match m6_core::parse::parse_request(&mut stream_clone) {
-        Ok(r) => r,
-        Err(e) => {
-            debug!(error = %e, "malformed request");
-            let hdrs: Vec<(&str, &str)> = vec![("Connection", "close")];
-            crate::http::write_response(&mut stream, e.status(), e.reason(), &hdrs, &[])?;
-            return Ok(());
-        }
-    };
-
     let ctx = HandlerContext { routes, config, site_dir };
 
-    let info = handle_request(&req, &ctx, &mut stream).context("handling request")?;
-
-    debug!(
-        path = req.path,
-        method = req.method,
-        status = info.status,
-        bytes = info.bytes,
-        latency_us = info.latency_us,
-        "request complete"
-    );
-
-    Ok(())
+    // The loop, the malformed-request answer, the HEAD rule and the keep-alive
+    // decision all live in core. This file had its own of each; they were not
+    // the same as m6-html's or m6-auth-server's, and none of the three kept a
+    // connection open.
+    m6_core::server::serve_connection(&mut stream, |req, resp| -> Result<()> {
+        let info = handle_request(req, &ctx, resp).context("handling request")?;
+        debug!(
+            path = req.path,
+            method = req.method,
+            status = info.status,
+            bytes = info.bytes,
+            latency_us = info.latency_us,
+            "request complete"
+        );
+        Ok(())
+    })
 }
 
 // ---------------------------------------------------------------------------

@@ -12,7 +12,7 @@
 # measures it without a bridge and is stable.
 #
 # target               floor  total
-h1:m6-auth-server      30     32
-h1:m6-file             30     32
-h1:m6-html             30     32
-h1:m6-http-redirect    30     32
+h1:m6-auth-server      32     32
+h1:m6-file             32     32
+h1:m6-html             32     32
+h1:m6-http-redirect    32     32

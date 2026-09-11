@@ -1,4 +1,4 @@
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -67,8 +67,10 @@ fn http_request(socket_path: &Path, request: &str) -> String {
     stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     stream.write_all(request.as_bytes()).unwrap();
 
-    let mut response = Vec::new();
-    let _ = stream.read_to_end(&mut response);
+    // One response, not read-to-EOF. Backends keep the connection open now
+    // (RFC 9112 9.3), so waiting for a close waits for the idle timeout.
+    let method = request.split(' ').next().unwrap_or("");
+    let response = m6_core::testkit::read_one(&mut stream, method).expect("read one response");
     String::from_utf8_lossy(&response).into_owned()
 }
 

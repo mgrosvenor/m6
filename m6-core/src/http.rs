@@ -107,68 +107,31 @@ impl RawResponse {
     }
 
     /// Serialize to HTTP/1.1 wire format.
+    /// Send this response through the one HTTP/1.1 response writer.
+    ///
+    /// `to_bytes` used to serialise it here, with its own status table and no
+    /// HEAD or `Connection` handling -- a fourth serialiser, inside core.
+    pub fn send<W: std::io::Write>(
+        &self,
+        resp: &mut crate::h1::Responder<'_, W>,
+    ) -> std::io::Result<()> {
+        let hdrs: Vec<(&str, &str)> =
+            self.headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        resp.send(self.status, &hdrs, &self.body)
+    }
+
+    /// The serialised response, for a caller that has bytes rather than a
+    /// stream: the connection is already gone, or the response is being
+    /// compared in a test.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let reason = status_reason(self.status);
         let mut out = Vec::new();
-        out.extend_from_slice(
-            format!("HTTP/1.1 {} {}\r\n", self.status, reason).as_bytes(),
-        );
-        // Write Content-Length if not already set.
-        let has_content_length = self
-            .headers
-            .iter()
-            .any(|(k, _)| k.to_ascii_lowercase() == "content-length");
-        if !has_content_length {
-            out.extend_from_slice(
-                format!("Content-Length: {}\r\n", self.body.len()).as_bytes(),
-            );
-        }
-        for (k, v) in &self.headers {
-            out.extend_from_slice(format!("{}: {}\r\n", k, v).as_bytes());
-        }
-        out.extend_from_slice(b"\r\n");
-        out.extend_from_slice(&self.body);
+        let mut resp = crate::h1::Responder::new(&mut out, "", false);
+        // Writing into a Vec cannot fail.
+        let _ = self.send(&mut resp);
         out
     }
 }
 
-fn status_reason(code: u16) -> &'static str {
-    match code {
-        100 => "Continue",
-        101 => "Switching Protocols",
-        200 => "OK",
-        201 => "Created",
-        202 => "Accepted",
-        204 => "No Content",
-        206 => "Partial Content",
-        301 => "Moved Permanently",
-        302 => "Found",
-        303 => "See Other",
-        304 => "Not Modified",
-        307 => "Temporary Redirect",
-        308 => "Permanent Redirect",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        403 => "Forbidden",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        408 => "Request Timeout",
-        409 => "Conflict",
-        410 => "Gone",
-        411 => "Length Required",
-        413 => "Content Too Large",
-        414 => "URI Too Long",
-        415 => "Unsupported Media Type",
-        422 => "Unprocessable Content",
-        429 => "Too Many Requests",
-        500 => "Internal Server Error",
-        501 => "Not Implemented",
-        502 => "Bad Gateway",
-        503 => "Service Unavailable",
-        504 => "Gateway Timeout",
-        _ => "Unknown",
-    }
-}
 
 #[cfg(test)]
 mod tests {

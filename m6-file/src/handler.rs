@@ -1,6 +1,7 @@
 use crate::compress::{choose_encoding, compress_brotli, compress_gzip, Encoding};
 use crate::config::Config;
-use crate::http::{write_error, write_head_response, write_response, Request};
+use crate::http::Request;
+use m6_core::h1::Responder;
 use crate::route::{MatchResult, Route};
 use anyhow::Result;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -76,12 +77,12 @@ fn cache_control_for(query: &str) -> &'static str {
 pub fn handle_request<W: Write>(
     req: &Request,
     ctx: &HandlerContext,
-    stream: &mut W,
+    resp: &mut Responder<'_, W>,
 ) -> Result<ResponseInfo> {
     let start = Instant::now();
 
     if req.method != "GET" && req.method != "HEAD" {
-        write_error(stream, 405, "Method Not Allowed")?;
+        resp.error(405)?;
         return Ok(ResponseInfo { status: 405, bytes: 0, latency_us: start.elapsed().as_micros() });
     }
 
@@ -89,12 +90,12 @@ pub fn handle_request<W: Write>(
         FindRouteResult::Found(r, p) => (r, p),
         FindRouteResult::InvalidParam => {
             debug!(path = req.path, "invalid path parameter");
-            write_error(stream, 400, "Bad Request")?;
+            resp.error(400)?;
             return Ok(ResponseInfo { status: 400, bytes: 0, latency_us: start.elapsed().as_micros() });
         }
         FindRouteResult::NotFound => {
             debug!(path = req.path, "no route matched");
-            write_error(stream, 404, "Not Found")?;
+            resp.error(404)?;
             return Ok(ResponseInfo { status: 404, bytes: 0, latency_us: start.elapsed().as_micros() });
         }
     };
@@ -108,12 +109,12 @@ pub fn handle_request<W: Write>(
     // filesystem through the same resolver, so exempting them just moved the
     // escape one route type over.
     if escapes_site_dir(&fs_path, ctx.site_dir) {
-        write_error(stream, 404, "Not Found")?;
+        resp.error(404)?;
         return Ok(ResponseInfo { status: 404, bytes: 0, latency_us: start.elapsed().as_micros() });
     }
 
     if route.tail {
-        return handle_tail(req, route, &params, ctx, stream, start);
+        return handle_tail(req, route, &params, ctx, resp, start);
     }
 
     // Every static asset used to go out as bare `Cache-Control: public` with
@@ -129,7 +130,7 @@ pub fn handle_request<W: Write>(
         Ok(m) => m,
         Err(_) => {
             debug!(path = %fs_path.display(), "file not found");
-            write_error(stream, 404, "Not Found")?;
+            resp.error(404)?;
             return Ok(ResponseInfo { status: 404, bytes: 0, latency_us: start.elapsed().as_micros() });
         }
     };
@@ -258,7 +259,7 @@ pub fn handle_request<W: Write>(
             ("ETag", &etag),
             ("Last-Modified", &last_modified),
         ];
-        write_response(stream, 412, "Precondition Failed", &hdrs, &[])?;
+        resp.send(412, &hdrs, &[])?;
         return Ok(ResponseInfo { status: 412, bytes: 0, latency_us: start.elapsed().as_micros() });
     }
 
@@ -268,7 +269,7 @@ pub fn handle_request<W: Write>(
             ("ETag", &etag),
             ("Last-Modified", &last_modified),
         ];
-        write_response(stream, 304, "Not Modified", &hdrs, &[])?;
+        resp.send(304, &hdrs, &[])?;
         return Ok(ResponseInfo { status: 304, bytes: 0, latency_us: start.elapsed().as_micros() });
     }
 
@@ -276,7 +277,7 @@ pub fn handle_request<W: Write>(
         Ok(d) => d,
         Err(_) => {
             debug!(path = %fs_path.display(), "file not found");
-            write_error(stream, 404, "Not Found")?;
+            resp.error(404)?;
             return Ok(ResponseInfo { status: 404, bytes: 0, latency_us: start.elapsed().as_micros() });
         }
     };
@@ -335,14 +336,12 @@ pub fn handle_request<W: Write>(
         hdrs.push((k.as_str(), v.as_str()));
     }
 
-    let bytes = if req.method == "HEAD" {
-        write_head_response(stream, 200, "OK", &hdrs, body.len())?;
-        0
-    } else {
-        let len = body.len();
-        write_response(stream, 200, "OK", &hdrs, &body)?;
-        len
-    };
+    // The HEAD rule lives in the responder now, and applies to every status
+    // this file can answer with -- not just this one, which is all
+    // `write_head_response` ever covered.
+    let before = resp.body_bytes();
+    resp.send(200, &hdrs, &body)?;
+    let bytes = resp.body_bytes() - before;
 
     Ok(ResponseInfo { status: 200, bytes, latency_us: start.elapsed().as_micros() })
 }
@@ -372,7 +371,7 @@ fn handle_tail<W: Write>(
     route: &Route,
     params: &crate::route::Params,
     ctx: &HandlerContext,
-    stream: &mut W,
+    resp: &mut Responder<'_, W>,
     start: Instant,
 ) -> Result<ResponseInfo> {
     let fs_path = route.resolve_fs_path(params, ctx.site_dir);
@@ -393,7 +392,7 @@ fn handle_tail<W: Write>(
     let mut file = match std::fs::File::open(&fs_path) {
         Ok(f) => f,
         Err(_) => {
-            write_error(stream, 404, "Not Found")?;
+            resp.error(404)?;
             return Ok(ResponseInfo { status: 404, bytes: 0, latency_us: start.elapsed().as_micros() });
         }
     };
@@ -447,10 +446,9 @@ fn handle_tail<W: Write>(
     // Same table as the main path above; see the note there.
     let mime = m6_core::mime::mime_from_path(&fs_path).to_string();
 
-    write_response(
-        stream,
+    let before = resp.body_bytes();
+    resp.send(
         200,
-        "OK",
         &[
             ("Content-Type", mime.as_str()),
             ("Cache-Control", "no-store"),
@@ -459,12 +457,23 @@ fn handle_tail<W: Write>(
         &body,
     )?;
 
-    Ok(ResponseInfo { status: 200, bytes: body.len(), latency_us: start.elapsed().as_micros() })
+    Ok(ResponseInfo {
+        status: 200,
+        bytes: resp.body_bytes() - before,
+        latency_us: start.elapsed().as_micros(),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The handler answers through a `Responder`, which is what applies the
+    /// HEAD rule and the connection policy. Tests build one over a `Vec` so
+    /// they exercise the same writer production does.
+    fn responder<'a>(out: &'a mut Vec<u8>, req: &'a Request) -> Responder<'a, Vec<u8>> {
+        Responder::new(out, &req.method, false)
+    }
     use crate::config::{Config, RouteConfig};
     use crate::route::Route;
     use std::io::Cursor;
@@ -514,7 +523,7 @@ mod tests {
         let ctx = HandlerContext { routes: &routes, config: &config, site_dir: dir.path() };
 
         let mut out = Vec::new();
-        let info = handle_request(&req, &ctx, &mut out).unwrap();
+        let info = handle_request(&req, &ctx, &mut responder(&mut out, &req)).unwrap();
 
         assert_eq!(info.status, 200);
         let (status, headers, body) = parse_response(&out);
@@ -538,7 +547,7 @@ mod tests {
         let ctx = HandlerContext { routes: &routes, config: &config, site_dir: dir.path() };
 
         let mut out = Vec::new();
-        handle_request(&req, &ctx, &mut out).unwrap();
+        handle_request(&req, &ctx, &mut responder(&mut out, &req)).unwrap();
         let (_, headers, body) = parse_response(&out);
 
         assert_eq!(body, b"line3\n");
@@ -558,7 +567,7 @@ mod tests {
         let ctx = HandlerContext { routes: &routes, config: &config, site_dir: dir.path() };
 
         let mut out = Vec::new();
-        handle_request(&req, &ctx, &mut out).unwrap();
+        handle_request(&req, &ctx, &mut responder(&mut out, &req)).unwrap();
         let (status, headers, body) = parse_response(&out);
 
         assert_eq!(status, 200);
@@ -580,7 +589,7 @@ mod tests {
         let ctx = HandlerContext { routes: &routes, config: &config, site_dir: dir.path() };
 
         let mut out = Vec::new();
-        handle_request(&req, &ctx, &mut out).unwrap();
+        handle_request(&req, &ctx, &mut responder(&mut out, &req)).unwrap();
         let (status, headers, body) = parse_response(&out);
 
         assert_eq!(status, 200);
@@ -602,7 +611,7 @@ mod tests {
         let ctx = HandlerContext { routes: &routes, config: &config, site_dir: dir.path() };
 
         let mut out = Vec::new();
-        handle_request(&req, &ctx, &mut out).unwrap();
+        handle_request(&req, &ctx, &mut responder(&mut out, &req)).unwrap();
         let (_, headers, body) = parse_response(&out);
 
         assert_eq!(body, b"only\none\n");
@@ -624,7 +633,7 @@ mod tests {
         let ctx = HandlerContext { routes: &routes, config: &config, site_dir: dir.path() };
 
         let mut out = Vec::new();
-        handle_request(&req, &ctx, &mut out).unwrap();
+        handle_request(&req, &ctx, &mut responder(&mut out, &req)).unwrap();
         let (_, headers, body) = parse_response(&out);
 
         assert_eq!(body, b"d\n");
@@ -654,7 +663,7 @@ mod tests {
         let ctx = HandlerContext { routes: &routes, config: &config, site_dir: dir.path() };
 
         let mut out = Vec::new();
-        handle_request(&req, &ctx, &mut out).unwrap();
+        handle_request(&req, &ctx, &mut responder(&mut out, &req)).unwrap();
         let (status, _headers, body) = parse_response(&out);
 
         assert_eq!(status, 200);
@@ -681,7 +690,7 @@ mod tests {
         let ctx = HandlerContext { routes: &routes, config: &config, site_dir: dir.path() };
 
         let mut out = Vec::new();
-        handle_request(&req, &ctx, &mut out).unwrap();
+        handle_request(&req, &ctx, &mut responder(&mut out, &req)).unwrap();
         let (status, _headers, body) = parse_response(&out);
 
         assert_eq!(status, 200);
@@ -699,7 +708,7 @@ mod tests {
         let ctx = HandlerContext { routes: &routes, config: &config, site_dir: dir.path() };
 
         let mut out = Vec::new();
-        let info = handle_request(&req, &ctx, &mut out).unwrap();
+        let info = handle_request(&req, &ctx, &mut responder(&mut out, &req)).unwrap();
         assert_eq!(info.status, 404);
     }
 
@@ -744,7 +753,7 @@ mod tests {
         let config = Config::default();
         let ctx = HandlerContext { routes: &routes, config: &config, site_dir: dir };
         let mut out = Vec::new();
-        handle_request(&req, &ctx, &mut out).unwrap();
+        handle_request(&req, &ctx, &mut responder(&mut out, &req)).unwrap();
         let (status, headers, body) = parse_response_bytes(&out);
         assert_eq!(status, 200, "expected 200 for {name}");
         let etag = headers.iter().find(|(k, _)| k == "etag").expect("etag header").1.clone();
@@ -831,7 +840,7 @@ mod tests {
             let config = Config::default();
             let ctx = HandlerContext { routes: &routes, config: &config, site_dir: dir.path() };
             let mut out = Vec::new();
-            handle_request(&req, &ctx, &mut out).unwrap();
+            handle_request(&req, &ctx, &mut responder(&mut out, &req)).unwrap();
             parse_response_bytes(&out).0
         };
 
