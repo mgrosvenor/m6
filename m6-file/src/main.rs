@@ -5,7 +5,8 @@ mod http;
 mod route;
 
 use anyhow::{Context, Result};
-use config::{socket_path_from_config, Config};
+use config::Config;
+use m6_core::server::socket_path_from_config;
 use handler::{handle_request, HandlerContext};
 use route::Route;
 use std::os::unix::fs::PermissionsExt;
@@ -134,11 +135,7 @@ fn run() -> i32 {
         "routes loaded"
     );
 
-    let socket_path = if let Ok(override_path) = std::env::var("M6_SOCKET_OVERRIDE") {
-        PathBuf::from(override_path)
-    } else {
-        socket_path_from_config(&config_path)
-    };
+    let socket_path = socket_path_from_config(&config_path);
 
     if let Some(parent) = socket_path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {

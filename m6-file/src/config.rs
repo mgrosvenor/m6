@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CompressionSettings {
@@ -93,23 +93,10 @@ impl Config {
     }
 }
 
-/// Derive the socket path from the config path.
-/// e.g. `configs/m6-file.conf` → `/run/m6/m6-file.sock`
-pub fn socket_path_from_config(config_path: &Path) -> PathBuf {
-    let stem = config_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("m6-file");
-    PathBuf::from(format!("/run/m6/{}.sock", stem))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_socket_path_derivation() {
-        let p = Path::new("configs/m6-file.conf");
-        assert_eq!(socket_path_from_config(p), PathBuf::from("/run/m6/m6-file.sock"));
-    }
-}
+// `socket_path_from_config` used to live here too, a fourth copy of a rule
+// m6-core already owned, and m6-file called this one rather than core's. It
+// differed only in its fallback stem (`m6-file` against core's `m6-default`),
+// which is the kind of difference that is harmless until the day it is not.
+// It is now `m6_core::server::socket_path_from_config`, which is also where
+// the `M6_SOCKET_OVERRIDE` escape hatch lives, so this service no longer
+// carries its own copy of that either.
