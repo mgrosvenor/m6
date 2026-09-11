@@ -60,6 +60,36 @@ pub fn socket_path_from_config(config_path: &Path) -> PathBuf {
 /// [`crate::app::App`] had no timeout at all.
 pub const DEFAULT_READ_TIMEOUT_SECS: u64 = 30;
 
+/// Default mode for a service's unix socket.
+///
+/// `0o660`, not the `0o666` that `m6-file` and `m6-auth-server` each set by
+/// hand. Every unit on this fleet runs `User=m6` and every socket lives in
+/// `/run/m6`, which systemd creates `0750` and owns as `m6`, so the world bits
+/// grant nothing that the directory does not already deny. They were free, and
+/// a permission that is free today is the one nobody re-examines when the
+/// directory mode changes.
+///
+/// Owner and group are what is actually used: the service creates the socket as
+/// `m6` and every consumer connects as `m6`, so this is the boundary the fleet
+/// already relies on, written down rather than inferred from a umask.
+pub const DEFAULT_SOCKET_MODE: u32 = 0o660;
+
+/// Apply the socket mode after bind, in one place.
+///
+/// `App` set no mode at all, so its five services took whatever the umask gave
+/// them, typically `0o755`. That worked for the same reason `0o666` worked:
+/// the directory was doing the enforcing. Neither is a decision anybody made.
+///
+/// Failure is logged and tolerated. The socket is already bound and the service
+/// is already serving; refusing to continue would trade a socket that is more
+/// permissive than intended for one that does not exist.
+pub fn apply_socket_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)) {
+        warn!(error = %e, mode = format!("{mode:04o}"), "failed to set socket permissions");
+    }
+}
+
 /// Apply the per-connection read timeout, in one place.
 ///
 /// A silent peer is the whole reason this exists. `serve_connection` blocks in

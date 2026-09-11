@@ -1690,6 +1690,7 @@ fn run_app_with_shutdown(
     // reason: it is applied to a socket at accept time, so a reload cannot
     // retune it without reopening connections that are already being served.
     let read_timeout = framework_state.config.server.read_timeout;
+    let socket_mode = framework_state.config.server.socket_mode;
 
     // Wrap state in RwLock so hot reload can atomically swap it while
     // in-flight requests continue reading the old state via their cloned Arc.
@@ -1720,6 +1721,10 @@ fn run_app_with_shutdown(
         eprintln!("Failed to bind socket {}: {e}", socket_path.display());
         std::process::exit(2);
     });
+
+    // Before the shutdown handle below, which self-connects to this socket:
+    // the mode has to be right by the time anything can reach it.
+    crate::server::apply_socket_mode(&socket_path, socket_mode);
 
     // After the bind, not before: the wake connects to this socket, so it has
     // to exist by the time a signal can arrive.

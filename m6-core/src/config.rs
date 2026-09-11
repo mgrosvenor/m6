@@ -45,6 +45,13 @@ pub struct ServerConfig {
     /// whole pool. Configure `read_timeout_s = 0` to ask for that old
     /// behaviour back deliberately.
     pub read_timeout: Option<std::time::Duration>,
+    /// Mode applied to the unix socket after bind, from `socket_mode`.
+    ///
+    /// Written the way systemd writes it, as an octal string:
+    /// `socket_mode = "0660"`. TOML has no octal literal, and `660` as a
+    /// decimal integer is `0o1224`, which is the kind of thing that is only
+    /// noticed a month after it stops mattering.
+    pub socket_mode: u32,
 }
 
 /// Compression level for a MIME type.
@@ -221,21 +228,50 @@ fn parse_config(tv: toml::Value, _site_dir: &Path) -> anyhow::Result<RendererCon
         .unwrap_or(256);
 
     // --- server ---
+    // Both keys refuse a value they cannot make sense of rather than quietly
+    // substituting a default. A service that will not start says so on the
+    // first line of its journal; a service that started with a socket mode or
+    // a deadline nobody chose looks healthy, which is lesson 12 and the reason
+    // the `[server]` section is the one place it would hurt most.
+    //
     // 30 seconds is not a new number: m6-file and m6-auth-server each picked it
     // by hand for the same reason, so it is the value this fleet already runs.
-    // A negative value is treated as absent rather than as an error, because a
-    // config that fails to parse takes the service down and an unreadable
-    // timeout is not worth that.
-    let read_timeout_s = tv
-        .get("server")
-        .and_then(|t| t.get("read_timeout_s"))
-        .and_then(|v| v.as_integer())
-        .filter(|v| *v >= 0)
-        .unwrap_or(crate::server::DEFAULT_READ_TIMEOUT_SECS as i64);
+    let read_timeout_s = match tv.get("server").and_then(|t| t.get("read_timeout_s")) {
+        None => crate::server::DEFAULT_READ_TIMEOUT_SECS as i64,
+        Some(v) => {
+            let n = v.as_integer().ok_or_else(|| {
+                anyhow::anyhow!("[server] read_timeout_s must be an integer, got {v}")
+            })?;
+            if n < 0 {
+                anyhow::bail!("[server] read_timeout_s must not be negative, got {n}");
+            }
+            n
+        }
+    };
     let read_timeout = if read_timeout_s == 0 {
         None
     } else {
         Some(std::time::Duration::from_secs(read_timeout_s as u64))
+    };
+
+    // An octal string, as systemd writes it. See `ServerConfig::socket_mode`
+    // for why this is not an integer.
+    let socket_mode = match tv.get("server").and_then(|t| t.get("socket_mode")) {
+        None => crate::server::DEFAULT_SOCKET_MODE,
+        Some(v) => {
+            let s = v.as_str().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "[server] socket_mode must be an octal string such as \"0660\", got {v}"
+                )
+            })?;
+            let mode = u32::from_str_radix(s.trim_start_matches("0o"), 8).map_err(|_| {
+                anyhow::anyhow!("[server] socket_mode {s:?} is not an octal number")
+            })?;
+            if mode > 0o777 {
+                anyhow::bail!("[server] socket_mode {s:?} sets bits above 0777");
+            }
+            mode
+        }
     };
 
     // --- global_params ---
@@ -304,7 +340,7 @@ fn parse_config(tv: toml::Value, _site_dir: &Path) -> anyhow::Result<RendererCon
         routes,
         thread_pool: ThreadPoolConfig { size: tp_size, queue_size: tp_queue },
         params_cache: ParamsCacheConfig { size: pc_size },
-        server: ServerConfig { read_timeout },
+        server: ServerConfig { read_timeout, socket_mode },
         compression,
         minification,
         log,
@@ -436,6 +472,69 @@ queue_size = 32
         assert_eq!(cfg.thread_pool.size, 4);
         assert_eq!(cfg.thread_pool.queue_size, 32);
         assert_eq!(cfg.user_config.get("site_name").unwrap(), "Test");
+    }
+
+    /// Parse a `[server]` body, or return the refusal message.
+    fn server_cfg(body: &str) -> anyhow::Result<ServerConfig> {
+        let mut f = NamedTempFile::new().unwrap();
+        write!(f, "[server]\n{body}\n").unwrap();
+        load(f.path(), Path::new("/tmp")).map(|c| c.server)
+    }
+
+    /// The defaults are the contract for every config that says nothing, which
+    /// is every config in production today.
+    #[test]
+    fn server_defaults_are_thirty_seconds_and_0660() {
+        let mut f = NamedTempFile::new().unwrap();
+        write!(f, "site_name = \"Test\"\n").unwrap();
+        let cfg = load(f.path(), Path::new("/tmp")).unwrap();
+        assert_eq!(cfg.server.read_timeout, Some(std::time::Duration::from_secs(30)));
+        assert_eq!(cfg.server.socket_mode, 0o660);
+    }
+
+    #[test]
+    fn server_keys_are_read() {
+        let s = server_cfg("read_timeout_s = 5\nsocket_mode = \"0600\"").unwrap();
+        assert_eq!(s.read_timeout, Some(std::time::Duration::from_secs(5)));
+        assert_eq!(s.socket_mode, 0o600);
+    }
+
+    /// Zero is the documented way to ask for the old no-timeout behaviour, so
+    /// it has to survive as `None` rather than becoming a zero-length deadline,
+    /// which would time out every read instantly.
+    #[test]
+    fn a_zero_read_timeout_means_no_timeout() {
+        assert_eq!(server_cfg("read_timeout_s = 0").unwrap().read_timeout, None);
+    }
+
+    /// `socket_mode` is octal wherever it is written, so `"0660"` and `"660"`
+    /// are the same mode and neither is decimal 660.
+    #[test]
+    fn socket_mode_is_octal_with_or_without_the_leading_zero() {
+        assert_eq!(server_cfg("socket_mode = \"0660\"").unwrap().socket_mode, 0o660);
+        assert_eq!(server_cfg("socket_mode = \"660\"").unwrap().socket_mode, 0o660);
+        assert_eq!(server_cfg("socket_mode = \"0o660\"").unwrap().socket_mode, 0o660);
+    }
+
+    /// A value that cannot be understood stops the service rather than being
+    /// silently replaced by a default. A socket running at a mode nobody chose
+    /// looks exactly like one running at the right mode.
+    #[test]
+    fn a_nonsense_server_value_is_refused_not_defaulted() {
+        for body in [
+            "read_timeout_s = -1",
+            "read_timeout_s = \"30\"",
+            "socket_mode = 660",
+            "socket_mode = \"rw-rw----\"",
+            "socket_mode = \"0999\"",
+            "socket_mode = \"7777\"",
+        ] {
+            assert!(
+                server_cfg(body).is_err(),
+                "{body:?} should have been refused, got {:?}",
+                server_cfg(body).map(|s| (s.read_timeout, s.socket_mode))
+            );
+        }
     }
 
     #[test]

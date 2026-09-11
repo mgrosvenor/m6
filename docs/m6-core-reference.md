@@ -213,7 +213,7 @@ pub struct RendererConfig {
     pub routes:        Vec<RouteConfig>,
     pub thread_pool:   ThreadPoolConfig,     // size, queue_size
     pub params_cache:  ParamsCacheConfig,    // size
-    pub server:        ServerConfig,         // read_timeout
+    pub server:        ServerConfig,         // read_timeout, socket_mode
     pub compression:   HashMap<String, CompressionLevel>,  // per-mime brotli/gzip
     pub minification:  MinificationConfig,   // per-mime enabled, inline_js
     pub log:           LogConfig,            // level, format
@@ -229,6 +229,19 @@ connection, defaulting to `server::DEFAULT_READ_TIMEOUT_SECS` (30). `0` means
 no timeout, which is what every `App` service did before the key existed. Read
 once at startup, like the pool dimensions: it is set on a socket at accept
 time, so a reload cannot retune connections already being served.
+
+`[server] socket_mode` is the mode applied to the unix socket after bind,
+defaulting to `server::DEFAULT_SOCKET_MODE` (`0o660`). It is an **octal
+string**, as systemd writes it, because TOML has no octal literal and `660`
+as a decimal integer is `0o1224`.
+
+Neither key silently falls back. A value that cannot be understood, a negative
+timeout or a mode above `0777`, fails `config::load` and the service does not
+start. A service that will not start says so on the first line of its journal;
+a service running at a socket mode nobody chose looks exactly like one running
+at the right mode. Note that `--dump-config` is m6-http only, so an App
+service's config is **not** validated at deploy time by
+`deploy-platform.sh`.
 
 ### `server`
 
