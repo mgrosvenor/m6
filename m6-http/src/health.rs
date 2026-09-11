@@ -162,6 +162,20 @@ pub struct PoolHealth {
 }
 
 /// The public payload. Field order here is the field order on the wire.
+///
+/// Two fields, and that is the whole endpoint. It is an unauthenticated public
+/// URL, so everything on it is published to anyone who asks, and a monitor
+/// needs exactly two things from it: whether this node can serve, and which
+/// node answered.
+///
+/// It used to also carry `uptime_s`, the name and occupancy of every socket
+/// pool, and the names of the URL backends. That told an anonymous caller the
+/// internal service topology (`m6-html`, `m6-file`, `render-contact`,
+/// `render-analytics`), how many workers back each one, when the process last
+/// restarted, and, by polling, exactly when a deploy or a crash happened and
+/// whether a pool was losing members. None of that helps a monitor decide up
+/// or down, and all of it helps someone deciding what to aim at. It lives on
+/// `/perf` now, which is token-gated.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct HealthReport {
     /// `"ok"` or `"degraded"`.
@@ -169,14 +183,6 @@ pub struct HealthReport {
     /// This node's identity, e.g. `"sydney"`. The reason to have the endpoint
     /// at all: the answer says which node produced it.
     pub node: String,
-    /// Whole seconds since this process began serving.
-    pub uptime_s: u64,
-    /// Socket-backed pools. Empty on a cache node, which has none.
-    pub pools: Vec<PoolHealth>,
-    /// Names of URL backends. Presence only: proving one reachable would mean
-    /// a network round trip inside a health check, which is how a health
-    /// check learns to hang.
-    pub url_backends: Vec<String>,
 }
 
 impl HealthReport {
@@ -185,12 +191,10 @@ impl HealthReport {
     /// Degraded when any configured socket pool has no live member. A node
     /// with no socket pools at all (every cache node) is not degraded by
     /// that fact alone.
-    pub fn build(
-        node: &str,
-        uptime_s: u64,
-        pools: Vec<PoolHealth>,
-        url_backends: Vec<String>,
-    ) -> (u16, HealthReport) {
+    /// `pools` decides the verdict and is not reported. The status code still
+    /// carries the whole answer a monitor acts on, and `/perf` has the detail
+    /// for whoever is allowed to see which pool went quiet.
+    pub fn build(node: &str, pools: &[PoolHealth]) -> (u16, HealthReport) {
         let degraded = pools.iter().any(|p| p.active == 0);
         let status = if degraded { "degraded" } else { "ok" };
         // 503 is the honest code: the node is up enough to answer, but not
@@ -203,7 +207,7 @@ impl HealthReport {
         // still serving every request correctly. That is also why the numbers
         // live on `/perf` and not here.
         let code = if degraded { 503 } else { 200 };
-        (code, HealthReport { status, node: node.to_string(), uptime_s, pools, url_backends })
+        (code, HealthReport { status, node: node.to_string() })
     }
 
     /// Serialise to a body plus headers.
@@ -228,16 +232,27 @@ impl HealthReport {
     }
 }
 
-/// The `/perf` payload: everything `/health` reports, plus the numbers.
+/// The `/perf` payload: the numbers, plus the detail `/health` used to leak.
 ///
-/// Carries `node` and `uptime_s` as well so a dashboard scraping several
-/// nodes can attribute a sample without correlating two requests, and so a
-/// counter reset is distinguishable from a quiet node (uptime went
-/// backwards means the process restarted, not that traffic stopped).
+/// Carries `node` and `uptime_s` so a dashboard scraping several nodes can
+/// attribute a sample without correlating two requests, and so a counter reset
+/// is distinguishable from a quiet node (uptime going backwards means the
+/// process restarted, not that traffic stopped).
+///
+/// `pools` and `url_backends` moved here from `/health`. They are genuinely
+/// useful for diagnosing a degraded node, which is why they are kept rather
+/// than dropped, and they are behind the token for the same reason the
+/// latency percentiles are: they describe the shape of the thing being served.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct PerfReport {
     pub node: String,
     pub uptime_s: u64,
+    /// Socket-backed pools. Empty on a cache node, which has none.
+    pub pools: Vec<PoolHealth>,
+    /// Names of URL backends. Presence only: proving one reachable would mean
+    /// a network round trip inside a monitoring endpoint, which is how a
+    /// monitoring endpoint learns to hang.
+    pub url_backends: Vec<String>,
     pub metrics: StatsSnapshot,
 }
 
@@ -252,9 +267,12 @@ pub enum PerfOutcome {
 }
 
 impl PerfReport {
+    #[allow(clippy::too_many_arguments)]
     pub fn build(
         node: &str,
         uptime_s: u64,
+        pools: Vec<PoolHealth>,
+        url_backends: Vec<String>,
         headers: &[(String, String)],
         configured_token: Option<&str>,
         snapshot: impl FnOnce() -> StatsSnapshot,
@@ -270,6 +288,8 @@ impl PerfReport {
                 PerfOutcome::Ok(PerfReport {
                     node: node.to_string(),
                     uptime_s,
+                    pools,
+                    url_backends,
                     metrics: snapshot(),
                 })
             }
@@ -312,14 +332,12 @@ mod tests {
     #[test]
     fn origin_with_live_pools_is_ok() {
         let (code, report) = HealthReport::build(
-            "sydney", 42,
-            vec![pool("m6-html", 1, 1), pool("m6-file", 2, 2)],
-            vec![],
+            "sydney",
+            &[pool("m6-html", 1, 1), pool("m6-file", 2, 2)],
         );
         assert_eq!(code, 200);
         assert_eq!(report.status, "ok");
         assert_eq!(report.node, "sydney");
-        assert_eq!(report.uptime_s, 42);
     }
 
     /// The regression this endpoint most needs to not have.
@@ -329,21 +347,16 @@ mod tests {
     /// count alone reports both edge nodes as permanently down.
     #[test]
     fn cache_node_with_no_socket_pools_is_ok_not_degraded() {
-        let (code, report) = HealthReport::build(
-            "london", 900, vec![], vec!["origin".to_string()],
-        );
+        let (code, report) = HealthReport::build("london", &[]);
         assert_eq!(code, 200, "a cache node has no socket pools and is not degraded for it");
         assert_eq!(report.status, "ok");
-        assert_eq!(report.url_backends, vec!["origin".to_string()]);
-        assert!(report.pools.is_empty());
     }
 
     #[test]
     fn an_empty_pool_degrades_the_node() {
         let (code, report) = HealthReport::build(
-            "sydney", 1,
-            vec![pool("m6-html", 1, 1), pool("render-contact", 0, 1)],
-            vec![],
+            "sydney",
+            &[pool("m6-html", 1, 1), pool("render-contact", 0, 1)],
         );
         assert_eq!(code, 503);
         assert_eq!(report.status, "degraded");
@@ -354,13 +367,13 @@ mod tests {
     /// `active` would call this healthy.
     #[test]
     fn members_present_but_all_failed_is_degraded() {
-        let (code, _) = HealthReport::build("sydney", 1, vec![pool("m6-html", 0, 3)], vec![]);
+        let (code, _) = HealthReport::build("sydney", &[pool("m6-html", 0, 3)]);
         assert_eq!(code, 503);
     }
 
     #[test]
     fn response_is_never_stored_and_never_indexed() {
-        let (code, report) = HealthReport::build("sydney", 5, vec![], vec![]);
+        let (code, report) = HealthReport::build("sydney", &[]);
         let (code, headers, body) = report.into_response(code);
         assert_eq!(code, 200);
         let get = |k: &str| {
@@ -443,7 +456,7 @@ mod tests {
     fn perf_is_404_when_no_token_is_configured() {
         // Off by default, and it does not advertise a door that cannot be
         // opened: 404, not 401.
-        let out = PerfReport::build("sydney", 5, &auth("Bearer x"), None, snap);
+        let out = PerfReport::build("sydney", 5, vec![], vec![], &auth("Bearer x"), None, snap);
         let (code, _, body) = out.into_response();
         assert_eq!(code, 404);
         assert!(!String::from_utf8_lossy(&body).contains("unauthorised"));
@@ -451,7 +464,7 @@ mod tests {
 
     #[test]
     fn perf_is_401_with_a_scheme_hint_when_credentials_are_wrong() {
-        let out = PerfReport::build("sydney", 5, &auth("Bearer wrong"), Some("right"), snap);
+        let out = PerfReport::build("sydney", 5, vec![], vec![], &auth("Bearer wrong"), Some("right"), snap);
         let (code, headers, _) = out.into_response();
         assert_eq!(code, 401);
         assert!(headers
@@ -469,13 +482,21 @@ mod tests {
             taken = true;
             snap()
         };
-        let _ = PerfReport::build("sydney", 5, &[], Some("tok"), counting);
+        let _ = PerfReport::build("sydney", 5, vec![], vec![], &[], Some("tok"), counting);
         assert!(!taken, "snapshot must not be taken without authorisation");
     }
 
     #[test]
     fn perf_returns_metrics_when_authorised() {
-        let out = PerfReport::build("sydney", 11, &auth("Bearer tok"), Some("tok"), snap);
+        let out = PerfReport::build(
+            "sydney",
+            11,
+            vec![pool("m6-html", 1, 1)],
+            vec!["origin".to_string()],
+            &auth("Bearer tok"),
+            Some("tok"),
+            snap,
+        );
         let (code, _, body) = out.into_response();
         assert_eq!(code, 200);
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -483,21 +504,36 @@ mod tests {
         assert_eq!(parsed["uptime_s"], 11);
         assert_eq!(parsed["metrics"]["requests_total"], 0);
         assert!(parsed["metrics"]["hit_samples"].is_number());
+        // The detail that /health used to publish to anyone lives here now.
+        assert_eq!(parsed["pools"][0]["name"], "m6-html");
+        assert_eq!(parsed["url_backends"][0], "origin");
     }
 
+    /// The public payload is exactly two fields, and this asserts the set
+    /// rather than an allowlist.
+    ///
+    /// An allowlist is the wrong shape for this test: it passes when a field
+    /// is removed and, more to the point, it passed for as long as `/health`
+    /// was publishing `uptime_s`, every pool name and occupancy, and the URL
+    /// backend names, because those were on the list. Naming the exact set
+    /// means anything added to this struct has to be added here too, in a
+    /// test whose name says why that is a decision and not a formality.
     #[test]
-    fn payload_leaks_no_version_or_traffic_data() {
-        let (code, report) = HealthReport::build(
-            "sydney", 7, vec![pool("m6-html", 1, 1)], vec!["origin".to_string()],
-        );
+    fn public_payload_is_exactly_status_and_node() {
+        let (code, report) = HealthReport::build("sydney", &[pool("m6-html", 1, 1)]);
         let (_, _, body) = report.into_response(code);
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let object = parsed.as_object().expect("object");
-        let allowed = ["status", "node", "uptime_s", "pools", "url_backends"];
-        assert!(!object.contains_key("metrics"), "metrics must be absent without a token");
-        for key in object.keys() {
-            assert!(allowed.contains(&key.as_str()), "unexpected public field: {key}");
-        }
+
+        let mut keys: Vec<&str> = object.keys().map(|k| k.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["node", "status"],
+            "/health is unauthenticated and public: every field here is \
+             published to anyone who asks. Topology, worker counts and uptime \
+             belong on token-gated /perf."
+        );
     }
 }
 
