@@ -693,3 +693,62 @@ mod image_dimension_tests {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// The `m6-core` renderer seam
+// ---------------------------------------------------------------------------
+
+/// Tera, behind `m6_core::render::Renderer`.
+///
+/// The service loop in `m6-core` hands over a template name and a finished
+/// context and gets bytes back. It does not link Tera and does not know this
+/// type exists.
+pub struct TeraRenderer {
+    tera: Tera,
+}
+
+impl m6_core::render::Renderer for TeraRenderer {
+    fn render(
+        &self,
+        template: &str,
+        ctx: &serde_json::Map<String, Value>,
+    ) -> std::result::Result<String, m6_core::render::RenderError> {
+        let mut tctx = tera::Context::new();
+        for (k, v) in ctx {
+            tctx.insert(k.as_str(), v);
+        }
+        self.tera.render(template, &tctx).map_err(|e| {
+            // `{{ not_found() }}` fails the render with a sentinel, because a
+            // Tera error carries nothing but a string. The sentinel stops
+            // here: core is told `NotFound`, not handed a string to search.
+            let msg = format!("{e:#}");
+            if msg.contains(NOT_FOUND_SENTINEL) {
+                m6_core::render::RenderError::NotFound
+            } else {
+                m6_core::render::RenderError::Failed(
+                    anyhow::Error::new(e).context(format!("rendering template {template}")),
+                )
+            }
+        })
+    }
+}
+
+/// Builds a `TeraRenderer`, at startup and again on every config reload.
+pub struct TeraFactory;
+
+impl m6_core::render::RendererFactory for TeraFactory {
+    fn build(
+        &self,
+        site_dir: &Path,
+        template_paths: &[String],
+    ) -> anyhow::Result<Box<dyn m6_core::render::Renderer>> {
+        // No templates named by config routes means a handler app calling
+        // `render_with` directly, so load everything under `site_dir`.
+        let tera = if template_paths.is_empty() {
+            build_tera(site_dir).context("compiling templates")?
+        } else {
+            build_tera_from_paths(site_dir, template_paths).context("compiling templates")?
+        };
+        Ok(Box::new(TeraRenderer { tera }))
+    }
+}
