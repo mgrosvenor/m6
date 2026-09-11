@@ -342,7 +342,7 @@ pub fn parse_form_body(body: &[u8]) -> Vec<(String, String)> {
 /// Invalid UTF-8 becomes U+FFFD rather than failing the decode. For a public
 /// form one mangled character is a far better outcome than discarding the
 /// submission, and a hostile client can always send invalid bytes.
-fn url_decode(s: &str) -> String {
+pub fn url_decode(s: &str) -> String {
     let mut out: Vec<u8> = Vec::with_capacity(s.len());
     let bytes = s.as_bytes();
     let mut i = 0;
