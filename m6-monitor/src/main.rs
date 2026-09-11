@@ -22,6 +22,7 @@
 //! cares about, and fails the way a service fails rather than the way a script
 //! does.
 
+mod check;
 mod digest;
 mod fleet;
 mod poll;
@@ -31,6 +32,19 @@ use std::time::Duration;
 use m6_core::prelude::*;
 
 fn main() -> anyhow::Result<()> {
+    // `m6-monitor --check <config>` prints the hourly health check and exits,
+    // which is what `tools/health-check.py` used to do over ssh. Same code
+    // path as the page, so the two cannot disagree.
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--check") {
+        let config = args
+            .iter()
+            .skip(1)
+            .find(|a| !a.starts_with("--"))
+            .ok_or_else(|| anyhow::anyhow!("usage: m6-monitor --check <config-path>"))?;
+        return run_check(std::path::Path::new(config));
+    }
+
     App::new()
         .route_get("/", page)
         .route_get("/digest", digest_json)
@@ -38,26 +52,39 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Poll the fleet, print the check, exit 1 on faults.
+fn run_check(config_path: &std::path::Path) -> anyhow::Result<()> {
+    let (d, readings) = collect_from(config_path)?;
+    print!("{}", check::render(&d, &readings));
+    if d.level == digest::Level::Fault {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 /// Poll the fleet and build a digest, or explain why not.
-fn collect(req: &Request) -> anyhow::Result<digest::Digest> {
-    // The fleet lives in this service's own config, so it is reloaded by the
-    // same hot reload as everything else.
-    let config_path = std::env::args()
-        .nth(2)
-        .ok_or_else(|| anyhow::anyhow!("no config path in argv"))?;
-    let fleet = fleet::Fleet::from_config(std::path::Path::new(&config_path))?;
+fn collect_from(
+    config_path: &std::path::Path,
+) -> anyhow::Result<(digest::Digest, Vec<poll::NodeReading>)> {
+    let fleet = fleet::Fleet::from_config(config_path)?;
     let token = fleet.perf_token();
     let readings = poll::fleet(
         &fleet.nodes,
         token.as_deref(),
         Duration::from_millis(fleet.timeout_ms),
     );
+    let d = digest::build(&readings, &digest::Thresholds::default(), now_iso8601());
+    Ok((d, readings))
+}
+
+fn collect(req: &Request) -> anyhow::Result<digest::Digest> {
+    // The fleet lives in this service's own config, so it is reloaded by the
+    // same hot reload as everything else.
+    let config_path = std::env::args()
+        .nth(2)
+        .ok_or_else(|| anyhow::anyhow!("no config path in argv"))?;
     let _ = req;
-    Ok(digest::build(
-        &readings,
-        &digest::Thresholds::default(),
-        now_iso8601(),
-    ))
+    Ok(collect_from(std::path::Path::new(&config_path))?.0)
 }
 
 fn digest_json(req: &Request) -> Result<Response> {

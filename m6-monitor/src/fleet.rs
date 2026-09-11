@@ -27,16 +27,60 @@ pub struct Node {
     /// origin without saying which is which invites the wrong conclusion.
     #[serde(default)]
     pub role: String,
+    /// This node's `/perf` bearer token, if it has its own.
+    ///
+    /// **The nodes do not share a token.** Measured 2026-09-11: syd, lon, chi
+    /// and the build host each have a different `/etc/m6/perf-token`. The
+    /// docs said otherwise and were wrong, and the failure is quiet: the
+    /// monitor polls with one token and two of three nodes answer 401 with
+    /// nothing to say why.
+    ///
+    /// Distinct tokens are the better property, so this follows reality
+    /// rather than changing it: a leaked token exposes one node's `/perf`,
+    /// not the fleet's.
+    #[serde(default)]
+    pub perf_token_file: Option<String>,
+}
+
+impl Node {
+    /// This node's token, falling back to the fleet-wide one.
+    pub fn perf_token(&self, fallback: Option<&str>) -> Option<String> {
+        match &self.perf_token_file {
+            Some(path) => read_token(path),
+            None => fallback.map(|s| s.to_string()),
+        }
+    }
+}
+
+fn read_token(path: &str) -> Option<String> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => {
+            let t = s.trim().to_string();
+            if t.is_empty() {
+                tracing::warn!(path = %path, "perf token file is empty");
+                None
+            } else {
+                Some(t)
+            }
+        }
+        Err(e) => {
+            tracing::warn!(path = %path, error = %e, "perf token file unreadable");
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Fleet {
     pub nodes: Vec<Node>,
-    /// Bearer token for `/perf` on every node.
+    /// Fallback `/perf` bearer token, for nodes that do not name their own.
     ///
     /// Read from a file, never inlined: this config is in git and the token is
     /// not. Absent means `/perf` is not polled, and the report says so rather
     /// than showing an empty fleet.
+    ///
+    /// In this deployment every node has a distinct token, so each one names
+    /// its own and this is mostly a convenience for a fleet that does share.
     #[serde(default)]
     pub perf_token_file: Option<String>,
     /// How long to wait for one node before giving up on it.
@@ -66,23 +110,9 @@ impl Fleet {
         Ok(fleet)
     }
 
-    /// The `/perf` bearer token, if one is configured and readable.
+    /// The fleet-wide fallback token, if one is configured and readable.
     pub fn perf_token(&self) -> Option<String> {
-        let path = self.perf_token_file.as_ref()?;
-        match std::fs::read_to_string(path) {
-            Ok(s) => {
-                let t = s.trim().to_string();
-                if t.is_empty() {
-                    None
-                } else {
-                    Some(t)
-                }
-            }
-            Err(e) => {
-                tracing::warn!(path = %path, error = %e, "perf token file unreadable");
-                None
-            }
-        }
+        read_token(self.perf_token_file.as_ref()?)
     }
 }
 
@@ -145,6 +175,32 @@ role = "cache"
         // And the token itself is not a field anyone could set inline.
         let raw = std::fs::read_to_string(f.path()).unwrap();
         assert!(!raw.contains("s3cret"));
+    }
+
+    /// The nodes do not share a token, so a per-node file must win over the
+    /// fleet-wide one. Getting this wrong is a quiet failure: the monitor
+    /// polls with the wrong token and the node answers 401.
+    #[test]
+    fn a_node_token_overrides_the_fleet_token() {
+        let mut per_node = tempfile::NamedTempFile::new().unwrap();
+        write!(per_node, "node-token\n").unwrap();
+
+        let n = Node {
+            name: "lon".into(),
+            url: "https://lon".into(),
+            role: "cache".into(),
+            perf_token_file: Some(per_node.path().to_string_lossy().to_string()),
+        };
+        assert_eq!(n.perf_token(Some("fleet-token")).as_deref(), Some("node-token"));
+
+        let bare = Node {
+            name: "syd".into(),
+            url: "https://syd".into(),
+            role: "origin".into(),
+            perf_token_file: None,
+        };
+        assert_eq!(bare.perf_token(Some("fleet-token")).as_deref(), Some("fleet-token"));
+        assert_eq!(bare.perf_token(None), None);
     }
 
     #[test]
