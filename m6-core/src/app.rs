@@ -1154,14 +1154,32 @@ pub struct App {
     renderer: Arc<dyn RendererFactory>,
 }
 
+/// The renderer a service gets when it does not ask for a particular one.
+///
+/// With the `templates` feature on, which is the default, that is Tera with
+/// the site filters. Without it no engine is linked, and a route naming a
+/// template becomes a configuration error the operator hears about rather
+/// than an empty body nobody notices.
+fn default_renderer() -> Arc<dyn RendererFactory> {
+    #[cfg(feature = "templates")]
+    { Arc::new(crate::template::TeraFactory) }
+    #[cfg(not(feature = "templates"))]
+    { Arc::new(crate::render::NoTemplates) }
+}
+
 impl App {
-    /// `renderer` is how this service turns a template name into bytes.
+    pub fn new() -> Self {
+        Self { routes: vec![], renderer: default_renderer() }
+    }
+
+    /// Use a renderer other than the default.
     ///
-    /// A service with no templates passes `crate::render::NoTemplates` and
-    /// links no template engine at all, which is the point of Phase 5.
-    /// `m6-html` passes its Tera factory.
-    pub fn new(renderer: impl RendererFactory) -> Self {
-        Self { routes: vec![], renderer: Arc::new(renderer) }
+    /// The seam stays public. Core does not depend on Tera at the type level,
+    /// only at the default, so a service with its own engine or none says so
+    /// and gets it.
+    pub fn renderer(mut self, renderer: impl RendererFactory) -> Self {
+        self.renderer = Arc::new(renderer);
+        self
     }
 
     fn add_route(
@@ -1228,6 +1246,12 @@ impl App {
 
     pub fn run(self) -> Result<()> {
         run_app(self.routes, self.renderer)
+    }
+}
+
+impl Default for App {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1313,6 +1337,12 @@ impl<G: Send + Sync + 'static> AppWithGlobal<G> {
         self.add_route(path, RouteMethod::Delete, handler)
     }
 
+    /// Use a different renderer. See `App::renderer`.
+    pub fn renderer(mut self, renderer: impl RendererFactory) -> Self {
+        self.renderer = Arc::new(renderer);
+        self
+    }
+
     pub fn run(self) -> Result<()> {
         run_app_global(
             self.raw_routes,
@@ -1325,31 +1355,28 @@ impl<G: Send + Sync + 'static> AppWithGlobal<G> {
 
 impl App {
     pub fn with_global<G: Send + Sync + 'static>(
-        renderer: impl RendererFactory,
         init_global: impl Fn(&Map<String, Value>) -> Result<G> + Send + Sync + 'static,
     ) -> AppWithGlobal<G> {
         AppWithGlobal {
             raw_routes: vec![],
             init_global: Arc::new(init_global),
             destroy_global: None,
-            renderer: Arc::new(renderer),
+            renderer: default_renderer(),
         }
     }
 
     pub fn with_thread_state<T: Any + Send + 'static>(
-        renderer: impl RendererFactory,
         init_thread: impl Fn(&Map<String, Value>, &()) -> Result<T> + Send + Sync + 'static,
     ) -> AppWithThreadState<T> {
         AppWithThreadState {
             raw_routes: vec![],
             init_thread: Arc::new(init_thread),
             destroy_thread: None,
-            renderer: Arc::new(renderer),
+            renderer: default_renderer(),
         }
     }
 
     pub fn with_state<G: Send + Sync + 'static, T: Any + Send + 'static>(
-        renderer: impl RendererFactory,
         init_global: impl Fn(&Map<String, Value>) -> Result<G> + Send + Sync + 'static,
         init_thread: impl Fn(&Map<String, Value>, &G) -> Result<T> + Send + Sync + 'static,
     ) -> AppWithState<G, T> {
@@ -1359,7 +1386,7 @@ impl App {
             init_thread: Arc::new(init_thread),
             destroy_thread: None,
             destroy_global: None,
-            renderer: Arc::new(renderer),
+            renderer: default_renderer(),
         }
     }
 }
@@ -1440,6 +1467,12 @@ impl<T: Any + Send + 'static> AppWithThreadState<T> {
         handler: impl Fn(&Request, &(), &mut T) -> Result<Response> + Send + Sync + 'static,
     ) -> Self {
         self.add_route(path, RouteMethod::Delete, move |req, t| handler(req, &(), t))
+    }
+
+    /// Use a different renderer. See `App::renderer`.
+    pub fn renderer(mut self, renderer: impl RendererFactory) -> Self {
+        self.renderer = Arc::new(renderer);
+        self
     }
 
     pub fn run(self) -> Result<()> {
@@ -1539,6 +1572,12 @@ impl<G: Send + Sync + 'static, T: Any + Send + 'static> AppWithState<G, T> {
         handler: impl Fn(&Request, &G, &mut T) -> Result<Response> + Send + Sync + 'static,
     ) -> Self {
         self.add_route(path, RouteMethod::Delete, handler)
+    }
+
+    /// Use a different renderer. See `App::renderer`.
+    pub fn renderer(mut self, renderer: impl RendererFactory) -> Self {
+        self.renderer = Arc::new(renderer);
+        self
     }
 
     pub fn run(self) -> Result<()> {
@@ -2259,7 +2298,7 @@ mod tests {
 
     #[test]
     fn test_app_new_builds() {
-        let _app = App::new(crate::render::NoTemplates)
+        let _app = App::new()
             .route("/", |_req| Ok(Response::text("home")))
             .route_get("/about", |_req| Ok(Response::text("about")))
             .route_post("/submit", |_req| Ok(Response::status(200)));
@@ -2332,7 +2371,7 @@ mod tests {
         let cfg1 = crate::config::load(f.path(), site_dir.path()).unwrap();
         assert_eq!(cfg1.user_config["site_name"].as_str().unwrap(), "v1");
 
-        let state1 = FrameworkState::build(cfg1, site_dir.path().to_path_buf(), &[], &crate::render::NoTemplates).unwrap();
+        let state1 = FrameworkState::build(cfg1, site_dir.path().to_path_buf(), &[], &*default_renderer()).unwrap();
         let fs = Arc::new(RwLock::new(state1));
 
         // Verify initial state.
@@ -2343,7 +2382,7 @@ mod tests {
         write!(f2, "site_name = \"v2\"\n").unwrap();
 
         let cfg2 = crate::config::load(f2.path(), site_dir.path()).unwrap();
-        let state2 = FrameworkState::build(cfg2, site_dir.path().to_path_buf(), &[], &crate::render::NoTemplates).unwrap();
+        let state2 = FrameworkState::build(cfg2, site_dir.path().to_path_buf(), &[], &*default_renderer()).unwrap();
 
         // Atomic swap.
         *fs.write().unwrap() = state2;
@@ -2420,7 +2459,7 @@ mod tests {
     #[test]
     fn test_app_with_global_builds() {
         // Just verify it compiles and builds without panicking.
-        let _app: AppWithGlobal<u32> = App::with_global(crate::render::NoTemplates, |_cfg| Ok(42u32))
+        let _app: AppWithGlobal<u32> = App::with_global(|_cfg| Ok(42u32))
             .route("/", |_req, g| {
                 assert_eq!(*g, 42);
                 Ok(Response::text("ok"))
@@ -2433,7 +2472,7 @@ mod tests {
     #[test]
     fn test_app_with_thread_state_builds() {
         let _app: AppWithThreadState<Vec<String>> =
-            App::with_thread_state(crate::render::NoTemplates, |_cfg, _g| Ok(Vec::<String>::new()))
+            App::with_thread_state(|_cfg, _g| Ok(Vec::<String>::new()))
                 .route("/push", |_req, _g, t| {
                     t.push("hello".to_string());
                     Ok(Response::text("ok"))
@@ -2455,7 +2494,6 @@ mod tests {
         }
 
         let _app: AppWithState<Global, Local> = App::with_state(
-            crate::render::NoTemplates,
             |_cfg| Ok(Global { base: 10 }),
             |_cfg, g| Ok(Local { count: g.base }),
         )

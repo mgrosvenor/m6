@@ -1773,12 +1773,15 @@ dependencies = [
  "brotli",
  "bytes",
  "chrono",
+ "comrak",
+ "criterion",
  "filetime",
  "flate2",
  "futures-util",
  "hmac",
  "httparse",
  "httpdate",
+ "lettre",
  "libc",
  "lru",
  "minify-html",
@@ -1791,12 +1794,14 @@ dependencies = [
  "sha2",
  "slug",
  "tempfile",
+ "tera",
  "thiserror 1.0.69",
  "tokio",
  "toml",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "ureq",
 ]
 
 [[package]]
@@ -1824,7 +1829,6 @@ dependencies = [
  "brotli",
  "flate2",
  "m6-core",
- "m6-render",
  "tempfile",
 ]
 
@@ -1881,37 +1885,6 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "m6-render"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64",
- "chrono",
- "comrak",
- "criterion",
- "filetime",
- "hmac",
- "httpdate",
- "lettre",
- "libc",
- "lru",
- "m6-core",
- "nix",
- "rand",
- "serde",
- "serde_json",
- "sha2",
- "slug",
- "tempfile",
- "tera",
- "thiserror 1.0.69",
- "toml",
- "tracing",
- "tracing-subscriber",
- "ureq",
 ]
 
 [[package]]

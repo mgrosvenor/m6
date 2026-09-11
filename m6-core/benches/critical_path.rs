@@ -21,14 +21,14 @@ fn html_response(html: String) -> Response {
     r
 }
 
-use m6_render::app::{
+use m6_core::app::{
     compile_pattern, find_route, match_route, route_specificity, CompiledRoute, RouteMethod,
 };
 use m6_core::compress::{brotli_compress, gzip_compress};
 use m6_core::minify::{minify_css, minify_html, minify_js, minify_json};
-use m6_render::request::{parse_cookies, parse_query_string};
-use m6_render::response::Response;
-use m6_render::server::write_response;
+use m6_core::request::{parse_cookies, parse_query_string};
+use m6_core::response::Response;
+use m6_core::server::write_response;
 
 // ── Realistic content fixtures ────────────────────────────────────────────────
 
@@ -453,7 +453,7 @@ size = 64
         // Instead, build a raw server using the public server + app modules.
         let listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
 
-        let config = m6_render::config::load(&cfg_path2, &site_dir).unwrap();
+        let config = m6_core::config::load(&cfg_path2, &site_dir).unwrap();
 
         // Build Tera directly.
         let tmpl_path = site_dir.join("templates/page.html");
@@ -491,7 +491,7 @@ size = 64
                 .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                 .ok();
 
-            let raw = match m6_render::server::parse_request(&mut stream) {
+            let raw = match m6_core::server::parse_request(&mut stream) {
                 Ok(Some(r)) => r,
                 _ => continue,
             };
@@ -764,7 +764,7 @@ size = 64
 
         std::thread::spawn(move || {
             let listener = std::os::unix::net::UnixListener::bind(&sock_path2).unwrap();
-            let config = m6_render::config::load(&cfg_path2, &site_dir2).unwrap();
+            let config = m6_core::config::load(&cfg_path2, &site_dir2).unwrap();
             let tmpl_path = site_dir2.join("templates/page.html");
             let mut tera = tera::Tera::default();
             tera.add_template_file(&tmpl_path, Some("templates/page.html"))
@@ -797,7 +797,7 @@ size = 64
                 stream
                     .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                     .ok();
-                let raw = match m6_render::server::parse_request(&mut stream) {
+                let raw = match m6_core::server::parse_request(&mut stream) {
                     Ok(Some(r)) => r,
                     _ => continue,
                 };
