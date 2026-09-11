@@ -50,6 +50,78 @@ pub const UNTRUSTED_INBOUND: &[&str] = &[
     "x-real-ip",
 ];
 
+/// Whether a listener is allowed to believe a forwarded client IP.
+///
+/// The address a request is attributed to decides two things that matter: the
+/// rate-limit bucket it counts against, and the `client_ip` in analytics. Get
+/// it from a header a client can set and the rate limiter is trivially
+/// bypassed by rotating the value, which is why [`UNTRUSTED_INBOUND`] strips
+/// `x-forwarded-for` from every request on every protocol and nothing
+/// downstream has ever been allowed to look at it.
+///
+/// That is right for the public listener and wrong for the backbone. A cache
+/// node forwards to origin over `h2c://10.0.0.1:80` and already sends the real
+/// client IP (`h2c_client.rs`), so origin was stripping the one accurate
+/// answer it had and attributing every relayed request to the tunnel address.
+/// The visible cost was analytics: three of five crawler sightings in an hour
+/// were unattributable. The larger cost was the rate limiter, where **every
+/// request arriving through one cache node shared a single bucket** -- so one
+/// abusive client could throttle every other visitor routed through that node,
+/// and its own quota was diluted by theirs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ForwardedTrust {
+    /// A forwarded client IP here is a forgery attempt. The public listener.
+    Never,
+    /// The peer is one of our own cache nodes, reachable only over the
+    /// WireGuard tunnel. Granted by the listener, never by a header, and never
+    /// on a listener bound to a public address -- see `H2cListener::bind`.
+    Backbone,
+}
+
+/// The single client address a peer asserted, if it asserted exactly one
+/// well-formed one.
+///
+/// `X-Forwarded-For` is defined as a list, and the general rule for reading
+/// one is that only the entries appended by hops you trust mean anything. Here
+/// the topology makes that simpler and stricter: a cache node strips the
+/// client's copy at its own ingress and emits exactly one value of its own, so
+/// on the backbone leg there is never a list. Anything else -- two entries, an
+/// empty value, something that is not an IP -- did not come from the path this
+/// trusts, so it is refused rather than parsed for a plausible-looking member.
+///
+/// Refusing also bounds the rate limiter's key space. The key would otherwise
+/// be an arbitrary string from a header, and a peer able to vary it freely
+/// could grow the limiter's map without limit.
+pub fn sole_forwarded_ip(value: &str) -> Option<&str> {
+    let candidate = value.trim();
+    if candidate.contains(',') {
+        return None;
+    }
+    // Parsed, not pattern-matched: this becomes a map key and a log field.
+    if candidate.parse::<std::net::IpAddr>().is_err() {
+        return None;
+    }
+    Some(candidate)
+}
+
+/// The address to attribute a request to, for rate limiting and analytics.
+///
+/// `forwarded` is whatever the request carried in `x-forwarded-for` before
+/// ingress stripped it. It is stripped either way: the header never reaches a
+/// handler, a backend or the cache key on any path. Only the derived address
+/// is ever trusted, and only where [`ForwardedTrust::Backbone`] says the peer
+/// is entitled to assert one.
+pub fn attributed_client_ip<'a>(
+    forwarded: Option<&'a str>,
+    peer_ip: &'a str,
+    trust: ForwardedTrust,
+) -> &'a str {
+    if trust == ForwardedTrust::Never {
+        return peer_ip;
+    }
+    forwarded.and_then(sole_forwarded_ip).unwrap_or(peer_ip)
+}
+
 /// True if `name` is a header a client is never allowed to supply.
 #[inline]
 pub fn is_untrusted_inbound(name: &str) -> bool {
@@ -1721,5 +1793,109 @@ mod via_and_connection_tests {
         for leak in ["syd", "lon", "chi", "mgrosvenor", "backend.internal"] {
             assert!(!via.contains(leak), "Via leaks {leak:?}: {via}");
         }
+    }
+}
+
+#[cfg(test)]
+mod forwarded_trust_tests {
+    use super::*;
+
+    /// The public listener must never believe a forwarded address, whatever it
+    /// looks like. This is the rate-limit bypass: rotate the value, never get
+    /// throttled.
+    #[test]
+    fn a_public_listener_always_attributes_to_the_peer() {
+        for forged in ["203.0.113.9", "", "not-an-ip", "1.1.1.1, 2.2.2.2"] {
+            assert_eq!(
+                attributed_client_ip(Some(forged), "198.51.100.7", ForwardedTrust::Never),
+                "198.51.100.7",
+                "forged {forged:?} was believed on a public listener"
+            );
+        }
+    }
+
+    /// On the backbone the forwarded address is the accurate one, and is the
+    /// whole point of the change: without it every request relayed by one
+    /// cache node is attributed to that node.
+    #[test]
+    fn the_backbone_attributes_to_the_forwarded_address() {
+        assert_eq!(
+            attributed_client_ip(Some("203.0.113.9"), "10.0.0.4", ForwardedTrust::Backbone),
+            "203.0.113.9"
+        );
+        assert_eq!(
+            attributed_client_ip(Some(" 203.0.113.9 "), "10.0.0.4", ForwardedTrust::Backbone),
+            "203.0.113.9",
+            "surrounding whitespace is field syntax, not part of the address"
+        );
+        assert_eq!(
+            attributed_client_ip(Some("2001:db8::1"), "10.0.0.4", ForwardedTrust::Backbone),
+            "2001:db8::1"
+        );
+    }
+
+    /// A request that arrives on the backbone without one is attributed to the
+    /// peer, not dropped: origin is directly reachable too, and its own
+    /// monitoring calls arrive with no forwarded address at all.
+    #[test]
+    fn a_missing_forwarded_address_falls_back_to_the_peer() {
+        assert_eq!(
+            attributed_client_ip(None, "10.0.0.4", ForwardedTrust::Backbone),
+            "10.0.0.4"
+        );
+    }
+
+    /// Anything that is not exactly one well-formed address did not come from
+    /// the path this trusts.
+    ///
+    /// A list is the interesting case. The general reading of
+    /// `X-Forwarded-For` takes the leftmost entry as the original client, and
+    /// doing that here would let a cache node's peer prepend whatever it liked
+    /// and have origin believe it. A cache node emits exactly one value, so a
+    /// list means something other than the expected topology produced it.
+    #[test]
+    fn anything_but_a_single_address_is_refused() {
+        for bad in [
+            "203.0.113.9, 10.0.0.4",
+            "203.0.113.9,10.0.0.4",
+            "",
+            "   ",
+            "localhost",
+            "203.0.113.9:443",
+            "<script>",
+            "203.0.113.999",
+        ] {
+            assert_eq!(sole_forwarded_ip(bad), None, "{bad:?} should be refused");
+            assert_eq!(
+                attributed_client_ip(Some(bad), "10.0.0.4", ForwardedTrust::Backbone),
+                "10.0.0.4",
+                "{bad:?} was believed on the backbone"
+            );
+        }
+    }
+
+    /// The value becomes a rate-limiter map key, so it must come from a
+    /// bounded set. Parsing as an address is what bounds it: a peer cannot
+    /// grow the limiter's map by varying a free-form string.
+    #[test]
+    fn the_attributed_address_is_always_a_parseable_address_or_the_peer() {
+        let huge = "a".repeat(10_000);
+        let out = attributed_client_ip(Some(&huge), "10.0.0.4", ForwardedTrust::Backbone);
+        assert_eq!(out, "10.0.0.4");
+    }
+
+    /// `x-forwarded-for` stays in the set stripped from every inbound request
+    /// on every protocol. Trust decides whether a *derived address* is
+    /// believed, never whether the header survives.
+    #[test]
+    fn the_header_itself_is_still_untrusted_inbound() {
+        assert!(is_untrusted_inbound("x-forwarded-for"));
+        assert!(is_untrusted_inbound("X-Forwarded-For"));
+        let mut headers = vec![
+            ("X-Forwarded-For".to_string(), "203.0.113.9".to_string()),
+            ("Accept".to_string(), "*/*".to_string()),
+        ];
+        strip_untrusted_inbound(&mut headers);
+        assert_eq!(headers, vec![("Accept".to_string(), "*/*".to_string())]);
     }
 }
