@@ -5,8 +5,13 @@
 # Lowering one is a decision to accept a regression and must be argued for in
 # the commit message.
 #
+# NO FLOOR FOR h1:m6-http-edge. The TLS bridge in front of it is a Python
+# threading proxy, and the score through it came back 26, 23 and 25 on three
+# consecutive runs of identical code. A floor set from a number that moves is a
+# false-failure generator. The targets below are measured over plain TCP or a
+# unix socket and are stable run to run.
+#
 # target               floor  total
 h1:m6-file             15     32
 h1:m6-html             15     32
-h1:m6-http-redirect    26     32
-h1:m6-http-edge        25     32
+h1:m6-http-redirect    27     32

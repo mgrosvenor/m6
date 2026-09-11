@@ -300,20 +300,20 @@ run_h1() {
     h1_against "h1:m6-http-redirect" "$REDIRECT_PORT"
   fi
 
-  # The :443 engine itself, serving real content. h1spec speaks cleartext, so a
-  # TLS bridge sits in front with ALPN pinned to http/1.1 -- without the pin the
-  # server negotiates h2 and none of the byte sequences mean anything.
-  if start_edge; then
-    require_free_port "$EDGE_BRIDGE_PORT" "the TLS bridge" || return 1
-    $SETSID nohup python3 "$HERE/tls_bridge.py" "$EDGE_BRIDGE_PORT" 127.0.0.1 "$TLS_PORT" \
-      > "$WORK/tls-bridge.log" 2>&1 &
-    local bpid=$!
-    PIDS+=($bpid)
-    if wait_port_owned_by "$bpid" "$EDGE_BRIDGE_PORT" "the TLS bridge"; then
-      bridge_sanity "$EDGE_BRIDGE_PORT" || return 1
-      h1_against "h1:m6-http-edge" "$EDGE_BRIDGE_PORT"
-    fi
-  fi
+  # NOT MEASURED: the :443 engine behind a TLS bridge.
+  #
+  # h1spec speaks cleartext, so reaching :443 needs a TLS-terminating proxy in
+  # front, and the score through a Python threading proxy came back 30, 27, 27,
+  # 24, 24 on five consecutive runs of identical code. A gate built on a number
+  # that moves is a false-failure generator.
+  #
+  # It is also unnecessary. Since the redirect listener was rewritten onto
+  # Http11Listener, :80 and :443 run the SAME HTTP/1.1 engine -- the only
+  # difference is H1Io::Plain versus H1Io::Tls. The redirect target above is
+  # plain TCP, needs no bridge, and is stable run to run, so it measures the
+  # engine directly. The TLS layer itself is covered by h2spec and h3spec.
+  #
+  # tools/tls_bridge.py is kept for ad-hoc investigation; it is not a gate.
 }
 
 # Prove the bridge carries a known-good request UNDER THE TESTER'S OWN
