@@ -71,7 +71,7 @@ fn finding_9_tail_route_must_refuse_symlink_outside_site_dir() {
 
     let req = get_request("/logs/tail/escape.log", "offset=0");
     let mut out = Vec::new();
-    let info = handle_request(&req, &ctx, &mut out).unwrap();
+    let info = handle_request(&req, &ctx, &mut m6_core::h1::Responder::new(&mut out, &req.method, false)).unwrap();
 
     assert_ne!(
         body_of(&out),
@@ -96,7 +96,7 @@ fn finding_9_control_non_tail_route_refuses_same_symlink() {
 
     let req = get_request("/logs/escape.log", "");
     let mut out = Vec::new();
-    let info = handle_request(&req, &ctx, &mut out).unwrap();
+    let info = handle_request(&req, &ctx, &mut m6_core::h1::Responder::new(&mut out, &req.method, false)).unwrap();
 
     assert_eq!(
         info.status, 404,

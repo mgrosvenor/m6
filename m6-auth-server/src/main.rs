@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::Result;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use m6_auth::Db;
 use m6_core::server::{socket_path_from_config, UnixServer};
@@ -230,36 +230,23 @@ fn handle_connection(
     mut stream: std::os::unix::net::UnixStream,
     state: &Arc<handlers::AppState>,
 ) -> Result<()> {
-    use std::io::Write;
-
     stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
 
-    // A malformed request is answered, not dropped.
-    //
-    // This was `parse_request(&mut stream)?`, which returned from here without
-    // writing anything, so every unparseable request got a silent close. It
-    // stayed invisible while the parser was lenient enough to accept almost
-    // anything; consolidating onto the stricter one made it visible
-    // immediately, as a conformance score that went DOWN while the parser
-    // underneath got better.
-    let req = match m6_core::parse::parse_request(&mut stream) {
-        Ok(r) => r,
-        Err(e) => {
-            debug!(error = %e, "malformed request");
-            let resp = m6_core::http::RawResponse::new(e.status())
-                .body(format!("{}: {e}", e.reason()));
-            stream.write_all(&resp.to_bytes())?;
-            return Ok(());
-        }
-    };
+    // The loop, the malformed-request answer, the HEAD rule and the keep-alive
+    // decision are core's. This file had its own of each -- including a
+    // `parse_request(&mut stream)?` that returned to a caller which only
+    // logged, so every unparseable request got a silent close.
+    let served: std::result::Result<(), std::io::Error> =
+        m6_core::server::serve_connection(&mut stream, |req, out| {
+            // Unix sockets have no peer IP, so rate limiting keys off what the
+            // proxy forwarded.
+            let peer_ip = req
+                .header("x-forwarded-for")
+                .or_else(|| req.header("x-real-ip"))
+                .unwrap_or("unix")
+                .to_string();
 
-    // Extract peer IP for rate limiting (use a placeholder since Unix sockets don't have IPs)
-    let peer_ip = req.header("x-forwarded-for")
-        .or_else(|| req.header("x-real-ip"))
-        .unwrap_or("unix")
-        .to_string();
-
-    let resp = handlers::dispatch(&req, state, &peer_ip);
-    stream.write_all(&resp.to_bytes())?;
-    Ok(())
+            handlers::dispatch(req, state, &peer_ip).send(out)
+        });
+    Ok(served?)
 }

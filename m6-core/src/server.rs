@@ -95,8 +95,67 @@ where
     };
 
     let resp = handler(req);
-    if let Err(e) = stream.write_all(&resp.to_bytes()) {
+    let mut out = crate::h1::Responder::new(stream, "", false);
+    if let Err(e) = resp.send(&mut out) {
         error!(error = %e, "failed to write response");
+    }
+}
+
+/// Most requests one connection may serve before it is closed.
+///
+/// Persistent connections are the default in HTTP/1.1 (RFC 9112 9.3), but an
+/// unbounded one lets a single peer hold a slot forever by pipelining. The
+/// edge uses the same cap.
+pub const MAX_REQUESTS_PER_CONN: u32 = 100;
+
+/// Serve HTTP/1.1 on one accepted connection until it ends.
+///
+/// **This is the one backend connection loop.** m6-file, m6-html and
+/// m6-auth-server each had their own, and each of the three answered exactly
+/// one request and closed -- legal (RFC 9112 9.3 allows a server to close at
+/// any time) and expensive, because m6-http speaks HTTP/1.1 to its backends
+/// over unix sockets, so every cache miss paid a fresh connect and a fresh
+/// accept. Measured by h1spec as "Keep-alive default (HTTP/1.1)" failing on
+/// all three.
+///
+/// The handler is given a [`crate::h1::Responder`] rather than the stream, so
+/// the two rules that must hold for every response -- no body on a HEAD, and
+/// persistence decided here rather than by the handler -- cannot be forgotten
+/// one branch at a time.
+///
+/// A malformed request is answered and the connection closed: after a framing
+/// error there is no way to know where the next request starts, and guessing
+/// is how a smuggled one gets through.
+pub fn serve_connection<S, E, F>(stream: &mut S, mut handler: F) -> Result<(), E>
+where
+    S: std::io::Read + std::io::Write,
+    E: From<std::io::Error>,
+    F: FnMut(&RawRequest, &mut crate::h1::Responder<'_, S>) -> Result<(), E>,
+{
+    let mut served = 0u32;
+    loop {
+        let req = match parse_request(stream) {
+            Ok(r) => r,
+            // An idle persistent connection going away is how this loop is
+            // meant to end, not an error to report.
+            Err(crate::parse::ParseError::ConnectionClosed) => return Ok(()),
+            Err(e) => {
+                debug!(error = %e, "malformed request");
+                let mut resp = crate::h1::Responder::new(stream, "", false);
+                resp.error(e.status())?;
+                return Ok(());
+            }
+        };
+
+        served += 1;
+        let keep_alive = crate::h1::keep_alive(&req) && served < MAX_REQUESTS_PER_CONN;
+
+        let mut resp = crate::h1::Responder::new(stream, &req.method, keep_alive);
+        handler(&req, &mut resp)?;
+
+        if !keep_alive {
+            return Ok(());
+        }
     }
 }
 

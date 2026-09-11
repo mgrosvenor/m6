@@ -1,8 +1,6 @@
 /// Unix socket HTTP/1.1 server — connection accept loop and HTTP parsing.
-use std::io::{BufWriter, Write};
 use std::os::unix::net::UnixStream;
 
-use anyhow::Context;
 
 use crate::request::RawRequest;
 
@@ -27,25 +25,26 @@ pub fn parse_request(stream: &mut UnixStream) -> anyhow::Result<Option<RawReques
     }
 }
 
-/// Write a complete HTTP response to the stream using BufWriter —
-/// avoids building an intermediate Vec<u8> copy of the response.
-pub fn write_response(stream: &mut UnixStream, response: &crate::response::Response) -> anyhow::Result<()> {
-    let mut w = BufWriter::with_capacity(512, stream as &mut dyn Write);
-    response.write_to(&mut w)?;
-    w.flush().context("flushing response")?;
-    Ok(())
+/// Send a response through the one HTTP/1.1 response writer.
+pub fn write_response<W: std::io::Write>(
+    resp: &mut m6_core::h1::Responder<'_, W>,
+    response: &crate::response::Response,
+) -> anyhow::Result<()> {
+    response.send(resp)
 }
 
-/// Write a minimal error response without a full `Response` struct.
-pub fn write_error_response(stream: &mut UnixStream, status: u16, body: &str) -> anyhow::Result<()> {
-    let resp = crate::response::Response {
-        status,
-        headers: vec![("Content-Type".to_string(), "text/plain".to_string())],
-        body: body.as_bytes().to_vec(),
-        template_name: None,
-            template_dict: None,
-    };
-    write_response(stream, &resp)
+/// A minimal error response, for the paths that have no `Response` to send:
+/// a full thread pool, or a request that never parsed.
+pub fn write_error_response<W: std::io::Write>(
+    stream: &mut W,
+    status: u16,
+    _body: &str,
+) -> anyhow::Result<()> {
+    // Not a persistent connection: these are the paths where the server is
+    // giving up on the connection, not serving it.
+    let mut resp = m6_core::h1::Responder::new(stream, "", false);
+    resp.error(status)?;
+    Ok(())
 }
 
 #[cfg(test)]
