@@ -32,9 +32,16 @@ commit log rather than written from memory.
 
 ## 1. Where the work is
 
-**Branch `main`, clean, 78 commits ahead of the deployed `22ee3a4` here and 15
+**Branch `main`, clean, 80 commits ahead of the deployed `22ee3a4` here and 15
 ahead of `d6ebfa5` in the site repo. No migration code is deployed and the
 freeze holds until it is finished.**
+
+> **Both repos are ahead of `origin/main` and that is not fine.** 61 commits on
+> `m6`, 13 on the site repo, as of 2026-09-12. Ahead of the *fleet* is the
+> deliberate freeze; ahead of *origin* is just unbacked work on a laptop, and
+> the site handover's §5 says to push when you find this. Not pushed here
+> because `m6`'s `pre-push` hook runs the full suite and the owner has not
+> asked for it this session. **Push both.**
 
 > The deployed commit is whatever the newest entry in
 > `~/dr-grosvenor-site/docs/RELEASES.md` names, and nothing else. **Recompute,
@@ -72,7 +79,9 @@ applied them:
   was previously refused on one node and served on two, which is exactly what
   the reconciliation was for.
 
-- 962 workspace tests pass at default features. Zero warnings.
+- **969 workspace tests pass at default features, verified on Linux via
+  `deploy/run-tests.sh m6` on 2026-09-12. Zero warnings**, release and test
+  builds, same count as macOS.
 - h1spec **32/32 on all four HTTP/1.1 targets**, with a CI ratchet
   (`tools/conformance.sh`, floors in `tools/conformance-scores.txt`) wired into
   `check.sh` as a blocking gate.
@@ -179,12 +188,13 @@ Services: `m6-http` (edge/proxy), `m6-file`, `m6-html`, `m6-auth-server`,
    `CONSOLIDATION-TODO.md`.
 2. **One app shape, minimal set only.** Scoped 2026-09-12; the architecture is
    agreed and deferred (`CONSOLIDATION-TODO.md` §3b). Do these and stop:
-   - **`App` sets a read timeout after accept.** Three lines at `app.rs:1872`
-     plus a config key. **The one urgent item on this whole list**: neither
-     `App` nor `m6_core::server` sets one, so five services park a worker
-     indefinitely on a silent peer, and the site has not been publicised yet.
+   - ~~**`App` sets a read timeout after accept.**~~ **DONE 2026-09-12**,
+     `d52a51b`. `[server] read_timeout_s`, default 30, `0` disables. The two
+     services that had hand-written the same 30 seconds now call the same core
+     function. **Production needs no config change; the default applies.** It
+     was not the three lines it looked like: see lesson 26.
    - **Socket permissions as a config key**, so m6-auth-server stops setting
-     `0666` by hand.
+     `0666` by hand. **Now the top item on this list.**
    - Optional: **lift the accept/poll block** m6-file duplicates 22 of 33 lines
      of.
    - Free, unrelated to shape: **`send_with_length` has zero callers** while
@@ -579,3 +589,30 @@ New 2026-09-12:
     cloud routine could not reach production over ssh. The check was a local
     session cron using my own shell and keys, and the answer was one field in
     a cron expression. `CronList` first, theory second.
+
+26. **A safety net added at one layer becomes a defect at the next.** Giving
+    `App` a read timeout was scoped as three lines and a config key. Setting
+    the option was indeed three lines. What the scoping missed is that nothing
+    downstream had ever seen a read time out: the timeout surfaced as
+    `ParseError::Io(WouldBlock)`, whose status is 400, and `serve_connection`
+    dutifully wrote that 400 to a peer that had sent nothing. m6-http pools
+    backend connections, so a response written into an idle socket is read as
+    the answer to the *next* request on it, which is manufactured response
+    smuggling on a code path added to improve safety. The fix is the split the
+    parser already made for `Ok(0)`, on whether any byte arrived: nothing means
+    an idle peer leaving, so close silently; a stalled part-request gets 408.
+    **When adding a deadline, follow the new error all the way to the wire**,
+    and ask what the peer does with whatever gets written.
+27. **`testkit::binary()` prefers `target/release`, and will happily hand a
+    test a binary from yesterday.** `cargo test` rebuilds the lib and the test
+    binary from current source, then spawns a service binary that may be hours
+    old. On 2026-09-12 a correct fix measured as broken twice, and the wire
+    said the opposite of the test: a manual run closed the connection at
+    exactly 1.00s while the suite insisted nothing happened. The release-first
+    rule is deliberate and should not be flipped (it was itself a fix, see the
+    doc comment), and there is no sound mtime check to bolt on, because in the
+    intended order cargo relinks the test binary *after* the release binaries.
+    So it is procedural: **`cargo build --workspace --release` before
+    `cargo test`**, and when an end-to-end test contradicts what the source
+    plainly says, `ls -la` the binary before debugging the code.
+    `deploy/run-tests.sh` builds release itself and is not exposed.

@@ -135,11 +135,22 @@ it comes up.
 Tier 1, half a day, near-zero risk. Per-connection handling is **already**
 consolidated in `server::serve_connection`, so what is left is small:
 
-- [ ] **`App` sets a read timeout after accept.** Three lines at `app.rs:1872`
-      plus a config key with a default. Five App services gain a protection
-      they do not have, and it removes one of m6-auth-server's two reasons for
-      a bespoke main. Most urgent item here: it is a live exposure and the site
-      has not been publicised yet.
+- [x] **`App` sets a read timeout after accept.** **DONE 2026-09-12**, `d52a51b`.
+      `[server] read_timeout_s`, default 30, `0` disables; `App` applies it
+      before handing the connection to a worker. m6-file and m6-auth-server had
+      each hand-written the same 30 seconds into their own accept path and now
+      call `server::apply_read_timeout`, so there is one implementation rather
+      than four. Production needs no config change: the default applies.
+
+      **It was not three lines, and the extra part is the interesting one.** A
+      timeout reached `serve_connection` as `ParseError::Io(WouldBlock)`, which
+      answers **400**. Into an *idle* connection that is a framing bug: m6-http
+      pools backend connections, so the 400 sits in the socket buffer and is
+      read as the response to the next request sent on it. `parse_request` now
+      splits a timeout on whether any byte arrived, exactly as it already split
+      `Ok(0)`: nothing yet is an idle peer leaving, closed silently; a stalled
+      part-request gets a real 408. Guards in `parse` and in
+      `m6-html/tests/read_timeout.rs`, all verified red first.
 - [ ] **Socket permissions as a config key.** ~5 lines in `server.rs`, then
       delete m6-auth-server's `set_permissions` block. Removes its other
       reason. After this its main differs in exactly one respect: it drives its
