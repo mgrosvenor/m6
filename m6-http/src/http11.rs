@@ -81,11 +81,33 @@ enum H1State {
 struct H1Conn {
     state:     H1State,
     client_ip: String,
+    /// Reset at the start of each request on a reused connection, so the
+    /// timeout below is idle time and not total connection age.
     created:   Instant,
+    /// Whether the response now being written leaves the connection open.
+    /// Decided per request from the version and the `Connection` header.
+    keep_alive: bool,
+    /// Requests answered on this connection. Bounded so one client cannot
+    /// hold a slot indefinitely by pipelining forever.
+    served:    u32,
 }
 
-/// Per-request idle timeout for HTTP/1.1 (single request per connection).
+/// Idle timeout for an HTTP/1.1 connection, measured from the start of the
+/// current request rather than from when the connection opened.
 pub(crate) const READ_TIMEOUT_SECS: u64 = 30;
+
+/// Most requests a single HTTP/1.1 connection may serve before it is closed.
+///
+/// Persistent connections are the default in HTTP/1.1 (RFC 9112 9.3) and this
+/// server did not implement them: every response carried `connection: close`.
+/// Legal, and expensive. Public clients mostly negotiate h2 so they were
+/// unaffected, but **m6-http talks HTTP/1.1 to its own backends**, so every
+/// cache miss paid a fresh connect to m6-file or m6-html.
+///
+/// A cap rather than unlimited so a connection cannot be held forever; at 100
+/// requests a browser's whole page load fits in one connection and a
+/// long-running client still cycles.
+const MAX_REQUESTS_PER_CONN: u32 = 100;
 /// Idle timeout for HTTP/2 connections (reused across many requests).
 pub(crate) const H2_IDLE_TIMEOUT_SECS: u64 = 300;
 /// 20 MiB — above m6-render's own 16 MiB multipart body cap, so oversized
@@ -170,9 +192,11 @@ impl Http11Listener {
                         }
                     } else {
                         ConnKind::Http1(H1Conn {
-                            state:     H1State::Reading { buf: Vec::new() },
-                            client_ip: peer.ip().to_string(),
-                            created:   Instant::now(),
+                            state:      H1State::Reading { buf: Vec::new() },
+                            client_ip:  peer.ip().to_string(),
+                            created:    Instant::now(),
+                            keep_alive: false,
+                            served:     0,
                         })
                     };
                     self.conns.push(Conn { stream, tls, kind });
@@ -312,9 +336,11 @@ where
     // Pump TLS I/O for H1 / still-handshaking connections.
     if advance_tls(conn.tls.as_mut().expect("tls path"), &conn.stream).is_err() {
         conn.kind = ConnKind::Http1(H1Conn {
-            state:     H1State::Done,
-            client_ip: String::new(),
-            created:   Instant::now(),
+            state:      H1State::Done,
+            client_ip:  String::new(),
+            created:    Instant::now(),
+            keep_alive: false,
+            served:     0,
         });
         return;
     }
@@ -341,9 +367,11 @@ where
             return;
         } else {
             conn.kind = ConnKind::Http1(H1Conn {
-                state:     H1State::Reading { buf: Vec::new() },
+                state:      H1State::Reading { buf: Vec::new() },
                 client_ip,
                 created,
+                keep_alive: false,
+                served:     0,
             });
         }
     }
@@ -481,6 +509,8 @@ where
                         continue;
                     }
                     ParseResult::Complete(req) => {
+                        h1.keep_alive = wants_keep_alive(&req)
+                            && h1.served + 1 < MAX_REQUESTS_PER_CONN;
                         match on_request(&req, &h1.client_ip) {
                             RequestOutcome::Ready(status, resp_headers, body, _, hints) => {
                                 let mut buf = Vec::new();
@@ -494,7 +524,9 @@ where
                                     }
                                     buf.extend_from_slice(b"\r\n");
                                 }
-                                buf.extend_from_slice(&build_response(status, &resp_headers, &body, &req.method));
+                                buf.extend_from_slice(&build_response(
+                                    status, &resp_headers, &body, &req.method, h1.keep_alive,
+                                ));
                                 h1.state = H1State::Writing { buf, pos: 0 };
                                 continue;
                             }
@@ -533,7 +565,9 @@ where
                     }
                     buf.extend_from_slice(b"\r\n");
                 }
-                buf.extend_from_slice(&build_response(status, &resp_headers, &body, &ctx.req.method));
+                buf.extend_from_slice(&build_response(
+                    status, &resp_headers, &body, &ctx.req.method, h1.keep_alive,
+                ));
                 h1.state = H1State::Writing { buf, pos: 0 };
                 // pump TLS to start sending immediately
                 if io.advance().is_err() { h1.state = H1State::Done; return; }
@@ -541,7 +575,7 @@ where
             }
             H1State::Writing { buf, pos } => {
                 let remaining = &buf[*pos..];
-                if remaining.is_empty() { h1.state = H1State::Done; return; }
+                if remaining.is_empty() { finish_response(h1); return; }
                 match io.write(remaining) {
                     Ok(0)      => { h1.state = H1State::Done; return; }
                     Ok(w)      => {
@@ -553,11 +587,58 @@ where
                 }
                 if io.advance().is_err() { h1.state = H1State::Done; return; }
                 let H1State::Writing { buf, pos } = &h1.state else { break };
-                if *pos >= buf.len() { h1.state = H1State::Done; return; }
+                if *pos >= buf.len() { finish_response(h1); return; }
                 break;
             }
             H1State::Done => return,
         }
+    }
+}
+
+/// End of a response: either close, or go back to reading for the next one.
+///
+/// Returning to `Reading` with an empty buffer is what makes the connection
+/// persistent. The idle clock restarts here, so the timeout measures time
+/// since the last request rather than the age of the connection -- otherwise a
+/// long-lived healthy connection would be reaped mid-request.
+fn finish_response(h1: &mut H1Conn) {
+    h1.served = h1.served.saturating_add(1);
+    if h1.keep_alive && h1.served < MAX_REQUESTS_PER_CONN {
+        h1.state = H1State::Reading { buf: Vec::new() };
+        h1.created = Instant::now();
+    } else {
+        h1.state = H1State::Done;
+    }
+}
+
+/// Whether this request leaves the connection open (RFC 9112 9.3).
+///
+/// HTTP/1.1 is persistent by default and closes only if asked. HTTP/1.0 is the
+/// reverse: it closes unless the client asked to keep it. Anything older, or a
+/// version we do not recognise, closes.
+fn wants_keep_alive(req: &HttpRequest) -> bool {
+    // EVERY `Connection` field line, not just the first. RFC 9110 5.3: repeated
+    // field lines are equivalent to one comma-joined value, so a request
+    // carrying `Connection: keep-alive` and `Connection: close` means
+    // `keep-alive, close` and must close.
+    //
+    // Taking only the first got this backwards and kept the connection open,
+    // which `test_hop_by_hop_stripped` caught immediately: it sends both, and
+    // its client then waited for a close that never came.
+    let has = |tok: &str| {
+        req.headers
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("connection"))
+            .flat_map(|(_, v)| v.split(','))
+            .any(|t| t.trim().eq_ignore_ascii_case(tok))
+    };
+
+    if req.version.eq_ignore_ascii_case("HTTP/1.1") {
+        !has("close")
+    } else if req.version.eq_ignore_ascii_case("HTTP/1.0") {
+        has("keep-alive")
+    } else {
+        false
     }
 }
 
@@ -763,7 +844,15 @@ pub fn parse_request(buf: &[u8]) -> ParseResult {
         method,
         path,
         query,
-        version: "HTTP/1.1".to_string(),
+        // The version the client actually sent, not a constant.
+        //
+        // This was hardcoded to "HTTP/1.1" for every request, so the field was
+        // a lie for anything that read it. It went unnoticed while nothing
+        // did: the code above uses httparse's own `req.version` and never this
+        // string. Persistent connections need it, because HTTP/1.1 defaults to
+        // keeping the connection and HTTP/1.0 defaults to closing it -- and
+        // with the constant in place an HTTP/1.0 client was told keep-alive.
+        version: if is_http11 { "HTTP/1.1".to_string() } else { "HTTP/1.0".to_string() },
         headers: fwd_headers,
         body,
     })
@@ -809,7 +898,13 @@ pub fn status_may_have_content_length(status: u16) -> bool {
     !(status == 204 || status == 304 || (100..200).contains(&status))
 }
 
-fn build_response(status: u16, headers: &[(String, String)], body: &[u8], method: &str) -> Vec<u8> {
+fn build_response(
+    status: u16,
+    headers: &[(String, String)],
+    body: &[u8],
+    method: &str,
+    keep_alive: bool,
+) -> Vec<u8> {
     let is_head = method.eq_ignore_ascii_case("HEAD");
     let reason = status_reason(status);
     let mut out = Vec::with_capacity(256 + if is_head { 0 } else { body.len() });
@@ -853,7 +948,15 @@ fn build_response(status: u16, headers: &[(String, String)], body: &[u8], method
     if status_may_have_content_length(status) {
         out.extend_from_slice(format!("content-length: {}\r\n", cl).as_bytes());
     }
-    out.extend_from_slice(b"connection: close\r\n\r\n");
+    // A response the recipient cannot frame must close, whatever either side
+    // would prefer: without Content-Length the body ends at end-of-connection,
+    // so keeping it open would make the next response unreadable.
+    let framed = status_may_have_content_length(status);
+    if keep_alive && framed {
+        out.extend_from_slice(b"connection: keep-alive\r\n\r\n");
+    } else {
+        out.extend_from_slice(b"connection: close\r\n\r\n");
+    }
     if !is_head {
         out.extend_from_slice(body);
     }
@@ -941,7 +1044,7 @@ mod head_framing_tests {
     #[test]
     fn get_sends_the_body() {
         let (head, body) = {
-            let raw = build_response(200, &hdrs(), BODY, "GET");
+            let raw = build_response(200, &hdrs(), BODY, "GET", false);
             let (h, b) = split(&raw);
             (h, b.to_vec())
         };
@@ -955,7 +1058,7 @@ mod head_framing_tests {
     /// it because it parses and discards the body, so every hand check passed.
     #[test]
     fn head_sends_zero_body_bytes() {
-        let raw = build_response(200, &hdrs(), BODY, "HEAD");
+        let raw = build_response(200, &hdrs(), BODY, "HEAD", false);
         let (_, body) = split(&raw);
         assert_eq!(body.len(), 0, "HEAD must send no body, got {} bytes", body.len());
     }
@@ -966,7 +1069,7 @@ mod head_framing_tests {
     /// the size checks that are most of the reason to send one.
     #[test]
     fn head_still_advertises_the_get_length() {
-        let raw = build_response(200, &hdrs(), BODY, "HEAD");
+        let raw = build_response(200, &hdrs(), BODY, "HEAD", false);
         let (head, _) = split(&raw);
         assert!(head.contains(&format!("content-length: {}", BODY.len())),
                 "expected content-length {}, headers were:\n{head}", BODY.len());
@@ -976,14 +1079,14 @@ mod head_framing_tests {
     /// header block — same status, same content-type, same everything.
     #[test]
     fn head_and_get_headers_match() {
-        let (gh, _) = { let r = build_response(200, &hdrs(), BODY, "GET"); let (h, _) = split(&r); (h, ()) };
-        let (hh, _) = { let r = build_response(200, &hdrs(), BODY, "HEAD"); let (h, _) = split(&r); (h, ()) };
+        let (gh, _) = { let r = build_response(200, &hdrs(), BODY, "GET", false); let (h, _) = split(&r); (h, ()) };
+        let (hh, _) = { let r = build_response(200, &hdrs(), BODY, "HEAD", false); let (h, _) = split(&r); (h, ()) };
         assert_eq!(gh, hh, "HEAD headers differ from GET headers");
     }
 
     #[test]
     fn method_match_is_case_insensitive() {
-        let raw = build_response(200, &hdrs(), BODY, "head");
+        let raw = build_response(200, &hdrs(), BODY, "head", false);
         let (_, body) = split(&raw);
         assert_eq!(body.len(), 0);
     }
@@ -1001,12 +1104,12 @@ mod head_framing_tests {
     #[test]
     fn empty_body_is_unchanged() {
         for m in ["GET", "HEAD"] {
-            let raw200 = build_response(200, &hdrs(), b"", m);
+            let raw200 = build_response(200, &hdrs(), b"", m, false);
             let (head, body) = split(&raw200);
             assert_eq!(body.len(), 0);
             assert!(head.contains("content-length: 0"), "200 must state its length:\n{head}");
 
-            let raw204 = build_response(204, &hdrs(), b"", m);
+            let raw204 = build_response(204, &hdrs(), b"", m, false);
             let (head, body) = split(&raw204);
             assert_eq!(body.len(), 0);
             assert!(
@@ -1096,7 +1199,7 @@ mod response_header_tests {
             ("Content-Type".to_string(), "image/svg+xml".to_string()),
         ];
         for method in ["GET", "HEAD"] {
-            let raw = build_response(200, &upstream, b"", method);
+            let raw = build_response(200, &upstream, b"", method, false);
             let found = header_lines(&raw, "content-length");
             assert_eq!(
                 found.len(),
@@ -1113,7 +1216,7 @@ mod response_header_tests {
     #[test]
     fn head_reports_the_get_representation_length() {
         let upstream = vec![("Content-Length".to_string(), "16580".to_string())];
-        let raw = build_response(200, &upstream, b"", "HEAD");
+        let raw = build_response(200, &upstream, b"", "HEAD", false);
         assert_eq!(header_lines(&raw, "content-length"), vec!["content-length: 16580"]);
         // ...and still no body.
         let body = String::from_utf8_lossy(&raw).split("\r\n\r\n").nth(1).unwrap_or("").len();
@@ -1125,7 +1228,7 @@ mod response_header_tests {
     #[test]
     fn body_length_wins_when_a_body_is_present() {
         let upstream = vec![("Content-Length".to_string(), "99999".to_string())];
-        let raw = build_response(200, &upstream, b"hello", "GET");
+        let raw = build_response(200, &upstream, b"hello", "GET", false);
         assert_eq!(header_lines(&raw, "content-length"), vec!["content-length: 5"]);
     }
 
@@ -1133,7 +1236,7 @@ mod response_header_tests {
     #[test]
     fn exactly_one_connection_header() {
         let upstream = vec![("Connection".to_string(), "keep-alive".to_string())];
-        let raw = build_response(200, &upstream, b"x", "GET");
+        let raw = build_response(200, &upstream, b"x", "GET", false);
         assert_eq!(header_lines(&raw, "connection").len(), 1);
     }
 
@@ -1144,7 +1247,7 @@ mod response_header_tests {
             ("Content-Type".to_string(), "text/html".to_string()),
             ("ETag".to_string(), "\"abc\"".to_string()),
         ];
-        let raw = build_response(200, &upstream, b"x", "GET");
+        let raw = build_response(200, &upstream, b"x", "GET", false);
         assert_eq!(header_lines(&raw, "content-type").len(), 1);
         assert_eq!(header_lines(&raw, "etag").len(), 1);
     }
@@ -1155,7 +1258,7 @@ mod bodyless_status_tests {
     use super::{build_response, status_may_have_content_length};
 
     fn head_of(status: u16) -> String {
-        let raw = build_response(status, &[("ETag".to_string(), "\"x\"".to_string())], b"", "GET");
+        let raw = build_response(status, &[("ETag".to_string(), "\"x\"".to_string())], b"", "GET", false);
         String::from_utf8_lossy(&raw).split("\r\n\r\n").next().unwrap_or("").to_string()
     }
 
@@ -1199,5 +1302,62 @@ mod bodyless_status_tests {
         let head = head_of(304);
         assert!(head.contains("ETag"), "304 lost its ETag:\n{head}");
         assert!(head.starts_with("HTTP/1.1 304 Not Modified"), "{head}");
+    }
+}
+
+#[cfg(test)]
+mod keep_alive_tests {
+    use super::*;
+
+    fn req(version: &str, conn_headers: &[&str]) -> HttpRequest {
+        HttpRequest {
+            method: "GET".into(),
+            path: "/".into(),
+            query: None,
+            version: version.into(),
+            headers: conn_headers
+                .iter()
+                .map(|v| ("Connection".to_string(), v.to_string()))
+                .collect(),
+            body: Vec::new(),
+        }
+    }
+
+    /// RFC 9112 9.3: HTTP/1.1 persists by default, HTTP/1.0 does not.
+    #[test]
+    fn version_sets_the_default() {
+        assert!(wants_keep_alive(&req("HTTP/1.1", &[])));
+        assert!(!wants_keep_alive(&req("HTTP/1.0", &[])));
+        // Anything we do not recognise closes.
+        assert!(!wants_keep_alive(&req("HTTP/0.9", &[])));
+    }
+
+    #[test]
+    fn the_connection_header_overrides_the_default() {
+        assert!(!wants_keep_alive(&req("HTTP/1.1", &["close"])));
+        assert!(wants_keep_alive(&req("HTTP/1.0", &["keep-alive"])));
+    }
+
+    /// RFC 9110 5.3: repeated field lines are one comma-joined value.
+    ///
+    /// Reading only the first `Connection` line answered "keep alive" to a
+    /// request that also said `close`. `test_hop_by_hop_stripped` sends both,
+    /// and its client then waited for a close that never came.
+    #[test]
+    fn every_connection_line_counts_not_just_the_first() {
+        assert!(!wants_keep_alive(&req("HTTP/1.1", &["keep-alive", "close"])));
+        assert!(!wants_keep_alive(&req("HTTP/1.1", &["close", "keep-alive"])));
+        assert!(!wants_keep_alive(&req("HTTP/1.1", &["keep-alive, close"])));
+    }
+
+    /// Tokens, not substrings: a value that merely contains the letters must
+    /// not match.
+    #[test]
+    fn matching_is_by_token() {
+        assert!(wants_keep_alive(&req("HTTP/1.1", &["x-not-close"])));
+        assert!(!wants_keep_alive(&req("HTTP/1.0", &["keep-alive-ish"])));
+        // Case-insensitive, per RFC 9110 7.6.1.
+        assert!(!wants_keep_alive(&req("HTTP/1.1", &["CLOSE"])));
+        assert!(wants_keep_alive(&req("HTTP/1.0", &["Keep-Alive"])));
     }
 }
