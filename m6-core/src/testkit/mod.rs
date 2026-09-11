@@ -50,6 +50,6 @@ pub mod wait;
 
 pub use paths::binary;
 pub use port::{claim_port, PortClaim};
-pub use process::{assert_lifecycle_logged, Service};
+pub use process::{assert_app_lifecycle, assert_lifecycle_logged, Service};
 pub use response::read_one;
 pub use wait::{for_path, for_tcp};
