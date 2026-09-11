@@ -456,13 +456,23 @@ case "$ONLY" in
 esac
 
 if [[ "$UPDATE" == "true" ]]; then
-  : > "$SCORES.new"
-  echo "# target            floor  total   (raised by tools/conformance.sh --update)" >> "$SCORES.new"
+  # MERGE, never rewrite. `--update h1` measures only the h1 targets, and a
+  # wholesale rewrite would silently delete the h2 and h3 floors -- turning the
+  # one file that says a protocol may not go backwards into the thing that lets
+  # it. The header comment explains the whole mechanism and is not regenerable,
+  # so it is preserved too.
+  cp "$SCORES" "$SCORES.new"
   while read -r k g t; do
     [[ -z "$k" ]] && continue
-    printf '%-20s %-6s %s\n' "$k" "$g" "$t" >> "$SCORES.new"
+    if grep -qE "^${k}[[:space:]]" "$SCORES.new"; then
+      # Replace this target's line in place, leaving every other line alone.
+      awk -v key="$k" -v floor="$g" -v total="$t" \
+        '$1 == key { printf "%-22s %-6s %s\n", key, floor, total; next } { print }' \
+        "$SCORES.new" > "$SCORES.tmp" && mv "$SCORES.tmp" "$SCORES.new"
+    else
+      printf '%-22s %-6s %s\n' "$k" "$g" "$t" >> "$SCORES.new"
+    fi
   done < "$MEASURED"
-  sort -o "$SCORES.new" "$SCORES.new"
   mv "$SCORES.new" "$SCORES"
   info "floors updated in $SCORES — commit this alongside the change that earned it"
   exit 0

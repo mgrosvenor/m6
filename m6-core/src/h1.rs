@@ -23,6 +23,256 @@
 
 use crate::http::RawRequest;
 
+/// Reduce an absolute-form request target to its path.
+///
+/// `http://host/a/b?c` becomes `/a/b?c`. Anything already in origin-form,
+/// asterisk-form (`OPTIONS *`) or authority-form (`CONNECT host:port`) is
+/// returned unchanged: only absolute-form carries a scheme.
+///
+/// A scheme-relative target (`//host/path`) is left alone. It is not
+/// absolute-form, and treating it as one would let `//evil.com/x` be rewritten
+/// to `/x` -- turning a request the router should refuse into one it serves.
+/// Is this a `Host` field value a server may act on (RFC 9110 4.2, RFC 3986)?
+///
+/// `Host` decides which site a request is for, so it is echoed into redirects,
+/// used as a cache key and handed to backends. A value with a space in it is
+/// not one authority: it is two tokens that different hops will split
+/// differently. The permitted set is the RFC 3986 authority alphabet, which
+/// excludes whitespace, controls and the delimiters that would let a value
+/// escape whatever it is later interpolated into.
+fn host_is_valid(v: &str) -> bool {
+    if v.len() > 253 {
+        return false;
+    }
+    // An IPv6 literal is bracketed and the only place `:` may repeat.
+    let (host, port) = match v.strip_prefix('[') {
+        Some(rest) => match rest.split_once(']') {
+            Some((inside, after)) => {
+                if !inside.bytes().all(|b| b.is_ascii_hexdigit() || b == b':' || b == b'.') {
+                    return false;
+                }
+                (None, after)
+            }
+            None => return false,
+        },
+        None => match v.split_once(':') {
+            Some((h, p)) => (Some(h), p),
+            None => (Some(v), ""),
+        },
+    };
+
+    if let Some(host) = host {
+        if host.is_empty() {
+            return false;
+        }
+        // reg-name: unreserved / pct-encoded / sub-delims.
+        let ok = |b: u8| {
+            b.is_ascii_alphanumeric()
+                || matches!(b, b'-' | b'.' | b'_' | b'~' | b'%'
+                             | b'!' | b'$' | b'&' | b'\'' | b'(' | b')'
+                             | b'*' | b'+' | b',' | b';' | b'=')
+        };
+        if !host.bytes().all(ok) {
+            return false;
+        }
+    }
+
+    let port = port.strip_prefix(':').unwrap_or(port);
+    port.is_empty() || (port.len() <= 5 && port.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// The interim response a client waiting on `Expect: 100-continue` needs.
+pub const CONTINUE_RESPONSE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
+
+/// What a client's `Expect` field asks of the server (RFC 9110 10.1.1).
+#[derive(Debug, PartialEq, Eq)]
+pub enum Expectation {
+    /// No `Expect` field, or one this version of HTTP ignores. Read the body.
+    None,
+    /// `Expect: 100-continue`. The client is holding the body back until it
+    /// hears that the request head was acceptable. Answer with
+    /// [`CONTINUE_RESPONSE`], or with a final status, *before* reading on.
+    ///
+    /// Answering is not optional in practice: a server that says nothing makes
+    /// every such client wait out its own timeout (curl waits a full second)
+    /// before sending the body anyway. That was the behaviour here.
+    Continue,
+    /// An expectation this server does not understand. RFC 9110 10.1.1: answer
+    /// 417 and do not read a body. Forwarding an expectation we cannot honour
+    /// would be worse, because the client would keep waiting for a response
+    /// nothing in the chain is going to send.
+    Unsupported,
+}
+
+/// Read the `Expect` field from a request head.
+///
+/// Returns `None` while the header block is still arriving: until the blank
+/// line lands, a later byte could still introduce an `Expect`, so there is
+/// nothing to conclude yet.
+///
+/// HTTP/1.0 clients get [`Expectation::None`] whatever they sent. `100
+/// (Continue)` is an HTTP/1.1 interim response and an HTTP/1.0 client has no
+/// way to read one: it would take the status line as the response.
+pub fn expectation(buf: &[u8]) -> Option<Expectation> {
+    let end = buf.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let head = &buf[..end];
+
+    let mut lines = head.split(|&b| b == b'\n');
+    // The request line is not a field, so `Expect` cannot appear in it, and
+    // the version it carries decides whether an interim response is readable.
+    let request_line = lines.next()?;
+    if !request_line.ends_with(b"HTTP/1.1\r") && !request_line.ends_with(b"HTTP/1.1") {
+        return Some(Expectation::None);
+    }
+
+    let mut found = Expectation::None;
+    for line in lines {
+        let Some(colon) = line.iter().position(|&b| b == b':') else { continue };
+        if !line[..colon].eq_ignore_ascii_case(b"expect") {
+            continue;
+        }
+        // A field may be repeated or comma-separated, and every member has to
+        // be one we understand before we can read a body.
+        for member in line[colon + 1..].split(|&b| b == b',') {
+            let member = trim_ascii(member);
+            if member.is_empty() {
+                continue;
+            }
+            if member.eq_ignore_ascii_case(b"100-continue") {
+                if found == Expectation::None {
+                    found = Expectation::Continue;
+                }
+            } else {
+                return Some(Expectation::Unsupported);
+            }
+        }
+    }
+    Some(found)
+}
+
+fn trim_ascii(mut b: &[u8]) -> &[u8] {
+    while let [first, rest @ ..] = b {
+        if first.is_ascii_whitespace() { b = rest } else { break }
+    }
+    while let [rest @ .., last] = b {
+        if last.is_ascii_whitespace() { b = rest } else { break }
+    }
+    b
+}
+
+/// Largest decoded chunked body accepted, matching the Content-Length cap.
+const MAX_CHUNKED_BODY: usize = 16 * 1024 * 1024;
+
+/// Outcome of decoding a chunked body.
+enum Chunked {
+    /// Fully decoded.
+    Done(Vec<u8>),
+    /// A complete body has not arrived yet; read more and retry.
+    Incomplete,
+    /// Malformed framing. Not recoverable: the connection cannot be trusted to
+    /// resynchronise, because the next bytes might be a smuggled request.
+    Bad,
+}
+
+/// Decode a chunked transfer-coded body (RFC 9112 7.1).
+///
+/// RFC 9112 7.1 makes this mandatory: "A server MUST be able to receive and
+/// decode the chunked transfer coding". It was refused outright before, with
+/// the reasoning that forwarding a body the proxy never read would be worse --
+/// true, and the answer is to read it, not to refuse every client that streams
+/// a request.
+///
+/// Decoding here rather than forwarding the coding onward is also the safer
+/// choice: the backend receives a plain `Content-Length` body, so the proxy
+/// and the backend cannot disagree about where the request ends. That
+/// disagreement is request smuggling.
+fn decode_chunked(buf: &[u8]) -> Chunked {
+    let mut out: Vec<u8> = Vec::new();
+    let mut i = 0usize;
+
+    loop {
+        // chunk-size [ ";" chunk-ext ] CRLF
+        let Some(eol) = find_crlf(&buf[i..]) else { return Chunked::Incomplete };
+        let line = &buf[i..i + eol];
+        // Extensions are permitted and ignored; the size ends at ';'.
+        let size_str = match line.iter().position(|&c| c == b';') {
+            Some(semi) => &line[..semi],
+            None => line,
+        };
+        if size_str.is_empty() || size_str.len() > 16 {
+            return Chunked::Bad;
+        }
+        let mut size: usize = 0;
+        for &c in size_str {
+            let d = match c {
+                b'0'..=b'9' => c - b'0',
+                b'a'..=b'f' => c - b'a' + 10,
+                b'A'..=b'F' => c - b'A' + 10,
+                // No sign, no whitespace, no underscores. A lenient size
+                // parser is exactly how two hops end up disagreeing.
+                _ => return Chunked::Bad,
+            };
+            size = match size.checked_mul(16).and_then(|v| v.checked_add(d as usize)) {
+                Some(v) => v,
+                None => return Chunked::Bad,
+            };
+        }
+        i += eol + 2;
+
+        if size == 0 {
+            // Last chunk. Trailer fields may follow, ending with a blank line.
+            loop {
+                let Some(eol) = find_crlf(&buf[i..]) else { return Chunked::Incomplete };
+                i += eol + 2;
+                if eol == 0 {
+                    return Chunked::Done(out);
+                }
+            }
+        }
+
+        if out.len() + size > MAX_CHUNKED_BODY {
+            return Chunked::Bad;
+        }
+        if buf.len() < i + size + 2 {
+            return Chunked::Incomplete;
+        }
+        out.extend_from_slice(&buf[i..i + size]);
+        i += size;
+        // Every chunk's data is followed by CRLF, exactly.
+        if &buf[i..i + 2] != b"\r\n" {
+            return Chunked::Bad;
+        }
+        i += 2;
+    }
+}
+
+fn find_crlf(buf: &[u8]) -> Option<usize> {
+    buf.windows(2).position(|w| w == b"\r\n")
+}
+
+fn strip_absolute_form(target: &str) -> &str {
+    let Some(scheme_end) = target.find("://") else {
+        return target;
+    };
+    // A scheme is `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )` (RFC 3986 3.1).
+    // Anything else before "://" is not a scheme, so this is not absolute-form.
+    let scheme = &target[..scheme_end];
+    if scheme.is_empty()
+        || !scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        || !scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    {
+        return target;
+    }
+    let after_scheme = &target[scheme_end + 3..];
+    match after_scheme.find('/') {
+        Some(slash) => &after_scheme[slash..],
+        // `http://host` with no path at all means the origin's root.
+        None => "/",
+    }
+}
+
 
 /// Outcome of parsing a client request. Public so security tests can assert on
 /// what the ingress boundary accepts, rejects, and strips.
@@ -78,9 +328,25 @@ pub fn parse_request(buf: &[u8]) -> ParseResult {
     let method = req.method.unwrap_or("GET").to_string();
     let raw_path = req.path.unwrap_or("/");
 
-    let (path, query) = match raw_path.find('?') {
-        Some(q) => (raw_path[..q].to_string(), Some(raw_path[q + 1..].to_string())),
-        None => (raw_path.to_string(), None),
+    // RFC 9112 3.2.2: a server MUST accept absolute-form
+    // (`GET http://host/path HTTP/1.1`), which is what a request through a
+    // proxy looks like and what an attacker sends to see whether the origin
+    // and the proxy agree about the target.
+    //
+    // The scheme and authority are dropped and the path kept, so routing sees
+    // the same target it would for origin-form. Previously the whole URI was
+    // handed to the router, which matched nothing and answered 404 -- accepted
+    // in name, unusable in fact.
+    //
+    // The authority is deliberately NOT used to override `Host`: doing so
+    // lets a client name one origin in the URI and another in `Host`, which is
+    // the routing-confusion primitive. `Host` stays authoritative; a
+    // disagreement is the client's problem, not a licence to pick one.
+    let target = strip_absolute_form(raw_path);
+
+    let (path, query) = match target.find('?') {
+        Some(q) => (target[..q].to_string(), Some(target[q + 1..].to_string())),
+        None => (target.to_string(), None),
     };
 
     // Extract what we need from req.headers before dropping req.
@@ -100,13 +366,26 @@ pub fn parse_request(buf: &[u8]) -> ParseResult {
     let mut saw_cl = false;
     let mut host_count = 0usize;
     let mut host_empty = false;
+    let mut saw_te = false;
     let mut fwd_headers: Vec<(String, String)> = Vec::with_capacity(nheaders);
 
     for h in &req.headers[..nheaders] {
         if h.name.eq_ignore_ascii_case("transfer-encoding") {
-            // Chunked bodies are not decoded here; accepting one would mean
-            // forwarding a body we never read.
-            return ParseResult::Error;
+            let Ok(v) = std::str::from_utf8(h.value) else { return ParseResult::Error };
+            // RFC 9112 6.1: `chunked` must be the FINAL coding, and any other
+            // coding is one this server does not implement. `chunked, gzip`
+            // is malformed; `gzip, chunked` names a coding we cannot decode.
+            let last = v.rsplit(',').next().unwrap_or("").trim();
+            if !last.eq_ignore_ascii_case("chunked") {
+                return ParseResult::Error;
+            }
+            if v.split(',').count() > 1 {
+                return ParseResult::Error;
+            }
+            saw_te = true;
+            // Not forwarded: transfer-coding is hop-by-hop, and the body is
+            // decoded here so the next hop gets a plain Content-Length.
+            continue;
         }
         if h.name.eq_ignore_ascii_case("content-length") {
             let Ok(value) = std::str::from_utf8(h.value) else {
@@ -124,9 +403,14 @@ pub fn parse_request(buf: &[u8]) -> ParseResult {
 
         if h.name.eq_ignore_ascii_case("host") {
             host_count += 1;
-            host_empty = std::str::from_utf8(h.value)
-                .map(|v| v.trim().is_empty())
-                .unwrap_or(true);
+            match std::str::from_utf8(h.value).map(str::trim) {
+                Ok(v) if !v.is_empty() => {
+                    if !host_is_valid(v) {
+                        return ParseResult::Error;
+                    }
+                }
+                _ => host_empty = true,
+            }
         }
 
         // A header value that is not UTF-8 is dropped rather than rejected
@@ -161,6 +445,22 @@ pub fn parse_request(buf: &[u8]) -> ParseResult {
         return ParseResult::Error;
     }
 
+    // RFC 9112 6.1: chunked is an HTTP/1.1 transfer coding. An HTTP/1.0
+    // message claiming it is malformed, and treating it as chunked anyway is
+    // exactly the version-straddling disagreement smuggling exploits: a hop
+    // that honours the header and one that falls back to read-to-close frame
+    // the same bytes differently.
+    if saw_te && !is_http11 {
+        return ParseResult::Error;
+    }
+
+    // Transfer-Encoding and Content-Length together is the smuggling
+    // primitive: two hops can pick different framings and disagree about
+    // where the request ends. RFC 9112 6.1 says reject.
+    if saw_te && saw_cl {
+        return ParseResult::Error;
+    }
+
     let content_length: usize = match first_cl {
         Some(v) => match v.parse() {
             Ok(n) => n,
@@ -174,6 +474,26 @@ pub fn parse_request(buf: &[u8]) -> ParseResult {
     };
 
     drop(req); // release borrow of `headers`
+
+    if saw_te {
+        // Decoded here, so the body handed on is a plain one of known length
+        // and no downstream hop has to agree with us about chunk framing.
+        return match decode_chunked(&buf[body_offset..]) {
+            Chunked::Incomplete => ParseResult::Incomplete,
+            Chunked::Bad => ParseResult::Error,
+            Chunked::Done(body) => {
+                fwd_headers.push(("Content-Length".to_string(), body.len().to_string()));
+                ParseResult::Complete(RawRequest {
+                    method,
+                    path,
+                    query,
+                    version: if is_http11 { "HTTP/1.1".to_string() } else { "HTTP/1.0".to_string() },
+                    headers: fwd_headers,
+                    body,
+                })
+            }
+        };
+    }
 
     let available = buf.len() - body_offset;
     if available < content_length {
@@ -198,4 +518,225 @@ pub fn parse_request(buf: &[u8]) -> ParseResult {
         headers: fwd_headers,
         body,
     })
+}
+
+#[cfg(test)]
+mod absolute_form_tests {
+    use super::*;
+
+    fn parse(raw: &[u8]) -> RawRequest {
+        match parse_request(raw) {
+            ParseResult::Complete(r) => r,
+            other => panic!("expected Complete, got {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    /// RFC 9112 3.2.2: a server MUST accept absolute-form, and the target it
+    /// routes on is the path.
+    #[test]
+    fn absolute_form_is_reduced_to_its_path() {
+        let r = parse(b"GET http://example.com/a/b?c=1 HTTP/1.1\r\nHost: example.com\r\n\r\n");
+        assert_eq!(r.path, "/a/b");
+        assert_eq!(r.query.as_deref(), Some("c=1"));
+
+        let r = parse(b"GET https://example.com/x HTTP/1.1\r\nHost: example.com\r\n\r\n");
+        assert_eq!(r.path, "/x");
+
+        // No path component at all means the root.
+        let r = parse(b"GET http://example.com HTTP/1.1\r\nHost: example.com\r\n\r\n");
+        assert_eq!(r.path, "/");
+    }
+
+    /// Origin-form, asterisk-form and authority-form are untouched.
+    #[test]
+    fn other_target_forms_pass_through() {
+        let r = parse(b"GET /a/b HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert_eq!(r.path, "/a/b");
+
+        let r = parse(b"OPTIONS * HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert_eq!(r.path, "*", "asterisk-form is a valid target for OPTIONS");
+
+        let r = parse(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n");
+        assert_eq!(r.path, "example.com:443", "authority-form is not a path");
+    }
+
+    /// A scheme-relative target must NOT be treated as absolute-form.
+    ///
+    /// `//evil.com/x` has no scheme. Rewriting it to `/x` would turn a request
+    /// the router should refuse into one it serves, which is the same
+    /// open-redirect shape `is_same_origin_path` exists to stop.
+    #[test]
+    fn scheme_relative_targets_are_not_rewritten() {
+        let r = parse(b"GET //evil.com/x HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert_eq!(r.path, "//evil.com/x", "scheme-relative must survive intact");
+    }
+
+    /// Only a real scheme counts. A path that merely contains "://" is a path.
+    #[test]
+    fn only_a_valid_scheme_triggers_the_rewrite() {
+        for target in [
+            "/redirect?to=http://evil.com/x",
+            "/a://b",
+            "/1http://evil.com/x",
+        ] {
+            let raw = format!("GET {target} HTTP/1.1\r\nHost: x\r\n\r\n");
+            let r = parse(raw.as_bytes());
+            let expected = target.split('?').next().unwrap();
+            assert_eq!(r.path, expected, "target {target:?} must not be rewritten");
+        }
+    }
+}
+
+#[cfg(test)]
+mod chunked_tests {
+    use super::*;
+
+    fn complete(raw: &[u8]) -> RawRequest {
+        match parse_request(raw) {
+            ParseResult::Complete(r) => r,
+            ParseResult::Incomplete => panic!("expected Complete, got Incomplete"),
+            ParseResult::Error => panic!("expected Complete, got Error"),
+        }
+    }
+    fn is_error(raw: &[u8]) -> bool { matches!(parse_request(raw), ParseResult::Error) }
+    fn is_incomplete(raw: &[u8]) -> bool { matches!(parse_request(raw), ParseResult::Incomplete) }
+
+    const HEAD: &[u8] = b"POST /x HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n";
+
+    fn with(body: &[u8]) -> Vec<u8> {
+        let mut v = HEAD.to_vec();
+        v.extend_from_slice(body);
+        v
+    }
+
+    /// RFC 9112 7.1: a server MUST be able to receive and decode chunked.
+    #[test]
+    fn a_chunked_body_is_decoded() {
+        let r = complete(&with(b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"));
+        assert_eq!(r.body, b"hello world");
+    }
+
+    /// The decoded body is handed on with a Content-Length, so the next hop
+    /// never has to agree with us about chunk framing.
+    #[test]
+    fn the_decoded_body_gets_a_content_length_and_te_is_not_forwarded() {
+        let r = complete(&with(b"5\r\nhello\r\n0\r\n\r\n"));
+        let cl = r.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("content-length"));
+        assert_eq!(cl.map(|(_, v)| v.as_str()), Some("5"));
+        assert!(
+            !r.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("transfer-encoding")),
+            "transfer-coding is hop-by-hop and must not be forwarded"
+        );
+    }
+
+    #[test]
+    fn chunk_extensions_and_trailers_are_tolerated() {
+        let r = complete(&with(b"5;name=value\r\nhello\r\n0\r\nX-Trailer: t\r\n\r\n"));
+        assert_eq!(r.body, b"hello");
+    }
+
+    #[test]
+    fn an_empty_chunked_body_is_valid() {
+        assert_eq!(complete(&with(b"0\r\n\r\n")).body, b"");
+    }
+
+    /// A body that has not fully arrived must be Incomplete, never Complete
+    /// with a truncated body.
+    #[test]
+    fn a_partial_chunked_body_is_incomplete() {
+        assert!(is_incomplete(&with(b"5\r\nhel")));
+        assert!(is_incomplete(&with(b"5\r\nhello\r\n")));      // no terminator yet
+        assert!(is_incomplete(&with(b"5\r\nhello\r\n0\r\n"))); // trailers unterminated
+    }
+
+    /// A lenient chunk-size parser is how two hops end up disagreeing about
+    /// where a request ends, which is request smuggling.
+    #[test]
+    fn malformed_chunk_sizes_are_refused() {
+        assert!(is_error(&with(b"+5\r\nhello\r\n0\r\n\r\n")), "sign");
+        assert!(is_error(&with(b"0x5\r\nhello\r\n0\r\n\r\n")), "0x prefix");
+        assert!(is_error(&with(b" 5\r\nhello\r\n0\r\n\r\n")), "leading space");
+        assert!(is_error(&with(b"5_0\r\nhello\r\n0\r\n\r\n")), "underscore");
+        assert!(is_error(&with(b"\r\nhello\r\n0\r\n\r\n")), "empty size");
+        assert!(is_error(&with(b"ffffffffffffffffff\r\n")), "size overflow");
+    }
+
+    /// Chunk data must be followed by exactly CRLF.
+    #[test]
+    fn a_missing_chunk_terminator_is_refused() {
+        assert!(is_error(&with(b"5\r\nhelloXX0\r\n\r\n")));
+    }
+
+    /// RFC 9112 6.1: chunked must be the final coding, and nothing else is
+    /// implemented.
+    #[test]
+    fn other_transfer_codings_are_refused() {
+        let mk = |te: &str| {
+            format!("POST /x HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: {te}\r\n\r\n0\r\n\r\n")
+                .into_bytes()
+        };
+        assert!(is_error(&mk("chunked, gzip")), "chunked must be last");
+        assert!(is_error(&mk("gzip, chunked")), "gzip is not implemented");
+        assert!(is_error(&mk("gzip")), "unknown coding");
+        assert!(is_error(&mk("bogus")), "unknown coding");
+    }
+
+    /// Transfer-Encoding with Content-Length is the smuggling primitive.
+    #[test]
+    fn transfer_encoding_with_content_length_is_refused() {
+        let raw = b"POST /x HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\
+                    Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
+        assert!(is_error(raw));
+    }
+}
+
+#[cfg(test)]
+mod host_tests {
+    use super::*;
+
+    fn is_error(raw: &[u8]) -> bool { matches!(parse_request(raw), ParseResult::Error) }
+    fn is_ok(raw: &[u8]) -> bool { matches!(parse_request(raw), ParseResult::Complete(_)) }
+
+    fn get(host: &str) -> Vec<u8> {
+        format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n").into_bytes()
+    }
+
+    /// `Host` decides which site a request is for. A value that two hops would
+    /// split differently is not one authority.
+    #[test]
+    fn a_host_with_whitespace_is_refused() {
+        assert!(is_error(&get("bad host")));
+        assert!(is_error(&get("bad\thost")));
+    }
+
+    #[test]
+    fn hosts_outside_the_authority_alphabet_are_refused() {
+        assert!(is_error(&get("ex<ample>.com")), "delimiters");
+        assert!(is_error(&get("example.com/path")), "a path is not an authority");
+        assert!(is_error(&get("example.com:https")), "port must be digits");
+        assert!(is_error(&get("example.com:99999999")), "port out of range");
+        assert!(is_error(&get("[::1")), "unterminated literal");
+        assert!(is_error(&get(&"a".repeat(254))), "over the length limit");
+    }
+
+    #[test]
+    fn ordinary_hosts_are_accepted() {
+        assert!(is_ok(&get("mgrosvenor.com")));
+        assert!(is_ok(&get("mgrosvenor.com:8443")));
+        assert!(is_ok(&get("localhost")));
+        assert!(is_ok(&get("127.0.0.1:80")));
+        assert!(is_ok(&get("[::1]")));
+        assert!(is_ok(&get("[::1]:8443")));
+        assert!(is_ok(&get("xn--n3h.example")), "punycode is ordinary");
+        assert!(is_ok(&get("under_score.example")));
+    }
+
+    /// RFC 9112 6.1: chunked is an HTTP/1.1 transfer coding. Honouring it on a
+    /// 1.0 message is the version-straddling disagreement smuggling exploits.
+    #[test]
+    fn chunked_on_http10_is_refused() {
+        let raw = b"POST / HTTP/1.0\r\nHost: localhost\r\n\
+                    Transfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+        assert!(is_error(raw));
+    }
 }

@@ -88,7 +88,7 @@ where
         Ok(r) => r,
         Err(e) => {
             error!(error = %e, "failed to parse request");
-            let resp = RawResponse::new(400).body(format!("Bad Request: {}", e));
+            let resp = RawResponse::new(e.status()).body(format!("{}: {}", e.reason(), e));
             let _ = stream.write_all(&resp.to_bytes());
             return;
         }

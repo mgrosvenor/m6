@@ -1,6 +1,6 @@
 /// HTTP/1.1 request parser from a byte stream.
 
-use std::io::Read;
+use std::io::{Read, Write};
 
 use crate::http::RawRequest;
 
@@ -19,15 +19,46 @@ pub enum ParseError {
     InvalidHeader,
     #[error("request too large")]
     RequestTooLarge,
+    #[error("expectation failed")]
+    ExpectationFailed,
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
 
+impl ParseError {
+    /// The status to answer this refusal with.
+    ///
+    /// One place, so every app answers the same way. They used to answer 400
+    /// to everything, which told a client that hit the size cap or asked for
+    /// an expectation we cannot meet the wrong thing about why.
+    pub fn status(&self) -> u16 {
+        match self {
+            ParseError::RequestTooLarge => 413,
+            ParseError::ExpectationFailed => 417,
+            _ => 400,
+        }
+    }
+
+    /// The reason phrase matching [`ParseError::status`].
+    pub fn reason(&self) -> &'static str {
+        match self.status() {
+            413 => "Payload Too Large",
+            417 => "Expectation Failed",
+            _ => "Bad Request",
+        }
+    }
+}
+
 /// Parse a complete HTTP/1.1 request from a Read stream.
 ///
-/// Handles: request line, headers, body (Content-Length based).
-/// Does not handle chunked transfer encoding.
-pub fn parse_request(stream: &mut impl Read) -> Result<RawRequest, ParseError> {
+/// Handles: request line, headers, and body framed by either `Content-Length`
+/// or `Transfer-Encoding: chunked`, all decided by `crate::h1`.
+///
+/// The stream is `Write` as well as `Read` because framing is not purely a
+/// reading problem: a client that sent `Expect: 100-continue` is waiting to be
+/// told to go ahead, and will not send the body until it is (see
+/// `crate::h1::Expectation`).
+pub fn parse_request(stream: &mut (impl Read + Write)) -> Result<RawRequest, ParseError> {
     // Read in chunks until the one parser in `crate::h1` says the message is
     // complete. It decides completeness, including the body, so this loop has
     // no framing logic of its own -- which is the point: there is one place
@@ -39,6 +70,7 @@ pub fn parse_request(stream: &mut impl Read) -> Result<RawRequest, ParseError> {
     // in.
     let mut buf: Vec<u8> = Vec::with_capacity(2048);
     let mut chunk = [0u8; 1024];
+    let mut expect_answered = false;
 
     loop {
         match crate::h1::parse_request(&buf) {
@@ -55,6 +87,25 @@ pub fn parse_request(stream: &mut impl Read) -> Result<RawRequest, ParseError> {
         let cap = if head_done { MAX_HEADER_BYTES + MAX_BODY_BYTES } else { MAX_HEADER_BYTES };
         if buf.len() > cap {
             return Err(ParseError::RequestTooLarge);
+        }
+
+        // Answer any expectation before the read below, which is where a
+        // client holding its body back would deadlock us against itself.
+        if !expect_answered {
+            match crate::h1::expectation(&buf) {
+                // The head is still arriving; a later byte could still carry
+                // an Expect, so there is nothing to answer yet.
+                None => {}
+                Some(crate::h1::Expectation::None) => expect_answered = true,
+                Some(crate::h1::Expectation::Continue) => {
+                    expect_answered = true;
+                    stream.write_all(crate::h1::CONTINUE_RESPONSE)?;
+                    stream.flush()?;
+                }
+                Some(crate::h1::Expectation::Unsupported) => {
+                    return Err(ParseError::ExpectationFailed)
+                }
+            }
         }
 
         match stream.read(&mut chunk) {
@@ -80,7 +131,7 @@ mod tests {
     #[test]
     fn test_parse_get_request() {
         let raw = b"GET /index.html HTTP/1.1\r\nHost: localhost\r\nAccept: text/html\r\n\r\n";
-        let mut cursor = Cursor::new(raw);
+        let mut cursor = Cursor::new(raw.to_vec());
         let req = parse_request(&mut cursor).unwrap();
         assert_eq!(req.method, "GET");
         assert_eq!(req.path, "/index.html");
@@ -92,7 +143,7 @@ mod tests {
     #[test]
     fn test_parse_get_with_query() {
         let raw = b"GET /search?q=foo&page=2 HTTP/1.1\r\nHost: localhost\r\n\r\n";
-        let mut cursor = Cursor::new(raw);
+        let mut cursor = Cursor::new(raw.to_vec());
         let req = parse_request(&mut cursor).unwrap();
         assert_eq!(req.path, "/search");
         assert_eq!(req.query.as_deref(), Some("q=foo&page=2"));
@@ -117,7 +168,7 @@ mod tests {
     #[test]
     fn test_parse_empty_stream_returns_closed() {
         let raw: &[u8] = b"";
-        let mut cursor = Cursor::new(raw);
+        let mut cursor = Cursor::new(raw.to_vec());
         let err = parse_request(&mut cursor).unwrap_err();
         assert!(matches!(err, ParseError::ConnectionClosed));
     }
@@ -126,7 +177,7 @@ mod tests {
     fn test_parse_missing_content_length_defaults_to_no_body() {
         // POST without Content-Length — body should be empty.
         let raw = b"POST /submit HTTP/1.1\r\nHost: localhost\r\n\r\n";
-        let mut cursor = Cursor::new(raw);
+        let mut cursor = Cursor::new(raw.to_vec());
         let req = parse_request(&mut cursor).unwrap();
         assert!(req.body.is_empty());
     }
@@ -135,20 +186,31 @@ mod tests {
 #[cfg(test)]
 mod chunked_head_tests {
     use super::*;
-    use std::io::Read;
+    use std::io::{Read, Write};
 
     /// A reader that counts `read` calls and can be told to hand over the
     /// bytes in fixed-size pieces, so a terminator can be forced to straddle
     /// a chunk boundary.
-    struct Chunked {
+    pub struct Chunked {
         data: Vec<u8>,
         at: usize,
         piece: usize,
         pub reads: usize,
+        /// Anything the parser wrote back, which for a well-formed request is
+        /// nothing at all.
+        pub written: Vec<u8>,
+    }
+
+    impl Write for Chunked {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.written.extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
     }
     impl Chunked {
-        fn new(data: &[u8], piece: usize) -> Self {
-            Chunked { data: data.to_vec(), at: 0, piece, reads: 0 }
+        pub fn new(data: &[u8], piece: usize) -> Self {
+            Chunked { data: data.to_vec(), at: 0, piece, reads: 0, written: Vec::new() }
         }
     }
     impl Read for Chunked {
@@ -249,6 +311,77 @@ Connection: keep-alive\r\n\r\n"
         // flood is refused as a malformed head before the byte cap is reached.
         // What matters is that it is refused, not which reason wins the race.
         assert!(parse_request(&mut r).is_err(), "an oversized head must be refused");
+    }
+}
+
+#[cfg(test)]
+mod expect_continue_tests {
+    use super::*;
+    use super::chunked_head_tests::Chunked;
+
+    fn post(expect: &str, body: &str) -> Vec<u8> {
+        format!(
+            "POST /submit HTTP/1.1\r\nHost: x\r\nExpect: {expect}\r\n\
+             Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    }
+
+    /// RFC 9110 10.1.1: a client that sent `Expect: 100-continue` is waiting
+    /// to be told to go ahead. Saying nothing made every such client sit out
+    /// its own timeout before sending the body anyway.
+    #[test]
+    fn a_hundred_continue_is_sent_before_the_body_is_awaited() {
+        // One byte at a time, so the head is complete several reads before the
+        // body is. That is the window where the client is waiting on us.
+        let mut r = Chunked::new(&post("100-continue", "name=alice"), 1);
+        let req = parse_request(&mut r).expect("parse");
+        assert_eq!(req.body, b"name=alice");
+        assert_eq!(r.written, m6_core_continue(), "no interim response was sent");
+    }
+
+    fn m6_core_continue() -> Vec<u8> {
+        crate::h1::CONTINUE_RESPONSE.to_vec()
+    }
+
+    /// Exactly once, however many reads the body takes.
+    #[test]
+    fn the_interim_response_is_not_repeated() {
+        let body = "x".repeat(64);
+        let mut r = Chunked::new(&post("100-continue", &body), 1);
+        parse_request(&mut r).expect("parse");
+        assert_eq!(r.written, m6_core_continue());
+    }
+
+    /// A request that arrives whole has nothing to wait for, so there is
+    /// nothing to say. Sending 100 here would be pure latency.
+    #[test]
+    fn a_request_that_arrives_complete_gets_no_interim_response() {
+        let mut r = Chunked::new(&post("100-continue", "name=alice"), 4096);
+        parse_request(&mut r).expect("parse");
+        assert!(r.written.is_empty(), "sent {:?}", String::from_utf8_lossy(&r.written));
+    }
+
+    /// RFC 9110 10.1.1: an expectation we do not understand is a 417, not a
+    /// body we read anyway. Forwarding it would leave the client waiting for a
+    /// response nothing in the chain intends to send.
+    #[test]
+    fn an_unknown_expectation_is_refused() {
+        let mut r = Chunked::new(&post("the-moon-on-a-stick", "hello"), 1);
+        assert!(matches!(parse_request(&mut r), Err(ParseError::ExpectationFailed)));
+        assert!(r.written.is_empty());
+    }
+
+    /// `100 (Continue)` is an HTTP/1.1 interim response. An HTTP/1.0 client
+    /// has no way to read one: it would take the status line as the response.
+    #[test]
+    fn an_http10_client_is_never_sent_an_interim_response() {
+        let raw = b"POST /submit HTTP/1.0\r\nExpect: 100-continue\r\n\
+                    Content-Length: 5\r\n\r\nhello";
+        let mut r = Chunked::new(raw, 1);
+        parse_request(&mut r).expect("parse");
+        assert!(r.written.is_empty());
     }
 }
 
