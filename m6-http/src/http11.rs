@@ -238,16 +238,56 @@ struct H2cPlainConn {
     client_ip: String,
 }
 
+/// Whether an h2c listener on `addr` may believe a forwarded client address.
+///
+/// Derived from the bind address, not configured. In production this listener
+/// is the WireGuard backbone and the only peers that can reach it are our own
+/// cache nodes, which is what makes their `x-forwarded-for` worth believing.
+/// Bound to a public address it is just another listener, and trusting it
+/// there would hand every client a rate-limit bypass.
+///
+/// `Iface::for_bind` already classifies a bind address as private or public,
+/// and already exists because the stats channels needed the same distinction.
+/// Reusing it means there is one definition of "this listener is on the
+/// tunnel" rather than two that can drift apart.
+fn trust_for_bind(addr: &str) -> crate::forward::ForwardedTrust {
+    match crate::stats::Iface::for_bind(addr) {
+        crate::stats::Iface::Internal => crate::forward::ForwardedTrust::Backbone,
+        crate::stats::Iface::External => crate::forward::ForwardedTrust::Never,
+    }
+}
+
 pub struct H2cListener {
     listener: TcpListener,
     conns:    Vec<H2cPlainConn>,
+    /// Whether a peer here may assert a client address for someone else.
+    ///
+    /// Derived from the bind address, not configured. This listener is the
+    /// WireGuard backbone in production and the only peers that can reach it
+    /// are our own cache nodes, which is what makes their
+    /// `x-forwarded-for` worth believing -- see
+    /// `crate::forward::ForwardedTrust`. Bound to a public address it is just
+    /// another listener, and trusting it there would hand every client a
+    /// rate-limit bypass.
+    trust:    crate::forward::ForwardedTrust,
 }
 
 impl H2cListener {
     pub fn bind(addr: &str) -> anyhow::Result<Self> {
         let listener = TcpListener::bind(addr)?;
         listener.set_nonblocking(true)?;
-        Ok(H2cListener { listener, conns: Vec::new() })
+
+        let trust = trust_for_bind(addr);
+        if trust == crate::forward::ForwardedTrust::Never {
+            warn!(
+                bind = %addr,
+                "h2c listener is bound to a public address: forwarded client \
+                 addresses will NOT be trusted, so requests relayed through it \
+                 are attributed to the peer that relayed them"
+            );
+        }
+
+        Ok(H2cListener { listener, conns: Vec::new(), trust })
     }
 
     pub fn raw_fd(&self) -> RawFd { self.listener.as_raw_fd() }
@@ -266,9 +306,15 @@ impl H2cListener {
                     }
                     stream.set_nodelay(true).ok();
                     poller.add(stream.as_raw_fd(), token).ok();
+                    let h2 = match self.trust {
+                        crate::forward::ForwardedTrust::Backbone => {
+                            Http2Conn::new().trusting_forwarded_for()
+                        }
+                        crate::forward::ForwardedTrust::Never => Http2Conn::new(),
+                    };
                     self.conns.push(H2cPlainConn {
                         stream,
-                        h2: Http2Conn::new(),
+                        h2,
                         client_ip: peer.ip().to_string(),
                     });
                 }
@@ -1233,5 +1279,53 @@ mod keep_alive_tests {
         // Case-insensitive, per RFC 9110 7.6.1.
         assert!(!wants_keep_alive(&req("HTTP/1.1", &["CLOSE"])));
         assert!(wants_keep_alive(&req("HTTP/1.0", &["Keep-Alive"])));
+    }
+}
+
+#[cfg(test)]
+mod h2c_trust_tests {
+    use super::trust_for_bind;
+    use crate::forward::ForwardedTrust;
+
+    /// The trust is derived from where the listener is bound, so there is no
+    /// config key to set wrong and no peer list to keep in step with the
+    /// WireGuard topology.
+    #[test]
+    fn only_a_private_bind_is_trusted() {
+        for private in [
+            "10.0.0.1:80",       // the production backbone address
+            "10.0.0.4:8080",
+            "172.16.0.1:80",
+            "192.168.1.1:80",
+            "127.0.0.1:8080",
+            "[::1]:80",
+            "[fd00::1]:80",
+        ] {
+            assert_eq!(
+                trust_for_bind(private),
+                ForwardedTrust::Backbone,
+                "{private} should be trusted"
+            );
+        }
+    }
+
+    /// Bound anywhere reachable from outside, it is just another listener. A
+    /// forwarded address there is a client choosing its own rate-limit bucket.
+    #[test]
+    fn a_public_bind_is_never_trusted() {
+        for public in [
+            "0.0.0.0:80",
+            "203.0.113.9:80",
+            "8.8.8.8:80",
+            "[2001:db8::1]:80",
+            "172.32.0.1:80",     // just outside 172.16/12
+            "11.0.0.1:80",       // just outside 10/8
+        ] {
+            assert_eq!(
+                trust_for_bind(public),
+                ForwardedTrust::Never,
+                "{public} must NOT be trusted"
+            );
+        }
     }
 }
