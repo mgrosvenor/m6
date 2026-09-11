@@ -7,8 +7,11 @@ outside this repo. **No performance regression.**
 The target shape, stated plainly:
 
 > **One thread. One event loop. A switch over connection state. Everything
-> non-blocking. Anything that must block gets its own sync thread and signals
-> the loop through an fd.**
+> non-blocking.** Where a transport cannot be made non-blocking, that is
+> handled **inside the IO layer** by a specific, named component owning one
+> blocking call and presenting a selectable fd. Such components are rare and
+> built for one job each. **There is no generic offload, and the work layer
+> cannot ask for a thread.**
 
 This is memcached over libevent, and it is QJump's applications over CamIO. It
 is also, already, m6-http.
@@ -88,14 +91,46 @@ future scale. **It is the better choice at the scale we have**, and 32 threads
 on one core is the clearest sign the current model is being fought rather than
 used.
 
-## 3. The offload primitive already exists, twice
+## 3. Three layers: IO, dispatch, work
 
-Anything that genuinely must block gets **its own sync thread, which signals
-the loop through an fd**. The loop never blocks; blocking appears to it as just
-another readable descriptor.
+This is the part the reference systems actually teach, and it is easy to get
+wrong in a way that looks like progress.
 
-Core already does this in two places, on both platforms, and has never named it
-a pattern:
+| layer | job | reference |
+|---|---|---|
+| **IO** | Present every transport as something selectable. Sockets, files, timers, signals, all the same shape. | CamIO |
+| **Dispatch** | One loop. Select, then decide what runs. | libevent |
+| **Work** | A switch over connection state. | memcached's `drive_machine` |
+
+**The layers are the point.** Each is replaceable without touching the others,
+and none of them knows how the one below is implemented.
+
+### Blocking belongs inside the IO layer, never above it
+
+Some transports cannot be made non-blocking by the kernel. A regular file is
+the obvious one: on Linux it is always reported ready, so there is no readiness
+event to wait for. Such a transport is implemented with **a dedicated thread,
+built for that one job, which presents itself upward as a selectable fd.**
+
+**This is not a general offload facility, and the distinction is the whole
+thing.** A generic `offload(|| blocking_work())` reachable from a handler is a
+thread pool wearing a file descriptor: it reintroduces shared state, arbitrary
+concurrency and every bug the single-threaded model exists to delete, while
+looking like an event loop. The work layer must have no way to ask for a
+thread.
+
+What the work layer sees is a stream it can select on. Whether that stream is a
+socket, an io_uring completion, or one carefully written reader thread is the
+IO layer's business and nobody else's.
+
+So offload threads should be **rare, specific and few**. Each one is a
+considered piece of the IO layer with a name and a single job, not an instance
+of a pattern.
+
+### Core already has two, and they are the right shape *because* they are specific
+
+Both are one job, carefully built, exposing an fd. Neither is a mechanism
+anything else can dispatch through, and that is why they are good:
 
 **`ConfigWatcher`, BSD path** (`watcher.rs`):
 
@@ -113,15 +148,24 @@ pub struct ConfigWatcher {
 **`ShutdownHandle::wake_fd`** (`signal.rs`), fed by m6-http from
 `poller.rs:371`: "The raw write end, for `m6_core::signal::Service::wake_fd`".
 
-Generalising this is naming a mechanism we already ship and have already
-debugged on two platforms.
+`ConfigWatcher` is the model to copy, and specifically **not** because it
+should be generalised. It is one component, for one transport, on one platform
+family, whose consumer registers an fd and never learns a thread exists. The
+`App` loop selects on `watcher.raw_fd()` and knows nothing else about it. That
+is the contract.
 
 **The resulting concurrency model is one sentence:** the loop owns all state
-and takes no locks; each offload thread owns exactly one blocking call and
-shares nothing but a completion fd.
+and takes no locks; a small, named set of IO components each own exactly one
+blocking call and share nothing but a completion fd.
 
 That is what makes it debuggable. Not "fewer threads", but **no shared mutable
-state to reason about.**
+state to reason about**, and a thread count you can enumerate by name.
+
+### The test for whether it has been done right
+
+If a handler can cause a thread to be created, the abstraction has leaked and
+the model is gone. The work layer asks for a stream. It never asks for
+concurrency.
 
 ## 4. What genuinely blocks
 
@@ -138,13 +182,26 @@ got it wrong.
   `Mutex<lru::LruCache<String, Arc<Map<String, Value>>>>`, and the `Mutex`
   exists only because of the pool.
 
-**Does block**, and needs the offload:
+**Does block:**
 
 - `m6-file`: `handler.rs:276`, `std::fs::read` per request.
 - The CMS and contact form: `Request::read_json`, `write_json_atomic`,
   `list_json`, `write_bytes`.
 
-That is the whole list.
+That is the whole list, and it is short enough that each case should be
+answered on its own terms rather than by one facility.
+
+**Prefer removing the blocking to wrapping it.** m6-file already reads whole
+files into a `Vec<u8>`; an in-memory content cache, which is what m6-http
+already does for responses, makes the common case need no I/O at all. A file
+stream with a reader thread behind it is the answer for what the cache misses,
+not the first answer. The cheapest blocking call is the one that does not
+happen.
+
+The CMS writes are rarer still: a handful of authenticated operations, not a
+request path. They can be a single named component, or they can stay
+synchronous and accept blocking the loop for the duration of one authenticated
+write, which is a legitimate choice to make explicitly rather than by default.
 
 ## 5. What this deletes
 
@@ -231,8 +288,13 @@ An event loop is also the only model in which admission control is
 6. **`send_with_length`**, and m6-file's HEAD path. A win, not a cost.
 7. **Unify `PoolManager`** behind one transport-agnostic backend. The pilot for
    a single I/O interface, contained inside m6-http.
-8. **Name the offload primitive in core**, generalising the `ConfigWatcher`
-   self-pipe and `wake_fd` into the supported way to do blocking work.
+8. **Define the IO layer's stream interface**: one selectable thing, whatever
+   the transport. This is the CamIO 1 idea and step 7 is its first customer.
+   **Do not add a generic offload facility here.** Where a transport cannot be
+   made non-blocking, it gets a specific, named component that owns one
+   blocking call and presents an fd, in the shape of `ConfigWatcher`. For
+   m6-file, try an in-memory content cache first: the best version of this step
+   adds no threads at all.
 9. **Wildcard route segment** and **socket permissions key**.
 10. **Move `App` to the loop**: reads on the loop, connection state machine,
     handlers inline, offload for the blocking few. The handler contract change
