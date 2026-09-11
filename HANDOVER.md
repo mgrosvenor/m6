@@ -3,17 +3,26 @@
 State of play for the next session. Written 2026-09-11.
 
 **Read this, then `docs/CONSOLIDATION-TODO.md`.** This file is what is true;
-that one is what is left, as a list to tick off.
+that one is the ledger of what is done and what is owed, audited against the
+commit log rather than written from memory.
 
 ---
 
 ## 1. Where the work is
 
-**Branch `main`, clean, 40 commits ahead of the deployed `b32e837` here and 6
-in the site repo. Nothing is deployed. The freeze holds until the migration is
-finished.**
+**Branch `main`, clean, 48 commits ahead of the deployed `b32e837` here and 12
+in the site repo. No migration code is deployed and the freeze holds until it
+is finished.**
 
-- 923 workspace tests pass at default features. Zero warnings.
+Three production changes WERE applied on 2026-09-11, on instruction, as
+deliberate exceptions. They change how services are confined and what the
+firewall denies, not what code runs:
+
+- **systemd hardening on every node**, 1.7 OK from `systemd-analyze`.
+- **The block ledger reconciled**, 26 identical rules on all three nodes.
+- **`80.94.95.211` blocked** after an 843-path credential sweep.
+
+- 962 workspace tests pass at default features. Zero warnings.
 - h1spec **32/32 on all four HTTP/1.1 targets**, with a CI ratchet
   (`tools/conformance.sh`, floors in `tools/conformance-scores.txt`) wired into
   `check.sh` as a blocking gate.
@@ -106,6 +115,10 @@ Services: `m6-http` (edge/proxy), `m6-file`, `m6-html`, `m6-auth-server`,
 
 ## 4. Immediate next steps, in order
 
+0. **Deploy what is already written but on no node**: `m6-monitor` (runbook
+   `deploy/FLEET-MONITOR.md`) and the firewall stats collector
+   (`deploy/FIREWALL-STATS.md`). Both are tested, neither is installed, and
+   until they are the hourly check still needs the Python script.
 1. **Document m6-core in full.** Owner's request. Start with the list of every
    component available, then detail each component and its interface. Core is
    now the only crate a service links and there is no reference to write one
