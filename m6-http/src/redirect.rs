@@ -60,8 +60,47 @@ fn host_is_safe(h: &str) -> bool {
         && !h.contains(['\r', '\n', '\0', '/', '\\', ' '])
 }
 
+/// Every method this listener answers. It redirects them all, so the list is
+/// what it accepts rather than what it implements.
+const ALLOW: &str = "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS";
+
+fn ready(status: u16, headers: Vec<(String, String)>) -> RequestOutcome {
+    RequestOutcome::Ready(status, headers, Vec::new(), String::new(), Arc::new(Vec::new()))
+}
+
 /// The whole of the redirect: one status, one header.
+///
+/// Two request targets are not resources and so have nothing to redirect to.
+/// Both used to be answered with 400, which says the request was malformed
+/// when it was not.
 fn redirect_for(req: &HttpRequest) -> RequestOutcome {
+    // RFC 9110 9.3.6: CONNECT establishes a tunnel through a proxy. This is an
+    // origin server and will not be one, so the method is refused -- 405, the
+    // answer for a method this resource does not support, with `Allow` naming
+    // the ones it does (RFC 9110 15.5.6 requires that field).
+    if req.method.eq_ignore_ascii_case("CONNECT") {
+        return ready(
+            405,
+            vec![
+                ("Allow".into(), ALLOW.into()),
+                ("Content-Length".into(), "0".into()),
+            ],
+        );
+    }
+
+    // RFC 9110 9.3.7: `OPTIONS *` asks about the server rather than any
+    // resource, so there is no target to send anywhere. Answering for the
+    // server is the whole point of the form.
+    if req.method.eq_ignore_ascii_case("OPTIONS") && req.path == "*" {
+        return ready(
+            200,
+            vec![
+                ("Allow".into(), ALLOW.into()),
+                ("Content-Length".into(), "0".into()),
+            ],
+        );
+    }
+
     let host = req
         .headers
         .iter()
@@ -69,31 +108,30 @@ fn redirect_for(req: &HttpRequest) -> RequestOutcome {
         .map(|(_, v)| v.trim())
         .unwrap_or("");
 
-    let target = req.path.as_str();
+    // The query is part of the target and must survive the hop. It did not:
+    // `req.path` is the path alone, so `http://host/x?v=1` redirected to
+    // `https://host/x` and every query parameter on an http:// link was
+    // silently dropped -- a versioned asset URL, a tracking parameter, a form
+    // GET. Found by a test written for the OPTIONS/CONNECT work above.
+    let target = match req.query.as_deref() {
+        Some(q) => format!("{}?{}", req.path, q),
+        None => req.path.clone(),
+    };
+    let target = target.as_str();
 
     if !host_is_safe(host) || !target_is_safe(target) {
-        return RequestOutcome::Ready(
-            400,
-            // No `Connection` here: the listener owns persistence (RFC 9112
-            // 9.3) and drops any copy a handler supplies, so one written here
-            // would be silently discarded and read as policy that is not
-            // being applied.
-            vec![("Content-Length".into(), "0".into())],
-            Vec::new(),
-            String::new(),
-            Arc::new(Vec::new()),
-        );
+        // No `Connection` here: the listener owns persistence (RFC 9112 9.3)
+        // and drops any copy a handler supplies, so one written here would be
+        // silently discarded and read as policy that is not being applied.
+        return ready(400, vec![("Content-Length".into(), "0".into())]);
     }
 
-    RequestOutcome::Ready(
+    ready(
         301,
         vec![
             ("Location".into(), format!("https://{host}{target}")),
             ("Content-Length".into(), "0".into()),
         ],
-        Vec::new(),
-        String::new(),
-        Arc::new(Vec::new()),
     )
 }
 
@@ -147,6 +185,71 @@ pub fn run(bind: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn request(method: &str, target: &str) -> HttpRequest {
+        let raw = format!("{method} {target} HTTP/1.1\r\nHost: mgrosvenor.com\r\n\r\n");
+        match m6_core::h1::parse_request(raw.as_bytes()) {
+            m6_core::h1::ParseResult::Complete(r) => r,
+            _ => panic!("fixture did not parse: {raw:?}"),
+        }
+    }
+
+    fn status_of(outcome: &RequestOutcome) -> u16 {
+        match outcome {
+            RequestOutcome::Ready(s, ..) => *s,
+            RequestOutcome::Pending { .. } => panic!("a redirect is never pending"),
+        }
+    }
+
+    fn header_of(outcome: &RequestOutcome, name: &str) -> Option<String> {
+        match outcome {
+            RequestOutcome::Ready(_, h, ..) => h
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.clone()),
+            RequestOutcome::Pending { .. } => None,
+        }
+    }
+
+    /// RFC 9110 9.3.7: `OPTIONS *` asks about the server, not a resource, so
+    /// there is nothing to redirect. It was answered 400 -- "your request is
+    /// malformed" for a request that is not.
+    #[test]
+    fn options_asterisk_is_answered_for_the_server() {
+        let out = redirect_for(&request("OPTIONS", "*"));
+        assert_eq!(status_of(&out), 200);
+        assert_eq!(header_of(&out, "allow").as_deref(), Some(ALLOW));
+    }
+
+    /// RFC 9110 9.3.6: CONNECT is for proxies. This is an origin server, so
+    /// the method is refused (405, with Allow per RFC 9110 15.5.6) rather than
+    /// called malformed.
+    #[test]
+    fn connect_is_refused_as_a_method_not_as_a_bad_request() {
+        let out = redirect_for(&request("CONNECT", "example.com:443"));
+        assert_eq!(status_of(&out), 405);
+        assert_eq!(header_of(&out, "allow").as_deref(), Some(ALLOW));
+    }
+
+    /// An ordinary request still redirects, and absolute-form -- which the
+    /// parser reduces to origin-form -- redirects to this server's own host,
+    /// not the one in the target.
+    #[test]
+    fn ordinary_targets_still_redirect() {
+        let out = redirect_for(&request("GET", "/capabilities?v=1"));
+        assert_eq!(status_of(&out), 301);
+        assert_eq!(
+            header_of(&out, "location").as_deref(),
+            Some("https://mgrosvenor.com/capabilities?v=1")
+        );
+
+        let out = redirect_for(&request("GET", "http://elsewhere.example/x"));
+        assert_eq!(
+            header_of(&out, "location").as_deref(),
+            Some("https://mgrosvenor.com/x"),
+            "the Location host comes from Host, never from the request target"
+        );
+    }
 
     #[test]
     fn unsafe_targets_and_hosts_are_refused() {

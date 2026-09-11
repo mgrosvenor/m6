@@ -22,6 +22,7 @@
 //! exactly this, and a backend has no proxy headers to strip.
 
 use crate::http::RawRequest;
+use std::io::Write;
 
 /// Reduce an absolute-form request target to its path.
 ///
@@ -518,6 +519,191 @@ pub fn parse_request(buf: &[u8]) -> ParseResult {
         headers: fwd_headers,
         body,
     })
+}
+
+// ── Responses ────────────────────────────────────────────────────────────────
+
+/// The reason phrase for a status code.
+///
+/// Reason phrases are advisory (RFC 9112 4.1) but an incorrect one is worse
+/// than a terse one: this used to answer `HTTP/1.1 501 Unknown`, a real status
+/// with a phrase that described nothing.
+pub fn status_reason(status: u16) -> &'static str {
+    match status {
+        100 => "Continue",
+        200 => "OK",
+        201 => "Created",
+        204 => "No Content",
+        206 => "Partial Content",
+        301 => "Moved Permanently",
+        302 => "Found",
+        304 => "Not Modified",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        412 => "Precondition Failed",
+        413 => "Payload Too Large",
+        417 => "Expectation Failed",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        501 => "Not Implemented",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
+        _ => "Unknown",
+    }
+}
+
+/// Whether this request leaves the connection open (RFC 9112 9.3).
+///
+/// HTTP/1.1 is persistent by default and closes only if asked. HTTP/1.0 is the
+/// reverse: it closes unless the client asked to keep it. Anything older, or a
+/// version we do not recognise, closes.
+pub fn keep_alive(req: &RawRequest) -> bool {
+    // EVERY `Connection` field line, not just the first. RFC 9110 5.3:
+    // repeated field lines are equivalent to one comma-joined value, so a
+    // request carrying `Connection: keep-alive` and `Connection: close` means
+    // `keep-alive, close` and must close.
+    //
+    // Taking only the first got this backwards and kept the connection open,
+    // which `test_hop_by_hop_stripped` caught immediately: it sends both, and
+    // its client then waited for a close that never came.
+    let has = |tok: &str| {
+        req.headers
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("connection"))
+            .flat_map(|(_, v)| v.split(','))
+            .any(|t| t.trim().eq_ignore_ascii_case(tok))
+    };
+
+    if req.version.eq_ignore_ascii_case("HTTP/1.1") {
+        !has("close")
+    } else if req.version.eq_ignore_ascii_case("HTTP/1.0") {
+        has("keep-alive")
+    } else {
+        false
+    }
+}
+
+/// The one way an m6 backend answers an HTTP/1.1 request.
+///
+/// Handlers are handed this instead of the raw stream, which is the point:
+/// two rules have to hold for **every** response, and a handler that writes
+/// the stream itself can only be trusted to remember them by inspection.
+///
+/// 1. **A HEAD response carries no body** (RFC 9110 9.3.2), while its
+///    `Content-Length` still describes the representation a GET would have
+///    returned. m6-file had a `write_head_response` for this and used it on
+///    the success path only, so every 404, 405 and 400 answering a HEAD went
+///    out with a body attached. m6-http fixed the identical defect months
+///    earlier and the fix was never carried across, because nothing tested it.
+///
+/// 2. **Persistence is the connection's decision, not the handler's**
+///    (RFC 9112 9.3). Every backend hardcoded `Connection: close`, so m6-http
+///    paid a fresh connect to m6-file or m6-html on every cache miss.
+pub struct Responder<'a, W: std::io::Write> {
+    w: &'a mut W,
+    /// Decides whether a body is written at all.
+    method: &'a str,
+    /// Decided by the connection from the request, before the handler runs.
+    keep_alive: bool,
+    /// Body bytes actually written, for the caller's access log.
+    written: usize,
+}
+
+impl<'a, W: std::io::Write> Responder<'a, W> {
+    /// Answer a request whose framing the connection has already decided.
+    pub fn new(w: &'a mut W, method: &'a str, keep_alive: bool) -> Self {
+        Responder { w, method, keep_alive, written: 0 }
+    }
+
+    /// Whether the connection stays open after this response.
+    pub fn keeps_alive(&self) -> bool {
+        self.keep_alive
+    }
+
+    /// Body bytes written so far.
+    pub fn body_bytes(&self) -> usize {
+        self.written
+    }
+
+    /// Send a response with `body` as its representation.
+    ///
+    /// On HEAD the bytes are not sent, but `Content-Length` still reports
+    /// their number: that is what a GET would have returned, which is exactly
+    /// what the field is for.
+    pub fn send(
+        &mut self,
+        status: u16,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> std::io::Result<()> {
+        self.send_with_length(status, headers, body, body.len())
+    }
+
+    /// A plain-text error response.
+    pub fn error(&mut self, status: u16) -> std::io::Result<()> {
+        let reason = status_reason(status);
+        let body = format!("{status} {reason}");
+        self.send(status, &[("Content-Type", "text/plain")], body.as_bytes())
+    }
+
+    /// Send a response whose `Content-Length` is known separately from the
+    /// bytes in hand -- a HEAD answered without reading the file, say.
+    ///
+    /// `body` is written only when it is the representation; `length` is
+    /// always what the header reports.
+    pub fn send_with_length(
+        &mut self,
+        status: u16,
+        headers: &[(&str, &str)],
+        body: &[u8],
+        length: usize,
+    ) -> std::io::Result<()> {
+        // One buffered writer, so a response is one write syscall rather than
+        // one per header.
+        let mut w = std::io::BufWriter::with_capacity(1024, &mut *self.w);
+        write!(w, "HTTP/1.1 {} {}\r\n", status, status_reason(status))?;
+        for (k, v) in headers {
+            // Any caller copy of a field this function emits itself is dropped,
+            // or the response goes out carrying both. Two `Content-Length`
+            // fields with different values is the framing ambiguity the parser
+            // refuses to accept from anyone else.
+            if k.eq_ignore_ascii_case("content-length") || k.eq_ignore_ascii_case("connection") {
+                continue;
+            }
+            w.write_all(k.as_bytes())?;
+            w.write_all(b": ")?;
+            w.write_all(v.as_bytes())?;
+            w.write_all(b"\r\n")?;
+        }
+        write!(
+            w,
+            "Content-Length: {}\r\nConnection: {}\r\n\r\n",
+            length,
+            if self.keep_alive { "keep-alive" } else { "close" }
+        )?;
+
+        // RFC 9110 9.3.2. A 304 and a 204 have no body either (RFC 9110 15.4.5,
+        // 15.3.5), and one sent on those is unframed bytes the peer will read
+        // as the start of the next response.
+        let bodyless = self.method.eq_ignore_ascii_case("HEAD")
+            || status == 204
+            || status == 304
+            || (100..200).contains(&status);
+        if !bodyless {
+            w.write_all(body)?;
+        }
+        w.flush()?;
+        drop(w);
+
+        if !bodyless {
+            self.written += body.len();
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

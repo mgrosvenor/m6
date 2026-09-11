@@ -1,6 +1,3 @@
-use anyhow::Result;
-use std::io::{BufWriter, Write};
-
 /// The request type is `m6_core::http::RawRequest`, parsed by the one parser
 /// in `m6_core::h1`.
 ///
@@ -22,64 +19,15 @@ pub fn accept_encoding(req: &Request) -> &str {
     m6_core::header(&req.headers, "accept-encoding").unwrap_or("")
 }
 
-/// Write an HTTP/1.1 response to a stream.
-/// Uses BufWriter with direct byte writes — no intermediate String heap allocations.
-pub fn write_response<W: Write>(
-    stream: &mut W,
-    status: u16,
-    reason: &str,
-    headers: &[(&str, &str)],
-    body: &[u8],
-) -> Result<()> {
-    let mut w = BufWriter::with_capacity(512, stream);
-    write!(w, "HTTP/1.1 {} {}\r\n", status, reason)?;
-    for (k, v) in headers {
-        w.write_all(k.as_bytes())?;
-        w.write_all(b": ")?;
-        w.write_all(v.as_bytes())?;
-        w.write_all(b"\r\n")?;
-    }
-    write!(w, "Content-Length: {}\r\nConnection: close\r\n\r\n", body.len())?;
-    w.write_all(body)?;
-    w.flush()?;
-    Ok(())
-}
-
-/// Write an HTTP/1.1 HEAD response (headers only, no body).
-/// `body_len` is the length of the body that *would* be sent for GET, so that
-/// `Content-Length` reflects the correct value per RFC 7231 §3.3.
-pub fn write_head_response<W: Write>(
-    stream: &mut W,
-    status: u16,
-    reason: &str,
-    headers: &[(&str, &str)],
-    body_len: usize,
-) -> Result<()> {
-    let mut w = BufWriter::with_capacity(512, stream);
-    write!(w, "HTTP/1.1 {} {}\r\n", status, reason)?;
-    for (k, v) in headers {
-        w.write_all(k.as_bytes())?;
-        w.write_all(b": ")?;
-        w.write_all(v.as_bytes())?;
-        w.write_all(b"\r\n")?;
-    }
-    write!(w, "Content-Length: {}\r\nConnection: close\r\n\r\n", body_len)?;
-    w.flush()?;
-    Ok(())
-}
-
-/// Write a simple error response.
-pub fn write_error<W: Write>(stream: &mut W, status: u16, reason: &str) -> Result<()> {
-    let body = format!("{} {}", status, reason);
-    write_response(
-        stream,
-        status,
-        reason,
-        &[("Content-Type", "text/plain")],
-        body.as_bytes(),
-    )
-}
-
+/// Responses are written by `m6_core::h1::Responder`, handed to the handler
+/// by `m6_core::server::serve_connection`.
+///
+/// This file used to carry three writers of its own -- `write_response`,
+/// `write_head_response` and `write_error` -- all hardcoding
+/// `Connection: close`, and only one of the three omitting the body on a HEAD.
+/// So every 404, 405, 400 and 412 answering a HEAD went out with a body, and
+/// no connection was ever reused. m6-html and m6-auth-server each had their
+/// own near-copies with their own versions of the same two defects.
 #[cfg(test)]
 mod tests {
     use super::*;

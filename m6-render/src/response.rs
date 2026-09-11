@@ -176,39 +176,37 @@ impl Response {
 
     // ---------- HTTP serialisation ----------
 
-    /// Write the response directly to `w` — no intermediate Vec allocation.
-    /// Uses BufWriter at the call site for efficient syscall batching.
-    pub fn write_to<W: std::io::Write>(&self, w: &mut W) -> anyhow::Result<()> {
-        let reason = reason_phrase(self.status);
-        write!(w, "HTTP/1.1 {} {}\r\n", self.status, reason)?;
+    /// Send this response through the one HTTP/1.1 response writer.
+    ///
+    /// This used to be `write_to`, a third serialiser alongside m6-file's and
+    /// m6-http's. It emitted no `Connection` field at all and no `Date`, and
+    /// it wrote the body on a HEAD -- three different answers to the same
+    /// questions in one workspace. What stays here is the part that is
+    /// genuinely this type's own: the two defaults it supplies when a handler
+    /// did not.
+    pub fn send<W: std::io::Write>(
+        &self,
+        resp: &mut m6_core::h1::Responder<'_, W>,
+    ) -> anyhow::Result<()> {
+        let has = |name: &str| self.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(name));
 
-        let mut has_content_type = false;
-        let mut has_etag = false;
-        for (k, v) in &self.headers {
-            if k.eq_ignore_ascii_case("content-type") {
-                has_content_type = true;
-            }
-            if k.eq_ignore_ascii_case("etag") {
-                has_etag = true;
-            }
-            w.write_all(k.as_bytes())?;
-            w.write_all(b": ")?;
-            w.write_all(v.as_bytes())?;
-            w.write_all(b"\r\n")?;
-        }
-        write!(w, "Content-Length: {}\r\n", self.body.len())?;
-        if !has_content_type && !self.body.is_empty() {
-            w.write_all(b"Content-Type: text/html; charset=utf-8\r\n")?;
+        let etag;
+        let mut hdrs: Vec<(&str, &str)> =
+            self.headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
+        if !has("content-type") && !self.body.is_empty() {
+            hdrs.push(("Content-Type", "text/html; charset=utf-8"));
         }
         // A rendered page has no filesystem mtime to hang a Last-Modified off
         // of, but its body is a plain byte string — a content hash gives
         // conditional-GET (see m6-http's cache-hit `is_not_modified` check) a
         // real signal to compare against once this response is cached.
-        if !has_etag && !self.body.is_empty() {
-            write!(w, "ETag: \"{:x}\"\r\n", content_hash(&self.body))?;
+        if !has("etag") && !self.body.is_empty() {
+            etag = format!("\"{:x}\"", content_hash(&self.body));
+            hdrs.push(("ETag", etag.as_str()));
         }
-        w.write_all(b"\r\n")?;
-        w.write_all(&self.body)?;
+
+        resp.send(self.status, &hdrs, &self.body)?;
         Ok(())
     }
 }
@@ -220,23 +218,6 @@ fn content_hash(body: &[u8]) -> u64 {
     hasher.finish()
 }
 
-fn reason_phrase(status: u16) -> &'static str {
-    match status {
-        200 => "OK",
-        201 => "Created",
-        204 => "No Content",
-        301 => "Moved Permanently",
-        302 => "Found",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        403 => "Forbidden",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        500 => "Internal Server Error",
-        503 => "Service Unavailable",
-        _ => "Unknown",
-    }
-}
 
 /// Map an `Error` to a `Response` (status only, body set by framework).
 pub fn error_to_response(err: &Error) -> Response {

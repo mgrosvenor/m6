@@ -110,7 +110,7 @@ fn bench_handle_request(c: &mut Criterion) {
         b.iter(|| {
             let ctx = HandlerContext { routes: &routes, config: &config, site_dir: dir.path() };
             let mut buf = Vec::with_capacity(256);
-            black_box(handle_request(black_box(&req), &ctx, &mut buf).unwrap());
+            black_box(handle_request(black_box(&req), &ctx, &mut m6_core::h1::Responder::new(&mut buf, &req.method, false)).unwrap());
         })
     });
     group.finish();
@@ -145,12 +145,14 @@ fn bench_socket_round_trip(c: &mut Criterion) {
         for stream in listener.incoming() {
             let mut stream = match stream { Ok(s) => s, Err(_) => break };
             stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
-            let req = match m6_core::parse::parse_request(&mut stream.try_clone().unwrap()) {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
+            // The same loop production runs, so the round trip measured here
+            // is the one that actually happens.
             let ctx = HandlerContext { routes: &routes, config: &config, site_dir: &dir_path };
-            handle_request(&req, &ctx, &mut stream).ok();
+            let _ = m6_core::server::serve_connection(&mut stream, |req, resp| {
+                handle_request(req, &ctx, resp).map(|_| ()).map_err(|e| {
+                    std::io::Error::other(e.to_string())
+                })
+            });
         }
     });
     std::thread::sleep(std::time::Duration::from_millis(10));
@@ -204,7 +206,7 @@ fn main() {
         report_percentiles("handle_request (disk read)", N_SLOW, || {
             let ctx = HandlerContext { routes: &routes, config: &config, site_dir: dir.path() };
             let mut buf = Vec::with_capacity(256);
-            black_box(handle_request(&req, &ctx, &mut buf).unwrap());
+            black_box(handle_request(&req, &ctx, &mut m6_core::h1::Responder::new(&mut buf, &req.method, false)).unwrap());
         });
     }
 
@@ -234,12 +236,12 @@ fn main() {
             for stream in listener2.incoming() {
                 let mut stream = match stream { Ok(s) => s, Err(_) => break };
                 stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
-                let req = match m6_core::parse::parse_request(&mut stream.try_clone().unwrap()) {
-                    Ok(r) => r,
-                    Err(_) => continue,
-                };
                 let ctx = HandlerContext { routes: &routes, config: &config, site_dir: &dir2_path };
-                handle_request(&req, &ctx, &mut stream).ok();
+                let _ = m6_core::server::serve_connection(&mut stream, |req, resp| {
+                    handle_request(req, &ctx, resp).map(|_| ()).map_err(|e| {
+                        std::io::Error::other(e.to_string())
+                    })
+                });
             }
         });
         std::thread::sleep(std::time::Duration::from_millis(10));

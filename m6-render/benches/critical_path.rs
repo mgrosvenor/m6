@@ -401,7 +401,8 @@ fn bench_response_write(c: &mut Criterion) {
     group.bench_function("response_write", |b| {
         b.iter(|| {
             let mut buf = Vec::with_capacity(512);
-            black_box(resp.write_to(&mut buf).unwrap());
+            let mut out = m6_core::h1::Responder::new(&mut buf, "GET", true);
+            black_box(resp.send(&mut out).unwrap());
         })
     });
     group.finish();
@@ -525,7 +526,8 @@ size = 64
                 Response::not_found()
             };
 
-            write_response(&mut stream, &resp).ok();
+            let mut out = m6_core::h1::Responder::new(&mut stream, "GET", false);
+            write_response(&mut out, &resp).ok();
         }
     });
 
@@ -729,7 +731,8 @@ fn main() {
         };
         report_percentiles("response_write", N, || {
             let mut buf = Vec::with_capacity(512);
-            black_box(resp.write_to(&mut buf).unwrap());
+            let mut out = m6_core::h1::Responder::new(&mut buf, "GET", true);
+            black_box(resp.send(&mut out).unwrap());
         });
     }
 
@@ -824,7 +827,8 @@ size = 64
                 } else {
                     Response::not_found()
                 };
-                write_response(&mut stream, &resp).ok();
+                let mut out = m6_core::h1::Responder::new(&mut stream, "GET", false);
+            write_response(&mut out, &resp).ok();
             }
         });
         std::thread::sleep(std::time::Duration::from_millis(20));

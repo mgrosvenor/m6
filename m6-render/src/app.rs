@@ -1837,21 +1837,32 @@ fn run_app_with_shutdown(
     Ok(())
 }
 
+/// One accepted connection, served until it ends.
+///
+/// The loop, the malformed-request answer, the HEAD rule and the keep-alive
+/// decision are core's. This file had its own of each, and answered exactly
+/// one request per connection.
 fn handle_connection(
     stream: &mut UnixStream,
     fs: &std::sync::RwLock<FrameworkState>,
     code_handlers: &HashMap<String, Arc<BoxHandler>>,
 ) {
-    let raw = match crate::server::parse_request(stream) {
-        Ok(Some(r)) => r,
-        Ok(None) => return,
-        Err(e) => {
-            error!("Parse error: {e}");
-            crate::server::write_error_response(stream, 400, "Bad Request").ok();
-            return;
-        }
-    };
+    let served: std::result::Result<(), std::io::Error> =
+        m6_core::server::serve_connection(stream, |raw, resp| {
+            handle_request(raw, resp, fs, code_handlers);
+            Ok(())
+        });
+    if let Err(e) = served {
+        error!("connection error: {e}");
+    }
+}
 
+fn handle_request<W: std::io::Write>(
+    raw: &RawRequest,
+    stream: &mut m6_core::h1::Responder<'_, W>,
+    fs: &std::sync::RwLock<FrameworkState>,
+    code_handlers: &HashMap<String, Arc<BoxHandler>>,
+) {
     let start = std::time::Instant::now();
 
     // Take a read lock once per request — released after we have everything
