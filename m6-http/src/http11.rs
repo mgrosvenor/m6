@@ -90,6 +90,9 @@ struct H1Conn {
     /// Requests answered on this connection. Bounded so one client cannot
     /// hold a slot indefinitely by pipelining forever.
     served:    u32,
+    /// Whether the current request's `Expect` field has been dealt with.
+    /// Answering twice would put a second interim response on the wire.
+    expect_handled: bool,
 }
 
 /// Idle timeout for an HTTP/1.1 connection, measured from the start of the
@@ -197,6 +200,7 @@ impl Http11Listener {
                             created:    Instant::now(),
                             keep_alive: false,
                             served:     0,
+                expect_handled: false,
                         })
                     };
                     self.conns.push(Conn { stream, tls, kind });
@@ -341,6 +345,7 @@ where
             created:    Instant::now(),
             keep_alive: false,
             served:     0,
+            expect_handled: false,
         });
         return;
     }
@@ -372,6 +377,7 @@ where
                 created,
                 keep_alive: false,
                 served:     0,
+                expect_handled: false,
             });
         }
     }
@@ -502,7 +508,36 @@ where
                     _ => break,
                 };
                 match parsed {
-                    ParseResult::Incomplete => break,
+                    ParseResult::Incomplete => {
+                        // The head may be complete even though the message is
+                        // not, and a client that sent `Expect: 100-continue`
+                        // is holding its body back until we answer. Saying
+                        // nothing is a deadlock the client breaks by timing
+                        // out: curl waits a full second, then sends anyway.
+                        if !h1.expect_handled {
+                            let exp = match &h1.state {
+                                H1State::Reading { buf } => m6_core::h1::expectation(buf),
+                                _ => None,
+                            };
+                            match exp {
+                                // Head still arriving; nothing to conclude yet.
+                                None => {}
+                                Some(m6_core::h1::Expectation::None) => h1.expect_handled = true,
+                                Some(m6_core::h1::Expectation::Continue) => {
+                                    h1.expect_handled = true;
+                                    let _ = io.write(m6_core::h1::CONTINUE_RESPONSE);
+                                    let _ = io.advance();
+                                }
+                                Some(m6_core::h1::Expectation::Unsupported) => {
+                                    h1.expect_handled = true;
+                                    let resp = b"HTTP/1.1 417 Expectation Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                                    h1.state = H1State::Writing { buf: resp.to_vec(), pos: 0 };
+                                    continue;
+                                }
+                            }
+                        }
+                        break;
+                    }
                     ParseResult::Error => {
                         let resp = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
                         h1.state = H1State::Writing { buf: resp.to_vec(), pos: 0 };
@@ -617,6 +652,7 @@ fn finish_response(h1: &mut H1Conn) {
     if h1.keep_alive && h1.served < MAX_REQUESTS_PER_CONN {
         h1.state = H1State::Reading { buf: Vec::new() };
         h1.created = Instant::now();
+        h1.expect_handled = false;
     } else {
         h1.state = H1State::Done;
     }

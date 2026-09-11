@@ -74,8 +74,11 @@ fn redirect_for(req: &HttpRequest) -> RequestOutcome {
     if !host_is_safe(host) || !target_is_safe(target) {
         return RequestOutcome::Ready(
             400,
-            vec![("Content-Length".into(), "0".into()),
-                 ("Connection".into(), "close".into())],
+            // No `Connection` here: the listener owns persistence (RFC 9112
+            // 9.3) and drops any copy a handler supplies, so one written here
+            // would be silently discarded and read as policy that is not
+            // being applied.
+            vec![("Content-Length".into(), "0".into())],
             Vec::new(),
             String::new(),
             Arc::new(Vec::new()),
@@ -87,7 +90,6 @@ fn redirect_for(req: &HttpRequest) -> RequestOutcome {
         vec![
             ("Location".into(), format!("https://{host}{target}")),
             ("Content-Length".into(), "0".into()),
-            ("Connection".into(), "close".into()),
         ],
         Vec::new(),
         String::new(),
@@ -96,6 +98,18 @@ fn redirect_for(req: &HttpRequest) -> RequestOutcome {
 }
 
 pub fn run(bind: &str) -> anyhow::Result<()> {
+    // `main` blocks the shutdown signals as its first statement, which makes
+    // them deliverable only to core's sigwait thread. Redirect mode returned
+    // before ever installing that thread, so SIGTERM was blocked and nothing
+    // was listening for it: the process could not be stopped by anything short
+    // of SIGKILL. Found by a conformance run that could not reclaim its port.
+    //
+    // No wake fd and no socket: this loop parks in `poll` with a one second
+    // timeout and re-checks the flag each time round, so it needs neither.
+    let shutdown = m6_core::signal::ShutdownHandle::install(
+        m6_core::signal::Service::new("m6-http-redirect"),
+    );
+
     let mut listener = Http11Listener::bind_plain(bind)?;
     let poller = Poller::new()?;
     poller.add(listener.raw_fd(), TOKEN_LISTENER)?;
@@ -124,6 +138,7 @@ pub fn run(bind: &str) -> anyhow::Result<()> {
         );
 
         if m6_core::signal::is_shutdown() {
+            shutdown.complete();
             return Ok(());
         }
     }
