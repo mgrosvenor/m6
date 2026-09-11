@@ -57,7 +57,12 @@ Verified by commit, gate green at each step unless noted.
 - [x] **SMTP verified post-hardening** by a real submission. Site `792d7ed`.
 - [x] **Block ledger reconciled**, 26 identical rules on all three nodes, with
       `sync-blocks.sh` to keep them that way. Site `178f171`.
-- [x] **`80.94.95.211` blocked**: 843 paths, 1,553 requests, got nothing.
+- [x] **`80.94.95.211` blocked**: 843 paths, 1,553 requests, got nothing. It
+      had been probing since 2026-09-05, six days rather than one. Verified
+      11:57: last reached the application at 10:08:22, before its rule, and
+      not since.
+- [x] **Blocks verified as effective**, not merely installed. The orphaned
+      Route53 checks are dropping ~1,350 packets on chi across six addresses.
 
 ### Bugs found and fixed
 
@@ -146,6 +151,11 @@ Verified by commit, gate green at each step unless noted.
       neither reproduces in isolation, and in both cases the assertion text
       was lost to a re-run. Capture the full output of the next failing
       full-suite run *before* running anything else.
+- [ ] **`185.19.40.146`, block candidate, decision owed.** Three identical
+      `//xmlrpc.php` sweeps on 2026-09-11 (06:34, 10:24, 11:48), ~20 requests
+      each, 90% refused. Meets the same bar as `103.168.67.253` already in the
+      ledger. One command: `./deploy/block-ip.sh 185.19.40.146 "..."` then
+      `./deploy/sync-blocks.sh --apply`.
 - [ ] **The 94.154.46.x operator is still cycling addresses.** `.250` appeared
       on 2026-09-11 running the same spoofed-Googlebot credential sweep, two
       days after `.243`-`.249` were blocked, exactly as BLOCKLIST.md predicted.

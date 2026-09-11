@@ -22,6 +22,20 @@ firewall denies, not what code runs:
 - **The block ledger reconciled**, 26 identical rules on all three nodes.
 - **`80.94.95.211` blocked** after an 843-path credential sweep.
 
+All three verified at 11:57 UTC by the hourly check, not just by the runs that
+applied them:
+
+- Contact form delivery is in the journal, `contact form: message sent` at
+  11:07:33, which is the last path the hardening left unproven and the one
+  staging cannot test.
+- `80.94.95.211` last reached the application at 10:08:22, before its rule
+  went in, and not since. Worth knowing it had been probing since
+  **2026-09-05**, six days rather than one.
+- The orphaned Route53 checks are still arriving and are now dropped: about
+  225 packets on each of six addresses on chi, ~1,350 in total. That traffic
+  was previously refused on one node and served on two, which is exactly what
+  the reconciliation was for.
+
 - 962 workspace tests pass at default features. Zero warnings.
 - h1spec **32/32 on all four HTTP/1.1 targets**, with a CI ratchet
   (`tools/conformance.sh`, floors in `tools/conformance-scores.txt`) wired into
@@ -275,6 +289,12 @@ renderers switched to m6-core.
   Neither is understood. A test that fails only when the machine is busy is
   either a real race or a test that is too tight, and both are worth knowing
   which.
+- **`185.19.40.146` is a block candidate and was left alone.** It ran the same
+  `//xmlrpc.php` sweep three times on 2026-09-11: 06:34:53, 10:24:24 and
+  11:48:04, about 20 requests each, 90% refused, nothing obtained. That is the
+  pattern `BLOCKLIST.md` blocks for, and the same standard as
+  `103.168.67.253` already in the ledger. Not blocked because the hourly check
+  is read-only and blocking is a write; it needs a decision, not a discovery.
 - **A coordinated probe hit chi** at 05:47-05:50 UTC: `34.91.241.0` (GCP), 890
   requests in under three minutes rotating 526 user agents, targeting SSRF
   (`/fetch`, `/proxy`), cloud credentials (`.aws`, `.azure`, gcloud ADC) and
