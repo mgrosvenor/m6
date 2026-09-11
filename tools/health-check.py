@@ -547,13 +547,22 @@ def main():
         for ip, v in sorted(by_ip.items(), key=lambda x: -x[1]["n"])[:4]:
             probe_paths = [(p, n) for p, n in v["paths"] if PROBE_RE.search(p)]
             inj = [(p, n) for p, n in v["paths"] if INJECTION_RE.search(p)]
-            burst = v["n"] >= 100
+            # Volume alone is not suspicious. A burst counts only when it is
+            # also failing: an ordinary heavy client is not an incident, and
+            # reporting one trains the reader to skim the fault list. This
+            # rule fired on the check's own load generator, 178 requests from
+            # the operator's own address, all served 200.
+            errors = sum(n for code, n in v["status"].items() if int(code) >= 400)
+            error_ratio = errors / v["n"] if v["n"] else 0.0
+            burst = v["n"] >= 100 and error_ratio >= 0.5
             if not (probe_paths or inj or burst):
                 continue
             served = v["status"].get("200", 0)
             label = []
             if v["ua_count"] >= 10:
                 label.append("%d UAs (rotating)" % v["ua_count"])
+            if burst:
+                label.append("%.0f%% refused" % (error_ratio * 100))
             if probe_paths:
                 label.append("%d probe paths" % len(probe_paths))
             if inj:
