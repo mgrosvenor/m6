@@ -369,6 +369,68 @@ pub fn url_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Percent-encode a single URL component, RFC 3986 unreserved only.
+///
+/// `/` IS encoded, as `%2F`. Use this for anything going into one field: a
+/// query value, a cookie value, a path segment.
+pub fn url_encode(s: &str) -> String {
+    encode(s, false)
+}
+
+/// Percent-encode a path, leaving `/` alone.
+///
+/// The separator has to survive or the result is one escaped blob rather than
+/// a path. This is what a `?next=/some/page` redirect target needs, and using
+/// [`url_encode`] there instead turns the destination into `%2Fsome%2Fpage`.
+///
+/// Two named functions rather than one with a flag, because the caller that
+/// picks wrong here produces a broken link rather than an error, and a
+/// boolean argument at the call site does not say which way round it goes.
+pub fn url_encode_path(s: &str) -> String {
+    encode(s, true)
+}
+
+fn encode(s: &str, keep_slash: bool) -> String {
+    // Encoding is defined over bytes, the same as decoding: a multi-byte
+    // character becomes one `%XX` per byte, never one per code point.
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            b'/' if keep_slash => out.push('/'),
+            _ => {
+                out.push('%');
+                out.push(char::from(HEX[(b >> 4) as usize]));
+                out.push(char::from(HEX[(b & 0xf) as usize]));
+            }
+        }
+    }
+    out
+}
+
+const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+/// One named cookie out of a `Cookie` header value.
+///
+/// Returns the FIRST match. A duplicate cookie name is a client's problem and
+/// the first is what a browser sends for the most specific path, so taking it
+/// is the conservative read. [`parse_cookies`] builds a whole map and keeps
+/// the last, which is the right answer when you want them all and the wrong
+/// one when you want a session token.
+pub fn cookie<'a>(header: &'a str, name: &str) -> Option<&'a str> {
+    for part in header.split(';') {
+        let part = part.trim();
+        if let Some(pos) = part.find('=') {
+            if part[..pos].trim() == name {
+                return Some(part[pos + 1..].trim());
+            }
+        }
+    }
+    None
+}
+
 fn hex_digit(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b - b'0'),
@@ -531,6 +593,84 @@ mod tests {
             "expected replacement characters, got {:?}",
             pairs[0].1
         );
+    }
+
+    /// A `%` immediately before a multi-byte character must not panic.
+    ///
+    /// Decoding by slicing the `&str` (`&s[i+1..i+3]`) panics when those
+    /// offsets land inside a character, and a hostile client arranges that by
+    /// putting a `%` before any non-ASCII byte. In a login handler that is a
+    /// remote crash. Indexing the byte array, as this does, cannot.
+    ///
+    /// Moved here from m6-auth-server when its second copy of `url_decode` was
+    /// deleted. The property belongs with the one implementation.
+    #[test]
+    fn percent_before_multibyte_does_not_panic() {
+        for input in ["%\u{e9}", "%\u{1F600}x", "abc%\u{4e2d}\u{6587}", "%", "%A", "%ZZ",
+                      "%%", "a%", "%F0%9F%98"] {
+            let _ = url_decode(input);
+        }
+    }
+
+    /// Also from m6-auth-server. A password is the worst place for the
+    /// Latin-1 defect: the user sees only "invalid credentials" and nothing
+    /// says the password was corrupted rather than wrong.
+    #[test]
+    fn a_password_shaped_field_survives_decoding() {
+        assert_eq!(url_decode("p%C3%A4ssw%C3%B6rd+123"), "p\u{e4}ssw\u{f6}rd 123");
+        assert_eq!(url_decode("plain%2Fascii"), "plain/ascii");
+    }
+
+    #[test]
+    fn url_encode_is_over_bytes_not_code_points() {
+        // One %XX per byte. A three-byte character becomes three escapes, not
+        // one, which is the same rule decoding obeys in reverse.
+        assert_eq!(url_encode("I\u{2019}m"), "I%E2%80%99m");
+        assert_eq!(url_encode("caf\u{e9}"), "caf%C3%A9");
+        assert_eq!(url_encode("\u{1F600}"), "%F0%9F%98%80");
+        assert_eq!(url_encode("a b"), "a%20b");
+        assert_eq!(url_encode("ok-1.txt~"), "ok-1.txt~");
+    }
+
+    /// The distinction the two functions exist for.
+    #[test]
+    fn only_the_path_form_keeps_the_separator() {
+        assert_eq!(url_encode("/blog/post"), "%2Fblog%2Fpost");
+        assert_eq!(url_encode_path("/blog/post"), "/blog/post");
+        // And the path form still escapes everything else.
+        assert_eq!(url_encode_path("/blog/a b"), "/blog/a%20b");
+        assert_eq!(url_encode_path("/caf\u{e9}/x"), "/caf%C3%A9/x");
+    }
+
+    /// Encode then decode must be the identity, including for the input that
+    /// broke the contact form.
+    #[test]
+    fn encode_decode_round_trips() {
+        for case in ["I\u{2019}m not sure", "caf\u{e9}", "\u{1F600}\u{1F44B}",
+                     "a b&c=d", "/a/b?x=1", "\u{65e5}\u{672c}\u{8a9e}"] {
+            assert_eq!(url_decode(&url_encode(case)), case, "round trip: {case:?}");
+        }
+    }
+
+    #[test]
+    fn cookie_reads_one_by_name() {
+        let h = "session=abc123; theme=dark; empty=";
+        assert_eq!(cookie(h, "session"), Some("abc123"));
+        assert_eq!(cookie(h, "theme"), Some("dark"));
+        assert_eq!(cookie(h, "empty"), Some(""));
+        assert_eq!(cookie(h, "absent"), None);
+        // A name that is a prefix of another must not match it.
+        assert_eq!(cookie("sessionid=x", "session"), None);
+    }
+
+    /// `cookie` takes the first, `parse_cookies` keeps the last. Both are
+    /// defensible and they differ, so the difference is pinned rather than
+    /// left for someone to discover through a session bug.
+    #[test]
+    fn duplicate_cookie_names_resolve_differently_on_purpose() {
+        let h = "sid=first; sid=second";
+        assert_eq!(cookie(h, "sid"), Some("first"));
+        assert_eq!(parse_cookies(h).get("sid").unwrap().as_str(), Some("second"));
     }
 
     #[test]

@@ -2,6 +2,12 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use m6_auth::Db;
 use m6_core::http::{RawRequest, RawResponse};
+// Form parsing, percent coding and cookie lookup are core's. This file had its
+// own of each; `url_decode` in particular was a second copy of the Latin-1
+// defect that reached production through the contact form, and it had to be
+// found and fixed twice. That is the argument for consolidating, so they are
+// gone rather than merely correct.
+use m6_core::request::{cookie, parse_form_body, url_encode_path};
 use tracing::{info, warn};
 
 use crate::jwt::{hash_token, now_secs, AccessClaims, RefreshClaims};
@@ -66,76 +72,6 @@ fn handle_login(req: &RawRequest, state: &AppState, peer_ip: &str) -> RawRespons
     }
 }
 
-fn parse_form_body(body: &[u8]) -> Vec<(String, String)> {
-    // Lossy, not `unwrap_or("")`: one invalid byte used to discard the entire
-    // body, producing a login attempt with no username and no password and no
-    // indication why. See `url_decode` below for the matching defect.
-    let s = String::from_utf8_lossy(body);
-    s.split('&')
-        .filter_map(|pair| {
-            let mut it = pair.splitn(2, '=');
-            let k = it.next()?;
-            let v = it.next().unwrap_or("");
-            Some((url_decode(k), url_decode(v)))
-        })
-        .collect()
-}
-
-fn hex_digit(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
-
-/// Percent-decode into BYTES, then interpret the result as UTF-8.
-///
-/// This was a second copy of the same defect fixed in
-/// `m6-render/src/request.rs`: it decoded each `%XX` and did
-/// `out.push(byte as char)`, which in Rust means "the character at code point
-/// `byte`" -- Latin-1. A multi-byte UTF-8 sequence was split into one wrong
-/// character per byte, so any non-ASCII input was corrupted before it was used.
-///
-/// Here that lands on the login form. A password containing any non-ASCII
-/// character would be silently mangled and the comparison would fail, with the
-/// user seeing nothing but "invalid credentials" no matter how carefully they
-/// typed it -- and nothing in the logs to say why.
-///
-/// ASCII is a fixed point under the broken version (byte == code point below
-/// 0x80), which is why this survived: every test anyone wrote used ASCII.
-fn url_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'+' {
-            out.push(b' ');
-            i += 1;
-        } else if bytes[i] == b'%' && i + 2 < bytes.len() {
-            // Parsed from the raw bytes, never by slicing the &str. `&s[i+1..i+3]`
-            // would panic if those offsets landed inside a multi-byte character,
-            // which a hostile client can arrange with a `%` before any non-ASCII
-            // byte -- a remote panic in the login handler.
-            match (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2])) {
-                (Some(h), Some(l)) => {
-                    out.push((h << 4) | l);
-                    i += 3;
-                }
-                _ => {
-                    out.push(b'%');
-                    i += 1;
-                }
-            }
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
 fn form_field<'a>(fields: &'a [(String, String)], key: &str) -> Option<&'a str> {
     fields.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
 }
@@ -165,7 +101,7 @@ fn handle_login_form(req: &RawRequest, state: &AppState, peer_ip: &str) -> RawRe
         Ok(Some(u)) => u,
         Ok(None) => {
             warn!(ip = %peer_ip, reason = "invalid_credentials", "login failure");
-            let next_enc = url_encode(&next);
+            let next_enc = url_encode_path(&next);
             return RawResponse::new(302)
                 .header("Location", format!("/login?error=invalid&next={}", next_enc));
         }
@@ -284,7 +220,7 @@ fn handle_refresh(req: &RawRequest, state: &AppState) -> RawResponse {
 }
 
 fn handle_refresh_browser(req: &RawRequest, state: &AppState) -> RawResponse {
-    let token = match extract_cookie(req, "refresh") {
+    let token = match req.header("cookie").and_then(|h| cookie(h, "refresh")).map(|v| v.to_string()) {
         Some(t) => t,
         None => return RawResponse::new(302).header("Location", "/login"),
     };
@@ -396,7 +332,7 @@ fn handle_logout(req: &RawRequest, state: &AppState) -> RawResponse {
 }
 
 fn handle_logout_browser(req: &RawRequest, state: &AppState) -> RawResponse {
-    if let Some(token) = extract_cookie(req, "refresh") {
+    if let Some(token) = req.header("cookie").and_then(|h| cookie(h, "refresh")).map(|v| v.to_string()) {
         let token_hash = hash_token(&token);
         if let Ok(db) = state.db.lock() {
             let _ = db.refresh_token_revoke(&token_hash);
@@ -479,72 +415,9 @@ fn issue_tokens(
     Ok((access_jwt, refresh_jwt))
 }
 
-/// Extract a named cookie from the Cookie header.
-fn extract_cookie<'a>(req: &'a RawRequest, name: &str) -> Option<String> {
-    let cookie_header = req.header("cookie")?;
-    for part in cookie_header.split(';') {
-        let part = part.trim();
-        if let Some(pos) = part.find('=') {
-            let k = part[..pos].trim();
-            let v = part[pos + 1..].trim();
-            if k == name {
-                return Some(v.to_string());
-            }
-        }
-    }
-    None
-}
-
-fn url_encode(s: &str) -> String {
-    let mut out = String::new();
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
-            | b'-' | b'_' | b'.' | b'~' | b'/' => out.push(b as char),
-            _ => out.push_str(&format!("%{:02X}", b)),
-        }
-    }
-    out
-}
-
 fn internal_error() -> RawResponse {
     RawResponse::new(500)
         .content_type("application/json")
         .body(r#"{"error":"internal_error"}"#)
 }
 
-#[cfg(test)]
-mod url_decode_tests {
-    use super::{parse_form_body, url_decode};
-
-    /// The same defect that reached production through the contact form
-    /// (m6-render). A password is the worst place for it: the user sees only
-    /// "invalid credentials" and there is nothing to tell them their password
-    /// was corrupted rather than wrong.
-    #[test]
-    fn multibyte_utf8_survives() {
-        assert_eq!(url_decode("caf%C3%A9"), "caf\u{e9}");
-        assert_eq!(url_decode("I%E2%80%99m"), "I\u{2019}m");
-        assert_eq!(url_decode("%F0%9F%98%80"), "\u{1F600}");
-        assert_eq!(url_decode("p%C3%A4ssw%C3%B6rd+123"), "p\u{e4}ssw\u{f6}rd 123");
-        // ASCII unchanged — the case that always passed, broken or not.
-        assert_eq!(url_decode("plain%2Fascii"), "plain/ascii");
-    }
-
-    /// A `%` immediately before a multi-byte character. Slicing the &str by
-    /// byte offset here (`&s[i+1..i+3]`) panics on a non-char-boundary, which
-    /// would be a remote crash in the login handler.
-    #[test]
-    fn percent_before_multibyte_does_not_panic() {
-        for input in ["%\u{e9}", "%\u{1F600}x", "abc%\u{4e2d}\u{6587}", "%", "%A", "%ZZ"] {
-            let _ = url_decode(input);
-        }
-    }
-
-    #[test]
-    fn invalid_utf8_body_does_not_discard_every_field() {
-        let pairs = parse_form_body(b"username=admin&password=%FF%FE");
-        assert_eq!(pairs.len(), 2, "one bad byte must not empty the whole form");
-        assert_eq!(pairs[0], ("username".to_string(), "admin".to_string()));
-    }
-}
