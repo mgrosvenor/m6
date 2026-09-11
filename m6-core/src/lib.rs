@@ -8,6 +8,7 @@ pub mod http;
 pub mod log;
 pub mod mime;
 pub mod minify;
+pub mod ndjson;
 pub mod negotiate;
 pub mod parse;
 pub mod path;
@@ -17,6 +18,7 @@ pub mod request;
 pub mod response;
 pub mod server;
 pub mod signal;
+pub mod telemetry;
 pub mod util;
 pub mod watcher;
 
