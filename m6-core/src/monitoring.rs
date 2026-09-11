@@ -269,6 +269,20 @@ pub struct PerfReport {
 
 /// Outcome of a `/perf` request.
 pub enum PerfOutcome {
+    /// A traffic summary from `/traffic`. Same gate as `/perf`.
+    ///
+    /// Its own path rather than more fields on `/perf`, for the reason that
+    /// split `/health` from `/perf`: the cost profiles differ. `/perf` sorts a
+    /// reservoir in memory; this reads the tail of a 47MB file. Putting the
+    /// expensive one behind a conditional on the cheaper path leaves the
+    /// expensive branch one misconfigured header away from being taken on
+    /// every request, and splitting the paths is what keeps each answer's cost
+    /// a property of the path rather than of the caller.
+    Traffic(TrafficReport),
+    /// The analytics log could not be read. Said out loud rather than reported
+    /// as a quiet hour, which is a mistake this codebase has made: an absent
+    /// file at the expected path looked exactly like a feature switched off.
+    TrafficError(String),
     /// No token configured: the endpoint is switched off and answers 404, so
     /// it does not advertise a door that cannot be opened.
     Disabled,
@@ -331,6 +345,19 @@ impl PerfOutcome {
                 let body = serde_json::to_vec(&report)
                     .unwrap_or_else(|_| br#"{"error":"serialisation failed"}"#.to_vec());
                 (200, headers, body)
+            }
+            PerfOutcome::Traffic(report) => {
+                let body = serde_json::to_vec(&report)
+                    .unwrap_or_else(|_| br#"{"error":"serialisation failed"}"#.to_vec());
+                (200, headers, body)
+            }
+            // 503, not 500: the node is serving, but its own view of its
+            // traffic is not available. A monitor shows that as a gap rather
+            // than as a quiet hour.
+            PerfOutcome::TrafficError(why) => {
+                let body = serde_json::to_vec(&serde_json::json!({"error": why}))
+                    .unwrap_or_else(|_| br#"{"error":"unreadable"}"#.to_vec());
+                (503, headers, body)
             }
         }
     }
@@ -569,3 +596,238 @@ mod tests {
     }
 }
 
+
+// ── /traffic ─────────────────────────────────────────────────────────────────
+
+/// What `/traffic` publishes: the node's own view of who has been asking it
+/// for things, and whether its logging is alive.
+///
+/// This is the endpoint that lets a fleet report be assembled without ssh. The
+/// alternative was shipping the analytics log to a central box, and the
+/// numbers say not to: the file is 31MB on syd and 47MB on chi, one request is
+/// about 350 bytes, and the summary a human reads is about 1KB. Roughly
+/// 1000:1. A second copy of the log would also land on a box that is not
+/// backed up, and inherit a retention problem the original already has.
+///
+/// So the node summarises its own log and publishes the summary. The raw
+/// NDJSON never moves, which is right for what it is: forensic material, read
+/// by hand when something is being investigated, which is rare.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrafficReport {
+    pub node: String,
+    /// The window summarised, in minutes.
+    pub window_minutes: u64,
+    pub total_requests: u64,
+    pub status: std::collections::BTreeMap<u16, u64>,
+    /// Clients worth a human's attention. Already graded: see
+    /// `telemetry::ClientSummary::is_notable`.
+    pub notable: Vec<NotableClient>,
+    /// Top talkers by request count, whatever they are.
+    ///
+    /// Separate from `notable` on purpose. Volume is not suspicion, and the
+    /// rule that conflated them fired on the operator's own address; but "who
+    /// is asking for the most" is still the first question about an hour of
+    /// traffic, and the answer is usually a crawler or a person.
+    pub heavy_hitters: Vec<HeavyHitter>,
+    pub crawlers: Vec<CrawlerReport>,
+    /// Bot-shaped requests discarded as forged, and the addresses that sent
+    /// them. Reported rather than silently dropped, because "no crawlers" and
+    /// "886 forged crawler requests" are very different quiet hours.
+    pub forged_bot_requests: u64,
+    pub forgers: Vec<String>,
+    /// Single refused probes: recorded, not escalated. One 404 to
+    /// `/.git/config` is internet weather.
+    pub probe_noise: Vec<String>,
+    pub logging: LoggingHealth,
+}
+
+/// Whether this process's main log layer is still emitting.
+///
+/// Replaces counting log targets out of `journalctl` over ssh. A config reload
+/// can silence every target except `analytics`, and when it does the process
+/// looks entirely healthy from outside. It does not look healthy from inside,
+/// which is where this is measured.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LoggingHealth {
+    pub events_total: u64,
+    /// `None` means nothing has ever been emitted, which is not the same as
+    /// "emitted zero seconds ago" and must not be reported as healthy.
+    pub seconds_since_last: Option<u64>,
+}
+
+impl LoggingHealth {
+    pub fn read() -> Self {
+        Self {
+            events_total: crate::log::pulse().events(),
+            seconds_since_last: crate::log::pulse().seconds_since_last(),
+        }
+    }
+
+    /// A healthy m6-http emits `periodic stats` every ten seconds. Past this,
+    /// on a process that is up and serving, the main layer has gone quiet.
+    pub const QUIET_SECONDS: u64 = 40;
+
+    pub fn is_blind(&self) -> bool {
+        match self.seconds_since_last {
+            None => true,
+            Some(s) => s > Self::QUIET_SECONDS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotableClient {
+    pub ip: String,
+    pub requests: u64,
+    pub distinct_user_agents: usize,
+    pub status: std::collections::BTreeMap<u16, u64>,
+    pub probe_paths: Vec<String>,
+    pub injection_paths: Vec<String>,
+    pub rotating_user_agents: bool,
+    pub first_seen: String,
+    pub last_seen: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeavyHitter {
+    pub ip: String,
+    pub requests: u64,
+    pub top_path: String,
+    pub user_agents: usize,
+    /// Share of responses that were 4xx or 5xx, so a loud client that is
+    /// being served is distinguishable from one that is being refused.
+    pub error_ratio: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CrawlerReport {
+    pub user_agent: String,
+    pub requests: u64,
+    pub client_ips: Vec<String>,
+    pub paths: Vec<String>,
+}
+
+impl TrafficReport {
+    /// Summarise an analytics stream.
+    ///
+    /// `since` is an RFC 3339 prefix; the timestamps are fixed-width UTC so a
+    /// string compare is a time compare.
+    pub fn build(node: &str, ndjson: &str, since: &str, window_minutes: u64) -> Self {
+        let records: Vec<crate::telemetry::AnalyticsRecord> =
+            crate::telemetry::parse_analytics(ndjson, since).collect();
+        let summary = crate::telemetry::TrafficSummary::from_records(&records);
+
+        let notable: Vec<NotableClient> = summary
+            .clients
+            .iter()
+            .filter(|(_, c)| c.is_notable())
+            .map(|(ip, c)| NotableClient {
+                ip: ip.clone(),
+                requests: c.requests,
+                distinct_user_agents: c.distinct_user_agents,
+                status: c.status.clone(),
+                probe_paths: c.probe_paths.iter().map(|(p, _)| p.clone()).collect(),
+                injection_paths: c.injection_paths.iter().map(|(p, _)| p.clone()).collect(),
+                rotating_user_agents: c.is_rotating_user_agents,
+                first_seen: c.first_seen.clone(),
+                last_seen: c.last_seen.clone(),
+            })
+            .collect();
+
+        let probe_noise: Vec<String> = summary
+            .clients
+            .iter()
+            .filter(|(_, c)| !c.is_notable() && !c.probe_paths.is_empty())
+            .map(|(ip, c)| format!("{ip} {}", c.probe_paths[0].0))
+            .collect();
+
+        let heavy_hitters: Vec<HeavyHitter> = summary
+            .clients
+            .iter()
+            .take(8)
+            .map(|(ip, c)| HeavyHitter {
+                ip: ip.clone(),
+                requests: c.requests,
+                top_path: c.paths.first().map(|(p, _)| p.clone()).unwrap_or_default(),
+                user_agents: c.distinct_user_agents,
+                error_ratio: c.error_ratio(),
+            })
+            .collect();
+
+        Self {
+            node: node.to_string(),
+            window_minutes,
+            heavy_hitters,
+            total_requests: summary.total_requests,
+            status: summary.status.clone(),
+            notable,
+            crawlers: summary
+                .crawlers
+                .iter()
+                .map(|c| CrawlerReport {
+                    user_agent: c.user_agent.clone(),
+                    requests: c.requests,
+                    client_ips: c.client_ips.clone(),
+                    paths: c.paths.iter().map(|(p, _)| p.clone()).collect(),
+                })
+                .collect(),
+            forged_bot_requests: summary.forged_bot_requests,
+            forgers: summary.forgers.clone(),
+            probe_noise,
+            logging: LoggingHealth::read(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod traffic_tests {
+    use super::*;
+
+    fn row(ts: &str, ip: &str, path: &str, status: u16, ua: &str) -> String {
+        format!(
+            r#"{{"timestamp":"{ts}","level":"INFO","fields":{{"message":"request","node":"sydney","path":"{path}","status":{status},"client_ip":"{ip}","user_agent":"{ua}"}}}}"#
+        )
+    }
+
+    #[test]
+    fn summarises_a_stream_into_something_small() {
+        let mut lines = vec![
+            row("2026-09-11T08:00:00Z", "1.2.3.4", "/", 200, "Mozilla/5.0 Chrome/131"),
+            row("2026-09-11T08:00:01Z", "5.6.7.8", "/robots.txt", 200,
+                "Mozilla/5.0 (compatible; ClaudeBot/1.0; +claudebot@anthropic.com)"),
+            row("2026-09-11T08:00:02Z", "9.9.9.9", "/.git/config", 404, "curl/8"),
+        ];
+        // A real scan: three distinct probe paths from one address.
+        for (i, p) in ["/.env", "/wp-admin/setup.php", "/@fs/etc/passwd"].iter().enumerate() {
+            lines.push(row(&format!("2026-09-11T08:01:{:02}Z", i), "203.0.113.5", p, 404, "curl/8"));
+        }
+        let r = TrafficReport::build("sydney", &lines.join("\n"), "", 60);
+
+        assert_eq!(r.total_requests, 6);
+        assert_eq!(r.crawlers.len(), 1);
+        assert!(r.crawlers[0].user_agent.contains("ClaudeBot"));
+        assert_eq!(r.notable.len(), 1, "the scanner, not the single 404");
+        assert_eq!(r.notable[0].ip, "203.0.113.5");
+        assert_eq!(r.probe_noise, vec!["9.9.9.9 /.git/config".to_string()]);
+        assert_eq!(r.status.get(&200), Some(&2));
+        assert_eq!(r.status.get(&404), Some(&4));
+
+        // The whole point: what goes over the wire is small.
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.len() < 2000, "summary was {} bytes", json.len());
+    }
+
+    /// Never having logged is not the same as having logged just now.
+    #[test]
+    fn logging_health_distinguishes_never_from_recently() {
+        let never = LoggingHealth { events_total: 0, seconds_since_last: None };
+        assert!(never.is_blind());
+
+        let alive = LoggingHealth { events_total: 5000, seconds_since_last: Some(3) };
+        assert!(!alive.is_blind());
+
+        // Silenced: the process is up and the main layer stopped.
+        let quiet = LoggingHealth { events_total: 5000, seconds_since_last: Some(600) };
+        assert!(quiet.is_blind(), "ten minutes of silence from a 10s heartbeat");
+    }
+}

@@ -209,10 +209,37 @@ pub struct HealthConfig {
     /// health check must stay constant-cost, and percentiles are not.
     #[serde(default = "default_perf_path")]
     pub perf_path: String,
+    /// Where the traffic summary is served. Same token as `/perf`.
+    ///
+    /// A third path rather than more fields on `/perf`, for the reason that
+    /// split `/health` from `/perf` in the first place: the cost profiles
+    /// differ. `/perf` sorts a reservoir in memory; this reads the tail of a
+    /// 47MB file. Putting the expensive one behind a conditional on a cheaper
+    /// path leaves the expensive branch one misconfigured header away from
+    /// being taken on every request, so each answer's cost stays a property of
+    /// its path.
+    #[serde(default = "default_traffic_path")]
+    pub traffic_path: String,
+    /// How long a traffic summary is reused before the analytics log is read
+    /// again.
+    ///
+    /// Without this a monitor polling every 30 seconds makes every node
+    /// re-read its analytics tail every 30 seconds, forever, to produce an
+    /// answer that changes slowly. The check that consumes this runs hourly.
+    #[serde(default = "default_traffic_cache_s")]
+    pub traffic_cache_s: u64,
 }
 
 fn default_perf_path() -> String {
     "/perf".to_string()
+}
+
+fn default_traffic_path() -> String {
+    "/traffic".to_string()
+}
+
+fn default_traffic_cache_s() -> u64 {
+    60
 }
 
 fn default_health_path() -> String {
@@ -227,6 +254,8 @@ impl Default for HealthConfig {
             metrics_token_file: None,
             metrics_token: None,
             perf_path: default_perf_path(),
+            traffic_path: default_traffic_path(),
+            traffic_cache_s: default_traffic_cache_s(),
         }
     }
 }
