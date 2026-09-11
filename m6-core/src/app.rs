@@ -2079,8 +2079,15 @@ fn handle_request<W: std::io::Write>(
             // fresh token only for routes with no dict (e.g. an unmatched
             // path's 404), where there's no rendered form to have carried one.
             let token = csrf_token_for_cookie.unwrap_or_else(generate_csrf_token);
-            let cookie = format!("_csrf={}; Path=/; SameSite=Strict; Secure", token);
-            resp.headers.push(("Set-Cookie".to_string(), cookie));
+            // No HttpOnly, deliberately: this is the double-submit token and
+            // the page has to be able to read it back.
+            resp.headers.push(
+                crate::cookie::Cookie::new("_csrf", token)
+                    .path("/")
+                    .same_site(crate::cookie::SameSite::Strict)
+                    .secure()
+                    .to_header(),
+            );
         }
     }
 
@@ -2091,21 +2098,21 @@ fn handle_request<W: std::io::Write>(
             .map(|h| h.contains("_flash="))
             .unwrap_or(false);
         if had_flash {
-            resp.headers.push((
-                "Set-Cookie".to_string(),
-                "_flash=; Max-Age=0; Path=/; HttpOnly".to_string(),
-            ));
+            // Path and HttpOnly must match the cookie being removed or the
+            // browser treats this as a different cookie and keeps both.
+            resp.headers.push(
+                crate::cookie::Cookie::removal("_flash")
+                    .path("/")
+                    .http_only()
+                    .to_header(),
+            );
         }
     }
 
     // ── Minification: applied BEFORE compression for better ratios.
     if !resp.body.is_empty() {
-        let content_type = resp
-            .headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
-            .map(|(_, v)| v.as_str())
-            .unwrap_or("");
+        let content_type =
+            crate::headers::get(&resp.headers[..], "content-type").unwrap_or("");
         let mime = content_type.split(';').next().unwrap_or("").trim();
 
         if minification.is_enabled(mime) {
@@ -2122,12 +2129,8 @@ fn handle_request<W: std::io::Write>(
     // ── Compression: applied AFTER minification.
     let accept_encoding = raw.header("accept-encoding").unwrap_or("");
     if !resp.body.is_empty() {
-        let content_type = resp
-            .headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
-            .map(|(_, v)| v.as_str())
-            .unwrap_or("");
+        let content_type =
+            crate::headers::get(&resp.headers[..], "content-type").unwrap_or("");
         let mime = content_type.split(';').next().unwrap_or("").trim();
 
         if let Some(level) = compression.get(mime) {

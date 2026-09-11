@@ -163,16 +163,18 @@ impl Response {
     }
 
     /// Set a cookie with `Max-Age` in seconds (0 = delete).
+    ///
+    /// `Path=/` and `HttpOnly`, which is the right default for a cookie a
+    /// handler sets without saying more. A cookie needing `Secure`,
+    /// `SameSite`, or to be readable from the page should be built with
+    /// [`crate::cookie::Cookie`] and pushed with `header`.
     pub fn cookie(mut self, name: &str, value: &str, max_age: i64) -> Self {
-        let cookie = if max_age == 0 {
-            format!("{}=; Max-Age=0; Path=/; HttpOnly", name)
+        let c = if max_age == 0 {
+            crate::cookie::Cookie::removal(name)
         } else {
-            format!(
-                "{}={}; Max-Age={}; Path=/; HttpOnly",
-                name, value, max_age
-            )
+            crate::cookie::Cookie::new(name, value).max_age(max_age)
         };
-        self.headers.push(("Set-Cookie".to_string(), cookie));
+        self.headers.push(c.path("/").http_only().to_header());
         self
     }
 
@@ -198,12 +200,14 @@ impl Response {
         let sig_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&sig_bytes);
 
         let cookie_val = format!("{}.{}", msg_b64, sig_b64);
-        let cookie = format!(
-            "_flash={}; Max-Age=120; Path=/; HttpOnly",
-            cookie_val
-        );
         let mut s = self;
-        s.headers.push(("Set-Cookie".to_string(), cookie));
+        s.headers.push(
+            crate::cookie::Cookie::new("_flash", cookie_val)
+                .max_age(120)
+                .path("/")
+                .http_only()
+                .to_header(),
+        );
         s
     }
 
@@ -221,7 +225,7 @@ impl Response {
         &self,
         resp: &mut crate::h1::Responder<'_, W>,
     ) -> anyhow::Result<()> {
-        let has = |name: &str| self.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(name));
+        let has = |name: &str| crate::headers::contains(&self.headers[..], name);
 
         let etag;
         let mut hdrs: Vec<(&str, &str)> =
