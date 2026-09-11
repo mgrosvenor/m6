@@ -14,6 +14,22 @@ file does not cross the network every hour. Read-only: `journalctl`,
 `systemctl show`, `df`, `stat` and a loopback `curl`, and nothing else. Exit
 status is 1 if there are faults.
 
+**Most of this is now a service.** `m6-monitor` runs on the central node,
+polls every node's `/health` and `/perf`, and serves the same digest as a page
+and as JSON. `/perf` carries the host's load, memory, disk, temperature and
+uptime as of 2026-09-11, so the numbers this script gathers over ssh are
+reachable over HTTP. See `deploy/ORIGIN-NODE.md` in the site repo.
+
+What the service cannot yet reach, and what keeps this script alive:
+
+  - **Part A, the log-target histogram.** `journalctl` is not exposed. A
+    log-target count on `/perf` would remove the need for this check
+    altogether, and is the obvious next thing to add.
+  - **ufw block counts**, which come from the kernel ring buffer.
+
+Everything else here is duplicated by the service, and the service is the one
+that keeps working when nobody remembers to run the script.
+
 **The rest of this file is why, not how.** It was written when the check was a
 list of commands to paste, and every trap it describes is now encoded in the
 script: the per-role analytics path, the nested `fields.user_agent` record

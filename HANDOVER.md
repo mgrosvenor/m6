@@ -7,8 +7,8 @@ same day after Phase 5 landed.
 
 ## 1. Where the work is
 
-**Branch `main`, clean, 51 commits ahead of the deployed `b32e837`, 29 not yet
-pushed. Nothing is deployed. The freeze holds until the whole migration is
+**Branch `main`, clean, 38 commits ahead of the deployed `b32e837` in this
+repo and 6 in the site repo. Nothing is deployed. The freeze holds until the whole migration is
 finished.**
 
 - 862 workspace tests pass at default features, 871 with `--all-features`.
@@ -30,7 +30,7 @@ finished.**
 | 3 | Semantics | done, 3.3 dropped |
 | 4 | HTTP/1.1 | done, 32/32 |
 | **5** | **Service loop** | **done** |
-| 6 | Consumer apps link `m6-core` only | **next** |
+| **6** | **Consumer apps link `m6-core` only** | **done** |
 | 7 | Decouple the repositories | not started |
 | 8 | Backend examples | not started |
 
@@ -100,13 +100,11 @@ New in `m6-core`:
 
 ## 4. Immediate next steps, in order
 
-1. **Phase 6.** `render-contact`, `render-analytics` and `render-cms` switch
-   from `m6-render` to `m6-core` and construct `App::new(..)` with the
-   renderer they actually want, which for all three is
-   `m6_core::render::NoTemplates` (none of them has a template file). Then
-   `m6-render/src/{app,config,error,multipart,request,response,server}.rs`
-   and its `util` shim are deleted; only `template.rs` is left, and Phase 0.1
-   says that becomes `m6-html`.
+1. **Deploy `m6-monitor` and prove it.** It has never run against the fleet.
+   It needs `configs/m6-monitor.conf` shipped to syd and the unit installed;
+   `deploy/ORIGIN-NODE.md` in the site repo is the runbook. Everything else
+   about it is tested, but "tested" and "has ever polled a real node" are
+   different claims.
 2. **Compile the watcher fix on the build box.** `m6-core/src/watcher.rs` is
    inside `#[cfg(target_os = "linux")]` and no Linux target is installed on
    the laptop, so the inotify alignment fix in `8bcebac` has never been
@@ -141,6 +139,38 @@ Three nodes, all checked every run:
 
 Anything a cache node serves from its own cache never reaches origin, so a
 syd-only reading is **biased, not partial**.
+
+---
+
+## 5b. What Phase 6 produced, and the new services
+
+`m6-render` is **deleted**. m6-core is the only crate a service links, and it
+carries templating, the service loop, request/response, config, ndjson,
+telemetry and host metrics. m6-html is four lines.
+
+The plan's justification for Phase 6 was wrong and is worth not repeating:
+"three of four consumers have zero template files yet link Tera" is true about
+files and false about need. All three render templates out of the *site*
+directory. Giving them `NoTemplates` would have compiled and 500'd every page.
+
+New in core since:
+
+| module | what |
+|---|---|
+| `ndjson` | NDJSON read/write. A torn last line is ordinary, skipped and counted |
+| `telemetry` | `AnalyticsRecord` (the definition the format never had), `PeriodicStats`, traffic classification, UA-forgery detection |
+| `host` | load, memory, disk, thermal, uptime. Reading only, no thresholds |
+| `monitoring` | `/health` and `/perf` wire types, shared by producer and consumer |
+
+`/perf` now carries the host snapshot. `/health` is still exactly
+`{"status","node"}` and a test pins it.
+
+**`m6-monitor`** is a new service at the central node: polls every node's
+`/health` and `/perf`, serves `/` as a page and `/digest` as JSON. It has
+never run against the real fleet. `deploy/ORIGIN-NODE.md` in the site repo is
+its runbook and records the thing that surprised me: the WireGuard mesh is not
+a path to these endpoints, because origin's backbone listener is h2c-only and
+the cache nodes have no backbone listener at all.
 
 ---
 
