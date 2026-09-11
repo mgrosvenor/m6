@@ -34,6 +34,19 @@ pub struct ParamsCacheConfig {
     pub size: usize,
 }
 
+/// Connection-level settings parsed from `[server]`.
+#[derive(Debug, Clone)]
+pub struct ServerConfig {
+    /// Read timeout applied to every accepted connection.
+    ///
+    /// `None` means no timeout, which is what every `App` service did before
+    /// this key existed: a peer that connects and then says nothing holds a
+    /// pool worker until it disconnects, and a handful of such peers take the
+    /// whole pool. Configure `read_timeout_s = 0` to ask for that old
+    /// behaviour back deliberately.
+    pub read_timeout: Option<std::time::Duration>,
+}
+
 /// Compression level for a MIME type.
 #[derive(Debug, Clone)]
 pub struct CompressionLevel {
@@ -61,6 +74,8 @@ pub struct RendererConfig {
     pub thread_pool: ThreadPoolConfig,
     /// Params-cache settings.
     pub params_cache: ParamsCacheConfig,
+    /// Connection-level settings.
+    pub server: ServerConfig,
     /// Compression settings keyed by MIME type.
     pub compression: std::collections::HashMap<String, CompressionLevel>,
     /// Minification settings keyed by MIME type.
@@ -114,6 +129,7 @@ const FRAMEWORK_KEYS: &[&str] = &[
     "secrets_file",
     "thread_pool",
     "params_cache",
+    "server",
     "compression",
     "minification",
     "log",
@@ -204,6 +220,24 @@ fn parse_config(tv: toml::Value, _site_dir: &Path) -> anyhow::Result<RendererCon
         .map(|v| v as usize)
         .unwrap_or(256);
 
+    // --- server ---
+    // 30 seconds is not a new number: m6-file and m6-auth-server each picked it
+    // by hand for the same reason, so it is the value this fleet already runs.
+    // A negative value is treated as absent rather than as an error, because a
+    // config that fails to parse takes the service down and an unreadable
+    // timeout is not worth that.
+    let read_timeout_s = tv
+        .get("server")
+        .and_then(|t| t.get("read_timeout_s"))
+        .and_then(|v| v.as_integer())
+        .filter(|v| *v >= 0)
+        .unwrap_or(crate::server::DEFAULT_READ_TIMEOUT_SECS as i64);
+    let read_timeout = if read_timeout_s == 0 {
+        None
+    } else {
+        Some(std::time::Duration::from_secs(read_timeout_s as u64))
+    };
+
     // --- global_params ---
     let global_params: Vec<String> = tv
         .get("global_params")
@@ -270,6 +304,7 @@ fn parse_config(tv: toml::Value, _site_dir: &Path) -> anyhow::Result<RendererCon
         routes,
         thread_pool: ThreadPoolConfig { size: tp_size, queue_size: tp_queue },
         params_cache: ParamsCacheConfig { size: pc_size },
+        server: ServerConfig { read_timeout },
         compression,
         minification,
         log,

@@ -80,17 +80,22 @@ arrives in the request dictionary. A minimal config:
 size       = 2
 queue_size = 8
 
+[server]
+# Read deadline on an accepted connection. Default 30, `0` disables.
+# A silent peer holds a pool worker for exactly this long and no longer.
+read_timeout_s = 30
+
 [log]
 level  = "info"
 format = "json"
 ```
 
-Framework sections are `[thread_pool]`, `[params_cache]`, `[compression]`,
-`[minification]`, `[log]`, plus `[[route]]` entries. Any other top-level key
-lands in `RendererConfig::user_config` and is readable from the request
-dictionary, which is how an app gets its own settings without inventing a
-second config file. `m6-monitor` puts its whole fleet under `[monitor]` this
-way.
+Framework sections are `[thread_pool]`, `[params_cache]`, `[server]`,
+`[compression]`, `[minification]`, `[log]`, plus `[[route]]` entries. Any
+other top-level key lands in `RendererConfig::user_config` and is readable
+from the request dictionary, which is how an app gets its own settings
+without inventing a second config file. `m6-monitor` puts its whole fleet
+under `[monitor]` this way.
 
 ### Logging
 

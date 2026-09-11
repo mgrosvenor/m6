@@ -213,6 +213,7 @@ pub struct RendererConfig {
     pub routes:        Vec<RouteConfig>,
     pub thread_pool:   ThreadPoolConfig,     // size, queue_size
     pub params_cache:  ParamsCacheConfig,    // size
+    pub server:        ServerConfig,         // read_timeout
     pub compression:   HashMap<String, CompressionLevel>,  // per-mime brotli/gzip
     pub minification:  MinificationConfig,   // per-mime enabled, inline_js
     pub log:           LogConfig,            // level, format
@@ -222,6 +223,12 @@ pub struct RendererConfig {
 A `RouteConfig` carries `path`, `template`, `params`, `status`, `cache`,
 `methods` and `headers`. `MinificationConfig::is_enabled(mime)` answers the
 per-type question. `toml_to_json` is the conversion used throughout.
+
+`[server] read_timeout_s` is the read deadline applied to every accepted
+connection, defaulting to `server::DEFAULT_READ_TIMEOUT_SECS` (30). `0` means
+no timeout, which is what every `App` service did before the key existed. Read
+once at startup, like the pool dimensions: it is set on a socket at accept
+time, so a reload cannot retune connections already being served.
 
 ### `server`
 
