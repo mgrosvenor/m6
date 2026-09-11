@@ -37,6 +37,7 @@ WORK="${CONFORMANCE_WORK:-/tmp/m6-conformance}"
 TLS_PORT=10443
 H2C_PORT=18080
 BRIDGE_BASE=18090
+AUTH_BRIDGE_PORT=18096
 REDIRECT_PORT=18081
 EDGE_BRIDGE_PORT=18095
 
@@ -228,6 +229,41 @@ TOML
   return 0
 }
 
+start_auth() {  # start_auth <bridge-port>
+  local port="$1" site="$WORK/auth-site"
+  mkdir -p "$site/data"
+  if [[ ! -f "$site/auth.pem" ]]; then
+    openssl genrsa -out "$site/auth.pem" 2048 2>/dev/null
+    openssl rsa -in "$site/auth.pem" -pubout -out "$site/auth.pub" 2>/dev/null
+  fi
+  cat > "$site/m6-auth.conf" <<TOML
+[storage]
+path = "data/auth.db"
+
+[tokens]
+access_ttl  = 900
+refresh_ttl = 2592000
+issuer      = "conformance"
+
+[keys]
+private_key = "$site/auth.pem"
+public_key  = "$site/auth.pub"
+TOML
+  local sock="$WORK/auth.sock"
+  rm -f "$sock"
+  M6_SOCKET_OVERRIDE="$sock" $SETSID nohup "$ROOT/target/release/m6-auth-server" \
+    "$site" "$site/m6-auth.conf" > "$WORK/auth.log" 2>&1 &
+  local pid=$!
+  PIDS+=($pid)
+  for _ in $(seq 1 300); do [[ -S "$sock" ]] && break; sleep 0.02; done
+  [[ -S "$sock" ]] || { fail "m6-auth-server never created $sock"; RESULT=1; return 1; }
+  require_free_port "$port" "the m6-auth-server bridge" || return 1
+  $SETSID nohup python3 "$HERE/unix_bridge.py" "$port" "$sock" > "$WORK/auth-bridge.log" 2>&1 &
+  local bpid=$!
+  PIDS+=($bpid)
+  wait_port_owned_by "$bpid" "$port" "the m6-auth-server bridge"
+}
+
 start_redirect() {
   # m6-http in redirect mode is a plaintext HTTP/1.1 server on :80, a separate
   # process from the :443 instance, running on every production node. It is the
@@ -293,6 +329,11 @@ run_h1() {
   if start_backend m6-html $((BRIDGE_BASE + 1)) \
        "$ROOT/m6-html/tests/fixtures" "$ROOT/m6-html/tests/fixtures/configs/m6-html.conf"; then
     h1_against "h1:m6-html" $((BRIDGE_BASE + 1))
+  fi
+
+  # m6-auth-server, the other consumer of the one parser in m6_core::h1.
+  if start_auth "$AUTH_BRIDGE_PORT"; then
+    h1_against "h1:m6-auth-server" "$AUTH_BRIDGE_PORT"
   fi
 
   # The plaintext :80 redirect listener, which is public-facing in production.

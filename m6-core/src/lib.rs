@@ -1,5 +1,6 @@
 pub mod compress;
 pub mod conditional;
+pub mod h1;
 pub mod http;
 pub mod log;
 pub mod mime;
@@ -19,6 +20,7 @@ pub mod testkit;
 
 pub use conditional::{evaluate_preconditions, is_not_modified, not_modified_headers, Precondition};
 pub use compress::{brotli_compress, brotli_decompress, gzip_compress, gzip_decompress};
+pub use h1::{parse_request, ParseResult};
 pub use http::{header, is_same_origin_path, HeaderSource, RawRequest, RawResponse};
 pub use mime::{mime_from_path, should_compress_default};
 pub use negotiate::{canonical_coding, coding_quality, preferred_coding};

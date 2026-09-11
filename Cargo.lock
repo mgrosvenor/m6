@@ -1771,6 +1771,7 @@ dependencies = [
  "anyhow",
  "brotli",
  "flate2",
+ "httparse",
  "httpdate",
  "libc",
  "minify-html",
