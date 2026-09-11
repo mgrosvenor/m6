@@ -418,7 +418,7 @@ fn handle_connection(
         Err(e) => {
             debug!(error = %e, "malformed request");
             let hdrs: Vec<(&str, &str)> = vec![("Connection", "close")];
-            crate::http::write_response(&mut stream, 400, "Bad Request", &hdrs, &[])?;
+            crate::http::write_response(&mut stream, e.status(), e.reason(), &hdrs, &[])?;
             return Ok(());
         }
     };

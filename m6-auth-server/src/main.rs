@@ -246,8 +246,8 @@ fn handle_connection(
         Ok(r) => r,
         Err(e) => {
             debug!(error = %e, "malformed request");
-            let resp = m6_core::http::RawResponse::new(400)
-                .body(format!("Bad Request: {e}"));
+            let resp = m6_core::http::RawResponse::new(e.status())
+                .body(format!("{}: {e}", e.reason()));
             stream.write_all(&resp.to_bytes())?;
             return Ok(());
         }

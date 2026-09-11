@@ -329,8 +329,8 @@ fn finding_7b_ambiguous_framing_must_be_rejected_at_ingress() {
              Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
         ),
         (
-            "chunked body we never decode",
-            "POST /upload HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n\
+            "chunked transfer-coding on an HTTP/1.0 message",
+            "POST /upload HTTP/1.0\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n\
              5\r\nhello\r\n0\r\n\r\n",
         ),
     ];
@@ -341,6 +341,37 @@ fn finding_7b_ambiguous_framing_must_be_rejected_at_ingress() {
             "{label}: should be rejected, but parsed"
         );
     }
+}
+
+/// The same property for a chunked body the server *does* accept.
+///
+/// This case used to be in the list above, rejected outright on the grounds
+/// that forwarding a coding we never decoded would be worse. True, and the
+/// answer was to decode it (RFC 9112 7.1 makes that mandatory), not to refuse
+/// every client that streams a request. What must not change is the property:
+/// the backend gets exactly one, unambiguous statement of where the body ends.
+#[test]
+fn finding_7d_a_decoded_chunked_body_leaves_no_framing_ambiguity() {
+    let raw = "POST /upload HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n\
+               5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+
+    let http11::ParseResult::Complete(req) = http11::parse_request(raw.as_bytes()) else {
+        panic!("a chunked body must be decoded, not refused");
+    };
+
+    assert_eq!(req.body, b"hello world");
+
+    let cl: Vec<_> = req.headers.iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+        .map(|(_, v)| v.as_str())
+        .collect();
+    assert_eq!(cl, ["11"], "the decoded body must be framed by one Content-Length");
+
+    assert!(
+        !req.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("transfer-encoding")),
+        "the transfer-coding is hop-by-hop and ends here; forwarding it alongside \
+         the Content-Length above would recreate the ambiguity this guards"
+    );
 }
 
 /// Guards against over-correction: agreeing duplicate `Content-Length` headers

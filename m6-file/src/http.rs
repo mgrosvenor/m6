@@ -88,7 +88,7 @@ mod tests {
     #[test]
     fn test_parse_request() {
         let raw = b"GET /assets/css/main.css HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: br, gzip\r\n\r\n";
-        let req = m6_core::parse::parse_request(&mut Cursor::new(raw)).unwrap();
+        let req = m6_core::parse::parse_request(&mut Cursor::new(raw.to_vec())).unwrap();
         assert_eq!(req.method, "GET");
         assert_eq!(req.path, "/assets/css/main.css");
         assert_eq!(accept_encoding(&req), "br, gzip");
@@ -97,7 +97,7 @@ mod tests {
     #[test]
     fn test_parse_request_with_query() {
         let raw = b"GET /path?foo=bar HTTP/1.1\r\nHost: localhost\r\n\r\n";
-        let req = m6_core::parse::parse_request(&mut Cursor::new(raw)).unwrap();
+        let req = m6_core::parse::parse_request(&mut Cursor::new(raw.to_vec())).unwrap();
         assert_eq!(req.path, "/path");
         assert_eq!(req.query.as_deref(), Some("foo=bar"));
     }
