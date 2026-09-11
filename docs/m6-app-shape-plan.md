@@ -67,6 +67,98 @@ core for everything except its loop.** The measure of success for m6-http is
 not that it becomes an `App`; it is that the count of things it implements
 itself keeps falling. Ten core modules today.
 
+**That is not the end of the answer, though.** Leaving it there leaves two
+concurrency models in the project, and two of anything is what this migration
+exists to remove. §2a is how they converge without rewriting m6-http and
+without pretending backends can be single-threaded.
+
+## 2a. The convergence: one I/O model, two execution models
+
+§2 says m6-http cannot be an `App`. That is true and remains true. It is also
+not the whole answer, because it leaves the project with **two concurrency
+models**, and two of anything is what this migration exists to remove.
+
+The resolution is not "make everything epoll". It is that **App's split is in
+the wrong place**, and moving it converges the two.
+
+### Why m6-http can be single-threaded epoll
+
+Because it never blocks. Its cache is an in-memory `AHashMap<CacheKey,
+CacheEntry>`, and there is **no disk I/O in its event loop or in `cache.rs`**.
+It parses, looks up a hash map, and proxies.
+
+### Why backends cannot be
+
+Because they exist to block. Every `App` handler does blocking disk I/O:
+`Request::read_json`, `write_json_atomic`, `list_json`, template loading,
+m6-file's `fs::read`. One slow disk read on a single-threaded event loop stalls
+every connection on the node. A naive "one model, make it epoll" would be
+actively wrong, and would be the highest-risk change available under a
+no-regression constraint.
+
+### Where App's split actually is
+
+```
+app.rs:1872   listener.accept()            event loop
+app.rs:1877   pool.try_submit(stream, ..)  hands the RAW SOCKET to a worker
+app.rs:1920   serve_connection(stream, ..) worker does the BLOCKING READ
+```
+
+**The read is the part an untrusted peer controls the timing of, and it runs on
+a worker.** §3.1's missing read timeout is a symptom of that, not the disease:
+a 30 second timeout on a two-worker pool still surrenders half the node's
+capacity for 30 seconds to one silent peer.
+
+### Where it should be
+
+**I/O on the loop, handler on a worker.**
+
+- The loop accepts, reads non-blocking into a buffer, and asks
+  `h1::parse_request(&buf)` whether the message is complete.
+- Only a **complete, parsed `Request`** is dispatched to a worker.
+- The worker runs the handler and may block on disk freely.
+
+What that buys:
+
+| | |
+|---|---|
+| Slowloris | Immune by construction. No worker is ever held by a slow peer. |
+| Handler contract | **Unchanged.** `Fn(&Request) -> Result<Response>`, still free to block. |
+| Concurrency models | One I/O model shared with m6-http; execution differs only in that backends have a worker pool behind the loop and m6-http does not need one. |
+| Read timeout | Becomes belt-and-braces rather than the defence. |
+
+### Core is already most of the way there
+
+```rust
+h1::parse_request(buf: &[u8]) -> ParseResult   // Complete | Incomplete | Error
+```
+
+That is an incremental, buffer-driven parser, and **m6-http already drives it
+exactly this way**, from an `H1State::Reading { buf }` state machine.
+`m6-core/src/parse.rs` exists only to adapt it back into a blocking stream for
+`App`'s benefit, and has no framing logic of its own.
+
+So this is not a new parser or a new protocol path. It is **deleting an
+adapter** and moving the read to the side of the fence that already has an
+event loop.
+
+### Honest risks
+
+- It is a real rewrite of `App`'s loop, which five production services depend
+  on. It is the largest item in this document.
+- The loop becomes the single thread doing all reads. At current traffic that
+  is nothing; it is still a new bottleneck where there was none.
+- It must be measured, and the baseline to measure against does not exist yet
+  (§5).
+
+### What this changes in the ordering
+
+§3.1's read timeout stays first, because it is a one-line socket option that
+closes a live exposure today and does not presuppose any of this. But it should
+be understood as a stopgap, and this section as the actual destination.
+
+---
+
 ## 3. What core is missing
 
 Five items. Two are config keys, two are capabilities core does not have at
@@ -233,11 +325,18 @@ Sequenced so each step ships alone and earns the next.
 6. **Migrate `m6-file` to `App`.** Delete its hand-rolled main and its copy of
    the accept loop.
 7. **Migrate `m6-auth-server` to `App`.** Same.
-8. **3.3 streaming body.** Last, because it is the only item with real design
-   in it: it changes what a `Response` is. Nothing above is blocked on it.
+8. **3.3 streaming body.** The only item above with real design in it: it
+   changes what a `Response` is. Nothing above is blocked on it.
+9. **§2a: move the read onto the event loop.** The destination. Largest item
+   here, and the one that leaves the project with a single I/O model instead of
+   two. Deliberately last: every step above is independently useful, ships
+   alone, and makes this one smaller. Doing it first would mean rewriting the
+   loop of five working services before the baseline to measure it against
+   exists.
 
 After 7 the fleet is one shape plus the edge. Step 8 raises the ceiling of that
-shape rather than changing who is in it.
+shape. **Step 9 is what makes it one good path rather than two that happen to
+share a parser.**
 
 ## 7. What this does not touch
 
