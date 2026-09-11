@@ -423,6 +423,27 @@ on it), then `Request`/`Response`, then `config`, then `App` last.
 **Gate:** full suite; `m6-html` and all three site renderers build and pass;
 the site deploys and serves; `/contact` accepts a real submission end to end.
 
+**DONE 2026-09-11.** Full suite green (862 at default features, 871 with
+`--all-features`), h1spec 32/32 on all four targets, zero warnings, and
+`render-contact`, `render-cms` and `render-analytics` all build unchanged.
+The deploy-and-serve half of the gate waits on the freeze.
+
+`m6-render` is 904 lines, 754 of which is `template.rs`.
+
+**Two things this section did not anticipate:**
+
+- **It says "minus the render step" without saying how core calls back into
+  rendering.** The answer is `m6-core/src/render.rs`: `Renderer`,
+  `RendererFactory`, `RenderError`, and `NoTemplates` for a binary that links
+  no engine. A factory rather than a value, because a config reload has to
+  rebuild one to pick up an edited template.
+- **`m6-render` could not be the pure re-export shim the mitigation assumes.**
+  Core's `App::new()` has to take a renderer, and the three site renderers
+  call `m6_render::App::new()` with no argument and expect Tera. So
+  `m6_render::App` is a unit struct whose four constructors supply
+  `TeraFactory` and return core's builders. No consumer changed, which is
+  what the mitigation was for, but by different means than it describes.
+
 **Risk:** high, by size. **Mitigation:** `m6-render` re-exports the moved
 symbols during the transition, so no consumer changes until Phase 6. Nothing
 downstream breaks while the move is in flight.
