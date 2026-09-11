@@ -19,7 +19,12 @@ pub mod request;
 pub mod response;
 pub mod server;
 pub mod template;
-pub mod util;
+
+/// Re-export shim: the helpers live in `m6-core` behind its `util` feature,
+/// which this crate enables.
+pub mod util {
+    pub use m6_core::util::{now_iso8601, slugify, today_iso8601};
+}
 
 #[cfg(feature = "multipart")]
 pub mod multipart;
@@ -28,6 +33,7 @@ pub use app::App;
 pub use error::{Error, Result};
 pub use request::Request;
 pub use response::Response;
+pub use crate::util::{now_iso8601, slugify, today_iso8601};
 
 /// Prelude: bring the most commonly needed types into scope.
 pub mod prelude {
