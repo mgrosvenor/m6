@@ -267,6 +267,19 @@ publicised yet and the current numbers are a pre-launch snapshot.
 An event loop is also the only model in which admission control is
 *expressible*: a loop can decline work, a blocking pool can only be full.
 
+## 9a. Scope decision, 2026-09-12
+
+**This design is agreed. It is not the near-term work.**
+
+The near-term work is the minimal set that makes the shapes roughly agree,
+tracked in `CONSOLIDATION-TODO.md` §3b-now: a read timeout in `App`, a socket
+permissions config key, optionally extracting the shared accept loop, plus the
+free `send_with_length` fix. Half a day to a day, near-zero risk, no migration
+and no contract change.
+
+Everything in §§1-8 is **deferred and tracked, not dropped**, in §3b-later. It
+should not need re-arguing each time it surfaces.
+
 ## 10. Sequence
 
 **Pre-launch, none of it requires the rewrite:**
