@@ -448,10 +448,31 @@ impl TrafficSummary {
             *e.2.entry(f.path.clone()).or_default() += 1;
         }
 
+        // Who has disqualified their own claim.
+        //
+        // Rotation is one way. Scanning is the other, and it was missed until
+        // 2026-09-11, when 94.154.46.250 requested /.aws/credentials,
+        // /settings.php, /composer.json and /config.js while presenting a
+        // single, unchanging `Googlebot/2.1` user agent. The rotation check
+        // saw one user agent and believed it, so the same address appeared in
+        // one report both as a credential scanner and as a Googlebot visit.
+        //
+        // Googlebot does not look for AWS credentials. An address asking for
+        // probe paths is not the crawler it says it is, whether it says so
+        // once or five hundred times, so behaviour overrides the claim.
+        //
+        // Deliberately NOT part of this: a high error ratio on its own. A
+        // genuine crawler re-crawling dead links is mostly 404s and is still
+        // a genuine crawler.
         let forgers: HashSet<String> = per_ip
             .iter()
-            .filter(|(_, a)| {
-                a.uas.len() >= UA_ROTATION_THRESHOLD && a.n >= UA_ROTATION_MIN_REQUESTS
+            .filter(|(ip, a)| {
+                let rotating =
+                    a.uas.len() >= UA_ROTATION_THRESHOLD && a.n >= UA_ROTATION_MIN_REQUESTS;
+                let scanning = a.paths.keys().any(|p| looks_like_probe(p))
+                    || a.paths.keys().any(|p| looks_like_injection(p));
+                let _ = ip;
+                rotating || scanning
             })
             .map(|(ip, _)| ip.clone())
             .collect();
@@ -704,6 +725,59 @@ mod tests {
         assert_eq!(sus[0].0, "34.91.241.0");
         assert!(sus[0].1.is_rotating_user_agents);
         assert!(!sus[0].1.probe_paths.is_empty());
+    }
+
+    /// The 2026-09-11 case that the rotation check alone missed.
+    ///
+    /// One address, one unchanging `Googlebot/2.1` user agent, asking for
+    /// `/.aws/credentials` and friends. It appeared in the same report as both
+    /// a credential scanner and a Googlebot visit, which is worse than either
+    /// alone: it puts a name you trust next to traffic you do not.
+    #[test]
+    fn a_scanner_claiming_to_be_googlebot_is_not_googlebot() {
+        let ua = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
+        // The paths it actually asked for, from the 09:17 burst on lon.
+        let paths = [
+            "/.aws/credentials", "/.env.backup", "/.env.2", "/.env.old",
+            "/settings.php", "/composer.json", "/config.js",
+        ];
+        let records: Vec<_> = paths
+            .iter()
+            .enumerate()
+            .map(|(i, p)| rec(&format!("2026-09-11T09:17:{:02}Z", i), "94.154.46.250", p, 404, ua))
+            .collect();
+
+        let s = TrafficSummary::from_records(&records);
+        assert!(
+            s.crawlers.is_empty(),
+            "a credential scanner must not be reported as a crawler sighting: {:?}",
+            s.crawlers.iter().map(|c| &c.user_agent).collect::<Vec<_>>()
+        );
+        assert_eq!(s.forgers, vec!["94.154.46.250".to_string()]);
+        assert_eq!(s.forged_bot_requests, paths.len() as u64);
+        // And it is still reported as what it is. One probe path is enough to
+        // disqualify the crawler claim; escalating to a fault still wants the
+        // scanning threshold, and four `.env`/credential paths clear it.
+        assert_eq!(s.suspicious(100).len(), 1);
+    }
+
+    /// The distinction that keeps the rule honest: a genuine crawler that is
+    /// mostly getting 404s, because it is re-crawling links that no longer
+    /// exist, is still a genuine crawler. Error ratio is not evidence of
+    /// forgery; asking for credentials is.
+    #[test]
+    fn a_crawler_hitting_dead_links_is_still_a_crawler() {
+        let ua = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
+        let records: Vec<_> = (0..20)
+            .map(|i| {
+                rec(&format!("2026-09-11T09:0{}:00Z", i % 10),
+                    "66.249.66.1", &format!("/old/post-{i}"), 404, ua)
+            })
+            .collect();
+        let s = TrafficSummary::from_records(&records);
+        assert_eq!(s.crawlers.len(), 1, "404s are not forgery");
+        assert_eq!(s.crawlers[0].requests, 20);
+        assert!(s.forgers.is_empty());
     }
 
     /// A genuine crawler fleet is the inverse shape and must survive.
