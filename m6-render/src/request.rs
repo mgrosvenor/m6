@@ -12,41 +12,18 @@ use crate::error::{Error, Result};
 ///
 /// Headers are stored as `Vec<(name, value)>` with lowercase names.
 /// Linear scan beats HashMap for the 4-8 headers typical in proxied requests.
-#[derive(Debug, Clone)]
-pub struct RawRequest {
-    pub method: String,
-    pub path: String,
-    pub query: String,
-    /// Header pairs with lowercase names, in order of appearance.
-    pub headers: Vec<(String, String)>,
-    pub body: Vec<u8>,
-}
-
-impl RawRequest {
-    pub fn method(&self) -> &str {
-        &self.method
-    }
-
-    pub fn path(&self) -> &str {
-        &self.path
-    }
-
-    pub fn query(&self) -> &str {
-        &self.query
-    }
-
-    /// Look up a header by name. `name` must be lowercase (all internal callers use lowercase).
-    pub fn header(&self, name: &str) -> Option<&str> {
-        self.headers
-            .iter()
-            .find(|(k, _)| k == name)
-            .map(|(_, v)| v.as_str())
-    }
-
-    pub fn content_type(&self) -> Option<&str> {
-        self.header("content-type")
-    }
-}
+/// The request type is `m6_core::http::RawRequest`, parsed by the one parser
+/// in `m6_core::h1`.
+///
+/// This crate used to carry its own, with its own parser in `server.rs`.
+/// Measured against h1spec it scored 15/32 against the shared parser's 27/32.
+///
+/// It also lowercased header names at parse time and documented that `header`
+/// takes a lowercase name, which is an invariant established in one file and
+/// relied on in another. The shared type keeps names as sent and compares
+/// case-insensitively, so there is no invariant to remember and no way to get
+/// it wrong.
+pub use m6_core::http::RawRequest;
 
 /// The full request context exposed to handlers and file I/O helpers.
 #[derive(Clone)]
@@ -611,9 +588,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let req = Request::new(
             RawRequest {
+                version: "HTTP/1.1".to_string(),
                 method: "GET".to_string(),
                 path: "/".to_string(),
-                query: String::new(),
+                query: None,
                 headers: vec![],
                 body: vec![],
             },
@@ -631,9 +609,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let req = Request::new(
             RawRequest {
+                version: "HTTP/1.1".to_string(),
                 method: "POST".to_string(),
                 path: "/upload".to_string(),
-                query: String::new(),
+                query: None,
                 headers: vec![],
                 body: vec![],
             },
@@ -657,9 +636,10 @@ mod tests {
         dict.insert("csrf_token".to_string(), json!(token));
         let req = Request::new(
             RawRequest {
+                version: "HTTP/1.1".to_string(),
                 method: "POST".to_string(),
                 path: "/form".to_string(),
-                query: String::new(),
+                query: None,
                 headers: vec![],
                 body: vec![],
             },

@@ -867,3 +867,48 @@ fn weak_if_none_match_is_304_on_a_cache_miss() {
     );
     assert_eq!(cold_strong.status, 304, "cold key, strong tag\nheaders:\n{}", cold_strong.headers);
 }
+
+// ── Finding 2 (e2e): forged proxy-owned headers must not survive ingress ─────
+
+/// A client-supplied `X-Auth-Claims` must not reach the auth check.
+///
+/// `X-Auth-Claims` is proxy-owned: m6-http sets it after verifying a session,
+/// and the backend trusts it. A client that sets it itself and is believed has
+/// forged an identity, which is why `UNTRUSTED_INBOUND` exists.
+///
+/// **This is an end-to-end test on purpose.** The unit test in
+/// `security_regressions.rs` used to prove the property by calling the parser,
+/// because stripping happened inside it. The parser is shared with every
+/// backend now and is pure, so stripping moved to the ingress caller — and a
+/// unit test of "parse, then strip" would only prove that those two functions
+/// work when called together, not that ingress calls them. Removing the call
+/// from `drive_h1` would leave such a test green. This one goes through the
+/// running server, so it cannot.
+#[test]
+fn forged_x_auth_claims_does_not_survive_ingress_e2e() {
+    let srv = start_server(100_000);
+
+    // Claims that would make the caller an admin if believed.
+    let forged = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(r#"{"sub":"admin","groups":["admins"],"roles":["admin"]}"#)
+    };
+
+    let resp = https_get(
+        &srv,
+        "/private/secret.txt",
+        &[("X-Auth-Claims", forged.as_str())],
+        srv.tls(),
+    );
+    assert_ne!(
+        resp.status, 200,
+        "a forged X-Auth-Claims was believed and served protected content\n\
+         headers:\n{}",
+        resp.headers
+    );
+    assert!(
+        !resp.body.windows(10).any(|w| w == b"TOP SECRET"),
+        "protected content leaked to a request carrying forged claims"
+    );
+}

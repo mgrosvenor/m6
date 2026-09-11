@@ -106,10 +106,23 @@ fn finding_2_forged_x_auth_claims_must_not_survive_ingress() {
         "GET /admin HTTP/1.1\r\nHost: example.com\r\nX-Auth-Claims: {forged}\r\n\r\n"
     );
 
-    let req = match http11::parse_request(raw.as_bytes()) {
+    // Parse, then strip: the two calls m6-http's ingress makes.
+    //
+    // Stripping used to happen inside the parser, so this test proved the
+    // property by parsing alone. The parser is shared with every backend now
+    // and is pure -- a backend has no proxy headers to strip -- so the policy
+    // moved to the ingress caller.
+    //
+    // That makes this test weaker than it was: it proves the two functions
+    // work together, not that ingress calls them.
+    // `forged_x_auth_claims_does_not_survive_ingress_e2e` in security_e2e.rs
+    // covers the real path, through the running server, and is the guard that
+    // would fail if the call were dropped from drive_h1.
+    let mut req = match http11::parse_request(raw.as_bytes()) {
         http11::ParseResult::Complete(r) => r,
         _ => panic!("expected a complete parse of:\n{raw}"),
     };
+    m6_http_lib::forward::strip_untrusted_inbound(&mut req.headers);
 
     assert!(
         !req.headers
@@ -135,10 +148,13 @@ fn finding_2b_all_proxy_owned_headers_stripped_at_ingress() {
                X-Real-IP: 10.0.0.99\r\n\
                User-Agent: probe\r\n\r\n";
 
-    let req = match http11::parse_request(raw.as_bytes()) {
+    // Parse, then strip: see the note on the test above. The end-to-end guard
+    // is `forged_x_auth_claims_does_not_survive_ingress_e2e` in security_e2e.rs.
+    let mut req = match http11::parse_request(raw.as_bytes()) {
         http11::ParseResult::Complete(r) => r,
         _ => panic!("expected a complete parse"),
     };
+    m6_http_lib::forward::strip_untrusted_inbound(&mut req.headers);
 
     for banned in forward::UNTRUSTED_INBOUND {
         assert!(

@@ -1738,6 +1738,30 @@ fn handle_request(
     outcome
 }
 
+
+/// The origin a request names, for `X-Forwarded-Host` and for the `Host` the
+/// backend leg requires.
+///
+/// Falls back to the configured domain, because a client is allowed to name no
+/// origin at all: HTTP/1.0 may omit `Host` entirely and m6-http serves it. The
+/// backend speaks HTTP/1.1, where that is malformed (RFC 9110 7.2), so
+/// something has to fill it in and only this process knows what site it is
+/// serving.
+///
+/// One function because there were three copies of this expression, and fixing
+/// one of them fixed one of three paths: HTTP/3 forwarded requests naming no
+/// origin, and HTTP/1.0 without Host reached the backend with an empty
+/// `X-Forwarded-Host` and no `Host` at all.
+fn origin_host<'a>(req: &'a forward::HttpRequest, config: &'a config::Config) -> &'a str {
+    req.headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(":authority"))
+        .or_else(|| req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("host")))
+        .map(|(_, v)| v.as_str())
+        .filter(|h| !h.is_empty())
+        .unwrap_or(config.site.domain.as_str())
+}
+
 fn handle_request_inner(
     req: &forward::HttpRequest,
     client_ip: &str,
@@ -2019,13 +2043,7 @@ fn handle_request_inner(
     let backend_name = route.backend.clone();
 
     // Check if URL backend — dispatch async.
-    let original_host = req
-        .headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case(":authority"))
-        .or_else(|| req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("host")))
-        .map(|(_, v)| v.as_str())
-        .unwrap_or("");
+    let original_host = origin_host(req, &state.config);
     let timeout = std::time::Duration::from_secs(state.config.server.backend_timeout_secs);
 
     if let Some((url, _tls_config, _)) = state.pool_manager.get_url_info(&backend_name) {
@@ -2289,11 +2307,7 @@ fn dispatch_custom_error_async(
     let (url, tls_config, _) = state.pool_manager.get_url_info(&backend_name)?;
     let url = url.to_string();
 
-    let original_host = req.headers.iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case(":authority"))
-        .or_else(|| req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("host")))
-        .map(|(_, v)| v.as_str())
-        .unwrap_or("");
+    let original_host = origin_host(req, &state.config);
     let timeout = std::time::Duration::from_secs(state.config.server.backend_timeout_secs);
 
     let error_query = format!("status={}&from={}", status, urlencoded(&req.path));
@@ -2438,17 +2452,7 @@ fn forward_to_backend(
     client_ip: &str,
     state: &mut ServerState,
 ) -> Result<HttpResponse, String> {
-    let original_host = req
-        .headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case(":authority"))
-        .or_else(|| {
-            req.headers
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("host"))
-        })
-        .map(|(_, v)| v.as_str())
-        .unwrap_or("");
+    let original_host = origin_host(req, &state.config);
 
     let timeout = std::time::Duration::from_secs(state.config.server.backend_timeout_secs);
 

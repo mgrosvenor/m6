@@ -46,9 +46,11 @@ fn make_site() -> (TempDir, Config, Vec<Route>) {
 
 fn make_get_request(path: &str) -> Request {
     Request {
+        version: "HTTP/1.1".to_string(),
+        body: Vec::new(),
         method: "GET".to_string(),
         path: path.to_string(),
-        query: String::new(),
+        query: None,
         headers: vec![],
     }
 }
@@ -143,7 +145,7 @@ fn bench_socket_round_trip(c: &mut Criterion) {
         for stream in listener.incoming() {
             let mut stream = match stream { Ok(s) => s, Err(_) => break };
             stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
-            let req = match Request::read(stream.try_clone().unwrap()) {
+            let req = match m6_core::parse::parse_request(&mut stream.try_clone().unwrap()) {
                 Ok(r) => r,
                 Err(_) => continue,
             };
@@ -232,7 +234,7 @@ fn main() {
             for stream in listener2.incoming() {
                 let mut stream = match stream { Ok(s) => s, Err(_) => break };
                 stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
-                let req = match Request::read(stream.try_clone().unwrap()) {
+                let req = match m6_core::parse::parse_request(&mut stream.try_clone().unwrap()) {
                     Ok(r) => r,
                     Err(_) => continue,
                 };

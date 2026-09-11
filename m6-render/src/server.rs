@@ -1,5 +1,5 @@
 /// Unix socket HTTP/1.1 server — connection accept loop and HTTP parsing.
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{BufWriter, Write};
 use std::os::unix::net::UnixStream;
 
 use anyhow::Context;
@@ -7,66 +7,24 @@ use anyhow::Context;
 use crate::request::RawRequest;
 
 /// Maximum request body size (16 MiB default).
-const MAX_BODY_SIZE: usize = 16 * 1024 * 1024;
+// The body cap lives with the parser now, in m6_core::parse.
 
 /// Parse an HTTP/1.1 request from a Unix stream.
 ///
-/// Returns `None` if the connection closed without sending anything.
+/// Delegates to the one parser, `m6_core::h1`, via its streaming wrapper.
+/// This function used to contain a second implementation: its own request-line
+/// and header reader over `BufReader::read_line`, scoring 15/32 on h1spec
+/// against the shared parser's 27/32, with no cap on the request line or on
+/// the number of headers.
+///
+/// Returns `None` if the connection closed without sending anything, which is
+/// an idle keep-alive connection going away rather than an error.
 pub fn parse_request(stream: &mut UnixStream) -> anyhow::Result<Option<RawRequest>> {
-    let mut reader = BufReader::new(stream as &mut dyn Read);
-
-    // Read the request line.
-    let mut request_line = String::new();
-    let n = reader.read_line(&mut request_line).context("reading request line")?;
-    if n == 0 {
-        return Ok(None); // EOF — connection closed
+    match m6_core::parse::parse_request(stream) {
+        Ok(req) => Ok(Some(req)),
+        Err(m6_core::parse::ParseError::ConnectionClosed) => Ok(None),
+        Err(e) => Err(anyhow::anyhow!(e)),
     }
-
-    let request_line = request_line.trim_end_matches(|c: char| c == '\r' || c == '\n');
-    let mut parts = request_line.splitn(3, ' ');
-    let method = parts.next().unwrap_or("").to_uppercase();
-    let full_path = parts.next().unwrap_or("/").to_string();
-
-    // Split path and query string.
-    let (path, query) = if let Some(idx) = full_path.find('?') {
-        (full_path[..idx].to_string(), full_path[idx + 1..].to_string())
-    } else {
-        (full_path, String::new())
-    };
-
-    // Read headers into Vec — lowercase keys, linear scan beats HashMap for 4-8 entries.
-    let mut headers: Vec<(String, String)> = Vec::with_capacity(8);
-    loop {
-        let mut line = String::new();
-        reader.read_line(&mut line).context("reading header")?;
-        let line = line.trim_end_matches(|c| c == '\r' || c == '\n');
-        if line.is_empty() {
-            break; // end of headers
-        }
-        if let Some(idx) = line.find(':') {
-            let name = line[..idx].trim().to_lowercase();
-            let value = line[idx + 1..].trim().to_string();
-            headers.push((name, value));
-        }
-    }
-
-    // Read body if Content-Length present.
-    let body = if let Some((_, len_str)) = headers.iter().find(|(k, _)| k == "content-length") {
-        let len: usize = len_str
-            .trim()
-            .parse()
-            .context("parsing Content-Length")?;
-        if len > MAX_BODY_SIZE {
-            anyhow::bail!("request body too large: {len}");
-        }
-        let mut body = vec![0u8; len];
-        reader.read_exact(&mut body).context("reading body")?;
-        body
-    } else {
-        vec![]
-    };
-
-    Ok(Some(RawRequest { method, path, query, headers, body }))
 }
 
 /// Write a complete HTTP response to the stream using BufWriter —
@@ -117,7 +75,7 @@ mod tests {
         let req = handle.join().unwrap().unwrap();
         assert_eq!(req.method, "GET");
         assert_eq!(req.path, "/test");
-        assert_eq!(req.query, "foo=bar");
+        assert_eq!(req.query.as_deref(), Some("foo=bar"));
         assert_eq!(req.header("host").unwrap(), "localhost");
     }
 
@@ -136,7 +94,11 @@ mod tests {
 
         let body = b"name=alice&age=30";
         let request = format!(
-            "POST /submit HTTP/1.1\r\nContent-Length: {}\r\nContent-Type: application/x-www-form-urlencoded\r\n\r\n",
+            // Host is required on HTTP/1.1 (RFC 9110 7.2). The parser this
+            // fixture predates accepted a request without one; the shared
+            // parser does not, and that is h1spec test 8.
+            "POST /submit HTTP/1.1\r\nHost: localhost\r\n\
+             Content-Length: {}\r\nContent-Type: application/x-www-form-urlencoded\r\n\r\n",
             body.len()
         );
         let mut client = UnixStream::connect(&sock_path2).unwrap();

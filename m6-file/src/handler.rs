@@ -167,7 +167,7 @@ pub fn handle_request<W: Write>(
     // was not consulted here.
     let mime = m6_core::mime::mime_from_path(&fs_path).to_string();
     let mime_base = mime.split(';').next().unwrap_or(&mime).to_string();
-    let accept_encoding = req.accept_encoding();
+    let accept_encoding = crate::http::accept_encoding(req);
     let (encoding, level) = choose_encoding(&mime, accept_encoding, ctx.config);
     let etag_suffix = match encoding {
         Encoding::Identity => "",
@@ -247,7 +247,7 @@ pub fn handle_request<W: Write>(
     // This is only safe because a deploy evicts. deploy.sh invalidates by
     // default for exactly this reason -- see the guard there before shortening
     // that path.
-    let cache_control = cache_control_for(&req.query);
+    let cache_control = cache_control_for(req.query.as_deref().unwrap_or(""));
 
     // 412: a precondition the client asserted is false, and the request must
     // not be applied. The previous `bool` could not express this outcome,
@@ -378,14 +378,13 @@ fn handle_tail<W: Write>(
     let fs_path = route.resolve_fs_path(params, ctx.site_dir);
 
     // Parse ?offset=N (default 0) and ?n=N (default 0 = no-line-limit).
-    let offset: u64 = req
-        .query
+    let query = req.query.as_deref().unwrap_or("");
+    let offset: u64 = query
         .split('&')
         .find(|p| p.starts_with("offset="))
         .and_then(|p| p["offset=".len()..].parse().ok())
         .unwrap_or(0);
-    let n: u64 = req
-        .query
+    let n: u64 = query
         .split('&')
         .find(|p| p.starts_with("n="))
         .and_then(|p| p["n=".len()..].parse().ok())
@@ -467,20 +466,19 @@ fn handle_tail<W: Write>(
 mod tests {
     use super::*;
     use crate::config::{Config, RouteConfig};
-    use crate::http::Request;
     use crate::route::Route;
     use std::io::Cursor;
 
     fn make_tail_request(path: &str, offset: u64) -> Request {
         let query = format!("offset={}", offset);
         let raw = format!("GET {}?{} HTTP/1.1\r\nHost: localhost\r\n\r\n", path, query);
-        Request::read(Cursor::new(raw.into_bytes())).unwrap()
+        m6_core::parse::parse_request(&mut Cursor::new(raw.into_bytes())).unwrap()
     }
 
     fn make_tail_n_request(path: &str, n: u64) -> Request {
         let query = format!("offset=0&n={}", n);
         let raw = format!("GET {}?{} HTTP/1.1\r\nHost: localhost\r\n\r\n", path, query);
-        Request::read(Cursor::new(raw.into_bytes())).unwrap()
+        m6_core::parse::parse_request(&mut Cursor::new(raw.into_bytes())).unwrap()
     }
 
     fn tail_route(url_path: &str, root: &str) -> Route {
@@ -644,7 +642,7 @@ mod tests {
         .unwrap();
 
         let raw = "GET /index.html HTTP/1.1\r\nHost: localhost\r\n\r\n";
-        let req = Request::read(Cursor::new(raw.as_bytes().to_vec())).unwrap();
+        let req = m6_core::parse::parse_request(&mut Cursor::new(raw.as_bytes().to_vec())).unwrap();
         let route = Route::from_config(&RouteConfig {
             path: "/{relpath}".to_string(),
             root: "".to_string(),
@@ -671,7 +669,7 @@ mod tests {
         std::fs::write(dir.path().join("photo.svg"), b"<svg>   <!-- kept --> </svg>").unwrap();
 
         let raw = "GET /photo.svg HTTP/1.1\r\nHost: localhost\r\n\r\n";
-        let req = Request::read(Cursor::new(raw.as_bytes().to_vec())).unwrap();
+        let req = m6_core::parse::parse_request(&mut Cursor::new(raw.as_bytes().to_vec())).unwrap();
         let route = Route::from_config(&RouteConfig {
             path: "/{relpath}".to_string(),
             root: "".to_string(),
@@ -741,7 +739,7 @@ mod tests {
             None => String::new(),
         };
         let raw = format!("GET /assets/{} HTTP/1.1\r\nHost: localhost\r\n{}\r\n", name, ae);
-        let req = Request::read(Cursor::new(raw.into_bytes())).unwrap();
+        let req = m6_core::parse::parse_request(&mut Cursor::new(raw.into_bytes())).unwrap();
         let routes = vec![asset_route()];
         let config = Config::default();
         let ctx = HandlerContext { routes: &routes, config: &config, site_dir: dir };
@@ -828,7 +826,7 @@ mod tests {
             let raw = format!(
                 "GET /assets/style.css HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: {}\r\nIf-None-Match: {}\r\n\r\n",
                 ae, e_br);
-            let req = Request::read(Cursor::new(raw.into_bytes())).unwrap();
+            let req = m6_core::parse::parse_request(&mut Cursor::new(raw.into_bytes())).unwrap();
             let routes = vec![asset_route()];
             let config = Config::default();
             let ctx = HandlerContext { routes: &routes, config: &config, site_dir: dir.path() };
@@ -867,7 +865,6 @@ fn find_route<'a>(url_path: &str, routes: &'a [Route]) -> FindRouteResult<'a> {
 
 #[cfg(test)]
 mod cache_control_tests {
-    use crate::http::Request;
     use std::io::Cursor;
 
     use super::cache_control_for;
@@ -881,7 +878,10 @@ mod cache_control_tests {
 
     fn query_of(url: &str) -> String {
         let raw = format!("GET {url} HTTP/1.1\r\nHost: localhost\r\n\r\n");
-        Request::read(Cursor::new(raw.into_bytes())).unwrap().query
+        m6_core::parse::parse_request(&mut Cursor::new(raw.into_bytes()))
+            .unwrap()
+            .query
+            .unwrap_or_default()
     }
 
     /// A `?v=<hash>` URL addresses one exact version, so it can be cached hard.

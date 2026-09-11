@@ -17,7 +17,7 @@ fn get_request(path: &str, query: &str) -> Request {
     } else {
         format!("GET {path}?{query} HTTP/1.1\r\nHost: localhost\r\n\r\n")
     };
-    Request::read(Cursor::new(raw.into_bytes())).unwrap()
+    m6_core::parse::parse_request(&mut Cursor::new(raw.into_bytes())).unwrap()
 }
 
 fn route(url_path: &str, root: &str, tail: bool) -> Route {
