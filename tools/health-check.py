@@ -127,6 +127,40 @@ def sh(cmd, timeout=120):
 
 out = {}
 
+# ── Loopback TTFB, measured FIRST ────────────────────────────────────────────
+#
+# Before the journal scans, not after. It used to run last, which put a 4ms
+# measurement immediately after a 24-hour `journalctl` scan on a 1-2 core VM,
+# and the check was measuring its own I/O contention: 2026-09-11 reported
+# maxima of 266ms on lon and 192ms on chi, neither of which reproduced in 12
+# clean samples a minute later.
+#
+# This is the third time this tool has measured its own effect on the thing it
+# is watching. The other two were flagging its own load generator as an
+# incident, and reading a 50% latency regression off a single sample taken
+# during that load.
+# Five samples, median reported. One sample is not a measurement: on
+# 2026-09-11 a single loopback read landed at 6.58ms against a ~4.3ms
+# baseline and read as a 50% regression, while seven consecutive samples
+# taken a minute later ran 4.38-4.68ms. The outlier coincided with the
+# check's own generated load. Same lesson as BENCHMARKS.md: report the
+# median and the spread, so noise looks like noise.
+lb = sh("for i in $(seq 1 5); do curl -sk -o /dev/null "
+        "-w 'ttfb=%{time_starttransfer} tls=%{time_appconnect}\n' "
+        "-H 'Host: mgrosvenor.com' https://127.0.0.1/capabilities; done")
+samples = [(float(a), float(b))
+           for a, b in re.findall(r"ttfb=([\d.]+) tls=([\d.]+)", lb)]
+if samples:
+    ttfbs = sorted(s for s, _ in samples)
+    tlss = sorted(t for _, t in samples)
+    mid = len(ttfbs) // 2
+    out["loopback"] = {
+        "ttfb": ttfbs[mid], "tls": tlss[mid],
+        "ttfb_min": ttfbs[0], "ttfb_max": ttfbs[-1], "n": len(ttfbs),
+    }
+else:
+    out["loopback"] = None
+
 # ── A. is logging alive ──────────────────────────────────────────────────────
 # Target histogram over the last 20 minutes. `analytics` alone, or `stats`
 # missing while requests are being served, means a config reload silenced
@@ -174,28 +208,6 @@ out["stats_24h"] = {
 }
 # The most recent windows, so a loaded one can be picked out after --load.
 out["recent_windows"] = windows("90 seconds ago")
-
-# Five samples, median reported. One sample is not a measurement: on
-# 2026-09-11 a single loopback read landed at 6.58ms against a ~4.3ms
-# baseline and read as a 50% regression, while seven consecutive samples
-# taken a minute later ran 4.38-4.68ms. The outlier coincided with the
-# check's own generated load. Same lesson as BENCHMARKS.md: report the
-# median and the spread, so noise looks like noise.
-lb = sh("for i in $(seq 1 5); do curl -sk -o /dev/null "
-        "-w 'ttfb=%{time_starttransfer} tls=%{time_appconnect}\n' "
-        "-H 'Host: mgrosvenor.com' https://127.0.0.1/capabilities; done")
-samples = [(float(a), float(b))
-           for a, b in re.findall(r"ttfb=([\d.]+) tls=([\d.]+)", lb)]
-if samples:
-    ttfbs = sorted(s for s, _ in samples)
-    tlss = sorted(t for _, t in samples)
-    mid = len(ttfbs) // 2
-    out["loopback"] = {
-        "ttfb": ttfbs[mid], "tls": tlss[mid],
-        "ttfb_min": ttfbs[0], "ttfb_max": ttfbs[-1], "n": len(ttfbs),
-    }
-else:
-    out["loopback"] = None
 
 # ── C. disk and logs ─────────────────────────────────────────────────────────
 df = sh("df -h / | tail -1").split()
@@ -538,6 +550,7 @@ def main():
 
     # ── D ────────────────────────────────────────────────────────────────────
     print("\nD. SECURITY AND TRAFFIC")
+    noise = []
     for node, r, err in results:
         if err:
             continue
@@ -573,14 +586,30 @@ def main():
             # the operator's own address, all served 200.
             errors = sum(n for code, n in v["status"].items() if int(code) >= 400)
             error_ratio = errors / v["n"] if v["n"] else 0.0
-            burst = v["n"] >= 100 and error_ratio >= 0.5
-            if not (probe_paths or inj or burst):
+            # Mirrors m6_core::telemetry::ClientSummary::is_notable.
+            #
+            # Deliberate on its own: injection, UA rotation, scanning across
+            # three or more distinct probe paths.
+            #
+            # Not on its own: volume (a busy client being served is a user;
+            # this rule once flagged the check's own load generator), or a
+            # single refused probe (one 404 to /.git/config is internet
+            # weather, and the firewall drops ~180 packets an hour unread).
+            #
+            # Volume counts combined with failure: ten mostly-refused requests
+            # is a sweep.
+            rotating = v["ua_count"] >= 10
+            scanning = len(probe_paths) >= 3
+            refused = v["n"] >= 10 and error_ratio >= 0.5
+            if not (inj or rotating or scanning or refused):
+                if probe_paths:
+                    noise.append((node["name"], ip, probe_paths[0][0]))
                 continue
             served = v["status"].get("200", 0)
             label = []
-            if v["ua_count"] >= 10:
+            if rotating:
                 label.append("%d UAs (rotating)" % v["ua_count"])
-            if burst:
+            if refused:
                 label.append("%.0f%% refused" % (error_ratio * 100))
             if probe_paths:
                 label.append("%d probe paths" % len(probe_paths))
@@ -610,6 +639,12 @@ def main():
                      ", ".join("%s x%d" % (ip, n) for ip, n in u["top"][:3])))
 
     # ── E ────────────────────────────────────────────────────────────────────
+    if noise:
+        # Recorded, not escalated. Visible so a pattern across runs is still
+        # spottable, quiet so the fault list stays worth reading.
+        print("  single refused probes (noise, not escalated): %s"
+              % ", ".join("%s %s %s" % (n, ip, p) for n, ip, p in noise[:6]))
+
     print("\nE. CRAWLERS  (reported every run, even a quiet one)")
     any_crawler = False
     for node, r, err in results:

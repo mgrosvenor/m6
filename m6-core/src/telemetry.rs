@@ -304,6 +304,31 @@ pub struct ClientSummary {
 }
 
 impl ClientSummary {
+    /// Whether this client is worth a human's attention.
+    ///
+    /// Three things count on their own, because each is deliberate rather than
+    /// incidental: an injection attempt, user-agent rotation, and scanning
+    /// across several distinct probe paths.
+    ///
+    /// Two things deliberately do NOT count on their own, both learned by
+    /// this rule firing on nothing:
+    ///
+    /// - **Volume.** A busy client being served normally is a user. The
+    ///   health check reported 185 requests from the operator's own address,
+    ///   178 of them its own load generation.
+    /// - **A single refused probe.** One 404 to `/.git/config` is background
+    ///   noise on any public address.
+    ///
+    /// What volume does do is combine with failure: a client that is mostly
+    /// being refused is looking for something it has not found, and ten of
+    /// those is a sweep.
+    pub fn is_notable(&self) -> bool {
+        !self.injection_paths.is_empty()
+            || self.is_rotating_user_agents
+            || self.probe_paths.len() >= PROBE_PATHS_FOR_CONCERN
+            || (self.requests >= REFUSED_REQUESTS_FOR_CONCERN && self.error_ratio() >= 0.5)
+    }
+
     /// Share of responses that were 4xx or 5xx.
     ///
     /// A client that is mostly being refused is looking for something it has
@@ -344,6 +369,22 @@ pub struct TrafficSummary {
     pub forged_bot_requests: u64,
     pub forgers: Vec<String>,
 }
+
+/// Distinct probe paths from one address before it reads as scanning rather
+/// than as internet weather.
+///
+/// A single 404 to `/.git/config` is not an incident. The firewall on these
+/// nodes drops around 180 packets an hour from a dozen sources and nobody
+/// reads those either. Reporting one refused probe at the same level as a
+/// credential sweep is how a fault list stops being read.
+pub const PROBE_PATHS_FOR_CONCERN: usize = 3;
+
+/// Requests from one address before a mostly-refused client counts, even
+/// without a probe path.
+///
+/// Catches the shape that has neither many distinct paths nor great volume: 20
+/// requests in five seconds, 18 of them 404, hammering one WordPress path.
+pub const REFUSED_REQUESTS_FOR_CONCERN: u64 = 10;
 
 /// How many distinct user agents from one address before we stop believing it.
 ///
@@ -497,16 +538,8 @@ impl TrafficSummary {
     /// operator's own address as a fault, in a run where 178 of them were the
     /// health check's own load generation. A rule that fires on the monitoring
     /// traffic is worse than no rule.
-    pub fn suspicious(&self, burst_threshold: u64) -> Vec<&(String, ClientSummary)> {
-        self.clients
-            .iter()
-            .filter(|(_, c)| {
-                !c.probe_paths.is_empty()
-                    || !c.injection_paths.is_empty()
-                    || c.is_rotating_user_agents
-                    || (c.requests >= burst_threshold && c.error_ratio() >= 0.5)
-            })
-            .collect()
+    pub fn suspicious(&self, _burst_threshold: u64) -> Vec<&(String, ClientSummary)> {
+        self.clients.iter().filter(|(_, c)| c.is_notable()).collect()
     }
 }
 
@@ -697,6 +730,43 @@ mod tests {
         assert!(!claims_to_be_bot(
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0 Safari/537.36"
         ));
+    }
+
+    /// One refused probe is internet weather, not an incident.
+    #[test]
+    fn a_single_refused_probe_is_not_notable() {
+        let s = TrafficSummary::from_records(&[rec(
+            "2026-09-11T08:09:22Z", "137.184.111.53", "/.git/config", 404, "curl/8",
+        )]);
+        assert!(s.suspicious(100).is_empty());
+        // It is still recorded; it is just not escalated.
+        assert_eq!(s.clients[0].1.probe_paths.len(), 1);
+    }
+
+    /// Scanning across several paths is deliberate and counts immediately,
+    /// at any volume.
+    #[test]
+    fn three_distinct_probe_paths_is_scanning() {
+        let records: Vec<_> = ["/.env", "/.git/config", "/wp-admin/setup.php"]
+            .iter()
+            .enumerate()
+            .map(|(i, p)| rec(&format!("2026-09-11T08:0{i}:00Z"), "203.0.113.7", p, 404, "curl/8"))
+            .collect();
+        let s = TrafficSummary::from_records(&records);
+        assert_eq!(s.suspicious(100).len(), 1, "three paths from one address is a sweep");
+    }
+
+    /// The shape with neither many paths nor great volume: one path, twenty
+    /// requests, almost all refused. Seen on lon, 2026-09-11.
+    #[test]
+    fn a_small_mostly_refused_sweep_counts() {
+        let mut records: Vec<_> = (0..18)
+            .map(|i| rec(&format!("2026-09-11T06:34:{:02}Z", i), "185.19.40.146",
+                         "//xmlrpc.php", 404, "curl/8"))
+            .collect();
+        records.push(rec("2026-09-11T06:34:59Z", "185.19.40.146", "/", 200, "curl/8"));
+        let s = TrafficSummary::from_records(&records);
+        assert_eq!(s.suspicious(100).len(), 1);
     }
 
     /// Volume alone must not raise a fault.

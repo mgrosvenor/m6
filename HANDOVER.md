@@ -289,23 +289,34 @@ New this session:
     `cargo test --workspace` never compiled them. This is why chrono and lru
     are unconditional dependencies of core rather than gated: the owner chose
     the dependency over the blind spot.
-14. **One sample is not a measurement, and a monitoring tool will measure its
-    own effect.** The health check flagged its own load generator as an
-    incident, then reported a 50% latency regression from a single sample that
-    landed during that load. Both were fixed in the tool. Watch for a third.
-15. **A claim can be literally true and support a false conclusion.** "Zero
+14. **A monitoring tool will measure its own effect, and it will keep doing
+    it.** Three times in one day, three different mechanisms: the health check
+    flagged its own load generator as a security incident; it read a 50%
+    latency regression off a single sample taken during that load; and it timed
+    a 4ms loopback call immediately after a 24-hour `journalctl` scan on a
+    two-core VM, reporting 266ms maxima that did not reproduce in twelve clean
+    samples a minute later. The fixes, in order: require failure as well as
+    volume, take the median of five, measure before the scan rather than after.
+    Assume there is a fourth.
+15. **A fault list only works if everything on it is a fault.** The same rule
+    fired on 185 requests from the operator's own address and on one 404 to
+    `/.git/config`. Both are noise and both teach the reader to skim. What
+    counts on its own is what is deliberate: injection, user-agent rotation,
+    scanning across several distinct paths. Volume counts only together with
+    failure, and a single refused probe is recorded without being escalated.
+16. **A claim can be literally true and support a false conclusion.** "Zero
     template files" was true of the three renderers and did not mean they
     needed no template engine.
-16. **Read the full user-agent list; a keyword list invents crawlers.** One IP
+17. **Read the full user-agent list; a keyword list invents crawlers.** One IP
     rotating 526 user agents would have been reported as a dozen AI crawlers
     visiting. `UA_ROTATION_THRESHOLD` makes that a property of the data.
-17. **Encoding and decoding are two halves of one block.** Core could
+18. **Encoding and decoding are two halves of one block.** Core could
     percent-decode and not encode, so callers wrote their own encoder. The same
     shape as having four cookie formatters and no cookie type.
-18. **Check the transport before writing the runbook.** The monitor was
+19. **Check the transport before writing the runbook.** The monitor was
     designed against the WireGuard mesh because that is the obvious answer;
     origin's backbone listener is h2c-only and the cache nodes have none.
-19. **A monitor inside the thing it monitors cannot report the failure that
+20. **A monitor inside the thing it monitors cannot report the failure that
     matters.** It was specified for the central node until the owner asked
     where it should run. Run it on syd and the fleet digest dies with syd.
     Related: a client that builds a fresh connection per request pays a cold
