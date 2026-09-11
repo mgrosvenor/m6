@@ -126,10 +126,23 @@ Verified by commit, gate green at each step unless noted.
 
 The owner's standing requirement: **every app has the same general structure,
 and that structure is documented well enough to pick up from outside the m6
-repo**, with **no performance regression**. `docs/m6-app-anatomy.md` is the
-shape; **`docs/m6-app-shape-plan.md` is the gap and the order**, including why
-m6-http is excluded on structural grounds rather than by assertion, what each
-enhancement transfers to which apps, and how each one avoids the hot path.
+repo**, with **no performance regression**.
+
+**The target shape is single-threaded: one event loop, a switch over connection
+state, everything non-blocking, and anything that must block on its own sync
+thread signalling the loop through an fd.** memcached over libevent; QJump's
+apps over CamIO. **m6-http is already this shape** and holds h2spec 146/146
+with zero `thread::spawn` in the server and zero `.lock()` on its request path,
+while `App` takes a mutex per request. `docs/m6-app-shape-plan.md` is the
+evidence and the route; `docs/m6-app-anatomy.md` is the snapshot of today.
+
+The case rests on the project's own history rather than on preference: the
+SIGTERM defect that went silent for thirty days on syd **cannot exist in a
+single-threaded program**, and the assertion in `install_with_hooks` is a guard
+against a bug class the other model deletes. On a **1-core, 950MB** origin,
+threads buy preemption rather than parallelism, which is worse for tail latency
+on a 6ms render, and `m6-file`'s pool was widened from 1 to 32 reactively after
+one page exhausted it.
 
 Core is missing five things. Two are live defects in services that are already
 the right shape, so they are worth doing whether or not anything is migrated:

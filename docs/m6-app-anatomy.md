@@ -248,6 +248,13 @@ Listed because apps have re-implemented several of these before:
 
 ## 6. The apps that are not shaped like this
 
+> **This section describes today, not the target.** The target shape is **one
+> thread, one event loop, a switch over connection state, everything
+> non-blocking, and anything that must block on its own sync thread signalling
+> the loop through an fd.** m6-http is already that shape; the `App` services
+> are not. `m6-app-shape-plan.md` is the route. Read this section as a snapshot
+> of a system mid-migration.
+
 **There is one app family and one edge. Everything else is unfinished.**
 
 | service | uses `App`? | is the difference real? |
