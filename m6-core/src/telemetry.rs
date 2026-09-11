@@ -303,6 +303,25 @@ pub struct ClientSummary {
     pub is_rotating_user_agents: bool,
 }
 
+impl ClientSummary {
+    /// Share of responses that were 4xx or 5xx.
+    ///
+    /// A client that is mostly being refused is looking for something it has
+    /// not found. A client that is mostly being served is using the site.
+    pub fn error_ratio(&self) -> f64 {
+        if self.requests == 0 {
+            return 0.0;
+        }
+        let errors: u64 = self
+            .status
+            .iter()
+            .filter(|(code, _)| **code >= 400)
+            .map(|(_, n)| *n)
+            .sum();
+        errors as f64 / self.requests as f64
+    }
+}
+
 /// A crawler we believe actually visited.
 #[derive(Debug, Clone)]
 pub struct CrawlerSighting {
@@ -467,8 +486,17 @@ impl TrafficSummary {
         summary
     }
 
-    /// Clients worth a human's attention: probing, injecting, rotating user
-    /// agents, or simply loud.
+    /// Clients worth a human's attention.
+    ///
+    /// Probing, injecting and user-agent rotation are suspicious on their own.
+    /// **Volume is not.** A burst only counts when it is also failing, because
+    /// an ordinary heavy client is not an incident and reporting it as one
+    /// trains the reader to skim the fault list.
+    ///
+    /// This was found by running the check: it flagged 185 requests from the
+    /// operator's own address as a fault, in a run where 178 of them were the
+    /// health check's own load generation. A rule that fires on the monitoring
+    /// traffic is worse than no rule.
     pub fn suspicious(&self, burst_threshold: u64) -> Vec<&(String, ClientSummary)> {
         self.clients
             .iter()
@@ -476,7 +504,7 @@ impl TrafficSummary {
                 !c.probe_paths.is_empty()
                     || !c.injection_paths.is_empty()
                     || c.is_rotating_user_agents
-                    || c.requests >= burst_threshold
+                    || (c.requests >= burst_threshold && c.error_ratio() >= 0.5)
             })
             .collect()
     }
@@ -669,6 +697,35 @@ mod tests {
         assert!(!claims_to_be_bot(
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0 Safari/537.36"
         ));
+    }
+
+    /// Volume alone must not raise a fault.
+    ///
+    /// The check's own load generator hit the site 178 times in an hour and
+    /// was reported as an incident. A heavy client that is being served
+    /// normally is a user, not an attacker.
+    #[test]
+    fn a_busy_client_being_served_is_not_suspicious() {
+        let records: Vec<_> = (0..185)
+            .map(|i| rec(&format!("2026-09-11T06:{:02}:00Z", i % 60),
+                         "220.233.79.92", "/capabilities", 200, "curl/8.7.1"))
+            .collect();
+        let s = TrafficSummary::from_records(&records);
+        assert_eq!(s.total_requests, 185);
+        assert!(s.suspicious(100).is_empty(), "a served burst is not an incident");
+    }
+
+    /// The same volume, mostly refused, is.
+    #[test]
+    fn a_busy_client_being_refused_is_suspicious() {
+        let records: Vec<_> = (0..185)
+            .map(|i| rec(&format!("2026-09-11T06:{:02}:00Z", i % 60),
+                         "203.0.113.9", "/nonexistent", 404, "curl/8.7.1"))
+            .collect();
+        let s = TrafficSummary::from_records(&records);
+        let sus = s.suspicious(100);
+        assert_eq!(sus.len(), 1);
+        assert!(sus[0].1.error_ratio() >= 0.5);
     }
 
     #[test]
