@@ -8,12 +8,20 @@
 //! | `m6-http/src/http11.rs` (this one, moved here) | **27/32** |
 //! | `m6-file/src/http.rs` | 15/32 |
 //! | `m6-render/src/server.rs` | 15/32 |
-//! | `m6-core/src/parse.rs` (deleted) | **14/32** |
+//! | `m6-core/src/parse.rs` (parser removed, see below) | **14/32** |
 //!
 //! The migration plan said to consolidate onto `m6-core/src/parse.rs`, which
 //! turned out to be the *worst* of the four. Measuring the candidate before
 //! moving anything onto it is what caught that; the survivor is the parser the
 //! edge already used, because it is the only one that has been attacked.
+//!
+//! **`parse.rs` still exists, and is on the production path of every socket
+//! backend** through [`crate::server::serve_connection`]. What was deleted is
+//! the parser that used to be *inside* it: it is now a stream adapter that
+//! reads bytes into a buffer and asks [`parse_request`] whether the message is
+//! complete, with no framing logic of its own. Reading that table as "the file
+//! is gone" costs whoever does it a detour through
+//! `server::serve_connection` looking for a second parser that is not there.
 //!
 //! **This function is pure.** The edge's version stripped proxy-owned headers
 //! (`X-Forwarded-For` and friends) inline while parsing, which is ingress

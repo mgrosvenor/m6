@@ -10,16 +10,21 @@ commit log rather than written from memory.
 
 ## 1. Where the work is
 
-**Branch `main`, clean, 69 commits ahead of the deployed `22ee3a4` here and 14
+**Branch `main`, clean, 71 commits ahead of the deployed `22ee3a4` here and 14
 ahead of `d6ebfa5` in the site repo. No migration code is deployed and the
 freeze holds until it is finished.**
 
 > The deployed commit is whatever the newest entry in
-> `~/dr-grosvenor-site/docs/RELEASES.md` names, and nothing else. Recompute
-> both counts from it rather than editing the number in place; this line was
-> wrong twice, naming `b32e837` and 48 when `b32e837` had already been
-> superseded by the 2026-09-10 18:47 deploy (its fleet md5 `aced7223` is now
-> the `.prev` rollback target). Of the 14 site commits, three record the
+> `~/dr-grosvenor-site/docs/RELEASES.md` names, and nothing else. **Recompute,
+> do not edit in place:**
+>
+> ```sh
+> git -C ~/m6 log --oneline <newest m6 sha in RELEASES.md>..HEAD | wc -l
+> ```
+>
+> This line was wrong twice, naming `b32e837` and 48 when `b32e837` had already
+> been superseded by the 2026-09-10 18:47 deploy (its fleet md5 `aced7223` is
+> now the `.prev` rollback target). Of the 14 site commits, three record the
 > hardening and block-ledger changes that *were* applied on instruction.
 
 Three production changes WERE applied on 2026-09-11, on instruction, as
@@ -141,18 +146,25 @@ Services: `m6-http` (edge/proxy), `m6-file`, `m6-html`, `m6-auth-server`,
    `deploy/FLEET-MONITOR.md`) and the firewall stats collector
    (`deploy/FIREWALL-STATS.md`). Both are tested, neither is installed, and
    until they are the hourly check still needs the Python script.
-1. **Document m6-core in full.** Owner's request. Start with the list of every
-   component available, then detail each component and its interface. Core is
-   now the only crate a service links and there is no reference to write one
-   against.
+1. ~~**Document m6-core in full.**~~ **DONE 2026-09-11:
+   `docs/m6-core-reference.md`.** All 30 modules and their interfaces, written
+   against the source. `m6-render-lib.md` is marked superseded (deleted crate)
+   and `m6-core.md` §9 is marked historical (pre-migration gap analysis that
+   read as current state). What remains is *inside* the code: seventeen of the
+   thirty modules still have no module-level doc comment, listed in
+   `CONSOLIDATION-TODO.md`.
 2. **Finish header to dict.** `FrameworkState::build_dict` is private and is
    where the real knowledge lives: twelve ordered steps, and the ordering is
    load-bearing (built-ins go in *after* params files so a params file cannot
    override them). The dict-to-header half landed in `3e7a7d8`.
-3. **Compile the watcher fix on the build box.** `m6-core/src/watcher.rs` is
-   inside `#[cfg(target_os = "linux")]`, no Linux target is installed here, and
-   the inotify alignment fix in `8bcebac` has **never been through a
-   compiler**.
+3. ~~**Compile the watcher fix on the build box.**~~ **DONE 2026-09-11**, via
+   `deploy/run-tests.sh`: 962 passed, 0 failed, **0 warnings** on Linux for both
+   the release and test builds, and the compile-time assertion
+   `align_of::<libc::inotify_event>() <= 8` was evaluated for the first time and
+   holds.
+   **Half the item remains and it is a different half.** `ConfigWatcher` has no
+   tests on any platform, so config hot reload on Linux still has no behavioural
+   coverage. "Never compiled" is closed; "never exercised" is not.
 4. **Deploy `m6-monitor` on the build host and prove it.** It is tested and has
    never polled a real node. `deploy/FLEET-MONITOR.md` is the runbook. It runs
    **off-fleet**, not on the centre: a monitor on syd cannot report that syd is

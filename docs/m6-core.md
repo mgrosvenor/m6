@@ -1,9 +1,15 @@
 # m6-core — Design
 
-**Status: design. Describes the target, not the current crate.** `m6-core`
-today is an unplanned collection of whatever was convenient to share; see
-§9 for the gap. This document defines what it is for, so the gap can be closed
-deliberately.
+**Status: design. Describes the target, and the target was reached.** This
+document defines what the crate is for and where its boundary is. It was
+written before the migration, when m6-core was an unplanned collection of
+whatever was convenient to share.
+
+Phases 0 to 6 are done, m6-render is deleted, and m6-core is now the only crate
+a service links. **§9 below is therefore history, not current state**: it
+describes the gap as it stood before the migration and is kept as the record of
+what was closed. For the crate as it is, and for every component and its
+interface, see **`m6-core-reference.md`**.
 
 ---
 
@@ -299,6 +305,10 @@ worse than ignoring it.
   moves behind one dependency.
 
 ## 9. Current state, and how far away it is
+
+> **Historical, as of before the migration.** Every item in this section has
+> been closed. Kept as the record of what the migration was for. Current state
+> is `m6-core-reference.md`.
 
 `m6-core` was never designed. It appears once in the entire documentation set,
 in `m6-render-lib.md`, as a conditional aside: "which may be extracted into a

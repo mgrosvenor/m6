@@ -92,10 +92,23 @@ Verified by commit, gate green at each step unless noted.
 
 ### 2. Document m6-core in full
 
-- [ ] Owner's request, **not started**. Every component listed, then each
-      component and its interface. Core is now the only crate a service links
-      and there is no reference to write one against. The largest outstanding
-      item.
+- [x] Owner's request. **`docs/m6-core-reference.md`**, written 2026-09-11
+      against the source rather than against the older docs. All 30 modules
+      grouped by task, the interface for each, the twelve ordered steps of
+      `build_dict` including why step 8 is load-bearing, and a closing section
+      of known gaps rather than a stop at the good parts.
+- [x] `m6-render-lib.md` marked **SUPERSEDED**: it documents a deleted crate.
+      Kept rather than removed, because it is the only description of the
+      renderer lifecycle written while someone was using it.
+- [x] `m6-core.md` §9 marked **historical**. It was the pre-migration gap
+      analysis and read as current state.
+- [ ] **Seventeen of thirty modules have no module-level doc comment**: `app`
+      has a one-line stub, and `compress`, `config`, `error`, `http`, `log`,
+      `mime`, `minify`, `multipart`, `parse`, `path`, `request`, `response`,
+      `server`, `signal`, `template`, `util`, `watcher` have none. The thirteen
+      that do are the best documentation in the repository, which makes the gap
+      sharper rather than softer. The reference covers the interface; these
+      would carry the *why*, next to the code.
 
 ### 3. Remaining audit findings
 
@@ -125,9 +138,29 @@ Verified by commit, gate green at each step unless noted.
 
 ### Owed, and easy to lose
 
-- [ ] **Compile `m6-core/src/watcher.rs` on the build box.** The inotify
-      alignment fix in `8bcebac` is `#[cfg(target_os = "linux")]` and no Linux
-      target is installed here. It has never been through a compiler.
+- [x] **Compile `m6-core/src/watcher.rs` on the build box.** Done 2026-09-11 via
+      `deploy/run-tests.sh`: m6 workspace on Linux, **962 passed, 0 failed, 0
+      warnings** on the release and test builds, same test count as macOS so
+      nothing is cfg'd out. The inotify alignment fix in `8bcebac` has now been
+      through a compiler, and the compile-time assertion
+      `align_of::<libc::inotify_event>() <= 8` was **evaluated** for the first
+      time and holds. That was the premise behind `#[repr(align(8))]` and it
+      was an untested assumption about the target's libc until now.
+- [ ] **`ConfigWatcher` has no tests, on any platform.** Found while confirming
+      the above. No `#[cfg(test)]` and no `#[test]` anywhere in `watcher.rs`;
+      `m6-core/tests/log_reload.rs` covers `LogHandle::reload` and not the
+      watcher. Two production consumers, `m6-file/src/main.rs:229` and
+      `app.rs:1748`, and config hot reload on Linux has never been exercised by
+      a test. So the item above closed "never compiled", not "verified": the
+      remaining half is behaviour.
+- [ ] **Staging cannot exercise the cache role.** `setup-staging.sh` is the same
+      shape as production and states three deliberate differences, one of which
+      has a sharper edge than it reads: staging is a **single origin, no cache
+      nodes, no WireGuard**. The 90s London outage was a cache-role fault
+      (`/run/m6` exists on an origin, not on a cache node), so staging would
+      have started that unit cleanly and proved the change safe. A green
+      staging run validates the origin role only. Worth writing next to lesson
+      21 in the hardening fragment.
 - [ ] **Benchmark Phases 5 and 6.** The plan requires a delta per phase and
       neither has one. The whole request path moved between crates.
 - [ ] **Deploy `m6-monitor`.** It has now been run against the real fleet from

@@ -1,5 +1,15 @@
 # m6-render (library crate)
 
+> **SUPERSEDED, 2026-09-11. The crate this describes has been deleted.**
+> m6-render is gone; m6-core is the only crate a service links. Almost
+> everything below now lives in m6-core, and the current interface is
+> **`m6-core-reference.md`**.
+>
+> Kept, not deleted, because it is the only description of the renderer
+> lifecycle and the request dictionary written while someone was using them,
+> and because the reference was written against the code rather than against
+> this. Where the two disagree, the reference is current and this is history.
+
 Framework for building m6 renderers. Handles the Unix socket server, HTTP parsing, config loading, params file loading, template rendering, thread pool management, and all other infrastructure. Renderer authors write lifecycle functions and handlers.
 
 m6-html is the degenerate case — the trivial renderer with no user state and a one-line main. Every other renderer is a more complex use of the same library.
