@@ -56,6 +56,37 @@ pub fn is_untrusted_inbound(name: &str) -> bool {
     UNTRUSTED_INBOUND.iter().any(|&h| name.eq_ignore_ascii_case(h))
 }
 
+/// Ensure the backend leg carries a `Host`.
+///
+/// That leg is HTTP/1.1, where a request without `Host` is malformed
+/// (RFC 9110 7.2). The client's own is forwarded when it sent one, but three
+/// cases legitimately arrive without:
+///
+/// | client | why |
+/// |---|---|
+/// | HTTP/1.0 | omitting `Host` is legal, and m6-http serves it |
+/// | HTTP/2 | carries the origin in `:authority` |
+/// | HTTP/3 | the same, and pseudo-headers are stripped on ingress |
+///
+/// `original_host` is already the authority in all three, so it is synthesised
+/// here, once, rather than in each protocol's own path. Doing it per protocol
+/// is exactly what went wrong: HTTP/2 translated `:authority` and HTTP/3 never
+/// did, so every HTTP/3 request reached the backend naming no origin at all.
+///
+/// It stayed invisible while the backends accepted anything. Making them
+/// strict turned it into a 400 on every HTTP/3 cache miss and on every
+/// HTTP/1.0 request, which is how it was found.
+fn write_host_if_absent(buf: &mut Vec<u8>, req: &HttpRequest, original_host: &str) {
+    if original_host.is_empty()
+        || req.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("host"))
+    {
+        return;
+    }
+    buf.extend_from_slice(b"Host: ");
+    buf.extend_from_slice(original_host.as_bytes());
+    buf.extend_from_slice(b"\r\n");
+}
+
 /// Drop every client-supplied copy of a proxy-owned header.
 ///
 /// Call on ingress for each protocol, immediately after parsing and before
@@ -166,16 +197,13 @@ fn via_value(existing: Option<&str>, received_version: &str) -> String {
     }
 }
 
-/// A parsed HTTP request (simplified for forwarding).
-#[derive(Debug, Clone)]
-pub struct HttpRequest {
-    pub method: String,
-    pub path: String,
-    pub query: Option<String>,
-    pub version: String,
-    pub headers: Vec<(String, String)>,
-    pub body: Vec<u8>,
-}
+/// The request type is `m6_core::http::RawRequest`, parsed by the one parser
+/// in `m6_core::h1`.
+///
+/// m6-http used to define its own, structurally identical to core's once
+/// `version` moved there. Two names for one shape is how two parsers stay
+/// alive: the edge kept its copy because its copy returned its type.
+pub use m6_core::http::RawRequest as HttpRequest;
 
 /// A parsed HTTP response.
 #[derive(Debug, Clone)]
@@ -374,6 +402,7 @@ pub fn forward_request_timeout(
     buf.extend_from_slice(b"Via: ");
     buf.extend_from_slice(via_value(existing_via, &req.version).as_bytes());
     buf.extend_from_slice(b"\r\n");
+    write_host_if_absent(&mut buf, req, original_host);
 
     // Add proxy headers
     buf.extend_from_slice(b"X-Forwarded-For: ");
@@ -398,8 +427,27 @@ pub fn forward_request_timeout(
         buf.extend_from_slice(&req.body);
     }
 
-    stream.write_all(&buf)?;
-    stream.flush()?;
+    // A backend is allowed to answer before it has read the whole request
+    // (RFC 9110 6.1), and a good one does: m6-file refuses a header block over
+    // its cap, writes 400, and closes without draining the rest. The proxy is
+    // still writing at that point, so the write fails with EPIPE.
+    //
+    // Treating that as a connection failure turns the backend's correct 400
+    // into a 502, and marks a healthy pool member down. The response is
+    // already waiting on the socket; read it.
+    let write_result = stream.write_all(&buf).and_then(|()| stream.flush());
+    if let Err(e) = write_result {
+        let broken = matches!(
+            e.kind(),
+            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+        );
+        if !broken {
+            return Err(e);
+        }
+        // Read the response the backend closed on us to deliver. If there is
+        // none, the original write error is the honest answer.
+        return read_response_for(stream, &req.method).map_err(|_| e);
+    }
 
     // Read response. The method matters: a HEAD response is bodyless whatever
     // its Content-Length says, and without this the read blocks until timeout.
@@ -981,6 +1029,7 @@ fn build_forwarded_request_bytes(
     buf.extend_from_slice(b"Via: ");
     buf.extend_from_slice(via_value(existing_via, &req.version).as_bytes());
     buf.extend_from_slice(b"\r\n");
+    write_host_if_absent(&mut buf, req, original_host);
 
     // Proxy headers
     buf.extend_from_slice(b"X-Forwarded-For: ");

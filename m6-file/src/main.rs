@@ -7,7 +7,6 @@ mod route;
 use anyhow::{Context, Result};
 use config::{socket_path_from_config, Config};
 use handler::{handle_request, HandlerContext};
-use http::Request;
 use route::Route;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
@@ -406,8 +405,23 @@ fn handle_connection(
 ) -> Result<()> {
     stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
 
-    let stream_clone = stream.try_clone().context("cloning stream")?;
-    let req = Request::read(stream_clone).context("reading request")?;
+    // A malformed request is answered, not dropped.
+    //
+    // This was `Request::read(stream_clone).context(...)?`, which returned the
+    // error to a caller that only logged it, so every unparseable request got
+    // a silent close. m6-auth-server had the identical bug, and it stayed
+    // invisible in both for the same reason: the old parser was lenient enough
+    // that almost nothing reached this path.
+    let mut stream_clone = stream.try_clone().context("cloning stream")?;
+    let req = match m6_core::parse::parse_request(&mut stream_clone) {
+        Ok(r) => r,
+        Err(e) => {
+            debug!(error = %e, "malformed request");
+            let hdrs: Vec<(&str, &str)> = vec![("Connection", "close")];
+            crate::http::write_response(&mut stream, 400, "Bad Request", &hdrs, &[])?;
+            return Ok(());
+        }
+    };
 
     let ctx = HandlerContext { routes, config, site_dir };
 
