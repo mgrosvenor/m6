@@ -122,6 +122,38 @@ Verified by commit, gate green at each step unless noted.
       next to `core::conditional`. Check whether it genuinely differs (strong
       vs weak) or merely duplicates.
 
+### 3b. One app shape, not three
+
+The owner's standing requirement: **every app has the same general structure,
+and that structure is documented well enough to pick up from outside the m6
+repo.** `docs/m6-app-anatomy.md` is the document. Two services still do not
+match it, and in both cases the divergence is historical rather than designed.
+
+- [ ] **`m6-file` should be an `App` service.** Its own `poll(2)` accept loop is
+      **22 of 33 lines byte-identical** to `App`'s at `app.rs:1759`; the
+      remainder are the same expressions with renamed locals (`pfd_ino`/`i`
+      against `pfd_w`/`w`, `.unwrap_or(-1)` against an `Option`). It already
+      calls `m6_core::server::serve_connection` per connection. The stated
+      reason for the copy, needing the watcher fd and the listener in one wait
+      set, is a thing `App` already does.
+- [ ] **`m6-auth-server` should be an `App` service.** It binds through
+      `UnixServer` directly. The only capability it needs that `App` lacks is
+      `chmod 0666` on the socket, which wants a config key, not a bespoke main.
+- [x] **`m6-monitor` lifecycle is now proven.** It was always structurally
+      correct (`App::new().route_get(..).run()`), but had no `tests/` directory
+      at all, so nothing had ever started the binary. `m6-monitor/tests/lifecycle.rs`.
+- [x] **`assert_app_lifecycle` moved into core's testkit.** The lifecycle
+      contract was opt-in and hand-written in five integration suites, which is
+      why the sixth service never got one. It is now one call.
+- [x] **`socket_path_from_config` and `M6_SOCKET_OVERRIDE` consolidated.** Four
+      copies: the derivation existed in `m6-core/src/server.rs` *and*
+      `m6-file/src/config.rs` (differing fallback stem, `m6-file` against
+      `m6-default`), and the override was wrapped identically in `app.rs`,
+      `m6-file` and `m6-auth-server`. One implementation now, in core.
+
+**`m6-http` is not on this list and should not be.** It is the edge: public TCP
+and UDP, TLS, h2, h3, proxying, the cache. It is what `App` services sit behind.
+
 ### 4. Phase 7, decouple the repositories
 
 - [ ] The site's renderers carry `m6-core = { path = "../../m6/m6-core" }`: a

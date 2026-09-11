@@ -18,7 +18,33 @@ use crate::parse;
 ///   "configs/m6-html.conf"   → "/run/m6/m6-html.sock"
 ///   "configs/m6-html-2.conf" → "/run/m6/m6-html-2.sock"
 ///   "/abs/path/to/foo.bar"   → "/run/m6/foo.sock"
+///
+/// # `M6_SOCKET_OVERRIDE`
+///
+/// Set, it wins outright. A test cannot write to `/run/m6`, so every service
+/// needs an escape hatch, and every service had written the same one:
+///
+/// ```text
+/// let socket_path = if let Ok(p) = std::env::var("M6_SOCKET_OVERRIDE") {
+///     PathBuf::from(p)
+/// } else {
+///     socket_path_from_config(&config_path)
+/// };
+/// ```
+///
+/// Three byte-identical copies of that, in `app.rs`, `m6-file` and
+/// `m6-auth-server`, wrapping this function rather than living in it. A fourth
+/// copy of the *derivation* sat in `m6-file/src/config.rs`, which is what
+/// m6-file actually called, and it differed: its fallback stem was `m6-file`
+/// where this one is `m6-default`. Harmless, and exactly the shape that is not
+/// harmless next time.
+///
+/// It lives here so the contract is one thing an app inherits rather than four
+/// things an app remembers.
 pub fn socket_path_from_config(config_path: &Path) -> PathBuf {
+    if let Ok(override_path) = std::env::var("M6_SOCKET_OVERRIDE") {
+        return PathBuf::from(override_path);
+    }
     let stem = config_path
         .file_stem()
         .and_then(|s| s.to_str())

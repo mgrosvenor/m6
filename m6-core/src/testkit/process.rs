@@ -271,3 +271,62 @@ pub fn assert_lifecycle_logged(name: &str, output: &str) {
         );
     }
 }
+
+/// The whole lifecycle contract of an `App` service, asserted in one call.
+///
+/// Spawn, wait for the socket, SIGTERM, then check the three things that make
+/// a shutdown clean rather than merely quiet:
+///
+/// 1. **Exit status is success.** A signal status means the process died at the
+///    default disposition instead of shutting down, which is the defect that
+///    hid for thirty days on syd: systemd counts death by the signal it sent as
+///    a clean stop, so `systemctl stop` reports success either way.
+/// 2. **The socket is gone.** One left behind keeps a dead member in m6-http's
+///    backend pool until the next rescan.
+/// 3. **The three lifecycle lines were logged**, under the service's own name.
+///
+/// # Why this is here and not written out per service
+///
+/// It was written out per service, five times, and the sixth never got written:
+/// `m6-monitor` had no `tests/` directory at all. Every `App` service takes the
+/// same argv (`site_dir`, `config_path`) and honours the same
+/// `M6_SOCKET_OVERRIDE`, so there was never anything service-specific in those
+/// five copies except the name. A contract that each service opts into by hand
+/// is one a new service silently fails to have.
+///
+/// The caller owns the `Command` and the temp directory, because `m6-core`
+/// cannot reach `tempfile` from inside a feature-gated module: it is a
+/// dev-dependency of this crate, not a dependency.
+///
+/// ```rust,no_run
+/// # use std::process::Command;
+/// # use m6_core::testkit::{assert_app_lifecycle, binary};
+/// # let (site_dir, config, sock) = (".", ".", std::path::Path::new("/tmp/x.sock"));
+/// assert_app_lifecycle(
+///     "m6-monitor",
+///     Command::new(binary("m6-monitor"))
+///         .arg(site_dir)
+///         .arg(config)
+///         .env("M6_SOCKET_OVERRIDE", sock),
+///     sock,
+/// );
+/// ```
+pub fn assert_app_lifecycle(name: &str, cmd: &mut Command, socket_path: &Path) {
+    let mut svc = Service::spawn(name, cmd);
+    svc.wait_for_path(socket_path, Duration::from_secs(10));
+
+    let status = svc.terminate(Duration::from_secs(5));
+    assert!(
+        status.success(),
+        "{name} should exit 0 on SIGTERM, got {status}. A signal exit status means the \
+         process died at the default disposition instead of shutting down.\n\
+         --- output ---\n{}",
+        svc.output()
+    );
+    assert!(
+        !socket_path.exists(),
+        "{name}: the socket at {} outlived the process",
+        socket_path.display()
+    );
+    assert_lifecycle_logged(name, &svc.output());
+}

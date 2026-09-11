@@ -1657,11 +1657,7 @@ fn run_app_with_shutdown(
         std::process::exit(1);
     });
 
-    let socket_path = if let Ok(override_path) = std::env::var("M6_SOCKET_OVERRIDE") {
-        PathBuf::from(override_path)
-    } else {
-        crate::socket_path_from_config(&config_path)
-    };
+    let socket_path = crate::socket_path_from_config(&config_path);
 
     // Build framework state.
     let code_route_signatures: Vec<(String, RouteMethod)> = code_routes

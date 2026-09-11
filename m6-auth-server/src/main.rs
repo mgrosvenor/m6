@@ -152,11 +152,7 @@ fn run() -> i32 {
     });
 
     // Derive socket path (can be overridden for tests)
-    let socket_path = if let Ok(override_path) = std::env::var("M6_SOCKET_OVERRIDE") {
-        PathBuf::from(override_path)
-    } else {
-        socket_path_from_config(&config_path)
-    };
+    let socket_path = socket_path_from_config(&config_path);
 
     // Ensure socket directory exists
     if let Some(parent) = socket_path.parent() {
