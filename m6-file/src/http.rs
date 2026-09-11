@@ -1,64 +1,25 @@
-use anyhow::{bail, Result};
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use anyhow::Result;
+use std::io::{BufWriter, Write};
 
-/// A parsed HTTP/1.1 request.
-#[derive(Debug)]
-pub struct Request {
-    pub method: String,
-    pub path: String,
-    #[allow(dead_code)]
-    pub query: String,
-    /// Headers stored as ordered pairs; linear scan is faster than HashMap for 3-6 entries.
-    pub headers: Vec<(String, String)>,
-}
+/// The request type is `m6_core::http::RawRequest`, parsed by the one parser
+/// in `m6_core::h1`.
+///
+/// This file used to carry its own. Measured against h1spec, the independent
+/// RFC 9112 tester, it scored 15/32 against the shared parser's 27/32, and it
+/// had no limit on the request line, the header count, or the length of any
+/// header -- it read with `BufReader::read_line` until a newline arrived, so a
+/// peer that never sent one made it allocate without bound.
+///
+/// It also lowercased header names at parse time, which is why the handler
+/// compared them with `k == "if-none-match"`. That is correct only under an
+/// invariant established in this file and invisible at the call site; the
+/// shared parser keeps names as sent and lookups go through
+/// `m6_core::header`, which is case-insensitive and needs no invariant.
+pub use m6_core::http::RawRequest as Request;
 
-impl Request {
-    /// Read and parse an HTTP/1.1 request from a stream.
-    pub fn read<R: Read>(stream: R) -> Result<Self> {
-        let mut reader = BufReader::new(stream);
-        let mut request_line = String::new();
-        reader.read_line(&mut request_line)?;
-        let request_line = request_line.trim_end_matches(|c| c == '\r' || c == '\n');
-
-        let parts: Vec<&str> = request_line.splitn(3, ' ').collect();
-        if parts.len() < 3 {
-            bail!("invalid request line: {:?}", request_line);
-        }
-        let method = parts[0].to_string();
-        let full_path = parts[1].to_string();
-        let (path, query) = if let Some(idx) = full_path.find('?') {
-            (full_path[..idx].to_string(), full_path[idx + 1..].to_string())
-        } else {
-            (full_path, String::new())
-        };
-
-        // Read headers into Vec — avoids hashing and is faster for small header counts.
-        let mut headers: Vec<(String, String)> = Vec::with_capacity(8);
-        loop {
-            let mut line = String::new();
-            reader.read_line(&mut line)?;
-            let line = line.trim_end_matches(|c| c == '\r' || c == '\n');
-            if line.is_empty() {
-                break;
-            }
-            if let Some(idx) = line.find(':') {
-                let key = line[..idx].trim().to_lowercase();
-                let val = line[idx + 1..].trim().to_string();
-                headers.push((key, val));
-            }
-        }
-
-        Ok(Request { method, path, query, headers })
-    }
-
-    /// Return the Accept-Encoding header value, or "" if absent.
-    pub fn accept_encoding(&self) -> &str {
-        self.headers
-            .iter()
-            .find(|(k, _)| k == "accept-encoding")
-            .map(|(_, v)| v.as_str())
-            .unwrap_or("")
-    }
+/// The `Accept-Encoding` value, or `""` when absent.
+pub fn accept_encoding(req: &Request) -> &str {
+    m6_core::header(&req.headers, "accept-encoding").unwrap_or("")
 }
 
 /// Write an HTTP/1.1 response to a stream.
@@ -127,17 +88,17 @@ mod tests {
     #[test]
     fn test_parse_request() {
         let raw = b"GET /assets/css/main.css HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: br, gzip\r\n\r\n";
-        let req = Request::read(Cursor::new(raw)).unwrap();
+        let req = m6_core::parse::parse_request(&mut Cursor::new(raw)).unwrap();
         assert_eq!(req.method, "GET");
         assert_eq!(req.path, "/assets/css/main.css");
-        assert_eq!(req.accept_encoding(), "br, gzip");
+        assert_eq!(accept_encoding(&req), "br, gzip");
     }
 
     #[test]
     fn test_parse_request_with_query() {
         let raw = b"GET /path?foo=bar HTTP/1.1\r\nHost: localhost\r\n\r\n";
-        let req = Request::read(Cursor::new(raw)).unwrap();
+        let req = m6_core::parse::parse_request(&mut Cursor::new(raw)).unwrap();
         assert_eq!(req.path, "/path");
-        assert_eq!(req.query, "foo=bar");
+        assert_eq!(req.query.as_deref(), Some("foo=bar"));
     }
 }

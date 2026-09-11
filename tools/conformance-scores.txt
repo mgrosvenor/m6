@@ -13,6 +13,6 @@
 #
 # target               floor  total
 h1:m6-auth-server      27     32
-h1:m6-file             15     32
-h1:m6-html             15     32
+h1:m6-file             27     32
+h1:m6-html             27     32
 h1:m6-http-redirect    27     32

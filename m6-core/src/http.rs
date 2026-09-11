@@ -35,13 +35,29 @@ pub struct RawRequest {
 }
 
 impl RawRequest {
-    /// Look up a header by name (case-insensitive).
+    /// Look up a header by name, case-insensitively.
+    ///
+    /// This used to lowercase the name *and every key it scanned*, so a single
+    /// lookup allocated one `String` per header examined. It goes through
+    /// [`HeaderSource`] now, which compares with `eq_ignore_ascii_case` and
+    /// allocates nothing.
     pub fn header(&self, name: &str) -> Option<&str> {
-        let name_lower = name.to_ascii_lowercase();
-        self.headers
-            .iter()
-            .find(|(k, _)| k.to_ascii_lowercase() == name_lower)
-            .map(|(_, v)| v.as_str())
+        crate::http::header(&self.headers, name)
+    }
+
+    /// The request method.
+    pub fn method(&self) -> &str {
+        &self.method
+    }
+
+    /// The request path, without the query string.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// The raw query string, or `""` when there is none.
+    pub fn query(&self) -> &str {
+        self.query.as_deref().unwrap_or("")
     }
 
     /// Return the Content-Type header value if present.
