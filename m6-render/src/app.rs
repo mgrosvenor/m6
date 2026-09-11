@@ -2506,46 +2506,15 @@ mod tests {
         assert_ne!(t1, t2);
     }
 
-    #[cfg(feature = "csrf")]
-    #[test]
-    fn test_csrf_verify_pass() {
-        let token = "abcd1234".to_string();
-        let mut dict = Map::new();
-        let mut cookies = Map::new();
-        cookies.insert("_csrf".to_string(), Value::String(token.clone()));
-        dict.insert("cookies".to_string(), Value::Object(cookies));
-        dict.insert("csrf_token".to_string(), Value::String(token.clone()));
-
-        let raw = RawRequest {
-            method: "POST".to_string(),
-            path: "/submit".to_string(),
-            query: String::new(),
-            headers: vec![],
-            body: vec![],
-        };
-        let req = Request::new(raw, dict, std::path::PathBuf::from("/tmp"));
-        assert!(req.verify_csrf().is_ok());
-    }
-
-    #[cfg(feature = "csrf")]
-    #[test]
-    fn test_csrf_verify_fail_mismatch() {
-        let mut dict = Map::new();
-        let mut cookies = Map::new();
-        cookies.insert("_csrf".to_string(), Value::String("token-a".to_string()));
-        dict.insert("cookies".to_string(), Value::Object(cookies));
-        dict.insert("csrf_token".to_string(), Value::String("token-b".to_string()));
-
-        let raw = RawRequest {
-            method: "POST".to_string(),
-            path: "/submit".to_string(),
-            query: String::new(),
-            headers: vec![],
-            body: vec![],
-        };
-        let req = Request::new(raw, dict, std::path::PathBuf::from("/tmp"));
-        assert!(matches!(req.verify_csrf(), Err(Error::Forbidden)));
-    }
+    // The two `verify_csrf` tests that used to live here have moved to
+    // `m6_core::request`, next to the method they exercise.
+    //
+    // They had not compiled since Phase 4. Both built a `RawRequest` with
+    // `query: String` and no `version`, which was m6-render's own type before
+    // the shared one replaced it, and `run-tests.sh` runs `cargo test
+    // --workspace` with default features, so `csrf` was never on and nothing
+    // ever tried. This is the bench problem from Phase 0.2 again: code that is
+    // never compiled is not covered by a green test run.
 }
 
 /// Newest mtime of any regular file beneath `dir`, or `None` for a missing or

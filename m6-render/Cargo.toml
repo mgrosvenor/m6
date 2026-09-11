@@ -10,9 +10,11 @@ name = "m6_render"
 default     = []
 email       = ["dep:lettre"]
 http-client = ["dep:ureq"]
-multipart   = ["dep:multer", "dep:tokio", "dep:bytes", "dep:futures-util"]
-flash       = ["dep:hmac", "dep:sha2"]
-csrf        = ["dep:rand"]
+# These forward to m6-core, which owns Request/Response as of Phase 5. The
+# local deps that remain are the ones app.rs still uses directly.
+multipart   = ["m6-core/multipart"]
+flash       = ["m6-core/flash", "dep:hmac", "dep:sha2"]
+csrf        = ["m6-core/csrf", "dep:rand"]
 
 [dependencies]
 tera       = "1"
@@ -36,10 +38,6 @@ libc       = "0.2"
 
 lettre        = { version = "0.11", optional = true, features = ["smtp-transport", "native-tls"] }
 ureq          = { version = "2",    optional = true, features = ["json"] }
-multer        = { version = "3",    optional = true }
-tokio         = { version = "1",    optional = true, features = ["rt", "macros"] }
-bytes         = { version = "1",    optional = true }
-futures-util  = { version = "0.3",  optional = true }
 hmac          = { version = "0.12", optional = true }
 sha2          = { version = "0.10", optional = true }
 rand          = { version = "0.8",  optional = true }
