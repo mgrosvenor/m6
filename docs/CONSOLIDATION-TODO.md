@@ -98,6 +98,12 @@ is small, that is worth knowing.
 - [ ] **A log-target histogram on `/perf`.** Would remove Part A of the hourly
   health check outright, which is the last thing in it that needs ssh apart
   from ufw counts.
-- [ ] **`redirect_lifecycle::sigterm_shuts_down_rather_than_being_ignored`**
-  failed once in a loaded full-suite run and would not reproduce in 21 further
-  runs. Cause unknown. It guards a bug that shipped.
+- [ ] **Two flaky tests, same shape.** Both spawn external processes and both
+  have failed exactly once inside a loaded full-workspace run:
+  `redirect_lifecycle::sigterm_shuts_down_rather_than_being_ignored` and
+  m6-auth-cli's `test_token_create_prints_jwt`. Neither reproduces in
+  isolation, and in both cases the assertion text was lost. Capture the full
+  output of the next failing full-suite run before re-running anything.
+- [ ] **Retire `tools/health-check.py`.** `m6-monitor --check` replaces every
+  part of it except ufw counts, which are the firewall's data rather than
+  m6's. It goes once the nodes run a binary carrying `/traffic`.

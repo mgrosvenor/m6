@@ -244,11 +244,24 @@ renderers switched to m6-core.
 - **24h hit rates**: syd ~0.58, lon ~0.16-0.19, chi ~0.19-0.21. Stable across
   the day. The earlier reconciliation that looked wrong was my own error:
   origin never sees what a cache node answers from its own cache.
-- **`redirect_lifecycle::sigterm_shuts_down_rather_than_being_ignored` is
-  flaky.** Failed once in a loaded full-suite run, would not reproduce in 21
-  further runs, and I never captured the assertion text. Ruled out: the obvious
-  startup race, because `redirect::run` installs `ShutdownHandle` *before*
-  `bind_plain`. It guards a bug that shipped.
+- **Two tests are flaky, and they share a shape.** Both spawn external
+  processes, both have failed exactly once inside a loaded full-workspace run,
+  and neither reproduces in isolation. In both cases the assertion text was
+  lost, which is the thing to fix first next time: capture the full output of
+  a failing full-suite run before re-running anything.
+
+  - `redirect_lifecycle::sigterm_shuts_down_rather_than_being_ignored`. Did
+    not reproduce in 21 further runs. Ruled out: the obvious startup race,
+    because `redirect::run` installs `ShutdownHandle` *before* `bind_plain`.
+    It guards a bug that shipped.
+  - `m6-auth-cli` `test_token_create_prints_jwt`. Did not reproduce in three
+    isolated runs or a subsequent full gate. It shells out to `openssl` three
+    times per `setup_keys`, and several tests in that file do the same, so
+    process spawning under load is the first place to look.
+
+  Neither is understood. A test that fails only when the machine is busy is
+  either a real race or a test that is too tight, and both are worth knowing
+  which.
 - **A coordinated probe hit chi** at 05:47-05:50 UTC: `34.91.241.0` (GCP), 890
   requests in under three minutes rotating 526 user agents, targeting SSRF
   (`/fetch`, `/proxy`), cloud credentials (`.aws`, `.azure`, gcloud ADC) and
