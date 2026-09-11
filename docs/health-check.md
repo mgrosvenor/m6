@@ -1,5 +1,28 @@
 # Hourly health check: the standing order
 
+## Run it
+
+```sh
+tools/health-check.py                 # observed only, generates no traffic
+tools/health-check.py --load          # also read a loaded window, labelled GENERATED
+tools/health-check.py --minutes 120   # widen the security and crawler window
+tools/health-check.py --json          # machine-readable, for trend tracking
+```
+
+One ssh per node, run in parallel, aggregating on the box so a 46MB analytics
+file does not cross the network every hour. Read-only: `journalctl`,
+`systemctl show`, `df`, `stat` and a loopback `curl`, and nothing else. Exit
+status is 1 if there are faults.
+
+**The rest of this file is why, not how.** It was written when the check was a
+list of commands to paste, and every trap it describes is now encoded in the
+script: the per-role analytics path, the nested `fields.user_agent` record
+shape, the 10-second window, observed versus generated, and the user-agent
+forgery check. Read it when the script surprises you, or before changing it.
+Doing the check by hand instead is how the traps come back.
+
+---
+
 mgrosvenor.com runs on **three nodes, not one**. Every part of this check runs
 on all three unless it says otherwise, and the report carries a row per node.
 
