@@ -153,7 +153,18 @@ Services: `m6-http` (edge/proxy), `m6-file`, `m6-html`, `m6-auth-server`,
    read as current state). What remains is *inside* the code: seventeen of the
    thirty modules still have no module-level doc comment, listed in
    `CONSOLIDATION-TODO.md`.
-2. **Finish header to dict.** `FrameworkState::build_dict` is private and is
+2. **One app shape.** Owner's standing requirement, with "no performance
+   regression" attached to it. **`docs/m6-app-shape-plan.md`** is the plan:
+   five core enhancements, why m6-http is excluded structurally rather than by
+   assertion, what each enhancement transfers to which apps, and the sequence.
+   Two of the five fix live defects in services that are already the right
+   shape, so they stand alone: **`App` sets no read timeout** (five services
+   exposed, and migrating the two stragglers as-is would delete the fleet's
+   only two), and **`send_with_length` has zero callers** (m6-file's HEAD does
+   a full read, minify and brotli-6, then discards the body).
+   The first step is **benchmarking Phases 5 and 6**, which is owed anyway:
+   without that baseline nothing below can claim it did not regress.
+2b. **Finish header to dict.** `FrameworkState::build_dict` is private and is
    where the real knowledge lives: twelve ordered steps, and the ordering is
    load-bearing (built-ins go in *after* params files so a params file cannot
    override them). The dict-to-header half landed in `3e7a7d8`.

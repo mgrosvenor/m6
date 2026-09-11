@@ -126,8 +126,37 @@ Verified by commit, gate green at each step unless noted.
 
 The owner's standing requirement: **every app has the same general structure,
 and that structure is documented well enough to pick up from outside the m6
-repo.** `docs/m6-app-anatomy.md` is the document. Two services still do not
-match it, and in both cases the divergence is historical rather than designed.
+repo**, with **no performance regression**. `docs/m6-app-anatomy.md` is the
+shape; **`docs/m6-app-shape-plan.md` is the gap and the order**, including why
+m6-http is excluded on structural grounds rather than by assertion, what each
+enhancement transfers to which apps, and how each one avoids the hot path.
+
+Core is missing five things. Two are live defects in services that are already
+the right shape, so they are worth doing whether or not anything is migrated:
+
+- [ ] **No read timeout on accepted connections.** Neither `App` nor
+      `m6_core::server` sets one. `m6-file` and `m6-auth-server` each set 30s
+      in their own mains; `m6-html`, `m6-monitor` and the three renderers have
+      none. A peer that connects and sends nothing parks a worker in
+      `parse_request`'s blocking `read()`, and the pools are two workers.
+      **Migrating the two stragglers onto `App` as it stands would delete the
+      only two read timeouts in the fleet.**
+- [ ] **`send_with_length` has zero callers.** It exists for "a HEAD answered
+      without reading the file" and nothing calls it, so m6-file's HEAD path
+      does a full `fs::read` + minify + brotli-6 and then discards the body at
+      `h1.rs:700`. `HEAD /assets/vditor/dist/js/lute/lute.min.js` is 3.6MB of
+      work to return a header. `Response` cannot express it either.
+- [ ] **No wildcard route segment.** `Segment` is `Literal|Param` and
+      `match_route` requires exact segment-count equality, so `App` cannot
+      express a static file server. This is the whole of m6-file's reason to be
+      a different shape.
+- [ ] **No streaming response body.** `Responder`'s three senders all take
+      `&[u8]` and `Response.body` is a `Vec<u8>`, so core cannot serve a body it
+      has not fully materialised. m6-file is not choosing to buffer.
+- [ ] **No socket-permissions config key.** `m6-auth-server` sets `0666` by
+      hand.
+
+Then, and only then, the two migrations below.
 
 - [ ] **`m6-file` should be an `App` service.** Its own `poll(2)` accept loop is
       **22 of 33 lines byte-identical** to `App`'s at `app.rs:1759`; the
