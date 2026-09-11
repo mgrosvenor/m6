@@ -175,10 +175,27 @@ out["stats_24h"] = {
 # The most recent windows, so a loaded one can be picked out after --load.
 out["recent_windows"] = windows("90 seconds ago")
 
-lb = sh("curl -sk -o /dev/null -w 'ttfb=%{time_starttransfer} tls=%{time_appconnect}' "
-        "-H 'Host: mgrosvenor.com' https://127.0.0.1/capabilities")
-mm = re.search(r"ttfb=([\d.]+) tls=([\d.]+)", lb)
-out["loopback"] = {"ttfb": float(mm.group(1)), "tls": float(mm.group(2))} if mm else None
+# Five samples, median reported. One sample is not a measurement: on
+# 2026-09-11 a single loopback read landed at 6.58ms against a ~4.3ms
+# baseline and read as a 50% regression, while seven consecutive samples
+# taken a minute later ran 4.38-4.68ms. The outlier coincided with the
+# check's own generated load. Same lesson as BENCHMARKS.md: report the
+# median and the spread, so noise looks like noise.
+lb = sh("for i in $(seq 1 5); do curl -sk -o /dev/null "
+        "-w 'ttfb=%{time_starttransfer} tls=%{time_appconnect}\n' "
+        "-H 'Host: mgrosvenor.com' https://127.0.0.1/capabilities; done")
+samples = [(float(a), float(b))
+           for a, b in re.findall(r"ttfb=([\d.]+) tls=([\d.]+)", lb)]
+if samples:
+    ttfbs = sorted(s for s, _ in samples)
+    tlss = sorted(t for _, t in samples)
+    mid = len(ttfbs) // 2
+    out["loopback"] = {
+        "ttfb": ttfbs[mid], "tls": tlss[mid],
+        "ttfb_min": ttfbs[0], "ttfb_max": ttfbs[-1], "n": len(ttfbs),
+    }
+else:
+    out["loopback"] = None
 
 # ── C. disk and logs ─────────────────────────────────────────────────────────
 df = sh("df -h / | tail -1").split()
@@ -495,9 +512,11 @@ def main():
         lb = r["loopback"]
         flag = "  SLOW" if lb["ttfb"] > TTFB_WARN_S else ""
         if flag:
-            warnings.append("%s: loopback TTFB %.1fms" % (node["name"], lb["ttfb"] * 1000))
-        print("  %-5s ttfb=%.2fms tls=%.2fms%s"
-              % (node["name"], lb["ttfb"] * 1000, lb["tls"] * 1000, flag))
+            warnings.append("%s: loopback TTFB median %.1fms" % (node["name"], lb["ttfb"] * 1000))
+        print("  %-5s ttfb=%.2fms tls=%.2fms   (median of %d, %.2f-%.2fms)%s"
+              % (node["name"], lb["ttfb"] * 1000, lb["tls"] * 1000,
+                 lb.get("n", 1), lb.get("ttfb_min", lb["ttfb"]) * 1000,
+                 lb.get("ttfb_max", lb["ttfb"]) * 1000, flag))
 
     print("\n  cache headers (origin)")
     for path, expect, got, ok in headers:
