@@ -96,6 +96,33 @@ impl Response {
         }
     }
 
+    /// An HTML body, already rendered.
+    ///
+    /// For a page a service built itself rather than one that came from a
+    /// template. `render` records a template name for the engine to fill in
+    /// later; this is the finished bytes.
+    pub fn html(s: impl Into<String>) -> Self {
+        Self {
+            status: 200,
+            headers: vec![("Content-Type".to_string(), "text/html; charset=utf-8".to_string())],
+            body: s.into().into_bytes(),
+            template_name: None,
+            template_dict: None,
+        }
+    }
+
+    /// Replace the body, keeping status and headers.
+    pub fn body(mut self, body: impl Into<Vec<u8>>) -> Self {
+        self.body = body.into();
+        self
+    }
+
+    /// Set the status, keeping everything else.
+    pub fn with_status(mut self, code: u16) -> Self {
+        self.status = code;
+        self
+    }
+
     pub fn text(s: &str) -> Self {
         Self {
             status: 200,

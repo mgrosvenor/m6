@@ -1888,6 +1888,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "m6-monitor"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "m6-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+ "tracing",
+ "ureq",
+]
+
+[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
