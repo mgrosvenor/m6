@@ -315,6 +315,7 @@ mod tests {
             disk: Some(Disk { total_bytes: 1000, available_bytes: 600 }),
             thermal: vec![],
             uptime_s: Some(694_521),
+            ..Default::default()
         };
         let d = build(&[reading("syd", "ok", Some(perf(host, vec![])))], &Thresholds::default(), now());
         assert_eq!(d.level, Level::Ok);

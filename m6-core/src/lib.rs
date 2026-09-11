@@ -4,6 +4,7 @@ pub mod conditional;
 pub mod config;
 pub mod cookie;
 pub mod error;
+pub mod firewall;
 pub mod h1;
 pub mod headers;
 pub mod host;

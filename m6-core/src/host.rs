@@ -239,6 +239,268 @@ pub fn parse_uptime(s: &str) -> Option<std::time::Duration> {
     Some(std::time::Duration::from_secs_f64(secs))
 }
 
+
+// ── Network interfaces ───────────────────────────────────────────────────────
+
+/// One interface's counters, from `/proc/net/dev`.
+///
+/// `rx_errs`, `rx_drop`, `tx_errs` and `tx_drop` are the reason this is here.
+/// Byte counters say how busy the box is, which is interesting; drops say the
+/// kernel threw traffic away, which is a cause. Latency that looks like a slow
+/// application is sometimes a NIC discarding packets, and that is invisible
+/// from inside the request path.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetDevice {
+    pub name: String,
+    pub rx_bytes: u64,
+    pub rx_packets: u64,
+    pub rx_errs: u64,
+    pub rx_drop: u64,
+    pub tx_bytes: u64,
+    pub tx_packets: u64,
+    pub tx_errs: u64,
+    pub tx_drop: u64,
+}
+
+impl NetDevice {
+    /// Anything the kernel refused to carry, in either direction.
+    pub fn discarded(&self) -> u64 {
+        self.rx_errs + self.rx_drop + self.tx_errs + self.tx_drop
+    }
+}
+
+/// Parse `/proc/net/dev`.
+///
+/// Loopback is skipped: it is always busy, never a fault, and reporting it
+/// next to a real interface invites reading its traffic as external.
+pub fn parse_net_dev(s: &str) -> Vec<NetDevice> {
+    let mut out = Vec::new();
+    for line in s.lines().skip(2) {
+        let Some((name, rest)) = line.split_once(':') else { continue };
+        let name = name.trim();
+        if name == "lo" {
+            continue;
+        }
+        let f: Vec<u64> = rest.split_whitespace().filter_map(|v| v.parse().ok()).collect();
+        if f.len() < 16 {
+            continue;
+        }
+        out.push(NetDevice {
+            name: name.to_string(),
+            rx_bytes: f[0], rx_packets: f[1], rx_errs: f[2], rx_drop: f[3],
+            tx_bytes: f[8], tx_packets: f[9], tx_errs: f[10], tx_drop: f[11],
+        });
+    }
+    out
+}
+
+// ── Disk throughput ──────────────────────────────────────────────────────────
+
+/// One block device's I/O counters, from `/proc/diskstats`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiskIo {
+    pub name: String,
+    pub read_bytes: u64,
+    pub written_bytes: u64,
+    pub reads: u64,
+    pub writes: u64,
+    /// Milliseconds with at least one I/O in flight. The saturation signal:
+    /// against wall-clock time it is a utilisation percentage, and a device
+    /// pinned near 100% is a device that is the bottleneck.
+    pub io_ms: u64,
+    pub in_flight: u64,
+}
+
+/// `/proc/diskstats` counts in 512-byte sectors regardless of the device's
+/// actual block size. This is a kernel ABI constant, not a property of the
+/// disk, and treating it as the latter gives numbers wrong by a factor of 8
+/// on a 4K-sector device.
+const SECTOR_BYTES: u64 = 512;
+
+/// Parse `/proc/diskstats`, keeping whole devices.
+///
+/// Partitions (`vda1`) are skipped: their counters are a subset of their
+/// parent's, so including both double-counts every byte.
+pub fn parse_diskstats(s: &str) -> Vec<DiskIo> {
+    let mut out = Vec::new();
+    for line in s.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 14 {
+            continue;
+        }
+        let name = f[2];
+        // Whole devices only. A trailing digit on a vd*/sd*/nvme partition
+        // means a slice of a device already counted.
+        let is_partition = name
+            .chars()
+            .last()
+            .map(|c| c.is_ascii_digit())
+            .unwrap_or(false)
+            && !name.starts_with("nvme");
+        if is_partition || name.starts_with("loop") || name.starts_with("ram") {
+            continue;
+        }
+        let n = |i: usize| f.get(i).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+        out.push(DiskIo {
+            name: name.to_string(),
+            reads: n(3),
+            read_bytes: n(5) * SECTOR_BYTES,
+            writes: n(7),
+            written_bytes: n(9) * SECTOR_BYTES,
+            in_flight: n(11),
+            io_ms: n(12),
+        });
+    }
+    out
+}
+
+// ── Pressure stall information ───────────────────────────────────────────────
+
+/// One PSI resource: the share of time work was stalled waiting for it.
+///
+/// More honest than load average, and the reason both are here. Load counts
+/// runnable tasks and says nothing about why; PSI says "work was blocked for
+/// this fraction of the last ten seconds, on this resource". `full` is time
+/// when *everything* was stalled, which on a single-purpose box is the number
+/// that matters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct Pressure {
+    pub some_avg10: f32,
+    pub some_avg60: f32,
+    pub full_avg10: f32,
+    pub full_avg60: f32,
+}
+
+/// Parse one `/proc/pressure/*` file.
+pub fn parse_pressure(s: &str) -> Option<Pressure> {
+    let mut p = Pressure::default();
+    let mut seen = false;
+    for line in s.lines() {
+        let full = line.starts_with("full");
+        if !full && !line.starts_with("some") {
+            continue;
+        }
+        seen = true;
+        for tok in line.split_whitespace() {
+            let Some((k, v)) = tok.split_once('=') else { continue };
+            let Ok(v) = v.parse::<f32>() else { continue };
+            match (full, k) {
+                (false, "avg10") => p.some_avg10 = v,
+                (false, "avg60") => p.some_avg60 = v,
+                (true, "avg10") => p.full_avg10 = v,
+                (true, "avg60") => p.full_avg60 = v,
+                _ => {}
+            }
+        }
+    }
+    seen.then_some(p)
+}
+
+// ── TCP health ───────────────────────────────────────────────────────────────
+
+/// Kernel-side connection health, from `/proc/net/netstat` and
+/// `/proc/net/sockstat`.
+///
+/// `listen_overflows` is the one to read first. It counts connections dropped
+/// because the accept queue was full, which is backpressure the application
+/// never sees: those clients got nothing, and m6's own 503 path does not know
+/// they existed. A server can look completely healthy in its own logs while
+/// this climbs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TcpHealth {
+    pub listen_overflows: u64,
+    pub listen_drops: u64,
+    pub syn_retrans: u64,
+    pub sockets_used: u64,
+    pub tcp_inuse: u64,
+    pub tcp_time_wait: u64,
+    pub tcp_orphan: u64,
+}
+
+/// Parse `/proc/net/netstat`, which alternates a header line of names and a
+/// line of values under the same prefix.
+pub fn parse_netstat(s: &str) -> TcpHealth {
+    let mut t = TcpHealth::default();
+    let lines: Vec<&str> = s.lines().collect();
+    for pair in lines.windows(2) {
+        let (names, values) = (pair[0], pair[1]);
+        let Some((np, nrest)) = names.split_once(':') else { continue };
+        let Some((vp, vrest)) = values.split_once(':') else { continue };
+        if np != vp {
+            continue;
+        }
+        for (k, v) in nrest.split_whitespace().zip(vrest.split_whitespace()) {
+            let Ok(v) = v.parse::<u64>() else { continue };
+            match k {
+                "ListenOverflows" => t.listen_overflows = v,
+                "ListenDrops" => t.listen_drops = v,
+                "TCPSynRetrans" => t.syn_retrans = v,
+                _ => {}
+            }
+        }
+    }
+    t
+}
+
+/// Merge `/proc/net/sockstat` counts into an existing [`TcpHealth`].
+pub fn parse_sockstat_into(s: &str, t: &mut TcpHealth) {
+    for line in s.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        let get = |key: &str| -> Option<u64> {
+            f.iter().position(|x| *x == key).and_then(|i| f.get(i + 1)).and_then(|v| v.parse().ok())
+        };
+        if line.starts_with("sockets:") {
+            t.sockets_used = get("used").unwrap_or(0);
+        } else if line.starts_with("TCP:") {
+            t.tcp_inuse = get("inuse").unwrap_or(0);
+            t.tcp_time_wait = get("tw").unwrap_or(0);
+            t.tcp_orphan = get("orphan").unwrap_or(0);
+        }
+    }
+}
+
+// ── File descriptors ─────────────────────────────────────────────────────────
+
+/// This process's open file descriptors against its own limit.
+///
+/// A server that runs out of descriptors stops accepting connections and the
+/// reason is not obvious from anywhere else: the failure is `EMFILE` deep in
+/// an accept loop, and what the operator sees is a site that stopped
+/// answering. Reporting the headroom makes it a number that can be watched
+/// instead of an outage to be diagnosed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileDescriptors {
+    pub open: u64,
+    pub soft_limit: u64,
+    pub hard_limit: u64,
+}
+
+impl FileDescriptors {
+    pub fn used_fraction(&self) -> f64 {
+        if self.soft_limit == 0 {
+            return 0.0;
+        }
+        self.open as f64 / self.soft_limit as f64
+    }
+}
+
+/// Parse the `Max open files` row of `/proc/self/limits`.
+pub fn parse_fd_limits(s: &str) -> Option<(u64, u64)> {
+    for line in s.lines() {
+        if !line.starts_with("Max open files") {
+            continue;
+        }
+        let rest = line.trim_start_matches("Max open files").trim();
+        let f: Vec<&str> = rest.split_whitespace().collect();
+        let parse = |v: &str| -> u64 {
+            if v == "unlimited" { u64::MAX } else { v.parse().unwrap_or(0) }
+        };
+        return Some((parse(f.first().copied().unwrap_or("0")),
+                     parse(f.get(1).copied().unwrap_or("0"))));
+    }
+    None
+}
+
 // ── Readers ──────────────────────────────────────────────────────────────────
 
 /// A snapshot of the host, with every field optional because every field can
@@ -256,6 +518,23 @@ pub struct HostSnapshot {
     pub disk: Option<Disk>,
     pub thermal: Vec<ThermalZone>,
     pub uptime_s: Option<u64>,
+    /// Interface counters. Empty off Linux.
+    #[serde(default)]
+    pub net: Vec<NetDevice>,
+    /// Block device throughput. Empty off Linux.
+    #[serde(default)]
+    pub disks: Vec<DiskIo>,
+    /// Pressure stall, per resource. Absent on kernels without PSI.
+    #[serde(default)]
+    pub cpu_pressure: Option<Pressure>,
+    #[serde(default)]
+    pub io_pressure: Option<Pressure>,
+    #[serde(default)]
+    pub memory_pressure: Option<Pressure>,
+    #[serde(default)]
+    pub tcp: Option<TcpHealth>,
+    #[serde(default)]
+    pub fds: Option<FileDescriptors>,
 }
 
 /// Read everything available about the host.
@@ -270,8 +549,61 @@ pub fn snapshot(disk_path: &Path) -> HostSnapshot {
         disk: disk(disk_path),
         thermal: thermal_zones(),
         uptime_s: uptime().map(|d| d.as_secs()),
+        net: net_devices(),
+        disks: disk_io(),
+        cpu_pressure: pressure("cpu"),
+        io_pressure: pressure("io"),
+        memory_pressure: pressure("memory"),
+        tcp: tcp_health(),
+        fds: file_descriptors(),
     }
 }
+
+#[cfg(target_os = "linux")]
+pub fn net_devices() -> Vec<NetDevice> {
+    std::fs::read_to_string("/proc/net/dev").map(|s| parse_net_dev(&s)).unwrap_or_default()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn net_devices() -> Vec<NetDevice> { Vec::new() }
+
+#[cfg(target_os = "linux")]
+pub fn disk_io() -> Vec<DiskIo> {
+    std::fs::read_to_string("/proc/diskstats").map(|s| parse_diskstats(&s)).unwrap_or_default()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn disk_io() -> Vec<DiskIo> { Vec::new() }
+
+#[cfg(target_os = "linux")]
+pub fn pressure(resource: &str) -> Option<Pressure> {
+    parse_pressure(&std::fs::read_to_string(format!("/proc/pressure/{resource}")).ok()?)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn pressure(_resource: &str) -> Option<Pressure> { None }
+
+#[cfg(target_os = "linux")]
+pub fn tcp_health() -> Option<TcpHealth> {
+    let mut t = parse_netstat(&std::fs::read_to_string("/proc/net/netstat").ok()?);
+    if let Ok(s) = std::fs::read_to_string("/proc/net/sockstat") {
+        parse_sockstat_into(&s, &mut t);
+    }
+    Some(t)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn tcp_health() -> Option<TcpHealth> { None }
+
+#[cfg(target_os = "linux")]
+pub fn file_descriptors() -> Option<FileDescriptors> {
+    let open = std::fs::read_dir("/proc/self/fd").ok()?.count() as u64;
+    let (soft, hard) = parse_fd_limits(&std::fs::read_to_string("/proc/self/limits").ok()?)?;
+    Some(FileDescriptors { open, soft_limit: soft, hard_limit: hard })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn file_descriptors() -> Option<FileDescriptors> { None }
 
 #[cfg(target_os = "linux")]
 pub fn load_average() -> Option<LoadAverage> {
@@ -478,5 +810,147 @@ mod tests {
         // load/memory/thermal/uptime are all legitimately None off Linux.
         let json = serde_json::to_string(&s).unwrap();
         assert!(json.contains("\"cpus\""));
+    }
+}
+
+#[cfg(test)]
+mod system_tests {
+    use super::*;
+
+    /// Real rows from syd, 2026-09-11.
+    #[test]
+    fn parses_real_net_dev_and_skips_loopback() {
+        let s = "Inter-|   Receive                                                |  Transmit\n\
+                 face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n\
+    lo: 10911902   11248    0    0    0     0          0         0 10911902   11248    0    0    0     0       0          0\n\
+enp1s0: 2929071615 3102200    0    0    0     0          0         0 3105995619 2471836    0    0    0     0       0          0\n";
+        let d = parse_net_dev(s);
+        assert_eq!(d.len(), 1, "loopback is always busy and never a fault");
+        assert_eq!(d[0].name, "enp1s0");
+        assert_eq!(d[0].rx_bytes, 2_929_071_615);
+        assert_eq!(d[0].rx_packets, 3_102_200);
+        assert_eq!(d[0].tx_bytes, 3_105_995_619);
+        assert_eq!(d[0].discarded(), 0);
+    }
+
+    /// The counters that matter are the ones that are usually zero.
+    #[test]
+    fn drops_and_errors_are_picked_up_from_the_right_columns() {
+        let s = "h\nh\n eth0: 100 10 1 2 0 0 0 0 200 20 3 4 0 0 0 0\n";
+        let d = parse_net_dev(s);
+        assert_eq!((d[0].rx_errs, d[0].rx_drop), (1, 2));
+        assert_eq!((d[0].tx_errs, d[0].tx_drop), (3, 4));
+        assert_eq!(d[0].discarded(), 10);
+    }
+
+    /// A real `vda` row. Sectors are 512 bytes by kernel ABI whatever the
+    /// device's real block size, so a 4K-sector disk read as 4096 would be
+    /// reported eight times too large.
+    #[test]
+    fn parses_real_diskstats_in_512_byte_sectors() {
+        let s = " 253       0 vda 29480462 17908798 1806624911 7728100 8813910 37472146 512578074 14928994 0 3407769 22701203 92366 0 3092727720 20811 292631 23296\n";
+        let d = parse_diskstats(s);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].name, "vda");
+        assert_eq!(d[0].reads, 29_480_462);
+        assert_eq!(d[0].read_bytes, 1_806_624_911 * 512);
+        assert_eq!(d[0].written_bytes, 512_578_074 * 512);
+        assert_eq!(d[0].io_ms, 3_407_769);
+        assert_eq!(d[0].in_flight, 0);
+    }
+
+    /// Partition counters are a subset of their parent's. Counting both
+    /// double-counts every byte the device ever moved.
+    #[test]
+    fn partitions_and_pseudo_devices_are_skipped() {
+        let s = " 253 0 vda 1 0 100 0 1 0 200 0 0 5 0 0 0 0 0 0 0\n\
+                  253 1 vda1 1 0 100 0 1 0 200 0 0 5 0 0 0 0 0 0 0\n\
+                  7 0 loop0 1 0 8 0 0 0 0 0 0 1 0 0 0 0 0 0 0\n";
+        let d = parse_diskstats(s);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].name, "vda");
+    }
+
+    /// Real PSI output from syd.
+    #[test]
+    fn parses_real_pressure() {
+        let p = parse_pressure(
+            "some avg10=0.20 avg60=0.48 avg300=0.31 total=5618265699\n\
+             full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+        )
+        .unwrap();
+        assert!((p.some_avg10 - 0.20).abs() < 1e-6);
+        assert!((p.some_avg60 - 0.48).abs() < 1e-6);
+        assert_eq!(p.full_avg10, 0.0);
+        // A kernel without PSI has no file at all, which is None, not zero.
+        assert!(parse_pressure("").is_none());
+    }
+
+    /// `ListenOverflows` is backpressure the application never sees: those
+    /// clients were dropped before accept, so nothing in m6's own logs knows
+    /// they existed.
+    #[test]
+    fn parses_netstat_name_value_pairs() {
+        let s = "TcpExt: SyncookiesSent ListenOverflows ListenDrops TCPSynRetrans\n\
+                 TcpExt: 0 7 9 42\n\
+                 IpExt: InOctets OutOctets\n\
+                 IpExt: 100 200\n";
+        let t = parse_netstat(s);
+        assert_eq!(t.listen_overflows, 7);
+        assert_eq!(t.listen_drops, 9);
+        assert_eq!(t.syn_retrans, 42);
+    }
+
+    /// Mismatched header and value prefixes must not be zipped together, or
+    /// every number is attributed to the wrong name.
+    #[test]
+    fn netstat_does_not_zip_across_different_sections() {
+        let s = "TcpExt: ListenOverflows\nIpExt: 999\n";
+        assert_eq!(parse_netstat(s).listen_overflows, 0);
+    }
+
+    #[test]
+    fn parses_real_sockstat() {
+        let mut t = TcpHealth::default();
+        parse_sockstat_into(
+            "sockets: used 229\nTCP: inuse 9 orphan 0 tw 0 alloc 10 mem 16\nUDP: inuse 5 mem 0\n",
+            &mut t,
+        );
+        assert_eq!(t.sockets_used, 229);
+        assert_eq!(t.tcp_inuse, 9);
+        assert_eq!(t.tcp_time_wait, 0);
+    }
+
+    /// The real limits row from m6-http on syd: a 1024 soft limit against a
+    /// 524288 hard one. The soft limit is what `accept` fails against.
+    #[test]
+    fn parses_fd_limits_and_keeps_soft_and_hard_apart() {
+        let s = "Limit                     Soft Limit           Hard Limit           Units\n\
+                 Max open files            1024                 524288               files\n";
+        let (soft, hard) = parse_fd_limits(s).unwrap();
+        assert_eq!(soft, 1024);
+        assert_eq!(hard, 524288);
+
+        let f = FileDescriptors { open: 512, soft_limit: soft, hard_limit: hard };
+        assert!((f.used_fraction() - 0.5).abs() < 1e-9, "headroom is against the SOFT limit");
+    }
+
+    #[test]
+    fn unlimited_fds_do_not_parse_as_zero() {
+        let s = "Max open files            unlimited            unlimited            files\n";
+        let (soft, _) = parse_fd_limits(s).unwrap();
+        assert_eq!(soft, u64::MAX);
+        assert_eq!(parse_fd_limits("Max locked memory 8388608 8388608 bytes\n"), None);
+    }
+
+    /// Everything is optional and a snapshot on a machine missing any of it
+    /// is an ordinary snapshot, not a failure.
+    #[test]
+    fn a_snapshot_serialises_with_whatever_it_could_read() {
+        let s = snapshot(Path::new("/"));
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"cpus\""));
+        assert!(json.contains("\"net\""));
+        assert!(json.contains("\"disks\""));
     }
 }
