@@ -226,7 +226,12 @@ fn handle_connection(
     mut stream: std::os::unix::net::UnixStream,
     state: &Arc<handlers::AppState>,
 ) -> Result<()> {
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
+    m6_core::server::apply_read_timeout(
+        &stream,
+        Some(std::time::Duration::from_secs(
+            m6_core::server::DEFAULT_READ_TIMEOUT_SECS,
+        )),
+    );
 
     // The loop, the malformed-request answer, the HEAD rule and the keep-alive
     // decision are core's. This file had its own of each -- including a
