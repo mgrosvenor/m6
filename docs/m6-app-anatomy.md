@@ -276,10 +276,17 @@ said they were until it was measured:
   only capability it needs that `App` does not offer is `chmod 0666` on the
   socket, which is a config key rather than an architecture.
 
-Closing both is owed work, tracked in `CONSOLIDATION-TODO.md`. Until then, note
-that the divergence is historical: neither is a divergent *implementation*,
-both assemble the same m6-core parts in a different order, so the risk is
-drift rather than disagreement today.
+Closing both is owed work. **`m6-app-shape-plan.md` is what it takes**: five
+core enhancements, two of which fix live defects in services that are already
+the right shape, and a sequence that keeps the hot path untouched. Until then,
+note that the divergence is historical: neither is a divergent
+*implementation*, both assemble the same m6-core parts in a different order, so
+the risk is drift rather than disagreement today.
+
+One thing that plan establishes and this document should not understate:
+**migrating those two onto `App` as it stands today would delete the only two
+read timeouts in the fleet.** They each set 30 seconds by hand; `App` sets
+none. One shape has to mean the shape absorbs what they knew.
 
 `m6-md` and `m6-auth-cli` are CLI tools, not services, and are outside this
 document.
