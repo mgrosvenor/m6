@@ -1905,6 +1905,34 @@ fn handle_request_inner(
         );
     }
 
+    // ── Traffic summary, the third monitoring path ──────────────────────────
+    // Its own path for the same reason /perf is not /health: this one reads
+    // the tail of the analytics log, so its cost is a property of the path
+    // rather than of a header on a cheaper one. Cached, so a polling monitor
+    // cannot make the node re-read the log on every scrape.
+    if state.config.health.enabled && req.path == state.config.health.traffic_path {
+        let outcome = health::traffic(
+            &state.config.node.name,
+            &state.config.analytics.log_path,
+            60,
+            std::time::Duration::from_secs(state.config.health.traffic_cache_s),
+            &req.headers,
+            state.config.health.metrics_token.as_deref(),
+        );
+        let (code, headers, body) = outcome.into_response();
+        analytics::log_monitor(
+            state.config.analytics.enabled, &req.headers, &state.config.node.name,
+            &req.path, code, client_ip, None,
+        );
+        return RequestOutcome::Ready(
+            code,
+            headers,
+            body,
+            health::PERF_BACKEND.to_string(),
+            std::sync::Arc::new(vec![]),
+        );
+    }
+
     // The custom-error render route takes `status`/`from` (and optional
     // `route`/`backend`/`detail`) straight from its query string and renders
     // them into the page — safe when `dispatch_custom_error_async`/

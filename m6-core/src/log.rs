@@ -18,6 +18,91 @@ type BoxedFilter = Box<dyn Filter<Registry> + Send + Sync + 'static>;
 /// operational logging.
 const ANALYTICS_TARGET: &str = "analytics";
 
+// ── Is logging alive ─────────────────────────────────────────────────────────
+
+/// A heartbeat for the main log layer.
+///
+/// A config reload can silence every target except `analytics`, found
+/// 2026-09-06 and still live. When it happens the process keeps serving, the
+/// analytics file keeps growing, and the operational log goes quiet: stats,
+/// pool events, warnings and errors all stop. Nothing about the process looks
+/// wrong, and a performance check then reads the silence as idle traffic.
+///
+/// Detecting it used to mean sshing to each node and counting log targets out
+/// of `journalctl`. It does not have to: the process knows what it emitted.
+/// This counts events **after** the reload-able filter, because the whole
+/// point is to observe what the filter is letting through rather than what the
+/// code tried to log.
+///
+/// Two atomics and no lock. It is incremented once per emitted event, on a
+/// path that is already formatting and writing a log line, and `analytics` is
+/// excluded from the main layer so per-request traffic does not reach it.
+pub struct LogPulse {
+    events: std::sync::atomic::AtomicU64,
+    /// Milliseconds since process start, at the last emitted event.
+    last_ms: std::sync::atomic::AtomicU64,
+}
+
+impl LogPulse {
+    const fn new() -> Self {
+        Self {
+            events: std::sync::atomic::AtomicU64::new(0),
+            last_ms: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn record(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.events.fetch_add(1, Relaxed);
+        self.last_ms.store(elapsed_ms(), Relaxed);
+    }
+
+    /// Events the main layer has emitted since start.
+    pub fn events(&self) -> u64 {
+        self.events.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Seconds since the last emitted event, or `None` if none ever was.
+    ///
+    /// A healthy m6-http emits `periodic stats` every ten seconds, so anything
+    /// past about thirty on a running process means the main layer has gone
+    /// quiet. That is the check, and it needs no log reader.
+    pub fn seconds_since_last(&self) -> Option<u64> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.events.load(Relaxed) == 0 {
+            return None;
+        }
+        Some((elapsed_ms().saturating_sub(self.last_ms.load(Relaxed))) / 1000)
+    }
+}
+
+static PULSE: LogPulse = LogPulse::new();
+
+fn process_start() -> std::time::Instant {
+    use std::sync::OnceLock;
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    *START.get_or_init(std::time::Instant::now)
+}
+
+fn elapsed_ms() -> u64 {
+    process_start().elapsed().as_millis() as u64
+}
+
+/// The process-wide log heartbeat.
+pub fn pulse() -> &'static LogPulse {
+    &PULSE
+}
+
+/// A layer that does nothing but count. Composed with the format layer
+/// *inside* the reload-able filter, so both see the same events.
+struct PulseLayer;
+
+impl<S: tracing::Subscriber> Layer<S> for PulseLayer {
+    fn on_event(&self, _event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+        PULSE.record();
+    }
+}
+
 /// Handle returned by [`init`] that allows runtime log level reloads.
 ///
 /// Keep the handle alive for the lifetime of the process. Dropping it flushes
@@ -105,15 +190,25 @@ fn make_main_layer(
     writer: NonBlocking,
     filter: reload::Layer<BoxedFilter, Registry>,
 ) -> BoxedLayer {
+    // `and_then` puts the counter inside the same `Filtered` wrapper as the
+    // format layer, so it counts exactly what is emitted. A counter outside
+    // the filter would keep ticking while the log was silenced, which is the
+    // one thing it must not do.
     match format {
         "json" => Box::new(
             fmt::layer()
                 .json()
                 .with_writer(writer)
                 .with_current_span(true)
+                .and_then(PulseLayer)
                 .with_filter(filter),
         ),
-        _ => Box::new(fmt::layer().with_writer(writer).with_filter(filter)),
+        _ => Box::new(
+            fmt::layer()
+                .with_writer(writer)
+                .and_then(PulseLayer)
+                .with_filter(filter),
+        ),
     }
 }
 
@@ -162,6 +257,9 @@ pub fn init(format: &str, level: &str) -> Result<LogHandle> {
 /// redeploy (e.g. not inside a rendered/generated site tree) — the file is
 /// opened in append mode and grown across restarts.
 pub fn init_with_analytics(format: &str, level: &str, analytics_path: Option<&Path>) -> Result<LogHandle> {
+    // Anchor the clock before anything can log, so `seconds_since_last` is
+    // measured from process start rather than from the first call.
+    let _ = process_start();
     let lvl = parse_level(level);
     let (writer, guard) = tracing_appender::non_blocking(std::io::stdout());
 
@@ -249,5 +347,31 @@ mod tests {
     fn test_parse_level_unknown_defaults_info() {
         assert_eq!(parse_level(""), Level::INFO);
         assert_eq!(parse_level("verbose"), Level::INFO);
+    }
+}
+
+#[cfg(test)]
+mod pulse_tests {
+    use super::*;
+
+    /// The counter must not tick before anything is logged, and
+    /// `seconds_since_last` must say "never" rather than "zero seconds ago".
+    ///
+    /// Zero would read as perfectly healthy on a process that has never
+    /// emitted a line, which is exactly the state this exists to catch.
+    #[test]
+    fn never_logged_is_not_logged_recently() {
+        let p = LogPulse::new();
+        assert_eq!(p.events(), 0);
+        assert_eq!(p.seconds_since_last(), None);
+    }
+
+    #[test]
+    fn recording_advances_the_count_and_starts_the_clock() {
+        let p = LogPulse::new();
+        p.record();
+        p.record();
+        assert_eq!(p.events(), 2);
+        assert_eq!(p.seconds_since_last(), Some(0));
     }
 }

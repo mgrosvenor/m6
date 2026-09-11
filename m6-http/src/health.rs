@@ -58,6 +58,8 @@ mod token_file_tests {
             enabled: true,
             path: "/health".to_string(),
             perf_path: "/perf".to_string(),
+            traffic_path: "/traffic".to_string(),
+            traffic_cache_s: 60,
             metrics_token_file: Some("/etc/m6/perf-token".to_string()),
             metrics_token: Some("super-secret-value".to_string()),
         };
@@ -116,5 +118,178 @@ mod monitoring_exclusion_tests {
                 "{backend} is real traffic and must be counted"
             );
         }
+    }
+}
+
+// ── /traffic ─────────────────────────────────────────────────────────────────
+
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+use m6_core::monitoring::TrafficReport;
+
+/// Last summary and when it was built.
+///
+/// One node, one cache. Behind a Mutex because building a summary reads a file
+/// and there is no reason to let two scrapes do it at once; the lock is held
+/// across the read deliberately, so a second caller waits for the first
+/// answer rather than starting a second 47MB tail.
+static CACHE: Mutex<Option<(Instant, TrafficReport)>> = Mutex::new(None);
+
+/// Read the last `window_minutes` of the analytics log and summarise it.
+///
+/// The tail is bounded rather than reading the whole file: an hour of traffic
+/// is at most a few hundred KB and the file is tens of MB, so reading it all
+/// would be almost entirely wasted work. 24MB is a wide margin over the
+/// busiest hour observed (370KB, during a 890-request probe).
+fn build_report(node: &str, path: &str, window_minutes: u64) -> anyhow::Result<TrafficReport> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    const TAIL_BYTES: u64 = 24 * 1024 * 1024;
+
+    let mut f = std::fs::File::open(path)?;
+    let len = f.metadata()?.len();
+    if len > TAIL_BYTES {
+        f.seek(SeekFrom::Start(len - TAIL_BYTES))?;
+    }
+    let mut buf = String::new();
+    f.read_to_string(&mut buf)?;
+    // A mid-record start is expected after a seek, and `ndjson::read_str`
+    // skips what it cannot parse, so the partial first line costs nothing.
+
+    let since = m6_core::util::iso8601_minutes_ago(window_minutes);
+    Ok(TrafficReport::build(node, &buf, &since, window_minutes))
+}
+
+/// Serve `/traffic`: this node's summary of its own traffic.
+///
+/// Same token as `/perf`, and the same order of operations: authorise first,
+/// then work. An anonymous caller never causes a file read.
+///
+/// The cache is what makes a file read safe to expose at all. Without it a
+/// monitor polling every thirty seconds makes every node re-read its analytics
+/// tail every thirty seconds, forever, to produce an answer that changes
+/// slowly. With it the read happens at most once per TTL however often the
+/// endpoint is scraped. The lock is held across the read deliberately: a
+/// second caller arriving mid-read waits for the first answer rather than
+/// starting a second tail.
+pub fn traffic(
+    node: &str,
+    log_path: &str,
+    window_minutes: u64,
+    cache_for: Duration,
+    headers: &[(String, String)],
+    configured_token: Option<&str>,
+) -> PerfOutcome {
+    match configured_token.filter(|t| !t.is_empty()) {
+        None => return PerfOutcome::Disabled,
+        Some(_) if !metrics_authorised(headers, configured_token) => {
+            return PerfOutcome::Unauthorised
+        }
+        Some(_) => {}
+    }
+
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((built, report)) = cache.as_ref() {
+        if built.elapsed() < cache_for {
+            return PerfOutcome::Traffic(report.clone());
+        }
+    }
+    match build_report(node, log_path, window_minutes) {
+        Ok(r) => {
+            *cache = Some((Instant::now(), r.clone()));
+            PerfOutcome::Traffic(r)
+        }
+        Err(e) => PerfOutcome::TrafficError(format!("{e}")),
+    }
+}
+
+#[cfg(test)]
+mod traffic_endpoint_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn row(ts: &str, ip: &str, path: &str, status: u16, ua: &str) -> String {
+        format!(
+            r#"{{"timestamp":"{ts}","level":"INFO","fields":{{"message":"request","node":"sydney","path":"{path}","status":{status},"client_ip":"{ip}","user_agent":"{ua}"}}}}"#
+        )
+    }
+
+    fn auth(v: &str) -> Vec<(String, String)> {
+        vec![("Authorization".to_string(), v.to_string())]
+    }
+
+    /// Authorisation happens before any file is opened. An anonymous caller
+    /// must not be able to make a node read its analytics log, which is the
+    /// whole reason the expensive endpoints are gated.
+    #[test]
+    fn an_unauthorised_caller_never_reaches_the_log() {
+        let out = traffic(
+            "sydney",
+            "/definitely/not/a/file",
+            60,
+            Duration::from_secs(60),
+            &auth("Bearer wrong"),
+            Some("right"),
+        );
+        // Unauthorised, not TrafficError: it never tried to open the path.
+        assert!(matches!(out, PerfOutcome::Unauthorised));
+    }
+
+    #[test]
+    fn no_token_configured_means_the_endpoint_does_not_exist() {
+        let out = traffic("sydney", "/nope", 60, Duration::from_secs(60), &[], None);
+        assert!(matches!(out, PerfOutcome::Disabled));
+        let (code, _, _) = out.into_response();
+        assert_eq!(code, 404, "404 not 401: it must not advertise a door");
+    }
+
+    /// An unreadable log is reported, not silently served as a quiet hour.
+    /// This codebase has made that mistake: an absent file at the expected
+    /// path looked exactly like a feature switched off.
+    #[test]
+    fn an_unreadable_log_is_a_503_with_a_reason() {
+        let out = traffic(
+            "sydney",
+            "/definitely/not/a/file",
+            60,
+            Duration::from_secs(0),
+            &auth("Bearer tok"),
+            Some("tok"),
+        );
+        let (code, _, body) = out.into_response();
+        assert_eq!(code, 503);
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(v["error"].as_str().unwrap_or("").len() > 0);
+    }
+
+    #[test]
+    fn summarises_a_real_log_and_serves_it() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        let now = m6_core::util::now_iso8601();
+        let ts = now.trim_end_matches('Z');
+        writeln!(f, "{}", row(&format!("{ts}.100Z"), "1.2.3.4", "/", 200, "Chrome/131")).unwrap();
+        writeln!(f, "{}", row(&format!("{ts}.200Z"), "5.6.7.8", "/robots.txt", 200,
+            "Mozilla/5.0 (compatible; ClaudeBot/1.0; +claudebot@anthropic.com)")).unwrap();
+        f.flush().unwrap();
+
+        let out = traffic(
+            "sydney",
+            f.path().to_str().unwrap(),
+            60,
+            Duration::from_secs(0),
+            &auth("Bearer tok"),
+            Some("tok"),
+        );
+        let (code, headers, body) = out.into_response();
+        assert_eq!(code, 200);
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["node"], "sydney");
+        assert_eq!(v["total_requests"], 2);
+        assert_eq!(v["crawlers"][0]["user_agent"].as_str().unwrap().contains("ClaudeBot"), true);
+        assert!(v["logging"].is_object(), "logging health travels with it");
+        // Never cached by anything in between.
+        assert!(headers.iter().any(|(k, val)|
+            k.eq_ignore_ascii_case("cache-control") && val == "no-store"));
     }
 }
