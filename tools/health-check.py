@@ -400,9 +400,25 @@ def classify_crawlers(analytics):
     crawler, and counting its ClaudeBot and GPTBot strings as sightings is how
     a report invents fifteen AI crawler visits out of one attacker.
     """
+    # Mirrors m6_core::telemetry::TrafficSummary::from_records.
+    #
+    # Two ways to disqualify your own claim. Rotation is one. Scanning is the
+    # other, and it was missed until 2026-09-11: 94.154.46.250 asked for
+    # /.aws/credentials, /.env.backup, /.env.old and /settings.php behind a
+    # single unchanging `Googlebot/2.1`, and appeared in one report as both a
+    # credential scanner and a Googlebot visit. Googlebot does not look for AWS
+    # credentials. Behaviour overrides the claim.
+    #
+    # Not included: a high error ratio on its own. A genuine crawler
+    # re-crawling dead links is mostly 404s and is still a genuine crawler.
     by_ip = analytics.get("by_ip", {})
-    forgers = {ip for ip, v in by_ip.items()
-               if v["ua_count"] >= 10 and v["n"] >= 20}
+    forgers = set()
+    for ip, v in by_ip.items():
+        rotating = v["ua_count"] >= 10 and v["n"] >= 20
+        scanning = any(PROBE_RE.search(p) or INJECTION_RE.search(p)
+                       for p, _ in v["paths"])
+        if rotating or scanning:
+            forgers.add(ip)
 
     genuine, forged_n = {}, 0
     for ua, v in analytics.get("by_ua", {}).items():
@@ -653,7 +669,7 @@ def main():
         genuine, forged, forgers = classify_crawlers(r.get("analytics", {}))
         if forged:
             print("  %-5s %d bot-shaped requests were FORGED by %s and are excluded"
-                  % (node["name"], forged, ", ".join(sorted(forgers)) or "a UA rotator"))
+                  % (node["name"], forged, ", ".join(sorted(forgers)) or "an unknown source"))
         if not genuine:
             print("  %-5s no genuine crawler traffic in the window" % node["name"])
             continue
