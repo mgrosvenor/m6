@@ -54,6 +54,26 @@ fn test_profile() -> String {
 /// Debug remains the fallback for `cargo test` run on its own with no release
 /// build present.
 ///
+/// # The trap that comes with it
+///
+/// **A stale `target/release/<name>` is preferred over a fresh source tree, and
+/// nothing says so.** `cargo test` rebuilds the lib and the test binary from
+/// current source, then spawns a service binary that may be hours old, so a fix
+/// that is present in the code under test is absent from the process being
+/// tested. That reads as the fix not working: on 2026-09-12 a correct read
+/// timeout was measured as broken twice, and the same mechanism will just as
+/// happily report a broken change as fixed.
+///
+/// There is no reliable mtime check to add here. In the intended workflow
+/// (`cargo build --release` then `cargo test`) cargo relinks the test binary
+/// *after* the release binaries, so "release is older than the test binary" is
+/// the normal case and not a staleness signal.
+///
+/// So the rule is procedural: **`cargo build --workspace --release` before
+/// `cargo test`**, every time, and when an end-to-end test contradicts what the
+/// source plainly says, check the binary's timestamp before debugging the code.
+/// `deploy/run-tests.sh` does the release build itself and is not exposed.
+///
 /// Panics with both paths and the build command to run, because "missing
 /// binary" is the single most common first-run failure and a bare `NotFound`
 /// says nothing about the fix.
