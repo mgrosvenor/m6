@@ -135,10 +135,8 @@ pub fn metrics_authorised(
     let Some(expected) = configured_token.filter(|t| !t.is_empty()) else {
         return false;
     };
-    headers
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
-        .and_then(|(_, value)| {
+    crate::headers::get(headers, "authorization")
+        .and_then(|value| {
             // The scheme is case-insensitive per RFC 9110 11.1.
             let rest = value.strip_prefix("Bearer ").or_else(|| {
                 value

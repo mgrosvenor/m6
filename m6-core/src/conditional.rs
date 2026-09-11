@@ -96,12 +96,7 @@ pub fn evaluate_preconditions(
     req_headers: &(impl HeaderSource + ?Sized),
     method: &str,
 ) -> Precondition {
-    let find = |name: &str| {
-        cached_headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.as_str())
-    };
+    let find = |name: &str| crate::headers::get(cached_headers, name);
     let etag = find("etag");
     let last_modified = find("last-modified");
     let is_get_or_head = method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD");

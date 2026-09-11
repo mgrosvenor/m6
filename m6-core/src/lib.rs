@@ -2,8 +2,10 @@ pub mod app;
 pub mod compress;
 pub mod conditional;
 pub mod config;
+pub mod cookie;
 pub mod error;
 pub mod h1;
+pub mod headers;
 pub mod host;
 pub mod http;
 pub mod log;
@@ -44,6 +46,7 @@ pub use conditional::{evaluate_preconditions, is_not_modified, not_modified_head
 pub use app::App;
 pub use compress::{brotli_compress, brotli_decompress, gzip_compress, gzip_decompress};
 pub use config::{RendererConfig, RouteConfig};
+pub use cookie::{Cookie, SameSite};
 pub use error::{Error, Result};
 pub use render::{NoTemplates, RenderError, Renderer, RendererFactory};
 pub use h1::{parse_request, ParseResult};
