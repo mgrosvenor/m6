@@ -4,12 +4,11 @@ mod key_watch;
 mod rate_limit;
 mod handlers;
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::Result;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use m6_auth::Db;
 use m6_core::server::{socket_path_from_config, UnixServer};
@@ -171,13 +170,7 @@ fn run() -> i32 {
         }
     };
 
-    // Set socket permissions
-    if let Err(e) = std::fs::set_permissions(
-        server.path(),
-        std::fs::Permissions::from_mode(0o666),
-    ) {
-        warn!(error = %e, "failed to set socket permissions");
-    }
+    m6_core::server::apply_socket_mode(server.path(), m6_core::server::DEFAULT_SOCKET_MODE);
 
     info!(issuer = %cfg.issuer, "auth config loaded");
 

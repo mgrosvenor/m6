@@ -151,10 +151,21 @@ consolidated in `server::serve_connection`, so what is left is small:
       `Ok(0)`: nothing yet is an idle peer leaving, closed silently; a stalled
       part-request gets a real 408. Guards in `parse` and in
       `m6-html/tests/read_timeout.rs`, all verified red first.
-- [ ] **Socket permissions as a config key.** ~5 lines in `server.rs`, then
-      delete m6-auth-server's `set_permissions` block. Removes its other
-      reason. After this its main differs in exactly one respect: it drives its
-      own accept loop.
+- [x] **Socket permissions as a config key.** **DONE 2026-09-12.**
+      `[server] socket_mode`, an octal string, default `0660`.
+      `server::apply_socket_mode` is the one implementation; m6-file and
+      m6-auth-server both had the `set_permissions` block, not just
+      m6-auth-server, and both now call it. m6-auth-server's main now differs
+      in exactly one respect: it drives its own accept loop.
+
+      **Three modes became one, and the fleet's effective mode changes.**
+      m6-file and m6-auth-server set `0666` by hand; `App`'s five services set
+      nothing and took `0755` from the umask. All seven are now `0660`. Nothing
+      is lost: every unit runs `User=m6` and `/run/m6` is `0750` owned by `m6`,
+      so the world bits never granted anything the directory did not already
+      deny. **Verify the modes after the next deploy** rather than assuming;
+      this is the first change here that alters a file permission in
+      production.
 
 Tier 2, about a day, moderate risk, optional:
 

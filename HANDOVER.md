@@ -193,17 +193,23 @@ Services: `m6-http` (edge/proxy), `m6-file`, `m6-html`, `m6-auth-server`,
      services that had hand-written the same 30 seconds now call the same core
      function. **Production needs no config change; the default applies.** It
      was not the three lines it looked like: see lesson 26.
-   - **Socket permissions as a config key**, so m6-auth-server stops setting
-     `0666` by hand. **Now the top item on this list.**
-   - Optional: **lift the accept/poll block** m6-file duplicates 22 of 33 lines
-     of.
-   - Free, unrelated to shape: **`send_with_length` has zero callers** while
-     m6-file's HEAD does a full `fs::read`, minify and brotli-6 before
-     discarding the body at `h1.rs:700`.
+   - ~~**Socket permissions as a config key.**~~ **DONE 2026-09-12.**
+     `[server] socket_mode`, octal string, default `0660`. It was m6-file *and*
+     m6-auth-server setting `0666` by hand, not just m6-auth-server, and `App`
+     set nothing at all so its five services took `0755` from the umask. All
+     seven are now `0660`. **This changes a file permission in production**,
+     which nothing else on this list does: check the modes after the deploy.
+     Safe because every unit is `User=m6` and `/run/m6` is `0750` owned by
+     `m6`, so the world bits were never load-bearing.
+   - **Still open, optional (Tier 2): lift the accept/poll block** m6-file
+     duplicates 22 of 33 lines of.
+   - **Still open, free and unrelated to shape: `send_with_length` has zero
+     callers** while m6-file's HEAD does a full `fs::read`, minify and brotli-6
+     before discarding the body at `h1.rs:700`.
 
    Anything touching performance still wants **benchmarking Phases 5 and 6**
-   first, which is owed anyway. The four above are either a socket option, a
-   config key, a code move, or strictly less work, so none of them needs it.
+   first, which is owed anyway. The two that remain are a code move and
+   strictly less work, so neither needs it.
 2b. **Finish header to dict.** `FrameworkState::build_dict` is private and is
    where the real knowledge lives: twelve ordered steps, and the ordering is
    load-bearing (built-ins go in *after* params files so a params file cannot

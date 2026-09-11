@@ -84,6 +84,8 @@ queue_size = 8
 # Read deadline on an accepted connection. Default 30, `0` disables.
 # A silent peer holds a pool worker for exactly this long and no longer.
 read_timeout_s = 30
+# Mode for the unix socket, octal string as systemd writes it. Default "0660".
+socket_mode = "0660"
 
 [log]
 level  = "info"
