@@ -6,6 +6,7 @@ members = [
     "m6-file",
     "m6-http",
     "m6-html",
+    "m6-monitor",
     "m6-auth-server",
     "m6-md",
 ]

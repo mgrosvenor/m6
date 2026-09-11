@@ -760,3 +760,84 @@ mod tests {
         assert_eq!(parse_analytics(&text, "").count(), 2);
     }
 }
+
+
+// ── The /perf metrics payload ────────────────────────────────────────────────
+//
+// The wire format of m6's monitoring endpoints. Here rather than in the binary
+// that produces it, because anything reading a fleet needs the same types the
+// nodes write, and a consumer holding its own copy of the shape is a consumer
+// that drifts from it. That is the mistake the analytics stream made: no type
+// anywhere, and every reader squinting at a sample.
+//
+// `version` and `iface` are `String` rather than `&'static str` for the same
+// reason. The producer knows them at compile time; a deserializing client
+// cannot. It costs two short allocations per channel on an endpoint that
+// already sorts a 4096 sample reservoir, and it is on no hot path.
+/// One channel's figures, as reported by `/perf`.
+///
+/// Cumulative counters, unlike the aggregate percentiles, which are windowed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChannelSnapshot {
+    /// e.g. `"http/2/external"`.
+    pub channel: String,
+    pub version: String,
+    pub iface: String,
+    pub requests: u64,
+    pub hits: u64,
+    pub misses: u64,
+    pub backend_errors: u64,
+    pub hit_samples: usize,
+    pub hit_p50_ns: u64,
+    pub hit_p99_ns: u64,
+    pub miss_samples: usize,
+    pub miss_p50_ns: u64,
+    pub miss_p99_ns: u64,
+}
+
+/// A read-only view of the counters, for the health endpoint.
+///
+/// Cumulative fields are monotonic for the life of the process, which is what
+/// makes "the request count stopped increasing" a usable liveness signal.
+///
+/// The percentile fields are **not** cumulative. `maybe_emit` clears the
+/// latency reservoirs every 10 seconds, so these describe the current partial
+/// window only, which may hold very few samples or none. That is why
+/// `hit_samples`/`miss_samples` are reported alongside: a p99 drawn from three
+/// samples is noise, and a consumer that cannot see the sample count has no
+/// way to tell it apart from a real one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StatsSnapshot {
+    pub requests_total: u64,
+    pub cache_hits_total: u64,
+    pub cache_misses_total: u64,
+    pub backend_errors_total: u64,
+    /// /health and /perf polls. Cumulative, and deliberately excluded from
+    /// `requests_total` so a stalled site is still detectable while a monitor
+    /// keeps polling. Reported rather than discarded so the monitor itself is
+    /// observable: a check that stops, or one that floods, shows up here.
+    pub monitor_requests_total: u64,
+    pub monitor_samples: usize,
+    pub monitor_p50_ns: u64,
+    pub monitor_p99_ns: u64,
+    pub rps_peak: u64,
+    /// Samples backing the hit percentiles in the current window.
+    pub hit_samples: usize,
+    pub hit_p50_ns: u64,
+    pub hit_p99_ns: u64,
+    pub hit_max_ns: u64,
+    /// Samples backing the miss percentiles in the current window.
+    pub miss_samples: usize,
+    pub miss_p50_ns: u64,
+    pub miss_p99_ns: u64,
+    pub miss_max_ns: u64,
+    /// Per (version, interface) breakdown. Channels that have seen no traffic
+    /// are omitted rather than reported as rows of zeros, so the list shows
+    /// what this node actually serves.
+    pub channels: Vec<ChannelSnapshot>,
+    /// Response codes actually emitted, keyed by code. Codes never returned
+    /// are omitted entirely: a fixed 100..599 table would be 500 rows of
+    /// zeros around the four that matter, and the useful signal here is
+    /// exactly which codes appeared.
+    pub status_counts: std::collections::BTreeMap<u16, u64>,
+}

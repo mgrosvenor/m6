@@ -1884,6 +1884,7 @@ fn handle_request_inner(
             state.started.elapsed().as_secs(),
             pools,
             state.pool_manager.url_backend_names(),
+            &state.config.site_dir,
             &req.headers,
             state.config.health.metrics_token.as_deref(),
             || state.stats.snapshot(),
