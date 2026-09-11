@@ -19,6 +19,8 @@ pub enum ParseError {
     InvalidHeader,
     #[error("request too large")]
     RequestTooLarge,
+    #[error("request timeout")]
+    RequestTimeout,
     #[error("expectation failed")]
     ExpectationFailed,
     #[error("io error: {0}")]
@@ -35,6 +37,7 @@ impl ParseError {
         match self {
             ParseError::RequestTooLarge => 413,
             ParseError::ExpectationFailed => 417,
+            ParseError::RequestTimeout => 408,
             _ => 400,
         }
     }
@@ -44,6 +47,7 @@ impl ParseError {
         match self.status() {
             413 => "Payload Too Large",
             417 => "Expectation Failed",
+            408 => "Request Timeout",
             _ => "Bad Request",
         }
     }
@@ -118,6 +122,28 @@ pub fn parse_request(stream: &mut (impl Read + Write)) -> Result<RawRequest, Par
                 return Err(ParseError::InvalidRequestLine);
             }
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            // A read timeout, which is a deadline expiring rather than a broken
+            // socket. It splits the same way the `Ok(0)` arm above does.
+            Err(ref e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                if buf.is_empty() {
+                    // An idle persistent connection that outlived the timeout.
+                    // Closing silently is the point: m6-http keeps backend
+                    // connections pooled, so anything written here would sit in
+                    // that socket's buffer and be read as the response to the
+                    // next request sent on it. A 400 in a response slot is the
+                    // framing confusion this codebase rejects on ingress.
+                    return Err(ParseError::ConnectionClosed);
+                }
+                // A request that started and stopped. The peer is mid-message
+                // and not reusing this connection for anything else, so it can
+                // be told why it is being cut off.
+                return Err(ParseError::RequestTimeout);
+            }
             Err(e) => return Err(ParseError::Io(e)),
         }
     }
@@ -171,6 +197,76 @@ mod tests {
         let mut cursor = Cursor::new(raw.to_vec());
         let err = parse_request(&mut cursor).unwrap_err();
         assert!(matches!(err, ParseError::ConnectionClosed));
+    }
+
+    /// A stream that yields `prefix`, then times out the way a socket with
+    /// `SO_RCVTIMEO` does: an error, not an EOF.
+    struct TimesOutAfter {
+        prefix: Cursor<Vec<u8>>,
+        kind: std::io::ErrorKind,
+    }
+
+    impl Read for TimesOutAfter {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.prefix.read(buf)? {
+                0 => Err(std::io::Error::new(self.kind, "timed out")),
+                n => Ok(n),
+            }
+        }
+    }
+
+    impl Write for TimesOutAfter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> { Ok(buf.len()) }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+
+    /// An idle persistent connection hitting the read timeout must look like a
+    /// close, so that `serve_connection` returns without writing anything.
+    ///
+    /// This is the one that matters operationally: m6-http pools backend
+    /// connections, so a response written into an idle socket is read as the
+    /// answer to the *next* request sent on it.
+    #[test]
+    fn timeout_before_any_byte_is_a_close_not_an_error() {
+        for kind in [std::io::ErrorKind::WouldBlock, std::io::ErrorKind::TimedOut] {
+            let mut s = TimesOutAfter { prefix: Cursor::new(Vec::new()), kind };
+            let err = parse_request(&mut s).unwrap_err();
+            assert!(
+                matches!(err, ParseError::ConnectionClosed),
+                "{kind:?} on an idle connection should read as a close, got {err:?}"
+            );
+        }
+    }
+
+    /// A request that started and then stalled is a different thing, and the
+    /// peer is mid-message rather than reusing the connection, so it can be
+    /// told why it is being cut off.
+    #[test]
+    fn timeout_mid_request_is_408() {
+        for kind in [std::io::ErrorKind::WouldBlock, std::io::ErrorKind::TimedOut] {
+            let mut s = TimesOutAfter {
+                prefix: Cursor::new(b"GET /slow HTTP/1.1\r\nHost: local".to_vec()),
+                kind,
+            };
+            let err = parse_request(&mut s).unwrap_err();
+            assert!(
+                matches!(err, ParseError::RequestTimeout),
+                "{kind:?} mid-request should be a timeout, got {err:?}"
+            );
+            assert_eq!(err.status(), 408);
+            assert_eq!(err.reason(), "Request Timeout");
+        }
+    }
+
+    /// A genuine socket error keeps reporting as one.
+    #[test]
+    fn a_real_io_error_is_still_an_io_error() {
+        let mut s = TimesOutAfter {
+            prefix: Cursor::new(Vec::new()),
+            kind: std::io::ErrorKind::ConnectionReset,
+        };
+        let err = parse_request(&mut s).unwrap_err();
+        assert!(matches!(err, ParseError::Io(_)), "got {err:?}");
     }
 
     #[test]

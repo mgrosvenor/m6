@@ -400,7 +400,12 @@ fn handle_connection(
     config: &Config,
     site_dir: &Path,
 ) -> Result<()> {
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
+    m6_core::server::apply_read_timeout(
+        &stream,
+        Some(std::time::Duration::from_secs(
+            m6_core::server::DEFAULT_READ_TIMEOUT_SECS,
+        )),
+    );
 
     let ctx = HandlerContext { routes, config, site_dir };
 

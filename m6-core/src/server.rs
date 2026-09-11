@@ -52,6 +52,33 @@ pub fn socket_path_from_config(config_path: &Path) -> PathBuf {
     PathBuf::from(format!("/run/m6/{}.sock", stem))
 }
 
+/// Default read timeout for an accepted connection, in seconds.
+///
+/// Not a fresh guess: `m6-file` and `m6-auth-server` had each hand-written
+/// `set_read_timeout(Some(Duration::from_secs(30)))` into their own accept
+/// path, so 30 is what this fleet already runs. The five services built on
+/// [`crate::app::App`] had no timeout at all.
+pub const DEFAULT_READ_TIMEOUT_SECS: u64 = 30;
+
+/// Apply the per-connection read timeout, in one place.
+///
+/// A silent peer is the whole reason this exists. `serve_connection` blocks in
+/// `read` waiting for a request line, so a peer that connects and never speaks
+/// holds its worker until it goes away. With a bounded thread pool, a handful
+/// of such peers is the entire pool, and the service answers 503 while looking
+/// perfectly healthy: no error, no panic, no log line.
+///
+/// Failure to set the option is logged and tolerated rather than fatal. The
+/// connection still works; it merely lacks a deadline, which is exactly where
+/// every one of these services was before. Refusing to serve it would turn a
+/// missing safety net into an outage.
+pub fn apply_read_timeout(stream: &UnixStream, timeout: Option<std::time::Duration>) {
+    let Some(dur) = timeout else { return };
+    if let Err(e) = stream.set_read_timeout(Some(dur)) {
+        warn!(error = %e, "failed to set read timeout on accepted connection");
+    }
+}
+
 /// A running Unix socket server.
 ///
 /// Accepts connections, calls handler for each, sends response.

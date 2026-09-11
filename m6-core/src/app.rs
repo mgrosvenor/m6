@@ -1686,6 +1686,10 @@ fn run_app_with_shutdown(
 
     let tp_size = framework_state.config.thread_pool.size;
     let tp_queue = framework_state.config.thread_pool.queue_size;
+    // Read once at startup, like the pool dimensions above and for the same
+    // reason: it is applied to a socket at accept time, so a reload cannot
+    // retune it without reopening connections that are already being served.
+    let read_timeout = framework_state.config.server.read_timeout;
 
     // Wrap state in RwLock so hot reload can atomically swap it while
     // in-flight requests continue reading the old state via their cloned Arc.
@@ -1871,6 +1875,10 @@ fn run_app_with_shutdown(
 
         match listener.accept() {
             Ok((stream, _)) => {
+                // Before the handoff, not inside the worker: a worker that has
+                // already taken the connection is the resource being protected.
+                crate::server::apply_read_timeout(&stream, read_timeout);
+
                 let fs = fs.clone();
                 let code_handlers = code_handlers.clone();
 
