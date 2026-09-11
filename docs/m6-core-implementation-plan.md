@@ -520,3 +520,51 @@ month. Nothing is deployed yet; the whole sequence ships at the end.
 
 **Stopping early is a valid outcome.** Phases 1 through 3 leave the codebase
 better with no architectural commitment. The commitment starts at Phase 5.
+
+---
+
+## Lessons this plan actually taught
+
+Recorded because several of them contradict what the plan said when it was
+written.
+
+**Measure the candidate before consolidating onto it.** Phase 4 said to
+consolidate the HTTP/1.1 parsers onto `m6-core/src/parse.rs`. Measured against
+h1spec that was the *worst* of the four at 14/32, against the edge parser's
+27/32. The survivor is the one the edge already used, because it is the only one
+that has been attacked. Measuring first is what caught it, and it overturned the
+written plan.
+
+**A phase can be smaller than it looks, or larger.** Phase 3.3 was dropped
+outright once it was scoped against what is actually there. Phase 5 turned out
+to be partly unavoidable inside Phase 4: HEAD suppression and keep-alive cannot
+be fixed in one place without moving the connection loop and the response
+writer, so they moved early.
+
+**A test can pin wrong behaviour as firmly as right behaviour.** Two in this
+work did: one asserted `content-length: 0` on a 204, one asserted that a chunked
+request body must be rejected. Both passed for exactly as long as the defect
+existed. When a fix makes a test fail, read the test before reading the fix.
+
+**Conformance scores are only as good as the harness.** Three measurements in
+Phase 4 were harness artefacts, not implementation behaviour: 11/32, 6/32 and
+two readings taken against a leftover process that still held the port. The
+guards in `tools/conformance.sh` (`bridge_sanity`, `require_free_port`,
+`wait_port_owned_by`) exist because of those, and a harness that cannot prove it
+is measuring the right process should refuse to report.
+
+**Silently swallowing an error looks like health.** m6-file and m6-auth-server
+both returned a parse error to a caller that only logged it, so every malformed
+request got a silent close. It stayed invisible for as long as the parser was
+lenient. Consolidating onto the stricter parser made m6-auth-server's score go
+*down* before it went up, which is the correct and alarming signal.
+
+**Derive a security boundary structurally.** Forwarded-address trust comes from
+the listener's bind address, not a config key, so there is nothing to set wrong.
+On this fleet a config reload already silences logging; a trust flag a reload
+could corrupt would be a security boundary that moves at deploy time.
+
+**Benchmark against a fixed baseline, paired and interleaved.** The build host
+is not a quiet machine. The same commit measured 320.66 and 366.24 ns, a 14.2%
+spread, and the claim that the host had "nothing else running" was in this
+repo's own documentation.
