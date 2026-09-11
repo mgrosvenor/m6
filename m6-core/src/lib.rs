@@ -1,3 +1,4 @@
+pub mod app;
 pub mod compress;
 pub mod conditional;
 pub mod config;
@@ -11,10 +12,12 @@ pub mod negotiate;
 pub mod parse;
 pub mod path;
 pub mod random;
+pub mod render;
 pub mod request;
 pub mod response;
 pub mod server;
 pub mod signal;
+pub mod util;
 pub mod watcher;
 
 /// Shared integration-test harness. Behind a feature so it is never compiled
@@ -26,9 +29,11 @@ pub mod testkit;
 pub mod multipart;
 
 pub use conditional::{evaluate_preconditions, is_not_modified, not_modified_headers, Precondition};
+pub use app::App;
 pub use compress::{brotli_compress, brotli_decompress, gzip_compress, gzip_decompress};
 pub use config::{RendererConfig, RouteConfig};
 pub use error::{Error, Result};
+pub use render::{NoTemplates, RenderError, Renderer, RendererFactory};
 pub use h1::{parse_request, ParseResult};
 pub use http::{header, is_same_origin_path, HeaderSource, RawRequest, RawResponse};
 pub use mime::{mime_from_path, should_compress_default};

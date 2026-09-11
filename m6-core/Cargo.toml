@@ -27,7 +27,7 @@ thiserror  = "1"
 tracing    = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json"] }
 tracing-appender   = "0.2"
-nix        = { version = "0.27", features = ["signal"] }
+nix        = { version = "0.27", features = ["signal", "poll"] }
 httparse   = "1"
 httpdate   = "1"
 rand       = "0.8"
@@ -38,6 +38,9 @@ brotli      = "6"
 flate2      = "1"
 base64      = "0.22"
 filetime    = "0.2"
+chrono      = { version = "0.4", features = ["serde"] }
+lru         = "0.16"
+slug        = "0.1"
 
 multer        = { version = "3",    optional = true }
 tokio         = { version = "1",    optional = true, features = ["rt", "macros"] }
