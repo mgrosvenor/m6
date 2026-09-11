@@ -25,6 +25,11 @@ pub struct RawRequest {
     pub method: String,
     pub path: String,
     pub query: Option<String>, // raw query string (without ?)
+    /// The version the client sent: "HTTP/1.1" or "HTTP/1.0".
+    ///
+    /// Persistent connections need it (RFC 9112 9.3: 1.1 keeps the connection
+    /// by default, 1.0 closes), which is why it is not optional.
+    pub version: String,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
 }
@@ -156,6 +161,7 @@ mod tests {
     #[test]
     fn test_raw_request_header_lookup_case_insensitive() {
         let req = RawRequest {
+            version: "HTTP/1.1".to_string(),
             method: "GET".into(),
             path: "/".into(),
             query: None,

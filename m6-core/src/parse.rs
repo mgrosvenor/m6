@@ -28,143 +28,48 @@ pub enum ParseError {
 /// Handles: request line, headers, body (Content-Length based).
 /// Does not handle chunked transfer encoding.
 pub fn parse_request(stream: &mut impl Read) -> Result<RawRequest, ParseError> {
-    // Read the head in chunks until `\r\n\r\n`.
+    // Read in chunks until the one parser in `crate::h1` says the message is
+    // complete. It decides completeness, including the body, so this loop has
+    // no framing logic of its own -- which is the point: there is one place
+    // where HTTP/1.1 framing is decided.
     //
     // This used to read **one byte per `read()` call**: 377 syscalls for a
-    // 377-byte request head from an ordinary browser, measured. Nothing
-    // buffered it either -- `m6_core::server::handle_connection` hands the raw
-    // `UnixStream` straight in -- so every one of those was a real syscall.
-    //
-    // A chunked read can overshoot the terminator and take the first bytes of
-    // the body with it, which is why the byte-at-a-time version existed. The
-    // overshoot is kept in `body` below rather than discarded, so nothing is
-    // lost and the body read starts from what was already pulled in.
-    let mut header_buf: Vec<u8> = Vec::with_capacity(2048);
+    // 377-byte request head from an ordinary browser, measured, and nothing
+    // buffered it because `crate::server` hands the raw `UnixStream` straight
+    // in.
+    let mut buf: Vec<u8> = Vec::with_capacity(2048);
     let mut chunk = [0u8; 1024];
-    let mut head_len: Option<usize> = None;
 
-    while head_len.is_none() {
-        // Rescan only from just before the tail already examined, so a
-        // terminator straddling two chunks is still found without rescanning
-        // the whole buffer each time.
-        let scan_from = header_buf.len().saturating_sub(3);
-        let n = match stream.read(&mut chunk) {
-            Ok(0) => {
-                if header_buf.is_empty() {
-                    return Err(ParseError::ConnectionClosed);
-                }
-                return Err(ParseError::InvalidRequestLine);
-            }
-            Ok(n) => n,
-            Err(e) => return Err(ParseError::Io(e)),
-        };
-        header_buf.extend_from_slice(&chunk[..n]);
-        if let Some(pos) = header_buf[scan_from..]
-            .windows(4)
-            .position(|w| w == b"\r\n\r\n")
-        {
-            head_len = Some(scan_from + pos + 4);
+    loop {
+        match crate::h1::parse_request(&buf) {
+            crate::h1::ParseResult::Complete(req) => return Ok(req),
+            crate::h1::ParseResult::Error => return Err(ParseError::InvalidHeader),
+            crate::h1::ParseResult::Incomplete => {}
         }
-        // The cap applies to the head, so check it against what the head could
-        // still be, not against the overshoot.
-        if head_len.is_none() && header_buf.len() > MAX_HEADER_BYTES {
+
+        // Two caps, because they guard different things. Until the blank line
+        // arrives everything read is head, and an unbounded head is how a peer
+        // makes the server buffer forever. After it, the body is bounded
+        // separately and much more generously.
+        let head_done = buf.windows(4).any(|w| w == b"\r\n\r\n");
+        let cap = if head_done { MAX_HEADER_BYTES + MAX_BODY_BYTES } else { MAX_HEADER_BYTES };
+        if buf.len() > cap {
             return Err(ParseError::RequestTooLarge);
         }
-    }
-    let head_len = head_len.expect("loop exits only when set");
-    if head_len > MAX_HEADER_BYTES {
-        return Err(ParseError::RequestTooLarge);
-    }
-    // Anything past the terminator is the first of the body.
-    let body_prefix = header_buf.split_off(head_len);
 
-    // Split into lines.
-    let header_str = std::str::from_utf8(&header_buf)
-        .map_err(|_| ParseError::InvalidRequestLine)?;
-
-    let mut lines = header_str.split("\r\n");
-
-    // Parse request line: METHOD path?query HTTP/1.1
-    let request_line = lines.next().ok_or(ParseError::InvalidRequestLine)?;
-    let mut parts = request_line.splitn(3, ' ');
-
-    let method = parts
-        .next()
-        .ok_or(ParseError::InvalidRequestLine)?
-        .to_string();
-    let raw_target = parts
-        .next()
-        .ok_or(ParseError::InvalidRequestLine)?;
-    let _version = parts
-        .next()
-        .ok_or(ParseError::InvalidRequestLine)?;
-
-    if method.is_empty() || raw_target.is_empty() {
-        return Err(ParseError::InvalidRequestLine);
-    }
-
-    // Split path from query.
-    let (path, query) = if let Some(pos) = raw_target.find('?') {
-        let q = raw_target[pos + 1..].to_string();
-        (raw_target[..pos].to_string(), Some(q))
-    } else {
-        (raw_target.to_string(), None)
-    };
-
-    // Parse headers.
-    let mut headers: Vec<(String, String)> = Vec::new();
-    for line in lines {
-        // Empty line marks end of headers (the \r\n\r\n split produces an empty entry).
-        if line.is_empty() {
-            break;
-        }
-        let colon = line.find(':').ok_or(ParseError::InvalidHeader)?;
-        let name = line[..colon].trim().to_string();
-        let value = line[colon + 1..].trim().to_string();
-        if name.is_empty() {
-            return Err(ParseError::InvalidHeader);
-        }
-        headers.push((name, value));
-    }
-
-    // Determine body length from Content-Length header.
-    let content_length: usize = headers
-        .iter()
-        .find(|(k, _)| k.to_ascii_lowercase() == "content-length")
-        .and_then(|(_, v)| v.trim().parse().ok())
-        .unwrap_or(0);
-
-    if content_length > MAX_BODY_BYTES {
-        return Err(ParseError::RequestTooLarge);
-    }
-
-    // Start from whatever the chunked head read already pulled past the
-    // terminator, then read only the remainder. Discarding the overshoot would
-    // silently truncate every body that arrived in the same packet as its
-    // headers, which is the common case.
-    let mut body = body_prefix;
-    if body.len() > content_length {
-        body.truncate(content_length);
-    }
-    if body.len() < content_length {
-        let mut rest = vec![0u8; content_length - body.len()];
-        stream.read_exact(&mut rest).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                ParseError::ConnectionClosed
-            } else {
-                ParseError::Io(e)
+        match stream.read(&mut chunk) {
+            Ok(0) => {
+                if buf.is_empty() {
+                    return Err(ParseError::ConnectionClosed);
+                }
+                // The peer half-closed with an incomplete message. Nothing more
+                // is coming, so it cannot become complete.
+                return Err(ParseError::InvalidRequestLine);
             }
-        })?;
-        body.extend_from_slice(&rest);
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) => return Err(ParseError::Io(e)),
+        }
     }
-
-    Ok(RawRequest {
-        method,
-        path,
-        query,
-        headers,
-        body,
-    })
 }
 
 #[cfg(test)]
@@ -197,7 +102,8 @@ mod tests {
     fn test_parse_post_with_body() {
         let body = b"name=alice&age=30";
         let raw = format!(
-            "POST /submit HTTP/1.1\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n",
+            "POST /submit HTTP/1.1\r\nHost: localhost\r\n\
+             Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n",
             body.len()
         );
         let mut bytes = raw.into_bytes();
@@ -338,9 +244,67 @@ Connection: keep-alive\r\n\r\n"
         }
         req.extend_from_slice(b"\r\n");
         let mut r = Chunked::new(&req, 4096);
+        // Either refusal is correct. The parser holds headers in a fixed
+        // 64-entry stack array -- no allocation, which is the point -- so a
+        // flood is refused as a malformed head before the byte cap is reached.
+        // What matters is that it is refused, not which reason wins the race.
+        assert!(parse_request(&mut r).is_err(), "an oversized head must be refused");
+    }
+}
+
+#[cfg(test)]
+mod stricter_after_consolidation_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// RFC 9110 7.2: an HTTP/1.1 request without `Host` is malformed.
+    ///
+    /// The parser this replaced accepted it, which is h1spec test 8 and one of
+    /// the reasons that implementation scored 14/32. The fixture for
+    /// `test_parse_post_with_body` had no `Host` and passed for the same
+    /// reason; it does now because the request it builds is valid, not because
+    /// the parser stopped checking.
+    #[test]
+    fn http11_without_host_is_refused() {
+        let raw = b"GET /x HTTP/1.1\r\nAccept: */*\r\n\r\n";
+        let mut c = Cursor::new(raw.to_vec());
+        assert!(parse_request(&mut c).is_err(), "HTTP/1.1 without Host must be refused");
+    }
+
+    /// Two `Host` headers are malformed however they disagree: it is the
+    /// ambiguity that routes a request two ways in two hops.
+    #[test]
+    fn duplicate_host_is_refused() {
+        let raw = b"GET /x HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n";
+        let mut c = Cursor::new(raw.to_vec());
+        assert!(parse_request(&mut c).is_err(), "duplicate Host must be refused");
+    }
+
+    /// Conflicting Content-Length is the request-smuggling primitive.
+    #[test]
+    fn conflicting_content_length_is_refused() {
+        let mut raw = b"POST /x HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\n".to_vec();
+        raw.extend_from_slice(b"hello");
+        let mut c = Cursor::new(raw);
+        assert!(parse_request(&mut c).is_err(), "conflicting Content-Length must be refused");
+    }
+
+    /// A head with no end is how a peer makes the server buffer forever.
+    ///
+    /// Refused either as too large or as malformed: the 64-entry stack array
+    /// the parser uses for headers fills before the byte cap does. Both are
+    /// refusals and the test asserts the property, not the race.
+    #[test]
+    fn an_endless_head_is_capped() {
+        let mut raw = b"GET / HTTP/1.1\r\nHost: a\r\n".to_vec();
+        for i in 0..600 {
+            raw.extend_from_slice(format!("X-Pad-{i}: {}\r\n", "a".repeat(64)).as_bytes());
+        }
+        // Deliberately never terminated.
+        let mut c = Cursor::new(raw);
         assert!(
-            matches!(parse_request(&mut r), Err(ParseError::RequestTooLarge)),
-            "an oversized head must be refused"
+            parse_request(&mut c).is_err(),
+            "an unterminated oversized head must be refused"
         );
     }
 }
