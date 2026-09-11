@@ -297,6 +297,10 @@ pub struct Http2Conn {
     next_push_id: u32,
     /// False when the client sends SETTINGS_ENABLE_PUSH=0.
     enable_push:  bool,
+    /// Whether this connection's peer may assert a client address on behalf of
+    /// someone else. `Never` unless the listener explicitly granted it, so a
+    /// connection that forgets to say anything is safe.
+    forwarded_trust: crate::forward::ForwardedTrust,
 }
 
 impl Http2Conn {
@@ -321,7 +325,19 @@ impl Http2Conn {
             conn_send_window:    DEFAULT_WINDOW as i32,
             next_push_id: 2,
             enable_push:  true,
+            forwarded_trust: crate::forward::ForwardedTrust::Never,
         }
+    }
+
+    /// Mark this connection as coming from one of our own cache nodes, so a
+    /// client address it forwards is believed rather than discarded.
+    ///
+    /// Opt-in, and granted only by [`crate::http11::H2cListener`] after it has
+    /// checked that it is bound to a private address. A connection built any
+    /// other way trusts nothing.
+    pub fn trusting_forwarded_for(mut self) -> Self {
+        self.forwarded_trust = crate::forward::ForwardedTrust::Backbone;
+        self
     }
 
     pub fn is_done(&self) -> bool { self.phase == Phase::Done }
@@ -1258,7 +1274,7 @@ impl Http2Conn {
 
     // ── Request dispatch ──────────────────────────────────────────────────────
 
-    fn maybe_dispatch<F>(&mut self, stream_id: u32, on_request: &mut F, client_ip: &str)
+    fn maybe_dispatch<F>(&mut self, stream_id: u32, on_request: &mut F, peer_ip: &str)
     where
         F: FnMut(&HttpRequest, &str) -> RequestOutcome,
     {
@@ -1308,9 +1324,20 @@ impl Http2Conn {
             return;
         }
 
-        let req = build_request(&headers, body);
+        let (req, forwarded_for) = build_request(&headers, body);
 
-        match on_request(&req, client_ip) {
+        // Per REQUEST, not per connection. One backbone connection from a
+        // cache node is long-lived and multiplexes requests from many
+        // different visitors, so a connection-level address would attribute
+        // all of them to whoever opened it.
+        let client_ip = crate::forward::attributed_client_ip(
+            forwarded_for.as_deref(),
+            peer_ip,
+            self.forwarded_trust,
+        )
+        .to_string();
+
+        match on_request(&req, &client_ip) {
             RequestOutcome::Ready(status, resp_headers, resp_body, _, hints) => {
                 let method = req.method.clone();
                 self.dispatch_h2_response(stream_id, status, resp_headers, resp_body, hints, on_request, &client_ip, &method);
@@ -1798,12 +1825,22 @@ fn is_headersonly(headers: &[(String, String)]) -> bool {
     false
 }
 
-fn build_request(headers: &[(String, String)], body: Vec<u8>) -> HttpRequest {
+/// Build the request, and hand back the `x-forwarded-for` it was carrying.
+///
+/// The header is stripped either way -- it never reaches a handler, a backend
+/// or a cache key. Returning the value separately is what lets the *caller*
+/// decide whether the peer was entitled to assert it, without the header
+/// itself surviving that decision.
+fn build_request(
+    headers: &[(String, String)],
+    body: Vec<u8>,
+) -> (HttpRequest, Option<String>) {
     let mut method = String::new();
     let mut path   = String::new();
     let mut query  = None;
     let mut fwd    = Vec::new();
     let mut authority: Option<String> = None;
+    let mut forwarded_for: Option<String> = None;
 
     for (k, v) in headers {
         match k.as_str() {
@@ -1820,7 +1857,11 @@ fn build_request(headers: &[(String, String)], body: Vec<u8>) -> HttpRequest {
             k if k.starts_with(':') => {}
             // Strip proxy-owned headers on ingress — see
             // `forward::UNTRUSTED_INBOUND`.
-            k if crate::forward::is_untrusted_inbound(k) => {}
+            k if crate::forward::is_untrusted_inbound(k) => {
+                if k.eq_ignore_ascii_case("x-forwarded-for") {
+                    forwarded_for = Some(v.clone());
+                }
+            }
             _ => fwd.push((k.clone(), v.clone())),
         }
     }
@@ -1840,12 +1881,20 @@ fn build_request(headers: &[(String, String)], body: Vec<u8>) -> HttpRequest {
         }
     }
 
-    HttpRequest { method, path, query, version: "HTTP/2".to_string(), headers: fwd, body }
+    let req =
+        HttpRequest { method, path, query, version: "HTTP/2".to_string(), headers: fwd, body };
+    (req, forwarded_for)
 }
 
 #[cfg(test)]
 mod authority_tests {
     use super::build_request;
+
+    /// `build_request` hands back the request and the `x-forwarded-for` it
+    /// stripped; these tests are about the request half.
+    fn req_of(pair: (crate::forward::HttpRequest, Option<String>)) -> crate::forward::HttpRequest {
+        pair.0
+    }
 
     fn h(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
@@ -1860,10 +1909,10 @@ mod authority_tests {
     /// The case every browser and curl actually sends: :authority, no Host.
     #[test]
     fn authority_becomes_host() {
-        let req = build_request(
+        let req = req_of(build_request(
             &h(&[(":method", "GET"), (":path", "/x"), (":authority", "www.example.com")]),
             vec![],
-        );
+        ));
         assert_eq!(host_of(&req), Some("www.example.com"));
     }
 
@@ -1871,7 +1920,7 @@ mod authority_tests {
     /// and must not be duplicated.
     #[test]
     fn explicit_host_wins_and_is_not_duplicated() {
-        let req = build_request(
+        let req = req_of(build_request(
             &h(&[
                 (":method", "GET"),
                 (":path", "/x"),
@@ -1879,7 +1928,7 @@ mod authority_tests {
                 ("host", "host.example"),
             ]),
             vec![],
-        );
+        ));
         assert_eq!(host_of(&req), Some("host.example"));
         assert_eq!(
             req.headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case("host")).count(),
@@ -1889,17 +1938,17 @@ mod authority_tests {
 
     #[test]
     fn no_authority_means_no_synthesized_host() {
-        let req = build_request(&h(&[(":method", "GET"), (":path", "/x")]), vec![]);
+        let req = req_of(build_request(&h(&[(":method", "GET"), (":path", "/x")]), vec![]));
         assert_eq!(host_of(&req), None);
     }
 
     /// Other pseudo-headers stay stripped -- they must never reach a backend.
     #[test]
     fn other_pseudo_headers_are_still_dropped() {
-        let req = build_request(
+        let req = req_of(build_request(
             &h(&[(":method", "GET"), (":path", "/x?a=1"), (":scheme", "https"), (":authority", "e.example")]),
             vec![],
-        );
+        ));
         assert!(!req.headers.iter().any(|(k, _)| k.starts_with(':')), "{:?}", req.headers);
         assert_eq!(req.path, "/x");
         assert_eq!(req.query.as_deref(), Some("a=1"));
@@ -1953,6 +2002,24 @@ mod frame_validation_tests {
     /// BEFORE any frame-specific validation, so a test that sends DATA on a
     /// bare stream id now measures the state machine rather than the thing it
     /// meant to test.
+    /// A HEADERS frame opening `stream_id` and carrying one extra header,
+    /// HPACK-encoded as a literal-without-indexing with a new name.
+    pub(super) fn open_stream_with_header(
+        stream_id: u32,
+        name: &str,
+        value: &str,
+    ) -> Vec<u8> {
+        let mut block = vec![0x82, 0x87, 0x84];      // :method GET, :scheme https, :path /
+        block.extend_from_slice(&[0x01, 0x0b]);      // :authority, literal
+        block.extend_from_slice(b"example.com");
+        block.push(0x00);                            // literal, new name, no indexing
+        block.push(name.len() as u8);
+        block.extend_from_slice(name.as_bytes());
+        block.push(value.len() as u8);
+        block.extend_from_slice(value.as_bytes());
+        frame(TYPE_HEADERS, FLAG_END_HEADERS, stream_id, &block)
+    }
+
     pub(super) fn open_stream(stream_id: u32) -> Vec<u8> {
         // ":method: GET" / ":scheme: https" / ":path: /" as HPACK static-table
         // indexed fields (2, 7, 4) -- no dynamic table, no Huffman.
@@ -2925,5 +2992,105 @@ mod hpack_table_size_setting_tests {
     fn the_clamp_is_the_advertised_maximum() {
         assert_eq!((u32::MAX as usize).min(HPACK_MAX_TABLE_SIZE), HPACK_MAX_TABLE_SIZE);
         assert_eq!((512usize).min(HPACK_MAX_TABLE_SIZE), 512);
+    }
+}
+
+/// Who a request gets attributed to, driven through the real frame path.
+///
+/// The unit tests in `forward` cover the decision; these cover the wiring,
+/// which is where it would silently not happen.
+#[cfg(test)]
+mod forwarded_client_ip_tests {
+    use super::frame_validation_tests::{frame, open_stream_with_header};
+    use super::*;
+
+    /// Drive one request through a connection and report the address the
+    /// request handler was given, plus whether the header survived into the
+    /// request the handler saw.
+    fn attributed(conn: Http2Conn, peer_ip: &str, forwarded: Option<&str>) -> (String, bool) {
+        let mut c = conn;
+        c.phase = Phase::Active;
+        let frames = match forwarded {
+            Some(v) => open_stream_with_header(1, "x-forwarded-for", v),
+            None => {
+                let mut block = vec![0x82, 0x87, 0x84];
+                block.extend_from_slice(&[0x01, 0x0b]);
+                block.extend_from_slice(b"example.com");
+                frame(TYPE_HEADERS, FLAG_END_HEADERS, 1, &block)
+            }
+        };
+        c.recv_buf.extend_from_slice(&frames);
+
+        let seen = std::cell::RefCell::new((String::new(), false));
+        {
+            let mut on_request = |req: &HttpRequest, ip: &str| -> RequestOutcome {
+                let survived = req
+                    .headers
+                    .iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case("x-forwarded-for"));
+                *seen.borrow_mut() = (ip.to_string(), survived);
+                RequestOutcome::Ready(
+                    200,
+                    vec![],
+                    b"ok".to_vec(),
+                    "test".to_string(),
+                    std::sync::Arc::new(vec![]),
+                )
+            };
+            while let Ok(true) = c.process_frame(&mut on_request, peer_ip) {}
+        }
+        seen.into_inner()
+    }
+
+    /// The default. A connection that was never explicitly granted trust
+    /// attributes to its peer, so a client cannot choose its own rate-limit
+    /// bucket by sending a header.
+    #[test]
+    fn a_public_connection_ignores_a_forged_forwarded_address() {
+        let (ip, survived) = attributed(
+            Http2Conn::new(),
+            "198.51.100.7",
+            Some("203.0.113.9"),
+        );
+        assert_eq!(ip, "198.51.100.7", "a forged X-Forwarded-For was believed");
+        assert!(!survived, "the header must not reach the handler");
+    }
+
+    /// The backbone connection believes it, which is the whole point: origin
+    /// was attributing every request relayed by a cache node to the tunnel
+    /// address, so all of them shared one rate-limit bucket and one
+    /// `client_ip` in analytics.
+    #[test]
+    fn a_backbone_connection_attributes_to_the_relayed_address() {
+        let (ip, survived) = attributed(
+            Http2Conn::new().trusting_forwarded_for(),
+            "10.0.0.4",
+            Some("203.0.113.9"),
+        );
+        assert_eq!(ip, "203.0.113.9");
+        assert!(
+            !survived,
+            "trust decides whether the address is believed, never whether the \
+             header survives: it is stripped on every path"
+        );
+    }
+
+    /// Origin is directly reachable as well as relayed, and its own health
+    /// checks arrive with no forwarded address.
+    #[test]
+    fn a_backbone_connection_without_one_falls_back_to_the_peer() {
+        let (ip, _) = attributed(Http2Conn::new().trusting_forwarded_for(), "10.0.0.4", None);
+        assert_eq!(ip, "10.0.0.4");
+    }
+
+    /// A list did not come from a cache node, which emits exactly one value.
+    #[test]
+    fn a_backbone_connection_refuses_a_list() {
+        let (ip, _) = attributed(
+            Http2Conn::new().trusting_forwarded_for(),
+            "10.0.0.4",
+            Some("203.0.113.9, 192.0.2.1"),
+        );
+        assert_eq!(ip, "10.0.0.4");
     }
 }
