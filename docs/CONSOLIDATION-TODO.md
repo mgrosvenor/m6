@@ -124,6 +124,63 @@ Verified by commit, gate green at each step unless noted.
 
 ### 3b. One app shape, not three
 
+**SCOPE DECISION, 2026-09-12.** The architecture below is agreed and stays on
+this list. It is **not** the near-term work. The near-term work is the minimal
+set that makes the shapes roughly agree, in §3b-now. Everything else is
+**deferred and tracked**, not dropped, and should not be re-litigated each time
+it comes up.
+
+#### 3b-now. The minimal set
+
+Tier 1, half a day, near-zero risk. Per-connection handling is **already**
+consolidated in `server::serve_connection`, so what is left is small:
+
+- [ ] **`App` sets a read timeout after accept.** Three lines at `app.rs:1872`
+      plus a config key with a default. Five App services gain a protection
+      they do not have, and it removes one of m6-auth-server's two reasons for
+      a bespoke main. Most urgent item here: it is a live exposure and the site
+      has not been publicised yet.
+- [ ] **Socket permissions as a config key.** ~5 lines in `server.rs`, then
+      delete m6-auth-server's `set_permissions` block. Removes its other
+      reason. After this its main differs in exactly one respect: it drives its
+      own accept loop.
+
+Tier 2, about a day, moderate risk, optional:
+
+- [ ] **Extract the accept/poll block into core.** m6-file's loop is 22 of 33
+      lines identical to `App`'s; both poll listener-plus-watcher-fd and differ
+      only in local names. One function both call. After this the stragglers'
+      mains are thin wrappers around core's loop, core's connection handling
+      and core's socket setup, which is "roughly agree" honestly earned with no
+      migration, no router change and no contract change.
+
+Unrelated to shape, free, no baseline needed:
+
+- [ ] **`send_with_length` has zero callers**, and m6-file's HEAD path does a
+      full `fs::read` + minify + brotli-6 before discarding the body at
+      `h1.rs:700`. ~20 lines, and a performance win rather than a cost.
+
+#### 3b-later. Agreed, deferred, still on the list
+
+Design is settled and written up in `docs/m6-app-shape-plan.md`. Not scheduled.
+
+- [ ] **Wildcard route segment.** `Segment` is `Literal|Param` and
+      `match_route` requires exact segment-count equality, so no router can
+      express a static file server. Only needed to migrate m6-file fully into
+      `App`.
+- [ ] **Streaming response body.** `Responder`'s three senders all take
+      `&[u8]` and `Response.body` is a `Vec<u8>`, so core cannot serve a body it
+      has not materialised. Matters on a 950MB box.
+- [ ] **The IO layer**: one selectable stream interface whatever the transport,
+      with blocking handled *inside* it by specific named components, never a
+      generic offload. Pilot is unifying `PoolManager { pools, url_backends }`.
+- [ ] **The event loop**: reads on the loop, connection state machine, handlers
+      inline.
+- [ ] **The handler contract** changes meaning from "may block" to "must not
+      block". This is what everything above rests on.
+
+---
+
 The owner's standing requirement: **every app has the same general structure,
 and that structure is documented well enough to pick up from outside the m6
 repo**, with **no performance regression**.
