@@ -1,18 +1,3 @@
-/// Library-level error type.
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("not found")]
-    NotFound,
-
-    #[error("forbidden")]
-    Forbidden,
-
-    #[error("bad request: {0}")]
-    BadRequest(String),
-
-    #[error(transparent)]
-    Other(#[from] anyhow::Error),
-}
-
-/// Library-level result type.
-pub type Result<T> = std::result::Result<T, Error>;
+//! Re-export shim. The error type lives in `m6-core` as of Phase 5; this keeps
+//! `m6_render::error::{Error, Result}` working until Phase 6 moves consumers.
+pub use m6_core::error::{Error, Result};
