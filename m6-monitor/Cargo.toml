@@ -1,0 +1,21 @@
+[package]
+name    = "m6-monitor"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "m6-monitor"
+
+[dependencies]
+# One crate. That is the point of it.
+m6-core    = { path = "../m6-core", features = ["http-client"] }
+anyhow     = "1"
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing    = "0.1"
+
+toml       = "0.8"
+ureq       = { version = "2", features = ["json"] }
+
+[dev-dependencies]
+tempfile = "3"
