@@ -91,8 +91,10 @@ is small, that is worth knowing.
 - [ ] **Benchmark Phase 5 and 6.** The plan requires a delta per phase and
   neither has one. The whole request path moved between crates and one virtual
   call per templated response was added.
-- [ ] **Prove `m6-monitor` against the real fleet.** It is tested and has
-  never polled a real node. Those are different claims.
+- [ ] **Deploy `m6-monitor` on the build host and prove it.** Tested, never
+  polled a real node. It runs off-fleet: a monitor on syd cannot report that
+  syd is down. `deploy/FLEET-MONITOR.md` is the runbook, and the build host
+  already reaches all three nodes and already holds the `/perf` token.
 - [ ] **A log-target histogram on `/perf`.** Would remove Part A of the hourly
   health check outright, which is the last thing in it that needs ssh apart
   from ufw counts.

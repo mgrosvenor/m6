@@ -118,8 +118,11 @@ Services: `m6-http` (edge/proxy), `m6-file`, `m6-html`, `m6-auth-server`,
    inside `#[cfg(target_os = "linux")]`, no Linux target is installed here, and
    the inotify alignment fix in `8bcebac` has **never been through a
    compiler**.
-4. **Prove `m6-monitor` against the real fleet.** It is tested and has never
-   polled a real node. Those are different claims.
+4. **Deploy `m6-monitor` on the build host and prove it.** It is tested and has
+   never polled a real node. `deploy/FLEET-MONITOR.md` is the runbook. It runs
+   **off-fleet**, not on the centre: a monitor on syd cannot report that syd is
+   down. The build host already reaches all three nodes and already holds the
+   `/perf` token.
 5. **The m6-http header sweep**, about a dozen ad-hoc lookups left.
 6. **HTTP Garden** (arxiv 2405.17737), the differential fuzzer. Needs Docker,
    so the build box.
@@ -187,8 +190,9 @@ subscriber produced, and every consumer re-derived it by squinting at a sample.
 ### `m6-monitor`, new service
 
 Polls every node's `/health` and `/perf`, serves `/` as a page and `/digest` as
-JSON. Central node only. `deploy/ORIGIN-NODE.md` in the site repo is the
-runbook.
+JSON. Runs on the **build host, outside the fleet**, because a monitor inside
+the fleet cannot report that the fleet is down. `deploy/FLEET-MONITOR.md` in
+the site repo is the runbook; `deploy/ORIGIN-NODE.md` is what is origin-only.
 
 **The WireGuard mesh is not a path to those endpoints.** Measured: origin's
 `10.0.0.1:80` is h2c-only and does not answer HTTP/1.1 at all, and the cache
@@ -301,3 +305,9 @@ New this session:
 18. **Check the transport before writing the runbook.** The monitor was
     designed against the WireGuard mesh because that is the obvious answer;
     origin's backbone listener is h2c-only and the cache nodes have none.
+19. **A monitor inside the thing it monitors cannot report the failure that
+    matters.** It was specified for the central node until the owner asked
+    where it should run. Run it on syd and the fleet digest dies with syd.
+    Related: a client that builds a fresh connection per request pays a cold
+    TLS handshake each time, which over a long link is most of the measurement
+    (828ms to lon, versus 27ms to syd, and the difference is the handshake).

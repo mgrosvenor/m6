@@ -27,9 +27,15 @@ pub struct NodeReading {
     /// Why `/perf` is absent, when it is. An aggregator that silently shows
     /// nothing for a node is indistinguishable from a healthy quiet node.
     pub perf_error: Option<String>,
-    /// Round trip for `/health`, measured from here. This is a network
-    /// measurement, not the node's own latency: it includes the path between
-    /// the monitor and the node, which is the point on a backbone.
+    /// Round trip for `/health`, measured from here, **including connect and
+    /// TLS**.
+    ///
+    /// This is a network measurement, not the node's own latency. It is the
+    /// cost of reaching the node from wherever the monitor runs, and over a
+    /// long link the handshake dominates it: from the build host in Sydney,
+    /// syd answers in 27ms and lon in 828ms, and almost all of that difference
+    /// is the handshake rather than anything either node did. Do not compare
+    /// it with the loopback TTFB, which measures the opposite thing.
     pub rtt: Option<Duration>,
     /// Set when the node could not be reached at all.
     pub unreachable: Option<String>,
@@ -52,13 +58,29 @@ impl NodeReading {
     }
 }
 
-fn get(url: &str, token: Option<&str>, timeout: Duration) -> anyhow::Result<(u16, String)> {
-    let agent = ureq::AgentBuilder::new()
+/// One agent per node, reused for both of that node's requests.
+///
+/// It was one agent per *request*, which meant a cold TLS handshake for each.
+/// Measured from the build host: 26ms to syd, 603ms to chi, 828ms to lon, and
+/// that is the handshake, not the node. Two requests per node paid it twice.
+///
+/// Not shared across nodes, because ureq pools per host anyway and a shared
+/// agent would serialise nothing useful while making the failure of one node
+/// harder to attribute.
+fn agent_for(timeout: Duration) -> ureq::Agent {
+    ureq::AgentBuilder::new()
         .timeout(timeout)
         // A monitor that follows redirects can be walked somewhere else by a
         // node it is supposed to be observing.
         .redirects(0)
-        .build();
+        .build()
+}
+
+fn get(
+    agent: &ureq::Agent,
+    url: &str,
+    token: Option<&str>,
+) -> anyhow::Result<(u16, String)> {
     let mut req = agent.get(url);
     if let Some(t) = token {
         req = req.set("Authorization", &format!("Bearer {t}"));
@@ -89,8 +111,14 @@ pub fn node(n: &Node, token: Option<&str>, timeout: Duration) -> NodeReading {
         unreachable: None,
     };
 
+    let agent = agent_for(timeout);
+
+    // First request on this agent, so the RTT below includes connect and TLS.
+    // That is deliberate and is what `rtt` documents: it is the cost of
+    // reaching the node, which is the thing a fleet view wants. `/perf` below
+    // reuses the connection and is not timed.
     let started = Instant::now();
-    match get(&format!("{}/health", n.url.trim_end_matches('/')), None, timeout) {
+    match get(&agent, &format!("{}/health", n.url.trim_end_matches('/')), None) {
         Ok((code, body)) => {
             reading.rtt = Some(started.elapsed());
             reading.health_status = Some(code);
@@ -116,7 +144,7 @@ pub fn node(n: &Node, token: Option<&str>, timeout: Duration) -> NodeReading {
         }
     };
 
-    match get(&format!("{}/perf", n.url.trim_end_matches('/')), Some(token), timeout) {
+    match get(&agent, &format!("{}/perf", n.url.trim_end_matches('/')), Some(token)) {
         Ok((200, body)) => match serde_json::from_str::<PerfReport>(&body) {
             Ok(p) => reading.perf = Some(p),
             Err(e) => reading.perf_error = Some(format!("unparseable: {e}")),
