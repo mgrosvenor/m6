@@ -291,6 +291,8 @@ mod tests {
             health_status: Some(if status == "degraded" { 503 } else { 200 }),
             perf,
             perf_error: None,
+            traffic: None,
+            traffic_error: None,
             rtt: Some(std::time::Duration::from_millis(3)),
             unreachable: None,
         }
