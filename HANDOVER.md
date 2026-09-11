@@ -1,6 +1,28 @@
 # Handover
 
-State of play for the next session. Written 2026-09-11.
+State of play for the next session. Written 2026-09-11, updated 2026-09-12.
+
+> ## Read first, 2026-09-12
+>
+> **The hourly health check was a session-only cron and it died with that
+> session.** Job `b54e3408`, 6:37/9:37/12:37/15:37/18:37/21:37 Sydney, six a
+> day, nothing between 21:37 and 06:37. `CronCreate` jobs are in-memory and
+> auto-expire after 7 days anyway. **If the owner still wants scheduled checks,
+> recreate it, and say plainly that it will not survive this session either.**
+> A durable version needs launchd or a real crontab on the Mac.
+>
+> **The app-shape architecture is agreed and deliberately not scheduled.** See
+> `docs/m6-app-shape-plan.md` and `docs/CONSOLIDATION-TODO.md` §3b. The split
+> is §3b-now (a read timeout, a socket-permissions key, optionally lifting a
+> duplicated accept loop, plus a free `send_with_length` fix) and §3b-later
+> (wildcard routing, streaming bodies, the IO layer, the event loop, the
+> handler contract). **Do not re-derive the argument.** It is written up.
+>
+> **Five addresses were blocked on 2026-09-12**, ledger and nodes at 31 rules
+> and in sync. One of them, `15.177.23.18`, was **not an attack**: it is the
+> eighth orphaned Route53 health check, and it was reported across three hourly
+> checks as the strongest malicious candidate of the day before its user agent
+> was read. See `deploy/BLOCKLIST.md`.
 
 **Read this, then `docs/CONSOLIDATION-TODO.md`.** This file is what is true;
 that one is the ledger of what is done and what is owed, audited against the
@@ -10,7 +32,7 @@ commit log rather than written from memory.
 
 ## 1. Where the work is
 
-**Branch `main`, clean, 71 commits ahead of the deployed `22ee3a4` here and 14
+**Branch `main`, clean, 78 commits ahead of the deployed `22ee3a4` here and 15
 ahead of `d6ebfa5` in the site repo. No migration code is deployed and the
 freeze holds until it is finished.**
 
@@ -24,8 +46,9 @@ freeze holds until it is finished.**
 >
 > This line was wrong twice, naming `b32e837` and 48 when `b32e837` had already
 > been superseded by the 2026-09-10 18:47 deploy (its fleet md5 `aced7223` is
-> now the `.prev` rollback target). Of the 14 site commits, three record the
-> hardening and block-ledger changes that *were* applied on instruction.
+> now the `.prev` rollback target). Of the 15 site commits, four record the
+> hardening, block-ledger and 2026-09-12 block changes that *were* applied on
+> instruction.
 
 Three production changes WERE applied on 2026-09-11, on instruction, as
 deliberate exceptions. They change how services are confined and what the
@@ -113,9 +136,10 @@ fn main() -> anyhow::Result<()> { App::new().run()?; Ok(()) }
 
 ## 3. What m6-core is now
 
-12,088 lines across 30 modules. This is the reference a new service is written
-against, and **writing that reference properly is an outstanding task**
-(`CONSOLIDATION-TODO.md` item 2).
+13,412 lines across 30 modules. **The reference is written:
+`docs/m6-core-reference.md`**, every module and its interface. The table below
+is the index; that file is the detail. What remains is *inside* the code:
+seventeen modules still have no module-level doc comment.
 
 | module | what |
 |---|---|
@@ -153,17 +177,23 @@ Services: `m6-http` (edge/proxy), `m6-file`, `m6-html`, `m6-auth-server`,
    read as current state). What remains is *inside* the code: seventeen of the
    thirty modules still have no module-level doc comment, listed in
    `CONSOLIDATION-TODO.md`.
-2. **One app shape.** Owner's standing requirement, with "no performance
-   regression" attached to it. **`docs/m6-app-shape-plan.md`** is the plan:
-   five core enhancements, why m6-http is excluded structurally rather than by
-   assertion, what each enhancement transfers to which apps, and the sequence.
-   Two of the five fix live defects in services that are already the right
-   shape, so they stand alone: **`App` sets no read timeout** (five services
-   exposed, and migrating the two stragglers as-is would delete the fleet's
-   only two), and **`send_with_length` has zero callers** (m6-file's HEAD does
-   a full read, minify and brotli-6, then discards the body).
-   The first step is **benchmarking Phases 5 and 6**, which is owed anyway:
-   without that baseline nothing below can claim it did not regress.
+2. **One app shape, minimal set only.** Scoped 2026-09-12; the architecture is
+   agreed and deferred (`CONSOLIDATION-TODO.md` §3b). Do these and stop:
+   - **`App` sets a read timeout after accept.** Three lines at `app.rs:1872`
+     plus a config key. **The one urgent item on this whole list**: neither
+     `App` nor `m6_core::server` sets one, so five services park a worker
+     indefinitely on a silent peer, and the site has not been publicised yet.
+   - **Socket permissions as a config key**, so m6-auth-server stops setting
+     `0666` by hand.
+   - Optional: **lift the accept/poll block** m6-file duplicates 22 of 33 lines
+     of.
+   - Free, unrelated to shape: **`send_with_length` has zero callers** while
+     m6-file's HEAD does a full `fs::read`, minify and brotli-6 before
+     discarding the body at `h1.rs:700`.
+
+   Anything touching performance still wants **benchmarking Phases 5 and 6**
+   first, which is owed anyway. The four above are either a socket option, a
+   config key, a code move, or strictly less work, so none of them needs it.
 2b. **Finish header to dict.** `FrameworkState::build_dict` is private and is
    where the real knowledge lives: twelve ordered steps, and the ordering is
    load-bearing (built-ins go in *after* params files so a params file cannot
@@ -228,6 +258,82 @@ Most of this is now reachable over HTTP instead of ssh, because `/perf` carries
 the host's load, memory, disk and temperature. What still needs a shell: the
 **log-target histogram** (Part A) and **ufw block counts**. A log-target count
 on `/perf` would remove Part A outright and is worth doing.
+
+---
+
+## 6a. Session of 2026-09-12
+
+Eight commits, `588daca` to `0a40584`. Docs and small core changes; **nothing
+deployed, freeze intact**.
+
+### The Linux build host works, and closed the oldest unverified item
+
+`deploy/run-tests.sh` rsyncs both trees to `root@45.63.29.146` **port 4022** and
+enforces zero warnings on Linux. **It needs no push, only a committed tree.**
+Result: **m6 962 passed, renderers 9 passed, 0 failed, 0 warnings** on release
+and test builds, same test count as macOS.
+
+- **The inotify alignment fix compiled for the first time**, and
+  `const _: () = assert!(align_of::<libc::inotify_event>() <= 8)` was
+  *evaluated* and holds. That premise was untested until now.
+- **New gap found doing it: `ConfigWatcher` has no tests on any platform.**
+  `tests/log_reload.rs` covers `LogHandle::reload`, not the watcher. Config hot
+  reload has never been exercised. "Never compiled" is closed; "never
+  exercised" is not.
+- Box is Linux, 4 cores, rustc 1.98.0, **h2spec and h3spec installed**, **no Go
+  and no Docker** (so Phase 8 and HTTP Garden need a toolchain install).
+- It is also **staging**, and staging is a **single origin**: it cannot
+  exercise the cache role, which is the role the 226/NAMESPACE outage hit.
+
+### Conformance: h2 verified, h3 gate is broken
+
+**h2spec 146/146 on Linux**, matching baseline. h3spec produced **no score and
+the script reported PASS**, which is two bugs in `tools/conformance.sh`:
+
+- `run_h3` never calls `start_edge`; `run_h2` does. Standalone
+  `conformance.sh h3` tests a port with nothing on it.
+- It only records a score `if got > 0`, so measuring nothing reports PASS.
+- Separately, `MEASURED="$WORK/measured.txt"` is truncated at script init but
+  `mkdir -p "$WORK"` runs ~330 lines later, so on a fresh box the ratchet's
+  bookkeeping silently fails to write.
+
+There are **no h2 or h3 floors** in `conformance-scores.txt`, only the four h1
+targets.
+
+### Core changes
+
+- **`testkit::assert_app_lifecycle`**: the whole lifecycle contract in one call
+  (exit status is success not a signal, socket removed, three lines logged
+  under the right name). It was opt-in and hand-copied into five suites, which
+  is why the sixth service never got one.
+- **`m6-monitor/tests/lifecycle.rs`**: it had no `tests/` directory at all. 17
+  unit tests and nothing had ever started the binary. It passes, so it was
+  always structurally right and merely unproven.
+- **`socket_path_from_config` consolidated, four copies to one.** The
+  derivation existed in `m6-core/src/server.rs` *and* `m6-file/src/config.rs`
+  with a different fallback stem, and m6-file called its own; the
+  `M6_SOCKET_OVERRIDE` wrapper was then duplicated in three mains. The override
+  now lives inside core's function.
+
+### New documents
+
+- **`docs/m6-core-reference.md`**: all 30 modules and their interfaces.
+- **`docs/m6-app-anatomy.md`**: the app shape, written to be followed from
+  another repo.
+- **`docs/m6-app-shape-plan.md`**: the single-threaded target, the evidence,
+  and the deferral.
+- `m6-render-lib.md` marked SUPERSEDED, `m6-core.md` §9 marked historical.
+
+### Production facts learned
+
+- **syd is 1 core and 950MB.** `m6-file` runs **32** workers on it; `m6-html`,
+  which renders every HTML page at ~6ms, runs **1** (no `size` line). The 32
+  was raised reactively after the gallery exhausted the default.
+- **The health check tool has a bug**: over windows longer than ~60 minutes the
+  UA-rotation heuristic flags the backbone addresses `10.0.0.4` (lon) and
+  `10.0.0.5` (chi) as forging bot UAs, because a cache node relays real
+  clients' agents. It then **excludes those requests from crawler counts**, so
+  wide-window crawler totals are understated. Not yet fixed.
 
 ---
 
@@ -336,12 +442,22 @@ renderers switched to m6-core.
   Neither is understood. A test that fails only when the machine is busy is
   either a real race or a test that is too tight, and both are worth knowing
   which.
-- **`185.19.40.146` is a block candidate and was left alone.** It ran the same
-  `//xmlrpc.php` sweep three times on 2026-09-11: 06:34:53, 10:24:24 and
-  11:48:04, about 20 requests each, 90% refused, nothing obtained. That is the
-  pattern `BLOCKLIST.md` blocks for, and the same standard as
-  `103.168.67.253` already in the ledger. Not blocked because the hourly check
-  is read-only and blocking is a write; it needs a decision, not a discovery.
+- ~~**`185.19.40.146` is a block candidate**~~ **BLOCKED 2026-09-12**, with
+  four others. Ledger and all three nodes at 31 rules, in sync.
+  **The open question it leaves is the campaign, not the address.** One
+  `//xmlrpc.php` operator ran an identical signature from three addresses,
+  rotating *and returning*: `185.19.40.146` (06:34, 10:24, 11:48, 12:32, 19:06,
+  20:10), `34.24.203.92` (14:47), `35.237.17.157` (15:14), the latter two both
+  GCP. Per-IP blocking slows it and will need topping up. **The structural
+  answers are in `BLOCKLIST.md`'s own closing section and neither exists:
+  negative caching, and a 404-rate throttle.** Negative caching is the bigger
+  prize: every 404 is uncacheable today, so on a cache node each junk request
+  crosses the Pacific and back at ~207ms.
+- **`45.142.193.161` was deliberately NOT blocked.** Top firewall-drop source
+  on all three nodes for eight hours, ~1,430 packets, but it never reaches the
+  application: it scans closed ports and the default deny already drops it. An
+  explicit rule would change nothing and imply the application had been
+  touched.
 - **A coordinated probe hit chi** at 05:47-05:50 UTC: `34.91.241.0` (GCP), 890
   requests in under three minutes rotating 526 user agents, targeting SSRF
   (`/fetch`, `/proxy`), cloud credentials (`.aws`, `.azure`, gcloud ADC) and
@@ -431,3 +547,35 @@ New this session:
     `deploy/systemd/m6-html.service`, read earlier the same session, and the
     mistake was made anyway. A caution that lives only next to the code it
     guards will be read and not retained. That is why it is here.
+
+New 2026-09-12:
+
+22. **Counts rank a source; identity decides what it is.** `15.177.23.18` sent
+    371 requests to chi, 100% refused, for three hours without adapting, and
+    was reported across three consecutive hourly checks as the strongest
+    malicious block candidate of the day. Reading one field settled it:
+    `UA: Amazon-Route53-Health-Check-Service`, path `/route53-health/index.php`,
+    every 30 seconds to the second. It is the eighth orphaned health check, and
+    seven siblings were already in the ledger. **Every trait that made it look
+    like a determined attacker is what a dead health check looks like**: high
+    volume, total failure, infinite persistence, no adaptation. An attacker
+    varies paths when refused; nothing was reading these results to vary them.
+    Rank by counts, then read the user agent and the path before naming it.
+23. **A gate that cannot measure must fail, not pass.** `run_h3` in
+    `tools/conformance.sh` never starts the server it tests, and records a
+    score only `if got > 0`, so a run that measured nothing printed **PASS**.
+    That is lesson 12 living inside the thing built to enforce lesson 5. Any
+    check whose failure mode is silence needs an explicit "did I actually
+    measure anything" assertion.
+24. **The same defect wears different clothes at every layer.** Four copies of
+    `socket_path_from_config`, five hand-written copies of the lifecycle
+    assertion, two accept loops 22/33 identical, four I/O idioms, two
+    concurrency models. Each was found by asking "how many implementations of
+    this are there?" rather than by reading any one of them. That question is
+    the most productive one available in this codebase and it has not stopped
+    paying yet.
+25. **Check which mechanism is running before explaining why it cannot work.**
+    Asked to reschedule the hourly health check, I explained at length why a
+    cloud routine could not reach production over ssh. The check was a local
+    session cron using my own shell and keys, and the answer was one field in
+    a cron expression. `CronList` first, theory second.

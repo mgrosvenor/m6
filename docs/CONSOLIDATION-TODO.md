@@ -342,8 +342,8 @@ and UDP, TLS, h2, h3, proxying, the cache. It is what `App` services sit behind.
 
 ## Deployment state
 
-**Nothing from the m6 migration is deployed.** 69 commits ahead of `22ee3a4`
-here, 14 ahead of `d6ebfa5` in the site repo. The freeze holds until the
+**Nothing from the m6 migration is deployed.** 78 commits ahead of `22ee3a4`
+here, 15 ahead of `d6ebfa5` in the site repo. The freeze holds until the
 migration finishes; that is the owner's standing instruction.
 
 The deployed commit is whatever the newest entry in
