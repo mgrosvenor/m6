@@ -1,24 +1,24 @@
 # Handover
 
-State of play for the next session. Written 2026-09-11, updated later the
-same day after Phase 5 landed.
+State of play for the next session. Written 2026-09-11.
+
+**Read this, then `docs/CONSOLIDATION-TODO.md`.** This file is what is true;
+that one is what is left, as a list to tick off.
 
 ---
 
 ## 1. Where the work is
 
-**Branch `main`, clean, 38 commits ahead of the deployed `b32e837` in this
-repo and 6 in the site repo. Nothing is deployed. The freeze holds until the whole migration is
+**Branch `main`, clean, 40 commits ahead of the deployed `b32e837` here and 6
+in the site repo. Nothing is deployed. The freeze holds until the migration is
 finished.**
 
-- 862 workspace tests pass at default features, 871 with `--all-features`.
-  Zero warnings. The count went 863 -> 862 because a duplicate
-  `socket_path_from_config` test went with the duplicate function.
+- 923 workspace tests pass at default features. Zero warnings.
 - h1spec **32/32 on all four HTTP/1.1 targets**, with a CI ratchet
   (`tools/conformance.sh`, floors in `tools/conformance-scores.txt`) wired into
   `check.sh` as a blocking gate.
-- h2spec and h3spec are **not installed on the laptop** and have skipped on
-  every local run. They must run on the build box before deploy.
+- h2spec and h3spec are **not installed on the laptop** and skip on every local
+  run. They must run on the build box before deploy.
 
 ### Migration status (`docs/m6-core-implementation-plan.md`)
 
@@ -29,27 +29,27 @@ finished.**
 | 2 | `m6_core::testkit` | done |
 | 3 | Semantics | done, 3.3 dropped |
 | 4 | HTTP/1.1 | done, 32/32 |
-| **5** | **Service loop** | **done** |
-| **6** | **Consumer apps link `m6-core` only** | **done** |
-| 7 | Decouple the repositories | not started |
+| 5 | Service loop | done |
+| 6 | Consumer apps link `m6-core` only | done |
+| 7 | Decouple the repositories | **next**, not started |
 | 8 | Backend examples | not started |
+
+**`m6-render` no longer exists.** m6-core is the only crate a service links.
 
 ---
 
-## 2. Standing constraints — these do not lapse
+## 2. Standing constraints that do not lapse
 
 - **Never use em dashes** in prose written for the owner.
 - **Zero compiler warnings**, pre-existing included, checked on Linux.
 - **Test locally, commit, then deploy. Never deploy from an uncommitted tree.**
 - **Secrets never enter git.** Only `.example` files, paths, documented shape.
-  Values live on the boxes.
 - Any change to **layout, copy, or rendering** needs individual approval before
   it ships.
 - Image resizing is the owner's job.
 - Firewall blocks are **per-IP only**, no CIDR rules.
 - Crawler sightings are reported **explicitly, every run**, even a quiet one.
-- The build box is **not backed up**. Everything done to a node is captured in
-  git.
+- The build box is **not backed up**. Everything done to a node is in git.
 - Keep dynamic allocations to an absolute minimum. **Latency is the key
   metric.**
 - "Clean and consistent is the only way forwards. Apps should deviate only
@@ -57,79 +57,89 @@ finished.**
 - "Clean simple code with lots of reuse out of core. This is not the place to
   get clever or inventive."
 
+### The architectural rule, restated 2026-09-11
+
+**m6-core is the PHP of m6: a box of blocks a service is assembled from.**
+Anything we can reasonably expect to generalise to other sites and instances
+belongs in core, and core should be **the only thing a service needs to link**
+to build its own m6-compatible service. mgrosvenor.com is the first instance of
+a general system, not the thing the system is for.
+
+A default service being nearly a no-op on top of core is the result we want,
+not a smell. `m6-html` is the whole renderer:
+
+```rust
+use m6_core::prelude::*;
+fn main() -> anyhow::Result<()> { App::new().run()?; Ok(()) }
+```
+
 ---
 
-## 3. What Phase 4 produced
+## 3. What m6-core is now
 
-**Five HTTP/1.1 implementations became one**, `m6-core/src/h1.rs`. All four
-conformance targets (m6-file, m6-html, m6-auth-server, m6-http-redirect) went
-27 → 30 → 32 out of 32.
+12,088 lines across 30 modules. This is the reference a new service is written
+against, and **writing that reference properly is an outstanding task**
+(`CONSOLIDATION-TODO.md` item 2).
 
-New in `m6-core`:
+| module | what |
+|---|---|
+| `app` | the service loop: thread pool, bounded queue, 503 backpressure, routing, config reload |
+| `h1`, `parse`, `http` | HTTP/1.1 parsing, framing, the one response writer |
+| `server` | unix socket server, `serve_connection` |
+| `request`, `response` | the handler-facing types, form/query/cookie parsing, percent coding |
+| `cookie` | the one `Set-Cookie` formatter |
+| `headers` | case-insensitive access, repeated fields, RFC-correct combining |
+| `config` | TOML config loading |
+| `ndjson` | newline-delimited JSON, read and written |
+| `telemetry` | analytics records, `periodic stats`, traffic classification |
+| `host` | load, memory, disk, thermal, uptime. Reading only |
+| `monitoring` | `/health` and `/perf`, shared by producer and consumer |
+| `render`, `template` | the renderer seam, and Tera behind it |
+| `conditional`, `negotiate`, `mime`, `compress`, `minify` | caching semantics, content negotiation |
+| `signal`, `watcher`, `log`, `random`, `path`, `util`, `error` | the rest of the runtime |
+| `testkit` | the shared harness, behind a feature |
 
-| item | file | what |
-|---|---|---|
-| `h1::parse_request` | `h1.rs` | The one HTTP/1.1 parser. Pure. |
-| `h1::Responder` | `h1.rs` | The one response writer. Owns HEAD suppression and `Connection`. |
-| `h1::Expectation`, `expectation()` | `h1.rs` | `Expect: 100-continue` (RFC 9110 10.1.1) |
-| `h1::keep_alive`, `status_reason` | `h1.rs` | Persistence decision, reason phrases |
-| `server::serve_connection` | `server.rs` | The one backend connection loop |
-| `testkit::read_one` | `testkit/response.rs` | Read exactly one response, method-aware |
-| `ForwardedTrust` etc. | `m6-http/src/forward.rs` | Trusted client-address attribution |
-
-**Deleted:** four serialisers (m6-file's three writers, m6-render's
-`Response::write_to`, the one inside `RawResponse::to_bytes`), m6-render's
-`handle_connection`, m6-http's second HTTP/1.1 implementation in `redirect.rs`.
-
-### Bugs found and fixed along the way, all awaiting the same deploy
-
-1. **SIGTERM could not stop the `:80` redirect listener.** `main` blocks the
-   shutdown signals so only core's `sigwait` thread sees them; redirect mode
-   returned before installing that thread. Only SIGKILL worked. Guarded by
-   `m6-http/tests/redirect_lifecycle.rs`.
-2. **The `:80` redirect dropped every query string.** `http://host/x?v=1` went
-   to `https://host/x`.
-3. **Backends answered a HEAD with a body** on every error path, and never kept
-   a connection open, so every cache miss paid a fresh connect.
-4. **`OPTIONS *` and `CONNECT` were answered 400** by the redirect listener.
-5. **Origin attributed every relayed request to the WireGuard tunnel**, so all
-   traffic through one cache node shared a single 300/min rate-limit bucket.
-6. **`conformance.sh --update` deleted the floors it had not measured.**
+Services: `m6-http` (edge/proxy), `m6-file`, `m6-html`, `m6-auth-server`,
+`m6-md`, `m6-monitor`, plus `m6-auth`/`m6-auth-cli`.
 
 ---
 
 ## 4. Immediate next steps, in order
 
-1. **Deploy `m6-monitor` and prove it.** It has never run against the fleet.
-   It needs `configs/m6-monitor.conf` shipped to syd and the unit installed;
-   `deploy/ORIGIN-NODE.md` in the site repo is the runbook. Everything else
-   about it is tested, but "tested" and "has ever polled a real node" are
-   different claims.
-2. **Compile the watcher fix on the build box.** `m6-core/src/watcher.rs` is
-   inside `#[cfg(target_os = "linux")]` and no Linux target is installed on
-   the laptop, so the inotify alignment fix in `8bcebac` has never been
-   through a compiler. It is three lines and a const assertion, and it is
-   still unverified.
-3. **HTTP Garden** (arxiv 2405.17737), the coverage-guided differential fuzzer.
-   Outstanding from "do them both". Needs Docker, which is not on the laptop, so
-   it runs on the build box.
-4. **h2spec and h3spec on the build box** before any deploy.
-5. **Re-derive the cache-hit latency baseline.** See §6.
-6. **Item 11**, normalise the cache key to `{identity, gzip, br}`. Deferred; has
-   an encoding-agreement hazard.
-7. **Benchmark Phase 5**, paired and interleaved, against the fixed baseline.
-   The plan requires every phase to report a delta and Phase 5 has not. It
-   moved the whole request path between crates and added one virtual call per
-   templated response, so a number is owed even if it is a flat one.
+1. **Document m6-core in full.** Owner's request. Start with the list of every
+   component available, then detail each component and its interface. Core is
+   now the only crate a service links and there is no reference to write one
+   against.
+2. **Finish header to dict.** `FrameworkState::build_dict` is private and is
+   where the real knowledge lives: twelve ordered steps, and the ordering is
+   load-bearing (built-ins go in *after* params files so a params file cannot
+   override them). The dict-to-header half landed in `3e7a7d8`.
+3. **Compile the watcher fix on the build box.** `m6-core/src/watcher.rs` is
+   inside `#[cfg(target_os = "linux")]`, no Linux target is installed here, and
+   the inotify alignment fix in `8bcebac` has **never been through a
+   compiler**.
+4. **Prove `m6-monitor` against the real fleet.** It is tested and has never
+   polled a real node. Those are different claims.
+5. **The m6-http header sweep**, about a dozen ad-hoc lookups left.
+6. **HTTP Garden** (arxiv 2405.17737), the differential fuzzer. Needs Docker,
+   so the build box.
+7. **h2spec and h3spec on the build box** before any deploy.
+8. **Benchmark Phases 5 and 6.** The plan requires a delta per phase and
+   neither has one. The whole request path moved between crates.
+9. **Phase 7**, then **Phase 8**.
 
 ---
 
 ## 5. The hourly health check
 
-**Read `docs/health-check.md` before running it.** The pasted prompt is written
-in syd terms and is not sufficient on its own.
+**It is a program now: `tools/health-check.py`.** One ssh per node, run in
+parallel, all five parts across all three nodes, read-only, exit 1 on faults.
+`--load` also reads a loaded window and labels it GENERATED.
 
-Three nodes, all checked every run:
+`docs/health-check.md` is still worth reading, but as *why*, not *how*. Every
+trap it describes is encoded in the script.
+
+Three nodes, always all three:
 
 | node | role | service | WireGuard | analytics file |
 |---|---|---|---|---|
@@ -137,158 +147,157 @@ Three nodes, all checked every run:
 | lon | cache | `m6-http-cache` | 10.0.0.4 | `/var/www/m6-cache/logs/analytics.ndjson` |
 | chi | cache | `m6-http-cache` | 10.0.0.5 | `/var/www/m6-cache/logs/analytics.ndjson` |
 
-Anything a cache node serves from its own cache never reaches origin, so a
-syd-only reading is **biased, not partial**.
+Most of this is now reachable over HTTP instead of ssh, because `/perf` carries
+the host's load, memory, disk and temperature. What still needs a shell: the
+**log-target histogram** (Part A) and **ufw block counts**. A log-target count
+on `/perf` would remove Part A outright and is worth doing.
 
 ---
 
-## 5b. What Phase 6 produced, and the new services
+## 6. What this session produced
 
-`m6-render` is **deleted**. m6-core is the only crate a service links, and it
-carries templating, the service loop, request/response, config, ndjson,
-telemetry and host metrics. m6-html is four lines.
+### Phases 5 and 6: m6-render is gone
 
-The plan's justification for Phase 6 was wrong and is worth not repeating:
-"three of four consumers have zero template files yet link Tera" is true about
-files and false about need. All three render templates out of the *site*
-directory. Giving them `NoTemplates` would have compiled and 500'd every page.
+`app.rs` (2,651 lines), `request`, `response`, `config`, `server`, `util`,
+`error`, `multipart` and `template` all moved into core. m6-render deleted.
 
-New in core since:
+The render seam is `m6_core::render`: `Renderer`, `RendererFactory`,
+`RenderError`, `NoTemplates`. Core routes, builds the dictionary, compresses
+and writes; it does not depend on Tera at the type level, only by default.
+`App::new()` gives you Tera; `.renderer(NoTemplates)` opts out.
 
-| module | what |
-|---|---|
-| `ndjson` | NDJSON read/write. A torn last line is ordinary, skipped and counted |
-| `telemetry` | `AnalyticsRecord` (the definition the format never had), `PeriodicStats`, traffic classification, UA-forgery detection |
-| `host` | load, memory, disk, thermal, uptime. Reading only, no thresholds |
-| `monitoring` | `/health` and `/perf` wire types, shared by producer and consumer |
+**`{{ not_found() }}` is typed now.** It used to fail the render with the magic
+string `__M6_NOT_FOUND__` and the loop recovered the intent with
+`msg.contains(..)`.
 
-`/perf` now carries the host snapshot. `/health` is still exactly
-`{"status","node"}` and a test pins it.
+**The plan's justification for Phase 6 was wrong**, and it is worth not
+repeating: "three of four consumers have zero template files yet link Tera" is
+true about files and false about need. All three render templates out of the
+*site* directory and use `| asset` and `img_dims()`. Giving them `NoTemplates`
+would have compiled and 500'd every page.
 
-**`m6-monitor`** is a new service at the central node: polls every node's
-`/health` and `/perf`, serves `/` as a page and `/digest` as JSON. It has
-never run against the real fleet. `deploy/ORIGIN-NODE.md` in the site repo is
-its runbook and records the thing that surprised me: the WireGuard mesh is not
-a path to these endpoints, because origin's backbone listener is h2c-only and
-the cache nodes have no backbone listener at all.
+### New in core
+
+`ndjson`, `telemetry`, `host`, `monitoring`, `cookie`, `headers`. See §3.
+
+`AnalyticsRecord` is the definition the analytics format never had: m6-http
+emits rows through `tracing::info!` so the JSON shape was whatever the
+subscriber produced, and every consumer re-derived it by squinting at a sample.
+
+### `m6-monitor`, new service
+
+Polls every node's `/health` and `/perf`, serves `/` as a page and `/digest` as
+JSON. Central node only. `deploy/ORIGIN-NODE.md` in the site repo is the
+runbook.
+
+**The WireGuard mesh is not a path to those endpoints.** Measured: origin's
+`10.0.0.1:80` is h2c-only and does not answer HTTP/1.1 at all, and the cache
+nodes have *no* backbone listener. It polls the per-node public names instead,
+which means it measures through each node's public edge and is **not**
+comparable with the loopback TTFB.
+
+### Bugs fixed, all awaiting the same deploy
+
+Carried forward from Phase 4: the `:80` redirect SIGTERM bug, the dropped query
+string, HEAD-with-a-body on error paths, `OPTIONS *`/`CONNECT` 400s, the
+WireGuard client-IP attribution, `conformance.sh --update` deleting floors.
+
+New this session:
+
+7. **`/health` was publishing the internal topology.** Every backend pool by
+   name with worker counts, plus `uptime_s` and `url_backends`, on an
+   unauthenticated public URL. Now `{"status","node"}`; the detail moved to
+   token-gated `/perf`. The test that should have caught it checked an
+   allowlist that the leaked fields were *on*.
+8. **The inotify read buffer was unaligned.** Cast a `[u8; 4096]` straight to
+   `*const libc::inotify_event` and dereferenced it. Undefined behaviour that
+   happened to work. **Still never compiled.**
+9. **`looks_like_injection` matched the raw path**, so `UNION%20SELECT` never
+   matched `union select`. SQLi in a URL is always percent-encoded, so the
+   detector read clean against exactly the traffic it exists to catch.
+10. **Two stale `csrf` tests** had not compiled since Phase 4. `run-tests.sh`
+    runs default features, `csrf` is not one, so nothing ever built them.
+11. **`check-templates.sh` gated on a log line that no longer exists**
+    (`"m6-render started"`, now `"routes loaded"`), so the template gate
+    reported FAILED on a clean start. Run by hand, which is why nobody noticed.
+
+### Site repo
+
+The container gutter asymmetry (`#curriculum-value` set `padding-left` and
+never `padding-right`, 7px against 25px at ≤768px, experience page only), the
+1144px max-width, `style.css` normalised to LF with a `.gitattributes`, and the
+renderers switched to m6-core.
 
 ---
 
-## 5a. What Phase 5 produced
+## 7. Open questions, honestly unresolved
 
-`m6-render` went from ~4,900 lines to 904, of which 754 is `template.rs`.
-`app.rs` (2,651 lines), `request.rs`, `response.rs`, `config.rs`,
-`server.rs`, `util.rs`, `error.rs` and `multipart.rs` are all in `m6-core`.
-
-The seam is `m6-core/src/render.rs`: `Renderer`, `RendererFactory`,
-`RenderError` and `NoTemplates`. Core routes, builds the dictionary,
-compresses and writes; it does not render and links no template engine.
-`m6-html` supplies `TeraRenderer`/`TeraFactory`.
-
-Three things worth knowing:
-
-- **`{{ not_found() }}` is typed now.** It used to fail the render with the
-  magic string `__M6_NOT_FOUND__` and the service loop recovered the intent
-  with `msg.contains(..)`. Tera still needs the sentinel internally because
-  its errors are strings, but it converts at the boundary.
-- **chrono and lru are unconditional deps of `m6-core`.** Gating them behind
-  an `app` feature kept them out of m6-file, m6-http and m6-auth-server but
-  stopped a default `cargo test --workspace` from compiling the 97 tests that
-  came with `app.rs`. Owner chose the dependency over the blind spot.
-- **`m6_render::App` is a unit struct, not a re-export.** Core's
-  `App::new()` takes a renderer; the shim's four constructors hand it
-  `TeraFactory` so the site renderers did not have to change. Phase 6
-  deletes it.
-
-Also fixed along the way, and also awaiting the same deploy:
-
-7. **`/health` was publishing the internal topology.** Every pool by name
-   (`m6-html`, `m6-file`, `render-contact`, `render-analytics`) with worker
-   counts, plus `uptime_s` and `url_backends`, on an unauthenticated public
-   URL. It is `{"status","node"}` now; the detail moved to token-gated
-   `/perf`. The test that should have caught it checked an allowlist that
-   the leaked fields were on, so it passed for as long as the leak existed.
-8. **The inotify read buffer was unaligned.** `read_events` cast offsets in a
-   `[u8; 4096]` straight to `*const libc::inotify_event` and dereferenced
-   them. That struct needs 4-byte alignment and a byte array has 1, so it was
-   undefined behaviour that happened to work. Owner spotted it. Not compiled
-   yet, see step 2 above.
-
----
-
-## 6. Open questions, honestly unresolved
-
-- **The cache-hit p50 baseline is unverified.** Recorded as 1.7-2.2us; syd has
-  measured a flat ~3.3us across 299 windows in 24 hours on an idle box. Either
-  the band was derived differently or the drift predates the visible window.
-  Re-derive before treating a miss as an incident.
-- **Per-node cache hit rates need re-measuring** now that all three analytics
-  files are readable. The 24h journal figures were syd 0.57, lon 0.16, chi 0.21.
-  An earlier reconciliation looked wrong (chi reporting ~300 misses/hour while
-  origin logged ~10 requests from chi) but that was probably my own error:
-  I was reconciling chi's counters against origin's log, and origin never sees
-  what chi answers from cache. Confirm from chi's own file.
+- **The cache-hit p50 baseline is unverified.** Recorded as 1.7-2.2us; four
+  separate readings today put every node at 2.9-3.4us, flat across hundreds of
+  windows. The baseline is the thing in doubt, not the measurement. Re-derive
+  before treating a miss as an incident. `tools/health-check.py` deliberately
+  asserts no p50 threshold for this reason.
+- **24h hit rates**: syd ~0.58, lon ~0.16-0.19, chi ~0.19-0.21. Stable across
+  the day. The earlier reconciliation that looked wrong was my own error:
+  origin never sees what a cache node answers from its own cache.
 - **`redirect_lifecycle::sigterm_shuts_down_rather_than_being_ignored` is
-  flaky.** Failed once inside a full `--all-features --test-threads=1`
-  workspace run. Did not reproduce in eight isolated runs, twelve concurrent
-  runs, or a second full-suite run, and I never captured the assertion text,
-  so the cause is unknown. Ruled out: the obvious startup race, because
-  `redirect::run` installs `ShutdownHandle` *before* `bind_plain`, so a
-  successful `wait_for_tcp` already implies the signal thread exists. This
-  guards a bug that shipped, so a flaky version of it is worth a real
-  diagnosis rather than a retry.
-- **`149.28.160.27`** has appeared for four consecutive hours, presenting its own
-  IP as TLS SNI (rejected by rustls) and as a spoofed `Referer`. Low rate,
-  getting nothing. Companions: `108.61.197.71`, `66.42.119.239`.
+  flaky.** Failed once in a loaded full-suite run, would not reproduce in 21
+  further runs, and I never captured the assertion text. Ruled out: the obvious
+  startup race, because `redirect::run` installs `ShutdownHandle` *before*
+  `bind_plain`. It guards a bug that shipped.
+- **A coordinated probe hit chi** at 05:47-05:50 UTC: `34.91.241.0` (GCP), 890
+  requests in under three minutes rotating 526 user agents, targeting SSRF
+  (`/fetch`, `/proxy`), cloud credentials (`.aws`, `.azure`, gcloud ADC) and
+  LFI (`/@fs/...`). It got 795 404s, 85 429s and ten 200s, all of them `/`.
+  Nothing sensitive served. Candidate for a per-IP block; not blocked, because
+  the check is read-only.
 
 ---
 
-## 7. Lessons that cost something to learn
+## 8. Lessons that cost something to learn
 
-These are in the plan too, but they are the ones worth carrying.
+The first twelve are from Phase 4 and are in the plan too. These are the ones
+worth carrying.
 
-1. **Measure the candidate before consolidating onto it.** The plan said to
-   consolidate the HTTP/1.1 parsers onto `m6-core/src/parse.rs`. Measured, that
-   was the *worst* of the four at 14/32. The survivor is the one the edge
-   already used, because it is the only one that has been attacked.
-2. **A test can pin wrong behaviour as firmly as right behaviour.**
-   `empty_body_is_unchanged` asserted `content-length: 0` on a 204 and passed
-   for as long as the violation existed. `finding_7b` asserted that a chunked
-   body must be *rejected*. Both had to be rewritten to state the property
-   rather than the current output.
+1. **Measure the candidate before consolidating onto it.** The plan named
+   `m6-core/src/parse.rs` as the consolidation target for HTTP/1.1; measured,
+   it was the *worst* of the four at 14/32.
+2. **A test can pin wrong behaviour as firmly as right behaviour.** Both
+   `/health`'s allowlist test and `empty_body_is_unchanged` passed for as long
+   as the defect existed.
 3. **A number measured from traffic you generated is not a production number.**
-   Warming seven pages and hammering them reported `cache_hit_rate=1.0000` every
-   hour while the real edge ran at 0.16 to 0.21.
 4. **An absent file at the path you expected is not evidence the feature is
-   off.** I reported "the cache nodes record no analytics" as a finding. They
-   had 12 MB and 45 MB of it, at a different path. Check where the process
-   actually writes.
-5. **Conformance harnesses produce fake scores.** Three scores in this work were
-   artefacts: a bridge closing both directions on EOF (11/32), a bridge
-   forwarding half-close onto a TLS socket (6/32), and measuring a leftover
-   process that still held the port (5/32, 8/32). `bridge_sanity`,
-   `require_free_port` and `wait_port_owned_by` exist because of those.
-6. **Kill by PID. Never `pkill -f <pattern>` naming a port or config path** —
-   over ssh the command line contains that string too, so it matches its own
-   session. That has killed the connection three times.
-7. **Benchmark paired and interleaved, against a fixed baseline, not the
-   previous commit.** The build host runs a full m6 stack on 4 cores; the same
-   commit measured 320.66 and 366.24 ns. Also: `--sample-size` on the CLI is
-   silently overridden by `group.sample_size()` in the bench source.
-8. **Do not hand-roll a conformance tester.** The implementation writing its own
-   tester encodes the same misreading of the RFC twice and passes.
-9. **Derive a security boundary structurally, not from config.** Forwarded-address
-   trust comes from the bind address via `Iface::for_bind`, so there is no key to
-   set wrong and no peer list to keep in step. A config reload is the thing that
-   silences logging on this fleet; a trust flag that a reload could get wrong is
-   a boundary that moves at deploy time.
-10. **Safe by default, opt in explicitly.** `Http2Conn::new()` trusts nothing;
-    the backbone listener calls `.trusting_forwarded_for()`. A connection built
-    any other way is safe by construction rather than by remembering.
+   off.** Check where the process actually writes.
+5. **Conformance harnesses produce fake scores.**
+6. **Kill by PID. Never `pkill -f <pattern>` naming a port or config path.**
+7. **Benchmark paired and interleaved against a fixed baseline.**
+8. **Do not hand-roll a conformance tester.**
+9. **Derive a security boundary structurally, not from config.**
+10. **Safe by default, opt in explicitly.**
 11. **Blocking a signal without installing a handler makes a process
-    unkillable.** Found because a conformance run could not reclaim its port.
-12. **Silently swallowing a parse error looks like health.** m6-file and
-    m6-auth-server both did `parse_request(...)?` into a caller that only
-    logged, so every malformed request got a silent close. Invisible while the
-    parser was lenient; the moment it got stricter the conformance score went
-    *down* while the code underneath got better.
+    unkillable.**
+12. **Silently swallowing a parse error looks like health.**
+
+New this session:
+
+13. **A feature gate that hides code from the default test run is how tests
+    rot.** Two `csrf` tests stayed broken from Phase 4 to Phase 5 because
+    `cargo test --workspace` never compiled them. This is why chrono and lru
+    are unconditional dependencies of core rather than gated: the owner chose
+    the dependency over the blind spot.
+14. **One sample is not a measurement, and a monitoring tool will measure its
+    own effect.** The health check flagged its own load generator as an
+    incident, then reported a 50% latency regression from a single sample that
+    landed during that load. Both were fixed in the tool. Watch for a third.
+15. **A claim can be literally true and support a false conclusion.** "Zero
+    template files" was true of the three renderers and did not mean they
+    needed no template engine.
+16. **Read the full user-agent list; a keyword list invents crawlers.** One IP
+    rotating 526 user agents would have been reported as a dozen AI crawlers
+    visiting. `UA_ROTATION_THRESHOLD` makes that a property of the data.
+17. **Encoding and decoding are two halves of one block.** Core could
+    percent-decode and not encode, so callers wrote their own encoder. The same
+    shape as having four cookie formatters and no cookie type.
+18. **Check the transport before writing the runbook.** The monitor was
+    designed against the WireGuard mesh because that is the obvious answer;
+    origin's backbone listener is h2c-only and the cache nodes have none.

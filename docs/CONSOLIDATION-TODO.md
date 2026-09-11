@@ -12,7 +12,7 @@ result we want, not a smell.
 
 ---
 
-## 1. Header to dict, dict to header  — IN PROGRESS
+## 1. Header to dict, dict to header: IN PROGRESS
 
 The asymmetry matters: one needs exposing, the other needs building.
 
@@ -23,12 +23,13 @@ The asymmetry matters: one needs exposing, the other needs building.
   steps, and the ordering is load-bearing (built-ins go in *after* params
   files so a params file cannot override them). A service not using `App`
   cannot reuse any of it.
-- [ ] **Dict -> header.** Does not exist. Response headers are assembled ad
-  hoc at eight sites: `Content-Type` three times, `Set-Cookie` three times
-  with two independent cookie formatters, `Cache-Control` inline from route
-  config. Collapse the duplication first, then there is something to expose.
+- [x] **Dict -> header.** Done, `3e7a7d8`. `m6_core::cookie` is the one
+  `Set-Cookie` formatter, replacing four `format!` calls whose attribute sets
+  differed in security-relevant ways. `m6_core::headers` is the accessor and
+  writer, including the RFC 9110 5.3 / RFC 6265 3 rule that `Set-Cookie` must
+  never be folded into a comma-separated line.
 
-## 2. Document m6-core in full  — NOT STARTED
+## 2. Document m6-core in full: NOT STARTED
 
 Owner's request. Start with the list of every component available, then detail
 each component and its interface. Core is now the only crate a service links,
@@ -40,11 +41,12 @@ exist.
 Re-checked 2026-09-11 against the current tree. Findings 1, 3, 5, 6 and 10 are
 resolved by Phases 1-6. Still live:
 
-- [ ] **7. Case-insensitive header lookup.** `core::http::header()` exists and
-  is not used. Ad-hoc `.find(|(k,_)| k.eq_ignore_ascii_case(name))` at eight
-  or more sites, including inside core itself (`conditional.rs`,
-  `monitoring.rs`, `negotiate.rs`, `response.rs`) and in `m6-http`
-  (`cache.rs`, `http2.rs`).
+- [~] **7. Case-insensitive header lookup.** Half done, `3e7a7d8`.
+  `m6_core::headers` now carries `get`, `get_all`, `set`, `append`,
+  `set_if_absent`, `remove` and the RFC rule about combining. Core's own sites
+  are converted. **About a dozen remain in m6-http** (`cache.rs`, `http2.rs`,
+  `redirect.rs`, `security.rs`, `main.rs`), left for a separate pass so a
+  mistake in a mechanical change stays isolated.
 - [ ] **8. Calendar arithmetic hand-rolled in `m6-md`.** `is_leap`,
   `doy_to_md`, days-since-epoch by hand in `m6-md/src/main.rs`. Core has had
   chrono unconditionally since Phase 6, so there is no dependency argument
@@ -56,7 +58,7 @@ resolved by Phases 1-6. Still live:
   whether it genuinely differs (strong vs weak comparison) or merely
   duplicates.
 
-## 4. Phase 7 — decouple the repositories  — NOT STARTED
+## 4. Phase 7, decouple the repositories: NOT STARTED
 
 `dr-grosvenor-site/render-*/Cargo.toml` carries
 `m6-core = { path = "../../m6/m6-core" }`: a filesystem layout hard-coded
@@ -69,7 +71,7 @@ stops syncing the `m6` tree and the `touch` workaround is deleted.
 This changes the release relationship between the two repos and should be a
 recorded decision, not just a commit.
 
-## 5. Phase 8 — backend examples  — NOT STARTED
+## 5. Phase 8, backend examples: NOT STARTED
 
 Six implementations of the same `/status` payload from
 `m6-backend-protocol.md`. Needs Go on the build host.
