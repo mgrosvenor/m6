@@ -18,9 +18,13 @@ partial view, it is a **biased** one, and in two specific ways:
    never reach origin.** Syd's analytics therefore records misses and direct-AU
    traffic only. Crawlers, bursts and probes that lon or chi answered are
    invisible there.
-2. **Neither cache node records analytics at all.** No `analytics` target in
-   their journals, no `analytics.ndjson` on disk. So the traffic syd cannot see
-   is not recorded anywhere else either. See "Known gaps" below.
+2. **Each node writes its own analytics, to a different path.** Origin uses
+   `/var/www/dr-grosvenor-site/logs/analytics.ndjson`; the cache nodes use
+   `/var/www/m6-cache/logs/analytics.ndjson`. `log_path` defaults to
+   `logs/analytics.ndjson` relative to the unit's `WorkingDirectory`, which
+   differs per role. Looking for origin's path on a cache node finds nothing
+   and looks exactly like "analytics is not running there". It is running. Read
+   all three files.
 
 The perf check had the same shape of error. Warming seven pages and then
 hammering them measures the warm-up, not production: it reported
@@ -83,15 +87,21 @@ journalctl -u <service> --since '24 hours ago' --no-pager -o cat | sed 's/\x1b\[
 
 ## C. Disk and logs
 
-`df -h /`, `journalctl --disk-usage`, and the size of
-`/var/www/dr-grosvenor-site/logs/analytics.ndjson` (syd only, it is the only
-node that writes one). Call out any node above 80%. Syd hit 82% on 2026-09-06
-from build artefacts; logrotate and a journald cap are installed.
+`df -h /`, `journalctl --disk-usage`, and the size of that node's analytics
+file:
+
+| node | analytics path |
+|---|---|
+| syd | `/var/www/dr-grosvenor-site/logs/analytics.ndjson` |
+| lon, chi | `/var/www/m6-cache/logs/analytics.ndjson` |
+
+Call out any node above 80%. Syd hit 82% on 2026-09-06 from build artefacts;
+logrotate and a journald cap are installed.
 
 ## D. Security and traffic, last 60 minutes, per node
 
-1. The node's own journal, `journalctl -k | grep -i ufw`, and syd's
-   `analytics.ndjson`.
+1. The node's own journal, `journalctl -k | grep -i ufw`, and **that node's
+   own `analytics.ndjson`** (paths in part C).
 2. Look for: bursts from one source, probe paths (`/wp-admin`, `/.env`,
    `/phpmyadmin`, `/.git`, `/admin`, `/xmlrpc.php`), repeated 401/403/404 from
    one source, SQLi/XSS-shaped queries, unusual UAs, ufw blocks, 5xx spikes,
@@ -115,13 +125,15 @@ and anything self-identifying as bot/crawler/spider/scout/probe, anything that
 is not a plausible browser string, and anything carrying an IP-literal
 `Referer`.
 
-Report every sighting explicitly: name, **exact UA**, paths, timestamps, source.
+Read **all three** analytics files, not origin's alone. A crawler that lon or
+chi answered from cache never reaches origin and appears only in that node's
+own file.
+
+Report every sighting explicitly: name, **exact UA**, paths, timestamps, source
+node.
 
 ## Known gaps, state them in the report rather than working around them
 
-- **Cache nodes record no analytics.** Anything lon or chi served from cache is
-  unrecorded fleet-wide. Crawler and burst reporting is therefore
-  origin-and-miss-only, and must say so.
 - **Relayed requests are attributed to the tunnel.** A request forwarded by a
   cache node logs `client_ip` as `10.0.0.4` or `10.0.0.5`, so its real source is
   not recoverable from syd. Fixed in the h2c forwarded-address work
