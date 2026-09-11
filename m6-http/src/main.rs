@@ -1838,18 +1838,13 @@ fn handle_request_inner(
     // It sits *after* method validation so a health path still refuses PUT
     // and friends like every other path, rather than becoming a hole in it.
     if state.config.health.enabled && req.path == state.config.health.path {
-        let pools = state
+        let pools: Vec<health::PoolHealth> = state
             .pool_manager
             .pool_health()
             .into_iter()
             .map(|(name, active, total)| health::PoolHealth { name, active, total })
             .collect();
-        let (code, report) = health::HealthReport::build(
-            &state.config.node.name,
-            state.started.elapsed().as_secs(),
-            pools,
-            state.pool_manager.url_backend_names(),
-        );
+        let (code, report) = health::HealthReport::build(&state.config.node.name, &pools);
         let (code, headers, body) = report.into_response(code);
         // Recorded, not discarded. `message = "monitor"` keeps it out of the
         // site-traffic rows every consumer already filters for, so an uptime
@@ -1874,9 +1869,21 @@ fn handle_request_inner(
     // the split is what keeps the health answer cheap. `snapshot` is passed
     // as a closure and is not called until authorisation passes.
     if state.config.health.enabled && req.path == state.config.health.perf_path {
+        // Pool occupancy is gathered here rather than on `/health`, which
+        // publishes neither. It costs a lock-free read of the pool manager and
+        // happens before the token check, which is fine: it is bounded work,
+        // unlike the reservoir sort in `snapshot`.
+        let pools: Vec<health::PoolHealth> = state
+            .pool_manager
+            .pool_health()
+            .into_iter()
+            .map(|(name, active, total)| health::PoolHealth { name, active, total })
+            .collect();
         let outcome = health::PerfReport::build(
             &state.config.node.name,
             state.started.elapsed().as_secs(),
+            pools,
+            state.pool_manager.url_backend_names(),
             &req.headers,
             state.config.health.metrics_token.as_deref(),
             || state.stats.snapshot(),
