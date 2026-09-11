@@ -1,5 +1,6 @@
 pub mod compress;
 pub mod conditional;
+pub mod config;
 pub mod error;
 pub mod h1;
 pub mod http;
@@ -26,6 +27,7 @@ pub mod multipart;
 
 pub use conditional::{evaluate_preconditions, is_not_modified, not_modified_headers, Precondition};
 pub use compress::{brotli_compress, brotli_decompress, gzip_compress, gzip_decompress};
+pub use config::{RendererConfig, RouteConfig};
 pub use error::{Error, Result};
 pub use h1::{parse_request, ParseResult};
 pub use http::{header, is_same_origin_path, HeaderSource, RawRequest, RawResponse};
