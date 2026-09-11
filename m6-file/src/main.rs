@@ -9,7 +9,6 @@ use config::Config;
 use m6_core::server::socket_path_from_config;
 use handler::{handle_request, HandlerContext};
 use route::Route;
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -154,12 +153,7 @@ fn run() -> i32 {
         }
     };
 
-    if let Err(e) = std::fs::set_permissions(
-        &socket_path,
-        std::fs::Permissions::from_mode(0o666),
-    ) {
-        warn!(error = %e, "failed to set socket permissions");
-    }
+    m6_core::server::apply_socket_mode(&socket_path, m6_core::server::DEFAULT_SOCKET_MODE);
 
     if let Err(e) = listener.set_nonblocking(true) {
         error!(error = %e, "failed to set listener non-blocking");
