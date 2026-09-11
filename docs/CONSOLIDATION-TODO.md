@@ -140,7 +140,20 @@ the right shape, so they are worth doing whether or not anything is migrated:
       none. A peer that connects and sends nothing parks a worker in
       `parse_request`'s blocking `read()`, and the pools are two workers.
       **Migrating the two stragglers onto `App` as it stands would delete the
-      only two read timeouts in the fleet.**
+      only two read timeouts in the fleet.** Note this is a **stopgap**: see
+      the item below for why a timeout is the wrong shape of fix.
+- [ ] **The read happens on a worker, not on the event loop.** `app.rs:1872`
+      accepts, `:1877` hands the **raw socket** to a worker, `:1920` the worker
+      does the blocking read. The part whose timing an untrusted peer controls
+      runs where capacity lives, so a 30s timeout on a two-worker pool still
+      surrenders half the node for 30s. Moving the read to the loop, and
+      dispatching only a **complete parsed `Request`** to a worker, is immune by
+      construction and leaves the handler contract unchanged. It also leaves the
+      project with **one I/O model**: `h1::parse_request(buf) -> ParseResult` is
+      already incremental and m6-http already drives it from an
+      `H1State::Reading { buf }` state machine; `parse.rs` is only the blocking
+      adapter. This is the destination, deliberately sequenced last in
+      `m6-app-shape-plan.md` §6 because everything else makes it smaller.
 - [ ] **`send_with_length` has zero callers.** It exists for "a HEAD answered
       without reading the file" and nothing calls it, so m6-file's HEAD path
       does a full `fs::read` + minify + brotli-6 and then discards the body at
