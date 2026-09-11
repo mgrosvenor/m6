@@ -6,7 +6,7 @@
 
 use std::time::{Duration, Instant};
 
-use m6_core::monitoring::{HealthReport, PerfReport};
+use m6_core::monitoring::{HealthReport, PerfReport, TrafficReport};
 
 use crate::fleet::Node;
 
@@ -37,6 +37,10 @@ pub struct NodeReading {
     /// is the handshake rather than anything either node did. Do not compare
     /// it with the loopback TTFB, which measures the opposite thing.
     pub rtt: Option<Duration>,
+    /// `/traffic`: this node's summary of its own traffic and whether its
+    /// logging is alive. Absent for the same reasons `/perf` can be.
+    pub traffic: Option<TrafficReport>,
+    pub traffic_error: Option<String>,
     /// Set when the node could not be reached at all.
     pub unreachable: Option<String>,
 }
@@ -98,7 +102,10 @@ fn get(
 }
 
 /// Poll one node.
-pub fn node(n: &Node, token: Option<&str>, timeout: Duration) -> NodeReading {
+pub fn node(n: &Node, fleet_token: Option<&str>, timeout: Duration) -> NodeReading {
+    // Per-node token first: the nodes do not share one.
+    let token = n.perf_token(fleet_token);
+    let token = token.as_deref();
     let mut reading = NodeReading {
         name: n.name.clone(),
         role: n.role.clone(),
@@ -107,6 +114,8 @@ pub fn node(n: &Node, token: Option<&str>, timeout: Duration) -> NodeReading {
         health_status: None,
         perf: None,
         perf_error: None,
+        traffic: None,
+        traffic_error: None,
         rtt: None,
         unreachable: None,
     };
@@ -139,12 +148,19 @@ pub fn node(n: &Node, token: Option<&str>, timeout: Duration) -> NodeReading {
     let token = match token {
         Some(t) => t,
         None => {
+            // Both gated endpoints are out of reach, and both must say so.
+            // A blank where a summary should be is indistinguishable from a
+            // quiet hour, and the standing order is explicit that a node
+            // whose logging cannot be checked is not "all clear".
             reading.perf_error = Some("no perf token configured".to_string());
+            reading.traffic_error = Some("no perf token configured".to_string());
             return reading;
         }
     };
 
-    match get(&agent, &format!("{}/perf", n.url.trim_end_matches('/')), Some(token)) {
+    let base = n.url.trim_end_matches('/');
+
+    match get(&agent, &format!("{base}/perf"), Some(token)) {
         Ok((200, body)) => match serde_json::from_str::<PerfReport>(&body) {
             Ok(p) => reading.perf = Some(p),
             Err(e) => reading.perf_error = Some(format!("unparseable: {e}")),
@@ -158,6 +174,29 @@ pub fn node(n: &Node, token: Option<&str>, timeout: Duration) -> NodeReading {
         Ok((code, _)) => reading.perf_error = Some(format!("unexpected status {code}")),
         Err(e) => reading.perf_error = Some(format!("{e}")),
     }
+
+    match get(&agent, &format!("{base}/traffic"), Some(token)) {
+        Ok((200, body)) => match serde_json::from_str::<TrafficReport>(&body) {
+            Ok(t) => reading.traffic = Some(t),
+            Err(e) => reading.traffic_error = Some(format!("unparseable: {e}")),
+        },
+        Ok((404, _)) => {
+            // An older node without the endpoint. Worth saying, because a
+            // silent absence is indistinguishable from a quiet hour.
+            reading.traffic_error =
+                Some("404: /traffic not available on this node".to_string())
+        }
+        Ok((503, body)) => {
+            let why = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v["error"].as_str().map(|s| s.to_string()))
+                .unwrap_or_else(|| "unreadable".to_string());
+            reading.traffic_error = Some(format!("503: {why}"))
+        }
+        Ok((code, _)) => reading.traffic_error = Some(format!("unexpected status {code}")),
+        Err(e) => reading.traffic_error = Some(format!("{e}")),
+    }
+
     reading
 }
 
@@ -183,6 +222,8 @@ pub fn fleet(nodes: &[Node], token: Option<&str>, timeout: Duration) -> Vec<Node
                     health_status: None,
                     perf: None,
                     perf_error: None,
+                    traffic: None,
+                    traffic_error: None,
                     rtt: None,
                     unreachable: Some("poll thread panicked".to_string()),
                 })
@@ -207,6 +248,8 @@ mod tests {
             health_status: None,
             perf: None,
             perf_error: None,
+            traffic: None,
+            traffic_error: None,
             rtt: None,
             unreachable: unreachable.map(|s| s.to_string()),
         }
