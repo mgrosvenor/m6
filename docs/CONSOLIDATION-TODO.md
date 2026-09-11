@@ -165,9 +165,14 @@ Verified by commit, gate green at each step unless noted.
 
 ## Deployment state
 
-**Nothing from the m6 migration is deployed.** 48 commits ahead of `b32e837`
-here, 12 in the site repo. The freeze holds until the migration finishes;
-that is the owner's standing instruction.
+**Nothing from the m6 migration is deployed.** 69 commits ahead of `22ee3a4`
+here, 14 ahead of `d6ebfa5` in the site repo. The freeze holds until the
+migration finishes; that is the owner's standing instruction.
+
+The deployed commit is whatever the newest entry in
+`~/dr-grosvenor-site/docs/RELEASES.md` names. Recompute from it; the previous
+figure here named `b32e837`, which the 2026-09-10 18:47 deploy had already
+superseded.
 
 The production changes listed as done above are deliberate exceptions, applied
 on instruction. They change how services are confined and what the firewall

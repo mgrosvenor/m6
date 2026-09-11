@@ -10,9 +10,17 @@ commit log rather than written from memory.
 
 ## 1. Where the work is
 
-**Branch `main`, clean, 48 commits ahead of the deployed `b32e837` here and 12
-in the site repo. No migration code is deployed and the freeze holds until it
-is finished.**
+**Branch `main`, clean, 69 commits ahead of the deployed `22ee3a4` here and 14
+ahead of `d6ebfa5` in the site repo. No migration code is deployed and the
+freeze holds until it is finished.**
+
+> The deployed commit is whatever the newest entry in
+> `~/dr-grosvenor-site/docs/RELEASES.md` names, and nothing else. Recompute
+> both counts from it rather than editing the number in place; this line was
+> wrong twice, naming `b32e837` and 48 when `b32e837` had already been
+> superseded by the 2026-09-10 18:47 deploy (its fleet md5 `aced7223` is now
+> the `.prev` rollback target). Of the 14 site commits, three record the
+> hardening and block-ledger changes that *were* applied on instruction.
 
 Three production changes WERE applied on 2026-09-11, on instruction, as
 deliberate exceptions. They change how services are confined and what the
@@ -162,12 +170,28 @@ Services: `m6-http` (edge/proxy), `m6-file`, `m6-html`, `m6-auth-server`,
 
 ## 5. The hourly health check
 
-**It is a program now: `tools/health-check.py`.** One ssh per node, run in
-parallel, all five parts across all three nodes, read-only, exit 1 on faults.
-`--load` also reads a loaded window and labels it GENERATED.
+**`m6-monitor --check <config>` is the health check** (`d524334`). It prints
+the hourly report and exits 1 on faults, over the same code path as the page,
+so the two cannot disagree. Every part the Python script sshed for is now a
+field the node computes: log targets and analytics from `/traffic`, periodic
+stats and host state from `/perf`.
+
+It also removes two of the three self-measurement defects by construction: it
+generates no load and runs no scans, so it can neither flag its own traffic as
+an incident nor time itself against its own journal read. The third, that it
+measures from wherever it runs, is unavoidable and is labelled in the output.
+
+**`tools/health-check.py` is kept, deliberately, and is still what to run
+today.** It reads ufw block counts, which are the firewall's data rather than
+m6's, and it is the only thing that has produced a full report against the
+binaries actually deployed. Under the freeze `--check` degrades honestly
+rather than usefully: `/traffic` 404s because the endpoint is not deployed and
+`/perf` fails to parse with `missing field pools`, both reported as named
+warnings rather than blanks. The script goes when the nodes run a binary from
+this side of the freeze.
 
 `docs/health-check.md` is still worth reading, but as *why*, not *how*. Every
-trap it describes is encoded in the script.
+trap it describes is encoded in both.
 
 Three nodes, always all three:
 
@@ -368,3 +392,19 @@ New this session:
     Related: a client that builds a fresh connection per request pays a cold
     TLS handshake each time, which over a long link is most of the measurement
     (828ms to lon, versus 27ms to syd, and the difference is the handshake).
+21. **Confinement must claim only what the role actually has.** Putting
+    `ReadWritePaths=/run/m6` in the shared hardening fragment took London off
+    the air for about ninety seconds on 2026-09-11 with `226/NAMESPACE`: a
+    cache node proxies to origin over h2c, runs no socket backends, and so has
+    no `/run/m6` at all, and an absent `ReadWritePaths` target fails mount
+    namespace setup outright. The fix is per-role fragments plus
+    `RuntimeDirectory` to guarantee what must exist, never a `-` prefix to
+    excuse an absent path: tolerance turns a misconfigured node into one that
+    starts anyway with weaker isolation than intended. Written up in the site
+    repo at `deploy/systemd/hardening/_common.conf` and
+    `deploy/systemd/hardening/m6-http-cache.conf`.
+
+    The second half of this lesson is that the warning was *already* in
+    `deploy/systemd/m6-html.service`, read earlier the same session, and the
+    mistake was made anyway. A caution that lives only next to the code it
+    guards will be read and not retained. That is why it is here.
