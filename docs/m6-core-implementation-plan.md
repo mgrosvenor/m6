@@ -390,6 +390,13 @@ which is the regression test that caught the last framing defect.
 
 The largest single move, and the one consumer apps are waiting for.
 
+**Partly done already, as a side effect of Phase 4.** `serve_connection` and
+`Responder` moved into `m6-core` (commit `4680cf7`) to get HEAD and keep-alive
+right in one place, and `m6-render`'s `handle_connection` and
+`Response::write_to` were deleted onto them. So the connection lifecycle half
+of `app.rs` has landed. What remains below is the rest: the thread pool,
+bounded queue, 503 backpressure, routing, compression and config reload.
+
 From `m6-render` into `m6-core`:
 
 | Component | Lines | Note |
@@ -500,8 +507,8 @@ worth knowing.
 | 1 Small consolidations | no | low | — | done, `3780834` |
 | 2 Testkit | no | low | 3, 4, 5, 8 | done, `3b9b895` |
 | 3 Semantics | no (fixes one bug) | moderate | 4 | done, `1ba5dfa`; 3.3 dropped |
-| 4 HTTP/1.1 | yes | moderate-high | 5 | in progress |
-| 5 Service loop | no | high (size) | 6 | |
+| 4 HTTP/1.1 | yes | moderate-high | 5 | **done**, `20f6a8d`..`4680cf7`; 32/32 h1spec on all four targets |
+| 5 Service loop | no | high (size) | 6 | **next** |
 | 6 Consumer apps | no | low | 7, 8 | |
 | 7 Decouple repos | no | low | — | |
 | 8 Backend examples | no | low | — | |
