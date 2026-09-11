@@ -136,6 +136,9 @@ use m6_core::monitoring::TrafficReport;
 /// answer rather than starting a second 47MB tail.
 static CACHE: Mutex<Option<(Instant, TrafficReport)>> = Mutex::new(None);
 
+/// Where the privileged collector leaves `nft -j list ruleset` output.
+const FIREWALL_JSON: &str = "/var/lib/m6/firewall.json";
+
 /// Read the last `window_minutes` of the analytics log and summarise it.
 ///
 /// The tail is bounded rather than reading the whole file: an hour of traffic
@@ -158,7 +161,13 @@ fn build_report(node: &str, path: &str, window_minutes: u64) -> anyhow::Result<T
     // skips what it cannot parse, so the partial first line costs nothing.
 
     let since = m6_core::util::iso8601_minutes_ago(window_minutes);
-    Ok(TrafficReport::build(node, &buf, &since, window_minutes))
+    let mut report = TrafficReport::build(node, &buf, &since, window_minutes);
+    // Written by the m6-firewall-stats timer. A node without the timer
+    // reports no firewall state rather than an empty one.
+    report.firewall =
+        m6_core::firewall::FirewallState::from_file(std::path::Path::new(FIREWALL_JSON))
+            .unwrap_or(None);
+    Ok(report)
 }
 
 /// Serve `/traffic`: this node's summary of its own traffic.

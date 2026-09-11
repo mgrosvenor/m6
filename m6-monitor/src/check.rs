@@ -257,6 +257,7 @@ mod tests {
             forgers: vec![],
             probe_noise: vec![],
             logging,
+            firewall: None,
         }
     }
 

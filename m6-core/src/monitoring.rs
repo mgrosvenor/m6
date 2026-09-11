@@ -639,6 +639,14 @@ pub struct TrafficReport {
     /// `/.git/config` is internet weather.
     pub probe_noise: Vec<String>,
     pub logging: LoggingHealth,
+    /// Deliberate firewall blocks and whether they are still being hit.
+    ///
+    /// `None` when no collector is installed on the node, which is different
+    /// from a node with no blocks. Read from a file written by a privileged
+    /// timer, because `nft list ruleset` needs CAP_NET_ADMIN and the process
+    /// answering public requests must not have it.
+    #[serde(default)]
+    pub firewall: Option<crate::firewall::FirewallState>,
 }
 
 /// Whether this process's main log layer is still emitting.
@@ -775,6 +783,7 @@ impl TrafficReport {
             forgers: summary.forgers.clone(),
             probe_noise,
             logging: LoggingHealth::read(),
+            firewall: None,
         }
     }
 }
