@@ -984,17 +984,8 @@ fn run_app_global<G: Send + Sync + 'static>(
     crate::signal::block();
 
     // We need the config before we can call init_global. Load it here.
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 3 {
-        eprintln!("Usage: {} <site-dir> <config-path>", args[0]);
-        std::process::exit(2);
-    }
-    let site_dir = PathBuf::from(&args[1]);
-    let config_path = PathBuf::from(&args[2]);
-    let cli_log_level = args
-        .windows(2)
-        .find(|w| w[0] == "--log-level")
-        .map(|w| w[1].clone());
+    let Invocation { site_dir, config_path, cli_log_level } =
+        parse_invocation(&sigs_of(&raw_routes), &names_of(&raw_named));
 
     let config = crate::config::load(&config_path, &site_dir).unwrap_or_else(|e| {
         eprintln!("Config error: {e}");
@@ -1079,17 +1070,8 @@ fn run_app_thread_state<T: Any + Send + 'static>(
     // what caught it, which is the guard earning its place.
     crate::signal::block();
 
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 3 {
-        eprintln!("Usage: {} <site-dir> <config-path>", args[0]);
-        std::process::exit(2);
-    }
-    let site_dir = PathBuf::from(&args[1]);
-    let config_path = PathBuf::from(&args[2]);
-    let cli_log_level = args
-        .windows(2)
-        .find(|w| w[0] == "--log-level")
-        .map(|w| w[1].clone());
+    let Invocation { site_dir, config_path, cli_log_level } =
+        parse_invocation(&sigs_of(&raw_routes), &names_of(&raw_named));
 
     let config = crate::config::load(&config_path, &site_dir).unwrap_or_else(|e| {
         eprintln!("Config error: {e}");
@@ -1174,17 +1156,8 @@ fn run_app_state<G: Send + Sync + 'static, T: Any + Send + 'static>(
     // what caught it, which is the guard earning its place.
     crate::signal::block();
 
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 3 {
-        eprintln!("Usage: {} <site-dir> <config-path>", args[0]);
-        std::process::exit(2);
-    }
-    let site_dir = PathBuf::from(&args[1]);
-    let config_path = PathBuf::from(&args[2]);
-    let cli_log_level = args
-        .windows(2)
-        .find(|w| w[0] == "--log-level")
-        .map(|w| w[1].clone());
+    let Invocation { site_dir, config_path, cli_log_level } =
+        parse_invocation(&sigs_of(&raw_routes), &names_of(&raw_named));
 
     let config = crate::config::load(&config_path, &site_dir).unwrap_or_else(|e| {
         eprintln!("Config error: {e}");
@@ -2018,13 +1991,35 @@ fn file_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
 fn unknown_handlers(
     routes: &[CompiledRoute],
     named: &HashMap<String, Arc<BoxHandler>>,
+    code_patterns: &[String],
 ) -> Vec<(String, String)> {
     let mut missing = Vec::new();
     for route in routes {
-        if let Some(name) = &route.handler {
-            if !named.contains_key(name) {
+        match &route.handler {
+            // A route naming a handler nothing provides.
+            Some(name) if !named.contains_key(name) => {
                 missing.push((route.pattern.clone(), name.clone()));
             }
+            Some(_) => {}
+            // A config route with no template and no handler can still be
+            // served by a code route registered on the same pattern, which is
+            // how the site's renderers carry `cache` and `methods` for an
+            // endpoint implemented in Rust. With no such route it can serve
+            // nothing, and the only symptom is a 404 that looks like a missing
+            // page. That is exactly what an out-of-step config and binary
+            // produce, so it is refused here rather than discovered in
+            // production.
+            //
+            // Matched on pattern alone, not pattern and method: a config route
+            // left at the default `Any` legitimately annotates a code route
+            // registered with `route_get`, and comparing methods would call
+            // that dead.
+            None if route.template.is_none()
+                && !code_patterns.contains(&route.pattern) =>
+            {
+                missing.push((route.pattern.clone(), "<no template, no handler>".to_string()));
+            }
+            None => {}
         }
     }
     missing
@@ -2044,6 +2039,131 @@ fn describe_unknown(missing: &[(String, String)], registered: &[String]) -> Stri
     format!("{} ({known})", named.join("; "))
 }
 
+/// Route signatures from any of the builders' raw route lists.
+///
+/// Generic over the handler type because the three stateful builders each
+/// store a different closure shape, and all three want the same two fields.
+fn sigs_of<H>(raw: &[(String, RouteMethod, H)]) -> Vec<(String, RouteMethod)> {
+    raw.iter().map(|(p, m, _)| (p.clone(), m.clone())).collect()
+}
+
+/// Handler names from any of the builders' raw named-handler lists.
+fn names_of<H>(raw: &[(String, H)]) -> Vec<String> {
+    raw.iter().map(|(n, _)| n.clone()).collect()
+}
+
+/// What every `App` service is started with.
+///
+/// One parser rather than four. `run_app` and the three stateful runners each
+/// had an identical copy of this, which is how `--dump-config` ended up
+/// existing only in m6-http: there was no one place to add it to.
+pub struct Invocation {
+    pub site_dir: PathBuf,
+    pub config_path: PathBuf,
+    pub cli_log_level: Option<String>,
+}
+
+/// Parse the command line, and handle the flags that do not start a server.
+///
+/// `--dump-config` loads the configuration exactly as the service would, prints
+/// what it resolved to, and exits: **0 if this binary can serve this config, 2
+/// if it cannot.** That is the check `deploy-platform.sh` runs against the new
+/// binary on every node before installing it, and it used to cover m6-http
+/// alone even though every service loads its config through the same function.
+///
+/// It is not a formality. The `App` migrations changed m6-file's config format,
+/// and the old binary against the new config and the new binary against the old
+/// one both fail, in opposite directions and neither loudly. A validation step
+/// that runs before the install is what turns that from an outage into a
+/// refused deploy.
+fn parse_invocation(routes: &[(String, RouteMethod)], handlers: &[String]) -> Invocation {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() < 3 {
+        eprintln!("Usage: {} <site-dir> <config-path> [--log-level LEVEL] [--dump-config]", args[0]);
+        std::process::exit(2);
+    }
+    let site_dir = PathBuf::from(&args[1]);
+    let config_path = PathBuf::from(&args[2]);
+    let cli_log_level = args
+        .windows(2)
+        .find(|w| w[0] == "--log-level")
+        .map(|w| w[1].clone());
+
+    if args.iter().any(|a| a == "--dump-config") {
+        std::process::exit(dump_config(&site_dir, &config_path, routes, handlers));
+    }
+
+    Invocation { site_dir, config_path, cli_log_level }
+}
+
+/// Load the config and report how each route would be served. Returns the
+/// process exit code.
+fn dump_config(
+    site_dir: &std::path::Path,
+    config_path: &std::path::Path,
+    code_routes: &[(String, RouteMethod)],
+    handlers: &[String],
+) -> i32 {
+    let config = match crate::config::load(config_path, site_dir) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("config error: {e:#}");
+            return 2;
+        }
+    };
+
+    println!("site_dir    {}", site_dir.display());
+    println!("config      {}", config_path.display());
+    println!("socket      {}", crate::socket_path_from_config(config_path).display());
+    println!(
+        "thread_pool size={} queue={}",
+        config.thread_pool.size, config.thread_pool.queue_size
+    );
+    println!(
+        "server      read_timeout={} socket_mode={:04o}",
+        config.server.read_timeout.map_or("none".into(), |d| format!("{}s", d.as_secs())),
+        config.server.socket_mode
+    );
+    for p in &config.global_params {
+        println!("global      {p}");
+    }
+    println!("handlers    {}", if handlers.is_empty() { "none".to_string() } else { handlers.join(", ") });
+
+    // Every route, and what would answer it. This is the part worth reading:
+    // a route with no way to be served is the failure the App migrations made
+    // possible, and it is invisible at runtime because it simply 404s.
+    let mut dead = 0;
+    println!("routes ({})", config.routes.len());
+    for rc in &config.routes {
+        let how = if let Some(h) = &rc.handler {
+            if handlers.iter().any(|n| n == h) {
+                format!("handler `{h}`")
+            } else {
+                dead += 1;
+                format!("handler `{h}` NOT REGISTERED")
+            }
+        } else if let Some(t) = &rc.template {
+            format!("template {t}")
+        } else if code_routes.iter().any(|(p, _)| *p == rc.path) {
+            "code route".to_string()
+        } else {
+            dead += 1;
+            "NOTHING CAN SERVE THIS".to_string()
+        };
+        println!("  {:<40} {}", rc.path, how);
+    }
+
+    if dead > 0 {
+        eprintln!(
+            "\n{dead} route(s) this binary cannot serve. Refusing: a config and a \n\
+             binary that disagree is an outage that looks like a 404."
+        );
+        return 2;
+    }
+    println!("\nok: this binary can serve every route in this config");
+    0
+}
+
 pub fn run_app(
     code_routes: Vec<CodeRoute>,
     named: Vec<NamedHandler>,
@@ -2057,17 +2177,11 @@ pub fn run_app(
     // disposition and kill the process. See crate::signal.
     crate::signal::block();
 
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 3 {
-        eprintln!("Usage: {} <site-dir> <config-path>", args[0]);
-        std::process::exit(2);
-    }
-    let site_dir = PathBuf::from(&args[1]);
-    let config_path = PathBuf::from(&args[2]);
-    let cli_log_level = args
-        .windows(2)
-        .find(|w| w[0] == "--log-level")
-        .map(|w| w[1].clone());
+    let Invocation { site_dir, config_path, cli_log_level } =
+        parse_invocation(
+            &code_routes.iter().map(|(p, m, _)| (p.clone(), m.clone())).collect::<Vec<_>>(),
+            &named.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+        );
     run_app_with_shutdown(
         Handlers { routes: code_routes, named },
         config_path,
@@ -2128,7 +2242,10 @@ fn run_app_with_shutdown(
                 std::process::exit(2);
             });
 
-    let missing = unknown_handlers(&framework_state.routes, &named_handlers);
+    let code_patterns: Vec<String> =
+        code_route_signatures.iter().map(|(p, _)| p.clone()).collect();
+    let missing =
+        unknown_handlers(&framework_state.routes, &named_handlers, &code_patterns);
     if !missing.is_empty() {
         eprintln!(
             "Config error: route names an unregistered handler: {}",
@@ -2305,7 +2422,7 @@ fn run_app_with_shutdown(
                             // keep serving, which is what makes a typo in a
                             // live config recoverable.
                             let missing =
-                                unknown_handlers(&new_state.routes, &named_handlers);
+                                unknown_handlers(&new_state.routes, &named_handlers, &code_patterns);
                             if !missing.is_empty() {
                                 error!(
                                     "Reload refused, route names an unregistered handler: {}",
@@ -3513,7 +3630,7 @@ tail = false
     fn a_route_naming_an_unregistered_handler_is_refused() {
         let (state, _d) = state_from(FILES);
 
-        let missing = unknown_handlers(&state.routes, &registry(&["uploads"]));
+        let missing = unknown_handlers(&state.routes, &registry(&["uploads"]), &[]);
         assert_eq!(missing, vec![("/assets/{*relpath}".to_string(), "files".to_string())]);
 
         // The operator needs to be told which route, which name, and what was
@@ -3524,7 +3641,7 @@ tail = false
         assert!(described.contains("uploads"), "{described}");
 
         // Registered, and there is nothing to refuse.
-        assert!(unknown_handlers(&state.routes, &registry(&["files"])).is_empty());
+        assert!(unknown_handlers(&state.routes, &registry(&["files"]), &[]).is_empty());
     }
 
     /// A template route is unaffected by any of this: it names no handler and
@@ -3533,7 +3650,7 @@ tail = false
     fn a_template_route_names_no_handler() {
         let (state, _d) = state_from("[[route]]\npath = \"/\"\ntemplate = \"index.html\"\n");
         assert!(state.routes[0].handler.is_none());
-        assert!(unknown_handlers(&state.routes, &HashMap::new()).is_empty());
+        assert!(unknown_handlers(&state.routes, &HashMap::new(), &[]).is_empty());
     }
 
     /// Core does not know what `root` or `tail` mean, and does not need to.
