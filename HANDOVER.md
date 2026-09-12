@@ -2,34 +2,44 @@
 
 State of play for the next session. Written 2026-09-11, updated 2026-09-12.
 
-> ## Read first, 2026-09-12
+> ## Read first, 2026-09-12 (late session)
 >
-> **The hourly health check was a session-only cron and it died with that
-> session.** Job `b54e3408`, 6:37/9:37/12:37/15:37/18:37/21:37 Sydney, six a
-> day, nothing between 21:37 and 06:37. `CronCreate` jobs are in-memory and
-> auto-expire after 7 days anyway. **If the owner still wants scheduled checks,
-> recreate it, and say plainly that it will not survive this session either.**
-> A durable version needs launchd or a real crontab on the Mac.
+> **The scope note on §3b was wrong and the owner corrected it twice. Read the
+> corrected one before planning anything.** Deferred is **the event loop and
+> the handler contract, only**; the IO layer is in scope as "arguably low touch
+> consolidation work"; wildcard routing, streaming bodies and **both
+> migrations** are live work and were never deferred. Verbatim in
+> `docs/CONSOLIDATION-TODO.md` §3b. Do not widen it again.
 >
-> **The app-shape architecture is agreed and deliberately not scheduled.** See
-> `docs/m6-app-shape-plan.md` and `docs/CONSOLIDATION-TODO.md` §3b. The split
-> is §3b-now (a read timeout, a socket-permissions key, optionally lifting a
-> duplicated accept loop, plus a free `send_with_length` fix) and §3b-later
-> (wildcard routing, streaming bodies, the IO layer, the event loop, the
-> handler contract). **Do not re-derive the argument.** It is written up.
+> **§3b-now is finished, and so is most of what sat behind it.** Read timeout,
+> socket mode, HEAD fast path, poll block, header sweep, wildcard routing,
+> streaming bodies, ConfigWatcher tests. See §6b.
 >
 > **The cache-hit p50 has doubled in six days and it is not a bad baseline.**
-> 1.7us on 2026-09-06 to 3.9us today, same counter, same node, same method,
+> 1.7us on 2026-09-06 to 3.9-4.0us now, same counter, same node, same method,
 > monotonic across four deploys. Three earlier sessions dismissed it by
-> re-baselining the prompt; that verdict is withdrawn. Tracked as
-> `docs/CONSOLIDATION-TODO.md` §3a with the evidence and the A/B that would
-> identify the commit. **Report the deviation, do not adjust the baseline.**
+> re-baselining the prompt; that verdict is withdrawn. Tracked as §3a with the
+> evidence and the A/B that would name the commit. **Report the deviation, do
+> not adjust the baseline.** Still not diagnosed.
 >
-> **Five addresses were blocked on 2026-09-12**, ledger and nodes at 31 rules
-> and in sync. One of them, `15.177.23.18`, was **not an attack**: it is the
-> eighth orphaned Route53 health check, and it was reported across three hourly
-> checks as the strongest malicious candidate of the day before its user agent
-> was read. See `deploy/BLOCKLIST.md`.
+> **A failed TCP bind is a warning, so m6-http can run with nothing listening
+> on 443.** Found 2026-09-12, tracked as §3d, deliberately **not** changed
+> because it is a production behaviour change under the freeze. `SO_REUSEADDR`
+> removed the most likely cause; the response is still fail-open.
+>
+> **The hourly health check is not scheduled.** The old cron was session-only
+> and died with that session. `CronCreate` jobs are in-memory and expire after
+> 7 days regardless. If the owner wants it scheduled, say plainly that it will
+> not survive the session either; a durable version needs launchd or a real
+> crontab.
+>
+> **Six addresses are blocked**, ledger and nodes in sync at 32 rules.
+> `13.220.90.211` was added 2026-09-12 on instruction. Two earlier notes still
+> apply: `15.177.23.18` was **not an attack** (the eighth orphaned Route53
+> health check, reported as the day's strongest malicious candidate across
+> three checks before its user agent was read), and `45.142.193.161` is
+> deliberately **not** blocked despite topping every ufw drop list, because it
+> only scans closed ports and never reaches the application.
 
 **Read this, then `docs/CONSOLIDATION-TODO.md`.** This file is what is true;
 that one is the ledger of what is done and what is owed, audited against the
@@ -39,12 +49,12 @@ commit log rather than written from memory.
 
 ## 1. Where the work is
 
-**Branch `main`, clean, 88 commits ahead of the deployed `22ee3a4` here and 17
-ahead of `d6ebfa5` in the site repo. No migration code is deployed and the
+**Branch `main`, clean, 103 commits ahead of the deployed `22ee3a4` here and
+20 ahead of `d6ebfa5` in the site repo. No migration code is deployed and the
 freeze holds until it is finished.**
 
-> **Both repos are ahead of `origin/main` and that is not fine.** 69 commits on
-> `m6`, 15 on the site repo, as of 2026-09-12. Ahead of the *fleet* is the
+> **Both repos are ahead of `origin/main` and that is not fine.** 84 commits on
+> `m6`, 18 on the site repo, as of 2026-09-12. Ahead of the *fleet* is the
 > deliberate freeze; ahead of *origin* is just unbacked work on a laptop, and
 > the site handover's §5 says to push when you find this. Not pushed here
 > because `m6`'s `pre-push` hook runs the full suite and the owner has not
@@ -86,15 +96,17 @@ applied them:
   was previously refused on one node and served on two, which is exactly what
   the reconciliation was for.
 
-- **981 workspace tests pass at default features, verified on Linux via
+- **1002 workspace tests pass at default features, verified on Linux via
   `deploy/run-tests.sh m6` on 2026-09-12. Zero warnings**, release and test
   builds, same count as macOS.
 - **Clippy is a gate now**, on the owner's instruction: `tools/clippy.sh`,
   wired into `check.sh` (step 2, so the pre-push hook covers it) and into the
   Linux gate before prod. It is a **ratchet**, not `-D warnings`: the count may
   fall and may never rise. Ceilings are **per platform** because clippy
-  versions disagree, at `tools/clippy-ceiling-Darwin.txt` (161) and
-  `tools/clippy-ceiling-Linux.txt` (148). A clippy *error* fails regardless.
+  versions disagree, at `tools/clippy-ceiling-Darwin.txt` (157) and
+  `tools/clippy-ceiling-Linux.txt` (148, and probably now lower: several
+  hand-rolled blocks were deleted after it was set, so run
+  `./tools/clippy.sh --update` on the build box and commit the result). A clippy *error* fails regardless.
   **Driving the ceiling to zero is outstanding and not yet approved as work.**
 - h1spec **32/32 on all four HTTP/1.1 targets**, with a CI ratchet
   (`tools/conformance.sh`, floors in `tools/conformance-scores.txt`) wired into
@@ -200,33 +212,32 @@ Services: `m6-http` (edge/proxy), `m6-file`, `m6-html`, `m6-auth-server`,
    read as current state). What remains is *inside* the code: seventeen of the
    thirty modules still have no module-level doc comment, listed in
    `CONSOLIDATION-TODO.md`.
-2. **One app shape, minimal set only.** Scoped 2026-09-12; the architecture is
-   agreed and deferred (`CONSOLIDATION-TODO.md` §3b). Do these and stop:
-   - ~~**`App` sets a read timeout after accept.**~~ **DONE 2026-09-12**,
-     `d52a51b`. `[server] read_timeout_s`, default 30, `0` disables. The two
-     services that had hand-written the same 30 seconds now call the same core
-     function. **Production needs no config change; the default applies.** It
-     was not the three lines it looked like: see lesson 26.
-   - ~~**Socket permissions as a config key.**~~ **DONE 2026-09-12.**
-     `[server] socket_mode`, octal string, default `0660`. It was m6-file *and*
-     m6-auth-server setting `0666` by hand, not just m6-auth-server, and `App`
-     set nothing at all so its five services took `0755` from the umask. All
-     seven are now `0660`. **This changes a file permission in production**,
-     which nothing else on this list does: check the modes after the deploy.
-     Safe because every unit is `User=m6` and `/run/m6` is `0750` owned by
-     `m6`, so the world bits were never load-bearing.
-   - **Still open, optional (Tier 2): lift the accept/poll block** m6-file
-     duplicates 22 of 33 lines of.
-   - ~~**`send_with_length` has zero callers.**~~ **DONE 2026-09-12.** m6-file
-     answers a HEAD from `metadata.len()` without opening the file, but **only
-     when the representation is the file** (identity coding, minification off
-     for the type). A HEAD must report what the matching GET would send, so a
-     minified or compressed representation still has to be produced to be
-     measured. Images, which are neither, are the case that cost anything.
+2. ~~**One app shape, minimal set only.**~~ **§3b-now COMPLETE 2026-09-12**,
+   all four: read timeout, socket mode, `send_with_length`, poll block. Details
+   in §6b and in `CONSOLIDATION-TODO.md` §3b.
 
-   Anything touching performance still wants **benchmarking Phases 5 and 6**
-   first, which is owed anyway. The two that remain are a code move and
-   strictly less work, so neither needs it.
+   **The scope note was wrong and the owner corrected it. Read §3b before
+   planning.** Deferred is the **event loop and the handler contract, only**.
+   The IO layer is in scope as low-touch. Wildcard routing and streaming
+   bodies were never deferred and are now **done**. Both migrations were never
+   deferred either.
+
+2a. **The two migrations, which are the live consolidation work.**
+   - **`m6-auth-server` onto `App`: ready now, nothing blocking.** Four routes,
+     all literal (`/auth/login`, `/auth/refresh`, `/auth/logout`,
+     `/auth/public-key`), no wildcards needed. Its stated blocker was `chmod`
+     on the socket and that is now `[server] socket_mode`. It is **not running
+     in production** (the origin's `site.toml` has its backend commented out),
+     so the risk is low.
+   - **`m6-file` onto `App`: one decision away, and the owner has made it.**
+     Wildcard routing and streaming both landed, and streaming was never a
+     blocker anyway because m6-file buffers everything. What is left is that
+     **`App` registers code routes once at startup, so a config reload cannot
+     add or change one**, where m6-file's `handle_reload` rebuilds its table
+     today. The owner's instruction on 2026-09-12 was to make it dynamic:
+     *"And dynamicly reload the file list."* **Not started.** That is the next
+     piece of code to write.
+
 2b. **Finish header to dict.** `FrameworkState::build_dict` is private and is
    where the real knowledge lives: twelve ordered steps, and the ordering is
    load-bearing (built-ins go in *after* params files so a params file cannot
@@ -244,7 +255,11 @@ Services: `m6-http` (edge/proxy), `m6-file`, `m6-html`, `m6-auth-server`,
    **off-fleet**, not on the centre: a monitor on syd cannot report that syd is
    down. The build host already reaches all three nodes and already holds the
    `/perf` token.
-5. **The m6-http header sweep**, about a dozen ad-hoc lookups left.
+5. ~~**The m6-http header sweep**~~ **DONE 2026-09-12.** It was 25 sites, not
+   "about a dozen", and m6-http was using none of `m6_core::headers`. Zero
+   remain in non-test code. Two of them were bugs rather than duplication: the
+   Set-Cookie scan and the `Connection` token check each read only the first
+   line of a field that may legitimately repeat.
 5b. **Rewrite `watcher.rs` on `nix`'s safe wrappers** (`CONSOLIDATION-TODO` §3c),
    owner's instruction 2026-09-12. The threads are already gone (`e6ba278`,
    single pollable kqueue on the main poll); what remains is ~390 lines of raw
@@ -253,6 +268,12 @@ Services: `m6-http` (edge/proxy), `m6-file`, `m6-html`, `m6-auth-server`,
    **Do not reach for `notify`**: it spawns its own thread and delivers over a
    channel, which puts back what `e6ba278` removed. The watcher must keep
    exposing a pollable fd for the service's own poll loop.
+5c. **Decide what a failed bind should do** (`CONSOLIDATION-TODO` §3d). A
+   failed TCP bind is a `warn!` and m6-http continues with the listener set to
+   `None`, so it can run with nothing on 443 while systemd sees it healthy.
+   `SO_REUSEADDR` removed the likely cause; the response is untouched because
+   it is a production behaviour change under the freeze. Check whether any node
+   role legitimately runs without a listener before making it fatal.
 6. **HTTP Garden** (arxiv 2405.17737), the differential fuzzer. Needs Docker,
    so the build box.
 7. **h2spec and h3spec on the build box** before any deploy.
@@ -303,6 +324,81 @@ Most of this is now reachable over HTTP instead of ssh, because `/perf` carries
 the host's load, memory, disk and temperature. What still needs a shell: the
 **log-target histogram** (Part A) and **ufw block counts**. A log-target count
 on `/perf` would remove Part A outright and is worth doing.
+
+---
+
+## 6b. Session of 2026-09-12, later
+
+**Nothing deployed. Freeze intact.** 1002 tests, zero warnings, clippy at its
+ceiling, verified on Linux.
+
+### Consolidation: §3b-now finished, and most of what sat behind it
+
+| item | commit | note |
+|---|---|---|
+| `App` read timeout | `d52a51b` | `[server] read_timeout_s`, default 30 |
+| Socket mode | `4fc33da` | `[server] socket_mode`, default `0660` |
+| HEAD without opening the file | `a094851`, `7932e43` | plus the directory regression it introduced |
+| poll(2) block into core | `cf84546` | only the poll block; the two concurrency models stay apart |
+| m6-http header sweep | | 25 sites, not "about a dozen"; none left |
+| ConfigWatcher tests + macOS rewrite | `e6ba278` | single pollable kqueue, no threads |
+| `{*name}` wildcard routes | | explicit, not implicit |
+| Streaming response bodies | | `send_stream`, used by m6-file |
+| `SO_REUSEADDR` | `07f11d8` | |
+| m6-md date arithmetic | | a real bug, below |
+
+### Three live bugs found, none of them the thing being worked on
+
+- **m6-md reported a quarter of all dates wrong.** Hand-rolled
+  civil-from-days, era anchored at 1970 instead of shifted to March. Measured:
+  7,281 of 29,200 days over 1970-2050. The last day of every leap year became
+  the first of the next, and the whole following year was a day late. Every
+  date in 2025 was wrong; it is correct today, which is why nobody saw it, and
+  it would have resumed on 2028-12-31. Now `m6_core::util::iso_date_from`.
+- **A HEAD on a directory answered 200.** Introduced by the HEAD fast path in
+  the same session and caught by the Linux gate: `std::fs::metadata` succeeds
+  on a directory, and the `fs::read` the fast path skipped was also what had
+  been rejecting non-files. `is_file()` now guards it.
+- **m6-http can run with nothing listening on 443.** A failed bind is a
+  warning. Tracked as §3d, not changed under the freeze.
+
+### Five intermittent test failures, all diagnosed, none written off
+
+The word "flake" was wrong. Each was reproduced deliberately before being
+fixed. **One of the two long-standing named ones is solved**:
+`redirect_lifecycle::sigterm_...` stored the shutdown flag *before* logging the
+line explaining it, so the main thread could drain, log "shutdown complete" and
+exit while that line sat in `tracing_appender`'s queue. The rest were four test
+helpers that panicked on a transport error inside the retry loop written to
+tolerate it, two unit tests racing over the global `SHUTDOWN_FLAG`, a
+wall-clock cache-hit assertion, and the `TIME_WAIT` port race that
+`SO_REUSEADDR` fixed.
+
+**`m6-auth-cli`'s `test_token_create_prints_jwt` is the only one left** and did
+not recur.
+
+### The tooling changed under you
+
+- **Clippy is a gate**, on the owner's instruction. `tools/clippy.sh`, in
+  `check.sh` step 2 and in the Linux gate. A ratchet, per platform, and a
+  clippy *error* fails regardless of the ceiling.
+- **`health-check.py` missed self-identifying bots four separate ways** and now
+  has `--self-test`. `bot\b` does not match `OnlineOrNot.com_bot_1.0`; a
+  `+https://...` in a UA is a bot convention and was not matched at all;
+  probe and injection paths were matched **raw**, so `%2e%2e%2f` was never
+  `../`; and a crawler that only polls `/health` was filtered out before
+  detection because those rows are `message = "monitor"`. Scanners are now
+  reported apart from crawlers. Fixing the `+URL` case alone surfaced three
+  crawlers that had never been reported.
+- **The Linux gate returns the whole `failures:` section** instead of a bare
+  `panicked at <file>:<line>` with the reason stripped off.
+
+### If you read one thing about method
+
+Run the suite as `cargo test --workspace > /tmp/run.txt 2>&1` and grep the
+file, never the pipe. Two of today's diagnoses came from captured output that
+earlier sessions had lost to a re-run, and one of those had been unexplained
+for weeks.
 
 ---
 
