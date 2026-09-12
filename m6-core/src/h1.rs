@@ -614,7 +614,13 @@ pub fn keep_alive(req: &RawRequest) -> bool {
 pub struct Responder<'a, W: std::io::Write> {
     w: &'a mut W,
     /// Decides whether a body is written at all.
-    method: &'a str,
+    ///
+    /// Stored as the decision rather than as the method string, which is the
+    /// only thing it was ever used for (`eq_ignore_ascii_case("HEAD")`).
+    /// Holding a `&'a str` tied the responder's lifetime to the request that
+    /// produced it, which is why `serve_connection` could not hand the request
+    /// to its handler and every `App` service cloned one per request instead.
+    is_head: bool,
     /// Decided by the connection from the request, before the handler runs.
     keep_alive: bool,
     /// Body bytes actually written, for the caller's access log.
@@ -623,8 +629,8 @@ pub struct Responder<'a, W: std::io::Write> {
 
 impl<'a, W: std::io::Write> Responder<'a, W> {
     /// Answer a request whose framing the connection has already decided.
-    pub fn new(w: &'a mut W, method: &'a str, keep_alive: bool) -> Self {
-        Responder { w, method, keep_alive, written: 0 }
+    pub fn new(w: &'a mut W, method: &str, keep_alive: bool) -> Self {
+        Responder { w, is_head: method.eq_ignore_ascii_case("HEAD"), keep_alive, written: 0 }
     }
 
     /// Whether the connection stays open after this response.
@@ -778,7 +784,7 @@ impl<'a, W: std::io::Write> Responder<'a, W> {
         // RFC 9110 9.3.2. A 304 and a 204 have no body either (RFC 9110 15.4.5,
         // 15.3.5), and one sent on those is unframed bytes the peer will read
         // as the start of the next response.
-        Ok(self.method.eq_ignore_ascii_case("HEAD")
+        Ok(self.is_head
             || status == 204
             || status == 304
             || (100..200).contains(&status))
