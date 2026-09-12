@@ -4,6 +4,35 @@ State of play for the next session. Written 2026-09-11, updated 2026-09-12.
 
 > ## Read first, 2026-09-13
 >
+> **§3a IS RESOLVED, AND IT WAS NEVER A CODE REGRESSION.** `hit_p50_ns` is a
+> load-dependent measurement: on a near-idle single-core VM the cache-hit path
+> goes cold between requests, so the number tracks request density.
+>
+> Same binary, same node, minutes apart: **~50-70 hits in a window reads
+> 3,900ns; 1,200 hits in a window reads 1,064ns**, which is *below* the
+> 1.7-2.2us band everyone treated as the baseline. The span the timer covers is
+> two in-memory operations, `make_lookup_key` and `Cache::lookup_with`, taken
+> **before the response is written**.
+>
+> The paired interleaved A/B §3a asked for was run across all five commits:
+> **125ns, identical at every one**, and flat from 1 to 20,000 cache entries.
+> Clocksource (20.9 ns/call) and steal time (0.02%) were measured and ruled
+> out. There is no culprit commit because there is no code regression.
+>
+> **Stop comparing `hit_p50_ns` across days.** It is only comparable between
+> windows with similar hit counts. The hourly prompt's baseline should read
+> "1.7-2.2us at ~40-70 hits/window, ~1.0us under sustained load", and a reading
+> should be reported with its window's hit count. That prompt is the owner's,
+> so it is flagged rather than changed.
+>
+> **`--dump-config` is on every `App` service now**, not just m6-http, because
+> config parsing is `m6_core::config::load` for all of them. It reports how
+> each route would be served and **exits 2 if this binary cannot serve this
+> config**, which is what `deploy-platform.sh` validates against the new binary
+> on every node before installing it. A config route that names an
+> unregistered handler, or that has no template and no handler and no code
+> route on its pattern, is now refused at startup rather than 404ing quietly.
+>
 > **`watcher.rs` is on `nix` now: zero `unsafe` in the production code**, down
 > from 390 lines of raw libc across three `#[cfg]` arms. The manual inotify
 > buffer walk that produced the alignment UB is gone, and so are `EventBuf`,

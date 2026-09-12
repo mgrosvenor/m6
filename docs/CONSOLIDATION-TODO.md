@@ -236,43 +236,72 @@ restart inside the `TIME_WAIT` window. It does not address the response.
       one of the listeners; that needs checking against `site.toml` for all
       three roles before it changes.
 
-### 3a. Cache-hit p50 regression: 2.1x in six days, cause unknown
+### 3a. Cache-hit p50: RESOLVED 2026-09-13, and it was never a code regression
 
-**TRACKED 2026-09-12. Open, not started, and deliberately not closed by
-re-baselining.**
+**It is a load-dependent measurement, not a regression.** The metric tracks how
+tightly spaced the requests are, because on a near-idle single-core VM the hit
+path goes cold between them.
 
-Production cache-hit p50 on the origin, all from m6's own `hit_p50_ns` over
-loaded windows, same node, same method:
+**The decisive measurement.** Same binary, same node, same counter, one window:
 
-| date | deploy | p50 | p99 |
-|---|---|---|---|
-| 2026-09-06 | s-maxage verify (41 + 29 hits) | **1.7us** | 2.0us |
-| 2026-09-10 | Rapid Reset `438bdb3` | 2.5us | - |
-| 2026-09-10 | flow control `b32e837` | 2.95us | 3.55us |
-| 2026-09-12 | `22ee3a4` loaded, 76 hits | **3.61us** | 4.52us |
-| 2026-09-12 | `22ee3a4` 24h, 268 windows | 3.90us | 4.20us |
+| window | cache hits in it | hit p50 | hit p99 |
+|---|---:|---:|---:|
+| routine traffic | ~50-70 | **3,900-4,000ns** | 4,200-4,400ns |
+| a tight burst | **1,200** | **1,064ns** | 3,782ns |
 
-Latency is the owner's stated key metric, so this is not a cosmetic drift.
+1,064ns is *below* the 1.7-2.2us band recorded on 2026-09-06 and treated as the
+baseline ever since. Nothing was deployed between those two readings; they are
+minutes apart on the same process.
 
-**Already ruled out** (2026-09-12): the `22ee3a4` monitoring-accounting change
-(monitor polls were excluded before and are still absent from `hit_p50_ns`);
-machine pressure (syd idle, load 0.08, 601MB free, no swap traffic); cache
-growth (process up 15 hours).
+**What the measured span actually is.** `hit_p50_ns` is taken at
+`m6-http/src/main.rs`, and the timer starts immediately before the cache lookup
+and stops immediately after it, *before the response is written*. So it spans
+exactly two in-memory operations: `make_lookup_key` and `Cache::lookup_with`.
+The `ctx.start` timers elsewhere in that file belong to the **miss** path and do
+not feed this number.
 
-**Still unknown:** which commit, or whether it is code. Two unmeasured
-hypotheses, Rapid Reset's per-stream accounting and `22ee3a4`'s move from a
-substring match to real q-value parsing per request. Against both, the *same
-binary* read 2.95us on 2026-09-10 and 3.6-3.9us today.
+**The paired, interleaved A/B that §3a asked for, run 2026-09-13** across
+`084f89e`, `438bdb3`, `b32e837`, `22ee3a4` and `06c176d`, five interleaved
+rounds, one host:
 
-- [ ] **Paired, interleaved A/B on the build box** across `084f89e`,
-      `438bdb3`, `b32e837`, `22ee3a4` and HEAD. One load, one host, medians of
-      five, per lesson 7. **This is the same work as item 8's owed "benchmark
-      Phases 5 and 6"** and should be done once, for both.
+| commit | lookup p50 |
+|---|---:|
+| all five | **125ns**, identical |
 
-**Do not close this by adjusting the baseline.** Three sessions did that, on
-the reasoning "we keep measuring ~3us, so 1.7-2.2 must be wrong", which is
-backwards: a regression that lands before the first reading makes every
-subsequent reading agree with the others. Consistency is not correctness.
+Flat. And flat across cache size too, which was the other candidate: 125-166ns
+from 1 entry to 20,000. So the code in the measured window did not change and
+does not scale with what is cached.
+
+**Ruled out along the way**, each cheaply and each read-only: a slow
+clocksource (all three nodes are `kvm-clock` at **20.9 ns/call**, measured);
+steal time (**0.02%** on syd, load 0.16 on an idle box); an accounting change in
+`22ee3a4` (ruled out previously); cache growth.
+
+**Why it looked monotonic across four deploys.** Each reading was taken from
+whatever traffic happened to be in the window, and the site is quiet. Density
+drifted; the number followed. That also explains the fact the earlier notes
+found most puzzling, that the *same binary* read 2.95us on 2026-09-10 and
+3.6-3.9us two days later, and it explains why three sessions looking for a
+culprit commit found nothing: there is no culprit commit.
+
+**The earlier sessions were half right for the wrong reason.** They concluded
+the baseline was wrong; the baseline is not wrong, it is *conditional on load*,
+and comparing two readings taken at different request densities compares two
+different things. Withdrawing the withdrawal is not the outcome: the deviation
+was real and worth chasing, and chasing it is what produced the measurement.
+
+- [x] **Stop treating `hit_p50_ns` as a cross-day regression signal.** It is
+      only comparable between windows of similar hit count. The hourly check
+      should report the hit count beside it, or the number invites exactly this
+      mistake again.
+- [ ] **Amend the hourly prompt** so the baseline reads "1.7-2.2us at ~40-70
+      hits/window; ~1.0us under sustained load", and so a reading is reported
+      with its window's hit count. Not done here because the prompt is the
+      owner's.
+- [ ] **Optional, if a load-independent number is wanted**: measure the hit
+      path with a fixed synthetic burst rather than ambient traffic, which is
+      what the burst above does and could be a `--bench` mode on the health
+      check.
 
 ### 3b. One app shape, not three
 
