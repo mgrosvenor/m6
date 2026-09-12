@@ -58,6 +58,7 @@ pub use negotiate::{canonical_coding, coding_quality, preferred_coding};
 pub use path::validate_path_param;
 pub use random::random_hex_token;
 pub use request::Request;
+pub use app::AppContext;
 pub use dict::Dict;
 pub use response::{Body, Response};
 pub use server::{socket_path_from_config, UnixServer};
@@ -95,7 +96,7 @@ pub use watcher::ConfigWatcher;
 /// }
 /// ```
 pub mod prelude {
-    pub use crate::app::App;
+    pub use crate::app::{App, AppContext};
     pub use crate::error::{Error, Result};
     pub use crate::request::Request;
     pub use crate::dict::Dict;

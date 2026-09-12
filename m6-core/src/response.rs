@@ -124,6 +124,32 @@ pub struct Response {
     pub template_dict: Option<crate::dict::Dict>,
 }
 
+impl From<crate::http::RawResponse> for Response {
+    /// The low-level response type, lifted into the one handlers return.
+    ///
+    /// `RawResponse` is what a service builds when it is writing its own
+    /// status, headers and body with no framework around it; `Response` is
+    /// what an `App` handler returns. They hold the same three things, so a
+    /// service migrating onto `App` does not have to rewrite handlers that
+    /// already produce a correct answer.
+    ///
+    /// `verbatim`, because a `RawResponse` was built to be written as-is: the
+    /// service that produced it set its own `Content-Type` and length and had
+    /// no pipeline behind it. m6-auth-server's bodies are JSON and form
+    /// redirects with `Set-Cookie` headers, and compressing them downstream
+    /// would change bytes their producer considers final.
+    fn from(r: crate::http::RawResponse) -> Self {
+        Self {
+            status: r.status,
+            headers: r.headers,
+            body: Body::Bytes(r.body),
+            verbatim: true,
+            template_name: None,
+            template_dict: None,
+        }
+    }
+}
+
 impl Response {
     // ---------- constructors ----------
 

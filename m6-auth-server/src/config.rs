@@ -4,17 +4,10 @@ use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
-pub struct LogConfig {
-    pub level:  Option<String>,
-    pub format: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
 struct RawConfig {
     storage: StorageConfig,
     tokens:  Option<TokensConfig>,
     keys:    KeysConfig,
-    log:     Option<LogConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -36,6 +29,13 @@ struct KeysConfig {
 }
 
 /// Parsed and validated auth server configuration.
+/// `[log]` is deliberately absent.
+///
+/// It used to be parsed here as well, into a `LogConfig` this service then
+/// resolved against `site.toml` by hand. `m6_core::app` does that for every
+/// service, from the same file, with the same precedence: site.toml, then the
+/// service config's `[log]`, then `--log-level`. Two parsers for one section
+/// is how they drift.
 pub struct AuthConfig {
     pub db_path:         PathBuf,   // relative to site_dir
     pub access_ttl:      u64,       // seconds
@@ -43,7 +43,6 @@ pub struct AuthConfig {
     pub issuer:          String,
     pub private_key_path: PathBuf,
     pub public_key_path:  PathBuf,
-    pub log:             Option<LogConfig>,
 }
 
 impl AuthConfig {
@@ -97,7 +96,6 @@ impl AuthConfig {
             issuer,
             private_key_path,
             public_key_path,
-            log: raw.log,
         })
     }
 }

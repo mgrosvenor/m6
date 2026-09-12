@@ -23,15 +23,26 @@ pub struct AppState {
     pub rate_limiter: Mutex<RateLimiter>,
 }
 
-/// Main dispatcher.
-pub fn dispatch(req: &RawRequest, state: &AppState, peer_ip: &str) -> RawResponse {
-    match (req.method.as_str(), req.path.as_str()) {
-        ("POST", "/auth/login")   => handle_login(req, state, peer_ip),
-        ("POST", "/auth/refresh") => handle_refresh(req, state),
-        ("POST", "/auth/logout")  => handle_logout(req, state),
-        ("GET",  "/auth/public-key") => handle_public_key(state),
-        _ => RawResponse::new(404).body("Not Found"),
-    }
+// The four handlers are reached by route now: `App` matches the path and the
+// method, so the dispatcher that did it here is gone. These wrappers exist so
+// the handler functions themselves stay private and unchanged -- they are the
+// security-carrying part of this service, and a migration is the wrong time to
+// touch them.
+
+pub fn dispatch_login(req: &RawRequest, state: &AppState, peer_ip: &str) -> RawResponse {
+    handle_login(req, state, peer_ip)
+}
+
+pub fn dispatch_refresh(req: &RawRequest, state: &AppState) -> RawResponse {
+    handle_refresh(req, state)
+}
+
+pub fn dispatch_logout(req: &RawRequest, state: &AppState) -> RawResponse {
+    handle_logout(req, state)
+}
+
+pub fn dispatch_public_key(state: &AppState) -> RawResponse {
+    handle_public_key(state)
 }
 
 // ─── POST /auth/login ─────────────────────────────────────────────────────────

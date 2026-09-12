@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use m6_core::testkit::{binary, wait, Service};
+use m6_core::testkit::{assert_app_lifecycle, binary, wait, Service};
 
 // ─── Test fixtures ────────────────────────────────────────────────────────────
 
@@ -447,21 +447,20 @@ fn t10_next_external_url_falls_back_to_root() {
 #[test]
 fn sigterm_shuts_down_and_removes_the_socket() {
     let env = setup_test_env("shutdown");
-    let mut svc = spawn_server(&env);
 
-    let status = svc.terminate(Duration::from_secs(5));
-    assert!(
-        status.success(),
-        "m6-auth-server should exit 0 on SIGTERM, got {status}. A signal exit status \
-         means the process died at the default disposition instead of shutting down.\n\
-         --- output ---\n{}",
-        svc.output()
+    // The whole lifecycle contract in one call: exit 0 rather than a signal
+    // status, the socket removed so m6-http does not keep a dead member in its
+    // backend pool, and the three lines logged under the right service name.
+    //
+    // This used to be written out by hand here, as it was in five other
+    // suites, which is how the sixth service ended up with no lifecycle test
+    // at all. It is core's now.
+    assert_app_lifecycle(
+        "m6-auth-server",
+        Command::new(binary("m6-auth-server"))
+            .arg(&env.site_dir)
+            .arg(&env.config_path)
+            .env("M6_SOCKET_OVERRIDE", &env.socket_path),
+        &env.socket_path,
     );
-    assert!(
-        !env.socket_path.exists(),
-        "the socket at {} outlived the process; m6-http would keep it in its \
-         backend pool until the next rescan",
-        env.socket_path.display()
-    );
-    m6_core::testkit::assert_lifecycle_logged("m6-auth-server", &svc.output());
 }

@@ -1,138 +1,58 @@
+//! The authentication service.
+//!
+//! An `App` service with one shared value: the database, the signing keys, the
+//! token lifetimes and the rate limiter. Four routes, all literal paths.
+//!
+//! This file used to be 246 lines of CLI parsing, logging setup, socket bind
+//! and permissions, an accept loop, and a `thread::spawn` per connection. All
+//! of it had an equivalent in core. The one capability it needed that `App`
+//! lacked was `chmod` on the socket, which became `[server] socket_mode` on
+//! 2026-09-12.
+//!
+//! **The connection model changes.** This spawned an unbounded thread per
+//! connection; `App` uses a bounded pool and answers 503 when the queue is
+//! full. For a login endpoint that is the safer of the two by a wide margin:
+//! a thread per connection is what turns a credential-stuffing burst into
+//! memory exhaustion, and this service already rate-limits per address
+//! precisely because it expects that traffic.
+
 mod config;
+mod handlers;
 mod jwt;
 mod key_watch;
 mod rate_limit;
-mod handlers;
 
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
-use anyhow::Result;
-use tracing::{error, info};
-
-use m6_auth::Db;
-use m6_core::server::{socket_path_from_config, UnixServer};
-use m6_core::signal::ShutdownHandle;
+use m6_core::prelude::*;
+use m6_core::http::RawResponse;
 
 use config::AuthConfig;
-use key_watch::{KeyMaterial, spawn_key_watcher};
+use handlers::AppState;
+use key_watch::{spawn_key_watcher, KeyMaterial};
 use rate_limit::RateLimiter;
 
-fn main() {
-    // Block SIGTERM and SIGINT before anything else, including logging.
-    // The mask is inherited only by threads created after this point, and
-    // tracing-appender's writer thread would otherwise take the signal at its
-    // default disposition and kill the process. See m6_core::signal.
-    m6_core::signal::block();
-    let code = run();
-    std::process::exit(code);
-}
+/// Build the shared state: config, keys, database, rate limiter.
+///
+/// Returns `Err` rather than exiting, so `App` reports it the same way it
+/// reports every other startup failure.
+fn build_state(ctx: &AppContext) -> Result<AppState> {
+    let cfg = AuthConfig::load(ctx.site_dir, ctx.config_path)
+        .map_err(|e| Error::Other(e.context("loading auth config")))?;
 
-fn run() -> i32 {
-    let args: Vec<String> = std::env::args().collect();
+    let key_material =
+        KeyMaterial::load(&cfg.private_key_path, &cfg.public_key_path, cfg.issuer.clone())
+            .map_err(|e| Error::Other(e.context("loading key material")))?;
 
-    // Parse CLI: m6-auth-server <site-dir> <config-path> [--log-level debug]
-    let mut site_dir_str: Option<String> = None;
-    let mut config_path_str: Option<String> = None;
-    let mut log_level: Option<String> = None;
-
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--log-level" => {
-                i += 1;
-                if i < args.len() {
-                    log_level = Some(args[i].clone());
-                }
-            }
-            arg if !arg.starts_with('-') => {
-                if site_dir_str.is_none() {
-                    site_dir_str = Some(arg.to_string());
-                } else if config_path_str.is_none() {
-                    config_path_str = Some(arg.to_string());
-                }
-            }
-            _ => {}
-        }
-        i += 1;
+    if let Some(parent) = cfg.db_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| Error::Other(anyhow::Error::new(e).context("creating db directory")))?;
     }
+    let db = m6_auth::Db::open(&cfg.db_path)
+        .map_err(|e| Error::Other(anyhow::anyhow!("opening auth database: {e}")))?;
 
-    let site_dir_str = match site_dir_str {
-        Some(s) => s,
-        None => {
-            eprintln!("Usage: m6-auth-server <site-dir> <config-path> [--log-level LEVEL]");
-            return 2;
-        }
-    };
-    let config_path_str = match config_path_str {
-        Some(s) => s,
-        None => {
-            eprintln!("Usage: m6-auth-server <site-dir> <config-path> [--log-level LEVEL]");
-            return 2;
-        }
-    };
-
-    let site_dir  = PathBuf::from(&site_dir_str);
-    let config_path = PathBuf::from(&config_path_str);
-
-    // Load config (exit 2 on config error)
-    let cfg = match AuthConfig::load(&site_dir, &config_path) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("failed to load config: {}", e);
-            return 2;
-        }
-    };
-
-    // Resolve log settings: site.toml base → per-app [log] override → CLI --log-level.
-    let (site_level, site_format) = m6_core::log::read_site_log_config(&site_dir);
-    let format = cfg.log.as_ref()
-        .and_then(|l| l.format.as_deref())
-        .unwrap_or(&site_format)
-        .to_string();
-    let cfg_level = cfg.log.as_ref()
-        .and_then(|l| l.level.as_deref())
-        .unwrap_or(&site_level)
-        .to_string();
-    let level = log_level.as_deref().unwrap_or(&cfg_level).to_string();
-
-    let _log_guard = match m6_core::log::init(&format, &level) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("logging init error: {}", e);
-            return 1;
-        }
-    };
-
-    // Load key material (exit 2 if unreadable or invalid)
-    let key_material = match KeyMaterial::load(&cfg.private_key_path, &cfg.public_key_path, cfg.issuer.clone()) {
-        Ok(k) => k,
-        Err(e) => {
-            error!(error = %e, "failed to load key material");
-            return 2;
-        }
-    };
-
-    // Open database (db_path already resolved to absolute in config.rs)
-    let db_path = cfg.db_path.clone();
-    if let Some(parent) = db_path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            error!(error = %e, "failed to create db directory");
-            return 1;
-        }
-    }
-    let db = match Db::open(&db_path) {
-        Ok(d) => d,
-        Err(e) => {
-            error!(error = %e, "failed to open auth database");
-            return 1;
-        }
-    };
-
-    // Wrap key material in Arc<RwLock<>> for hot-swappable key rotation
+    // Hot-swappable across key rotation, so a rotation needs no restart.
     let keys = Arc::new(RwLock::new(key_material));
-
-    // Spawn key file watcher — reloads keys on rotation without restart
     spawn_key_watcher(
         cfg.private_key_path.clone(),
         cfg.public_key_path.clone(),
@@ -140,107 +60,57 @@ fn run() -> i32 {
         Arc::clone(&keys),
     );
 
-    // Build shared state
-    let state = Arc::new(handlers::AppState {
+    tracing::info!(issuer = %cfg.issuer, "auth config loaded");
+
+    Ok(AppState {
         db: Mutex::new(db),
         keys,
-        access_ttl:  cfg.access_ttl,
+        access_ttl: cfg.access_ttl,
         refresh_ttl: cfg.refresh_ttl,
         issuer: cfg.issuer.clone(),
         rate_limiter: Mutex::new(RateLimiter::new()),
-    });
-
-    // Derive socket path (can be overridden for tests)
-    let socket_path = socket_path_from_config(&config_path);
-
-    // Ensure socket directory exists
-    if let Some(parent) = socket_path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            error!(error = %e, dir = %parent.display(), "failed to create socket directory");
-            return 1;
-        }
-    }
-
-    // Bind Unix socket
-    let server = match UnixServer::bind(socket_path.clone()) {
-        Ok(s) => s,
-        Err(e) => {
-            error!(error = %e, socket = %socket_path.display(), "failed to bind socket");
-            return 1;
-        }
-    };
-
-    m6_core::server::apply_socket_mode(server.path(), m6_core::server::DEFAULT_SOCKET_MODE);
-
-    info!(issuer = %cfg.issuer, "auth config loaded");
-
-    // Shutdown. `socket` supplies both things this used to do by hand: the
-    // self-connect that returns the parked accept(), which cost a whole extra
-    // thread spinning on `shutdown.wait()` here, and the socket unlink on the
-    // way out, which this service did not do at all.
-    let _shutdown = ShutdownHandle::install(
-        m6_core::signal::Service::new("m6-auth-server").socket(socket_path.clone()),
-    );
-
-    // Accept loop
-    loop {
-        if _shutdown.is_shutdown() {
-            break;
-        }
-
-        let (stream, _addr) = match server.listener().accept() {
-            Ok(s) => s,
-            Err(e) => {
-                if _shutdown.is_shutdown() {
-                    break;
-                }
-                error!(error = %e, "accept error");
-                continue;
-            }
-        };
-
-        if _shutdown.is_shutdown() {
-            break;
-        }
-
-        let state2 = Arc::clone(&state);
-        std::thread::spawn(move || {
-            if let Err(e) = handle_connection(stream, &state2) {
-                tracing::debug!(error = %e, "connection error");
-            }
-        });
-    }
-
-    _shutdown.complete();
-    0
+    })
 }
 
-fn handle_connection(
-    mut stream: std::os::unix::net::UnixStream,
-    state: &Arc<handlers::AppState>,
-) -> Result<()> {
-    m6_core::server::apply_read_timeout(
-        &stream,
-        Some(std::time::Duration::from_secs(
-            m6_core::server::DEFAULT_READ_TIMEOUT_SECS,
-        )),
-    );
+/// A unix socket has no peer address, so rate limiting keys off what the proxy
+/// forwarded. `"unix"` when nothing did, which buckets every unattributed
+/// request together rather than exempting them.
+fn peer_ip(req: &Request) -> String {
+    req.header("x-forwarded-for")
+        .or_else(|| req.header("x-real-ip"))
+        .unwrap_or("unix")
+        .to_string()
+}
 
-    // The loop, the malformed-request answer, the HEAD rule and the keep-alive
-    // decision are core's. This file had its own of each -- including a
-    // `parse_request(&mut stream)?` that returned to a caller which only
-    // logged, so every unparseable request got a silent close.
-    let served: std::result::Result<(), std::io::Error> =
-        m6_core::server::serve_connection(&mut stream, |req, out| {
-            // Unix sockets have no peer IP, so rate limiting keys off what the
-            // proxy forwarded.
-            let peer_ip = req
-                .header("x-forwarded-for")
-                .or_else(|| req.header("x-real-ip"))
-                .unwrap_or("unix")
-                .to_string();
+/// Adapt one of `handlers`' functions to a route.
+///
+/// The handlers return `RawResponse` and are left alone: they are the
+/// security-carrying part of this service (rate limiting, JWT minting, cookie
+/// flags), and a migration is the wrong time to rewrite them. `RawResponse`
+/// lifts into `Response` verbatim.
+macro_rules! route {
+    ($app:expr, $method:ident, $path:literal, $f:expr) => {
+        $app.$method($path, move |req: &Request, state: &AppState| {
+            let f: fn(&Request, &AppState, &str) -> RawResponse = $f;
+            Ok(f(req, state, &peer_ip(req)).into())
+        })
+    };
+}
 
-            handlers::dispatch(&req, state, &peer_ip).send(out)
-        });
-    Ok(served?)
+fn main() -> anyhow::Result<()> {
+    let app = App::with_global(build_state);
+    let app = route!(app, route_post, "/auth/login", |req, state, ip| {
+        handlers::dispatch_login(req.raw(), state, ip)
+    });
+    let app = route!(app, route_post, "/auth/refresh", |req, state, _ip| {
+        handlers::dispatch_refresh(req.raw(), state)
+    });
+    let app = route!(app, route_post, "/auth/logout", |req, state, _ip| {
+        handlers::dispatch_logout(req.raw(), state)
+    });
+    let app = route!(app, route_get, "/auth/public-key", |_req, state, _ip| {
+        handlers::dispatch_public_key(state)
+    });
+    app.run()?;
+    Ok(())
 }
