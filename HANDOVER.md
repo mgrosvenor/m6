@@ -72,12 +72,10 @@ commit log rather than written from memory.
 20 ahead of `d6ebfa5` in the site repo. No migration code is deployed and the
 freeze holds until it is finished.**
 
-> **Both repos are ahead of `origin/main` and that is not fine.** 84 commits on
-> `m6`, 18 on the site repo, as of 2026-09-12. Ahead of the *fleet* is the
-> deliberate freeze; ahead of *origin* is just unbacked work on a laptop, and
-> the site handover's §5 says to push when you find this. Not pushed here
-> because `m6`'s `pre-push` hook runs the full suite and the owner has not
-> asked for it this session. **Push both.**
+> **Both repos are pushed and level with `origin/main` as of 2026-09-12**:
+> `m6` at `6c1f74a`, the site repo at `5eb16d8`. Ahead of the *fleet* is the
+> deliberate freeze and is fine; ahead of *origin* is unbacked work on a laptop
+> and is not. If you find them ahead again, push.
 
 > The deployed commit is whatever the newest entry in
 > `~/dr-grosvenor-site/docs/RELEASES.md` names, and nothing else. **Recompute,
