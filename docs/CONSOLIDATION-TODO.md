@@ -208,11 +208,23 @@ subsequent reading agree with the others. Consistency is not correctness.
 
 ### 3b. One app shape, not three
 
-**SCOPE DECISION, 2026-09-12.** The architecture below is agreed and stays on
-this list. It is **not** the near-term work. The near-term work is the minimal
-set that makes the shapes roughly agree, in §3b-now. Everything else is
-**deferred and tracked**, not dropped, and should not be re-litigated each time
-it comes up.
+**SCOPE DECISION, 2026-09-12, NARROWED BY THE OWNER THE SAME DAY.**
+
+The first version of this note said everything outside §3b-now was deferred,
+and that was recorded too widely. The owner's correction, verbatim: *"IO layer,
+the event loop, the handler contract. These are deferred. Only."* and *"I/o
+layer is arguably low touch consolidation work."*
+
+So the deferred set is **the event loop and the handler contract**, with the IO
+layer in scope as low-touch. Everything else below is live work:
+
+- **wildcard route segment** and **streaming response body** are in scope, not
+  deferred, and they are what m6-file's migration waits on.
+- **both migrations are in scope.** They were never in the deferred list; they
+  are sequenced after core gains the capabilities they need.
+- **m6-auth-server's migration is unblocked as of 2026-09-12.** Its stated
+  blocker was `chmod` on the socket, which is now `[server] socket_mode`. Its
+  four routes are all literal paths, so it needs no wildcard support.
 
 #### 3b-now. The minimal set
 
