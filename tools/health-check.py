@@ -47,6 +47,7 @@ import argparse
 import concurrent.futures
 import json
 import re
+from urllib.parse import unquote
 import subprocess
 import sys
 import time
@@ -83,12 +84,62 @@ DISK_WARN_PCT = 80
 TTFB_WARN_S = 0.010
 HIT_RATE_FLOOR = 0.10      # per node, 24h. Below this the edge lifetime regressed.
 
+# `bot(?![a-z])`, not `bot\b`. `\b` is a word boundary and `_` is a word
+# character, so `bot\b` does not match `OnlineOrNot.com_bot_1.0`, which is a
+# bot saying so in its name. That agent went unreported on all three nodes for
+# two consecutive hourly checks while this regex sat here looking correct.
+#
+# `\+https?://` is the other half. `(compatible; ForestEngine/1.0;
+# +https://forestengine.net/)` carries no keyword at all, but the trailing
+# `+URL` is the convention a crawler uses to say who it is and where to
+# complain. Nothing else puts a URL in a user agent.
 BOT_RE = re.compile(
-    r"bot\b|crawl|spider|scout|probe|slurp|fetcher|Amzn-|GPTBot|ClaudeBot|"
+    r"bot(?![a-zA-Z])|crawl|spider|scout|probe|slurp|fetcher|\+https?://|"
+    r"Amzn-|GPTBot|ClaudeBot|"
     r"Claude-User|Claude-Web|anthropic|Perplexity|Applebot|Bytespider|CCBot|"
     r"facebookexternalhit|Twitterbot|LinkedInBot|MJ12|Yandex|Baidu|DuckDuck|"
     r"Googlebot|Google-Extended|bingbot|Amazonbot|WhatsApp|Discord|Slackbot|"
     r"Grok|OAI-SearchBot|ChatGPT-User",
+    re.I)
+
+def decode_path(p):
+    """Percent-decode a path, twice, for MATCHING ONLY.
+
+    Probe and injection paths arrive encoded, and these regexes were being run
+    against the raw string. `looks_like_injection` had exactly this defect on
+    the Rust side and it is recorded in the handover: `UNION%20SELECT` never
+    matched `union select`, so the detector read clean against precisely the
+    traffic it exists to catch. The same bug was sitting here.
+
+    Twice, because double encoding is routine in traversal attempts: the
+    WebLogic probe seen on 2026-09-12 was `/console/css/%252e%252e%252f...`,
+    which is `%2e%2e%2f` after one pass and `../` only after two.
+
+    Never use this to make a serving decision; it is deliberately more
+    permissive than any parser should be.
+    """
+    prev = p
+    for _ in range(2):
+        try:
+            nxt = unquote(prev)
+        except Exception:
+            break
+        if nxt == prev:
+            break
+        prev = nxt
+    return prev
+
+
+# Offensive tooling that announces itself. **Deliberately NOT in `BOT_RE`.**
+# zgrab is not a crawler visiting the site, and reporting it under "crawlers"
+# would file a scan next to Amazonbot and teach the reader to skim the section
+# that matters. These surface as a security signal instead.
+#
+# Seen against this fleet: zgrab (2026-09-12, Exchange probe on chi),
+# libredtail-http (2026-09-12, encoded traversal on lon).
+SCANNER_RE = re.compile(
+    r"zgrab|masscan|nuclei|sqlmap|nikto|dirbuster|gobuster|wpscan|"
+    r"libredtail|nmap|httpx|feroxbuster|wfuzz|hydra",
     re.I)
 
 PROBE_RE = re.compile(
@@ -246,6 +297,8 @@ if "render-contact" in units:
 cut = sh("date -u -d '%d minutes ago' +%%Y-%%m-%%dT%%H:%%M" % minutes).strip()
 by_ua  = collections.defaultdict(lambda: {"n": 0, "ips": collections.Counter(),
                                           "paths": collections.Counter()})
+by_ua_monitor = collections.defaultdict(lambda: {"n": 0, "ips": collections.Counter(),
+                                                 "paths": collections.Counter()})
 by_ip  = collections.defaultdict(lambda: {"n": 0, "uas": set(),
                                           "paths": collections.Counter(),
                                           "status": collections.Counter(),
@@ -273,7 +326,22 @@ try:
             if d.get("timestamp", "") < cut:
                 continue
             f = d.get("fields", {})
-            if f.get("message") != "request":
+            msg = f.get("message")
+            if msg == "monitor":
+                # Monitor polls (/health, /perf) are deliberately kept out of
+                # the traffic stats, and that is right. But it also hid an
+                # entire class of visitor: `OnlineOrNot.com_bot` only ever
+                # requests /health, so it was invisible to the crawler report
+                # on all three nodes while the standing order says report every
+                # crawler, every run. Counted here, reported apart.
+                mua = f.get("user_agent", "")
+                if mua:
+                    m = by_ua_monitor[mua]
+                    m["n"] += 1
+                    m["ips"][f.get("client_ip", "")] += 1
+                    m["paths"][f.get("path", "")] += 1
+                continue
+            if msg != "request":
                 continue
             total += 1
             ua, ip, path = f.get("user_agent", ""), f.get("client_ip", ""), f.get("path", "")
@@ -301,6 +369,9 @@ out["analytics"] = {
                    "ip_total": len(v["ips"]),
                    "paths": v["paths"].most_common(6)}
               for ua, v in by_ua.items()},
+    "by_ua_monitor": {ua: {"n": v["n"], "ips": v["ips"].most_common(),
+                           "paths": v["paths"].most_common(4)}
+                      for ua, v in by_ua_monitor.items()},
     "by_ip": {ip: {"n": v["n"], "ua_count": len(v["uas"]),
                    "paths": v["paths"].most_common(12),
                    "status": {str(k): c for k, c in v["status"].items()},
@@ -415,7 +486,7 @@ def classify_crawlers(analytics):
     forgers = set()
     for ip, v in by_ip.items():
         rotating = v["ua_count"] >= 10 and v["n"] >= 20
-        scanning = any(PROBE_RE.search(p) or INJECTION_RE.search(p)
+        scanning = any(PROBE_RE.search(decode_path(p)) or INJECTION_RE.search(decode_path(p))
                        for p, _ in v["paths"])
         if rotating or scanning:
             forgers.add(ip)
@@ -440,14 +511,105 @@ def fmt_bytes(n):
         n /= 1024.0
 
 
+def self_test():
+    """Assertions against the real strings this tool has missed in production.
+
+    Every case here is something that actually went unreported, taken verbatim
+    from the analytics log on the date given. A detector with no tests is how
+    the same agent goes unreported for two consecutive hourly checks while the
+    regex above looks perfectly reasonable.
+
+    Run: ./tools/health-check.py --self-test
+    """
+    failures = []
+
+    def check(cond, msg):
+        if not cond:
+            failures.append(msg)
+
+    # --- Agents that were missed, 2026-09-12 ---------------------------------
+    missed = [
+        ("OnlineOrNot.com_bot_1.0_(https://onlineornot.com)",
+         "underscore after 'bot' defeats a word boundary"),
+        ("Mozilla/5.0 (compatible; ForestEngine/1.0; +https://forestengine.net/)",
+         "no keyword at all; identifies itself with +URL"),
+    ]
+    for ua, why in missed:
+        check(BOT_RE.search(ua), "BOT_RE misses %r (%s)" % (ua, why))
+
+    # --- Agents that were already caught, and must stay caught ---------------
+    for ua in [
+        "RecordedFuture Global Inventory Crawler",
+        "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; "
+        "Amazonbot/0.1; +https://developer.amazon.com/support/amazonbot)",
+        "Mozilla/5.0 (compatible; DotBot/1.2; +https://opensiteexplorer.org/dotbot)",
+        "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+        "CyberConvoyScout/1.0",
+    ]:
+        check(BOT_RE.search(ua), "BOT_RE regressed on %r" % ua)
+
+    # --- Scanners are scanners, not crawlers ---------------------------------
+    # Filed apart on purpose: a scan reported next to Amazonbot teaches the
+    # reader to skim the section that matters.
+    for ua in ["Mozilla/5.0 zgrab/0.x", "libredtail-http", "sqlmap/1.7"]:
+        check(SCANNER_RE.search(ua), "SCANNER_RE misses %r" % ua)
+        check(not BOT_RE.search(ua),
+              "%r is a scanner and must not be reported as a crawler" % ua)
+
+    # --- Real browsers must NOT be called bots -------------------------------
+    for ua in [
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1",
+        "Mozilla/5.0 (X11; Linux x86_64; rv:142.0) Gecko/20100101 Firefox/142.0",
+        "curl/8.7.1",
+        "Mozilla/5.0",
+    ]:
+        check(not BOT_RE.search(ua), "BOT_RE false positive on %r" % ua)
+
+    # --- Encoded probes, which were matched raw and therefore not at all -----
+    encoded = [
+        ("/console/css/%252e%252e%252fconsole.portal", "double-encoded traversal"),
+        ("/cgi-bin/.%2e/.%2e/.%2e/", "encoded traversal"),
+        ("/%2e%2e%2f%2e%2e%2fetc/passwd", "encoded traversal to passwd"),
+    ]
+    for path, why in encoded:
+        check(PROBE_RE.search(decode_path(path)),
+              "PROBE_RE misses %r (%s)" % (path, why))
+
+    check(INJECTION_RE.search(decode_path("/?q=UNION%20SELECT%20*")),
+          "INJECTION_RE misses percent-encoded UNION SELECT, which is the only "
+          "way it ever arrives in a URL")
+
+    # --- Ordinary paths must not be probes -----------------------------------
+    for path in ["/", "/capabilities", "/assets/js/nav.js", "/robots.txt"]:
+        check(not PROBE_RE.search(decode_path(path)),
+              "PROBE_RE false positive on %r" % path)
+
+    if failures:
+        print("SELF-TEST FAILED (%d)" % len(failures))
+        for f in failures:
+            print("  -", f)
+        return 1
+    print("self-test ok")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--self-test", action="store_true",
+                    help="check the detectors against agents and paths this "
+                         "tool has previously missed, then exit")
     ap.add_argument("--minutes", type=int, default=60,
                     help="security and crawler window (default 60)")
     ap.add_argument("--load", action="store_true",
                     help="generate traffic and read a loaded window; always labelled GENERATED")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     args = ap.parse_args()
+
+    if args.self_test:
+        return self_test()
 
     generated = 0
     if args.load:
@@ -593,8 +755,8 @@ def main():
         by_ip = a.get("by_ip", {})
         # Bursts, probes and injections.
         for ip, v in sorted(by_ip.items(), key=lambda x: -x[1]["n"])[:4]:
-            probe_paths = [(p, n) for p, n in v["paths"] if PROBE_RE.search(p)]
-            inj = [(p, n) for p, n in v["paths"] if INJECTION_RE.search(p)]
+            probe_paths = [(p, n) for p, n in v["paths"] if PROBE_RE.search(decode_path(p))]
+            inj = [(p, n) for p, n in v["paths"] if INJECTION_RE.search(decode_path(p))]
             # Volume alone is not suspicious. A burst counts only when it is
             # also failing: an ordinary heavy client is not an incident, and
             # reporting one trains the reader to skim the fault list. This
@@ -661,6 +823,28 @@ def main():
         print("  single refused probes (noise, not escalated): %s"
               % ", ".join("%s %s %s" % (n, ip, p) for n, ip, p in noise[:6]))
 
+    # Known offensive tooling, by name, reported even when the paths it asked
+    # for did not trip PROBE_RE. A tool that announces itself is worth a line
+    # whatever it happened to request.
+    scanners = []
+    for node, r, err in results:
+        if err:
+            continue
+        # by_ua, not by_ip: by_ip carries only a `ua_count`, so the agent
+        # strings live on the other index.
+        for ua, v in (r.get("analytics", {}).get("by_ua", {}) or {}).items():
+            if not SCANNER_RE.search(ua):
+                continue
+            ips = ", ".join(ip for ip, _ in (v.get("ips") or [])[:3])
+            paths = ", ".join(pp for pp, _ in (v.get("paths") or [])[:3])
+            scanners.append((node["name"], v.get("n", 0), ips[:40], ua[:52], paths[:70]))
+    if scanners:
+        print("  known scanning tools (by user agent):")
+        for n, cnt, ips, ua, paths in scanners[:8]:
+            print("    %-5s %3d req  %-40s  UA: %s" % (n, cnt, ips, ua))
+            if paths:
+                print("          paths: %s" % paths)
+
     print("\nE. CRAWLERS  (reported every run, even a quiet one)")
     any_crawler = False
     for node, r, err in results:
@@ -688,6 +872,29 @@ def main():
             print("        UA: %s" % ua)
             print("        paths: %s"
                   % ", ".join("%s x%d" % (p, n) for p, n in v["paths"][:4]))
+    # Bot-shaped agents that only ever touch /health or /perf. Reported apart
+    # from the crawlers above because they are not reading the site, and apart
+    # from nothing at all because the standing order is every crawler, every
+    # run. This is where `OnlineOrNot.com_bot` lives.
+    mon = {}
+    for node, r, err in results:
+        if err:
+            continue
+        for ua, v in (r.get("analytics", {}).get("by_ua_monitor", {}) or {}).items():
+            if not BOT_RE.search(ua):
+                continue
+            e = mon.setdefault(ua, {"n": 0, "nodes": set(), "paths": set()})
+            e["n"] += v.get("n", 0)
+            e["nodes"].add(node["name"])
+            for pp, _ in (v.get("paths") or []):
+                e["paths"].add(pp)
+    if mon:
+        any_crawler = True
+        print("  monitoring-endpoint agents (not site traffic):")
+        for ua, e in sorted(mon.items(), key=lambda x: -x[1]["n"]):
+            print("    %3d req  %-16s %s" % (e["n"], ",".join(sorted(e["nodes"])), ua[:60]))
+            print("          paths: %s" % ", ".join(sorted(e["paths"])[:4]))
+
     if not any_crawler:
         print("  (none seen on any node)")
 
