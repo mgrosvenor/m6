@@ -115,8 +115,13 @@ pub struct Response {
     /// while the renderer lived in the same crate as the type, which is the
     /// arrangement this migration is undoing.
     pub template_name: Option<String>,
-    /// Extra template context supplied by the handler via render_with.
-    pub template_dict: Option<Map<String, Value>>,
+    /// The context to render with, when the caller supplied one.
+    ///
+    /// `None` means "the request's own dictionary", which is what the service
+    /// loop already holds, so the common path carries no context at all rather
+    /// than a copy of the dict it is about to be rendered against. It used to
+    /// store a full clone of that dict and then merge it into itself.
+    pub template_dict: Option<crate::dict::Dict>,
 }
 
 impl Response {
@@ -129,18 +134,23 @@ impl Response {
 
     /// Render a template with extra context merged on top of the request dict.
     pub fn render_with(template: &str, req: &Request, extra: Value) -> Result<Self> {
+        // Cheap now: the clone shares the request dict's base and copies only
+        // the overlay, and the extras go on top of that.
         let mut dict = req.dict.clone();
         if let Some(obj) = extra.as_object() {
             for (k, v) in obj {
                 dict.insert(k.clone(), v.clone());
             }
         }
-        Self::render_dict(template, &dict, 200)
+        Self::render_context(template, dict, 200)
     }
 
     /// Render a template with a custom status code.
-    pub fn render_status(template: &str, req: &Request, status: u16) -> Result<Self> {
-        Self::render_dict(template, &req.dict, status)
+    ///
+    /// Carries no context of its own: the service loop renders against the
+    /// request's dictionary, which is exactly what this would have copied.
+    pub fn render_status(template: &str, _req: &Request, status: u16) -> Result<Self> {
+        Ok(Self::render_request_dict(template, status))
     }
 
     /// Record a template render from a dict directly, without a `Request`.
@@ -149,14 +159,39 @@ impl Response {
         dict: &Map<String, Value>,
         status: u16,
     ) -> Result<Self> {
+        Self::render_context(template, dict.clone().into(), status)
+    }
+
+    /// Record a template render against a context this response owns.
+    ///
+    /// The `Dict` form of `render_dict`, and what the service loop and
+    /// `render_with` use, because handing over a `Dict` shares its base rather
+    /// than copying it.
+    pub fn render_context(template: &str, dict: crate::dict::Dict, status: u16) -> Result<Self> {
         Ok(Self {
             status,
             headers: vec![],
             body: Body::empty(),
             verbatim: false,
             template_name: Some(template.to_string()),
-            template_dict: Some(dict.clone()),
+            template_dict: Some(dict),
         })
+    }
+
+    /// Record a template render against the request's own dictionary.
+    ///
+    /// Carries no context: the service loop already has the request dict and
+    /// uses it when none was supplied. This is the common path, and it used to
+    /// store a full copy of that dict only to merge it back into itself.
+    pub fn render_request_dict(template: &str, status: u16) -> Self {
+        Self {
+            status,
+            headers: vec![],
+            body: Body::empty(),
+            verbatim: false,
+            template_name: Some(template.to_string()),
+            template_dict: None,
+        }
     }
 
     pub fn redirect(location: &str) -> Self {

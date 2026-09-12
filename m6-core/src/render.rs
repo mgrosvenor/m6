@@ -13,7 +13,6 @@
 
 use std::path::Path;
 
-use serde_json::{Map, Value};
 
 /// What went wrong rendering a template.
 ///
@@ -47,7 +46,7 @@ impl std::fmt::Display for RenderError {
 /// One virtual call per templated response, on a path that is already doing
 /// file I/O and compression.
 pub trait Renderer: Send + Sync + 'static {
-    fn render(&self, template: &str, ctx: &Map<String, Value>) -> Result<String, RenderError>;
+    fn render(&self, template: &str, ctx: &crate::dict::Dict) -> Result<String, RenderError>;
 }
 
 /// Builds a `Renderer` for a site.
@@ -75,7 +74,7 @@ pub trait RendererFactory: Send + Sync + 'static {
 pub struct NoTemplates;
 
 impl Renderer for NoTemplates {
-    fn render(&self, template: &str, _ctx: &Map<String, Value>) -> Result<String, RenderError> {
+    fn render(&self, template: &str, _ctx: &crate::dict::Dict) -> Result<String, RenderError> {
         Err(RenderError::Failed(anyhow::anyhow!(
             "route asked for template `{template}`, but this binary links no template engine"
         )))

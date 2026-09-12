@@ -237,6 +237,7 @@ fn make_routes() -> Vec<CompiledRoute> {
             specificity: spec,
             handler: None,
             settings: std::sync::Arc::new(serde_json::Map::new()),
+            base_dict: std::sync::Arc::new(serde_json::Map::new()),
             }
         })
         .collect();
@@ -328,6 +329,7 @@ fn bench_match_route(c: &mut Criterion) {
             specificity: route_specificity(&segs),
             handler: None,
             settings: std::sync::Arc::new(serde_json::Map::new()),
+            base_dict: std::sync::Arc::new(serde_json::Map::new()),
     };
     let path_segs: Vec<&str> = "/blog/hello-world"
         .split('/')
@@ -495,6 +497,7 @@ size = 64
             specificity: spec,
             handler: None,
             settings: std::sync::Arc::new(serde_json::Map::new()),
+            base_dict: std::sync::Arc::new(serde_json::Map::new()),
                 }
             })
             .collect();
@@ -702,6 +705,7 @@ fn main() {
             specificity: route_specificity(&segs),
             handler: None,
             settings: std::sync::Arc::new(serde_json::Map::new()),
+            base_dict: std::sync::Arc::new(serde_json::Map::new()),
         };
         let path_segs: Vec<&str> = "/blog/hello-world"
             .split('/')
@@ -806,6 +810,7 @@ size = 64
             specificity: spec,
             handler: None,
             settings: std::sync::Arc::new(serde_json::Map::new()),
+            base_dict: std::sync::Arc::new(serde_json::Map::new()),
                     }
                 })
                 .collect();

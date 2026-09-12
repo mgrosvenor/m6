@@ -30,9 +30,17 @@ pub use crate::http::RawRequest;
 pub struct Request {
     pub(crate) raw: RawRequest,
     /// Merged request dictionary.
-    pub(crate) dict: Map<String, Value>,
+    ///
+    /// A `Dict` rather than a `Map`: the static half is shared with every
+    /// other request on this route rather than copied into each one. Cloning a
+    /// `Request` therefore no longer copies the site's content.
+    pub(crate) dict: crate::dict::Dict,
     /// Site directory (absolute).
-    pub(crate) site_dir: PathBuf,
+    ///
+    /// Shared rather than owned: it is the same path for the life of a reload,
+    /// and building a `Request` used to allocate a fresh `PathBuf` for it on
+    /// every request.
+    pub(crate) site_dir: std::sync::Arc<PathBuf>,
     /// The matched route's pattern, when one matched.
     pub(crate) route_pattern: Option<String>,
     /// The matched route's own config keys that core does not define.
@@ -43,7 +51,13 @@ pub struct Request {
 }
 
 impl Request {
-    pub fn new(raw: RawRequest, dict: Map<String, Value>, site_dir: PathBuf) -> Self {
+    pub fn new(
+        raw: RawRequest,
+        dict: impl Into<crate::dict::Dict>,
+        site_dir: impl Into<std::sync::Arc<PathBuf>>,
+    ) -> Self {
+        let dict = dict.into();
+        let site_dir = site_dir.into();
         Self { raw, dict, site_dir, route_pattern: None, route_settings: None }
     }
 
@@ -147,7 +161,7 @@ impl Request {
 
     // ---------- request dictionary ----------
 
-    pub fn dict(&self) -> &Map<String, Value> {
+    pub fn dict(&self) -> &crate::dict::Dict {
         &self.dict
     }
 
