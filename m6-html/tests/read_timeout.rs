@@ -7,7 +7,7 @@
 //! looking healthy: no panic, no error, no log line.
 //!
 //! These tests are written against the fixture config `m6-html-timeout.conf`,
-//! which sets a two-worker pool and a one second deadline. Both fail against an
+//! which sets a two-worker pool and a three second deadline. Both fail against an
 //! `App` with no timeout: the first hangs until the harness timeout, the second
 //! never gets its request answered.
 
@@ -42,20 +42,15 @@ fn spawn_server(id: &str) -> (Server, PathBuf) {
     );
     svc.wait_for_path(&socket_path, Duration::from_secs(10));
 
-    let mut ready = false;
-    for _ in 0..200 {
-        if get_root(&socket_path, Duration::from_secs(5)).is_some() {
-            ready = true;
-            break;
-        }
-        svc.assert_alive("waiting for the first answered request");
-        std::thread::sleep(Duration::from_millis(25));
-    }
+    let ready = m6_core::testkit::wait::until(Duration::from_secs(10), || {
+        get_root(&socket_path, Duration::from_secs(5)).is_some()
+    });
     assert!(
         ready,
         "m6-html never answered a request\n--- output ---\n{}",
         svc.output()
     );
+    svc.assert_alive("after the first answered request");
 
     (Server { svc, _dir: dir }, socket_path)
 }
@@ -85,7 +80,7 @@ fn a_silent_peer_is_disconnected_without_a_response() {
     let (mut server, socket_path) = spawn_server("silent");
 
     let mut stream = UnixStream::connect(&socket_path).expect("connect");
-    // Comfortably longer than the config's one second, so a read that returns
+    // Comfortably longer than the config's three seconds, so a read that returns
     // is the server's decision and not this timeout firing.
     stream.set_read_timeout(Some(Duration::from_secs(10))).expect("timeout");
 
@@ -118,41 +113,54 @@ fn a_silent_peer_is_disconnected_without_a_response() {
 fn silent_peers_do_not_starve_the_thread_pool() {
     let (mut server, socket_path) = spawn_server("starve");
 
-    // Hold these open and silent for the rest of the test.
-    let hogs: Vec<UnixStream> = (0..4)
+    // Open more connections than the pool can hold, all at once.
+    //
+    // Two workers plus a two-deep queue holds four; the rest are refused with a
+    // 503 straight away and cost nothing. Opening eight in a tight loop makes
+    // saturation independent of how many slots the readiness request from
+    // `spawn_server` still happens to occupy, which is what a fixed four got
+    // wrong: whichever connection arrives fifth takes the 503, and when that
+    // was a hog rather than the probe, only three were left holding.
+    //
+    // Adding them one per attempt does not work either, and the reason is worth
+    // keeping: a silent peer is released after the deadline, so with a slow
+    // probe between attempts the hogs die as fast as they are added and the
+    // pool never accumulates. All at once, then probe, is the only shape that
+    // races neither the deadline nor the queue.
+    let hogs: Vec<UnixStream> = (0..8)
         .filter_map(|_| UnixStream::connect(&socket_path).ok())
         .collect();
-    assert_eq!(hogs.len(), 4, "could not open the connections to fill the pool");
+    assert_eq!(hogs.len(), 8, "could not open the connections to fill the pool");
 
-    // Give the server a moment to accept them onto its workers and queue.
-    std::thread::sleep(Duration::from_millis(200));
+    // A short per-probe timeout so a queued probe gives up and retries quickly
+    // rather than sitting out the whole hold.
+    let saturated = m6_core::testkit::wait::until(Duration::from_secs(3), || {
+        get_root(&socket_path, Duration::from_millis(300))
+            .is_some_and(|r| r.contains("503"))
+    });
+    assert!(
+        saturated,
+        "eight silent peers never filled a two-worker, two-deep pool, so this \
+         test would not be measuring recovery from anything\n\
+         --- output ---\n{}",
+        server.svc.output()
+    );
 
     // Recovery is not instant and is not meant to be. The two workers time out
     // after a second and pick up the two queued connections, which time out a
-    // second after that. Until then the queue is full and the honest answer is
-    // a 503, so a 503 is a retry rather than a result: what is being asserted
-    // is that the pool comes back at all, not how fast.
-    let started = Instant::now();
-    let mut served = None;
-    let mut last = String::from("(no response at all)");
-    while started.elapsed() < Duration::from_secs(15) {
-        if let Some(resp) = get_root(&socket_path, Duration::from_secs(5)) {
-            if resp.contains("200 OK") {
-                served = Some(resp);
-                break;
-            }
-            last = resp;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-
-    served.unwrap_or_else(|| {
-        panic!(
-            "the pool never recovered while four silent peers held it; last \
-             answer was:\n{last}\n--- output ---\n{}",
-            server.svc.output()
-        )
+    // second after that. Until then a 503 is the honest answer, so it counts
+    // as "not yet" rather than as a result: what is asserted is that the pool
+    // comes back at all, not how fast.
+    let recovered = m6_core::testkit::wait::until(Duration::from_secs(30), || {
+        get_root(&socket_path, Duration::from_secs(5))
+            .is_some_and(|r| r.contains("200 OK"))
     });
+    assert!(
+        recovered,
+        "the pool never recovered while four silent peers held it\n\
+         --- output ---\n{}",
+        server.svc.output()
+    );
 
     drop(hogs);
     server.svc.assert_alive("after the pool recovered");

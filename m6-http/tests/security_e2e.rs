@@ -93,6 +93,20 @@ struct HttpResponse {
     body: Vec<u8>,
 }
 
+/// A response that never arrived, carrying the reason in place of headers.
+///
+/// Status 0 is already what an unparseable response parses to, so
+/// `wait_until_serving`'s `status == 200` retry loop reads this as "not yet"
+/// and tries again, which is what that loop is for. The reason is kept so a
+/// final assertion prints the transport error rather than nothing.
+fn no_response(reason: impl std::fmt::Display) -> HttpResponse {
+    HttpResponse {
+        status: 0,
+        headers: format!("<no response: {reason}>"),
+        body: Vec::new(),
+    }
+}
+
 impl HttpResponse {
     /// Case-insensitive header lookup over the raw header block.
     fn has_header(&self, name: &str) -> bool {
@@ -113,10 +127,17 @@ fn https_get(
     tls: Arc<rustls::ClientConfig>,
 ) -> HttpResponse {
     let port = srv.port;
-    let tcp = srv.tcp();
-    tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let Some(tcp) = srv.tcp() else {
+        return no_response("tcp connect refused while m6-http was alive");
+    };
+    if let Err(e) = tcp.set_read_timeout(Some(Duration::from_secs(10))) {
+        return no_response(format!("set_read_timeout: {e}"));
+    }
     let name = rustls::pki_types::ServerName::try_from("127.0.0.1".to_string()).unwrap();
-    let conn = rustls::ClientConnection::new(tls, name).unwrap();
+    let conn = match rustls::ClientConnection::new(tls, name) {
+        Ok(c) => c,
+        Err(e) => return no_response(format!("tls setup: {e}")),
+    };
     let mut stream = StreamOwned::new(conn, tcp);
 
     let mut req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n");
@@ -124,15 +145,24 @@ fn https_get(
         req.push_str(&format!("{k}: {v}\r\n"));
     }
     req.push_str("Connection: close\r\n\r\n");
-    stream.write_all(req.as_bytes()).unwrap();
-    stream.flush().unwrap();
+    // Not `.unwrap()`. This is called from `wait_until_serving`'s retry loop,
+    // and a server that is bound but not yet serving resets the connection,
+    // which surfaces on this write because the write drives the TLS handshake.
+    // An unwrap here ends the run instead of retrying: see the twin of this
+    // helper in `analytics_e2e.rs`, where it did exactly that on 2026-09-12.
+    if let Err(e) = stream.write_all(req.as_bytes()) {
+        return no_response(format!("write request: {e}"));
+    }
+    if let Err(e) = stream.flush() {
+        return no_response(format!("flush request: {e}"));
+    }
 
     let mut raw = Vec::new();
     match stream.read_to_end(&mut raw) {
         Ok(_) => {}
         // Peer closed without close_notify — normal for Connection: close.
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
-        Err(e) => panic!("TLS read error: {e}"),
+        Err(e) => return no_response(format!("tls read: {e}")),
     }
 
     let text = String::from_utf8_lossy(&raw);
@@ -316,12 +346,20 @@ impl Server {
     /// `ConnectionRefused` means nothing is listening, which means m6-http
     /// died since the last request. Asking the service reports its exit status
     /// and its own last words instead of a bare io error that names neither.
-    fn tcp(&self) -> TcpStream {
+    /// Open a TCP connection, or `None` if the server is not accepting yet.
+    ///
+    /// **A refused connect does not mean the server died.** `assert_alive`
+    /// still fails loudly, with exit status and stderr, when the process
+    /// really is gone; what remains is m6-http alive and not yet bound, which
+    /// `wait_until_serving` exists to wait out. See the twin of this method in
+    /// `analytics_e2e.rs`, where panicking here ended a run on 2026-09-12 with
+    /// a message that said the server was alive.
+    fn tcp(&self) -> Option<TcpStream> {
         match TcpStream::connect(("127.0.0.1", self.port)) {
-            Ok(s) => s,
-            Err(e) => {
+            Ok(s) => Some(s),
+            Err(_) => {
                 self.http.borrow_mut().assert_alive("the client was connecting");
-                panic!("connect to 127.0.0.1:{} failed with m6-http alive: {e}", self.port);
+                None
             }
         }
     }
@@ -743,7 +781,9 @@ fn tls_client_config_h2(cert_der: &[u8]) -> Arc<rustls::ClientConfig> {
 fn h2_data_frame_at_max_frame_size_must_get_a_response() {
     let srv = start_server(100_000);
 
-    let tcp = srv.tcp();
+    // Not a readiness probe: the server is already serving by here, so a
+    // refused connect is a genuine failure rather than something to retry.
+    let tcp = srv.tcp().expect("connect for the max-frame-size test");
     tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     let name = rustls::pki_types::ServerName::try_from("127.0.0.1".to_string()).unwrap();
     let conn =
