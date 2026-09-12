@@ -240,7 +240,7 @@ fn handle_connection(
                 .unwrap_or("unix")
                 .to_string();
 
-            handlers::dispatch(req, state, &peer_ip).send(out)
+            handlers::dispatch(&req, state, &peer_ip).send(out)
         });
     Ok(served?)
 }

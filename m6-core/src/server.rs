@@ -289,7 +289,11 @@ pub fn serve_connection<S, E, F>(stream: &mut S, mut handler: F) -> Result<(), E
 where
     S: std::io::Read + std::io::Write,
     E: From<std::io::Error>,
-    F: FnMut(&RawRequest, &mut crate::h1::Responder<'_, S>) -> Result<(), E>,
+    // Takes the request by value: this loop has no use for it after the
+    // handler returns, and handing it over saves every `App` service a full
+    // clone of the method, path, query, every header and the body, once per
+    // request, purely so a `Request` could own one.
+    F: FnMut(RawRequest, &mut crate::h1::Responder<'_, S>) -> Result<(), E>,
 {
     let mut served = 0u32;
     loop {
@@ -310,7 +314,7 @@ where
         let keep_alive = crate::h1::keep_alive(&req) && served < MAX_REQUESTS_PER_CONN;
 
         let mut resp = crate::h1::Responder::new(stream, &req.method, keep_alive);
-        handler(&req, &mut resp)?;
+        handler(req, &mut resp)?;
 
         if !keep_alive {
             return Ok(());

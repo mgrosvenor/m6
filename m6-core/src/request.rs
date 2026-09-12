@@ -75,6 +75,18 @@ impl Request {
         self
     }
 
+    /// Take the raw request back.
+    ///
+    /// `serve_connection` hands the request to its handler rather than lending
+    /// it, so the service loop gives ownership to the `Request` and takes it
+    /// back afterwards for the work that happens after the handler: the
+    /// content-coding negotiation, the cookie checks and the access log.
+    /// Without this the loop would have to copy the request to keep a second
+    /// view of it, which is the copy this was all for.
+    pub fn into_raw(self) -> RawRequest {
+        self.raw
+    }
+
     // ---------- matched route ----------
 
     /// The pattern of the route that matched, e.g. `/assets/{*relpath}`.

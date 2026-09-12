@@ -62,8 +62,8 @@ State of play for the next session. Written 2026-09-11, updated 2026-09-12.
 > offender**, at ~0.63ms of pure copying per HTML page with `content.json`
 > deep-copied six times.
 >
-> **J1 to J5 are done. Core's own copying went from ~442us to ~2.4us per
-> request.** The static half of the request dictionary is built once per route
+> **J1 to J6 are done and J7 is closed as accepted on the owner's call. Core's
+> own copying went from ~442us to ~1.58us per request, a factor of 280.** The static half of the request dictionary is built once per route
 > per reload and shared behind an `Arc` (`m6-core/src/dict.rs`), with only the
 > per-request overlay allocated. `build_dict` 222,708ns -> 1,125ns; the
 > `Request` clone 108,583 -> 542; `render_response`'s clone removed outright.
@@ -73,12 +73,24 @@ State of play for the next session. Written 2026-09-11, updated 2026-09-12.
 > base, so a params file still cannot override `year`, `datetime` or
 > `request_path`. The test is `dict::tests::a_base_entry_can_never_override_an_overlay_one`.
 >
-> **What remains is J7, and it is 98% of the remainder: Tera copies the whole
-> context into itself** (`Context::insert` calls `to_value`), 150,666ns of the
-> 153,084 left. Core cannot remove it from this side of the seam. Three routes
-> out are written up in §7; the only one that adds no dependency problem is a
-> per-route context prebuilt per reload with the overlay inserted and removed
-> around the render, and that is a design decision, not a patch.
+> **Everything that remains is inside Tera, and the owner has closed it:**
+> *"Don't bother with tera. That's just how it is."* Worth knowing the number
+> anyway, because it is larger than it looks: on a minimal template the
+> context build is **99.6%** of the work (178,875ns to build, 750ns to
+> render), and the cost is proportional to the size of the context rather than
+> to what the template reads. A page touching three keys still pays to copy
+> all 1,364 nodes of `content.json`. If it is ever reopened, the cheaper lever
+> is on the site side, not in core: the whole content file is in every page's
+> context because the config puts it there.
+>
+> **J6 is worth reading for what it found.** Both "small" copies were borrows
+> dressed as copies. The route table is now shared, so routing happens outside
+> the read lock and returns a borrow. And `serve_connection` hands the request
+> to its handler rather than lending it: the only thing preventing the move
+> was `Responder` holding `method: &'a str` when the sole use of it was
+> `eq_ignore_ascii_case("HEAD")`. Storing the decision instead of the string
+> cut the lifetime tie and stopped every `App` service copying a whole request
+> per request.
 >
 > **This is not §3a.** That is m6-http's cache-hit p50 and never touches
 > m6-html. Do not conflate them.

@@ -621,14 +621,46 @@ Ordered so each stands alone and the cheap, no-risk ones land first.
       this response supplied"; `None` means "render against the request's own
       dictionary", which the service loop already holds.
       **109,500ns became zero.**
-- [ ] **J6. The small rows.** Still open. `route.clone()`, `raw.clone()` and the two
-      `site_dir.clone()`s are ~900ns together. Worth doing once the big ones
-      are gone, not before: they are 0.1% of the bill and chasing them first
-      would be motion instead of progress.
-- [ ] **J7. Tera's own copy is the floor, and it is now 98% of what remains.**
+- [x] **J6. The small rows. DONE.** `route.clone()`, `raw.clone()` and the two
+      `site_dir.clone()`s were ~900ns together, and both turned out to be
+      borrows dressed as copies rather than anything inherent:
+
+      - **The route table is shared** (`Arc<Vec<CompiledRoute>>`), so routing
+        now happens *outside* the read lock and returns a borrow. The matched
+        route was previously cloned out of the guard for no reason other than
+        to outlive it.
+      - **`serve_connection` hands the request to its handler** rather than
+        lending it. It has no use for the request afterwards, and the only
+        thing stopping the move was `Responder` holding `method: &'a str` when
+        the sole use of it was `eq_ignore_ascii_case("HEAD")`. The responder
+        now stores that decision, the lifetime tie goes, and every `App`
+        service stops copying the method, path, query, every header and the
+        body once per request. `Request::into_raw` gives the loop the request
+        back for the coding negotiation, the cookie checks and the access log.
+- [~] **J7. Tera's own copy. CLOSED AS ACCEPTED, owner's call 2026-09-12:**
+      *"Don't bother with tera. That's just how it is."* Recorded rather than
+      struck out, because the number is worth knowing and the reasoning should
+      not have to be rediscovered.
+
+      **It is now 99% of what remains, and the proportion is worse than it
+      looks.**
       `tera::Context::insert` calls `to_value`, which deep-copies each value
-      into the engine's own `BTreeMap`. **150,666ns of the remaining
-      153,084ns.** Three ways out, none of them free:
+      into the engine's own `BTreeMap`. **143,417ns of the remaining
+      145,001ns.**
+
+      Measured against the render itself, on a minimal template, which is the
+      case *most* favourable to the copy being negligible:
+
+      | | ns |
+      |---|---:|
+      | context build | 178,875 |
+      | build + render | 179,625 |
+      | **render alone** | **750** |
+      | **context share** | **99.6%** |
+
+      The cost is proportional to the size of the context, not to what the
+      template reads: a page touching three keys still pays to copy all 1,364
+      nodes of `content.json`. Three ways out existed, none of them free:
 
       1. **A per-route `tera::Context` prebuilt once per reload**, with the
          request's overlay inserted before the render and removed after.
@@ -642,28 +674,34 @@ Ordered so each stands alone and the cheap, no-risk ones land first.
          owns a `BTreeMap<String, Value>` and every entry point copies into it.
       3. **A different engine**, one that renders against a borrowed context.
 
-      Option 1 is the only one that does not take on a dependency problem, and
-      it is a real design decision rather than a patch, so it is not taken
-      here.
+      Option 1 is the only one that takes on no dependency problem, and its
+      costs are real: a lock per route serialises concurrent renders of the
+      same page, and the thread-local variant that avoids the lock pays
+      threads x routes x context size in memory, which on a 950MB origin is
+      not nothing. **The owner's call is to leave it.** If it is ever
+      reopened, the cheaper lever is probably on the site side rather than in
+      core: the whole content file is in every page's context because the
+      config puts it there.
 
-#### Where it stands after J1 to J5
+#### Where it stands: J1 to J6 done, J7 accepted
 
-Same measurement, same input, after the jobs above:
+Same measurement, same input:
 
 | copy | before | after |
 |---|---:|---:|
-| config + site_dir out of the read lock | 458 | **42** |
-| `route.clone()` | 167 | 167 |
+| config + `site_dir` out of the read lock | 458 | **42** |
+| the matched route | 167 | **42** |
 | `build_dict` | 222,708 | **1,125** |
-| `raw.clone()` | 458 | 542 |
-| `dict.clone()` into `Request` | 108,583 | **542** |
+| `raw.clone()` | 458 | **0** |
+| `dict.clone()` into `Request` | 108,583 | **375** |
 | `dict.clone()` in `render_response` | 109,500 | **0** |
-| `tera::Context`, in the engine | 189,000 | 150,666 |
-| **total** | **630,874** | **153,084** |
+| `tera::Context`, in the engine | 189,000 | 143,417 |
+| **total** | **630,874** | **145,001** |
 
-**Core's own copying: ~442,000ns to ~2,400ns.** What is left is J6's ~700ns of
-small rows and J7, the engine's own copy, which is 98% of the remainder and
-cannot be removed from this side of the seam.
+**Core's own copying: ~442,000ns to ~1,584ns, a factor of 280.** Everything
+that remains is inside Tera, which is closed as accepted.
+
+`App` no longer copies anything that does not vary between requests.
 
 #### The rule this leaves behind
 
