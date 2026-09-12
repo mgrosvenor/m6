@@ -67,7 +67,7 @@ pub fn write_h1_headers(out: &mut Vec<u8>, existing: &[(String, String)]) {
         return;
     }
     for (name, value) in &guard.pairs {
-        if existing.iter().any(|(k, _)| k.eq_ignore_ascii_case(name)) {
+        if m6_core::headers::contains(existing, name) {
             continue;
         }
         out.extend_from_slice(name.as_bytes());
@@ -94,7 +94,7 @@ impl HeadersGuard {
         existing: &'a [(String, String)],
     ) -> impl Iterator<Item = (&'a str, &'a str)> + 'a {
         self.0.pairs.iter().filter_map(move |(name, value)| {
-            let overridden = existing.iter().any(|(k, _)| k.eq_ignore_ascii_case(name));
+            let overridden = m6_core::headers::contains(existing, name);
             (!overridden).then_some((name.as_str(), value.as_str()))
         })
     }

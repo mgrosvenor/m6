@@ -425,10 +425,7 @@ fn event_loop(
                     if let Some(redirect) = www_redirect(&req, &state.config) {
                         return redirect;
                     }
-                    let enc_str = req.headers
-                        .iter()
-                        .find(|(k, _)| k.eq_ignore_ascii_case("accept-encoding"))
-                        .map(|(_, v)| v.as_str())
+                    let enc_str = m6_core::headers::get(&req.headers[..], "accept-encoding")
                         .unwrap_or("");
                     let start = std::time::Instant::now();
 
@@ -647,10 +644,7 @@ fn event_loop(
                     if let Some(redirect) = www_redirect(&req, &state.config) {
                         return redirect;
                     }
-                    let enc_str = req.headers
-                        .iter()
-                        .find(|(k, _)| k.eq_ignore_ascii_case("accept-encoding"))
-                        .map(|(_, v)| v.as_str())
+                    let enc_str = m6_core::headers::get(&req.headers[..], "accept-encoding")
                         .unwrap_or("");
                     let start = std::time::Instant::now();
 
@@ -1658,11 +1652,7 @@ fn www_redirect_headers(location: String) -> Vec<(String, String)> {
 }
 
 fn www_redirect(req: &forward::HttpRequest, config: &config::Config) -> Option<RequestOutcome> {
-    let host = req
-        .headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("host"))
-        .map(|(_, v)| v.as_str());
+    let host = m6_core::headers::get(&req.headers[..], "host");
     let location = www_redirect_location(host, &req.path, req.query.as_deref(), config)?;
     Some(RequestOutcome::Ready(
         301,
@@ -1753,11 +1743,8 @@ fn handle_request(
 /// origin, and HTTP/1.0 without Host reached the backend with an empty
 /// `X-Forwarded-Host` and no `Host` at all.
 fn origin_host<'a>(req: &'a forward::HttpRequest, config: &'a config::Config) -> &'a str {
-    req.headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case(":authority"))
-        .or_else(|| req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("host")))
-        .map(|(_, v)| v.as_str())
+    m6_core::headers::get(&req.headers[..], ":authority")
+        .or_else(|| m6_core::headers::get(&req.headers[..], "host"))
         .filter(|h| !h.is_empty())
         .unwrap_or(config.site.domain.as_str())
 }
@@ -1987,18 +1974,10 @@ fn handle_request_inner(
     // Auth check — only if route has `require`
     if let Some(ref require) = route.require {
         if let Some(ref pk) = state.public_key {
-            let auth_header = req
-                .headers
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
-                .map(|(_, v)| v.as_str());
+            let auth_header = m6_core::headers::get(&req.headers[..], "authorization");
             let cookie_header_owned = auth::combined_cookie_header(&req.headers);
             let cookie_header = cookie_header_owned.as_deref();
-            let accept_header = req
-                .headers
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("accept"))
-                .map(|(_, v)| v.as_str());
+            let accept_header = m6_core::headers::get(&req.headers[..], "accept");
 
             match auth::extract_token(auth_header, cookie_header) {
                 None => {
@@ -2151,10 +2130,9 @@ fn handle_request_inner(
                     // Extract early-hints from the response body (HTML only).
                     // This is done ONLY on the cache-miss path to keep the
                     // cache-hit path at <10 µs.
-                    let content_type = http_resp.headers.iter()
-                        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
-                        .map(|(_, v)| v.as_str())
-                        .unwrap_or("");
+                    let content_type =
+                        m6_core::headers::get(&http_resp.headers[..], "content-type")
+                            .unwrap_or("");
                     let hint_paths = hints::extract_hints(&http_resp.body, content_type);
                     // Queue any hints not already in the cache for prefetch.
                     for hp in &hint_paths {
@@ -2436,11 +2414,10 @@ fn apply_error_mode(
                 query: Some(error_query),
                 version: "HTTP/3".to_string(),
                 headers: vec![
-                    ("Host".to_string(), req.headers
-                        .iter()
-                        .find(|(k, _)| k.eq_ignore_ascii_case("host"))
-                        .map(|(_, v)| v.clone())
-                        .unwrap_or_default()),
+                    ("Host".to_string(),
+                        m6_core::headers::get(&req.headers[..], "host")
+                            .unwrap_or_default()
+                            .to_string()),
                 ],
                 body: vec![],
             };
@@ -2619,11 +2596,11 @@ fn invalidate_after_unsafe_method(
     state.cache.evict_path(&req.path);
 
     for name in ["location", "content-location"] {
-        if let Some((_, v)) = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)) {
+        if let Some(v) = m6_core::headers::get(headers, name) {
             // Same-origin only. A bare path is ours by definition; an absolute
             // URL is ours only if its authority matches the configured domain.
             let path = if v.starts_with('/') {
-                Some(v.as_str())
+                Some(v)
             } else {
                 v.split_once("://")
                     .map(|(_, rest)| rest)
@@ -2656,7 +2633,7 @@ fn invalidate_after_unsafe_method(
 /// would make it look freshly generated and silently defeat the `Age` header
 /// sitting next to it.
 fn set_date(headers: &mut Vec<(String, String)>) {
-    if headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("date")) {
+    if m6_core::headers::contains(&headers[..], "date") {
         return;
     }
     headers.push(("date".to_string(), httpdate::fmt_http_date(std::time::SystemTime::now())));
@@ -2839,9 +2816,9 @@ fn finalize_url_response_inner(
                 && request_permits_storage(&ctx.req.headers)
                 && should_cache(http_resp.status, &http_resp.headers)
             {
-                let content_type = http_resp.headers.iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
-                    .map(|(_, v)| v.as_str()).unwrap_or("");
+                let content_type =
+                    m6_core::headers::get(&http_resp.headers[..], "content-type")
+                        .unwrap_or("");
                 let hint_paths = hints::extract_hints(&http_resp.body, content_type);
                 for hp in &hint_paths {
                     let mut kbuf = [0u8; 512];

@@ -179,9 +179,8 @@ const REFRESH_MARGIN: std::time::Duration = std::time::Duration::from_secs(1);
 /// a negative that would wrap.
 fn expires_lifetime(headers: &[(String, String)]) -> Option<std::time::Duration> {
     let get = |name: &str| {
-        headers.iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(name))
-            .and_then(|(_, v)| httpdate::parse_http_date(v.trim()).ok())
+        m6_core::headers::get(headers, name)
+            .and_then(|v| httpdate::parse_http_date(v.trim()).ok())
     };
     let expires = get("expires")?;
     let date = get("date").unwrap_or_else(std::time::SystemTime::now);
@@ -681,14 +680,12 @@ impl Cache {
         // directions. A missing or under-reported Age is corrected by Date, and
         // a clock skewed such that Date is in the future yields a zero apparent
         // age rather than a negative one, leaving Age to stand.
-        let age_value = response.headers.iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("age"))
-            .and_then(|(_, v)| v.trim().parse::<u64>().ok())
+        let age_value = m6_core::headers::get(&response.headers[..], "age")
+            .and_then(|v| v.trim().parse::<u64>().ok())
             .map(std::time::Duration::from_secs)
             .unwrap_or_default();
-        let apparent_age = response.headers.iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("date"))
-            .and_then(|(_, v)| httpdate::parse_http_date(v).ok())
+        let apparent_age = m6_core::headers::get(&response.headers[..], "date")
+            .and_then(|v| httpdate::parse_http_date(v).ok())
             .and_then(|d| std::time::SystemTime::now().duration_since(d).ok())
             .unwrap_or_default();
         let upstream_age = age_value.max(apparent_age);
