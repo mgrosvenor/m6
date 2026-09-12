@@ -32,11 +32,11 @@ commit log rather than written from memory.
 
 ## 1. Where the work is
 
-**Branch `main`, clean, 80 commits ahead of the deployed `22ee3a4` here and 15
+**Branch `main`, clean, 84 commits ahead of the deployed `22ee3a4` here and 15
 ahead of `d6ebfa5` in the site repo. No migration code is deployed and the
 freeze holds until it is finished.**
 
-> **Both repos are ahead of `origin/main` and that is not fine.** 61 commits on
+> **Both repos are ahead of `origin/main` and that is not fine.** 65 commits on
 > `m6`, 13 on the site repo, as of 2026-09-12. Ahead of the *fleet* is the
 > deliberate freeze; ahead of *origin* is just unbacked work on a laptop, and
 > the site handover's §5 says to push when you find this. Not pushed here
@@ -79,7 +79,7 @@ applied them:
   was previously refused on one node and served on two, which is exactly what
   the reconciliation was for.
 
-- **969 workspace tests pass at default features, verified on Linux via
+- **980 workspace tests pass at default features, verified on Linux via
   `deploy/run-tests.sh m6` on 2026-09-12. Zero warnings**, release and test
   builds, same count as macOS.
 - h1spec **32/32 on all four HTTP/1.1 targets**, with a CI ratchet
@@ -636,3 +636,26 @@ New 2026-09-12:
     `cargo test`**, and when an end-to-end test contradicts what the source
     plainly says, `ls -la` the binary before debugging the code.
     `deploy/run-tests.sh` builds release itself and is not exposed.
+28. **Skipping a read means skipping what the read was rejecting.** m6-file's
+    HEAD fast path answers from `std::fs::metadata`, which succeeds on a
+    directory and reports its size, so `HEAD /assets/css` returned `200` with
+    `Content-Length: 128` while the GET beside it returned 404. The `fs::read`
+    the fast path removed was doing two jobs: producing the bytes, and failing
+    on anything that was not a file. Only the first was obvious. **Before
+    skipping work, list what that work was implicitly validating.** Same family
+    as the conditional-request defect: a correct function in one crate and a
+    wrong inline copy in another, invisible until the cache state changed.
+29. **A control assertion is what makes a test mean anything, and it earns its
+    place on the machine you did not think about.** The HEAD test chmods a file
+    to `000` and requires the HEAD to answer anyway. The Linux build host runs
+    the suite as **root**, root ignores permission bits, the file stayed
+    readable, and what fired was the control: "the file must really be
+    unreadable or this test proves nothing". Without that line the test would
+    have gone green on a box where it demonstrates nothing, which is the
+    "never been red" failure wearing a uid. It now skips explicitly when it can
+    read a `0000` file. **A green tick that depends on who ran it is worse than
+    an absent one.**
+30. **A method-equivalence test only covers the inputs it is given.** The HEAD
+    against GET comparison walks identity, minified and brotli and asserts
+    identical headers, and it stayed green through the directory defect above,
+    because every path it asks for is a file. Equivalence is not coverage.
