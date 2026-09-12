@@ -3,38 +3,37 @@
 //!
 //! The reproduction asserts the **secure** behaviour. It failed when written
 //! and passes now that the finding is fixed.
+//!
+//! Rewritten when m6-file became an `App` service: it is now driven through
+//! the handler's real entry point with the `Request` the service loop builds,
+//! rather than through a `HandlerContext` that no longer exists. The property
+//! under test is unchanged, and deliberately so: this is the test that caught
+//! the tail path returning before the escape check, and the migration moved
+//! that dispatch.
 
-use std::io::Cursor;
+use m6_core::http::RawRequest;
+use m6_core::Request;
+use m6_file_lib::handler::serve;
+use serde_json::{json, Map};
 
-use m6_file_lib::config::{Config, RouteConfig};
-use m6_file_lib::handler::{handle_request, HandlerContext};
-use m6_file_lib::http::Request;
-use m6_file_lib::route::Route;
-
-fn get_request(path: &str, query: &str) -> Request {
-    let raw = if query.is_empty() {
-        format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n")
-    } else {
-        format!("GET {path}?{query} HTTP/1.1\r\nHost: localhost\r\n\r\n")
-    };
-    m6_core::parse::parse_request(&mut Cursor::new(raw.into_bytes())).unwrap()
-}
-
-fn route(url_path: &str, root: &str, tail: bool) -> Route {
-    Route::from_config(&RouteConfig {
-        path: url_path.to_string(),
-        root: root.to_string(),
-        tail: Some(tail),
+/// The `Request` the service loop hands the handler: route settings from
+/// config, path parameters from core's router.
+fn request(path: &str, query: &str, site_dir: &std::path::Path, tail: bool, relpath: &str) -> Request {
+    let raw = RawRequest {
+        version: "HTTP/1.1".to_string(),
+        method: "GET".to_string(),
+        path: path.to_string(),
+        query: if query.is_empty() { None } else { Some(query.to_string()) },
         headers: vec![],
-    })
-}
-
-fn body_of(raw: &[u8]) -> Vec<u8> {
-    let end = raw
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .expect("header terminator");
-    raw[end + 4..].to_vec()
+        body: vec![],
+    };
+    let mut dict = Map::new();
+    dict.insert("relpath".to_string(), json!(relpath));
+    let mut settings = Map::new();
+    settings.insert("root".to_string(), json!("logs/"));
+    settings.insert("tail".to_string(), json!(tail));
+    Request::new(raw, dict, site_dir.to_path_buf())
+        .with_route_settings(std::sync::Arc::new(settings))
 }
 
 /// Build a site dir containing `logs/escape.log` — a symlink pointing at a
@@ -53,35 +52,46 @@ fn site_with_escaping_symlink() -> (tempfile::TempDir, std::path::PathBuf) {
     (dir, site_dir)
 }
 
+/// Status and body as they would go on the wire.
+fn wire(req: &Request) -> (u16, Vec<u8>) {
+    let resp = serve(req).expect("handler");
+    let mut out = Vec::new();
+    {
+        let mut r = m6_core::h1::Responder::new(&mut out, req.method(), false);
+        resp.send(&mut r).expect("send");
+    }
+    let sep = out.windows(4).position(|w| w == b"\r\n\r\n").expect("header terminator");
+    let head = std::str::from_utf8(&out[..sep]).expect("headers are ASCII");
+    let status: u16 =
+        head.lines().next().unwrap().split_whitespace().nth(1).unwrap().parse().unwrap();
+    (status, out[sep + 4..].to_vec())
+}
+
 // ── Finding 9: tail routes bypass the symlink check ──────────────────────────
 
-/// `handler.rs:55-57` dispatches to `handle_tail` *before* the symlink escape
-/// check at `:63-74`, so a symlink under a tail route's root is followed out
-/// of the site directory and its contents are served.
+/// The tail dispatch used to happen *before* the symlink escape check, so a
+/// symlink under a tail route's root was followed out of the site directory
+/// and its contents served.
 ///
 /// Property: a symlink escaping `site_dir` must be refused on every route,
 /// tail or not.
 #[test]
 fn finding_9_tail_route_must_refuse_symlink_outside_site_dir() {
     let (_guard, site_dir) = site_with_escaping_symlink();
-
-    let routes = vec![route("/logs/tail/{relpath}", "logs/", true)];
-    let config = Config::default();
-    let ctx = HandlerContext { routes: &routes, config: &config, site_dir: &site_dir };
-
-    let req = get_request("/logs/tail/escape.log", "offset=0");
-    let mut out = Vec::new();
-    let info = handle_request(&req, &ctx, &mut m6_core::h1::Responder::new(&mut out, &req.method, false)).unwrap();
+    let (status, body) = wire(&request(
+        "/logs/tail/escape.log",
+        "offset=0",
+        &site_dir,
+        true,
+        "escape.log",
+    ));
 
     assert_ne!(
-        body_of(&out),
+        body,
         b"ESCAPED SECRET".to_vec(),
         "a tail route served a file from outside site_dir via symlink"
     );
-    assert_eq!(
-        info.status, 404,
-        "the escaping symlink should be refused with 404"
-    );
+    assert_eq!(status, 404, "the escaping symlink should be refused with 404");
 }
 
 /// The identical symlink *is* correctly refused on a non-tail route, which
@@ -89,17 +99,6 @@ fn finding_9_tail_route_must_refuse_symlink_outside_site_dir() {
 #[test]
 fn finding_9_control_non_tail_route_refuses_same_symlink() {
     let (_guard, site_dir) = site_with_escaping_symlink();
-
-    let routes = vec![route("/logs/{relpath}", "logs/", false)];
-    let config = Config::default();
-    let ctx = HandlerContext { routes: &routes, config: &config, site_dir: &site_dir };
-
-    let req = get_request("/logs/escape.log", "");
-    let mut out = Vec::new();
-    let info = handle_request(&req, &ctx, &mut m6_core::h1::Responder::new(&mut out, &req.method, false)).unwrap();
-
-    assert_eq!(
-        info.status, 404,
-        "the non-tail path correctly rejects the escaping symlink"
-    );
+    let (status, _) = wire(&request("/logs/escape.log", "", &site_dir, false, "escape.log"));
+    assert_eq!(status, 404, "the non-tail path correctly rejects the escaping symlink");
 }

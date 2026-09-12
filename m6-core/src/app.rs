@@ -2393,7 +2393,8 @@ fn handle_request<W: std::io::Write>(
             // cost a full copy of the method, path, query, every header and
             // the body, per request.
             let req = Request::new(raw, dict.clone(), Arc::clone(&site_dir))
-                .with_route(route);
+                .with_route(route)
+                .with_config(Arc::clone(&config));
 
             // Dispatch to code handler or template render.
             // A code handler is only used when the matched route is a code route
@@ -2463,7 +2464,15 @@ fn handle_request<W: std::io::Write>(
             // other directive a site actually configured (e.g.
             // "public, max-age=60, must-revalidate"). Pass it through as
             // configured instead.
-            resp = resp.header("Cache-Control", &route.cache);
+            // A default, not an override. A handler that decided its own
+            // caching has decided it per request in a way a static route
+            // setting cannot express -- m6-file answers `immutable` for a
+            // `?v=` URL and a short window for everything else -- and
+            // appending a second `Cache-Control` here would put two on the
+            // wire rather than replacing one.
+            if !crate::headers::contains(&resp.headers[..], "cache-control") {
+                resp = resp.header("Cache-Control", &route.cache);
+            }
 
             // Last-Modified, from the route's own inputs (see CompiledRoute).
             // Only on a success: attaching a validator to a 404 or a 500 would

@@ -1,24 +1,39 @@
-use crate::compress::{choose_encoding, compress_brotli, compress_gzip, Encoding};
-use crate::config::Config;
-use crate::http::Request;
-use m6_core::h1::Responder;
-use crate::route::{MatchResult, Route};
-use anyhow::Result;
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
-use std::time::Instant;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+
+use m6_core::{Request, Response, Result};
 use tracing::{debug, warn};
 
-pub struct HandlerContext<'a> {
-    pub routes: &'a [Route],
-    pub config: &'a Config,
-    pub site_dir: &'a Path,
-}
+use crate::compress::{choose_encoding, compress_brotli, compress_gzip, Encoding};
 
-pub struct ResponseInfo {
-    pub status: u16,
-    pub bytes: usize,
-    pub latency_us: u128,
+/// Resolve the file this request addresses, from the route's `root` setting
+/// and the path parameters core captured.
+///
+/// `root` may itself carry placeholders (`content/posts/{stem}/`), which are
+/// filled from the same parameters. The trailing component is `relpath` for a
+/// `{*relpath}` wildcard route or `filename` for a two-parameter one; a route
+/// with neither addresses the file `root` names outright, which is how
+/// `/favicon.ico` works.
+fn resolve_fs_path(req: &Request, site_dir: &Path) -> PathBuf {
+    let mut root = req.route_str("root").unwrap_or("").to_string();
+    if root.contains('{') {
+        for (k, v) in req.dict().iter() {
+            if let Some(s) = v.as_str() {
+                root = root.replace(&format!("{{{}}}", k), s);
+            }
+        }
+    }
+    let rel = req
+        .dict()
+        .get("relpath")
+        .or_else(|| req.dict().get("filename"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if rel.is_empty() {
+        site_dir.join(&root)
+    } else {
+        site_dir.join(&root).join(rel)
+    }
 }
 
 /// True if `fs_path` is a symlink resolving outside `site_dir`.
@@ -68,39 +83,25 @@ fn cache_control_for(query: &str) -> &'static str {
     }
 }
 
-/// Handle a single HTTP request.
+/// Serve one static file.
 ///
-/// Route param validation in `route.rs` (no `..`, safe chars only) prevents
-/// path traversal — no per-request `canonicalize` needed.
-/// Compression is applied per-request according to Accept-Encoding + config;
-/// m6-http caches the full response so subsequent requests never reach here.
-pub fn handle_request<W: Write>(
-    req: &Request,
-    ctx: &HandlerContext,
-    resp: &mut Responder<'_, W>,
-) -> Result<ResponseInfo> {
-    let start = Instant::now();
-
-    if req.method != "GET" && req.method != "HEAD" {
-        resp.error(405)?;
-        return Ok(ResponseInfo { status: 405, bytes: 0, latency_us: start.elapsed().as_micros() });
+/// Registered with `App::handler("files", serve)`; the route that reaches it,
+/// and the directory it serves from, are config. Core routes, validates the
+/// path parameters and applies the route's extra headers; everything from the
+/// filesystem down is here.
+///
+/// **This handler owns its own representation.** It negotiates the content
+/// coding, compresses, and builds an ETag naming the result, so every response
+/// it returns is `verbatim` or a stream, and core's pipeline leaves it alone.
+/// Letting core compress afterwards would put brotli bytes on the wire under a
+/// tag asserting identity, which is what the `-br`/`-gz` suffixes prevent.
+pub fn serve(req: &Request) -> Result<Response> {
+    if req.method() != "GET" && req.method() != "HEAD" {
+        return Ok(Response::status(405));
     }
 
-    let (route, params) = match find_route(&req.path, ctx.routes) {
-        FindRouteResult::Found(r, p) => (r, p),
-        FindRouteResult::InvalidParam => {
-            debug!(path = req.path, "invalid path parameter");
-            resp.error(400)?;
-            return Ok(ResponseInfo { status: 400, bytes: 0, latency_us: start.elapsed().as_micros() });
-        }
-        FindRouteResult::NotFound => {
-            debug!(path = req.path, "no route matched");
-            resp.error(404)?;
-            return Ok(ResponseInfo { status: 404, bytes: 0, latency_us: start.elapsed().as_micros() });
-        }
-    };
-
-    let fs_path = route.resolve_fs_path(&params, ctx.site_dir);
+    let site_dir = req.site_path("");
+    let fs_path = resolve_fs_path(req, &site_dir);
 
     // Fast symlink check: if the path is (or contains) a symlink that escapes
     // site_dir, return 404.  Regular files skip canonicalize entirely.
@@ -108,34 +109,34 @@ pub fn handle_request<W: Write>(
     // Runs before the `tail` dispatch below — tail routes read the same
     // filesystem through the same resolver, so exempting them just moved the
     // escape one route type over.
-    if escapes_site_dir(&fs_path, ctx.site_dir) {
-        resp.error(404)?;
-        return Ok(ResponseInfo { status: 404, bytes: 0, latency_us: start.elapsed().as_micros() });
+    if escapes_site_dir(&fs_path, &site_dir) {
+        return Ok(Response::not_found());
     }
 
-    if route.tail {
-        return handle_tail(req, route, &params, ctx, resp, start);
+    if req.route_bool("tail", false) {
+        return serve_tail(req, &fs_path);
     }
+
+    let empty_compression = std::collections::HashMap::new();
+    let (compression, minification) = match req.config() {
+        Some(c) => (&c.compression, Some(&c.minification)),
+        None => (&empty_compression, None),
+    };
 
     // Every static asset used to go out as bare `Cache-Control: public` with
     // no ETag/Last-Modified at all — with no freshness info and no way to
     // revalidate, a browser that had already cached a file had no reason to
-    // ever ask again, and a plain reload (not a hard refresh) couldn't
-    // discover a newer deploy either. mtime+size is cheap to read and stable
-    // across the minify/compress steps below (those transform the same
-    // source bytes deterministically), so it's computed once, up front,
-    // before doing any of that work — a conditional-GET hit skips reading,
-    // minifying, and compressing the file entirely, not just the transfer.
-    let metadata = match std::fs::metadata(&fs_path) {
-        Ok(m) => m,
-        Err(_) => {
-            debug!(path = %fs_path.display(), "file not found");
-            resp.error(404)?;
-            return Ok(ResponseInfo { status: 404, bytes: 0, latency_us: start.elapsed().as_micros() });
-        }
+    // ever ask again. mtime+size is cheap to read and stable across the
+    // minify/compress steps below (those transform the same source bytes
+    // deterministically), so it is computed once, up front: a conditional-GET
+    // hit skips reading, minifying and compressing the file entirely.
+    let Ok(metadata) = std::fs::metadata(&fs_path) else {
+        debug!(path = %fs_path.display(), "file not found");
+        return Ok(Response::not_found());
     };
     let mtime = metadata.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-    let mtime_secs = mtime.duration_since(std::time::SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs();
+    let mtime_secs =
+        mtime.duration_since(std::time::SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs();
     let last_modified = httpdate::fmt_http_date(mtime);
 
     // Content negotiation is resolved HERE, before the ETag, because the ETag
@@ -144,32 +145,18 @@ pub fn handle_request<W: Write>(
     // mtime+size alone gave brotli, gzip and identity of the same file one
     // shared strong validator — three representations, three different byte
     // strings, one tag asserting they are the same. RFC 9110 requires a strong
-    // validator to be unique per representation, and the practical consequence
-    // is not theoretical: a downstream shared cache holding the brotli entry
-    // can match that tag against a gzip-only client's request and hand it a
-    // brotli body it cannot decode. Folding the coding into the tag makes the
-    // three variants distinguishable.
+    // validator to be unique per representation, and a downstream shared cache
+    // holding the brotli entry can otherwise match that tag against a
+    // gzip-only client's request and hand it a body it cannot decode.
     //
-    // `mime_from_path` and `choose_encoding` both work off the path and
-    // the request headers, never the file contents, so moving them above the
-    // conditional check costs nothing and still lets a 304 skip the read,
-    // minify and compress entirely.
-    // m6-core's table, NOT the mime_guess crate.
-    //
-    // Two MIME implementations existed and the wrong one was serving. Every
-    // text type went out with no charset -- `text/markdown`, `text/plain`,
-    // `text/css`, `text/javascript` -- so a client fell back to Latin-1 and
-    // rendered UTF-8 as mojibake. An em dash (U+2014, bytes e2 80 94) came
-    // out as "a EUR --" in every .md file, in llms.txt and in llms-full.txt:
-    // the three documents that exist specifically to be machine-read.
-    //
-    // The bytes were always correct; only the label was missing. m6-core's
-    // table has carried `text/markdown; charset=utf-8` all along and simply
-    // was not consulted here.
+    // The MIME table is m6-core's, NOT the mime_guess crate. Two
+    // implementations existed and the wrong one was serving: every text type
+    // went out with no charset, so a client fell back to Latin-1 and rendered
+    // UTF-8 as mojibake in every .md file, in llms.txt and in llms-full.txt.
     let mime = m6_core::mime::mime_from_path(&fs_path).to_string();
     let mime_base = mime.split(';').next().unwrap_or(&mime).to_string();
-    let accept_encoding = crate::http::accept_encoding(req);
-    let (encoding, level) = choose_encoding(&mime, accept_encoding, ctx.config);
+    let accept_encoding = req.header("accept-encoding").unwrap_or("");
+    let (encoding, level) = choose_encoding(&mime, accept_encoding, compression);
     let etag_suffix = match encoding {
         Encoding::Identity => "",
         Encoding::Brotli => "-br",
@@ -179,184 +166,93 @@ pub fn handle_request<W: Write>(
 
     // Preconditions come from m6-core, which implements all four steps of
     // RFC 9110 13.2.2 in the required order. What was here did steps 3 and 4
-    // only, and step 3 with strong comparison:
-    //
-    //     inm == "*" || inm.split(',').any(|tag| tag.trim() == etag)
-    //
-    // Byte equality is *strong* comparison. `If-None-Match` requires weak
-    // (8.8.3.2), so a client returning the validator it had been given as
-    // `W/"..."` never matched and was sent the whole body again. `If-Match`
-    // and `If-Unmodified-Since` were not consulted at all, so a client could
-    // assert a precondition and have it silently ignored.
+    // only, and step 3 with strong comparison, so a client returning the
+    // validator it had been given as `W/"..."` never matched.
     let validators = [
         ("ETag".to_string(), etag.clone()),
         ("Last-Modified".to_string(), last_modified.clone()),
     ];
     let precondition =
-        m6_core::evaluate_preconditions(&validators, &req.headers, &req.method);
+        m6_core::evaluate_preconditions(&validators, req.headers(), req.method());
 
-    // Short max-age (fast repeat loads within it) plus stale-while-revalidate
-    // (a shared cache past that window serves its stale copy immediately and
-    // refreshes behind the request, so no visitor ever waits on an origin
-    // round trip). The conditional-GET machinery above is what keeps that
-    // refresh cheap: a 304 on an unchanged file, not a full refetch.
-    //
-    // This replaced `must-revalidate`, which says the opposite — never reuse
-    // a stale entry without checking first — and so forbade exactly the
-    // behaviour above. The two cannot both be advertised; a blocking
-    // revalidation on every expiry is what the edge cache exists to avoid,
-    // and one stale serve per minute per entry is the accepted price.
-    //
-    // The window is deliberately short. stale-while-revalidate is not a
-    // shared-cache-only directive: browsers honour it too, so a long window
-    // means a visitor keeps rendering the previous stylesheet for that long
-    // after a deploy, and invalidate-cache.sh cannot reach into their cache
-    // to help. 86400 was tried and made every CSS change invisible until a
-    // visitor's second page load. 60s bounds that to ~2 minutes worst case
-    // while still giving the edge what it actually needs -- a refresh takes
-    // about a second, so the herd never blocks on origin.
-    //
-    // The cost is origin-down grace: the edge now serves stale for a minute
-    // rather than a day. Raising it is safe once asset URLs are
-    // content-hashed, since a changed file would then be a new URL.
-    // A request carrying `?v=<content-hash>` (emitted by the `| asset` template
-    // filter) addresses one exact version of the file: changed bytes produce a
-    // different hash and therefore a different URL, so this response can never
-    // go stale for that URL. `immutable` additionally tells the browser not to
-    // revalidate even on reload, which is the whole point -- otherwise every
-    // reload still costs a conditional request per asset.
-    //
-    // Everything else keeps the short window. An unversioned URL is exactly the
-    // case where a long max-age strands visitors on the previous file with no
-    // server-side way to reach them: no invalidation can touch a browser cache.
-    // Notably the webfont is still requested unversioned from inside
-    // style.css's @font-face, so it must stay on the short window.
-    //
-    // `s-maxage=86400` is the exception, and the distinction is the whole point.
-    // The note above records that 86400 was tried and rolled back -- but what
-    // was raised then was `stale-while-revalidate`, which browsers honour, so it
-    // stranded visitors on the previous file for a day. `s-maxage` is defined
-    // for SHARED caches only (RFC 9111 5.2.2.10): a browser ignores it outright
-    // and keeps obeying the 60s `max-age` beside it. So this lengthens only the
-    // copy held by the edge -- the one copy `invalidate-cache.sh` can actually
-    // reach and evict on deploy.
-    //
-    // Without it the edge re-fetched every unversioned asset once a minute, and
-    // on a low-traffic site almost every visit arrived after expiry: measured at
-    // a 45% asset hit rate, with the webfont at 21 misses to 14 hits.
-    //
-    // This is only safe because a deploy evicts. deploy.sh invalidates by
-    // default for exactly this reason -- see the guard there before shortening
-    // that path.
-    let cache_control = cache_control_for(req.query.as_deref().unwrap_or(""));
+    let cache_control = cache_control_for(req.query());
+
+    let validator_headers = |r: Response| {
+        r.header("Cache-Control", cache_control)
+            .header("ETag", &etag)
+            .header("Last-Modified", &last_modified)
+    };
 
     // 412: a precondition the client asserted is false, and the request must
-    // not be applied. The previous `bool` could not express this outcome,
-    // which is why If-Match was ignored rather than honoured.
+    // not be applied.
     if precondition == m6_core::Precondition::Failed {
-        let hdrs: Vec<(&str, &str)> = vec![
-            ("Cache-Control", cache_control),
-            ("ETag", &etag),
-            ("Last-Modified", &last_modified),
-        ];
-        resp.send(412, &hdrs, &[])?;
-        return Ok(ResponseInfo { status: 412, bytes: 0, latency_us: start.elapsed().as_micros() });
+        return Ok(validator_headers(Response::status(412)).verbatim());
     }
-
     if precondition == m6_core::Precondition::NotModified {
-        let hdrs: Vec<(&str, &str)> = vec![
-            ("Cache-Control", cache_control),
-            ("ETag", &etag),
-            ("Last-Modified", &last_modified),
-        ];
-        resp.send(304, &hdrs, &[])?;
-        return Ok(ResponseInfo { status: 304, bytes: 0, latency_us: start.elapsed().as_micros() });
+        return Ok(validator_headers(Response::status(304)).verbatim());
     }
 
-    // A HEAD whose representation is the file on disk needs no file on disk.
+    // A HEAD whose representation is the file on disk needs no file on disk,
+    // and neither does a GET: the bytes on the wire are the bytes on disk, so
+    // there is nothing to hold in memory.
     //
-    // The responder drops the body for a HEAD (RFC 9110 9.3.2) at the very end
-    // of `send`, so everything below ran in full and was thrown away: a whole
-    // `fs::read`, then minification, then brotli at level 6. On a HEAD of a
-    // large image that is the entire cost of the request, spent to produce
-    // bytes nobody receives.
-    //
-    // `Content-Length` is the reason it cannot simply be skipped: a HEAD has
-    // to report what the matching GET would send, so a compressed or minified
-    // representation genuinely has to be produced to be measured. The case
-    // that does not is identity coding with minification off for this type,
-    // where the representation *is* the file and `metadata.len()` is already
-    // its length. That is also the common case for the assets worth caring
-    // about, since images are neither compressed nor minified here.
-    //
-    // The ETag agrees by construction: at identity the suffix is empty and the
-    // tag is built from `mtime_secs` and this same `metadata.len()`.
+    // `Content-Length` is why it cannot simply be skipped for a HEAD: a HEAD
+    // has to report what the matching GET would send, so a compressed or
+    // minified representation genuinely has to be produced to be measured. The
+    // case that does not is identity coding with minification off for this
+    // type, where the representation *is* the file and `metadata.len()` is
+    // already its length. That is also the common case for the assets worth
+    // caring about, since images are neither compressed nor minified here.
     //
     // `is_file` is load-bearing and was missing in the first version of this.
     // `std::fs::metadata` succeeds on a directory and reports its size, so
     // `HEAD /assets/css` answered `200` with `Content-Length: 128` while the
-    // GET beside it answered 404 and every earlier HEAD had too. The read this
-    // block skips is also what used to reject a non-file, by failing.
-    let is_head = req.method == "HEAD";
-    let representation_is_the_file = metadata.is_file()
-        && encoding == Encoding::Identity
-        && !ctx.config.minification.is_enabled(&mime_base);
+    // GET beside it answered 404. The read this block skips is also what used
+    // to reject a non-file, by failing.
+    let minify_this = minification.map(|m| m.is_enabled(&mime_base)).unwrap_or(false);
+    let representation_is_the_file =
+        metadata.is_file() && encoding == Encoding::Identity && !minify_this;
+
     if representation_is_the_file {
-        let mut hdrs: Vec<(&str, &str)> = vec![
-            ("Content-Type", mime.as_str()),
-            ("Cache-Control", cache_control),
-            ("ETag", &etag),
-            ("Last-Modified", &last_modified),
-        ];
-        for (k, v) in &route.headers {
-            hdrs.push((k.as_str(), v.as_str()));
+        let base = validator_headers(Response::status(200)).header("Content-Type", &mime);
+        if req.method() == "HEAD" {
+            // No body to produce, but the length still has to be the one the
+            // GET would send. `Response::stream` promises it without reading:
+            // the responder drops the body for a HEAD.
+            return Ok(Response::stream(200, metadata.len(), std::io::empty())
+                .header("Content-Type", &mime)
+                .header("Cache-Control", cache_control)
+                .header("ETag", &etag)
+                .header("Last-Modified", &last_modified));
         }
-
-        if is_head {
-            resp.send_with_length(200, &hdrs, &[], metadata.len() as usize)?;
-            return Ok(ResponseInfo { status: 200, bytes: 0, latency_us: start.elapsed().as_micros() });
-        }
-
-        // Stream it. The bytes on the wire are the bytes on disk, so there is
-        // nothing to hold in memory: this used to `fs::read` the whole file,
-        // and `/assets/vditor/dist/js/lute/lute.min.js` is 3.6MB of allocation
-        // per cache miss to hand back something that is copied straight out
-        // again. `metadata.len()` is the same number the ETag above is built
-        // from, so the promise and the validator cannot disagree.
-        //
-        // A file that changed between the `stat` and the `open` is handled by
-        // `send_stream` rather than here: short reads fail and overruns are
-        // capped, because `Content-Length` is already on the wire by then.
-        let before = resp.body_bytes();
-        match std::fs::File::open(&fs_path) {
-            Ok(file) => {
-                resp.send_stream(200, &hdrs, metadata.len(), file)?;
-                let bytes = resp.body_bytes() - before;
-                return Ok(ResponseInfo { status: 200, bytes, latency_us: start.elapsed().as_micros() });
-            }
-            Err(_) => {
-                debug!(path = %fs_path.display(), "file not found");
-                resp.error(404)?;
-                return Ok(ResponseInfo { status: 404, bytes: 0, latency_us: start.elapsed().as_micros() });
-            }
-        }
+        let Ok(file) = std::fs::File::open(&fs_path) else {
+            debug!(path = %fs_path.display(), "file not found");
+            return Ok(Response::not_found());
+        };
+        // `lute.min.js` is 3.6MB that used to be read into a `Vec` on every
+        // cache miss to be copied straight out again. A file that changed
+        // between the `stat` and the `open` is handled by the responder rather
+        // than here: short reads fail and overruns are capped, because
+        // `Content-Length` is already on the wire by then.
+        let mut streamed = Response::stream(200, metadata.len(), file);
+        streamed.headers = base.headers;
+        return Ok(streamed);
     }
 
-    let data = match std::fs::read(&fs_path) {
-        Ok(d) => d,
-        Err(_) => {
-            debug!(path = %fs_path.display(), "file not found");
-            resp.error(404)?;
-            return Ok(ResponseInfo { status: 404, bytes: 0, latency_us: start.elapsed().as_micros() });
-        }
+    let Ok(data) = std::fs::read(&fs_path) else {
+        debug!(path = %fs_path.display(), "file not found");
+        return Ok(Response::not_found());
     };
 
     // Minification is applied BEFORE compression, gated by content-type and
-    // config — mirroring m6-render's pipeline so a static asset gets the
-    // same treatment here as it would through the render path.
-    let data = if ctx.config.minification.is_enabled(&mime_base) {
+    // config, mirroring core's pipeline so a static asset gets the same
+    // treatment here as it would through the render path.
+    let data = if minify_this {
         match mime_base.as_str() {
-            "text/html" => m6_core::minify::minify_html(&data, ctx.config.minification.inline_js),
+            "text/html" => m6_core::minify::minify_html(
+                &data,
+                minification.map(|m| m.inline_js).unwrap_or(false),
+            ),
             "text/css" => m6_core::minify::minify_css(&data),
             "application/json" => m6_core::minify::minify_json(&data),
             "application/javascript" | "text/javascript" => m6_core::minify::minify_js(&data),
@@ -367,11 +263,10 @@ pub fn handle_request<W: Write>(
     };
 
     // On a compression failure this used to keep the `Content-Encoding: br`
-    // (or gzip) label while handing back the *uncompressed* bytes that
-    // `.unwrap_or(data)` fell through to — a body no client could decode,
-    // announced as one it could. Falling back has to drop the label with it,
-    // and the ETag's coding suffix has to come off too, or the identity bytes
-    // would go out tagged as the brotli representation.
+    // label while handing back the *uncompressed* bytes — a body no client
+    // could decode, announced as one it could. Falling back has to drop the
+    // label with it, and the ETag's coding suffix has to come off too, or the
+    // identity bytes would go out tagged as the brotli representation.
     let (body, content_encoding): (Vec<u8>, Option<&str>) = match encoding {
         Encoding::Identity => (data, None),
         Encoding::Brotli => match compress_brotli(&data, level.unwrap_or(6)) {
@@ -392,27 +287,17 @@ pub fn handle_request<W: Write>(
         },
     };
 
-    let mut hdrs: Vec<(&str, &str)> = vec![
-        ("Content-Type", mime.as_str()),
-        ("Cache-Control", cache_control),
-        ("ETag", &etag),
-        ("Last-Modified", &last_modified),
-    ];
+    let mut resp = Response::status(200)
+        .header("Content-Type", &mime)
+        .header("Cache-Control", cache_control)
+        .header("ETag", &etag)
+        .header("Last-Modified", &last_modified)
+        .body(body)
+        .verbatim();
     if let Some(enc) = content_encoding {
-        hdrs.push(("Content-Encoding", enc));
+        resp = resp.header("Content-Encoding", enc);
     }
-    for (k, v) in &route.headers {
-        hdrs.push((k.as_str(), v.as_str()));
-    }
-
-    // The HEAD rule lives in the responder now, and applies to every status
-    // this file can answer with -- not just this one, which is all
-    // `write_head_response` ever covered.
-    let before = resp.body_bytes();
-    resp.send(200, &hdrs, &body)?;
-    let bytes = resp.body_bytes() - before;
-
-    Ok(ResponseInfo { status: 200, bytes, latency_us: start.elapsed().as_micros() })
+    Ok(resp)
 }
 
 /// Lookback window used to locate the last N lines when `?n=N&offset=0`.
@@ -424,7 +309,7 @@ const TAIL_LOOKBACK: u64 = 64 * 1024;
 /// Prevents blocking the event loop for more than a few milliseconds.
 const MAX_TAIL_BYTES: u64 = 512 * 1024;
 
-/// Serve a file from a byte offset (tail mode).
+/// Serve a file from a byte offset (tail mode), for a route with `tail = true`.
 ///
 /// Query parameters:
 ///   `offset=N` – start byte (default 0).
@@ -435,18 +320,9 @@ const MAX_TAIL_BYTES: u64 = 512 * 1024;
 /// Always responds with `Cache-Control: no-store` and an `X-Log-End` header
 /// containing the end byte of the returned slice so the caller can request
 /// the next chunk.
-fn handle_tail<W: Write>(
-    req: &Request,
-    route: &Route,
-    params: &crate::route::Params,
-    ctx: &HandlerContext,
-    resp: &mut Responder<'_, W>,
-    start: Instant,
-) -> Result<ResponseInfo> {
-    let fs_path = route.resolve_fs_path(params, ctx.site_dir);
-
+fn serve_tail(req: &Request, fs_path: &Path) -> Result<Response> {
     // Parse ?offset=N (default 0) and ?n=N (default 0 = no-line-limit).
-    let query = req.query.as_deref().unwrap_or("");
+    let query = req.query();
     let offset: u64 = query
         .split('&')
         .find(|p| p.starts_with("offset="))
@@ -458,25 +334,24 @@ fn handle_tail<W: Write>(
         .and_then(|p| p["n=".len()..].parse().ok())
         .unwrap_or(0);
 
-    let mut file = match std::fs::File::open(&fs_path) {
-        Ok(f) => f,
-        Err(_) => {
-            resp.error(404)?;
-            return Ok(ResponseInfo { status: 404, bytes: 0, latency_us: start.elapsed().as_micros() });
-        }
+    let Ok(mut file) = std::fs::File::open(fs_path) else {
+        return Ok(Response::not_found());
     };
 
     // Determine current file size.
-    let file_size = file.seek(SeekFrom::End(0))?;
+    let file_size = file.seek(SeekFrom::End(0)).map_err(|e| m6_core::Error::Other(e.into()))?;
 
     let (body, end_offset) = if offset == 0 && n > 0 {
         // ── tail -n N mode ────────────────────────────────────────────────────
         // Scan the last TAIL_LOOKBACK bytes for the start of the last N lines.
         let lookback = TAIL_LOOKBACK.min(file_size);
         let scan_start = file_size - lookback;
-        file.seek(SeekFrom::Start(scan_start))?;
+        file.seek(SeekFrom::Start(scan_start)).map_err(|e| m6_core::Error::Other(e.into()))?;
         let mut buf = Vec::new();
-        std::io::Read::by_ref(&mut file).take(lookback).read_to_end(&mut buf)?;
+        Read::by_ref(&mut file)
+            .take(lookback)
+            .read_to_end(&mut buf)
+            .map_err(|e| m6_core::Error::Other(e.into()))?;
 
         // Walk backwards through buf counting newlines; `cut` becomes the
         // index of the first byte of the last-N-lines slice.
@@ -503,331 +378,192 @@ fn handle_tail<W: Write>(
     } else {
         // ── incremental / byte-offset mode ───────────────────────────────────
         let read_from = offset.min(file_size);
-        file.seek(SeekFrom::Start(read_from))?;
+        file.seek(SeekFrom::Start(read_from)).map_err(|e| m6_core::Error::Other(e.into()))?;
         let mut body = Vec::new();
-        std::io::Read::by_ref(&mut file).take(MAX_TAIL_BYTES).read_to_end(&mut body)?;
+        Read::by_ref(&mut file)
+            .take(MAX_TAIL_BYTES)
+            .read_to_end(&mut body)
+            .map_err(|e| m6_core::Error::Other(e.into()))?;
         let end_offset = read_from + body.len() as u64;
         (body, end_offset)
     };
 
-    let end_str = end_offset.to_string();
-
     // Same table as the main path above; see the note there.
-    let mime = m6_core::mime::mime_from_path(&fs_path).to_string();
+    let mime = m6_core::mime::mime_from_path(fs_path).to_string();
 
-    let before = resp.body_bytes();
-    resp.send(
-        200,
-        &[
-            ("Content-Type", mime.as_str()),
-            ("Cache-Control", "no-store"),
-            ("X-Log-End", end_str.as_str()),
-        ],
-        &body,
-    )?;
-
-    Ok(ResponseInfo {
-        status: 200,
-        bytes: resp.body_bytes() - before,
-        latency_us: start.elapsed().as_micros(),
-    })
+    Ok(Response::status(200)
+        .header("Content-Type", &mime)
+        .header("Cache-Control", "no-store")
+        .header("X-Log-End", &end_offset.to_string())
+        .body(body)
+        .verbatim())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use m6_core::http::RawRequest;
+    use serde_json::{json, Map, Value};
 
-    /// The handler answers through a `Responder`, which is what applies the
-    /// HEAD rule and the connection policy. Tests build one over a `Vec` so
-    /// they exercise the same writer production does.
-    fn responder<'a>(out: &'a mut Vec<u8>, req: &'a Request) -> Responder<'a, Vec<u8>> {
-        Responder::new(out, &req.method, false)
+    /// Build the `Request` the service loop would hand this handler: the
+    /// route's settings, the path parameters core captured, and the config.
+    fn request(
+        method: &str,
+        path: &str,
+        query: Option<&str>,
+        headers: &[(&str, &str)],
+        site_dir: &std::path::Path,
+        settings: Value,
+        params: &[(&str, &str)],
+    ) -> Request {
+        let raw = RawRequest {
+            version: "HTTP/1.1".to_string(),
+            method: method.to_string(),
+            path: path.to_string(),
+            query: query.map(str::to_string),
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            body: vec![],
+        };
+        let mut dict = Map::new();
+        for (k, v) in params {
+            dict.insert(k.to_string(), json!(v));
+        }
+        let mut s = Map::new();
+        if let Some(obj) = settings.as_object() {
+            for (k, v) in obj {
+                s.insert(k.clone(), v.clone());
+            }
+        }
+        Request::new(raw, dict, site_dir.to_path_buf())
+            .with_route_settings(std::sync::Arc::new(s))
     }
-    use crate::config::{Config, RouteConfig};
-    use crate::route::Route;
-    use std::io::Cursor;
 
-    fn make_tail_request(path: &str, offset: u64) -> Request {
-        let query = format!("offset={}", offset);
-        let raw = format!("GET {}?{} HTTP/1.1\r\nHost: localhost\r\n\r\n", path, query);
-        m6_core::parse::parse_request(&mut Cursor::new(raw.into_bytes())).unwrap()
-    }
-
-    fn make_tail_n_request(path: &str, n: u64) -> Request {
-        let query = format!("offset=0&n={}", n);
-        let raw = format!("GET {}?{} HTTP/1.1\r\nHost: localhost\r\n\r\n", path, query);
-        m6_core::parse::parse_request(&mut Cursor::new(raw.into_bytes())).unwrap()
-    }
-
-    fn tail_route(url_path: &str, root: &str) -> Route {
-        Route::from_config(&RouteConfig {
-            path: url_path.to_string(),
-            root: root.to_string(),
-            tail: Some(true),
-            headers: vec![],
-        })
-    }
-
-    fn parse_response(buf: &[u8]) -> (u16, Vec<(String, String)>, Vec<u8>) {
-        let s = std::str::from_utf8(buf).unwrap();
-        let (head, body_str) = s.split_once("\r\n\r\n").unwrap();
+    /// Serve one request and return (status, headers, body) as they would go
+    /// on the wire, through the same responder production uses.
+    fn wire(req: &Request) -> (u16, Vec<(String, String)>, Vec<u8>) {
+        let resp = serve(req).expect("handler");
+        let mut out = Vec::new();
+        {
+            let mut r = m6_core::h1::Responder::new(&mut out, req.method(), false);
+            resp.send(&mut r).expect("send");
+        }
+        let sep = out.windows(4).position(|w| w == b"\r\n\r\n").expect("header terminator");
+        let head = std::str::from_utf8(&out[..sep]).expect("headers are ASCII");
         let mut lines = head.lines();
-        let status_line = lines.next().unwrap();
-        let status: u16 = status_line.split_whitespace().nth(1).unwrap().parse().unwrap();
-        let headers: Vec<(String, String)> = lines
+        let status: u16 =
+            lines.next().unwrap().split_whitespace().nth(1).unwrap().parse().unwrap();
+        let headers = lines
             .filter_map(|l| l.split_once(": ").map(|(k, v)| (k.to_lowercase(), v.to_string())))
             .collect();
-        (status, headers, body_str.as_bytes().to_vec())
+        (status, headers, out[sep + 4..].to_vec())
+    }
+
+    fn header<'a>(hs: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        hs.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+    }
+
+    fn tail_req(dir: &std::path::Path, name: &str, query: &str) -> Request {
+        request(
+            "GET",
+            &format!("/logs/tail/{name}"),
+            Some(query),
+            &[],
+            dir,
+            json!({"root": "", "tail": true}),
+            &[("relpath", name)],
+        )
     }
 
     #[test]
     fn tail_from_zero_returns_full_content() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("app.log"), b"line1\nline2\n").unwrap();
-
-        let req = make_tail_request("/logs/tail/app.log", 0);
-        let route = tail_route("/logs/tail/{relpath}", "");
-        let routes = vec![route];
-        let config = Config::default();
-        let ctx = HandlerContext { routes: &routes, config: &config, site_dir: dir.path() };
-
-        let mut out = Vec::new();
-        let info = handle_request(&req, &ctx, &mut responder(&mut out, &req)).unwrap();
-
-        assert_eq!(info.status, 200);
-        let (status, headers, body) = parse_response(&out);
+        let (status, headers, body) = wire(&tail_req(dir.path(), "app.log", "offset=0"));
         assert_eq!(status, 200);
         assert_eq!(body, b"line1\nline2\n");
-        let end: u64 = headers.iter().find(|(k, _)| k == "x-log-end").unwrap().1.parse().unwrap();
-        assert_eq!(end, 12);
-        let cc = headers.iter().find(|(k, _)| k == "cache-control").unwrap();
-        assert_eq!(cc.1, "no-store");
+        assert_eq!(header(&headers, "x-log-end").unwrap(), "12");
+        assert_eq!(header(&headers, "cache-control").unwrap(), "no-store");
     }
 
     #[test]
     fn tail_from_mid_offset_returns_new_bytes_only() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("app.log"), b"line1\nline2\nline3\n").unwrap();
-
-        let req = make_tail_request("/logs/tail/app.log", 12); // skip "line1\nline2\n"
-        let route = tail_route("/logs/tail/{relpath}", "");
-        let routes = vec![route];
-        let config = Config::default();
-        let ctx = HandlerContext { routes: &routes, config: &config, site_dir: dir.path() };
-
-        let mut out = Vec::new();
-        handle_request(&req, &ctx, &mut responder(&mut out, &req)).unwrap();
-        let (_, headers, body) = parse_response(&out);
-
+        let (_, headers, body) = wire(&tail_req(dir.path(), "app.log", "offset=12"));
         assert_eq!(body, b"line3\n");
-        let end: u64 = headers.iter().find(|(k, _)| k == "x-log-end").unwrap().1.parse().unwrap();
-        assert_eq!(end, 18);
+        assert_eq!(header(&headers, "x-log-end").unwrap(), "18");
     }
 
     #[test]
     fn tail_beyond_eof_returns_empty_body() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("app.log"), b"abc").unwrap();
-
-        let req = make_tail_request("/logs/tail/app.log", 999);
-        let route = tail_route("/logs/tail/{relpath}", "");
-        let routes = vec![route];
-        let config = Config::default();
-        let ctx = HandlerContext { routes: &routes, config: &config, site_dir: dir.path() };
-
-        let mut out = Vec::new();
-        handle_request(&req, &ctx, &mut responder(&mut out, &req)).unwrap();
-        let (status, headers, body) = parse_response(&out);
-
+        let (status, headers, body) = wire(&tail_req(dir.path(), "app.log", "offset=999"));
         assert_eq!(status, 200);
         assert!(body.is_empty());
-        let end: u64 = headers.iter().find(|(k, _)| k == "x-log-end").unwrap().1.parse().unwrap();
-        assert_eq!(end, 3); // clamped to file size
+        assert_eq!(header(&headers, "x-log-end").unwrap(), "3", "clamped to file size");
     }
 
     #[test]
     fn tail_n_returns_last_n_lines() {
         let dir = tempfile::tempdir().unwrap();
-        // 4 lines; requesting last 2 should skip "line1\n" and "line2\n"
         std::fs::write(dir.path().join("app.log"), b"line1\nline2\nline3\nline4\n").unwrap();
-
-        let req = make_tail_n_request("/logs/tail/app.log", 2);
-        let route = tail_route("/logs/tail/{relpath}", "");
-        let routes = vec![route];
-        let config = Config::default();
-        let ctx = HandlerContext { routes: &routes, config: &config, site_dir: dir.path() };
-
-        let mut out = Vec::new();
-        handle_request(&req, &ctx, &mut responder(&mut out, &req)).unwrap();
-        let (status, headers, body) = parse_response(&out);
-
+        let (status, headers, body) = wire(&tail_req(dir.path(), "app.log", "offset=0&n=2"));
         assert_eq!(status, 200);
         assert_eq!(body, b"line3\nline4\n");
-        // X-Log-End must equal file size so next poll starts at EOF
-        let end: u64 = headers.iter().find(|(k, _)| k == "x-log-end").unwrap().1.parse().unwrap();
-        assert_eq!(end, 24); // full file size
+        // X-Log-End must equal file size so the next poll starts at EOF.
+        assert_eq!(header(&headers, "x-log-end").unwrap(), "24");
     }
 
     #[test]
     fn tail_n_fewer_lines_than_n_returns_all() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("app.log"), b"only\none\n").unwrap();
-
-        let req = make_tail_n_request("/logs/tail/app.log", 100);
-        let route = tail_route("/logs/tail/{relpath}", "");
-        let routes = vec![route];
-        let config = Config::default();
-        let ctx = HandlerContext { routes: &routes, config: &config, site_dir: dir.path() };
-
-        let mut out = Vec::new();
-        handle_request(&req, &ctx, &mut responder(&mut out, &req)).unwrap();
-        let (_, headers, body) = parse_response(&out);
-
+        let (_, headers, body) = wire(&tail_req(dir.path(), "app.log", "offset=0&n=100"));
         assert_eq!(body, b"only\none\n");
-        let end: u64 = headers.iter().find(|(k, _)| k == "x-log-end").unwrap().1.parse().unwrap();
-        assert_eq!(end, 9);
-    }
-
-    #[test]
-    fn tail_n_x_log_end_equals_file_size() {
-        // The X-Log-End on a tail-n response must point to current EOF so that
-        // the next incremental poll starts right after all existing content.
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("app.log"), b"a\nb\nc\nd\n").unwrap();
-
-        let req = make_tail_n_request("/logs/tail/app.log", 1);
-        let route = tail_route("/logs/tail/{relpath}", "");
-        let routes = vec![route];
-        let config = Config::default();
-        let ctx = HandlerContext { routes: &routes, config: &config, site_dir: dir.path() };
-
-        let mut out = Vec::new();
-        handle_request(&req, &ctx, &mut responder(&mut out, &req)).unwrap();
-        let (_, headers, body) = parse_response(&out);
-
-        assert_eq!(body, b"d\n");
-        let end: u64 = headers.iter().find(|(k, _)| k == "x-log-end").unwrap().1.parse().unwrap();
-        assert_eq!(end, 8); // file size, not just the last-line offset
-    }
-
-    #[test]
-    fn static_html_is_minified_before_serving() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("index.html"),
-            b"<html>\n  <body>\n    <!-- comment -->\n    <p>Hi</p>\n  </body>\n</html>\n",
-        )
-        .unwrap();
-
-        let raw = "GET /index.html HTTP/1.1\r\nHost: localhost\r\n\r\n";
-        let req = m6_core::parse::parse_request(&mut Cursor::new(raw.as_bytes().to_vec())).unwrap();
-        let route = Route::from_config(&RouteConfig {
-            path: "/{relpath}".to_string(),
-            root: "".to_string(),
-            tail: None,
-            headers: vec![],
-        });
-        let routes = vec![route];
-        let config = Config::default();
-        let ctx = HandlerContext { routes: &routes, config: &config, site_dir: dir.path() };
-
-        let mut out = Vec::new();
-        handle_request(&req, &ctx, &mut responder(&mut out, &req)).unwrap();
-        let (status, _headers, body) = parse_response(&out);
-
-        assert_eq!(status, 200);
-        let body_str = std::str::from_utf8(&body).unwrap();
-        assert!(!body_str.contains("<!-- comment -->"), "comment should be stripped: {}", body_str);
-        assert!(body_str.contains("Hi"), "content missing: {}", body_str);
-    }
-
-    #[test]
-    fn minification_disabled_for_mime_leaves_body_untouched() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("photo.svg"), b"<svg>   <!-- kept --> </svg>").unwrap();
-
-        let raw = "GET /photo.svg HTTP/1.1\r\nHost: localhost\r\n\r\n";
-        let req = m6_core::parse::parse_request(&mut Cursor::new(raw.as_bytes().to_vec())).unwrap();
-        let route = Route::from_config(&RouteConfig {
-            path: "/{relpath}".to_string(),
-            root: "".to_string(),
-            tail: None,
-            headers: vec![],
-        });
-        let routes = vec![route];
-        let config = Config::default();
-        let ctx = HandlerContext { routes: &routes, config: &config, site_dir: dir.path() };
-
-        let mut out = Vec::new();
-        handle_request(&req, &ctx, &mut responder(&mut out, &req)).unwrap();
-        let (status, _headers, body) = parse_response(&out);
-
-        assert_eq!(status, 200);
-        assert_eq!(body, b"<svg>   <!-- kept --> </svg>");
+        assert_eq!(header(&headers, "x-log-end").unwrap(), "9");
     }
 
     #[test]
     fn tail_missing_file_returns_404() {
         let dir = tempfile::tempdir().unwrap();
-
-        let req = make_tail_request("/logs/tail/missing.log", 0);
-        let route = tail_route("/logs/tail/{relpath}", "");
-        let routes = vec![route];
-        let config = Config::default();
-        let ctx = HandlerContext { routes: &routes, config: &config, site_dir: dir.path() };
-
-        let mut out = Vec::new();
-        let info = handle_request(&req, &ctx, &mut responder(&mut out, &req)).unwrap();
-        assert_eq!(info.status, 404);
+        let (status, _, _) = wire(&tail_req(dir.path(), "missing.log", "offset=0"));
+        assert_eq!(status, 404);
     }
 
-    /// `parse_response` above runs the whole buffer through `from_utf8`, which
-    /// is fine for the text bodies every other test sends but panics on a
-    /// brotli or gzip one. Split on the header terminator as bytes instead and
-    /// only decode the head.
-    fn parse_response_bytes(buf: &[u8]) -> (u16, Vec<(String, String)>, Vec<u8>) {
-        let sep = buf.windows(4).position(|w| w == b"\r\n\r\n").expect("header terminator");
-        let head = std::str::from_utf8(&buf[..sep]).expect("headers are ASCII");
-        let mut lines = head.lines();
-        let status: u16 = lines.next().unwrap().split_whitespace().nth(1).unwrap().parse().unwrap();
-        let headers = lines
-            .filter_map(|l| l.split_once(": ").map(|(k, v)| (k.to_lowercase(), v.to_string())))
-            .collect();
-        (status, headers, buf[sep + 4..].to_vec())
+    fn asset_req(
+        dir: &std::path::Path,
+        name: &str,
+        accept_encoding: Option<&str>,
+        extra: &[(&str, &str)],
+    ) -> Request {
+        let mut headers: Vec<(&str, &str)> = vec![];
+        if let Some(ae) = accept_encoding {
+            headers.push(("Accept-Encoding", ae));
+        }
+        headers.extend_from_slice(extra);
+        request(
+            "GET",
+            &format!("/assets/{name}"),
+            None,
+            &headers,
+            dir,
+            json!({"root": "assets/"}),
+            &[("relpath", name)],
+        )
     }
 
-    // ── Representation-specific ETags ────────────────────────────────────────
-
-    fn asset_route() -> Route {
-        Route::from_config(&RouteConfig {
-            path: "/assets/{relpath}".to_string(),
-            root: "assets/".to_string(),
-            tail: None,
-            headers: vec![],
-        })
-    }
-
-    /// Drive one GET for `/assets/<name>` with the given Accept-Encoding and
-    /// return (etag, content-encoding, body length).
-    fn fetch(dir: &std::path::Path, name: &str, accept_encoding: Option<&str>)
-        -> (String, Option<String>, usize)
-    {
-        let ae = match accept_encoding {
-            Some(v) => format!("Accept-Encoding: {}\r\n", v),
-            None => String::new(),
-        };
-        let raw = format!("GET /assets/{} HTTP/1.1\r\nHost: localhost\r\n{}\r\n", name, ae);
-        let req = m6_core::parse::parse_request(&mut Cursor::new(raw.into_bytes())).unwrap();
-        let routes = vec![asset_route()];
-        let config = Config::default();
-        let ctx = HandlerContext { routes: &routes, config: &config, site_dir: dir };
-        let mut out = Vec::new();
-        handle_request(&req, &ctx, &mut responder(&mut out, &req)).unwrap();
-        let (status, headers, body) = parse_response_bytes(&out);
-        assert_eq!(status, 200, "expected 200 for {name}");
-        let etag = headers.iter().find(|(k, _)| k == "etag").expect("etag header").1.clone();
-        let ce = headers.iter().find(|(k, _)| k == "content-encoding").map(|(_, v)| v.clone());
-        (etag, ce, body.len())
+    fn with_compression(mut req: Request, mime: &str) -> Request {
+        let mut cfg = m6_core::config::RendererConfig::default();
+        cfg.compression.insert(
+            mime.to_string(),
+            m6_core::config::CompressionLevel { brotli: 6, gzip: 6 },
+        );
+        req = req.with_config(std::sync::Arc::new(cfg));
+        req
     }
 
     /// A file with enough redundancy that brotli and gzip both actually
@@ -840,24 +576,38 @@ mod tests {
         s.into_bytes()
     }
 
+    fn css_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        std::fs::write(dir.path().join("assets/style.css"), compressible_css()).unwrap();
+        dir
+    }
+
+    fn fetch(dir: &std::path::Path, ae: Option<&str>) -> (String, Option<String>, usize) {
+        let req = with_compression(asset_req(dir, "style.css", ae, &[]), "text/css");
+        let (status, headers, body) = wire(&req);
+        assert_eq!(status, 200);
+        (
+            header(&headers, "etag").expect("etag").to_string(),
+            header(&headers, "content-encoding").map(str::to_string),
+            body.len(),
+        )
+    }
+
     /// The defect: brotli, gzip and identity of the same file all carried one
     /// strong validator. RFC 9110 requires a strong ETag to identify the
     /// representation actually sent, and a downstream shared cache that
     /// believes otherwise can hand a brotli body to a gzip-only client.
     #[test]
     fn each_content_coding_gets_its_own_etag() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
-        std::fs::write(dir.path().join("assets/style.css"), compressible_css()).unwrap();
-
-        let (e_br, ce_br, _)   = fetch(dir.path(), "style.css", Some("br"));
-        let (e_gz, ce_gz, _)   = fetch(dir.path(), "style.css", Some("gzip"));
-        let (e_id, ce_id, _)   = fetch(dir.path(), "style.css", None);
+        let dir = css_dir();
+        let (e_br, ce_br, _) = fetch(dir.path(), Some("br"));
+        let (e_gz, ce_gz, _) = fetch(dir.path(), Some("gzip"));
+        let (e_id, ce_id, _) = fetch(dir.path(), None);
 
         assert_eq!(ce_br.as_deref(), Some("br"));
         assert_eq!(ce_gz.as_deref(), Some("gzip"));
         assert_eq!(ce_id, None);
-
         assert_ne!(e_br, e_gz, "brotli and gzip share an ETag");
         assert_ne!(e_br, e_id, "brotli and identity share an ETag");
         assert_ne!(e_gz, e_id, "gzip and identity share an ETag");
@@ -867,77 +617,131 @@ mod tests {
     /// unversioned URL a client already cached does not spuriously miss.
     #[test]
     fn identity_keeps_the_unsuffixed_etag() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
-        std::fs::write(dir.path().join("assets/style.css"), compressible_css()).unwrap();
-
-        let (e_id, _, _) = fetch(dir.path(), "style.css", None);
+        let dir = css_dir();
+        let (e_id, _, _) = fetch(dir.path(), None);
         assert!(!e_id.contains("-br"), "identity tag carries a coding suffix: {e_id}");
         assert!(!e_id.contains("-gz"), "identity tag carries a coding suffix: {e_id}");
     }
 
-    /// Two requests for the same representation must agree, or every reload
-    /// is a full transfer.
     #[test]
     fn the_same_representation_is_stable_across_requests() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
-        std::fs::write(dir.path().join("assets/style.css"), compressible_css()).unwrap();
-
-        let (first, _, _)  = fetch(dir.path(), "style.css", Some("br"));
-        let (second, _, _) = fetch(dir.path(), "style.css", Some("br"));
-        assert_eq!(first, second);
+        let dir = css_dir();
+        assert_eq!(fetch(dir.path(), Some("br")).0, fetch(dir.path(), Some("br")).0);
     }
 
     /// A conditional request carrying the brotli tag must 304 for brotli, and
-    /// must NOT 304 for a client that can only take gzip -- that pairing is
+    /// must NOT 304 for a client that can only take gzip: that pairing is
     /// exactly what the shared tag made indistinguishable.
     #[test]
     fn a_brotli_etag_does_not_validate_a_gzip_request() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
-        std::fs::write(dir.path().join("assets/style.css"), compressible_css()).unwrap();
-
-        let (e_br, _, _) = fetch(dir.path(), "style.css", Some("br"));
-
+        let dir = css_dir();
+        let (e_br, _, _) = fetch(dir.path(), Some("br"));
         let cond = |ae: &str| -> u16 {
-            let raw = format!(
-                "GET /assets/style.css HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: {}\r\nIf-None-Match: {}\r\n\r\n",
-                ae, e_br);
-            let req = m6_core::parse::parse_request(&mut Cursor::new(raw.into_bytes())).unwrap();
-            let routes = vec![asset_route()];
-            let config = Config::default();
-            let ctx = HandlerContext { routes: &routes, config: &config, site_dir: dir.path() };
-            let mut out = Vec::new();
-            handle_request(&req, &ctx, &mut responder(&mut out, &req)).unwrap();
-            parse_response_bytes(&out).0
+            let req = with_compression(
+                asset_req(dir.path(), "style.css", Some(ae), &[("If-None-Match", &e_br)]),
+                "text/css",
+            );
+            wire(&req).0
         };
-
         assert_eq!(cond("br"), 304, "the brotli tag should validate a brotli request");
         assert_eq!(cond("gzip"), 200, "the brotli tag must not validate a gzip request");
     }
-}
 
-enum FindRouteResult<'a> {
-    Found(&'a Route, crate::route::Params),
-    /// A route matched the prefix/structure but the param value was invalid.
-    InvalidParam,
-    NotFound,
-}
-
-fn find_route<'a>(url_path: &str, routes: &'a [Route]) -> FindRouteResult<'a> {
-    let mut saw_invalid = false;
-    for route in routes {
-        match route.match_path(url_path) {
-            MatchResult::Matched(params) => return FindRouteResult::Found(route, params),
-            MatchResult::InvalidParam => saw_invalid = true,
-            MatchResult::NoMatch => {}
-        }
+    /// A directory has metadata and a size, so the HEAD fast path answered
+    /// `200` with a `Content-Length` for one while the GET beside it answered
+    /// 404. The read the fast path skips was also what rejected a non-file.
+    #[test]
+    fn a_head_on_a_directory_is_not_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("assets/css")).unwrap();
+        let req = request(
+            "HEAD",
+            "/assets/css",
+            None,
+            &[],
+            dir.path(),
+            json!({"root": "assets/"}),
+            &[("relpath", "css")],
+        );
+        let (status, _, _) = wire(&req);
+        assert_ne!(status, 200, "a directory is not a representation");
     }
-    if saw_invalid {
-        FindRouteResult::InvalidParam
-    } else {
-        FindRouteResult::NotFound
+
+    /// A HEAD must report exactly what the GET would send.
+    #[test]
+    fn head_reports_exactly_what_get_would() {
+        let dir = css_dir();
+        let get = wire(&with_compression(asset_req(dir.path(), "style.css", None, &[]), "text/css"));
+        let mut head_req = request(
+            "HEAD",
+            "/assets/style.css",
+            None,
+            &[],
+            dir.path(),
+            json!({"root": "assets/"}),
+            &[("relpath", "style.css")],
+        );
+        head_req = with_compression(head_req, "text/css");
+        let (status, headers, body) = wire(&head_req);
+
+        assert_eq!(status, get.0);
+        assert!(body.is_empty(), "a HEAD carries no body");
+        assert_eq!(header(&headers, "etag"), header(&get.1, "etag"));
+        assert_eq!(header(&headers, "content-type"), header(&get.1, "content-type"));
+        assert_eq!(
+            header(&headers, "content-length").unwrap().parse::<usize>().unwrap(),
+            get.2.len(),
+            "the length must be what the GET actually sent"
+        );
+    }
+
+    #[test]
+    fn a_method_other_than_get_or_head_is_405() {
+        let dir = css_dir();
+        let req = request(
+            "POST",
+            "/assets/style.css",
+            None,
+            &[],
+            dir.path(),
+            json!({"root": "assets/"}),
+            &[("relpath", "style.css")],
+        );
+        assert_eq!(wire(&req).0, 405);
+    }
+
+    #[test]
+    fn a_missing_file_is_404() {
+        let dir = css_dir();
+        let req = asset_req(dir.path(), "nothing.css", None, &[]);
+        assert_eq!(wire(&req).0, 404);
+    }
+
+    /// Text types must declare UTF-8 or a client falls back to Latin-1 and
+    /// renders UTF-8 as mojibake.
+    #[test]
+    fn text_types_declare_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        std::fs::write(dir.path().join("assets/a.md"), b"# hi").unwrap();
+        let (_, headers, _) = wire(&asset_req(dir.path(), "a.md", None, &[]));
+        assert_eq!(header(&headers, "content-type").unwrap(), "text/markdown; charset=utf-8");
+    }
+
+    /// A symlink pointing outside the site directory is a 404, not a file.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlink_escaping_the_site_dir_is_404() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret"), b"secret").unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret"),
+            dir.path().join("assets/escape"),
+        )
+        .unwrap();
+        assert_eq!(wire(&asset_req(dir.path(), "escape", None, &[])).0, 404);
     }
 }
 

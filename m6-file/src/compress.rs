@@ -1,5 +1,7 @@
-use crate::config::Config;
+use std::collections::HashMap;
+
 use anyhow::Result;
+use m6_core::config::CompressionLevel;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Encoding {
@@ -26,12 +28,12 @@ use m6_core::coding_quality;
 pub fn choose_encoding(
     mime_type: &str,
     accept_encoding: &str,
-    config: &Config,
+    compression: &HashMap<String, CompressionLevel>,
 ) -> (Encoding, Option<u32>) {
     let mime_base = mime_type.split(';').next().unwrap_or(mime_type).trim();
 
     // Which codings are permitted for this MIME type, and at what level.
-    let (br_level, gz_level) = match config.compression.get(mime_base) {
+    let (br_level, gz_level) = match compression.get(mime_base) {
         Some(settings) => (
             if settings.brotli > 0 { Some(settings.brotli) } else { None },
             if settings.gzip > 0 { Some(settings.gzip) } else { None },
@@ -79,11 +81,11 @@ pub fn compress_gzip(data: &[u8], level: u32) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use std::collections::HashMap;
 
     #[test]
     fn test_choose_encoding_default_compress() {
-        let config = Config::default();
+        let config: HashMap<String, CompressionLevel> = HashMap::new();
         let (enc, level) = choose_encoding("text/css", "br, gzip", &config);
         assert_eq!(enc, Encoding::Brotli);
         assert!(level.is_some());
@@ -95,7 +97,7 @@ mod tests {
         // 9239), not "application/javascript" — this is the string that
         // actually reaches choose_encoding from a real request, so it's the
         // one that must match, not the deprecated form alone.
-        let config = Config::default();
+        let config: HashMap<String, CompressionLevel> = HashMap::new();
         let (enc, level) = choose_encoding("text/javascript", "br, gzip", &config);
         assert_eq!(enc, Encoding::Brotli);
         assert!(level.is_some());
@@ -103,7 +105,7 @@ mod tests {
 
     #[test]
     fn test_choose_encoding_no_compress() {
-        let config = Config::default();
+        let config: HashMap<String, CompressionLevel> = HashMap::new();
         let (enc, _) = choose_encoding("image/jpeg", "br, gzip", &config);
         assert_eq!(enc, Encoding::Identity);
     }
@@ -127,10 +129,10 @@ mod tests {
 #[cfg(test)]
 mod q_value_tests {
     use super::*;
-    use crate::config::Config;
+    use std::collections::HashMap;
 
     fn pick(ae: &str) -> Encoding {
-        choose_encoding("text/css", ae, &Config::default()).0
+        choose_encoding("text/css", ae, &HashMap::new()).0
     }
 
     /// The defect. `contains("br")` matched a client that had explicitly
@@ -191,7 +193,7 @@ mod q_value_tests {
     /// An uncompressible MIME type is identity regardless of what is offered.
     #[test]
     fn uncompressible_types_stay_identity() {
-        let c = Config::default();
+        let c: HashMap<String, CompressionLevel> = HashMap::new();
         assert_eq!(choose_encoding("image/png", "br, gzip", &c).0, Encoding::Identity);
     }
 }
