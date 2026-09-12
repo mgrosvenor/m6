@@ -19,6 +19,24 @@ pub struct RouteConfig {
     pub methods: Option<Vec<String>>,
     /// Extra response headers as `[[key, value]]` pairs.
     pub headers: Vec<(String, String)>,
+    /// Name of a handler registered in code with `App::handler`.
+    ///
+    /// This is what makes a route dynamic. A handler is code and cannot appear
+    /// while the process runs; a *route* is config and must be able to. Naming
+    /// the binding in config puts the half that changes on the side that
+    /// reloads, so adding an asset tree is a config edit rather than a
+    /// restart.
+    pub handler: Option<String>,
+    /// Keys on this `[[route]]` that core does not define, verbatim.
+    ///
+    /// Core deliberately does not know what `root` or `tail` mean; m6-file
+    /// does. A handler reads them through `Request::route_setting`, which is
+    /// what lets a service keep its own per-route vocabulary without core
+    /// growing a field per consumer.
+    ///
+    /// `Arc` because the matched route is cloned once per request and a map
+    /// cloned per request is a dynamic allocation on the hot path.
+    pub settings: std::sync::Arc<Map<String, Value>>,
 }
 
 /// Thread-pool configuration parsed from `[thread_pool]`.
@@ -379,11 +397,26 @@ fn parse_routes(val: Option<&toml::Value>) -> anyhow::Result<Vec<RouteConfig>> {
             .and_then(|v| v.as_integer())
             .unwrap_or(200) as u16;
 
+        let handler = item.get("handler").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+        // A handler route defaults to `no-store`, a template route to
+        // `public`, and an explicit `cache` wins over both.
+        //
+        // The default has to depend on the kind of route because the two are
+        // not the same kind of thing: a template renders a document from files
+        // on disk, a handler computes an answer. Letting a handler route
+        // inherit `public` would put dynamic output in a shared cache by
+        // omission, which is the shape of defect that is found by someone else
+        // seeing another user's page. Code routes registered with
+        // `App::route_get` already defaulted to `no-store` for this reason;
+        // this is the same rule reaching the config-declared form.
         let cache = item
             .get("cache")
             .and_then(|v| v.as_str())
-            .unwrap_or("public")
-            .to_string();
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| {
+                if handler.is_some() { "no-store".to_string() } else { "public".to_string() }
+            });
 
         let methods: Option<Vec<String>> = item.get("methods").and_then(|v| v.as_array()).map(|a| {
             a.iter()
@@ -406,7 +439,32 @@ fn parse_routes(val: Option<&toml::Value>) -> anyhow::Result<Vec<RouteConfig>> {
             })
             .unwrap_or_default();
 
-        routes.push(RouteConfig { path, template, params, status, cache, methods, headers });
+        // Everything core does not define is kept rather than dropped, so a
+        // service can carry its own per-route vocabulary. Unknown keys were
+        // previously discarded in silence, which is indistinguishable from a
+        // typo being honoured.
+        const KNOWN: [&str; 8] =
+            ["path", "template", "params", "status", "cache", "methods", "headers", "handler"];
+        let mut settings = Map::new();
+        if let Some(table) = item.as_table() {
+            for (k, v) in table {
+                if !KNOWN.contains(&k.as_str()) {
+                    settings.insert(k.clone(), toml_to_json(v));
+                }
+            }
+        }
+
+        routes.push(RouteConfig {
+            path,
+            template,
+            params,
+            status,
+            cache,
+            methods,
+            headers,
+            handler,
+            settings: std::sync::Arc::new(settings),
+        });
     }
 
     Ok(routes)
