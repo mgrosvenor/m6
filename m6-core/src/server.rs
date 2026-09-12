@@ -349,7 +349,7 @@ pub fn parse_request(stream: &mut UnixStream) -> anyhow::Result<Option<RawReques
 /// Send a response through the one HTTP/1.1 response writer.
 pub fn write_response<W: std::io::Write>(
     resp: &mut crate::h1::Responder<'_, W>,
-    response: &crate::response::Response,
+    response: crate::response::Response,
 ) -> anyhow::Result<()> {
     response.send(resp)
 }
