@@ -35,15 +35,25 @@ State of play for the next session. Written 2026-09-11, updated 2026-09-12.
 > m6-file" was written at 14:32 on 2026-09-12 and `send_stream` reached
 > m6-file at 14:55 the same day; the two were never reconciled.
 >
-> **m6-file is still not migrated, and the reason is now a number.** `App`
-> builds a request dictionary before every handler call: **p50 3.08us**
-> measured in release, against 167ns to route, on a service whose entire
-> tracked cache-hit p50 is 3.9us. A static asset request reads none of it.
-> Migrating as `App` stands is a measured regression against the owner's
-> stated key metric, so the next decision is how a handler route opts out of
-> the dict. `CONSOLIDATION-TODO.md` under "m6-file should be an `App` service"
-> has the options and the re-run command. **This needs a decision, not more
-> code.**
+> **m6-file is still not migrated, and measuring `App` first found something
+> bigger: `App` deep-copies its immutable state on every request.** Tracked as
+> `CONSOLIDATION-TODO.md` §7.
+>
+> `build_dict` starts from an empty map and copies the whole static config in,
+> per request. With the site's real `data/content.json` (68KB, 1,364 nodes),
+> which production declares as **both** the global params and the route's
+> params, and which `render_response` then clones a third time:
+> **~323us of pure copying per HTML page before Tera is called**, on a laptop.
+> syd is 1 core and renders every page at ~6ms. Nothing in it varies between
+> requests.
+>
+> The first number I reported was 3.08us from a synthetic 20-key config, and
+> the owner's response was that 3us sounded wrong for building a small map.
+> It was: the parser and the map are noise (41 to 583ns), the copy is
+> everything, and against the real config it is seventy times larger.
+>
+> **This is not §3a.** That is m6-http's cache-hit p50 and never touches
+> m6-html. Do not conflate them.
 >
 
 > ## Read first, 2026-09-12 (late session)
@@ -161,8 +171,16 @@ applied them:
   and test builds, clippy at its 157 Darwin ceiling, 2026-09-12 (latest
   session). Verified on Linux via `deploy/run-tests.sh m6`. The sixteen over
   the previous 1002 are the wildcard, config-route-handler and streaming-body
-  tests. One further test, `app::dict_cost_probe`, is `#[ignore]`d on purpose:
-  it is a measurement, and a timing assertion is the wall-clock trap.
+  tests. The `app::dict_cost` module is `#[ignore]`d on purpose: those are
+  measurements, and a timing assertion is the wall-clock trap.
+- **The port race recurred once on 2026-09-12 (latest session)**, in
+  `security_e2e::forged_x_auth_claims_does_not_survive_ingress_e2e`:
+  `HTTP/1.1 TCP listener bind failed ... Address already in use (os error 48)`,
+  then "m6-http never served a backend request". Clean on the next full run and
+  on three runs in isolation. `SO_REUSEADDR` (`07f11d8`) was believed to have
+  closed this; it has not, or not entirely. It is also §3d demonstrated: the
+  bind failure is a `warn!`, so the process came up with nothing on the port
+  and the test reported the symptom rather than the cause.
 - **Clippy is a gate now**, on the owner's instruction: `tools/clippy.sh`,
   wired into `check.sh` (step 2, so the pre-push hook covers it) and into the
   Linux gate before prod. It is a **ratchet**, not `-D warnings`: the count may
@@ -1014,10 +1032,18 @@ New 2026-09-12:
     whether anything has landed since.
 37. **Measure the cost of the thing you are migrating onto, not just its
     capabilities.** The gating question for m6-file looked like a list of
-    features `App` lacked, and all of them got built. The thing that actually
-    stops the migration is that `App` spends 3.08us per request building a
-    dictionary a file handler never reads, which is most of the 3.9us the
-    owner tracks as the key metric. No capability list would have surfaced
-    that; one `#[ignore]`d measurement did. Lesson 1 said measure the
-    candidate before consolidating onto it, and that was about *correctness*
-    scores; this is the same rule about cost.
+    features `App` lacked, and all of them got built. What actually stops the
+    migration is that `App` deep-copies its whole static config into a fresh
+    map on every request. No capability list would have surfaced it; one
+    `#[ignore]`d measurement did. Lesson 1 said measure the candidate before
+    consolidating onto it, and that was about *correctness* scores; this is
+    the same rule about cost.
+38. **A synthetic benchmark measures the shape you imagined, not the one that
+    runs.** The first figure was 3.08us, from a config with twenty short
+    string keys, and it was reported as the finding. The owner's reply was
+    that 3us sounded wrong for building a small map, which was the right
+    instinct twice over: the map and the parser are 41 to 583ns, so the number
+    was all copy; and the real config loads a 68KB JSON file **twice**, making
+    the true figure ~323us, seventy times larger. **Take the input from
+    production before quoting a number**, and when a measurement looks too big
+    for what it claims to measure, that gap is the finding.

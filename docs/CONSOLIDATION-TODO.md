@@ -502,38 +502,9 @@ Then, and only then, the two migrations below.
       so a handler can now serve a file without materialising it and without
       having its negotiated representation re-encoded downstream.
 
-      **What is left is not plumbing, it is a measured cost, and this row has
-      understated the work three times now.** The row said "one decision away";
-      it was three core changes away, two of which are now done. The third is
-      this:
+      **What is left is a defect in `App`, not a decision about m6-file.** See
+      §7 below, which is where the work now is. The migration waits on it.
 
-      **`App` builds a request dictionary before every handler call, and a
-      static asset request uses none of it.** Measured on the laptop in
-      release, 2026-09-12: **`build_dict` p50 3.08us, p99 5.25us**, against
-      `find_route` at **167ns**. For scale, the production cache-hit p50 the
-      owner tracks as the key metric is **3.9us** (§3a), and syd is a 1-core
-      VM that will be worse. m6-file today matches a route and goes to the
-      filesystem; migrating as `App` stands adds roughly the whole tracked
-      cache-hit budget to every asset request, to build a map of config keys,
-      query params, cookies and two `chrono::Utc::now()` format calls that the
-      file handler never reads.
-
-      The measurement is `app::dict_cost_probe`, `#[ignore]`d because a timing
-      assertion is the wall-clock trap that `test_static_file_cache_hit`
-      already fell into. Re-run it with:
-
-      ```sh
-      cargo test --release -p m6-core measure_build_dict -- --ignored --nocapture
-      ```
-
-      - [ ] **Decide how a handler route avoids the dict it does not use.**
-            Options, unranked because this is the owner's call: an explicit
-            registration variant (`handler_no_dict`), a lazy dict built on
-            first `req.dict()`, or accepting the cost. Path params still have
-            to be validated either way, which is step 4 of `build_dict` and is
-            the only part m6-file needs. **Until this is settled the migration
-            is a known regression against the stated key metric**, so it is not
-            wired up.
       - [ ] Then: the handler returns `Response` instead of writing to a
             `Responder`, and the config gains `handler = "files"` on all 15
             routes with `/assets/{relpath}` becoming `/assets/{*relpath}`.
@@ -543,6 +514,72 @@ Then, and only then, the two migrations below.
             `App`'s bounded pool and 503 backpressure. On a 1-core origin that
             is a behaviour change on the asset path and wants measuring, not
             assuming.
+
+### 7. `App` deep-copies its immutable state on every request
+
+**FOUND 2026-09-12 (latest session), measuring `App` before migrating m6-file
+onto it. Open, not started. This is an m6-html production cost, not only an
+obstacle to the migration.**
+
+`build_dict` starts from `Map::new()` and copies the whole of the service's
+static configuration into it, per request. Nothing in steps 1 to 3 varies
+between requests; it is the config file and the params files, identical until
+the next reload.
+
+Measured in release on the laptop. With a synthetic 20-key config the whole
+dict is ~4.7us and **the copy is 2.7us of it**, while everything that actually
+does work per request is noise beside it:
+
+| phase | ns |
+|---|---|
+| `Map::new()` | 41 |
+| query parse + map | 42 |
+| `parse_cookies` | 250 |
+| `chrono::Utc::now()` + two `strftime` | 583 |
+| **clone 20 config keys** | **2,708** |
+
+Against the site's real `data/content.json` (68KB, 1,364 nodes) it is far
+worse, because production declares that file **twice** and a third copy is
+taken after the dict is finished:
+
+| phase | ns |
+|---|---|
+| step 2, global params clone | 104,583 |
+| step 3, route params clone, *the same file again* | 103,125 |
+| `render_response`'s `dict.clone()` (app.rs:798) | 103,542 |
+| **total before Tera is called** | **~323,000** |
+
+**That is 0.32ms of pure copying per HTML page, on a laptop, before the
+template engine starts.** syd is a 1-core VM. m6-html renders every HTML page
+on the site at a stated ~6ms.
+
+It is **not** an explanation for §3a: that is m6-http's cache-hit p50 and
+never reaches m6-html. Do not conflate them.
+
+Three things to decide, roughly independent:
+
+- [ ] **Stop copying immutable state per request.** The static base (config
+      keys, global params, static route params) is fixed between reloads and
+      belongs behind an `Arc`, with the per-request dict a small overlay
+      consulted first. The twelve-step precedence survives: built-ins are in
+      the overlay and params files in the base, so built-ins still win, which
+      is the ordering step 8's comment calls load-bearing. The cost is that
+      `dict` stops being a flat `Map<String, Value>`, which touches
+      `Request::dict`, `Response::render_dict` and the renderer seam.
+- [ ] **Do not clone the same file twice.** Steps 2 and 3 both insert
+      `data/content.json`, the second overwriting the first with identical
+      values. One conditional halves the cost today, independently of the
+      above. Worth checking whether the config needs to name it twice at all.
+- [ ] **`render_response` clones the finished dict** to merge a handler's
+      extra context, which is usually absent. Clone only when
+      `resp.template_dict` is `Some`, or merge without copying.
+
+`m6-core/src/app.rs`'s `dict_cost` module holds all three measurements,
+`#[ignore]`d because a timing assertion is the wall-clock trap:
+
+```sh
+cargo test --release -p m6-core dict_cost -- --ignored --nocapture
+```
 - [ ] **`m6-auth-server` should be an `App` service.** It binds through
       `UnixServer` directly. **Its stated blocker is gone**: the capability it
       needed that `App` lacked was `chmod` on the socket, and that is now

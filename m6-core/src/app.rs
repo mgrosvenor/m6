@@ -3447,52 +3447,77 @@ tail = false
 }
 
 #[cfg(test)]
-mod dict_cost_probe {
+mod dict_cost {
+    //! What `App` spends per request before a handler or a template runs.
+    //!
+    //! All `#[ignore]`d. These are measurements, not assertions: a timing
+    //! assertion is the wall-clock trap `test_static_file_cache_hit` already
+    //! fell into once, firing on a loaded build box against correct code.
+    //!
+    //! ```sh
+    //! cargo test --release -p m6-core dict_cost -- --ignored --nocapture
+    //! ```
+    //!
+    //! Measured on the laptop in release, 2026-09-12. **The whole cost is
+    //! copying immutable state per request**, and it is nothing to do with
+    //! parsing:
+    //!
+    //! | what | ns |
+    //! |---|---|
+    //! | `Map::new()` | 41 |
+    //! | query parse + map | 42 |
+    //! | `parse_cookies` | 333 |
+    //! | `chrono::Utc::now()` + two `strftime` | 708 |
+    //! | **cloning 20 config keys** | **2,750** |
+    //!
+    //! Against the site's real `data/content.json`, 68KB and 1,364 nodes, the
+    //! same shape costs far more, because that file is loaded as *both* the
+    //! global params and the route's params and is then cloned a third time by
+    //! `render_response`:
+    //!
+    //! | what | ns |
+    //! |---|---|
+    //! | step 2, global params clone | 104,583 |
+    //! | step 3, route params clone, same file | 103,125 |
+    //! | `render_response`'s `dict.clone()` | 103,542 |
+    //! | **total before the engine runs** | **323,292** |
+    //!
+    //! None of it varies between requests. It is the config and the content
+    //! file, identical until the next reload, deep-copied three times per page.
+
     use super::*;
     use std::io::Write;
 
-    /// What `App` spends per request before a handler is reached.
-    ///
-    /// Not an assertion, a measurement, printed with `--nocapture`. m6-file
-    /// does none of this today: it matches a route and goes straight to the
-    /// filesystem. If it becomes an `App` service, every asset request pays
-    /// whatever this costs, and latency is the stated key metric.
-    ///
-    /// Measured 2026-09-12 on the laptop, release:
-    /// **build_dict p50 3.08us, p99 5.25us; find_route p50 167ns.** syd is a
-    /// 1-core VM and would be worse. The tracked production cache-hit p50 is
-    /// 3.9us, so this is not a rounding error beside it.
-    ///
-    /// `#[ignore]`d deliberately. A timing assertion is the wall-clock trap
-    /// that `test_static_file_cache_hit` already fell into once: it fires on a
-    /// loaded build box against correct code. Run it when the question is
-    /// asked:
-    ///
-    /// ```sh
-    /// cargo test --release -p m6-core measure_build_dict -- --ignored --nocapture
-    /// ```
-    #[test]
-    #[ignore = "a measurement, not an assertion; see the doc comment"]
-    fn measure_build_dict_for_a_static_asset_request() {
+    fn median<F: FnMut()>(n: usize, mut f: F) -> u64 {
+        for _ in 0..n / 4 {
+            f();
+        }
+        let mut v = Vec::with_capacity(n);
+        for _ in 0..n {
+            let t = std::time::Instant::now();
+            f();
+            v.push(t.elapsed().as_nanos() as u64);
+        }
+        v.sort_unstable();
+        v[v.len() / 2]
+    }
+
+    /// Build a state from TOML, with `site_dir` already populated by `setup`.
+    fn state_from(toml: &str, setup: impl FnOnce(&std::path::Path)) -> (FrameworkState, tempfile::TempDir) {
         let site_dir = tempfile::TempDir::new().unwrap();
         std::fs::create_dir(site_dir.path().join("templates")).unwrap();
-
-        // A config shaped like the real one: a handful of site-wide keys that
-        // every dict copies, plus the asset route.
-        let mut cfg = String::new();
-        for i in 0..20 {
-            cfg.push_str(&format!("key_{i} = \"value_{i}\"\n"));
-        }
-        cfg.push_str("[[route]]\npath = \"/assets/{*relpath}\"\nhandler = \"files\"\nroot = \"assets/\"\n");
+        setup(site_dir.path());
         let mut f = tempfile::NamedTempFile::new().unwrap();
-        write!(f, "{cfg}").unwrap();
-
+        write!(f, "{toml}").unwrap();
         let config = crate::config::load(f.path(), site_dir.path()).unwrap();
         let state =
             FrameworkState::build(config, site_dir.path().to_path_buf(), &[], &*default_renderer())
                 .unwrap();
+        (state, site_dir)
+    }
 
-        let raw = RawRequest {
+    fn asset_request() -> RawRequest {
+        RawRequest {
             version: "HTTP/1.1".to_string(),
             method: "GET".to_string(),
             path: "/assets/css/main.css".to_string(),
@@ -3503,37 +3528,153 @@ mod dict_cost_probe {
                 ("Cookie".to_string(), "_csrf=abc; session=def".to_string()),
             ],
             body: vec![],
+        }
+    }
+
+    fn config_with_keys(n: usize) -> String {
+        let mut cfg = String::new();
+        for i in 0..n {
+            cfg.push_str(&format!("key_{i} = \"value_{i}\"\n"));
+        }
+        cfg
+    }
+
+    /// The headline for a static asset request: what a file handler would pay
+    /// per request for a dictionary it never reads.
+    #[test]
+    #[ignore = "a measurement, not an assertion"]
+    fn measure_build_dict_for_a_static_asset_request() {
+        let toml = format!(
+            "{}[[route]]\npath = \"/assets/{{*relpath}}\"\nhandler = \"files\"\n",
+            config_with_keys(20)
+        );
+        let (state, _d) = state_from(&toml, |_| {});
+        let raw = asset_request();
+        let (route, params) = find_route(raw.path(), raw.method(), &state.routes).unwrap();
+
+        const N: usize = 20_000;
+        let whole = median(N, || {
+            std::hint::black_box(state.build_dict(&raw, route, &params).unwrap());
+        });
+        let routing = median(N, || {
+            std::hint::black_box(find_route(raw.path(), raw.method(), &state.routes));
+        });
+        println!("build_dict p50 {whole}ns | find_route p50 {routing}ns");
+    }
+
+    /// Where that time goes, phase by phase. The answer is the copy, not the
+    /// parser: cloning the config alone is more than half of it.
+    #[test]
+    #[ignore = "a measurement, not an assertion"]
+    fn where_does_build_dict_spend_its_time() {
+        let toml = format!(
+            "{}[[route]]\npath = \"/assets/{{*relpath}}\"\nhandler = \"files\"\n",
+            config_with_keys(20)
+        );
+        let (state, _d) = state_from(&toml, |_| {});
+        let raw = asset_request();
+        let (route, params) = find_route(raw.path(), raw.method(), &state.routes).unwrap();
+        const N: usize = 20_000;
+
+        println!("--- build_dict phase breakdown (ns, median of {N}) ---");
+        println!("whole build_dict          {:>7}", median(N, || {
+            std::hint::black_box(state.build_dict(&raw, route, &params).unwrap());
+        }));
+        println!("Map::new alone            {:>7}", median(N, || {
+            std::hint::black_box(Map::new());
+        }));
+        println!("1. user_config clone x{:<3} {:>7}", state.config.user_config.len(), median(N, || {
+            let mut d = Map::new();
+            for (k, v) in &state.config.user_config {
+                d.insert(k.clone(), v.clone());
+            }
+            std::hint::black_box(d);
+        }));
+        println!("5. query parse + map      {:>7}", median(N, || {
+            let mut q = Map::new();
+            for (k, v) in parse_query_string(raw.query()) {
+                q.insert(k.clone(), Value::String(v.clone()));
+            }
+            std::hint::black_box(Value::Object(q));
+        }));
+        println!("7. parse_cookies          {:>7}", median(N, || {
+            std::hint::black_box(parse_cookies(raw.header("cookie").unwrap()));
+        }));
+        println!("8. now() + both formats   {:>7}", median(N, || {
+            let n = chrono::Utc::now();
+            std::hint::black_box((
+                n.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                n.format("%Y").to_string(),
+            ));
+        }));
+    }
+
+    /// The same thing against the site's real content file, which is the
+    /// number that matters: m6-html renders every HTML page through this.
+    #[test]
+    #[ignore = "a measurement, and it needs the site repo beside this one"]
+    fn build_dict_against_the_real_content_json() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../dr-grosvenor-site/data/content.json");
+        if !src.exists() {
+            println!("SKIP: {} not present", src.display());
+            return;
+        }
+
+        // Exactly what production declares: the same file as the global params
+        // and as the route's params.
+        let toml = format!(
+            "{}global_params = [\"data/content.json\"]\n\
+             [[route]]\npath = \"/\"\ntemplate = \"index.html\"\nparams = [\"data/content.json\"]\n",
+            config_with_keys(34)
+        );
+        let (state, _d) = state_from(&toml, |dir| {
+            std::fs::create_dir(dir.join("data")).unwrap();
+            std::fs::copy(&src, dir.join("data/content.json")).unwrap();
+        });
+
+        let raw = RawRequest {
+            version: "HTTP/1.1".to_string(),
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            query: None,
+            headers: vec![("Cookie".to_string(), "_csrf=abc".to_string())],
+            body: vec![],
         };
         let (route, params) = find_route(raw.path(), raw.method(), &state.routes).unwrap();
 
-        // Warm, then take the median of a decent run.
-        for _ in 0..1000 {
-            let _ = state.build_dict(&raw, route, &params).unwrap();
-        }
-        let mut samples = Vec::with_capacity(2000);
-        for _ in 0..2000 {
-            let t = std::time::Instant::now();
-            let d = state.build_dict(&raw, route, &params).unwrap();
-            samples.push(t.elapsed().as_nanos() as u64);
+        const N: usize = 2_000;
+        let whole = median(N, || {
+            std::hint::black_box(state.build_dict(&raw, route, &params).unwrap());
+        });
+        let globals = median(N, || {
+            let mut d = Map::new();
+            for (k, v) in &state.global_params_data {
+                d.insert(k.clone(), v.clone());
+            }
             std::hint::black_box(d);
-        }
-        samples.sort_unstable();
-        let p50 = samples[samples.len() / 2];
-        let p99 = samples[samples.len() * 99 / 100];
+        });
+        let route_params = median(N, || {
+            let mut d = Map::new();
+            for pf in &route.params_files {
+                if let Some(m) = state.static_params.get(pf) {
+                    for (k, v) in m.as_ref() {
+                        d.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            std::hint::black_box(d);
+        });
+        let dict = state.build_dict(&raw, route, &params).unwrap();
+        let render_copy = median(N, || {
+            std::hint::black_box(dict.clone());
+        });
 
-        // And the routing it replaces, for scale.
-        let mut rsamples = Vec::with_capacity(2000);
-        for _ in 0..2000 {
-            let t = std::time::Instant::now();
-            let m = find_route(raw.path(), raw.method(), &state.routes);
-            rsamples.push(t.elapsed().as_nanos() as u64);
-            std::hint::black_box(m);
-        }
-        rsamples.sort_unstable();
-
-        println!(
-            "build_dict per request: p50 {p50}ns p99 {p99}ns | find_route p50 {}ns",
-            rsamples[rsamples.len() / 2]
-        );
+        println!("--- production-shaped per-request dict cost (ns, median of {N}) ---");
+        println!("whole build_dict                 {whole:>8}");
+        println!("  step 2, global params clone    {globals:>8}");
+        println!("  step 3, route params clone     {route_params:>8}  (same file, again)");
+        println!("render_response dict.clone()     {render_copy:>8}  (third copy)");
+        println!("total before the engine runs     {:>8}", whole + render_copy);
     }
 }
