@@ -18,7 +18,7 @@ use tracing::{error, info, warn};
 use crate::error::{Error, Result};
 use crate::request::{
     parse_auth_claims, parse_cookies, parse_form_body, parse_query_string, validate_path_param,
-    RawRequest, Request,
+    validate_wildcard_param, RawRequest, Request,
 };
 use crate::response::{error_to_response, Response};
 use crate::render::{RenderError, Renderer, RendererFactory};
@@ -144,6 +144,28 @@ pub struct CompiledRoute {
     /// arrives. Omitting the header is correct there — RFC 9110 lets a server
     /// leave it out, and a wrong date is far worse than an absent one.
     pub last_modified: Option<std::time::SystemTime>,
+    /// Name of the registered handler this route dispatches to, if any.
+    ///
+    /// `Some` for a config route carrying `handler = "..."`. `None` for a
+    /// template route and for a route registered in code with `route_get` and
+    /// friends, which is found by pattern and method instead: those are bound
+    /// at the call site, so the pattern *is* the binding.
+    pub handler: Option<String>,
+    /// The matched route's own config keys that core does not define.
+    pub settings: Arc<Map<String, Value>>,
+}
+
+impl CompiledRoute {
+    /// Was `name` captured by a `{*name}` wildcard on this route?
+    ///
+    /// Asked per matched parameter rather than stored per capture because a
+    /// route has at most a handful of segments and this runs once per param,
+    /// not once per segment per request.
+    pub fn is_wildcard_param(&self, name: &str) -> bool {
+        self.segments
+            .iter()
+            .any(|s| matches!(s, Segment::Wildcard(n) if n == name))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -396,6 +418,11 @@ impl FrameworkState {
                 // A code route renders whatever its handler decides at request
                 // time, so there is no input file whose mtime describes it.
                 last_modified: None,
+                // A code route is bound by pattern and method at the call
+                // site, so it names no handler and carries no config of its
+                // own. The config-declared form below is the one that does.
+                handler: None,
+                settings: Arc::new(Map::new()),
             });
         }
 
@@ -430,6 +457,8 @@ impl FrameworkState {
                 headers: rc.headers.clone(),
                 specificity: spec,
                 last_modified: None, // filled in below, once templates_mtime is known
+                handler: rc.handler.clone(),
+                settings: Arc::clone(&rc.settings),
             });
         }
 
@@ -450,6 +479,20 @@ impl FrameworkState {
         // editing a publication should not make /capabilities look modified.
         let templates_mtime = newest_mtime_under(&site_dir.join("templates"));
         for route in &mut routes {
+            // The date is derived from templates and params files, so it is
+            // only meaningful for a route that renders from them.
+            //
+            // This loop used to run over every route, which quietly included
+            // the code routes it was never meant to touch: their
+            // `params_files` is empty, so nothing skipped them and they took
+            // the newest template's mtime as their own. The comment at the
+            // emit site already said "skipped when the route has no honest
+            // date -- a code route", and that was true of the intent and not
+            // of the code. A handler's answer is computed per request and is
+            // not dated by a template it may never read.
+            if route.template.is_none() {
+                continue;
+            }
             // A params path with a placeholder resolves per request, so no
             // build-time value can be right. Leave the header off rather than
             // publish a date that is wrong for most requests.
@@ -624,8 +667,17 @@ impl FrameworkState {
         }
 
         // 4. Path params.
+        //
+        // Which validation applies is a property of the route, not of the
+        // parameter's name: a `{*name}` capture is defined to span segments
+        // and is the only one allowed to carry a slash. Everything else is
+        // one segment and is checked exactly as before.
         for (k, v) in path_params {
-            validate_path_param(k, v)?;
+            if route.is_wildcard_param(k) {
+                validate_wildcard_param(k, v)?;
+            } else {
+                validate_path_param(k, v)?;
+            }
             dict.insert(k.clone(), Value::String(v.clone()));
         }
 
@@ -835,6 +887,7 @@ fn drain_thread_state_typed<T: Any + Send + 'static>(
 /// Run with global state only.
 fn run_app_global<G: Send + Sync + 'static>(
     raw_routes: Vec<GlobalRawRoute<G>>,
+    raw_named: Vec<GlobalRawNamed<G>>,
     init_global: Arc<dyn Fn(&Map<String, Value>) -> Result<G> + Send + Sync>,
     destroy_global: Option<Arc<dyn Fn(G) + Send + Sync>>,
     renderer: Arc<dyn RendererFactory>,
@@ -874,6 +927,17 @@ fn run_app_global<G: Send + Sync + 'static>(
         })
         .collect();
 
+    // Named handlers take the same conversion as the routes above: the state
+    // is what the closure captures, and by what the route was bound to.
+    let named: Vec<NamedHandler> = raw_named
+        .into_iter()
+        .map(|(name, handler)| {
+            let arc_g2 = arc_g.clone();
+            let h: BoxHandler = Box::new(move |req: &Request| handler(req, &*arc_g2));
+            (name, Arc::new(h))
+        })
+        .collect();
+
     // Build a type-erased on_shutdown callback that calls destroy_global.
     let arc_g_destroy = arc_g.clone();
     let on_shutdown: Option<Box<dyn FnOnce() + Send>> = destroy_global.map(|dg| {
@@ -889,7 +953,7 @@ fn run_app_global<G: Send + Sync + 'static>(
     });
 
     run_app_with_shutdown(
-        code_routes,
+        Handlers { routes: code_routes, named },
         config_path,
         site_dir,
         on_shutdown,
@@ -902,6 +966,7 @@ fn run_app_global<G: Send + Sync + 'static>(
 /// Run with per-thread state only (no global).
 fn run_app_thread_state<T: Any + Send + 'static>(
     raw_routes: Vec<ThreadRawRoute<T>>,
+    raw_named: Vec<ThreadRawNamed<T>>,
     init_thread: Arc<dyn Fn(&Map<String, Value>, &()) -> Result<T> + Send + Sync>,
     destroy_thread: Option<Arc<dyn Fn(T) + Send + Sync>>,
     renderer: Arc<dyn RendererFactory>,
@@ -956,10 +1021,20 @@ fn run_app_thread_state<T: Any + Send + 'static>(
         })
         .collect();
 
+    let named: Vec<NamedHandler> = raw_named
+        .into_iter()
+        .map(|(name, handler)| {
+            let h: BoxHandler = Box::new(move |req: &Request| {
+                with_thread_state::<T, _>(|t| handler(req, t))
+            });
+            (name, Arc::new(h))
+        })
+        .collect();
+
     let on_thread_exit: Arc<dyn Fn() + Send + Sync> = Arc::new(drain_thread_state);
 
     run_app_with_shutdown(
-        code_routes,
+        Handlers { routes: code_routes, named },
         config_path,
         site_dir,
         None,
@@ -972,6 +1047,7 @@ fn run_app_thread_state<T: Any + Send + 'static>(
 /// Run with global + per-thread state.
 fn run_app_state<G: Send + Sync + 'static, T: Any + Send + 'static>(
     raw_routes: Vec<StateRawRoute<G, T>>,
+    raw_named: Vec<StateRawNamed<G, T>>,
     renderer: Arc<dyn RendererFactory>,
     init_global: Arc<dyn Fn(&Map<String, Value>) -> Result<G> + Send + Sync>,
     init_thread: Arc<dyn Fn(&Map<String, Value>, &G) -> Result<T> + Send + Sync>,
@@ -1036,6 +1112,17 @@ fn run_app_state<G: Send + Sync + 'static, T: Any + Send + 'static>(
         })
         .collect();
 
+    let named: Vec<NamedHandler> = raw_named
+        .into_iter()
+        .map(|(name, handler)| {
+            let arc_g3 = arc_g.clone();
+            let h: BoxHandler = Box::new(move |req: &Request| {
+                with_thread_state::<T, _>(|t| handler(req, &*arc_g3, t))
+            });
+            (name, Arc::new(h))
+        })
+        .collect();
+
     let arc_g_destroy = arc_g.clone();
     let on_shutdown: Option<Box<dyn FnOnce() + Send>> = destroy_global.map(|dg| {
         let ag = arc_g_destroy;
@@ -1050,7 +1137,7 @@ fn run_app_state<G: Send + Sync + 'static, T: Any + Send + 'static>(
     let on_thread_exit: Arc<dyn Fn() + Send + Sync> = Arc::new(drain_thread_state);
 
     run_app_with_shutdown(
-        code_routes,
+        Handlers { routes: code_routes, named },
         config_path,
         site_dir,
         on_shutdown,
@@ -1206,9 +1293,23 @@ pub fn is_shutdown() -> bool {
 /// Handler function entries: (pattern, method, handler).
 type CodeRoute = (String, RouteMethod, Arc<BoxHandler>);
 
+/// A handler registered by name rather than bound to a pattern: (name, handler).
+type NamedHandler = (String, Arc<BoxHandler>);
+
+/// Everything a service supplies in code: handlers bound to a pattern at the
+/// call site, and handlers bound to a name for config to route to.
+///
+/// One argument rather than two because they are one thing, the set of code a
+/// config can reach, and because every runner threads them to the same place.
+struct Handlers {
+    routes: Vec<CodeRoute>,
+    named: Vec<NamedHandler>,
+}
+
 /// App with no user state.
 pub struct App {
     routes: Vec<CodeRoute>,
+    named: Vec<NamedHandler>,
     renderer: Arc<dyn RendererFactory>,
 }
 
@@ -1227,7 +1328,44 @@ fn default_renderer() -> Arc<dyn RendererFactory> {
 
 impl App {
     pub fn new() -> Self {
-        Self { routes: vec![], renderer: default_renderer() }
+        Self { routes: vec![], named: vec![], renderer: default_renderer() }
+    }
+
+    /// Register a handler under a name, for config to route to.
+    ///
+    /// `route_get("/health", f)` binds code to a path at the call site, so the
+    /// set of routes is fixed for the life of the process and a config reload
+    /// cannot add one. That is correct for a service whose routes are part of
+    /// its code, and wrong for one whose routes are part of its deployment: a
+    /// static file server gains an asset tree by being told about a directory,
+    /// not by being recompiled.
+    ///
+    /// This splits the binding in two along the line where the change actually
+    /// falls. The handler is code and is registered here, once. The route is
+    /// config:
+    ///
+    /// ```toml
+    /// [[route]]
+    /// path = "/assets/{*relpath}"
+    /// handler = "files"
+    /// root = "assets/"
+    /// ```
+    ///
+    /// Config routes are recompiled on every reload, so adding, changing or
+    /// removing one of these takes effect without a restart, and the handler
+    /// reads `root` through `Request::route_setting`. A route naming a handler
+    /// that was never registered is a hard error: startup exits 2 and a reload
+    /// is refused with the previous routes left serving.
+    pub fn handler(
+        mut self,
+        name: &str,
+        handler: impl Fn(&Request) -> Result<Response> + Send + Sync + 'static,
+    ) -> Self {
+        self.named.push((
+            name.to_string(),
+            Arc::new(Box::new(handler) as BoxHandler),
+        ));
+        self
     }
 
     /// Use a renderer other than the default.
@@ -1303,7 +1441,7 @@ impl App {
     }
 
     pub fn run(self) -> Result<()> {
-        run_app(self.routes, self.renderer)
+        run_app(self.routes, self.named, self.renderer)
     }
 }
 
@@ -1320,8 +1458,12 @@ impl Default for App {
 // Raw stateful route (Global-only): stores the handler before G is known.
 type GlobalRawRoute<G> = (String, RouteMethod, Arc<dyn Fn(&Request, &G) -> Result<Response> + Send + Sync>);
 
+// The same, bound to a name rather than to a pattern. See `App::handler`.
+type GlobalRawNamed<G> = (String, Arc<dyn Fn(&Request, &G) -> Result<Response> + Send + Sync>);
+
 pub struct AppWithGlobal<G: Send + Sync + 'static> {
     raw_routes: Vec<GlobalRawRoute<G>>,
+    raw_named: Vec<GlobalRawNamed<G>>,
     init_global: Arc<dyn Fn(&Map<String, Value>) -> Result<G> + Send + Sync>,
     destroy_global: Option<Arc<dyn Fn(G) + Send + Sync>>,
     renderer: Arc<dyn RendererFactory>,
@@ -1330,6 +1472,17 @@ pub struct AppWithGlobal<G: Send + Sync + 'static> {
 impl<G: Send + Sync + 'static> AppWithGlobal<G> {
     pub fn on_destroy(mut self, f: impl Fn(G) + Send + Sync + 'static) -> Self {
         self.destroy_global = Some(Arc::new(f));
+        self
+    }
+
+    /// Register a handler under a name, for config to route to.
+    /// See `App::handler`.
+    pub fn handler(
+        mut self,
+        name: &str,
+        handler: impl Fn(&Request, &G) -> Result<Response> + Send + Sync + 'static,
+    ) -> Self {
+        self.raw_named.push((name.to_string(), Arc::new(handler)));
         self
     }
 
@@ -1404,6 +1557,7 @@ impl<G: Send + Sync + 'static> AppWithGlobal<G> {
     pub fn run(self) -> Result<()> {
         run_app_global(
             self.raw_routes,
+            self.raw_named,
             self.init_global,
             self.destroy_global,
             self.renderer,
@@ -1417,6 +1571,7 @@ impl App {
     ) -> AppWithGlobal<G> {
         AppWithGlobal {
             raw_routes: vec![],
+            raw_named: vec![],
             init_global: Arc::new(init_global),
             destroy_global: None,
             renderer: default_renderer(),
@@ -1428,6 +1583,7 @@ impl App {
     ) -> AppWithThreadState<T> {
         AppWithThreadState {
             raw_routes: vec![],
+            raw_named: vec![],
             init_thread: Arc::new(init_thread),
             destroy_thread: None,
             renderer: default_renderer(),
@@ -1440,6 +1596,7 @@ impl App {
     ) -> AppWithState<G, T> {
         AppWithState {
             raw_routes: vec![],
+            raw_named: vec![],
             init_global: Arc::new(init_global),
             init_thread: Arc::new(init_thread),
             destroy_thread: None,
@@ -1456,8 +1613,12 @@ impl App {
 // Raw stateful route (ThreadLocal): stores the handler before config/TLS known.
 type ThreadRawRoute<T> = (String, RouteMethod, Arc<dyn Fn(&Request, &mut T) -> Result<Response> + Send + Sync>);
 
+// The same, bound to a name rather than to a pattern. See `App::handler`.
+type ThreadRawNamed<T> = (String, Arc<dyn Fn(&Request, &mut T) -> Result<Response> + Send + Sync>);
+
 pub struct AppWithThreadState<T: Any + Send + 'static> {
     raw_routes: Vec<ThreadRawRoute<T>>,
+    raw_named: Vec<ThreadRawNamed<T>>,
     init_thread: Arc<dyn Fn(&Map<String, Value>, &()) -> Result<T> + Send + Sync>,
     destroy_thread: Option<Arc<dyn Fn(T) + Send + Sync>>,
     renderer: Arc<dyn RendererFactory>,
@@ -1466,6 +1627,20 @@ pub struct AppWithThreadState<T: Any + Send + 'static> {
 impl<T: Any + Send + 'static> AppWithThreadState<T> {
     pub fn on_destroy_thread(mut self, f: impl Fn(T) + Send + Sync + 'static) -> Self {
         self.destroy_thread = Some(Arc::new(f));
+        self
+    }
+
+    /// Register a handler under a name, for config to route to.
+    /// See `App::handler`.
+    pub fn handler(
+        mut self,
+        name: &str,
+        handler: impl Fn(&Request, &(), &mut T) -> Result<Response> + Send + Sync + 'static,
+    ) -> Self {
+        self.raw_named.push((
+            name.to_string(),
+            Arc::new(move |req: &Request, t: &mut T| handler(req, &(), t)),
+        ));
         self
     }
 
@@ -1536,6 +1711,7 @@ impl<T: Any + Send + 'static> AppWithThreadState<T> {
     pub fn run(self) -> Result<()> {
         run_app_thread_state(
             self.raw_routes,
+            self.raw_named,
             self.init_thread,
             self.destroy_thread,
             self.renderer,
@@ -1554,8 +1730,15 @@ type StateRawRoute<G, T> = (
     Arc<dyn Fn(&Request, &G, &mut T) -> Result<Response> + Send + Sync>,
 );
 
+// The same, bound to a name rather than to a pattern. See `App::handler`.
+type StateRawNamed<G, T> = (
+    String,
+    Arc<dyn Fn(&Request, &G, &mut T) -> Result<Response> + Send + Sync>,
+);
+
 pub struct AppWithState<G: Send + Sync + 'static, T: Any + Send + 'static> {
     raw_routes: Vec<StateRawRoute<G, T>>,
+    raw_named: Vec<StateRawNamed<G, T>>,
     init_global: Arc<dyn Fn(&Map<String, Value>) -> Result<G> + Send + Sync>,
     init_thread: Arc<dyn Fn(&Map<String, Value>, &G) -> Result<T> + Send + Sync>,
     destroy_thread: Option<Arc<dyn Fn(T) + Send + Sync>>,
@@ -1571,6 +1754,17 @@ impl<G: Send + Sync + 'static, T: Any + Send + 'static> AppWithState<G, T> {
 
     pub fn on_destroy(mut self, f: impl Fn(G) + Send + Sync + 'static) -> Self {
         self.destroy_global = Some(Arc::new(f));
+        self
+    }
+
+    /// Register a handler under a name, for config to route to.
+    /// See `App::handler`.
+    pub fn handler(
+        mut self,
+        name: &str,
+        handler: impl Fn(&Request, &G, &mut T) -> Result<Response> + Send + Sync + 'static,
+    ) -> Self {
+        self.raw_named.push((name.to_string(), Arc::new(handler)));
         self
     }
 
@@ -1641,6 +1835,7 @@ impl<G: Send + Sync + 'static, T: Any + Send + 'static> AppWithState<G, T> {
     pub fn run(self) -> Result<()> {
         run_app_state(
             self.raw_routes,
+            self.raw_named,
             self.renderer,
             self.init_global,
             self.init_thread,
@@ -1659,7 +1854,52 @@ fn file_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(path).ok()?.modified().ok()
 }
 
-pub fn run_app(code_routes: Vec<CodeRoute>, renderer: Arc<dyn RendererFactory>) -> Result<()> {
+/// Config routes naming a handler that was never registered.
+///
+/// Returned rather than logged so the two callers can answer differently in
+/// the way each of them should: startup exits 2, and a reload refuses the new
+/// state and keeps serving the old one.
+///
+/// This is deliberately fatal rather than a per-route warning. A misplaced
+/// wildcard is narrowed and warned about because the narrower reading is still
+/// a defensible route; a handler name with no code behind it has no reading at
+/// all, and the alternatives are a route that 404s or one that 500s while the
+/// config plainly says it should serve. Refusing the whole config keeps the
+/// previous one serving, which is the outcome an operator can recover from.
+fn unknown_handlers(
+    routes: &[CompiledRoute],
+    named: &HashMap<String, Arc<BoxHandler>>,
+) -> Vec<(String, String)> {
+    let mut missing = Vec::new();
+    for route in routes {
+        if let Some(name) = &route.handler {
+            if !named.contains_key(name) {
+                missing.push((route.pattern.clone(), name.clone()));
+            }
+        }
+    }
+    missing
+}
+
+/// Render `unknown_handlers`' answer as one line an operator can act on.
+fn describe_unknown(missing: &[(String, String)], registered: &[String]) -> String {
+    let named: Vec<String> = missing
+        .iter()
+        .map(|(pattern, handler)| format!("{pattern} -> `{handler}`"))
+        .collect();
+    let known = if registered.is_empty() {
+        "none are registered".to_string()
+    } else {
+        format!("registered: {}", registered.join(", "))
+    };
+    format!("{} ({known})", named.join("; "))
+}
+
+pub fn run_app(
+    code_routes: Vec<CodeRoute>,
+    named: Vec<NamedHandler>,
+    renderer: Arc<dyn RendererFactory>,
+) -> Result<()> {
     // Block SIGTERM and SIGINT before anything else, logging included. Apps
     // built on this framework have a `main` that does nothing but call here,
     // so this is the process's first statement in practice. The mask is
@@ -1680,7 +1920,7 @@ pub fn run_app(code_routes: Vec<CodeRoute>, renderer: Arc<dyn RendererFactory>) 
         .find(|w| w[0] == "--log-level")
         .map(|w| w[1].clone());
     run_app_with_shutdown(
-        code_routes,
+        Handlers { routes: code_routes, named },
         config_path,
         site_dir,
         None,
@@ -1691,7 +1931,7 @@ pub fn run_app(code_routes: Vec<CodeRoute>, renderer: Arc<dyn RendererFactory>) 
 }
 
 fn run_app_with_shutdown(
-    code_routes: Vec<CodeRoute>,
+    handlers: Handlers,
     config_path: PathBuf,
     site_dir: PathBuf,
     on_shutdown: Option<Box<dyn FnOnce() + Send>>,
@@ -1718,10 +1958,19 @@ fn run_app_with_shutdown(
     let socket_path = crate::socket_path_from_config(&config_path);
 
     // Build framework state.
+    let Handlers { routes: code_routes, named } = handlers;
     let code_route_signatures: Vec<(String, RouteMethod)> = code_routes
         .iter()
         .map(|(p, m, _)| (p.clone(), m.clone()))
         .collect();
+
+    // Handlers registered by name, for config-declared routes to dispatch to.
+    // Built before the state so a route naming a handler nothing provides is
+    // caught at startup rather than by the first request that matches it.
+    let named_handlers: Arc<HashMap<String, Arc<BoxHandler>>> =
+        Arc::new(named.into_iter().collect());
+    let mut registered_names: Vec<String> = named_handlers.keys().cloned().collect();
+    registered_names.sort();
 
     let framework_state =
         FrameworkState::build(config, site_dir.clone(), &code_route_signatures, &*renderer)
@@ -1729,6 +1978,15 @@ fn run_app_with_shutdown(
                 eprintln!("Startup error: {e:#}");
                 std::process::exit(2);
             });
+
+    let missing = unknown_handlers(&framework_state.routes, &named_handlers);
+    if !missing.is_empty() {
+        eprintln!(
+            "Config error: route names an unregistered handler: {}",
+            describe_unknown(&missing, &registered_names)
+        );
+        std::process::exit(2);
+    }
 
     // Validate flash_secret presence at startup (exit 2 if feature enabled but key absent).
     #[cfg(feature = "flash")]
@@ -1891,9 +2149,29 @@ fn run_app_with_shutdown(
                             error!("Reload failed (template/state error): {e}");
                         }
                         Ok(new_state) => {
-                            *fs.write().unwrap() = new_state;
-                            let elapsed = reload_start.elapsed().as_millis();
-                            info!(elapsed_ms = elapsed, "Reload complete");
+                            // The new config may have added a route naming a
+                            // handler this binary does not have. Refuse the
+                            // whole state rather than swap in one that cannot
+                            // serve a route it advertises: the previous routes
+                            // keep serving, which is what makes a typo in a
+                            // live config recoverable.
+                            let missing =
+                                unknown_handlers(&new_state.routes, &named_handlers);
+                            if !missing.is_empty() {
+                                error!(
+                                    "Reload refused, route names an unregistered handler: {}",
+                                    describe_unknown(&missing, &registered_names)
+                                );
+                            } else {
+                                let routes = new_state.routes.len();
+                                *fs.write().unwrap() = new_state;
+                                let elapsed = reload_start.elapsed().as_millis();
+                                info!(
+                                    elapsed_ms = elapsed,
+                                    routes = routes,
+                                    "Reload complete"
+                                );
+                            }
                         }
                     }
                 }
@@ -1913,9 +2191,10 @@ fn run_app_with_shutdown(
 
                 let fs = fs.clone();
                 let code_handlers = code_handlers.clone();
+                let named_handlers = named_handlers.clone();
 
                 match pool.try_submit(stream, move |mut s| {
-                    handle_connection(&mut s, &*fs, &code_handlers);
+                    handle_connection(&mut s, &*fs, &code_handlers, &named_handlers);
                 }) {
                     Ok(_) => {}
                     Err(mut s) => {
@@ -1955,10 +2234,11 @@ fn handle_connection(
     stream: &mut UnixStream,
     fs: &std::sync::RwLock<FrameworkState>,
     code_handlers: &HashMap<String, Arc<BoxHandler>>,
+    named_handlers: &HashMap<String, Arc<BoxHandler>>,
 ) {
     let served: std::result::Result<(), std::io::Error> =
         crate::server::serve_connection(stream, |raw, resp| {
-            handle_request(raw, resp, fs, code_handlers);
+            handle_request(raw, resp, fs, code_handlers, named_handlers);
             Ok(())
         });
     if let Err(e) = served {
@@ -1971,6 +2251,7 @@ fn handle_request<W: std::io::Write>(
     stream: &mut crate::h1::Responder<'_, W>,
     fs: &std::sync::RwLock<FrameworkState>,
     code_handlers: &HashMap<String, Arc<BoxHandler>>,
+    named_handlers: &HashMap<String, Arc<BoxHandler>>,
 ) {
     let start = std::time::Instant::now();
 
@@ -2018,7 +2299,8 @@ fn handle_request<W: std::io::Write>(
                 csrf_token_for_cookie = dict.get("csrf_token").and_then(|v| v.as_str()).map(str::to_string);
             }
 
-            let req = Request::new(raw.clone(), dict.clone(), site_dir.clone());
+            let req = Request::new(raw.clone(), dict.clone(), site_dir.clone())
+                .with_route(&route);
 
             // Dispatch to code handler or template render.
             // A code handler is only used when the matched route is a code route
@@ -2027,7 +2309,28 @@ fn handle_request<W: std::io::Write>(
             // — this ensures GET routes handled by config are not shadowed by POST
             // code handlers registered on the same path.
             let handler_key = format!("{}:{}", route.pattern, route_method_key(&route.method));
-            let mut resp = if route.template.is_none() {
+            let mut resp = if let Some(name) = &route.handler {
+                // A config-declared route naming a registered handler. The
+                // lookup cannot miss: `unknown_handlers` refuses a state whose
+                // routes name anything absent, at startup and at every reload,
+                // so an absent handler here means that check was bypassed
+                // rather than that config is wrong. Answer 500 and say so,
+                // rather than 404, which would read as "no such page".
+                match named_handlers.get(name) {
+                    Some(handler) => match handler.call(&req) {
+                        Ok(r) => r,
+                        Err(e) => error_to_response(&e),
+                    },
+                    None => {
+                        error!(
+                            pattern = %route.pattern,
+                            handler = %name,
+                            "route names a handler that is not registered"
+                        );
+                        Response::status(500)
+                    }
+                }
+            } else if route.template.is_none() {
                 if let Some(handler) = code_handlers.get(&handler_key) {
                     match handler.call(&req) {
                         Ok(r) => r,
@@ -2267,6 +2570,8 @@ mod tests {
             headers: vec![],
             specificity: 3,
             last_modified: None,
+            handler: None,
+            settings: Arc::new(Map::new()),
         };
         let segs: Vec<&str> = "/blog/hello-world".split('/').filter(|s| !s.is_empty()).collect();
         let m = match_route(&segs, &route);
@@ -2289,6 +2594,8 @@ mod tests {
             headers: vec![],
             specificity: 3,
             last_modified: None,
+            handler: None,
+            settings: Arc::new(Map::new()),
         };
         let segs_ab: Vec<&str> = "/blog/a/b".split('/').filter(|s| !s.is_empty()).collect();
         let segs_b: Vec<&str> = "/blog".split('/').filter(|s| !s.is_empty()).collect();
@@ -2310,6 +2617,8 @@ mod tests {
                 headers: vec![],
                 specificity: route_specificity(&compile_pattern("/blog/{stem}")),
                 last_modified: None,
+                handler: None,
+                settings: Arc::new(Map::new()),
             },
             CompiledRoute {
                 pattern: "/blog/about".to_string(),
@@ -2322,6 +2631,8 @@ mod tests {
                 headers: vec![],
                 specificity: route_specificity(&compile_pattern("/blog/about")),
                 last_modified: None,
+                handler: None,
+                settings: Arc::new(Map::new()),
             },
         ];
 
@@ -2749,6 +3060,8 @@ mod wildcard_route_tests {
             cache: String::new(),
             headers: Vec::new(),
             last_modified: None,
+            handler: None,
+            settings: Arc::new(Map::new()),
         }
     }
 
@@ -2814,6 +3127,85 @@ mod wildcard_route_tests {
         assert!(par > wild, "param {par} should beat wildcard {wild}");
     }
 
+    /// The matcher is not the wire. Every test above stops at `match_route`,
+    /// and the capture still has to survive `build_dict` to reach a handler.
+    ///
+    /// Step 4 validates every path param with `allow_slash = false`, on a
+    /// premise stated in `request::validate_path_param`'s own doc comment:
+    /// "this crate's router has no catch-all support ... so a parameter here
+    /// captures exactly one path segment and can never contain a slash". That
+    /// was true when it was written and `Segment::Wildcard` made it false, so
+    /// the one capture that is *defined* to hold slashes was answered 400.
+    #[test]
+    fn a_wildcard_capture_survives_dict_building() {
+        use std::io::Write;
+
+        let site_dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(site_dir.path().join("templates")).unwrap();
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "[[route]]\npath = \"/assets/{{*relpath}}\"\ntemplate = \"x.html\"").unwrap();
+
+        let cfg = crate::config::load(f.path(), site_dir.path()).unwrap();
+        let state = FrameworkState::build(
+            cfg,
+            site_dir.path().to_path_buf(),
+            &[],
+            &*default_renderer(),
+        )
+        .unwrap();
+
+        let raw = RawRequest {
+            version: "HTTP/1.1".to_string(),
+            method: "GET".to_string(),
+            path: "/assets/css/main.css".to_string(),
+            query: None,
+            headers: vec![],
+            body: vec![],
+        };
+        let (route, params) =
+            find_route(raw.path(), raw.method(), &state.routes).expect("route should match");
+
+        let dict = state
+            .build_dict(&raw, route, &params)
+            .expect("a wildcard capture is not a malformed request");
+        assert_eq!(dict["relpath"].as_str().unwrap(), "css/main.css");
+    }
+
+    /// The other half of the fix: a wildcard is allowed the separator, and
+    /// nothing else. Traversal still has to be refused, or the capability that
+    /// exists to serve a directory tree is a way out of it.
+    #[test]
+    fn a_wildcard_capture_still_refuses_traversal() {
+        use std::io::Write;
+
+        let site_dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(site_dir.path().join("templates")).unwrap();
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "[[route]]\npath = \"/assets/{{*relpath}}\"\ntemplate = \"x.html\"").unwrap();
+        let cfg = crate::config::load(f.path(), site_dir.path()).unwrap();
+        let state =
+            FrameworkState::build(cfg, site_dir.path().to_path_buf(), &[], &*default_renderer())
+                .unwrap();
+
+        // `..` never survives the matcher, so drive the check directly: these
+        // are the values that would reach step 4 if it ever did.
+        let route = &state.routes[0];
+        assert!(route.is_wildcard_param("relpath"));
+        assert!(!route.is_wildcard_param("stem"));
+
+        for bad in ["../etc/passwd", "css/../../etc/passwd", "a b/c", "/leading", "trailing/"] {
+            assert!(
+                validate_wildcard_param("relpath", bad).is_err(),
+                "{bad} should be refused"
+            );
+        }
+        assert!(validate_wildcard_param("relpath", "css/main.css").is_ok());
+
+        // And an ordinary parameter on the same route is unchanged: still one
+        // segment, still no slash.
+        assert!(validate_path_param("stem", "a/b").is_err());
+    }
+
     /// A wildcard that is not last has no single correct split, so it is
     /// narrowed to an ordinary parameter rather than taking the service down.
     #[test]
@@ -2823,5 +3215,209 @@ mod wildcard_route_tests {
         // Which means it behaves as one segment, not as a greedy match.
         assert!(m("/a/{*rest}/c", "/a/b/x/c").is_none());
         assert!(m("/a/{*rest}/c", "/a/b/c").is_some());
+    }
+}
+
+#[cfg(test)]
+mod config_route_handler_tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Build a `FrameworkState` from TOML written to a temporary file, the way
+    /// the service does at startup and again at every reload.
+    fn state_from(toml: &str) -> (FrameworkState, tempfile::TempDir) {
+        let site_dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(site_dir.path().join("templates")).unwrap();
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(f, "{toml}").unwrap();
+        let cfg = crate::config::load(f.path(), site_dir.path()).unwrap();
+        let state =
+            FrameworkState::build(cfg, site_dir.path().to_path_buf(), &[], &*default_renderer())
+                .unwrap();
+        (state, site_dir)
+    }
+
+    fn registry(names: &[&str]) -> HashMap<String, Arc<BoxHandler>> {
+        names
+            .iter()
+            .map(|n| {
+                let h: BoxHandler = Box::new(|_req: &Request| Ok(Response::text("ok")));
+                (n.to_string(), Arc::new(h))
+            })
+            .collect()
+    }
+
+    const FILES: &str = r#"
+[[route]]
+path = "/assets/{*relpath}"
+handler = "files"
+root = "assets/"
+tail = false
+"#;
+
+    /// The binding config declares and code provides.
+    #[test]
+    fn a_config_route_can_name_a_handler() {
+        let (state, _d) = state_from(FILES);
+        let route = &state.routes[0];
+        assert_eq!(route.handler.as_deref(), Some("files"));
+        assert_eq!(route.pattern, "/assets/{*relpath}");
+    }
+
+    /// The point of the whole change, at the level the state owns it: the route
+    /// table is rebuilt from config, so a config that gained a route produces a
+    /// state that serves it, with the same handlers and no restart.
+    ///
+    /// `App` registers code routes once at startup. That is correct for a route
+    /// that is part of the program and wrong for one that is part of the
+    /// deployment, and it was the last thing standing between `m6-file` and
+    /// `App`: its `handle_reload` rebuilds its route table today, so migrating
+    /// as things stood would have quietly removed the ability to add an asset
+    /// tree without restarting the service.
+    #[test]
+    fn a_reload_adds_a_route_that_the_previous_state_did_not_have() {
+        use std::sync::RwLock;
+
+        let (state1, _d) = state_from(FILES);
+        let fs = Arc::new(RwLock::new(state1));
+
+        // Before: nothing answers under /downloads.
+        assert!(find_route("/downloads/report.pdf", "GET", &fs.read().unwrap().routes).is_none());
+
+        let (state2, _d2) = state_from(&format!(
+            "{FILES}\n[[route]]\npath = \"/downloads/{{*relpath}}\"\nhandler = \"files\"\nroot = \"files/\"\n"
+        ));
+        *fs.write().unwrap() = state2;
+
+        // After: it does, and it is bound to the same handler the binary
+        // already had.
+        let guard = fs.read().unwrap();
+        let (route, params) = find_route("/downloads/report.pdf", "GET", &guard.routes)
+            .expect("the reloaded state should serve the new route");
+        assert_eq!(route.handler.as_deref(), Some("files"));
+        assert_eq!(route.settings.get("root").unwrap().as_str().unwrap(), "files/");
+        assert_eq!(params[0].1, "report.pdf");
+
+        // And the route that was already there is untouched.
+        assert!(find_route("/assets/css/main.css", "GET", &guard.routes).is_some());
+    }
+
+    /// A handler name with no code behind it has no defensible reading, so it
+    /// is refused rather than narrowed. The caller decides what that means:
+    /// exit 2 at startup, and at reload a refusal that leaves the previous
+    /// routes serving.
+    #[test]
+    fn a_route_naming_an_unregistered_handler_is_refused() {
+        let (state, _d) = state_from(FILES);
+
+        let missing = unknown_handlers(&state.routes, &registry(&["uploads"]));
+        assert_eq!(missing, vec![("/assets/{*relpath}".to_string(), "files".to_string())]);
+
+        // The operator needs to be told which route, which name, and what was
+        // available. A bare "unknown handler" sends them reading config by eye.
+        let described = describe_unknown(&missing, &["uploads".to_string()]);
+        assert!(described.contains("/assets/{*relpath}"), "{described}");
+        assert!(described.contains("`files`"), "{described}");
+        assert!(described.contains("uploads"), "{described}");
+
+        // Registered, and there is nothing to refuse.
+        assert!(unknown_handlers(&state.routes, &registry(&["files"])).is_empty());
+    }
+
+    /// A template route is unaffected by any of this: it names no handler and
+    /// is not subject to the check.
+    #[test]
+    fn a_template_route_names_no_handler() {
+        let (state, _d) = state_from("[[route]]\npath = \"/\"\ntemplate = \"index.html\"\n");
+        assert!(state.routes[0].handler.is_none());
+        assert!(unknown_handlers(&state.routes, &HashMap::new()).is_empty());
+    }
+
+    /// Core does not know what `root` or `tail` mean, and does not need to.
+    /// Keys it does not define are kept verbatim for the handler; keys it does
+    /// define are consumed, not duplicated into the bag.
+    #[test]
+    fn keys_core_does_not_define_are_kept_for_the_handler() {
+        let (state, _d) = state_from(FILES);
+        let s = &state.routes[0].settings;
+        assert_eq!(s.get("root").unwrap().as_str().unwrap(), "assets/");
+        assert!(!s.get("tail").unwrap().as_bool().unwrap());
+        for consumed in ["path", "handler", "template", "cache", "status", "methods", "headers"] {
+            assert!(s.get(consumed).is_none(), "{consumed} is core's, not the handler's");
+        }
+    }
+
+    /// A handler computes its answer; a template renders a document from files
+    /// on disk. Letting the first inherit the second's `public` default would
+    /// put dynamic output in a shared cache by omission.
+    #[test]
+    fn a_handler_route_defaults_to_no_store_and_an_explicit_cache_wins() {
+        let (state, _d) = state_from(FILES);
+        assert_eq!(state.routes[0].cache, "no-store");
+
+        let (explicit, _d2) = state_from(
+            "[[route]]\npath = \"/a/{*r}\"\nhandler = \"files\"\ncache = \"public, max-age=60\"\n",
+        );
+        assert_eq!(explicit.routes[0].cache, "public, max-age=60");
+
+        let (template, _d3) = state_from("[[route]]\npath = \"/\"\ntemplate = \"index.html\"\n");
+        assert_eq!(template.routes[0].cache, "public");
+    }
+
+    /// `Last-Modified` is derived from templates and params files, so it
+    /// belongs to routes that render from them. The loop that computes it used
+    /// to run over every route, including the code routes its own comment said
+    /// were skipped, and hand a handler the newest template's mtime as the date
+    /// of an answer computed per request.
+    #[test]
+    fn a_handler_route_carries_no_last_modified() {
+        let (state, _d) = state_from(FILES);
+        assert!(state.routes[0].last_modified.is_none());
+    }
+
+    /// The handler's side of the contract: it reads its own route's config
+    /// through the request, which is what lets a service keep a per-route
+    /// vocabulary core knows nothing about.
+    #[test]
+    fn a_handler_reads_its_routes_settings_from_the_request() {
+        let (state, dir) = state_from(FILES);
+        let raw = RawRequest {
+            version: "HTTP/1.1".to_string(),
+            method: "GET".to_string(),
+            path: "/assets/css/main.css".to_string(),
+            query: None,
+            headers: vec![],
+            body: vec![],
+        };
+        let req = Request::new(raw, Map::new(), dir.path().to_path_buf())
+            .with_route(&state.routes[0]);
+
+        assert_eq!(req.route_pattern(), Some("/assets/{*relpath}"));
+        assert_eq!(req.route_str("root"), Some("assets/"));
+        assert!(!req.route_bool("tail", true), "tail = false in config");
+        assert!(req.route_bool("absent", true), "an absent key takes the default");
+        assert_eq!(req.route_str("nothing"), None);
+    }
+
+    /// A request built without a route has no settings, rather than a wrong
+    /// answer: every accessor says "absent" and the defaults apply.
+    #[test]
+    fn a_request_with_no_route_reports_no_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let req = Request::new(
+            RawRequest {
+                version: "HTTP/1.1".to_string(),
+                method: "GET".to_string(),
+                path: "/".to_string(),
+                query: None,
+                headers: vec![],
+                body: vec![],
+            },
+            Map::new(),
+            dir.path().to_path_buf(),
+        );
+        assert_eq!(req.route_pattern(), None);
+        assert_eq!(req.route_str("root"), None);
+        assert!(req.route_bool("tail", true));
     }
 }

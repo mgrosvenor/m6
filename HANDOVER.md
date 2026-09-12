@@ -2,6 +2,32 @@
 
 State of play for the next session. Written 2026-09-11, updated 2026-09-12.
 
+> ## Read first, 2026-09-12 (latest session)
+>
+> **`App` has config-driven routes now, which was the owner's
+> *"dynamicly reload the file list"*.** A handler is registered once by name
+> (`App::handler("files", f)`), a route names it in config
+> (`handler = "files"`), and config routes are rebuilt on every reload, so
+> adding an asset tree is a config edit rather than a restart. Keys core does
+> not define (`root`, `tail`) are kept for the handler to read. An unregistered
+> handler name is fatal: exit 2 at startup, and a reload refused with the
+> previous routes still serving. Detail in `CONSOLIDATION-TODO.md` §6.
+> **m6-file is not migrated yet**; that is the next piece of code.
+>
+> **Wildcard routing was marked DONE and did not work.** Found doing the above.
+> Any `{*name}` capture spanning more than one segment was answered **400**,
+> which is every use it exists for: `build_dict` validated it with
+> `allow_slash = false`, on a premise that was true when written and that
+> `Segment::Wildcard` made false. All six of its tests stopped at the matcher.
+> Fixed, with the two halves separated as `validate_wildcard_param`, and
+> traversal still refused. **Lesson 30 again: the matcher is not the wire.**
+>
+> **Code routes were emitting a `Last-Modified` they had no claim to**, the
+> newest template's mtime for an answer computed per request. The comment at
+> the emit site already said code routes were skipped; the loop did not skip
+> them. Fixed.
+>
+
 > ## Read first, 2026-09-12 (late session)
 >
 > **The scope note on §3b was wrong and the owner corrected it twice. Read the
@@ -113,9 +139,11 @@ applied them:
   was previously refused on one node and served on two, which is exactly what
   the reconciliation was for.
 
-- **1002 workspace tests pass at default features, verified on Linux via
-  `deploy/run-tests.sh m6` on 2026-09-12. Zero warnings**, release and test
-  builds, same count as macOS.
+- **1013 workspace tests pass at default features, verified on Linux via
+  `deploy/run-tests.sh m6` on 2026-09-12 (latest session). Zero warnings**,
+  release and test builds, clippy ok, same count as macOS so nothing is cfg'd
+  out. The eleven over the previous 1002 are the wildcard and
+  config-route-handler tests.
 - **Clippy is a gate now**, on the owner's instruction: `tools/clippy.sh`,
   wired into `check.sh` (step 2, so the pre-push hook covers it) and into the
   Linux gate before prod. It is a **ratchet**, not `-D warnings`: the count may
@@ -247,14 +275,19 @@ Services: `m6-http` (edge/proxy), `m6-file`, `m6-html`, `m6-auth-server`,
      on the socket and that is now `[server] socket_mode`. It is **not running
      in production** (the origin's `site.toml` has its backend commented out),
      so the risk is low.
-   - **`m6-file` onto `App`: one decision away, and the owner has made it.**
+   - **`m6-file` onto `App`: unblocked, and the blocker is now built.**
      Wildcard routing and streaming both landed, and streaming was never a
-     blocker anyway because m6-file buffers everything. What is left is that
-     **`App` registers code routes once at startup, so a config reload cannot
-     add or change one**, where m6-file's `handle_reload` rebuilds its table
-     today. The owner's instruction on 2026-09-12 was to make it dynamic:
-     *"And dynamicly reload the file list."* **Not started.** That is the next
-     piece of code to write.
+     blocker anyway because m6-file buffers everything. The last real
+     difference was that **`App` registered code routes once at startup, so a
+     config reload could not add or change one**, where m6-file's
+     `handle_reload` rebuilds its table. The owner's instruction on 2026-09-12
+     was *"And dynamicly reload the file list."* **Core side DONE** the same
+     day: `App::handler(name, f)` plus `handler = "..."` on `[[route]]`, with
+     per-route settings for `root` and `tail`, in `CONSOLIDATION-TODO.md` §6.
+     **The migration itself is the next piece of code to write**, and it is
+     what will carry the end-to-end reload test the core change does not have:
+     write the config, let the watcher fire, get 200 on a path that did not
+     exist a moment ago.
 
 2b. **Finish header to dict.** `FrameworkState::build_dict` is private and is
    where the real knowledge lives: twelve ordered steps, and the ordering is
@@ -925,3 +958,26 @@ New 2026-09-12:
     version, plus cfg-gated code that only compiles there), and the
     unreadable-file test could not work because the box runs as **root**, which
     ignores permission bits. None of it was visible locally.
+
+
+34. **A doc comment that justifies a decision by naming a premise becomes a lie
+    the day the premise changes, and nothing anywhere checks it.**
+    `validate_path_param` said, correctly and at length, that every parameter
+    is validated with `allow_slash = false` *because* "this crate's router has
+    no catch-all support ... a parameter here captures exactly one path segment
+    and can never contain a slash". Adding `Segment::Wildcard` falsified that
+    sentence and left the code it was explaining in place, so the one capture
+    defined to hold slashes was answered 400 by the validator. The comment was
+    the best possible warning and it was in the one file the change did not
+    touch. **When adding a capability, grep for the assumption it invalidates**,
+    not just for the code it calls: `allow_slash`, `exact segment count` and
+    `can never` were each one search away. Same family as lesson 21, where the
+    caution lived next to the code it guarded and was read and not retained.
+35. **Two of this session's three findings were in work already marked DONE.**
+    Wildcard routing shipped with six green tests that all stopped at the
+    matcher, and the `Last-Modified` loop contradicted the comment at its own
+    emit site. Neither was found by reading the ledger, which said both were
+    finished; both were found by using the feature for the next thing. **The
+    cheapest audit of a completed item is the first real consumer**, and until
+    there is one, "done" means "written", which is what §6's closing note now
+    says out loud about the reload chain itself.

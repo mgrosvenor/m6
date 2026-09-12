@@ -363,6 +363,29 @@ Design is settled and written up in `docs/m6-app-shape-plan.md`. Not scheduled.
       Specificity orders literal > param > wildcard, so adding a catch-all to a
       config cannot quietly capture the traffic of the exact routes beside it.
       `App`.
+
+      **It did not work end to end, and this row said it did.** Found and fixed
+      2026-09-12 (later session). A capture spanning more than one segment was
+      answered **400**, which is every use the feature exists for:
+      `/assets/css/main.css` produced `relpath = "css/main.css"`, and step 4 of
+      `build_dict` validates every path param with `allow_slash = false`, so
+      the slash failed validation before any handler saw it.
+      `request::validate_path_param` even carried the reason in its own doc
+      comment: "this crate's router has no catch-all support ... a parameter
+      here captures exactly one path segment and can never contain a slash."
+      That was true when it was written and `Segment::Wildcard` made it false.
+      The fix is `validate_wildcard_param` plus `CompiledRoute::is_wildcard_param`,
+      so which validation applies is decided by the **route** rather than by
+      the parameter's name, which is the same mistake the old m6-render code
+      made in the other direction by exempting anything called `relpath`.
+      Traversal is still refused: `..`, a leading or trailing slash, and every
+      character outside the set are unchanged, so what a wildcard gains over an
+      ordinary parameter is the separator and nothing else.
+
+      **Why six passing tests did not catch it:** all six stop at
+      `match_route`. The matcher was right; nothing took a capture through to
+      the wire. Lesson 30 in the handover is the general form and this is
+      another instance of it.
 - [ ] **Streaming response body.** `Responder`'s three senders all take
       `&[u8]` and `Response.body` is a `Vec<u8>`, so core cannot serve a body it
       has not fully materialised.
@@ -458,13 +481,13 @@ Then, and only then, the two migrations below.
       `server::serve_connection` per connection.
 
       **Wildcard routing landed 2026-09-12, and streaming was never a blocker**
-      (it buffers everything, see above). What is left is one real difference,
-      found 2026-09-12 and not yet resolved: **`App` registers code routes once
-      at startup, so a config reload cannot add or change one.** m6-file's
-      `handle_reload` rebuilds its route table today, so migrating as things
-      stand would quietly remove the ability to add an asset route without a
-      restart. Either `App` grows config-driven routes that survive reload, or
-      that capability is dropped deliberately rather than by accident.
+      (it buffers everything, see above).
+
+      **The route-reload blocker is gone as of 2026-09-12 (later session).**
+      `App` now grows config-driven routes that survive a reload, which was the
+      owner's instruction (*"And dynamicly reload the file list."*). See §6
+      below for the shape. What remains for m6-file itself is the migration:
+      its handler, its per-route `root` and `tail`, and its own accept loop.
 - [ ] **`m6-auth-server` should be an `App` service.** It binds through
       `UnixServer` directly. **Its stated blocker is gone**: the capability it
       needed that `App` lacked was `chmod` on the socket, and that is now
@@ -484,6 +507,79 @@ Then, and only then, the two migrations below.
 
 **`m6-http` is not on this list and should not be.** It is the edge: public TCP
 and UDP, TLS, h2, h3, proxying, the cache. It is what `App` services sit behind.
+
+### 6. Config-driven routes: done 2026-09-12 (later session)
+
+**The owner's instruction was *"And dynamicly reload the file list."*** This is
+the core half of it. m6-file is not migrated yet.
+
+`App` bound every route at the call site, so the route table was fixed for the
+life of the process. That is right for a route that is part of the **program**
+and wrong for one that is part of the **deployment**: a static file server
+gains an asset tree by being told about a directory, not by being recompiled.
+
+The fix splits the binding along the line where change actually falls. A
+handler is code, registered once by name:
+
+```rust
+App::new().handler("files", serve_file).run()
+```
+
+A route is config, and config routes are already recompiled on every reload:
+
+```toml
+[[route]]
+path = "/assets/{*relpath}"
+handler = "files"
+root = "assets/"
+```
+
+So adding, changing or removing one of these takes effect without a restart,
+which is the capability m6-file would otherwise have lost on migration.
+
+- [x] `handler = "..."` on `[[route]]`, and `App::handler(name, f)`. Present on
+      all four builders (`App`, `AppWithGlobal`, `AppWithThreadState`,
+      `AppWithState`) rather than only the one with a consumer, because "the
+      sixth service never got one" is how `assert_app_lifecycle` was missed.
+- [x] **Keys core does not define are kept, not dropped.** Core does not know
+      what `root` or `tail` mean and should not; the handler reads them through
+      `Request::route_setting` / `route_str` / `route_bool`. Unknown keys were
+      previously discarded in silence, which is indistinguishable from a typo
+      being honoured. `Arc<Map>` because the matched route is cloned per
+      request.
+- [x] **An unregistered handler name is fatal, not a warning.** Startup exits 2;
+      a reload is refused and the previous routes keep serving. A misplaced
+      wildcard is narrowed because the narrower reading is still defensible; a
+      handler name with no code behind it has no reading at all, and the
+      alternatives are a route that 404s or 500s while the config plainly says
+      it should serve. The message names the route, the name, and what **was**
+      registered.
+- [x] **A handler route defaults to `no-store`**, a template route to `public`,
+      explicit `cache` wins over both. Code routes already defaulted this way;
+      letting the config-declared form inherit `public` would put dynamic
+      output in a shared cache by omission.
+
+**Two defects found doing it, neither in the thing being worked on:**
+
+1. **Wildcard routing did not work end to end.** Recorded against its own row
+   in §3b-later above. It was marked DONE and answered 400 for every capture
+   spanning more than one segment.
+2. **Code routes were getting a `Last-Modified` they had no claim to.** The
+   per-route loop ran over every route; a code route has no `params_files`, so
+   nothing skipped it and it took the newest template's mtime as the date of an
+   answer computed per request. The comment at the emit site already said
+   "skipped when the route has no honest date -- a code route", so the intent
+   was right and the loop did not match it. Now keyed on `template.is_none()`,
+   which is the honest test: the date is derived from templates and params
+   files, so it belongs to routes that render from them.
+
+**What is not proven yet.** The tests are at the level the state owns: build a
+state from config A, build another from config B, and assert the second serves
+a route the first did not. What has no test is the **whole chain against a
+running binary** — write the config, let the watcher fire, request the new path
+and get 200. That needs a binary with a named handler registered, which is
+m6-file after its migration, and it is the test to write there rather than a
+fixture binary invented for it.
 
 ### 4. Phase 7, decouple the repositories
 

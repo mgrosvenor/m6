@@ -33,11 +33,73 @@ pub struct Request {
     pub(crate) dict: Map<String, Value>,
     /// Site directory (absolute).
     pub(crate) site_dir: PathBuf,
+    /// The matched route's pattern, when one matched.
+    pub(crate) route_pattern: Option<String>,
+    /// The matched route's own config keys that core does not define.
+    ///
+    /// Empty for a route registered in code, which has no config entry of its
+    /// own, and for a request that reached a handler some other way.
+    pub(crate) route_settings: Option<std::sync::Arc<Map<String, Value>>>,
 }
 
 impl Request {
     pub fn new(raw: RawRequest, dict: Map<String, Value>, site_dir: PathBuf) -> Self {
-        Self { raw, dict, site_dir }
+        Self { raw, dict, site_dir, route_pattern: None, route_settings: None }
+    }
+
+    /// Attach the matched route, so a handler can read the config that sent
+    /// the request to it.
+    ///
+    /// Separate from `new` rather than a fourth argument because a `Request`
+    /// is legitimately built without a route in tests and in callers that
+    /// never route, and because both fields are cheap clones: the pattern is
+    /// a short string already cloned with the route, and the settings are an
+    /// `Arc`.
+    pub fn with_route(mut self, route: &crate::app::CompiledRoute) -> Self {
+        self.route_pattern = Some(route.pattern.clone());
+        self.route_settings = Some(std::sync::Arc::clone(&route.settings));
+        self
+    }
+
+    // ---------- matched route ----------
+
+    /// The pattern of the route that matched, e.g. `/assets/{*relpath}`.
+    pub fn route_pattern(&self) -> Option<&str> {
+        self.route_pattern.as_deref()
+    }
+
+    /// A key from the matched route's `[[route]]` table that core does not
+    /// define.
+    ///
+    /// This is how a handler registered with `App::handler` reads its own
+    /// per-route configuration. Core does not know what `root` means; the
+    /// handler does, and the route says it:
+    ///
+    /// ```toml
+    /// [[route]]
+    /// path = "/assets/{*relpath}"
+    /// handler = "files"
+    /// root = "assets/"
+    /// ```
+    pub fn route_setting(&self, key: &str) -> Option<&Value> {
+        self.route_settings.as_ref()?.get(key)
+    }
+
+    /// `route_setting` as a string, for the common case.
+    pub fn route_str(&self, key: &str) -> Option<&str> {
+        self.route_setting(key)?.as_str()
+    }
+
+    /// `route_setting` as a boolean, with a default for an absent key.
+    ///
+    /// A key that is present but is not a boolean returns the default and is
+    /// not silently coerced: `tail = "yes"` is a config error, and reading it
+    /// as `true` would hide it.
+    pub fn route_bool(&self, key: &str, default: bool) -> bool {
+        match self.route_setting(key) {
+            Some(Value::Bool(b)) => *b,
+            _ => default,
+        }
     }
 
     // ---------- raw HTTP access ----------
@@ -482,8 +544,7 @@ pub fn parse_auth_claims(header: &str) -> Map<String, Value> {
     map
 }
 
-/// Validate a path parameter value. Returns Err(BadRequest) if invalid.
-/// Validate a path parameter value.
+/// Validate an ordinary path parameter, which is exactly one path segment.
 ///
 /// Delegates to `m6_core::validate_path_param`, which is the one
 /// implementation.
@@ -491,15 +552,35 @@ pub fn parse_auth_claims(header: &str) -> Map<String, Value> {
 /// The local copy this replaces had a name-based special case: a parameter
 /// called `relpath` was checked for `..` and then returned `Ok` with **no
 /// character validation at all**, accepting spaces, control characters and
-/// NUL. That branch was also unreachable in its intended sense, because this
-/// crate's router has no catch-all support: `Segment` is only `Literal` or
-/// `Param` and `match_route` requires an exact segment count, so a parameter
-/// here captures exactly one path segment and can never contain a slash.
-///
-/// Every parameter is therefore validated with `allow_slash = false`.
+/// NUL. The name is still not what decides this; the route is. See
+/// `validate_wildcard_param` for the segment-spanning half, and use this one
+/// for a `Segment::Param`, which cannot contain a slash.
 pub fn validate_path_param(name: &str, value: &str) -> Result<()> {
     crate::validate_path_param(value, false).map_err(|e| {
         Error::BadRequest(format!("path param `{name}` is invalid: {e}"))
+    })?;
+    Ok(())
+}
+
+/// Validate a `{*name}` wildcard capture, which spans path segments.
+///
+/// The same validation with `allow_slash = true`, and it exists as its own
+/// function because the choice between the two belongs to the route rather
+/// than to the parameter's name. `validate_path_param` used to carry a
+/// comment explaining that a slash was impossible here, because "this crate's
+/// router has no catch-all support ... `Segment` is only `Literal` or `Param`
+/// and `match_route` requires an exact segment count". That was true when it
+/// was written. `Segment::Wildcard` made it false on 2026-09-12 and nothing
+/// said so: every wildcard test stopped at the matcher, so the capability
+/// looked complete while `/assets/css/main.css` was answered **400** by step 4
+/// of `build_dict` for containing the slash the wildcard exists to capture.
+///
+/// Traversal is still refused. `..` is rejected as a substring, a leading or
+/// trailing slash is rejected, and the character set is unchanged, so what
+/// this permits over the ordinary form is the separator and nothing else.
+pub fn validate_wildcard_param(name: &str, value: &str) -> Result<()> {
+    crate::validate_path_param(value, true).map_err(|e| {
+        Error::BadRequest(format!("wildcard param `{name}` is invalid: {e}"))
     })?;
     Ok(())
 }
