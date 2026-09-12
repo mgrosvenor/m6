@@ -299,6 +299,38 @@ pub fn is_shutdown() -> bool {
 mod tests {
     use super::*;
 
+    /// Serialises the tests that read and write [`SHUTDOWN_FLAG`].
+    ///
+    /// **That flag is one `static` for the whole process, and `cargo test` runs
+    /// the tests in a binary on several threads at once.** So
+    /// `the_flag_is_shared_by_every_clone_and_the_free_function`, which stores
+    /// `true` and then restores `false`, and `a_fresh_flag_is_clear`, which
+    /// asserts the flag is `false`, were two threads writing and reading one
+    /// global with nothing between them. Whenever the store landed inside the
+    /// other test's window, the assert failed.
+    ///
+    /// It failed once in a full-workspace run on 2026-09-12 and not once in
+    /// 300 runs of this module on its own, because the window is a couple of
+    /// atomic stores wide and only a loaded machine schedules the two threads
+    /// far enough apart. **The narrowness is why it read as noise, and it was
+    /// never noise:** widening each test's window by 50 ms reproduces
+    /// `assertion failed: !handle.is_shutdown()` every single time.
+    ///
+    /// The module comment below already worried about `--test-threads=1`
+    /// letting a signal mask leak between tests. A thread mask is per-thread
+    /// and parallel tests each get their own, so that direction was safe. This
+    /// is the opposite direction, and it is the one that bites.
+    static FLAG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Take [`FLAG_LOCK`], surviving a panic in a previous holder.
+    ///
+    /// A poisoned mutex here means some earlier test panicked, which the
+    /// harness has already reported. Refusing to run the rest because of it
+    /// would turn one failure into several.
+    fn flag_guard() -> std::sync::MutexGuard<'static, ()> {
+        FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// The ordering rule is enforced, not merely documented.
     ///
     /// Each of these sets its own precondition explicitly rather than relying
@@ -323,6 +355,7 @@ mod tests {
 
     #[test]
     fn a_fresh_flag_is_clear() {
+        let _guard = flag_guard();
         SHUTDOWN_FLAG.store(false, Ordering::SeqCst);
         SIGNAL_COUNT.store(0, Ordering::SeqCst);
         let handle = ShutdownHandle { name: Arc::from("test"), socket: None };
@@ -332,6 +365,7 @@ mod tests {
 
     #[test]
     fn the_flag_is_shared_by_every_clone_and_the_free_function() {
+        let _guard = flag_guard();
         SHUTDOWN_FLAG.store(false, Ordering::SeqCst);
         let handle = ShutdownHandle { name: Arc::from("test"), socket: None };
         let clone = handle.clone();

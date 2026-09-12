@@ -69,14 +69,42 @@ impl HttpResponse {
     }
 }
 
+/// A response that never arrived, carrying the reason in place of headers.
+///
+/// **Every transport failure in these helpers funnels here instead of
+/// panicking, and that is the whole point.** They are called from
+/// `wait::until(30s, || https_get(..).status == 200)` readiness loops whose
+/// entire job is to retry until m6-http has filled its backend pool. A panic
+/// inside that closure does not retry, it ends the test.
+///
+/// That is what failed on 2026-09-12: `write_all(..).unwrap()` met a
+/// `ConnectionReset` and the run died at
+/// `custom_error_page_fetch_is_logged_to_analytics`, inside the loop written
+/// to tolerate exactly that. `wait_for_tcp` proves something is bound, which
+/// is not the same as being ready to serve, and a server that accepts and
+/// closes before reading sends RST rather than FIN, so the client sees the
+/// reset on its *next write* rather than on connect.
+///
+/// The reason is kept rather than discarded: `status` is already 0 for an
+/// unparseable response, so the readiness loop treats this as "not yet", while
+/// a final assertion prints the transport error instead of an unwrap panic
+/// with no context.
+fn no_response(reason: impl std::fmt::Display) -> HttpResponse {
+    HttpResponse { status: 0, headers: format!("<no response: {reason}>") }
+}
+
 /// One HTTP/1.1-over-TLS GET against a bare port.
 ///
 /// Three tests here build ad-hoc stacks that have no [`Server`], so the
 /// primitive takes a port. Tests that do have a `Server` should go through
 /// [`Server::get`], which reports a dead service instead of a bare io error.
+///
+/// Never panics on a transport failure. See [`no_response`].
 fn https_get(port: u16, path: &str, extra: &[(&str, &str)], tls: Arc<rustls::ClientConfig>) -> HttpResponse {
-    let tcp = TcpStream::connect(("127.0.0.1", port)).expect("tcp connect");
-    https_exchange(tcp, port, path, extra, tls)
+    match TcpStream::connect(("127.0.0.1", port)) {
+        Ok(tcp) => https_exchange(tcp, port, path, extra, tls),
+        Err(e) => no_response(format!("tcp connect: {e}")),
+    }
 }
 
 fn https_exchange(
@@ -86,9 +114,14 @@ fn https_exchange(
     extra: &[(&str, &str)],
     tls: Arc<rustls::ClientConfig>,
 ) -> HttpResponse {
-    tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    if let Err(e) = tcp.set_read_timeout(Some(Duration::from_secs(10))) {
+        return no_response(format!("set_read_timeout: {e}"));
+    }
     let name = rustls::pki_types::ServerName::try_from("127.0.0.1".to_string()).unwrap();
-    let conn = rustls::ClientConnection::new(tls, name).unwrap();
+    let conn = match rustls::ClientConnection::new(tls, name) {
+        Ok(c) => c,
+        Err(e) => return no_response(format!("tls setup: {e}")),
+    };
     let mut stream = StreamOwned::new(conn, tcp);
 
     let mut req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n");
@@ -96,14 +129,20 @@ fn https_exchange(
         req.push_str(&format!("{k}: {v}\r\n"));
     }
     req.push_str("Connection: close\r\n\r\n");
-    stream.write_all(req.as_bytes()).unwrap();
-    stream.flush().unwrap();
+    // The handshake is driven by this write, so a server that is bound but not
+    // yet serving surfaces here rather than at connect.
+    if let Err(e) = stream.write_all(req.as_bytes()) {
+        return no_response(format!("write request: {e}"));
+    }
+    if let Err(e) = stream.flush() {
+        return no_response(format!("flush request: {e}"));
+    }
 
     let mut raw = Vec::new();
     match stream.read_to_end(&mut raw) {
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
-        Err(e) => panic!("TLS read error: {e}"),
+        Err(e) => return no_response(format!("tls read: {e}")),
     }
 
     let text = String::from_utf8_lossy(&raw);
@@ -307,22 +346,38 @@ impl Server {
         tls_client_config(&self.cert_der)
     }
 
-    /// Open a TCP connection to the server, or say why it could not be opened.
-    /// See the same method in `security_e2e.rs`: a refused connect means the
-    /// server died, and the exit status and its last stderr are the answer.
-    fn tcp(&self) -> TcpStream {
+    /// Open a TCP connection, or `None` if the server is not accepting yet.
+    ///
+    /// **A refused connect does not mean the server died**, which is what this
+    /// used to assume before panicking. `assert_alive` is still checked first
+    /// and still fails loudly, with the exit status and stderr, when the
+    /// process really is gone. What is left over is the other case, and it is
+    /// the common one: m6-http is alive and has not bound the listener yet.
+    /// There is a real window for it, because the port is held by a
+    /// [`PortClaim`] that is released so m6-http can bind it.
+    ///
+    /// On 2026-09-12 that window produced
+    /// `connect to 127.0.0.1:22143 failed with m6-http alive: Connection
+    /// refused`, inside `wait_until_serving`, the loop whose entire job is to
+    /// wait for the server to come up. The panic message contained its own
+    /// refutation: it said the server was alive.
+    fn tcp(&self) -> Option<TcpStream> {
         match TcpStream::connect(("127.0.0.1", self.port)) {
-            Ok(s) => s,
-            Err(e) => {
+            Ok(s) => Some(s),
+            Err(_) => {
+                // Fatal and self-reporting when the process is actually dead.
                 self.http.borrow_mut().assert_alive("the client was connecting");
-                panic!("connect to 127.0.0.1:{} failed with m6-http alive: {e}", self.port);
+                None
             }
         }
     }
 
     /// One HTTP/1.1-over-TLS GET against this server.
     fn get(&self, path: &str, extra: &[(&str, &str)]) -> HttpResponse {
-        https_exchange(self.tcp(), self.port, path, extra, self.tls())
+        match self.tcp() {
+            Some(tcp) => https_exchange(tcp, self.port, path, extra, self.tls()),
+            None => no_response("tcp connect refused while m6-http was alive"),
+        }
     }
 
     /// Wait until a request actually reaches the backend, then clear the log.
@@ -1134,4 +1189,48 @@ backend = "origin"
         !edge_lines[0].session_new,
         "edge did not mint anything — it reused origin's session — so its line should say session_new=false"
     );
+}
+
+/// The readiness probe must survive a server that is bound but not serving.
+///
+/// This is the failure from 2026-09-12 reproduced deterministically. A server
+/// that accepts a connection and closes it without reading sends RST rather
+/// than FIN, so the client does not learn about it at connect time: it learns
+/// on its next write, which for TLS is the handshake. `https_get` used to
+/// `.unwrap()` there, and because it is called from inside
+/// `wait::until(30s, ..)` the panic ended the run instead of retrying, in the
+/// loop written to tolerate precisely this.
+///
+/// Verified red against the previous helper: `called Result::unwrap() on an
+/// Err value: Os { code: 54, kind: ConnectionReset }`, the same error and the
+/// same line as the original failure.
+#[test]
+fn a_probe_against_a_bound_but_dead_server_does_not_panic() {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+    let port = listener.local_addr().unwrap().port();
+
+    // Accept and drop without reading. The client's ClientHello is sitting
+    // unread in the receive buffer, which is what turns the close into an RST.
+    let accepting = std::thread::spawn(move || {
+        for stream in listener.incoming().take(1) {
+            drop(stream);
+        }
+    });
+
+    let (_cert_pem, _key_pem, cert_der) = generate_tls_cert();
+    let tls = tls_client_config(&cert_der);
+
+    let resp = https_get(port, "/probe", &[], tls);
+    assert_eq!(
+        resp.status, 0,
+        "a dead server must read as 'not serving', got {} with headers:\n{}",
+        resp.status, resp.headers
+    );
+    assert!(
+        resp.headers.starts_with("<no response:"),
+        "the reason must survive for the final assertion to print, got:\n{}",
+        resp.headers
+    );
+
+    accepting.join().ok();
 }
