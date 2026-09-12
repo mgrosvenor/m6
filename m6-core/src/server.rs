@@ -453,3 +453,78 @@ mod tests {
         assert_eq!(req.body, body);
     }
 }
+
+/// Bind a TCP listener with `SO_REUSEADDR`, the way a server should.
+///
+/// **`std::net::TcpListener::bind` does not set it**, and m6-http did not set
+/// it either, so a port carrying connections in `TIME_WAIT` could not be
+/// rebound. That is not an edge case for a server: the peer that closes first
+/// holds `TIME_WAIT`, and for an HTTP server sending `Connection: close` that
+/// is us, on every closed connection, for up to a minute afterwards.
+///
+/// The consequence in production is worse than the one in the tests. m6-http
+/// treats a failed bind as a warning and carries on with the listener set to
+/// `None`, so a restart inside that window brings the process up **with
+/// nothing listening on 443**, running, healthy to systemd, and serving no
+/// one. The test suite only showed it as intermittent
+/// `Address already in use (os error 48)` because the ports are recycled fast.
+///
+/// `SO_REUSEADDR` is the right tool and not a blunt one: it permits binding
+/// over `TIME_WAIT`, and still refuses a port that has a **live** listener, so
+/// a genuine "something else is already running here" is still an error. That
+/// is `SO_REUSEPORT`, which this deliberately does not set.
+pub fn bind_tcp_reuseaddr(addr: std::net::SocketAddr) -> std::io::Result<std::net::TcpListener> {
+    let domain = match addr {
+        std::net::SocketAddr::V4(_) => socket2::Domain::IPV4,
+        std::net::SocketAddr::V6(_) => socket2::Domain::IPV6,
+    };
+    let sock = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+    sock.set_reuse_address(true)?;
+    sock.bind(&addr.into())?;
+    // The same backlog std uses, so this changes one thing and not two.
+    sock.listen(128)?;
+    Ok(sock.into())
+}
+
+#[cfg(test)]
+mod bind_tests {
+    use super::bind_tcp_reuseaddr;
+
+    fn loopback(port: u16) -> std::net::SocketAddr {
+        std::net::SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    /// The property that fixes the flake: a port whose previous listener is
+    /// gone can be rebound at once, even with sockets left in `TIME_WAIT`.
+    #[test]
+    fn a_port_can_be_rebound_after_its_listener_and_a_connection_close() {
+        let first = bind_tcp_reuseaddr(loopback(0)).expect("first bind");
+        let port = first.local_addr().unwrap().port();
+
+        // A real accepted connection, closed from the server side, which is
+        // what leaves TIME_WAIT on this port.
+        let client = std::net::TcpStream::connect(loopback(port)).expect("connect");
+        let (server, _) = first.accept().expect("accept");
+        drop(server);
+        drop(client);
+        drop(first);
+
+        bind_tcp_reuseaddr(loopback(port))
+            .expect("a port must be rebindable once its listener is gone");
+    }
+
+    /// And it is not a blunt instrument. A port with a **live** listener is
+    /// still refused, so "something else is already running here" stays an
+    /// error rather than two servers silently sharing a port. That would be
+    /// `SO_REUSEPORT`, which this deliberately does not set.
+    #[test]
+    fn a_live_listener_still_refuses_a_second_bind() {
+        let held = bind_tcp_reuseaddr(loopback(0)).expect("first bind");
+        let port = held.local_addr().unwrap().port();
+        assert!(
+            bind_tcp_reuseaddr(loopback(port)).is_err(),
+            "two live listeners on one port must not be allowed"
+        );
+        drop(held);
+    }
+}

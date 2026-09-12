@@ -1793,6 +1793,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "slug",
+ "socket2",
  "tempfile",
  "tera",
  "thiserror 1.0.69",

@@ -129,6 +129,19 @@ pub struct Http11Listener {
     conns:      Vec<Conn>,
 }
 
+/// Resolve a `host:port` bind string to one address.
+///
+/// `bind_tcp_reuseaddr` takes a `SocketAddr` because it has to choose a socket
+/// domain before binding, which `TcpListener::bind`'s `ToSocketAddrs` hides.
+/// The first resolved address wins, which is what `TcpListener::bind` does too
+/// for a single-address host like `127.0.0.1` or `0.0.0.0`.
+fn resolve_bind(addr: &str) -> anyhow::Result<std::net::SocketAddr> {
+    use std::net::ToSocketAddrs;
+    addr.to_socket_addrs()?
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("bind address {addr:?} resolved to nothing"))
+}
+
 impl Http11Listener {
     pub fn bind(addr: &str, tls_config: Arc<rustls::ServerConfig>) -> anyhow::Result<Self> {
         Self::bind_maybe_tls(addr, Some(tls_config))
@@ -143,7 +156,11 @@ impl Http11Listener {
         addr: &str,
         tls_config: Option<Arc<rustls::ServerConfig>>,
     ) -> anyhow::Result<Self> {
-        let listener = TcpListener::bind(addr)?;
+        // SO_REUSEADDR, which `TcpListener::bind` does not set. Without it a
+        // restart inside the TIME_WAIT window cannot rebind, and m6-http treats
+        // a failed bind as a warning: the process comes up with no listener at
+        // all, running and healthy to systemd, serving nobody.
+        let listener = m6_core::server::bind_tcp_reuseaddr(resolve_bind(addr)?)?;
         listener.set_nonblocking(true)?;
         Ok(Http11Listener { listener, tls_config, conns: Vec::new() })
     }
@@ -274,7 +291,7 @@ pub struct H2cListener {
 
 impl H2cListener {
     pub fn bind(addr: &str) -> anyhow::Result<Self> {
-        let listener = TcpListener::bind(addr)?;
+        let listener = m6_core::server::bind_tcp_reuseaddr(resolve_bind(addr)?)?;
         listener.set_nonblocking(true)?;
 
         let trust = trust_for_bind(addr);
