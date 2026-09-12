@@ -719,10 +719,10 @@ fn wants_keep_alive(req: &HttpRequest) -> bool {
     // which `test_hop_by_hop_stripped` caught immediately: it sends both, and
     // its client then waited for a close that never came.
     let has = |tok: &str| {
-        req.headers
-            .iter()
-            .filter(|(k, _)| k.eq_ignore_ascii_case("connection"))
-            .flat_map(|(_, v)| v.split(','))
+        // `get_all`: Connection may be sent as several field lines, and taking
+        // only the first would miss a token in the second.
+        m6_core::headers::get_all(&req.headers[..], "connection")
+            .flat_map(|v| v.split(','))
             .any(|t| t.trim().eq_ignore_ascii_case(tok))
     };
 
@@ -857,10 +857,8 @@ fn build_response(
     // number -- but a backend that framed the HEAD itself returns an empty
     // body, and then only its own header still knows the real length.
     let cl = if is_head && body.is_empty() {
-        headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
-            .and_then(|(_, v)| v.trim().parse::<usize>().ok())
+        m6_core::headers::get(headers, "content-length")
+            .and_then(|v| v.trim().parse::<usize>().ok())
             .unwrap_or(0)
     } else {
         body.len()

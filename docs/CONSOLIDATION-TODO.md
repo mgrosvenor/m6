@@ -112,9 +112,22 @@ Verified by commit, gate green at each step unless noted.
 
 ### 3. Remaining audit findings
 
-- [~] **Case-insensitive header lookup.** Core is converted; about a dozen
-      ad-hoc `.find(|(k,_)| k.eq_ignore_ascii_case(..))` remain in m6-http
-      (`cache.rs`, `http2.rs`, `redirect.rs`, `security.rs`, `main.rs`).
+- [x] **Case-insensitive header lookup.** **DONE 2026-09-12.** m6-http used
+      **none** of `m6_core::headers`; it is now the only implementation.
+      **25 sites, not "about a dozen"**, across `analytics.rs`, `cache.rs`,
+      `forward.rs`, `http11.rs`, `http2.rs`, `redirect.rs`, `security.rs` and
+      twelve in `main.rs`. Zero remain in non-test code, checked by pattern.
+
+      Name-against-a-constant-list comparisons (`HOP_BY_HOP`,
+      `UNTRUSTED_INBOUND`) were deliberately left alone: those are not lookups,
+      and `eq_ignore_ascii_case` is the right call there.
+
+      **Two sites were taking the first of a repeatable field** and are now
+      `get_all`, which is the real win rather than the tidiness:
+      `analytics.rs`'s Set-Cookie scan, the exact field the headers module
+      documents as the one everybody folds by mistake, and `http11.rs`'s
+      `Connection` token check, which would have missed a token sent on a
+      second field line.
 - [ ] **Calendar arithmetic hand-rolled in `m6-md`.** `is_leap`, `doy_to_md`,
       days-since-epoch by hand. Core has chrono unconditionally now, so there
       is no dependency argument left.

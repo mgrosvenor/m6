@@ -160,9 +160,8 @@ pub fn record(
 /// load generates (every static asset it references) instead of writing a
 /// fresh `Set-Cookie` on each one.
 pub fn is_html_response(resp_headers: &[(String, String)]) -> bool {
-    resp_headers.iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
-        .is_some_and(|(_, v)| v.to_ascii_lowercase().starts_with("text/html"))
+    m6_core::headers::get(resp_headers, "content-type")
+        .is_some_and(|v| v.to_ascii_lowercase().starts_with("text/html"))
 }
 
 /// Convenience veneer over [`record`] for call sites that already own a
@@ -205,10 +204,10 @@ fn session_from_set_cookie_header(set_cookie: &str) -> Option<String> {
 /// carry multiple `Set-Cookie` fields for unrelated reasons, so every
 /// occurrence is checked, not just the first.
 fn session_from_response_headers(resp_headers: &[(String, String)]) -> Option<String> {
-    resp_headers
-        .iter()
-        .filter(|(k, _)| k.eq_ignore_ascii_case("set-cookie"))
-        .find_map(|(_, v)| session_from_set_cookie_header(v))
+    // `get_all`, not `get`: Set-Cookie is the field the headers module names as
+    // the one everybody folds by mistake, and a response may carry several.
+    m6_core::headers::get_all(resp_headers, "set-cookie")
+        .find_map(session_from_set_cookie_header)
 }
 
 /// Like [`finish_response`], but for a response whose backend may itself be

@@ -1876,7 +1876,7 @@ fn build_request(
     // A client that sent both wins with its own Host, which is only reachable
     // from a non-conforming client; :authority fills in otherwise.
     if let Some(authority) = authority {
-        if !fwd.iter().any(|(k, _)| k.eq_ignore_ascii_case("host")) {
+        if !m6_core::headers::contains(&fwd[..], "host") {
             fwd.push(("Host".to_string(), authority));
         }
     }
