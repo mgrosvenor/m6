@@ -301,7 +301,7 @@ pub fn handle_request<W: Write>(
     let representation_is_the_file = metadata.is_file()
         && encoding == Encoding::Identity
         && !ctx.config.minification.is_enabled(&mime_base);
-    if is_head && representation_is_the_file {
+    if representation_is_the_file {
         let mut hdrs: Vec<(&str, &str)> = vec![
             ("Content-Type", mime.as_str()),
             ("Cache-Control", cache_control),
@@ -311,8 +311,35 @@ pub fn handle_request<W: Write>(
         for (k, v) in &route.headers {
             hdrs.push((k.as_str(), v.as_str()));
         }
-        resp.send_with_length(200, &hdrs, &[], metadata.len() as usize)?;
-        return Ok(ResponseInfo { status: 200, bytes: 0, latency_us: start.elapsed().as_micros() });
+
+        if is_head {
+            resp.send_with_length(200, &hdrs, &[], metadata.len() as usize)?;
+            return Ok(ResponseInfo { status: 200, bytes: 0, latency_us: start.elapsed().as_micros() });
+        }
+
+        // Stream it. The bytes on the wire are the bytes on disk, so there is
+        // nothing to hold in memory: this used to `fs::read` the whole file,
+        // and `/assets/vditor/dist/js/lute/lute.min.js` is 3.6MB of allocation
+        // per cache miss to hand back something that is copied straight out
+        // again. `metadata.len()` is the same number the ETag above is built
+        // from, so the promise and the validator cannot disagree.
+        //
+        // A file that changed between the `stat` and the `open` is handled by
+        // `send_stream` rather than here: short reads fail and overruns are
+        // capped, because `Content-Length` is already on the wire by then.
+        let before = resp.body_bytes();
+        match std::fs::File::open(&fs_path) {
+            Ok(file) => {
+                resp.send_stream(200, &hdrs, metadata.len(), file)?;
+                let bytes = resp.body_bytes() - before;
+                return Ok(ResponseInfo { status: 200, bytes, latency_us: start.elapsed().as_micros() });
+            }
+            Err(_) => {
+                debug!(path = %fs_path.display(), "file not found");
+                resp.error(404)?;
+                return Ok(ResponseInfo { status: 404, bytes: 0, latency_us: start.elapsed().as_micros() });
+            }
+        }
     }
 
     let data = match std::fs::read(&fs_path) {
