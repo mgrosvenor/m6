@@ -106,6 +106,15 @@ impl Request {
         self
     }
 
+    /// The raw request, borrowed.
+    ///
+    /// For a handler that was written against `RawRequest` before its service
+    /// became an `App` service, and for anything that needs the request as the
+    /// wire delivered it rather than through the accessors above.
+    pub fn raw(&self) -> &RawRequest {
+        &self.raw
+    }
+
     /// Take the raw request back.
     ///
     /// `serve_connection` hands the request to its handler rather than lending
