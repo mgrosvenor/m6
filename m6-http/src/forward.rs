@@ -150,7 +150,7 @@ pub fn is_untrusted_inbound(name: &str) -> bool {
 /// HTTP/1.0 request, which is how it was found.
 fn write_host_if_absent(buf: &mut Vec<u8>, req: &HttpRequest, original_host: &str) {
     if original_host.is_empty()
-        || req.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("host"))
+        || m6_core::headers::contains(&req.headers[..], "host")
     {
         return;
     }
@@ -288,10 +288,7 @@ pub struct HttpResponse {
 
 impl HttpResponse {
     pub fn header(&self, name: &str) -> Option<&str> {
-        self.headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.as_str())
+        m6_core::headers::get(&self.headers[..], name)
     }
 }
 

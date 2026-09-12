@@ -101,11 +101,8 @@ fn redirect_for(req: &HttpRequest) -> RequestOutcome {
         );
     }
 
-    let host = req
-        .headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("host"))
-        .map(|(_, v)| v.trim())
+    let host = m6_core::headers::get(&req.headers[..], "host")
+        .map(str::trim)
         .unwrap_or("");
 
     // The query is part of the target and must survive the hop. It did not:
