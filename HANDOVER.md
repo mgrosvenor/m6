@@ -262,9 +262,16 @@ Services: `m6-http` (edge/proxy), `m6-file`, `m6-html`, `m6-auth-server`,
    the release and test builds, and the compile-time assertion
    `align_of::<libc::inotify_event>() <= 8` was evaluated for the first time and
    holds.
-   **Half the item remains and it is a different half.** `ConfigWatcher` has no
-   tests on any platform, so config hot reload on Linux still has no behavioural
-   coverage. "Never compiled" is closed; "never exercised" is not.
+   ~~**Half the item remains and it is a different half.**~~ **THAT HALF IS
+   NOW DONE TOO, 2026-09-12, `e6ba278`.** `ConfigWatcher` has four tests,
+   waiting on its own fd with `poll(2)` the way `App` does rather than
+   sleeping. Writing them found two defects in the macOS implementation, both
+   fixed in the same commit: `new` returned before its watcher threads had
+   registered their kevents, so an edge-triggered change in that window was
+   lost silently, and those threads never exited. Both went with the threads,
+   which should never have existed: a kqueue descriptor is pollable, so it goes
+   straight onto the service's own poll loop as Linux already did with inotify.
+   What is still owed there is §3c, the rewrite onto `nix`.
 4. **Deploy `m6-monitor` on the build host and prove it.** It is tested and has
    never polled a real node. `deploy/FLEET-MONITOR.md` is the runbook. It runs
    **off-fleet**, not on the centre: a monitor on syd cannot report that syd is
