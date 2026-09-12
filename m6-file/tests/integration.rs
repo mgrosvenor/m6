@@ -445,3 +445,184 @@ fn conditional_requests_follow_rfc9110_precedence() {
         "an unparseable date must be ignored, not turned into 412"
     );
 }
+
+// ─── HEAD answers what GET would, however the answer is produced ─────────────
+
+/// Send a raw request and return the response as bytes.
+///
+/// Bytes, not a `String`: a brotli body is not UTF-8, and `from_utf8_lossy`
+/// replaces each invalid byte with a three-byte U+FFFD, so measuring a
+/// compressed body through a `String` reported 135 bytes for 79. That is a
+/// measurement bug that looks exactly like a `Content-Length` bug.
+fn http_request_bytes(socket_path: &Path, request: &str) -> Vec<u8> {
+    let mut stream = UnixStream::connect(socket_path)
+        .unwrap_or_else(|e| panic!("connect to {:?}: {}", socket_path, e));
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream.write_all(request.as_bytes()).unwrap();
+    let method = request.split(' ').next().unwrap_or("");
+    m6_core::testkit::read_one(&mut stream, method).expect("read one response")
+}
+
+/// Split a raw response into its status line, its headers as sorted
+/// `name: value` pairs (lowercased names), and its body length in bytes.
+fn split_response(raw: &[u8]) -> (String, Vec<String>, usize) {
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("response has a header/body split");
+    let head = std::str::from_utf8(&raw[..split]).expect("headers are ASCII");
+    let body_len = raw.len() - (split + 4);
+
+    let mut lines = head.lines();
+    let status = lines.next().unwrap_or("").to_string();
+    let mut headers: Vec<String> = lines
+        .filter_map(|l| l.split_once(": "))
+        .map(|(k, v)| format!("{}: {}", k.to_ascii_lowercase(), v))
+        .collect();
+    headers.sort();
+    (status, headers, body_len)
+}
+
+/// A HEAD must carry exactly the headers the matching GET carries, and its
+/// `Content-Length` must be the length of the body that GET actually returns.
+///
+/// m6-file now answers a HEAD without touching the file when the
+/// representation *is* the file: identity coding, minification off for the
+/// type. Everything else still reads, minifies and compresses, because a
+/// `Content-Length` that does not describe the GET body is worse than a slow
+/// HEAD. This walks all three shapes together so the fast path cannot drift
+/// away from the slow one.
+#[test]
+fn head_reports_exactly_what_get_would() {
+    let (_guard, socket_path) = spawn_server("head-eq-get");
+
+    // (path, Accept-Encoding, which path it should take, why)
+    let cases: [(&str, &str, &str); 3] = [
+        // Not compressed, not minified: the fast path.
+        ("/assets/images/photo.txt", "identity", "identity, unminified"),
+        // Minified, so the representation is not the bytes on disk.
+        ("/assets/css/style.css", "identity", "identity but minified"),
+        // Compressed, so the length is only known after compressing.
+        ("/assets/css/style.css", "br", "brotli"),
+    ];
+
+    for (path, encoding, what) in cases {
+        let req = |method: &str| {
+            http_request_bytes(
+                &socket_path,
+                &format!(
+                    "{method} {path} HTTP/1.1\r\nHost: localhost\r\n\
+                     Accept-Encoding: {encoding}\r\n\r\n"
+                ),
+            )
+        };
+
+        let (get_status, get_headers, get_body_len) = split_response(&req("GET"));
+        let (head_status, head_headers, head_body_len) = split_response(&req("HEAD"));
+
+        assert!(get_status.contains("200"), "{what}: GET should be 200, got {get_status}");
+        assert_eq!(head_status, get_status, "{what}: status line must match");
+        assert_eq!(
+            head_headers, get_headers,
+            "{what}: HEAD and GET must carry identical headers"
+        );
+        assert_eq!(head_body_len, 0, "{what}: a HEAD must carry no body");
+
+        // The header the fast path is most likely to get wrong: it reports a
+        // length it computed from metadata rather than from the bytes sent.
+        let declared: usize = get_headers
+            .iter()
+            .find_map(|h| h.strip_prefix("content-length: "))
+            .unwrap_or_else(|| panic!("{what}: no content-length"))
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            declared, get_body_len,
+            "{what}: content-length must be the number of body bytes GET sends"
+        );
+    }
+}
+
+/// The fast path must actually skip the read, not merely produce the right
+/// answer by a slower route.
+///
+/// Correctness and the saving are separate properties, and
+/// `head_reports_exactly_what_get_would` only covers the first: a refactor that
+/// quietly restored the `fs::read` would keep every one of those assertions
+/// green. So this proves the negative directly, by making the file impossible
+/// to read and requiring the HEAD to succeed anyway. `stat` needs directory
+/// traversal, not read permission, so the metadata the answer is built from is
+/// still available.
+///
+/// The GET beside it is the control. If it also succeeded, the file would be
+/// readable and this test would be proving nothing.
+#[test]
+fn a_head_on_an_unreadable_file_still_answers() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let site = dir.path();
+    std::fs::create_dir_all(site.join("assets")).unwrap();
+
+    // Not a text type: no minification, no compression, so this is the shape
+    // the fast path is for.
+    let body = vec![b'x'; 4096];
+    let file = site.join("assets").join("opaque.bin");
+    std::fs::write(&file, &body).unwrap();
+
+    let config = site.join("m6-file.conf");
+    std::fs::write(
+        &config,
+        "[[route]]\npath = \"/assets/{relpath}\"\nroot = \"assets/\"\n",
+    )
+    .unwrap();
+
+    let socket_path = dir.path().join("unreadable.sock");
+    let mut svc = Service::spawn(
+        "m6-file",
+        Command::new(binary("m6-file"))
+            .arg(site)
+            .arg(&config)
+            .env("M6_SOCKET_OVERRIDE", &socket_path),
+    );
+    svc.wait_for_path(&socket_path, Duration::from_secs(10));
+    assert!(wait::for_unix(&socket_path, Duration::from_secs(10)), "never accepted");
+
+    // Readable first, so the fixture is known good before it is broken.
+    let req = |method: &str| {
+        http_request_bytes(
+            &socket_path,
+            &format!(
+                "{method} /assets/opaque.bin HTTP/1.1\r\nHost: localhost\r\n\
+                 Accept-Encoding: identity\r\n\r\n"
+            ),
+        )
+    };
+    let (status, _, _) = split_response(&req("GET"));
+    assert!(status.contains("200"), "the fixture should serve before chmod, got {status}");
+
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let (head_status, head_headers, _) = split_response(&req("HEAD"));
+    assert!(
+        head_status.contains("200"),
+        "a HEAD must not need to read the file, got {head_status}\n--- output ---\n{}",
+        svc.output()
+    );
+    assert!(
+        head_headers.contains(&format!("content-length: {}", body.len())),
+        "content-length should be the file size from metadata, got {head_headers:?}"
+    );
+
+    // The control: the same request as a GET genuinely cannot be served.
+    let (get_status, _, _) = split_response(&req("GET"));
+    assert!(
+        get_status.contains("404"),
+        "the file must really be unreadable or this test proves nothing, got {get_status}"
+    );
+
+    // Restore before the tempdir is removed.
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).ok();
+    svc.assert_alive("after serving an unreadable file's metadata");
+}

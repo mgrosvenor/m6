@@ -203,9 +203,12 @@ Services: `m6-http` (edge/proxy), `m6-file`, `m6-html`, `m6-auth-server`,
      `m6`, so the world bits were never load-bearing.
    - **Still open, optional (Tier 2): lift the accept/poll block** m6-file
      duplicates 22 of 33 lines of.
-   - **Still open, free and unrelated to shape: `send_with_length` has zero
-     callers** while m6-file's HEAD does a full `fs::read`, minify and brotli-6
-     before discarding the body at `h1.rs:700`.
+   - ~~**`send_with_length` has zero callers.**~~ **DONE 2026-09-12.** m6-file
+     answers a HEAD from `metadata.len()` without opening the file, but **only
+     when the representation is the file** (identity coding, minification off
+     for the type). A HEAD must report what the matching GET would send, so a
+     minified or compressed representation still has to be produced to be
+     measured. Images, which are neither, are the case that cost anything.
 
    Anything touching performance still wants **benchmarking Phases 5 and 6**
    first, which is owed anyway. The two that remain are a code move and
@@ -458,6 +461,17 @@ renderers switched to m6-core.
   Neither is understood. A test that fails only when the machine is busy is
   either a real race or a test that is too tight, and both are worth knowing
   which.
+
+  **It happened a third time on 2026-09-12 and the output was lost again, the
+  same way.** A full-workspace run reported 938 passed and 1 failed where a
+  clean run is 979, so a suite aborted roughly 41 tests in. Which test it was
+  is unknown: the run was piped through `grep` for the totals, and the next
+  action was to re-run rather than to read, which is precisely what the
+  paragraph above says not to do. Three captured runs afterwards were 979/0,
+  and three more on Linux were clean. **So the instruction is now concrete:
+  run the full suite as `cargo test --workspace > /tmp/run.txt 2>&1` and grep
+  the file, never the pipe.** A failure that only shows up under load is one
+  you get a few seconds to read.
 - ~~**`185.19.40.146` is a block candidate**~~ **BLOCKED 2026-09-12**, with
   four others. Ledger and all three nodes at 31 rules, in sync.
   **The open question it leaves is the campaign, not the address.** One

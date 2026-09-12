@@ -273,6 +273,41 @@ pub fn handle_request<W: Write>(
         return Ok(ResponseInfo { status: 304, bytes: 0, latency_us: start.elapsed().as_micros() });
     }
 
+    // A HEAD whose representation is the file on disk needs no file on disk.
+    //
+    // The responder drops the body for a HEAD (RFC 9110 9.3.2) at the very end
+    // of `send`, so everything below ran in full and was thrown away: a whole
+    // `fs::read`, then minification, then brotli at level 6. On a HEAD of a
+    // large image that is the entire cost of the request, spent to produce
+    // bytes nobody receives.
+    //
+    // `Content-Length` is the reason it cannot simply be skipped: a HEAD has
+    // to report what the matching GET would send, so a compressed or minified
+    // representation genuinely has to be produced to be measured. The case
+    // that does not is identity coding with minification off for this type,
+    // where the representation *is* the file and `metadata.len()` is already
+    // its length. That is also the common case for the assets worth caring
+    // about, since images are neither compressed nor minified here.
+    //
+    // The ETag agrees by construction: at identity the suffix is empty and the
+    // tag is built from `mtime_secs` and this same `metadata.len()`.
+    let is_head = req.method == "HEAD";
+    let representation_is_the_file =
+        encoding == Encoding::Identity && !ctx.config.minification.is_enabled(&mime_base);
+    if is_head && representation_is_the_file {
+        let mut hdrs: Vec<(&str, &str)> = vec![
+            ("Content-Type", mime.as_str()),
+            ("Cache-Control", cache_control),
+            ("ETag", &etag),
+            ("Last-Modified", &last_modified),
+        ];
+        for (k, v) in &route.headers {
+            hdrs.push((k.as_str(), v.as_str()));
+        }
+        resp.send_with_length(200, &hdrs, &[], metadata.len() as usize)?;
+        return Ok(ResponseInfo { status: 200, bytes: 0, latency_us: start.elapsed().as_micros() });
+    }
+
     let data = match std::fs::read(&fs_path) {
         Ok(d) => d,
         Err(_) => {

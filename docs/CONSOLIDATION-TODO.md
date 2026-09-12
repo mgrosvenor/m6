@@ -178,9 +178,27 @@ Tier 2, about a day, moderate risk, optional:
 
 Unrelated to shape, free, no baseline needed:
 
-- [ ] **`send_with_length` has zero callers**, and m6-file's HEAD path does a
-      full `fs::read` + minify + brotli-6 before discarding the body at
-      `h1.rs:700`. ~20 lines, and a performance win rather than a cost.
+- [x] **`send_with_length` has zero callers.** **DONE 2026-09-12.** m6-file now
+      answers a HEAD from `metadata.len()` without opening the file, and
+      `send_with_length` is what lets it: the length reported is separate from
+      the bytes in hand.
+
+      **Only when the representation is the file**, which is identity coding
+      with minification off for the type. That is the constraint the item did
+      not state and it is not optional: a HEAD has to report what the matching
+      GET would send, so a minified or compressed representation genuinely has
+      to be produced to be measured. Dropping the minification half of the
+      condition makes a HEAD on `style.css` report 131 where the GET sends 106,
+      which is what the guard catches.
+
+      It is still the common case for the assets that cost anything, since
+      images are neither minified nor compressed here. Two guards, because
+      correctness and the saving are different properties:
+      `head_reports_exactly_what_get_would` walks HEAD against GET across all
+      three shapes, and `a_head_on_an_unreadable_file_still_answers` chmods the
+      file to `000` and requires the HEAD to succeed anyway, so a refactor that
+      quietly restores the `fs::read` fails. The first stays green when the
+      fast path is disabled; only the second goes red.
 
 #### 3b-later. Agreed, deferred, still on the list
 
