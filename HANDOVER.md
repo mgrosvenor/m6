@@ -52,6 +52,16 @@ State of play for the next session. Written 2026-09-11, updated 2026-09-12.
 > It was: the parser and the map are noise (41 to 583ns), the copy is
 > everything, and against the real config it is seventy times larger.
 >
+> **The owner then asked for a full copy audit of the system, with the target
+> stated as zero and config to be a read-only reference throughout. It is
+> `CONSOLIDATION-TODO.md` §7a.** Result: **`m6-http` and `m6-file` are already
+> right** (`Arc<Vec<_>>` headers and `bytes::Bytes` bodies at the edge, `Arc`
+> config and routes in m6-file), and **`App`, the framework both are meant to
+> migrate onto, is the only offender**, at **~0.63ms of pure copying per HTML
+> page**. `content.json` is deep-copied **six times per request**. The route to
+> zero is listed there in the order that pays; the floor is Tera's own context
+> build (189us), which core cannot remove without changing the renderer seam.
+>
 > **This is not §3a.** That is m6-http's cache-hit p50 and never touches
 > m6-html. Do not conflate them.
 >

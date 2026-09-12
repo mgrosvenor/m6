@@ -3678,3 +3678,112 @@ mod dict_cost {
         println!("total before the engine runs     {:>8}", whole + render_copy);
     }
 }
+
+#[cfg(test)]
+mod copy_audit {
+    //! Every copy `App` makes per request, measured against the production
+    //! input. `#[ignore]`d: measurements, not assertions.
+    //!
+    //! ```sh
+    //! cargo test --release -p m6-core copy_audit -- --ignored --nocapture
+    //! ```
+    use super::*;
+    use std::io::Write;
+
+    fn median<F: FnMut()>(n: usize, mut f: F) -> u64 {
+        for _ in 0..n / 4 { f(); }
+        let mut v = Vec::with_capacity(n);
+        for _ in 0..n {
+            let t = std::time::Instant::now();
+            f();
+            v.push(t.elapsed().as_nanos() as u64);
+        }
+        v.sort_unstable();
+        v[v.len() / 2]
+    }
+
+    #[test]
+    #[ignore = "a measurement; needs the site repo beside this one"]
+    fn every_copy_app_makes_per_request() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../dr-grosvenor-site/data/content.json");
+        if !src.exists() {
+            println!("SKIP: {} not present", src.display());
+            return;
+        }
+        let site_dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(site_dir.path().join("templates")).unwrap();
+        std::fs::create_dir(site_dir.path().join("data")).unwrap();
+        std::fs::copy(&src, site_dir.path().join("data/content.json")).unwrap();
+
+        let mut cfg = String::new();
+        for i in 0..34 { cfg.push_str(&format!("key_{i} = \"value_{i}\"\n")); }
+        cfg.push_str("global_params = [\"data/content.json\"]\n");
+        cfg.push_str("[compression.\"text/html\"]\nbrotli = 6\ngzip = 6\n");
+        cfg.push_str("[compression.\"text/css\"]\nbrotli = 6\ngzip = 6\n");
+        cfg.push_str("[minification]\n\"text/html\" = true\n\"text/css\" = true\n");
+        cfg.push_str("[[route]]\npath = \"/\"\ntemplate = \"index.html\"\nparams = [\"data/content.json\"]\n");
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(f, "{cfg}").unwrap();
+        let config = crate::config::load(f.path(), site_dir.path()).unwrap();
+        let state =
+            FrameworkState::build(config, site_dir.path().to_path_buf(), &[], &*default_renderer())
+                .unwrap();
+
+        let raw = RawRequest {
+            version: "HTTP/1.1".to_string(),
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            query: None,
+            headers: vec![
+                ("Host".to_string(), "mgrosvenor.com".to_string()),
+                ("User-Agent".to_string(), "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)".to_string()),
+                ("Accept".to_string(), "text/html,application/xhtml+xml,application/xml;q=0.9".to_string()),
+                ("Accept-Encoding".to_string(), "gzip, deflate, br".to_string()),
+                ("Cookie".to_string(), "_csrf=abc123".to_string()),
+            ],
+            body: vec![],
+        };
+        let (route, params) = find_route(raw.path(), raw.method(), &state.routes).unwrap();
+        let dict = state.build_dict(&raw, route, &params).unwrap();
+
+        const N: usize = 2_000;
+        let rows: Vec<(&str, u64)> = vec![
+            ("route.clone()", median(N, || { std::hint::black_box(route.clone()); })),
+            ("site_dir.clone() x2", median(N, || {
+                std::hint::black_box((state.site_dir.clone(), state.site_dir.clone()));
+            })),
+            ("config.compression.clone()", median(N, || {
+                std::hint::black_box(state.config.compression.clone());
+            })),
+            ("config.minification.clone()", median(N, || {
+                std::hint::black_box(state.config.minification.clone());
+            })),
+            ("build_dict (3 copies inside)", median(N, || {
+                std::hint::black_box(state.build_dict(&raw, route, &params).unwrap());
+            })),
+            ("raw.clone()", median(N, || { std::hint::black_box(raw.clone()); })),
+            ("dict.clone() into Request", median(N, || { std::hint::black_box(dict.clone()); })),
+            ("dict.clone() in render_response", median(N, || { std::hint::black_box(dict.clone()); })),
+            // Tera's `insert` serialises each value into its own context, so
+            // the engine takes a copy of its own. This one is not core's to
+            // remove without changing the renderer seam, but it is part of the
+            // per-request bill and the audit is dishonest without it.
+            ("tera::Context build (in the engine)", median(N, || {
+                let mut tctx = tera::Context::new();
+                for (k, v) in &dict {
+                    tctx.insert(k.as_str(), v);
+                }
+                std::hint::black_box(tctx);
+            })),
+        ];
+        let total: u64 = rows.iter().map(|(_, ns)| ns).sum();
+
+        println!("| copy | ns |");
+        println!("|---|---:|");
+        for (what, ns) in &rows {
+            println!("| {what} | {ns} |");
+        }
+        println!("| **total per request** | **{total}** |");
+    }
+}

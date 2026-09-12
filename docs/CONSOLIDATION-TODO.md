@@ -515,6 +515,86 @@ Then, and only then, the two migrations below.
             is a behaviour change on the asset path and wants measuring, not
             assuming.
 
+### 7a. Copy audit: the whole system, 2026-09-12
+
+**Owner's instruction: "I think we need a full audit of copy costs throughout
+the system." "The right number is zero." "Things like config should obviously
+be a read only reference throughout."**
+
+Audited: `m6-http` (edge, cache, forward), `m6-file`, `m6-core`'s `App` request
+path, and the four `App` services. Measured with the production input, release,
+on the laptop. `m6-core/src/app.rs`'s `copy_audit` module:
+
+```sh
+cargo test --release -p m6-core copy_audit -- --ignored --nocapture
+```
+
+**Two of the three services already do it right, and the framework they are
+meant to migrate onto is the one that does not.**
+
+| crate | per-request copying | verdict |
+|---|---|---|
+| `m6-http` | `CachedResponse` is `Arc<Vec<(String,String)>>` headers and `bytes::Bytes` body, so a cache hit is a refcount bump. `forward.rs` has no clones on the hot path. | **already zero** |
+| `m6-file` | `Arc<Config>` and `Arc<Vec<Route>>` cloned per connection as refcounts; per-request clones are a root `String`, param names, an ETag. | **already near zero** |
+| `m6-core` `App` | below | **~0.63ms per page** |
+
+Every copy `App` makes serving one HTML page, with the real
+`data/content.json` (68KB, 1,364 nodes):
+
+| copy | ns |
+|---|---:|
+| `route.clone()` | 167 |
+| `site_dir.clone()` x2 | 83 |
+| `config.compression.clone()` | 208 |
+| `config.minification.clone()` | 167 |
+| `build_dict` (three copies inside) | 222,708 |
+| `raw.clone()` | 458 |
+| `dict.clone()` into `Request` | 108,583 |
+| `dict.clone()` in `render_response` | 109,500 |
+| `tera::Context` build, inside the engine | 189,000 |
+| **total per request** | **630,874** |
+
+**`content.json` is deep-copied six times per request**: three times inside
+`build_dict` (global params, route params naming the same file, and the base),
+once into `Request`, once in `render_response`, once into Tera's context. None
+of it varies between requests. m6-html renders every HTML page on the site this
+way, on a 1-core VM, at a stated ~6ms.
+
+The small rows are not the point and should not be chased first; the four
+five-figure rows are 99.9% of it.
+
+**Route to zero, in the order that pays:**
+
+- [ ] **Config by reference, never by value.** `RendererConfig` behind an
+      `Arc` in `FrameworkState`; the pipeline and handlers borrow it. Removes
+      the `compression`, `minification` and `site_dir` clones outright. This is
+      the owner's stated rule and it is cheap.
+- [ ] **A per-route base dict, built once per reload.** Steps 1 to 3 produce
+      the same map for every request on a given route: config keys, global
+      params, static params files. Precompute it per `CompiledRoute` as an
+      `Arc<Map>` at `FrameworkState::build` time.
+- [ ] **A layered `Dict`**: `Arc<Map>` base plus a small per-request overlay,
+      `get` checking overlay then base. **The twelve-step precedence survives**:
+      built-ins live in the overlay and params files in the base, so built-ins
+      still win, which is what step 8's comment calls load-bearing. Dynamic
+      params files (those with a `{placeholder}`) go in the overlay ahead of the
+      built-ins, preserving their order too. This is the change that removes the
+      three big rows, and it is also the one that changes a core type:
+      `Request::dict`, `Response::render_dict` and the renderer seam all take
+      `&Map` today.
+- [ ] **Do not clone the same file twice.** Steps 2 and 3 both insert
+      `data/content.json` because the config names it in both places, the second
+      overwriting the first with identical values. Worth fixing in the code and
+      asking whether the config needs to say it twice.
+- [ ] **`render_response` clones only to merge a handler context** that is
+      usually absent. Clone when `template_dict` is `Some`, borrow otherwise.
+- [ ] **Tera's own copy is the one core cannot remove by itself.**
+      `tera::Context::insert` serialises each value into the engine's own map,
+      189us of the total. Reaching zero there means either a renderer seam that
+      can hand Tera a prebuilt context per route, or an engine that borrows.
+      **Record it as the floor rather than pretending the other fixes reach
+      zero**: they take core to zero and leave this.
+
 ### 7. `App` deep-copies its immutable state on every request
 
 **FOUND 2026-09-12 (latest session), measuring `App` before migrating m6-file
