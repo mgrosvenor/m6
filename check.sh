@@ -8,9 +8,10 @@
 #
 # Order of operations:
 #   1. Build (release)
-#   2. Unit + integration tests
-#   3. Conformance ratchet (h1spec / h2spec / h3spec) — BLOCKS the push
-#   4. Benchmarks (informational — prints criterion output; never blocks the push)
+#   2. Clippy ratchet — BLOCKS the push
+#   3. Unit + integration tests
+#   4. Conformance ratchet (h1spec / h2spec / h3spec) — BLOCKS the push
+#   5. Benchmarks (informational — prints criterion output; never blocks the push)
 #
 # Why benches don't gate:
 #   Sub-microsecond criterion benchmarks on a development machine have ±5-15%
@@ -59,7 +60,18 @@ info "Building (release)..."
 cargo build --workspace --release --quiet
 pass "Build"
 
-# ── 2. Correctness: unit + integration tests ──────────────────────────────────
+# ── 2. Clippy ─────────────────────────────────────────────────────────────────
+# A ratchet, not `-D warnings`: the count may fall and may never rise. See
+# tools/clippy.sh for why, and tools/clippy-ceiling.txt for where it stands.
+# The rustc zero-warnings rule is separate and absolute.
+info "Running clippy..."
+if ./tools/clippy.sh; then
+  pass "Clippy (nothing new)"
+else
+  fail "Clippy regressed — see above"
+fi
+
+# ── 3. Correctness: unit + integration tests ──────────────────────────────────
 # --test-threads=1: several integration suites (m6-http's edge_proxy.rs,
 # security_e2e.rs, analytics_e2e.rs) spawn real m6-http/m6-html/m6-file
 # processes bound to fixed loopback ports. Run concurrently with each other,
@@ -72,7 +84,7 @@ else
   fail "Test suite failed — fix correctness issues before performance check"
 fi
 
-# ── 3. Conformance: HTTP/1.1, HTTP/2, HTTP/3 ─────────────────────────────────
+# ── 4. Conformance: HTTP/1.1, HTTP/2, HTTP/3 ─────────────────────────────────
 # A ratchet against independent testers (h1spec, h2spec, h3spec). Floors live
 # in tools/conformance-scores.txt; a score below its floor fails the push.
 #
@@ -92,7 +104,7 @@ else
   fail "Conformance regressed — see above, and tools/conformance-scores.txt"
 fi
 
-# ── 4. Performance (informational) ────────────────────────────────────────────
+# ── 5. Performance (informational) ────────────────────────────────────────────
 if [[ "$RUN_BENCH" == "false" ]]; then
   info "Skipping benchmarks (--no-bench)"
   echo ""

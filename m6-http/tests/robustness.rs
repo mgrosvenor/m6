@@ -92,30 +92,38 @@ impl Server {
     /// Open a TLS connection with ALPN pinned to HTTP/1.1 — these tests are
     /// about the h1 parser, and without pinning, rustls may offer h2 and the
     /// server would answer a protocol these byte sequences are not written for.
-    fn connect(&self) -> StreamOwned<rustls::ClientConnection, TcpStream> {
+    ///
+    /// `None` when the server is alive but not yet accepting. See the body.
+    fn connect(&self) -> Option<StreamOwned<rustls::ClientConnection, TcpStream>> {
         let mut cfg = (*tls_client_config(&self.cert_der)).clone();
         cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
         let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
         let conn = rustls::ClientConnection::new(Arc::new(cfg), name).unwrap();
         let sock = match TcpStream::connect(("127.0.0.1", self.port)) {
             Ok(s) => s,
-            Err(e) => {
-                // Connection refused here means nothing is listening, which
-                // means a service died since the last request. These two calls
-                // panic with the exit status and the child's own last words;
-                // the fallthrough covers the case where both are somehow still
-                // alive, which would be a genuinely different bug.
+            Err(_) => {
+                // A dead service is the case worth stopping for, and these two
+                // calls panic with the exit status and the child's own last
+                // words. What is left when both are alive is **not** "a
+                // genuinely different bug", which is what this comment used to
+                // claim before panicking on it: it is m6-http running but not
+                // yet accepting on the port, which is an ordinary startup
+                // window and the reason `wait_until_serving` exists.
+                //
+                // It fired on 2026-09-12 as `connect to 127.0.0.1:26376 failed
+                // with both services alive: Connection refused`, a message that
+                // stated its own refutation.
                 self.http.borrow_mut().assert_alive("the client was reconnecting");
                 self.file.borrow_mut().assert_alive("the client was reconnecting");
-                panic!(
-                    "connect to 127.0.0.1:{} failed with both services alive: {e}",
-                    self.port
-                );
+                return None;
             }
         };
-        sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-        sock.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
-        StreamOwned::new(conn, sock)
+        if sock.set_read_timeout(Some(Duration::from_secs(10))).is_err()
+            || sock.set_write_timeout(Some(Duration::from_secs(10))).is_err()
+        {
+            return None;
+        }
+        Some(StreamOwned::new(conn, sock))
     }
 
     /// Send raw bytes, read whatever comes back until EOF or timeout.
@@ -124,7 +132,9 @@ impl Server {
     /// answering, which is a legitimate response to garbage and is treated as
     /// such throughout.
     fn raw(&self, bytes: &[u8]) -> Vec<u8> {
-        let mut s = self.connect();
+        // Not yet accepting reads the same as closed on us, which is exactly
+        // what this function already promises its callers.
+        let Some(mut s) = self.connect() else { return Vec::new() };
         // A write failure is itself a valid outcome (server closed on us).
         if s.write_all(bytes).is_err() {
             return Vec::new();
@@ -550,7 +560,7 @@ fn hostile_host_headers_do_not_reach_the_response_head() {
 fn connect_and_send_nothing_does_not_wedge_the_server() {
     let s = start_server();
     {
-        let _idle = s.connect();
+        let _idle = s.connect().expect("connect: the server is serving by here");
         std::thread::sleep(Duration::from_millis(500));
     }
     s.assert_still_healthy("idle connection");
@@ -561,7 +571,7 @@ fn connect_and_send_nothing_does_not_wedge_the_server() {
 fn a_dribbled_and_abandoned_request_does_not_wedge_the_server() {
     let s = start_server();
     {
-        let mut c = s.connect();
+        let mut c = s.connect().expect("connect: the server is serving by here");
         for b in b"GET /public/open.txt HTTP/1.1\r\nHos" {
             if c.write_all(&[*b]).is_err() {
                 break;
@@ -579,7 +589,7 @@ fn a_dribbled_and_abandoned_request_does_not_wedge_the_server() {
 fn a_declared_body_that_never_arrives_does_not_wedge_the_server() {
     let s = start_server();
     {
-        let mut c = s.connect();
+        let mut c = s.connect().expect("connect: the server is serving by here");
         let _ = c.write_all(
             b"POST /public/open.txt HTTP/1.1\r\nHost: localhost\r\n\
               Content-Length: 1000\r\nConnection: close\r\n\r\n",
@@ -598,7 +608,7 @@ fn concurrent_half_open_connections_do_not_starve_a_real_request() {
     let s = start_server();
     let mut held = Vec::new();
     for _ in 0..8 {
-        let mut c = s.connect();
+        let mut c = s.connect().expect("connect: the server is serving by here");
         let _ = c.write_all(b"GET /public/open.txt HTTP/1.1\r\nHost: local");
         let _ = c.flush();
         held.push(c);
