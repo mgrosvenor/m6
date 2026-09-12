@@ -2,7 +2,27 @@
 
 State of play for the next session. Written 2026-09-11, updated 2026-09-12.
 
-> ## Read first, 2026-09-12 (latest session)
+> ## Read first, 2026-09-13
+>
+> **`m6-auth-server` is an `App` service too, so both migrations are done and
+> every service is one shape.** `main.rs` is 116 lines. Its handlers are
+> untouched on purpose: they carry the rate limiting, JWT minting and cookie
+> flags, and they return `RawResponse`, which now lifts into `Response`.
+> It is **not running in production** (the origin's `site.toml` has its backend
+> commented out), so the risk is low.
+>
+> **It found a latent defect in core and the guard caught it.** `run_app`
+> calls `signal::block()` first; the three **stateful** runners never did.
+> Nothing had been built on them, so SIGTERM handling was silently wrong for
+> every stateful service. m6-auth-server spawns a key-rotation watcher inside
+> `init_global`, that thread inherited an unblocked mask, and the assertion in
+> `install_with_hooks` fired at startup. Fixed in all three.
+>
+> **`init_global` takes an `AppContext` now** (config, site dir, config path),
+> because a service whose config names files has to resolve them against the
+> same roots the service uses.
+>
+> ## Read first, 2026-09-12 (previous session)
 >
 > **`m6-file` is an `App` service.** `main.rs` is 34 lines; 969 went, including
 > a second router, a second config parser, its accept loop, worker pool and

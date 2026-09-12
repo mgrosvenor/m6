@@ -967,10 +967,22 @@ fn drain_thread_state_typed<T: Any + Send + 'static>(
 fn run_app_global<G: Send + Sync + 'static>(
     raw_routes: Vec<GlobalRawRoute<G>>,
     raw_named: Vec<GlobalRawNamed<G>>,
-    init_global: Arc<dyn Fn(&Map<String, Value>) -> Result<G> + Send + Sync>,
+    init_global: Arc<dyn Fn(&AppContext) -> Result<G> + Send + Sync>,
     destroy_global: Option<Arc<dyn Fn(G) + Send + Sync>>,
     renderer: Arc<dyn RendererFactory>,
 ) -> Result<()> {
+    // Before anything else, and before `init_global` below, which is allowed
+    // to spawn threads and in m6-auth-server's case does: the mask is
+    // inherited only by threads created after this call, so a watcher started
+    // during initialisation would otherwise take SIGTERM at its default
+    // disposition and kill the process.
+    //
+    // `run_app` has always done this and these three never did, which made
+    // SIGTERM handling silently wrong for every stateful service. Nothing had
+    // been built on them until now; the assertion in `install_with_hooks` is
+    // what caught it, which is the guard earning its place.
+    crate::signal::block();
+
     // We need the config before we can call init_global. Load it here.
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
@@ -990,8 +1002,13 @@ fn run_app_global<G: Send + Sync + 'static>(
     });
 
     // Call init_global with the user config.
-    let g = init_global(&config.user_config).unwrap_or_else(|e| {
-        eprintln!("init_global failed: {e}");
+    let g = init_global(&AppContext {
+        config: &config.user_config,
+        site_dir: &site_dir,
+        config_path: &config_path,
+    })
+    .unwrap_or_else(|e| {
+        eprintln!("init_global failed: {e:#}");
         std::process::exit(2);
     });
     let arc_g = Arc::new(g);
@@ -1050,6 +1067,18 @@ fn run_app_thread_state<T: Any + Send + 'static>(
     destroy_thread: Option<Arc<dyn Fn(T) + Send + Sync>>,
     renderer: Arc<dyn RendererFactory>,
 ) -> Result<()> {
+    // Before anything else, and before `init_global` below, which is allowed
+    // to spawn threads and in m6-auth-server's case does: the mask is
+    // inherited only by threads created after this call, so a watcher started
+    // during initialisation would otherwise take SIGTERM at its default
+    // disposition and kill the process.
+    //
+    // `run_app` has always done this and these three never did, which made
+    // SIGTERM handling silently wrong for every stateful service. Nothing had
+    // been built on them until now; the assertion in `install_with_hooks` is
+    // what caught it, which is the guard earning its place.
+    crate::signal::block();
+
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
         eprintln!("Usage: {} <site-dir> <config-path>", args[0]);
@@ -1128,11 +1157,23 @@ fn run_app_state<G: Send + Sync + 'static, T: Any + Send + 'static>(
     raw_routes: Vec<StateRawRoute<G, T>>,
     raw_named: Vec<StateRawNamed<G, T>>,
     renderer: Arc<dyn RendererFactory>,
-    init_global: Arc<dyn Fn(&Map<String, Value>) -> Result<G> + Send + Sync>,
+    init_global: Arc<dyn Fn(&AppContext) -> Result<G> + Send + Sync>,
     init_thread: Arc<dyn Fn(&Map<String, Value>, &G) -> Result<T> + Send + Sync>,
     destroy_thread: Option<Arc<dyn Fn(T) + Send + Sync>>,
     destroy_global: Option<Arc<dyn Fn(G) + Send + Sync>>,
 ) -> Result<()> {
+    // Before anything else, and before `init_global` below, which is allowed
+    // to spawn threads and in m6-auth-server's case does: the mask is
+    // inherited only by threads created after this call, so a watcher started
+    // during initialisation would otherwise take SIGTERM at its default
+    // disposition and kill the process.
+    //
+    // `run_app` has always done this and these three never did, which made
+    // SIGTERM handling silently wrong for every stateful service. Nothing had
+    // been built on them until now; the assertion in `install_with_hooks` is
+    // what caught it, which is the guard earning its place.
+    crate::signal::block();
+
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
         eprintln!("Usage: {} <site-dir> <config-path>", args[0]);
@@ -1150,8 +1191,13 @@ fn run_app_state<G: Send + Sync + 'static, T: Any + Send + 'static>(
         std::process::exit(2);
     });
 
-    let g = init_global(&config.user_config).unwrap_or_else(|e| {
-        eprintln!("init_global failed: {e}");
+    let g = init_global(&AppContext {
+        config: &config.user_config,
+        site_dir: &site_dir,
+        config_path: &config_path,
+    })
+    .unwrap_or_else(|e| {
+        eprintln!("init_global failed: {e:#}");
         std::process::exit(2);
     });
     let arc_g = Arc::new(g);
@@ -1369,6 +1415,24 @@ pub fn is_shutdown() -> bool {
 // App builder — no state
 // ---------------------------------------------------------------------------
 
+/// What a service was started with, for building its shared state.
+///
+/// A struct rather than a widening argument list. The initialiser first took
+/// only the config's non-framework keys, which was enough for a service whose
+/// state is derived from values; it is not enough for one whose config *names
+/// files*, because those resolve against a root the map does not carry.
+/// m6-auth-server's `db_path` resolves against its config file's directory and
+/// its key paths against the site, so the initialiser is given both roots
+/// rather than a third argument each time a service needs another.
+pub struct AppContext<'a> {
+    /// The config's non-framework keys, already parsed by core.
+    pub config: &'a Map<String, Value>,
+    /// The site directory, as passed on the command line.
+    pub site_dir: &'a std::path::Path,
+    /// The config file this service was started with.
+    pub config_path: &'a std::path::Path,
+}
+
 /// Handler function entries: (pattern, method, handler).
 type CodeRoute = (String, RouteMethod, Arc<BoxHandler>);
 
@@ -1543,7 +1607,7 @@ type GlobalRawNamed<G> = (String, Arc<dyn Fn(&Request, &G) -> Result<Response> +
 pub struct AppWithGlobal<G: Send + Sync + 'static> {
     raw_routes: Vec<GlobalRawRoute<G>>,
     raw_named: Vec<GlobalRawNamed<G>>,
-    init_global: Arc<dyn Fn(&Map<String, Value>) -> Result<G> + Send + Sync>,
+    init_global: Arc<dyn Fn(&AppContext) -> Result<G> + Send + Sync>,
     destroy_global: Option<Arc<dyn Fn(G) + Send + Sync>>,
     renderer: Arc<dyn RendererFactory>,
 }
@@ -1645,8 +1709,14 @@ impl<G: Send + Sync + 'static> AppWithGlobal<G> {
 }
 
 impl App {
+    /// An app with one shared value, built once at startup.
+    ///
+    /// The initialiser receives an [`AppContext`]: the parsed config plus the
+    /// site directory and the config path, because a service whose config
+    /// names files has to resolve them against the same roots the rest of the
+    /// service uses.
     pub fn with_global<G: Send + Sync + 'static>(
-        init_global: impl Fn(&Map<String, Value>) -> Result<G> + Send + Sync + 'static,
+        init_global: impl Fn(&AppContext) -> Result<G> + Send + Sync + 'static,
     ) -> AppWithGlobal<G> {
         AppWithGlobal {
             raw_routes: vec![],
@@ -1670,7 +1740,7 @@ impl App {
     }
 
     pub fn with_state<G: Send + Sync + 'static, T: Any + Send + 'static>(
-        init_global: impl Fn(&Map<String, Value>) -> Result<G> + Send + Sync + 'static,
+        init_global: impl Fn(&AppContext) -> Result<G> + Send + Sync + 'static,
         init_thread: impl Fn(&Map<String, Value>, &G) -> Result<T> + Send + Sync + 'static,
     ) -> AppWithState<G, T> {
         AppWithState {
@@ -1818,7 +1888,7 @@ type StateRawNamed<G, T> = (
 pub struct AppWithState<G: Send + Sync + 'static, T: Any + Send + 'static> {
     raw_routes: Vec<StateRawRoute<G, T>>,
     raw_named: Vec<StateRawNamed<G, T>>,
-    init_global: Arc<dyn Fn(&Map<String, Value>) -> Result<G> + Send + Sync>,
+    init_global: Arc<dyn Fn(&AppContext) -> Result<G> + Send + Sync>,
     init_thread: Arc<dyn Fn(&Map<String, Value>, &G) -> Result<T> + Send + Sync>,
     destroy_thread: Option<Arc<dyn Fn(T) + Send + Sync>>,
     destroy_global: Option<Arc<dyn Fn(G) + Send + Sync>>,
@@ -2941,7 +3011,7 @@ mod tests {
     #[test]
     fn test_app_with_global_builds() {
         // Just verify it compiles and builds without panicking.
-        let _app: AppWithGlobal<u32> = App::with_global(|_cfg| Ok(42u32))
+        let _app: AppWithGlobal<u32> = App::with_global(|_ctx| Ok(42u32))
             .route("/", |_req, g| {
                 assert_eq!(*g, 42);
                 Ok(Response::text("ok"))
@@ -2976,7 +3046,7 @@ mod tests {
         }
 
         let _app: AppWithState<Global, Local> = App::with_state(
-            |_cfg| Ok(Global { base: 10 }),
+            |_ctx| Ok(Global { base: 10 }),
             |_cfg, g| Ok(Local { count: g.base }),
         )
         .route("/inc", |_req, g, t| {
