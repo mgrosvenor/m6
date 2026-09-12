@@ -131,9 +131,16 @@ Verified by commit, gate green at each step unless noted.
 - [ ] **Calendar arithmetic hand-rolled in `m6-md`.** `is_leap`, `doy_to_md`,
       days-since-epoch by hand. Core has chrono unconditionally now, so there
       is no dependency argument left.
-- [ ] **ETag / conditional in `m6-file`.** Its own `If-None-Match` comparison
-      next to `core::conditional`. Check whether it genuinely differs (strong
-      vs weak) or merely duplicates.
+- [x] **ETag / conditional in `m6-file`.** **ALREADY DONE; this row was stale.**
+      Closed 2026-09-11 in `f4bdfed` and never struck off here. Verified
+      2026-09-12: `m6-file/src/handler.rs` calls
+      `m6_core::evaluate_preconditions` and reads `m6_core::Precondition`; the
+      only trace of the old copy is a comment quoting the line it replaced.
+
+      It did genuinely differ, which is why it mattered: the inline version was
+      `inm.split(',').any(|tag| tag.trim() == etag)`, byte equality, which is
+      *strong* comparison, and `If-None-Match` requires weak (RFC 9110
+      8.8.3.2). `If-Match` and `If-Unmodified-Since` were not consulted at all.
 
 ### 3c. `watcher.rs` is hand-rolled unsafe libc and should not be
 
@@ -375,13 +382,13 @@ the right shape, so they are worth doing whether or not anything is migrated:
       /assets/css`). A compressed or minified representation still has to be
       produced to be measured, because a HEAD must report what the GET would
       send. `Response` still cannot express it.
-- [ ] **No wildcard route segment.** `Segment` is `Literal|Param` and
-      `match_route` requires exact segment-count equality, so `App` cannot
-      express a static file server. This is the whole of m6-file's reason to be
-      a different shape.
-- [ ] **No streaming response body.** `Responder`'s three senders all take
-      `&[u8]` and `Response.body` is a `Vec<u8>`, so core cannot serve a body it
-      has not fully materialised. m6-file is not choosing to buffer.
+- Wildcard routing and streaming bodies were listed again here and are the
+  same two items as in §3b-later above. Recorded once, there, so that closing
+  one closes it. The short version: `Segment` is `Literal|Param` with exact
+  segment-count matching, so `App` cannot express a static file server; and
+  `Responder`'s senders all take `&[u8]`, so core cannot serve a body it has
+  not fully materialised. **Together they are the whole of m6-file's reason to
+  be a different shape**, and neither is deferred.
 - [x] **No socket-permissions config key.** **DONE 2026-09-12**, `4fc33da`.
       `[server] socket_mode`, octal string, default `0660`. It was m6-file *and*
       m6-auth-server setting `0666` by hand, and `App` setting nothing at all,
