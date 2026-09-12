@@ -291,9 +291,16 @@ pub fn handle_request<W: Write>(
     //
     // The ETag agrees by construction: at identity the suffix is empty and the
     // tag is built from `mtime_secs` and this same `metadata.len()`.
+    //
+    // `is_file` is load-bearing and was missing in the first version of this.
+    // `std::fs::metadata` succeeds on a directory and reports its size, so
+    // `HEAD /assets/css` answered `200` with `Content-Length: 128` while the
+    // GET beside it answered 404 and every earlier HEAD had too. The read this
+    // block skips is also what used to reject a non-file, by failing.
     let is_head = req.method == "HEAD";
-    let representation_is_the_file =
-        encoding == Encoding::Identity && !ctx.config.minification.is_enabled(&mime_base);
+    let representation_is_the_file = metadata.is_file()
+        && encoding == Encoding::Identity
+        && !ctx.config.minification.is_enabled(&mime_base);
     if is_head && representation_is_the_file {
         let mut hdrs: Vec<(&str, &str)> = vec![
             ("Content-Type", mime.as_str()),
