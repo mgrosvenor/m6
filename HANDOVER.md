@@ -12,7 +12,8 @@ State of play for the next session. Written 2026-09-11, updated 2026-09-12.
 > not define (`root`, `tail`) are kept for the handler to read. An unregistered
 > handler name is fatal: exit 2 at startup, and a reload refused with the
 > previous routes still serving. Detail in `CONSOLIDATION-TODO.md` §6.
-> **m6-file is not migrated yet**; that is the next piece of code.
+> **m6-file is not migrated yet**, and the reason changed during the session;
+> see below.
 >
 > **Wildcard routing was marked DONE and did not work.** Found doing the above.
 > Any `{*name}` capture spanning more than one segment was answered **400**,
@@ -26,6 +27,23 @@ State of play for the next session. Written 2026-09-11, updated 2026-09-12.
 > newest template's mtime for an answer computed per request. The comment at
 > the emit site already said code routes were skipped; the loop did not skip
 > them. Fixed.
+>
+> **`Response` can stream now**, and `Response::verbatim()` stops core
+> re-encoding a representation a handler already negotiated. `Body` is a sum
+> type, so a stream structurally has no bytes for the minifier, the compressor
+> or the default ETag hash to touch. The ledger's "streaming never blocked
+> m6-file" was written at 14:32 on 2026-09-12 and `send_stream` reached
+> m6-file at 14:55 the same day; the two were never reconciled.
+>
+> **m6-file is still not migrated, and the reason is now a number.** `App`
+> builds a request dictionary before every handler call: **p50 3.08us**
+> measured in release, against 167ns to route, on a service whose entire
+> tracked cache-hit p50 is 3.9us. A static asset request reads none of it.
+> Migrating as `App` stands is a measured regression against the owner's
+> stated key metric, so the next decision is how a handler route opts out of
+> the dict. `CONSOLIDATION-TODO.md` under "m6-file should be an `App` service"
+> has the options and the re-run command. **This needs a decision, not more
+> code.**
 >
 
 > ## Read first, 2026-09-12 (late session)
@@ -139,11 +157,12 @@ applied them:
   was previously refused on one node and served on two, which is exactly what
   the reconciliation was for.
 
-- **1013 workspace tests pass at default features, verified on Linux via
-  `deploy/run-tests.sh m6` on 2026-09-12 (latest session). Zero warnings**,
-  release and test builds, clippy ok, same count as macOS so nothing is cfg'd
-  out. The eleven over the previous 1002 are the wildcard and
-  config-route-handler tests.
+- **1018 workspace tests pass at default features, zero warnings**, release
+  and test builds, clippy at its 157 Darwin ceiling, 2026-09-12 (latest
+  session). Verified on Linux via `deploy/run-tests.sh m6`. The sixteen over
+  the previous 1002 are the wildcard, config-route-handler and streaming-body
+  tests. One further test, `app::dict_cost_probe`, is `#[ignore]`d on purpose:
+  it is a measurement, and a timing assertion is the wall-clock trap.
 - **Clippy is a gate now**, on the owner's instruction: `tools/clippy.sh`,
   wired into `check.sh` (step 2, so the pre-push hook covers it) and into the
   Linux gate before prod. It is a **ratchet**, not `-D warnings`: the count may
@@ -981,3 +1000,24 @@ New 2026-09-12:
     cheapest audit of a completed item is the first real consumer**, and until
     there is one, "done" means "written", which is what §6's closing note now
     says out loud about the reload chain itself.
+
+
+36. **Two ledger entries written 23 minutes apart contradicted each other, and
+    the later work inherited the earlier claim.** `a979390` at 14:32 recorded
+    "streaming never blocked m6-file, checked against the source"; `8c79ee7`
+    at 14:55 gave m6-file `send_stream`. Both were accurate when written. The
+    migration row kept pointing at the first one for the rest of the day, and
+    a session later it was still being quoted, by me, to the owner. **A
+    "checked against the source" note is a measurement with a timestamp, not a
+    fact**, and it expires the moment the source changes. When a row cites a
+    check, cite the commit it was checked at, so the next reader can see
+    whether anything has landed since.
+37. **Measure the cost of the thing you are migrating onto, not just its
+    capabilities.** The gating question for m6-file looked like a list of
+    features `App` lacked, and all of them got built. The thing that actually
+    stops the migration is that `App` spends 3.08us per request building a
+    dictionary a file handler never reads, which is most of the 3.9us the
+    owner tracks as the key metric. No capability list would have surfaced
+    that; one `#[ignore]`d measurement did. Lesson 1 said measure the
+    candidate before consolidating onto it, and that was about *correctness*
+    scores; this is the same rule about cost.

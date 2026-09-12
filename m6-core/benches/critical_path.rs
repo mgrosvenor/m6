@@ -17,7 +17,7 @@ fn html_response(html: String) -> Response {
     let mut r = Response::status(200);
     r.headers
         .push(("Content-Type".to_string(), "text/html; charset=utf-8".to_string()));
-    r.body = html.into_bytes();
+    r.body = m6_core::Body::Bytes(html.into_bytes());
     r
 }
 
@@ -392,22 +392,33 @@ fn bench_template_render(c: &mut Criterion) {
 }
 
 /// Response::write_to: serialise a pre-built HTML response to a Vec.
+/// Build the response this benchmark serialises.
+///
+/// A fresh one per iteration because `Response::send` consumes it: a body may
+/// be a stream, and a response goes on the wire once. `iter_batched` keeps the
+/// construction out of the timed section, so the number still means what it
+/// meant before -- serialisation only.
+fn response_to_write() -> Response {
+    let mut r = Response::status(200);
+    r.headers.push(("Content-Type".to_string(), "text/html; charset=utf-8".to_string()));
+    r.headers.push(("Cache-Control".to_string(), "public".to_string()));
+    r.body = m6_core::Body::Bytes(MINIMAL_TEMPLATE.as_bytes().to_vec());
+    r
+}
+
 fn bench_response_write(c: &mut Criterion) {
-    let resp = {
-        let mut r = Response::status(200);
-        r.headers.push(("Content-Type".to_string(), "text/html; charset=utf-8".to_string()));
-        r.headers.push(("Cache-Control".to_string(), "public".to_string()));
-        r.body = MINIMAL_TEMPLATE.as_bytes().to_vec();
-        r
-    };
     let mut group = c.benchmark_group("response_write");
     group.sample_size(1_000);
     group.bench_function("response_write", |b| {
-        b.iter(|| {
-            let mut buf = Vec::with_capacity(512);
-            let mut out = m6_core::h1::Responder::new(&mut buf, "GET", true);
-            black_box(resp.send(&mut out).unwrap());
-        })
+        b.iter_batched(
+            response_to_write,
+            |resp| {
+                let mut buf = Vec::with_capacity(512);
+                let mut out = m6_core::h1::Responder::new(&mut buf, "GET", true);
+                black_box(resp.send(&mut out).unwrap());
+            },
+            criterion::BatchSize::SmallInput,
+        )
     });
     group.finish();
 }
@@ -533,7 +544,7 @@ size = 64
             };
 
             let mut out = m6_core::h1::Responder::new(&mut stream, "GET", false);
-            write_response(&mut out, &resp).ok();
+            write_response(&mut out, resp).ok();
         }
     });
 
@@ -730,14 +741,13 @@ fn main() {
 
     // Response serialisation
     {
-        let resp = {
-            let mut r = Response::status(200);
-            r.headers.push(("Content-Type".to_string(), "text/html; charset=utf-8".to_string()));
-            r.headers.push(("Cache-Control".to_string(), "public".to_string()));
-            r.body = MINIMAL_TEMPLATE.as_bytes().to_vec();
-            r
-        };
-        report_percentiles("response_write", N, || {
+        // Includes building the response, which the criterion bench of the
+        // same name excludes via `iter_batched`. Named differently so the two
+        // numbers are not read as the same measurement: `Response::send`
+        // consumes its receiver now, so a fresh one is needed per iteration
+        // and this hand-rolled timer has no setup phase to hide it in.
+        report_percentiles("response_build_write", N, || {
+            let resp = response_to_write();
             let mut buf = Vec::with_capacity(512);
             let mut out = m6_core::h1::Responder::new(&mut buf, "GET", true);
             black_box(resp.send(&mut out).unwrap());
@@ -838,7 +848,7 @@ size = 64
                     Response::not_found()
                 };
                 let mut out = m6_core::h1::Responder::new(&mut stream, "GET", false);
-            write_response(&mut out, &resp).ok();
+            write_response(&mut out, resp).ok();
             }
         });
         std::thread::sleep(std::time::Duration::from_millis(20));

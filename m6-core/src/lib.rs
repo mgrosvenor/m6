@@ -57,7 +57,7 @@ pub use negotiate::{canonical_coding, coding_quality, preferred_coding};
 pub use path::validate_path_param;
 pub use random::random_hex_token;
 pub use request::Request;
-pub use response::Response;
+pub use response::{Body, Response};
 pub use server::{socket_path_from_config, UnixServer};
 pub use signal::ShutdownHandle;
 pub use watcher::ConfigWatcher;

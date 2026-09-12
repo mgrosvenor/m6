@@ -802,7 +802,7 @@ impl FrameworkState {
                 }
             }
             let html = self.renderer.render(&template_name, &ctx)?;
-            resp.body = html.into_bytes();
+            resp.body = crate::response::Body::Bytes(html.into_bytes());
             resp.headers
                 .push(("Content-Type".to_string(), "text/html; charset=utf-8".to_string()));
             resp.template_name = None;
@@ -2289,7 +2289,7 @@ fn handle_request<W: std::io::Write>(
                 Ok(d) => d,
                 Err(e) => {
                     let r = error_to_response(&e);
-                    crate::server::write_response(stream, &r).ok();
+                    crate::server::write_response(stream, r).ok();
                     return;
                 }
             };
@@ -2449,25 +2449,46 @@ fn handle_request<W: std::io::Write>(
     }
 
     // ── Minification: applied BEFORE compression for better ratios.
-    if !resp.body.is_empty() {
-        let content_type =
-            crate::headers::get(&resp.headers[..], "content-type").unwrap_or("");
-        let mime = content_type.split(';').next().unwrap_or("").trim();
+    //
+    // Both transforms below are skipped for a `verbatim` response, which is a
+    // handler saying it has already produced the exact representation. m6-file
+    // negotiates the coding itself and builds an ETag naming it, so
+    // re-compressing here would put brotli bytes on the wire under a tag
+    // asserting identity.
+    //
+    // A streamed body needs no such flag: `as_bytes` gives `None` and there is
+    // nothing to transform. That is deliberate rather than incidental -- the
+    // alternative shape, a `Vec<u8>` plus an optional reader, would have left
+    // all four transforms free to run on the empty bytes beside the stream and
+    // produce a correct-looking response with the wrong body.
+    if !resp.verbatim {
+        if let Some(bytes) = resp.body.as_bytes() {
+            if !bytes.is_empty() {
+                let content_type =
+                    crate::headers::get(&resp.headers[..], "content-type").unwrap_or("");
+                let mime = content_type.split(';').next().unwrap_or("").trim();
 
-        if minification.is_enabled(mime) {
-            resp.body = match mime {
-                "text/html" => crate::minify::minify_html(&resp.body, minification.inline_js),
-                "text/css" => crate::minify::minify_css(&resp.body),
-                "application/json" => crate::minify::minify_json(&resp.body),
-                "application/javascript" | "text/javascript" => crate::minify::minify_js(&resp.body),
-                _ => resp.body,
-            };
+                if minification.is_enabled(mime) {
+                    let minified = match mime {
+                        "text/html" => Some(crate::minify::minify_html(bytes, minification.inline_js)),
+                        "text/css" => Some(crate::minify::minify_css(bytes)),
+                        "application/json" => Some(crate::minify::minify_json(bytes)),
+                        "application/javascript" | "text/javascript" => {
+                            Some(crate::minify::minify_js(bytes))
+                        }
+                        _ => None,
+                    };
+                    if let Some(m) = minified {
+                        resp.body = crate::response::Body::Bytes(m);
+                    }
+                }
+            }
         }
     }
 
     // ── Compression: applied AFTER minification.
     let accept_encoding = raw.header("accept-encoding").unwrap_or("");
-    if !resp.body.is_empty() {
+    if !resp.verbatim && !resp.body.is_empty() {
         let content_type =
             crate::headers::get(&resp.headers[..], "content-type").unwrap_or("");
         let mime = content_type.split(';').next().unwrap_or("").trim();
@@ -2500,21 +2521,24 @@ fn handle_request<W: std::io::Write>(
             if level.gzip > 0 {
                 candidates.push("gzip");
             }
-            match crate::preferred_coding(accept_encoding, &candidates) {
-                Some("br") => {
+            // `as_bytes` is `None` for a stream, so a streamed body simply
+            // does not reach either compressor.
+            let plain = resp.body.as_bytes().map(|b| b.to_vec());
+            match (crate::preferred_coding(accept_encoding, &candidates), plain) {
+                (Some("br"), Some(bytes)) => {
                     if let Ok(compressed) =
-                        crate::compress::brotli_compress(&resp.body, level.brotli)
+                        crate::compress::brotli_compress(&bytes, level.brotli)
                     {
-                        resp.body = compressed;
+                        resp.body = crate::response::Body::Bytes(compressed);
                         resp.headers
                             .push(("Content-Encoding".to_string(), "br".to_string()));
                     }
                 }
-                Some("gzip") => {
+                (Some("gzip"), Some(bytes)) => {
                     if let Ok(compressed) =
-                        crate::compress::gzip_compress(&resp.body, level.gzip)
+                        crate::compress::gzip_compress(&bytes, level.gzip)
                     {
-                        resp.body = compressed;
+                        resp.body = crate::response::Body::Bytes(compressed);
                         resp.headers
                             .push(("Content-Encoding".to_string(), "gzip".to_string()));
                     }
@@ -2536,7 +2560,7 @@ fn handle_request<W: std::io::Write>(
         "request complete"
     );
 
-    crate::server::write_response(stream, &resp).ok();
+    crate::server::write_response(stream, resp).ok();
 }
 
 
@@ -3419,5 +3443,97 @@ tail = false
         assert_eq!(req.route_pattern(), None);
         assert_eq!(req.route_str("root"), None);
         assert!(req.route_bool("tail", true));
+    }
+}
+
+#[cfg(test)]
+mod dict_cost_probe {
+    use super::*;
+    use std::io::Write;
+
+    /// What `App` spends per request before a handler is reached.
+    ///
+    /// Not an assertion, a measurement, printed with `--nocapture`. m6-file
+    /// does none of this today: it matches a route and goes straight to the
+    /// filesystem. If it becomes an `App` service, every asset request pays
+    /// whatever this costs, and latency is the stated key metric.
+    ///
+    /// Measured 2026-09-12 on the laptop, release:
+    /// **build_dict p50 3.08us, p99 5.25us; find_route p50 167ns.** syd is a
+    /// 1-core VM and would be worse. The tracked production cache-hit p50 is
+    /// 3.9us, so this is not a rounding error beside it.
+    ///
+    /// `#[ignore]`d deliberately. A timing assertion is the wall-clock trap
+    /// that `test_static_file_cache_hit` already fell into once: it fires on a
+    /// loaded build box against correct code. Run it when the question is
+    /// asked:
+    ///
+    /// ```sh
+    /// cargo test --release -p m6-core measure_build_dict -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "a measurement, not an assertion; see the doc comment"]
+    fn measure_build_dict_for_a_static_asset_request() {
+        let site_dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(site_dir.path().join("templates")).unwrap();
+
+        // A config shaped like the real one: a handful of site-wide keys that
+        // every dict copies, plus the asset route.
+        let mut cfg = String::new();
+        for i in 0..20 {
+            cfg.push_str(&format!("key_{i} = \"value_{i}\"\n"));
+        }
+        cfg.push_str("[[route]]\npath = \"/assets/{*relpath}\"\nhandler = \"files\"\nroot = \"assets/\"\n");
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(f, "{cfg}").unwrap();
+
+        let config = crate::config::load(f.path(), site_dir.path()).unwrap();
+        let state =
+            FrameworkState::build(config, site_dir.path().to_path_buf(), &[], &*default_renderer())
+                .unwrap();
+
+        let raw = RawRequest {
+            version: "HTTP/1.1".to_string(),
+            method: "GET".to_string(),
+            path: "/assets/css/main.css".to_string(),
+            query: None,
+            headers: vec![
+                ("Host".to_string(), "localhost".to_string()),
+                ("Accept-Encoding".to_string(), "br, gzip".to_string()),
+                ("Cookie".to_string(), "_csrf=abc; session=def".to_string()),
+            ],
+            body: vec![],
+        };
+        let (route, params) = find_route(raw.path(), raw.method(), &state.routes).unwrap();
+
+        // Warm, then take the median of a decent run.
+        for _ in 0..1000 {
+            let _ = state.build_dict(&raw, route, &params).unwrap();
+        }
+        let mut samples = Vec::with_capacity(2000);
+        for _ in 0..2000 {
+            let t = std::time::Instant::now();
+            let d = state.build_dict(&raw, route, &params).unwrap();
+            samples.push(t.elapsed().as_nanos() as u64);
+            std::hint::black_box(d);
+        }
+        samples.sort_unstable();
+        let p50 = samples[samples.len() / 2];
+        let p99 = samples[samples.len() * 99 / 100];
+
+        // And the routing it replaces, for scale.
+        let mut rsamples = Vec::with_capacity(2000);
+        for _ in 0..2000 {
+            let t = std::time::Instant::now();
+            let m = find_route(raw.path(), raw.method(), &state.routes);
+            rsamples.push(t.elapsed().as_nanos() as u64);
+            std::hint::black_box(m);
+        }
+        rsamples.sort_unstable();
+
+        println!(
+            "build_dict per request: p50 {p50}ns p99 {p99}ns | find_route p50 {}ns",
+            rsamples[rsamples.len() / 2]
+        );
     }
 }

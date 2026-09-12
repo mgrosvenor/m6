@@ -386,21 +386,33 @@ Design is settled and written up in `docs/m6-app-shape-plan.md`. Not scheduled.
       `match_route`. The matcher was right; nothing took a capture through to
       the wire. Lesson 30 in the handover is the general form and this is
       another instance of it.
-- [ ] **Streaming response body.** `Responder`'s three senders all take
-      `&[u8]` and `Response.body` is a `Vec<u8>`, so core cannot serve a body it
-      has not fully materialised.
+- [x] **Streaming response body. DONE 2026-09-12 (latest session).**
+      `Response.body` is now `Body`, a sum type of `Bytes(Vec<u8>)` and
+      `Stream { len, reader }`, and `Response::send` dispatches a stream to
+      `Responder::send_stream`. `Response::stream(status, len, reader)` builds
+      one. `Response::send` takes `self` by value, because a stream owns its
+      reader and a response goes on the wire once.
 
-      **NOT a blocker for m6-file's migration, and this entry used to claim it
-      was.** The old wording, "m6-file is not choosing to buffer", is false:
-      every one of its response paths materialises a `Vec<u8>` and always has.
-      The ordinary path is `std::fs::read` of the whole file; the tail path is
-      `read_to_end` into a `Vec` capped at `MAX_TAIL_BYTES`; the HEAD fast path
-      sends no body at all. Checked against the source 2026-09-12 after the
-      owner said so.
+      **A sum type rather than a `Vec<u8>` beside an optional reader**, because
+      the difference is load-bearing: `as_bytes()` is `None` for a stream, so
+      minification, compression and the default content-hash ETag have nothing
+      to act on and cannot silently run against empty bytes sitting next to the
+      real body. Structural, not a flag.
 
-      It stays on the list as a real gap on its own terms: `HEAD` aside, a
-      3.6MB asset is read entirely into memory on every cache miss. But nothing
-      waits on it.
+      Alongside it, `Response::verbatim()` for the buffered case: a handler
+      that has already negotiated the coding and built an ETag naming that
+      representation. Core skips minify and compress for it. m6-file needs this
+      because re-compressing its output downstream would put brotli bytes on
+      the wire under a tag asserting identity, which is what its `-br`/`-gz`
+      suffixes exist to prevent.
+
+      **This row said "NOT a blocker for m6-file's migration" and it was
+      wrong.** The claim was written at 14:32 on 2026-09-12 (`a979390`,
+      "checked against the source") and 23 minutes later `8c79ee7` gave
+      m6-file `send_stream` for its identity path. Both entries were true when
+      written; nothing reconciled them, and the migration row inherited the
+      stale one. Migrating onto a byte-only `Response` would have put the
+      3.6MB-per-miss `fs::read` back on the service that serves every asset.
 - [ ] **The IO layer**: one selectable stream interface whatever the transport,
       with blocking handled *inside* it by specific named components, never a
       generic offload. Pilot is unifying `PoolManager { pools, url_backends }`.
@@ -486,8 +498,51 @@ Then, and only then, the two migrations below.
       **The route-reload blocker is gone as of 2026-09-12 (later session).**
       `App` now grows config-driven routes that survive a reload, which was the
       owner's instruction (*"And dynamicly reload the file list."*). See §6
-      below for the shape. What remains for m6-file itself is the migration:
-      its handler, its per-route `root` and `tail`, and its own accept loop.
+      below for the shape. **Streaming and `verbatim` landed the same session**,
+      so a handler can now serve a file without materialising it and without
+      having its negotiated representation re-encoded downstream.
+
+      **What is left is not plumbing, it is a measured cost, and this row has
+      understated the work three times now.** The row said "one decision away";
+      it was three core changes away, two of which are now done. The third is
+      this:
+
+      **`App` builds a request dictionary before every handler call, and a
+      static asset request uses none of it.** Measured on the laptop in
+      release, 2026-09-12: **`build_dict` p50 3.08us, p99 5.25us**, against
+      `find_route` at **167ns**. For scale, the production cache-hit p50 the
+      owner tracks as the key metric is **3.9us** (§3a), and syd is a 1-core
+      VM that will be worse. m6-file today matches a route and goes to the
+      filesystem; migrating as `App` stands adds roughly the whole tracked
+      cache-hit budget to every asset request, to build a map of config keys,
+      query params, cookies and two `chrono::Utc::now()` format calls that the
+      file handler never reads.
+
+      The measurement is `app::dict_cost_probe`, `#[ignore]`d because a timing
+      assertion is the wall-clock trap that `test_static_file_cache_hit`
+      already fell into. Re-run it with:
+
+      ```sh
+      cargo test --release -p m6-core measure_build_dict -- --ignored --nocapture
+      ```
+
+      - [ ] **Decide how a handler route avoids the dict it does not use.**
+            Options, unranked because this is the owner's call: an explicit
+            registration variant (`handler_no_dict`), a lazy dict built on
+            first `req.dict()`, or accepting the cost. Path params still have
+            to be validated either way, which is step 4 of `build_dict` and is
+            the only part m6-file needs. **Until this is settled the migration
+            is a known regression against the stated key metric**, so it is not
+            wired up.
+      - [ ] Then: the handler returns `Response` instead of writing to a
+            `Responder`, and the config gains `handler = "files"` on all 15
+            routes with `/assets/{relpath}` becoming `/assets/{*relpath}`.
+            That last one is a production config change and is why the core
+            wildcard defect above had to be fixed first.
+      - [ ] Then: its accept loop and 32-worker channel model give way to
+            `App`'s bounded pool and 503 backpressure. On a 1-core origin that
+            is a behaviour change on the asset path and wants measuring, not
+            assuming.
 - [ ] **`m6-auth-server` should be an `App` service.** It binds through
       `UnixServer` directly. **Its stated blocker is gone**: the capability it
       needed that `App` lacked was `chmod` on the socket, and that is now
