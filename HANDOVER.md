@@ -186,10 +186,13 @@ fn main() -> anyhow::Result<()> { App::new().run()?; Ok(()) }
 
 ## 3. What m6-core is now
 
-13,412 lines across 30 modules. **The reference is written:
+15,191 lines across 31 modules, recounted 2026-09-12. **The reference is
+written:
 `docs/m6-core-reference.md`**, every module and its interface. The table below
 is the index; that file is the detail. What remains is *inside* the code:
-seventeen modules still have no module-level doc comment.
+eighteen of the thirty-one modules still have no module-level doc comment
+(recounted 2026-09-12; it was seventeen of thirty before `server.rs` grew and
+the count moved).
 
 | module | what |
 |---|---|
@@ -272,8 +275,21 @@ Services: `m6-http` (edge/proxy), `m6-file`, `m6-html`, `m6-auth-server`,
    which should never have existed: a kqueue descriptor is pollable, so it goes
    straight onto the service's own poll loop as Linux already did with inotify.
    What is still owed there is §3c, the rewrite onto `nix`.
-4. **Deploy `m6-monitor` on the build host and prove it.** It is tested and has
-   never polled a real node. `deploy/FLEET-MONITOR.md` is the runbook. It runs
+4. **Deploy `m6-monitor` on the build host and prove it.** **Verified
+   2026-09-12: it is installed on no machine at all** — not syd, lon or chi,
+   and not the build host. This file used to say "has never polled a real
+   node" while `CONSOLIDATION-TODO` said "has now been run against the real
+   fleet from the laptop and works"; the two disagreed and neither was checked.
+   What is certain is that nothing is installed anywhere.
+
+   **It also cannot replace `tools/health-check.py` yet, whatever gets
+   installed.** `--check` reads `/traffic`, which **404s** on the deployed
+   binary, and `/perf`, whose deployed shape is `{node, uptime_s, metrics}`
+   with no `pools` field. Both were measured on syd on 2026-09-12. So the
+   build-host install is worth doing on its own (it is off-fleet and breaks no
+   freeze), but retiring the script waits on a post-freeze binary reaching the
+   nodes **and** on the firewall stats collector, because ufw counts are the
+   firewall's data and m6 does not expose them. `deploy/FLEET-MONITOR.md` is the runbook. It runs
    **off-fleet**, not on the centre: a monitor on syd cannot report that syd is
    down. The build host already reaches all three nodes and already holds the
    `/perf` token.
@@ -351,6 +367,9 @@ on `/perf` would remove Part A outright and is worth doing.
 
 ## 6b. Session of 2026-09-12, later
 
+> **Point-in-time record, not current state.** Claims here were true when
+> written. §1 and §4 are what is true now; where they disagree, they win.
+
 **Nothing deployed. Freeze intact.** 1002 tests, zero warnings, clippy at its
 ceiling, verified on Linux.
 
@@ -425,6 +444,9 @@ for weeks.
 ---
 
 ## 6a. Session of 2026-09-12
+
+> **Point-in-time record, not current state.** Claims here were true when
+> written. §1 and §4 are what is true now; where they disagree, they win.
 
 Eight commits, `588daca` to `0a40584`. Docs and small core changes; **nothing
 deployed, freeze intact**.
@@ -501,6 +523,9 @@ targets.
 ---
 
 ## 6. What this session produced
+
+> **Point-in-time record, not current state.** Claims here were true when
+> written. §1 and §4 are what is true now; where they disagree, they win.
 
 ### Phases 5 and 6: m6-render is gone
 

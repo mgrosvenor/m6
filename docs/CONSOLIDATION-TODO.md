@@ -534,14 +534,23 @@ and UDP, TLS, h2, h3, proxying, the cache. It is what `App` services sit behind.
       21 in the hardening fragment.
 - [ ] **Benchmark Phases 5 and 6.** The plan requires a delta per phase and
       neither has one. The whole request path moved between crates.
-- [ ] **Deploy `m6-monitor`.** It has now been run against the real fleet from
-      the laptop and works; it has never been installed on the build host.
-      `deploy/FLEET-MONITOR.md` is the runbook.
+- [ ] **Deploy `m6-monitor`.** **Verified 2026-09-12: installed on no machine
+      at all** — not syd, lon, chi, nor the build host. This entry used to say
+      it "has now been run against the real fleet from the laptop and works"
+      while `HANDOVER.md` said it "has never polled a real node". The two
+      disagreed, neither had been checked, and the checkable part is that
+      nothing is installed anywhere. `deploy/FLEET-MONITOR.md` is the runbook.
+      The build host is off-fleet, so installing it there breaks no freeze.
 - [ ] **Deploy the firewall stats collector.** Written and unit-tested, on no
       node. Until then `/traffic` reports `firewall: null`.
-- [ ] **Retire `tools/health-check.py`.** `m6-monitor --check` covers every
-      part and `/traffic` now covers ufw via the collector. Blocked only on
-      the two deployments above.
+- [ ] **Retire `tools/health-check.py`.** Blocked on the two deployments
+      above **and on the freeze**, which the old wording did not say. Measured
+      on syd 2026-09-12: `--check` reads `/traffic`, which **404s** on the
+      deployed binary, and `/perf`, whose deployed shape is
+      `{node, uptime_s, metrics}` with no `pools` field. So `--check` against
+      production today degrades to named warnings where the script reports
+      data, and it stays the tool to run until a post-freeze binary is on the
+      nodes.
 - [ ] **Raise the fd soft limit.** m6-http runs at 1024 against a 524288 hard
       limit. Harmless at 11 open, and the failure mode is `EMFILE` in an
       accept loop at 3am with nothing saying why.
