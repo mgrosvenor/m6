@@ -103,7 +103,7 @@ mod tests {
 #[cfg(test)]
 mod date_tests {
     use super::iso_date_from;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, UNIX_EPOCH};
 
     fn at(days: u64) -> String {
         iso_date_from(UNIX_EPOCH + Duration::from_secs(days * 86400))
