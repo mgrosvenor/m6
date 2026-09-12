@@ -90,40 +90,10 @@ fn toml_to_json(v: toml::Value) -> Value {
 // ── File mtime fallback ───────────────────────────────────────────────────────
 
 fn file_mtime_iso(path: &Path) -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
     let mtime = std::fs::metadata(path)
         .and_then(|m| m.modified())
-        .unwrap_or(SystemTime::now());
-    let secs = mtime.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    // Format as YYYY-MM-DD
-    let days = secs / 86400;
-    let y400 = days / 146097;
-    let rem  = days % 146097;
-    let y100 = (rem / 36524).min(3);
-    let rem  = rem - y100 * 36524;
-    let y4   = rem / 1461;
-    let rem  = rem % 1461;
-    let y1   = (rem / 365).min(3);
-    let doy  = rem - y1 * 365;
-    let year = (y400 * 400 + y100 * 100 + y4 * 4 + y1 + 1970) as u32;
-    let (month, day) = doy_to_md(doy as u32, is_leap(year));
-    format!("{:04}-{:02}-{:02}", year, month, day)
-}
-
-fn is_leap(y: u32) -> bool { y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) }
-
-fn doy_to_md(doy: u32, leap: bool) -> (u32, u32) {
-    let months: &[u32] = if leap {
-        &[31,29,31,30,31,30,31,31,30,31,30,31]
-    } else {
-        &[31,28,31,30,31,30,31,31,30,31,30,31]
-    };
-    let mut rem = doy;
-    for (i, &days) in months.iter().enumerate() {
-        if rem < days { return ((i + 1) as u32, rem + 1); }
-        rem -= days;
-    }
-    (12, 31)
+        .unwrap_or_else(|_| std::time::SystemTime::now());
+    m6_core::util::iso_date_from(mtime)
 }
 
 // ── Process one file ──────────────────────────────────────────────────────────
