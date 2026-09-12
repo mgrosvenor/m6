@@ -324,14 +324,12 @@ one page exhausted it.
 Core is missing five things. Two are live defects in services that are already
 the right shape, so they are worth doing whether or not anything is migrated:
 
-- [ ] **No read timeout on accepted connections.** Neither `App` nor
-      `m6_core::server` sets one. `m6-file` and `m6-auth-server` each set 30s
-      in their own mains; `m6-html`, `m6-monitor` and the three renderers have
-      none. A peer that connects and sends nothing parks a worker in
-      `parse_request`'s blocking `read()`, and the pools are two workers.
-      **Migrating the two stragglers onto `App` as it stands would delete the
-      only two read timeouts in the fleet.** Note this is a **stopgap**: see
-      the item below for why a timeout is the wrong shape of fix.
+- [x] **No read timeout on accepted connections.** **DONE 2026-09-12**,
+      `d52a51b`. `[server] read_timeout_s`, default 30, applied by `App` before
+      the connection reaches a worker; m6-file and m6-auth-server now call the
+      same `server::apply_read_timeout` instead of keeping their own copies.
+      Migrating the stragglers onto `App` no longer deletes the fleet's only
+      two timeouts. **Still a stopgap for the reason the next item gives.**
 - [ ] **The read happens on a worker, not on the event loop.** `app.rs:1872`
       accepts, `:1877` hands the **raw socket** to a worker, `:1920` the worker
       does the blocking read. The part whose timing an untrusted peer controls
@@ -344,11 +342,14 @@ the right shape, so they are worth doing whether or not anything is migrated:
       `H1State::Reading { buf }` state machine; `parse.rs` is only the blocking
       adapter. This is the destination, deliberately sequenced last in
       `m6-app-shape-plan.md` §6 because everything else makes it smaller.
-- [ ] **`send_with_length` has zero callers.** It exists for "a HEAD answered
-      without reading the file" and nothing calls it, so m6-file's HEAD path
-      does a full `fs::read` + minify + brotli-6 and then discards the body at
-      `h1.rs:700`. `HEAD /assets/vditor/dist/js/lute/lute.min.js` is 3.6MB of
-      work to return a header. `Response` cannot express it either.
+- [x] **`send_with_length` has zero callers.** **DONE 2026-09-12**,
+      `a094851` and `7932e43`. m6-file answers a HEAD from `metadata.len()`
+      without opening the file, but **only when the representation is the file**
+      (identity coding, minification off, and `is_file()` — a directory also has
+      metadata, which is how the first version answered 200 to `HEAD
+      /assets/css`). A compressed or minified representation still has to be
+      produced to be measured, because a HEAD must report what the GET would
+      send. `Response` still cannot express it.
 - [ ] **No wildcard route segment.** `Segment` is `Literal|Param` and
       `match_route` requires exact segment-count equality, so `App` cannot
       express a static file server. This is the whole of m6-file's reason to be
@@ -356,8 +357,11 @@ the right shape, so they are worth doing whether or not anything is migrated:
 - [ ] **No streaming response body.** `Responder`'s three senders all take
       `&[u8]` and `Response.body` is a `Vec<u8>`, so core cannot serve a body it
       has not fully materialised. m6-file is not choosing to buffer.
-- [ ] **No socket-permissions config key.** `m6-auth-server` sets `0666` by
-      hand.
+- [x] **No socket-permissions config key.** **DONE 2026-09-12**, `4fc33da`.
+      `[server] socket_mode`, octal string, default `0660`. It was m6-file *and*
+      m6-auth-server setting `0666` by hand, and `App` setting nothing at all,
+      so its five services took `0755` from the umask. All seven are now one
+      call to `server::apply_socket_mode`.
 
 Then, and only then, the two migrations below.
 
@@ -369,8 +373,10 @@ Then, and only then, the two migrations below.
       reason for the copy, needing the watcher fd and the listener in one wait
       set, is a thing `App` already does.
 - [ ] **`m6-auth-server` should be an `App` service.** It binds through
-      `UnixServer` directly. The only capability it needs that `App` lacks is
-      `chmod 0666` on the socket, which wants a config key, not a bespoke main.
+      `UnixServer` directly. **Its stated blocker is gone**: the capability it
+      needed that `App` lacked was `chmod` on the socket, and that is now
+      `[server] socket_mode` (2026-09-12). What remains is that it drives its
+      own accept loop, which is the same question as m6-file above.
 - [x] **`m6-monitor` lifecycle is now proven.** It was always structurally
       correct (`App::new().route_get(..).run()`), but had no `tests/` directory
       at all, so nothing had ever started the binary. `m6-monitor/tests/lifecycle.rs`.
@@ -410,13 +416,21 @@ and UDP, TLS, h2, h3, proxying, the cache. It is what `App` services sit behind.
       `align_of::<libc::inotify_event>() <= 8` was **evaluated** for the first
       time and holds. That was the premise behind `#[repr(align(8))]` and it
       was an untested assumption about the target's libc until now.
-- [ ] **`ConfigWatcher` has no tests, on any platform.** Found while confirming
-      the above. No `#[cfg(test)]` and no `#[test]` anywhere in `watcher.rs`;
-      `m6-core/tests/log_reload.rs` covers `LogHandle::reload` and not the
-      watcher. Two production consumers, `m6-file/src/main.rs:229` and
-      `app.rs:1748`, and config hot reload on Linux has never been exercised by
-      a test. So the item above closed "never compiled", not "verified": the
-      remaining half is behaviour.
+- [x] **`ConfigWatcher` has no tests, on any platform.** **DONE 2026-09-12**,
+      `e6ba278`. Four tests, waiting on the watcher's own fd with `poll(2)` the
+      way `App` does rather than sleeping: a write is seen and matched by name,
+      an idle watcher stays quiet, an absent directory is skipped rather than
+      fatal, and the Linux/macOS name-precision divergence is pinned in both
+      directions.
+
+      **Writing them found two defects in the macOS implementation**, both now
+      fixed in the same commit: `new` returned before its watcher threads had
+      registered their kevents, so an edge-triggered change in that window was
+      lost silently; and those threads never exited, waking once a second to
+      write to a closed descriptor for the life of the process. Both went away
+      with the threads, which should never have existed: a kqueue descriptor is
+      pollable, so it now goes straight onto the service's own poll loop, as
+      Linux already did with inotify. See §3c for what is still owed there.
 - [ ] **Staging cannot exercise the cache role.** `setup-staging.sh` is the same
       shape as production and states three deliberate differences, one of which
       has a sharper edge than it reads: staging is a **single origin, no cache
@@ -442,12 +456,19 @@ and UDP, TLS, h2, h3, proxying, the cache. It is what `App` services sit behind.
       The one thing `systemd-analyze` still flags, and it matters for the
       analytics stream, which holds client IPs, session ids and user agents.
       Staging first, then lon, chi, syd.
-- [ ] **Two flaky tests, same shape.** `redirect_lifecycle::sigterm_...` and
-      m6-auth-cli's `test_token_create_prints_jwt`. Both spawn external
-      processes, both failed exactly once inside a loaded full-workspace run,
-      neither reproduces in isolation, and in both cases the assertion text
-      was lost to a re-run. Capture the full output of the next failing
-      full-suite run *before* running anything else.
+- [~] **Two flaky tests, same shape.** **Five separate intermittent failures
+      were diagnosed to root cause on 2026-09-12 and none was chance**; see
+      HANDOVER open questions for the detail. Four helpers panicked on a
+      transport error inside the retry loop written to tolerate it, and two unit
+      tests raced over the process-global `SHUTDOWN_FLAG`. Each was reproduced
+      deliberately before being fixed.
+
+      **The two named here still have no explanation** and did not recur. What
+      has changed is that the next one will be readable: the Linux gate returns
+      the whole `failures:` section instead of a bare `panicked at <file>:<n>`,
+      and the rule is to run the suite as
+      `cargo test --workspace > /tmp/run.txt 2>&1` and grep the file, never the
+      pipe.
 - [ ] **`185.19.40.146`, block candidate, decision owed.** Three identical
       `//xmlrpc.php` sweeps on 2026-09-11 (06:34, 10:24, 11:48), ~20 requests
       each, 90% refused. Meets the same bar as `103.168.67.253` already in the
