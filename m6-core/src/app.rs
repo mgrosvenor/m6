@@ -1772,72 +1772,41 @@ fn run_app_with_shutdown(
         // When inotify is available we poll two fds (listener + inotify).
         // The 100 ms timeout ensures we catch shutdown signals promptly
         // even when the server is completely idle.
-        let borrowed_listener =
-            unsafe { std::os::fd::BorrowedFd::borrow_raw(listener_fd) };
-        let mut pfd_listener = nix::poll::PollFd::new(
-            &borrowed_listener,
-            nix::poll::PollFlags::POLLIN,
-        );
-
-        let watcher_fd = watcher.as_ref().and_then(|w| w.raw_fd()).unwrap_or(-1);
-        let (poll_result, listener_ready, inotify_fired) = if watcher_fd >= 0 {
-            let borrowed_ino =
-                unsafe { std::os::fd::BorrowedFd::borrow_raw(watcher_fd) };
-            let pfd_ino = nix::poll::PollFd::new(
-                &borrowed_ino,
-                nix::poll::PollFlags::POLLIN,
-            );
-            let mut fds = [pfd_listener, pfd_ino];
-            let r = nix::poll::poll(&mut fds, 100);
-            let l = fds[0]
-                .revents()
-                .map_or(false, |f| f.contains(nix::poll::PollFlags::POLLIN));
-            let i = fds[1]
-                .revents()
-                .map_or(false, |f| f.contains(nix::poll::PollFlags::POLLIN));
-            (r, l, i)
-        } else {
-            let r = nix::poll::poll(std::slice::from_mut(&mut pfd_listener), 100);
-            let l = pfd_listener
-                .revents()
-                .map_or(false, |f| f.contains(nix::poll::PollFlags::POLLIN));
-            (r, l, false)
-        };
+        let watcher_fd = watcher.as_ref().and_then(|w| w.raw_fd());
+        let ready = crate::server::poll_listener_and_watcher(listener_fd, watcher_fd, 100);
+        let (listener_ready, inotify_fired) = (ready.listener, ready.watcher);
 
         // ── Determine whether a reload is needed ─────────────────────────
         let mut should_reload = false;
 
-        match poll_result {
-            Ok(0) | Err(_) => {
-                // Timeout or interrupted — check shutdown flag.
-                if is_shutdown() {
-                    info!("Shutdown signal received, draining...");
-                    pool.drain();
-                    if let Some(f) = on_shutdown_cell.take() {
-                        f();
-                    }
-                    info!("Clean shutdown");
-                    break;
+        // Neither fd fired: a timeout, or a signal interrupted the wait.
+        if ready.idle {
+            if is_shutdown() {
+                info!("Shutdown signal received, draining...");
+                pool.drain();
+                if let Some(f) = on_shutdown_cell.take() {
+                    f();
                 }
-                // Mtime fallback: check every ~10 timeouts (≈1 s).
-                if watcher_fd < 0 {
-                    reload_countdown = reload_countdown.saturating_sub(1);
-                    if reload_countdown == 0 {
-                        reload_countdown = 10;
-                        let nm = file_mtime(&config_path);
-                        let ns = file_mtime(&site_toml_path);
-                        if nm != config_mtime || ns != site_toml_mtime {
-                            config_mtime = nm;
-                            site_toml_mtime = ns;
-                            should_reload = true;
-                        }
+                info!("Clean shutdown");
+                break;
+            }
+            // Mtime fallback: check every ~10 timeouts (≈1 s).
+            if watcher_fd.is_none() {
+                reload_countdown = reload_countdown.saturating_sub(1);
+                if reload_countdown == 0 {
+                    reload_countdown = 10;
+                    let nm = file_mtime(&config_path);
+                    let ns = file_mtime(&site_toml_path);
+                    if nm != config_mtime || ns != site_toml_mtime {
+                        config_mtime = nm;
+                        site_toml_mtime = ns;
+                        should_reload = true;
                     }
-                }
-                if !should_reload {
-                    continue;
                 }
             }
-            Ok(_) => {}
+            if !should_reload {
+                continue;
+            }
         }
 
         // Watcher fired — drain events and check for our watched files.

@@ -236,66 +236,35 @@ fn run() -> i32 {
             break;
         }
 
-        let borrowed_listener =
-            unsafe { std::os::fd::BorrowedFd::borrow_raw(listener_fd) };
-        let mut pfd_listener = nix::poll::PollFd::new(
-            &borrowed_listener,
-            nix::poll::PollFlags::POLLIN,
-        );
-
         let watcher_fd = watcher.as_ref().and_then(|w| w.raw_fd());
-
-        let (poll_result, listener_ready, watcher_fired) = if let Some(wfd) = watcher_fd {
-            let borrowed_w = unsafe { std::os::fd::BorrowedFd::borrow_raw(wfd) };
-            let pfd_w = nix::poll::PollFd::new(
-                &borrowed_w,
-                nix::poll::PollFlags::POLLIN,
-            );
-            let mut fds = [pfd_listener, pfd_w];
-            let r = nix::poll::poll(&mut fds, 100);
-            let l = fds[0]
-                .revents()
-                .map_or(false, |f| f.contains(nix::poll::PollFlags::POLLIN));
-            let w = fds[1]
-                .revents()
-                .map_or(false, |f| f.contains(nix::poll::PollFlags::POLLIN));
-            (r, l, w)
-        } else {
-            let r = nix::poll::poll(std::slice::from_mut(&mut pfd_listener), 100);
-            let l = pfd_listener
-                .revents()
-                .map_or(false, |f| f.contains(nix::poll::PollFlags::POLLIN));
-            (r, l, false)
-        };
+        let ready = m6_core::server::poll_listener_and_watcher(listener_fd, watcher_fd, 100);
+        let (listener_ready, watcher_fired) = (ready.listener, ready.watcher);
 
         // ── Determine whether a reload is needed ─────────────────────────
         let mut should_reload = false;
 
-        match poll_result {
-            Ok(0) | Err(_) => {
-                // Timeout or interrupted — check shutdown flag.
-                if shutdown.is_shutdown() {
-                    break;
-                }
-                // Mtime fallback: check every ~10 timeouts (≈1 s) when no watcher fd.
-                if watcher_fd.is_none() {
-                    reload_countdown = reload_countdown.saturating_sub(1);
-                    if reload_countdown == 0 {
-                        reload_countdown = 10;
-                        let new_mtime = std::fs::metadata(&config_path)
-                            .and_then(|m| m.modified())
-                            .ok();
-                        if new_mtime != last_config_mtime {
-                            last_config_mtime = new_mtime;
-                            should_reload = true;
-                        }
+        // Neither fd fired: a timeout, or a signal interrupted the wait.
+        if ready.idle {
+            if shutdown.is_shutdown() {
+                break;
+            }
+            // Mtime fallback: check every ~10 timeouts (≈1 s) when no watcher fd.
+            if watcher_fd.is_none() {
+                reload_countdown = reload_countdown.saturating_sub(1);
+                if reload_countdown == 0 {
+                    reload_countdown = 10;
+                    let new_mtime = std::fs::metadata(&config_path)
+                        .and_then(|m| m.modified())
+                        .ok();
+                    if new_mtime != last_config_mtime {
+                        last_config_mtime = new_mtime;
+                        should_reload = true;
                     }
                 }
-                if !should_reload {
-                    continue;
-                }
             }
-            Ok(_) => {}
+            if !should_reload {
+                continue;
+            }
         }
 
         // Watcher fd fired — drain events and check for our config file.
