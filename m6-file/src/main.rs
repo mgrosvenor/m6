@@ -377,7 +377,7 @@ fn handle_connection(
     // the same as m6-html's or m6-auth-server's, and none of the three kept a
     // connection open.
     m6_core::server::serve_connection(&mut stream, |req, resp| -> Result<()> {
-        let info = handle_request(req, &ctx, resp).context("handling request")?;
+        let info = handle_request(&req, &ctx, resp).context("handling request")?;
         debug!(
             path = req.path,
             method = req.method,

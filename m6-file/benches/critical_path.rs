@@ -149,7 +149,7 @@ fn bench_socket_round_trip(c: &mut Criterion) {
             // is the one that actually happens.
             let ctx = HandlerContext { routes: &routes, config: &config, site_dir: &dir_path };
             let _ = m6_core::server::serve_connection(&mut stream, |req, resp| {
-                handle_request(req, &ctx, resp).map(|_| ()).map_err(|e| {
+                handle_request(&req, &ctx, resp).map(|_| ()).map_err(|e| {
                     std::io::Error::other(e.to_string())
                 })
             });
@@ -238,7 +238,7 @@ fn main() {
                 stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
                 let ctx = HandlerContext { routes: &routes, config: &config, site_dir: &dir2_path };
                 let _ = m6_core::server::serve_connection(&mut stream, |req, resp| {
-                    handle_request(req, &ctx, resp).map(|_| ()).map_err(|e| {
+                    handle_request(&req, &ctx, resp).map(|_| ()).map_err(|e| {
                         std::io::Error::other(e.to_string())
                     })
                 });

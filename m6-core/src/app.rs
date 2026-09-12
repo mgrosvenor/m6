@@ -392,7 +392,11 @@ struct FrameworkState {
     /// Likewise: one `PathBuf` allocation per request, twice, for a path that
     /// does not change between reloads.
     site_dir: Arc<PathBuf>,
-    routes: Vec<CompiledRoute>,
+    /// Shared rather than owned, so a request can route outside the read lock
+    /// without copying the route it matched. `find_route` returns a borrow,
+    /// and the borrow used to be turned into an owned `CompiledRoute` purely
+    /// to outlive the guard.
+    routes: Arc<Vec<CompiledRoute>>,
     global_params_data: Map<String, Value>,
     static_params: HashMap<String, Arc<Map<String, Value>>>,
     params_cache: Arc<ParamsCache>,
@@ -666,7 +670,7 @@ impl FrameworkState {
         Ok(Self {
             config: Arc::new(config),
             site_dir: Arc::new(site_dir),
-            routes,
+            routes: Arc::new(routes),
             global_params_data,
             static_params,
             params_cache,
@@ -2322,7 +2326,7 @@ fn handle_connection(
 }
 
 fn handle_request<W: std::io::Write>(
-    raw: &RawRequest,
+    raw: RawRequest,
     stream: &mut crate::h1::Responder<'_, W>,
     fs: &std::sync::RwLock<FrameworkState>,
     code_handlers: &HashMap<String, Arc<BoxHandler>>,
@@ -2339,14 +2343,17 @@ fn handle_request<W: std::io::Write>(
     // directory. They do not vary between reloads, so an `Arc` clone is the
     // honest way to carry them out: two refcount bumps instead of two
     // `HashMap`s and a `PathBuf`.
-    let (route_match, site_dir, config) = {
+    let (routes, site_dir, config) = {
         let fs_r = fs.read().unwrap();
-        let route_match = find_route(raw.path(), raw.method(), &fs_r.routes)
-            .map(|(route, params)| (route.clone(), params));
-        (route_match, Arc::clone(&fs_r.site_dir), Arc::clone(&fs_r.config))
+        (Arc::clone(&fs_r.routes), Arc::clone(&fs_r.site_dir), Arc::clone(&fs_r.config))
     };
     let compression = &config.compression;
     let minification = &config.minification;
+
+    // Routing happens outside the lock now, against the shared route table.
+    // It used to happen inside, and the matched route was then cloned purely
+    // so it could outlive the guard.
+    let route_match = find_route(raw.path(), raw.method(), &routes);
 
     // Populated from `dict["csrf_token"]` inside the matched-route arm below
     // (when the csrf feature is on) so the cookie set further down uses the
@@ -2356,12 +2363,13 @@ fn handle_request<W: std::io::Write>(
     #[cfg(feature = "csrf")]
     let mut csrf_token_for_cookie: Option<String> = None;
 
-    let mut resp = match route_match {
+    let (mut resp, raw) = match route_match {
         None => {
             warn!(path = raw.path(), "unmatched path");
-            Response::not_found()
+            (Response::not_found(), raw)
         }
         Some((route, path_params)) => {
+            let route: &CompiledRoute = route;
             // Re-acquire read lock for dict building and template rendering.
             let fs_r = fs.read().unwrap();
 
@@ -2380,8 +2388,12 @@ fn handle_request<W: std::io::Write>(
                 csrf_token_for_cookie = dict.get("csrf_token").and_then(|v| v.as_str()).map(str::to_string);
             }
 
-            let req = Request::new(raw.clone(), dict.clone(), Arc::clone(&site_dir))
-                .with_route(&route);
+            // `raw` is handed over rather than cloned: `serve_connection` has
+            // no use for it after this, and a `Request` owning one used to
+            // cost a full copy of the method, path, query, every header and
+            // the body, per request.
+            let req = Request::new(raw, dict.clone(), Arc::clone(&site_dir))
+                .with_route(route);
 
             // Dispatch to code handler or template render.
             // A code handler is only used when the matched route is a code route
@@ -2434,7 +2446,7 @@ fn handle_request<W: std::io::Write>(
                 match fs_r.render_response(&mut resp, &dict) {
                     Ok(()) => {}
                     Err(RenderError::NotFound) => {
-                        warn!(path = raw.path(), "template signalled not_found");
+                        warn!(path = req.path(), "template signalled not_found");
                         resp = Response::not_found();
                     }
                     Err(RenderError::Failed(e)) => {
@@ -2475,7 +2487,9 @@ fn handle_request<W: std::io::Write>(
                 resp.headers.push((k.clone(), v.clone()));
             }
 
-            resp
+            // The raw request comes back for the tail below, which negotiates
+            // the coding, checks the cookies and writes the access log.
+            (resp, req.into_raw())
         }
     };
 
@@ -3841,11 +3855,17 @@ mod copy_audit {
             ("Arc::clone(config) + Arc::clone(site_dir)  [was 458]", median(N, || {
                 std::hint::black_box((Arc::clone(&state.config), Arc::clone(&state.site_dir)));
             })),
-            ("route.clone()", median(N, || { std::hint::black_box(route.clone()); })),
+            // J6 (done): the route table is shared, so routing borrows from
+            // an `Arc` instead of cloning the matched route out of the guard.
+            ("Arc::clone(routes)  [was route.clone(), 167]", median(N, || {
+                std::hint::black_box(Arc::clone(&state.routes));
+            })),
             ("build_dict (3 copies inside)", median(N, || {
                 std::hint::black_box(state.build_dict(&raw, route, &params).unwrap());
             })),
-            ("raw.clone()", median(N, || { std::hint::black_box(raw.clone()); })),
+            // J6 (done): `serve_connection` hands the request over instead of
+            // lending it, so there is nothing to clone.
+            ("raw.clone()  [removed]", 0),
             ("dict.clone() into Request", median(N, || { std::hint::black_box(dict.clone()); })),
             // J5 (done): render_response renders against the request dict
             // when the response supplied no context of its own, which is the
@@ -3864,6 +3884,35 @@ mod copy_audit {
             })),
         ];
         let total: u64 = rows.iter().map(|(_, ns)| ns).sum();
+
+        // J7 in proportion: what does the render itself cost, against the
+        // context build that precedes it? A minimal template is the *most*
+        // favourable case for the copy mattering, since a real page does far
+        // more work; if the copy is small even here, it is smaller in
+        // production.
+        let mut tera = tera::Tera::default();
+        tera.add_raw_template("t.html", "<h1>{{ site_name | default(value='x') }}</h1>").unwrap();
+        let ctx_build = median(N, || {
+            let mut tctx = tera::Context::new();
+            for (k, v) in dict.iter() {
+                tctx.insert(k.as_str(), v);
+            }
+            std::hint::black_box(tctx);
+        });
+        let build_and_render = median(N, || {
+            let mut tctx = tera::Context::new();
+            for (k, v) in dict.iter() {
+                tctx.insert(k.as_str(), v);
+            }
+            std::hint::black_box(tera.render("t.html", &tctx).unwrap());
+        });
+        println!();
+        println!("J7 in proportion (minimal template, the most favourable case):");
+        println!("  context build      {ctx_build:>8} ns");
+        println!("  build + render     {build_and_render:>8} ns");
+        println!("  render alone       {:>8} ns", build_and_render.saturating_sub(ctx_build));
+        println!("  context share      {:>7.1}%", 100.0 * ctx_build as f64 / build_and_render as f64);
+
 
         println!("| copy | ns |");
         println!("|---|---:|");
