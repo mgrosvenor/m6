@@ -32,12 +32,12 @@ commit log rather than written from memory.
 
 ## 1. Where the work is
 
-**Branch `main`, clean, 84 commits ahead of the deployed `22ee3a4` here and 15
+**Branch `main`, clean, 88 commits ahead of the deployed `22ee3a4` here and 17
 ahead of `d6ebfa5` in the site repo. No migration code is deployed and the
 freeze holds until it is finished.**
 
-> **Both repos are ahead of `origin/main` and that is not fine.** 65 commits on
-> `m6`, 13 on the site repo, as of 2026-09-12. Ahead of the *fleet* is the
+> **Both repos are ahead of `origin/main` and that is not fine.** 69 commits on
+> `m6`, 15 on the site repo, as of 2026-09-12. Ahead of the *fleet* is the
 > deliberate freeze; ahead of *origin* is just unbacked work on a laptop, and
 > the site handover's §5 says to push when you find this. Not pushed here
 > because `m6`'s `pre-push` hook runs the full suite and the owner has not
@@ -79,9 +79,16 @@ applied them:
   was previously refused on one node and served on two, which is exactly what
   the reconciliation was for.
 
-- **980 workspace tests pass at default features, verified on Linux via
+- **981 workspace tests pass at default features, verified on Linux via
   `deploy/run-tests.sh m6` on 2026-09-12. Zero warnings**, release and test
   builds, same count as macOS.
+- **Clippy is a gate now**, on the owner's instruction: `tools/clippy.sh`,
+  wired into `check.sh` (step 2, so the pre-push hook covers it) and into the
+  Linux gate before prod. It is a **ratchet**, not `-D warnings`: the count may
+  fall and may never rise. Ceilings are **per platform** because clippy
+  versions disagree, at `tools/clippy-ceiling-Darwin.txt` (161) and
+  `tools/clippy-ceiling-Linux.txt` (148). A clippy *error* fails regardless.
+  **Driving the ceiling to zero is outstanding and not yet approved as work.**
 - h1spec **32/32 on all four HTTP/1.1 targets**, with a CI ratchet
   (`tools/conformance.sh`, floors in `tools/conformance-scores.txt`) wired into
   `check.sh` as a blocking gate.
@@ -443,35 +450,42 @@ renderers switched to m6-core.
 - **24h hit rates**: syd ~0.58, lon ~0.16-0.19, chi ~0.19-0.21. Stable across
   the day. The earlier reconciliation that looked wrong was my own error:
   origin never sees what a cache node answers from its own cache.
-- **Two tests are flaky, and they share a shape.** Both spawn external
-  processes, both have failed exactly once inside a loaded full-workspace run,
-  and neither reproduces in isolation. In both cases the assertion text was
-  lost, which is the thing to fix first next time: capture the full output of
-  a failing full-suite run before re-running anything.
+- ~~**Two tests are flaky, and they share a shape.**~~ **LARGELY RESOLVED
+  2026-09-12, and "flaky" was the wrong word for all of it.** Five distinct
+  intermittent failures were run to ground in one session. Every one had a
+  specific mechanism, and every one was reproduced deliberately before being
+  fixed. Nothing was written off.
 
-  - `redirect_lifecycle::sigterm_shuts_down_rather_than_being_ignored`. Did
-    not reproduce in 21 further runs. Ruled out: the obvious startup race,
-    because `redirect::run` installs `ShutdownHandle` *before* `bind_plain`.
-    It guards a bug that shipped.
-  - `m6-auth-cli` `test_token_create_prints_jwt`. Did not reproduce in three
-    isolated runs or a subsequent full gate. It shells out to `openssl` three
-    times per `setup_keys`, and several tests in that file do the same, so
-    process spawning under load is the first place to look.
+  - **Four helpers panicked inside a readiness loop.** Every e2e suite waits
+    with `wait::until(30s, || <request>.status == 200)` for m6-http to fill its
+    backend pool, and four of the request helpers `.unwrap()`ed a transport
+    error, so the first hiccup ended the run instead of being retried. Two
+    unwrapped `write_all` (a server that accepts then closes sends RST, so the
+    client learns on its next write, which for TLS is the handshake); two
+    panicked on a refused connect on the stated premise that a refusal means
+    the service died, while calling `assert_alive` first and printing
+    `failed with m6-http alive` when it did not. Reproduced deterministically
+    with a listener that accepts and drops, matching the original error exactly.
+  - **Two unit tests raced over a global `static`.** `SHUTDOWN_FLAG` is one
+    `AtomicBool` for the process; one test stores `true`, another asserts
+    `false`, and `cargo test` runs them on different threads. It failed once in
+    a full run and never in 300 runs of that module alone, because the window
+    is two atomic stores wide. Widening each side by 50 ms reproduces it every
+    time. Fixed with a mutex, verified under those same widened windows.
+  - **A wall-clock assertion.** `test_static_file_cache_hit` closed with
+    `hit_latency < 5ms`. It is the example the site handover's traps already
+    used, and it duly fired on the loaded Linux build box against correct code.
+    Now asserts `Age`, measured on the wire first: a miss carries no `age`
+    header, a hit carries one.
 
-  Neither is understood. A test that fails only when the machine is busy is
-  either a real race or a test that is too tight, and both are worth knowing
-  which.
+  **The two originally named here are still not understood**, and neither
+  recurred this session: `redirect_lifecycle::sigterm_shuts_down_rather_than_being_ignored`
+  and `m6-auth-cli`'s `test_token_create_prints_jwt`. What has changed is that
+  the next one will be readable rather than lost. **Run the suite as
+  `cargo test --workspace > /tmp/run.txt 2>&1` and grep the file, never the
+  pipe**, and the Linux gate now returns the whole `failures:` section instead
+  of a bare `panicked at <file>:<line>` with the reason stripped off.
 
-  **It happened a third time on 2026-09-12 and the output was lost again, the
-  same way.** A full-workspace run reported 938 passed and 1 failed where a
-  clean run is 979, so a suite aborted roughly 41 tests in. Which test it was
-  is unknown: the run was piped through `grep` for the totals, and the next
-  action was to re-run rather than to read, which is precisely what the
-  paragraph above says not to do. Three captured runs afterwards were 979/0,
-  and three more on Linux were clean. **So the instruction is now concrete:
-  run the full suite as `cargo test --workspace > /tmp/run.txt 2>&1` and grep
-  the file, never the pipe.** A failure that only shows up under load is one
-  you get a few seconds to read.
 - ~~**`185.19.40.146` is a block candidate**~~ **BLOCKED 2026-09-12**, with
   four others. Ledger and all three nodes at 31 rules, in sync.
   **The open question it leaves is the campaign, not the address.** One
@@ -659,3 +673,22 @@ New 2026-09-12:
     against GET comparison walks identity, minified and brotli and asserts
     identical headers, and it stayed green through the directory defect above,
     because every path it asks for is a file. Equivalence is not coverage.
+31. **A test helper that cannot fail is not a probe.** Four readiness helpers
+    in the e2e suites `.unwrap()`ed a transport error while being called from
+    inside a 30-second retry loop written to tolerate exactly that. Two of them
+    panicked on a refused connect *after* asking whether the service was alive,
+    and printed the answer in the panic: `failed with m6-http alive`. **When a
+    failure message contains its own refutation, believe the message.**
+32. **"It does not reproduce" is a statement about the harness, not the bug.**
+    Five separate intermittent failures were each reproduced deliberately once
+    the mechanism was guessed: a listener that accepts and drops for the RST, a
+    50 ms window on each side of a global static for the race. The one that
+    took longest, `a_fresh_flag_is_clear`, ran clean 300 times in isolation and
+    300 times under artificial CPU load, and was still a hard race. **Narrow is
+    not the same as rare, and neither is the same as acceptable.**
+33. **A gate must run where production runs, and the difference will find you.**
+    Three things only showed up on the Linux build box: clippy was not
+    installed, the clippy count differed by 13 from the laptop's (different
+    version, plus cfg-gated code that only compiles there), and the
+    unreadable-file test could not work because the box runs as **root**, which
+    ignores permission bits. None of it was visible locally.

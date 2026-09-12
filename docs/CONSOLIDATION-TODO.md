@@ -169,12 +169,21 @@ consolidated in `server::serve_connection`, so what is left is small:
 
 Tier 2, about a day, moderate risk, optional:
 
-- [ ] **Extract the accept/poll block into core.** m6-file's loop is 22 of 33
-      lines identical to `App`'s; both poll listener-plus-watcher-fd and differ
-      only in local names. One function both call. After this the stragglers'
-      mains are thin wrappers around core's loop, core's connection handling
-      and core's socket setup, which is "roughly agree" honestly earned with no
-      migration, no router change and no contract change.
+- [x] **Extract the accept/poll block into core.** **DONE 2026-09-12**,
+      `cf84546`, and only the poll block. `server::poll_listener_and_watcher`
+      returns a `PollReady` of three flags; both callers had built the same
+      `BorrowedFd` and `PollFd`, branched on whether the watcher had a usable
+      fd, and unpacked `revents` identically, differing only in local names and
+      in whether an absent watcher fd was `Option<RawFd>` or the sentinel `-1`.
+
+      **What was deliberately left alone is what comes after the wait.** `App`
+      submits to a bounded thread pool and answers 503 when the queue is full;
+      m6-file sends down a channel to a fixed worker set and counts in-flight
+      requests itself, drains every ready connection per wake, and resets
+      `O_NONBLOCK` because its listener is non-blocking and `App`'s is not.
+      Those are two concurrency models rather than two copies of one. Merging
+      them is §3b-later, and forcing it here would be the wrong abstraction
+      that `m6-core.md` warns costs more than the duplicate.
 
 Unrelated to shape, free, no baseline needed:
 
