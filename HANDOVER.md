@@ -245,6 +245,14 @@ Services: `m6-http` (edge/proxy), `m6-file`, `m6-html`, `m6-auth-server`,
    down. The build host already reaches all three nodes and already holds the
    `/perf` token.
 5. **The m6-http header sweep**, about a dozen ad-hoc lookups left.
+5b. **Rewrite `watcher.rs` on `nix`'s safe wrappers** (`CONSOLIDATION-TODO` §3c),
+   owner's instruction 2026-09-12. The threads are already gone (`e6ba278`,
+   single pollable kqueue on the main poll); what remains is ~390 lines of raw
+   unsafe libc across three cfg arms, including the manual `inotify_event`
+   pointer walk that produced the alignment UB. `nix` is already a dependency.
+   **Do not reach for `notify`**: it spawns its own thread and delivers over a
+   channel, which puts back what `e6ba278` removed. The watcher must keep
+   exposing a pollable fd for the service's own poll loop.
 6. **HTTP Garden** (arxiv 2405.17737), the differential fuzzer. Needs Docker,
    so the build box.
 7. **h2spec and h3spec on the build box** before any deploy.

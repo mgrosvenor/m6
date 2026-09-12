@@ -122,6 +122,39 @@ Verified by commit, gate green at each step unless noted.
       next to `core::conditional`. Check whether it genuinely differs (strong
       vs weak) or merely duplicates.
 
+### 3c. `watcher.rs` is hand-rolled unsafe libc and should not be
+
+**OWNER'S INSTRUCTION, 2026-09-12: put it on the list.** The verdict was
+"standard OS interfaces to watch a file and poll to wake up when there's a
+change; extra threads are totally unnecessary; there are standard Unix wrappers
+around all of these."
+
+**The threads are already gone** (`e6ba278`): macOS now registers on a single
+kqueue and returns that descriptor from `raw_fd`, so the service's existing
+`poll(2)` waits on it directly, as Linux already did with inotify. That fixed a
+startup race and a thread leak, and cut the watcher tests from 5.01s to 0.31s.
+
+**What is still wrong is the level it is written at.** 390 lines of raw
+`unsafe` libc across three `#[cfg]` arms: `inotify_init1`, manual pointer
+arithmetic over `inotify_event` (which is where the unaligned-read UB came from
+in the first place), `kqueue`, `kevent`, `open(O_EVTONLY)`, hand-managed
+descriptors and three `Drop` impls. None of that is m6's problem to solve.
+
+- [ ] **Rewrite on `nix`'s safe wrappers.** `nix::sys::inotify` and
+      `nix::sys::event` cover both platforms, and **`nix` is already a
+      dependency** of m6-core, since it is where `nix::poll` comes from. No new
+      dependency, and the unsafe blocks and the manual event-buffer walk both
+      go.
+
+**Constraint the rewrite must not break:** the watcher exposes a pollable file
+descriptor and the *service's own* poll loop waits on it. The obvious crate,
+`notify`, spawns a background thread and delivers over a channel, which would
+reintroduce exactly what `e6ba278` removed. A wrapper is wanted, not a runtime.
+
+This also retires the standing lesson about the unaligned `inotify_event` read:
+that bug existed because the code was doing pointer arithmetic it had no
+business doing.
+
 ### 3a. Cache-hit p50 regression: 2.1x in six days, cause unknown
 
 **TRACKED 2026-09-12. Open, not started, and deliberately not closed by
