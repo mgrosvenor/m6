@@ -150,16 +150,50 @@ pub struct CompiledRoute {
 pub enum Segment {
     Literal(String),
     Param(String),
+    /// `{*name}` — captures this segment and every one after it, joined by `/`.
+    ///
+    /// **Only legal as the last segment**, because a wildcard in the middle has
+    /// no single correct answer: `/a/{*rest}/c` against `/a/b/c/d/c` could
+    /// split in two places and neither is more right than the other.
+    ///
+    /// This is what `App` needed in order to express a static file server, and
+    /// it is the whole of why `m6-file` has a different shape. Note m6-file
+    /// spells the same idea as a bare `{relpath}` in the last position, which
+    /// works because its own matcher makes the final parameter greedy. Core
+    /// does not copy that: making the last `{param}` implicitly span several
+    /// segments would silently change the meaning of every route already
+    /// written, including every one in production. The star is explicit.
+    Wildcard(String),
 }
 
 /// Compile a route pattern string into segments.
+///
+/// `{name}` is one segment, `{*name}` is the rest of the path. A `{*name}`
+/// anywhere but last is compiled as an ordinary parameter and warned about,
+/// rather than rejected: this runs at startup for every route in a config, and
+/// taking a service down over a pattern that is merely ambiguous is worse than
+/// serving it with the narrower reading.
 pub fn compile_pattern(pattern: &str) -> Vec<Segment> {
-    pattern
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .map(|s| {
+    let raw: Vec<&str> = pattern.split('/').filter(|s| !s.is_empty()).collect();
+    let last = raw.len().saturating_sub(1);
+    raw.iter()
+        .enumerate()
+        .map(|(i, s)| {
             if s.starts_with('{') && s.ends_with('}') {
-                Segment::Param(s[1..s.len() - 1].to_string())
+                let inner = &s[1..s.len() - 1];
+                if let Some(name) = inner.strip_prefix('*') {
+                    if i == last {
+                        return Segment::Wildcard(name.to_string());
+                    }
+                    warn!(
+                        pattern = pattern,
+                        segment = *s,
+                        "a wildcard is only meaningful as the last segment; \
+                         treating it as an ordinary parameter"
+                    );
+                    return Segment::Param(name.to_string());
+                }
+                Segment::Param(inner.to_string())
             } else {
                 Segment::Literal(s.to_string())
             }
@@ -167,11 +201,19 @@ pub fn compile_pattern(pattern: &str) -> Vec<Segment> {
         .collect()
 }
 
+/// How specific a route is. Higher wins when several match.
+///
+/// A wildcard scores *below* a parameter in the same position, so
+/// `/assets/{name}` beats `/assets/{*rest}` for a one-segment tail and
+/// `/assets/style.css` beats both. Without that, adding a catch-all to a config
+/// would quietly capture traffic from the exact routes beside it.
 pub fn route_specificity(segments: &[Segment]) -> i32 {
     let mut score = (segments.len() as i32) * 2;
     for seg in segments {
-        if matches!(seg, Segment::Literal(_)) {
-            score += 1;
+        match seg {
+            Segment::Literal(_) => score += 1,
+            Segment::Param(_) => {}
+            Segment::Wildcard(_) => score -= 1,
         }
     }
     score
@@ -196,9 +238,19 @@ pub type PathParams = Vec<(String, String)>;
 /// Try to match pre-split URL path segments against a compiled route.
 /// Returns `Some(params)` on success.
 pub fn match_route(path_segs: &[&str], route: &CompiledRoute) -> Option<PathParams> {
-    if path_segs.len() != route.segments.len() {
+    let trailing_wildcard = matches!(route.segments.last(), Some(Segment::Wildcard(_)));
+
+    // A wildcard route matches a path at least as long as its own fixed part.
+    // Everything else still requires an exact segment count, which is what
+    // stops `/a/{b}` answering for `/a/b/c`.
+    if trailing_wildcard {
+        if path_segs.len() < route.segments.len() {
+            return None;
+        }
+    } else if path_segs.len() != route.segments.len() {
         return None;
     }
+
     let mut params = PathParams::new();
     for (ps, seg) in route.segments.iter().enumerate() {
         match seg {
@@ -209,6 +261,12 @@ pub fn match_route(path_segs: &[&str], route: &CompiledRoute) -> Option<PathPara
             }
             Segment::Param(name) => {
                 params.push((name.clone(), path_segs[ps].to_string()));
+            }
+            Segment::Wildcard(name) => {
+                // The rest of the path, rejoined. Empty segments were dropped
+                // by the split, so `/a//b` captures as `a/b`; that collapsing
+                // is deliberate, since the two address the same file.
+                params.push((name.clone(), path_segs[ps..].join("/")));
             }
         }
     }
@@ -2671,5 +2729,99 @@ mod last_modified_tests {
         // Returns rather than recursing forever; the too-deep file is simply
         // not counted, which is the safe direction.
         assert!(newest_mtime_under(d.path()).is_none());
+    }
+}
+
+#[cfg(test)]
+mod wildcard_route_tests {
+    use super::*;
+
+    fn route(pattern: &str) -> CompiledRoute {
+        let segments = compile_pattern(pattern);
+        CompiledRoute {
+            pattern: pattern.to_string(),
+            method: RouteMethod::Any,
+            specificity: route_specificity(&segments),
+            segments,
+            template: None,
+            params_files: Vec::new(),
+            status: 200,
+            cache: String::new(),
+            headers: Vec::new(),
+            last_modified: None,
+        }
+    }
+
+    fn m(pattern: &str, path: &str) -> Option<PathParams> {
+        let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        match_route(&segs, &route(pattern))
+    }
+
+    /// The capability `App` was missing, and the whole of why m6-file has a
+    /// different shape: a static file server needs one route to answer for a
+    /// path of unknown depth.
+    #[test]
+    fn a_wildcard_captures_the_rest_of_the_path() {
+        assert_eq!(
+            m("/assets/{*relpath}", "/assets/css/main.css"),
+            Some(vec![("relpath".to_string(), "css/main.css".to_string())])
+        );
+        assert_eq!(
+            m("/assets/{*relpath}", "/assets/a/b/c/d/e.png"),
+            Some(vec![("relpath".to_string(), "a/b/c/d/e.png".to_string())])
+        );
+    }
+
+    /// One segment is still a match. `{*name}` means "the rest", and one is a
+    /// quantity of rest.
+    #[test]
+    fn a_wildcard_also_matches_a_single_segment() {
+        assert_eq!(
+            m("/assets/{*relpath}", "/assets/favicon.ico"),
+            Some(vec![("relpath".to_string(), "favicon.ico".to_string())])
+        );
+    }
+
+    /// But not an empty one. `/assets` is the directory, not a file in it, and
+    /// capturing an empty string would hand the handler a path it cannot use.
+    #[test]
+    fn a_wildcard_does_not_match_nothing() {
+        assert_eq!(m("/assets/{*relpath}", "/assets"), None);
+    }
+
+    /// The guard that stops this being a behaviour change: an ordinary
+    /// parameter is still exactly one segment. Every route in production is
+    /// written this way, and if `{p}` had quietly become greedy they would all
+    /// have changed meaning at once.
+    #[test]
+    fn an_ordinary_parameter_still_matches_exactly_one_segment() {
+        assert!(m("/assets/{relpath}", "/assets/css/main.css").is_none());
+        assert_eq!(
+            m("/assets/{relpath}", "/assets/main.css"),
+            Some(vec![("relpath".to_string(), "main.css".to_string())])
+        );
+    }
+
+    /// A literal beats a parameter beats a wildcard for the same path, so
+    /// adding a catch-all to a config does not quietly capture the traffic of
+    /// the exact routes sitting beside it.
+    #[test]
+    fn specificity_orders_literal_above_param_above_wildcard() {
+        let lit = route("/assets/style.css").specificity;
+        let par = route("/assets/{name}").specificity;
+        let wild = route("/assets/{*rest}").specificity;
+        assert!(lit > par, "literal {lit} should beat param {par}");
+        assert!(par > wild, "param {par} should beat wildcard {wild}");
+    }
+
+    /// A wildcard that is not last has no single correct split, so it is
+    /// narrowed to an ordinary parameter rather than taking the service down.
+    #[test]
+    fn a_wildcard_that_is_not_last_is_narrowed_not_fatal() {
+        let segs = compile_pattern("/a/{*rest}/c");
+        assert!(matches!(segs[1], Segment::Param(_)), "got {:?}", segs[1]);
+        // Which means it behaves as one segment, not as a greedy match.
+        assert!(m("/a/{*rest}/c", "/a/b/x/c").is_none());
+        assert!(m("/a/{*rest}/c", "/a/b/c").is_some());
     }
 }

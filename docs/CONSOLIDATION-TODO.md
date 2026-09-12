@@ -316,9 +316,22 @@ Unrelated to shape, free, no baseline needed:
 
 Design is settled and written up in `docs/m6-app-shape-plan.md`. Not scheduled.
 
-- [ ] **Wildcard route segment.** `Segment` is `Literal|Param` and
-      `match_route` requires exact segment-count equality, so no router can
-      express a static file server. Only needed to migrate m6-file fully into
+- [x] **Wildcard route segment.** **DONE 2026-09-12.** `Segment::Wildcard`,
+      spelled `{*name}`, captures the rest of the path joined by `/`. Legal
+      only as the last segment; anywhere else it is narrowed to an ordinary
+      parameter with a warning rather than taking the service down over a
+      pattern that is merely ambiguous.
+
+      **Deliberately explicit rather than implicit.** m6-file spells the same
+      idea as a bare `{relpath}` in final position, relying on its own matcher
+      making the last parameter greedy. Core does not copy that: making the
+      last `{param}` span several segments would have silently changed the
+      meaning of every route already written, including every one in
+      production. There is a test pinning that `{p}` is still exactly one
+      segment, which is the guard that matters here.
+
+      Specificity orders literal > param > wildcard, so adding a catch-all to a
+      config cannot quietly capture the traffic of the exact routes beside it.
       `App`.
 - [ ] **Streaming response body.** `Responder`'s three senders all take
       `&[u8]` and `Response.body` is a `Vec<u8>`, so core cannot serve a body it
