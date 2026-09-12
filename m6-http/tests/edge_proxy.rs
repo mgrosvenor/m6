@@ -113,6 +113,19 @@ fn https_get(port: u16, path: &str, extra_headers: &[(&str, &str)], tls: Arc<rus
     (status_line, headers, body)
 }
 
+/// Whether the response header block carries `name`, case-insensitively.
+///
+/// The header block here is the raw text including the status line, so the
+/// first line is skipped: `HTTP/1.1 200 OK` would otherwise match a search for
+/// a header called "http".
+fn has_header(headers: &str, name: &str) -> bool {
+    let want = format!("{}:", name.to_ascii_lowercase());
+    headers
+        .lines()
+        .skip(1)
+        .any(|l| l.trim_start().to_ascii_lowercase().starts_with(&want))
+}
+
 fn status_code(status_line: &str) -> u16 {
     status_line.split_whitespace().nth(1).unwrap_or("0").parse().unwrap_or(0)
 }
@@ -493,17 +506,34 @@ fn test_static_file_proxy() {
 #[test]
 fn test_static_file_cache_hit() {
     let stack = EdgeStack::start();
-    let (s1, _, b1) = stack.get("/assets/hello.txt");
+    let (s1, h1, b1) = stack.get("/assets/hello.txt");
     assert_eq!(status_code(&s1), 200);
 
-    let t0 = Instant::now();
-    let (s2, _, b2) = stack.get("/assets/hello.txt");
-    let hit_latency = t0.elapsed();
-
+    let (s2, h2, b2) = stack.get("/assets/hello.txt");
     assert_eq!(status_code(&s2), 200);
     assert_eq!(b1, b2);
-    assert!(hit_latency < Duration::from_millis(5),
-        "file cache hit took {:?}", hit_latency);
+
+    // Assert the cache state, not the clock.
+    //
+    // This used to be `hit_latency < 5ms`, which measures the machine. It is
+    // named in the site handover's traps as the wall-clock example, and on
+    // 2026-09-12 it duly failed on the loaded Linux build box while the code
+    // was perfectly correct. A test that fails when the machine is busy tells
+    // you about the machine.
+    //
+    // `Age` is the structural answer and it discriminates exactly: the edge
+    // adds it when it serves from its own store, so a miss carries no `age`
+    // header at all and a hit carries one (`age: 0` when it was stored a
+    // moment ago). Measured on the wire before being relied on.
+    assert!(
+        !has_header(&h1, "age"),
+        "the first request should be a miss, but it carried an age header:\n{h1}"
+    );
+    assert!(
+        has_header(&h2, "age"),
+        "the second request should have been served from the edge cache, but \
+         it carried no age header:\n{h2}"
+    );
 }
 
 /// 6. Error propagation — 404 from global forwarded to client.
