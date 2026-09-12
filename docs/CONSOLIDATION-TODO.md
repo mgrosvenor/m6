@@ -175,6 +175,36 @@ This also retires the standing lesson about the unaligned `inotify_event` read:
 that bug existed because the code was doing pointer arithmetic it had no
 business doing.
 
+### 3d. A failed bind is a warning, and it should not be
+
+**FOUND 2026-09-12 while fixing the port race. Not changed, because it is a
+production behaviour change and the fleet is frozen.**
+
+`m6-http/src/main.rs:3331`:
+
+```rust
+Err(e) => {
+    warn!(error = %e, "HTTP/1.1 TCP listener bind failed, HTTP/1.1 disabled");
+    None
+}
+```
+
+A server that cannot bind its listener comes up anyway, with the listener set
+to `None`. systemd sees a running process, `/health` answers on whatever else
+is listening, and **nothing is serving 443**. It is the shape the handover
+calls the recurring one: artefact wrong, process healthy, failure deferred and
+invisible.
+
+`SO_REUSEADDR` (done, below) removes the most likely *cause*, which was a
+restart inside the `TIME_WAIT` window. It does not address the response.
+
+- [ ] **Decide what a failed bind should do.** Exiting non-zero is the obvious
+      answer: systemd restarts, the failure is visible, and `Restart=on-failure`
+      already exists. The reason this is a decision and not a patch is that the
+      same arm may be load-bearing for a node that legitimately runs without
+      one of the listeners; that needs checking against `site.toml` for all
+      three roles before it changes.
+
 ### 3a. Cache-hit p50 regression: 2.1x in six days, cause unknown
 
 **TRACKED 2026-09-12. Open, not started, and deliberately not closed by
