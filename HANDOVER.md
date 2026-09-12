@@ -543,8 +543,33 @@ renderers switched to m6-core.
     Now asserts `Age`, measured on the wire first: a miss carries no `age`
     header, a hit carries one.
 
-  **The two originally named here are still not understood**, and neither
-  recurred this session: `redirect_lifecycle::sigterm_shuts_down_rather_than_being_ignored`
+  **One of the two originally named is now understood and fixed.**
+  `redirect_lifecycle::sigterm_shuts_down_rather_than_being_ignored` was an
+  ordering bug in `signal.rs`, caught on 2026-09-12 by finally capturing the
+  output: the journal had `started`, the listener line and `shutdown complete`,
+  and nothing in between. The signal thread did
+  `SHUTDOWN_FLAG.store(true)` and *then* logged. The flag is what releases the
+  main thread, which drains, logs "shutdown complete" and returns from `main`,
+  and process exit discards whatever is still queued in `tracing_appender`'s
+  non-blocking writer. So the line was racing the whole drain, and the redirect
+  listener runs start-to-complete in ~20ms, which is why only a loaded machine
+  lost it. Logging before the store makes the two lines ordered rather than
+  concurrent. Fixed; 6/6 in isolation and clean in a full run.
+
+  **The remaining intermittent failure is a port race, and it is not the
+  m6-auth-cli one either.** Seen three times on 2026-09-12 across
+  `robustness.rs` and `analytics_e2e.rs`, always as
+  `HTTP/1.1 TCP listener bind failed ... Address already in use (os error 48)`
+  followed by "m6-http never served a backend request". `claim_port` hands out
+  a port after verifying it binds, then drops that listener; the service binds
+  some milliseconds later, after cert generation and config writing. Something
+  takes the port in between. **Not yet diagnosed**, and the candidates are
+  TIME_WAIT from a previous test's client connections on the same port, and a
+  `PortClaim` released while its service process is still exiting. Worth noting
+  m6-http does not set `SO_REUSEADDR`.
+
+  **`m6-auth-cli`'s `test_token_create_prints_jwt` is still not understood**
+  and did not recur: `redirect_lifecycle::sigterm_shuts_down_rather_than_being_ignored`
   and `m6-auth-cli`'s `test_token_create_prints_jwt`. What has changed is that
   the next one will be readable rather than lost. **Run the suite as
   `cargo test --workspace > /tmp/run.txt 2>&1` and grep the file, never the
