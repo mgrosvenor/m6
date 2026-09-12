@@ -26,7 +26,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR/.."
 
-CEILING_FILE="tools/clippy-ceiling.txt"
+# Per platform, because the count is not portable. The build box runs clippy
+# 0.1.98 on Linux and the laptop 0.1.95 on macOS, and they disagreed by 13
+# findings on identical source: new lints arrive with new versions, and
+# cfg-gated code is only linted where it compiles. One shared number would
+# either fail spuriously on whichever side lints harder, or sit so high on the
+# other that it gates nothing.
+CEILING_FILE="tools/clippy-ceiling-$(uname -s).txt"
 UPDATE=false
 [[ "${1:-}" == "--update" ]] && UPDATE=true
 
@@ -56,7 +62,7 @@ fi
 
 if $UPDATE; then
   echo "$COUNT" > "$CEILING_FILE"
-  echo "clippy ceiling set to $COUNT"
+  echo "clippy ceiling for $(uname -s) set to $COUNT ($CEILING_FILE)"
   exit 0
 fi
 
@@ -81,4 +87,4 @@ if (( COUNT < CEILING )); then
   # ratchet teaches people to stop improving things.
 fi
 
-echo "clippy: $COUNT findings, ceiling $CEILING"
+echo "clippy: $COUNT findings on $(uname -s), ceiling $CEILING"
