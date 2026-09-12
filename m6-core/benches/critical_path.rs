@@ -235,6 +235,8 @@ fn make_routes() -> Vec<CompiledRoute> {
                 headers: Vec::new(),
             last_modified: None,
             specificity: spec,
+            handler: None,
+            settings: std::sync::Arc::new(serde_json::Map::new()),
             }
         })
         .collect();
@@ -324,6 +326,8 @@ fn bench_match_route(c: &mut Criterion) {
         headers: Vec::new(),
             last_modified: None,
             specificity: route_specificity(&segs),
+            handler: None,
+            settings: std::sync::Arc::new(serde_json::Map::new()),
     };
     let path_segs: Vec<&str> = "/blog/hello-world"
         .split('/')
@@ -478,6 +482,8 @@ size = 64
                     headers: Vec::new(),
             last_modified: None,
             specificity: spec,
+            handler: None,
+            settings: std::sync::Arc::new(serde_json::Map::new()),
                 }
             })
             .collect();
@@ -683,6 +689,8 @@ fn main() {
             headers: Vec::new(),
             last_modified: None,
             specificity: route_specificity(&segs),
+            handler: None,
+            settings: std::sync::Arc::new(serde_json::Map::new()),
         };
         let path_segs: Vec<&str> = "/blog/hello-world"
             .split('/')
@@ -786,6 +794,8 @@ size = 64
                         headers: Vec::new(),
             last_modified: None,
             specificity: spec,
+            handler: None,
+            settings: std::sync::Arc::new(serde_json::Map::new()),
                     }
                 })
                 .collect();
