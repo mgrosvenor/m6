@@ -670,7 +670,86 @@ impl<'a, W: std::io::Write> Responder<'a, W> {
         body: &[u8],
         length: usize,
     ) -> std::io::Result<()> {
-        // One buffered writer, so a response is one write syscall rather than
+        let bodyless = self.write_head(status, headers, length as u64)?;
+        if !bodyless {
+            self.w.write_all(body)?;
+            self.w.flush()?;
+            self.written += body.len();
+        }
+        Ok(())
+    }
+
+    /// Send a response whose body is copied from a reader rather than held in
+    /// memory.
+    ///
+    /// **`length` is a promise already on the wire.** m6 frames with
+    /// `Content-Length`, so by the time the first body byte is written the peer
+    /// has been told exactly how many are coming. That makes a short read a
+    /// framing fault and not a small disappointment: whatever is written next
+    /// on a reused connection would be read as the tail of this body. So a
+    /// reader that ends early returns `UnexpectedEof` here, and
+    /// `serve_connection` closes the connection rather than continuing on it.
+    /// The peer then sees fewer bytes than promised followed by EOF, which it
+    /// must discard. That is the honest failure; silently sending fewer bytes
+    /// than the header claims is the smuggling primitive this codebase rejects
+    /// on ingress.
+    ///
+    /// The reader is capped at `length` as well as required to reach it, so a
+    /// file that grew between `stat` and `read` cannot overrun the promise
+    /// either.
+    ///
+    /// On HEAD the reader is never touched, which is the point: the file is
+    /// not opened, let alone read.
+    pub fn send_stream<R: std::io::Read>(
+        &mut self,
+        status: u16,
+        headers: &[(&str, &str)],
+        length: u64,
+        body: R,
+    ) -> std::io::Result<()> {
+        let bodyless = self.write_head(status, headers, length)?;
+        if bodyless {
+            return Ok(());
+        }
+
+        // 64 KiB: large enough that a multi-megabyte asset is tens of writes
+        // rather than thousands, small enough that concurrent streams do not
+        // each cost a meaningful slice of a 950MB origin.
+        use std::io::Read as _;
+        let mut buf = [0u8; 64 * 1024];
+        let mut remaining = length;
+        let mut reader = body.take(length);
+        while remaining > 0 {
+            let n = reader.read(&mut buf)?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "body ended {remaining} bytes short of the \
+                         Content-Length already sent"
+                    ),
+                ));
+            }
+            self.w.write_all(&buf[..n])?;
+            self.written += n;
+            remaining -= n as u64;
+        }
+        self.w.flush()?;
+        Ok(())
+    }
+
+    /// Write the status line and headers. Returns whether a body may follow.
+    ///
+    /// One implementation, because the two senders differ only in where the
+    /// bytes come from, and a second copy of the `Content-Length`/`Connection`
+    /// handling is exactly how two responses end up framed differently.
+    fn write_head(
+        &mut self,
+        status: u16,
+        headers: &[(&str, &str)],
+        length: u64,
+    ) -> std::io::Result<bool> {
+        // One buffered writer, so the head is one write syscall rather than
         // one per header.
         let mut w = std::io::BufWriter::with_capacity(1024, &mut *self.w);
         write!(w, "HTTP/1.1 {} {}\r\n", status, status_reason(status))?;
@@ -693,24 +772,16 @@ impl<'a, W: std::io::Write> Responder<'a, W> {
             length,
             if self.keep_alive { "keep-alive" } else { "close" }
         )?;
+        w.flush()?;
+        drop(w);
 
         // RFC 9110 9.3.2. A 304 and a 204 have no body either (RFC 9110 15.4.5,
         // 15.3.5), and one sent on those is unframed bytes the peer will read
         // as the start of the next response.
-        let bodyless = self.method.eq_ignore_ascii_case("HEAD")
+        Ok(self.method.eq_ignore_ascii_case("HEAD")
             || status == 204
             || status == 304
-            || (100..200).contains(&status);
-        if !bodyless {
-            w.write_all(body)?;
-        }
-        w.flush()?;
-        drop(w);
-
-        if !bodyless {
-            self.written += body.len();
-        }
-        Ok(())
+            || (100..200).contains(&status))
     }
 }
 
@@ -932,5 +1003,92 @@ mod host_tests {
         let raw = b"POST / HTTP/1.0\r\nHost: localhost\r\n\
                     Transfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
         assert!(is_error(raw));
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+
+    fn respond(method: &str, keep_alive: bool, len: u64, body: &[u8])
+        -> (std::io::Result<()>, String)
+    {
+        let mut out: Vec<u8> = Vec::new();
+        let r = {
+            let mut resp = Responder::new(&mut out, method, keep_alive);
+            resp.send_stream(200, &[("Content-Type", "text/plain")], len, body)
+        };
+        (r, String::from_utf8_lossy(&out).into_owned())
+    }
+
+    /// A streamed body is byte-identical to a buffered one, head included.
+    /// If it were not, the two senders would be two framings.
+    #[test]
+    fn streaming_produces_the_same_bytes_as_sending_a_slice() {
+        let body = b"hello from a reader";
+        let (r, streamed) = respond("GET", true, body.len() as u64, &body[..]);
+        r.expect("stream");
+
+        let mut out: Vec<u8> = Vec::new();
+        {
+            let mut resp = Responder::new(&mut out, "GET", true);
+            resp.send(200, &[("Content-Type", "text/plain")], body).expect("send");
+        }
+        assert_eq!(streamed, String::from_utf8_lossy(&out));
+    }
+
+    /// The promise on the wire has to match the bytes after it.
+    #[test]
+    fn the_content_length_matches_what_is_written() {
+        let body = vec![b'x'; 200_000];
+        let (r, s) = respond("GET", true, body.len() as u64, &body[..]);
+        r.expect("stream");
+        assert!(s.contains("Content-Length: 200000"), "head was:\n{}", &s[..120.min(s.len())]);
+        let split = s.find("\r\n\r\n").unwrap() + 4;
+        assert_eq!(s.len() - split, 200_000);
+    }
+
+    /// A reader that ends early must fail, not quietly send a short body.
+    ///
+    /// `Content-Length` is already on the wire by then, so the peer is waiting
+    /// for a fixed number of bytes. Sending fewer and carrying on would make
+    /// whatever is written next read as the tail of this body, which is the
+    /// smuggling primitive the parser rejects on ingress. The error closes the
+    /// connection instead.
+    #[test]
+    fn a_short_reader_is_an_error_and_not_a_short_body() {
+        let (r, _) = respond("GET", true, 100, b"only twelve\n");
+        let e = r.expect_err("a body that ends early must not be sent as if complete");
+        assert_eq!(e.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    /// And a reader with more to give cannot overrun the promise either, which
+    /// is the case of a file that grew between `stat` and `read`.
+    #[test]
+    fn a_long_reader_is_truncated_to_the_promised_length() {
+        let (r, s) = respond("GET", true, 5, b"0123456789");
+        r.expect("stream");
+        let split = s.find("\r\n\r\n").unwrap() + 4;
+        assert_eq!(&s[split..], "01234");
+    }
+
+    /// On HEAD the reader is never touched. That is the point of streaming a
+    /// file: it is not opened, let alone read.
+    #[test]
+    fn head_reports_the_length_and_reads_nothing() {
+        struct Exploding;
+        impl std::io::Read for Exploding {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                panic!("HEAD must not read the body");
+            }
+        }
+        let mut out: Vec<u8> = Vec::new();
+        {
+            let mut resp = Responder::new(&mut out, "HEAD", true);
+            resp.send_stream(200, &[], 4096, Exploding).expect("head");
+        }
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("Content-Length: 4096"), "{s}");
+        assert!(s.ends_with("\r\n\r\n"), "a HEAD must carry no body");
     }
 }
