@@ -122,6 +122,44 @@ Verified by commit, gate green at each step unless noted.
       next to `core::conditional`. Check whether it genuinely differs (strong
       vs weak) or merely duplicates.
 
+### 3a. Cache-hit p50 regression: 2.1x in six days, cause unknown
+
+**TRACKED 2026-09-12. Open, not started, and deliberately not closed by
+re-baselining.**
+
+Production cache-hit p50 on the origin, all from m6's own `hit_p50_ns` over
+loaded windows, same node, same method:
+
+| date | deploy | p50 | p99 |
+|---|---|---|---|
+| 2026-09-06 | s-maxage verify (41 + 29 hits) | **1.7us** | 2.0us |
+| 2026-09-10 | Rapid Reset `438bdb3` | 2.5us | - |
+| 2026-09-10 | flow control `b32e837` | 2.95us | 3.55us |
+| 2026-09-12 | `22ee3a4` loaded, 76 hits | **3.61us** | 4.52us |
+| 2026-09-12 | `22ee3a4` 24h, 268 windows | 3.90us | 4.20us |
+
+Latency is the owner's stated key metric, so this is not a cosmetic drift.
+
+**Already ruled out** (2026-09-12): the `22ee3a4` monitoring-accounting change
+(monitor polls were excluded before and are still absent from `hit_p50_ns`);
+machine pressure (syd idle, load 0.08, 601MB free, no swap traffic); cache
+growth (process up 15 hours).
+
+**Still unknown:** which commit, or whether it is code. Two unmeasured
+hypotheses, Rapid Reset's per-stream accounting and `22ee3a4`'s move from a
+substring match to real q-value parsing per request. Against both, the *same
+binary* read 2.95us on 2026-09-10 and 3.6-3.9us today.
+
+- [ ] **Paired, interleaved A/B on the build box** across `084f89e`,
+      `438bdb3`, `b32e837`, `22ee3a4` and HEAD. One load, one host, medians of
+      five, per lesson 7. **This is the same work as item 8's owed "benchmark
+      Phases 5 and 6"** and should be done once, for both.
+
+**Do not close this by adjusting the baseline.** Three sessions did that, on
+the reasoning "we keep measuring ~3us, so 1.7-2.2 must be wrong", which is
+backwards: a regression that lands before the first reading makes every
+subsequent reading agree with the others. Consistency is not correctness.
+
 ### 3b. One app shape, not three
 
 **SCOPE DECISION, 2026-09-12.** The architecture below is agreed and stays on

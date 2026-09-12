@@ -18,6 +18,13 @@ State of play for the next session. Written 2026-09-11, updated 2026-09-12.
 > (wildcard routing, streaming bodies, the IO layer, the event loop, the
 > handler contract). **Do not re-derive the argument.** It is written up.
 >
+> **The cache-hit p50 has doubled in six days and it is not a bad baseline.**
+> 1.7us on 2026-09-06 to 3.9us today, same counter, same node, same method,
+> monotonic across four deploys. Three earlier sessions dismissed it by
+> re-baselining the prompt; that verdict is withdrawn. Tracked as
+> `docs/CONSOLIDATION-TODO.md` §3a with the evidence and the A/B that would
+> identify the commit. **Report the deviation, do not adjust the baseline.**
+>
 > **Five addresses were blocked on 2026-09-12**, ledger and nodes at 31 rules
 > and in sync. One of them, `15.177.23.18`, was **not an attack**: it is the
 > eighth orphaned Route53 health check, and it was reported across three hourly
@@ -241,8 +248,12 @@ Services: `m6-http` (edge/proxy), `m6-file`, `m6-html`, `m6-auth-server`,
 6. **HTTP Garden** (arxiv 2405.17737), the differential fuzzer. Needs Docker,
    so the build box.
 7. **h2spec and h3spec on the build box** before any deploy.
-8. **Benchmark Phases 5 and 6.** The plan requires a delta per phase and
-   neither has one. The whole request path moved between crates.
+8. **Benchmark Phases 5 and 6, and find the p50 regression with the same run.**
+   The plan requires a delta per phase and neither has one; the whole request
+   path moved between crates. **Now also the way to settle §3a**, the cache-hit
+   p50 that has gone 1.7 -> 3.9us across four deploys in six days. One paired,
+   interleaved A/B across `084f89e`, `438bdb3`, `b32e837`, `22ee3a4` and HEAD
+   answers both questions, so do it once.
 9. **Phase 7**, then **Phase 8**.
 
 ---
@@ -442,11 +453,57 @@ renderers switched to m6-core.
 
 ## 7. Open questions, honestly unresolved
 
-- **The cache-hit p50 baseline is unverified.** Recorded as 1.7-2.2us; four
-  separate readings today put every node at 2.9-3.4us, flat across hundreds of
-  windows. The baseline is the thing in doubt, not the measurement. Re-derive
-  before treating a miss as an incident. `tools/health-check.py` deliberately
-  asserts no p50 threshold for this reason.
+- **THE CACHE-HIT p50 HAS DOUBLED IN SIX DAYS AND NOBODY HAS INVESTIGATED IT.**
+  **Corrected 2026-09-12. This entry previously said the baseline was
+  "unverified" and told the reader to stop flagging it. That was wrong, and the
+  reasoning behind it was backwards.**
+
+  The 1.7-2.2us band is not a guess and was not derived "some other way". It is
+  a recorded production measurement in `~/dr-grosvenor-site/docs/RELEASES.md`,
+  taken with **the same instrument, on the same node, by the same method** as
+  every reading since: m6's own `hit_p50_ns`, over loaded windows on the origin.
+
+  | date | deploy | method | p50 | p99 |
+  |---|---|---|---|---|
+  | 2026-09-06 | s-maxage verify | 2 loaded windows, 41 + 29 hits | **1.7us** | 2.0us |
+  | 2026-09-10 | Rapid Reset `438bdb3` | loaded window | 2.5us | - |
+  | 2026-09-10 | flow control `b32e837` | loaded window | 2.95us | 3.55us |
+  | 2026-09-12 | `22ee3a4` | loaded window, 76 hits | **3.61us** | 4.52us |
+  | 2026-09-12 | `22ee3a4` | 24h, 268 windows | 3.90us | 4.20us |
+
+  **2.1x slower in six days, monotonic across four deploys**, in the metric the
+  owner has named as the key one. The 24h figure over 268 windows corroborates
+  the loaded reading, so it is not a single bad sample.
+
+  Ruled out on 2026-09-12:
+  - **An accounting change.** `22ee3a4` was "monitoring accounted separately",
+    which is exactly the shape that fakes a regression. It is not: monitor
+    polls were excluded from the stats counters before and are still absent
+    from `hit_p50_ns` now. Same population either way.
+  - **Machine pressure.** syd measured idle at the time: load 0.08 on one core,
+    601MB available of 950, 109MB swap allocated with zero swap-in/out while
+    sampling, m6-http RSS 47MB.
+  - **Unbounded growth.** m6-http had been up 15 hours, not weeks.
+
+  **Not yet known: which change did it, or whether it is code at all.** Two
+  hypotheses, neither measured: Rapid Reset added per-stream accounting, and
+  `22ee3a4` replaced a substring match with real q-value parsing on every
+  request. Against that, the *same binary* read 2.95us on 2026-09-10 and
+  3.6-3.9us today, which is a rise with no code change, so part of this may be
+  environmental in a way an idle snapshot does not capture.
+
+  **How to settle it:** a paired, interleaved A/B on the build box across
+  `084f89e`, `438bdb3`, `b32e837`, `22ee3a4` and HEAD, one load, one host,
+  medians of five. That is lesson 7, and it is the same work as the owed
+  "benchmark Phases 5 and 6" in item 8.
+
+  **How this got lost is the part to carry.** Three consecutive sessions saw
+  the deviation and each concluded the *baseline* was wrong rather than the
+  server, on the reasoning "we keep measuring ~3us, so 1.7-2.2 must be wrong".
+  That is backwards: if a regression lands before your first reading, every
+  reading after it agrees with every other one. Consistency is not correctness.
+  It was then written into two handovers as settled, with an instruction to
+  stop reporting it.
 - **24h hit rates**: syd ~0.58, lon ~0.16-0.19, chi ~0.19-0.21. Stable across
   the day. The earlier reconciliation that looked wrong was my own error:
   origin never sees what a cache node answers from its own cache.

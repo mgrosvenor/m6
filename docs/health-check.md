@@ -120,7 +120,7 @@ journalctl -u <service> --since '24 hours ago' --no-pager -o cat | sed 's/\x1b\[
 
 | quantity | recorded baseline | status |
 |---|---|---|
-| hit p50 / p99 | 1.7-2.2us / 2.0-2.7us | **unverified.** Syd has measured a flat ~3.3us p50 across 293 windows in 24h with the box idle. Either the band was derived some other way or the drift predates the visible window. Re-derive before treating a miss as an incident. |
+| hit p50 / p99 | 1.7-2.2us / 2.0-2.7us | **CORRECT, AND CURRENTLY MISSED BY 2.1x.** This row used to read "unverified", on the reasoning that a flat ~3.3us across 293 windows meant the band must be wrong. That is backwards: a regression landing before the first reading makes every later reading agree. The band is a recorded production measurement (RELEASES.md, 2026-09-06, same counter, same node, same method), and the readings since are 1.7 -> 2.5 -> 2.95 -> 3.9us across four deploys. **Report the deviation; it is real.** See HANDOVER.md open questions. |
 | steady-state hit rate | ~1.0000 | **wrong as a fleet target.** True only of a freshly warmed page hit repeatedly. Real 24h rates: syd 0.56, lon 0.16, chi 0.19. |
 | loopback TTFB | ~4.3ms, ~3.8ms of it TLS | holds |
 
