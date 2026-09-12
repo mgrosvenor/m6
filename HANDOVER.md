@@ -27,6 +27,25 @@ State of play for the next session. Written 2026-09-11, updated 2026-09-12.
 > because it is a production behaviour change under the freeze. `SO_REUSEADDR`
 > removed the most likely cause; the response is still fail-open.
 >
+> **A hit rate near 0.3 does not mean what the hourly prompt says it means.**
+> The prompt reads a fall toward 0.3 as the edge lifetime having regressed.
+> On 2026-09-12 syd read 0.3466 over 24h and 0.3052 lifetime, and the edge was
+> fine: **55.2% of its requests since restart were 404s** (2,796 of 5,068) and
+> a 404 is uncacheable, so every one counts as a miss. Real traffic in the same
+> hour was 93 HIT / 8 MISS = **0.92**.
+>
+> So separate the two before reporting a regression, because the number is the
+> same either way:
+>
+> 1. **Last hour from analytics** (`cache_state` HIT vs MISS). Near 1.0 means
+>    the edge lifetime is working.
+> 2. **404 share from `/perf` `status_counts`.** High means the aggregate is
+>    scan volume, not lifetime.
+>
+> This is the case `deploy/BLOCKLIST.md` predicts in its closing section, and
+> the fix it names is **negative caching**, still not implemented. Until it
+> exists, every junk 404 on a cache node is a Pacific round trip.
+
 > **The hourly health check is not scheduled.** The old cron was session-only
 > and died with that session. `CronCreate` jobs are in-memory and expire after
 > 7 days regardless. If the owner wants it scheduled, say plainly that it will
