@@ -480,7 +480,8 @@ backend = "m6-file"
         site.join("configs/m6-file.conf"),
         r#"
 [[route]]
-path = "/public/{relpath}"
+path = "/public/{*relpath}"
+handler = "files"
 root = "public/"
 "#,
     )
@@ -789,7 +790,8 @@ backend = "error-backend"
         site.join("configs/m6-file.conf"),
         r#"
 [[route]]
-path = "/public/{relpath}"
+path = "/public/{*relpath}"
+handler = "files"
 root = "public/"
 "#,
     )
@@ -1040,7 +1042,7 @@ backend = "m6-file"
     .unwrap();
     std::fs::write(
         origin_site.join("configs/m6-file.conf"),
-        "[[route]]\npath = \"/public/{relpath}\"\nroot = \"public/\"\n",
+        "[[route]]\npath = \"/public/{*relpath}\"\nhandler = \"files\"\nroot = \"public/\"\n",
     )
     .unwrap();
 

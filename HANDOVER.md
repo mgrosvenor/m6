@@ -4,6 +4,30 @@ State of play for the next session. Written 2026-09-11, updated 2026-09-12.
 
 > ## Read first, 2026-09-12 (latest session)
 >
+> **`m6-file` is an `App` service.** `main.rs` is 34 lines; 969 went, including
+> a second router, a second config parser, its accept loop, worker pool and
+> reload handling. **The end-to-end reload proof exists at last**:
+> `m6-file/tests/dynamic_routes.rs` writes a config, lets the watcher fire and
+> gets a 200 on a path that 404'd a moment earlier.
+>
+> **Four behaviour changes, all deliberate, none deployed.** Detail in
+> `CONSOLIDATION-TODO.md` under "m6-file IS an `App` service":
+>
+> 1. **Traversal answers 404 everywhere**, where a single-segment parameter
+>    used to answer 400. m6-file was inconsistent about this; core now splits
+>    on the reason, `Traversal` to 404 and `InvalidChars` to 400.
+> 2. **A burst sheds with 503 instead of queueing without bound.** Production's
+>    `size = 32` gives a 256-deep queue. **This is the one to watch on the
+>    gallery page**, which fires dozens of concurrent images and is why the
+>    pool was widened to 32 in the first place.
+> 3. Core supplies `Cache-Control` as a default rather than appending a second
+>    one over a handler's.
+> 4. **The config format changed and the site repo is updated to match.** All
+>    15 routes gained `handler = "files"`, and `/assets/{relpath}` became
+>    `/assets/{*relpath}`. **The binary and the config must ship together**:
+>    the old config against the new binary exits 2, and the new config against
+>    the old binary serves nothing under `/assets`.
+>
 > **`App` has config-driven routes now, which was the owner's
 > *"dynamicly reload the file list"*.** A handler is registered once by name
 > (`App::handler("files", f)`), a route names it in config

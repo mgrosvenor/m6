@@ -1816,6 +1816,7 @@ dependencies = [
  "mime_guess",
  "nix",
  "serde",
+ "serde_json",
  "tempfile",
  "toml",
  "tracing",

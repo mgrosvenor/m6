@@ -487,7 +487,7 @@ the right shape, so they are worth doing whether or not anything is migrated:
 
 Then, and only then, the two migrations below.
 
-- [ ] **`m6-file` should be an `App` service.** Its own `poll(2)` accept loop
+- [x] **`m6-file` IS an `App` service. DONE 2026-09-12.** Its own `poll(2)` accept loop
       was 22 of 33 lines identical to `App`'s; that block is now
       `server::poll_listener_and_watcher` and both call it. It already uses
       `server::serve_connection` per connection.
@@ -502,18 +502,49 @@ Then, and only then, the two migrations below.
       so a handler can now serve a file without materialising it and without
       having its negotiated representation re-encoded downstream.
 
-      **What is left is a defect in `App`, not a decision about m6-file.** See
-      §7 below, which is where the work now is. The migration waits on it.
+      `main.rs` is 34 lines and one of them is
+      `App::new().handler("files", handler::serve).run()`. **969 lines went**:
+      `route.rs` (a second router), `config.rs` (a second config parser),
+      `http.rs`, and the CLI parsing, logging setup, socket bind, accept loop,
+      worker pool, graceful drain and reload handling in `main.rs`. All had an
+      equivalent in core, and most had been extracted from here in the first
+      place.
 
-      - [ ] Then: the handler returns `Response` instead of writing to a
-            `Responder`, and the config gains `handler = "files"` on all 15
-            routes with `/assets/{relpath}` becoming `/assets/{*relpath}`.
-            That last one is a production config change and is why the core
-            wildcard defect above had to be fixed first.
-      - [ ] Then: its accept loop and 32-worker channel model give way to
-            `App`'s bounded pool and 503 backpressure. On a 1-core origin that
-            is a behaviour change on the asset path and wants measuring, not
-            assuming.
+      **The end-to-end reload proof now exists**, which is what the core-side
+      work could not provide on its own: `m6-file/tests/dynamic_routes.rs`
+      writes a config, lets the watcher fire, and gets a 200 on a path that
+      404'd a moment earlier. It also pins the reverse (a removed route stops
+      serving) and the refusal (a reload naming an unregistered handler is
+      rejected and the previous routes keep serving).
+
+      **Four behaviour changes, none of them silent:**
+
+      1. **Traversal answers 404 everywhere, where an ordinary parameter used
+         to answer 400.** m6-file was inconsistent: 404 for `..` in a
+         catch-all, 400 for the same `..` in a single-segment parameter,
+         because the two went down different arms of its matcher. Core now
+         splits on the *reason*: `PathParamError::Traversal` is 404,
+         `InvalidChars` is 400. 404 is the disclosure-safe answer and is what
+         m6-file's own spec (§l2) documented; a merely malformed value gives
+         nothing away by being named as malformed.
+      2. **A burst sheds instead of queueing.** m6-file fed a fixed worker set
+         through an **unbounded** `mpsc` channel; `App` uses a bounded pool and
+         answers 503 when the queue is full. The bounded form is the better
+         design, but it has to be sized: production's `size = 32` gives
+         `queue_size = 256` by default, against a gallery page that fires
+         dozens of concurrent images. `l5_concurrent_requests` fires 100 and
+         needed the fixture sized to match.
+      3. **Core supplies `Cache-Control` as a default, not an override.** It
+         used to append unconditionally, so a handler that set its own would
+         have put two on the wire. m6-file sets its own per request, because
+         `?v=` is `immutable` and everything else is a short window.
+      4. **Config format.** All 15 production routes gained `handler = "files"`
+         and `/assets/{relpath}` became `/assets/{*relpath}`. The wildcard has
+         to be explicit because m6-file's matcher made a bare trailing
+         parameter greedy and core's does not; that difference is why the core
+         wildcard defect had to be fixed first. Verified by serving the real
+         production config against the new binary: 15 routes, 32 threads,
+         assets 200, missing file 404.
 ### 7. Copy costs: the audit, and the jobs to reach zero
 
 **OWNER'S INSTRUCTION, 2026-09-12:** *"I think we need a full audit of copy

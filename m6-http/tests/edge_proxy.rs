@@ -197,7 +197,8 @@ cache    = "no-store"
     // m6-file.conf
     std::fs::write(dir.join("configs/m6-file.conf"), r#"
 [[route]]
-path = "/assets/{relpath}"
+path = "/assets/{*relpath}"
+handler = "files"
 root = "assets/"
 "#).unwrap();
 }
