@@ -574,7 +574,7 @@ fn a_head_on_an_unreadable_file_still_answers() {
     let config = site.join("m6-file.conf");
     std::fs::write(
         &config,
-        "[[route]]\npath = \"/assets/{relpath}\"\nroot = \"assets/\"\n",
+        "[[route]]\npath = \"/assets/{*relpath}\"\nhandler = \"files\"\nroot = \"assets/\"\n",
     )
     .unwrap();
 

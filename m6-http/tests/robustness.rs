@@ -257,7 +257,7 @@ backend = "m6-file"
 
     std::fs::write(
         site.join("configs/m6-file.conf"),
-        "[[route]]\npath = \"/public/{relpath}\"\nroot = \"public/\"\n",
+        "[[route]]\npath = \"/public/{*relpath}\"\nhandler = \"files\"\nroot = \"public/\"\n",
     )
     .unwrap();
 

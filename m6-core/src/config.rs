@@ -40,20 +40,20 @@ pub struct RouteConfig {
 }
 
 /// Thread-pool configuration parsed from `[thread_pool]`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ThreadPoolConfig {
     pub size: usize,
     pub queue_size: usize,
 }
 
 /// LRU params-cache configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ParamsCacheConfig {
     pub size: usize,
 }
 
 /// Connection-level settings parsed from `[server]`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ServerConfig {
     /// Read timeout applied to every accepted connection.
     ///
@@ -80,14 +80,14 @@ pub struct CompressionLevel {
 }
 
 /// Log configuration from `[log]` in the renderer config file.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct LogConfig {
     pub level:  Option<String>,
     pub format: Option<String>,
 }
 
 /// Fully parsed renderer configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RendererConfig {
     /// Non-framework keys merged into every request dictionary.
     pub user_config: Map<String, Value>,
@@ -110,7 +110,7 @@ pub struct RendererConfig {
 }
 
 /// Per-MIME-type minification enable flag.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct MinificationConfig {
     /// Which MIME types have minification enabled.
     pub enabled: std::collections::HashMap<String, bool>,

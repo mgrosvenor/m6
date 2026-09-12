@@ -48,6 +48,14 @@ pub struct Request {
     /// Empty for a route registered in code, which has no config entry of its
     /// own, and for a request that reached a handler some other way.
     pub(crate) route_settings: Option<std::sync::Arc<Map<String, Value>>>,
+    /// The service's parsed configuration, shared.
+    ///
+    /// A handler that negotiates its own content coding needs the
+    /// `[compression]` and `[minification]` tables, and they are the service's
+    /// config rather than the route's. Carried as an `Arc` clone, which is the
+    /// rule this codebase settled on: config is a read-only reference
+    /// throughout, never a copy.
+    pub(crate) config: Option<std::sync::Arc<crate::config::RendererConfig>>,
 }
 
 impl Request {
@@ -58,7 +66,30 @@ impl Request {
     ) -> Self {
         let dict = dict.into();
         let site_dir = site_dir.into();
-        Self { raw, dict, site_dir, route_pattern: None, route_settings: None }
+        Self { raw, dict, site_dir, route_pattern: None, route_settings: None, config: None }
+    }
+
+    /// Attach route settings directly, without a `CompiledRoute`.
+    ///
+    /// For a handler's own tests, which have a route's config but no framework
+    /// state to compile it from.
+    pub fn with_route_settings(mut self, settings: std::sync::Arc<Map<String, Value>>) -> Self {
+        self.route_settings = Some(settings);
+        self
+    }
+
+    /// Attach the service configuration. The service loop does this; a test
+    /// building a `Request` by hand does not have to.
+    pub fn with_config(mut self, config: std::sync::Arc<crate::config::RendererConfig>) -> Self {
+        self.config = Some(config);
+        self
+    }
+
+    /// The service's parsed configuration, when the service loop supplied it.
+    ///
+    /// `None` for a `Request` built outside the loop.
+    pub fn config(&self) -> Option<&crate::config::RendererConfig> {
+        self.config.as_deref()
     }
 
     /// Attach the matched route, so a handler can read the config that sent
@@ -140,6 +171,19 @@ impl Request {
 
     pub fn header(&self, name: &str) -> Option<&str> {
         self.raw.header(name)
+    }
+
+    /// The raw query string, or `""` when absent.
+    pub fn query(&self) -> &str {
+        self.raw.query()
+    }
+
+    /// Every request header, as sent.
+    ///
+    /// For a handler that has to evaluate preconditions or negotiate a coding
+    /// itself, which needs the fields rather than one lookup at a time.
+    pub fn headers(&self) -> &[(String, String)] {
+        &self.raw.headers
     }
 
     pub fn content_type(&self) -> Option<&str> {
@@ -582,10 +626,32 @@ pub fn parse_auth_claims(header: &str) -> Map<String, Value> {
 /// `validate_wildcard_param` for the segment-spanning half, and use this one
 /// for a `Segment::Param`, which cannot contain a slash.
 pub fn validate_path_param(name: &str, value: &str) -> Result<()> {
-    crate::validate_path_param(value, false).map_err(|e| {
-        Error::BadRequest(format!("path param `{name}` is invalid: {e}"))
-    })?;
+    crate::validate_path_param(value, false).map_err(|e| param_error(name, e))?;
     Ok(())
+}
+
+/// Turn a rejected path parameter into the status the refusal should carry.
+///
+/// **Traversal is a 404, everything else a 400**, and the difference is
+/// deliberate. A `..` is an attempt to address something outside the site;
+/// answering 400 confirms that the attempt was recognised as traversal, which
+/// tells the sender their payload reached the router and is worth varying. A
+/// 404 tells them nothing they did not already know, and is the behaviour
+/// m6-file's own spec documented (§l2, "../ traversal in URL → 404") before it
+/// became an `App` service. A value that is merely malformed -- a space, a
+/// control byte -- discloses nothing by being named as malformed.
+///
+/// m6-file used to answer both, inconsistently: 404 for traversal in a
+/// catch-all and 400 for the same `..` in an ordinary parameter, because the
+/// two went down different arms of its matcher. This is the same rule for
+/// both.
+fn param_error(name: &str, e: crate::path::PathParamError) -> Error {
+    match e {
+        crate::path::PathParamError::Traversal => Error::NotFound,
+        crate::path::PathParamError::InvalidChars => {
+            Error::BadRequest(format!("path param `{name}` is invalid: {e}"))
+        }
+    }
 }
 
 /// Validate a `{*name}` wildcard capture, which spans path segments.
@@ -605,9 +671,7 @@ pub fn validate_path_param(name: &str, value: &str) -> Result<()> {
 /// trailing slash is rejected, and the character set is unchanged, so what
 /// this permits over the ordinary form is the separator and nothing else.
 pub fn validate_wildcard_param(name: &str, value: &str) -> Result<()> {
-    crate::validate_path_param(value, true).map_err(|e| {
-        Error::BadRequest(format!("wildcard param `{name}` is invalid: {e}"))
-    })?;
+    crate::validate_path_param(value, true).map_err(|e| param_error(name, e))?;
     Ok(())
 }
 

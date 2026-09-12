@@ -467,11 +467,13 @@ require = "group:admins"
         site.join("configs/m6-file.conf"),
         r#"
 [[route]]
-path = "/public/{relpath}"
+path = "/public/{*relpath}"
+handler = "files"
 root = "public/"
 
 [[route]]
-path = "/private/{relpath}"
+path = "/private/{*relpath}"
+handler = "files"
 root = "private/"
 "#,
     )
