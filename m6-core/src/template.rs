@@ -711,10 +711,10 @@ impl crate::render::Renderer for TeraRenderer {
     fn render(
         &self,
         template: &str,
-        ctx: &serde_json::Map<String, Value>,
+        ctx: &crate::dict::Dict,
     ) -> std::result::Result<String, crate::render::RenderError> {
         let mut tctx = tera::Context::new();
-        for (k, v) in ctx {
+        for (k, v) in ctx.iter() {
             tctx.insert(k.as_str(), v);
         }
         self.tera.render(template, &tctx).map_err(|e| {

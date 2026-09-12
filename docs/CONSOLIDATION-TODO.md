@@ -514,16 +514,21 @@ Then, and only then, the two migrations below.
             `App`'s bounded pool and 503 backpressure. On a 1-core origin that
             is a behaviour change on the asset path and wants measuring, not
             assuming.
+### 7. Copy costs: the audit, and the jobs to reach zero
 
-### 7a. Copy audit: the whole system, 2026-09-12
+**OWNER'S INSTRUCTION, 2026-09-12:** *"I think we need a full audit of copy
+costs throughout the system."* *"The right number is zero."* *"Things like
+config should obviously be a read only reference throughout."* *"Let's make App
+clean and robust and copy free."*
 
-**Owner's instruction: "I think we need a full audit of copy costs throughout
-the system." "The right number is zero." "Things like config should obviously
-be a read only reference throughout."**
+The goal is **zero**. Where practical reality imposes a floor, the floor is
+named and measured rather than folded into the claim.
 
-Audited: `m6-http` (edge, cache, forward), `m6-file`, `m6-core`'s `App` request
-path, and the four `App` services. Measured with the production input, release,
-on the laptop. `m6-core/src/app.rs`'s `copy_audit` module:
+#### The audit
+
+Audited `m6-http` (edge, cache, forward), `m6-file`, `m6-core`'s `App` request
+path, and the four `App` services. Release, laptop, production input.
+`m6-core/src/app.rs`'s `copy_audit`:
 
 ```sh
 cargo test --release -p m6-core copy_audit -- --ignored --nocapture
@@ -534,224 +539,138 @@ meant to migrate onto is the one that does not.**
 
 | crate | per-request copying | verdict |
 |---|---|---|
-| `m6-http` | `CachedResponse` is `Arc<Vec<(String,String)>>` headers and `bytes::Bytes` body, so a cache hit is a refcount bump. `forward.rs` has no clones on the hot path. | **already zero** |
-| `m6-file` | `Arc<Config>` and `Arc<Vec<Route>>` cloned per connection as refcounts; per-request clones are a root `String`, param names, an ETag. | **already near zero** |
+| `m6-http` | `CachedResponse` is `Arc<Vec<(String,String)>>` headers and `bytes::Bytes` body, so a cache hit is a refcount bump. No clones on `forward.rs`'s hot path. | **already zero** |
+| `m6-file` | `Arc<Config>` and `Arc<Vec<Route>>` per connection as refcounts; per-request is a root `String`, param names, an ETag. | **already near zero** |
 | `m6-core` `App` | below | **~0.63ms per page** |
 
-Every copy `App` makes serving one HTML page, with the real
-`data/content.json` (68KB, 1,364 nodes):
+Serving one HTML page with the real `data/content.json` (68KB, 1,364 nodes):
 
-| copy | ns |
-|---|---:|
-| `route.clone()` | 167 |
-| `site_dir.clone()` x2 | 83 |
-| `config.compression.clone()` | 208 |
-| `config.minification.clone()` | 167 |
-| `build_dict` (three copies inside) | 222,708 |
-| `raw.clone()` | 458 |
-| `dict.clone()` into `Request` | 108,583 |
-| `dict.clone()` in `render_response` | 109,500 |
-| `tera::Context` build, inside the engine | 189,000 |
-| **total per request** | **630,874** |
+| copy | ns | job |
+|---|---:|---|
+| `route.clone()` | 167 | J6 |
+| `site_dir.clone()` x2 | 83 | J1 |
+| `config.compression.clone()` | 208 | J1 |
+| `config.minification.clone()` | 167 | J1 |
+| `build_dict`, three copies inside | 222,708 | J2, J3, J4 |
+| `raw.clone()` into `Request` | 458 | J6 |
+| `dict.clone()` into `Request` | 108,583 | J3 |
+| `dict.clone()` in `render_response` | 109,500 | J5 |
+| `tera::Context` build, in the engine | 189,000 | J7 |
+| **total per request** | **630,874** | |
 
-**`content.json` is deep-copied six times per request**: three times inside
-`build_dict` (global params, route params naming the same file, and the base),
-once into `Request`, once in `render_response`, once into Tera's context. None
-of it varies between requests. m6-html renders every HTML page on the site this
-way, on a 1-core VM, at a stated ~6ms.
+**`content.json` is deep-copied six times per request** and none of it varies
+between requests: it is the config file and the content file, identical until
+the next reload. m6-html renders every page on the site this way, on a 1-core
+VM, at a stated ~6ms.
 
-The small rows are not the point and should not be chased first; the four
-five-figure rows are 99.9% of it.
-
-**Route to zero, in the order that pays:**
-
-- [ ] **Config by reference, never by value.** `RendererConfig` behind an
-      `Arc` in `FrameworkState`; the pipeline and handlers borrow it. Removes
-      the `compression`, `minification` and `site_dir` clones outright. This is
-      the owner's stated rule and it is cheap.
-- [ ] **A per-route base dict, built once per reload.** Steps 1 to 3 produce
-      the same map for every request on a given route: config keys, global
-      params, static params files. Precompute it per `CompiledRoute` as an
-      `Arc<Map>` at `FrameworkState::build` time.
-- [ ] **A layered `Dict`**: `Arc<Map>` base plus a small per-request overlay,
-      `get` checking overlay then base. **The twelve-step precedence survives**:
-      built-ins live in the overlay and params files in the base, so built-ins
-      still win, which is what step 8's comment calls load-bearing. Dynamic
-      params files (those with a `{placeholder}`) go in the overlay ahead of the
-      built-ins, preserving their order too. This is the change that removes the
-      three big rows, and it is also the one that changes a core type:
-      `Request::dict`, `Response::render_dict` and the renderer seam all take
-      `&Map` today.
-- [ ] **Do not clone the same file twice.** Steps 2 and 3 both insert
-      `data/content.json` because the config names it in both places, the second
-      overwriting the first with identical values. Worth fixing in the code and
-      asking whether the config needs to say it twice.
-- [ ] **`render_response` clones only to merge a handler context** that is
-      usually absent. Clone when `template_dict` is `Some`, borrow otherwise.
-- [ ] **Tera's own copy is the one core cannot remove by itself.**
-      `tera::Context::insert` serialises each value into the engine's own map,
-      189us of the total. Reaching zero there means either a renderer seam that
-      can hand Tera a prebuilt context per route, or an engine that borrows.
-      **Record it as the floor rather than pretending the other fixes reach
-      zero**: they take core to zero and leave this.
-
-### 7. `App` deep-copies its immutable state on every request
-
-**FOUND 2026-09-12 (latest session), measuring `App` before migrating m6-file
-onto it. Open, not started. This is an m6-html production cost, not only an
-obstacle to the migration.**
-
-`build_dict` starts from `Map::new()` and copies the whole of the service's
-static configuration into it, per request. Nothing in steps 1 to 3 varies
-between requests; it is the config file and the params files, identical until
-the next reload.
-
-Measured in release on the laptop. With a synthetic 20-key config the whole
-dict is ~4.7us and **the copy is 2.7us of it**, while everything that actually
-does work per request is noise beside it:
-
-| phase | ns |
-|---|---|
-| `Map::new()` | 41 |
-| query parse + map | 42 |
-| `parse_cookies` | 250 |
-| `chrono::Utc::now()` + two `strftime` | 583 |
-| **clone 20 config keys** | **2,708** |
-
-Against the site's real `data/content.json` (68KB, 1,364 nodes) it is far
-worse, because production declares that file **twice** and a third copy is
-taken after the dict is finished:
-
-| phase | ns |
-|---|---|
-| step 2, global params clone | 104,583 |
-| step 3, route params clone, *the same file again* | 103,125 |
-| `render_response`'s `dict.clone()` (app.rs:798) | 103,542 |
-| **total before Tera is called** | **~323,000** |
-
-**That is 0.32ms of pure copying per HTML page, on a laptop, before the
-template engine starts.** syd is a 1-core VM. m6-html renders every HTML page
-on the site at a stated ~6ms.
-
-It is **not** an explanation for §3a: that is m6-http's cache-hit p50 and
+It is **not** an explanation for §3a, which is m6-http's cache-hit p50 and
 never reaches m6-html. Do not conflate them.
 
-Three things to decide, roughly independent:
+#### The jobs
 
-- [ ] **Stop copying immutable state per request.** The static base (config
-      keys, global params, static route params) is fixed between reloads and
-      belongs behind an `Arc`, with the per-request dict a small overlay
-      consulted first. The twelve-step precedence survives: built-ins are in
-      the overlay and params files in the base, so built-ins still win, which
-      is the ordering step 8's comment calls load-bearing. The cost is that
-      `dict` stops being a flat `Map<String, Value>`, which touches
-      `Request::dict`, `Response::render_dict` and the renderer seam.
-- [ ] **Do not clone the same file twice.** Steps 2 and 3 both insert
-      `data/content.json`, the second overwriting the first with identical
-      values. One conditional halves the cost today, independently of the
-      above. Worth checking whether the config needs to name it twice at all.
-- [ ] **`render_response` clones the finished dict** to merge a handler's
-      extra context, which is usually absent. Clone only when
-      `resp.template_dict` is `Some`, or merge without copying.
+Ordered so each stands alone and the cheap, no-risk ones land first.
 
-`m6-core/src/app.rs`'s `dict_cost` module holds all three measurements,
-`#[ignore]`d because a timing assertion is the wall-clock trap:
+- [x] **J1. Config by reference, never by value. DONE.** `Arc<RendererConfig>` in
+      `FrameworkState`; the pipeline and handlers borrow it. Removes the
+      `compression`, `minification` and `site_dir` rows outright. No type
+      change outside core. *The owner's stated rule, and the cheapest job here.*
+      **458ns of deep copies became 42ns of refcount bumps.** `FrameworkState`
+      holds `Arc<RendererConfig>` and `Arc<PathBuf>`; the read lock hands out
+      `Arc` clones, and the pipeline borrows from them.
+- [x] **J2. A per-route base dict, built once per reload. DONE.** Steps 1 to 3 of
+      `build_dict` produce the same map for every request on a given route:
+      config keys, global params, static params files. Precompute it per
+      `CompiledRoute` as an `Arc<Map>` at `FrameworkState::build` time.
+      **Done**, as `CompiledRoute::base_dict`. Routes are keyed on their static
+      params-file list and share the merged result, so fifteen routes over one
+      content file hold one copy rather than fifteen.
+- [x] **J3. A layered `Dict`: `Arc` base plus a per-request overlay. DONE.** `get`
+      checks overlay then base; only the overlay is ever built per request, and
+      it holds a handful of entries. Removes the two big `dict.clone()` rows as
+      well, because a `Dict` clone is an `Arc` bump plus a small map.
 
-```sh
-cargo test --release -p m6-core dict_cost -- --ignored --nocapture
-```
-- [ ] **`m6-auth-server` should be an `App` service.** It binds through
-      `UnixServer` directly. **Its stated blocker is gone**: the capability it
-      needed that `App` lacked was `chmod` on the socket, and that is now
-      `[server] socket_mode` (2026-09-12). What remains is that it drives its
-      own accept loop, which is the same question as m6-file above.
-- [x] **`m6-monitor` lifecycle is now proven.** It was always structurally
-      correct (`App::new().route_get(..).run()`), but had no `tests/` directory
-      at all, so nothing had ever started the binary. `m6-monitor/tests/lifecycle.rs`.
-- [x] **`assert_app_lifecycle` moved into core's testkit.** The lifecycle
-      contract was opt-in and hand-written in five integration suites, which is
-      why the sixth service never got one. It is now one call.
-- [x] **`socket_path_from_config` and `M6_SOCKET_OVERRIDE` consolidated.** Four
-      copies: the derivation existed in `m6-core/src/server.rs` *and*
-      `m6-file/src/config.rs` (differing fallback stem, `m6-file` against
-      `m6-default`), and the override was wrapped identically in `app.rs`,
-      `m6-file` and `m6-auth-server`. One implementation now, in core.
+      **The twelve-step precedence survives, and this is the part to get
+      right.** Built-ins (step 8) live in the overlay and params files in the
+      base, so built-ins still win, which is what step 8's comment calls
+      load-bearing. Dynamic params files, those whose path holds a
+      `{placeholder}`, resolve per request and so go in the overlay *ahead of*
+      the built-ins, preserving their order too. **Write the precedence test
+      first**: a params file trying to override `year`, `datetime` and
+      `request_path` must still lose.
 
-**`m6-http` is not on this list and should not be.** It is the edge: public TCP
-and UDP, TLS, h2, h3, proxying, the cache. It is what `App` services sit behind.
+      **Done**, as `m6-core/src/dict.rs`. The precedence test was written
+      first and is `a_base_entry_can_never_override_an_overlay_one`; a
+      params file trying to set `year`, `datetime` or `request_path` still
+      loses. `Request`, `Response::template_dict` and the `Renderer` seam all
+      take a `Dict` now, and `From<Map> for Dict` keeps every caller that hands
+      core an owned map working unchanged.
 
-### 6. Config-driven routes: done 2026-09-12 (later session)
+      **`build_dict` went from 222,708ns to 1,125ns. The `Request` clone went
+      from 108,583ns to 542ns.**
+- [x] **J4. Do not merge the same params file twice. DONE.** Steps 2 and 3 both
+      insert `data/content.json`, because the production config names it as
+      `global_params` *and* as the route's `params`, and the second pass
+      overwrites the first with identical values. Fixed in the base-dict
+      build: a static params file already merged as a global param is skipped.
+      **Still worth asking separately whether the config needs to say it
+      twice**, which is a site-repo question and is not answered here.
+- [x] **J5. DONE.** `render_response` cloned the dict to merge a handler context that
+      was usually absent, and for a config template route the context it merged
+      was a copy of the very dict it had been passed: the dict was cloned,
+      merged into itself, and thrown away. `template_dict` now means "a context
+      this response supplied"; `None` means "render against the request's own
+      dictionary", which the service loop already holds.
+      **109,500ns became zero.**
+- [ ] **J6. The small rows.** Still open. `route.clone()`, `raw.clone()` and the two
+      `site_dir.clone()`s are ~900ns together. Worth doing once the big ones
+      are gone, not before: they are 0.1% of the bill and chasing them first
+      would be motion instead of progress.
+- [ ] **J7. Tera's own copy is the floor, and it is now 98% of what remains.**
+      `tera::Context::insert` calls `to_value`, which deep-copies each value
+      into the engine's own `BTreeMap`. **150,666ns of the remaining
+      153,084ns.** Three ways out, none of them free:
 
-**The owner's instruction was *"And dynamicly reload the file list."*** This is
-the core half of it. m6-file is not migrated yet.
+      1. **A per-route `tera::Context` prebuilt once per reload**, with the
+         request's overlay inserted before the render and removed after.
+         Zero copies of the base. Costs a lock per route, which serialises
+         concurrent renders of the same page; on a 1-core origin that is close
+         to free, and under the single-threaded target shape it is free, but it
+         is contention on the current thread pool. A thread-local per
+         (route, reload generation) avoids the lock at the cost of one copy per
+         thread per reload rather than per request.
+      2. **Patch or fork Tera** so a context can borrow. Upstream's `Context`
+         owns a `BTreeMap<String, Value>` and every entry point copies into it.
+      3. **A different engine**, one that renders against a borrowed context.
 
-`App` bound every route at the call site, so the route table was fixed for the
-life of the process. That is right for a route that is part of the **program**
-and wrong for one that is part of the **deployment**: a static file server
-gains an asset tree by being told about a directory, not by being recompiled.
+      Option 1 is the only one that does not take on a dependency problem, and
+      it is a real design decision rather than a patch, so it is not taken
+      here.
 
-The fix splits the binding along the line where change actually falls. A
-handler is code, registered once by name:
+#### Where it stands after J1 to J5
 
-```rust
-App::new().handler("files", serve_file).run()
-```
+Same measurement, same input, after the jobs above:
 
-A route is config, and config routes are already recompiled on every reload:
+| copy | before | after |
+|---|---:|---:|
+| config + site_dir out of the read lock | 458 | **42** |
+| `route.clone()` | 167 | 167 |
+| `build_dict` | 222,708 | **1,125** |
+| `raw.clone()` | 458 | 542 |
+| `dict.clone()` into `Request` | 108,583 | **542** |
+| `dict.clone()` in `render_response` | 109,500 | **0** |
+| `tera::Context`, in the engine | 189,000 | 150,666 |
+| **total** | **630,874** | **153,084** |
 
-```toml
-[[route]]
-path = "/assets/{*relpath}"
-handler = "files"
-root = "assets/"
-```
+**Core's own copying: ~442,000ns to ~2,400ns.** What is left is J6's ~700ns of
+small rows and J7, the engine's own copy, which is 98% of the remainder and
+cannot be removed from this side of the seam.
 
-So adding, changing or removing one of these takes effect without a restart,
-which is the capability m6-file would otherwise have lost on migration.
+#### The rule this leaves behind
 
-- [x] `handler = "..."` on `[[route]]`, and `App::handler(name, f)`. Present on
-      all four builders (`App`, `AppWithGlobal`, `AppWithThreadState`,
-      `AppWithState`) rather than only the one with a consumer, because "the
-      sixth service never got one" is how `assert_app_lifecycle` was missed.
-- [x] **Keys core does not define are kept, not dropped.** Core does not know
-      what `root` or `tail` mean and should not; the handler reads them through
-      `Request::route_setting` / `route_str` / `route_bool`. Unknown keys were
-      previously discarded in silence, which is indistinguishable from a typo
-      being honoured. `Arc<Map>` because the matched route is cloned per
-      request.
-- [x] **An unregistered handler name is fatal, not a warning.** Startup exits 2;
-      a reload is refused and the previous routes keep serving. A misplaced
-      wildcard is narrowed because the narrower reading is still defensible; a
-      handler name with no code behind it has no reading at all, and the
-      alternatives are a route that 404s or 500s while the config plainly says
-      it should serve. The message names the route, the name, and what **was**
-      registered.
-- [x] **A handler route defaults to `no-store`**, a template route to `public`,
-      explicit `cache` wins over both. Code routes already defaulted this way;
-      letting the config-declared form inherit `public` would put dynamic
-      output in a shared cache by omission.
-
-**Two defects found doing it, neither in the thing being worked on:**
-
-1. **Wildcard routing did not work end to end.** Recorded against its own row
-   in §3b-later above. It was marked DONE and answered 400 for every capture
-   spanning more than one segment.
-2. **Code routes were getting a `Last-Modified` they had no claim to.** The
-   per-route loop ran over every route; a code route has no `params_files`, so
-   nothing skipped it and it took the newest template's mtime as the date of an
-   answer computed per request. The comment at the emit site already said
-   "skipped when the route has no honest date -- a code route", so the intent
-   was right and the loop did not match it. Now keyed on `template.is_none()`,
-   which is the honest test: the date is derived from templates and params
-   files, so it belongs to routes that render from them.
-
-**What is not proven yet.** The tests are at the level the state owns: build a
-state from config A, build another from config B, and assert the second serves
-a route the first did not. What has no test is the **whole chain against a
-running binary** — write the config, let the watcher fire, request the new path
-and get 200. That needs a binary with a named handler registered, which is
-m6-file after its migration, and it is the test to write there rather than a
-fixture binary invented for it.
+Immutable state is shared, never copied. Anything that does not vary between
+requests belongs behind an `Arc` and is read through a reference: config,
+params files, routes, templates. A per-request allocation has to earn itself by
+holding something that genuinely differs per request.
 
 ### 4. Phase 7, decouple the repositories
 

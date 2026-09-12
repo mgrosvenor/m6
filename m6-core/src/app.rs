@@ -20,6 +20,7 @@ use crate::request::{
     parse_auth_claims, parse_cookies, parse_form_body, parse_query_string, validate_path_param,
     validate_wildcard_param, RawRequest, Request,
 };
+use crate::dict::Dict;
 use crate::response::{error_to_response, Response};
 use crate::render::{RenderError, Renderer, RendererFactory};
 
@@ -153,6 +154,14 @@ pub struct CompiledRoute {
     pub handler: Option<String>,
     /// The matched route's own config keys that core does not define.
     pub settings: Arc<Map<String, Value>>,
+    /// The part of this route's request dictionary that does not vary between
+    /// requests: config keys, global params files and this route's static
+    /// params files, merged once per reload in that order.
+    ///
+    /// Shared with every request on this route rather than copied into each
+    /// one. On the real site this is `data/content.json`, 68KB and 1,364
+    /// nodes, and it used to be deep-copied per request several times over.
+    pub base_dict: Arc<Map<String, Value>>,
 }
 
 impl CompiledRoute {
@@ -373,8 +382,16 @@ impl ParamsCache {
 // ---------------------------------------------------------------------------
 
 struct FrameworkState {
-    config: crate::config::RendererConfig,
-    site_dir: PathBuf,
+    /// Behind an `Arc` because it is immutable between reloads and every
+    /// request needs to read it. It used to be owned here, and the two maps a
+    /// request actually wanted -- `compression` and `minification` -- were
+    /// deep-cloned out from under the read lock, per request, because the
+    /// pipeline uses them after the lock is released. An `Arc` clone is a
+    /// refcount bump and carries the whole config rather than two fields of it.
+    config: Arc<crate::config::RendererConfig>,
+    /// Likewise: one `PathBuf` allocation per request, twice, for a path that
+    /// does not change between reloads.
+    site_dir: Arc<PathBuf>,
     routes: Vec<CompiledRoute>,
     global_params_data: Map<String, Value>,
     static_params: HashMap<String, Arc<Map<String, Value>>>,
@@ -388,6 +405,8 @@ impl FrameworkState {
     fn build(
         config: crate::config::RendererConfig,
         site_dir: PathBuf,
+        // NOTE: takes them by value and wraps them; callers keep passing
+        // owned values and the sharing is this type's business.
         code_routes: &[(String, RouteMethod)],
         renderer_factory: &dyn RendererFactory,
     ) -> anyhow::Result<Self> {
@@ -423,6 +442,7 @@ impl FrameworkState {
                 // own. The config-declared form below is the one that does.
                 handler: None,
                 settings: Arc::new(Map::new()),
+                base_dict: Arc::new(Map::new()), // filled in below
             });
         }
 
@@ -459,6 +479,7 @@ impl FrameworkState {
                 last_modified: None, // filled in below, once templates_mtime is known
                 handler: rc.handler.clone(),
                 settings: Arc::clone(&rc.settings),
+                base_dict: Arc::new(Map::new()), // filled in below
             });
         }
 
@@ -571,6 +592,54 @@ impl FrameworkState {
             }
         }
 
+        // ── The per-route base dictionary ───────────────────────────────────
+        //
+        // Steps 1 to 3 of `build_dict` produced the same map for every request
+        // on a given route, and produced it per request: the config's keys,
+        // every global params file, and the route's static params files, in
+        // that order. Merged once, here, and shared with every request on the
+        // route behind an `Arc`.
+        //
+        // Routes sharing a params-file set share the merged result too, keyed
+        // on the static file list, so a site with fifteen routes over one
+        // content file holds one copy rather than fifteen.
+        let mut base_by_key: HashMap<String, Arc<Map<String, Value>>> = HashMap::new();
+        for route in &mut routes {
+            let static_files: Vec<&String> =
+                route.params_files.iter().filter(|p| !p.contains('{')).collect();
+            let key = static_files.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("\u{1}");
+
+            let base = base_by_key.entry(key).or_insert_with(|| {
+                let mut m = Map::new();
+                // 1. Config keys.
+                for (k, v) in &config.user_config {
+                    m.insert(k.clone(), v.clone());
+                }
+                // 2. Global params files.
+                for (k, v) in &global_params_data {
+                    m.insert(k.clone(), v.clone());
+                }
+                // 3. This route's static params files, in declaration order.
+                //
+                // A file already merged as a global param is skipped rather
+                // than merged a second time over itself. The production config
+                // names `data/content.json` as both, which used to cost a
+                // second full copy of it for identical values.
+                for pf in &static_files {
+                    if config.global_params.contains(pf) {
+                        continue;
+                    }
+                    if let Some(sp) = static_params.get(pf.as_str()) {
+                        for (k, v) in sp.as_ref() {
+                            m.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+                Arc::new(m)
+            });
+            route.base_dict = Arc::clone(base);
+        }
+
         let params_cache = Arc::new(ParamsCache::new(config.params_cache.size));
 
         // Flash secret: decode from config if present. Presence is validated at server startup,
@@ -595,8 +664,8 @@ impl FrameworkState {
         };
 
         Ok(Self {
-            config,
-            site_dir,
+            config: Arc::new(config),
+            site_dir: Arc::new(site_dir),
             routes,
             global_params_data,
             static_params,
@@ -608,28 +677,33 @@ impl FrameworkState {
     }
 
     /// Build the request dictionary for a matched route.
+    ///
+    /// **Steps 1 to 3 are not here any more**, because they produced the same
+    /// map for every request on a route: config keys, global params files and
+    /// the route's *static* params files. They are merged once per reload into
+    /// `route.base_dict` and shared behind an `Arc`. What is left in this
+    /// function is what genuinely varies per request.
+    ///
+    /// The ordering the original twelve steps depended on is preserved by the
+    /// layering rather than by this loop; see `crate::dict`.
     fn build_dict(
         &self,
         raw: &RawRequest,
         route: &CompiledRoute,
         path_params: &PathParams,
-    ) -> Result<Map<String, Value>> {
-        let mut dict = Map::new();
+    ) -> Result<Dict> {
+        let mut dict = Dict::with_base(Arc::clone(&route.base_dict));
 
-        // 1. Config keys.
-        for (k, v) in &self.config.user_config {
-            dict.insert(k.clone(), v.clone());
-        }
-
-        // 2. Global params files.
-        for (k, v) in &self.global_params_data {
-            dict.insert(k.clone(), v.clone());
-        }
-
-        // 3. Route params files.
+        // 3b. Params files whose path holds a `{placeholder}` resolve per
+        // request, so they cannot live in the base. They go in first, ahead of
+        // everything else in the overlay, which keeps them below the built-ins
+        // exactly as they were below them before.
         for pf_template in &route.params_files {
-            let arc_m: Option<Arc<Map<String, Value>>> = if pf_template.contains('{') {
-                let pf_resolved = resolve_path_template(pf_template, path_params);
+            if !pf_template.contains('{') {
+                continue; // static: already in the base
+            }
+            let pf_resolved = resolve_path_template(pf_template, path_params);
+            let arc_m: Option<Arc<Map<String, Value>>> =
                 if let Some(cached) = self.params_cache.get(&pf_resolved) {
                     Some(cached)
                 } else {
@@ -654,10 +728,7 @@ impl FrameworkState {
                         error!(path = %abs.display(), "params file missing");
                         None
                     }
-                }
-            } else {
-                self.static_params.get(pf_template).cloned()
-            };
+                };
 
             if let Some(m) = arc_m {
                 for (k, v) in m.as_ref() {
@@ -792,16 +863,20 @@ impl FrameworkState {
     fn render_response(
         &self,
         resp: &mut Response,
-        dict: &Map<String, Value>,
+        dict: &Dict,
     ) -> std::result::Result<(), RenderError> {
         if let Some(template_name) = resp.template_name.clone() {
-            let mut ctx = dict.clone();
-            if let Some(handler_dict) = &resp.template_dict {
-                for (k, v) in handler_dict {
-                    ctx.insert(k.clone(), v.clone());
-                }
-            }
-            let html = self.renderer.render(&template_name, &ctx)?;
+            // No copy on the common path. A response that supplied its own
+            // context is rendered against that; one that did not is rendered
+            // against the request's dictionary, which is this argument. It
+            // used to clone the dict here unconditionally and then merge into
+            // it a context that, for a config template route, was a copy of
+            // the same dict.
+            let ctx: &Dict = match &resp.template_dict {
+                Some(supplied) => supplied,
+                None => dict,
+            };
+            let html = self.renderer.render(&template_name, ctx)?;
             resp.body = crate::response::Body::Bytes(html.into_bytes());
             resp.headers
                 .push(("Content-Type".to_string(), "text/html; charset=utf-8".to_string()));
@@ -2257,15 +2332,21 @@ fn handle_request<W: std::io::Write>(
 
     // Take a read lock once per request — released after we have everything
     // we need so that a concurrent hot reload can proceed promptly.
-    let (route_match, site_dir, compression, minification) = {
+    //
+    // What leaves the lock is shared, not copied. The pipeline below runs
+    // outside the lock and needs the compression and minification settings,
+    // which used to be deep-cloned here per request along with the site
+    // directory. They do not vary between reloads, so an `Arc` clone is the
+    // honest way to carry them out: two refcount bumps instead of two
+    // `HashMap`s and a `PathBuf`.
+    let (route_match, site_dir, config) = {
         let fs_r = fs.read().unwrap();
         let route_match = find_route(raw.path(), raw.method(), &fs_r.routes)
             .map(|(route, params)| (route.clone(), params));
-        let site_dir = fs_r.site_dir.clone();
-        let compression = fs_r.config.compression.clone();
-        let minification = fs_r.config.minification.clone();
-        (route_match, site_dir, compression, minification)
+        (route_match, Arc::clone(&fs_r.site_dir), Arc::clone(&fs_r.config))
     };
+    let compression = &config.compression;
+    let minification = &config.minification;
 
     // Populated from `dict["csrf_token"]` inside the matched-route arm below
     // (when the csrf feature is on) so the cookie set further down uses the
@@ -2299,7 +2380,7 @@ fn handle_request<W: std::io::Write>(
                 csrf_token_for_cookie = dict.get("csrf_token").and_then(|v| v.as_str()).map(str::to_string);
             }
 
-            let req = Request::new(raw.clone(), dict.clone(), site_dir.clone())
+            let req = Request::new(raw.clone(), dict.clone(), Arc::clone(&site_dir))
                 .with_route(&route);
 
             // Dispatch to code handler or template render.
@@ -2340,7 +2421,7 @@ fn handle_request<W: std::io::Write>(
                     Response::not_found()
                 }
             } else if let Some(template) = &route.template {
-                match Response::render_dict(template, &dict, route.status) {
+                match Ok::<_, Error>(Response::render_request_dict(template, route.status)) {
                     Ok(r) => r,
                     Err(e) => error_to_response(&e),
                 }
@@ -2596,6 +2677,7 @@ mod tests {
             last_modified: None,
             handler: None,
             settings: Arc::new(Map::new()),
+            base_dict: Arc::new(Map::new()),
         };
         let segs: Vec<&str> = "/blog/hello-world".split('/').filter(|s| !s.is_empty()).collect();
         let m = match_route(&segs, &route);
@@ -2620,6 +2702,7 @@ mod tests {
             last_modified: None,
             handler: None,
             settings: Arc::new(Map::new()),
+            base_dict: Arc::new(Map::new()),
         };
         let segs_ab: Vec<&str> = "/blog/a/b".split('/').filter(|s| !s.is_empty()).collect();
         let segs_b: Vec<&str> = "/blog".split('/').filter(|s| !s.is_empty()).collect();
@@ -2643,6 +2726,7 @@ mod tests {
                 last_modified: None,
                 handler: None,
                 settings: Arc::new(Map::new()),
+                base_dict: Arc::new(Map::new()),
             },
             CompiledRoute {
                 pattern: "/blog/about".to_string(),
@@ -2657,6 +2741,7 @@ mod tests {
                 last_modified: None,
                 handler: None,
                 settings: Arc::new(Map::new()),
+                base_dict: Arc::new(Map::new()),
             },
         ];
 
@@ -3086,6 +3171,7 @@ mod wildcard_route_tests {
             last_modified: None,
             handler: None,
             settings: Arc::new(Map::new()),
+            base_dict: Arc::new(Map::new()),
         }
     }
 
@@ -3192,7 +3278,7 @@ mod wildcard_route_tests {
         let dict = state
             .build_dict(&raw, route, &params)
             .expect("a wildcard capture is not a malformed request");
-        assert_eq!(dict["relpath"].as_str().unwrap(), "css/main.css");
+        assert_eq!(dict.get("relpath").unwrap().as_str().unwrap(), "css/main.css");
     }
 
     /// The other half of the fix: a wildcard is allowed the separator, and
@@ -3749,29 +3835,29 @@ mod copy_audit {
 
         const N: usize = 2_000;
         let rows: Vec<(&str, u64)> = vec![
+            // J1 (done): config and site_dir leave the read lock as `Arc`
+            // clones. These three rows were 458ns of deep copies; they are now
+            // two refcount bumps. Measured as the path actually runs it.
+            ("Arc::clone(config) + Arc::clone(site_dir)  [was 458]", median(N, || {
+                std::hint::black_box((Arc::clone(&state.config), Arc::clone(&state.site_dir)));
+            })),
             ("route.clone()", median(N, || { std::hint::black_box(route.clone()); })),
-            ("site_dir.clone() x2", median(N, || {
-                std::hint::black_box((state.site_dir.clone(), state.site_dir.clone()));
-            })),
-            ("config.compression.clone()", median(N, || {
-                std::hint::black_box(state.config.compression.clone());
-            })),
-            ("config.minification.clone()", median(N, || {
-                std::hint::black_box(state.config.minification.clone());
-            })),
             ("build_dict (3 copies inside)", median(N, || {
                 std::hint::black_box(state.build_dict(&raw, route, &params).unwrap());
             })),
             ("raw.clone()", median(N, || { std::hint::black_box(raw.clone()); })),
             ("dict.clone() into Request", median(N, || { std::hint::black_box(dict.clone()); })),
-            ("dict.clone() in render_response", median(N, || { std::hint::black_box(dict.clone()); })),
+            // J5 (done): render_response renders against the request dict
+            // when the response supplied no context of its own, which is the
+            // common path. There is no copy left to measure here.
+            ("render_response copy  [removed]", 0),
             // Tera's `insert` serialises each value into its own context, so
             // the engine takes a copy of its own. This one is not core's to
             // remove without changing the renderer seam, but it is part of the
             // per-request bill and the audit is dishonest without it.
             ("tera::Context build (in the engine)", median(N, || {
                 let mut tctx = tera::Context::new();
-                for (k, v) in &dict {
+                for (k, v) in dict.iter() {
                     tctx.insert(k.as_str(), v);
                 }
                 std::hint::black_box(tctx);

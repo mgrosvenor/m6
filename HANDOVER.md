@@ -52,15 +52,33 @@ State of play for the next session. Written 2026-09-11, updated 2026-09-12.
 > It was: the parser and the map are noise (41 to 583ns), the copy is
 > everything, and against the real config it is seventy times larger.
 >
-> **The owner then asked for a full copy audit of the system, with the target
-> stated as zero and config to be a read-only reference throughout. It is
-> `CONSOLIDATION-TODO.md` §7a.** Result: **`m6-http` and `m6-file` are already
-> right** (`Arc<Vec<_>>` headers and `bytes::Bytes` bodies at the edge, `Arc`
-> config and routes in m6-file), and **`App`, the framework both are meant to
-> migrate onto, is the only offender**, at **~0.63ms of pure copying per HTML
-> page**. `content.json` is deep-copied **six times per request**. The route to
-> zero is listed there in the order that pays; the floor is Tera's own context
-> build (189us), which core cannot remove without changing the renderer seam.
+> **The owner then asked for a full copy audit with the target stated as zero,
+> and then for `App` to be made copy free. Both are `CONSOLIDATION-TODO.md`
+> §7, which carries the audit and the jobs J1 to J7.**
+>
+> The audit found **`m6-http` and `m6-file` already right** (`Arc<Vec<_>>`
+> headers and `bytes::Bytes` bodies at the edge, `Arc` config and routes in
+> m6-file) and **`App`, the framework both are meant to migrate onto, the only
+> offender**, at ~0.63ms of pure copying per HTML page with `content.json`
+> deep-copied six times.
+>
+> **J1 to J5 are done. Core's own copying went from ~442us to ~2.4us per
+> request.** The static half of the request dictionary is built once per route
+> per reload and shared behind an `Arc` (`m6-core/src/dict.rs`), with only the
+> per-request overlay allocated. `build_dict` 222,708ns -> 1,125ns; the
+> `Request` clone 108,583 -> 542; `render_response`'s clone removed outright.
+>
+> **The twelve-step precedence is preserved by the layering, and that is the
+> part to not break.** Built-ins are in the overlay and params files in the
+> base, so a params file still cannot override `year`, `datetime` or
+> `request_path`. The test is `dict::tests::a_base_entry_can_never_override_an_overlay_one`.
+>
+> **What remains is J7, and it is 98% of the remainder: Tera copies the whole
+> context into itself** (`Context::insert` calls `to_value`), 150,666ns of the
+> 153,084 left. Core cannot remove it from this side of the seam. Three routes
+> out are written up in §7; the only one that adds no dependency problem is a
+> per-route context prebuilt per reload with the overlay inserted and removed
+> around the render, and that is a design decision, not a patch.
 >
 > **This is not §3a.** That is m6-http's cache-hit p50 and never touches
 > m6-html. Do not conflate them.
@@ -177,11 +195,10 @@ applied them:
   was previously refused on one node and served on two, which is exactly what
   the reconciliation was for.
 
-- **1018 workspace tests pass at default features, zero warnings**, release
+- **1024 workspace tests pass at default features, zero warnings**, release
   and test builds, clippy at its 157 Darwin ceiling, 2026-09-12 (latest
-  session). Verified on Linux via `deploy/run-tests.sh m6`. The sixteen over
-  the previous 1002 are the wildcard, config-route-handler and streaming-body
-  tests. The `app::dict_cost` module is `#[ignore]`d on purpose: those are
+  session). The twenty-two over the previous 1002 are the wildcard,
+  config-route-handler, streaming-body and `Dict` tests. The `app::dict_cost` module is `#[ignore]`d on purpose: those are
   measurements, and a timing assertion is the wall-clock trap.
 - **The port race recurred once on 2026-09-12 (latest session)**, in
   `security_e2e::forged_x_auth_claims_does_not_survive_ingress_e2e`:
