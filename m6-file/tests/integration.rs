@@ -604,6 +604,20 @@ fn a_head_on_an_unreadable_file_still_answers() {
 
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
 
+    // Root ignores file permission bits, and the Linux build host runs the
+    // suite as root, so there the file is still perfectly readable and this
+    // test can prove nothing. Skip rather than assert something untrue: a
+    // green tick that depends on the uid of whoever ran it is worse than an
+    // absent one. The proof still runs on every developer machine.
+    if std::fs::read(&file).is_ok() {
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).ok();
+        eprintln!(
+            "skipping: this process can read a 0000 file, so it is running as root \
+             and cannot demonstrate that the read was skipped"
+        );
+        return;
+    }
+
     let (head_status, head_headers, _) = split_response(&req("HEAD"));
     assert!(
         head_status.contains("200"),
@@ -625,4 +639,38 @@ fn a_head_on_an_unreadable_file_still_answers() {
     // Restore before the tempdir is removed.
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).ok();
     svc.assert_alive("after serving an unreadable file's metadata");
+}
+
+/// A path that resolves to a directory is a 404, and a HEAD says so too.
+///
+/// This is a regression guard with a short and embarrassing history. The HEAD
+/// fast path answers from `std::fs::metadata`, which succeeds on a directory
+/// and reports its size, so the first version of it answered
+/// `HEAD /assets/css` with `200` and `Content-Length: 128` while the GET beside
+/// it answered 404. The `fs::read` that the fast path skips was also what had
+/// been rejecting non-files, by failing.
+///
+/// `head_reports_exactly_what_get_would` did not catch it because every path it
+/// asks for is a file. A method-equivalence test only covers the inputs it is
+/// given.
+#[test]
+fn a_directory_is_404_for_both_methods() {
+    let (_guard, socket_path) = spawn_server("dir-404");
+
+    for path in ["/assets/css", "/assets/images"] {
+        for method in ["GET", "HEAD"] {
+            let raw = http_request_bytes(
+                &socket_path,
+                &format!(
+                    "{method} {path} HTTP/1.1\r\nHost: localhost\r\n\
+                     Accept-Encoding: identity\r\n\r\n"
+                ),
+            );
+            let (status, headers, _) = split_response(&raw);
+            assert!(
+                status.contains("404"),
+                "{method} {path} is a directory and must be 404, got {status} {headers:?}"
+            );
+        }
+    }
 }
