@@ -104,9 +104,7 @@ applied them:
   Linux gate before prod. It is a **ratchet**, not `-D warnings`: the count may
   fall and may never rise. Ceilings are **per platform** because clippy
   versions disagree, at `tools/clippy-ceiling-Darwin.txt` (157) and
-  `tools/clippy-ceiling-Linux.txt` (148, and probably now lower: several
-  hand-rolled blocks were deleted after it was set, so run
-  `./tools/clippy.sh --update` on the build box and commit the result). A clippy *error* fails regardless.
+  `tools/clippy-ceiling-Linux.txt` (145). A clippy *error* fails regardless.
   **Driving the ceiling to zero is outstanding and not yet approved as work.**
 - h1spec **32/32 on all four HTTP/1.1 targets**, with a CI ratchet
   (`tools/conformance.sh`, floors in `tools/conformance-scores.txt`) wired into
