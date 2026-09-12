@@ -335,7 +335,19 @@ Design is settled and written up in `docs/m6-app-shape-plan.md`. Not scheduled.
       `App`.
 - [ ] **Streaming response body.** `Responder`'s three senders all take
       `&[u8]` and `Response.body` is a `Vec<u8>`, so core cannot serve a body it
-      has not materialised. Matters on a 950MB box.
+      has not fully materialised.
+
+      **NOT a blocker for m6-file's migration, and this entry used to claim it
+      was.** The old wording, "m6-file is not choosing to buffer", is false:
+      every one of its response paths materialises a `Vec<u8>` and always has.
+      The ordinary path is `std::fs::read` of the whole file; the tail path is
+      `read_to_end` into a `Vec` capped at `MAX_TAIL_BYTES`; the HEAD fast path
+      sends no body at all. Checked against the source 2026-09-12 after the
+      owner said so.
+
+      It stays on the list as a real gap on its own terms: `HEAD` aside, a
+      3.6MB asset is read entirely into memory on every cache miss. But nothing
+      waits on it.
 - [ ] **The IO layer**: one selectable stream interface whatever the transport,
       with blocking handled *inside* it by specific named components, never a
       generic offload. Pilot is unifying `PoolManager { pools, url_backends }`.
@@ -410,13 +422,19 @@ the right shape, so they are worth doing whether or not anything is migrated:
 
 Then, and only then, the two migrations below.
 
-- [ ] **`m6-file` should be an `App` service.** Its own `poll(2)` accept loop is
-      **22 of 33 lines byte-identical** to `App`'s at `app.rs:1759`; the
-      remainder are the same expressions with renamed locals (`pfd_ino`/`i`
-      against `pfd_w`/`w`, `.unwrap_or(-1)` against an `Option`). It already
-      calls `m6_core::server::serve_connection` per connection. The stated
-      reason for the copy, needing the watcher fd and the listener in one wait
-      set, is a thing `App` already does.
+- [ ] **`m6-file` should be an `App` service.** Its own `poll(2)` accept loop
+      was 22 of 33 lines identical to `App`'s; that block is now
+      `server::poll_listener_and_watcher` and both call it. It already uses
+      `server::serve_connection` per connection.
+
+      **Wildcard routing landed 2026-09-12, and streaming was never a blocker**
+      (it buffers everything, see above). What is left is one real difference,
+      found 2026-09-12 and not yet resolved: **`App` registers code routes once
+      at startup, so a config reload cannot add or change one.** m6-file's
+      `handle_reload` rebuilds its route table today, so migrating as things
+      stand would quietly remove the ability to add an asset route without a
+      restart. Either `App` grows config-driven routes that survive reload, or
+      that capability is dropped deliberately rather than by accident.
 - [ ] **`m6-auth-server` should be an `App` service.** It binds through
       `UnixServer` directly. **Its stated blocker is gone**: the capability it
       needed that `App` lacked was `chmod` on the socket, and that is now
