@@ -1,16 +1,61 @@
-/// Cross-platform file-change notifier.
-///
-/// `ConfigWatcher` watches a set of file paths (by monitoring their parent
-/// directories) and signals when any of the watched files change.
-///
-/// On Linux: uses raw libc inotify syscalls.
-/// On macOS/FreeBSD/OpenBSD: uses kqueue EVFILT_VNODE via a self-pipe and
-///   background threads (one per unique parent directory).
-/// Fallback: no-op; `raw_fd()` returns `None`, `read_events` always returns
-///   false.
+//! Cross-platform file-change notifier.
+//!
+//! `ConfigWatcher` watches a set of file paths, by watching their parent
+//! directories, and signals when any of the watched files change. It exposes a
+//! **pollable file descriptor**, so the service's own `poll(2)` waits on it
+//! alongside its listener. That is the whole design constraint: this is not a
+//! runtime, it is one more descriptor for the loop that already exists.
+//!
+//! `notify`, the obvious crate, spawns a background thread and delivers over a
+//! channel. That is the arrangement `e6ba278` removed from the macOS arm here,
+//! and putting it back would reintroduce the startup race and the thread leak
+//! it removed. A wrapper is wanted, not a runtime.
+//!
+//! - **Linux**: `nix::sys::inotify`.
+//! - **macOS, FreeBSD, OpenBSD**: `nix::sys::event`, one kqueue, no threads.
+//! - **Anything else**: a no-op; `raw_fd()` returns `None` and `read_events`
+//!   always returns false, so the service falls back to mtime polling.
+//!
+//! **This was 390 lines of raw `unsafe` libc across three `#[cfg]` arms**, on
+//! the owner's instruction to put it on the list: *"standard OS interfaces to
+//! watch a file and poll to wake up when there's a change; extra threads are
+//! totally unnecessary; there are standard Unix wrappers around all of these."*
+//! The single most valuable part to have gone is the manual walk over the
+//! inotify read buffer, which is where the unaligned-read UB came from: the
+//! code cast offsets into a `[u8; 4096]` straight to `*const inotify_event` and
+//! dereferenced them. `nix` copies each header into an aligned `MaybeUninit`
+//! instead, which is the correct way to do it and not something this crate
+//! should have been deciding for itself.
 
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{AsFd, AsRawFd, RawFd};
 use std::path::Path;
+
+/// The directories and files to watch, deduplicated.
+///
+/// Directories catch create, rename and delete of a config file; the files
+/// themselves catch an in-place write, which does not change the directory at
+/// all. Linux gets both from a directory watch because inotify reports the
+/// entry name; kqueue reports only which descriptor changed, so it needs the
+/// file registered too.
+fn watch_targets(paths: &[&Path], include_files: bool) -> Vec<std::path::PathBuf> {
+    use std::collections::HashSet;
+    let mut seen: HashSet<std::path::PathBuf> = HashSet::new();
+    let mut targets = Vec::new();
+    for path in paths {
+        let dir = path.parent().unwrap_or(Path::new("/"));
+        if !dir.exists() {
+            tracing::warn!(dir = %dir.display(), "watch directory does not exist, skipping");
+            continue;
+        }
+        if seen.insert(dir.to_path_buf()) {
+            targets.push(dir.to_path_buf());
+        }
+        if include_files && path.exists() && seen.insert(path.to_path_buf()) {
+            targets.push(path.to_path_buf());
+        }
+    }
+    targets
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Linux: inotify
@@ -18,139 +63,82 @@ use std::path::Path;
 
 #[cfg(target_os = "linux")]
 pub struct ConfigWatcher {
-    inotify_fd: RawFd,
+    inotify: nix::sys::inotify::Inotify,
 }
-
-#[cfg(target_os = "linux")]
-const EVENT_BUF_LEN: usize = 4096;
-
-/// Read buffer for `inotify_event`, aligned.
-///
-/// `read_events` casts offsets into this buffer straight to
-/// `*const libc::inotify_event` and dereferences them. That struct begins with
-/// a `c_int`, so it needs 4-byte alignment, and a bare `[u8; N]` has alignment
-/// 1: nothing made the base address suitable. It worked because a 4096-byte
-/// stack array is almost always well aligned in practice, which is the kind of
-/// luck that holds until a compiler version or a stack layout changes.
-///
-/// The kernel pads each event's `len` so that the next one stays aligned
-/// relative to the start of the buffer, so aligning the base is sufficient.
-#[cfg(target_os = "linux")]
-#[repr(align(8))]
-struct EventBuf([u8; EVENT_BUF_LEN]);
-
-#[cfg(target_os = "linux")]
-const _: () = assert!(
-    std::mem::align_of::<libc::inotify_event>() <= 8,
-    "EventBuf must be at least as aligned as inotify_event"
-);
 
 #[cfg(target_os = "linux")]
 impl ConfigWatcher {
     pub fn new(paths: &[&Path]) -> anyhow::Result<Self> {
-        use std::collections::HashSet;
-        use std::ffi::CString;
+        use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
 
-        let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
-        if fd < 0 {
-            anyhow::bail!("inotify_init1 failed: {}", std::io::Error::last_os_error());
-        }
+        let inotify = Inotify::init(InitFlags::IN_CLOEXEC | InitFlags::IN_NONBLOCK)
+            .map_err(|e| anyhow::anyhow!("inotify_init1 failed: {e}"))?;
 
-        let mask = libc::IN_CLOSE_WRITE | libc::IN_CREATE | libc::IN_MOVED_TO;
-        let mut watched: HashSet<std::path::PathBuf> = HashSet::new();
+        // `IN_CLOSE_WRITE` rather than `IN_MODIFY`: a writer that makes several
+        // writes produces one event on close instead of a reload per write.
+        // `IN_CREATE` and `IN_MOVED_TO` catch the write-to-temp-then-rename
+        // that every careful editor and every deploy script does.
+        let mask = AddWatchFlags::IN_CLOSE_WRITE
+            | AddWatchFlags::IN_CREATE
+            | AddWatchFlags::IN_MOVED_TO;
 
-        for path in paths {
-            let dir = path.parent().unwrap_or(Path::new("/"));
-            if !dir.exists() {
-                tracing::warn!(dir = %dir.display(), "watch directory does not exist, skipping");
-                continue;
-            }
-            if watched.insert(dir.to_path_buf()) {
-                match CString::new(dir.to_string_lossy().as_bytes()) {
-                    Ok(cstr) => {
-                        let wd = unsafe { libc::inotify_add_watch(fd, cstr.as_ptr(), mask) };
-                        if wd < 0 {
-                            tracing::warn!(
-                                dir = %dir.display(),
-                                error = %std::io::Error::last_os_error(),
-                                "inotify_add_watch failed"
-                            );
-                        }
-                    }
-                    Err(_) => {
-                        tracing::warn!(dir = %dir.display(), "directory path contains interior NUL, skipping");
-                    }
-                }
+        for dir in watch_targets(paths, false) {
+            if let Err(e) = inotify.add_watch(&dir, mask) {
+                tracing::warn!(dir = %dir.display(), error = %e, "inotify_add_watch failed");
             }
         }
 
-        Ok(ConfigWatcher { inotify_fd: fd })
+        Ok(ConfigWatcher { inotify })
     }
 
     pub fn raw_fd(&self) -> Option<RawFd> {
-        Some(self.inotify_fd)
+        Some(self.inotify.as_fd().as_raw_fd())
     }
 
+    /// Drain pending events, returning true if any names a watched file.
     pub fn read_events(&mut self, filenames: &[&str]) -> bool {
-        let mut buf = EventBuf([0u8; EVENT_BUF_LEN]);
         let mut matched = false;
+        // One `read` per call, so loop until the queue is empty. An empty
+        // non-blocking queue is `EAGAIN`, which is the normal way out rather
+        // than an error to report.
         loop {
-            let n = unsafe {
-                libc::read(
-                    self.inotify_fd,
-                    buf.0.as_mut_ptr() as *mut libc::c_void,
-                    buf.0.len(),
-                )
-            };
-            if n <= 0 {
-                break;
-            }
-            let n = n as usize;
-            let mut offset = 0usize;
-            while offset + std::mem::size_of::<libc::inotify_event>() <= n {
-                let event =
-                    unsafe { &*(buf.0.as_ptr().add(offset) as *const libc::inotify_event) };
-                let name_len = event.len as usize;
-                if name_len > 0 {
-                    let name_start = offset + std::mem::size_of::<libc::inotify_event>();
-                    let name_end = name_start + name_len;
-                    if name_end <= n {
-                        let name = std::ffi::CStr::from_bytes_until_nul(&buf.0[name_start..name_end])
-                            .ok()
-                            .and_then(|s| s.to_str().ok())
-                            .unwrap_or("");
-                        if filenames.iter().any(|f| *f == name) {
-                            matched = true;
+            match self.inotify.read_events() {
+                Ok(events) if events.is_empty() => break,
+                Ok(events) => {
+                    for ev in events {
+                        if let Some(name) = ev.name.as_ref().and_then(|n| n.to_str()) {
+                            if filenames.contains(&name) {
+                                matched = true;
+                            }
                         }
                     }
                 }
-                offset += std::mem::size_of::<libc::inotify_event>() + name_len;
+                Err(nix::errno::Errno::EAGAIN) => break,
+                Err(e) => {
+                    tracing::warn!(error = %e, "inotify read failed");
+                    break;
+                }
             }
         }
         matched
     }
 }
 
-#[cfg(target_os = "linux")]
-impl Drop for ConfigWatcher {
-    fn drop(&mut self) {
-        unsafe { libc::close(self.inotify_fd) };
-    }
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
-// macOS / FreeBSD / OpenBSD: kqueue EVFILT_VNODE + self-pipe
+// macOS / FreeBSD / OpenBSD: kqueue
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
 pub struct ConfigWatcher {
-    /// The kqueue itself. **This is what `raw_fd` returns**, because a kqueue
-    /// descriptor is pollable: it becomes readable when events are pending, so
-    /// the service's existing `poll(2)` can wait on it directly.
-    kq: RawFd,
-    /// Descriptors for the watched directories and files, held open because a
-    /// kevent registration lasts only as long as its descriptor.
-    watched_fds: Vec<RawFd>,
+    /// **This is what `raw_fd` returns**, because a kqueue descriptor is
+    /// pollable: it becomes readable when events are pending, so the service's
+    /// existing `poll(2)` waits on it directly.
+    kq: nix::sys::event::Kqueue,
+    /// The watched directories and files, held open because a kevent
+    /// registration lasts exactly as long as its descriptor. `File` rather than
+    /// a raw fd, so closing them is the borrow checker's job and not a `Drop`
+    /// impl's.
+    _watched: Vec<std::fs::File>,
 }
 
 #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
@@ -158,97 +146,61 @@ impl ConfigWatcher {
     /// Register every watch on one kqueue, synchronously.
     ///
     /// **This used to spawn a thread per watched directory**, each running its
-    /// own `kqueue` loop on a one second timeout and writing a byte into a
-    /// self-pipe so that the main loop's `poll` would wake. That is a second
-    /// event loop, plus a pipe to get back to the first one, for a descriptor
-    /// the first one could already have waited on. Three defects came with it:
-    ///
-    /// - **A startup race.** `new` returned before the threads had registered
-    ///   their kevents, and `EV_CLEAR` is edge-triggered, so a config change in
-    ///   that window was lost with no sign. Linux never had this, because
-    ///   `inotify_add_watch` happens inside `new`.
-    /// - **A thread leak.** `Drop` closed the pipe, but the threads looped
-    ///   forever with no shutdown path, waking once a second to write to a
-    ///   closed descriptor for the life of the process.
-    /// - **Two more file descriptors and a thread per watcher**, to carry a
-    ///   single readable bit.
-    ///
-    /// Registering here means the watch is live before `new` returns, which is
-    /// the contract Linux already had and the one the caller assumes.
+    /// own kqueue loop on a one second timeout and writing a byte into a
+    /// self-pipe so the main loop's `poll` would wake: a second event loop,
+    /// plus a pipe to get back to the first one, for a descriptor the first one
+    /// could already have waited on. It cost a startup race (`new` returned
+    /// before the threads had registered, and `EV_CLEAR` is edge-triggered, so
+    /// a change in that window was lost silently) and a thread leak (the
+    /// threads had no shutdown path and woke once a second forever, writing to
+    /// a closed descriptor). Registering here means the watch is live before
+    /// `new` returns, which is the contract Linux always had.
     pub fn new(paths: &[&Path]) -> anyhow::Result<Self> {
-        use std::collections::HashSet;
+        use nix::sys::event::{EventFilter, EvFlags, FilterFlag, KEvent, Kqueue};
 
-        let kq = unsafe { libc::kqueue() };
-        if kq < 0 {
-            anyhow::bail!("kqueue failed: {}", std::io::Error::last_os_error());
-        }
+        let kq = Kqueue::new().map_err(|e| anyhow::anyhow!("kqueue failed: {e}"))?;
+        let mut watched = Vec::new();
 
-        let mut watched_fds: Vec<RawFd> = Vec::new();
-        let mut seen: HashSet<std::path::PathBuf> = HashSet::new();
-
-        // Directories catch create, rename and delete of the config file;
-        // the files themselves catch an in-place write, which does not change
-        // the directory at all. Both are needed, and both are just more
-        // registrations on the same kqueue.
-        let mut targets: Vec<std::path::PathBuf> = Vec::new();
-        for path in paths {
-            let dir = path.parent().unwrap_or(Path::new("/"));
-            if !dir.exists() {
-                tracing::warn!(dir = %dir.display(), "watch directory does not exist, skipping");
-                continue;
-            }
-            if seen.insert(dir.to_path_buf()) {
-                targets.push(dir.to_path_buf());
-            }
-            if path.exists() && seen.insert(path.to_path_buf()) {
-                targets.push(path.to_path_buf());
-            }
-        }
-
-        for target in &targets {
-            let Ok(cstr) = std::ffi::CString::new(target.as_os_str().as_encoded_bytes()) else {
-                tracing::warn!(path = %target.display(), "path contains interior NUL, skipping");
-                continue;
+        for target in watch_targets(paths, true) {
+            // `File::open` works on a directory on Unix and gives an owned
+            // descriptor. The previous version used `open(O_EVTONLY)`, which is
+            // the more precise flag -- it does not hold the volume against
+            // unmount -- but it is not in `nix`'s `OFlag`, and reaching past
+            // the wrapper for it is what this rewrite is removing. A config
+            // file's volume is not being unmounted under a running service.
+            let file = match std::fs::File::open(&target) {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::warn!(path = %target.display(), error = %e, "cannot open to watch, not watching");
+                    continue;
+                }
             };
-            let fd = unsafe { libc::open(cstr.as_ptr(), libc::O_EVTONLY) };
-            if fd < 0 {
-                tracing::warn!(
-                    path = %target.display(),
-                    error = %std::io::Error::last_os_error(),
-                    "open(O_EVTONLY) failed, not watching"
-                );
+
+            let ev = KEvent::new(
+                file.as_raw_fd() as usize,
+                EventFilter::EVFILT_VNODE,
+                EvFlags::EV_ADD | EvFlags::EV_ENABLE | EvFlags::EV_CLEAR,
+                FilterFlag::NOTE_WRITE
+                    | FilterFlag::NOTE_EXTEND
+                    | FilterFlag::NOTE_ATTRIB
+                    | FilterFlag::NOTE_LINK
+                    | FilterFlag::NOTE_RENAME
+                    | FilterFlag::NOTE_DELETE,
+                0,
+                0,
+            );
+            if let Err(e) = kq.kevent(&[ev], &mut [], Some(ZERO_TIMEOUT)) {
+                tracing::warn!(path = %target.display(), error = %e, "kevent registration failed, not watching");
                 continue;
             }
-            let ev = libc::kevent {
-                ident: fd as libc::uintptr_t,
-                filter: libc::EVFILT_VNODE,
-                flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_CLEAR,
-                fflags: (libc::NOTE_WRITE
-                    | libc::NOTE_EXTEND
-                    | libc::NOTE_ATTRIB
-                    | libc::NOTE_LINK
-                    | libc::NOTE_RENAME
-                    | libc::NOTE_DELETE) as u32,
-                data: 0,
-                udata: std::ptr::null_mut(),
-            };
-            if unsafe { libc::kevent(kq, &ev, 1, std::ptr::null_mut(), 0, std::ptr::null()) } < 0 {
-                tracing::warn!(
-                    path = %target.display(),
-                    error = %std::io::Error::last_os_error(),
-                    "kevent registration failed, not watching"
-                );
-                unsafe { libc::close(fd) };
-                continue;
-            }
-            watched_fds.push(fd);
+            watched.push(file);
         }
 
-        Ok(ConfigWatcher { kq, watched_fds })
+        Ok(ConfigWatcher { kq, _watched: watched })
     }
 
     pub fn raw_fd(&self) -> Option<RawFd> {
-        Some(self.kq)
+        Some(self.kq.as_fd().as_raw_fd())
     }
 
     /// Drain pending events. Returns true if there were any.
@@ -259,34 +211,38 @@ impl ConfigWatcher {
     /// costs a spurious reload. Linux compares the name and does not. The cost
     /// is one wasted reload on a development machine, so it stays.
     pub fn read_events(&mut self, _filenames: &[&str]) -> bool {
-        let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-        let mut evs = unsafe { std::mem::zeroed::<[libc::kevent; 16]>() };
+        use nix::sys::event::{EventFilter, EvFlags, FilterFlag, KEvent};
+
+        let mut evs = [KEvent::new(
+            0,
+            EventFilter::EVFILT_VNODE,
+            EvFlags::empty(),
+            FilterFlag::empty(),
+            0,
+            0,
+        ); 16];
         let mut any = false;
         loop {
-            let n = unsafe {
-                libc::kevent(self.kq, std::ptr::null(), 0, evs.as_mut_ptr(), 16, &zero)
-            };
-            if n <= 0 {
-                break;
-            }
-            any = true;
-            if (n as usize) < evs.len() {
-                break;
+            match self.kq.kevent(&[], &mut evs, Some(ZERO_TIMEOUT)) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    any = true;
+                    if n < evs.len() {
+                        break;
+                    }
+                }
             }
         }
         any
     }
 }
 
+/// Poll the queue rather than wait on it: the service's own `poll(2)` has
+/// already told us something is ready, and a blocking drain here would hold the
+/// loop.
 #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
-impl Drop for ConfigWatcher {
-    fn drop(&mut self) {
-        for fd in self.watched_fds.drain(..) {
-            unsafe { libc::close(fd) };
-        }
-        unsafe { libc::close(self.kq) };
-    }
-}
+const ZERO_TIMEOUT: nix::libc::timespec =
+    nix::libc::timespec { tv_sec: 0, tv_nsec: 0 };
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Fallback (no-op)
@@ -334,11 +290,12 @@ mod tests {
     /// than a sleep chosen to be probably long enough. A filesystem event is
     /// asynchronous, and the honest way to wait for one is to wait on the thing
     /// that signals it.
-    fn readable_within(w: &ConfigWatcher, ms: i32) -> bool {
+    fn readable_within(w: &ConfigWatcher, ms: u16) -> bool {
+        // Through the same shared helper the service loop uses, so the test
+        // waits on the descriptor exactly as production does rather than on a
+        // second hand-rolled `poll` that could drift from it.
         let fd = w.raw_fd().expect("a supported platform has a watcher fd");
-        let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
-        let n = unsafe { libc::poll(&mut pfd, 1, ms) };
-        n > 0 && (pfd.revents & libc::POLLIN) != 0
+        crate::server::poll_listener_and_watcher(fd, None, ms).listener
     }
 
     fn write_file(path: &Path, body: &str) {

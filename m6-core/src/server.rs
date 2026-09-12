@@ -106,17 +106,21 @@ pub fn poll_listener_and_watcher(
     // borrowed rather than owned precisely so that returning does not close
     // them.
     let borrowed_listener = unsafe { BorrowedFd::borrow_raw(listener_fd) };
-    let mut pfd_listener = PollFd::new(&borrowed_listener, PollFlags::POLLIN);
+    let mut pfd_listener = PollFd::new(borrowed_listener, PollFlags::POLLIN);
 
     let fired = |pfd: &PollFd| {
         pfd.revents().is_some_and(|f| f.contains(PollFlags::POLLIN))
     };
 
-    let timeout = timeout_ms as i32;
+    // `PollTimeout` is a distinct type now rather than a bare `i32`, which is
+    // an improvement worth taking: -1 meaning "block forever" and 0 meaning
+    // "return immediately" used to be two magic values in the same integer.
+    // `timeout_ms` is a `u16`, so this conversion is total.
+    let timeout = nix::poll::PollTimeout::from(timeout_ms);
     match watcher_fd {
         Some(wfd) => {
             let borrowed_watcher = unsafe { BorrowedFd::borrow_raw(wfd) };
-            let pfd_watcher = PollFd::new(&borrowed_watcher, PollFlags::POLLIN);
+            let pfd_watcher = PollFd::new(borrowed_watcher, PollFlags::POLLIN);
             let mut fds = [pfd_listener, pfd_watcher];
             let result = poll(&mut fds, timeout);
             PollReady {
