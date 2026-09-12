@@ -160,11 +160,42 @@ arithmetic over `inotify_event` (which is where the unaligned-read UB came from
 in the first place), `kqueue`, `kevent`, `open(O_EVTONLY)`, hand-managed
 descriptors and three `Drop` impls. None of that is m6's problem to solve.
 
-- [ ] **Rewrite on `nix`'s safe wrappers.** `nix::sys::inotify` and
-      `nix::sys::event` cover both platforms, and **`nix` is already a
-      dependency** of m6-core, since it is where `nix::poll` comes from. No new
-      dependency, and the unsafe blocks and the manual event-buffer walk both
-      go.
+- [x] **Rewritten on `nix`'s safe wrappers. DONE 2026-09-13.**
+      **Zero `unsafe` in the production code**, down from 390 lines of raw
+      libc across three `#[cfg]` arms.
+
+      The manual walk over the inotify read buffer is the part worth naming:
+      it cast offsets into a `[u8; 4096]` straight to `*const inotify_event`
+      and dereferenced them, which is where the unaligned-read UB came from.
+      `nix` copies each header into an aligned `MaybeUninit`. `EventBuf`, its
+      `#[repr(align(8))]` and the `align_of::<inotify_event>() <= 8`
+      compile-time assertion all go with it, **which retires the standing
+      lesson attached to them**.
+
+      The macOS arm holds its descriptors in `std::fs::File` rather than raw
+      fds with a `Drop` impl, so closing them is the borrow checker's job. It
+      gives up `O_EVTONLY`, which is not in `nix`'s `OFlag`: the practical
+      difference is that the open descriptor holds the volume against unmount,
+      which is not something that happens to a config file's volume under a
+      running service. Reaching past the wrapper for that flag is what this
+      rewrite exists to stop.
+
+      **`nix` went 0.27 to 0.31, and that is what made the kqueue arm
+      possible.** 0.27's `Kqueue` wraps an `OwnedFd` with no accessor, so it
+      cannot hand the poll loop a descriptor, and a pollable fd is the whole
+      design constraint. 0.31 adds `AsFd for Kqueue`. The upgrade surface was
+      two imports across the workspace and cost one change: `PollTimeout` is a
+      distinct type rather than a bare `i32`, which is an improvement, since
+      -1 for "block forever" and 0 for "return immediately" were two magic
+      values in one integer.
+
+      **m6-file and m6-http declared `nix` and used none of it.** Those
+      dependencies are gone, so the workspace resolves one version rather than
+      two.
+
+      Compiled and exercised on Linux via the build-host gate, which matters
+      here more than usual: the inotify arm is `#[cfg]`-gated off on the
+      laptop, and it is the one that runs in production.
 
 **Constraint the rewrite must not break:** the watcher exposes a pollable file
 descriptor and the *service's own* poll loop waits on it. The obvious crate,

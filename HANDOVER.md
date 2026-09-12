@@ -4,6 +4,19 @@ State of play for the next session. Written 2026-09-11, updated 2026-09-12.
 
 > ## Read first, 2026-09-13
 >
+> **`watcher.rs` is on `nix` now: zero `unsafe` in the production code**, down
+> from 390 lines of raw libc across three `#[cfg]` arms. The manual inotify
+> buffer walk that produced the alignment UB is gone, and so are `EventBuf`,
+> its `#[repr(align(8))]` and the `align_of` assertion. **That retires the
+> standing lesson about the unaligned read.** §3c is closed.
+>
+> **`nix` went 0.27 to 0.31** and that is what made it possible: 0.27's
+> `Kqueue` has no fd accessor, so it cannot hand the poll loop a descriptor.
+> The upgrade surface was two imports. `m6-file` and `m6-http` declared `nix`
+> and used none of it; those are gone, so the workspace holds one version.
+>
+> **Clippy's Darwin ceiling is 155**, down from 157.
+>
 > **`m6-auth-server` is an `App` service too, so both migrations are done and
 > every service is one shape.** `main.rs` is 116 lines. Its handlers are
 > untouched on purpose: they carry the rate limiting, JWT minting and cookie
@@ -451,7 +464,9 @@ Services: `m6-http` (edge/proxy), `m6-file`, `m6-html`, `m6-auth-server`,
    remain in non-test code. Two of them were bugs rather than duplication: the
    Set-Cookie scan and the `Connection` token check each read only the first
    line of a field that may legitimately repeat.
-5b. **Rewrite `watcher.rs` on `nix`'s safe wrappers** (`CONSOLIDATION-TODO` §3c),
+5b. ~~**Rewrite `watcher.rs` on `nix`'s safe wrappers**~~ **DONE 2026-09-13**,
+   see `CONSOLIDATION-TODO` §3c. Original entry:
+   **Rewrite `watcher.rs` on `nix`'s safe wrappers** (`CONSOLIDATION-TODO` §3c),
    owner's instruction 2026-09-12. The threads are already gone (`e6ba278`,
    single pollable kqueue on the main poll); what remains is ~390 lines of raw
    unsafe libc across three cfg arms, including the manual `inotify_event`
