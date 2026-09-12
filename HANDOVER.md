@@ -4,6 +4,14 @@ State of play for the next session. Written 2026-09-11, updated 2026-09-12.
 
 > ## Read first, 2026-09-13
 >
+> **The performance story is written up per commit: `docs/PERFORMANCE.md`.**
+> Headline, measured 2026-09-13 on the real site, real production
+> `m6-html.conf` and real `data/content.json`, five interleaved rounds:
+> **a rendered page went from 2.79 ms to 1.64 ms**, deployed commit against
+> HEAD. The rendered bytes are identical (same content-hash ETag, same
+> `Content-Length`), so no layout or copy change. That is the Phase 5/6 delta
+> the plan has owed since the migration.
+>
 > **§3a IS RESOLVED, AND IT WAS NEVER A CODE REGRESSION.** `hit_p50_ns` is a
 > load-dependent measurement: on a near-idle single-core VM the cache-hit path
 > goes cold between requests, so the number tracks request density.
