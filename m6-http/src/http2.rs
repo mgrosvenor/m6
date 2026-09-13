@@ -305,6 +305,36 @@ pub struct Http2Conn {
     /// Consecutive REFUSED_STREAM answers sent, cleared whenever a stream is
     /// accepted. See `MAX_REFUSED_STREAK`.
     refused_streak: u32,
+    /// Send windows of streams closed in the last few moments, so a
+    /// WINDOW_UPDATE that arrives just after we finished a response is still
+    /// validated instead of falling through a lookup that no longer finds it.
+    ///
+    /// RFC 9113 5.1 requires tolerating exactly this: an endpoint "might receive
+    /// a WINDOW_UPDATE or RST_STREAM frame from its peer in the time before the
+    /// peer receives and processes the frame that closes the stream". Tolerating
+    /// is not the same as ignoring, and 6.9.1 still makes a window above 2^31-1
+    /// a FLOW_CONTROL_ERROR.
+    ///
+    /// This is what made h2spec 6.9.1/3 fail about one run in three: h2spec
+    /// sends HEADERS with END_STREAM and then two WINDOW_UPDATEs that overflow
+    /// the window, usually in the same segment. If the response was Ready, we
+    /// dispatched it, sent END_STREAM and REMOVED the stream inside the same
+    /// frame loop, so the WINDOW_UPDATEs found nothing and were dropped on the
+    /// floor. Whether it failed depended on whether the response beat the
+    /// WINDOW_UPDATE, which is why it looked like a flake.
+    closed_windows: std::collections::VecDeque<(u32, i32)>,
+    /// The peer sent us a GOAWAY. Distinct from `Phase::GoingAway`, which means
+    /// WE are shutting the connection down.
+    ///
+    /// RFC 9113 6.8: a receiver of GOAWAY must not open new streams, and that is
+    /// all. It is not told to close, and closing at once is what broke h2spec
+    /// 5.4.1: with no streams open we went straight to `Phase::Done`, the caller
+    /// closed the socket, and the PING the peer sent immediately after its
+    /// GOAWAY arrived at a closed socket, so the kernel answered RST. h2spec saw
+    /// "connection reset by peer" where it expected a clean close or a PING ACK,
+    /// and it failed about one run in three depending on whether the PING landed
+    /// before or after our close.
+    peer_goaway: bool,
     /// Whether a GOAWAY has already gone out, so the generic error path does
     /// not overwrite a precise code with PROTOCOL_ERROR.
     goaway_sent: bool,
@@ -346,6 +376,8 @@ impl Http2Conn {
             last_stream_id: 0,
             recently_reset: std::collections::VecDeque::new(),
             refused_streak: 0,
+            closed_windows: std::collections::VecDeque::new(),
+            peer_goaway: false,
             goaway_sent: false,
             continuation_stream_id: None,
             header_block_buf: Vec::new(),
@@ -770,7 +802,18 @@ impl Http2Conn {
             TYPE_PUSH_PROMISE => return Err("client sent PUSH_PROMISE"),
             TYPE_PING => self.handle_ping(flags, &payload),
             TYPE_GOAWAY => {
-                self.phase = Phase::GoingAway;
+                // NOT `phase = GoingAway`. That is our own teardown, and taking
+                // it here meant closing the connection the instant no streams
+                // were open, which races anything the peer sent after its
+                // GOAWAY. RFC 9113 5.1 says so explicitly: an endpoint "might
+                // receive a WINDOW_UPDATE or RST_STREAM frame from its peer in
+                // the time before the peer receives and processes the frame that
+                // closes the stream", and the same applies to the connection.
+                //
+                // So: refuse new streams, keep serving, and let the connection
+                // end when the peer closes it (EOF in fill_recv) or the idle
+                // timeout fires. Both already drive us to Done.
+                self.peer_goaway = true;
             }
             TYPE_WINDOW_UPDATE => self.handle_window_update(stream_id, &payload)?,
             TYPE_CONTINUATION => {
@@ -782,6 +825,22 @@ impl Http2Conn {
     }
 
     // ── Stream state machine (RFC 9113 5.1) ───────────────────────────────────
+
+    /// Drop a stream that has just been answered, remembering its send window.
+    ///
+    /// Bounded at the same size as the reset memory: this exists to cover the
+    /// gap between us closing a stream and the peer learning about it, which is
+    /// one round trip, not an unbounded history.
+    fn close_stream_remembering_window(&mut self, stream_id: u32) {
+        let window = self.streams.get(&stream_id).map(|s| s.send_window);
+        self.streams.remove(&stream_id);
+        if let Some(w) = window {
+            if self.closed_windows.len() >= RESET_MEMORY {
+                self.closed_windows.pop_front();
+            }
+            self.closed_windows.push_back((stream_id, w));
+        }
+    }
 
     /// Remember a stream terminated by RST_STREAM, evicting the oldest.
     fn note_reset(&mut self, stream_id: u32) {
@@ -1106,6 +1165,28 @@ impl Http2Conn {
                 return Ok(());
             }
             s.send_window += inc as i32;
+        } else if let Some(pos) = self
+            .closed_windows
+            .iter()
+            .position(|(id, _)| *id == stream_id)
+        {
+            // The stream closed moments ago and the peer cannot have known yet.
+            // RFC 9113 5.1 says accept the frame; 6.9.1 says the window still
+            // must not exceed 2^31-1, and a stream error is how that is
+            // reported. Silently dropping it was the bug.
+            let w = self.closed_windows[pos].1;
+            if w as i64 + inc as i64 > MAX_WINDOW {
+                self.push_frame(
+                    TYPE_RST_STREAM,
+                    0,
+                    stream_id,
+                    &ERR_FLOW_CONTROL.to_be_bytes(),
+                );
+                self.closed_windows.remove(pos);
+                self.note_reset(stream_id);
+                return Ok(());
+            }
+            self.closed_windows[pos].1 = w + inc as i32;
         }
         // A larger window may unblock pending response data.
         self.flush_pending_streams();
@@ -1143,6 +1224,22 @@ impl Http2Conn {
         if stream_id <= self.last_stream_id && !self.streams.contains_key(&stream_id) {
             self.send_goaway(ERR_PROTOCOL_ERROR);
             self.phase = Phase::GoingAway;
+            return Ok(());
+        }
+        // RFC 9113 6.8: after receiving GOAWAY, "the receiver of the GOAWAY MUST
+        // NOT open additional streams". Refused rather than ignored, so the peer
+        // is told plainly instead of waiting for a response that will not come.
+        // REFUSED_STREAM is the code the RFC names for a stream the endpoint is
+        // declining to process, and it tells the peer the request can safely be
+        // retried on a new connection.
+        if self.peer_goaway && !self.streams.contains_key(&stream_id) {
+            self.push_frame(
+                TYPE_RST_STREAM,
+                0,
+                stream_id,
+                &ERR_REFUSED_STREAM.to_be_bytes(),
+            );
+            self.last_stream_id = self.last_stream_id.max(stream_id);
             return Ok(());
         }
         // Rapid Reset, CVE-2023-44487. `streams.len()` was the whole of this
@@ -1800,7 +1897,7 @@ impl Http2Conn {
                 if to_send == 0 && is_last {
                     // Empty DATA + END_STREAM to close the stream.
                     self.push_frame(TYPE_DATA, FLAG_END_STREAM, stream_id, &[]);
-                    self.streams.remove(&stream_id);
+                    self.close_stream_remembering_window(stream_id);
                     continue 'outer;
                 }
 
@@ -1836,7 +1933,7 @@ impl Http2Conn {
                         .map(|s| s.state == StreamState::HalfClosedRemote)
                         .unwrap_or(true);
                     if peer_done {
-                        self.streams.remove(&stream_id);
+                        self.close_stream_remembering_window(stream_id);
                         self.last_stream_id = self.last_stream_id.max(stream_id);
                     } else if let Some(s) = self.streams.get_mut(&stream_id) {
                         s.state = StreamState::HalfClosedLocal;
@@ -2604,7 +2701,7 @@ mod stream_state_tests {
     }
 
     /// Every frame of `ftype` in the outgoing buffer, as (stream_id, payload).
-    fn sent_frames(buf: &[u8], ftype: u8) -> Vec<(u32, Vec<u8>)> {
+    pub(super) fn sent_frames(buf: &[u8], ftype: u8) -> Vec<(u32, Vec<u8>)> {
         let mut out = Vec::new();
         let mut i = 0usize;
         while i + FRAME_HDR <= buf.len() {
@@ -3604,5 +3701,191 @@ mod hpack_robustness {
                 "a {n}-byte truncation passes validation and panics the decoder"
             );
         }
+    }
+}
+
+// ── Issue #7: two intermittent h2spec failures, made deterministic ───────────
+//
+// Both were found because h2spec scored 145/146 on a CI runner while the build
+// host said 146/146, and "flake" was refused as an answer. Repeating the run on
+// the build host reproduced it 2 times in 6, with two DIFFERENT tests failing,
+// which is what said the cause was one race rather than one bad test.
+//
+// The loop that found them is not a regression test: it needs twenty runs to be
+// convincing and it only reports a number. These two are deterministic, and they
+// assert the behaviour rather than the score.
+#[cfg(test)]
+mod issue_7_intermittent_conformance {
+    use super::stream_state_tests::sent_frames;
+    use super::*;
+
+    /// h2spec 5.4.1: a GOAWAY carrying an unknown error code "MUST NOT trigger
+    /// any special behavior". h2spec sends GOAWAY, then a PING, and expects
+    /// either a clean close or a PING ACK.
+    ///
+    /// We used to take `Phase::GoingAway` on receipt, which with no streams open
+    /// becomes `Phase::Done` in the same `drive` call, and the caller then closed
+    /// the socket. The PING arriving immediately afterwards hit a closed socket,
+    /// so the kernel answered RST and h2spec reported "connection reset by peer".
+    /// It failed or passed depending on whether the PING landed before our close,
+    /// which is the whole of why it looked intermittent.
+    #[test]
+    fn a_received_goaway_does_not_close_the_connection() {
+        let mut c = Http2Conn::new();
+        c.phase = Phase::Active;
+
+        // GOAWAY: last-stream-id 0, error code 0xff (unknown).
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_be_bytes());
+        payload.extend_from_slice(&0xffu32.to_be_bytes());
+        c.recv_buf
+            .extend_from_slice(&frame(TYPE_GOAWAY, 0, 0, &payload));
+
+        let mut on_request = |_: &HttpRequest, _: &str| -> RequestOutcome { unreachable!() };
+        assert!(matches!(
+            c.process_frame(&mut on_request, "127.0.0.1"),
+            Ok(true)
+        ));
+
+        assert!(c.peer_goaway, "the peer's GOAWAY must be recorded");
+        assert_ne!(
+            c.phase,
+            Phase::Done,
+            "receiving GOAWAY must not close the connection: the peer may have \
+             sent more frames behind it, and closing races them into a TCP reset"
+        );
+        assert_ne!(
+            c.phase,
+            Phase::GoingAway,
+            "GoingAway is OUR teardown. Taking it here is what caused the reset."
+        );
+    }
+
+    /// The frames behind that GOAWAY must still be served, which is the
+    /// observable half of the same fix.
+    ///
+    /// This asserts the PING is ACKed AND that we are still willing to serve
+    /// afterwards. The ACK alone does not discriminate: the frame loop drains
+    /// whatever is already buffered even in `GoingAway`, so a version with the
+    /// bug still ACKs a PING that arrived in the same read. What the bug broke
+    /// was the SOCKET, one layer down, where the caller saw `is_done()` and
+    /// closed while the peer was still writing. That is not observable from
+    /// here, which is exactly why the h2spec gate earns its place: it was the
+    /// only thing that ever saw this.
+    #[test]
+    fn frames_behind_a_received_goaway_are_still_served() {
+        let mut c = Http2Conn::new();
+        c.phase = Phase::Active;
+
+        let mut goaway = Vec::new();
+        goaway.extend_from_slice(&0u32.to_be_bytes());
+        goaway.extend_from_slice(&0xffu32.to_be_bytes());
+        c.recv_buf
+            .extend_from_slice(&frame(TYPE_GOAWAY, 0, 0, &goaway));
+        c.recv_buf
+            .extend_from_slice(&frame(TYPE_PING, 0, 0, b"h2spec  "));
+
+        let mut on_request = |_: &HttpRequest, _: &str| -> RequestOutcome { unreachable!() };
+        while let Ok(true) = c.process_frame(&mut on_request, "127.0.0.1") {}
+
+        let acks: Vec<_> = sent_frames(&c.send_buf, TYPE_PING)
+            .into_iter()
+            .filter(|(_, p)| p.as_slice() == b"h2spec  ")
+            .collect();
+        assert!(
+            !acks.is_empty(),
+            "the PING must be ACKed. send_buf: {:?}",
+            c.send_buf
+        );
+
+        // The discriminating half. `is_done()` is not enough on its own: the old
+        // code set `GoingAway` here and `drive` turned that into `Done` later,
+        // so a check for Done passes at this layer either way. The phase itself
+        // is what decides, and it must still be Active.
+        assert_eq!(
+            c.phase,
+            Phase::Active,
+            "after a GOAWAY and a PING the connection must still be Active. \
+             GoingAway means we have begun our own teardown, and `drive` turns \
+             that into Done as soon as no streams are open, so the caller closes \
+             the socket under whatever the peer sends next."
+        );
+        assert!(!c.is_done());
+    }
+
+    /// h2spec 6.9.1/3: WINDOW_UPDATEs that take a STREAM's window above 2^31-1
+    /// MUST produce RST_STREAM with FLOW_CONTROL_ERROR.
+    ///
+    /// h2spec sends HEADERS with END_STREAM and then the WINDOW_UPDATEs, usually
+    /// in one segment. When the response was Ready we dispatched it, sent
+    /// END_STREAM and REMOVED the stream inside the same frame loop, so the
+    /// WINDOW_UPDATE found no stream and the `if let Some(s)` fell through to
+    /// nothing at all. Whether it failed depended on whether the response beat
+    /// the WINDOW_UPDATE.
+    #[test]
+    fn a_window_update_overflowing_a_just_closed_stream_is_still_a_stream_error() {
+        let mut c = Http2Conn::new();
+        c.phase = Phase::Active;
+        c.streams.insert(1, H2Stream::new(65_535));
+        // Answered and dropped, exactly as the response path does it.
+        c.close_stream_remembering_window(1);
+        assert!(
+            !c.streams.contains_key(&1),
+            "the stream is gone, which is the situation under test"
+        );
+        c.send_buf.clear();
+
+        // An increment that cannot fit: window + inc > 2^31-1.
+        let inc: u32 = 0x7fff_ffff;
+        c.handle_window_update(1, &inc.to_be_bytes()).unwrap();
+
+        let rsts = sent_frames(&c.send_buf, TYPE_RST_STREAM);
+        assert_eq!(
+            rsts.len(),
+            1,
+            "an overflowing WINDOW_UPDATE on a stream closed moments ago must \
+             still be answered with RST_STREAM. RFC 9113 5.1 requires accepting \
+             the frame and 6.9.1 requires the error; dropping it silently is what \
+             made h2spec 6.9.1/3 fail one run in three. send_buf: {:?}",
+            c.send_buf
+        );
+        assert_eq!(rsts[0].0, 1, "on the stream the update named");
+        assert_eq!(
+            rsts[0].1,
+            ERR_FLOW_CONTROL.to_be_bytes().to_vec(),
+            "with FLOW_CONTROL_ERROR"
+        );
+    }
+
+    /// The memory that makes the above possible must stay bounded. It exists to
+    /// cover one round trip, not to keep a history: unbounded, it is a
+    /// memory-exhaustion vector driven by opening and completing streams in a
+    /// loop, which is the same shape as Rapid Reset.
+    #[test]
+    fn the_closed_window_memory_is_bounded() {
+        let mut c = Http2Conn::new();
+        for id in 1..=(RESET_MEMORY as u32 + 50) {
+            c.streams.insert(id, H2Stream::new(65_535));
+            c.close_stream_remembering_window(id);
+        }
+        assert_eq!(c.closed_windows.len(), RESET_MEMORY);
+        assert!(
+            !c.closed_windows.iter().any(|(id, _)| *id == 1),
+            "oldest entries must be evicted"
+        );
+    }
+
+    /// Build a frame header plus payload.
+    fn frame(ftype: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
+        let len = payload.len();
+        let mut v = Vec::with_capacity(FRAME_HDR + len);
+        v.push((len >> 16) as u8);
+        v.push((len >> 8) as u8);
+        v.push(len as u8);
+        v.push(ftype);
+        v.push(flags);
+        v.extend_from_slice(&stream_id.to_be_bytes());
+        v.extend_from_slice(payload);
+        v
     }
 }
