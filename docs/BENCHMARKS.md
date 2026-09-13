@@ -264,3 +264,96 @@ tell here was the gap between the within-run interval (+/-0.08%) and the
 between-run spread (+/-13%): whatever varied was fixed for the life of a
 process and different between processes, which pointed at the environment
 rather than at the benchmark or the code.
+
+---
+
+## Backend examples, direct to socket (2026-09-13)
+
+`docs/m6-backend-examples.md` §5. Six implementations of the same `/status`
+route, measured on their Unix sockets with no proxy in the path, answering the
+question "how expensive is this implementation of the contract".
+
+**Conditions.** Commit `cad572f`. Build host, 4-core Linux 7.0.0-31-generic x86_64.
+Payload 660 bytes, byte-identical across all six and asserted so by
+`m6-http/tests/backends_contract.rs`. 5 seconds of load per backend.
+**Concurrency 2**, for the reason this file already documents: the generator and
+the server share four cores and at higher concurrency the client starves the
+server it is measuring.
+
+    cargo build --workspace --release
+    python3 tools/backend-bench.py --duration 5 --workers 2
+
+**Everything ran from RAM**, staged into `/dev/shm`: binaries, payload and
+sockets. Cold start reads the binary off disk otherwise, and the largest binary
+here is 57x the smallest, so a disk-backed run charges `m6-core` for a page
+cache miss and calls it framework overhead. A run on macOS is labelled NOT-RAM by
+the tool and is not comparable: there the cold-start column was 400-650ms for
+every compiled example and 52ms for Python, which is first-exec code signing on
+Apple Silicon rather than anything about the languages.
+
+**The client's own cost was measured, not assumed**: connect and close on a
+socket in the generator's own process, no HTTP. 20,475 rps, p50 44.7us. Every
+row below sits above that floor, so the numbers are resolvable rather than
+generator-bound.
+
+| language | rps | p50 us | p99 us | RSS KB | artifact bytes | cold ms |
+|---|---:|---:|---:|---:|---:|---:|
+| c | 23,353 | 155.9 | 401.0 | 2,160 | 21,968 | 3.1 |
+| cpp | 23,088 | 158.2 | 398.2 | 4,224 | 37,856 | 3.3 |
+| python | 3,513 | 1,122.3 | 1,605.8 | 12,912 | 10,510 | 34.0 |
+| go | 20,828 | 171.2 | 516.9 | 14,436 | 8,485,293 | 5.8 |
+| rust-plain | 28,954 | 63.7 | 138.8 | 2,612 | 554,888 | 2.9 |
+| rust-m6core | 18,297 | 102.2 | 194.9 | 22,992 | 31,468,168 | 19.0 |
+
+Read Python's row as §4 asks: this route is deliberately the shape it is worst
+at, trivial per-request work at a high rate with nothing native to dispatch
+into. It is the floor of what dispatch costs, not a verdict on the language.
+
+### What linking m6-core costs
+
+This is the comparison the phase exists for, per §5.3: same language, same
+compiler, same payload, same concurrency model, so the delta is the library.
+
+| | rust-plain | rust-m6core | delta |
+|---|---:|---:|---|
+| throughput | 28,954 rps | 18,297 rps | **-36.8%** |
+| p50 | 63.7 us | 102.2 us | **+38.5 us** |
+| p99 | 138.8 us | 194.9 us | +56.1 us |
+| RSS | 2,612 KB | 22,992 KB | 8.8x |
+| artifact | 554,888 B | 31,468,168 B | 56.7x |
+| cold start | 2.9 ms | 19.0 ms | 6.6x |
+
+Reproduced: a second identical run gave -35.6% and +36.0us, within 3% of the
+first.
+
+**§5.3 says that if this number is not close to zero, `m6-core` has a problem
+worth knowing about. It is not close to zero.** Roughly 37us per request goes
+somewhere: dictionary building, route matching, the response pipeline and
+logging, on a route whose own work is copying 660 bytes out of memory.
+
+Two things that are true at the same time, and neither cancels the other:
+
+- **It is a real cost and the biggest single finding of Phase 8.** A backend
+  answering trivial requests at a high rate pays about a third of its throughput
+  for the convenience, and carries 8.8x the resident memory.
+- **It is measured on the shape that maximises it.** The route does almost
+  nothing, so the framework is nearly the whole cost. Behind the edge cache the
+  hit rate is 0.87 to 0.90 and a hit is served in single-digit microseconds, so
+  most requests never reach a backend at all. This is not "the site is 36%
+  slower".
+
+### The methodology bug this found, in the examples rather than in m6
+
+The first version of this measurement reported `m6-core` as **72% faster** than
+plain Rust. That was wrong, and the cause was the control rather than the
+subject: `rust-plain` spawned a thread per connection while core answered from a
+fixed pool, so the comparison was pooling against thread-per-connection and not
+library against no library.
+
+Protocol §7 names a fixed pool with a bounded queue as the reference model, so
+`rust-plain` was also simply not being a faithful reference. Giving it one took
+it from 17,608 to 46,826 rps at concurrency 4, a 2.7x improvement from the
+concurrency model alone, and inverted the sign of the answer.
+
+**A control that differs from its subject in two ways measures neither.** The
+number above is from a pair that differs only in the library.

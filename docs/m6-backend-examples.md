@@ -1,6 +1,12 @@
 # m6 backend examples — Design
 
-**Status: design. The examples described here do not exist yet.**
+**Status: implemented, 2026-09-13.** All six exist under
+`m6-http/tests/backends/`, all six conform, and the shared assertion set of §7
+runs them in the gate. What is still owed against this document is listed in
+§11.
+
+Where this document and the implementation disagree, §10 records the
+disagreement rather than either side quietly winning.
 
 ---
 
@@ -219,7 +225,30 @@ against Rust-with-`m6-core`. Same language, same compiler, same payload, so the
 delta is exactly the overhead the library adds. If that number is not close to
 zero, `m6-core` has a problem worth knowing about.
 
-### 5.4 Honesty requirements
+### 5.4 Run from RAM, or the measurement is about the disk
+
+**The binaries, the payload and the sockets all live on tmpfs for a benchmark
+run.** Otherwise the numbers are partly a story about the filesystem, and which
+part varies with what else the box has touched recently.
+
+It matters most for the two figures this document asks for that are not
+steady-state throughput:
+
+- **Cold start to first successful response** reads the binary off disk. That is
+  the number which decides whether a backend can be scaled by adding instances,
+  and on a cold page cache it measures the disk rather than the runtime. The gap
+  is largest for exactly the examples whose binaries are largest, so it would
+  land as a size penalty on `rust-m6core` that has nothing to do with
+  `m6-core`.
+- **Reading the payload at startup**, which every example does, for the same
+  reason.
+
+On Linux the build host, `/dev/shm` is tmpfs and is what the benchmark uses.
+`/run` is also tmpfs and is where production sockets live, so a socket there is
+already in RAM. macOS has no tmpfs by default, so a run on a laptop states that
+it is not comparable to a build-host run rather than pretending otherwise.
+
+### 5.5 Honesty requirements
 
 Per the traps this project has already hit:
 
@@ -282,8 +311,10 @@ developers will not have every runtime installed.
 Same shape as the existing zero-warnings rule, which is enforced on Linux on
 the build host rather than on whatever the developer happens to be running.
 
-The build host currently has Python, C and C++. **Go must be installed**, and
-it is the highest value addition of the set for the reason in §4.
+**Go is installed**, 2026-09-13: `golang-go` 1.26.0 on the build host, and
+1.27.1 on the laptop via Homebrew. The build host now carries all four external
+runtimes, and `deploy/run-tests.sh` asserts each one and fails the run if any is
+absent, rather than letting a language go untested.
 
 ## 9. Deliberately out of scope
 
@@ -302,3 +333,154 @@ it is the highest value addition of the set for the reason in §4.
 - **Node, Ruby, PHP, Java.** Nothing against them. The set above already spans
   systems, scripting and a mature HTTP stack, and each addition is a runtime
   the build host must carry. Add one when there is a reason.
+
+---
+
+## 10. Where this document and the code disagree
+
+Writing the examples found contradictions between normative documents. They are
+recorded here rather than resolved by whichever file was edited last.
+
+### 10.1 Socket mode: 0666 in the spec, 0660 in core and in production
+
+`m6-backend-protocol.md` §1.2 step 3 says the backend MUST `chmod 0666`, and
+explains why: the proxy runs as a different user and cannot connect otherwise.
+It calls this the single most common cause of a backend that starts cleanly and
+is never contacted.
+
+**`m6-core` defaults to `0660`, and production runs `0660`.** The m6 handover
+records the move to 0660 as a deliberate hardening, away from a 0755 that came
+from the umask by accident. So the fleet contradicts the MUST and works, because
+the proxy is in the socket's group.
+
+The four hand-written examples implement 0666 as the spec states. The
+`rust-m6core` example sets `socket_mode = "0666"` in its own config to match
+them, so the shared test can assert one value. Nothing here changes core's
+default.
+
+**This wants a decision.** Either the spec should say 0660 with a note that the
+proxy must share the group, which is what actually runs and is tighter, or core
+should default to 0666, which is looser and would undo a deliberate hardening.
+The first looks right, and it is the owner's call, not a documentation tidy-up.
+
+### 10.2 A bare 404 has no body
+
+Core answers an unmatched path with a 404 and no body. That satisfies the
+protocol, which only asks for an honest status, but not §3 of this document,
+where every example serves "a small not-found page". The `rust-m6core` example
+registers a catch-all `/{*any}` route last so its 404 matches the other five.
+
+Not a defect in either document, but worth knowing before reading the examples
+side by side and wondering why one needed an extra route.
+
+### 10.3 Core minifies, and the examples must not
+
+Core's pipeline minifies and compresses what a handler returns. That is correct
+for a service returning a document, and wrong for these examples: protocol §3.6
+says a backend SHOULD NOT compress because the proxy negotiates and caches each
+representation itself, and a minified body would also make `rust-m6core`'s
+`/boom` 167 bytes where the other five send 178.
+
+Both HTML routes and `/status` in that example are therefore `.verbatim()`.
+`/status` would need it regardless: identical bytes across six languages is the
+whole point of that route, and anything that re-encodes could re-space them.
+
+### 10.4 A backend's 404 body never reaches the client
+
+§7 of this document says an unknown path "produces the backend's 404, not
+m6-http's". That is true of the **status** and false of the **body**.
+
+The status is genuinely the backend's: the proxy routes the request, forwards it
+and relays what comes back. `/boom` proves the relaying, because a 500 is not a
+status the proxy would invent for a route that resolved.
+
+The body belongs to the edge, under `[errors] mode`:
+
+| mode | what the client gets for a backend 404 |
+|---|---|
+| `internal`, the default | m6-http's own error page |
+| `status` | the status and an empty body |
+| `custom` | the document named in config |
+
+**No mode relays the backend's own error page.** So an example's carefully
+written 404 page is never seen through a proxy, only on its socket. Either §7
+should say "status" or the proxy should gain a passthrough mode. Owner's call.
+
+Worth knowing separately: `"passthrough"` is not a valid mode and silently
+becomes `internal` (`m6-http/src/error.rs:22`). The first version of the
+through-proxy test wrote exactly that and spent a while looking like a proxy
+bug.
+
+### 10.5 The proxy does not compress, and two documents say it does
+
+This is the largest of the disagreements and the one with a consequence for
+anyone writing a backend.
+
+- protocol §3.6: "The backend SHOULD NOT compress its response... **The proxy
+  performs content negotiation and compression itself**, caches each
+  representation, and reuses it across clients."
+- §7 of this document: "m6-http applies compression and caching **on top of** an
+  uncompressed, uncached backend response, proving that the backend need not
+  participate."
+
+**m6-http has no compressor.** `brotli` and `flate2` appear only in
+`m6-core/Cargo.toml`, the only implementation is `m6-core/src/compress.rs`, and
+nothing under `m6-http/src` calls it. What the proxy does is cache and select
+per-encoding *variants* of whatever a backend produced, keyed on
+content-encoding: negotiation over what already exists, not compression.
+
+Confirmed by measurement, not just by reading: 660 bytes of JSON requested
+through the edge with `Accept-Encoding: br, gzip` come back with no
+`Content-Encoding` and the identity length, for all six examples.
+
+**The consequence.** A backend that follows §3.6 and declines to compress has
+its bytes delivered uncompressed, always. For the Rust services this is
+invisible, because `m6-core` compresses on the backend side, which is precisely
+what §3.6 tells backends not to do. For a C, Go or Python backend written from
+the specification as written, it is not invisible at all: the site simply
+serves them uncompressed.
+
+`backends_through_proxy.rs` asserts the current behaviour and names this
+section, rather than carrying a permanently failing test. Resolving it is either
+teaching the proxy to compress, which is the behaviour both documents already
+promise, or correcting both documents to say that compression is the backend's
+job and `m6-core` is how a Rust backend gets it. The first matches what a reader
+of the protocol expects; the second matches the fleet. Owner's call.
+
+---
+
+---
+
+## 11. Still owed against this document
+
+- ~~The benchmark of §5~~ **done 2026-09-13**, `tools/backend-bench.py`, results
+  in `docs/BENCHMARKS.md`. The answer to §5.3's question is that linking
+  `m6-core` costs **36% of throughput and +37us p50** on this route, reproduced
+  within 3% across two runs, plus 8.8x resident memory and 56.7x binary size.
+  §5.3 says that if the number is not close to zero then core has a problem
+  worth knowing about, and it is not close to zero. What it is NOT is "the site
+  is 36% slower": the route is deliberately the shape that maximises framework
+  overhead, and behind the edge cache most requests never reach a backend.
+
+  Getting there required fixing the control rather than the subject. The first
+  run reported core as 72% FASTER, because `rust-plain` spawned a thread per
+  connection while core answered from a fixed pool, so the comparison was
+  pooling against thread-per-connection. `rust-plain` now uses protocol §7's
+  reference model, which is what it should always have been, and that alone took
+  it from 17,608 to 46,826 rps.
+- ~~The through-the-proxy half of §7~~ **done 2026-09-13**,
+  `m6-http/tests/backends_through_proxy.rs`: six tests, each example behind a
+  real m6-http over TLS. Two of the behaviours §7 promised turned out not to
+  happen, and are recorded in §10.4 and §10.5 rather than asserted. The
+  `X-Forwarded-For` and `Via` checks are deliberately not duplicated here:
+  `security_regressions.rs` already asserts them against the forwarded request
+  itself, which is a better layer than inferring them from a backend's reply,
+  and re-asserting them would have meant growing a sixth route on all six
+  examples that §3 does not have.
+- ~~A README per example~~ **done 2026-09-13**. Each directory carries one,
+  saying what that language is for, how to build and run it, and what its
+  measured numbers are. The module-level comment in each source file carries the
+  same argument at the point where someone is reading the code.
+
+Nothing else on this document is outstanding. What remains are the two decisions
+in §10.1 and §10.5, which are the owner's rather than tasks.
