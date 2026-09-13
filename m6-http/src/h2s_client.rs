@@ -104,7 +104,7 @@ impl H2sTlsClientConn {
             })?;
 
         let conn = ClientConnection::new(tls_config, server_name)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("h2s: TLS init: {}", e)))?;
+            .map_err(|e| io::Error::other(format!("h2s: TLS init: {}", e)))?;
 
         // Use StreamOwned for the blocking setup phase (TLS handshake + initial frames).
         let mut tls_stream = rustls::StreamOwned::new(conn, tcp);
@@ -488,7 +488,7 @@ impl H2sTlsClientConn {
                                     self.mark_dead("h2s: INITIAL_WINDOW_SIZE above 2^31-1");
                                     return;
                                 }
-                                5 if val >= 16_384 && val <= 16_777_215 => {
+                                5 if (16_384..=16_777_215).contains(&val) => {
                                     self.peer_max_frame = val
                                 }
                                 _ => {}
@@ -680,8 +680,8 @@ impl H2sTlsClientConn {
 
                 // Per-stream credit. This arm did not exist: a stream-level
                 // WINDOW_UPDATE fell through to the catch-all and was discarded.
-                TYPE_WINDOW_UPDATE if stream_id > 0 => {
-                    if payload.len() >= 4 {
+                TYPE_WINDOW_UPDATE if stream_id > 0
+                    && payload.len() >= 4 => {
                         let inc = (((payload[0] as u32) << 24)
                             | ((payload[1] as u32) << 16)
                             | ((payload[2] as u32) << 8)
@@ -713,7 +713,6 @@ impl H2sTlsClientConn {
                             }
                         }
                     }
-                }
 
                 _ => {}
             }
@@ -785,6 +784,12 @@ impl H2sTlsClientConn {
 
 pub struct H2sTlsClientPool {
     entries: HashMap<String, H2sTlsClientConn>,
+}
+
+impl Default for H2sTlsClientPool {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl H2sTlsClientPool {

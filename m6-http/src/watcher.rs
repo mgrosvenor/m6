@@ -255,16 +255,14 @@ impl FsWatcher {
                     }
                 }
 
-                if event.mask.contains(EventMask::DELETE)
-                    || event.mask.contains(EventMask::MOVED_FROM)
-                {
-                    if name.ends_with(".sock") {
+                if (event.mask.contains(EventMask::DELETE)
+                    || event.mask.contains(EventMask::MOVED_FROM))
+                    && name.ends_with(".sock") {
                         result.push(FsEvent {
                             path: self.inner.socket_dir.join(&name),
                             kind: FsEventKind::SocketDeleted,
                         });
                     }
-                }
 
                 if event.mask.contains(EventMask::CLOSE_WRITE) {
                     if name == "site.toml" || name.is_empty() {

@@ -153,7 +153,7 @@ pub fn is_browser_request(accept: Option<&str>) -> bool {
 }
 
 /// Extract the `refresh` cookie value if present.
-pub fn extract_refresh_cookie<'a>(cookie_header: Option<&'a str>) -> Option<&'a str> {
+pub fn extract_refresh_cookie(cookie_header: Option<&str>) -> Option<&str> {
     let cookies = cookie_header?;
     for cookie in cookies.split(';') {
         let cookie = cookie.trim();

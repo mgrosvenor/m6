@@ -621,10 +621,10 @@ impl H2TimedClient {
     fn flush_write(&mut self) -> io::Result<usize> {
         let mut total = 0;
         loop {
-            match {
+            let res = {
                 let mut sr = &self.stream;
                 self.conn.write_tls(&mut sr)
-            } {
+            }; match res {
                 Ok(0) => break,
                 Ok(n) => {
                     total += n;
@@ -638,15 +638,15 @@ impl H2TimedClient {
 
     fn fill_recv_deadline(&mut self, deadline: Instant) -> io::Result<()> {
         loop {
-            match {
+            let res = {
                 let mut sr = &self.stream;
                 self.conn.read_tls(&mut sr)
-            } {
+            }; match res {
                 Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "closed")),
                 Ok(_) => {
                     self.conn
                         .process_new_packets()
-                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                        .map_err(|e| io::Error::other(e.to_string()))?;
                     break;
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -673,15 +673,15 @@ impl H2TimedClient {
 
     fn fill_recv_drain(&mut self) -> io::Result<()> {
         loop {
-            match {
+            let res = {
                 let mut sr = &self.stream;
                 self.conn.read_tls(&mut sr)
-            } {
+            }; match res {
                 Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "closed")),
                 Ok(_) => {
                     self.conn
                         .process_new_packets()
-                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                        .map_err(|e| io::Error::other(e.to_string()))?;
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => return Err(e),
@@ -1776,7 +1776,7 @@ fn write_boxwhisker_svg(stats: &[BoxStats], title: &str, path: &str) -> std::io:
         }
 
         // Phase label (strip "proto/" prefix for display)
-        let display_label = s.label.split('/').last().unwrap_or(&s.label);
+        let display_label = s.label.split('/').next_back().unwrap_or(&s.label);
         el!(
             svg,
             "<text x=\"{:.1}\" y=\"{:.1}\" text-anchor=\"end\" fill=\"{}\" \

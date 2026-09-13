@@ -2495,7 +2495,7 @@ fn run_app_with_shutdown(
         if inotify_fired {
             should_reload = watcher
                 .as_mut()
-                .map_or(false, |w| w.read_events(&[&config_filename, "site.toml"]));
+                .is_some_and(|w| w.read_events(&[&config_filename, "site.toml"]));
         }
 
         // ── Hot reload ───────────────────────────────────────────────────
@@ -2561,7 +2561,7 @@ fn run_app_with_shutdown(
                 let named_handlers = named_handlers.clone();
 
                 match pool.try_submit(stream, move |mut s| {
-                    handle_connection(&mut s, &*fs, &code_handlers, &named_handlers);
+                    handle_connection(&mut s, &fs, &code_handlers, &named_handlers);
                 }) {
                     Ok(_) => {}
                     Err(mut s) => {
@@ -2667,7 +2667,7 @@ fn handle_request<W: std::io::Write>(
             let fs_r = fs.read().unwrap();
 
             // Build request dict.
-            let dict = match fs_r.build_dict(&raw, &route, &path_params) {
+            let dict = match fs_r.build_dict(&raw, route, &path_params) {
                 Ok(d) => d,
                 Err(e) => {
                     let r = error_to_response(&e);
@@ -3150,7 +3150,7 @@ mod tests {
         std::fs::create_dir(site_dir.path().join("templates")).unwrap();
 
         let mut f = NamedTempFile::new().unwrap();
-        write!(f, "site_name = \"v1\"\n").unwrap();
+        writeln!(f, "site_name = \"v1\"").unwrap();
 
         let cfg1 = crate::config::load(f.path(), site_dir.path()).unwrap();
         assert_eq!(cfg1.user_config["site_name"].as_str().unwrap(), "v1");
@@ -3174,7 +3174,7 @@ mod tests {
 
         // Write a new config.
         let mut f2 = NamedTempFile::new().unwrap();
-        write!(f2, "site_name = \"v2\"\n").unwrap();
+        writeln!(f2, "site_name = \"v2\"").unwrap();
 
         let cfg2 = crate::config::load(f2.path(), site_dir.path()).unwrap();
         let state2 = FrameworkState::build(
@@ -3204,7 +3204,7 @@ mod tests {
         use tempfile::NamedTempFile;
 
         let mut f = NamedTempFile::new().unwrap();
-        write!(f, "v1\n").unwrap();
+        writeln!(f, "v1").unwrap();
         let mtime1 = file_mtime(f.path());
         assert!(mtime1.is_some());
 
@@ -3429,7 +3429,7 @@ fn newest_mtime_under(dir: &std::path::Path) -> Option<std::time::SystemTime> {
                 walk(&e.path(), depth - 1, newest);
             } else if ft.is_file() {
                 if let Some(t) = e.metadata().ok().and_then(|m| m.modified().ok()) {
-                    if newest.map_or(true, |n| t > n) {
+                    if newest.is_none_or(|n| t > n) {
                         *newest = Some(t);
                     }
                 }

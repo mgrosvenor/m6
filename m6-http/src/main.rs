@@ -433,7 +433,7 @@ fn event_loop(
                     // Ahead of the cache lookup below: the key has no host
                     // component, so a warm apex entry would answer a www
                     // request and this redirect would never run.
-                    if let Some(redirect) = www_redirect(&req, &state.config) {
+                    if let Some(redirect) = www_redirect(req, &state.config) {
                         return redirect;
                     }
                     let enc_str =
@@ -718,7 +718,7 @@ fn event_loop(
                     // Ahead of the cache lookup below: the key has no host
                     // component, so a warm apex entry would answer a www
                     // request and this redirect would never run.
-                    if let Some(redirect) = www_redirect(&req, &state.config) {
+                    if let Some(redirect) = www_redirect(req, &state.config) {
                         return redirect;
                     }
                     let enc_str =

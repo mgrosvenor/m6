@@ -126,7 +126,7 @@ fn handle_h1_conn(mut stream: impl Read + Write) {
         .unwrap_or("")
         .lines()
         .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
-        .and_then(|l| l.splitn(2, ':').nth(1))
+        .and_then(|l| l.split_once(':').map(|x| x.1))
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(0);
     let body_read = total - body_start;
@@ -181,7 +181,7 @@ fn handle_h2_conn(mut stream: impl Read + Write) {
     if stream.read_exact(&mut preface_buf).is_err() {
         return;
     }
-    if &preface_buf != H2_PREFACE {
+    if preface_buf != H2_PREFACE {
         return;
     }
 

@@ -365,7 +365,7 @@ fn write_svg(stats: &[BoxStats], title: &str, path: &str) -> std::io::Result<()>
                 "#eef0f4"
             );
         }
-        let lbl = s.label.split('/').last().unwrap_or(&s.label);
+        let lbl = s.label.split('/').next_back().unwrap_or(&s.label);
         el!(
             svg,
             "<text x=\"{:.1}\" y=\"{:.1}\" text-anchor=\"end\" fill=\"{}\" \
@@ -900,9 +900,9 @@ fn make_quiche_cfg(skip_verify: bool) -> quiche::Config {
     cfg.set_max_recv_udp_payload_size(1_350);
     cfg.set_max_send_udp_payload_size(1_350);
     cfg.set_initial_max_data(16 * 1024 * 1024);
-    cfg.set_initial_max_stream_data_bidi_local(1 * 1024 * 1024);
-    cfg.set_initial_max_stream_data_bidi_remote(1 * 1024 * 1024);
-    cfg.set_initial_max_stream_data_uni(1 * 1024 * 1024);
+    cfg.set_initial_max_stream_data_bidi_local(1024 * 1024);
+    cfg.set_initial_max_stream_data_bidi_remote(1024 * 1024);
+    cfg.set_initial_max_stream_data_uni(1024 * 1024);
     cfg.set_initial_max_streams_bidi(128);
     cfg.set_initial_max_streams_uni(128);
     cfg.set_disable_active_migration(true);
