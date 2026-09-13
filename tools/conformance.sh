@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# conformance.sh — HTTP/1.1, HTTP/2 and HTTP/3 conformance, as a ratchet.
+# conformance.sh — HTTP/1.1, HTTP/2 and HTTP/3 conformance, as a minimum-score check.
 #
 # HTTP/2 and HTTP/3 have had third-party conformance testing since 2026-09;
 # HTTP/1.1 had none until 2026-09-11, and the divergence showed. Four HTTP/1.1
@@ -16,7 +16,7 @@
 #   h3spec   github.com/kazu-yamamoto/h3spec     RFC 9114 + QUIC
 #   h1spec   github.com/dropseed/h1spec          RFC 9112 / 9110
 #
-# ── The ratchet ───────────────────────────────────────────────────────────────
+# ── The minimum-score check ───────────────────────────────────────────────────────────────
 #
 # Each target has a floor in scores.txt. A run below its floor fails. A run
 # above it prints the new number and tells you to raise the floor, which is a
@@ -137,7 +137,7 @@ total_for() { awk -v k="$1" '$1==k {print $3}' "$SCORES" 2>/dev/null; }
 # developer laptop as well as the Linux build box.
 # `mkdir` first. This truncation used to run ~330 lines before `mkdir -p
 # "$WORK"`, so on a fresh box it failed and every later append went nowhere:
-# the ratchet's own bookkeeping was silently not written.
+# the score file's own bookkeeping was silently not written.
 mkdir -p "$WORK"
 MEASURED="$WORK/measured.txt"
 : > "$MEASURED"

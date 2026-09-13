@@ -8,9 +8,9 @@
 #
 # Order of operations:
 #   1. Build (release)
-#   2. Clippy ratchet — BLOCKS the push
+#   2. Clippy minimum-score check — BLOCKS the push
 #   3. Unit + integration tests
-#   4. Conformance ratchet (h1spec / h2spec / h3spec) — BLOCKS the push
+#   4. Conformance minimum-score check (h1spec / h2spec / h3spec) — BLOCKS the push
 #   5. Benchmarks (informational — prints criterion output; never blocks the push)
 #
 # Why benches don't gate:
@@ -61,7 +61,7 @@ cargo build --workspace --release --quiet
 pass "Build"
 
 # ── 2. Clippy ─────────────────────────────────────────────────────────────────
-# A ratchet, not `-D warnings`: the count may fall and may never rise. See
+# A minimum-score check, not `-D warnings`: the count may fall and may never rise. See
 # tools/clippy.sh for why, and tools/clippy-ceiling.txt for where it stands.
 # The rustc zero-warnings rule is separate and absolute.
 info "Running clippy..."
@@ -85,7 +85,7 @@ else
 fi
 
 # ── 4. Conformance: HTTP/1.1, HTTP/2, HTTP/3 ─────────────────────────────────
-# A ratchet against independent testers (h1spec, h2spec, h3spec). Floors live
+# A minimum score against independent testers (h1spec, h2spec, h3spec). Floors live
 # in tools/conformance-scores.txt; a score below its floor fails the push.
 #
 # This gates because HTTP/1.1 went untested for the whole life of the project

@@ -392,7 +392,7 @@ There were four parsers. Measured against h1spec, the independent RFC 9112
 tester, this one scored 27/32 and the others 15, 15 and 14. The plan named the
 14 as the consolidation target. Measuring the candidate before moving anything
 onto it is what caught that. All four targets now score 32/32 and
-`tools/conformance.sh` ratchets it.
+`tools/conformance.sh` holds them there.
 
 `Expectation` and `expectation(buf)` handle `Expect: 100-continue`;
 `CONTINUE_RESPONSE` is the reply. `keep_alive(&req)` decides connection reuse.

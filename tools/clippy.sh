@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# clippy.sh — the clippy ratchet.
+# clippy.sh — the clippy minimum.
 #
 # Usage:
 #   ./tools/clippy.sh            # check; fails if the count went up
 #   ./tools/clippy.sh --update   # record the current count as the new ceiling
 #
-# Why a ratchet rather than `-D warnings`:
+# Why a minimum-score check rather than `-D warnings`:
 #
 # The workspace had 161 clippy findings the day this was added, and none of them
 # is a correctness bug: empty lines after doc comments, `if` blocks that could
@@ -84,7 +84,7 @@ if (( COUNT < CEILING )); then
   echo "clippy findings fell from $CEILING to $COUNT — lower the ceiling:"
   echo "    ./tools/clippy.sh --update"
   # Not a failure. Refusing a push because someone improved things is how a
-  # ratchet teaches people to stop improving things.
+  # minimum-score check teaches people to stop improving things.
 fi
 
 echo "clippy: $COUNT findings on $(uname -s), ceiling $CEILING"
