@@ -1,48 +1,23 @@
-/// Signal handling for m6 processes: double-SIGTERM graceful shutdown pattern.
-///
-/// `m6-decisions.md` specifies this once, for all tools: SIGTERM and SIGINT are
-/// identical, the first requests a clean shutdown and the second exits
-/// immediately. It was then implemented four times, in four different ways.
-///
-/// **This is the `sigwait` design, adopted from `m6-file`, not the
-/// signal-handler design this module used to carry.** A dedicated thread blocks
-/// the signals and waits for one, so no code ever runs in signal context and
-/// async-signal-safety stops being a concern: the "handler" is ordinary code on
-/// an ordinary thread and may allocate, log or take a lock.
-///
-/// It also solves the problem the handler version ignored. A service blocked in
-/// `accept()` does not notice a flag being set by a handler, so it sits there
-/// until the next connection arrives. [`Service::socket`] exists to poke it
-/// awake, by connecting to the service's own socket.
-///
-/// # One sequence, for every service
-///
-/// [`ShutdownHandle::install`] is the only entry point and it takes a
-/// [`Service`]. The sequence it runs is the same everywhere: log that the
-/// signal arrived, wake the parked loop, and on the way out unlink the socket
-/// and log a completion line. What a service supplies is data, not a different
-/// code path.
-///
-/// # The ordering rule, and why it is enforced
-///
-/// [`block`] must be the first statement of `main`, before anything creates a
-/// thread. Blocking a signal is per-thread: `pthread_sigmask` changes only the
-/// calling thread, and threads inherit the mask **at creation**. A
-/// process-directed signal is delivered to any thread that does not block it,
-/// so one unblocked thread anywhere in the process is enough to take the
-/// default action, which for SIGTERM is death.
-///
-/// That is not hypothetical. Every m6 service initialised logging first, and
-/// `tracing_appender::non_blocking` spawns a writer thread. By the time
-/// `install` blocked the signals in `main`, that writer thread had
-/// existed for a hundred lines and had SIGTERM unblocked. The kernel delivered
-/// every SIGTERM to it, so `m6-file` exited 143 on `systemctl stop` rather than
-/// running its shutdown path, and never unlinked its socket. The `sigwait`
-/// thread was correct and never received a signal in its life.
-///
-/// [`ShutdownHandle::install`] now refuses to start unless [`block`] has
-/// already run, because the failure is silent and only shows up as a service
-/// that will not stop cleanly.
+//! Shutting down on purpose.
+//!
+//! **`block()` must be the first statement of `main`.** The signal mask is
+//! inherited only by threads created after it, and a service's logging writer
+//! is a thread; if it starts first it takes SIGTERM at the default disposition
+//! and the process dies instead of draining. `install_with_hooks` asserts the
+//! mask is set, and that assertion has since caught a real case: the stateful
+//! `App` runners never called `block()`, so SIGTERM handling was quietly wrong
+//! for every service built on them.
+//!
+//! **Log before setting the flag, not after.** The flag is what releases the
+//! main thread, which drains, logs "shutdown complete" and returns from
+//! `main`, and process exit discards whatever is still queued in the writer.
+//! A line logged after the store is racing the whole drain, and on a loaded
+//! machine it loses.
+//!
+//! A `ShutdownHandle` also self-connects to wake a parked `accept`, and
+//! unlinks the socket on the way out so m6-http does not keep a dead member in
+//! its backend pool.
+
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

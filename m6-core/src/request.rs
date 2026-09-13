@@ -1,4 +1,16 @@
-/// HTTP request type and request-dictionary building.
+//! What a handler is given.
+//!
+//! `Request` carries the raw request, the request dictionary, the site
+//! directory, the matched route's own config, and the service config. All of
+//! it is shared rather than copied: the dictionary is a `Dict` whose static
+//! half belongs to the route, and the paths and config are behind `Arc`s.
+//!
+//! That was not always true. Building one used to clone the whole request and
+//! the whole dictionary, which on this site meant copying a 68KB content file
+//! per request. See `crate::dict` and `docs/PERFORMANCE.md`.
+//!
+//! The file helpers resolve against the site directory and refuse to leave it.
+
 // HashMap removed — headers are stored as Vec for small-N linear-scan performance.
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};

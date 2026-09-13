@@ -1,4 +1,18 @@
-/// Logging initialisation for m6 processes.
+//! Logging setup, once, for every service.
+//!
+//! Resolution order is fixed and shared: `site.toml`'s `[log]`, then the
+//! service config's `[log]`, then `--log-level`. Each service used to resolve
+//! this itself and they did not agree.
+//!
+//! **The writer thread is why `signal::block()` must come first.**
+//! `tracing_appender`'s non-blocking writer is a thread, it inherits the
+//! signal mask as it was when it started, and if SIGTERM is not blocked by
+//! then the kernel can deliver it there and kill the process at the default
+//! disposition.
+//!
+//! It is also why a line logged after the shutdown flag is set can be lost:
+//! process exit discards whatever is still queued. See the `signal` module.
+
 use anyhow::Result;
 use std::path::Path;
 use tracing::Level;

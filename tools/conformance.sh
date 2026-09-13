@@ -275,7 +275,7 @@ sockets = "$WORK/edge-m6-html-*.sock"
 path    = "/public/{relpath}"
 backend = "m6-file"
 
-[[route_group]]
+[[route]]
 path    = "/"
 backend = "m6-html"
 TOML
