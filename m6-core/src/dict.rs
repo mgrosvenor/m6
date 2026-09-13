@@ -44,13 +44,19 @@ pub struct Dict {
 impl Dict {
     /// A dictionary layered over a shared base.
     pub fn with_base(base: Arc<Map<String, Value>>) -> Self {
-        Self { base: Some(base), overlay: Map::new() }
+        Self {
+            base: Some(base),
+            overlay: Map::new(),
+        }
     }
 
     /// A dictionary with no base, for a caller that has no framework state:
     /// tests, and handlers building a context by hand.
     pub fn new() -> Self {
-        Self { base: None, overlay: Map::new() }
+        Self {
+            base: None,
+            overlay: Map::new(),
+        }
     }
 
     /// Insert into the overlay, where it shadows any base entry of the same
@@ -119,7 +125,10 @@ impl From<Map<String, Value>> for Dict {
     /// An owned map becomes an overlay with no base, so existing callers that
     /// hand core a `Map` keep working unchanged.
     fn from(m: Map<String, Value>) -> Self {
-        Self { base: None, overlay: m }
+        Self {
+            base: None,
+            overlay: m,
+        }
     }
 }
 
@@ -224,7 +233,11 @@ mod tests {
         let d = Dict::with_base(Arc::clone(&b));
         assert_eq!(Arc::strong_count(&b), 2);
         let d2 = d.clone();
-        assert_eq!(Arc::strong_count(&b), 3, "the clone shares, it does not copy");
+        assert_eq!(
+            Arc::strong_count(&b),
+            3,
+            "the clone shares, it does not copy"
+        );
         drop(d2);
         assert_eq!(Arc::strong_count(&b), 2);
         drop(d);

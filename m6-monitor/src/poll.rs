@@ -80,11 +80,7 @@ fn agent_for(timeout: Duration) -> ureq::Agent {
         .build()
 }
 
-fn get(
-    agent: &ureq::Agent,
-    url: &str,
-    token: Option<&str>,
-) -> anyhow::Result<(u16, String)> {
+fn get(agent: &ureq::Agent, url: &str, token: Option<&str>) -> anyhow::Result<(u16, String)> {
     let mut req = agent.get(url);
     if let Some(t) = token {
         req = req.set("Authorization", &format!("Bearer {t}"));
@@ -127,7 +123,11 @@ pub fn node(n: &Node, fleet_token: Option<&str>, timeout: Duration) -> NodeReadi
     // reaching the node, which is the thing a fleet view wants. `/perf` below
     // reuses the connection and is not timed.
     let started = Instant::now();
-    match get(&agent, &format!("{}/health", n.url.trim_end_matches('/')), None) {
+    match get(
+        &agent,
+        &format!("{}/health", n.url.trim_end_matches('/')),
+        None,
+    ) {
         Ok((code, body)) => {
             reading.rtt = Some(started.elapsed());
             reading.health_status = Some(code);
@@ -165,9 +165,7 @@ pub fn node(n: &Node, fleet_token: Option<&str>, timeout: Duration) -> NodeReadi
             Ok(p) => reading.perf = Some(p),
             Err(e) => reading.perf_error = Some(format!("unparseable: {e}")),
         },
-        Ok((401, _)) => {
-            reading.perf_error = Some("401: token rejected by this node".to_string())
-        }
+        Ok((401, _)) => reading.perf_error = Some("401: token rejected by this node".to_string()),
         Ok((404, _)) => {
             reading.perf_error = Some("404: /perf not enabled on this node".to_string())
         }
@@ -183,8 +181,7 @@ pub fn node(n: &Node, fleet_token: Option<&str>, timeout: Duration) -> NodeReadi
         Ok((404, _)) => {
             // An older node without the endpoint. Worth saying, because a
             // silent absence is indistinguishable from a quiet hour.
-            reading.traffic_error =
-                Some("404: /traffic not available on this node".to_string())
+            reading.traffic_error = Some("404: /traffic not available on this node".to_string())
         }
         Ok((503, body)) => {
             let why = serde_json::from_str::<serde_json::Value>(&body)
@@ -260,7 +257,10 @@ mod tests {
     /// as fine, or a working fleet gets reported as broken.
     #[test]
     fn unreachable_is_its_own_state() {
-        assert_eq!(reading(Some("connection refused"), None).status(), "unreachable");
+        assert_eq!(
+            reading(Some("connection refused"), None).status(),
+            "unreachable"
+        );
         assert!(!reading(Some("timeout"), None).is_up());
         assert_eq!(reading(None, Some("ok")).status(), "ok");
         assert_eq!(reading(None, Some("degraded")).status(), "degraded");

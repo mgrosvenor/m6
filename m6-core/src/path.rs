@@ -1,7 +1,5 @@
 /// Path validation and resolution utilities.
 
-
-
 #[derive(Debug, thiserror::Error)]
 pub enum PathParamError {
     #[error("path traversal attempt")]
@@ -98,16 +96,46 @@ mod tests {
             ("hello-world", false, true, "all agreed"),
             ("style.css", false, true, "m6-core used to reject the dot"),
             ("a/b/c", true, true, "all agreed"),
-            ("/leading", true, false, "m6-render and m6-file used to allow it"),
-            ("trailing/", true, false, "m6-render and m6-file used to allow it"),
-            ("a b", false, false, "m6-render relpath used to allow a space"),
-            ("a\u{0}b", false, false, "m6-render relpath used to allow NUL"),
-            ("a\nb", false, false, "m6-render relpath used to allow a newline"),
+            (
+                "/leading",
+                true,
+                false,
+                "m6-render and m6-file used to allow it",
+            ),
+            (
+                "trailing/",
+                true,
+                false,
+                "m6-render and m6-file used to allow it",
+            ),
+            (
+                "a b",
+                false,
+                false,
+                "m6-render relpath used to allow a space",
+            ),
+            (
+                "a\u{0}b",
+                false,
+                false,
+                "m6-render relpath used to allow NUL",
+            ),
+            (
+                "a\nb",
+                false,
+                false,
+                "m6-render relpath used to allow a newline",
+            ),
             ("..", false, false, "all agreed"),
             ("../etc/passwd", true, false, "all agreed"),
             ("a..b", true, false, "m6-file allowed it inside a component"),
             ("a/../b", true, false, "all agreed"),
-            ("%2e%2e", false, false, "not decoded here, and % is not allowed"),
+            (
+                "%2e%2e",
+                false,
+                false,
+                "not decoded here, and % is not allowed",
+            ),
             ("a/b", false, false, "slash needs allow_slash"),
         ];
         for (value, allow_slash, expect_ok, why) in cases {
@@ -136,7 +164,10 @@ mod tests {
 
     #[test]
     fn test_validate_path_param_valid_simple() {
-        assert_eq!(validate_path_param("hello-world_123", false).unwrap(), "hello-world_123");
+        assert_eq!(
+            validate_path_param("hello-world_123", false).unwrap(),
+            "hello-world_123"
+        );
     }
 
     #[test]
@@ -182,8 +213,4 @@ mod tests {
             Err(PathParamError::InvalidChars)
         ));
     }
-
-
-
-
 }

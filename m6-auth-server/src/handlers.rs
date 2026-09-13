@@ -15,11 +15,11 @@ use crate::key_watch::KeyMaterial;
 use crate::rate_limit::RateLimiter;
 
 pub struct AppState {
-    pub db:          Mutex<Db>,
-    pub keys:        Arc<RwLock<KeyMaterial>>,
-    pub access_ttl:  u64,
+    pub db: Mutex<Db>,
+    pub keys: Arc<RwLock<KeyMaterial>>,
+    pub access_ttl: u64,
     pub refresh_ttl: u64,
-    pub issuer:      String,
+    pub issuer: String,
     pub rate_limiter: Mutex<RateLimiter>,
 }
 
@@ -84,7 +84,10 @@ fn handle_login(req: &RawRequest, state: &AppState, peer_ip: &str) -> RawRespons
 }
 
 fn form_field<'a>(fields: &'a [(String, String)], key: &str) -> Option<&'a str> {
-    fields.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    fields
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.as_str())
 }
 
 use m6_core::is_same_origin_path;
@@ -113,8 +116,10 @@ fn handle_login_form(req: &RawRequest, state: &AppState, peer_ip: &str) -> RawRe
         Ok(None) => {
             warn!(ip = %peer_ip, reason = "invalid_credentials", "login failure");
             let next_enc = url_encode_path(&next);
-            return RawResponse::new(302)
-                .header("Location", format!("/login?error=invalid&next={}", next_enc));
+            return RawResponse::new(302).header(
+                "Location",
+                format!("/login?error=invalid&next={}", next_enc),
+            );
         }
         Err(e) => {
             warn!(error = %e, "db error on login");
@@ -123,18 +128,20 @@ fn handle_login_form(req: &RawRequest, state: &AppState, peer_ip: &str) -> RawRe
     };
 
     // Issue tokens
-    let (access_jwt, refresh_jwt) = match issue_tokens(state, &user.id, &user.username, &user.groups, &user.roles) {
-        Ok(p) => p,
-        Err(e) => {
-            warn!(error = %e, "failed to issue tokens");
-            return internal_error();
-        }
-    };
+    let (access_jwt, refresh_jwt) =
+        match issue_tokens(state, &user.id, &user.username, &user.groups, &user.roles) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(error = %e, "failed to issue tokens");
+                return internal_error();
+            }
+        };
 
     // Store refresh token hash
     let refresh_hash = hash_token(&refresh_jwt);
     let now = now_secs();
-    if let Err(e) = db.refresh_token_store(&user.id, &refresh_hash, now + state.refresh_ttl as i64) {
+    if let Err(e) = db.refresh_token_store(&user.id, &refresh_hash, now + state.refresh_ttl as i64)
+    {
         warn!(error = %e, "failed to store refresh token");
         return internal_error();
     }
@@ -165,7 +172,11 @@ fn handle_login_json(req: &RawRequest, state: &AppState, peer_ip: &str) -> RawRe
 
     let body: LoginReq = match serde_json::from_slice(&req.body) {
         Ok(b) => b,
-        Err(_) => return RawResponse::new(400).content_type("application/json").body(r#"{"error":"bad_request"}"#),
+        Err(_) => {
+            return RawResponse::new(400)
+                .content_type("application/json")
+                .body(r#"{"error":"bad_request"}"#)
+        }
     };
 
     let db = match state.db.lock() {
@@ -188,18 +199,20 @@ fn handle_login_json(req: &RawRequest, state: &AppState, peer_ip: &str) -> RawRe
     };
 
     // Issue tokens
-    let (access_jwt, refresh_jwt) = match issue_tokens(state, &user.id, &user.username, &user.groups, &user.roles) {
-        Ok(p) => p,
-        Err(e) => {
-            warn!(error = %e, "failed to issue tokens");
-            return internal_error();
-        }
-    };
+    let (access_jwt, refresh_jwt) =
+        match issue_tokens(state, &user.id, &user.username, &user.groups, &user.roles) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(error = %e, "failed to issue tokens");
+                return internal_error();
+            }
+        };
 
     // Store refresh token hash
     let refresh_hash = hash_token(&refresh_jwt);
     let now = now_secs();
-    if let Err(e) = db.refresh_token_store(&user.id, &refresh_hash, now + state.refresh_ttl as i64) {
+    if let Err(e) = db.refresh_token_store(&user.id, &refresh_hash, now + state.refresh_ttl as i64)
+    {
         warn!(error = %e, "failed to store refresh token");
         return internal_error();
     }
@@ -231,7 +244,11 @@ fn handle_refresh(req: &RawRequest, state: &AppState) -> RawResponse {
 }
 
 fn handle_refresh_browser(req: &RawRequest, state: &AppState) -> RawResponse {
-    let token = match req.header("cookie").and_then(|h| cookie(h, "refresh")).map(|v| v.to_string()) {
+    let token = match req
+        .header("cookie")
+        .and_then(|h| cookie(h, "refresh"))
+        .map(|v| v.to_string())
+    {
         Some(t) => t,
         None => return RawResponse::new(302).header("Location", "/login"),
     };
@@ -239,7 +256,8 @@ fn handle_refresh_browser(req: &RawRequest, state: &AppState) -> RawResponse {
     match do_refresh(state, &token) {
         Ok((access_jwt, user_id)) => {
             info!(user_id = %user_id, "token refresh");
-            let location = req.header("referer")
+            let location = req
+                .header("referer")
                 .filter(|r| is_same_origin_path(r))
                 .unwrap_or("/")
                 .to_string();
@@ -252,9 +270,7 @@ fn handle_refresh_browser(req: &RawRequest, state: &AppState) -> RawResponse {
                 .header("Location", location)
                 .header("Set-Cookie", session_cookie)
         }
-        Err(_) => {
-            RawResponse::new(302).header("Location", "/login")
-        }
+        Err(_) => RawResponse::new(302).header("Location", "/login"),
     }
 }
 
@@ -266,7 +282,11 @@ fn handle_refresh_json(req: &RawRequest, state: &AppState) -> RawResponse {
 
     let body: RefreshReq = match serde_json::from_slice(&req.body) {
         Ok(b) => b,
-        Err(_) => return RawResponse::new(400).content_type("application/json").body(r#"{"error":"bad_request"}"#),
+        Err(_) => {
+            return RawResponse::new(400)
+                .content_type("application/json")
+                .body(r#"{"error":"bad_request"}"#)
+        }
     };
 
     match do_refresh(state, &body.refresh_token) {
@@ -280,25 +300,27 @@ fn handle_refresh_json(req: &RawRequest, state: &AppState) -> RawResponse {
                 .content_type("application/json")
                 .body(resp_body.to_string())
         }
-        Err(_) => {
-            RawResponse::new(401)
-                .content_type("application/json")
-                .body(r#"{"error":"invalid_token"}"#)
-        }
+        Err(_) => RawResponse::new(401)
+            .content_type("application/json")
+            .body(r#"{"error":"invalid_token"}"#),
     }
 }
 
 fn do_refresh(state: &AppState, token: &str) -> anyhow::Result<(String, String)> {
     // Decode and verify signature + expiry — read-lock keys for decode
     let claims = {
-        let keys = state.keys.read().map_err(|_| anyhow::anyhow!("keys lock poisoned"))?;
+        let keys = state
+            .keys
+            .read()
+            .map_err(|_| anyhow::anyhow!("keys lock poisoned"))?;
         keys.jwt.decode_refresh(token)?.claims
     };
 
     // Verify hash in database
     let token_hash = hash_token(token);
     let db = state.db.lock().map_err(|_| anyhow::anyhow!("lock error"))?;
-    let stored_user_id = db.refresh_token_verify(&token_hash)?
+    let stored_user_id = db
+        .refresh_token_verify(&token_hash)?
         .ok_or_else(|| anyhow::anyhow!("token not found or expired"))?;
 
     if stored_user_id != claims.sub {
@@ -306,23 +328,27 @@ fn do_refresh(state: &AppState, token: &str) -> anyhow::Result<(String, String)>
     }
 
     // Load user to get fresh groups/roles
-    let user = db.user_get_by_id(&claims.sub)?
+    let user = db
+        .user_get_by_id(&claims.sub)?
         .ok_or_else(|| anyhow::anyhow!("user not found"))?;
 
     let now = now_secs();
     let access_claims = AccessClaims {
-        iss:      state.issuer.clone(),
-        sub:      user.id.clone(),
-        exp:      now + state.access_ttl as i64,
-        iat:      now,
+        iss: state.issuer.clone(),
+        sub: user.id.clone(),
+        exp: now + state.access_ttl as i64,
+        iat: now,
         username: user.username.clone(),
-        groups:   user.groups.clone(),
-        roles:    user.roles.clone(),
+        groups: user.groups.clone(),
+        roles: user.roles.clone(),
     };
 
     // Read-lock keys for encode
     let access_jwt = {
-        let keys = state.keys.read().map_err(|_| anyhow::anyhow!("keys lock poisoned"))?;
+        let keys = state
+            .keys
+            .read()
+            .map_err(|_| anyhow::anyhow!("keys lock poisoned"))?;
         keys.jwt.encode_access(&access_claims)?
     };
     Ok((access_jwt, user.id))
@@ -331,7 +357,8 @@ fn do_refresh(state: &AppState, token: &str) -> anyhow::Result<(String, String)>
 // ─── POST /auth/logout ────────────────────────────────────────────────────────
 
 fn handle_logout(req: &RawRequest, state: &AppState) -> RawResponse {
-    let is_api = req.header("authorization")
+    let is_api = req
+        .header("authorization")
         .map(|v| v.to_ascii_lowercase().starts_with("bearer "))
         .unwrap_or(false);
 
@@ -343,7 +370,11 @@ fn handle_logout(req: &RawRequest, state: &AppState) -> RawResponse {
 }
 
 fn handle_logout_browser(req: &RawRequest, state: &AppState) -> RawResponse {
-    if let Some(token) = req.header("cookie").and_then(|h| cookie(h, "refresh")).map(|v| v.to_string()) {
+    if let Some(token) = req
+        .header("cookie")
+        .and_then(|h| cookie(h, "refresh"))
+        .map(|v| v.to_string())
+    {
         let token_hash = hash_token(&token);
         if let Ok(db) = state.db.lock() {
             let _ = db.refresh_token_revoke(&token_hash);
@@ -352,7 +383,7 @@ fn handle_logout_browser(req: &RawRequest, state: &AppState) -> RawResponse {
     info!("logout (browser)");
 
     let clear_session = "session=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0";
-    let clear_refresh  = "refresh=; HttpOnly; Secure; SameSite=Lax; Path=/auth/refresh; Max-Age=0";
+    let clear_refresh = "refresh=; HttpOnly; Secure; SameSite=Lax; Path=/auth/refresh; Max-Age=0";
 
     RawResponse::new(302)
         .header("Location", "/")
@@ -363,8 +394,13 @@ fn handle_logout_browser(req: &RawRequest, state: &AppState) -> RawResponse {
 fn handle_logout_api(req: &RawRequest, state: &AppState) -> RawResponse {
     // Extract user_id from bearer token, revoke all their refresh tokens
     if let Some(auth) = req.header("authorization") {
-        let token = auth.trim_start_matches("Bearer ").trim_start_matches("bearer ");
-        let decode_result = state.keys.read().ok()
+        let token = auth
+            .trim_start_matches("Bearer ")
+            .trim_start_matches("bearer ");
+        let decode_result = state
+            .keys
+            .read()
+            .ok()
             .and_then(|keys| keys.jwt.decode_access(token).ok());
         if let Some(data) = decode_result {
             let user_id = &data.claims.sub;
@@ -401,27 +437,30 @@ fn issue_tokens(
     let now = now_secs();
 
     let access_claims = AccessClaims {
-        iss:      state.issuer.clone(),
-        sub:      user_id.to_string(),
-        exp:      now + state.access_ttl as i64,
-        iat:      now,
+        iss: state.issuer.clone(),
+        sub: user_id.to_string(),
+        exp: now + state.access_ttl as i64,
+        iat: now,
         username: username.to_string(),
-        groups:   groups.to_vec(),
-        roles:    roles.to_vec(),
+        groups: groups.to_vec(),
+        roles: roles.to_vec(),
     };
 
     let refresh_claims = RefreshClaims {
-        iss:        state.issuer.clone(),
-        sub:        user_id.to_string(),
-        exp:        now + state.refresh_ttl as i64,
-        iat:        now,
-        username:   username.to_string(),
+        iss: state.issuer.clone(),
+        sub: user_id.to_string(),
+        exp: now + state.refresh_ttl as i64,
+        iat: now,
+        username: username.to_string(),
         token_type: "refresh".to_string(),
     };
 
     // Read-lock keys — the watcher may replace the engine during key rotation
-    let keys = state.keys.read().map_err(|_| anyhow::anyhow!("keys lock poisoned"))?;
-    let access_jwt  = keys.jwt.encode_access(&access_claims)?;
+    let keys = state
+        .keys
+        .read()
+        .map_err(|_| anyhow::anyhow!("keys lock poisoned"))?;
+    let access_jwt = keys.jwt.encode_access(&access_claims)?;
     let refresh_jwt = keys.jwt.encode_refresh(&refresh_claims)?;
     Ok((access_jwt, refresh_jwt))
 }
@@ -431,4 +470,3 @@ fn internal_error() -> RawResponse {
         .content_type("application/json")
         .body(r#"{"error":"internal_error"}"#)
 }
-

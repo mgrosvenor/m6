@@ -1,5 +1,4 @@
 /// MIME type utilities for m6.
-
 use std::path::Path;
 
 /// Detect MIME type from the file extension of `path`.
@@ -113,12 +112,18 @@ mod tests {
 
     #[test]
     fn test_mime_from_path_unknown() {
-        assert_eq!(mime_from_path(Path::new("file.xyz")), "application/octet-stream");
+        assert_eq!(
+            mime_from_path(Path::new("file.xyz")),
+            "application/octet-stream"
+        );
     }
 
     #[test]
     fn test_mime_from_path_no_extension() {
-        assert_eq!(mime_from_path(Path::new("Makefile")), "application/octet-stream");
+        assert_eq!(
+            mime_from_path(Path::new("Makefile")),
+            "application/octet-stream"
+        );
     }
 
     #[test]

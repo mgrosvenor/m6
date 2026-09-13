@@ -13,7 +13,6 @@
 
 use std::path::Path;
 
-
 /// What went wrong rendering a template.
 ///
 /// The distinction is typed rather than sniffed out of an error string. A

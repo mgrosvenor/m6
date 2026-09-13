@@ -10,10 +10,8 @@ pub fn brotli_compress(data: &[u8], quality: u32) -> anyhow::Result<Vec<u8>> {
     let mut out = Vec::with_capacity(data.len() / 2 + 128);
     {
         let mut writer = CompressorWriter::new(
-            &mut out,
-            4096,    // buffer size
-            quality,
-            22,      // lgwin (window size)
+            &mut out, 4096, // buffer size
+            quality, 22, // lgwin (window size)
         );
         writer.write_all(data).context("brotli compress write")?;
     }

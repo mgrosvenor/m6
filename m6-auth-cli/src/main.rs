@@ -1,5 +1,8 @@
 use anyhow::{bail, Context, Result};
-use m6_auth::{Db, jwt::{AccessClaims, JwtEngine, hash_token, now_secs}};
+use m6_auth::{
+    jwt::{hash_token, now_secs, AccessClaims, JwtEngine},
+    Db,
+};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::process;
@@ -9,8 +12,8 @@ use std::process;
 #[derive(Deserialize, Default)]
 struct Config {
     storage: StorageConfig,
-    tokens:  Option<TokensConfig>,
-    keys:    Option<KeysConfig>,
+    tokens: Option<TokensConfig>,
+    keys: Option<KeysConfig>,
 }
 
 #[derive(Deserialize, Default)]
@@ -26,14 +29,14 @@ struct TokensConfig {
 #[derive(Deserialize, Default)]
 struct KeysConfig {
     private_key: String,
-    public_key:  String,
+    public_key: String,
 }
 
 struct ParsedConfig {
-    db_path:          PathBuf,
-    issuer:           String,
+    db_path: PathBuf,
+    issuer: String,
     private_key_path: Option<PathBuf>,
-    public_key_path:  Option<PathBuf>,
+    public_key_path: Option<PathBuf>,
 }
 
 /// Infer the site root from the config file path.
@@ -41,7 +44,11 @@ struct ParsedConfig {
 /// its parent; otherwise the site root is the config file's directory.
 fn infer_site_dir(config_path: &Path) -> PathBuf {
     let config_dir = config_path.parent().unwrap_or(Path::new("."));
-    if config_dir.file_name().map(|n| n == "configs").unwrap_or(false) {
+    if config_dir
+        .file_name()
+        .map(|n| n == "configs")
+        .unwrap_or(false)
+    {
         config_dir.parent().unwrap_or(config_dir).to_path_buf()
     } else {
         config_dir.to_path_buf()
@@ -55,8 +62,8 @@ fn load_config(config_path: &str) -> Result<ParsedConfig> {
     }
     let raw = std::fs::read_to_string(p)
         .with_context(|| format!("reading config file: {}", config_path))?;
-    let cfg: Config = toml::from_str(&raw)
-        .with_context(|| format!("parsing config file: {}", config_path))?;
+    let cfg: Config =
+        toml::from_str(&raw).with_context(|| format!("parsing config file: {}", config_path))?;
 
     let db_path = if cfg.storage.path.is_empty() {
         bail!("config missing [storage] path");
@@ -70,7 +77,8 @@ fn load_config(config_path: &str) -> Result<ParsedConfig> {
         }
     };
 
-    let issuer = cfg.tokens
+    let issuer = cfg
+        .tokens
         .and_then(|t| t.issuer)
         .unwrap_or_else(|| "localhost".to_string());
 
@@ -83,7 +91,12 @@ fn load_config(config_path: &str) -> Result<ParsedConfig> {
         _ => (None, None),
     };
 
-    Ok(ParsedConfig { db_path, issuer, private_key_path, public_key_path })
+    Ok(ParsedConfig {
+        db_path,
+        issuer,
+        private_key_path,
+        public_key_path,
+    })
 }
 
 // ── Password prompting ────────────────────────────────────────────────────────
@@ -92,8 +105,7 @@ fn get_password(pw_flag: Option<&str>, confirm: bool) -> Result<String> {
     if let Some(pw) = pw_flag {
         return Ok(pw.to_string());
     }
-    let pw = rpassword::prompt_password("Password: ")
-        .context("reading password")?;
+    let pw = rpassword::prompt_password("Password: ").context("reading password")?;
     if confirm {
         let pw2 = rpassword::prompt_password("Confirm password: ")
             .context("reading password confirmation")?;
@@ -119,7 +131,10 @@ fn format_timestamp(ts: i64) -> String {
 
     // Gregorian calendar computation
     let (year, month, day) = days_to_ymd(days);
-    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", year, month, day, hh, mm, ss)
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        year, month, day, hh, mm, ss
+    )
 }
 
 fn days_to_ymd(days: u64) -> (u64, u64, u64) {
@@ -453,7 +468,9 @@ fn cmd_group_member_del(db: &Db, args: &[String]) -> Result<()> {
 
 fn cmd_token_create(db: &Db, cfg: &ParsedConfig, args: &[String]) -> Result<()> {
     if args.is_empty() {
-        bail!("usage: token create <username> [--name <name>] [--ttl-days <days>] [--site-dir <dir>]");
+        bail!(
+            "usage: token create <username> [--name <name>] [--ttl-days <days>] [--site-dir <dir>]"
+        );
     }
     let username = &args[0];
     let name = flag_value(args, "--name").unwrap_or("api-token");
@@ -479,7 +496,9 @@ fn cmd_token_create(db: &Db, cfg: &ParsedConfig, args: &[String]) -> Result<()> 
 
     let private_key_path = private_key_path
         .ok_or_else(|| anyhow::anyhow!("config missing [keys] section — cannot mint tokens"))?;
-    let public_key_path = cfg.public_key_path.as_ref()
+    let public_key_path = cfg
+        .public_key_path
+        .as_ref()
         .ok_or_else(|| anyhow::anyhow!("config missing [keys] section — cannot mint tokens"))?;
 
     let private_pem = std::fs::read_to_string(&private_key_path)
@@ -490,7 +509,8 @@ fn cmd_token_create(db: &Db, cfg: &ParsedConfig, args: &[String]) -> Result<()> 
     let engine = JwtEngine::new(&private_pem, &public_pem, cfg.issuer.clone())
         .context("loading JWT keys")?;
 
-    let user = db.user_get(username)?
+    let user = db
+        .user_get(username)?
         .ok_or_else(|| anyhow::anyhow!("user '{}' not found", username))?;
 
     let now = now_secs();
@@ -498,23 +518,25 @@ fn cmd_token_create(db: &Db, cfg: &ParsedConfig, args: &[String]) -> Result<()> 
     let exp = now + ttl_secs;
 
     let claims = AccessClaims {
-        iss:      cfg.issuer.clone(),
-        sub:      user.id.clone(),
+        iss: cfg.issuer.clone(),
+        sub: user.id.clone(),
         exp,
-        iat:      now,
+        iat: now,
         username: user.username.clone(),
-        groups:   user.groups.clone(),
-        roles:    user.roles.clone(),
+        groups: user.groups.clone(),
+        roles: user.roles.clone(),
     };
 
-    let token = engine.encode_access(&claims)
-        .context("encoding JWT")?;
+    let token = engine.encode_access(&claims).context("encoding JWT")?;
     let token_hash = hash_token(&token);
 
     db.api_token_create(&user.id, &user.username, name, &token_hash, exp)?;
 
     let expires_str = format_timestamp(exp);
-    eprintln!("API token created for '{}' (expires {})", username, expires_str);
+    eprintln!(
+        "API token created for '{}' (expires {})",
+        username, expires_str
+    );
     eprintln!("Save this token — it will not be shown again:");
     println!("{}", token);
     Ok(())
@@ -536,7 +558,10 @@ fn cmd_token_ls(db: &Db, args: &[String]) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string(&tokens)?);
     } else {
-        println!("{:<36} {:<20} {:<22} {}", "ID", "NAME", "CREATED", "EXPIRES");
+        println!(
+            "{:<36} {:<20} {:<22} {}",
+            "ID", "NAME", "CREATED", "EXPIRES"
+        );
         for t in &tokens {
             let created = format_timestamp(t.created_at);
             let expires = format_timestamp(t.expires_at);
@@ -556,7 +581,10 @@ fn cmd_token_revoke(db: &Db, args: &[String]) -> Result<()> {
     let token_id = &args[0];
     match db.api_token_revoke(token_id) {
         Ok(()) => {
-            eprintln!("token '{}' revoked (note: token remains valid until its expiry date)", token_id);
+            eprintln!(
+                "token '{}' revoked (note: token remains valid until its expiry date)",
+                token_id
+            );
             Ok(())
         }
         Err(m6_auth::AuthError::ApiTokenNotFound(_)) => bail!("token '{}' not found", token_id),
@@ -580,9 +608,7 @@ fn run() -> Result<()> {
     let rest: Vec<String> = raw_args[4..].to_vec();
 
     // Load config and open db
-    let cfg = load_config(config_path).map_err(|e| {
-        anyhow::anyhow!("__config_error__: {}", e)
-    })?;
+    let cfg = load_config(config_path).map_err(|e| anyhow::anyhow!("__config_error__: {}", e))?;
 
     // Ensure parent directory exists
     if let Some(parent) = cfg.db_path.parent() {
@@ -596,19 +622,19 @@ fn run() -> Result<()> {
 
     match entity.as_str() {
         "user" => match command.as_str() {
-            "ls"     => cmd_user_ls(&db, &rest)?,
-            "add"    => cmd_user_add(&db, &rest)?,
-            "del"    => cmd_user_del(&db, &rest)?,
+            "ls" => cmd_user_ls(&db, &rest)?,
+            "add" => cmd_user_add(&db, &rest)?,
+            "del" => cmd_user_del(&db, &rest)?,
             "passwd" => cmd_user_passwd(&db, &rest)?,
-            "roles"  => cmd_user_roles(&db, &rest)?,
-            other    => {
+            "roles" => cmd_user_roles(&db, &rest)?,
+            other => {
                 eprintln!("error: unknown user command: {}", other);
                 print_usage();
                 process::exit(2);
             }
         },
         "group" => match command.as_str() {
-            "ls"  => cmd_group_ls(&db, &rest)?,
+            "ls" => cmd_group_ls(&db, &rest)?,
             "add" => cmd_group_add(&db, &rest)?,
             "del" => cmd_group_del(&db, &rest)?,
             "member" => {
@@ -621,7 +647,7 @@ fn run() -> Result<()> {
                 let subcmd = &rest[0];
                 let sub_rest: Vec<String> = rest[1..].to_vec();
                 match subcmd.as_str() {
-                    "ls"  => cmd_group_member_ls(&db, &sub_rest)?,
+                    "ls" => cmd_group_member_ls(&db, &sub_rest)?,
                     "add" => cmd_group_member_add(&db, &sub_rest)?,
                     "del" => cmd_group_member_del(&db, &sub_rest)?,
                     other => {
@@ -639,9 +665,9 @@ fn run() -> Result<()> {
         },
         "token" => match command.as_str() {
             "create" => cmd_token_create(&db, &cfg, &rest)?,
-            "ls"     => cmd_token_ls(&db, &rest)?,
+            "ls" => cmd_token_ls(&db, &rest)?,
             "revoke" => cmd_token_revoke(&db, &rest)?,
-            other    => {
+            other => {
                 eprintln!("error: unknown token command: {}", other);
                 print_usage();
                 process::exit(2);

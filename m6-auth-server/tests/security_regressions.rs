@@ -50,7 +50,10 @@ fn finding_8_login_next_must_not_allow_protocol_relative_redirect() {
         !is_offsite(&next),
         "post-login Location `{next}` redirects to another origin"
     );
-    assert_eq!(next, "/", "an off-site target must fall back to the site root");
+    assert_eq!(
+        next, "/",
+        "an off-site target must fall back to the site root"
+    );
 }
 
 /// The backslash form gets the same treatment from browsers.
@@ -90,7 +93,10 @@ fn finding_8_legitimate_relative_paths_still_accepted() {
     assert_eq!(validate_next(Some("/dashboard")), "/dashboard");
     assert_eq!(validate_next(Some("/a/b?c=d")), "/a/b?c=d");
     assert_eq!(validate_next(Some("/")), "/");
-    assert_eq!(refresh_redirect_location(Some("/admin/page")), "/admin/page");
+    assert_eq!(
+        refresh_redirect_location(Some("/admin/page")),
+        "/admin/page"
+    );
 
     // Absolute URLs and missing values fall back to the site root.
     assert_eq!(validate_next(Some("https://evil.com")), "/");

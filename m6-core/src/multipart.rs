@@ -30,9 +30,10 @@ pub fn parse_upload(
 
     rt.block_on(async {
         let body_bytes = bytes::Bytes::copy_from_slice(body);
-        let stream = futures_util::stream::once(async move {
-            Ok::<_, std::convert::Infallible>(body_bytes)
-        });
+        let stream =
+            futures_util::stream::once(
+                async move { Ok::<_, std::convert::Infallible>(body_bytes) },
+            );
         let mut multipart = multer::Multipart::new(stream, boundary);
 
         while let Some(field) = multipart
@@ -44,10 +45,7 @@ pub fn parse_upload(
             if name != field_name {
                 continue;
             }
-            let filename = field
-                .file_name()
-                .unwrap_or("upload")
-                .to_string();
+            let filename = field.file_name().unwrap_or("upload").to_string();
             let content_type = field
                 .content_type()
                 .map(|m| m.to_string())
@@ -58,7 +56,11 @@ pub fn parse_upload(
                 .map_err(|e| crate::error::Error::BadRequest(format!("reading field: {e}")))?
                 .to_vec();
 
-            return Ok(Upload { filename, content_type, data });
+            return Ok(Upload {
+                filename,
+                content_type,
+                data,
+            });
         }
 
         Err(crate::error::Error::BadRequest(format!(

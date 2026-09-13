@@ -67,8 +67,13 @@ where
 {
     // Connection-specific fields (8.2.2). `upgrade` is included: neither HTTP/2
     // nor HTTP/3 has an upgrade mechanism, so its presence is always malformed.
-    const CONNECTION_SPECIFIC: &[&[u8]] =
-        &[b"connection", b"keep-alive", b"proxy-connection", b"transfer-encoding", b"upgrade"];
+    const CONNECTION_SPECIFIC: &[&[u8]] = &[
+        b"connection",
+        b"keep-alive",
+        b"proxy-connection",
+        b"transfer-encoding",
+        b"upgrade",
+    ];
 
     let mut seen_regular = false;
     let (mut method, mut scheme, mut path, mut authority) = (0u32, 0u32, 0u32, 0u32);
@@ -94,15 +99,24 @@ where
                 return Err("pseudo-header after regular field");
             }
             match pseudo {
-                b"method"    => { method += 1; method_value = Some(value); }
-                b"scheme"    => { scheme += 1; scheme_value = Some(value); }
-                b"path"      => { path += 1; path_value = Some(value); }
+                b"method" => {
+                    method += 1;
+                    method_value = Some(value);
+                }
+                b"scheme" => {
+                    scheme += 1;
+                    scheme_value = Some(value);
+                }
+                b"path" => {
+                    path += 1;
+                    path_value = Some(value);
+                }
                 b"authority" => authority += 1,
                 // `:status` is a RESPONSE pseudo-header; in a request it is
                 // malformed rather than merely unknown, but the outcome is the
                 // same and the reason is more useful spelled out.
-                b"status"    => return Err("response pseudo-header in request"),
-                _            => return Err("unknown pseudo-header"),
+                b"status" => return Err("response pseudo-header in request"),
+                _ => return Err("unknown pseudo-header"),
             }
         } else {
             seen_regular = true;
@@ -136,10 +150,15 @@ where
         return Ok(());
     }
 
-    if method == 0 { return Err("missing :method"); }
-    if scheme == 0 { return Err("missing :scheme"); }
-    if path == 0   { return Err("missing :path"); }
-
+    if method == 0 {
+        return Err("missing :method");
+    }
+    if scheme == 0 {
+        return Err("missing :scheme");
+    }
+    if path == 0 {
+        return Err("missing :path");
+    }
 
     // 8.3.1 -- :path must not be empty. `OPTIONS *` is the one legitimate
     // asterisk-form, carried as :path = "*".
@@ -179,32 +198,57 @@ mod pseudo_header_tests {
     use super::validate_request_headers;
 
     fn h(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
     fn ok(pairs: &[(&str, &str)]) {
-        assert_eq!(validate_request_headers(&h(pairs)), Ok(()), "should be valid: {pairs:?}");
+        assert_eq!(
+            validate_request_headers(&h(pairs)),
+            Ok(()),
+            "should be valid: {pairs:?}"
+        );
     }
     fn bad(pairs: &[(&str, &str)]) -> &'static str {
-        validate_request_headers(&h(pairs))
-            .expect_err(&format!("should be rejected: {pairs:?}"))
+        validate_request_headers(&h(pairs)).expect_err(&format!("should be rejected: {pairs:?}"))
     }
 
-    const GOOD: &[(&str, &str)] =
-        &[(":method", "GET"), (":scheme", "https"), (":path", "/"), (":authority", "example.com")];
+    const GOOD: &[(&str, &str)] = &[
+        (":method", "GET"),
+        (":scheme", "https"),
+        (":path", "/"),
+        (":authority", "example.com"),
+    ];
 
     /// A well-formed request must still pass. Without this the whole module
     /// could "fix" 21 failures by rejecting everything.
     #[test]
     fn well_formed_requests_pass() {
         ok(GOOD);
-        ok(&[(":method", "GET"), (":scheme", "https"), (":path", "/x"),
-             (":authority", "example.com"), ("user-agent", "curl/8"), ("accept", "*/*")]);
+        ok(&[
+            (":method", "GET"),
+            (":scheme", "https"),
+            (":path", "/x"),
+            (":authority", "example.com"),
+            ("user-agent", "curl/8"),
+            ("accept", "*/*"),
+        ]);
         // TE: trailers is the one permitted connection-ish header.
-        ok(&[(":method", "GET"), (":scheme", "https"), (":path", "/"),
-             (":authority", "example.com"), ("te", "trailers")]);
+        ok(&[
+            (":method", "GET"),
+            (":scheme", "https"),
+            (":path", "/"),
+            (":authority", "example.com"),
+            ("te", "trailers"),
+        ]);
         // OPTIONS * is the legitimate asterisk-form.
-        ok(&[(":method", "OPTIONS"), (":scheme", "https"), (":path", "*"),
-             (":authority", "example.com")]);
+        ok(&[
+            (":method", "OPTIONS"),
+            (":scheme", "https"),
+            (":path", "*"),
+            (":authority", "example.com"),
+        ]);
     }
 
     /// RFC 9113 8.3.1 / RFC 9114 4.3.1: an http or https request must name its
@@ -223,8 +267,12 @@ mod pseudo_header_tests {
         );
         // Host alone satisfies it: a proxy fronting HTTP/1.1 may forward Host
         // instead of synthesising :authority.
-        ok(&[(":method", "GET"), (":scheme", "https"), (":path", "/"),
-             ("host", "example.com")]);
+        ok(&[
+            (":method", "GET"),
+            (":scheme", "https"),
+            (":path", "/"),
+            ("host", "example.com"),
+        ]);
         // A scheme with no mandatory authority component is exempt.
         ok(&[(":method", "GET"), (":scheme", "ftp"), (":path", "/")]);
         // A more specific defect still reports itself, not this rule.
@@ -239,8 +287,15 @@ mod pseudo_header_tests {
     /// "Sends a HEADERS frame that contains the header field name in uppercase letters".
     #[test]
     fn uppercase_field_names_are_rejected() {
-        assert_eq!(bad(&[(":method", "GET"), (":scheme", "https"), (":path", "/"),
-                         ("User-Agent", "x")]), "uppercase field name");
+        assert_eq!(
+            bad(&[
+                (":method", "GET"),
+                (":scheme", "https"),
+                (":path", "/"),
+                ("User-Agent", "x")
+            ]),
+            "uppercase field name"
+        );
         assert_eq!(bad(&[(":Method", "GET")]), "uppercase field name");
     }
 
@@ -248,34 +303,78 @@ mod pseudo_header_tests {
     /// pseudo-header field".
     #[test]
     fn unknown_and_misplaced_pseudo_headers_are_rejected() {
-        assert_eq!(bad(&[(":method", "GET"), (":scheme", "https"), (":path", "/"),
-                         (":unknown", "x")]), "unknown pseudo-header");
+        assert_eq!(
+            bad(&[
+                (":method", "GET"),
+                (":scheme", "https"),
+                (":path", "/"),
+                (":unknown", "x")
+            ]),
+            "unknown pseudo-header"
+        );
         // A response pseudo-header has no place in a request.
-        assert_eq!(bad(&[(":method", "GET"), (":scheme", "https"), (":path", "/"),
-                         (":status", "200")]), "response pseudo-header in request");
+        assert_eq!(
+            bad(&[
+                (":method", "GET"),
+                (":scheme", "https"),
+                (":path", "/"),
+                (":status", "200")
+            ]),
+            "response pseudo-header in request"
+        );
         // Pseudo-headers must all come first.
-        assert_eq!(bad(&[(":method", "GET"), ("user-agent", "x"), (":path", "/")]),
-                   "pseudo-header after regular field");
+        assert_eq!(
+            bad(&[(":method", "GET"), ("user-agent", "x"), (":path", "/")]),
+            "pseudo-header after regular field"
+        );
     }
 
     /// RFC 9113 8.3.1. h2spec: "Sends a HEADERS frame with empty \":path\"".
     #[test]
     fn mandatory_pseudo_headers_are_enforced() {
-        assert_eq!(bad(&[(":method", "GET"), (":scheme", "https"), (":path", "")]), "empty :path");
-        assert_eq!(bad(&[(":scheme", "https"), (":path", "/")]), "missing :method");
-        assert_eq!(bad(&[(":method", "GET"), (":path", "/")]), "missing :scheme");
-        assert_eq!(bad(&[(":method", "GET"), (":scheme", "https")]), "missing :path");
+        assert_eq!(
+            bad(&[(":method", "GET"), (":scheme", "https"), (":path", "")]),
+            "empty :path"
+        );
+        assert_eq!(
+            bad(&[(":scheme", "https"), (":path", "/")]),
+            "missing :method"
+        );
+        assert_eq!(
+            bad(&[(":method", "GET"), (":path", "/")]),
+            "missing :scheme"
+        );
+        assert_eq!(
+            bad(&[(":method", "GET"), (":scheme", "https")]),
+            "missing :path"
+        );
         // Asterisk-form is only legal for OPTIONS.
-        assert_eq!(bad(&[(":method", "GET"), (":scheme", "https"), (":path", "*")]),
-                   "asterisk :path on non-OPTIONS");
+        assert_eq!(
+            bad(&[(":method", "GET"), (":scheme", "https"), (":path", "*")]),
+            "asterisk :path on non-OPTIONS"
+        );
     }
 
     #[test]
     fn duplicate_pseudo_headers_are_rejected() {
-        assert_eq!(bad(&[(":method", "GET"), (":method", "POST"),
-                         (":scheme", "https"), (":path", "/")]), "duplicate pseudo-header");
-        assert_eq!(bad(&[(":method", "GET"), (":scheme", "https"),
-                         (":path", "/"), (":path", "/y")]), "duplicate pseudo-header");
+        assert_eq!(
+            bad(&[
+                (":method", "GET"),
+                (":method", "POST"),
+                (":scheme", "https"),
+                (":path", "/")
+            ]),
+            "duplicate pseudo-header"
+        );
+        assert_eq!(
+            bad(&[
+                (":method", "GET"),
+                (":scheme", "https"),
+                (":path", "/"),
+                (":path", "/y")
+            ]),
+            "duplicate pseudo-header"
+        );
     }
 
     /// RFC 9113 8.2.2. These are HTTP/1.1 hop-by-hop metadata with no meaning
@@ -284,7 +383,13 @@ mod pseudo_header_tests {
     /// ingress means it never gets that far.
     #[test]
     fn connection_specific_fields_are_rejected() {
-        for f in ["connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade"] {
+        for f in [
+            "connection",
+            "keep-alive",
+            "proxy-connection",
+            "transfer-encoding",
+            "upgrade",
+        ] {
             let mut v = GOOD.to_vec();
             v.push((f, "x"));
             assert_eq!(bad(&v), "connection-specific header field", "for {f}");
@@ -300,10 +405,17 @@ mod pseudo_header_tests {
     /// while "fixing" conformance.
     #[test]
     fn connect_has_its_own_rules() {
-        assert_eq!(validate_request_headers(&h(&[(":method", "CONNECT"),
-                                                 (":authority", "example.com:443")])), Ok(()));
-        assert_eq!(bad(&[(":method", "CONNECT"), (":authority", "x"), (":path", "/")]),
-                   "CONNECT with :scheme or :path");
+        assert_eq!(
+            validate_request_headers(&h(&[
+                (":method", "CONNECT"),
+                (":authority", "example.com:443")
+            ])),
+            Ok(())
+        );
+        assert_eq!(
+            bad(&[(":method", "CONNECT"), (":authority", "x"), (":path", "/")]),
+            "CONNECT with :scheme or :path"
+        );
         assert_eq!(bad(&[(":method", "CONNECT")]), "CONNECT without :authority");
     }
 
