@@ -288,7 +288,7 @@ fn test_user_del_unknown_exits_1() {
 fn test_config_not_found_exits_2() {
     let bin = binary_path();
     let out = Command::new(&bin)
-        .args(&["/nonexistent/path/m6-auth.conf", "user", "ls"])
+        .args(["/nonexistent/path/m6-auth.conf", "user", "ls"])
         .output()
         .expect("run");
     assert_eq!(out.status.code(), Some(2), "stdout: {}", stdout(&out));
