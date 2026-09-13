@@ -25,17 +25,22 @@ resolver = "2"
 # Shared by every crate in the workspace, so they cannot drift apart. Each
 # member inherits with `version.workspace = true` and friends.
 #
-# The version matches the newest tag. `tools/release.sh` bumps it as part of
-# cutting a release, so the tag and the crates always agree at a release point.
-# Before this they did not: the tag said v0.2.0 and every crate said 0.1.0.
+# The version matches the newest tag. Bump it HERE, on develop, before running
+# `tools/release.sh` — that script merges, tags and pushes, and does NOT touch
+# this line. An earlier comment here said it did, which is the kind of claim that
+# is only tested once, at a release, and this was that release.
 #
-# 1.0.0 IS THE TARGET, AND IT IS NOT CUT UNTIL THE CONSOLIDATION WORK IS DONE.
-# Owner's decision, 2026-09-13. What is outstanding is in
-# docs/CONSOLIDATION-TODO.md; the short version is phase 7 (decoupling the
-# repositories), phase 8, and the deployment of everything currently sitting
-# undeployed on develop.
+# Before any of this the tag said v0.2.0 and every crate said 0.1.0.
+#
+# 1.0.0 WAS CUT ON 2026-09-14. The consolidation work it was waiting on is done:
+# clippy at zero, h3 measured and understood, phase 8's six backend examples and
+# the m6-core overhead measurement they existed for, and the advisories resolved.
+#
+# Phase 7 (the renderers pinned to a tag rather than a path) is sequenced AT the
+# release, because it needs a tag to pin to. See docs/CONSOLIDATION-TODO.md for
+# what remains, and CHANGELOG.md's 1.0.0 entry for what is knowingly not fixed.
 [workspace.package]
-version      = "0.2.0"
+version      = "1.0.0"
 edition      = "2021"
 # The oldest toolchain we test. Declared because declaring one and not testing
 # it is a claim rather than a fact: CI builds the whole workspace with exactly
