@@ -55,6 +55,9 @@ allow = [
     "MPL-2.0",
     "CC0-1.0",
     "Unlicense",
+    # BSD Zero Clause, the most permissive of the family: no attribution
+    # requirement at all. `quoted_printable`, via lettre, uses it.
+    "0BSD",
     "OpenSSL",
     # The Mozilla root certificate store, shipped as data by webpki-roots. The
     # Community Data License Agreement is permissive; it governs the data set

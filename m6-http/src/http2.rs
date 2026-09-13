@@ -3506,11 +3506,20 @@ mod hpack_robustness {
             // 0 is not used." The validator parses this index and discards it.
             ("indexed field, index 0", vec![0x80]),
             // Indexed field far past the static and dynamic tables.
-            ("indexed field, huge index", vec![0xFF, 0xFF, 0xFF, 0xFF, 0x7F]),
+            (
+                "indexed field, huge index",
+                vec![0xFF, 0xFF, 0xFF, 0xFF, 0x7F],
+            ),
             ("integer overflow", vec![0xFF; 12]),
-            ("truncated literal name", vec![0x40, 0x7F, 0xFF, 0xFF, 0xFF, 0x7F]),
+            (
+                "truncated literal name",
+                vec![0x40, 0x7F, 0xFF, 0xFF, 0xFF, 0x7F],
+            ),
             ("truncated huffman string", vec![0x40, 0x8F, 0xFF]),
-            ("absurd table size update", vec![0x3F, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F]),
+            (
+                "absurd table size update",
+                vec![0x3F, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F],
+            ),
             ("lone continuation", vec![0xFF]),
             ("literal, indexed name 0, no strings", vec![0x40]),
         ]
@@ -3563,7 +3572,10 @@ mod hpack_robustness {
                 let _ = decode_hpack(&mut dec, &block, &mut out);
             })
             .is_ok();
-            assert!(ok, "a {n}-byte truncation passes validation and panics the decoder");
+            assert!(
+                ok,
+                "a {n}-byte truncation passes validation and panics the decoder"
+            );
         }
     }
 }
