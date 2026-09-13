@@ -14,3 +14,4 @@
 # slower, nothing more.
 #
 # target                     ns
+render:capabilities        2170589
