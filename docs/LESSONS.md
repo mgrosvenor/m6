@@ -309,10 +309,10 @@ New 2026-09-12:
     upstream, watch two PRs and re-measure". The version check I had run was
     also filtered to the 0.2x line and could not have seen a newer one.
 
-    Applying both PRs to tag 0.29.3 and measuring settled it: h3 goes from
-    37/49 to **47/49**, with only the QPACK pair left. So the thing I had
-    written off as possibly needing the transport layer replaced was three
-    clean cherry-picks and forty-nine lines.
+    Applying both PRs and measuring settled it: h3 goes from 37/49 to **47/49**,
+    with only the QPACK pair left. So the thing written off as possibly needing
+    the transport layer replaced was three clean cherry-picks and forty-nine
+    lines, and m6 now runs on a fork carrying them.
 
     Two things, then. **Knowing which component owns a defect tells you nothing
     about whether it is fixable, or about what would fix it.** A remedy inferred
