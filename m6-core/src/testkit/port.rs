@@ -43,7 +43,40 @@ impl PortClaim {
 }
 
 impl Drop for PortClaim {
+    /// Release the port only once it is genuinely free.
+    ///
+    /// Removing the marker immediately is what made the long-standing
+    /// `Address already in use` failures possible. The claim guarantees no
+    /// other test picks the port, but it says nothing about whether the
+    /// *service* that was using it has finished with it: a claim dropped while
+    /// its process is still exiting frees the marker, the next test claims the
+    /// port, and its service cannot bind.
+    ///
+    /// That used to be survivable, because a failed bind was a warning and
+    /// m6-http carried on with no listener; the test then failed with
+    /// "never served a backend request", which named the symptom and not the
+    /// cause. Since a failed bind became fatal it is a hard failure instead,
+    /// which is the honest outcome and makes fixing this necessary rather than
+    /// optional.
+    ///
+    /// So: wait until the port actually binds before saying it is available.
+    /// Bounded, because a port held forever by something outside the suite
+    /// must not hang the run; if the wait expires the marker is released
+    /// anyway and the next claimant's own bind check will skip it.
     fn drop(&mut self) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match TcpListener::bind(("127.0.0.1", self.port)) {
+                Ok(l) => {
+                    drop(l);
+                    break;
+                }
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(_) => break,
+            }
+        }
         let _ = std::fs::remove_file(&self.marker);
     }
 }
