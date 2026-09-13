@@ -271,3 +271,57 @@ New 2026-09-12:
     at five seconds so something outside the suite cannot hang the run.
     Containing a race in the type means it cannot come back through a test
     that happens to declare its fields in the wrong order.
+
+40. **Correct attribution is not a diagnosis.** h3 conformance sat at 37/49 for
+    months with the twelve failures recorded as quiche's, on sound reasoning:
+    QUIC transport parameter validation, packet reserved bits and QPACK are all
+    below the layer m6-http works at. The 1.0 list therefore carried the remedy
+    that followed from it, "one dependency bump and one CI run", and nobody
+    doubted it because the attribution was right.
+
+    The bump was done: 0.26.1 to 0.29.3, three releases, with a feature rename
+    on the way because 0.29 dropped the vendored BoringSSL build. The score did
+    not move by one test.
+
+    Reading quiche's source explained the mechanism. Every one of the twelve is
+    worded "MUST **send** \<error\>" rather than "MUST reject". For the eight
+    transport parameter cases quiche does detect the problem and calls `close()`
+    itself, queueing the right code, but `close()` calls `mark_closed()` when no
+    packet has yet been fully processed, and `recv_count` only increments at the
+    end of `recv_single`, so a bad parameter in the client's first Initial makes
+    the queued close unsendable. For the two reserved-bit cases it does not
+    detect anything: there is no reserved-bit validation in `packet.rs` at all.
+    The two QPACK codes, 0x201 and 0x202, appear nowhere in its h3 module.
+
+    **Then the second mistake, and it is the one worth the entry.** Having read
+    the source, I concluded these were deliberate anti-DoS and anti-MITM design
+    choices and wrote that into the record: unfixable, and moving the ceiling
+    would mean carrying a patched quiche or replacing the QUIC layer. The owner
+    did not believe it, said so, and asked the obvious question I had not asked:
+    are there outstanding issues, is there a newer version.
+
+    Ten of the twelve are open upstream bugs with open fix pull requests.
+    Issue #2515 describes the first-flight unsendable CONNECTION_CLOSE in the
+    same terms I had just derived, down to `recv_count == 0` and the expected
+    TRANSPORT_PARAMETER_ERROR 0x08, and PR #2521 proposes the fix. Issues #2526
+    and #2652 cover the reserved bits, with PR #2575 active. So the honest
+    position is not "unfixable by design", it is "a known defect waiting on
+    upstream, watch two PRs and re-measure". The version check I had run was
+    also filtered to the 0.2x line and could not have seen a newer one.
+
+    Applying both PRs and measuring settled it: h3 goes from 37/49 to **47/49**,
+    with only the QPACK pair left. So the thing written off as possibly needing
+    the transport layer replaced was three clean cherry-picks and forty-nine
+    lines, and m6 now runs on a fork carrying them.
+
+    Two things, then. **Knowing which component owns a defect tells you nothing
+    about whether it is fixable, or about what would fix it.** A remedy inferred
+    from an attribution is still a guess, and it reads as a plan for as long as
+    nobody tries it. The bump was the cheapest way to find out, and watching the
+    number refuse to move is what started the real investigation.
+
+    And: **a dependency's source tells you what it does, not whether its
+    authors think that is correct.** A comment explaining a behaviour reads
+    exactly like a comment endorsing it. The issue tracker is where intent
+    actually lives, it takes one search, and skipping it turned a two-PR wait
+    into a false claim that the transport layer might have to be replaced.
