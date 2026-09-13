@@ -31,7 +31,10 @@ name = "m6_http_lib"
 path = "src/lib.rs"
 
 [dependencies]
-quiche         = { git = "https://github.com/cloudflare/quiche", tag = "0.26.1", features = ["boringssl-vendored"] }
+# 0.29 dropped the vendored-BoringSSL build: no `boringssl-vendored` feature and
+# no cmake build step. Its default feature is `boringssl-boring-crate`, so
+# BoringSSL now comes in through the `boring` crate, which vendors its own.
+quiche         = { git = "https://github.com/cloudflare/quiche", tag = "0.29.3" }
 matchit        = "0.8"
 serde          = { version = "1", features = ["derive"] }
 serde_json     = "1"
