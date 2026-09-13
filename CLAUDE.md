@@ -139,9 +139,11 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 
 | file | what it holds |
 |---|---|
-| `HANDOVER.md` | what is true right now, and the lessons that cost something |
-| `docs/CONSOLIDATION-TODO.md` | what is done and what is owed |
-| `docs/PERFORMANCE.md` | the performance story by commit, with how each number was measured |
+| `HANDOVER.md` | **start here.** What is true right now, written for someone with no prior context |
+| `docs/CONSOLIDATION-TODO.md` | what is done and what is owed, with the 1.0 list at the top |
+| `docs/PERFORMANCE.md` | every performance number, how it was measured, on what |
+| `docs/LESSONS.md` | the things that cost something to learn |
+| `docs/SESSION-NOTES.md` | point-in-time records. Not maintained; the handover wins |
 | `docs/m6-core-reference.md` | every core module and its interface |
 | `CHANGELOG.md` | what changed in each release |
 
