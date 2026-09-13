@@ -5,17 +5,23 @@ to bottom before touching anything. It is what is true right now.
 
 Then: `CLAUDE.md` for the rules, `docs/CONSOLIDATION-TODO.md` for what is owed.
 
-Last rewritten 2026-09-13. **Every factual claim in it was checked against the
-repository, the fleet and the GitHub API on that date**, not written from
-memory. That pass found two claims wrong and one bug; all three are corrected
-below.
+Last rewritten 2026-09-13, and **every factual claim in it was checked against
+the repository, the fleet and the GitHub API that day** rather than written
+from memory. Two verification passes have now run over it. The first found two
+wrong claims and a real bug in the test harness; the second found three more
+wrong numbers. All of them are corrected below, and the pattern is worth
+naming: **every single error was a number that was true when it was measured
+and had quietly stopped being true by the time it was read.** Counts, commit
+hashes and scores rot. Where this file can give you the command instead of the
+number, it does.
 
 ---
 
 ## 0. If you read nothing else
 
-- **Do not deploy.** 133 m6 commits and 24 site commits are undeployed behind a
-  deliberate freeze. Lifting it has a known hazard: §6.
+- **Do not deploy.** 135 m6 commits are undeployed behind a deliberate freeze,
+  counted 2026-09-13; recompute with the command in §3, never trust the
+  number. Lifting the freeze has a known hazard: §6.
 - **`main` is not what is running.** It holds all of that undeployed work. The
   deployed commit is whatever the newest entry in
   `~/dr-grosvenor-site/docs/RELEASES.md` names.
@@ -136,13 +142,23 @@ tree, which it has already caught me doing.
 
 | repo | branch | state |
 |---|---|---|
-| m6 | `main` | `ead669b`, **133 commits behind develop**, none of it deployed. Not what is running. |
-| m6 | `develop` | `9abfebe`, the CI branch merged in with everything passing |
+| m6 | `main` | `ead669b`, **12 commits behind `develop`**. Not what is running: it also holds work that has never deployed. |
+| m6 | `develop` | `bc1e9b1`, pushed |
 | site | `main` | `e9f11c2` |
-| site | `develop` | `0b04e67`, pushed |
+| site | `develop` | `0b04e67`, 2 ahead of `main`, pushed |
 
-**CI runs on `develop` now**, from 2026-09-13. It was added on a branch, so
-before that push it had never run there.
+**Two different numbers get confused here, so keep them apart.** `main` is 12
+commits behind `develop`: that is unreleased work. 135 commits are undeployed:
+that is measured from the deployed commit, which is far behind `main`. An
+earlier version of this table printed 135 in the `main` row and was wrong.
+
+**CI runs on `develop` now**, from 2026-09-13, and before that push it had
+never run there. **It has not yet finished a run.** `cargo-deny` (53s) and MSRV
+(2m28s) pass; the build-tests-clippy job and the conformance job were both
+still going 45 minutes in. Whether that is a slow honest run or a hang is
+unestablished, and it is the first thing to look at: `gh run list --branch
+develop`. Conformance on a shared runner has to build the stack and drive three
+protocol testers, so slow is plausible, but nobody has watched one to the end.
 
 ### What is deployed
 
@@ -151,6 +167,13 @@ before that push it had never run there.
 ```sh
 git -C ~/m6 log --oneline 22ee3a4..develop | wc -l
 ```
+
+**The site side of that cannot be recomputed at all.** Every entry in
+`RELEASES.md` names the m6 commit it shipped and none of them names the site
+commit, checked across the whole file. So "which content and configs are live"
+has no recorded answer, and any figure for undeployed site commits is an
+estimate. **Record both hashes at the next release**, and treat this as part of
+lifting the freeze rather than a documentation chore.
 
 Three production changes were applied during the freeze on explicit
 instruction: systemd hardening fleet-wide, the firewall block ledger
@@ -345,8 +368,11 @@ credential probes), `95.173.161.147` (encoded traversal aimed at `/bin/sh`),
 
 ## 8. The dozen lessons that come up most
 
-Full list, all 49, in `docs/LESSONS.md`.
+Full list, 39 of them, in `docs/LESSONS.md`.
 
+0. **A number in a document is a measurement with a timestamp, not a fact.**
+   Every error found in two verification passes over this file was a number
+   that was true when taken and stale when read.
 1. **A check that cannot measure must fail, not pass.**
 2. **A gate that runs only where it is convenient is not a gate.** The only
    thing running conformance was a laptop hook on a machine with neither h2spec
@@ -374,6 +400,13 @@ Full list, all 49, in `docs/LESSONS.md`.
     over three hours was reported as the day's strongest attacker three times.
     One field settled it: `UA: Amazon-Route53-Health-Check-Service`.
 12. **Run the suite to a file and grep the file, never the pipe.**
+13. **Making a warning fatal does not create the bug it reveals.** The e2e port
+    race was survivable while a failed bind only warned: the service came up
+    with no listener and the test failed later with "never served a backend
+    request", naming the symptom and not the cause. Making the bind fatal
+    turned it into an immediate honest failure, which is the only reason it was
+    found. Lesson 39 has the whole thing, including the two different races
+    that were being treated as one.
 
 ---
 
@@ -381,29 +414,8 @@ Full list, all 49, in `docs/LESSONS.md`.
 
 - **`m6-auth-cli`'s `test_token_create_prints_jwt`** fails intermittently and
   has never been explained. Did not recur on 2026-09-12 or -13.
-- ~~**A port race in the e2e suites.**~~ **FIXED 2026-09-13**, and worth
-  reading because two different races were being conflated.
-
-  `SO_REUSEADDR` fixes rebinding a port in `TIME_WAIT`: a socket closed but
-  lingering. That was real and is fixed. It cannot fix a port another process
-  is *actively listening on*, and refusing that is the whole point of the
-  check.
-
-  The remaining failure was the second kind. `PortClaim::drop` removed its
-  marker file immediately, but the marker only guarantees no other *test* picks
-  the port. It says nothing about whether the *service* that was using it has
-  exited. A claim dropped while its process was still shutting down freed the
-  marker, the next test claimed the port, and its service could not bind.
-
-  It was survivable while a failed bind was a warning: the process came up with
-  no listener and the test failed later with "never served a backend request",
-  naming the symptom rather than the cause. **Making a failed bind fatal (§3d)
-  turned it into an immediate honest failure**, which is what surfaced it.
-
-  `PortClaim::drop` now waits until the port genuinely binds before releasing
-  the marker, bounded at five seconds so something outside the suite cannot
-  hang the run. The race is contained in the primitive rather than depending on
-  every test declaring its fields in the right drop order.
+- **How long CI takes, and whether it finishes.** See §3. No run on `develop`
+  has been observed to completion.
 - **Four `cargo deny` advisories** listed as exceptions in `deny.toml`, issue
   #3. **Their reachability has never been established**; that issue was written
   before checking, which is the same mistake made with a fifth. That fifth,
@@ -413,9 +425,9 @@ Full list, all 49, in `docs/LESSONS.md`.
   than trusting the issue text.
 - **GitHub issues**: #1 (CI, done, close it) and #3 (above).
 - **GitHub branch protection on `main` is not set**, confirmed against the
-  API: `Branch not protected`. The hooks protect one
-  laptop. Setting it needs the owner's go-ahead because it changes how the
-  repository behaves for everyone.
+  API: `Branch not protected`. The hooks protect one laptop. Setting it needs
+  the owner's go-ahead because it changes how the repository behaves for
+  everyone.
 - **`FrameworkState::build_dict` is private**, so the twelve ordered steps of
   dictionary building are not reusable by a service not using `App`.
 - **The IO layer, the event loop and the handler contract are deferred**,
