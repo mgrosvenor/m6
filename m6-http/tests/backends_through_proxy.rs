@@ -368,6 +368,10 @@ enabled = false
 [[backend]]
 name    = "example"
 sockets = "{}"
+# None of the six examples compresses: protocol §3.6 told backends not to, and
+# m6-http has no compressor to make up the difference. Saying so is what stops
+# the edge advertising an encoding dimension with exactly one value.
+compresses = false
 
 [[route]]
 path    = "/{{*rest}}"
@@ -607,6 +611,35 @@ fn the_proxy_does_not_compress_an_uncompressed_backend() {
             "{lang}: the proxy sent a Content-Encoding, which it has no \
              compressor for. Headers:\n{}",
             asked.headers
+        );
+    });
+}
+
+#[test]
+fn a_non_compressing_backend_gets_no_vary_accept_encoding() {
+    // The other half of §10.5's resolution. m6-http is a cache, not a
+    // transformer: it has no compressor, so for a backend that does not compress
+    // there is exactly ONE representation and `Vary: Accept-Encoding` advertises
+    // variants that can never exist. Every shared cache downstream would then
+    // fragment its storage on a header that cannot change the body.
+    //
+    // `compresses = false` on the `[[backend]]` entry is how the two sides agree,
+    // and this asserts the edge acts on it rather than merely recording it. The
+    // same key is read by m6-core, which refuses to start if it disagrees with
+    // what the service can actually do.
+    for_each(|lang, s| {
+        let r = s.get_with("/status", &[("Accept-Encoding", "br, gzip")]);
+        assert_eq!(r.status, 200, "{lang}: /status");
+        let vary = r.header("vary").unwrap_or_default();
+        assert!(
+            !vary.to_ascii_lowercase().contains("accept-encoding"),
+            "{lang}: the backend declares compresses = false, so the edge must \
+             not vary on Accept-Encoding. Got `Vary: {vary}`. Headers:\n{}",
+            r.headers
+        );
+        assert!(
+            !r.has_header("content-encoding"),
+            "{lang}: and nothing should be compressed"
         );
     });
 }

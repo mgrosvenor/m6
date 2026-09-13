@@ -500,6 +500,54 @@ pub struct BackendConfig {
     /// For testing with self-signed certs only — do not use in production.
     #[serde(default)]
     pub tls_skip_verify: bool,
+    /// Whether this backend compresses its own responses.
+    ///
+    /// **m6-http is a cache, not a transformer.** It does not compress: it
+    /// negotiates between representations a backend produced and caches each
+    /// one. `brotli` and `flate2` are in m6-core, on the backend side, and
+    /// nothing under m6-http/src calls a compressor.
+    ///
+    /// That contradicted two normative documents, which told backends not to
+    /// compress on the grounds that the proxy would. A C, Go or Python backend
+    /// written from that advice had its bytes served uncompressed forever, and
+    /// it was invisible for the Rust services only because m6-core compresses
+    /// for them. See docs/m6-backend-examples.md §10.5.
+    ///
+    /// So the two sides agree in config instead. The edge reads this to decide
+    /// whether to promise variants by varying on `Accept-Encoding`; the backend
+    /// reads the SAME key and refuses to start if it disagrees with what it can
+    /// actually do (`m6_core::compress::check_declared_support`).
+    ///
+    /// DEFAULT TRUE, deliberately. Every backend in this fleet is built on
+    /// m6-core, which compresses by default, so true is what is already
+    /// running. A backend that does not compress says so, and then the edge
+    /// stops advertising an encoding dimension that has exactly one value.
+    #[serde(default = "default_compresses")]
+    pub compresses: bool,
+}
+
+/// See [`BackendConfig::compresses`]. True because that is what the fleet does.
+fn default_compresses() -> bool {
+    true
+}
+
+impl Config {
+    /// Whether the named backend compresses its own responses.
+    ///
+    /// An unknown name answers `true`, which is the conservative direction: it
+    /// keeps `Vary: Accept-Encoding` on a response whose origin we cannot
+    /// identify. Answering `false` there would drop the header from a response
+    /// that really does have several encodings, and a shared cache would then
+    /// hand one client's brotli body to a client that asked for identity. A
+    /// redundant `Vary` costs cache efficiency; a missing one is a correctness
+    /// bug.
+    pub fn backend_compresses(&self, name: &str) -> bool {
+        self.backends
+            .iter()
+            .find(|b| b.name == name)
+            .map(|b| b.compresses)
+            .unwrap_or(true)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
