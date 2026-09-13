@@ -16,3 +16,15 @@ h1:m6-auth-server      32     32
 h1:m6-file             32     32
 h1:m6-html             32     32
 h1:m6-http-redirect    32     32
+h2:m6-http             146    146
+h3:m6-http             37     49
+
+# h2 and h3 had NO FLOOR until 2026-09-13, which meant neither was ratcheted
+# and neither was ever measured by a gate. The pre-push hook was the only thing
+# running conformance and it runs on a laptop where h2spec and h3spec are not
+# installed, so both were skipped on every run and the script said nothing. The
+# Linux gate did not run conformance at all.
+#
+# h3 is 37/49, not 49/49: twelve QUIC transport requirements genuinely fail
+# today. The floor records where it is so it cannot get worse, which is what a
+# ratchet is for. Raising it is the work, and is its own change.
