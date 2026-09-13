@@ -1,4 +1,15 @@
-/// MIME type utilities for m6.
+//! Content types, from a path.
+//!
+//! **The single table.** Two implementations existed, this one and the
+//! `mime_guess` crate, and the wrong one was serving: every text type went out
+//! with no charset, so clients fell back to Latin-1 and rendered UTF-8 as
+//! mojibake. An em dash came out as three garbage characters in every `.md`
+//! file, in `llms.txt` and in `llms-full.txt` -- the three documents that exist
+//! specifically to be machine-read.
+//!
+//! The bytes were always right. Only the label was missing. Text types declare
+//! `charset=utf-8` here; binary types and `application/json` deliberately do
+//! not, since the parameter is undefined for JSON by RFC 8259.
 
 use std::path::Path;
 
@@ -113,12 +124,18 @@ mod tests {
 
     #[test]
     fn test_mime_from_path_unknown() {
-        assert_eq!(mime_from_path(Path::new("file.xyz")), "application/octet-stream");
+        assert_eq!(
+            mime_from_path(Path::new("file.xyz")),
+            "application/octet-stream"
+        );
     }
 
     #[test]
     fn test_mime_from_path_no_extension() {
-        assert_eq!(mime_from_path(Path::new("Makefile")), "application/octet-stream");
+        assert_eq!(
+            mime_from_path(Path::new("Makefile")),
+            "application/octet-stream"
+        );
     }
 
     #[test]

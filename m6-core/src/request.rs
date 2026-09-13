@@ -1,4 +1,16 @@
-/// HTTP request type and request-dictionary building.
+//! What a handler is given.
+//!
+//! `Request` carries the raw request, the request dictionary, the site
+//! directory, the matched route's own config, and the service config. All of
+//! it is shared rather than copied: the dictionary is a `Dict` whose static
+//! half belongs to the route, and the paths and config are behind `Arc`s.
+//!
+//! That was not always true. Building one used to clone the whole request and
+//! the whole dictionary, which on this site meant copying a 68KB content file
+//! per request. See `crate::dict` and `docs/PERFORMANCE.md`.
+//!
+//! The file helpers resolve against the site directory and refuse to leave it.
+
 // HashMap removed — headers are stored as Vec for small-N linear-scan performance.
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
@@ -66,7 +78,14 @@ impl Request {
     ) -> Self {
         let dict = dict.into();
         let site_dir = site_dir.into();
-        Self { raw, dict, site_dir, route_pattern: None, route_settings: None, config: None }
+        Self {
+            raw,
+            dict,
+            site_dir,
+            route_pattern: None,
+            route_settings: None,
+            config: None,
+        }
     }
 
     /// Attach route settings directly, without a `CompiledRoute`.
@@ -243,9 +262,7 @@ impl Request {
         // We check for `..` components.
         for comp in Path::new(rel).components() {
             if comp == Component::ParentDir {
-                return Err(Error::BadRequest(
-                    "path traversal not allowed".to_string(),
-                ));
+                return Err(Error::BadRequest("path traversal not allowed".to_string()));
             }
         }
         Ok(abs)
@@ -383,10 +400,7 @@ impl Request {
     /// Parse a named file field from a multipart/form-data body (feature = "multipart").
     #[cfg(feature = "multipart")]
     pub fn file(&self, name: &str) -> crate::error::Result<crate::multipart::Upload> {
-        let ct = self
-            .raw
-            .content_type()
-            .unwrap_or("");
+        let ct = self.raw.content_type().unwrap_or("");
         crate::multipart::parse_upload(&self.raw.body, ct, name)
     }
 
@@ -492,10 +506,7 @@ pub fn url_decode(s: &str) -> String {
             out.push(b' ');
             i += 1;
         } else if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(h), Some(l)) = (
-                hex_digit(bytes[i + 1]),
-                hex_digit(bytes[i + 2]),
-            ) {
+            if let (Some(h), Some(l)) = (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2])) {
                 out.push((h << 4) | l);
                 i += 3;
             } else {
@@ -729,7 +740,10 @@ mod tests {
             // Emoji mixed with text and a `+` space.
             ("hi+%F0%9F%91%8B+there", "hi \u{1F44B} there"),
             // Non-Latin scripts.
-            ("%D0%9F%D1%80%D0%B8%D0%B2%D0%B5%D1%82", "\u{041f}\u{0440}\u{0438}\u{0432}\u{0435}\u{0442}"),
+            (
+                "%D0%9F%D1%80%D0%B8%D0%B2%D0%B5%D1%82",
+                "\u{041f}\u{0440}\u{0438}\u{0432}\u{0435}\u{0442}",
+            ),
             ("%E6%97%A5%E6%9C%AC%E8%AA%9E", "\u{65e5}\u{672c}\u{8a9e}"),
             // Combining mark: must not be reordered or split.
             ("e%CC%81", "e\u{0301}"),
@@ -755,7 +769,10 @@ mod tests {
         assert_eq!(pairs[0], ("name".to_string(), "Ren\u{e9}".to_string()));
         assert_eq!(
             pairs[1],
-            ("message".to_string(), "I\u{2019}m here \u{1F389}".to_string())
+            (
+                "message".to_string(),
+                "I\u{2019}m here \u{1F389}".to_string()
+            )
         );
     }
 
@@ -786,8 +803,17 @@ mod tests {
     /// deleted. The property belongs with the one implementation.
     #[test]
     fn percent_before_multibyte_does_not_panic() {
-        for input in ["%\u{e9}", "%\u{1F600}x", "abc%\u{4e2d}\u{6587}", "%", "%A", "%ZZ",
-                      "%%", "a%", "%F0%9F%98"] {
+        for input in [
+            "%\u{e9}",
+            "%\u{1F600}x",
+            "abc%\u{4e2d}\u{6587}",
+            "%",
+            "%A",
+            "%ZZ",
+            "%%",
+            "a%",
+            "%F0%9F%98",
+        ] {
             let _ = url_decode(input);
         }
     }
@@ -797,7 +823,10 @@ mod tests {
     /// says the password was corrupted rather than wrong.
     #[test]
     fn a_password_shaped_field_survives_decoding() {
-        assert_eq!(url_decode("p%C3%A4ssw%C3%B6rd+123"), "p\u{e4}ssw\u{f6}rd 123");
+        assert_eq!(
+            url_decode("p%C3%A4ssw%C3%B6rd+123"),
+            "p\u{e4}ssw\u{f6}rd 123"
+        );
         assert_eq!(url_decode("plain%2Fascii"), "plain/ascii");
     }
 
@@ -826,8 +855,14 @@ mod tests {
     /// broke the contact form.
     #[test]
     fn encode_decode_round_trips() {
-        for case in ["I\u{2019}m not sure", "caf\u{e9}", "\u{1F600}\u{1F44B}",
-                     "a b&c=d", "/a/b?x=1", "\u{65e5}\u{672c}\u{8a9e}"] {
+        for case in [
+            "I\u{2019}m not sure",
+            "caf\u{e9}",
+            "\u{1F600}\u{1F44B}",
+            "a b&c=d",
+            "/a/b?x=1",
+            "\u{65e5}\u{672c}\u{8a9e}",
+        ] {
             assert_eq!(url_decode(&url_encode(case)), case, "round trip: {case:?}");
         }
     }
@@ -850,7 +885,10 @@ mod tests {
     fn duplicate_cookie_names_resolve_differently_on_purpose() {
         let h = "sid=first; sid=second";
         assert_eq!(cookie(h, "sid"), Some("first"));
-        assert_eq!(parse_cookies(h).get("sid").unwrap().as_str(), Some("second"));
+        assert_eq!(
+            parse_cookies(h).get("sid").unwrap().as_str(),
+            Some("second")
+        );
     }
 
     #[test]
@@ -899,7 +937,10 @@ mod tests {
             assert!(validate_path_param(name, "a b").is_err(), "{name}: space");
             assert!(validate_path_param(name, "a\u{0}b").is_err(), "{name}: NUL");
             assert!(validate_path_param(name, "a/b/c").is_err(), "{name}: slash");
-            assert!(validate_path_param(name, "ok-1.txt").is_ok(), "{name}: valid");
+            assert!(
+                validate_path_param(name, "ok-1.txt").is_ok(),
+                "{name}: valid"
+            );
         }
     }
 
@@ -918,7 +959,8 @@ mod tests {
             Map::new(),
             dir.path().to_path_buf(),
         );
-        req.write_json_atomic("test.json", &json!({"key": "value"})).unwrap();
+        req.write_json_atomic("test.json", &json!({"key": "value"}))
+            .unwrap();
         let v = req.read_json("test.json").unwrap();
         assert_eq!(v["key"], "value");
     }

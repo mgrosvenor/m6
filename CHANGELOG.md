@@ -1,13 +1,42 @@
-# m6 release notes
+# Changelog
 
-Newest first. One entry per change that reaches a running node.
+What changed in each release, newest first.
 
 Each entry records what changed, why it mattered, and how it was verified.
 "Verified" means measured against a running server, not inferred from the
 source: several defects in this list were invisible in the code and only showed
 up against the deployed artefact.
 
-Deploy order is fixed: **test locally, commit, then deploy.** Never the reverse.
+Versions follow [semantic versioning](https://semver.org). `main` holds
+releases only; work happens on `develop`. See `CONTRIBUTING.md`.
+
+---
+
+## Unreleased
+
+Everything below this heading is on `develop` and has **not** been released or
+deployed. It is a large body of work: the m6-core migration (phases 0 to 6),
+both service migrations onto `App`, the copy elimination, streaming response
+bodies, and the conformance and performance checks becoming real.
+
+`docs/PERFORMANCE.md` has the measured performance story by commit.
+`docs/CONSOLIDATION-TODO.md` has what is done and what is owed.
+
+The individual entries are below, under the historical section, because they
+were written before this file was organised by release.
+
+---
+
+## 0.2.0 and earlier — 2026-03-15 and before
+
+**Not split by version.** This project kept one flat list of changes until
+2026-09-13, when `main` became release-only and versions started to mean
+something. Splitting the entries below across the versions they shipped in
+would mean guessing, and a changelog that guesses is worse than one that says
+it does not know. Everything here is accurate about *what* changed; it is the
+*which release* that is not recorded.
+
+From the next release onwards, each version gets its own heading.
 
 ---
 

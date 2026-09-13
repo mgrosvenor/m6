@@ -103,9 +103,8 @@ impl H2sTlsClientConn {
                 )
             })?;
 
-        let conn = ClientConnection::new(tls_config, server_name).map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("h2s: TLS init: {}", e))
-        })?;
+        let conn = ClientConnection::new(tls_config, server_name)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("h2s: TLS init: {}", e)))?;
 
         // Use StreamOwned for the blocking setup phase (TLS handshake + initial frames).
         let mut tls_stream = rustls::StreamOwned::new(conn, tcp);
@@ -187,7 +186,10 @@ impl H2sTlsClientConn {
         original_host: &str,
     ) -> io::Result<mpsc::Receiver<io::Result<HttpResponse>>> {
         if self.is_dead {
-            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "h2s: connection dead"));
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "h2s: connection dead",
+            ));
         }
 
         let stream_id = self.next_stream_id;
@@ -250,7 +252,11 @@ impl H2sTlsClientConn {
                 resp_body: vec![],
                 headers_done: false,
                 tx,
-                pending_body: if has_body { req.body.clone() } else { Vec::new() },
+                pending_body: if has_body {
+                    req.body.clone()
+                } else {
+                    Vec::new()
+                },
                 body_off: 0,
                 send_window: self.peer_initial_window,
             },
@@ -275,7 +281,9 @@ impl H2sTlsClientConn {
         let max_frame = (self.peer_max_frame as usize).max(1);
         loop {
             let (chunk, last) = {
-                let Some(s) = self.streams.get_mut(&stream_id) else { return };
+                let Some(s) = self.streams.get_mut(&stream_id) else {
+                    return;
+                };
                 let remaining = s.pending_body.len() - s.body_off;
                 if remaining == 0 {
                     return;
@@ -401,24 +409,20 @@ impl H2sTlsClientConn {
                     eof = Some("h2s: connection closed".to_string());
                     break;
                 }
-                Ok(_) => {
-                    match self.tls_conn.process_new_packets() {
-                        Ok(_) => {
-                            loop {
-                                match self.tls_conn.reader().read(&mut tmp) {
-                                    Ok(0) => break,
-                                    Ok(n) => self.recv_buf.extend_from_slice(&tmp[..n]),
-                                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                                    Err(_) => break,
-                                }
-                            }
+                Ok(_) => match self.tls_conn.process_new_packets() {
+                    Ok(_) => loop {
+                        match self.tls_conn.reader().read(&mut tmp) {
+                            Ok(0) => break,
+                            Ok(n) => self.recv_buf.extend_from_slice(&tmp[..n]),
+                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                            Err(_) => break,
                         }
-                        Err(e) => {
-                            eof = Some(format!("h2s: TLS process error: {}", e));
-                            break;
-                        }
+                    },
+                    Err(e) => {
+                        eof = Some(format!("h2s: TLS process error: {}", e));
+                        break;
                     }
-                }
+                },
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => {
                     eof = Some(format!("h2s: read error: {}", e));
@@ -785,7 +789,9 @@ pub struct H2sTlsClientPool {
 
 impl H2sTlsClientPool {
     pub fn new() -> Self {
-        Self { entries: HashMap::new() }
+        Self {
+            entries: HashMap::new(),
+        }
     }
 
     /// Dispatch a request to the named backend URL.
@@ -828,7 +834,8 @@ impl H2sTlsClientPool {
             }
             conn.drive();
         }
-        self.entries.retain(|_, c| !(c.is_dead && c.streams.is_empty()));
+        self.entries
+            .retain(|_, c| !(c.is_dead && c.streams.is_empty()));
     }
 }
 
@@ -848,15 +855,14 @@ pub fn parse_h2s_host_port(base_url: &str) -> io::Result<(String, u16)> {
     // IPv6: [::1]:port
     if let Some(bracket_end) = authority.find(']') {
         let host = authority[1..bracket_end].to_string();
-        let port = if bracket_end + 1 < authority.len()
-            && authority.as_bytes()[bracket_end + 1] == b':'
-        {
-            authority[bracket_end + 2..].parse::<u16>().map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "invalid port in h2s URL")
-            })?
-        } else {
-            443
-        };
+        let port =
+            if bracket_end + 1 < authority.len() && authority.as_bytes()[bracket_end + 1] == b':' {
+                authority[bracket_end + 2..].parse::<u16>().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "invalid port in h2s URL")
+                })?
+            } else {
+                443
+            };
         return Ok((host, port));
     }
 

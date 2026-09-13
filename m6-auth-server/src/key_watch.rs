@@ -10,7 +10,6 @@
 ///   issued access tokens expire naturally.  Refresh tokens are verified
 ///   against the *database* (hash match), not re-validated by JWT
 ///   signature, so old refresh tokens remain usable until they expire.
-
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
@@ -25,19 +24,36 @@ use crate::jwt::JwtEngine;
 /// The hot-swappable key material.  Wrapped in Arc<RwLock<>> so the
 /// watcher thread can replace it while request threads hold read locks.
 pub struct KeyMaterial {
-    pub jwt:            JwtEngine,
+    pub jwt: JwtEngine,
     pub public_key_pem: String,
 }
 
 impl KeyMaterial {
-    pub fn load(private_key_path: &std::path::Path, public_key_path: &std::path::Path, issuer: String) -> anyhow::Result<Self> {
-        let private_pem = std::fs::read_to_string(private_key_path)
-            .map_err(|e| anyhow::anyhow!("cannot read private key {}: {}", private_key_path.display(), e))?;
-        let public_pem = std::fs::read_to_string(public_key_path)
-            .map_err(|e| anyhow::anyhow!("cannot read public key {}: {}", public_key_path.display(), e))?;
+    pub fn load(
+        private_key_path: &std::path::Path,
+        public_key_path: &std::path::Path,
+        issuer: String,
+    ) -> anyhow::Result<Self> {
+        let private_pem = std::fs::read_to_string(private_key_path).map_err(|e| {
+            anyhow::anyhow!(
+                "cannot read private key {}: {}",
+                private_key_path.display(),
+                e
+            )
+        })?;
+        let public_pem = std::fs::read_to_string(public_key_path).map_err(|e| {
+            anyhow::anyhow!(
+                "cannot read public key {}: {}",
+                public_key_path.display(),
+                e
+            )
+        })?;
 
         let jwt = JwtEngine::new(&private_pem, &public_pem, issuer)?;
-        Ok(KeyMaterial { jwt, public_key_pem: public_pem })
+        Ok(KeyMaterial {
+            jwt,
+            public_key_pem: public_pem,
+        })
     }
 }
 
@@ -87,20 +103,20 @@ fn watch_loop_poll(
     let poll_interval = Duration::from_secs(5);
 
     let mut last_private = mtime(private_key_path);
-    let mut last_public  = mtime(public_key_path);
+    let mut last_public = mtime(public_key_path);
 
     loop {
         std::thread::sleep(poll_interval);
 
         let cur_private = mtime(private_key_path);
-        let cur_public  = mtime(public_key_path);
+        let cur_public = mtime(public_key_path);
 
         let changed = cur_private != last_private || cur_public != last_public;
 
         if changed {
             reload(private_key_path, public_key_path, issuer, keys);
             last_private = mtime(private_key_path);
-            last_public  = mtime(public_key_path);
+            last_public = mtime(public_key_path);
         }
     }
 }
@@ -140,7 +156,11 @@ fn watch_loop_inotify(
             Err(_) => return Err(()),
         };
         let wd = unsafe { libc::inotify_add_watch(inotify_fd, c_path.as_ptr(), mask) };
-        if wd < 0 { Err(()) } else { Ok(wd) }
+        if wd < 0 {
+            Err(())
+        } else {
+            Ok(wd)
+        }
     };
 
     let _wd1 = watch_dir(private_key_path).unwrap_or_else(|_| {
@@ -157,9 +177,7 @@ fn watch_loop_inotify(
 
     loop {
         // Blocking read; returns when at least one event is available.
-        let n = unsafe {
-            libc::read(inotify_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-        };
+        let n = unsafe { libc::read(inotify_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
         if n < 0 {
             let errno = unsafe { *libc::__errno_location() };
             if errno == libc::EINTR {
@@ -175,12 +193,10 @@ fn watch_loop_inotify(
         let mut offset = 0usize;
         let mut relevant = false;
         while offset + std::mem::size_of::<libc::inotify_event>() <= n as usize {
-            let event = unsafe {
-                &*(buf.as_ptr().add(offset) as *const libc::inotify_event)
-            };
+            let event = unsafe { &*(buf.as_ptr().add(offset) as *const libc::inotify_event) };
             let name_len = event.len as usize;
             let name_bytes = &buf[offset + std::mem::size_of::<libc::inotify_event>()
-                               ..offset + std::mem::size_of::<libc::inotify_event>() + name_len];
+                ..offset + std::mem::size_of::<libc::inotify_event>() + name_len];
             // Trim trailing NULs
             let name = std::ffi::CStr::from_bytes_until_nul(name_bytes)
                 .ok()
@@ -188,8 +204,14 @@ fn watch_loop_inotify(
                 .unwrap_or("");
 
             // Check whether the changed file matches our key filenames
-            let priv_name = private_key_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            let pub_name  = public_key_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            let priv_name = private_key_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            let pub_name = public_key_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
             if name == priv_name || name == pub_name {
                 relevant = true;
             }
@@ -215,21 +237,19 @@ fn reload(
     keys: &Arc<RwLock<KeyMaterial>>,
 ) {
     match KeyMaterial::load(private_key_path, public_key_path, issuer.to_string()) {
-        Ok(new_keys) => {
-            match keys.write() {
-                Ok(mut guard) => {
-                    *guard = new_keys;
-                    info!(
-                        private_key = %private_key_path.display(),
-                        public_key  = %public_key_path.display(),
-                        "key rotation: new keys loaded"
-                    );
-                }
-                Err(e) => {
-                    error!(error = %e, "key rotation: RwLock poisoned; cannot update keys");
-                }
+        Ok(new_keys) => match keys.write() {
+            Ok(mut guard) => {
+                *guard = new_keys;
+                info!(
+                    private_key = %private_key_path.display(),
+                    public_key  = %public_key_path.display(),
+                    "key rotation: new keys loaded"
+                );
             }
-        }
+            Err(e) => {
+                error!(error = %e, "key rotation: RwLock poisoned; cannot update keys");
+            }
+        },
         Err(e) => {
             error!(error = %e, "key rotation: failed to load new keys; continuing with current keys");
         }

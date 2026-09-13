@@ -35,8 +35,16 @@ pub fn choose_encoding(
     // Which codings are permitted for this MIME type, and at what level.
     let (br_level, gz_level) = match compression.get(mime_base) {
         Some(settings) => (
-            if settings.brotli > 0 { Some(settings.brotli) } else { None },
-            if settings.gzip > 0 { Some(settings.gzip) } else { None },
+            if settings.brotli > 0 {
+                Some(settings.brotli)
+            } else {
+                None
+            },
+            if settings.gzip > 0 {
+                Some(settings.gzip)
+            } else {
+                None
+            },
         ),
         None if m6_core::should_compress_default(mime_base) => (Some(6), Some(6)),
         None => (None, None),
@@ -51,7 +59,9 @@ pub fn choose_encoding(
     ];
     for (enc, level, name) in candidates {
         let Some(level) = level else { continue };
-        let Some(q) = coding_quality(accept_encoding, name) else { continue };
+        let Some(q) = coding_quality(accept_encoding, name) else {
+            continue;
+        };
         if best.as_ref().is_none_or(|(_, _, bq)| q > *bq) {
             best = Some((enc, Some(level), q));
         }
@@ -194,6 +204,9 @@ mod q_value_tests {
     #[test]
     fn uncompressible_types_stay_identity() {
         let c: HashMap<String, CompressionLevel> = HashMap::new();
-        assert_eq!(choose_encoding("image/png", "br, gzip", &c).0, Encoding::Identity);
+        assert_eq!(
+            choose_encoding("image/png", "br, gzip", &c).0,
+            Encoding::Identity
+        );
     }
 }

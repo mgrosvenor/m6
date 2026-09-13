@@ -1,4 +1,11 @@
-/// Brotli and gzip compression helpers.
+//! Brotli and gzip compression.
+//!
+//! Compression is applied after minification, and only to types the config
+//! names. Which coding to use is not decided here: that is `negotiate`, which
+//! reads the client's `Accept-Encoding` q-values. Keeping the two apart is
+//! deliberate, because deciding and doing were once the same function in three
+//! places and they disagreed.
+
 use std::io::Write;
 
 use anyhow::Context;
@@ -10,10 +17,8 @@ pub fn brotli_compress(data: &[u8], quality: u32) -> anyhow::Result<Vec<u8>> {
     let mut out = Vec::with_capacity(data.len() / 2 + 128);
     {
         let mut writer = CompressorWriter::new(
-            &mut out,
-            4096,    // buffer size
-            quality,
-            22,      // lgwin (window size)
+            &mut out, 4096, // buffer size
+            quality, 22, // lgwin (window size)
         );
         writer.write_all(data).context("brotli compress write")?;
     }

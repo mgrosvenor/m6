@@ -191,7 +191,10 @@ role = "cache"
             role: "cache".into(),
             perf_token_file: Some(per_node.path().to_string_lossy().to_string()),
         };
-        assert_eq!(n.perf_token(Some("fleet-token")).as_deref(), Some("node-token"));
+        assert_eq!(
+            n.perf_token(Some("fleet-token")).as_deref(),
+            Some("node-token")
+        );
 
         let bare = Node {
             name: "syd".into(),
@@ -199,7 +202,10 @@ role = "cache"
             role: "origin".into(),
             perf_token_file: None,
         };
-        assert_eq!(bare.perf_token(Some("fleet-token")).as_deref(), Some("fleet-token"));
+        assert_eq!(
+            bare.perf_token(Some("fleet-token")).as_deref(),
+            Some("fleet-token")
+        );
         assert_eq!(bare.perf_token(None), None);
     }
 

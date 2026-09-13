@@ -1,15 +1,74 @@
-# The ledger: what is done, and what is not
+# The ledger: what is done, and what is owed
 
-Rewritten 2026-09-11 after an audit against the commit log rather than from
-memory. Three items here were marked open while already done, and about ten
-pieces of work were not recorded at all.
+**`HANDOVER.md` is what is true. This is what is owed.** Read that first; it is
+written for someone with no prior context.
 
-**`HANDOVER.md` is what is true. This is what is owed.**
+Status block below rewritten 2026-09-13. The sections after it are the detailed
+history, kept because the reasoning in them is usually the only record of why
+something is shaped the way it is.
 
 Ordering principle, the owner's: **m6-core is the PHP of m6, a box of blocks a
-service is assembled from.** Anything we can reasonably expect to generalise to
-other sites and instances belongs in core, and core should be the only thing a
-service links.
+service is assembled from.** Anything that can reasonably be expected to
+generalise belongs in core, and core should be the only thing a service links.
+
+---
+
+## STATUS, 2026-09-13
+
+### The road to 1.0, in agreed order
+
+1.0 is **not cut until the consolidation work is done**. Owner's decision,
+recorded beside the version in `Cargo.toml`.
+
+| # | item | state |
+|---|---|---|
+| 1 | **Drive clippy to zero** | not started. 135 macOS / 145 Linux. Most are mechanical; `cargo clippy --fix` handles a large share. |
+| 2 | **quiche 0.26.1 → 0.29.3, re-measure h3** | not started. All twelve h3 failures are inside quiche, not m6. One CI run to find out. |
+| 3 | **Renderers onto a git dependency pinned to a tag** | not started. This is Phase 7. Owner's call 2026-09-13: **a git tag, NOT crates.io.** Publishing would mean owning a public API, a name and maintenance for other people. m6-http already takes quiche this way. |
+| 4 | **Phase 8: six `/status` implementations** | not started. Needs `apt install golang` on the build host, nothing more. |
+| 5 | **Deploy, lifting the freeze** | blocked on 1-4 and on the m6-file config/binary sequencing. Not a code task. |
+
+### Done in the 2026-09-12 and -13 sessions
+
+Everything here is on `develop` or on the unmerged CI branch. None of it is
+deployed.
+
+| area | what landed |
+|---|---|
+| **Config-driven routes** | `App::handler(name, f)` plus `handler = "..."` on `[[route]]`, rebuilt on every reload. The owner's *"dynamicly reload the file list"*. Unknown handler name is fatal at startup and refuses a reload. |
+| **Both migrations** | `m6-file` and `m6-auth-server` are `App` services. m6-file lost 969 lines including a second router and a second config parser; m6-auth-server's main is 116 lines. |
+| **Streaming bodies** | `Response.body` is `Bytes` or `Stream { len, reader }`. A stream structurally has no bytes for the minifier, compressor or default ETag to touch. |
+| **Copy elimination** | Core's per-request copying went from ~442us to ~1.58us. `m6-core/src/dict.rs` is a shared base plus a per-request overlay. See `docs/PERFORMANCE.md`. |
+| **§3a resolved** | The cache-hit p50 was never a code regression. It is load-dependent. |
+| **`watcher.rs` on `nix`** | Zero `unsafe` in production code, down from 390 lines of raw libc. Retires the alignment UB lesson. |
+| **Real conformance checks** | h1, h2 and h3 all measured, against a two-backend edge. Previously h2 and h3 were skipped silently on every run. |
+| **CI on GitHub Actions** | Every push and PR. Found four real problems on its first three runs. |
+| **Branch model** | `main` releases only, `develop` integration, one branch per issue, enforced by `.githooks/pre-push`. |
+| **Project hygiene** | rustfmt accepted, `cargo deny`, MSRV 1.88 declared and tested, versions aligned at 0.2.0, CHANGELOG by release, CONTRIBUTING and SECURITY. |
+| **§3d decided** | A configured-but-failed bind is fatal; an unconfigured listener is not a bind. |
+| **Production hardening** | `UMask=0027`, `LimitNOFILE=65535` (site repo, undeployed). |
+| **Documentation** | 16 module docs written, `docs/PERFORMANCE.md`, `docs/LESSONS.md`, `docs/SESSION-NOTES.md`, `CLAUDE.md`. |
+
+### Deferred by the owner, not in 1.0
+
+The **event loop** and the **handler contract**, explicitly. The IO layer is in
+scope as low-touch consolidation but is not started. See §3b.
+
+### Still owed, not on the 1.0 path
+
+- `FrameworkState::build_dict` is private; the twelve ordered steps are not
+  reusable by a service not using `App`. §1.
+- `m6-monitor` and the firewall stats collector are deployed nowhere.
+- `tools/health-check.py` cannot be retired until those are deployed and a
+  post-freeze binary is on the nodes.
+- Staging cannot exercise the cache role.
+- The hourly prompt's `hit_p50_ns` baseline is wrong now that §3a is
+  understood. Owner's file to change.
+- Four `cargo deny` advisories whose reachability has never been established
+  (issue #3).
+- GitHub branch protection on `main`.
+
+---
 
 ---
 

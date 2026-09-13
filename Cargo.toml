@@ -11,3 +11,29 @@ members = [
     "m6-md",
 ]
 resolver = "2"
+
+# Shared by every crate in the workspace, so they cannot drift apart. Each
+# member inherits with `version.workspace = true` and friends.
+#
+# The version matches the newest tag. `tools/release.sh` bumps it as part of
+# cutting a release, so the tag and the crates always agree at a release point.
+# Before this they did not: the tag said v0.2.0 and every crate said 0.1.0.
+#
+# 1.0.0 IS THE TARGET, AND IT IS NOT CUT UNTIL THE CONSOLIDATION WORK IS DONE.
+# Owner's decision, 2026-09-13. What is outstanding is in
+# docs/CONSOLIDATION-TODO.md; the short version is phase 7 (decoupling the
+# repositories), phase 8, and the deployment of everything currently sitting
+# undeployed on develop.
+[workspace.package]
+version      = "0.2.0"
+edition      = "2021"
+# The oldest toolchain we test. Declared because declaring one and not testing
+# it is a claim rather than a fact: CI builds the whole workspace with exactly
+# this version, and that is how this number was found rather than guessed. The
+# guess was 1.85, on the basis that `is_none_or` (1.82) is the newest standard
+# library call we make. CI answered with the real constraint, which is the
+# dependencies: globset and the icu_* crates require 1.88.
+rust-version = "1.88"
+license      = "BSD-3-Clause"
+authors      = ["Matthew P. Grosvenor"]
+repository   = "https://github.com/mgrosvenor/m6"

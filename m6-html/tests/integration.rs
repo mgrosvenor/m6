@@ -20,7 +20,9 @@ struct Server {
 }
 
 fn fixtures_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures")
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
 }
 
 fn config_path() -> PathBuf {
@@ -85,11 +87,14 @@ fn http_request(socket_path: &Path, request: &str) -> String {
         Err(_) => return String::new(),
     };
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
-    if stream.write_all(request.as_bytes()).is_err() { return String::new(); }
+    if stream.write_all(request.as_bytes()).is_err() {
+        return String::new();
+    }
     // One response, not read-to-EOF: the connection stays open (RFC 9112 9.3),
     // so waiting for a close waits for the idle timeout.
     stream.shutdown(std::net::Shutdown::Write).ok();
-    let response = m6_core::testkit::read_one(&mut stream, request.split(' ').next().unwrap_or("")).unwrap_or_default();
+    let response = m6_core::testkit::read_one(&mut stream, request.split(' ').next().unwrap_or(""))
+        .unwrap_or_default();
     String::from_utf8_lossy(&response).into_owned()
 }
 
@@ -101,17 +106,20 @@ fn http_request_bytes(socket_path: &Path, request: &str) -> Vec<u8> {
         Err(_) => return Vec::new(),
     };
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
-    if stream.write_all(request.as_bytes()).is_err() { return Vec::new(); }
+    if stream.write_all(request.as_bytes()).is_err() {
+        return Vec::new();
+    }
     stream.shutdown(std::net::Shutdown::Write).ok();
-    m6_core::testkit::read_one(&mut stream, request.split(' ').next().unwrap_or("")).unwrap_or_default()
+    m6_core::testkit::read_one(&mut stream, request.split(' ').next().unwrap_or(""))
+        .unwrap_or_default()
 }
 
 /// Return just the body bytes from a raw HTTP response bytes (after \r\n\r\n).
 fn response_body_bytes(raw: &[u8]) -> Vec<u8> {
     // Find the double CRLF separator.
     for i in 0..raw.len().saturating_sub(3) {
-        if raw[i] == b'\r' && raw[i+1] == b'\n' && raw[i+2] == b'\r' && raw[i+3] == b'\n' {
-            return raw[i+4..].to_vec();
+        if raw[i] == b'\r' && raw[i + 1] == b'\n' && raw[i + 2] == b'\r' && raw[i + 3] == b'\n' {
+            return raw[i + 4..].to_vec();
         }
     }
     vec![]
@@ -120,7 +128,7 @@ fn response_body_bytes(raw: &[u8]) -> Vec<u8> {
 /// Return just the header section (before the blank line) as a string.
 fn response_headers_str(raw: &[u8]) -> String {
     for i in 0..raw.len().saturating_sub(3) {
-        if raw[i] == b'\r' && raw[i+1] == b'\n' && raw[i+2] == b'\r' && raw[i+3] == b'\n' {
+        if raw[i] == b'\r' && raw[i + 1] == b'\n' && raw[i + 2] == b'\r' && raw[i + 3] == b'\n' {
             return String::from_utf8_lossy(&raw[..i]).to_string();
         }
     }
@@ -135,7 +143,11 @@ fn response_headers_str(raw: &[u8]) -> String {
 #[test]
 fn l1_valid_config_starts_and_socket_appears() {
     let (_guard, socket_path) = spawn_server("l1-start");
-    assert!(socket_path.exists(), "socket should exist at {:?}", socket_path);
+    assert!(
+        socket_path.exists(),
+        "socket should exist at {:?}",
+        socket_path
+    );
 }
 
 /// secrets_file pointing at a non-existent path is silently ignored.
@@ -143,14 +155,21 @@ fn l1_valid_config_starts_and_socket_appears() {
 fn l1_secrets_file_absent_still_starts() {
     // The fixture config already has secrets_file = "/nonexistent/path/secrets.toml"
     let (_guard, socket_path) = spawn_server("l1-secrets-absent");
-    assert!(socket_path.exists(), "server should start even when secrets_file is absent");
+    assert!(
+        socket_path.exists(),
+        "server should start even when secrets_file is absent"
+    );
 
     // Make a request to confirm it actually serves.
     let resp = http_request(
         &socket_path,
         "GET /blog HTTP/1.1\r\nHost: localhost\r\n\r\n",
     );
-    assert!(resp.contains("200 OK"), "expected 200, got: {}", &resp[..resp.len().min(300)]);
+    assert!(
+        resp.contains("200 OK"),
+        "expected 200, got: {}",
+        &resp[..resp.len().min(300)]
+    );
 }
 
 /// SIGTERM causes the process to exit cleanly (exit code 0).
@@ -196,7 +215,11 @@ fn l2_exact_route_matched_for_blog() {
         &socket_path,
         "GET /blog HTTP/1.1\r\nHost: localhost\r\n\r\n",
     );
-    assert!(resp.contains("200 OK"), "expected 200, got: {}", &resp[..resp.len().min(300)]);
+    assert!(
+        resp.contains("200 OK"),
+        "expected 200, got: {}",
+        &resp[..resp.len().min(300)]
+    );
     // The post-index template contains "Posts"
     assert!(resp.contains("Posts"), "expected post-index content");
 }
@@ -210,8 +233,16 @@ fn l2_parameterised_route_extracts_stem() {
         &socket_path,
         "GET /blog/hello-world HTTP/1.1\r\nHost: localhost\r\n\r\n",
     );
-    assert!(resp.contains("200 OK"), "expected 200, got: {}", &resp[..resp.len().min(300)]);
-    assert!(resp.contains("Stem: hello-world"), "expected stem in body, got: {}", &resp);
+    assert!(
+        resp.contains("200 OK"),
+        "expected 200, got: {}",
+        &resp[..resp.len().min(300)]
+    );
+    assert!(
+        resp.contains("Stem: hello-world"),
+        "expected stem in body, got: {}",
+        &resp
+    );
 }
 
 /// An unknown path returns 404.
@@ -223,7 +254,11 @@ fn l2_unknown_path_returns_404() {
         &socket_path,
         "GET /no-such-path HTTP/1.1\r\nHost: localhost\r\n\r\n",
     );
-    assert!(resp.contains("404"), "expected 404, got: {}", &resp[..resp.len().min(300)]);
+    assert!(
+        resp.contains("404"),
+        "expected 404, got: {}",
+        &resp[..resp.len().min(300)]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -243,7 +278,10 @@ fn l3_global_and_route_params_merged() {
     );
     assert!(resp.contains("200 OK"), "expected 200");
     // title from route params
-    assert!(resp.contains("Hello World"), "expected title from route params");
+    assert!(
+        resp.contains("Hello World"),
+        "expected title from route params"
+    );
 }
 
 /// A missing params file causes the server to return 500 (params load fails
@@ -327,10 +365,7 @@ fn l5_request_path_built_in_key() {
     // home.html does reference request_path, but the route requires content/pages/index.json.
     // The server will render the template even if that file is missing (static params silently
     // logged at startup as error, then rendered with empty params).
-    let resp = http_request(
-        &socket_path,
-        "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n",
-    );
+    let resp = http_request(&socket_path, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
     // We should get a 200 (home template renders with empty params for missing index.json)
     // and the request_path built-in should appear.
     assert!(resp.contains("200 OK"), "expected 200 for /");
@@ -368,10 +403,7 @@ fn l5_error_route_gets_status_and_from() {
 fn l5_site_name_from_global_params() {
     let (_guard, socket_path) = spawn_server("l5-sitename");
 
-    let resp = http_request(
-        &socket_path,
-        "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n",
-    );
+    let resp = http_request(&socket_path, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
     assert!(resp.contains("200 OK"), "expected 200");
     assert!(
         resp.contains("Test Site"),
@@ -432,7 +464,11 @@ fn l7_brotli_compression() {
         "GET /blog HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: br\r\n\r\n",
     );
     let headers = response_headers_str(&raw);
-    assert!(headers.contains("200 OK"), "expected 200, got: {}", &headers[..headers.len().min(300)]);
+    assert!(
+        headers.contains("200 OK"),
+        "expected 200, got: {}",
+        &headers[..headers.len().min(300)]
+    );
     assert!(
         headers.to_lowercase().contains("content-encoding: br"),
         "expected brotli encoding, got headers:\n{}",
@@ -460,7 +496,11 @@ fn l7_gzip_compression() {
         "GET /blog HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: gzip\r\n\r\n",
     );
     let headers = response_headers_str(&raw);
-    assert!(headers.contains("200 OK"), "expected 200, got: {}", &headers[..headers.len().min(300)]);
+    assert!(
+        headers.contains("200 OK"),
+        "expected 200, got: {}",
+        &headers[..headers.len().min(300)]
+    );
     assert!(
         headers.to_lowercase().contains("content-encoding: gzip"),
         "expected gzip encoding, got headers:\n{}",
@@ -471,7 +511,10 @@ fn l7_gzip_compression() {
     let body_bytes = response_body_bytes(&raw);
     let decompressed = gzip_decompress(&body_bytes);
     let html = String::from_utf8_lossy(&decompressed);
-    assert!(html.contains("Posts"), "decompressed gzip body should contain 'Posts'");
+    assert!(
+        html.contains("Posts"),
+        "decompressed gzip body should contain 'Posts'"
+    );
 }
 
 /// No Accept-Encoding → identity (no Content-Encoding header).
@@ -490,7 +533,10 @@ fn l7_no_compression_without_accept_encoding() {
         &resp[..resp.find("\r\n\r\n").unwrap_or(resp.len().min(500))]
     );
     // Body should be plain HTML.
-    assert!(resp.contains("Posts"), "body should contain template content");
+    assert!(
+        resp.contains("Posts"),
+        "body should contain template content"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -506,9 +552,18 @@ fn l8_concurrent_requests_all_routes() {
 
     let routes = vec![
         ("GET /blog HTTP/1.1\r\nHost: localhost\r\n\r\n", "200 OK"),
-        ("GET /blog/hello-world HTTP/1.1\r\nHost: localhost\r\n\r\n", "200 OK"),
-        ("GET /_errors?status=404&from=/x HTTP/1.1\r\nHost: localhost\r\n\r\n", "200 OK"),
-        ("GET /no-such-path HTTP/1.1\r\nHost: localhost\r\n\r\n", "404"),
+        (
+            "GET /blog/hello-world HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "200 OK",
+        ),
+        (
+            "GET /_errors?status=404&from=/x HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "200 OK",
+        ),
+        (
+            "GET /no-such-path HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "404",
+        ),
     ];
 
     for i in 0..100 {
@@ -559,7 +614,9 @@ fn brotli_decompress(data: &[u8]) -> Vec<u8> {
     use std::io::Read;
     let mut out = Vec::new();
     let mut reader = brotli::Decompressor::new(data, 4096);
-    reader.read_to_end(&mut out).expect("brotli decompress failed");
+    reader
+        .read_to_end(&mut out)
+        .expect("brotli decompress failed");
     out
 }
 
@@ -567,6 +624,8 @@ fn gzip_decompress(data: &[u8]) -> Vec<u8> {
     use std::io::Read;
     let mut decoder = flate2::read::GzDecoder::new(data);
     let mut out = Vec::new();
-    decoder.read_to_end(&mut out).expect("gzip decompress failed");
+    decoder
+        .read_to_end(&mut out)
+        .expect("gzip decompress failed");
     out
 }
