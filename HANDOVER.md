@@ -5,7 +5,10 @@ to bottom before touching anything. It is what is true right now.
 
 Then: `CLAUDE.md` for the rules, `docs/CONSOLIDATION-TODO.md` for what is owed.
 
-Last rewritten 2026-09-13.
+Last rewritten 2026-09-13. **Every factual claim in it was checked against the
+repository, the fleet and the GitHub API on that date**, not written from
+memory. That pass found two claims wrong and one bug; all three are corrected
+below.
 
 ---
 
@@ -138,8 +141,8 @@ tree, which it has already caught me doing.
 | site | `main` | `e9f11c2` |
 | site | `develop` | `0b04e67`, pushed |
 
-**CI has never run on `develop`.** It was added on a branch. The first push to
-`develop` will be its first run there.
+**CI runs on `develop` now**, from 2026-09-13. It was added on a branch, so
+before that push it had never run there.
 
 ### What is deployed
 
@@ -162,7 +165,7 @@ Run everything: `cd ~/dr-grosvenor-site && ./deploy/run-tests.sh m6`.
 
 | check | state | where it runs |
 |---|---|---|
-| tests | **1022 passing**, 0 failures | everywhere |
+| tests | **1022 passing**, 0 failures, verified over three consecutive runs | everywhere |
 | compiler warnings | **0**, release and test builds | Linux, enforced |
 | clippy | **135 macOS / 145 Linux** | `tools/clippy.sh` |
 | `cargo fmt` | clean | CI, `check.sh` |
@@ -378,9 +381,29 @@ Full list, all 49, in `docs/LESSONS.md`.
 
 - **`m6-auth-cli`'s `test_token_create_prints_jwt`** fails intermittently and
   has never been explained. Did not recur on 2026-09-12 or -13.
-- **A port race in the e2e suites.** `Address already in use` on m6-http's TCP
-  listener, seen after `SO_REUSEADDR` was believed to have closed it. Clean on
-  re-runs.
+- ~~**A port race in the e2e suites.**~~ **FIXED 2026-09-13**, and worth
+  reading because two different races were being conflated.
+
+  `SO_REUSEADDR` fixes rebinding a port in `TIME_WAIT`: a socket closed but
+  lingering. That was real and is fixed. It cannot fix a port another process
+  is *actively listening on*, and refusing that is the whole point of the
+  check.
+
+  The remaining failure was the second kind. `PortClaim::drop` removed its
+  marker file immediately, but the marker only guarantees no other *test* picks
+  the port. It says nothing about whether the *service* that was using it has
+  exited. A claim dropped while its process was still shutting down freed the
+  marker, the next test claimed the port, and its service could not bind.
+
+  It was survivable while a failed bind was a warning: the process came up with
+  no listener and the test failed later with "never served a backend request",
+  naming the symptom rather than the cause. **Making a failed bind fatal (§3d)
+  turned it into an immediate honest failure**, which is what surfaced it.
+
+  `PortClaim::drop` now waits until the port genuinely binds before releasing
+  the marker, bounded at five seconds so something outside the suite cannot
+  hang the run. The race is contained in the primitive rather than depending on
+  every test declaring its fields in the right drop order.
 - **Four `cargo deny` advisories** listed as exceptions in `deny.toml`, issue
   #3. **Their reachability has never been established**; that issue was written
   before checking, which is the same mistake made with a fifth. That fifth,
@@ -389,7 +412,8 @@ Full list, all 49, in `docs/LESSONS.md`.
   pinned by `http2::hpack_robustness`. Do the same for the other four rather
   than trusting the issue text.
 - **GitHub issues**: #1 (CI, done, close it) and #3 (above).
-- **GitHub branch protection on `main` is not set.** The hooks protect one
+- **GitHub branch protection on `main` is not set**, confirmed against the
+  API: `Branch not protected`. The hooks protect one
   laptop. Setting it needs the owner's go-ahead because it changes how the
   repository behaves for everyone.
 - **`FrameworkState::build_dict` is private**, so the twelve ordered steps of
