@@ -89,7 +89,8 @@ fn it_answers_a_redirect_before_it_is_stopped() {
     let (mut svc, claim, _dir) = start();
 
     let mut s = TcpStream::connect(("127.0.0.1", claim.port())).expect("connect");
-    s.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
+    s.set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
     s.write_all(b"GET /capabilities HTTP/1.1\r\nHost: example.com\r\n\r\n")
         .expect("write");
     // One response, not read-to-EOF: HTTP/1.1 is persistent by default (RFC
@@ -107,7 +108,8 @@ fn it_answers_a_redirect_before_it_is_stopped() {
 
     assert!(resp.starts_with("HTTP/1.1 301 "), "got: {resp}");
     assert!(
-        resp.to_ascii_lowercase().contains("location: https://example.com/capabilities"),
+        resp.to_ascii_lowercase()
+            .contains("location: https://example.com/capabilities"),
         "got: {resp}"
     );
 

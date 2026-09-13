@@ -1,6 +1,19 @@
-/// Path validation and resolution utilities.
-
-
+//! Is this path parameter safe to use?
+//!
+//! **The single implementation.** There were three and they disagreed on real
+//! input: one rejected a leading slash and excluded `.`, one allowed `a..b`
+//! inside a component, and one returned `Ok` with no character validation at
+//! all for any parameter that happened to be named `relpath`.
+//!
+//! Path traversal safety is not something to hold three opinions about.
+//! Allowed: alphanumeric, `-`, `_`, `.`, and `/` when the caller says the
+//! value spans segments. Rejected: `..` anywhere as a substring, a leading or
+//! trailing slash, and every other byte including space, control characters
+//! and NUL.
+//!
+//! Whether slashes are allowed is decided by the **route**, not by the
+//! parameter's name: a `{*name}` wildcard capture spans segments and an
+//! ordinary `{name}` does not.
 
 #[derive(Debug, thiserror::Error)]
 pub enum PathParamError {
@@ -98,16 +111,46 @@ mod tests {
             ("hello-world", false, true, "all agreed"),
             ("style.css", false, true, "m6-core used to reject the dot"),
             ("a/b/c", true, true, "all agreed"),
-            ("/leading", true, false, "m6-render and m6-file used to allow it"),
-            ("trailing/", true, false, "m6-render and m6-file used to allow it"),
-            ("a b", false, false, "m6-render relpath used to allow a space"),
-            ("a\u{0}b", false, false, "m6-render relpath used to allow NUL"),
-            ("a\nb", false, false, "m6-render relpath used to allow a newline"),
+            (
+                "/leading",
+                true,
+                false,
+                "m6-render and m6-file used to allow it",
+            ),
+            (
+                "trailing/",
+                true,
+                false,
+                "m6-render and m6-file used to allow it",
+            ),
+            (
+                "a b",
+                false,
+                false,
+                "m6-render relpath used to allow a space",
+            ),
+            (
+                "a\u{0}b",
+                false,
+                false,
+                "m6-render relpath used to allow NUL",
+            ),
+            (
+                "a\nb",
+                false,
+                false,
+                "m6-render relpath used to allow a newline",
+            ),
             ("..", false, false, "all agreed"),
             ("../etc/passwd", true, false, "all agreed"),
             ("a..b", true, false, "m6-file allowed it inside a component"),
             ("a/../b", true, false, "all agreed"),
-            ("%2e%2e", false, false, "not decoded here, and % is not allowed"),
+            (
+                "%2e%2e",
+                false,
+                false,
+                "not decoded here, and % is not allowed",
+            ),
             ("a/b", false, false, "slash needs allow_slash"),
         ];
         for (value, allow_slash, expect_ok, why) in cases {
@@ -136,7 +179,10 @@ mod tests {
 
     #[test]
     fn test_validate_path_param_valid_simple() {
-        assert_eq!(validate_path_param("hello-world_123", false).unwrap(), "hello-world_123");
+        assert_eq!(
+            validate_path_param("hello-world_123", false).unwrap(),
+            "hello-world_123"
+        );
     }
 
     #[test]
@@ -182,8 +228,4 @@ mod tests {
             Err(PathParamError::InvalidChars)
         ));
     }
-
-
-
-
 }

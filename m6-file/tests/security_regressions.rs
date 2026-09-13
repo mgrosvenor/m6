@@ -18,12 +18,22 @@ use serde_json::{json, Map};
 
 /// The `Request` the service loop hands the handler: route settings from
 /// config, path parameters from core's router.
-fn request(path: &str, query: &str, site_dir: &std::path::Path, tail: bool, relpath: &str) -> Request {
+fn request(
+    path: &str,
+    query: &str,
+    site_dir: &std::path::Path,
+    tail: bool,
+    relpath: &str,
+) -> Request {
     let raw = RawRequest {
         version: "HTTP/1.1".to_string(),
         method: "GET".to_string(),
         path: path.to_string(),
-        query: if query.is_empty() { None } else { Some(query.to_string()) },
+        query: if query.is_empty() {
+            None
+        } else {
+            Some(query.to_string())
+        },
         headers: vec![],
         body: vec![],
     };
@@ -60,10 +70,20 @@ fn wire(req: &Request) -> (u16, Vec<u8>) {
         let mut r = m6_core::h1::Responder::new(&mut out, req.method(), false);
         resp.send(&mut r).expect("send");
     }
-    let sep = out.windows(4).position(|w| w == b"\r\n\r\n").expect("header terminator");
+    let sep = out
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("header terminator");
     let head = std::str::from_utf8(&out[..sep]).expect("headers are ASCII");
-    let status: u16 =
-        head.lines().next().unwrap().split_whitespace().nth(1).unwrap().parse().unwrap();
+    let status: u16 = head
+        .lines()
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap();
     (status, out[sep + 4..].to_vec())
 }
 
@@ -91,7 +111,10 @@ fn finding_9_tail_route_must_refuse_symlink_outside_site_dir() {
         b"ESCAPED SECRET".to_vec(),
         "a tail route served a file from outside site_dir via symlink"
     );
-    assert_eq!(status, 404, "the escaping symlink should be refused with 404");
+    assert_eq!(
+        status, 404,
+        "the escaping symlink should be refused with 404"
+    );
 }
 
 /// The identical symlink *is* correctly refused on a non-tail route, which
@@ -99,6 +122,15 @@ fn finding_9_tail_route_must_refuse_symlink_outside_site_dir() {
 #[test]
 fn finding_9_control_non_tail_route_refuses_same_symlink() {
     let (_guard, site_dir) = site_with_escaping_symlink();
-    let (status, _) = wire(&request("/logs/escape.log", "", &site_dir, false, "escape.log"));
-    assert_eq!(status, 404, "the non-tail path correctly rejects the escaping symlink");
+    let (status, _) = wire(&request(
+        "/logs/escape.log",
+        "",
+        &site_dir,
+        false,
+        "escape.log",
+    ));
+    assert_eq!(
+        status, 404,
+        "the non-tail path correctly rejects the escaping symlink"
+    );
 }

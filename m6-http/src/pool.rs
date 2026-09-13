@@ -20,7 +20,12 @@ struct PoolMember {
 
 impl PoolMember {
     fn new(path: PathBuf) -> Self {
-        PoolMember { path, connections: 0, retry_at: None, failure_count: 0 }
+        PoolMember {
+            path,
+            connections: 0,
+            retry_at: None,
+            failure_count: 0,
+        }
     }
 
     fn is_available(&self) -> bool {
@@ -60,7 +65,11 @@ pub struct BackendPool {
 
 impl BackendPool {
     pub fn new(name: String, socket_glob: String) -> Self {
-        BackendPool { name, socket_glob, members: Vec::new() }
+        BackendPool {
+            name,
+            socket_glob,
+            members: Vec::new(),
+        }
     }
 
     /// Add a socket path to the pool (if not already present).
@@ -302,7 +311,10 @@ pub struct PoolManager {
 
 impl PoolManager {
     pub fn new() -> Self {
-        PoolManager { pools: Vec::new(), url_backends: Vec::new() }
+        PoolManager {
+            pools: Vec::new(),
+            url_backends: Vec::new(),
+        }
     }
 
     pub fn from_config(backends: &[BackendConfig]) -> Self {
@@ -331,7 +343,10 @@ impl PoolManager {
     }
 
     pub fn get_pool_mut(&mut self, name: &str) -> Option<&mut BackendPool> {
-        self.pools.iter_mut().find(|(n, _)| n == name).map(|(_, p)| p)
+        self.pools
+            .iter_mut()
+            .find(|(n, _)| n == name)
+            .map(|(_, p)| p)
     }
 
     pub fn get_pool(&self, name: &str) -> Option<&BackendPool> {
@@ -339,14 +354,21 @@ impl PoolManager {
     }
 
     pub fn get_url(&self, name: &str) -> Option<&str> {
-        self.url_backends.iter().find(|b| b.name == name).map(|b| b.url.as_str())
+        self.url_backends
+            .iter()
+            .find(|b| b.name == name)
+            .map(|b| b.url.as_str())
     }
 
     /// Returns (url, tls_config, skip_verify) for a URL backend.
-    pub fn get_url_info(&self, name: &str) -> Option<(&str, std::sync::Arc<rustls::ClientConfig>, bool)> {
-        self.url_backends.iter().find(|b| b.name == name).map(|b| {
-            (b.url.as_str(), b.tls_config.clone(), b.skip_verify)
-        })
+    pub fn get_url_info(
+        &self,
+        name: &str,
+    ) -> Option<(&str, std::sync::Arc<rustls::ClientConfig>, bool)> {
+        self.url_backends
+            .iter()
+            .find(|b| b.name == name)
+            .map(|b| (b.url.as_str(), b.tls_config.clone(), b.skip_verify))
     }
 
     /// Handle a socket appearing — add to matching pool.
@@ -425,7 +447,10 @@ mod tests {
         // Create a dummy file (not a real socket, but tests add/remove logic)
         std::fs::write(&sock_path, "").unwrap();
 
-        let mut pool = BackendPool::new("test".to_string(), format!("{}/*.sock", dir.path().display()));
+        let mut pool = BackendPool::new(
+            "test".to_string(),
+            format!("{}/*.sock", dir.path().display()),
+        );
         pool.add_socket(sock_path.clone());
         assert_eq!(pool.total_count(), 1);
 
@@ -466,7 +491,8 @@ mod tests {
     #[test]
     fn test_pool_manager_socket_disappeared() {
         let mut mgr = PoolManager::new();
-        let mut pool = BackendPool::new("m6-html".to_string(), "/run/m6/m6-html-*.sock".to_string());
+        let mut pool =
+            BackendPool::new("m6-html".to_string(), "/run/m6/m6-html-*.sock".to_string());
         pool.add_socket(PathBuf::from("/run/m6/m6-html-1.sock"));
         mgr.add_pool(pool);
 

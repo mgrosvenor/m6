@@ -105,7 +105,11 @@ impl RouteTable {
             };
             // matchit returns error on duplicate; we already validate in config
             if let Err(e) = router.insert(route.path.clone(), entry.clone()) {
-                return Err(anyhow::anyhow!("router insert error for {}: {}", route.path, e));
+                return Err(anyhow::anyhow!(
+                    "router insert error for {}: {}",
+                    route.path,
+                    e
+                ));
             }
             entries.push(entry);
         }
@@ -115,7 +119,11 @@ impl RouteTable {
             let glob_pattern = if std::path::Path::new(&rg.glob).is_absolute() {
                 rg.glob.clone()
             } else {
-                config.site_dir.join(&rg.glob).to_string_lossy().into_owned()
+                config
+                    .site_dir
+                    .join(&rg.glob)
+                    .to_string_lossy()
+                    .into_owned()
             };
 
             let paths = match glob::glob(&glob_pattern) {
@@ -158,7 +166,11 @@ impl RouteTable {
         }
 
         let has_protected_routes = entries.iter().any(|e| e.require.is_some());
-        Ok(RouteTable { router, entries, has_protected_routes })
+        Ok(RouteTable {
+            router,
+            entries,
+            has_protected_routes,
+        })
     }
 
     /// Match a request path. Returns the matched RouteEntry if found.
@@ -213,11 +225,17 @@ impl RouteTable {
                 backend: "bench".to_string(),
                 require: require.map(str::to_string),
             };
-            router.insert(path.to_string(), entry.clone()).expect("bench route insert");
+            router
+                .insert(path.to_string(), entry.clone())
+                .expect("bench route insert");
             entries.push(entry);
         }
         let has_protected_routes = entries.iter().any(|e| e.require.is_some());
-        RouteTable { router, entries, has_protected_routes }
+        RouteTable {
+            router,
+            entries,
+            has_protected_routes,
+        }
     }
 
     /// Number of routes.
@@ -242,7 +260,11 @@ pub fn build_invalidation_map(config: &Config) -> HashMap<String, Vec<String>> {
         let glob_pattern = if std::path::Path::new(&rg.glob).is_absolute() {
             rg.glob.clone()
         } else {
-            config.site_dir.join(&rg.glob).to_string_lossy().into_owned()
+            config
+                .site_dir
+                .join(&rg.glob)
+                .to_string_lossy()
+                .into_owned()
         };
 
         let paths = match glob::glob(&glob_pattern) {
@@ -265,7 +287,10 @@ pub fn build_invalidation_map(config: &Config) -> HashMap<String, Vec<String>> {
         if backend.sockets.is_none() {
             continue; // URL backends don't have renderer configs
         }
-        let conf_path = config.site_dir.join("configs").join(format!("{}.conf", backend.name));
+        let conf_path = config
+            .site_dir
+            .join("configs")
+            .join(format!("{}.conf", backend.name));
         if !conf_path.exists() {
             continue;
         }
@@ -350,19 +375,18 @@ fn add_renderer_params_to_map(
                 } else {
                     site_dir.join(&params_glob).to_string_lossy().into_owned()
                 };
-                map.entry(resolved_glob)
-                    .or_default()
-                    .push(url_path.clone());
+                map.entry(resolved_glob).or_default().push(url_path.clone());
             } else {
                 // Static params file — resolve relative to site_dir.
                 let resolved = if std::path::Path::new(params_path_tmpl).is_absolute() {
                     params_path_tmpl.clone()
                 } else {
-                    site_dir.join(params_path_tmpl).to_string_lossy().into_owned()
+                    site_dir
+                        .join(params_path_tmpl)
+                        .to_string_lossy()
+                        .into_owned()
                 };
-                map.entry(resolved)
-                    .or_default()
-                    .push(url_path.clone());
+                map.entry(resolved).or_default().push(url_path.clone());
             }
         }
     }
@@ -371,12 +395,20 @@ fn add_renderer_params_to_map(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AnalyticsConfig, BackendConfig, Config, ErrorsConfig, LogConfig, NodeConfig, RateLimitConfig, RouteConfig, SecurityConfig, ServerConfig, SiteConfig};
+    use crate::config::{
+        AnalyticsConfig, BackendConfig, Config, ErrorsConfig, LogConfig, NodeConfig,
+        RateLimitConfig, RouteConfig, SecurityConfig, ServerConfig, SiteConfig,
+    };
     use std::path::PathBuf;
 
     fn make_config(routes: Vec<RouteConfig>, backends: Vec<BackendConfig>) -> Config {
         Config {
-            site: SiteConfig { name: "Test".to_string(), domain: "test.example.com".to_string(), redirect_www: true, describedby: String::new() },
+            site: SiteConfig {
+                name: "Test".to_string(),
+                domain: "test.example.com".to_string(),
+                redirect_www: true,
+                describedby: String::new(),
+            },
             server: ServerConfig {
                 bind: "127.0.0.1:8443".to_string(),
                 tls_cert: Some("/tmp/cert.pem".to_string()),
@@ -389,7 +421,9 @@ mod tests {
             log: LogConfig::default(),
             analytics: AnalyticsConfig::default(),
             health: Default::default(),
-            node: NodeConfig { name: "test-node".to_string() },
+            node: NodeConfig {
+                name: "test-node".to_string(),
+            },
             rate_limit: RateLimitConfig::default(),
             errors: ErrorsConfig::default(),
             security: SecurityConfig::default(),
@@ -411,7 +445,12 @@ mod tests {
     }
 
     fn make_route(path: &str, backend: &str) -> RouteConfig {
-        RouteConfig { path: path.to_string(), backend: backend.to_string(), require: None, cache: None }
+        RouteConfig {
+            path: path.to_string(),
+            backend: backend.to_string(),
+            require: None,
+            cache: None,
+        }
     }
 
     #[test]
@@ -448,7 +487,10 @@ mod tests {
     #[test]
     fn test_exact_beats_parameterized() {
         let config = make_config(
-            vec![make_route("/admin/special", "exact-backend"), make_route("/admin/{page}", "param-backend")],
+            vec![
+                make_route("/admin/special", "exact-backend"),
+                make_route("/admin/{page}", "param-backend"),
+            ],
             vec![make_backend("exact-backend"), make_backend("param-backend")],
         );
         let table = RouteTable::from_config(&config).unwrap();
@@ -514,7 +556,12 @@ params = ["data/home.json", "data/shared.json"]
         std::fs::write(site_dir.join("key.pem"), "dummy").unwrap();
 
         let config = Config {
-            site: SiteConfig { name: "Test".to_string(), domain: "test.example.com".to_string(), redirect_www: true, describedby: String::new() },
+            site: SiteConfig {
+                name: "Test".to_string(),
+                domain: "test.example.com".to_string(),
+                redirect_www: true,
+                describedby: String::new(),
+            },
             server: ServerConfig {
                 bind: "127.0.0.1:8443".to_string(),
                 tls_cert: Some(site_dir.join("cert.pem").to_string_lossy().into_owned()),
@@ -527,7 +574,9 @@ params = ["data/home.json", "data/shared.json"]
             log: LogConfig::default(),
             analytics: AnalyticsConfig::default(),
             health: Default::default(),
-            node: NodeConfig { name: "test-node".to_string() },
+            node: NodeConfig {
+                name: "test-node".to_string(),
+            },
             rate_limit: RateLimitConfig::default(),
             errors: ErrorsConfig::default(),
             security: SecurityConfig::default(),
@@ -546,17 +595,26 @@ params = ["data/home.json", "data/shared.json"]
         let map = build_invalidation_map(&config);
 
         // data/about.json → ["/about"]
-        let about_key = site_dir.join("data/about.json").to_string_lossy().into_owned();
+        let about_key = site_dir
+            .join("data/about.json")
+            .to_string_lossy()
+            .into_owned();
         assert!(map.contains_key(&about_key), "about.json key missing");
         assert!(map[&about_key].contains(&"/about".to_string()));
 
         // data/home.json → ["/home"]
-        let home_key = site_dir.join("data/home.json").to_string_lossy().into_owned();
+        let home_key = site_dir
+            .join("data/home.json")
+            .to_string_lossy()
+            .into_owned();
         assert!(map.contains_key(&home_key), "home.json key missing");
         assert!(map[&home_key].contains(&"/home".to_string()));
 
         // data/shared.json → ["/home"]
-        let shared_key = site_dir.join("data/shared.json").to_string_lossy().into_owned();
+        let shared_key = site_dir
+            .join("data/shared.json")
+            .to_string_lossy()
+            .into_owned();
         assert!(map.contains_key(&shared_key), "shared.json key missing");
         assert!(map[&shared_key].contains(&"/home".to_string()));
     }
@@ -580,7 +638,12 @@ params = ["content/posts/{stem}.json"]
         std::fs::write(site_dir.join("key.pem"), "dummy").unwrap();
 
         let config = Config {
-            site: SiteConfig { name: "Test".to_string(), domain: "test.example.com".to_string(), redirect_www: true, describedby: String::new() },
+            site: SiteConfig {
+                name: "Test".to_string(),
+                domain: "test.example.com".to_string(),
+                redirect_www: true,
+                describedby: String::new(),
+            },
             server: ServerConfig {
                 bind: "127.0.0.1:8443".to_string(),
                 tls_cert: Some(site_dir.join("cert.pem").to_string_lossy().into_owned()),
@@ -593,7 +656,9 @@ params = ["content/posts/{stem}.json"]
             log: LogConfig::default(),
             analytics: AnalyticsConfig::default(),
             health: Default::default(),
-            node: NodeConfig { name: "test-node".to_string() },
+            node: NodeConfig {
+                name: "test-node".to_string(),
+            },
             rate_limit: RateLimitConfig::default(),
             errors: ErrorsConfig::default(),
             security: SecurityConfig::default(),
@@ -612,8 +677,15 @@ params = ["content/posts/{stem}.json"]
         let map = build_invalidation_map(&config);
 
         // Templated params: key is a glob pattern with `*` substituted for `{stem}`
-        let glob_key = site_dir.join("content/posts/*.json").to_string_lossy().into_owned();
-        assert!(map.contains_key(&glob_key), "templated glob key missing: {}", glob_key);
+        let glob_key = site_dir
+            .join("content/posts/*.json")
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            map.contains_key(&glob_key),
+            "templated glob key missing: {}",
+            glob_key
+        );
         assert!(map[&glob_key].contains(&"/blog/{stem}".to_string()));
     }
 
@@ -628,7 +700,12 @@ params = ["content/posts/{stem}.json"]
         std::fs::write(site_dir.join("key.pem"), "dummy").unwrap();
 
         let config = Config {
-            site: SiteConfig { name: "Test".to_string(), domain: "test.example.com".to_string(), redirect_www: true, describedby: String::new() },
+            site: SiteConfig {
+                name: "Test".to_string(),
+                domain: "test.example.com".to_string(),
+                redirect_www: true,
+                describedby: String::new(),
+            },
             server: ServerConfig {
                 bind: "127.0.0.1:8443".to_string(),
                 tls_cert: Some(site_dir.join("cert.pem").to_string_lossy().into_owned()),
@@ -641,7 +718,9 @@ params = ["content/posts/{stem}.json"]
             log: LogConfig::default(),
             analytics: AnalyticsConfig::default(),
             health: Default::default(),
-            node: NodeConfig { name: "test-node".to_string() },
+            node: NodeConfig {
+                name: "test-node".to_string(),
+            },
             rate_limit: RateLimitConfig::default(),
             errors: ErrorsConfig::default(),
             security: SecurityConfig::default(),

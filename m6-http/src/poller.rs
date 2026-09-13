@@ -2,7 +2,6 @@
 ///
 /// Uses epoll on Linux, kqueue on macOS/FreeBSD/OpenBSD,
 /// and falls back to poll(2) on all other Unix platforms.
-
 use std::io;
 use std::os::unix::io::RawFd;
 
@@ -46,9 +45,7 @@ mod imp {
 
     pub fn delete(imp: &Imp, fd: RawFd) -> io::Result<()> {
         // Linux 2.6.9+ allows null event pointer for DEL
-        let r = unsafe {
-            libc::epoll_ctl(imp.epfd, libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut())
-        };
+        let r = unsafe { libc::epoll_ctl(imp.epfd, libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut()) };
         if r < 0 {
             Err(io::Error::last_os_error())
         } else {
@@ -56,11 +53,7 @@ mod imp {
         }
     }
 
-    pub fn wait(
-        imp: &Imp,
-        events: &mut [Token; 64],
-        timeout_ms: i32,
-    ) -> io::Result<usize> {
+    pub fn wait(imp: &Imp, events: &mut [Token; 64], timeout_ms: i32) -> io::Result<usize> {
         let mut raw = [libc::epoll_event { events: 0, u64: 0 }; 64];
         // Plain `epoll_wait`, not `epoll_pwait`. Signals no longer unblock this
         // loop: they are blocked process-wide and consumed by the `sigwait`
@@ -88,11 +81,7 @@ mod imp {
 // ─────────────────────────────────────────────────────────────────────────────
 // macOS / FreeBSD / OpenBSD: kqueue
 // ─────────────────────────────────────────────────────────────────────────────
-#[cfg(any(
-    target_os = "macos",
-    target_os = "freebsd",
-    target_os = "openbsd"
-))]
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
 mod imp {
     use super::Token;
     use std::io;
@@ -119,9 +108,8 @@ mod imp {
             data: 0,
             udata: token.0 as *mut libc::c_void,
         };
-        let r = unsafe {
-            libc::kevent(imp.kqfd, &ev, 1, std::ptr::null_mut(), 0, std::ptr::null())
-        };
+        let r =
+            unsafe { libc::kevent(imp.kqfd, &ev, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
         if r < 0 {
             Err(io::Error::last_os_error())
         } else {
@@ -138,9 +126,8 @@ mod imp {
             data: 0,
             udata: std::ptr::null_mut(),
         };
-        let r = unsafe {
-            libc::kevent(imp.kqfd, &ev, 1, std::ptr::null_mut(), 0, std::ptr::null())
-        };
+        let r =
+            unsafe { libc::kevent(imp.kqfd, &ev, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
         if r < 0 {
             Err(io::Error::last_os_error())
         } else {
@@ -148,11 +135,7 @@ mod imp {
         }
     }
 
-    pub fn wait(
-        imp: &Imp,
-        events: &mut [Token; 64],
-        timeout_ms: i32,
-    ) -> io::Result<usize> {
+    pub fn wait(imp: &Imp, events: &mut [Token; 64], timeout_ms: i32) -> io::Result<usize> {
         let ts;
         let ts_ptr = if timeout_ms < 0 {
             std::ptr::null()
@@ -164,9 +147,8 @@ mod imp {
             &ts as *const _
         };
         let mut raw = [unsafe { std::mem::zeroed::<libc::kevent>() }; 64];
-        let n = unsafe {
-            libc::kevent(imp.kqfd, std::ptr::null(), 0, raw.as_mut_ptr(), 64, ts_ptr)
-        };
+        let n =
+            unsafe { libc::kevent(imp.kqfd, std::ptr::null(), 0, raw.as_mut_ptr(), 64, ts_ptr) };
         if n < 0 {
             let e = io::Error::last_os_error();
             if e.kind() == io::ErrorKind::Interrupted {
@@ -205,7 +187,9 @@ mod imp {
     }
 
     pub fn new() -> io::Result<Imp> {
-        Ok(Imp { fds: Mutex::new(Vec::new()) })
+        Ok(Imp {
+            fds: Mutex::new(Vec::new()),
+        })
     }
 
     pub fn add(imp: &Imp, fd: RawFd, token: Token) -> io::Result<()> {
@@ -218,11 +202,7 @@ mod imp {
         Ok(())
     }
 
-    pub fn wait(
-        imp: &Imp,
-        events: &mut [Token; 64],
-        timeout_ms: i32,
-    ) -> io::Result<usize> {
+    pub fn wait(imp: &Imp, events: &mut [Token; 64], timeout_ms: i32) -> io::Result<usize> {
         let registered = imp.fds.lock().unwrap().clone();
         if registered.is_empty() {
             // Nothing to poll — sleep briefly and return 0
@@ -233,9 +213,19 @@ mod imp {
         }
         let mut poll_fds: Vec<libc::pollfd> = registered
             .iter()
-            .map(|(fd, _)| libc::pollfd { fd: *fd, events: libc::POLLIN, revents: 0 })
+            .map(|(fd, _)| libc::pollfd {
+                fd: *fd,
+                events: libc::POLLIN,
+                revents: 0,
+            })
             .collect();
-        let ret = unsafe { libc::poll(poll_fds.as_mut_ptr(), poll_fds.len() as libc::nfds_t, timeout_ms) };
+        let ret = unsafe {
+            libc::poll(
+                poll_fds.as_mut_ptr(),
+                poll_fds.len() as libc::nfds_t,
+                timeout_ms,
+            )
+        };
         if ret < 0 {
             let e = io::Error::last_os_error();
             if e.kind() == io::ErrorKind::Interrupted {
@@ -330,7 +320,6 @@ impl Drop for Poller {
         imp::drop_imp(&self.0);
     }
 }
-
 
 /// Read end of the wake pipe. Register with `Poller::add`.
 pub struct WakeReader(RawFd);

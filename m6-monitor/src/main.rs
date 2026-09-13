@@ -89,7 +89,9 @@ fn collect(req: &Request) -> anyhow::Result<digest::Digest> {
 
 fn digest_json(req: &Request) -> Result<Response> {
     match collect(req) {
-        Ok(d) => Ok(Response::json(serde_json::to_value(&d).unwrap_or(json!({})))),
+        Ok(d) => Ok(Response::json(
+            serde_json::to_value(&d).unwrap_or(json!({})),
+        )),
         // 503 rather than 500: the monitor is up, the fleet view is not.
         Err(e) => Ok(Response::json_status(
             json!({"error": format!("{e:#}")}),
@@ -102,12 +104,19 @@ fn page(req: &Request) -> Result<Response> {
     let d = match collect(req) {
         Ok(d) => d,
         Err(e) => {
-            return Ok(Response::json_status(json!({"error": format!("{e:#}")}), 503));
+            return Ok(Response::json_status(
+                json!({"error": format!("{e:#}")}),
+                503,
+            ));
         }
     };
     // 503 when something is actually broken, so a check pointed at this page
     // is useful without parsing it.
-    let code = if d.level == digest::Level::Fault { 503 } else { 200 };
+    let code = if d.level == digest::Level::Fault {
+        503
+    } else {
+        200
+    };
     Ok(Response::html(render(&d))
         .with_status(code)
         // A monitoring page must never be served from a cache, by us or by
@@ -189,8 +198,15 @@ fn render(d: &digest::Digest) -> String {
         h.push_str("<div class=f>Nothing to report.</div>");
     }
     for f in &d.findings {
-        let cls = if f.level == digest::Level::Warn { "f warn" } else { "f" };
-        h.push_str(&format!("<div class='{cls}'><b>{}</b> &middot; {}</div>", f.node, f.text));
+        let cls = if f.level == digest::Level::Warn {
+            "f warn"
+        } else {
+            "f"
+        };
+        h.push_str(&format!(
+            "<div class='{cls}'><b>{}</b> &middot; {}</div>",
+            f.node, f.text
+        ));
     }
 
     h.push_str(
@@ -220,15 +236,25 @@ fn render(d: &digest::Digest) -> String {
             n.name,
             n.role,
             n.status,
-            n.rtt_ms.map(|v| format!("{v:.1}ms")).unwrap_or_else(|| "-".into()),
+            n.rtt_ms
+                .map(|v| format!("{v:.1}ms"))
+                .unwrap_or_else(|| "-".into()),
             opt(n.requests_total),
-            n.hit_rate.map(|v| format!("{v:.4}")).unwrap_or_else(|| "-".into()),
-            n.hit_p50_ns.map(|v| format!("{v}ns")).unwrap_or_else(|| "-".into()),
-            n.hit_p99_ns.map(|v| format!("{v}ns")).unwrap_or_else(|| "-".into()),
+            n.hit_rate
+                .map(|v| format!("{v:.4}"))
+                .unwrap_or_else(|| "-".into()),
+            n.hit_p50_ns
+                .map(|v| format!("{v}ns"))
+                .unwrap_or_else(|| "-".into()),
+            n.hit_p99_ns
+                .map(|v| format!("{v}ns"))
+                .unwrap_or_else(|| "-".into()),
             load,
             mem,
             disk,
-            n.thermal_max_c.map(|c| format!("{c:.0}C")).unwrap_or_else(|| "-".into()),
+            n.thermal_max_c
+                .map(|c| format!("{c:.0}C"))
+                .unwrap_or_else(|| "-".into()),
             n.uptime_s.map(dur).unwrap_or_else(|| "-".into()),
             n.host_uptime_s.map(dur).unwrap_or_else(|| "-".into()),
         ));
@@ -246,7 +272,10 @@ fn render(d: &digest::Digest) -> String {
                 .collect::<Vec<_>>()
                 .join(" &middot; ")
         };
-        h.push_str(&format!("<tr><td>{}</td><td style='text-align:left'>{}</td></tr>", n.name, pools));
+        h.push_str(&format!(
+            "<tr><td>{}</td><td style='text-align:left'>{}</td></tr>",
+            n.name, pools
+        ));
     }
     h.push_str("</table></div>");
     h

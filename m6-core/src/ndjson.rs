@@ -121,8 +121,7 @@ pub fn to_string<'a, T: Serialize + 'a>(
 ) -> std::io::Result<String> {
     let mut out = Vec::new();
     write_all(&mut out, values)?;
-    String::from_utf8(out)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    String::from_utf8(out).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
 #[cfg(test)]
@@ -137,7 +136,10 @@ mod tests {
     }
 
     fn row(n: u32, s: &str) -> Row {
-        Row { n, s: s.to_string() }
+        Row {
+            n,
+            s: s.to_string(),
+        }
     }
 
     #[test]
@@ -165,7 +167,11 @@ mod tests {
         let got: Vec<Row> = r.by_ref().collect();
         assert_eq!(got, vec![row(1, "a"), row(2, "b")]);
         assert_eq!(r.read_count(), 2);
-        assert_eq!(r.skipped(), 1, "the blank lines are not failures; `not json` is");
+        assert_eq!(
+            r.skipped(),
+            1,
+            "the blank lines are not failures; `not json` is"
+        );
     }
 
     /// A record whose JSON contains an escaped newline is still one line, and

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 const MAX_ATTEMPTS: u32 = 5;
-const WINDOW_SECS: u64  = 15 * 60; // 15 minutes
+const WINDOW_SECS: u64 = 15 * 60; // 15 minutes
 
 /// Simple in-memory rate limiter: 5 login attempts per 15 minutes per IP.
 pub struct RateLimiter {
@@ -11,7 +11,9 @@ pub struct RateLimiter {
 
 impl RateLimiter {
     pub fn new() -> Self {
-        RateLimiter { map: HashMap::new() }
+        RateLimiter {
+            map: HashMap::new(),
+        }
     }
 
     /// Check whether `ip` is currently rate-limited.

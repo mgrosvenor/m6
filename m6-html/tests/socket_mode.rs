@@ -17,7 +17,9 @@ use std::time::Duration;
 use m6_core::testkit::{binary, Service};
 
 fn fixtures_dir() -> PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures")
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
 }
 
 /// Spawn `m6-html` with `body` as the whole of its `[server]` section and

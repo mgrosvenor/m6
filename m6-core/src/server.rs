@@ -1,8 +1,23 @@
-/// Unix socket server for m6 inter-process communication.
+//! The parts of a service that are not its handlers.
+//!
+//! Binding and owning a unix socket, applying its mode, applying a read
+//! timeout to an accepted connection, waiting on the listener and the config
+//! watcher together, and serving one connection until it ends.
+//!
+//! **`serve_connection` is the shared answer to four questions** each service
+//! used to answer for itself and differently: the keep-alive decision, what to
+//! say to a request that did not parse, whether a body goes out on a HEAD, and
+//! whether the connection is reused at all. Before it, every 404, 405, 400 and
+//! 412 answering a HEAD went out with a body on at least one service, and no
+//! connection was ever reused.
+//!
+//! It hands the request to its handler rather than lending it, because it has
+//! no use for it afterwards and lending it cost every service a full copy.
 
+use std::io::Write;
+/// Unix socket server for m6 inter-process communication.
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::io::Write;
 
 use anyhow::Result;
 use tracing::{debug, error, warn};
@@ -108,9 +123,7 @@ pub fn poll_listener_and_watcher(
     let borrowed_listener = unsafe { BorrowedFd::borrow_raw(listener_fd) };
     let mut pfd_listener = PollFd::new(borrowed_listener, PollFlags::POLLIN);
 
-    let fired = |pfd: &PollFd| {
-        pfd.revents().is_some_and(|f| f.contains(PollFlags::POLLIN))
-    };
+    let fired = |pfd: &PollFd| pfd.revents().is_some_and(|f| f.contains(PollFlags::POLLIN));
 
     // `PollTimeout` is a distinct type now rather than a bare `i32`, which is
     // an improvement worth taking: -1 meaning "block forever" and 0 meaning
@@ -418,7 +431,9 @@ mod tests {
         });
 
         let mut client = UnixStream::connect(&sock_path2).unwrap();
-        client.write_all(b"GET /test?foo=bar HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+        client
+            .write_all(b"GET /test?foo=bar HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
         drop(client);
 
         let req = handle.join().unwrap().unwrap();

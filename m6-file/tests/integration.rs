@@ -16,7 +16,9 @@ struct Server {
 }
 
 fn fixtures_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures")
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
 }
 
 fn config_path() -> PathBuf {
@@ -64,7 +66,9 @@ fn spawn_server(id: &str) -> (Server, PathBuf) {
 fn http_request(socket_path: &Path, request: &str) -> String {
     let mut stream = UnixStream::connect(socket_path)
         .unwrap_or_else(|e| panic!("connect to {:?}: {}", socket_path, e));
-    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
     stream.write_all(request.as_bytes()).unwrap();
 
     // One response, not read-to-EOF. Backends keep the connection open now
@@ -79,7 +83,11 @@ fn http_request(socket_path: &Path, request: &str) -> String {
 #[test]
 fn l1_valid_config_starts_and_socket_appears() {
     let (_guard, socket_path) = spawn_server("l1-start");
-    assert!(socket_path.exists(), "socket should exist at {:?}", socket_path);
+    assert!(
+        socket_path.exists(),
+        "socket should exist at {:?}",
+        socket_path
+    );
 }
 
 #[test]
@@ -116,10 +124,15 @@ fn l1_sigterm_exits_zero() {
 fn l2_existing_file_correct_bytes_and_content_type() {
     let (_guard, socket_path) = spawn_server("l2-existing");
 
-    let req = "GET /assets/css/main.css HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: identity\r\n\r\n";
+    let req =
+        "GET /assets/css/main.css HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: identity\r\n\r\n";
     let resp = http_request(&socket_path, req);
 
-    assert!(resp.contains("200 OK"), "expected 200, got:\n{}", &resp[..resp.len().min(300)]);
+    assert!(
+        resp.contains("200 OK"),
+        "expected 200, got:\n{}",
+        &resp[..resp.len().min(300)]
+    );
     assert!(
         resp.to_lowercase().contains("content-type: text/css"),
         "expected text/css content type, headers:\n{}",
@@ -138,7 +151,11 @@ fn l2_nonexistent_file_404() {
 
     let req = "GET /assets/css/nonexistent.css HTTP/1.1\r\nHost: localhost\r\n\r\n";
     let resp = http_request(&socket_path, req);
-    assert!(resp.contains("404"), "expected 404, got: {}", &resp[..resp.len().min(200)]);
+    assert!(
+        resp.contains("404"),
+        "expected 404, got: {}",
+        &resp[..resp.len().min(200)]
+    );
 }
 
 #[test]
@@ -159,7 +176,8 @@ fn l2_dotdot_in_url_returns_404() {
 fn l2_relpath_with_subdirectory() {
     let (_guard, socket_path) = spawn_server("l2-subdir");
 
-    let req = "GET /assets/css/main.css HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: identity\r\n\r\n";
+    let req =
+        "GET /assets/css/main.css HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: identity\r\n\r\n";
     let resp = http_request(&socket_path, req);
     assert!(
         resp.contains("200 OK"),
@@ -200,7 +218,11 @@ fn l3_css_brotli_compressed() {
     let req = "GET /assets/css/main.css HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: br\r\n\r\n";
     let resp = http_request(&socket_path, req);
 
-    assert!(resp.contains("200 OK"), "expected 200, got: {}", &resp[..resp.len().min(200)]);
+    assert!(
+        resp.contains("200 OK"),
+        "expected 200, got: {}",
+        &resp[..resp.len().min(200)]
+    );
     assert!(
         resp.to_lowercase().contains("content-encoding: br"),
         "expected brotli encoding for CSS, response headers:\n{}",
@@ -212,10 +234,15 @@ fn l3_css_brotli_compressed() {
 fn l3_css_gzip_compressed() {
     let (_guard, socket_path) = spawn_server("l3-gzip");
 
-    let req = "GET /assets/css/main.css HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: gzip\r\n\r\n";
+    let req =
+        "GET /assets/css/main.css HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: gzip\r\n\r\n";
     let resp = http_request(&socket_path, req);
 
-    assert!(resp.contains("200 OK"), "expected 200, got: {}", &resp[..resp.len().min(200)]);
+    assert!(
+        resp.contains("200 OK"),
+        "expected 200, got: {}",
+        &resp[..resp.len().min(200)]
+    );
     assert!(
         resp.to_lowercase().contains("content-encoding: gzip"),
         "expected gzip encoding for CSS"
@@ -227,7 +254,8 @@ fn l3_no_compression_without_accept_encoding() {
     let (_guard, socket_path) = spawn_server("l3-no-compress");
 
     // Without Accept-Encoding: br/gzip, identity should be used
-    let req = "GET /assets/css/main.css HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: identity\r\n\r\n";
+    let req =
+        "GET /assets/css/main.css HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: identity\r\n\r\n";
     let resp = http_request(&socket_path, req);
     assert!(resp.contains("200 OK"), "expected 200");
     assert!(
@@ -242,7 +270,8 @@ fn l3_no_compression_without_accept_encoding() {
 fn l4_cache_control_public() {
     let (_guard, socket_path) = spawn_server("l4-cache");
 
-    let req = "GET /assets/css/main.css HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: identity\r\n\r\n";
+    let req =
+        "GET /assets/css/main.css HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: identity\r\n\r\n";
     let resp = http_request(&socket_path, req);
 
     assert!(resp.contains("200 OK"), "expected 200");
@@ -287,7 +316,8 @@ fn l4b_head_returns_correct_content_length() {
     let (_guard, socket_path) = spawn_server("l4b-head");
 
     // First get the body length via GET.
-    let get_req = "GET /assets/css/main.css HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: identity\r\n\r\n";
+    let get_req =
+        "GET /assets/css/main.css HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: identity\r\n\r\n";
     let get_resp = http_request(&socket_path, get_req);
 
     // Extract Content-Length from GET response.
@@ -381,9 +411,7 @@ fn conditional_requests_follow_rfc9110_precedence() {
             ),
         )
     };
-    let status = |resp: &str| -> String {
-        resp.lines().next().unwrap_or("").trim().to_string()
-    };
+    let status = |resp: &str| -> String { resp.lines().next().unwrap_or("").trim().to_string() };
 
     let etag = get("")
         .lines()
@@ -407,7 +435,10 @@ fn conditional_requests_follow_rfc9110_precedence() {
 
     // 2. If-Unmodified-Since, only consulted when If-Match is absent.
     assert!(
-        status(&get("If-Unmodified-Since: Thu, 01 Jan 1970 00:00:00 GMT\r\n")).contains("412"),
+        status(&get(
+            "If-Unmodified-Since: Thu, 01 Jan 1970 00:00:00 GMT\r\n"
+        ))
+        .contains("412"),
         "If-Unmodified-Since in the past must be 412"
     );
 
@@ -421,7 +452,10 @@ fn conditional_requests_follow_rfc9110_precedence() {
         "WEAK form of the current tag must also be 304 (RFC 9110 8.8.3.2) — \
          this is the assertion that was failing"
     );
-    assert!(status(&get("If-None-Match: *\r\n")).contains("304"), "If-None-Match: *");
+    assert!(
+        status(&get("If-None-Match: *\r\n")).contains("304"),
+        "If-None-Match: *"
+    );
     assert!(
         status(&get("If-None-Match: \"nope\"\r\n")).contains("200"),
         "a non-matching If-None-Match must proceed"
@@ -457,7 +491,9 @@ fn conditional_requests_follow_rfc9110_precedence() {
 fn http_request_bytes(socket_path: &Path, request: &str) -> Vec<u8> {
     let mut stream = UnixStream::connect(socket_path)
         .unwrap_or_else(|e| panic!("connect to {:?}: {}", socket_path, e));
-    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
     stream.write_all(request.as_bytes()).unwrap();
     let method = request.split(' ').next().unwrap_or("");
     m6_core::testkit::read_one(&mut stream, method).expect("read one response")
@@ -499,7 +535,11 @@ fn head_reports_exactly_what_get_would() {
     // (path, Accept-Encoding, which path it should take, why)
     let cases: [(&str, &str, &str); 3] = [
         // Not compressed, not minified: the fast path.
-        ("/assets/images/photo.txt", "identity", "identity, unminified"),
+        (
+            "/assets/images/photo.txt",
+            "identity",
+            "identity, unminified",
+        ),
         // Minified, so the representation is not the bytes on disk.
         ("/assets/css/style.css", "identity", "identity but minified"),
         // Compressed, so the length is only known after compressing.
@@ -520,7 +560,10 @@ fn head_reports_exactly_what_get_would() {
         let (get_status, get_headers, get_body_len) = split_response(&req("GET"));
         let (head_status, head_headers, head_body_len) = split_response(&req("HEAD"));
 
-        assert!(get_status.contains("200"), "{what}: GET should be 200, got {get_status}");
+        assert!(
+            get_status.contains("200"),
+            "{what}: GET should be 200, got {get_status}"
+        );
         assert_eq!(head_status, get_status, "{what}: status line must match");
         assert_eq!(
             head_headers, get_headers,
@@ -587,7 +630,10 @@ fn a_head_on_an_unreadable_file_still_answers() {
             .env("M6_SOCKET_OVERRIDE", &socket_path),
     );
     svc.wait_for_path(&socket_path, Duration::from_secs(10));
-    assert!(wait::for_unix(&socket_path, Duration::from_secs(10)), "never accepted");
+    assert!(
+        wait::for_unix(&socket_path, Duration::from_secs(10)),
+        "never accepted"
+    );
 
     // Readable first, so the fixture is known good before it is broken.
     let req = |method: &str| {
@@ -600,7 +646,10 @@ fn a_head_on_an_unreadable_file_still_answers() {
         )
     };
     let (status, _, _) = split_response(&req("GET"));
-    assert!(status.contains("200"), "the fixture should serve before chmod, got {status}");
+    assert!(
+        status.contains("200"),
+        "the fixture should serve before chmod, got {status}"
+    );
 
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
 

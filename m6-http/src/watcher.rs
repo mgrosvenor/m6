@@ -8,7 +8,6 @@
 ///
 /// Socket pool membership is managed separately via periodic rescan, so this
 /// watcher does not need to track socket files.
-
 use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 
@@ -108,11 +107,13 @@ impl FsWatcher {
 
             let mut tls_filenames: Vec<String> = Vec::new();
             // Empty in redirect mode, which has no certificate to watch.
-            let tls_paths: Vec<&String> =
-                [config.server.tls_cert.as_ref(), config.server.tls_key.as_ref()]
-                    .into_iter()
-                    .flatten()
-                    .collect();
+            let tls_paths: Vec<&String> = [
+                config.server.tls_cert.as_ref(),
+                config.server.tls_key.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
             let mut watched_dirs: HashSet<std::path::PathBuf> = HashSet::new();
             for tls_path_str in &tls_paths {
                 let tls_path = std::path::Path::new(tls_path_str);
@@ -130,7 +131,13 @@ impl FsWatcher {
                 }
             }
 
-            Ok(FsWatcher { inner: FsWatcherInner { inotify, tls_filenames, socket_dir } })
+            Ok(FsWatcher {
+                inner: FsWatcherInner {
+                    inotify,
+                    tls_filenames,
+                    socket_dir,
+                },
+            })
         }
 
         // ── macOS / FreeBSD / OpenBSD ──────────────────────────────────────────
@@ -155,7 +162,11 @@ impl FsWatcher {
                 .map_err(|e| anyhow::anyhow!("spawn kqueue watcher: {e}"))?;
 
             Ok(FsWatcher {
-                inner: FsWatcherInner { pipe_read, pipe_write, _thread: thread },
+                inner: FsWatcherInner {
+                    pipe_read,
+                    pipe_write,
+                    _thread: thread,
+                },
             })
         }
 
@@ -168,7 +179,9 @@ impl FsWatcher {
         )))]
         {
             let _ = config;
-            Err(anyhow::anyhow!("filesystem watching not supported on this platform"))
+            Err(anyhow::anyhow!(
+                "filesystem watching not supported on this platform"
+            ))
         }
     }
 
@@ -353,8 +366,7 @@ fn kqueue_watch_site_dir(site_dir: PathBuf, pipe_write: RawFd) {
         ident: dir_fd as libc::uintptr_t,
         filter: libc::EVFILT_VNODE,
         flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_CLEAR,
-        fflags: (libc::NOTE_WRITE | libc::NOTE_EXTEND | libc::NOTE_ATTRIB | libc::NOTE_LINK)
-            as u32,
+        fflags: (libc::NOTE_WRITE | libc::NOTE_EXTEND | libc::NOTE_ATTRIB | libc::NOTE_LINK) as u32,
         data: 0,
         udata: std::ptr::null_mut(),
     };
@@ -363,9 +375,7 @@ fn kqueue_watch_site_dir(site_dir: PathBuf, pipe_write: RawFd) {
     // Also watch site.toml directly: NOTE_ATTRIB fires on `touch`, NOTE_WRITE
     // fires on content writes, NOTE_RENAME/DELETE fires on atomic overwrites.
     let site_toml_path = site_dir.join("site.toml");
-    let site_toml_cstr = std::ffi::CString::new(
-        site_toml_path.as_os_str().as_encoded_bytes()
-    );
+    let site_toml_cstr = std::ffi::CString::new(site_toml_path.as_os_str().as_encoded_bytes());
     let file_fd = match &site_toml_cstr {
         Ok(cstr) => unsafe { libc::open(cstr.as_ptr(), libc::O_EVTONLY) },
         Err(_) => -1,
@@ -375,23 +385,22 @@ fn kqueue_watch_site_dir(site_dir: PathBuf, pipe_write: RawFd) {
             ident: file_fd as libc::uintptr_t,
             filter: libc::EVFILT_VNODE,
             flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_CLEAR,
-            fflags: (libc::NOTE_WRITE
-                | libc::NOTE_ATTRIB
-                | libc::NOTE_RENAME
-                | libc::NOTE_DELETE) as u32,
+            fflags: (libc::NOTE_WRITE | libc::NOTE_ATTRIB | libc::NOTE_RENAME | libc::NOTE_DELETE)
+                as u32,
             data: 0,
             udata: std::ptr::null_mut(),
         };
         unsafe { libc::kevent(kq, &ev_file, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
     }
 
-    let timeout = libc::timespec { tv_sec: 1, tv_nsec: 0 };
+    let timeout = libc::timespec {
+        tv_sec: 1,
+        tv_nsec: 0,
+    };
     let mut out_ev = unsafe { std::mem::zeroed::<libc::kevent>() };
 
     loop {
-        let n = unsafe {
-            libc::kevent(kq, std::ptr::null(), 0, &mut out_ev, 1, &timeout)
-        };
+        let n = unsafe { libc::kevent(kq, std::ptr::null(), 0, &mut out_ev, 1, &timeout) };
         if n > 0 {
             let byte: u8 = 1;
             unsafe {
@@ -399,5 +408,4 @@ fn kqueue_watch_site_dir(site_dir: PathBuf, pipe_write: RawFd) {
             }
         }
     }
-
 }

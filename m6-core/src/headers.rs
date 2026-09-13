@@ -94,7 +94,9 @@ pub fn combine(headers: &[(String, String)], name: &str) -> Option<String> {
 /// across a `set`. Appending after a remove would move the field to the end
 /// and make two otherwise identical responses differ byte for byte.
 pub fn set(headers: &mut Vec<(String, String)>, name: &str, value: impl Into<String>) {
-    let first = headers.iter().position(|(k, _)| k.eq_ignore_ascii_case(name));
+    let first = headers
+        .iter()
+        .position(|(k, _)| k.eq_ignore_ascii_case(name));
     match first {
         Some(i) => {
             headers[i] = (name.to_string(), value.into());
@@ -177,7 +179,10 @@ mod tests {
     /// RFC 9110 5.3 allows folding for list-valued fields.
     #[test]
     fn a_list_valued_field_combines() {
-        assert_eq!(combine(&h(), "accept-encoding"), Some("gzip, br".to_string()));
+        assert_eq!(
+            combine(&h(), "accept-encoding"),
+            Some("gzip, br".to_string())
+        );
     }
 
     /// RFC 6265 3: Set-Cookie must not be folded. A cookie value can contain a
