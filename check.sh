@@ -95,10 +95,17 @@ fi
 # body on a HEAD that 404s -- a defect fixed in m6-http months earlier and
 # never applied to the other implementation, because nothing measured it.
 #
-# Testers that are not installed are skipped with a note rather than failing,
-# so a laptop without h2spec still gets the h1 gate.
+# `--allow-missing-tools` is for THIS gate only, and it is not a pass: an
+# absent tester is reported in red as NOT TESTED, and the summary refuses to
+# say "pass". A laptop without h2spec still gets the h1 gate, and the run says
+# plainly what it did not do.
+#
+# The pre-prod gate (`deploy/run-tests.sh`, on the Linux build host where both
+# testers are installed) runs WITHOUT the flag, so the path to a deploy cannot
+# skip h2 or h3. That split is the whole design: skipping is a laptop
+# convenience and never a way to ship.
 info "Running conformance (h1spec / h2spec / h3spec)..."
-if ./tools/conformance.sh 2>&1; then
+if ./tools/conformance.sh --allow-missing-tools 2>&1; then
   pass "Conformance (nothing went backwards)"
 else
   fail "Conformance regressed — see above, and tools/conformance-scores.txt"
