@@ -12,18 +12,106 @@ releases only; work happens on `develop`. See `CONTRIBUTING.md`.
 
 ---
 
-## Unreleased
+## 1.0.0 — 2026-09-14
 
-Everything below this heading is on `develop` and has **not** been released or
-deployed. It is a large body of work: the m6-core migration (phases 0 to 6),
-both service migrations onto `App`, the copy elimination, streaming response
-bodies, and the conformance and performance checks becoming real.
+The first release. Everything under this heading was on `develop` unreleased and
+undeployed, some of it for months.
 
 `docs/PERFORMANCE.md` has the measured performance story by commit.
 `docs/CONSOLIDATION-TODO.md` has what is done and what is owed.
 
-The individual entries are below, under the historical section, because they
-were written before this file was organised by release.
+### What 1.0.0 means here
+
+It does not mean finished. It means the consolidation work is done, the checks
+are real, and the numbers in this repository are measurements rather than claims.
+The API is stable enough to tag and pin against, which is what
+`m6-backend-protocol.md` version 1 already says about the wire contract.
+
+### The body of work
+
+- **m6-core is the PHP of m6**, phases 0 to 6: a box of blocks a service is
+  assembled from, and the only crate a service links. `m6-file` and
+  `m6-auth-server` are `App` services now; m6-file lost 969 lines including a
+  second router and a second config parser.
+- **Config-driven routes.** `App::handler(name, f)` plus `handler = "..."` on a
+  route, rebuilt on every reload, so a static file server gains an asset tree by
+  being told about a directory rather than by being recompiled.
+- **Streaming response bodies.** A stream structurally has no bytes for the
+  minifier, compressor or default ETag to touch.
+- **Copy elimination.** Core's per-request copying went from ~442us to ~1.58us.
+- **Zero `unsafe` in production code**, down from 390 lines of raw libc in the
+  filesystem watcher.
+
+### The checks became real
+
+This is the half that mattered most, because most of it had never run.
+
+- **h1, h2 and h3 conformance are measured against recorded minimums.** h2 and
+  h3 had no minimum at all and were silently skipped on every run: the only
+  thing running them was a laptop hook on a machine with neither `h2spec` nor
+  `h3spec` installed, and the Linux checks did not run conformance at all. h1
+  32/32 on four targets, h2 146/146, h3 47/49.
+- **A check that cannot measure now fails rather than passing.**
+  `tools/conformance.sh` broke that rule four separate ways and reported success
+  through all of them.
+- **clippy is silent**, `-D warnings`, on both toolchains, and the per-platform
+  ceiling files are deleted. That ceiling turned out to be per-clippy-version:
+  45 findings at 0.1.95 against 123 at 0.1.98 on identical source.
+- **Zero compiler warnings**, release and test builds, checked on Linux.
+- **CI on GitHub Actions** on every push and PR, and `cargo-deny` now runs on the
+  build host too, because a check that lives in one place only is not a check.
+- **Six reference backends** in C, C++, Python, Go, and Rust with and without
+  m6-core, all conforming to the wire contract, with 13 shared tests running them
+  in the build checks. The multi-language promise was written down and never
+  exercised until now.
+- **An end-to-end check of the whole 7-node topology** on one machine,
+  `deploy/verify-local.sh` in the site repository: 30 checks covering every node,
+  every page, the cache headers, the cache actually caching, and per-node
+  invalidation.
+
+### Protocol fixes in this release
+
+- **HTTP/2: a received GOAWAY no longer closes the connection**, so the frames
+  behind it are answered instead of meeting a TCP reset. And a WINDOW_UPDATE that
+  overflows a stream we have just answered is still a FLOW_CONTROL_ERROR rather
+  than being dropped. Both were intermittent, both came from discarding state the
+  instant we finished with it, and h2 went from 2 failures in 6 runs to 20 out of
+  20 clean.
+- **h3 37/49 to 47/49.** All twelve failures were upstream in quiche, and the
+  recorded remedy — bump the version — moved the score by zero tests. Ten are
+  cleared by two open upstream pull requests, applied on a fork pinned by
+  revision. The last two are QPACK and are accepted.
+- **Compression is the backend's job, and m6-http is a cache, not a
+  transformer.** The protocol told backends not to compress on the grounds that
+  the proxy would, and the proxy has no compressor: a C, Go or Python backend
+  written from that advice served uncompressed bytes forever.
+  `[[backend]] compresses` is now read by both sides, and a backend refuses to
+  start if it disagrees with what it can actually do.
+- **Supply chain:** five `cargo-deny` exceptions down to three, each remaining one
+  stating whether it is reachable and how that was checked. `rustls-pemfile` is
+  gone from the tree entirely.
+
+### Known, recorded, and not fixed in 1.0.0
+
+Stated here rather than discovered later:
+
+- **h3 is 47/49.** The two remaining are QPACK, quiche models neither code, and
+  closing them means writing protocol validation into a forked dependency.
+- **m6-http depends on a fork of quiche**, pinned by revision, carrying two
+  unmerged upstream pull requests. Deliberate, and to be dropped for a tag when
+  upstream releases them.
+- **Linking m6-core costs about 36% of a backend's throughput** and 8.8x its
+  resident memory on a trivial route. Measured, reproduced within 3%, and
+  recorded in `docs/BENCHMARKS.md`. It is measured on the shape that maximises
+  it, and behind the edge cache most requests never reach a backend.
+- **One intermittent test-harness failure**, issue #9: a claimed TCP port
+  occasionally turns out to be in use. Two failures in five full runs, the
+  mechanism identified, the fix not yet written. It affects the test harness, not
+  m6.
+- **`m6-monitor` and the firewall stats collector are deployed nowhere**, so
+  `tools/health-check.py` cannot be retired yet.
+- **Staging cannot exercise the cache role**: single origin, no cache nodes, no
+  WireGuard.
 
 ---
 
