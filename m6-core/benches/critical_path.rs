@@ -426,7 +426,8 @@ fn bench_response_write(c: &mut Criterion) {
             |resp| {
                 let mut buf = Vec::with_capacity(512);
                 let mut out = m6_core::h1::Responder::new(&mut buf, "GET", true);
-                black_box(resp.send(&mut out).unwrap());
+                let _: () = resp.send(&mut out).unwrap();
+                black_box(());
             },
             criterion::BatchSize::SmallInput,
         )
@@ -449,10 +450,9 @@ fn bench_socket_round_trip(c: &mut Criterion) {
     std::fs::write(tmpl_dir.join("page.html"), MINIMAL_TEMPLATE).unwrap();
 
     // Write minimal config.
-    let cfg_text = format!(
-        r#"
+    let cfg_text = r#"
 [[route]]
-path     = "/blog/{{stem}}"
+path     = "/blog/{stem}"
 template = "templates/page.html"
 
 [thread_pool]
@@ -461,8 +461,7 @@ queue_size = 64
 
 [params_cache]
 size = 64
-"#
-    );
+"#.to_string();
     let cfg_path = dir.path().join("m6.toml");
     std::fs::write(&cfg_path, &cfg_text).unwrap();
 
@@ -773,7 +772,8 @@ fn main() {
             let resp = response_to_write();
             let mut buf = Vec::with_capacity(512);
             let mut out = m6_core::h1::Responder::new(&mut buf, "GET", true);
-            black_box(resp.send(&mut out).unwrap());
+            resp.send(&mut out).unwrap();
+            black_box(());
         });
     }
 

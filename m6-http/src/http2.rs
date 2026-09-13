@@ -314,6 +314,12 @@ pub struct Http2Conn {
     forwarded_trust: crate::forward::ForwardedTrust,
 }
 
+impl Default for Http2Conn {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Http2Conn {
     pub fn new() -> Self {
         Http2Conn {
@@ -877,7 +883,7 @@ impl Http2Conn {
             if flags & FLAG_ACK != 0 && length != 0 {
                 return FrameVerdict::ConnectionError(ERR_FRAME_SIZE);
             }
-            if flags & FLAG_ACK == 0 && length % 6 != 0 {
+            if flags & FLAG_ACK == 0 && !length.is_multiple_of(6) {
                 return FrameVerdict::ConnectionError(ERR_FRAME_SIZE);
             }
         }
@@ -983,7 +989,7 @@ impl Http2Conn {
         if flags & FLAG_ACK != 0 {
             return Ok(());
         }
-        if payload.len() % 6 != 0 {
+        if !payload.len().is_multiple_of(6) {
             return Err("SETTINGS payload not multiple of 6");
         }
         let mut i = 0;
@@ -1104,7 +1110,7 @@ impl Http2Conn {
         if stream_id == 0 {
             return Err("HEADERS on stream 0");
         }
-        if stream_id % 2 == 0 {
+        if stream_id.is_multiple_of(2) {
             return Err("client used even stream ID");
         }
         // RFC 9113 5.1.1: "The identifier of a newly established stream MUST
@@ -1585,7 +1591,7 @@ impl Http2Conn {
                         RequestOutcome::Ready(ps, ph, pb, _, _) => (ps, ph, pb),
                         RequestOutcome::Pending { .. } => continue, // can't push async assets
                     };
-                    if ps < 200 || ps >= 300 {
+                    if !(200..300).contains(&ps) {
                         continue;
                     }
                     // Skip if the body exceeds the current connection send window.
@@ -1947,7 +1953,7 @@ fn setting_bytes(buf: &mut Vec<u8>, id: u16, val: u32) {
 
 /// Decode an RFC 7541 5.1 integer with an `n`-bit prefix, advancing `i`.
 fn hpack_prefix_int(b: &[u8], i: &mut usize, n: u32) -> Result<usize, &'static str> {
-    let mask = ((1usize << n) - 1) as usize;
+    let mask = (1usize << n) - 1;
     if *i >= b.len() {
         return Err("HPACK: truncated integer");
     }

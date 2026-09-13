@@ -189,13 +189,12 @@ fn collect_flag_values<'a>(args: &'a [String], flag: &str) -> Vec<&'a str> {
     let mut vals = Vec::new();
     let mut i = 0;
     while i < args.len() {
-        if args[i] == flag {
-            if i + 1 < args.len() {
+        if args[i] == flag
+            && i + 1 < args.len() {
                 vals.push(args[i + 1].as_str());
                 i += 2;
                 continue;
             }
-        }
         i += 1;
     }
     vals
@@ -205,11 +204,10 @@ fn collect_flag_values<'a>(args: &'a [String], flag: &str) -> Vec<&'a str> {
 fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     let mut i = 0;
     while i < args.len() {
-        if args[i] == flag {
-            if i + 1 < args.len() {
+        if args[i] == flag
+            && i + 1 < args.len() {
                 return Some(args[i + 1].as_str());
             }
-        }
         i += 1;
     }
     None
@@ -228,7 +226,7 @@ fn cmd_user_ls(db: &Db, args: &[String]) -> Result<()> {
         let out = serde_json::to_string(&users)?;
         println!("{}", out);
     } else {
-        println!("{:<16} {:<24} {}", "USERNAME", "ROLES", "CREATED");
+        println!("{:<16} {:<24} CREATED", "USERNAME", "ROLES");
         for u in &users {
             let roles = u.roles.join(",");
             let created = format_timestamp(u.created_at);
@@ -354,7 +352,7 @@ fn cmd_group_ls(db: &Db, args: &[String]) -> Result<()> {
         let out = serde_json::to_string(&groups)?;
         println!("{}", out);
     } else {
-        println!("{:<16} {}", "GROUP", "MEMBERS");
+        println!("{:<16} MEMBERS", "GROUP");
         for g in &groups {
             println!("{:<16} {}", g.name, g.members.len());
         }
@@ -415,7 +413,7 @@ fn cmd_group_member_ls(db: &Db, args: &[String]) -> Result<()> {
         let out = serde_json::to_string(&members)?;
         println!("{}", out);
     } else {
-        println!("{:<16} {}", "USERNAME", "ROLES");
+        println!("{:<16} ROLES", "USERNAME");
         for u in &members {
             let roles = u.roles.join(",");
             println!("{:<16} {}", u.username, roles);
@@ -559,8 +557,8 @@ fn cmd_token_ls(db: &Db, args: &[String]) -> Result<()> {
         println!("{}", serde_json::to_string(&tokens)?);
     } else {
         println!(
-            "{:<36} {:<20} {:<22} {}",
-            "ID", "NAME", "CREATED", "EXPIRES"
+            "{:<36} {:<20} {:<22} EXPIRES",
+            "ID", "NAME", "CREATED"
         );
         for t in &tokens {
             let created = format_timestamp(t.created_at);
