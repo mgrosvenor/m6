@@ -1,6 +1,12 @@
 # m6 backend examples — Design
 
-**Status: design. The examples described here do not exist yet.**
+**Status: implemented, 2026-09-13.** All six exist under
+`m6-http/tests/backends/`, all six conform, and the shared assertion set of §7
+runs them in the gate. What is still owed against this document is listed in
+§11.
+
+Where this document and the implementation disagree, §10 records the
+disagreement rather than either side quietly winning.
 
 ---
 
@@ -219,7 +225,30 @@ against Rust-with-`m6-core`. Same language, same compiler, same payload, so the
 delta is exactly the overhead the library adds. If that number is not close to
 zero, `m6-core` has a problem worth knowing about.
 
-### 5.4 Honesty requirements
+### 5.4 Run from RAM, or the measurement is about the disk
+
+**The binaries, the payload and the sockets all live on tmpfs for a benchmark
+run.** Otherwise the numbers are partly a story about the filesystem, and which
+part varies with what else the box has touched recently.
+
+It matters most for the two figures this document asks for that are not
+steady-state throughput:
+
+- **Cold start to first successful response** reads the binary off disk. That is
+  the number which decides whether a backend can be scaled by adding instances,
+  and on a cold page cache it measures the disk rather than the runtime. The gap
+  is largest for exactly the examples whose binaries are largest, so it would
+  land as a size penalty on `rust-m6core` that has nothing to do with
+  `m6-core`.
+- **Reading the payload at startup**, which every example does, for the same
+  reason.
+
+On Linux the build host, `/dev/shm` is tmpfs and is what the benchmark uses.
+`/run` is also tmpfs and is where production sockets live, so a socket there is
+already in RAM. macOS has no tmpfs by default, so a run on a laptop states that
+it is not comparable to a build-host run rather than pretending otherwise.
+
+### 5.5 Honesty requirements
 
 Per the traps this project has already hit:
 
@@ -282,8 +311,10 @@ developers will not have every runtime installed.
 Same shape as the existing zero-warnings rule, which is enforced on Linux on
 the build host rather than on whatever the developer happens to be running.
 
-The build host currently has Python, C and C++. **Go must be installed**, and
-it is the highest value addition of the set for the reason in §4.
+**Go is installed**, 2026-09-13: `golang-go` 1.26.0 on the build host, and
+1.27.1 on the laptop via Homebrew. The build host now carries all four external
+runtimes, and `deploy/run-tests.sh` asserts each one and fails the run if any is
+absent, rather than letting a language go untested.
 
 ## 9. Deliberately out of scope
 
@@ -302,3 +333,71 @@ it is the highest value addition of the set for the reason in §4.
 - **Node, Ruby, PHP, Java.** Nothing against them. The set above already spans
   systems, scripting and a mature HTTP stack, and each addition is a runtime
   the build host must carry. Add one when there is a reason.
+
+---
+
+## 10. Where this document and the code disagree
+
+Writing the examples found contradictions between normative documents. They are
+recorded here rather than resolved by whichever file was edited last.
+
+### 10.1 Socket mode: 0666 in the spec, 0660 in core and in production
+
+`m6-backend-protocol.md` §1.2 step 3 says the backend MUST `chmod 0666`, and
+explains why: the proxy runs as a different user and cannot connect otherwise.
+It calls this the single most common cause of a backend that starts cleanly and
+is never contacted.
+
+**`m6-core` defaults to `0660`, and production runs `0660`.** The m6 handover
+records the move to 0660 as a deliberate hardening, away from a 0755 that came
+from the umask by accident. So the fleet contradicts the MUST and works, because
+the proxy is in the socket's group.
+
+The four hand-written examples implement 0666 as the spec states. The
+`rust-m6core` example sets `socket_mode = "0666"` in its own config to match
+them, so the shared test can assert one value. Nothing here changes core's
+default.
+
+**This wants a decision.** Either the spec should say 0660 with a note that the
+proxy must share the group, which is what actually runs and is tighter, or core
+should default to 0666, which is looser and would undo a deliberate hardening.
+The first looks right, and it is the owner's call, not a documentation tidy-up.
+
+### 10.2 A bare 404 has no body
+
+Core answers an unmatched path with a 404 and no body. That satisfies the
+protocol, which only asks for an honest status, but not §3 of this document,
+where every example serves "a small not-found page". The `rust-m6core` example
+registers a catch-all `/{*any}` route last so its 404 matches the other five.
+
+Not a defect in either document, but worth knowing before reading the examples
+side by side and wondering why one needed an extra route.
+
+### 10.3 Core minifies, and the examples must not
+
+Core's pipeline minifies and compresses what a handler returns. That is correct
+for a service returning a document, and wrong for these examples: protocol §3.6
+says a backend SHOULD NOT compress because the proxy negotiates and caches each
+representation itself, and a minified body would also make `rust-m6core`'s
+`/boom` 167 bytes where the other five send 178.
+
+Both HTML routes and `/status` in that example are therefore `.verbatim()`.
+`/status` would need it regardless: identical bytes across six languages is the
+whole point of that route, and anything that re-encodes could re-space them.
+
+---
+
+## 11. Still owed against this document
+
+- **The benchmark of §5**, including the `rust-plain` against `rust-m6core`
+  delta that §5.3 calls the genuinely informative comparison. The examples and
+  their conformance tests exist; the measurement does not yet.
+- **The through-the-proxy half of §7**: `X-Forwarded-For` carrying the real
+  client address, `X-Forwarded-Host` and `Via` arriving intact, the proxy
+  applying compression and caching on top of an uncompressed and uncached
+  backend response, `/boom` reported as a backend error and replaceable with a
+  styled error page, and a backend 404 passed through rather than replaced.
+  These need a TLS edge in the path; the socket-level half is done.
+- **A README per example**, which §4 asks for so a reader can tell whether they
+  are in the right place. The module-level comment in each file carries that
+  text today.
