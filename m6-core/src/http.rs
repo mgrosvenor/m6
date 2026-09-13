@@ -115,8 +115,11 @@ impl RawResponse {
         &self,
         resp: &mut crate::h1::Responder<'_, W>,
     ) -> std::io::Result<()> {
-        let hdrs: Vec<(&str, &str)> =
-            self.headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let hdrs: Vec<(&str, &str)> = self
+            .headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
         resp.send(self.status, &hdrs, &self.body)
     }
 
@@ -131,7 +134,6 @@ impl RawResponse {
         out
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -251,10 +253,14 @@ pub trait HeaderSource {
 
 impl HeaderSource for [(String, String)] {
     fn find(&self, name: &str) -> Option<&str> {
-        self.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+        self.iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
     }
     fn find_all<'a>(&'a self, name: &str) -> impl Iterator<Item = &'a str> {
-        self.iter().filter(move |(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+        self.iter()
+            .filter(move |(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
     }
 }
 

@@ -1,0 +1,92 @@
+# cargo-deny: what we will and will not depend on.
+#
+# Run locally with:  cargo deny check
+# CI runs it on every push.
+#
+# This exists because dependency problems are invisible until they are not.
+# The workspace was carrying two versions of `nix` until 2026-09-13, because
+# m6-file and m6-http declared it and used none of it, and nothing said so.
+
+[graph]
+all-features = false
+
+[advisories]
+# A known vulnerability in anything we ship fails the build. There is no
+# "informational" setting here on purpose: an advisory we have decided to
+# accept belongs in `ignore` below with a reason beside it, not hidden behind
+# a global severity threshold.
+#
+# EVERY ENTRY HERE IS A DEBT WITH AN ISSUE NUMBER. They are listed so the check
+# is green and the exceptions are visible; they are not listed because they are
+# acceptable. All of them are to be resolved before 1.0.
+ignore = [
+    # hpack: the decoder panics on some invalid input, and the crate is
+    # unmaintained. NOT REACHABLE HERE, and checked rather than asserted:
+    # `validate_hpack_block` walks every block before the decoder sees it and
+    # rejects malformed ones with GOAWAY(COMPRESSION_ERROR).
+    # `m6-http/src/http2.rs`'s `hpack_robustness` tests run hostile blocks
+    # through the production sequence and fail if any survives validation and
+    # panics. The maintained fork has the identical bug, so switching crates
+    # is not a fix.
+    { id = "RUSTSEC-2023-0084", reason = "decoder panic not reachable: validate_hpack_block rejects first, pinned by http2::hpack_robustness" },
+    { id = "RUSTSEC-2023-0085", reason = "unmaintained; the fork has the same bug, and our own validator is the defence" },
+
+    # The rest, tracked together.
+    # → https://github.com/mgrosvenor/m6/issues/3
+    { id = "RUSTSEC-2025-0134", reason = "see issue #3" },
+    { id = "RUSTSEC-2026-0235", reason = "see issue #3" },
+    { id = "RUSTSEC-2026-0253", reason = "see issue #3" },
+]
+
+[licenses]
+# BSD-3-Clause ourselves, and permissive licences only in the tree. A copyleft
+# dependency is a decision about how this software can be used, so it is one to
+# take deliberately rather than discover.
+confidence-threshold = 0.9
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+    "Unlicense",
+    "OpenSSL",
+    # The Mozilla root certificate store, shipped as data by webpki-roots. The
+    # Community Data License Agreement is permissive; it governs the data set
+    # rather than code, which is why it is not one of the usual names.
+    "CDLA-Permissive-2.0",
+]
+
+[bans]
+# Two versions of the same crate is usually an accident and always a cost:
+# longer builds, a larger binary, and two copies of whatever state it holds.
+# Warn rather than deny, because a transitive duplicate is often not ours to
+# fix, and the point is that it becomes visible.
+multiple-versions = "warn"
+# Warn, not deny. cargo-deny treats every crate here as publishable, and a
+# `path` dependency with no version is not publishable to crates.io. Giving the
+# intra-workspace dependencies explicit versions is the fix, and it is the
+# right one to make if these are ever published; it also means every release
+# has to bump them in step. That is a decision for the 1.0 work, not something
+# to slip in here, so for now it warns and stays visible.
+wildcards = "warn"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+# quiche is m6-http's HTTP/3 and QUIC implementation. It is taken from
+# Cloudflare's repository rather than crates.io and pinned to a tag, which is
+# deliberate: the crates.io releases lag, and HTTP/3 is the one place this
+# project does not write its own protocol implementation.
+#
+# Listed explicitly so that adding a *second* git dependency is a decision
+# somebody makes rather than something that arrives with a transitive update.
+allow-git = ["https://github.com/cloudflare/quiche"]

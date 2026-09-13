@@ -4,7 +4,7 @@
 /// Run with: cargo bench -p m6-http
 use criterion::{black_box, criterion_group, Criterion};
 
-use m6_http_lib::cache::{Cache, CacheKey, CachedResponse, make_lookup_key};
+use m6_http_lib::cache::{make_lookup_key, Cache, CacheKey, CachedResponse};
 use m6_http_lib::stats::{Channel, Iface, Stats, Version};
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -17,8 +17,14 @@ fn make_cache_with_entry() -> (Cache, &'static str, &'static str) {
     let resp = CachedResponse {
         status: 200,
         headers: std::sync::Arc::new(vec![
-            ("content-type".to_string(), "text/html; charset=utf-8".to_string()),
-            ("cache-control".to_string(), "public, max-age=3600".to_string()),
+            (
+                "content-type".to_string(),
+                "text/html; charset=utf-8".to_string(),
+            ),
+            (
+                "cache-control".to_string(),
+                "public, max-age=3600".to_string(),
+            ),
             ("vary".to_string(), "accept-encoding".to_string()),
         ]),
         body: bytes::Bytes::from_static(b"<html><body>hello world</body></html>"),
@@ -34,7 +40,9 @@ fn make_cache_with_entry() -> (Cache, &'static str, &'static str) {
 /// timings, then print p0/p1/p50/p99/p100/avg/stddev/count.
 fn report_percentiles<F: FnMut()>(label: &str, n: usize, mut f: F) {
     let warmup = n / 10;
-    for _ in 0..warmup { f(); }
+    for _ in 0..warmup {
+        f();
+    }
 
     let mut samples: Vec<u64> = Vec::with_capacity(n);
     for _ in 0..n {
@@ -52,19 +60,24 @@ fn report_percentiles<F: FnMut()>(label: &str, n: usize, mut f: F) {
     };
 
     let avg = samples.iter().sum::<u64>() as f64 / count;
-    let variance = samples.iter()
-        .map(|&x| { let d = x as f64 - avg; d * d })
-        .sum::<f64>() / count;
+    let variance = samples
+        .iter()
+        .map(|&x| {
+            let d = x as f64 - avg;
+            d * d
+        })
+        .sum::<f64>()
+        / count;
     let stddev = variance.sqrt();
 
     println!(
         "\n── {label} (n={n}) ─────────────────────────────────────────────\n\
          p0={p0}ns  p1={p1}ns  p50={p50}ns  p99={p99}ns  p100={p100}ns\n\
          avg={avg:.1}ns  stddev={stddev:.1}ns",
-        p0   = p(0.0),
-        p1   = p(1.0),
-        p50  = p(50.0),
-        p99  = p(99.0),
+        p0 = p(0.0),
+        p1 = p(1.0),
+        p50 = p(50.0),
+        p99 = p(99.0),
         p100 = p(100.0),
     );
 }
@@ -170,8 +183,8 @@ fn bench_h3_header_extract(c: &mut Criterion) {
             let mut enc = b"" as &[u8];
             for h in black_box(&headers) {
                 match h.name() {
-                    b":path"           => path = h.value(),
-                    b":method"         => method = h.value(),
+                    b":path" => path = h.value(),
+                    b":method" => method = h.value(),
                     b"accept-encoding" => enc = h.value(),
                     _ => {}
                 }
@@ -203,13 +216,13 @@ fn bench_full_cache_hit_path(c: &mut Criterion) {
             let mut enc: &[u8] = b"";
             for h in black_box(&headers) {
                 match h.name() {
-                    b":path"           => path = h.value(),
+                    b":path" => path = h.value(),
                     b"accept-encoding" => enc = h.value(),
                     _ => {}
                 }
             }
             let path_str = std::str::from_utf8(path).unwrap_or("/");
-            let enc_str  = std::str::from_utf8(enc).unwrap_or("");
+            let enc_str = std::str::from_utf8(enc).unwrap_or("");
             let mut buf = [0u8; 512];
             let key = make_lookup_key(path_str, None, enc_str, &mut buf);
             black_box(cache.get(key))
@@ -245,8 +258,14 @@ fn bench_parse_request(c: &mut Criterion) {
 fn bench_security_headers(c: &mut Criterion) {
     m6_http_lib::security::configure(&m6_http_lib::config::SecurityConfig::default());
     let response_headers = vec![
-        ("content-type".to_string(), "text/html; charset=utf-8".to_string()),
-        ("cache-control".to_string(), "public, max-age=3600".to_string()),
+        (
+            "content-type".to_string(),
+            "text/html; charset=utf-8".to_string(),
+        ),
+        (
+            "cache-control".to_string(),
+            "public, max-age=3600".to_string(),
+        ),
         ("alt-svc".to_string(), "h3=\":8443\"; ma=86400".to_string()),
     ];
     let mut group = c.benchmark_group("security_headers");
@@ -258,10 +277,7 @@ fn bench_security_headers(c: &mut Criterion) {
     group.bench_function("security_headers", |b| {
         b.iter(|| {
             out.clear();
-            m6_http_lib::security::write_h1_headers(
-                &mut out,
-                black_box(&response_headers),
-            );
+            m6_http_lib::security::write_h1_headers(&mut out, black_box(&response_headers));
             black_box(out.len())
         })
     });
@@ -318,9 +334,8 @@ fn bench_chunked_body_accumulation(c: &mut Criterion) {
     // so total copying is O(N²) in the number of chunks: quadrupling the body
     // should roughly 16x the clone variant while only 4x-ing the fixed one.
     for &body in &[256 * 1024usize, 1024 * 1024usize] {
-        let head = format!(
-            "POST /upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: {body}\r\n\r\n"
-        );
+        let head =
+            format!("POST /upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: {body}\r\n\r\n");
         let mut full = head.into_bytes();
         full.extend(std::iter::repeat(b'x').take(body));
         let kib = body / 1024;
@@ -409,7 +424,8 @@ fn bench_requires_auth(c: &mut Criterion) {
     group.sample_size(100_000);
 
     // Site with at least one protected route: a real lookup is required.
-    let guarded = RouteTable::for_bench(&[("/blog/{stem}", None), ("/admin", Some("group:admins"))]);
+    let guarded =
+        RouteTable::for_bench(&[("/blog/{stem}", None), ("/admin", Some("group:admins"))]);
     group.bench_function("site_with_protected_routes", |b| {
         b.iter(|| black_box(guarded.requires_auth(black_box("/blog/hello-world"))))
     });
@@ -449,11 +465,13 @@ fn main() {
     // Raw percentile report — 100K samples each, 10K warmup.
     const N: usize = 100_000;
 
-    println!("\n\
+    println!(
+        "\n\
         ════════════════════════════════════════════════════════════════\n\
         Raw percentile report  (100K samples, 10K warmup, release mode)\n\
         System: Apple M4 (macOS 15.7.4)\n\
-        ════════════════════════════════════════════════════════════════");
+        ════════════════════════════════════════════════════════════════"
+    );
 
     {
         let mut buf = [0u8; 512];
@@ -490,12 +508,12 @@ fn main() {
         let mut stats = Stats::new();
         report_percentiles("stats_record", N, || {
             stats.record(
-                    black_box(250),
-                    black_box(true),
-                    black_box(200),
-                    black_box(Channel::new(Version::Http2, Iface::External)),
-                    black_box("m6-html"),
-                );
+                black_box(250),
+                black_box(true),
+                black_box(200),
+                black_box(Channel::new(Version::Http2, Iface::External)),
+                black_box("m6-html"),
+            );
         });
     }
 
@@ -515,8 +533,8 @@ fn main() {
             let mut enc = b"" as &[u8];
             for h in black_box(&headers) {
                 match h.name() {
-                    b":path"           => path = h.value(),
-                    b":method"         => method = h.value(),
+                    b":path" => path = h.value(),
+                    b":method" => method = h.value(),
                     b"accept-encoding" => enc = h.value(),
                     _ => {}
                 }
@@ -541,13 +559,13 @@ fn main() {
             let mut enc: &[u8] = b"";
             for h in black_box(&headers) {
                 match h.name() {
-                    b":path"           => path = h.value(),
+                    b":path" => path = h.value(),
                     b"accept-encoding" => enc = h.value(),
                     _ => {}
                 }
             }
             let path_str = std::str::from_utf8(path).unwrap_or("/");
-            let enc_str  = std::str::from_utf8(enc).unwrap_or("");
+            let enc_str = std::str::from_utf8(enc).unwrap_or("");
             let mut buf = [0u8; 512];
             let key = make_lookup_key(path_str, None, enc_str, &mut buf);
             black_box(cache.get(key));

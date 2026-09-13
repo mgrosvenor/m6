@@ -75,7 +75,13 @@ pub fn parse_loadavg(s: &str) -> Option<LoadAverage> {
         }
         None => (0, 0),
     };
-    Some(LoadAverage { one, five, fifteen, running, total })
+    Some(LoadAverage {
+        one,
+        five,
+        fifteen,
+        running,
+        total,
+    })
 }
 
 /// Logical CPUs available to this process.
@@ -84,7 +90,9 @@ pub fn parse_loadavg(s: &str) -> Option<LoadAverage> {
 /// platform exposes them, which is what a load comparison wants: the number of
 /// CPUs this process may actually run on, not the number the machine has.
 pub fn cpu_count() -> usize {
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
 }
 
 // ── Memory ───────────────────────────────────────────────────────────────────
@@ -208,7 +216,11 @@ pub fn disk(path: &Path) -> Option<Disk> {
         // f_frsize is the fragment size and is the unit f_blocks and f_bavail
         // are counted in. f_bsize is the preferred I/O block size and is not
         // the same thing, though they usually match.
-        let unit = if st.f_frsize > 0 { st.f_frsize } else { st.f_bsize } as u64;
+        let unit = if st.f_frsize > 0 {
+            st.f_frsize
+        } else {
+            st.f_bsize
+        } as u64;
         Some(Disk {
             total_bytes: st.f_blocks as u64 * unit,
             available_bytes: st.f_bavail as u64 * unit,
@@ -238,7 +250,6 @@ pub fn parse_uptime(s: &str) -> Option<std::time::Duration> {
     let secs: f64 = s.split_whitespace().next()?.parse().ok()?;
     Some(std::time::Duration::from_secs_f64(secs))
 }
-
 
 // ── Network interfaces ───────────────────────────────────────────────────────
 
@@ -276,19 +287,30 @@ impl NetDevice {
 pub fn parse_net_dev(s: &str) -> Vec<NetDevice> {
     let mut out = Vec::new();
     for line in s.lines().skip(2) {
-        let Some((name, rest)) = line.split_once(':') else { continue };
+        let Some((name, rest)) = line.split_once(':') else {
+            continue;
+        };
         let name = name.trim();
         if name == "lo" {
             continue;
         }
-        let f: Vec<u64> = rest.split_whitespace().filter_map(|v| v.parse().ok()).collect();
+        let f: Vec<u64> = rest
+            .split_whitespace()
+            .filter_map(|v| v.parse().ok())
+            .collect();
         if f.len() < 16 {
             continue;
         }
         out.push(NetDevice {
             name: name.to_string(),
-            rx_bytes: f[0], rx_packets: f[1], rx_errs: f[2], rx_drop: f[3],
-            tx_bytes: f[8], tx_packets: f[9], tx_errs: f[10], tx_drop: f[11],
+            rx_bytes: f[0],
+            rx_packets: f[1],
+            rx_errs: f[2],
+            rx_drop: f[3],
+            tx_bytes: f[8],
+            tx_packets: f[9],
+            tx_errs: f[10],
+            tx_drop: f[11],
         });
     }
     out
@@ -382,7 +404,9 @@ pub fn parse_pressure(s: &str) -> Option<Pressure> {
         }
         seen = true;
         for tok in line.split_whitespace() {
-            let Some((k, v)) = tok.split_once('=') else { continue };
+            let Some((k, v)) = tok.split_once('=') else {
+                continue;
+            };
             let Ok(v) = v.parse::<f32>() else { continue };
             match (full, k) {
                 (false, "avg10") => p.some_avg10 = v,
@@ -424,8 +448,12 @@ pub fn parse_netstat(s: &str) -> TcpHealth {
     let lines: Vec<&str> = s.lines().collect();
     for pair in lines.windows(2) {
         let (names, values) = (pair[0], pair[1]);
-        let Some((np, nrest)) = names.split_once(':') else { continue };
-        let Some((vp, vrest)) = values.split_once(':') else { continue };
+        let Some((np, nrest)) = names.split_once(':') else {
+            continue;
+        };
+        let Some((vp, vrest)) = values.split_once(':') else {
+            continue;
+        };
         if np != vp {
             continue;
         }
@@ -447,7 +475,10 @@ pub fn parse_sockstat_into(s: &str, t: &mut TcpHealth) {
     for line in s.lines() {
         let f: Vec<&str> = line.split_whitespace().collect();
         let get = |key: &str| -> Option<u64> {
-            f.iter().position(|x| *x == key).and_then(|i| f.get(i + 1)).and_then(|v| v.parse().ok())
+            f.iter()
+                .position(|x| *x == key)
+                .and_then(|i| f.get(i + 1))
+                .and_then(|v| v.parse().ok())
         };
         if line.starts_with("sockets:") {
             t.sockets_used = get("used").unwrap_or(0);
@@ -493,10 +524,16 @@ pub fn parse_fd_limits(s: &str) -> Option<(u64, u64)> {
         let rest = line.trim_start_matches("Max open files").trim();
         let f: Vec<&str> = rest.split_whitespace().collect();
         let parse = |v: &str| -> u64 {
-            if v == "unlimited" { u64::MAX } else { v.parse().unwrap_or(0) }
+            if v == "unlimited" {
+                u64::MAX
+            } else {
+                v.parse().unwrap_or(0)
+            }
         };
-        return Some((parse(f.first().copied().unwrap_or("0")),
-                     parse(f.get(1).copied().unwrap_or("0"))));
+        return Some((
+            parse(f.first().copied().unwrap_or("0")),
+            parse(f.get(1).copied().unwrap_or("0")),
+        ));
     }
     None
 }
@@ -561,19 +598,27 @@ pub fn snapshot(disk_path: &Path) -> HostSnapshot {
 
 #[cfg(target_os = "linux")]
 pub fn net_devices() -> Vec<NetDevice> {
-    std::fs::read_to_string("/proc/net/dev").map(|s| parse_net_dev(&s)).unwrap_or_default()
+    std::fs::read_to_string("/proc/net/dev")
+        .map(|s| parse_net_dev(&s))
+        .unwrap_or_default()
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn net_devices() -> Vec<NetDevice> { Vec::new() }
+pub fn net_devices() -> Vec<NetDevice> {
+    Vec::new()
+}
 
 #[cfg(target_os = "linux")]
 pub fn disk_io() -> Vec<DiskIo> {
-    std::fs::read_to_string("/proc/diskstats").map(|s| parse_diskstats(&s)).unwrap_or_default()
+    std::fs::read_to_string("/proc/diskstats")
+        .map(|s| parse_diskstats(&s))
+        .unwrap_or_default()
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn disk_io() -> Vec<DiskIo> { Vec::new() }
+pub fn disk_io() -> Vec<DiskIo> {
+    Vec::new()
+}
 
 #[cfg(target_os = "linux")]
 pub fn pressure(resource: &str) -> Option<Pressure> {
@@ -581,7 +626,9 @@ pub fn pressure(resource: &str) -> Option<Pressure> {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn pressure(_resource: &str) -> Option<Pressure> { None }
+pub fn pressure(_resource: &str) -> Option<Pressure> {
+    None
+}
 
 #[cfg(target_os = "linux")]
 pub fn tcp_health() -> Option<TcpHealth> {
@@ -593,17 +640,25 @@ pub fn tcp_health() -> Option<TcpHealth> {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn tcp_health() -> Option<TcpHealth> { None }
+pub fn tcp_health() -> Option<TcpHealth> {
+    None
+}
 
 #[cfg(target_os = "linux")]
 pub fn file_descriptors() -> Option<FileDescriptors> {
     let open = std::fs::read_dir("/proc/self/fd").ok()?.count() as u64;
     let (soft, hard) = parse_fd_limits(&std::fs::read_to_string("/proc/self/limits").ok()?)?;
-    Some(FileDescriptors { open, soft_limit: soft, hard_limit: hard })
+    Some(FileDescriptors {
+        open,
+        soft_limit: soft,
+        hard_limit: hard,
+    })
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn file_descriptors() -> Option<FileDescriptors> { None }
+pub fn file_descriptors() -> Option<FileDescriptors> {
+    None
+}
 
 #[cfg(target_os = "linux")]
 pub fn load_average() -> Option<LoadAverage> {
@@ -672,7 +727,10 @@ pub fn thermal_zones() -> Vec<ThermalZone> {
         let label = std::fs::read_to_string(path.join("type"))
             .map(|s| s.trim().to_string())
             .unwrap_or_else(|_| name.clone());
-        out.push(ThermalZone { name: label, celsius });
+        out.push(ThermalZone {
+            name: label,
+            celsius,
+        });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
@@ -732,10 +790,8 @@ mod tests {
     /// emergency on a healthy machine.
     #[test]
     fn mem_free_is_only_a_fallback() {
-        let with_available = parse_meminfo(
-            "MemTotal: 1000 kB\nMemFree: 10 kB\nMemAvailable: 800 kB\n",
-        )
-        .unwrap();
+        let with_available =
+            parse_meminfo("MemTotal: 1000 kB\nMemFree: 10 kB\nMemAvailable: 800 kB\n").unwrap();
         assert_eq!(with_available.available_bytes, 800 * 1024);
 
         let without = parse_meminfo("MemTotal: 1000 kB\nMemFree: 10 kB\n").unwrap();
@@ -785,7 +841,10 @@ mod tests {
         assert!(parse_loadavg("").is_none());
         assert!(parse_loadavg("nonsense").is_none());
         assert!(parse_meminfo("").is_none());
-        assert!(parse_meminfo("MemFree: 10 kB\n").is_none(), "no MemTotal, no answer");
+        assert!(
+            parse_meminfo("MemFree: 10 kB\n").is_none(),
+            "no MemTotal, no answer"
+        );
         assert!(parse_uptime("").is_none());
     }
 
@@ -931,8 +990,15 @@ enp1s0: 2929071615 3102200    0    0    0     0          0         0 3105995619 
         assert_eq!(soft, 1024);
         assert_eq!(hard, 524288);
 
-        let f = FileDescriptors { open: 512, soft_limit: soft, hard_limit: hard };
-        assert!((f.used_fraction() - 0.5).abs() < 1e-9, "headroom is against the SOFT limit");
+        let f = FileDescriptors {
+            open: 512,
+            soft_limit: soft,
+            hard_limit: hard,
+        };
+        assert!(
+            (f.used_fraction() - 0.5).abs() < 1e-9,
+            "headroom is against the SOFT limit"
+        );
     }
 
     #[test]
@@ -940,7 +1006,10 @@ enp1s0: 2929071615 3102200    0    0    0     0          0         0 3105995619 
         let s = "Max open files            unlimited            unlimited            files\n";
         let (soft, _) = parse_fd_limits(s).unwrap();
         assert_eq!(soft, u64::MAX);
-        assert_eq!(parse_fd_limits("Max locked memory 8388608 8388608 bytes\n"), None);
+        assert_eq!(
+            parse_fd_limits("Max locked memory 8388608 8388608 bytes\n"),
+            None
+        );
     }
 
     /// Everything is optional and a snapshot on a machine missing any of it

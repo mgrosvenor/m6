@@ -43,7 +43,6 @@
 /// [`ShutdownHandle::install`] now refuses to start unless [`block`] has
 /// already run, because the failure is silent and only shows up as a service
 /// that will not stop cleanly.
-
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -135,7 +134,11 @@ pub struct Service {
 impl Service {
     /// A service with no unix socket and no wake pipe.
     pub fn new(name: impl Into<String>) -> Self {
-        Service { name: name.into(), socket: None, wake_fd: None }
+        Service {
+            name: name.into(),
+            socket: None,
+            wake_fd: None,
+        }
     }
 
     /// Set the unix socket to wake through and unlink.
@@ -210,7 +213,11 @@ impl ShutdownHandle {
         // a thread other than main still needs the mask set here.
         block();
 
-        let Service { name, socket, wake_fd } = service;
+        let Service {
+            name,
+            socket,
+            wake_fd,
+        } = service;
         let name: Arc<str> = Arc::from(name);
         let socket = socket.map(Arc::new);
 
@@ -296,7 +303,11 @@ impl ShutdownHandle {
     /// Every service says the same thing, so `grep 'shutdown complete'` is a
     /// uniform signal across the fleet rather than a per-app accident.
     pub fn complete(&self) {
-        finish(&self.name, self.socket.as_deref().map(|p| p.as_path()), "complete");
+        finish(
+            &self.name,
+            self.socket.as_deref().map(|p| p.as_path()),
+            "complete",
+        );
     }
 
     /// Returns true if graceful shutdown has been requested.
@@ -374,7 +385,10 @@ mod tests {
     #[test]
     fn block_blocks_both_signals_this_module_owns() {
         let _ = managed().thread_unblock();
-        assert!(!blocked_here(), "precondition: signals start unblocked here");
+        assert!(
+            !blocked_here(),
+            "precondition: signals start unblocked here"
+        );
         block();
         assert!(blocked_here());
         let _ = managed().thread_unblock();
@@ -385,7 +399,10 @@ mod tests {
         let _guard = flag_guard();
         SHUTDOWN_FLAG.store(false, Ordering::SeqCst);
         SIGNAL_COUNT.store(0, Ordering::SeqCst);
-        let handle = ShutdownHandle { name: Arc::from("test"), socket: None };
+        let handle = ShutdownHandle {
+            name: Arc::from("test"),
+            socket: None,
+        };
         assert!(!handle.is_shutdown());
         assert!(!is_shutdown());
     }
@@ -394,7 +411,10 @@ mod tests {
     fn the_flag_is_shared_by_every_clone_and_the_free_function() {
         let _guard = flag_guard();
         SHUTDOWN_FLAG.store(false, Ordering::SeqCst);
-        let handle = ShutdownHandle { name: Arc::from("test"), socket: None };
+        let handle = ShutdownHandle {
+            name: Arc::from("test"),
+            socket: None,
+        };
         let clone = handle.clone();
         SHUTDOWN_FLAG.store(true, Ordering::SeqCst);
         assert!(handle.is_shutdown());
