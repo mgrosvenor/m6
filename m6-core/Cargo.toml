@@ -62,7 +62,7 @@ flate2      = "1"
 base64      = "0.22"
 filetime    = "0.2"
 chrono      = { version = "0.4", features = ["serde"] }
-lru         = "0.16"
+lru         = "0.18"
 slug        = "0.1"
 
 tera          = { version = "1",    optional = true }
