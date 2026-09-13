@@ -147,6 +147,78 @@ fn require_all() -> bool {
     std::env::var("M6_BACKENDS_REQUIRE_ALL").is_ok_and(|v| v == "1")
 }
 
+/// Compile each language once per test binary, not once per test.
+///
+/// Seven tests times three compiled languages was twenty-one invocations of a
+/// compiler, and on the build host that was most of the 110 seconds this file
+/// took. The built binaries do not depend on which test asked for them, so they
+/// are cached here and the scratch directory per backend holds only its socket.
+fn built_binary(lang: Lang, src: &Path) -> PathBuf {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    static CACHE: OnceLock<Mutex<HashMap<&'static str, PathBuf>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+
+    // The lock is held across the compile deliberately: two tests starting the
+    // same language at once would otherwise both build, to the same output path,
+    // and the second link would truncate the binary the first had just started
+    // running. That is the same shape as the scratch-directory collision this
+    // file already had once.
+    let mut guard = cache.lock().expect("build cache");
+    if let Some(p) = guard.get(lang.dir()) {
+        return p.clone();
+    }
+
+    let dir = PathBuf::from(format!("/tmp/m6bx-build-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("build dir");
+    let bin = dir.join(lang.dir());
+
+    match lang {
+        Lang::C => compile(
+            "cc",
+            &[
+                "-std=c11",
+                "-O2",
+                "-pthread",
+                "-o",
+                bin.to_str().unwrap(),
+                src.join("main.c").to_str().unwrap(),
+            ],
+        ),
+        Lang::Cpp => compile(
+            "c++",
+            &[
+                "-std=c++17",
+                "-O2",
+                "-pthread",
+                "-o",
+                bin.to_str().unwrap(),
+                src.join("main.cpp").to_str().unwrap(),
+            ],
+        ),
+        Lang::Go => {
+            let out = Command::new("go")
+                .args(["build", "-o", bin.to_str().unwrap(), "."])
+                .current_dir(src)
+                // Go wants a writable cache and the environment may have no HOME.
+                .env("GOCACHE", dir.join("gocache"))
+                .output()
+                .expect("go build");
+            assert!(
+                out.status.success(),
+                "go build failed:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        Lang::Python | Lang::RustPlain | Lang::RustM6core => {
+            unreachable!("{} is not compiled here", lang.dir())
+        }
+    }
+    guard.insert(lang.dir(), bin.clone());
+    bin
+}
+
 /// A running backend, killed and cleaned up on drop.
 struct Backend {
     lang: Lang,
@@ -183,55 +255,8 @@ impl Backend {
         let src = backends_dir().join(lang.dir());
 
         let mut cmd = match lang {
-            Lang::C => {
-                let bin = scratch.path().join("ex");
-                compile(
-                    "cc",
-                    &[
-                        "-std=c11",
-                        "-O2",
-                        "-pthread",
-                        "-o",
-                        bin.to_str().unwrap(),
-                        src.join("main.c").to_str().unwrap(),
-                    ],
-                );
-                let mut c = Command::new(bin);
-                c.arg(&sock).arg(payload_path());
-                c
-            }
-            Lang::Cpp => {
-                let bin = scratch.path().join("ex");
-                compile(
-                    "c++",
-                    &[
-                        "-std=c++17",
-                        "-O2",
-                        "-pthread",
-                        "-o",
-                        bin.to_str().unwrap(),
-                        src.join("main.cpp").to_str().unwrap(),
-                    ],
-                );
-                let mut c = Command::new(bin);
-                c.arg(&sock).arg(payload_path());
-                c
-            }
-            Lang::Go => {
-                let bin = scratch.path().join("ex");
-                let out = Command::new("go")
-                    .args(["build", "-o", bin.to_str().unwrap(), "."])
-                    .current_dir(&src)
-                    // Go wants a writable cache; the sandbox may not have HOME.
-                    .env("GOCACHE", scratch.path().join("gocache"))
-                    .output()
-                    .expect("go build");
-                assert!(
-                    out.status.success(),
-                    "go build failed:\n{}",
-                    String::from_utf8_lossy(&out.stderr)
-                );
-                let mut c = Command::new(bin);
+            Lang::C | Lang::Cpp | Lang::Go => {
+                let mut c = Command::new(built_binary(lang, &src));
                 c.arg(&sock).arg(payload_path());
                 c
             }
