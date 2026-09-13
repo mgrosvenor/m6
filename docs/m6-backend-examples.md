@@ -411,7 +411,7 @@ becomes `internal` (`m6-http/src/error.rs:22`). The first version of the
 through-proxy test wrote exactly that and spent a while looking like a proxy
 bug.
 
-### 10.5 The proxy does not compress, and two documents say it does
+### 10.5 The proxy does not compress — RESOLVED 2026-09-13
 
 This is the largest of the disagreements and the one with a consequence for
 anyone writing a backend.
@@ -440,12 +440,34 @@ what §3.6 tells backends not to do. For a C, Go or Python backend written from
 the specification as written, it is not invisible at all: the site simply
 serves them uncompressed.
 
-`backends_through_proxy.rs` asserts the current behaviour and names this
-section, rather than carrying a permanently failing test. Resolving it is either
-teaching the proxy to compress, which is the behaviour both documents already
-promise, or correcting both documents to say that compression is the backend's
-job and `m6-core` is how a Rust backend gets it. The first matches what a reader
-of the protocol expects; the second matches the fleet. Owner's call.
+**Resolved, owner's decision 2026-09-13: m6-http is explicitly a cache, not a
+transformer.** The documents were wrong, not the code. Compression is the
+backend's job, `m6-core` is how a Rust backend gets it, and the proxy negotiates
+between and caches the representations a backend produced.
+
+What changed:
+
+- Protocol §3.6 rewritten to say so, with a new §3.6.1 for the config key.
+- **`[[backend]] compresses = <bool>` in `site.toml`, read by BOTH sides**,
+  default `true` because every backend here is built on core. The edge uses it
+  to decide whether to add `Vary: Accept-Encoding`: for a backend with one
+  representation that header promises variants that cannot exist and fragments
+  every shared cache downstream for nothing.
+- **The backend refuses to start if it disagrees with the edge.**
+  `m6_core::compress::check_declared_support` runs before binding and exits 2,
+  which is what §8.3 reserves for a configuration error. Both directions fault,
+  and `declared false while compressing` is the dangerous one: the edge stops
+  varying while the backend still returns brotli, so a compressed body can be
+  cached and replayed to a client that asked for identity.
+- All six examples declare `compresses = false`, which is the truth about them,
+  and `backends_through_proxy.rs` asserts the edge then sends no
+  `Vary: Accept-Encoding`. That test was checked by flipping the key to `true`
+  and confirming it fails, so it discriminates rather than merely passing.
+
+The gap is now explicit and visible rather than closed, which is what was asked
+for. A non-Rust backend still serves uncompressed bytes if it chooses not to
+compress — but it chooses that knowingly, the config records it, and nothing
+promises otherwise.
 
 ---
 
@@ -471,7 +493,7 @@ of the protocol expects; the second matches the fleet. Owner's call.
 - ~~The through-the-proxy half of §7~~ **done 2026-09-13**,
   `m6-http/tests/backends_through_proxy.rs`: six tests, each example behind a
   real m6-http over TLS. Two of the behaviours §7 promised turned out not to
-  happen, and are recorded in §10.4 and §10.5 rather than asserted. The
+  happen; §10.5 is now resolved and §10.4 is recorded rather than asserted. The
   `X-Forwarded-For` and `Via` checks are deliberately not duplicated here:
   `security_regressions.rs` already asserts them against the forwarded request
   itself, which is a better layer than inferring them from a backend's reply,
@@ -483,4 +505,5 @@ of the protocol expects; the second matches the fleet. Owner's call.
   same argument at the point where someone is reading the code.
 
 Nothing else on this document is outstanding. What remains are the two decisions
-in §10.1 and §10.5, which are the owner's rather than tasks.
+in §10.1 and §10.4. §10.5 is settled: the proxy is a cache, not a transformer,
+and the two sides now agree in config.

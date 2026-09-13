@@ -247,7 +247,9 @@ rebasable. Pinned by **revision, not branch**, so the dependency cannot move
 under a build that claims to be reproducible. quiche's own suite passes on it:
 1123 tests, zero failures.
 
-**What it costs, and this is not a formality.** Both PRs are unmerged and both
+**ACCEPTED, owner's decision 2026-09-13.** Not an open question. What it costs
+is recorded so it can be re-read when upstream releases the fixes and the fork
+can be dropped for a tag. Both PRs are unmerged and both
 come from third-party forks, not Cloudflare, so the QUIC transport path of a
 production edge now carries community changes upstream has not reviewed, plus 25
 unreleased master commits. #2575's own commit message records that the ideal
@@ -356,14 +358,15 @@ Writing the examples found them. All five are in
   defaults to 0660 and production runs 0660, because the proxy shares the group.
   The fleet contradicts a MUST and works. Either the spec says 0660, or core
   loosens and undoes a deliberate hardening.
-- **§10.5, compression.** Protocol §3.6 tells backends not to compress because
-  "the proxy performs content negotiation and compression itself". **m6-http has
-  no compressor.** brotli and flate2 are only in m6-core; the proxy caches and
-  selects per-encoding variants of what a backend produced. Measured: 660 bytes
-  through the edge with `Accept-Encoding: br, gzip` come back uncompressed. So a
-  C, Go or Python backend written from the spec serves uncompressed bytes
-  forever, and it is invisible for the Rust services only because m6-core
-  compresses on the backend side, which is what §3.6 tells backends not to do.
+- ~~**§10.5, compression.**~~ **SETTLED 2026-09-13: m6-http is a cache, not a
+  transformer.** The documents were wrong, not the code: brotli and flate2 live
+  in m6-core, the proxy has no compressor, and it negotiates between and caches
+  the representations a backend produced. Protocol §3.6 now says so and §3.6.1
+  adds `[[backend]] compresses = <bool>` to site.toml, **read by both sides**.
+  The edge uses it to decide whether to add `Vary: Accept-Encoding`; the backend
+  refuses to start if it disagrees, exiting 2 before binding. Default true,
+  because every backend here is built on core. The quiche fork is accepted too,
+  so neither of these is an open question any more.
 
 The other three are smaller: a bare 404 has no body, core minifies what the
 examples must not, and no error mode relays a backend's own error page.

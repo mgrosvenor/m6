@@ -185,11 +185,60 @@ impl Service {
     }
 
     fn death_report(&self, context: &str, status: ExitStatus) -> String {
+        let out = self.output();
         format!(
-            "{} exited while {context}: {status}\n--- output ---\n{}",
+            "{} exited while {context}: {status}\n--- output ---\n{}{}",
             self.name,
-            tail(&self.output(), 40)
+            tail(&out, 40),
+            who_holds_the_port(&out),
         )
+    }
+}
+
+/// If the child died because a port was taken, say WHO has it.
+///
+/// This exists because a full-workspace run fails about one time in three with
+/// `Address already in use` on a port the allocator had just probed as free, a
+/// DIFFERENT test losing each time, and none of the obvious explanations
+/// survived checking: the claim protocol is an O_EXCL marker plus a bind probe,
+/// nothing in the tree binds a fixed port in 20000..=29999, and this laptop's
+/// ephemeral range really is 49152..=65535 as `port.rs` claims. So the holder is
+/// something none of that accounts for, and the only way to find out is to ask
+/// at the moment it happens.
+///
+/// The h2 lesson applied: a count without a name cannot be diagnosed, and the
+/// temptation is then to call it a flake. `lsof` is best-effort — absent on some
+/// systems, and the holder may already be gone by the time this runs, which is
+/// itself worth knowing.
+fn who_holds_the_port(output: &str) -> String {
+    let Some(port) = output
+        .split("bind=127.0.0.1:")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split(|c: char| !c.is_ascii_digit())
+                .next()
+                .filter(|d| !d.is_empty())
+        })
+        .map(str::to_string)
+    else {
+        return String::new();
+    };
+
+    let listing = std::process::Command::new("lsof")
+        .args(["-nP", &format!("-iTCP:{port}")])
+        .output()
+        .ok()
+        .filter(|o| !o.stdout.is_empty())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+
+    match listing {
+        Some(l) => format!("\n--- who holds port {port} (lsof, taken after the failure) ---\n{l}"),
+        None => format!(
+            "\n--- nothing holds port {port} by the time lsof ran ---\n\
+             The holder released it between the failed bind and this check, so it \
+             was transient rather than a long-lived listener. That rules out a \
+             stray service and points at a short-lived socket.\n"
+        ),
     }
 }
 
