@@ -385,6 +385,70 @@ Both HTML routes and `/status` in that example are therefore `.verbatim()`.
 `/status` would need it regardless: identical bytes across six languages is the
 whole point of that route, and anything that re-encodes could re-space them.
 
+### 10.4 A backend's 404 body never reaches the client
+
+§7 of this document says an unknown path "produces the backend's 404, not
+m6-http's". That is true of the **status** and false of the **body**.
+
+The status is genuinely the backend's: the proxy routes the request, forwards it
+and relays what comes back. `/boom` proves the relaying, because a 500 is not a
+status the proxy would invent for a route that resolved.
+
+The body belongs to the edge, under `[errors] mode`:
+
+| mode | what the client gets for a backend 404 |
+|---|---|
+| `internal`, the default | m6-http's own error page |
+| `status` | the status and an empty body |
+| `custom` | the document named in config |
+
+**No mode relays the backend's own error page.** So an example's carefully
+written 404 page is never seen through a proxy, only on its socket. Either §7
+should say "status" or the proxy should gain a passthrough mode. Owner's call.
+
+Worth knowing separately: `"passthrough"` is not a valid mode and silently
+becomes `internal` (`m6-http/src/error.rs:22`). The first version of the
+through-proxy test wrote exactly that and spent a while looking like a proxy
+bug.
+
+### 10.5 The proxy does not compress, and two documents say it does
+
+This is the largest of the disagreements and the one with a consequence for
+anyone writing a backend.
+
+- protocol §3.6: "The backend SHOULD NOT compress its response... **The proxy
+  performs content negotiation and compression itself**, caches each
+  representation, and reuses it across clients."
+- §7 of this document: "m6-http applies compression and caching **on top of** an
+  uncompressed, uncached backend response, proving that the backend need not
+  participate."
+
+**m6-http has no compressor.** `brotli` and `flate2` appear only in
+`m6-core/Cargo.toml`, the only implementation is `m6-core/src/compress.rs`, and
+nothing under `m6-http/src` calls it. What the proxy does is cache and select
+per-encoding *variants* of whatever a backend produced, keyed on
+content-encoding: negotiation over what already exists, not compression.
+
+Confirmed by measurement, not just by reading: 660 bytes of JSON requested
+through the edge with `Accept-Encoding: br, gzip` come back with no
+`Content-Encoding` and the identity length, for all six examples.
+
+**The consequence.** A backend that follows §3.6 and declines to compress has
+its bytes delivered uncompressed, always. For the Rust services this is
+invisible, because `m6-core` compresses on the backend side, which is precisely
+what §3.6 tells backends not to do. For a C, Go or Python backend written from
+the specification as written, it is not invisible at all: the site simply
+serves them uncompressed.
+
+`backends_through_proxy.rs` asserts the current behaviour and names this
+section, rather than carrying a permanently failing test. Resolving it is either
+teaching the proxy to compress, which is the behaviour both documents already
+promise, or correcting both documents to say that compression is the backend's
+job and `m6-core` is how a Rust backend gets it. The first matches what a reader
+of the protocol expects; the second matches the fleet. Owner's call.
+
+---
+
 ---
 
 ## 11. Still owed against this document
@@ -404,12 +468,15 @@ whole point of that route, and anything that re-encodes could re-space them.
   pooling against thread-per-connection. `rust-plain` now uses protocol §7's
   reference model, which is what it should always have been, and that alone took
   it from 17,608 to 46,826 rps.
-- **The through-the-proxy half of §7**: `X-Forwarded-For` carrying the real
-  client address, `X-Forwarded-Host` and `Via` arriving intact, the proxy
-  applying compression and caching on top of an uncompressed and uncached
-  backend response, `/boom` reported as a backend error and replaceable with a
-  styled error page, and a backend 404 passed through rather than replaced.
-  These need a TLS edge in the path; the socket-level half is done.
+- ~~The through-the-proxy half of §7~~ **done 2026-09-13**,
+  `m6-http/tests/backends_through_proxy.rs`: six tests, each example behind a
+  real m6-http over TLS. Two of the behaviours §7 promised turned out not to
+  happen, and are recorded in §10.4 and §10.5 rather than asserted. The
+  `X-Forwarded-For` and `Via` checks are deliberately not duplicated here:
+  `security_regressions.rs` already asserts them against the forwarded request
+  itself, which is a better layer than inferring them from a backend's reply,
+  and re-asserting them would have meant growing a sixth route on all six
+  examples that §3 does not have.
 - **A README per example**, which §4 asks for so a reader can tell whether they
   are in the right place. The module-level comment in each file carries that
   text today.
