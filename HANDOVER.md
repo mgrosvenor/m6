@@ -316,12 +316,12 @@ applied them:
   and the test reported the symptom rather than the cause.
 - **Clippy is a gate now**, on the owner's instruction: `tools/clippy.sh`,
   wired into `check.sh` (step 2, so the pre-push hook covers it) and into the
-  Linux gate before prod. It is a **ratchet**, not `-D warnings`: the count may
+  Linux gate before prod. The count may fall and may never rise, rather than `-D warnings`: the count may
   fall and may never rise. Ceilings are **per platform** because clippy
   versions disagree, at `tools/clippy-ceiling-Darwin.txt` (157) and
   `tools/clippy-ceiling-Linux.txt` (145). A clippy *error* fails regardless.
   **Driving the ceiling to zero is outstanding and not yet approved as work.**
-- h1spec **32/32 on all four HTTP/1.1 targets**, with a CI ratchet
+- h1spec **32/32 on all four HTTP/1.1 targets**, with a recorded minimum
   (`tools/conformance.sh`, floors in `tools/conformance-scores.txt`) wired into
   `check.sh` as a blocking gate.
 - h2spec and h3spec are **not installed on the laptop** and skip on every local
@@ -626,7 +626,7 @@ not recur.
 ### The tooling changed under you
 
 - **Clippy is a gate**, on the owner's instruction. `tools/clippy.sh`, in
-  `check.sh` step 2 and in the Linux gate. A ratchet, per platform, and a
+  `check.sh` step 2 and in the Linux gate. Per platform, and the count may fall and may never rise, and a
   clippy *error* fails regardless of the ceiling.
 - **`health-check.py` missed self-identifying bots four separate ways** and now
   has `--self-test`. `bot\b` does not match `OnlineOrNot.com_bot_1.0`; a
@@ -684,7 +684,7 @@ the script reported PASS**, which is two bugs in `tools/conformance.sh`:
   `conformance.sh h3` tests a port with nothing on it.
 - It only records a score `if got > 0`, so measuring nothing reports PASS.
 - Separately, `MEASURED="$WORK/measured.txt"` is truncated at script init but
-  `mkdir -p "$WORK"` runs ~330 lines later, so on a fresh box the ratchet's
+  `mkdir -p "$WORK"` runs ~330 lines later, so on a fresh box the minimum-score check's
   bookkeeping silently fails to write.
 
 There are **no h2 or h3 floors** in `conformance-scores.txt`, only the four h1
