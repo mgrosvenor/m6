@@ -82,7 +82,7 @@ pub struct CompressionLevel {
 /// Log configuration from `[log]` in the renderer config file.
 #[derive(Debug, Clone, Default)]
 pub struct LogConfig {
-    pub level:  Option<String>,
+    pub level: Option<String>,
     pub format: Option<String>,
 }
 
@@ -144,7 +144,10 @@ fn default_minification() -> MinificationConfig {
     // and falls back to original bytes on parse failure.
     m.insert("application/javascript".to_string(), true);
     m.insert("text/javascript".to_string(), true);
-    MinificationConfig { enabled: m, inline_js: false }
+    MinificationConfig {
+        enabled: m,
+        inline_js: false,
+    }
 }
 
 /// Framework-consumed top-level keys that must not appear in the request dict.
@@ -194,7 +197,9 @@ fn merge_toml(dst: &mut toml::Value, src: toml::Value) {
     match (dst, src) {
         (toml::Value::Table(d), toml::Value::Table(s)) => {
             for (k, v) in s {
-                let entry = d.entry(k).or_insert(toml::Value::Table(toml::map::Map::new()));
+                let entry = d
+                    .entry(k)
+                    .or_insert(toml::Value::Table(toml::map::Map::new()));
                 merge_toml(entry, v);
             }
         }
@@ -221,7 +226,9 @@ fn default_compression() -> std::collections::HashMap<String, CompressionLevel> 
 }
 
 fn parse_config(tv: toml::Value, _site_dir: &Path) -> anyhow::Result<RendererConfig> {
-    let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
 
     // --- thread_pool ---
     let tp_size = tv
@@ -323,7 +330,9 @@ fn parse_config(tv: toml::Value, _site_dir: &Path) -> anyhow::Result<RendererCon
             if key == "inline_js" {
                 minification.inline_js = val.as_bool().unwrap_or(false);
             } else {
-                minification.enabled.insert(key.clone(), val.as_bool().unwrap_or(false));
+                minification
+                    .enabled
+                    .insert(key.clone(), val.as_bool().unwrap_or(false));
             }
         }
     }
@@ -356,9 +365,15 @@ fn parse_config(tv: toml::Value, _site_dir: &Path) -> anyhow::Result<RendererCon
         user_config,
         global_params,
         routes,
-        thread_pool: ThreadPoolConfig { size: tp_size, queue_size: tp_queue },
+        thread_pool: ThreadPoolConfig {
+            size: tp_size,
+            queue_size: tp_queue,
+        },
         params_cache: ParamsCacheConfig { size: pc_size },
-        server: ServerConfig { read_timeout, socket_mode },
+        server: ServerConfig {
+            read_timeout,
+            socket_mode,
+        },
         compression,
         minification,
         log,
@@ -380,7 +395,10 @@ fn parse_routes(val: Option<&toml::Value>) -> anyhow::Result<Vec<RouteConfig>> {
             .ok_or_else(|| anyhow::anyhow!("route missing `path`"))?
             .to_string();
 
-        let template = item.get("template").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let template = item
+            .get("template")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
 
         let params: Vec<String> = item
             .get("params")
@@ -397,7 +415,10 @@ fn parse_routes(val: Option<&toml::Value>) -> anyhow::Result<Vec<RouteConfig>> {
             .and_then(|v| v.as_integer())
             .unwrap_or(200) as u16;
 
-        let handler = item.get("handler").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let handler = item
+            .get("handler")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
 
         // A handler route defaults to `no-store`, a template route to
         // `public`, and an explicit `cache` wins over both.
@@ -415,14 +436,19 @@ fn parse_routes(val: Option<&toml::Value>) -> anyhow::Result<Vec<RouteConfig>> {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .unwrap_or_else(|| {
-                if handler.is_some() { "no-store".to_string() } else { "public".to_string() }
+                if handler.is_some() {
+                    "no-store".to_string()
+                } else {
+                    "public".to_string()
+                }
             });
 
-        let methods: Option<Vec<String>> = item.get("methods").and_then(|v| v.as_array()).map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_uppercase()))
-                .collect()
-        });
+        let methods: Option<Vec<String>> =
+            item.get("methods").and_then(|v| v.as_array()).map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_uppercase()))
+                    .collect()
+            });
 
         let headers: Vec<(String, String)> = item
             .get("headers")
@@ -443,8 +469,9 @@ fn parse_routes(val: Option<&toml::Value>) -> anyhow::Result<Vec<RouteConfig>> {
         // service can carry its own per-route vocabulary. Unknown keys were
         // previously discarded in silence, which is indistinguishable from a
         // typo being honoured.
-        const KNOWN: [&str; 8] =
-            ["path", "template", "params", "status", "cache", "methods", "headers", "handler"];
+        const KNOWN: [&str; 8] = [
+            "path", "template", "params", "status", "cache", "methods", "headers", "handler",
+        ];
         let mut settings = Map::new();
         if let Some(table) = item.as_table() {
             for (k, v) in table {
@@ -475,11 +502,9 @@ pub fn toml_to_json(v: &toml::Value) -> Value {
     match v {
         toml::Value::String(s) => Value::String(s.clone()),
         toml::Value::Integer(i) => Value::Number((*i).into()),
-        toml::Value::Float(f) => {
-            serde_json::Number::from_f64(*f)
-                .map(Value::Number)
-                .unwrap_or(Value::Null)
-        }
+        toml::Value::Float(f) => serde_json::Number::from_f64(*f)
+            .map(Value::Number)
+            .unwrap_or(Value::Null),
         toml::Value::Boolean(b) => Value::Bool(*b),
         toml::Value::Array(a) => Value::Array(a.iter().map(toml_to_json).collect()),
         toml::Value::Table(t) => {
@@ -546,7 +571,10 @@ queue_size = 32
         let mut f = NamedTempFile::new().unwrap();
         write!(f, "site_name = \"Test\"\n").unwrap();
         let cfg = load(f.path(), Path::new("/tmp")).unwrap();
-        assert_eq!(cfg.server.read_timeout, Some(std::time::Duration::from_secs(30)));
+        assert_eq!(
+            cfg.server.read_timeout,
+            Some(std::time::Duration::from_secs(30))
+        );
         assert_eq!(cfg.server.socket_mode, 0o660);
     }
 
@@ -569,9 +597,18 @@ queue_size = 32
     /// are the same mode and neither is decimal 660.
     #[test]
     fn socket_mode_is_octal_with_or_without_the_leading_zero() {
-        assert_eq!(server_cfg("socket_mode = \"0660\"").unwrap().socket_mode, 0o660);
-        assert_eq!(server_cfg("socket_mode = \"660\"").unwrap().socket_mode, 0o660);
-        assert_eq!(server_cfg("socket_mode = \"0o660\"").unwrap().socket_mode, 0o660);
+        assert_eq!(
+            server_cfg("socket_mode = \"0660\"").unwrap().socket_mode,
+            0o660
+        );
+        assert_eq!(
+            server_cfg("socket_mode = \"660\"").unwrap().socket_mode,
+            0o660
+        );
+        assert_eq!(
+            server_cfg("socket_mode = \"0o660\"").unwrap().socket_mode,
+            0o660
+        );
     }
 
     /// A value that cannot be understood stops the service rather than being
@@ -609,7 +646,10 @@ queue_size = 32
         .unwrap();
 
         let cfg = load(cfg_file.path(), Path::new("/tmp")).unwrap();
-        assert_eq!(cfg.user_config.get("password").unwrap().as_str().unwrap(), "secret");
+        assert_eq!(
+            cfg.user_config.get("password").unwrap().as_str().unwrap(),
+            "secret"
+        );
     }
 
     #[test]

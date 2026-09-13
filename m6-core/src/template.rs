@@ -17,8 +17,12 @@ pub fn build_tera(site_dir: &Path) -> anyhow::Result<Tera> {
     }
 
     let mut tera = Tera::default();
-    let pairs: Vec<(&str, &str)> = contents.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    tera.add_raw_templates(pairs).context("compiling templates")?;
+    let pairs: Vec<(&str, &str)> = contents
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    tera.add_raw_templates(pairs)
+        .context("compiling templates")?;
     register_filters(&mut tera, site_dir);
     Ok(tera)
 }
@@ -53,10 +57,7 @@ fn collect_templates(
 /// Build a Tera instance from explicit template paths (relative to site_dir).
 /// Also loads all *.html/*.txt/*.xml/*.json siblings in each referenced template's
 /// directory so that `{% extends %}` and `{% include %}` work correctly.
-pub fn build_tera_from_paths(
-    site_dir: &Path,
-    template_paths: &[String],
-) -> anyhow::Result<Tera> {
+pub fn build_tera_from_paths(site_dir: &Path, template_paths: &[String]) -> anyhow::Result<Tera> {
     use std::collections::HashSet;
 
     // Collect unique directories that contain route-referenced templates.
@@ -100,7 +101,10 @@ pub fn build_tera_from_paths(
     }
 
     let mut tera = Tera::default();
-    let pairs: Vec<(&str, &str)> = contents.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let pairs: Vec<(&str, &str)> = contents
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
     tera.add_raw_templates(pairs)
         .context("compiling templates")?;
     register_filters(&mut tera, site_dir);
@@ -139,15 +143,21 @@ fn build_image_dimensions(site_dir: &Path) -> HashMap<String, (u32, u32)> {
 }
 
 fn collect_image_dimensions(root: &Path, dir: &Path, out: &mut HashMap<String, (u32, u32)>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
             collect_image_dimensions(root, &path, out);
             continue;
         }
-        let Ok(rel) = path.strip_prefix(root) else { continue };
-        let Ok(bytes) = std::fs::read(&path) else { continue };
+        let Ok(rel) = path.strip_prefix(root) else {
+            continue;
+        };
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
         if let Some(dims) = image_dimensions(&bytes) {
             out.insert(rel.to_string_lossy().replace('\\', "/"), dims);
         }
@@ -196,7 +206,12 @@ fn image_dimensions(b: &[u8]) -> Option<(u32, u32)> {
 }
 
 fn be32(b: &[u8]) -> Option<u32> {
-    Some(u32::from_be_bytes([*b.first()?, *b.get(1)?, *b.get(2)?, *b.get(3)?]))
+    Some(u32::from_be_bytes([
+        *b.first()?,
+        *b.get(1)?,
+        *b.get(2)?,
+        *b.get(3)?,
+    ]))
 }
 
 /// WebP has three container flavours and they store the size differently.
@@ -240,15 +255,15 @@ fn jpeg_dimensions(b: &[u8]) -> Option<(u32, u32)> {
         }
         let marker = b[i + 1];
         // SOF0..SOF15, excluding the four that are not frame headers.
-        if (0xC0..=0xCF).contains(&marker)
-            && marker != 0xC4 && marker != 0xC8 && marker != 0xCC
-        {
+        if (0xC0..=0xCF).contains(&marker) && marker != 0xC4 && marker != 0xC8 && marker != 0xCC {
             let h = u16::from_be_bytes([b[i + 5], b[i + 6]]) as u32;
             let w = u16::from_be_bytes([b[i + 7], b[i + 8]]) as u32;
             return Some((w, h));
         }
         let len = u16::from_be_bytes([*b.get(i + 2)?, *b.get(i + 3)?]) as usize;
-        if len < 2 { return None; }
+        if len < 2 {
+            return None;
+        }
         i += 2 + len;
     }
     None
@@ -267,7 +282,9 @@ fn svg_dimensions(text: &str) -> Option<(u32, u32)> {
         let start = tag.find(&pat)? + pat.len();
         let rest = &tag[start..];
         let val = &rest[..rest.find('"')?];
-        if val.ends_with('%') { return None; }
+        if val.ends_with('%') {
+            return None;
+        }
         val.trim_end_matches(|c: char| c.is_ascii_alphabetic())
             .trim()
             .parse::<f64>()
@@ -296,7 +313,9 @@ fn svg_dimensions(text: &str) -> Option<(u32, u32)> {
 }
 
 fn collect_asset_hashes(root: &Path, dir: &Path, out: &mut HashMap<String, String>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
@@ -322,7 +341,10 @@ fn collect_asset_hashes(root: &Path, dir: &Path, out: &mut HashMap<String, Strin
 /// is a caching miss, not a broken page, and failing the render over it would
 /// turn a typo in one icon name into a blank site.
 fn asset_url(manifest: &HashMap<String, String>, raw: &str) -> String {
-    let rel = raw.trim_start_matches('/').strip_prefix("assets/").unwrap_or(raw.trim_start_matches('/'));
+    let rel = raw
+        .trim_start_matches('/')
+        .strip_prefix("assets/")
+        .unwrap_or(raw.trim_start_matches('/'));
     match manifest.get(rel) {
         Some(hash) => format!("/assets/{rel}?v={hash}"),
         None => format!("/assets/{rel}"),
@@ -365,9 +387,15 @@ fn register_filters(tera: &mut Tera, site_dir: &Path) {
     // It is rebuilt whenever Tera is, which is what a config reload already
     // does, so a redeployed asset gets a new hash without a restart.
     let manifest = std::sync::Arc::new(build_asset_manifest(site_dir));
-    tera.register_filter("asset", move |value: &Value, _args: &HashMap<String, Value>| {
-        Ok(Value::String(asset_url(&manifest, value.as_str().unwrap_or(""))))
-    });
+    tera.register_filter(
+        "asset",
+        move |value: &Value, _args: &HashMap<String, Value>| {
+            Ok(Value::String(asset_url(
+                &manifest,
+                value.as_str().unwrap_or(""),
+            )))
+        },
+    );
 
     // `{{ img_dims(path=x) | safe }}` — ready-to-paste ` width="W" height="H"`.
     //
@@ -393,19 +421,13 @@ fn register_filters(tera: &mut Tera, site_dir: &Path) {
 }
 
 /// `| slugify` — "Hello World" → "hello-world"
-fn filter_slugify(
-    value: &Value,
-    _args: &HashMap<String, Value>,
-) -> tera::Result<Value> {
+fn filter_slugify(value: &Value, _args: &HashMap<String, Value>) -> tera::Result<Value> {
     let s = value.as_str().unwrap_or("");
     Ok(Value::String(slug::slugify(s)))
 }
 
 /// `| date_format(fmt="%B %d, %Y")` — format a date string
-fn filter_date_format(
-    value: &Value,
-    args: &HashMap<String, Value>,
-) -> tera::Result<Value> {
+fn filter_date_format(value: &Value, args: &HashMap<String, Value>) -> tera::Result<Value> {
     use chrono::NaiveDate;
 
     let fmt = args
@@ -426,10 +448,7 @@ fn filter_date_format(
 }
 
 /// `| markdown` — render Markdown via comrak
-fn filter_markdown(
-    value: &Value,
-    _args: &HashMap<String, Value>,
-) -> tera::Result<Value> {
+fn filter_markdown(value: &Value, _args: &HashMap<String, Value>) -> tera::Result<Value> {
     let s = value.as_str().unwrap_or("");
     let options = comrak::Options::default();
     let html = comrak::markdown_to_html(s, &options);
@@ -437,14 +456,8 @@ fn filter_markdown(
 }
 
 /// `| truncate_words(n=50)` — truncate to N words
-fn filter_truncate_words(
-    value: &Value,
-    args: &HashMap<String, Value>,
-) -> tera::Result<Value> {
-    let n = args
-        .get("n")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(50) as usize;
+fn filter_truncate_words(value: &Value, args: &HashMap<String, Value>) -> tera::Result<Value> {
+    let n = args.get("n").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
 
     let s = value.as_str().unwrap_or("");
     let words: Vec<&str> = s.split_whitespace().collect();
@@ -551,7 +564,11 @@ mod asset_filter_tests {
         let mut m = HashMap::new();
         m.insert("css/style.css".to_string(), "deadbeef".to_string());
         let want = "/assets/css/style.css?v=deadbeef";
-        for input in ["css/style.css", "/assets/css/style.css", "assets/css/style.css"] {
+        for input in [
+            "css/style.css",
+            "/assets/css/style.css",
+            "assets/css/style.css",
+        ] {
             assert_eq!(asset_url(&m, input), want, "input {input:?}");
         }
     }
@@ -563,7 +580,10 @@ mod asset_filter_tests {
     fn unknown_asset_degrades_to_an_unversioned_url() {
         let m = HashMap::new();
         assert_eq!(asset_url(&m, "icons/nope.svg"), "/assets/icons/nope.svg");
-        assert_eq!(asset_url(&m, "/assets/icons/nope.svg"), "/assets/icons/nope.svg");
+        assert_eq!(
+            asset_url(&m, "/assets/icons/nope.svg"),
+            "/assets/icons/nope.svg"
+        );
     }
 
     /// The filter has to work through Tera, not just as a function: registration
@@ -579,9 +599,13 @@ mod asset_filter_tests {
         ctx.insert("icon", "css/style.css");
 
         let mut t = tera;
-        t.add_raw_template("t", r#"{{ "css/style.css" | asset }}|{{ icon | asset }}"#).unwrap();
+        t.add_raw_template("t", r#"{{ "css/style.css" | asset }}|{{ icon | asset }}"#)
+            .unwrap();
         let out = t.render("t", &ctx).unwrap();
-        assert_eq!(out, format!("/assets/css/style.css?v={hash}|/assets/css/style.css?v={hash}"));
+        assert_eq!(
+            out,
+            format!("/assets/css/style.css?v={hash}|/assets/css/style.css?v={hash}")
+        );
     }
 
     #[test]
@@ -600,7 +624,7 @@ mod image_dimension_tests {
     /// byte layout rather than on a fixture that happens to match.
     fn png(w: u32, h: u32) -> Vec<u8> {
         let mut v = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
-        v.extend_from_slice(&[0, 0, 0, 13]);        // IHDR length
+        v.extend_from_slice(&[0, 0, 0, 13]); // IHDR length
         v.extend_from_slice(b"IHDR");
         v.extend_from_slice(&w.to_be_bytes());
         v.extend_from_slice(&h.to_be_bytes());
@@ -623,7 +647,7 @@ mod image_dimension_tests {
 
     fn webp_lossy(w: u16, h: u16) -> Vec<u8> {
         let mut v = b"RIFF\0\0\0\0WEBPVP8 ".to_vec();
-        v.extend_from_slice(&[0u8; 10]);            // chunk size + start code
+        v.extend_from_slice(&[0u8; 10]); // chunk size + start code
         v.extend_from_slice(&w.to_le_bytes());
         v.extend_from_slice(&h.to_le_bytes());
         v
@@ -645,9 +669,18 @@ mod image_dimension_tests {
 
     #[test]
     fn svg_prefers_explicit_size_then_falls_back_to_viewbox() {
-        assert_eq!(svg_dimensions(r#"<svg width="39" height="39" viewBox="0 0 78 78">"#), Some((39, 39)));
-        assert_eq!(svg_dimensions(r#"<svg viewBox="0 0 24 24">"#), Some((24, 24)));
-        assert_eq!(svg_dimensions(r#"<svg width="80px" height="58px">"#), Some((80, 58)));
+        assert_eq!(
+            svg_dimensions(r#"<svg width="39" height="39" viewBox="0 0 78 78">"#),
+            Some((39, 39))
+        );
+        assert_eq!(
+            svg_dimensions(r#"<svg viewBox="0 0 24 24">"#),
+            Some((24, 24))
+        );
+        assert_eq!(
+            svg_dimensions(r#"<svg width="80px" height="58px">"#),
+            Some((80, 58))
+        );
     }
 
     /// A percentage is not an intrinsic size. Emitting `width="100"` for
@@ -656,15 +689,18 @@ mod image_dimension_tests {
     fn svg_percentage_is_not_a_size() {
         assert_eq!(svg_dimensions(r#"<svg width="100%" height="100%">"#), None);
         // ...but a viewBox alongside it still is.
-        assert_eq!(svg_dimensions(r#"<svg width="100%" height="100%" viewBox="0 0 16 9">"#), Some((16, 9)));
+        assert_eq!(
+            svg_dimensions(r#"<svg width="100%" height="100%" viewBox="0 0 16 9">"#),
+            Some((16, 9))
+        );
     }
 
     #[test]
     fn unrecognised_or_truncated_input_yields_nothing() {
         assert_eq!(image_dimensions(b""), None);
         assert_eq!(image_dimensions(b"not an image at all"), None);
-        assert_eq!(image_dimensions(&png(10, 10)[..12]), None);   // truncated PNG
-        assert_eq!(image_dimensions(&[0xFF, 0xD8]), None);        // JPEG with no SOF
+        assert_eq!(image_dimensions(&png(10, 10)[..12]), None); // truncated PNG
+        assert_eq!(image_dimensions(&[0xFF, 0xD8]), None); // JPEG with no SOF
     }
 
     /// The attribute pair is all-or-nothing: a lone `width` is a presentational
@@ -673,7 +709,10 @@ mod image_dimension_tests {
     fn attributes_are_emitted_as_a_pair_or_not_at_all() {
         let mut m = HashMap::new();
         m.insert("icons/logo.svg".to_string(), (80u32, 80u32));
-        assert_eq!(img_dims_attrs(&m, "icons/logo.svg"), r#" width="80" height="80""#);
+        assert_eq!(
+            img_dims_attrs(&m, "icons/logo.svg"),
+            r#" width="80" height="80""#
+        );
         assert_eq!(img_dims_attrs(&m, "icons/unknown.svg"), "");
     }
 
@@ -689,7 +728,11 @@ mod image_dimension_tests {
             "assets/icons/logo.svg",
             "/assets/icons/logo.svg?v=deadbeef",
         ] {
-            assert_eq!(img_dims_attrs(&m, input), r#" width="80" height="80""#, "input {input:?}");
+            assert_eq!(
+                img_dims_attrs(&m, input),
+                r#" width="80" height="80""#,
+                "input {input:?}"
+            );
         }
     }
 }

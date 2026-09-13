@@ -9,7 +9,6 @@
 ///     "http/1.1" → H1 state machine (Handshake→Reading→Writing, Connection: close)
 /// - `drive_all()` is called after every epoll wakeup (for any TOKEN_TCP event)
 ///   and drives every active connection one step forward.
-
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -20,7 +19,7 @@ use rustls::ServerConnection;
 use tracing::warn;
 
 use crate::forward::{HttpRequest, HttpResponse, PendingUrlContext};
-use crate::http2::{Http2Conn, H2Io};
+use crate::http2::{H2Io, Http2Conn};
 use crate::poller::{Poller, Token};
 
 // ── Request outcome ───────────────────────────────────────────────────────────
@@ -28,10 +27,16 @@ use crate::poller::{Poller, Token};
 /// The result of dispatching a request to a backend.
 pub enum RequestOutcome {
     /// Response is available immediately (cache hit, socket backend, auth error, etc.)
-    Ready(u16, Vec<(String, String)>, Vec<u8>, String, std::sync::Arc<Vec<String>>),
+    Ready(
+        u16,
+        Vec<(String, String)>,
+        Vec<u8>,
+        String,
+        std::sync::Arc<Vec<String>>,
+    ),
     /// URL backend I/O dispatched to a thread; poll `rx` with `try_recv()`.
     Pending {
-        rx:  std::sync::mpsc::Receiver<std::io::Result<HttpResponse>>,
+        rx: std::sync::mpsc::Receiver<std::io::Result<HttpResponse>>,
         ctx: PendingUrlContext,
     },
 }
@@ -52,8 +57,8 @@ struct Conn {
     /// `None` on a plaintext listener. HTTP/2 already carried this
     /// distinction (`H2Io::Tls` / `H2Io::Plain`); this gives HTTP/1.1 the same
     /// one, so `:80` runs this code rather than a second implementation.
-    tls:    Option<ServerConnection>,
-    kind:   ConnKind,
+    tls: Option<ServerConnection>,
+    kind: ConnKind,
 }
 
 impl Conn {
@@ -69,27 +74,32 @@ impl Conn {
 // ── HTTP/1.1 state machine ────────────────────────────────────────────────────
 
 enum H1State {
-    Reading { buf: Vec<u8> },
+    Reading {
+        buf: Vec<u8>,
+    },
     WaitingBackend {
-        rx:  std::sync::mpsc::Receiver<std::io::Result<HttpResponse>>,
+        rx: std::sync::mpsc::Receiver<std::io::Result<HttpResponse>>,
         ctx: PendingUrlContext,
     },
-    Writing { buf: Vec<u8>, pos: usize },
+    Writing {
+        buf: Vec<u8>,
+        pos: usize,
+    },
     Done,
 }
 
 struct H1Conn {
-    state:     H1State,
+    state: H1State,
     client_ip: String,
     /// Reset at the start of each request on a reused connection, so the
     /// timeout below is idle time and not total connection age.
-    created:   Instant,
+    created: Instant,
     /// Whether the response now being written leaves the connection open.
     /// Decided per request from the version and the `Connection` header.
     keep_alive: bool,
     /// Requests answered on this connection. Bounded so one client cannot
     /// hold a slot indefinitely by pipelining forever.
-    served:    u32,
+    served: u32,
     /// Whether the current request's `Expect` field has been dealt with.
     /// Answering twice would put a second interim response on the wire.
     expect_handled: bool,
@@ -121,12 +131,12 @@ const MAX_REQUEST_BYTES: usize = 20 * 1024 * 1024;
 // ── Public API ────────────────────────────────────────────────────────────────
 
 pub struct Http11Listener {
-    listener:   TcpListener,
+    listener: TcpListener,
     /// `None` binds a plaintext listener. Only HTTP/1.1 is reachable then:
     /// h2 needs ALPN, which needs TLS, and h3 needs QUIC, which mandates it.
     /// A browser following an `http://` link speaks HTTP/1.1 and nothing else.
     tls_config: Option<Arc<rustls::ServerConfig>>,
-    conns:      Vec<Conn>,
+    conns: Vec<Conn>,
 }
 
 /// Resolve a `host:port` bind string to one address.
@@ -162,10 +172,16 @@ impl Http11Listener {
         // all, running and healthy to systemd, serving nobody.
         let listener = m6_core::server::bind_tcp_reuseaddr(resolve_bind(addr)?)?;
         listener.set_nonblocking(true)?;
-        Ok(Http11Listener { listener, tls_config, conns: Vec::new() })
+        Ok(Http11Listener {
+            listener,
+            tls_config,
+            conns: Vec::new(),
+        })
     }
 
-    pub fn raw_fd(&self) -> RawFd { self.listener.as_raw_fd() }
+    pub fn raw_fd(&self) -> RawFd {
+        self.listener.as_raw_fd()
+    }
 
     pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
         self.listener.local_addr()
@@ -186,7 +202,10 @@ impl Http11Listener {
                         Some(cfg) => {
                             let mut tls = match ServerConnection::new(Arc::clone(cfg)) {
                                 Ok(t) => t,
-                                Err(e) => { warn!("tls ServerConnection::new: {e}"); continue; }
+                                Err(e) => {
+                                    warn!("tls ServerConnection::new: {e}");
+                                    continue;
+                                }
                             };
                             // Raises rustls' *outgoing* buffering caps (sendable_plaintext /
                             // sendable_tls) to match MAX_REQUEST_BYTES, so a large response
@@ -208,22 +227,25 @@ impl Http11Listener {
                     let kind = if tls.is_some() {
                         ConnKind::Handshake {
                             client_ip: peer.ip().to_string(),
-                            created:   Instant::now(),
+                            created: Instant::now(),
                         }
                     } else {
                         ConnKind::Http1(H1Conn {
-                            state:      H1State::Reading { buf: Vec::new() },
-                            client_ip:  peer.ip().to_string(),
-                            created:    Instant::now(),
+                            state: H1State::Reading { buf: Vec::new() },
+                            client_ip: peer.ip().to_string(),
+                            created: Instant::now(),
                             keep_alive: false,
-                            served:     0,
-                expect_handled: false,
+                            served: 0,
+                            expect_handled: false,
                         })
                     };
                     self.conns.push(Conn { stream, tls, kind });
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e) => { warn!("tcp accept: {e}"); break; }
+                Err(e) => {
+                    warn!("tcp accept: {e}");
+                    break;
+                }
             }
         }
     }
@@ -232,8 +254,16 @@ impl Http11Listener {
     pub fn drive_all<F, G>(&mut self, mut on_request: F, mut on_response: G, poller: &Poller)
     where
         F: FnMut(&HttpRequest, &str) -> RequestOutcome,
-        G: FnMut(std::io::Result<HttpResponse>, &PendingUrlContext)
-               -> (u16, Vec<(String, String)>, Vec<u8>, String, std::sync::Arc<Vec<String>>),
+        G: FnMut(
+            std::io::Result<HttpResponse>,
+            &PendingUrlContext,
+        ) -> (
+            u16,
+            Vec<(String, String)>,
+            Vec<u8>,
+            String,
+            std::sync::Arc<Vec<String>>,
+        ),
     {
         for conn in &mut self.conns {
             drive_conn(conn, &mut on_request, &mut on_response);
@@ -250,8 +280,8 @@ impl Http11Listener {
 // ── H2C (HTTP/2 cleartext) listener ──────────────────────────────────────────
 
 struct H2cPlainConn {
-    stream:    TcpStream,
-    h2:        Http2Conn,
+    stream: TcpStream,
+    h2: Http2Conn,
     client_ip: String,
 }
 
@@ -276,7 +306,7 @@ fn trust_for_bind(addr: &str) -> crate::forward::ForwardedTrust {
 
 pub struct H2cListener {
     listener: TcpListener,
-    conns:    Vec<H2cPlainConn>,
+    conns: Vec<H2cPlainConn>,
     /// Whether a peer here may assert a client address for someone else.
     ///
     /// Derived from the bind address, not configured. This listener is the
@@ -286,7 +316,7 @@ pub struct H2cListener {
     /// `crate::forward::ForwardedTrust`. Bound to a public address it is just
     /// another listener, and trusting it there would hand every client a
     /// rate-limit bypass.
-    trust:    crate::forward::ForwardedTrust,
+    trust: crate::forward::ForwardedTrust,
 }
 
 impl H2cListener {
@@ -304,10 +334,16 @@ impl H2cListener {
             );
         }
 
-        Ok(H2cListener { listener, conns: Vec::new(), trust })
+        Ok(H2cListener {
+            listener,
+            conns: Vec::new(),
+            trust,
+        })
     }
 
-    pub fn raw_fd(&self) -> RawFd { self.listener.as_raw_fd() }
+    pub fn raw_fd(&self) -> RawFd {
+        self.listener.as_raw_fd()
+    }
 
     pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
         self.listener.local_addr()
@@ -336,7 +372,10 @@ impl H2cListener {
                     });
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e) => { warn!("h2c accept: {e}"); break; }
+                Err(e) => {
+                    warn!("h2c accept: {e}");
+                    break;
+                }
             }
         }
     }
@@ -344,12 +383,22 @@ impl H2cListener {
     pub fn drive_all<F, G>(&mut self, mut on_request: F, mut on_response: G, poller: &Poller)
     where
         F: FnMut(&HttpRequest, &str) -> RequestOutcome,
-        G: FnMut(std::io::Result<HttpResponse>, &PendingUrlContext)
-               -> (u16, Vec<(String, String)>, Vec<u8>, String, std::sync::Arc<Vec<String>>),
+        G: FnMut(
+            std::io::Result<HttpResponse>,
+            &PendingUrlContext,
+        ) -> (
+            u16,
+            Vec<(String, String)>,
+            Vec<u8>,
+            String,
+            std::sync::Arc<Vec<String>>,
+        ),
     {
         for conn in &mut self.conns {
             conn.h2.drive(
-                H2Io::Plain { stream: &conn.stream },
+                H2Io::Plain {
+                    stream: &conn.stream,
+                },
                 &conn.client_ip,
                 &mut on_request,
                 &mut on_response,
@@ -369,15 +418,27 @@ impl H2cListener {
 fn drive_conn<F, G>(conn: &mut Conn, on_request: &mut F, on_response: &mut G)
 where
     F: FnMut(&HttpRequest, &str) -> RequestOutcome,
-    G: FnMut(std::io::Result<HttpResponse>, &PendingUrlContext)
-           -> (u16, Vec<(String, String)>, Vec<u8>, String, std::sync::Arc<Vec<String>>),
+    G: FnMut(
+        std::io::Result<HttpResponse>,
+        &PendingUrlContext,
+    ) -> (
+        u16,
+        Vec<(String, String)>,
+        Vec<u8>,
+        String,
+        std::sync::Arc<Vec<String>>,
+    ),
 {
     // Plaintext connection: HTTP/1.1 only, straight to the state machine. No
     // handshake to pump and no ALPN to dispatch on.
     let Some(tls) = conn.tls.as_mut() else {
-        let ConnKind::Http1(h1) = &mut conn.kind else { return };
+        let ConnKind::Http1(h1) = &mut conn.kind else {
+            return;
+        };
         drive_h1(
-            &mut H1Io::Plain { stream: &conn.stream },
+            &mut H1Io::Plain {
+                stream: &conn.stream,
+            },
             h1,
             on_request,
             on_response,
@@ -389,13 +450,19 @@ where
 
     // HTTP/2: stream and tls are in conn; pass them by reference.
     if let ConnKind::Http2(h2) = &mut conn.kind {
-        let client_ip = conn.stream.peer_addr()
+        let client_ip = conn
+            .stream
+            .peer_addr()
             .map(|a| a.ip().to_string())
             .unwrap_or_default();
         h2.drive(
-            H2Io::Tls { tls: conn.tls.as_mut().expect("tls path"), stream: &conn.stream },
+            H2Io::Tls {
+                tls: conn.tls.as_mut().expect("tls path"),
+                stream: &conn.stream,
+            },
             &client_ip,
-            on_request, on_response,
+            on_request,
+            on_response,
         );
         return;
     }
@@ -403,11 +470,11 @@ where
     // Pump TLS I/O for H1 / still-handshaking connections.
     if advance_tls(conn.tls.as_mut().expect("tls path"), &conn.stream).is_err() {
         conn.kind = ConnKind::Http1(H1Conn {
-            state:      H1State::Done,
-            client_ip:  String::new(),
-            created:    Instant::now(),
+            state: H1State::Done,
+            client_ip: String::new(),
+            created: Instant::now(),
             keep_alive: false,
-            served:     0,
+            served: 0,
             expect_handled: false,
         });
         return;
@@ -420,35 +487,51 @@ where
 
     // Handshake just completed — dispatch on ALPN.
     if let ConnKind::Handshake { client_ip, created } = &conn.kind {
-        let proto     = conn.tls.as_ref().expect("tls path").alpn_protocol().map(|p| p.to_vec());
+        let proto = conn
+            .tls
+            .as_ref()
+            .expect("tls path")
+            .alpn_protocol()
+            .map(|p| p.to_vec());
         let client_ip = client_ip.clone();
-        let created   = *created;
+        let created = *created;
         if proto.as_deref() == Some(b"h2".as_slice()) {
             conn.kind = ConnKind::Http2(Http2Conn::new());
             // Drive immediately — client preface may already be buffered.
-            let ConnKind::Http2(h2) = &mut conn.kind else { return };
+            let ConnKind::Http2(h2) = &mut conn.kind else {
+                return;
+            };
             h2.drive(
-                H2Io::Tls { tls: conn.tls.as_mut().expect("tls path"), stream: &conn.stream },
+                H2Io::Tls {
+                    tls: conn.tls.as_mut().expect("tls path"),
+                    stream: &conn.stream,
+                },
                 &client_ip,
-                on_request, on_response,
+                on_request,
+                on_response,
             );
             return;
         } else {
             conn.kind = ConnKind::Http1(H1Conn {
-                state:      H1State::Reading { buf: Vec::new() },
+                state: H1State::Reading { buf: Vec::new() },
                 client_ip,
                 created,
                 keep_alive: false,
-                served:     0,
+                served: 0,
                 expect_handled: false,
             });
         }
     }
 
     // Drive HTTP/1.1 state machine.
-    let ConnKind::Http1(h1) = &mut conn.kind else { return };
+    let ConnKind::Http1(h1) = &mut conn.kind else {
+        return;
+    };
     drive_h1(
-        &mut H1Io::Tls { tls: conn.tls.as_mut().expect("tls path"), stream: &conn.stream },
+        &mut H1Io::Tls {
+            tls: conn.tls.as_mut().expect("tls path"),
+            stream: &conn.stream,
+        },
         h1,
         on_request,
         on_response,
@@ -473,8 +556,13 @@ where
 /// One implementation per protocol version. The plaintext listener is this
 /// same code with `Plain`, and the redirect is a response, not a server.
 enum H1Io<'a> {
-    Tls { tls: &'a mut ServerConnection, stream: &'a TcpStream },
-    Plain { stream: &'a TcpStream },
+    Tls {
+        tls: &'a mut ServerConnection,
+        stream: &'a TcpStream,
+    },
+    Plain {
+        stream: &'a TcpStream,
+    },
 }
 
 impl H1Io<'_> {
@@ -514,16 +602,19 @@ impl H1Io<'_> {
     }
 }
 
-fn drive_h1<F, G>(
-    io:          &mut H1Io<'_>,
-    h1:          &mut H1Conn,
-    on_request:  &mut F,
-    on_response: &mut G,
-)
+fn drive_h1<F, G>(io: &mut H1Io<'_>, h1: &mut H1Conn, on_request: &mut F, on_response: &mut G)
 where
     F: FnMut(&HttpRequest, &str) -> RequestOutcome,
-    G: FnMut(std::io::Result<HttpResponse>, &PendingUrlContext)
-           -> (u16, Vec<(String, String)>, Vec<u8>, String, std::sync::Arc<Vec<String>>),
+    G: FnMut(
+        std::io::Result<HttpResponse>,
+        &PendingUrlContext,
+    ) -> (
+        u16,
+        Vec<(String, String)>,
+        Vec<u8>,
+        String,
+        std::sync::Arc<Vec<String>>,
+    ),
 {
     if h1.created.elapsed().as_secs() > READ_TIMEOUT_SECS {
         h1.state = H1State::Done;
@@ -541,20 +632,33 @@ where
                     // Falling through to the parse below is what `redirect.rs`
                     // failed to do.
                     Ok(0) if io.zero_read_is_eof() => {
-                        let H1State::Reading { buf } = &h1.state else { break };
-                        if buf.is_empty() { h1.state = H1State::Done; return; }
+                        let H1State::Reading { buf } = &h1.state else {
+                            break;
+                        };
+                        if buf.is_empty() {
+                            h1.state = H1State::Done;
+                            return;
+                        }
                         break;
                     }
-                    Ok(0)  => break,
-                    Ok(n)  => n,
+                    Ok(0) => break,
+                    Ok(n) => n,
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(_) => { h1.state = H1State::Done; return; }
+                    Err(_) => {
+                        h1.state = H1State::Done;
+                        return;
+                    }
                 };
-                let H1State::Reading { buf } = &mut h1.state else { break };
+                let H1State::Reading { buf } = &mut h1.state else {
+                    break;
+                };
                 buf.extend_from_slice(&tmp[..n]);
                 if buf.len() > MAX_REQUEST_BYTES {
                     let resp = b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                    h1.state = H1State::Writing { buf: resp.to_vec(), pos: 0 };
+                    h1.state = H1State::Writing {
+                        buf: resp.to_vec(),
+                        pos: 0,
+                    };
                     continue;
                 }
                 // Parse under an immutable borrow. `ParseResult` owns all of
@@ -594,7 +698,10 @@ where
                                 Some(m6_core::h1::Expectation::Unsupported) => {
                                     h1.expect_handled = true;
                                     let resp = b"HTTP/1.1 417 Expectation Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                                    h1.state = H1State::Writing { buf: resp.to_vec(), pos: 0 };
+                                    h1.state = H1State::Writing {
+                                        buf: resp.to_vec(),
+                                        pos: 0,
+                                    };
                                     continue;
                                 }
                             }
@@ -603,7 +710,10 @@ where
                     }
                     ParseResult::Error => {
                         let resp = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                        h1.state = H1State::Writing { buf: resp.to_vec(), pos: 0 };
+                        h1.state = H1State::Writing {
+                            buf: resp.to_vec(),
+                            pos: 0,
+                        };
                         continue;
                     }
                     ParseResult::Complete(mut req) => {
@@ -618,8 +728,8 @@ where
                         // moment the call was missing, which is what those
                         // tests are for.
                         crate::forward::strip_untrusted_inbound(&mut req.headers);
-                        h1.keep_alive = wants_keep_alive(&req)
-                            && h1.served + 1 < MAX_REQUESTS_PER_CONN;
+                        h1.keep_alive =
+                            wants_keep_alive(&req) && h1.served + 1 < MAX_REQUESTS_PER_CONN;
                         match on_request(&req, &h1.client_ip) {
                             RequestOutcome::Ready(status, resp_headers, body, _, hints) => {
                                 let mut buf = Vec::new();
@@ -634,7 +744,11 @@ where
                                     buf.extend_from_slice(b"\r\n");
                                 }
                                 buf.extend_from_slice(&build_response(
-                                    status, &resp_headers, &body, &req.method, h1.keep_alive,
+                                    status,
+                                    &resp_headers,
+                                    &body,
+                                    &req.method,
+                                    h1.keep_alive,
                                 ));
                                 h1.state = H1State::Writing { buf, pos: 0 };
                                 continue;
@@ -651,15 +765,18 @@ where
                 use std::sync::mpsc::TryRecvError;
                 // Move state out so we can destructure and replace.
                 let old = std::mem::replace(&mut h1.state, H1State::Done);
-                let H1State::WaitingBackend { rx, ctx } = old else { break };
+                let H1State::WaitingBackend { rx, ctx } = old else {
+                    break;
+                };
                 let http_result = match rx.try_recv() {
-                    Ok(r)  => r,
+                    Ok(r) => r,
                     Err(TryRecvError::Empty) => {
                         h1.state = H1State::WaitingBackend { rx, ctx }; // put back
                         break;
                     }
                     Err(TryRecvError::Disconnected) => Err(io::Error::new(
-                        io::ErrorKind::BrokenPipe, "url backend thread died",
+                        io::ErrorKind::BrokenPipe,
+                        "url backend thread died",
                     )),
                 };
                 let (status, resp_headers, body, _, hints) = on_response(http_result, &ctx);
@@ -675,28 +792,54 @@ where
                     buf.extend_from_slice(b"\r\n");
                 }
                 buf.extend_from_slice(&build_response(
-                    status, &resp_headers, &body, &ctx.req.method, h1.keep_alive,
+                    status,
+                    &resp_headers,
+                    &body,
+                    &ctx.req.method,
+                    h1.keep_alive,
                 ));
                 h1.state = H1State::Writing { buf, pos: 0 };
                 // pump TLS to start sending immediately
-                if io.advance().is_err() { h1.state = H1State::Done; return; }
+                if io.advance().is_err() {
+                    h1.state = H1State::Done;
+                    return;
+                }
                 continue; // fall through to Writing
             }
             H1State::Writing { buf, pos } => {
                 let remaining = &buf[*pos..];
-                if remaining.is_empty() { finish_response(h1); return; }
+                if remaining.is_empty() {
+                    finish_response(h1);
+                    return;
+                }
                 match io.write(remaining) {
-                    Ok(0)      => { h1.state = H1State::Done; return; }
-                    Ok(w)      => {
-                        let H1State::Writing { pos, .. } = &mut h1.state else { break };
+                    Ok(0) => {
+                        h1.state = H1State::Done;
+                        return;
+                    }
+                    Ok(w) => {
+                        let H1State::Writing { pos, .. } = &mut h1.state else {
+                            break;
+                        };
                         *pos += w;
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(_) => { h1.state = H1State::Done; return; }
+                    Err(_) => {
+                        h1.state = H1State::Done;
+                        return;
+                    }
                 }
-                if io.advance().is_err() { h1.state = H1State::Done; return; }
-                let H1State::Writing { buf, pos } = &h1.state else { break };
-                if *pos >= buf.len() { finish_response(h1); return; }
+                if io.advance().is_err() {
+                    h1.state = H1State::Done;
+                    return;
+                }
+                let H1State::Writing { buf, pos } = &h1.state else {
+                    break;
+                };
+                if *pos >= buf.len() {
+                    finish_response(h1);
+                    return;
+                }
                 break;
             }
             H1State::Done => return,
@@ -756,8 +899,11 @@ fn wants_keep_alive(req: &HttpRequest) -> bool {
 fn advance_tls(tls: &mut ServerConnection, stream: &TcpStream) -> io::Result<()> {
     loop {
         match tls.read_tls(&mut &*stream) {
-            Ok(0)  => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "closed")),
-            Ok(_)  => { tls.process_new_packets().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?; }
+            Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "closed")),
+            Ok(_) => {
+                tls.process_new_packets()
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
             // rustls caps its incoming-plaintext buffer at a fixed 16 KiB
             // (not application-configurable — set_buffer_limit only covers
@@ -769,15 +915,19 @@ fn advance_tls(tls: &mut ServerConnection, stream: &TcpStream) -> io::Result<()>
             // drive_h1 drains the reader right after we return, and the
             // next poller wakeup (level-triggered — more data is still
             // sitting in the kernel socket buffer) resumes pumping.
-            Err(e) if e.kind() == io::ErrorKind::Other
-                && e.to_string().contains("received plaintext buffer full") => break,
+            Err(e)
+                if e.kind() == io::ErrorKind::Other
+                    && e.to_string().contains("received plaintext buffer full") =>
+            {
+                break
+            }
             Err(e) => return Err(e),
         }
     }
     loop {
         match tls.write_tls(&mut &*stream) {
-            Ok(0)  => break,
-            Ok(_)  => {}
+            Ok(0) => break,
+            Ok(_) => {}
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
             Err(e) => return Err(e),
         }
@@ -845,9 +995,7 @@ fn build_response(
     let is_head = method.eq_ignore_ascii_case("HEAD");
     let reason = status_reason(status);
     let mut out = Vec::with_capacity(256 + if is_head { 0 } else { body.len() });
-    out.extend_from_slice(
-        format!("HTTP/1.1 {} {}\r\n", status, reason).as_bytes()
-    );
+    out.extend_from_slice(format!("HTTP/1.1 {} {}\r\n", status, reason).as_bytes());
     // Any upstream copy of a header this function emits itself is dropped
     // here, or the response goes out carrying both.
     //
@@ -937,10 +1085,10 @@ pub fn make_tls_server_config(
     use std::fs::File;
     use std::io::BufReader;
 
-    let cert_file = File::open(cert_path)
-        .map_err(|e| anyhow::anyhow!("open cert {}: {}", cert_path, e))?;
-    let key_file = File::open(key_path)
-        .map_err(|e| anyhow::anyhow!("open key {}: {}", key_path, e))?;
+    let cert_file =
+        File::open(cert_path).map_err(|e| anyhow::anyhow!("open cert {}: {}", cert_path, e))?;
+    let key_file =
+        File::open(key_path).map_err(|e| anyhow::anyhow!("open key {}: {}", key_path, e))?;
 
     let certs: Vec<_> = certs(&mut BufReader::new(cert_file))
         .collect::<Result<_, _>>()
@@ -966,12 +1114,21 @@ mod head_framing_tests {
     use super::*;
 
     fn hdrs() -> Vec<(String, String)> {
-        vec![("content-type".to_string(), "text/html; charset=utf-8".to_string())]
+        vec![(
+            "content-type".to_string(),
+            "text/html; charset=utf-8".to_string(),
+        )]
     }
 
     fn split(raw: &[u8]) -> (String, &[u8]) {
-        let i = raw.windows(4).position(|w| w == b"\r\n\r\n").expect("header terminator");
-        (String::from_utf8_lossy(&raw[..i]).to_string(), &raw[i + 4..])
+        let i = raw
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("header terminator");
+        (
+            String::from_utf8_lossy(&raw[..i]).to_string(),
+            &raw[i + 4..],
+        )
     }
 
     const BODY: &[u8] = b"<!doctype html><html><body>hello</body></html>";
@@ -995,7 +1152,12 @@ mod head_framing_tests {
     fn head_sends_zero_body_bytes() {
         let raw = build_response(200, &hdrs(), BODY, "HEAD", false);
         let (_, body) = split(&raw);
-        assert_eq!(body.len(), 0, "HEAD must send no body, got {} bytes", body.len());
+        assert_eq!(
+            body.len(),
+            0,
+            "HEAD must send no body, got {} bytes",
+            body.len()
+        );
     }
 
     /// RFC 9110 9.3.2: the headers are those a GET would have sent, so
@@ -1006,16 +1168,27 @@ mod head_framing_tests {
     fn head_still_advertises_the_get_length() {
         let raw = build_response(200, &hdrs(), BODY, "HEAD", false);
         let (head, _) = split(&raw);
-        assert!(head.contains(&format!("content-length: {}", BODY.len())),
-                "expected content-length {}, headers were:\n{head}", BODY.len());
+        assert!(
+            head.contains(&format!("content-length: {}", BODY.len())),
+            "expected content-length {}, headers were:\n{head}",
+            BODY.len()
+        );
     }
 
     /// A HEAD response must otherwise be indistinguishable from the GET's
     /// header block — same status, same content-type, same everything.
     #[test]
     fn head_and_get_headers_match() {
-        let (gh, _) = { let r = build_response(200, &hdrs(), BODY, "GET", false); let (h, _) = split(&r); (h, ()) };
-        let (hh, _) = { let r = build_response(200, &hdrs(), BODY, "HEAD", false); let (h, _) = split(&r); (h, ()) };
+        let (gh, _) = {
+            let r = build_response(200, &hdrs(), BODY, "GET", false);
+            let (h, _) = split(&r);
+            (h, ())
+        };
+        let (hh, _) = {
+            let r = build_response(200, &hdrs(), BODY, "HEAD", false);
+            let (h, _) = split(&r);
+            (h, ())
+        };
         assert_eq!(gh, hh, "HEAD headers differ from GET headers");
     }
 
@@ -1042,7 +1215,10 @@ mod head_framing_tests {
             let raw200 = build_response(200, &hdrs(), b"", m, false);
             let (head, body) = split(&raw200);
             assert_eq!(body.len(), 0);
-            assert!(head.contains("content-length: 0"), "200 must state its length:\n{head}");
+            assert!(
+                head.contains("content-length: 0"),
+                "200 must state its length:\n{head}"
+            );
 
             let raw204 = build_response(204, &hdrs(), b"", m, false);
             let (head, body) = split(&raw204);
@@ -1070,7 +1246,9 @@ mod line_ending_tests {
     #[test]
     fn crlf_headers_parse() {
         let h = headers_of(b"GET / HTTP/1.1\r\nHost: a\r\nX-One: 1\r\n\r\n").expect("parsed");
-        assert!(h.iter().any(|(k, v)| k.eq_ignore_ascii_case("x-one") && v == "1"));
+        assert!(h
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("x-one") && v == "1"));
     }
 
     /// The question this file exists to answer: does a **bare LF** inside the
@@ -1117,7 +1295,10 @@ mod response_header_tests {
         let text = String::from_utf8_lossy(raw);
         let head = text.split("\r\n\r\n").next().unwrap_or("").to_string();
         head.lines()
-            .filter(|l| l.to_lowercase().starts_with(&format!("{}:", name.to_lowercase())))
+            .filter(|l| {
+                l.to_lowercase()
+                    .starts_with(&format!("{}:", name.to_lowercase()))
+            })
             .map(|l| l.trim().to_string())
             .collect()
     }
@@ -1152,9 +1333,16 @@ mod response_header_tests {
     fn head_reports_the_get_representation_length() {
         let upstream = vec![("Content-Length".to_string(), "16580".to_string())];
         let raw = build_response(200, &upstream, b"", "HEAD", false);
-        assert_eq!(header_lines(&raw, "content-length"), vec!["content-length: 16580"]);
+        assert_eq!(
+            header_lines(&raw, "content-length"),
+            vec!["content-length: 16580"]
+        );
         // ...and still no body.
-        let body = String::from_utf8_lossy(&raw).split("\r\n\r\n").nth(1).unwrap_or("").len();
+        let body = String::from_utf8_lossy(&raw)
+            .split("\r\n\r\n")
+            .nth(1)
+            .unwrap_or("")
+            .len();
         assert_eq!(body, 0, "HEAD must send no body");
     }
 
@@ -1164,7 +1352,10 @@ mod response_header_tests {
     fn body_length_wins_when_a_body_is_present() {
         let upstream = vec![("Content-Length".to_string(), "99999".to_string())];
         let raw = build_response(200, &upstream, b"hello", "GET", false);
-        assert_eq!(header_lines(&raw, "content-length"), vec!["content-length: 5"]);
+        assert_eq!(
+            header_lines(&raw, "content-length"),
+            vec!["content-length: 5"]
+        );
     }
 
     /// Same duplication hazard: `connection: close` is written unconditionally.
@@ -1193,8 +1384,18 @@ mod bodyless_status_tests {
     use super::{build_response, status_may_have_content_length};
 
     fn head_of(status: u16) -> String {
-        let raw = build_response(status, &[("ETag".to_string(), "\"x\"".to_string())], b"", "GET", false);
-        String::from_utf8_lossy(&raw).split("\r\n\r\n").next().unwrap_or("").to_string()
+        let raw = build_response(
+            status,
+            &[("ETag".to_string(), "\"x\"".to_string())],
+            b"",
+            "GET",
+            false,
+        );
+        String::from_utf8_lossy(&raw)
+            .split("\r\n\r\n")
+            .next()
+            .unwrap_or("")
+            .to_string()
     }
 
     /// RFC 9110 8.6. m6 sent `content-length: 0` on every 304, on all three
@@ -1280,8 +1481,14 @@ mod keep_alive_tests {
     /// and its client then waited for a close that never came.
     #[test]
     fn every_connection_line_counts_not_just_the_first() {
-        assert!(!wants_keep_alive(&req("HTTP/1.1", &["keep-alive", "close"])));
-        assert!(!wants_keep_alive(&req("HTTP/1.1", &["close", "keep-alive"])));
+        assert!(!wants_keep_alive(&req(
+            "HTTP/1.1",
+            &["keep-alive", "close"]
+        )));
+        assert!(!wants_keep_alive(&req(
+            "HTTP/1.1",
+            &["close", "keep-alive"]
+        )));
         assert!(!wants_keep_alive(&req("HTTP/1.1", &["keep-alive, close"])));
     }
 
@@ -1308,7 +1515,7 @@ mod h2c_trust_tests {
     #[test]
     fn only_a_private_bind_is_trusted() {
         for private in [
-            "10.0.0.1:80",       // the production backbone address
+            "10.0.0.1:80", // the production backbone address
             "10.0.0.4:8080",
             "172.16.0.1:80",
             "192.168.1.1:80",
@@ -1333,8 +1540,8 @@ mod h2c_trust_tests {
             "203.0.113.9:80",
             "8.8.8.8:80",
             "[2001:db8::1]:80",
-            "172.32.0.1:80",     // just outside 172.16/12
-            "11.0.0.1:80",       // just outside 10/8
+            "172.32.0.1:80", // just outside 172.16/12
+            "11.0.0.1:80",   // just outside 10/8
         ] {
             assert_eq!(
                 trust_for_bind(public),

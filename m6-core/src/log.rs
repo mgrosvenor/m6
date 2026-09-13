@@ -1,5 +1,4 @@
 /// Logging initialisation for m6 processes.
-
 use anyhow::Result;
 use std::path::Path;
 use tracing::Level;
@@ -98,7 +97,11 @@ pub fn pulse() -> &'static LogPulse {
 struct PulseLayer;
 
 impl<S: tracing::Subscriber> Layer<S> for PulseLayer {
-    fn on_event(&self, _event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+    fn on_event(
+        &self,
+        _event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
         PULSE.record();
     }
 }
@@ -177,7 +180,9 @@ impl LogHandle {
 /// operational logging (and double-write them when [`init_with_analytics`]
 /// is in use).
 fn make_filter(level: Level) -> BoxedFilter {
-    Box::new(LevelFilter::from_level(level).and(filter_fn(|meta| meta.target() != ANALYTICS_TARGET)))
+    Box::new(
+        LevelFilter::from_level(level).and(filter_fn(|meta| meta.target() != ANALYTICS_TARGET)),
+    )
 }
 
 /// Build the main stdout layer around an already-registered reloadable filter.
@@ -219,7 +224,10 @@ fn make_analytics_layer(path: &Path) -> Result<(BoxedLayer, WorkerGuard)> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
     let (writer, guard) = tracing_appender::non_blocking(file);
     let filter = filter_fn(|meta| meta.target() == ANALYTICS_TARGET);
     let layer: BoxedLayer = Box::new(
@@ -256,7 +264,11 @@ pub fn init(format: &str, level: &str) -> Result<LogHandle> {
 /// `analytics_path` should point outside any directory that gets wiped on
 /// redeploy (e.g. not inside a rendered/generated site tree) — the file is
 /// opened in append mode and grown across restarts.
-pub fn init_with_analytics(format: &str, level: &str, analytics_path: Option<&Path>) -> Result<LogHandle> {
+pub fn init_with_analytics(
+    format: &str,
+    level: &str,
+    analytics_path: Option<&Path>,
+) -> Result<LogHandle> {
     // Anchor the clock before anything can log, so `seconds_since_last` is
     // measured from process start rather than from the first call.
     let _ = process_start();

@@ -28,17 +28,17 @@ use rustls::StreamOwned;
 use m6_core::testkit::{binary, claim_port, PortClaim, Service};
 
 fn generate_tls_cert() -> (String, String, Vec<u8>) {
-    let ck = rcgen::generate_simple_self_signed(vec![
-        "localhost".to_string(),
-        "127.0.0.1".to_string(),
-    ])
-    .expect("rcgen");
+    let ck =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+            .expect("rcgen");
     let der = ck.cert.der().to_vec();
     (ck.cert.pem(), ck.key_pair.serialize_pem(), der)
 }
 
 fn tls_client_config(cert_der: &[u8]) -> Arc<rustls::ClientConfig> {
-    rustls::crypto::ring::default_provider().install_default().ok();
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
     let cert = rustls::pki_types::CertificateDer::from(cert_der.to_vec());
     let mut store = rustls::RootCertStore::empty();
     store.add(cert).unwrap();
@@ -90,7 +90,10 @@ impl HttpResponse {
 /// a final assertion prints the transport error instead of an unwrap panic
 /// with no context.
 fn no_response(reason: impl std::fmt::Display) -> HttpResponse {
-    HttpResponse { status: 0, headers: format!("<no response: {reason}>") }
+    HttpResponse {
+        status: 0,
+        headers: format!("<no response: {reason}>"),
+    }
 }
 
 /// One HTTP/1.1-over-TLS GET against a bare port.
@@ -100,7 +103,12 @@ fn no_response(reason: impl std::fmt::Display) -> HttpResponse {
 /// [`Server::get`], which reports a dead service instead of a bare io error.
 ///
 /// Never panics on a transport failure. See [`no_response`].
-fn https_get(port: u16, path: &str, extra: &[(&str, &str)], tls: Arc<rustls::ClientConfig>) -> HttpResponse {
+fn https_get(
+    port: u16,
+    path: &str,
+    extra: &[(&str, &str)],
+    tls: Arc<rustls::ClientConfig>,
+) -> HttpResponse {
     match TcpStream::connect(("127.0.0.1", port)) {
         Ok(tcp) => https_exchange(tcp, port, path, extra, tls),
         Err(e) => no_response(format!("tcp connect: {e}")),
@@ -179,7 +187,9 @@ fn h3_get(port: u16, path: &str, cookie: Option<&str>) -> Result<(u16, Vec<Strin
     let local = udp.local_addr().unwrap();
 
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).map_err(|e| e.to_string())?;
-    config.set_application_protos(quiche::h3::APPLICATION_PROTOCOL).map_err(|e| e.to_string())?;
+    config
+        .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
+        .map_err(|e| e.to_string())?;
     config.set_max_idle_timeout(10_000);
     config.set_initial_max_data(10_000_000);
     config.set_initial_max_stream_data_bidi_local(1_000_000);
@@ -230,7 +240,10 @@ fn h3_get(port: u16, path: &str, cookie: Option<&str>) -> Result<(u16, Vec<Strin
 
         if conn.is_established() && h3.is_none() {
             let cfg = quiche::h3::Config::new().map_err(|e| e.to_string())?;
-            h3 = Some(quiche::h3::Connection::with_transport(&mut conn, &cfg).map_err(|e| format!("h3 init: {e}"))?);
+            h3 = Some(
+                quiche::h3::Connection::with_transport(&mut conn, &cfg)
+                    .map_err(|e| format!("h3 init: {e}"))?,
+            );
         }
 
         if let Some(ref mut h3c) = h3 {
@@ -366,7 +379,9 @@ impl Server {
             Ok(s) => Some(s),
             Err(_) => {
                 // Fatal and self-reporting when the process is actually dead.
-                self.http.borrow_mut().assert_alive("the client was connecting");
+                self.http
+                    .borrow_mut()
+                    .assert_alive("the client was connecting");
                 None
             }
         }
@@ -431,11 +446,19 @@ fn start_server() -> Server {
     // A second HTML page, referencing nothing — the session tests need a
     // text/html response (only those mint a session, per the HTTP-06 fix) but
     // must not drag page.html's prefetch hints into their own line counts.
-    std::fs::write(site.join("public/plain.html"), b"<!doctype html><title>hi</title>").unwrap();
+    std::fs::write(
+        site.join("public/plain.html"),
+        b"<!doctype html><title>hi</title>",
+    )
+    .unwrap();
     // Used only as the readiness probe, so no test's path is warmed by it.
     // Probing a path a test then asserts on turns its first request into a
     // cache HIT, and `session_cookie_minted_once_and_reused_h3` asserts MISS.
-    std::fs::write(site.join("public/probe.html"), b"<!doctype html><title>probe</title>").unwrap();
+    std::fs::write(
+        site.join("public/probe.html"),
+        b"<!doctype html><title>probe</title>",
+    )
+    .unwrap();
 
     let sock = dir.path().join("m6-file-1.sock");
     let sock_glob = dir.path().join("m6-file-*.sock");
@@ -572,11 +595,25 @@ fn session_cookie_minted_once_and_reused_h1() {
 
     std::thread::sleep(Duration::from_millis(200)); // let the log writer flush
     let lines = read_analytics_lines(&srv.analytics_log);
-    assert_eq!(lines.len(), 2, "expected exactly 2 analytics lines, got {}: {lines:?}", lines.len());
-    assert!(lines[0].session_new, "first request's line should have session_new=true");
+    assert_eq!(
+        lines.len(),
+        2,
+        "expected exactly 2 analytics lines, got {}: {lines:?}",
+        lines.len()
+    );
+    assert!(
+        lines[0].session_new,
+        "first request's line should have session_new=true"
+    );
     assert_eq!(lines[0].session_id, session_id);
-    assert!(!lines[1].session_new, "second (replayed-cookie) request's line should have session_new=false");
-    assert_eq!(lines[1].session_id, session_id, "second request should log the SAME session id, not a fresh one");
+    assert!(
+        !lines[1].session_new,
+        "second (replayed-cookie) request's line should have session_new=false"
+    );
+    assert_eq!(
+        lines[1].session_id, session_id,
+        "second request should log the SAME session id, not a fresh one"
+    );
 }
 
 /// Same property over HTTP/3 — the protocol whose analytics code path is
@@ -586,7 +623,8 @@ fn session_cookie_minted_once_and_reused_h1() {
 fn session_cookie_minted_once_and_reused_h3() {
     let srv = start_server();
 
-    let (status1, set_cookies1) = h3_get(srv.port, "/public/plain.html", None).expect("h3 request 1");
+    let (status1, set_cookies1) =
+        h3_get(srv.port, "/public/plain.html", None).expect("h3 request 1");
     assert_eq!(status1, 200);
     assert_eq!(
         set_cookies1.len(),
@@ -598,7 +636,8 @@ fn session_cookie_minted_once_and_reused_h3() {
     let cookie_value = set_cookies1[0].split(';').next().unwrap();
     let session_id = cookie_value.split_once('=').unwrap().1;
 
-    let (status2, set_cookies2) = h3_get(srv.port, "/public/plain.html", Some(cookie_value)).expect("h3 request 2");
+    let (status2, set_cookies2) =
+        h3_get(srv.port, "/public/plain.html", Some(cookie_value)).expect("h3 request 2");
     assert_eq!(status2, 200);
     assert!(
         set_cookies2.is_empty(),
@@ -608,7 +647,12 @@ fn session_cookie_minted_once_and_reused_h3() {
 
     std::thread::sleep(Duration::from_millis(200));
     let lines = read_analytics_lines(&srv.analytics_log);
-    assert_eq!(lines.len(), 2, "expected exactly 2 analytics lines, got {}: {lines:?}", lines.len());
+    assert_eq!(
+        lines.len(),
+        2,
+        "expected exactly 2 analytics lines, got {}: {lines:?}",
+        lines.len()
+    );
     assert_eq!(lines[0].cache_state, "MISS"); // first hit of this path, nothing cached yet
     assert!(lines[0].session_new);
     assert_eq!(lines[0].session_id, session_id);
@@ -662,7 +706,9 @@ fn prefetched_assets_are_not_logged_to_analytics() {
          the prefetch was logged",
         lines.len()
     );
-    assert!(lines.iter().all(|l| l.path == "/public/page.html" || l.path == "/public/style.css"));
+    assert!(lines
+        .iter()
+        .all(|l| l.path == "/public/page.html" || l.path == "/public/style.css"));
     // At least one of the style.css fetches should have been served from
     // cache once the prefetch (which this loop exists to give a chance to
     // run) completed — confirms the prefetch actually happened, not just
@@ -688,7 +734,12 @@ fn backend_4xx_is_logged_to_analytics() {
 
     std::thread::sleep(Duration::from_millis(400));
     let lines = read_analytics_lines(&srv.analytics_log);
-    assert_eq!(lines.len(), 1, "expected exactly 1 analytics line for the 404, got {}: {lines:?}", lines.len());
+    assert_eq!(
+        lines.len(),
+        1,
+        "expected exactly 1 analytics line for the 404, got {}: {lines:?}",
+        lines.len()
+    );
     assert_eq!(lines[0].path, "/public/does-not-exist.txt");
 }
 
@@ -859,7 +910,8 @@ name = "test-node"
     std::thread::sleep(Duration::from_millis(400));
     let lines = read_analytics_lines(&analytics_log);
     assert_eq!(
-        lines.len(), 1,
+        lines.len(),
+        1,
         "expected exactly 1 analytics line for the custom-error-page fetch, got {}: {lines:?}",
         lines.len()
     );
@@ -953,12 +1005,18 @@ name = "test-node"
 
     let tls = tls_client_config(&cert_der);
     let resp = https_get(port, "/proxy/anything", &[], tls);
-    assert!(resp.status >= 500, "expected a 5xx for an unreachable backend, got {}: {}", resp.status, resp.headers);
+    assert!(
+        resp.status >= 500,
+        "expected a 5xx for an unreachable backend, got {}: {}",
+        resp.status,
+        resp.headers
+    );
 
     std::thread::sleep(Duration::from_millis(400));
     let lines = read_analytics_lines(&analytics_log);
     assert_eq!(
-        lines.len(), 1,
+        lines.len(),
+        1,
         "expected exactly 1 analytics line for the connection-failure response, got {}: {lines:?}",
         lines.len()
     );
@@ -992,15 +1050,21 @@ fn edge_reuses_origin_session_instead_of_minting_a_second_one() {
     // HTTP-06 fix — a session cookie on every image and stylesheet was both
     // noise and a needless per-asset identifier). A .txt fixture here would
     // exercise the no-mint path and never see the bug this test guards.
-    std::fs::write(origin_site.join("public/page.html"), b"<!doctype html><title>x</title>")
-        .unwrap();
+    std::fs::write(
+        origin_site.join("public/page.html"),
+        b"<!doctype html><title>x</title>",
+    )
+    .unwrap();
     // A second asset used only as the readiness probe. It must not be the
     // path under test: probing through the edge would populate the edge cache,
     // the real request would then be a HIT, the origin would never see it, and
     // the assertion that both nodes logged a line would fail for a reason that
     // has nothing to do with sessions.
-    std::fs::write(origin_site.join("public/probe.html"), b"<!doctype html><title>probe</title>")
-        .unwrap();
+    std::fs::write(
+        origin_site.join("public/probe.html"),
+        b"<!doctype html><title>probe</title>",
+    )
+    .unwrap();
 
     let origin_sock = origin_dir.path().join("m6-file-1.sock");
     let origin_sock_glob = origin_dir.path().join("m6-file-*.sock");
@@ -1164,13 +1228,23 @@ backend = "origin"
 
     let set_cookies = resp.header_values("set-cookie");
     assert_eq!(
-        set_cookies.len(), 1,
+        set_cookies.len(),
+        1,
         "the client must see exactly ONE Set-Cookie even though two m6-http \
          instances (edge + origin) both touched this request — got {}: {:?}\n\
          full headers:\n{}",
-        set_cookies.len(), set_cookies, resp.headers
+        set_cookies.len(),
+        set_cookies,
+        resp.headers
     );
-    let session_id = set_cookies[0].split(';').next().unwrap().split_once('=').unwrap().1.to_string();
+    let session_id = set_cookies[0]
+        .split(';')
+        .next()
+        .unwrap()
+        .split_once('=')
+        .unwrap()
+        .1
+        .to_string();
 
     std::thread::sleep(Duration::from_millis(400));
 
@@ -1179,14 +1253,28 @@ backend = "origin"
     // visibility isn't lost), and BOTH must agree on the same session id.
     let origin_lines = read_analytics_lines(&origin_analytics_log);
     let edge_lines = read_analytics_lines(&edge_analytics_log);
-    assert_eq!(origin_lines.len(), 1, "expected exactly 1 analytics line at origin: {origin_lines:?}");
-    assert_eq!(edge_lines.len(), 1, "expected exactly 1 analytics line at edge: {edge_lines:?}");
-    assert_eq!(origin_lines[0].session_id, session_id, "origin's logged session id must match the cookie the client received");
+    assert_eq!(
+        origin_lines.len(),
+        1,
+        "expected exactly 1 analytics line at origin: {origin_lines:?}"
+    );
+    assert_eq!(
+        edge_lines.len(),
+        1,
+        "expected exactly 1 analytics line at edge: {edge_lines:?}"
+    );
+    assert_eq!(
+        origin_lines[0].session_id, session_id,
+        "origin's logged session id must match the cookie the client received"
+    );
     assert_eq!(
         edge_lines[0].session_id, session_id,
         "edge's logged session id must match origin's — not a second, independently-minted one"
     );
-    assert!(origin_lines[0].session_new, "origin minted the session, so its line should say session_new=true");
+    assert!(
+        origin_lines[0].session_new,
+        "origin minted the session, so its line should say session_new=true"
+    );
     assert!(
         !edge_lines[0].session_new,
         "edge did not mint anything — it reused origin's session — so its line should say session_new=false"

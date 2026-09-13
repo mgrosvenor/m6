@@ -164,6 +164,9 @@ mod tests {
         };
         // The marker must be gone, so the same port can be claimed again.
         let dir = claim_dir();
-        assert!(!dir.join(port.to_string()).exists(), "marker outlived the claim");
+        assert!(
+            !dir.join(port.to_string()).exists(),
+            "marker outlived the claim"
+        );
     }
 }

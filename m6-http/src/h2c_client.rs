@@ -144,7 +144,10 @@ impl H2cClientConn {
         original_host: &str,
     ) -> io::Result<mpsc::Receiver<io::Result<HttpResponse>>> {
         if self.is_dead {
-            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "h2c: connection dead"));
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "h2c: connection dead",
+            ));
         }
 
         let stream_id = self.next_stream_id;
@@ -199,8 +202,7 @@ impl H2cClientConn {
 
         // Push HEADERS frame
         let has_body = !req.body.is_empty();
-        let headers_flags =
-            FLAG_END_HEADERS | if has_body { 0 } else { FLAG_END_STREAM };
+        let headers_flags = FLAG_END_HEADERS | if has_body { 0 } else { FLAG_END_STREAM };
         self.push_frame(TYPE_HEADERS, headers_flags, stream_id, &header_block);
 
         let (tx, rx) = mpsc::channel();
@@ -212,7 +214,11 @@ impl H2cClientConn {
                 resp_body: vec![],
                 headers_done: false,
                 tx,
-                pending_body: if has_body { req.body.clone() } else { Vec::new() },
+                pending_body: if has_body {
+                    req.body.clone()
+                } else {
+                    Vec::new()
+                },
                 body_off: 0,
                 send_window: self.peer_initial_window,
             },
@@ -253,7 +259,9 @@ impl H2cClientConn {
         let max_frame = (self.peer_max_frame as usize).max(1);
         loop {
             let (chunk, last) = {
-                let Some(s) = self.streams.get_mut(&stream_id) else { return };
+                let Some(s) = self.streams.get_mut(&stream_id) else {
+                    return;
+                };
                 let remaining = s.pending_body.len() - s.body_off;
                 if remaining == 0 {
                     return;
@@ -815,15 +823,14 @@ fn parse_h2c_host_port(base_url: &str) -> io::Result<(String, u16)> {
     // IPv6: [::1]:port or [::1]
     if let Some(bracket_end) = authority.find(']') {
         let host = authority[1..bracket_end].to_string();
-        let port = if bracket_end + 1 < authority.len()
-            && authority.as_bytes()[bracket_end + 1] == b':'
-        {
-            authority[bracket_end + 2..].parse::<u16>().map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "invalid port in h2c URL")
-            })?
-        } else {
-            80
-        };
+        let port =
+            if bracket_end + 1 < authority.len() && authority.as_bytes()[bracket_end + 1] == b':' {
+                authority[bracket_end + 2..].parse::<u16>().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "invalid port in h2c URL")
+                })?
+            } else {
+                80
+            };
         return Ok((host, port));
     }
 

@@ -8,7 +8,6 @@
 ///
 /// Frame format (RFC 9113 §4.1):
 ///   [length: u24][type: u8][flags: u8][stream_id: u31][payload: length bytes]
-
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::time::Instant;
@@ -19,41 +18,46 @@ use crate::http11::RequestOutcome;
 
 /// I/O abstraction: TLS (HTTPS) or plain TCP (H2C over WireGuard).
 pub enum H2Io<'a> {
-    Tls { tls: &'a mut rustls::ServerConnection, stream: &'a std::net::TcpStream },
-    Plain { stream: &'a std::net::TcpStream },
+    Tls {
+        tls: &'a mut rustls::ServerConnection,
+        stream: &'a std::net::TcpStream,
+    },
+    Plain {
+        stream: &'a std::net::TcpStream,
+    },
 }
 
 // ── Frame type constants ──────────────────────────────────────────────────────
 
-const TYPE_DATA:          u8 = 0x0;
-const TYPE_HEADERS:       u8 = 0x1;
-const TYPE_PRIORITY:      u8 = 0x2;
-const TYPE_RST_STREAM:    u8 = 0x3;
-const TYPE_SETTINGS:      u8 = 0x4;
-const TYPE_PUSH_PROMISE:  u8 = 0x5;
-const TYPE_PING:          u8 = 0x6;
-const TYPE_GOAWAY:        u8 = 0x7;
+const TYPE_DATA: u8 = 0x0;
+const TYPE_HEADERS: u8 = 0x1;
+const TYPE_PRIORITY: u8 = 0x2;
+const TYPE_RST_STREAM: u8 = 0x3;
+const TYPE_SETTINGS: u8 = 0x4;
+const TYPE_PUSH_PROMISE: u8 = 0x5;
+const TYPE_PING: u8 = 0x6;
+const TYPE_GOAWAY: u8 = 0x7;
 const TYPE_WINDOW_UPDATE: u8 = 0x8;
-const TYPE_CONTINUATION:  u8 = 0x9;
+const TYPE_CONTINUATION: u8 = 0x9;
 
-const FLAG_END_STREAM:  u8 = 0x1;
+const FLAG_END_STREAM: u8 = 0x1;
 const FLAG_END_HEADERS: u8 = 0x4;
-const FLAG_PADDED:      u8 = 0x8;
-const FLAG_PRIORITY:    u8 = 0x20;
-const FLAG_ACK:         u8 = 0x1;
+const FLAG_PADDED: u8 = 0x8;
+const FLAG_PRIORITY: u8 = 0x20;
+const FLAG_ACK: u8 = 0x1;
 
-const SETTING_HEADER_TABLE_SIZE:      u16 = 0x1;
-const SETTING_ENABLE_PUSH:            u16 = 0x2;
+const SETTING_HEADER_TABLE_SIZE: u16 = 0x1;
+const SETTING_ENABLE_PUSH: u16 = 0x2;
 const SETTING_MAX_CONCURRENT_STREAMS: u16 = 0x3;
-const SETTING_INITIAL_WINDOW_SIZE:    u16 = 0x4;
-const SETTING_MAX_FRAME_SIZE:         u16 = 0x5;
+const SETTING_INITIAL_WINDOW_SIZE: u16 = 0x4;
+const SETTING_MAX_FRAME_SIZE: u16 = 0x5;
 
 const CLIENT_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-const FRAME_HDR:      usize = 9;
+const FRAME_HDR: usize = 9;
 
-const DEFAULT_WINDOW:       u32 = 65_535;
-const DEFAULT_MAX_FRAME:    u32 = 16_384;
-const MAX_CONCURRENT:       u32 = 100;
+const DEFAULT_WINDOW: u32 = 65_535;
+const DEFAULT_MAX_FRAME: u32 = 16_384;
+const MAX_CONCURRENT: u32 = 100;
 
 /// Hard ceiling on a single buffered HTTP/2 request body.
 ///
@@ -94,14 +98,14 @@ const MAX_FRAME_SIZE: usize = 16_384;
 /// and matches the order other servers use.
 const MAX_HEADER_BLOCK: usize = 256 * 1024;
 
-const ERR_NO_ERROR:       u32 = 0x0;
+const ERR_NO_ERROR: u32 = 0x0;
 const ERR_PROTOCOL_ERROR: u32 = 0x1;
-const ERR_STREAM_CLOSED:  u32 = 0x5;
+const ERR_STREAM_CLOSED: u32 = 0x5;
 const ERR_REFUSED_STREAM: u32 = 0x7;
-const ERR_FRAME_SIZE:     u32 = 0x6;
-const ERR_FLOW_CONTROL:   u32 = 0x3;
+const ERR_FRAME_SIZE: u32 = 0x6;
+const ERR_FLOW_CONTROL: u32 = 0x3;
 const ERR_ENHANCE_YOUR_CALM: u32 = 0xb;
-const ERR_COMPRESSION:    u32 = 0x9;
+const ERR_COMPRESSION: u32 = 0x9;
 
 /// The HPACK dynamic table size a peer's encoder may assume for our decoder.
 ///
@@ -204,23 +208,26 @@ enum FrameVerdict {
 }
 
 struct H2Stream {
-    state:        StreamState,
-    headers:      Vec<(String, String)>,
-    body:         Vec<u8>,
+    state: StreamState,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
     headers_done: bool,
-    send_window:  i32,
+    send_window: i32,
     /// Per-stream RECEIVE window. RFC 9113 5.2 requires flow control to be
     /// tracked per stream as well as per connection; only the connection
     /// window existed, so one stream could consume the whole connection's
     /// credit and no stream-level limit applied at all.
-    recv_window:  i32,
+    recv_window: i32,
     // Buffered response body for flow-controlled delivery.
     // None  = request not yet dispatched.
     // Some  = response queued; resp_sent bytes already flushed.
-    resp_body:    Option<Vec<u8>>,
-    resp_sent:    usize,
+    resp_body: Option<Vec<u8>>,
+    resp_sent: usize,
     /// Pending URL-backend request: set by maybe_dispatch when backend is async.
-    pending_rx:   Option<(std::sync::mpsc::Receiver<std::io::Result<HttpResponse>>, PendingUrlContext)>,
+    pending_rx: Option<(
+        std::sync::mpsc::Receiver<std::io::Result<HttpResponse>>,
+        PendingUrlContext,
+    )>,
 }
 
 impl H2Stream {
@@ -241,24 +248,28 @@ impl H2Stream {
 
 // ── Connection phase ──────────────────────────────────────────────────────────
 
-#[derive(PartialEq)]
-#[derive(Debug)]
-enum Phase { Preface, Active, GoingAway, Done }
+#[derive(PartialEq, Debug)]
+enum Phase {
+    Preface,
+    Active,
+    GoingAway,
+    Done,
+}
 
 // ── Public type ───────────────────────────────────────────────────────────────
 
 pub struct Http2Conn {
-    phase:    Phase,
+    phase: Phase,
     recv_buf: Vec<u8>,
     send_buf: Vec<u8>,
     /// Updated on every received frame; drives the idle timeout.
     last_active: Instant,
 
-    streams:       HashMap<u32, H2Stream>,
-    hpack_dec:     hpack::Decoder<'static>,
-    hpack_enc:     hpack::Encoder<'static>,
+    streams: HashMap<u32, H2Stream>,
+    hpack_dec: hpack::Decoder<'static>,
+    hpack_enc: hpack::Encoder<'static>,
 
-    last_stream_id:         u32,
+    last_stream_id: u32,
     /// Stream ids recently terminated by RST_STREAM, newest last.
     ///
     /// RFC 9113 5.1 treats a closed stream differently depending on HOW it
@@ -277,26 +288,26 @@ pub struct Http2Conn {
     /// double duty: they also hold the stream's concurrency slot for
     /// `RESET_DECAY`, which is what makes `MAX_CONCURRENT` bind against a
     /// reset flood. See `active_streams`.
-    recently_reset:         std::collections::VecDeque<(u32, Instant)>,
+    recently_reset: std::collections::VecDeque<(u32, Instant)>,
     /// Consecutive REFUSED_STREAM answers sent, cleared whenever a stream is
     /// accepted. See `MAX_REFUSED_STREAK`.
-    refused_streak:         u32,
+    refused_streak: u32,
     /// Whether a GOAWAY has already gone out, so the generic error path does
     /// not overwrite a precise code with PROTOCOL_ERROR.
-    goaway_sent:            bool,
+    goaway_sent: bool,
     continuation_stream_id: Option<u32>,
-    header_block_buf:       Vec<u8>,
+    header_block_buf: Vec<u8>,
 
     peer_initial_window: i32,
-    peer_max_frame:      u32,
-    conn_recv_window:    i32,
-    conn_send_window:    i32,
+    peer_max_frame: u32,
+    conn_recv_window: i32,
+    conn_send_window: i32,
 
     /// Next server-initiated (push) stream ID.  Server-initiated streams are
     /// even-numbered; starts at 2, incremented by 2 per push.
     next_push_id: u32,
     /// False when the client sends SETTINGS_ENABLE_PUSH=0.
-    enable_push:  bool,
+    enable_push: bool,
     /// Whether this connection's peer may assert a client address on behalf of
     /// someone else. `Never` unless the listener explicitly granted it, so a
     /// connection that forgets to say anything is safe.
@@ -306,11 +317,11 @@ pub struct Http2Conn {
 impl Http2Conn {
     pub fn new() -> Self {
         Http2Conn {
-            phase:    Phase::Preface,
+            phase: Phase::Preface,
             recv_buf: Vec::with_capacity(16_384),
             send_buf: Vec::with_capacity(16_384),
             last_active: Instant::now(),
-            streams:  HashMap::new(),
+            streams: HashMap::new(),
             hpack_dec: hpack::Decoder::new(),
             hpack_enc: hpack::Encoder::new(),
             last_stream_id: 0,
@@ -320,11 +331,11 @@ impl Http2Conn {
             continuation_stream_id: None,
             header_block_buf: Vec::new(),
             peer_initial_window: DEFAULT_WINDOW as i32,
-            peer_max_frame:      DEFAULT_MAX_FRAME,
-            conn_recv_window:    DEFAULT_WINDOW as i32,
-            conn_send_window:    DEFAULT_WINDOW as i32,
+            peer_max_frame: DEFAULT_MAX_FRAME,
+            conn_recv_window: DEFAULT_WINDOW as i32,
+            conn_send_window: DEFAULT_WINDOW as i32,
             next_push_id: 2,
-            enable_push:  true,
+            enable_push: true,
             forwarded_trust: crate::forward::ForwardedTrust::Never,
         }
     }
@@ -340,22 +351,33 @@ impl Http2Conn {
         self
     }
 
-    pub fn is_done(&self) -> bool { self.phase == Phase::Done }
+    pub fn is_done(&self) -> bool {
+        self.phase == Phase::Done
+    }
 
     /// Drive one step: pump I/O, parse frames, dispatch requests.
     pub fn drive<F, G>(
         &mut self,
-        mut io:      H2Io<'_>,
-        client_ip:   &str,
-        on_request:  &mut F,
+        mut io: H2Io<'_>,
+        client_ip: &str,
+        on_request: &mut F,
         on_response: &mut G,
-    )
-    where
+    ) where
         F: FnMut(&HttpRequest, &str) -> RequestOutcome,
-        G: FnMut(std::io::Result<HttpResponse>, &PendingUrlContext)
-               -> (u16, Vec<(String, String)>, Vec<u8>, String, std::sync::Arc<Vec<String>>),
+        G: FnMut(
+            std::io::Result<HttpResponse>,
+            &PendingUrlContext,
+        ) -> (
+            u16,
+            Vec<(String, String)>,
+            Vec<u8>,
+            String,
+            std::sync::Arc<Vec<String>>,
+        ),
     {
-        if self.phase == Phase::Done { return; }
+        if self.phase == Phase::Done {
+            return;
+        }
 
         // Poll any pending URL-backend receivers before processing new frames.
         self.poll_pending_url(on_response);
@@ -378,9 +400,9 @@ impl Http2Conn {
 
         loop {
             match self.process_frame(on_request, client_ip) {
-                Ok(true)  => {}
+                Ok(true) => {}
                 Ok(false) => break,
-                Err(e)    => {
+                Err(e) => {
                     tracing::warn!("http2 error: {e}");
                     // Only if nothing more specific has already been said.
                     // Handlers that detect a connection error send their own
@@ -412,7 +434,10 @@ impl Http2Conn {
         }
 
         if self.phase == Phase::GoingAway
-            && self.streams.values().all(|s| s.state == StreamState::Closed)
+            && self
+                .streams
+                .values()
+                .all(|s| s.state == StreamState::Closed)
         {
             self.phase = Phase::Done;
         }
@@ -425,8 +450,14 @@ impl Http2Conn {
             H2Io::Tls { tls, stream } => {
                 loop {
                     match tls.read_tls(&mut &**stream) {
-                        Ok(0)  => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "closed")),
-                        Ok(_)  => { tls.process_new_packets().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?; }
+                        Ok(0) => {
+                            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "closed"))
+                        }
+                        Ok(_) => {
+                            tls.process_new_packets().map_err(|e| {
+                                io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+                            })?;
+                        }
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                         // rustls caps its incoming-plaintext buffer at a fixed
                         // 16 KiB and refuses to pull more ciphertext until the
@@ -447,16 +478,20 @@ impl Http2Conn {
                         // and the next (level-triggered) poller wakeup resumes,
                         // because the rest of the record is still in the kernel
                         // socket buffer.
-                        Err(e) if e.kind() == io::ErrorKind::Other
-                            && e.to_string().contains("received plaintext buffer full") => break,
+                        Err(e)
+                            if e.kind() == io::ErrorKind::Other
+                                && e.to_string().contains("received plaintext buffer full") =>
+                        {
+                            break
+                        }
                         Err(e) => return Err(e),
                     }
                 }
                 let mut tmp = [0u8; 8192];
                 loop {
                     match tls.reader().read(&mut tmp) {
-                        Ok(0)  => break,
-                        Ok(n)  => {
+                        Ok(0) => break,
+                        Ok(n) => {
                             self.recv_buf.extend_from_slice(&tmp[..n]);
                             self.last_active = Instant::now();
                         }
@@ -470,8 +505,13 @@ impl Http2Conn {
                 let mut tmp = [0u8; 8192];
                 loop {
                     match stream.read(&mut tmp) {
-                        Ok(0)  => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "closed")),
-                        Ok(n)  => { self.recv_buf.extend_from_slice(&tmp[..n]); self.last_active = Instant::now(); }
+                        Ok(0) => {
+                            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "closed"))
+                        }
+                        Ok(n) => {
+                            self.recv_buf.extend_from_slice(&tmp[..n]);
+                            self.last_active = Instant::now();
+                        }
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                         Err(e) => return Err(e),
                     }
@@ -499,10 +539,16 @@ impl Http2Conn {
                     let mut socket_full = false;
                     loop {
                         match tls.write_tls(&mut &**stream) {
-                            Ok(0)  => break,
-                            Ok(_)  => {}
-                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => { socket_full = true; break; }
-                            Err(e) => { self.send_buf.drain(..pos); return Err(e); }
+                            Ok(0) => break,
+                            Ok(_) => {}
+                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                socket_full = true;
+                                break;
+                            }
+                            Err(e) => {
+                                self.send_buf.drain(..pos);
+                                return Err(e);
+                            }
                         }
                     }
 
@@ -517,8 +563,8 @@ impl Http2Conn {
                 // Final drain of any remaining encrypted records.
                 loop {
                     match tls.write_tls(&mut &**stream) {
-                        Ok(0)  => break,
-                        Ok(_)  => {}
+                        Ok(0) => break,
+                        Ok(_) => {}
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                         Err(e) => return Err(e),
                     }
@@ -531,9 +577,14 @@ impl Http2Conn {
                 while pos < self.send_buf.len() {
                     match stream.write(&self.send_buf[pos..]) {
                         Ok(0) => break,
-                        Ok(n) => { pos += n; }
+                        Ok(n) => {
+                            pos += n;
+                        }
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                        Err(e) => { self.send_buf.drain(..pos); return Err(e); }
+                        Err(e) => {
+                            self.send_buf.drain(..pos);
+                            return Err(e);
+                        }
                     }
                 }
                 self.send_buf.drain(..pos);
@@ -553,18 +604,24 @@ impl Http2Conn {
         F: FnMut(&HttpRequest, &str) -> RequestOutcome,
     {
         if self.phase == Phase::Preface {
-            if self.recv_buf.len() < CLIENT_PREFACE.len() { return Ok(false); }
-            if !self.recv_buf.starts_with(CLIENT_PREFACE) { return Err("bad connection preface"); }
+            if self.recv_buf.len() < CLIENT_PREFACE.len() {
+                return Ok(false);
+            }
+            if !self.recv_buf.starts_with(CLIENT_PREFACE) {
+                return Err("bad connection preface");
+            }
             self.recv_buf.drain(..CLIENT_PREFACE.len());
             self.phase = Phase::Active;
             self.send_server_settings();
         }
 
-        if self.recv_buf.len() < FRAME_HDR { return Ok(false); }
+        if self.recv_buf.len() < FRAME_HDR {
+            return Ok(false);
+        }
 
-        let length    = u24_be(&self.recv_buf[0..3]) as usize;
-        let ftype     = self.recv_buf[3];
-        let flags     = self.recv_buf[4];
+        let length = u24_be(&self.recv_buf[0..3]) as usize;
+        let ftype = self.recv_buf[3];
+        let flags = self.recv_buf[4];
         let stream_id = u32::from_be_bytes(self.recv_buf[5..9].try_into().unwrap()) & 0x7fff_ffff;
 
         // RFC 9113 4.2: a frame larger than the advertised SETTINGS_MAX_FRAME_SIZE
@@ -581,7 +638,9 @@ impl Http2Conn {
             return Err("frame exceeds SETTINGS_MAX_FRAME_SIZE");
         }
 
-        if self.recv_buf.len() < FRAME_HDR + length { return Ok(false); }
+        if self.recv_buf.len() < FRAME_HDR + length {
+            return Ok(false);
+        }
 
         let payload: Vec<u8> = self.recv_buf[FRAME_HDR..FRAME_HDR + length].to_vec();
         self.recv_buf.drain(..FRAME_HDR + length);
@@ -636,7 +695,11 @@ impl Http2Conn {
         // Checked before dispatch so no handler has to re-derive it, and so
         // that a frame on an idle or closed stream never reaches code that
         // would create the stream as a side effect of looking it up.
-        match if mid_header_block { FrameVerdict::Allow } else { self.frame_verdict(ftype, stream_id) } {
+        match if mid_header_block {
+            FrameVerdict::Allow
+        } else {
+            self.frame_verdict(ftype, stream_id)
+        } {
             FrameVerdict::Allow => {}
             FrameVerdict::ConnectionError(code) => {
                 self.send_goaway(code);
@@ -651,9 +714,11 @@ impl Http2Conn {
         }
 
         match ftype {
-            TYPE_DATA          => self.handle_data(stream_id, flags, &payload, on_request, client_ip)?,
-            TYPE_HEADERS       => self.handle_headers(stream_id, flags, &payload, on_request, client_ip)?,
-            TYPE_PRIORITY      => {
+            TYPE_DATA => self.handle_data(stream_id, flags, &payload, on_request, client_ip)?,
+            TYPE_HEADERS => {
+                self.handle_headers(stream_id, flags, &payload, on_request, client_ip)?
+            }
+            TYPE_PRIORITY => {
                 // RFC 9113 5.3.1: "A stream cannot depend on itself. An
                 // endpoint MUST treat this as a stream error of type
                 // PROTOCOL_ERROR." Priority is deprecated in 9113 and the
@@ -661,12 +726,17 @@ impl Http2Conn {
                 // rather than accepted and discarded.
                 let dep = u32::from_be_bytes(payload[0..4].try_into().unwrap()) & 0x7fff_ffff;
                 if dep == stream_id {
-                    self.push_frame(TYPE_RST_STREAM, 0, stream_id, &ERR_PROTOCOL_ERROR.to_be_bytes());
+                    self.push_frame(
+                        TYPE_RST_STREAM,
+                        0,
+                        stream_id,
+                        &ERR_PROTOCOL_ERROR.to_be_bytes(),
+                    );
                     self.streams.remove(&stream_id);
                     self.note_reset(stream_id);
                 }
             }
-            TYPE_RST_STREAM    => {
+            TYPE_RST_STREAM => {
                 // Marked Closed, then removed. Removal alone is not enough:
                 // `stream_state` derives Idle for any absent id above
                 // `last_stream_id`, so resetting the newest stream and then
@@ -677,13 +747,17 @@ impl Http2Conn {
                 self.last_stream_id = self.last_stream_id.max(stream_id);
                 self.note_reset(stream_id);
             }
-            TYPE_SETTINGS      => self.handle_settings(flags, &payload)?,
-            TYPE_PUSH_PROMISE  => return Err("client sent PUSH_PROMISE"),
-            TYPE_PING          => self.handle_ping(flags, &payload),
-            TYPE_GOAWAY        => { self.phase = Phase::GoingAway; }
+            TYPE_SETTINGS => self.handle_settings(flags, &payload)?,
+            TYPE_PUSH_PROMISE => return Err("client sent PUSH_PROMISE"),
+            TYPE_PING => self.handle_ping(flags, &payload),
+            TYPE_GOAWAY => {
+                self.phase = Phase::GoingAway;
+            }
             TYPE_WINDOW_UPDATE => self.handle_window_update(stream_id, &payload)?,
-            TYPE_CONTINUATION  => self.handle_continuation(stream_id, flags, &payload, on_request, client_ip)?,
-            _                  => {}
+            TYPE_CONTINUATION => {
+                self.handle_continuation(stream_id, flags, &payload, on_request, client_ip)?
+            }
+            _ => {}
         }
         Ok(true)
     }
@@ -720,7 +794,9 @@ impl Http2Conn {
     /// `now` is a parameter rather than read here so the decay is testable
     /// without sleeping: a test that waits a real second is a test nobody runs.
     fn active_streams(&self, now: Instant) -> usize {
-        let recent = self.recently_reset.iter()
+        let recent = self
+            .recently_reset
+            .iter()
             .filter(|(id, at)| id % 2 == 1 && now.duration_since(*at) < RESET_DECAY)
             .count();
         self.streams.len() + recent
@@ -739,17 +815,25 @@ impl Http2Conn {
     ///
     /// Returns the verdict for the frame's SHAPE only. Stream state is a
     /// separate question, answered by `frame_verdict`.
-    fn frame_shape_verdict(&self, ftype: u8, flags: u8, stream_id: u32, length: usize)
-        -> FrameVerdict
-    {
+    fn frame_shape_verdict(
+        &self,
+        ftype: u8,
+        flags: u8,
+        stream_id: u32,
+        length: usize,
+    ) -> FrameVerdict {
         // Stream association. "MUST be associated with a stream" and its
         // inverse are both connection errors of type PROTOCOL_ERROR: a frame
         // on the wrong scope means the peer and we disagree about what the
         // frame refers to, and nothing after it can be trusted.
         let needs_stream = matches!(
             ftype,
-            TYPE_DATA | TYPE_HEADERS | TYPE_PRIORITY | TYPE_RST_STREAM
-                | TYPE_PUSH_PROMISE | TYPE_CONTINUATION
+            TYPE_DATA
+                | TYPE_HEADERS
+                | TYPE_PRIORITY
+                | TYPE_RST_STREAM
+                | TYPE_PUSH_PROMISE
+                | TYPE_CONTINUATION
         );
         let needs_connection = matches!(ftype, TYPE_SETTINGS | TYPE_PING | TYPE_GOAWAY);
 
@@ -769,9 +853,9 @@ impl Http2Conn {
         // malformed RST_STREAM, PING or WINDOW_UPDATE is a *connection* error
         // because the connection's shared state is what they act on.
         let fixed: Option<(usize, bool)> = match ftype {
-            TYPE_PRIORITY     => Some((5, false)),  // stream error
-            TYPE_RST_STREAM   => Some((4, true)),
-            TYPE_PING         => Some((8, true)),
+            TYPE_PRIORITY => Some((5, false)), // stream error
+            TYPE_RST_STREAM => Some((4, true)),
+            TYPE_PING => Some((8, true)),
             TYPE_WINDOW_UPDATE => Some((4, true)),
             _ => None,
         };
@@ -878,9 +962,7 @@ impl Http2Conn {
                 // short period", since they may already have been in flight.
                 StreamState::Closed => match ftype {
                     TYPE_WINDOW_UPDATE | TYPE_RST_STREAM => FrameVerdict::Allow,
-                    _ if self.was_reset(stream_id) => {
-                        FrameVerdict::StreamError(ERR_STREAM_CLOSED)
-                    }
+                    _ if self.was_reset(stream_id) => FrameVerdict::StreamError(ERR_STREAM_CLOSED),
                     _ => FrameVerdict::ConnectionError(ERR_STREAM_CLOSED),
                 },
 
@@ -898,12 +980,16 @@ impl Http2Conn {
     // ── Frame handlers ────────────────────────────────────────────────────────
 
     fn handle_settings(&mut self, flags: u8, payload: &[u8]) -> Result<(), &'static str> {
-        if flags & FLAG_ACK != 0 { return Ok(()); }
-        if payload.len() % 6 != 0 { return Err("SETTINGS payload not multiple of 6"); }
+        if flags & FLAG_ACK != 0 {
+            return Ok(());
+        }
+        if payload.len() % 6 != 0 {
+            return Err("SETTINGS payload not multiple of 6");
+        }
         let mut i = 0;
         while i + 6 <= payload.len() {
-            let id  = u16::from_be_bytes(payload[i..i+2].try_into().unwrap());
-            let val = u32::from_be_bytes(payload[i+2..i+6].try_into().unwrap());
+            let id = u16::from_be_bytes(payload[i..i + 2].try_into().unwrap());
+            let val = u32::from_be_bytes(payload[i + 2..i + 6].try_into().unwrap());
             match id {
                 // RFC 9113 6.5.2: SETTINGS_HEADER_TABLE_SIZE tells us the size
                 // the PEER's decoder will accept, so it bounds OUR ENCODER, not
@@ -923,20 +1009,29 @@ impl Http2Conn {
                 // (`hpack::Encoder` exposes no table-size control at all, so the
                 // encoder side of this setting cannot be applied either way.)
                 SETTING_HEADER_TABLE_SIZE => {
-                    self.hpack_dec.set_max_table_size((val as usize).min(HPACK_MAX_TABLE_SIZE));
+                    self.hpack_dec
+                        .set_max_table_size((val as usize).min(HPACK_MAX_TABLE_SIZE));
                 }
-                SETTING_ENABLE_PUSH       => {
-                    if val > 1 { return Err("invalid ENABLE_PUSH"); }
+                SETTING_ENABLE_PUSH => {
+                    if val > 1 {
+                        return Err("invalid ENABLE_PUSH");
+                    }
                     self.enable_push = val == 1;
                 }
                 SETTING_INITIAL_WINDOW_SIZE => {
-                    if val > 0x7fff_ffff { return Err("INITIAL_WINDOW_SIZE overflow"); }
+                    if val > 0x7fff_ffff {
+                        return Err("INITIAL_WINDOW_SIZE overflow");
+                    }
                     let delta = val as i32 - self.peer_initial_window;
                     self.peer_initial_window = val as i32;
-                    for s in self.streams.values_mut() { s.send_window += delta; }
+                    for s in self.streams.values_mut() {
+                        s.send_window += delta;
+                    }
                 }
                 SETTING_MAX_FRAME_SIZE => {
-                    if !(16_384..=16_777_215).contains(&val) { return Err("invalid MAX_FRAME_SIZE"); }
+                    if !(16_384..=16_777_215).contains(&val) {
+                        return Err("invalid MAX_FRAME_SIZE");
+                    }
                     self.peer_max_frame = val;
                 }
                 SETTING_MAX_CONCURRENT_STREAMS | _ => {}
@@ -954,9 +1049,13 @@ impl Http2Conn {
     }
 
     fn handle_window_update(&mut self, stream_id: u32, payload: &[u8]) -> Result<(), &'static str> {
-        if payload.len() < 4 { return Err("WINDOW_UPDATE too short"); }
+        if payload.len() < 4 {
+            return Err("WINDOW_UPDATE too short");
+        }
         let inc = u32::from_be_bytes(payload[0..4].try_into().unwrap()) & 0x7fff_ffff;
-        if inc == 0 { return Err("zero WINDOW_UPDATE increment"); }
+        if inc == 0 {
+            return Err("zero WINDOW_UPDATE increment");
+        }
         // RFC 9113 6.9.1: a flow-control window must not exceed 2^31-1. A
         // WINDOW_UPDATE that would take it past that is a FLOW_CONTROL_ERROR --
         // a connection error on stream 0, otherwise a stream error.
@@ -974,7 +1073,12 @@ impl Http2Conn {
             self.conn_send_window += inc as i32;
         } else if let Some(s) = self.streams.get_mut(&stream_id) {
             if s.send_window as i64 + inc as i64 > MAX_WINDOW {
-                self.push_frame(TYPE_RST_STREAM, 0, stream_id, &ERR_FLOW_CONTROL.to_be_bytes());
+                self.push_frame(
+                    TYPE_RST_STREAM,
+                    0,
+                    stream_id,
+                    &ERR_FLOW_CONTROL.to_be_bytes(),
+                );
                 self.streams.remove(&stream_id);
                 self.note_reset(stream_id);
                 return Ok(());
@@ -987,14 +1091,22 @@ impl Http2Conn {
     }
 
     fn handle_headers<F>(
-        &mut self, stream_id: u32, flags: u8, payload: &[u8],
-        on_request: &mut F, client_ip: &str,
+        &mut self,
+        stream_id: u32,
+        flags: u8,
+        payload: &[u8],
+        on_request: &mut F,
+        client_ip: &str,
     ) -> Result<(), &'static str>
     where
         F: FnMut(&HttpRequest, &str) -> RequestOutcome,
     {
-        if stream_id == 0 { return Err("HEADERS on stream 0"); }
-        if stream_id % 2 == 0 { return Err("client used even stream ID"); }
+        if stream_id == 0 {
+            return Err("HEADERS on stream 0");
+        }
+        if stream_id % 2 == 0 {
+            return Err("client used even stream ID");
+        }
         // RFC 9113 5.1.1: "The identifier of a newly established stream MUST
         // be numerically greater than all streams that the initiating endpoint
         // has opened or reserved. [...] An endpoint that receives an unexpected
@@ -1019,7 +1131,12 @@ impl Http2Conn {
         // zero. Recently-reset streams keep their slot for `RESET_DECAY` so the
         // cap counts streams *started*, not streams still open.
         if self.active_streams(Instant::now()) >= MAX_CONCURRENT as usize {
-            self.push_frame(TYPE_RST_STREAM, 0, stream_id, &ERR_REFUSED_STREAM.to_be_bytes());
+            self.push_frame(
+                TYPE_RST_STREAM,
+                0,
+                stream_id,
+                &ERR_REFUSED_STREAM.to_be_bytes(),
+            );
             // Refusing a stream closes it *by RST_STREAM*, and it has to be
             // recorded as such. The peer's own RST_STREAM for this id is very
             // likely already in flight -- a client that cancels quickly is the
@@ -1079,10 +1196,18 @@ impl Http2Conn {
             }
             // RFC 9113 5.3.1: a stream cannot depend on itself.
             let dep = u32::from_be_bytes([
-                payload[pos] & 0x7f, payload[pos + 1], payload[pos + 2], payload[pos + 3],
+                payload[pos] & 0x7f,
+                payload[pos + 1],
+                payload[pos + 2],
+                payload[pos + 3],
             ]);
             if dep == stream_id {
-                self.push_frame(TYPE_RST_STREAM, 0, stream_id, &ERR_PROTOCOL_ERROR.to_be_bytes());
+                self.push_frame(
+                    TYPE_RST_STREAM,
+                    0,
+                    stream_id,
+                    &ERR_PROTOCOL_ERROR.to_be_bytes(),
+                );
                 return Ok(());
             }
             pos += 5;
@@ -1094,9 +1219,13 @@ impl Http2Conn {
         }
         let header_block = &payload[pos..payload.len() - pad];
 
-        let stream = self.streams.entry(stream_id)
+        let stream = self
+            .streams
+            .entry(stream_id)
             .or_insert_with(|| H2Stream::new(self.peer_initial_window));
-        if flags & FLAG_END_STREAM != 0 { stream.state = StreamState::HalfClosedRemote; }
+        if flags & FLAG_END_STREAM != 0 {
+            stream.state = StreamState::HalfClosedRemote;
+        }
 
         if flags & FLAG_END_HEADERS != 0 {
             let mut combined = self.header_block_buf.clone();
@@ -1129,13 +1258,23 @@ impl Http2Conn {
                 // would desynchronise every later one on a healthy stream.
                 if flags & FLAG_END_STREAM == 0 {
                     tracing::debug!(stream_id, "h2: second HEADERS frame without END_STREAM");
-                    self.push_frame(TYPE_RST_STREAM, 0, stream_id, &ERR_PROTOCOL_ERROR.to_be_bytes());
+                    self.push_frame(
+                        TYPE_RST_STREAM,
+                        0,
+                        stream_id,
+                        &ERR_PROTOCOL_ERROR.to_be_bytes(),
+                    );
                     self.streams.remove(&stream_id);
                     return Ok(());
                 }
                 if let Some((name, _)) = block.iter().find(|(k, _)| k.starts_with(':')) {
                     tracing::debug!(stream_id, field = %name, "h2: pseudo-header in trailers");
-                    self.push_frame(TYPE_RST_STREAM, 0, stream_id, &ERR_PROTOCOL_ERROR.to_be_bytes());
+                    self.push_frame(
+                        TYPE_RST_STREAM,
+                        0,
+                        stream_id,
+                        &ERR_PROTOCOL_ERROR.to_be_bytes(),
+                    );
                     self.streams.remove(&stream_id);
                     return Ok(());
                 }
@@ -1158,8 +1297,12 @@ impl Http2Conn {
     }
 
     fn handle_continuation<F>(
-        &mut self, stream_id: u32, flags: u8, payload: &[u8],
-        on_request: &mut F, client_ip: &str,
+        &mut self,
+        stream_id: u32,
+        flags: u8,
+        payload: &[u8],
+        on_request: &mut F,
+        client_ip: &str,
     ) -> Result<(), &'static str>
     where
         F: FnMut(&HttpRequest, &str) -> RequestOutcome,
@@ -1193,13 +1336,19 @@ impl Http2Conn {
     }
 
     fn handle_data<F>(
-        &mut self, stream_id: u32, flags: u8, payload: &[u8],
-        on_request: &mut F, client_ip: &str,
+        &mut self,
+        stream_id: u32,
+        flags: u8,
+        payload: &[u8],
+        on_request: &mut F,
+        client_ip: &str,
     ) -> Result<(), &'static str>
     where
         F: FnMut(&HttpRequest, &str) -> RequestOutcome,
     {
-        if stream_id == 0 { return Err("DATA on stream 0"); }
+        if stream_id == 0 {
+            return Err("DATA on stream 0");
+        }
 
         // PADDED with an empty payload has nowhere to put the pad-length byte.
         // This used to fall through and treat the frame as unpadded.
@@ -1208,7 +1357,9 @@ impl Http2Conn {
         }
         let data = if flags & FLAG_PADDED != 0 {
             let pad = payload[0] as usize;
-            if pad >= payload.len() { return Err("DATA: excess padding"); }
+            if pad >= payload.len() {
+                return Err("DATA: excess padding");
+            }
             &payload[1..payload.len() - pad]
         } else {
             payload
@@ -1222,7 +1373,9 @@ impl Http2Conn {
         let data_len = data.len();
 
         self.conn_recv_window -= charged;
-        if self.conn_recv_window < 0 { return Err("connection flow control exceeded"); }
+        if self.conn_recv_window < 0 {
+            return Err("connection flow control exceeded");
+        }
         if self.conn_recv_window < DEFAULT_WINDOW as i32 / 2 {
             let inc = DEFAULT_WINDOW as i32 - self.conn_recv_window;
             self.conn_recv_window += inc;
@@ -1239,7 +1392,9 @@ impl Http2Conn {
         let mut over_cap = false;
         let should_dispatch = if let Some(s) = self.streams.get_mut(&stream_id) {
             s.recv_window -= charged;
-            if s.recv_window < 0 { return Err("stream flow control exceeded"); }
+            if s.recv_window < 0 {
+                return Err("stream flow control exceeded");
+            }
             if s.body.len() + data_len > MAX_H2_BODY {
                 over_cap = true;
                 false
@@ -1259,7 +1414,12 @@ impl Http2Conn {
         };
         if over_cap {
             self.streams.remove(&stream_id);
-            self.push_frame(TYPE_RST_STREAM, 0, stream_id, &ERR_PROTOCOL_ERROR.to_be_bytes());
+            self.push_frame(
+                TYPE_RST_STREAM,
+                0,
+                stream_id,
+                &ERR_PROTOCOL_ERROR.to_be_bytes(),
+            );
             return Ok(());
         }
         if stream_inc > 0 {
@@ -1278,16 +1438,22 @@ impl Http2Conn {
     where
         F: FnMut(&HttpRequest, &str) -> RequestOutcome,
     {
-        let ready = self.streams.get(&stream_id).map(|s| {
-            s.headers_done
+        let ready = self
+            .streams
+            .get(&stream_id)
+            .map(|s| {
+                s.headers_done
                 && (s.state == StreamState::HalfClosedRemote
                     || is_headersonly(&s.headers))
                 && s.state != StreamState::Closed
                 && s.resp_body.is_none()  // not already dispatched
                 && s.pending_rx.is_none() // not already waiting on async
-        }).unwrap_or(false);
+            })
+            .unwrap_or(false);
 
-        if !ready { return; }
+        if !ready {
+            return;
+        }
 
         // Clone what we need, then drop the immutable borrow.
         let (headers, body) = {
@@ -1304,14 +1470,24 @@ impl Http2Conn {
         // conformance point -- a length mismatch between what a message claims
         // and what it carries is the same class of ambiguity that makes request
         // smuggling work, and here m6 is the one that would forward it on.
-        if let Some(declared) = headers.iter()
+        if let Some(declared) = headers
+            .iter()
             .find(|(k, _)| k == "content-length")
             .and_then(|(_, v)| v.trim().parse::<usize>().ok())
         {
             if declared != body.len() {
-                tracing::debug!(stream_id, declared, actual = body.len(),
-                    "h2: content-length disagrees with DATA length");
-                self.push_frame(TYPE_RST_STREAM, 0, stream_id, &ERR_PROTOCOL_ERROR.to_be_bytes());
+                tracing::debug!(
+                    stream_id,
+                    declared,
+                    actual = body.len(),
+                    "h2: content-length disagrees with DATA length"
+                );
+                self.push_frame(
+                    TYPE_RST_STREAM,
+                    0,
+                    stream_id,
+                    &ERR_PROTOCOL_ERROR.to_be_bytes(),
+                );
                 self.streams.remove(&stream_id);
                 return;
             }
@@ -1319,7 +1495,12 @@ impl Http2Conn {
 
         if let Err(why) = validate_request_headers(&headers) {
             tracing::debug!(stream_id, reason = why, "h2: malformed request headers");
-            self.push_frame(TYPE_RST_STREAM, 0, stream_id, &ERR_PROTOCOL_ERROR.to_be_bytes());
+            self.push_frame(
+                TYPE_RST_STREAM,
+                0,
+                stream_id,
+                &ERR_PROTOCOL_ERROR.to_be_bytes(),
+            );
             self.streams.remove(&stream_id);
             return;
         }
@@ -1340,7 +1521,16 @@ impl Http2Conn {
         match on_request(&req, &client_ip) {
             RequestOutcome::Ready(status, resp_headers, resp_body, _, hints) => {
                 let method = req.method.clone();
-                self.dispatch_h2_response(stream_id, status, resp_headers, resp_body, hints, on_request, &client_ip, &method);
+                self.dispatch_h2_response(
+                    stream_id,
+                    status,
+                    resp_headers,
+                    resp_body,
+                    hints,
+                    on_request,
+                    &client_ip,
+                    &method,
+                );
             }
             RequestOutcome::Pending { rx, ctx } => {
                 if let Some(s) = self.streams.get_mut(&stream_id) {
@@ -1354,16 +1544,15 @@ impl Http2Conn {
     /// store body, and flush.
     fn dispatch_h2_response<F>(
         &mut self,
-        stream_id:    u32,
-        status:       u16,
+        stream_id: u32,
+        status: u16,
         resp_headers: Vec<(String, String)>,
-        resp_body:    Vec<u8>,
-        hints:        std::sync::Arc<Vec<String>>,
-        on_request:   &mut F,
-        client_ip:    &str,
-        method:       &str,
-    )
-    where
+        resp_body: Vec<u8>,
+        hints: std::sync::Arc<Vec<String>>,
+        on_request: &mut F,
+        client_ip: &str,
+        method: &str,
+    ) where
         F: FnMut(&HttpRequest, &str) -> RequestOutcome,
     {
         if !hints.is_empty() {
@@ -1380,23 +1569,29 @@ impl Http2Conn {
                 // push stream, which we ignore (the stream isn't in self.streams).
                 for hint_url in hints.iter() {
                     // Bail early if the connection send window is exhausted.
-                    if self.conn_send_window <= 0 { break; }
+                    if self.conn_send_window <= 0 {
+                        break;
+                    }
 
                     let push_req = HttpRequest {
-                        method:  "GET".to_string(),
-                        path:    hint_url.clone(),
-                        query:   None,
+                        method: "GET".to_string(),
+                        path: hint_url.clone(),
+                        query: None,
                         version: "HTTP/2.0".to_string(),
                         headers: vec![],
-                        body:    vec![],
+                        body: vec![],
                     };
                     let (ps, ph, pb) = match on_request(&push_req, client_ip) {
                         RequestOutcome::Ready(ps, ph, pb, _, _) => (ps, ph, pb),
                         RequestOutcome::Pending { .. } => continue, // can't push async assets
                     };
-                    if ps < 200 || ps >= 300 { continue; }
+                    if ps < 200 || ps >= 300 {
+                        continue;
+                    }
                     // Skip if the body exceeds the current connection send window.
-                    if pb.len() as i32 > self.conn_send_window { continue; }
+                    if pb.len() as i32 > self.conn_send_window {
+                        continue;
+                    }
 
                     let push_stream_id = self.next_push_id;
                     self.next_push_id += 2;
@@ -1411,12 +1606,22 @@ impl Http2Conn {
                         ]);
                         let mut promise_payload = promised_id_bytes.to_vec();
                         promise_payload.extend_from_slice(&hpack_req);
-                        self.push_frame(TYPE_PUSH_PROMISE, FLAG_END_HEADERS, stream_id, &promise_payload);
+                        self.push_frame(
+                            TYPE_PUSH_PROMISE,
+                            FLAG_END_HEADERS,
+                            stream_id,
+                            &promise_payload,
+                        );
                     }
 
                     // HEADERS on the push stream.
                     let push_hdr_block = self.encode_response_headers(ps, &ph, pb.len());
-                    self.push_frame(TYPE_HEADERS, FLAG_END_HEADERS, push_stream_id, &push_hdr_block);
+                    self.push_frame(
+                        TYPE_HEADERS,
+                        FLAG_END_HEADERS,
+                        push_stream_id,
+                        &push_hdr_block,
+                    );
 
                     // DATA + END_STREAM on the push stream.
                     self.push_frame(TYPE_DATA, FLAG_END_STREAM, push_stream_id, &pb);
@@ -1426,9 +1631,8 @@ impl Http2Conn {
                 // Push disabled by client — fall back to 103 Early Hints.
                 let early_block = {
                     let mut pairs: Vec<(&[u8], &[u8])> = vec![(b":status", b"103")];
-                    let link_values: Vec<String> = hints.iter()
-                        .map(|u| crate::hints::link_header(u))
-                        .collect();
+                    let link_values: Vec<String> =
+                        hints.iter().map(|u| crate::hints::link_header(u)).collect();
                     for lv in &link_values {
                         pairs.push((b"link", lv.as_bytes()));
                     }
@@ -1444,7 +1648,11 @@ impl Http2Conn {
         // is what made HTTP/2 abort the stream with INTERNAL_ERROR: the DATA
         // frames disagreed with the framing the client had been promised.
         let advertised_len = resp_body.len();
-        let resp_body = if method.eq_ignore_ascii_case("HEAD") { Vec::new() } else { resp_body };
+        let resp_body = if method.eq_ignore_ascii_case("HEAD") {
+            Vec::new()
+        } else {
+            resp_body
+        };
         let header_block = self.encode_response_headers(status, &resp_headers, advertised_len);
         self.push_frame(TYPE_HEADERS, FLAG_END_HEADERS, stream_id, &header_block);
 
@@ -1462,8 +1670,16 @@ impl Http2Conn {
     /// Poll all streams that have a pending URL-backend receiver.
     fn poll_pending_url<G>(&mut self, on_response: &mut G)
     where
-        G: FnMut(std::io::Result<HttpResponse>, &PendingUrlContext)
-               -> (u16, Vec<(String, String)>, Vec<u8>, String, std::sync::Arc<Vec<String>>),
+        G: FnMut(
+            std::io::Result<HttpResponse>,
+            &PendingUrlContext,
+        ) -> (
+            u16,
+            Vec<(String, String)>,
+            Vec<u8>,
+            String,
+            std::sync::Arc<Vec<String>>,
+        ),
     {
         use std::sync::mpsc::TryRecvError;
         let stream_ids: Vec<u32> = self.streams.keys().copied().collect();
@@ -1473,10 +1689,11 @@ impl Http2Conn {
             let result: Option<std::io::Result<HttpResponse>> = match self.streams.get(&sid) {
                 Some(s) => match &s.pending_rx {
                     Some((rx, _)) => match rx.try_recv() {
-                        Ok(r) => Some(r),  // r is already io::Result<HttpResponse>
+                        Ok(r) => Some(r), // r is already io::Result<HttpResponse>
                         Err(TryRecvError::Empty) => None,
                         Err(TryRecvError::Disconnected) => Some(Err(std::io::Error::new(
-                            std::io::ErrorKind::BrokenPipe, "url backend thread died",
+                            std::io::ErrorKind::BrokenPipe,
+                            "url backend thread died",
                         ))),
                     },
                     None => None,
@@ -1485,16 +1702,24 @@ impl Http2Conn {
             };
             if let Some(http_result) = result {
                 // Move out the pending context.
-                let ctx = self.streams.get_mut(&sid)
+                let ctx = self
+                    .streams
+                    .get_mut(&sid)
                     .and_then(|s| s.pending_rx.take())
                     .map(|(_, ctx)| ctx);
                 if let Some(ctx) = ctx {
-                    let (status, resp_headers, resp_body, _, _hints) = on_response(http_result, &ctx);
+                    let (status, resp_headers, resp_body, _, _hints) =
+                        on_response(http_result, &ctx);
                     // No server push for async responses (hints only exist for cached assets which are Ready).
                     // Same HEAD framing as the sync path above.
                     let advertised_len = resp_body.len();
-                    let resp_body = if ctx.req.method.eq_ignore_ascii_case("HEAD") { Vec::new() } else { resp_body };
-                    let header_block = self.encode_response_headers(status, &resp_headers, advertised_len);
+                    let resp_body = if ctx.req.method.eq_ignore_ascii_case("HEAD") {
+                        Vec::new()
+                    } else {
+                        resp_body
+                    };
+                    let header_block =
+                        self.encode_response_headers(status, &resp_headers, advertised_len);
                     self.push_frame(TYPE_HEADERS, FLAG_END_HEADERS, sid, &header_block);
                     if let Some(s) = self.streams.get_mut(&sid) {
                         s.resp_body = Some(resp_body);
@@ -1521,11 +1746,11 @@ impl Http2Conn {
                 let (to_send, is_last) = {
                     let s = match self.streams.get(&stream_id) {
                         Some(s) => s,
-                        None    => continue 'outer,
+                        None => continue 'outer,
                     };
                     let body = match &s.resp_body {
                         Some(b) => b,
-                        None    => continue 'outer,  // not dispatched yet
+                        None => continue 'outer, // not dispatched yet
                     };
                     let remaining = body.len() - s.resp_sent;
                     if remaining == 0 {
@@ -1537,10 +1762,9 @@ impl Http2Conn {
                                 "h2 stream {} blocked: conn_window={} stream_window={} remaining={}",
                                 stream_id, self.conn_send_window, s.send_window, remaining
                             );
-                            continue 'outer;  // blocked; wait for WINDOW_UPDATE
+                            continue 'outer; // blocked; wait for WINDOW_UPDATE
                         }
-                        let window = (self.conn_send_window.min(s.send_window) as usize)
-                            .min(max);
+                        let window = (self.conn_send_window.min(s.send_window) as usize).min(max);
                         let n = remaining.min(window);
                         (n, s.resp_sent + n == body.len())
                     }
@@ -1567,7 +1791,7 @@ impl Http2Conn {
                 self.conn_send_window -= to_send as i32;
                 let s = self.streams.get_mut(&stream_id).unwrap();
                 s.send_window -= to_send as i32;
-                s.resp_sent   += to_send;
+                s.resp_sent += to_send;
 
                 if is_last {
                     // We have sent END_STREAM. RFC 9113 5.1: which state that
@@ -1593,9 +1817,17 @@ impl Http2Conn {
                     continue 'outer;
                 }
                 // More data remains but the window may now be exhausted.
-                if self.conn_send_window <= 0 { break; }
-                let sw = self.streams.get(&stream_id).map(|s| s.send_window).unwrap_or(0);
-                if sw <= 0 { break; }
+                if self.conn_send_window <= 0 {
+                    break;
+                }
+                let sw = self
+                    .streams
+                    .get(&stream_id)
+                    .map(|s| s.send_window)
+                    .unwrap_or(0);
+                if sw <= 0 {
+                    break;
+                }
             }
         }
     }
@@ -1603,16 +1835,15 @@ impl Http2Conn {
     // ── Frame encoding helpers ────────────────────────────────────────────────
 
     fn encode_response_headers(
-        &mut self, status: u16,
+        &mut self,
+        status: u16,
         headers: &[(String, String)],
         body_len: usize,
     ) -> Vec<u8> {
-        let status_str  = status.to_string();
+        let status_str = status.to_string();
         let bodylen_str = body_len.to_string();
 
-        let mut pairs: Vec<(&[u8], &[u8])> = vec![
-            (b":status", status_str.as_bytes()),
-        ];
+        let mut pairs: Vec<(&[u8], &[u8])> = vec![(b":status", status_str.as_bytes())];
         // RFC 9110 8.6: a 1xx/204 must not carry Content-Length, and a 304 must
         // not unless it equals the 200's. m6 sent `content-length: 0` on every
         // 304 -- the one value that actively misinforms, since it claims the
@@ -1620,11 +1851,14 @@ impl Http2Conn {
         if crate::http11::status_may_have_content_length(status) {
             pairs.push((b"content-length", bodylen_str.as_bytes()));
         }
-        let filtered: Vec<(String, String)> = headers.iter()
+        let filtered: Vec<(String, String)> = headers
+            .iter()
             .filter(|(k, _)| {
                 let kl = k.to_lowercase();
-                !matches!(kl.as_str(),
-                    "connection" | "transfer-encoding" | "keep-alive" | "content-length")
+                !matches!(
+                    kl.as_str(),
+                    "connection" | "transfer-encoding" | "keep-alive" | "content-length"
+                )
             })
             .map(|(k, v)| (k.to_lowercase(), v.clone()))
             .collect();
@@ -1647,25 +1881,31 @@ impl Http2Conn {
     fn push_frame(&mut self, ftype: u8, flags: u8, stream_id: u32, payload: &[u8]) {
         let len = payload.len();
         self.send_buf.push((len >> 16) as u8);
-        self.send_buf.push((len >> 8)  as u8);
-        self.send_buf.push(len         as u8);
+        self.send_buf.push((len >> 8) as u8);
+        self.send_buf.push(len as u8);
         self.send_buf.push(ftype);
         self.send_buf.push(flags);
-        self.send_buf.extend_from_slice(&(stream_id & 0x7fff_ffff).to_be_bytes());
+        self.send_buf
+            .extend_from_slice(&(stream_id & 0x7fff_ffff).to_be_bytes());
         self.send_buf.extend_from_slice(payload);
     }
 
     fn push_window_update(&mut self, stream_id: u32, inc: u32) {
-        self.push_frame(TYPE_WINDOW_UPDATE, 0, stream_id, &(inc & 0x7fff_ffff).to_be_bytes());
+        self.push_frame(
+            TYPE_WINDOW_UPDATE,
+            0,
+            stream_id,
+            &(inc & 0x7fff_ffff).to_be_bytes(),
+        );
     }
 
     fn send_server_settings(&mut self) {
         let mut p = Vec::with_capacity(12);
         setting_bytes(&mut p, SETTING_MAX_CONCURRENT_STREAMS, MAX_CONCURRENT);
-        setting_bytes(&mut p, SETTING_INITIAL_WINDOW_SIZE,    1_048_576);
+        setting_bytes(&mut p, SETTING_INITIAL_WINDOW_SIZE, 1_048_576);
         // Advertised so the limit we enforce is the limit a conforming peer
         // sends. Enforcing an unadvertised bound is how interop breaks.
-        setting_bytes(&mut p, SETTING_MAX_FRAME_SIZE,         MAX_FRAME_SIZE as u32);
+        setting_bytes(&mut p, SETTING_MAX_FRAME_SIZE, MAX_FRAME_SIZE as u32);
         self.push_frame(TYPE_SETTINGS, 0, 0, &p);
     }
 
@@ -1814,12 +2054,13 @@ fn decode_hpack(
     Ok(())
 }
 
-
-
 fn is_headersonly(headers: &[(String, String)]) -> bool {
     for (k, v) in headers {
         if k == ":method" {
-            return matches!(v.as_str(), "GET" | "HEAD" | "DELETE" | "OPTIONS" | "CONNECT");
+            return matches!(
+                v.as_str(),
+                "GET" | "HEAD" | "DELETE" | "OPTIONS" | "CONNECT"
+            );
         }
     }
     false
@@ -1831,24 +2072,21 @@ fn is_headersonly(headers: &[(String, String)]) -> bool {
 /// or a cache key. Returning the value separately is what lets the *caller*
 /// decide whether the peer was entitled to assert it, without the header
 /// itself surviving that decision.
-fn build_request(
-    headers: &[(String, String)],
-    body: Vec<u8>,
-) -> (HttpRequest, Option<String>) {
+fn build_request(headers: &[(String, String)], body: Vec<u8>) -> (HttpRequest, Option<String>) {
     let mut method = String::new();
-    let mut path   = String::new();
-    let mut query  = None;
-    let mut fwd    = Vec::new();
+    let mut path = String::new();
+    let mut query = None;
+    let mut fwd = Vec::new();
     let mut authority: Option<String> = None;
     let mut forwarded_for: Option<String> = None;
 
     for (k, v) in headers {
         match k.as_str() {
-            ":method"    => method = v.clone(),
-            ":path"      => {
+            ":method" => method = v.clone(),
+            ":path" => {
                 if let Some(q) = v.find('?') {
-                    path  = v[..q].to_string();
-                    query = Some(v[q+1..].to_string());
+                    path = v[..q].to_string();
+                    query = Some(v[q + 1..].to_string());
                 } else {
                     path = v.clone();
                 }
@@ -1881,8 +2119,14 @@ fn build_request(
         }
     }
 
-    let req =
-        HttpRequest { method, path, query, version: "HTTP/2".to_string(), headers: fwd, body };
+    let req = HttpRequest {
+        method,
+        path,
+        query,
+        version: "HTTP/2".to_string(),
+        headers: fwd,
+        body,
+    };
     (req, forwarded_for)
 }
 
@@ -1897,7 +2141,10 @@ mod authority_tests {
     }
 
     fn h(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
     fn host_of(req: &crate::forward::HttpRequest) -> Option<&str> {
         req.headers
@@ -1910,7 +2157,11 @@ mod authority_tests {
     #[test]
     fn authority_becomes_host() {
         let req = req_of(build_request(
-            &h(&[(":method", "GET"), (":path", "/x"), (":authority", "www.example.com")]),
+            &h(&[
+                (":method", "GET"),
+                (":path", "/x"),
+                (":authority", "www.example.com"),
+            ]),
             vec![],
         ));
         assert_eq!(host_of(&req), Some("www.example.com"));
@@ -1931,14 +2182,20 @@ mod authority_tests {
         ));
         assert_eq!(host_of(&req), Some("host.example"));
         assert_eq!(
-            req.headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case("host")).count(),
+            req.headers
+                .iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case("host"))
+                .count(),
             1
         );
     }
 
     #[test]
     fn no_authority_means_no_synthesized_host() {
-        let req = req_of(build_request(&h(&[(":method", "GET"), (":path", "/x")]), vec![]));
+        let req = req_of(build_request(
+            &h(&[(":method", "GET"), (":path", "/x")]),
+            vec![],
+        ));
         assert_eq!(host_of(&req), None);
     }
 
@@ -1946,10 +2203,19 @@ mod authority_tests {
     #[test]
     fn other_pseudo_headers_are_still_dropped() {
         let req = req_of(build_request(
-            &h(&[(":method", "GET"), (":path", "/x?a=1"), (":scheme", "https"), (":authority", "e.example")]),
+            &h(&[
+                (":method", "GET"),
+                (":path", "/x?a=1"),
+                (":scheme", "https"),
+                (":authority", "e.example"),
+            ]),
             vec![],
         ));
-        assert!(!req.headers.iter().any(|(k, _)| k.starts_with(':')), "{:?}", req.headers);
+        assert!(
+            !req.headers.iter().any(|(k, _)| k.starts_with(':')),
+            "{:?}",
+            req.headers
+        );
         assert_eq!(req.path, "/x");
         assert_eq!(req.query.as_deref(), Some("a=1"));
     }
@@ -1969,8 +2235,13 @@ mod frame_validation_tests {
         c.phase = Phase::Active;
         c.recv_buf.extend_from_slice(frames);
         let mut on_request = |_: &HttpRequest, _: &str| -> RequestOutcome {
-            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string(),
-                                  std::sync::Arc::new(vec![]))
+            RequestOutcome::Ready(
+                200,
+                vec![],
+                b"ok".to_vec(),
+                "test".to_string(),
+                std::sync::Arc::new(vec![]),
+            )
         };
         loop {
             match c.process_frame(&mut on_request, "127.0.0.1") {
@@ -2004,15 +2275,11 @@ mod frame_validation_tests {
     /// meant to test.
     /// A HEADERS frame opening `stream_id` and carrying one extra header,
     /// HPACK-encoded as a literal-without-indexing with a new name.
-    pub(super) fn open_stream_with_header(
-        stream_id: u32,
-        name: &str,
-        value: &str,
-    ) -> Vec<u8> {
-        let mut block = vec![0x82, 0x87, 0x84];      // :method GET, :scheme https, :path /
-        block.extend_from_slice(&[0x01, 0x0b]);      // :authority, literal
+    pub(super) fn open_stream_with_header(stream_id: u32, name: &str, value: &str) -> Vec<u8> {
+        let mut block = vec![0x82, 0x87, 0x84]; // :method GET, :scheme https, :path /
+        block.extend_from_slice(&[0x01, 0x0b]); // :authority, literal
         block.extend_from_slice(b"example.com");
-        block.push(0x00);                            // literal, new name, no indexing
+        block.push(0x00); // literal, new name, no indexing
         block.push(name.len() as u8);
         block.extend_from_slice(name.as_bytes());
         block.push(value.len() as u8);
@@ -2045,7 +2312,10 @@ mod frame_validation_tests {
             let payload = vec![0u8; short];
             let f = frame(TYPE_HEADERS, FLAG_PRIORITY, 1, &payload);
             let r = feed(&f);
-            assert!(r.is_err(), "a {short}-byte PRIORITY HEADERS payload should be rejected");
+            assert!(
+                r.is_err(),
+                "a {short}-byte PRIORITY HEADERS payload should be rejected"
+            );
         }
     }
 
@@ -2095,7 +2365,13 @@ mod frame_validation_tests {
         c.phase = Phase::Active;
         c.recv_buf.extend_from_slice(&frame(TYPE_DATA, 0, 1, &[]));
         let mut on_request = |_: &HttpRequest, _: &str| -> RequestOutcome {
-            RequestOutcome::Ready(200, vec![], vec![], "t".to_string(), std::sync::Arc::new(vec![]))
+            RequestOutcome::Ready(
+                200,
+                vec![],
+                vec![],
+                "t".to_string(),
+                std::sync::Arc::new(vec![]),
+            )
         };
         let _ = c.process_frame(&mut on_request, "127.0.0.1");
 
@@ -2104,7 +2380,8 @@ mod frame_validation_tests {
         let buf = &c.send_buf;
         let mut i = 0usize;
         while i + FRAME_HDR <= buf.len() {
-            let len = ((buf[i] as usize) << 16) | ((buf[i + 1] as usize) << 8) | buf[i + 2] as usize;
+            let len =
+                ((buf[i] as usize) << 16) | ((buf[i + 1] as usize) << 8) | buf[i + 2] as usize;
             let ftype = buf[i + 3];
             let body = &buf[i + FRAME_HDR..(i + FRAME_HDR + len).min(buf.len())];
             if ftype == TYPE_WINDOW_UPDATE && body.len() == 4 {
@@ -2134,11 +2411,10 @@ mod frame_validation_tests {
     }
 }
 
-
 #[cfg(test)]
 mod stream_state_tests {
-    use super::*;
     use super::frame_validation_tests::{feed, frame, open_stream};
+    use super::*;
 
     /// RFC 9113 5.1 idle: "Receiving any frame other than HEADERS or PRIORITY
     /// on a stream in this state MUST be treated as a connection error of
@@ -2199,8 +2475,14 @@ mod stream_state_tests {
         let mut st = H2Stream::new(65535);
         st.state = StreamState::HalfClosedRemote;
         c.streams.insert(1, st);
-        assert_eq!(c.frame_verdict(TYPE_DATA, 1), FrameVerdict::StreamError(ERR_STREAM_CLOSED));
-        assert_eq!(c.frame_verdict(TYPE_HEADERS, 1), FrameVerdict::StreamError(ERR_STREAM_CLOSED));
+        assert_eq!(
+            c.frame_verdict(TYPE_DATA, 1),
+            FrameVerdict::StreamError(ERR_STREAM_CLOSED)
+        );
+        assert_eq!(
+            c.frame_verdict(TYPE_HEADERS, 1),
+            FrameVerdict::StreamError(ERR_STREAM_CLOSED)
+        );
         assert_eq!(c.frame_verdict(TYPE_WINDOW_UPDATE, 1), FrameVerdict::Allow);
         assert_eq!(c.frame_verdict(TYPE_RST_STREAM, 1), FrameVerdict::Allow);
         assert_eq!(c.frame_verdict(TYPE_PRIORITY, 1), FrameVerdict::Allow);
@@ -2227,7 +2509,7 @@ mod stream_state_tests {
     #[test]
     fn closed_after_end_stream_is_a_connection_error() {
         let mut c = Http2Conn::new();
-        c.last_stream_id = 9;                       // 3 is closed, never reset
+        c.last_stream_id = 9; // 3 is closed, never reset
         for ftype in [TYPE_DATA, TYPE_HEADERS, TYPE_CONTINUATION] {
             assert_eq!(
                 c.frame_verdict(ftype, 3),
@@ -2265,7 +2547,10 @@ mod stream_state_tests {
         }
         assert_eq!(c.recently_reset.len(), RESET_MEMORY);
         assert!(!c.was_reset(1), "oldest entries must be evicted");
-        assert!(c.was_reset(RESET_MEMORY as u32 + 50), "newest must be retained");
+        assert!(
+            c.was_reset(RESET_MEMORY as u32 + 50),
+            "newest must be retained"
+        );
     }
 
     // ── Rapid Reset, CVE-2023-44487 ───────────────────────────────────────────
@@ -2274,8 +2559,13 @@ mod stream_state_tests {
     fn run(c: &mut Http2Conn, bytes: &[u8]) -> Result<(), &'static str> {
         c.recv_buf.extend_from_slice(bytes);
         let mut on_request = |_: &HttpRequest, _: &str| -> RequestOutcome {
-            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string(),
-                                  std::sync::Arc::new(vec![]))
+            RequestOutcome::Ready(
+                200,
+                vec![],
+                b"ok".to_vec(),
+                "test".to_string(),
+                std::sync::Arc::new(vec![]),
+            )
         };
         loop {
             match c.process_frame(&mut on_request, "127.0.0.1") {
@@ -2291,10 +2581,11 @@ mod stream_state_tests {
         let mut out = Vec::new();
         let mut i = 0usize;
         while i + FRAME_HDR <= buf.len() {
-            let len = ((buf[i] as usize) << 16) | ((buf[i + 1] as usize) << 8) | buf[i + 2] as usize;
+            let len =
+                ((buf[i] as usize) << 16) | ((buf[i + 1] as usize) << 8) | buf[i + 2] as usize;
             let this = buf[i + 3];
-            let sid = u32::from_be_bytes([buf[i + 5], buf[i + 6], buf[i + 7], buf[i + 8]])
-                & 0x7fff_ffff;
+            let sid =
+                u32::from_be_bytes([buf[i + 5], buf[i + 6], buf[i + 7], buf[i + 8]]) & 0x7fff_ffff;
             let end = (i + FRAME_HDR + len).min(buf.len());
             if this == ftype {
                 out.push((sid, buf[i + FRAME_HDR..end].to_vec()));
@@ -2307,7 +2598,12 @@ mod stream_state_tests {
     /// Open `stream_id` and cancel it immediately -- one unit of Rapid Reset.
     fn open_and_reset(stream_id: u32) -> Vec<u8> {
         let mut f = open_stream(stream_id);
-        f.extend(frame(TYPE_RST_STREAM, 0, stream_id, &ERR_NO_ERROR.to_be_bytes()));
+        f.extend(frame(
+            TYPE_RST_STREAM,
+            0,
+            stream_id,
+            &ERR_NO_ERROR.to_be_bytes(),
+        ));
         f
     }
 
@@ -2329,7 +2625,8 @@ mod stream_state_tests {
 
         assert_eq!(c.streams.len(), 0, "every stream really was cancelled");
         assert_eq!(
-            c.active_streams(Instant::now()), MAX_CONCURRENT as usize,
+            c.active_streams(Instant::now()),
+            MAX_CONCURRENT as usize,
             "cancelled streams must still hold their slots"
         );
 
@@ -2374,7 +2671,10 @@ mod stream_state_tests {
             id += 2;
         }
 
-        assert!(ended.is_some(), "a peer ignoring the cap must be disconnected");
+        assert!(
+            ended.is_some(),
+            "a peer ignoring the cap must be disconnected"
+        );
         assert_eq!(c.phase, Phase::GoingAway);
 
         let goaways = sent_frames(&c.send_buf, TYPE_GOAWAY);
@@ -2385,7 +2685,10 @@ mod stream_state_tests {
             "a flood is ENHANCE_YOUR_CALM, not PROTOCOL_ERROR: the frames are \
              individually legal and it is the rate that is not"
         );
-        assert!(c.goaway_sent, "the generic error path must not add a second");
+        assert!(
+            c.goaway_sent,
+            "the generic error path must not add a second"
+        );
     }
 
     /// The precise code must survive the driver's generic error handling.
@@ -2418,7 +2721,8 @@ mod stream_state_tests {
         let now = Instant::now();
         assert_eq!(c.active_streams(now), MAX_CONCURRENT as usize);
         assert_eq!(
-            c.active_streams(now + RESET_DECAY * 2), 0,
+            c.active_streams(now + RESET_DECAY * 2),
+            0,
             "slots must be released once the decay window has passed"
         );
     }
@@ -2467,7 +2771,8 @@ mod stream_state_tests {
             c.note_reset(push_id);
         }
         assert_eq!(
-            c.active_streams(Instant::now()), 0,
+            c.active_streams(Instant::now()),
+            0,
             "declined pushes are not the peer's doing"
         );
 
@@ -2532,9 +2837,12 @@ mod stream_state_tests {
     /// and processed as though it continued a header block that had ended.
     #[test]
     fn continuation_without_a_preceding_headers_is_refused() {
-        let mut f = open_stream(1);          // carries END_HEADERS
+        let mut f = open_stream(1); // carries END_HEADERS
         f.extend(frame(TYPE_CONTINUATION, FLAG_END_HEADERS, 1, &[0x82]));
-        assert!(feed(&f).is_err(), "CONTINUATION after END_HEADERS must be refused");
+        assert!(
+            feed(&f).is_err(),
+            "CONTINUATION after END_HEADERS must be refused"
+        );
     }
 
     /// RFC 9113 5.1.1: a new stream id must exceed every id already opened.
@@ -2549,18 +2857,27 @@ mod stream_state_tests {
         c.phase = Phase::Active;
         c.recv_buf.extend_from_slice(&f);
         let mut on_request = |_: &HttpRequest, _: &str| -> RequestOutcome {
-            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "t".to_string(),
-                                  std::sync::Arc::new(vec![]))
+            RequestOutcome::Ready(
+                200,
+                vec![],
+                b"ok".to_vec(),
+                "t".to_string(),
+                std::sync::Arc::new(vec![]),
+            )
         };
         while let Ok(true) = c.process_frame(&mut on_request, "127.0.0.1") {}
-        assert_eq!(c.phase, Phase::GoingAway, "a backwards stream id must GOAWAY");
+        assert_eq!(
+            c.phase,
+            Phase::GoingAway,
+            "a backwards stream id must GOAWAY"
+        );
     }
 }
 
 #[cfg(test)]
 mod continuation_state_tests {
-    use super::*;
     use super::frame_validation_tests::{feed, frame};
+    use super::*;
 
     /// HEADERS with END_STREAM but WITHOUT END_HEADERS is legal: a request
     /// with no body whose header block does not fit in one frame. END_STREAM
@@ -2589,7 +2906,10 @@ mod continuation_state_tests {
         let mut f = frame(TYPE_HEADERS, 0, 1, &[0x82]);
         f.extend(frame(TYPE_CONTINUATION, 0, 1, &[0x87]));
         f.extend(frame(TYPE_CONTINUATION, FLAG_END_HEADERS, 1, &[0x84]));
-        assert!(feed(&f).is_ok(), "a multi-frame header block must be accepted");
+        assert!(
+            feed(&f).is_ok(),
+            "a multi-frame header block must be accepted"
+        );
     }
 }
 
@@ -2598,13 +2918,18 @@ mod f005_regression {
     //! F-005 regression guards. These are the report's own proofs-of-concept
     //! with every assertion INVERTED: each one asserted the buggy behaviour and
     //! passed against the vulnerable build, and each must now fail closed.
+    use super::frame_validation_tests::{feed, frame, open_stream};
     use super::*;
-    use super::frame_validation_tests::{frame, feed, open_stream};
 
     fn drain_buf(c: &mut Http2Conn) -> Result<(), &'static str> {
         let mut on_request = |_: &HttpRequest, _: &str| -> RequestOutcome {
-            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "t".to_string(),
-                                  std::sync::Arc::new(vec![]))
+            RequestOutcome::Ready(
+                200,
+                vec![],
+                b"ok".to_vec(),
+                "t".to_string(),
+                std::sync::Arc::new(vec![]),
+            )
         };
         loop {
             match c.process_frame(&mut on_request, "127.0.0.1") {
@@ -2623,8 +2948,12 @@ mod f005_regression {
     fn oversized_frame_is_refused_before_buffering() {
         let mut c = Http2Conn::new();
         c.phase = Phase::Active;
-        c.recv_buf.extend_from_slice(&frame(TYPE_HEADERS, 0, 1, &vec![0u8; 200_000]));
-        assert!(drain_buf(&mut c).is_err(), "an oversized frame must be refused");
+        c.recv_buf
+            .extend_from_slice(&frame(TYPE_HEADERS, 0, 1, &vec![0u8; 200_000]));
+        assert!(
+            drain_buf(&mut c).is_err(),
+            "an oversized frame must be refused"
+        );
         assert!(
             c.header_block_buf.is_empty(),
             "refused on its header: nothing may be buffered, found {} bytes",
@@ -2637,8 +2966,12 @@ mod f005_regression {
     fn a_frame_at_the_limit_is_still_accepted() {
         let mut c = Http2Conn::new();
         c.phase = Phase::Active;
-        c.recv_buf.extend_from_slice(&frame(TYPE_HEADERS, 0, 1, &vec![0u8; MAX_FRAME_SIZE]));
-        assert!(drain_buf(&mut c).is_ok(), "MAX_FRAME_SIZE exactly must be accepted");
+        c.recv_buf
+            .extend_from_slice(&frame(TYPE_HEADERS, 0, 1, &vec![0u8; MAX_FRAME_SIZE]));
+        assert!(
+            drain_buf(&mut c).is_ok(),
+            "MAX_FRAME_SIZE exactly must be accepted"
+        );
     }
 
     /// The same boundary, but for a DATA frame carried on a real stream.
@@ -2656,7 +2989,12 @@ mod f005_regression {
     #[test]
     fn data_frame_at_exactly_max_frame_size_is_accepted() {
         let mut f = open_stream(1);
-        f.extend(frame(TYPE_DATA, FLAG_END_STREAM, 1, &vec![0u8; MAX_FRAME_SIZE]));
+        f.extend(frame(
+            TYPE_DATA,
+            FLAG_END_STREAM,
+            1,
+            &vec![0u8; MAX_FRAME_SIZE],
+        ));
         assert!(
             feed(&f).is_ok(),
             "a DATA frame of exactly 2^14 octets is legal and must not kill the connection"
@@ -2671,10 +3009,12 @@ mod f005_regression {
     fn continuation_flood_is_bounded() {
         let mut c = Http2Conn::new();
         c.phase = Phase::Active;
-        c.recv_buf.extend_from_slice(&frame(TYPE_HEADERS, 0, 1, &[0u8; 16]));
+        c.recv_buf
+            .extend_from_slice(&frame(TYPE_HEADERS, 0, 1, &[0u8; 16]));
         let chunk = vec![0u8; 16_000];
         for _ in 0..2000 {
-            c.recv_buf.extend_from_slice(&frame(TYPE_CONTINUATION, 0, 1, &chunk));
+            c.recv_buf
+                .extend_from_slice(&frame(TYPE_CONTINUATION, 0, 1, &chunk));
         }
         assert!(drain_buf(&mut c).is_err(), "the flood must be refused");
         assert!(
@@ -2691,9 +3031,13 @@ mod f005_regression {
         let mut c = Http2Conn::new();
         c.phase = Phase::Active;
         for _ in 0..1000 {
-            c.recv_buf.extend_from_slice(&frame(TYPE_CONTINUATION, 0, 7, &[0u8; 16_000]));
+            c.recv_buf
+                .extend_from_slice(&frame(TYPE_CONTINUATION, 0, 7, &[0u8; 16_000]));
         }
-        assert!(drain_buf(&mut c).is_err(), "CONTINUATION with no open block must be refused");
+        assert!(
+            drain_buf(&mut c).is_err(),
+            "CONTINUATION with no open block must be refused"
+        );
         assert!(c.header_block_buf.is_empty());
     }
 
@@ -2705,7 +3049,12 @@ mod f005_regression {
     fn window_update_overflow_is_refused_not_wrapped() {
         let mut f = open_stream(1);
         for _ in 0..3 {
-            f.extend(frame(TYPE_WINDOW_UPDATE, 0, 1, &0x7fff_ffffu32.to_be_bytes()));
+            f.extend(frame(
+                TYPE_WINDOW_UPDATE,
+                0,
+                1,
+                &0x7fff_ffffu32.to_be_bytes(),
+            ));
         }
         // Must not panic, and must not leave a negative window.
         let _ = feed(&f);
@@ -2716,10 +3065,17 @@ mod f005_regression {
         let mut c = Http2Conn::new();
         c.phase = Phase::Active;
         for _ in 0..3 {
-            c.recv_buf.extend_from_slice(
-                &frame(TYPE_WINDOW_UPDATE, 0, 0, &0x7fff_ffffu32.to_be_bytes()));
+            c.recv_buf.extend_from_slice(&frame(
+                TYPE_WINDOW_UPDATE,
+                0,
+                0,
+                &0x7fff_ffffu32.to_be_bytes(),
+            ));
         }
-        assert!(drain_buf(&mut c).is_err(), "connection window overflow must GOAWAY");
+        assert!(
+            drain_buf(&mut c).is_err(),
+            "connection window overflow must GOAWAY"
+        );
         assert!(c.conn_send_window >= 0, "window must never wrap negative");
     }
 
@@ -2729,7 +3085,8 @@ mod f005_regression {
         let mut c = Http2Conn::new();
         c.phase = Phase::Active;
         let before = c.conn_send_window;
-        c.recv_buf.extend_from_slice(&frame(TYPE_WINDOW_UPDATE, 0, 0, &1000u32.to_be_bytes()));
+        c.recv_buf
+            .extend_from_slice(&frame(TYPE_WINDOW_UPDATE, 0, 0, &1000u32.to_be_bytes()));
         assert!(drain_buf(&mut c).is_ok());
         assert_eq!(c.conn_send_window, before + 1000);
     }
@@ -2740,8 +3097,8 @@ mod frame_shape_tests {
     //! RFC 9113 6.1-6.10 frame shape rules. None of these were checked:
     //! PRIORITY was accepted and discarded whatever it contained, RST_STREAM
     //! and PING took any length, and SETTINGS took any stream id.
+    use super::frame_validation_tests::{feed, frame, open_stream};
     use super::*;
-    use super::frame_validation_tests::{frame, feed, open_stream};
 
     fn verdict(ftype: u8, flags: u8, stream_id: u32, len: usize) -> FrameVerdict {
         Http2Conn::new().frame_shape_verdict(ftype, flags, stream_id, len)
@@ -2752,7 +3109,13 @@ mod frame_shape_tests {
     /// what the frame refers to, so nothing after it can be trusted.
     #[test]
     fn stream_association_is_enforced_both_ways() {
-        for ftype in [TYPE_DATA, TYPE_HEADERS, TYPE_PRIORITY, TYPE_RST_STREAM, TYPE_CONTINUATION] {
+        for ftype in [
+            TYPE_DATA,
+            TYPE_HEADERS,
+            TYPE_PRIORITY,
+            TYPE_RST_STREAM,
+            TYPE_CONTINUATION,
+        ] {
             assert_eq!(
                 verdict(ftype, 0, 0, 5),
                 FrameVerdict::ConnectionError(ERR_PROTOCOL_ERROR),
@@ -2773,11 +3136,21 @@ mod frame_shape_tests {
     /// are connection errors, because they act on shared connection state.
     #[test]
     fn fixed_lengths_use_the_error_class_the_rfc_specifies() {
-        assert_eq!(verdict(TYPE_PRIORITY, 0, 1, 4), FrameVerdict::StreamError(ERR_FRAME_SIZE));
-        assert_eq!(verdict(TYPE_PRIORITY, 0, 1, 6), FrameVerdict::StreamError(ERR_FRAME_SIZE));
+        assert_eq!(
+            verdict(TYPE_PRIORITY, 0, 1, 4),
+            FrameVerdict::StreamError(ERR_FRAME_SIZE)
+        );
+        assert_eq!(
+            verdict(TYPE_PRIORITY, 0, 1, 6),
+            FrameVerdict::StreamError(ERR_FRAME_SIZE)
+        );
         assert_eq!(verdict(TYPE_PRIORITY, 0, 1, 5), FrameVerdict::Allow);
 
-        for (ftype, want) in [(TYPE_RST_STREAM, 4usize), (TYPE_PING, 8), (TYPE_WINDOW_UPDATE, 4)] {
+        for (ftype, want) in [
+            (TYPE_RST_STREAM, 4usize),
+            (TYPE_PING, 8),
+            (TYPE_WINDOW_UPDATE, 4),
+        ] {
             let sid = if ftype == TYPE_PING { 0 } else { 1 };
             assert_eq!(
                 verdict(ftype, 0, sid, want + 1),
@@ -2817,8 +3190,8 @@ mod frame_shape_tests {
     #[test]
     fn a_stream_may_not_depend_on_itself() {
         let mut f = open_stream(1);
-        let mut payload = 1u32.to_be_bytes().to_vec();   // depends on stream 1
-        payload.push(0);                                  // weight
+        let mut payload = 1u32.to_be_bytes().to_vec(); // depends on stream 1
+        payload.push(0); // weight
         f.extend(frame(TYPE_PRIORITY, 0, 1, &payload));
         // Stream error, so the connection survives.
         assert!(feed(&f).is_ok());
@@ -2928,11 +3301,14 @@ mod hpack_validation_tests {
     #[test]
     fn a_truncated_block_is_an_error_not_a_panic() {
         for b in [
-            vec![0x00, 0x05, b'a'],       // string shorter than its length
-            vec![0x3f, 0xe1],             // integer continuation runs off the end
-            vec![0x00],                   // literal with nothing after it
+            vec![0x00, 0x05, b'a'], // string shorter than its length
+            vec![0x3f, 0xe1],       // integer continuation runs off the end
+            vec![0x00],             // literal with nothing after it
         ] {
-            assert!(validate_hpack_block(&b, HPACK_MAX_TABLE_SIZE).is_err(), "{b:?}");
+            assert!(
+                validate_hpack_block(&b, HPACK_MAX_TABLE_SIZE).is_err(),
+                "{b:?}"
+            );
         }
     }
 
@@ -2948,8 +3324,8 @@ mod hpack_table_size_setting_tests {
     //! RFC 9113 6.5.2. A peer's SETTINGS_HEADER_TABLE_SIZE must never be able
     //! to enlarge OUR decoder's dynamic table: it describes the peer's decoder,
     //! not ours, and the value is an unbounded u32.
+    use super::frame_validation_tests::{feed, frame};
     use super::*;
-    use super::frame_validation_tests::{frame, feed};
 
     fn settings(id: u16, val: u32) -> Vec<u8> {
         let mut p = Vec::new();
@@ -2963,10 +3339,16 @@ mod hpack_table_size_setting_tests {
     fn a_huge_peer_table_size_cannot_enlarge_our_decoder() {
         let mut c = Http2Conn::new();
         c.phase = Phase::Active;
-        c.recv_buf.extend_from_slice(&settings(SETTING_HEADER_TABLE_SIZE, u32::MAX));
+        c.recv_buf
+            .extend_from_slice(&settings(SETTING_HEADER_TABLE_SIZE, u32::MAX));
         let mut on_request = |_: &HttpRequest, _: &str| -> RequestOutcome {
-            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "t".to_string(),
-                                  std::sync::Arc::new(vec![]))
+            RequestOutcome::Ready(
+                200,
+                vec![],
+                b"ok".to_vec(),
+                "t".to_string(),
+                std::sync::Arc::new(vec![]),
+            )
         };
         loop {
             match c.process_frame(&mut on_request, "127.0.0.1") {
@@ -2977,7 +3359,11 @@ mod hpack_table_size_setting_tests {
         }
         // The setting is legal, so the connection survives; what must NOT happen
         // is our own table cap following it upwards.
-        assert_eq!(c.phase, Phase::Active, "a legal SETTINGS value must not kill the connection");
+        assert_eq!(
+            c.phase,
+            Phase::Active,
+            "a legal SETTINGS value must not kill the connection"
+        );
     }
 
     /// A peer asking for a smaller table is honoured: that only reduces memory.
@@ -2990,7 +3376,10 @@ mod hpack_table_size_setting_tests {
     /// The clamp itself, stated directly.
     #[test]
     fn the_clamp_is_the_advertised_maximum() {
-        assert_eq!((u32::MAX as usize).min(HPACK_MAX_TABLE_SIZE), HPACK_MAX_TABLE_SIZE);
+        assert_eq!(
+            (u32::MAX as usize).min(HPACK_MAX_TABLE_SIZE),
+            HPACK_MAX_TABLE_SIZE
+        );
         assert_eq!((512usize).min(HPACK_MAX_TABLE_SIZE), 512);
     }
 }
@@ -3047,11 +3436,7 @@ mod forwarded_client_ip_tests {
     /// bucket by sending a header.
     #[test]
     fn a_public_connection_ignores_a_forged_forwarded_address() {
-        let (ip, survived) = attributed(
-            Http2Conn::new(),
-            "198.51.100.7",
-            Some("203.0.113.9"),
-        );
+        let (ip, survived) = attributed(Http2Conn::new(), "198.51.100.7", Some("203.0.113.9"));
         assert_eq!(ip, "198.51.100.7", "a forged X-Forwarded-For was believed");
         assert!(!survived, "the header must not reach the handler");
     }
@@ -3092,5 +3477,93 @@ mod forwarded_client_ip_tests {
             Some("203.0.113.9, 192.0.2.1"),
         );
         assert_eq!(ip, "10.0.0.4");
+    }
+}
+
+#[cfg(test)]
+mod hpack_robustness {
+    //! Can a peer reach the HPACK decoder's panic?
+    //!
+    //! `hpack` 0.3.0 carries RUSTSEC-2023-0084: `Decoder::decode` panics on
+    //! some invalid input, `Option::unwrap()` on a `None` at decoder.rs:453.
+    //! The maintained fork, `fluke-hpack` 0.3.1, has the same panic at :505,
+    //! so switching crates does not fix it.
+    //!
+    //! It only matters if such a block can reach the decoder. In production it
+    //! cannot arrive unexamined: `check_hpack_block` runs `validate_hpack_block`
+    //! first and answers GOAWAY(COMPRESSION_ERROR) on anything it rejects.
+    //!
+    //! So this tests the production sequence, validate then decode, rather than
+    //! the decoder alone. Testing the decoder alone proves only that a crate we
+    //! do not control has a bug, which is already known.
+
+    use super::{decode_hpack, validate_hpack_block, HPACK_MAX_TABLE_SIZE};
+
+    /// The shapes a malformed or hostile HEADERS frame takes.
+    fn hostile_blocks() -> Vec<(&'static str, Vec<u8>)> {
+        vec![
+            // Indexed header field, index 0. RFC 7541 6.1: "The index value of
+            // 0 is not used." The validator parses this index and discards it.
+            ("indexed field, index 0", vec![0x80]),
+            // Indexed field far past the static and dynamic tables.
+            ("indexed field, huge index", vec![0xFF, 0xFF, 0xFF, 0xFF, 0x7F]),
+            ("integer overflow", vec![0xFF; 12]),
+            ("truncated literal name", vec![0x40, 0x7F, 0xFF, 0xFF, 0xFF, 0x7F]),
+            ("truncated huffman string", vec![0x40, 0x8F, 0xFF]),
+            ("absurd table size update", vec![0x3F, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F]),
+            ("lone continuation", vec![0xFF]),
+            ("literal, indexed name 0, no strings", vec![0x40]),
+        ]
+    }
+
+    /// The property that matters: nothing a peer can send reaches the decoder
+    /// and panics it. Either the validator rejects the block, or the decoder
+    /// handles it. A panic here is a remote denial of service on the edge.
+    #[test]
+    fn no_hostile_block_survives_validation_and_panics_the_decoder() {
+        let mut reached = Vec::new();
+        for (name, block) in hostile_blocks() {
+            if validate_hpack_block(&block, HPACK_MAX_TABLE_SIZE).is_err() {
+                continue; // rejected before the decoder ever sees it
+            }
+            // It passed validation, so production would decode it. Does it
+            // survive? `catch_unwind` is used to *report* which input gets
+            // through, not to make it safe.
+            let panicked = std::panic::catch_unwind(|| {
+                let mut dec = hpack::Decoder::new();
+                let mut out = Vec::new();
+                let _ = decode_hpack(&mut dec, &block, &mut out);
+            })
+            .is_err();
+            if panicked {
+                reached.push(name);
+            }
+        }
+        assert!(
+            reached.is_empty(),
+            "these blocks pass validation and then panic the decoder, \
+             which is a remote denial of service: {reached:?}"
+        );
+    }
+
+    /// Every truncation of a well-formed block is something a peer can send,
+    /// by closing mid-frame or lying about a length.
+    #[test]
+    fn no_truncation_of_a_good_block_survives_validation_and_panics() {
+        let good: Vec<u8> = vec![0x82, 0x87, 0x84, 0x41, 0x03, b'a', b'b', b'c'];
+        for n in 0..=good.len() {
+            let part = &good[..n];
+            if validate_hpack_block(part, HPACK_MAX_TABLE_SIZE).is_err() {
+                continue;
+            }
+            let block = part.to_vec();
+            let ok = std::panic::catch_unwind(|| {
+                let mut dec = hpack::Decoder::new();
+                let mut out = Vec::new();
+                let _ = decode_hpack(&mut dec, &block, &mut out);
+            })
+            .is_ok();
+            assert!(ok, "a {n}-byte truncation passes validation and panics the decoder");
+        }
     }
 }

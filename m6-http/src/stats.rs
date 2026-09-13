@@ -97,7 +97,11 @@ impl Iface {
             [127, ..] => true,
             _ => host.starts_with("fd") || host.starts_with("fc") || host == "::1",
         };
-        if private { Iface::Internal } else { Iface::External }
+        if private {
+            Iface::Internal
+        } else {
+            Iface::External
+        }
     }
 
     pub fn as_str(self) -> &'static str {
@@ -136,7 +140,11 @@ impl Channel {
             1 => Version::Http2,
             _ => Version::Http3,
         };
-        let iface = if i % 2 == 1 { Iface::Internal } else { Iface::External };
+        let iface = if i % 2 == 1 {
+            Iface::Internal
+        } else {
+            Iface::External
+        };
         Channel { version, iface }
     }
 
@@ -209,28 +217,27 @@ impl ChannelStats {
 // them; only the shape is shared.
 pub use m6_core::telemetry::{ChannelSnapshot, StatsSnapshot};
 
-
 pub struct Stats {
     // Cumulative
-    pub requests_total:       u64,
-    pub cache_hits_total:     u64,
-    pub cache_misses_total:   u64,
+    pub requests_total: u64,
+    pub cache_hits_total: u64,
+    pub cache_misses_total: u64,
     pub backend_errors_total: u64,
 
     // Window counters (reset each emit)
-    window_requests:       u64,
-    window_cache_hits:     u64,
-    window_cache_misses:   u64,
+    window_requests: u64,
+    window_cache_hits: u64,
+    window_cache_misses: u64,
     window_backend_errors: u64,
 
     // Raw latency samples — ring buffers, one per category
-    hit_samples:  Box<[u64; RESERVOIR]>,
-    hit_idx:      usize,
-    hit_count:    usize,   // capped at RESERVOIR
+    hit_samples: Box<[u64; RESERVOIR]>,
+    hit_idx: usize,
+    hit_count: usize, // capped at RESERVOIR
 
     miss_samples: Box<[u64; RESERVOIR]>,
-    miss_idx:     usize,
-    miss_count:   usize,
+    miss_idx: usize,
+    miss_count: usize,
 
     // ── Monitoring endpoints, accounted separately ────────────────────────
     //
@@ -247,10 +254,10 @@ pub struct Stats {
     // exclusion existed, and separate accounting preserves it without
     // throwing the data away.
     pub monitor_requests_total: u64,
-    window_monitor_requests:    u64,
+    window_monitor_requests: u64,
     monitor_samples: Box<[u64; RESERVOIR]>,
-    monitor_idx:     usize,
-    monitor_count:   usize,
+    monitor_idx: usize,
+    monitor_count: usize,
 
     /// Per (version, interface) breakdown. Fixed-size dense table rather than
     /// a map: six entries, indexed arithmetically, no allocation and no hash
@@ -266,25 +273,37 @@ pub struct Stats {
     // RPS
     pub rps_peak: u64,
     window_start: Instant,
-    last_emit:    Instant,
+    last_emit: Instant,
 }
 
 impl Stats {
     pub fn new() -> Self {
         let now = Instant::now();
         Stats {
-            requests_total: 0, cache_hits_total: 0, cache_misses_total: 0, backend_errors_total: 0,
-            window_requests: 0, window_cache_hits: 0, window_cache_misses: 0, window_backend_errors: 0,
-            hit_samples:  Box::new([0u64; RESERVOIR]),
-            hit_idx: 0, hit_count: 0,
+            requests_total: 0,
+            cache_hits_total: 0,
+            cache_misses_total: 0,
+            backend_errors_total: 0,
+            window_requests: 0,
+            window_cache_hits: 0,
+            window_cache_misses: 0,
+            window_backend_errors: 0,
+            hit_samples: Box::new([0u64; RESERVOIR]),
+            hit_idx: 0,
+            hit_count: 0,
             miss_samples: Box::new([0u64; RESERVOIR]),
-            miss_idx: 0, miss_count: 0,
-            monitor_requests_total: 0, window_monitor_requests: 0,
+            miss_idx: 0,
+            miss_count: 0,
+            monitor_requests_total: 0,
+            window_monitor_requests: 0,
             monitor_samples: Box::new([0u64; RESERVOIR]),
-            monitor_idx: 0, monitor_count: 0,
+            monitor_idx: 0,
+            monitor_count: 0,
             channels: (0..CHANNELS).map(|_| ChannelStats::new()).collect(),
             status_counts: Box::new([0u64; 500]),
-            rps_peak: 0, window_start: now, last_emit: now,
+            rps_peak: 0,
+            window_start: now,
+            last_emit: now,
         }
     }
 
@@ -339,94 +358,109 @@ impl Stats {
             self.status_counts[usize::from(status) - 100] += 1;
         }
         self.channels[channel.index()].record(elapsed_ns, cache_hit, backend_error);
-        self.requests_total  += 1;
+        self.requests_total += 1;
         self.window_requests += 1;
 
         if elapsed_ns > 0 {
             if cache_hit {
-                self.cache_hits_total  += 1;
+                self.cache_hits_total += 1;
                 self.window_cache_hits += 1;
                 self.hit_samples[self.hit_idx] = elapsed_ns;
                 self.hit_idx = (self.hit_idx + 1) & (RESERVOIR - 1);
-                if self.hit_count < RESERVOIR { self.hit_count += 1; }
+                if self.hit_count < RESERVOIR {
+                    self.hit_count += 1;
+                }
             } else {
-                self.cache_misses_total  += 1;
+                self.cache_misses_total += 1;
                 self.window_cache_misses += 1;
                 self.miss_samples[self.miss_idx] = elapsed_ns;
                 self.miss_idx = (self.miss_idx + 1) & (RESERVOIR - 1);
-                if self.miss_count < RESERVOIR { self.miss_count += 1; }
+                if self.miss_count < RESERVOIR {
+                    self.miss_count += 1;
+                }
             }
         } else if cache_hit {
-            self.cache_hits_total  += 1;
+            self.cache_hits_total += 1;
             self.window_cache_hits += 1;
         } else {
-            self.cache_misses_total  += 1;
+            self.cache_misses_total += 1;
             self.window_cache_misses += 1;
         }
 
         if backend_error {
-            self.backend_errors_total  += 1;
+            self.backend_errors_total += 1;
             self.window_backend_errors += 1;
         }
     }
 
     #[inline]
     pub fn maybe_emit(&mut self, pool_members: usize) {
-        let now     = Instant::now();
+        let now = Instant::now();
         let elapsed = now.duration_since(self.last_emit);
-        if elapsed.as_secs() < EMIT_INTERVAL_SECS { return; }
+        if elapsed.as_secs() < EMIT_INTERVAL_SECS {
+            return;
+        }
 
         let elapsed_secs = elapsed.as_secs_f64().max(0.001);
-        let rps_avg      = (self.window_requests as f64 / elapsed_secs) as u64;
-        if rps_avg > self.rps_peak { self.rps_peak = rps_avg; }
+        let rps_avg = (self.window_requests as f64 / elapsed_secs) as u64;
+        if rps_avg > self.rps_peak {
+            self.rps_peak = rps_avg;
+        }
 
-        let total_window   = self.window_cache_hits + self.window_cache_misses;
-        let cache_hit_rate = if total_window > 0 { self.window_cache_hits as f64 / total_window as f64 } else { 0.0 };
+        let total_window = self.window_cache_hits + self.window_cache_misses;
+        let cache_hit_rate = if total_window > 0 {
+            self.window_cache_hits as f64 / total_window as f64
+        } else {
+            0.0
+        };
 
-        let (hp0, hp50, hp99, hp100) = percentiles(&self.hit_samples,  self.hit_count);
+        let (hp0, hp50, hp99, hp100) = percentiles(&self.hit_samples, self.hit_count);
         let (mp0, mp50, mp99, mp100) = percentiles(&self.miss_samples, self.miss_count);
-        let (_, kp50, kp99, _)       = percentiles(&self.monitor_samples, self.monitor_count);
+        let (_, kp50, kp99, _) = percentiles(&self.monitor_samples, self.monitor_count);
 
         tracing::info!(
-            requests       = self.requests_total,
-            rps_avg        = rps_avg,
-            rps_peak       = self.rps_peak,
-            cache_hits     = self.window_cache_hits,
-            cache_misses   = self.window_cache_misses,
+            requests = self.requests_total,
+            rps_avg = rps_avg,
+            rps_peak = self.rps_peak,
+            cache_hits = self.window_cache_hits,
+            cache_misses = self.window_cache_misses,
             cache_hit_rate = format_args!("{:.4}", cache_hit_rate),
             backend_errors = self.window_backend_errors,
-            pool_members   = pool_members,
-            hit_p0_ns      = hp0,
-            hit_p50_ns     = hp50,
-            hit_p99_ns     = hp99,
-            hit_max_ns     = hp100,
-            miss_p0_ns     = mp0,
-            miss_p50_ns    = mp50,
-            miss_p99_ns    = mp99,
-            miss_max_ns    = mp100,
+            pool_members = pool_members,
+            hit_p0_ns = hp0,
+            hit_p50_ns = hp50,
+            hit_p99_ns = hp99,
+            hit_max_ns = hp100,
+            miss_p0_ns = mp0,
+            miss_p50_ns = mp50,
+            miss_p99_ns = mp99,
+            miss_max_ns = mp100,
             // Monitoring endpoints, deliberately outside every counter above.
             // Reported so a monitor that stops polling, or one that starts
             // flooding, is visible; a reader can tell those apart from a
             // traffic change because these never move the traffic figures.
             monitor_requests = self.window_monitor_requests,
-            monitor_p50_ns   = kp50,
-            monitor_p99_ns   = kp99,
+            monitor_p50_ns = kp50,
+            monitor_p99_ns = kp99,
             "periodic stats"
         );
 
         // Reset window
-        self.window_requests = 0; self.window_cache_hits = 0;
-        self.window_cache_misses = 0; self.window_backend_errors = 0;
-        self.hit_idx = 0; self.hit_count = 0;
-        self.miss_idx = 0; self.miss_count = 0;
+        self.window_requests = 0;
+        self.window_cache_hits = 0;
+        self.window_cache_misses = 0;
+        self.window_backend_errors = 0;
+        self.hit_idx = 0;
+        self.hit_count = 0;
+        self.miss_idx = 0;
+        self.miss_count = 0;
         self.window_monitor_requests = 0;
-        self.monitor_idx = 0; self.monitor_count = 0;
+        self.monitor_idx = 0;
+        self.monitor_count = 0;
         self.window_start = now;
-        self.last_emit    = now;
+        self.last_emit = now;
     }
 }
-
-
 
 impl Stats {
     /// Snapshot without mutating anything.
@@ -472,10 +506,8 @@ impl Stats {
                 .filter(|(_, c)| c.requests > 0)
                 .map(|(i, c)| {
                     let ch = Channel::from_index(i);
-                    let (_, hp50, hp99, _) =
-                        percentiles_n(&c.hit_samples[..], c.hit_count);
-                    let (_, mp50, mp99, _) =
-                        percentiles_n(&c.miss_samples[..], c.miss_count);
+                    let (_, hp50, hp99, _) = percentiles_n(&c.hit_samples[..], c.hit_count);
+                    let (_, mp50, mp99, _) = percentiles_n(&c.miss_samples[..], c.miss_count);
                     ChannelSnapshot {
                         channel: ch.label(),
                         version: ch.version.as_str().to_string(),
@@ -500,20 +532,29 @@ impl Stats {
 /// Slice-based percentiles, for the per-channel reservoirs (which are a
 /// different fixed size from the aggregate ones).
 fn percentiles_n(samples: &[u64], n: usize) -> (u64, u64, u64, u64) {
-    if n == 0 { return (0, 0, 0, 0); }
+    if n == 0 {
+        return (0, 0, 0, 0);
+    }
     let mut buf: Vec<u64> = samples[..n].to_vec();
     buf.sort_unstable();
-    (buf[0], buf[(n - 1) * 50 / 100], buf[(n - 1) * 99 / 100], buf[n - 1])
+    (
+        buf[0],
+        buf[(n - 1) * 50 / 100],
+        buf[(n - 1) * 99 / 100],
+        buf[n - 1],
+    )
 }
 
 /// Sort the first `n` samples and return exact (p0, p50, p99, p100).
 fn percentiles(samples: &[u64; RESERVOIR], n: usize) -> (u64, u64, u64, u64) {
-    if n == 0 { return (0, 0, 0, 0); }
+    if n == 0 {
+        return (0, 0, 0, 0);
+    }
     let mut buf: Vec<u64> = samples[..n].to_vec();
     buf.sort_unstable();
-    let p0   = buf[0];
-    let p50  = buf[(n - 1) * 50 / 100];
-    let p99  = buf[(n - 1) * 99 / 100];
+    let p0 = buf[0];
+    let p50 = buf[(n - 1) * 50 / 100];
+    let p99 = buf[(n - 1) * 99 / 100];
     let p100 = buf[n - 1];
     (p0, p50, p99, p100)
 }
@@ -545,8 +586,14 @@ mod tests {
         }
 
         // Site traffic is untouched by 50 monitor polls.
-        assert_eq!(s.requests_total, 1, "monitor polls leaked into requests_total");
-        assert_eq!(s.cache_misses_total, 1, "monitor polls leaked into the miss count");
+        assert_eq!(
+            s.requests_total, 1,
+            "monitor polls leaked into requests_total"
+        );
+        assert_eq!(
+            s.cache_misses_total, 1,
+            "monitor polls leaked into the miss count"
+        );
         assert_eq!(s.backend_errors_total, 0);
 
         // And the polls are not lost.
@@ -578,9 +625,27 @@ mod tests {
     #[test]
     fn test_record_and_counts() {
         let mut s = Stats::new();
-        s.record(50, true, 200, Channel::new(Version::Http11, Iface::External), "m6-html");
-        s.record(200, false, 200, Channel::new(Version::Http11, Iface::External), "m6-html");
-        s.record(800, false, 200, Channel::new(Version::Http11, Iface::External), "m6-html");
+        s.record(
+            50,
+            true,
+            200,
+            Channel::new(Version::Http11, Iface::External),
+            "m6-html",
+        );
+        s.record(
+            200,
+            false,
+            200,
+            Channel::new(Version::Http11, Iface::External),
+            "m6-html",
+        );
+        s.record(
+            800,
+            false,
+            200,
+            Channel::new(Version::Http11, Iface::External),
+            "m6-html",
+        );
         assert_eq!(s.requests_total, 3);
         assert_eq!(s.cache_hits_total, 1);
         assert_eq!(s.cache_misses_total, 2);
@@ -595,11 +660,19 @@ mod tests {
     fn test_exact_percentiles() {
         let mut s = Stats::new();
         // 100 hit samples: 1..=100 ns
-        for i in 1u64..=100 { s.record(i, true, 200, Channel::new(Version::Http11, Iface::External), "m6-html"); }
+        for i in 1u64..=100 {
+            s.record(
+                i,
+                true,
+                200,
+                Channel::new(Version::Http11, Iface::External),
+                "m6-html",
+            );
+        }
         let (p0, p50, p99, p100) = percentiles(&s.hit_samples, s.hit_count);
-        assert_eq!(p0,   1);
-        assert_eq!(p50,  50);
-        assert_eq!(p99,  99);
+        assert_eq!(p0, 1);
+        assert_eq!(p50, 50);
+        assert_eq!(p99, 99);
         assert_eq!(p100, 100);
     }
 
@@ -607,14 +680,25 @@ mod tests {
     fn test_record_overhead() {
         let mut s = Stats::new();
         let start = Instant::now();
-        for i in 1..=1000u64 { s.record(i, i % 2 == 0, 200, Channel::new(Version::Http11, Iface::External), "m6-html"); }
+        for i in 1..=1000u64 {
+            s.record(
+                i,
+                i % 2 == 0,
+                200,
+                Channel::new(Version::Http11, Iface::External),
+                "m6-html",
+            );
+        }
         let elapsed = start.elapsed();
         #[cfg(debug_assertions)]
         let threshold_us = 1_000;
         #[cfg(not(debug_assertions))]
         let threshold_us = 100;
-        assert!(elapsed.as_micros() < threshold_us,
-            "record() too slow: {}µs for 1000 calls", elapsed.as_micros());
+        assert!(
+            elapsed.as_micros() < threshold_us,
+            "record() too slow: {}µs for 1000 calls",
+            elapsed.as_micros()
+        );
     }
 }
 
@@ -680,12 +764,20 @@ mod channel_tests {
         // Only channels that saw traffic are reported.
         assert_eq!(snap.channels.len(), 2);
 
-        let pubc = snap.channels.iter().find(|c| c.iface == "external").unwrap();
+        let pubc = snap
+            .channels
+            .iter()
+            .find(|c| c.iface == "external")
+            .unwrap();
         assert_eq!(pubc.channel, "http/2/external");
         assert_eq!((pubc.requests, pubc.hits, pubc.misses), (1, 1, 0));
         assert_eq!(pubc.hit_p50_ns, 3_000);
 
-        let tun = snap.channels.iter().find(|c| c.iface == "internal").unwrap();
+        let tun = snap
+            .channels
+            .iter()
+            .find(|c| c.iface == "internal")
+            .unwrap();
         assert_eq!(tun.channel, "http/2/internal");
         assert_eq!((tun.requests, tun.hits, tun.misses), (2, 0, 2));
         assert!(tun.miss_p50_ns >= 200_000_000);
@@ -701,14 +793,24 @@ mod channel_tests {
         stats.record(1_000_000, false, 502, h1, "m6-html");
         let snap = stats.snapshot();
         assert_eq!(snap.backend_errors_total, 1);
-        let c = snap.channels.iter().find(|c| c.channel == "http/1.1/external").unwrap();
+        let c = snap
+            .channels
+            .iter()
+            .find(|c| c.channel == "http/1.1/external")
+            .unwrap();
         assert_eq!(c.backend_errors, 1);
     }
 
     #[test]
     fn silent_channels_are_omitted_not_zero_filled() {
         let mut stats = Stats::new();
-        stats.record(1_000, true, 200, Channel::new(Version::Http3, Iface::External), "m6-html");
+        stats.record(
+            1_000,
+            true,
+            200,
+            Channel::new(Version::Http3, Iface::External),
+            "m6-html",
+        );
         let snap = stats.snapshot();
         assert_eq!(snap.channels.len(), 1, "a node reports only what it serves");
         assert_eq!(snap.channels[0].channel, "http/3/external");
@@ -726,8 +828,12 @@ mod status_code_tests {
     #[test]
     fn only_codes_actually_emitted_are_reported() {
         let mut s = Stats::new();
-        for _ in 0..5 { s.record(1_000, true, 200, ch(), "m6-html"); }
-        for _ in 0..3 { s.record(2_000, false, 404, ch(), "m6-html"); }
+        for _ in 0..5 {
+            s.record(1_000, true, 200, ch(), "m6-html");
+        }
+        for _ in 0..3 {
+            s.record(2_000, false, 404, ch(), "m6-html");
+        }
         s.record(3_000, true, 304, ch(), "m6-html");
 
         let snap = s.snapshot();
@@ -750,7 +856,10 @@ mod status_code_tests {
         s.record(1_000, false, 500, ch(), "m6-html");
         s.record(1_000, false, 503, ch(), "m6-html");
         let snap = s.snapshot();
-        assert_eq!(snap.backend_errors_total, 2, "only 5xx counts as a backend error");
+        assert_eq!(
+            snap.backend_errors_total, 2,
+            "only 5xx counts as a backend error"
+        );
         assert_eq!(snap.status_counts.get(&499), Some(&1));
     }
 
@@ -764,7 +873,10 @@ mod status_code_tests {
         s.record(1_000, false, 600, ch(), "m6-html");
         s.record(1_000, false, u16::MAX, ch(), "m6-html");
         let snap = s.snapshot();
-        assert!(snap.status_counts.is_empty(), "no bogus code may be counted");
+        assert!(
+            snap.status_counts.is_empty(),
+            "no bogus code may be counted"
+        );
         // The request itself is still counted; only the code is discarded.
         assert_eq!(snap.requests_total, 4);
     }
@@ -784,7 +896,9 @@ mod status_code_tests {
 mod backend_error_attribution_tests {
     use super::*;
 
-    fn ch() -> Channel { Channel::new(Version::Http2, Iface::External) }
+    fn ch() -> Channel {
+        Channel::new(Version::Http2, Iface::External)
+    }
 
     /// The regression this closes, seen on all three nodes for nine
     /// consecutive hours: a bot sends an unrecognised verb, method validation
@@ -825,7 +939,9 @@ mod backend_error_attribution_tests {
     #[test]
     fn a_cached_5xx_is_not_recounted() {
         let mut s = Stats::new();
-        for _ in 0..10 { s.record(1_000, true, 500, ch(), "cache"); }
+        for _ in 0..10 {
+            s.record(1_000, true, 500, ch(), "cache");
+        }
         assert_eq!(s.snapshot().backend_errors_total, 0);
     }
 }

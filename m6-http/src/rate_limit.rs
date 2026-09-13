@@ -19,7 +19,9 @@ pub struct RateLimiter {
 
 impl RateLimiter {
     pub fn new() -> Self {
-        RateLimiter { map: HashMap::new() }
+        RateLimiter {
+            map: HashMap::new(),
+        }
     }
 
     /// Record a request from `ip` and report whether it's over `limit_per_min`.
@@ -30,7 +32,8 @@ impl RateLimiter {
         let window = Duration::from_secs(WINDOW_SECS);
 
         if self.map.len() > MAX_TRACKED_IPS {
-            self.map.retain(|_, (_, seen)| now.duration_since(*seen) < window);
+            self.map
+                .retain(|_, (_, seen)| now.duration_since(*seen) < window);
         }
 
         let entry = self.map.entry(ip.to_string()).or_insert((0, now));
