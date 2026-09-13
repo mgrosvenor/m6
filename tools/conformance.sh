@@ -152,8 +152,35 @@ SETSID=""
 have setsid && SETSID="setsid"
 
 
-check() {  # check <key> <passed> <total>
-  local key="$1" got="$2" tot="$3"
+# Name the tests that failed, from whichever tester's output this is.
+#
+# WITHOUT THIS, A REGRESSION IS UNDIAGNOSABLE FROM CI. On 2026-09-13 the h2
+# target came back 145/146 on a GitHub runner while the build host said 146/146,
+# and the only thing in the CI log was "145/146 — floor is 146. Conformance went
+# BACKWARDS." The log file naming the test lives in $WORK on a runner that is
+# destroyed when the job ends, so there was nothing left to look at and the
+# temptation was to call it a flake and move on. A count is not a diagnosis.
+#
+# Each tester marks failures differently: h2spec uses ×, h3spec [✘], h1spec its
+# own text. All three are matched rather than guessing which produced this log,
+# and -a because h2spec's output carries control bytes that make GNU grep treat
+# the file as binary and print nothing useful.
+report_failures() {  # report_failures <log-path>
+  local log="$1"
+  [[ -f "$log" ]] || { info "  no output file at $log"; return; }
+  local found
+  found="$(grep -a -nE '✘|✖|×|✕|^\s*Error|FAILED' "$log" | head -40 || true)"
+  if [[ -n "$found" ]]; then
+    info "  the failing tests, from $log:"
+    printf '%s\n' "$found" | sed 's/^/      /' >&2
+  else
+    info "  no failure markers matched; the tail of $log:"
+    tail -30 "$log" | sed 's/^/      /' >&2
+  fi
+}
+
+check() {  # check <key> <passed> <total> [log-path]
+  local key="$1" got="$2" tot="$3" log="${4:-}"
   local floor; floor="$(floor_for "$key")"
   printf '%s %s %s\n' "$key" "$got" "$tot" >> "$MEASURED"
   if [[ -z "$floor" ]]; then
@@ -162,6 +189,9 @@ check() {  # check <key> <passed> <total>
   fi
   if (( got < floor )); then
     fail "$key: $got/$tot — floor is $floor. Conformance went BACKWARDS."
+    # Print the names, not just the count, so a CI failure can be read after
+    # the runner is gone.
+    [[ -n "$log" ]] && report_failures "$log"
     RESULT=1
   elif (( got > floor )); then
     pass "$key: $got/$tot — above the floor of $floor. Raise it with --update, in the commit that earned it."
@@ -183,7 +213,7 @@ measured_or_fail() {  # measured_or_fail <key> <got> <tot> <log-path>
     RESULT=1
     return 1
   fi
-  check "$key" "$got" "$tot"
+  check "$key" "$got" "$tot" "$log"
 }
 
 # A tool that is not installed is a run that did not test anything.

@@ -1099,22 +1099,27 @@ pub fn make_tls_server_config(
     cert_path: &str,
     key_path: &str,
 ) -> anyhow::Result<Arc<rustls::ServerConfig>> {
-    use rustls_pemfile::{certs, private_key};
-    use std::fs::File;
-    use std::io::BufReader;
+    // `rustls_pki_types::pem`, not the `rustls-pemfile` crate. That crate is
+    // unmaintained (RUSTSEC-2025-0134, archived August 2025) and its own
+    // advisory points here: the last release of it was a thin wrapper around
+    // this same code. There is no vulnerability to dodge, and no new dependency
+    // either, because rustls already brings rustls-pki-types in.
+    //
+    // It also reads better: `pem_file_iter` and `from_pem_file` open the file
+    // themselves, so the File and BufReader this used to build by hand are gone.
+    use rustls_pki_types::pem::PemObject;
+    use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
-    let cert_file =
-        File::open(cert_path).map_err(|e| anyhow::anyhow!("open cert {}: {}", cert_path, e))?;
-    let key_file =
-        File::open(key_path).map_err(|e| anyhow::anyhow!("open key {}: {}", key_path, e))?;
-
-    let certs: Vec<_> = certs(&mut BufReader::new(cert_file))
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(cert_path)
+        .map_err(|e| anyhow::anyhow!("open cert {}: {}", cert_path, e))?
         .collect::<Result<_, _>>()
         .map_err(|e| anyhow::anyhow!("parse cert: {}", e))?;
 
-    let key = private_key(&mut BufReader::new(key_file))
-        .map_err(|e| anyhow::anyhow!("parse key: {}", e))?
-        .ok_or_else(|| anyhow::anyhow!("no private key found in {}", key_path))?;
+    // A file with no key in it is an error here rather than `Ok(None)`, which is
+    // what `private_key` used to return and what the `ok_or_else` below it
+    // existed to turn into a message.
+    let key = PrivateKeyDer::from_pem_file(key_path)
+        .map_err(|e| anyhow::anyhow!("parse key {}: {}", key_path, e))?;
 
     let mut config = rustls::ServerConfig::builder()
         .with_no_client_auth()
