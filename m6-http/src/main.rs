@@ -1898,7 +1898,7 @@ fn send_h3_response(
 /// one place further down.
 ///
 /// Only the exact `www.` alias redirects. An arbitrary unrecognised Host is
-/// served normally, because node hostnames (`origin.example.com`) have to keep
+/// served normally, because node hostnames (`node-a.example.com`) have to keep
 /// answering directly — per-node verification depends on reaching one specific
 /// node by name instead of through the GeoDNS-routed apex.
 fn www_redirect_location(
@@ -4037,11 +4037,7 @@ mod www_redirect_tests {
     #[test]
     fn host_matching_is_case_insensitive_and_port_tolerant() {
         let c = cfg("example.com", true);
-        for host in [
-            "WWW.example.com",
-            "Www.MGrosvenor.Com",
-            "www.example.com:80",
-        ] {
+        for host in ["WWW.example.com", "Www.ExAmPle.Com", "www.example.com:80"] {
             assert_eq!(
                 www_redirect_location(Some(host), "/x", None, &c),
                 Some("https://example.com/x".to_string()),
@@ -4066,8 +4062,8 @@ mod www_redirect_tests {
     fn other_hosts_are_left_alone() {
         let c = cfg("example.com", true);
         for host in [
-            "origin.example.com",
-            "edge-a.example.com",
+            "node-a.example.com",
+            "node-b.example.com",
             "evil.example",
             "www.evil.example",
         ] {
@@ -4084,7 +4080,7 @@ mod www_redirect_tests {
     fn www_of_another_domain_is_not_our_alias() {
         let c = cfg("example.com", true);
         assert_eq!(
-            www_redirect_location(Some("www.example.com.evil.example"), "/", None, &c),
+            www_redirect_location(Some("www.example.com.evil.test"), "/", None, &c),
             None
         );
     }

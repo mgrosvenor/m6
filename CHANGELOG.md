@@ -20,6 +20,18 @@ undeployed, some of it for months.
 `docs/PERFORMANCE.md` has the measured performance story by commit.
 `docs/CONSOLIDATION-TODO.md` has what is done and what is owed.
 
+### What this repository is
+
+**m6 is a generic web system: an HTTP edge and a library for writing services
+behind it.** It is not a website. A site built on m6 is a separate repository
+with its own changelog and its own version numbers, and nothing about any
+particular site's content, fleet or deployment schedule belongs in this file.
+
+The boundary is the wire contract in `docs/m6-backend-protocol.md`, which is
+version 1 and language agnostic, plus `m6-core` for services that want the Rust
+conveniences. Anything that generalises belongs here; anything true only of one
+deployment does not.
+
 ### What 1.0.0 means here
 
 It does not mean finished. It means the consolidation work is done, the checks
@@ -64,10 +76,6 @@ This is the half that mattered most, because most of it had never run.
   m6-core, all conforming to the wire contract, with 13 shared tests running them
   in the build checks. The multi-language promise was written down and never
   exercised until now.
-- **An end-to-end check of the whole 7-node topology** on one machine,
-  `deploy/verify-local.sh` in the site repository: 30 checks covering every node,
-  every page, the cache headers, the cache actually caching, and per-node
-  invalidation.
 
 ### Protocol fixes in this release
 
@@ -108,10 +116,10 @@ Stated here rather than discovered later:
   occasionally turns out to be in use. Two failures in five full runs, the
   mechanism identified, the fix not yet written. It affects the test harness, not
   m6.
-- **`m6-monitor` and the firewall stats collector are deployed nowhere**, so
-  `tools/health-check.py` cannot be retired yet.
-- **Staging cannot exercise the cache role**: single origin, no cache nodes, no
-  WireGuard.
+- **`m6-monitor`'s `/traffic` and `/perf` shapes have moved** since anything was
+  built against them, so a consumer written to the older shape will not find
+  `pools` or a `firewall` field. Whether any given deployment runs it is that
+  deployment's business, not this repository's.
 
 ---
 
@@ -997,7 +1005,7 @@ HTML for cache MISS and HIT, and verified absent on CSS and on llms.txt itself.
 ## 2026-09-06 — HTTP caching correctness
 
 Three defects in the revalidation and caching headers, all raised from a live
-audit of example.com, then reproduced and root-caused here. None is
+audit of a production deployment, then reproduced and root-caused here. None is
 cosmetic: each costs bandwidth or risks a downstream cache serving the wrong
 bytes.
 
