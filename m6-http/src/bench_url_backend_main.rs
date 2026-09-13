@@ -75,16 +75,16 @@ fn parse_args() -> Args {
 // ── TLS server config ─────────────────────────────────────────────────────────
 
 fn make_tls_server_config(cert: &str, key: &str, h2: bool) -> Arc<rustls::ServerConfig> {
-    use rustls_pemfile::{certs, private_key};
-    use std::fs::File;
-    use std::io::BufReader;
+    // See the note in http11.rs: rustls-pemfile is unmaintained
+    // (RUSTSEC-2025-0134) and this is where its code lives now.
+    use rustls_pki_types::pem::PemObject;
+    use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
-    let certs: Vec<_> = certs(&mut BufReader::new(File::open(cert).expect("cert")))
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(cert)
+        .expect("open cert")
         .collect::<Result<_, _>>()
         .expect("parse cert");
-    let pkey = private_key(&mut BufReader::new(File::open(key).expect("key")))
-        .expect("parse key")
-        .expect("no key");
+    let pkey = PrivateKeyDer::from_pem_file(key).expect("parse key");
 
     let mut cfg = rustls::ServerConfig::builder()
         .with_no_client_auth()

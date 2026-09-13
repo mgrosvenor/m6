@@ -20,23 +20,77 @@ all-features = false
 # is green and the exceptions are visible; they are not listed because they are
 # acceptable. All of them are to be resolved before 1.0.
 ignore = [
-    # hpack: the decoder panics on some invalid input, and the crate is
-    # unmaintained. NOT REACHABLE HERE, and checked rather than asserted:
-    # `validate_hpack_block` walks every block before the decoder sees it and
-    # rejects malformed ones with GOAWAY(COMPRESSION_ERROR).
+    # THREE EXCEPTIONS, DOWN FROM FIVE on 2026-09-13 (issue #3). Each one below
+    # states whether the advisory is REACHABLE here and how that was checked,
+    # because the previous version of this file said "see issue #3" for three of
+    # them and the issue had been written before anyone looked.
+
+    # ── hpack: decoder panics on invalid input, and the crate is unmaintained ──
+    #
+    # NOT REACHABLE. `validate_hpack_block` walks every block before the decoder
+    # sees it and rejects malformed ones with GOAWAY(COMPRESSION_ERROR).
     # `m6-http/src/http2.rs`'s `hpack_robustness` tests run hostile blocks
     # through the production sequence and fail if any survives validation and
-    # panics. The maintained fork has the identical bug, so switching crates
-    # is not a fix.
+    # panics. The maintained fork has the identical bug, so switching crates is
+    # not a fix.
     { id = "RUSTSEC-2023-0084", reason = "decoder panic not reachable: validate_hpack_block rejects first, pinned by http2::hpack_robustness" },
     { id = "RUSTSEC-2023-0085", reason = "unmaintained; the fork has the same bug, and our own validator is the defence" },
 
-    # The rest, tracked together.
-    # → https://github.com/mgrosvenor/m6/issues/3
-    { id = "RUSTSEC-2025-0134", reason = "see issue #3" },
-    { id = "RUSTSEC-2026-0235", reason = "see issue #3" },
-    { id = "RUSTSEC-2026-0253", reason = "see issue #3" },
+    # ── rkyv 0.7.46: out-of-bounds read from insufficient archive validation ───
+    #
+    # NOT REACHABLE, and checked rather than asserted, 2026-09-13.
+    #
+    # How it gets here:
+    #   rkyv 0.7.46 <- parcel_sourcemap 2.1.1 <- lightningcss 1.0.0-alpha.72
+    #                 <- minify-html 0.15 <- m6-core
+    #
+    # The advisory is about the CHECKED validation APIs: `rkyv::access` and
+    # `rkyv::from_bytes` could return a slice with a forged length when an
+    # archive carries several Rc/Arc pointers sharing an address with different
+    # metadata. It needs an attacker-supplied rkyv ARCHIVE.
+    #
+    # Three things, each verifiable:
+    #   1. parcel_sourcemap's only deserialisation entry point is
+    #      `SourceMap::from_buffer` (src/lib.rs:355), and it uses the UNCHECKED
+    #      `archived_root`, not the checked APIs the advisory concerns.
+    #   2. lightningcss never calls `from_buffer`. It uses parcel_sourcemap to
+    #      BUILD sourcemaps, not to read archives.
+    #      grep -r from_buffer <lightningcss>/src  -> nothing
+    #   3. m6 mentions sourcemaps nowhere and calls rkyv nowhere.
+    #      grep -ri 'sourcemap\|source_map' m6-*/src  -> nothing
+    #      grep -r 'rkyv::\|archived_root' m6-*/src   -> nothing
+    #
+    # So nothing in this tree feeds bytes to rkyv at all, let alone attacker
+    # bytes through a checked API.
+    #
+    # AND IT CANNOT BE PATCHED HERE: the fix is rkyv >= 0.8.17 and lightningcss
+    # pins the 0.7 series, which the advisory says is affected and unmaintained.
+    # Removing it means dropping CSS minification or replacing lightningcss, and
+    # neither is worth doing for an unreachable path. Re-check if lightningcss
+    # ever moves to rkyv 0.8, or if we start reading sourcemaps.
+    { id = "RUSTSEC-2026-0235", reason = "rkyv only reached via lightningcss sourcemap building; its one deserialise entry point is never called, and m6 touches no archives. Cannot patch: lightningcss pins 0.7" },
 ]
+
+# ── RESOLVED on 2026-09-13, issue #3, rather than documented ──────────────────
+#
+# Two exceptions were deleted instead of explained, because both had a fix:
+#
+# RUSTSEC-2025-0134, rustls-pemfile 2.2.0, unmaintained. There was no
+#   vulnerability at all: `informational = "unmaintained"`, `patched = []`, the
+#   repository archived in August 2025. Its own advisory says the code now lives
+#   in rustls-pki-types behind the `PemObject` trait, and rustls already pulls
+#   that in, so migrating m6-http's two call sites added no dependency and
+#   removed one. The replacement is also shorter: `pem_file_iter` and
+#   `from_pem_file` open the file themselves. rustls-pemfile is now absent from
+#   Cargo.lock entirely.
+#
+# RUSTSEC-2026-0253, lru 0.16.4, use-after-free via a panicking key Drop in
+#   `pop()`. It WAS a production dependency, in m6-core's `ParamsCache`
+#   (app.rs:380), so not dismissible as dev-only. It was also not reachable: the
+#   advisory needs a key type whose `Drop` can panic, and the key is `String`,
+#   whose Drop is a deallocation. Bumped to 0.18.4 anyway, which is past the
+#   patched 0.18.2, because a bump that costs nothing beats an argument that has
+#   to be re-read every time someone audits this file. No API change.
 
 [licenses]
 # BSD-3-Clause ourselves, and permissive licences only in the tree. A copyleft
@@ -85,11 +139,33 @@ unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 
-# quiche is m6-http's HTTP/3 and QUIC implementation. It is taken from
-# Cloudflare's repository rather than crates.io and pinned to a tag, which is
-# deliberate: the crates.io releases lag, and HTTP/3 is the one place this
-# project does not write its own protocol implementation.
+# quiche is m6-http's HTTP/3 and QUIC implementation. It comes from git rather
+# than crates.io deliberately: the crates.io releases lag, and HTTP/3 is the one
+# place this project does not write its own protocol implementation.
 #
-# Listed explicitly so that adding a *second* git dependency is a decision
-# somebody makes rather than something that arrives with a transitive update.
-allow-git = ["https://github.com/cloudflare/quiche"]
+# BOTH URLS ARE LISTED, and the fork is the one actually used.
+#
+# `mgrosvenor/quiche` is quiche master plus two open upstream pull requests,
+# adopted 2026-09-13 because released quiche scores 37/49 on h3spec and the fork
+# scores 47/49. See m6-http/Cargo.toml and tools/conformance-scores.txt for the
+# whole story. It is meant to be temporary: when upstream releases those fixes,
+# m6-http goes back to a cloudflare tag and the fork entry below should be
+# deleted rather than left to rot.
+#
+# `cloudflare/quiche` stays listed for that return, which is why cargo-deny
+# reports an `unmatched-source` warning for it today. That warning is the correct
+# state of affairs and not something to silence.
+#
+# THIS LIST IS WHY CI WENT RED AND THE BUILD HOST DID NOT. Repointing m6-http at
+# the fork changed the source and nothing updated this, so `cargo deny` failed on
+# every push from 2026-09-13 06:41 onwards while `deploy/run-tests.sh` kept
+# saying everything passed. cargo-deny runs ONLY in CI: the build host has no
+# cargo-deny and run-tests.sh does not call it. A gate that runs in one place
+# only is the third time this project has been caught by that shape.
+#
+# Listed explicitly so that adding another git dependency is a decision somebody
+# makes rather than something that arrives with a transitive update.
+allow-git = [
+    "https://github.com/mgrosvenor/quiche",
+    "https://github.com/cloudflare/quiche",
+]
