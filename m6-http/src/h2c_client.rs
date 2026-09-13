@@ -434,7 +434,7 @@ impl H2cClientConn {
                                     self.mark_dead("h2c: INITIAL_WINDOW_SIZE above 2^31-1");
                                     return;
                                 }
-                                5 if val >= 16_384 && val <= 16_777_215 => {
+                                5 if (16_384..=16_777_215).contains(&val) => {
                                     self.peer_max_frame = val
                                 }
                                 _ => {}
@@ -634,8 +634,8 @@ impl H2cClientConn {
                 // WINDOW_UPDATE fell through to the catch-all and was discarded,
                 // so a peer that granted credit per stream rather than per
                 // connection was never heard.
-                TYPE_WINDOW_UPDATE if stream_id > 0 => {
-                    if payload.len() >= 4 {
+                TYPE_WINDOW_UPDATE if stream_id > 0
+                    && payload.len() >= 4 => {
                         let inc = (((payload[0] as u32) << 24)
                             | ((payload[1] as u32) << 16)
                             | ((payload[2] as u32) << 8)
@@ -669,7 +669,6 @@ impl H2cClientConn {
                             }
                         }
                     }
-                }
 
                 _ => {
                     // Ignore all other frame types
@@ -750,6 +749,12 @@ impl H2cClientConn {
 pub struct H2cClientPool {
     /// backend base_url → connection
     connections: HashMap<String, H2cClientConn>,
+}
+
+impl Default for H2cClientPool {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl H2cClientPool {

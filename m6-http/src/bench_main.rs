@@ -533,7 +533,7 @@ impl H2Client {
                 Ok(_) => {
                     self.conn
                         .process_new_packets()
-                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                        .map_err(|e| io::Error::other(e.to_string()))?;
                     break; // got at least one TLS record
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -572,7 +572,7 @@ impl H2Client {
                 Ok(_) => {
                     self.conn
                         .process_new_packets()
-                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                        .map_err(|e| io::Error::other(e.to_string()))?;
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => return Err(e),

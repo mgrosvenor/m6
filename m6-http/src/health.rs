@@ -277,7 +277,7 @@ mod traffic_endpoint_tests {
         let (code, _, body) = out.into_response();
         assert_eq!(code, 503);
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(v["error"].as_str().unwrap_or("").len() > 0);
+        assert!(!v["error"].as_str().unwrap_or("").is_empty());
     }
 
     #[test]
@@ -318,12 +318,11 @@ mod traffic_endpoint_tests {
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["node"], "sydney");
         assert_eq!(v["total_requests"], 2);
-        assert_eq!(
+        assert!(
             v["crawlers"][0]["user_agent"]
                 .as_str()
                 .unwrap()
-                .contains("ClaudeBot"),
-            true
+                .contains("ClaudeBot")
         );
         assert!(v["logging"].is_object(), "logging health travels with it");
         // Never cached by anything in between.

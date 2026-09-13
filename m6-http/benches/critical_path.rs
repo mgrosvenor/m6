@@ -337,7 +337,7 @@ fn bench_chunked_body_accumulation(c: &mut Criterion) {
         let head =
             format!("POST /upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: {body}\r\n\r\n");
         let mut full = head.into_bytes();
-        full.extend(std::iter::repeat(b'x').take(body));
+        full.extend(std::iter::repeat_n(b'x', body));
         let kib = body / 1024;
 
         // What the code used to do: clone the accumulated buffer every read

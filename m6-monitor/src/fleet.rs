@@ -162,7 +162,7 @@ role = "cache"
     #[test]
     fn the_token_is_read_from_a_file_never_from_the_config() {
         let mut tok = tempfile::NamedTempFile::new().unwrap();
-        write!(tok, "s3cret\n").unwrap();
+        writeln!(tok, "s3cret").unwrap();
         let mut f = tempfile::NamedTempFile::new().unwrap();
         write!(
             f,
@@ -183,7 +183,7 @@ role = "cache"
     #[test]
     fn a_node_token_overrides_the_fleet_token() {
         let mut per_node = tempfile::NamedTempFile::new().unwrap();
-        write!(per_node, "node-token\n").unwrap();
+        writeln!(per_node, "node-token").unwrap();
 
         let n = Node {
             name: "edge-a".into(),

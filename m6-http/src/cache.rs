@@ -460,6 +460,12 @@ pub struct Cache {
     max_bytes: usize,
 }
 
+impl Default for Cache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Cache {
     pub fn new() -> Self {
         Self::with_max_bytes(DEFAULT_MAX_BYTES)
