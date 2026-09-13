@@ -247,14 +247,11 @@ fn handle_h2_conn(mut stream: impl Read + Write) {
             recv_buf.drain(..9 + length);
 
             match ftype {
-                FT_SETTINGS => {
-                    if flags & FL_ACK == 0 {
-                        // Client's SETTINGS — ACK it.
-                        push_frame(&mut send_buf, FT_SETTINGS, FL_ACK, 0, &[]);
-                    }
-                    // If it's our SETTINGS ACK, nothing to do.
+                FT_SETTINGS if flags & FL_ACK == 0 => {
+                    // Client's SETTINGS — ACK it.
+                    push_frame(&mut send_buf, FT_SETTINGS, FL_ACK, 0, &[]);
                 }
-
+                // If it's our SETTINGS ACK, nothing to do.
                 FT_HEADERS if sid > 0 => {
                     // Decode to keep HPACK state consistent; ignore the result.
                     let _ = hpack_dec.decode(&payload);
@@ -270,13 +267,11 @@ fn handle_h2_conn(mut stream: impl Read + Write) {
                     }
                 }
 
-                FT_DATA if sid > 0 => {
-                    if flags & FL_END_STREAM != 0 {
-                        // Body complete — send response if this was a queued stream.
-                        if let Some(pos) = pending.iter().position(|&s| s == sid) {
-                            pending.remove(pos);
-                            send_response(&mut send_buf, &mut hpack_enc, sid);
-                        }
+                FT_DATA if sid > 0 && flags & FL_END_STREAM != 0 => {
+                    // Body complete — send response if this was a queued stream.
+                    if let Some(pos) = pending.iter().position(|&s| s == sid) {
+                        pending.remove(pos);
+                        send_response(&mut send_buf, &mut hpack_enc, sid);
                     }
                 }
 
@@ -284,10 +279,8 @@ fn handle_h2_conn(mut stream: impl Read + Write) {
                     // Ignore flow control for bench (responses fit in default window).
                 }
 
-                FT_PING => {
-                    if flags & FL_ACK == 0 && payload.len() == 8 {
-                        push_frame(&mut send_buf, FT_PING, FL_ACK, 0, &payload);
-                    }
+                FT_PING if flags & FL_ACK == 0 && payload.len() == 8 => {
+                    push_frame(&mut send_buf, FT_PING, FL_ACK, 0, &payload);
                 }
 
                 FT_GOAWAY => return,

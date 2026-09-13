@@ -1183,9 +1183,7 @@ fn parse_url_scheme_authority(url: &str) -> io::Result<(String, String)> {
     let scheme = url[..idx].to_lowercase();
     let rest = &url[idx + sep.len()..];
     // Authority ends at the first `/`, `?`, or `#`
-    let auth_end = rest
-        .find(['/', '?', '#'])
-        .unwrap_or(rest.len());
+    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let authority = rest[..auth_end].to_string();
     Ok((scheme, authority))
 }

@@ -207,6 +207,19 @@ enum FrameVerdict {
     StreamError(u32),
 }
 
+/// A synchronous H2 response, as the handler produced it.
+///
+/// These four travelled as four separate arguments to `dispatch_h2_response`,
+/// which put it at nine and made the call site a column of bare values whose
+/// order was the only thing saying which was which. They are one thing: the
+/// response.
+struct H2Response {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+    hints: std::sync::Arc<Vec<String>>,
+}
+
 struct H2Stream {
     state: StreamState,
     headers: Vec<(String, String)>,
@@ -1040,7 +1053,10 @@ impl Http2Conn {
                     }
                     self.peer_max_frame = val;
                 }
-                SETTING_MAX_CONCURRENT_STREAMS | _ => {}
+                // Every other setting, MAX_CONCURRENT_STREAMS included, is
+                // accepted and ignored: the wildcard already covered it, and
+                // naming it alongside claimed a handling it never had.
+                _ => {}
             }
             i += 6;
         }
@@ -1529,10 +1545,12 @@ impl Http2Conn {
                 let method = req.method.clone();
                 self.dispatch_h2_response(
                     stream_id,
-                    status,
-                    resp_headers,
-                    resp_body,
-                    hints,
+                    H2Response {
+                        status,
+                        headers: resp_headers,
+                        body: resp_body,
+                        hints,
+                    },
                     on_request,
                     &client_ip,
                     &method,
@@ -1551,16 +1569,19 @@ impl Http2Conn {
     fn dispatch_h2_response<F>(
         &mut self,
         stream_id: u32,
-        status: u16,
-        resp_headers: Vec<(String, String)>,
-        resp_body: Vec<u8>,
-        hints: std::sync::Arc<Vec<String>>,
+        resp: H2Response,
         on_request: &mut F,
         client_ip: &str,
         method: &str,
     ) where
         F: FnMut(&HttpRequest, &str) -> RequestOutcome,
     {
+        let H2Response {
+            status,
+            headers: resp_headers,
+            body: resp_body,
+            hints,
+        } = resp;
         if !hints.is_empty() {
             if self.enable_push {
                 // ── HTTP/2 Server Push ─────────────────────────────────────

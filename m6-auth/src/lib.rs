@@ -119,8 +119,13 @@ impl Db {
         Ok(Db(conn))
     }
 
-    pub fn close(self) -> std::result::Result<(), (Connection, rusqlite::Error)> {
-        self.0.close()
+    /// Close the database, handing the `Connection` back on failure so the
+    /// caller can retry with it. That is rusqlite's own signature for `close`,
+    /// and it is the reason the error is large: it carries a whole connection.
+    /// Boxed so that size sits on the failure path rather than in every
+    /// `Result` this function returns.
+    pub fn close(self) -> std::result::Result<(), Box<(Connection, rusqlite::Error)>> {
+        self.0.close().map_err(Box::new)
     }
 
     // ── helpers ──────────────────────────────────────────────────────────────
@@ -540,8 +545,12 @@ impl Db {
             "SELECT id, user_id, name, created_at, expires_at
              FROM api_tokens WHERE user_id = ?1 ORDER BY created_at DESC",
         )?;
-        let rows: std::result::Result<Vec<(String, String, String, i64, i64)>, rusqlite::Error> =
-            stmt.query_map(params![user_id], |row| {
+        /// One `api_tokens` row as the query returns it: id, user_id, name,
+        /// created_at, expires_at. Named because five positional columns in a
+        /// bare tuple is exactly where a column order mistake hides.
+        type TokenRow = (String, String, String, i64, i64);
+        let rows: std::result::Result<Vec<TokenRow>, rusqlite::Error> = stmt
+            .query_map(params![user_id], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
