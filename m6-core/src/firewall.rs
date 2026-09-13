@@ -220,7 +220,7 @@ mod tests {
     fn an_allowed_source_is_not_a_block() {
         let json = r#"{"nftables":[
           {"rule":{"family":"ip","table":"filter","chain":"ufw-user-input","handle":4,
-            "expr":[{"match":{"op":"==","left":{"payload":{"protocol":"ip","field":"saddr"}},"right":"10.0.0.4"}},
+            "expr":[{"match":{"op":"==","left":{"payload":{"protocol":"ip","field":"saddr"}},"right":"192.0.2.4"}},
                     {"counter":{"packets":5,"bytes":300}},{"accept":null}]}}
         ]}"#;
         let s = FirewallState::from_nft_json(json).unwrap();

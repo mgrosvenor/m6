@@ -100,7 +100,7 @@ deployed, freeze intact**.
 
 ### The Linux build host works, and closed the oldest unverified item
 
-`deploy/run-tests.sh` rsyncs both trees to `root@45.63.29.146` **port 4022** and
+`deploy/run-tests.sh` rsyncs both trees to `root@<build-host>` **port 4022** and
 enforces zero warnings on Linux. **It needs no push, only a committed tree.**
 Result: **m6 962 passed, renderers 9 passed, 0 failed, 0 warnings** on release
 and test builds, same test count as macOS.
@@ -162,8 +162,8 @@ targets.
   which renders every HTML page at ~6ms, runs **1** (no `size` line). The 32
   was raised reactively after the gallery exhausted the default.
 - **The health check tool has a bug**: over windows longer than ~60 minutes the
-  UA-rotation heuristic flags the backbone addresses `10.0.0.4` (lon) and
-  `10.0.0.5` (chi) as forging bot UAs, because a cache node relays real
+  UA-rotation heuristic flags the backbone addresses `192.0.2.4` (lon) and
+  `192.0.2.5` (chi) as forging bot UAs, because a cache node relays real
   clients' agents. It then **excludes those requests from crawler counts**, so
   wide-window crawler totals are understated. Not yet fixed.
 
@@ -210,7 +210,7 @@ the fleet cannot report that the fleet is down. `deploy/FLEET-MONITOR.md` in
 the site repo is the runbook; `deploy/ORIGIN-NODE.md` is what is origin-only.
 
 **The WireGuard mesh is not a path to those endpoints.** Measured: origin's
-`10.0.0.1:80` is h2c-only and does not answer HTTP/1.1 at all, and the cache
+`192.0.2.1:80` is h2c-only and does not answer HTTP/1.1 at all, and the cache
 nodes have *no* backbone listener. It polls the per-node public names instead,
 which means it measures through each node's public edge and is **not**
 comparable with the loopback TTFB.
@@ -257,7 +257,7 @@ renderers switched to m6-core.
   reasoning behind it was backwards.**
 
   The 1.7-2.2us band is not a guess and was not derived "some other way". It is
-  a recorded production measurement in `~/dr-grosvenor-site/docs/RELEASES.md`,
+  a recorded production measurement in `the deployment repository/docs/RELEASES.md`,
   taken with **the same instrument, on the same node, by the same method** as
   every reading since: m6's own `hit_p50_ns`, over loaded windows on the origin.
 

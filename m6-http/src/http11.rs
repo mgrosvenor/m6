@@ -1538,7 +1538,9 @@ mod h2c_trust_tests {
     #[test]
     fn only_a_private_bind_is_trusted() {
         for private in [
-            "10.0.0.1:80", // the production backbone address
+            // RFC 1918 space: private is the property under test here, not
+            // any particular deployment's addressing.
+            "10.0.0.1:80",
             "10.0.0.4:8080",
             "172.16.0.1:80",
             "192.168.1.1:80",

@@ -125,7 +125,7 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
         if !r.is_up() {
             let why = r.unreachable.as_deref().unwrap_or("no reason given");
             // Naming the address matters: "chi is unreachable" and "chi is
-            // unreachable at 10.0.0.5" are different problems, and the second
+            // unreachable at 192.0.2.5" are different problems, and the second
             // one is the one where the fleet config is what is wrong.
             findings.push(Finding {
                 level: Level::Fault,

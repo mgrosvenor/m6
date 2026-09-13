@@ -35,8 +35,11 @@ note "checking out develop"
 git checkout develop --quiet || die "no develop branch"
 git pull --ff-only --quiet || die "develop has diverged from origin"
 
-SITE="${SITE_REPO:-$HOME/dr-grosvenor-site}"
-[[ -x "$SITE/deploy/run-tests.sh" ]] || die "cannot find $SITE/deploy/run-tests.sh (set SITE_REPO)"
+# Which deployment repository runs the checks is a property of this working
+# copy, not of m6. See tools/find-deployment.sh.
+# shellcheck source=tools/find-deployment.sh
+. "$(dirname "$0")/find-deployment.sh"
+SITE="$(_m6_find_deployment "$(cd "$(dirname "$0")/.." && pwd)")" || exit 1
 note "running everything on the build host before cutting $TAG"
 ( cd "$SITE" && ./deploy/run-tests.sh ) || die "checks failed. No release."
 

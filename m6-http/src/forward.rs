@@ -60,7 +60,7 @@ pub const UNTRUSTED_INBOUND: &[&str] = &[
 /// downstream has ever been allowed to look at it.
 ///
 /// That is right for the public listener and wrong for the backbone. A cache
-/// node forwards to origin over `h2c://10.0.0.1:80` and already sends the real
+/// node forwards to origin over `h2c://192.0.2.1:80` and already sends the real
 /// client IP (`h2c_client.rs`), so origin was stripping the one accurate
 /// answer it had and attributing every relayed request to the tunnel address.
 /// The visible cost was analytics: three of five crawler sightings in an hour
@@ -1552,10 +1552,7 @@ mod smuggling_tests {
             ],
             body: b"a=1".to_vec(),
         };
-        assert_eq!(
-            check_forwardable(&r, "203.0.113.7", "mgrosvenor.com"),
-            Ok(())
-        );
+        assert_eq!(check_forwardable(&r, "203.0.113.7", "example.com"), Ok(()));
     }
 }
 
@@ -1913,7 +1910,7 @@ mod via_and_connection_tests {
     fn via_does_not_disclose_internal_topology() {
         let out = serialised(&req(&[], "HTTP/1.1"));
         let via = header_values(&out, "via").join(" ");
-        for leak in ["syd", "lon", "chi", "mgrosvenor", "backend.internal"] {
+        for leak in ["node-a", "node-b", "node-c", "example", "backend.internal"] {
             assert!(!via.contains(leak), "Via leaks {leak:?}: {via}");
         }
     }
@@ -1943,16 +1940,16 @@ mod forwarded_trust_tests {
     #[test]
     fn the_backbone_attributes_to_the_forwarded_address() {
         assert_eq!(
-            attributed_client_ip(Some("203.0.113.9"), "10.0.0.4", ForwardedTrust::Backbone),
+            attributed_client_ip(Some("203.0.113.9"), "192.0.2.4", ForwardedTrust::Backbone),
             "203.0.113.9"
         );
         assert_eq!(
-            attributed_client_ip(Some(" 203.0.113.9 "), "10.0.0.4", ForwardedTrust::Backbone),
+            attributed_client_ip(Some(" 203.0.113.9 "), "192.0.2.4", ForwardedTrust::Backbone),
             "203.0.113.9",
             "surrounding whitespace is field syntax, not part of the address"
         );
         assert_eq!(
-            attributed_client_ip(Some("2001:db8::1"), "10.0.0.4", ForwardedTrust::Backbone),
+            attributed_client_ip(Some("2001:db8::1"), "192.0.2.4", ForwardedTrust::Backbone),
             "2001:db8::1"
         );
     }
@@ -1963,8 +1960,8 @@ mod forwarded_trust_tests {
     #[test]
     fn a_missing_forwarded_address_falls_back_to_the_peer() {
         assert_eq!(
-            attributed_client_ip(None, "10.0.0.4", ForwardedTrust::Backbone),
-            "10.0.0.4"
+            attributed_client_ip(None, "192.0.2.4", ForwardedTrust::Backbone),
+            "192.0.2.4"
         );
     }
 
@@ -1979,8 +1976,8 @@ mod forwarded_trust_tests {
     #[test]
     fn anything_but_a_single_address_is_refused() {
         for bad in [
-            "203.0.113.9, 10.0.0.4",
-            "203.0.113.9,10.0.0.4",
+            "203.0.113.9, 192.0.2.4",
+            "203.0.113.9,192.0.2.4",
             "",
             "   ",
             "localhost",
@@ -1990,8 +1987,8 @@ mod forwarded_trust_tests {
         ] {
             assert_eq!(sole_forwarded_ip(bad), None, "{bad:?} should be refused");
             assert_eq!(
-                attributed_client_ip(Some(bad), "10.0.0.4", ForwardedTrust::Backbone),
-                "10.0.0.4",
+                attributed_client_ip(Some(bad), "192.0.2.4", ForwardedTrust::Backbone),
+                "192.0.2.4",
                 "{bad:?} was believed on the backbone"
             );
         }
@@ -2003,8 +2000,8 @@ mod forwarded_trust_tests {
     #[test]
     fn the_attributed_address_is_always_a_parseable_address_or_the_peer() {
         let huge = "a".repeat(10_000);
-        let out = attributed_client_ip(Some(&huge), "10.0.0.4", ForwardedTrust::Backbone);
-        assert_eq!(out, "10.0.0.4");
+        let out = attributed_client_ip(Some(&huge), "192.0.2.4", ForwardedTrust::Backbone);
+        assert_eq!(out, "192.0.2.4");
     }
 
     /// `x-forwarded-for` stays in the set stripped from every inbound request

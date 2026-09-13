@@ -36,7 +36,7 @@ pub struct SiteConfig {
     /// ranking signals across both until they do.
     ///
     /// Only the `www.` alias is redirected, never an arbitrary unrecognised
-    /// Host. Node hostnames (`syd.mgrosvenor.com`) must keep serving directly,
+    /// Host. Node hostnames (`node-a.example.com`) must keep serving directly,
     /// because per-node verification depends on reaching a specific node by
     /// name rather than through the GeoDNS-routed apex.
     #[serde(default = "default_true")]

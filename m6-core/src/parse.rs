@@ -351,7 +351,7 @@ mod chunked_head_tests {
 
     fn browser_request() -> Vec<u8> {
         b"GET /capabilities HTTP/1.1\r\n\
-Host: mgrosvenor.com\r\n\
+Host: example.com\r\n\
 User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36\r\n\
 Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n\

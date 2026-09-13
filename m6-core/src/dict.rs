@@ -147,7 +147,7 @@ mod tests {
 
     fn base() -> Arc<Map<String, Value>> {
         let mut m = Map::new();
-        m.insert("site_name".into(), json!("mgrosvenor.com"));
+        m.insert("site_name".into(), json!("example.com"));
         m.insert("year".into(), json!("1999"));
         Arc::new(m)
     }
@@ -196,7 +196,7 @@ mod tests {
             seen,
             vec![
                 ("extra".to_string(), json!(1)),
-                ("site_name".to_string(), json!("mgrosvenor.com")),
+                ("site_name".to_string(), json!("example.com")),
                 ("year".to_string(), json!("2026")),
             ]
         );
@@ -220,7 +220,7 @@ mod tests {
         let mut d = Dict::with_base(base());
         d.insert("year".into(), json!("2026"));
         let m = d.to_map();
-        assert_eq!(m.get("site_name").unwrap(), &json!("mgrosvenor.com"));
+        assert_eq!(m.get("site_name").unwrap(), &json!("example.com"));
         assert_eq!(m.get("year").unwrap(), &json!("2026"));
         assert_eq!(m.len(), 2);
     }

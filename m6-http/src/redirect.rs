@@ -192,7 +192,7 @@ mod tests {
     use super::*;
 
     fn request(method: &str, target: &str) -> HttpRequest {
-        let raw = format!("{method} {target} HTTP/1.1\r\nHost: mgrosvenor.com\r\n\r\n");
+        let raw = format!("{method} {target} HTTP/1.1\r\nHost: example.com\r\n\r\n");
         match m6_core::h1::parse_request(raw.as_bytes()) {
             m6_core::h1::ParseResult::Complete(r) => r,
             _ => panic!("fixture did not parse: {raw:?}"),
@@ -245,13 +245,13 @@ mod tests {
         assert_eq!(status_of(&out), 301);
         assert_eq!(
             header_of(&out, "location").as_deref(),
-            Some("https://mgrosvenor.com/capabilities?v=1")
+            Some("https://example.com/capabilities?v=1")
         );
 
         let out = redirect_for(&request("GET", "http://elsewhere.example/x"));
         assert_eq!(
             header_of(&out, "location").as_deref(),
-            Some("https://mgrosvenor.com/x"),
+            Some("https://example.com/x"),
             "the Location host comes from Host, never from the request target"
         );
     }
@@ -272,7 +272,7 @@ mod tests {
         assert!(!host_is_safe("a/b"));
         assert!(!host_is_safe("a b"));
         assert!(!host_is_safe(""));
-        assert!(host_is_safe("mgrosvenor.com"));
-        assert!(host_is_safe("mgrosvenor.com:8443"));
+        assert!(host_is_safe("example.com"));
+        assert!(host_is_safe("example.com:8443"));
     }
 }

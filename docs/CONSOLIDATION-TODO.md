@@ -983,7 +983,7 @@ here, 15 ahead of `d6ebfa5` in the site repo. The freeze holds until the
 migration finishes; that is the owner's standing instruction.
 
 The deployed commit is whatever the newest entry in
-`~/dr-grosvenor-site/docs/RELEASES.md` names. Recompute from it; the previous
+`the deployment repository/docs/RELEASES.md` names. Recompute from it; the previous
 figure here named `b32e837`, which the 2026-09-10 18:47 deploy had already
 superseded.
 

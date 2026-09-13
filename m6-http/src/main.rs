@@ -1898,7 +1898,7 @@ fn send_h3_response(
 /// one place further down.
 ///
 /// Only the exact `www.` alias redirects. An arbitrary unrecognised Host is
-/// served normally, because node hostnames (`syd.mgrosvenor.com`) have to keep
+/// served normally, because node hostnames (`node-a.example.com`) have to keep
 /// answering directly — per-node verification depends on reaching one specific
 /// node by name instead of through the GeoDNS-routed apex.
 fn www_redirect_location(
@@ -4018,33 +4018,29 @@ mod www_redirect_tests {
 
     #[test]
     fn redirects_www_to_apex_preserving_path_and_query() {
-        let c = cfg("mgrosvenor.com", true);
+        let c = cfg("example.com", true);
         assert_eq!(
             www_redirect_location(
-                Some("www.mgrosvenor.com"),
+                Some("www.example.com"),
                 "/capabilities",
                 Some("a=1&b=2"),
                 &c
             ),
-            Some("https://mgrosvenor.com/capabilities?a=1&b=2".to_string())
+            Some("https://example.com/capabilities?a=1&b=2".to_string())
         );
         assert_eq!(
-            www_redirect_location(Some("www.mgrosvenor.com"), "/", None, &c),
-            Some("https://mgrosvenor.com/".to_string())
+            www_redirect_location(Some("www.example.com"), "/", None, &c),
+            Some("https://example.com/".to_string())
         );
     }
 
     #[test]
     fn host_matching_is_case_insensitive_and_port_tolerant() {
-        let c = cfg("mgrosvenor.com", true);
-        for host in [
-            "WWW.mgrosvenor.com",
-            "Www.MGrosvenor.Com",
-            "www.mgrosvenor.com:80",
-        ] {
+        let c = cfg("example.com", true);
+        for host in ["WWW.example.com", "Www.ExAmPle.Com", "www.example.com:80"] {
             assert_eq!(
                 www_redirect_location(Some(host), "/x", None, &c),
-                Some("https://mgrosvenor.com/x".to_string()),
+                Some("https://example.com/x".to_string()),
                 "host {host} should redirect"
             );
         }
@@ -4053,9 +4049,9 @@ mod www_redirect_tests {
     /// The apex itself must not redirect, or every request loops forever.
     #[test]
     fn apex_is_left_alone() {
-        let c = cfg("mgrosvenor.com", true);
+        let c = cfg("example.com", true);
         assert_eq!(
-            www_redirect_location(Some("mgrosvenor.com"), "/", None, &c),
+            www_redirect_location(Some("example.com"), "/", None, &c),
             None
         );
     }
@@ -4064,10 +4060,10 @@ mod www_redirect_tests {
     /// depends on reaching one specific node by name, not via the GeoDNS apex.
     #[test]
     fn other_hosts_are_left_alone() {
-        let c = cfg("mgrosvenor.com", true);
+        let c = cfg("example.com", true);
         for host in [
-            "syd.mgrosvenor.com",
-            "lon.mgrosvenor.com",
+            "node-a.example.com",
+            "node-b.example.com",
             "evil.example",
             "www.evil.example",
         ] {
@@ -4082,9 +4078,9 @@ mod www_redirect_tests {
     /// `www.` prefixing a *different* domain is not this site's www alias.
     #[test]
     fn www_of_another_domain_is_not_our_alias() {
-        let c = cfg("mgrosvenor.com", true);
+        let c = cfg("example.com", true);
         assert_eq!(
-            www_redirect_location(Some("www.mgrosvenor.com.evil.example"), "/", None, &c),
+            www_redirect_location(Some("www.example.com.evil.test"), "/", None, &c),
             None
         );
     }
@@ -4093,24 +4089,24 @@ mod www_redirect_tests {
     /// bytes -- otherwise this is an open redirect.
     #[test]
     fn never_echoes_the_client_supplied_host() {
-        let c = cfg("mgrosvenor.com", true);
-        let got = www_redirect_location(Some("www.mgrosvenor.com"), "/x", None, &c).unwrap();
-        assert!(got.starts_with("https://mgrosvenor.com/"), "got {got}");
+        let c = cfg("example.com", true);
+        let got = www_redirect_location(Some("www.example.com"), "/x", None, &c).unwrap();
+        assert!(got.starts_with("https://example.com/"), "got {got}");
     }
 
     #[test]
     fn rejects_control_characters_rather_than_injecting_headers() {
-        let c = cfg("mgrosvenor.com", true);
+        let c = cfg("example.com", true);
         assert_eq!(
-            www_redirect_location(Some("www.mgrosvenor.com"), "/x\r\nX-Injected: 1", None, &c),
+            www_redirect_location(Some("www.example.com"), "/x\r\nX-Injected: 1", None, &c),
             None
         );
         assert_eq!(
-            www_redirect_location(Some("www.mgrosvenor.com"), "/x", Some("a=1\r\nX-I: 1"), &c),
+            www_redirect_location(Some("www.example.com"), "/x", Some("a=1\r\nX-I: 1"), &c),
             None
         );
         assert_eq!(
-            www_redirect_location(Some("www.mgrosvenor.com"), "/x\0y", None, &c),
+            www_redirect_location(Some("www.example.com"), "/x\0y", None, &c),
             None
         );
     }
@@ -4119,15 +4115,15 @@ mod www_redirect_tests {
     fn disabled_by_config_and_absent_host() {
         assert_eq!(
             www_redirect_location(
-                Some("www.mgrosvenor.com"),
+                Some("www.example.com"),
                 "/",
                 None,
-                &cfg("mgrosvenor.com", false)
+                &cfg("example.com", false)
             ),
             None
         );
         assert_eq!(
-            www_redirect_location(None, "/", None, &cfg("mgrosvenor.com", true)),
+            www_redirect_location(None, "/", None, &cfg("example.com", true)),
             None
         );
     }
@@ -4135,7 +4131,7 @@ mod www_redirect_tests {
     /// A bare "www." with nothing after it must not panic or match.
     #[test]
     fn degenerate_hosts_do_not_panic() {
-        let c = cfg("mgrosvenor.com", true);
+        let c = cfg("example.com", true);
         for host in ["www.", "www", "", ":80", "."] {
             assert_eq!(
                 www_redirect_location(Some(host), "/", None, &c),

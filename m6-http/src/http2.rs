@@ -3573,7 +3573,7 @@ mod forwarded_client_ip_tests {
     fn a_backbone_connection_attributes_to_the_relayed_address() {
         let (ip, survived) = attributed(
             Http2Conn::new().trusting_forwarded_for(),
-            "10.0.0.4",
+            "192.0.2.4",
             Some("203.0.113.9"),
         );
         assert_eq!(ip, "203.0.113.9");
@@ -3588,8 +3588,8 @@ mod forwarded_client_ip_tests {
     /// checks arrive with no forwarded address.
     #[test]
     fn a_backbone_connection_without_one_falls_back_to_the_peer() {
-        let (ip, _) = attributed(Http2Conn::new().trusting_forwarded_for(), "10.0.0.4", None);
-        assert_eq!(ip, "10.0.0.4");
+        let (ip, _) = attributed(Http2Conn::new().trusting_forwarded_for(), "192.0.2.4", None);
+        assert_eq!(ip, "192.0.2.4");
     }
 
     /// A list did not come from a cache node, which emits exactly one value.
@@ -3597,10 +3597,10 @@ mod forwarded_client_ip_tests {
     fn a_backbone_connection_refuses_a_list() {
         let (ip, _) = attributed(
             Http2Conn::new().trusting_forwarded_for(),
-            "10.0.0.4",
+            "192.0.2.4",
             Some("203.0.113.9, 192.0.2.1"),
         );
-        assert_eq!(ip, "10.0.0.4");
+        assert_eq!(ip, "192.0.2.4");
     }
 }
 

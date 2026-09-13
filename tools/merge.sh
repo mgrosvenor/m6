@@ -26,9 +26,11 @@ ISSUE="${BASH_REMATCH[2]}"
 git diff --quiet && git diff --cached --quiet || die "working tree is dirty"
 git rev-parse --verify "$BRANCH" >/dev/null 2>&1 || die "no such branch: $BRANCH"
 
-SITE="${SITE_REPO:-$HOME/dr-grosvenor-site}"
-[[ -x "$SITE/deploy/run-tests.sh" ]] \
-  || die "cannot find the build-host runner at $SITE/deploy/run-tests.sh (set SITE_REPO)"
+# Which deployment repository runs the checks is a property of this working
+# copy, not of m6. See tools/find-deployment.sh.
+# shellcheck source=tools/find-deployment.sh
+. "$(dirname "$0")/find-deployment.sh"
+SITE="$(_m6_find_deployment "$(cd "$(dirname "$0")/.." && pwd)")" || exit 1
 
 note "running everything on the build host (this is the slow part, and the point)"
 git checkout "$BRANCH" --quiet || die "cannot check out $BRANCH"

@@ -41,7 +41,11 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 BASELINE="$HERE/perf-baseline.txt"
 WORK="${PERFCHECK_WORK:-/tmp/m6-perfcheck}"
-SITE="${PERFCHECK_SITE:-$HOME/dr-grosvenor-site}"
+# The deployment repository, discovered rather than named: m6 is generic and does
+# not know whose site this is. PERFCHECK_SITE still wins if set.
+# shellcheck source=tools/find-deployment.sh
+. "$HERE/find-deployment.sh"
+SITE="${PERFCHECK_SITE:-$(_m6_find_deployment "$ROOT" || true)}"
 UPDATE=false
 MARGIN=20
 

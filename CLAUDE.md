@@ -22,7 +22,7 @@ Types: `feat` `fix` `perf` `docs` `refactor` `test` `chore`.
 > that have never been deployed, because this model was adopted mid-project.
 > From the next release onwards `main` only advances at a release. Until then,
 > do not read `main` as "what is running": the deployed commit is whatever the
-> newest entry in `~/dr-grosvenor-site/docs/RELEASES.md` names.
+> newest entry in `the deployment repository/docs/RELEASES.md` names.
 
 ### The cycle
 

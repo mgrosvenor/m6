@@ -21,18 +21,19 @@ number, it does.
 
 - **Do not deploy.** 135 m6 commits are undeployed behind a deliberate freeze,
   counted 2026-09-13; recompute with the command in §3, never trust the
-  number. Lifting the freeze has a known hazard: §6.
+  number. Lifting the freeze has a known hazard, recorded in the deployment
+  repository's `docs/OPERATIONS.md`.
 - **`main` is not what is running.** It holds all of that undeployed work. The
   deployed commit is whatever the newest entry in
-  `~/dr-grosvenor-site/docs/RELEASES.md` names.
+  the deployment repository's `docs/RELEASES.md` names.
 - **m6-http depends on a FORK of quiche**, `mgrosvenor/quiche` branch
   `m6-h3-conformance`, pinned by revision. It is quiche master plus two open
   upstream PRs, and it takes h3 conformance from 37/49 to **47/49**. Drop it and
   return to a tag as soon as upstream releases those fixes. §4.
 - **49/49 is not being chased.** The last two are QPACK, they are upstream's
   choice rather than a bug, and the owner has accepted them: not a 1.0 blocker.
-- **There are two repositories** and they must deploy together. §1, §6.
-- **Blocking an IP address is a write.** Propose, never apply unasked. §7.
+- **m6 and a site are two repositories** and they must deploy together. §1, §6.
+- **Operations lives with the deployment**, not here. §6.
 
 ---
 
@@ -40,37 +41,23 @@ number, it does.
 
 `m6` is an HTTP stack in Rust: an edge (`m6-http`: TLS, HTTP/1.1, HTTP/2,
 HTTP/3, a cache, proxying) and services behind it built on a shared library
-(`m6-core`). It serves **mgrosvenor.com** from three nodes.
+(`m6-core`). It is generic: a site built on it is a separate repository.
 
-**The site is a separate repository**, `~/dr-grosvenor-site`, holding content,
+**A site is a separate repository**, holding content,
 production configs, deploy scripts, and three renderer crates of its own
 (`render-cms`, `render-analytics`, `render-contact`). Most changes touch both
 repositories, they deploy separately, and they can disagree. That is the
 largest release risk; see §6.
 
-### The fleet
+### Where it runs
 
-| node | role | service | WireGuard | analytics file |
-|---|---|---|---|---|
-| syd | origin | `m6-http-origin` | 10.0.0.1 | `/var/www/dr-grosvenor-site/logs/analytics.ndjson` |
-| lon | cache | `m6-http-cache` | 10.0.0.4 | `/var/www/m6-cache/logs/analytics.ndjson` |
-| chi | cache | `m6-http-cache` | 10.0.0.5 | `/var/www/m6-cache/logs/analytics.ndjson` |
+**m6 does not know.** A fleet is configuration, not code: which nodes exist,
+what they are called and how they reach each other belong to a deployment, and
+that is a separate repository with its own changelog and its own
+`docs/OPERATIONS.md`.
 
-All three are **1-core VMs**; syd has 950MB. Access is `ssh root@<node>.mgrosvenor.com`.
-
-The **build host** is a separate 4-core Linux box, `root@45.63.29.146` **port
-4022**. It runs every gate that needs a quiet machine or a real Linux. It is
-**not backed up**: everything done to a node must be in git.
-
-### The services
-
-| binary | what it does | shape |
-|---|---|---|
-| `m6-http` | the edge: TLS, h1/h2/h3, cache, proxy | its own event loop, not an `App` |
-| `m6-file` | static files | `App` service, one named handler |
-| `m6-html` | renders pages from templates | `App` service, no code routes |
-| `m6-auth-server` | login, tokens, keys | `App` service with global state. **Not running in production** |
-| `m6-md`, `m6-monitor` | markdown, fleet digest | `App` services |
+That used to be a table in this file, with hostnames and WireGuard addresses in
+it, which is how a generic system ends up describing one site.
 
 ### The architectural rule
 
@@ -123,9 +110,9 @@ tree, which it has already caught me doing.
 | `tools/clippy.sh` | clippy, `-D warnings`. No ceiling, no `--update` |
 | `tools/conformance.sh` | h1/h2/h3 against recorded minimum scores |
 | `tools/perfcheck.sh` | page render against a recorded number, 20% margin |
-| `tools/health-check.py` | the hourly production check; §7 |
+| — | the hourly production check moved to the deployment repository; §6 |
 | `check.sh` | the laptop pre-push set |
-| `~/dr-grosvenor-site/deploy/run-tests.sh` | everything, on the build host |
+| the deployment repo's `deploy/run-tests.sh` | everything, on the build host. Found by `tools/find-deployment.sh` |
 
 ### How to write for the owner
 
@@ -190,7 +177,8 @@ confinement and firewall rules, not what code runs.
 
 ## 4. Health of the checks
 
-Run everything: `cd ~/dr-grosvenor-site && ./deploy/run-tests.sh m6`.
+Run everything: `./tools/merge.sh <branch>`, which finds the deployment
+repository and runs its `deploy/run-tests.sh`.
 
 | check | state | where it runs |
 |---|---|---|
@@ -400,7 +388,7 @@ matching the newest tag; `release.sh` bumps them at a release.
 | 2 | ~~**quiche 0.26.1 → 0.29.3, re-measure h3**~~ | **done 2026-09-13, issue #4.** The bump alone moved nothing. h3 is now **47/49** on a fork of quiche master carrying PRs #2521 and #2575, floor raised to 47. The last two are QPACK and are accepted, not chased. §4 |
 | 3 | **Phase 7: renderers onto a git tag** | below |
 | 4 | ~~**Phase 8: six `/status` implementations**~~ | **done 2026-09-13, issue #6.** All six conform, 13 tests in the gate, Go installed. The measurement: **linking m6-core costs 36% of throughput and +37us p50**, 8.8x RSS, 56.7x binary. §4 below |
-| 5 | **Deploy, lifting the freeze** | §6. Not a code task. |
+| 5 | **Deploy, lifting the freeze** | the deployment repository's business; §6. Not a code task. |
 
 ### Phase 7 in detail
 
@@ -425,92 +413,21 @@ supersede. `deploy.sh` must stop syncing the m6 tree at the same time.
 
 ---
 
-## 6. The deploy, and the thing that will bite
+## 6. Operations: the fleet, the deploy, the hourly check
 
-**m6-file's config and binary must land together.** The `App` migration changed
-its config format: every route needs `handler = "files"`, and
-`/assets/{relpath}` became `/assets/{*relpath}`. Both orderings break:
+**Not here. m6 is a generic web system and does not know whose fleet it is
+running on.** Those sections used to live in this file, which meant a generic
+system's handover carried one particular deployment's node names, WireGuard
+addresses and analytics paths.
 
-- **New config, old binary**: the old matcher reads `{*relpath}` as a
-  single-segment parameter, so every nested asset 404s.
-- **Old config, new binary**: routes name no handler, so everything under
-  `/assets` 404s.
+They are now in the deployment repository, as `docs/OPERATIONS.md`: the fleet
+table, the m6-file config-and-binary ordering hazard, and the hourly health
+check with its traps. `deploy/health-check.py` moved there with them.
 
-`deploy.sh` ships configs; `deploy-platform.sh` ships binaries. Two separate
-runs. **`--dump-config` exists on every service now** and `deploy-platform.sh`
-validates with it before installing, so the second case is a refused deploy
-rather than a silent outage. The first is not covered. **Write a combined step
-before touching production.**
+What stays m6's business is in §4: whether the checks are honest, and what they
+measure.
 
-### Verify after deploying: deliberate behaviour changes
-
-- socket modes are **0660** (were 0755 from umask, or 0666 by hand)
-- traversal answers **404** where a single-segment parameter gave 400
-- m6-file **sheds with 503** past a 256-deep queue instead of queueing without
-  bound. Production sets `size = 32`, so the queue is 256. **Watch the gallery
-  page**, which fires dozens of concurrent image requests and is why the pool
-  was widened to 32 in the first place.
-- a route's `Cache-Control` is a **default, not an override**
-- a **failed bind is fatal** where it used to warn and continue
-- `UMask=0027` and `LimitNOFILE=65535` on every service
-- rendered bytes are **unchanged**: verified byte-identical before and after
-  the migration, same content-hash ETag, same Content-Length
-
-### Known gaps in the deploy path
-
-- **Staging cannot exercise the cache role.** Single origin, no cache nodes, no
-  WireGuard. The 90-second London outage on 2026-09-11 was a cache-role fault
-  and staging would have called that change safe.
-- **`m6-monitor` is installed on no machine**, not even the build host, and
-  cannot replace `health-check.py` yet: `--check` reads `/traffic`, which 404s
-  on the deployed binary, and `/perf`, whose deployed shape has no `pools`
-  field. Measured on syd 2026-09-12.
-- **The firewall stats collector** is written, tested, and on no node. Until it
-  is deployed `/traffic` reports `firewall: null`.
-
----
-
-## 7. The hourly health check
-
-**`tools/health-check.py --load` is the standing order.** It covers all three
-nodes, which the syd-only commands in the prompt do not, and it encodes the
-traps: per-role analytics paths, the nested record shape, ANSI stripping,
-generated-versus-observed labelling, forged-bot detection.
-
-**It is not scheduled.** A cron created from a session dies with it; a durable
-version needs launchd or a real crontab.
-
-### Three baselines in the prompt that are now wrong
-
-1. **`hit_p50_ns` is load-dependent and not comparable across days.** On a
-   near-idle single-core VM the cache-hit path goes cold between requests, so
-   the number tracks request density. Same binary, same node, minutes apart:
-   50-70 hits per window reads **3,900ns**; 1,200 hits reads **1,064ns**, below
-   the 1.7-2.2us band treated as the baseline. **Report the window's hit count
-   beside the number.** The prompt still states 1.7-2.2us flat; it is the
-   owner's file to change.
-2. **A hit rate near 0.3 usually means scan volume, not a regression.** A 404
-   is uncacheable and counts as a miss. Separate last-hour HIT/MISS from the
-   404 share. chi has read 72% 404s in an hour with real traffic fine.
-3. **Crawler totals over windows longer than ~60 minutes are understated.** The
-   user-agent rotation heuristic flags backbone addresses 10.0.0.4 and 10.0.0.5
-   as forging bot agents, because a cache node relays real clients' agents,
-   then excludes those requests. Known tool bug, not an incident.
-
-### Standing security rules
-
-- Firewall blocks are **per-IP only**, never CIDR.
-- **Blocking is a write.** Propose candidates; never apply without being asked.
-- Crawler sightings are reported **explicitly, every run**, even a quiet one.
-
-**Four block candidates are outstanding and unblocked**: `136.69.139.253`
-(1,350 requests in under two minutes, 741 rotating user agents, SSRF and cloud
-credential probes), `95.173.161.147` (encoded traversal aimed at `/bin/sh`),
-`94.26.106.175` (phpinfo sweep, seen on two separate days), `34.20.194.202`.
-
----
-
-## 8. The dozen lessons that come up most
+## 7. The dozen lessons that come up most
 
 Full list, 40 of them, in `docs/LESSONS.md`.
 
@@ -561,7 +478,7 @@ Full list, 40 of them, in `docs/LESSONS.md`.
 
 ---
 
-## 9. Open questions, honestly unresolved
+## 8. Open questions, honestly unresolved
 
 - **`m6-auth-cli`'s `test_token_create_prints_jwt`** fails intermittently and
   has never been explained. Did not recur on 2026-09-12 or -13.

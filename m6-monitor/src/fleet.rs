@@ -1,6 +1,6 @@
 //! Which nodes there are, and how to reach them.
 //!
-//! A fleet is configuration, not code. mgrosvenor.com is three nodes named
+//! A fleet is configuration, not code. example.com is three nodes named
 //! syd, lon and chi; that is one deployment of m6 and nothing here knows it.
 
 use std::path::Path;
@@ -134,12 +134,12 @@ timeout_ms = 2000
 
 [[monitor.nodes]]
 name = "syd"
-url  = "http://10.0.0.1:8080"
+url  = "http://192.0.2.1:8080"
 role = "origin"
 
 [[monitor.nodes]]
 name = "lon"
-url  = "http://10.0.0.4:8080"
+url  = "http://192.0.2.4:8080"
 role = "cache"
 "#
         )

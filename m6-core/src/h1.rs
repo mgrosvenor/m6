@@ -1064,8 +1064,8 @@ mod host_tests {
 
     #[test]
     fn ordinary_hosts_are_accepted() {
-        assert!(is_ok(&get("mgrosvenor.com")));
-        assert!(is_ok(&get("mgrosvenor.com:8443")));
+        assert!(is_ok(&get("example.com")));
+        assert!(is_ok(&get("example.com:8443")));
         assert!(is_ok(&get("localhost")));
         assert!(is_ok(&get("127.0.0.1:80")));
         assert!(is_ok(&get("[::1]")));

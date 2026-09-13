@@ -4185,13 +4185,25 @@ mod dict_cost {
         );
     }
 
-    /// The same thing against the site's real content file, which is the
-    /// number that matters: m6-html renders every HTML page through this.
+    /// The same thing against a real deployment's content file, which is the
+    /// number that matters: an HTML service renders every page through this.
+    ///
+    /// Point it at yours. m6 is generic and ships no content of its own, so
+    /// there is nothing here to measure against by default:
+    ///
+    ///     M6_REAL_CONTENT_JSON=/path/to/data/content.json \
+    ///       cargo test -p m6-core build_dict_against_the_real_content_json -- --ignored
+    ///
+    /// This used to join `../<deployment-repo>/data/content.json`, one
+    /// particular site, from a generic library's test suite.
     #[test]
-    #[ignore = "a measurement, and it needs the site repo beside this one"]
+    #[ignore = "a measurement; set M6_REAL_CONTENT_JSON to a content file"]
     fn build_dict_against_the_real_content_json() {
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../dr-grosvenor-site/data/content.json");
+        let Ok(path) = std::env::var("M6_REAL_CONTENT_JSON") else {
+            println!("SKIP: set M6_REAL_CONTENT_JSON to a content.json to measure against");
+            return;
+        };
+        let src = std::path::PathBuf::from(path);
         if !src.exists() {
             println!("SKIP: {} not present", src.display());
             return;
@@ -4286,8 +4298,13 @@ mod copy_audit {
     #[test]
     #[ignore = "a measurement; needs the site repo beside this one"]
     fn every_copy_app_makes_per_request() {
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../dr-grosvenor-site/data/content.json");
+        // As above: a real content file, named by the environment rather than
+        // by this repository. See build_dict_against_the_real_content_json.
+        let Ok(path) = std::env::var("M6_REAL_CONTENT_JSON") else {
+            println!("SKIP: set M6_REAL_CONTENT_JSON to a content.json to measure against");
+            return;
+        };
+        let src = std::path::PathBuf::from(path);
         if !src.exists() {
             println!("SKIP: {} not present", src.display());
             return;
@@ -4323,7 +4340,7 @@ mod copy_audit {
             path: "/".to_string(),
             query: None,
             headers: vec![
-                ("Host".to_string(), "mgrosvenor.com".to_string()),
+                ("Host".to_string(), "example.com".to_string()),
                 (
                     "User-Agent".to_string(),
                     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)".to_string(),

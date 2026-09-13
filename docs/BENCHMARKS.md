@@ -68,7 +68,7 @@ results:
 | CPU governor | not exposed on this VM — frequency scaling is not controlled |
 
 The server under test was the staging m6-http, serving the real
-mgrosvenor.com content, so the payloads are real pages rather than a synthetic
+example.com content, so the payloads are real pages rather than a synthetic
 fixture.
 
     cargo build --release --bin m6-bench
