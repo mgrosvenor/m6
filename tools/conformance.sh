@@ -28,6 +28,26 @@
 #   tools/conformance.sh              # everything
 #   tools/conformance.sh h1           # one protocol
 #   tools/conformance.sh --update     # rewrite floors to the measured scores
+#   tools/conformance.sh --allow-missing-tools
+#                                     # let an absent h2spec/h3spec SKIP rather
+#                                     # than fail. For a developer laptop only.
+#                                     # The pre-prod gate must never pass it.
+#
+# A GATE THAT CANNOT MEASURE MUST FAIL, NOT PASS.
+#
+# This script used to break that rule three ways, and reported PASS through all
+# of them:
+#
+#   - `run_h3` never started the server it tested, so h3spec talked to a port
+#     with nothing on it.
+#   - Both h2 and h3 recorded a score only if the parse produced one, so a run
+#     that measured nothing skipped the floor check entirely and fell through
+#     to "nothing went backwards".
+#   - An absent h2spec or h3spec printed "skipped" and returned success, so the
+#     laptop's missing tools looked exactly like a pass.
+#
+# Every one of those is now a failure. A target listed in the scores file and
+# not measured in a full run fails the run.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -42,12 +62,14 @@ REDIRECT_PORT=18081
 EDGE_BRIDGE_PORT=18095
 
 UPDATE=false
+ALLOW_MISSING=false
 ONLY=""
 for arg in "$@"; do
   case "$arg" in
     --update) UPDATE=true ;;
+    --allow-missing-tools) ALLOW_MISSING=true ;;
     h1|h2|h3) ONLY="$arg" ;;
-    *) echo "usage: $0 [h1|h2|h3] [--update]"; exit 2 ;;
+    *) echo "usage: $0 [h1|h2|h3] [--update] [--allow-missing-tools]"; exit 2 ;;
   esac
 done
 
@@ -113,9 +135,15 @@ total_for() { awk -v k="$1" '$1==k {print $3}' "$SCORES" 2>/dev/null; }
 # Measured scores go in a file, not an associative array: macOS ships bash 3.2,
 # which has neither `declare -A` nor `setsid`, and this has to run on a
 # developer laptop as well as the Linux build box.
+# `mkdir` first. This truncation used to run ~330 lines before `mkdir -p
+# "$WORK"`, so on a fresh box it failed and every later append went nowhere:
+# the ratchet's own bookkeeping was silently not written.
+mkdir -p "$WORK"
 MEASURED="$WORK/measured.txt"
 : > "$MEASURED"
 RESULT=0
+SKIPPED=""
+
 
 # setsid keeps a child alive past this script on Linux and does not exist on
 # macOS. Neither matters here -- the trap kills everything on exit -- so use it
@@ -142,11 +170,53 @@ check() {  # check <key> <passed> <total>
   fi
 }
 
+# Record a score, or fail because there was nothing to record.
+#
+# The difference between this and calling `check` directly is the whole point
+# of the file: `check` compares a number against a floor, and says nothing at
+# all when handed no number.
+measured_or_fail() {  # measured_or_fail <key> <got> <tot> <log-path>
+  local key="$1" got="$2" tot="$3" log="$4"
+  if [[ -z "$got" || -z "$tot" || "$tot" -eq 0 ]]; then
+    fail "$key: measured NOTHING — no score could be parsed from the output."
+    info "  a gate that cannot measure must fail, not pass. Output: $log"
+    RESULT=1
+    return 1
+  fi
+  check "$key" "$got" "$tot"
+}
+
+# A tool that is not installed is a run that did not test anything.
+require_tool() {  # require_tool <binary> <label>
+  if have "$1"; then return 0; fi
+  if [[ "$ALLOW_MISSING" == "true" ]]; then
+    # Explicitly permitted, so it does not fail the run -- but it is reported
+    # as a skip in red and the summary refuses to say "pass". The property
+    # that matters is that the path to a deploy cannot take this branch: the
+    # Linux gate runs without the flag, on a box where both testers exist.
+    fail "$2: SKIPPED — $1 is not installed. THIS RUN DID NOT TEST $2."
+    SKIPPED="$SKIPPED $2"
+    return 1
+  fi
+  fail "$2: $1 is not installed. A gate that cannot measure must fail, not pass."
+  info "  install it, or pass --allow-missing-tools on a laptop (never before a deploy)."
+  RESULT=1
+  return 1
+}
+
 # ── Loopback instance ─────────────────────────────────────────────────────────
 # A loopback instance, not the staging service: staging was once found running
 # a stale binary, and measuring it reported pre-fix numbers as current.
 
+EDGE_UP=false
 start_edge() {
+  # Idempotent. h2 and h3 both need the edge and both call this; the second
+  # call used to collide with the first on port 10443 and be reported as "port
+  # already in use", which read as an environment problem and was really this
+  # function being called twice.
+  if [[ "$EDGE_UP" == "true" ]]; then
+    return 0
+  fi
   # Self-contained: builds its own site, cert and backend. The alternative is
   # the manual one-time setup in the site HANDOVER, which is fine for a person
   # and useless in CI, and which was once measured while pointing at a stale
@@ -169,7 +239,11 @@ start_edge() {
   fi
 
   printf 'PUBLIC CONTENT\n' > "$site/public/open.txt"
-  printf '[[route]]\npath = "/public/{relpath}"\nroot = "public/"\n' \
+  # m6-file is an `App` service: the handler is named in config, and the
+  # wildcard is explicit. The old spelling now fails at startup, which is the
+  # point of that check -- but it failed HERE first, unnoticed, because
+  # `start_edge` only ran under h2 and h2spec is absent on the laptop.
+  printf '[[route]]\npath = "/public/{*relpath}"\nhandler = "files"\nroot = "public/"\n' \
     > "$site/configs/m6-file.conf"
   cat > "$site/site.toml" <<TOML
 [site]
@@ -226,6 +300,7 @@ TOML
   # The backend pool is filled by a periodic rescan, so listening is not the
   # same as being able to serve.
   sleep 2.5
+  EDGE_UP=true
   return 0
 }
 
@@ -313,7 +388,8 @@ start_backend() {  # start_backend <name> <bridge-port> <site-dir> <config>
 
 run_h1() {
   if ! have uvx; then
-    info "h1: skipped, uvx not installed (https://docs.astral.sh/uv/)"
+    require_tool uvx "h1 (all targets)" || true
+    info "h1: h1spec is delivered through uvx (https://docs.astral.sh/uv/)"
     return
   fi
   info "HTTP/1.1 — h1spec (RFC 9112/9110)"
@@ -422,27 +498,46 @@ h1_against() {  # h1_against <score-key> <port>
 # ── h2 and h3 ─────────────────────────────────────────────────────────────────
 
 run_h2() {
-  if ! have h2spec; then info "h2: skipped, h2spec not installed"; return; fi
+  require_tool h2spec "h2:m6-http" || return 1
   info "HTTP/2 — h2spec (RFC 9113)"
-  start_edge || return
-  local out; out="$(h2spec -h 127.0.0.1 -p $TLS_PORT -t -k --timeout 5 2>&1)"
-  local got tot
-  got="$(echo "$out" | grep -oE '[0-9]+ passed' | tail -1 | grep -oE '[0-9]+')"
-  local failed; failed="$(echo "$out" | grep -oE '[0-9]+ failed' | tail -1 | grep -oE '[0-9]+')"
+  start_edge || { fail "h2:m6-http: the edge never came up, so nothing was measured"; RESULT=1; return 1; }
+  local log="$WORK/h2spec.out"
+  h2spec -h 127.0.0.1 -p $TLS_PORT -t -k --timeout 5 > "$log" 2>&1
+  local got failed tot
+  got="$(grep -oE '[0-9]+ passed' "$log" | tail -1 | grep -oE '[0-9]+')"
+  failed="$(grep -oE '[0-9]+ failed' "$log" | tail -1 | grep -oE '[0-9]+')"
   tot=$(( ${got:-0} + ${failed:-0} ))
-  [[ -n "$got" ]] && check "h2:m6-http" "$got" "$tot"
+  measured_or_fail "h2:m6-http" "${got:-}" "$tot" "$log"
 }
 
 run_h3() {
-  if ! have h3spec; then info "h3: skipped, h3spec not installed"; return; fi
+  require_tool h3spec "h3:m6-http" || return 1
   info "HTTP/3 — h3spec (RFC 9114 + QUIC)"
+  # THE EDGE HAS TO BE RUNNING. This line was missing, which is why h3 could
+  # report a pass having talked to a closed UDP port. m6-http binds QUIC on the
+  # same address as `server.bind`, so the same loopback instance serves it.
+  start_edge || { fail "h3:m6-http: the edge never came up, so nothing was measured"; RESULT=1; return 1; }
   # -n or every test fails on certificate name mismatch and reports a false
   # disaster.
-  local out; out="$(h3spec -n 127.0.0.1 $TLS_PORT 2>&1)"
-  local got failed
-  got="$(echo "$out" | grep -coE '^\s*\+' || true)"
-  failed="$(echo "$out" | grep -coE '^\s*-' || true)"
-  [[ "${got:-0}" -gt 0 ]] && check "h3:m6-http" "$got" $(( got + failed ))
+  local log="$WORK/h3spec.out"
+  h3spec -n 127.0.0.1 $TLS_PORT > "$log" 2>&1
+  # Parse h3spec's own summary line -- "49 examples, 12 failures" -- rather
+  # than counting result markers.
+  #
+  # The previous parser counted lines starting with `+` or `-`, which this
+  # tester has never emitted: it marks each result with a trailing [✔] or [✘].
+  # So the count was always zero, and the zero was then used to SKIP the floor
+  # check rather than to fail. Two bugs compounding: a parser that matched
+  # nothing, and a gate that treated "nothing" as "fine".
+  local total failed got
+  total="$(grep -oE '[0-9]+ examples' "$log" | tail -1 | grep -oE '[0-9]+')"
+  failed="$(grep -oE '[0-9]+ failures?' "$log" | tail -1 | grep -oE '[0-9]+')"
+  if [[ -n "$total" && -n "$failed" ]]; then
+    got=$(( total - failed ))
+  else
+    got=""
+  fi
+  measured_or_fail "h3:m6-http" "$got" "${total:-0}" "$log"
 }
 
 # ── Run ───────────────────────────────────────────────────────────────────────
@@ -478,10 +573,40 @@ if [[ "$UPDATE" == "true" ]]; then
   exit 0
 fi
 
+# ── Did this run actually measure what it claims? ────────────────────────────
+#
+# The per-target checks above catch a target that measured nothing. This
+# catches a target that was never attempted at all, which is the failure the
+# old script had no way to see: `run_h3` returning early left no trace, and the
+# summary line said "nothing went backwards" because, strictly, nothing had.
+#
+# Every target with a floor must appear in this run's measurements. Only a
+# full run can assert that, since `conformance.sh h1` is deliberately partial.
+if [[ -z "$ONLY" && "$UPDATE" != "true" ]]; then
+  echo
+  missing=""
+  while read -r key _floor _total; do
+    [[ -z "$key" || "$key" == \#* ]] && continue
+    case "$SKIPPED" in *" $key"*) continue ;; esac
+    grep -qE "^${key} " "$MEASURED" || missing="$missing $key"
+  done < "$SCORES"
+  if [[ -n "$missing" ]]; then
+    fail "these targets have a floor and were NOT MEASURED:$missing"
+    info "  a target that is not measured is not gated. That is the whole point."
+    RESULT=1
+  fi
+fi
+
 echo
+if [[ -n "$SKIPPED" ]]; then
+  fail "conformance INCOMPLETE — NOT TESTED:$SKIPPED"
+  info "  this run proves nothing about those protocols. Do not read it as a pass."
+  info "  the Linux gate runs without --allow-missing-tools and will test them."
+  exit $RESULT
+fi
 if (( RESULT == 0 )); then
-  pass "conformance: nothing went backwards"
+  pass "conformance: every target measured, nothing went backwards"
 else
-  fail "conformance regressed — see above"
+  fail "conformance regressed or could not measure — see above"
 fi
 exit $RESULT
