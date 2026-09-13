@@ -319,6 +319,55 @@ this file. What it actually took:
 Fix it, or add a targeted `#[allow]` naming the lint with the reason argued in
 the commit. Do not put the ceiling back.
 
+### m6-core costs 36% of a backend's throughput, measured
+
+Phase 8's reason for existing, settled 2026-09-13. `rust-plain` and
+`rust-m6core` in `m6-http/tests/backends/` are the same language, compiler,
+payload and concurrency model, so the difference between them is the library.
+
+| | rust-plain | rust-m6core | delta |
+|---|---:|---:|---|
+| throughput | 28,954 rps | 18,297 rps | **-36.8%** |
+| p50 | 63.7 us | 102.2 us | **+38.5 us** |
+| RSS | 2,612 KB | 22,992 KB | 8.8x |
+| artifact | 555 KB | 31.5 MB | 56.7x |
+| cold start | 2.9 ms | 19.0 ms | 6.6x |
+
+Reproduced within 3%. Conditions in `docs/BENCHMARKS.md`: build host, tmpfs,
+concurrency 2, 660-byte payload.
+
+**Both of these are true and neither cancels the other.** It is a real cost, and
+`docs/m6-backend-examples.md` §5.3 says a delta this far from zero means core has
+a problem worth knowing about. It is also measured on the shape that maximises
+it: a route whose own work is copying 660 bytes, so the framework is nearly the
+whole cost, while behind the edge cache the hit rate is 0.87 to 0.90 and most
+requests never reach a backend. It is not "the site is 36% slower".
+
+The first run of this said core was 72% **faster**. The control was wrong, not
+the subject: it spawned a thread per connection while core answered from a pool.
+A control that differs from its subject in two ways measures neither.
+
+### Five places the documents and the code disagree
+
+Writing the examples found them. All five are in
+`docs/m6-backend-examples.md` §10, and **two are decisions rather than tasks**:
+
+- **§10.1, socket mode.** Protocol §1.2 says a backend MUST `chmod 0666`. Core
+  defaults to 0660 and production runs 0660, because the proxy shares the group.
+  The fleet contradicts a MUST and works. Either the spec says 0660, or core
+  loosens and undoes a deliberate hardening.
+- **§10.5, compression.** Protocol §3.6 tells backends not to compress because
+  "the proxy performs content negotiation and compression itself". **m6-http has
+  no compressor.** brotli and flate2 are only in m6-core; the proxy caches and
+  selects per-encoding variants of what a backend produced. Measured: 660 bytes
+  through the edge with `Accept-Encoding: br, gzip` come back uncompressed. So a
+  C, Go or Python backend written from the spec serves uncompressed bytes
+  forever, and it is invisible for the Rust services only because m6-core
+  compresses on the backend side, which is what §3.6 tells backends not to do.
+
+The other three are smaller: a bare 404 has no body, core minifies what the
+examples must not, and no error mode relays a backend's own error page.
+
 ### Where checks run, and why
 
 - **CI** (GitHub Actions, every push and PR): build, tests, warnings, clippy,
@@ -347,7 +396,7 @@ matching the newest tag; `release.sh` bumps them at a release.
 | 1 | ~~**clippy to zero**~~ | **done 2026-09-13, issue #5.** 0 on both toolchains, and `clippy.sh` is `-D warnings` with the ceiling files deleted. §4 |
 | 2 | ~~**quiche 0.26.1 → 0.29.3, re-measure h3**~~ | **done 2026-09-13, issue #4.** The bump alone moved nothing. h3 is now **47/49** on a fork of quiche master carrying PRs #2521 and #2575, floor raised to 47. The last two are QPACK and are accepted, not chased. §4 |
 | 3 | **Phase 7: renderers onto a git tag** | below |
-| 4 | **Phase 8: six `/status` implementations** | `apt install golang` on the build host, nothing more. Its purpose is the measurement that says whether linking core costs or saves. |
+| 4 | ~~**Phase 8: six `/status` implementations**~~ | **done 2026-09-13, issue #6.** All six conform, 13 tests in the gate, Go installed. The measurement: **linking m6-core costs 36% of throughput and +37us p50**, 8.8x RSS, 56.7x binary. §4 below |
 | 5 | **Deploy, lifting the freeze** | §6. Not a code task. |
 
 ### Phase 7 in detail

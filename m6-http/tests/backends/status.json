@@ -1,0 +1,13 @@
+{
+  "service": "m6-backend-example",
+  "protocol_version": 1,
+  "region": "ap-southeast-2",
+  "node": "example-1",
+  "records": [
+    { "id": "3f8a1c02", "kind": "article", "title": "The backend contract", "words": 1840, "published": true },
+    { "id": "9b4e7d51", "kind": "article", "title": "One request per connection", "words": 920, "published": true },
+    { "id": "c1d02a6f", "kind": "note", "title": "Framing is the part to get right", "words": 210, "published": false }
+  ],
+  "limits": { "header_bytes": 8192, "body_bytes": 134217728, "timeout_secs": 30 },
+  "links": { "self": "/status", "health": "/health", "spec": "/docs/m6-backend-protocol" }
+}

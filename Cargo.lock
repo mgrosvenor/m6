@@ -1871,6 +1871,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "m6-example-rust-m6core"
+version = "0.2.0"
+dependencies = [
+ "m6-core",
+]
+
+[[package]]
+name = "m6-example-rust-plain"
+version = "0.2.0"
+
+[[package]]
 name = "m6-file"
 version = "0.2.0"
 dependencies = [
