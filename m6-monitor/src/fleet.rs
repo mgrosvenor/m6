@@ -134,12 +134,12 @@ timeout_ms = 2000
 
 [[monitor.nodes]]
 name = "origin"
-url  = "http://10.0.0.1:8080"
+url  = "http://192.0.2.1:8080"
 role = "origin"
 
 [[monitor.nodes]]
 name = "edge-a"
-url  = "http://10.0.0.4:8080"
+url  = "http://192.0.2.4:8080"
 role = "cache"
 "#
         )

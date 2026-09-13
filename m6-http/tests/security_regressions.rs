@@ -141,10 +141,10 @@ fn finding_2b_all_proxy_owned_headers_stripped_at_ingress() {
     let raw = "GET /public HTTP/1.1\r\n\
                Host: example.com\r\n\
                X-Auth-Claims: forged\r\n\
-               X-Forwarded-For: 10.0.0.99\r\n\
+               X-Forwarded-For: 192.0.2.99\r\n\
                X-Forwarded-Proto: http\r\n\
                X-Forwarded-Host: evil.com\r\n\
-               X-Real-IP: 10.0.0.99\r\n\
+               X-Real-IP: 192.0.2.99\r\n\
                User-Agent: probe\r\n\r\n";
 
     // Parse, then strip: see the note on the test above. The end-to-end guard
@@ -262,7 +262,7 @@ fn finding_5b_responses_that_vary_per_user_must_not_be_cached() {
 fn finding_6_forged_x_forwarded_for_must_not_reach_backend() {
     let req = get_request(
         "/auth/login",
-        vec![("X-Forwarded-For".to_string(), "10.0.0.99".to_string())],
+        vec![("X-Forwarded-For".to_string(), "192.0.2.99".to_string())],
     );
 
     let raw = forward_and_capture(&req, "203.0.113.9");

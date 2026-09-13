@@ -438,7 +438,7 @@ mod tests {
 
     #[test]
     fn test_parse_referer_strips_query_and_scheme() {
-        let (host, path) = parse_referer("https://www.google.com/search?q=dr+grosvenor&foo=bar");
+        let (host, path) = parse_referer("https://www.google.com/search?q=example+search&foo=bar");
         assert_eq!(host, Some("www.google.com".to_string()));
         assert_eq!(path, Some("/search".to_string()));
     }
