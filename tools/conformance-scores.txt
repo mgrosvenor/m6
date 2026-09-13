@@ -84,6 +84,10 @@ h3:m6-http             47     49
 # makes the fork rebasable, and because any QPACK work we write would want to go
 # upstream from there.
 #
+# THE FORK IS ACCEPTED. Owner's decision, 2026-09-13: "I'm ok with this." So it
+# is not an open question, and the note below about what it costs is there to be
+# re-read when upstream releases the fixes, not to reopen the choice.
+#
 # ADOPTED: m6-http now pins github.com/mgrosvenor/quiche by revision, branch
 # m6-h3-conformance, which is quiche master plus both PRs. Pinned by REVISION and
 # not by branch, so the dependency cannot move under a build that claims to be
