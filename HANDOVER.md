@@ -184,12 +184,19 @@ In the agreed order:
 2. **Upgrade quiche 0.26.1 → 0.29.3, re-measure h3.** If the twelve clear, h3
    is genuinely green. If not, they are upstream bugs worth reporting to
    cloudflare/quiche with the h3spec output.
-3. **Publish `m6-core` to crates.io** and switch the site's three renderer
-   crates from `path = "../../m6/m6-core"` to a version dependency. This is
-   Phase 7. **The owner's call was a published crate, not a git revision pin**:
-   versioned, reproducible, cached, and semver means something. It forces
-   deciding what the public API is, which 1.0 should assert anyway. `m6-core`
-   currently exposes a lot (`app`, `dict`, `h1`, `testkit`, …).
+3. **Point the site's renderers at m6 as a git dependency pinned to a tag**,
+   instead of `path = "../../m6/m6-core"`. This is Phase 7. **Not crates.io**:
+   the owner's call, 2026-09-13. Publishing would mean committing to a public
+   API, a name, and maintenance for other people, none of which this project
+   wants. A tag gives the versioning without any of that, and m6-http already
+   depends on quiche exactly this way.
+
+   ```toml
+   m6-core = { git = "https://github.com/mgrosvenor/m6", tag = "v1.0.0" }
+   ```
+
+   **Gate:** the site builds with no `m6` checkout beside it, and `deploy.sh`
+   stops syncing the tree to the build host.
 4. **Phase 8: six implementations of the same `/status` payload.** Needs Go on
    the build host, which is `apt install golang`. Its purpose is the
    measurement that says whether linking core costs or saves, which 1.0 should

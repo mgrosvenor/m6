@@ -24,7 +24,7 @@ recorded beside the version in `Cargo.toml`.
 |---|---|---|
 | 1 | **Drive clippy to zero** | not started. 135 macOS / 145 Linux. Most are mechanical; `cargo clippy --fix` handles a large share. |
 | 2 | **quiche 0.26.1 → 0.29.3, re-measure h3** | not started. All twelve h3 failures are inside quiche, not m6. One CI run to find out. |
-| 3 | **Publish `m6-core` to crates.io**, renderers onto a version dependency | not started. This is Phase 7. Owner's call: **a published crate, not a git revision pin**. Forces deciding the public API. |
+| 3 | **Renderers onto a git dependency pinned to a tag** | not started. This is Phase 7. Owner's call 2026-09-13: **a git tag, NOT crates.io.** Publishing would mean owning a public API, a name and maintenance for other people. m6-http already takes quiche this way. |
 | 4 | **Phase 8: six `/status` implementations** | not started. Needs `apt install golang` on the build host, nothing more. |
 | 5 | **Deploy, lifting the freeze** | blocked on 1-4 and on the m6-file config/binary sequencing. Not a code task. |
 
