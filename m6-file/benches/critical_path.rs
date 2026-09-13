@@ -52,7 +52,9 @@ fn make_get_request(site_dir: &std::path::Path, relpath: &str) -> Request {
 
 fn report_percentiles<F: FnMut()>(label: &str, n: usize, mut f: F) {
     let warmup = n / 10;
-    for _ in 0..warmup { f(); }
+    for _ in 0..warmup {
+        f();
+    }
     let mut samples: Vec<u64> = Vec::with_capacity(n);
     for _ in 0..n {
         let t0 = std::time::Instant::now();
@@ -66,13 +68,24 @@ fn report_percentiles<F: FnMut()>(label: &str, n: usize, mut f: F) {
         samples[idx.min(samples.len() - 1)]
     };
     let avg = samples.iter().sum::<u64>() as f64 / count;
-    let variance = samples.iter().map(|&x| { let d = x as f64 - avg; d * d }).sum::<f64>() / count;
+    let variance = samples
+        .iter()
+        .map(|&x| {
+            let d = x as f64 - avg;
+            d * d
+        })
+        .sum::<f64>()
+        / count;
     let stddev = variance.sqrt();
     println!(
         "\n── {label} (n={n}) ─────────────────────────────────────────────\n\
          p0={p0}ns  p1={p1}ns  p50={p50}ns  p99={p99}ns  p100={p100}ns\n\
          avg={avg:.1}ns  stddev={stddev:.1}ns",
-        p0 = p(0.0), p1 = p(1.0), p50 = p(50.0), p99 = p(99.0), p100 = p(100.0),
+        p0 = p(0.0),
+        p1 = p(1.0),
+        p50 = p(50.0),
+        p99 = p(99.0),
+        p100 = p(100.0),
     );
 }
 
@@ -103,8 +116,13 @@ fn spawn_server(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
 
     std::thread::spawn(move || {
         for stream in listener.incoming() {
-            let mut stream = match stream { Ok(s) => s, Err(_) => break };
-            stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
+            let mut stream = match stream {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .ok();
             let site_dir = site_dir.clone();
             // The same connection loop production runs, so the round trip
             // measured here is the one that actually happens.
@@ -117,7 +135,8 @@ fn spawn_server(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
                 let req = Request::new(raw, dict, site_dir.clone())
                     .with_route_settings(std::sync::Arc::new(settings));
                 let r = serve(&req).map_err(|e| std::io::Error::other(e.to_string()))?;
-                r.send(resp).map_err(|e| std::io::Error::other(e.to_string()))
+                r.send(resp)
+                    .map_err(|e| std::io::Error::other(e.to_string()))
             });
         }
     });

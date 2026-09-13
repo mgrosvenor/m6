@@ -1,7 +1,10 @@
 [package]
 name    = "m6-http"
-version = "0.1.0"
-edition = "2021"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
 
 [[bin]]
 name = "m6-http"
@@ -44,6 +47,20 @@ bytes          = "1"
 base64         = "0.22"
 sha2           = "0.10"
 httparse       = "1"
+# Upstream, deliberately, despite RUSTSEC-2023-0084 and -0085.
+#
+# The advisory is real: `Decoder::decode` panics on some invalid input,
+# `Option::unwrap()` on a `None` at decoder.rs:453. The maintained fork,
+# `fluke-hpack` 0.3.1, has the identical panic at :505, so switching crates
+# buys nothing.
+#
+# It is not reachable here. `check_hpack_block` runs `validate_hpack_block`
+# over every block before it reaches the decoder and answers
+# GOAWAY(COMPRESSION_ERROR) on anything malformed, so the decoder only ever
+# sees blocks that have already been walked and found well-formed.
+# `http2::hpack_robustness` is what keeps that true: it runs hostile blocks
+# through the production sequence, validate then decode, and fails if any of
+# them survives validation and panics.
 hpack          = "0.3"
 ahash          = "0.8"
 libc           = "0.2"

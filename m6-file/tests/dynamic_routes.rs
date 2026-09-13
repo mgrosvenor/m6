@@ -33,7 +33,11 @@ struct Server {
 fn status_of(socket: &Path, path: &str) -> Option<String> {
     let mut s = UnixStream::connect(socket).ok()?;
     s.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
-    write!(s, "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").ok()?;
+    write!(
+        s,
+        "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    )
+    .ok()?;
     let mut buf = String::new();
     s.read_to_string(&mut buf).ok()?;
     buf.lines().next().map(str::to_string)
@@ -43,8 +47,10 @@ fn write_config(path: &Path, routes: &str) {
     std::fs::write(path, format!("[thread_pool]\nsize = 4\n\n{routes}")).unwrap();
 }
 
-const ASSETS_ROUTE: &str = "[[route]]\npath = \"/assets/{*relpath}\"\nhandler = \"files\"\nroot = \"assets/\"\n";
-const DOWNLOADS_ROUTE: &str = "[[route]]\npath = \"/downloads/{*relpath}\"\nhandler = \"files\"\nroot = \"files/\"\n";
+const ASSETS_ROUTE: &str =
+    "[[route]]\npath = \"/assets/{*relpath}\"\nhandler = \"files\"\nroot = \"assets/\"\n";
+const DOWNLOADS_ROUTE: &str =
+    "[[route]]\npath = \"/downloads/{*relpath}\"\nhandler = \"files\"\nroot = \"files/\"\n";
 
 /// Start m6-file with `routes`, serving `site`.
 fn spawn(site: &Path, config: &Path, id: &str) -> (Server, PathBuf) {
@@ -61,7 +67,11 @@ fn spawn(site: &Path, config: &Path, id: &str) -> (Server, PathBuf) {
     let ready = wait::until(Duration::from_secs(10), || {
         status_of(&socket, "/assets/a.txt").is_some()
     });
-    assert!(ready, "m6-file never answered\n--- output ---\n{}", svc.output());
+    assert!(
+        ready,
+        "m6-file never answered\n--- output ---\n{}",
+        svc.output()
+    );
     (Server { svc, _dir: dir }, socket)
 }
 
@@ -89,7 +99,9 @@ fn a_config_reload_adds_a_route_to_a_running_service() {
         "the declared route should serve"
     );
     assert!(
-        status_of(&socket, "/downloads/deep/report.txt").unwrap().contains("404"),
+        status_of(&socket, "/downloads/deep/report.txt")
+            .unwrap()
+            .contains("404"),
         "the undeclared route must not serve"
     );
 
@@ -97,8 +109,7 @@ fn a_config_reload_adds_a_route_to_a_running_service() {
     write_config(&config, &format!("{ASSETS_ROUTE}\n{DOWNLOADS_ROUTE}"));
 
     let serving = wait::until(Duration::from_secs(10), || {
-        status_of(&socket, "/downloads/deep/report.txt")
-            .is_some_and(|s| s.contains("200"))
+        status_of(&socket, "/downloads/deep/report.txt").is_some_and(|s| s.contains("200"))
     });
     assert!(
         serving,
@@ -108,7 +119,9 @@ fn a_config_reload_adds_a_route_to_a_running_service() {
 
     // And the original route is untouched by the reload.
     assert!(status_of(&socket, "/assets/a.txt").unwrap().contains("200"));
-    server.svc.assert_alive("after a config reload added a route");
+    server
+        .svc
+        .assert_alive("after a config reload added a route");
 }
 
 /// The other direction: a route removed from config stops being served, and
@@ -120,7 +133,9 @@ fn a_config_reload_removes_a_route_from_a_running_service() {
     write_config(&config, &format!("{ASSETS_ROUTE}\n{DOWNLOADS_ROUTE}"));
 
     let (mut server, socket) = spawn(site.path(), &config, "reload-remove");
-    assert!(status_of(&socket, "/downloads/deep/report.txt").unwrap().contains("200"));
+    assert!(status_of(&socket, "/downloads/deep/report.txt")
+        .unwrap()
+        .contains("200"));
 
     write_config(&config, ASSETS_ROUTE);
 
@@ -133,7 +148,9 @@ fn a_config_reload_removes_a_route_from_a_running_service() {
         server.svc.output()
     );
     assert!(status_of(&socket, "/assets/a.txt").unwrap().contains("200"));
-    server.svc.assert_alive("after a config reload removed a route");
+    server
+        .svc
+        .assert_alive("after a config reload removed a route");
 }
 
 /// A route naming a handler this binary does not have is refused, and the

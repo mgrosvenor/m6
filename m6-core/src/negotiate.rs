@@ -54,7 +54,10 @@ pub fn coding_quality(accept_encoding: &str, coding: &str) -> Option<f32> {
         let mut q: f32 = 1.0;
         for param in bits {
             let param = param.trim();
-            if let Some(v) = param.strip_prefix("q=").or_else(|| param.strip_prefix("Q=")) {
+            if let Some(v) = param
+                .strip_prefix("q=")
+                .or_else(|| param.strip_prefix("Q="))
+            {
                 // An unparseable q is treated as 1, per the general rule that a
                 // malformed parameter is ignored rather than made fatal.
                 q = v.trim().parse::<f32>().unwrap_or(1.0);

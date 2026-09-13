@@ -1,0 +1,136 @@
+name: CI
+
+# Every push and every pull request, on both long-lived branches.
+#
+# WHAT IS NOT HERE: the performance check. A wall-clock measurement on a shared
+# runner measures the runner, not the code. It stays on the build host, which
+# is quiet and is where the recorded numbers in tools/perf-baseline.txt were
+# taken. See CLAUDE.md, "Why the build host and not the laptop" -- the same
+# argument applies twice over to a runner shared with the rest of the world.
+
+on:
+  push:
+    branches: [main, develop, 'feat/**', 'fix/**', 'perf/**', 'docs/**', 'refactor/**', 'test/**', 'chore/**']
+  pull_request:
+    branches: [main, develop]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-test:
+    name: build, tests, clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Enforceable as of 2026-09-13, when the tree was formatted. Before that
+      # it would have rewritten 1,890 places: the code aligned struct fields by
+      # hand and rustfmt undoes that. The owner's call was to run it and accept
+      # the result, so now there is one answer to what the formatting is and no
+      # one has to hold it in their head.
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      # Zero warnings, release and test builds, pre-existing included. This is
+      # a standing rule and it is checked on Linux because that is where it
+      # runs: three defects have only ever shown up there.
+      - name: Release build, zero warnings
+        run: |
+          cargo build --workspace --release 2>&1 | tee build.log
+          n=$(grep -c '^warning' build.log || true)
+          echo "release warnings: $n"
+          [ "$n" -eq 0 ] || { echo "::error::$n release warning(s)"; exit 1; }
+
+      - name: Test build, zero warnings
+        run: |
+          cargo test --workspace --no-run 2>&1 | tee testbuild.log
+          n=$(grep -c '^warning' testbuild.log || true)
+          echo "test-build warnings: $n"
+          [ "$n" -eq 0 ] || { echo "::error::$n test-build warning(s)"; exit 1; }
+
+      # Capture in full, then report. Grepping the pipe drops the assertion
+      # message and leaves a bare `panicked at <file>:<line>`, which names the
+      # place and not the reason.
+      - name: Test suite
+        run: |
+          cargo test --workspace > full.log 2>&1 || true
+          grep -E '^test result:' full.log || true
+          if grep -q '^failures:' full.log; then
+            sed -n '/^failures:/,$p' full.log | head -80
+            echo "::error::tests failed"
+            exit 1
+          fi
+
+      # The count may fall and may never rise. Per platform, because clippy
+      # versions disagree; this runner is Linux, so it reads the Linux number.
+      - name: Clippy, at or under the recorded count
+        run: ./tools/clippy.sh
+
+  conformance:
+    name: h1, h2, h3 conformance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # h1spec is delivered through uvx. On the build host this was installed
+      # but not on the gate's PATH, and the resulting skip was silent, so the
+      # four h1 targets went ungated for weeks on the one box that gated a
+      # deploy. Install it explicitly and let the script fail if it is absent.
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Install h2spec
+        run: |
+          curl -sSL -o h2spec.tar.gz \
+            https://github.com/summerwind/h2spec/releases/download/v2.6.0/h2spec_linux_amd64.tar.gz
+          tar xzf h2spec.tar.gz
+          sudo install -m755 h2spec /usr/local/bin/h2spec
+          h2spec --version
+
+      - name: Install h3spec
+        run: |
+          curl -sSL -o h3spec \
+            https://github.com/kazu-yamamoto/h3spec/releases/download/v0.1.13/h3spec-linux-x86_64
+          sudo install -m755 h3spec /usr/local/bin/h3spec
+
+      - name: Build the servers under test
+        run: cargo build --workspace --release
+
+      # WITHOUT --allow-missing-tools, deliberately. All three testers are
+      # installed above, so an absent one here is a failure and not a skip.
+      # That flag exists for a laptop and is never a way to ship.
+      - name: Conformance
+        run: ./tools/conformance.sh
+
+  dependencies:
+    name: advisories, licences, duplicates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  msrv:
+    name: minimum supported Rust version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read rust-version from the workspace
+        id: msrv
+        run: echo "version=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+      # Declaring an MSRV and not testing it is a claim, not a fact.
+      - run: cargo check --workspace --all-targets

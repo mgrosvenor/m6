@@ -128,10 +128,7 @@ fn credential_matches(presented: &str, expected: &str) -> bool {
 ///
 /// Expects `Authorization: Bearer <token>`. Returns false when no token is
 /// configured, so metrics are off unless deliberately switched on.
-pub fn metrics_authorised(
-    headers: &[(String, String)],
-    configured_token: Option<&str>,
-) -> bool {
+pub fn metrics_authorised(headers: &[(String, String)], configured_token: Option<&str>) -> bool {
     let Some(expected) = configured_token.filter(|t| !t.is_empty()) else {
         return false;
     };
@@ -208,7 +205,13 @@ impl HealthReport {
         // still serving every request correctly. That is also why the numbers
         // live on `/perf` and not here.
         let code = if degraded { 503 } else { 200 };
-        (code, HealthReport { status, node: node.to_string() })
+        (
+            code,
+            HealthReport {
+                status,
+                node: node.to_string(),
+            },
+        )
     }
 
     /// Serialise to a body plus headers.
@@ -223,7 +226,10 @@ impl HealthReport {
             // monitor can still read.
             .unwrap_or_else(|_| br#"{"status":"degraded"}"#.to_vec());
         let headers = vec![
-            ("Content-Type".to_string(), "application/json; charset=utf-8".to_string()),
+            (
+                "Content-Type".to_string(),
+                "application/json; charset=utf-8".to_string(),
+            ),
             ("Cache-Control".to_string(), "no-store".to_string()),
             // Nothing here is meant for a browser to render or a crawler to
             // index, and it is a public URL.
@@ -305,9 +311,7 @@ impl PerfReport {
     ) -> PerfOutcome {
         match configured_token.filter(|t| !t.is_empty()) {
             None => PerfOutcome::Disabled,
-            Some(_) if !metrics_authorised(headers, configured_token) => {
-                PerfOutcome::Unauthorised
-            }
+            Some(_) if !metrics_authorised(headers, configured_token) => PerfOutcome::Unauthorised,
             Some(_) => {
                 // `snapshot` is a closure so the reservoir sort happens only
                 // after authorisation passes, never for an anonymous caller.
@@ -329,7 +333,10 @@ impl PerfReport {
 impl PerfOutcome {
     pub fn into_response(self) -> (u16, Vec<(String, String)>, Vec<u8>) {
         let mut headers = vec![
-            ("Content-Type".to_string(), "application/json; charset=utf-8".to_string()),
+            (
+                "Content-Type".to_string(),
+                "application/json; charset=utf-8".to_string(),
+            ),
             ("Cache-Control".to_string(), "no-store".to_string()),
             ("X-Robots-Tag".to_string(), "noindex, nofollow".to_string()),
         ];
@@ -369,15 +376,17 @@ mod tests {
     use std::path::Path;
 
     fn pool(name: &str, active: usize, total: usize) -> PoolHealth {
-        PoolHealth { name: name.to_string(), active, total }
+        PoolHealth {
+            name: name.to_string(),
+            active,
+            total,
+        }
     }
 
     #[test]
     fn origin_with_live_pools_is_ok() {
-        let (code, report) = HealthReport::build(
-            "sydney",
-            &[pool("m6-html", 1, 1), pool("m6-file", 2, 2)],
-        );
+        let (code, report) =
+            HealthReport::build("sydney", &[pool("m6-html", 1, 1), pool("m6-file", 2, 2)]);
         assert_eq!(code, 200);
         assert_eq!(report.status, "ok");
         assert_eq!(report.node, "sydney");
@@ -391,7 +400,10 @@ mod tests {
     #[test]
     fn cache_node_with_no_socket_pools_is_ok_not_degraded() {
         let (code, report) = HealthReport::build("london", &[]);
-        assert_eq!(code, 200, "a cache node has no socket pools and is not degraded for it");
+        assert_eq!(
+            code, 200,
+            "a cache node has no socket pools and is not degraded for it"
+        );
         assert_eq!(report.status, "ok");
     }
 
@@ -420,7 +432,10 @@ mod tests {
         let (code, headers, body) = report.into_response(code);
         assert_eq!(code, 200);
         let get = |k: &str| {
-            headers.iter().find(|(n, _)| n.eq_ignore_ascii_case(k)).map(|(_, v)| v.as_str())
+            headers
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(k))
+                .map(|(_, v)| v.as_str())
         };
         assert_eq!(get("Cache-Control"), Some("no-store"));
         assert_eq!(get("X-Robots-Tag"), Some("noindex, nofollow"));
@@ -463,11 +478,11 @@ mod tests {
     fn wrong_or_malformed_credentials_are_refused() {
         for value in [
             "Bearer wrong",
-            "Bearer s3cre",       // prefix of the real token
-            "Bearer s3secret1",   // longer
-            "Basic s3cret",       // wrong scheme
-            "s3cret",             // no scheme
-            "Bearer",             // no token
+            "Bearer s3cre",     // prefix of the real token
+            "Bearer s3secret1", // longer
+            "Basic s3cret",     // wrong scheme
+            "s3cret",           // no scheme
+            "Bearer",           // no token
             "",
         ] {
             assert!(
@@ -502,7 +517,16 @@ mod tests {
     fn perf_is_404_when_no_token_is_configured() {
         // Off by default, and it does not advertise a door that cannot be
         // opened: 404, not 401.
-        let out = PerfReport::build("sydney", 5, vec![], vec![], Path::new("/"), &auth("Bearer x"), None, snap);
+        let out = PerfReport::build(
+            "sydney",
+            5,
+            vec![],
+            vec![],
+            Path::new("/"),
+            &auth("Bearer x"),
+            None,
+            snap,
+        );
         let (code, _, body) = out.into_response();
         assert_eq!(code, 404);
         assert!(!String::from_utf8_lossy(&body).contains("unauthorised"));
@@ -510,7 +534,16 @@ mod tests {
 
     #[test]
     fn perf_is_401_with_a_scheme_hint_when_credentials_are_wrong() {
-        let out = PerfReport::build("sydney", 5, vec![], vec![], Path::new("/"), &auth("Bearer wrong"), Some("right"), snap);
+        let out = PerfReport::build(
+            "sydney",
+            5,
+            vec![],
+            vec![],
+            Path::new("/"),
+            &auth("Bearer wrong"),
+            Some("right"),
+            snap,
+        );
         let (code, headers, _) = out.into_response();
         assert_eq!(code, 401);
         assert!(headers
@@ -528,7 +561,16 @@ mod tests {
             taken = true;
             snap()
         };
-        let _ = PerfReport::build("sydney", 5, vec![], vec![], Path::new("/"), &[], Some("tok"), counting);
+        let _ = PerfReport::build(
+            "sydney",
+            5,
+            vec![],
+            vec![],
+            Path::new("/"),
+            &[],
+            Some("tok"),
+            counting,
+        );
         assert!(!taken, "snapshot must not be taken without authorisation");
     }
 
@@ -556,7 +598,10 @@ mod tests {
         assert_eq!(parsed["url_backends"][0], "origin");
         // And the machine underneath, so an aggregator gets a node in one
         // request and can read latency next to the load that produced it.
-        assert!(parsed["host"].is_object(), "/perf carries the host snapshot");
+        assert!(
+            parsed["host"].is_object(),
+            "/perf carries the host snapshot"
+        );
         assert!(parsed["host"]["cpus"].as_u64().unwrap_or(0) >= 1);
         assert!(parsed["host"]["disk"]["total_bytes"].as_u64().unwrap_or(0) > 0);
         // Absent, not zero, where the platform cannot answer.
@@ -595,7 +640,6 @@ mod tests {
         );
     }
 }
-
 
 // ── /traffic ─────────────────────────────────────────────────────────────────
 
@@ -801,14 +845,40 @@ mod traffic_tests {
     #[test]
     fn summarises_a_stream_into_something_small() {
         let mut lines = vec![
-            row("2026-09-11T08:00:00Z", "1.2.3.4", "/", 200, "Mozilla/5.0 Chrome/131"),
-            row("2026-09-11T08:00:01Z", "5.6.7.8", "/robots.txt", 200,
-                "Mozilla/5.0 (compatible; ClaudeBot/1.0; +claudebot@anthropic.com)"),
-            row("2026-09-11T08:00:02Z", "9.9.9.9", "/.git/config", 404, "curl/8"),
+            row(
+                "2026-09-11T08:00:00Z",
+                "1.2.3.4",
+                "/",
+                200,
+                "Mozilla/5.0 Chrome/131",
+            ),
+            row(
+                "2026-09-11T08:00:01Z",
+                "5.6.7.8",
+                "/robots.txt",
+                200,
+                "Mozilla/5.0 (compatible; ClaudeBot/1.0; +claudebot@anthropic.com)",
+            ),
+            row(
+                "2026-09-11T08:00:02Z",
+                "9.9.9.9",
+                "/.git/config",
+                404,
+                "curl/8",
+            ),
         ];
         // A real scan: three distinct probe paths from one address.
-        for (i, p) in ["/.env", "/wp-admin/setup.php", "/@fs/etc/passwd"].iter().enumerate() {
-            lines.push(row(&format!("2026-09-11T08:01:{:02}Z", i), "203.0.113.5", p, 404, "curl/8"));
+        for (i, p) in ["/.env", "/wp-admin/setup.php", "/@fs/etc/passwd"]
+            .iter()
+            .enumerate()
+        {
+            lines.push(row(
+                &format!("2026-09-11T08:01:{:02}Z", i),
+                "203.0.113.5",
+                p,
+                404,
+                "curl/8",
+            ));
         }
         let r = TrafficReport::build("sydney", &lines.join("\n"), "", 60);
 
@@ -829,14 +899,26 @@ mod traffic_tests {
     /// Never having logged is not the same as having logged just now.
     #[test]
     fn logging_health_distinguishes_never_from_recently() {
-        let never = LoggingHealth { events_total: 0, seconds_since_last: None };
+        let never = LoggingHealth {
+            events_total: 0,
+            seconds_since_last: None,
+        };
         assert!(never.is_blind());
 
-        let alive = LoggingHealth { events_total: 5000, seconds_since_last: Some(3) };
+        let alive = LoggingHealth {
+            events_total: 5000,
+            seconds_since_last: Some(3),
+        };
         assert!(!alive.is_blind());
 
         // Silenced: the process is up and the main layer stopped.
-        let quiet = LoggingHealth { events_total: 5000, seconds_since_last: Some(600) };
-        assert!(quiet.is_blind(), "ten minutes of silence from a 10s heartbeat");
+        let quiet = LoggingHealth {
+            events_total: 5000,
+            seconds_since_last: Some(600),
+        };
+        assert!(
+            quiet.is_blind(),
+            "ten minutes of silence from a 10s heartbeat"
+        );
     }
 }

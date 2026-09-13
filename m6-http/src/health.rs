@@ -111,8 +111,16 @@ mod monitoring_exclusion_tests {
     /// than the one above and much harder to notice.
     #[test]
     fn real_backends_are_still_counted() {
-        for backend in ["cache", "m6-html", "m6-file", "render-contact",
-                        "render-analytics", "origin", "method-check", ""] {
+        for backend in [
+            "cache",
+            "m6-html",
+            "m6-file",
+            "render-contact",
+            "render-analytics",
+            "origin",
+            "method-check",
+            "",
+        ] {
             assert!(
                 !is_monitoring_endpoint(backend),
                 "{backend} is real traffic and must be counted"
@@ -277,9 +285,24 @@ mod traffic_endpoint_tests {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         let now = m6_core::util::now_iso8601();
         let ts = now.trim_end_matches('Z');
-        writeln!(f, "{}", row(&format!("{ts}.100Z"), "1.2.3.4", "/", 200, "Chrome/131")).unwrap();
-        writeln!(f, "{}", row(&format!("{ts}.200Z"), "5.6.7.8", "/robots.txt", 200,
-            "Mozilla/5.0 (compatible; ClaudeBot/1.0; +claudebot@anthropic.com)")).unwrap();
+        writeln!(
+            f,
+            "{}",
+            row(&format!("{ts}.100Z"), "1.2.3.4", "/", 200, "Chrome/131")
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "{}",
+            row(
+                &format!("{ts}.200Z"),
+                "5.6.7.8",
+                "/robots.txt",
+                200,
+                "Mozilla/5.0 (compatible; ClaudeBot/1.0; +claudebot@anthropic.com)"
+            )
+        )
+        .unwrap();
         f.flush().unwrap();
 
         let out = traffic(
@@ -295,10 +318,17 @@ mod traffic_endpoint_tests {
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["node"], "sydney");
         assert_eq!(v["total_requests"], 2);
-        assert_eq!(v["crawlers"][0]["user_agent"].as_str().unwrap().contains("ClaudeBot"), true);
+        assert_eq!(
+            v["crawlers"][0]["user_agent"]
+                .as_str()
+                .unwrap()
+                .contains("ClaudeBot"),
+            true
+        );
         assert!(v["logging"].is_object(), "logging health travels with it");
         // Never cached by anything in between.
-        assert!(headers.iter().any(|(k, val)|
-            k.eq_ignore_ascii_case("cache-control") && val == "no-store"));
+        assert!(headers
+            .iter()
+            .any(|(k, val)| k.eq_ignore_ascii_case("cache-control") && val == "no-store"));
     }
 }

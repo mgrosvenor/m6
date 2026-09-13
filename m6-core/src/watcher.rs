@@ -78,9 +78,8 @@ impl ConfigWatcher {
         // writes produces one event on close instead of a reload per write.
         // `IN_CREATE` and `IN_MOVED_TO` catch the write-to-temp-then-rename
         // that every careful editor and every deploy script does.
-        let mask = AddWatchFlags::IN_CLOSE_WRITE
-            | AddWatchFlags::IN_CREATE
-            | AddWatchFlags::IN_MOVED_TO;
+        let mask =
+            AddWatchFlags::IN_CLOSE_WRITE | AddWatchFlags::IN_CREATE | AddWatchFlags::IN_MOVED_TO;
 
         for dir in watch_targets(paths, false) {
             if let Err(e) = inotify.add_watch(&dir, mask) {
@@ -156,7 +155,7 @@ impl ConfigWatcher {
     /// a closed descriptor). Registering here means the watch is live before
     /// `new` returns, which is the contract Linux always had.
     pub fn new(paths: &[&Path]) -> anyhow::Result<Self> {
-        use nix::sys::event::{EventFilter, EvFlags, FilterFlag, KEvent, Kqueue};
+        use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 
         let kq = Kqueue::new().map_err(|e| anyhow::anyhow!("kqueue failed: {e}"))?;
         let mut watched = Vec::new();
@@ -196,7 +195,10 @@ impl ConfigWatcher {
             watched.push(file);
         }
 
-        Ok(ConfigWatcher { kq, _watched: watched })
+        Ok(ConfigWatcher {
+            kq,
+            _watched: watched,
+        })
     }
 
     pub fn raw_fd(&self) -> Option<RawFd> {
@@ -211,7 +213,7 @@ impl ConfigWatcher {
     /// costs a spurious reload. Linux compares the name and does not. The cost
     /// is one wasted reload on a development machine, so it stays.
     pub fn read_events(&mut self, _filenames: &[&str]) -> bool {
-        use nix::sys::event::{EventFilter, EvFlags, FilterFlag, KEvent};
+        use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent};
 
         let mut evs = [KEvent::new(
             0,
@@ -241,8 +243,10 @@ impl ConfigWatcher {
 /// already told us something is ready, and a blocking drain here would hold the
 /// loop.
 #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
-const ZERO_TIMEOUT: nix::libc::timespec =
-    nix::libc::timespec { tv_sec: 0, tv_nsec: 0 };
+const ZERO_TIMEOUT: nix::libc::timespec = nix::libc::timespec {
+    tv_sec: 0,
+    tv_nsec: 0,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Fallback (no-op)
@@ -320,7 +324,10 @@ mod tests {
         write_file(&cfg, "size = 1\n");
 
         let mut w = ConfigWatcher::new(&[cfg.as_path()]).expect("watcher");
-        assert!(w.raw_fd().is_some(), "a supported platform must expose an fd");
+        assert!(
+            w.raw_fd().is_some(),
+            "a supported platform must expose an fd"
+        );
 
         write_file(&cfg, "size = 2\n");
 
@@ -354,7 +361,10 @@ mod tests {
             !readable_within(&w, 300),
             "the watcher fd was readable with nothing happening"
         );
-        assert!(!w.read_events(&["app.conf"]), "an idle watcher reported an event");
+        assert!(
+            !w.read_events(&["app.conf"]),
+            "an idle watcher reported an event"
+        );
     }
 
     /// A directory that does not exist is skipped, not fatal.

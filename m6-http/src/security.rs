@@ -143,7 +143,9 @@ mod tests {
             "content-security-policy",
         ] {
             assert!(
-                headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(expected)),
+                headers
+                    .iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case(expected)),
                 "missing {expected} in {headers:?}"
             );
         }
@@ -154,10 +156,7 @@ mod tests {
         let _g = LOCK.lock().unwrap();
         configure(&SecurityConfig::default());
 
-        let mut headers = vec![(
-            "X-Frame-Options".to_string(),
-            "SAMEORIGIN".to_string(),
-        )];
+        let mut headers = vec![("X-Frame-Options".to_string(), "SAMEORIGIN".to_string())];
         apply(&mut headers);
 
         let values: Vec<&str> = headers
@@ -165,13 +164,20 @@ mod tests {
             .filter(|(k, _)| k.eq_ignore_ascii_case("x-frame-options"))
             .map(|(_, v)| v.as_str())
             .collect();
-        assert_eq!(values, vec!["SAMEORIGIN"], "backend's value must win, exactly once");
+        assert_eq!(
+            values,
+            vec!["SAMEORIGIN"],
+            "backend's value must win, exactly once"
+        );
     }
 
     #[test]
     fn report_only_mode_sends_report_only_header_name_with_same_policy() {
         let _g = LOCK.lock().unwrap();
-        let cfg = SecurityConfig { csp_mode: crate::config::CspMode::ReportOnly, ..SecurityConfig::default() };
+        let cfg = SecurityConfig {
+            csp_mode: crate::config::CspMode::ReportOnly,
+            ..SecurityConfig::default()
+        };
         let policy = cfg.content_security_policy.clone();
         configure(&cfg);
 
@@ -179,7 +185,9 @@ mod tests {
         apply(&mut headers);
 
         assert!(
-            !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-security-policy")),
+            !headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("content-security-policy")),
             "report-only mode must not send the enforcing header name"
         );
         let report_only = headers
@@ -195,18 +203,25 @@ mod tests {
     #[test]
     fn off_mode_omits_csp_header_entirely_regardless_of_policy_string() {
         let _g = LOCK.lock().unwrap();
-        let cfg = SecurityConfig { csp_mode: crate::config::CspMode::Off, ..SecurityConfig::default() };
+        let cfg = SecurityConfig {
+            csp_mode: crate::config::CspMode::Off,
+            ..SecurityConfig::default()
+        };
         configure(&cfg);
 
         let mut headers = Vec::new();
         apply(&mut headers);
 
         assert!(
-            !headers.iter().any(|(k, _)| k.to_ascii_lowercase().starts_with("content-security-policy")),
+            !headers.iter().any(|(k, _)| k
+                .to_ascii_lowercase()
+                .starts_with("content-security-policy")),
             "off mode must send neither the enforcing nor report-only CSP header"
         );
         assert!(
-            headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("x-frame-options")),
+            headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("x-frame-options")),
             "off mode must only affect CSP, not the other security headers"
         );
     }

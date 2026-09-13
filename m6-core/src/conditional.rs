@@ -69,7 +69,11 @@ fn etag_strong_eq(a: &str, b: &str) -> bool {
 /// match (a full 200 instead of a 304), never a wrongly authorised write.
 fn etag_list_contains(list: &str, tag: &str, strong: bool) -> bool {
     list.split(',').any(|candidate| {
-        if strong { etag_strong_eq(candidate, tag) } else { etag_weak_eq(candidate, tag) }
+        if strong {
+            etag_strong_eq(candidate, tag)
+        } else {
+            etag_weak_eq(candidate, tag)
+        }
     })
 }
 
@@ -104,12 +108,18 @@ pub fn evaluate_preconditions(
     let lm_secs = || {
         last_modified
             .and_then(|lm| httpdate::parse_http_date(lm).ok())
-            .map(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs())
+            .map(|t| {
+                t.duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            })
     };
     let hdr_secs = |v: &str| {
-        httpdate::parse_http_date(v)
-            .ok()
-            .map(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs())
+        httpdate::parse_http_date(v).ok().map(|t| {
+            t.duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        })
     };
 
     // 1. If-Match — strong comparison.
@@ -145,7 +155,11 @@ pub fn evaluate_preconditions(
         return if matched {
             // A match means the client already has it. Safe methods get 304;
             // anything else is a failed precondition on a state change.
-            if is_get_or_head { Precondition::NotModified } else { Precondition::Failed }
+            if is_get_or_head {
+                Precondition::NotModified
+            } else {
+                Precondition::Failed
+            }
         } else {
             Precondition::Proceed
         };
@@ -199,7 +213,8 @@ pub fn not_modified_headers(cached_headers: &[(String, String)]) -> Vec<(String,
     // 304 only when it equals the 200's length, and getting that wrong is
     // worse than omitting it. The serialisers set framing for a bodyless
     // response themselves.
-    cached_headers.iter()
+    cached_headers
+        .iter()
         .filter(|(k, _)| {
             let k = k.to_ascii_lowercase();
             k == "etag"
@@ -221,11 +236,17 @@ mod precondition_tests {
     fn stored() -> Vec<(String, String)> {
         vec![
             ("ETag".to_string(), "\"abc123\"".to_string()),
-            ("Last-Modified".to_string(), "Thu, 03 Sep 2026 10:00:00 GMT".to_string()),
+            (
+                "Last-Modified".to_string(),
+                "Thu, 03 Sep 2026 10:00:00 GMT".to_string(),
+            ),
         ]
     }
     fn req(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
     fn eval(h: &[(&str, &str)], method: &str) -> Precondition {
         evaluate_preconditions(&stored(), &req(h)[..], method)
@@ -248,26 +269,47 @@ mod precondition_tests {
 
     #[test]
     fn if_none_match_list_and_wildcard() {
-        assert_eq!(eval(&[("if-none-match", "\"x\", \"abc123\", \"y\"")], "GET"), Precondition::NotModified);
-        assert_eq!(eval(&[("if-none-match", "*")], "GET"), Precondition::NotModified);
-        assert_eq!(eval(&[("if-none-match", "\"nope\"")], "GET"), Precondition::Proceed);
+        assert_eq!(
+            eval(&[("if-none-match", "\"x\", \"abc123\", \"y\"")], "GET"),
+            Precondition::NotModified
+        );
+        assert_eq!(
+            eval(&[("if-none-match", "*")], "GET"),
+            Precondition::NotModified
+        );
+        assert_eq!(
+            eval(&[("if-none-match", "\"nope\"")], "GET"),
+            Precondition::Proceed
+        );
     }
 
     /// On an unsafe method a matching If-None-Match is a failed precondition,
     /// not a 304 — 304 is meaningless as a response to a state change.
     #[test]
     fn if_none_match_on_unsafe_method_is_412() {
-        assert_eq!(eval(&[("if-none-match", "*")], "POST"), Precondition::Failed);
-        assert_eq!(eval(&[("if-none-match", "\"abc123\"")], "PUT"), Precondition::Failed);
+        assert_eq!(
+            eval(&[("if-none-match", "*")], "POST"),
+            Precondition::Failed
+        );
+        assert_eq!(
+            eval(&[("if-none-match", "\"abc123\"")], "PUT"),
+            Precondition::Failed
+        );
     }
 
     /// F006. If-Match was ignored entirely, so a conditional write guarding
     /// against a lost update was applied unconditionally.
     #[test]
     fn if_match_is_enforced_with_strong_comparison() {
-        assert_eq!(eval(&[("if-match", "\"abc123\"")], "PUT"), Precondition::Proceed);
+        assert_eq!(
+            eval(&[("if-match", "\"abc123\"")], "PUT"),
+            Precondition::Proceed
+        );
         assert_eq!(eval(&[("if-match", "*")], "PUT"), Precondition::Proceed);
-        assert_eq!(eval(&[("if-match", "\"stale\"")], "PUT"), Precondition::Failed);
+        assert_eq!(
+            eval(&[("if-match", "\"stale\"")], "PUT"),
+            Precondition::Failed
+        );
         // Strong comparison: a weak tag must NOT authorise a write, even though
         // it names the same entity.
         assert_eq!(
@@ -281,11 +323,17 @@ mod precondition_tests {
     fn if_unmodified_since_is_enforced() {
         // Resource modified 03 Sep; client believes it is unchanged since 01 Sep.
         assert_eq!(
-            eval(&[("if-unmodified-since", "Tue, 01 Sep 2026 10:00:00 GMT")], "PUT"),
+            eval(
+                &[("if-unmodified-since", "Tue, 01 Sep 2026 10:00:00 GMT")],
+                "PUT"
+            ),
             Precondition::Failed
         );
         assert_eq!(
-            eval(&[("if-unmodified-since", "Sat, 05 Sep 2026 10:00:00 GMT")], "PUT"),
+            eval(
+                &[("if-unmodified-since", "Sat, 05 Sep 2026 10:00:00 GMT")],
+                "PUT"
+            ),
             Precondition::Proceed
         );
     }
@@ -298,7 +346,7 @@ mod precondition_tests {
         assert_eq!(
             eval(
                 &[
-                    ("if-match", "\"abc123\""),                              // passes
+                    ("if-match", "\"abc123\""),                               // passes
                     ("if-unmodified-since", "Tue, 01 Sep 2026 10:00:00 GMT"), // would fail
                 ],
                 "PUT"
@@ -311,7 +359,10 @@ mod precondition_tests {
     #[test]
     fn failed_if_match_beats_if_none_match() {
         assert_eq!(
-            eval(&[("if-match", "\"stale\""), ("if-none-match", "\"abc123\"")], "GET"),
+            eval(
+                &[("if-match", "\"stale\""), ("if-none-match", "\"abc123\"")],
+                "GET"
+            ),
             Precondition::Failed
         );
     }
@@ -323,8 +374,8 @@ mod precondition_tests {
         assert_eq!(
             eval(
                 &[
-                    ("if-none-match", "\"different\""),                       // no match -> proceed
-                    ("if-modified-since", "Sat, 05 Sep 2026 10:00:00 GMT"),   // would say 304
+                    ("if-none-match", "\"different\""), // no match -> proceed
+                    ("if-modified-since", "Sat, 05 Sep 2026 10:00:00 GMT"), // would say 304
                 ],
                 "GET"
             ),
@@ -335,11 +386,17 @@ mod precondition_tests {
     #[test]
     fn if_modified_since_still_works_alone() {
         assert_eq!(
-            eval(&[("if-modified-since", "Sat, 05 Sep 2026 10:00:00 GMT")], "GET"),
+            eval(
+                &[("if-modified-since", "Sat, 05 Sep 2026 10:00:00 GMT")],
+                "GET"
+            ),
             Precondition::NotModified
         );
         assert_eq!(
-            eval(&[("if-modified-since", "Tue, 01 Sep 2026 10:00:00 GMT")], "GET"),
+            eval(
+                &[("if-modified-since", "Tue, 01 Sep 2026 10:00:00 GMT")],
+                "GET"
+            ),
             Precondition::Proceed
         );
     }
@@ -348,13 +405,22 @@ mod precondition_tests {
     /// failure. Otherwise a malformed header turns every request into a 412.
     #[test]
     fn unparseable_dates_are_ignored_not_failed() {
-        assert_eq!(eval(&[("if-unmodified-since", "not a date")], "PUT"), Precondition::Proceed);
-        assert_eq!(eval(&[("if-modified-since", "not a date")], "GET"), Precondition::Proceed);
+        assert_eq!(
+            eval(&[("if-unmodified-since", "not a date")], "PUT"),
+            Precondition::Proceed
+        );
+        assert_eq!(
+            eval(&[("if-modified-since", "not a date")], "GET"),
+            Precondition::Proceed
+        );
     }
 
     #[test]
     fn no_preconditions_proceeds() {
         assert_eq!(eval(&[], "GET"), Precondition::Proceed);
-        assert_eq!(eval(&[("accept", "text/html")], "GET"), Precondition::Proceed);
+        assert_eq!(
+            eval(&[("accept", "text/html")], "GET"),
+            Precondition::Proceed
+        );
     }
 }

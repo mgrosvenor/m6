@@ -58,12 +58,19 @@ impl Service {
         let err = child.stderr.take().expect("stderr was piped");
         drains.push(spawn_drain(name, "stderr", err, Arc::clone(&output)));
 
-        Service { name: name.to_string(), child: Some(child), output, drains }
+        Service {
+            name: name.to_string(),
+            child: Some(child),
+            output,
+            drains,
+        }
     }
 
     /// `Some(status)` once the child has exited, `None` while it runs.
     fn exited(&mut self) -> Option<ExitStatus> {
-        self.child.as_mut().and_then(|c| c.try_wait().ok().flatten())
+        self.child
+            .as_mut()
+            .and_then(|c| c.try_wait().ok().flatten())
     }
 
     /// Kill the service now rather than at drop, for a test whose subject is
@@ -132,7 +139,10 @@ impl Service {
                 return;
             }
             if let Some(status) = self.exited() {
-                panic!("{}", self.death_report(&format!("waiting for port {port}"), status));
+                panic!(
+                    "{}",
+                    self.death_report(&format!("waiting for port {port}"), status)
+                );
             }
             if Instant::now() >= deadline {
                 panic!(
@@ -244,7 +254,11 @@ fn tail(s: &str, n: usize) -> String {
     if start == 0 {
         s.to_string()
     } else {
-        format!("({} earlier lines omitted)\n{}", start, lines[start..].join("\n"))
+        format!(
+            "({} earlier lines omitted)\n{}",
+            start,
+            lines[start..].join("\n")
+        )
     }
 }
 

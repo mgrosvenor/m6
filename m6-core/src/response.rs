@@ -1,4 +1,20 @@
-/// HTTP response type and constructors.
+//! What a handler returns.
+//!
+//! A `Response` is a status, headers and a `Body`, where the body is either
+//! bytes or a stream of known length. The distinction is load-bearing: a body
+//! core has not read cannot be minified, compressed or hashed into an ETag,
+//! and making that a flag beside the bytes would leave those three free to run
+//! against bytes that are not there.
+//!
+//! `verbatim` marks a response whose representation the handler has already
+//! decided -- it negotiated the coding, compressed, and built a validator
+//! naming the result -- so the pipeline leaves it alone. Compressing such a
+//! body again would put brotli bytes on the wire under an ETag asserting
+//! identity.
+//!
+//! `send` takes `self` by value, because a stream owns its reader and a
+//! response goes on the wire once.
+
 use serde_json::{Map, Value};
 
 use crate::error::{Error, Result};
@@ -180,11 +196,7 @@ impl Response {
     }
 
     /// Record a template render from a dict directly, without a `Request`.
-    pub fn render_dict(
-        template: &str,
-        dict: &Map<String, Value>,
-        status: u16,
-    ) -> Result<Self> {
+    pub fn render_dict(template: &str, dict: &Map<String, Value>, status: u16) -> Result<Self> {
         Self::render_context(template, dict.clone().into(), status)
     }
 
@@ -266,7 +278,10 @@ impl Response {
     pub fn html(s: impl Into<String>) -> Self {
         Self {
             status: 200,
-            headers: vec![("Content-Type".to_string(), "text/html; charset=utf-8".to_string())],
+            headers: vec![(
+                "Content-Type".to_string(),
+                "text/html; charset=utf-8".to_string(),
+            )],
             body: Body::Bytes(s.into().into_bytes()),
             verbatim: false,
             template_name: None,
@@ -298,7 +313,10 @@ impl Response {
         Self {
             status,
             headers: vec![],
-            body: Body::Stream { len, reader: Box::new(reader) },
+            body: Body::Stream {
+                len,
+                reader: Box::new(reader),
+            },
             verbatim: true,
             template_name: None,
             template_dict: None,
@@ -324,7 +342,10 @@ impl Response {
     pub fn text(s: &str) -> Self {
         Self {
             status: 200,
-            headers: vec![("Content-Type".to_string(), "text/plain; charset=utf-8".to_string())],
+            headers: vec![(
+                "Content-Type".to_string(),
+                "text/plain; charset=utf-8".to_string(),
+            )],
             body: Body::Bytes(s.as_bytes().to_vec()),
             verbatim: false,
             template_name: None,
@@ -390,11 +411,10 @@ impl Response {
         use hmac::{Hmac, Mac};
         use sha2::Sha256;
 
-        let msg_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(message.as_bytes());
+        let msg_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(message.as_bytes());
 
-        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret)
-            .expect("HMAC accepts any key length");
+        let mut mac =
+            <Hmac<Sha256> as Mac>::new_from_slice(secret).expect("HMAC accepts any key length");
         mac.update(msg_b64.as_bytes());
         let sig_bytes = mac.finalize().into_bytes();
         let sig_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&sig_bytes);
@@ -429,13 +449,20 @@ impl Response {
         self,
         resp: &mut crate::h1::Responder<'_, W>,
     ) -> anyhow::Result<()> {
-        let Response { status, headers, body, .. } = self;
+        let Response {
+            status,
+            headers,
+            body,
+            ..
+        } = self;
 
         let has = |name: &str| crate::headers::contains(&headers[..], name);
 
         let etag;
-        let mut hdrs: Vec<(&str, &str)> =
-            headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let mut hdrs: Vec<(&str, &str)> = headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
 
         if !has("content-type") && !body.is_empty() {
             hdrs.push(("Content-Type", "text/html; charset=utf-8"));
@@ -474,7 +501,6 @@ fn content_hash(body: &[u8]) -> u64 {
     hasher.finish()
 }
 
-
 /// Map an `Error` to a `Response` (status only, body set by framework).
 pub fn error_to_response(err: &Error) -> Response {
     match err {
@@ -499,7 +525,10 @@ mod body_tests {
             let mut resp = Responder::new(&mut out, method, false);
             r.send(&mut resp).expect("send");
         }
-        let sep = out.windows(4).position(|w| w == b"\r\n\r\n").expect("header terminator");
+        let sep = out
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("header terminator");
         let head = String::from_utf8(out[..sep].to_vec()).expect("headers are ASCII");
         (head, out[sep + 4..].to_vec())
     }
@@ -509,12 +538,19 @@ mod body_tests {
     #[test]
     fn a_streamed_body_reaches_the_wire_with_its_length() {
         let payload = b"the quick brown fox".to_vec();
-        let r = Response::stream(200, payload.len() as u64, std::io::Cursor::new(payload.clone()))
-            .header("Content-Type", "text/plain");
+        let r = Response::stream(
+            200,
+            payload.len() as u64,
+            std::io::Cursor::new(payload.clone()),
+        )
+        .header("Content-Type", "text/plain");
 
         let (head, body) = send_to_wire(r, "GET");
         assert!(head.contains("200"), "{head}");
-        assert!(head.contains(&format!("Content-Length: {}", payload.len())), "{head}");
+        assert!(
+            head.contains(&format!("Content-Length: {}", payload.len())),
+            "{head}"
+        );
         assert_eq!(body, payload);
     }
 
@@ -540,13 +576,19 @@ mod body_tests {
     /// beside an optional reader.
     #[test]
     fn a_stream_offers_no_bytes_to_transform() {
-        let s = Body::Stream { len: 4, reader: Box::new(std::io::Cursor::new(b"abcd".to_vec())) };
+        let s = Body::Stream {
+            len: 4,
+            reader: Box::new(std::io::Cursor::new(b"abcd".to_vec())),
+        };
         assert!(s.as_bytes().is_none());
         assert_eq!(s.len(), 4);
         // And is not "empty", which is the test the pipeline steps use to skip
         // work: a zero-length stream is still a stream.
         assert!(!s.is_empty());
-        let zero = Body::Stream { len: 0, reader: Box::new(std::io::empty()) };
+        let zero = Body::Stream {
+            len: 0,
+            reader: Box::new(std::io::empty()),
+        };
         assert!(!zero.is_empty());
 
         let b = Body::Bytes(b"abcd".to_vec());

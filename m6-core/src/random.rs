@@ -53,7 +53,8 @@ mod tests {
     fn output_is_lowercase_hex_only() {
         let t = random_hex_token::<32>();
         assert!(
-            t.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            t.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
             "non-hex character in {t}"
         );
     }

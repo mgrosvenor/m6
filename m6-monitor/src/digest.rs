@@ -140,8 +140,7 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
             findings.push(Finding {
                 level: Level::Fault,
                 node: r.name.clone(),
-                text: "reports degraded: a configured socket pool has no live member"
-                    .to_string(),
+                text: "reports degraded: a configured socket pool has no live member".to_string(),
             });
         }
 
@@ -176,7 +175,10 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
                 findings.push(Finding {
                     level: Level::Warn,
                     node: r.name.clone(),
-                    text: format!("{} backend errors since start", p.metrics.backend_errors_total),
+                    text: format!(
+                        "{} backend errors since start",
+                        p.metrics.backend_errors_total
+                    ),
                 });
             }
 
@@ -261,7 +263,13 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
 
     findings.sort_by(|a, b| b.level.cmp(&a.level));
     let level = findings.iter().map(|f| f.level).max().unwrap_or(Level::Ok);
-    Digest { generated_at: now, nodes, findings, level, thresholds: t.clone() }
+    Digest {
+        generated_at: now,
+        nodes,
+        findings,
+        level,
+        thresholds: t.clone(),
+    }
 }
 
 #[cfg(test)]
@@ -287,7 +295,10 @@ mod tests {
             name: name.into(),
             role: "origin".into(),
             url: "http://x".into(),
-            health: Some(HealthReport { status: status.into(), node: "sydney".into() }),
+            health: Some(HealthReport {
+                status: status.into(),
+                node: "sydney".into(),
+            }),
             health_status: Some(if status == "degraded" { 503 } else { 200 }),
             perf,
             perf_error: None,
@@ -306,18 +317,31 @@ mod tests {
     fn a_healthy_fleet_has_no_findings() {
         let host = HostSnapshot {
             cpus: 2,
-            load: Some(LoadAverage { one: 0.13, five: 0.1, fifteen: 0.09, running: 1, total: 231 }),
+            load: Some(LoadAverage {
+                one: 0.13,
+                five: 0.1,
+                fifteen: 0.09,
+                running: 1,
+                total: 231,
+            }),
             memory: Some(Memory {
                 total_bytes: 1_000_000,
                 available_bytes: 700_000,
                 source: MemorySource::Host,
             }),
-            disk: Some(Disk { total_bytes: 1000, available_bytes: 600 }),
+            disk: Some(Disk {
+                total_bytes: 1000,
+                available_bytes: 600,
+            }),
             thermal: vec![],
             uptime_s: Some(694_521),
             ..Default::default()
         };
-        let d = build(&[reading("origin", "ok", Some(perf(host, vec![])))], &Thresholds::default(), now());
+        let d = build(
+            &[reading("origin", "ok", Some(perf(host, vec![])))],
+            &Thresholds::default(),
+            now(),
+        );
         assert_eq!(d.level, Level::Ok);
         assert!(d.findings.is_empty(), "{:?}", d.findings);
         assert_eq!(d.nodes[0].cpus, Some(2));
@@ -330,12 +354,21 @@ mod tests {
     fn load_is_judged_per_cpu() {
         let mk = |cpus: usize| HostSnapshot {
             cpus,
-            load: Some(LoadAverage { one: 3.0, five: 3.0, fifteen: 3.0, running: 3, total: 100 }),
+            load: Some(LoadAverage {
+                one: 3.0,
+                five: 3.0,
+                fifteen: 3.0,
+                running: 3,
+                total: 100,
+            }),
             ..Default::default()
         };
         let t = Thresholds::default();
         let quiet = build(&[reading("a", "ok", Some(perf(mk(4), vec![])))], &t, now());
-        assert!(quiet.findings.is_empty(), "3.0 across 4 cpu is not a warning");
+        assert!(
+            quiet.findings.is_empty(),
+            "3.0 across 4 cpu is not a warning"
+        );
         let busy = build(&[reading("b", "ok", Some(perf(mk(1), vec![])))], &t, now());
         assert_eq!(busy.level, Level::Warn);
         assert!(busy.findings[0].text.contains("per cpu"));
@@ -344,11 +377,23 @@ mod tests {
     #[test]
     fn an_empty_pool_is_a_fault_and_so_is_the_degraded_verdict() {
         let pools = vec![
-            PoolHealth { name: "m6-html".into(), active: 1, total: 1 },
-            PoolHealth { name: "render-contact".into(), active: 0, total: 2 },
+            PoolHealth {
+                name: "m6-html".into(),
+                active: 1,
+                total: 1,
+            },
+            PoolHealth {
+                name: "render-contact".into(),
+                active: 0,
+                total: 2,
+            },
         ];
         let d = build(
-            &[reading("origin", "degraded", Some(perf(HostSnapshot::default(), pools)))],
+            &[reading(
+                "origin",
+                "degraded",
+                Some(perf(HostSnapshot::default(), pools)),
+            )],
             &Thresholds::default(),
             now(),
         );
@@ -385,7 +430,11 @@ mod tests {
     #[test]
     fn an_empty_latency_window_is_absent_not_zero() {
         let d = build(
-            &[reading("origin", "ok", Some(perf(HostSnapshot::default(), vec![])))],
+            &[reading(
+                "origin",
+                "ok",
+                Some(perf(HostSnapshot::default(), vec![])),
+            )],
             &Thresholds::default(),
             now(),
         );

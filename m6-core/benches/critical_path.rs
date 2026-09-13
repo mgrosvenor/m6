@@ -15,8 +15,10 @@ use tempfile::TempDir;
 // Helper: build an HTML response from outside the crate (template_name is pub(crate)).
 fn html_response(html: String) -> Response {
     let mut r = Response::status(200);
-    r.headers
-        .push(("Content-Type".to_string(), "text/html; charset=utf-8".to_string()));
+    r.headers.push((
+        "Content-Type".to_string(),
+        "text/html; charset=utf-8".to_string(),
+    ));
     r.body = m6_core::Body::Bytes(html.into_bytes());
     r
 }
@@ -209,8 +211,7 @@ const JS_3KB: &[u8] = b"
 // ── Fixtures ──────────────────────────────────────────────────────────────────
 
 /// Minimal Tera template — one variable substitution.
-const MINIMAL_TEMPLATE: &str =
-    "<!doctype html><html><body><h1>{{ title }}</h1></body></html>";
+const MINIMAL_TEMPLATE: &str = "<!doctype html><html><body><h1>{{ title }}</h1></body></html>";
 
 fn make_routes() -> Vec<CompiledRoute> {
     let patterns = &[
@@ -233,18 +234,17 @@ fn make_routes() -> Vec<CompiledRoute> {
                 status: 200,
                 cache: "public".to_string(),
                 headers: Vec::new(),
-            last_modified: None,
-            specificity: spec,
-            handler: None,
-            settings: std::sync::Arc::new(serde_json::Map::new()),
-            base_dict: std::sync::Arc::new(serde_json::Map::new()),
+                last_modified: None,
+                specificity: spec,
+                handler: None,
+                settings: std::sync::Arc::new(serde_json::Map::new()),
+                base_dict: std::sync::Arc::new(serde_json::Map::new()),
             }
         })
         .collect();
     routes.sort_by(|a, b| b.specificity.cmp(&a.specificity));
     routes
 }
-
 
 // ── Percentile reporter ────────────────────────────────────────────────────────
 
@@ -325,11 +325,11 @@ fn bench_match_route(c: &mut Criterion) {
         status: 200,
         cache: "public".to_string(),
         headers: Vec::new(),
-            last_modified: None,
-            specificity: route_specificity(&segs),
-            handler: None,
-            settings: std::sync::Arc::new(serde_json::Map::new()),
-            base_dict: std::sync::Arc::new(serde_json::Map::new()),
+        last_modified: None,
+        specificity: route_specificity(&segs),
+        handler: None,
+        settings: std::sync::Arc::new(serde_json::Map::new()),
+        base_dict: std::sync::Arc::new(serde_json::Map::new()),
     };
     let path_segs: Vec<&str> = "/blog/hello-world"
         .split('/')
@@ -388,7 +388,12 @@ fn bench_template_render(c: &mut Criterion) {
     let mut group = c.benchmark_group("template_render");
     group.sample_size(1_000);
     group.bench_function("template_render", |b| {
-        b.iter(|| black_box(tera.render(black_box("page.html"), black_box(&ctx)).unwrap()))
+        b.iter(|| {
+            black_box(
+                tera.render(black_box("page.html"), black_box(&ctx))
+                    .unwrap(),
+            )
+        })
     });
     group.finish();
 }
@@ -402,8 +407,12 @@ fn bench_template_render(c: &mut Criterion) {
 /// meant before -- serialisation only.
 fn response_to_write() -> Response {
     let mut r = Response::status(200);
-    r.headers.push(("Content-Type".to_string(), "text/html; charset=utf-8".to_string()));
-    r.headers.push(("Cache-Control".to_string(), "public".to_string()));
+    r.headers.push((
+        "Content-Type".to_string(),
+        "text/html; charset=utf-8".to_string(),
+    ));
+    r.headers
+        .push(("Cache-Control".to_string(), "public".to_string()));
     r.body = m6_core::Body::Bytes(MINIMAL_TEMPLATE.as_bytes().to_vec());
     r
 }
@@ -493,11 +502,11 @@ size = 64
                     status: rc.status,
                     cache: rc.cache.clone(),
                     headers: Vec::new(),
-            last_modified: None,
-            specificity: spec,
-            handler: None,
-            settings: std::sync::Arc::new(serde_json::Map::new()),
-            base_dict: std::sync::Arc::new(serde_json::Map::new()),
+                    last_modified: None,
+                    specificity: spec,
+                    handler: None,
+                    settings: std::sync::Arc::new(serde_json::Map::new()),
+                    base_dict: std::sync::Arc::new(serde_json::Map::new()),
                 }
             })
             .collect();
@@ -516,8 +525,7 @@ size = 64
                 _ => continue,
             };
 
-            let resp = if let Some((route, params)) =
-                find_route(raw.path(), raw.method(), &routes)
+            let resp = if let Some((route, params)) = find_route(raw.path(), raw.method(), &routes)
             {
                 // Build a minimal dict with path params only.
                 let mut dict = Map::new();
@@ -613,10 +621,18 @@ fn bench_compress(c: &mut Criterion) {
 fn bench_minify(c: &mut Criterion) {
     let mut group = c.benchmark_group("minify");
     group.sample_size(500);
-    group.bench_function("minify_html_2kb",   |b| b.iter(|| black_box(minify_html(black_box(HTML_2KB), false))));
-    group.bench_function("minify_css_8kb",    |b| b.iter(|| black_box(minify_css(black_box(CSS_8KB)))));
-    group.bench_function("minify_json_1kb",   |b| b.iter(|| black_box(minify_json(black_box(JSON_1KB)))));
-    group.bench_function("minify_js_3kb",     |b| b.iter(|| black_box(minify_js(black_box(JS_3KB)))));
+    group.bench_function("minify_html_2kb", |b| {
+        b.iter(|| black_box(minify_html(black_box(HTML_2KB), false)))
+    });
+    group.bench_function("minify_css_8kb", |b| {
+        b.iter(|| black_box(minify_css(black_box(CSS_8KB))))
+    });
+    group.bench_function("minify_json_1kb", |b| {
+        b.iter(|| black_box(minify_json(black_box(JSON_1KB))))
+    });
+    group.bench_function("minify_js_3kb", |b| {
+        b.iter(|| black_box(minify_js(black_box(JS_3KB))))
+    });
     group.finish();
 }
 
@@ -739,7 +755,10 @@ fn main() {
         let mut ctx = tera::Context::new();
         ctx.insert("title", "Hello, World!");
         report_percentiles("template_render", N, || {
-            black_box(tera.render(black_box("page.html"), black_box(&ctx)).unwrap());
+            black_box(
+                tera.render(black_box("page.html"), black_box(&ctx))
+                    .unwrap(),
+            );
         });
     }
 
@@ -806,11 +825,11 @@ size = 64
                         status: rc.status,
                         cache: rc.cache.clone(),
                         headers: Vec::new(),
-            last_modified: None,
-            specificity: spec,
-            handler: None,
-            settings: std::sync::Arc::new(serde_json::Map::new()),
-            base_dict: std::sync::Arc::new(serde_json::Map::new()),
+                        last_modified: None,
+                        specificity: spec,
+                        handler: None,
+                        settings: std::sync::Arc::new(serde_json::Map::new()),
+                        base_dict: std::sync::Arc::new(serde_json::Map::new()),
                     }
                 })
                 .collect();
@@ -826,34 +845,33 @@ size = 64
                     Ok(Some(r)) => r,
                     _ => continue,
                 };
-                let resp = if let Some((route, params)) =
-                    find_route(raw.path(), raw.method(), &routes2)
-                {
-                    let mut dict = Map::new();
-                    for (k, v) in &params {
-                        dict.insert(k.clone(), Value::String(v.clone()));
-                    }
-                    dict.insert(
-                        "title".to_string(),
-                        Value::String(format!("Post: {}", raw.path())),
-                    );
-                    if let Some(tmpl_name) = &route.template {
-                        let mut ctx = tera::Context::new();
-                        for (k, v) in &dict {
-                            ctx.insert(k.as_str(), v);
+                let resp =
+                    if let Some((route, params)) = find_route(raw.path(), raw.method(), &routes2) {
+                        let mut dict = Map::new();
+                        for (k, v) in &params {
+                            dict.insert(k.clone(), Value::String(v.clone()));
                         }
-                        match tera.render(tmpl_name, &ctx) {
-                            Ok(html) => html_response(html),
-                            Err(_) => Response::status(500),
+                        dict.insert(
+                            "title".to_string(),
+                            Value::String(format!("Post: {}", raw.path())),
+                        );
+                        if let Some(tmpl_name) = &route.template {
+                            let mut ctx = tera::Context::new();
+                            for (k, v) in &dict {
+                                ctx.insert(k.as_str(), v);
+                            }
+                            match tera.render(tmpl_name, &ctx) {
+                                Ok(html) => html_response(html),
+                                Err(_) => Response::status(500),
+                            }
+                        } else {
+                            Response::not_found()
                         }
                     } else {
                         Response::not_found()
-                    }
-                } else {
-                    Response::not_found()
-                };
+                    };
                 let mut out = m6_core::h1::Responder::new(&mut stream, "GET", false);
-            write_response(&mut out, resp).ok();
+                write_response(&mut out, resp).ok();
             }
         });
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -898,10 +916,18 @@ size = 64
     // ── Minification ─────────────────────────────────────────────────────────
     const N_MIN: usize = 5_000;
     println!("\n── Minification paths (n={N_MIN}) ───────────────────────────────────────────");
-    report_percentiles("minify html 2KB",  N_MIN, || { black_box(minify_html(black_box(HTML_2KB), false)); });
-    report_percentiles("minify css 8KB",   N_MIN, || { black_box(minify_css(black_box(CSS_8KB))); });
-    report_percentiles("minify json 1KB",  N_MIN, || { black_box(minify_json(black_box(JSON_1KB))); });
-    report_percentiles("minify js 3KB",    N_MIN, || { black_box(minify_js(black_box(JS_3KB))); });
+    report_percentiles("minify html 2KB", N_MIN, || {
+        black_box(minify_html(black_box(HTML_2KB), false));
+    });
+    report_percentiles("minify css 8KB", N_MIN, || {
+        black_box(minify_css(black_box(CSS_8KB)));
+    });
+    report_percentiles("minify json 1KB", N_MIN, || {
+        black_box(minify_json(black_box(JSON_1KB)));
+    });
+    report_percentiles("minify js 3KB", N_MIN, || {
+        black_box(minify_js(black_box(JS_3KB)));
+    });
 
     // ── Minify + compress pipeline ────────────────────────────────────────────
     const N_PIPE: usize = 2_000;
