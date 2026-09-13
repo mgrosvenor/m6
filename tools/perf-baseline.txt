@@ -1,0 +1,16 @@
+# Recorded performance numbers, in nanoseconds. Lower is better.
+#
+# BUILD-HOST NUMBERS. They are taken on the Linux build host by
+# deploy/run-tests.sh and mean nothing on any other machine. A laptop running
+# dev servers sits at load 20-30 and its readings move by half between runs.
+#
+# A run slower than its number by more than the margin (default 20%) fails.
+# A run faster prints the new number and asks you to record it, deliberately,
+# in the commit that earned it. Recording a slower number is a decision to
+# accept a regression and has to be argued for in the commit message.
+#
+# docs/PERFORMANCE.md has the real production-shaped measurements and how they
+# were taken. These are here to catch a change that makes something markedly
+# slower, nothing more.
+#
+# target                     ns
