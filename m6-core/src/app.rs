@@ -2315,6 +2315,37 @@ fn run_app_with_shutdown(
         std::process::exit(2);
     });
 
+    // Does site.toml tell the edge the truth about whether we compress?
+    //
+    // Before logging is up, because it exits 2 and that is a configuration error
+    // detected before binding — the one thing exit 2 means (backend protocol
+    // §8.3). A service that starts having disagreed with the edge about this
+    // serves either fragmented caches or, worse, brotli to clients that asked
+    // for identity, and neither is visible from the outside until it bites.
+    //
+    // The backend name is the config file's stem, which is the same convention
+    // `socket_path_from_config` uses to derive /run/m6/<stem>.sock, so the name
+    // in site.toml's `[[backend]]` and the name here are the same string.
+    {
+        let backend_name = config_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("m6-default");
+        // "Compresses" means at least one MIME type has a non-zero level. The
+        // defaults give text types real levels and images zero, so a service
+        // that has not opted out does compress.
+        let compresses = config
+            .compression
+            .values()
+            .any(|c| c.brotli > 0 || c.gzip > 0);
+        if let Err(msg) =
+            crate::compress::check_declared_support(&site_dir, backend_name, compresses)
+        {
+            eprintln!("Config error: {msg}");
+            std::process::exit(2);
+        }
+    }
+
     // Init logging: site.toml base → renderer config [log] → CLI --log-level.
     let (site_level, site_format) = crate::log::read_site_log_config(&site_dir);
     let format = config
