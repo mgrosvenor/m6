@@ -1,0 +1,25 @@
+[package]
+name         = "m6-example-rust-m6core"
+description  = "m6 backend example: Rust on m6-core, the default inside the ecosystem"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+publish      = false
+
+# m6-core and nothing else, which is the architectural rule: core is the only
+# crate a service links. Its pair, rust-plain, links nothing at all, so the
+# difference between the two binaries is exactly what this dependency costs.
+#
+# `default-features = false` because this example renders no templates. Tera and
+# comrak are on by default and would be dead weight here, and linking them would
+# put their cost into a measurement that is supposed to be about the service
+# loop. A service that wants templating turns the feature back on by name.
+[dependencies]
+m6-core = { path = "../../../../m6-core", default-features = false }
+
+[[bin]]
+name = "m6-example-rust-m6core"
+path = "src/main.rs"
