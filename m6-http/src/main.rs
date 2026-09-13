@@ -1207,7 +1207,21 @@ fn drain_udp(
 
         let recv_info = quiche::RecvInfo { from, to: local };
         if let Err(e) = qconn.conn.recv(pkt, recv_info) {
+            // REJECTING A PACKET IS NOT THE END OF THE WORK. quiche has already
+            // called close() internally and queued a CONNECTION_CLOSE carrying
+            // the right wire code, and the only way it reaches the peer is
+            // conn.send(), which here is flush_conn. This path used to
+            // `continue` straight past it.
+            //
+            // The close was not lost: the timer path calls on_timeout() and
+            // then flush_conn, so it went out one tick late. That is still a
+            // needless delay on the one packet whose job is to say why the
+            // connection is ending, so it goes out here instead.
+            //
+            // It does not move h3 conformance. The twelve h3spec failures are
+            // quiche's and are documented in tools/conformance-scores.txt.
             warn!("conn.recv error: {}", e);
+            flush_conn(udp, qconn);
             continue;
         }
 
@@ -1217,6 +1231,7 @@ fn drain_udp(
                 Ok(c) => c,
                 Err(e) => {
                     warn!("h3 Config::new error: {}", e);
+                    flush_conn(udp, qconn);
                     continue;
                 }
             };
@@ -1226,6 +1241,7 @@ fn drain_udp(
                 }
                 Err(e) => {
                     warn!("h3 init error: {}", e);
+                    flush_conn(udp, qconn);
                     continue;
                 }
             }
