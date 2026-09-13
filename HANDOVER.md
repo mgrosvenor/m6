@@ -120,7 +120,7 @@ tree, which it has already caught me doing.
 | `tools/branch.sh` | start work; confirms the issue exists with `gh` |
 | `tools/merge.sh` | full checks, then merge into develop, recording what ran |
 | `tools/release.sh` | develop into main; refuses without a CHANGELOG entry |
-| `tools/clippy.sh` | clippy against a recorded count, per platform |
+| `tools/clippy.sh` | clippy, `-D warnings`. No ceiling, no `--update` |
 | `tools/conformance.sh` | h1/h2/h3 against recorded minimum scores |
 | `tools/perfcheck.sh` | page render against a recorded number, 20% margin |
 | `tools/health-check.py` | the hourly production check; §7 |
@@ -196,7 +196,7 @@ Run everything: `cd ~/dr-grosvenor-site && ./deploy/run-tests.sh m6`.
 |---|---|---|
 | tests | **1022 passing**, 0 failures, verified over three consecutive runs | everywhere |
 | compiler warnings | **0**, release and test builds | Linux, enforced |
-| clippy | ceiling **135 macOS / 145 Linux**, but Linux **measures 123** on 2026-09-13 and the ceiling has not been lowered yet. Item 1's job | `tools/clippy.sh` |
+| clippy | **0**, both toolchains, enforced with `-D warnings` | `tools/clippy.sh` |
 | `cargo fmt` | clean | CI, `check.sh` |
 | `cargo deny` | clean, 5 advisories as recorded exceptions | CI |
 | h1 conformance | **32/32** on four targets | CI, build host |
@@ -267,23 +267,57 @@ careless version becomes unbounded memory on a stream a peer controls.
 `tools/conformance-scores.txt` has the full detail, the rebuild recipe and the
 one merge conflict to expect.
 
-### clippy at 135 should be zero
+### clippy is zero, and there is no ceiling any more
 
-The arrangement is "the count may fall and may never rise", which is living
-with the number. Investigated, not assumed:
+Done 2026-09-13, issue #5. `tools/clippy.sh` is now `-D warnings`: one finding
+fails the run, the same as a rustc warning. `--update` is gone and the two
+`tools/clippy-ceiling-*.txt` files are deleted.
 
-- `cargo clippy --fix` applies about **30 of the 135**.
-- **18** collapsible `if` inside a `match`: mechanical, but each touches real
-  logic and wants reading.
-- **15** "very complex type": these are the
-  `Arc<dyn Fn(&Request, &G, &mut T) -> Result<Response> + Send + Sync>` shapes
-  in `App`'s stateful builders. Fixing them means type aliases, which is a real
-  readability gain rather than silencing a lint.
-- The rest is a long tail: 9 `write!` ending in a newline, 6 `while let`, 6
-  `Error::other`, and singles.
+**Zero was verified on both toolchains**, which is the only reason a single
+absolute rule is safe. That distinction turned out to matter more than the
+ceiling did:
 
-Reachable, but it is a real branch with diffs across most crates, not one
-`--fix` run.
+| | clippy | findings before |
+|---|---|---|
+| this laptop, Homebrew | 0.1.95 | 45 |
+| build host and CI, stable | 0.1.98 | 123 |
+
+**The per-platform ceiling was really per-clippy-version.** Identical source,
+78 findings apart. New lints arrive with new versions, and cfg-gated code is
+only linted where it compiles, so the macOS kqueue block in `watcher.rs` is
+invisible to clippy on Linux and the Linux-only lints are invisible here. The
+practical consequence: **`--fix` for the Linux findings had to run on the build
+host**, with the changed sources pulled back and read under git. Fixing from a
+1.95 laptop is fixing the wrong list.
+
+The handover's old breakdown here, 30 auto-fixable and 18 collapsible `if` and
+15 complex types, was taken at 135 and had rotted like every other number in
+this file. What it actually took:
+
+- **`--fix` cleared 123 to 49**, all of it behaviour-preserving: `map_or` to
+  `is_some_and`/`is_none_or`, `write!` with a trailing newline to `writeln!`,
+  `Error::new(Other, e)` to `Error::other`, redundant borrows, and `Default`
+  for 12 types that had `new()` without one.
+- **The other 49 wanted decisions**, and the owner's call was to reshape
+  everything and allow nothing. Type aliases for the `Arc<dyn Fn(..)>` builder
+  shapes in `app.rs`; `is_empty` beside `len`; boxing four oversized enum
+  variants; `&mut Vec<u8>` to `&mut [u8]`; and two argument lists grouped into
+  `EventLoopIo` and `H2Response`, which took an 8- and a 9-argument function to
+  4 and 6.
+- **Three findings were real documentation bugs**, not style. The clearest:
+  `health.rs` carried the doc comment for a timing-safe credential comparison
+  directly above `#[cfg(test)] mod token_file_tests`, so it documented the test
+  module. The function it described had moved to `m6-core/src/monitoring.rs`
+  during the consolidation and the comment stayed behind. Two module-level
+  prose blocks in `http11.rs` and `hints.rs` were `///` rather than `//!`, so
+  they documented the next `use` statement.
+- **One was arguably a real bug**: a `drop(req)` in `m6-core/src/h1.rs`
+  commented "release borrow of `headers`". It compiles without it. NLL had
+  ended that borrow for years and the line was pre-NLL residue.
+
+**If a toolchain upgrade brings a new lint, the gate fails.** That is intended.
+Fix it, or add a targeted `#[allow]` naming the lint with the reason argued in
+the commit. Do not put the ceiling back.
 
 ### Where checks run, and why
 
@@ -310,7 +344,7 @@ matching the newest tag; `release.sh` bumps them at a release.
 
 | # | item | notes |
 |---|---|---|
-| 1 | **clippy to zero** | §4 has the breakdown |
+| 1 | ~~**clippy to zero**~~ | **done 2026-09-13, issue #5.** 0 on both toolchains, and `clippy.sh` is `-D warnings` with the ceiling files deleted. §4 |
 | 2 | ~~**quiche 0.26.1 → 0.29.3, re-measure h3**~~ | **done 2026-09-13, issue #4.** The bump alone moved nothing. h3 is now **47/49** on a fork of quiche master carrying PRs #2521 and #2575, floor raised to 47. The last two are QPACK and are accepted, not chased. §4 |
 | 3 | **Phase 7: renderers onto a git tag** | below |
 | 4 | **Phase 8: six `/status` implementations** | `apt install golang` on the build host, nothing more. Its purpose is the measurement that says whether linking core costs or saves. |

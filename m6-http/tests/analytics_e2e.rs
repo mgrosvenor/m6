@@ -168,13 +168,8 @@ fn https_exchange(
 // ── HTTP/3 client ─────────────────────────────────────────────────────────────
 
 fn quic_flush(conn: &mut quiche::Connection, udp: &UdpSocket, out: &mut [u8]) {
-    loop {
-        match conn.send(out) {
-            Ok((n, info)) => {
-                let _ = udp.send_to(&out[..n], info.to);
-            }
-            Err(_) => break,
-        }
+    while let Ok((n, info)) = conn.send(out) {
+        let _ = udp.send_to(&out[..n], info.to);
     }
 }
 

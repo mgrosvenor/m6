@@ -206,47 +206,42 @@ impl ShutdownHandle {
                 let sock = thread_socket.as_deref().map(|p| p.as_path());
                 let name = &*thread_name;
 
-                loop {
-                    match wait_mask.wait() {
-                        Ok(_sig) => {
-                            let count = SIGNAL_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
-                            if count >= 2 {
-                                finish(name, sock, "forced");
-                                std::process::exit(0);
-                            }
-                            // Log BEFORE publishing the flag, not after.
-                            //
-                            // The flag is what releases the main thread: it
-                            // sees `is_shutdown()`, drains, logs "shutdown
-                            // complete" and returns from `main`, and process
-                            // exit discards whatever is still queued in
-                            // `tracing_appender`'s non-blocking writer. With
-                            // the store first, this line was racing the entire
-                            // drain, so a fast service could exit with
-                            // "shutdown complete" written and "shutdown signal
-                            // received" lost.
-                            //
-                            // That is the whole of
-                            // `redirect_lifecycle::sigterm_shuts_down_rather_than_being_ignored`,
-                            // which failed intermittently for weeks and never
-                            // reproduced in isolation: the redirect listener
-                            // gets from start to complete in about 20ms, so
-                            // under load the appender thread is simply
-                            // scheduled too late. Captured 2026-09-12 with the
-                            // journal showing `started`, the listener line, and
-                            // `shutdown complete` -- and nothing in between.
-                            //
-                            // Ordering the other way does not make the log
-                            // durable, it makes it *ordered*: the main thread
-                            // cannot observe the flag until this call has
-                            // returned, so the line is queued ahead of the
-                            // completion line rather than concurrently with it.
-                            tracing::info!("{name} shutdown signal received");
-                            SHUTDOWN_FLAG.store(true, Ordering::SeqCst);
-                            wake(sock, wake_fd);
-                        }
-                        Err(_) => break,
+                while let Ok(_sig) = wait_mask.wait() {
+                    let count = SIGNAL_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
+                    if count >= 2 {
+                        finish(name, sock, "forced");
+                        std::process::exit(0);
                     }
+                    // Log BEFORE publishing the flag, not after.
+                    //
+                    // The flag is what releases the main thread: it
+                    // sees `is_shutdown()`, drains, logs "shutdown
+                    // complete" and returns from `main`, and process
+                    // exit discards whatever is still queued in
+                    // `tracing_appender`'s non-blocking writer. With
+                    // the store first, this line was racing the entire
+                    // drain, so a fast service could exit with
+                    // "shutdown complete" written and "shutdown signal
+                    // received" lost.
+                    //
+                    // That is the whole of
+                    // `redirect_lifecycle::sigterm_shuts_down_rather_than_being_ignored`,
+                    // which failed intermittently for weeks and never
+                    // reproduced in isolation: the redirect listener
+                    // gets from start to complete in about 20ms, so
+                    // under load the appender thread is simply
+                    // scheduled too late. Captured 2026-09-12 with the
+                    // journal showing `started`, the listener line, and
+                    // `shutdown complete` -- and nothing in between.
+                    //
+                    // Ordering the other way does not make the log
+                    // durable, it makes it *ordered*: the main thread
+                    // cannot observe the flag until this call has
+                    // returned, so the line is queued ahead of the
+                    // completion line rather than concurrently with it.
+                    tracing::info!("{name} shutdown signal received");
+                    SHUTDOWN_FLAG.store(true, Ordering::SeqCst);
+                    wake(sock, wake_fd);
                 }
             })
             .expect("spawning the signal thread");

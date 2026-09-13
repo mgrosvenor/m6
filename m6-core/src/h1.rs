@@ -517,8 +517,6 @@ pub fn parse_request(buf: &[u8]) -> ParseResult {
         None => 0,
     };
 
-    drop(req); // release borrow of `headers`
-
     if saw_te {
         // Decoded here, so the body handed on is a plain one of known length
         // and no downstream hop has to agree with us about chunk framing.

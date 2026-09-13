@@ -255,15 +255,14 @@ impl FsWatcher {
                     }
                 }
 
-                if event.mask.contains(EventMask::DELETE)
-                    || event.mask.contains(EventMask::MOVED_FROM)
+                if (event.mask.contains(EventMask::DELETE)
+                    || event.mask.contains(EventMask::MOVED_FROM))
+                    && name.ends_with(".sock")
                 {
-                    if name.ends_with(".sock") {
-                        result.push(FsEvent {
-                            path: self.inner.socket_dir.join(&name),
-                            kind: FsEventKind::SocketDeleted,
-                        });
-                    }
+                    result.push(FsEvent {
+                        path: self.inner.socket_dir.join(&name),
+                        kind: FsEventKind::SocketDeleted,
+                    });
                 }
 
                 if event.mask.contains(EventMask::CLOSE_WRITE) {
@@ -366,7 +365,7 @@ fn kqueue_watch_site_dir(site_dir: PathBuf, pipe_write: RawFd) {
         ident: dir_fd as libc::uintptr_t,
         filter: libc::EVFILT_VNODE,
         flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_CLEAR,
-        fflags: (libc::NOTE_WRITE | libc::NOTE_EXTEND | libc::NOTE_ATTRIB | libc::NOTE_LINK) as u32,
+        fflags: libc::NOTE_WRITE | libc::NOTE_EXTEND | libc::NOTE_ATTRIB | libc::NOTE_LINK,
         data: 0,
         udata: std::ptr::null_mut(),
     };
@@ -385,8 +384,7 @@ fn kqueue_watch_site_dir(site_dir: PathBuf, pipe_write: RawFd) {
             ident: file_fd as libc::uintptr_t,
             filter: libc::EVFILT_VNODE,
             flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_CLEAR,
-            fflags: (libc::NOTE_WRITE | libc::NOTE_ATTRIB | libc::NOTE_RENAME | libc::NOTE_DELETE)
-                as u32,
+            fflags: libc::NOTE_WRITE | libc::NOTE_ATTRIB | libc::NOTE_RENAME | libc::NOTE_DELETE,
             data: 0,
             udata: std::ptr::null_mut(),
         };

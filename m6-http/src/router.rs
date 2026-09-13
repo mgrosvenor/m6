@@ -45,20 +45,24 @@ fn expand_glob_vars(template: &str, file_path: &Path, glob_pattern: &str) -> Str
     // `{relpath}`: file path relative to glob prefix directory.
     let relpath = {
         let fp = file_path.to_string_lossy();
-        if fp.starts_with(glob_prefix) {
-            fp[glob_prefix.len()..].to_string()
-        } else {
-            fp.into_owned()
+        // `strip_prefix` rather than `starts_with` plus a slice: the slice
+        // repeated the prefix length and would panic rather than fall through if
+        // the two ever disagreed. Taken as an owned `String` first so the borrow
+        // of `fp` ends before the fallback moves it.
+        let stripped = fp.strip_prefix(glob_prefix).map(str::to_string);
+        match stripped {
+            Some(rest) => rest,
+            None => fp.into_owned(),
         }
     };
 
     // `{dir}`: directory of matched file, relative to glob prefix.
     let rel_dir = {
         let d = Path::new(&dir).to_string_lossy();
-        if d.starts_with(glob_prefix) {
-            d[glob_prefix.len()..].to_string()
-        } else {
-            d.into_owned()
+        let stripped = d.strip_prefix(glob_prefix).map(str::to_string);
+        match stripped {
+            Some(rest) => rest,
+            None => d.into_owned(),
         }
     };
 
@@ -241,6 +245,12 @@ impl RouteTable {
     /// Number of routes.
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Whether the table has no routes at all, which for a configured service
+    /// means every request will 404.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }
 

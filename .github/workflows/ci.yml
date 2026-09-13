@@ -68,9 +68,10 @@ jobs:
             exit 1
           fi
 
-      # The count may fall and may never rise. Per platform, because clippy
-      # versions disagree; this runner is Linux, so it reads the Linux number.
-      - name: Clippy, at or under the recorded count
+      # Clippy must be silent: `-D warnings`, no ceiling. It went to zero on
+      # 2026-09-13 and is held there the same way rustc warnings are. A new
+      # lint from a toolchain upgrade fails this, which is intended.
+      - name: Clippy, silent
         run: ./tools/clippy.sh
 
   conformance:

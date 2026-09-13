@@ -309,6 +309,12 @@ pub struct PoolManager {
     url_backends: Vec<UrlBackend>,
 }
 
+impl Default for PoolManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PoolManager {
     pub fn new() -> Self {
         PoolManager {

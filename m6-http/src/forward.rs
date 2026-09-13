@@ -1183,9 +1183,7 @@ fn parse_url_scheme_authority(url: &str) -> io::Result<(String, String)> {
     let scheme = url[..idx].to_lowercase();
     let rest = &url[idx + sep.len()..];
     // Authority ends at the first `/`, `?`, or `#`
-    let auth_end = rest
-        .find(|c| c == '/' || c == '?' || c == '#')
-        .unwrap_or(rest.len());
+    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let authority = rest[..auth_end].to_string();
     Ok((scheme, authority))
 }
@@ -1234,7 +1232,7 @@ fn forward_over_tls(
     })?;
 
     let conn = ClientConnection::new(tls_config, server_name)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("TLS init error: {}", e)))?;
+        .map_err(|e| io::Error::other(format!("TLS init error: {}", e)))?;
 
     let mut tls_stream = StreamOwned::new(conn, tcp);
     tls_stream.write_all(&req_bytes)?;
