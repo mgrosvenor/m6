@@ -1,12 +1,25 @@
 # Handover
 
-**Written for someone with no prior context.** Read this, then
-`docs/CONSOLIDATION-TODO.md`. This file is what is true now; that one is the
-ledger of what is done and what is owed.
+**Written for someone taking over with no prior context.** Read this file top
+to bottom before touching anything. It is what is true right now.
 
-Last rewritten 2026-09-13. Previous versions of this file accreted session
-notes; those are now in `docs/SESSION-NOTES.md` and the lessons in
-`docs/LESSONS.md`.
+Then: `CLAUDE.md` for the rules, `docs/CONSOLIDATION-TODO.md` for what is owed.
+
+Last rewritten 2026-09-13.
+
+---
+
+## 0. If you read nothing else
+
+- **Do not deploy.** 133 m6 commits and 24 site commits are undeployed behind a
+  deliberate freeze. Lifting it has a known hazard: §6.
+- **`main` is not what is running.** It holds all of that undeployed work. The
+  deployed commit is whatever the newest entry in
+  `~/dr-grosvenor-site/docs/RELEASES.md` names.
+- **h3 conformance is 37/49 and reports PASS.** That is a failing protocol
+  implementation with today's failure recorded as the standard. §4.
+- **There are two repositories** and they must deploy together. §1, §6.
+- **Blocking an IP address is a write.** Propose, never apply unasked. §7.
 
 ---
 
@@ -16,11 +29,11 @@ notes; those are now in `docs/SESSION-NOTES.md` and the lessons in
 HTTP/3, a cache, proxying) and services behind it built on a shared library
 (`m6-core`). It serves **mgrosvenor.com** from three nodes.
 
-The site lives in a **separate repository**, `~/dr-grosvenor-site`, holding the
-content, the production configs, the deploy scripts, and three small renderer
-crates of its own. Both repositories are part of most changes, they deploy
-separately, and they can disagree. That is currently the largest release risk;
-see §6.
+**The site is a separate repository**, `~/dr-grosvenor-site`, holding content,
+production configs, deploy scripts, and three renderer crates of its own
+(`render-cms`, `render-analytics`, `render-contact`). Most changes touch both
+repositories, they deploy separately, and they can disagree. That is the
+largest release risk; see §6.
 
 ### The fleet
 
@@ -30,16 +43,27 @@ see §6.
 | lon | cache | `m6-http-cache` | 10.0.0.4 | `/var/www/m6-cache/logs/analytics.ndjson` |
 | chi | cache | `m6-http-cache` | 10.0.0.5 | `/var/www/m6-cache/logs/analytics.ndjson` |
 
-All three are **1-core VMs**; syd has 950MB. The build host is a separate
-4-core Linux box at `root@45.63.29.146` **port 4022**. It is **not backed up**,
-so everything done to a node must be in git.
+All three are **1-core VMs**; syd has 950MB. Access is `ssh root@<node>.mgrosvenor.com`.
+
+The **build host** is a separate 4-core Linux box, `root@45.63.29.146` **port
+4022**. It runs every gate that needs a quiet machine or a real Linux. It is
+**not backed up**: everything done to a node must be in git.
+
+### The services
+
+| binary | what it does | shape |
+|---|---|---|
+| `m6-http` | the edge: TLS, h1/h2/h3, cache, proxy | its own event loop, not an `App` |
+| `m6-file` | static files | `App` service, one named handler |
+| `m6-html` | renders pages from templates | `App` service, no code routes |
+| `m6-auth-server` | login, tokens, keys | `App` service with global state. **Not running in production** |
+| `m6-md`, `m6-monitor` | markdown, fleet digest | `App` services |
 
 ### The architectural rule
 
 **m6-core is the PHP of m6: a box of blocks a service is assembled from.**
 Anything that generalises belongs in core, and core should be the only thing a
-service links. A service being nearly a no-op on top of core is the goal, not a
-smell:
+service links. A service being nearly a no-op on top of core is the goal:
 
 ```rust
 use m6_core::prelude::*;
@@ -48,25 +72,58 @@ fn main() -> anyhow::Result<()> { App::new().run()?; Ok(()) }
 
 ---
 
-## 2. Read these before doing anything
+## 2. How to work here
 
-1. **`CLAUDE.md`** — the branch model, what has to pass, the standing rules.
-   The git hooks enforce most of it.
-2. **`docs/PERFORMANCE.md`** — every performance number, how it was measured,
-   on what. Do not quote a performance number from anywhere else.
-3. **`docs/LESSONS.md`** — each one cost something. §8 here has the dozen that
-   come up most.
+### The branch model, new as of 2026-09-13
+
+| branch | what it is |
+|---|---|
+| `main` | releases only. Advances **only** via `tools/release.sh`. |
+| `develop` | where work is integrated |
+| `<type>/<issue>-<slug>` | one branch per issue, off `develop` |
+
+Types: `feat` `fix` `perf` `docs` `refactor` `test` `chore`.
+
+`.githooks/pre-push` (version-controlled, via `core.hooksPath`) refuses a push
+to `main` that `release.sh` did not make, a merge on `develop` without the
+record that the checks ran, and a branch name with no issue number.
+
+```sh
+./tools/branch.sh 42 some-slug --type fix   # off develop; checks the issue exists
+git push origin fix/42-some-slug            # fast local checks
+./tools/merge.sh fix/42-some-slug           # everything on the build host, then merges
+./tools/release.sh 1.0.0                    # develop into main, changelog, tag
+```
+
+**`merge.sh` takes more than ten minutes.** It runs a release build, the whole
+suite, clippy, h1/h2/h3 conformance and the performance check on the build
+host. Run it in the background and let it finish. It refuses on a dirty working
+tree, which it has already caught me doing.
+
+### The tools
+
+| tool | what it does |
+|---|---|
+| `tools/branch.sh` | start work; confirms the issue exists with `gh` |
+| `tools/merge.sh` | full checks, then merge into develop, recording what ran |
+| `tools/release.sh` | develop into main; refuses without a CHANGELOG entry |
+| `tools/clippy.sh` | clippy against a recorded count, per platform |
+| `tools/conformance.sh` | h1/h2/h3 against recorded minimum scores |
+| `tools/perfcheck.sh` | page render against a recorded number, 20% margin |
+| `tools/health-check.py` | the hourly production check; §7 |
+| `check.sh` | the laptop pre-push set |
+| `~/dr-grosvenor-site/deploy/run-tests.sh` | everything, on the build host |
 
 ### How to write for the owner
 
 - **No em dashes.**
 - **No agile or consultant vocabulary.** He is an old-school Unix engineer and
-  said so plainly. Say "a recorded minimum", not the other word. A latency
+  said so directly. Say "a recorded minimum", not the other word. A latency
   spike is fine; an investigation is not a "spike".
-- Commit messages say what changed, why it mattered, and **how it was
-  verified**. Verified means measured against something running, not inferred
-  from the source.
-- He reads carefully and pushes back on hand-waving. Give him the number.
+- Commit messages: what changed, why it mattered, **how it was verified**.
+  Verified means measured against something running.
+- He reads carefully and pushes back hard on hand-waving, and he is usually
+  right. Give him the number, and say plainly when you were wrong.
 
 ---
 
@@ -74,101 +131,90 @@ fn main() -> anyhow::Result<()> { App::new().run()?; Ok(()) }
 
 ### Branches
 
-**The branch model is new, adopted 2026-09-13.** `main` is releases only;
-`develop` is where work is integrated; work happens on `<type>/<issue>-<slug>`
-branched from `develop`. `.githooks/pre-push` refuses anything else and is
-version-controlled via `core.hooksPath`.
-
 | repo | branch | state |
 |---|---|---|
-| m6 | `main` | `ead669b`. **Holds ~130 undeployed commits** because the model arrived mid-project. Do **not** read `main` as "what is running". |
-| m6 | `develop` | `697d7f8`, pushed |
-| m6 | `chore/1-ci-on-github-actions` | `7b7076d`, pushed, **CI green, NOT MERGED** |
-| site | `develop` | `0b04e67`, **2 commits ahead of origin, unpushed** |
+| m6 | `main` | `ead669b`, **133 commits behind develop**, none of it deployed. Not what is running. |
+| m6 | `develop` | `9abfebe`, the CI branch merged in with everything passing |
 | site | `main` | `e9f11c2` |
+| site | `develop` | `0b04e67`, pushed |
 
-**Do these two things first:**
-
-```sh
-git -C ~/dr-grosvenor-site push                        # develop is unpushed
-cd ~/m6 && ./tools/merge.sh chore/1-ci-on-github-actions
-```
-
-The merge runs everything on the build host and takes **more than ten
-minutes**. It was started once and timed out. Nothing was lost and nothing was
-half-merged; just run it again and let it finish.
-
-### The cycle, once that is done
-
-```sh
-./tools/branch.sh <issue> <slug> --type fix   # branches off develop
-# work, commit
-git push origin fix/<issue>-<slug>            # fast local checks
-./tools/merge.sh fix/<issue>-<slug>           # everything, then merge
-./tools/release.sh 1.0.0                      # develop into main, changelog, tag
-```
+**CI has never run on `develop`.** It was added on a branch. The first push to
+`develop` will be its first run there.
 
 ### What is deployed
 
-**Nothing since 2026-09-10.** The deployed commit is whatever the newest entry
-in `~/dr-grosvenor-site/docs/RELEASES.md` names, currently m6 `22ee3a4`.
-Recompute, never edit in place:
+**Nothing since 2026-09-10**, m6 `22ee3a4`. Recompute, never edit in place:
 
 ```sh
 git -C ~/m6 log --oneline 22ee3a4..develop | wc -l
 ```
 
-**130 m6 commits and 24 site commits are undeployed.** The freeze holds until
-the consolidation work is finished. Three production changes were applied
-during it on explicit instruction (systemd hardening, the firewall block ledger
-reconciled, one address blocked); those changed confinement and firewall rules,
-not what code runs.
+Three production changes were applied during the freeze on explicit
+instruction: systemd hardening fleet-wide, the firewall block ledger
+reconciled to 32 identical rules, and one address blocked. Those changed
+confinement and firewall rules, not what code runs.
 
 ---
 
 ## 4. Health of the checks
 
-Run the whole set: `cd ~/dr-grosvenor-site && ./deploy/run-tests.sh m6`
-(build host, several minutes).
+Run everything: `cd ~/dr-grosvenor-site && ./deploy/run-tests.sh m6`.
 
-| check | state | where |
+| check | state | where it runs |
 |---|---|---|
 | tests | **1022 passing**, 0 failures | everywhere |
 | compiler warnings | **0**, release and test builds | Linux, enforced |
 | clippy | **135 macOS / 145 Linux** | `tools/clippy.sh` |
 | `cargo fmt` | clean | CI, `check.sh` |
-| `cargo deny` | clean, 5 advisories listed as exceptions | CI |
-| h1 conformance | **32/32** on all four targets | CI, build host |
+| `cargo deny` | clean, 5 advisories as recorded exceptions | CI |
+| h1 conformance | **32/32** on four targets | CI, build host |
 | h2 conformance | **146/146** | CI, build host |
-| h3 conformance | **37/49 — RED, see below** | CI, build host |
+| h3 conformance | **37/49 — RED** | CI, build host |
 | performance | `render:capabilities` 2,170,589 ns | build host only |
 
-### Two of those are not what they look like
+### h3 is red and reports PASS
 
-**h3 is 37/49, which is a failing protocol implementation reported as PASS**
-because 37 is what is written in `tools/conformance-scores.txt`. That is
-recording today's failure as the standard. All twelve failures are QUIC
-transport parameter validation, packet reserved bits, and QPACK — **every one
-inside `quiche`**, which m6-http uses for HTTP/3 and which is pinned to **tag
-0.26.1** while upstream is **0.29.3**. m6's own code sits above that layer.
-Upgrading quiche is the first thing to try and costs one CI run.
+`tools/conformance-scores.txt` records 37, so 37/49 passes. That is recording
+today's failure as the standard, and it should not stand.
 
-**clippy at 135 should be zero.** The arrangement is "the count may fall and
-may never rise", which is living with the number rather than removing it. Most
-are mechanical and `cargo clippy --fix` handles a large share: 18 collapsible
-`if` inside a `match`, 15 complex types, 9 `write!` ending in a newline, 6
-`while let`, 6 `Error::other`, then a long tail.
+All twelve failures are QUIC transport parameter validation, packet reserved
+bits, and QPACK. **Every one is inside `quiche`**, which m6-http uses for
+HTTP/3 and which is pinned to **tag 0.26.1** while upstream is **0.29.3**. m6's
+own code sits above that layer. Upgrading is one dependency bump and one CI run
+to find out whether it clears them.
 
-### Where the checks run, and why it matters
+### clippy at 135 should be zero
+
+The arrangement is "the count may fall and may never rise", which is living
+with the number. Investigated, not assumed:
+
+- `cargo clippy --fix` applies about **30 of the 135**.
+- **18** collapsible `if` inside a `match`: mechanical, but each touches real
+  logic and wants reading.
+- **15** "very complex type": these are the
+  `Arc<dyn Fn(&Request, &G, &mut T) -> Result<Response> + Send + Sync>` shapes
+  in `App`'s stateful builders. Fixing them means type aliases, which is a real
+  readability gain rather than silencing a lint.
+- The rest is a long tail: 9 `write!` ending in a newline, 6 `while let`, 6
+  `Error::other`, and singles.
+
+Reachable, but it is a real branch with diffs across most crates, not one
+`--fix` run.
+
+### Where checks run, and why
 
 - **CI** (GitHub Actions, every push and PR): build, tests, warnings, clippy,
-  fmt, h1/h2/h3 conformance, cargo-deny, MSRV.
-- **Build host** (`deploy/run-tests.sh`): all of that plus the **performance
-  check**, which is not on CI because a wall-clock measurement on a shared
-  runner measures the runner.
-- **Laptop** (`check.sh`, pre-push): the fast subset. It passes
-  `--allow-missing-tools` to the conformance script because h2spec and h3spec
-  are not installed there, and the output says loudly what it did **not** test.
+  fmt, h1/h2/h3, cargo-deny, MSRV.
+- **Build host** (`run-tests.sh`): all of that **plus the performance check**,
+  which is not on CI because a wall-clock measurement on a shared runner
+  measures the runner.
+- **Laptop** (`check.sh`): the fast subset. It passes `--allow-missing-tools`
+  because h2spec and h3spec are not installed there, and the output says
+  loudly what it did **not** test.
+
+**A check that cannot measure must fail, not pass.** `tools/conformance.sh`
+broke this four separate ways and reported success through all of them; h2 and
+h3 were untested for months and nothing said so. Its header lists the four.
 
 ---
 
@@ -176,32 +222,36 @@ are mechanical and `cargo clippy --fix` handles a large share: 18 collapsible
 
 **1.0 is not cut until the consolidation work is done.** Owner's decision,
 recorded beside the version in `Cargo.toml`. All nine crates are at 0.2.0,
-matching the newest tag; `tools/release.sh` bumps them at a release.
+matching the newest tag; `release.sh` bumps them at a release.
 
-In the agreed order:
+| # | item | notes |
+|---|---|---|
+| 1 | **clippy to zero** | §4 has the breakdown |
+| 2 | **quiche 0.26.1 → 0.29.3, re-measure h3** | one bump, one CI run |
+| 3 | **Phase 7: renderers onto a git tag** | below |
+| 4 | **Phase 8: six `/status` implementations** | `apt install golang` on the build host, nothing more. Its purpose is the measurement that says whether linking core costs or saves. |
+| 5 | **Deploy, lifting the freeze** | §6. Not a code task. |
 
-1. **Drive clippy to zero.** Cheapest, asked for directly.
-2. **Upgrade quiche 0.26.1 → 0.29.3, re-measure h3.** If the twelve clear, h3
-   is genuinely green. If not, they are upstream bugs worth reporting to
-   cloudflare/quiche with the h3spec output.
-3. **Point the site's renderers at m6 as a git dependency pinned to a tag**,
-   instead of `path = "../../m6/m6-core"`. This is Phase 7. **Not crates.io**:
-   the owner's call, 2026-09-13. Publishing would mean committing to a public
-   API, a name, and maintenance for other people, none of which this project
-   wants. A tag gives the versioning without any of that, and m6-http already
-   depends on quiche exactly this way.
+### Phase 7 in detail
 
-   ```toml
-   m6-core = { git = "https://github.com/mgrosvenor/m6", tag = "v1.0.0" }
-   ```
+The site's three renderers carry `m6-core = { path = "../../m6/m6-core" }`: a
+filesystem layout hard-coded across a repository boundary with no version
+constraint. Replace with:
 
-   **Gate:** the site builds with no `m6` checkout beside it, and `deploy.sh`
-   stops syncing the tree to the build host.
-4. **Phase 8: six implementations of the same `/status` payload.** Needs Go on
-   the build host, which is `apt install golang`. Its purpose is the
-   measurement that says whether linking core costs or saves, which 1.0 should
-   be able to answer.
-5. **Deploy, lifting the freeze.** §6. Not a code task.
+```toml
+m6-core = { git = "https://github.com/mgrosvenor/m6", tag = "v1.0.0" }
+```
+
+**Not crates.io.** The owner's call: publishing means owning a public API, a
+name, and maintenance for other people. A tag gives the versioning without any
+of it, and m6-http already takes quiche exactly this way.
+
+**Verified:** a crate depending on m6-core by git revision resolves and
+compiles with no `../m6` checkout present, which is the gate Phase 7 states.
+
+**Sequence it at the release.** It needs a tag to pin to, and pinning to a bare
+revision now means pinning to a commit that items 1, 2 and 4 immediately
+supersede. `deploy.sh` must stop syncing the m6 tree at the same time.
 
 ---
 
@@ -217,7 +267,7 @@ its config format: every route needs `handler = "files"`, and
   `/assets` 404s.
 
 `deploy.sh` ships configs; `deploy-platform.sh` ships binaries. Two separate
-runs. **`--dump-config` now exists on every service** and `deploy-platform.sh`
+runs. **`--dump-config` exists on every service now** and `deploy-platform.sh`
 validates with it before installing, so the second case is a refused deploy
 rather than a silent outage. The first is not covered. **Write a combined step
 before touching production.**
@@ -225,14 +275,16 @@ before touching production.**
 ### Verify after deploying: deliberate behaviour changes
 
 - socket modes are **0660** (were 0755 from umask, or 0666 by hand)
-- path traversal answers **404** where a single-segment parameter gave 400
+- traversal answers **404** where a single-segment parameter gave 400
 - m6-file **sheds with 503** past a 256-deep queue instead of queueing without
   bound. Production sets `size = 32`, so the queue is 256. **Watch the gallery
   page**, which fires dozens of concurrent image requests and is why the pool
   was widened to 32 in the first place.
-- a route's `Cache-Control` is now a **default, not an override**
+- a route's `Cache-Control` is a **default, not an override**
 - a **failed bind is fatal** where it used to warn and continue
 - `UMask=0027` and `LimitNOFILE=65535` on every service
+- rendered bytes are **unchanged**: verified byte-identical before and after
+  the migration, same content-hash ETag, same Content-Length
 
 ### Known gaps in the deploy path
 
@@ -240,11 +292,11 @@ before touching production.**
   WireGuard. The 90-second London outage on 2026-09-11 was a cache-role fault
   and staging would have called that change safe.
 - **`m6-monitor` is installed on no machine**, not even the build host, and
-  cannot replace `tools/health-check.py` yet: `--check` reads `/traffic`, which
-  404s on the deployed binary, and `/perf`, whose deployed shape has no `pools`
+  cannot replace `health-check.py` yet: `--check` reads `/traffic`, which 404s
+  on the deployed binary, and `/perf`, whose deployed shape has no `pools`
   field. Measured on syd 2026-09-12.
-- **The firewall stats collector** is written, unit-tested, and on no node.
-  Until it is deployed `/traffic` reports `firewall: null`.
+- **The firewall stats collector** is written, tested, and on no node. Until it
+  is deployed `/traffic` reports `firewall: null`.
 
 ---
 
@@ -258,22 +310,22 @@ generated-versus-observed labelling, forged-bot detection.
 **It is not scheduled.** A cron created from a session dies with it; a durable
 version needs launchd or a real crontab.
 
-### Three things the prompt's baselines get wrong
+### Three baselines in the prompt that are now wrong
 
 1. **`hit_p50_ns` is load-dependent and not comparable across days.** On a
    near-idle single-core VM the cache-hit path goes cold between requests, so
    the number tracks request density. Same binary, same node, minutes apart:
    50-70 hits per window reads **3,900ns**; 1,200 hits reads **1,064ns**, below
-   the 1.7-2.2us band everyone treated as the baseline. **Report the window's
-   hit count beside the number.** The prompt still states 1.7-2.2us flat; it is
-   the owner's to change.
+   the 1.7-2.2us band treated as the baseline. **Report the window's hit count
+   beside the number.** The prompt still states 1.7-2.2us flat; it is the
+   owner's file to change.
 2. **A hit rate near 0.3 usually means scan volume, not a regression.** A 404
    is uncacheable and counts as a miss. Separate last-hour HIT/MISS from the
    404 share. chi has read 72% 404s in an hour with real traffic fine.
 3. **Crawler totals over windows longer than ~60 minutes are understated.** The
-   user-agent rotation heuristic flags the backbone addresses 10.0.0.4 and
-   10.0.0.5 as forging bot agents, because a cache node relays real clients'
-   agents, then excludes those requests. Known tool bug, not an incident.
+   user-agent rotation heuristic flags backbone addresses 10.0.0.4 and 10.0.0.5
+   as forging bot agents, because a cache node relays real clients' agents,
+   then excludes those requests. Known tool bug, not an incident.
 
 ### Standing security rules
 
@@ -290,45 +342,35 @@ credential probes), `95.173.161.147` (encoded traversal aimed at `/bin/sh`),
 
 ## 8. The dozen lessons that come up most
 
-Full list in `docs/LESSONS.md`.
+Full list, all 49, in `docs/LESSONS.md`.
 
 1. **A check that cannot measure must fail, not pass.**
-   `tools/conformance.sh` broke this four ways and reported success through all
-   of them. h2 and h3 were untested for months and nothing said so.
 2. **A gate that runs only where it is convenient is not a gate.** The only
-   thing running conformance was a laptop hook, on a machine where neither
-   h2spec nor h3spec is installed. h1 was not running on the build host either,
-   because `uvx` was installed but not on the gate's PATH.
+   thing running conformance was a laptop hook on a machine with neither h2spec
+   nor h3spec installed. h1 was not running on the build host either, because
+   `uvx` was installed but not on the gate's PATH.
 3. **Recording today's failure as the standard is the same error in a new
    costume.** h3 37/49 reports PASS because 37 is written in a file.
 4. **Measure the candidate before consolidating onto it, and measure its cost,
-   not only its features.** What blocked m6-file's migration was not a missing
-   capability but `App` spending 0.63ms per page copying its own config.
+   not only its features.**
 5. **A synthetic benchmark measures the shape you imagined.** The first copy
    figure was 3.08us from a 20-key config; the real config loads a 68KB JSON
-   file twice, making it ~323us. When a number looks too big for what it claims
-   to measure, that gap is the finding.
+   file twice, making it ~323us.
 6. **`testkit::binary()` prefers `target/release`** and will hand a test a
-   binary from yesterday. Run `cargo build --workspace --release` before
-   `cargo test`.
+   binary from yesterday. `cargo build --workspace --release` first.
 7. **A doc comment that justifies a decision by naming a premise becomes a lie
-   the day the premise changes.** `validate_path_param` explained why slashes
-   were impossible; `Segment::Wildcard` falsified it, and the one capture
-   defined to hold slashes was answered 400.
+   the day the premise changes.**
 8. **The matcher is not the wire.** Six wildcard tests all stopped at
    `match_route`, so a feature marked done had never worked end to end.
 9. **Confinement must claim only what the role actually has.**
    `ReadWritePaths=/run/m6` in a shared systemd fragment took London off the
-   air: a cache node has no `/run/m6`, and an absent target fails mount
-   namespace setup outright. Never use a `-` prefix to excuse it.
+   air: a cache node has no `/run/m6`.
 10. **Kill by PID.** Never `pkill -f` naming a port or config path. This laptop
-    runs the owner's own dev and preview servers, and it sits at load 20-30.
-11. **Counts rank a source; identity decides what it is.** An address sending
-    371 refused requests over three hours was reported as the day's strongest
-    attacker three times. One field settled it:
-    `UA: Amazon-Route53-Health-Check-Service`.
+    runs the owner's own dev and preview servers and sits at load 20-30.
+11. **Counts rank a source; identity decides what it is.** 371 refused requests
+    over three hours was reported as the day's strongest attacker three times.
+    One field settled it: `UA: Amazon-Route53-Health-Check-Service`.
 12. **Run the suite to a file and grep the file, never the pipe.**
-    `cargo test --workspace > /tmp/run.txt 2>&1`.
 
 ---
 
@@ -339,14 +381,19 @@ Full list in `docs/LESSONS.md`.
 - **A port race in the e2e suites.** `Address already in use` on m6-http's TCP
   listener, seen after `SO_REUSEADDR` was believed to have closed it. Clean on
   re-runs.
-- **Four `cargo deny` advisories** listed as exceptions in `deny.toml`, tracked
-  in issue #3. **The reachability of each has not been established**; that
-  issue was written before checking, which is the same mistake made with the
-  hpack one. A fifth, hpack's decoder panic, **was** checked and is not
-  reachable: `validate_hpack_block` rejects malformed blocks before the decoder
-  sees them, pinned by `http2::hpack_robustness`.
-- **GitHub issues**: #1 (CI, effectively done, close when the branch merges)
-  and #3 (the advisories above).
-- **GitHub branch protection on `main` is not set.** The hooks protect this
-  laptop only. Setting it needs the owner's go-ahead because it changes how the
+- **Four `cargo deny` advisories** listed as exceptions in `deny.toml`, issue
+  #3. **Their reachability has never been established**; that issue was written
+  before checking, which is the same mistake made with a fifth. That fifth,
+  hpack's decoder panic, **was** checked and is **not** reachable:
+  `validate_hpack_block` rejects malformed blocks before the decoder sees them,
+  pinned by `http2::hpack_robustness`. Do the same for the other four rather
+  than trusting the issue text.
+- **GitHub issues**: #1 (CI, done, close it) and #3 (above).
+- **GitHub branch protection on `main` is not set.** The hooks protect one
+  laptop. Setting it needs the owner's go-ahead because it changes how the
   repository behaves for everyone.
+- **`FrameworkState::build_dict` is private**, so the twelve ordered steps of
+  dictionary building are not reusable by a service not using `App`.
+- **The IO layer, the event loop and the handler contract are deferred**,
+  explicitly, by the owner. Not 1.0 work. See `docs/CONSOLIDATION-TODO.md` §3b
+  and do not widen that scope.

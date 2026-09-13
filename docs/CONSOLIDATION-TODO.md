@@ -15,6 +15,10 @@ generalise belongs in core, and core should be the only thing a service links.
 
 ## STATUS, 2026-09-13
 
+**Branch state 2026-09-13:** `develop` is at `9abfebe` with the CI work merged
+and everything passing on the build host. `main` is 133 commits behind and
+none of it is deployed.
+
 ### The road to 1.0, in agreed order
 
 1.0 is **not cut until the consolidation work is done**. Owner's decision,
