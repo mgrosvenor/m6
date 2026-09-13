@@ -25,8 +25,10 @@ number, it does.
 - **`main` is not what is running.** It holds all of that undeployed work. The
   deployed commit is whatever the newest entry in
   `~/dr-grosvenor-site/docs/RELEASES.md` names.
-- **h3 conformance is 37/49 and reports PASS.** That is a failing protocol
-  implementation with today's failure recorded as the standard. §4.
+- **h3 conformance is 37/49 and that is quiche's ceiling, settled 2026-09-13.**
+  Bumping quiche was the recorded fix and it moved nothing. None of the twelve
+  is fixable in m6, and ten are open upstream bugs whose open fix PRs, applied
+  and measured, take h3 to **47/49**. Adopting them is your call, not a task. §4.
 - **There are two repositories** and they must deploy together. §1, §6.
 - **Blocking an IP address is a write.** Propose, never apply unasked. §7.
 
@@ -192,24 +194,66 @@ Run everything: `cd ~/dr-grosvenor-site && ./deploy/run-tests.sh m6`.
 |---|---|---|
 | tests | **1022 passing**, 0 failures, verified over three consecutive runs | everywhere |
 | compiler warnings | **0**, release and test builds | Linux, enforced |
-| clippy | **135 macOS / 145 Linux** | `tools/clippy.sh` |
+| clippy | ceiling **135 macOS / 145 Linux**, but Linux **measures 123** on 2026-09-13 and the ceiling has not been lowered yet. Item 1's job | `tools/clippy.sh` |
 | `cargo fmt` | clean | CI, `check.sh` |
 | `cargo deny` | clean, 5 advisories as recorded exceptions | CI |
 | h1 conformance | **32/32** on four targets | CI, build host |
 | h2 conformance | **146/146** | CI, build host |
-| h3 conformance | **37/49 — RED** | CI, build host |
+| h3 conformance | **37/49 — quiche's ceiling, not m6's** | CI, build host |
 | performance | `render:capabilities` 2,170,589 ns | build host only |
 
-### h3 is red and reports PASS
+### h3 is 37/49, and that is quiche's ceiling, not a gap in m6
 
-`tools/conformance-scores.txt` records 37, so 37/49 passes. That is recording
-today's failure as the standard, and it should not stand.
+**This section used to say the fix was to bump quiche and that it was one
+dependency bump and one CI run. The bump was done on 2026-09-13, 0.26.1 to
+0.29.3, three releases newer. The score did not move by one test.** The
+attribution was right and the remedy was wrong.
 
-All twelve failures are QUIC transport parameter validation, packet reserved
-bits, and QPACK. **Every one is inside `quiche`**, which m6-http uses for
-HTTP/3 and which is pinned to **tag 0.26.1** while upstream is **0.29.3**. m6's
-own code sits above that layer. Upgrading is one dependency bump and one CI run
-to find out whether it clears them.
+**0.29.3 is the newest plain release**, checked against every tag in
+cloudflare/quiche on 2026-09-13. The higher numbers in that repo are
+`tokio-quiche`, a different crate. There is no 0.30 to move to.
+
+All twelve are worded "MUST **send** \<error\>", not "MUST reject". Ten of them
+are **open upstream bugs with open fix pull requests**, so this is a wait, not
+a dead end:
+
+| failures | what quiche does | upstream |
+|---|---|---|
+| **8** TRANSPORT_PARAMETER_ERROR | detects them (the edge log shows exactly 8 `InvalidTransportParam`) and calls `close()`, which queues the right code, then calls `mark_closed()` because `recv_count` is still 0: it increments at the end of `recv_single`, after frames are parsed. `send()` then returns `Done`, so a correctly built close can never go out | issue **#2515**, open since 2026-06-22, naming the same mechanism and the same `recv_count == 0`. Fix PR **#2521**, open, unmerged |
+| **2** PROTOCOL_VIOLATION, reserved bits | **does not detect them.** There is no reserved-bit validation anywhere in `packet.rs`; the packets are accepted | issues **#2526** and **#2652**, open. Fix PR **#2575**, open, last touched 2026-09-10. #2596 closed the Initial case; h3spec tests Handshake and Short |
+| **2** QPACK stream errors | codes 0x201 and 0x202 appear nowhere in its h3 module, which runs a static table only, so there is no dynamic table capacity to exceed | nothing open. #90, "don't error on QPACK instruction", is closed, so this looks settled rather than pending |
+
+**None of the twelve is reachable through quiche's public API, so none is
+fixable in m6.** The full trace, with source line numbers and issue numbers, is
+in `tools/conformance-scores.txt`.
+
+So the floor of 37 is legitimate: it is the measured ceiling of the newest
+quiche release, not today's failure written down, and it must still not fall.
+
+**What would move it, measured on the build host 2026-09-13:**
+
+| quiche | h3 |
+|---|---|
+| 0.29.3 as released | **37/49** |
+| 0.29.3 + cherry-picked #2521 + #2575 | **47/49** |
+| master, 25 commits on, + both PRs | **47/49** |
+
+**The two bases score the same**, so the choice between them is about what you
+would rather carry, not about the number. Only the QPACK pair remains either
+way, which neither PR touches, so 47 is this approach's ceiling. quiche's own
+suite passes on both, 1050 tests on the tag and 1123 on master, zero failures.
+
+Off the tag all three commits apply with no conflict. Off master, #2521 has gone
+stale and needs one trivial resolution, because master reworded the very line it
+changes. The recipe, the commits and that resolution are in
+`tools/conformance-scores.txt`.
+
+**This is not adopted, and adopting it is a decision rather than a task.** Both
+PRs are unmerged and both come from third-party forks, not Cloudflare, so either
+base means unreviewed community code in the QUIC transport path of a production
+edge, and pinning a fork rather than a tag. Master additionally puts 25
+unreleased commits there for no measured gain. The cheap alternative is to wait
+for a release that carries them and re-measure.
 
 ### clippy at 135 should be zero
 
@@ -255,7 +299,7 @@ matching the newest tag; `release.sh` bumps them at a release.
 | # | item | notes |
 |---|---|---|
 | 1 | **clippy to zero** | §4 has the breakdown |
-| 2 | **quiche 0.26.1 → 0.29.3, re-measure h3** | one bump, one CI run |
+| 2 | ~~**quiche 0.26.1 → 0.29.3, re-measure h3**~~ | **done 2026-09-13, issue #4.** Bumped, re-measured, h3 unchanged at 37/49 and now explained. §4 |
 | 3 | **Phase 7: renderers onto a git tag** | below |
 | 4 | **Phase 8: six `/status` implementations** | `apt install golang` on the build host, nothing more. Its purpose is the measurement that says whether linking core costs or saves. |
 | 5 | **Deploy, lifting the freeze** | §6. Not a code task. |
@@ -370,7 +414,7 @@ credential probes), `95.173.161.147` (encoded traversal aimed at `/bin/sh`),
 
 ## 8. The dozen lessons that come up most
 
-Full list, 39 of them, in `docs/LESSONS.md`.
+Full list, 40 of them, in `docs/LESSONS.md`.
 
 0. **A number in a document is a measurement with a timestamp, not a fact.**
    Every error found in two verification passes over this file was a number
@@ -381,28 +425,35 @@ Full list, 39 of them, in `docs/LESSONS.md`.
    nor h3spec installed. h1 was not running on the build host either, because
    `uvx` was installed but not on the gate's PATH.
 3. **Recording today's failure as the standard is the same error in a new
-   costume.** h3 37/49 reports PASS because 37 is written in a file.
-4. **Measure the candidate before consolidating onto it, and measure its cost,
+   costume.** h3 37/49 was the example here, and it turned out to be the
+   exception that sharpens the rule: 37 is a dependency's measured ceiling, so
+   the floor was legitimate and only the wording around it was wrong. §4. The
+   rule stands for every floor that records something you could fix.
+4. **Correct attribution is not a diagnosis.** The twelve h3 failures were
+   rightly placed inside quiche, and the remedy inferred from that, "bump the
+   version", was carried on the 1.0 list unquestioned until it was tried and
+   moved nothing. Lesson 40 in full.
+5. **Measure the candidate before consolidating onto it, and measure its cost,
    not only its features.**
-5. **A synthetic benchmark measures the shape you imagined.** The first copy
+6. **A synthetic benchmark measures the shape you imagined.** The first copy
    figure was 3.08us from a 20-key config; the real config loads a 68KB JSON
    file twice, making it ~323us.
-6. **`testkit::binary()` prefers `target/release`** and will hand a test a
+7. **`testkit::binary()` prefers `target/release`** and will hand a test a
    binary from yesterday. `cargo build --workspace --release` first.
-7. **A doc comment that justifies a decision by naming a premise becomes a lie
+8. **A doc comment that justifies a decision by naming a premise becomes a lie
    the day the premise changes.**
-8. **The matcher is not the wire.** Six wildcard tests all stopped at
+9. **The matcher is not the wire.** Six wildcard tests all stopped at
    `match_route`, so a feature marked done had never worked end to end.
-9. **Confinement must claim only what the role actually has.**
+10. **Confinement must claim only what the role actually has.**
    `ReadWritePaths=/run/m6` in a shared systemd fragment took London off the
    air: a cache node has no `/run/m6`.
-10. **Kill by PID.** Never `pkill -f` naming a port or config path. This laptop
+11. **Kill by PID.** Never `pkill -f` naming a port or config path. This laptop
     runs the owner's own dev and preview servers and sits at load 20-30.
-11. **Counts rank a source; identity decides what it is.** 371 refused requests
+12. **Counts rank a source; identity decides what it is.** 371 refused requests
     over three hours was reported as the day's strongest attacker three times.
     One field settled it: `UA: Amazon-Route53-Health-Check-Service`.
-12. **Run the suite to a file and grep the file, never the pipe.**
-13. **Making a warning fatal does not create the bug it reveals.** The e2e port
+13. **Run the suite to a file and grep the file, never the pipe.**
+14. **Making a warning fatal does not create the bug it reveals.** The e2e port
     race was survivable while a failed bind only warned: the service came up
     with no listener and the test failed later with "never served a backend
     request", naming the symptom and not the cause. Making the bind fatal
