@@ -25,10 +25,12 @@ number, it does.
 - **`main` is not what is running.** It holds all of that undeployed work. The
   deployed commit is whatever the newest entry in
   `~/dr-grosvenor-site/docs/RELEASES.md` names.
-- **h3 conformance is 37/49 and that is quiche's ceiling, settled 2026-09-13.**
-  Bumping quiche was the recorded fix and it moved nothing. None of the twelve
-  is fixable in m6, and ten are open upstream bugs whose open fix PRs, applied
-  and measured, take h3 to **47/49**. Adopting them is your call, not a task. §4.
+- **m6-http depends on a FORK of quiche**, `mgrosvenor/quiche` branch
+  `m6-h3-conformance`, pinned by revision. It is quiche master plus two open
+  upstream PRs, and it takes h3 conformance from 37/49 to **47/49**. Drop it and
+  return to a tag as soon as upstream releases those fixes. §4.
+- **49/49 is not being chased.** The last two are QPACK, they are upstream's
+  choice rather than a bug, and the owner has accepted them: not a 1.0 blocker.
 - **There are two repositories** and they must deploy together. §1, §6.
 - **Blocking an IP address is a write.** Propose, never apply unasked. §7.
 
@@ -199,61 +201,71 @@ Run everything: `cd ~/dr-grosvenor-site && ./deploy/run-tests.sh m6`.
 | `cargo deny` | clean, 5 advisories as recorded exceptions | CI |
 | h1 conformance | **32/32** on four targets | CI, build host |
 | h2 conformance | **146/146** | CI, build host |
-| h3 conformance | **37/49 — quiche's ceiling, not m6's** | CI, build host |
+| h3 conformance | **47/49**, on a fork of quiche. Floor 47 | CI, build host |
 | performance | `render:capabilities` 2,170,589 ns | build host only |
 
-### h3 is 37/49, and that is quiche's ceiling, not a gap in m6
+### h3 is 47/49, on a fork of quiche, and 49 is not being chased
 
-**This section used to say the fix was to bump quiche and that it was one
-dependency bump and one CI run. The bump was done on 2026-09-13, 0.26.1 to
-0.29.3, three releases newer. The score did not move by one test.** The
-attribution was right and the remedy was wrong.
+**m6-http does not depend on released quiche any more.** It pins
+`github.com/mgrosvenor/quiche` by revision, branch `m6-h3-conformance`, which is
+quiche master plus two open upstream pull requests. That is a real decision with
+a real cost, taken on 2026-09-13, and §4 is where it is written down.
 
-**0.29.3 is the newest plain release**, checked against every tag in
-cloudflare/quiche on 2026-09-13. The higher numbers in that repo are
-`tokio-quiche`, a different crate. There is no 0.30 to move to.
+The short history, because every step of it was wrong before it was right:
 
-All twelve are worded "MUST **send** \<error\>", not "MUST reject". Ten of them
-are **open upstream bugs with open fix pull requests**, so this is a wait, not
-a dead end:
+1. h3 was 37/49 with the floor at 37, and the 1.0 list said the fix was to bump
+   quiche from 0.26.1, since all twelve failures sit below the layer m6-http
+   works at. **The bump was done, 0.26.1 to 0.29.3, and the score did not move
+   by one test.** 0.29.3 is also the newest plain release: the higher numbers in
+   that repo are `tokio-quiche`, a different crate.
+2. Reading quiche's source then produced a confident claim that the twelve were
+   deliberate anti-DoS design and effectively unfixable. **That was wrong, and it
+   got caught only because the owner did not believe it.** A source comment
+   explaining a behaviour reads exactly like one endorsing it. The issue tracker
+   is where intent lives.
+3. Ten of the twelve are open upstream bugs with open fix PRs. Applied and
+   measured, they take h3 to 47/49.
 
 | failures | what quiche does | upstream |
 |---|---|---|
-| **8** TRANSPORT_PARAMETER_ERROR | detects them (the edge log shows exactly 8 `InvalidTransportParam`) and calls `close()`, which queues the right code, then calls `mark_closed()` because `recv_count` is still 0: it increments at the end of `recv_single`, after frames are parsed. `send()` then returns `Done`, so a correctly built close can never go out | issue **#2515**, open since 2026-06-22, naming the same mechanism and the same `recv_count == 0`. Fix PR **#2521**, open, unmerged |
-| **2** PROTOCOL_VIOLATION, reserved bits | **does not detect them.** There is no reserved-bit validation anywhere in `packet.rs`; the packets are accepted | issues **#2526** and **#2652**, open. Fix PR **#2575**, open, last touched 2026-09-10. #2596 closed the Initial case; h3spec tests Handshake and Short |
-| **2** QPACK stream errors | codes 0x201 and 0x202 appear nowhere in its h3 module, which runs a static table only, so there is no dynamic table capacity to exceed | nothing open. #90, "don't error on QPACK instruction", is closed, so this looks settled rather than pending |
+| **8** TRANSPORT_PARAMETER_ERROR | detects them (the edge log shows exactly 8 `InvalidTransportParam`) and calls `close()`, queueing the right code, then calls `mark_closed()` because `recv_count` is still 0: it increments at the end of `recv_single`, after frames are parsed. `send()` then returns `Done`, so a correctly built close can never go out | issue **#2515**, open since 2026-06-22, naming the same mechanism and the same `recv_count == 0`. Fix PR **#2521** |
+| **2** PROTOCOL_VIOLATION, reserved bits | **does not detect them.** There is no reserved-bit validation anywhere in `packet.rs`; the packets are accepted | issues **#2526** and **#2652**. Fix PR **#2575**, last touched 2026-09-10. #2596 closed the Initial case; h3spec tests Handshake and Short |
+| **2** QPACK stream errors | reads the peer's QPACK streams and **discards every byte**, counting only totals. Static table only, so no dynamic table capacity to exceed | nothing open, and #90 "don't error on QPACK instruction" is closed. Upstream's choice, not its mistake |
 
-**None of the twelve is reachable through quiche's public API, so none is
-fixable in m6.** The full trace, with source line numbers and issue numbers, is
-in `tools/conformance-scores.txt`.
-
-So the floor of 37 is legitimate: it is the measured ceiling of the newest
-quiche release, not today's failure written down, and it must still not fall.
-
-**What would move it, measured on the build host 2026-09-13:**
+Measured on the build host, every run with the linked source confirmed in
+`Cargo.lock`:
 
 | quiche | h3 |
 |---|---|
 | 0.29.3 as released | **37/49** |
-| 0.29.3 + cherry-picked #2521 + #2575 | **47/49** |
-| master, 25 commits on, + both PRs | **47/49** |
+| tag 0.29.3 + cherry-picked #2521 + #2575 | **47/49** |
+| master + both PRs | **47/49**, adopted |
 
-**The two bases score the same**, so the choice between them is about what you
-would rather carry, not about the number. Only the QPACK pair remains either
-way, which neither PR touches, so 47 is this approach's ceiling. quiche's own
-suite passes on both, 1050 tests on the tag and 1123 on master, zero failures.
+Both bases scored the same, so the choice was never about the number. Master was
+taken because it is where both PRs are based, which is what keeps the fork
+rebasable. Pinned by **revision, not branch**, so the dependency cannot move
+under a build that claims to be reproducible. quiche's own suite passes on it:
+1123 tests, zero failures.
 
-Off the tag all three commits apply with no conflict. Off master, #2521 has gone
-stale and needs one trivial resolution, because master reworded the very line it
-changes. The recipe, the commits and that resolution are in
-`tools/conformance-scores.txt`.
+**What it costs, and this is not a formality.** Both PRs are unmerged and both
+come from third-party forks, not Cloudflare, so the QUIC transport path of a
+production edge now carries community changes upstream has not reviewed, plus 25
+unreleased master commits. #2575's own commit message records that the ideal
+test, crafting a real packet with the AEAD-protected reserved bit set, was **not**
+written. And pinning a fork cuts against the reason Phase 7 chose a tag over
+crates.io: not owning someone else's release surface.
 
-**This is not adopted, and adopting it is a decision rather than a task.** Both
-PRs are unmerged and both come from third-party forks, not Cloudflare, so either
-base means unreviewed community code in the QUIC transport path of a production
-edge, and pinning a fork rather than a tag. Master additionally puts 25
-unreleased commits there for no measured gain. The cheap alternative is to wait
-for a release that carries them and re-measure.
+**So drop the fork when upstream releases these.** That is the point of it. Watch
+#2521 and #2575, then go back to a tag and re-measure.
+
+**49/49 is not being chased.** Owner's decision, 2026-09-13: *"47/49 is good
+enough. It's not going to block 1.0.0"*. The two QPACK failures are accepted.
+Closing them would mean writing new protocol validation into the fork ourselves,
+which is small in lines and not small in kind: new parsing on the connection path
+with no upstream review, needing per-stream buffering that is exactly where a
+careless version becomes unbounded memory on a stream a peer controls.
+`tools/conformance-scores.txt` has the full detail, the rebuild recipe and the
+one merge conflict to expect.
 
 ### clippy at 135 should be zero
 
@@ -299,7 +311,7 @@ matching the newest tag; `release.sh` bumps them at a release.
 | # | item | notes |
 |---|---|---|
 | 1 | **clippy to zero** | §4 has the breakdown |
-| 2 | ~~**quiche 0.26.1 → 0.29.3, re-measure h3**~~ | **done 2026-09-13, issue #4.** Bumped, re-measured, h3 unchanged at 37/49 and now explained. §4 |
+| 2 | ~~**quiche 0.26.1 → 0.29.3, re-measure h3**~~ | **done 2026-09-13, issue #4.** The bump alone moved nothing. h3 is now **47/49** on a fork of quiche master carrying PRs #2521 and #2575, floor raised to 47. The last two are QPACK and are accepted, not chased. §4 |
 | 3 | **Phase 7: renderers onto a git tag** | below |
 | 4 | **Phase 8: six `/status` implementations** | `apt install golang` on the build host, nothing more. Its purpose is the measurement that says whether linking core costs or saves. |
 | 5 | **Deploy, lifting the freeze** | §6. Not a code task. |
