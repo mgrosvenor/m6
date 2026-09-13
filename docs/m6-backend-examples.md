@@ -389,9 +389,21 @@ whole point of that route, and anything that re-encodes could re-space them.
 
 ## 11. Still owed against this document
 
-- **The benchmark of §5**, including the `rust-plain` against `rust-m6core`
-  delta that §5.3 calls the genuinely informative comparison. The examples and
-  their conformance tests exist; the measurement does not yet.
+- ~~The benchmark of §5~~ **done 2026-09-13**, `tools/backend-bench.py`, results
+  in `docs/BENCHMARKS.md`. The answer to §5.3's question is that linking
+  `m6-core` costs **36% of throughput and +37us p50** on this route, reproduced
+  within 3% across two runs, plus 8.8x resident memory and 56.7x binary size.
+  §5.3 says that if the number is not close to zero then core has a problem
+  worth knowing about, and it is not close to zero. What it is NOT is "the site
+  is 36% slower": the route is deliberately the shape that maximises framework
+  overhead, and behind the edge cache most requests never reach a backend.
+
+  Getting there required fixing the control rather than the subject. The first
+  run reported core as 72% FASTER, because `rust-plain` spawned a thread per
+  connection while core answered from a fixed pool, so the comparison was
+  pooling against thread-per-connection. `rust-plain` now uses protocol §7's
+  reference model, which is what it should always have been, and that alone took
+  it from 17,608 to 46,826 rps.
 - **The through-the-proxy half of §7**: `X-Forwarded-For` carrying the real
   client address, `X-Forwarded-Host` and `Via` arriving intact, the proxy
   applying compression and caching on top of an uncompressed and uncached
