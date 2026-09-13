@@ -1,14 +1,18 @@
-/// Non-blocking HTTP/1.1 and HTTP/2 over TLS (rustls) integrated into the epoll loop.
-///
-/// Design:
-/// - `TcpListener` registered with TOKEN_TCP.
-/// - `accept_pending()` drains new connections, eagerly advances the TLS handshake,
-///   and registers each fd with the poller.
-/// - After the TLS handshake, the negotiated ALPN protocol determines the handler:
-///     "h2"       → Http2Conn  (multiplexed streams, full H2 framing)
-///     "http/1.1" → H1 state machine (Handshake→Reading→Writing, Connection: close)
-/// - `drive_all()` is called after every epoll wakeup (for any TOKEN_TCP event)
-///   and drives every active connection one step forward.
+//! Non-blocking HTTP/1.1 and HTTP/2 over TLS (rustls) integrated into the epoll loop.
+//!
+//! Design:
+//! - `TcpListener` registered with TOKEN_TCP.
+//! - `accept_pending()` drains new connections, eagerly advances the TLS handshake,
+//!   and registers each fd with the poller.
+//! - After the TLS handshake, the negotiated ALPN protocol determines the handler:
+//!
+//!   ```text
+//!   "h2"       → Http2Conn  (multiplexed streams, full H2 framing)
+//!   "http/1.1" → H1 state machine (Handshake→Reading→Writing, Connection: close)
+//!   ```
+//!
+//! - `drive_all()` is called after every epoll wakeup (for any TOKEN_TCP event)
+//!   and drives every active connection one step forward.
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -49,7 +53,15 @@ enum ConnKind {
     /// HTTP/1.1 after handshake.
     Http1(H1Conn),
     /// HTTP/2 after handshake.
-    Http2(Http2Conn),
+    ///
+    /// Boxed: `Http2Conn` is 336 bytes against the 80 of the largest other
+    /// variant, so inline it sized every stored `Conn` to match, H1 and
+    /// mid-handshake ones included. The cost is one allocation per HTTP/2
+    /// connection, paid once at ALPN selection rather than per request, and a
+    /// connection here is long-lived. On a 950MB single-core origin holding a
+    /// map of these, the 256 bytes saved on every other entry is the better
+    /// side of that trade.
+    Http2(Box<Http2Conn>),
 }
 
 struct Conn {
@@ -79,7 +91,10 @@ enum H1State {
     },
     WaitingBackend {
         rx: std::sync::mpsc::Receiver<std::io::Result<HttpResponse>>,
-        ctx: PendingUrlContext,
+        /// Boxed: this context is much larger than the read and write buffers
+        /// the other variants hold, and an inline copy sized every H1 state,
+        /// including `Done`, to match it.
+        ctx: Box<PendingUrlContext>,
     },
     Writing {
         buf: Vec<u8>,
@@ -496,7 +511,7 @@ where
         let client_ip = client_ip.clone();
         let created = *created;
         if proto.as_deref() == Some(b"h2".as_slice()) {
-            conn.kind = ConnKind::Http2(Http2Conn::new());
+            conn.kind = ConnKind::Http2(Box::default());
             // Drive immediately — client preface may already be buffered.
             let ConnKind::Http2(h2) = &mut conn.kind else {
                 return;
@@ -754,7 +769,10 @@ where
                                 continue;
                             }
                             RequestOutcome::Pending { rx, ctx } => {
-                                h1.state = H1State::WaitingBackend { rx, ctx };
+                                h1.state = H1State::WaitingBackend {
+                                    rx,
+                                    ctx: Box::new(ctx),
+                                };
                                 break; // nothing more to do; poll next iteration
                             }
                         }

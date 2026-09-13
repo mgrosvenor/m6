@@ -550,7 +550,8 @@ fn l8_concurrent_requests_all_routes() {
 
     let mut handles = Vec::new();
 
-    let routes = [("GET /blog HTTP/1.1\r\nHost: localhost\r\n\r\n", "200 OK"),
+    let routes = [
+        ("GET /blog HTTP/1.1\r\nHost: localhost\r\n\r\n", "200 OK"),
         (
             "GET /blog/hello-world HTTP/1.1\r\nHost: localhost\r\n\r\n",
             "200 OK",
@@ -562,7 +563,8 @@ fn l8_concurrent_requests_all_routes() {
         (
             "GET /no-such-path HTTP/1.1\r\nHost: localhost\r\n\r\n",
             "404",
-        )];
+        ),
+    ];
 
     for i in 0..100 {
         let sp = socket_path.clone();

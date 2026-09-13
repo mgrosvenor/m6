@@ -947,6 +947,13 @@ impl Cache {
     pub fn len(&self) -> usize {
         self.map.read().map(|m| m.len()).unwrap_or(0)
     }
+
+    /// Whether the cache holds nothing. A poisoned lock reads as empty, for the
+    /// same reason `len` reads as zero: this is an occupancy report, and it must
+    /// not panic on the path that reports it.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 /// Roughly how many bytes an entry occupies.

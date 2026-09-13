@@ -38,6 +38,27 @@ use m6_http_lib::stats::Stats;
 /// value is stated where it is used.
 const H3_MESSAGE_ERROR: u64 = 0x10e;
 
+/// A rendered error document held for reuse: when it was rendered, its headers,
+/// and its body. Keyed by status, so one entry answers every path that 404s.
+///
+/// Named because the written-out form appeared in the `ServerState` field and
+/// again in each test that builds one, and three copies of
+/// `(Instant, Vec<(String, String)>, Vec<u8>)` say nothing about which element
+/// is the body.
+type CachedErrorPage = (std::time::Instant, Vec<(String, String)>, Vec<u8>);
+
+/// What finalizing a URL-backend response yields: the status, the response
+/// headers, the body, the name of the backend that served it, and the early
+/// hints URLs to advertise. Returned by both `finalize_url_response` and its
+/// inner half, which is why it is worth a name.
+type FinalizedResponse = (
+    u16,
+    Vec<(String, String)>,
+    Vec<u8>,
+    String,
+    std::sync::Arc<Vec<String>>,
+);
+
 /// How long a fetched error document is reused before being re-fetched.
 /// Short enough that a redeployed error page appears promptly, long enough
 /// that a sustained sweep costs one fetch a minute rather than one per path.
@@ -165,7 +186,7 @@ struct ServerState {
     /// need a response per path, it needs one error document.
     ///
     /// Keyed by status, so at most a handful of entries ever.
-    error_pages: HashMap<u16, (std::time::Instant, Vec<(String, String)>, Vec<u8>)>,
+    error_pages: HashMap<u16, CachedErrorPage>,
     /// When this process began serving, for the health endpoint's uptime.
     ///
     /// `Instant`, not `SystemTime`: it is monotonic, so a clock step (NTP
@@ -281,16 +302,36 @@ fn make_quiche_config(server_config: &config::ServerConfig) -> anyhow::Result<qu
 
 // ── Event loop ────────────────────────────────────────────────────────────────
 
-fn event_loop(
+/// Everything the event loop polls, owned for its lifetime.
+///
+/// These five arrived as five separate arguments, which put `event_loop` at
+/// eight. They are not five unrelated values: they are the set of things the
+/// loop waits on, which is why the poller registers every one of them in the
+/// same breath. `tcp`, `h2c` and `watcher` are optional because a node's role
+/// decides whether it has them at all.
+struct EventLoopIo {
     udp: UdpSocket,
-    mut tcp: Option<Http11Listener>,
-    mut h2c: Option<H2cListener>,
-    mut watcher: Option<FsWatcher>,
+    tcp: Option<Http11Listener>,
+    h2c: Option<H2cListener>,
+    watcher: Option<FsWatcher>,
+    wake_reader: WakeReader,
+}
+
+fn event_loop(
+    io: EventLoopIo,
     state: &mut ServerState,
     quiche_config: &mut quiche::Config,
     log_handle: &m6_core::log::LogHandle,
-    wake_reader: WakeReader,
 ) -> i32 {
+    // Destructured rather than accessed through `io` throughout: the loop body
+    // is long and reads better against the names it has always used.
+    let EventLoopIo {
+        udp,
+        mut tcp,
+        mut h2c,
+        mut watcher,
+        wake_reader,
+    } = io;
     let poller = match Poller::new() {
         Ok(p) => p,
         Err(e) => {
@@ -377,8 +418,8 @@ fn event_loop(
             break;
         }
 
-        for i in 0..n {
-            match ev_buf[i] {
+        for ev in &ev_buf[..n] {
+            match *ev {
                 // Shutdown poke. Drained so one byte cannot spin the loop; the
                 // flag was already checked above, so there is nothing else to
                 // do here.
@@ -1119,7 +1160,9 @@ fn event_loop(
 
 fn drain_udp(
     udp: &UdpSocket,
-    recv_buf: &mut Vec<u8>,
+    // A slice, not `&mut Vec<u8>`: this never grows or shrinks the buffer, it
+    // fills it and reslices it to the datagram length.
+    recv_buf: &mut [u8],
     connections: &mut HashMap<Vec<u8>, QuicConn>,
     conn_id_map: &mut HashMap<Vec<u8>, Vec<u8>>,
     quiche_config: &mut quiche::Config,
@@ -1262,12 +1305,7 @@ fn drain_udp(
 fn process_h3(qconn: &mut QuicConn, _udp: &UdpSocket, state: &mut ServerState, quic_port: u16) {
     // client_ip is NOT computed here — deferred to cache-miss path in handle_h3_request.
 
-    loop {
-        let h3 = match qconn.h3_conn.as_mut() {
-            Some(h) => h,
-            None => break,
-        };
-
+    while let Some(h3) = qconn.h3_conn.as_mut() {
         match h3.poll(&mut qconn.conn) {
             Ok((
                 stream_id,
@@ -1295,11 +1333,7 @@ fn process_h3(qconn: &mut QuicConn, _udp: &UdpSocket, state: &mut ServerState, q
             Ok((stream_id, quiche::h3::Event::Data)) => {
                 // Need to borrow h3_conn mutably again
                 let mut buf = [0u8; 65536];
-                loop {
-                    let h3 = match qconn.h3_conn.as_mut() {
-                        Some(h) => h,
-                        None => break,
-                    };
+                while let Some(h3) = qconn.h3_conn.as_mut() {
                     match h3.recv_body(&mut qconn.conn, stream_id, &mut buf) {
                         Ok(0) => break,
                         Ok(read) => {
@@ -3003,7 +3037,7 @@ fn invalidate_after_unsafe_method(
             } else {
                 v.split_once("://")
                     .map(|(_, rest)| rest)
-                    .and_then(|rest| rest.split_once('/').map(|(host, p)| (host, p)))
+                    .and_then(|rest| rest.split_once('/'))
                     .filter(|(host, _)| {
                         let host = host.split(':').next().unwrap_or(host);
                         host == state.config.site.domain
@@ -3137,13 +3171,7 @@ fn finalize_url_response(
     ctx: &forward::PendingUrlContext,
     quic_port: u16,
     state: &mut ServerState,
-) -> (
-    u16,
-    Vec<(String, String)>,
-    Vec<u8>,
-    String,
-    std::sync::Arc<Vec<String>>,
-) {
+) -> FinalizedResponse {
     let describedby = state.config.site.describedby.clone();
     let mut r = finalize_url_response_inner(http_result, ctx, quic_port, state);
     set_vary_accept_encoding(&mut r.1);
@@ -3158,13 +3186,7 @@ fn finalize_url_response_inner(
     ctx: &forward::PendingUrlContext,
     quic_port: u16,
     state: &mut ServerState,
-) -> (
-    u16,
-    Vec<(String, String)>,
-    Vec<u8>,
-    String,
-    std::sync::Arc<Vec<String>>,
-) {
+) -> FinalizedResponse {
     let req = &ctx.req;
     let enc = &ctx.enc;
 
@@ -3922,14 +3944,16 @@ fn run(args: Vec<String>) -> i32 {
     };
 
     let code = event_loop(
-        udp,
-        tcp_listener,
-        h2c_listener,
-        watcher,
+        EventLoopIo {
+            udp,
+            tcp: tcp_listener,
+            h2c: h2c_listener,
+            watcher,
+            wake_reader,
+        },
         &mut state,
         &mut quiche_config,
         &log_handle,
-        wake_reader,
     );
     shutdown.complete();
     code
@@ -4432,8 +4456,7 @@ mod error_page_holder_tests {
     /// (path, query, encoding) and every junk path is a distinct key.
     #[test]
     fn one_entry_serves_every_path() {
-        let mut pages: HashMap<u16, (std::time::Instant, Vec<(String, String)>, Vec<u8>)> =
-            HashMap::new();
+        let mut pages: HashMap<u16, CachedErrorPage> = HashMap::new();
         pages.insert(
             404,
             (std::time::Instant::now(), vec![], b"not found".to_vec()),
@@ -4444,7 +4467,7 @@ mod error_page_holder_tests {
             "/route53-health/index.php",
             "/yarn.lock",
         ] {
-            let hit = pages.get(&404).is_some();
+            let hit = pages.contains_key(&404);
             assert!(hit, "{path} must be answered from the single held document");
         }
         assert_eq!(pages.len(), 1, "one document, not one per path");
@@ -4454,11 +4477,10 @@ mod error_page_holder_tests {
     /// served under a 500.
     #[test]
     fn statuses_do_not_share_a_document() {
-        let mut pages: HashMap<u16, (std::time::Instant, Vec<(String, String)>, Vec<u8>)> =
-            HashMap::new();
+        let mut pages: HashMap<u16, CachedErrorPage> = HashMap::new();
         pages.insert(404, (std::time::Instant::now(), vec![], b"gone".to_vec()));
         assert!(
-            pages.get(&500).is_none(),
+            !pages.contains_key(&500),
             "500 must not be answered by the 404 document"
         );
     }

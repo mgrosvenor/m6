@@ -624,7 +624,8 @@ impl H2TimedClient {
             let res = {
                 let mut sr = &self.stream;
                 self.conn.write_tls(&mut sr)
-            }; match res {
+            };
+            match res {
                 Ok(0) => break,
                 Ok(n) => {
                     total += n;
@@ -641,7 +642,8 @@ impl H2TimedClient {
             let res = {
                 let mut sr = &self.stream;
                 self.conn.read_tls(&mut sr)
-            }; match res {
+            };
+            match res {
                 Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "closed")),
                 Ok(_) => {
                     self.conn
@@ -676,7 +678,8 @@ impl H2TimedClient {
             let res = {
                 let mut sr = &self.stream;
                 self.conn.read_tls(&mut sr)
-            }; match res {
+            };
+            match res {
                 Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "closed")),
                 Ok(_) => {
                     self.conn
@@ -761,20 +764,20 @@ impl H2TimedClient {
                             ));
                         }
                     }
-                    0x1 if fsid == sid => {
+                    0x1 if fsid == sid
                         // HEADERS
-                        if flags & 0x1 != 0 {
-                            // END_STREAM (no body)
-                            let t_done = Instant::now();
-                            let us = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1_000_000.0;
-                            let t_fb = first_byte_time.unwrap_or(t_done);
-                            return Ok((
-                                body,
-                                us(t_req_start, t_req_sent),
-                                us(t_req_sent, t_fb),
-                                us(t_fb, t_done),
-                            ));
-                        }
+                        && flags & 0x1 != 0 =>
+                    {
+                        // END_STREAM (no body)
+                        let t_done = Instant::now();
+                        let us = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1_000_000.0;
+                        let t_fb = first_byte_time.unwrap_or(t_done);
+                        return Ok((
+                            body,
+                            us(t_req_start, t_req_sent),
+                            us(t_req_sent, t_fb),
+                            us(t_fb, t_done),
+                        ));
                     }
                     0x3 if fsid == sid => anyhow::bail!("server RST_STREAM"),
                     0x7 => anyhow::bail!("server GOAWAY"),
@@ -1014,18 +1017,16 @@ impl H2cTimedClient {
                             ));
                         }
                     }
-                    0x1 if fsid == sid => {
-                        if flags & 0x1 != 0 {
-                            let t_done = Instant::now();
-                            let us = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1_000_000.0;
-                            let t_fb = first_byte_time.unwrap_or(t_done);
-                            return Ok((
-                                body,
-                                us(t_req_start, t_req_sent),
-                                us(t_req_sent, t_fb),
-                                us(t_fb, t_done),
-                            ));
-                        }
+                    0x1 if fsid == sid && flags & 0x1 != 0 => {
+                        let t_done = Instant::now();
+                        let us = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1_000_000.0;
+                        let t_fb = first_byte_time.unwrap_or(t_done);
+                        return Ok((
+                            body,
+                            us(t_req_start, t_req_sent),
+                            us(t_req_sent, t_fb),
+                            us(t_fb, t_done),
+                        ));
                     }
                     0x3 if fsid == sid => anyhow::bail!("server RST_STREAM"),
                     0x7 => anyhow::bail!("server GOAWAY"),

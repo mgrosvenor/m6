@@ -284,7 +284,10 @@ pub enum PerfOutcome {
     /// expensive branch one misconfigured header away from being taken on
     /// every request, and splitting the paths is what keeps each answer's cost
     /// a property of the path rather than of the caller.
-    Traffic(TrafficReport),
+    /// Boxed: `TrafficReport` is far larger than every other variant here, so
+    /// carrying it inline made the whole enum that size even when the outcome
+    /// was a one-word error.
+    Traffic(Box<TrafficReport>),
     /// The analytics log could not be read. Said out loud rather than reported
     /// as a quiet hour, which is a mistake this codebase has made: an absent
     /// file at the expected path looked exactly like a feature switched off.
@@ -294,7 +297,10 @@ pub enum PerfOutcome {
     Disabled,
     /// Configured, but the caller presented no or wrong credentials.
     Unauthorised,
-    Ok(PerfReport),
+    /// Boxed for the same reason as `Traffic`: `PerfReport` is 608 bytes
+    /// against the 24 of the largest error variant, and an inline copy made
+    /// every `PerfOutcome` that size.
+    Ok(Box<PerfReport>),
 }
 
 impl PerfReport {
@@ -317,14 +323,14 @@ impl PerfReport {
                 // after authorisation passes, never for an anonymous caller.
                 // Read after authorisation, like the reservoir sort: an
                 // anonymous caller never causes a /proc read either.
-                PerfOutcome::Ok(PerfReport {
+                PerfOutcome::Ok(Box::new(PerfReport {
                     node: node.to_string(),
                     uptime_s,
                     pools,
                     url_backends,
                     metrics: snapshot(),
                     host: crate::host::snapshot(host_path),
-                })
+                }))
             }
         }
     }
