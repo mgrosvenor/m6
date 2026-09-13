@@ -243,3 +243,31 @@ New 2026-09-12:
     the true figure ~323us, seventy times larger. **Take the input from
     production before quoting a number**, and when a measurement looks too big
     for what it claims to measure, that gap is the finding.
+39. **Making a warning fatal does not create the bug it reveals.** The e2e
+    suites raced on ports. `SO_REUSEADDR` had been added and was believed to
+    have closed it, and it had: it fixes rebinding a port in `TIME_WAIT`, a
+    socket closed but lingering. It cannot fix a port another process is
+    actively **listening** on, and refusing that is the entire point of the
+    check. Those are two different races and were being treated as one.
+
+    The second one was in the test harness, not the server. `PortClaim::drop`
+    removed its marker file immediately, but the marker only guarantees no
+    other **test** picks the port. It says nothing about whether the
+    **service** that was using it has exited. A claim dropped while its
+    process was still shutting down freed the marker, the next test claimed
+    the port, and its service could not bind.
+
+    It stayed survivable while a failed bind was a warning: the process came
+    up with no listener and the test failed later with "never served a backend
+    request", naming the symptom and not the cause. A comment in `http11.rs`
+    had predicted exactly that outcome in exactly those words. Making a failed
+    bind fatal turned a confusing late failure into an immediate honest one,
+    which is the only reason it was ever found. **When a change to error
+    handling starts producing failures, the first question is whether it
+    created them or stopped hiding them.**
+
+    Fixed in the primitive rather than in each test: `PortClaim::drop` now
+    waits until the port genuinely binds before releasing the marker, bounded
+    at five seconds so something outside the suite cannot hang the run.
+    Containing a race in the type means it cannot come back through a test
+    that happens to declare its fields in the wrong order.
