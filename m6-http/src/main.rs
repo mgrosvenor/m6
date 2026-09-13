@@ -3825,14 +3825,28 @@ fn run(args: Vec<String>) -> i32 {
                 info!(bind = %config.server.bind, "HTTP/1.1 over TLS listener started");
                 Some(l)
             }
+            // FATAL, not a warning. `bind` is configured on every node, so a
+            // failure to bind it is a node that cannot serve: systemd sees a
+            // running process, /health answers on whatever else is listening,
+            // and nothing is on 443. That is the shape this project keeps
+            // meeting -- artefact wrong, process healthy, failure deferred and
+            // invisible -- and `Restart=on-failure` already exists to handle
+            // the honest version.
+            //
+            // The distinction §3d asked for is between a listener that is
+            // configured and failed, and one that was never configured. This
+            // arm is the first. `h2c_bind` below is the second: absent on a
+            // cache node, which is not a failure to bind but an absence of a
+            // bind, and is left alone.
             Err(e) => {
-                warn!(error = %e, "HTTP/1.1 TCP listener bind failed, HTTP/1.1 disabled");
-                None
+                error!(bind = %config.server.bind, error = %e,
+                       "HTTP/1.1 TCP listener bind failed; refusing to run without it");
+                return 1;
             }
         },
         Err(e) => {
-            warn!(error = %e, "HTTP/1.1 TLS config failed, HTTP/1.1 disabled");
-            None
+            error!(error = %e, "HTTP/1.1 TLS config failed; refusing to run without it");
+            return 1;
         }
     };
 
@@ -3842,9 +3856,13 @@ fn run(args: Vec<String>) -> i32 {
                 info!(bind = %h2c_bind, "H2C (HTTP/2 cleartext) listener started");
                 Some(l)
             }
+            // Configured and failed, so fatal, by the same argument as the
+            // TLS listener above. A cache node has no `h2c_bind` at all and
+            // never reaches this arm.
             Err(e) => {
-                warn!(error = %e, "H2C listener bind failed, H2C disabled");
-                None
+                error!(bind = %h2c_bind, error = %e,
+                       "H2C listener bind failed; it is configured, so refusing to run without it");
+                return 1;
             }
         }
     } else {
