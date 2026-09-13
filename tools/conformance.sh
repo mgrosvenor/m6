@@ -224,7 +224,8 @@ start_edge() {
   local site="$WORK/edge-site"
   mkdir -p "$site/public" "$site/configs"
 
-  if [[ ! -x "$ROOT/target/release/m6-http" || ! -x "$ROOT/target/release/m6-file" ]]; then
+  if [[ ! -x "$ROOT/target/release/m6-http" || ! -x "$ROOT/target/release/m6-file" \
+        || ! -x "$ROOT/target/release/m6-html" ]]; then
     fail "no release build; run: cargo build --workspace --release"
     RESULT=1
     return 1
@@ -266,9 +267,17 @@ enabled = false
 name    = "m6-file"
 sockets = "$WORK/edge-m6-file-*.sock"
 
+[[backend]]
+name    = "m6-html"
+sockets = "$WORK/edge-m6-html-*.sock"
+
 [[route]]
 path    = "/public/{relpath}"
 backend = "m6-file"
+
+[[route_group]]
+path    = "/"
+backend = "m6-html"
 TOML
   cat > "$WORK/conf.toml" <<TOML
 [server]
@@ -290,6 +299,25 @@ TOML
   PIDS+=($fpid)
   for _ in $(seq 1 300); do [[ -S "$sock" ]] && break; sleep 0.02; done
   [[ -S "$sock" ]] || { fail "edge backend never created $sock"; RESULT=1; return 1; }
+
+  # A second backend, so the edge under test routes the way production does:
+  # m6-http in front of a file service AND a renderer, not in front of one
+  # thing. h2spec and h3spec exercise the edge's own framing either way, but a
+  # single-backend edge is not the service that runs, and the point of running
+  # these against a live stack is that it is the live stack.
+  mkdir -p "$site/templates"
+  printf '<!doctype html><html><body><h1>conformance</h1></body></html>\n' \
+    > "$site/templates/index.html"
+  printf '[[route]]\npath = "/"\ntemplate = "templates/index.html"\n' \
+    > "$site/configs/m6-html.conf"
+  local hsock="$WORK/edge-m6-html-1.sock"
+  rm -f "$hsock"
+  M6_SOCKET_OVERRIDE="$hsock" $SETSID nohup "$ROOT/target/release/m6-html" \
+    "$site" "$site/configs/m6-html.conf" > "$WORK/edge-html.log" 2>&1 &
+  local hpid=$!
+  PIDS+=($hpid)
+  for _ in $(seq 1 300); do [[ -S "$hsock" ]] && break; sleep 0.02; done
+  [[ -S "$hsock" ]] || { fail "edge renderer never created $hsock"; RESULT=1; return 1; }
 
   require_free_port "$TLS_PORT" "the loopback edge" || return 1
   $SETSID nohup "$ROOT/target/release/m6-http" "$site" "$WORK/conf.toml" \
@@ -504,8 +532,13 @@ run_h2() {
   local log="$WORK/h2spec.out"
   h2spec -h 127.0.0.1 -p $TLS_PORT -t -k --timeout 5 > "$log" 2>&1
   local got failed tot
-  got="$(grep -oE '[0-9]+ passed' "$log" | tail -1 | grep -oE '[0-9]+')"
-  failed="$(grep -oE '[0-9]+ failed' "$log" | tail -1 | grep -oE '[0-9]+')"
+  # -a, because h2spec's output carries control bytes and GNU grep then treats
+  # the file as binary: it prints "binary file matches" instead of the match,
+  # the parse yields nothing, and the run is scored as having measured nothing.
+  # That happened on the first CI run and the "measured NOTHING" check caught
+  # it, which is the check doing its job.
+  got="$(grep -a -oE '[0-9]+ passed' "$log" | tail -1 | grep -oE '[0-9]+')"
+  failed="$(grep -a -oE '[0-9]+ failed' "$log" | tail -1 | grep -oE '[0-9]+')"
   tot=$(( ${got:-0} + ${failed:-0} ))
   measured_or_fail "h2:m6-http" "${got:-}" "$tot" "$log"
 }
@@ -530,8 +563,8 @@ run_h3() {
   # check rather than to fail. Two bugs compounding: a parser that matched
   # nothing, and a gate that treated "nothing" as "fine".
   local total failed got
-  total="$(grep -oE '[0-9]+ examples' "$log" | tail -1 | grep -oE '[0-9]+')"
-  failed="$(grep -oE '[0-9]+ failures?' "$log" | tail -1 | grep -oE '[0-9]+')"
+  total="$(grep -a -oE '[0-9]+ examples' "$log" | tail -1 | grep -oE '[0-9]+')"
+  failed="$(grep -a -oE '[0-9]+ failures?' "$log" | tail -1 | grep -oE '[0-9]+')"
   if [[ -n "$total" && -n "$failed" ]]; then
     got=$(( total - failed ))
   else
