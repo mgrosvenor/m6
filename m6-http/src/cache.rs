@@ -460,6 +460,12 @@ pub struct Cache {
     max_bytes: usize,
 }
 
+impl Default for Cache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Cache {
     pub fn new() -> Self {
         Self::with_max_bytes(DEFAULT_MAX_BYTES)
@@ -940,6 +946,13 @@ impl Cache {
     /// memory-occupancy figure, not a count of servable entries.
     pub fn len(&self) -> usize {
         self.map.read().map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// Whether the cache holds nothing. A poisoned lock reads as empty, for the
+    /// same reason `len` reads as zero: this is an occupancy report, and it must
+    /// not panic on the path that reports it.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 

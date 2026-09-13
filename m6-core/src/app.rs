@@ -46,6 +46,27 @@ type ThreadInitFn = Arc<dyn Fn() -> Box<dyn Any + Send> + Send + Sync>;
 /// Destructor: called once per thread at shutdown, receives the type-erased state.
 type ThreadDestroyFn = Arc<dyn Fn(Box<dyn Any + Send>) + Send + Sync>;
 
+// ── The stateful builders' callback shapes ────────────────────────────────────
+//
+// These four spell out the closures a service hands `App` when it carries state.
+// They are aliases rather than the types written out because the written-out
+// forms are what `App`'s builders, their private run functions and their
+// internal structs all repeat, once per arity, and a reader comparing two
+// signatures had to diff forty characters of `Arc<dyn Fn(..) + Send + Sync>` to
+// find the one difference that mattered. Naming them says which is which.
+
+/// Builds the global state once, at startup, before any worker thread exists.
+/// Fails the service if it returns `Err`: there is no degraded mode.
+type InitGlobal<G> = Arc<dyn Fn(&AppContext) -> Result<G> + Send + Sync>;
+
+/// Builds one thread's state from the config dict and the global state. Called
+/// once per worker thread. `G` is `()` for a service with thread state only.
+type InitThread<G, T> = Arc<dyn Fn(&Map<String, Value>, &G) -> Result<T> + Send + Sync>;
+
+/// Tears state down at shutdown. `None` is the common case: most services hold
+/// nothing that needs an explicit drop, and the option is what says so.
+type Destroy<S> = Option<Arc<dyn Fn(S) + Send + Sync>>;
+
 /// Global thread-init function — set at startup before any threads are created.
 static THREAD_INIT_FN: OnceLock<ThreadInitFn> = OnceLock::new();
 
@@ -989,8 +1010,8 @@ fn drain_thread_state_typed<T: Any + Send + 'static>(destroy: &Arc<dyn Fn(T) + S
 fn run_app_global<G: Send + Sync + 'static>(
     raw_routes: Vec<GlobalRawRoute<G>>,
     raw_named: Vec<GlobalRawNamed<G>>,
-    init_global: Arc<dyn Fn(&AppContext) -> Result<G> + Send + Sync>,
-    destroy_global: Option<Arc<dyn Fn(G) + Send + Sync>>,
+    init_global: InitGlobal<G>,
+    destroy_global: Destroy<G>,
     renderer: Arc<dyn RendererFactory>,
 ) -> Result<()> {
     // Before anything else, and before `init_global` below, which is allowed
@@ -1082,8 +1103,8 @@ fn run_app_global<G: Send + Sync + 'static>(
 fn run_app_thread_state<T: Any + Send + 'static>(
     raw_routes: Vec<ThreadRawRoute<T>>,
     raw_named: Vec<ThreadRawNamed<T>>,
-    init_thread: Arc<dyn Fn(&Map<String, Value>, &()) -> Result<T> + Send + Sync>,
-    destroy_thread: Option<Arc<dyn Fn(T) + Send + Sync>>,
+    init_thread: InitThread<(), T>,
+    destroy_thread: Destroy<T>,
     renderer: Arc<dyn RendererFactory>,
 ) -> Result<()> {
     // Before anything else, and before `init_global` below, which is allowed
@@ -1169,10 +1190,10 @@ fn run_app_state<G: Send + Sync + 'static, T: Any + Send + 'static>(
     raw_routes: Vec<StateRawRoute<G, T>>,
     raw_named: Vec<StateRawNamed<G, T>>,
     renderer: Arc<dyn RendererFactory>,
-    init_global: Arc<dyn Fn(&AppContext) -> Result<G> + Send + Sync>,
-    init_thread: Arc<dyn Fn(&Map<String, Value>, &G) -> Result<T> + Send + Sync>,
-    destroy_thread: Option<Arc<dyn Fn(T) + Send + Sync>>,
-    destroy_global: Option<Arc<dyn Fn(G) + Send + Sync>>,
+    init_global: InitGlobal<G>,
+    init_thread: InitThread<G, T>,
+    destroy_thread: Destroy<T>,
+    destroy_global: Destroy<G>,
 ) -> Result<()> {
     // Before anything else, and before `init_global` below, which is allowed
     // to spawn threads and in m6-auth-server's case does: the mask is
@@ -1628,8 +1649,8 @@ type GlobalRawNamed<G> = (
 pub struct AppWithGlobal<G: Send + Sync + 'static> {
     raw_routes: Vec<GlobalRawRoute<G>>,
     raw_named: Vec<GlobalRawNamed<G>>,
-    init_global: Arc<dyn Fn(&AppContext) -> Result<G> + Send + Sync>,
-    destroy_global: Option<Arc<dyn Fn(G) + Send + Sync>>,
+    init_global: InitGlobal<G>,
+    destroy_global: Destroy<G>,
     renderer: Arc<dyn RendererFactory>,
 }
 
@@ -1793,8 +1814,8 @@ type ThreadRawNamed<T> = (
 pub struct AppWithThreadState<T: Any + Send + 'static> {
     raw_routes: Vec<ThreadRawRoute<T>>,
     raw_named: Vec<ThreadRawNamed<T>>,
-    init_thread: Arc<dyn Fn(&Map<String, Value>, &()) -> Result<T> + Send + Sync>,
-    destroy_thread: Option<Arc<dyn Fn(T) + Send + Sync>>,
+    init_thread: InitThread<(), T>,
+    destroy_thread: Destroy<T>,
     renderer: Arc<dyn RendererFactory>,
 }
 
@@ -1916,10 +1937,10 @@ type StateRawNamed<G, T> = (
 pub struct AppWithState<G: Send + Sync + 'static, T: Any + Send + 'static> {
     raw_routes: Vec<StateRawRoute<G, T>>,
     raw_named: Vec<StateRawNamed<G, T>>,
-    init_global: Arc<dyn Fn(&AppContext) -> Result<G> + Send + Sync>,
-    init_thread: Arc<dyn Fn(&Map<String, Value>, &G) -> Result<T> + Send + Sync>,
-    destroy_thread: Option<Arc<dyn Fn(T) + Send + Sync>>,
-    destroy_global: Option<Arc<dyn Fn(G) + Send + Sync>>,
+    init_global: InitGlobal<G>,
+    init_thread: InitThread<G, T>,
+    destroy_thread: Destroy<T>,
+    destroy_global: Destroy<G>,
     renderer: Arc<dyn RendererFactory>,
 }
 
@@ -2495,7 +2516,7 @@ fn run_app_with_shutdown(
         if inotify_fired {
             should_reload = watcher
                 .as_mut()
-                .map_or(false, |w| w.read_events(&[&config_filename, "site.toml"]));
+                .is_some_and(|w| w.read_events(&[&config_filename, "site.toml"]));
         }
 
         // ── Hot reload ───────────────────────────────────────────────────
@@ -2561,7 +2582,7 @@ fn run_app_with_shutdown(
                 let named_handlers = named_handlers.clone();
 
                 match pool.try_submit(stream, move |mut s| {
-                    handle_connection(&mut s, &*fs, &code_handlers, &named_handlers);
+                    handle_connection(&mut s, &fs, &code_handlers, &named_handlers);
                 }) {
                     Ok(_) => {}
                     Err(mut s) => {
@@ -2667,7 +2688,7 @@ fn handle_request<W: std::io::Write>(
             let fs_r = fs.read().unwrap();
 
             // Build request dict.
-            let dict = match fs_r.build_dict(&raw, &route, &path_params) {
+            let dict = match fs_r.build_dict(&raw, route, &path_params) {
                 Ok(d) => d,
                 Err(e) => {
                     let r = error_to_response(&e);
@@ -3150,7 +3171,7 @@ mod tests {
         std::fs::create_dir(site_dir.path().join("templates")).unwrap();
 
         let mut f = NamedTempFile::new().unwrap();
-        write!(f, "site_name = \"v1\"\n").unwrap();
+        writeln!(f, "site_name = \"v1\"").unwrap();
 
         let cfg1 = crate::config::load(f.path(), site_dir.path()).unwrap();
         assert_eq!(cfg1.user_config["site_name"].as_str().unwrap(), "v1");
@@ -3174,7 +3195,7 @@ mod tests {
 
         // Write a new config.
         let mut f2 = NamedTempFile::new().unwrap();
-        write!(f2, "site_name = \"v2\"\n").unwrap();
+        writeln!(f2, "site_name = \"v2\"").unwrap();
 
         let cfg2 = crate::config::load(f2.path(), site_dir.path()).unwrap();
         let state2 = FrameworkState::build(
@@ -3204,7 +3225,7 @@ mod tests {
         use tempfile::NamedTempFile;
 
         let mut f = NamedTempFile::new().unwrap();
-        write!(f, "v1\n").unwrap();
+        writeln!(f, "v1").unwrap();
         let mtime1 = file_mtime(f.path());
         assert!(mtime1.is_some());
 
@@ -3429,7 +3450,7 @@ fn newest_mtime_under(dir: &std::path::Path) -> Option<std::time::SystemTime> {
                 walk(&e.path(), depth - 1, newest);
             } else if ft.is_file() {
                 if let Some(t) = e.metadata().ok().and_then(|m| m.modified().ok()) {
-                    if newest.map_or(true, |n| t > n) {
+                    if newest.is_none_or(|n| t > n) {
                         *newest = Some(t);
                     }
                 }

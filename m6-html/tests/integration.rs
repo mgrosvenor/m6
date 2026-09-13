@@ -241,7 +241,7 @@ fn l2_parameterised_route_extracts_stem() {
     assert!(
         resp.contains("Stem: hello-world"),
         "expected stem in body, got: {}",
-        &resp
+        resp
     );
 }
 
@@ -472,7 +472,7 @@ fn l7_brotli_compression() {
     assert!(
         headers.to_lowercase().contains("content-encoding: br"),
         "expected brotli encoding, got headers:\n{}",
-        &headers
+        headers
     );
 
     // Decompress the body and check it's valid HTML.
@@ -504,7 +504,7 @@ fn l7_gzip_compression() {
     assert!(
         headers.to_lowercase().contains("content-encoding: gzip"),
         "expected gzip encoding, got headers:\n{}",
-        &headers
+        headers
     );
 
     // Decompress and verify.
@@ -550,7 +550,7 @@ fn l8_concurrent_requests_all_routes() {
 
     let mut handles = Vec::new();
 
-    let routes = vec![
+    let routes = [
         ("GET /blog HTTP/1.1\r\nHost: localhost\r\n\r\n", "200 OK"),
         (
             "GET /blog/hello-world HTTP/1.1\r\nHost: localhost\r\n\r\n",
@@ -568,7 +568,7 @@ fn l8_concurrent_requests_all_routes() {
 
     for i in 0..100 {
         let sp = socket_path.clone();
-        let (req, expected) = routes[i % routes.len()].clone();
+        let (req, expected) = routes[i % routes.len()];
         let handle = std::thread::spawn(move || {
             // Retry up to 3 times to handle transient 503s from a full queue.
             let mut last_resp = String::new();

@@ -533,7 +533,7 @@ impl H2Client {
                 Ok(_) => {
                     self.conn
                         .process_new_packets()
-                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                        .map_err(|e| io::Error::other(e.to_string()))?;
                     break; // got at least one TLS record
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -572,7 +572,7 @@ impl H2Client {
                 Ok(_) => {
                     self.conn
                         .process_new_packets()
-                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                        .map_err(|e| io::Error::other(e.to_string()))?;
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => return Err(e),
@@ -617,9 +617,9 @@ impl H2Client {
                 let payload = self.recv_buf[9..total].to_vec();
                 self.recv_buf.drain(..total);
                 match ftype {
-                    0x0 => {
+                    0x0
                         // DATA
-                        if fsid == sid {
+                        if fsid == sid => {
                             let data_len = payload.len() as u32;
                             body.extend_from_slice(&payload);
                             if data_len > 0 {
@@ -642,13 +642,11 @@ impl H2Client {
                                 return Ok(body);
                             } // END_STREAM
                         }
-                    }
-                    0x1 if fsid == sid => {
-                        if flags & 0x1 != 0 {
+                    0x1 if fsid == sid
+                        && flags & 0x1 != 0 => {
                             return Ok(body); // HEADERS with END_STREAM (no body)
                         }
                         // HEADERS without END_STREAM: response headers only, body follows
-                    }
                     0x3 if fsid == sid => anyhow::bail!("server RST_STREAM on sid {sid}"),
                     0x7 => anyhow::bail!("server sent GOAWAY"),
                     _ => {} // SETTINGS, SETTINGS-ACK, WINDOW_UPDATE, PRIORITY, etc.
@@ -966,34 +964,30 @@ impl H2cClient {
                 let payload = self.recv_buf[9..total].to_vec();
                 self.recv_buf.drain(..total);
                 match ftype {
-                    0x0 => {
-                        if fsid == sid {
-                            let data_len = payload.len() as u32;
-                            body.extend_from_slice(&payload);
-                            if data_len > 0 {
-                                self.send_buf.extend_from_slice(&make_h2_frame(
-                                    0x8,
-                                    0,
-                                    0,
-                                    &data_len.to_be_bytes(),
-                                ));
-                                self.send_buf.extend_from_slice(&make_h2_frame(
-                                    0x8,
-                                    0,
-                                    sid,
-                                    &data_len.to_be_bytes(),
-                                ));
-                                self.flush_write()?;
-                            }
-                            if flags & 0x1 != 0 {
-                                return Ok(body);
-                            }
+                    0x0 if fsid == sid => {
+                        let data_len = payload.len() as u32;
+                        body.extend_from_slice(&payload);
+                        if data_len > 0 {
+                            self.send_buf.extend_from_slice(&make_h2_frame(
+                                0x8,
+                                0,
+                                0,
+                                &data_len.to_be_bytes(),
+                            ));
+                            self.send_buf.extend_from_slice(&make_h2_frame(
+                                0x8,
+                                0,
+                                sid,
+                                &data_len.to_be_bytes(),
+                            ));
+                            self.flush_write()?;
                         }
-                    }
-                    0x1 if fsid == sid => {
                         if flags & 0x1 != 0 {
                             return Ok(body);
                         }
+                    }
+                    0x1 if fsid == sid && flags & 0x1 != 0 => {
+                        return Ok(body);
                     }
                     0x3 if fsid == sid => anyhow::bail!("server RST_STREAM on sid {sid}"),
                     0x7 => anyhow::bail!("server sent GOAWAY"),

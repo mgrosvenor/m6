@@ -1,8 +1,8 @@
-/// Early-hints extraction: scan an HTML response body for cacheable assets
-/// that the browser should preload.
-///
-/// Called **only** on the cache-miss path, never on a cache hit.
-/// Results are stored in `CachedResponse.hints` and reused on subsequent hits.
+//! Early-hints extraction: scan an HTML response body for cacheable assets
+//! that the browser should preload.
+//!
+//! Called **only** on the cache-miss path, never on a cache hit.
+//! Results are stored in `CachedResponse.hints` and reused on subsequent hits.
 
 /// Return the `as=` attribute value for a URL based on its extension.
 fn preload_as(url: &str) -> &'static str {

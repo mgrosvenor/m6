@@ -101,7 +101,8 @@ fn bench_handle_request(c: &mut Criterion) {
             let mut buf = Vec::with_capacity(256);
             let resp = serve(black_box(&req)).unwrap();
             let mut r = m6_core::h1::Responder::new(&mut buf, req.method(), false);
-            black_box(resp.send(&mut r).unwrap());
+            resp.send(&mut r).unwrap();
+            black_box(());
         })
     });
     group.finish();
@@ -191,7 +192,8 @@ fn main() {
             let mut buf = Vec::with_capacity(256);
             let resp = serve(&req).unwrap();
             let mut r = m6_core::h1::Responder::new(&mut buf, req.method(), false);
-            black_box(resp.send(&mut r).unwrap());
+            resp.send(&mut r).unwrap();
+            black_box(());
         });
     }
 

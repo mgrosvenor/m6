@@ -51,7 +51,7 @@ and when it is time to ship:
 |---|---|---|
 | unit + integration tests | the whole workspace, zero failures | `cargo test --workspace` |
 | compiler warnings | **zero**, release and test builds, pre-existing included | Linux |
-| clippy | at or under the recorded count; the count may fall and may never rise | `tools/clippy.sh` |
+| clippy | **silent. `-D warnings`, no ceiling**, from 2026-09-13 | `tools/clippy.sh` |
 | h1, h2, h3 conformance | at or above the recorded scores | `tools/conformance.sh` |
 | performance | within margin of the recorded number | `tools/perfcheck.sh` |
 
@@ -87,6 +87,9 @@ not skip, and it does not print a number it did not take. See
 - **No agile or consultant vocabulary.** Plain technical English. Say "a
   recorded minimum", not the other word.
 - **Zero compiler warnings**, pre-existing included, checked on Linux.
+- **Zero clippy findings too**, from 2026-09-13. No ceiling to raise. A new lint
+  from a toolchain upgrade gets fixed, or gets a targeted `#[allow]` naming the
+  lint with the reason argued in the commit. Never a global allowance.
 - **Test locally, commit, then deploy.** Never deploy from an uncommitted tree.
 - **Secrets never enter git.** Only `.example` files, paths, documented shape.
 - Any change to **layout, copy, or rendering** needs individual approval before

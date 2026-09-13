@@ -197,7 +197,7 @@ impl Server {
         assert!(
             head.starts_with("HTTP/1.1 200"),
             "server unhealthy after {after}: {:?}",
-            &head.chars().take(120).collect::<String>()
+            head.chars().take(120).collect::<String>()
         );
         assert!(
             resp.windows(14).any(|w| w == b"PUBLIC CONTENT"),
@@ -363,7 +363,7 @@ fn assert_concluded(resp: &[u8], case: &str) {
     assert!(
         head.starts_with("HTTP/"),
         "{case}: reply was neither empty nor an HTTP response: {:?}",
-        &head.chars().take(120).collect::<String>()
+        head.chars().take(120).collect::<String>()
     );
 }
 
@@ -514,7 +514,7 @@ fn oversized_headers_are_bounded() {
 
     // One enormous header value.
     let mut req = b"GET /public/open.txt HTTP/1.1\r\nHost: localhost\r\nX-Big: ".to_vec();
-    req.extend(std::iter::repeat(b'A').take(128 * 1024));
+    req.extend(std::iter::repeat_n(b'A', 128 * 1024));
     req.extend_from_slice(b"\r\nConnection: close\r\n\r\n");
     let resp = s.raw(&req);
     assert_concluded(&resp, "oversized single header");
@@ -532,7 +532,7 @@ fn oversized_headers_are_bounded() {
 
     // Enormous request target.
     let mut req = b"GET /public/".to_vec();
-    req.extend(std::iter::repeat(b'a').take(64 * 1024));
+    req.extend(std::iter::repeat_n(b'a', 64 * 1024));
     req.extend_from_slice(b" HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
     let resp = s.raw(&req);
     assert_concluded(&resp, "oversized request target");
@@ -767,7 +767,7 @@ fn diagnostic_show_actual_responses() {
         ("bare LF in value (fixed)",
          b"GET /public/open.txt HTTP/1.1\r\nHost: localhost\r\nX-T: a\nX-Injected: yes\r\nConnection: close\r\n\r\n".to_vec()),
     ];
-    println!("\n  {:<26} {:>6}  {}", "case", "bytes", "first line");
+    println!("\n  {:<26} {:>6}  first line", "case", "bytes");
     for (name, req) in cases {
         let resp = s.raw(&req);
         let first = head_of(&resp)

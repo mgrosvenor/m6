@@ -398,12 +398,11 @@ fn http2_get_returns_200_with_body() {
     while let Some((ftype, _flags, _sid, payload, next)) = next_h2_frame(&raw, pos) {
         pos = next;
         match ftype {
-            0x1 => {
+            0x1
                 // HEADERS: check for 0x88 = :status 200
-                if payload.contains(&0x88u8) {
+                if payload.contains(&0x88u8) => {
                     got_200 = true;
                 }
-            }
             0x0 => {
                 // DATA
                 body_bytes.extend_from_slice(&payload);

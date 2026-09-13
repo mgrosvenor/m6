@@ -261,7 +261,7 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
         nodes.push(d);
     }
 
-    findings.sort_by(|a, b| b.level.cmp(&a.level));
+    findings.sort_by_key(|f| std::cmp::Reverse(f.level));
     let level = findings.iter().map(|f| f.level).max().unwrap_or(Level::Ok);
     Digest {
         generated_at: now,

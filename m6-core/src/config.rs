@@ -583,7 +583,7 @@ queue_size = 32
     #[test]
     fn server_defaults_are_thirty_seconds_and_0660() {
         let mut f = NamedTempFile::new().unwrap();
-        write!(f, "site_name = \"Test\"\n").unwrap();
+        writeln!(f, "site_name = \"Test\"").unwrap();
         let cfg = load(f.path(), Path::new("/tmp")).unwrap();
         assert_eq!(
             cfg.server.read_timeout,
@@ -649,7 +649,7 @@ queue_size = 32
     #[test]
     fn test_secrets_override() {
         let mut secrets = NamedTempFile::new().unwrap();
-        write!(secrets, "password = \"secret\"\n").unwrap();
+        writeln!(secrets, "password = \"secret\"").unwrap();
 
         let mut cfg_file = NamedTempFile::new().unwrap();
         write!(
@@ -669,7 +669,7 @@ queue_size = 32
     #[test]
     fn test_secrets_absent_ignored() {
         let mut cfg_file = NamedTempFile::new().unwrap();
-        write!(cfg_file, "secrets_file = \"/nonexistent/path/file.toml\"\n").unwrap();
+        writeln!(cfg_file, "secrets_file = \"/nonexistent/path/file.toml\"").unwrap();
         // Should not error
         load(cfg_file.path(), Path::new("/tmp")).unwrap();
     }
@@ -680,7 +680,7 @@ queue_size = 32
         write!(secrets, "not valid toml {{{{").unwrap();
 
         let mut cfg_file = NamedTempFile::new().unwrap();
-        write!(cfg_file, "secrets_file = {:?}\n", secrets.path()).unwrap();
+        writeln!(cfg_file, "secrets_file = {:?}", secrets.path()).unwrap();
 
         assert!(load(cfg_file.path(), Path::new("/tmp")).is_err());
     }
