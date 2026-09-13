@@ -9,6 +9,16 @@ members = [
     "m6-monitor",
     "m6-auth-server",
     "m6-md",
+    # The two Rust backend examples, docs/m6-backend-examples.md. Workspace
+    # members rather than standalone crates so the normal build compiles them,
+    # the zero-warnings rule covers them, and clippy is held to silence on them
+    # like everything else. An example that does not build is worse than no
+    # example, because it is the thing people copy.
+    #
+    # They are a pair on purpose: same language, same compiler, same payload, so
+    # the difference between them is exactly what linking m6-core costs.
+    "m6-http/tests/backends/rust-plain",
+    "m6-http/tests/backends/rust-m6core",
 ]
 resolver = "2"
 
