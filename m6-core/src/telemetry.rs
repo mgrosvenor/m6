@@ -475,9 +475,18 @@ impl TrafficSummary {
             first: String,
             last: String,
         }
+        /// Per-user-agent accumulator. A struct rather than the
+        /// `(u64, HashMap, HashMap)` it used to be: the two maps have the same
+        /// type and were read positionally as `e.1` and `e.2`, so nothing at the
+        /// use site said which one held addresses and which held paths.
+        #[derive(Default)]
+        struct UaAcc {
+            n: u64,
+            ips: HashMap<String, u64>,
+            paths: HashMap<String, u64>,
+        }
         let mut per_ip: HashMap<String, Acc> = HashMap::new();
-        let mut per_ua: HashMap<String, (u64, HashMap<String, u64>, HashMap<String, u64>)> =
-            HashMap::new();
+        let mut per_ua: HashMap<String, UaAcc> = HashMap::new();
         let mut summary = TrafficSummary::default();
 
         for rec in records {
@@ -507,12 +516,10 @@ impl TrafficSummary {
                 acc.last = rec.timestamp.clone();
             }
 
-            let e = per_ua
-                .entry(rec.user_agent().to_string())
-                .or_insert_with(|| (0, HashMap::new(), HashMap::new()));
-            e.0 += 1;
-            *e.1.entry(f.client_ip.clone()).or_default() += 1;
-            *e.2.entry(f.path.clone()).or_default() += 1;
+            let e = per_ua.entry(rec.user_agent().to_string()).or_default();
+            e.n += 1;
+            *e.ips.entry(f.client_ip.clone()).or_default() += 1;
+            *e.paths.entry(f.path.clone()).or_default() += 1;
         }
 
         // Who has disqualified their own claim.
@@ -544,7 +551,7 @@ impl TrafficSummary {
             .map(|(ip, _)| ip.clone())
             .collect();
 
-        for (ua, (n, ips, paths)) in per_ua {
+        for (ua, UaAcc { n, ips, paths }) in per_ua {
             if !claims_to_be_bot(&ua) {
                 continue;
             }
@@ -570,7 +577,9 @@ impl TrafficSummary {
                 paths: p,
             });
         }
-        summary.crawlers.sort_by(|a, b| b.requests.cmp(&a.requests));
+        summary
+            .crawlers
+            .sort_by_key(|c| std::cmp::Reverse(c.requests));
 
         let mut clients: Vec<(String, ClientSummary)> = per_ip
             .into_iter()
@@ -606,7 +615,7 @@ impl TrafficSummary {
                 )
             })
             .collect();
-        clients.sort_by(|a, b| b.1.requests.cmp(&a.1.requests));
+        clients.sort_by_key(|c| std::cmp::Reverse(c.1.requests));
         summary.clients = clients;
 
         let mut f: Vec<String> = forgers.into_iter().collect();

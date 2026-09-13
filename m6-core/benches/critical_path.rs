@@ -242,7 +242,7 @@ fn make_routes() -> Vec<CompiledRoute> {
             }
         })
         .collect();
-    routes.sort_by(|a, b| b.specificity.cmp(&a.specificity));
+    routes.sort_by_key(|r| std::cmp::Reverse(r.specificity));
     routes
 }
 
@@ -461,7 +461,8 @@ queue_size = 64
 
 [params_cache]
 size = 64
-"#.to_string();
+"#
+    .to_string();
     let cfg_path = dir.path().join("m6.toml");
     std::fs::write(&cfg_path, &cfg_text).unwrap();
 

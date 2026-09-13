@@ -129,10 +129,7 @@ fn stub_origin(listener: TcpListener, report: mpsc::Sender<Observed>) {
     let mut conn_credit: i64 = 65_535;
     let mut req_stream = 0u32;
 
-    loop {
-        let Some(hdr) = read_exact_or_eof(&mut sock, FRAME_HDR) else {
-            break;
-        };
+    while let Some(hdr) = read_exact_or_eof(&mut sock, FRAME_HDR) {
         let len = ((hdr[0] as usize) << 16) | ((hdr[1] as usize) << 8) | hdr[2] as usize;
         let ftype = hdr[3];
         let flags = hdr[4];

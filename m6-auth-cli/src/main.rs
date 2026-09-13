@@ -189,12 +189,11 @@ fn collect_flag_values<'a>(args: &'a [String], flag: &str) -> Vec<&'a str> {
     let mut vals = Vec::new();
     let mut i = 0;
     while i < args.len() {
-        if args[i] == flag
-            && i + 1 < args.len() {
-                vals.push(args[i + 1].as_str());
-                i += 2;
-                continue;
-            }
+        if args[i] == flag && i + 1 < args.len() {
+            vals.push(args[i + 1].as_str());
+            i += 2;
+            continue;
+        }
         i += 1;
     }
     vals
@@ -204,10 +203,9 @@ fn collect_flag_values<'a>(args: &'a [String], flag: &str) -> Vec<&'a str> {
 fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     let mut i = 0;
     while i < args.len() {
-        if args[i] == flag
-            && i + 1 < args.len() {
-                return Some(args[i + 1].as_str());
-            }
+        if args[i] == flag && i + 1 < args.len() {
+            return Some(args[i + 1].as_str());
+        }
         i += 1;
     }
     None
@@ -556,10 +554,7 @@ fn cmd_token_ls(db: &Db, args: &[String]) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string(&tokens)?);
     } else {
-        println!(
-            "{:<36} {:<20} {:<22} EXPIRES",
-            "ID", "NAME", "CREATED"
-        );
+        println!("{:<36} {:<20} {:<22} EXPIRES", "ID", "NAME", "CREATED");
         for t in &tokens {
             let created = format_timestamp(t.created_at);
             let expires = format_timestamp(t.expires_at);

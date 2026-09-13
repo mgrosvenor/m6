@@ -46,6 +46,27 @@ type ThreadInitFn = Arc<dyn Fn() -> Box<dyn Any + Send> + Send + Sync>;
 /// Destructor: called once per thread at shutdown, receives the type-erased state.
 type ThreadDestroyFn = Arc<dyn Fn(Box<dyn Any + Send>) + Send + Sync>;
 
+// ── The stateful builders' callback shapes ────────────────────────────────────
+//
+// These four spell out the closures a service hands `App` when it carries state.
+// They are aliases rather than the types written out because the written-out
+// forms are what `App`'s builders, their private run functions and their
+// internal structs all repeat, once per arity, and a reader comparing two
+// signatures had to diff forty characters of `Arc<dyn Fn(..) + Send + Sync>` to
+// find the one difference that mattered. Naming them says which is which.
+
+/// Builds the global state once, at startup, before any worker thread exists.
+/// Fails the service if it returns `Err`: there is no degraded mode.
+type InitGlobal<G> = Arc<dyn Fn(&AppContext) -> Result<G> + Send + Sync>;
+
+/// Builds one thread's state from the config dict and the global state. Called
+/// once per worker thread. `G` is `()` for a service with thread state only.
+type InitThread<G, T> = Arc<dyn Fn(&Map<String, Value>, &G) -> Result<T> + Send + Sync>;
+
+/// Tears state down at shutdown. `None` is the common case: most services hold
+/// nothing that needs an explicit drop, and the option is what says so.
+type Destroy<S> = Option<Arc<dyn Fn(S) + Send + Sync>>;
+
 /// Global thread-init function — set at startup before any threads are created.
 static THREAD_INIT_FN: OnceLock<ThreadInitFn> = OnceLock::new();
 
@@ -989,8 +1010,8 @@ fn drain_thread_state_typed<T: Any + Send + 'static>(destroy: &Arc<dyn Fn(T) + S
 fn run_app_global<G: Send + Sync + 'static>(
     raw_routes: Vec<GlobalRawRoute<G>>,
     raw_named: Vec<GlobalRawNamed<G>>,
-    init_global: Arc<dyn Fn(&AppContext) -> Result<G> + Send + Sync>,
-    destroy_global: Option<Arc<dyn Fn(G) + Send + Sync>>,
+    init_global: InitGlobal<G>,
+    destroy_global: Destroy<G>,
     renderer: Arc<dyn RendererFactory>,
 ) -> Result<()> {
     // Before anything else, and before `init_global` below, which is allowed
@@ -1082,8 +1103,8 @@ fn run_app_global<G: Send + Sync + 'static>(
 fn run_app_thread_state<T: Any + Send + 'static>(
     raw_routes: Vec<ThreadRawRoute<T>>,
     raw_named: Vec<ThreadRawNamed<T>>,
-    init_thread: Arc<dyn Fn(&Map<String, Value>, &()) -> Result<T> + Send + Sync>,
-    destroy_thread: Option<Arc<dyn Fn(T) + Send + Sync>>,
+    init_thread: InitThread<(), T>,
+    destroy_thread: Destroy<T>,
     renderer: Arc<dyn RendererFactory>,
 ) -> Result<()> {
     // Before anything else, and before `init_global` below, which is allowed
@@ -1169,10 +1190,10 @@ fn run_app_state<G: Send + Sync + 'static, T: Any + Send + 'static>(
     raw_routes: Vec<StateRawRoute<G, T>>,
     raw_named: Vec<StateRawNamed<G, T>>,
     renderer: Arc<dyn RendererFactory>,
-    init_global: Arc<dyn Fn(&AppContext) -> Result<G> + Send + Sync>,
-    init_thread: Arc<dyn Fn(&Map<String, Value>, &G) -> Result<T> + Send + Sync>,
-    destroy_thread: Option<Arc<dyn Fn(T) + Send + Sync>>,
-    destroy_global: Option<Arc<dyn Fn(G) + Send + Sync>>,
+    init_global: InitGlobal<G>,
+    init_thread: InitThread<G, T>,
+    destroy_thread: Destroy<T>,
+    destroy_global: Destroy<G>,
 ) -> Result<()> {
     // Before anything else, and before `init_global` below, which is allowed
     // to spawn threads and in m6-auth-server's case does: the mask is
@@ -1628,8 +1649,8 @@ type GlobalRawNamed<G> = (
 pub struct AppWithGlobal<G: Send + Sync + 'static> {
     raw_routes: Vec<GlobalRawRoute<G>>,
     raw_named: Vec<GlobalRawNamed<G>>,
-    init_global: Arc<dyn Fn(&AppContext) -> Result<G> + Send + Sync>,
-    destroy_global: Option<Arc<dyn Fn(G) + Send + Sync>>,
+    init_global: InitGlobal<G>,
+    destroy_global: Destroy<G>,
     renderer: Arc<dyn RendererFactory>,
 }
 
@@ -1793,8 +1814,8 @@ type ThreadRawNamed<T> = (
 pub struct AppWithThreadState<T: Any + Send + 'static> {
     raw_routes: Vec<ThreadRawRoute<T>>,
     raw_named: Vec<ThreadRawNamed<T>>,
-    init_thread: Arc<dyn Fn(&Map<String, Value>, &()) -> Result<T> + Send + Sync>,
-    destroy_thread: Option<Arc<dyn Fn(T) + Send + Sync>>,
+    init_thread: InitThread<(), T>,
+    destroy_thread: Destroy<T>,
     renderer: Arc<dyn RendererFactory>,
 }
 
@@ -1916,10 +1937,10 @@ type StateRawNamed<G, T> = (
 pub struct AppWithState<G: Send + Sync + 'static, T: Any + Send + 'static> {
     raw_routes: Vec<StateRawRoute<G, T>>,
     raw_named: Vec<StateRawNamed<G, T>>,
-    init_global: Arc<dyn Fn(&AppContext) -> Result<G> + Send + Sync>,
-    init_thread: Arc<dyn Fn(&Map<String, Value>, &G) -> Result<T> + Send + Sync>,
-    destroy_thread: Option<Arc<dyn Fn(T) + Send + Sync>>,
-    destroy_global: Option<Arc<dyn Fn(G) + Send + Sync>>,
+    init_global: InitGlobal<G>,
+    init_thread: InitThread<G, T>,
+    destroy_thread: Destroy<T>,
+    destroy_global: Destroy<G>,
     renderer: Arc<dyn RendererFactory>,
 }
 

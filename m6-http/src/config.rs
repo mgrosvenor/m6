@@ -901,16 +901,14 @@ pub fn warn_health_token(health: &HealthConfig) {
 
 pub fn warn_system_config_extra_keys(system_config_path: &Path) {
     if let Ok(raw) = std::fs::read_to_string(system_config_path) {
-        if let Ok(val) = raw.parse::<toml::Value>() {
-            if let toml::Value::Table(tbl) = val {
-                for key in tbl.keys() {
-                    if key != "server" && key != "node" {
-                        warn!(
-                            key = %key,
-                            file = %system_config_path.display(),
-                            "system config: ignoring non-[server]/[node] key"
-                        );
-                    }
+        if let Ok(toml::Value::Table(tbl)) = raw.parse::<toml::Value>() {
+            for key in tbl.keys() {
+                if key != "server" && key != "node" {
+                    warn!(
+                        key = %key,
+                        file = %system_config_path.display(),
+                        "system config: ignoring non-[server]/[node] key"
+                    );
                 }
             }
         }
