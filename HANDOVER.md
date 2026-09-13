@@ -153,12 +153,14 @@ that is measured from the deployed commit, which is far behind `main`. An
 earlier version of this table printed 135 in the `main` row and was wrong.
 
 **CI runs on `develop` now**, from 2026-09-13, and before that push it had
-never run there. **It has not yet finished a run.** `cargo-deny` (53s) and MSRV
-(2m28s) pass; the build-tests-clippy job and the conformance job were both
-still going 45 minutes in. Whether that is a slow honest run or a hang is
-unestablished, and it is the first thing to look at: `gh run list --branch
-develop`. Conformance on a shared runner has to build the stack and drive three
-protocol testers, so slow is plausible, but nobody has watched one to the end.
+never run there. **Two runs have gone green end to end**, all five jobs: build,
+tests, clippy, fmt, h1/h2/h3 conformance, cargo-deny and MSRV.
+
+Expect **roughly 10 minutes warm and 40 cold.** The first run took 41m49s and
+the second 9m58s, same workflow, and the difference is the cargo cache. Forty
+minutes with no output looks exactly like a hang, so it is worth knowing it is
+not one: conformance has to build the whole stack and drive three protocol
+testers. Watch with `gh run list --branch develop`.
 
 ### What is deployed
 
@@ -414,8 +416,6 @@ Full list, 39 of them, in `docs/LESSONS.md`.
 
 - **`m6-auth-cli`'s `test_token_create_prints_jwt`** fails intermittently and
   has never been explained. Did not recur on 2026-09-12 or -13.
-- **How long CI takes, and whether it finishes.** See §3. No run on `develop`
-  has been observed to completion.
 - **Four `cargo deny` advisories** listed as exceptions in `deny.toml`, issue
   #3. **Their reachability has never been established**; that issue was written
   before checking, which is the same mistake made with a fifth. That fifth,
