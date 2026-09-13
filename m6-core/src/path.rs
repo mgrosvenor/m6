@@ -1,4 +1,19 @@
-/// Path validation and resolution utilities.
+//! Is this path parameter safe to use?
+//!
+//! **The single implementation.** There were three and they disagreed on real
+//! input: one rejected a leading slash and excluded `.`, one allowed `a..b`
+//! inside a component, and one returned `Ok` with no character validation at
+//! all for any parameter that happened to be named `relpath`.
+//!
+//! Path traversal safety is not something to hold three opinions about.
+//! Allowed: alphanumeric, `-`, `_`, `.`, and `/` when the caller says the
+//! value spans segments. Rejected: `..` anywhere as a substring, a leading or
+//! trailing slash, and every other byte including space, control characters
+//! and NUL.
+//!
+//! Whether slashes are allowed is decided by the **route**, not by the
+//! parameter's name: a `{*name}` wildcard capture spans segments and an
+//! ordinary `{name}` does not.
 
 #[derive(Debug, thiserror::Error)]
 pub enum PathParamError {

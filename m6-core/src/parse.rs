@@ -1,4 +1,16 @@
-/// HTTP/1.1 request parser from a byte stream.
+//! Reading a request off a blocking stream.
+//!
+//! A thin adapter over `crate::h1`, which holds the actual parser and is
+//! incremental. This module is the blocking half: it reads until `h1` says it
+//! has a complete request, or until something goes wrong.
+//!
+//! **A read timeout arrives here as an error, and which error matters.** A
+//! peer that connects and says nothing is an idle connection going away, and
+//! is closed silently; a peer that sends part of a request and stops gets 408.
+//! Answering 400 to the first case is a framing bug rather than a rudeness:
+//! m6-http pools backend connections, so a response written into an idle
+//! socket is read as the answer to the next request sent on it.
+
 use std::io::{Read, Write};
 
 use crate::http::RawRequest;

@@ -1,4 +1,14 @@
-/// Minimal HTTP/1.1 types shared across all m6 processes.
+//! The wire types: a request and a response as they arrive and leave.
+//!
+//! `RawRequest` is what the parser produces and what every service sees.
+//! Header names are kept **as sent**; lookups go through `crate::headers`,
+//! which compares case-insensitively. An earlier version lowercased names at
+//! parse time, which made correctness depend on an invariant established in
+//! one file and relied on in another.
+//!
+//! `RawResponse` is the low-level answer, for code writing its own status,
+//! headers and body with no framework around it. `Response` is what an `App`
+//! handler returns, and a `RawResponse` lifts into one.
 
 /// HTTP method constants.
 #[derive(Debug, Clone, PartialEq, Eq)]
