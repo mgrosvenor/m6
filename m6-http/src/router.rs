@@ -451,6 +451,7 @@ mod tests {
             sockets: Some("/run/m6/*.sock".to_string()),
             url: None,
             tls_skip_verify: false,
+            compresses: true,
         }
     }
 
@@ -596,6 +597,7 @@ params = ["data/home.json", "data/shared.json"]
                 sockets: Some("/run/m6/m6-html-*.sock".to_string()),
                 url: None,
                 tls_skip_verify: false,
+                compresses: true,
             }],
             routes: vec![],
             route_groups: vec![],
@@ -678,6 +680,7 @@ params = ["content/posts/{stem}.json"]
                 sockets: Some("/run/m6/m6-html-*.sock".to_string()),
                 url: None,
                 tls_skip_verify: false,
+                compresses: true,
             }],
             routes: vec![],
             route_groups: vec![],
@@ -740,6 +743,7 @@ params = ["content/posts/{stem}.json"]
                 sockets: None,
                 url: Some("https://api.example.com".to_string()),
                 tls_skip_verify: false,
+                compresses: true,
             }],
             routes: vec![],
             route_groups: vec![],

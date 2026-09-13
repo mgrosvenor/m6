@@ -600,7 +600,7 @@ fn event_loop(
                             // metadata RFC 9110 15.4.5 requires -- and a client
                             // updating its stored entry from it would lose the
                             // knowledge that the response varies by encoding.
-                            set_vary_accept_encoding(&mut headers);
+                            set_vary_accept_encoding(&mut headers, true);
                             set_age(&mut headers, age);
                             set_date(&mut headers);
                             debug!(
@@ -639,7 +639,7 @@ fn event_loop(
                             headers.push(("link".to_string(), hints::link_header(url)));
                         }
                         set_alt_svc(&mut headers, quic_port);
-                        set_vary_accept_encoding(&mut headers);
+                        set_vary_accept_encoding(&mut headers, true);
                         set_age(&mut headers, age);
                         set_describedby_link(&mut headers, &state.config.site.describedby);
                         debug!(
@@ -878,7 +878,7 @@ fn event_loop(
                             // metadata RFC 9110 15.4.5 requires -- and a client
                             // updating its stored entry from it would lose the
                             // knowledge that the response varies by encoding.
-                            set_vary_accept_encoding(&mut headers);
+                            set_vary_accept_encoding(&mut headers, true);
                             set_age(&mut headers, age);
                             set_date(&mut headers);
                             debug!(
@@ -915,7 +915,7 @@ fn event_loop(
                             headers.push(("link".to_string(), hints::link_header(url)));
                         }
                         set_alt_svc(&mut headers, quic_port);
-                        set_vary_accept_encoding(&mut headers);
+                        set_vary_accept_encoding(&mut headers, true);
                         set_age(&mut headers, age);
                         set_describedby_link(&mut headers, &state.config.site.describedby);
                         debug!(
@@ -1599,7 +1599,7 @@ fn handle_h3_request(
             let mut headers = not_modified_headers(&cached.headers);
             // Same as the h1/h2 304 paths: Vary and Date are added post-insert
             // so the stored headers do not have them.
-            set_vary_accept_encoding(&mut headers);
+            set_vary_accept_encoding(&mut headers, true);
             set_age(&mut headers, age);
             set_date(&mut headers);
             if let (Some(sc), true) = (set_cookie, html) {
@@ -1657,7 +1657,7 @@ fn handle_h3_request(
         for url in cached.hints.iter() {
             headers_with_links.push(("link".to_string(), hints::link_header(url)));
         }
-        set_vary_accept_encoding(&mut headers_with_links);
+        set_vary_accept_encoding(&mut headers_with_links, true);
         set_age(&mut headers_with_links, age);
         set_describedby_link(&mut headers_with_links, &state.config.site.describedby);
         set_alt_svc(&mut headers_with_links, quic_port);
@@ -2010,8 +2010,9 @@ fn handle_request(
 ) -> RequestOutcome {
     let describedby = state.config.site.describedby.clone();
     let mut outcome = handle_request_inner(req, client_ip, content_encoding, state, is_prefetch);
-    if let RequestOutcome::Ready(status, ref mut headers, _, _, _) = outcome {
-        set_vary_accept_encoding(headers);
+    if let RequestOutcome::Ready(status, ref mut headers, _, ref backend, _) = outcome {
+        let compresses = state.config.backend_compresses(backend);
+        set_vary_accept_encoding(headers, compresses);
         set_date(headers);
         set_describedby_link(headers, &describedby);
         invalidate_after_unsafe_method(state, req, status, headers);
@@ -2955,7 +2956,18 @@ fn set_alt_svc(headers: &mut Vec<(String, String)>, quic_port: u16) {
 /// one client's private variant would be stored and replayed to everyone.
 /// Preserving the other field names keeps that response uncacheable, which is
 /// the whole reason `should_cache` inspects `Vary` at all.
-fn set_vary_accept_encoding(headers: &mut Vec<(String, String)>) {
+fn set_vary_accept_encoding(headers: &mut Vec<(String, String)>, backend_compresses: bool) {
+    // A backend that does not compress has exactly ONE representation, so there
+    // is no encoding dimension to vary on and saying otherwise is a promise of
+    // variants that will never exist. m6-http is a cache, not a transformer: it
+    // does not compress, so it cannot manufacture the alternatives this header
+    // would be advertising. See BackendConfig::compresses.
+    //
+    // Skipped rather than stripped: if the backend named `Vary: Accept-Encoding`
+    // itself, that is its statement about its own output and not ours to remove.
+    if !backend_compresses && !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("vary")) {
+        return;
+    }
     let mut fields: Vec<String> = Vec::new();
     for (k, v) in headers.iter() {
         if !k.eq_ignore_ascii_case("vary") {
@@ -3174,7 +3186,8 @@ fn finalize_url_response(
 ) -> FinalizedResponse {
     let describedby = state.config.site.describedby.clone();
     let mut r = finalize_url_response_inner(http_result, ctx, quic_port, state);
-    set_vary_accept_encoding(&mut r.1);
+    let compresses = state.config.backend_compresses(&r.3);
+    set_vary_accept_encoding(&mut r.1, compresses);
     set_date(&mut r.1);
     set_describedby_link(&mut r.1, &describedby);
     invalidate_after_unsafe_method(state, &ctx.req, r.0, &r.1);
@@ -4253,7 +4266,7 @@ mod vary_tests {
         // the first client to ask for any URL -- every fresh visitor -- got a
         // negotiated body with nothing saying it was negotiated.
         let mut h = hdrs(&[("content-type", "text/css")]);
-        set_vary_accept_encoding(&mut h);
+        set_vary_accept_encoding(&mut h, true);
         assert_eq!(vary_of(&h), vec!["Accept-Encoding"]);
     }
 
@@ -4262,14 +4275,14 @@ mod vary_tests {
         // A cache node's upstream is the origin, which already added this on
         // its own cache hit.
         let mut h = hdrs(&[("vary", "Accept-Encoding")]);
-        set_vary_accept_encoding(&mut h);
+        set_vary_accept_encoding(&mut h, true);
         assert_eq!(vary_of(&h), vec!["Accept-Encoding"]);
     }
 
     #[test]
     fn matches_case_insensitively_rather_than_appending_a_variant() {
         let mut h = hdrs(&[("Vary", "accept-encoding")]);
-        set_vary_accept_encoding(&mut h);
+        set_vary_accept_encoding(&mut h, true);
         assert_eq!(vary_of(&h).len(), 1);
         assert_eq!(vary_of(&h)[0].to_lowercase(), "accept-encoding");
     }
@@ -4282,7 +4295,7 @@ mod vary_tests {
     #[test]
     fn preserves_other_field_names_so_the_response_stays_uncacheable() {
         let mut h = hdrs(&[("vary", "Cookie")]);
-        set_vary_accept_encoding(&mut h);
+        set_vary_accept_encoding(&mut h, true);
         assert_eq!(vary_of(&h).len(), 1);
         let v = vary_of(&h)[0].to_lowercase();
         assert!(v.contains("cookie"), "Cookie was dropped: {v}");
@@ -4299,7 +4312,7 @@ mod vary_tests {
     #[test]
     fn collapses_several_vary_headers_into_one() {
         let mut h = hdrs(&[("vary", "Cookie"), ("vary", "Accept-Language")]);
-        set_vary_accept_encoding(&mut h);
+        set_vary_accept_encoding(&mut h, true);
         assert_eq!(vary_of(&h).len(), 1, "must emit exactly one Vary header");
         let v = vary_of(&h)[0].to_lowercase();
         for want in ["cookie", "accept-language", "accept-encoding"] {
@@ -4313,7 +4326,7 @@ mod vary_tests {
     #[test]
     fn leaves_vary_star_alone() {
         let mut h = hdrs(&[("vary", "*")]);
-        set_vary_accept_encoding(&mut h);
+        set_vary_accept_encoding(&mut h, true);
         assert_eq!(vary_of(&h), vec!["*"]);
         assert!(!should_cache(200, &h));
     }
@@ -4323,7 +4336,7 @@ mod vary_tests {
     #[test]
     fn an_encoding_only_vary_is_still_cacheable() {
         let mut h = hdrs(&[("cache-control", "public"), ("content-type", "text/css")]);
-        set_vary_accept_encoding(&mut h);
+        set_vary_accept_encoding(&mut h, true);
         assert!(should_cache(200, &h));
     }
 }
