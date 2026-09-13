@@ -1,6 +1,11 @@
-/// Multipart file upload support (feature = "multipart").
-///
-/// Uses the `multer` crate to parse `multipart/form-data` bodies.
+//! `multipart/form-data` parsing, behind the `multipart` feature.
+//!
+//! Only reached for a content type that says multipart. Note that core's
+//! ordinary form handling decodes `application/x-www-form-urlencoded` only,
+//! and warns loudly when a POST carries a body it did not decode: a client
+//! that switched to multipart once produced empty fields everywhere, which
+//! looked downstream like a failed CAPTCHA and left nothing in any log to say
+//! the body had been skipped.
 
 /// A single uploaded file.
 #[derive(Debug, Clone)]

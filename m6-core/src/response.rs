@@ -1,4 +1,20 @@
-/// HTTP response type and constructors.
+//! What a handler returns.
+//!
+//! A `Response` is a status, headers and a `Body`, where the body is either
+//! bytes or a stream of known length. The distinction is load-bearing: a body
+//! core has not read cannot be minified, compressed or hashed into an ETag,
+//! and making that a flag beside the bytes would leave those three free to run
+//! against bytes that are not there.
+//!
+//! `verbatim` marks a response whose representation the handler has already
+//! decided -- it negotiated the coding, compressed, and built a validator
+//! naming the result -- so the pipeline leaves it alone. Compressing such a
+//! body again would put brotli bytes on the wire under an ETag asserting
+//! identity.
+//!
+//! `send` takes `self` by value, because a stream owns its reader and a
+//! response goes on the wire once.
+
 use serde_json::{Map, Value};
 
 use crate::error::{Error, Result};

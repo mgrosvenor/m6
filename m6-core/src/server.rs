@@ -1,3 +1,19 @@
+//! The parts of a service that are not its handlers.
+//!
+//! Binding and owning a unix socket, applying its mode, applying a read
+//! timeout to an accepted connection, waiting on the listener and the config
+//! watcher together, and serving one connection until it ends.
+//!
+//! **`serve_connection` is the shared answer to four questions** each service
+//! used to answer for itself and differently: the keep-alive decision, what to
+//! say to a request that did not parse, whether a body goes out on a HEAD, and
+//! whether the connection is reused at all. Before it, every 404, 405, 400 and
+//! 412 answering a HEAD went out with a body on at least one service, and no
+//! connection was ever reused.
+//!
+//! It hands the request to its handler rather than lending it, because it has
+//! no use for it afterwards and lending it cost every service a full copy.
+
 use std::io::Write;
 /// Unix socket server for m6 inter-process communication.
 use std::os::unix::net::{UnixListener, UnixStream};

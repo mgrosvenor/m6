@@ -1,7 +1,21 @@
-/// Config loading: TOML → serde_json::Map.
-///
-/// Load the renderer TOML config, optionally merge a secrets file,
-/// and return the merged map plus the parsed route/framework settings.
+//! Configuration: TOML in, `RendererConfig` out.
+//!
+//! **One parser for every service.** Each of them used to carry its own, and
+//! they drifted: m6-file and m6-auth-server had their own `[log]` handling,
+//! m6-file had a second `[[route]]` shape, and each resolved paths against a
+//! slightly different root.
+//!
+//! Keys core does not define are kept rather than dropped. A `[[route]]` may
+//! carry anything a service's handler needs -- `root` and `tail` for
+//! m6-file -- and core passes them through untouched via
+//! `Request::route_setting`. Discarding them silently was indistinguishable
+//! from a typo being honoured.
+//!
+//! `--dump-config` on any service prints what this produced and how each route
+//! would be served, and exits non-zero if the binary cannot serve the config.
+//! That is what the deploy validates against the new binary before installing
+//! it.
+
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
