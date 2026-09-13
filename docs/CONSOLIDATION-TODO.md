@@ -29,7 +29,7 @@ recorded beside the version in `Cargo.toml`.
 | 1 | **Drive clippy to zero** | **done 2026-09-13, issue #5.** 0 on both toolchains. `tools/clippy.sh` is now `-D warnings` and the two ceiling files are deleted, so there is no number left to maintain. The per-platform ceiling turned out to be per-clippy-version: 45 findings on the laptop at 0.1.95 against 123 on the build host at 0.1.98, identical source, so `--fix` had to run on the build host. Along the way it found three misattached doc comments and one pre-NLL `drop()`. §4 of HANDOVER.md. |
 | 2 | **quiche 0.26.1 → 0.29.3, re-measure h3** | **done 2026-09-13, issue #4.** Bumped and re-measured on the build host: h3 stayed at 37/49, unmoved by three releases. 0.29.3 is the newest plain release; the higher tags in that repo are tokio-quiche. The twelve are quiche's and **none is reachable through its public API**, so none is fixable in m6. Ten are open upstream bugs with open fix PRs: **#2515** with PR **#2521** for the eight transport parameter cases, **#2526** and **#2652** with PR **#2575** for the two reserved-bit cases. **h3 is now 47/49 and the floor is 47.** m6-http pins `mgrosvenor/quiche` by revision, branch `m6-h3-conformance`, which is quiche master plus PRs #2521 and #2575. Measured both ways first, tag plus cherry-picks and master plus merges, and both scored 47/49; master was taken as the rebasable base. **Drop the fork for a tag once upstream releases those fixes.** The remaining two are QPACK, which is upstream's choice rather than a bug, and are accepted: owner's decision 2026-09-13, "47/49 is good enough, it's not going to block 1.0.0". Everything, including the rebuild recipe and the one merge conflict to expect, is in `tools/conformance-scores.txt`. |
 | 3 | **Renderers onto a git dependency pinned to a tag** | not started. This is Phase 7. Owner's call 2026-09-13: **a git tag, NOT crates.io.** Publishing would mean owning a public API, a name and maintenance for other people. m6-http already takes quiche this way. |
-| 4 | **Phase 8: six `/status` implementations** | not started. Needs `apt install golang` on the build host, nothing more. |
+| 4 | **Phase 8: six `/status` implementations** | **done 2026-09-13, issue #6.** Six examples under `m6-http/tests/backends/`, all conforming, 13 shared tests in the gate (7 on the socket, 6 behind a real edge), Go installed on the build host, and `deploy/run-tests.sh` fails if any runtime is missing. The measurement it existed for: **linking m6-core costs 36% of throughput and +37us p50**, plus 8.8x RSS and 56.7x binary size, reproduced within 3%. `docs/BENCHMARKS.md` has the conditions. It also found five places where normative documents and the code disagree, `docs/m6-backend-examples.md` §10; two of those are decisions for the owner, not tasks. |
 | 5 | **Deploy, lifting the freeze** | blocked on 1-4 and on the m6-file config/binary sequencing. Not a code task. |
 
 ### Done in the 2026-09-12 and -13 sessions
@@ -874,9 +874,23 @@ holding something that genuinely differs per request.
 
 ### 5. Phase 8, backend examples
 
-- [ ] Six implementations of the same `/status` payload. Needs Go on the build
-      host. **This phase is also the measurement:** Rust-without-core against
-      Rust-with-core says whether core is worth linking.
+- [x] Six implementations of the same `/status` payload. **DONE 2026-09-13**,
+      issue #6. Go installed on the build host (1.26.0) and on the laptop
+      (1.27.1). All six conform, 13 shared tests run them in the gate, and
+      `deploy/run-tests.sh` fails if a runtime is absent rather than skipping a
+      language silently.
+
+      **The measurement:** linking m6-core costs **-36.8% throughput and
+      +38.5us p50**, with 8.8x resident memory and 56.7x binary size, reproduced
+      within 3% across two runs at concurrency 2 from tmpfs. §5.3 of the examples
+      doc says that if the delta is not close to zero then core has a problem
+      worth knowing about. It is not close to zero, AND it is measured on the
+      shape that maximises it: behind the edge cache most requests never reach a
+      backend. `docs/BENCHMARKS.md` carries the conditions.
+
+      The first attempt reported core as 72% FASTER, because the control spawned
+      a thread per connection while core used a pool. A control that differs from
+      its subject in two ways measures neither.
 
 ### Owed, and easy to lose
 

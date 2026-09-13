@@ -477,6 +477,10 @@ of the protocol expects; the second matches the fleet. Owner's call.
   itself, which is a better layer than inferring them from a backend's reply,
   and re-asserting them would have meant growing a sixth route on all six
   examples that §3 does not have.
-- **A README per example**, which §4 asks for so a reader can tell whether they
-  are in the right place. The module-level comment in each file carries that
-  text today.
+- ~~A README per example~~ **done 2026-09-13**. Each directory carries one,
+  saying what that language is for, how to build and run it, and what its
+  measured numbers are. The module-level comment in each source file carries the
+  same argument at the point where someone is reading the code.
+
+Nothing else on this document is outstanding. What remains are the two decisions
+in §10.1 and §10.5, which are the owner's rather than tasks.
