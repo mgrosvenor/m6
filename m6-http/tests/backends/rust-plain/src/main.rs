@@ -22,9 +22,27 @@
 //! Rust, and that would be a problem with the platform rather than with the
 //! example. It is about the same length, which is the answer.
 //!
+//! # Why a thread pool and not a thread per connection
+//!
+//! Protocol §7 names the reference model: a fixed thread pool with a bounded
+//! queue, pool size the CPU count, queue depth pool times eight, and a full
+//! queue answered `503` immediately rather than queued without limit.
+//!
+//! The first version of this file spawned a thread per connection instead, which
+//! the protocol permits. It was measurably wrong for the job this file has:
+//! against its `rust-m6core` pair on the build host it was **72% slower**,
+//! 17,608 rps against 30,270, because it paid a thread creation on every
+//! request while core answered from a warm pool. That difference was being
+//! reported as `m6-core`'s overhead when it was nothing of the kind, and a
+//! control that differs from its subject in two ways measures neither.
+//!
+//! So both halves of the pair now use the same concurrency model and the delta
+//! is the library, which is what §5.3 of the examples doc claims it is.
+//!
 //! Standard library only: `std::os::unix`, `std::net` is not even needed.
 //! `docs/m6-backend-protocol.md` §9 is the checklist this implements.
 
+use std::collections::VecDeque;
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -33,7 +51,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 const LANGUAGE: &str = "Rust (no m6-core)";
@@ -90,31 +108,22 @@ fn main() -> ExitCode {
     LISTEN_FD.store(listener.as_raw_fd(), Ordering::SeqCst);
     install_signal_handlers();
 
+    // Protocol §7's reference model: fixed pool, bounded queue, 503 when full.
+    let workers = thread::available_parallelism().map_or(4, |n| n.get());
+    let pool = Pool::new(workers, workers * 8, Arc::clone(&status_body));
+
     for conn in listener.incoming() {
         if SIGNALLED.load(Ordering::SeqCst) {
             break;
         }
         match conn {
-            Ok(stream) => {
-                let body = Arc::clone(&status_body);
-                // Spec §7 requires only that a new connection can be accepted
-                // while another is handled, and allows threads, processes or an
-                // event loop. A thread per connection is the clearest to read.
-                if thread::Builder::new()
-                    .name("conn".into())
-                    .spawn(move || serve(stream, &body))
-                    .is_err()
-                {
-                    // Out of threads: the connection is dropped, which closes
-                    // it. The proxy reports that as a 502 promptly rather than
-                    // waiting out its 30 second timeout (spec §5).
-                    continue;
-                }
-            }
+            Ok(stream) => pool.submit(stream),
             Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
             Err(_) => break, // the listener was shut down by the signal handler
         }
     }
+    // Finish what is in flight before removing the socket (spec §8.2).
+    pool.shutdown();
     // Removing the socket is what withdraws this member from the pool. Left
     // behind, the proxy keeps selecting a member that refuses every connection
     // (spec §8.2).
@@ -171,6 +180,113 @@ fn install_signal_handlers() {
         // keeps this example readable beside the C one, which must do it.
         let ignore: extern "C" fn(i32) = std::mem::transmute(SIG_IGN);
         libc_signal(SIGPIPE, ignore);
+    }
+}
+
+/// A fixed thread pool with a bounded queue, protocol §7's reference model.
+///
+/// Hand-written because this example links nothing: a channel crate would be the
+/// obvious way and would also put a dependency into the control half of a
+/// measurement about dependencies. `Condvar` plus a `VecDeque` is enough.
+struct Pool {
+    inner: Arc<PoolInner>,
+    handles: Vec<thread::JoinHandle<()>>,
+}
+
+struct PoolInner {
+    queue: Mutex<VecDeque<UnixStream>>,
+    ready: Condvar,
+    depth: usize,
+    closed: AtomicBool,
+    status_body: Arc<Vec<u8>>,
+}
+
+impl Pool {
+    fn new(workers: usize, depth: usize, status_body: Arc<Vec<u8>>) -> Pool {
+        let inner = Arc::new(PoolInner {
+            queue: Mutex::new(VecDeque::with_capacity(depth)),
+            ready: Condvar::new(),
+            depth,
+            closed: AtomicBool::new(false),
+            status_body,
+        });
+        let mut handles = Vec::with_capacity(workers);
+        for i in 0..workers {
+            let inner = Arc::clone(&inner);
+            handles.push(
+                thread::Builder::new()
+                    .name(format!("worker-{i}"))
+                    .spawn(move || worker(&inner))
+                    .expect("spawning a pool worker"),
+            );
+        }
+        Pool { inner, handles }
+    }
+
+    /// Queue a connection, or answer 503 if the queue is full.
+    ///
+    /// Shedding is correct behaviour under overload and is how backpressure
+    /// reaches the proxy (§7). Queueing without limit instead is how a backend
+    /// turns a load spike into 30 second timeouts on every connection.
+    fn submit(&self, mut stream: UnixStream) {
+        let mut q = self.inner.queue.lock().unwrap_or_else(|e| e.into_inner());
+        if q.len() >= self.inner.depth {
+            drop(q);
+            let page = html_page(
+                "503 Service Unavailable",
+                "The request queue is full. Try again.",
+            );
+            respond(
+                &mut stream,
+                503,
+                "Service Unavailable",
+                "text/html; charset=utf-8",
+                page.as_bytes(),
+                false,
+            );
+            return;
+        }
+        q.push_back(stream);
+        drop(q);
+        self.inner.ready.notify_one();
+    }
+
+    /// Stop the workers once the queue is drained, then wait for them.
+    fn shutdown(self) {
+        self.inner.closed.store(true, Ordering::SeqCst);
+        self.inner.ready.notify_all();
+        for h in self.handles {
+            let _ = h.join();
+        }
+    }
+}
+
+fn worker(inner: &PoolInner) {
+    loop {
+        let stream = {
+            let mut q = inner.queue.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                if let Some(s) = q.pop_front() {
+                    break Some(s);
+                }
+                if inner.closed.load(Ordering::SeqCst) {
+                    break None;
+                }
+                // Waited on with a timeout rather than indefinitely: a worker
+                // parked in `wait` when `closed` is set between its check and
+                // the notify would otherwise never wake, and shutdown would
+                // hang on the join.
+                let (guard, _) = inner
+                    .ready
+                    .wait_timeout(q, std::time::Duration::from_millis(50))
+                    .unwrap_or_else(|e| e.into_inner());
+                q = guard;
+            }
+        };
+        match stream {
+            Some(s) => serve(s, &inner.status_body),
+            None => return,
+        }
     }
 }
 
