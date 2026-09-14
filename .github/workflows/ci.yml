@@ -265,6 +265,40 @@ jobs:
             kill "$pid" 2>/dev/null || true
           done
 
+  changelog:
+    name: the release says what changed
+    # Only for a release: a pull request into main IS the release now, so this is
+    # where `release.sh`'s changelog guard lives. It refused to cut a release
+    # without an entry for the version; that script is gone, and the guard is not.
+    if: github.base_ref == 'main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: CHANGELOG.md has an entry for this version
+        run: |
+          v=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          echo "workspace version: $v"
+          if ! grep -qE "^## +\[?${v}" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## ${v}' section."
+            echo "A release says what changed in it: what changed, why it mattered,"
+            echo "and how it was verified. Write the entry before merging to main."
+            exit 1
+          fi
+          echo "found the entry:"
+          sed -n "/^## \+\[\?${v}/,/^## /p" CHANGELOG.md | head -20
+
+      - name: the version is not already tagged
+        run: |
+          v=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if git rev-parse "v$v" >/dev/null 2>&1; then
+            echo "::error::v$v already exists as a tag. Bump the version in Cargo.toml."
+            exit 1
+          fi
+          echo "v$v is free"
+
   msrv:
     name: minimum supported Rust version
     runs-on: ubuntu-latest
