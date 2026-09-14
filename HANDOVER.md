@@ -115,6 +115,21 @@ tree, which it has already caught me doing.
 | `check.sh` | the laptop pre-push set |
 | the deployment repo's `deploy/run-tests.sh` | the deployment's own half: its renderers, its content, its rendered configs. It no longer runs m6's |
 
+**Set the build host in your shell.** `merge.sh` and `release.sh` both run
+`tools/build-host-tests.sh`, which refuses without it and says so rather than
+quietly checking nothing:
+
+```sh
+export M6_BUILD_HOST=root@<your-linux-box>
+export M6_BUILD_SSH_OPTS='-p 4022'        # if it is not on 22
+```
+
+The address is deliberately **not** written down in m6: which machine builds this
+is a property of whoever is working here, not of a generic web system. It is in
+the deployment repository's `docs/OPERATIONS.md`, which is where the rest of the
+infrastructure lives. A merge attempted without it fails before touching anything,
+which is the right outcome and was confirmed by doing it.
+
 **`tools/find-deployment.sh` is gone.** `merge.sh`, `release.sh` and
 `perfcheck.sh` used it to locate a deployment repository and run its
 `deploy/run-tests.sh`, which had it backwards: a release of m6 cannot depend on
