@@ -2157,14 +2157,9 @@ pub struct Invocation {
 fn parse_invocation(routes: &[(String, RouteMethod)], handlers: &[String]) -> Invocation {
     let args: Vec<String> = std::env::args().collect();
 
-    // `--version` before the argument-count check, because it takes no site
-    // directory and no config. A deploy needs it: the only way to close the
-    // config-and-binary ordering hazard is to install both together and then
-    // assert what is actually on the node, and that assertion needs the binary to
-    // be able to say what it is. Unknown config keys are ignored rather than
-    // refused (see `docs/m6-site-toml.md`), so a version floor written into a
-    // config cannot protect an older binary from it -- the old binary skips the
-    // key. Asking the binary is the only thing that works.
+    // Before the argument-count check, because `--version` takes no site directory
+    // and no config: a deploy asks a freshly installed binary what it is before
+    // any config is in place.
     if args.iter().any(|a| a == "--version" || a == "-V") {
         // The program's own name, from argv[0], not `CARGO_PKG_NAME`. That macro
         // expands where it is written, which is m6-core, so every service would
