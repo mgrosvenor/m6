@@ -12,6 +12,42 @@ releases only; work happens on `develop`. See `CONTRIBUTING.md`.
 
 ---
 
+## Unreleased
+
+### Security
+
+**rustls 0.23.44 → 0.23.45, for RUSTSEC-2026-0285.**
+
+rustls accepted TLS 1.3 handshake messages sent at the wrong encryption level
+when they followed a key-changing message in the same record: a plaintext
+`EncryptedExtensions` packed into the same record as the `ServerHello`, for
+example. RFC 8446 §5.1 requires that handshake messages do not span key changes
+and that the connection is terminated with `unexpected_message` if they do.
+Functionally the same bug as Go's GO-2026-4340 (CVE-2025-61730).
+
+`CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N`, category crypto-failure. The
+advisory is explicit that the handshake transcript is still authenticated, so a
+network-position attacker cannot use this to alter or complete a handshake; the
+practical effect is that a peer could send handshake messages that should have
+been encrypted in plaintext without rustls rejecting the connection. A
+protocol-strictness failure rather than a break in authentication. m6-http
+terminates TLS, so it is fixed rather than deferred to the next release.
+
+`Cargo.lock` only: the declared constraint was already `"0.23"`. Three edges
+move rather than one, and `cargo update --dry-run` reporting "Locking 1 package"
+undersells it — `cssparser-macros → syn` goes 3.0.5 to 2.0.119 and
+`tempfile → getrandom` goes 0.4.3 to 0.3.4. Both are cargo re-resolving onto
+versions **already present in the lockfile** rather than new dependencies, both
+are build-time graphs, and pointing `cssparser-macros` at the syn 2 the rest of
+the tree already uses reduces duplication.
+
+Verified against a real handshake rather than a successful build, since the
+change is a TLS library: TLS 1.3 negotiating `AEAD-CHACHA20-POLY1305-SHA256`
+with verify 0, TLS 1.2 negotiating `ECDHE-RSA-CHACHA20-POLY1305`, ALPN h2 and
+h1 both answering 200.
+
+---
+
 ## 1.0.0 — 2026-09-14
 
 The first release. Everything under this heading was on `develop` unreleased and
