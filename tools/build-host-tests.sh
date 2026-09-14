@@ -56,9 +56,18 @@
 # are actually used. So they are built here, and their end-to-end test runs
 # against the binaries this script just built.
 #
-# What it does NOT run: the performance check. `tools/perfcheck.sh` measures
-# rendering real content against a rendered config; see its own header for where
-# it belongs.
+# It DOES run the performance check, as of 2026-09-14.
+#
+# It used to skip it, on the stated grounds that `tools/perfcheck.sh` measures
+# "rendering real content against a rendered config" and therefore belonged to a
+# deployment. That stopped being true the same day: perfcheck was repointed at the
+# examples, whose content is committed, so it measures m6 against bytes that are
+# the same on every machine.
+#
+# Until this was wired up, the two baselines recorded in perf-baseline.txt had
+# nothing checking them — a recorded number nobody compares against is a number
+# nobody will notice moving. And this is the only place it can run: a wall-clock
+# measurement needs a quiet machine, which a shared CI runner is not.
 
 set -uo pipefail
 
@@ -238,6 +247,14 @@ echo "### conformance"
 ./tools/conformance.sh > /tmp/conformance.out 2>&1
 echo "CONFORMANCE_STATUS=$?"
 tail -14 /tmp/conformance.out
+
+echo "### performance"
+# Against the recorded numbers in tools/perf-baseline.txt, taken on this machine.
+# A run slower than its number by more than the margin fails; a faster one prints
+# the reading and asks for it to be recorded deliberately.
+./tools/perfcheck.sh > /tmp/perf.out 2>&1
+echo "PERF_STATUS=$?"
+grep -E 'render:|PASS|FAIL' /tmp/perf.out | tail -6
 REMOTE
 
 # ── The examples ─────────────────────────────────────────────────────────────
@@ -390,13 +407,16 @@ missing=$(sed -n 's/^BACKEND_RUNTIMES_MISSING=//p' "$LOG" | tail -1)
     echo "${RED}   A language that never ran is not a language that passed.${RESET}" >&2
     FAILED=1; }
 [[ "$cf" == "0" ]] || { echo "${RED}   conformance failed (h1/h2/h3)${RESET}" >&2
-                        sed -n '/^### conformance/,$p' "$LOG" >&2; FAILED=1; }
+                        sed -n '/^### conformance/,/^### performance/p' "$LOG" >&2; FAILED=1; }
+pf=$(num_after PERF_STATUS "$LOG"); pf="${pf:-?}"
+[[ "$pf" == "0" ]] || { echo "${RED}   performance check failed${RESET}" >&2
+                        sed -n '/^### performance/,$p' "$LOG" >&2; FAILED=1; }
 [[ "$failed" == "0" && "$passed" -gt 0 ]] || {
     echo "${RED}   m6: $passed passed, $failed failed${RESET}" >&2
     sed -n '/^### failure detail/,$p' "$LOG" >&2; FAILED=1; }
 
 if [[ $FAILED -eq 0 ]]; then
-    ok "m6: $passed passed, 0 failed, 0 warnings (release + test), clippy silent, cargo-deny ok, h1+h2+h3 ok"
+    ok "m6: $passed passed, 0 failed, 0 warnings (release + test), clippy silent, cargo-deny ok, h1+h2+h3 ok, performance ok"
 else
     echo
     echo "${RED}m6's own checks FAILED on $BUILD_HOST. Full log: $LOG${RESET}" >&2
@@ -455,8 +475,6 @@ fi
 if [[ $FAILED -eq 0 ]]; then
     echo
     echo "${GREEN}m6 and its examples passed on $BUILD_HOST.${RESET}"
-    echo "The performance check belongs to a deployment: it measures rendering real"
-    echo "content. Run that deployment's own runner for it."
 else
     echo
     echo "${RED}Checks FAILED on $BUILD_HOST.${RESET}" >&2
