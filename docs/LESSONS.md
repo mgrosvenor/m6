@@ -428,3 +428,47 @@ New 2026-09-12:
     It was found the hour after m6's checks started building the examples, which
     is lesson 41 arriving on time: the examples are the only code in the checks
     that uses m6 the way a reader would.
+
+45. **The failure I spent five pushes on was already written down in this
+    repository, in the header of `tag.sh`.**
+
+    Pushing was broken and silent: git died with SIGPIPE, exit 141, no message,
+    while `check.sh` printed "All checks passed" and the remote never moved. git
+    opens its connection, runs the pre-push hook, then sends the pack. The hook ran
+    the whole workspace suite single-threaded plus conformance, over ten minutes,
+    so the connection sat idle long enough for the server to close it and git wrote
+    the pack to a dead socket.
+
+    `tag.sh` says, and has said for some time:
+
+    > The pre-push hook only runs build + tests (~30s). This script is the right
+    > place to gate tags on benchmark results because it runs locally before
+    > creating the tag, **avoiding SSH-timeout issues that occur when benchmarks
+    > run inside the network-push hook.**
+
+    Somebody hit this, diagnosed it correctly, wrote it down, and put the slow work
+    somewhere safe. Then the hook grew from ~30 seconds to over ten minutes and
+    walked straight back into it. The note was not wrong and it was not hidden; it
+    was in a file I had already listed twice that afternoon.
+
+    Two separate things went wrong, and they are worth keeping apart.
+
+    **The first is that a comment protecting an invariant does not protect it.**
+    `tag.sh` explained why slow things must stay out of the hook. Nothing stopped
+    the hook becoming slow. A rule that lives only in prose beside the workaround,
+    rather than in the thing it constrains, decays silently — and this one decayed
+    into a repository nobody could push to.
+
+    **The second is mine: I reached for explanations further away than the code I
+    had just been editing.** I blamed the network, then credentials, then the
+    hook's stdin handling, and fixed the stdin handling — correctly, as it
+    happens, and it changed nothing. The cheap discriminating test was
+    `git push --no-verify --dry-run`, which cleared the network, the credentials
+    and the refusal logic in one command and took four seconds. I ran it fifth.
+    **When a tool breaks right after you have edited its hooks, the hook is the
+    first hypothesis, and the test that excludes it is the first test.**
+
+    And a third, smaller: four of the five attempts reported success because I
+    wrapped the push in compound commands ending in `echo`, so the exit code I
+    read belonged to the echo. Lesson 25's shape again, self-inflicted: a
+    measurement that cannot fail is not a measurement.
