@@ -63,8 +63,9 @@ scope as low-touch consolidation but is not started. See §3b.
 - `FrameworkState::build_dict` is private; the twelve ordered steps are not
   reusable by a service not using `App`. §1.
 - `m6-monitor` and the firewall stats collector are deployed nowhere.
-- `tools/health-check.py` cannot be retired until those are deployed and a
-  post-freeze binary is on the nodes.
+- The deployment's `deploy/health-check.py` cannot be retired until those are
+  deployed and a post-freeze binary is on the nodes. It moved out of m6 on
+  2026-09-14: a generic web system does not carry one fleet's health check.
 - Staging cannot exercise the cache role.
 - The hourly prompt's `hit_p50_ns` baseline is wrong now that §3a is
   understood. Owner's file to change.
@@ -936,7 +937,8 @@ holding something that genuinely differs per request.
       The build host is off-fleet, so installing it there breaks no freeze.
 - [ ] **Deploy the firewall stats collector.** Written and unit-tested, on no
       node. Until then `/traffic` reports `firewall: null`.
-- [ ] **Retire `tools/health-check.py`.** Blocked on the two deployments
+- [ ] **Retire the deployment's `deploy/health-check.py`** (it was
+      `tools/health-check.py` here until 2026-09-14). Blocked on the two deployments
       above **and on the freeze**, which the old wording did not say. Measured
       on syd 2026-09-12: `--check` reads `/traffic`, which **404s** on the
       deployed binary, and `/perf`, whose deployed shape is

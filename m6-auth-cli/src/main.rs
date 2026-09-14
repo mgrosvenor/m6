@@ -590,6 +590,14 @@ fn cmd_token_revoke(db: &Db, args: &[String]) -> Result<()> {
 fn run() -> Result<()> {
     let raw_args: Vec<String> = std::env::args().collect();
 
+    // Before the argument-count check: `--version` takes no config and no
+    // subcommand. A deploy installs this binary alongside the services, so it
+    // answers too.
+    if raw_args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("m6-auth-cli {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     if raw_args.len() < 4 {
         print_usage();
         process::exit(2);

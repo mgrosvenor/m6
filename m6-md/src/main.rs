@@ -164,6 +164,11 @@ fn parse_args(args: &[String]) -> Result<Cli> {
 
     while i < args.len() {
         match args[i].as_str() {
+            // Its own parser, so the flag is added here too.
+            "--version" | "-V" => {
+                println!("m6-md {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
             "--output" => {
                 i += 1;
                 if i >= args.len() {

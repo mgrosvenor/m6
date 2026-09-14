@@ -76,6 +76,34 @@ This is the half that mattered most, because most of it had never run.
   m6-core, all conforming to the wire contract, with 13 shared tests running them
   in the build checks. The multi-language promise was written down and never
   exercised until now.
+- **The examples repository is built by m6's own checks**, and its CMS example's
+  end-to-end suite runs against the binaries those checks just built. Nothing had
+  ever built it. By the time anyone looked it did not compile at all: every
+  renderer crate still pointed at `m6-render`, a crate m6 had deleted, and the
+  binaries left in `target/release` from before the deletion meant running an
+  example still appeared to work.
+
+  Underneath that were five more, each invisible for the same reason. Every asset
+  in every example returned 502, because m6-file became an `App` service and ten
+  configs across the repository were left naming no handler, so the service
+  exited 2 before binding. PATCH and DELETE were refused at the edge by
+  `allowed_methods`, which looks exactly like a missing route. Unpublishing a
+  post in the CMS example answered `{"unpublished": true}` and left the post
+  listed and readable. Starting an example ran `pkill -x m6-http` and killed
+  every other m6 on the machine.
+
+  m6's own checks were passing throughout, and could not have caught any of it:
+  m6 contains no site, and the examples are where its interfaces are actually
+  used. `tools/perfcheck.sh` also measured a deployment's content through a
+  deployment's rendered config, so m6 could not measure itself either; it now
+  renders two pages from the examples, whose content is committed, so the number
+  means the same thing on every machine.
+- **The CMS example's end-to-end suite has no skipped checks**, and 96 rather
+  than 46. The previous version had five that accepted a range of answers, and
+  each one was hiding one of the defects above: the unpublish check read the
+  API's own reply rather than asking the public site, and the auth checks passed
+  on "302 or 401 or 403". It also pinned `--http1.1` for everything, so the
+  example that runs the whole stack never exercised HTTP/2 once.
 
 ### Protocol fixes in this release
 
@@ -95,6 +123,35 @@ This is the half that mattered most, because most of it had never run.
   written from that advice served uncompressed bytes forever.
   `[[backend]] compresses` is now read by both sides, and a backend refuses to
   start if it disagrees with what it can actually do.
+- **`touch site.toml` never reloaded anything on Linux.** m6-core's
+  `Request::touch` is the documented way for a renderer to invalidate the edge
+  after writing content, and it used `utimensat(2)`, which reports `IN_ATTRIB`.
+  The inotify mask asked for `IN_CLOSE_WRITE | IN_CREATE | IN_MOVED_TO`, so the
+  event was read and discarded, and the mtime fallback runs only when there is no
+  watcher fd. macOS was fine, because kqueue reports the attribute change, so the
+  defect was invisible where the code was written and live where it runs. Blog
+  publishing was spared only because `m6-md --touch` has its own implementation
+  that opens the file. The watcher now accepts `IN_ATTRIB` and `Request::touch`
+  opens and closes the file as well; either alone is sufficient. Found within the
+  hour after the checks started building the examples on Linux.
+- **A backend's error headers survive the error page.** m6-http replaces a
+  backend's 4xx or 5xx with its own page and threw the backend's whole header
+  block away with it. So a throttled login reached the client as a generic "An
+  unexpected error occurred" with no `Retry-After`, even though m6-auth-server had
+  set one: the throttle worked and was unusable, because the one header saying
+  when to come back was the one discarded. The same substitution dropped
+  `WWW-Authenticate` from a backend 401 and `Allow` from a backend 405, which
+  RFC 9110 11.6.1 and 10.2.1 require. Those four headers now carry over and
+  nothing else does, because the rest describe a body that is no longer being
+  sent.
+- **The login throttle counts failures, not logins.** m6-auth-server incremented
+  on every login request before looking at the credentials, and never cleared the
+  count, so six logins in fifteen minutes locked the IP out whether or not any
+  password was wrong. Counting successes stops no attack, since an attacker with
+  the password does not need six attempts; what it stopped was a person using
+  three devices, and any test suite that logs in repeatedly. The limits move into
+  `[rate_limit] max_attempts` and `window_secs`, defaulting to the previous 5 and
+  900.
 - **Supply chain:** five `cargo-deny` exceptions down to three, each remaining one
   stating whether it is reachable and how that was checked. `rustls-pemfile` is
   gone from the tree entirely.

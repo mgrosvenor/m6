@@ -2558,6 +2558,12 @@ fn handle_request_inner(
             detail: Some(detail),
         };
         let (s, mut h, b, n) = apply_error_mode(status, req, client_ip, state, Some(&ctx));
+        // The error page replaces the backend's response wholesale, so the
+        // headers that tell the client what to do next have to be carried over
+        // by hand. Without this, a backend's 429 arrived with no `Retry-After`
+        // and a backend's 401 with no `WWW-Authenticate`. See
+        // `error::PRESERVED_ERROR_HEADERS`.
+        error::preserve_actionable_headers(&resp_headers, &mut h);
         // Bug fix: this early return used to skip analytics for every
         // backend-returned error status uniformly — unlike its async sibling
         // (finalize_url_response), which deliberately logs a backend-returned
@@ -3647,6 +3653,12 @@ fn parse_args(args: &[String]) -> anyhow::Result<Cli> {
             "--dump-config" => {
                 dump_config = true;
             }
+            // Its own parser, so the flag is added here too. See m6-core's
+            // `parse_invocation`.
+            "--version" | "-V" => {
+                println!("m6-http {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
             arg if arg.starts_with("--") => {
                 anyhow::bail!("unknown flag: {}", arg);
             }
@@ -4512,5 +4524,72 @@ mod error_page_holder_tests {
     fn ttl_is_short_enough_to_pick_up_a_redeploy() {
         assert!(ERROR_PAGE_TTL <= std::time::Duration::from_secs(300));
         assert!(ERROR_PAGE_TTL >= std::time::Duration::from_secs(10));
+    }
+}
+
+
+/// `Vary: Accept-Encoding` is promised only when the backend can deliver
+/// variants, and `[[backend]] compresses` is how the two sides agree.
+///
+/// **This half had no tests.** Issue #8 is about the edge not advertising what
+/// the backend cannot do, and every test written for it lived in m6-core, on the
+/// backend's side of the contract: whether a service refuses to start when its
+/// declaration disagrees with its build. The edge's own behaviour -- reading the
+/// flag and deciding whether to add the header -- was untested, which is the half
+/// a visitor actually sees.
+#[cfg(test)]
+mod compresses_vary_tests {
+    use super::*;
+
+    fn headers(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn vary_of(h: &[(String, String)]) -> Option<String> {
+        h.iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("vary"))
+            .map(|(_, v)| v.clone())
+    }
+
+    #[test]
+    fn a_compressing_backend_gets_vary_accept_encoding() {
+        let mut h = headers(&[("Content-Type", "text/html")]);
+        set_vary_accept_encoding(&mut h, true);
+        let v = vary_of(&h).expect("Vary must be set for a compressing backend");
+        assert!(
+            v.to_ascii_lowercase().contains("accept-encoding"),
+            "Vary was {v:?}"
+        );
+    }
+
+    /// The defect issue #8 is about. A backend that does not compress has exactly
+    /// one representation, so advertising an encoding dimension promises variants
+    /// that will never exist. m6-http is a cache, not a transformer: it has no
+    /// compressor, so it cannot manufacture them.
+    #[test]
+    fn a_non_compressing_backend_gets_no_vary() {
+        let mut h = headers(&[("Content-Type", "text/html")]);
+        set_vary_accept_encoding(&mut h, false);
+        assert!(
+            vary_of(&h).is_none(),
+            "a backend that does not compress was promised encoding variants: {:?}",
+            vary_of(&h)
+        );
+    }
+
+    /// A `Vary` the backend set itself is its statement about its own output, so
+    /// it is left alone rather than stripped.
+    #[test]
+    fn a_backends_own_vary_survives_even_when_it_does_not_compress() {
+        let mut h = headers(&[("Vary", "Accept-Language")]);
+        set_vary_accept_encoding(&mut h, false);
+        let v = vary_of(&h).expect("the backend's own Vary must not be removed");
+        assert!(
+            v.to_ascii_lowercase().contains("accept-language"),
+            "the backend's own field was lost: {v:?}"
+        );
     }
 }
