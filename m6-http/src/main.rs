@@ -4527,7 +4527,6 @@ mod error_page_holder_tests {
     }
 }
 
-
 /// `Vary: Accept-Encoding` is promised only when the backend can deliver
 /// variants, and `[[backend]] compresses` is how the two sides agree.
 ///
