@@ -1,6 +1,16 @@
 name: CI
 
-# Every push and every pull request, on both long-lived branches.
+# Pull requests, not pushes. Owner's call.
+#
+# The local checks are what a push goes through: `.githooks/pre-push` runs
+# `check.sh`, and a merge into develop has already been through
+# `tools/build-host-tests.sh` on a real Linux box, which tests strictly more than
+# a runner can -- it has h2spec and h3spec installed and it is quiet enough to
+# measure. Running the same ground again on every push spends runner minutes to
+# re-confirm what the build host already said.
+#
+# A pull request is different: it is the point where someone else's change arrives
+# and nothing local has vouched for it.
 #
 # WHAT IS NOT HERE: the performance check. A wall-clock measurement on a shared
 # runner measures the runner, not the code. It stays on the build host, which
@@ -9,10 +19,10 @@ name: CI
 # argument applies twice over to a runner shared with the rest of the world.
 
 on:
-  push:
-    branches: [main, develop, 'feat/**', 'fix/**', 'perf/**', 'docs/**', 'refactor/**', 'test/**', 'chore/**']
   pull_request:
     branches: [main, develop]
+  # Manual, for re-running against a branch without opening a pull request.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
