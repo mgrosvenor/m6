@@ -407,7 +407,9 @@ mod tests {
         preserve_actionable_headers(&backend, &mut page);
         assert_eq!(value_of(&page, "retry-after").as_deref(), Some("5"));
         assert_eq!(
-            page.iter().filter(|(k, _)| k.eq_ignore_ascii_case("retry-after")).count(),
+            page.iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case("retry-after"))
+                .count(),
             1,
             "no duplicate Retry-After"
         );
