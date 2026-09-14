@@ -237,7 +237,13 @@ jobs:
               # InvalidKeyFormat" and exits, and pre-creating one here made dev.sh
               # skip generating a good one — 33 of 98 checks failed with 502s
               # because the auth server was never up.
-              openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$d/keys/auth.pem" 2>/dev/null
+              # `ec_param_enc:named_curve` too. It is the default for OpenSSL, so it
+              # changes nothing here, but LibreSSL -- which is what macOS ships as
+              # /usr/bin/openssl -- writes explicit curve parameters instead of the
+              # prime256v1 OID, and the token signer refuses those with "JWT encode
+              # error: InvalidEcdsaKey" at every login. Stated here so the two sides
+              # of the check generate the same key.
+              openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -pkeyopt ec_param_enc:named_curve -out "$d/keys/auth.pem" 2>/dev/null
               openssl pkey -in "$d/keys/auth.pem" -pubout -out "$d/keys/auth.pub" 2>/dev/null
               chmod 600 "$d/keys/auth.pem" 2>/dev/null || true
             fi
