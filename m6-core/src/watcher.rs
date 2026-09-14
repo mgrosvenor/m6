@@ -78,8 +78,31 @@ impl ConfigWatcher {
         // writes produces one event on close instead of a reload per write.
         // `IN_CREATE` and `IN_MOVED_TO` catch the write-to-temp-then-rename
         // that every careful editor and every deploy script does.
-        let mask =
-            AddWatchFlags::IN_CLOSE_WRITE | AddWatchFlags::IN_CREATE | AddWatchFlags::IN_MOVED_TO;
+        //
+        // `IN_ATTRIB` for a timestamp-only change, and this one was missing.
+        //
+        // `docs/m6-site-toml.md` tells renderers to "touch site.toml after
+        // writing to trigger the reload", and a bare timestamp update is exactly
+        // what that reads as. `utimensat(2)` with no open -- what
+        // `filetime::set_file_times` does, and therefore what m6-core's own
+        // `Request::touch` did -- reports IN_ATTRIB and nothing else. None of the
+        // three flags above match it, so the event was read and discarded.
+        //
+        // On Linux that meant the documented invalidation mechanism had never
+        // worked. Measured on the build host: `utimensat(AT_FDCWD, "site.toml",
+        // NULL, 0)` produced zero reload lines, while opening the file for write
+        // and closing it produced two. macOS was unaffected, because kqueue
+        // registers the files themselves and reports the attribute change, so
+        // the defect was invisible on the machine the code was written on and
+        // live on the platform that serves production.
+        //
+        // The cost of including it is a reload on `chmod` or `chown` of a
+        // watched file, which a reload is idempotent about, against a silent
+        // failure to reload at all.
+        let mask = AddWatchFlags::IN_CLOSE_WRITE
+            | AddWatchFlags::IN_CREATE
+            | AddWatchFlags::IN_MOVED_TO
+            | AddWatchFlags::IN_ATTRIB;
 
         for dir in watch_targets(paths, false) {
             if let Err(e) = inotify.add_watch(&dir, mask) {
@@ -338,6 +361,47 @@ mod tests {
         assert!(
             w.read_events(&["app.conf"]),
             "the event arrived but was not reported for the watched name"
+        );
+    }
+
+    /// A timestamp-only change wakes the poller, and this is the one that was
+    /// broken.
+    ///
+    /// `utimensat(2)` with no open is what `filetime::set_file_times` does, and
+    /// therefore what m6-core's own `Request::touch` did. It reports `IN_ATTRIB`
+    /// and nothing else, and the mask asked only for
+    /// `IN_CLOSE_WRITE | IN_CREATE | IN_MOVED_TO`, so the event was read and
+    /// thrown away. **The documented reload mechanism had never worked on Linux.**
+    ///
+    /// It worked on macOS, because kqueue registers the files themselves and
+    /// reports the attribute change -- so on the machine this code was written on
+    /// there was nothing to see, while on the platform that serves production a
+    /// CMS publish rebuilt its index, reported success, and did not appear.
+    ///
+    /// The test writes no bytes on purpose. Touching the content would produce
+    /// IN_CLOSE_WRITE and pass against the old mask, which is how the existing
+    /// tests all passed: every one of them changed the file's contents.
+    #[test]
+    fn a_timestamp_only_touch_wakes_the_poller() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = dir.path().join("app.conf");
+        write_file(&cfg, "size = 1\n");
+
+        let mut w = ConfigWatcher::new(&[cfg.as_path()]).expect("watcher");
+        let _ = w.read_events(&["app.conf"]); // drain the setup's own events
+
+        // No open, no write: only the timestamps move.
+        let now = filetime::FileTime::now();
+        filetime::set_file_times(&cfg, now, now).expect("set_file_times");
+
+        assert!(
+            readable_within(&w, 5_000),
+            "a timestamp-only touch did not wake the poller; the documented \
+             `touch site.toml` reload mechanism is broken on this platform"
+        );
+        assert!(
+            w.read_events(&["app.conf"]),
+            "the timestamp change arrived but was not reported for the watched name"
         );
     }
 
