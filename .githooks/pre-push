@@ -71,11 +71,47 @@ done
 run_checks=0
 checks_for=""
 
+# `${#refs[@]}` guard, not a bare `"${refs[@]}"`. Under `set -u`, bash 3.2 --
+# which is still macOS's /bin/bash -- treats expanding an EMPTY array as an
+# unbound variable and dies with `refs[@]: unbound variable`. git can invoke this
+# hook with nothing on stdin, and then the hook fails the push for a reason that
+# has nothing to do with the push.
+if [[ ${#refs[@]} -gt 0 ]]; then
 for entry in "${refs[@]}"; do
   read -r local_ref local_sha remote_ref remote_sha <<< "$entry"
   [[ -z "${local_ref:-}" ]] && continue
   # A deletion. Not this hook's business.
   [[ "$local_sha" =~ ^0+$ ]] && continue
+
+  # TAGS FIRST, because they are not branches and the catch-all below would
+  # demand an issue number from one.
+  #
+  # `branch="${remote_ref#refs/heads/}"` leaves a tag ref untouched -- it does not
+  # start with `refs/heads/` -- so `refs/tags/v1.0.0` fell through to the
+  # work-branch case and was refused with "does not name an issue". **That meant no
+  # release could ever be tagged.** It went unnoticed because the hook was written
+  # on 2026-09-13 and v1.0.0 was the first tag pushed after it: release.sh merged
+  # main, pushed it, and then died on the tag, leaving the release half done.
+  #
+  # A release tag is `v<major>.<minor>.<patch>` and only release.sh pushes one, so
+  # the same M6_RELEASE guard that protects main protects this.
+  if [[ "$remote_ref" == refs/tags/* ]]; then
+    tag="${remote_ref#refs/tags/}"
+    if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      refuse "tag '$tag' is not a release tag.
+
+  Tags on this repository are versions: v1.0.0, v1.2.3. Nothing else is pushed.
+  If you are cutting a release:   ./tools/release.sh <version>"
+    fi
+    if [[ "${M6_RELEASE:-}" != "1" ]]; then
+      refuse "tag '$tag' looks like a release tag but M6_RELEASE is not set.
+
+  Release tags are created by tools/release.sh, which sets it. A tag pushed by
+  hand has not been through the checks."
+    fi
+    note "release tag $tag"
+    continue
+  fi
 
   branch="${remote_ref#refs/heads/}"
 
@@ -135,6 +171,7 @@ for entry in "${refs[@]}"; do
       ;;
   esac
 done
+fi
 
 # Say what was NOT checked here, because a gate that stays quiet about its scope
 # gets mistaken for one that covered everything. Same rule as tools/conformance.sh.
