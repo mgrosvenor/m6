@@ -3653,6 +3653,14 @@ fn parse_args(args: &[String]) -> anyhow::Result<Cli> {
             "--dump-config" => {
                 dump_config = true;
             }
+            // A deploy has to be able to ask a node which binary is installed.
+            // See the note in m6-core's `parse_invocation`: a version floor in a
+            // config cannot work, because an older binary ignores keys it does not
+            // know, so asking the binary is the only thing that does.
+            "--version" | "-V" => {
+                println!("m6-http {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
             arg if arg.starts_with("--") => {
                 anyhow::bail!("unknown flag: {}", arg);
             }
