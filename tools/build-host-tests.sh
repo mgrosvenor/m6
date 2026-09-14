@@ -261,9 +261,18 @@ echo "EG_RELEASE_WARNINGS=$(cargo build --release 2>&1 | grep -c '^warning' || t
 
 echo "### examples clippy"
 # The examples meet the same standard as m6: a reader copies from them.
-cargo clippy --workspace --all-targets --release 2>&1 | grep -c '^warning' > /tmp/eg-clippy.count
+#
+# Into its OWN target directory. clippy and cargo build share fingerprints when
+# they share a target dir, so each one invalidates the other's artifacts: running
+# clippy here left the release build stale, and the 05-cms stage below then spent
+# three minutes rebuilding from scratch inside its startup timeout and was
+# reported as a stack that never answered. The wasted disk is worth more than a
+# failure that points at the wrong thing.
+CARGO_TARGET_DIR=target/clippy cargo clippy --workspace --all-targets --release 2>&1 \
+    | grep -c '^warning' > /tmp/eg-clippy.count
 echo "EG_CLIPPY_WARNINGS=$(cat /tmp/eg-clippy.count)"
-cargo clippy --workspace --all-targets --release 2>&1 | grep '^warning' | head -5
+CARGO_TARGET_DIR=target/clippy cargo clippy --workspace --all-targets --release 2>&1 \
+    | grep '^warning' | head -5
 
 echo "### examples unit tests"
 cargo test --workspace > /tmp/eg-tests.log 2>&1
@@ -275,12 +284,36 @@ echo "### every example's config parses"
 # m6-file's config schema changed and ten example configs were left naming no
 # handler, so the service exited 2 before binding and every asset 502'd. Parsing
 # each config with the real binary is cheap and catches that class outright.
+#
+# EVERY example is accounted for, and an example that is not parsed must say why.
+# A loop that quietly stepped over the ones it could not find a config for would
+# be the silent skip this project has been bitten by four times -- it would report
+# nine of eleven and read exactly like eleven of eleven.
 EG_CONFIG_BAD=0
+EG_CONFIG_UNEXPLAINED=0
 for d in examples/*/; do
     name=$(basename "$d")
+    case "$name" in
+        data) continue ;;   # shared fixtures, not an example
+        06-systemd)
+            printf '  %-24s not parsed: systemd units only, it has no site config\n' "$name"
+            continue ;;
+        09-global-deployment)
+            # Its configs name /etc/letsencrypt paths for five real cache nodes,
+            # so m6-http rejects them here for a missing certificate rather than
+            # for anything wrong with the config. Its own integration test in
+            # examples/09-global-deployment/integration-test covers it instead,
+            # and that test ran above.
+            printf '  %-24s not parsed: production configs name letsencrypt paths; its integration test covers it\n' "$name"
+            continue ;;
+    esac
     sys="$d/configs/system-dev.toml"
     [ -f "$sys" ] || sys="$d/site.toml"
-    [ -f "$sys" ] || continue
+    if [ ! -f "$sys" ]; then
+        printf '  %-24s NO CONFIG FOUND and no reason recorded for that\n' "$name"
+        EG_CONFIG_UNEXPLAINED=$((EG_CONFIG_UNEXPLAINED + 1))
+        continue
+    fi
     out=$("$M6_DIR/target/release/m6-http" "$(cd "$d" && pwd)" "$(cd "$(dirname "$sys")" && pwd)/$(basename "$sys")" --dump-config 2>&1 >/dev/null)
     if [ -n "$out" ]; then
         printf '  %-24s %s\n' "$name" "$(echo "$out" | head -1)"
@@ -290,23 +323,34 @@ for d in examples/*/; do
     fi
 done
 echo "EG_CONFIG_BAD=$EG_CONFIG_BAD"
+echo "EG_CONFIG_UNEXPLAINED=$EG_CONFIG_UNEXPLAINED"
 
 echo "### 05-cms end-to-end"
 # The one example that runs the whole stack: edge, templates, files, markdown,
 # auth and a custom renderer. If this passes, the parts work together.
+# Everything built BEFORE dev.sh, so the readiness wait below measures startup
+# and nothing else. dev.sh builds what it needs itself, which is right for a
+# person running it by hand and wrong here: a cold build inside a startup timeout
+# is reported as a stack that never came up.
+cargo build --release -p render-cms 2>&1 | tail -1
+(cd "$M6_DIR" && cargo build --workspace --release 2>&1 | tail -1)
+
 cd examples/05-cms || exit 1
 M6="$M6_DIR" M6_NO_BROWSER=1 ./dev.sh --no-open > /tmp/eg-cms-dev.log 2>&1 &
 DEV_PID=$!
 up=0
-for _ in $(seq 1 60); do
+# 180 seconds. Six services have to bind, and m6-md regenerates posts.json from
+# twelve markdown files first.
+for _ in $(seq 1 180); do
     code=$(curl -sk --http1.1 -o /dev/null -w '%{http_code}' https://127.0.0.1:8443/ 2>/dev/null || true)
     if [ "$code" = "200" ]; then up=1; break; fi
     sleep 1
 done
 if [ "$up" != "1" ]; then
     echo "EG_CMS_STATUS=1"
-    echo "the 05-cms stack never answered; dev.sh output:"
+    echo "the 05-cms stack never answered in 180s; dev.sh output:"
     tail -30 /tmp/eg-cms-dev.log
+    echo "--- service logs ---"
     tail -20 logs/*.log 2>/dev/null
 else
     ./test.sh > /tmp/eg-cms-test.log 2>&1
@@ -381,6 +425,12 @@ if [[ -n "$EXAMPLES" ]]; then
     [[ "$egk" == "0" ]] || { echo "${RED}   examples: $egk config(s) rejected by m6-http${RESET}" >&2
                              sed -n '/^### every example/,/^### 05-cms/p' "$EXAMPLES_LOG" >&2
                              EG_FAILED=1; }
+    egu=$(num_after EG_CONFIG_UNEXPLAINED "$EXAMPLES_LOG"); egu="${egu:-?}"
+    [[ "$egu" == "0" ]] || {
+        echo "${RED}   examples: $egu example(s) had no config and no recorded reason.${RESET}" >&2
+        echo "${RED}   Either give it one, or record in build-host-tests.sh why it has none.${RESET}" >&2
+        sed -n '/^### every example/,/^### 05-cms/p' "$EXAMPLES_LOG" >&2
+        EG_FAILED=1; }
     [[ "$ege" == "0" ]] || { echo "${RED}   examples: the 05-cms end-to-end suite failed${RESET}" >&2
                              sed -n '/^### 05-cms end-to-end/,$p' "$EXAMPLES_LOG" >&2
                              EG_FAILED=1; }
