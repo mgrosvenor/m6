@@ -3,19 +3,21 @@
 #
 # The model:
 #
-#   main      releases only. What people see on GitHub. It only ever advances
-#             by a merge from develop, made by tools/release.sh, with a
-#             CHANGELOG entry and a tag.
+#   main      releases only. What people see on GitHub. It advances only by a
+#             PULL REQUEST from develop, with a CHANGELOG entry, then a tag.
 #   develop   where the work is integrated. Everything branches from here and
-#             merges back here.
+#             comes back by PULL REQUEST.
 #   <branch>  one branch per issue, named <type>/<issue>-<slug>, created by
 #             tools/branch.sh.
 #
+# Owner's decision, 2026-09-14: a pull request is the only way into develop and
+# the only way from develop to main. tools/merge.sh and tools/release.sh, which
+# did both locally, are deleted.
+#
 # What this hook refuses:
 #
-#   - any push to main that tools/release.sh did not make
-#   - any push to develop carrying a merge commit that tools/merge.sh did not
-#     make, because that merge did not go through the full checks
+#   - any direct push to main (M6_RELEASE=1 is for the release tag path)
+#   - a tag that is not a release version, or one pushed without M6_RELEASE=1
 #   - any push of a work branch whose name carries no issue number
 #
 # Bypass with --no-verify only if you can say out loud why, and expect the
@@ -118,35 +120,26 @@ for entry in "${refs[@]}"; do
   case "$branch" in
     main)
       if [[ "${M6_RELEASE:-}" != "1" ]]; then
-        refuse "main takes releases only.
+        refuse "main takes releases only, and only by pull request.
 
-  main only ever advances by a merge from develop, made by tools/release.sh,
-  with a CHANGELOG entry and a tag. Nothing is pushed to it by hand.
+  Open a pull request from develop into main. CI checks that CHANGELOG.md has an
+  entry for the version in Cargo.toml and that the version is not already tagged.
+  Merge it on GitHub, then tag the merge:
 
-  If you are cutting a release:   ./tools/release.sh <version>
+      git fetch origin && git checkout main && git pull
+      ./tag.sh v<version>
+
   If you meant develop:           git push origin develop"
       fi
       note "release push to main (M6_RELEASE=1)"
       ;;
 
     develop)
-      # Every merge commit arriving on develop must carry the trailer that
-      # tools/merge.sh writes, which is the evidence the full checks ran.
-      range="$remote_sha..$local_sha"
-      [[ "$remote_sha" =~ ^0+$ ]] && range="$local_sha"
-      bad=""
-      for c in $(git rev-list --merges "$range" 2>/dev/null); do
-        git show -s --format=%B "$c" | grep -q '^Checks: ' || bad="$bad $(git rev-parse --short "$c")"
-      done
-      if [[ -n "$bad" ]]; then
-        refuse "merge commit(s) on develop with no record of the checks:$bad
-
-  A merge into develop has to pass the full set first: unit tests, clippy,
-  h1/h2/h3 conformance and the performance check. tools/merge.sh runs them
-  and records what it ran in the merge commit.
-
-  Use:  ./tools/merge.sh <branch>"
-      fi
+      # The `Checks:` trailer requirement is gone, with tools/merge.sh. It existed
+      # because a local merge carried no other evidence that the checks had run.
+      # Work now reaches develop by PULL REQUEST, where CI is the evidence and
+      # GitHub makes the merge commit, so there is nothing here to inspect and no
+      # trailer to look for.
       run_checks=1
       checks_for="develop"
       ;;
