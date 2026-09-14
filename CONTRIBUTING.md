@@ -10,7 +10,7 @@ what you saw.
 ./tools/branch.sh <issue> <slug> --type fix   # branches off develop
 # work, commit
 git push origin fix/<issue>-<slug>            # runs the fast checks
-./tools/merge.sh fix/<issue>-<slug>           # runs everything, then merges
+gh pr create --base develop --fill           # CI runs everything, then merge on GitHub
 ```
 
 `CLAUDE.md` has the full model. The rules below are the ones a contributor
@@ -38,7 +38,7 @@ All of it, on Linux, before anything merges into `develop`:
 - h1, h2 and h3 conformance, at or above their recorded scores
 - the performance check, within its margin
 
-`tools/merge.sh` runs them. CI runs the first four on every push.
+CI runs them on the pull request. `tools/build-host-tests.sh` runs the same ground plus the performance check, which a shared runner cannot measure.
 
 ### If you make something faster
 
