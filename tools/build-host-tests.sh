@@ -312,8 +312,13 @@ for d in examples/*/; do
     fi
     # Five examples need an auth signing keypair too; their setup.sh makes it.
     if [ ! -f "$d/keys/auth.pub" ]; then
-        openssl ecparam -name prime256v1 -genkey -noout -out "$d/keys/auth.pem" 2>/dev/null
-        openssl ec -in "$d/keys/auth.pem" -pubout -out "$d/keys/auth.pub" 2>/dev/null
+        # PKCS#8 (`genpkey`), not SEC1 (`ecparam -genkey`). m6-auth-server
+        # refuses SEC1 with "invalid private key (tried EC and RSA):
+        # InvalidKeyFormat" and exits, and pre-creating one here made dev.sh
+        # skip generating a good one — 33 of 98 checks failed with 502s
+        # because the auth server was never up.
+        openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$d/keys/auth.pem" 2>/dev/null
+        openssl pkey -in "$d/keys/auth.pem" -pubout -out "$d/keys/auth.pub" 2>/dev/null
         chmod 600 "$d/keys/auth.pem" 2>/dev/null || true
     fi
 done
