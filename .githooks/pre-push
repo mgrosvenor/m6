@@ -20,6 +20,25 @@
 #
 # Bypass with --no-verify only if you can say out loud why, and expect the
 # next person to find it in the history.
+#
+# ── Read every ref BEFORE running anything slow ──────────────────────────────
+#
+# This used to `exec check.sh` from inside the `while read` loop, and that broke
+# pushing outright: **git died with SIGPIPE (exit 141) and no error message.**
+#
+# `exec` replaces the hook process, so git's stdin pipe -- the one it is writing
+# the ref list down -- was inherited by check.sh, which never reads it. git wrote
+# to a pipe with nobody listening, got EPIPE, and was killed by SIGPIPE. From the
+# outside it looked exactly like a push that silently did nothing: check.sh
+# printed "All checks passed", and the remote never moved. It took four failed
+# pushes and a `--no-verify --dry-run` to establish that the hook was the cause
+# rather than the network, the credentials or the refusal logic.
+#
+# `exec` inside the loop was also wrong on its own terms: it left every ref after
+# the first unvalidated, so a push of two branches at once only ever checked one.
+#
+# So: drain stdin completely, decide, and only then run the checks -- once, with
+# stdin from /dev/null so nothing downstream can inherit git's pipe.
 
 set -uo pipefail
 REPO="$(git rev-parse --show-toplevel)"
@@ -28,7 +47,17 @@ refuse() { echo -e "${RED}pre-push refused:${RESET} $*" >&2; exit 1; }
 note()   { echo -e "${YELLOW}----${RESET} $*"; }
 
 # git feeds the hook one line per ref: <local ref> <local sha> <remote ref> <remote sha>
-while read -r local_ref local_sha remote_ref remote_sha; do
+# Read all of them first. Nothing slow happens until stdin is at EOF.
+refs=()
+while read -r line; do
+  [[ -n "$line" ]] && refs+=("$line")
+done
+
+run_checks=0
+checks_for=""
+
+for entry in "${refs[@]}"; do
+  read -r local_ref local_sha remote_ref remote_sha <<< "$entry"
   [[ -z "${local_ref:-}" ]] && continue
   # A deletion. Not this hook's business.
   [[ "$local_sha" =~ ^0+$ ]] && continue
@@ -67,8 +96,8 @@ while read -r local_ref local_sha remote_ref remote_sha; do
 
   Use:  ./tools/merge.sh <branch>"
       fi
-      note "pushing develop; running the local checks"
-      exec "$REPO/check.sh" --no-bench
+      run_checks=1
+      checks_for="develop"
       ;;
 
     "")
@@ -86,9 +115,18 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   Types: feat fix perf docs refactor test chore
   Create one with:  ./tools/branch.sh <issue> <slug>"
       fi
-      note "pushing work branch $branch; running the local checks"
-      exec "$REPO/check.sh" --no-bench
+      run_checks=1
+      checks_for="${checks_for:+$checks_for }$branch"
       ;;
   esac
 done
+
+if [[ $run_checks -eq 1 ]]; then
+  note "pushing $checks_for; running the local checks"
+  # `< /dev/null`, and not `exec`: see the note at the top of this file. git's
+  # stdin pipe must not outlive this hook's reading of it.
+  "$REPO/check.sh" --no-bench < /dev/null
+  exit $?
+fi
+
 exit 0
