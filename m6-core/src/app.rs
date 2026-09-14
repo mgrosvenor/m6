@@ -2156,9 +2156,31 @@ pub struct Invocation {
 /// refused deploy.
 fn parse_invocation(routes: &[(String, RouteMethod)], handlers: &[String]) -> Invocation {
     let args: Vec<String> = std::env::args().collect();
+
+    // `--version` before the argument-count check, because it takes no site
+    // directory and no config. A deploy needs it: the only way to close the
+    // config-and-binary ordering hazard is to install both together and then
+    // assert what is actually on the node, and that assertion needs the binary to
+    // be able to say what it is. Unknown config keys are ignored rather than
+    // refused (see `docs/m6-site-toml.md`), so a version floor written into a
+    // config cannot protect an older binary from it -- the old binary skips the
+    // key. Asking the binary is the only thing that works.
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        // The program's own name, from argv[0], not `CARGO_PKG_NAME`. That macro
+        // expands where it is written, which is m6-core, so every service would
+        // announce itself as "m6-core" and a deploy log would not say which binary
+        // it had just checked.
+        let name = std::path::Path::new(&args[0])
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("m6");
+        println!("{} {}", name, env!("CARGO_PKG_VERSION"));
+        std::process::exit(0);
+    }
+
     if args.len() < 3 {
         eprintln!(
-            "Usage: {} <site-dir> <config-path> [--log-level LEVEL] [--dump-config]",
+            "Usage: {} <site-dir> <config-path> [--log-level LEVEL] [--dump-config] [--version]",
             args[0]
         );
         std::process::exit(2);
