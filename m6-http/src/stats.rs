@@ -230,14 +230,43 @@ pub struct Stats {
     window_cache_misses: u64,
     window_backend_errors: u64,
 
-    // Raw latency samples — ring buffers, one per category
+    // Raw latency samples — ring buffers, one per category.
+    //
+    // ── These are NOT reset on emit, and that is the fix for a real defect ──
+    //
+    // They used to be. `maybe_emit` set every `_idx` and `_count` back to 0
+    // every ten seconds, and `snapshot()` -- which is what `/perf` serves --
+    // read those same fields. So `/perf` reported the percentiles of whatever
+    // fraction of a ten-second window happened to be open when it was scraped.
+    //
+    // **On a site taking a couple of requests a minute that is almost always
+    // nothing.** Observed on origin, 2026-09-14: `cache_hits_total: 338` beside
+    // `hit_samples: 0, hit_p50_ns: 0, hit_p99_ns: 0`. m6-monitor faithfully
+    // turned zero samples into `null`, so the fleet digest carried no latency
+    // at all, on any node, and never had. The one number the monitor exists to
+    // trend was structurally absent, while the periodic log ten lines above was
+    // printing 3,878ns for the same counter.
+    //
+    // So the ring now runs as a ring: never cleared, wrapping at RESERVOIR,
+    // holding the most recent samples however long they took to arrive.
+    // `snapshot()` reads all of it. The periodic log still reports its own
+    // ten-second window, from `*_window_added` below, so the operational
+    // logging is unchanged -- which is what `snapshot()`'s own comment was
+    // protecting when it declined to reset. Declining to reset was right; also
+    // reading the window the emitter reset was the bug.
+    //
+    // No extra memory and no extra work on the request path: one reservoir,
+    // one store per sample, exactly as before.
     hit_samples: Box<[u64; RESERVOIR]>,
     hit_idx: usize,
-    hit_count: usize, // capped at RESERVOIR
+    hit_count: usize, // total held, capped at RESERVOIR
+    /// Samples added since the last emit. The periodic log's window.
+    hit_window_added: usize,
 
     miss_samples: Box<[u64; RESERVOIR]>,
     miss_idx: usize,
     miss_count: usize,
+    miss_window_added: usize,
 
     // ── Monitoring endpoints, accounted separately ────────────────────────
     //
@@ -258,6 +287,7 @@ pub struct Stats {
     monitor_samples: Box<[u64; RESERVOIR]>,
     monitor_idx: usize,
     monitor_count: usize,
+    monitor_window_added: usize,
 
     /// Per (version, interface) breakdown. Fixed-size dense table rather than
     /// a map: six entries, indexed arithmetically, no allocation and no hash
@@ -297,14 +327,17 @@ impl Stats {
             hit_samples: Box::new([0u64; RESERVOIR]),
             hit_idx: 0,
             hit_count: 0,
+            hit_window_added: 0,
             miss_samples: Box::new([0u64; RESERVOIR]),
             miss_idx: 0,
             miss_count: 0,
+            miss_window_added: 0,
             monitor_requests_total: 0,
             window_monitor_requests: 0,
             monitor_samples: Box::new([0u64; RESERVOIR]),
             monitor_idx: 0,
             monitor_count: 0,
+            monitor_window_added: 0,
             channels: (0..CHANNELS).map(|_| ChannelStats::new()).collect(),
             status_counts: Box::new([0u64; 500]),
             rps_peak: 0,
@@ -345,6 +378,7 @@ impl Stats {
                 if self.monitor_count < RESERVOIR {
                     self.monitor_count += 1;
                 }
+                self.monitor_window_added += 1;
             }
             return;
         }
@@ -376,6 +410,7 @@ impl Stats {
                 if self.hit_count < RESERVOIR {
                     self.hit_count += 1;
                 }
+                self.hit_window_added += 1;
             } else {
                 self.cache_misses_total += 1;
                 self.window_cache_misses += 1;
@@ -384,6 +419,7 @@ impl Stats {
                 if self.miss_count < RESERVOIR {
                     self.miss_count += 1;
                 }
+                self.miss_window_added += 1;
             }
         } else if cache_hit {
             self.cache_hits_total += 1;
@@ -420,9 +456,28 @@ impl Stats {
             0.0
         };
 
-        let (hp0, hp50, hp99, hp100) = percentiles(&self.hit_samples, self.hit_count);
-        let (mp0, mp50, mp99, mp100) = percentiles(&self.miss_samples, self.miss_count);
-        let (_, kp50, kp99, _) = percentiles(&self.monitor_samples, self.monitor_count);
+        // THIS WINDOW only, which is what a periodic line means. `*_window_added`
+        // rather than `*_count`: the reservoirs are no longer cleared here, so
+        // the count is everything the ring holds and would turn each line into a
+        // running average.
+        let (hp0, hp50, hp99, hp100) = percentiles_ring(
+            &self.hit_samples,
+            self.hit_idx,
+            self.hit_count,
+            self.hit_window_added,
+        );
+        let (mp0, mp50, mp99, mp100) = percentiles_ring(
+            &self.miss_samples,
+            self.miss_idx,
+            self.miss_count,
+            self.miss_window_added,
+        );
+        let (_, kp50, kp99, _) = percentiles_ring(
+            &self.monitor_samples,
+            self.monitor_idx,
+            self.monitor_count,
+            self.monitor_window_added,
+        );
 
         tracing::info!(
             requests = self.requests_total,
@@ -433,10 +488,19 @@ impl Stats {
             cache_hit_rate = format_args!("{:.4}", cache_hit_rate),
             backend_errors = self.window_backend_errors,
             pool_members = pool_members,
+            // The sample count beside the percentiles, not just the numbers.
+            // `hit_p50_ns` is load-dependent (docs/PERFORMANCE.md §4: 3,900ns at
+            // 50-70 hits in a window, 1,064ns at ~1,200), so a percentile with no
+            // count attached cannot be compared to anything, and a p50 over one
+            // sample reads exactly like a p50 over a thousand. This is also not
+            // the same number as `cache_hits`: a request timed at 0ns is counted
+            // as a hit and contributes no sample.
+            hit_samples = self.hit_window_added,
             hit_p0_ns = hp0,
             hit_p50_ns = hp50,
             hit_p99_ns = hp99,
             hit_max_ns = hp100,
+            miss_samples = self.miss_window_added,
             miss_p0_ns = mp0,
             miss_p50_ns = mp50,
             miss_p99_ns = mp99,
@@ -451,18 +515,17 @@ impl Stats {
             "periodic stats"
         );
 
-        // Reset window
+        // Reset the window COUNTERS. The reservoirs are deliberately left alone:
+        // see the note on `hit_samples`. Clearing `hit_idx`/`hit_count` here is
+        // what left `/perf` with nothing to report, on every node, permanently.
         self.window_requests = 0;
         self.window_cache_hits = 0;
         self.window_cache_misses = 0;
         self.window_backend_errors = 0;
-        self.hit_idx = 0;
-        self.hit_count = 0;
-        self.miss_idx = 0;
-        self.miss_count = 0;
         self.window_monitor_requests = 0;
-        self.monitor_idx = 0;
-        self.monitor_count = 0;
+        self.hit_window_added = 0;
+        self.miss_window_added = 0;
+        self.monitor_window_added = 0;
         self.window_start = now;
         self.last_emit = now;
     }
@@ -476,10 +539,37 @@ impl Stats {
     /// window and the periodic stats log would report only the traffic that
     /// arrived between scrapes. A monitor polling every 30 seconds would
     /// silently gut the operational logging it exists to complement.
+    ///
+    /// **That reasoning was right and incomplete, and the gap was the defect.**
+    /// Not resetting was correct; reading the window that `maybe_emit` DID reset
+    /// was not. `/perf` served the percentiles of a partial ten-second window,
+    /// which on a site taking a couple of requests a minute is almost always
+    /// empty, so it reported zeros and m6-monitor showed `null` latency on every
+    /// node. See the note on `hit_samples`.
+    ///
+    /// The percentiles here now span **the most recent up to `RESERVOIR`
+    /// samples, not a period of time.** On a quiet node that can reach back
+    /// hours and will blend idle and busy traffic, which matters because this
+    /// number is load-dependent (`docs/PERFORMANCE.md` §4). `hit_samples` is
+    /// reported beside it for exactly that reason: it is the only thing that
+    /// makes the percentile interpretable, and zero samples means "not
+    /// measured" rather than "zero nanoseconds". For the fine-grained view, the
+    /// periodic log still reports per-window figures every ten seconds.
     pub fn snapshot(&self) -> StatsSnapshot {
-        let (_, hp50, hp99, hmax) = percentiles(&self.hit_samples, self.hit_count);
-        let (_, mp50, mp99, mmax) = percentiles(&self.miss_samples, self.miss_count);
-        let (_, kp50, kp99, _) = percentiles(&self.monitor_samples, self.monitor_count);
+        let (_, hp50, hp99, hmax) =
+            percentiles_ring(&self.hit_samples, self.hit_idx, self.hit_count, RESERVOIR);
+        let (_, mp50, mp99, mmax) = percentiles_ring(
+            &self.miss_samples,
+            self.miss_idx,
+            self.miss_count,
+            RESERVOIR,
+        );
+        let (_, kp50, kp99, _) = percentiles_ring(
+            &self.monitor_samples,
+            self.monitor_idx,
+            self.monitor_count,
+            RESERVOIR,
+        );
         StatsSnapshot {
             requests_total: self.requests_total,
             cache_hits_total: self.cache_hits_total,
@@ -552,11 +642,37 @@ fn percentiles_n(samples: &[u64], n: usize) -> (u64, u64, u64, u64) {
 }
 
 /// Sort the first `n` samples and return exact (p0, p50, p99, p100).
-fn percentiles(samples: &[u64; RESERVOIR], n: usize) -> (u64, u64, u64, u64) {
+/// Percentiles over the `take` most recently written entries of a ring buffer.
+///
+/// `idx` is where the next write will go, so the newest sample is at `idx - 1`
+/// and the run of `take` newest ends there. `held` caps it: a ring that has seen
+/// fewer samples than `take` has only what it has.
+///
+/// This replaced a version that read `samples[..n]` from the front. That was
+/// correct only while `maybe_emit` reset `idx` to 0 every ten seconds, which is
+/// the reset that made `/perf` report nothing. Reading from the front of a ring
+/// that genuinely wraps would silently report the OLDEST samples as if they were
+/// the window, so the two changes had to go together.
+///
+/// Returns `(p0, p50, p99, p100)`, and `(0, 0, 0, 0)` when there is nothing to
+/// measure. The caller reports the sample count beside these, which is what
+/// distinguishes "0 ns" from "not measured" -- a distinction this endpoint
+/// needs, because it had been reporting the first while meaning the second.
+fn percentiles_ring(
+    samples: &[u64; RESERVOIR],
+    idx: usize,
+    held: usize,
+    take: usize,
+) -> (u64, u64, u64, u64) {
+    let n = take.min(held).min(RESERVOIR);
     if n == 0 {
         return (0, 0, 0, 0);
     }
-    let mut buf: Vec<u64> = samples[..n].to_vec();
+    let mut buf: Vec<u64> = Vec::with_capacity(n);
+    // Walk back from the newest. `+ RESERVOIR` keeps the subtraction in usize.
+    for k in 1..=n {
+        buf.push(samples[(idx + RESERVOIR - k) & (RESERVOIR - 1)]);
+    }
     buf.sort_unstable();
     let p0 = buf[0];
     let p50 = buf[(n - 1) * 50 / 100];
@@ -675,7 +791,8 @@ mod tests {
                 "m6-html",
             );
         }
-        let (p0, p50, p99, p100) = percentiles(&s.hit_samples, s.hit_count);
+        let (p0, p50, p99, p100) =
+            percentiles_ring(&s.hit_samples, s.hit_idx, s.hit_count, RESERVOIR);
         assert_eq!(p0, 1);
         assert_eq!(p50, 50);
         assert_eq!(p99, 99);
@@ -949,5 +1066,188 @@ mod backend_error_attribution_tests {
             s.record(1_000, true, 500, ch(), "cache");
         }
         assert_eq!(s.snapshot().backend_errors_total, 0);
+    }
+}
+
+/// `/perf` must report the latency it measured, not the latency of whichever
+/// ten-second window happened to be open when it was scraped.
+///
+/// ## The defect these cover
+///
+/// `maybe_emit` reset `hit_idx` and `hit_count` to 0 every ten seconds, and
+/// `snapshot()` -- which is what `/perf` serves -- read those same fields. On a
+/// site taking a couple of requests a minute, almost every ten-second window
+/// holds no cache hit at all, so `/perf` reported zeros essentially always.
+///
+/// Observed on origin, 2026-09-14: `cache_hits_total: 338` beside `hit_samples: 0,
+/// hit_p50_ns: 0, hit_p99_ns: 0`. m6-monitor turned zero samples into `null`,
+/// so the fleet digest carried NO LATENCY FOR ANY NODE and never had, while the
+/// periodic log was printing 3,878ns for the same counter in the same minute.
+///
+/// Nothing caught it because every existing test recorded samples and read them
+/// back **without an emit in between**, which is the one ordering where the old
+/// code was correct. `an_emit_does_not_erase_what_perf_reports` is the test that
+/// was missing, and it fails against the old implementation.
+#[cfg(test)]
+mod perf_reservoir_tests {
+    use super::*;
+
+    fn hit(s: &mut Stats, ns: u64) {
+        s.record(
+            ns,
+            true,
+            200,
+            Channel::new(Version::Http2, Iface::External),
+            "cache",
+        );
+    }
+
+    /// The regression test. An emit between the traffic and the scrape used to
+    /// leave `/perf` with nothing.
+    #[test]
+    fn an_emit_does_not_erase_what_perf_reports() {
+        let mut s = Stats::new();
+        for ns in [1_000, 2_000, 3_000, 4_000, 5_000] {
+            hit(&mut s, ns);
+        }
+        // Force the window boundary the emitter would hit on a timer.
+        s.last_emit = Instant::now() - std::time::Duration::from_secs(EMIT_INTERVAL_SECS + 1);
+        s.maybe_emit(1);
+
+        let snap = s.snapshot();
+        assert_eq!(
+            snap.hit_samples, 5,
+            "the emit cleared the reservoir /perf reads. This is the defect: \
+             m6-monitor showed null latency on every node because of it."
+        );
+        assert!(
+            snap.hit_p50_ns > 0,
+            "hit_p50_ns is {} with 5 samples recorded",
+            snap.hit_p50_ns
+        );
+        assert_eq!(snap.hit_max_ns, 5_000);
+        // The cumulative counter was never the problem and must not change.
+        assert_eq!(snap.cache_hits_total, 5);
+    }
+
+    /// The periodic log keeps its per-window meaning, which is the property
+    /// `snapshot()`'s comment was protecting when it declined to reset.
+    ///
+    /// Checked through the window counter the log reports rather than by
+    /// capturing tracing output: after an emit the window is empty, and new
+    /// traffic lands in the next window only.
+    #[test]
+    fn the_periodic_window_still_only_covers_its_own_window() {
+        let mut s = Stats::new();
+        for ns in [10, 20, 30] {
+            hit(&mut s, ns);
+        }
+        assert_eq!(s.hit_window_added, 3);
+
+        s.last_emit = Instant::now() - std::time::Duration::from_secs(EMIT_INTERVAL_SECS + 1);
+        s.maybe_emit(1);
+        assert_eq!(
+            s.hit_window_added, 0,
+            "the window counter must reset on emit, or every periodic line \
+             becomes a running average instead of a window"
+        );
+
+        hit(&mut s, 40);
+        assert_eq!(
+            s.hit_window_added, 1,
+            "new traffic belongs to the new window"
+        );
+        // And the ring kept everything, which is what /perf now reads.
+        assert_eq!(s.snapshot().hit_samples, 4);
+    }
+
+    /// The window view and the `/perf` view genuinely differ after an emit.
+    ///
+    /// Both are computed from one reservoir now, so this is what proves the two
+    /// readers are not accidentally sharing an answer.
+    #[test]
+    fn the_window_and_the_lifetime_view_differ() {
+        let mut s = Stats::new();
+        for _ in 0..10 {
+            hit(&mut s, 1_000);
+        }
+        s.last_emit = Instant::now() - std::time::Duration::from_secs(EMIT_INTERVAL_SECS + 1);
+        s.maybe_emit(1);
+        // A slow second window.
+        for _ in 0..10 {
+            hit(&mut s, 9_000);
+        }
+
+        let window = percentiles_ring(&s.hit_samples, s.hit_idx, s.hit_count, s.hit_window_added);
+        assert_eq!(
+            window.1, 9_000,
+            "the window should see only the slow samples"
+        );
+        let snap = s.snapshot();
+        assert_eq!(snap.hit_samples, 20, "/perf should see both windows");
+        assert!(
+            snap.hit_p50_ns >= 1_000 && snap.hit_p50_ns <= 9_000,
+            "lifetime p50 {} should sit between the two regimes",
+            snap.hit_p50_ns
+        );
+    }
+
+    /// Reading a wrapped ring must return the NEWEST samples, not the oldest.
+    ///
+    /// The old `percentiles` read `samples[..n]` from the front, which was only
+    /// correct because the index was reset to 0 every window. Against a ring
+    /// that genuinely wraps -- which it now does -- reading from the front
+    /// reports the oldest samples as if they were current, so this had to change
+    /// with the reset and is the half that would fail silently.
+    #[test]
+    fn a_wrapped_ring_reports_the_newest_samples() {
+        let mut s = Stats::new();
+        // Fill the ring with a slow value, then overwrite it all with a fast one.
+        for _ in 0..RESERVOIR {
+            hit(&mut s, 9_999);
+        }
+        assert_eq!(s.snapshot().hit_samples, RESERVOIR);
+        assert_eq!(s.snapshot().hit_p50_ns, 9_999);
+
+        for _ in 0..RESERVOIR {
+            hit(&mut s, 111);
+        }
+        let snap = s.snapshot();
+        assert_eq!(snap.hit_samples, RESERVOIR, "the ring is capped, not grown");
+        assert_eq!(
+            snap.hit_p50_ns, 111,
+            "a wrapped ring reported stale samples as current"
+        );
+        assert_eq!(snap.cache_hits_total, (RESERVOIR * 2) as u64);
+    }
+
+    /// Zero samples must stay distinguishable from zero nanoseconds.
+    ///
+    /// `tools/conformance.sh`'s rule: a check that cannot measure must fail
+    /// rather than print a number it did not take. The percentile is 0 when
+    /// there is nothing to measure, so `hit_samples` is what carries the
+    /// difference, and it has to be reported for the number to mean anything.
+    #[test]
+    fn no_samples_is_reported_as_no_samples() {
+        let snap = Stats::new().snapshot();
+        assert_eq!(snap.hit_samples, 0);
+        assert_eq!(snap.hit_p50_ns, 0);
+        assert_eq!(snap.cache_hits_total, 0);
+    }
+
+    /// A request timed at 0ns counts as a hit and contributes no sample, so the
+    /// two numbers legitimately differ and neither is a substitute for the other.
+    #[test]
+    fn a_zero_nanosecond_request_counts_but_does_not_sample() {
+        let mut s = Stats::new();
+        hit(&mut s, 0);
+        hit(&mut s, 5_000);
+        let snap = s.snapshot();
+        assert_eq!(snap.cache_hits_total, 2);
+        assert_eq!(
+            snap.hit_samples, 1,
+            "the 0ns request must not enter the reservoir"
+        );
+        assert_eq!(snap.hit_p50_ns, 5_000);
     }
 }
