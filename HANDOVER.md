@@ -134,6 +134,17 @@ not compile at all, and underneath that were five more defects nobody could see.
 Read lesson 41. `M6_SKIP_EXAMPLES=1` runs without it and says what that leaves
 unchecked.
 
+**It earned itself within the hour.** The first Linux run found that
+`Request::touch` -- m6's documented way for a renderer to invalidate the edge --
+had never worked on Linux, because `utimensat` reports `IN_ATTRIB` and the
+inotify mask did not ask for it. Four watcher tests passed throughout, because
+every one of them wrote bytes. Lesson 44.
+
+**GitHub Actions runs the examples too**, as the `examples` job in
+`.github/workflows/ci.yml`, and `m6-examples` has its own workflow building the
+other direction against m6's `develop`. Before 2026-09-14 neither existed, so a
+push could break every example and CI stayed green.
+
 ### How to write for the owner
 
 - **No em dashes.**

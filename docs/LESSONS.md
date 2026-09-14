@@ -391,3 +391,40 @@ New 2026-09-12:
     of this script started. The general rule: **a cleanup must be able to name
     what it owns.** If it can only describe what it wants to kill, it will kill
     somebody else's.
+
+44. **A test that changes the file's contents cannot tell you whether a
+    timestamp-only change is noticed.** `Request::touch` is m6-core's documented
+    way for a renderer to invalidate the edge: write the content, then touch
+    `site.toml`. On Linux it had never worked, and four watcher tests passed
+    throughout.
+
+    It called `filetime::set_file_times`, which is `utimensat(2)` with no open.
+    That reports `IN_ATTRIB`. The inotify mask asked for
+    `IN_CLOSE_WRITE | IN_CREATE | IN_MOVED_TO`, so the event arrived, was read,
+    and was discarded. The mtime-polling fallback that would have caught it runs
+    only when there is no watcher fd, and on Linux there always is one.
+
+    Every existing watcher test wrote bytes, so every one of them produced
+    `IN_CLOSE_WRITE` and passed against a mask that could not see the case the
+    function actually used. The new test writes nothing on purpose, and reverting
+    the mask in place on a Linux box confirmed it discriminates: five passed with
+    the flag, four passed and one failed without it.
+
+    Two things worth separating here.
+
+    **The obvious one: it worked on macOS.** kqueue registers the watched files
+    themselves and reports the attribute change, so the machine the code was
+    written on had nothing to show, while the platform that serves production was
+    broken. That is the same shape as lesson 33 and it will keep recurring.
+
+    **The one that matters more: `m6-md --touch` worked the whole time.** Its own
+    `touch_file` opens the file for write, so blog publishing was fine. One of two
+    implementations of the same idea was correct, the working one was the one in
+    daily use, and the broken one was the one m6 tells other people to use. **A
+    second implementation of a documented mechanism is where the documented
+    mechanism goes to rot**, because the copy that gets exercised is not the copy
+    that gets recommended.
+
+    It was found the hour after m6's checks started building the examples, which
+    is lesson 41 arriving on time: the examples are the only code in the checks
+    that uses m6 the way a reader would.
