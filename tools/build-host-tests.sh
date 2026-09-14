@@ -297,6 +297,29 @@ echo "EG_TEST_STATUS=$?"
 grep -E '^test result:' /tmp/eg-tests.log || true
 sed -n '/^failures:/,$p' /tmp/eg-tests.log | head -40
 
+echo "### development certificates"
+# A fresh checkout has no keys/: they are gitignored, and each example's dev.sh
+# generates them. The config parse below validates that tls_cert exists, so
+# without this every example is rejected for a missing file. This passed here only
+# because rsync carried the developer's own untracked keys.
+for d in examples/*/; do
+    [ -f "$d/dev.sh" ] || continue
+    mkdir -p "$d/keys"
+    if [ ! -f "$d/keys/dev.pem" ]; then
+        openssl req -x509 -newkey rsa:2048 -sha256 -days 365 -nodes \
+            -keyout "$d/keys/dev-key.pem" -out "$d/keys/dev.pem" \
+            -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" 2>/dev/null
+    fi
+    # Five examples need an auth signing keypair too; their setup.sh makes it.
+    if [ ! -f "$d/keys/auth.pub" ]; then
+        openssl ecparam -name prime256v1 -genkey -noout -out "$d/keys/auth.pem" 2>/dev/null
+        openssl ec -in "$d/keys/auth.pem" -pubout -out "$d/keys/auth.pub" 2>/dev/null
+        chmod 600 "$d/keys/auth.pem" 2>/dev/null || true
+    fi
+done
+mkdir -p examples/09-global-deployment/certs
+echo "certificates present"
+
 echo "### every example's config parses"
 # m6-file's config schema changed and ten example configs were left naming no
 # handler, so the service exited 2 before binding and every asset 502'd. Parsing
