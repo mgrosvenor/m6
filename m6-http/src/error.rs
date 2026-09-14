@@ -162,6 +162,63 @@ pub fn make_error_response(
     }
 }
 
+/// Headers that must survive an error-page substitution.
+///
+/// When a backend answers 4xx or 5xx, `apply_error_mode` replaces the whole
+/// response with this server's own error page, which throws the backend's header
+/// block away. For nearly every header that is right: they describe a body that
+/// is no longer being sent.
+///
+/// These four are not about the body at all. They tell the client what to do
+/// next, and three of them are required:
+///
+///   - `WWW-Authenticate`   MUST be sent on 401 (RFC 9110 11.6.1)
+///   - `Proxy-Authenticate` MUST be sent on 407 (RFC 9110 11.7.1)
+///   - `Allow`              MUST be sent on 405 (RFC 9110 10.2.1)
+///   - `Retry-After`        says when to come back (RFC 9110 10.2.3)
+///
+/// Dropping the first three turns a conformant backend response into a
+/// non-conformant proxy response, and the client cannot recover because the one
+/// header telling it how is the one that went missing.
+///
+/// Found by the CMS example's end-to-end test. m6-auth-server answers a
+/// throttled login with `429` and `Retry-After: 60`; what reached the client was
+/// a generic "An unexpected error occurred" page carrying no `Retry-After`, so
+/// nothing downstream could know when to try again. The throttle worked and was
+/// unusable.
+pub const PRESERVED_ERROR_HEADERS: &[&str] = &[
+    "retry-after",
+    "www-authenticate",
+    "proxy-authenticate",
+    "allow",
+];
+
+/// Copy the actionable headers from a backend's error response onto the error
+/// page that replaces it.
+///
+/// Anything the error page set for itself wins: this fills gaps and never
+/// overwrites, so a proxy-generated `Retry-After` is not replaced by a
+/// backend's.
+pub fn preserve_actionable_headers(
+    backend_headers: &[(String, String)],
+    page_headers: &mut Vec<(String, String)>,
+) {
+    for name in PRESERVED_ERROR_HEADERS {
+        if page_headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case(name))
+        {
+            continue;
+        }
+        if let Some((k, v)) = backend_headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        {
+            page_headers.push((k.clone(), v.clone()));
+        }
+    }
+}
+
 pub fn status_reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
@@ -267,5 +324,112 @@ mod tests {
         assert!(s.contains("503"));
         assert!(s.contains("Service Unavailable"));
         assert!(s.starts_with("<!DOCTYPE html>"));
+    }
+
+    // ── Headers that survive an error-page substitution ──────────────────────
+    //
+    // The defect these cover: the CMS example's throttled login answered 429
+    // with `Retry-After: 60` from m6-auth-server, and the client received the
+    // proxy's generic error page with no `Retry-After` on it at all.
+
+    fn h(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn value_of(headers: &[(String, String)], name: &str) -> Option<String> {
+        headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+    }
+
+    #[test]
+    fn retry_after_survives_the_error_page() {
+        let backend = h(&[("Retry-After", "60"), ("Content-Type", "application/json")]);
+        let mut page = h(&[("Content-Type", "text/html; charset=utf-8")]);
+        preserve_actionable_headers(&backend, &mut page);
+        assert_eq!(value_of(&page, "retry-after").as_deref(), Some("60"));
+    }
+
+    /// The backend's Content-Type describes a body that is no longer being sent,
+    /// so it must NOT come across: the page is HTML, not the backend's JSON.
+    #[test]
+    fn headers_describing_the_discarded_body_do_not_survive() {
+        let backend = h(&[("Content-Type", "application/json"), ("ETag", "\"abc\"")]);
+        let mut page = h(&[("Content-Type", "text/html; charset=utf-8")]);
+        preserve_actionable_headers(&backend, &mut page);
+        assert_eq!(
+            value_of(&page, "content-type").as_deref(),
+            Some("text/html; charset=utf-8")
+        );
+        assert!(value_of(&page, "etag").is_none());
+    }
+
+    /// RFC 9110 11.6.1: a 401 without WWW-Authenticate is not a conformant
+    /// response, so a proxy that drops it makes a correct backend incorrect.
+    #[test]
+    fn www_authenticate_survives_on_401() {
+        let backend = h(&[("WWW-Authenticate", "Bearer realm=\"api\"")]);
+        let mut page = Vec::new();
+        preserve_actionable_headers(&backend, &mut page);
+        assert_eq!(
+            value_of(&page, "www-authenticate").as_deref(),
+            Some("Bearer realm=\"api\"")
+        );
+    }
+
+    /// RFC 9110 10.2.1: Allow is required on 405.
+    #[test]
+    fn allow_survives_on_405() {
+        let backend = h(&[("Allow", "GET, HEAD, POST")]);
+        let mut page = Vec::new();
+        preserve_actionable_headers(&backend, &mut page);
+        assert_eq!(value_of(&page, "allow").as_deref(), Some("GET, HEAD, POST"));
+    }
+
+    #[test]
+    fn proxy_authenticate_survives_on_407() {
+        let backend = h(&[("Proxy-Authenticate", "Basic realm=\"proxy\"")]);
+        let mut page = Vec::new();
+        preserve_actionable_headers(&backend, &mut page);
+        assert!(value_of(&page, "proxy-authenticate").is_some());
+    }
+
+    /// The page's own value wins. A proxy that set its own Retry-After knows
+    /// something the backend does not, so it is not overwritten.
+    #[test]
+    fn the_error_page_wins_where_it_set_the_header_itself() {
+        let backend = h(&[("Retry-After", "60")]);
+        let mut page = h(&[("Retry-After", "5")]);
+        preserve_actionable_headers(&backend, &mut page);
+        assert_eq!(value_of(&page, "retry-after").as_deref(), Some("5"));
+        assert_eq!(
+            page.iter().filter(|(k, _)| k.eq_ignore_ascii_case("retry-after")).count(),
+            1,
+            "no duplicate Retry-After"
+        );
+    }
+
+    /// Header names are case-insensitive (RFC 9110 5.1), and backends do not
+    /// agree on the case they send.
+    #[test]
+    fn matching_ignores_header_case() {
+        let backend = h(&[("rEtRy-AfTeR", "30")]);
+        let mut page = Vec::new();
+        preserve_actionable_headers(&backend, &mut page);
+        assert_eq!(value_of(&page, "retry-after").as_deref(), Some("30"));
+    }
+
+    /// A connection failure leaves no backend headers at all, which must be a
+    /// no-op rather than a panic.
+    #[test]
+    fn no_backend_headers_is_a_no_op() {
+        let mut page = h(&[("Content-Type", "text/html")]);
+        let before = page.len();
+        preserve_actionable_headers(&[], &mut page);
+        assert_eq!(page.len(), before);
     }
 }

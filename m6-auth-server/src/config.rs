@@ -8,6 +8,7 @@ struct RawConfig {
     storage: StorageConfig,
     tokens: Option<TokensConfig>,
     keys: KeysConfig,
+    rate_limit: Option<RateLimitConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -28,6 +29,17 @@ struct KeysConfig {
     public_key: String,
 }
 
+/// `[rate_limit]` — the login throttle, in the config rather than hard-coded.
+///
+/// It was two `const`s in `rate_limit.rs`, which meant a deployment that needed
+/// a different budget had to be recompiled, and a test suite that logs in
+/// repeatedly had no way to ask for room. See `rate_limit::RateLimiter`.
+#[derive(Debug, Deserialize)]
+struct RateLimitConfig {
+    max_attempts: Option<u32>,
+    window_secs: Option<u64>,
+}
+
 /// Parsed and validated auth server configuration.
 /// `[log]` is deliberately absent.
 ///
@@ -43,6 +55,9 @@ pub struct AuthConfig {
     pub issuer: String,
     pub private_key_path: PathBuf,
     pub public_key_path: PathBuf,
+    /// Failed logins allowed per IP per `rate_limit_window_secs`.
+    pub rate_limit_max_attempts: u32,
+    pub rate_limit_window_secs: u64,
 }
 
 impl AuthConfig {
@@ -90,6 +105,17 @@ impl AuthConfig {
         let private_key_path = site_dir.join(&raw.keys.private_key);
         let public_key_path = site_dir.join(&raw.keys.public_key);
 
+        let rl = raw.rate_limit.unwrap_or(RateLimitConfig {
+            max_attempts: None,
+            window_secs: None,
+        });
+        let rate_limit_max_attempts = rl
+            .max_attempts
+            .unwrap_or(crate::rate_limit::DEFAULT_MAX_ATTEMPTS);
+        let rate_limit_window_secs = rl
+            .window_secs
+            .unwrap_or(crate::rate_limit::DEFAULT_WINDOW_SECS);
+
         Ok(AuthConfig {
             db_path,
             access_ttl,
@@ -97,6 +123,8 @@ impl AuthConfig {
             issuer,
             private_key_path,
             public_key_path,
+            rate_limit_max_attempts,
+            rate_limit_window_secs,
         })
     }
 }
