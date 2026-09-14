@@ -164,6 +164,13 @@ fn parse_args(args: &[String]) -> Result<Cli> {
 
     while i < args.len() {
         match args[i].as_str() {
+            // Same reason as the other services: a deploy has to be able to ask
+            // a node which binary is installed, because a version floor written
+            // into a config cannot protect an older binary from it.
+            "--version" | "-V" => {
+                println!("m6-md {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
             "--output" => {
                 i += 1;
                 if i >= args.len() {
