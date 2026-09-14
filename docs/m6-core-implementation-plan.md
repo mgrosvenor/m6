@@ -478,7 +478,7 @@ release notes, because the shrink is the point and should be a number.
 
 The cross-repo path dependency becomes removable once Phase 6 lands.
 
-Today `dr-grosvenor-site/render-*/Cargo.toml` carries
+Today `the deployment repository/render-*/Cargo.toml` carries
 `m6-render = { path = "../../m6/m6-render" }`. That hard-codes a filesystem
 layout across a repo boundary with **no version constraint**, so the site links
 whatever is on disk. `deploy.sh` rsyncs the whole `m6` tree to the builder and

@@ -1,6 +1,6 @@
 //! Which nodes there are, and how to reach them.
 //!
-//! A fleet is configuration, not code. mgrosvenor.com is three nodes named
+//! A fleet is configuration, not code. example.com is three nodes named
 //! syd, lon and chi; that is one deployment of m6 and nothing here knows it.
 
 use std::path::Path;
@@ -134,12 +134,12 @@ timeout_ms = 2000
 
 [[monitor.nodes]]
 name = "syd"
-url  = "http://10.0.0.1:8080"
+url  = "http://192.0.2.1:8080"
 role = "origin"
 
 [[monitor.nodes]]
 name = "lon"
-url  = "http://10.0.0.4:8080"
+url  = "http://192.0.2.4:8080"
 role = "cache"
 "#
         )
@@ -162,7 +162,7 @@ role = "cache"
     #[test]
     fn the_token_is_read_from_a_file_never_from_the_config() {
         let mut tok = tempfile::NamedTempFile::new().unwrap();
-        write!(tok, "s3cret\n").unwrap();
+        writeln!(tok, "s3cret").unwrap();
         let mut f = tempfile::NamedTempFile::new().unwrap();
         write!(
             f,
@@ -183,7 +183,7 @@ role = "cache"
     #[test]
     fn a_node_token_overrides_the_fleet_token() {
         let mut per_node = tempfile::NamedTempFile::new().unwrap();
-        write!(per_node, "node-token\n").unwrap();
+        writeln!(per_node, "node-token").unwrap();
 
         let n = Node {
             name: "lon".into(),
@@ -191,7 +191,10 @@ role = "cache"
             role: "cache".into(),
             perf_token_file: Some(per_node.path().to_string_lossy().to_string()),
         };
-        assert_eq!(n.perf_token(Some("fleet-token")).as_deref(), Some("node-token"));
+        assert_eq!(
+            n.perf_token(Some("fleet-token")).as_deref(),
+            Some("node-token")
+        );
 
         let bare = Node {
             name: "syd".into(),
@@ -199,7 +202,10 @@ role = "cache"
             role: "origin".into(),
             perf_token_file: None,
         };
-        assert_eq!(bare.perf_token(Some("fleet-token")).as_deref(), Some("fleet-token"));
+        assert_eq!(
+            bare.perf_token(Some("fleet-token")).as_deref(),
+            Some("fleet-token")
+        );
         assert_eq!(bare.perf_token(None), None);
     }
 

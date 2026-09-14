@@ -46,18 +46,13 @@ const POLL_TIMEOUT_MS: i32 = 1_000;
 /// so anything that could terminate the header or inject one is rejected
 /// rather than sanitised. A redirect has no reason to accept those.
 fn target_is_safe(t: &str) -> bool {
-    !t.is_empty()
-        && t.len() <= 2048
-        && t.starts_with('/')
-        && !t.contains(['\r', '\n', '\0'])
+    !t.is_empty() && t.len() <= 2048 && t.starts_with('/') && !t.contains(['\r', '\n', '\0'])
 }
 
 /// A `Host` we are willing to echo into a `Location`. Rejects anything that
 /// is not plausibly a hostname, for the same reason as above.
 fn host_is_safe(h: &str) -> bool {
-    !h.is_empty()
-        && h.len() <= 253
-        && !h.contains(['\r', '\n', '\0', '/', '\\', ' '])
+    !h.is_empty() && h.len() <= 253 && !h.contains(['\r', '\n', '\0', '/', '\\', ' '])
 }
 
 /// Every method this listener answers. It redirects them all, so the list is
@@ -65,7 +60,13 @@ fn host_is_safe(h: &str) -> bool {
 const ALLOW: &str = "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS";
 
 fn ready(status: u16, headers: Vec<(String, String)>) -> RequestOutcome {
-    RequestOutcome::Ready(status, headers, Vec::new(), String::new(), Arc::new(Vec::new()))
+    RequestOutcome::Ready(
+        status,
+        headers,
+        Vec::new(),
+        String::new(),
+        Arc::new(Vec::new()),
+    )
 }
 
 /// The whole of the redirect: one status, one header.
@@ -141,9 +142,8 @@ pub fn run(bind: &str) -> anyhow::Result<()> {
     //
     // No wake fd and no socket: this loop parks in `poll` with a one second
     // timeout and re-checks the flag each time round, so it needs neither.
-    let shutdown = m6_core::signal::ShutdownHandle::install(
-        m6_core::signal::Service::new("m6-http-redirect"),
-    );
+    let shutdown =
+        m6_core::signal::ShutdownHandle::install(m6_core::signal::Service::new("m6-http-redirect"));
 
     let mut listener = Http11Listener::bind_plain(bind)?;
     let poller = Poller::new()?;
@@ -168,7 +168,15 @@ pub fn run(bind: &str) -> anyhow::Result<()> {
         listener.drive_all(
             |req, _client_ip| redirect_for(req),
             // No URL backends here, so no pending response can ever arrive.
-            |_resp, _ctx| (500, Vec::new(), Vec::new(), String::new(), Arc::new(Vec::new())),
+            |_resp, _ctx| {
+                (
+                    500,
+                    Vec::new(),
+                    Vec::new(),
+                    String::new(),
+                    Arc::new(Vec::new()),
+                )
+            },
             &poller,
         );
 
@@ -184,7 +192,7 @@ mod tests {
     use super::*;
 
     fn request(method: &str, target: &str) -> HttpRequest {
-        let raw = format!("{method} {target} HTTP/1.1\r\nHost: mgrosvenor.com\r\n\r\n");
+        let raw = format!("{method} {target} HTTP/1.1\r\nHost: example.com\r\n\r\n");
         match m6_core::h1::parse_request(raw.as_bytes()) {
             m6_core::h1::ParseResult::Complete(r) => r,
             _ => panic!("fixture did not parse: {raw:?}"),
@@ -237,13 +245,13 @@ mod tests {
         assert_eq!(status_of(&out), 301);
         assert_eq!(
             header_of(&out, "location").as_deref(),
-            Some("https://mgrosvenor.com/capabilities?v=1")
+            Some("https://example.com/capabilities?v=1")
         );
 
         let out = redirect_for(&request("GET", "http://elsewhere.example/x"));
         assert_eq!(
             header_of(&out, "location").as_deref(),
-            Some("https://mgrosvenor.com/x"),
+            Some("https://example.com/x"),
             "the Location host comes from Host, never from the request target"
         );
     }
@@ -264,7 +272,7 @@ mod tests {
         assert!(!host_is_safe("a/b"));
         assert!(!host_is_safe("a b"));
         assert!(!host_is_safe(""));
-        assert!(host_is_safe("mgrosvenor.com"));
-        assert!(host_is_safe("mgrosvenor.com:8443"));
+        assert!(host_is_safe("example.com"));
+        assert!(host_is_safe("example.com:8443"));
     }
 }

@@ -1,15 +1,79 @@
-# The ledger: what is done, and what is not
+# The ledger: what is done, and what is owed
 
-Rewritten 2026-09-11 after an audit against the commit log rather than from
-memory. Three items here were marked open while already done, and about ten
-pieces of work were not recorded at all.
+**`HANDOVER.md` is what is true. This is what is owed.** Read that first; it is
+written for someone with no prior context.
 
-**`HANDOVER.md` is what is true. This is what is owed.**
+Status block below rewritten 2026-09-13. The sections after it are the detailed
+history, kept because the reasoning in them is usually the only record of why
+something is shaped the way it is.
 
 Ordering principle, the owner's: **m6-core is the PHP of m6, a box of blocks a
-service is assembled from.** Anything we can reasonably expect to generalise to
-other sites and instances belongs in core, and core should be the only thing a
-service links.
+service is assembled from.** Anything that can reasonably be expected to
+generalise belongs in core, and core should be the only thing a service links.
+
+---
+
+## STATUS, 2026-09-13
+
+**Branch state 2026-09-13:** `develop` is at `9abfebe` with the CI work merged
+and everything passing on the build host. `main` is 133 commits behind and
+none of it is deployed.
+
+### The road to 1.0, in agreed order
+
+1.0 is **not cut until the consolidation work is done**. Owner's decision,
+recorded beside the version in `Cargo.toml`.
+
+| # | item | state |
+|---|---|---|
+| 1 | **Drive clippy to zero** | **done 2026-09-13, issue #5.** 0 on both toolchains. `tools/clippy.sh` is now `-D warnings` and the two ceiling files are deleted, so there is no number left to maintain. The per-platform ceiling turned out to be per-clippy-version: 45 findings on the laptop at 0.1.95 against 123 on the build host at 0.1.98, identical source, so `--fix` had to run on the build host. Along the way it found three misattached doc comments and one pre-NLL `drop()`. §4 of HANDOVER.md. |
+| 2 | **quiche 0.26.1 → 0.29.3, re-measure h3** | **done 2026-09-13, issue #4.** Bumped and re-measured on the build host: h3 stayed at 37/49, unmoved by three releases. 0.29.3 is the newest plain release; the higher tags in that repo are tokio-quiche. The twelve are quiche's and **none is reachable through its public API**, so none is fixable in m6. Ten are open upstream bugs with open fix PRs: **#2515** with PR **#2521** for the eight transport parameter cases, **#2526** and **#2652** with PR **#2575** for the two reserved-bit cases. **h3 is now 47/49 and the floor is 47.** m6-http pins `mgrosvenor/quiche` by revision, branch `m6-h3-conformance`, which is quiche master plus PRs #2521 and #2575. Measured both ways first, tag plus cherry-picks and master plus merges, and both scored 47/49; master was taken as the rebasable base. **Drop the fork for a tag once upstream releases those fixes.** The remaining two are QPACK, which is upstream's choice rather than a bug, and are accepted: owner's decision 2026-09-13, "47/49 is good enough, it's not going to block 1.0.0". Everything, including the rebuild recipe and the one merge conflict to expect, is in `tools/conformance-scores.txt`. |
+| 3 | **Renderers onto a git dependency pinned to a tag** | not started. This is Phase 7. Owner's call 2026-09-13: **a git tag, NOT crates.io.** Publishing would mean owning a public API, a name and maintenance for other people. m6-http already takes quiche this way. |
+| 4 | **Phase 8: six `/status` implementations** | **done 2026-09-13, issue #6.** Six examples under `m6-http/tests/backends/`, all conforming, 13 shared tests in the gate (7 on the socket, 6 behind a real edge), Go installed on the build host, and `deploy/run-tests.sh` fails if any runtime is missing. The measurement it existed for: **linking m6-core costs 36% of throughput and +37us p50**, plus 8.8x RSS and 56.7x binary size, reproduced within 3%. `docs/BENCHMARKS.md` has the conditions. It also found five places where normative documents and the code disagree, `docs/m6-backend-examples.md` §10; two of those are decisions for the owner, not tasks. |
+| 5 | **Deploy, lifting the freeze** | blocked on 1-4 and on the m6-file config/binary sequencing. Not a code task. |
+
+### Done in the 2026-09-12 and -13 sessions
+
+Everything here is on `develop` or on the unmerged CI branch. None of it is
+deployed.
+
+| area | what landed |
+|---|---|
+| **Config-driven routes** | `App::handler(name, f)` plus `handler = "..."` on `[[route]]`, rebuilt on every reload. The owner's *"dynamicly reload the file list"*. Unknown handler name is fatal at startup and refuses a reload. |
+| **Both migrations** | `m6-file` and `m6-auth-server` are `App` services. m6-file lost 969 lines including a second router and a second config parser; m6-auth-server's main is 116 lines. |
+| **Streaming bodies** | `Response.body` is `Bytes` or `Stream { len, reader }`. A stream structurally has no bytes for the minifier, compressor or default ETag to touch. |
+| **Copy elimination** | Core's per-request copying went from ~442us to ~1.58us. `m6-core/src/dict.rs` is a shared base plus a per-request overlay. See `docs/PERFORMANCE.md`. |
+| **§3a resolved** | The cache-hit p50 was never a code regression. It is load-dependent. |
+| **`watcher.rs` on `nix`** | Zero `unsafe` in production code, down from 390 lines of raw libc. Retires the alignment UB lesson. |
+| **Real conformance checks** | h1, h2 and h3 all measured, against a two-backend edge. Previously h2 and h3 were skipped silently on every run. |
+| **CI on GitHub Actions** | Every push and PR. Found four real problems on its first three runs. |
+| **Branch model** | `main` releases only, `develop` integration, one branch per issue, enforced by `.githooks/pre-push`. |
+| **Project hygiene** | rustfmt accepted, `cargo deny`, MSRV 1.88 declared and tested, versions aligned at 0.2.0, CHANGELOG by release, CONTRIBUTING and SECURITY. |
+| **§3d decided** | A configured-but-failed bind is fatal; an unconfigured listener is not a bind. |
+| **Production hardening** | `UMask=0027`, `LimitNOFILE=65535` (site repo, undeployed). |
+| **Documentation** | 16 module docs written, `docs/PERFORMANCE.md`, `docs/LESSONS.md`, `docs/SESSION-NOTES.md`, `CLAUDE.md`. |
+
+### Deferred by the owner, not in 1.0
+
+The **event loop** and the **handler contract**, explicitly. The IO layer is in
+scope as low-touch consolidation but is not started. See §3b.
+
+### Still owed, not on the 1.0 path
+
+- `FrameworkState::build_dict` is private; the twelve ordered steps are not
+  reusable by a service not using `App`. §1.
+- `m6-monitor` and the firewall stats collector are deployed nowhere.
+- The deployment's `deploy/health-check.py` cannot be retired until those are
+  deployed and a post-freeze binary is on the nodes. It moved out of m6 on
+  2026-09-14: a generic web system does not carry one fleet's health check.
+- Staging cannot exercise the cache role.
+- The hourly prompt's `hit_p50_ns` baseline is wrong now that §3a is
+  understood. Owner's file to change.
+- Four `cargo deny` advisories whose reachability has never been established
+  (issue #3).
+- GitHub branch protection on `main`.
+
+---
 
 ---
 
@@ -811,9 +875,23 @@ holding something that genuinely differs per request.
 
 ### 5. Phase 8, backend examples
 
-- [ ] Six implementations of the same `/status` payload. Needs Go on the build
-      host. **This phase is also the measurement:** Rust-without-core against
-      Rust-with-core says whether core is worth linking.
+- [x] Six implementations of the same `/status` payload. **DONE 2026-09-13**,
+      issue #6. Go installed on the build host (1.26.0) and on the laptop
+      (1.27.1). All six conform, 13 shared tests run them in the gate, and
+      `deploy/run-tests.sh` fails if a runtime is absent rather than skipping a
+      language silently.
+
+      **The measurement:** linking m6-core costs **-36.8% throughput and
+      +38.5us p50**, with 8.8x resident memory and 56.7x binary size, reproduced
+      within 3% across two runs at concurrency 2 from tmpfs. §5.3 of the examples
+      doc says that if the delta is not close to zero then core has a problem
+      worth knowing about. It is not close to zero, AND it is measured on the
+      shape that maximises it: behind the edge cache most requests never reach a
+      backend. `docs/BENCHMARKS.md` carries the conditions.
+
+      The first attempt reported core as 72% FASTER, because the control spawned
+      a thread per connection while core used a pool. A control that differs from
+      its subject in two ways measures neither.
 
 ### Owed, and easy to lose
 
@@ -859,7 +937,8 @@ holding something that genuinely differs per request.
       The build host is off-fleet, so installing it there breaks no freeze.
 - [ ] **Deploy the firewall stats collector.** Written and unit-tested, on no
       node. Until then `/traffic` reports `firewall: null`.
-- [ ] **Retire `tools/health-check.py`.** Blocked on the two deployments
+- [ ] **Retire the deployment's `deploy/health-check.py`** (it was
+      `tools/health-check.py` here until 2026-09-14). Blocked on the two deployments
       above **and on the freeze**, which the old wording did not say. Measured
       on syd 2026-09-12: `--check` reads `/traffic`, which **404s** on the
       deployed binary, and `/perf`, whose deployed shape is
@@ -906,7 +985,7 @@ here, 15 ahead of `d6ebfa5` in the site repo. The freeze holds until the
 migration finishes; that is the owner's standing instruction.
 
 The deployed commit is whatever the newest entry in
-`~/dr-grosvenor-site/docs/RELEASES.md` names. Recompute from it; the previous
+`the deployment repository/docs/RELEASES.md` names. Recompute from it; the previous
 figure here named `b32e837`, which the 2026-09-10 18:47 deploy had already
 superseded.
 

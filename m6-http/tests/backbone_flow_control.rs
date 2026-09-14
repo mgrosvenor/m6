@@ -107,7 +107,8 @@ fn stub_origin(listener: TcpListener, report: mpsc::Sender<Observed>) {
     }
     let mut out = Vec::new();
     let settings = [
-        0x00, 0x04, // SETTINGS_INITIAL_WINDOW_SIZE
+        0x00,
+        0x04, // SETTINGS_INITIAL_WINDOW_SIZE
         (STUB_INITIAL_WINDOW >> 24) as u8,
         (STUB_INITIAL_WINDOW >> 16) as u8,
         (STUB_INITIAL_WINDOW >> 8) as u8,
@@ -128,8 +129,7 @@ fn stub_origin(listener: TcpListener, report: mpsc::Sender<Observed>) {
     let mut conn_credit: i64 = 65_535;
     let mut req_stream = 0u32;
 
-    loop {
-        let Some(hdr) = read_exact_or_eof(&mut sock, FRAME_HDR) else { break };
+    while let Some(hdr) = read_exact_or_eof(&mut sock, FRAME_HDR) {
         let len = ((hdr[0] as usize) << 16) | ((hdr[1] as usize) << 8) | hdr[2] as usize;
         let ftype = hdr[3];
         let flags = hdr[4];
@@ -199,7 +199,13 @@ fn stub_origin(listener: TcpListener, report: mpsc::Sender<Observed>) {
                 let grant = payload.len() as u32;
                 if grant > 0 {
                     let mut wu = Vec::new();
-                    frame(&mut wu, TYPE_WINDOW_UPDATE, 0, req_stream, &grant.to_be_bytes());
+                    frame(
+                        &mut wu,
+                        TYPE_WINDOW_UPDATE,
+                        0,
+                        req_stream,
+                        &grant.to_be_bytes(),
+                    );
                     frame(&mut wu, TYPE_WINDOW_UPDATE, 0, 0, &grant.to_be_bytes());
                     if sock.write_all(&wu).is_err() {
                         break;
@@ -213,7 +219,11 @@ fn stub_origin(listener: TcpListener, report: mpsc::Sender<Observed>) {
         }
     }
 
-    let _ = report.send(Observed { body, overrun, stalls });
+    let _ = report.send(Observed {
+        body,
+        overrun,
+        stalls,
+    });
 }
 
 /// A body several times the peer's advertised window arrives whole, in order,
@@ -248,7 +258,10 @@ fn a_backbone_body_respects_the_peers_send_window() {
         conn.drive();
         thread::sleep(Duration::from_millis(1));
     }
-    assert!(!conn.is_dead, "connection died during the SETTINGS exchange");
+    assert!(
+        !conn.is_dead,
+        "connection died during the SETTINGS exchange"
+    );
 
     let req = HttpRequest {
         method: "POST".to_string(),

@@ -1,6 +1,14 @@
-/// Minification helpers for HTML, CSS, JSON, and JS content.
-///
-/// Minification is applied BEFORE compression for better ratios.
+//! Minification for HTML, CSS, JSON and JavaScript.
+//!
+//! Applied before compression, and only for types the config enables. Each
+//! function returns the original bytes unchanged if the input does not parse,
+//! so a minifier that cannot understand a file degrades to passing it through
+//! rather than corrupting it.
+//!
+//! Inline `<script>` minification is **off by default** and should stay that
+//! way unless every inline script is a self-contained ES module: the engine
+//! parses scripts as modules, which has different scoping, and it can silently
+//! rewrite valid classic scripts into broken ones.
 
 /// Minify HTML using the `minify-html` crate.
 ///

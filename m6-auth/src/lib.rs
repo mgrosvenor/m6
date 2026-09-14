@@ -1,6 +1,6 @@
 pub mod jwt;
 
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use uuid::Uuid;
@@ -9,26 +9,26 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
-    pub id:         String,
-    pub username:   String,
-    pub roles:      Vec<String>,
-    pub groups:     Vec<String>, // populated by queries that join memberships
+    pub id: String,
+    pub username: String,
+    pub roles: Vec<String>,
+    pub groups: Vec<String>, // populated by queries that join memberships
     pub created_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Group {
-    pub id:      String,
-    pub name:    String,
+    pub id: String,
+    pub name: String,
     pub members: Vec<String>, // usernames, populated by queries that join memberships
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiToken {
-    pub id:         String,
-    pub user_id:    String,
-    pub username:   String,
-    pub name:       String,
+    pub id: String,
+    pub user_id: String,
+    pub username: String,
+    pub name: String,
     pub created_at: i64,
     pub expires_at: i64,
 }
@@ -108,17 +108,24 @@ pub struct Db(Connection);
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
-        conn.execute_batch("
+        conn.execute_batch(
+            "
             PRAGMA journal_mode=WAL;
             PRAGMA busy_timeout=5000;
             PRAGMA foreign_keys=ON;
-        ")?;
+        ",
+        )?;
         conn.execute_batch(SCHEMA)?;
         Ok(Db(conn))
     }
 
-    pub fn close(self) -> std::result::Result<(), (Connection, rusqlite::Error)> {
-        self.0.close()
+    /// Close the database, handing the `Connection` back on failure so the
+    /// caller can retry with it. That is rusqlite's own signature for `close`,
+    /// and it is the reason the error is large: it carries a whole connection.
+    /// Boxed so that size sits on the failure path rather than in every
+    /// `Result` this function returns.
+    pub fn close(self) -> std::result::Result<(), Box<(Connection, rusqlite::Error)>> {
+        self.0.close().map_err(Box::new)
     }
 
     // ── helpers ──────────────────────────────────────────────────────────────
@@ -144,7 +151,13 @@ impl Db {
     ) -> Result<User> {
         let roles: Vec<String> = serde_json::from_str(&roles_json).unwrap_or_default();
         let groups = self.user_groups_by_id(&id)?;
-        Ok(User { id, username, roles, groups, created_at })
+        Ok(User {
+            id,
+            username,
+            roles,
+            groups,
+            created_at,
+        })
     }
 
     // ── User ops ─────────────────────────────────────────────────────────────
@@ -230,9 +243,9 @@ impl Db {
     }
 
     pub fn user_list(&self) -> Result<Vec<User>> {
-        let mut stmt = self.0.prepare(
-            "SELECT id, username, roles, created_at FROM users ORDER BY username",
-        )?;
+        let mut stmt = self
+            .0
+            .prepare("SELECT id, username, roles, created_at FROM users ORDER BY username")?;
         let rows: std::result::Result<Vec<(String, String, String, i64)>, rusqlite::Error> = stmt
             .query_map([], |row| {
                 Ok((
@@ -252,10 +265,9 @@ impl Db {
     }
 
     pub fn user_delete(&self, username: &str) -> Result<()> {
-        let n = self.0.execute(
-            "DELETE FROM users WHERE username = ?1",
-            params![username],
-        )?;
+        let n = self
+            .0
+            .execute("DELETE FROM users WHERE username = ?1", params![username])?;
         if n == 0 {
             return Err(AuthError::UserNotFound(username.to_string()));
         }
@@ -334,7 +346,11 @@ impl Db {
             "INSERT INTO groups (id, name) VALUES (?1, ?2)",
             params![id, name],
         )?;
-        Ok(Group { id, name: name.to_string(), members: vec![] })
+        Ok(Group {
+            id,
+            name: name.to_string(),
+            members: vec![],
+        })
     }
 
     pub fn group_get(&self, name: &str) -> Result<Option<Group>> {
@@ -347,7 +363,11 @@ impl Db {
         match result {
             Ok((id, gname)) => {
                 let members = self.group_member_names_by_id(&id)?;
-                Ok(Some(Group { id, name: gname, members }))
+                Ok(Some(Group {
+                    id,
+                    name: gname,
+                    members,
+                }))
             }
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(AuthError::Db(e)),
@@ -355,9 +375,9 @@ impl Db {
     }
 
     pub fn group_list(&self) -> Result<Vec<Group>> {
-        let mut stmt = self.0.prepare(
-            "SELECT id, name FROM groups ORDER BY name",
-        )?;
+        let mut stmt = self
+            .0
+            .prepare("SELECT id, name FROM groups ORDER BY name")?;
         let rows: std::result::Result<Vec<(String, String)>, rusqlite::Error> = stmt
             .query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -373,10 +393,9 @@ impl Db {
     }
 
     pub fn group_delete(&self, name: &str) -> Result<()> {
-        let n = self.0.execute(
-            "DELETE FROM groups WHERE name = ?1",
-            params![name],
-        )?;
+        let n = self
+            .0
+            .execute("DELETE FROM groups WHERE name = ?1", params![name])?;
         if n == 0 {
             return Err(AuthError::GroupNotFound(name.to_string()));
         }
@@ -441,7 +460,12 @@ impl Db {
 
     // ── Refresh token ops ────────────────────────────────────────────────────
 
-    pub fn refresh_token_store(&self, user_id: &str, token_hash: &str, expires_at: i64) -> Result<()> {
+    pub fn refresh_token_store(
+        &self,
+        user_id: &str,
+        token_hash: &str,
+        expires_at: i64,
+    ) -> Result<()> {
         self.0.execute(
             "INSERT OR REPLACE INTO refresh_tokens (token_hash, user_id, expires_at) VALUES (?1, ?2, ?3)",
             params![token_hash, user_id, expires_at],
@@ -505,7 +529,14 @@ impl Db {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![id, user_id, name, token_hash, created_at, expires_at],
         )?;
-        Ok(ApiToken { id, user_id: user_id.to_string(), username: username.to_string(), name: name.to_string(), created_at, expires_at })
+        Ok(ApiToken {
+            id,
+            user_id: user_id.to_string(),
+            username: username.to_string(),
+            name: name.to_string(),
+            created_at,
+            expires_at,
+        })
     }
 
     pub fn api_token_list(&self, username: &str) -> Result<Vec<ApiToken>> {
@@ -514,7 +545,11 @@ impl Db {
             "SELECT id, user_id, name, created_at, expires_at
              FROM api_tokens WHERE user_id = ?1 ORDER BY created_at DESC",
         )?;
-        let rows: std::result::Result<Vec<(String, String, String, i64, i64)>, rusqlite::Error> = stmt
+        /// One `api_tokens` row as the query returns it: id, user_id, name,
+        /// created_at, expires_at. Named because five positional columns in a
+        /// bare tuple is exactly where a column order mistake hides.
+        type TokenRow = (String, String, String, i64, i64);
+        let rows: std::result::Result<Vec<TokenRow>, rusqlite::Error> = stmt
             .query_map(params![user_id], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -525,16 +560,23 @@ impl Db {
                 ))
             })?
             .collect();
-        Ok(rows?.into_iter().map(|(id, uid, name, ca, ea)| ApiToken {
-            id, user_id: uid, username: username.to_string(), name, created_at: ca, expires_at: ea,
-        }).collect())
+        Ok(rows?
+            .into_iter()
+            .map(|(id, uid, name, ca, ea)| ApiToken {
+                id,
+                user_id: uid,
+                username: username.to_string(),
+                name,
+                created_at: ca,
+                expires_at: ea,
+            })
+            .collect())
     }
 
     pub fn api_token_revoke(&self, token_id: &str) -> Result<()> {
-        let n = self.0.execute(
-            "DELETE FROM api_tokens WHERE id = ?1",
-            params![token_id],
-        )?;
+        let n = self
+            .0
+            .execute("DELETE FROM api_tokens WHERE id = ?1", params![token_id])?;
         if n == 0 {
             return Err(AuthError::ApiTokenNotFound(token_id.to_string()));
         }
@@ -551,7 +593,9 @@ impl Db {
         );
         match result {
             Ok(id) => Ok(id),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Err(AuthError::GroupNotFound(name.to_string())),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                Err(AuthError::GroupNotFound(name.to_string()))
+            }
             Err(e) => Err(AuthError::Db(e)),
         }
     }
@@ -564,7 +608,9 @@ impl Db {
         );
         match result {
             Ok(id) => Ok(id),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Err(AuthError::UserNotFound(username.to_string())),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                Err(AuthError::UserNotFound(username.to_string()))
+            }
             Err(e) => Err(AuthError::Db(e)),
         }
     }
@@ -601,11 +647,9 @@ mod tests {
     #[test]
     fn test_wal_mode() {
         let (db, _f) = tmp_db();
-        let mode: String = db.0.query_row(
-            "PRAGMA journal_mode",
-            [],
-            |row| row.get(0),
-        ).expect("pragma");
+        let mode: String =
+            db.0.query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                .expect("pragma");
         assert_eq!(mode, "wal");
     }
 
@@ -614,7 +658,9 @@ mod tests {
     #[test]
     fn test_user_create_and_get() {
         let (db, _f) = tmp_db();
-        let u = db.user_create("alice", "hunter2", &["admin", "user"]).expect("create");
+        let u = db
+            .user_create("alice", "hunter2", &["admin", "user"])
+            .expect("create");
         assert_eq!(u.username, "alice");
         assert!(u.roles.contains(&"admin".to_string()));
         assert!(u.roles.contains(&"user".to_string()));
@@ -628,7 +674,9 @@ mod tests {
     fn test_user_create_duplicate() {
         let (db, _f) = tmp_db();
         db.user_create("alice", "pass1", &[]).expect("first create");
-        let err = db.user_create("alice", "pass2", &[]).expect_err("should fail");
+        let err = db
+            .user_create("alice", "pass2", &[])
+            .expect_err("should fail");
         assert!(matches!(err, AuthError::UserExists(_)));
     }
 
@@ -666,7 +714,8 @@ mod tests {
         let u = db.user_create("alice", "pass", &[]).expect("create");
         let _g = db.group_create("admins").expect("group");
         db.group_member_add("admins", "alice").expect("add member");
-        db.refresh_token_store(&u.id, "tok_hash_1", i64::MAX).expect("store token");
+        db.refresh_token_store(&u.id, "tok_hash_1", i64::MAX)
+            .expect("store token");
 
         // Confirm membership and token exist
         let members = db.group_members("admins").expect("members");
@@ -698,15 +747,22 @@ mod tests {
         db.user_create("alice", "old_pass", &[]).expect("create");
         db.user_set_password("alice", "new_pass").expect("set pw");
 
-        assert!(db.user_verify_password("alice", "old_pass").expect("verify").is_none());
-        assert!(db.user_verify_password("alice", "new_pass").expect("verify").is_some());
+        assert!(db
+            .user_verify_password("alice", "old_pass")
+            .expect("verify")
+            .is_none());
+        assert!(db
+            .user_verify_password("alice", "new_pass")
+            .expect("verify")
+            .is_some());
     }
 
     #[test]
     fn test_user_set_roles() {
         let (db, _f) = tmp_db();
         db.user_create("alice", "pass", &["user"]).expect("create");
-        db.user_set_roles("alice", &["admin", "mod"]).expect("set roles");
+        db.user_set_roles("alice", &["admin", "mod"])
+            .expect("set roles");
         let u = db.user_get("alice").expect("get").expect("some");
         assert!(u.roles.contains(&"admin".to_string()));
         assert!(u.roles.contains(&"mod".to_string()));
@@ -718,8 +774,12 @@ mod tests {
     #[test]
     fn test_verify_correct_password() {
         let (db, _f) = tmp_db();
-        db.user_create("alice", "correct", &["user"]).expect("create");
-        let u = db.user_verify_password("alice", "correct").expect("verify").expect("some");
+        db.user_create("alice", "correct", &["user"])
+            .expect("create");
+        let u = db
+            .user_verify_password("alice", "correct")
+            .expect("verify")
+            .expect("some");
         assert_eq!(u.username, "alice");
     }
 
@@ -818,7 +878,8 @@ mod tests {
         db.user_create("alice", "p", &[]).expect("user");
         db.group_create("team").expect("group");
         db.group_member_add("team", "alice").expect("first add");
-        db.group_member_add("team", "alice").expect("second add idempotent");
+        db.group_member_add("team", "alice")
+            .expect("second add idempotent");
         let members = db.group_members("team").expect("members");
         assert_eq!(members.len(), 1);
     }
@@ -827,7 +888,9 @@ mod tests {
     fn test_group_member_add_unknown_group() {
         let (db, _f) = tmp_db();
         db.user_create("alice", "p", &[]).expect("user");
-        let err = db.group_member_add("nonexistent", "alice").expect_err("should fail");
+        let err = db
+            .group_member_add("nonexistent", "alice")
+            .expect_err("should fail");
         assert!(matches!(err, AuthError::GroupNotFound(_)));
     }
 
@@ -835,7 +898,9 @@ mod tests {
     fn test_group_member_add_unknown_user() {
         let (db, _f) = tmp_db();
         db.group_create("team").expect("group");
-        let err = db.group_member_add("team", "ghost").expect_err("should fail");
+        let err = db
+            .group_member_add("team", "ghost")
+            .expect_err("should fail");
         assert!(matches!(err, AuthError::UserNotFound(_)));
     }
 
@@ -858,8 +923,12 @@ mod tests {
     fn test_refresh_token_store_and_verify() {
         let (db, _f) = tmp_db();
         let u = db.user_create("alice", "p", &[]).expect("user");
-        db.refresh_token_store(&u.id, "hash1", i64::MAX).expect("store");
-        let uid = db.refresh_token_verify("hash1").expect("verify").expect("some");
+        db.refresh_token_store(&u.id, "hash1", i64::MAX)
+            .expect("store");
+        let uid = db
+            .refresh_token_verify("hash1")
+            .expect("verify")
+            .expect("some");
         assert_eq!(uid, u.id);
     }
 
@@ -877,7 +946,8 @@ mod tests {
     fn test_refresh_token_revoke() {
         let (db, _f) = tmp_db();
         let u = db.user_create("alice", "p", &[]).expect("user");
-        db.refresh_token_store(&u.id, "tok", i64::MAX).expect("store");
+        db.refresh_token_store(&u.id, "tok", i64::MAX)
+            .expect("store");
         db.refresh_token_revoke("tok").expect("revoke");
         let r = db.refresh_token_verify("tok").expect("verify");
         assert!(r.is_none());
@@ -905,7 +975,8 @@ mod tests {
         let db2 = Db::open(&path).expect("db2");
 
         // Interleave writes
-        db1.user_create("alice", "pass_a", &["admin"]).expect("alice");
+        db1.user_create("alice", "pass_a", &["admin"])
+            .expect("alice");
         db2.user_create("bob", "pass_b", &["user"]).expect("bob");
         db1.user_create("carol", "pass_c", &[]).expect("carol");
 
@@ -922,7 +993,8 @@ mod tests {
     fn test_api_token_create_and_list() {
         let (db, _f) = tmp_db();
         let u = db.user_create("alice", "pass", &[]).expect("user");
-        let tok = db.api_token_create(&u.id, "alice", "ci-deploy", "hash1", i64::MAX)
+        let tok = db
+            .api_token_create(&u.id, "alice", "ci-deploy", "hash1", i64::MAX)
             .expect("create");
         assert_eq!(tok.user_id, u.id);
         assert_eq!(tok.username, "alice");
@@ -938,8 +1010,10 @@ mod tests {
     fn test_api_token_list_multiple() {
         let (db, _f) = tmp_db();
         let u = db.user_create("bob", "pass", &[]).expect("user");
-        db.api_token_create(&u.id, "bob", "token-a", "hash_a", i64::MAX).expect("a");
-        db.api_token_create(&u.id, "bob", "token-b", "hash_b", i64::MAX).expect("b");
+        db.api_token_create(&u.id, "bob", "token-a", "hash_a", i64::MAX)
+            .expect("a");
+        db.api_token_create(&u.id, "bob", "token-b", "hash_b", i64::MAX)
+            .expect("b");
         let list = db.api_token_list("bob").expect("list");
         assert_eq!(list.len(), 2);
         assert!(list.iter().any(|t| t.name == "token-a"));
@@ -965,7 +1039,8 @@ mod tests {
     fn test_api_token_revoke() {
         let (db, _f) = tmp_db();
         let u = db.user_create("alice", "pass", &[]).expect("user");
-        let tok = db.api_token_create(&u.id, "alice", "my-token", "hashX", i64::MAX)
+        let tok = db
+            .api_token_create(&u.id, "alice", "my-token", "hashX", i64::MAX)
             .expect("create");
         db.api_token_revoke(&tok.id).expect("revoke");
         let list = db.api_token_list("alice").expect("list");
@@ -975,7 +1050,9 @@ mod tests {
     #[test]
     fn test_api_token_revoke_not_found() {
         let (db, _f) = tmp_db();
-        let err = db.api_token_revoke("nonexistent-id").expect_err("should fail");
+        let err = db
+            .api_token_revoke("nonexistent-id")
+            .expect_err("should fail");
         assert!(matches!(err, AuthError::ApiTokenNotFound(_)));
     }
 
@@ -983,7 +1060,8 @@ mod tests {
     fn test_api_token_cascade_on_user_delete() {
         let (db, _f) = tmp_db();
         let u = db.user_create("alice", "pass", &[]).expect("user");
-        db.api_token_create(&u.id, "alice", "tok", "hashY", i64::MAX).expect("create");
+        db.api_token_create(&u.id, "alice", "tok", "hashY", i64::MAX)
+            .expect("create");
         db.user_delete("alice").expect("delete");
         // After user deletion, api_token_list errors with UserNotFound (user is gone)
         let err = db.api_token_list("alice").expect_err("user gone");
@@ -994,9 +1072,11 @@ mod tests {
     fn test_api_token_hash_unique() {
         let (db, _f) = tmp_db();
         let u = db.user_create("alice", "pass", &[]).expect("user");
-        db.api_token_create(&u.id, "alice", "tok-1", "same_hash", i64::MAX).expect("first");
+        db.api_token_create(&u.id, "alice", "tok-1", "same_hash", i64::MAX)
+            .expect("first");
         // Same hash must fail (UNIQUE constraint on token_hash)
-        let err = db.api_token_create(&u.id, "alice", "tok-2", "same_hash", i64::MAX)
+        let err = db
+            .api_token_create(&u.id, "alice", "tok-2", "same_hash", i64::MAX)
             .expect_err("duplicate hash");
         assert!(matches!(err, AuthError::Db(_)));
     }

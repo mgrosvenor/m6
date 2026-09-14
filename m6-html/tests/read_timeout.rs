@@ -20,7 +20,9 @@ use std::time::{Duration, Instant};
 use m6_core::testkit::{binary, Service};
 
 fn fixtures_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures")
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
 }
 
 struct Server {
@@ -82,7 +84,9 @@ fn a_silent_peer_is_disconnected_without_a_response() {
     let mut stream = UnixStream::connect(&socket_path).expect("connect");
     // Comfortably longer than the config's three seconds, so a read that returns
     // is the server's decision and not this timeout firing.
-    stream.set_read_timeout(Some(Duration::from_secs(10))).expect("timeout");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("timeout");
 
     let started = Instant::now();
     let mut buf = [0u8; 1024];
@@ -130,13 +134,16 @@ fn silent_peers_do_not_starve_the_thread_pool() {
     let hogs: Vec<UnixStream> = (0..8)
         .filter_map(|_| UnixStream::connect(&socket_path).ok())
         .collect();
-    assert_eq!(hogs.len(), 8, "could not open the connections to fill the pool");
+    assert_eq!(
+        hogs.len(),
+        8,
+        "could not open the connections to fill the pool"
+    );
 
     // A short per-probe timeout so a queued probe gives up and retries quickly
     // rather than sitting out the whole hold.
     let saturated = m6_core::testkit::wait::until(Duration::from_secs(3), || {
-        get_root(&socket_path, Duration::from_millis(300))
-            .is_some_and(|r| r.contains("503"))
+        get_root(&socket_path, Duration::from_millis(300)).is_some_and(|r| r.contains("503"))
     });
     assert!(
         saturated,
@@ -152,8 +159,7 @@ fn silent_peers_do_not_starve_the_thread_pool() {
     // as "not yet" rather than as a result: what is asserted is that the pool
     // comes back at all, not how fast.
     let recovered = m6_core::testkit::wait::until(Duration::from_secs(30), || {
-        get_root(&socket_path, Duration::from_secs(5))
-            .is_some_and(|r| r.contains("200 OK"))
+        get_root(&socket_path, Duration::from_secs(5)).is_some_and(|r| r.contains("200 OK"))
     });
     assert!(
         recovered,

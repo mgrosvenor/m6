@@ -1,13 +1,195 @@
-# m6 release notes
+# Changelog
 
-Newest first. One entry per change that reaches a running node.
+What changed in each release, newest first.
 
 Each entry records what changed, why it mattered, and how it was verified.
 "Verified" means measured against a running server, not inferred from the
 source: several defects in this list were invisible in the code and only showed
 up against the deployed artefact.
 
-Deploy order is fixed: **test locally, commit, then deploy.** Never the reverse.
+Versions follow [semantic versioning](https://semver.org). `main` holds
+releases only; work happens on `develop`. See `CONTRIBUTING.md`.
+
+---
+
+## 1.0.0 — 2026-09-14
+
+The first release. Everything under this heading was on `develop` unreleased and
+undeployed, some of it for months.
+
+`docs/PERFORMANCE.md` has the measured performance story by commit.
+`docs/CONSOLIDATION-TODO.md` has what is done and what is owed.
+
+### What this repository is
+
+**m6 is a generic web system: an HTTP edge and a library for writing services
+behind it.** It is not a website. A site built on m6 is a separate repository
+with its own changelog and its own version numbers, and nothing about any
+particular site's content, fleet or deployment schedule belongs in this file.
+
+The boundary is the wire contract in `docs/m6-backend-protocol.md`, which is
+version 1 and language agnostic, plus `m6-core` for services that want the Rust
+conveniences. Anything that generalises belongs here; anything true only of one
+deployment does not.
+
+### What 1.0.0 means here
+
+It does not mean finished. It means the consolidation work is done, the checks
+are real, and the numbers in this repository are measurements rather than claims.
+The API is stable enough to tag and pin against, which is what
+`m6-backend-protocol.md` version 1 already says about the wire contract.
+
+### The body of work
+
+- **m6-core is the PHP of m6**, phases 0 to 6: a box of blocks a service is
+  assembled from, and the only crate a service links. `m6-file` and
+  `m6-auth-server` are `App` services now; m6-file lost 969 lines including a
+  second router and a second config parser.
+- **Config-driven routes.** `App::handler(name, f)` plus `handler = "..."` on a
+  route, rebuilt on every reload, so a static file server gains an asset tree by
+  being told about a directory rather than by being recompiled.
+- **Streaming response bodies.** A stream structurally has no bytes for the
+  minifier, compressor or default ETag to touch.
+- **Copy elimination.** Core's per-request copying went from ~442us to ~1.58us.
+- **Zero `unsafe` in production code**, down from 390 lines of raw libc in the
+  filesystem watcher.
+
+### The checks became real
+
+This is the half that mattered most, because most of it had never run.
+
+- **h1, h2 and h3 conformance are measured against recorded minimums.** h2 and
+  h3 had no minimum at all and were silently skipped on every run: the only
+  thing running them was a laptop hook on a machine with neither `h2spec` nor
+  `h3spec` installed, and the Linux checks did not run conformance at all. h1
+  32/32 on four targets, h2 146/146, h3 47/49.
+- **A check that cannot measure now fails rather than passing.**
+  `tools/conformance.sh` broke that rule four separate ways and reported success
+  through all of them.
+- **clippy is silent**, `-D warnings`, on both toolchains, and the per-platform
+  ceiling files are deleted. That ceiling turned out to be per-clippy-version:
+  45 findings at 0.1.95 against 123 at 0.1.98 on identical source.
+- **Zero compiler warnings**, release and test builds, checked on Linux.
+- **CI on GitHub Actions** on every push and PR, and `cargo-deny` now runs on the
+  build host too, because a check that lives in one place only is not a check.
+- **Six reference backends** in C, C++, Python, Go, and Rust with and without
+  m6-core, all conforming to the wire contract, with 13 shared tests running them
+  in the build checks. The multi-language promise was written down and never
+  exercised until now.
+- **The examples repository is built by m6's own checks**, and its CMS example's
+  end-to-end suite runs against the binaries those checks just built. Nothing had
+  ever built it. By the time anyone looked it did not compile at all: every
+  renderer crate still pointed at `m6-render`, a crate m6 had deleted, and the
+  binaries left in `target/release` from before the deletion meant running an
+  example still appeared to work.
+
+  Underneath that were five more, each invisible for the same reason. Every asset
+  in every example returned 502, because m6-file became an `App` service and ten
+  configs across the repository were left naming no handler, so the service
+  exited 2 before binding. PATCH and DELETE were refused at the edge by
+  `allowed_methods`, which looks exactly like a missing route. Unpublishing a
+  post in the CMS example answered `{"unpublished": true}` and left the post
+  listed and readable. Starting an example ran `pkill -x m6-http` and killed
+  every other m6 on the machine.
+
+  m6's own checks were passing throughout, and could not have caught any of it:
+  m6 contains no site, and the examples are where its interfaces are actually
+  used. `tools/perfcheck.sh` also measured a deployment's content through a
+  deployment's rendered config, so m6 could not measure itself either; it now
+  renders two pages from the examples, whose content is committed, so the number
+  means the same thing on every machine.
+- **The CMS example's end-to-end suite has no skipped checks**, and 96 rather
+  than 46. The previous version had five that accepted a range of answers, and
+  each one was hiding one of the defects above: the unpublish check read the
+  API's own reply rather than asking the public site, and the auth checks passed
+  on "302 or 401 or 403". It also pinned `--http1.1` for everything, so the
+  example that runs the whole stack never exercised HTTP/2 once.
+
+### Protocol fixes in this release
+
+- **HTTP/2: a received GOAWAY no longer closes the connection**, so the frames
+  behind it are answered instead of meeting a TCP reset. And a WINDOW_UPDATE that
+  overflows a stream we have just answered is still a FLOW_CONTROL_ERROR rather
+  than being dropped. Both were intermittent, both came from discarding state the
+  instant we finished with it, and h2 went from 2 failures in 6 runs to 20 out of
+  20 clean.
+- **h3 37/49 to 47/49.** All twelve failures were upstream in quiche, and the
+  recorded remedy — bump the version — moved the score by zero tests. Ten are
+  cleared by two open upstream pull requests, applied on a fork pinned by
+  revision. The last two are QPACK and are accepted.
+- **Compression is the backend's job, and m6-http is a cache, not a
+  transformer.** The protocol told backends not to compress on the grounds that
+  the proxy would, and the proxy has no compressor: a C, Go or Python backend
+  written from that advice served uncompressed bytes forever.
+  `[[backend]] compresses` is now read by both sides, and a backend refuses to
+  start if it disagrees with what it can actually do.
+- **`touch site.toml` never reloaded anything on Linux.** m6-core's
+  `Request::touch` is the documented way for a renderer to invalidate the edge
+  after writing content, and it used `utimensat(2)`, which reports `IN_ATTRIB`.
+  The inotify mask asked for `IN_CLOSE_WRITE | IN_CREATE | IN_MOVED_TO`, so the
+  event was read and discarded, and the mtime fallback runs only when there is no
+  watcher fd. macOS was fine, because kqueue reports the attribute change, so the
+  defect was invisible where the code was written and live where it runs. Blog
+  publishing was spared only because `m6-md --touch` has its own implementation
+  that opens the file. The watcher now accepts `IN_ATTRIB` and `Request::touch`
+  opens and closes the file as well; either alone is sufficient. Found within the
+  hour after the checks started building the examples on Linux.
+- **A backend's error headers survive the error page.** m6-http replaces a
+  backend's 4xx or 5xx with its own page and threw the backend's whole header
+  block away with it. So a throttled login reached the client as a generic "An
+  unexpected error occurred" with no `Retry-After`, even though m6-auth-server had
+  set one: the throttle worked and was unusable, because the one header saying
+  when to come back was the one discarded. The same substitution dropped
+  `WWW-Authenticate` from a backend 401 and `Allow` from a backend 405, which
+  RFC 9110 11.6.1 and 10.2.1 require. Those four headers now carry over and
+  nothing else does, because the rest describe a body that is no longer being
+  sent.
+- **The login throttle counts failures, not logins.** m6-auth-server incremented
+  on every login request before looking at the credentials, and never cleared the
+  count, so six logins in fifteen minutes locked the IP out whether or not any
+  password was wrong. Counting successes stops no attack, since an attacker with
+  the password does not need six attempts; what it stopped was a person using
+  three devices, and any test suite that logs in repeatedly. The limits move into
+  `[rate_limit] max_attempts` and `window_secs`, defaulting to the previous 5 and
+  900.
+- **Supply chain:** five `cargo-deny` exceptions down to three, each remaining one
+  stating whether it is reachable and how that was checked. `rustls-pemfile` is
+  gone from the tree entirely.
+
+### Known, recorded, and not fixed in 1.0.0
+
+Stated here rather than discovered later:
+
+- **h3 is 47/49.** The two remaining are QPACK, quiche models neither code, and
+  closing them means writing protocol validation into a forked dependency.
+- **m6-http depends on a fork of quiche**, pinned by revision, carrying two
+  unmerged upstream pull requests. Deliberate, and to be dropped for a tag when
+  upstream releases them.
+- **Linking m6-core costs about 36% of a backend's throughput** and 8.8x its
+  resident memory on a trivial route. Measured, reproduced within 3%, and
+  recorded in `docs/BENCHMARKS.md`. It is measured on the shape that maximises
+  it, and behind the edge cache most requests never reach a backend.
+- **One intermittent test-harness failure**, issue #9: a claimed TCP port
+  occasionally turns out to be in use. Two failures in five full runs, the
+  mechanism identified, the fix not yet written. It affects the test harness, not
+  m6.
+- **`m6-monitor`'s `/traffic` and `/perf` shapes have moved** since anything was
+  built against them, so a consumer written to the older shape will not find
+  `pools` or a `firewall` field. Whether any given deployment runs it is that
+  deployment's business, not this repository's.
+
+---
+
+## 0.2.0 and earlier — 2026-03-15 and before
+
+**Not split by version.** This project kept one flat list of changes until
+2026-09-13, when `main` became release-only and versions started to mean
+something. Splitting the entries below across the versions they shipped in
+would mean guessing, and a changelog that guesses is worse than one that says
+it does not know. Everything here is accurate about *what* changed; it is the
+*which release* that is not recorded.
+
+From the next release onwards, each version gets its own heading.
 
 ---
 
@@ -880,7 +1062,7 @@ HTML for cache MISS and HIT, and verified absent on CSS and on llms.txt itself.
 ## 2026-09-06 — HTTP caching correctness
 
 Three defects in the revalidation and caching headers, all raised from a live
-audit of mgrosvenor.com, then reproduced and root-caused here. None is
+audit of a production deployment, then reproduced and root-caused here. None is
 cosmetic: each costs bandwidth or risks a downstream cache serving the wrong
 bytes.
 

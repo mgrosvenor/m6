@@ -34,31 +34,31 @@ fn generate_test_rsa_keys() -> (String, String) {
         .expect("openssl rsa -pubout");
 
     let private = std::fs::read_to_string(&key_path).unwrap();
-    let public  = std::fs::read_to_string(&pub_path).unwrap();
+    let public = std::fs::read_to_string(&pub_path).unwrap();
     (private, public)
 }
 
 struct TestEnv {
-    _temp:       tempfile::TempDir,
-    site_dir:    PathBuf,
+    _temp: tempfile::TempDir,
+    site_dir: PathBuf,
     config_path: PathBuf,
     socket_path: PathBuf,
-    _key_dir:    tempfile::TempDir,
+    _key_dir: tempfile::TempDir,
 }
 
 fn setup_test_env(id: &str) -> TestEnv {
-    let temp    = tempfile::TempDir::new().unwrap();
+    let temp = tempfile::TempDir::new().unwrap();
     let key_dir = tempfile::TempDir::new().unwrap();
 
-    let site_dir    = temp.path().to_path_buf();
+    let site_dir = temp.path().to_path_buf();
     let config_path = site_dir.join("m6-auth-test.conf");
 
     // Generate keys
     let (private_pem, public_pem) = generate_test_rsa_keys();
     let private_key_path = key_dir.path().join("auth.pem");
-    let public_key_path  = key_dir.path().join("auth.pub");
+    let public_key_path = key_dir.path().join("auth.pub");
     std::fs::write(&private_key_path, &private_pem).unwrap();
-    std::fs::write(&public_key_path,  &public_pem).unwrap();
+    std::fs::write(&public_key_path, &public_pem).unwrap();
 
     // Write config
     let db_path = "data/auth.db";
@@ -90,7 +90,13 @@ public_key  = "{}"
     // unlinking a socket another live server was serving on.
     let socket_path = temp.path().join(format!("{id}.sock"));
 
-    TestEnv { _temp: temp, site_dir, config_path, socket_path, _key_dir: key_dir }
+    TestEnv {
+        _temp: temp,
+        site_dir,
+        config_path,
+        socket_path,
+        _key_dir: key_dir,
+    }
 }
 
 /// Spawn `m6-auth-server` and wait until it accepts a connection.
@@ -121,14 +127,17 @@ fn seed_user(site_dir: &Path, username: &str, password: &str) {
     let db_path = site_dir.join("data/auth.db");
     std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
     let db = m6_auth::Db::open(&db_path).expect("open db");
-    db.user_create(username, password, &["user"]).expect("create user");
+    db.user_create(username, password, &["user"])
+        .expect("create user");
 }
 
 /// Send a raw HTTP request over a Unix socket and return the full response bytes.
 fn http_request(socket_path: &Path, request: &str) -> String {
     let mut stream = UnixStream::connect(socket_path)
         .unwrap_or_else(|e| panic!("connect {:?}: {}", socket_path, e));
-    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
     stream.write_all(request.as_bytes()).unwrap();
     // One response, not read-to-EOF: the connection stays open (RFC 9112 9.3).
     let method = request.split(' ').next().unwrap_or("");
@@ -136,16 +145,29 @@ fn http_request(socket_path: &Path, request: &str) -> String {
     String::from_utf8_lossy(&resp).into_owned()
 }
 
-fn http_request_with_body(socket_path: &Path, method: &str, path: &str, content_type: &str, body: &str) -> String {
+fn http_request_with_body(
+    socket_path: &Path,
+    method: &str,
+    path: &str,
+    content_type: &str,
+    body: &str,
+) -> String {
     let req = format!(
         "{} {} HTTP/1.1\r\nHost: localhost\r\nContent-Type: {}\r\nContent-Length: {}\r\n\r\n{}",
-        method, path, content_type, body.len(), body
+        method,
+        path,
+        content_type,
+        body.len(),
+        body
     );
     http_request(socket_path, &req)
 }
 
 fn parse_status(resp: &str) -> u16 {
-    resp.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0)
+    resp.split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
 }
 
 fn get_header<'a>(resp: &'a str, name: &str) -> Option<&'a str> {
@@ -185,21 +207,46 @@ fn t01_login_form_valid_credentials_302_cookies() {
     let _guard = spawn_server(&env);
 
     let body = "username=alice&password=correct_pass&next=/dashboard";
-    let resp = http_request_with_body(&env.socket_path, "POST", "/auth/login",
-        "application/x-www-form-urlencoded", body);
+    let resp = http_request_with_body(
+        &env.socket_path,
+        "POST",
+        "/auth/login",
+        "application/x-www-form-urlencoded",
+        body,
+    );
 
     assert_eq!(parse_status(&resp), 302, "expected 302\n{}", resp);
 
     let location = get_header(&resp, "Location").unwrap_or("");
-    assert_eq!(location, "/dashboard", "expected redirect to /dashboard, got {}", location);
+    assert_eq!(
+        location, "/dashboard",
+        "expected redirect to /dashboard, got {}",
+        location
+    );
 
     let cookies = get_all_headers(&resp, "Set-Cookie");
-    assert!(cookies.len() >= 2, "expected 2 Set-Cookie headers, got {}", cookies.len());
+    assert!(
+        cookies.len() >= 2,
+        "expected 2 Set-Cookie headers, got {}",
+        cookies.len()
+    );
 
-    let has_session = cookies.iter().any(|c| c.starts_with("session=") && c.contains("HttpOnly") && c.contains("Path=/"));
-    let has_refresh = cookies.iter().any(|c| c.starts_with("refresh=") && c.contains("HttpOnly") && c.contains("Path=/auth/refresh"));
-    assert!(has_session, "missing session cookie with HttpOnly and Path=/\ncookies: {:?}", cookies);
-    assert!(has_refresh, "missing refresh cookie with HttpOnly and Path=/auth/refresh\ncookies: {:?}", cookies);
+    let has_session = cookies
+        .iter()
+        .any(|c| c.starts_with("session=") && c.contains("HttpOnly") && c.contains("Path=/"));
+    let has_refresh = cookies.iter().any(|c| {
+        c.starts_with("refresh=") && c.contains("HttpOnly") && c.contains("Path=/auth/refresh")
+    });
+    assert!(
+        has_session,
+        "missing session cookie with HttpOnly and Path=/\ncookies: {:?}",
+        cookies
+    );
+    assert!(
+        has_refresh,
+        "missing refresh cookie with HttpOnly and Path=/auth/refresh\ncookies: {:?}",
+        cookies
+    );
 }
 
 /// Login JSON, valid credentials → 200, JSON tokens, no cookies.
@@ -210,19 +257,35 @@ fn t02_login_json_valid_credentials_200_no_cookies() {
     let _guard = spawn_server(&env);
 
     let body = r#"{"username":"bob","password":"pass123"}"#;
-    let resp = http_request_with_body(&env.socket_path, "POST", "/auth/login",
-        "application/json", body);
+    let resp = http_request_with_body(
+        &env.socket_path,
+        "POST",
+        "/auth/login",
+        "application/json",
+        body,
+    );
 
     assert_eq!(parse_status(&resp), 200, "expected 200\n{}", resp);
 
     let cookies = get_all_headers(&resp, "Set-Cookie");
-    assert!(cookies.is_empty(), "JSON login should not set cookies, got: {:?}", cookies);
+    assert!(
+        cookies.is_empty(),
+        "JSON login should not set cookies, got: {:?}",
+        cookies
+    );
 
     // Verify JSON body
     let body_start = resp.find("\r\n\r\n").map(|i| i + 4).unwrap_or(resp.len());
-    let json_body: serde_json::Value = serde_json::from_str(&resp[body_start..]).expect("valid JSON");
-    assert!(json_body["access_token"].is_string(), "missing access_token");
-    assert!(json_body["refresh_token"].is_string(), "missing refresh_token");
+    let json_body: serde_json::Value =
+        serde_json::from_str(&resp[body_start..]).expect("valid JSON");
+    assert!(
+        json_body["access_token"].is_string(),
+        "missing access_token"
+    );
+    assert!(
+        json_body["refresh_token"].is_string(),
+        "missing refresh_token"
+    );
     assert!(json_body["expires_in"].is_number(), "missing expires_in");
 }
 
@@ -234,13 +297,21 @@ fn t03_login_form_wrong_password_302_error() {
     let _guard = spawn_server(&env);
 
     let body = "username=carol&password=wrong_pass";
-    let resp = http_request_with_body(&env.socket_path, "POST", "/auth/login",
-        "application/x-www-form-urlencoded", body);
+    let resp = http_request_with_body(
+        &env.socket_path,
+        "POST",
+        "/auth/login",
+        "application/x-www-form-urlencoded",
+        body,
+    );
 
     assert_eq!(parse_status(&resp), 302, "expected 302\n{}", resp);
     let location = get_header(&resp, "Location").unwrap_or("");
-    assert!(location.contains("/login") && location.contains("error=invalid"),
-        "expected redirect to login error, got: {}", location);
+    assert!(
+        location.contains("/login") && location.contains("error=invalid"),
+        "expected redirect to login error, got: {}",
+        location
+    );
 }
 
 #[test]
@@ -250,8 +321,13 @@ fn t03b_login_json_wrong_password_401() {
     let _guard = spawn_server(&env);
 
     let body = r#"{"username":"dave","password":"wrong_pass"}"#;
-    let resp = http_request_with_body(&env.socket_path, "POST", "/auth/login",
-        "application/json", body);
+    let resp = http_request_with_body(
+        &env.socket_path,
+        "POST",
+        "/auth/login",
+        "application/json",
+        body,
+    );
 
     assert_eq!(parse_status(&resp), 401, "expected 401\n{}", resp);
 }
@@ -267,10 +343,19 @@ fn t04_login_rate_limited_429() {
 
     // First 5 attempts (fail with 401)
     for _ in 0..5 {
-        let resp = http_request_with_body(&env.socket_path, "POST", "/auth/login",
-            "application/json", body);
+        let resp = http_request_with_body(
+            &env.socket_path,
+            "POST",
+            "/auth/login",
+            "application/json",
+            body,
+        );
         let status = parse_status(&resp);
-        assert!(status == 401 || status == 429, "expected 401 or 429, got {}", status);
+        assert!(
+            status == 401 || status == 429,
+            "expected 401 or 429, got {}",
+            status
+        );
         if status == 429 {
             // We already got rate-limited early, test passes
             let retry_after = get_header(&resp, "Retry-After").unwrap_or("");
@@ -280,11 +365,24 @@ fn t04_login_rate_limited_429() {
     }
 
     // 6th attempt must be 429
-    let resp = http_request_with_body(&env.socket_path, "POST", "/auth/login",
-        "application/json", body);
-    assert_eq!(parse_status(&resp), 429, "6th attempt should be rate-limited\n{}", resp);
+    let resp = http_request_with_body(
+        &env.socket_path,
+        "POST",
+        "/auth/login",
+        "application/json",
+        body,
+    );
+    assert_eq!(
+        parse_status(&resp),
+        429,
+        "6th attempt should be rate-limited\n{}",
+        resp
+    );
     let retry_after = get_header(&resp, "Retry-After").unwrap_or("");
-    assert!(!retry_after.is_empty(), "expected Retry-After header on 429");
+    assert!(
+        !retry_after.is_empty(),
+        "expected Retry-After header on 429"
+    );
 }
 
 /// Refresh: valid refresh cookie → 302, new session cookie.
@@ -296,11 +394,19 @@ fn t05_refresh_valid_cookie_302_new_session() {
 
     // Login to get tokens
     let body = r#"{"username":"eve","password":"evepw"}"#;
-    let login_resp = http_request_with_body(&env.socket_path, "POST", "/auth/login",
-        "application/json", body);
+    let login_resp = http_request_with_body(
+        &env.socket_path,
+        "POST",
+        "/auth/login",
+        "application/json",
+        body,
+    );
     assert_eq!(parse_status(&login_resp), 200);
 
-    let body_start = login_resp.find("\r\n\r\n").map(|i| i + 4).unwrap_or(login_resp.len());
+    let body_start = login_resp
+        .find("\r\n\r\n")
+        .map(|i| i + 4)
+        .unwrap_or(login_resp.len());
     let json: serde_json::Value = serde_json::from_str(&login_resp[body_start..]).unwrap();
     let refresh_token = json["refresh_token"].as_str().unwrap();
 
@@ -311,11 +417,22 @@ fn t05_refresh_valid_cookie_302_new_session() {
     );
     let resp = http_request(&env.socket_path, &req);
 
-    assert_eq!(parse_status(&resp), 302, "expected 302 on refresh\n{}", resp);
+    assert_eq!(
+        parse_status(&resp),
+        302,
+        "expected 302 on refresh\n{}",
+        resp
+    );
 
     let cookies = get_all_headers(&resp, "Set-Cookie");
-    let has_session = cookies.iter().any(|c| c.starts_with("session=") && c.contains("HttpOnly"));
-    assert!(has_session, "expected new session cookie after refresh\ncookies: {:?}", cookies);
+    let has_session = cookies
+        .iter()
+        .any(|c| c.starts_with("session=") && c.contains("HttpOnly"));
+    assert!(
+        has_session,
+        "expected new session cookie after refresh\ncookies: {:?}",
+        cookies
+    );
 }
 
 /// Refresh: expired/invalid token → 302 /login.
@@ -329,7 +446,11 @@ fn t06_refresh_invalid_token_302_login() {
 
     assert_eq!(parse_status(&resp), 302, "expected 302\n{}", resp);
     let location = get_header(&resp, "Location").unwrap_or("");
-    assert_eq!(location, "/login", "expected redirect to /login, got {}", location);
+    assert_eq!(
+        location, "/login",
+        "expected redirect to /login, got {}",
+        location
+    );
 }
 
 /// Logout: clears both cookies (Max-Age=0).
@@ -341,13 +462,19 @@ fn t07_logout_clears_cookies() {
 
     // Login via form to get cookies
     let body = "username=frank&password=frankpw";
-    let login_resp = http_request_with_body(&env.socket_path, "POST", "/auth/login",
-        "application/x-www-form-urlencoded", body);
+    let login_resp = http_request_with_body(
+        &env.socket_path,
+        "POST",
+        "/auth/login",
+        "application/x-www-form-urlencoded",
+        body,
+    );
     assert_eq!(parse_status(&login_resp), 302);
 
     // Extract refresh cookie value
     let cookies = get_all_headers(&login_resp, "Set-Cookie");
-    let refresh_cookie = cookies.iter()
+    let refresh_cookie = cookies
+        .iter()
         .find(|c| c.starts_with("refresh="))
         .map(|c| {
             let token_part = c.split(';').next().unwrap_or("");
@@ -361,13 +488,30 @@ fn t07_logout_clears_cookies() {
         refresh_cookie
     );
     let logout_resp = http_request(&env.socket_path, &req);
-    assert_eq!(parse_status(&logout_resp), 302, "expected 302 on logout\n{}", logout_resp);
+    assert_eq!(
+        parse_status(&logout_resp),
+        302,
+        "expected 302 on logout\n{}",
+        logout_resp
+    );
 
     let logout_cookies = get_all_headers(&logout_resp, "Set-Cookie");
-    let session_cleared = logout_cookies.iter().any(|c| c.contains("session=") && c.contains("Max-Age=0"));
-    let refresh_cleared = logout_cookies.iter().any(|c| c.contains("refresh=") && c.contains("Max-Age=0"));
-    assert!(session_cleared, "session cookie not cleared (Max-Age=0)\ncookies: {:?}", logout_cookies);
-    assert!(refresh_cleared, "refresh cookie not cleared (Max-Age=0)\ncookies: {:?}", logout_cookies);
+    let session_cleared = logout_cookies
+        .iter()
+        .any(|c| c.contains("session=") && c.contains("Max-Age=0"));
+    let refresh_cleared = logout_cookies
+        .iter()
+        .any(|c| c.contains("refresh=") && c.contains("Max-Age=0"));
+    assert!(
+        session_cleared,
+        "session cookie not cleared (Max-Age=0)\ncookies: {:?}",
+        logout_cookies
+    );
+    assert!(
+        refresh_cleared,
+        "refresh cookie not cleared (Max-Age=0)\ncookies: {:?}",
+        logout_cookies
+    );
 }
 
 /// Public key endpoint returns valid PEM.
@@ -380,8 +524,11 @@ fn t08_public_key_returns_pem() {
     let resp = http_request(&env.socket_path, req);
 
     assert_eq!(parse_status(&resp), 200, "expected 200\n{}", resp);
-    assert!(resp.contains("BEGIN PUBLIC KEY") || resp.contains("BEGIN RSA PUBLIC KEY"),
-        "expected PEM public key in response\n{}", resp);
+    assert!(
+        resp.contains("BEGIN PUBLIC KEY") || resp.contains("BEGIN RSA PUBLIC KEY"),
+        "expected PEM public key in response\n{}",
+        resp
+    );
 }
 
 /// JWT signature verifiable with returned public key.
@@ -393,18 +540,29 @@ fn t09_jwt_verifiable_with_public_key() {
 
     // Get access token
     let body = r#"{"username":"grace","password":"gracepw"}"#;
-    let login_resp = http_request_with_body(&env.socket_path, "POST", "/auth/login",
-        "application/json", body);
+    let login_resp = http_request_with_body(
+        &env.socket_path,
+        "POST",
+        "/auth/login",
+        "application/json",
+        body,
+    );
     assert_eq!(parse_status(&login_resp), 200);
 
-    let body_start = login_resp.find("\r\n\r\n").map(|i| i + 4).unwrap_or(login_resp.len());
+    let body_start = login_resp
+        .find("\r\n\r\n")
+        .map(|i| i + 4)
+        .unwrap_or(login_resp.len());
     let json: serde_json::Value = serde_json::from_str(&login_resp[body_start..]).unwrap();
     let access_token = json["access_token"].as_str().unwrap();
 
     // Get public key
     let req = "GET /auth/public-key HTTP/1.1\r\nHost: localhost\r\n\r\n";
     let pk_resp = http_request(&env.socket_path, req);
-    let pk_body_start = pk_resp.find("\r\n\r\n").map(|i| i + 4).unwrap_or(pk_resp.len());
+    let pk_body_start = pk_resp
+        .find("\r\n\r\n")
+        .map(|i| i + 4)
+        .unwrap_or(pk_resp.len());
     let public_pem = &pk_resp[pk_body_start..];
 
     // Verify the JWT using jsonwebtoken directly
@@ -413,8 +571,13 @@ fn t09_jwt_verifiable_with_public_key() {
     let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
     validation.set_issuer(&["test.example.com"]);
 
-    let result = jsonwebtoken::decode::<serde_json::Value>(access_token, &decoding_key, &validation);
-    assert!(result.is_ok(), "JWT verification failed: {:?}", result.err());
+    let result =
+        jsonwebtoken::decode::<serde_json::Value>(access_token, &decoding_key, &validation);
+    assert!(
+        result.is_ok(),
+        "JWT verification failed: {:?}",
+        result.err()
+    );
 }
 
 /// `next` parameter with external URL → falls back to `/`.
@@ -426,12 +589,21 @@ fn t10_next_external_url_falls_back_to_root() {
 
     // Attempt to redirect to external URL
     let body = "username=henry&password=henrypw&next=https://evil.example.com/steal";
-    let resp = http_request_with_body(&env.socket_path, "POST", "/auth/login",
-        "application/x-www-form-urlencoded", body);
+    let resp = http_request_with_body(
+        &env.socket_path,
+        "POST",
+        "/auth/login",
+        "application/x-www-form-urlencoded",
+        body,
+    );
 
     assert_eq!(parse_status(&resp), 302, "expected 302\n{}", resp);
     let location = get_header(&resp, "Location").unwrap_or("");
-    assert_eq!(location, "/", "external URL should fall back to /, got: {}", location);
+    assert_eq!(
+        location, "/",
+        "external URL should fall back to /, got: {}",
+        location
+    );
 }
 
 // ─── Shutdown ─────────────────────────────────────────────────────────────────

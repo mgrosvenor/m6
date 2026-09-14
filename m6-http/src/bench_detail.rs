@@ -15,7 +15,6 @@
 ///
 /// Cache note: all paths are pre-warmed (100 warmup requests) before measurement.
 /// Warmup samples are excluded from all reported statistics.
-
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, UdpSocket};
 use std::os::unix::io::AsRawFd;
@@ -23,51 +22,90 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rand::Rng;
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::ClientConfig;
-use rustls::pki_types::{ServerName, CertificateDer, UnixTime};
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
 struct Args {
-    addr:        String,
-    h2c_addr:    String,
-    n:           usize,
+    addr: String,
+    h2c_addr: String,
+    n: usize,
     skip_verify: bool,
-    http11:      bool,
-    http2:       bool,
-    http3:       bool,
-    h2c:         bool,
-    out_dir:     String,
+    http11: bool,
+    http2: bool,
+    http3: bool,
+    h2c: bool,
+    out_dir: String,
 }
 
 impl Args {
     fn parse() -> Self {
         let mut a = Args {
-            addr:        "127.0.0.1:8443".into(),
-            h2c_addr:    "127.0.0.1:8080".into(),
-            n:           10_000,
+            addr: "127.0.0.1:8443".into(),
+            h2c_addr: "127.0.0.1:8080".into(),
+            n: 10_000,
             skip_verify: false,
-            http11:      true,
-            http2:       true,
-            http3:       true,
-            h2c:         false,
-            out_dir:     ".".into(),
+            http11: true,
+            http2: true,
+            http3: true,
+            h2c: false,
+            out_dir: ".".into(),
         };
         let raw: Vec<String> = std::env::args().skip(1).collect();
         let mut i = 0;
         while i < raw.len() {
             match raw[i].as_str() {
-                "--addr"         => { i += 1; a.addr     = raw[i].clone(); }
-                "--h2c-addr"     => { i += 1; a.h2c_addr = raw[i].clone(); }
-                "--n"            => { i += 1; a.n        = raw[i].parse().expect("--n"); }
-                "--out-dir"      => { i += 1; a.out_dir  = raw[i].clone(); }
-                "--skip-verify"  => { a.skip_verify = true; }
-                "--http11-only"  => { a.http11 = true;  a.http2 = false; a.http3 = false; a.h2c = false; }
-                "--http2-only"   => { a.http11 = false; a.http2 = true;  a.http3 = false; a.h2c = false; }
-                "--http3-only"   => { a.http11 = false; a.http2 = false; a.http3 = true;  a.h2c = false; }
-                "--h2c-only"     => { a.http11 = false; a.http2 = false; a.http3 = false; a.h2c = true; }
-                "--h2c"          => { a.h2c = true; }
-                other => { eprintln!("unknown flag: {other}"); std::process::exit(1); }
+                "--addr" => {
+                    i += 1;
+                    a.addr = raw[i].clone();
+                }
+                "--h2c-addr" => {
+                    i += 1;
+                    a.h2c_addr = raw[i].clone();
+                }
+                "--n" => {
+                    i += 1;
+                    a.n = raw[i].parse().expect("--n");
+                }
+                "--out-dir" => {
+                    i += 1;
+                    a.out_dir = raw[i].clone();
+                }
+                "--skip-verify" => {
+                    a.skip_verify = true;
+                }
+                "--http11-only" => {
+                    a.http11 = true;
+                    a.http2 = false;
+                    a.http3 = false;
+                    a.h2c = false;
+                }
+                "--http2-only" => {
+                    a.http11 = false;
+                    a.http2 = true;
+                    a.http3 = false;
+                    a.h2c = false;
+                }
+                "--http3-only" => {
+                    a.http11 = false;
+                    a.http2 = false;
+                    a.http3 = true;
+                    a.h2c = false;
+                }
+                "--h2c-only" => {
+                    a.http11 = false;
+                    a.http2 = false;
+                    a.http3 = false;
+                    a.h2c = true;
+                }
+                "--h2c" => {
+                    a.h2c = true;
+                }
+                other => {
+                    eprintln!("unknown flag: {other}");
+                    std::process::exit(1);
+                }
             }
             i += 1;
         }
@@ -81,36 +119,57 @@ impl Args {
 struct NoVerify;
 
 impl rustls::client::danger::ServerCertVerifier for NoVerify {
-    fn verify_server_cert(&self, _: &CertificateDer<'_>, _: &[CertificateDer<'_>],
-        _: &ServerName<'_>, _: &[u8], _: UnixTime,
+    fn verify_server_cert(
+        &self,
+        _: &CertificateDer<'_>,
+        _: &[CertificateDer<'_>],
+        _: &ServerName<'_>,
+        _: &[u8],
+        _: UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
-    fn verify_tls12_signature(&self, _: &[u8], _: &CertificateDer<'_>,
+    fn verify_tls12_signature(
+        &self,
+        _: &[u8],
+        _: &CertificateDer<'_>,
         _: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
     }
-    fn verify_tls13_signature(&self, _: &[u8], _: &CertificateDer<'_>,
+    fn verify_tls13_signature(
+        &self,
+        _: &[u8],
+        _: &CertificateDer<'_>,
         _: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
     }
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::default_provider().signature_verification_algorithms.supported_schemes()
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
 fn make_tls_config_h1(skip_verify: bool) -> Arc<ClientConfig> {
     if skip_verify {
-        Arc::new(ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoVerify))
-            .with_no_client_auth())
+        Arc::new(
+            ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerify))
+                .with_no_client_auth(),
+        )
     } else {
         let mut roots = rustls::RootCertStore::empty();
-        for cert in rustls_native_certs::load_native_certs().certs { roots.add(cert).ok(); }
-        Arc::new(ClientConfig::builder().with_root_certificates(roots).with_no_client_auth())
+        for cert in rustls_native_certs::load_native_certs().certs {
+            roots.add(cert).ok();
+        }
+        Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        )
     }
 }
 
@@ -124,8 +183,12 @@ fn make_tls_config_h2(skip_verify: bool) -> Arc<ClientConfig> {
         Arc::new(cfg)
     } else {
         let mut roots = rustls::RootCertStore::empty();
-        for cert in rustls_native_certs::load_native_certs().certs { roots.add(cert).ok(); }
-        let mut cfg = ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+        for cert in rustls_native_certs::load_native_certs().certs {
+            roots.add(cert).ok();
+        }
+        let mut cfg = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
         cfg.alpn_protocols = vec![b"h2".to_vec()];
         Arc::new(cfg)
     }
@@ -134,7 +197,8 @@ fn make_tls_config_h2(skip_verify: bool) -> Arc<ClientConfig> {
 fn make_quiche_cfg(skip_verify: bool) -> quiche::Config {
     let mut cfg = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
     cfg.verify_peer(!skip_verify);
-    cfg.set_application_protos(quiche::h3::APPLICATION_PROTOCOL).unwrap();
+    cfg.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
+        .unwrap();
     cfg.set_max_idle_timeout(5000);
     cfg.set_max_recv_udp_payload_size(1350);
     cfg.set_max_send_udp_payload_size(1350);
@@ -153,17 +217,17 @@ fn make_quiche_cfg(skip_verify: bool) -> quiche::Config {
 /// All values in microseconds.
 #[derive(Clone)]
 struct BoxStats {
-    label:  String,
-    n:      usize,
+    label: String,
+    n: usize,
     #[allow(dead_code)]
-    min:    f64,
-    p5:     f64,
-    p25:    f64,
-    p50:    f64,
-    p75:    f64,
-    p95:    f64,
-    max:    f64,
-    mean:   f64,
+    min: f64,
+    p5: f64,
+    p25: f64,
+    p50: f64,
+    p75: f64,
+    p95: f64,
+    max: f64,
+    mean: f64,
     stddev: f64,
 }
 
@@ -171,19 +235,23 @@ impl BoxStats {
     fn from_samples(label: impl Into<String>, mut v: Vec<f64>) -> Self {
         assert!(!v.is_empty(), "no samples");
         v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let n    = v.len();
-        let pct  = |p: f64| { let idx = ((p / 100.0) * (n as f64 - 1.0)).round() as usize; v[idx.min(n-1)] };
+        let n = v.len();
+        let pct = |p: f64| {
+            let idx = ((p / 100.0) * (n as f64 - 1.0)).round() as usize;
+            v[idx.min(n - 1)]
+        };
         let mean = v.iter().sum::<f64>() / n as f64;
-        let var  = v.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1).max(1) as f64;
+        let var = v.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1).max(1) as f64;
         BoxStats {
-            label: label.into(), n,
-            min:    v[0],
-            p5:     pct(5.0),
-            p25:    pct(25.0),
-            p50:    pct(50.0),
-            p75:    pct(75.0),
-            p95:    pct(95.0),
-            max:    *v.last().unwrap(),
+            label: label.into(),
+            n,
+            min: v[0],
+            p5: pct(5.0),
+            p25: pct(25.0),
+            p50: pct(50.0),
+            p75: pct(75.0),
+            p95: pct(95.0),
+            max: *v.last().unwrap(),
             mean,
             stddev: var.sqrt(),
         }
@@ -192,39 +260,40 @@ impl BoxStats {
 
 /// All per-phase sample collections for one protocol.
 struct PhaseSamples {
-    connect:      Vec<f64>, // TCP connect (H1/H2) or QUIC handshake (H3)
-    tls:          Vec<f64>, // TLS handshake (H1/H2); H3 = 0 (included in QUIC hs)
-    proto_setup:  Vec<f64>, // H2: SETTINGS exchange; H3: H3 init; H1: 0
+    connect: Vec<f64>,      // TCP connect (H1/H2) or QUIC handshake (H3)
+    tls: Vec<f64>,          // TLS handshake (H1/H2); H3 = 0 (included in QUIC hs)
+    proto_setup: Vec<f64>,  // H2: SETTINGS exchange; H3: H3 init; H1: 0
     request_send: Vec<f64>, // write request bytes
-    ttfb:         Vec<f64>, // request_sent → first byte of response
-    transfer:     Vec<f64>, // first byte → last byte
-    total:        Vec<f64>, // connection open → last byte received
+    ttfb: Vec<f64>,         // request_sent → first byte of response
+    transfer: Vec<f64>,     // first byte → last byte
+    total: Vec<f64>,        // connection open → last byte received
 }
 
 impl PhaseSamples {
     fn new(n: usize) -> Self {
         PhaseSamples {
-            connect:      Vec::with_capacity(n),
-            tls:          Vec::with_capacity(n),
-            proto_setup:  Vec::with_capacity(n),
+            connect: Vec::with_capacity(n),
+            tls: Vec::with_capacity(n),
+            proto_setup: Vec::with_capacity(n),
             request_send: Vec::with_capacity(n),
-            ttfb:         Vec::with_capacity(n),
-            transfer:     Vec::with_capacity(n),
-            total:        Vec::with_capacity(n),
+            ttfb: Vec::with_capacity(n),
+            transfer: Vec::with_capacity(n),
+            total: Vec::with_capacity(n),
         }
     }
 
     fn into_stats(self, proto: &str) -> Vec<BoxStats> {
         let phases: &[(&str, Vec<f64>)] = &[
-            ("connect",      self.connect),
-            ("tls",          self.tls),
-            ("proto_setup",  self.proto_setup),
+            ("connect", self.connect),
+            ("tls", self.tls),
+            ("proto_setup", self.proto_setup),
             ("request_send", self.request_send),
-            ("ttfb",         self.ttfb),
-            ("transfer",     self.transfer),
-            ("total",        self.total),
+            ("ttfb", self.ttfb),
+            ("transfer", self.transfer),
+            ("total", self.total),
         ];
-        phases.iter()
+        phases
+            .iter()
             .filter(|(_, v)| !v.is_empty() && v.iter().any(|&x| x > 0.0))
             .map(|(name, v)| BoxStats::from_samples(format!("{proto}/{name}"), v.clone()))
             .collect()
@@ -233,33 +302,34 @@ impl PhaseSamples {
 
 /// Full-page-load sample collections (one sample = HTML + all assets).
 struct FullPageSamples {
-    connect:     Vec<f64>, // TCP/QUIC connection setup
-    tls:         Vec<f64>, // TLS handshake (H1/H2)
-    html_done:   Vec<f64>, // start → HTML fully received
+    connect: Vec<f64>,     // TCP/QUIC connection setup
+    tls: Vec<f64>,         // TLS handshake (H1/H2)
+    html_done: Vec<f64>,   // start → HTML fully received
     assets_done: Vec<f64>, // start → last asset fully received
-    total:       Vec<f64>, // start → last byte
+    total: Vec<f64>,       // start → last byte
 }
 
 impl FullPageSamples {
     fn new(n: usize) -> Self {
         FullPageSamples {
-            connect:     Vec::with_capacity(n),
-            tls:         Vec::with_capacity(n),
-            html_done:   Vec::with_capacity(n),
+            connect: Vec::with_capacity(n),
+            tls: Vec::with_capacity(n),
+            html_done: Vec::with_capacity(n),
             assets_done: Vec::with_capacity(n),
-            total:       Vec::with_capacity(n),
+            total: Vec::with_capacity(n),
         }
     }
 
     fn into_stats(self, proto: &str) -> Vec<BoxStats> {
         let phases: &[(&str, Vec<f64>)] = &[
-            ("connect",     self.connect),
-            ("tls",         self.tls),
-            ("html_done",   self.html_done),
+            ("connect", self.connect),
+            ("tls", self.tls),
+            ("html_done", self.html_done),
             ("assets_done", self.assets_done),
-            ("total",       self.total),
+            ("total", self.total),
         ];
-        phases.iter()
+        phases
+            .iter()
             .filter(|(_, v)| !v.is_empty() && v.iter().any(|&x| x > 0.0))
             .map(|(name, v)| BoxStats::from_samples(format!("{proto}/fullpage/{name}"), v.clone()))
             .collect()
@@ -270,9 +340,11 @@ impl FullPageSamples {
 
 /// Single H1 GET with per-phase timestamps. The TLS handshake is driven
 /// explicitly before writing the request so the phases can be separated.
-fn h1_timed_get(addr: &str, path: &str, tls_cfg: Arc<ClientConfig>)
-    -> anyhow::Result<(Vec<u8>, f64, f64, f64, f64, f64)>
-{
+fn h1_timed_get(
+    addr: &str,
+    path: &str,
+    tls_cfg: Arc<ClientConfig>,
+) -> anyhow::Result<(Vec<u8>, f64, f64, f64, f64, f64)> {
     // connect
     let t0 = Instant::now();
     let stream = TcpStream::connect(addr)?;
@@ -297,11 +369,18 @@ fn h1_timed_get(addr: &str, path: &str, tls_cfg: Arc<ClientConfig>)
             // Read server response
             match conn.read_tls(&mut &stream) {
                 Ok(0) => anyhow::bail!("TLS closed during handshake"),
-                Ok(_) => { conn.process_new_packets().map_err(|e| anyhow::anyhow!("{e}"))?; }
+                Ok(_) => {
+                    conn.process_new_packets()
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     // Blocking poll: wait for socket readable
                     unsafe {
-                        let mut pfd = libc::pollfd { fd: stream.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+                        let mut pfd = libc::pollfd {
+                            fd: stream.as_raw_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        };
                         libc::poll(&mut pfd, 1, 5000);
                     }
                 }
@@ -329,7 +408,10 @@ fn h1_timed_get(addr: &str, path: &str, tls_cfg: Arc<ClientConfig>)
         // Read one byte at a time until we get something
         loop {
             match tls_stream.read(&mut first_byte) {
-                Ok(1) => { resp.push(first_byte[0]); break; }
+                Ok(1) => {
+                    resp.push(first_byte[0]);
+                    break;
+                }
                 Ok(0) => break, // EOF
                 Ok(_) => unreachable!(),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
@@ -354,17 +436,21 @@ fn h1_timed_get(addr: &str, path: &str, tls_cfg: Arc<ClientConfig>)
     let us = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1_000_000.0;
     Ok((
         resp,
-        us(t0,              t_connected),   // connect
-        us(t_connected,     t_tls),         // tls
-        us(t_tls,           t_request_sent),// request_send
-        us(t_request_sent,  t_first_byte),  // ttfb
-        us(t_first_byte,    t_done),        // transfer
+        us(t0, t_connected),              // connect
+        us(t_connected, t_tls),           // tls
+        us(t_tls, t_request_sent),        // request_send
+        us(t_request_sent, t_first_byte), // ttfb
+        us(t_first_byte, t_done),         // transfer
     ))
 }
 
-fn bench_h1_phases(addr: &str, path: &str, n: usize, warmup: usize, tls_cfg: Arc<ClientConfig>)
-    -> anyhow::Result<PhaseSamples>
-{
+fn bench_h1_phases(
+    addr: &str,
+    path: &str,
+    n: usize,
+    warmup: usize,
+    tls_cfg: Arc<ClientConfig>,
+) -> anyhow::Result<PhaseSamples> {
     for _ in 0..warmup {
         h1_timed_get(addr, path, Arc::clone(&tls_cfg))?;
     }
@@ -402,7 +488,9 @@ fn make_h2c_get_headers(path: &str) -> Vec<u8> {
         h.extend_from_slice(pb);
     }
     h.push(0x86); // :scheme http (index 6; index 7 = https)
-    h.extend_from_slice(&[0x41, 0x09, b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't']);
+    h.extend_from_slice(&[
+        0x41, 0x09, b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
+    ]);
     h
 }
 
@@ -419,7 +507,9 @@ fn make_h2_get_headers(path: &str) -> Vec<u8> {
         h.extend_from_slice(pb);
     }
     h.push(0x87); // :scheme https
-    h.extend_from_slice(&[0x41, 0x09, b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't']);
+    h.extend_from_slice(&[
+        0x41, 0x09, b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
+    ]);
     h
 }
 
@@ -427,8 +517,8 @@ fn make_h2_frame(ftype: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8
     let len = payload.len();
     let mut f = Vec::with_capacity(9 + len);
     f.push((len >> 16) as u8);
-    f.push((len >> 8)  as u8);
-    f.push(len         as u8);
+    f.push((len >> 8) as u8);
+    f.push(len as u8);
     f.push(ftype);
     f.push(flags);
     f.extend_from_slice(&(stream_id & 0x7fff_ffff).to_be_bytes());
@@ -437,28 +527,32 @@ fn make_h2_frame(ftype: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8
 }
 
 fn try_parse_h2_frame(buf: &[u8]) -> Option<(u8, u8, u32, usize)> {
-    if buf.len() < 9 { return None; }
+    if buf.len() < 9 {
+        return None;
+    }
     let length = ((buf[0] as usize) << 16) | ((buf[1] as usize) << 8) | buf[2] as usize;
     let total = 9 + length;
-    if buf.len() < total { return None; }
-    let ftype     = buf[3];
-    let flags     = buf[4];
+    if buf.len() < total {
+        return None;
+    }
+    let ftype = buf[3];
+    let flags = buf[4];
     let stream_id = u32::from_be_bytes(buf[5..9].try_into().unwrap()) & 0x7fff_ffff;
     Some((ftype, flags, stream_id, total))
 }
 
 /// Timed H2 client. Tracks connection-setup phases separately from per-request phases.
 struct H2TimedClient {
-    conn:           rustls::ClientConnection,
-    stream:         TcpStream,
-    recv_buf:       Vec<u8>,
-    tmp:            [u8; 8192],
+    conn: rustls::ClientConnection,
+    stream: TcpStream,
+    recv_buf: Vec<u8>,
+    tmp: [u8; 8192],
     next_stream_id: u32,
-    requests_done:  usize,
+    requests_done: usize,
     // Connection-setup timings (set once on connect)
-    pub connect_us:      f64,
-    pub tls_us:          f64,
-    pub proto_setup_us:  f64,
+    pub connect_us: f64,
+    pub tls_us: f64,
+    pub proto_setup_us: f64,
 }
 
 impl H2TimedClient {
@@ -474,25 +568,30 @@ impl H2TimedClient {
         let conn = rustls::ClientConnection::new(tls_cfg, server_name)?;
 
         let mut c = H2TimedClient {
-            conn, stream,
-            recv_buf:       Vec::with_capacity(16_384),
-            tmp:            [0u8; 8192],
+            conn,
+            stream,
+            recv_buf: Vec::with_capacity(16_384),
+            tmp: [0u8; 8192],
             next_stream_id: 1,
-            requests_done:  0,
-            connect_us:     0.0,
-            tls_us:         0.0,
+            requests_done: 0,
+            connect_us: 0.0,
+            tls_us: 0.0,
             proto_setup_us: 0.0,
         };
 
         // Queue preface + empty SETTINGS
         c.conn.writer().write_all(H2_CLIENT_PREFACE)?;
-        c.conn.writer().write_all(&make_h2_frame(0x4, 0x0, 0, &[]))?;
+        c.conn
+            .writer()
+            .write_all(&make_h2_frame(0x4, 0x0, 0, &[]))?;
 
         // Drive TLS handshake
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             c.flush_write()?;
-            if !c.conn.is_handshaking() { break; }
+            if !c.conn.is_handshaking() {
+                break;
+            }
             c.fill_recv_deadline(deadline)?;
         }
         let t_tls = Instant::now();
@@ -501,16 +600,20 @@ impl H2TimedClient {
         // Expand the connection-level flow-control window to 16 MiB so large responses
         // (blog pages, compressed assets) don't cause a server-side send stall.
         c.fill_recv_drain()?;
-        c.conn.writer().write_all(&make_h2_frame(0x4, 0x1, 0, &[]))?;  // SETTINGS ACK
-        let window_increment: u32 = 16 * 1024 * 1024 - 65_535;        // 16 MiB - initial
-        c.conn.writer().write_all(&make_h2_frame(0x8, 0x0, 0, &window_increment.to_be_bytes()))?;
+        c.conn
+            .writer()
+            .write_all(&make_h2_frame(0x4, 0x1, 0, &[]))?; // SETTINGS ACK
+        let window_increment: u32 = 16 * 1024 * 1024 - 65_535; // 16 MiB - initial
+        c.conn
+            .writer()
+            .write_all(&make_h2_frame(0x8, 0x0, 0, &window_increment.to_be_bytes()))?;
         c.flush_write()?;
         let t_proto = Instant::now();
 
         let us = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1_000_000.0;
-        c.connect_us     = us(t0,          t_connected);
-        c.tls_us         = us(t_connected, t_tls);
-        c.proto_setup_us = us(t_tls,       t_proto);
+        c.connect_us = us(t0, t_connected);
+        c.tls_us = us(t_connected, t_tls);
+        c.proto_setup_us = us(t_tls, t_proto);
 
         Ok(c)
     }
@@ -518,9 +621,15 @@ impl H2TimedClient {
     fn flush_write(&mut self) -> io::Result<usize> {
         let mut total = 0;
         loop {
-            match { let mut sr = &self.stream; self.conn.write_tls(&mut sr) } {
-                Ok(0)  => break,
-                Ok(n)  => { total += n; }
+            let res = {
+                let mut sr = &self.stream;
+                self.conn.write_tls(&mut sr)
+            };
+            match res {
+                Ok(0) => break,
+                Ok(n) => {
+                    total += n;
+                }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => return Err(e),
             }
@@ -530,11 +639,16 @@ impl H2TimedClient {
 
     fn fill_recv_deadline(&mut self, deadline: Instant) -> io::Result<()> {
         loop {
-            match { let mut sr = &self.stream; self.conn.read_tls(&mut sr) } {
+            let res = {
+                let mut sr = &self.stream;
+                self.conn.read_tls(&mut sr)
+            };
+            match res {
                 Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "closed")),
                 Ok(_) => {
-                    self.conn.process_new_packets()
-                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                    self.conn
+                        .process_new_packets()
+                        .map_err(|e| io::Error::other(e.to_string()))?;
                     break;
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -545,7 +659,11 @@ impl H2TimedClient {
                     self.flush_write()?;
                     let ms = remaining.as_millis().min(100) as i32;
                     unsafe {
-                        let mut pfd = libc::pollfd { fd: self.stream.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+                        let mut pfd = libc::pollfd {
+                            fd: self.stream.as_raw_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        };
                         libc::poll(&mut pfd, 1, ms);
                     }
                 }
@@ -557,11 +675,16 @@ impl H2TimedClient {
 
     fn fill_recv_drain(&mut self) -> io::Result<()> {
         loop {
-            match { let mut sr = &self.stream; self.conn.read_tls(&mut sr) } {
+            let res = {
+                let mut sr = &self.stream;
+                self.conn.read_tls(&mut sr)
+            };
+            match res {
                 Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "closed")),
                 Ok(_) => {
-                    self.conn.process_new_packets()
-                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                    self.conn
+                        .process_new_packets()
+                        .map_err(|e| io::Error::other(e.to_string()))?;
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => return Err(e),
@@ -573,8 +696,8 @@ impl H2TimedClient {
     fn drain_plaintext(&mut self) -> io::Result<()> {
         loop {
             match self.conn.reader().read(&mut self.tmp) {
-                Ok(0)  => break,
-                Ok(n)  => self.recv_buf.extend_from_slice(&self.tmp[..n]),
+                Ok(0) => break,
+                Ok(n) => self.recv_buf.extend_from_slice(&self.tmp[..n]),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => return Err(e),
             }
@@ -583,9 +706,7 @@ impl H2TimedClient {
     }
 
     /// Send a GET request and return (body, request_send_us, ttfb_us, transfer_us).
-    fn get_timed(&mut self, path: &str)
-        -> anyhow::Result<(Vec<u8>, f64, f64, f64)>
-    {
+    fn get_timed(&mut self, path: &str) -> anyhow::Result<(Vec<u8>, f64, f64, f64)> {
         let sid = self.next_stream_id;
         self.next_stream_id += 2;
         self.requests_done += 1;
@@ -603,7 +724,9 @@ impl H2TimedClient {
         let deadline = Instant::now() + Duration::from_secs(5);
 
         loop {
-            if Instant::now() > deadline { anyhow::bail!("H2 response timeout"); }
+            if Instant::now() > deadline {
+                anyhow::bail!("H2 response timeout");
+            }
 
             if let Some((ftype, flags, fsid, total)) = try_parse_h2_frame(&self.recv_buf) {
                 let payload = self.recv_buf[9..total].to_vec();
@@ -615,7 +738,8 @@ impl H2TimedClient {
                 }
 
                 match ftype {
-                    0x0 if fsid == sid => { // DATA
+                    0x0 if fsid == sid => {
+                        // DATA
                         // Return flow-control credit for every DATA frame received
                         // (both connection-level and stream-level) so the server never stalls.
                         if !payload.is_empty() {
@@ -627,26 +751,33 @@ impl H2TimedClient {
                             self.flush_write()?;
                         }
                         body.extend_from_slice(&payload);
-                        if flags & 0x1 != 0 { // END_STREAM
+                        if flags & 0x1 != 0 {
+                            // END_STREAM
                             let t_done = Instant::now();
                             let us = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1_000_000.0;
                             let t_fb = first_byte_time.unwrap_or(t_done);
-                            return Ok((body,
+                            return Ok((
+                                body,
                                 us(t_req_start, t_req_sent),
-                                us(t_req_sent,  t_fb),
-                                us(t_fb,        t_done)));
+                                us(t_req_sent, t_fb),
+                                us(t_fb, t_done),
+                            ));
                         }
                     }
-                    0x1 if fsid == sid => { // HEADERS
-                        if flags & 0x1 != 0 { // END_STREAM (no body)
-                            let t_done = Instant::now();
-                            let us = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1_000_000.0;
-                            let t_fb = first_byte_time.unwrap_or(t_done);
-                            return Ok((body,
-                                us(t_req_start, t_req_sent),
-                                us(t_req_sent,  t_fb),
-                                us(t_fb,        t_done)));
-                        }
+                    0x1 if fsid == sid
+                        // HEADERS
+                        && flags & 0x1 != 0 =>
+                    {
+                        // END_STREAM (no body)
+                        let t_done = Instant::now();
+                        let us = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1_000_000.0;
+                        let t_fb = first_byte_time.unwrap_or(t_done);
+                        return Ok((
+                            body,
+                            us(t_req_start, t_req_sent),
+                            us(t_req_sent, t_fb),
+                            us(t_fb, t_done),
+                        ));
                     }
                     0x3 if fsid == sid => anyhow::bail!("server RST_STREAM"),
                     0x7 => anyhow::bail!("server GOAWAY"),
@@ -654,16 +785,21 @@ impl H2TimedClient {
                 }
                 continue;
             }
-            self.fill_recv_deadline(deadline).map_err(|e| anyhow::anyhow!("H2 read: {}", e))?;
+            self.fill_recv_deadline(deadline)
+                .map_err(|e| anyhow::anyhow!("H2 read: {}", e))?;
         }
     }
 }
 
 const H2_MAX_REQS: usize = 1_000;
 
-fn bench_h2_phases(addr: &str, path: &str, n: usize, warmup: usize, skip_verify: bool)
-    -> anyhow::Result<PhaseSamples>
-{
+fn bench_h2_phases(
+    addr: &str,
+    path: &str,
+    n: usize,
+    warmup: usize,
+    skip_verify: bool,
+) -> anyhow::Result<PhaseSamples> {
     let tls_cfg = make_tls_config_h2(skip_verify);
     let mut s = PhaseSamples::new(n);
 
@@ -708,14 +844,14 @@ fn bench_h2_phases(addr: &str, path: &str, n: usize, warmup: usize, skip_verify:
 
 /// Timed H2C client over plain TCP. Tracks connection-setup phases separately.
 struct H2cTimedClient {
-    stream:         TcpStream,
-    send_buf:       Vec<u8>,
-    recv_buf:       Vec<u8>,
-    tmp:            [u8; 8192],
+    stream: TcpStream,
+    send_buf: Vec<u8>,
+    recv_buf: Vec<u8>,
+    tmp: [u8; 8192],
     next_stream_id: u32,
-    requests_done:  usize,
+    requests_done: usize,
     // Connection-setup timings
-    pub connect_us:     f64,
+    pub connect_us: f64,
     pub proto_setup_us: f64,
 }
 
@@ -737,12 +873,18 @@ impl H2cTimedClient {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut got_settings = false;
         while !got_settings {
-            if Instant::now() > deadline { anyhow::bail!("H2C setup timeout"); }
+            if Instant::now() > deadline {
+                anyhow::bail!("H2C setup timeout");
+            }
             let n = (&stream).read(&mut tmp)?;
-            if n == 0 { anyhow::bail!("H2C: closed during setup"); }
+            if n == 0 {
+                anyhow::bail!("H2C: closed during setup");
+            }
             recv_buf.extend_from_slice(&tmp[..n]);
             while let Some((ftype, flags, _, total)) = try_parse_h2_frame(&recv_buf) {
-                if ftype == 0x4 && flags & 0x1 == 0 { got_settings = true; }
+                if ftype == 0x4 && flags & 0x1 == 0 {
+                    got_settings = true;
+                }
                 recv_buf.drain(..total);
             }
         }
@@ -756,22 +898,26 @@ impl H2cTimedClient {
         let us = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1_000_000.0;
         Ok(H2cTimedClient {
             stream,
-            send_buf:       Vec::with_capacity(4096),
+            send_buf: Vec::with_capacity(4096),
             recv_buf,
-            tmp:            [0u8; 8192],
+            tmp: [0u8; 8192],
             next_stream_id: 1,
-            requests_done:  0,
-            connect_us:     us(t0,          t_connected),
+            requests_done: 0,
+            connect_us: us(t0, t_connected),
             proto_setup_us: us(t_connected, t_proto),
         })
     }
 
     fn flush_write(&mut self) -> io::Result<()> {
         loop {
-            if self.send_buf.is_empty() { break; }
+            if self.send_buf.is_empty() {
+                break;
+            }
             match (&self.stream).write(&self.send_buf) {
                 Ok(0) => break,
-                Ok(n) => { self.send_buf.drain(..n); }
+                Ok(n) => {
+                    self.send_buf.drain(..n);
+                }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => return Err(e),
             }
@@ -783,7 +929,10 @@ impl H2cTimedClient {
         loop {
             match (&self.stream).read(&mut self.tmp) {
                 Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "closed")),
-                Ok(n) => { self.recv_buf.extend_from_slice(&self.tmp[..n]); break; }
+                Ok(n) => {
+                    self.recv_buf.extend_from_slice(&self.tmp[..n]);
+                    break;
+                }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
@@ -793,7 +942,9 @@ impl H2cTimedClient {
                     let ms = remaining.as_millis().min(100) as i32;
                     unsafe {
                         let mut pfd = libc::pollfd {
-                            fd: self.stream.as_raw_fd(), events: libc::POLLIN, revents: 0,
+                            fd: self.stream.as_raw_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
                         };
                         libc::poll(&mut pfd, 1, ms);
                     }
@@ -823,7 +974,9 @@ impl H2cTimedClient {
         let deadline = Instant::now() + Duration::from_secs(5);
 
         loop {
-            if Instant::now() > deadline { anyhow::bail!("H2C response timeout"); }
+            if Instant::now() > deadline {
+                anyhow::bail!("H2C response timeout");
+            }
 
             if let Some((ftype, flags, fsid, total)) = try_parse_h2_frame(&self.recv_buf) {
                 let payload = self.recv_buf[9..total].to_vec();
@@ -837,8 +990,18 @@ impl H2cTimedClient {
                     0x0 if fsid == sid => {
                         if !payload.is_empty() {
                             let inc = payload.len() as u32;
-                            self.send_buf.extend_from_slice(&make_h2_frame(0x8, 0x0, 0, &inc.to_be_bytes()));
-                            self.send_buf.extend_from_slice(&make_h2_frame(0x8, 0x0, sid, &inc.to_be_bytes()));
+                            self.send_buf.extend_from_slice(&make_h2_frame(
+                                0x8,
+                                0x0,
+                                0,
+                                &inc.to_be_bytes(),
+                            ));
+                            self.send_buf.extend_from_slice(&make_h2_frame(
+                                0x8,
+                                0x0,
+                                sid,
+                                &inc.to_be_bytes(),
+                            ));
                             self.flush_write()?;
                         }
                         body.extend_from_slice(&payload);
@@ -846,16 +1009,24 @@ impl H2cTimedClient {
                             let t_done = Instant::now();
                             let us = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1_000_000.0;
                             let t_fb = first_byte_time.unwrap_or(t_done);
-                            return Ok((body, us(t_req_start, t_req_sent), us(t_req_sent, t_fb), us(t_fb, t_done)));
+                            return Ok((
+                                body,
+                                us(t_req_start, t_req_sent),
+                                us(t_req_sent, t_fb),
+                                us(t_fb, t_done),
+                            ));
                         }
                     }
-                    0x1 if fsid == sid => {
-                        if flags & 0x1 != 0 {
-                            let t_done = Instant::now();
-                            let us = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1_000_000.0;
-                            let t_fb = first_byte_time.unwrap_or(t_done);
-                            return Ok((body, us(t_req_start, t_req_sent), us(t_req_sent, t_fb), us(t_fb, t_done)));
-                        }
+                    0x1 if fsid == sid && flags & 0x1 != 0 => {
+                        let t_done = Instant::now();
+                        let us = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1_000_000.0;
+                        let t_fb = first_byte_time.unwrap_or(t_done);
+                        return Ok((
+                            body,
+                            us(t_req_start, t_req_sent),
+                            us(t_req_sent, t_fb),
+                            us(t_fb, t_done),
+                        ));
                     }
                     0x3 if fsid == sid => anyhow::bail!("server RST_STREAM"),
                     0x7 => anyhow::bail!("server GOAWAY"),
@@ -863,16 +1034,20 @@ impl H2cTimedClient {
                 }
                 continue;
             }
-            self.fill_recv_deadline(deadline).map_err(|e| anyhow::anyhow!("H2C read: {e}"))?;
+            self.fill_recv_deadline(deadline)
+                .map_err(|e| anyhow::anyhow!("H2C read: {e}"))?;
         }
     }
 }
 
 const H2C_MAX_REQS: usize = 1_000;
 
-fn bench_h2c_phases(addr: &str, path: &str, n: usize, warmup: usize)
-    -> anyhow::Result<PhaseSamples>
-{
+fn bench_h2c_phases(
+    addr: &str,
+    path: &str,
+    n: usize,
+    warmup: usize,
+) -> anyhow::Result<PhaseSamples> {
     let mut s = PhaseSamples::new(n);
 
     // Warmup on a dedicated connection (not counted).
@@ -906,9 +1081,12 @@ fn bench_h2c_phases(addr: &str, path: &str, n: usize, warmup: usize)
     Ok(s)
 }
 
-fn bench_h2c_fullpage(addr: &str, html_path: &str, n: usize, warmup: usize)
-    -> anyhow::Result<FullPageSamples>
-{
+fn bench_h2c_fullpage(
+    addr: &str,
+    html_path: &str,
+    n: usize,
+    warmup: usize,
+) -> anyhow::Result<FullPageSamples> {
     // Discover assets.
     let mut client = H2cTimedClient::connect(addr)?;
     let (html_body, _, _, _) = client.get_timed(html_path)?;
@@ -967,17 +1145,29 @@ fn quic_flush(conn: &mut quiche::Connection, udp: &UdpSocket) {
     let mut out = [0u8; 1350];
     loop {
         match conn.send(&mut out) {
-            Ok((len, _)) => { udp.send(&out[..len]).ok(); }
+            Ok((len, _)) => {
+                udp.send(&out[..len]).ok();
+            }
             Err(quiche::Error::Done) => break,
-            Err(e) => { eprintln!("quic_flush: {e}"); break; }
+            Err(e) => {
+                eprintln!("quic_flush: {e}");
+                break;
+            }
         }
     }
 }
 
 /// Connect QUIC+H3. Returns (conn, h3, udp, quic_hs_us, h3_init_us).
-fn h3_connect_timed(addr: &str, cfg: &mut quiche::Config)
-    -> anyhow::Result<(quiche::Connection, quiche::h3::Connection, UdpSocket, f64, f64)>
-{
+fn h3_connect_timed(
+    addr: &str,
+    cfg: &mut quiche::Config,
+) -> anyhow::Result<(
+    quiche::Connection,
+    quiche::h3::Connection,
+    UdpSocket,
+    f64,
+    f64,
+)> {
     let udp = UdpSocket::bind("0.0.0.0:0")?;
     udp.connect(addr)?;
     let scid = new_scid();
@@ -991,20 +1181,35 @@ fn h3_connect_timed(addr: &str, cfg: &mut quiche::Config)
     let mut buf = [0u8; 65535];
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        if Instant::now() > deadline { anyhow::bail!("QUIC handshake timeout"); }
+        if Instant::now() > deadline {
+            anyhow::bail!("QUIC handshake timeout");
+        }
         conn.on_timeout();
         quic_flush(&mut conn, &udp);
         udp.set_read_timeout(Some(Duration::from_millis(100)))?;
         let n = match udp.recv(&mut buf) {
             Ok(n) => n,
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock
-                   || e.kind() == io::ErrorKind::TimedOut => continue,
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
+            {
+                continue
+            }
             Err(e) => return Err(e.into()),
         };
-        conn.recv(&mut buf[..n], quiche::RecvInfo { from: peer, to: local })?;
+        conn.recv(
+            &mut buf[..n],
+            quiche::RecvInfo {
+                from: peer,
+                to: local,
+            },
+        )?;
         quic_flush(&mut conn, &udp);
-        if conn.is_established() { break; }
-        if conn.is_closed() { anyhow::bail!("QUIC closed during handshake"); }
+        if conn.is_established() {
+            break;
+        }
+        if conn.is_closed() {
+            anyhow::bail!("QUIC closed during handshake");
+        }
     }
     let t_quic = Instant::now();
 
@@ -1019,14 +1224,14 @@ fn h3_connect_timed(addr: &str, cfg: &mut quiche::Config)
 /// Single H3 GET with per-phase timing. Returns (body, req_send_us, ttfb_us, transfer_us).
 fn h3_timed_get(
     conn: &mut quiche::Connection,
-    h3:   &mut quiche::h3::Connection,
-    udp:  &UdpSocket,
+    h3: &mut quiche::h3::Connection,
+    udp: &UdpSocket,
     path: &[u8],
 ) -> anyhow::Result<(Vec<u8>, f64, f64, f64)> {
     let req = vec![
-        quiche::h3::Header::new(b":method",    b"GET"),
-        quiche::h3::Header::new(b":path",      path),
-        quiche::h3::Header::new(b":scheme",    b"https"),
+        quiche::h3::Header::new(b":method", b"GET"),
+        quiche::h3::Header::new(b":path", path),
+        quiche::h3::Header::new(b":scheme", b"https"),
         quiche::h3::Header::new(b":authority", b"localhost"),
     ];
 
@@ -1036,68 +1241,90 @@ fn h3_timed_get(
     let t_req_sent = Instant::now();
 
     let mut body = Vec::new();
-    let mut buf  = [0u8; 65535];
+    let mut buf = [0u8; 65535];
     let mut first_event_time: Option<Instant> = None;
     let deadline = Instant::now() + Duration::from_secs(5);
 
     loop {
-        if Instant::now() > deadline { anyhow::bail!("H3 timeout"); }
+        if Instant::now() > deadline {
+            anyhow::bail!("H3 timeout");
+        }
         conn.on_timeout();
         quic_flush(conn, udp);
         udp.set_read_timeout(Some(Duration::from_millis(100)))?;
         let n = match udp.recv(&mut buf) {
             Ok(n) => n,
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock
-                   || e.kind() == io::ErrorKind::TimedOut => {
-                if conn.is_closed() { break; }
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
+            {
+                if conn.is_closed() {
+                    break;
+                }
                 continue;
             }
             Err(e) => return Err(e.into()),
         };
-        conn.recv(&mut buf[..n], quiche::RecvInfo {
-            from: udp.peer_addr()?,
-            to:   udp.local_addr()?,
-        })?;
+        conn.recv(
+            &mut buf[..n],
+            quiche::RecvInfo {
+                from: udp.peer_addr()?,
+                to: udp.local_addr()?,
+            },
+        )?;
         quic_flush(conn, udp);
 
         loop {
             match h3.poll(conn) {
                 Ok((sid, quiche::h3::Event::Headers { .. })) if sid == stream_id => {
-                    if first_event_time.is_none() { first_event_time = Some(Instant::now()); }
+                    if first_event_time.is_none() {
+                        first_event_time = Some(Instant::now());
+                    }
                 }
                 Ok((sid, quiche::h3::Event::Data)) => {
-                    if first_event_time.is_none() { first_event_time = Some(Instant::now()); }
+                    if first_event_time.is_none() {
+                        first_event_time = Some(Instant::now());
+                    }
                     while let Ok(read) = h3.recv_body(conn, sid, &mut buf) {
-                        if sid == stream_id { body.extend_from_slice(&buf[..read]); }
+                        if sid == stream_id {
+                            body.extend_from_slice(&buf[..read]);
+                        }
                     }
                 }
                 Ok((sid, quiche::h3::Event::Finished)) if sid == stream_id => {
                     let t_done = Instant::now();
                     let us = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1_000_000.0;
                     let t_fb = first_event_time.unwrap_or(t_done);
-                    return Ok((body,
+                    return Ok((
+                        body,
                         us(t_req_start, t_req_sent),
-                        us(t_req_sent,  t_fb),
-                        us(t_fb,        t_done)));
+                        us(t_req_sent, t_fb),
+                        us(t_fb, t_done),
+                    ));
                 }
                 Ok(_) => {}
                 Err(quiche::h3::Error::Done) => break,
                 Err(e) => return Err(e.into()),
             }
         }
-        if conn.is_closed() { break; }
+        if conn.is_closed() {
+            break;
+        }
     }
     anyhow::bail!("H3 connection closed before response finished")
 }
 
 const H3_MAX_STREAMS: usize = 90;
 
-fn bench_h3_phases(addr: &str, path: &str, n: usize, warmup: usize, skip_verify: bool)
-    -> anyhow::Result<PhaseSamples>
-{
+fn bench_h3_phases(
+    addr: &str,
+    path: &str,
+    n: usize,
+    warmup: usize,
+    skip_verify: bool,
+) -> anyhow::Result<PhaseSamples> {
     let mut cfg = make_quiche_cfg(skip_verify);
-    let mut s   = PhaseSamples::new(n);
-    let pb      = path.as_bytes().to_vec();
+    let mut s = PhaseSamples::new(n);
+    let pb = path.as_bytes().to_vec();
 
     let (mut conn, mut h3, mut udp, quic_us, h3_us) = h3_connect_timed(addr, &mut cfg)?;
     let mut reqs = 0usize;
@@ -1106,7 +1333,10 @@ fn bench_h3_phases(addr: &str, path: &str, n: usize, warmup: usize, skip_verify:
     for _ in 0..warmup {
         if reqs >= H3_MAX_STREAMS {
             let (c, h, u, _, _) = h3_connect_timed(addr, &mut cfg)?;
-            conn = c; h3 = h; udp = u; reqs = 0;
+            conn = c;
+            h3 = h;
+            udp = u;
+            reqs = 0;
         }
         h3_timed_get(&mut conn, &mut h3, &udp, &pb)?;
         reqs += 1;
@@ -1114,13 +1344,16 @@ fn bench_h3_phases(addr: &str, path: &str, n: usize, warmup: usize, skip_verify:
 
     // Record connection phases from the first post-warmup connection
     s.connect.push(quic_us);
-    s.tls.push(0.0);         // QUIC hs includes TLS; reported as connect
+    s.tls.push(0.0); // QUIC hs includes TLS; reported as connect
     s.proto_setup.push(h3_us);
 
     for _ in 0..n {
         if reqs >= H3_MAX_STREAMS {
             let (c, h, u, qus, h3us) = h3_connect_timed(addr, &mut cfg)?;
-            conn = c; h3 = h; udp = u; reqs = 0;
+            conn = c;
+            h3 = h;
+            udp = u;
+            reqs = 0;
             s.connect.push(qus);
             s.proto_setup.push(h3us);
         }
@@ -1140,31 +1373,55 @@ fn bench_h3_phases(addr: &str, path: &str, n: usize, warmup: usize, skip_verify:
 /// Mirrors the logic in hints.rs so the bench sees the same assets.
 fn extract_assets(html: &[u8]) -> Vec<String> {
     const ASSET_EXTS: &[&str] = &[
-        ".css", ".js", ".woff2", ".woff", ".png", ".jpg", ".jpeg",
-        ".webp", ".gif", ".svg", ".ico",
+        ".css", ".js", ".woff2", ".woff", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg", ".ico",
     ];
 
     let mut out = Vec::new();
-    let mut i   = 0usize;
+    let mut i = 0usize;
 
     while i < html.len() {
         // Match href= or src= (both quoted and unquoted values — minified HTML omits quotes)
-        let skip = if html[i..].starts_with(b"href=") { 5 }
-                   else if html[i..].starts_with(b"src=") { 4 }
-                   else { i += 1; continue; };
+        let skip = if html[i..].starts_with(b"href=") {
+            5
+        } else if html[i..].starts_with(b"src=") {
+            4
+        } else {
+            i += 1;
+            continue;
+        };
         i += skip;
-        if i >= html.len() { break; }
+        if i >= html.len() {
+            break;
+        }
 
         // Skip optional opening quote
         let quoted = html[i] == b'"' || html[i] == b'\'';
-        let close  = if quoted { let q = html[i]; i += 1; q } else { b' ' };
-        let start  = i;
+        let close = if quoted {
+            let q = html[i];
+            i += 1;
+            q
+        } else {
+            b' '
+        };
+        let start = i;
 
         // Read until closing quote, whitespace, or '>'
         while i < html.len() {
             let b = html[i];
-            if quoted  && b == close { break; }
-            if !quoted && (b == b' ' || b == b'\t' || b == b'\r' || b == b'\n' || b == b'>' || b == b'"' || b == b'\'') { break; }
+            if quoted && b == close {
+                break;
+            }
+            if !quoted
+                && (b == b' '
+                    || b == b'\t'
+                    || b == b'\r'
+                    || b == b'\n'
+                    || b == b'>'
+                    || b == b'"'
+                    || b == b'\'')
+            {
+                break;
+            }
             i += 1;
         }
 
@@ -1184,9 +1441,13 @@ fn extract_assets(html: &[u8]) -> Vec<String> {
 
 // ── Full-page-load benchmarks ─────────────────────────────────────────────────
 
-fn bench_h1_fullpage(addr: &str, html_path: &str, n: usize, warmup: usize, tls_cfg: Arc<ClientConfig>)
-    -> anyhow::Result<FullPageSamples>
-{
+fn bench_h1_fullpage(
+    addr: &str,
+    html_path: &str,
+    n: usize,
+    warmup: usize,
+    tls_cfg: Arc<ClientConfig>,
+) -> anyhow::Result<FullPageSamples> {
     // Discover assets from a pre-warmup fetch
     let (html_body, _, _, _, _, _) = h1_timed_get(addr, html_path, Arc::clone(&tls_cfg))?;
     let assets = extract_assets(&html_body);
@@ -1222,9 +1483,13 @@ fn bench_h1_fullpage(addr: &str, html_path: &str, n: usize, warmup: usize, tls_c
     Ok(s)
 }
 
-fn bench_h2_fullpage(addr: &str, html_path: &str, n: usize, warmup: usize, skip_verify: bool)
-    -> anyhow::Result<FullPageSamples>
-{
+fn bench_h2_fullpage(
+    addr: &str,
+    html_path: &str,
+    n: usize,
+    warmup: usize,
+    skip_verify: bool,
+) -> anyhow::Result<FullPageSamples> {
     let tls_cfg = make_tls_config_h2(skip_verify);
 
     // Discover assets
@@ -1275,9 +1540,13 @@ fn bench_h2_fullpage(addr: &str, html_path: &str, n: usize, warmup: usize, skip_
     Ok(s)
 }
 
-fn bench_h3_fullpage(addr: &str, html_path: &str, n: usize, warmup: usize, skip_verify: bool)
-    -> anyhow::Result<FullPageSamples>
-{
+fn bench_h3_fullpage(
+    addr: &str,
+    html_path: &str,
+    n: usize,
+    warmup: usize,
+    skip_verify: bool,
+) -> anyhow::Result<FullPageSamples> {
     let mut cfg = make_quiche_cfg(skip_verify);
 
     // Discover assets
@@ -1290,14 +1559,20 @@ fn bench_h3_fullpage(addr: &str, html_path: &str, n: usize, warmup: usize, skip_
     for _ in 0..warmup {
         if reqs >= H3_MAX_STREAMS {
             let (c, h, u, _, _) = h3_connect_timed(addr, &mut cfg)?;
-            conn = c; h3 = h; udp = u; reqs = 0;
+            conn = c;
+            h3 = h;
+            udp = u;
+            reqs = 0;
         }
         h3_timed_get(&mut conn, &mut h3, &udp, html_path.as_bytes())?;
         reqs += 1;
         for asset in &assets {
             if reqs >= H3_MAX_STREAMS {
                 let (c, h, u, _, _) = h3_connect_timed(addr, &mut cfg)?;
-                conn = c; h3 = h; udp = u; reqs = 0;
+                conn = c;
+                h3 = h;
+                udp = u;
+                reqs = 0;
             }
             h3_timed_get(&mut conn, &mut h3, &udp, asset.as_bytes())?;
             reqs += 1;
@@ -1313,7 +1588,10 @@ fn bench_h3_fullpage(addr: &str, html_path: &str, n: usize, warmup: usize, skip_
         let reqs_needed = 1 + assets_owned.len();
         if reqs + reqs_needed > H3_MAX_STREAMS {
             let (c, h, u, _, _) = h3_connect_timed(addr, &mut cfg)?;
-            conn = c; h3 = h; udp = u; reqs = 0;
+            conn = c;
+            h3 = h;
+            udp = u;
+            reqs = 0;
         }
 
         let t_start = Instant::now();
@@ -1340,13 +1618,19 @@ fn bench_h3_fullpage(addr: &str, html_path: &str, n: usize, warmup: usize, skip_
 // ── Text reporter ─────────────────────────────────────────────────────────────
 
 fn print_stats(stats: &[BoxStats]) {
-    if stats.is_empty() { return; }
-    println!("{:<35} {:>7} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}",
-        "phase", "n", "p5", "p25", "p50", "p75", "p95", "mean", "stddev", "max");
+    if stats.is_empty() {
+        return;
+    }
+    println!(
+        "{:<35} {:>7} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}",
+        "phase", "n", "p5", "p25", "p50", "p75", "p95", "mean", "stddev", "max"
+    );
     println!("{}", "-".repeat(110));
     for s in stats {
-        println!("{:<35} {:>7} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1}  µs",
-            s.label, s.n, s.p5, s.p25, s.p50, s.p75, s.p95, s.mean, s.stddev, s.max);
+        println!(
+            "{:<35} {:>7} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1}  µs",
+            s.label, s.n, s.p5, s.p25, s.p50, s.p75, s.p95, s.mean, s.stddev, s.max
+        );
     }
     println!();
 }
@@ -1361,14 +1645,16 @@ fn print_stats(stats: &[BoxStats]) {
 //   Top:         50px for title
 
 fn write_boxwhisker_svg(stats: &[BoxStats], title: &str, path: &str) -> std::io::Result<()> {
-    if stats.is_empty() { return Ok(()); }
+    if stats.is_empty() {
+        return Ok(());
+    }
 
     let label_w: f64 = 220.0;
-    let plot_w:  f64 = 900.0;
-    let row_h:   f64 = 44.0;
-    let top:     f64 = 60.0;
-    let bottom:  f64 = 60.0;
-    let box_h:   f64 = 20.0;
+    let plot_w: f64 = 900.0;
+    let row_h: f64 = 44.0;
+    let top: f64 = 60.0;
+    let bottom: f64 = 60.0;
+    let box_h: f64 = 20.0;
     let canvas_w = (label_w + plot_w + 40.0) as u32;
     let canvas_h = (top + row_h * stats.len() as f64 + bottom) as u32;
 
@@ -1384,131 +1670,305 @@ fn write_boxwhisker_svg(stats: &[BoxStats], title: &str, path: &str) -> std::io:
     }
 
     let mut svg = String::with_capacity(32_768);
-    el!(svg, "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{}\" height=\"{}\" \
-              font-family=\"monospace\" font-size=\"13\">", canvas_w, canvas_h);
+    el!(
+        svg,
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{}\" height=\"{}\" \
+              font-family=\"monospace\" font-size=\"13\">",
+        canvas_w,
+        canvas_h
+    );
 
     // Background
-    el!(svg, "<rect width=\"{}\" height=\"{}\" fill=\"{}\"/>", canvas_w, canvas_h, "#f8f9fa");
+    el!(
+        svg,
+        "<rect width=\"{}\" height=\"{}\" fill=\"{}\"/>",
+        canvas_w,
+        canvas_h,
+        "#f8f9fa"
+    );
 
     // Title
-    el!(svg, "<text x=\"{:.1}\" y=\"30\" font-size=\"16\" font-weight=\"bold\" \
+    el!(
+        svg,
+        "<text x=\"{:.1}\" y=\"30\" font-size=\"16\" font-weight=\"bold\" \
               fill=\"{}\" text-anchor=\"middle\">{}</text>",
-        canvas_w as f64 / 2.0, "#222", title);
+        canvas_w as f64 / 2.0,
+        "#222",
+        title
+    );
 
     // X-axis
     let n_ticks = 5usize;
     let axis_y = top + row_h * stats.len() as f64;
-    el!(svg, "<line x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" \
+    el!(
+        svg,
+        "<line x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" \
               stroke=\"{}\" stroke-width=\"1\"/>",
-        to_x(0.0), axis_y, to_x(x_max), axis_y, "#aaa");
+        to_x(0.0),
+        axis_y,
+        to_x(x_max),
+        axis_y,
+        "#aaa"
+    );
     for t in 0..=n_ticks {
-        let v  = x_max * t as f64 / n_ticks as f64;
+        let v = x_max * t as f64 / n_ticks as f64;
         let tx = to_x(v);
-        el!(svg, "<line x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" \
+        el!(
+            svg,
+            "<line x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" \
                   stroke=\"{}\" stroke-width=\"1\"/>",
-            tx, axis_y, tx, axis_y + 5.0, "#aaa");
-        el!(svg, "<text x=\"{:.1}\" y=\"{:.1}\" text-anchor=\"middle\" fill=\"{}\">{:.0}µs</text>",
-            tx, axis_y + 18.0, "#555", v);
+            tx,
+            axis_y,
+            tx,
+            axis_y + 5.0,
+            "#aaa"
+        );
+        el!(
+            svg,
+            "<text x=\"{:.1}\" y=\"{:.1}\" text-anchor=\"middle\" fill=\"{}\">{:.0}µs</text>",
+            tx,
+            axis_y + 18.0,
+            "#555",
+            v
+        );
     }
-    el!(svg, "<text x=\"{:.1}\" y=\"{:.1}\" text-anchor=\"middle\" fill=\"{}\" \
+    el!(
+        svg,
+        "<text x=\"{:.1}\" y=\"{:.1}\" text-anchor=\"middle\" fill=\"{}\" \
               font-size=\"12\">Latency (µs)</text>",
-        label_w + plot_w / 2.0, axis_y + 36.0, "#555");
+        label_w + plot_w / 2.0,
+        axis_y + 36.0,
+        "#555"
+    );
 
     // Grid lines
     for t in 0..=n_ticks {
-        let v  = x_max * t as f64 / n_ticks as f64;
+        let v = x_max * t as f64 / n_ticks as f64;
         let tx = to_x(v);
-        el!(svg, "<line x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" \
+        el!(
+            svg,
+            "<line x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" \
                   stroke=\"{}\" stroke-width=\"1\" stroke-dasharray=\"4,4\"/>",
-            tx, top, tx, axis_y, "#ddd");
+            tx,
+            top,
+            tx,
+            axis_y,
+            "#ddd"
+        );
     }
 
     // One row per phase
     for (i, s) in stats.iter().enumerate() {
-        let cy           = top + row_h * i as f64 + row_h / 2.0;
-        let y_box_top    = cy - box_h / 2.0;
+        let cy = top + row_h * i as f64 + row_h / 2.0;
+        let y_box_top = cy - box_h / 2.0;
         let y_box_bottom = cy + box_h / 2.0;
 
         // Alternating row background
         if i % 2 == 0 {
-            el!(svg, "<rect x=\"0\" y=\"{:.1}\" width=\"{}\" height=\"{:.1}\" \
+            el!(
+                svg,
+                "<rect x=\"0\" y=\"{:.1}\" width=\"{}\" height=\"{:.1}\" \
                       fill=\"{}\" opacity=\"0.5\"/>",
-                top + row_h * i as f64, canvas_w, row_h, "#eef0f4");
+                top + row_h * i as f64,
+                canvas_w,
+                row_h,
+                "#eef0f4"
+            );
         }
 
         // Phase label (strip "proto/" prefix for display)
-        let display_label = s.label.split('/').last().unwrap_or(&s.label);
-        el!(svg, "<text x=\"{:.1}\" y=\"{:.1}\" text-anchor=\"end\" fill=\"{}\" \
+        let display_label = s.label.split('/').next_back().unwrap_or(&s.label);
+        el!(
+            svg,
+            "<text x=\"{:.1}\" y=\"{:.1}\" text-anchor=\"end\" fill=\"{}\" \
                   dominant-baseline=\"middle\">{}</text>",
-            label_w - 8.0, cy, "#333", display_label);
+            label_w - 8.0,
+            cy,
+            "#333",
+            display_label
+        );
 
         // Whisker line: p5 → p95
-        el!(svg, "<line x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" \
+        el!(
+            svg,
+            "<line x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" \
                   stroke=\"{}\" stroke-width=\"2\"/>",
-            to_x(s.p5), cy, to_x(s.p95), cy, "#6699cc");
+            to_x(s.p5),
+            cy,
+            to_x(s.p95),
+            cy,
+            "#6699cc"
+        );
         // Whisker caps
         for &v in &[s.p5, s.p95] {
             let vx = to_x(v);
-            el!(svg, "<line x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" \
+            el!(
+                svg,
+                "<line x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" \
                       stroke=\"{}\" stroke-width=\"2\"/>",
-                vx, y_box_top, vx, y_box_bottom, "#6699cc");
+                vx,
+                y_box_top,
+                vx,
+                y_box_bottom,
+                "#6699cc"
+            );
         }
 
         // IQR box (Q1 → Q3)
-        let bx     = to_x(s.p25);
+        let bx = to_x(s.p25);
         let bwidth = (to_x(s.p75) - bx).max(1.0);
-        el!(svg, "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" \
+        el!(
+            svg,
+            "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" \
                   fill=\"{}\" opacity=\"0.7\" rx=\"2\"/>",
-            bx, y_box_top, bwidth, box_h, "#4488cc");
+            bx,
+            y_box_top,
+            bwidth,
+            box_h,
+            "#4488cc"
+        );
 
         // Median line
         let mx = to_x(s.p50);
-        el!(svg, "<line x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" \
+        el!(
+            svg,
+            "<line x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" \
                   stroke=\"{}\" stroke-width=\"2.5\"/>",
-            mx, y_box_top, mx, y_box_bottom, "#fff");
+            mx,
+            y_box_top,
+            mx,
+            y_box_bottom,
+            "#fff"
+        );
 
         // Mean diamond
         let mnx = to_x(s.mean);
-        let d   = 5.0_f64;
-        el!(svg, "<polygon points=\"{:.1},{:.1} {:.1},{:.1} {:.1},{:.1} {:.1},{:.1}\" \
+        let d = 5.0_f64;
+        el!(
+            svg,
+            "<polygon points=\"{:.1},{:.1} {:.1},{:.1} {:.1},{:.1} {:.1},{:.1}\" \
                   fill=\"{}\" opacity=\"0.9\"/>",
-            mnx-d, cy, mnx, cy-d, mnx+d, cy, mnx, cy+d, "#ff6600");
+            mnx - d,
+            cy,
+            mnx,
+            cy - d,
+            mnx + d,
+            cy,
+            mnx,
+            cy + d,
+            "#ff6600"
+        );
 
         // p50 label centred in box
-        el!(svg, "<text x=\"{:.1}\" y=\"{:.1}\" font-size=\"11\" fill=\"{}\" \
+        el!(
+            svg,
+            "<text x=\"{:.1}\" y=\"{:.1}\" font-size=\"11\" fill=\"{}\" \
                   dominant-baseline=\"middle\" text-anchor=\"middle\">p50={:.0}</text>",
-            (to_x(s.p25) + to_x(s.p75)) / 2.0, cy, "#ddf", s.p50);
+            (to_x(s.p25) + to_x(s.p75)) / 2.0,
+            cy,
+            "#ddf",
+            s.p50
+        );
 
         // p5 / p95 labels
-        el!(svg, "<text x=\"{:.1}\" y=\"{:.1}\" font-size=\"10\" fill=\"{}\" \
+        el!(
+            svg,
+            "<text x=\"{:.1}\" y=\"{:.1}\" font-size=\"10\" fill=\"{}\" \
                   text-anchor=\"middle\">{:.0}</text>",
-            to_x(s.p5), y_box_top - 2.0, "#666", s.p5);
-        el!(svg, "<text x=\"{:.1}\" y=\"{:.1}\" font-size=\"10\" fill=\"{}\" \
+            to_x(s.p5),
+            y_box_top - 2.0,
+            "#666",
+            s.p5
+        );
+        el!(
+            svg,
+            "<text x=\"{:.1}\" y=\"{:.1}\" font-size=\"10\" fill=\"{}\" \
                   text-anchor=\"middle\">{:.0}</text>",
-            to_x(s.p95), y_box_top - 2.0, "#666", s.p95);
+            to_x(s.p95),
+            y_box_top - 2.0,
+            "#666",
+            s.p95
+        );
     }
 
     // Legend
     let lx = label_w + plot_w + 5.0;
     let ly = top + 10.0;
-    el!(svg, "<rect x=\"{:.0}\" y=\"{:.0}\" width=\"14\" height=\"14\" fill=\"{}\" opacity=\"0.7\"/>",
-        lx, ly, "#4488cc");
-    el!(svg, "<text x=\"{:.0}\" y=\"{:.0}\" font-size=\"11\" fill=\"{}\" \
-              dominant-baseline=\"middle\">IQR (p25-p75)</text>", lx+18.0, ly+7.0, "#444");
-    el!(svg, "<line x1=\"{:.0}\" y1=\"{:.0}\" x2=\"{:.0}\" y2=\"{:.0}\" \
-              stroke=\"{}\" stroke-width=\"2\"/>", lx, ly+24.0, lx+14.0, ly+24.0, "#6699cc");
-    el!(svg, "<text x=\"{:.0}\" y=\"{:.0}\" font-size=\"11\" fill=\"{}\" \
-              dominant-baseline=\"middle\">p5-p95 whiskers</text>", lx+18.0, ly+24.0, "#444");
-    let dlx = lx + 10.0; let dly = ly + 38.0;
-    el!(svg, "<polygon points=\"{:.1},{:.1} {:.1},{:.1} {:.1},{:.1} {:.1},{:.1}\" \
+    el!(
+        svg,
+        "<rect x=\"{:.0}\" y=\"{:.0}\" width=\"14\" height=\"14\" fill=\"{}\" opacity=\"0.7\"/>",
+        lx,
+        ly,
+        "#4488cc"
+    );
+    el!(
+        svg,
+        "<text x=\"{:.0}\" y=\"{:.0}\" font-size=\"11\" fill=\"{}\" \
+              dominant-baseline=\"middle\">IQR (p25-p75)</text>",
+        lx + 18.0,
+        ly + 7.0,
+        "#444"
+    );
+    el!(
+        svg,
+        "<line x1=\"{:.0}\" y1=\"{:.0}\" x2=\"{:.0}\" y2=\"{:.0}\" \
+              stroke=\"{}\" stroke-width=\"2\"/>",
+        lx,
+        ly + 24.0,
+        lx + 14.0,
+        ly + 24.0,
+        "#6699cc"
+    );
+    el!(
+        svg,
+        "<text x=\"{:.0}\" y=\"{:.0}\" font-size=\"11\" fill=\"{}\" \
+              dominant-baseline=\"middle\">p5-p95 whiskers</text>",
+        lx + 18.0,
+        ly + 24.0,
+        "#444"
+    );
+    let dlx = lx + 10.0;
+    let dly = ly + 38.0;
+    el!(
+        svg,
+        "<polygon points=\"{:.1},{:.1} {:.1},{:.1} {:.1},{:.1} {:.1},{:.1}\" \
               fill=\"{}\" opacity=\"0.9\"/>",
-        dlx-5.0, dly, dlx, dly-5.0, dlx+5.0, dly, dlx, dly+5.0, "#ff6600");
-    el!(svg, "<text x=\"{:.0}\" y=\"{:.0}\" font-size=\"11\" fill=\"{}\" \
-              dominant-baseline=\"middle\">mean</text>", lx+18.0, dly, "#444");
-    el!(svg, "<line x1=\"{:.0}\" y1=\"{:.0}\" x2=\"{:.0}\" y2=\"{:.0}\" \
-              stroke=\"{}\" stroke-width=\"2.5\"/>", lx, ly+52.0, lx+14.0, ly+52.0, "#555");
-    el!(svg, "<text x=\"{:.0}\" y=\"{:.0}\" font-size=\"11\" fill=\"{}\" \
-              dominant-baseline=\"middle\">median (p50)</text>", lx+18.0, ly+52.0, "#444");
+        dlx - 5.0,
+        dly,
+        dlx,
+        dly - 5.0,
+        dlx + 5.0,
+        dly,
+        dlx,
+        dly + 5.0,
+        "#ff6600"
+    );
+    el!(
+        svg,
+        "<text x=\"{:.0}\" y=\"{:.0}\" font-size=\"11\" fill=\"{}\" \
+              dominant-baseline=\"middle\">mean</text>",
+        lx + 18.0,
+        dly,
+        "#444"
+    );
+    el!(
+        svg,
+        "<line x1=\"{:.0}\" y1=\"{:.0}\" x2=\"{:.0}\" y2=\"{:.0}\" \
+              stroke=\"{}\" stroke-width=\"2.5\"/>",
+        lx,
+        ly + 52.0,
+        lx + 14.0,
+        ly + 52.0,
+        "#555"
+    );
+    el!(
+        svg,
+        "<text x=\"{:.0}\" y=\"{:.0}\" font-size=\"11\" fill=\"{}\" \
+              dominant-baseline=\"middle\">median (p50)</text>",
+        lx + 18.0,
+        ly + 52.0,
+        "#444"
+    );
 
     svg.push_str("\n</svg>\n");
     std::fs::write(path, &svg)
@@ -1522,22 +1982,29 @@ fn main() {
     const WARMUP: usize = 100;
     const HTML_PATH: &str = "/";
 
-    println!("m6-bench-detail  target={}  h2c-target={}  n={}  skip-verify={}  warmup={}",
-             args.addr, args.h2c_addr, args.n, args.skip_verify, WARMUP);
+    println!(
+        "m6-bench-detail  target={}  h2c-target={}  n={}  skip-verify={}  warmup={}",
+        args.addr, args.h2c_addr, args.n, args.skip_verify, WARMUP
+    );
     println!("{}", "=".repeat(110));
 
     // ── HTTP/1.1 ──────────────────────────────────────────────────────────────
     if args.http11 {
-        println!("\n[HTTP/1.1] Per-phase breakdown (n={}, cache pre-warmed, {} warmup req discarded)",
-                 args.n, WARMUP);
+        println!(
+            "\n[HTTP/1.1] Per-phase breakdown (n={}, cache pre-warmed, {} warmup req discarded)",
+            args.n, WARMUP
+        );
         let tls_cfg = make_tls_config_h1(args.skip_verify);
         match bench_h1_phases(&args.addr, HTML_PATH, args.n, WARMUP, Arc::clone(&tls_cfg)) {
             Ok(samples) => {
                 let stats = samples.into_stats("HTTP/1.1");
                 print_stats(&stats);
                 let svg_path = format!("{}/m6_latency_h1_phases.svg", args.out_dir);
-                if let Err(e) = write_boxwhisker_svg(&stats,
-                    &format!("HTTP/1.1 Per-Phase Latency  (n={}, µs)", args.n), &svg_path) {
+                if let Err(e) = write_boxwhisker_svg(
+                    &stats,
+                    &format!("HTTP/1.1 Per-Phase Latency  (n={}, µs)", args.n),
+                    &svg_path,
+                ) {
                     eprintln!("SVG write error: {e}");
                 } else {
                     println!("Chart: {svg_path}");
@@ -1552,8 +2019,11 @@ fn main() {
                 let stats = samples.into_stats("HTTP/1.1");
                 print_stats(&stats);
                 let svg_path = format!("{}/m6_latency_h1_fullpage.svg", args.out_dir);
-                if let Err(e) = write_boxwhisker_svg(&stats,
-                    &format!("HTTP/1.1 Full-Page Load  (n={}, µs)", args.n), &svg_path) {
+                if let Err(e) = write_boxwhisker_svg(
+                    &stats,
+                    &format!("HTTP/1.1 Full-Page Load  (n={}, µs)", args.n),
+                    &svg_path,
+                ) {
                     eprintln!("SVG write error: {e}");
                 } else {
                     println!("Chart: {svg_path}");
@@ -1565,15 +2035,20 @@ fn main() {
 
     // ── HTTP/2 ────────────────────────────────────────────────────────────────
     if args.http2 {
-        println!("\n[HTTP/2] Per-phase breakdown (n={}, cache pre-warmed, {} warmup req discarded)",
-                 args.n, WARMUP);
+        println!(
+            "\n[HTTP/2] Per-phase breakdown (n={}, cache pre-warmed, {} warmup req discarded)",
+            args.n, WARMUP
+        );
         match bench_h2_phases(&args.addr, HTML_PATH, args.n, WARMUP, args.skip_verify) {
             Ok(samples) => {
                 let stats = samples.into_stats("HTTP/2");
                 print_stats(&stats);
                 let svg_path = format!("{}/m6_latency_h2_phases.svg", args.out_dir);
-                if let Err(e) = write_boxwhisker_svg(&stats,
-                    &format!("HTTP/2 Per-Phase Latency  (n={}, µs)", args.n), &svg_path) {
+                if let Err(e) = write_boxwhisker_svg(
+                    &stats,
+                    &format!("HTTP/2 Per-Phase Latency  (n={}, µs)", args.n),
+                    &svg_path,
+                ) {
                     eprintln!("SVG write error: {e}");
                 } else {
                     println!("Chart: {svg_path}");
@@ -1588,8 +2063,11 @@ fn main() {
                 let stats = samples.into_stats("HTTP/2");
                 print_stats(&stats);
                 let svg_path = format!("{}/m6_latency_h2_fullpage.svg", args.out_dir);
-                if let Err(e) = write_boxwhisker_svg(&stats,
-                    &format!("HTTP/2 Full-Page Load  (n={}, µs)", args.n), &svg_path) {
+                if let Err(e) = write_boxwhisker_svg(
+                    &stats,
+                    &format!("HTTP/2 Full-Page Load  (n={}, µs)", args.n),
+                    &svg_path,
+                ) {
                     eprintln!("SVG write error: {e}");
                 } else {
                     println!("Chart: {svg_path}");
@@ -1601,15 +2079,20 @@ fn main() {
 
     // ── HTTP/3 ────────────────────────────────────────────────────────────────
     if args.http3 {
-        println!("\n[HTTP/3] Per-phase breakdown (n={}, cache pre-warmed, {} warmup req discarded)",
-                 args.n, WARMUP);
+        println!(
+            "\n[HTTP/3] Per-phase breakdown (n={}, cache pre-warmed, {} warmup req discarded)",
+            args.n, WARMUP
+        );
         match bench_h3_phases(&args.addr, HTML_PATH, args.n, WARMUP, args.skip_verify) {
             Ok(samples) => {
                 let stats = samples.into_stats("HTTP/3");
                 print_stats(&stats);
                 let svg_path = format!("{}/m6_latency_h3_phases.svg", args.out_dir);
-                if let Err(e) = write_boxwhisker_svg(&stats,
-                    &format!("HTTP/3 Per-Phase Latency  (n={}, µs)", args.n), &svg_path) {
+                if let Err(e) = write_boxwhisker_svg(
+                    &stats,
+                    &format!("HTTP/3 Per-Phase Latency  (n={}, µs)", args.n),
+                    &svg_path,
+                ) {
                     eprintln!("SVG write error: {e}");
                 } else {
                     println!("Chart: {svg_path}");
@@ -1624,8 +2107,11 @@ fn main() {
                 let stats = samples.into_stats("HTTP/3");
                 print_stats(&stats);
                 let svg_path = format!("{}/m6_latency_h3_fullpage.svg", args.out_dir);
-                if let Err(e) = write_boxwhisker_svg(&stats,
-                    &format!("HTTP/3 Full-Page Load  (n={}, µs)", args.n), &svg_path) {
+                if let Err(e) = write_boxwhisker_svg(
+                    &stats,
+                    &format!("HTTP/3 Full-Page Load  (n={}, µs)", args.n),
+                    &svg_path,
+                ) {
                     eprintln!("SVG write error: {e}");
                 } else {
                     println!("Chart: {svg_path}");
@@ -1637,15 +2123,20 @@ fn main() {
 
     // ── H2C ───────────────────────────────────────────────────────────────────
     if args.h2c {
-        println!("\n[H2C] Per-phase breakdown (n={}, cache pre-warmed, {} warmup req discarded)",
-                 args.n, WARMUP);
+        println!(
+            "\n[H2C] Per-phase breakdown (n={}, cache pre-warmed, {} warmup req discarded)",
+            args.n, WARMUP
+        );
         match bench_h2c_phases(&args.h2c_addr, HTML_PATH, args.n, WARMUP) {
             Ok(samples) => {
                 let stats = samples.into_stats("H2C");
                 print_stats(&stats);
                 let svg_path = format!("{}/m6_latency_h2c_phases.svg", args.out_dir);
-                if let Err(e) = write_boxwhisker_svg(&stats,
-                    &format!("H2C Per-Phase Latency  (n={}, µs)", args.n), &svg_path) {
+                if let Err(e) = write_boxwhisker_svg(
+                    &stats,
+                    &format!("H2C Per-Phase Latency  (n={}, µs)", args.n),
+                    &svg_path,
+                ) {
                     eprintln!("SVG write error: {e}");
                 } else {
                     println!("Chart: {svg_path}");
@@ -1660,8 +2151,11 @@ fn main() {
                 let stats = samples.into_stats("H2C");
                 print_stats(&stats);
                 let svg_path = format!("{}/m6_latency_h2c_fullpage.svg", args.out_dir);
-                if let Err(e) = write_boxwhisker_svg(&stats,
-                    &format!("H2C Full-Page Load  (n={}, µs)", args.n), &svg_path) {
+                if let Err(e) = write_boxwhisker_svg(
+                    &stats,
+                    &format!("H2C Full-Page Load  (n={}, µs)", args.n),
+                    &svg_path,
+                ) {
                     eprintln!("SVG write error: {e}");
                 } else {
                     println!("Chart: {svg_path}");

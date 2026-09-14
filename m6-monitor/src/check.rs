@@ -27,7 +27,12 @@ pub fn render(d: &Digest, readings: &[NodeReading]) -> String {
     let bar = "=".repeat(74);
 
     let _ = writeln!(o, "\n{bar}");
-    let _ = writeln!(o, "m6 fleet health check   {}   {} node(s)", d.generated_at, d.nodes.len());
+    let _ = writeln!(
+        o,
+        "m6 fleet health check   {}   {} node(s)",
+        d.generated_at,
+        d.nodes.len()
+    );
     let _ = writeln!(o, "{bar}");
 
     // ── A. logging ───────────────────────────────────────────────────────────
@@ -64,14 +69,19 @@ pub fn render(d: &Digest, readings: &[NodeReading]) -> String {
                     o,
                     "  {:<5} unknown  {}",
                     r.name,
-                    r.unreachable.as_deref().unwrap_or("no traffic summary and no reason given")
+                    r.unreachable
+                        .as_deref()
+                        .unwrap_or("no traffic summary and no reason given")
                 );
             }
         }
     }
 
     // ── B. performance ───────────────────────────────────────────────────────
-    let _ = writeln!(o, "\nB. PERFORMANCE  (observed; this tool generates no traffic)");
+    let _ = writeln!(
+        o,
+        "\nB. PERFORMANCE  (observed; this tool generates no traffic)"
+    );
     let _ = writeln!(
         o,
         "  {:<5} {:>9} {:>8} {:>10} {:>10} {:>8}",
@@ -82,11 +92,21 @@ pub fn render(d: &Digest, readings: &[NodeReading]) -> String {
             o,
             "  {:<5} {:>9} {:>8} {:>10} {:>10} {:>8}",
             n.name,
-            n.requests_total.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
-            n.hit_rate.map(|v| format!("{v:.4}")).unwrap_or_else(|| "-".into()),
-            n.hit_p50_ns.map(|v| format!("{v}ns")).unwrap_or_else(|| "-".into()),
-            n.hit_p99_ns.map(|v| format!("{v}ns")).unwrap_or_else(|| "-".into()),
-            n.backend_errors.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
+            n.requests_total
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".into()),
+            n.hit_rate
+                .map(|v| format!("{v:.4}"))
+                .unwrap_or_else(|| "-".into()),
+            n.hit_p50_ns
+                .map(|v| format!("{v}ns"))
+                .unwrap_or_else(|| "-".into()),
+            n.hit_p99_ns
+                .map(|v| format!("{v}ns"))
+                .unwrap_or_else(|| "-".into()),
+            n.backend_errors
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".into()),
         );
     }
     let _ = writeln!(
@@ -99,7 +119,9 @@ pub fn render(d: &Digest, readings: &[NodeReading]) -> String {
             o,
             "  {:<5} rtt {}",
             n.name,
-            n.rtt_ms.map(|v| format!("{v:.1}ms")).unwrap_or_else(|| "-".into())
+            n.rtt_ms
+                .map(|v| format!("{v:.1}ms"))
+                .unwrap_or_else(|| "-".into())
         );
     }
 
@@ -114,9 +136,15 @@ pub fn render(d: &Digest, readings: &[NodeReading]) -> String {
                 (Some(l), Some(c)) => format!("{l:.2}/{c}cpu"),
                 _ => "-".to_string(),
             },
-            n.memory_used.map(|v| format!("{:.0}%", v * 100.0)).unwrap_or_else(|| "-".into()),
-            n.disk_used.map(|v| format!("{:.0}%", v * 100.0)).unwrap_or_else(|| "-".into()),
-            n.thermal_max_c.map(|c| format!("{c:.0}C")).unwrap_or_else(|| "-".into()),
+            n.memory_used
+                .map(|v| format!("{:.0}%", v * 100.0))
+                .unwrap_or_else(|| "-".into()),
+            n.disk_used
+                .map(|v| format!("{:.0}%", v * 100.0))
+                .unwrap_or_else(|| "-".into()),
+            n.thermal_max_c
+                .map(|c| format!("{c:.0}C"))
+                .unwrap_or_else(|| "-".into()),
             n.uptime_s.map(fmt_dur).unwrap_or_else(|| "-".into()),
         );
     }
@@ -134,19 +162,29 @@ pub fn render(d: &Digest, readings: &[NodeReading]) -> String {
             let _ = writeln!(
                 o,
                 "        top: {} x{} {} ({:.0}% refused, {} UA)",
-                h.ip, h.requests, h.top_path, h.error_ratio * 100.0, h.user_agents
+                h.ip,
+                h.requests,
+                h.top_path,
+                h.error_ratio * 100.0,
+                h.user_agents
             );
         }
         for c in &t.notable {
             let _ = writeln!(
                 o,
                 "  {:<5} NOTABLE {} x{} {}..{}",
-                r.name, c.ip, c.requests,
+                r.name,
+                c.ip,
+                c.requests,
                 c.first_seen.get(11..19).unwrap_or(""),
                 c.last_seen.get(11..19).unwrap_or("")
             );
             if c.rotating_user_agents {
-                let _ = writeln!(o, "        {} distinct user agents (rotating)", c.distinct_user_agents);
+                let _ = writeln!(
+                    o,
+                    "        {} distinct user agents (rotating)",
+                    c.distinct_user_agents
+                );
             }
             for p in c.probe_paths.iter().take(8) {
                 let _ = writeln!(o, "        probe {p}");
@@ -180,7 +218,11 @@ pub fn render(d: &Digest, readings: &[NodeReading]) -> String {
             );
         }
         if t.crawlers.is_empty() {
-            let _ = writeln!(o, "  {:<5} no genuine crawler traffic in the window", r.name);
+            let _ = writeln!(
+                o,
+                "  {:<5} no genuine crawler traffic in the window",
+                r.name
+            );
             continue;
         }
         any = true;
@@ -195,7 +237,12 @@ pub fn render(d: &Digest, readings: &[NodeReading]) -> String {
                 "  {:<5} {:>4}  {}{}",
                 r.name,
                 c.requests,
-                c.client_ips.iter().take(3).cloned().collect::<Vec<_>>().join(", "),
+                c.client_ips
+                    .iter()
+                    .take(3)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", "),
                 more
             );
             let _ = writeln!(o, "        UA: {}", c.user_agent);
@@ -208,8 +255,16 @@ pub fn render(d: &Digest, readings: &[NodeReading]) -> String {
 
     // ── verdict ──────────────────────────────────────────────────────────────
     let _ = writeln!(o, "\n{bar}");
-    let faults: Vec<_> = d.findings.iter().filter(|f| f.level == Level::Fault).collect();
-    let warns: Vec<_> = d.findings.iter().filter(|f| f.level == Level::Warn).collect();
+    let faults: Vec<_> = d
+        .findings
+        .iter()
+        .filter(|f| f.level == Level::Fault)
+        .collect();
+    let warns: Vec<_> = d
+        .findings
+        .iter()
+        .filter(|f| f.level == Level::Warn)
+        .collect();
     if !faults.is_empty() {
         let _ = writeln!(o, "FAULTS ({})", faults.len());
         for f in &faults {
@@ -286,14 +341,20 @@ mod tests {
     /// entire shape of the 2026-09-06 defect.
     #[test]
     fn a_silent_log_is_a_fault_even_on_a_responsive_node() {
-        let quiet = traffic(LoggingHealth { events_total: 5000, seconds_since_last: Some(600) });
+        let quiet = traffic(LoggingHealth {
+            events_total: 5000,
+            seconds_since_last: Some(600),
+        });
         let out = render(&digest(), &[reading("syd", Some(quiet))]);
         assert!(out.contains("FAULT  main log silent for 600s"), "{out}");
     }
 
     #[test]
     fn a_live_log_is_ok() {
-        let alive = traffic(LoggingHealth { events_total: 5000, seconds_since_last: Some(4) });
+        let alive = traffic(LoggingHealth {
+            events_total: 5000,
+            seconds_since_last: Some(4),
+        });
         let out = render(&digest(), &[reading("syd", Some(alive))]);
         assert!(out.contains("ok     last event 4s ago"), "{out}");
     }
@@ -301,7 +362,10 @@ mod tests {
     /// Never having logged must not read as healthy.
     #[test]
     fn never_logged_is_a_fault_not_a_zero() {
-        let never = traffic(LoggingHealth { events_total: 0, seconds_since_last: None });
+        let never = traffic(LoggingHealth {
+            events_total: 0,
+            seconds_since_last: None,
+        });
         let out = render(&digest(), &[reading("syd", Some(never))]);
         assert!(out.contains("nothing has ever been logged"), "{out}");
     }
@@ -320,9 +384,16 @@ mod tests {
     /// Crawlers are reported every run, including when there are none.
     #[test]
     fn crawlers_are_always_a_section() {
-        let out = render(&digest(), &[reading("syd", Some(traffic(
-            LoggingHealth { events_total: 1, seconds_since_last: Some(1) },
-        )))]);
+        let out = render(
+            &digest(),
+            &[reading(
+                "syd",
+                Some(traffic(LoggingHealth {
+                    events_total: 1,
+                    seconds_since_last: Some(1),
+                })),
+            )],
+        );
         assert!(out.contains("E. CRAWLERS"));
         assert!(out.contains("no genuine crawler traffic in the window"));
     }

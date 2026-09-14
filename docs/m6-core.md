@@ -30,7 +30,7 @@ process that terminates them; §4.1 gives the reasoning and the measurement
 behind it.
 
 The test of success is that a new m6 application is small. `m6-html` is six
-lines today and serves every HTML page on mgrosvenor.com. That is the shape
+lines today and serves every HTML page on example.com. That is the shape
 everything else should approach.
 
 ## 2. What it is not

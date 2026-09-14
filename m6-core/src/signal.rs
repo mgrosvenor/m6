@@ -1,48 +1,22 @@
-/// Signal handling for m6 processes: double-SIGTERM graceful shutdown pattern.
-///
-/// `m6-decisions.md` specifies this once, for all tools: SIGTERM and SIGINT are
-/// identical, the first requests a clean shutdown and the second exits
-/// immediately. It was then implemented four times, in four different ways.
-///
-/// **This is the `sigwait` design, adopted from `m6-file`, not the
-/// signal-handler design this module used to carry.** A dedicated thread blocks
-/// the signals and waits for one, so no code ever runs in signal context and
-/// async-signal-safety stops being a concern: the "handler" is ordinary code on
-/// an ordinary thread and may allocate, log or take a lock.
-///
-/// It also solves the problem the handler version ignored. A service blocked in
-/// `accept()` does not notice a flag being set by a handler, so it sits there
-/// until the next connection arrives. [`Service::socket`] exists to poke it
-/// awake, by connecting to the service's own socket.
-///
-/// # One sequence, for every service
-///
-/// [`ShutdownHandle::install`] is the only entry point and it takes a
-/// [`Service`]. The sequence it runs is the same everywhere: log that the
-/// signal arrived, wake the parked loop, and on the way out unlink the socket
-/// and log a completion line. What a service supplies is data, not a different
-/// code path.
-///
-/// # The ordering rule, and why it is enforced
-///
-/// [`block`] must be the first statement of `main`, before anything creates a
-/// thread. Blocking a signal is per-thread: `pthread_sigmask` changes only the
-/// calling thread, and threads inherit the mask **at creation**. A
-/// process-directed signal is delivered to any thread that does not block it,
-/// so one unblocked thread anywhere in the process is enough to take the
-/// default action, which for SIGTERM is death.
-///
-/// That is not hypothetical. Every m6 service initialised logging first, and
-/// `tracing_appender::non_blocking` spawns a writer thread. By the time
-/// `install` blocked the signals in `main`, that writer thread had
-/// existed for a hundred lines and had SIGTERM unblocked. The kernel delivered
-/// every SIGTERM to it, so `m6-file` exited 143 on `systemctl stop` rather than
-/// running its shutdown path, and never unlinked its socket. The `sigwait`
-/// thread was correct and never received a signal in its life.
-///
-/// [`ShutdownHandle::install`] now refuses to start unless [`block`] has
-/// already run, because the failure is silent and only shows up as a service
-/// that will not stop cleanly.
+//! Shutting down on purpose.
+//!
+//! **`block()` must be the first statement of `main`.** The signal mask is
+//! inherited only by threads created after it, and a service's logging writer
+//! is a thread; if it starts first it takes SIGTERM at the default disposition
+//! and the process dies instead of draining. `install_with_hooks` asserts the
+//! mask is set, and that assertion has since caught a real case: the stateful
+//! `App` runners never called `block()`, so SIGTERM handling was quietly wrong
+//! for every service built on them.
+//!
+//! **Log before setting the flag, not after.** The flag is what releases the
+//! main thread, which drains, logs "shutdown complete" and returns from
+//! `main`, and process exit discards whatever is still queued in the writer.
+//! A line logged after the store is racing the whole drain, and on a loaded
+//! machine it loses.
+//!
+//! A `ShutdownHandle` also self-connects to wake a parked `accept`, and
+//! unlinks the socket on the way out so m6-http does not keep a dead member in
+//! its backend pool.
 
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
@@ -135,7 +109,11 @@ pub struct Service {
 impl Service {
     /// A service with no unix socket and no wake pipe.
     pub fn new(name: impl Into<String>) -> Self {
-        Service { name: name.into(), socket: None, wake_fd: None }
+        Service {
+            name: name.into(),
+            socket: None,
+            wake_fd: None,
+        }
     }
 
     /// Set the unix socket to wake through and unlink.
@@ -210,7 +188,11 @@ impl ShutdownHandle {
         // a thread other than main still needs the mask set here.
         block();
 
-        let Service { name, socket, wake_fd } = service;
+        let Service {
+            name,
+            socket,
+            wake_fd,
+        } = service;
         let name: Arc<str> = Arc::from(name);
         let socket = socket.map(Arc::new);
 
@@ -224,47 +206,42 @@ impl ShutdownHandle {
                 let sock = thread_socket.as_deref().map(|p| p.as_path());
                 let name = &*thread_name;
 
-                loop {
-                    match wait_mask.wait() {
-                        Ok(_sig) => {
-                            let count = SIGNAL_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
-                            if count >= 2 {
-                                finish(name, sock, "forced");
-                                std::process::exit(0);
-                            }
-                            // Log BEFORE publishing the flag, not after.
-                            //
-                            // The flag is what releases the main thread: it
-                            // sees `is_shutdown()`, drains, logs "shutdown
-                            // complete" and returns from `main`, and process
-                            // exit discards whatever is still queued in
-                            // `tracing_appender`'s non-blocking writer. With
-                            // the store first, this line was racing the entire
-                            // drain, so a fast service could exit with
-                            // "shutdown complete" written and "shutdown signal
-                            // received" lost.
-                            //
-                            // That is the whole of
-                            // `redirect_lifecycle::sigterm_shuts_down_rather_than_being_ignored`,
-                            // which failed intermittently for weeks and never
-                            // reproduced in isolation: the redirect listener
-                            // gets from start to complete in about 20ms, so
-                            // under load the appender thread is simply
-                            // scheduled too late. Captured 2026-09-12 with the
-                            // journal showing `started`, the listener line, and
-                            // `shutdown complete` -- and nothing in between.
-                            //
-                            // Ordering the other way does not make the log
-                            // durable, it makes it *ordered*: the main thread
-                            // cannot observe the flag until this call has
-                            // returned, so the line is queued ahead of the
-                            // completion line rather than concurrently with it.
-                            tracing::info!("{name} shutdown signal received");
-                            SHUTDOWN_FLAG.store(true, Ordering::SeqCst);
-                            wake(sock, wake_fd);
-                        }
-                        Err(_) => break,
+                while let Ok(_sig) = wait_mask.wait() {
+                    let count = SIGNAL_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
+                    if count >= 2 {
+                        finish(name, sock, "forced");
+                        std::process::exit(0);
                     }
+                    // Log BEFORE publishing the flag, not after.
+                    //
+                    // The flag is what releases the main thread: it
+                    // sees `is_shutdown()`, drains, logs "shutdown
+                    // complete" and returns from `main`, and process
+                    // exit discards whatever is still queued in
+                    // `tracing_appender`'s non-blocking writer. With
+                    // the store first, this line was racing the entire
+                    // drain, so a fast service could exit with
+                    // "shutdown complete" written and "shutdown signal
+                    // received" lost.
+                    //
+                    // That is the whole of
+                    // `redirect_lifecycle::sigterm_shuts_down_rather_than_being_ignored`,
+                    // which failed intermittently for weeks and never
+                    // reproduced in isolation: the redirect listener
+                    // gets from start to complete in about 20ms, so
+                    // under load the appender thread is simply
+                    // scheduled too late. Captured 2026-09-12 with the
+                    // journal showing `started`, the listener line, and
+                    // `shutdown complete` -- and nothing in between.
+                    //
+                    // Ordering the other way does not make the log
+                    // durable, it makes it *ordered*: the main thread
+                    // cannot observe the flag until this call has
+                    // returned, so the line is queued ahead of the
+                    // completion line rather than concurrently with it.
+                    tracing::info!("{name} shutdown signal received");
+                    SHUTDOWN_FLAG.store(true, Ordering::SeqCst);
+                    wake(sock, wake_fd);
                 }
             })
             .expect("spawning the signal thread");
@@ -296,7 +273,11 @@ impl ShutdownHandle {
     /// Every service says the same thing, so `grep 'shutdown complete'` is a
     /// uniform signal across the fleet rather than a per-app accident.
     pub fn complete(&self) {
-        finish(&self.name, self.socket.as_deref().map(|p| p.as_path()), "complete");
+        finish(
+            &self.name,
+            self.socket.as_deref().map(|p| p.as_path()),
+            "complete",
+        );
     }
 
     /// Returns true if graceful shutdown has been requested.
@@ -374,7 +355,10 @@ mod tests {
     #[test]
     fn block_blocks_both_signals_this_module_owns() {
         let _ = managed().thread_unblock();
-        assert!(!blocked_here(), "precondition: signals start unblocked here");
+        assert!(
+            !blocked_here(),
+            "precondition: signals start unblocked here"
+        );
         block();
         assert!(blocked_here());
         let _ = managed().thread_unblock();
@@ -385,7 +369,10 @@ mod tests {
         let _guard = flag_guard();
         SHUTDOWN_FLAG.store(false, Ordering::SeqCst);
         SIGNAL_COUNT.store(0, Ordering::SeqCst);
-        let handle = ShutdownHandle { name: Arc::from("test"), socket: None };
+        let handle = ShutdownHandle {
+            name: Arc::from("test"),
+            socket: None,
+        };
         assert!(!handle.is_shutdown());
         assert!(!is_shutdown());
     }
@@ -394,7 +381,10 @@ mod tests {
     fn the_flag_is_shared_by_every_clone_and_the_free_function() {
         let _guard = flag_guard();
         SHUTDOWN_FLAG.store(false, Ordering::SeqCst);
-        let handle = ShutdownHandle { name: Arc::from("test"), socket: None };
+        let handle = ShutdownHandle {
+            name: Arc::from("test"),
+            socket: None,
+        };
         let clone = handle.clone();
         SHUTDOWN_FLAG.store(true, Ordering::SeqCst);
         assert!(handle.is_shutdown());

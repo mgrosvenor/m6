@@ -9,5 +9,46 @@ members = [
     "m6-monitor",
     "m6-auth-server",
     "m6-md",
+    # The two Rust backend examples, docs/m6-backend-examples.md. Workspace
+    # members rather than standalone crates so the normal build compiles them,
+    # the zero-warnings rule covers them, and clippy is held to silence on them
+    # like everything else. An example that does not build is worse than no
+    # example, because it is the thing people copy.
+    #
+    # They are a pair on purpose: same language, same compiler, same payload, so
+    # the difference between them is exactly what linking m6-core costs.
+    "m6-http/tests/backends/rust-plain",
+    "m6-http/tests/backends/rust-m6core",
 ]
 resolver = "2"
+
+# Shared by every crate in the workspace, so they cannot drift apart. Each
+# member inherits with `version.workspace = true` and friends.
+#
+# The version matches the newest tag. Bump it HERE, on develop, before running
+# `tools/release.sh` — that script merges, tags and pushes, and does NOT touch
+# this line. An earlier comment here said it did, which is the kind of claim that
+# is only tested once, at a release, and this was that release.
+#
+# Before any of this the tag said v0.2.0 and every crate said 0.1.0.
+#
+# 1.0.0 WAS CUT ON 2026-09-14. The consolidation work it was waiting on is done:
+# clippy at zero, h3 measured and understood, phase 8's six backend examples and
+# the m6-core overhead measurement they existed for, and the advisories resolved.
+#
+# Phase 7 (the renderers pinned to a tag rather than a path) is sequenced AT the
+# release, because it needs a tag to pin to. See docs/CONSOLIDATION-TODO.md for
+# what remains, and CHANGELOG.md's 1.0.0 entry for what is knowingly not fixed.
+[workspace.package]
+version      = "1.0.0"
+edition      = "2021"
+# The oldest toolchain we test. Declared because declaring one and not testing
+# it is a claim rather than a fact: CI builds the whole workspace with exactly
+# this version, and that is how this number was found rather than guessed. The
+# guess was 1.85, on the basis that `is_none_or` (1.82) is the newest standard
+# library call we make. CI answered with the real constraint, which is the
+# dependencies: globset and the icu_* crates require 1.88.
+rust-version = "1.88"
+license      = "BSD-3-Clause"
+authors      = ["Matthew P. Grosvenor"]
+repository   = "https://github.com/mgrosvenor/m6"

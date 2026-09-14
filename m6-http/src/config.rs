@@ -36,7 +36,7 @@ pub struct SiteConfig {
     /// ranking signals across both until they do.
     ///
     /// Only the `www.` alias is redirected, never an arbitrary unrecognised
-    /// Host. Node hostnames (`syd.mgrosvenor.com`) must keep serving directly,
+    /// Host. Node hostnames (`node-a.example.com`) must keep serving directly,
     /// because per-node verification depends on reaching a specific node by
     /// name rather than through the GeoDNS-routed apex.
     #[serde(default = "default_true")]
@@ -140,7 +140,10 @@ fn default_log_format() -> String {
 
 impl Default for LogConfig {
     fn default() -> Self {
-        LogConfig { level: default_log_level(), format: default_log_format() }
+        LogConfig {
+            level: default_log_level(),
+            format: default_log_format(),
+        }
     }
 }
 
@@ -167,7 +170,10 @@ fn default_analytics_log_path() -> String {
 
 impl Default for AnalyticsConfig {
     fn default() -> Self {
-        AnalyticsConfig { enabled: default_true(), log_path: default_analytics_log_path() }
+        AnalyticsConfig {
+            enabled: default_true(),
+            log_path: default_analytics_log_path(),
+        }
     }
 }
 
@@ -281,7 +287,10 @@ fn default_requests_per_min() -> u32 {
 
 impl Default for RateLimitConfig {
     fn default() -> Self {
-        RateLimitConfig { enabled: default_true(), requests_per_min: default_requests_per_min() }
+        RateLimitConfig {
+            enabled: default_true(),
+            requests_per_min: default_requests_per_min(),
+        }
     }
 }
 
@@ -302,7 +311,11 @@ fn default_errors_mode() -> String {
 
 impl Default for ErrorsConfig {
     fn default() -> Self {
-        ErrorsConfig { mode: default_errors_mode(), path: None, verbose_fallback: false }
+        ErrorsConfig {
+            mode: default_errors_mode(),
+            path: None,
+            verbose_fallback: false,
+        }
     }
 }
 
@@ -446,12 +459,21 @@ impl SecurityConfig {
         };
         [
             ("strict-transport-security", self.hsts.as_str()),
-            ("x-content-type-options", self.x_content_type_options.as_str()),
+            (
+                "x-content-type-options",
+                self.x_content_type_options.as_str(),
+            ),
             ("x-frame-options", self.x_frame_options.as_str()),
             ("referrer-policy", self.referrer_policy.as_str()),
             ("permissions-policy", self.permissions_policy.as_str()),
-            ("cross-origin-opener-policy", self.cross_origin_opener_policy.as_str()),
-            ("cross-origin-resource-policy", self.cross_origin_resource_policy.as_str()),
+            (
+                "cross-origin-opener-policy",
+                self.cross_origin_opener_policy.as_str(),
+            ),
+            (
+                "cross-origin-resource-policy",
+                self.cross_origin_resource_policy.as_str(),
+            ),
             (csp_header_name, self.content_security_policy.as_str()),
         ]
         .into_iter()
@@ -478,6 +500,54 @@ pub struct BackendConfig {
     /// For testing with self-signed certs only — do not use in production.
     #[serde(default)]
     pub tls_skip_verify: bool,
+    /// Whether this backend compresses its own responses.
+    ///
+    /// **m6-http is a cache, not a transformer.** It does not compress: it
+    /// negotiates between representations a backend produced and caches each
+    /// one. `brotli` and `flate2` are in m6-core, on the backend side, and
+    /// nothing under m6-http/src calls a compressor.
+    ///
+    /// That contradicted two normative documents, which told backends not to
+    /// compress on the grounds that the proxy would. A C, Go or Python backend
+    /// written from that advice had its bytes served uncompressed forever, and
+    /// it was invisible for the Rust services only because m6-core compresses
+    /// for them. See docs/m6-backend-examples.md §10.5.
+    ///
+    /// So the two sides agree in config instead. The edge reads this to decide
+    /// whether to promise variants by varying on `Accept-Encoding`; the backend
+    /// reads the SAME key and refuses to start if it disagrees with what it can
+    /// actually do (`m6_core::compress::check_declared_support`).
+    ///
+    /// DEFAULT TRUE, deliberately. Every backend in this fleet is built on
+    /// m6-core, which compresses by default, so true is what is already
+    /// running. A backend that does not compress says so, and then the edge
+    /// stops advertising an encoding dimension that has exactly one value.
+    #[serde(default = "default_compresses")]
+    pub compresses: bool,
+}
+
+/// See [`BackendConfig::compresses`]. True because that is what the fleet does.
+fn default_compresses() -> bool {
+    true
+}
+
+impl Config {
+    /// Whether the named backend compresses its own responses.
+    ///
+    /// An unknown name answers `true`, which is the conservative direction: it
+    /// keeps `Vary: Accept-Encoding` on a response whose origin we cannot
+    /// identify. Answering `false` there would drop the header from a response
+    /// that really does have several encodings, and a shared cache would then
+    /// hand one client's brotli body to a client that asked for identity. A
+    /// redundant `Vary` costs cache efficiency; a missing one is a correctness
+    /// bug.
+    pub fn backend_compresses(&self, name: &str) -> bool {
+        self.backends
+            .iter()
+            .find(|b| b.name == name)
+            .map(|b| b.compresses)
+            .unwrap_or(true)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -546,7 +616,7 @@ struct RawServerSection {
 #[derive(Debug, Deserialize)]
 struct RawSystemToml {
     server: Option<RawServerSection>,
-    node:   Option<NodeConfig>,
+    node: Option<NodeConfig>,
 }
 
 // ── Loading ─────────────────────────────────────────────────────────────────
@@ -600,9 +670,9 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
     // address twice, or carried a second one that was never listened on.
     let bind = match sys_server.bind.or(site_server.bind) {
         Some(b) => b,
-        None => redirect_bind.clone().ok_or_else(|| {
-            anyhow::anyhow!("config error: [server].bind is required")
-        })?,
+        None => redirect_bind
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("config error: [server].bind is required"))?,
     };
     let tls_cert = sys_server.tls_cert.or(site_server.tls_cert);
     let tls_key = sys_server.tls_key.or(site_server.tls_key);
@@ -614,7 +684,8 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
             anyhow::bail!("config error: [server].tls_key is required");
         }
     }
-    let backend_timeout_secs = sys_server.backend_timeout_secs
+    let backend_timeout_secs = sys_server
+        .backend_timeout_secs
         .or(site_server.backend_timeout_secs)
         .unwrap_or(30);
     let h2c_bind = sys_server.h2c_bind.or(site_server.h2c_bind);
@@ -624,11 +695,17 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
     let tls_key_path = tls_key.as_deref().map(|k| resolve_path(site_dir, k));
 
     // Validate [site] required keys
-    let raw_site = site_parsed.site
-        .unwrap_or(RawSiteSection { name: None, domain: None, redirect_www: None, describedby: None });
-    let site_name = raw_site.name
+    let raw_site = site_parsed.site.unwrap_or(RawSiteSection {
+        name: None,
+        domain: None,
+        redirect_www: None,
+        describedby: None,
+    });
+    let site_name = raw_site
+        .name
         .ok_or_else(|| anyhow::anyhow!("config error: [site].name is required"))?;
-    let site_domain = raw_site.domain
+    let site_domain = raw_site
+        .domain
         .ok_or_else(|| anyhow::anyhow!("config error: [site].domain is required"))?;
 
     // Node identity comes from system config, not site.toml (see NodeConfig
@@ -639,19 +716,26 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
             file = %system_config_path.display(),
             "system config: no [node].name set, falling back to [site].name for node identity"
         );
-        NodeConfig { name: site_name.clone() }
+        NodeConfig {
+            name: site_name.clone(),
+        }
     });
 
     let server = ServerConfig {
         bind,
-        tls_cert: tls_cert_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
-        tls_key: tls_key_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+        tls_cert: tls_cert_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned()),
+        tls_key: tls_key_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned()),
         backend_timeout_secs,
         h2c_bind,
         redirect_bind: redirect_bind.clone(),
         // Uppercased once at load so the hot-path check is a plain comparison
         // rather than a case-insensitive one per request.
-        allowed_methods: sys_server.allowed_methods
+        allowed_methods: sys_server
+            .allowed_methods
             .or(site_server.allowed_methods)
             .unwrap_or_else(default_allowed_methods)
             .iter()
@@ -715,7 +799,8 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         if !backend_names.contains(route.backend.as_str()) {
             anyhow::bail!(
                 "config error: route {} references unknown backend `{}`",
-                route.path, route.backend
+                route.path,
+                route.backend
             );
         }
         if !seen_paths.insert(route.path.clone()) {
@@ -729,7 +814,8 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         if !backend_names.contains(rg.backend.as_str()) {
             anyhow::bail!(
                 "config error: route_group {} references unknown backend `{}`",
-                rg.path, rg.backend
+                rg.path,
+                rg.backend
             );
         }
     }
@@ -863,16 +949,14 @@ pub fn warn_health_token(health: &HealthConfig) {
 
 pub fn warn_system_config_extra_keys(system_config_path: &Path) {
     if let Ok(raw) = std::fs::read_to_string(system_config_path) {
-        if let Ok(val) = raw.parse::<toml::Value>() {
-            if let toml::Value::Table(tbl) = val {
-                for key in tbl.keys() {
-                    if key != "server" && key != "node" {
-                        warn!(
-                            key = %key,
-                            file = %system_config_path.display(),
-                            "system config: ignoring non-[server]/[node] key"
-                        );
-                    }
+        if let Ok(toml::Value::Table(tbl)) = raw.parse::<toml::Value>() {
+            for key in tbl.keys() {
+                if key != "server" && key != "node" {
+                    warn!(
+                        key = %key,
+                        file = %system_config_path.display(),
+                        "system config: ignoring non-[server]/[node] key"
+                    );
                 }
             }
         }
@@ -890,6 +974,75 @@ mod tests {
 
     fn write_file(dir: &Path, name: &str, content: &str) {
         std::fs::write(dir.join(name), content).unwrap();
+    }
+
+    /// `[[backend]] compresses` and what the edge does with it.
+    ///
+    /// Issue #8: the proxy is a cache, not a transformer, so it must not promise
+    /// encodings a backend cannot produce. Every test written for that issue was
+    /// in m6-core, on the backend's side of the contract; the edge's own reading
+    /// of the flag had none, which is the half a visitor sees.
+    ///
+    /// Through the real `load`, so the key's parsing and its default are covered
+    /// too rather than a hand-built struct that cannot drift from the TOML.
+    #[test]
+    fn compresses_is_read_from_the_config_and_defaults_to_true() {
+        let dir = make_test_dir();
+        write_file(
+            dir.path(),
+            "site.toml",
+            r#"
+[site]
+name   = "Test"
+domain = "test.example.com"
+
+[server]
+bind     = "127.0.0.1:8443"
+tls_cert = "cert.pem"
+tls_key  = "key.pem"
+
+[[backend]]
+name    = "says-yes"
+sockets = "/run/m6/a-*.sock"
+compresses = true
+
+[[backend]]
+name    = "says-no"
+sockets = "/run/m6/b-*.sock"
+compresses = false
+
+# No `compresses` key at all: the default has to be true, because a missing
+# Vary is a correctness bug and a redundant one only costs cache efficiency.
+[[backend]]
+name    = "says-nothing"
+sockets = "/run/m6/c-*.sock"
+
+[[route]]
+path    = "/"
+backend = "says-yes"
+"#,
+        );
+        write_file(dir.path(), "cert.pem", "");
+        write_file(dir.path(), "key.pem", "");
+        write_file(
+            dir.path(),
+            "system.toml",
+            "[server]\nbind = \"127.0.0.1:8443\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n",
+        );
+
+        let cfg = load(dir.path(), &dir.path().join("system.toml")).expect("load");
+
+        assert!(cfg.backend_compresses("says-yes"));
+        assert!(!cfg.backend_compresses("says-no"));
+        assert!(
+            cfg.backend_compresses("says-nothing"),
+            "a backend that does not mention `compresses` must be assumed to compress"
+        );
+        assert!(
+            cfg.backend_compresses("never-configured"),
+            "an unknown backend name must be assumed to compress: a missing Vary is a \
+             correctness bug, a redundant one only costs cache efficiency"
+        );
     }
 
     fn minimal_site_toml() -> String {
@@ -910,7 +1063,8 @@ sockets = "/run/m6/m6-html-*.sock"
 [[route]]
 path    = "/"
 backend = "m6-html"
-"#.to_string()
+"#
+        .to_string()
     }
 
     fn minimal_system_toml() -> String {
@@ -919,7 +1073,8 @@ backend = "m6-html"
 bind     = "127.0.0.1:8443"
 tls_cert = "cert.pem"
 tls_key  = "key.pem"
-"#.to_string()
+"#
+        .to_string()
     }
 
     fn setup_minimal(dir: &Path) {
@@ -995,7 +1150,10 @@ tls_key  = "key.pem"
         let dir = make_test_dir();
         write_file(dir.path(), "cert.pem", "dummy");
         write_file(dir.path(), "key.pem", "dummy");
-        write_file(dir.path(), "site.toml", r#"
+        write_file(
+            dir.path(),
+            "site.toml",
+            r#"
 [site]
 domain = "test.example.com"
 [server]
@@ -1005,8 +1163,13 @@ tls_key  = "key.pem"
 [[backend]]
 name = "b"
 sockets = "/run/m6/*.sock"
-"#);
-        write_file(dir.path(), "system.toml", "[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n");
+"#,
+        );
+        write_file(
+            dir.path(),
+            "system.toml",
+            "[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n",
+        );
         let result = load(dir.path(), &dir.path().join("system.toml"));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("name"));
@@ -1016,7 +1179,10 @@ sockets = "/run/m6/*.sock"
     fn test_missing_tls_cert_fails() {
         let dir = make_test_dir();
         write_file(dir.path(), "key.pem", "dummy");
-        write_file(dir.path(), "site.toml", r#"
+        write_file(
+            dir.path(),
+            "site.toml",
+            r#"
 [site]
 name   = "Test"
 domain = "test.example.com"
@@ -1024,7 +1190,8 @@ domain = "test.example.com"
 bind     = "0.0.0.0:443"
 tls_cert = "missing-cert.pem"
 tls_key  = "key.pem"
-"#);
+"#,
+        );
         write_file(dir.path(), "system.toml", "");
         let result = load(dir.path(), &dir.path().join("system.toml"));
         assert!(result.is_err());
@@ -1036,7 +1203,10 @@ tls_key  = "key.pem"
         let dir = make_test_dir();
         write_file(dir.path(), "cert.pem", "dummy");
         write_file(dir.path(), "key.pem", "dummy");
-        write_file(dir.path(), "site.toml", r#"
+        write_file(
+            dir.path(),
+            "site.toml",
+            r#"
 [site]
 name   = "Test"
 domain = "test.example.com"
@@ -1050,7 +1220,8 @@ sockets = "/run/m6/*.sock"
 [[route]]
 path    = "/"
 backend = "unknown"
-"#);
+"#,
+        );
         write_file(dir.path(), "system.toml", "");
         let result = load(dir.path(), &dir.path().join("system.toml"));
         assert!(result.is_err());
@@ -1062,7 +1233,10 @@ backend = "unknown"
         let dir = make_test_dir();
         write_file(dir.path(), "cert.pem", "dummy");
         write_file(dir.path(), "key.pem", "dummy");
-        write_file(dir.path(), "site.toml", r#"
+        write_file(
+            dir.path(),
+            "site.toml",
+            r#"
 [site]
 name   = "Test"
 domain = "test.example.com"
@@ -1079,7 +1253,8 @@ backend = "b"
 [[route]]
 path    = "/"
 backend = "b"
-"#);
+"#,
+        );
         write_file(dir.path(), "system.toml", "");
         let result = load(dir.path(), &dir.path().join("system.toml"));
         assert!(result.is_err());
@@ -1091,7 +1266,10 @@ backend = "b"
         let dir = make_test_dir();
         write_file(dir.path(), "cert.pem", "dummy");
         write_file(dir.path(), "key.pem", "dummy");
-        write_file(dir.path(), "site.toml", r#"
+        write_file(
+            dir.path(),
+            "site.toml",
+            r#"
 [site]
 name   = "Test"
 domain = "test.example.com"
@@ -1106,7 +1284,8 @@ sockets = "/run/m6/*.sock"
 path    = "/"
 backend = "b"
 require = "group:editors"
-"#);
+"#,
+        );
         write_file(dir.path(), "system.toml", "");
         let result = load(dir.path(), &dir.path().join("system.toml"));
         assert!(result.is_err());
@@ -1118,7 +1297,10 @@ require = "group:editors"
         let dir = make_test_dir();
         write_file(dir.path(), "cert.pem", "dummy");
         write_file(dir.path(), "key.pem", "dummy");
-        write_file(dir.path(), "site.toml", r#"
+        write_file(
+            dir.path(),
+            "site.toml",
+            r#"
 [site]
 name   = "Test"
 domain = "test.example.com"
@@ -1131,7 +1313,8 @@ mode = "custom"
 [[backend]]
 name = "b"
 sockets = "/run/m6/*.sock"
-"#);
+"#,
+        );
         write_file(dir.path(), "system.toml", "");
         let result = load(dir.path(), &dir.path().join("system.toml"));
         assert!(result.is_err());
@@ -1143,7 +1326,10 @@ sockets = "/run/m6/*.sock"
         let dir = make_test_dir();
         write_file(dir.path(), "cert.pem", "dummy");
         write_file(dir.path(), "key.pem", "dummy");
-        write_file(dir.path(), "site.toml", r#"
+        write_file(
+            dir.path(),
+            "site.toml",
+            r#"
 [site]
 name   = "Test"
 domain = "test.example.com"
@@ -1154,13 +1340,18 @@ tls_key  = "key.pem"
 [[backend]]
 name = "b"
 sockets = "/run/m6/*.sock"
-"#);
-        write_file(dir.path(), "system.toml", r#"
+"#,
+        );
+        write_file(
+            dir.path(),
+            "system.toml",
+            r#"
 [server]
 bind = "0.0.0.0:443"
 tls_cert = "cert.pem"
 tls_key = "key.pem"
-"#);
+"#,
+        );
         let cfg = load(dir.path(), &dir.path().join("system.toml")).unwrap();
         assert_eq!(cfg.server.bind, "0.0.0.0:443");
     }
@@ -1173,13 +1364,17 @@ tls_key = "key.pem"
     #[test]
     fn test_redirect_mode_needs_no_tls() {
         let dir = make_test_dir();
-        write_file(dir.path(), "site.toml", r#"
+        write_file(
+            dir.path(),
+            "site.toml",
+            r#"
 [site]
 name   = "Test"
 domain = "test.example.com"
 [server]
 redirect_bind = "0.0.0.0:80"
-"#);
+"#,
+        );
         write_file(dir.path(), "system.toml", "");
         let cfg = load(dir.path(), &dir.path().join("system.toml")).unwrap();
         assert_eq!(cfg.server.redirect_bind.as_deref(), Some("0.0.0.0:80"));
@@ -1196,7 +1391,10 @@ redirect_bind = "0.0.0.0:80"
     #[test]
     fn test_tls_still_required_when_not_redirecting() {
         let dir = make_test_dir();
-        write_file(dir.path(), "site.toml", r#"
+        write_file(
+            dir.path(),
+            "site.toml",
+            r#"
 [site]
 name   = "Test"
 domain = "test.example.com"
@@ -1205,7 +1403,8 @@ bind = "0.0.0.0:443"
 [[backend]]
 name = "b"
 sockets = "/run/m6/*.sock"
-"#);
+"#,
+        );
         write_file(dir.path(), "system.toml", "");
         let err = load(dir.path(), &dir.path().join("system.toml"))
             .unwrap_err()
@@ -1226,7 +1425,10 @@ sockets = "/run/m6/*.sock"
         let dir = make_test_dir();
         write_file(dir.path(), "cert.pem", "dummy");
         write_file(dir.path(), "key.pem", "dummy");
-        write_file(dir.path(), "site.toml", r#"
+        write_file(
+            dir.path(),
+            "site.toml",
+            r#"
 [site]
 name   = "Test"
 domain = "test.example.com"
@@ -1241,8 +1443,13 @@ sockets = "/run/m6/*.sock"
 [[route]]
 path    = "/"
 backend = "b"
-"#);
-        write_file(dir.path(), "system.toml", "[server]\nbind = \"127.0.0.1:8443\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n");
+"#,
+        );
+        write_file(
+            dir.path(),
+            "system.toml",
+            "[server]\nbind = \"127.0.0.1:8443\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n",
+        );
         let cfg = load(dir.path(), &dir.path().join("system.toml")).unwrap();
         assert_eq!(cfg.server.backend_timeout_secs, 60);
     }
@@ -1252,7 +1459,10 @@ backend = "b"
         let dir = make_test_dir();
         write_file(dir.path(), "cert.pem", "dummy");
         write_file(dir.path(), "key.pem", "dummy");
-        write_file(dir.path(), "site.toml", r#"
+        write_file(
+            dir.path(),
+            "site.toml",
+            r#"
 [site]
 name   = "Test"
 domain = "test.example.com"
@@ -1264,14 +1474,19 @@ backend_timeout_secs = 10
 [[backend]]
 name = "b"
 sockets = "/run/m6/*.sock"
-"#);
-        write_file(dir.path(), "system.toml", r#"
+"#,
+        );
+        write_file(
+            dir.path(),
+            "system.toml",
+            r#"
 [server]
 bind = "127.0.0.1:8443"
 tls_cert = "cert.pem"
 tls_key = "key.pem"
 backend_timeout_secs = 120
-"#);
+"#,
+        );
         let cfg = load(dir.path(), &dir.path().join("system.toml")).unwrap();
         assert_eq!(cfg.server.backend_timeout_secs, 120);
     }

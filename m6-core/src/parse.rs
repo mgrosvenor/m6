@@ -1,4 +1,15 @@
-/// HTTP/1.1 request parser from a byte stream.
+//! Reading a request off a blocking stream.
+//!
+//! A thin adapter over `crate::h1`, which holds the actual parser and is
+//! incremental. This module is the blocking half: it reads until `h1` says it
+//! has a complete request, or until something goes wrong.
+//!
+//! **A read timeout arrives here as an error, and which error matters.** A
+//! peer that connects and says nothing is an idle connection going away, and
+//! is closed silently; a peer that sends part of a request and stops gets 408.
+//! Answering 400 to the first case is a framing bug rather than a rudeness:
+//! m6-http pools backend connections, so a response written into an idle
+//! socket is read as the answer to the next request sent on it.
 
 use std::io::{Read, Write};
 
@@ -88,7 +99,11 @@ pub fn parse_request(stream: &mut (impl Read + Write)) -> Result<RawRequest, Par
         // makes the server buffer forever. After it, the body is bounded
         // separately and much more generously.
         let head_done = buf.windows(4).any(|w| w == b"\r\n\r\n");
-        let cap = if head_done { MAX_HEADER_BYTES + MAX_BODY_BYTES } else { MAX_HEADER_BYTES };
+        let cap = if head_done {
+            MAX_HEADER_BYTES + MAX_BODY_BYTES
+        } else {
+            MAX_HEADER_BYTES
+        };
         if buf.len() > cap {
             return Err(ParseError::RequestTooLarge);
         }
@@ -216,8 +231,12 @@ mod tests {
     }
 
     impl Write for TimesOutAfter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> { Ok(buf.len()) }
-        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     /// An idle persistent connection hitting the read timeout must look like a
@@ -229,7 +248,10 @@ mod tests {
     #[test]
     fn timeout_before_any_byte_is_a_close_not_an_error() {
         for kind in [std::io::ErrorKind::WouldBlock, std::io::ErrorKind::TimedOut] {
-            let mut s = TimesOutAfter { prefix: Cursor::new(Vec::new()), kind };
+            let mut s = TimesOutAfter {
+                prefix: Cursor::new(Vec::new()),
+                kind,
+            };
             let err = parse_request(&mut s).unwrap_err();
             assert!(
                 matches!(err, ParseError::ConnectionClosed),
@@ -302,11 +324,19 @@ mod chunked_head_tests {
             self.written.extend_from_slice(b);
             Ok(b.len())
         }
-        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
     impl Chunked {
         pub fn new(data: &[u8], piece: usize) -> Self {
-            Chunked { data: data.to_vec(), at: 0, piece, reads: 0, written: Vec::new() }
+            Chunked {
+                data: data.to_vec(),
+                at: 0,
+                piece,
+                reads: 0,
+                written: Vec::new(),
+            }
         }
     }
     impl Read for Chunked {
@@ -321,7 +351,7 @@ mod chunked_head_tests {
 
     fn browser_request() -> Vec<u8> {
         b"GET /capabilities HTTP/1.1\r\n\
-Host: mgrosvenor.com\r\n\
+Host: example.com\r\n\
 User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36\r\n\
 Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n\
@@ -357,8 +387,7 @@ Connection: keep-alive\r\n\r\n"
         let req = browser_request();
         for piece in [1, 2, 3, 5, 7, 13, 64, 377] {
             let mut r = Chunked::new(&req, piece);
-            let parsed = parse_request(&mut r)
-                .unwrap_or_else(|e| panic!("piece={piece}: {e}"));
+            let parsed = parse_request(&mut r).unwrap_or_else(|e| panic!("piece={piece}: {e}"));
             assert_eq!(parsed.method, "GET", "piece={piece}");
             assert_eq!(parsed.headers.len(), 5, "piece={piece}");
         }
@@ -373,8 +402,7 @@ Connection: keep-alive\r\n\r\n"
         req.extend_from_slice(b"name=alice&age=30");
         for piece in [1, 8, 64, 4096] {
             let mut r = Chunked::new(&req, piece);
-            let parsed = parse_request(&mut r)
-                .unwrap_or_else(|e| panic!("piece={piece}: {e}"));
+            let parsed = parse_request(&mut r).unwrap_or_else(|e| panic!("piece={piece}: {e}"));
             assert_eq!(
                 parsed.body, b"name=alice&age=30",
                 "body truncated or corrupted at piece={piece}"
@@ -406,14 +434,17 @@ Connection: keep-alive\r\n\r\n"
         // 64-entry stack array -- no allocation, which is the point -- so a
         // flood is refused as a malformed head before the byte cap is reached.
         // What matters is that it is refused, not which reason wins the race.
-        assert!(parse_request(&mut r).is_err(), "an oversized head must be refused");
+        assert!(
+            parse_request(&mut r).is_err(),
+            "an oversized head must be refused"
+        );
     }
 }
 
 #[cfg(test)]
 mod expect_continue_tests {
-    use super::*;
     use super::chunked_head_tests::Chunked;
+    use super::*;
 
     fn post(expect: &str, body: &str) -> Vec<u8> {
         format!(
@@ -434,7 +465,11 @@ mod expect_continue_tests {
         let mut r = Chunked::new(&post("100-continue", "name=alice"), 1);
         let req = parse_request(&mut r).expect("parse");
         assert_eq!(req.body, b"name=alice");
-        assert_eq!(r.written, m6_core_continue(), "no interim response was sent");
+        assert_eq!(
+            r.written,
+            m6_core_continue(),
+            "no interim response was sent"
+        );
     }
 
     fn m6_core_continue() -> Vec<u8> {
@@ -456,7 +491,11 @@ mod expect_continue_tests {
     fn a_request_that_arrives_complete_gets_no_interim_response() {
         let mut r = Chunked::new(&post("100-continue", "name=alice"), 4096);
         parse_request(&mut r).expect("parse");
-        assert!(r.written.is_empty(), "sent {:?}", String::from_utf8_lossy(&r.written));
+        assert!(
+            r.written.is_empty(),
+            "sent {:?}",
+            String::from_utf8_lossy(&r.written)
+        );
     }
 
     /// RFC 9110 10.1.1: an expectation we do not understand is a 417, not a
@@ -465,7 +504,10 @@ mod expect_continue_tests {
     #[test]
     fn an_unknown_expectation_is_refused() {
         let mut r = Chunked::new(&post("the-moon-on-a-stick", "hello"), 1);
-        assert!(matches!(parse_request(&mut r), Err(ParseError::ExpectationFailed)));
+        assert!(matches!(
+            parse_request(&mut r),
+            Err(ParseError::ExpectationFailed)
+        ));
         assert!(r.written.is_empty());
     }
 
@@ -497,7 +539,10 @@ mod stricter_after_consolidation_tests {
     fn http11_without_host_is_refused() {
         let raw = b"GET /x HTTP/1.1\r\nAccept: */*\r\n\r\n";
         let mut c = Cursor::new(raw.to_vec());
-        assert!(parse_request(&mut c).is_err(), "HTTP/1.1 without Host must be refused");
+        assert!(
+            parse_request(&mut c).is_err(),
+            "HTTP/1.1 without Host must be refused"
+        );
     }
 
     /// Two `Host` headers are malformed however they disagree: it is the
@@ -506,16 +551,24 @@ mod stricter_after_consolidation_tests {
     fn duplicate_host_is_refused() {
         let raw = b"GET /x HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n";
         let mut c = Cursor::new(raw.to_vec());
-        assert!(parse_request(&mut c).is_err(), "duplicate Host must be refused");
+        assert!(
+            parse_request(&mut c).is_err(),
+            "duplicate Host must be refused"
+        );
     }
 
     /// Conflicting Content-Length is the request-smuggling primitive.
     #[test]
     fn conflicting_content_length_is_refused() {
-        let mut raw = b"POST /x HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\n".to_vec();
+        let mut raw =
+            b"POST /x HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\n"
+                .to_vec();
         raw.extend_from_slice(b"hello");
         let mut c = Cursor::new(raw);
-        assert!(parse_request(&mut c).is_err(), "conflicting Content-Length must be refused");
+        assert!(
+            parse_request(&mut c).is_err(),
+            "conflicting Content-Length must be refused"
+        );
     }
 
     /// A head with no end is how a peer makes the server buffer forever.

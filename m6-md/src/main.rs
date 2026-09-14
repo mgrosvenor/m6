@@ -6,7 +6,6 @@
 /// Each *.md file may begin with a TOML frontmatter block delimited by +++.
 /// Files beginning with _ are skipped (drafts/partials convention).
 /// Output: { "documents": [...] } sorted by date descending.
-
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -18,13 +17,13 @@ use tracing::{debug, info, warn};
 fn render_markdown(src: &str) -> String {
     use comrak::{markdown_to_html, Options};
     let mut opts = Options::default();
-    opts.extension.strikethrough   = true;
-    opts.extension.table           = true;
-    opts.extension.autolink        = true;
-    opts.extension.tasklist        = true;
-    opts.extension.footnotes       = true;
-    opts.extension.shortcodes      = true;
-    opts.render.unsafe_            = true; // pass through raw HTML in source
+    opts.extension.strikethrough = true;
+    opts.extension.table = true;
+    opts.extension.autolink = true;
+    opts.extension.tasklist = true;
+    opts.extension.footnotes = true;
+    opts.extension.shortcodes = true;
+    opts.render.unsafe_ = true; // pass through raw HTML in source
     markdown_to_html(src, &opts)
 }
 
@@ -73,15 +72,17 @@ fn parse_frontmatter(toml_str: &str, stem: &str) -> Result<Map<String, Value>> {
 
 fn toml_to_json(v: toml::Value) -> Value {
     match v {
-        toml::Value::String(s)   => json!(s),
-        toml::Value::Integer(i)  => json!(i),
-        toml::Value::Float(f)    => json!(f),
-        toml::Value::Boolean(b)  => json!(b),
+        toml::Value::String(s) => json!(s),
+        toml::Value::Integer(i) => json!(i),
+        toml::Value::Float(f) => json!(f),
+        toml::Value::Boolean(b) => json!(b),
         toml::Value::Datetime(d) => json!(d.to_string()),
-        toml::Value::Array(arr)  => Value::Array(arr.into_iter().map(toml_to_json).collect()),
-        toml::Value::Table(tbl)  => {
+        toml::Value::Array(arr) => Value::Array(arr.into_iter().map(toml_to_json).collect()),
+        toml::Value::Table(tbl) => {
             let mut m = Map::new();
-            for (k, v) in tbl { m.insert(k, toml_to_json(v)); }
+            for (k, v) in tbl {
+                m.insert(k, toml_to_json(v));
+            }
             Value::Object(m)
         }
     }
@@ -105,8 +106,8 @@ fn process_file(path: &Path) -> Result<Value> {
         .unwrap_or("untitled")
         .to_string();
 
-    let src = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let src =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
 
     let (fm_str, body_md) = split_frontmatter(&src);
 
@@ -131,11 +132,11 @@ fn process_file(path: &Path) -> Result<Value> {
 
     // Build final object: fixed fields first, then passthrough
     let mut obj = Map::new();
-    obj.insert("stem".into(),  json!(stem));
-    obj.insert("path".into(),  json!(format!("/{stem}")));
+    obj.insert("stem".into(), json!(stem));
+    obj.insert("path".into(), json!(format!("/{stem}")));
     obj.insert("title".into(), json!(title));
-    obj.insert("date".into(),  json!(date));
-    obj.insert("body".into(),  json!(body_html));
+    obj.insert("date".into(), json!(date));
+    obj.insert("body".into(), json!(body_html));
     for (k, v) in fields {
         obj.insert(k, v);
     }
@@ -147,30 +148,39 @@ fn process_file(path: &Path) -> Result<Value> {
 
 struct Cli {
     input_dir: PathBuf,
-    output:    PathBuf,
+    output: PathBuf,
     log_level: String,
-    watch:     bool,
-    touch:     Option<PathBuf>,
+    watch: bool,
+    touch: Option<PathBuf>,
 }
 
 fn parse_args(args: &[String]) -> Result<Cli> {
     let mut input_dir = None;
-    let mut output    = None;
+    let mut output = None;
     let mut log_level = "info".to_string();
-    let mut watch     = false;
-    let mut touch     = None;
+    let mut watch = false;
+    let mut touch = None;
     let mut i = 1usize;
 
     while i < args.len() {
         match args[i].as_str() {
+            // Its own parser, so the flag is added here too.
+            "--version" | "-V" => {
+                println!("m6-md {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
             "--output" => {
                 i += 1;
-                if i >= args.len() { bail!("--output requires a value"); }
+                if i >= args.len() {
+                    bail!("--output requires a value");
+                }
                 output = Some(PathBuf::from(&args[i]));
             }
             "--log-level" => {
                 i += 1;
-                if i >= args.len() { bail!("--log-level requires a value"); }
+                if i >= args.len() {
+                    bail!("--log-level requires a value");
+                }
                 log_level = args[i].clone();
             }
             "--watch" => {
@@ -178,7 +188,9 @@ fn parse_args(args: &[String]) -> Result<Cli> {
             }
             "--touch" => {
                 i += 1;
-                if i >= args.len() { bail!("--touch requires a value"); }
+                if i >= args.len() {
+                    bail!("--touch requires a value");
+                }
                 touch = Some(PathBuf::from(&args[i]));
             }
             arg if arg.starts_with("--") => bail!("unknown flag: {arg}"),
@@ -194,13 +206,18 @@ fn parse_args(args: &[String]) -> Result<Cli> {
     }
 
     let input_dir = input_dir.ok_or_else(|| anyhow::anyhow!("required: <input-dir>"))?;
-    let output    = output.ok_or_else(|| anyhow::anyhow!("required: --output <file>"))?;
+    let output = output.ok_or_else(|| anyhow::anyhow!("required: --output <file>"))?;
 
-    Ok(Cli { input_dir, output, log_level, watch, touch })
+    Ok(Cli {
+        input_dir,
+        output,
+        log_level,
+        watch,
+        touch,
+    })
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
-
 
 fn main() {
     // Block SIGTERM and SIGINT before anything else, including logging.
@@ -250,9 +267,7 @@ fn run(args: Vec<String>) -> i32 {
     // for all tools: first signal clean, second immediate.
     // No socket and no custom wake: m6-md watches the filesystem and parks in
     // a channel recv, which the shutdown flag is re-checked around.
-    let shutdown = m6_core::signal::ShutdownHandle::install(
-        m6_core::signal::Service::new("m6-md"),
-    );
+    let shutdown = m6_core::signal::ShutdownHandle::install(m6_core::signal::Service::new("m6-md"));
 
     let (tx, rx) = std::sync::mpsc::channel();
 
@@ -301,7 +316,9 @@ fn run(args: Vec<String>) -> i32 {
         std::thread::sleep(std::time::Duration::from_millis(50));
         drain_channel(&rx);
 
-        if m6_core::signal::is_shutdown() { break; }
+        if m6_core::signal::is_shutdown() {
+            break;
+        }
 
         debug!("md change detected, regenerating");
         match process(&cli) {
@@ -328,9 +345,10 @@ fn run(args: Vec<String>) -> i32 {
 fn event_affects_md(event: &notify::Event) -> bool {
     use notify::EventKind::*;
     matches!(event.kind, Create(_) | Modify(_) | Remove(_))
-        && event.paths.iter().any(|p| {
-            p.extension().and_then(|e| e.to_str()) == Some("md")
-        })
+        && event
+            .paths
+            .iter()
+            .any(|p| p.extension().and_then(|e| e.to_str()) == Some("md"))
 }
 
 /// Drain all pending events from the channel (non-blocking).
@@ -352,7 +370,10 @@ fn touch_file(path: &Path) -> Result<()> {
 fn process(cli: &Cli) -> Result<()> {
     // Validate input directory
     if !cli.input_dir.exists() {
-        bail!("input directory does not exist: {}", cli.input_dir.display());
+        bail!(
+            "input directory does not exist: {}",
+            cli.input_dir.display()
+        );
     }
     if !cli.input_dir.is_dir() {
         bail!("input path is not a directory: {}", cli.input_dir.display());
@@ -361,7 +382,10 @@ fn process(cli: &Cli) -> Result<()> {
     // Validate output parent directory
     let output_parent = cli.output.parent().unwrap_or(Path::new("."));
     if !output_parent.exists() {
-        bail!("output directory does not exist: {}", output_parent.display());
+        bail!(
+            "output directory does not exist: {}",
+            output_parent.display()
+        );
     }
 
     // Collect *.md files (non-recursive, skip _ prefix)
@@ -372,7 +396,8 @@ fn process(cli: &Cli) -> Result<()> {
         .filter(|p| {
             p.is_file()
                 && p.extension().and_then(|e| e.to_str()) == Some("md")
-                && !p.file_name()
+                && !p
+                    .file_name()
                     .and_then(|n| n.to_str())
                     .map(|n| n.starts_with('_'))
                     .unwrap_or(false)

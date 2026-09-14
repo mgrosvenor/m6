@@ -1,4 +1,11 @@
-/// Utility functions exposed via the prelude.
+//! Small shared helpers, exposed through the prelude.
+//!
+//! Dates, slugs, and the handful of things every service wanted and three of
+//! them had written for themselves. `iso_date_from` is here because m6-md's
+//! hand-rolled civil-from-days arithmetic was wrong for 7,281 days out of
+//! 29,200: the era was anchored at 1970 instead of being shifted to March, so
+//! the last day of every leap year became the first of the next and the whole
+//! following year was a day late.
 
 /// Slugify a string: "Hello World" → "hello-world"
 pub fn slugify(s: &str) -> String {

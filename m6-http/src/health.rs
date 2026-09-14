@@ -36,15 +36,6 @@ pub fn is_monitoring_endpoint(backend: &str) -> bool {
     backend == HEALTH_BACKEND || backend == PERF_BACKEND
 }
 
-/// Compare a presented credential against the expected one without leaking
-/// the match position through timing.
-///
-/// A naive `==` on strings returns at the first differing byte, so response
-/// time reveals how many leading bytes were correct and the token can be
-/// recovered one byte at a time. Lengths are compared first and unequal
-/// lengths rejected outright, which does leak length; that is not
-/// recoverable-secret information in the way a prefix is.
-
 #[cfg(test)]
 mod token_file_tests {
     use crate::config::HealthConfig;
@@ -111,8 +102,16 @@ mod monitoring_exclusion_tests {
     /// than the one above and much harder to notice.
     #[test]
     fn real_backends_are_still_counted() {
-        for backend in ["cache", "m6-html", "m6-file", "render-contact",
-                        "render-analytics", "origin", "method-check", ""] {
+        for backend in [
+            "cache",
+            "m6-html",
+            "m6-file",
+            "render-contact",
+            "render-analytics",
+            "origin",
+            "method-check",
+            "",
+        ] {
             assert!(
                 !is_monitoring_endpoint(backend),
                 "{backend} is real traffic and must be counted"
@@ -201,13 +200,13 @@ pub fn traffic(
     let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((built, report)) = cache.as_ref() {
         if built.elapsed() < cache_for {
-            return PerfOutcome::Traffic(report.clone());
+            return PerfOutcome::Traffic(Box::new(report.clone()));
         }
     }
     match build_report(node, log_path, window_minutes) {
         Ok(r) => {
             *cache = Some((Instant::now(), r.clone()));
-            PerfOutcome::Traffic(r)
+            PerfOutcome::Traffic(Box::new(r))
         }
         Err(e) => PerfOutcome::TrafficError(format!("{e}")),
     }
@@ -269,7 +268,7 @@ mod traffic_endpoint_tests {
         let (code, _, body) = out.into_response();
         assert_eq!(code, 503);
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(v["error"].as_str().unwrap_or("").len() > 0);
+        assert!(!v["error"].as_str().unwrap_or("").is_empty());
     }
 
     #[test]
@@ -277,9 +276,24 @@ mod traffic_endpoint_tests {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         let now = m6_core::util::now_iso8601();
         let ts = now.trim_end_matches('Z');
-        writeln!(f, "{}", row(&format!("{ts}.100Z"), "1.2.3.4", "/", 200, "Chrome/131")).unwrap();
-        writeln!(f, "{}", row(&format!("{ts}.200Z"), "5.6.7.8", "/robots.txt", 200,
-            "Mozilla/5.0 (compatible; ClaudeBot/1.0; +claudebot@anthropic.com)")).unwrap();
+        writeln!(
+            f,
+            "{}",
+            row(&format!("{ts}.100Z"), "1.2.3.4", "/", 200, "Chrome/131")
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "{}",
+            row(
+                &format!("{ts}.200Z"),
+                "5.6.7.8",
+                "/robots.txt",
+                200,
+                "Mozilla/5.0 (compatible; ClaudeBot/1.0; +claudebot@anthropic.com)"
+            )
+        )
+        .unwrap();
         f.flush().unwrap();
 
         let out = traffic(
@@ -295,10 +309,14 @@ mod traffic_endpoint_tests {
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["node"], "sydney");
         assert_eq!(v["total_requests"], 2);
-        assert_eq!(v["crawlers"][0]["user_agent"].as_str().unwrap().contains("ClaudeBot"), true);
+        assert!(v["crawlers"][0]["user_agent"]
+            .as_str()
+            .unwrap()
+            .contains("ClaudeBot"));
         assert!(v["logging"].is_object(), "logging health travels with it");
         // Never cached by anything in between.
-        assert!(headers.iter().any(|(k, val)|
-            k.eq_ignore_ascii_case("cache-control") && val == "no-store"));
+        assert!(headers
+            .iter()
+            .any(|(k, val)| k.eq_ignore_ascii_case("cache-control") && val == "no-store"));
     }
 }
