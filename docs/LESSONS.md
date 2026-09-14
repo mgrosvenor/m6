@@ -325,3 +325,106 @@ New 2026-09-12:
     exactly like a comment endorsing it. The issue tracker is where intent
     actually lives, it takes one search, and skipping it turned a two-PR wait
     into a false claim that the transport layer might have to be replaced.
+
+41. **Two repositories that build separately, with nothing building them
+    together, is not a risk. It is a defect already present, waiting to be
+    looked at.** m6-examples had not compiled for days: every renderer crate
+    still pointed at `m6-render`, a crate m6 had deleted. The binaries left in
+    `target/release` from before the deletion meant running an example still
+    looked fine, so nothing announced it.
+
+    Getting it to build took four small edits. What that bought was the ability
+    to ask questions, and the answers were five more defects sitting in plain
+    sight: every asset in every example returned 502 because m6-file's config
+    schema had changed and ten configs were left naming no handler; PATCH was
+    refused at the edge by `allowed_methods`, which looks exactly like a missing
+    route; unpublishing a CMS post answered `{"unpublished": true}` and left the
+    post listed and readable; starting an example ran `pkill -x m6-http` and
+    killed the seven-node fleet running on the same laptop, which it did again
+    that afternoon.
+
+    None of them were subtle. Every one was a single request away from being
+    obvious. They survived because **the only thing that asks whether an
+    interface still works is code that uses it**, and m6's own checks contain no
+    site. The same session had already found the identical shape in the
+    deployment repository's renderers, by hand, and treated it as an incident
+    rather than as a category.
+
+    The fix is not vigilance, it is that m6's own checks build the examples and
+    run their end-to-end suite. That is also the honest reading of the earlier
+    lesson about a check that lives in one place only: this was a check that
+    lived in no place at all.
+
+42. **A check that accepts a range of answers is a comment.** The CMS example's
+    suite had five: "302 or 401 or 403", "may require a valid token", "session
+    may persist on server". Each one sat exactly on top of a real defect.
+
+    The worst of them read the API's own reply. Unpublishing a post returned
+    `{"unpublished": true}`, the test asserted that the body contained the word
+    "unpublished", and it passed for however long the handler had been broken --
+    while the post stayed in the index, stayed listed, and stayed readable. The
+    test and the defect agreed with each other, so the test defended it.
+
+    Another said "token not found in cookie jar (may use httpOnly)" on every run
+    of a working server, because it used `grep -oP` and this is macOS. The
+    hedge in the message is what made that survivable: it had an explanation
+    ready for its own failure, so nobody had to look.
+
+    **Ask the system, not the component that just told you what it did.** Every
+    step of that lifecycle is now checked against what a visitor sees, and the
+    rewritten suite has no skips at all: 96 checks, each with one expected
+    answer. Three of the six defects above were found by writing it.
+
+43. **`pkill -x` is a machine-wide operation, and so is any name.** Three
+    examples' `dev.sh` and the deployment's own `dev.sh` cleared stale state with
+    `pkill -x m6-http; pkill -x m6-html; ...`. A process name is not a scope:
+    anyone with another m6 running lost all of it, with no error, no log line,
+    and nothing to connect the disappearance to the command that caused it.
+
+    It destroyed a running seven-node local fleet twice in one afternoon, the
+    second time while cleaning up after the first.
+
+    Scoping by path (`pgrep -f "$SITE"`) fixes the examples, where each one owns
+    its own directory. It does **not** fix the deployment, whose dev stack and
+    whose local fleet both run with paths under the same repository -- there, a
+    pid file is the only thing that actually knows which processes a previous run
+    of this script started. The general rule: **a cleanup must be able to name
+    what it owns.** If it can only describe what it wants to kill, it will kill
+    somebody else's.
+
+44. **A test that changes the file's contents cannot tell you whether a
+    timestamp-only change is noticed.** `Request::touch` is m6-core's documented
+    way for a renderer to invalidate the edge: write the content, then touch
+    `site.toml`. On Linux it had never worked, and four watcher tests passed
+    throughout.
+
+    It called `filetime::set_file_times`, which is `utimensat(2)` with no open.
+    That reports `IN_ATTRIB`. The inotify mask asked for
+    `IN_CLOSE_WRITE | IN_CREATE | IN_MOVED_TO`, so the event arrived, was read,
+    and was discarded. The mtime-polling fallback that would have caught it runs
+    only when there is no watcher fd, and on Linux there always is one.
+
+    Every existing watcher test wrote bytes, so every one of them produced
+    `IN_CLOSE_WRITE` and passed against a mask that could not see the case the
+    function actually used. The new test writes nothing on purpose, and reverting
+    the mask in place on a Linux box confirmed it discriminates: five passed with
+    the flag, four passed and one failed without it.
+
+    Two things worth separating here.
+
+    **The obvious one: it worked on macOS.** kqueue registers the watched files
+    themselves and reports the attribute change, so the machine the code was
+    written on had nothing to show, while the platform that serves production was
+    broken. That is the same shape as lesson 33 and it will keep recurring.
+
+    **The one that matters more: `m6-md --touch` worked the whole time.** Its own
+    `touch_file` opens the file for write, so blog publishing was fine. One of two
+    implementations of the same idea was correct, the working one was the one in
+    daily use, and the broken one was the one m6 tells other people to use. **A
+    second implementation of a documented mechanism is where the documented
+    mechanism goes to rot**, because the copy that gets exercised is not the copy
+    that gets recommended.
+
+    It was found the hour after m6's checks started building the examples, which
+    is lesson 41 arriving on time: the examples are the only code in the checks
+    that uses m6 the way a reader would.
