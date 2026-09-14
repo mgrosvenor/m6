@@ -1,8 +1,9 @@
 # Recorded performance numbers, in nanoseconds. Lower is better.
 #
 # BUILD-HOST NUMBERS. They are taken on the Linux build host by
-# deploy/run-tests.sh and mean nothing on any other machine. A laptop running
-# dev servers sits at load 20-30 and its readings move by half between runs.
+# tools/build-host-tests.sh and mean nothing on any other machine. A laptop
+# running dev servers sits at load 20-30 and its readings move by half between
+# runs.
 #
 # A run slower than its number by more than the margin (default 20%) fails.
 # A run faster prints the new number and asks you to record it, deliberately,
@@ -13,5 +14,56 @@
 # were taken. These are here to catch a change that makes something markedly
 # slower, nothing more.
 #
+# ── What the targets are ─────────────────────────────────────────────────────
+#
+# Both render an HTML page end to end over the socket, from the examples
+# repository, whose content is committed so the same bytes are rendered on every
+# machine.
+#
+#   render:minimal     example 01, `/`. A 10-line template over 185 bytes of
+#                      params, so what is left is the FIXED per-request cost.
+#                      The defect this check exists for was that shape: `App`
+#                      spent 0.63 ms per page copying its own config regardless
+#                      of page size.
+#
+#   render:blog-index  example 05, `/blog`. The post index rendered from 113 KB
+#                      of posts.json, iterating every post. The per-item cost,
+#                      which a minimal page cannot see.
+#
+# ── 2026-09-14: `render:capabilities` is gone ────────────────────────────────
+#
+# It measured a deployment's `/capabilities` against its own content, through
+# `deploy/rendered/prod/configs/m6-html.conf`. m6 is a generic web system and
+# could not measure itself: a checkout with no site beside it failed this check
+# rather than running it, and the recorded 2170589ns described one site's 84 KB
+# content file, so it meant nothing to anyone else.
+#
+# Its number is deliberately not carried over. Neither new target renders the
+# same page from the same bytes, so translating it would be inventing a
+# measurement. A deployment can still measure its own content by setting
+# PERFCHECK_SITE, and should keep its own number in its own repository.
+#
+# ── First readings, 2026-09-14, on the build host ────────────────────────────
+#
+# Taken at load average 0.20 on the 4-core Linux build host, which is the only
+# machine these mean anything on.
+#
+# Each perfcheck round is already the minimum of five requests. Three rounds were
+# run and the MEDIAN of the three is recorded, rather than the best of them: the
+# lowest reading is the one the machine was least busy for, and recording it would
+# set a ceiling the same code fails to meet on an ordinary afternoon.
+#
+#   render:minimal      190261, 203222, 201827 ns   -> median 201827  (6.8% spread)
+#   render:blog-index  1781799, 1848274, 1784823 ns -> median 1784823 (3.7% spread)
+#
+# Both spreads sit well inside the 20% margin, which is the margin doing its job:
+# it is there for exactly this variation and not much wider than it.
+#
+# For reference only, NOT a baseline: the same two targets on a macOS laptop read
+# 92020ns and 1005416ns. The laptop is roughly twice as fast here and its readings
+# move by half between runs, which is why the recorded numbers are the build
+# host's and comparing the two tells you nothing.
+#
 # target                     ns
-render:capabilities        2170589
+render:minimal              201827
+render:blog-index          1784823

@@ -26,15 +26,16 @@ ISSUE="${BASH_REMATCH[2]}"
 git diff --quiet && git diff --cached --quiet || die "working tree is dirty"
 git rev-parse --verify "$BRANCH" >/dev/null 2>&1 || die "no such branch: $BRANCH"
 
-# Which deployment repository runs the checks is a property of this working
-# copy, not of m6. See tools/find-deployment.sh.
-# shellcheck source=tools/find-deployment.sh
-. "$(dirname "$0")/find-deployment.sh"
-SITE="$(_m6_find_deployment "$(cd "$(dirname "$0")/.." && pwd)")" || exit 1
-
+# m6's own runner, not a deployment's.
+#
+# This used to find a deployment repository and call its `deploy/run-tests.sh m6`,
+# which is backwards: m6 is a generic web system and its own correctness is its
+# own business, so a bare checkout with no site anywhere near it could not check
+# itself before merging. A deployment still keeps its own runner for the things
+# only it can check -- its renderers, its content, its rendered configs.
 note "running everything on the build host (this is the slow part, and the point)"
 git checkout "$BRANCH" --quiet || die "cannot check out $BRANCH"
-if ! ( cd "$SITE" && ./deploy/run-tests.sh m6 ); then
+if ! "$(dirname "$0")/build-host-tests.sh"; then
   die "checks failed on the build host. Nothing merged."
 fi
 
@@ -47,8 +48,9 @@ git commit --quiet -m "Merge $BRANCH into develop
 
 Closes #$ISSUE
 
-Checks: tests, clippy, h1/h2/h3 conformance, performance — all passed on the
-build host at $(date -u '+%Y-%m-%d %H:%M UTC')." \
+Checks: tests, zero warnings, clippy, cargo-deny, h1/h2/h3 conformance, the
+backend examples, and the m6-examples repository including its CMS end-to-end
+suite — all passed on the build host at $(date -u '+%Y-%m-%d %H:%M UTC')." \
   || die "merge commit failed"
 
 echo -e "${GREEN}merged $BRANCH into develop${RESET}"

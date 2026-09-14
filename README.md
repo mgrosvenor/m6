@@ -4,6 +4,82 @@ m6 is a platform for building and deploying fast websites — covering the full 
 
 ---
 
+## Install
+
+Four steps. The last one is the point: it runs the whole stack and checks it,
+so you finish knowing the install works rather than assuming it.
+
+**1. Build the binaries.**
+
+```sh
+git clone https://github.com/mgrosvenor/m6
+cd m6
+cargo build --release --workspace
+export PATH="$PWD/target/release:$PATH"
+```
+
+Rust 1.75 or newer. Linux is the production target (epoll, inotify); macOS works
+for development.
+
+**2. A development certificate.** m6-http is HTTPS only, so there is no way to
+serve anything without one. [mkcert](https://github.com/FiloSottile/mkcert)
+issues one your browser already trusts:
+
+```sh
+brew install mkcert        # or your package manager's equivalent
+mkcert -install
+```
+
+**3. The examples.** They live in their own repository, checked out beside this
+one, because the renderer crates reach m6 by relative path:
+
+```sh
+cd ..
+git clone https://github.com/mgrosvenor/m6-examples
+cd m6-examples
+cargo build --release      # the custom renderers
+```
+
+**4. Run the whole stack and check it.**
+
+```sh
+cd examples/05-cms
+./dev.sh                   # in one terminal: six services come up
+./test.sh                  # in another
+```
+
+Example 05 is the one that exercises everything at once: m6-http at the edge,
+m6-html for templates, m6-file for assets, m6-md for markdown, m6-auth-server
+for logins, and a custom Rust renderer for the CMS. `test.sh` makes 96 checks
+against it — both wire protocols, assets including nested paths, compression,
+the cache, the security headers, every request method, the full draft to publish
+to unpublish cycle checked against what a visitor actually sees, login, logout,
+and the login throttle including its recovery.
+
+```
+  96 passed  0 failed  (96 checks)
+```
+
+Anything other than that is a real answer about your install, not noise. The
+suite has no skipped checks and nothing in it passes on more than one answer.
+
+Then read [`docs/m6-user-guide.md`](docs/m6-user-guide.md), which walks the
+eleven examples from a static site up to a global fleet.
+
+### If you are changing m6 itself
+
+Build the examples too, and run that suite. They are where m6's interfaces are
+actually used, and they are the first place a change to them breaks. m6's own
+checks do this for you:
+
+```sh
+M6_BUILD_HOST=root@your-linux-box ./tools/build-host-tests.sh
+```
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md).
+
+---
+
 ## System Architecture
 
 ```

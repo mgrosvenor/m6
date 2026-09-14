@@ -434,11 +434,21 @@ backend = "example"
 
         let tls = trusting_client(&cert_der);
         // Wait for the edge to answer, rather than sleeping a fixed amount.
+        //
+        // The panic matters. This loop used to run to its deadline and then carry
+        // on regardless, so an edge that never bound produced a connection error
+        // in whichever assertion happened to run first, naming the symptom instead
+        // of the cause. A wait that cannot fail is not a wait, it is a sleep with
+        // extra steps.
         let deadline = Instant::now() + Duration::from_secs(20);
-        while Instant::now() < deadline {
+        loop {
             if TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
                 break;
             }
+            assert!(
+                Instant::now() < deadline,
+                "{lang}: the edge never bound 127.0.0.1:{port} within 20s"
+            );
             std::thread::sleep(Duration::from_millis(25));
         }
 

@@ -35,13 +35,10 @@ note "checking out develop"
 git checkout develop --quiet || die "no develop branch"
 git pull --ff-only --quiet || die "develop has diverged from origin"
 
-# Which deployment repository runs the checks is a property of this working
-# copy, not of m6. See tools/find-deployment.sh.
-# shellcheck source=tools/find-deployment.sh
-. "$(dirname "$0")/find-deployment.sh"
-SITE="$(_m6_find_deployment "$(cd "$(dirname "$0")/.." && pwd)")" || exit 1
+# m6's own runner, not a deployment's. See the same note in tools/merge.sh: a
+# release of m6 cannot depend on somebody's site being checked out beside it.
 note "running everything on the build host before cutting $TAG"
-( cd "$SITE" && ./deploy/run-tests.sh ) || die "checks failed. No release."
+"$(dirname "$0")/build-host-tests.sh" || die "checks failed. No release."
 
 note "merging develop into main"
 git checkout main --quiet || die "no main branch"

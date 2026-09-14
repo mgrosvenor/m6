@@ -52,13 +52,17 @@ fn handle_login(req: &RawRequest, state: &AppState, peer_ip: &str) -> RawRespons
     let is_form = ct.contains("application/x-www-form-urlencoded");
     let is_json = ct.contains("application/json");
 
-    // Rate limiting (applied regardless of content type)
+    // Rate limiting (applied regardless of content type).
+    //
+    // A read, not a read-and-increment. The counter now moves only when a
+    // password was actually wrong, so a caller that always succeeds is never
+    // throttled. See `rate_limit::RateLimiter` for what counting successes cost.
     {
-        let mut rl = match state.rate_limiter.lock() {
+        let rl = match state.rate_limiter.lock() {
             Ok(l) => l,
             Err(_) => return internal_error(),
         };
-        if rl.check_and_increment(peer_ip) {
+        if rl.is_blocked(peer_ip) {
             warn!(ip = %peer_ip, "rate limit exceeded on login");
             if is_json {
                 return RawResponse::new(429)
@@ -80,6 +84,28 @@ fn handle_login(req: &RawRequest, state: &AppState, peer_ip: &str) -> RawRespons
     } else {
         // Default to form handling for unknown content types
         handle_login_form(req, state, peer_ip)
+    }
+}
+
+/// Count a wrong password against `peer_ip`'s budget.
+///
+/// A poisoned lock is logged and otherwise ignored: refusing the login because
+/// the throttle's mutex is broken would turn a bookkeeping fault into an outage,
+/// and the alternative failure (one uncounted wrong password) is smaller. It is
+/// logged rather than swallowed, because a silently dead throttle is worse than
+/// a loud one.
+fn note_login_failure(state: &AppState, peer_ip: &str) {
+    match state.rate_limiter.lock() {
+        Ok(mut rl) => rl.record_failure(peer_ip),
+        Err(_) => warn!("rate limiter mutex poisoned; login failure not counted"),
+    }
+}
+
+/// Forget `peer_ip`'s failures after a correct password.
+fn note_login_success(state: &AppState, peer_ip: &str) {
+    match state.rate_limiter.lock() {
+        Ok(mut rl) => rl.clear(peer_ip),
+        Err(_) => warn!("rate limiter mutex poisoned; login success not cleared"),
     }
 }
 
@@ -115,6 +141,7 @@ fn handle_login_form(req: &RawRequest, state: &AppState, peer_ip: &str) -> RawRe
         Ok(Some(u)) => u,
         Ok(None) => {
             warn!(ip = %peer_ip, reason = "invalid_credentials", "login failure");
+            note_login_failure(state, peer_ip);
             let next_enc = url_encode_path(&next);
             return RawResponse::new(302).header(
                 "Location",
@@ -126,6 +153,11 @@ fn handle_login_form(req: &RawRequest, state: &AppState, peer_ip: &str) -> RawRe
             return internal_error();
         }
     };
+
+    // The password was right, so this IP's failure count goes away. Without this
+    // a person who mistyped five times and then got it right stayed locked out
+    // for the rest of the window.
+    note_login_success(state, peer_ip);
 
     // Issue tokens
     let (access_jwt, refresh_jwt) =
@@ -188,6 +220,7 @@ fn handle_login_json(req: &RawRequest, state: &AppState, peer_ip: &str) -> RawRe
         Ok(Some(u)) => u,
         Ok(None) => {
             warn!(ip = %peer_ip, reason = "invalid_credentials", "login failure");
+            note_login_failure(state, peer_ip);
             return RawResponse::new(401)
                 .content_type("application/json")
                 .body(r#"{"error":"invalid_credentials"}"#);
@@ -197,6 +230,11 @@ fn handle_login_json(req: &RawRequest, state: &AppState, peer_ip: &str) -> RawRe
             return internal_error();
         }
     };
+
+    // The password was right, so this IP's failure count goes away. Without this
+    // a person who mistyped five times and then got it right stayed locked out
+    // for the rest of the window.
+    note_login_success(state, peer_ip);
 
     // Issue tokens
     let (access_jwt, refresh_jwt) =
