@@ -182,6 +182,92 @@ A/B used a portable bench written against the API common to all five commits.
 
 ---
 
+## 4a. §4's sequel: `/perf` never reported any latency at all
+
+**Found and fixed 2026-09-15.** §4 established that `hit_p50_ns` is load
+dependent and that the number should be read beside its sample count. While
+checking the fleet against that, the endpoint that serves it turned out to
+report nothing.
+
+`/perf` on origin, with ten hours of uptime behind it:
+
+```json
+"cache_hits_total": 338,   "cache_misses_total": 1035,
+"hit_samples": 0, "hit_p50_ns": 0, "hit_p99_ns": 0,
+"miss_samples": 0, "monitor_samples": 0
+```
+
+338 hits counted, **zero latency samples**. m6-monitor correctly reads zero
+samples as "not measured" and publishes `null`, so the fleet digest carried no
+latency for any node and never had. The one number the monitor exists to trend
+was structurally absent, while the `periodic stats` line was printing
+`hit_p50_ns=3878` for the same counter in the same minute.
+
+### Cause
+
+`maybe_emit` reset `hit_idx` and `hit_count` to 0 every ten seconds, and
+`snapshot()` -- what `/perf` serves -- read those same fields. So `/perf`
+reported the percentiles of whatever fraction of a ten-second window happened to
+be open when it was scraped. **origin takes about two requests a minute**, so
+almost every ten-second window contains no cache hit at all.
+
+`snapshot()`'s own comment reasoned carefully about not *resetting* from the
+scrape path, so a polling monitor could not gut the operational log. That was
+right, and it was incomplete: it read the window the emitter did reset.
+
+### Not everything was broken, which is why it survived
+
+The **per-channel** reservoirs were never cleared, so they held real data the
+whole time. Same scrape, same second:
+
+| channel | requests | hit samples | hit p50 |
+|---|---:|---:|---:|
+| http/1.1/external | 839 | 35 | 3,191 ns |
+| http/2/external | 249 | 131 | 2,604 ns |
+| http/2/internal | 569 | 174 | 2,789 ns |
+
+The aggregate was the only broken figure, and it is the only one m6-monitor
+reads. Anyone opening `/perf` and scrolling past the aggregate would have seen
+plausible numbers.
+
+### Fix
+
+One reservoir, run as a ring and never cleared. `*_window_added` counters give
+the periodic log its own ten-second window, so the operational logging is
+unchanged. `percentiles_ring` reads the newest *n* entries rather than
+`samples[..n]` from the front, which had been correct only because the index was
+reset every window and would have reported the **oldest** samples as current
+once the ring genuinely wrapped. No extra memory, no extra work per request.
+
+`snapshot()` now spans the most recent up to `RESERVOIR` (4096) samples, **which
+is a count, not a period of time.** On a quiet node it reaches back hours and
+blends idle and busy traffic. That is exactly why `hit_samples` is reported
+beside it, in the periodic log and in the monitor digest as well as in `/perf`:
+per §4 the percentile means nothing without it.
+
+### Verified
+
+Unit: `stats::perf_reservoir_tests`, six tests. Three of them fail against the
+old reset, including `an_emit_does_not_erase_what_perf_reports`; the other three
+are properties that held either way. Checked by reinstating the old reset and
+watching them fail, because a regression test that passes against the broken
+version is worse than no test.
+
+End to end: the 05-cms example stack with a perf token, 40 requests, then scrapes
+across two emit boundaries with silence in between -- the ordering that used to
+return zeros.
+
+| scrape | hit_samples | hit_p50_ns | hit_p99_ns |
+|---|---:|---:|---:|
+| straight after traffic | 81 | 2,250 | 5,625 |
+| after 14s of silence | 81 | 2,250 | 5,625 |
+| after 14s more | 81 | 2,250 | 5,625 |
+
+And the periodic log still means "this window": `cache_hits=39
+hit_p50_ns=2208` in the busy window, zeros in the idle ones either side.
+
+---
+
 ## 5. How to reproduce any of this
 
 **Copy audit** (core's per-request copying, against the real content file):
