@@ -109,10 +109,30 @@ tree, which it has already caught me doing.
 | `tools/release.sh` | develop into main; refuses without a CHANGELOG entry |
 | `tools/clippy.sh` | clippy, `-D warnings`. No ceiling, no `--update` |
 | `tools/conformance.sh` | h1/h2/h3 against recorded minimum scores |
-| `tools/perfcheck.sh` | page render against a recorded number, 20% margin |
+| `tools/perfcheck.sh` | two page renders from the examples, against recorded numbers, 20% margin |
+| `tools/build-host-tests.sh` | **everything, on the build host.** m6's own: build, warnings, clippy, cargo-deny, tests, conformance, then the examples repository and its CMS end-to-end suite. `merge.sh` and `release.sh` both call it |
 | — | the hourly production check moved to the deployment repository; §6 |
 | `check.sh` | the laptop pre-push set |
-| the deployment repo's `deploy/run-tests.sh` | everything, on the build host. Found by `tools/find-deployment.sh` |
+| the deployment repo's `deploy/run-tests.sh` | the deployment's own half: its renderers, its content, its rendered configs. It no longer runs m6's |
+
+**`tools/find-deployment.sh` is gone.** `merge.sh`, `release.sh` and
+`perfcheck.sh` used it to locate a deployment repository and run its
+`deploy/run-tests.sh`, which had it backwards: a release of m6 cannot depend on
+somebody's site being checked out beside it, and a bare checkout could not check
+itself. All three now use m6's own runner and the examples.
+
+### The examples repository is part of the checks
+
+`m6-examples`, checked out **beside** this one (the renderer crates reach m6 by
+relative path, so they have to be siblings). `tools/build-host-tests.sh` builds it
+against the m6 tree it just built, parses every example's config with the real
+m6-http, and runs example 05's end-to-end suite over the whole running stack.
+
+This is not optional courtesy to the examples. It is the only code in the checks
+that **uses** m6's interfaces, and nothing had ever built it: by 2026-09-14 it did
+not compile at all, and underneath that were five more defects nobody could see.
+Read lesson 41. `M6_SKIP_EXAMPLES=1` runs without it and says what that leaves
+unchecked.
 
 ### How to write for the owner
 
@@ -388,7 +408,17 @@ matching the newest tag; `release.sh` bumps them at a release.
 | 2 | ~~**quiche 0.26.1 → 0.29.3, re-measure h3**~~ | **done 2026-09-13, issue #4.** The bump alone moved nothing. h3 is now **47/49** on a fork of quiche master carrying PRs #2521 and #2575, floor raised to 47. The last two are QPACK and are accepted, not chased. §4 |
 | 3 | **Phase 7: renderers onto a git tag** | below |
 | 4 | ~~**Phase 8: six `/status` implementations**~~ | **done 2026-09-13, issue #6.** All six conform, 13 tests in the gate, Go installed. The measurement: **linking m6-core costs 36% of throughput and +37us p50**, 8.8x RSS, 56.7x binary. §4 below |
-| 5 | **Deploy, lifting the freeze** | the deployment repository's business; §6. Not a code task. |
+| 5 | ~~**The examples are built by the checks**~~ | **done 2026-09-14, issue #11.** They did not compile at all, and five more defects were underneath that. `build-host-tests.sh` now builds them and runs example 05's end-to-end suite; `merge.sh` and `release.sh` both call it; `find-deployment.sh` is deleted. See §2 and lesson 41 |
+| 6 | **Deploy, lifting the freeze** | the deployment repository's business; §6. Not a code task. |
+
+**One thing 1.0 still owes: the two performance numbers.** `render:capabilities`
+measured a deployment's content and is removed; `render:minimal` and
+`render:blog-index` replace it and **have never been recorded on the build host**.
+Until they are, `perfcheck.sh` reports each reading and passes, which is honest
+about having nothing to compare against but means a regression would not be
+caught. Record them with `tools/perfcheck.sh --update` on the build host, in a
+commit that says they are first readings. `tools/perf-baseline.txt` explains why
+the old number was not translated across.
 
 ### Phase 7 in detail
 
