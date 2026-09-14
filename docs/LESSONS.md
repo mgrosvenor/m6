@@ -325,3 +325,69 @@ New 2026-09-12:
     exactly like a comment endorsing it. The issue tracker is where intent
     actually lives, it takes one search, and skipping it turned a two-PR wait
     into a false claim that the transport layer might have to be replaced.
+
+41. **Two repositories that build separately, with nothing building them
+    together, is not a risk. It is a defect already present, waiting to be
+    looked at.** m6-examples had not compiled for days: every renderer crate
+    still pointed at `m6-render`, a crate m6 had deleted. The binaries left in
+    `target/release` from before the deletion meant running an example still
+    looked fine, so nothing announced it.
+
+    Getting it to build took four small edits. What that bought was the ability
+    to ask questions, and the answers were five more defects sitting in plain
+    sight: every asset in every example returned 502 because m6-file's config
+    schema had changed and ten configs were left naming no handler; PATCH was
+    refused at the edge by `allowed_methods`, which looks exactly like a missing
+    route; unpublishing a CMS post answered `{"unpublished": true}` and left the
+    post listed and readable; starting an example ran `pkill -x m6-http` and
+    killed the seven-node fleet running on the same laptop, which it did again
+    that afternoon.
+
+    None of them were subtle. Every one was a single request away from being
+    obvious. They survived because **the only thing that asks whether an
+    interface still works is code that uses it**, and m6's own checks contain no
+    site. The same session had already found the identical shape in the
+    deployment repository's renderers, by hand, and treated it as an incident
+    rather than as a category.
+
+    The fix is not vigilance, it is that m6's own checks build the examples and
+    run their end-to-end suite. That is also the honest reading of the earlier
+    lesson about a check that lives in one place only: this was a check that
+    lived in no place at all.
+
+42. **A check that accepts a range of answers is a comment.** The CMS example's
+    suite had five: "302 or 401 or 403", "may require a valid token", "session
+    may persist on server". Each one sat exactly on top of a real defect.
+
+    The worst of them read the API's own reply. Unpublishing a post returned
+    `{"unpublished": true}`, the test asserted that the body contained the word
+    "unpublished", and it passed for however long the handler had been broken --
+    while the post stayed in the index, stayed listed, and stayed readable. The
+    test and the defect agreed with each other, so the test defended it.
+
+    Another said "token not found in cookie jar (may use httpOnly)" on every run
+    of a working server, because it used `grep -oP` and this is macOS. The
+    hedge in the message is what made that survivable: it had an explanation
+    ready for its own failure, so nobody had to look.
+
+    **Ask the system, not the component that just told you what it did.** Every
+    step of that lifecycle is now checked against what a visitor sees, and the
+    rewritten suite has no skips at all: 96 checks, each with one expected
+    answer. Three of the six defects above were found by writing it.
+
+43. **`pkill -x` is a machine-wide operation, and so is any name.** Three
+    examples' `dev.sh` and the deployment's own `dev.sh` cleared stale state with
+    `pkill -x m6-http; pkill -x m6-html; ...`. A process name is not a scope:
+    anyone with another m6 running lost all of it, with no error, no log line,
+    and nothing to connect the disappearance to the command that caused it.
+
+    It destroyed a running seven-node local fleet twice in one afternoon, the
+    second time while cleaning up after the first.
+
+    Scoping by path (`pgrep -f "$SITE"`) fixes the examples, where each one owns
+    its own directory. It does **not** fix the deployment, whose dev stack and
+    whose local fleet both run with paths under the same repository -- there, a
+    pid file is the only thing that actually knows which processes a previous run
+    of this script started. The general rule: **a cleanup must be able to name
+    what it owns.** If it can only describe what it wants to kill, it will kill
+    somebody else's.
