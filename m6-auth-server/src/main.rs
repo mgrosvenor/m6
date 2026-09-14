@@ -71,7 +71,10 @@ fn build_state(ctx: &AppContext) -> Result<AppState> {
         access_ttl: cfg.access_ttl,
         refresh_ttl: cfg.refresh_ttl,
         issuer: cfg.issuer.clone(),
-        rate_limiter: Mutex::new(RateLimiter::new()),
+        rate_limiter: Mutex::new(RateLimiter::with_limits(
+            cfg.rate_limit_max_attempts,
+            cfg.rate_limit_window_secs,
+        )),
     })
 }
 

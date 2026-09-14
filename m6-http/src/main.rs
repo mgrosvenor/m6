@@ -2558,6 +2558,12 @@ fn handle_request_inner(
             detail: Some(detail),
         };
         let (s, mut h, b, n) = apply_error_mode(status, req, client_ip, state, Some(&ctx));
+        // The error page replaces the backend's response wholesale, so the
+        // headers that tell the client what to do next have to be carried over
+        // by hand. Without this, a backend's 429 arrived with no `Retry-After`
+        // and a backend's 401 with no `WWW-Authenticate`. See
+        // `error::PRESERVED_ERROR_HEADERS`.
+        error::preserve_actionable_headers(&resp_headers, &mut h);
         // Bug fix: this early return used to skip analytics for every
         // backend-returned error status uniformly — unlike its async sibling
         // (finalize_url_response), which deliberately logs a backend-returned
