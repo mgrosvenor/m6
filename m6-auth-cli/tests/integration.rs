@@ -50,7 +50,14 @@ impl TestEnv {
         let pub_ = key_dir.join("auth.pub");
 
         let st = Command::new("openssl")
-            .args(["ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out"])
+            .args([
+                "ecparam",
+                "-name",
+                "prime256v1",
+                "-genkey",
+                "-noout",
+                "-out",
+            ])
             .arg(&sec1)
             .stderr(Stdio::null())
             .status()
@@ -82,7 +89,11 @@ impl TestEnv {
     }
 
     fn config(&self) -> String {
-        self.dir.path().join("m6-auth.conf").to_string_lossy().to_string()
+        self.dir
+            .path()
+            .join("m6-auth.conf")
+            .to_string_lossy()
+            .to_string()
     }
 
     fn run(&self, args: &[&str]) -> Output {
@@ -109,7 +120,15 @@ fn stderr(o: &Output) -> String {
 #[test]
 fn test_bootstrap_user_add() {
     let env = TestEnv::new();
-    let out = env.run(&["user", "add", "admin", "--role", "admin", "--password", "secret"]);
+    let out = env.run(&[
+        "user",
+        "add",
+        "admin",
+        "--role",
+        "admin",
+        "--password",
+        "secret",
+    ]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
 }
 
@@ -117,7 +136,15 @@ fn test_bootstrap_user_add() {
 fn test_bootstrap_group_add() {
     let env = TestEnv::new();
     // Need a user first for group member add
-    env.run(&["user", "add", "admin", "--role", "admin", "--password", "secret"]);
+    env.run(&[
+        "user",
+        "add",
+        "admin",
+        "--role",
+        "admin",
+        "--password",
+        "secret",
+    ]);
     let out = env.run(&["group", "add", "editors"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
 }
@@ -125,7 +152,15 @@ fn test_bootstrap_group_add() {
 #[test]
 fn test_bootstrap_group_member_add() {
     let env = TestEnv::new();
-    env.run(&["user", "add", "admin", "--role", "admin", "--password", "secret"]);
+    env.run(&[
+        "user",
+        "add",
+        "admin",
+        "--role",
+        "admin",
+        "--password",
+        "secret",
+    ]);
     env.run(&["group", "add", "editors"]);
     let out = env.run(&["group", "member", "add", "editors", "admin"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
@@ -134,7 +169,15 @@ fn test_bootstrap_group_member_add() {
 #[test]
 fn test_bootstrap_user_ls_json_contains_admin() {
     let env = TestEnv::new();
-    env.run(&["user", "add", "admin", "--role", "admin", "--password", "secret"]);
+    env.run(&[
+        "user",
+        "add",
+        "admin",
+        "--role",
+        "admin",
+        "--password",
+        "secret",
+    ]);
     env.run(&["group", "add", "editors"]);
     env.run(&["group", "member", "add", "editors", "admin"]);
 
@@ -142,19 +185,29 @@ fn test_bootstrap_user_ls_json_contains_admin() {
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
 
     let body = stdout(&out);
-    let parsed: serde_json::Value = serde_json::from_str(&body)
-        .expect("valid JSON");
+    let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
     assert!(parsed.is_array(), "should be a JSON array");
     let arr = parsed.as_array().unwrap();
     assert!(!arr.is_empty(), "array should not be empty");
-    assert!(arr.iter().any(|u| u["username"] == "admin"),
-        "admin not found in: {}", body);
+    assert!(
+        arr.iter().any(|u| u["username"] == "admin"),
+        "admin not found in: {}",
+        body
+    );
 }
 
 #[test]
 fn test_bootstrap_group_member_ls_shows_admin() {
     let env = TestEnv::new();
-    env.run(&["user", "add", "admin", "--role", "admin", "--password", "secret"]);
+    env.run(&[
+        "user",
+        "add",
+        "admin",
+        "--role",
+        "admin",
+        "--password",
+        "secret",
+    ]);
     env.run(&["group", "add", "editors"]);
     env.run(&["group", "member", "add", "editors", "admin"]);
 
@@ -170,7 +223,15 @@ fn test_bootstrap_group_member_ls_shows_admin() {
 fn test_full_bootstrap_sequence() {
     let env = TestEnv::new();
 
-    let out = env.run(&["user", "add", "admin", "--role", "admin", "--password", "secret"]);
+    let out = env.run(&[
+        "user",
+        "add",
+        "admin",
+        "--role",
+        "admin",
+        "--password",
+        "secret",
+    ]);
     assert_eq!(out.status.code(), Some(0));
 
     let out = env.run(&["group", "add", "editors"]);
@@ -205,7 +266,8 @@ fn test_user_add_duplicate_exits_1() {
     let err = stderr(&out);
     assert!(
         err.contains("alice") && (err.contains("already exists") || err.contains("exist")),
-        "expected clear error about duplicate, got: {}", err
+        "expected clear error about duplicate, got: {}",
+        err
     );
 }
 
@@ -217,7 +279,8 @@ fn test_user_del_unknown_exits_1() {
     let err = stderr(&out);
     assert!(
         err.contains("ghost") || err.contains("not found"),
-        "expected clear error, got: {}", err
+        "expected clear error, got: {}",
+        err
     );
 }
 
@@ -225,14 +288,15 @@ fn test_user_del_unknown_exits_1() {
 fn test_config_not_found_exits_2() {
     let bin = binary_path();
     let out = Command::new(&bin)
-        .args(&["/nonexistent/path/m6-auth.conf", "user", "ls"])
+        .args(["/nonexistent/path/m6-auth.conf", "user", "ls"])
         .output()
         .expect("run");
     assert_eq!(out.status.code(), Some(2), "stdout: {}", stdout(&out));
     let err = stderr(&out);
     assert!(
         err.contains("not found") || err.contains("config"),
-        "expected config error, got: {}", err
+        "expected config error, got: {}",
+        err
     );
 }
 
@@ -245,7 +309,8 @@ fn test_no_arguments_exits_2() {
     let err = stderr(&out);
     assert!(
         err.contains("Usage") || err.contains("usage") || err.contains("m6-auth-cli"),
-        "expected usage message, got: {}", err
+        "expected usage message, got: {}",
+        err
     );
 }
 
@@ -286,7 +351,17 @@ fn test_group_ls_json_is_valid_array() {
 #[test]
 fn test_user_ls_table_format() {
     let env = TestEnv::new();
-    env.run(&["user", "add", "alice", "--role", "admin", "--role", "user", "--password", "pw"]);
+    env.run(&[
+        "user",
+        "add",
+        "alice",
+        "--role",
+        "admin",
+        "--role",
+        "user",
+        "--password",
+        "pw",
+    ]);
 
     let out = env.run(&["user", "ls"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
@@ -326,23 +401,38 @@ fn test_user_roles_set_unset() {
 
     // Add admin role
     let out = env.run(&["user", "roles", "alice", "--set", "admin"]);
-    assert_eq!(out.status.code(), Some(0), "set role failed: {}", stderr(&out));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "set role failed: {}",
+        stderr(&out)
+    );
 
     // Remove user role
     let out = env.run(&["user", "roles", "alice", "--unset", "user"]);
-    assert_eq!(out.status.code(), Some(0), "unset role failed: {}", stderr(&out));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "unset role failed: {}",
+        stderr(&out)
+    );
 
     // Verify via JSON
     let out = env.run(&["user", "ls", "--json"]);
     let body = stdout(&out);
     let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-    let alice = parsed.as_array().unwrap()
+    let alice = parsed
+        .as_array()
+        .unwrap()
         .iter()
         .find(|u| u["username"] == "alice")
         .expect("alice not found");
     let roles: Vec<String> = serde_json::from_value(alice["roles"].clone()).unwrap();
     assert!(roles.contains(&"admin".to_string()), "admin role missing");
-    assert!(!roles.contains(&"user".to_string()), "user role should be removed");
+    assert!(
+        !roles.contains(&"user".to_string()),
+        "user role should be removed"
+    );
 }
 
 // ── group del ─────────────────────────────────────────────────────────────────
@@ -385,7 +475,11 @@ fn test_token_create_prints_jwt() {
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
     let body = stdout(&out);
     // A JWT has three dot-separated base64url segments
-    assert!(body.trim().split('.').count() == 3, "expected JWT, got: {}", body);
+    assert!(
+        body.trim().split('.').count() == 3,
+        "expected JWT, got: {}",
+        body
+    );
 }
 
 #[test]
@@ -408,7 +502,8 @@ fn test_token_create_missing_keys_exits_1() {
     let err = stderr(&out);
     assert!(
         err.contains("key") || err.contains("not found") || err.contains("No such"),
-        "expected key error, got: {}", err
+        "expected key error, got: {}",
+        err
     );
 }
 
@@ -467,7 +562,11 @@ fn test_token_revoke_removes_token() {
     let body = stdout(&out);
     let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
     let arr = parsed.as_array().unwrap();
-    assert!(arr.is_empty(), "expected empty list after revoke, got: {}", body);
+    assert!(
+        arr.is_empty(),
+        "expected empty list after revoke, got: {}",
+        body
+    );
 }
 
 #[test]

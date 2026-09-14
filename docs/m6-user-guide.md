@@ -1,22 +1,41 @@
 # m6 — User Guide
 
-Eleven examples, each building on the last. Clone the examples repo to follow along:
+Eleven examples, each building on the last. Clone the examples repository
+**beside your m6 checkout**, not inside it: the examples' renderer crates reach
+m6 by relative path (`../../../../m6/m6-core`), so the two have to be siblings.
 
 ```bash
-git clone https://github.com/m6/m6-examples
+git clone https://github.com/mgrosvenor/m6-examples
 cd m6-examples
+cargo build --release        # the custom renderers used by 03, 04, 05, 07 and 11
 ```
 
 Prerequisites:
 
 ```bash
-# Install m6 binaries
-cargo install m6-http m6-html m6-file m6-auth
+# m6's binaries, from source. They are not on crates.io.
+git clone https://github.com/mgrosvenor/m6 && cd m6
+cargo build --release --workspace
+export PATH="$PWD/target/release:$PATH"
 
-# TLS for development (run once)
-mkcert -install && mkcert localhost 127.0.0.1
-# Outputs localhost.pem and localhost-key.pem
+# TLS for development, once. m6-http is HTTPS only.
+mkcert -install
 ```
+
+Each example's `dev.sh` generates its own certificate into `keys/` on first run,
+so there is nothing to place by hand.
+
+Before following the examples, it is worth running the one that uses all of m6 at
+once and checking it:
+
+```bash
+cd examples/05-cms
+./dev.sh        # one terminal
+./test.sh       # another: 96 checks over the whole stack
+```
+
+`README.md`'s install section explains what that covers. If it passes, every
+component below is working on your machine.
 
 ---
 

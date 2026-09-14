@@ -15,14 +15,14 @@ use anyhow::Context;
 use serde_json::{Map, Value};
 use tracing::{error, info, warn};
 
+use crate::dict::Dict;
 use crate::error::{Error, Result};
+use crate::render::{RenderError, Renderer, RendererFactory};
 use crate::request::{
     parse_auth_claims, parse_cookies, parse_form_body, parse_query_string, validate_path_param,
     validate_wildcard_param, RawRequest, Request,
 };
-use crate::dict::Dict;
 use crate::response::{error_to_response, Response};
-use crate::render::{RenderError, Renderer, RendererFactory};
 
 // ---------------------------------------------------------------------------
 // Per-thread state infrastructure
@@ -45,6 +45,27 @@ type ThreadInitFn = Arc<dyn Fn() -> Box<dyn Any + Send> + Send + Sync>;
 
 /// Destructor: called once per thread at shutdown, receives the type-erased state.
 type ThreadDestroyFn = Arc<dyn Fn(Box<dyn Any + Send>) + Send + Sync>;
+
+// ── The stateful builders' callback shapes ────────────────────────────────────
+//
+// These four spell out the closures a service hands `App` when it carries state.
+// They are aliases rather than the types written out because the written-out
+// forms are what `App`'s builders, their private run functions and their
+// internal structs all repeat, once per arity, and a reader comparing two
+// signatures had to diff forty characters of `Arc<dyn Fn(..) + Send + Sync>` to
+// find the one difference that mattered. Naming them says which is which.
+
+/// Builds the global state once, at startup, before any worker thread exists.
+/// Fails the service if it returns `Err`: there is no degraded mode.
+type InitGlobal<G> = Arc<dyn Fn(&AppContext) -> Result<G> + Send + Sync>;
+
+/// Builds one thread's state from the config dict and the global state. Called
+/// once per worker thread. `G` is `()` for a service with thread state only.
+type InitThread<G, T> = Arc<dyn Fn(&Map<String, Value>, &G) -> Result<T> + Send + Sync>;
+
+/// Tears state down at shutdown. `None` is the common case: most services hold
+/// nothing that needs an explicit drop, and the option is what says so.
+type Destroy<S> = Option<Arc<dyn Fn(S) + Send + Sync>>;
 
 /// Global thread-init function — set at startup before any threads are created.
 static THREAD_INIT_FN: OnceLock<ThreadInitFn> = OnceLock::new();
@@ -254,11 +275,11 @@ pub fn route_specificity(segments: &[Segment]) -> i32 {
 /// registered on the same path with different HTTP methods.
 fn route_method_key(m: &RouteMethod) -> &'static str {
     match m {
-        RouteMethod::Any    => "ANY",
-        RouteMethod::Get    => "GET",
-        RouteMethod::Post   => "POST",
-        RouteMethod::Put    => "PUT",
-        RouteMethod::Patch  => "PATCH",
+        RouteMethod::Any => "ANY",
+        RouteMethod::Get => "GET",
+        RouteMethod::Post => "POST",
+        RouteMethod::Put => "PUT",
+        RouteMethod::Patch => "PATCH",
         RouteMethod::Delete => "DELETE",
     }
 }
@@ -322,7 +343,9 @@ pub fn find_route<'a>(
         if let Some(params) = match_route(&path_segs, route) {
             match &best {
                 Some((best_route, _)) if route.specificity <= best_route.specificity => {}
-                _ => { best = Some((route, params)); }
+                _ => {
+                    best = Some((route, params));
+                }
             }
         }
     }
@@ -361,7 +384,9 @@ impl ParamsCache {
     fn new(size: usize) -> Self {
         use std::num::NonZeroUsize;
         let cap = NonZeroUsize::new(size.max(1)).unwrap();
-        Self { inner: Mutex::new(lru::LruCache::new(cap)) }
+        Self {
+            inner: Mutex::new(lru::LruCache::new(cap)),
+        }
     }
 
     fn get(&self, key: &str) -> Option<Arc<Map<String, Value>>> {
@@ -424,7 +449,9 @@ impl FrameworkState {
             let segs = compile_pattern(pattern);
             let spec = route_specificity(&segs);
             // Look for a matching config route to inherit its cache setting.
-            let cache = config.routes.iter()
+            let cache = config
+                .routes
+                .iter()
                 .find(|r| r.path == *pattern)
                 .map(|r| r.cache.clone())
                 .unwrap_or_else(|| "no-store".to_string());
@@ -609,9 +636,16 @@ impl FrameworkState {
         // content file holds one copy rather than fifteen.
         let mut base_by_key: HashMap<String, Arc<Map<String, Value>>> = HashMap::new();
         for route in &mut routes {
-            let static_files: Vec<&String> =
-                route.params_files.iter().filter(|p| !p.contains('{')).collect();
-            let key = static_files.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("\u{1}");
+            let static_files: Vec<&String> = route
+                .params_files
+                .iter()
+                .filter(|p| !p.contains('{'))
+                .collect();
+            let key = static_files
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join("\u{1}");
 
             let base = base_by_key.entry(key).or_insert_with(|| {
                 let mut m = Map::new();
@@ -651,7 +685,8 @@ impl FrameworkState {
         #[cfg(feature = "flash")]
         let flash_secret = {
             use base64::Engine;
-            let raw = config.user_config
+            let raw = config
+                .user_config
                 .get("flash_secret")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
@@ -660,9 +695,7 @@ impl FrameworkState {
             } else {
                 base64::engine::general_purpose::STANDARD
                     .decode(raw)
-                    .or_else(|_| {
-                        base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(raw)
-                    })
+                    .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(raw))
                     .context("decoding flash_secret (expected base64)")?
             }
         };
@@ -806,9 +839,18 @@ impl FrameworkState {
 
         // 8. Built-in keys (set after params files — cannot be overridden by them).
         let now = chrono::Utc::now();
-        dict.insert("request_path".to_string(), Value::String(raw.path().to_string()));
-        dict.insert("datetime".to_string(), Value::String(now.format("%Y-%m-%dT%H:%M:%SZ").to_string()));
-        dict.insert("year".to_string(), Value::String(now.format("%Y").to_string()));
+        dict.insert(
+            "request_path".to_string(),
+            Value::String(raw.path().to_string()),
+        );
+        dict.insert(
+            "datetime".to_string(),
+            Value::String(now.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
+        );
+        dict.insert(
+            "year".to_string(),
+            Value::String(now.format("%Y").to_string()),
+        );
 
         // 9. Auth keys.
         if let Some(claims_hdr) = raw.header("x-auth-claims") {
@@ -822,10 +864,7 @@ impl FrameworkState {
 
         // 11. Flash message: verify HMAC, add to dict if valid, clear cookie.
         #[cfg(feature = "flash")]
-        if let Some(flash_cookie) = cookies_map
-            .get("_flash")
-            .and_then(|v| v.as_str())
-        {
+        if let Some(flash_cookie) = cookies_map.get("_flash").and_then(|v| v.as_str()) {
             if let Some(msg) = verify_flash_cookie(flash_cookie, &self.flash_secret) {
                 dict.insert("flash".to_string(), Value::String(msg));
             }
@@ -882,8 +921,10 @@ impl FrameworkState {
             };
             let html = self.renderer.render(&template_name, ctx)?;
             resp.body = crate::response::Body::Bytes(html.into_bytes());
-            resp.headers
-                .push(("Content-Type".to_string(), "text/html; charset=utf-8".to_string()));
+            resp.headers.push((
+                "Content-Type".to_string(),
+                "text/html; charset=utf-8".to_string(),
+            ));
             resp.template_name = None;
             resp.template_dict = None;
         }
@@ -925,7 +966,11 @@ fn verify_flash_cookie(cookie_val: &str, secret: &[u8]) -> Option<String> {
     if expected.len() != provided.len() {
         return None;
     }
-    let ok = expected.iter().zip(provided.iter()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0;
+    let ok = expected
+        .iter()
+        .zip(provided.iter())
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+        == 0;
     if !ok {
         return None;
     }
@@ -951,9 +996,7 @@ fn generate_csrf_token() -> String {
 // ---------------------------------------------------------------------------
 
 /// Helper: downcast TLS and call the typed destroy.
-fn drain_thread_state_typed<T: Any + Send + 'static>(
-    destroy: &Arc<dyn Fn(T) + Send + Sync>,
-) {
+fn drain_thread_state_typed<T: Any + Send + 'static>(destroy: &Arc<dyn Fn(T) + Send + Sync>) {
     THREAD_STATE.with(|cell| {
         if let Some(boxed) = cell.borrow_mut().take() {
             if let Ok(t) = boxed.downcast::<T>() {
@@ -967,8 +1010,8 @@ fn drain_thread_state_typed<T: Any + Send + 'static>(
 fn run_app_global<G: Send + Sync + 'static>(
     raw_routes: Vec<GlobalRawRoute<G>>,
     raw_named: Vec<GlobalRawNamed<G>>,
-    init_global: Arc<dyn Fn(&AppContext) -> Result<G> + Send + Sync>,
-    destroy_global: Option<Arc<dyn Fn(G) + Send + Sync>>,
+    init_global: InitGlobal<G>,
+    destroy_global: Destroy<G>,
     renderer: Arc<dyn RendererFactory>,
 ) -> Result<()> {
     // Before anything else, and before `init_global` below, which is allowed
@@ -984,8 +1027,11 @@ fn run_app_global<G: Send + Sync + 'static>(
     crate::signal::block();
 
     // We need the config before we can call init_global. Load it here.
-    let Invocation { site_dir, config_path, cli_log_level } =
-        parse_invocation(&sigs_of(&raw_routes), &names_of(&raw_named));
+    let Invocation {
+        site_dir,
+        config_path,
+        cli_log_level,
+    } = parse_invocation(&sigs_of(&raw_routes), &names_of(&raw_named));
 
     let config = crate::config::load(&config_path, &site_dir).unwrap_or_else(|e| {
         eprintln!("Config error: {e}");
@@ -1040,7 +1086,10 @@ fn run_app_global<G: Send + Sync + 'static>(
     });
 
     run_app_with_shutdown(
-        Handlers { routes: code_routes, named },
+        Handlers {
+            routes: code_routes,
+            named,
+        },
         config_path,
         site_dir,
         on_shutdown,
@@ -1054,8 +1103,8 @@ fn run_app_global<G: Send + Sync + 'static>(
 fn run_app_thread_state<T: Any + Send + 'static>(
     raw_routes: Vec<ThreadRawRoute<T>>,
     raw_named: Vec<ThreadRawNamed<T>>,
-    init_thread: Arc<dyn Fn(&Map<String, Value>, &()) -> Result<T> + Send + Sync>,
-    destroy_thread: Option<Arc<dyn Fn(T) + Send + Sync>>,
+    init_thread: InitThread<(), T>,
+    destroy_thread: Destroy<T>,
     renderer: Arc<dyn RendererFactory>,
 ) -> Result<()> {
     // Before anything else, and before `init_global` below, which is allowed
@@ -1070,8 +1119,11 @@ fn run_app_thread_state<T: Any + Send + 'static>(
     // what caught it, which is the guard earning its place.
     crate::signal::block();
 
-    let Invocation { site_dir, config_path, cli_log_level } =
-        parse_invocation(&sigs_of(&raw_routes), &names_of(&raw_named));
+    let Invocation {
+        site_dir,
+        config_path,
+        cli_log_level,
+    } = parse_invocation(&sigs_of(&raw_routes), &names_of(&raw_named));
 
     let config = crate::config::load(&config_path, &site_dir).unwrap_or_else(|e| {
         eprintln!("Config error: {e}");
@@ -1081,11 +1133,9 @@ fn run_app_thread_state<T: Any + Send + 'static>(
     // Set up TLS init fn (closes over config dict).
     let cfg_clone: Map<String, Value> = config.user_config.clone();
     let init_fn = init_thread.clone();
-    let tls_init: ThreadInitFn = Arc::new(move || {
-        match init_fn(&cfg_clone, &()) {
-            Ok(t) => Box::new(t) as Box<dyn Any + Send>,
-            Err(e) => panic!("init_thread failed: {e}"),
-        }
+    let tls_init: ThreadInitFn = Arc::new(move || match init_fn(&cfg_clone, &()) {
+        Ok(t) => Box::new(t) as Box<dyn Any + Send>,
+        Err(e) => panic!("init_thread failed: {e}"),
     });
     THREAD_INIT_FN.set(tls_init).ok();
 
@@ -1104,9 +1154,8 @@ fn run_app_thread_state<T: Any + Send + 'static>(
     let code_routes: Vec<CodeRoute> = raw_routes
         .into_iter()
         .map(|(path, method, handler)| {
-            let h: BoxHandler = Box::new(move |req: &Request| {
-                with_thread_state::<T, _>(|t| handler(req, t))
-            });
+            let h: BoxHandler =
+                Box::new(move |req: &Request| with_thread_state::<T, _>(|t| handler(req, t)));
             (path, method, Arc::new(h))
         })
         .collect();
@@ -1114,9 +1163,8 @@ fn run_app_thread_state<T: Any + Send + 'static>(
     let named: Vec<NamedHandler> = raw_named
         .into_iter()
         .map(|(name, handler)| {
-            let h: BoxHandler = Box::new(move |req: &Request| {
-                with_thread_state::<T, _>(|t| handler(req, t))
-            });
+            let h: BoxHandler =
+                Box::new(move |req: &Request| with_thread_state::<T, _>(|t| handler(req, t)));
             (name, Arc::new(h))
         })
         .collect();
@@ -1124,7 +1172,10 @@ fn run_app_thread_state<T: Any + Send + 'static>(
     let on_thread_exit: Arc<dyn Fn() + Send + Sync> = Arc::new(drain_thread_state);
 
     run_app_with_shutdown(
-        Handlers { routes: code_routes, named },
+        Handlers {
+            routes: code_routes,
+            named,
+        },
         config_path,
         site_dir,
         None,
@@ -1139,10 +1190,10 @@ fn run_app_state<G: Send + Sync + 'static, T: Any + Send + 'static>(
     raw_routes: Vec<StateRawRoute<G, T>>,
     raw_named: Vec<StateRawNamed<G, T>>,
     renderer: Arc<dyn RendererFactory>,
-    init_global: Arc<dyn Fn(&AppContext) -> Result<G> + Send + Sync>,
-    init_thread: Arc<dyn Fn(&Map<String, Value>, &G) -> Result<T> + Send + Sync>,
-    destroy_thread: Option<Arc<dyn Fn(T) + Send + Sync>>,
-    destroy_global: Option<Arc<dyn Fn(G) + Send + Sync>>,
+    init_global: InitGlobal<G>,
+    init_thread: InitThread<G, T>,
+    destroy_thread: Destroy<T>,
+    destroy_global: Destroy<G>,
 ) -> Result<()> {
     // Before anything else, and before `init_global` below, which is allowed
     // to spawn threads and in m6-auth-server's case does: the mask is
@@ -1156,8 +1207,11 @@ fn run_app_state<G: Send + Sync + 'static, T: Any + Send + 'static>(
     // what caught it, which is the guard earning its place.
     crate::signal::block();
 
-    let Invocation { site_dir, config_path, cli_log_level } =
-        parse_invocation(&sigs_of(&raw_routes), &names_of(&raw_named));
+    let Invocation {
+        site_dir,
+        config_path,
+        cli_log_level,
+    } = parse_invocation(&sigs_of(&raw_routes), &names_of(&raw_named));
 
     let config = crate::config::load(&config_path, &site_dir).unwrap_or_else(|e| {
         eprintln!("Config error: {e}");
@@ -1179,11 +1233,9 @@ fn run_app_state<G: Send + Sync + 'static, T: Any + Send + 'static>(
     let cfg_clone: Map<String, Value> = config.user_config.clone();
     let init_fn = init_thread.clone();
     let arc_g2 = arc_g.clone();
-    let tls_init: ThreadInitFn = Arc::new(move || {
-        match init_fn(&cfg_clone, &*arc_g2) {
-            Ok(t) => Box::new(t) as Box<dyn Any + Send>,
-            Err(e) => panic!("init_thread failed: {e}"),
-        }
+    let tls_init: ThreadInitFn = Arc::new(move || match init_fn(&cfg_clone, &*arc_g2) {
+        Ok(t) => Box::new(t) as Box<dyn Any + Send>,
+        Err(e) => panic!("init_thread failed: {e}"),
     });
     THREAD_INIT_FN.set(tls_init).ok();
 
@@ -1235,7 +1287,10 @@ fn run_app_state<G: Send + Sync + 'static, T: Any + Send + 'static>(
     let on_thread_exit: Arc<dyn Fn() + Send + Sync> = Arc::new(drain_thread_state);
 
     run_app_with_shutdown(
-        Handlers { routes: code_routes, named },
+        Handlers {
+            routes: code_routes,
+            named,
+        },
         config_path,
         site_dir,
         on_shutdown,
@@ -1295,7 +1350,10 @@ impl ThreadPool {
             });
         }
 
-        Self { queue: tx, in_flight }
+        Self {
+            queue: tx,
+            in_flight,
+        }
     }
 
     /// Submit work. Returns false if the queue is full (→ 503).
@@ -1374,9 +1432,7 @@ fn install_shutdown(socket_path: &std::path::Path) -> crate::signal::ShutdownHan
                 .map(str::to_owned)
         })
         .unwrap_or_else(|| "m6-render".to_string());
-    crate::signal::ShutdownHandle::install(
-        crate::signal::Service::new(name).socket(socket_path),
-    )
+    crate::signal::ShutdownHandle::install(crate::signal::Service::new(name).socket(socket_path))
 }
 
 #[inline]
@@ -1437,14 +1493,22 @@ pub struct App {
 /// than an empty body nobody notices.
 fn default_renderer() -> Arc<dyn RendererFactory> {
     #[cfg(feature = "templates")]
-    { Arc::new(crate::template::TeraFactory) }
+    {
+        Arc::new(crate::template::TeraFactory)
+    }
     #[cfg(not(feature = "templates"))]
-    { Arc::new(crate::render::NoTemplates) }
+    {
+        Arc::new(crate::render::NoTemplates)
+    }
 }
 
 impl App {
     pub fn new() -> Self {
-        Self { routes: vec![], named: vec![], renderer: default_renderer() }
+        Self {
+            routes: vec![],
+            named: vec![],
+            renderer: default_renderer(),
+        }
     }
 
     /// Register a handler under a name, for config to route to.
@@ -1477,10 +1541,8 @@ impl App {
         name: &str,
         handler: impl Fn(&Request) -> Result<Response> + Send + Sync + 'static,
     ) -> Self {
-        self.named.push((
-            name.to_string(),
-            Arc::new(Box::new(handler) as BoxHandler),
-        ));
+        self.named
+            .push((name.to_string(), Arc::new(Box::new(handler) as BoxHandler)));
         self
     }
 
@@ -1572,16 +1634,23 @@ impl Default for App {
 // ---------------------------------------------------------------------------
 
 // Raw stateful route (Global-only): stores the handler before G is known.
-type GlobalRawRoute<G> = (String, RouteMethod, Arc<dyn Fn(&Request, &G) -> Result<Response> + Send + Sync>);
+type GlobalRawRoute<G> = (
+    String,
+    RouteMethod,
+    Arc<dyn Fn(&Request, &G) -> Result<Response> + Send + Sync>,
+);
 
 // The same, bound to a name rather than to a pattern. See `App::handler`.
-type GlobalRawNamed<G> = (String, Arc<dyn Fn(&Request, &G) -> Result<Response> + Send + Sync>);
+type GlobalRawNamed<G> = (
+    String,
+    Arc<dyn Fn(&Request, &G) -> Result<Response> + Send + Sync>,
+);
 
 pub struct AppWithGlobal<G: Send + Sync + 'static> {
     raw_routes: Vec<GlobalRawRoute<G>>,
     raw_named: Vec<GlobalRawNamed<G>>,
-    init_global: Arc<dyn Fn(&AppContext) -> Result<G> + Send + Sync>,
-    destroy_global: Option<Arc<dyn Fn(G) + Send + Sync>>,
+    init_global: InitGlobal<G>,
+    destroy_global: Destroy<G>,
     renderer: Arc<dyn RendererFactory>,
 }
 
@@ -1608,11 +1677,8 @@ impl<G: Send + Sync + 'static> AppWithGlobal<G> {
         method: RouteMethod,
         handler: impl Fn(&Request, &G) -> Result<Response> + Send + Sync + 'static,
     ) -> Self {
-        self.raw_routes.push((
-            path.to_string(),
-            method,
-            Arc::new(handler),
-        ));
+        self.raw_routes
+            .push((path.to_string(), method, Arc::new(handler)));
         self
     }
 
@@ -1733,16 +1799,23 @@ impl App {
 // ---------------------------------------------------------------------------
 
 // Raw stateful route (ThreadLocal): stores the handler before config/TLS known.
-type ThreadRawRoute<T> = (String, RouteMethod, Arc<dyn Fn(&Request, &mut T) -> Result<Response> + Send + Sync>);
+type ThreadRawRoute<T> = (
+    String,
+    RouteMethod,
+    Arc<dyn Fn(&Request, &mut T) -> Result<Response> + Send + Sync>,
+);
 
 // The same, bound to a name rather than to a pattern. See `App::handler`.
-type ThreadRawNamed<T> = (String, Arc<dyn Fn(&Request, &mut T) -> Result<Response> + Send + Sync>);
+type ThreadRawNamed<T> = (
+    String,
+    Arc<dyn Fn(&Request, &mut T) -> Result<Response> + Send + Sync>,
+);
 
 pub struct AppWithThreadState<T: Any + Send + 'static> {
     raw_routes: Vec<ThreadRawRoute<T>>,
     raw_named: Vec<ThreadRawNamed<T>>,
-    init_thread: Arc<dyn Fn(&Map<String, Value>, &()) -> Result<T> + Send + Sync>,
-    destroy_thread: Option<Arc<dyn Fn(T) + Send + Sync>>,
+    init_thread: InitThread<(), T>,
+    destroy_thread: Destroy<T>,
     renderer: Arc<dyn RendererFactory>,
 }
 
@@ -1772,7 +1845,8 @@ impl<T: Any + Send + 'static> AppWithThreadState<T> {
         method: RouteMethod,
         handler: impl Fn(&Request, &mut T) -> Result<Response> + Send + Sync + 'static,
     ) -> Self {
-        self.raw_routes.push((path.to_string(), method, Arc::new(handler)));
+        self.raw_routes
+            .push((path.to_string(), method, Arc::new(handler)));
         self
     }
 
@@ -1821,7 +1895,9 @@ impl<T: Any + Send + 'static> AppWithThreadState<T> {
         path: &str,
         handler: impl Fn(&Request, &(), &mut T) -> Result<Response> + Send + Sync + 'static,
     ) -> Self {
-        self.add_route(path, RouteMethod::Delete, move |req, t| handler(req, &(), t))
+        self.add_route(path, RouteMethod::Delete, move |req, t| {
+            handler(req, &(), t)
+        })
     }
 
     /// Use a different renderer. See `App::renderer`.
@@ -1861,10 +1937,10 @@ type StateRawNamed<G, T> = (
 pub struct AppWithState<G: Send + Sync + 'static, T: Any + Send + 'static> {
     raw_routes: Vec<StateRawRoute<G, T>>,
     raw_named: Vec<StateRawNamed<G, T>>,
-    init_global: Arc<dyn Fn(&AppContext) -> Result<G> + Send + Sync>,
-    init_thread: Arc<dyn Fn(&Map<String, Value>, &G) -> Result<T> + Send + Sync>,
-    destroy_thread: Option<Arc<dyn Fn(T) + Send + Sync>>,
-    destroy_global: Option<Arc<dyn Fn(G) + Send + Sync>>,
+    init_global: InitGlobal<G>,
+    init_thread: InitThread<G, T>,
+    destroy_thread: Destroy<T>,
+    destroy_global: Destroy<G>,
     renderer: Arc<dyn RendererFactory>,
 }
 
@@ -1896,7 +1972,8 @@ impl<G: Send + Sync + 'static, T: Any + Send + 'static> AppWithState<G, T> {
         method: RouteMethod,
         handler: impl Fn(&Request, &G, &mut T) -> Result<Response> + Send + Sync + 'static,
     ) -> Self {
-        self.raw_routes.push((path.to_string(), method, Arc::new(handler)));
+        self.raw_routes
+            .push((path.to_string(), method, Arc::new(handler)));
         self
     }
 
@@ -2014,10 +2091,11 @@ fn unknown_handlers(
             // left at the default `Any` legitimately annotates a code route
             // registered with `route_get`, and comparing methods would call
             // that dead.
-            None if route.template.is_none()
-                && !code_patterns.contains(&route.pattern) =>
-            {
-                missing.push((route.pattern.clone(), "<no template, no handler>".to_string()));
+            None if route.template.is_none() && !code_patterns.contains(&route.pattern) => {
+                missing.push((
+                    route.pattern.clone(),
+                    "<no template, no handler>".to_string(),
+                ));
             }
             None => {}
         }
@@ -2078,8 +2156,28 @@ pub struct Invocation {
 /// refused deploy.
 fn parse_invocation(routes: &[(String, RouteMethod)], handlers: &[String]) -> Invocation {
     let args: Vec<String> = std::env::args().collect();
+
+    // Before the argument-count check, because `--version` takes no site directory
+    // and no config: a deploy asks a freshly installed binary what it is before
+    // any config is in place.
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        // The program's own name, from argv[0], not `CARGO_PKG_NAME`. That macro
+        // expands where it is written, which is m6-core, so every service would
+        // announce itself as "m6-core" and a deploy log would not say which binary
+        // it had just checked.
+        let name = std::path::Path::new(&args[0])
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("m6");
+        println!("{} {}", name, env!("CARGO_PKG_VERSION"));
+        std::process::exit(0);
+    }
+
     if args.len() < 3 {
-        eprintln!("Usage: {} <site-dir> <config-path> [--log-level LEVEL] [--dump-config]", args[0]);
+        eprintln!(
+            "Usage: {} <site-dir> <config-path> [--log-level LEVEL] [--dump-config] [--version]",
+            args[0]
+        );
         std::process::exit(2);
     }
     let site_dir = PathBuf::from(&args[1]);
@@ -2093,7 +2191,11 @@ fn parse_invocation(routes: &[(String, RouteMethod)], handlers: &[String]) -> In
         std::process::exit(dump_config(&site_dir, &config_path, routes, handlers));
     }
 
-    Invocation { site_dir, config_path, cli_log_level }
+    Invocation {
+        site_dir,
+        config_path,
+        cli_log_level,
+    }
 }
 
 /// Load the config and report how each route would be served. Returns the
@@ -2114,20 +2216,33 @@ fn dump_config(
 
     println!("site_dir    {}", site_dir.display());
     println!("config      {}", config_path.display());
-    println!("socket      {}", crate::socket_path_from_config(config_path).display());
+    println!(
+        "socket      {}",
+        crate::socket_path_from_config(config_path).display()
+    );
     println!(
         "thread_pool size={} queue={}",
         config.thread_pool.size, config.thread_pool.queue_size
     );
     println!(
         "server      read_timeout={} socket_mode={:04o}",
-        config.server.read_timeout.map_or("none".into(), |d| format!("{}s", d.as_secs())),
+        config
+            .server
+            .read_timeout
+            .map_or("none".into(), |d| format!("{}s", d.as_secs())),
         config.server.socket_mode
     );
     for p in &config.global_params {
         println!("global      {p}");
     }
-    println!("handlers    {}", if handlers.is_empty() { "none".to_string() } else { handlers.join(", ") });
+    println!(
+        "handlers    {}",
+        if handlers.is_empty() {
+            "none".to_string()
+        } else {
+            handlers.join(", ")
+        }
+    );
 
     // Every route, and what would answer it. This is the part worth reading:
     // a route with no way to be served is the failure the App migrations made
@@ -2177,13 +2292,22 @@ pub fn run_app(
     // disposition and kill the process. See crate::signal.
     crate::signal::block();
 
-    let Invocation { site_dir, config_path, cli_log_level } =
-        parse_invocation(
-            &code_routes.iter().map(|(p, m, _)| (p.clone(), m.clone())).collect::<Vec<_>>(),
-            &named.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
-        );
+    let Invocation {
+        site_dir,
+        config_path,
+        cli_log_level,
+    } = parse_invocation(
+        &code_routes
+            .iter()
+            .map(|(p, m, _)| (p.clone(), m.clone()))
+            .collect::<Vec<_>>(),
+        &named.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+    );
     run_app_with_shutdown(
-        Handlers { routes: code_routes, named },
+        Handlers {
+            routes: code_routes,
+            named,
+        },
         config_path,
         site_dir,
         None,
@@ -2208,10 +2332,51 @@ fn run_app_with_shutdown(
         std::process::exit(2);
     });
 
+    // Does site.toml tell the edge the truth about whether we compress?
+    //
+    // Before logging is up, because it exits 2 and that is a configuration error
+    // detected before binding — the one thing exit 2 means (backend protocol
+    // §8.3). A service that starts having disagreed with the edge about this
+    // serves either fragmented caches or, worse, brotli to clients that asked
+    // for identity, and neither is visible from the outside until it bites.
+    //
+    // The backend name is the config file's stem, which is the same convention
+    // `socket_path_from_config` uses to derive /run/m6/<stem>.sock, so the name
+    // in site.toml's `[[backend]]` and the name here are the same string.
+    {
+        let backend_name = config_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("m6-default");
+        // "Compresses" means at least one MIME type has a non-zero level. The
+        // defaults give text types real levels and images zero, so a service
+        // that has not opted out does compress.
+        let compresses = config
+            .compression
+            .values()
+            .any(|c| c.brotli > 0 || c.gzip > 0);
+        if let Err(msg) =
+            crate::compress::check_declared_support(&site_dir, backend_name, compresses)
+        {
+            eprintln!("Config error: {msg}");
+            std::process::exit(2);
+        }
+    }
+
     // Init logging: site.toml base → renderer config [log] → CLI --log-level.
     let (site_level, site_format) = crate::log::read_site_log_config(&site_dir);
-    let format = config.log.format.as_deref().unwrap_or(&site_format).to_string();
-    let cfg_level = config.log.level.as_deref().unwrap_or(&site_level).to_string();
+    let format = config
+        .log
+        .format
+        .as_deref()
+        .unwrap_or(&site_format)
+        .to_string();
+    let cfg_level = config
+        .log
+        .level
+        .as_deref()
+        .unwrap_or(&site_level)
+        .to_string();
     let level = cli_log_level.as_deref().unwrap_or(&cfg_level).to_string();
     let _log_guard = crate::log::init(&format, &level).unwrap_or_else(|e| {
         eprintln!("logging init error: {e}");
@@ -2221,7 +2386,10 @@ fn run_app_with_shutdown(
     let socket_path = crate::socket_path_from_config(&config_path);
 
     // Build framework state.
-    let Handlers { routes: code_routes, named } = handlers;
+    let Handlers {
+        routes: code_routes,
+        named,
+    } = handlers;
     let code_route_signatures: Vec<(String, RouteMethod)> = code_routes
         .iter()
         .map(|(p, m, _)| (p.clone(), m.clone()))
@@ -2242,10 +2410,11 @@ fn run_app_with_shutdown(
                 std::process::exit(2);
             });
 
-    let code_patterns: Vec<String> =
-        code_route_signatures.iter().map(|(p, _)| p.clone()).collect();
-    let missing =
-        unknown_handlers(&framework_state.routes, &named_handlers, &code_patterns);
+    let code_patterns: Vec<String> = code_route_signatures
+        .iter()
+        .map(|(p, _)| p.clone())
+        .collect();
+    let missing = unknown_handlers(&framework_state.routes, &named_handlers, &code_patterns);
     if !missing.is_empty() {
         eprintln!(
             "Config error: route names an unregistered handler: {}",
@@ -2335,7 +2504,7 @@ fn run_app_with_shutdown(
     let mut watcher = crate::ConfigWatcher::new(&[&config_path, &site_toml_path]).ok();
 
     // Mtime fallback state — only meaningful when watcher.raw_fd() is None.
-    let mut config_mtime    = file_mtime(&config_path);
+    let mut config_mtime = file_mtime(&config_path);
     let mut site_toml_mtime = file_mtime(&site_toml_path);
     let mut reload_countdown: u8 = 10;
 
@@ -2393,7 +2562,9 @@ fn run_app_with_shutdown(
 
         // Watcher fired — drain events and check for our watched files.
         if inotify_fired {
-            should_reload = watcher.as_mut().map_or(false, |w| w.read_events(&[&config_filename, "site.toml"]));
+            should_reload = watcher
+                .as_mut()
+                .is_some_and(|w| w.read_events(&[&config_filename, "site.toml"]));
         }
 
         // ── Hot reload ───────────────────────────────────────────────────
@@ -2421,8 +2592,11 @@ fn run_app_with_shutdown(
                             // serve a route it advertises: the previous routes
                             // keep serving, which is what makes a typo in a
                             // live config recoverable.
-                            let missing =
-                                unknown_handlers(&new_state.routes, &named_handlers, &code_patterns);
+                            let missing = unknown_handlers(
+                                &new_state.routes,
+                                &named_handlers,
+                                &code_patterns,
+                            );
                             if !missing.is_empty() {
                                 error!(
                                     "Reload refused, route names an unregistered handler: {}",
@@ -2432,11 +2606,7 @@ fn run_app_with_shutdown(
                                 let routes = new_state.routes.len();
                                 *fs.write().unwrap() = new_state;
                                 let elapsed = reload_start.elapsed().as_millis();
-                                info!(
-                                    elapsed_ms = elapsed,
-                                    routes = routes,
-                                    "Reload complete"
-                                );
+                                info!(elapsed_ms = elapsed, routes = routes, "Reload complete");
                             }
                         }
                     }
@@ -2460,12 +2630,13 @@ fn run_app_with_shutdown(
                 let named_handlers = named_handlers.clone();
 
                 match pool.try_submit(stream, move |mut s| {
-                    handle_connection(&mut s, &*fs, &code_handlers, &named_handlers);
+                    handle_connection(&mut s, &fs, &code_handlers, &named_handlers);
                 }) {
                     Ok(_) => {}
                     Err(mut s) => {
                         warn!("Thread pool queue full, returning 503");
-                        crate::server::write_error_response(&mut s, 503, "Service Unavailable").ok();
+                        crate::server::write_error_response(&mut s, 503, "Service Unavailable")
+                            .ok();
                     }
                 }
             }
@@ -2532,7 +2703,11 @@ fn handle_request<W: std::io::Write>(
     // `HashMap`s and a `PathBuf`.
     let (routes, site_dir, config) = {
         let fs_r = fs.read().unwrap();
-        (Arc::clone(&fs_r.routes), Arc::clone(&fs_r.site_dir), Arc::clone(&fs_r.config))
+        (
+            Arc::clone(&fs_r.routes),
+            Arc::clone(&fs_r.site_dir),
+            Arc::clone(&fs_r.config),
+        )
     };
     let compression = &config.compression;
     let minification = &config.minification;
@@ -2561,7 +2736,7 @@ fn handle_request<W: std::io::Write>(
             let fs_r = fs.read().unwrap();
 
             // Build request dict.
-            let dict = match fs_r.build_dict(&raw, &route, &path_params) {
+            let dict = match fs_r.build_dict(&raw, route, &path_params) {
                 Ok(d) => d,
                 Err(e) => {
                     let r = error_to_response(&e);
@@ -2572,7 +2747,10 @@ fn handle_request<W: std::io::Write>(
 
             #[cfg(feature = "csrf")]
             {
-                csrf_token_for_cookie = dict.get("csrf_token").and_then(|v| v.as_str()).map(str::to_string);
+                csrf_token_for_cookie = dict
+                    .get("csrf_token")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
             }
 
             // `raw` is handed over rather than cloned: `serve_connection` has
@@ -2692,7 +2870,8 @@ fn handle_request<W: std::io::Write>(
     // ── CSRF: set _csrf cookie if not already present in the request.
     #[cfg(feature = "csrf")]
     {
-        let has_csrf = raw.header("cookie")
+        let has_csrf = raw
+            .header("cookie")
             .map(|h| h.contains("_csrf="))
             .unwrap_or(false);
         if !has_csrf {
@@ -2724,7 +2903,8 @@ fn handle_request<W: std::io::Write>(
     // ── Flash: clear the _flash cookie after reading it.
     #[cfg(feature = "flash")]
     {
-        let had_flash = raw.header("cookie")
+        let had_flash = raw
+            .header("cookie")
             .map(|h| h.contains("_flash="))
             .unwrap_or(false);
         if had_flash {
@@ -2761,7 +2941,9 @@ fn handle_request<W: std::io::Write>(
 
                 if minification.is_enabled(mime) {
                     let minified = match mime {
-                        "text/html" => Some(crate::minify::minify_html(bytes, minification.inline_js)),
+                        "text/html" => {
+                            Some(crate::minify::minify_html(bytes, minification.inline_js))
+                        }
                         "text/css" => Some(crate::minify::minify_css(bytes)),
                         "application/json" => Some(crate::minify::minify_json(bytes)),
                         "application/javascript" | "text/javascript" => {
@@ -2780,8 +2962,7 @@ fn handle_request<W: std::io::Write>(
     // ── Compression: applied AFTER minification.
     let accept_encoding = raw.header("accept-encoding").unwrap_or("");
     if !resp.verbatim && !resp.body.is_empty() {
-        let content_type =
-            crate::headers::get(&resp.headers[..], "content-type").unwrap_or("");
+        let content_type = crate::headers::get(&resp.headers[..], "content-type").unwrap_or("");
         let mime = content_type.split(';').next().unwrap_or("").trim();
 
         if let Some(level) = compression.get(mime) {
@@ -2817,18 +2998,14 @@ fn handle_request<W: std::io::Write>(
             let plain = resp.body.as_bytes().map(|b| b.to_vec());
             match (crate::preferred_coding(accept_encoding, &candidates), plain) {
                 (Some("br"), Some(bytes)) => {
-                    if let Ok(compressed) =
-                        crate::compress::brotli_compress(&bytes, level.brotli)
-                    {
+                    if let Ok(compressed) = crate::compress::brotli_compress(&bytes, level.brotli) {
                         resp.body = crate::response::Body::Bytes(compressed);
                         resp.headers
                             .push(("Content-Encoding".to_string(), "br".to_string()));
                     }
                 }
                 (Some("gzip"), Some(bytes)) => {
-                    if let Ok(compressed) =
-                        crate::compress::gzip_compress(&bytes, level.gzip)
-                    {
+                    if let Ok(compressed) = crate::compress::gzip_compress(&bytes, level.gzip) {
                         resp.body = crate::response::Body::Bytes(compressed);
                         resp.headers
                             .push(("Content-Encoding".to_string(), "gzip".to_string()));
@@ -2853,8 +3030,6 @@ fn handle_request<W: std::io::Write>(
 
     crate::server::write_response(stream, resp).ok();
 }
-
-
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -2889,11 +3064,17 @@ mod tests {
             settings: Arc::new(Map::new()),
             base_dict: Arc::new(Map::new()),
         };
-        let segs: Vec<&str> = "/blog/hello-world".split('/').filter(|s| !s.is_empty()).collect();
+        let segs: Vec<&str> = "/blog/hello-world"
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect();
         let m = match_route(&segs, &route);
         assert!(m.is_some());
         let params = m.unwrap();
-        let stem = params.iter().find(|(k, _)| k == "stem").map(|(_, v)| v.as_str());
+        let stem = params
+            .iter()
+            .find(|(k, _)| k == "stem")
+            .map(|(_, v)| v.as_str());
         assert_eq!(stem, Some("hello-world"));
     }
 
@@ -3018,7 +3199,10 @@ mod tests {
 
         // At most one of submitted1/submitted2 can be true given queue_size=1.
         // At least one submit should have returned false.
-        assert!(!(submitted1 && submitted2), "both submits succeeded but queue_size=1");
+        assert!(
+            !(submitted1 && submitted2),
+            "both submits succeeded but queue_size=1"
+        );
     }
 
     /// Hot-reload: FrameworkState::build succeeds with a fresh config, and the
@@ -3026,8 +3210,8 @@ mod tests {
     #[test]
     fn test_hot_reload_state_swap() {
         use std::io::Write;
-        use tempfile::NamedTempFile;
         use std::sync::RwLock;
+        use tempfile::NamedTempFile;
 
         let site_dir = tempfile::TempDir::new().unwrap();
         // Create a minimal templates directory so Tera doesn't scan an
@@ -3035,29 +3219,51 @@ mod tests {
         std::fs::create_dir(site_dir.path().join("templates")).unwrap();
 
         let mut f = NamedTempFile::new().unwrap();
-        write!(f, "site_name = \"v1\"\n").unwrap();
+        writeln!(f, "site_name = \"v1\"").unwrap();
 
         let cfg1 = crate::config::load(f.path(), site_dir.path()).unwrap();
         assert_eq!(cfg1.user_config["site_name"].as_str().unwrap(), "v1");
 
-        let state1 = FrameworkState::build(cfg1, site_dir.path().to_path_buf(), &[], &*default_renderer()).unwrap();
+        let state1 = FrameworkState::build(
+            cfg1,
+            site_dir.path().to_path_buf(),
+            &[],
+            &*default_renderer(),
+        )
+        .unwrap();
         let fs = Arc::new(RwLock::new(state1));
 
         // Verify initial state.
-        assert_eq!(fs.read().unwrap().config.user_config["site_name"].as_str().unwrap(), "v1");
+        assert_eq!(
+            fs.read().unwrap().config.user_config["site_name"]
+                .as_str()
+                .unwrap(),
+            "v1"
+        );
 
         // Write a new config.
         let mut f2 = NamedTempFile::new().unwrap();
-        write!(f2, "site_name = \"v2\"\n").unwrap();
+        writeln!(f2, "site_name = \"v2\"").unwrap();
 
         let cfg2 = crate::config::load(f2.path(), site_dir.path()).unwrap();
-        let state2 = FrameworkState::build(cfg2, site_dir.path().to_path_buf(), &[], &*default_renderer()).unwrap();
+        let state2 = FrameworkState::build(
+            cfg2,
+            site_dir.path().to_path_buf(),
+            &[],
+            &*default_renderer(),
+        )
+        .unwrap();
 
         // Atomic swap.
         *fs.write().unwrap() = state2;
 
         // New state is visible.
-        assert_eq!(fs.read().unwrap().config.user_config["site_name"].as_str().unwrap(), "v2");
+        assert_eq!(
+            fs.read().unwrap().config.user_config["site_name"]
+                .as_str()
+                .unwrap(),
+            "v2"
+        );
     }
 
     /// file_mtime returns different values after a file is updated.
@@ -3067,7 +3273,7 @@ mod tests {
         use tempfile::NamedTempFile;
 
         let mut f = NamedTempFile::new().unwrap();
-        write!(f, "v1\n").unwrap();
+        writeln!(f, "v1").unwrap();
         let mtime1 = file_mtime(f.path());
         assert!(mtime1.is_some());
 
@@ -3075,9 +3281,8 @@ mod tests {
         // On most CI systems the mtime granularity is 1ns, so just rewrite.
         std::thread::sleep(std::time::Duration::from_millis(10));
         // Touch by setting mtime explicitly via filetime.
-        let future = filetime::FileTime::from_unix_time(
-            filetime::FileTime::now().unix_seconds() + 1, 0
-        );
+        let future =
+            filetime::FileTime::from_unix_time(filetime::FileTime::now().unix_seconds() + 1, 0);
         filetime::set_file_mtime(f.path(), future).unwrap();
 
         let mtime2 = file_mtime(f.path());
@@ -3092,7 +3297,10 @@ mod tests {
 
         // Build a compression map with level 0 for text/html.
         let mut compression: HashMap<String, CompressionLevel> = HashMap::new();
-        compression.insert("text/html".to_string(), CompressionLevel { brotli: 0, gzip: 0 });
+        compression.insert(
+            "text/html".to_string(),
+            CompressionLevel { brotli: 0, gzip: 0 },
+        );
 
         // Simulate the guard: level.brotli > 0 is false → no encoding applied.
         let mime = "text/html";
@@ -3109,7 +3317,10 @@ mod tests {
         use std::collections::HashMap;
 
         let mut compression: HashMap<String, CompressionLevel> = HashMap::new();
-        compression.insert("text/html".to_string(), CompressionLevel { brotli: 4, gzip: 5 });
+        compression.insert(
+            "text/html".to_string(),
+            CompressionLevel { brotli: 4, gzip: 5 },
+        );
 
         let level = compression.get("text/html").unwrap();
         assert!(level.brotli > 0);
@@ -3170,8 +3381,12 @@ mod tests {
             t.count += g.base;
             Ok(Response::text("ok"))
         })
-        .on_destroy_thread(|l| { let _ = l; })
-        .on_destroy(|g| { let _ = g; });
+        .on_destroy_thread(|l| {
+            let _ = l;
+        })
+        .on_destroy(|g| {
+            let _ = g;
+        });
     }
 
     // ── Minification tests ────────────────────────────────────────────────
@@ -3208,7 +3423,9 @@ mod tests {
         let resp = Response::text("ok").flash(message, secret);
 
         // Find the Set-Cookie header.
-        let cookie_hdr = resp.headers.iter()
+        let cookie_hdr = resp
+            .headers
+            .iter()
             .find(|(k, _)| k == "Set-Cookie")
             .map(|(_, v)| v.as_str())
             .expect("Set-Cookie header not found");
@@ -3272,14 +3489,16 @@ fn newest_mtime_under(dir: &std::path::Path) -> Option<std::time::SystemTime> {
         if depth == 0 {
             return;
         }
-        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
         for e in entries.flatten() {
             let Ok(ft) = e.file_type() else { continue };
             if ft.is_dir() {
                 walk(&e.path(), depth - 1, newest);
             } else if ft.is_file() {
                 if let Some(t) = e.metadata().ok().and_then(|m| m.modified().ok()) {
-                    if newest.map_or(true, |n| t > n) {
+                    if newest.is_none_or(|n| t > n) {
                         *newest = Some(t);
                     }
                 }
@@ -3318,12 +3537,17 @@ mod last_modified_tests {
 
         let past = SystemTime::now() - Duration::from_secs(3600);
         let recent = SystemTime::now() - Duration::from_secs(60);
-        filetime::set_file_mtime(d.path().join("old.html"), filetime::FileTime::from(past)).unwrap();
-        filetime::set_file_mtime(d.path().join("new.html"), filetime::FileTime::from(recent)).unwrap();
+        filetime::set_file_mtime(d.path().join("old.html"), filetime::FileTime::from(past))
+            .unwrap();
+        filetime::set_file_mtime(d.path().join("new.html"), filetime::FileTime::from(recent))
+            .unwrap();
 
         let got = newest_mtime_under(d.path()).expect("some mtime");
         let delta = got.duration_since(recent).unwrap_or_else(|e| e.duration());
-        assert!(delta < Duration::from_secs(2), "expected the newer file's mtime");
+        assert!(
+            delta < Duration::from_secs(2),
+            "expected the newer file's mtime"
+        );
     }
 
     /// Partials commonly live in a subdirectory; a change to one of those must
@@ -3337,12 +3561,20 @@ mod last_modified_tests {
 
         let past = SystemTime::now() - Duration::from_secs(7200);
         let recent = SystemTime::now() - Duration::from_secs(30);
-        filetime::set_file_mtime(d.path().join("page.html"), filetime::FileTime::from(past)).unwrap();
-        filetime::set_file_mtime(d.path().join("partials/_head.html"), filetime::FileTime::from(recent)).unwrap();
+        filetime::set_file_mtime(d.path().join("page.html"), filetime::FileTime::from(past))
+            .unwrap();
+        filetime::set_file_mtime(
+            d.path().join("partials/_head.html"),
+            filetime::FileTime::from(recent),
+        )
+        .unwrap();
 
         let got = newest_mtime_under(d.path()).expect("some mtime");
         let delta = got.duration_since(recent).unwrap_or_else(|e| e.duration());
-        assert!(delta < Duration::from_secs(2), "a nested partial should date the output");
+        assert!(
+            delta < Duration::from_secs(2),
+            "a nested partial should date the output"
+        );
     }
 
     /// The walk is depth-bounded so a symlink loop under the site directory
@@ -3463,7 +3695,11 @@ mod wildcard_route_tests {
         let site_dir = tempfile::TempDir::new().unwrap();
         std::fs::create_dir(site_dir.path().join("templates")).unwrap();
         let mut f = tempfile::NamedTempFile::new().unwrap();
-        writeln!(f, "[[route]]\npath = \"/assets/{{*relpath}}\"\ntemplate = \"x.html\"").unwrap();
+        writeln!(
+            f,
+            "[[route]]\npath = \"/assets/{{*relpath}}\"\ntemplate = \"x.html\""
+        )
+        .unwrap();
 
         let cfg = crate::config::load(f.path(), site_dir.path()).unwrap();
         let state = FrameworkState::build(
@@ -3488,7 +3724,10 @@ mod wildcard_route_tests {
         let dict = state
             .build_dict(&raw, route, &params)
             .expect("a wildcard capture is not a malformed request");
-        assert_eq!(dict.get("relpath").unwrap().as_str().unwrap(), "css/main.css");
+        assert_eq!(
+            dict.get("relpath").unwrap().as_str().unwrap(),
+            "css/main.css"
+        );
     }
 
     /// The other half of the fix: a wildcard is allowed the separator, and
@@ -3501,11 +3740,19 @@ mod wildcard_route_tests {
         let site_dir = tempfile::TempDir::new().unwrap();
         std::fs::create_dir(site_dir.path().join("templates")).unwrap();
         let mut f = tempfile::NamedTempFile::new().unwrap();
-        writeln!(f, "[[route]]\npath = \"/assets/{{*relpath}}\"\ntemplate = \"x.html\"").unwrap();
+        writeln!(
+            f,
+            "[[route]]\npath = \"/assets/{{*relpath}}\"\ntemplate = \"x.html\""
+        )
+        .unwrap();
         let cfg = crate::config::load(f.path(), site_dir.path()).unwrap();
-        let state =
-            FrameworkState::build(cfg, site_dir.path().to_path_buf(), &[], &*default_renderer())
-                .unwrap();
+        let state = FrameworkState::build(
+            cfg,
+            site_dir.path().to_path_buf(),
+            &[],
+            &*default_renderer(),
+        )
+        .unwrap();
 
         // `..` never survives the matcher, so drive the check directly: these
         // are the values that would reach step 4 if it ever did.
@@ -3513,7 +3760,13 @@ mod wildcard_route_tests {
         assert!(route.is_wildcard_param("relpath"));
         assert!(!route.is_wildcard_param("stem"));
 
-        for bad in ["../etc/passwd", "css/../../etc/passwd", "a b/c", "/leading", "trailing/"] {
+        for bad in [
+            "../etc/passwd",
+            "css/../../etc/passwd",
+            "a b/c",
+            "/leading",
+            "trailing/",
+        ] {
             assert!(
                 validate_wildcard_param("relpath", bad).is_err(),
                 "{bad} should be refused"
@@ -3551,9 +3804,13 @@ mod config_route_handler_tests {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         write!(f, "{toml}").unwrap();
         let cfg = crate::config::load(f.path(), site_dir.path()).unwrap();
-        let state =
-            FrameworkState::build(cfg, site_dir.path().to_path_buf(), &[], &*default_renderer())
-                .unwrap();
+        let state = FrameworkState::build(
+            cfg,
+            site_dir.path().to_path_buf(),
+            &[],
+            &*default_renderer(),
+        )
+        .unwrap();
         (state, site_dir)
     }
 
@@ -3615,7 +3872,10 @@ tail = false
         let (route, params) = find_route("/downloads/report.pdf", "GET", &guard.routes)
             .expect("the reloaded state should serve the new route");
         assert_eq!(route.handler.as_deref(), Some("files"));
-        assert_eq!(route.settings.get("root").unwrap().as_str().unwrap(), "files/");
+        assert_eq!(
+            route.settings.get("root").unwrap().as_str().unwrap(),
+            "files/"
+        );
         assert_eq!(params[0].1, "report.pdf");
 
         // And the route that was already there is untouched.
@@ -3631,7 +3891,10 @@ tail = false
         let (state, _d) = state_from(FILES);
 
         let missing = unknown_handlers(&state.routes, &registry(&["uploads"]), &[]);
-        assert_eq!(missing, vec![("/assets/{*relpath}".to_string(), "files".to_string())]);
+        assert_eq!(
+            missing,
+            vec![("/assets/{*relpath}".to_string(), "files".to_string())]
+        );
 
         // The operator needs to be told which route, which name, and what was
         // available. A bare "unknown handler" sends them reading config by eye.
@@ -3662,8 +3925,13 @@ tail = false
         let s = &state.routes[0].settings;
         assert_eq!(s.get("root").unwrap().as_str().unwrap(), "assets/");
         assert!(!s.get("tail").unwrap().as_bool().unwrap());
-        for consumed in ["path", "handler", "template", "cache", "status", "methods", "headers"] {
-            assert!(s.get(consumed).is_none(), "{consumed} is core's, not the handler's");
+        for consumed in [
+            "path", "handler", "template", "cache", "status", "methods", "headers",
+        ] {
+            assert!(
+                s.get(consumed).is_none(),
+                "{consumed} is core's, not the handler's"
+            );
         }
     }
 
@@ -3709,13 +3977,16 @@ tail = false
             headers: vec![],
             body: vec![],
         };
-        let req = Request::new(raw, Map::new(), dir.path().to_path_buf())
-            .with_route(&state.routes[0]);
+        let req =
+            Request::new(raw, Map::new(), dir.path().to_path_buf()).with_route(&state.routes[0]);
 
         assert_eq!(req.route_pattern(), Some("/assets/{*relpath}"));
         assert_eq!(req.route_str("root"), Some("assets/"));
         assert!(!req.route_bool("tail", true), "tail = false in config");
-        assert!(req.route_bool("absent", true), "an absent key takes the default");
+        assert!(
+            req.route_bool("absent", true),
+            "an absent key takes the default"
+        );
         assert_eq!(req.route_str("nothing"), None);
     }
 
@@ -3799,16 +4070,23 @@ mod dict_cost {
     }
 
     /// Build a state from TOML, with `site_dir` already populated by `setup`.
-    fn state_from(toml: &str, setup: impl FnOnce(&std::path::Path)) -> (FrameworkState, tempfile::TempDir) {
+    fn state_from(
+        toml: &str,
+        setup: impl FnOnce(&std::path::Path),
+    ) -> (FrameworkState, tempfile::TempDir) {
         let site_dir = tempfile::TempDir::new().unwrap();
         std::fs::create_dir(site_dir.path().join("templates")).unwrap();
         setup(site_dir.path());
         let mut f = tempfile::NamedTempFile::new().unwrap();
         write!(f, "{toml}").unwrap();
         let config = crate::config::load(f.path(), site_dir.path()).unwrap();
-        let state =
-            FrameworkState::build(config, site_dir.path().to_path_buf(), &[], &*default_renderer())
-                .unwrap();
+        let state = FrameworkState::build(
+            config,
+            site_dir.path().to_path_buf(),
+            &[],
+            &*default_renderer(),
+        )
+        .unwrap();
         (state, site_dir)
     }
 
@@ -3873,45 +4151,76 @@ mod dict_cost {
         const N: usize = 20_000;
 
         println!("--- build_dict phase breakdown (ns, median of {N}) ---");
-        println!("whole build_dict          {:>7}", median(N, || {
-            std::hint::black_box(state.build_dict(&raw, route, &params).unwrap());
-        }));
-        println!("Map::new alone            {:>7}", median(N, || {
-            std::hint::black_box(Map::new());
-        }));
-        println!("1. user_config clone x{:<3} {:>7}", state.config.user_config.len(), median(N, || {
-            let mut d = Map::new();
-            for (k, v) in &state.config.user_config {
-                d.insert(k.clone(), v.clone());
-            }
-            std::hint::black_box(d);
-        }));
-        println!("5. query parse + map      {:>7}", median(N, || {
-            let mut q = Map::new();
-            for (k, v) in parse_query_string(raw.query()) {
-                q.insert(k.clone(), Value::String(v.clone()));
-            }
-            std::hint::black_box(Value::Object(q));
-        }));
-        println!("7. parse_cookies          {:>7}", median(N, || {
-            std::hint::black_box(parse_cookies(raw.header("cookie").unwrap()));
-        }));
-        println!("8. now() + both formats   {:>7}", median(N, || {
-            let n = chrono::Utc::now();
-            std::hint::black_box((
-                n.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-                n.format("%Y").to_string(),
-            ));
-        }));
+        println!(
+            "whole build_dict          {:>7}",
+            median(N, || {
+                std::hint::black_box(state.build_dict(&raw, route, &params).unwrap());
+            })
+        );
+        println!(
+            "Map::new alone            {:>7}",
+            median(N, || {
+                std::hint::black_box(Map::new());
+            })
+        );
+        println!(
+            "1. user_config clone x{:<3} {:>7}",
+            state.config.user_config.len(),
+            median(N, || {
+                let mut d = Map::new();
+                for (k, v) in &state.config.user_config {
+                    d.insert(k.clone(), v.clone());
+                }
+                std::hint::black_box(d);
+            })
+        );
+        println!(
+            "5. query parse + map      {:>7}",
+            median(N, || {
+                let mut q = Map::new();
+                for (k, v) in parse_query_string(raw.query()) {
+                    q.insert(k.clone(), Value::String(v.clone()));
+                }
+                std::hint::black_box(Value::Object(q));
+            })
+        );
+        println!(
+            "7. parse_cookies          {:>7}",
+            median(N, || {
+                std::hint::black_box(parse_cookies(raw.header("cookie").unwrap()));
+            })
+        );
+        println!(
+            "8. now() + both formats   {:>7}",
+            median(N, || {
+                let n = chrono::Utc::now();
+                std::hint::black_box((
+                    n.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                    n.format("%Y").to_string(),
+                ));
+            })
+        );
     }
 
-    /// The same thing against the site's real content file, which is the
-    /// number that matters: m6-html renders every HTML page through this.
+    /// The same thing against a real deployment's content file, which is the
+    /// number that matters: an HTML service renders every page through this.
+    ///
+    /// Point it at yours. m6 is generic and ships no content of its own, so
+    /// there is nothing here to measure against by default:
+    ///
+    ///     M6_REAL_CONTENT_JSON=/path/to/data/content.json \
+    ///       cargo test -p m6-core build_dict_against_the_real_content_json -- --ignored
+    ///
+    /// This used to join `../<deployment-repo>/data/content.json`, one
+    /// particular site, from a generic library's test suite.
     #[test]
-    #[ignore = "a measurement, and it needs the site repo beside this one"]
+    #[ignore = "a measurement; set M6_REAL_CONTENT_JSON to a content file"]
     fn build_dict_against_the_real_content_json() {
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../example-site/data/content.json");
+        let Ok(path) = std::env::var("M6_REAL_CONTENT_JSON") else {
+            println!("SKIP: set M6_REAL_CONTENT_JSON to a content.json to measure against");
+            return;
+        };
+        let src = std::path::PathBuf::from(path);
         if !src.exists() {
             println!("SKIP: {} not present", src.display());
             return;
@@ -3971,7 +4280,10 @@ mod dict_cost {
         println!("  step 2, global params clone    {globals:>8}");
         println!("  step 3, route params clone     {route_params:>8}  (same file, again)");
         println!("render_response dict.clone()     {render_copy:>8}  (third copy)");
-        println!("total before the engine runs     {:>8}", whole + render_copy);
+        println!(
+            "total before the engine runs     {:>8}",
+            whole + render_copy
+        );
     }
 }
 
@@ -3987,7 +4299,9 @@ mod copy_audit {
     use std::io::Write;
 
     fn median<F: FnMut()>(n: usize, mut f: F) -> u64 {
-        for _ in 0..n / 4 { f(); }
+        for _ in 0..n / 4 {
+            f();
+        }
         let mut v = Vec::with_capacity(n);
         for _ in 0..n {
             let t = std::time::Instant::now();
@@ -4001,8 +4315,13 @@ mod copy_audit {
     #[test]
     #[ignore = "a measurement; needs the site repo beside this one"]
     fn every_copy_app_makes_per_request() {
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../example-site/data/content.json");
+        // As above: a real content file, named by the environment rather than
+        // by this repository. See build_dict_against_the_real_content_json.
+        let Ok(path) = std::env::var("M6_REAL_CONTENT_JSON") else {
+            println!("SKIP: set M6_REAL_CONTENT_JSON to a content.json to measure against");
+            return;
+        };
+        let src = std::path::PathBuf::from(path);
         if !src.exists() {
             println!("SKIP: {} not present", src.display());
             return;
@@ -4013,7 +4332,9 @@ mod copy_audit {
         std::fs::copy(&src, site_dir.path().join("data/content.json")).unwrap();
 
         let mut cfg = String::new();
-        for i in 0..34 { cfg.push_str(&format!("key_{i} = \"value_{i}\"\n")); }
+        for i in 0..34 {
+            cfg.push_str(&format!("key_{i} = \"value_{i}\"\n"));
+        }
         cfg.push_str("global_params = [\"data/content.json\"]\n");
         cfg.push_str("[compression.\"text/html\"]\nbrotli = 6\ngzip = 6\n");
         cfg.push_str("[compression.\"text/css\"]\nbrotli = 6\ngzip = 6\n");
@@ -4022,9 +4343,13 @@ mod copy_audit {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         write!(f, "{cfg}").unwrap();
         let config = crate::config::load(f.path(), site_dir.path()).unwrap();
-        let state =
-            FrameworkState::build(config, site_dir.path().to_path_buf(), &[], &*default_renderer())
-                .unwrap();
+        let state = FrameworkState::build(
+            config,
+            site_dir.path().to_path_buf(),
+            &[],
+            &*default_renderer(),
+        )
+        .unwrap();
 
         let raw = RawRequest {
             version: "HTTP/1.1".to_string(),
@@ -4033,9 +4358,18 @@ mod copy_audit {
             query: None,
             headers: vec![
                 ("Host".to_string(), "example.com".to_string()),
-                ("User-Agent".to_string(), "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)".to_string()),
-                ("Accept".to_string(), "text/html,application/xhtml+xml,application/xml;q=0.9".to_string()),
-                ("Accept-Encoding".to_string(), "gzip, deflate, br".to_string()),
+                (
+                    "User-Agent".to_string(),
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)".to_string(),
+                ),
+                (
+                    "Accept".to_string(),
+                    "text/html,application/xhtml+xml,application/xml;q=0.9".to_string(),
+                ),
+                (
+                    "Accept-Encoding".to_string(),
+                    "gzip, deflate, br".to_string(),
+                ),
                 ("Cookie".to_string(), "_csrf=abc123".to_string()),
             ],
             body: vec![],
@@ -4048,21 +4382,35 @@ mod copy_audit {
             // J1 (done): config and site_dir leave the read lock as `Arc`
             // clones. These three rows were 458ns of deep copies; they are now
             // two refcount bumps. Measured as the path actually runs it.
-            ("Arc::clone(config) + Arc::clone(site_dir)  [was 458]", median(N, || {
-                std::hint::black_box((Arc::clone(&state.config), Arc::clone(&state.site_dir)));
-            })),
+            (
+                "Arc::clone(config) + Arc::clone(site_dir)  [was 458]",
+                median(N, || {
+                    std::hint::black_box((Arc::clone(&state.config), Arc::clone(&state.site_dir)));
+                }),
+            ),
             // J6 (done): the route table is shared, so routing borrows from
             // an `Arc` instead of cloning the matched route out of the guard.
-            ("Arc::clone(routes)  [was route.clone(), 167]", median(N, || {
-                std::hint::black_box(Arc::clone(&state.routes));
-            })),
-            ("build_dict (3 copies inside)", median(N, || {
-                std::hint::black_box(state.build_dict(&raw, route, &params).unwrap());
-            })),
+            (
+                "Arc::clone(routes)  [was route.clone(), 167]",
+                median(N, || {
+                    std::hint::black_box(Arc::clone(&state.routes));
+                }),
+            ),
+            (
+                "build_dict (3 copies inside)",
+                median(N, || {
+                    std::hint::black_box(state.build_dict(&raw, route, &params).unwrap());
+                }),
+            ),
             // J6 (done): `serve_connection` hands the request over instead of
             // lending it, so there is nothing to clone.
             ("raw.clone()  [removed]", 0),
-            ("dict.clone() into Request", median(N, || { std::hint::black_box(dict.clone()); })),
+            (
+                "dict.clone() into Request",
+                median(N, || {
+                    std::hint::black_box(dict.clone());
+                }),
+            ),
             // J5 (done): render_response renders against the request dict
             // when the response supplied no context of its own, which is the
             // common path. There is no copy left to measure here.
@@ -4071,13 +4419,16 @@ mod copy_audit {
             // the engine takes a copy of its own. This one is not core's to
             // remove without changing the renderer seam, but it is part of the
             // per-request bill and the audit is dishonest without it.
-            ("tera::Context build (in the engine)", median(N, || {
-                let mut tctx = tera::Context::new();
-                for (k, v) in dict.iter() {
-                    tctx.insert(k.as_str(), v);
-                }
-                std::hint::black_box(tctx);
-            })),
+            (
+                "tera::Context build (in the engine)",
+                median(N, || {
+                    let mut tctx = tera::Context::new();
+                    for (k, v) in dict.iter() {
+                        tctx.insert(k.as_str(), v);
+                    }
+                    std::hint::black_box(tctx);
+                }),
+            ),
         ];
         let total: u64 = rows.iter().map(|(_, ns)| ns).sum();
 
@@ -4087,7 +4438,8 @@ mod copy_audit {
         // more work; if the copy is small even here, it is smaller in
         // production.
         let mut tera = tera::Tera::default();
-        tera.add_raw_template("t.html", "<h1>{{ site_name | default(value='x') }}</h1>").unwrap();
+        tera.add_raw_template("t.html", "<h1>{{ site_name | default(value='x') }}</h1>")
+            .unwrap();
         let ctx_build = median(N, || {
             let mut tctx = tera::Context::new();
             for (k, v) in dict.iter() {
@@ -4106,9 +4458,14 @@ mod copy_audit {
         println!("J7 in proportion (minimal template, the most favourable case):");
         println!("  context build      {ctx_build:>8} ns");
         println!("  build + render     {build_and_render:>8} ns");
-        println!("  render alone       {:>8} ns", build_and_render.saturating_sub(ctx_build));
-        println!("  context share      {:>7.1}%", 100.0 * ctx_build as f64 / build_and_render as f64);
-
+        println!(
+            "  render alone       {:>8} ns",
+            build_and_render.saturating_sub(ctx_build)
+        );
+        println!(
+            "  context share      {:>7.1}%",
+            100.0 * ctx_build as f64 / build_and_render as f64
+        );
 
         println!("| copy | ns |");
         println!("|---|---:|");

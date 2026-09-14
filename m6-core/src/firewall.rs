@@ -89,9 +89,13 @@ impl FirewallState {
         let mut total_rules = 0usize;
 
         for entry in rules {
-            let Some(rule) = entry.get("rule") else { continue };
+            let Some(rule) = entry.get("rule") else {
+                continue;
+            };
             total_rules += 1;
-            let Some(exprs) = rule.get("expr").and_then(|e| e.as_array()) else { continue };
+            let Some(exprs) = rule.get("expr").and_then(|e| e.as_array()) else {
+                continue;
+            };
 
             let mut address = None;
             let mut counter = None;
@@ -130,7 +134,10 @@ impl FirewallState {
                     address,
                     packets,
                     bytes,
-                    comment: rule.get("comment").and_then(|c| c.as_str()).map(String::from),
+                    comment: rule
+                        .get("comment")
+                        .and_then(|c| c.as_str())
+                        .map(String::from),
                     chain: rule
                         .get("chain")
                         .and_then(|c| c.as_str())
@@ -141,7 +148,10 @@ impl FirewallState {
         }
 
         blocks.sort_by(|a, b| a.address.cmp(&b.address));
-        Ok(FirewallState { blocks, total_rules })
+        Ok(FirewallState {
+            blocks,
+            total_rules,
+        })
     }
 
     /// Read the file the collector writes.
@@ -210,7 +220,7 @@ mod tests {
     fn an_allowed_source_is_not_a_block() {
         let json = r#"{"nftables":[
           {"rule":{"family":"ip","table":"filter","chain":"ufw-user-input","handle":4,
-            "expr":[{"match":{"op":"==","left":{"payload":{"protocol":"ip","field":"saddr"}},"right":"10.0.0.4"}},
+            "expr":[{"match":{"op":"==","left":{"payload":{"protocol":"ip","field":"saddr"}},"right":"192.0.2.4"}},
                     {"counter":{"packets":5,"bytes":300}},{"accept":null}]}}
         ]}"#;
         let s = FirewallState::from_nft_json(json).unwrap();
@@ -229,7 +239,11 @@ mod tests {
                     {"counter":{"packets":1,"bytes":60}},{"drop":null}]}}
         ]}"#;
         let s = FirewallState::from_nft_json(json).unwrap();
-        assert!(s.blocks.is_empty(), "a prefix is not an address: {:?}", s.blocks);
+        assert!(
+            s.blocks.is_empty(),
+            "a prefix is not an address: {:?}",
+            s.blocks
+        );
     }
 
     /// A block at zero has done its job; one still counting has not.
@@ -245,7 +259,10 @@ mod tests {
         ]}"#;
         let s = FirewallState::from_nft_json(json).unwrap();
         assert_eq!(s.blocks.len(), 2);
-        assert_eq!(s.active().map(|b| b.address.as_str()).collect::<Vec<_>>(), ["2.2.2.2"]);
+        assert_eq!(
+            s.active().map(|b| b.address.as_str()).collect::<Vec<_>>(),
+            ["2.2.2.2"]
+        );
         assert_eq!(
             s.blocked_addresses().collect::<Vec<_>>(),
             ["1.1.1.1", "2.2.2.2"],
@@ -256,7 +273,10 @@ mod tests {
     #[test]
     fn a_missing_collector_file_is_not_an_error() {
         let got = FirewallState::from_file(std::path::Path::new("/no/such/firewall.json")).unwrap();
-        assert!(got.is_none(), "no collector is not the same as a broken firewall");
+        assert!(
+            got.is_none(),
+            "no collector is not the same as a broken firewall"
+        );
     }
 
     #[test]

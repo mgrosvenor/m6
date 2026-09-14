@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 /// an auth cookie in a later field invisible to a naive single-field
 /// lookup. The spec requires the receiver to join multiple fields with
 /// `"; "` before treating it as a single logical header — that's this.
-pub fn combined_cookie_header(headers: &(impl crate::analytics::HeaderSource + ?Sized)) -> Option<String> {
+pub fn combined_cookie_header(
+    headers: &(impl crate::analytics::HeaderSource + ?Sized),
+) -> Option<String> {
     let mut parts = headers.find_all("cookie").peekable();
     parts.peek()?;
     Some(parts.collect::<Vec<_>>().join("; "))
@@ -61,10 +63,16 @@ impl PublicKey {
 
         // Try RS256 first, then ES256
         if let Ok(key) = DecodingKey::from_rsa_pem(&pem) {
-            return Ok(PublicKey { decoding_key: key, algorithm: Algorithm::RS256 });
+            return Ok(PublicKey {
+                decoding_key: key,
+                algorithm: Algorithm::RS256,
+            });
         }
         if let Ok(key) = DecodingKey::from_ec_pem(&pem) {
-            return Ok(PublicKey { decoding_key: key, algorithm: Algorithm::ES256 });
+            return Ok(PublicKey {
+                decoding_key: key,
+                algorithm: Algorithm::ES256,
+            });
         }
         anyhow::bail!("public key at {} is neither RSA nor EC PEM", path.display())
     }
@@ -77,8 +85,8 @@ impl PublicKey {
         // Don't require any audience
         validation.set_required_spec_claims(&["exp"]);
 
-        let data = decode::<Claims>(token, &self.decoding_key, &validation)
-            .map_err(AuthError::Invalid)?;
+        let data =
+            decode::<Claims>(token, &self.decoding_key, &validation).map_err(AuthError::Invalid)?;
 
         Ok(data.claims)
     }
@@ -145,7 +153,7 @@ pub fn is_browser_request(accept: Option<&str>) -> bool {
 }
 
 /// Extract the `refresh` cookie value if present.
-pub fn extract_refresh_cookie<'a>(cookie_header: Option<&'a str>) -> Option<&'a str> {
+pub fn extract_refresh_cookie(cookie_header: Option<&str>) -> Option<&str> {
     let cookies = cookie_header?;
     for cookie in cookies.split(';') {
         let cookie = cookie.trim();
@@ -172,7 +180,10 @@ mod tests {
     #[test]
     fn test_combined_cookie_header_single_field() {
         let headers = vec![("cookie".to_string(), "a=1; b=2".to_string())];
-        assert_eq!(combined_cookie_header(&headers), Some("a=1; b=2".to_string()));
+        assert_eq!(
+            combined_cookie_header(&headers),
+            Some("a=1; b=2".to_string())
+        );
     }
 
     #[test]
@@ -275,7 +286,9 @@ mod tests {
         };
         let encoded = encode_claims_header(&claims);
         // Decode and verify
-        let decoded = base64::engine::general_purpose::STANDARD.decode(&encoded).unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&encoded)
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
         assert_eq!(json["sub"], "user1");
     }

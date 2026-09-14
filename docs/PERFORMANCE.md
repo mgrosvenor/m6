@@ -197,7 +197,7 @@ build box against correct code. These are measurements, not tests.
 
 **Page render A/B.** Build `m6-html` at the two commits into separate target
 directories, then alternate: start one on a unix socket against
-`~/example-site` and the production `m6-html.conf`, warm it, time 300
+`the deployment repository` and the production `m6-html.conf`, warm it, time 300
 requests, kill it, repeat with the other, five rounds. Interleaving is the
 point; running all of one then all of the other measures the afternoon.
 

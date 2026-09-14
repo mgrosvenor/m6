@@ -1,7 +1,10 @@
 [package]
 name    = "m6-http"
-version = "0.1.0"
-edition = "2021"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
 
 [[bin]]
 name = "m6-http"
@@ -28,7 +31,29 @@ name = "m6_http_lib"
 path = "src/lib.rs"
 
 [dependencies]
-quiche         = { git = "https://github.com/cloudflare/quiche", tag = "0.26.1", features = ["boringssl-vendored"] }
+# quiche, from our own fork, pinned BY REVISION and not by branch: a branch name
+# would let the dependency change under a build that claims to be reproducible.
+#
+# The fork is quiche master plus two upstream pull requests that are open and
+# unmerged, and it exists for one measured reason: released quiche scores 37/49
+# on h3spec and this scores 47/49. Ten of the twelve failures are upstream bugs
+# with fixes nobody has merged yet.
+#
+#   PR #2521, issue #2515   a transport error in the peer's first flight left the
+#                           CONNECTION_CLOSE unsendable, so a malformed transport
+#                           parameter got silence instead of the error naming it
+#   PR #2575, issues #2526  non-zero reserved bits were accepted; there was no
+#           and #2652       reserved-bit validation in packet.rs at all
+#
+# The two h3spec failures that remain are QPACK, which neither PR touches.
+#
+# WHEN UPSTREAM RELEASES THESE, drop the fork and go back to a tag. The full
+# story, the recipe and every measurement are in tools/conformance-scores.txt.
+#
+# 0.29 also dropped the vendored-BoringSSL build: no `boringssl-vendored` feature
+# and no cmake build step. The default feature is `boringssl-boring-crate`, so
+# BoringSSL comes in through the `boring` crate, which vendors its own.
+quiche         = { git = "https://github.com/mgrosvenor/quiche", rev = "916a5a2596616ac36cefc3238142fb9a04f8dae3" }
 matchit        = "0.8"
 serde          = { version = "1", features = ["derive"] }
 serde_json     = "1"
@@ -44,11 +69,29 @@ bytes          = "1"
 base64         = "0.22"
 sha2           = "0.10"
 httparse       = "1"
+# Upstream, deliberately, despite RUSTSEC-2023-0084 and -0085.
+#
+# The advisory is real: `Decoder::decode` panics on some invalid input,
+# `Option::unwrap()` on a `None` at decoder.rs:453. The maintained fork,
+# `fluke-hpack` 0.3.1, has the identical panic at :505, so switching crates
+# buys nothing.
+#
+# It is not reachable here. `check_hpack_block` runs `validate_hpack_block`
+# over every block before it reaches the decoder and answers
+# GOAWAY(COMPRESSION_ERROR) on anything malformed, so the decoder only ever
+# sees blocks that have already been walked and found well-formed.
+# `http2::hpack_robustness` is what keeps that true: it runs hostile blocks
+# through the production sequence, validate then decode, and fails if any of
+# them survives validation and panics.
 hpack          = "0.3"
 ahash          = "0.8"
 libc           = "0.2"
 rustls         = { version = "0.23", default-features = false, features = ["ring", "std"] }
-rustls-pemfile = "2"
+# rustls-pki-types rather than rustls-pemfile: that crate is unmaintained
+# (RUSTSEC-2025-0134) and its advisory points at this one, which carries the same
+# PEM code behind the `PemObject` trait. rustls already depends on it, so this is
+# naming a dependency the tree already had rather than adding one.
+rustls-pki-types = "1"
 rustls-native-certs = "0.8"
 webpki-roots   = "0.26"
 rand           = "0.8"

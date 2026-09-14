@@ -48,7 +48,10 @@ fn escapes_site_dir(fs_path: &Path, site_dir: &Path) -> bool {
     if !meta.file_type().is_symlink() {
         return false;
     }
-    match (std::fs::canonicalize(fs_path), std::fs::canonicalize(site_dir)) {
+    match (
+        std::fs::canonicalize(fs_path),
+        std::fs::canonicalize(site_dir),
+    ) {
         (Ok(real), Ok(root)) => !real.starts_with(root),
         _ => true,
     }
@@ -134,9 +137,13 @@ pub fn serve(req: &Request) -> Result<Response> {
         debug!(path = %fs_path.display(), "file not found");
         return Ok(Response::not_found());
     };
-    let mtime = metadata.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-    let mtime_secs =
-        mtime.duration_since(std::time::SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs();
+    let mtime = metadata
+        .modified()
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    let mtime_secs = mtime
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     let last_modified = httpdate::fmt_http_date(mtime);
 
     // Content negotiation is resolved HERE, before the ETag, because the ETag
@@ -172,8 +179,7 @@ pub fn serve(req: &Request) -> Result<Response> {
         ("ETag".to_string(), etag.clone()),
         ("Last-Modified".to_string(), last_modified.clone()),
     ];
-    let precondition =
-        m6_core::evaluate_preconditions(&validators, req.headers(), req.method());
+    let precondition = m6_core::evaluate_preconditions(&validators, req.headers(), req.method());
 
     let cache_control = cache_control_for(req.query());
 
@@ -209,7 +215,9 @@ pub fn serve(req: &Request) -> Result<Response> {
     // `HEAD /assets/css` answered `200` with `Content-Length: 128` while the
     // GET beside it answered 404. The read this block skips is also what used
     // to reject a non-file, by failing.
-    let minify_this = minification.map(|m| m.is_enabled(&mime_base)).unwrap_or(false);
+    let minify_this = minification
+        .map(|m| m.is_enabled(&mime_base))
+        .unwrap_or(false);
     let representation_is_the_file =
         metadata.is_file() && encoding == Encoding::Identity && !minify_this;
 
@@ -339,14 +347,17 @@ fn serve_tail(req: &Request, fs_path: &Path) -> Result<Response> {
     };
 
     // Determine current file size.
-    let file_size = file.seek(SeekFrom::End(0)).map_err(|e| m6_core::Error::Other(e.into()))?;
+    let file_size = file
+        .seek(SeekFrom::End(0))
+        .map_err(|e| m6_core::Error::Other(e.into()))?;
 
     let (body, end_offset) = if offset == 0 && n > 0 {
         // ── tail -n N mode ────────────────────────────────────────────────────
         // Scan the last TAIL_LOOKBACK bytes for the start of the last N lines.
         let lookback = TAIL_LOOKBACK.min(file_size);
         let scan_start = file_size - lookback;
-        file.seek(SeekFrom::Start(scan_start)).map_err(|e| m6_core::Error::Other(e.into()))?;
+        file.seek(SeekFrom::Start(scan_start))
+            .map_err(|e| m6_core::Error::Other(e.into()))?;
         let mut buf = Vec::new();
         Read::by_ref(&mut file)
             .take(lookback)
@@ -361,7 +372,11 @@ fn serve_tail(req: &Request, fs_path: &Path) -> Result<Response> {
         // before counting to get the right N-line boundary.
         let mut found = 0u64;
         let mut cut = 0; // default: return everything when file has fewer than N lines
-        let scan_end = if buf.last() == Some(&b'\n') { buf.len() - 1 } else { buf.len() };
+        let scan_end = if buf.last() == Some(&b'\n') {
+            buf.len() - 1
+        } else {
+            buf.len()
+        };
         for i in (0..scan_end).rev() {
             if buf[i] == b'\n' {
                 found += 1;
@@ -378,7 +393,8 @@ fn serve_tail(req: &Request, fs_path: &Path) -> Result<Response> {
     } else {
         // ── incremental / byte-offset mode ───────────────────────────────────
         let read_from = offset.min(file_size);
-        file.seek(SeekFrom::Start(read_from)).map_err(|e| m6_core::Error::Other(e.into()))?;
+        file.seek(SeekFrom::Start(read_from))
+            .map_err(|e| m6_core::Error::Other(e.into()))?;
         let mut body = Vec::new();
         Read::by_ref(&mut file)
             .take(MAX_TAIL_BYTES)
@@ -437,8 +453,7 @@ mod tests {
                 s.insert(k.clone(), v.clone());
             }
         }
-        Request::new(raw, dict, site_dir.to_path_buf())
-            .with_route_settings(std::sync::Arc::new(s))
+        Request::new(raw, dict, site_dir.to_path_buf()).with_route_settings(std::sync::Arc::new(s))
     }
 
     /// Serve one request and return (status, headers, body) as they would go
@@ -450,13 +465,25 @@ mod tests {
             let mut r = m6_core::h1::Responder::new(&mut out, req.method(), false);
             resp.send(&mut r).expect("send");
         }
-        let sep = out.windows(4).position(|w| w == b"\r\n\r\n").expect("header terminator");
+        let sep = out
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("header terminator");
         let head = std::str::from_utf8(&out[..sep]).expect("headers are ASCII");
         let mut lines = head.lines();
-        let status: u16 =
-            lines.next().unwrap().split_whitespace().nth(1).unwrap().parse().unwrap();
+        let status: u16 = lines
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
         let headers = lines
-            .filter_map(|l| l.split_once(": ").map(|(k, v)| (k.to_lowercase(), v.to_string())))
+            .filter_map(|l| {
+                l.split_once(": ")
+                    .map(|(k, v)| (k.to_lowercase(), v.to_string()))
+            })
             .collect();
         (status, headers, out[sep + 4..].to_vec())
     }
@@ -504,7 +531,11 @@ mod tests {
         let (status, headers, body) = wire(&tail_req(dir.path(), "app.log", "offset=999"));
         assert_eq!(status, 200);
         assert!(body.is_empty());
-        assert_eq!(header(&headers, "x-log-end").unwrap(), "3", "clamped to file size");
+        assert_eq!(
+            header(&headers, "x-log-end").unwrap(),
+            "3",
+            "clamped to file size"
+        );
     }
 
     #[test]
@@ -571,7 +602,10 @@ mod tests {
     fn compressible_css() -> Vec<u8> {
         let mut s = String::new();
         for i in 0..400 {
-            s.push_str(&format!(".selector-{} {{ color: #aabbcc; margin: 0 auto; }}\n", i));
+            s.push_str(&format!(
+                ".selector-{} {{ color: #aabbcc; margin: 0 auto; }}\n",
+                i
+            ));
         }
         s.into_bytes()
     }
@@ -619,14 +653,23 @@ mod tests {
     fn identity_keeps_the_unsuffixed_etag() {
         let dir = css_dir();
         let (e_id, _, _) = fetch(dir.path(), None);
-        assert!(!e_id.contains("-br"), "identity tag carries a coding suffix: {e_id}");
-        assert!(!e_id.contains("-gz"), "identity tag carries a coding suffix: {e_id}");
+        assert!(
+            !e_id.contains("-br"),
+            "identity tag carries a coding suffix: {e_id}"
+        );
+        assert!(
+            !e_id.contains("-gz"),
+            "identity tag carries a coding suffix: {e_id}"
+        );
     }
 
     #[test]
     fn the_same_representation_is_stable_across_requests() {
         let dir = css_dir();
-        assert_eq!(fetch(dir.path(), Some("br")).0, fetch(dir.path(), Some("br")).0);
+        assert_eq!(
+            fetch(dir.path(), Some("br")).0,
+            fetch(dir.path(), Some("br")).0
+        );
     }
 
     /// A conditional request carrying the brotli tag must 304 for brotli, and
@@ -638,13 +681,26 @@ mod tests {
         let (e_br, _, _) = fetch(dir.path(), Some("br"));
         let cond = |ae: &str| -> u16 {
             let req = with_compression(
-                asset_req(dir.path(), "style.css", Some(ae), &[("If-None-Match", &e_br)]),
+                asset_req(
+                    dir.path(),
+                    "style.css",
+                    Some(ae),
+                    &[("If-None-Match", &e_br)],
+                ),
                 "text/css",
             );
             wire(&req).0
         };
-        assert_eq!(cond("br"), 304, "the brotli tag should validate a brotli request");
-        assert_eq!(cond("gzip"), 200, "the brotli tag must not validate a gzip request");
+        assert_eq!(
+            cond("br"),
+            304,
+            "the brotli tag should validate a brotli request"
+        );
+        assert_eq!(
+            cond("gzip"),
+            200,
+            "the brotli tag must not validate a gzip request"
+        );
     }
 
     /// A directory has metadata and a size, so the HEAD fast path answered
@@ -671,7 +727,10 @@ mod tests {
     #[test]
     fn head_reports_exactly_what_get_would() {
         let dir = css_dir();
-        let get = wire(&with_compression(asset_req(dir.path(), "style.css", None, &[]), "text/css"));
+        let get = wire(&with_compression(
+            asset_req(dir.path(), "style.css", None, &[]),
+            "text/css",
+        ));
         let mut head_req = request(
             "HEAD",
             "/assets/style.css",
@@ -687,9 +746,15 @@ mod tests {
         assert_eq!(status, get.0);
         assert!(body.is_empty(), "a HEAD carries no body");
         assert_eq!(header(&headers, "etag"), header(&get.1, "etag"));
-        assert_eq!(header(&headers, "content-type"), header(&get.1, "content-type"));
         assert_eq!(
-            header(&headers, "content-length").unwrap().parse::<usize>().unwrap(),
+            header(&headers, "content-type"),
+            header(&get.1, "content-type")
+        );
+        assert_eq!(
+            header(&headers, "content-length")
+                .unwrap()
+                .parse::<usize>()
+                .unwrap(),
             get.2.len(),
             "the length must be what the GET actually sent"
         );
@@ -725,7 +790,10 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("assets")).unwrap();
         std::fs::write(dir.path().join("assets/a.md"), b"# hi").unwrap();
         let (_, headers, _) = wire(&asset_req(dir.path(), "a.md", None, &[]));
-        assert_eq!(header(&headers, "content-type").unwrap(), "text/markdown; charset=utf-8");
+        assert_eq!(
+            header(&headers, "content-type").unwrap(),
+            "text/markdown; charset=utf-8"
+        );
     }
 
     /// A symlink pointing outside the site directory is a 404, not a file.
@@ -787,12 +855,15 @@ mod cache_control_tests {
         for url in [
             "/assets/fonts/montserrat-normal.woff2",
             "/assets/css/style.css",
-            "/assets/css/style.css?v=",          // empty hash is not a version
-            "/assets/css/style.css?version=1",   // must not match on prefix
+            "/assets/css/style.css?v=", // empty hash is not a version
+            "/assets/css/style.css?version=1", // must not match on prefix
             "/assets/css/style.css?vv=1",
             "/assets/css/style.css?other=v=1",
         ] {
-            assert!(!is_versioned(&query_of(url)), "{url} must NOT be treated as versioned");
+            assert!(
+                !is_versioned(&query_of(url)),
+                "{url} must NOT be treated as versioned"
+            );
         }
     }
 
@@ -822,7 +893,10 @@ mod cache_control_tests {
     fn unversioned_lengthens_only_the_edge_never_the_browser() {
         let cc = cache_control_for(&query_of("/assets/css/style.css"));
 
-        assert!(cc.contains("s-maxage=86400"), "edge must hold it long: {cc}");
+        assert!(
+            cc.contains("s-maxage=86400"),
+            "edge must hold it long: {cc}"
+        );
         assert!(cc.contains("max-age=60"), "browser must stay short: {cc}");
         assert!(
             cc.contains("stale-while-revalidate=60"),
@@ -862,7 +936,11 @@ mod charset_tests {
             ("nav.js", "text/javascript; charset=utf-8"),
             ("page.html", "text/html; charset=utf-8"),
         ] {
-            assert_eq!(m6_core::mime::mime_from_path(Path::new(file)), want, "{file}");
+            assert_eq!(
+                m6_core::mime::mime_from_path(Path::new(file)),
+                want,
+                "{file}"
+            );
         }
     }
 
@@ -872,7 +950,10 @@ mod charset_tests {
     fn binary_and_json_carry_no_charset() {
         for file in ["a.webp", "a.png", "a.woff2", "a.pdf", "a.json", "a.ico"] {
             let m = m6_core::mime::mime_from_path(Path::new(file));
-            assert!(!m.contains("charset"), "{file} must not declare a charset, got {m}");
+            assert!(
+                !m.contains("charset"),
+                "{file} must not declare a charset, got {m}"
+            );
         }
     }
 
@@ -882,11 +963,14 @@ mod charset_tests {
     #[test]
     fn every_extension_in_use_is_known() {
         for file in [
-            "a.webp", "a.jpg", "a.png", "a.js", "a.svg", "a.pdf",
-            "a.md", "a.txt", "a.woff2", "a.css", "a.xml", "a.json", "a.ico",
+            "a.webp", "a.jpg", "a.png", "a.js", "a.svg", "a.pdf", "a.md", "a.txt", "a.woff2",
+            "a.css", "a.xml", "a.json", "a.ico",
         ] {
             let m = m6_core::mime::mime_from_path(Path::new(file));
-            assert_ne!(m, "application/octet-stream", "{file} fell through to the default");
+            assert_ne!(
+                m, "application/octet-stream",
+                "{file} fell through to the default"
+            );
         }
     }
 }

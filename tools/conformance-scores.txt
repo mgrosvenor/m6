@@ -17,7 +17,7 @@ h1:m6-file             32     32
 h1:m6-html             32     32
 h1:m6-http-redirect    32     32
 h2:m6-http             146    146
-h3:m6-http             37     49
+h3:m6-http             47     49
 
 # h2 and h3 had NO FLOOR until 2026-09-13, which meant neither had a recorded minimum
 # and neither was ever measured by a gate. The pre-push hook was the only thing
@@ -25,6 +25,133 @@ h3:m6-http             37     49
 # installed, so both were skipped on every run and the script said nothing. The
 # Linux gate did not run conformance at all.
 #
-# h3 is 37/49, not 49/49: twelve QUIC transport requirements genuinely fail
-# today. The floor records where it is so it cannot get worse, which is what a
-# minimum-score check is for. Raising it is the work, and is its own change.
+# h3 IS 47/49, AND THE FLOOR SAYS 47 BECAUSE OF A FORK. Read this before
+# touching either number.
+#
+# It was 37/49, recorded as twelve requirements that "genuinely fail today",
+# with the 1.0 list saying the fix was to bump quiche from 0.26.1 since all
+# twelve sit below the layer m6-http works at. The bump was done on 2026-09-13,
+# to 0.29.3, three releases newer. THE SCORE DID NOT MOVE BY ONE TEST. 0.29.3 is
+# also the newest plain release: checked against every tag in cloudflare/quiche
+# that day, there is no 0.30 line, and the higher numbers in that repo are
+# tokio-quiche, a different crate.
+#
+# All twelve are worded "MUST send <error>", not "MUST reject". Ten are upstream
+# bugs with open fix pull requests. They are NOT deliberate design, and an
+# earlier version of this comment said they were. That was wrong, and what made
+# it get checked was the owner refusing to believe it.
+#
+#   8  TRANSPORT_PARAMETER_ERROR, Transport 7.3, 7.4 and 18.2
+#      quiche DOES detect these: the edge log shows exactly 8
+#      InvalidTransportParam from conn.recv(). On that error quiche calls
+#      close() itself (lib.rs:2885), queueing the right code. close() then
+#      calls mark_closed() because no packet has been fully processed yet:
+#      recv_count increments at the END of recv_single, after frames are
+#      parsed, so a bad parameter in the client's first Initial leaves it at 0.
+#      send() returns Done on a closed connection, so the close is built
+#      correctly and can never go out.
+#
+#      Upstream issue #2515, "First-flight transport errors can make pending
+#      CONNECTION_CLOSE unsendable", open since 2026-06-22, names the same
+#      mechanism, the same recv_count == 0, and the same expected Initial
+#      CONNECTION_CLOSE with TRANSPORT_PARAMETER_ERROR 0x08. PR #2521 fixes it.
+#
+#   2  PROTOCOL_VIOLATION for non-zero reserved bits, Handshake and Short,
+#      Transport 17.2. quiche does NOT detect these. There is no reserved-bit
+#      validation anywhere in packet.rs, so the packets are simply accepted.
+#      Upstream: #2526 "reserved packet bits are accepted" and #2652
+#      "Authenticated reserved-bits validation is missing", both open, with PR
+#      #2575 open and last touched 2026-09-10. #2596 covered Initial packets and
+#      is closed; h3spec tests Handshake and Short, the two that were failing.
+#
+#   2  QPACK_ENCODER_STREAM_ERROR and QPACK_DECODER_STREAM_ERROR, QPACK 4.1.3
+#      and 4.4.3. These are the two that STILL fail at 47/49, and they are not
+#      upstream bugs. See the last block in this file.
+#
+# None of the twelve was reachable through quiche's public API, so none was
+# fixable in m6. The fix was to change which quiche we build against.
+#
+# WHAT MOVED IT. Not the version bump: that was tried and changed nothing. The
+# two open upstream fixes clear all ten. Measured on the build host 2026-09-13,
+# every run with the linked source confirmed in Cargo.lock:
+#
+#     quiche 0.29.3 as released                    h3  37/49
+#     0.29.3 + cherry-picked #2521 + #2575         h3  47/49
+#     quiche master (25 commits on) + both PRs     h3  47/49   <- adopted
+#
+# The two bases scored the same, so the choice between them was never about the
+# number. Master was taken because it is where both PRs are based, which is what
+# makes the fork rebasable, and because any QPACK work we write would want to go
+# upstream from there.
+#
+# THE FORK IS ACCEPTED. Owner's decision, 2026-09-13: "I'm ok with this." So it
+# is not an open question, and the note below about what it costs is there to be
+# re-read when upstream releases the fixes, not to reopen the choice.
+#
+# ADOPTED: m6-http now pins github.com/mgrosvenor/quiche by revision, branch
+# m6-h3-conformance, which is quiche master plus both PRs. Pinned by REVISION and
+# not by branch, so the dependency cannot move under a build that claims to be
+# reproducible. quiche's own suite passes on it: 1123 tests, zero failures,
+# including the assertions the PRs add (missing_initial_source_connection_id now
+# requires send() to emit the close, plus the two reserved-bit mask tests).
+#
+# WHAT THIS COSTS, since it is a real cost and not a formality. Both PRs are
+# unmerged and both come from third-party forks, snvtac/quiche and
+# Soundcreates/quiche, not from Cloudflare. So the QUIC transport path of a
+# production edge now carries community changes that upstream has not reviewed,
+# plus 25 unreleased master commits. #2575's own commit message records that the
+# ideal test, crafting a real packet with the AEAD-protected reserved bit set,
+# was NOT written because it is a heavy lift, and that it pins the bit masks
+# instead. And pinning a fork cuts against the reason Phase 7 chose a tag over
+# crates.io: not owning someone else's release surface.
+#
+# WHEN UPSTREAM RELEASES THESE, drop the fork and go back to a tag. That is the
+# point of the fork, not a permanent arrangement. Watch #2521 and #2575.
+#
+# HOW THE FORK WAS BUILT, so it can be rebuilt or rebased from nothing:
+#
+#     git clone https://github.com/cloudflare/quiche && cd quiche
+#     git fetch origin refs/pull/2521/head:pr2521 refs/pull/2575/head:pr2575
+#     git checkout -B m6-h3-conformance origin/master
+#     git merge pr2521      # ONE conflict, see below
+#     git merge pr2575      # clean
+#
+# The #2521 conflict exists because master has moved past the PR's base and
+# reworded the very line it changes. Resolution is master's comment with the PR's
+# condition:
+#
+#     // Close immediately if no peer packet was authenticated.
+#     if self.recv_count == 0 && !self.received_authenticated_packet {
+#
+# Off the TAG instead, all three commits cherry-pick with no conflict, in this
+# order. #2575 is TWO commits and the second will not apply without the first:
+#
+#     adb565187e47f05dd14fa4ef572290f282c78092   PR #2521, first-flight closes
+#     6586499                                    PR #2575 (1/2), reject reserved bits
+#     25bcd4e                                    PR #2575 (2/2), extract + tests
+#
+# THE LAST TWO, to 49/49, are QPACK and ARE NOT BEING FIXED. Owner's decision,
+# 2026-09-13: "47/49 is good enough. It's not going to block 1.0.0". So 47 is the
+# floor, the two QPACK failures are accepted, and this is not an open task. What
+# follows is why, so the decision does not get revisited from scratch.
+#
+# They are not upstream bugs. quiche reads the peer's QPACK encoder and decoder
+# streams and discards every byte, counting only the totals (h3/mod.rs,
+# State::QpackInstruction). It runs a static table only, and #90, "h3: don't
+# error on QPACK instruction", is closed, so ignoring these instructions is a
+# decision upstream made rather than something it got wrong. Codes 0x201 and
+# 0x202 are absent from its h3 WireErrorCode for the same reason.
+#
+# Closing the gap would mean writing new protocol validation ourselves: two Error
+# variants and their to_wire arms, then parsing the two instructions instead of
+# discarding them. Set Dynamic Table Capacity, 001 prefix, must fail with 0x201
+# when it exceeds the capacity we advertise, which is 0. Insert Count Increment,
+# 00 prefix, must fail with 0x202 when it is 0. decode_int in
+# h3/qpack/decoder.rs already parses prefixed integers and
+# close_conn_critical_stream shows the close pattern, so it would need nothing
+# from m6. Small in lines. NOT small in kind: new validation on the connection
+# path with no upstream review, needing per-stream buffering for instructions
+# split across reads, which is where a careless version becomes unbounded memory
+# on a stream a peer controls. That is the trade that was declined, and declining
+# it is the right call for two conformance tests about how politely we refuse a
+# hostile peer.

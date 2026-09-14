@@ -60,7 +60,7 @@ pub const UNTRUSTED_INBOUND: &[&str] = &[
 /// downstream has ever been allowed to look at it.
 ///
 /// That is right for the public listener and wrong for the backbone. A cache
-/// node forwards to origin over `h2c://10.0.0.1:80` and already sends the real
+/// node forwards to origin over `h2c://192.0.2.1:80` and already sends the real
 /// client IP (`h2c_client.rs`), so origin was stripping the one accurate
 /// answer it had and attributing every relayed request to the tunnel address.
 /// The visible cost was analytics: three of five crawler sightings in an hour
@@ -125,7 +125,9 @@ pub fn attributed_client_ip<'a>(
 /// True if `name` is a header a client is never allowed to supply.
 #[inline]
 pub fn is_untrusted_inbound(name: &str) -> bool {
-    UNTRUSTED_INBOUND.iter().any(|&h| name.eq_ignore_ascii_case(h))
+    UNTRUSTED_INBOUND
+        .iter()
+        .any(|&h| name.eq_ignore_ascii_case(h))
 }
 
 /// Ensure the backend leg carries a `Host`.
@@ -149,9 +151,7 @@ pub fn is_untrusted_inbound(name: &str) -> bool {
 /// strict turned it into a 400 on every HTTP/3 cache miss and on every
 /// HTTP/1.0 request, which is how it was found.
 fn write_host_if_absent(buf: &mut Vec<u8>, req: &HttpRequest, original_host: &str) {
-    if original_host.is_empty()
-        || m6_core::headers::contains(&req.headers[..], "host")
-    {
+    if original_host.is_empty() || m6_core::headers::contains(&req.headers[..], "host") {
         return;
     }
     buf.extend_from_slice(b"Host: ");
@@ -196,8 +196,7 @@ fn proxy_owned_request_header(name: &str) -> bool {
 /// Headers that must not be copied verbatim onto a forwarded request.
 #[inline]
 fn skip_when_forwarding(name: &str) -> bool {
-    HOP_BY_HOP.iter().any(|&h| name.eq_ignore_ascii_case(h))
-        || proxy_owned_request_header(name)
+    HOP_BY_HOP.iter().any(|&h| name.eq_ignore_ascii_case(h)) || proxy_owned_request_header(name)
 }
 
 /// The pseudonym this proxy identifies itself by in `Via`.
@@ -325,8 +324,20 @@ pub fn h1_field_name_is_safe(name: &str) -> bool {
             b.is_ascii_alphanumeric()
                 || matches!(
                     b,
-                    b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*'
-                        | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
                 )
         })
 }
@@ -348,7 +359,12 @@ pub fn check_forwardable(
 ) -> Result<(), String> {
     // The method is written before the first space, so a space in it forges a
     // request line on its own — no CR needed.
-    if req.method.is_empty() || !req.method.bytes().all(|b| b.is_ascii_graphic() && b != b'/') {
+    if req.method.is_empty()
+        || !req
+            .method
+            .bytes()
+            .all(|b| b.is_ascii_graphic() && b != b'/')
+    {
         return Err(format!("method {:?}", req.method));
     }
     for (label, s) in [
@@ -357,11 +373,16 @@ pub fn check_forwardable(
     ] {
         // A space here ends the request target and makes the remainder look
         // like the HTTP version token.
-        if s.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0 || b == b' ') {
+        if s.bytes()
+            .any(|b| b == b'\r' || b == b'\n' || b == 0 || b == b' ')
+        {
             return Err(format!("request {label}"));
         }
     }
-    for (label, s) in [("X-Forwarded-For", client_ip), ("X-Forwarded-Host", original_host)] {
+    for (label, s) in [
+        ("X-Forwarded-For", client_ip),
+        ("X-Forwarded-Host", original_host),
+    ] {
         if !h1_field_value_is_safe(s) {
             return Err(format!("proxy header {label}"));
         }
@@ -458,9 +479,7 @@ pub fn forward_request_timeout(
             existing_via = Some(value.as_str());
             continue; // re-emitted below with our own hop appended
         }
-        if skip_when_forwarding(name)
-            || nominated.iter().any(|n| name.eq_ignore_ascii_case(n))
-        {
+        if skip_when_forwarding(name) || nominated.iter().any(|n| name.eq_ignore_ascii_case(n)) {
             continue;
         }
         buf.extend_from_slice(name.as_bytes());
@@ -592,9 +611,9 @@ pub fn read_response_for<R: Read>(mut reader: R, request_method: &str) -> io::Re
     let mut lines = header_section.split("\r\n");
 
     // Status line
-    let status_line = lines.next().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "empty response")
-    })?;
+    let status_line = lines
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty response"))?;
     let (status, reason) = parse_status_line(status_line)?;
 
     let mut headers: Vec<(String, String)> = Vec::with_capacity(16);
@@ -689,7 +708,12 @@ pub fn read_response_for<R: Read>(mut reader: R, request_method: &str) -> io::Re
         || status == 304
         || (100..200).contains(&status);
     if bodyless {
-        return Ok(HttpResponse { status, reason, headers, body: Vec::new() });
+        return Ok(HttpResponse {
+            status,
+            reason,
+            headers,
+            body: Vec::new(),
+        });
     }
 
     // Body bytes that arrived in the same read as the headers — borrow from stack buffer.
@@ -703,7 +727,9 @@ pub fn read_response_for<R: Read>(mut reader: R, request_method: &str) -> io::Re
         if len > MAX_BACKEND_BODY {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("backend declared Content-Length {len}, above the {MAX_BACKEND_BODY} limit"),
+                format!(
+                    "backend declared Content-Length {len}, above the {MAX_BACKEND_BODY} limit"
+                ),
             ));
         }
         let mut body = vec![0u8; len];
@@ -718,8 +744,7 @@ pub fn read_response_for<R: Read>(mut reader: R, request_method: &str) -> io::Re
         // needing to know the size in advance.
         let mut body = body_prefix.to_vec();
         let remaining = MAX_BACKEND_BODY.saturating_sub(body.len());
-        let read = std::io::Read::take(&mut reader, remaining as u64 + 1)
-            .read_to_end(&mut body)?;
+        let read = std::io::Read::take(&mut reader, remaining as u64 + 1).read_to_end(&mut body)?;
         let _ = read;
         if body.len() > MAX_BACKEND_BODY {
             return Err(std::io::Error::new(
@@ -730,7 +755,12 @@ pub fn read_response_for<R: Read>(mut reader: R, request_method: &str) -> io::Re
         body
     };
 
-    Ok(HttpResponse { status, reason, body, headers })
+    Ok(HttpResponse {
+        status,
+        reason,
+        body,
+        headers,
+    })
 }
 
 /// Locate the end of the HTTP header section (\r\n\r\n).
@@ -796,7 +826,10 @@ fn read_chunked_body<R: Read>(reader: &mut R, prefix: Vec<u8>) -> io::Result<Vec
 
     loop {
         let crlf = find_crlf(&pending[pos..]).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "chunked: missing CRLF after size")
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "chunked: missing CRLF after size",
+            )
         })?;
         let size_line = std::str::from_utf8(&pending[pos..pos + crlf])
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "chunked: size not utf8"))?;
@@ -808,8 +841,12 @@ fn read_chunked_body<R: Read>(reader: &mut R, prefix: Vec<u8>) -> io::Result<Vec
                 format!("chunked: invalid chunk size {size_str:?}"),
             ));
         }
-        let size = usize::from_str_radix(size_str, 16)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "chunked: chunk size out of range"))?;
+        let size = usize::from_str_radix(size_str, 16).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "chunked: chunk size out of range",
+            )
+        })?;
         pos += crlf + 2;
 
         if size == 0 {
@@ -913,7 +950,14 @@ pub fn parse_request(data: &[u8]) -> Result<HttpRequest, String> {
 
     let body = data[body_start..].to_vec();
 
-    Ok(HttpRequest { method, path, query, version, headers: parsed_headers, body })
+    Ok(HttpRequest {
+        method,
+        path,
+        query,
+        version,
+        headers: parsed_headers,
+        body,
+    })
 }
 
 /// Forward a request to a URL backend over HTTP/1.1.
@@ -951,10 +995,13 @@ pub fn forward_url_request(
 
     // ── Parse URL ────────────────────────────────────────────────────────────
     let (scheme, authority) = parse_url_scheme_authority(base_url)?;
-    let (host, port) = split_host_port(&authority, match scheme.as_str() {
-        "https" => 443,
-        _ => 80, // http and h2c both default to 80
-    })?;
+    let (host, port) = split_host_port(
+        &authority,
+        match scheme.as_str() {
+            "https" => 443,
+            _ => 80, // http and h2c both default to 80
+        },
+    )?;
 
     // ── TCP connect ──────────────────────────────────────────────────────────
     use std::net::TcpStream;
@@ -994,9 +1041,9 @@ pub fn forward_url_request(
 /// thread returns.  All fields are cheaply cloneable.
 #[derive(Clone)]
 pub struct PendingUrlContext {
-    pub req:          HttpRequest,
-    pub client_ip:    String,
-    pub enc:          String,
+    pub req: HttpRequest,
+    pub client_ip: String,
+    pub enc: String,
     pub backend_name: String,
     /// Whether the response may enter the shared cache. False for
     /// `require`-protected routes (the cache key carries no identity, so a
@@ -1010,7 +1057,7 @@ pub struct PendingUrlContext {
     /// via `handle_request`'s `is_prefetch` -- otherwise every refresh logs
     /// itself as a request from 127.0.0.1 and corrupts the visit counts.
     pub is_prefetch: bool,
-    pub start:        std::time::Instant,   // request arrival time for miss timing
+    pub start: std::time::Instant, // request arrival time for miss timing
     /// Set when this dispatch is itself a `[errors] mode = "custom"` fetch of
     /// the error page (rather than a normal routed request) — carries the
     /// ORIGINAL failing status so the fetched body can be returned under it.
@@ -1023,17 +1070,22 @@ pub struct PendingUrlContext {
 /// Returns a one-shot channel.  The caller MUST poll with `try_recv()` inside
 /// the event loop — never block waiting on the receiver.
 pub fn dispatch_url_request(
-    base_url:      String,
-    req:           HttpRequest,
-    client_ip:     String,
+    base_url: String,
+    req: HttpRequest,
+    client_ip: String,
     original_host: String,
-    timeout:       Option<std::time::Duration>,
-    tls_config:    std::sync::Arc<rustls::ClientConfig>,
+    timeout: Option<std::time::Duration>,
+    tls_config: std::sync::Arc<rustls::ClientConfig>,
 ) -> std::sync::mpsc::Receiver<std::io::Result<HttpResponse>> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = tx.send(forward_url_request(
-            &base_url, &req, &client_ip, &original_host, timeout, tls_config,
+            &base_url,
+            &req,
+            &client_ip,
+            &original_host,
+            timeout,
+            tls_config,
         ));
     });
     rx
@@ -1082,9 +1134,7 @@ fn build_forwarded_request_bytes(
             existing_via = Some(value.as_str());
             continue;
         }
-        if skip_when_forwarding(name)
-            || nominated.iter().any(|n| name.eq_ignore_ascii_case(n))
-        {
+        if skip_when_forwarding(name) || nominated.iter().any(|n| name.eq_ignore_ascii_case(n)) {
             continue;
         }
         if name.eq_ignore_ascii_case("host") {
@@ -1133,9 +1183,7 @@ fn parse_url_scheme_authority(url: &str) -> io::Result<(String, String)> {
     let scheme = url[..idx].to_lowercase();
     let rest = &url[idx + sep.len()..];
     // Authority ends at the first `/`, `?`, or `#`
-    let auth_end = rest
-        .find(|c| c == '/' || c == '?' || c == '#')
-        .unwrap_or(rest.len());
+    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let authority = rest[..auth_end].to_string();
     Ok((scheme, authority))
 }
@@ -1145,13 +1193,14 @@ fn split_host_port(authority: &str, default_port: u16) -> io::Result<(String, u1
     // IPv6: `[::1]:8443`
     if let Some(bracket_end) = authority.find(']') {
         let host = authority[1..bracket_end].to_string();
-        let port = if bracket_end + 1 < authority.len() && authority.as_bytes()[bracket_end + 1] == b':' {
-            authority[bracket_end + 2..].parse::<u16>().map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "invalid port in URL")
-            })?
-        } else {
-            default_port
-        };
+        let port =
+            if bracket_end + 1 < authority.len() && authority.as_bytes()[bracket_end + 1] == b':' {
+                authority[bracket_end + 2..].parse::<u16>().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "invalid port in URL")
+                })?
+            } else {
+                default_port
+            };
         return Ok((host, port));
     }
     if let Some(colon) = authority.rfind(':') {
@@ -1171,17 +1220,19 @@ fn forward_over_tls(
     tls_config: std::sync::Arc<rustls::ClientConfig>,
     request_method: &str,
 ) -> io::Result<HttpResponse> {
-    use std::io::Write;
     use rustls::ClientConnection;
     use rustls::StreamOwned;
+    use std::io::Write;
 
     let server_name = rustls::pki_types::ServerName::try_from(host.to_string()).map_err(|_| {
-        io::Error::new(io::ErrorKind::InvalidInput, format!("invalid server name: {}", host))
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid server name: {}", host),
+        )
     })?;
 
-    let conn = ClientConnection::new(tls_config, server_name).map_err(|e| {
-        io::Error::new(io::ErrorKind::Other, format!("TLS init error: {}", e))
-    })?;
+    let conn = ClientConnection::new(tls_config, server_name)
+        .map_err(|e| io::Error::other(format!("TLS init error: {}", e)))?;
 
     let mut tls_stream = StreamOwned::new(conn, tcp);
     tls_stream.write_all(&req_bytes)?;
@@ -1190,7 +1241,12 @@ fn forward_over_tls(
 }
 
 /// Build a simple HTTP response buffer (kept for tests).
-pub fn build_response(status: u16, reason: &str, headers: &[(String, String)], body: &[u8]) -> Vec<u8> {
+pub fn build_response(
+    status: u16,
+    reason: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> Vec<u8> {
     use std::fmt::Write;
     let mut out = String::new();
     let _ = write!(out, "HTTP/1.1 {} {}\r\n", status, reason);
@@ -1204,7 +1260,6 @@ pub fn build_response(status: u16, reason: &str, headers: &[(String, String)], b
     bytes.extend_from_slice(body);
     bytes
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1278,14 +1333,16 @@ mod tests {
 
     #[test]
     fn test_parse_url_scheme_authority_with_path() {
-        let (scheme, authority) = parse_url_scheme_authority("https://api.example.com/v1/foo").unwrap();
+        let (scheme, authority) =
+            parse_url_scheme_authority("https://api.example.com/v1/foo").unwrap();
         assert_eq!(scheme, "https");
         assert_eq!(authority, "api.example.com");
     }
 
     #[test]
     fn test_parse_url_scheme_authority_with_port() {
-        let (scheme, authority) = parse_url_scheme_authority("https://api.example.com:8443/v1").unwrap();
+        let (scheme, authority) =
+            parse_url_scheme_authority("https://api.example.com:8443/v1").unwrap();
         assert_eq!(scheme, "https");
         assert_eq!(authority, "api.example.com:8443");
     }
@@ -1336,7 +1393,8 @@ mod tests {
             ],
             body: vec![],
         };
-        let bytes = build_forwarded_request_bytes(&req, "api.example.com", "1.2.3.4", "original.host");
+        let bytes =
+            build_forwarded_request_bytes(&req, "api.example.com", "1.2.3.4", "original.host");
         let s = std::str::from_utf8(&bytes).unwrap();
 
         assert!(s.starts_with("GET /api/test?key=value HTTP/1.1\r\n"));
@@ -1393,7 +1451,7 @@ mod smuggling_tests {
         let attacks = [
             "evil\r\nX-Injected: yes",
             "evil\r\n\r\nGET /admin HTTP/1.1\r\nHost: internal",
-            "evil\nX-Injected: bare-lf",   // bare LF: many parsers accept it
+            "evil\nX-Injected: bare-lf", // bare LF: many parsers accept it
             "evil\rX-Injected: bare-cr",
             "evil\0truncated",
         ];
@@ -1478,9 +1536,18 @@ mod smuggling_tests {
             query: Some("v=1&x=%E2%80%99".to_string()),
             version: "HTTP/1.1".to_string(),
             headers: vec![
-                ("Content-Type".to_string(), "application/x-www-form-urlencoded".to_string()),
-                ("User-Agent".to_string(), "Mozilla/5.0 (Macintosh)".to_string()),
-                ("X-Obs-Text".to_string(), "caf\u{e9} \u{2014} fine".to_string()),
+                (
+                    "Content-Type".to_string(),
+                    "application/x-www-form-urlencoded".to_string(),
+                ),
+                (
+                    "User-Agent".to_string(),
+                    "Mozilla/5.0 (Macintosh)".to_string(),
+                ),
+                (
+                    "X-Obs-Text".to_string(),
+                    "caf\u{e9} \u{2014} fine".to_string(),
+                ),
                 ("Accept".to_string(), "text/html;q=0.9, */*".to_string()),
             ],
             body: b"a=1".to_vec(),
@@ -1520,8 +1587,11 @@ mod response_framing_tests {
     /// A single field carrying a list must be checked element-wise too.
     #[test]
     fn content_length_list_must_agree() {
-        assert!(read_response(&b"HTTP/1.1 200 OK\r\nContent-Length: 5, 6\r\n\r\nhello"[..]).is_err());
-        let r = read_response(&b"HTTP/1.1 200 OK\r\nContent-Length: 5, 5\r\n\r\nhello"[..]).unwrap();
+        assert!(
+            read_response(&b"HTTP/1.1 200 OK\r\nContent-Length: 5, 6\r\n\r\nhello"[..]).is_err()
+        );
+        let r =
+            read_response(&b"HTTP/1.1 200 OK\r\nContent-Length: 5, 5\r\n\r\nhello"[..]).unwrap();
         assert_eq!(r.body, b"hello");
     }
 
@@ -1529,9 +1599,14 @@ mod response_framing_tests {
     /// the classic smuggling primitive because the next hop may pick the other.
     #[test]
     fn transfer_encoding_with_content_length_is_refused() {
-        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n0\r\n\r\n";
+        let raw =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n0\r\n\r\n";
         let err = read_response(&raw[..]).unwrap_err();
-        assert!(err.to_string().contains("both Transfer-Encoding and Content-Length"), "got: {err}");
+        assert!(
+            err.to_string()
+                .contains("both Transfer-Encoding and Content-Length"),
+            "got: {err}"
+        );
     }
 
     /// F030. Transfer-Encoding is a list and only the FINAL coding frames the
@@ -1540,7 +1615,8 @@ mod response_framing_tests {
     /// envelope back as though it were the body.
     #[test]
     fn transfer_encoding_list_ending_in_chunked_is_chunked() {
-        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+        let raw =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
         let r = read_response(&raw[..]).expect("gzip, chunked is chunked");
         assert_eq!(r.body, b"hello", "chunk envelope was not decoded");
     }
@@ -1551,7 +1627,10 @@ mod response_framing_tests {
     fn transfer_encoding_not_ending_in_chunked_is_refused() {
         let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, gzip\r\n\r\nhello";
         let err = read_response(&raw[..]).unwrap_err();
-        assert!(err.to_string().contains("not ending in chunked"), "got: {err}");
+        assert!(
+            err.to_string().contains("not ending in chunked"),
+            "got: {err}"
+        );
     }
 
     /// F031. An unparseable length used to become `None` via `.ok()` and fall
@@ -1581,8 +1660,11 @@ mod response_framing_tests {
         let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 16422\r\n\r\n";
         let r = read_response_for(&raw[..], "HEAD").expect("HEAD must not wait for a body");
         assert!(r.body.is_empty());
-        assert_eq!(r.header("content-length"), Some("16422"),
-            "the header must survive; only the body is absent");
+        assert_eq!(
+            r.header("content-length"),
+            Some("16422"),
+            "the header must survive; only the body is absent"
+        );
     }
 
     /// Same rule, driven by status rather than method (RFC 9112 6.3).
@@ -1640,7 +1722,10 @@ mod chunked_tests {
     #[test]
     fn missing_crlf_after_chunk_data_is_refused() {
         let err = read_response(&resp("5\r\nhelloXX0\r\n\r\n")[..]).unwrap_err();
-        assert!(err.to_string().contains("not terminated by CRLF"), "got: {err}");
+        assert!(
+            err.to_string().contains("not terminated by CRLF"),
+            "got: {err}"
+        );
     }
 
     /// F033/F034. The decoder returned at the zero chunk without confirming the
@@ -1649,8 +1734,7 @@ mod chunked_tests {
     #[test]
     fn truncated_trailer_section_is_refused() {
         for body in ["5\r\nhello\r\n0\r\n", "5\r\nhello\r\n0\r\nX-Trailer: v\r\n"] {
-            let err = read_response(&resp(body)[..])
-                .unwrap_err();
+            let err = read_response(&resp(body)[..]).unwrap_err();
             assert!(
                 err.to_string().contains("trailer section was terminated"),
                 "{body:?} should be refused, got: {err}"
@@ -1660,7 +1744,8 @@ mod chunked_tests {
 
     #[test]
     fn malformed_trailer_is_refused() {
-        let err = read_response(&resp("5\r\nhello\r\n0\r\nnot a header line\r\n\r\n")[..]).unwrap_err();
+        let err =
+            read_response(&resp("5\r\nhello\r\n0\r\nnot a header line\r\n\r\n")[..]).unwrap_err();
         assert!(err.to_string().contains("malformed trailer"), "got: {err}");
     }
 
@@ -1684,7 +1769,10 @@ mod chunked_tests {
     #[test]
     fn short_chunk_data_is_refused() {
         let err = read_response(&resp("10\r\nhello\r\n0\r\n\r\n")[..]).unwrap_err();
-        assert!(err.to_string().contains("shorter than declared"), "got: {err}");
+        assert!(
+            err.to_string().contains("shorter than declared"),
+            "got: {err}"
+        );
     }
 }
 
@@ -1698,15 +1786,21 @@ mod via_and_connection_tests {
             path: "/".to_string(),
             query: None,
             version: version.to_string(),
-            headers: headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
             body: Vec::new(),
         }
     }
 
     fn serialised(r: &HttpRequest) -> String {
-        String::from_utf8_lossy(
-            &build_forwarded_request_bytes(r, "backend.internal", "1.2.3.4", "example.com"),
-        )
+        String::from_utf8_lossy(&build_forwarded_request_bytes(
+            r,
+            "backend.internal",
+            "1.2.3.4",
+            "example.com",
+        ))
         .into_owned()
     }
 
@@ -1715,7 +1809,10 @@ mod via_and_connection_tests {
             .next()
             .unwrap_or("")
             .lines()
-            .filter(|l| l.to_lowercase().starts_with(&format!("{}:", name.to_lowercase())))
+            .filter(|l| {
+                l.to_lowercase()
+                    .starts_with(&format!("{}:", name.to_lowercase()))
+            })
             .map(|l| l.split_once(':').unwrap().1.trim().to_string())
             .collect()
     }
@@ -1735,9 +1832,19 @@ mod via_and_connection_tests {
             "HTTP/1.1",
         );
         let out = serialised(&r);
-        assert!(header_values(&out, "x-session-hint").is_empty(), "nominated field forwarded:\n{out}");
-        assert!(header_values(&out, "x-internal-flag").is_empty(), "nominated field forwarded:\n{out}");
-        assert_eq!(header_values(&out, "x-legitimate"), vec!["kept"], "unrelated header dropped:\n{out}");
+        assert!(
+            header_values(&out, "x-session-hint").is_empty(),
+            "nominated field forwarded:\n{out}"
+        );
+        assert!(
+            header_values(&out, "x-internal-flag").is_empty(),
+            "nominated field forwarded:\n{out}"
+        );
+        assert_eq!(
+            header_values(&out, "x-legitimate"),
+            vec!["kept"],
+            "unrelated header dropped:\n{out}"
+        );
     }
 
     /// `close`/`keep-alive`/`upgrade` are connection OPTIONS, not field names.
@@ -1745,7 +1852,10 @@ mod via_and_connection_tests {
     /// `Close` must survive.
     #[test]
     fn connection_options_are_not_treated_as_field_names() {
-        let r = req(&[("Connection", "keep-alive, close"), ("X-Keep", "v")], "HTTP/1.1");
+        let r = req(
+            &[("Connection", "keep-alive, close"), ("X-Keep", "v")],
+            "HTTP/1.1",
+        );
         let out = serialised(&r);
         assert_eq!(header_values(&out, "x-keep"), vec!["v"]);
     }
@@ -1761,9 +1871,18 @@ mod via_and_connection_tests {
     /// is being forwarded over -- h2/h3 requests all leave here as HTTP/1.1.
     #[test]
     fn via_reports_the_received_protocol() {
-        assert_eq!(header_values(&serialised(&req(&[], "HTTP/2")), "via"), vec!["2 m6"]);
-        assert_eq!(header_values(&serialised(&req(&[], "HTTP/3")), "via"), vec!["3 m6"]);
-        assert_eq!(header_values(&serialised(&req(&[], "HTTP/1.0")), "via"), vec!["1.0 m6"]);
+        assert_eq!(
+            header_values(&serialised(&req(&[], "HTTP/2")), "via"),
+            vec!["2 m6"]
+        );
+        assert_eq!(
+            header_values(&serialised(&req(&[], "HTTP/3")), "via"),
+            vec!["3 m6"]
+        );
+        assert_eq!(
+            header_values(&serialised(&req(&[], "HTTP/1.0")), "via"),
+            vec!["1.0 m6"]
+        );
     }
 
     /// An upstream proxy's Via must be preserved and appended to, not replaced
@@ -1771,7 +1890,11 @@ mod via_and_connection_tests {
     #[test]
     fn existing_via_is_extended_not_replaced() {
         let out = serialised(&req(&[("Via", "1.1 upstream-cache")], "HTTP/1.1"));
-        assert_eq!(header_values(&out, "via"), vec!["1.1 upstream-cache, 1.1 m6"], "\n{out}");
+        assert_eq!(
+            header_values(&out, "via"),
+            vec!["1.1 upstream-cache, 1.1 m6"],
+            "\n{out}"
+        );
     }
 
     /// Exactly one Via, whatever the input. Two would be legal to merge but
@@ -1787,7 +1910,7 @@ mod via_and_connection_tests {
     fn via_does_not_disclose_internal_topology() {
         let out = serialised(&req(&[], "HTTP/1.1"));
         let via = header_values(&out, "via").join(" ");
-        for leak in ["origin", "edge-a", "edge-b", "mgrosvenor", "backend.internal"] {
+        for leak in ["node-a", "node-b", "node-c", "example", "backend.internal"] {
             assert!(!via.contains(leak), "Via leaks {leak:?}: {via}");
         }
     }
@@ -1817,16 +1940,16 @@ mod forwarded_trust_tests {
     #[test]
     fn the_backbone_attributes_to_the_forwarded_address() {
         assert_eq!(
-            attributed_client_ip(Some("203.0.113.9"), "10.0.0.4", ForwardedTrust::Backbone),
+            attributed_client_ip(Some("203.0.113.9"), "192.0.2.4", ForwardedTrust::Backbone),
             "203.0.113.9"
         );
         assert_eq!(
-            attributed_client_ip(Some(" 203.0.113.9 "), "10.0.0.4", ForwardedTrust::Backbone),
+            attributed_client_ip(Some(" 203.0.113.9 "), "192.0.2.4", ForwardedTrust::Backbone),
             "203.0.113.9",
             "surrounding whitespace is field syntax, not part of the address"
         );
         assert_eq!(
-            attributed_client_ip(Some("2001:db8::1"), "10.0.0.4", ForwardedTrust::Backbone),
+            attributed_client_ip(Some("2001:db8::1"), "192.0.2.4", ForwardedTrust::Backbone),
             "2001:db8::1"
         );
     }
@@ -1837,8 +1960,8 @@ mod forwarded_trust_tests {
     #[test]
     fn a_missing_forwarded_address_falls_back_to_the_peer() {
         assert_eq!(
-            attributed_client_ip(None, "10.0.0.4", ForwardedTrust::Backbone),
-            "10.0.0.4"
+            attributed_client_ip(None, "192.0.2.4", ForwardedTrust::Backbone),
+            "192.0.2.4"
         );
     }
 
@@ -1853,8 +1976,8 @@ mod forwarded_trust_tests {
     #[test]
     fn anything_but_a_single_address_is_refused() {
         for bad in [
-            "203.0.113.9, 10.0.0.4",
-            "203.0.113.9,10.0.0.4",
+            "203.0.113.9, 192.0.2.4",
+            "203.0.113.9,192.0.2.4",
             "",
             "   ",
             "localhost",
@@ -1864,8 +1987,8 @@ mod forwarded_trust_tests {
         ] {
             assert_eq!(sole_forwarded_ip(bad), None, "{bad:?} should be refused");
             assert_eq!(
-                attributed_client_ip(Some(bad), "10.0.0.4", ForwardedTrust::Backbone),
-                "10.0.0.4",
+                attributed_client_ip(Some(bad), "192.0.2.4", ForwardedTrust::Backbone),
+                "192.0.2.4",
                 "{bad:?} was believed on the backbone"
             );
         }
@@ -1877,8 +2000,8 @@ mod forwarded_trust_tests {
     #[test]
     fn the_attributed_address_is_always_a_parseable_address_or_the_peer() {
         let huge = "a".repeat(10_000);
-        let out = attributed_client_ip(Some(&huge), "10.0.0.4", ForwardedTrust::Backbone);
-        assert_eq!(out, "10.0.0.4");
+        let out = attributed_client_ip(Some(&huge), "192.0.2.4", ForwardedTrust::Backbone);
+        assert_eq!(out, "192.0.2.4");
     }
 
     /// `x-forwarded-for` stays in the set stripped from every inbound request

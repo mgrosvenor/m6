@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+# pre-push — the branch rules, enforced by git rather than by memory.
+#
+# The model:
+#
+#   main      releases only. What people see on GitHub. It only ever advances
+#             by a merge from develop, made by tools/release.sh, with a
+#             CHANGELOG entry and a tag.
+#   develop   where the work is integrated. Everything branches from here and
+#             merges back here.
+#   <branch>  one branch per issue, named <type>/<issue>-<slug>, created by
+#             tools/branch.sh.
+#
+# What this hook refuses:
+#
+#   - any push to main that tools/release.sh did not make
+#   - any push to develop carrying a merge commit that tools/merge.sh did not
+#     make, because that merge did not go through the full checks
+#   - any push of a work branch whose name carries no issue number
+#
+# Bypass with --no-verify only if you can say out loud why, and expect the
+# next person to find it in the history.
+#
+# ── This hook is FAST, and that is the point ─────────────────────────────────
+#
+# It used to run `check.sh` -- the whole workspace test suite single-threaded, plus
+# conformance -- which took over ten minutes. **That broke pushing outright.** git
+# opens its connection to the remote, then runs the hook, then sends the pack. With
+# a ten-minute hook in the middle the connection sits idle long enough for the
+# server to close it, and git then writes the pack to a dead socket: killed by
+# SIGPIPE, exit 141, no error message. From the outside it looked exactly like a
+# push that silently did nothing, while check.sh printed "All checks passed".
+#
+# It took several attempts to attribute, and `git push --no-verify --dry-run`
+# reporting `faedb8f..47df3b0 develop -> develop` and exit 0 is what settled it:
+# the network, the credentials and the refusal logic were all fine.
+#
+# So the content checks are not here any more, and nothing is lost by that,
+# because two things already cover them and both are stricter:
+#
+#   - a PULL REQUEST runs the full set in CI, and a pull request is the only way
+#     work reaches develop or main
+#   - a MERGE runs tools/build-host-tests.sh on a real Linux box, which tests
+#     strictly more than either: it has h2spec and h3spec installed, and it is
+#     quiet enough for the performance numbers to mean something
+#
+# What stays here is what is instant and cannot be checked anywhere else: the
+# branch rules. A hook has to be cheap enough that nobody reaches for
+# `--no-verify`, and this one is now milliseconds.
+#
+# Run the local set deliberately when you want it:  ./check.sh
+#
+# ── Read every ref before deciding ───────────────────────────────────────────
+#
+# The old version also `exec`ed from inside the `while read` loop, which left
+# every ref after the first unvalidated: pushing two branches at once only ever
+# checked one of them. Stdin is drained fully now, then every ref is validated.
+
+set -uo pipefail
+RED='\033[0;31m'; YELLOW='\033[1;33m'; RESET='\033[0m'
+refuse() { echo -e "${RED}pre-push refused:${RESET} $*" >&2; exit 1; }
+note()   { echo -e "${YELLOW}----${RESET} $*"; }
+
+# git feeds the hook one line per ref: <local ref> <local sha> <remote ref> <remote sha>
+# Read all of them first. Nothing slow happens until stdin is at EOF.
+refs=()
+while read -r line; do
+  [[ -n "$line" ]] && refs+=("$line")
+done
+
+run_checks=0
+checks_for=""
+
+for entry in "${refs[@]}"; do
+  read -r local_ref local_sha remote_ref remote_sha <<< "$entry"
+  [[ -z "${local_ref:-}" ]] && continue
+  # A deletion. Not this hook's business.
+  [[ "$local_sha" =~ ^0+$ ]] && continue
+
+  branch="${remote_ref#refs/heads/}"
+
+  case "$branch" in
+    main)
+      if [[ "${M6_RELEASE:-}" != "1" ]]; then
+        refuse "main takes releases only.
+
+  main only ever advances by a merge from develop, made by tools/release.sh,
+  with a CHANGELOG entry and a tag. Nothing is pushed to it by hand.
+
+  If you are cutting a release:   ./tools/release.sh <version>
+  If you meant develop:           git push origin develop"
+      fi
+      note "release push to main (M6_RELEASE=1)"
+      ;;
+
+    develop)
+      # Every merge commit arriving on develop must carry the trailer that
+      # tools/merge.sh writes, which is the evidence the full checks ran.
+      range="$remote_sha..$local_sha"
+      [[ "$remote_sha" =~ ^0+$ ]] && range="$local_sha"
+      bad=""
+      for c in $(git rev-list --merges "$range" 2>/dev/null); do
+        git show -s --format=%B "$c" | grep -q '^Checks: ' || bad="$bad $(git rev-parse --short "$c")"
+      done
+      if [[ -n "$bad" ]]; then
+        refuse "merge commit(s) on develop with no record of the checks:$bad
+
+  A merge into develop has to pass the full set first: unit tests, clippy,
+  h1/h2/h3 conformance and the performance check. tools/merge.sh runs them
+  and records what it ran in the merge commit.
+
+  Use:  ./tools/merge.sh <branch>"
+      fi
+      run_checks=1
+      checks_for="develop"
+      ;;
+
+    "")
+      ;;
+
+    *)
+      # A work branch. It must name the issue it belongs to.
+      if ! [[ "$branch" =~ ^(feat|fix|perf|docs|refactor|test|chore)/[0-9]+- ]]; then
+        refuse "branch '$branch' does not name an issue.
+
+  Work branches are <type>/<issue>-<slug>, for example:
+      fix/42-h3-gate-measures-nothing
+      perf/57-stop-copying-the-config
+
+  Types: feat fix perf docs refactor test chore
+  Create one with:  ./tools/branch.sh <issue> <slug>"
+      fi
+      run_checks=1
+      checks_for="${checks_for:+$checks_for }$branch"
+      ;;
+  esac
+done
+
+# Say what was NOT checked here, because a gate that stays quiet about its scope
+# gets mistaken for one that covered everything. Same rule as tools/conformance.sh.
+if [[ $run_checks -eq 1 ]]; then
+  note "pushing $checks_for — branch rules only; tests, clippy and conformance run in CI on the pull request"
+  note "  to run them here first:  ./check.sh"
+fi
+
+exit 0

@@ -49,17 +49,17 @@ use m6_core::testkit::{binary, claim_port, PortClaim, Service};
 // ── Harness ───────────────────────────────────────────────────────────────────
 
 fn generate_tls_cert() -> (String, String, Vec<u8>) {
-    let ck = rcgen::generate_simple_self_signed(vec![
-        "localhost".to_string(),
-        "127.0.0.1".to_string(),
-    ])
-    .expect("rcgen");
+    let ck =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+            .expect("rcgen");
     let der = ck.cert.der().to_vec();
     (ck.cert.pem(), ck.key_pair.serialize_pem(), der)
 }
 
 fn tls_client_config(cert_der: &[u8]) -> Arc<rustls::ClientConfig> {
-    rustls::crypto::ring::default_provider().install_default().ok();
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
     let cert = rustls::pki_types::CertificateDer::from(cert_der.to_vec());
     let mut store = rustls::RootCertStore::empty();
     store.add(cert).unwrap();
@@ -113,13 +113,21 @@ impl Server {
                 // It fired on 2026-09-12 as `connect to 127.0.0.1:26376 failed
                 // with both services alive: Connection refused`, a message that
                 // stated its own refutation.
-                self.http.borrow_mut().assert_alive("the client was reconnecting");
-                self.file.borrow_mut().assert_alive("the client was reconnecting");
+                self.http
+                    .borrow_mut()
+                    .assert_alive("the client was reconnecting");
+                self.file
+                    .borrow_mut()
+                    .assert_alive("the client was reconnecting");
                 return None;
             }
         };
-        if sock.set_read_timeout(Some(Duration::from_secs(10))).is_err()
-            || sock.set_write_timeout(Some(Duration::from_secs(10))).is_err()
+        if sock
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .is_err()
+            || sock
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .is_err()
         {
             return None;
         }
@@ -134,7 +142,9 @@ impl Server {
     fn raw(&self, bytes: &[u8]) -> Vec<u8> {
         // Not yet accepting reads the same as closed on us, which is exactly
         // what this function already promises its callers.
-        let Some(mut s) = self.connect() else { return Vec::new() };
+        let Some(mut s) = self.connect() else {
+            return Vec::new();
+        };
         // A write failure is itself a valid outcome (server closed on us).
         if s.write_all(bytes).is_err() {
             return Vec::new();
@@ -181,14 +191,13 @@ impl Server {
     /// each abuse case. This is the assertion that actually catches a crash or
     /// a wedged accept loop.
     fn assert_still_healthy(&self, after: &str) {
-        let resp = self.raw(
-            b"GET /public/open.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-        );
+        let resp = self
+            .raw(b"GET /public/open.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
         let head = String::from_utf8_lossy(&resp);
         assert!(
             head.starts_with("HTTP/1.1 200"),
             "server unhealthy after {after}: {:?}",
-            &head.chars().take(120).collect::<String>()
+            head.chars().take(120).collect::<String>()
         );
         assert!(
             resp.windows(14).any(|w| w == b"PUBLIC CONTENT"),
@@ -292,7 +301,9 @@ name = "robustness-node"
 
     let mut http_proc = Service::spawn(
         "m6-http",
-        Command::new(binary("m6-http")).arg(site).arg(site.join("system.toml")),
+        Command::new(binary("m6-http"))
+            .arg(site)
+            .arg(site.join("system.toml")),
     );
     http_proc.wait_for_tcp(port, Duration::from_secs(10));
 
@@ -352,7 +363,7 @@ fn assert_concluded(resp: &[u8], case: &str) {
     assert!(
         head.starts_with("HTTP/"),
         "{case}: reply was neither empty nor an HTTP response: {:?}",
-        &head.chars().take(120).collect::<String>()
+        head.chars().take(120).collect::<String>()
     );
 }
 
@@ -503,7 +514,7 @@ fn oversized_headers_are_bounded() {
 
     // One enormous header value.
     let mut req = b"GET /public/open.txt HTTP/1.1\r\nHost: localhost\r\nX-Big: ".to_vec();
-    req.extend(std::iter::repeat(b'A').take(128 * 1024));
+    req.extend(std::iter::repeat_n(b'A', 128 * 1024));
     req.extend_from_slice(b"\r\nConnection: close\r\n\r\n");
     let resp = s.raw(&req);
     assert_concluded(&resp, "oversized single header");
@@ -521,7 +532,7 @@ fn oversized_headers_are_bounded() {
 
     // Enormous request target.
     let mut req = b"GET /public/".to_vec();
-    req.extend(std::iter::repeat(b'a').take(64 * 1024));
+    req.extend(std::iter::repeat_n(b'a', 64 * 1024));
     req.extend_from_slice(b" HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
     let resp = s.raw(&req);
     assert_concluded(&resp, "oversized request target");
@@ -541,9 +552,8 @@ fn hostile_host_headers_do_not_reach_the_response_head() {
         "localhost/../../evil",
         "",
     ] {
-        let req = format!(
-            "GET /public/open.txt HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
-        );
+        let req =
+            format!("GET /public/open.txt HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
         let resp = s.raw(req.as_bytes());
         assert_concluded(&resp, "hostile host");
         assert_no_injected_header(&resp, "x-injected");
@@ -632,7 +642,7 @@ fn malformed_request_lines_are_handled_and_do_not_crash() {
     let cases: [&[u8]; 10] = [
         b"\r\n\r\n",
         b"GET\r\n\r\n",
-        b"GET /public/open.txt\r\n\r\n",                   // no version
+        b"GET /public/open.txt\r\n\r\n", // no version
         b"GET  /public/open.txt  HTTP/1.1\r\nHost: localhost\r\n\r\n", // double spaces
         b"GET /public/open.txt HTTP/9.9\r\nHost: localhost\r\n\r\n",
         b"GET /public/open.txt HTTP/1.1extra\r\nHost: localhost\r\n\r\n",
@@ -678,8 +688,14 @@ fn injection_shaped_queries_are_inert() {
         assert_no_injected_header(&resp, "x-injected");
         // Nothing script-shaped should ever appear in a response HEAD.
         let head = head_of(&resp).to_ascii_lowercase();
-        assert!(!head.contains("<script"), "payload {p} reached the response head:\n{head}");
-        assert!(!head.contains("jndi:"), "payload {p} reached the response head:\n{head}");
+        assert!(
+            !head.contains("<script"),
+            "payload {p} reached the response head:\n{head}"
+        );
+        assert!(
+            !head.contains("jndi:"),
+            "payload {p} reached the response head:\n{head}"
+        );
         s.assert_still_healthy(p);
     }
 }
@@ -751,10 +767,14 @@ fn diagnostic_show_actual_responses() {
         ("bare LF in value (fixed)",
          b"GET /public/open.txt HTTP/1.1\r\nHost: localhost\r\nX-T: a\nX-Injected: yes\r\nConnection: close\r\n\r\n".to_vec()),
     ];
-    println!("\n  {:<26} {:>6}  {}", "case", "bytes", "first line");
+    println!("\n  {:<26} {:>6}  first line", "case", "bytes");
     for (name, req) in cases {
         let resp = s.raw(&req);
-        let first = head_of(&resp).lines().next().unwrap_or("<empty>").to_string();
+        let first = head_of(&resp)
+            .lines()
+            .next()
+            .unwrap_or("<empty>")
+            .to_string();
         println!("  {:<26} {:>6}  {}", name, resp.len(), first);
     }
 }

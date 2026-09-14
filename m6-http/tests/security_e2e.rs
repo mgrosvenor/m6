@@ -31,11 +31,9 @@ use m6_core::testkit::{binary, claim_port, PortClaim, Service};
 
 /// Self-signed TLS cert for 127.0.0.1/localhost.
 fn generate_tls_cert() -> (String, String, Vec<u8>) {
-    let ck = rcgen::generate_simple_self_signed(vec![
-        "localhost".to_string(),
-        "127.0.0.1".to_string(),
-    ])
-    .expect("rcgen");
+    let ck =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+            .expect("rcgen");
     let der = ck.cert.der().to_vec();
     (ck.cert.pem(), ck.key_pair.serialize_pem(), der)
 }
@@ -76,7 +74,9 @@ fn mint_jwt(private_pem: &str, sub: &str, groups: &[&str]) -> String {
 // ── HTTP/1.1 client ───────────────────────────────────────────────────────────
 
 fn tls_client_config(cert_der: &[u8]) -> Arc<rustls::ClientConfig> {
-    rustls::crypto::ring::default_provider().install_default().ok();
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
     let cert = rustls::pki_types::CertificateDer::from(cert_der.to_vec());
     let mut store = rustls::RootCertStore::empty();
     store.add(cert).unwrap();
@@ -174,20 +174,23 @@ fn https_get(
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    let body = if end + 4 <= raw.len() { raw[end + 4..].to_vec() } else { Vec::new() };
-    HttpResponse { status, headers, body }
+    let body = if end + 4 <= raw.len() {
+        raw[end + 4..].to_vec()
+    } else {
+        Vec::new()
+    };
+    HttpResponse {
+        status,
+        headers,
+        body,
+    }
 }
 
 // ── HTTP/3 client ─────────────────────────────────────────────────────────────
 
 fn quic_flush(conn: &mut quiche::Connection, udp: &UdpSocket, out: &mut [u8]) {
-    loop {
-        match conn.send(out) {
-            Ok((n, info)) => {
-                let _ = udp.send_to(&out[..n], info.to);
-            }
-            Err(_) => break,
-        }
+    while let Ok((n, info)) = conn.send(out) {
+        let _ = udp.send_to(&out[..n], info.to);
     }
 }
 
@@ -253,7 +256,10 @@ fn h3_get_many(port: u16, path: &str, count: usize) -> Result<Vec<u16>, String> 
         }
 
         if conn.is_closed() {
-            return Err(format!("connection closed after {} responses", statuses.len()));
+            return Err(format!(
+                "connection closed after {} responses",
+                statuses.len()
+            ));
         }
 
         if conn.is_established() && h3.is_none() {
@@ -358,7 +364,9 @@ impl Server {
         match TcpStream::connect(("127.0.0.1", self.port)) {
             Ok(s) => Some(s),
             Err(_) => {
-                self.http.borrow_mut().assert_alive("the client was connecting");
+                self.http
+                    .borrow_mut()
+                    .assert_alive("the client was connecting");
                 None
             }
         }
@@ -510,7 +518,9 @@ name = "test-node"
 
     let mut http_proc = Service::spawn(
         "m6-http",
-        Command::new(binary("m6-http")).arg(site).arg(site.join("system.toml")),
+        Command::new(binary("m6-http"))
+            .arg(site)
+            .arg(site.join("system.toml")),
     );
     http_proc.wait_for_tcp(port, Duration::from_secs(10));
 
@@ -547,7 +557,8 @@ fn finding_1_e2e_anonymous_client_must_not_read_protected_content_from_cache() {
     // Sanity: without a token the route is properly refused on a cold cache.
     let cold = https_get(&srv, "/private/secret.txt", &[], srv.tls());
     assert_ne!(
-        cold.status, 200,
+        cold.status,
+        200,
         "cold-cache anonymous request should never succeed (got {}), \
          body={:?}",
         cold.status,
@@ -751,7 +762,9 @@ fn hpack_literal(static_index: u8, value: &str) -> Vec<u8> {
 }
 
 fn tls_client_config_h2(cert_der: &[u8]) -> Arc<rustls::ClientConfig> {
-    rustls::crypto::ring::default_provider().install_default().ok();
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
     let cert = rustls::pki_types::CertificateDer::from(cert_der.to_vec());
     let mut store = rustls::RootCertStore::empty();
     store.add(cert).unwrap();
@@ -788,8 +801,7 @@ fn h2_data_frame_at_max_frame_size_must_get_a_response() {
     let tcp = srv.tcp().expect("connect for the max-frame-size test");
     tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     let name = rustls::pki_types::ServerName::try_from("127.0.0.1".to_string()).unwrap();
-    let conn =
-        rustls::ClientConnection::new(tls_client_config_h2(&srv.cert_der), name).unwrap();
+    let conn = rustls::ClientConnection::new(tls_client_config_h2(&srv.cert_der), name).unwrap();
     let mut s = StreamOwned::new(conn, tcp);
 
     let authority = format!("127.0.0.1:{}", srv.port);
@@ -801,9 +813,9 @@ fn h2_data_frame_at_max_frame_size_must_get_a_response() {
 
     let mut out = Vec::new();
     out.extend_from_slice(H2_PREFACE);
-    out.extend(h2_frame(0x04, 0, 0, &[]));                    // SETTINGS
-    out.extend(h2_frame(0x01, 0x04, 1, &block));              // HEADERS, END_HEADERS
-    out.extend(h2_frame(0x00, 0x01, 1, &vec![0u8; 16_384]));  // DATA 2^14, END_STREAM
+    out.extend(h2_frame(0x04, 0, 0, &[])); // SETTINGS
+    out.extend(h2_frame(0x01, 0x04, 1, &block)); // HEADERS, END_HEADERS
+    out.extend(h2_frame(0x00, 0x01, 1, &vec![0u8; 16_384])); // DATA 2^14, END_STREAM
     s.write_all(&out).unwrap();
     s.flush().unwrap();
 
@@ -882,7 +894,11 @@ fn weak_if_none_match_is_304_on_a_cache_miss() {
         &[("If-None-Match", &etag)],
         srv.tls(),
     );
-    assert_eq!(warm.status, 304, "warm key, strong tag\nheaders:\n{}", warm.headers);
+    assert_eq!(
+        warm.status, 304,
+        "warm key, strong tag\nheaders:\n{}",
+        warm.headers
+    );
 
     // Cold key, weak form: this one has to travel to m6-file.
     let weak = format!("W/{etag}");
@@ -898,7 +914,11 @@ fn weak_if_none_match_is_304_on_a_cache_miss() {
          200 here means the backend is doing strong comparison again.\nheaders:\n{}",
         cold.headers
     );
-    assert!(cold.body.is_empty(), "a 304 must carry no body, got {} bytes", cold.body.len());
+    assert!(
+        cold.body.is_empty(),
+        "a 304 must carry no body, got {} bytes",
+        cold.body.len()
+    );
 
     // And the strong form on a different cold key, for symmetry.
     let cold_strong = https_get(
@@ -907,7 +927,11 @@ fn weak_if_none_match_is_304_on_a_cache_miss() {
         &[("If-None-Match", &etag)],
         srv.tls(),
     );
-    assert_eq!(cold_strong.status, 304, "cold key, strong tag\nheaders:\n{}", cold_strong.headers);
+    assert_eq!(
+        cold_strong.status, 304,
+        "cold key, strong tag\nheaders:\n{}",
+        cold_strong.headers
+    );
 }
 
 // ── Finding 2 (e2e): forged proxy-owned headers must not survive ingress ─────

@@ -100,10 +100,18 @@ fi
 # say "pass". A laptop without h2spec still gets the h1 gate, and the run says
 # plainly what it did not do.
 #
-# The pre-prod gate (`deploy/run-tests.sh`, on the Linux build host where both
+# The full checks (`tools/build-host-tests.sh`, on the Linux build host where both
 # testers are installed) runs WITHOUT the flag, so the path to a deploy cannot
 # skip h2 or h3. That split is the whole design: skipping is a laptop
 # convenience and never a way to ship.
+info "Checking formatting..."
+if cargo fmt --all --check >/dev/null 2>&1; then
+  pass "Formatting (cargo fmt)"
+else
+  fail "Formatting: run 'cargo fmt --all'"
+  cargo fmt --all --check 2>&1 | head -20
+fi
+
 info "Running conformance (h1spec / h2spec / h3spec)..."
 if ./tools/conformance.sh --allow-missing-tools 2>&1; then
   pass "Conformance (nothing went backwards)"

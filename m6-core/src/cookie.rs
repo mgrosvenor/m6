@@ -189,7 +189,10 @@ mod tests {
 
         // app.rs, clearing the flash after reading it
         let cleared = Cookie::removal("_flash").path("/").http_only();
-        assert_eq!(cleared.to_header_value(), "_flash=; Max-Age=0; Path=/; HttpOnly");
+        assert_eq!(
+            cleared.to_header_value(),
+            "_flash=; Max-Age=0; Path=/; HttpOnly"
+        );
 
         // app.rs, the CSRF double-submit token. No HttpOnly, deliberately.
         let csrf = Cookie::new("_csrf", "token")
@@ -251,7 +254,10 @@ mod tests {
     /// each other rather than each against its own idea of the format.
     #[test]
     fn what_we_write_is_what_we_read() {
-        let c = Cookie::new("sid", "abc123").max_age(60).path("/").http_only();
+        let c = Cookie::new("sid", "abc123")
+            .max_age(60)
+            .path("/")
+            .http_only();
         let header = c.to_header_value();
         // A browser sends back only `name=value`, so that is what the reader
         // is given here.

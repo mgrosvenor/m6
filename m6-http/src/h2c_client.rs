@@ -144,7 +144,10 @@ impl H2cClientConn {
         original_host: &str,
     ) -> io::Result<mpsc::Receiver<io::Result<HttpResponse>>> {
         if self.is_dead {
-            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "h2c: connection dead"));
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "h2c: connection dead",
+            ));
         }
 
         let stream_id = self.next_stream_id;
@@ -183,14 +186,15 @@ impl H2cClientConn {
             .collect();
 
         // Build HPACK header list
-        let mut hdr_list: Vec<(&[u8], &[u8])> = Vec::new();
-        hdr_list.push((b":method", req.method.as_bytes()));
-        hdr_list.push((b":path", full_path.as_bytes()));
-        hdr_list.push((b":scheme", b"http"));
-        hdr_list.push((b":authority", host.as_bytes()));
-        hdr_list.push((b"x-forwarded-for", client_ip.as_bytes()));
-        hdr_list.push((b"x-forwarded-proto", b"https"));
-        hdr_list.push((b"x-forwarded-host", original_host.as_bytes()));
+        let mut hdr_list: Vec<(&[u8], &[u8])> = vec![
+            (b":method", req.method.as_bytes()),
+            (b":path", full_path.as_bytes()),
+            (b":scheme", b"http"),
+            (b":authority", host.as_bytes()),
+            (b"x-forwarded-for", client_ip.as_bytes()),
+            (b"x-forwarded-proto", b"https"),
+            (b"x-forwarded-host", original_host.as_bytes()),
+        ];
         for (k, v) in &forwarded {
             hdr_list.push((k.as_slice(), v.as_slice()));
         }
@@ -199,8 +203,7 @@ impl H2cClientConn {
 
         // Push HEADERS frame
         let has_body = !req.body.is_empty();
-        let headers_flags =
-            FLAG_END_HEADERS | if has_body { 0 } else { FLAG_END_STREAM };
+        let headers_flags = FLAG_END_HEADERS | if has_body { 0 } else { FLAG_END_STREAM };
         self.push_frame(TYPE_HEADERS, headers_flags, stream_id, &header_block);
 
         let (tx, rx) = mpsc::channel();
@@ -212,7 +215,11 @@ impl H2cClientConn {
                 resp_body: vec![],
                 headers_done: false,
                 tx,
-                pending_body: if has_body { req.body.clone() } else { Vec::new() },
+                pending_body: if has_body {
+                    req.body.clone()
+                } else {
+                    Vec::new()
+                },
                 body_off: 0,
                 send_window: self.peer_initial_window,
             },
@@ -253,7 +260,9 @@ impl H2cClientConn {
         let max_frame = (self.peer_max_frame as usize).max(1);
         loop {
             let (chunk, last) = {
-                let Some(s) = self.streams.get_mut(&stream_id) else { return };
+                let Some(s) = self.streams.get_mut(&stream_id) else {
+                    return;
+                };
                 let remaining = s.pending_body.len() - s.body_off;
                 if remaining == 0 {
                     return;
@@ -398,47 +407,43 @@ impl H2cClientConn {
             }
 
             match ftype {
-                TYPE_SETTINGS => {
-                    if flags & FLAG_ACK == 0 {
-                        // Parse settings pairs (6 bytes each)
-                        let mut pos = 0usize;
-                        while pos + 6 <= payload.len() {
-                            let id = ((payload[pos] as u16) << 8) | (payload[pos + 1] as u16);
-                            let val = ((payload[pos + 2] as u32) << 24)
-                                | ((payload[pos + 3] as u32) << 16)
-                                | ((payload[pos + 4] as u32) << 8)
-                                | (payload[pos + 5] as u32);
-                            match id {
-                                // RFC 9113 6.9.2: a change to INITIAL_WINDOW_SIZE
-                                // applies retroactively to every open stream, by
-                                // the delta. Only new streams used to see it,
-                                // because the value was stored and never read.
-                                4 if val <= i32::MAX as u32 => {
-                                    let delta = val as i32 - self.peer_initial_window;
-                                    self.peer_initial_window = val as i32;
-                                    if delta != 0 {
-                                        for s in self.streams.values_mut() {
-                                            s.send_window = s.send_window.saturating_add(delta);
-                                        }
+                TYPE_SETTINGS if flags & FLAG_ACK == 0 => {
+                    // Parse settings pairs (6 bytes each)
+                    let mut pos = 0usize;
+                    while pos + 6 <= payload.len() {
+                        let id = ((payload[pos] as u16) << 8) | (payload[pos + 1] as u16);
+                        let val = ((payload[pos + 2] as u32) << 24)
+                            | ((payload[pos + 3] as u32) << 16)
+                            | ((payload[pos + 4] as u32) << 8)
+                            | (payload[pos + 5] as u32);
+                        match id {
+                            // RFC 9113 6.9.2: a change to INITIAL_WINDOW_SIZE
+                            // applies retroactively to every open stream, by
+                            // the delta. Only new streams used to see it,
+                            // because the value was stored and never read.
+                            4 if val <= i32::MAX as u32 => {
+                                let delta = val as i32 - self.peer_initial_window;
+                                self.peer_initial_window = val as i32;
+                                if delta != 0 {
+                                    for s in self.streams.values_mut() {
+                                        s.send_window = s.send_window.saturating_add(delta);
                                     }
                                 }
-                                4 => {
-                                    self.mark_dead("h2c: INITIAL_WINDOW_SIZE above 2^31-1");
-                                    return;
-                                }
-                                5 if val >= 16_384 && val <= 16_777_215 => {
-                                    self.peer_max_frame = val
-                                }
-                                _ => {}
                             }
-                            pos += 6;
+                            4 => {
+                                self.mark_dead("h2c: INITIAL_WINDOW_SIZE above 2^31-1");
+                                return;
+                            }
+                            5 if (16_384..=16_777_215).contains(&val) => self.peer_max_frame = val,
+                            _ => {}
                         }
-                        // Send SETTINGS ACK
-                        self.push_frame(TYPE_SETTINGS, FLAG_ACK, 0, &[]);
-                        // A raised window, or a raised max frame size, may have
-                        // unblocked a body that is mid-flight.
-                        self.pump_all();
+                        pos += 6;
                     }
+                    // Send SETTINGS ACK
+                    self.push_frame(TYPE_SETTINGS, FLAG_ACK, 0, &[]);
+                    // A raised window, or a raised max frame size, may have
+                    // unblocked a body that is mid-flight.
+                    self.pump_all();
                 }
 
                 TYPE_HEADERS if stream_id > 0 => {
@@ -589,75 +594,69 @@ impl H2cClientConn {
                     return;
                 }
 
-                TYPE_PING => {
-                    if flags & FLAG_ACK == 0 && payload.len() == 8 {
-                        let ping_payload = payload.clone();
-                        self.push_frame(TYPE_PING, FLAG_ACK, 0, &ping_payload);
-                    }
+                TYPE_PING if flags & FLAG_ACK == 0 && payload.len() == 8 => {
+                    let ping_payload = payload.clone();
+                    self.push_frame(TYPE_PING, FLAG_ACK, 0, &ping_payload);
                 }
 
-                TYPE_WINDOW_UPDATE if stream_id == 0 => {
-                    if payload.len() >= 4 {
-                        // The reserved high bit is ignored (RFC 9113 6.9).
-                        let inc = (((payload[0] as u32) << 24)
-                            | ((payload[1] as u32) << 16)
-                            | ((payload[2] as u32) << 8)
-                            | (payload[3] as u32))
-                            & 0x7FFF_FFFF;
-                        if inc == 0 {
-                            self.mark_dead("h2c: WINDOW_UPDATE increment of 0 on stream 0");
+                TYPE_WINDOW_UPDATE if stream_id == 0 && payload.len() >= 4 => {
+                    // The reserved high bit is ignored (RFC 9113 6.9).
+                    let inc = (((payload[0] as u32) << 24)
+                        | ((payload[1] as u32) << 16)
+                        | ((payload[2] as u32) << 8)
+                        | (payload[3] as u32))
+                        & 0x7FFF_FFFF;
+                    if inc == 0 {
+                        self.mark_dead("h2c: WINDOW_UPDATE increment of 0 on stream 0");
+                        return;
+                    }
+                    // 6.9.1: a window above 2^31-1 is a FLOW_CONTROL_ERROR,
+                    // not a wrap. `+=` on an i32 used to overflow, which
+                    // panics in a debug build.
+                    match self.conn_send_window.checked_add(inc as i32) {
+                        Some(w) => self.conn_send_window = w,
+                        None => {
+                            self.mark_dead("h2c: connection send window above 2^31-1");
                             return;
                         }
-                        // 6.9.1: a window above 2^31-1 is a FLOW_CONTROL_ERROR,
-                        // not a wrap. `+=` on an i32 used to overflow, which
-                        // panics in a debug build.
-                        match self.conn_send_window.checked_add(inc as i32) {
-                            Some(w) => self.conn_send_window = w,
-                            None => {
-                                self.mark_dead("h2c: connection send window above 2^31-1");
-                                return;
-                            }
-                        }
-                        self.pump_all();
                     }
+                    self.pump_all();
                 }
 
                 // Per-stream credit. This arm did not exist: a stream-level
                 // WINDOW_UPDATE fell through to the catch-all and was discarded,
                 // so a peer that granted credit per stream rather than per
                 // connection was never heard.
-                TYPE_WINDOW_UPDATE if stream_id > 0 => {
-                    if payload.len() >= 4 {
-                        let inc = (((payload[0] as u32) << 24)
-                            | ((payload[1] as u32) << 16)
-                            | ((payload[2] as u32) << 8)
-                            | (payload[3] as u32))
-                            & 0x7FFF_FFFF;
-                        if inc == 0 {
-                            // A zero increment is a stream error, not a
-                            // connection one (6.9).
-                            self.push_frame(
-                                TYPE_RST_STREAM,
-                                0,
-                                stream_id,
-                                &1u32.to_be_bytes(), // PROTOCOL_ERROR
-                            );
-                            self.streams.remove(&stream_id);
-                        } else if let Some(s) = self.streams.get_mut(&stream_id) {
-                            match s.send_window.checked_add(inc as i32) {
-                                Some(w) => {
-                                    s.send_window = w;
-                                    self.pump_stream(stream_id);
-                                }
-                                None => {
-                                    self.push_frame(
-                                        TYPE_RST_STREAM,
-                                        0,
-                                        stream_id,
-                                        &3u32.to_be_bytes(), // FLOW_CONTROL_ERROR
-                                    );
-                                    self.streams.remove(&stream_id);
-                                }
+                TYPE_WINDOW_UPDATE if stream_id > 0 && payload.len() >= 4 => {
+                    let inc = (((payload[0] as u32) << 24)
+                        | ((payload[1] as u32) << 16)
+                        | ((payload[2] as u32) << 8)
+                        | (payload[3] as u32))
+                        & 0x7FFF_FFFF;
+                    if inc == 0 {
+                        // A zero increment is a stream error, not a
+                        // connection one (6.9).
+                        self.push_frame(
+                            TYPE_RST_STREAM,
+                            0,
+                            stream_id,
+                            &1u32.to_be_bytes(), // PROTOCOL_ERROR
+                        );
+                        self.streams.remove(&stream_id);
+                    } else if let Some(s) = self.streams.get_mut(&stream_id) {
+                        match s.send_window.checked_add(inc as i32) {
+                            Some(w) => {
+                                s.send_window = w;
+                                self.pump_stream(stream_id);
+                            }
+                            None => {
+                                self.push_frame(
+                                    TYPE_RST_STREAM,
+                                    0,
+                                    stream_id,
+                                    &3u32.to_be_bytes(), // FLOW_CONTROL_ERROR
+                                );
+                                self.streams.remove(&stream_id);
                             }
                         }
                     }
@@ -744,6 +743,12 @@ pub struct H2cClientPool {
     connections: HashMap<String, H2cClientConn>,
 }
 
+impl Default for H2cClientPool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl H2cClientPool {
     pub fn new() -> Self {
         Self {
@@ -815,15 +820,14 @@ fn parse_h2c_host_port(base_url: &str) -> io::Result<(String, u16)> {
     // IPv6: [::1]:port or [::1]
     if let Some(bracket_end) = authority.find(']') {
         let host = authority[1..bracket_end].to_string();
-        let port = if bracket_end + 1 < authority.len()
-            && authority.as_bytes()[bracket_end + 1] == b':'
-        {
-            authority[bracket_end + 2..].parse::<u16>().map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "invalid port in h2c URL")
-            })?
-        } else {
-            80
-        };
+        let port =
+            if bracket_end + 1 < authority.len() && authority.as_bytes()[bracket_end + 1] == b':' {
+                authority[bracket_end + 2..].parse::<u16>().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "invalid port in h2c URL")
+                })?
+            } else {
+                80
+            };
         return Ok((host, port));
     }
 

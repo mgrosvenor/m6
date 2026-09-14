@@ -102,9 +102,8 @@ fn get_request(path: &str, headers: Vec<(String, String)>) -> HttpRequest {
 #[test]
 fn finding_2_forged_x_auth_claims_must_not_survive_ingress() {
     let forged = b64(r#"{"sub":"admin","groups":["admins"],"roles":["admin"]}"#);
-    let raw = format!(
-        "GET /admin HTTP/1.1\r\nHost: example.com\r\nX-Auth-Claims: {forged}\r\n\r\n"
-    );
+    let raw =
+        format!("GET /admin HTTP/1.1\r\nHost: example.com\r\nX-Auth-Claims: {forged}\r\n\r\n");
 
     // Parse, then strip: the two calls m6-http's ingress makes.
     //
@@ -142,10 +141,10 @@ fn finding_2b_all_proxy_owned_headers_stripped_at_ingress() {
     let raw = "GET /public HTTP/1.1\r\n\
                Host: example.com\r\n\
                X-Auth-Claims: forged\r\n\
-               X-Forwarded-For: 10.0.0.99\r\n\
+               X-Forwarded-For: 192.0.2.99\r\n\
                X-Forwarded-Proto: http\r\n\
                X-Forwarded-Host: evil.com\r\n\
-               X-Real-IP: 10.0.0.99\r\n\
+               X-Real-IP: 192.0.2.99\r\n\
                User-Agent: probe\r\n\r\n";
 
     // Parse, then strip: see the note on the test above. The end-to-end guard
@@ -158,7 +157,9 @@ fn finding_2b_all_proxy_owned_headers_stripped_at_ingress() {
 
     for banned in forward::UNTRUSTED_INBOUND {
         assert!(
-            !req.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(banned)),
+            !req.headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case(banned)),
             "`{banned}` survived ingress: {:?}",
             req.headers
         );
@@ -212,10 +213,7 @@ fn finding_5_distinct_query_strings_must_not_share_a_cache_entry() {
         CacheKey::new("/search", Some("q=attacker"), ""),
         CachedResponse {
             status: 200,
-            headers: std::sync::Arc::new(vec![(
-                "cache-control".to_string(),
-                "public".to_string(),
-            )]),
+            headers: std::sync::Arc::new(vec![("cache-control".to_string(), "public".to_string())]),
             body: bytes::Bytes::from_static(b"ATTACKER CONTROLLED"),
             hints: std::sync::Arc::new(vec![]),
         },
@@ -264,7 +262,7 @@ fn finding_5b_responses_that_vary_per_user_must_not_be_cached() {
 fn finding_6_forged_x_forwarded_for_must_not_reach_backend() {
     let req = get_request(
         "/auth/login",
-        vec![("X-Forwarded-For".to_string(), "10.0.0.99".to_string())],
+        vec![("X-Forwarded-For".to_string(), "192.0.2.99".to_string())],
     );
 
     let raw = forward_and_capture(&req, "203.0.113.9");
@@ -337,7 +335,10 @@ fn finding_7b_ambiguous_framing_must_be_rejected_at_ingress() {
 
     for (label, raw) in ambiguous {
         assert!(
-            matches!(http11::parse_request(raw.as_bytes()), http11::ParseResult::Error),
+            matches!(
+                http11::parse_request(raw.as_bytes()),
+                http11::ParseResult::Error
+            ),
             "{label}: should be rejected, but parsed"
         );
     }
@@ -361,14 +362,22 @@ fn finding_7d_a_decoded_chunked_body_leaves_no_framing_ambiguity() {
 
     assert_eq!(req.body, b"hello world");
 
-    let cl: Vec<_> = req.headers.iter()
+    let cl: Vec<_> = req
+        .headers
+        .iter()
         .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
         .map(|(_, v)| v.as_str())
         .collect();
-    assert_eq!(cl, ["11"], "the decoded body must be framed by one Content-Length");
+    assert_eq!(
+        cl,
+        ["11"],
+        "the decoded body must be framed by one Content-Length"
+    );
 
     assert!(
-        !req.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("transfer-encoding")),
+        !req.headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("transfer-encoding")),
         "the transfer-coding is hop-by-hop and ends here; forwarding it alongside \
          the Content-Length above would recreate the ambiguity this guards"
     );

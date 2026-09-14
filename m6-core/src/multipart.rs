@@ -1,6 +1,11 @@
-/// Multipart file upload support (feature = "multipart").
-///
-/// Uses the `multer` crate to parse `multipart/form-data` bodies.
+//! `multipart/form-data` parsing, behind the `multipart` feature.
+//!
+//! Only reached for a content type that says multipart. Note that core's
+//! ordinary form handling decodes `application/x-www-form-urlencoded` only,
+//! and warns loudly when a POST carries a body it did not decode: a client
+//! that switched to multipart once produced empty fields everywhere, which
+//! looked downstream like a failed CAPTCHA and left nothing in any log to say
+//! the body had been skipped.
 
 /// A single uploaded file.
 #[derive(Debug, Clone)]
@@ -30,9 +35,10 @@ pub fn parse_upload(
 
     rt.block_on(async {
         let body_bytes = bytes::Bytes::copy_from_slice(body);
-        let stream = futures_util::stream::once(async move {
-            Ok::<_, std::convert::Infallible>(body_bytes)
-        });
+        let stream =
+            futures_util::stream::once(
+                async move { Ok::<_, std::convert::Infallible>(body_bytes) },
+            );
         let mut multipart = multer::Multipart::new(stream, boundary);
 
         while let Some(field) = multipart
@@ -44,10 +50,7 @@ pub fn parse_upload(
             if name != field_name {
                 continue;
             }
-            let filename = field
-                .file_name()
-                .unwrap_or("upload")
-                .to_string();
+            let filename = field.file_name().unwrap_or("upload").to_string();
             let content_type = field
                 .content_type()
                 .map(|m| m.to_string())
@@ -58,7 +61,11 @@ pub fn parse_upload(
                 .map_err(|e| crate::error::Error::BadRequest(format!("reading field: {e}")))?
                 .to_vec();
 
-            return Ok(Upload { filename, content_type, data });
+            return Ok(Upload {
+                filename,
+                content_type,
+                data,
+            });
         }
 
         Err(crate::error::Error::BadRequest(format!(

@@ -24,8 +24,8 @@ mod rate_limit;
 
 use std::sync::{Arc, Mutex, RwLock};
 
-use m6_core::prelude::*;
 use m6_core::http::RawResponse;
+use m6_core::prelude::*;
 
 use config::AuthConfig;
 use handlers::AppState;
@@ -40,9 +40,12 @@ fn build_state(ctx: &AppContext) -> Result<AppState> {
     let cfg = AuthConfig::load(ctx.site_dir, ctx.config_path)
         .map_err(|e| Error::Other(e.context("loading auth config")))?;
 
-    let key_material =
-        KeyMaterial::load(&cfg.private_key_path, &cfg.public_key_path, cfg.issuer.clone())
-            .map_err(|e| Error::Other(e.context("loading key material")))?;
+    let key_material = KeyMaterial::load(
+        &cfg.private_key_path,
+        &cfg.public_key_path,
+        cfg.issuer.clone(),
+    )
+    .map_err(|e| Error::Other(e.context("loading key material")))?;
 
     if let Some(parent) = cfg.db_path.parent() {
         std::fs::create_dir_all(parent)
@@ -68,7 +71,10 @@ fn build_state(ctx: &AppContext) -> Result<AppState> {
         access_ttl: cfg.access_ttl,
         refresh_ttl: cfg.refresh_ttl,
         issuer: cfg.issuer.clone(),
-        rate_limiter: Mutex::new(RateLimiter::new()),
+        rate_limiter: Mutex::new(RateLimiter::with_limits(
+            cfg.rate_limit_max_attempts,
+            cfg.rate_limit_window_secs,
+        )),
     })
 }
 

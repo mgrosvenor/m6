@@ -1,0 +1,24 @@
+[package]
+name         = "m6-example-rust-plain"
+description  = "m6 backend example: Rust with no m6-core, the honest control for the core-overhead measurement"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+publish      = false
+
+# NO DEPENDENCIES, deliberately. This is the control in the measurement that
+# says what m6-core costs, so anything linked here that its pair does not link
+# would show up in the delta and be read as core's overhead.
+#
+# It also answers a question about the platform: if writing a backend in plain
+# Rust against docs/m6-backend-protocol.md is much harder than the Go example,
+# the contract has drifted toward Rust and the problem is the platform rather
+# than the example.
+[dependencies]
+
+[[bin]]
+name = "m6-example-rust-plain"
+path = "src/main.rs"

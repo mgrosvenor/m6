@@ -51,7 +51,7 @@ Each `[[backend]]` with `sockets` is a pool. m6-http discovers pool members by w
 
 **URL backends** (`http://`, `https://`) are not pooled — one HTTP/1.1 connection per request, run on a dedicated I/O thread.
 
-**H2C backends** use the `h2c://` scheme (e.g. `url = "h2c://10.0.0.2:8080"`). The connection is maintained persistently by an event-loop-driven `H2cClientPool` — no thread is spawned. Intended for inter-node requests over WireGuard tunnels, where TLS at the application layer is redundant.
+**H2C backends** use the `h2c://` scheme (e.g. `url = "h2c://192.0.2.2:8080"`). The connection is maintained persistently by an event-loop-driven `H2cClientPool` — no thread is spawned. Intended for inter-node requests over WireGuard tunnels, where TLS at the application layer is redundant.
 
 **H2S backends** use the `h2s://` scheme (e.g. `url = "h2s://api.example.com:443"`). Like H2C but over TLS — ALPN negotiates `h2` during the handshake; startup fails if the server does not support it. The connection is maintained persistently by an event-loop-driven `H2sTlsClientPool`. Intended for HTTP/2 forwarding to external TLS-terminating upstreams.
 
@@ -207,7 +207,7 @@ The H2C listener accepts plain TCP connections and speaks HTTP/2 framing directl
 ```toml
 [[backend]]
 name = "global"
-url  = "h2c://10.0.0.2:8080"
+url  = "h2c://192.0.2.2:8080"
 ```
 
 Outbound H2C connections are maintained persistently by `H2cClientPool`, driven by the event loop — no thread is spawned per request. Multiple requests to the same upstream are multiplexed over the single persistent H2 connection.
