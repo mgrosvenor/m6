@@ -9,14 +9,19 @@ by anyone remembering them.
 
 | branch | what it is |
 |---|---|
-| `main` | Releases only. What the world sees on GitHub. It advances **only** by a merge from `develop`, made by `tools/release.sh`, with a CHANGELOG entry and a tag. |
-| `develop` | Where work is integrated. Everything branches from here and merges back here. |
+| `main` | Releases only. What the world sees on GitHub. It advances **only** by a pull request from `develop`, with a CHANGELOG entry, then a tag. |
+| `develop` | Where work is integrated. Everything branches from here and comes back **by pull request**. |
 | `<type>/<issue>-<slug>` | One branch per issue. Created by `tools/branch.sh`. |
+
+**A pull request is the only way into `develop`, and the only way from `develop`
+to `main`.** Owner's decision, 2026-09-14. `tools/merge.sh` and
+`tools/release.sh` merged locally and are deleted.
 
 Types: `feat` `fix` `perf` `docs` `refactor` `test` `chore`.
 
-**Nothing is pushed to `main` by hand.** The pre-push hook refuses it unless
-`tools/release.sh` is doing it.
+**Nothing is pushed to `main` by hand.** The pre-push hook refuses any direct
+push to it. `main` moves only when a pull request is merged on GitHub; the tag
+that follows is pushed by `./tag.sh`, which sets the one variable the hook accepts.
 
 > **Note on the transition, 2026-09-13.** `main` currently holds ~120 commits
 > that have never been deployed, because this model was adopted mid-project.
@@ -29,16 +34,26 @@ Types: `feat` `fix` `perf` `docs` `refactor` `test` `chore`.
 ```sh
 ./tools/branch.sh 42 h3-gate-measures-nothing --type fix   # from develop
 # ... work, commit ...
-git push origin fix/42-h3-gate-measures-nothing            # runs the local checks
-./tools/merge.sh fix/42-h3-gate-measures-nothing           # full checks, then merge
-git push origin develop
+git push origin fix/42-h3-gate-measures-nothing
+gh pr create --base develop --fill                         # CI runs the full set
+# review, then merge on GitHub
 ```
 
 and when it is time to ship:
 
 ```sh
-# write the CHANGELOG entry first
-./tools/release.sh 0.3.0
+# bump the version in Cargo.toml and write the CHANGELOG entry first
+gh pr create --base main --head develop --title "Release 1.1.0"
+# CI additionally checks the changelog entry and that the version is untagged
+# merge on GitHub, then:
+git checkout main && git pull && ./tag.sh v1.1.0
+```
+
+The build host is still worth running by hand before opening a pull request, because
+it tests more than a runner can:
+
+```sh
+M6_BUILD_HOST=root@<box> ./tools/build-host-tests.sh
 ```
 
 ---
@@ -58,10 +73,10 @@ and when it is time to ship:
 | the examples build | zero warnings, clippy silent, their tests pass, every config parses | the `m6-examples` repository |
 | the examples work | example 05's end-to-end suite over the whole running stack | `examples/05-cms/test.sh` |
 
-`tools/merge.sh` runs all of it through `tools/build-host-tests.sh` on the build
-host, and records what it ran in the merge commit. **The pre-push hook refuses
-a merge commit on `develop` that carries no such record**, so this is not a
-convention that can be quietly skipped.
+**CI runs all of it on the pull request.** `tools/build-host-tests.sh` runs the
+same ground plus the two things a shared runner cannot do: the performance check,
+which needs a quiet machine, and conformance against a real h2spec/h3spec install.
+Run it before opening the pull request when the change could touch either.
 
 **The examples are not a courtesy.** `m6-examples` is the only code in the
 checks that uses m6's interfaces, and until 2026-09-14 nothing built it: it had
