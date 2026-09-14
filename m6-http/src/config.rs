@@ -976,6 +976,75 @@ mod tests {
         std::fs::write(dir.join(name), content).unwrap();
     }
 
+    /// `[[backend]] compresses` and what the edge does with it.
+    ///
+    /// Issue #8: the proxy is a cache, not a transformer, so it must not promise
+    /// encodings a backend cannot produce. Every test written for that issue was
+    /// in m6-core, on the backend's side of the contract; the edge's own reading
+    /// of the flag had none, which is the half a visitor sees.
+    ///
+    /// Through the real `load`, so the key's parsing and its default are covered
+    /// too rather than a hand-built struct that cannot drift from the TOML.
+    #[test]
+    fn compresses_is_read_from_the_config_and_defaults_to_true() {
+        let dir = make_test_dir();
+        write_file(
+            dir.path(),
+            "site.toml",
+            r#"
+[site]
+name   = "Test"
+domain = "test.example.com"
+
+[server]
+bind     = "127.0.0.1:8443"
+tls_cert = "cert.pem"
+tls_key  = "key.pem"
+
+[[backend]]
+name    = "says-yes"
+sockets = "/run/m6/a-*.sock"
+compresses = true
+
+[[backend]]
+name    = "says-no"
+sockets = "/run/m6/b-*.sock"
+compresses = false
+
+# No `compresses` key at all: the default has to be true, because a missing
+# Vary is a correctness bug and a redundant one only costs cache efficiency.
+[[backend]]
+name    = "says-nothing"
+sockets = "/run/m6/c-*.sock"
+
+[[route]]
+path    = "/"
+backend = "says-yes"
+"#,
+        );
+        write_file(dir.path(), "cert.pem", "");
+        write_file(dir.path(), "key.pem", "");
+        write_file(
+            dir.path(),
+            "system.toml",
+            "[server]\nbind = \"127.0.0.1:8443\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n",
+        );
+
+        let cfg = load(dir.path(), &dir.path().join("system.toml")).expect("load");
+
+        assert!(cfg.backend_compresses("says-yes"));
+        assert!(!cfg.backend_compresses("says-no"));
+        assert!(
+            cfg.backend_compresses("says-nothing"),
+            "a backend that does not mention `compresses` must be assumed to compress"
+        );
+        assert!(
+            cfg.backend_compresses("never-configured"),
+            "an unknown backend name must be assumed to compress: a missing Vary is a \
+             correctness bug, a redundant one only costs cache efficiency"
+        );
+    }
+
     fn minimal_site_toml() -> String {
         r#"
 [site]
