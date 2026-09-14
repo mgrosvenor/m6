@@ -350,12 +350,55 @@ impl Request {
     }
 
     /// Touch a file (update mtime), creating it if it doesn't exist.
+    /// Update a file's timestamps so a watching service reloads it.
+    ///
+    /// The documented way for a renderer to invalidate the edge after writing
+    /// new content: write the file, then `touch("site.toml")`. See
+    /// `docs/m6-site-toml.md`.
+    ///
+    /// ## Why it opens the file as well as setting the times
+    ///
+    /// This used to be `filetime::set_file_times` alone, which is
+    /// `utimensat(2)` against the path with no open. **On Linux that produced no
+    /// reload at all**, so the mechanism this function exists to provide had
+    /// never worked on the platform that serves production.
+    ///
+    /// `utimensat` reports `IN_ATTRIB` and nothing else. m6-core's watcher asked
+    /// inotify for `IN_CLOSE_WRITE | IN_CREATE | IN_MOVED_TO`, so the event was
+    /// read and discarded, and the mtime fallback that would have caught it runs
+    /// only when there is no watcher fd at all -- which on Linux there always is.
+    ///
+    /// macOS was fine, because kqueue registers the files themselves and reports
+    /// the attribute change. So the CMS example published a post, rebuilt its
+    /// index, reported success, and the post did not appear -- on Linux only,
+    /// which is why it survived: it works on the machine it was written on.
+    ///
+    /// Found by m6's own checks once they started running the examples on Linux,
+    /// and it had been broken since the watcher was rewritten.
+    ///
+    /// The watcher now also accepts `IN_ATTRIB`, so either fix alone is enough.
+    /// Both are here on purpose: the flag makes any external tool's `touch` work,
+    /// and the open makes this function work against a watcher that does not have
+    /// the flag. Opening for write and closing is what `m6-md --touch` has always
+    /// done, which is why blog publishing worked while this did not.
+    ///
+    /// The timestamps are still set, because they are what the mtime-polling
+    /// fallback compares and what `Last-Modified` is derived from. Opening a file
+    /// for writing without writing to it does not move its mtime.
     pub fn touch(&self, rel: &str) -> Result<()> {
         let path = self.validated_path(rel)?;
         if path.exists() {
             let now = filetime::FileTime::now();
             filetime::set_file_times(&path, now, now)
                 .with_context(|| format!("touching {}", path.display()))
+                .map_err(Error::Other)?;
+            // Dropped immediately: the close is what produces IN_CLOSE_WRITE.
+            // `truncate(false)`, so the file's contents are untouched.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(false)
+                .open(&path)
+                .with_context(|| format!("opening {} to signal a change", path.display()))
                 .map_err(Error::Other)?;
         } else {
             std::fs::File::create(&path)
