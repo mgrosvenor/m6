@@ -76,6 +76,16 @@ pub struct NodeDigest {
     pub hit_rate: Option<f64>,
     pub hit_p50_ns: Option<u64>,
     pub hit_p99_ns: Option<u64>,
+    /// How many samples the percentiles above were taken over.
+    ///
+    /// Carried because `hit_p50_ns` cannot be read without it. The number is
+    /// **load-dependent** -- `docs/PERFORMANCE.md` §4: the same binary on the
+    /// same node reads 3,900ns over a window of 50-70 hits and 1,064ns over
+    /// ~1,200, because the cache-hit path goes cold between requests on a
+    /// near-idle VM. A percentile with no count beside it looks like a
+    /// regression whenever traffic is quiet, and a p50 over one sample reads
+    /// exactly like a p50 over a thousand.
+    pub hit_samples: Option<usize>,
     pub backend_errors: Option<u64>,
     pub pools: Vec<(String, usize, usize)>,
     pub load_one: Option<f64>,
@@ -110,6 +120,7 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
             hit_rate: None,
             hit_p50_ns: None,
             hit_p99_ns: None,
+            hit_samples: None,
             backend_errors: None,
             pools: Vec::new(),
             load_one: None,
@@ -153,9 +164,22 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
             if hits + misses > 0 {
                 d.hit_rate = Some(hits as f64 / (hits + misses) as f64);
             }
-            // Zero means "no sample in this window", not "zero nanoseconds".
-            d.hit_p50_ns = (p.metrics.hit_p50_ns > 0).then_some(p.metrics.hit_p50_ns);
-            d.hit_p99_ns = (p.metrics.hit_p99_ns > 0).then_some(p.metrics.hit_p99_ns);
+            // Keyed off the SAMPLE COUNT, not off the percentile being non-zero.
+            //
+            // Both express "not measured" rather than "zero nanoseconds", and
+            // this reading was correct even when it was reporting nothing: until
+            // 2026-09-15 m6-http's `/perf` cleared the reservoir these come from
+            // every ten seconds, so a node taking a couple of requests a minute
+            // served `hit_samples: 0` almost every scrape and the whole fleet
+            // digest carried `null` latency. The monitor was honest and the
+            // endpoint was not. Fixed in m6-http's `stats.rs`.
+            //
+            // The count is the authoritative signal, so use it directly: a
+            // percentile is absent exactly when nothing was sampled.
+            let sampled = p.metrics.hit_samples > 0;
+            d.hit_samples = Some(p.metrics.hit_samples);
+            d.hit_p50_ns = sampled.then_some(p.metrics.hit_p50_ns);
+            d.hit_p99_ns = sampled.then_some(p.metrics.hit_p99_ns);
             d.pools = p
                 .pools
                 .iter()

@@ -46,6 +46,53 @@ change is a TLS library: TLS 1.3 negotiating `AEAD-CHACHA20-POLY1305-SHA256`
 with verify 0, TLS 1.2 negotiating `ECDHE-RSA-CHACHA20-POLY1305`, ALPN h2 and
 h1 both answering 200.
 
+### Fixed
+
+**`/perf` reported no latency at all, on every node, and never had.**
+
+`m6-http`'s aggregate latency reservoirs were cleared by `maybe_emit` every ten
+seconds, and `Stats::snapshot()` -- which is what `/perf` serves -- read those
+same fields. So `/perf` returned the percentiles of whatever fraction of a
+ten-second window happened to be open when it was scraped, and a node taking a
+couple of requests a minute has almost no cache hits in any given ten seconds.
+
+Observed on a production origin with ten hours of uptime: `cache_hits_total: 338`
+beside `hit_samples: 0, hit_p50_ns: 0, hit_p99_ns: 0`. m6-monitor correctly reads
+zero samples as "not measured" and publishes `null`, so the fleet digest carried
+**no latency for any node**, while the `periodic stats` log line was printing
+`hit_p50_ns=3878` for the same counter in the same minute.
+
+The per-channel reservoirs were never cleared and held real data throughout,
+which is why this survived: anyone scrolling past the aggregate in `/perf` saw
+plausible per-channel numbers. The aggregate is the only figure m6-monitor reads.
+
+The reservoirs now run as rings and are never cleared. New `*_window_added`
+counters give the periodic log its own ten-second window, so the operational
+logging is unchanged -- which is the property `snapshot()`'s comment was
+protecting when it declined to reset. Declining to reset was right; also reading
+the window the emitter reset was the defect. One reservoir, no extra memory, no
+extra work on the request path.
+
+`percentiles_ring` replaces `percentiles`: it reads the newest *n* entries rather
+than `samples[..n]` from the front, which was correct only while the index was
+reset every window. Against a ring that genuinely wraps, reading from the front
+reports the **oldest** samples as current, so the two changes had to land
+together.
+
+`snapshot()`'s percentiles now span the most recent up to 4096 samples, **a count
+rather than a period of time**. On a quiet node that reaches back hours and
+blends idle and busy traffic, which matters because this number is load dependent
+(`docs/PERFORMANCE.md` §4). `hit_samples` and `miss_samples` are therefore
+reported beside the percentiles in the periodic log as well, and m6-monitor's
+digest carries `hit_samples` per node so the figure can be read at all.
+
+Verified: six tests in `stats::perf_reservoir_tests`, three of which fail against
+the old reset, checked by reinstating it. End to end against a running 05-cms
+stack, scraped across two emit boundaries with silence between them: 81 samples,
+p50 2,250ns, p99 5,625ns, stable across all three scrapes, where the old code
+returned zeros. The periodic log still reports per-window figures: 39 hits at
+p50 2,208ns in the busy window, zeros in the idle ones either side.
+
 ---
 
 ## 1.0.0 — 2026-09-14
