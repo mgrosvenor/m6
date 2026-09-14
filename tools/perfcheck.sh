@@ -41,11 +41,22 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 BASELINE="$HERE/perf-baseline.txt"
 WORK="${PERFCHECK_WORK:-/tmp/m6-perfcheck}"
-# The deployment repository, discovered rather than named: m6 is generic and does
-# not know whose site this is. PERFCHECK_SITE still wins if set.
-# shellcheck source=tools/find-deployment.sh
-. "$HERE/find-deployment.sh"
-SITE="${PERFCHECK_SITE:-$(_m6_find_deployment "$ROOT" || true)}"
+
+# ── What is measured, and where it comes from ─────────────────────────────────
+#
+# The examples repository, checked out beside this one. It used to be a
+# deployment's `deploy/rendered/prod/configs/m6-html.conf`, which meant m6 could
+# not measure itself: a bare checkout with no site beside it failed the check
+# rather than running it, and the recorded number belonged to one particular
+# site's content.
+#
+# The examples are m6's own, they are version-controlled with it in mind, and
+# their content is committed, so the same bytes are rendered on every machine
+# and the number means the same thing twice. PERFCHECK_EXAMPLES overrides the
+# location; PERFCHECK_SITE still points the whole check at a deployment instead,
+# for a deployment that wants to measure its own content.
+EXAMPLES="${PERFCHECK_EXAMPLES:-$(cd "$ROOT/.." 2>/dev/null && pwd)/m6-examples}"
+SITE="${PERFCHECK_SITE:-}"
 UPDATE=false
 MARGIN=20
 
@@ -104,22 +115,41 @@ compare() {  # compare <key> <measured-ns>
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
-# ── Target: a rendered HTML page, end to end over the socket ──────────────────
+# ── Targets: a rendered HTML page, end to end over the socket ─────────────────
 #
-# The one number that covers the most code: routing, the request dictionary,
-# the template engine, compression and the response writer. It is also where
-# the copy work landed, so it is the number that would have caught it.
-measure_render() {
-  local conf="$SITE/deploy/rendered/prod/configs/m6-html.conf"
+# The one kind of number that covers the most code: routing, the request
+# dictionary, the template engine, compression and the response writer. It is
+# also where the copy work landed, so it is the number that would have caught it.
+#
+# Two of them, because a page has two costs and one target cannot separate them:
+#
+#   render:minimal     example 01, `/`. A 10-line template over 185 bytes of
+#                      params. Almost no content, which is the point: what is
+#                      left is the FIXED per-request cost, undiluted. The defect
+#                      this file exists for was exactly that shape -- `App` spent
+#                      0.63 ms per page copying its own config, regardless of how
+#                      big the page was -- and it shows up most clearly here.
+#
+#   render:blog-index  example 05, `/blog`. The post index rendered from 113 KB
+#                      of committed posts.json, iterating every post. This is the
+#                      per-item cost, which a minimal page cannot see at all.
+#
+# A regression in one and not the other says where to look, which one number
+# never did.
+measure_one() {
+  local key="$1" site="$2" conf="$3" path="$4"
+
   if [[ ! -f "$conf" ]]; then
-    fail "render:capabilities — no site at $SITE, so nothing was measured."
-    info "  set PERFCHECK_SITE, or check out the site repo beside this one."
+    fail "$key — no config at $conf, so nothing was measured."
+    info "  The examples are expected beside this checkout:"
+    info "    git clone https://github.com/mgrosvenor/m6-examples"
+    info "  Or set PERFCHECK_EXAMPLES, or PERFCHECK_SITE for a deployment."
     RESULT=1
     return 1
   fi
   local bin="$ROOT/target/release/m6-html"
   if [[ ! -x "$bin" ]]; then
-    fail "render:capabilities — $bin is missing. Build release first."
+    fail "$key — $bin is missing. Build release first."
     RESULT=1
     return 1
   fi
@@ -130,20 +160,20 @@ measure_render() {
   # what the code costs, not what the box was busy with.
   for _ in 1 2 3 4 5; do
     rm -f "$sock"
-    M6_SOCKET_OVERRIDE="$sock" "$bin" "$SITE" "$conf" --log-level error \
+    M6_SOCKET_OVERRIDE="$sock" "$bin" "$site" "$conf" --log-level error \
       > "$WORK/render.log" 2>&1 &
     local pid=$!
     PIDS+=("$pid")
     local i
     for i in $(seq 1 100); do [[ -S "$sock" ]] && break; sleep 0.05; done
     if [[ ! -S "$sock" ]]; then
-      fail "render:capabilities — m6-html never bound $sock. See $WORK/render.log"
+      fail "$key — m6-html never bound $sock. See $WORK/render.log"
       RESULT=1
       kill "$pid" 2>/dev/null
       return 1
     fi
     local got
-    got="$(python3 "$HERE/perfcheck_client.py" "$sock" /capabilities 200 2>/dev/null)"
+    got="$(python3 "$HERE/perfcheck_client.py" "$sock" "$path" 200 2>/dev/null)"
     kill "$pid" 2>/dev/null
     wait "$pid" 2>/dev/null
     if [[ -n "$got" ]]; then
@@ -152,22 +182,25 @@ measure_render() {
   done
 
   if [[ -z "$best" ]]; then
-    fail "render:capabilities — measured nothing. A check that cannot measure must fail."
+    fail "$key — measured nothing. A check that cannot measure must fail."
     RESULT=1
     return 1
   fi
-  compare "render:capabilities" "$best"
+  compare "$key" "$best"
 }
 
-# WANTED, NOT PRESENT: a second target covering m6-http's own request path.
-# The obvious one is the cache lookup, and a first attempt at it parsed
-# criterion's output and could not, so it printed "skipping" and returned
-# success. That is precisely the failure just removed from the conformance
-# check, and shipping it here would have been the same mistake in a new file.
-# One target that always runs beats two where one quietly does not.
-
 info "Performance check (margin ${MARGIN}%)"
-measure_render
+
+if [[ -n "$SITE" ]]; then
+  # A deployment measuring its own content. Its layout, its target name.
+  measure_one "render:capabilities" "$SITE" \
+    "$SITE/deploy/rendered/prod/configs/m6-html.conf" /capabilities
+else
+  measure_one "render:minimal" "$EXAMPLES/examples/01-static" \
+    "$EXAMPLES/examples/01-static/configs/m6-html.conf" /
+  measure_one "render:blog-index" "$EXAMPLES/examples/05-cms" \
+    "$EXAMPLES/examples/05-cms/configs/m6-html.conf" /blog
+fi
 
 if [[ "$UPDATE" == "true" ]]; then
   cp "$BASELINE" "$BASELINE.new" 2>/dev/null || : > "$BASELINE.new"
