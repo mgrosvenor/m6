@@ -123,6 +123,17 @@ This is the half that mattered most, because most of it had never run.
   written from that advice served uncompressed bytes forever.
   `[[backend]] compresses` is now read by both sides, and a backend refuses to
   start if it disagrees with what it can actually do.
+- **`touch site.toml` never reloaded anything on Linux.** m6-core's
+  `Request::touch` is the documented way for a renderer to invalidate the edge
+  after writing content, and it used `utimensat(2)`, which reports `IN_ATTRIB`.
+  The inotify mask asked for `IN_CLOSE_WRITE | IN_CREATE | IN_MOVED_TO`, so the
+  event was read and discarded, and the mtime fallback runs only when there is no
+  watcher fd. macOS was fine, because kqueue reports the attribute change, so the
+  defect was invisible where the code was written and live where it runs. Blog
+  publishing was spared only because `m6-md --touch` has its own implementation
+  that opens the file. The watcher now accepts `IN_ATTRIB` and `Request::touch`
+  opens and closes the file as well; either alone is sufficient. Found within the
+  hour after the checks started building the examples on Linux.
 - **A backend's error headers survive the error page.** m6-http replaces a
   backend's 4xx or 5xx with its own page and threw the backend's whole header
   block away with it. So a throttled login reached the client as a generic "An
