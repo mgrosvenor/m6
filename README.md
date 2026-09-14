@@ -85,12 +85,12 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md).
 ```
                          ┌──────────────────────────────────────────────┐
   Browser / API client   │                  m6-http                     │
-─────────────────────►   │  - TLS termination (HTTP/3 + HTTP/2 + H1.1) │
+─────────────────────►   │  - TLS termination (HTTP/3 + HTTP/2 + H1.1)  │
   HTTPS (any port)       │  - Routing (site.toml)                       │
                          │  - Response cache (path × encoding)          │
-                         │  - JWT auth enforcement (local verify)        │
-                         │  - Backend pool management (least-conn)       │
-                         │  - Hot-reload (config + certs + pools)        │
+                         │  - JWT auth enforcement (local verify)       │
+                         │  - Backend pool management (least-conn)      │
+                         │  - Hot-reload (config + certs + pools)       │
                          └────┬──────────────┬──────────────┬───────────┘
                               │              │              │
                     Unix socket         Unix socket     URL backend
