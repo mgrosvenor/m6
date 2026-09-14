@@ -43,18 +43,27 @@
 # measurement. A deployment can still measure its own content by setting
 # PERFCHECK_SITE, and should keep its own number in its own repository.
 #
-# ── No numbers recorded yet ──────────────────────────────────────────────────
+# ── First readings, 2026-09-14, on the build host ────────────────────────────
 #
-# The two targets below have never been measured on the build host. Until they
-# are, this check reports each reading and passes, which is honest: it has
-# nothing to compare against and says so rather than inventing a ceiling.
+# Taken at load average 0.20 on the 4-core Linux build host, which is the only
+# machine these mean anything on.
 #
-# Record them with, on the build host and nowhere else:
+# Each perfcheck round is already the minimum of five requests. Three rounds were
+# run and the MEDIAN of the three is recorded, rather than the best of them: the
+# lowest reading is the one the machine was least busy for, and recording it would
+# set a ceiling the same code fails to meet on an ordinary afternoon.
 #
-#     tools/perfcheck.sh --update
+#   render:minimal      190261, 203222, 201827 ns   -> median 201827  (6.8% spread)
+#   render:blog-index  1781799, 1848274, 1784823 ns -> median 1784823 (3.7% spread)
 #
-# For reference only, NOT a baseline: on a macOS laptop at load, the minimum of
-# five rounds was 92020ns and 1005416ns respectively. Laptop readings move by
-# half between runs and are not comparable with the build host's.
+# Both spreads sit well inside the 20% margin, which is the margin doing its job:
+# it is there for exactly this variation and not much wider than it.
+#
+# For reference only, NOT a baseline: the same two targets on a macOS laptop read
+# 92020ns and 1005416ns. The laptop is roughly twice as fast here and its readings
+# move by half between runs, which is why the recorded numbers are the build
+# host's and comparing the two tells you nothing.
 #
 # target                     ns
+render:minimal              201827
+render:blog-index          1784823
