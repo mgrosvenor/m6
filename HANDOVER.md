@@ -411,14 +411,13 @@ matching the newest tag; `release.sh` bumps them at a release.
 | 5 | ~~**The examples are built by the checks**~~ | **done 2026-09-14, issue #11.** They did not compile at all, and five more defects were underneath that. `build-host-tests.sh` now builds them and runs example 05's end-to-end suite; `merge.sh` and `release.sh` both call it; `find-deployment.sh` is deleted. See §2 and lesson 41 |
 | 6 | **Deploy, lifting the freeze** | the deployment repository's business; §6. Not a code task. |
 
-**One thing 1.0 still owes: the two performance numbers.** `render:capabilities`
-measured a deployment's content and is removed; `render:minimal` and
-`render:blog-index` replace it and **have never been recorded on the build host**.
-Until they are, `perfcheck.sh` reports each reading and passes, which is honest
-about having nothing to compare against but means a regression would not be
-caught. Record them with `tools/perfcheck.sh --update` on the build host, in a
-commit that says they are first readings. `tools/perf-baseline.txt` explains why
-the old number was not translated across.
+**The two performance numbers are recorded.** `render:capabilities` measured a
+deployment's content and is removed; `render:minimal` (201827ns) and
+`render:blog-index` (1784823ns) replace it, first measured on the build host on
+2026-09-14 at load 0.20. Three rounds each, median recorded rather than best,
+with all readings and the spread in `tools/perf-baseline.txt`. Two further rounds
+pass against them. That file also explains why the old number was not translated
+across: neither target renders the same page from the same bytes.
 
 ### Phase 7 in detail
 
