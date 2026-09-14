@@ -148,11 +148,25 @@ Verified by commit, gate green at each step unless noted.
 
 ### 1. Header to dict
 
-- [ ] `FrameworkState::build_dict` is private and is where the real knowledge
-      lives: twelve ordered steps, and the ordering is load-bearing (built-ins
-      go in *after* params files so a params file cannot override them). A
-      service not using `App` cannot reuse any of it. The dict-to-header half
-      is done, `3e7a7d8`.
+- [x] **Closed 2026-09-14, by deciding rather than by changing the API.**
+
+      This said `FrameworkState::build_dict` is private and that a service not
+      using `App` cannot reuse any of it. Both halves are still true, and
+      neither is a problem any more:
+
+      - **Nothing wants it.** `grep build_dict` across `m6-http`, `m6-file`,
+        `m6-html` and `m6-md` returns nothing. The three binaries that do not
+        use `App` do not build request dictionaries; they have no templates to
+        render against one.
+      - **The knowledge is no longer only in the private function.** The
+        layering it depended on now lives in `crate::dict`, which is public, and
+        the ordering is written down twice: in `app`'s module doc, next to the
+        code, and in `docs/m6-core-reference.md`. Step 8 staying after the
+        params files is stated as a rule with the reason, in both.
+
+      Making it public to satisfy a caller that does not exist would be an
+      interface to maintain for nobody. Reopen this the day a service outside
+      `App` needs a dictionary. The dict-to-header half was done in `3e7a7d8`.
 
 ### 2. Document m6-core in full
 
@@ -166,13 +180,26 @@ Verified by commit, gate green at each step unless noted.
       renderer lifecycle written while someone was using it.
 - [x] `m6-core.md` §9 marked **historical**. It was the pre-migration gap
       analysis and read as current state.
-- [ ] **Seventeen of thirty modules have no module-level doc comment**: `app`
-      has a one-line stub, and `compress`, `config`, `error`, `http`, `log`,
-      `mime`, `minify`, `multipart`, `parse`, `path`, `request`, `response`,
-      `server`, `signal`, `template`, `util`, `watcher` have none. The thirteen
-      that do are the best documentation in the repository, which makes the gap
-      sharper rather than softer. The reference covers the interface; these
-      would carry the *why*, next to the code.
+- [x] **Every module has a module-level doc comment. DONE 2026-09-14.**
+
+      This entry said seventeen modules had none. **Sixteen of the seventeen
+      already did**, and had for some time: `compress`, `config`, `error`,
+      `http`, `log`, `mime`, `minify`, `multipart`, `parse`, `path`, `request`,
+      `response`, `server`, `signal`, `template`, `util` and `watcher` carry
+      between 7 and 20 lines each, and they carry the *why* rather than the
+      interface, which is what this item asked for. The list was written once
+      and never re-read against the source.
+
+      Counted, not estimated: `head -20` on each module's file, `grep -c '^//!'`.
+
+      `app` was the real gap, and it was the worst one to have: one line for
+      4,477 lines, and it is the module every service goes through and every
+      other module is reached from. It now documents the four builders and why
+      there are four, route specificity deciding matches rather than
+      declaration order, the base-plus-overlay dictionary and which of the
+      twelve steps still run per request, **why step 8 must stay after the
+      params files**, thread state, and draining on shutdown. Every claim in it
+      was checked against the code rather than against this ledger.
 
 ### 3. Remaining audit findings
 
@@ -192,9 +219,14 @@ Verified by commit, gate green at each step unless noted.
       documents as the one everybody folds by mistake, and `http11.rs`'s
       `Connection` token check, which would have missed a token sent on a
       second field line.
-- [ ] **Calendar arithmetic hand-rolled in `m6-md`.** `is_leap`, `doy_to_md`,
-      days-since-epoch by hand. Core has chrono unconditionally now, so there
-      is no dependency argument left.
+- [x] **Calendar arithmetic hand-rolled in `m6-md`. ALREADY DONE; this row was
+      stale.** Verified 2026-09-14: `is_leap`, `doy_to_md` and the
+      days-since-epoch arithmetic are gone from `m6-md/src/` entirely, and
+      `file_mtime_iso` calls `m6_core::util::iso_date_from`. `util`'s own module
+      doc records why it moved: the hand-rolled version was wrong for 7,281 days
+      out of 29,200, because the era was anchored at 1970 instead of being
+      shifted to March, so the last day of every leap year became the first of
+      the next and the whole following year was a day late.
 - [x] **ETag / conditional in `m6-file`.** **ALREADY DONE; this row was stale.**
       Closed 2026-09-11 in `f4bdfed` and never struck off here. Verified
       2026-09-12: `m6-file/src/handler.rs` calls

@@ -563,8 +563,10 @@ Full list, 40 of them, in `docs/LESSONS.md`.
   API: `Branch not protected`. The hooks protect one laptop. Setting it needs
   the owner's go-ahead because it changes how the repository behaves for
   everyone.
-- **`FrameworkState::build_dict` is private**, so the twelve ordered steps of
-  dictionary building are not reusable by a service not using `App`.
+- **`FrameworkState::build_dict` is private**, and that is now a decision
+  rather than a debt: nothing outside `App` builds a request dictionary, and the
+  ordering is documented in `app`'s module doc and in
+  `docs/m6-core-reference.md`. See `docs/CONSOLIDATION-TODO.md` §1.
 - **The IO layer, the event loop and the handler contract are deferred**,
   explicitly, by the owner. Not 1.0 work. See `docs/CONSOLIDATION-TODO.md` §3b
   and do not widen that scope.
