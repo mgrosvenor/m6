@@ -411,8 +411,14 @@ if [[ -n "$EXAMPLES" ]]; then
     ege=$(num_after EG_CMS_STATUS       "$EXAMPLES_LOG"); ege="${ege:-?}"
     read -r egpassed egfailed < \
         <(awk '/^test result:/{p+=$4; f+=$6} END{print p+0, f+0}' "$EXAMPLES_LOG")
-    cms=$(sed -n 's/.*\([0-9][0-9]*\) passed  *\([0-9][0-9]*\) failed.*/\1 passed, \2 failed/p' \
-        "$EXAMPLES_LOG" | tail -1)
+    # NOT a `.*\([0-9][0-9]*\) passed` capture. The leading `.*` is greedy, so on
+    # "98 passed" it swallowed the 9 and the group matched "8": the run reported
+    # the CMS suite as 8 checks when it had made 98. A summary that gets its own
+    # numbers wrong is worse than no summary, because it is the line a reader
+    # trusts instead of opening the log.
+    cms_pass=$(grep -oE '[0-9]+ passed' "$EXAMPLES_LOG" | tail -1 | awk '{print $1}')
+    cms_fail=$(grep -oE '[0-9]+ failed' "$EXAMPLES_LOG" | tail -1 | awk '{print $1}')
+    cms="${cms_pass:-?} passed, ${cms_fail:-?} failed"
 
     EG_FAILED=0
     [[ "$egw" == "0" ]] || { echo "${RED}   examples: $egw release warning(s)${RESET}" >&2; EG_FAILED=1; }
