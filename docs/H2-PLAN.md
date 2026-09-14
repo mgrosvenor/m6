@@ -15,7 +15,7 @@
 > retroactive `SETTINGS_INITIAL_WINDOW_SIZE` handling per RFC 9113 6.9.2.
 > Guard: `m6-http/tests/backbone_flow_control.rs`, a stub origin that enforces
 > the window it advertises, verified red without the fix. Full write-up in
-> `~/example-site/HANDOVER.md` §5a, and the EOF defect it uncovered in
+> `the deployment repository/HANDOVER.md` §5a, and the EOF defect it uncovered in
 > §5c.
 >
 > The only H2 item not implemented is

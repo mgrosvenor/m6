@@ -1,6 +1,6 @@
+use ahash::AHashMap;
 /// In-memory response cache with atomic Arc swap.
 use std::borrow::Borrow;
-use ahash::AHashMap;
 
 /// A cached HTTP response.
 ///
@@ -14,8 +14,8 @@ use ahash::AHashMap;
 pub struct CachedResponse {
     pub status: u16,
     pub headers: std::sync::Arc<Vec<(String, String)>>,
-    pub body:    bytes::Bytes,
-    pub hints:   std::sync::Arc<Vec<String>>,
+    pub body: bytes::Bytes,
+    pub hints: std::sync::Arc<Vec<String>>,
 }
 // Conditional requests and preconditions live in `m6_core::conditional`.
 // They are version-independent semantics with two consumers, and the second
@@ -44,9 +44,8 @@ impl CacheKey {
         // never smuggle one request's query into another's key.
         let path_stripped = &path[..path.find('?').unwrap_or(path.len())];
         let query = query.unwrap_or("");
-        let mut s = String::with_capacity(
-            path_stripped.len() + query.len() + content_encoding.len() + 2,
-        );
+        let mut s =
+            String::with_capacity(path_stripped.len() + query.len() + content_encoding.len() + 2);
         s.push_str(path_stripped);
         s.push('\x01');
         s.push_str(query);
@@ -179,12 +178,15 @@ const REFRESH_MARGIN: std::time::Duration = std::time::Duration::from_secs(1);
 /// a negative that would wrap.
 fn expires_lifetime(headers: &[(String, String)]) -> Option<std::time::Duration> {
     let get = |name: &str| {
-        m6_core::headers::get(headers, name)
-            .and_then(|v| httpdate::parse_http_date(v.trim()).ok())
+        m6_core::headers::get(headers, name).and_then(|v| httpdate::parse_http_date(v.trim()).ok())
     };
     let expires = get("expires")?;
     let date = get("date").unwrap_or_else(std::time::SystemTime::now);
-    Some(expires.duration_since(date).unwrap_or(std::time::Duration::ZERO))
+    Some(
+        expires
+            .duration_since(date)
+            .unwrap_or(std::time::Duration::ZERO),
+    )
 }
 
 /// Ceiling on an entry stored with no explicit freshness directive.
@@ -264,13 +266,13 @@ impl CacheControl {
             for (dname, dval) in split_directives(value) {
                 let secs = || dval.as_deref().and_then(|v| v.trim().parse::<u64>().ok());
                 match dname.as_str() {
-                    "no-store"               => cc.no_store = true,
-                    "no-cache"               => cc.no_cache = true,
-                    "private"                => cc.private = true,
-                    "public"                 => cc.public = true,
-                    "must-revalidate"        => cc.must_revalidate = true,
-                    "max-age"                => cc.max_age = secs(),
-                    "s-maxage"               => cc.s_maxage = secs(),
+                    "no-store" => cc.no_store = true,
+                    "no-cache" => cc.no_cache = true,
+                    "private" => cc.private = true,
+                    "public" => cc.public = true,
+                    "must-revalidate" => cc.must_revalidate = true,
+                    "max-age" => cc.max_age = secs(),
+                    "s-maxage" => cc.s_maxage = secs(),
                     "stale-while-revalidate" => cc.stale_while_revalidate = secs(),
                     _ => {}
                 }
@@ -285,7 +287,9 @@ impl CacheControl {
         if self.no_cache {
             return Some(std::time::Duration::ZERO);
         }
-        self.s_maxage.or(self.max_age).map(std::time::Duration::from_secs)
+        self.s_maxage
+            .or(self.max_age)
+            .map(std::time::Duration::from_secs)
     }
 }
 
@@ -298,10 +302,22 @@ fn split_directives(value: &str) -> Vec<(String, Option<String>)> {
     let mut escaped = false;
     for ch in value.chars() {
         match ch {
-            '\\' if in_quotes && !escaped => { escaped = true; cur.push(ch); }
-            '"' if !escaped => { in_quotes = !in_quotes; cur.push(ch); }
-            ',' if !in_quotes => { push_directive(&mut out, &cur); cur.clear(); }
-            _ => { escaped = false; cur.push(ch); }
+            '\\' if in_quotes && !escaped => {
+                escaped = true;
+                cur.push(ch);
+            }
+            '"' if !escaped => {
+                in_quotes = !in_quotes;
+                cur.push(ch);
+            }
+            ',' if !in_quotes => {
+                push_directive(&mut out, &cur);
+                cur.clear();
+            }
+            _ => {
+                escaped = false;
+                cur.push(ch);
+            }
         }
     }
     push_directive(&mut out, &cur);
@@ -316,7 +332,10 @@ fn push_directive(out: &mut Vec<(String, Option<String>)>, raw: &str) {
     match t.split_once('=') {
         Some((n, v)) => {
             let v = v.trim();
-            let v = v.strip_prefix('"').and_then(|r| r.strip_suffix('"')).unwrap_or(v);
+            let v = v
+                .strip_prefix('"')
+                .and_then(|r| r.strip_suffix('"'))
+                .unwrap_or(v);
             out.push((n.trim().to_ascii_lowercase(), Some(v.to_string())));
         }
         None => out.push((t.to_ascii_lowercase(), None)),
@@ -441,6 +460,12 @@ pub struct Cache {
     max_bytes: usize,
 }
 
+impl Default for Cache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Cache {
     pub fn new() -> Self {
         Self::with_max_bytes(DEFAULT_MAX_BYTES)
@@ -459,8 +484,6 @@ impl Cache {
     pub fn bytes_held(&self) -> usize {
         self.bytes.load(std::sync::atomic::Ordering::Relaxed)
     }
-
-
 
     /// A cache whose hasher is seeded deterministically. **Benchmarks only.**
     ///
@@ -576,7 +599,11 @@ impl Cache {
             Some(None) => Lookup::Stale(resp, age), // `max-stale` with no value: any
             Some(Some(limit)) => {
                 let staleness = self.staleness(key).unwrap_or_default();
-                if staleness.as_secs() <= limit { Lookup::Stale(resp, age) } else { Lookup::Miss }
+                if staleness.as_secs() <= limit {
+                    Lookup::Stale(resp, age)
+                } else {
+                    Lookup::Miss
+                }
             }
             // No max-stale from the client. The stale-while-revalidate window
             // is the ORIGIN's permission to serve stale, which is independent
@@ -624,8 +651,12 @@ impl Cache {
         CacheKey: std::borrow::Borrow<Q>,
         Q: std::hash::Hash + Eq + ?Sized,
     {
-        let Ok(map) = self.map.read() else { return Lookup::Miss };
-        let Some(entry) = map.get(key) else { return Lookup::Miss };
+        let Ok(map) = self.map.read() else {
+            return Lookup::Miss;
+        };
+        let Some(entry) = map.get(key) else {
+            return Lookup::Miss;
+        };
         // One relaxed store, under the shared lock, so eviction can prefer
         // entries nobody reads. No lock upgrade and no allocation: the
         // attack this defends against is a flood of entries that are written
@@ -717,10 +748,12 @@ impl Cache {
         // Measured against the response's own `Date` rather than our clock,
         // per 4.2.1, so a skewed server does not get a longer or shorter
         // lifetime here than it asked for.
-        let expires_at = Some(match d.lifetime.or_else(|| expires_lifetime(&response.headers)) {
-            Some(l) => now + l.saturating_sub(REFRESH_MARGIN),
-            None => now + HEURISTIC_MAX_LIFETIME,
-        });
+        let expires_at = Some(
+            match d.lifetime.or_else(|| expires_lifetime(&response.headers)) {
+                Some(l) => now + l.saturating_sub(REFRESH_MARGIN),
+                None => now + HEURISTIC_MAX_LIFETIME,
+            },
+        );
         // `no-cache` forbids a stale serve outright and outranks any
         // stale-while-revalidate the same response happens to carry —
         // otherwise the two together would produce exactly the unrevalidated
@@ -736,17 +769,20 @@ impl Cache {
         let serve_stale_until = expires_at.map(|e| e + stale_window);
         let footprint = entry_footprint(&key, &response);
         if let Ok(mut map) = self.map.write() {
-            let replaced = map.insert(key, CacheEntry {
-                response,
-                stored_at: now,
-                upstream_age,
-                expires_at,
-                serve_stale_until,
-                footprint,
-                last_read: std::sync::atomic::AtomicU64::new(
-                    READ_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                ),
-            });
+            let replaced = map.insert(
+                key,
+                CacheEntry {
+                    response,
+                    stored_at: now,
+                    upstream_age,
+                    expires_at,
+                    serve_stale_until,
+                    footprint,
+                    last_read: std::sync::atomic::AtomicU64::new(
+                        READ_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    ),
+                },
+            );
             let freed = replaced.map(|e| e.footprint).unwrap_or(0);
             let held = self
                 .bytes
@@ -787,7 +823,12 @@ impl Cache {
         // the global counter, so no two entries share one.
         let mut entries: Vec<(u64, usize)> = map
             .values()
-            .map(|e| (e.last_read.load(std::sync::atomic::Ordering::Relaxed), e.footprint))
+            .map(|e| {
+                (
+                    e.last_read.load(std::sync::atomic::Ordering::Relaxed),
+                    e.footprint,
+                )
+            })
             .collect();
         entries.sort_unstable_by_key(|(tick, _)| *tick);
 
@@ -814,7 +855,8 @@ impl Cache {
             .bytes
             .load(std::sync::atomic::Ordering::Relaxed)
             .saturating_sub(freed);
-        self.bytes.store(now_held, std::sync::atomic::Ordering::Relaxed);
+        self.bytes
+            .store(now_held, std::sync::atomic::Ordering::Relaxed);
         tracing::info!(
             dropped = before - map.len(),
             bytes_held = now_held,
@@ -862,7 +904,8 @@ impl Cache {
                     // drifts up while the map shrinks and the cache evicts on
                     // every insert forever. Deploys call this on every
                     // invalidation, so the drift would be relentless.
-                    self.bytes.fetch_sub(e.footprint, std::sync::atomic::Ordering::Relaxed);
+                    self.bytes
+                        .fetch_sub(e.footprint, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
@@ -892,7 +935,10 @@ impl Cache {
     /// points back at the arithmetic.
     #[cfg(test)]
     fn footprint_sum(&self) -> usize {
-        self.map.read().map(|m| m.values().map(|e| e.footprint).sum()).unwrap_or(0)
+        self.map
+            .read()
+            .map(|m| m.values().map(|e| e.footprint).sum())
+            .unwrap_or(0)
     }
 
     /// Number of stored entries, including any that are past their freshness
@@ -900,6 +946,13 @@ impl Cache {
     /// memory-occupancy figure, not a count of servable entries.
     pub fn len(&self) -> usize {
         self.map.read().map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// Whether the cache holds nothing. A poisoned lock reads as empty, for the
+    /// same reason `len` reads as zero: this is an occupancy report, and it must
+    /// not panic on the path that reports it.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -1037,14 +1090,14 @@ impl RequestDirectives {
                 for (k, v) in split_directives(value) {
                     let secs = || v.as_deref().and_then(|v| v.trim().parse::<u64>().ok());
                     match k.to_ascii_lowercase().as_str() {
-                        "no-cache"       => d.no_cache = true,
-                        "no-store"       => d.no_store = true,
-                        "max-age"        => d.max_age = secs(),
-                        "min-fresh"      => d.min_fresh = secs(),
+                        "no-cache" => d.no_cache = true,
+                        "no-store" => d.no_store = true,
+                        "max-age" => d.max_age = secs(),
+                        "min-fresh" => d.min_fresh = secs(),
                         // Bare `max-stale` means unlimited; with a value it is
                         // bounded. The nested Option distinguishes them, which
                         // a plain Option<u64> could not.
-                        "max-stale"      => d.max_stale = Some(secs()),
+                        "max-stale" => d.max_stale = Some(secs()),
                         "only-if-cached" => d.only_if_cached = true,
                         _ => {}
                     }
@@ -1058,7 +1111,9 @@ impl RequestDirectives {
         if !saw_cache_control {
             for (name, value) in req_headers {
                 if name.eq_ignore_ascii_case("pragma")
-                    && value.split(',').any(|t| t.trim().eq_ignore_ascii_case("no-cache"))
+                    && value
+                        .split(',')
+                        .any(|t| t.trim().eq_ignore_ascii_case("no-cache"))
                 {
                     d.no_cache = true;
                 }
@@ -1088,7 +1143,11 @@ pub fn request_permits_storage(req_headers: &[(String, String)]) -> bool {
 /// the cookie is not — so only the cookie is excluded from storage, not the
 /// response.
 pub fn strip_set_cookie(headers: &[(String, String)]) -> Vec<(String, String)> {
-    headers.iter().filter(|(k, _)| !k.eq_ignore_ascii_case("set-cookie")).cloned().collect()
+    headers
+        .iter()
+        .filter(|(k, _)| !k.eq_ignore_ascii_case("set-cookie"))
+        .cloned()
+        .collect()
 }
 
 #[cfg(test)]
@@ -1131,10 +1190,16 @@ mod tests {
     #[test]
     fn a_public_404_is_stored_but_other_4xx_are_not() {
         let (status, headers, _) = make_response(404, "public");
-        assert!(should_cache(status, &headers), "404 is storable per RFC 9111 3");
+        assert!(
+            should_cache(status, &headers),
+            "404 is storable per RFC 9111 3"
+        );
         for s in [400u16, 401, 403, 429] {
             let (status, headers, _) = make_response(s, "public");
-            assert!(!should_cache(status, &headers), "{s} is not in the RFC 9111 3 list");
+            assert!(
+                !should_cache(status, &headers),
+                "{s} is not in the RFC 9111 3 list"
+            );
         }
     }
 
@@ -1378,7 +1443,12 @@ mod tests {
         let k1 = CacheKey::new("/page", None, "gzip");
         let k2 = CacheKey::new("/page", None, "br");
         let k3 = CacheKey::new("/other", None, "");
-        let resp = CachedResponse { status: 200, headers: std::sync::Arc::new(vec![]), body: bytes::Bytes::new(), hints: std::sync::Arc::new(vec![]) };
+        let resp = CachedResponse {
+            status: 200,
+            headers: std::sync::Arc::new(vec![]),
+            body: bytes::Bytes::new(),
+            hints: std::sync::Arc::new(vec![]),
+        };
         cache.insert(k1.clone(), resp.clone());
         cache.insert(k2.clone(), resp.clone());
         cache.insert(k3.clone(), resp.clone());
@@ -1386,11 +1456,17 @@ mod tests {
         cache.evict_path("/page");
 
         let mut buf = [0u8; 512];
-        assert!(cache.get(make_lookup_key("/page", None, "gzip", &mut buf)).is_none());
+        assert!(cache
+            .get(make_lookup_key("/page", None, "gzip", &mut buf))
+            .is_none());
         let mut buf = [0u8; 512];
-        assert!(cache.get(make_lookup_key("/page", None, "br", &mut buf)).is_none());
+        assert!(cache
+            .get(make_lookup_key("/page", None, "br", &mut buf))
+            .is_none());
         let mut buf = [0u8; 512];
-        assert!(cache.get(make_lookup_key("/other", None, "", &mut buf)).is_some());
+        assert!(cache
+            .get(make_lookup_key("/other", None, "", &mut buf))
+            .is_some());
     }
 
     #[test]
@@ -1398,7 +1474,12 @@ mod tests {
         let cache = Cache::new();
         // key stored with no query
         let k = CacheKey::new("/page", None, "");
-        let resp = CachedResponse { status: 200, headers: std::sync::Arc::new(vec![]), body: bytes::Bytes::new(), hints: std::sync::Arc::new(vec![]) };
+        let resp = CachedResponse {
+            status: 200,
+            headers: std::sync::Arc::new(vec![]),
+            body: bytes::Bytes::new(),
+            hints: std::sync::Arc::new(vec![]),
+        };
         cache.insert(k.clone(), resp);
         // evict with query — should still evict
         cache.evict_path("/page?x=1");
@@ -1484,7 +1565,11 @@ mod tests {
             let got = cache.get(&key).expect("just inserted");
             assert_eq!(
                 content_encoding_of(&got),
-                if resp_enc.is_empty() { None } else { Some(resp_enc) },
+                if resp_enc.is_empty() {
+                    None
+                } else {
+                    Some(resp_enc)
+                },
                 "content-encoding must survive for key {key_enc:?}"
             );
         }
@@ -1502,7 +1587,10 @@ mod tests {
         let probe = CacheKey::new("/assets/css/style.css", None, "br");
 
         cache.insert(probe.clone(), encoded("br", b"small"));
-        cache.insert(browser.clone(), encoded("", b"this-is-the-large-identity-body"));
+        cache.insert(
+            browser.clone(),
+            encoded("", b"this-is-the-large-identity-body"),
+        );
 
         // Probing the `br` key reports health it cannot vouch for.
         assert_eq!(content_encoding_of(&cache.get(&probe).unwrap()), Some("br"));
@@ -1555,11 +1643,17 @@ mod tests {
 
         // Same query — must match.
         let mut buf = [0u8; 512];
-        assert_eq!(borrowed, make_lookup_key("/foo", Some("x=1"), "br", &mut buf));
+        assert_eq!(
+            borrowed,
+            make_lookup_key("/foo", Some("x=1"), "br", &mut buf)
+        );
 
         // Different query — must not match.
         let mut buf = [0u8; 512];
-        assert_ne!(borrowed, make_lookup_key("/foo", Some("y=2"), "br", &mut buf));
+        assert_ne!(
+            borrowed,
+            make_lookup_key("/foo", Some("y=2"), "br", &mut buf)
+        );
     }
 
     /// Keys are `path\x01query\x01encoding`; a path/query pair must not be able
@@ -1590,11 +1684,17 @@ mod tests {
         cache.evict_path("/page");
 
         let mut buf = [0u8; 512];
-        assert!(cache.get(make_lookup_key("/page", Some("a=1"), "", &mut buf)).is_none());
+        assert!(cache
+            .get(make_lookup_key("/page", Some("a=1"), "", &mut buf))
+            .is_none());
         let mut buf = [0u8; 512];
-        assert!(cache.get(make_lookup_key("/page", Some("a=2"), "gzip", &mut buf)).is_none());
+        assert!(cache
+            .get(make_lookup_key("/page", Some("a=2"), "gzip", &mut buf))
+            .is_none());
         let mut buf = [0u8; 512];
-        assert!(cache.get(make_lookup_key("/other", Some("a=1"), "", &mut buf)).is_some());
+        assert!(cache
+            .get(make_lookup_key("/other", Some("a=1"), "", &mut buf))
+            .is_some());
     }
 
     #[test]
@@ -1606,7 +1706,9 @@ mod tests {
         ];
         let stripped = strip_set_cookie(&headers);
         assert_eq!(stripped.len(), 2);
-        assert!(stripped.iter().all(|(k, _)| !k.eq_ignore_ascii_case("set-cookie")));
+        assert!(stripped
+            .iter()
+            .all(|(k, _)| !k.eq_ignore_ascii_case("set-cookie")));
         assert!(stripped.iter().any(|(k, _)| k == "Content-Type"));
         assert!(stripped.iter().any(|(k, _)| k == "Cache-Control"));
     }
@@ -1639,11 +1741,16 @@ mod method_gate_tests {
         // Case-sensitive: `get` is a different (unregistered) method, and must
         // not slip past the method gate by reaching the cache first.
         for m in ["get", "head", "Get", "Head"] {
-            assert!(!method_may_read_cache(m), "{m} must not be treated as GET/HEAD");
+            assert!(
+                !method_may_read_cache(m),
+                "{m} must not be treated as GET/HEAD"
+            );
         }
         // Every verb below was served the cached page before this gate existed,
         // including TRACE and an entirely invented method.
-        for m in ["POST", "PUT", "DELETE", "PATCH", "OPTIONS", "TRACE", "CONNECT", "FOO", ""] {
+        for m in [
+            "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "TRACE", "CONNECT", "FOO", "",
+        ] {
             assert!(!method_may_read_cache(m), "{m} must not read cache");
         }
     }
@@ -1654,8 +1761,13 @@ mod method_gate_tests {
     #[test]
     fn only_get_may_write() {
         assert!(method_may_write_cache("GET"));
-        assert!(!method_may_write_cache("get"), "case-sensitive: `get` is not GET");
-        for m in ["HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "TRACE", "FOO", ""] {
+        assert!(
+            !method_may_write_cache("get"),
+            "case-sensitive: `get` is not GET"
+        );
+        for m in [
+            "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "TRACE", "FOO", "",
+        ] {
             assert!(!method_may_write_cache(m), "{m} must not write cache");
         }
     }
@@ -1669,7 +1781,10 @@ mod method_gate_tests {
     fn everything_that_may_write_may_also_read() {
         for m in ["GET", "HEAD", "POST", "PUT", "DELETE", "TRACE", "FOO"] {
             if method_may_write_cache(m) {
-                assert!(method_may_read_cache(m), "{m} can write but not read — key namespace would split");
+                assert!(
+                    method_may_read_cache(m),
+                    "{m} can write but not read — key namespace would split"
+                );
             }
         }
     }
@@ -1680,19 +1795,26 @@ mod method_gate_tests {
     #[test]
     fn a_head_cannot_poison_the_get_entry() {
         let cache = Cache::new();
-        cache.insert(CacheKey::new("/page", None, "br"), CachedResponse {
-            status: 200,
-            headers: std::sync::Arc::new(vec![]),
-            body: bytes::Bytes::from_static(b"full GET body"),
-            hints: std::sync::Arc::new(vec![]),
-        });
+        cache.insert(
+            CacheKey::new("/page", None, "br"),
+            CachedResponse {
+                status: 200,
+                headers: std::sync::Arc::new(vec![]),
+                body: bytes::Bytes::from_static(b"full GET body"),
+                hints: std::sync::Arc::new(vec![]),
+            },
+        );
 
         // What a HEAD would store if it were allowed to: same key, empty body.
-        assert!(!method_may_write_cache("HEAD"),
-                "if this ever becomes true, the entry below overwrites the GET body");
+        assert!(
+            !method_may_write_cache("HEAD"),
+            "if this ever becomes true, the entry below overwrites the GET body"
+        );
 
         let mut b2 = [0u8; 512];
-        let got = cache.get(make_lookup_key("/page", None, "br", &mut b2)).expect("entry present");
+        let got = cache
+            .get(make_lookup_key("/page", None, "br", &mut b2))
+            .expect("entry present");
         assert_eq!(&got.body[..], b"full GET body");
     }
 }
@@ -1702,7 +1824,10 @@ mod cache_control_tests {
     use super::*;
 
     fn h(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     #[test]
@@ -1720,21 +1845,38 @@ mod cache_control_tests {
     fn no_store_on_a_later_field_line_still_wins() {
         let hs = h(&[("cache-control", "public"), ("cache-control", "no-store")]);
         assert!(CacheControl::parse(&hs).no_store);
-        assert!(!should_cache(200, &hs), "public on an earlier line must not beat a later no-store");
+        assert!(
+            !should_cache(200, &hs),
+            "public on an earlier line must not beat a later no-store"
+        );
     }
 
     /// `contains("public")` matched any extension token containing the word.
     #[test]
     fn an_extension_token_containing_public_is_not_the_public_directive() {
         let cc = CacheControl::parse(&h(&[("cache-control", "public-cache-extension")]));
-        assert!(!cc.public, "matched a directive named `public-cache-extension`");
-        assert!(!should_cache(200, &h(&[("cache-control", "public-cache-extension")])));
+        assert!(
+            !cc.public,
+            "matched a directive named `public-cache-extension`"
+        );
+        assert!(!should_cache(
+            200,
+            &h(&[("cache-control", "public-cache-extension")])
+        ));
     }
 
     #[test]
     fn private_and_no_store_both_forbid_storage() {
-        for v in ["private", "no-store", "public, private", "max-age=60, no-store"] {
-            assert!(!should_cache(200, &h(&[("cache-control", v)])), "{v} must not be stored");
+        for v in [
+            "private",
+            "no-store",
+            "public, private",
+            "max-age=60, no-store",
+        ] {
+            assert!(
+                !should_cache(200, &h(&[("cache-control", v)])),
+                "{v} must not be stored"
+            );
         }
     }
 
@@ -1768,7 +1910,10 @@ mod cache_control_tests {
     #[test]
     fn s_maxage_wins_for_a_shared_cache() {
         let cc = CacheControl::parse(&h(&[("cache-control", "max-age=10, s-maxage=99")]));
-        assert_eq!(cc.shared_lifetime(), Some(std::time::Duration::from_secs(99)));
+        assert_eq!(
+            cc.shared_lifetime(),
+            Some(std::time::Duration::from_secs(99))
+        );
     }
 
     #[test]
@@ -1782,7 +1927,10 @@ mod cache_control_tests {
     /// though it were the whole resource.
     #[test]
     fn a_206_is_never_stored() {
-        assert!(!should_cache(206, &h(&[("cache-control", "public, max-age=60")])));
+        assert!(!should_cache(
+            206,
+            &h(&[("cache-control", "public, max-age=60")])
+        ));
     }
 
     /// The storable set is now RFC 9111 3 rather than "any 2xx". 300, 301
@@ -1792,10 +1940,16 @@ mod cache_control_tests {
     #[test]
     fn the_rfc_9111_storable_set_is_honoured() {
         for s in [200u16, 203, 204, 300, 301, 308, 404, 405, 410, 414, 501] {
-            assert!(should_cache(s, &h(&[("cache-control", "public")])), "{s} should store");
+            assert!(
+                should_cache(s, &h(&[("cache-control", "public")])),
+                "{s} should store"
+            );
         }
         for s in [199u16, 201, 202, 205, 302, 400, 500, 503] {
-            assert!(!should_cache(s, &h(&[("cache-control", "public")])), "{s} should not store");
+            assert!(
+                !should_cache(s, &h(&[("cache-control", "public")])),
+                "{s} should not store"
+            );
         }
     }
 
@@ -1803,15 +1957,24 @@ mod cache_control_tests {
     /// response written to cache. Request directives were not parsed at all.
     #[test]
     fn request_no_store_forbids_storage() {
-        assert!(!request_permits_storage(&h(&[("cache-control", "no-store")])));
-        assert!(!request_permits_storage(&h(&[("Cache-Control", "No-Store")])));
+        assert!(!request_permits_storage(&h(&[(
+            "cache-control",
+            "no-store"
+        )])));
+        assert!(!request_permits_storage(&h(&[(
+            "Cache-Control",
+            "No-Store"
+        )])));
     }
 
     /// Request `no-cache` means "revalidate before reuse", NOT "do not store".
     /// Treating them alike would cost hit rate for no correctness gain.
     #[test]
     fn request_no_cache_does_not_forbid_storage() {
-        assert!(request_permits_storage(&h(&[("cache-control", "no-cache")])));
+        assert!(request_permits_storage(&h(&[(
+            "cache-control",
+            "no-cache"
+        )])));
         assert!(request_permits_storage(&h(&[])));
     }
 }
@@ -1824,7 +1987,10 @@ mod age_tests {
         CachedResponse {
             status: 200,
             headers: std::sync::Arc::new(
-                headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+                headers
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
             ),
             body: bytes::Bytes::from_static(b"x"),
             hints: std::sync::Arc::new(vec![]),
@@ -1835,11 +2001,19 @@ mod age_tests {
     #[test]
     fn a_fresh_entry_starts_at_about_zero() {
         let c = Cache::new();
-        c.insert(CacheKey::new("/a", None, ""), resp(&[("cache-control", "public, max-age=60")]));
+        c.insert(
+            CacheKey::new("/a", None, ""),
+            resp(&[("cache-control", "public, max-age=60")]),
+        );
         match c.lookup("/a\u{1}\u{1}") {
             Lookup::Fresh(_, age) => assert!(age.as_secs() < 2, "age was {age:?}"),
-            other => panic!("expected Fresh, got {}", match other {
-                Lookup::Stale(..) => "Stale", _ => "Miss" }),
+            other => panic!(
+                "expected Fresh, got {}",
+                match other {
+                    Lookup::Stale(..) => "Stale",
+                    _ => "Miss",
+                }
+            ),
         }
     }
 
@@ -1856,8 +2030,14 @@ mod age_tests {
         );
         match c.lookup("/b\u{1}\u{1}") {
             Lookup::Fresh(_, age) => {
-                assert!(age.as_secs() >= 120, "upstream Age was dropped; got {age:?}");
-                assert!(age.as_secs() < 125, "age inflated beyond the upstream value: {age:?}");
+                assert!(
+                    age.as_secs() >= 120,
+                    "upstream Age was dropped; got {age:?}"
+                );
+                assert!(
+                    age.as_secs() < 125,
+                    "age inflated beyond the upstream value: {age:?}"
+                );
             }
             _ => panic!("expected Fresh"),
         }
@@ -1869,7 +2049,10 @@ mod age_tests {
         let c = Cache::new();
         c.insert(
             CacheKey::new("/c", None, ""),
-            resp(&[("cache-control", "public, max-age=60"), ("age", "not-a-number")]),
+            resp(&[
+                ("cache-control", "public, max-age=60"),
+                ("age", "not-a-number"),
+            ]),
         );
         match c.lookup("/c\u{1}\u{1}") {
             Lookup::Fresh(_, age) => assert!(age.as_secs() < 2, "age was {age:?}"),
@@ -1881,7 +2064,10 @@ mod age_tests {
     #[test]
     fn an_entry_without_a_lifetime_still_reports_age() {
         let c = Cache::new();
-        c.insert(CacheKey::new("/d", None, ""), resp(&[("cache-control", "public"), ("age", "7")]));
+        c.insert(
+            CacheKey::new("/d", None, ""),
+            resp(&[("cache-control", "public"), ("age", "7")]),
+        );
         match c.lookup("/d\u{1}\u{1}") {
             Lookup::Fresh(_, age) => assert!(age.as_secs() >= 7),
             _ => panic!("expected Fresh"),
@@ -1915,7 +2101,10 @@ mod heuristic_freshness_tests {
         // But it has a finite deadline rather than none at all.
         let map = c.map.read().unwrap();
         let e = map.get("/p\u{1}\u{1}").expect("stored");
-        assert!(e.expires_at.is_some(), "bare `public` must not be fresh forever");
+        assert!(
+            e.expires_at.is_some(),
+            "bare `public` must not be fresh forever"
+        );
     }
 
     /// An explicit lifetime is still honoured exactly and is not replaced by
@@ -1926,9 +2115,18 @@ mod heuristic_freshness_tests {
         c.insert(CacheKey::new("/q", None, ""), resp("public, max-age=60"));
         let map = c.map.read().unwrap();
         let e = map.get("/q\u{1}\u{1}").expect("stored");
-        let ttl = e.expires_at.unwrap().saturating_duration_since(std::time::Instant::now());
-        assert!(ttl.as_secs() <= 60, "explicit max-age was overridden: {ttl:?}");
-        assert!(ttl.as_secs() > 30, "explicit max-age was truncated: {ttl:?}");
+        let ttl = e
+            .expires_at
+            .unwrap()
+            .saturating_duration_since(std::time::Instant::now());
+        assert!(
+            ttl.as_secs() <= 60,
+            "explicit max-age was overridden: {ttl:?}"
+        );
+        assert!(
+            ttl.as_secs() > 30,
+            "explicit max-age was truncated: {ttl:?}"
+        );
     }
 }
 
@@ -1948,12 +2146,15 @@ mod expires_tests {
 
     fn stored(headers: Vec<(String, String)>) -> Option<std::time::Instant> {
         let c = Cache::new();
-        c.insert(CacheKey::new("/e", None, ""), CachedResponse {
-            status: 200,
-            headers: std::sync::Arc::new(headers),
-            body: bytes::Bytes::from_static(b"x"),
-            hints: std::sync::Arc::new(vec![]),
-        });
+        c.insert(
+            CacheKey::new("/e", None, ""),
+            CachedResponse {
+                status: 200,
+                headers: std::sync::Arc::new(headers),
+                body: bytes::Bytes::from_static(b"x"),
+                hints: std::sync::Arc::new(vec![]),
+            },
+        );
         let map = c.map.read().unwrap();
         map.get("/e\u{1}\u{1}").and_then(|e| e.expires_at)
     }
@@ -1970,7 +2171,10 @@ mod expires_tests {
         ])
         .expect("stored with a deadline");
         let ttl = e.saturating_duration_since(std::time::Instant::now());
-        assert!(ttl.as_secs() > 60 && ttl.as_secs() <= 120, "ttl was {ttl:?}, expected ~120s");
+        assert!(
+            ttl.as_secs() > 60 && ttl.as_secs() <= 120,
+            "ttl was {ttl:?}, expected ~120s"
+        );
     }
 
     /// Measured against the response's own Date, not our clock, so clock skew
@@ -1986,7 +2190,10 @@ mod expires_tests {
         ])
         .expect("stored");
         let ttl = e.saturating_duration_since(std::time::Instant::now());
-        assert!(ttl.as_secs() <= 60, "skew leaked into the lifetime: {ttl:?}");
+        assert!(
+            ttl.as_secs() <= 60,
+            "skew leaked into the lifetime: {ttl:?}"
+        );
     }
 
     /// max-age outranks Expires (RFC 9111 4.2.1).
@@ -2026,7 +2233,10 @@ mod expires_tests {
         ])
         .expect("stored");
         let ttl = e.saturating_duration_since(std::time::Instant::now());
-        assert!(ttl.as_secs() > 3600, "should have fallen back to the heuristic, got {ttl:?}");
+        assert!(
+            ttl.as_secs() > 3600,
+            "should have fallen back to the heuristic, got {ttl:?}"
+        );
     }
 }
 
@@ -2035,7 +2245,10 @@ mod not_modified_header_tests {
     use super::*;
 
     fn h(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     /// RFC 9110 15.4.5: a 304 carries the metadata a 200 would have, so the
@@ -2062,7 +2275,8 @@ mod not_modified_header_tests {
     fn vary_survives_onto_the_304() {
         let out = not_modified_headers(&h(&[("vary", "Accept-Encoding"), ("etag", "\"x\"")]));
         assert!(
-            out.iter().any(|(k, v)| k.eq_ignore_ascii_case("vary") && v == "Accept-Encoding"),
+            out.iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("vary") && v == "Accept-Encoding"),
             "Vary was dropped from the 304"
         );
     }
@@ -2078,18 +2292,23 @@ mod not_modified_header_tests {
         ]));
         let names: Vec<String> = out.iter().map(|(k, _)| k.to_ascii_lowercase()).collect();
         for unwanted in ["content-length", "content-type", "content-encoding"] {
-            assert!(!names.contains(&unwanted.to_string()), "304 carried {unwanted}");
+            assert!(
+                !names.contains(&unwanted.to_string()),
+                "304 carried {unwanted}"
+            );
         }
     }
 }
-
 
 #[cfg(test)]
 mod request_directive_tests {
     use super::*;
 
     fn h(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
     fn parse(pairs: &[(&str, &str)]) -> RequestDirectives {
         RequestDirectives::parse(&h(pairs))
@@ -2126,8 +2345,14 @@ mod request_directive_tests {
     /// is nested.
     #[test]
     fn max_stale_distinguishes_bare_from_bounded() {
-        assert_eq!(parse(&[("cache-control", "max-stale")]).max_stale, Some(None));
-        assert_eq!(parse(&[("cache-control", "max-stale=60")]).max_stale, Some(Some(60)));
+        assert_eq!(
+            parse(&[("cache-control", "max-stale")]).max_stale,
+            Some(None)
+        );
+        assert_eq!(
+            parse(&[("cache-control", "max-stale=60")]).max_stale,
+            Some(Some(60))
+        );
         assert_eq!(parse(&[("cache-control", "max-age=5")]).max_stale, None);
     }
 
@@ -2141,7 +2366,10 @@ mod request_directive_tests {
     /// legal). Splitting naively on ',' would produce a bogus directive.
     #[test]
     fn quoted_values_do_not_split_the_directive_list() {
-        let d = parse(&[("cache-control", "no-cache=\"Set-Cookie, X-Thing\", max-age=30")]);
+        let d = parse(&[(
+            "cache-control",
+            "no-cache=\"Set-Cookie, X-Thing\", max-age=30",
+        )]);
         assert!(d.no_cache);
         assert_eq!(d.max_age, Some(30));
     }
@@ -2178,7 +2406,10 @@ mod request_directive_tests {
     #[test]
     fn no_cache_forces_a_miss_on_a_fresh_entry() {
         let (cache, key) = cache_with("public, max-age=600");
-        assert!(matches!(cache.lookup(&key), Lookup::Fresh(..)), "precondition: normally a hit");
+        assert!(
+            matches!(cache.lookup(&key), Lookup::Fresh(..)),
+            "precondition: normally a hit"
+        );
         let d = parse(&[("cache-control", "no-cache")]);
         assert!(matches!(cache.lookup_with(&key, &d), Lookup::Miss));
     }
@@ -2224,7 +2455,10 @@ mod corrected_age_tests {
         CachedResponse {
             status: 200,
             headers: std::sync::Arc::new(
-                headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+                headers
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
             ),
             body: bytes::Bytes::from_static(b"x"),
             hints: std::sync::Arc::new(vec![]),
@@ -2265,7 +2499,10 @@ mod corrected_age_tests {
             ("date", &d),
             ("age", "5"), // upstream under-reports badly
         ]);
-        assert!((595..=605).contains(&age), "Date should win at ~600s, got {age}");
+        assert!(
+            (595..=605).contains(&age),
+            "Date should win at ~600s, got {age}"
+        );
     }
 
     /// ...and the other way round: a large Age with a recent Date must stand,
@@ -2278,7 +2515,10 @@ mod corrected_age_tests {
             ("date", &d),
             ("age", "900"),
         ]);
-        assert!((895..=910).contains(&age), "Age should win at ~900s, got {age}");
+        assert!(
+            (895..=910).contains(&age),
+            "Age should win at ~900s, got {age}"
+        );
     }
 
     /// A Date in the future (clock skew) must not produce a negative or
@@ -2317,7 +2557,6 @@ mod corrected_age_tests {
     }
 }
 
-
 #[cfg(test)]
 mod storable_status_tests {
     use super::*;
@@ -2327,7 +2566,10 @@ mod storable_status_tests {
     #[test]
     fn the_rfc_9111_set_is_storable() {
         for s in [200, 203, 204, 300, 301, 308, 404, 405, 410, 414, 501] {
-            assert!(status_is_storable(s), "{s} is heuristically cacheable per RFC 9111 3");
+            assert!(
+                status_is_storable(s),
+                "{s} is heuristically cacheable per RFC 9111 3"
+            );
         }
     }
 
@@ -2359,10 +2601,11 @@ mod storable_status_tests {
     /// Storable is necessary, not sufficient: no-store still wins.
     #[test]
     fn storable_status_does_not_override_no_store() {
-        let headers = vec![
-            ("Cache-Control".to_string(), "no-store".to_string()),
-        ];
-        assert!(!should_cache(404, &headers), "no-store must still refuse a storable status");
+        let headers = vec![("Cache-Control".to_string(), "no-store".to_string())];
+        assert!(
+            !should_cache(404, &headers),
+            "no-store must still refuse a storable status"
+        );
     }
 }
 
@@ -2406,7 +2649,11 @@ mod capacity_tests {
         );
         // 2,000 entries of 54 KB is ~108 MB of pressure against a 4 MB bound,
         // so the great majority must be gone.
-        assert!(cache.len() < 200, "expected heavy eviction, {} entries remain", cache.len());
+        assert!(
+            cache.len() < 200,
+            "expected heavy eviction, {} entries remain",
+            cache.len()
+        );
     }
 
     /// Eviction is least-recently-read, so an entry the site actually serves
@@ -2423,8 +2670,14 @@ mod capacity_tests {
             // would while an attacker floods alongside it.
             let mut buf = [0u8; 512];
             let k = make_lookup_key("/", None, "gzip", &mut buf);
-            assert!(!matches!(cache.lookup(k), Lookup::Miss), "hot entry evicted at i={i}");
-            cache.insert(CacheKey::new("/", None, &format!("identity, x{i}")), resp(10_000));
+            assert!(
+                !matches!(cache.lookup(k), Lookup::Miss),
+                "hot entry evicted at i={i}"
+            );
+            cache.insert(
+                CacheKey::new("/", None, &format!("identity, x{i}")),
+                resp(10_000),
+            );
         }
 
         let mut buf = [0u8; 512];
@@ -2487,16 +2740,28 @@ mod capacity_accounting_tests {
         assert_eq!(cache.bytes_held(), cache.footprint_sum(), "after inserts");
 
         cache.evict_path("/p0");
-        assert_eq!(cache.bytes_held(), cache.footprint_sum(), "after evict_path");
+        assert_eq!(
+            cache.bytes_held(),
+            cache.footprint_sum(),
+            "after evict_path"
+        );
 
         cache.evict_paths(&["/p1".to_string(), "/p2".to_string()]);
-        assert_eq!(cache.bytes_held(), cache.footprint_sum(), "after evict_paths");
+        assert_eq!(
+            cache.bytes_held(),
+            cache.footprint_sum(),
+            "after evict_paths"
+        );
 
         // Overwrites, which replace rather than add.
         for _ in 0..10 {
             cache.insert(CacheKey::new("/p3", None, "gzip"), resp(20_000));
         }
-        assert_eq!(cache.bytes_held(), cache.footprint_sum(), "after overwrites");
+        assert_eq!(
+            cache.bytes_held(),
+            cache.footprint_sum(),
+            "after overwrites"
+        );
 
         cache.clear();
         assert_eq!(cache.bytes_held(), 0, "clear must zero the counter");
@@ -2510,19 +2775,29 @@ mod capacity_accounting_tests {
         let cache = Cache::with_max_bytes(1024 * 1024);
         for _cycle in 0..50 {
             for i in 0..20 {
-                cache.insert(CacheKey::new(&format!("/page{i}"), None, "gzip"), resp(5_000));
+                cache.insert(
+                    CacheKey::new(&format!("/page{i}"), None, "gzip"),
+                    resp(5_000),
+                );
             }
             for i in 0..20 {
                 cache.evict_path(&format!("/page{i}"));
             }
         }
-        assert_eq!(cache.bytes_held(), 0, "counter stranded after 50 deploy cycles");
+        assert_eq!(
+            cache.bytes_held(),
+            0,
+            "counter stranded after 50 deploy cycles"
+        );
         assert_eq!(cache.len(), 0);
 
         // And the cache still works afterwards.
         cache.insert(CacheKey::new("/after", None, "gzip"), resp(5_000));
         let mut buf = [0u8; 512];
         let k = make_lookup_key("/after", None, "gzip", &mut buf);
-        assert!(!matches!(cache.lookup(k), Lookup::Miss), "cache unusable after cycles");
+        assert!(
+            !matches!(cache.lookup(k), Lookup::Miss),
+            "cache unusable after cycles"
+        );
     }
 }

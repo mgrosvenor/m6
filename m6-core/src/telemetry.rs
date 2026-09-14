@@ -154,7 +154,9 @@ fn field(line: &str, key: &str) -> Option<u64> {
     let pat = format!("{key}=");
     let start = line.find(&pat)? + pat.len();
     let rest = &line[start..];
-    let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
     rest[..end].parse().ok()
 }
 
@@ -201,7 +203,9 @@ pub struct StatsAggregate {
     pub windows_with_hits: usize,
 }
 
-pub fn aggregate_windows<'a>(windows: impl IntoIterator<Item = &'a PeriodicStats>) -> StatsAggregate {
+pub fn aggregate_windows<'a>(
+    windows: impl IntoIterator<Item = &'a PeriodicStats>,
+) -> StatsAggregate {
     let mut agg = StatsAggregate::default();
     let (mut s50, mut s99) = (0u64, 0u64);
     for w in windows {
@@ -215,7 +219,11 @@ pub fn aggregate_windows<'a>(windows: impl IntoIterator<Item = &'a PeriodicStats
         }
     }
     let total = agg.hits + agg.misses;
-    agg.hit_rate = if total > 0 { agg.hits as f64 / total as f64 } else { 0.0 };
+    agg.hit_rate = if total > 0 {
+        agg.hits as f64 / total as f64
+    } else {
+        0.0
+    };
     if agg.windows_with_hits > 0 {
         agg.hit_p50_ns = s50 / agg.windows_with_hits as u64;
         agg.hit_p99_ns = s99 / agg.windows_with_hits as u64;
@@ -232,26 +240,85 @@ pub fn aggregate_windows<'a>(windows: impl IntoIterator<Item = &'a PeriodicStats
 /// known crawler names missed `CyberConvoyScout` and `GenomeCrawlerd`, both of
 /// which self-identify plainly; `scout` and `crawl` catch them.
 pub const BOT_MARKERS: &[&str] = &[
-    "bot", "crawl", "spider", "scout", "probe", "slurp", "fetcher", "archiver",
-    "amzn-", "gptbot", "claudebot", "claude-user", "claude-web", "anthropic",
-    "perplexity", "applebot", "bytespider", "ccbot", "facebookexternalhit",
-    "twitterbot", "linkedinbot", "mj12", "yandex", "baidu", "duckduck",
-    "googlebot", "google-extended", "bingbot", "amazonbot", "whatsapp",
-    "discord", "slackbot", "grok", "oai-searchbot", "chatgpt-user", "semrush",
+    "bot",
+    "crawl",
+    "spider",
+    "scout",
+    "probe",
+    "slurp",
+    "fetcher",
+    "archiver",
+    "amzn-",
+    "gptbot",
+    "claudebot",
+    "claude-user",
+    "claude-web",
+    "anthropic",
+    "perplexity",
+    "applebot",
+    "bytespider",
+    "ccbot",
+    "facebookexternalhit",
+    "twitterbot",
+    "linkedinbot",
+    "mj12",
+    "yandex",
+    "baidu",
+    "duckduck",
+    "googlebot",
+    "google-extended",
+    "bingbot",
+    "amazonbot",
+    "whatsapp",
+    "discord",
+    "slackbot",
+    "grok",
+    "oai-searchbot",
+    "chatgpt-user",
+    "semrush",
 ];
 
 /// Path fragments that only appear in probes. A static site has no `/fetch`.
 pub const PROBE_MARKERS: &[&str] = &[
-    ".env", "wp-admin", "wp-login", "phpmyadmin", "/.git", "xmlrpc.php",
-    "/admin", "/actuator", "credentials", "passwd", "/@fs", "../", "/fetch",
-    "/proxy", "/webhook", "/api/fetch", "/redirect", ".aws", ".azure",
-    "gcloud", "/shell", "/cgi-bin", "/console", "/.ssh", "/config.json",
+    ".env",
+    "wp-admin",
+    "wp-login",
+    "phpmyadmin",
+    "/.git",
+    "xmlrpc.php",
+    "/admin",
+    "/actuator",
+    "credentials",
+    "passwd",
+    "/@fs",
+    "../",
+    "/fetch",
+    "/proxy",
+    "/webhook",
+    "/api/fetch",
+    "/redirect",
+    ".aws",
+    ".azure",
+    "gcloud",
+    "/shell",
+    "/cgi-bin",
+    "/console",
+    "/.ssh",
+    "/config.json",
 ];
 
 /// Query or path shapes that indicate an injection attempt.
 pub const INJECTION_MARKERS: &[&str] = &[
-    "union select", "or 1=1", "<script", "javascript:", "%3cscript",
-    "/etc/passwd", "base64_decode", "concat(", "sleep(", "benchmark(",
+    "union select",
+    "or 1=1",
+    "<script",
+    "javascript:",
+    "%3cscript",
+    "/etc/passwd",
+    "base64_decode",
+    "concat(",
+    "sleep(",
+    "benchmark(",
 ];
 
 fn matches_any(haystack: &str, needles: &[&str]) -> bool {
@@ -408,9 +475,18 @@ impl TrafficSummary {
             first: String,
             last: String,
         }
+        /// Per-user-agent accumulator. A struct rather than the
+        /// `(u64, HashMap, HashMap)` it used to be: the two maps have the same
+        /// type and were read positionally as `e.1` and `e.2`, so nothing at the
+        /// use site said which one held addresses and which held paths.
+        #[derive(Default)]
+        struct UaAcc {
+            n: u64,
+            ips: HashMap<String, u64>,
+            paths: HashMap<String, u64>,
+        }
         let mut per_ip: HashMap<String, Acc> = HashMap::new();
-        let mut per_ua: HashMap<String, (u64, HashMap<String, u64>, HashMap<String, u64>)> =
-            HashMap::new();
+        let mut per_ua: HashMap<String, UaAcc> = HashMap::new();
         let mut summary = TrafficSummary::default();
 
         for rec in records {
@@ -440,12 +516,10 @@ impl TrafficSummary {
                 acc.last = rec.timestamp.clone();
             }
 
-            let e = per_ua
-                .entry(rec.user_agent().to_string())
-                .or_insert_with(|| (0, HashMap::new(), HashMap::new()));
-            e.0 += 1;
-            *e.1.entry(f.client_ip.clone()).or_default() += 1;
-            *e.2.entry(f.path.clone()).or_default() += 1;
+            let e = per_ua.entry(rec.user_agent().to_string()).or_default();
+            e.n += 1;
+            *e.ips.entry(f.client_ip.clone()).or_default() += 1;
+            *e.paths.entry(f.path.clone()).or_default() += 1;
         }
 
         // Who has disqualified their own claim.
@@ -477,7 +551,7 @@ impl TrafficSummary {
             .map(|(ip, _)| ip.clone())
             .collect();
 
-        for (ua, (n, ips, paths)) in per_ua {
+        for (ua, UaAcc { n, ips, paths }) in per_ua {
             if !claims_to_be_bot(&ua) {
                 continue;
             }
@@ -503,7 +577,9 @@ impl TrafficSummary {
                 paths: p,
             });
         }
-        summary.crawlers.sort_by(|a, b| b.requests.cmp(&a.requests));
+        summary
+            .crawlers
+            .sort_by_key(|c| std::cmp::Reverse(c.requests));
 
         let mut clients: Vec<(String, ClientSummary)> = per_ip
             .into_iter()
@@ -520,8 +596,8 @@ impl TrafficSummary {
                     .filter(|(p, _)| looks_like_injection(p))
                     .cloned()
                     .collect();
-                let rotating = a.uas.len() >= UA_ROTATION_THRESHOLD
-                    && a.n >= UA_ROTATION_MIN_REQUESTS;
+                let rotating =
+                    a.uas.len() >= UA_ROTATION_THRESHOLD && a.n >= UA_ROTATION_MIN_REQUESTS;
                 paths.truncate(16);
                 (
                     ip,
@@ -539,7 +615,7 @@ impl TrafficSummary {
                 )
             })
             .collect();
-        clients.sort_by(|a, b| b.1.requests.cmp(&a.1.requests));
+        clients.sort_by_key(|c| std::cmp::Reverse(c.1.requests));
         summary.clients = clients;
 
         let mut f: Vec<String> = forgers.into_iter().collect();
@@ -560,7 +636,10 @@ impl TrafficSummary {
     /// health check's own load generation. A rule that fires on the monitoring
     /// traffic is worse than no rule.
     pub fn suspicious(&self, _burst_threshold: u64) -> Vec<&(String, ClientSummary)> {
-        self.clients.iter().filter(|(_, c)| c.is_notable()).collect()
+        self.clients
+            .iter()
+            .filter(|(_, c)| c.is_notable())
+            .collect()
     }
 }
 
@@ -623,7 +702,10 @@ mod tests {
     #[test]
     fn idle_windows_do_not_dilute_the_percentiles() {
         let busy = PeriodicStats {
-            cache_hits: 76, cache_misses: 1, hit_p50_ns: 3455, hit_p99_ns: 3968,
+            cache_hits: 76,
+            cache_misses: 1,
+            hit_p50_ns: 3455,
+            hit_p99_ns: 3968,
             ..Default::default()
         };
         let idle = PeriodicStats::default();
@@ -654,7 +736,8 @@ mod tests {
     /// `cache_hits` must not be read out of `cache_hit_rate`.
     #[test]
     fn field_names_are_not_matched_as_prefixes() {
-        let line = "periodic stats cache_hit_rate=0.9870 cache_hits=76 hit_p0_ns=2983 hit_p50_ns=3455";
+        let line =
+            "periodic stats cache_hit_rate=0.9870 cache_hits=76 hit_p0_ns=2983 hit_p50_ns=3455";
         let s = PeriodicStats::parse(line).unwrap();
         assert_eq!(s.cache_hits, 76);
         assert_eq!(s.hit_p50_ns, 3455);
@@ -669,9 +752,17 @@ mod tests {
     fn a_user_agent_rotator_is_not_a_dozen_crawlers() {
         let mut records = Vec::new();
         for (i, name) in [
-            "ClaudeBot/1.0", "GPTBot/1.2", "Applebot/0.1", "PerplexityBot/1.0",
-            "Bytespider", "GrokBot/1.0", "LinkedInBot/1.0", "Slackbot/1.0",
-            "Discordbot/2.0", "Amzn-SearchBot/1.0", "ChatGPT-User/1.0",
+            "ClaudeBot/1.0",
+            "GPTBot/1.2",
+            "Applebot/0.1",
+            "PerplexityBot/1.0",
+            "Bytespider",
+            "GrokBot/1.0",
+            "LinkedInBot/1.0",
+            "Slackbot/1.0",
+            "Discordbot/2.0",
+            "Amzn-SearchBot/1.0",
+            "ChatGPT-User/1.0",
             "facebookexternalhit/1.1",
         ]
         .iter()
@@ -695,7 +786,10 @@ mod tests {
             ));
         }
         // A real crawler, one user agent from several addresses.
-        for (i, ip) in ["18.205.91.101", "34.194.233.48", "52.203.152.231"].iter().enumerate() {
+        for (i, ip) in ["18.205.91.101", "34.194.233.48", "52.203.152.231"]
+            .iter()
+            .enumerate()
+        {
             records.push(rec(
                 &format!("2026-09-11T05:50:{:02}Z", i),
                 ip,
@@ -738,13 +832,26 @@ mod tests {
         let ua = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
         // The paths it actually asked for, from the 09:17 burst on lon.
         let paths = [
-            "/.aws/credentials", "/.env.backup", "/.env.2", "/.env.old",
-            "/settings.php", "/composer.json", "/config.js",
+            "/.aws/credentials",
+            "/.env.backup",
+            "/.env.2",
+            "/.env.old",
+            "/settings.php",
+            "/composer.json",
+            "/config.js",
         ];
         let records: Vec<_> = paths
             .iter()
             .enumerate()
-            .map(|(i, p)| rec(&format!("2026-09-11T09:17:{:02}Z", i), "94.154.46.250", p, 404, ua))
+            .map(|(i, p)| {
+                rec(
+                    &format!("2026-09-11T09:17:{:02}Z", i),
+                    "94.154.46.250",
+                    p,
+                    404,
+                    ua,
+                )
+            })
             .collect();
 
         let s = TrafficSummary::from_records(&records);
@@ -770,8 +877,13 @@ mod tests {
         let ua = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
         let records: Vec<_> = (0..20)
             .map(|i| {
-                rec(&format!("2026-09-11T09:0{}:00Z", i % 10),
-                    "66.249.66.1", &format!("/old/post-{i}"), 404, ua)
+                rec(
+                    &format!("2026-09-11T09:0{}:00Z", i % 10),
+                    "66.249.66.1",
+                    &format!("/old/post-{i}"),
+                    404,
+                    ua,
+                )
             })
             .collect();
         let s = TrafficSummary::from_records(&records);
@@ -785,8 +897,15 @@ mod tests {
     fn many_addresses_one_user_agent_is_a_fleet_not_a_forger() {
         let ua = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
         let records: Vec<_> = (0..40)
-            .map(|i| rec(&format!("2026-09-11T05:0{}:00Z", i % 10),
-                         &format!("66.249.66.{i}"), "/", 200, ua))
+            .map(|i| {
+                rec(
+                    &format!("2026-09-11T05:0{}:00Z", i % 10),
+                    &format!("66.249.66.{i}"),
+                    "/",
+                    200,
+                    ua,
+                )
+            })
             .collect();
         let s = TrafficSummary::from_records(&records);
         assert!(s.forgers.is_empty());
@@ -799,8 +918,12 @@ mod tests {
     /// a check that listed crawler names.
     #[test]
     fn generic_markers_catch_crawlers_no_list_would_name() {
-        assert!(claims_to_be_bot("Mozilla/5.0 (compatible; CyberConvoyScout/1.0; +https://scout.cyberconvoy.co)"));
-        assert!(claims_to_be_bot("Mozilla/5.0 (compatible; GenomeCrawlerd/1.0; +https://www.nokia.com/genomecrawler)"));
+        assert!(claims_to_be_bot(
+            "Mozilla/5.0 (compatible; CyberConvoyScout/1.0; +https://scout.cyberconvoy.co)"
+        ));
+        assert!(claims_to_be_bot(
+            "Mozilla/5.0 (compatible; GenomeCrawlerd/1.0; +https://www.nokia.com/genomecrawler)"
+        ));
         assert!(!claims_to_be_bot(
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0 Safari/537.36"
         ));
@@ -810,7 +933,11 @@ mod tests {
     #[test]
     fn a_single_refused_probe_is_not_notable() {
         let s = TrafficSummary::from_records(&[rec(
-            "2026-09-11T08:09:22Z", "137.184.111.53", "/.git/config", 404, "curl/8",
+            "2026-09-11T08:09:22Z",
+            "137.184.111.53",
+            "/.git/config",
+            404,
+            "curl/8",
         )]);
         assert!(s.suspicious(100).is_empty());
         // It is still recorded; it is just not escalated.
@@ -824,10 +951,22 @@ mod tests {
         let records: Vec<_> = ["/.env", "/.git/config", "/wp-admin/setup.php"]
             .iter()
             .enumerate()
-            .map(|(i, p)| rec(&format!("2026-09-11T08:0{i}:00Z"), "203.0.113.7", p, 404, "curl/8"))
+            .map(|(i, p)| {
+                rec(
+                    &format!("2026-09-11T08:0{i}:00Z"),
+                    "203.0.113.7",
+                    p,
+                    404,
+                    "curl/8",
+                )
+            })
             .collect();
         let s = TrafficSummary::from_records(&records);
-        assert_eq!(s.suspicious(100).len(), 1, "three paths from one address is a sweep");
+        assert_eq!(
+            s.suspicious(100).len(),
+            1,
+            "three paths from one address is a sweep"
+        );
     }
 
     /// The shape with neither many paths nor great volume: one path, twenty
@@ -835,10 +974,23 @@ mod tests {
     #[test]
     fn a_small_mostly_refused_sweep_counts() {
         let mut records: Vec<_> = (0..18)
-            .map(|i| rec(&format!("2026-09-11T06:34:{:02}Z", i), "185.19.40.146",
-                         "//xmlrpc.php", 404, "curl/8"))
+            .map(|i| {
+                rec(
+                    &format!("2026-09-11T06:34:{:02}Z", i),
+                    "185.19.40.146",
+                    "//xmlrpc.php",
+                    404,
+                    "curl/8",
+                )
+            })
             .collect();
-        records.push(rec("2026-09-11T06:34:59Z", "185.19.40.146", "/", 200, "curl/8"));
+        records.push(rec(
+            "2026-09-11T06:34:59Z",
+            "185.19.40.146",
+            "/",
+            200,
+            "curl/8",
+        ));
         let s = TrafficSummary::from_records(&records);
         assert_eq!(s.suspicious(100).len(), 1);
     }
@@ -851,20 +1003,37 @@ mod tests {
     #[test]
     fn a_busy_client_being_served_is_not_suspicious() {
         let records: Vec<_> = (0..185)
-            .map(|i| rec(&format!("2026-09-11T06:{:02}:00Z", i % 60),
-                         "220.233.79.92", "/capabilities", 200, "curl/8.7.1"))
+            .map(|i| {
+                rec(
+                    &format!("2026-09-11T06:{:02}:00Z", i % 60),
+                    "220.233.79.92",
+                    "/capabilities",
+                    200,
+                    "curl/8.7.1",
+                )
+            })
             .collect();
         let s = TrafficSummary::from_records(&records);
         assert_eq!(s.total_requests, 185);
-        assert!(s.suspicious(100).is_empty(), "a served burst is not an incident");
+        assert!(
+            s.suspicious(100).is_empty(),
+            "a served burst is not an incident"
+        );
     }
 
     /// The same volume, mostly refused, is.
     #[test]
     fn a_busy_client_being_refused_is_suspicious() {
         let records: Vec<_> = (0..185)
-            .map(|i| rec(&format!("2026-09-11T06:{:02}:00Z", i % 60),
-                         "203.0.113.9", "/nonexistent", 404, "curl/8.7.1"))
+            .map(|i| {
+                rec(
+                    &format!("2026-09-11T06:{:02}:00Z", i % 60),
+                    "203.0.113.9",
+                    "/nonexistent",
+                    404,
+                    "curl/8.7.1",
+                )
+            })
             .collect();
         let s = TrafficSummary::from_records(&records);
         let sus = s.suspicious(100);
@@ -874,8 +1043,14 @@ mod tests {
 
     #[test]
     fn probe_and_injection_shapes() {
-        for p in ["/.env", "/@fs/root/.aws/credentials", "/wp-admin/setup.php",
-                  "/static../etc/passwd", "/actuator", "/proxy"] {
+        for p in [
+            "/.env",
+            "/@fs/root/.aws/credentials",
+            "/wp-admin/setup.php",
+            "/static../etc/passwd",
+            "/actuator",
+            "/proxy",
+        ] {
             assert!(looks_like_probe(p), "{p} should read as a probe");
         }
         for p in ["/", "/capabilities", "/assets/css/style.css?v=713e7c6e"] {
@@ -885,7 +1060,9 @@ mod tests {
         // raw path alone reports clean against exactly the traffic this
         // exists to catch.
         assert!(looks_like_injection("/x?q=1%20UNION%20SELECT%20password"));
-        assert!(looks_like_injection("/x?q=%3Cscript%3Ealert(1)%3C/script%3E"));
+        assert!(looks_like_injection(
+            "/x?q=%3Cscript%3Ealert(1)%3C/script%3E"
+        ));
         assert!(looks_like_injection("/x?q=1+UNION+SELECT+password"));
         assert!(looks_like_probe("/static..%2Fetc%2Fpasswd"));
         // And unencoded still works.
@@ -904,7 +1081,6 @@ mod tests {
         assert_eq!(parse_analytics(&text, "").count(), 2);
     }
 }
-
 
 // ── The /perf metrics payload ────────────────────────────────────────────────
 //

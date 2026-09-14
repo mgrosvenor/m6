@@ -243,16 +243,68 @@ SHOULD say so.
 
 ### 3.6 Compression
 
-The backend SHOULD NOT compress its response, and SHOULD ignore
-`Accept-Encoding`.
+**Compression is the backend's job. The proxy is a cache, not a transformer.**
 
-The proxy performs content negotiation and compression itself, caches each
-representation, and reuses it across clients. A backend that compresses
-duplicates that work per request and prevents the proxy from serving a
-different encoding from cache.
+This section previously said the opposite: that a backend SHOULD NOT compress
+because "the proxy performs content negotiation and compression itself". That
+was wrong, and wrong in the direction that costs a backend author real
+performance. **m6-http has no compressor.** `brotli` and `flate2` are
+dependencies of `m6-core`, the implementation is `m6-core/src/compress.rs`, and
+nothing under `m6-http/src` calls it. What the proxy does is *negotiate between
+and cache the representations a backend produced*, keyed on content-encoding.
+It cannot manufacture one that does not exist.
 
-A backend that does compress MUST send an accurate `Content-Encoding` and MUST
-honour `Accept-Encoding` correctly, including `q=0` meaning "not acceptable".
+The consequence of believing the old text: a C, Go or Python backend written
+from this document declined to compress, the proxy did not compress either, and
+the bytes went out uncompressed forever. It was invisible for the Rust services
+because `m6-core` compresses for them, which is exactly what the old text told
+backends not to do.
+
+So:
+
+- A backend **MAY** compress. If it does, it MUST send an accurate
+  `Content-Encoding`, and it MUST honour `Accept-Encoding` correctly, including
+  `q=0` meaning "not acceptable".
+- A backend that does not compress is serving one representation, and that is a
+  legitimate choice — a device backend has better uses for its cycles.
+- **Either way it MUST say which, in config**, so the proxy and the backend
+  agree. See §3.6.1.
+
+### 3.6.1 Declaring it: `[[backend]] compresses`
+
+`site.toml` is read by both sides:
+
+```toml
+[[backend]]
+name       = "my-renderer"
+sockets    = "/run/m6/my-renderer*.sock"
+compresses = false          # default: true
+```
+
+**The proxy** uses it to decide whether to advertise an encoding dimension. For
+a backend that does not compress there is exactly one representation, so
+`Vary: Accept-Encoding` would promise variants that can never exist and every
+shared cache downstream would fragment its storage on a header that cannot
+change the body. A `Vary` the backend sent itself is left alone; this is about
+what the proxy adds.
+
+**The backend** reads the same key and MUST refuse to start if it disagrees
+with what it can actually do. `m6-core` services get this from
+`m6_core::compress::check_declared_support`, called before binding, exiting `2`
+per §8.3. A backend in another language SHOULD do the equivalent. Both
+directions are faults, and the second is the dangerous one:
+
+| declared | reality | what goes wrong |
+|---|---|---|
+| `true` | compresses nothing | the proxy advertises variants that never exist; downstream caches fragment for nothing |
+| `false` | compresses | the proxy stops varying on `Accept-Encoding`, so a compressed body can be cached and replayed to a client that asked for identity and cannot read it |
+
+**Default is `true`**, because every backend in the reference deployment is
+built on `m6-core`, which compresses unless told not to. A `site.toml` written
+before this key existed keeps working and keeps agreeing.
+
+If the proxy ever gains a compressor, this section is the one to revisit: the
+key would then describe who *does* the work rather than whether it happens.
 
 ---
 

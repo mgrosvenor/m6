@@ -57,7 +57,10 @@ fn host_is_valid(v: &str) -> bool {
     let (host, port) = match v.strip_prefix('[') {
         Some(rest) => match rest.split_once(']') {
             Some((inside, after)) => {
-                if !inside.bytes().all(|b| b.is_ascii_hexdigit() || b == b':' || b == b'.') {
+                if !inside
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() || b == b':' || b == b'.')
+                {
                     return false;
                 }
                 (None, after)
@@ -77,9 +80,24 @@ fn host_is_valid(v: &str) -> bool {
         // reg-name: unreserved / pct-encoded / sub-delims.
         let ok = |b: u8| {
             b.is_ascii_alphanumeric()
-                || matches!(b, b'-' | b'.' | b'_' | b'~' | b'%'
-                             | b'!' | b'$' | b'&' | b'\'' | b'(' | b')'
-                             | b'*' | b'+' | b',' | b';' | b'=')
+                || matches!(
+                    b,
+                    b'-' | b'.'
+                        | b'_'
+                        | b'~'
+                        | b'%'
+                        | b'!'
+                        | b'$'
+                        | b'&'
+                        | b'\''
+                        | b'('
+                        | b')'
+                        | b'*'
+                        | b'+'
+                        | b','
+                        | b';'
+                        | b'='
+                )
         };
         if !host.bytes().all(ok) {
             return false;
@@ -136,7 +154,9 @@ pub fn expectation(buf: &[u8]) -> Option<Expectation> {
 
     let mut found = Expectation::None;
     for line in lines {
-        let Some(colon) = line.iter().position(|&b| b == b':') else { continue };
+        let Some(colon) = line.iter().position(|&b| b == b':') else {
+            continue;
+        };
         if !line[..colon].eq_ignore_ascii_case(b"expect") {
             continue;
         }
@@ -161,10 +181,18 @@ pub fn expectation(buf: &[u8]) -> Option<Expectation> {
 
 fn trim_ascii(mut b: &[u8]) -> &[u8] {
     while let [first, rest @ ..] = b {
-        if first.is_ascii_whitespace() { b = rest } else { break }
+        if first.is_ascii_whitespace() {
+            b = rest
+        } else {
+            break;
+        }
     }
     while let [rest @ .., last] = b {
-        if last.is_ascii_whitespace() { b = rest } else { break }
+        if last.is_ascii_whitespace() {
+            b = rest
+        } else {
+            break;
+        }
     }
     b
 }
@@ -201,7 +229,9 @@ fn decode_chunked(buf: &[u8]) -> Chunked {
 
     loop {
         // chunk-size [ ";" chunk-ext ] CRLF
-        let Some(eol) = find_crlf(&buf[i..]) else { return Chunked::Incomplete };
+        let Some(eol) = find_crlf(&buf[i..]) else {
+            return Chunked::Incomplete;
+        };
         let line = &buf[i..i + eol];
         // Extensions are permitted and ignored; the size ends at ';'.
         let size_str = match line.iter().position(|&c| c == b';') {
@@ -231,7 +261,9 @@ fn decode_chunked(buf: &[u8]) -> Chunked {
         if size == 0 {
             // Last chunk. Trailer fields may follow, ending with a blank line.
             loop {
-                let Some(eol) = find_crlf(&buf[i..]) else { return Chunked::Incomplete };
+                let Some(eol) = find_crlf(&buf[i..]) else {
+                    return Chunked::Incomplete;
+                };
                 i += eol + 2;
                 if eol == 0 {
                     return Chunked::Done(out);
@@ -281,7 +313,6 @@ fn strip_absolute_form(target: &str) -> &str {
         None => "/",
     }
 }
-
 
 /// Outcome of parsing a client request. Public so security tests can assert on
 /// what the ingress boundary accepts, rejects, and strips.
@@ -380,7 +411,9 @@ pub fn parse_request(buf: &[u8]) -> ParseResult {
 
     for h in &req.headers[..nheaders] {
         if h.name.eq_ignore_ascii_case("transfer-encoding") {
-            let Ok(v) = std::str::from_utf8(h.value) else { return ParseResult::Error };
+            let Ok(v) = std::str::from_utf8(h.value) else {
+                return ParseResult::Error;
+            };
             // RFC 9112 6.1: `chunked` must be the FINAL coding, and any other
             // coding is one this server does not implement. `chunked, gzip`
             // is malformed; `gzip, chunked` names a coding we cannot decode.
@@ -425,7 +458,9 @@ pub fn parse_request(buf: &[u8]) -> ParseResult {
         // A header value that is not UTF-8 is dropped rather than rejected
         // (matching prior behaviour); `content-length` is the exception
         // handled above, where it is a framing error.
-        let Ok(v) = std::str::from_utf8(h.value) else { continue };
+        let Ok(v) = std::str::from_utf8(h.value) else {
+            continue;
+        };
         fwd_headers.push((h.name.to_string(), v.to_string()));
     }
 
@@ -482,8 +517,6 @@ pub fn parse_request(buf: &[u8]) -> ParseResult {
         None => 0,
     };
 
-    drop(req); // release borrow of `headers`
-
     if saw_te {
         // Decoded here, so the body handed on is a plain one of known length
         // and no downstream hop has to agree with us about chunk framing.
@@ -496,7 +529,11 @@ pub fn parse_request(buf: &[u8]) -> ParseResult {
                     method,
                     path,
                     query,
-                    version: if is_http11 { "HTTP/1.1".to_string() } else { "HTTP/1.0".to_string() },
+                    version: if is_http11 {
+                        "HTTP/1.1".to_string()
+                    } else {
+                        "HTTP/1.0".to_string()
+                    },
                     headers: fwd_headers,
                     body,
                 })
@@ -523,7 +560,11 @@ pub fn parse_request(buf: &[u8]) -> ParseResult {
         // string. Persistent connections need it, because HTTP/1.1 defaults to
         // keeping the connection and HTTP/1.0 defaults to closing it -- and
         // with the constant in place an HTTP/1.0 client was told keep-alive.
-        version: if is_http11 { "HTTP/1.1".to_string() } else { "HTTP/1.0".to_string() },
+        version: if is_http11 {
+            "HTTP/1.1".to_string()
+        } else {
+            "HTTP/1.0".to_string()
+        },
         headers: fwd_headers,
         body,
     })
@@ -630,7 +671,12 @@ pub struct Responder<'a, W: std::io::Write> {
 impl<'a, W: std::io::Write> Responder<'a, W> {
     /// Answer a request whose framing the connection has already decided.
     pub fn new(w: &'a mut W, method: &str, keep_alive: bool) -> Self {
-        Responder { w, is_head: method.eq_ignore_ascii_case("HEAD"), keep_alive, written: 0 }
+        Responder {
+            w,
+            is_head: method.eq_ignore_ascii_case("HEAD"),
+            keep_alive,
+            written: 0,
+        }
     }
 
     /// Whether the connection stays open after this response.
@@ -776,7 +822,11 @@ impl<'a, W: std::io::Write> Responder<'a, W> {
             w,
             "Content-Length: {}\r\nConnection: {}\r\n\r\n",
             length,
-            if self.keep_alive { "keep-alive" } else { "close" }
+            if self.keep_alive {
+                "keep-alive"
+            } else {
+                "close"
+            }
         )?;
         w.flush()?;
         drop(w);
@@ -784,10 +834,7 @@ impl<'a, W: std::io::Write> Responder<'a, W> {
         // RFC 9110 9.3.2. A 304 and a 204 have no body either (RFC 9110 15.4.5,
         // 15.3.5), and one sent on those is unframed bytes the peer will read
         // as the start of the next response.
-        Ok(self.is_head
-            || status == 204
-            || status == 304
-            || (100..200).contains(&status))
+        Ok(self.is_head || status == 204 || status == 304 || (100..200).contains(&status))
     }
 }
 
@@ -798,7 +845,10 @@ mod absolute_form_tests {
     fn parse(raw: &[u8]) -> RawRequest {
         match parse_request(raw) {
             ParseResult::Complete(r) => r,
-            other => panic!("expected Complete, got {:?}", std::mem::discriminant(&other)),
+            other => panic!(
+                "expected Complete, got {:?}",
+                std::mem::discriminant(&other)
+            ),
         }
     }
 
@@ -839,7 +889,10 @@ mod absolute_form_tests {
     #[test]
     fn scheme_relative_targets_are_not_rewritten() {
         let r = parse(b"GET //evil.com/x HTTP/1.1\r\nHost: x\r\n\r\n");
-        assert_eq!(r.path, "//evil.com/x", "scheme-relative must survive intact");
+        assert_eq!(
+            r.path, "//evil.com/x",
+            "scheme-relative must survive intact"
+        );
     }
 
     /// Only a real scheme counts. A path that merely contains "://" is a path.
@@ -869,8 +922,12 @@ mod chunked_tests {
             ParseResult::Error => panic!("expected Complete, got Error"),
         }
     }
-    fn is_error(raw: &[u8]) -> bool { matches!(parse_request(raw), ParseResult::Error) }
-    fn is_incomplete(raw: &[u8]) -> bool { matches!(parse_request(raw), ParseResult::Incomplete) }
+    fn is_error(raw: &[u8]) -> bool {
+        matches!(parse_request(raw), ParseResult::Error)
+    }
+    fn is_incomplete(raw: &[u8]) -> bool {
+        matches!(parse_request(raw), ParseResult::Incomplete)
+    }
 
     const HEAD: &[u8] = b"POST /x HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n";
 
@@ -892,10 +949,15 @@ mod chunked_tests {
     #[test]
     fn the_decoded_body_gets_a_content_length_and_te_is_not_forwarded() {
         let r = complete(&with(b"5\r\nhello\r\n0\r\n\r\n"));
-        let cl = r.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("content-length"));
+        let cl = r
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-length"));
         assert_eq!(cl.map(|(_, v)| v.as_str()), Some("5"));
         assert!(
-            !r.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("transfer-encoding")),
+            !r.headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("transfer-encoding")),
             "transfer-coding is hop-by-hop and must not be forwarded"
         );
     }
@@ -916,7 +978,7 @@ mod chunked_tests {
     #[test]
     fn a_partial_chunked_body_is_incomplete() {
         assert!(is_incomplete(&with(b"5\r\nhel")));
-        assert!(is_incomplete(&with(b"5\r\nhello\r\n")));      // no terminator yet
+        assert!(is_incomplete(&with(b"5\r\nhello\r\n"))); // no terminator yet
         assert!(is_incomplete(&with(b"5\r\nhello\r\n0\r\n"))); // trailers unterminated
     }
 
@@ -926,7 +988,10 @@ mod chunked_tests {
     fn malformed_chunk_sizes_are_refused() {
         assert!(is_error(&with(b"+5\r\nhello\r\n0\r\n\r\n")), "sign");
         assert!(is_error(&with(b"0x5\r\nhello\r\n0\r\n\r\n")), "0x prefix");
-        assert!(is_error(&with(b" 5\r\nhello\r\n0\r\n\r\n")), "leading space");
+        assert!(
+            is_error(&with(b" 5\r\nhello\r\n0\r\n\r\n")),
+            "leading space"
+        );
         assert!(is_error(&with(b"5_0\r\nhello\r\n0\r\n\r\n")), "underscore");
         assert!(is_error(&with(b"\r\nhello\r\n0\r\n\r\n")), "empty size");
         assert!(is_error(&with(b"ffffffffffffffffff\r\n")), "size overflow");
@@ -965,8 +1030,12 @@ mod chunked_tests {
 mod host_tests {
     use super::*;
 
-    fn is_error(raw: &[u8]) -> bool { matches!(parse_request(raw), ParseResult::Error) }
-    fn is_ok(raw: &[u8]) -> bool { matches!(parse_request(raw), ParseResult::Complete(_)) }
+    fn is_error(raw: &[u8]) -> bool {
+        matches!(parse_request(raw), ParseResult::Error)
+    }
+    fn is_ok(raw: &[u8]) -> bool {
+        matches!(parse_request(raw), ParseResult::Complete(_))
+    }
 
     fn get(host: &str) -> Vec<u8> {
         format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n").into_bytes()
@@ -983,7 +1052,10 @@ mod host_tests {
     #[test]
     fn hosts_outside_the_authority_alphabet_are_refused() {
         assert!(is_error(&get("ex<ample>.com")), "delimiters");
-        assert!(is_error(&get("example.com/path")), "a path is not an authority");
+        assert!(
+            is_error(&get("example.com/path")),
+            "a path is not an authority"
+        );
         assert!(is_error(&get("example.com:https")), "port must be digits");
         assert!(is_error(&get("example.com:99999999")), "port out of range");
         assert!(is_error(&get("[::1")), "unterminated literal");
@@ -1016,9 +1088,12 @@ mod host_tests {
 mod stream_tests {
     use super::*;
 
-    fn respond(method: &str, keep_alive: bool, len: u64, body: &[u8])
-        -> (std::io::Result<()>, String)
-    {
+    fn respond(
+        method: &str,
+        keep_alive: bool,
+        len: u64,
+        body: &[u8],
+    ) -> (std::io::Result<()>, String) {
         let mut out: Vec<u8> = Vec::new();
         let r = {
             let mut resp = Responder::new(&mut out, method, keep_alive);
@@ -1038,7 +1113,8 @@ mod stream_tests {
         let mut out: Vec<u8> = Vec::new();
         {
             let mut resp = Responder::new(&mut out, "GET", true);
-            resp.send(200, &[("Content-Type", "text/plain")], body).expect("send");
+            resp.send(200, &[("Content-Type", "text/plain")], body)
+                .expect("send");
         }
         assert_eq!(streamed, String::from_utf8_lossy(&out));
     }
@@ -1049,7 +1125,11 @@ mod stream_tests {
         let body = vec![b'x'; 200_000];
         let (r, s) = respond("GET", true, body.len() as u64, &body[..]);
         r.expect("stream");
-        assert!(s.contains("Content-Length: 200000"), "head was:\n{}", &s[..120.min(s.len())]);
+        assert!(
+            s.contains("Content-Length: 200000"),
+            "head was:\n{}",
+            &s[..120.min(s.len())]
+        );
         let split = s.find("\r\n\r\n").unwrap() + 4;
         assert_eq!(s.len() - split, 200_000);
     }

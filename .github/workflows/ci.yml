@@ -1,0 +1,281 @@
+name: CI
+
+# Pull requests, not pushes. Owner's call.
+#
+# The local checks are what a push goes through: `.githooks/pre-push` runs
+# `check.sh`, and a merge into develop has already been through
+# `tools/build-host-tests.sh` on a real Linux box, which tests strictly more than
+# a runner can -- it has h2spec and h3spec installed and it is quiet enough to
+# measure. Running the same ground again on every push spends runner minutes to
+# re-confirm what the build host already said.
+#
+# A pull request is different: it is the point where someone else's change arrives
+# and nothing local has vouched for it.
+#
+# WHAT IS NOT HERE: the performance check. A wall-clock measurement on a shared
+# runner measures the runner, not the code. It stays on the build host, which
+# is quiet and is where the recorded numbers in tools/perf-baseline.txt were
+# taken. See CLAUDE.md, "Why the build host and not the laptop" -- the same
+# argument applies twice over to a runner shared with the rest of the world.
+
+on:
+  pull_request:
+    branches: [main, develop]
+  # Manual, for re-running against a branch without opening a pull request.
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-test:
+    name: build, tests, clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Enforceable as of 2026-09-13, when the tree was formatted. Before that
+      # it would have rewritten 1,890 places: the code aligned struct fields by
+      # hand and rustfmt undoes that. The owner's call was to run it and accept
+      # the result, so now there is one answer to what the formatting is and no
+      # one has to hold it in their head.
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      # Zero warnings, release and test builds, pre-existing included. This is
+      # a standing rule and it is checked on Linux because that is where it
+      # runs: three defects have only ever shown up there.
+      - name: Release build, zero warnings
+        run: |
+          cargo build --workspace --release 2>&1 | tee build.log
+          n=$(grep -c '^warning' build.log || true)
+          echo "release warnings: $n"
+          [ "$n" -eq 0 ] || { echo "::error::$n release warning(s)"; exit 1; }
+
+      - name: Test build, zero warnings
+        run: |
+          cargo test --workspace --no-run 2>&1 | tee testbuild.log
+          n=$(grep -c '^warning' testbuild.log || true)
+          echo "test-build warnings: $n"
+          [ "$n" -eq 0 ] || { echo "::error::$n test-build warning(s)"; exit 1; }
+
+      # Capture in full, then report. Grepping the pipe drops the assertion
+      # message and leaves a bare `panicked at <file>:<line>`, which names the
+      # place and not the reason.
+      - name: Test suite
+        run: |
+          cargo test --workspace > full.log 2>&1 || true
+          grep -E '^test result:' full.log || true
+          if grep -q '^failures:' full.log; then
+            sed -n '/^failures:/,$p' full.log | head -80
+            echo "::error::tests failed"
+            exit 1
+          fi
+
+      # Clippy must be silent: `-D warnings`, no ceiling. It went to zero on
+      # 2026-09-13 and is held there the same way rustc warnings are. A new
+      # lint from a toolchain upgrade fails this, which is intended.
+      - name: Clippy, silent
+        run: ./tools/clippy.sh
+
+  conformance:
+    name: h1, h2, h3 conformance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # h1spec is delivered through uvx. On the build host this was installed
+      # but not on the gate's PATH, and the resulting skip was silent, so the
+      # four h1 targets went ungated for weeks on the one box that gated a
+      # deploy. Install it explicitly and let the script fail if it is absent.
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Install h2spec
+        run: |
+          curl -sSL -o h2spec.tar.gz \
+            https://github.com/summerwind/h2spec/releases/download/v2.6.0/h2spec_linux_amd64.tar.gz
+          tar xzf h2spec.tar.gz
+          sudo install -m755 h2spec /usr/local/bin/h2spec
+          h2spec --version
+
+      - name: Install h3spec
+        run: |
+          curl -sSL -o h3spec \
+            https://github.com/kazu-yamamoto/h3spec/releases/download/v0.1.13/h3spec-linux-x86_64
+          sudo install -m755 h3spec /usr/local/bin/h3spec
+
+      - name: Build the servers under test
+        run: cargo build --workspace --release
+
+      # WITHOUT --allow-missing-tools, deliberately. All three testers are
+      # installed above, so an absent one here is a failure and not a skip.
+      # That flag exists for a laptop and is never a way to ship.
+      - name: Conformance
+        run: ./tools/conformance.sh
+
+  dependencies:
+    name: advisories, licences, duplicates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  examples:
+    name: the examples build and work
+    runs-on: ubuntu-latest
+    steps:
+      # SIBLING CHECKOUTS, and the layout is load-bearing. The example renderer
+      # crates depend on m6 by relative path (`../../../../m6/m6-core`), so
+      # m6-examples and m6 have to sit beside each other. Checking either one out
+      # at the workspace root breaks the path and the error is a missing
+      # Cargo.toml several directories away from the cause.
+      - uses: actions/checkout@v4
+        with:
+          path: m6
+
+      - uses: actions/checkout@v4
+        with:
+          repository: mgrosvenor/m6-examples
+          path: m6-examples
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            m6
+            m6-examples
+
+      - name: Build m6
+        working-directory: m6
+        run: |
+          cargo build --workspace --release
+          echo "$PWD/target/release" >> "$GITHUB_PATH"
+
+      # Zero warnings and silent clippy, the same standard as m6 itself: a reader
+      # copies from these.
+      - name: Examples build, zero warnings
+        working-directory: m6-examples
+        run: |
+          cargo build --release 2>&1 | tee build.log
+          n=$(grep -c '^warning' build.log || true)
+          echo "examples release warnings: $n"
+          [ "$n" -eq 0 ] || { echo "::error::$n warning(s) building the examples"; exit 1; }
+
+      - name: Examples clippy, silent
+        working-directory: m6-examples
+        run: |
+          cargo clippy --workspace --all-targets --release 2>&1 | tee clippy.log
+          n=$(grep -c '^warning' clippy.log || true)
+          [ "$n" -eq 0 ] || { echo "::error::$n clippy finding(s) in the examples"; exit 1; }
+
+      - name: Examples unit tests
+        working-directory: m6-examples
+        run: |
+          cargo test --workspace > full.log 2>&1 || true
+          grep -E '^test result:' full.log || true
+          if grep -q '^failures:' full.log; then
+            sed -n '/^failures:/,$p' full.log | head -60
+            echo "::error::example tests failed"
+            exit 1
+          fi
+
+      # m6-file's config schema changed on 2026-09-12 and ten example configs
+      # were left naming no handler, so the service exited 2 before binding and
+      # every asset in every example returned 502 for two days. Parsing each
+      # config with the real binary is a second of work and catches that outright.
+      #
+      # Every example is accounted for. 06-systemd is systemd units with no site
+      # config, and 09-global-deployment's configs name /etc/letsencrypt paths for
+      # five real cache nodes, so m6-http would reject them here for a missing
+      # certificate rather than for anything wrong with them; its own integration
+      # test covers it and ran above. An example with neither a config nor a
+      # reason recorded here fails the job.
+      - name: Every example's config parses
+        working-directory: m6-examples
+        run: |
+          bad=0 unexplained=0
+          for d in examples/*/; do
+            name=$(basename "$d")
+            case "$name" in
+              data) continue ;;
+              06-systemd) echo "  $name  not parsed: systemd units only, no site config"; continue ;;
+              09-global-deployment) echo "  $name  not parsed: configs name letsencrypt paths; its integration test covers it"; continue ;;
+            esac
+            sys="$d/configs/system-dev.toml"
+            [ -f "$sys" ] || sys="$d/site.toml"
+            if [ ! -f "$sys" ]; then
+              echo "  $name  NO CONFIG and no reason recorded for that"
+              unexplained=$((unexplained + 1)); continue
+            fi
+            if out=$(m6-http "$(cd "$d" && pwd)" "$(cd "$(dirname "$sys")" && pwd)/$(basename "$sys")" --dump-config 2>&1 >/dev/null) && [ -z "$out" ]; then
+              echo "  $name  ok"
+            else
+              echo "  $name  $(echo "$out" | head -1)"
+              bad=$((bad + 1))
+            fi
+          done
+          [ "$bad" -eq 0 ] || { echo "::error::$bad example config(s) rejected by m6-http"; exit 1; }
+          [ "$unexplained" -eq 0 ] || { echo "::error::$unexplained example(s) with no config and no recorded reason"; exit 1; }
+
+      # The one example that runs the whole stack: m6-http at the edge, m6-html,
+      # m6-file, m6-md, m6-auth-server and a custom renderer. If this passes, the
+      # parts work together.
+      #
+      # A FRESH CHECKOUT, which is the point: keys/ and the auth database are not
+      # in git, so dev.sh generates a certificate with openssl (the runner has no
+      # mkcert) and creates the admin user. That is exactly what a new reader gets
+      # on step one of the README, and it is checked here rather than assumed.
+      - name: Example 05, end to end over the running stack
+        working-directory: m6-examples/examples/05-cms
+        run: |
+          M6="$GITHUB_WORKSPACE/m6" M6_NO_BROWSER=1 ./dev.sh --no-open > dev.log 2>&1 &
+          for _ in $(seq 1 180); do
+            code=$(curl -sk --http1.1 -o /dev/null -w '%{http_code}' https://127.0.0.1:8443/ 2>/dev/null || true)
+            [ "$code" = "200" ] && break
+            sleep 1
+          done
+          if [ "$(curl -sk --http1.1 -o /dev/null -w '%{http_code}' https://127.0.0.1:8443/ 2>/dev/null)" != "200" ]; then
+            echo "--- dev.sh ---"; tail -40 dev.log
+            echo "--- services ---"; tail -20 logs/*.log 2>/dev/null || true
+            echo "::error::the 05-cms stack never answered in 180s"
+            exit 1
+          fi
+          ./test.sh
+
+      - name: Stop the stack
+        if: always()
+        working-directory: m6-examples/examples/05-cms
+        run: |
+          for pid in $(pgrep -f "$PWD" 2>/dev/null || true); do
+            [ "$pid" = "$$" ] && continue
+            kill "$pid" 2>/dev/null || true
+          done
+
+  msrv:
+    name: minimum supported Rust version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read rust-version from the workspace
+        id: msrv
+        run: echo "version=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+      # Declaring an MSRV and not testing it is a claim, not a fact.
+      - run: cargo check --workspace --all-targets
