@@ -100,7 +100,7 @@ fi
 # say "pass". A laptop without h2spec still gets the h1 gate, and the run says
 # plainly what it did not do.
 #
-# The pre-prod gate (`deploy/run-tests.sh`, on the Linux build host where both
+# The full checks (`tools/build-host-tests.sh`, on the Linux build host where both
 # testers are installed) runs WITHOUT the flag, so the path to a deploy cannot
 # skip h2 or h3. That split is the whole design: skipping is a laptop
 # convenience and never a way to ship.

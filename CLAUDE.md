@@ -54,11 +54,20 @@ and when it is time to ship:
 | clippy | **silent. `-D warnings`, no ceiling**, from 2026-09-13 | `tools/clippy.sh` |
 | h1, h2, h3 conformance | at or above the recorded scores | `tools/conformance.sh` |
 | performance | within margin of the recorded number | `tools/perfcheck.sh` |
+| cargo-deny | advisories, licences and sources | `cargo deny check` |
+| the examples build | zero warnings, clippy silent, their tests pass, every config parses | the `m6-examples` repository |
+| the examples work | example 05's end-to-end suite over the whole running stack | `examples/05-cms/test.sh` |
 
-`tools/merge.sh` runs all of it through `deploy/run-tests.sh` on the build
+`tools/merge.sh` runs all of it through `tools/build-host-tests.sh` on the build
 host, and records what it ran in the merge commit. **The pre-push hook refuses
 a merge commit on `develop` that carries no such record**, so this is not a
 convention that can be quietly skipped.
+
+**The examples are not a courtesy.** `m6-examples` is the only code in the
+checks that uses m6's interfaces, and until 2026-09-14 nothing built it: it had
+stopped compiling entirely, and five more defects were sitting underneath that
+where nobody could see them. A change to m6 lands with the examples building, or
+it does not land. See `docs/LESSONS.md` lesson 41.
 
 ### Why the build host and not the laptop
 

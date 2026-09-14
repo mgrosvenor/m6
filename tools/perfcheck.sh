@@ -22,7 +22,7 @@
 # reading of one process is a reading of the afternoon. See the m6 handover's
 # lesson 7 and docs/PERFORMANCE.md.
 #
-# WHERE IT RUNS. The build host, through deploy/run-tests.sh, and not the
+# WHERE IT RUNS. The build host, and not the
 # laptop's pre-push hook. A wall-clock measurement needs a quiet machine: this
 # laptop sits at load 20-30 with the owner's own dev servers and preview
 # instances running, and readings there moved by half between consecutive runs.
