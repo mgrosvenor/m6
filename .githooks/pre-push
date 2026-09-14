@@ -21,27 +21,42 @@
 # Bypass with --no-verify only if you can say out loud why, and expect the
 # next person to find it in the history.
 #
-# ── Read every ref BEFORE running anything slow ──────────────────────────────
+# ── This hook is FAST, and that is the point ─────────────────────────────────
 #
-# This used to `exec check.sh` from inside the `while read` loop, and that broke
-# pushing outright: **git died with SIGPIPE (exit 141) and no error message.**
+# It used to run `check.sh` -- the whole workspace test suite single-threaded, plus
+# conformance -- which took over ten minutes. **That broke pushing outright.** git
+# opens its connection to the remote, then runs the hook, then sends the pack. With
+# a ten-minute hook in the middle the connection sits idle long enough for the
+# server to close it, and git then writes the pack to a dead socket: killed by
+# SIGPIPE, exit 141, no error message. From the outside it looked exactly like a
+# push that silently did nothing, while check.sh printed "All checks passed".
 #
-# `exec` replaces the hook process, so git's stdin pipe -- the one it is writing
-# the ref list down -- was inherited by check.sh, which never reads it. git wrote
-# to a pipe with nobody listening, got EPIPE, and was killed by SIGPIPE. From the
-# outside it looked exactly like a push that silently did nothing: check.sh
-# printed "All checks passed", and the remote never moved. It took four failed
-# pushes and a `--no-verify --dry-run` to establish that the hook was the cause
-# rather than the network, the credentials or the refusal logic.
+# It took several attempts to attribute, and `git push --no-verify --dry-run`
+# reporting `faedb8f..47df3b0 develop -> develop` and exit 0 is what settled it:
+# the network, the credentials and the refusal logic were all fine.
 #
-# `exec` inside the loop was also wrong on its own terms: it left every ref after
-# the first unvalidated, so a push of two branches at once only ever checked one.
+# So the content checks are not here any more, and nothing is lost by that,
+# because two things already cover them and both are stricter:
 #
-# So: drain stdin completely, decide, and only then run the checks -- once, with
-# stdin from /dev/null so nothing downstream can inherit git's pipe.
+#   - a PULL REQUEST runs the full set in CI, and a pull request is the only way
+#     work reaches develop or main
+#   - a MERGE runs tools/build-host-tests.sh on a real Linux box, which tests
+#     strictly more than either: it has h2spec and h3spec installed, and it is
+#     quiet enough for the performance numbers to mean something
+#
+# What stays here is what is instant and cannot be checked anywhere else: the
+# branch rules. A hook has to be cheap enough that nobody reaches for
+# `--no-verify`, and this one is now milliseconds.
+#
+# Run the local set deliberately when you want it:  ./check.sh
+#
+# ── Read every ref before deciding ───────────────────────────────────────────
+#
+# The old version also `exec`ed from inside the `while read` loop, which left
+# every ref after the first unvalidated: pushing two branches at once only ever
+# checked one of them. Stdin is drained fully now, then every ref is validated.
 
 set -uo pipefail
-REPO="$(git rev-parse --show-toplevel)"
 RED='\033[0;31m'; YELLOW='\033[1;33m'; RESET='\033[0m'
 refuse() { echo -e "${RED}pre-push refused:${RESET} $*" >&2; exit 1; }
 note()   { echo -e "${YELLOW}----${RESET} $*"; }
@@ -121,12 +136,11 @@ for entry in "${refs[@]}"; do
   esac
 done
 
+# Say what was NOT checked here, because a gate that stays quiet about its scope
+# gets mistaken for one that covered everything. Same rule as tools/conformance.sh.
 if [[ $run_checks -eq 1 ]]; then
-  note "pushing $checks_for; running the local checks"
-  # `< /dev/null`, and not `exec`: see the note at the top of this file. git's
-  # stdin pipe must not outlive this hook's reading of it.
-  "$REPO/check.sh" --no-bench < /dev/null
-  exit $?
+  note "pushing $checks_for — branch rules only; tests, clippy and conformance run in CI on the pull request"
+  note "  to run them here first:  ./check.sh"
 fi
 
 exit 0
