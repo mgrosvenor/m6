@@ -2271,7 +2271,7 @@ dependencies = [
 [[package]]
 name = "octets"
 version = "0.3.7"
-source = "git+https://github.com/mgrosvenor/quiche?rev=916a5a2596616ac36cefc3238142fb9a04f8dae3#916a5a2596616ac36cefc3238142fb9a04f8dae3"
+source = "git+https://github.com/mgrosvenor/quiche?rev=c5ccefcdc08bc5b9cbca3052375edb520ba6e944#c5ccefcdc08bc5b9cbca3052375edb520ba6e944"
 
 [[package]]
 name = "once_cell"
@@ -2652,7 +2652,7 @@ dependencies = [
 [[package]]
 name = "quiche"
 version = "0.29.3"
-source = "git+https://github.com/mgrosvenor/quiche?rev=916a5a2596616ac36cefc3238142fb9a04f8dae3#916a5a2596616ac36cefc3238142fb9a04f8dae3"
+source = "git+https://github.com/mgrosvenor/quiche?rev=c5ccefcdc08bc5b9cbca3052375edb520ba6e944#c5ccefcdc08bc5b9cbca3052375edb520ba6e944"
 dependencies = [
  "boring",
  "bytes",
