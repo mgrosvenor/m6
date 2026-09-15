@@ -349,39 +349,113 @@ where h3 with 0-RTT answers in 6.4 ms.
 
 **Never conclude anything about protocol choice from a loopback number.**
 
-### An extra round trip on every new h3 connection: the certificate chain
+### An extra round trip on every new h3 connection, and how it was misdiagnosed twice
 
-The cold h3 handshake above is 12.2 ms on a 5.1 ms path, which is 2.4 round
-trips for a handshake that should need one. `m6-probe-h3` reports the shape,
-which is what identified it:
+**Fixed 2026-09-15** by `cfg.set_max_amplification_factor(4)`, which is temporary
+and tracked as ledger item 0. Staging went from **12.5 ms to 6.8 ms**.
+
+A QUIC server may send only `factor x bytes received` before it has validated the
+client's address (RFC 9000 8.1, to stop it being used as a reflection amplifier).
+A client's opening Initial is padded to 1200 bytes, so at quiche's default factor
+of 3 the budget is 3600. Our handshake flight is 4082 bytes, nearly all
+certificate chain. `m6-probe-h3`'s timeline, against a 4.85 ms RTT:
 
 ```
-handshake shape: 12.785ms  client flights=5  server datagrams=4
-                 server bytes before established=4080
++0.741ms  client 1200B
++7.018ms  server 1200B   1.00x
++7.223ms  server 2400B   2.00x
++7.240ms  server 3600B   3.00x   <- stops dead, 482 bytes still owed
++12.221ms server 4082B           <- one full round trip later
 ```
 
-QUIC forbids a server from sending more than about **three times** what it has
-received until the client's address is validated. The client's opening datagram
-is 1360 bytes, so the budget is 4080, and the server sent **exactly 4080** and
-stopped. It then had to wait for the client before finishing.
+At factor 4 the budget is 4800 and the whole flight goes out at once: the final
+datagram arrives 0.10-0.33 ms after the previous one instead of 4.98-6.28 ms.
+**Conformance is unchanged at 47/49** — h3spec does not test this limit, which was
+measured rather than assumed.
 
-The cause is chain size. `build.mgrosvenor.com`'s `fullchain.pem` is already
-ECDSA, so the leaf is small, but it carries **four** certificates totalling 3400
-DER bytes: a full cross-signed path from Let's Encrypt's new ECDSA hierarchy
-back to the old RSA root.
+#### This is the ordinary case, not something unusual about this deployment
 
-| | certificate | bytes |
+Worth stating plainly because the first two explanations written here assumed the
+opposite. [Fastly's study](https://www.fastly.com/blog/quic-handshake-tls-compression-certificates-extension-study)
+measured **40-44% of uncompressed chains** exceeding the budget, and certificate
+compression taking that to **1-9%**. [Other work](https://blog.apnic.net/2023/01/16/on-the-interplay-between-tls-certificates-and-quic-performance/)
+puts it at **61%** for a Firefox-sized 1352-byte Initial. Roughly half the QUIC
+internet pays this round trip.
+
+Measured chains, for scale. Ours is unremarkable and two are larger:
+
+| site | certs | chain bytes |
 |---|---|---|
-| [0] | leaf | 922 |
-| [1] | `YE2` intermediate | 656 |
-| [2] | `ISRG Root YE`, cross-signed by X2 | 682 |
-| [3] | `ISRG Root X2`, cross-signed by X1 | 1140 |
+| this deployment | 4 | 3429 |
+| news.ycombinator.com | 4 | 3393 |
+| letsencrypt.org | 4 | 3576 |
+| cloudflare.com | 3 | 2552 |
+| github.com | 3 | 2718 |
+| www.google.com | 3 | 3755 |
+| www.mozilla.org | 3 | 4051 |
 
-Dropping [3] alone gives 2260 bytes and fits inside the budget. **Not done, and
-it is the owner's call**, because it changes what every TLS client sees: clients
-that trust ISRG Root X1 but not X2 would stop validating. The same 3400 bytes
-costs h1 and h2 nothing in round trips, since TCP has no amplification limit, so
-this is h3-only.
+Hacker News and letsencrypt.org carry the identical 4-certificate Let's Encrypt
+chain, byte for byte on the intermediates.
+
+#### Two wrong diagnoses, both of which produced a confident explanation
+
+Recorded because each was stated as fact and each had to be withdrawn.
+
+1. **"The chain is unusually long because it is on a new hierarchy."** Wrong. The
+   chain is a standard Let's Encrypt ECDSA chain that many sites use, and Google's
+   and Mozilla's are bigger. Withdrawn after measuring seven sites instead of
+   reasoning about one.
+
+2. **"The amplification limit is not involved, the ratio is only 1.62x."** Wrong,
+   and wrong in the more instructive way: 1.62x is the ratio at the END of the
+   handshake, by which time the client has sent its ACKs. The ratio at the instant
+   the server stopped was exactly 3.00x. A totals-only view cannot see this, which
+   is why the probe now prints a per-packet timeline with the live ratio.
+
+   This retraction was itself wrong, and diagnosis 1's replacement — "their chain
+   is smaller so they fit" — did not survive its own arithmetic either, since
+   Cloudflare sends 4198 bytes, which does not fit in 3600. What actually differs
+   is the factor each server runs at.
+
+A third hypothesis, **pacing**, was tested and killed rather than argued: quiche
+enables pacing by default and `flush_conn` discards `send_info.at`, so it looked
+like a strong candidate. Disabling pacing on staging changed the stall not at all.
+
+#### What other edges appear to run at
+
+Measured with `m6-probe-h3` on a 1200-byte client Initial. **Treat this as our
+measurement, not established fact**: byte accounting here counts QUIC payload, and
+no public source corroborates servers exceeding the limit.
+
+| edge | bytes sent before establishment | implied factor |
+|---|---|---|
+| m6 at quiche's default | 3600 then stops | 3.00x |
+| Cloudflare | 4198 in one flight | 3.50x |
+| Fastly (serving www.mozilla.org) | 5360 in one flight | 4.47x |
+
+#### The proper fix, measured
+
+Certificate compression (RFC 8879), tracked as issue #28. On our own chain:
+
+| | bytes |
+|---|---|
+| chain uncompressed | 3400 |
+| chain, zlib (RFC 8879 algorithm 1) | **2345** |
+| saving | **1055** |
+| needed to fit at factor 3 | 482 |
+| flight after compression | ~3027 |
+| margin under the 3600 budget | **573** |
+
+zlib alone is more than enough and is the weakest of the three algorithms. It has
+no compatibility cost, unlike trimming the chain: a client that does not advertise
+`compress_certificate` simply gets today's behaviour. Not reachable today — quiche
+binds 12 `SSL_CTX_*` functions and `SSL_CTX_add_cert_compression_alg` is not among
+them, though BoringSSL underneath implements it. When it lands, the factor
+override is deleted.
+
+rustls supports it for h1 and h2 behind its `brotli` and `zlib` features, neither
+of which this build enables. No round-trip win there, since TCP has no
+amplification limit, just fewer bytes.
 
 ### 0-RTT
 

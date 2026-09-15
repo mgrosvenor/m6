@@ -90,13 +90,42 @@ fn main() {
     match probe::quic_handshake_shape(&addr) {
         Ok(sh) => {
             println!(
-                "handshake shape: {:.3}ms  client flights={}  server datagrams={}  \
-                 server bytes before established={}",
+                "handshake shape: {:.3}ms  client flights={}  server datagrams={}\n    \
+                 client sent {}B, server sent {}B before established  (ratio {:.2}x, \
+                 QUIC allows ~3x an unvalidated address)",
                 sh.elapsed.as_secs_f64() * 1000.0,
                 sh.client_flights,
                 sh.server_datagrams,
-                sh.server_bytes_before_established
+                sh.client_bytes_before_established,
+                sh.server_bytes_before_established,
+                sh.server_bytes_before_established as f64
+                    / sh.client_bytes_before_established.max(1) as f64
             );
+            // Per-datagram arrivals, and the gaps between them. A total says a
+            // handshake was slow; the gaps say where the time went, and a gap of
+            // about one round trip means the server was waiting for the client
+            // while a long gap with nothing owed means it was simply not sending.
+            // The merged timeline, with the live amplification ratio at each
+            // point. The ratio AT THE MOMENT the server stops is the one that
+            // matters; an end-of-handshake ratio hides it.
+            let mut csent = 0usize;
+            let mut ssent = 0usize;
+            for (at, who, cum) in &sh.timeline {
+                if *who == "client" {
+                    csent = *cum;
+                } else {
+                    ssent = *cum;
+                }
+                println!(
+                    "    +{:>8.3}ms  {:<6} cum {:>5}B    client {:>5}B / server {:>5}B  = {:.2}x",
+                    at.as_secs_f64() * 1000.0,
+                    who,
+                    cum,
+                    csent,
+                    ssent,
+                    ssent as f64 / csent.max(1) as f64
+                );
+            }
             // The QUIC anti-amplification limit lets a server send only about 3x
             // what it has received until the client address is validated. A
             // certificate chain over that budget makes the server stop and wait,

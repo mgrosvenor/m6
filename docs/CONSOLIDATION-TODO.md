@@ -62,10 +62,14 @@ scope as low-touch consolidation but is not started. See §3b.
 
 - `FrameworkState::build_dict` is private; the twelve ordered steps are not
   reusable by a service not using `App`. §1.
-- `m6-monitor` and the firewall stats collector are deployed nowhere.
-- The deployment's `deploy/health-check.py` cannot be retired until those are
-  deployed and a post-freeze binary is on the nodes. It moved out of m6 on
-  2026-09-14: a generic web system does not carry one fleet's health check.
+- ~~`m6-monitor` and the firewall stats collector are deployed nowhere.~~ **Both
+  deployed 2026-09-15**: the monitor on the build host, the collector on all
+  three nodes.
+- The deployment's `deploy/health-check.py` is not retired yet. The three reasons
+  this used to give were all stale and are corrected in the detail entry below;
+  what remains is a post-1.0.0 binary on the nodes and a field-by-field
+  comparison of the two reports. It moved out of m6 on 2026-09-14: a generic web
+  system does not carry one fleet's health check.
 - Staging cannot exercise the cache role.
 - The hourly prompt's `hit_p50_ns` baseline is wrong now that §3a is
   understood. Owner's file to change.
@@ -145,6 +149,164 @@ Verified by commit, gate green at each step unless noted.
 ---
 
 ## Not done
+
+### 0. Latency: the h3 handshake round trip, and 0-RTT
+
+Added 2026-09-15. Three jobs that belong together, in this order. Recorded here
+because the first is a TEMPORARY workaround that must not be allowed to become
+permanent, and the third is the line that deletes it.
+
+- [ ] **m6 issue #27 — quiche fork: reject CRYPTO frames in 0-RTT packets.**
+
+      Blocks turning 0-RTT on. All the m6-side work is done and verified on
+      staging; this one check in the fork is what holds it back.
+
+      Isolated by running the conformance gate with `cfg.enable_early_data()` in
+      and out and changing nothing else:
+
+      | configuration | h3spec |
+      |---|---|
+      | amplification factor 4, early data OFF | 47/49 PASS |
+      | amplification factor 4, early data ON | 46/49 FAIL |
+
+      The single regression is "MUST send PROTOCOL_VIOLATION if CRYPTO in 0-RTT
+      is received [TLS 8.3]". RFC 9001 8.3 forbids CRYPTO frames in 0-RTT
+      packets; quiche accepts them once early data is enabled.
+
+      Owner's decision, 2026-09-15: fix it in the fork rather than lower the
+      floor or abandon 0-RTT. `cfg.enable_early_data()` sits commented out in
+      `m6-http/src/main.rs` with the reasoning beside it. **Uncomment it** once
+      the fork carries the fix and the gate reads 47/49 with it enabled.
+
+- [ ] **m6 issue #28 — quiche fork: certificate compression, RFC 8879.**
+
+      The proper fix for an extra round trip on every new h3 connection.
+
+      A QUIC server may send only `factor x bytes received` before validating
+      the client's address. A 1200-byte client Initial gives a 3600-byte budget
+      at factor 3; our handshake flight is 4082 bytes, nearly all certificate
+      chain. Measured with `m6-probe-h3` against a 4.85ms RTT, the server sent
+      3600, stopped with 482 bytes left, and waited a full round trip.
+
+      We are the ordinary case: Fastly measured 40-44% of uncompressed chains
+      exceeding the budget and compression taking it to 1-9%; other work puts it
+      at 61% for a 1352-byte Initial. Nothing in that literature proposes
+      raising the factor.
+
+      Measured on our own chain, zlib takes it from 3400 to 2345 bytes, saving
+      1055 where 482 is needed. Not reachable today: quiche binds 12 `SSL_CTX_*`
+      functions and `SSL_CTX_add_cert_compression_alg` is not among them, though
+      BoringSSL underneath implements it.
+
+      Cheap and separate: **rustls already supports this for h1 and h2**, behind
+      its `brotli` and `zlib` features, which this build does not enable. No
+      round-trip win over TCP, just fewer bytes. One line in
+      `m6-http/Cargo.toml`.
+
+- [ ] **Then revert the amplification factor to 3.**
+
+      `cfg.set_max_amplification_factor(4)` in `m6-http/src/main.rs` is a
+      deliberate, temporary deviation from RFC 9000 8.1, which says MUST NOT
+      exceed 3. Owner's decision, 2026-09-15: ship 4 now so production gets the
+      round trip back, remove it once compression makes it unnecessary.
+
+      It costs nothing measurable today: h3spec does not test the amplification
+      limit, so the gate still reads 47/49, and staging went from ~12.5ms to
+      ~6.8ms. The argument for accepting it is that 3x and 4x are the same
+      practical outcome for a reflection amplifier, where DNS gives ~50x and
+      memcached ~50,000x, and at either factor the attacker burns a third or a
+      quarter of the attack on their own upstream.
+
+      **DELETE THE LINE when #28 lands.** It is one line and it is commented as
+      temporary in the source.
+
+- [ ] **Put `amplification_limited_count` on `/perf`.**
+
+      quiche already counts "the number of times send() was blocked because the
+      anti-amplification budget was exhausted". That is the direct server-side
+      signal for this whole class of problem, and it would have identified the
+      cause immediately instead of by inference from a client-side timeline. It
+      also verifies #28 actually engaged rather than trusting the timing.
+
+
+### 0a. Packaging: publish m6 as a Debian package, install prod from it
+
+Added 2026-09-15, m6 issue #25. **Filed deliberately unstarted.** Owner's words:
+"The package plan needs to be thought through carefully." This changes how
+production is deployed, so the design is the work, not the packaging.
+
+- [ ] **Decide the five open questions before writing anything.** They are in the
+      issue and each one has a real trade:
+
+      1. One `m6` package or several? One, probably: they always deploy together.
+      2. Do the systemd units ship in the site package? It would have prevented
+         the leftover disabled `m6-http-origin` on the cache nodes that aborted a
+         fleet deploy on 2026-09-15.
+      3. Does config validation happen before `apt install` (download, extract,
+         `--dump-config`, install) or after (install, validate, roll back)? The
+         first is safer, the second simpler.
+      4. Does the apt repository live in this repository's `gh-pages` or its own?
+      5. Secrets backup to the laptop. Worth doing, but the laptop then holds
+         every production secret in one place, so it needs encryption independent
+         of FileVault and must sit outside any git working tree.
+
+- [ ] **Choose release asset or apt repository.** Not equivalent: a `.deb` on a
+      GitHub release gives install but no upgrade path, while an apt repository
+      gives `apt update && apt upgrade`. The stated goal was install AND upgrade,
+      which points at the repository. That needs `Packages`, `Release` and a
+      detached GPG signature, and **the signing key's private half must live in
+      GitHub Actions secrets**, which is the one part that cannot be set up from
+      here. An apt repo on Pages is also **public**: anyone could install m6.
+      Fine for an open-source project, but it should be a decision rather than a
+      side effect.
+
+- [ ] **Build `m6_<version>_amd64.deb` in CI on merge to `main`**, holding the
+      seven installed binaries: `m6-http`, `m6-file`, `m6-html`, `m6-md`,
+      `m6-auth-server`, `m6-auth-cli`, `m6-monitor`. All four boxes are amd64
+      Ubuntu 26.04, so there is one target and `ubuntu-latest` builds it
+      natively. No cross-compilation.
+
+- [ ] **A second package in the deployment repository** ships renderers,
+      templates, content, assets and units, declaring `Depends: m6 (>= version)`.
+
+      Note the correction that matters: **a `.deb` cannot make the site "build
+      against" m6.** The renderers link `m6-core` as a Rust library and Rust has
+      no stable ABI, so there is nothing useful to ship for compilation. Build
+      time keeps taking `m6-core` from git at the release tag; run time is what
+      the dependency expresses, since m6-http serves the site and m6-html renders
+      it. Debian's `Build-Depends` against `Depends` says this correctly.
+
+**What must not be lost, and this is the part a naive version would break.**
+`deploy-platform.sh` does work `apt install` does not, and all of it was earned
+by something going wrong:
+
+- validates **every** config against the **new** binary before installing it, so
+  a config the new binary rejects is found while the old one still serves
+- restarts in a fixed order, edges before origin, verifying nothing until every
+  unit on the node has restarted
+- asserts nested assets actually serve, cache-busted, because a healthy process
+  can serve 404s for every asset
+- checks the fleet ran byte-identical artefacts at the end
+
+A package changes *how the bytes arrive*. It replaces none of the above, and a
+design that quietly dropped them would be a regression that looked like a
+simplification.
+
+**Why it is worth doing anyway.** It makes "byte-identical on every box" a
+property of the artefact rather than of whoever ran the deploy, which is
+currently satisfied only by nobody invoking the script per node. Rollback becomes
+`apt install m6=1.0.0` rather than `mv /usr/local/bin/m6-http.prev`. And the
+boxes become disposable: with both packages installed, everything on a node is in
+a package or rendered from `params/` in git except four files.
+
+    /etc/m6/perf-token
+    /etc/m6/cloudns.env
+    /etc/m6/auth.pem
+    <site>/keys/render-contact-secrets.toml
+
+That is the irreducible per-box state, secrets and nothing else. The build host
+is not backed up and the standing rule is that everything done to a node is in
+git; this is what would make that literally true.
 
 ### 1. Header to dict
 
@@ -967,17 +1129,43 @@ holding something that genuinely differs per request.
       disagreed, neither had been checked, and the checkable part is that
       nothing is installed anywhere. `deploy/FLEET-MONITOR.md` is the runbook.
       The build host is off-fleet, so installing it there breaks no freeze.
-- [ ] **Deploy the firewall stats collector.** Written and unit-tested, on no
-      node. Until then `/traffic` reports `firewall: null`.
+- [x] **Deploy the firewall stats collector. Done 2026-09-15.** Installed on
+      syd, lon and chi via `deploy/install-firewall-stats.sh`, so `/traffic` now
+      carries real `firewall` data instead of `null`. m6-monitor renders it as of
+      `f3fff92`, which it had not before because until the collector existed
+      every node returned `null` and there was nothing to print.
 - [ ] **Retire the deployment's `deploy/health-check.py`** (it was
-      `tools/health-check.py` here until 2026-09-14). Blocked on the two deployments
-      above **and on the freeze**, which the old wording did not say. Measured
-      on syd 2026-09-12: `--check` reads `/traffic`, which **404s** on the
-      deployed binary, and `/perf`, whose deployed shape is
-      `{node, uptime_s, metrics}` with no `pools` field. So `--check` against
-      production today degrades to named warnings where the script reports
-      data, and it stays the tool to run until a post-freeze binary is on the
-      nodes.
+      `tools/health-check.py` here until 2026-09-14). Owner's instruction,
+      2026-09-15: "I want it on the todo list to retire the old script."
+
+      **The two blockers this entry used to name were both stale and are gone.**
+      It said `/traffic` 404s and `/perf` carries no `pools` field, measured on
+      syd 2026-09-12. Re-measured 2026-09-14 on all three nodes: `/traffic`
+      answers **200** and `/perf` **does** carry `pools`. Both need
+      `Authorization: Bearer` from `/etc/m6/perf-token`; a token passed as a
+      query parameter returns 401, which reads exactly like a broken endpoint and
+      is probably how the original reading was taken.
+
+      A third claimed blocker was also wrong: that only the ssh script could see
+      the config-reload logging defect, because `journalctl` is not exposed over
+      HTTP. `m6_core::monitoring::LoggingHealth` measures it **in-process**, which
+      is strictly better, and `PulseLayer` sits inside the reloadable filter so a
+      reload that silences the main layer stops the pulse. That claim reached the
+      owner's standing health-check prompt from `docs/OPERATIONS.md` in the
+      deployment repository, so it cost more than a wrong sentence.
+
+      **What genuinely remains**, tracked in m6 issue #26:
+
+      - [x] render the firewall section — `f3fff92`
+      - [x] cache-header assertions from the deployment's own declaration — `f3fff92`
+      - [x] per-channel handshake timing published by m6-http — `d56cedc`, split by
+            resumption in the commit after it
+      - [x] m6-monitor prints the handshake figures — section G
+      - [ ] **deploy a post-1.0.0 m6-http to the nodes**, or section G reports
+            "no handshakes recorded" because the old binary does not publish them
+      - [ ] **compare the two reports field by field on one window** and record
+            what only the ssh script can still see. This is the step that
+            justifies retirement rather than assuming it.
 - [ ] **Raise the fd soft limit.** m6-http runs at 1024 against a 524288 hard
       limit. Harmless at 11 open, and the failure mode is `EMFILE` in an
       accept loop at 3am with nothing saying why.
