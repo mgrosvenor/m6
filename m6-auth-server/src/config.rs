@@ -49,10 +49,26 @@ struct RateLimitConfig {
 /// service config's `[log]`, then `--log-level`. Two parsers for one section
 /// is how they drift.
 pub struct AuthConfig {
-    pub db_path: PathBuf, // relative to site_dir
+    /// Resolved against the CONFIG FILE's directory, not the site root.
+    ///
+    /// This comment used to say "relative to site_dir", which is what the two
+    /// key paths below do and what every other service in m6 does with a
+    /// relative path. It was simply wrong, and being wrong cost something:
+    /// three of the examples grew three different workarounds for it. 05-cms
+    /// looked for `<site>/data/auth.db` and never found the database, so it
+    /// re-created the admin user on every run and died; 11-admin-dashboard
+    /// wrote `path = "../data/auth.db"` to climb back out of `configs/`; two
+    /// others check both locations.
+    ///
+    /// m6-auth-cli resolves it the same way, so the server and the tool do
+    /// agree and no deployment is broken by this. Whether the behaviour should
+    /// change to match `[keys]` is a separate decision, because it moves a
+    /// running deployment's database.
+    pub db_path: PathBuf,
     pub access_ttl: u64,  // seconds
     pub refresh_ttl: u64, // seconds
     pub issuer: String,
+    /// Both key paths are resolved against `site_dir`. See `db_path`.
     pub private_key_path: PathBuf,
     pub public_key_path: PathBuf,
     /// Failed logins allowed per IP per `rate_limit_window_secs`.

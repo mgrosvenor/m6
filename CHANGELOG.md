@@ -12,6 +12,220 @@ releases only; work happens on `develop`. See `CONTRIBUTING.md`.
 
 ---
 
+## Unreleased
+
+## 1.1.0 — 2026-09-15
+
+### Performance
+
+**The HTTP/3 handshake took two round trips and now takes one.** Staging went
+from ~12.5 ms to ~6.8 ms on a 5 ms path.
+
+A QUIC server may send only `factor x bytes received` before it has validated the
+client's address, to stop it being used as a reflection amplifier (RFC 9000 §8.1).
+A client's opening Initial is padded to 1200 bytes, so at quiche's default factor
+of 3 the budget is 3600. m6-http's handshake flight is 4082 bytes, nearly all
+certificate chain, so quiche sent 3600, stopped with 482 bytes owed, and waited a
+full round trip for the client's ACK. Measured against a 4.85 ms RTT:
+
+```
++7.240ms  server 3600B   3.00x   <- stops dead, 482 bytes still owed
++12.221ms server 4082B           <- one full round trip later
+```
+
+`cfg.set_max_amplification_factor(4)` raises the budget to 4800 and the flight
+goes out in one piece. **Conformance is unchanged at 47/49**, measured either side
+of the change rather than assumed: h3spec does not test this limit.
+
+**This is deliberately temporary and marked as such in the source.** RFC 9000
+§8.1 says MUST NOT exceed 3. It is accepted because 3x and 4x are the same
+practical outcome for a reflection amplifier — DNS gives around 50x, NTP monlist
+500x, memcached 50,000x, and at either factor the attacker burns a third or a
+quarter of the attack on their own upstream. The line is deleted when certificate
+compression lands (issue #28), which measurement shows is sufficient: zlib takes
+the chain from 3400 to 2345 bytes, saving 1055 where 482 is needed.
+
+This is also the ordinary case rather than anything unusual about one deployment.
+Fastly's study measured 40-44% of uncompressed chains exceeding the budget, and
+compression taking that to 1-9%.
+
+### Added
+
+**Per-channel handshake timing on `/perf`, for h1, h2 and h3, split by
+resumption.** Never summed on either axis, because neither axis is the same
+measurement:
+
+- h1 and h2 are the rustls handshake and EXCLUDE the TCP round trip, which
+  finished before rustls saw the socket. h3 is the QUIC handshake and INCLUDES its
+  equivalent, because QUIC folds transport and crypto together.
+- a resumed handshake skips the certificate and the signature. rustls with the
+  `std` feature defaults to a 256-session store, so resumption is already
+  happening without anything being configured for it, and blending the two gives a
+  figure that moves with the returning-visitor mix while neither cost changes.
+
+Each of the four groups carries windowed percentiles plus a lifetime count, mean,
+min and max that the reservoir cannot discard. The per-channel reservoir is now
+1024, up from 512.
+
+**Three single-purpose probe clients**: `m6-probe-h1`, `m6-probe-h2`,
+`m6-probe-h3`. One protocol each, one handshake per connection, strictly
+sequential, no requests and no charts. They exist because a figure the server
+reports about itself has to be checkable against something. `m6-probe-h3` also
+reports handshake shape — client flights, server datagrams, and a per-packet
+timeline with the live amplification ratio — which is what identified the round
+trip above.
+
+**m6-monitor renders three sections it previously could not**: firewall blocks,
+cache-header assertions taken from the deployment's own declaration rather than
+duplicated in the monitor, and connection setup per channel. `header_faults` folds
+into the verdict, so a wrong cache policy can no longer print ALL CLEAR.
+
+### Fixed
+
+**A completed TLS handshake was discarded if the client closed immediately.**
+`advance_tls` returns `Err` on EOF, and a client that finishes its handshake and
+closes at once sends the final flight and the FIN together, so one call completed
+the handshake, hit EOF, took the error path, replaced `conn.kind` and returned
+about forty lines above where the handshake was recorded.
+
+Measured with 200 sequential handshakes per protocol against a client figure of
+0.34 ms: **h1 recorded 0 of 200**, because nothing happens after an h1 handshake
+so the close won every time, and the channel did not appear on `/perf` at all.
+**h2 recorded 70 of 200 at a p50 of 6.14 ms**, because the only survivors were
+connections the server reached before the close — that is, ones that had already
+waited an extra event-loop turn. The surviving population was selected for
+slowness, so the figure read 18x the truth and looked plausible. h3 was unaffected,
+recording 200 of 200 correctly, because the QUIC path stamps inside the packet
+handler.
+
+**`m6-bench-detail` panicked before measuring anything.** m6-http builds rustls
+with `default-features = false`, so no process-level `CryptoProvider` is installed
+automatically and the first `ClientConfig::builder()` panicked. Every other binary
+in the crate installs it in `main`; this one built a provider inside a verifier
+method and dropped the result. Its h1 config also offered no ALPN, so it measured
+whichever channel the server fell back to, and its chart directory was never
+created, making every SVG write fail while the run still exited 0.
+
+### Security
+
+**rustls 0.23.44 → 0.23.45, for RUSTSEC-2026-0285.**
+
+**rustls 0.23.44 → 0.23.45, for RUSTSEC-2026-0285.**
+
+rustls accepted TLS 1.3 handshake messages sent at the wrong encryption level
+when they followed a key-changing message in the same record: a plaintext
+`EncryptedExtensions` packed into the same record as the `ServerHello`, for
+example. RFC 8446 §5.1 requires that handshake messages do not span key changes
+and that the connection is terminated with `unexpected_message` if they do.
+Functionally the same bug as Go's GO-2026-4340 (CVE-2025-61730).
+
+`CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N`, category crypto-failure. The
+advisory is explicit that the handshake transcript is still authenticated, so a
+network-position attacker cannot use this to alter or complete a handshake; the
+practical effect is that a peer could send handshake messages that should have
+been encrypted in plaintext without rustls rejecting the connection. A
+protocol-strictness failure rather than a break in authentication. m6-http
+terminates TLS, so it is fixed rather than deferred to the next release.
+
+`Cargo.lock` only: the declared constraint was already `"0.23"`. Three edges
+move rather than one, and `cargo update --dry-run` reporting "Locking 1 package"
+undersells it — `cssparser-macros → syn` goes 3.0.5 to 2.0.119 and
+`tempfile → getrandom` goes 0.4.3 to 0.3.4. Both are cargo re-resolving onto
+versions **already present in the lockfile** rather than new dependencies, both
+are build-time graphs, and pointing `cssparser-macros` at the syn 2 the rest of
+the tree already uses reduces duplication.
+
+Verified against a real handshake rather than a successful build, since the
+change is a TLS library: TLS 1.3 negotiating `AEAD-CHACHA20-POLY1305-SHA256`
+with verify 0, TLS 1.2 negotiating `ECDHE-RSA-CHACHA20-POLY1305`, ALPN h2 and
+h1 both answering 200.
+
+### Changed
+
+**A secrets file supplies values; it no longer overrides them.** A key set in
+both a config and its `secrets_file` is now an error at load, naming every
+clashing key and both paths. It used to merge with "src wins on conflict",
+silently, so a config file could state a value that was not the one in use.
+
+That is not hypothetical. A deployed renderer config read `host = "localhost"`,
+`port = 1025` and a `from` address, and all of them were inert because the
+secrets file set them too: the service was relaying through a real provider and
+sending as a different domain. An audit read the deployed config and drew the
+wrong conclusion. A file that is overridden looks exactly like a file that is
+correct when you are holding one file.
+
+Tables are still descended into, so two files contributing DIFFERENT keys to one
+section is unaffected -- that is what a secrets file is for. A clash is one value
+claimed twice. An empty string counts as a value, because `username = ""` beside
+a real username is exactly how a config comes to look as though it holds
+credentials.
+
+**This is a breaking change for any deployment whose two files overlap.** The
+service will refuse to start and say which keys. The fix is to give each key one
+owner: secrets in the secrets file, everything else in the config. If the config
+held a deliberately broken placeholder so that a missing secrets file would fail
+loudly, delete it -- an absent required key already fails loudly and names
+itself, which a present-but-wrong value does not.
+
+### Fixed
+
+**No email address is published in `SECURITY.md`.** GitHub renders that file on
+the repository front page, so an address in it is an address scrapers read. It
+now points at GitHub private vulnerability reporting, which is the better channel
+anyway because it threads and takes attachments, and at a contact form.
+
+`m6-core`'s "this crate names no particular deployment" test grew the second
+domain it had been missing, which is how a personal address survived in that file.
+Its own self-test was checking one entry of the banned list rather than all of
+them, which is why a missing entry was never going to be noticed.
+
+**`/perf` reported no latency at all, on every node, and never had.**
+
+`m6-http`'s aggregate latency reservoirs were cleared by `maybe_emit` every ten
+seconds, and `Stats::snapshot()` -- which is what `/perf` serves -- read those
+same fields. So `/perf` returned the percentiles of whatever fraction of a
+ten-second window happened to be open when it was scraped, and a node taking a
+couple of requests a minute has almost no cache hits in any given ten seconds.
+
+Observed on a production origin with ten hours of uptime: `cache_hits_total: 338`
+beside `hit_samples: 0, hit_p50_ns: 0, hit_p99_ns: 0`. m6-monitor correctly reads
+zero samples as "not measured" and publishes `null`, so the fleet digest carried
+**no latency for any node**, while the `periodic stats` log line was printing
+`hit_p50_ns=3878` for the same counter in the same minute.
+
+The per-channel reservoirs were never cleared and held real data throughout,
+which is why this survived: anyone scrolling past the aggregate in `/perf` saw
+plausible per-channel numbers. The aggregate is the only figure m6-monitor reads.
+
+The reservoirs now run as rings and are never cleared. New `*_window_added`
+counters give the periodic log its own ten-second window, so the operational
+logging is unchanged -- which is the property `snapshot()`'s comment was
+protecting when it declined to reset. Declining to reset was right; also reading
+the window the emitter reset was the defect. One reservoir, no extra memory, no
+extra work on the request path.
+
+`percentiles_ring` replaces `percentiles`: it reads the newest *n* entries rather
+than `samples[..n]` from the front, which was correct only while the index was
+reset every window. Against a ring that genuinely wraps, reading from the front
+reports the **oldest** samples as current, so the two changes had to land
+together.
+
+`snapshot()`'s percentiles now span the most recent up to 4096 samples, **a count
+rather than a period of time**. On a quiet node that reaches back hours and
+blends idle and busy traffic, which matters because this number is load dependent
+(`docs/PERFORMANCE.md` §4). `hit_samples` and `miss_samples` are therefore
+reported beside the percentiles in the periodic log as well, and m6-monitor's
+digest carries `hit_samples` per node so the figure can be read at all.
+
+Verified: six tests in `stats::perf_reservoir_tests`, three of which fail against
+the old reset, checked by reinstating it. End to end against a running 05-cms
+stack, scraped across two emit boundaries with silence between them: 81 samples,
+p50 2,250ns, p99 5,625ns, stable across all three scrapes, where the old code
+returned zeros. The periodic log still reports per-window figures: 39 hits at
+p50 2,208ns in the busy window, zeros in the idle ones either side.
+
+---
+
 ## 1.0.0 — 2026-09-14
 
 The first release. Everything under this heading was on `develop` unreleased and

@@ -472,3 +472,69 @@ New 2026-09-12:
     wrapped the push in compound commands ending in `echo`, so the exit code I
     read belonged to the echo. Lesson 25's shape again, self-inflicted: a
     measurement that cannot fail is not a measurement.
+
+46. **A config that is overridden is indistinguishable from a config that is
+    correct.** `m6_core::config::load` merged a secrets file over the base config
+    with "src wins on conflict", silently. A deployed renderer config therefore
+    read `host = "localhost"`, `port = 1025` and a `from` address, all of them
+    inert, while the service relayed through a real provider and sent as a
+    different domain entirely.
+
+    The cost was not an outage. It was a **wrong belief**: an audit of where the
+    site sends mail from read the deployed config and reported what it said. The
+    file was not stale and it was not wrong; it was shadowed, and there is nothing
+    in the file to say so.
+
+    The defence that had been argued for the overlap is the interesting part. The
+    base config pointed at a dead relay on purpose, so that a missing secrets file
+    would fail loudly rather than quietly succeed against the wrong host. **That
+    reasoning requires the config to hold a deliberately wrong value, which is
+    what made it misleading.** And it was never needed: the service already
+    required every field and named the missing one. An absent required key fails
+    loudly AND says what is absent. A present-but-wrong one only misleads.
+
+    **When a value must come from somewhere else, leave it out. Do not leave a
+    placeholder.** One key, one owner, and a clash is an error.
+
+47. **`test -r` answers a different question from "can I read this".** A deploy
+    script verified that the service user could read a TLS private key with
+    `sudo -u m6 test -r <key>`, and it reported failure on a key that user reads
+    perfectly well. `test -r` resolves through `access(2)`, which answers from the
+    traditional permission bits and does not reflect a POSIX ACL. The bits were
+    `rw-r----- root root`, so it said no; the ACL was `user:m6:r--` with a
+    matching mask, so the read succeeded.
+
+    The certificate was issued correctly and the ACLs were correct. The check was
+    wrong, and it failed the run. **Verify by doing the thing, not by asking
+    whether it would be permitted** — on an ACL, on a capability, on anything
+    where authority is not in the mode bits, the two disagree.
+
+48. **A self-test that checks one case is a self-test for one case.** m6-core has
+    a test asserting that no file names one particular deployment, and a companion
+    test that the scan can actually find something. The companion checked
+    `banned[1]`: one entry of the list.
+
+    So the list could grow an entry that was never exercised, and it could also be
+    MISSING one — which it was. The maintainer's second domain was absent from the
+    ban, and a personal email address consequently sat in a published
+    `SECURITY.md`, on the front page of a public repository, with both tests green
+    beside it.
+
+    Widening the ban was the small fix. The real one was making the companion
+    iterate every entry, because otherwise the same hole reopens for the next entry
+    somebody adds. **A test that proves a guard works must prove it for the whole
+    guard.**
+
+49. **A pipeline's exit code belongs to the last command in it.** Lesson 45
+    recorded this after four pushes reported success because they ended in `echo`.
+    It recurred three times in one day: `./deploy.sh > log 2>&1; echo $?; tail log`
+    reported the tail's status, and a `cargo test | grep | tail -20` run reported
+    exit 0 while the log contained seven failures.
+
+    The third instance was the worst, because the truncation was also silent: the
+    file I read "0 failures" out of was the last twenty lines of *filtered* output,
+    so the absence of failures in it meant nothing at all.
+
+    Knowing the lesson is not the same as having the habit. **If the exit code
+    matters, nothing goes after the command — redirect to a file, echo `$?` on its
+    own line, and read the file.**
