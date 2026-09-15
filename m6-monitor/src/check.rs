@@ -84,13 +84,13 @@ pub fn render(d: &Digest, readings: &[NodeReading]) -> String {
     );
     let _ = writeln!(
         o,
-        "  {:<5} {:>9} {:>8} {:>10} {:>10} {:>8}",
-        "node", "requests", "hit rate", "hit p50", "hit p99", "errors"
+        "  {:<5} {:>9} {:>8} {:>10} {:>10} {:>8} {:>8}",
+        "node", "requests", "hit rate", "hit p50", "hit p99", "samples", "errors"
     );
     for n in &d.nodes {
         let _ = writeln!(
             o,
-            "  {:<5} {:>9} {:>8} {:>10} {:>10} {:>8}",
+            "  {:<5} {:>9} {:>8} {:>10} {:>10} {:>8} {:>8}",
             n.name,
             n.requests_total
                 .map(|v| v.to_string())
@@ -104,11 +104,72 @@ pub fn render(d: &Digest, readings: &[NodeReading]) -> String {
             n.hit_p99_ns
                 .map(|v| format!("{v}ns"))
                 .unwrap_or_else(|| "-".into()),
+            // The count goes beside the percentiles, always. A p50 over 46 hits and
+            // one over 1200 are different claims and the number alone cannot be
+            // compared to anything without it -- which is why the owner's standing
+            // order says "ALWAYS with the sample count beside them", and why this
+            // report was sending the reader to /perf on each node to get it.
+            n.hit_samples
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".into()),
             n.backend_errors
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "-".into()),
         );
     }
+    // ── The channel split ────────────────────────────────────────────────────
+    //
+    // A node's aggregate hit rate mixes channels and two of them are SUPPOSED to
+    // look bad, so the aggregate alone invites a wrong conclusion. This was the last
+    // thing a health check had to leave the monitor for: the data was already in the
+    // same /perf response and simply was not rendered, so every run ended with an
+    // ssh to each production node for figures already in hand.
+    //
+    //   http/2/internal    the backbone. A cache node forwards to origin only when
+    //                      it has already missed, so this is majority-miss by
+    //                      construction, and a HIGH rate here would be the problem.
+    //   http/1.1/external  the scanner population, asking for paths that do not
+    //                      exist. A few percent is normal.
+    //   http/2/external    the browsers, and the only channel that answers whether
+    //                      the cache is working for visitors.
+    let any_channels = readings.iter().any(|r| {
+        r.perf
+            .as_ref()
+            .is_some_and(|p| !p.metrics.channels.is_empty())
+    });
+    if any_channels {
+        let _ = writeln!(o, "\n  per channel (the aggregate above mixes these)");
+        for r in readings {
+            let Some(p) = &r.perf else { continue };
+            for c in &p.metrics.channels {
+                let total = c.hits + c.misses;
+                if total == 0 {
+                    continue;
+                }
+                // The visitor channel is marked because it is what a reader should
+                // look at first, and the two that look bad by design are the ones
+                // most often mistaken for a fault.
+                let note = match c.channel.as_str() {
+                    "http/2/external" => "  <- visitors",
+                    "http/2/internal" => "  (backbone: majority-miss by design)",
+                    "http/1.1/external" => "  (scanners)",
+                    _ => "",
+                };
+                let _ = writeln!(
+                    o,
+                    "  {:<5} {:<20} hits {:>6}  misses {:>6}  rate {:.4}  n {:>5}{}",
+                    r.name,
+                    c.channel,
+                    c.hits,
+                    c.misses,
+                    c.hits as f64 / total as f64,
+                    c.hit_samples,
+                    note
+                );
+            }
+        }
+    }
+
     let _ = writeln!(
         o,
         "\n  rtt is from this host, connect and TLS included, and is NOT the\n  \
