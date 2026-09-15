@@ -428,50 +428,44 @@ fn make_quiche_config(server_config: &config::ServerConfig) -> anyhow::Result<qu
     // smaller than the QPACK work declined at 47/49. UNCOMMENT THIS the moment
     // the fork carries it and the gate reads 47/49 with it enabled.
     //
-    // STILL HELD BACK. The fork now carries the RFC 9001 8.3 check, and it is not
-    // sufficient. See below.
+    // ENABLED 2026-09-16. The fork carries the three changes this needed.
     //
     // It was held back because accepting early data cost one conformance test:
     // "MUST send PROTOCOL_VIOLATION if CRYPTO in 0-RTT is received [TLS 8.3]",
-    // taking h3spec from 47/49 to 46/49. quiche discarded 0-RTT packets outright
-    // before early data was enabled, so the rule was satisfied for free; once they
-    // are accepted they reach process_frame, and nothing there looked at the packet
-    // type.
+    // 47/49 -> 46/49. Fixing it took three attempts and the first two were in the
+    // wrong place, which is worth recording because the wrong places looked right.
     //
-    // Fixed in the fork at c5ccefcd rather than by lowering the floor or abandoning
-    // 0-RTT, which was the owner's call. Two lines: `hdr.ty == Type::ZeroRTT` in the
-    // CRYPTO arm returning `Error::InvalidPacket`, whose `to_wire` mapping is
-    // PROTOCOL_VIOLATION. quiche's own 1123 + 45 tests pass unchanged.
+    // 1. A guard in quiche's `process_frame` on the CRYPTO arm. Correct per the RFC
+    //    and it changed the score not at all. h3spec sends its 0-RTT packet during a
+    //    FRESH handshake with no resumption, so there is no 0-RTT read key, so the
+    //    packet is buffered as undecryptable and its frames are never parsed. From
+    //    h3spec's own qlog:
     //
-    // ── Why that was not enough, measured ────────────────────────────────────
+    //        1. initial: [crypto, padding]
+    //        2. initial: [crypto]
+    //        3. 0RTT:    [crypto, padding]   <- the violation
+    //        4. initial: [ack, crypto, padding]
     //
-    // With the check in place, h3spec still reads 46/49 and still fails the same
-    // test. The check is in `process_frame`, and a 0-RTT packet never gets there
-    // unless the server can DECRYPT it:
+    //    A check on frame CONTENTS cannot fire for that. Kept anyway: it is right
+    //    for a genuinely resumed connection, where the frame is readable.
     //
-    //     let aead = if hdr.ty == Type::ZeroRTT {
-    //         self.crypto_ctx[epoch].crypto_0rtt_open.as_ref()   // None
-    //     };
-    //     match aead {
-    //         None => if hdr.ty == Type::ZeroRTT && !self.is_established() {
-    //             self.undecryptable_pkts.push_back(...);
-    //             return Ok(pkt_len);        // buffered, never parsed
+    // 2. Reject the packet on its TYPE instead, before decryption. A server holding
+    //    handshake keys but no 0-RTT key knows no PSK was accepted, so the client
+    //    sent 0-RTT it was never entitled to send. This DETECTED the violation --
+    //    m6-http logged `conn.recv error: InvalidPacket` -- and h3spec still failed.
     //
-    // Without a resumption key there is no 0-RTT read key, so the packet is
-    // buffered and returns Ok. Its frames are never parsed, so no check on frame
-    // contents can fire. The guard is still correct and will fire on a genuinely
-    // resumed connection; it is simply not what this test exercises.
+    // 3. The close was going out where the client could not read it. quiche put the
+    //    CONNECTION_CLOSE in a Handshake packet, and a client derives its handshake
+    //    keys from the server's flight, which had not been sent. Its qlog showed it
+    //    received only an Initial carrying an ACK. `write_pkt_type` only preferred
+    //    an Initial close when `recv_count == 0`, a first-flight case; here
+    //    recv_count was non-zero. Now keyed on whether the server has ever sent a
+    //    Handshake packet, which is the fact that determines whether the peer could
+    //    have the keys.
     //
-    // What remains to establish, and the order to do it in: whether h3spec resumes
-    // a session before sending the 0-RTT CRYPTO frame (if it does not, the packet
-    // is undecryptable by construction and the rule cannot be enforced from frame
-    // contents at all), and if it does, whether the CONNECTION_CLOSE can actually
-    // be sent -- which is the same `recv_count`/`mark_closed` territory upstream
-    // PR #2521 fixed for first-flight errors.
-    //
-    // Enabling early data without that answered costs one conformance test, and
-    // the gate is the thing that would have to be lowered. Left off.
-    // cfg.enable_early_data();
+    // Verified: h3spec 47/49 WITH early data enabled, h2 146/146, h1 32/32 on four
+    // targets, every target measured. quiche's own suite unchanged at 1123 + 45.
+    cfg.enable_early_data();
 
     Ok(cfg)
 }
