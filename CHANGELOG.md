@@ -14,6 +14,96 @@ releases only; work happens on `develop`. See `CONTRIBUTING.md`.
 
 ## Unreleased
 
+## 1.4.0 — 2026-09-16
+
+### Performance
+
+**The certificate chain no longer costs a round trip, and the spec deviation that
+hid that is gone.**
+
+A QUIC server may send only three times what it has received before it has validated
+the client's address (RFC 9000 8.1). A 1200-byte client Initial gives a 3600-byte
+budget, and m6's uncompressed handshake flight was 4081 bytes: the server sent 3600,
+stopped, and waited a full round trip for an ACK before it could finish. 1.2.0 and
+1.3.0 covered that with `set_max_amplification_factor(4)`, a deliberate deviation
+marked temporary from the day it shipped.
+
+Certificate compression (RFC 8879) removes the need for it. Measured against the
+staging origin, same probe and path, only compression changing:
+
+| | server flight | datagrams | handshake |
+|---|---|---|---|
+| no compression | 4081 B | 4 | stalls at 3600, +5.07 ms |
+| brotli | **2859 B** | 3 | no stall, 1.16x |
+
+2859 against a 3600 budget, so the flight fits at the **conforming factor of 3** with
+headroom for a chain that grows. On the London and Chicago paths, where a round trip
+is 270 to 300 ms, that round trip was the single largest avoidable cost in setting up
+a new connection.
+
+### zlib is accepted, never offered
+
+m6 compresses with brotli, and with zstd where that feature is built. It accepts all
+three as a client and offers **zlib to nobody**, which needs explaining because it
+looks like missing support and is not.
+
+Offering zlib broke h3spec: 38 of 49 tests failed with `TLSDecryptError "cannot
+verify CertificateVerify"`. Not a codec defect. m6's zlib output is ordinary
+RFC 1950 and libz round-trips it byte-identically.
+
+hs-tls, which h3spec is built on, decodes a CompressedCertificate into a certificate
+chain and then reconstructs the wire bytes by **re-compressing** at zlib's default
+level (`tls/Network/TLS/Packet13.hs`):
+
+```haskell
+putOpaque24 $ BL.toStrict $ compress $ BL.fromStrict bs
+```
+
+A TLS 1.3 transcript is the handshake messages as transmitted, so a reconstruction
+only agrees when both ends run a byte-identical compressor at identical settings. m6
+compresses at level 9 with miniz_oxide, so the transcript hashes differ and the peer
+rejects m6's CertificateVerify.
+
+zlib is also the only algorithm hs-tls implements, so offering it is precisely what
+selects it for the clients that cannot handle it. Declining it costs them nothing:
+they advertise nothing m6 compresses with, so they receive a plain chain and
+handshake normally. Brotli compresses m6's own chain better than zlib did anyway,
+2859 bytes against 2962.
+
+The failure is independent of certificate size. Three self-signed certificates of
+615 B, 1151 B and 1846 B on disk (EC P-256, RSA-2048, RSA-4096) all fail identically,
+so it is not a fragmentation or flight-size effect.
+
+### Fixed
+
+**The conformance harness reused an expired certificate, and reported it as a
+protocol regression.** `start_edge` generated its self-signed certificate only when
+the file was absent, never when it had expired, and `$WORK` is a fixed path under
+/tmp that survives between runs. A `-days 2` certificate created on Sep 11 was still
+in use on Sep 15: every handshake failed with `TlsFail`, and h3 scored 11/49 against
+a floor of 47.
+
+That is indistinguishable from a broken server if you read only the summary line.
+Several certificate-compression and amplification measurements were taken against it
+and misread before the certificate itself was checked, and five consecutive source
+changes produced an identical score without that being recognised as the signal it
+was.
+
+The certificate is now regenerated when it is missing **or** within an hour of
+expiry. Note the direction of this defect: an expired fixture can only cause a false
+FAIL, never a false PASS, so no previously recorded score was inflated by it.
+
+### Changed
+
+The quiche fork is at `bdf00278`, on branch `m6-cert-compression`. It adds RFC 8879
+compression and decompression for zlib, brotli and zstd, with zlib registered for
+decompression only. Its own suite passes unchanged at 1123 + 45 tests, zero warnings
+and clippy silent in both the default and `cert-compression-zstd` configurations.
+
+`zstd` remains behind a feature flag: it is the only one of the three with no pure
+Rust compressor, and it saves about 50 bytes less than brotli on a real chain. Not a
+trade worth inheriting silently.
+
 ## 1.3.0 — 2026-09-16
 
 ### Performance
