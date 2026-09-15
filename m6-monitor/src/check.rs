@@ -250,6 +250,78 @@ pub fn render(d: &Digest, readings: &[NodeReading]) -> String {
     }
 
     // ── E. crawlers ──────────────────────────────────────────────────────────
+    // ── Connection setup, per channel ────────────────────────────────────────
+    //
+    // Printed per channel and NEVER summed, because the three are not the same
+    // measurement. h1 and h2 are the rustls handshake, which excludes the TCP
+    // round trip that finished before rustls saw the socket. h3 is the QUIC
+    // handshake, which includes its equivalent because QUIC folds transport and
+    // crypto together. A combined figure would track the protocol mix rather
+    // than the cost of anything.
+    //
+    // This is the measurement the ssh health check took with a loopback curl on
+    // each node. It is better here: these are REAL client handshakes rather than
+    // a synthetic one against localhost.
+    let any_hs = readings.iter().any(|r| {
+        r.perf
+            .as_ref()
+            .map(|p| p.metrics.channels.iter().any(|c| c.handshake_samples > 0))
+            .unwrap_or(false)
+    });
+    let _ = writeln!(
+        o,
+        "\nG. CONNECTION SETUP  (per channel; the three are not comparable)"
+    );
+    if !any_hs {
+        let _ = writeln!(
+            o,
+            "  no handshakes recorded yet. A node running m6-http 1.0.0 does not report them."
+        );
+    } else {
+        for r in readings {
+            let Some(p) = &r.perf else { continue };
+            for c in &p.metrics.channels {
+                if c.handshake_samples == 0 {
+                    continue;
+                }
+                // The sample count is not decoration. A p50 over three handshakes
+                // and one over three thousand are different claims, and the
+                // number alone cannot be compared to anything without it.
+                // Two rows per channel rather than one long one. The first is
+                // the recent window the percentiles come from; the second is the
+                // lifetime record, which the window discards.
+                //
+                // `total` and `samples` differ once a channel passes the
+                // reservoir size, and the difference is the point: p99 over the
+                // last 1024 connections says nothing about the worst of the
+                // 40,000 before them, and `max` does.
+                let _ = writeln!(
+                    o,
+                    "  {:<5} {:<20} last {:>5}  p50 {:>8.2}ms  p99 {:>8.2}ms",
+                    r.name,
+                    c.channel,
+                    c.handshake_samples,
+                    c.handshake_p50_ns as f64 / 1e6,
+                    c.handshake_p99_ns as f64 / 1e6
+                );
+                let _ = writeln!(
+                    o,
+                    "  {:<5} {:<20} all  {:>5}  mean {:>7.2}ms  min {:>7.2}ms  max {:>7.2}ms",
+                    "",
+                    "",
+                    c.handshake_total,
+                    c.handshake_mean_ns as f64 / 1e6,
+                    c.handshake_min_ns as f64 / 1e6,
+                    c.handshake_max_ns as f64 / 1e6
+                );
+            }
+        }
+        let _ = writeln!(
+            o,
+            "  h1/h2 exclude the TCP round trip; h3 includes its equivalent."
+        );
+    }
+
     // ── F. cache headers, as the deployment declared them ────────────────────
     //
     // The failure these catch is a response that is SERVED CORRECTLY and cached

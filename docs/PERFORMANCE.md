@@ -299,6 +299,149 @@ the number means nothing.
 
 ---
 
+## 5a. Connection setup, per channel, measured by our own clients
+
+Added 2026-09-15. Three new single-purpose binaries, `m6-probe-h1`,
+`m6-probe-h2` and `m6-probe-h3`, each doing one handshake per connection,
+strictly sequentially, with no requests and no charts. Source in
+`m6-http/src/probe.rs`. m6-http publishes the same measurement per channel on
+`/perf`, and the point of the probes is that the server's figure about itself is
+now checkable.
+
+### The figures
+
+On the build host's loopback, 200 sequential handshakes each, against the
+server's own report of the same connections:
+
+| channel | probe p50 | `/perf` p50 | `/perf` samples |
+|---|---|---|---|
+| http/1.1 | 0.381 ms | 0.425 ms | 200 of 200 |
+| http/2 | 0.353 ms | 0.423 ms | 270 (200 probe + 70 warmer) |
+| http/3 | 1.132 ms | 1.075 ms | 200 of 200 |
+
+The client figure sits just above the server's for h1 and h3 because the client
+times from its own first send and the server from receiving that packet.
+
+**h1 and h2 are the rustls handshake and EXCLUDE the TCP round trip**, because
+rustls is handed the socket after the three-way handshake finishes. **h3 is the
+QUIC handshake and INCLUDES its equivalent**, because QUIC folds transport and
+crypto together and there is no earlier point to start from. The two are not the
+same span and must never be averaged. A single "handshake p50" across all three
+would track the protocol mix, which is the error §4a fixed for the request
+latency aggregate.
+
+### Loopback makes h3 look slow, and that is an artefact
+
+On loopback h3 reads 1.1 ms against h2's 0.42 ms, because loopback has no round
+trip and so prices only CPU. Over a real path it inverts. From a laptop to the
+build host, 5.1 ms RTT measured by ping:
+
+| | real path, 5.1 ms RTT |
+|---|---|
+| h1 rustls handshake (excl. TCP connect) | 7.79 ms |
+| h2 rustls handshake (excl. TCP connect) | 6.14 ms |
+| h3 cold QUIC handshake | 12.2 ms |
+| **h3 0-RTT, first packet to response headers** | **6.0 - 6.7 ms** |
+
+h1 and h2 need a TCP round trip before any of that, so a returning visitor over
+h2 pays TCP, then TLS, then a request round trip: roughly 16 ms to a response
+where h3 with 0-RTT answers in 6.4 ms.
+
+**Never conclude anything about protocol choice from a loopback number.**
+
+### An extra round trip on every new h3 connection: the certificate chain
+
+The cold h3 handshake above is 12.2 ms on a 5.1 ms path, which is 2.4 round
+trips for a handshake that should need one. `m6-probe-h3` reports the shape,
+which is what identified it:
+
+```
+handshake shape: 12.785ms  client flights=5  server datagrams=4
+                 server bytes before established=4080
+```
+
+QUIC forbids a server from sending more than about **three times** what it has
+received until the client's address is validated. The client's opening datagram
+is 1360 bytes, so the budget is 4080, and the server sent **exactly 4080** and
+stopped. It then had to wait for the client before finishing.
+
+The cause is chain size. `build.mgrosvenor.com`'s `fullchain.pem` is already
+ECDSA, so the leaf is small, but it carries **four** certificates totalling 3400
+DER bytes: a full cross-signed path from Let's Encrypt's new ECDSA hierarchy
+back to the old RSA root.
+
+| | certificate | bytes |
+|---|---|---|
+| [0] | leaf | 922 |
+| [1] | `YE2` intermediate | 656 |
+| [2] | `ISRG Root YE`, cross-signed by X2 | 682 |
+| [3] | `ISRG Root X2`, cross-signed by X1 | 1140 |
+
+Dropping [3] alone gives 2260 bytes and fits inside the budget. **Not done, and
+it is the owner's call**, because it changes what every TLS client sees: clients
+that trust ISRG Root X1 but not X2 would stop validating. The same 3400 bytes
+costs h1 and h2 nothing in round trips, since TCP has no amplification limit, so
+this is h3-only.
+
+### 0-RTT
+
+Enabled 2026-09-15 (`cfg.enable_early_data()`), and it engages: verified on
+staging with `m6-probe-h3 --0rtt /`, which reports whether the request was on
+the wire before the handshake completed rather than inferring it from timing.
+
+0-RTT data is replayable, so `handle_h3_request` is deliberately stricter than
+RFC 8470's "idempotent methods" advice: in early data it serves **only a fresh
+cache hit** and answers 425 Too Early to everything else. A replayed cache read
+re-sends bytes and does nothing more. "GET is safe" would not have been enough,
+because this site's analytics beacon is a fire-and-forget GET, and a stale hit
+would queue a background refresh, which is a write. Both gates verified against
+staging: a cached path answers 200 in early data, an uncached one answers 425.
+
+### Reproducing
+
+```sh
+cargo build --release --bin m6-probe-h1 --bin m6-probe-h2 --bin m6-probe-h3
+./target/release/m6-probe-h1 --addr HOST:443 --n 200
+./target/release/m6-probe-h2 --addr HOST:443 --n 200
+./target/release/m6-probe-h3 --addr HOST:443 --n 200
+./target/release/m6-probe-h3 --addr HOST:443 --0rtt /
+./target/release/m6-probe-h3 --addr HOST:443 --0rtt /some-path --method POST
+```
+
+### Two measuring-tool defects found on the way, both of which produced numbers
+
+Recorded because in both cases the tool reported success and a plausible figure,
+which is worse than a tool that fails.
+
+1. **`m6-bench-detail` panicked before measuring anything.** m6-http builds
+   rustls with `default-features = false`, so no process-level CryptoProvider is
+   installed automatically, and the first `ClientConfig::builder()` panicked.
+   Every other binary in the crate installs it; this one did not. With our own
+   client broken, handshake timing was taken with `h3spec` instead -- a
+   conformance tester that deliberately opens stalled connections -- which
+   reported an **h3 handshake p50 of 113 ms on loopback** for an engine that
+   answers requests in microseconds. That figure was believed long enough to be
+   written down. The real figure is 1.1 ms.
+
+2. **The first version of `m6-probe-h1/h2` never completed a handshake.**
+   rustls' client reports `is_handshaking() == false` as soon as it has the
+   traffic keys, one step before the client Finished is flushed. The loop exited
+   on that condition and dropped the socket, so the server never received
+   Finished, sat handshaking until EOF, and recorded nothing. The probe reported
+   200 successes at a plausible 0.34 ms while the server completed zero. The 70
+   h2 samples the server did report turned out to be the cache warmer's curl
+   connections at startup, which very nearly got read as a server bug.
+
+A third defect, this one in m6-http itself and fixed here: the handshake was
+stamped about forty lines below the point where `advance_tls` returns an error,
+so a client that completed its handshake and closed immediately had the
+measurement thrown away. h1 recorded **0 of 200** such handshakes, and h2 kept
+only the ones the server reached before the close -- that is, the slow ones --
+giving a p50 of **6.14 ms against a true 0.42 ms**. A biased partial sample set
+is worse than none, because 6.14 ms looked plausible.
+
+---
+
 ## 6. What is still unmeasured
 
 Stated plainly, because a performance document that implies more coverage than
@@ -315,7 +458,9 @@ it has is how the next person gets misled.
   image requests and is why m6-file's pool was widened to 32, is the case to
   measure.
 - **No h2 or h3 conformance-side performance data.** h2spec and h3spec are
-  correctness gates, not timing.
+  correctness gates, not timing. h3spec in particular must NEVER be used as a
+  load generator for a timing measurement: it deliberately opens stalled and
+  malformed connections, and doing this produced the 113 ms figure in §5a.
 - **The 6 ms per page** quoted in the handover predates all of this and was
   measured on syd under unknown conditions. It should be re-measured after a
   deploy rather than carried forward.

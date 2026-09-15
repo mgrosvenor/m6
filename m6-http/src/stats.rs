@@ -8,10 +8,16 @@ const EMIT_INTERVAL_SECS: u64 = 10;
 /// 4096 × 8 bytes = 32 KB per reservoir.
 const RESERVOIR: usize = 4096;
 
-/// Per-channel reservoir. Smaller than the aggregate one on purpose: there
-/// are up to six channels × two categories, so the full 4096 would cost
-/// 384 KB to answer a question that a few hundred samples already answers.
-const CHANNEL_RESERVOIR: usize = 512;
+/// Per-channel reservoir. Smaller than the aggregate one on purpose, but not as
+/// small as it was: six channels × three categories (hit, miss, handshake) at
+/// 1024 u64s is 144 KB, against 72 KB at 512 and 1.1 MB at the aggregate 4096.
+///
+/// 1024 rather than 512 on the owner's call. The extra 72 KB is nothing on these
+/// VMs and it doubles the window a p99 is drawn from, which matters most for
+/// handshakes: they arrive far less often than requests, so a fixed number of
+/// samples covers a much longer stretch of wall clock time on that channel than
+/// it does for cache hits.
+const CHANNEL_RESERVOIR: usize = 1024;
 
 /// Whether a response was produced by m6-http itself rather than fetched
 /// from a backend.
@@ -167,6 +173,44 @@ struct ChannelStats {
     miss_samples: Box<[u64; CHANNEL_RESERVOIR]>,
     miss_idx: usize,
     miss_count: usize,
+    /// TLS or QUIC handshake durations for connections on this channel.
+    ///
+    /// Per channel and NEVER aggregated across channels, because the three are
+    /// not the same measurement:
+    ///
+    ///   http/1.1 and http/2  rustls, timed from `ServerConnection::new` to
+    ///                        `!is_handshaking()`. EXCLUDES the TCP round trip,
+    ///                        which happened before rustls saw the socket.
+    ///   http/3               QUIC via quiche, timed to `is_established()`.
+    ///                        INCLUDES its equivalent of that round trip,
+    ///                        because QUIC folds transport and crypto together.
+    ///
+    /// A single "handshake p50" over all three would track the protocol mix
+    /// rather than the cost of anything, which is the same error as the /perf
+    /// aggregate fixed earlier and as blending resumed with full handshakes.
+    /// The ring holds only the most recent `CHANNEL_RESERVOIR` durations, and
+    /// the percentiles describe those. The four running figures below are
+    /// LIFETIME and are never overwritten, because a percentile over the last
+    /// 512 connections is not the same claim as the cost of the 40,000 before
+    /// them, and a ring on its own silently discards the difference.
+    ///
+    /// `handshake_ring_len` saturates at the ring size on purpose: it says how
+    /// many samples the percentiles were computed from. `handshake_total` is the
+    /// true count and never saturates. Reporting only the first would have
+    /// printed "512 samples" forever on a node that had served millions.
+    handshake_samples: Box<[u64; CHANNEL_RESERVOIR]>,
+    handshake_idx: usize,
+    handshake_ring_len: usize,
+    /// Every handshake ever recorded on this channel. Never reset, never capped.
+    handshake_total: u64,
+    /// Sum of every duration ever recorded, for a lifetime mean the ring cannot
+    /// give. At 10ms a handshake this overflows u64 after ~6e10 handshakes,
+    /// which a 1-core VM will not reach.
+    handshake_sum_ns: u64,
+    /// Lifetime extremes. `min` starts at u64::MAX as a "nothing yet" sentinel
+    /// and is reported only when `handshake_total > 0`.
+    handshake_min_ns: u64,
+    handshake_max_ns: u64,
 }
 
 impl ChannelStats {
@@ -182,7 +226,34 @@ impl ChannelStats {
             miss_samples: Box::new([0u64; CHANNEL_RESERVOIR]),
             miss_idx: 0,
             miss_count: 0,
+            handshake_samples: Box::new([0u64; CHANNEL_RESERVOIR]),
+            handshake_idx: 0,
+            handshake_ring_len: 0,
+            handshake_total: 0,
+            handshake_sum_ns: 0,
+            handshake_min_ns: u64::MAX,
+            handshake_max_ns: 0,
         }
+    }
+
+    fn record_handshake(&mut self, elapsed_ns: u64) {
+        if elapsed_ns == 0 {
+            return;
+        }
+        // Ring first, for the percentiles.
+        self.handshake_samples[self.handshake_idx] = elapsed_ns;
+        self.handshake_idx = (self.handshake_idx + 1) % CHANNEL_RESERVOIR;
+        if self.handshake_ring_len < CHANNEL_RESERVOIR {
+            self.handshake_ring_len += 1;
+        }
+        // Then the lifetime figures, which the ring overwrite cannot touch.
+        // saturating_add rather than wrapping: on the one machine where this
+        // could ever overflow, a stuck maximum is a readable wrong answer and a
+        // wrapped one is not.
+        self.handshake_total = self.handshake_total.saturating_add(1);
+        self.handshake_sum_ns = self.handshake_sum_ns.saturating_add(elapsed_ns);
+        self.handshake_min_ns = self.handshake_min_ns.min(elapsed_ns);
+        self.handshake_max_ns = self.handshake_max_ns.max(elapsed_ns);
     }
 
     fn record(&mut self, elapsed_ns: u64, cache_hit: bool, backend_error: bool) {
@@ -344,6 +415,17 @@ impl Stats {
             window_start: now,
             last_emit: now,
         }
+    }
+
+    /// Record one completed handshake on a channel.
+    ///
+    /// Separate from `record`, and called at a different time: a handshake
+    /// happens once per CONNECTION and a request many times within it. Folding
+    /// it into `record` would have meant either timing it per request, which is
+    /// meaningless, or carrying it on the request path, which is the one place
+    /// this project does not add work.
+    pub fn record_handshake(&mut self, elapsed_ns: u64, channel: Channel) {
+        self.channels[channel.index()].record_handshake(elapsed_ns);
     }
 
     #[inline(always)]
@@ -599,11 +681,20 @@ impl Stats {
                 .channels
                 .iter()
                 .enumerate()
-                .filter(|(_, c)| c.requests > 0)
+                // Requests OR handshakes. A channel can have a completed
+                // handshake and no request yet: a scanner that connects and
+                // disconnects, a connection still in flight, or a client that
+                // gave up after the TLS exchange. Filtering on requests alone
+                // recorded those handshakes and then dropped them from the
+                // report, which a test caught by asking for a channel that had
+                // one sample and no traffic.
+                .filter(|(_, c)| c.requests > 0 || c.handshake_total > 0)
                 .map(|(i, c)| {
                     let ch = Channel::from_index(i);
                     let (_, hp50, hp99, _) = percentiles_n(&c.hit_samples[..], c.hit_count);
                     let (_, mp50, mp99, _) = percentiles_n(&c.miss_samples[..], c.miss_count);
+                    let (_, kp50, kp99, _) =
+                        percentiles_n(&c.handshake_samples[..], c.handshake_ring_len);
                     ChannelSnapshot {
                         channel: ch.label(),
                         version: ch.version.as_str().to_string(),
@@ -618,6 +709,29 @@ impl Stats {
                         miss_samples: c.miss_count,
                         miss_p50_ns: mp50,
                         miss_p99_ns: mp99,
+                        // What the percentiles were computed from: the ring,
+                        // capped at CHANNEL_RESERVOIR.
+                        handshake_samples: c.handshake_ring_len,
+                        handshake_p50_ns: kp50,
+                        handshake_p99_ns: kp99,
+                        // The lifetime record, which the ring cannot discard.
+                        // The mean is derived here rather than in the reader so
+                        // every consumer divides the same way.
+                        handshake_total: c.handshake_total,
+                        // checked_div rather than a guard: zero total means no
+                        // handshakes, and 0 is the right answer for "nothing to
+                        // average" as long as `handshake_total` is printed beside
+                        // it so a reader can tell 0 from absent.
+                        handshake_mean_ns: c
+                            .handshake_sum_ns
+                            .checked_div(c.handshake_total)
+                            .unwrap_or(0),
+                        handshake_min_ns: if c.handshake_total > 0 {
+                            c.handshake_min_ns
+                        } else {
+                            0
+                        },
+                        handshake_max_ns: c.handshake_max_ns,
                     }
                 })
                 .collect(),
@@ -1249,5 +1363,187 @@ mod perf_reservoir_tests {
             "the 0ns request must not enter the reservoir"
         );
         assert_eq!(snap.hit_p50_ns, 5_000);
+    }
+}
+
+/// Handshake timing, and the separation that makes it meaningful.
+///
+/// Connection setup is measured per channel and never aggregated, because the
+/// three protocols do not measure the same span:
+///
+///   h1 and h2  rustls, from `ServerConnection::new` to `!is_handshaking()`.
+///              EXCLUDES the TCP round trip, already done before rustls saw the
+///              socket.
+///   h3         QUIC, to `is_established()`. INCLUDES the equivalent round trip,
+///              because QUIC folds transport and crypto together.
+///
+/// A combined figure would track the protocol mix rather than the cost of
+/// anything -- the same error as the `/perf` aggregate fixed earlier today.
+#[cfg(test)]
+mod handshake_tests {
+
+    /// The reservoir overwrites. The lifetime figures must not.
+    ///
+    /// This is the property the owner asked for in as many words: do not throw
+    /// values away and keep the count. Before this, `handshake_count` saturated
+    /// at the reservoir size, so a node that had served a million handshakes
+    /// reported "512 samples" and had silently forgotten every duration outside
+    /// the last 512 -- including its worst.
+    #[test]
+    fn a_full_reservoir_does_not_lose_the_count_or_the_extremes() {
+        let mut s = Stats::new();
+        let c = ch(Version::Http11);
+
+        // One deliberately slow handshake FIRST, then enough traffic to push it
+        // out of the ring entirely.
+        s.record_handshake(900_000_000, c);
+        for _ in 0..(CHANNEL_RESERVOIR * 2) {
+            s.record_handshake(1_000_000, c);
+        }
+
+        let snap = s.snapshot();
+        let h = snap
+            .channels
+            .iter()
+            .find(|x| x.channel == c.label())
+            .expect("channel present");
+
+        // The window is capped, and says so.
+        assert_eq!(h.handshake_samples, CHANNEL_RESERVOIR);
+        // The count is not capped.
+        assert_eq!(h.handshake_total, (CHANNEL_RESERVOIR * 2 + 1) as u64);
+        // The 900ms outlier is long gone from the ring, so the percentiles
+        // cannot see it. That is expected and is exactly why max exists.
+        assert!(
+            h.handshake_p99_ns < 900_000_000,
+            "outlier should have been evicted from the ring, p99 was {}",
+            h.handshake_p99_ns
+        );
+        // And it is still on the record.
+        assert_eq!(h.handshake_max_ns, 900_000_000);
+        assert_eq!(h.handshake_min_ns, 1_000_000);
+        // Mean over everything, not over the window.
+        let expect_mean = (900_000_000 + 1_000_000 * (CHANNEL_RESERVOIR as u64 * 2))
+            / (CHANNEL_RESERVOIR as u64 * 2 + 1);
+        assert_eq!(h.handshake_mean_ns, expect_mean);
+    }
+
+    /// A channel with no handshake reports zero for min, not u64::MAX. The
+    /// sentinel must never reach a reader, who would render it as 18 billion
+    /// milliseconds and reasonably conclude the node was broken.
+    #[test]
+    fn the_min_sentinel_never_escapes() {
+        let mut s = Stats::new();
+        // Traffic but no handshake: an h2c or internal channel.
+        s.record(1_000, false, 200, ch(Version::Http11), "");
+        let snap = s.snapshot();
+        for c in &snap.channels {
+            assert_eq!(c.handshake_total, 0);
+            assert_eq!(
+                c.handshake_min_ns, 0,
+                "channel {} leaked the sentinel",
+                c.channel
+            );
+        }
+    }
+
+    use super::*;
+
+    fn ch(v: Version) -> Channel {
+        Channel::new(v, Iface::External)
+    }
+
+    #[test]
+    fn a_handshake_is_recorded_on_its_own_channel() {
+        let mut s = Stats::new();
+        s.record_handshake(4_000_000, ch(Version::Http11));
+        let snap = s.snapshot();
+        let h1 = snap
+            .channels
+            .iter()
+            .find(|c| c.channel == "http/1.1/external")
+            .expect("h1 channel present once it has a sample");
+        assert_eq!(h1.handshake_samples, 1);
+        assert_eq!(h1.handshake_p50_ns, 4_000_000);
+    }
+
+    /// The property the whole design rests on.
+    #[test]
+    fn the_three_protocols_never_share_a_figure() {
+        let mut s = Stats::new();
+        // Deliberately far apart, as a real fleet would be: a resumed TLS
+        // handshake and a QUIC one that includes a round trip are not close.
+        s.record_handshake(1_000_000, ch(Version::Http11));
+        s.record_handshake(2_000_000, ch(Version::Http2));
+        s.record_handshake(90_000_000, ch(Version::Http3));
+
+        let snap = s.snapshot();
+        let get = |name: &str| {
+            snap.channels
+                .iter()
+                .find(|c| c.channel == name)
+                .unwrap_or_else(|| panic!("{name} missing"))
+                .handshake_p50_ns
+        };
+        assert_eq!(get("http/1.1/external"), 1_000_000);
+        assert_eq!(get("http/2/external"), 2_000_000);
+        assert_eq!(get("http/3/external"), 90_000_000);
+        // And the slow h3 figure has not contaminated the others, which is what
+        // an aggregate would have done.
+        assert!(get("http/1.1/external") < get("http/3/external"));
+    }
+
+    /// External and internal are different events even on one protocol: a
+    /// browser handshake and one from the WireGuard backbone.
+    #[test]
+    fn interface_separates_them_too() {
+        let mut s = Stats::new();
+        s.record_handshake(5_000, Channel::new(Version::Http2, Iface::External));
+        s.record_handshake(50_000, Channel::new(Version::Http2, Iface::Internal));
+        let snap = s.snapshot();
+        let ext = snap
+            .channels
+            .iter()
+            .find(|c| c.channel == "http/2/external")
+            .unwrap();
+        let int = snap
+            .channels
+            .iter()
+            .find(|c| c.channel == "http/2/internal")
+            .unwrap();
+        assert_eq!(ext.handshake_p50_ns, 5_000);
+        assert_eq!(int.handshake_p50_ns, 50_000);
+    }
+
+    /// Zero samples must not read as a zero-nanosecond handshake. Same rule as
+    /// the hit percentiles: the count is what distinguishes them.
+    #[test]
+    fn no_handshake_is_no_samples_not_zero_nanoseconds() {
+        let mut s = Stats::new();
+        // Traffic, but no handshake recorded -- a plaintext or reused connection.
+        s.record(1_000, true, 200, ch(Version::Http11), "cache");
+        let snap = s.snapshot();
+        let h1 = snap
+            .channels
+            .iter()
+            .find(|c| c.channel == "http/1.1/external")
+            .unwrap();
+        assert_eq!(h1.handshake_samples, 0);
+        assert_eq!(h1.handshake_p50_ns, 0);
+        // The request itself was still counted.
+        assert_eq!(h1.requests, 1);
+    }
+
+    /// A zero duration is not a sample. The clock resolution is nanoseconds and a
+    /// real handshake is microseconds at minimum, so a zero means "not measured".
+    #[test]
+    fn a_zero_duration_is_not_recorded() {
+        let mut s = Stats::new();
+        s.record_handshake(0, ch(Version::Http2));
+        let snap = s.snapshot();
+        assert!(
+            snap.channels.iter().all(|c| c.handshake_samples == 0),
+            "a zero duration must not enter the reservoir"
+        );
     }
 }

@@ -64,7 +64,28 @@ enum ConnKind {
     Http2(Box<Http2Conn>),
 }
 
+/// One completed handshake, for the caller that owns the stats.
+///
+/// `drive_all` returns these rather than recording them itself: the listener has
+/// no stats handle, and giving it one would couple the transport to the metrics.
+#[derive(Debug, Clone, Copy)]
+pub struct HandshakeSample {
+    pub elapsed_ns: u64,
+    /// True if ALPN selected h2. False means HTTP/1.1.
+    pub is_h2: bool,
+}
+
 struct Conn {
+    /// Handshake duration, set once when TLS completes and taken by `drive_all`.
+    ///
+    /// Recorded here rather than passed out through a callback because
+    /// `drive_conn` is a free function over one connection and knows nothing
+    /// about the stats. The alternative was a third generic parameter threaded
+    /// through `drive_all` and its three call sites, one of which is the :80
+    /// redirector that has no stats at all.
+    handshake_ns: Option<u64>,
+    /// Whether that handshake negotiated h2. `None` means h1 or no ALPN.
+    handshake_h2: bool,
     stream: TcpStream,
     /// `None` on a plaintext listener. HTTP/2 already carried this
     /// distinction (`H2Io::Tls` / `H2Io::Plain`); this gives HTTP/1.1 the same
@@ -254,7 +275,13 @@ impl Http11Listener {
                             expect_handled: false,
                         })
                     };
-                    self.conns.push(Conn { stream, tls, kind });
+                    self.conns.push(Conn {
+                        handshake_ns: None,
+                        handshake_h2: false,
+                        stream,
+                        tls,
+                        kind,
+                    });
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => {
@@ -266,7 +293,12 @@ impl Http11Listener {
     }
 
     /// Drive all active connections. Done connections are deregistered and dropped.
-    pub fn drive_all<F, G>(&mut self, mut on_request: F, mut on_response: G, poller: &Poller)
+    pub fn drive_all<F, G>(
+        &mut self,
+        mut on_request: F,
+        mut on_response: G,
+        poller: &Poller,
+    ) -> Vec<HandshakeSample>
     where
         F: FnMut(&HttpRequest, &str) -> RequestOutcome,
         G: FnMut(
@@ -280,8 +312,17 @@ impl Http11Listener {
             std::sync::Arc<Vec<String>>,
         ),
     {
+        // `Vec::new()` does not allocate until something is pushed, and most
+        // wakeups complete no handshake at all, so the common path here is free.
+        let mut handshakes = Vec::new();
         for conn in &mut self.conns {
             drive_conn(conn, &mut on_request, &mut on_response);
+            if let Some(ns) = conn.handshake_ns.take() {
+                handshakes.push(HandshakeSample {
+                    elapsed_ns: ns,
+                    is_h2: conn.handshake_h2,
+                });
+            }
         }
         for conn in &self.conns {
             if conn.is_done() {
@@ -289,6 +330,7 @@ impl Http11Listener {
             }
         }
         self.conns.retain(|c| !c.is_done());
+        handshakes
     }
 }
 
@@ -483,7 +525,51 @@ where
     }
 
     // Pump TLS I/O for H1 / still-handshaking connections.
-    if advance_tls(conn.tls.as_mut().expect("tls path"), &conn.stream).is_err() {
+    let tls_failed = advance_tls(conn.tls.as_mut().expect("tls path"), &conn.stream).is_err();
+
+    // ── Stamp the handshake BEFORE deciding the connection is unusable ────────
+    //
+    // This sits above the error path deliberately, and the ordering is the whole
+    // fix. `advance_tls` reads whatever arrived; when a client completes its
+    // handshake and closes immediately, the final flight and the FIN arrive
+    // together, so ONE call finishes the handshake and then hits EOF and returns
+    // Err. The old code took the error path, replaced `conn.kind` (destroying the
+    // `Handshake` variant and its `created` stamp) and returned, roughly forty
+    // lines above the point where the handshake was recorded. A completed,
+    // perfectly normal handshake was thrown away.
+    //
+    // Measured on staging, 200 sequential handshakes per protocol from
+    // m6-probe-h1/h2/h3 against a client figure of 0.34ms:
+    //
+    //   h1   0 of 200 recorded.       Nothing happens after an h1 handshake, so
+    //                                 the close won the race every single time.
+    //   h2  70 of 200, p50 6.14ms.    18x the truth, and WHY is the point: the
+    //                                 only survivors were connections the server
+    //                                 reached before the close, meaning ones that
+    //                                 had already waited an extra event-loop turn.
+    //                                 The population was selected for slowness.
+    //   h3 200 of 200, p50 1.00ms.    Correct, because the QUIC path in main.rs
+    //                                 stamps at `is_established()` inside the
+    //                                 packet handler where nothing can overtake it.
+    //
+    // A partial sample set that is also biased is worse than none: h2's 6.14ms
+    // looked plausible and was reported as the node's handshake cost.
+    //
+    // `handshake_ns.is_none()` guards against re-stamping, since this runs on
+    // every wakeup for the connection.
+    if conn.handshake_ns.is_none() {
+        if let ConnKind::Handshake { created, .. } = &conn.kind {
+            let tls = conn.tls.as_ref().expect("tls path");
+            if !tls.is_handshaking() {
+                let elapsed = created.elapsed().as_nanos() as u64;
+                let is_h2 = tls.alpn_protocol() == Some(b"h2".as_slice());
+                conn.handshake_ns = Some(elapsed);
+                conn.handshake_h2 = is_h2;
+            }
+        }
+    }
+
+    if tls_failed {
         conn.kind = ConnKind::Http1(H1Conn {
             state: H1State::Done,
             client_ip: String::new(),
@@ -500,7 +586,7 @@ where
         return;
     }
 
-    // Handshake just completed — dispatch on ALPN.
+    // Handshake just completed -- dispatch on ALPN.
     if let ConnKind::Handshake { client_ip, created } = &conn.kind {
         let proto = conn
             .tls
@@ -509,6 +595,10 @@ where
             .alpn_protocol()
             .map(|p| p.to_vec());
         let client_ip = client_ip.clone();
+        // Still needed by the H1 branch below, which carries the accept stamp
+        // forward as the connection's own age. The handshake DURATION is no
+        // longer taken here: it is stamped above, before the error path can
+        // discard it.
         let created = *created;
         if proto.as_deref() == Some(b"h2".as_slice()) {
             conn.kind = ConnKind::Http2(Box::default());

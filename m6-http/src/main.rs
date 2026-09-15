@@ -108,6 +108,17 @@ struct QuicConn {
     client_addr: SocketAddr,
     /// When we last heard from this connection (for timeout tracking)
     last_active: Instant,
+    /// When `quiche::accept` created this connection.
+    ///
+    /// The QUIC handshake is timed from here to `is_established()`. That span is
+    /// WIDER than the rustls one measured in http11.rs: QUIC folds the transport
+    /// and cryptographic handshakes together, so it includes the round trip TCP
+    /// had already completed before rustls ever saw a socket. The two are
+    /// reported on separate channels and never summed, for that reason.
+    created: Instant,
+    /// Set once the handshake has been recorded, so a connection that stays up
+    /// for an hour contributes one sample rather than one per packet.
+    handshake_recorded: bool,
 }
 
 struct PendingRequest {
@@ -297,6 +308,42 @@ fn make_quiche_config(server_config: &config::ServerConfig) -> anyhow::Result<qu
     cfg.set_initial_max_streams_uni(100);
     cfg.set_disable_active_migration(true);
 
+    // ── 0-RTT ─────────────────────────────────────────────────────────────────
+    //
+    // A returning visitor sends its request in the FIRST flight, so the response
+    // costs zero round trips instead of one. On loopback that saves about a
+    // millisecond and looks unimportant. On the paths this fleet actually serves
+    // it is the single largest latency win available: London and Chicago are
+    // roughly 300ms from the Sydney origin, and a saved round trip is 300ms that
+    // no amount of local tuning can recover.
+    //
+    // For comparison, over TCP the same visitor pays TWO round trips before any
+    // application data: one for the TCP handshake and one for TLS. Measured on
+    // the build host's loopback with m6-probe-h1/h2/h3, h3 establishment is
+    // ~1.1ms against h2's ~0.42ms, which reads as h3 being slower -- but loopback
+    // has no RTT, so it prices only CPU and values a saved round trip at nothing.
+    //
+    // ── The replay problem, and why this is still safe ────────────────────────
+    //
+    // 0-RTT data is REPLAYABLE. An attacker who captures the first flight can
+    // send it again, and the server cannot tell the copy from the original: the
+    // anti-replay guarantee of the full handshake is exactly what has not
+    // happened yet. RFC 8470 is the rule here, and neither BoringSSL's
+    // single-use tickets nor quiche closes the hole on its own.
+    //
+    // So enabling this is only half the change. The other half is in
+    // `handle_h3_request`, which answers 425 Too Early to anything a replay could
+    // affect, and it is deliberately stricter than RFC 8470's "idempotent
+    // methods" advice: only a FRESH CACHE HIT is served in early data. A replayed
+    // cache read re-sends bytes and does nothing else.
+    //
+    // "GET is safe" would NOT have been good enough here. This site's analytics
+    // beacon is a fire-and-forget GET (assets/js/nav-timing.js), so a replayed
+    // 0-RTT GET would inflate a page-view counter. m6-http cannot recognise that
+    // route -- it is proxied like any other -- which is the reason the rule is
+    // about where the answer comes from rather than about a list of paths.
+    cfg.enable_early_data();
+
     Ok(cfg)
 }
 
@@ -464,7 +511,7 @@ fn event_loop(
             // Safety: on_request and on_response are called sequentially, never
             // concurrently, so the two `&mut state` aliases never overlap.
             let state_ptr = state as *mut ServerState;
-            t.drive_all(
+            let handshakes = t.drive_all(
                 |req, client_ip| {
                     let state = unsafe { &mut *state_ptr };
                     let ua = analytics::header(&req.headers, "user-agent");
@@ -744,6 +791,22 @@ fn event_loop(
                 },
                 &poller,
             );
+            // Handshakes completed on this wakeup, attributed by negotiated ALPN.
+            //
+            // Recorded here because this is where the stats live; the listener
+            // returns the samples rather than holding a stats handle of its own.
+            // The interface comes from the listener the connection arrived on, so
+            // a browser handshake and a backbone one land on different channels.
+            for hs in handshakes {
+                let v = if hs.is_h2 {
+                    HttpVersion::Http2
+                } else {
+                    HttpVersion::Http11
+                };
+                state
+                    .stats
+                    .record_handshake(hs.elapsed_ns, Channel::new(v, state.tls_iface));
+            }
         }
 
         // Drive H2C (HTTP/2 cleartext) connections.
@@ -1019,6 +1082,12 @@ fn event_loop(
                 },
                 &poller,
             );
+            // No handshake recording here, and that is not an omission. This is
+            // the H2C CLEARTEXT listener -- a different type from the TLS one
+            // above, with its own `drive_all` that returns nothing because there
+            // is no handshake to time. h2c is the backbone path from the cache
+            // nodes, which carry their own TLS to the visitor and reach the
+            // origin in the clear over WireGuard.
         }
 
         // Drive connection timeouts and flush pending sends
@@ -1230,6 +1299,8 @@ fn drain_udp(
                     pending_url: HashMap::new(),
                     client_addr: from,
                     last_active: Instant::now(),
+                    created: Instant::now(),
+                    handshake_recorded: false,
                 },
             );
             // Alias the client's Initial DCID → our 20-byte key for retransmits.
@@ -1268,8 +1339,34 @@ fn drain_udp(
             continue;
         }
 
-        // Establish H3 connection once QUIC handshake is complete
-        if qconn.conn.is_established() && qconn.h3_conn.is_none() {
+        // The QUIC handshake is complete exactly here, the first time this is
+        // true. Guarded by a flag because this branch is reached on every packet
+        // for the life of the connection, and recording unguarded would turn one
+        // handshake into thousands of samples of a steadily growing duration.
+        if qconn.conn.is_established() && !qconn.handshake_recorded {
+            qconn.handshake_recorded = true;
+            state.stats.record_handshake(
+                qconn.created.elapsed().as_nanos() as u64,
+                Channel::new(HttpVersion::Http3, state.tls_iface),
+            );
+        }
+
+        // Establish the H3 connection once the QUIC handshake is complete, OR as
+        // soon as early data arrives.
+        //
+        // The early-data half is what makes 0-RTT reach the application at all.
+        // With `is_established()` alone the requests in a client's first flight
+        // were accepted by QUIC and then had nowhere to go, because the h3
+        // connection that parses them did not exist until a round trip later --
+        // so the round trip 0-RTT exists to save was still being paid.
+        //
+        // quiche permits this: `h3::Connection::with_transport` gates on
+        // established-or-early-data for CLIENTS only, and this is the server.
+        //
+        // `handle_h3_request` decides what may actually be ANSWERED this early.
+        // Parsing a request in early data is not the risk; acting on it is.
+        if (qconn.conn.is_established() || qconn.conn.is_in_early_data()) && qconn.h3_conn.is_none()
+        {
             let h3_config = match quiche::h3::Config::new() {
                 Ok(c) => c,
                 Err(e) => {
@@ -1460,6 +1557,31 @@ fn handle_h3_request(
     let enc_str = std::str::from_utf8(enc_bytes).unwrap_or("");
     let query_str = query_bytes.and_then(|q| std::str::from_utf8(q).ok());
 
+    // ── 0-RTT gate A: replayable methods ─────────────────────────────────────
+    //
+    // True only while the handshake is still incomplete, which is precisely the
+    // window in which this request could be a replay of a captured first flight.
+    // Once established it is false and none of this applies, so the fast path for
+    // every normal request is one boolean.
+    let in_early_data = !qconn.conn.is_established();
+    if in_early_data && !(method_bytes == b"GET" || method_bytes == b"HEAD") {
+        // 425 Too Early, RFC 8470 5.2: the client retries once the handshake
+        // finishes, and nothing here has touched state. A replayed POST would
+        // otherwise submit the contact form twice.
+        //
+        // This costs a round trip on exactly the requests where correctness beats
+        // latency, and costs nothing on the reads that make up the page load.
+        let mut headers: Vec<(String, String)> = Vec::new();
+        set_date(&mut headers);
+        send_h3_response(stream_id, qconn, 425, &headers, Bytes::new(), false);
+        debug!(
+            stream_id,
+            method = %String::from_utf8_lossy(method_bytes),
+            "h3 0-RTT: refused a replayable method with 425"
+        );
+        return;
+    }
+
     let start = Instant::now();
 
     // ── Rate limit — before cache lookup, routing, or any backend work ───────
@@ -1537,6 +1659,38 @@ fn handle_h3_request(
         let mut headers: Vec<(String, String)> = Vec::new();
         set_date(&mut headers);
         send_h3_response(stream_id, qconn, 504, &headers, Bytes::new(), false);
+        return;
+    }
+
+    // ── 0-RTT gate B: only a FRESH cache hit is answered in early data ────────
+    //
+    // Gate A already refused replayable methods. This refuses everything else a
+    // replay could act on, and it is what makes 0-RTT defensible on this site
+    // rather than merely RFC-compliant:
+    //
+    //   - A backend request may have side effects. The analytics beacon is a
+    //     fire-and-forget GET, so "the method is safe" does not mean "replaying it
+    //     changes nothing". m6-http cannot pick that route out -- it is proxied
+    //     like any other -- so the rule is about where the answer comes from.
+    //   - A STALE hit is excluded too, even though it serves from cache, because
+    //     serving stale QUEUES A BACKGROUND REFRESH. That is a write, and a replay
+    //     would queue it again.
+    //
+    // A fresh hit re-sends bytes m6 already holds and touches nothing else, so a
+    // replay of one is indistinguishable from the visitor pressing reload.
+    //
+    // This is the common case for the thing 0-RTT is for: a returning visitor
+    // fetching a warm page and its assets. Everything else pays one round trip,
+    // which is what it would have paid anyway without 0-RTT.
+    if in_early_data && !matches!(looked_up, m6_http_lib::cache::Lookup::Fresh(..)) {
+        let mut headers: Vec<(String, String)> = Vec::new();
+        set_date(&mut headers);
+        send_h3_response(stream_id, qconn, 425, &headers, Bytes::new(), false);
+        debug!(
+            stream_id,
+            path = path_str,
+            "h3 0-RTT: no fresh cache entry, refused with 425"
+        );
         return;
     }
     // Serve stale now, refresh behind the request — see the HTTP/1.1 path for
