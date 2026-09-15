@@ -37,6 +37,12 @@ pub struct NodeReading {
     /// is the handshake rather than anything either node did. Do not compare
     /// it with the loopback TTFB, which measures the opposite thing.
     pub rtt: Option<Duration>,
+    /// Outcome of each `[[monitor.header_check]]` this deployment declared.
+    ///
+    /// Empty when none are declared, which the report states rather than
+    /// rendering as a pass: "nothing configured" and "everything correct" must
+    /// not look the same.
+    pub header_checks: Vec<HeaderCheckResult>,
     /// `/traffic`: this node's summary of its own traffic and whether its
     /// logging is alive. Absent for the same reasons `/perf` can be.
     pub traffic: Option<TrafficReport>,
@@ -97,8 +103,59 @@ fn get(agent: &ureq::Agent, url: &str, token: Option<&str>) -> anyhow::Result<(u
     }
 }
 
+/// What one declared header check found.
+#[derive(Debug, Clone)]
+pub struct HeaderCheckResult {
+    pub path: String,
+    pub header: String,
+    pub expected: String,
+    /// What came back, or None if the header was absent entirely. Absent and
+    /// wrong are different failures and are reported differently.
+    pub actual: Option<String>,
+    pub status: Option<u16>,
+    /// Transport failure, as opposed to a wrong answer.
+    pub error: Option<String>,
+}
+
+impl HeaderCheckResult {
+    pub fn passed(&self) -> bool {
+        self.error.is_none() && self.actual.as_deref() == Some(self.expected.as_str())
+    }
+}
+
+/// Read one response header, without downloading the body.
+///
+/// Separate from `get` because it needs the HEADER rather than the payload, and
+/// because a 4xx or 5xx is a legitimate answer here too: a path that should be
+/// cacheable answering 500 is exactly the kind of thing a header check is for,
+/// and swallowing it as a transport error would hide it.
+fn head_header(
+    agent: &ureq::Agent,
+    url: &str,
+    header: &str,
+) -> (Option<u16>, Option<String>, Option<String>) {
+    match agent.get(url).call() {
+        Ok(resp) => (
+            Some(resp.status()),
+            resp.header(header).map(|v| v.trim().to_string()),
+            None,
+        ),
+        Err(ureq::Error::Status(code, resp)) => (
+            Some(code),
+            resp.header(header).map(|v| v.trim().to_string()),
+            None,
+        ),
+        Err(e) => (None, None, Some(format!("{e}"))),
+    }
+}
+
 /// Poll one node.
-pub fn node(n: &Node, fleet_token: Option<&str>, timeout: Duration) -> NodeReading {
+pub fn node(
+    n: &Node,
+    fleet_token: Option<&str>,
+    timeout: Duration,
+    header_checks: &[crate::fleet::HeaderCheck],
+) -> NodeReading {
     // Per-node token first: the nodes do not share one.
     let token = n.perf_token(fleet_token);
     let token = token.as_deref();
@@ -112,6 +169,7 @@ pub fn node(n: &Node, fleet_token: Option<&str>, timeout: Duration) -> NodeReadi
         perf_error: None,
         traffic: None,
         traffic_error: None,
+        header_checks: Vec::new(),
         rtt: None,
         unreachable: None,
     };
@@ -194,6 +252,45 @@ pub fn node(n: &Node, fleet_token: Option<&str>, timeout: Duration) -> NodeReadi
         Err(e) => reading.traffic_error = Some(format!("{e}")),
     }
 
+    // ── The deployment's own header assertions ───────────────────────────────
+    //
+    // Run last, and against the node's PUBLIC base url rather than a loopback,
+    // because the thing being checked is what a visitor receives. A cache node
+    // may legitimately answer differently from the origin, which is why a check
+    // can name the roles it applies to.
+    for hc in header_checks {
+        if !hc.roles.is_empty() && !hc.roles.iter().any(|r| r == &n.role) {
+            continue;
+        }
+        // Cache-bust by default. `s-maxage=86400` means a stale entry answers 200
+        // for a day after the backend stopped being able to produce it, so an
+        // un-busted check can pass against a broken node.
+        let url = if hc.cache_bust {
+            let sep = if hc.path.contains('?') { '&' } else { '?' };
+            format!(
+                "{}{}{}hc={}",
+                n.url,
+                hc.path,
+                sep,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            )
+        } else {
+            format!("{}{}", n.url, hc.path)
+        };
+        let (status, actual, error) = head_header(&agent, &url, &hc.header);
+        reading.header_checks.push(HeaderCheckResult {
+            path: hc.path.clone(),
+            header: hc.header.clone(),
+            expected: hc.expect.clone(),
+            actual,
+            status,
+            error,
+        });
+    }
+
     reading
 }
 
@@ -202,11 +299,16 @@ pub fn node(n: &Node, fleet_token: Option<&str>, timeout: Duration) -> NodeReadi
 /// In parallel because a fleet report should cost one timeout, not one per
 /// node: three nodes behind a five second timeout is fifteen seconds of a
 /// human waiting, and the slow case is exactly when someone is watching.
-pub fn fleet(nodes: &[Node], token: Option<&str>, timeout: Duration) -> Vec<NodeReading> {
+pub fn fleet(
+    nodes: &[Node],
+    token: Option<&str>,
+    timeout: Duration,
+    header_checks: &[crate::fleet::HeaderCheck],
+) -> Vec<NodeReading> {
     std::thread::scope(|scope| {
         let handles: Vec<_> = nodes
             .iter()
-            .map(|n| scope.spawn(move || node(n, token, timeout)))
+            .map(|n| scope.spawn(move || node(n, token, timeout, header_checks)))
             .collect();
         handles
             .into_iter()
@@ -221,6 +323,7 @@ pub fn fleet(nodes: &[Node], token: Option<&str>, timeout: Duration) -> Vec<Node
                     perf_error: None,
                     traffic: None,
                     traffic_error: None,
+                    header_checks: Vec::new(),
                     rtt: None,
                     unreachable: Some("poll thread panicked".to_string()),
                 })
@@ -247,6 +350,7 @@ mod tests {
             perf_error: None,
             traffic: None,
             traffic_error: None,
+            header_checks: Vec::new(),
             rtt: None,
             unreachable: unreachable.map(|s| s.to_string()),
         }

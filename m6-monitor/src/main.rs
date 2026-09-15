@@ -72,6 +72,7 @@ fn collect_from(
         &fleet.nodes,
         token.as_deref(),
         Duration::from_millis(fleet.timeout_ms),
+        &fleet.header_check,
     );
     let d = digest::build(&readings, &digest::Thresholds::default(), now_iso8601());
     Ok((d, readings))
