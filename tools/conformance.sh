@@ -263,7 +263,19 @@ start_edge() {
 
   # rustls rejects an X.509 v1 certificate (UnsupportedCertVersion). `-addext`
   # is what forces v3, and openssl gives no warning if you leave it out.
-  if [[ ! -f "$WORK/cert.pem" ]]; then
+  #
+  # Regenerated when it is missing OR within an hour of expiry, not merely when
+  # it is missing. $WORK is a fixed path under /tmp that survives between runs,
+  # so a `-days 2` certificate generated on one day was still being reused four
+  # days later: every handshake failed with TlsFail, and h3 scored 11/49 while
+  # the edge log filled with TLS errors. The score looked exactly like a
+  # protocol regression, and two days of certificate-compression and
+  # amplification-factor work were measured against it and misread, because a
+  # stale certificate and a broken server are indistinguishable from the summary
+  # line alone. A test fixture with an expiry date has to be checked for it.
+  if [[ ! -f "$WORK/cert.pem" ]] \
+     || ! openssl x509 -in "$WORK/cert.pem" -noout -checkend 3600 >/dev/null 2>&1; then
+    rm -f "$WORK/cert.pem" "$WORK/key.pem"
     openssl req -x509 -newkey rsa:2048 -keyout "$WORK/key.pem" -out "$WORK/cert.pem" \
       -days 2 -nodes -subj "/CN=localhost" \
       -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" 2>/dev/null

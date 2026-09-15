@@ -308,66 +308,29 @@ fn make_quiche_config(server_config: &config::ServerConfig) -> anyhow::Result<qu
     cfg.set_initial_max_streams_uni(100);
     cfg.set_disable_active_migration(true);
 
-    // ── Anti-amplification factor: 4 rather than quiche's default 3 ───────────
+    // NO amplification factor override. quiche's conforming default of 3 stands.
     //
-    // Removes a full round trip from EVERY new HTTP/3 connection.
+    // 1.2.0 and 1.3.0 carried `set_max_amplification_factor(4)` because the
+    // uncompressed handshake flight was 4082 bytes against a 3600-byte budget, so the
+    // server sent 3600, stopped, and waited a full round trip for an ACK. It was
+    // marked temporary from the day it shipped, and certificate compression below is
+    // what removes the need for it.
     //
-    // Before validating a client's address a server may send only
-    // `factor x bytes received`. A client's opening Initial is padded to 1200
-    // bytes, so at factor 3 the budget is 3600. Our handshake flight is 4082
-    // bytes, nearly all of it the certificate chain, so quiche sent 3600,
-    // stopped with 482 bytes left, and waited a round trip for the client's ACK
-    // before finishing. Measured with m6-probe-h3 from a laptop: the final server
-    // datagram arrived 4.98ms after the previous one against a 4.85ms RTT, making
-    // the handshake ~2 RTT instead of 1. At factor 4 the budget is 4800 and the
-    // flight goes out in one go, with 718 bytes of headroom for a chain that
-    // grows at renewal.
+    // Measured against the staging origin, same probe and path, only compression
+    // changing. The client sends 2467 bytes, so the budget is 3600:
     //
-    // ── Why this is not the security tradeoff it appears to be ───────────────
+    //     no compression    server sent 4081B   stalls at 3600, +5.07ms, 4 datagrams
+    //     brotli            server sent 2859B   no stall, 3 datagrams, 1.16x
     //
-    // RFC 9000 8.1 says MUST NOT exceed 3, to stop a server being used as a
-    // reflection amplifier: an attacker spoofs a victim's address, sends an
-    // Initial, and the server sprays the response at the victim. So the question
-    // is how much worse a 4x reflector is than a 3x one, and the answer is: not
-    // measurably. Reflection is only worth mounting when the return is orders of
-    // magnitude. DNS gives around 50x, NTP monlist around 500x, memcached around
-    // 50,000x. At 3x an attacker spends 1200 bytes of their own upstream to
-    // deliver 3600, burning a third of the attack on themselves; at 4x, a
-    // quarter. Neither is an amplifier anyone would choose, and moving between
-    // them does not change that. Calling 4x "a 33% stronger reflector" is true
-    // and useless; the distinction that would matter is 3x against 30x.
+    // 2859 against 3600 leaves room for a chain that grows, and the handshake now
+    // completes in one round trip while satisfying RFC 9000 8.1 rather than
+    // deviating from it. Both numbers are the whole server flight before the
+    // address is validated, not the certificate alone.
     //
-    // Measured against real edges with m6-probe-h3, on a 1200-byte client
-    // Initial, both well past the limit:
-    //
-    //   Cloudflare (cloudflare.com)        4198 bytes  =  3.50x
-    //   Fastly     (www.mozilla.org)       5360 bytes  =  4.47x
-    //
-    // Two of the largest CDNs in operation exceed it, and Cloudflare wrote quiche.
-    //
-    // The real consequence is CONFORMANCE, because this repository gates on
-    // h3spec scores and h3spec covers QUIC as well as RFC 9114. That is measured
-    // rather than argued: the score either side of this change is in the commit.
-    //
-    // ── THIS IS TEMPORARY. It goes back to the default of 3. ─────────────────
-    //
-    // Owner's decision, 2026-09-15: ship 4 now so production gets the round trip
-    // back, and remove it once certificate compression makes it unnecessary.
-    //
-    // Compression is the properly correct fix, and the one the QUIC community
-    // actually recommends. Fastly's study of the problem measured 40-44% of
-    // UNCOMPRESSED chains exceeding the budget, and compression taking that to
-    // 1-9%; other work puts it at 61% for a Firefox-sized 1352-byte Initial. So
-    // this is the ordinary case rather than anything unusual about this
-    // deployment, and nobody in that literature proposes raising the factor.
-    // Measured here, zlib takes our chain from 3400 to 2345 bytes, a 1055-byte
-    // saving where 482 is needed, which puts the flight under 3600 at factor 3.
-    //
-    // Not reachable today: quiche binds 12 SSL_CTX functions and
-    // `SSL_CTX_add_cert_compression_alg` is not one of them, though BoringSSL
-    // underneath implements RFC 8879. Tracked as its own issue against the fork,
-    // and when it lands THIS LINE IS DELETED.
-    cfg.set_max_amplification_factor(4);
+    // The flight is brotli, not zlib, and that is deliberate: see the comment on
+    // the zlib registration in the quiche fork. Offering zlib breaks any peer that
+    // rebuilds the handshake transcript by re-compressing, which is what h3spec
+    // does, and it compresses our chain less well than brotli anyway.
 
     // ── 0-RTT ─────────────────────────────────────────────────────────────────
     //
@@ -466,6 +429,43 @@ fn make_quiche_config(server_config: &config::ServerConfig) -> anyhow::Result<qu
     // Verified: h3spec 47/49 WITH early data enabled, h2 146/146, h1 32/32 on four
     // targets, every target measured. quiche's own suite unchanged at 1123 + 45.
     cfg.enable_early_data();
+
+    // ── Certificate compression, RFC 8879 ────────────────────────────────────
+    //
+    // Compresses with brotli, and with zstd when that feature is built. zlib is
+    // accepted but never offered, because a peer that rebuilds the handshake
+    // transcript by re-compressing cannot verify our CertificateVerify; the fork's
+    // registration comment carries the mechanism and the measurement.
+    //
+    // BoringSSL negotiates from the intersection with the client's
+    // `compress_certificate` extension, so a client that advertises nothing we
+    // compress with receives the chain uncompressed and handshakes normally. That
+    // is the whole compatibility story, and it is what makes declining zlib free.
+    //
+    // This is what allows the amplification factor to stay at the conforming 3. A
+    // QUIC server may send only `factor x bytes received` before it has validated
+    // the client's address (RFC 9000 8.1). A 1200-byte client Initial gives a
+    // 3600-byte budget, and the uncompressed handshake flight was 4082 -- 482 over,
+    // so the server sent 3600, stopped, and waited a full round trip for an ACK.
+    //
+    // Measured on this deployment's own chain:
+    //
+    //     uncompressed  3429 bytes
+    //     brotli        2258 bytes  66%
+    //     zstd          2308 bytes  67%
+    //     zlib          2359 bytes  69%
+    //
+    // Measured end to end on staging: the whole server flight went from 4081 bytes
+    // to 2859 with brotli, a 1222-byte saving, and that is what deletes the
+    // amplification factor override above.
+    //
+    // Verified against third parties too, which is what proved our client really
+    // advertises rather than merely supports: Cloudflare's flight went from 4198 to
+    // 3388 bytes for the same probe. A Fastly edge did not change at all, so not
+    // every QUIC server compresses -- a reason to accept every algorithm as a client
+    // even where we decline to offer one as a server.
+    cfg.enable_cert_compression()
+        .context("enable certificate compression")?;
 
     Ok(cfg)
 }
