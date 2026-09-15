@@ -153,24 +153,30 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
 }
 
 fn make_tls_config_h1(skip_verify: bool) -> Arc<ClientConfig> {
-    if skip_verify {
-        Arc::new(
-            ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(NoVerify))
-                .with_no_client_auth(),
-        )
+    // ALPN is set explicitly, exactly as the h2 config below does it.
+    //
+    // m6-http attributes a connection to a channel BY its negotiated ALPN, so a
+    // client that offers none is not measuring "the h1 channel", it is measuring
+    // whichever channel the server falls back to when ALPN is absent. That may
+    // be the right one today and silently stop being it after any change to the
+    // fallback. Offering `http/1.1` and nothing else is also what a real
+    // `curl --http1.1` sends, so the probe matches a client that exists.
+    let mut cfg = if skip_verify {
+        ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerify))
+            .with_no_client_auth()
     } else {
         let mut roots = rustls::RootCertStore::empty();
         for cert in rustls_native_certs::load_native_certs().certs {
             roots.add(cert).ok();
         }
-        Arc::new(
-            ClientConfig::builder()
-                .with_root_certificates(roots)
-                .with_no_client_auth(),
-        )
-    }
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth()
+    };
+    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Arc::new(cfg)
 }
 
 fn make_tls_config_h2(skip_verify: bool) -> Arc<ClientConfig> {
@@ -1977,7 +1983,36 @@ fn write_boxwhisker_svg(stats: &[BoxStats], title: &str, path: &str) -> std::io:
 // ── main ──────────────────────────────────────────────────────────────────────
 
 fn main() {
+    // m6-http is built with rustls `default-features = false`, so there is NO
+    // automatic process-level CryptoProvider. Without this, the first
+    // `ClientConfig::builder()` below panics:
+    //
+    //   Could not automatically determine the process-level CryptoProvider
+    //
+    // which is what this binary did, from its first TLS protocol onward, before
+    // 2026-09-15. `default_provider()` appears further up in
+    // `supported_verify_schemes`, but that builds a provider and drops it; the
+    // builder needs the INSTALLED one. m6-http's own main, m6-bench,
+    // m6-bench-coldstart and bench-url-backend all install it here and this one
+    // was simply missed.
+    //
+    // The consequence was worse than a broken tool. With our own client
+    // panicking, handshake timing got measured with h3spec instead -- a
+    // conformance tester that deliberately opens stalled and malformed
+    // connections -- and it reported an h3 handshake p50 of 113ms on loopback
+    // for an engine that answers requests in microseconds. A broken measuring
+    // tool does not leave you with no number, it leaves you with a wrong one.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let args = Args::parse();
+
+    // Create the chart directory before measuring. Without this every chart
+    // write failed with "SVG write error: No such file or directory" and the run
+    // still exited 0, so the tool reported success having written nothing.
+    if let Err(e) = std::fs::create_dir_all(&args.out_dir) {
+        eprintln!("cannot create --out-dir {}: {e}", args.out_dir);
+        std::process::exit(2);
+    }
     // Cache warmup: 100 requests per path before measurement
     const WARMUP: usize = 100;
     const HTML_PATH: &str = "/";

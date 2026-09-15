@@ -1113,6 +1113,46 @@ pub struct ChannelSnapshot {
     pub miss_samples: usize,
     pub miss_p50_ns: u64,
     pub miss_p99_ns: u64,
+    /// Connection setup cost on this channel, and NOT comparable across
+    /// channels.
+    ///
+    /// For `http/1.1` and `http/2` this is the rustls handshake, timed from
+    /// `ServerConnection::new` to the point it stops handshaking. It EXCLUDES
+    /// the TCP round trip, which completed before rustls saw the socket.
+    ///
+    /// For `http/3` it is the QUIC handshake to `is_established()`, which
+    /// INCLUDES the equivalent of that round trip, because QUIC folds transport
+    /// and crypto setup together.
+    ///
+    /// They are reported per channel and never summed for that reason. A single
+    /// figure across all three would track the protocol mix rather than the cost
+    /// of anything -- the same error as an aggregate that blends resumed and full
+    /// handshakes, or the pre-2026-09-15 `/perf` aggregate.
+    ///
+    /// `handshake_samples` is the count the percentiles were taken over. Zero
+    /// means no handshake has completed on this channel, which is not the same
+    /// as a handshake taking zero nanoseconds.
+    #[serde(default)]
+    pub handshake_samples: usize,
+    #[serde(default)]
+    pub handshake_p50_ns: u64,
+    #[serde(default)]
+    pub handshake_p99_ns: u64,
+    /// Every handshake ever recorded on this channel, uncapped. Distinct from
+    /// `handshake_samples`, which is how many the percentiles came from and
+    /// saturates at the reservoir size. A node reporting `samples 512, total
+    /// 40119` has served 40,119 handshakes and describes the last 512.
+    #[serde(default)]
+    pub handshake_total: u64,
+    /// Lifetime mean, min and max. These survive the reservoir overwriting, so a
+    /// long-running node keeps its worst case rather than forgetting it as soon
+    /// as 512 further connections arrive.
+    #[serde(default)]
+    pub handshake_mean_ns: u64,
+    #[serde(default)]
+    pub handshake_min_ns: u64,
+    #[serde(default)]
+    pub handshake_max_ns: u64,
 }
 
 /// A read-only view of the counters, for the health endpoint.
