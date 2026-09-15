@@ -1190,6 +1190,15 @@ pub struct StatsSnapshot {
     pub cache_hits_total: u64,
     pub cache_misses_total: u64,
     pub backend_errors_total: u64,
+    /// The same errors, attributed to the backend that produced them.
+    ///
+    /// `#[serde(default)]` so a node older than 1.3.0 parses as an empty map rather
+    /// than failing. The total alone cannot say WHICH service is failing, and for
+    /// render-contact that distinction is the difference between seeing silent mail
+    /// loss and not: a submission whose SMTP send fails returns 500 and is counted
+    /// only here.
+    #[serde(default)]
+    pub backend_errors_by_name: std::collections::BTreeMap<String, u64>,
     /// /health and /perf polls. Cumulative, and deliberately excluded from
     /// `requests_total` so a stalled site is still detectable while a monitor
     /// keeps polling. Reported rather than discarded so the monitor itself is
