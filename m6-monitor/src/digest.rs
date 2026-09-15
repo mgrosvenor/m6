@@ -196,13 +196,38 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
                 }
             }
             if p.metrics.backend_errors_total > 0 {
+                // NAME the backend. "3 backend errors since start" left the
+                // operator to guess which service, and the guess that matters is
+                // render-contact: a submission whose SMTP send fails returns 500
+                // and is counted nowhere else, so an anonymous total is the
+                // difference between seeing silent mail loss and not.
+                //
+                // Falls back to the bare total against a node older than 1.3.0,
+                // whose /perf carries no attribution, rather than reporting nothing.
+                let text = if p.metrics.backend_errors_by_name.is_empty() {
+                    format!(
+                        "{} backend errors since start (node too old to attribute them)",
+                        p.metrics.backend_errors_total
+                    )
+                } else {
+                    let mut by: Vec<(&String, &u64)> =
+                        p.metrics.backend_errors_by_name.iter().collect();
+                    // Worst first: the operator reads the first line.
+                    by.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+                    let named = by
+                        .iter()
+                        .map(|(n, c)| format!("{n} {c}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!(
+                        "{} backend errors since start: {named}",
+                        p.metrics.backend_errors_total
+                    )
+                };
                 findings.push(Finding {
                     level: Level::Warn,
                     node: r.name.clone(),
-                    text: format!(
-                        "{} backend errors since start",
-                        p.metrics.backend_errors_total
-                    ),
+                    text,
                 });
             }
 
@@ -425,6 +450,64 @@ mod tests {
         assert_eq!(d.level, Level::Fault);
         assert_eq!(d.findings.len(), 2);
         assert!(d.findings.iter().any(|f| f.text.contains("render-contact")));
+    }
+
+    /// Backend errors name the backend, worst first.
+    ///
+    /// The message content IS the feature. "3 backend errors since start" was
+    /// already reported; what it could not say is WHICH service, and the service
+    /// that matters is the one that sends mail. A contact submission whose SMTP
+    /// send fails returns 500 and is counted nowhere else, so an anonymous total is
+    /// the difference between seeing silent mail loss and not.
+    #[test]
+    fn backend_errors_name_the_backend_worst_first() {
+        let mut p = perf(HostSnapshot::default(), vec![]);
+        p.metrics.backend_errors_total = 7;
+        p.metrics.backend_errors_by_name = [
+            ("m6-html".to_string(), 2u64),
+            ("render-contact".to_string(), 5u64),
+        ]
+        .into_iter()
+        .collect();
+        let d = build(
+            &[reading("origin", "ok", Some(p))],
+            &Thresholds::default(),
+            now(),
+        );
+        let f = d
+            .findings
+            .iter()
+            .find(|f| f.text.contains("backend errors"))
+            .expect("a backend-error finding");
+        assert!(f.text.contains("render-contact 5"), "{}", f.text);
+        assert!(f.text.contains("m6-html 2"), "{}", f.text);
+        // Worst first, because the operator reads the first name.
+        let (a, b) = (
+            f.text.find("render-contact").unwrap(),
+            f.text.find("m6-html").unwrap(),
+        );
+        assert!(a < b, "worst backend must come first: {}", f.text);
+    }
+
+    /// An older node sends no attribution. Say so rather than reporting nothing,
+    /// and rather than implying the errors did not happen.
+    #[test]
+    fn an_unattributed_total_still_reports_and_says_why() {
+        let mut p = perf(HostSnapshot::default(), vec![]);
+        p.metrics.backend_errors_total = 3;
+        p.metrics.backend_errors_by_name.clear();
+        let d = build(
+            &[reading("origin", "ok", Some(p))],
+            &Thresholds::default(),
+            now(),
+        );
+        let f = d
+            .findings
+            .iter()
+            .find(|f| f.text.contains("backend errors"))
+            .expect("a backend-error finding");
+        assert!(f.text.contains('3'), "{}", f.text);
+        assert!(f.text.contains("too old"), "{}", f.text);
     }
 
     /// A node that did not answer must not be reported as healthy, and must
