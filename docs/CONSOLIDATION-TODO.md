@@ -235,30 +235,55 @@ Added 2026-09-15, m6 issue #25. **Filed deliberately unstarted.** Owner's words:
 "The package plan needs to be thought through carefully." This changes how
 production is deployed, so the design is the work, not the packaging.
 
-- [ ] **Decide the five open questions before writing anything.** They are in the
-      issue and each one has a real trade:
+- [x] **The five open questions are DECIDED. Owner, 2026-09-15**, recorded in
+      full on the issue. In short:
 
-      1. One `m6` package or several? One, probably: they always deploy together.
-      2. Do the systemd units ship in the site package? It would have prevented
-         the leftover disabled `m6-http-origin` on the cache nodes that aborted a
-         fleet deploy on 2026-09-15.
-      3. Does config validation happen before `apt install` (download, extract,
-         `--dump-config`, install) or after (install, validate, roll back)? The
-         first is safer, the second simpler.
-      4. Does the apt repository live in this repository's `gh-pages` or its own?
-      5. Secrets backup to the laptop. Worth doing, but the laptop then holds
-         every production secret in one place, so it needs encryption independent
-         of FileVault and must sit outside any git working tree.
+      1. **One package**, `m6`, holding every binary, the core library, docs and
+         "headers or whatever the Rust equivalent is".
+      2. **Hosted on GitHub Pages**, which settles it as an apt REPOSITORY rather
+         than a release asset, so `apt upgrade` works.
+      3. **Validation: whatever makes sense.** Taking the safer option: download,
+         extract to a temporary directory, `--dump-config` every config on the
+         node against the NEW binary, and only then `apt install`. A config the
+         new binary rejects is found while the old one still serves.
+      4. Apt repo in this repository's `gh-pages`, unless it collides with
+         something already published there.
+      5. **Backup and deploy model**, below. This is the substantial one.
 
-- [ ] **Choose release asset or apt repository.** Not equivalent: a `.deb` on a
-      GitHub release gives install but no upgrade path, while an apt repository
-      gives `apt update && apt upgrade`. The stated goal was install AND upgrade,
-      which points at the repository. That needs `Packages`, `Release` and a
-      detached GPG signature, and **the signing key's private half must live in
-      GitHub Actions secrets**, which is the one part that cannot be set up from
-      here. An apt repo on Pages is also **public**: anyone could install m6.
-      Fine for an open-source project, but it should be a decision rather than a
-      side effect.
+- [ ] **What m6 must provide for the deployment model.** The owner's target
+      shape is: install the m6 package, install the site package, then run one
+      deploy command taking a single JSON file of all per-node config and secrets,
+      plus the node name. **The model itself, the file layout and the deploy
+      command belong in the deployment repository's own docs**, not here, because
+      m6 is generic and does not know about any one fleet. This entry exists only
+      to record what m6 has to offer so that model can work:
+
+      - every binary must accept its config from a path given on the command
+        line, which they already do
+      - `--dump-config` must validate without starting, which it already does,
+        and is what makes validate-before-install possible
+      - nothing may require state that is neither in a package nor in that one
+        JSON file. The four loose secret files listed below are exactly what the
+        model replaces.
+
+      One warning worth carrying, because it is a property of the design rather
+      than of any deployment: **a single JSON holding every production secret for
+      every node is a single high-value target.** It needs encryption at rest
+      independent of the laptop's disk encryption, and it must sit outside any git
+      working tree so it cannot be committed by accident.
+
+- [ ] **Set up the apt repository signing.** `Packages`, `Release` and a detached
+      GPG signature. **The signing key's private half must live in GitHub Actions
+      secrets, and that step needs the owner at a keyboard** — it cannot be done
+      from here. Note also that an apt repo on Pages is **public**: anyone can
+      `apt install m6`. That follows from the hosting choice rather than being a
+      separate decision.
+
+- [ ] **Decide whether the systemd units ship in the site package.** Left open by
+      "whatever makes sense". The argument for: it would have prevented the
+      leftover disabled `m6-http-origin` on the cache nodes that aborted a fleet
+      deploy on 2026-09-15. The package would ship all units and each node enables
+      its own role's.
 
 - [ ] **Build `m6_<version>_amd64.deb` in CI on merge to `main`**, holding the
       seven installed binaries: `m6-http`, `m6-file`, `m6-html`, `m6-md`,
@@ -275,6 +300,47 @@ production is deployed, so the design is the work, not the packaging.
       time keeps taking `m6-core` from git at the release tag; run time is what
       the dependency expresses, since m6-http serves the site and m6-html renders
       it. Debian's `Build-Depends` against `Depends` says this correctly.
+
+      **A correction to an earlier version of this entry, which was wrong.** It
+      said Rust has no stable ABI so there is nothing installable another crate
+      can link against. That conflated two different things:
+
+      - **Rust-to-Rust linking** (`rlib`, Rust `dylib`) genuinely has no stable
+        ABI: the consumer must be built with the identical rustc and identical
+        dependency versions. That is the only part the claim was true of.
+      - **`crate-type = ["cdylib", "staticlib"]`** with `extern "C"` and
+        `#[repr(C)]` produces an ordinary `libm6core.so` or `.a` with a C ABI,
+        which IS stable, and `cbindgen` generates real headers. That is exactly
+        "library and headers" in the Debian sense and is completely standard.
+
+      So there are three workable ways to satisfy "the core library and headers",
+      not zero:
+
+      **And the identical-rustc point does not rule out an `rlib` either.** One
+      CI builds both packages with one pinned toolchain, so "the consumer must be
+      built with the same rustc" is satisfied by construction here. That objection
+      was raised and correctly dismissed by the owner.
+
+      **What actually decides the shape is a cargo limitation, not an ABI or a
+      version one: cargo cannot consume a prebuilt `rlib` as a dependency.** It
+      can be linked by driving `rustc --extern m6_core=/usr/lib/m6/libm6_core.rlib`
+      by hand, but that means leaving the cargo workflow for the renderers, and
+      cargo will otherwise insist on building `m6-core` from source.
+
+      | option | works? | what it costs |
+      |---|---|---|
+      | vendored `m6-core` source + rustdoc, `[patch]` override, `cargo build --offline` | yes | compile happens locally, which for Rust is normal |
+      | prebuilt `rlib` | links fine, but **cargo cannot consume it as a dependency** | abandon cargo for the renderers |
+      | `cdylib`/`staticlib` with a C ABI + cbindgen headers | yes, genuinely stable and linkable by anything | an FFI surface to design and maintain |
+
+      **So: ship the source in the package** at something like
+      `/usr/share/m6/vendor`, and have the site's build use a `[patch]` or path
+      override pointing there with `cargo build --offline`. That delivers the
+      actual goal — **no git fetch at build time, and the version tied to the
+      installed package** — while staying inside cargo.
+
+      Keep the `cdylib` route for if a non-Rust consumer ever appears, at which
+      point it is the right answer.
 
 **What must not be lost, and this is the part a naive version would break.**
 `deploy-platform.sh` does work `apt install` does not, and all of it was earned
