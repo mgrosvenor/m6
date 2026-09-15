@@ -41,15 +41,31 @@ fn banned() -> Vec<String> {
     vec![
         format!("dr-{}-site", "grosvenor"),
         format!("{}.com", "mgrosvenor"),
+        // The maintainer's OTHER domain, added 2026-09-15 after this test missed
+        // it. `SECURITY.md` carried a personal address at `thegrosvenors.au` for
+        // however long, on the front page of a public repository, and this test
+        // said nothing because it only knew one of the two domains. A guard that
+        // covers most of the thing it guards is the kind that gets trusted.
+        format!("the{}.au", "grosvenors"),
     ]
 }
 
 /// Substrings that legitimately contain the surname. Checked before the ban, so a
 /// line carrying only these is not a finding.
+///
+/// The point of this test is to keep one DEPLOYMENT's details -- node names,
+/// backbone addresses, analytics paths, fleet topology -- out of a generic web
+/// system. It is not to make the maintainer uncontactable, so the project's own
+/// URLs and its way of receiving a security report are allowed, and are the only
+/// things that are.
 const ALLOWED: &[&str] = &[
     "github.com/mgrosvenor/m6",
     "github.com/mgrosvenor/quiche",
     "Matthew P. Grosvenor",
+    // SECURITY.md's reporting channel. A project needs a way to receive a
+    // vulnerability report, and this is a link to a contact form rather than a
+    // published address precisely so nothing is there for a scraper to read.
+    "mgrosvenor.com/contact",
 ];
 
 fn repo_root() -> PathBuf {
@@ -151,13 +167,25 @@ fn no_file_names_one_particular_deployment() {
 #[test]
 fn the_scan_would_catch_a_trace() {
     let banned = banned();
-    let sample = format!("  sites = [\"{}\"]", banned[1]);
     assert!(
-        banned.iter().any(|b| sample.contains(b.as_str())),
-        "the banned list does not match a line that plainly contains a trace"
+        !banned.is_empty(),
+        "the banned list is empty; the scan guards nothing"
     );
-    assert!(
-        !ALLOWED.iter().any(|a| sample.contains(a)),
-        "an ALLOWED entry is broad enough to excuse a real trace"
-    );
+
+    // EVERY entry, not just one. This used to test `banned[1]` alone, so a third
+    // entry could be added and never exercised -- and the entry that was missing
+    // was the maintainer's second domain, which sat in a published SECURITY.md
+    // with this test passing beside it. A self-test that checks one of n is a
+    // self-test for one of n.
+    for b in &banned {
+        let sample = format!("  sites = [\"{b}\"]");
+        assert!(
+            banned.iter().any(|x| sample.contains(x.as_str())),
+            "the banned list does not match a line that plainly contains {b}"
+        );
+        assert!(
+            !ALLOWED.iter().any(|a| sample.contains(a)),
+            "an ALLOWED entry is broad enough to excuse a real trace of {b}"
+        );
+    }
 }

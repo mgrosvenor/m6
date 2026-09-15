@@ -8,10 +8,16 @@ const EMIT_INTERVAL_SECS: u64 = 10;
 /// 4096 × 8 bytes = 32 KB per reservoir.
 const RESERVOIR: usize = 4096;
 
-/// Per-channel reservoir. Smaller than the aggregate one on purpose: there
-/// are up to six channels × two categories, so the full 4096 would cost
-/// 384 KB to answer a question that a few hundred samples already answers.
-const CHANNEL_RESERVOIR: usize = 512;
+/// Per-channel reservoir. Smaller than the aggregate one on purpose, but not as
+/// small as it was: six channels × three categories (hit, miss, handshake) at
+/// 1024 u64s is 144 KB, against 72 KB at 512 and 1.1 MB at the aggregate 4096.
+///
+/// 1024 rather than 512 on the owner's call. The extra 72 KB is nothing on these
+/// VMs and it doubles the window a p99 is drawn from, which matters most for
+/// handshakes: they arrive far less often than requests, so a fixed number of
+/// samples covers a much longer stretch of wall clock time on that channel than
+/// it does for cache hits.
+const CHANNEL_RESERVOIR: usize = 1024;
 
 /// Whether a response was produced by m6-http itself rather than fetched
 /// from a backend.
@@ -167,6 +173,111 @@ struct ChannelStats {
     miss_samples: Box<[u64; CHANNEL_RESERVOIR]>,
     miss_idx: usize,
     miss_count: usize,
+    /// TLS or QUIC handshake durations for connections on this channel.
+    ///
+    /// Per channel and NEVER aggregated across channels, because the three are
+    /// not the same measurement:
+    ///
+    ///   http/1.1 and http/2  rustls, timed from `ServerConnection::new` to
+    ///                        `!is_handshaking()`. EXCLUDES the TCP round trip,
+    ///                        which happened before rustls saw the socket.
+    ///   http/3               QUIC via quiche, timed to `is_established()`.
+    ///                        INCLUDES its equivalent of that round trip,
+    ///                        because QUIC folds transport and crypto together.
+    ///
+    /// A single "handshake p50" over all three would track the protocol mix
+    /// rather than the cost of anything, which is the same error as the /perf
+    /// aggregate fixed earlier.
+    ///
+    /// Split again by resumption, for exactly the same reason. A resumed
+    /// handshake skips the certificate and the signature and is far cheaper, so a
+    /// blended figure moves when the mix of returning and first-time visitors
+    /// moves while neither cost has changed. rustls with the `std` feature
+    /// defaults to a 256-session store, so this is already happening on h1 and
+    /// h2, and h3 resumption became common when 0-RTT was enabled.
+    ///
+    /// The ratio of the two `total` counts is the resumption rate, so splitting
+    /// loses nothing: the mix is recoverable from the parts, where the parts are
+    /// not recoverable from a blend.
+    handshake_full: DurationStats,
+    handshake_resumed: DurationStats,
+}
+
+/// A bounded reservoir of durations, plus the lifetime figures a reservoir cannot
+/// keep.
+///
+/// One type used by both handshake reservoirs rather than two copies of the ring
+/// arithmetic. The hit and miss reservoirs above predate this and still inline the
+/// same pattern; they could adopt it, but they sit on the per-request hot path and
+/// changing them is not part of this.
+struct DurationStats {
+    /// Only the most recent `CHANNEL_RESERVOIR` durations. The percentiles
+    /// describe these and nothing older.
+    ring: Box<[u64; CHANNEL_RESERVOIR]>,
+    idx: usize,
+    /// Saturates at the ring size on purpose: it says how many samples the
+    /// percentiles came from.
+    ring_len: usize,
+    /// Every duration ever recorded. Never reset, never capped. Reporting only
+    /// `ring_len` would print "1024 samples" forever on a node serving millions.
+    total: u64,
+    /// For a lifetime mean the ring cannot give. At 10ms a handshake this
+    /// overflows u64 after ~6e10 handshakes, which a 1-core VM will not reach.
+    sum_ns: u64,
+    /// Lifetime extremes, which survive the ring overwriting. `min` starts at
+    /// u64::MAX as a "nothing yet" sentinel that must never reach a reader: it
+    /// would render as 18 billion milliseconds.
+    min_ns: u64,
+    max_ns: u64,
+}
+
+impl DurationStats {
+    fn new() -> DurationStats {
+        DurationStats {
+            ring: Box::new([0u64; CHANNEL_RESERVOIR]),
+            idx: 0,
+            ring_len: 0,
+            total: 0,
+            sum_ns: 0,
+            min_ns: u64::MAX,
+            max_ns: 0,
+        }
+    }
+
+    fn record(&mut self, elapsed_ns: u64) {
+        if elapsed_ns == 0 {
+            return;
+        }
+        // Ring first, for the percentiles.
+        self.ring[self.idx] = elapsed_ns;
+        self.idx = (self.idx + 1) % CHANNEL_RESERVOIR;
+        if self.ring_len < CHANNEL_RESERVOIR {
+            self.ring_len += 1;
+        }
+        // Then the lifetime figures, which the ring overwrite cannot touch.
+        // saturating_add rather than wrapping: on the one machine where this
+        // could ever overflow, a stuck maximum is a readable wrong answer and a
+        // wrapped one is not.
+        self.total = self.total.saturating_add(1);
+        self.sum_ns = self.sum_ns.saturating_add(elapsed_ns);
+        self.min_ns = self.min_ns.min(elapsed_ns);
+        self.max_ns = self.max_ns.max(elapsed_ns);
+    }
+
+    /// The reportable form. Zero throughout when nothing has been recorded, and
+    /// the sentinel never escapes.
+    fn snapshot(&self) -> m6_core::telemetry::HandshakeStats {
+        let (_, p50, p99, _) = percentiles_n(&self.ring[..], self.ring_len);
+        m6_core::telemetry::HandshakeStats {
+            samples: self.ring_len,
+            p50_ns: p50,
+            p99_ns: p99,
+            total: self.total,
+            mean_ns: self.sum_ns.checked_div(self.total).unwrap_or(0),
+            min_ns: if self.total > 0 { self.min_ns } else { 0 },
+            max_ns: self.max_ns,
+        }
+    }
 }
 
 impl ChannelStats {
@@ -182,7 +293,23 @@ impl ChannelStats {
             miss_samples: Box::new([0u64; CHANNEL_RESERVOIR]),
             miss_idx: 0,
             miss_count: 0,
+            handshake_full: DurationStats::new(),
+            handshake_resumed: DurationStats::new(),
         }
+    }
+
+    fn record_handshake(&mut self, elapsed_ns: u64, resumed: bool) {
+        if resumed {
+            self.handshake_resumed.record(elapsed_ns);
+        } else {
+            self.handshake_full.record(elapsed_ns);
+        }
+    }
+
+    /// Any handshake at all, either kind. Used only to decide whether a channel
+    /// is worth reporting.
+    fn handshakes_seen(&self) -> u64 {
+        self.handshake_full.total + self.handshake_resumed.total
     }
 
     fn record(&mut self, elapsed_ns: u64, cache_hit: bool, backend_error: bool) {
@@ -230,14 +357,43 @@ pub struct Stats {
     window_cache_misses: u64,
     window_backend_errors: u64,
 
-    // Raw latency samples — ring buffers, one per category
+    // Raw latency samples — ring buffers, one per category.
+    //
+    // ── These are NOT reset on emit, and that is the fix for a real defect ──
+    //
+    // They used to be. `maybe_emit` set every `_idx` and `_count` back to 0
+    // every ten seconds, and `snapshot()` -- which is what `/perf` serves --
+    // read those same fields. So `/perf` reported the percentiles of whatever
+    // fraction of a ten-second window happened to be open when it was scraped.
+    //
+    // **On a site taking a couple of requests a minute that is almost always
+    // nothing.** Observed on syd, 2026-09-14: `cache_hits_total: 338` beside
+    // `hit_samples: 0, hit_p50_ns: 0, hit_p99_ns: 0`. m6-monitor faithfully
+    // turned zero samples into `null`, so the fleet digest carried no latency
+    // at all, on any node, and never had. The one number the monitor exists to
+    // trend was structurally absent, while the periodic log ten lines above was
+    // printing 3,878ns for the same counter.
+    //
+    // So the ring now runs as a ring: never cleared, wrapping at RESERVOIR,
+    // holding the most recent samples however long they took to arrive.
+    // `snapshot()` reads all of it. The periodic log still reports its own
+    // ten-second window, from `*_window_added` below, so the operational
+    // logging is unchanged -- which is what `snapshot()`'s own comment was
+    // protecting when it declined to reset. Declining to reset was right; also
+    // reading the window the emitter reset was the bug.
+    //
+    // No extra memory and no extra work on the request path: one reservoir,
+    // one store per sample, exactly as before.
     hit_samples: Box<[u64; RESERVOIR]>,
     hit_idx: usize,
-    hit_count: usize, // capped at RESERVOIR
+    hit_count: usize, // total held, capped at RESERVOIR
+    /// Samples added since the last emit. The periodic log's window.
+    hit_window_added: usize,
 
     miss_samples: Box<[u64; RESERVOIR]>,
     miss_idx: usize,
     miss_count: usize,
+    miss_window_added: usize,
 
     // ── Monitoring endpoints, accounted separately ────────────────────────
     //
@@ -258,6 +414,7 @@ pub struct Stats {
     monitor_samples: Box<[u64; RESERVOIR]>,
     monitor_idx: usize,
     monitor_count: usize,
+    monitor_window_added: usize,
 
     /// Per (version, interface) breakdown. Fixed-size dense table rather than
     /// a map: six entries, indexed arithmetically, no allocation and no hash
@@ -297,20 +454,34 @@ impl Stats {
             hit_samples: Box::new([0u64; RESERVOIR]),
             hit_idx: 0,
             hit_count: 0,
+            hit_window_added: 0,
             miss_samples: Box::new([0u64; RESERVOIR]),
             miss_idx: 0,
             miss_count: 0,
+            miss_window_added: 0,
             monitor_requests_total: 0,
             window_monitor_requests: 0,
             monitor_samples: Box::new([0u64; RESERVOIR]),
             monitor_idx: 0,
             monitor_count: 0,
+            monitor_window_added: 0,
             channels: (0..CHANNELS).map(|_| ChannelStats::new()).collect(),
             status_counts: Box::new([0u64; 500]),
             rps_peak: 0,
             window_start: now,
             last_emit: now,
         }
+    }
+
+    /// Record one completed handshake on a channel.
+    ///
+    /// Separate from `record`, and called at a different time: a handshake
+    /// happens once per CONNECTION and a request many times within it. Folding
+    /// it into `record` would have meant either timing it per request, which is
+    /// meaningless, or carrying it on the request path, which is the one place
+    /// this project does not add work.
+    pub fn record_handshake(&mut self, elapsed_ns: u64, channel: Channel, resumed: bool) {
+        self.channels[channel.index()].record_handshake(elapsed_ns, resumed);
     }
 
     #[inline(always)]
@@ -345,6 +516,7 @@ impl Stats {
                 if self.monitor_count < RESERVOIR {
                     self.monitor_count += 1;
                 }
+                self.monitor_window_added += 1;
             }
             return;
         }
@@ -376,6 +548,7 @@ impl Stats {
                 if self.hit_count < RESERVOIR {
                     self.hit_count += 1;
                 }
+                self.hit_window_added += 1;
             } else {
                 self.cache_misses_total += 1;
                 self.window_cache_misses += 1;
@@ -384,6 +557,7 @@ impl Stats {
                 if self.miss_count < RESERVOIR {
                     self.miss_count += 1;
                 }
+                self.miss_window_added += 1;
             }
         } else if cache_hit {
             self.cache_hits_total += 1;
@@ -420,9 +594,28 @@ impl Stats {
             0.0
         };
 
-        let (hp0, hp50, hp99, hp100) = percentiles(&self.hit_samples, self.hit_count);
-        let (mp0, mp50, mp99, mp100) = percentiles(&self.miss_samples, self.miss_count);
-        let (_, kp50, kp99, _) = percentiles(&self.monitor_samples, self.monitor_count);
+        // THIS WINDOW only, which is what a periodic line means. `*_window_added`
+        // rather than `*_count`: the reservoirs are no longer cleared here, so
+        // the count is everything the ring holds and would turn each line into a
+        // running average.
+        let (hp0, hp50, hp99, hp100) = percentiles_ring(
+            &self.hit_samples,
+            self.hit_idx,
+            self.hit_count,
+            self.hit_window_added,
+        );
+        let (mp0, mp50, mp99, mp100) = percentiles_ring(
+            &self.miss_samples,
+            self.miss_idx,
+            self.miss_count,
+            self.miss_window_added,
+        );
+        let (_, kp50, kp99, _) = percentiles_ring(
+            &self.monitor_samples,
+            self.monitor_idx,
+            self.monitor_count,
+            self.monitor_window_added,
+        );
 
         tracing::info!(
             requests = self.requests_total,
@@ -433,10 +626,19 @@ impl Stats {
             cache_hit_rate = format_args!("{:.4}", cache_hit_rate),
             backend_errors = self.window_backend_errors,
             pool_members = pool_members,
+            // The sample count beside the percentiles, not just the numbers.
+            // `hit_p50_ns` is load-dependent (docs/PERFORMANCE.md §4: 3,900ns at
+            // 50-70 hits in a window, 1,064ns at ~1,200), so a percentile with no
+            // count attached cannot be compared to anything, and a p50 over one
+            // sample reads exactly like a p50 over a thousand. This is also not
+            // the same number as `cache_hits`: a request timed at 0ns is counted
+            // as a hit and contributes no sample.
+            hit_samples = self.hit_window_added,
             hit_p0_ns = hp0,
             hit_p50_ns = hp50,
             hit_p99_ns = hp99,
             hit_max_ns = hp100,
+            miss_samples = self.miss_window_added,
             miss_p0_ns = mp0,
             miss_p50_ns = mp50,
             miss_p99_ns = mp99,
@@ -451,18 +653,17 @@ impl Stats {
             "periodic stats"
         );
 
-        // Reset window
+        // Reset the window COUNTERS. The reservoirs are deliberately left alone:
+        // see the note on `hit_samples`. Clearing `hit_idx`/`hit_count` here is
+        // what left `/perf` with nothing to report, on every node, permanently.
         self.window_requests = 0;
         self.window_cache_hits = 0;
         self.window_cache_misses = 0;
         self.window_backend_errors = 0;
-        self.hit_idx = 0;
-        self.hit_count = 0;
-        self.miss_idx = 0;
-        self.miss_count = 0;
         self.window_monitor_requests = 0;
-        self.monitor_idx = 0;
-        self.monitor_count = 0;
+        self.hit_window_added = 0;
+        self.miss_window_added = 0;
+        self.monitor_window_added = 0;
         self.window_start = now;
         self.last_emit = now;
     }
@@ -476,10 +677,37 @@ impl Stats {
     /// window and the periodic stats log would report only the traffic that
     /// arrived between scrapes. A monitor polling every 30 seconds would
     /// silently gut the operational logging it exists to complement.
+    ///
+    /// **That reasoning was right and incomplete, and the gap was the defect.**
+    /// Not resetting was correct; reading the window that `maybe_emit` DID reset
+    /// was not. `/perf` served the percentiles of a partial ten-second window,
+    /// which on a site taking a couple of requests a minute is almost always
+    /// empty, so it reported zeros and m6-monitor showed `null` latency on every
+    /// node. See the note on `hit_samples`.
+    ///
+    /// The percentiles here now span **the most recent up to `RESERVOIR`
+    /// samples, not a period of time.** On a quiet node that can reach back
+    /// hours and will blend idle and busy traffic, which matters because this
+    /// number is load-dependent (`docs/PERFORMANCE.md` §4). `hit_samples` is
+    /// reported beside it for exactly that reason: it is the only thing that
+    /// makes the percentile interpretable, and zero samples means "not
+    /// measured" rather than "zero nanoseconds". For the fine-grained view, the
+    /// periodic log still reports per-window figures every ten seconds.
     pub fn snapshot(&self) -> StatsSnapshot {
-        let (_, hp50, hp99, hmax) = percentiles(&self.hit_samples, self.hit_count);
-        let (_, mp50, mp99, mmax) = percentiles(&self.miss_samples, self.miss_count);
-        let (_, kp50, kp99, _) = percentiles(&self.monitor_samples, self.monitor_count);
+        let (_, hp50, hp99, hmax) =
+            percentiles_ring(&self.hit_samples, self.hit_idx, self.hit_count, RESERVOIR);
+        let (_, mp50, mp99, mmax) = percentiles_ring(
+            &self.miss_samples,
+            self.miss_idx,
+            self.miss_count,
+            RESERVOIR,
+        );
+        let (_, kp50, kp99, _) = percentiles_ring(
+            &self.monitor_samples,
+            self.monitor_idx,
+            self.monitor_count,
+            RESERVOIR,
+        );
         StatsSnapshot {
             requests_total: self.requests_total,
             cache_hits_total: self.cache_hits_total,
@@ -509,11 +737,19 @@ impl Stats {
                 .channels
                 .iter()
                 .enumerate()
-                .filter(|(_, c)| c.requests > 0)
+                // Requests OR handshakes. A channel can have a completed
+                // handshake and no request yet: a scanner that connects and
+                // disconnects, a connection still in flight, or a client that
+                // gave up after the TLS exchange. Filtering on requests alone
+                // recorded those handshakes and then dropped them from the
+                // report, which a test caught by asking for a channel that had
+                // one sample and no traffic.
+                .filter(|(_, c)| c.requests > 0 || c.handshakes_seen() > 0)
                 .map(|(i, c)| {
                     let ch = Channel::from_index(i);
                     let (_, hp50, hp99, _) = percentiles_n(&c.hit_samples[..], c.hit_count);
                     let (_, mp50, mp99, _) = percentiles_n(&c.miss_samples[..], c.miss_count);
+
                     ChannelSnapshot {
                         channel: ch.label(),
                         version: ch.version.as_str().to_string(),
@@ -528,6 +764,12 @@ impl Stats {
                         miss_samples: c.miss_count,
                         miss_p50_ns: mp50,
                         miss_p99_ns: mp99,
+                        // Full and resumed separately, never combined. The
+                        // percentiles, the lifetime count, the mean and the
+                        // extremes are all derived inside DurationStats so every
+                        // consumer divides and guards the same way.
+                        handshake_full: c.handshake_full.snapshot(),
+                        handshake_resumed: c.handshake_resumed.snapshot(),
                     }
                 })
                 .collect(),
@@ -552,11 +794,37 @@ fn percentiles_n(samples: &[u64], n: usize) -> (u64, u64, u64, u64) {
 }
 
 /// Sort the first `n` samples and return exact (p0, p50, p99, p100).
-fn percentiles(samples: &[u64; RESERVOIR], n: usize) -> (u64, u64, u64, u64) {
+/// Percentiles over the `take` most recently written entries of a ring buffer.
+///
+/// `idx` is where the next write will go, so the newest sample is at `idx - 1`
+/// and the run of `take` newest ends there. `held` caps it: a ring that has seen
+/// fewer samples than `take` has only what it has.
+///
+/// This replaced a version that read `samples[..n]` from the front. That was
+/// correct only while `maybe_emit` reset `idx` to 0 every ten seconds, which is
+/// the reset that made `/perf` report nothing. Reading from the front of a ring
+/// that genuinely wraps would silently report the OLDEST samples as if they were
+/// the window, so the two changes had to go together.
+///
+/// Returns `(p0, p50, p99, p100)`, and `(0, 0, 0, 0)` when there is nothing to
+/// measure. The caller reports the sample count beside these, which is what
+/// distinguishes "0 ns" from "not measured" -- a distinction this endpoint
+/// needs, because it had been reporting the first while meaning the second.
+fn percentiles_ring(
+    samples: &[u64; RESERVOIR],
+    idx: usize,
+    held: usize,
+    take: usize,
+) -> (u64, u64, u64, u64) {
+    let n = take.min(held).min(RESERVOIR);
     if n == 0 {
         return (0, 0, 0, 0);
     }
-    let mut buf: Vec<u64> = samples[..n].to_vec();
+    let mut buf: Vec<u64> = Vec::with_capacity(n);
+    // Walk back from the newest. `+ RESERVOIR` keeps the subtraction in usize.
+    for k in 1..=n {
+        buf.push(samples[(idx + RESERVOIR - k) & (RESERVOIR - 1)]);
+    }
     buf.sort_unstable();
     let p0 = buf[0];
     let p50 = buf[(n - 1) * 50 / 100];
@@ -675,7 +943,8 @@ mod tests {
                 "m6-html",
             );
         }
-        let (p0, p50, p99, p100) = percentiles(&s.hit_samples, s.hit_count);
+        let (p0, p50, p99, p100) =
+            percentiles_ring(&s.hit_samples, s.hit_idx, s.hit_count, RESERVOIR);
         assert_eq!(p0, 1);
         assert_eq!(p50, 50);
         assert_eq!(p99, 99);
@@ -949,5 +1218,371 @@ mod backend_error_attribution_tests {
             s.record(1_000, true, 500, ch(), "cache");
         }
         assert_eq!(s.snapshot().backend_errors_total, 0);
+    }
+}
+
+/// `/perf` must report the latency it measured, not the latency of whichever
+/// ten-second window happened to be open when it was scraped.
+///
+/// ## The defect these cover
+///
+/// `maybe_emit` reset `hit_idx` and `hit_count` to 0 every ten seconds, and
+/// `snapshot()` -- which is what `/perf` serves -- read those same fields. On a
+/// site taking a couple of requests a minute, almost every ten-second window
+/// holds no cache hit at all, so `/perf` reported zeros essentially always.
+///
+/// Observed on syd, 2026-09-14: `cache_hits_total: 338` beside `hit_samples: 0,
+/// hit_p50_ns: 0, hit_p99_ns: 0`. m6-monitor turned zero samples into `null`,
+/// so the fleet digest carried NO LATENCY FOR ANY NODE and never had, while the
+/// periodic log was printing 3,878ns for the same counter in the same minute.
+///
+/// Nothing caught it because every existing test recorded samples and read them
+/// back **without an emit in between**, which is the one ordering where the old
+/// code was correct. `an_emit_does_not_erase_what_perf_reports` is the test that
+/// was missing, and it fails against the old implementation.
+#[cfg(test)]
+mod perf_reservoir_tests {
+    use super::*;
+
+    fn hit(s: &mut Stats, ns: u64) {
+        s.record(
+            ns,
+            true,
+            200,
+            Channel::new(Version::Http2, Iface::External),
+            "cache",
+        );
+    }
+
+    /// The regression test. An emit between the traffic and the scrape used to
+    /// leave `/perf` with nothing.
+    #[test]
+    fn an_emit_does_not_erase_what_perf_reports() {
+        let mut s = Stats::new();
+        for ns in [1_000, 2_000, 3_000, 4_000, 5_000] {
+            hit(&mut s, ns);
+        }
+        // Force the window boundary the emitter would hit on a timer.
+        s.last_emit = Instant::now() - std::time::Duration::from_secs(EMIT_INTERVAL_SECS + 1);
+        s.maybe_emit(1);
+
+        let snap = s.snapshot();
+        assert_eq!(
+            snap.hit_samples, 5,
+            "the emit cleared the reservoir /perf reads. This is the defect: \
+             m6-monitor showed null latency on every node because of it."
+        );
+        assert!(
+            snap.hit_p50_ns > 0,
+            "hit_p50_ns is {} with 5 samples recorded",
+            snap.hit_p50_ns
+        );
+        assert_eq!(snap.hit_max_ns, 5_000);
+        // The cumulative counter was never the problem and must not change.
+        assert_eq!(snap.cache_hits_total, 5);
+    }
+
+    /// The periodic log keeps its per-window meaning, which is the property
+    /// `snapshot()`'s comment was protecting when it declined to reset.
+    ///
+    /// Checked through the window counter the log reports rather than by
+    /// capturing tracing output: after an emit the window is empty, and new
+    /// traffic lands in the next window only.
+    #[test]
+    fn the_periodic_window_still_only_covers_its_own_window() {
+        let mut s = Stats::new();
+        for ns in [10, 20, 30] {
+            hit(&mut s, ns);
+        }
+        assert_eq!(s.hit_window_added, 3);
+
+        s.last_emit = Instant::now() - std::time::Duration::from_secs(EMIT_INTERVAL_SECS + 1);
+        s.maybe_emit(1);
+        assert_eq!(
+            s.hit_window_added, 0,
+            "the window counter must reset on emit, or every periodic line \
+             becomes a running average instead of a window"
+        );
+
+        hit(&mut s, 40);
+        assert_eq!(
+            s.hit_window_added, 1,
+            "new traffic belongs to the new window"
+        );
+        // And the ring kept everything, which is what /perf now reads.
+        assert_eq!(s.snapshot().hit_samples, 4);
+    }
+
+    /// The window view and the `/perf` view genuinely differ after an emit.
+    ///
+    /// Both are computed from one reservoir now, so this is what proves the two
+    /// readers are not accidentally sharing an answer.
+    #[test]
+    fn the_window_and_the_lifetime_view_differ() {
+        let mut s = Stats::new();
+        for _ in 0..10 {
+            hit(&mut s, 1_000);
+        }
+        s.last_emit = Instant::now() - std::time::Duration::from_secs(EMIT_INTERVAL_SECS + 1);
+        s.maybe_emit(1);
+        // A slow second window.
+        for _ in 0..10 {
+            hit(&mut s, 9_000);
+        }
+
+        let window = percentiles_ring(&s.hit_samples, s.hit_idx, s.hit_count, s.hit_window_added);
+        assert_eq!(
+            window.1, 9_000,
+            "the window should see only the slow samples"
+        );
+        let snap = s.snapshot();
+        assert_eq!(snap.hit_samples, 20, "/perf should see both windows");
+        assert!(
+            snap.hit_p50_ns >= 1_000 && snap.hit_p50_ns <= 9_000,
+            "lifetime p50 {} should sit between the two regimes",
+            snap.hit_p50_ns
+        );
+    }
+
+    /// Reading a wrapped ring must return the NEWEST samples, not the oldest.
+    ///
+    /// The old `percentiles` read `samples[..n]` from the front, which was only
+    /// correct because the index was reset to 0 every window. Against a ring
+    /// that genuinely wraps -- which it now does -- reading from the front
+    /// reports the oldest samples as if they were current, so this had to change
+    /// with the reset and is the half that would fail silently.
+    #[test]
+    fn a_wrapped_ring_reports_the_newest_samples() {
+        let mut s = Stats::new();
+        // Fill the ring with a slow value, then overwrite it all with a fast one.
+        for _ in 0..RESERVOIR {
+            hit(&mut s, 9_999);
+        }
+        assert_eq!(s.snapshot().hit_samples, RESERVOIR);
+        assert_eq!(s.snapshot().hit_p50_ns, 9_999);
+
+        for _ in 0..RESERVOIR {
+            hit(&mut s, 111);
+        }
+        let snap = s.snapshot();
+        assert_eq!(snap.hit_samples, RESERVOIR, "the ring is capped, not grown");
+        assert_eq!(
+            snap.hit_p50_ns, 111,
+            "a wrapped ring reported stale samples as current"
+        );
+        assert_eq!(snap.cache_hits_total, (RESERVOIR * 2) as u64);
+    }
+
+    /// Zero samples must stay distinguishable from zero nanoseconds.
+    ///
+    /// `tools/conformance.sh`'s rule: a check that cannot measure must fail
+    /// rather than print a number it did not take. The percentile is 0 when
+    /// there is nothing to measure, so `hit_samples` is what carries the
+    /// difference, and it has to be reported for the number to mean anything.
+    #[test]
+    fn no_samples_is_reported_as_no_samples() {
+        let snap = Stats::new().snapshot();
+        assert_eq!(snap.hit_samples, 0);
+        assert_eq!(snap.hit_p50_ns, 0);
+        assert_eq!(snap.cache_hits_total, 0);
+    }
+
+    /// A request timed at 0ns counts as a hit and contributes no sample, so the
+    /// two numbers legitimately differ and neither is a substitute for the other.
+    #[test]
+    fn a_zero_nanosecond_request_counts_but_does_not_sample() {
+        let mut s = Stats::new();
+        hit(&mut s, 0);
+        hit(&mut s, 5_000);
+        let snap = s.snapshot();
+        assert_eq!(snap.cache_hits_total, 2);
+        assert_eq!(
+            snap.hit_samples, 1,
+            "the 0ns request must not enter the reservoir"
+        );
+        assert_eq!(snap.hit_p50_ns, 5_000);
+    }
+}
+
+/// Handshake timing, and the separation that makes it meaningful.
+///
+/// Connection setup is measured per channel and never aggregated, because the
+/// three protocols do not measure the same span:
+///
+///   h1 and h2  rustls, from `ServerConnection::new` to `!is_handshaking()`.
+///              EXCLUDES the TCP round trip, already done before rustls saw the
+///              socket.
+///   h3         QUIC, to `is_established()`. INCLUDES the equivalent round trip,
+///              because QUIC folds transport and crypto together.
+///
+/// A combined figure would track the protocol mix rather than the cost of
+/// anything -- the same error as the `/perf` aggregate fixed earlier today.
+#[cfg(test)]
+mod handshake_tests {
+
+    /// The reservoir overwrites. The lifetime figures must not.
+    ///
+    /// This is the property the owner asked for in as many words: do not throw
+    /// values away and keep the count. Before this, `handshake_count` saturated
+    /// at the reservoir size, so a node that had served a million handshakes
+    /// reported "512 samples" and had silently forgotten every duration outside
+    /// the last 512 -- including its worst.
+    #[test]
+    fn a_full_reservoir_does_not_lose_the_count_or_the_extremes() {
+        let mut s = Stats::new();
+        let c = ch(Version::Http11);
+
+        // One deliberately slow handshake FIRST, then enough traffic to push it
+        // out of the ring entirely.
+        s.record_handshake(900_000_000, c, false);
+        for _ in 0..(CHANNEL_RESERVOIR * 2) {
+            s.record_handshake(1_000_000, c, false);
+        }
+
+        let snap = s.snapshot();
+        let h = snap
+            .channels
+            .iter()
+            .find(|x| x.channel == c.label())
+            .expect("channel present");
+
+        // The window is capped, and says so.
+        assert_eq!(h.handshake_full.samples, CHANNEL_RESERVOIR);
+        // The count is not capped.
+        assert_eq!(h.handshake_full.total, (CHANNEL_RESERVOIR * 2 + 1) as u64);
+        // The 900ms outlier is long gone from the ring, so the percentiles
+        // cannot see it. That is expected and is exactly why max exists.
+        assert!(
+            h.handshake_full.p99_ns < 900_000_000,
+            "outlier should have been evicted from the ring, p99 was {}",
+            h.handshake_full.p99_ns
+        );
+        // And it is still on the record.
+        assert_eq!(h.handshake_full.max_ns, 900_000_000);
+        assert_eq!(h.handshake_full.min_ns, 1_000_000);
+        // Mean over everything, not over the window.
+        let expect_mean = (900_000_000 + 1_000_000 * (CHANNEL_RESERVOIR as u64 * 2))
+            / (CHANNEL_RESERVOIR as u64 * 2 + 1);
+        assert_eq!(h.handshake_full.mean_ns, expect_mean);
+    }
+
+    /// A channel with no handshake reports zero for min, not u64::MAX. The
+    /// sentinel must never reach a reader, who would render it as 18 billion
+    /// milliseconds and reasonably conclude the node was broken.
+    #[test]
+    fn the_min_sentinel_never_escapes() {
+        let mut s = Stats::new();
+        // Traffic but no handshake: an h2c or internal channel.
+        s.record(1_000, false, 200, ch(Version::Http11), "");
+        let snap = s.snapshot();
+        for c in &snap.channels {
+            assert_eq!(c.handshake_full.total, 0);
+            assert_eq!(
+                c.handshake_full.min_ns, 0,
+                "channel {} leaked the sentinel",
+                c.channel
+            );
+        }
+    }
+
+    use super::*;
+
+    fn ch(v: Version) -> Channel {
+        Channel::new(v, Iface::External)
+    }
+
+    #[test]
+    fn a_handshake_is_recorded_on_its_own_channel() {
+        let mut s = Stats::new();
+        s.record_handshake(4_000_000, ch(Version::Http11), false);
+        let snap = s.snapshot();
+        let h1 = snap
+            .channels
+            .iter()
+            .find(|c| c.channel == "http/1.1/external")
+            .expect("h1 channel present once it has a sample");
+        assert_eq!(h1.handshake_full.samples, 1);
+        assert_eq!(h1.handshake_full.p50_ns, 4_000_000);
+    }
+
+    /// The property the whole design rests on.
+    #[test]
+    fn the_three_protocols_never_share_a_figure() {
+        let mut s = Stats::new();
+        // Deliberately far apart, as a real fleet would be: a resumed TLS
+        // handshake and a QUIC one that includes a round trip are not close.
+        s.record_handshake(1_000_000, ch(Version::Http11), false);
+        s.record_handshake(2_000_000, ch(Version::Http2), false);
+        s.record_handshake(90_000_000, ch(Version::Http3), false);
+
+        let snap = s.snapshot();
+        let get = |name: &str| {
+            snap.channels
+                .iter()
+                .find(|c| c.channel == name)
+                .unwrap_or_else(|| panic!("{name} missing"))
+                .handshake_full
+                .p50_ns
+        };
+        assert_eq!(get("http/1.1/external"), 1_000_000);
+        assert_eq!(get("http/2/external"), 2_000_000);
+        assert_eq!(get("http/3/external"), 90_000_000);
+        // And the slow h3 figure has not contaminated the others, which is what
+        // an aggregate would have done.
+        assert!(get("http/1.1/external") < get("http/3/external"));
+    }
+
+    /// External and internal are different events even on one protocol: a
+    /// browser handshake and one from the WireGuard backbone.
+    #[test]
+    fn interface_separates_them_too() {
+        let mut s = Stats::new();
+        s.record_handshake(5_000, Channel::new(Version::Http2, Iface::External), false);
+        s.record_handshake(50_000, Channel::new(Version::Http2, Iface::Internal), false);
+        let snap = s.snapshot();
+        let ext = snap
+            .channels
+            .iter()
+            .find(|c| c.channel == "http/2/external")
+            .unwrap();
+        let int = snap
+            .channels
+            .iter()
+            .find(|c| c.channel == "http/2/internal")
+            .unwrap();
+        assert_eq!(ext.handshake_full.p50_ns, 5_000);
+        assert_eq!(int.handshake_full.p50_ns, 50_000);
+    }
+
+    /// Zero samples must not read as a zero-nanosecond handshake. Same rule as
+    /// the hit percentiles: the count is what distinguishes them.
+    #[test]
+    fn no_handshake_is_no_samples_not_zero_nanoseconds() {
+        let mut s = Stats::new();
+        // Traffic, but no handshake recorded -- a plaintext or reused connection.
+        s.record(1_000, true, 200, ch(Version::Http11), "cache");
+        let snap = s.snapshot();
+        let h1 = snap
+            .channels
+            .iter()
+            .find(|c| c.channel == "http/1.1/external")
+            .unwrap();
+        assert_eq!(h1.handshake_full.samples, 0);
+        assert_eq!(h1.handshake_full.p50_ns, 0);
+        // The request itself was still counted.
+        assert_eq!(h1.requests, 1);
+    }
+
+    /// A zero duration is not a sample. The clock resolution is nanoseconds and a
+    /// real handshake is microseconds at minimum, so a zero means "not measured".
+    #[test]
+    fn a_zero_duration_is_not_recorded() {
+        let mut s = Stats::new();
+        s.record_handshake(0, ch(Version::Http2), false);
+        let snap = s.snapshot();
+        assert!(
+            snap.channels.iter().all(|c| c.handshake_full.samples == 0),
+            "a zero duration must not enter the reservoir"
+        );
     }
 }

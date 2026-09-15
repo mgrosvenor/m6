@@ -1,4 +1,108 @@
-//! App builder, thread pool, lifecycle management.
+//! The service: routing, the request dictionary, the thread pool, and the
+//! lifecycle that holds them together.
+//!
+//! This is the module a service actually uses. `App::new().run()` is a whole
+//! working service, and every other module in core is reached through it. It is
+//! also the longest file here, so this note says how it is laid out and which
+//! parts are load-bearing for reasons that are not visible locally.
+//!
+//! ```ignore
+//! use m6_core::prelude::*;
+//! fn main() -> anyhow::Result<()> { App::new().run()?; Ok(()) }
+//! ```
+//!
+//! ## The shape
+//!
+//! Four builders, not one, and the extra three exist for typing rather than for
+//! features: `App`, `AppWithGlobal<G>`, `AppWithThreadState<T>` and
+//! `AppWithState<G, T>`. A handler that needs shared state has to receive it
+//! with its real type, and the alternative to four builders was one builder
+//! handing out `dyn Any` and making every handler downcast.
+//!
+//! Below them, in order of a request's life:
+//!
+//! | part | what it does |
+//! |---|---|
+//! | `compile_pattern`, `route_specificity` | a route string becomes `Vec<Segment>` once, at load |
+//! | `find_route`, `match_route` | most specific match wins, not first declared |
+//! | `FrameworkState::build` | everything that can be computed per RELOAD rather than per request |
+//! | `FrameworkState::build_dict` | the per-request dictionary, described below |
+//! | `ThreadPool` | fixed workers over a bounded queue |
+//! | `install_shutdown`, `is_shutdown` | draining rather than dropping in-flight work |
+//!
+//! ## Specificity, not declaration order
+//!
+//! `/blog/{stem}` and `/blog/feed` both match `/blog/feed`. The more specific
+//! one wins, decided by `route_specificity` at load time, so the answer does not
+//! depend on the order of `[[route]]` blocks in a file somebody edits later.
+//! Code-registered routes are compiled ahead of config routes and inherit the
+//! config's `cache` value for the same path, so a handler on a path the config
+//! also names does not silently lose its caching policy.
+//!
+//! A trailing `{param}` matches ONE segment. Spanning several is `{*param}`,
+//! spelled out, because making the last parameter implicitly greedy would
+//! change the meaning of every route already written. m6-file's own matcher did
+//! make it greedy, and reconciling the two is what made every nested asset on a
+//! live site 404 while the process stayed perfectly healthy.
+//!
+//! ## The request dictionary, and why its ordering matters
+//!
+//! `build_dict` is where a request becomes the map a template renders against.
+//! It was twelve ordered steps. It is now a base plus an overlay, and the
+//! ordering the twelve steps depended on is preserved by the layering rather
+//! than by one function running top to bottom. `crate::dict` holds that.
+//!
+//! **Steps 1 to 3 left this function because they produced the same map for
+//! every request on a route**: config keys, global params files, and the route's
+//! static params files. They are merged once per reload into `route.base_dict`
+//! and shared behind an `Arc`. That is the difference between 222,708ns and
+//! 1,125ns per request, and it is the single largest measured win in the
+//! project. See `docs/PERFORMANCE.md`.
+//!
+//! What is left varies per request, and the order within it is still
+//! load-bearing:
+//!
+//! | step | what goes in |
+//! |---|---|
+//! | 3b | params files whose path holds a `{placeholder}`, so they resolve per request |
+//! | 4 | path params, validated per route: `{*param}` may contain `/`, `{param}` may not |
+//! | 5 | query params, at the top level AND as a nested `query` map |
+//! | 6 | POST form fields |
+//! | 7 | cookies |
+//! | 8 | **the built-ins** |
+//! | 9 | auth claims |
+//! | 10 | error keys |
+//! | 11 | flash message, if its HMAC verifies |
+//! | 12 | CSRF token |
+//!
+//! **Step 8 is the one to be careful with.** The built-ins go in AFTER every
+//! params file, which means a params file cannot override them. That is
+//! deliberate: `request_path`, the node name and the rest describe the request,
+//! and a content file that could redefine them could make a page lie about
+//! which URL it is. Moving step 8 earlier would look like a tidy-up and would
+//! open exactly that.
+//!
+//! Step 6 decodes `application/x-www-form-urlencoded` and nothing else. A body
+//! in any other type is skipped and a warning is logged, loudly, because the
+//! silent version cost real debugging time: a client switched to multipart, every
+//! field arrived empty, and downstream that looked like a failed CAPTCHA with
+//! nothing in any log to say a body had been ignored. `crate::multipart` handles
+//! the other type when the feature is on.
+//!
+//! ## Thread state
+//!
+//! One `thread_local!` slot holds the user's `T` as `Box<dyn Any + Send>`, with
+//! the init and destroy callbacks stored globally so a worker thread can call
+//! them without carrying type parameters. Exactly one stateful app can be active
+//! per process, which is not enforced at runtime because a binary has one `main`
+//! calling one `run()`.
+//!
+//! ## Shutdown drains
+//!
+//! `install_shutdown` makes a signal set a flag that `is_shutdown` reports and
+//! the pool's `drain` waits on, rather than the process exiting under whatever
+//! requests happen to be in flight. A service that drops work on SIGTERM turns
+//! every deploy into a handful of failed requests.
 #![allow(dead_code)]
 
 use std::any::Any;

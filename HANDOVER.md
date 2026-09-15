@@ -78,46 +78,60 @@ fn main() -> anyhow::Result<()> { App::new().run()?; Ok(()) }
 
 | branch | what it is |
 |---|---|
-| `main` | releases only. Advances **only** via `tools/release.sh`. |
-| `develop` | where work is integrated |
+| `main` | releases only. Advances **only** by a pull request from `develop`, then a tag. |
+| `develop` | where work is integrated, **by pull request** |
 | `<type>/<issue>-<slug>` | one branch per issue, off `develop` |
 
 Types: `feat` `fix` `perf` `docs` `refactor` `test` `chore`.
 
-`.githooks/pre-push` (version-controlled, via `core.hooksPath`) refuses a push
-to `main` that `release.sh` did not make, a merge on `develop` without the
-record that the checks ran, and a branch name with no issue number.
+`.githooks/pre-push` (version-controlled, via `core.hooksPath`) refuses a direct
+push to `main`, a release tag that is not a version or is pushed without
+`M6_RELEASE=1`, and a work branch whose name carries no issue number. It is
+milliseconds: the content checks are CI's job, and a hook that took ten minutes
+killed every push with SIGPIPE by idling out git's connection. Do not put a suite
+back into it.
 
 ```sh
 ./tools/branch.sh 42 some-slug --type fix   # off develop; checks the issue exists
-git push origin fix/42-some-slug            # fast local checks
-./tools/merge.sh fix/42-some-slug           # everything on the build host, then merges
-./tools/release.sh 1.0.0                    # develop into main, changelog, tag
+git push origin fix/42-some-slug
+gh pr create --base develop --fill          # CI runs the full set
+# merge on GitHub
+
+# and to release:
+# bump Cargo.toml, write the CHANGELOG entry
+gh pr create --base main --head develop --title "Release 1.1.0"
+# merge on GitHub, then
+git checkout main && git pull && ./tag.sh v1.1.0
 ```
 
-**`merge.sh` takes more than ten minutes.** It runs a release build, the whole
-suite, clippy, h1/h2/h3 conformance and the performance check on the build
-host. Run it in the background and let it finish. It refuses on a dirty working
-tree, which it has already caught me doing.
+**Run the build host before opening a pull request** when the change could touch
+performance or conformance, because a shared runner cannot measure wall-clock and
+CI's h3spec is not the same as a quiet Linux box:
+
+```sh
+M6_BUILD_HOST=root@<box> M6_BUILD_SSH_OPTS='-p 4022' ./tools/build-host-tests.sh
+```
+
+It takes ten to fifteen minutes and runs everything: m6's build, warnings, clippy,
+cargo-deny, the whole suite, h1/h2/h3 conformance, the performance check, then the
+examples repository and its CMS end-to-end suite.
 
 ### The tools
 
 | tool | what it does |
 |---|---|
 | `tools/branch.sh` | start work; confirms the issue exists with `gh` |
-| `tools/merge.sh` | full checks, then merge into develop, recording what ran |
-| `tools/release.sh` | develop into main; refuses without a CHANGELOG entry |
 | `tools/clippy.sh` | clippy, `-D warnings`. No ceiling, no `--update` |
 | `tools/conformance.sh` | h1/h2/h3 against recorded minimum scores |
 | `tools/perfcheck.sh` | two page renders from the examples, against recorded numbers, 20% margin |
-| `tools/build-host-tests.sh` | **everything, on the build host.** m6's own: build, warnings, clippy, cargo-deny, tests, conformance, then the examples repository and its CMS end-to-end suite. `merge.sh` and `release.sh` both call it |
+| `tools/build-host-tests.sh` | **everything, on the build host.** Build, warnings, clippy, cargo-deny, tests, h1/h2/h3 conformance, the performance check, then the examples repository and its CMS end-to-end suite. Run it before opening a pull request |
+| `tag.sh` | tag a release already merged into main, and push it. Checks the branch, the tree, the version against Cargo.toml, the changelog entry, and that the tag is free. Runs no suite: the pull request already did |
 | — | the hourly production check moved to the deployment repository; §6 |
 | `check.sh` | the laptop pre-push set |
 | the deployment repo's `deploy/run-tests.sh` | the deployment's own half: its renderers, its content, its rendered configs. It no longer runs m6's |
 
-**Set the build host in your shell.** `merge.sh` and `release.sh` both run
-`tools/build-host-tests.sh`, which refuses without it and says so rather than
-quietly checking nothing:
+**Set the build host in your shell.** `tools/build-host-tests.sh` refuses without
+it and says so rather than quietly checking nothing:
 
 ```sh
 export M6_BUILD_HOST=root@<your-linux-box>
@@ -130,8 +144,8 @@ the deployment repository's `docs/OPERATIONS.md`, which is where the rest of the
 infrastructure lives. A merge attempted without it fails before touching anything,
 which is the right outcome and was confirmed by doing it.
 
-**`tools/find-deployment.sh` is gone.** `merge.sh`, `release.sh` and
-`perfcheck.sh` used it to locate a deployment repository and run its
+**`tools/find-deployment.sh` is gone**, along with `merge.sh` and `release.sh`.
+All three used it to locate a deployment repository and run its
 `deploy/run-tests.sh`, which had it backwards: a release of m6 cannot depend on
 somebody's site being checked out beside it, and a bare checkout could not check
 itself. All three now use m6's own runner and the examples.
@@ -223,7 +237,7 @@ confinement and firewall rules, not what code runs.
 
 ## 4. Health of the checks
 
-Run everything: `./tools/merge.sh <branch>`, which finds the deployment
+Run everything: `./tools/build-host-tests.sh`, which finds the deployment
 repository and runs its `deploy/run-tests.sh`.
 
 | check | state | where it runs |
@@ -426,7 +440,7 @@ h3 were untested for months and nothing said so. Its header lists the four.
 
 **1.0 is not cut until the consolidation work is done.** Owner's decision,
 recorded beside the version in `Cargo.toml`. All nine crates are at 0.2.0,
-matching the newest tag; `release.sh` bumps them at a release.
+matching the newest tag. Bump them in `Cargo.toml` in the release pull request.
 
 | # | item | notes |
 |---|---|---|
@@ -434,7 +448,7 @@ matching the newest tag; `release.sh` bumps them at a release.
 | 2 | ~~**quiche 0.26.1 → 0.29.3, re-measure h3**~~ | **done 2026-09-13, issue #4.** The bump alone moved nothing. h3 is now **47/49** on a fork of quiche master carrying PRs #2521 and #2575, floor raised to 47. The last two are QPACK and are accepted, not chased. §4 |
 | 3 | **Phase 7: renderers onto a git tag** | below |
 | 4 | ~~**Phase 8: six `/status` implementations**~~ | **done 2026-09-13, issue #6.** All six conform, 13 tests in the gate, Go installed. The measurement: **linking m6-core costs 36% of throughput and +37us p50**, 8.8x RSS, 56.7x binary. §4 below |
-| 5 | ~~**The examples are built by the checks**~~ | **done 2026-09-14, issue #11.** They did not compile at all, and five more defects were underneath that. `build-host-tests.sh` now builds them and runs example 05's end-to-end suite; `merge.sh` and `release.sh` both call it; `find-deployment.sh` is deleted. See §2 and lesson 41 |
+| 5 | ~~**The examples are built by the checks**~~ | **done 2026-09-14, issue #11.** They did not compile at all, and five more defects were underneath that. `build-host-tests.sh` now builds them and runs example 05's end-to-end suite; `find-deployment.sh` is deleted. See §2 and lesson 41 |
 | 6 | **Deploy, lifting the freeze** | the deployment repository's business; §6. Not a code task. |
 
 **The two performance numbers are recorded.** `render:capabilities` measured a
@@ -549,8 +563,10 @@ Full list, 40 of them, in `docs/LESSONS.md`.
   API: `Branch not protected`. The hooks protect one laptop. Setting it needs
   the owner's go-ahead because it changes how the repository behaves for
   everyone.
-- **`FrameworkState::build_dict` is private**, so the twelve ordered steps of
-  dictionary building are not reusable by a service not using `App`.
+- **`FrameworkState::build_dict` is private**, and that is now a decision
+  rather than a debt: nothing outside `App` builds a request dictionary, and the
+  ordering is documented in `app`'s module doc and in
+  `docs/m6-core-reference.md`. See `docs/CONSOLIDATION-TODO.md` §1.
 - **The IO layer, the event loop and the handler contract are deferred**,
   explicitly, by the owner. Not 1.0 work. See `docs/CONSOLIDATION-TODO.md` §3b
   and do not widen that scope.
