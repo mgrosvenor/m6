@@ -205,10 +205,10 @@ pub fn load(config_path: &Path, site_dir: &Path) -> anyhow::Result<RendererConfi
             // file could state a value that was not the one in use, silently, with
             // nothing logged and neither file mentioning the other.
             //
-            // It cost a wrong conclusion about a live system. The origin's
-            // render-contact.conf read `from = "noreply@example.com"`,
-            // `to = "matthew@..."`, `host = "localhost"`, `port = 1025` -- and
-            // every one of those was inert, because the secrets file set all four.
+            // It cost a wrong conclusion about a live system. A deployed renderer
+            // config read `from = "noreply@example.com"`,
+            // `to = "someone@example.net"`, `host = "localhost"`, `port = 1025`
+            // -- and all four were inert, because the secrets file set them.
             // The form was relaying through a real provider and sending as a
             // different domain entirely. An audit read the deployed config and
             // believed it. A file that is overridden is indistinguishable from a
@@ -806,10 +806,10 @@ queue_size = 32
 /// silently. A config file could therefore state a value that was not the one in
 /// use, with nothing logged and neither file mentioning the other.
 ///
-/// It cost a wrong conclusion about a live system. The production origin's
-/// `render-contact.conf` read `from = "noreply@example.com"`,
-/// `to = "matthew@..."`, `host = "localhost"` and `port = 1025`, and all four
-/// were inert because the secrets file set them. The form was relaying through a
+/// It cost a wrong conclusion about a live system. A deployed renderer config
+/// read `from = "noreply@example.com"`, `to = "someone@example.net"`,
+/// `host = "localhost"` and `port = 1025`, and all four were inert because the
+/// secrets file set them. The form was relaying through a
 /// real provider and sending as an entirely different domain. An audit read the
 /// deployed config and believed it, because a file that is overridden looks
 /// exactly like a file that is correct when you are holding one file.
