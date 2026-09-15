@@ -428,9 +428,44 @@ fn make_quiche_config(server_config: &config::ServerConfig) -> anyhow::Result<qu
     // smaller than the QPACK work declined at 47/49. UNCOMMENT THIS the moment
     // the fork carries it and the gate reads 47/49 with it enabled.
     //
-    // Deliberately one commented line rather than a config flag: this is a
-    // fortnight's wait for a known fix, not a knob anyone should be turning.
-    // cfg.enable_early_data();
+    // ENABLED 2026-09-16. The fork carries the three changes this needed.
+    //
+    // It was held back because accepting early data cost one conformance test:
+    // "MUST send PROTOCOL_VIOLATION if CRYPTO in 0-RTT is received [TLS 8.3]",
+    // 47/49 -> 46/49. Fixing it took three attempts and the first two were in the
+    // wrong place, which is worth recording because the wrong places looked right.
+    //
+    // 1. A guard in quiche's `process_frame` on the CRYPTO arm. Correct per the RFC
+    //    and it changed the score not at all. h3spec sends its 0-RTT packet during a
+    //    FRESH handshake with no resumption, so there is no 0-RTT read key, so the
+    //    packet is buffered as undecryptable and its frames are never parsed. From
+    //    h3spec's own qlog:
+    //
+    //        1. initial: [crypto, padding]
+    //        2. initial: [crypto]
+    //        3. 0RTT:    [crypto, padding]   <- the violation
+    //        4. initial: [ack, crypto, padding]
+    //
+    //    A check on frame CONTENTS cannot fire for that. Kept anyway: it is right
+    //    for a genuinely resumed connection, where the frame is readable.
+    //
+    // 2. Reject the packet on its TYPE instead, before decryption. A server holding
+    //    handshake keys but no 0-RTT key knows no PSK was accepted, so the client
+    //    sent 0-RTT it was never entitled to send. This DETECTED the violation --
+    //    m6-http logged `conn.recv error: InvalidPacket` -- and h3spec still failed.
+    //
+    // 3. The close was going out where the client could not read it. quiche put the
+    //    CONNECTION_CLOSE in a Handshake packet, and a client derives its handshake
+    //    keys from the server's flight, which had not been sent. Its qlog showed it
+    //    received only an Initial carrying an ACK. `write_pkt_type` only preferred
+    //    an Initial close when `recv_count == 0`, a first-flight case; here
+    //    recv_count was non-zero. Now keyed on whether the server has ever sent a
+    //    Handshake packet, which is the fact that determines whether the peer could
+    //    have the keys.
+    //
+    // Verified: h3spec 47/49 WITH early data enabled, h2 146/146, h1 32/32 on four
+    // targets, every target measured. quiche's own suite unchanged at 1123 + 45.
+    cfg.enable_early_data();
 
     Ok(cfg)
 }
