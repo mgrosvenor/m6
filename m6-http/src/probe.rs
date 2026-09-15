@@ -269,10 +269,21 @@ fn quic_client_cfg() -> io::Result<quiche::Config> {
     cfg.set_initial_max_streams_bidi(10);
     cfg.set_initial_max_streams_uni(10);
     cfg.set_disable_active_migration(true);
+
     // Without this the client will not offer early data on the resumed
     // connection, and the probe would report 0-RTT as not working while the
     // server was configured perfectly well.
     cfg.enable_early_data();
+
+    // Advertise `compress_certificate`. Registering decompressors gives the client
+    // the CAPABILITY; this is what puts the extension on the wire. Without it the
+    // server has nothing to negotiate against and sends an uncompressed chain --
+    // which is exactly what the first measurement of RFC 8879 showed, a flight still
+    // 4081 bytes and still stalling at the amplification limit. The probe was
+    // measuring the absence of its own request.
+    if let Err(e) = cfg.enable_cert_compression() {
+        eprintln!("WARNING: client could not enable cert compression: {e:?}");
+    }
     Ok(cfg)
 }
 
@@ -632,6 +643,16 @@ pub fn quic_handshake_shape(addr: &str) -> io::Result<HandshakeShape> {
     // without the credit was the first attempt at this fix and it changed nothing.
     cfg.set_initial_max_stream_data_uni(100_000);
     cfg.set_disable_active_migration(true);
+
+    // Advertise `compress_certificate`. Registering decompressors gives the client
+    // the CAPABILITY; this is what puts the extension on the wire. Without it the
+    // server has nothing to negotiate against and sends an uncompressed chain --
+    // which is exactly what the first measurement of RFC 8879 showed, a flight still
+    // 4081 bytes and still stalling at the amplification limit. The probe was
+    // measuring the absence of its own request.
+    if let Err(e) = cfg.enable_cert_compression() {
+        eprintln!("WARNING: client could not enable cert compression: {e:?}");
+    }
 
     // A fresh connection ID per connection. A reused one would let the server
     // treat the second connection as the first, and the handshake being measured
