@@ -612,6 +612,25 @@ pub fn quic_handshake_shape(addr: &str) -> io::Result<HandshakeShape> {
     cfg.set_initial_max_data(1_000_000);
     cfg.set_initial_max_stream_data_bidi_local(100_000);
     cfg.set_initial_max_streams_bidi(10);
+    // Unidirectional streams, which h3 needs for its control stream and the two
+    // QPACK streams. Omitting this leaves the limit at the default of 0, so the
+    // server cannot open them and `h3::Connection::with_transport` fails with
+    // StreamLimit -- which it then LOGS. Probing production wrote four
+    // `h3 init error: TransportError(StreamLimit)` warnings into edge-a's journal
+    // and the same into edge-b's, and they turned up in a health check as an
+    // unexplained new error on two nodes.
+    //
+    // The handshake figure was unaffected, because QUIC establishment completes
+    // before h3 is set up. But a measuring tool that makes the thing it measures
+    // log errors is not read-only, and the next person reading those logs has no
+    // way to know the cause was the probe.
+    cfg.set_initial_max_streams_uni(10);
+    // And credit to WRITE on those streams. The stream limit alone is not enough:
+    // a peer allowed to open a stream but granted zero bytes on it cannot send the
+    // h3 SETTINGS frame, and quiche surfaces the resulting failure from
+    // `h3::Connection::with_transport` as a transport error. Setting the limit
+    // without the credit was the first attempt at this fix and it changed nothing.
+    cfg.set_initial_max_stream_data_uni(100_000);
     cfg.set_disable_active_migration(true);
 
     // A fresh connection ID per connection. A reused one would let the server
