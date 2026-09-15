@@ -201,9 +201,114 @@ pub fn render(d: &Digest, readings: &[NodeReading]) -> String {
                 t.probe_noise.join(", ")
             );
         }
+
+        // The firewall, which this report has been receiving and discarding.
+        //
+        // `/traffic` has carried `firewall: Option<FirewallState>` all along and
+        // nothing rendered it. That was reasonable until 2026-09-15: the collector
+        // that writes /var/lib/m6/firewall.json was written, tested and deployed
+        // nowhere, so every node returned `firewall: null` and there was nothing
+        // to print. It is installed now.
+        //
+        // Blocks that have dropped NOTHING are not printed individually. A block
+        // at zero has done its job -- whoever it was aimed at stopped coming -- and
+        // thirty-eight of those every three hours would bury the ones that matter.
+        // The count is still reported, because "38 blocks, none being hit" and
+        // "no firewall data at all" are very different states and must not look
+        // the same.
+        match &t.firewall {
+            Some(fw) => {
+                let hit: Vec<_> = fw.active().collect();
+                let _ = writeln!(
+                    o,
+                    "  {:<5} firewall: {} block(s) of {} rules, {} still being hit",
+                    r.name,
+                    fw.blocks.len(),
+                    fw.total_rules,
+                    hit.len()
+                );
+                for b in hit.iter().take(5) {
+                    let _ = writeln!(
+                        o,
+                        "        hit {} {} packets {} bytes",
+                        b.address, b.packets, b.bytes
+                    );
+                }
+            }
+            // Said out loud rather than omitted. A node with no collector looks
+            // exactly like a node with no blocks if the line is simply absent,
+            // and the first is a gap in the reporting while the second is a fact
+            // about the node.
+            None => {
+                let _ = writeln!(
+                    o,
+                    "  {:<5} firewall: no data (collector not installed on this node)",
+                    r.name
+                );
+            }
+        }
     }
 
     // ── E. crawlers ──────────────────────────────────────────────────────────
+    // ── F. cache headers, as the deployment declared them ────────────────────
+    //
+    // The failure these catch is a response that is SERVED CORRECTLY and cached
+    // wrongly: a page that should revalidate pinned for a day, or an asset that
+    // is not immutable so a content change never reaches anyone. Both are
+    // invisible to a status-code check, which is why this section exists.
+    //
+    // What to expect is declared by the DEPLOYMENT in the fleet config, not here.
+    // A cache policy is a property of a site; m6 is a generic web system and has
+    // no business knowing that /capabilities wants max-age=60.
+    let mut header_faults: Vec<String> = Vec::new();
+    let any_declared = readings.iter().any(|r| !r.header_checks.is_empty());
+    let _ = writeln!(o, "\nF. CACHE HEADERS");
+    if !any_declared {
+        // Said out loud. "No checks configured" and "all checks passed" must not
+        // look the same, and an empty section reads as the second.
+        let _ = writeln!(
+            o,
+            "  none declared. Add [[monitor.header_check]] entries to the fleet config."
+        );
+    } else {
+        for r in readings {
+            for hc in &r.header_checks {
+                if hc.passed() {
+                    let _ = writeln!(o, "  {:<5} ok     {} {}", r.name, hc.path, hc.header);
+                } else if let Some(e) = &hc.error {
+                    let _ = writeln!(
+                        o,
+                        "  {:<5} FAULT  {} could not be fetched: {}",
+                        r.name, hc.path, e
+                    );
+                    header_faults
+                        .push(format!("{}: {} could not be fetched: {e}", r.name, hc.path));
+                } else {
+                    // Absent and wrong are different failures and read
+                    // differently: a missing header is usually a route that lost
+                    // its policy, a wrong one a policy that changed.
+                    let got = hc
+                        .actual
+                        .clone()
+                        .unwrap_or_else(|| "<header absent>".to_string());
+                    let code = hc
+                        .status
+                        .map(|c| format!(" (HTTP {c})"))
+                        .unwrap_or_default();
+                    let _ = writeln!(
+                        o,
+                        "  {:<5} FAULT  {} {} is {:?}, expected {:?}{}",
+                        r.name, hc.path, hc.header, got, hc.expected, code
+                    );
+                    header_faults.push(format!(
+                        "{}: {} {} is {:?}, expected {:?}",
+                        r.name, hc.path, hc.header, got, hc.expected
+                    ));
+                }
+            }
+        }
+    }
+
     let _ = writeln!(o, "\nE. CRAWLERS  (reported every run, even a quiet one)");
     let mut any = false;
     for r in readings {
@@ -253,6 +358,96 @@ pub fn render(d: &Digest, readings: &[NodeReading]) -> String {
         let _ = writeln!(o, "  (none seen on any node)");
     }
 
+    // ── G. connection setup, per channel and per resumption state ────────────
+    //
+    // Never summed on either axis, and both axes matter:
+    //
+    //   ACROSS PROTOCOLS  h1 and h2 are the rustls handshake, which EXCLUDES the
+    //                     TCP round trip that finished before rustls saw the
+    //                     socket. h3 is the QUIC handshake, which INCLUDES its
+    //                     equivalent, because QUIC folds transport and crypto
+    //                     together. They are not the same span.
+    //   ACROSS RESUMPTION A resumed handshake skips the certificate and the
+    //                     signature. Blending it with a full one gives a figure
+    //                     that moves when the returning-visitor mix moves while
+    //                     neither cost has changed.
+    //
+    // This replaces the loopback curl the ssh health check ran on each node, and
+    // is better than it: these are real client handshakes, not a synthetic one
+    // against localhost.
+    let any_hs = readings.iter().any(|r| {
+        r.perf
+            .as_ref()
+            .map(|p| {
+                p.metrics
+                    .channels
+                    .iter()
+                    .any(|c| c.handshake_full.total > 0 || c.handshake_resumed.total > 0)
+            })
+            .unwrap_or(false)
+    });
+    let _ = writeln!(o, "\nG. CONNECTION SETUP");
+    if !any_hs {
+        let _ = writeln!(
+            o,
+            "  no handshakes recorded. A node running m6-http 1.0.0 does not report them."
+        );
+    } else {
+        for r in readings {
+            let Some(p) = &r.perf else { continue };
+            for c in &p.metrics.channels {
+                let full = &c.handshake_full;
+                let res = &c.handshake_resumed;
+                if full.total == 0 && res.total == 0 {
+                    continue;
+                }
+                // The resumption rate, from the two counts. Printed because it is
+                // the thing that would have silently moved a blended median, and
+                // because a low rate on the browser channel is itself a finding:
+                // it means returning visitors are paying full handshakes.
+                let tot = full.total + res.total;
+                let _ = writeln!(
+                    o,
+                    "  {:<5} {:<20} {} handshakes, {:.0}% resumed",
+                    r.name,
+                    c.channel,
+                    tot,
+                    100.0 * res.total as f64 / tot as f64
+                );
+                for (label, h) in [("full", full), ("resumed", res)] {
+                    if h.total == 0 {
+                        // Said plainly rather than printed as zeroes. "p50 0.00ms"
+                        // on a kind that never happened reads as an impossibly
+                        // fast server rather than as an absence of data.
+                        let _ = writeln!(o, "        {label:<8} none");
+                        continue;
+                    }
+                    // Two figures with different spans on one line, each labelled:
+                    // percentiles over the recent window the reservoir holds, then
+                    // the lifetime record the window discards. p99 over the last
+                    // 1024 connections says nothing about the worst of the 40,000
+                    // before them; max does.
+                    let _ = writeln!(
+                        o,
+                        "        {label:<8} last {:>5}  p50 {:>7.2}ms  p99 {:>7.2}ms   \
+                         all {:>7}  mean {:>7.2}ms  min {:>7.2}ms  max {:>7.2}ms",
+                        h.samples,
+                        h.p50_ns as f64 / 1e6,
+                        h.p99_ns as f64 / 1e6,
+                        h.total,
+                        h.mean_ns as f64 / 1e6,
+                        h.min_ns as f64 / 1e6,
+                        h.max_ns as f64 / 1e6
+                    );
+                }
+            }
+        }
+        let _ = writeln!(
+            o,
+            "  h1/h2 exclude the TCP round trip; h3 includes its equivalent. Do not compare them."
+        );
+    }
+
     // ── verdict ──────────────────────────────────────────────────────────────
     let _ = writeln!(o, "\n{bar}");
     let faults: Vec<_> = d
@@ -277,7 +472,17 @@ pub fn render(d: &Digest, readings: &[NodeReading]) -> String {
             let _ = writeln!(o, "  - {}: {}", f.node, f.text);
         }
     }
-    if faults.is_empty() && warns.is_empty() {
+    // Header failures are found HERE rather than in the digest, because the digest
+    // is built from /health and /perf and knows nothing about them. They still
+    // have to reach the verdict: a node serving a page with the wrong cache policy
+    // is not "all clear", and printing that it is would be the report lying.
+    if !header_faults.is_empty() {
+        let _ = writeln!(o, "CACHE HEADER FAULTS ({})", header_faults.len());
+        for f in &header_faults {
+            let _ = writeln!(o, "  - {f}");
+        }
+    }
+    if faults.is_empty() && warns.is_empty() && header_faults.is_empty() {
         let _ = writeln!(o, "ALL CLEAR on all {} nodes.", d.nodes.len());
     }
     let _ = writeln!(o, "{bar}");
@@ -316,7 +521,7 @@ mod tests {
         }
     }
 
-    fn reading(name: &str, t: Option<TrafficReport>) -> NodeReading {
+    pub(super) fn reading(name: &str, t: Option<TrafficReport>) -> NodeReading {
         NodeReading {
             name: name.into(),
             role: "origin".into(),
@@ -327,12 +532,28 @@ mod tests {
             perf_error: None,
             traffic: t,
             traffic_error: None,
+            header_checks: Vec::new(),
             rtt: None,
             unreachable: None,
         }
     }
 
-    fn digest() -> Digest {
+    pub(super) fn hc(
+        path: &str,
+        expected: &str,
+        actual: Option<&str>,
+    ) -> crate::poll::HeaderCheckResult {
+        crate::poll::HeaderCheckResult {
+            path: path.into(),
+            header: "cache-control".into(),
+            expected: expected.into(),
+            actual: actual.map(|a| a.into()),
+            status: Some(200),
+            error: None,
+        }
+    }
+
+    pub(super) fn digest() -> Digest {
         crate::digest::build(&[], &crate::digest::Thresholds::default(), "now".into())
     }
 
@@ -396,5 +617,84 @@ mod tests {
         );
         assert!(out.contains("E. CRAWLERS"));
         assert!(out.contains("no genuine crawler traffic in the window"));
+    }
+}
+
+/// The cache-header section, and the verdict it must be able to change.
+///
+/// These assert the part that is easy to get wrong: a check that reports a
+/// failure in its own section and then prints ALL CLEAR at the bottom is worse
+/// than no check, because the summary is what gets read.
+#[cfg(test)]
+mod header_check_tests {
+    use super::tests::{digest, hc, reading};
+    use super::*;
+
+    #[test]
+    fn a_passing_check_is_reported_and_stays_all_clear() {
+        let mut r = reading("syd", None);
+        r.header_checks.push(hc(
+            "/capabilities",
+            "public, max-age=60",
+            Some("public, max-age=60"),
+        ));
+        let out = render(&digest(), &[r]);
+        assert!(out.contains("F. CACHE HEADERS"), "{out}");
+        assert!(out.contains("/capabilities"), "{out}");
+        assert!(
+            out.contains("ALL CLEAR"),
+            "a passing check must not raise a fault:\n{out}"
+        );
+    }
+
+    /// The one that matters. A wrong cache policy must reach the verdict.
+    #[test]
+    fn a_wrong_header_is_a_fault_and_removes_all_clear() {
+        let mut r = reading("syd", None);
+        r.header_checks
+            .push(hc("/capabilities", "public, max-age=60", Some("no-store")));
+        let out = render(&digest(), &[r]);
+        assert!(out.contains("CACHE HEADER FAULTS"), "{out}");
+        assert!(
+            !out.contains("ALL CLEAR"),
+            "a node serving the wrong cache policy is not all clear:\n{out}"
+        );
+        // Both values, so the reader does not have to go and look them up.
+        assert!(out.contains("no-store"), "{out}");
+        assert!(out.contains("max-age=60"), "{out}");
+    }
+
+    /// An absent header and a wrong one are different problems.
+    #[test]
+    fn an_absent_header_says_so_rather_than_comparing_to_empty() {
+        let mut r = reading("lon", None);
+        r.header_checks
+            .push(hc("/capabilities", "public, max-age=60", None));
+        let out = render(&digest(), &[r]);
+        assert!(out.contains("<header absent>"), "{out}");
+        assert!(!out.contains("ALL CLEAR"), "{out}");
+    }
+
+    /// A fetch that never completed is not a wrong header.
+    #[test]
+    fn a_transport_failure_is_reported_as_one() {
+        let mut r = reading("chi", None);
+        let mut c = hc("/capabilities", "public, max-age=60", None);
+        c.error = Some("connection refused".into());
+        c.status = None;
+        r.header_checks.push(c);
+        let out = render(&digest(), &[r]);
+        assert!(out.contains("could not be fetched"), "{out}");
+        assert!(!out.contains("ALL CLEAR"), "{out}");
+    }
+
+    /// Nothing configured must not read as everything passing.
+    #[test]
+    fn no_checks_declared_says_so() {
+        let out = render(&digest(), &[reading("syd", None)]);
+        assert!(out.contains("F. CACHE HEADERS"), "{out}");
+        assert!(out.contains("none declared"), "{out}");
+        // And it is not a fault: declaring none is a choice, not a failure.
+        assert!(out.contains("ALL CLEAR"), "{out}");
     }
 }
