@@ -4,12 +4,18 @@
 
 Report security issues privately, **not** through the public issue tracker.
 
-- GitHub: use [private vulnerability reporting](https://github.com/mgrosvenor/m6/security/advisories/new)
-- Email: `matthew@thegrosvenors.au`
+- **Preferred:** GitHub [private vulnerability reporting](https://github.com/mgrosvenor/m6/security/advisories/new).
+  It is private, it threads, and it takes attachments.
+- Otherwise: the [contact form](https://mgrosvenor.com/contact).
+
+No address is published here deliberately. An address in a file GitHub renders on
+the repository's front page is an address scrapers read, and the two channels
+above both reach the maintainer without one.
 
 Please include what you did, what you observed, and anything that helps
-reproduce it: a request, a packet capture, a log line with its timestamp. If
-you have a proof of concept, say so and hold it until we have talked.
+reproduce it: a request, a packet capture, a log line with its timestamp. If you
+have a proof of concept, say so and hold it until we have talked -- use GitHub
+for anything you need to attach, since the contact form takes text only.
 
 You will get an acknowledgement. This is a one-person project, so please allow
 a reasonable window before disclosing publicly.

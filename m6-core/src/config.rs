@@ -198,6 +198,52 @@ pub fn load(config_path: &Path, site_dir: &Path) -> anyhow::Result<RendererConfi
                 .with_context(|| format!("reading secrets file {}", sp.display()))?;
             let secrets: toml::Value = toml::from_str(&srw)
                 .with_context(|| format!("parsing secrets file {}", sp.display()))?;
+
+            // ONE KEY, ONE OWNER. A key set in both files is refused here.
+            //
+            // This used to be a plain merge with "src wins", which meant a config
+            // file could state a value that was not the one in use, silently, with
+            // nothing logged and neither file mentioning the other.
+            //
+            // It cost a wrong conclusion about a live system. A deployed renderer
+            // config read `from = "noreply@example.com"`,
+            // `to = "someone@example.net"`, `host = "localhost"`, `port = 1025`
+            // -- and all four were inert, because the secrets file set them.
+            // The form was relaying through a real provider and sending as a
+            // different domain entirely. An audit read the deployed config and
+            // believed it. A file that is overridden is indistinguishable from a
+            // file that is correct, when you are looking at one file.
+            //
+            // The deployment's stated reason for the overlap was that a missing
+            // secrets file should fail loudly rather than quietly succeed against
+            // the wrong host, so the base config pointed at a dead relay on
+            // purpose. That intent is right and the mechanism inverted it: the way
+            // to fail loudly for a missing required value is for the value to be
+            // ABSENT. Present-and-deliberately-wrong is what made the config lie.
+            let mut clashes = Vec::new();
+            find_key_clashes(&toml_val, &secrets, "", &mut clashes);
+            if !clashes.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "{} key(s) are set in both the config and its secrets file, so \
+                     which value applies cannot be read from either file:\n{}\n\n\
+                     config:  {}\n  secrets: {}\n\n\
+                     Each key must have exactly one owner. Put a secret only in the \
+                     secrets file and remove it from the config; a value that is not \
+                     secret belongs only in the config. If the config held a \
+                     deliberately broken placeholder so that a missing secrets file \
+                     would fail loudly, delete the placeholder -- an absent required \
+                     key fails loudly by itself, and says which key is missing.",
+                    clashes.len(),
+                    clashes
+                        .iter()
+                        .map(|k| format!("  {k}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    config_path.display(),
+                    sp.display(),
+                ));
+            }
+
             merge_toml(&mut toml_val, secrets);
         }
         // Silently ignore if absent.
@@ -206,7 +252,47 @@ pub fn load(config_path: &Path, site_dir: &Path) -> anyhow::Result<RendererConfi
     parse_config(toml_val, site_dir)
 }
 
+/// Every leaf key present in BOTH trees, as dotted paths.
+///
+/// Tables are descended into rather than reported: two files each contributing
+/// different keys to the same `[smtp]` section is the whole point of having a
+/// secrets file, and is not a clash. A clash is one VALUE claimed twice.
+///
+/// An empty string is a value like any other. `username = ""` in the config
+/// beside a real username in the secrets file is exactly the case that made the
+/// config unreadable, so it is reported rather than treated as "unset".
+fn find_key_clashes(
+    base: &toml::Value,
+    secrets: &toml::Value,
+    prefix: &str,
+    out: &mut Vec<String>,
+) {
+    let (Some(b), Some(s)) = (base.as_table(), secrets.as_table()) else {
+        return;
+    };
+    for (k, sv) in s {
+        let Some(bv) = b.get(k) else { continue };
+        let path = if prefix.is_empty() {
+            k.clone()
+        } else {
+            format!("{prefix}.{k}")
+        };
+        match (bv.is_table(), sv.is_table()) {
+            // Both tables: not a clash in itself, look inside.
+            (true, true) => find_key_clashes(bv, sv, &path, out),
+            // One is a table and the other is not: the shapes disagree, which is
+            // a clash and a confusing one, so it is named too.
+            _ => out.push(path),
+        }
+    }
+}
+
 /// Deep-merge `src` into `dst`; `src` wins on conflict.
+///
+/// Reachable only after `find_key_clashes` has confirmed there are no leaf
+/// conflicts, so in practice `src` never replaces a value -- it only adds keys.
+/// The conflict arm is kept because this function is a general merge and a future
+/// caller may not have that guarantee.
 fn merge_toml(dst: &mut toml::Value, src: toml::Value) {
     match (dst, src) {
         (toml::Value::Table(d), toml::Value::Table(s)) => {
@@ -646,8 +732,36 @@ queue_size = 32
         }
     }
 
+    /// A secrets file SUPPLIES a value the config does not have.
+    ///
+    /// This test was `test_secrets_override` and asserted the opposite: that a
+    /// `password` in the config was silently replaced by the one in the secrets
+    /// file. That behaviour is gone, and the test is inverted rather than deleted,
+    /// because the old assertion is the clearest statement of what changed.
+    ///
+    /// The override let a config file state a value that was not in use. On the
+    /// production origin four keys in `render-contact.conf` were inert that way,
+    /// and an audit of where the site sends mail from read the deployed config and
+    /// drew the wrong conclusion. See `secrets_overlay_tests`.
     #[test]
-    fn test_secrets_override() {
+    fn test_secrets_supply_a_value_the_config_does_not_set() {
+        let mut secrets = NamedTempFile::new().unwrap();
+        writeln!(secrets, "password = \"secret\"").unwrap();
+
+        let mut cfg_file = NamedTempFile::new().unwrap();
+        // No `password` here. That is the point: one owner per key.
+        writeln!(cfg_file, "secrets_file = {:?}", secrets.path()).unwrap();
+
+        let cfg = load(cfg_file.path(), Path::new("/tmp")).unwrap();
+        assert_eq!(
+            cfg.user_config.get("password").unwrap().as_str().unwrap(),
+            "secret"
+        );
+    }
+
+    /// And setting it in both is refused, which is what used to be an override.
+    #[test]
+    fn test_secrets_no_longer_override_the_config() {
         let mut secrets = NamedTempFile::new().unwrap();
         writeln!(secrets, "password = \"secret\"").unwrap();
 
@@ -659,11 +773,9 @@ queue_size = 32
         )
         .unwrap();
 
-        let cfg = load(cfg_file.path(), Path::new("/tmp")).unwrap();
-        assert_eq!(
-            cfg.user_config.get("password").unwrap().as_str().unwrap(),
-            "secret"
-        );
+        let err = load(cfg_file.path(), Path::new("/tmp"))
+            .expect_err("a key in both files must be refused, not silently resolved");
+        assert!(format!("{err}").contains("password"), "{err}");
     }
 
     #[test]
@@ -683,5 +795,188 @@ queue_size = 32
         writeln!(cfg_file, "secrets_file = {:?}", secrets.path()).unwrap();
 
         assert!(load(cfg_file.path(), Path::new("/tmp")).is_err());
+    }
+}
+
+/// A key belongs to exactly one file.
+///
+/// ## The defect these cover
+///
+/// `load` merged the secrets file over the config with "src wins on conflict",
+/// silently. A config file could therefore state a value that was not the one in
+/// use, with nothing logged and neither file mentioning the other.
+///
+/// It cost a wrong conclusion about a live system. A deployed renderer config
+/// read `from = "noreply@example.com"`, `to = "someone@example.net"`,
+/// `host = "localhost"` and `port = 1025`, and all four were inert because the
+/// secrets file set them. The form was relaying through a
+/// real provider and sending as an entirely different domain. An audit read the
+/// deployed config and believed it, because a file that is overridden looks
+/// exactly like a file that is correct when you are holding one file.
+///
+/// Nothing caught it because every test wrote keys into one file or the other and
+/// never the same key into both, which is the one case where the old code was
+/// unambiguous.
+#[cfg(test)]
+mod secrets_overlay_tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::{NamedTempFile, TempDir};
+
+    /// Write a config that points at a secrets file, and the secrets file.
+    /// Returns the result of loading it.
+    fn load_pair(config_body: &str, secrets_body: &str) -> anyhow::Result<RendererConfig> {
+        let dir = TempDir::new().unwrap();
+        let secrets_path = dir.path().join("secrets.toml");
+        std::fs::write(&secrets_path, secrets_body).unwrap();
+
+        let mut cfg = NamedTempFile::new().unwrap();
+        writeln!(cfg, "secrets_file = \"{}\"", secrets_path.display()).unwrap();
+        write!(cfg, "{config_body}").unwrap();
+        cfg.flush().unwrap();
+
+        load(cfg.path(), dir.path())
+    }
+
+    /// The regression test. This is the exact shape the production config had.
+    #[test]
+    fn a_key_set_in_both_files_is_refused() {
+        let r = load_pair(
+            r#"
+[smtp]
+host = "localhost"
+port = 1025
+from = "noreply@example.com"
+"#,
+            r#"
+[smtp]
+host = "smtp.provider.example"
+port = 587
+from = "real@example.com"
+username = "someone"
+"#,
+        );
+        let err = match r {
+            Ok(_) => panic!(
+                "a config that sets smtp.host/port/from AND a secrets file that sets \
+                 the same three was accepted. Which value applies cannot be read \
+                 from either file: this is the defect."
+            ),
+            Err(e) => format!("{e}"),
+        };
+        // Every clashing key is named, because fixing one at a time with a
+        // restart between is how a five-key overlap takes five deploys.
+        for key in ["smtp.host", "smtp.port", "smtp.from"] {
+            assert!(err.contains(key), "the error should name {key}:\n{err}");
+        }
+        // And the key that is only in the secrets file must NOT be reported.
+        assert!(
+            !err.contains("smtp.username"),
+            "smtp.username is set in one file only and is not a clash:\n{err}"
+        );
+    }
+
+    /// The whole point of a secrets file: it contributes keys the config does not
+    /// have, including into a section the config also uses.
+    #[test]
+    fn a_secrets_file_may_add_keys_to_a_section_the_config_also_uses() {
+        let cfg = load_pair(
+            r#"
+[smtp]
+host = "smtp.provider.example"
+port = 587
+"#,
+            r#"
+[smtp]
+username = "someone"
+password = "hunter2"
+"#,
+        )
+        .expect("adding new keys to a shared section is not a clash");
+        let smtp = cfg.user_config.get("smtp").expect("smtp section survives");
+        // All four present: two from each file.
+        for k in ["host", "port", "username", "password"] {
+            assert!(smtp.get(k).is_some(), "{k} missing from the merged config");
+        }
+    }
+
+    /// An empty string is a value, not "unset".
+    ///
+    /// `username = ""` beside a real username is precisely how the production
+    /// config came to read as though it held the credentials. Treating `""` as
+    /// absent would keep that case silent, so it is a clash.
+    #[test]
+    fn an_empty_placeholder_is_still_a_clash() {
+        let r = load_pair(
+            "[smtp]\nusername = \"\"\npassword = \"\"\n",
+            "[smtp]\nusername = \"someone\"\npassword = \"hunter2\"\n",
+        );
+        let err = match r {
+            Ok(_) => panic!("empty-string placeholders were treated as unset"),
+            Err(e) => format!("{e}"),
+        };
+        assert!(err.contains("smtp.username"), "{err}");
+        assert!(err.contains("smtp.password"), "{err}");
+    }
+
+    /// The error has to be actionable: both paths, so the reader knows which two
+    /// files to look at without guessing.
+    #[test]
+    fn the_error_names_both_files_and_says_what_to_do() {
+        let err = format!(
+            "{}",
+            load_pair("[smtp]\nhost = \"a\"\n", "[smtp]\nhost = \"b\"\n").unwrap_err()
+        );
+        assert!(
+            err.contains("secrets.toml"),
+            "names the secrets file:\n{err}"
+        );
+        assert!(
+            err.contains("exactly one owner"),
+            "says what the rule is:\n{err}"
+        );
+        assert!(
+            err.contains("fails loudly"),
+            "addresses the deliberate-placeholder case, which is why the overlap \
+             existed in the first place:\n{err}"
+        );
+    }
+
+    /// A top-level key, not only one inside a section.
+    #[test]
+    fn a_top_level_key_clash_is_caught_too() {
+        let err = format!(
+            "{}",
+            load_pair("site_name = \"A\"\n", "site_name = \"B\"\n").unwrap_err()
+        );
+        assert!(err.contains("site_name"), "{err}");
+    }
+
+    /// A section in one file and a scalar of the same name in the other is a
+    /// clash, and a confusing one, so it is named rather than silently merged.
+    #[test]
+    fn a_table_against_a_scalar_is_a_clash() {
+        let err = format!(
+            "{}",
+            load_pair("smtp = \"nonsense\"\n", "[smtp]\nhost = \"a\"\n").unwrap_err()
+        );
+        assert!(err.contains("smtp"), "{err}");
+    }
+
+    /// No secrets file at all is not an error. A service that needs a value which
+    /// nothing provides fails on the missing value, which names what is missing.
+    #[test]
+    fn an_absent_secrets_file_is_not_an_error() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = NamedTempFile::new().unwrap();
+        writeln!(
+            cfg,
+            "secrets_file = \"{}\"",
+            dir.path().join("does-not-exist.toml").display()
+        )
+        .unwrap();
+        writeln!(cfg, "site_name = \"A\"").unwrap();
+        cfg.flush().unwrap();
+        load(cfg.path(), dir.path()).expect("an absent secrets file is tolerated");
     }
 }
