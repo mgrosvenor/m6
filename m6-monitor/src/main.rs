@@ -45,11 +45,92 @@ fn main() -> anyhow::Result<()> {
         return run_check(std::path::Path::new(config));
     }
 
-    App::new()
+    App::with_global(build_state)
         .route_get("/", page)
         .route_get("/digest", digest_json)
+        .route_get("/check", check_text)
         .run()?;
     Ok(())
+}
+
+/// How often the background poller refreshes the fleet view.
+///
+/// Every request used to poll the whole fleet itself, which meant load on the
+/// production nodes scaled with how often anyone LOOKED at the monitor, two
+/// requests moments apart could disagree because they came from different polls,
+/// and a plain `/digest` fetch took 2.9 to 3.6 seconds. A monitoring endpoint
+/// should answer instantly from a recent reading.
+const DEFAULT_POLL_SECS: u64 = 30;
+
+/// A completed fleet poll, and when it completed.
+struct Snapshot {
+    digest: digest::Digest,
+    readings: Vec<poll::NodeReading>,
+    at: std::time::Instant,
+    at_utc: String,
+}
+
+/// What every route reads. Nothing here polls.
+struct MonitorState {
+    /// `None` until the first poll completes. Reported as such rather than
+    /// served as zeroes: "not measured yet" and "measured as zero" are different
+    /// claims and this file already makes that distinction for sample counts.
+    latest: std::sync::Arc<std::sync::RwLock<Option<Snapshot>>>,
+    interval: Duration,
+}
+
+impl MonitorState {
+    /// Age of the current snapshot, and whether it is stale enough to distrust.
+    ///
+    /// Stale at three missed intervals. A monitor serving an old reading without
+    /// saying so is worse than one that is plainly down, because it looks like
+    /// current information.
+    fn age(&self, snap: &Snapshot) -> (f64, bool) {
+        let age = snap.at.elapsed().as_secs_f64();
+        (age, age > self.interval.as_secs_f64() * 3.0)
+    }
+}
+
+/// Build the shared state and start the poller.
+fn build_state(ctx: &AppContext) -> Result<MonitorState> {
+    let interval = Duration::from_secs(
+        ctx.config
+            .get("poll_interval_s")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(DEFAULT_POLL_SECS),
+    );
+    let latest: std::sync::Arc<std::sync::RwLock<Option<Snapshot>>> =
+        std::sync::Arc::new(std::sync::RwLock::new(None));
+
+    // `config_path` from the AppContext rather than argv. The old code read
+    // `std::env::args().nth(2)` inside the request handler, which quietly assumed
+    // an argument position.
+    let path = ctx.config_path.to_path_buf();
+    let writer = std::sync::Arc::clone(&latest);
+    std::thread::spawn(move || loop {
+        match collect_from(&path) {
+            Ok((digest, readings)) => {
+                let snap = Snapshot {
+                    digest,
+                    readings,
+                    at: std::time::Instant::now(),
+                    at_utc: m6_core::util::now_iso8601(),
+                };
+                match writer.write() {
+                    Ok(mut g) => *g = Some(snap),
+                    Err(e) => tracing::error!(error = %e, "snapshot lock poisoned"),
+                }
+            }
+            // The previous snapshot is KEPT on failure, and its age keeps
+            // growing, which every response reports. Replacing it with an error
+            // would throw away the last known good reading; hiding the failure
+            // would present a stale one as current.
+            Err(e) => tracing::warn!(error = %format!("{e:#}"), "fleet poll failed"),
+        }
+        std::thread::sleep(interval);
+    });
+
+    Ok(MonitorState { latest, interval })
 }
 
 /// Poll the fleet, print the check, exit 1 on faults.
@@ -78,31 +159,88 @@ fn collect_from(
     Ok((d, readings))
 }
 
-fn collect(req: &Request) -> anyhow::Result<digest::Digest> {
-    // The fleet lives in this service's own config, so it is reloaded by the
-    // same hot reload as everything else.
-    let config_path = std::env::args()
-        .nth(2)
-        .ok_or_else(|| anyhow::anyhow!("no config path in argv"))?;
-    let _ = req;
-    Ok(collect_from(std::path::Path::new(&config_path))?.0)
+/// The digest from the latest snapshot, for the HTML page.
+///
+/// Clones the digest because the page holds it across the render while the lock
+/// must not be. A digest is small; blocking the poller for the length of an HTML
+/// build would not be.
+fn snapshot_digest(st: &MonitorState) -> anyhow::Result<digest::Digest> {
+    let guard = st
+        .latest
+        .read()
+        .map_err(|e| anyhow::anyhow!("snapshot unreadable: {e}"))?;
+    let snap = guard
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("no fleet poll has completed yet"))?;
+    Ok(snap.digest.clone())
 }
 
-fn digest_json(req: &Request) -> Result<Response> {
-    match collect(req) {
-        Ok(d) => Ok(Response::json(
-            serde_json::to_value(&d).unwrap_or(json!({})),
-        )),
-        // 503 rather than 500: the monitor is up, the fleet view is not.
-        Err(e) => Ok(Response::json_status(
-            json!({"error": format!("{e:#}")}),
-            503,
-        )),
+/// The whole A-to-G report, as text, from the latest snapshot.
+///
+/// This is what `--check` printed, and the only reason that flag existed: the
+/// report had no route out. With this it is reachable the way everything else is,
+/// over an ssh-forwarded socket:
+///
+/// ```text
+/// ssh -fN -L /tmp/m6mon.sock:/run/m6/m6-monitor.sock root@<build-host>
+/// curl --unix-socket /tmp/m6mon.sock http://localhost/check
+/// ```
+fn check_text(_req: &Request, st: &MonitorState) -> Result<Response> {
+    let guard = match st.latest.read() {
+        Ok(g) => g,
+        Err(e) => return Ok(Response::text(&format!("snapshot unreadable: {e}")).with_status(503)),
+    };
+    let Some(snap) = guard.as_ref() else {
+        return Ok(Response::text("no fleet poll has completed yet\n").with_status(503));
+    };
+    let (age, stale) = st.age(snap);
+    let mut out = String::new();
+    // The age goes FIRST, before any figure, so it cannot be read past.
+    if stale {
+        out.push_str(&format!(
+            "STALE: this reading is {age:.0}s old and the poll interval is {}s. \
+             The poller is failing; the figures below are not current.\n\n",
+            st.interval.as_secs()
+        ));
+    } else {
+        out.push_str(&format!("polled {age:.1}s ago ({})\n", snap.at_utc));
     }
+    out.push_str(&check::render(&snap.digest, &snap.readings));
+    Ok(Response::text(&out))
 }
 
-fn page(req: &Request) -> Result<Response> {
-    let d = match collect(req) {
+fn digest_json(_req: &Request, st: &MonitorState) -> Result<Response> {
+    let guard = match st.latest.read() {
+        Ok(g) => g,
+        // 503 rather than 500: the monitor is up, the fleet view is not.
+        Err(e) => {
+            return Ok(Response::json_status(
+                json!({"error": format!("snapshot unreadable: {e}")}),
+                503,
+            ))
+        }
+    };
+    let Some(snap) = guard.as_ref() else {
+        return Ok(Response::json_status(
+            json!({"error": "no fleet poll has completed yet"}),
+            503,
+        ));
+    };
+    let (age, stale) = st.age(snap);
+    let mut v = serde_json::to_value(&snap.digest).unwrap_or(json!({}));
+    // Age is part of the reading, not metadata. A consumer that cannot tell a
+    // 3-second-old digest from a 40-minute-old one is guessing.
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("snapshot_age_s".into(), json!((age * 10.0).round() / 10.0));
+        obj.insert("snapshot_at".into(), json!(snap.at_utc));
+        obj.insert("poll_interval_s".into(), json!(st.interval.as_secs()));
+        obj.insert("stale".into(), json!(stale));
+    }
+    Ok(Response::json(v))
+}
+
+fn page(_req: &Request, st: &MonitorState) -> Result<Response> {
+    let d = match snapshot_digest(st) {
         Ok(d) => d,
         Err(e) => {
             return Ok(Response::json_status(
