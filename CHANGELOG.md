@@ -14,6 +14,119 @@ releases only; work happens on `develop`. See `CONTRIBUTING.md`.
 
 ## Unreleased
 
+## 1.3.0 — 2026-09-16
+
+### Performance
+
+**HTTP/3 0-RTT is enabled.** A returning visitor's request rides in the first
+flight, so a complete response costs one round trip instead of a handshake plus a
+round trip.
+
+Measured from a laptop against a 4.92 ms path:
+
+| scenario | h1 | h2 | h3 | h3 + 0-RTT |
+|---|---|---|---|---|
+| cold, first packet to first response | 23.1 ms | 15.1 ms | 13.0 ms | **6.4 ms** |
+| warm, time to first byte | 10.24 ms | 5.00 ms | 5.02 ms | 5.00 ms |
+
+6.4 ms against a 4.92 ms round trip is **1.3 RTT**, within 0.3 RTT of the floor: no
+HTTP response can beat one round trip, because the request has to arrive and the
+answer has to come back. Against h2 a returning visitor is **2.4x faster** to a
+first response.
+
+The h1 and h3 cold figures are `m6-bench-detail` phase measurements, n=30 for
+per-request phases and n=1 for connection setup, which that tool records only from
+its first post-warmup connection. The 0-RTT figure is n=4 from `m6-probe-h3 --0rtt`
+(6.38, 6.41, 6.49, 6.53 ms).
+
+**The replay gates are unchanged and still strict.** In early data m6 serves only a
+FRESH cache hit and answers 425 Too Early to everything else — not merely RFC 8470's
+"idempotent methods". This site's analytics beacon is a fire-and-forget GET, so
+"GET is safe" would not have been enough, and a stale hit queues a background
+refresh, which is a write.
+
+### Fixed
+
+**Enabling 0-RTT used to cost a conformance test. It no longer does**, and the
+failure was in three different places before it was found.
+
+h3spec's `MUST send PROTOCOL_VIOLATION if CRYPTO in 0-RTT is received [TLS 8.3]`
+took h3 from 47/49 to 46/49 whenever early data was enabled. Three fixes in the
+quiche fork, of which the first two were in the wrong place:
+
+1. **A guard on the CRYPTO frame** in `process_frame`. Correct per RFC 9001 §8.3 and
+   it changed the score not at all. h3spec sends its 0-RTT packet during a FRESH
+   handshake with no resumption, so there is no 0-RTT read key, so the packet is
+   buffered as undecryptable and its frames are never parsed. Its own qlog:
+
+   ```
+   1. initial: [crypto, padding]
+   2. initial: [crypto]
+   3. 0RTT:    [crypto, padding]   <- the violation
+   4. initial: [ack, crypto, padding]
+   ```
+
+   A check on frame CONTENTS cannot fire for that, by anyone. Kept regardless: it is
+   correct for a genuinely resumed connection, where the frame is readable.
+
+2. **Reject on the packet TYPE**, before decryption. A server holding handshake keys
+   but no 0-RTT key knows no PSK was accepted, so the peer sent 0-RTT it was never
+   entitled to send. This detected the violation — m6-http logged
+   `conn.recv error: InvalidPacket` — and h3spec still failed.
+
+3. **The CONNECTION_CLOSE was going where the client could not read it.** quiche put
+   it in a Handshake packet, and a client derives its handshake keys from the
+   server's flight, which had not been sent. The client's qlog showed it received
+   only an Initial carrying an ACK: no close, no server CRYPTO at all.
+   `write_pkt_type` preferred an Initial close only when `recv_count == 0`, a
+   first-flight case; here it was non-zero. Now keyed on whether the server has ever
+   sent a Handshake packet, which is the fact that decides whether the peer could
+   hold the keys.
+
+   A first version preferred Initial whenever the handshake was unconfirmed, and
+   quiche's own `app_close_by_server_during_handshake_not_established` caught it:
+   there the client IS established and has discarded its Initial keys, so Initial is
+   the unreadable one.
+
+**Backend errors name the backend.** The monitor reported a single total, "3 backend
+errors since start", leaving the operator to guess the service. The guess that
+matters is render-contact: a contact submission whose SMTP send fails returns 500
+and is counted nowhere else, so an anonymous total is the difference between seeing
+silent mail loss and not seeing it.
+
+m6-http already knew which backend errored — `Stats::record` takes the name and uses
+it to decide whether an error counts at all — and then discarded it. Now kept per
+backend, on `/perf`, rendered worst-first:
+
+```
+3 backend errors since start: render-contact 5, m6-html 2
+```
+
+The new field is `serde(default)`, so a node older than this reports "node too old
+to attribute them" rather than nothing, which is the same rule this codebase uses
+for absent sample counts.
+
+### Security
+
+**The quiche revision production depended on was unreferenced.** 1.2.0 pinned
+`916a5a25`, which sat on no branch and no tag in the fork and was reachable only by
+raw SHA. GitHub garbage-collects unreferenced objects; when that happened every
+build would have failed, CI included, and the commit would have been unrecoverable.
+Now referenced by both a branch and a tag, `m6-pinned-1.2.0`.
+
+The fork is now at `4bbba71e`. Its own suite passes unchanged at 1123 + 45 tests.
+
+### Changed
+
+`tools/build-host-tests.sh` reports build-host disk usage and, above 80%, prints the
+command that reclaims it. `cargo test --workspace` fills `target/debug` and cargo
+never garbage-collects it: the build host sat at 73% with **65G** of debug artefacts
+across 5023 dependency files and 2311 fingerprint directories, against 6G of release
+trees that deploys actually use. Clearing it took 104G used down to 37G.
+
+Reported rather than deleted automatically. A gate that quietly removes 65G of build
+cache makes the next run slow for reasons the operator did not choose.
+
 ## 1.2.0 — 2026-09-15
 
 ### Changed
