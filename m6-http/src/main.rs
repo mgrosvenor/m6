@@ -428,8 +428,49 @@ fn make_quiche_config(server_config: &config::ServerConfig) -> anyhow::Result<qu
     // smaller than the QPACK work declined at 47/49. UNCOMMENT THIS the moment
     // the fork carries it and the gate reads 47/49 with it enabled.
     //
-    // Deliberately one commented line rather than a config flag: this is a
-    // fortnight's wait for a known fix, not a knob anyone should be turning.
+    // STILL HELD BACK. The fork now carries the RFC 9001 8.3 check, and it is not
+    // sufficient. See below.
+    //
+    // It was held back because accepting early data cost one conformance test:
+    // "MUST send PROTOCOL_VIOLATION if CRYPTO in 0-RTT is received [TLS 8.3]",
+    // taking h3spec from 47/49 to 46/49. quiche discarded 0-RTT packets outright
+    // before early data was enabled, so the rule was satisfied for free; once they
+    // are accepted they reach process_frame, and nothing there looked at the packet
+    // type.
+    //
+    // Fixed in the fork at c5ccefcd rather than by lowering the floor or abandoning
+    // 0-RTT, which was the owner's call. Two lines: `hdr.ty == Type::ZeroRTT` in the
+    // CRYPTO arm returning `Error::InvalidPacket`, whose `to_wire` mapping is
+    // PROTOCOL_VIOLATION. quiche's own 1123 + 45 tests pass unchanged.
+    //
+    // ── Why that was not enough, measured ────────────────────────────────────
+    //
+    // With the check in place, h3spec still reads 46/49 and still fails the same
+    // test. The check is in `process_frame`, and a 0-RTT packet never gets there
+    // unless the server can DECRYPT it:
+    //
+    //     let aead = if hdr.ty == Type::ZeroRTT {
+    //         self.crypto_ctx[epoch].crypto_0rtt_open.as_ref()   // None
+    //     };
+    //     match aead {
+    //         None => if hdr.ty == Type::ZeroRTT && !self.is_established() {
+    //             self.undecryptable_pkts.push_back(...);
+    //             return Ok(pkt_len);        // buffered, never parsed
+    //
+    // Without a resumption key there is no 0-RTT read key, so the packet is
+    // buffered and returns Ok. Its frames are never parsed, so no check on frame
+    // contents can fire. The guard is still correct and will fire on a genuinely
+    // resumed connection; it is simply not what this test exercises.
+    //
+    // What remains to establish, and the order to do it in: whether h3spec resumes
+    // a session before sending the 0-RTT CRYPTO frame (if it does not, the packet
+    // is undecryptable by construction and the rule cannot be enforced from frame
+    // contents at all), and if it does, whether the CONNECTION_CLOSE can actually
+    // be sent -- which is the same `recv_count`/`mark_closed` territory upstream
+    // PR #2521 fixed for first-flight errors.
+    //
+    // Enabling early data without that answered costs one conformance test, and
+    // the gate is the thing that would have to be lowered. Left off.
     // cfg.enable_early_data();
 
     Ok(cfg)
