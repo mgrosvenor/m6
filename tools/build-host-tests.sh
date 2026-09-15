@@ -506,6 +506,30 @@ else
     echo "${YELLOW}   including whether this m6 still builds the code that uses it.${RESET}"
 fi
 
+# ── Disk: report it, and say what would reclaim it ───────────────────────────
+#
+# `cargo test --workspace` above is what fills target/debug, and cargo NEVER
+# garbage-collects it: every dependency bump and toolchain change leaves its
+# artefacts behind for good. On 2026-09-15 the build host was at 73% with **65G**
+# of target/debug across 5023 files in deps and 2311 fingerprint directories, while
+# the release trees that deploys actually use were 6G. Clearing it took the box from
+# 104G used to 37G.
+#
+# Reported rather than deleted. This script is a GATE, and a gate that quietly
+# removes 65G of build cache makes the next run slow for reasons the operator did
+# not choose. The number and the command are enough.
+# shellcheck disable=SC2086
+DISK="$(ssh $SSH_OPTS "$BUILD_HOST" "df -h / | awk 'NR==2 {print \$5\" of \"\$2\" used\"}'" 2>/dev/null)"
+# shellcheck disable=SC2086
+DEBUG_SZ="$(ssh $SSH_OPTS "$BUILD_HOST" "du -sh /root/build/*/target/debug 2>/dev/null | awk '{s+=\$1} END {print NR\" tree(s)\"}'" 2>/dev/null)"
+echo
+echo "   build host disk: ${DISK:-unknown}${DEBUG_SZ:+, debug caches in $DEBUG_SZ}"
+case "${DISK%% *}" in
+    8[0-9]%|9[0-9]%|100%)
+        echo "${YELLOW}   above 80%. Reclaim the debug caches, which deploys do not use:${RESET}"
+        echo "${YELLOW}     ssh $SSH_OPTS $BUILD_HOST 'rm -rf /root/build/*/target/debug'${RESET}" ;;
+esac
+
 if [[ $FAILED -eq 0 ]]; then
     echo
     echo "${GREEN}m6 and its examples passed on $BUILD_HOST.${RESET}"

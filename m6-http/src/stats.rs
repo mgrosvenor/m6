@@ -350,6 +350,17 @@ pub struct Stats {
     pub cache_hits_total: u64,
     pub cache_misses_total: u64,
     pub backend_errors_total: u64,
+    /// Errors attributed to the BACKEND that produced them.
+    ///
+    /// The total alone says "3 backend errors since start" and leaves the operator
+    /// to guess which service. That guess matters most for the one that sends mail:
+    /// a contact-form submission whose SMTP send fails returns 500, so it is
+    /// counted here and nowhere else, and "render-contact: 3" is the difference
+    /// between noticing silent mail loss and not.
+    ///
+    /// A small map rather than a fixed array: backend names come from config and
+    /// this deployment has six. Only backends that have actually errored appear.
+    backend_errors_by_name: std::collections::BTreeMap<String, u64>,
 
     // Window counters (reset each emit)
     window_requests: u64,
@@ -447,6 +458,7 @@ impl Stats {
             cache_hits_total: 0,
             cache_misses_total: 0,
             backend_errors_total: 0,
+            backend_errors_by_name: std::collections::BTreeMap::new(),
             window_requests: 0,
             window_cache_hits: 0,
             window_cache_misses: 0,
@@ -569,6 +581,12 @@ impl Stats {
 
         if backend_error {
             self.backend_errors_total += 1;
+            // Keyed by the backend m6-http actually dispatched to, so the name in
+            // the report is the name in the config rather than a guess.
+            *self
+                .backend_errors_by_name
+                .entry(backend.to_string())
+                .or_insert(0) += 1;
             self.window_backend_errors += 1;
         }
     }
@@ -713,6 +731,11 @@ impl Stats {
             cache_hits_total: self.cache_hits_total,
             cache_misses_total: self.cache_misses_total,
             backend_errors_total: self.backend_errors_total,
+            backend_errors_by_name: self
+                .backend_errors_by_name
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect(),
             monitor_requests_total: self.monitor_requests_total,
             monitor_samples: self.monitor_count,
             monitor_p50_ns: kp50,
