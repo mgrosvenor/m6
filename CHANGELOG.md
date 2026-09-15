@@ -46,7 +46,44 @@ change is a TLS library: TLS 1.3 negotiating `AEAD-CHACHA20-POLY1305-SHA256`
 with verify 0, TLS 1.2 negotiating `ECDHE-RSA-CHACHA20-POLY1305`, ALPN h2 and
 h1 both answering 200.
 
+### Changed
+
+**A secrets file supplies values; it no longer overrides them.** A key set in
+both a config and its `secrets_file` is now an error at load, naming every
+clashing key and both paths. It used to merge with "src wins on conflict",
+silently, so a config file could state a value that was not the one in use.
+
+That is not hypothetical. A deployed renderer config read `host = "localhost"`,
+`port = 1025` and a `from` address, and all of them were inert because the
+secrets file set them too: the service was relaying through a real provider and
+sending as a different domain. An audit read the deployed config and drew the
+wrong conclusion. A file that is overridden looks exactly like a file that is
+correct when you are holding one file.
+
+Tables are still descended into, so two files contributing DIFFERENT keys to one
+section is unaffected -- that is what a secrets file is for. A clash is one value
+claimed twice. An empty string counts as a value, because `username = ""` beside
+a real username is exactly how a config comes to look as though it holds
+credentials.
+
+**This is a breaking change for any deployment whose two files overlap.** The
+service will refuse to start and say which keys. The fix is to give each key one
+owner: secrets in the secrets file, everything else in the config. If the config
+held a deliberately broken placeholder so that a missing secrets file would fail
+loudly, delete it -- an absent required key already fails loudly and names
+itself, which a present-but-wrong value does not.
+
 ### Fixed
+
+**No email address is published in `SECURITY.md`.** GitHub renders that file on
+the repository front page, so an address in it is an address scrapers read. It
+now points at GitHub private vulnerability reporting, which is the better channel
+anyway because it threads and takes attachments, and at a contact form.
+
+`m6-core`'s "this crate names no particular deployment" test grew the second
+domain it had been missing, which is how a personal address survived in that file.
+Its own self-test was checking one entry of the banned list rather than all of
+them, which is why a missing entry was never going to be noticed.
 
 **`/perf` reported no latency at all, on every node, and never had.**
 
