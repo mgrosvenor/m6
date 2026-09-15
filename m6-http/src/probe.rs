@@ -123,13 +123,15 @@ pub fn tls_handshake(
 ) -> io::Result<(Duration, Option<Vec<u8>>)> {
     // TCP connect happens BEFORE the clock starts, matching what the server's
     // h1/h2 figure excludes.
-    let mut sock = TcpStream::connect(addr)?;
+    let (host, peer) = resolve(addr)?;
+    let mut sock = TcpStream::connect(peer)?;
     sock.set_nodelay(true)?;
 
-    // The name is irrelevant to the measurement (NoVerify above) but rustls
-    // requires one and it goes out as SNI.
-    let name = ServerName::try_from("localhost")
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    // The real hostname, not a placeholder: it goes out as SNI, and a server
+    // handed the wrong one either refuses or answers with a different
+    // certificate, which silently changes what is being measured.
+    let name =
+        ServerName::try_from(host).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     let mut conn = rustls::ClientConnection::new(cfg, name)
         .map_err(|e| io::Error::other(format!("ClientConnection::new: {e}")))?;
 
@@ -195,21 +197,28 @@ pub fn tls_handshake(
     Ok((elapsed, alpn))
 }
 
-/// Flush everything quiche wants to send. Returns the number of datagrams sent,
-/// so a caller can count flights: a flush that sends nothing is not a flight.
-fn quic_flush_counted(conn: &mut quiche::Connection, udp: &UdpSocket) -> usize {
+/// Flush everything quiche wants to send, returning (datagrams, bytes).
+///
+/// The BYTES are what matters for the anti-amplification ratio, and counting only
+/// the server's side of it was the mistake that made an earlier reading of this
+/// look impossible: a server appeared to send 4x what it had received, which no
+/// conforming server does. The budget grows with every byte the client sends, so
+/// the server's total is meaningless without the client's beside it.
+fn quic_flush_counted(conn: &mut quiche::Connection, udp: &UdpSocket) -> (usize, usize) {
     let mut out = [0u8; 1350];
     let mut sent = 0;
+    let mut bytes = 0;
     loop {
         match conn.send(&mut out) {
             Ok((n, _)) => {
                 if udp.send(&out[..n]).is_err() {
-                    return sent;
+                    return (sent, bytes);
                 }
                 sent += 1;
+                bytes += n;
             }
-            Err(quiche::Error::Done) => return sent,
-            Err(_) => return sent,
+            Err(quiche::Error::Done) => return (sent, bytes),
+            Err(_) => return (sent, bytes),
         }
     }
 }
@@ -267,27 +276,62 @@ fn quic_client_cfg() -> io::Result<quiche::Config> {
     Ok(cfg)
 }
 
+/// Split `host:port` into the SNI name and a resolved socket address.
+///
+/// Both halves are needed and they are not the same thing. Earlier versions
+/// parsed the target straight into a `SocketAddr`, which accepts only literal
+/// IPs, and sent a hardcoded SNI of "localhost". That was fine against our own
+/// loopback and useless for the question that matters most: whether OTHER
+/// servers pay the same handshake cost we do. A real host rejects or misserves a
+/// wrong SNI, so a probe that cannot send the right one cannot compare anything.
+pub fn resolve(addr: &str) -> io::Result<(String, std::net::SocketAddr)> {
+    use std::net::ToSocketAddrs;
+    let host = match addr.rsplit_once(':') {
+        Some((h, _)) => h.trim_matches(['[', ']']).to_string(),
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{addr}: expected host:port"),
+            ))
+        }
+    };
+    let sock = addr
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("{addr}: no address")))?;
+    Ok((host, sock))
+}
+
 /// Open a UDP socket connected to `addr`, returning it with the two addresses
-/// quiche needs on every packet.
-fn quic_socket(addr: &str) -> io::Result<(UdpSocket, std::net::SocketAddr, std::net::SocketAddr)> {
-    let udp = UdpSocket::bind("0.0.0.0:0")?;
-    udp.connect(addr)?;
-    let peer: std::net::SocketAddr = addr
-        .parse()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{addr}: {e}")))?;
+/// quiche needs on every packet, plus the SNI name to present.
+fn quic_socket(
+    addr: &str,
+) -> io::Result<(
+    UdpSocket,
+    std::net::SocketAddr,
+    std::net::SocketAddr,
+    String,
+)> {
+    let (host, peer) = resolve(addr)?;
+    let udp = UdpSocket::bind(if peer.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    })?;
+    udp.connect(peer)?;
     let local = udp.local_addr()?;
     udp.set_read_timeout(Some(Duration::from_millis(5)))?;
-    Ok((udp, peer, local))
+    Ok((udp, peer, local, host))
 }
 
 /// A request, as h3 headers. The method is a parameter so the 0-RTT safety gate
 /// for replayable methods can be PROVEN rather than asserted: an untested
 /// security gate is a claim.
-fn h3_req(method: &str, path: &str) -> Vec<quiche::h3::Header> {
+fn h3_req(method: &str, path: &str, authority: &str) -> Vec<quiche::h3::Header> {
     vec![
         quiche::h3::Header::new(b":method", method.as_bytes()),
         quiche::h3::Header::new(b":scheme", b"https"),
-        quiche::h3::Header::new(b":authority", b"localhost"),
+        quiche::h3::Header::new(b":authority", authority.as_bytes()),
         quiche::h3::Header::new(b":path", path.as_bytes()),
     ]
 }
@@ -302,13 +346,13 @@ fn h3_req(method: &str, path: &str) -> Vec<quiche::h3::Header> {
 /// warming first.
 pub fn zero_rtt_h3(addr: &str, path: &str, method: &str) -> io::Result<ZeroRtt> {
     // ── Connection 1: full handshake, then wait for the ticket ────────────────
-    let (udp, peer, local) = quic_socket(addr)?;
+    let (udp, peer, local, sni) = quic_socket(addr)?;
     let mut cfg = quic_client_cfg()?;
     let mut scid = [0u8; 16];
     getrandom_scid(&mut scid);
     let t0 = Instant::now();
     let mut conn = quiche::connect(
-        Some("localhost"),
+        Some(&sni),
         &quiche::ConnectionId::from_ref(&scid),
         local,
         peer,
@@ -338,7 +382,7 @@ pub fn zero_rtt_h3(addr: &str, path: &str, method: &str) -> io::Result<ZeroRtt> 
         if let Some(hc) = h3.as_mut() {
             if !sent {
                 if hc
-                    .send_request(&mut conn, &h3_req("GET", path), true)
+                    .send_request(&mut conn, &h3_req("GET", path, &sni), true)
                     .is_ok()
                 {
                     sent = true;
@@ -398,13 +442,13 @@ pub fn zero_rtt_h3(addr: &str, path: &str, method: &str) -> io::Result<ZeroRtt> 
     };
 
     // ── Connection 2: resume, and send in the first flight ────────────────────
-    let (udp2, peer2, local2) = quic_socket(addr)?;
+    let (udp2, peer2, local2, sni2) = quic_socket(addr)?;
     let mut cfg2 = quic_client_cfg()?;
     let mut scid2 = [0u8; 16];
     getrandom_scid(&mut scid2);
     let t1 = Instant::now();
     let mut c2 = quiche::connect(
-        Some("localhost"),
+        Some(&sni2),
         &quiche::ConnectionId::from_ref(&scid2),
         local2,
         peer2,
@@ -445,7 +489,7 @@ pub fn zero_rtt_h3(addr: &str, path: &str, method: &str) -> io::Result<ZeroRtt> 
             }
             if let Some(hc2) = h3b.as_mut() {
                 if hc2
-                    .send_request(&mut c2, &h3_req(method, path), true)
+                    .send_request(&mut c2, &h3_req(method, path, &sni2), true)
                     .is_ok()
                 {
                     sent2 = true;
@@ -519,12 +563,34 @@ pub fn zero_rtt_h3(addr: &str, path: &str, method: &str) -> io::Result<ZeroRtt> 
 /// certificate chain larger than that budget forces the server to stop and wait
 /// for more client data, costing a full round trip. A value sitting just under
 /// ~3600 with more than one client flight is that limit, not a slow network.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct HandshakeShape {
     pub elapsed: Duration,
     pub client_flights: usize,
     pub server_datagrams: usize,
     pub server_bytes_before_established: usize,
+    /// What the client sent before establishment. The anti-amplification budget
+    /// is roughly three times this, so it is the denominator without which the
+    /// server's figure says nothing.
+    pub client_bytes_before_established: usize,
+    /// A merged timeline of who sent what, when, as cumulative byte totals.
+    ///
+    /// This exists because the TOTALS are ambiguous and led to two wrong
+    /// conclusions in a row. The anti-amplification budget is three times what the
+    /// server has received AT THAT MOMENT, so a ratio computed from end-of-handshake
+    /// totals can look comfortable (1.6x) while the ratio at the instant the server
+    /// stopped was right on the 3x limit. Only a timeline distinguishes them.
+    ///
+    /// Each entry is (time, who, cumulative bytes that side has sent).
+    pub timeline: Vec<(Duration, &'static str, usize)>,
+    /// When each server datagram arrived, measured from the client's first send.
+    ///
+    /// The totals say a handshake was slow; only the gaps say WHERE. A pause
+    /// between two server datagrams is the server not sending, and its size
+    /// identifies the cause: roughly one round trip means it was waiting for the
+    /// client (the anti-amplification limit), while a pause much shorter than a
+    /// round trip means it had data to send and did not send it.
+    pub server_arrivals: Vec<Duration>,
 }
 
 /// One QUIC handshake, timed to `is_established()`.
@@ -533,12 +599,7 @@ pub struct HandshakeShape {
 /// no earlier point to start from: the first thing the client does is send an
 /// Initial packet, and crypto and transport complete together.
 pub fn quic_handshake_shape(addr: &str) -> io::Result<HandshakeShape> {
-    let udp = UdpSocket::bind("0.0.0.0:0")?;
-    udp.connect(addr)?;
-    let peer: std::net::SocketAddr = addr
-        .parse()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{addr}: {e}")))?;
-    let local = udp.local_addr()?;
+    let (udp, peer, local, sni) = quic_socket(addr)?;
 
     let mut cfg = quiche::Config::new(quiche::PROTOCOL_VERSION)
         .map_err(|e| io::Error::other(format!("quiche::Config::new: {e}")))?;
@@ -561,9 +622,11 @@ pub fn quic_handshake_shape(addr: &str) -> io::Result<HandshakeShape> {
     let scid = quiche::ConnectionId::from_ref(&scid);
 
     let t0 = Instant::now();
-    let mut conn = quiche::connect(Some("localhost"), &scid, local, peer, &mut cfg)
+    let mut conn = quiche::connect(Some(&sni), &scid, local, peer, &mut cfg)
         .map_err(|e| io::Error::other(format!("quiche::connect: {e}")))?;
-    quic_flush(&mut conn, &udp);
+    let (_, mut client_bytes) = quic_flush_counted(&mut conn, &udp);
+    let mut timeline: Vec<(Duration, &'static str, usize)> =
+        vec![(t0.elapsed(), "client", client_bytes)];
 
     let mut buf = [0u8; 65535];
     let deadline = t0 + Duration::from_secs(5);
@@ -575,6 +638,7 @@ pub fn quic_handshake_shape(addr: &str) -> io::Result<HandshakeShape> {
     let mut client_flights = 1usize;
     let mut server_datagrams = 0usize;
     let mut server_bytes = 0usize;
+    let mut server_arrivals: Vec<Duration> = Vec::new();
     while !conn.is_established() {
         if Instant::now() > deadline {
             return Err(io::Error::new(
@@ -588,10 +652,33 @@ pub fn quic_handshake_shape(addr: &str) -> io::Result<HandshakeShape> {
                 "QUIC closed during handshake",
             ));
         }
+        // ── FLUSH BEFORE RECV ────────────────────────────────────────────────
+        //
+        // The first version of this loop read before it wrote. When the server is
+        // waiting on the client -- for the ACK that validates its address, which
+        // is exactly the case this function exists to detect -- the probe sat in
+        // the 5ms read timeout BEFORE sending the thing the server was waiting
+        // for, then sent it. That added roughly 5ms per round trip to the
+        // measurement and made a 1-RTT handshake read as though it were two.
+        //
+        // The identical mistake was made and fixed in `zero_rtt_h3`, where it
+        // reported 18.2ms against a true 1.05ms. A measuring tool that adds its
+        // own latency to the thing it measures reports a plausible number and an
+        // entirely wrong conclusion.
+        let (dg, by) = quic_flush_counted(&mut conn, &udp);
+        if by > 0 {
+            client_bytes += by;
+            timeline.push((t0.elapsed(), "client", client_bytes));
+        }
+        if dg > 0 {
+            client_flights += 1;
+        }
         match udp.recv(&mut buf) {
             Ok(n) => {
                 server_datagrams += 1;
                 server_bytes += n;
+                server_arrivals.push(t0.elapsed());
+                timeline.push((t0.elapsed(), "server", server_bytes));
                 conn.recv(
                     &mut buf[..n],
                     quiche::RecvInfo {
@@ -611,18 +698,19 @@ pub fn quic_handshake_shape(addr: &str) -> io::Result<HandshakeShape> {
             }
             Err(e) => return Err(e),
         }
-        // A flush that puts nothing on the wire is not a flight. Counting only
-        // the ones that send is what makes the total mean "round trips the client
-        // had to contribute to".
-        if quic_flush_counted(&mut conn, &udp) > 0 {
-            client_flights += 1;
-        }
     }
+    // One last flush so the client's final flight is actually on the wire, the
+    // same reason the TLS probe flushes its Finished: the loop exits on the
+    // CLIENT's view of establishment, which is one step before the server's.
+    quic_flush(&mut conn, &udp);
     Ok(HandshakeShape {
         elapsed: t0.elapsed(),
         client_flights,
         server_datagrams,
         server_bytes_before_established: server_bytes,
+        client_bytes_before_established: client_bytes,
+        timeline,
+        server_arrivals,
     })
 }
 

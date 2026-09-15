@@ -73,6 +73,14 @@ pub struct HandshakeSample {
     pub elapsed_ns: u64,
     /// True if ALPN selected h2. False means HTTP/1.1.
     pub is_h2: bool,
+    /// True if the session was RESUMED rather than negotiated from scratch.
+    ///
+    /// Reported separately and never blended with full handshakes: a resumed one
+    /// skips the certificate and the signature, so mixing them gives a figure that
+    /// tracks the returning-visitor mix rather than the cost of either. rustls
+    /// with the `std` feature defaults to a 256-session store, so this happens in
+    /// production without anything being configured for it.
+    pub resumed: bool,
 }
 
 struct Conn {
@@ -86,6 +94,9 @@ struct Conn {
     handshake_ns: Option<u64>,
     /// Whether that handshake negotiated h2. `None` means h1 or no ALPN.
     handshake_h2: bool,
+    /// Whether that handshake resumed a session rather than doing full key
+    /// exchange. Stamped at the same moment as `handshake_ns`.
+    handshake_resumed: bool,
     stream: TcpStream,
     /// `None` on a plaintext listener. HTTP/2 already carried this
     /// distinction (`H2Io::Tls` / `H2Io::Plain`); this gives HTTP/1.1 the same
@@ -278,6 +289,7 @@ impl Http11Listener {
                     self.conns.push(Conn {
                         handshake_ns: None,
                         handshake_h2: false,
+                        handshake_resumed: false,
                         stream,
                         tls,
                         kind,
@@ -321,6 +333,7 @@ impl Http11Listener {
                 handshakes.push(HandshakeSample {
                     elapsed_ns: ns,
                     is_h2: conn.handshake_h2,
+                    resumed: conn.handshake_resumed,
                 });
             }
         }
@@ -563,8 +576,13 @@ where
             if !tls.is_handshaking() {
                 let elapsed = created.elapsed().as_nanos() as u64;
                 let is_h2 = tls.alpn_protocol() == Some(b"h2".as_slice());
+                // `handshake_kind()` is only meaningful once the handshake is
+                // over, which is exactly here. `FullWithHelloRetryRequest` counts
+                // as full: it did the key exchange, and then some.
+                let resumed = matches!(tls.handshake_kind(), Some(rustls::HandshakeKind::Resumed));
                 conn.handshake_ns = Some(elapsed);
                 conn.handshake_h2 = is_h2;
+                conn.handshake_resumed = resumed;
             }
         }
     }

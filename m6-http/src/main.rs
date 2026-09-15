@@ -308,6 +308,67 @@ fn make_quiche_config(server_config: &config::ServerConfig) -> anyhow::Result<qu
     cfg.set_initial_max_streams_uni(100);
     cfg.set_disable_active_migration(true);
 
+    // ── Anti-amplification factor: 4 rather than quiche's default 3 ───────────
+    //
+    // Removes a full round trip from EVERY new HTTP/3 connection.
+    //
+    // Before validating a client's address a server may send only
+    // `factor x bytes received`. A client's opening Initial is padded to 1200
+    // bytes, so at factor 3 the budget is 3600. Our handshake flight is 4082
+    // bytes, nearly all of it the certificate chain, so quiche sent 3600,
+    // stopped with 482 bytes left, and waited a round trip for the client's ACK
+    // before finishing. Measured with m6-probe-h3 from a laptop: the final server
+    // datagram arrived 4.98ms after the previous one against a 4.85ms RTT, making
+    // the handshake ~2 RTT instead of 1. At factor 4 the budget is 4800 and the
+    // flight goes out in one go, with 718 bytes of headroom for a chain that
+    // grows at renewal.
+    //
+    // ── Why this is not the security tradeoff it appears to be ───────────────
+    //
+    // RFC 9000 8.1 says MUST NOT exceed 3, to stop a server being used as a
+    // reflection amplifier: an attacker spoofs a victim's address, sends an
+    // Initial, and the server sprays the response at the victim. So the question
+    // is how much worse a 4x reflector is than a 3x one, and the answer is: not
+    // measurably. Reflection is only worth mounting when the return is orders of
+    // magnitude. DNS gives around 50x, NTP monlist around 500x, memcached around
+    // 50,000x. At 3x an attacker spends 1200 bytes of their own upstream to
+    // deliver 3600, burning a third of the attack on themselves; at 4x, a
+    // quarter. Neither is an amplifier anyone would choose, and moving between
+    // them does not change that. Calling 4x "a 33% stronger reflector" is true
+    // and useless; the distinction that would matter is 3x against 30x.
+    //
+    // Measured against real edges with m6-probe-h3, on a 1200-byte client
+    // Initial, both well past the limit:
+    //
+    //   Cloudflare (cloudflare.com)        4198 bytes  =  3.50x
+    //   Fastly     (www.mozilla.org)       5360 bytes  =  4.47x
+    //
+    // Two of the largest CDNs in operation exceed it, and Cloudflare wrote quiche.
+    //
+    // The real consequence is CONFORMANCE, because this repository gates on
+    // h3spec scores and h3spec covers QUIC as well as RFC 9114. That is measured
+    // rather than argued: the score either side of this change is in the commit.
+    //
+    // ── THIS IS TEMPORARY. It goes back to the default of 3. ─────────────────
+    //
+    // Owner's decision, 2026-09-15: ship 4 now so production gets the round trip
+    // back, and remove it once certificate compression makes it unnecessary.
+    //
+    // Compression is the properly correct fix, and the one the QUIC community
+    // actually recommends. Fastly's study of the problem measured 40-44% of
+    // UNCOMPRESSED chains exceeding the budget, and compression taking that to
+    // 1-9%; other work puts it at 61% for a Firefox-sized 1352-byte Initial. So
+    // this is the ordinary case rather than anything unusual about this
+    // deployment, and nobody in that literature proposes raising the factor.
+    // Measured here, zlib takes our chain from 3400 to 2345 bytes, a 1055-byte
+    // saving where 482 is needed, which puts the flight under 3600 at factor 3.
+    //
+    // Not reachable today: quiche binds 12 SSL_CTX functions and
+    // `SSL_CTX_add_cert_compression_alg` is not one of them, though BoringSSL
+    // underneath implements RFC 8879. Tracked as its own issue against the fork,
+    // and when it lands THIS LINE IS DELETED.
+    cfg.set_max_amplification_factor(4);
+
     // ── 0-RTT ─────────────────────────────────────────────────────────────────
     //
     // A returning visitor sends its request in the FIRST flight, so the response
@@ -342,7 +403,34 @@ fn make_quiche_config(server_config: &config::ServerConfig) -> anyhow::Result<qu
     // 0-RTT GET would inflate a page-view counter. m6-http cannot recognise that
     // route -- it is proxied like any other -- which is the reason the rule is
     // about where the answer comes from rather than about a list of paths.
-    cfg.enable_early_data();
+    //
+    // ── HELD BACK, one line, pending a fix in the quiche fork ─────────────────
+    //
+    // Everything above and the two gates in `handle_h3_request` are finished and
+    // were verified on staging: `m6-probe-h3 --0rtt /` confirmed the request went
+    // out before the handshake completed, a cached path answered 200 in early
+    // data, and an uncached one answered 425. Over a real 5.1ms path it answered
+    // in 6.0-6.7ms where h2 needs roughly 16ms.
+    //
+    // It is not enabled because it costs a conformance test, isolated by running
+    // the gate with this line in and out while changing nothing else:
+    //
+    //     factor 4, this line OUT   h3spec 47/49  PASS
+    //     factor 4, this line IN    h3spec 46/49  FAIL
+    //
+    // The single regression is "MUST send PROTOCOL_VIOLATION if CRYPTO in 0-RTT
+    // is received [TLS 8.3]". With early data off quiche never accepts a 0-RTT
+    // packet so the case cannot arise; with it on, quiche accepts them and does
+    // not police CRYPTO frames inside them.
+    //
+    // Owner's decision, 2026-09-15: fix it in the fork rather than lower the
+    // floor or abandon 0-RTT. The check is narrow and well specified, and far
+    // smaller than the QPACK work declined at 47/49. UNCOMMENT THIS the moment
+    // the fork carries it and the gate reads 47/49 with it enabled.
+    //
+    // Deliberately one commented line rather than a config flag: this is a
+    // fortnight's wait for a known fix, not a knob anyone should be turning.
+    // cfg.enable_early_data();
 
     Ok(cfg)
 }
@@ -803,9 +891,11 @@ fn event_loop(
                 } else {
                     HttpVersion::Http11
                 };
-                state
-                    .stats
-                    .record_handshake(hs.elapsed_ns, Channel::new(v, state.tls_iface));
+                state.stats.record_handshake(
+                    hs.elapsed_ns,
+                    Channel::new(v, state.tls_iface),
+                    hs.resumed,
+                );
             }
         }
 
@@ -1345,9 +1435,15 @@ fn drain_udp(
         // handshake into thousands of samples of a steadily growing duration.
         if qconn.conn.is_established() && !qconn.handshake_recorded {
             qconn.handshake_recorded = true;
+            // Resumed handshakes are counted apart from full ones. With 0-RTT
+            // enabled this is now the common case for a returning visitor, and a
+            // blended figure would drop as the returning share grew while neither
+            // cost had changed.
+            let resumed = qconn.conn.is_resumed();
             state.stats.record_handshake(
                 qconn.created.elapsed().as_nanos() as u64,
                 Channel::new(HttpVersion::Http3, state.tls_iface),
+                resumed,
             );
         }
 

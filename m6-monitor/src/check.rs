@@ -250,78 +250,6 @@ pub fn render(d: &Digest, readings: &[NodeReading]) -> String {
     }
 
     // ── E. crawlers ──────────────────────────────────────────────────────────
-    // ── Connection setup, per channel ────────────────────────────────────────
-    //
-    // Printed per channel and NEVER summed, because the three are not the same
-    // measurement. h1 and h2 are the rustls handshake, which excludes the TCP
-    // round trip that finished before rustls saw the socket. h3 is the QUIC
-    // handshake, which includes its equivalent because QUIC folds transport and
-    // crypto together. A combined figure would track the protocol mix rather
-    // than the cost of anything.
-    //
-    // This is the measurement the ssh health check took with a loopback curl on
-    // each node. It is better here: these are REAL client handshakes rather than
-    // a synthetic one against localhost.
-    let any_hs = readings.iter().any(|r| {
-        r.perf
-            .as_ref()
-            .map(|p| p.metrics.channels.iter().any(|c| c.handshake_samples > 0))
-            .unwrap_or(false)
-    });
-    let _ = writeln!(
-        o,
-        "\nG. CONNECTION SETUP  (per channel; the three are not comparable)"
-    );
-    if !any_hs {
-        let _ = writeln!(
-            o,
-            "  no handshakes recorded yet. A node running m6-http 1.0.0 does not report them."
-        );
-    } else {
-        for r in readings {
-            let Some(p) = &r.perf else { continue };
-            for c in &p.metrics.channels {
-                if c.handshake_samples == 0 {
-                    continue;
-                }
-                // The sample count is not decoration. A p50 over three handshakes
-                // and one over three thousand are different claims, and the
-                // number alone cannot be compared to anything without it.
-                // Two rows per channel rather than one long one. The first is
-                // the recent window the percentiles come from; the second is the
-                // lifetime record, which the window discards.
-                //
-                // `total` and `samples` differ once a channel passes the
-                // reservoir size, and the difference is the point: p99 over the
-                // last 1024 connections says nothing about the worst of the
-                // 40,000 before them, and `max` does.
-                let _ = writeln!(
-                    o,
-                    "  {:<5} {:<20} last {:>5}  p50 {:>8.2}ms  p99 {:>8.2}ms",
-                    r.name,
-                    c.channel,
-                    c.handshake_samples,
-                    c.handshake_p50_ns as f64 / 1e6,
-                    c.handshake_p99_ns as f64 / 1e6
-                );
-                let _ = writeln!(
-                    o,
-                    "  {:<5} {:<20} all  {:>5}  mean {:>7.2}ms  min {:>7.2}ms  max {:>7.2}ms",
-                    "",
-                    "",
-                    c.handshake_total,
-                    c.handshake_mean_ns as f64 / 1e6,
-                    c.handshake_min_ns as f64 / 1e6,
-                    c.handshake_max_ns as f64 / 1e6
-                );
-            }
-        }
-        let _ = writeln!(
-            o,
-            "  h1/h2 exclude the TCP round trip; h3 includes its equivalent."
-        );
-    }
-
     // ── F. cache headers, as the deployment declared them ────────────────────
     //
     // The failure these catch is a response that is SERVED CORRECTLY and cached
@@ -428,6 +356,96 @@ pub fn render(d: &Digest, readings: &[NodeReading]) -> String {
     }
     if !any {
         let _ = writeln!(o, "  (none seen on any node)");
+    }
+
+    // ── G. connection setup, per channel and per resumption state ────────────
+    //
+    // Never summed on either axis, and both axes matter:
+    //
+    //   ACROSS PROTOCOLS  h1 and h2 are the rustls handshake, which EXCLUDES the
+    //                     TCP round trip that finished before rustls saw the
+    //                     socket. h3 is the QUIC handshake, which INCLUDES its
+    //                     equivalent, because QUIC folds transport and crypto
+    //                     together. They are not the same span.
+    //   ACROSS RESUMPTION A resumed handshake skips the certificate and the
+    //                     signature. Blending it with a full one gives a figure
+    //                     that moves when the returning-visitor mix moves while
+    //                     neither cost has changed.
+    //
+    // This replaces the loopback curl the ssh health check ran on each node, and
+    // is better than it: these are real client handshakes, not a synthetic one
+    // against localhost.
+    let any_hs = readings.iter().any(|r| {
+        r.perf
+            .as_ref()
+            .map(|p| {
+                p.metrics
+                    .channels
+                    .iter()
+                    .any(|c| c.handshake_full.total > 0 || c.handshake_resumed.total > 0)
+            })
+            .unwrap_or(false)
+    });
+    let _ = writeln!(o, "\nG. CONNECTION SETUP");
+    if !any_hs {
+        let _ = writeln!(
+            o,
+            "  no handshakes recorded. A node running m6-http 1.0.0 does not report them."
+        );
+    } else {
+        for r in readings {
+            let Some(p) = &r.perf else { continue };
+            for c in &p.metrics.channels {
+                let full = &c.handshake_full;
+                let res = &c.handshake_resumed;
+                if full.total == 0 && res.total == 0 {
+                    continue;
+                }
+                // The resumption rate, from the two counts. Printed because it is
+                // the thing that would have silently moved a blended median, and
+                // because a low rate on the browser channel is itself a finding:
+                // it means returning visitors are paying full handshakes.
+                let tot = full.total + res.total;
+                let _ = writeln!(
+                    o,
+                    "  {:<5} {:<20} {} handshakes, {:.0}% resumed",
+                    r.name,
+                    c.channel,
+                    tot,
+                    100.0 * res.total as f64 / tot as f64
+                );
+                for (label, h) in [("full", full), ("resumed", res)] {
+                    if h.total == 0 {
+                        // Said plainly rather than printed as zeroes. "p50 0.00ms"
+                        // on a kind that never happened reads as an impossibly
+                        // fast server rather than as an absence of data.
+                        let _ = writeln!(o, "        {label:<8} none");
+                        continue;
+                    }
+                    // Two figures with different spans on one line, each labelled:
+                    // percentiles over the recent window the reservoir holds, then
+                    // the lifetime record the window discards. p99 over the last
+                    // 1024 connections says nothing about the worst of the 40,000
+                    // before them; max does.
+                    let _ = writeln!(
+                        o,
+                        "        {label:<8} last {:>5}  p50 {:>7.2}ms  p99 {:>7.2}ms   \
+                         all {:>7}  mean {:>7.2}ms  min {:>7.2}ms  max {:>7.2}ms",
+                        h.samples,
+                        h.p50_ns as f64 / 1e6,
+                        h.p99_ns as f64 / 1e6,
+                        h.total,
+                        h.mean_ns as f64 / 1e6,
+                        h.min_ns as f64 / 1e6,
+                        h.max_ns as f64 / 1e6
+                    );
+                }
+            }
+        }
+        let _ = writeln!(
+            o,
+            "  h1/h2 exclude the TCP round trip; h3 includes its equivalent. Do not compare them."
+        );
     }
 
     // ── verdict ──────────────────────────────────────────────────────────────
