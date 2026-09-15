@@ -1129,30 +1129,48 @@ pub struct ChannelSnapshot {
     /// of anything -- the same error as an aggregate that blends resumed and full
     /// handshakes, or the pre-2026-09-15 `/perf` aggregate.
     ///
-    /// `handshake_samples` is the count the percentiles were taken over. Zero
-    /// means no handshake has completed on this channel, which is not the same
-    /// as a handshake taking zero nanoseconds.
+    /// Split by whether the session was RESUMED, and never combined, for the same
+    /// reason the channels are never combined.
+    ///
+    /// A resumed handshake skips the certificate and the signature, so it is far
+    /// cheaper than a full one. Blending them produces a figure that moves when
+    /// the mix of returning and first-time visitors moves, while the cost of
+    /// either is unchanged. That is not a measurement of anything.
+    ///
+    /// This is not hypothetical here. rustls with the `std` feature defaults to a
+    /// 256-session in-memory store, so h1 and h2 resumption is already happening
+    /// in production, and h3 resumption became common once 0-RTT was enabled on
+    /// 2026-09-15.
+    ///
+    /// The ratio of the two `total` fields IS the resumption rate, so nothing is
+    /// lost by splitting: a reader who wants the mix can compute it, where a
+    /// reader given only a blend cannot recover the parts.
     #[serde(default)]
-    pub handshake_samples: usize,
+    pub handshake_full: HandshakeStats,
     #[serde(default)]
-    pub handshake_p50_ns: u64,
-    #[serde(default)]
-    pub handshake_p99_ns: u64,
-    /// Every handshake ever recorded on this channel, uncapped. Distinct from
-    /// `handshake_samples`, which is how many the percentiles came from and
-    /// saturates at the reservoir size. A node reporting `samples 512, total
-    /// 40119` has served 40,119 handshakes and describes the last 512.
-    #[serde(default)]
-    pub handshake_total: u64,
-    /// Lifetime mean, min and max. These survive the reservoir overwriting, so a
-    /// long-running node keeps its worst case rather than forgetting it as soon
-    /// as 512 further connections arrive.
-    #[serde(default)]
-    pub handshake_mean_ns: u64,
-    #[serde(default)]
-    pub handshake_min_ns: u64,
-    #[serde(default)]
-    pub handshake_max_ns: u64,
+    pub handshake_resumed: HandshakeStats,
+}
+
+/// Handshake durations for one channel and one resumption state.
+///
+/// `samples` is what the percentiles were taken over and saturates at the
+/// reservoir size. `total` is every handshake ever recorded and does not. A
+/// channel reporting `samples 1024, total 40119` has served 40,119 handshakes and
+/// its percentiles describe the last 1024; `mean`, `min` and `max` span all of
+/// them, so a long-running node keeps its worst case instead of forgetting it as
+/// soon as 1024 further connections arrive.
+///
+/// All zero means no handshake of this kind has completed, which is not the same
+/// as one taking zero nanoseconds. Check `total` before reading any of the rest.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HandshakeStats {
+    pub samples: usize,
+    pub p50_ns: u64,
+    pub p99_ns: u64,
+    pub total: u64,
+    pub mean_ns: u64,
+    pub min_ns: u64,
+    pub max_ns: u64,
 }
 
 /// A read-only view of the counters, for the health endpoint.
