@@ -1113,6 +1113,64 @@ pub struct ChannelSnapshot {
     pub miss_samples: usize,
     pub miss_p50_ns: u64,
     pub miss_p99_ns: u64,
+    /// Connection setup cost on this channel, and NOT comparable across
+    /// channels.
+    ///
+    /// For `http/1.1` and `http/2` this is the rustls handshake, timed from
+    /// `ServerConnection::new` to the point it stops handshaking. It EXCLUDES
+    /// the TCP round trip, which completed before rustls saw the socket.
+    ///
+    /// For `http/3` it is the QUIC handshake to `is_established()`, which
+    /// INCLUDES the equivalent of that round trip, because QUIC folds transport
+    /// and crypto setup together.
+    ///
+    /// They are reported per channel and never summed for that reason. A single
+    /// figure across all three would track the protocol mix rather than the cost
+    /// of anything -- the same error as an aggregate that blends resumed and full
+    /// handshakes, or the pre-2026-09-15 `/perf` aggregate.
+    ///
+    /// Split by whether the session was RESUMED, and never combined, for the same
+    /// reason the channels are never combined.
+    ///
+    /// A resumed handshake skips the certificate and the signature, so it is far
+    /// cheaper than a full one. Blending them produces a figure that moves when
+    /// the mix of returning and first-time visitors moves, while the cost of
+    /// either is unchanged. That is not a measurement of anything.
+    ///
+    /// This is not hypothetical here. rustls with the `std` feature defaults to a
+    /// 256-session in-memory store, so h1 and h2 resumption is already happening
+    /// in production, and h3 resumption became common once 0-RTT was enabled on
+    /// 2026-09-15.
+    ///
+    /// The ratio of the two `total` fields IS the resumption rate, so nothing is
+    /// lost by splitting: a reader who wants the mix can compute it, where a
+    /// reader given only a blend cannot recover the parts.
+    #[serde(default)]
+    pub handshake_full: HandshakeStats,
+    #[serde(default)]
+    pub handshake_resumed: HandshakeStats,
+}
+
+/// Handshake durations for one channel and one resumption state.
+///
+/// `samples` is what the percentiles were taken over and saturates at the
+/// reservoir size. `total` is every handshake ever recorded and does not. A
+/// channel reporting `samples 1024, total 40119` has served 40,119 handshakes and
+/// its percentiles describe the last 1024; `mean`, `min` and `max` span all of
+/// them, so a long-running node keeps its worst case instead of forgetting it as
+/// soon as 1024 further connections arrive.
+///
+/// All zero means no handshake of this kind has completed, which is not the same
+/// as one taking zero nanoseconds. Check `total` before reading any of the rest.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HandshakeStats {
+    pub samples: usize,
+    pub p50_ns: u64,
+    pub p99_ns: u64,
+    pub total: u64,
+    pub mean_ns: u64,
+    pub min_ns: u64,
+    pub max_ns: u64,
 }
 
 /// A read-only view of the counters, for the health endpoint.

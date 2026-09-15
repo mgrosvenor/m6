@@ -26,6 +26,27 @@ path = "src/bench_coldstart.rs"
 name = "bench-url-backend"
 path = "src/bench_url_backend_main.rs"
 
+# Three single-purpose handshake probes. One protocol each, one handshake per
+# connection, strictly sequential, no requests and no charts -- the minimum that
+# can check m6-http's own per-channel handshake figure on /perf against an
+# independent measurement taken by our own client.
+#
+# Separate binaries rather than one with a --proto flag: each is a dozen lines
+# over src/probe.rs, and the h3 figure spans a DIFFERENT thing from the other two
+# (QUIC includes the transport round trip, TLS does not). Three commands make that
+# hard to forget; one command with a flag invites averaging the output.
+[[bin]]
+name = "m6-probe-h1"
+path = "src/probe_h1_main.rs"
+
+[[bin]]
+name = "m6-probe-h2"
+path = "src/probe_h2_main.rs"
+
+[[bin]]
+name = "m6-probe-h3"
+path = "src/probe_h3_main.rs"
+
 [lib]
 name = "m6_http_lib"
 path = "src/lib.rs"

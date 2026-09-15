@@ -328,6 +328,7 @@ mod tests {
             perf_error: None,
             traffic: None,
             traffic_error: None,
+            header_checks: Vec::new(),
             rtt: Some(std::time::Duration::from_millis(3)),
             unreachable: None,
         }

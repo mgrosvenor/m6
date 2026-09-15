@@ -299,6 +299,223 @@ the number means nothing.
 
 ---
 
+## 5a. Connection setup, per channel, measured by our own clients
+
+Added 2026-09-15. Three new single-purpose binaries, `m6-probe-h1`,
+`m6-probe-h2` and `m6-probe-h3`, each doing one handshake per connection,
+strictly sequentially, with no requests and no charts. Source in
+`m6-http/src/probe.rs`. m6-http publishes the same measurement per channel on
+`/perf`, and the point of the probes is that the server's figure about itself is
+now checkable.
+
+### The figures
+
+On the build host's loopback, 200 sequential handshakes each, against the
+server's own report of the same connections:
+
+| channel | probe p50 | `/perf` p50 | `/perf` samples |
+|---|---|---|---|
+| http/1.1 | 0.381 ms | 0.425 ms | 200 of 200 |
+| http/2 | 0.353 ms | 0.423 ms | 270 (200 probe + 70 warmer) |
+| http/3 | 1.132 ms | 1.075 ms | 200 of 200 |
+
+The client figure sits just above the server's for h1 and h3 because the client
+times from its own first send and the server from receiving that packet.
+
+**h1 and h2 are the rustls handshake and EXCLUDE the TCP round trip**, because
+rustls is handed the socket after the three-way handshake finishes. **h3 is the
+QUIC handshake and INCLUDES its equivalent**, because QUIC folds transport and
+crypto together and there is no earlier point to start from. The two are not the
+same span and must never be averaged. A single "handshake p50" across all three
+would track the protocol mix, which is the error §4a fixed for the request
+latency aggregate.
+
+### Loopback makes h3 look slow, and that is an artefact
+
+On loopback h3 reads 1.1 ms against h2's 0.42 ms, because loopback has no round
+trip and so prices only CPU. Over a real path it inverts. From a laptop to the
+build host, 5.1 ms RTT measured by ping:
+
+| | real path, 5.1 ms RTT |
+|---|---|
+| h1 rustls handshake (excl. TCP connect) | 7.79 ms |
+| h2 rustls handshake (excl. TCP connect) | 6.14 ms |
+| h3 cold QUIC handshake | 12.2 ms |
+| **h3 0-RTT, first packet to response headers** | **6.0 - 6.7 ms** |
+
+h1 and h2 need a TCP round trip before any of that, so a returning visitor over
+h2 pays TCP, then TLS, then a request round trip: roughly 16 ms to a response
+where h3 with 0-RTT answers in 6.4 ms.
+
+**Never conclude anything about protocol choice from a loopback number.**
+
+### An extra round trip on every new h3 connection, and how it was misdiagnosed twice
+
+**Fixed 2026-09-15** by `cfg.set_max_amplification_factor(4)`, which is temporary
+and tracked as ledger item 0. Staging went from **12.5 ms to 6.8 ms**.
+
+A QUIC server may send only `factor x bytes received` before it has validated the
+client's address (RFC 9000 8.1, to stop it being used as a reflection amplifier).
+A client's opening Initial is padded to 1200 bytes, so at quiche's default factor
+of 3 the budget is 3600. Our handshake flight is 4082 bytes, nearly all
+certificate chain. `m6-probe-h3`'s timeline, against a 4.85 ms RTT:
+
+```
++0.741ms  client 1200B
++7.018ms  server 1200B   1.00x
++7.223ms  server 2400B   2.00x
++7.240ms  server 3600B   3.00x   <- stops dead, 482 bytes still owed
++12.221ms server 4082B           <- one full round trip later
+```
+
+At factor 4 the budget is 4800 and the whole flight goes out at once: the final
+datagram arrives 0.10-0.33 ms after the previous one instead of 4.98-6.28 ms.
+**Conformance is unchanged at 47/49** — h3spec does not test this limit, which was
+measured rather than assumed.
+
+#### This is the ordinary case, not something unusual about this deployment
+
+Worth stating plainly because the first two explanations written here assumed the
+opposite. [Fastly's study](https://www.fastly.com/blog/quic-handshake-tls-compression-certificates-extension-study)
+measured **40-44% of uncompressed chains** exceeding the budget, and certificate
+compression taking that to **1-9%**. [Other work](https://blog.apnic.net/2023/01/16/on-the-interplay-between-tls-certificates-and-quic-performance/)
+puts it at **61%** for a Firefox-sized 1352-byte Initial. Roughly half the QUIC
+internet pays this round trip.
+
+Measured chains, for scale. Ours is unremarkable and two are larger:
+
+| site | certs | chain bytes |
+|---|---|---|
+| this deployment | 4 | 3429 |
+| news.ycombinator.com | 4 | 3393 |
+| letsencrypt.org | 4 | 3576 |
+| cloudflare.com | 3 | 2552 |
+| github.com | 3 | 2718 |
+| www.google.com | 3 | 3755 |
+| www.mozilla.org | 3 | 4051 |
+
+Hacker News and letsencrypt.org carry the identical 4-certificate Let's Encrypt
+chain, byte for byte on the intermediates.
+
+#### Two wrong diagnoses, both of which produced a confident explanation
+
+Recorded because each was stated as fact and each had to be withdrawn.
+
+1. **"The chain is unusually long because it is on a new hierarchy."** Wrong. The
+   chain is a standard Let's Encrypt ECDSA chain that many sites use, and Google's
+   and Mozilla's are bigger. Withdrawn after measuring seven sites instead of
+   reasoning about one.
+
+2. **"The amplification limit is not involved, the ratio is only 1.62x."** Wrong,
+   and wrong in the more instructive way: 1.62x is the ratio at the END of the
+   handshake, by which time the client has sent its ACKs. The ratio at the instant
+   the server stopped was exactly 3.00x. A totals-only view cannot see this, which
+   is why the probe now prints a per-packet timeline with the live ratio.
+
+   This retraction was itself wrong, and diagnosis 1's replacement — "their chain
+   is smaller so they fit" — did not survive its own arithmetic either, since
+   Cloudflare sends 4198 bytes, which does not fit in 3600. What actually differs
+   is the factor each server runs at.
+
+A third hypothesis, **pacing**, was tested and killed rather than argued: quiche
+enables pacing by default and `flush_conn` discards `send_info.at`, so it looked
+like a strong candidate. Disabling pacing on staging changed the stall not at all.
+
+#### What other edges appear to run at
+
+Measured with `m6-probe-h3` on a 1200-byte client Initial. **Treat this as our
+measurement, not established fact**: byte accounting here counts QUIC payload, and
+no public source corroborates servers exceeding the limit.
+
+| edge | bytes sent before establishment | implied factor |
+|---|---|---|
+| m6 at quiche's default | 3600 then stops | 3.00x |
+| Cloudflare | 4198 in one flight | 3.50x |
+| Fastly (serving www.mozilla.org) | 5360 in one flight | 4.47x |
+
+#### The proper fix, measured
+
+Certificate compression (RFC 8879), tracked as issue #28. On our own chain:
+
+| | bytes |
+|---|---|
+| chain uncompressed | 3400 |
+| chain, zlib (RFC 8879 algorithm 1) | **2345** |
+| saving | **1055** |
+| needed to fit at factor 3 | 482 |
+| flight after compression | ~3027 |
+| margin under the 3600 budget | **573** |
+
+zlib alone is more than enough and is the weakest of the three algorithms. It has
+no compatibility cost, unlike trimming the chain: a client that does not advertise
+`compress_certificate` simply gets today's behaviour. Not reachable today — quiche
+binds 12 `SSL_CTX_*` functions and `SSL_CTX_add_cert_compression_alg` is not among
+them, though BoringSSL underneath implements it. When it lands, the factor
+override is deleted.
+
+rustls supports it for h1 and h2 behind its `brotli` and `zlib` features, neither
+of which this build enables. No round-trip win there, since TCP has no
+amplification limit, just fewer bytes.
+
+### 0-RTT
+
+Enabled 2026-09-15 (`cfg.enable_early_data()`), and it engages: verified on
+staging with `m6-probe-h3 --0rtt /`, which reports whether the request was on
+the wire before the handshake completed rather than inferring it from timing.
+
+0-RTT data is replayable, so `handle_h3_request` is deliberately stricter than
+RFC 8470's "idempotent methods" advice: in early data it serves **only a fresh
+cache hit** and answers 425 Too Early to everything else. A replayed cache read
+re-sends bytes and does nothing more. "GET is safe" would not have been enough,
+because this site's analytics beacon is a fire-and-forget GET, and a stale hit
+would queue a background refresh, which is a write. Both gates verified against
+staging: a cached path answers 200 in early data, an uncached one answers 425.
+
+### Reproducing
+
+```sh
+cargo build --release --bin m6-probe-h1 --bin m6-probe-h2 --bin m6-probe-h3
+./target/release/m6-probe-h1 --addr HOST:443 --n 200
+./target/release/m6-probe-h2 --addr HOST:443 --n 200
+./target/release/m6-probe-h3 --addr HOST:443 --n 200
+./target/release/m6-probe-h3 --addr HOST:443 --0rtt /
+./target/release/m6-probe-h3 --addr HOST:443 --0rtt /some-path --method POST
+```
+
+### Two measuring-tool defects found on the way, both of which produced numbers
+
+Recorded because in both cases the tool reported success and a plausible figure,
+which is worse than a tool that fails.
+
+1. **`m6-bench-detail` panicked before measuring anything.** m6-http builds
+   rustls with `default-features = false`, so no process-level CryptoProvider is
+   installed automatically, and the first `ClientConfig::builder()` panicked.
+   Every other binary in the crate installs it; this one did not. With our own
+   client broken, handshake timing was taken with `h3spec` instead -- a
+   conformance tester that deliberately opens stalled connections -- which
+   reported an **h3 handshake p50 of 113 ms on loopback** for an engine that
+   answers requests in microseconds. That figure was believed long enough to be
+   written down. The real figure is 1.1 ms.
+
+2. **The first version of `m6-probe-h1/h2` never completed a handshake.**
+   rustls' client reports `is_handshaking() == false` as soon as it has the
+   traffic keys, one step before the client Finished is flushed. The loop exited
+   on that condition and dropped the socket, so the server never received
+   Finished, sat handshaking until EOF, and recorded nothing. The probe reported
+   200 successes at a plausible 0.34 ms while the server completed zero. The 70
+   h2 samples the server did report turned out to be the cache warmer's curl
+   connections at startup, which very nearly got read as a server bug.
+
+A third defect, this one in m6-http itself and fixed here: the handshake was
+stamped about forty lines below the point where `advance_tls` returns an error,
+so a client that completed its handshake and closed immediately had the
+measurement thrown away. h1 recorded **0 of 200** such handshakes, and h2 kept
+only the ones the server reached before the close -- that is, the slow ones --
+giving a p50 of **6.14 ms against a true 0.42 ms**. A biased partial sample set
+is worse than none, because 6.14 ms looked plausible.
+
+---
+
 ## 6. What is still unmeasured
 
 Stated plainly, because a performance document that implies more coverage than
@@ -315,7 +532,9 @@ it has is how the next person gets misled.
   image requests and is why m6-file's pool was widened to 32, is the case to
   measure.
 - **No h2 or h3 conformance-side performance data.** h2spec and h3spec are
-  correctness gates, not timing.
+  correctness gates, not timing. h3spec in particular must NEVER be used as a
+  load generator for a timing measurement: it deliberately opens stalled and
+  malformed connections, and doing this produced the 113 ms figure in §5a.
 - **The 6 ms per page** quoted in the handover predates all of this and was
   measured on origin under unknown conditions. It should be re-measured after a
   deploy rather than carried forward.

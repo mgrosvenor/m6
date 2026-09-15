@@ -86,6 +86,55 @@ pub struct Fleet {
     /// How long to wait for one node before giving up on it.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
+    /// Response headers this deployment expects on particular paths.
+    ///
+    /// **Declared by the deployment, not by m6.** A cache policy is a property of
+    /// a site: `max-age=60, s-maxage=86400` is right for one page and wrong for
+    /// another, and m6 has no business knowing which. Hardcoding the strings here
+    /// would put one site's decisions inside a generic web system, which the
+    /// `no_file_names_one_particular_deployment` test exists to prevent, and would
+    /// drift from that site's config the first time it changed.
+    ///
+    /// Empty by default, so a fleet that declares none is checked for nothing and
+    /// the report says so rather than silently passing.
+    #[serde(default)]
+    pub header_check: Vec<HeaderCheck>,
+}
+
+/// One "this path must answer with this header" assertion.
+///
+/// The failure these catch is a response that is SERVED CORRECTLY and cached
+/// wrongly: a page that should be revalidated pinned for a day, or an immutable
+/// asset that is not, so a content change never reaches anyone. Both look
+/// perfectly healthy to a status-code check, which is why the fleet report needs
+/// its own.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct HeaderCheck {
+    /// Path to request, relative to the node's base URL.
+    pub path: String,
+    /// Header to read. Case-insensitive, as HTTP field names are.
+    pub header: String,
+    /// The value it must have, compared exactly after trimming.
+    pub expect: String,
+    /// Which roles to check this on. Empty means every node.
+    ///
+    /// An origin and a cache node do not always agree: the origin states the
+    /// policy and the edge may add to it. A check that is only meaningful on one
+    /// of them should say so rather than be written to pass on both.
+    #[serde(default)]
+    pub roles: Vec<String>,
+    /// Append a unique query string, so a cached copy cannot answer for a
+    /// backend that has stopped being able to produce one.
+    ///
+    /// On by default. `s-maxage=86400` means a stale entry keeps answering 200
+    /// for a day after the thing behind it broke, and a check that accepts that
+    /// answer is checking the cache rather than the site.
+    #[serde(default = "default_true")]
+    pub cache_bust: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_timeout_ms() -> u64 {
