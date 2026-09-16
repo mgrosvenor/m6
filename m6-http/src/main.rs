@@ -241,6 +241,80 @@ impl ServerState {
     }
 }
 
+/// Whether a route is worth warming. Split out so it can be tested without a
+/// ServerState: the queueing needs one, the decision does not.
+fn is_warmable(path: &str, cache: Option<&str>, error_path: Option<&str>) -> bool {
+    // A pattern is not a URL. `/assets/{*relpath}` has nothing to fetch.
+    if path.contains('{') {
+        return false;
+    }
+    // The error page. Refused on a public listener by design, and warming it would
+    // put a 404 body in the cache.
+    if error_path == Some(path) {
+        return false;
+    }
+    // Not cacheable, so the fetch is pure cost.
+    if cache.map(|c| c.trim() == "no-store").unwrap_or(false) {
+        return false;
+    }
+    true
+}
+
+/// Seed the background-fetch queue with this node's own warmable routes.
+///
+/// The server knows its route table, so it warms its own cache rather than having
+/// something outside it do so. This replaced `m6-warm-local`, a shell script a
+/// systemd unit ran on each node, which found the warmable routes by running a
+/// REGEX over the node's own site.toml. The parsed config is right here, so the
+/// selection is done properly:
+///
+///   - concrete paths only. A route like `/assets/{*relpath}` is a pattern, not a
+///     URL, and there is nothing to fetch.
+///   - not the configured error path. Requesting it is refused on a public
+///     listener by design, and warming it would fill the cache with a 404 body.
+///   - nothing a route marks `no-store`, because the answer is not cacheable and
+///     the fetch would be pure cost.
+///
+/// One entry per path per encoding, because the cache keys on encoding: warming
+/// only identity leaves a gzip visitor paying for the miss anyway.
+///
+/// Nothing here fetches. It queues, and the event loop drains one entry per
+/// iteration, which is why this cannot delay startup, block serving, or stampede
+/// the origin. It is the same queue that refreshes stale entries.
+fn seed_cache_warm(state: &mut ServerState) {
+    // Same three the shell script used. Identity is the empty string here because
+    // that is how the cache key spells "no content-encoding".
+    const ENCODINGS: [&str; 3] = ["", "gzip", "br"];
+
+    let error_path = match &state.error_mode {
+        ErrorMode::Custom { path } => Some(path.clone()),
+        _ => None,
+    };
+
+    let mut queued = 0usize;
+    let mut skipped = 0usize;
+    for route in &state.config.routes.clone() {
+        if !is_warmable(&route.path, route.cache.as_deref(), error_path.as_deref()) {
+            skipped += 1;
+            continue;
+        }
+        for enc in ENCODINGS {
+            state.queue_refresh(Refresh {
+                path: route.path.clone(),
+                query: None,
+                enc: enc.to_string(),
+            });
+            queued += 1;
+        }
+    }
+
+    info!(
+        queued,
+        skipped_routes = skipped,
+        "cache warm queued: this node warms itself, one fetch per route per encoding"
+    );
+}
+
 // ── Signal handling ───────────────────────────────────────────────────────────
 //
 // One mechanism, shared with every other m6 service: `m6-core` blocks the
@@ -4293,6 +4367,10 @@ fn run(args: Vec<String>) -> i32 {
         started: std::time::Instant::now(),
     };
 
+    if state.config.server.warm_on_start {
+        seed_cache_warm(&mut state);
+    }
+
     let code = event_loop(
         EventLoopIo {
             udp,
@@ -4334,6 +4412,7 @@ mod www_redirect_tests {
                 backend_timeout_secs: 30,
                 h2c_bind: None,
                 redirect_bind: None,
+                warm_on_start: false,
                 allowed_methods: vec!["GET".into(), "HEAD".into(), "POST".into()],
             },
             log: LogConfig::default(),
@@ -4915,5 +4994,52 @@ mod compresses_vary_tests {
             v.to_ascii_lowercase().contains("accept-language"),
             "the backend's own field was lost: {v:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod cache_warm_tests {
+    use super::is_warmable;
+
+    /// An ordinary cacheable page is warmed.
+    #[test]
+    fn a_plain_route_is_warmable() {
+        assert!(is_warmable("/", None, Some("/_errors")));
+        assert!(is_warmable(
+            "/capabilities",
+            Some("public, max-age=60"),
+            Some("/_errors")
+        ));
+    }
+
+    /// A pattern is not a URL. The shell version this replaced skipped these by
+    /// looking for a `{` in a regex match over site.toml; the parsed config makes it
+    /// the same decision on better evidence.
+    #[test]
+    fn a_pattern_is_not_a_url_and_is_not_warmed() {
+        assert!(!is_warmable("/assets/{*relpath}", None, None));
+        assert!(!is_warmable("/blog/{stem}", None, None));
+    }
+
+    /// Warming the error page would put a 404 body in the cache, and on a public
+    /// listener the request is refused anyway.
+    #[test]
+    fn the_error_page_is_not_warmed() {
+        assert!(!is_warmable("/_errors", None, Some("/_errors")));
+        // ...but a site that has not configured one has nothing to exclude, and a
+        // path that merely looks like an error page is still an ordinary route.
+        assert!(is_warmable("/_errors", None, None));
+    }
+
+    /// no-store means the answer cannot be cached, so the fetch is pure cost.
+    #[test]
+    fn a_no_store_route_is_not_warmed() {
+        assert!(!is_warmable("/contact", Some("no-store"), None));
+        assert!(
+            !is_warmable("/contact", Some("  no-store  "), None),
+            "whitespace"
+        );
+        // Any other policy is cacheable as far as this decision goes.
+        assert!(is_warmable("/contact", Some("private, max-age=0"), None));
     }
 }
