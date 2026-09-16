@@ -164,8 +164,7 @@ measure_one() {
       > "$WORK/render.log" 2>&1 &
     local pid=$!
     PIDS+=("$pid")
-    local i
-    for i in $(seq 1 100); do [[ -S "$sock" ]] && break; sleep 0.05; done
+    for _ in $(seq 1 100); do [[ -S "$sock" ]] && break; sleep 0.05; done
     if [[ ! -S "$sock" ]]; then
       fail "$key — m6-html never bound $sock. See $WORK/render.log"
       RESULT=1

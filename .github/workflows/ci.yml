@@ -131,6 +131,35 @@ jobs:
         with:
           command: check
 
+  shell:
+    name: shell scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # m6 carried `# shellcheck disable=` directives for months and nothing ever ran
+      # shellcheck, so the directives were decoration and the findings accumulated
+      # unseen. When first run on 2026-09-16 there were 2 errors and 14 warnings, and
+      # both errors were real: `for p in ${PIDS[@]:-}` in tools/conformance.sh, an
+      # unquoted array expansion in the path that kills the harness's own child
+      # processes, so an element containing whitespace would re-split and kill the
+      # wrong thing or nothing at all.
+      #
+      # Warning level, not style: style is 100+ findings of preference across this
+      # repo, and a gate that reports preference gets ignored, which is how the two
+      # real errors survived.
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          FAIL=0
+          COUNT=0
+          while IFS= read -r f; do
+            COUNT=$((COUNT + 1))
+            if ! shellcheck -S warning "$f"; then FAIL=1; fi
+          done < <(find . -name '*.sh' -not -path './target/*' -not -path './.git/*')
+          echo "checked $COUNT shell script(s)"
+          exit $FAIL
+
   examples:
     name: the examples build and work
     runs-on: ubuntu-latest
