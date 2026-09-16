@@ -72,8 +72,27 @@
 //! tuning loop. Gating it also means an anonymous scrape loop can never reach
 //! the sort.
 //!
-//! No version or build string is exposed by either endpoint, at any tier:
-//! that only tells a scanner which vulnerabilities are worth trying.
+//! **`/health` exposes no version or build string.** It is unauthenticated, and a
+//! version on a public URL tells a scanner which vulnerabilities are worth trying.
+//! That has not changed.
+//!
+//! `/perf` does report the release, from 2026-09-16. This reverses "no version at
+//! any tier", so the reasoning is recorded rather than left as a silent edit.
+//!
+//! The disclosure argument applies to an anonymous reader, and `/perf` has none:
+//! with no token configured it is a 404, and with one it is a 401 without the
+//! credential. An attacker holding the perf token already reads live latency
+//! percentiles and error counters, which is a far better tuning signal than a
+//! version string. So the marginal disclosure is small, and it is bounded by a
+//! secret we already treat as sensitive.
+//!
+//! Against that: with no version anywhere, "every node runs the release we think
+//! it does" was an invariant nothing could check without ssh, and on 2026-09-16
+//! four written records disagreed about this fleet while all three nodes served
+//! something none of them named. An operator cannot act on a fleet they cannot
+//! observe, and a silent version turned a deploy defect into four months of
+//! plausible-looking bookkeeping. The version goes behind the token, not on
+//! `/health`, which keeps the public surface exactly as it was.
 //!
 //! With no token configured `/perf` does not exist at all (404, not 401), so
 //! forgetting to configure it fails closed and does not advertise a door.
@@ -253,6 +272,28 @@ impl HealthReport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PerfReport {
     pub node: String,
+    /// The m6 release this node is running.
+    ///
+    /// Without this the only way to learn what a node runs is to ssh in and ask
+    /// the binary, so "every node runs the pinned release" was an invariant
+    /// nothing could check. On 2026-09-16 four written records disagreed about
+    /// this fleet and none of them matched it: the deployment repo's pin said
+    /// v1.2.0, its captured config said 1.2.0 with an md5 matching nothing
+    /// running, its release log named v1.1.0, and all three nodes were serving
+    /// 1.3.0. No node was faulty. Nothing could observe the truth, so the
+    /// records rotted without anyone being wrong on purpose.
+    ///
+    /// This is m6-core's own version, taken at compile time. For m6-http that is
+    /// the same number the binary reports, because the workspace shares one
+    /// version and core is a path dependency. For a service that links core from
+    /// git at a tag, it is that tag: "which m6 was this built against", which is
+    /// the more useful answer for a service whose own version means nothing here.
+    ///
+    /// `serde(default)` so a node older than this change deserialises to an empty
+    /// string instead of making the whole payload unparseable to an aggregator.
+    /// The monitor renders that as "too old to say" rather than as agreement.
+    #[serde(default)]
+    pub version: String,
     /// This process's uptime. `host.uptime_s` is the machine's, and the two
     /// differing is how a service restart is told apart from a reboot.
     pub uptime_s: u64,
@@ -325,6 +366,7 @@ impl PerfReport {
                 // anonymous caller never causes a /proc read either.
                 PerfOutcome::Ok(Box::new(PerfReport {
                     node: node.to_string(),
+                    version: env!("CARGO_PKG_VERSION").to_string(),
                     uptime_s,
                     pools,
                     url_backends,
@@ -536,6 +578,52 @@ mod tests {
         let (code, _, body) = out.into_response();
         assert_eq!(code, 404);
         assert!(!String::from_utf8_lossy(&body).contains("unauthorised"));
+    }
+
+    /// The version reaches the wire, and it is the crate's real version rather
+    /// than a placeholder. An aggregator cannot report drift it never receives.
+    #[test]
+    fn perf_reports_the_running_version() {
+        let out = PerfReport::build(
+            "sydney",
+            5,
+            vec![],
+            vec![],
+            Path::new("/"),
+            &auth("Bearer right"),
+            Some("right"),
+            snap,
+        );
+        let (code, _, body) = out.into_response();
+        assert_eq!(code, 200);
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["version"].as_str(), Some(env!("CARGO_PKG_VERSION")));
+        assert!(!v["version"].as_str().unwrap().is_empty());
+    }
+
+    /// A payload without the field still parses, because the fleet is upgraded one
+    /// node at a time and an aggregator that cannot read an older node learns
+    /// nothing about the node it most needs to ask about.
+    #[test]
+    fn a_perf_payload_without_a_version_still_parses() {
+        // A real payload with the field taken out, rather than a hand-written
+        // fixture: a fixture only proves the fixture parses, and the first attempt
+        // at one failed on unrelated required fields of StatsSnapshot.
+        let out = PerfReport::build(
+            "sydney",
+            5,
+            vec![],
+            vec![],
+            Path::new("/"),
+            &auth("Bearer right"),
+            Some("right"),
+            snap,
+        );
+        let (_, _, body) = out.into_response();
+        let mut v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(v.as_object_mut().unwrap().remove("version").is_some());
+        let p: PerfReport = serde_json::from_value(v).expect("older node must parse");
+        assert_eq!(p.version, "");
     }
 
     #[test]
