@@ -208,6 +208,16 @@ pub fn render(d: &Digest, readings: &[NodeReading]) -> String {
                 .unwrap_or_else(|| "-".into()),
             n.uptime_s.map(fmt_dur).unwrap_or_else(|| "-".into()),
         );
+        // The release each node runs, on the line with load and disk rather than
+        // in a section of its own: the question "is this node the one that is
+        // behind" is asked at the same moment as "is this node the busy one".
+        let _ = writeln!(
+            o,
+            "        m6 {}",
+            n.version
+                .as_deref()
+                .unwrap_or("unknown (node too old to report it)"),
+        );
     }
 
     // ── D. security ──────────────────────────────────────────────────────────
