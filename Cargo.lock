@@ -1786,7 +1786,7 @@ dependencies = [
 
 [[package]]
 name = "m6-auth"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "anyhow",
  "bcrypt",
@@ -1803,7 +1803,7 @@ dependencies = [
 
 [[package]]
 name = "m6-auth-cli"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "anyhow",
  "m6-auth",
@@ -1816,7 +1816,7 @@ dependencies = [
 
 [[package]]
 name = "m6-auth-server"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "anyhow",
  "hex",
@@ -1836,7 +1836,7 @@ dependencies = [
 
 [[package]]
 name = "m6-core"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1877,18 +1877,18 @@ dependencies = [
 
 [[package]]
 name = "m6-example-rust-m6core"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "m6-core",
 ]
 
 [[package]]
 name = "m6-example-rust-plain"
-version = "1.4.0"
+version = "1.5.0"
 
 [[package]]
 name = "m6-file"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "anyhow",
  "criterion",
@@ -1905,7 +1905,7 @@ dependencies = [
 
 [[package]]
 name = "m6-html"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "anyhow",
  "brotli 6.0.0",
@@ -1916,7 +1916,7 @@ dependencies = [
 
 [[package]]
 name = "m6-http"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "ahash 0.8.12",
  "anyhow",
@@ -1955,7 +1955,7 @@ dependencies = [
 
 [[package]]
 name = "m6-md"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "anyhow",
  "comrak",
@@ -1970,7 +1970,7 @@ dependencies = [
 
 [[package]]
 name = "m6-monitor"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "anyhow",
  "m6-core",
@@ -2291,7 +2291,7 @@ dependencies = [
 [[package]]
 name = "octets"
 version = "0.3.7"
-source = "git+https://github.com/mgrosvenor/quiche?rev=bdf00278#bdf0027852f0a8e2ec9970a55696f1cfe4a1d736"
+source = "git+https://github.com/mgrosvenor/quiche?rev=efff6235#efff6235e0d6970df97c37d0ac12e73a12323d28"
 
 [[package]]
 name = "once_cell"
@@ -2672,7 +2672,7 @@ dependencies = [
 [[package]]
 name = "quiche"
 version = "0.29.3"
-source = "git+https://github.com/mgrosvenor/quiche?rev=bdf00278#bdf0027852f0a8e2ec9970a55696f1cfe4a1d736"
+source = "git+https://github.com/mgrosvenor/quiche?rev=efff6235#efff6235e0d6970df97c37d0ac12e73a12323d28"
 dependencies = [
  "boring",
  "brotli 7.0.0",
