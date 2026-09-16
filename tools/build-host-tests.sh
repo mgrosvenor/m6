@@ -463,7 +463,7 @@ if [[ -n "$EXAMPLES" ]]; then
     egt=$(num_after EG_TEST_STATUS      "$EXAMPLES_LOG"); egt="${egt:-?}"
     egk=$(num_after EG_CONFIG_BAD       "$EXAMPLES_LOG"); egk="${egk:-?}"
     ege=$(num_after EG_CMS_STATUS       "$EXAMPLES_LOG"); ege="${ege:-?}"
-    read -r egpassed egfailed < \
+    read -r egpassed _ < \
         <(awk '/^test result:/{p+=$4; f+=$6} END{print p+0, f+0}' "$EXAMPLES_LOG")
     # NOT a `.*\([0-9][0-9]*\) passed` capture. The leading `.*` is greedy, so on
     # "98 passed" it swallowed the 9 and the group matched "8": the run reported

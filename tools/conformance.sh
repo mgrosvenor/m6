@@ -55,10 +55,12 @@ ROOT="$(cd "$HERE/.." && pwd)"
 SCORES="$HERE/conformance-scores.txt"
 WORK="${CONFORMANCE_WORK:-/tmp/m6-conformance}"
 TLS_PORT=10443
+# shellcheck disable=SC2034  # unused, but records the reserved port
 H2C_PORT=18080
 BRIDGE_BASE=18090
 AUTH_BRIDGE_PORT=18096
 REDIRECT_PORT=18081
+# shellcheck disable=SC2034  # unused, but records the reserved port
 EDGE_BRIDGE_PORT=18095
 
 UPDATE=false
@@ -84,9 +86,9 @@ cleanup() {
   # the config path: over ssh the command line contains that string too, so
   # pkill matches its own session and kills the connection. That has happened
   # three times in this project.
-  for p in ${PIDS[@]:-}; do kill "$p" 2>/dev/null || true; done
+  for p in ${PIDS[@]+"${PIDS[@]}"}; do kill "$p" 2>/dev/null || true; done
   sleep 0.3
-  for p in ${PIDS[@]:-}; do kill -9 "$p" 2>/dev/null || true; done
+  for p in ${PIDS[@]+"${PIDS[@]}"}; do kill -9 "$p" 2>/dev/null || true; done
 }
 trap cleanup EXIT
 
@@ -338,7 +340,7 @@ TOML
   M6_SOCKET_OVERRIDE="$sock" $SETSID nohup "$ROOT/target/release/m6-file" \
     "$site" "$site/configs/m6-file.conf" > "$WORK/edge-file.log" 2>&1 &
   local fpid=$!
-  PIDS+=($fpid)
+  PIDS+=("$fpid")
   for _ in $(seq 1 300); do [[ -S "$sock" ]] && break; sleep 0.02; done
   [[ -S "$sock" ]] || { fail "edge backend never created $sock"; RESULT=1; return 1; }
 
@@ -357,7 +359,7 @@ TOML
   M6_SOCKET_OVERRIDE="$hsock" $SETSID nohup "$ROOT/target/release/m6-html" \
     "$site" "$site/configs/m6-html.conf" > "$WORK/edge-html.log" 2>&1 &
   local hpid=$!
-  PIDS+=($hpid)
+  PIDS+=("$hpid")
   for _ in $(seq 1 300); do [[ -S "$hsock" ]] && break; sleep 0.02; done
   [[ -S "$hsock" ]] || { fail "edge renderer never created $hsock"; RESULT=1; return 1; }
 
@@ -365,7 +367,7 @@ TOML
   $SETSID nohup "$ROOT/target/release/m6-http" "$site" "$WORK/conf.toml" \
     > "$WORK/edge.log" 2>&1 &
   local pid=$!
-  PIDS+=($pid)
+  PIDS+=("$pid")
   wait_port_owned_by "$pid" "$TLS_PORT" "the loopback edge" || return 1
   # The backend pool is filled by a periodic rescan, so listening is not the
   # same as being able to serve.
@@ -399,13 +401,13 @@ TOML
   M6_SOCKET_OVERRIDE="$sock" $SETSID nohup "$ROOT/target/release/m6-auth-server" \
     "$site" "$site/m6-auth.conf" > "$WORK/auth.log" 2>&1 &
   local pid=$!
-  PIDS+=($pid)
+  PIDS+=("$pid")
   for _ in $(seq 1 300); do [[ -S "$sock" ]] && break; sleep 0.02; done
   [[ -S "$sock" ]] || { fail "m6-auth-server never created $sock"; RESULT=1; return 1; }
   require_free_port "$port" "the m6-auth-server bridge" || return 1
   $SETSID nohup python3 "$HERE/unix_bridge.py" "$port" "$sock" > "$WORK/auth-bridge.log" 2>&1 &
   local bpid=$!
-  PIDS+=($bpid)
+  PIDS+=("$bpid")
   wait_port_owned_by "$bpid" "$port" "the m6-auth-server bridge"
 }
 
@@ -434,7 +436,7 @@ TOML
   $SETSID nohup "$ROOT/target/release/m6-http" "$site" "$WORK/redirect.toml" \
     > "$WORK/redirect.log" 2>&1 &
   local pid=$!
-  PIDS+=($pid)
+  PIDS+=("$pid")
   wait_port_owned_by "$pid" "$REDIRECT_PORT" "the redirect listener"
 }
 
@@ -450,7 +452,7 @@ start_backend() {  # start_backend <name> <bridge-port> <site-dir> <config>
   require_free_port "$port" "the $name bridge" || return 1
   $SETSID nohup python3 "$HERE/unix_bridge.py" "$port" "$sock" > "$WORK/$name-bridge.log" 2>&1 &
   local bpid=$!
-  PIDS+=($bpid)
+  PIDS+=("$bpid")
   wait_port_owned_by "$bpid" "$port" "the $name bridge"
 }
 
