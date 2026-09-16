@@ -14,6 +14,44 @@ releases only; work happens on `develop`. See `CONTRIBUTING.md`.
 
 ## Unreleased
 
+## 1.7.0 — 2026-09-16
+
+### Fixed
+
+**Custom error pages work across a proxy hop.** 1.6.0 recorded this as a limitation;
+this fixes it.
+
+m6-http refused every external request to its configured `errors.path`, for a sound
+reason: the page is fetched with the status and the original path appended to its URL,
+so a public caller allowed to request it directly could supply its own and have a
+deployment's template render them.
+
+It refused a deployment's own cache nodes on the same rule. A cache node holds no
+content, so when a path matches nothing it fetches the error page from the origin over
+h2c on the private backbone. The origin refused it exactly like a stranger, the node
+fell back to m6-http's built-in page, and that is what visitors saw at the edge.
+
+**Every layer of config was correct.** Both site configs set `mode = "custom"`, both
+routed the error path to the HTML backend, and that backend returned 200 with the
+branded page when asked directly over its socket. The mechanism was configured,
+deployed and dead, which is worse than unsupported because it looks like it works. The
+origin looked healthy for an unrelated reason: a missing path there matches a route to
+the backend and never reaches the error machinery at all.
+
+The origin always had the information needed. `Iface::for_bind` classifies a private
+bind as internal, and the h2c listener is granted `ForwardedTrust::Backbone` on exactly
+that basis, its own comment reading "granted by the listener, never by a header". That
+fact simply never reached the decision. It does now, threaded to the handler and read
+only by this guard, so a public client still cannot claim it.
+
+The decision is a pure function rather than an inline condition, because no test drives
+an h2c listener end to end and this needed to be testable. Three tests cover it: a
+public request refused and an internal one allowed, ordinary paths untouched on either
+listener, and no firing at all when no custom page is configured.
+
+A deployment that worked around this by serving the same template at a second
+routable path no longer needs to.
+
 ## 1.6.0 — 2026-09-16
 
 ### Security
