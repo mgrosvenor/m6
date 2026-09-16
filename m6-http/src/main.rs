@@ -5005,7 +5005,11 @@ mod cache_warm_tests {
     #[test]
     fn a_plain_route_is_warmable() {
         assert!(is_warmable("/", None, Some("/_errors")));
-        assert!(is_warmable("/capabilities", Some("public, max-age=60"), Some("/_errors")));
+        assert!(is_warmable(
+            "/capabilities",
+            Some("public, max-age=60"),
+            Some("/_errors")
+        ));
     }
 
     /// A pattern is not a URL. The shell version this replaced skipped these by
@@ -5031,7 +5035,10 @@ mod cache_warm_tests {
     #[test]
     fn a_no_store_route_is_not_warmed() {
         assert!(!is_warmable("/contact", Some("no-store"), None));
-        assert!(!is_warmable("/contact", Some("  no-store  "), None), "whitespace");
+        assert!(
+            !is_warmable("/contact", Some("  no-store  "), None),
+            "whitespace"
+        );
         // Any other policy is cacheable as far as this decision goes.
         assert!(is_warmable("/contact", Some("private, max-age=0"), None));
     }
