@@ -74,7 +74,7 @@ path = "src/lib.rs"
 # 0.29 also dropped the vendored-BoringSSL build: no `boringssl-vendored` feature
 # and no cmake build step. The default feature is `boringssl-boring-crate`, so
 # BoringSSL comes in through the `boring` crate, which vendors its own.
-quiche         = { git = "https://github.com/mgrosvenor/quiche", rev = "bdf00278" }
+quiche         = { git = "https://github.com/mgrosvenor/quiche", rev = "efff6235" }
 matchit        = "0.8"
 serde          = { version = "1", features = ["derive"] }
 serde_json     = "1"
