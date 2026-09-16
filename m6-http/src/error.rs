@@ -136,6 +136,29 @@ pub fn internal_error_html(
     }
 }
 
+/// Whether a request to the configured custom error path must be refused.
+///
+/// The error page is fetched with the status and original path appended to its
+/// URL, so a public caller allowed to request it directly could supply its own
+/// and have a deployment's template render them. Refused, therefore, on a public
+/// listener.
+///
+/// It must NOT be refused on an internal one. A cache node of the same deployment
+/// fetches this page from the origin over h2c on the private backbone, and refusing
+/// it there broke custom error pages across a proxy hop completely: the edge asked,
+/// the origin refused it exactly like a stranger, and the edge served its built-in
+/// page instead. Every layer of config was correct and the mechanism was dead, which
+/// is worse than unsupported, because it looks configured.
+///
+/// `from_internal` comes from the listener's bind address and never from a header,
+/// so a public client cannot claim it.
+pub fn refuses_custom_error_path(mode: &ErrorMode, path: &str, from_internal: bool) -> bool {
+    match mode {
+        ErrorMode::Custom { path: error_path } => path == error_path && !from_internal,
+        _ => false,
+    }
+}
+
 /// Build a simple error response given mode and status.
 pub fn make_error_response(
     status: u16,
@@ -369,6 +392,54 @@ mod tests {
             s.len() > 200,
             "verbose body is no richer than the plain one"
         );
+    }
+
+    /// A public caller is refused the error path; one of our own nodes is not.
+    ///
+    /// This is the whole of issue #55. The origin already knew which listener a
+    /// request arrived on -- `Iface::for_bind` classifies a private bind as internal
+    /// and the h2c listener is granted `ForwardedTrust::Backbone` on that basis --
+    /// and the fact simply never reached this decision, so the origin refused its own
+    /// cache nodes and custom error pages could not cross a proxy hop.
+    #[test]
+    fn the_error_path_is_refused_publicly_and_allowed_internally() {
+        let mode = ErrorMode::Custom {
+            path: "/_errors".to_string(),
+        };
+        assert!(
+            refuses_custom_error_path(&mode, "/_errors", false),
+            "a public request to the error path must be refused"
+        );
+        assert!(
+            !refuses_custom_error_path(&mode, "/_errors", true),
+            "our own node over the backbone must be allowed the error page"
+        );
+    }
+
+    /// Any other path is none of this guard's business, on either listener.
+    #[test]
+    fn an_ordinary_path_is_never_refused_by_the_error_guard() {
+        let mode = ErrorMode::Custom {
+            path: "/_errors".to_string(),
+        };
+        for internal in [false, true] {
+            assert!(!refuses_custom_error_path(&mode, "/", internal));
+            assert!(!refuses_custom_error_path(
+                &mode,
+                "/_errors-not-quite",
+                internal
+            ));
+        }
+    }
+
+    /// With no custom page configured there is nothing to guard, including for a
+    /// path that happens to look like one.
+    #[test]
+    fn without_custom_mode_the_guard_never_fires() {
+        for mode in [ErrorMode::Internal, ErrorMode::Status] {
+            assert!(!refuses_custom_error_path(&mode, "/_errors", false));
+            assert!(!refuses_custom_error_path(&mode, "/_errors", true));
+        }
     }
 
     // ── Headers that survive an error-page substitution ──────────────────────
