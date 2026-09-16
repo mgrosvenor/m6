@@ -14,6 +14,53 @@ releases only; work happens on `develop`. See `CONTRIBUTING.md`.
 
 ## Unreleased
 
+## 1.6.0 — 2026-09-16
+
+### Security
+
+**The production error page no longer names the software serving it.**
+
+`internal_error_html` in non-verbose mode, which is what production uses, rendered:
+
+```html
+<body><h1>404 Not Found</h1><p>m6-http</p></body>
+```
+
+Verbose mode puts a description of the status in that paragraph, which is useful to a
+developer reading it. Production put the name of the server software there, which tells
+a visitor nothing and tells a scanner what is serving.
+
+Found on a live fleet, and only on part of it. An origin never shows this page, because
+a missing path there is routed to a backend that renders the site's own. A cache node
+has no route matching an arbitrary path, so this page answered every probe for
+`/.env`, `/wp-admin` and the rest, naming the software that refused them.
+
+**The existing test on this body passed throughout.** It asserted only what the body
+should contain and never what it should not, and a page can be right about the status
+and still say too much. Both halves are asserted now, across four statuses, plus a
+second test holding verbose mode to still carrying its detail so the fix cannot be made
+by gutting that instead.
+
+This is the generic default. A deployment that wants a branded page configures
+`[errors] mode = "custom"`; this is what answers when that is absent, or when its fetch
+fails, which is exactly the case where an origin is unreachable and an edge has nothing
+else to serve.
+
+### Note for anyone using custom error pages behind a cache
+
+m6-http refuses every external request to its own `errors.path`, correctly: a caller
+could otherwise supply its own `status` and `from` and have them rendered. It cannot,
+however, distinguish a spoofing stranger from a downstream cache node of the same
+deployment fetching the page it was told to fetch. **So `mode = "custom"` does not work
+across a proxy hop**: the edge asks, the origin refuses it like any stranger, and the
+edge falls back to this page.
+
+Nothing in m6 changes here, because the workaround is a deployment's to make: serve the
+same error template at a second, normally-routable path and point the edge's
+`errors.path` at that. Whether m6 should grant the backbone listener an exception is
+open; the trust concept already exists as `ForwardedTrust::Backbone`, but it is not
+threaded to where the refusal happens.
+
 ## 1.5.0 — 2026-09-16
 
 ### Fixed
