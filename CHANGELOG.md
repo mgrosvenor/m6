@@ -14,6 +14,91 @@ releases only; work happens on `develop`. See `CONTRIBUTING.md`.
 
 ## Unreleased
 
+## 1.5.0 — 2026-09-16
+
+### Fixed
+
+**1.4.0 made the HTTP/3 handshake slower on short paths than having no certificate
+compression at all.** This fixes it, and the defect is worth describing because the
+code looked obviously correct.
+
+BoringSSL calls a certificate compressor on **every full handshake**. A certificate
+chain does not change while the process runs, so the same bytes were recompressed per
+connection, and brotli at quality 11 is expensive:
+
+| | cost on a 3.4 KB chain |
+|---|---|
+| brotli q11 | **8.848 ms** |
+| brotli q9 | 2.104 ms |
+| brotli q4 | 1.113 ms |
+| zlib L9 | 0.137 ms |
+
+Quality 11 was chosen for the best ratio without anyone measuring what it cost. End to
+end, h3 handshake p50 against a 4.9 ms path:
+
+| | p50 | flight |
+|---|---|---|
+| no compression | 12.5 ms (2 RTT, the flight stalls on the 3600-byte budget) | 4081 B |
+| zlib | 7.0 ms | 2962 B |
+| brotli q11, per handshake (1.4.0) | **14.6 ms** | 2859 B |
+| **brotli q11, cached (1.5.0)** | **6.8 ms** | 2858 B |
+
+A kilobyte saved is worth nothing against ten milliseconds of CPU.
+
+**On the long paths this was invisible.** London at 308 ms and Chicago at 211 ms both
+measured 1.00 and 1.05 round trips after the 1.4.0 deploy, because a round trip hides
+ten milliseconds completely. Sydney serves its own city over a 5 ms path from a
+single-core VM, and there it was the whole cost: 9.5 ms under 1.3.0, 14.6 ms under
+1.4.0. It was found by measuring production after the rollout, not by any gate.
+Neither CI nor conformance measures handshake CPU on a short path.
+
+The compressed chain is now cached for the life of the process, keyed by the
+uncompressed bytes so a collision cannot serve one host's chain in place of another's,
+bounded at 8 entries, and a failure is not cached so a transient one does not persist.
+The compressor runs outside the lock: holding a lock across an 8 ms compression would
+serialise every concurrent handshake behind it. Quality 11 is kept, because the cache
+makes it a one-off per chain and the ratio is the reason to prefer brotli at all.
+
+### Changed
+
+**`/perf` reports the running release, and m6-monitor flags fleet drift.**
+
+`/perf` published node, uptime, pools, backends, metrics and host, and no version, so
+the only way to learn what a node was running was to ssh in and ask the binary. "Every
+node runs the release we think it does" was an invariant nothing could check remotely.
+
+On 2026-09-16 four written records disagreed about the deployment fleet and none of
+them matched it: the deployment repository's m6 pin said v1.2.0, its captured config
+said 1.2.0 with an md5 matching nothing running, its release log named v1.1.0 as the
+newest deploy, and all three nodes were serving 1.3.0 with an identical md5. No node
+was faulty. Nothing could observe the truth, so the records rotted quietly.
+
+The monitor now prints the version per node and raises a warning when the reporting
+nodes disagree, naming each. **A node that cannot report its version counts as drift,
+not as agreement**: two nodes agreeing while a third is silent is not a uniform fleet,
+it is an unknown one, and calling it uniform is the failure this exists to remove.
+
+The field is `serde(default)`, so a node older than this change deserialises to an
+empty string instead of making the payload unparseable, and renders as "unknown (node
+too old to report it)". The fleet is upgraded one node at a time, and an aggregator
+that cannot read an older node learns nothing about the node it most needs to ask
+about.
+
+**This reverses a documented decision.** `monitoring.rs` said "No version or build
+string is exposed by either endpoint, at any tier: that only tells a scanner which
+vulnerabilities are worth trying." That argument is about an anonymous reader, and
+`/perf` has none: with no token configured it is a 404, and with one it is a 401
+without the credential. Anyone holding the perf token already reads live latency
+percentiles and error counters, which is a far better attack signal than a version
+string. `/health` is unauthenticated and still exposes nothing, so the public surface
+is unchanged. The reasoning is recorded in the module docs, not only in a commit.
+
+### Note
+
+The quiche fork is at `efff6235` on branch `m6-cert-compression`. Its own suite passes
+at 1126 + 45 tests, zero warnings and clippy silent in both the default and
+`cert-compression-zstd` configurations.
+
 ## 1.4.0 — 2026-09-16
 
 ### Performance
