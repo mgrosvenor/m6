@@ -103,6 +103,61 @@ echo -e "${YELLOW}----${RESET} Pushing $TAG..."
 # stops a tag being pushed by hand without going through this script.
 M6_RELEASE=1 git push origin "$TAG"
 
+# ── Publish the GitHub release ────────────────────────────────────────────────
+#
+# A tag is not a release. This script used to stop at the push and then print a
+# `releases/tag/$TAG` URL, which renders a page for a bare tag and so looked exactly
+# like a published release. It was not one: on 2026-09-16, v1.1.0, v1.2.0, v1.3.0 and
+# v1.4.0 were all tags with no release behind them, and only v1.0.0 had ever been
+# published. Four releases went out with that step silently skipped because the
+# script's own output implied it had happened.
+#
+# The rollout depends on this. The owner's procedure is: m6 is tagged AND given a
+# proper GitHub release, then the pin in the deployment repository is bumped, then all
+# binaries are force rebuilt from there. A missing release breaks the first step of the
+# only permitted path to production.
+#
+# Notes come from the CHANGELOG section this script has already checked exists, so the
+# release says the same thing as the repository rather than a summary written twice.
+NOTES="$(mktemp)"
+trap 'rm -f "$NOTES"' EXIT
+awk -v ver="$VERSION" '
+    $0 ~ "^## +\\[?" ver {found = 1; next}
+    found && /^## / {exit}
+    found {print}
+' "$SCRIPT_DIR/CHANGELOG.md" > "$NOTES"
+
+if [[ ! -s "$NOTES" ]]; then
+  echo -e "${RED}ERROR${RESET}: could not extract $VERSION's notes from CHANGELOG.md."
+  echo "  The tag is pushed. Publish the release by hand before deploying:"
+  echo "    gh release create $TAG --title \"$TAG\" --notes-file <notes>"
+  exit 1
+fi
+
+if ! command -v gh >/dev/null 2>&1; then
+  echo -e "${RED}ERROR${RESET}: gh is not installed, so the release cannot be published."
+  echo "  The tag is pushed but there is NO release, and the rollout needs one."
+  echo "  Publish it, then bump the pin in the deployment repository:"
+  echo "    gh release create $TAG --title \"$TAG\" --notes-file <CHANGELOG section>"
+  exit 1
+fi
+
+echo -e "${YELLOW}----${RESET} Publishing the GitHub release..."
+if ! gh release create "$TAG" --title "$TAG" --notes-file "$NOTES" --verify-tag; then
+  echo -e "${RED}ERROR${RESET}: the tag is pushed but the release was NOT published."
+  echo "  Do not deploy until it is: the rollout starts from a released tag."
+  exit 1
+fi
+
 echo ""
-echo -e "${GREEN}Released $TAG.${RESET}"
+echo -e "${GREEN}Released $TAG, tag and GitHub release.${RESET}"
 echo "  https://github.com/mgrosvenor/m6/releases/tag/$TAG"
+echo ""
+# Deliberately NOT naming a deployment here. m6 is a generic web system and
+# m6-core's generic_system test fails when one particular deployment's identity
+# appears anywhere in the repository. The first version of these lines named one and
+# the test caught it, which is the test working.
+echo "This tag is not deployed anywhere yet. A deployment moves to it by:"
+echo "  1. bumping its own m6 pin to $TAG"
+echo "  2. merging that"
+echo "  3. rebuilding every binary from the deployment repository at the new pin"
