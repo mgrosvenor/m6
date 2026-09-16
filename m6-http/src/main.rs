@@ -841,7 +841,9 @@ fn event_loop(
                         );
                     } // end cache hit
 
-                    let mut outcome = handle_request(req, client_ip, enc_str, state, false);
+                    let mut outcome = handle_request(
+                        req, client_ip, enc_str, state, false, /* from_internal */ false,
+                    );
                     if let RequestOutcome::Ready(status, ref mut headers, _, ref backend, _) =
                         outcome
                     {
@@ -1135,7 +1137,14 @@ fn event_loop(
                         );
                     } // end cache hit
 
-                    let mut outcome = handle_request(req, client_ip, enc_str, state, false);
+                    let mut outcome = handle_request(
+                        req,
+                        client_ip,
+                        enc_str,
+                        state,
+                        false,
+                        state.h2c_iface == Iface::Internal,
+                    );
                     if let RequestOutcome::Ready(status, ref mut headers, _, ref backend, _) =
                         outcome
                     {
@@ -1321,7 +1330,14 @@ fn event_loop(
             // the set still needing work.
             if state.cache.get(lk).is_none() {
                 let synth = synth_refresh_request(&r);
-                match handle_request(&synth, "127.0.0.1", &r.enc, state, true) {
+                match handle_request(
+                    &synth,
+                    "127.0.0.1",
+                    &r.enc,
+                    state,
+                    true,
+                    /* from_internal */ false,
+                ) {
                     // Socket backend: already completed and inserted inline.
                     RequestOutcome::Ready(..) => {
                         debug!(path = %r.path, enc = %r.enc, "background fetch: cache filled");
@@ -1994,7 +2010,9 @@ fn handle_h3_request(
         body: req.body,
     };
 
-    match handle_request(&http_req, &client_ip, enc_str, state, false) {
+    match handle_request(
+        &http_req, &client_ip, enc_str, state, false, /* from_internal */ false,
+    ) {
         RequestOutcome::Ready(status, mut resp_headers, body, backend_name, hints) => {
             // Add Link: preload headers to the response (fallback for proxies/CDNs).
             for url in hints.iter() {
@@ -2292,9 +2310,17 @@ fn handle_request(
     content_encoding: &str,
     state: &mut ServerState,
     is_prefetch: bool,
+    from_internal: bool,
 ) -> RequestOutcome {
     let describedby = state.config.site.describedby.clone();
-    let mut outcome = handle_request_inner(req, client_ip, content_encoding, state, is_prefetch);
+    let mut outcome = handle_request_inner(
+        req,
+        client_ip,
+        content_encoding,
+        state,
+        is_prefetch,
+        from_internal,
+    );
     if let RequestOutcome::Ready(status, ref mut headers, _, ref backend, _) = outcome {
         let compresses = state.config.backend_compresses(backend);
         set_vary_accept_encoding(headers, compresses);
@@ -2331,6 +2357,11 @@ fn handle_request_inner(
     content_encoding: &str,
     state: &mut ServerState,
     is_prefetch: bool,
+    // True when this request arrived on a listener bound to a private address,
+    // meaning one of our own nodes over the backbone rather than a public client.
+    // Granted by the listener, never by a header, so a public client cannot claim
+    // it. Only the error-path guard reads it.
+    from_internal: bool,
 ) -> RequestOutcome {
     // Prefetch requests are synthetic (no real client, client_ip is a
     // placeholder) and their response is discarded by the caller — logging
@@ -2543,11 +2574,20 @@ fn handle_request_inner(
     // to the backend with client-controlled query params instead, letting
     // any caller spoof an arbitrary status/from pair. Refuse it exactly like
     // any other route miss.
-    if let ErrorMode::Custom { path: error_path } = &state.error_mode {
-        if req.path == *error_path {
-            let (s, h, b, n) = apply_error_mode(404, req, client_ip, state, None);
-            return RequestOutcome::Ready(s, h, b, n, std::sync::Arc::new(vec![]));
-        }
+    //
+    // UNLESS it arrived on an internal listener. A cache node of this deployment
+    // fetches the error page from the origin over h2c on the WireGuard backbone,
+    // and refusing it there broke custom error pages across a proxy hop entirely:
+    // the edge asked, the origin refused it exactly like a stranger, and the edge
+    // fell back to the built-in page. Every config was correct and the mechanism
+    // was dead, which is worse than unsupported because it looks configured.
+    //
+    // `from_internal` is granted by the listener's bind address, never by a header,
+    // so a public client cannot claim it -- the same rule that decides whether a
+    // forwarded client address is trusted on that listener.
+    if error::refuses_custom_error_path(&state.error_mode, &req.path, from_internal) {
+        let (s, h, b, n) = apply_error_mode(404, req, client_ip, state, None);
+        return RequestOutcome::Ready(s, h, b, n, std::sync::Arc::new(vec![]));
     }
 
     // Route lookup
