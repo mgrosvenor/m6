@@ -121,9 +121,16 @@ pub fn internal_error_html(
         )
         .into_bytes()
     } else {
+        // The status and nothing else. This used to print "m6-http" here, which
+        // told a visitor nothing and told a scanner what was serving: on a fleet
+        // where the origin routes unknown paths to an HTML backend and the cache
+        // nodes do not, every probe for /.env at an edge was answered with the
+        // name of the software that refused it. A production error page should
+        // not identify its implementation. Verbose mode still carries detail,
+        // because that is for a developer reading it, not a stranger.
         format!(
             "<!DOCTYPE html><html><head><title>{status} {reason}</title></head>\
-            <body><h1>{status} {reason}</h1><p>m6-http</p></body></html>"
+            <body><h1>{status} {reason}</h1></body></html>"
         )
         .into_bytes()
     }
@@ -324,6 +331,44 @@ mod tests {
         assert!(s.contains("503"));
         assert!(s.contains("Service Unavailable"));
         assert!(s.starts_with("<!DOCTYPE html>"));
+    }
+
+    /// A production error page must not name the software serving it.
+    ///
+    /// The body used to be `<h1>404 Not Found</h1><p>m6-http</p>`. Harmless on an
+    /// origin, where a missing path is usually routed to a backend that renders the
+    /// site's own page, and a disclosure on a cache node, where nothing matches an
+    /// arbitrary path and this page is what answers every probe for /.env.
+    ///
+    /// The test above passed throughout, because it asserted only what the body
+    /// SHOULD contain and never what it should not. That is the gap this closes: a
+    /// page can be correct about the status and still say too much.
+    #[test]
+    fn a_production_error_page_does_not_name_the_software() {
+        for status in [400u16, 404, 500, 503] {
+            let html = internal_error_html(status, status_reason(status), false, "/x", None);
+            let s = std::str::from_utf8(&html).unwrap();
+            assert!(s.contains(&status.to_string()), "{status}: lost the status");
+            assert!(
+                !s.to_lowercase().contains("m6"),
+                "{status} error page names the software: {s}"
+            );
+        }
+    }
+
+    /// Verbose mode is for a developer reading it, so it keeps its detail. It is
+    /// documented as dev-only and defaults to off.
+    #[test]
+    fn verbose_mode_still_explains_the_status() {
+        let html = internal_error_html(503, "Service Unavailable", true, "/x", None);
+        let s = std::str::from_utf8(&html).unwrap();
+        assert!(s.contains("503"));
+        // Something more than the bare status: the verbose body carries a
+        // description and a debug table.
+        assert!(
+            s.len() > 200,
+            "verbose body is no richer than the plain one"
+        );
     }
 
     // ── Headers that survive an error-page substitution ──────────────────────
