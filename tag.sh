@@ -153,7 +153,11 @@ echo ""
 echo -e "${GREEN}Released $TAG, tag and GitHub release.${RESET}"
 echo "  https://github.com/mgrosvenor/m6/releases/tag/$TAG"
 echo ""
-echo "Next, and this is the only path to production:"
-echo "  1. bump m6-core's tag to $TAG in dr-grosvenor-site/Cargo.toml"
-echo "  2. merge it"
-echo "  3. force rebuild every binary from there: deploy/build.sh"
+# Deliberately NOT naming a deployment here. m6 is a generic web system and
+# m6-core's generic_system test fails when one particular deployment's identity
+# appears anywhere in the repository. The first version of these lines named one and
+# the test caught it, which is the test working.
+echo "This tag is not deployed anywhere yet. A deployment moves to it by:"
+echo "  1. bumping its own m6 pin to $TAG"
+echo "  2. merging that"
+echo "  3. rebuilding every binary from the deployment repository at the new pin"
