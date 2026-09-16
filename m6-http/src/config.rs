@@ -96,6 +96,29 @@ pub struct ServerConfig {
     /// cache, so `tls_cert`/`tls_key` may point nowhere.
     #[serde(default)]
     pub redirect_bind: Option<String>,
+    /// Warm this node's own cache when it starts.
+    ///
+    /// The server knows its route table, so it can fill its own cache instead of
+    /// something outside it doing so. On a cache node that means one fetch per
+    /// warmable route per encoding from the origin at startup, after the listeners
+    /// are up, so the first real visitor to each page gets a hit rather than paying
+    /// for the miss.
+    ///
+    /// This replaced a shell script that a systemd unit ran on each node
+    /// (`m6-warm-local`), which parsed the node's own site.toml **with a regex** to
+    /// find the warmable routes. The server has the parsed config, so it selects
+    /// them properly: concrete paths only, skipping the configured error path and
+    /// anything a route marks `no-store`.
+    ///
+    /// Off by default. A server should not do network I/O at boot unless asked: on a
+    /// cache node this reaches across the backbone to the origin, and a fleet
+    /// restarting together would all reach at once.
+    ///
+    /// Warming rides the existing background-fetch queue, which drains one entry per
+    /// event-loop iteration. So it cannot delay startup, cannot block serving, and
+    /// cannot stampede: it is the same mechanism that refreshes stale entries.
+    #[serde(default)]
+    pub warm_on_start: bool,
     /// Request methods this server will serve. Anything else is answered 405
     /// with an `Allow` header, before routing, cache lookup or backend
     /// dispatch.
@@ -605,6 +628,7 @@ struct RawSiteSection {
 #[derive(Debug, Deserialize)]
 struct RawServerSection {
     bind: Option<String>,
+    warm_on_start: Option<bool>,
     tls_cert: Option<String>,
     tls_key: Option<String>,
     backend_timeout_secs: Option<u64>,
@@ -645,6 +669,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
     // site.toml [server] provides base values, system config [server] overrides.
     let site_server = site_parsed.server.unwrap_or(RawServerSection {
         bind: None,
+        warm_on_start: None,
         tls_cert: None,
         tls_key: None,
         backend_timeout_secs: None,
@@ -654,6 +679,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
     });
     let sys_server = system_parsed.server.unwrap_or(RawServerSection {
         bind: None,
+        warm_on_start: None,
         tls_cert: None,
         tls_key: None,
         backend_timeout_secs: None,
@@ -664,6 +690,13 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
 
     // Resolved before `bind`, because in redirect mode it supplies the default.
     let redirect_bind = sys_server.redirect_bind.or(site_server.redirect_bind);
+    // Same precedence as every other server field: the system config wins, because
+    // warming is a property of the node, not of the site it serves. A cache node
+    // wants it; a laptop running the site locally does not.
+    let warm_on_start = sys_server
+        .warm_on_start
+        .or(site_server.warm_on_start)
+        .unwrap_or(false);
 
     // A redirector binds `redirect_bind` and nothing else, so requiring a
     // separate `bind` there would mean every redirect config carried the same
@@ -731,6 +764,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
             .map(|p| p.to_string_lossy().into_owned()),
         backend_timeout_secs,
         h2c_bind,
+        warm_on_start,
         redirect_bind: redirect_bind.clone(),
         // Uppercased once at load so the hot-path check is a plain comparison
         // rather than a case-insensitive one per request.
