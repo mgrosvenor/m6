@@ -41,15 +41,13 @@ URL_H2S_PID=""
 # Extract flags we forward to m6-bench; discard protocol/suite filters
 # (bench.sh controls those itself).
 BENCH_PASS=("--skip-verify")   # bench uses a self-signed cert; TLS validity is not the test
-SKIP_VERIFY=1
 i=0
 args=("$@")
 while [[ $i -lt ${#args[@]} ]]; do
     arg="${args[$i]}"
     case "$arg" in
         --skip-verify)
-            BENCH_PASS+=("--skip-verify")
-            SKIP_VERIFY=1
+            # Already in BENCH_PASS above; accepted so the flag is not an error.
             ;;
         --latency-n|--duration|--concurrency|--p99-limit-us|--rps-min|--addr)
             BENCH_PASS+=("$arg" "${args[$((i+1))]}")
