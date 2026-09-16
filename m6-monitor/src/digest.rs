@@ -70,6 +70,11 @@ pub struct NodeDigest {
     /// relabelled.
     pub reported_node: Option<String>,
     pub rtt_ms: Option<f64>,
+    /// The m6 release the node is running, from `/perf`. `None` when the node
+    /// predates the field, which reads as "cannot say" and never as agreement:
+    /// a fleet where one node is silent about its version is exactly the case the
+    /// drift check must not call uniform.
+    pub version: Option<String>,
     pub uptime_s: Option<u64>,
     pub host_uptime_s: Option<u64>,
     pub requests_total: Option<u64>,
@@ -114,6 +119,7 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
             status: r.status().to_string(),
             reported_node: r.health.as_ref().map(|h| h.node.clone()),
             rtt_ms: r.rtt.map(|d| d.as_secs_f64() * 1000.0),
+            version: None,
             uptime_s: None,
             host_uptime_s: None,
             requests_total: None,
@@ -156,6 +162,13 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
         }
 
         if let Some(p) = &r.perf {
+            // Empty rather than absent on a node older than the field, so it is
+            // reported as unknown instead of as an empty version string.
+            d.version = if p.version.is_empty() {
+                None
+            } else {
+                Some(p.version.clone())
+            };
             d.uptime_s = Some(p.uptime_s);
             d.requests_total = Some(p.metrics.requests_total);
             d.backend_errors = Some(p.metrics.backend_errors_total);
@@ -310,6 +323,48 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
         nodes.push(d);
     }
 
+    // ── the fleet runs one release, or it does not ───────────────────────────
+    //
+    // A per-node version is only half the answer. The question an operator has is
+    // "is this fleet uniform", and answering it per node means comparing three
+    // lines by eye and being right every time.
+    //
+    // Drift here is not cosmetic. It means requests are being served by different
+    // code depending on which region answered, so a defect reproduces in one
+    // region and not another, and a measurement means different things per node.
+    // On 2026-09-10 this fleet ran three distinct m6-http binaries for about
+    // twenty minutes and it was not noticed, because nothing compared them.
+    //
+    // A node that cannot say counts as drift rather than as agreement: two nodes
+    // agreeing while the third is silent is not a uniform fleet, it is an unknown
+    // one, and reporting it as uniform is the failure mode this whole change
+    // exists to remove.
+    // uptime_s is set exactly when /perf was read, so it is the marker for "this
+    // node answered" without needing a second flag that could disagree with it.
+    let reporting: Vec<&NodeDigest> = nodes.iter().filter(|n| n.uptime_s.is_some()).collect();
+    if reporting.len() > 1 {
+        let mut seen: Vec<&str> = reporting
+            .iter()
+            .map(|n| n.version.as_deref().unwrap_or("unknown"))
+            .collect();
+        seen.sort_unstable();
+        seen.dedup();
+        if seen.len() > 1 {
+            let detail = reporting
+                .iter()
+                .map(|n| format!("{} {}", n.name, n.version.as_deref().unwrap_or("unknown")))
+                .collect::<Vec<_>>()
+                .join(", ");
+            findings.push(Finding {
+                level: Level::Warn,
+                node: "fleet".to_string(),
+                text: format!(
+                    "m6 version drift across the fleet: {detail}.                      Requests are served by different code depending on the region."
+                ),
+            });
+        }
+    }
+
     findings.sort_by_key(|f| std::cmp::Reverse(f.level));
     let level = findings.iter().map(|f| f.level).max().unwrap_or(Level::Ok);
     Digest {
@@ -331,6 +386,7 @@ mod tests {
     fn perf(host: HostSnapshot, pools: Vec<PoolHealth>) -> PerfReport {
         PerfReport {
             node: "sydney".into(),
+            version: "1.4.0".into(),
             uptime_s: 100,
             pools,
             url_backends: vec![],
@@ -361,6 +417,106 @@ mod tests {
 
     fn now() -> String {
         "2026-09-11T07:00:00Z".to_string()
+    }
+
+    /// A host snapshot with nothing interesting in it, for tests about other things.
+    fn plain_host() -> HostSnapshot {
+        HostSnapshot {
+            cpus: 1,
+            uptime_s: Some(1000),
+            ..Default::default()
+        }
+    }
+
+    fn perf_at(version: &str) -> PerfReport {
+        let mut p = perf(plain_host(), vec![]);
+        p.version = version.into();
+        p
+    }
+
+    /// Two nodes on different releases is a warning, and it names both.
+    ///
+    /// On 2026-09-10 this fleet ran three distinct m6-http binaries for twenty
+    /// minutes without anyone noticing, because nothing compared them.
+    #[test]
+    fn version_drift_across_the_fleet_is_reported() {
+        let d = build(
+            &[
+                reading("origin", "ok", Some(perf_at("1.4.0"))),
+                reading("edge-a", "ok", Some(perf_at("1.3.0"))),
+            ],
+            &Thresholds::default(),
+            now(),
+        );
+        let drift: Vec<_> = d
+            .findings
+            .iter()
+            .filter(|f| f.text.contains("version drift"))
+            .collect();
+        assert_eq!(drift.len(), 1, "{:?}", d.findings);
+        assert_eq!(drift[0].level, Level::Warn);
+        assert!(drift[0].text.contains("origin 1.4.0"), "{}", drift[0].text);
+        assert!(drift[0].text.contains("edge-a 1.3.0"), "{}", drift[0].text);
+    }
+
+    /// A uniform fleet says nothing, which is the whole point of the check being
+    /// quiet when there is nothing to say.
+    #[test]
+    fn a_uniform_fleet_reports_no_drift() {
+        let d = build(
+            &[
+                reading("origin", "ok", Some(perf_at("1.4.0"))),
+                reading("edge-a", "ok", Some(perf_at("1.4.0"))),
+            ],
+            &Thresholds::default(),
+            now(),
+        );
+        assert!(
+            !d.findings.iter().any(|f| f.text.contains("version drift")),
+            "{:?}",
+            d.findings
+        );
+    }
+
+    /// A node that cannot say its version counts as drift, not as agreement.
+    ///
+    /// This is the case the change exists for: reporting "uniform" because the
+    /// silent node was skipped is worse than reporting nothing, because it is a
+    /// claim rather than a gap.
+    #[test]
+    fn a_node_that_cannot_report_its_version_is_not_agreement() {
+        let d = build(
+            &[
+                reading("origin", "ok", Some(perf_at("1.4.0"))),
+                // Empty version: a node older than the field.
+                reading("edge-a", "ok", Some(perf_at(""))),
+            ],
+            &Thresholds::default(),
+            now(),
+        );
+        let drift: Vec<_> = d
+            .findings
+            .iter()
+            .filter(|f| f.text.contains("version drift"))
+            .collect();
+        assert_eq!(drift.len(), 1, "{:?}", d.findings);
+        assert!(drift[0].text.contains("edge-a unknown"), "{}", drift[0].text);
+    }
+
+    /// One node cannot drift from itself. A single-node fleet on an unknown
+    /// version is not a drift finding, it is simply a fleet of one.
+    #[test]
+    fn a_single_node_never_drifts() {
+        let d = build(
+            &[reading("origin", "ok", Some(perf_at("")))],
+            &Thresholds::default(),
+            now(),
+        );
+        assert!(
+            !d.findings.iter().any(|f| f.text.contains("version drift")),
+            "{:?}",
+            d.findings
+        );
     }
 
     #[test]
