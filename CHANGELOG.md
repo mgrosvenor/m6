@@ -91,6 +91,35 @@ Verified by four tests: DATA is split to the peer's maximum frame size, the per-
 window bounds a push, a push does not move the peer's high-water mark, and a client may
 decline a push with `RST_STREAM`.
 
+**Early hints, and therefore server push, did nothing at all on any site m6 minifies.**
+`hints::extract_hints` matched only quoted HTML attributes: `href="`, `src="`, `href='`
+and `src='`. m6's own minifier strips attribute quotes, so the extractor found nothing
+in the output of the server it ships with. Measured against a live homepage, fetched as
+identity so the body is the real thing: **0 quoted `href="`, 0 quoted `src="`, 182
+unquoted `href=`, 108 unquoted `src=`**.
+
+Everything downstream was inert: no `Link: rel=preload`, no `103 Early Hints` on h2 or
+h3, no prefetch of hinted assets into the cache, and no server push, whose branch is
+guarded on the hint list being non-empty. A performance feature with tests, a config
+surface and two protocol paths, doing nothing.
+
+HTML5 allows an unquoted attribute value, ending at whitespace or `>`. Both forms are
+read now, and an attribute name must be preceded by whitespace so that `data-href` and
+`xlink:href` are not mistaken for `href`.
+
+**A hint now names what the page will actually request.** The URL was emitted with its
+query string removed, so a hint read `/assets/css/style.css` while the page asked for
+`/assets/css/style.css?v=ae331def`. m6 keys the cache on the full path including the
+query, so the preload warmed an entry nothing would ask for and the visitor paid the
+miss anyway. The query is ignored where it should be, which is reading the extension to
+decide the `as=` value, and kept everywhere else.
+
+**The existing tests could not have caught this.** Every one of them wrote its own
+fixture, and every one wrote it with quotes, so they passed against input the server
+never produces. The new test does not write its input: it runs the same `minify_html`
+production runs and asserts on what comes out, with a guard that fails if the minifier
+ever stops stripping quotes and makes the test vacuous.
+
 **Two real defects in the conformance gate, found by running shellcheck for the first
 time.** The repository has 10 shell scripts, several carrying shellcheck disable
 directives, and nothing had ever run shellcheck: not CI, not
