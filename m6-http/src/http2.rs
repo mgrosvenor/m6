@@ -1726,10 +1726,16 @@ impl Http2Conn {
                         break;
                     }
 
+                    // Split the hint: it carries the page's cache-busting query,
+                    // and the cache key builders strip the path at `?`. Passing
+                    // the whole URL as a path keys `/a.css?v=1` as `/a.css`
+                    // while still fetching the versioned resource, so the
+                    // versioned response lands under the unversioned key.
+                    let (hint_path, hint_query) = crate::hints::split_url(hint_url);
                     let push_req = HttpRequest {
                         method: "GET".to_string(),
-                        path: hint_url.clone(),
-                        query: None,
+                        path: hint_path.to_string(),
+                        query: hint_query.map(str::to_string),
                         version: "HTTP/2.0".to_string(),
                         headers: vec![],
                         body: vec![],

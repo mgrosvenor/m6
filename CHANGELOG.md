@@ -14,6 +14,42 @@ releases only; work happens on `develop`. See `CONTRIBUTING.md`.
 
 ## Unreleased
 
+## 1.8.1 — 2026-09-18
+
+### Fixed
+
+**A prefetched or pushed hint was stored under the unversioned cache key, so an edge
+answered `/a.css` with the immutable `/a.css?v=1` response.** Found on a live fleet
+within minutes of the 1.8.0 rollout, by the deploy's own check that an unversioned asset
+must not be immutable.
+
+| asset, requested with no query | edge | origin |
+|---|---|---|
+| `/assets/css/style.css` | `max-age=31536000, immutable` | `max-age=60, s-maxage=86400` |
+| `/assets/js/nav.js` | `max-age=31536000, immutable` | `max-age=60, s-maxage=86400` |
+| `/assets/icons/logo.svg` | `max-age=31536000, immutable` | `max-age=60, s-maxage=86400` |
+
+`extract_hints` returns URLs as the page wrote them, so a hint carries the page's
+cache-busting query. Three callers passed that whole string as a **path** with **no
+query**: both prefetch queue sites and the HTTP/2 push request. Both key builders strip
+the path at `?` and read the query only from their own argument, so
+`make_lookup_key("/a.css?v=1", None, "")` is byte-identical to
+`make_lookup_key("/a.css", None, "")`. The request that went out still carried `?v=1`,
+so the backend returned the versioned, immutable response, and it was stored where an
+unversioned request finds it.
+
+The stripping is deliberate and stays: it stops a stray `?` smuggling one request's
+query into another's key. What was missing is that callers must split first, which
+`hints::split_url` now does in one place for all three.
+
+**Why it appeared only now.** The prefetch loop is not new. It could not run, because
+`extract_hints` returned an empty list on every page until 1.8.0 fixed it. A latent
+defect became reachable the moment the feature it serves started working.
+
+Verified by a test that pins the trap rather than describing it: the two lookup keys are
+asserted equal, so the next caller meets the requirement to split as a failing
+assumption rather than a comment.
+
 ## 1.8.0 — 2026-09-17
 
 ### Added
