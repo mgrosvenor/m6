@@ -182,9 +182,9 @@ pub struct PoolHealth {
 /// needs exactly two things from it: whether this node can serve, and which
 /// node answered.
 ///
-/// It used to also carry `uptime_s`, the name and occupancy of every socket
-/// pool, and the names of the URL backends. That told an anonymous caller the
-/// internal service topology (`m6-html`, `m6-file`, `render-contact`,
+/// It deliberately does not carry `uptime_s`, the name and occupancy of every
+/// socket pool, or the names of the URL backends. That would tell an anonymous
+/// caller the internal service topology (`m6-html`, `m6-file`, `render-contact`,
 /// `render-analytics`), how many workers back each one, when the process last
 /// restarted, and, by polling, exactly when a deploy or a crash happened and
 /// whether a pool was losing members. None of that helps a monitor decide up
@@ -258,7 +258,7 @@ impl HealthReport {
     }
 }
 
-/// The `/perf` payload: the numbers, plus the detail `/health` used to leak.
+/// The `/perf` payload: the numbers, plus the detail `/health` must not leak.
 ///
 /// Carries `node` and `uptime_s` so a dashboard scraping several nodes can
 /// attribute a sample without correlating two requests, and so a counter reset
@@ -344,18 +344,44 @@ pub enum PerfOutcome {
     Ok(Box<PerfReport>),
 }
 
+/// What a report is about: the node, and the live facts to report on it.
+pub struct PerfSubject<'a> {
+    pub node: &'a str,
+    pub uptime_s: u64,
+    pub pools: Vec<PoolHealth>,
+    pub url_backends: Vec<String>,
+    pub host_path: &'a std::path::Path,
+}
+
+/// Who is asking, and what would authorise them.
+///
+/// Separate from [`PerfSubject`] because the two are answered at different
+/// times and by different code: access decides whether there is a report at
+/// all, and the subject is only read once it has. Keeping them apart is also
+/// what stopped `build` taking eight positional arguments, six of which were
+/// `&str`-ish and easy to transpose.
+pub struct PerfAccess<'a> {
+    pub headers: &'a [(String, String)],
+    pub configured_token: Option<&'a str>,
+}
+
 impl PerfReport {
-    #[allow(clippy::too_many_arguments)]
     pub fn build(
-        node: &str,
-        uptime_s: u64,
-        pools: Vec<PoolHealth>,
-        url_backends: Vec<String>,
-        host_path: &std::path::Path,
-        headers: &[(String, String)],
-        configured_token: Option<&str>,
+        subject: PerfSubject<'_>,
+        access: PerfAccess<'_>,
         snapshot: impl FnOnce() -> StatsSnapshot,
     ) -> PerfOutcome {
+        let PerfSubject {
+            node,
+            uptime_s,
+            pools,
+            url_backends,
+            host_path,
+        } = subject;
+        let PerfAccess {
+            headers,
+            configured_token,
+        } = access;
         match configured_token.filter(|t| !t.is_empty()) {
             None => PerfOutcome::Disabled,
             Some(_) if !metrics_authorised(headers, configured_token) => PerfOutcome::Unauthorised,
@@ -566,13 +592,17 @@ mod tests {
         // Off by default, and it does not advertise a door that cannot be
         // opened: 404, not 401.
         let out = PerfReport::build(
-            "sydney",
-            5,
-            vec![],
-            vec![],
-            Path::new("/"),
-            &auth("Bearer x"),
-            None,
+            PerfSubject {
+                node: "sydney",
+                uptime_s: 5,
+                pools: vec![],
+                url_backends: vec![],
+                host_path: Path::new("/"),
+            },
+            PerfAccess {
+                headers: &auth("Bearer x"),
+                configured_token: None,
+            },
             snap,
         );
         let (code, _, body) = out.into_response();
@@ -585,13 +615,17 @@ mod tests {
     #[test]
     fn perf_reports_the_running_version() {
         let out = PerfReport::build(
-            "sydney",
-            5,
-            vec![],
-            vec![],
-            Path::new("/"),
-            &auth("Bearer right"),
-            Some("right"),
+            PerfSubject {
+                node: "sydney",
+                uptime_s: 5,
+                pools: vec![],
+                url_backends: vec![],
+                host_path: Path::new("/"),
+            },
+            PerfAccess {
+                headers: &auth("Bearer right"),
+                configured_token: Some("right"),
+            },
             snap,
         );
         let (code, _, body) = out.into_response();
@@ -610,13 +644,17 @@ mod tests {
         // fixture: a fixture only proves the fixture parses, and the first attempt
         // at one failed on unrelated required fields of StatsSnapshot.
         let out = PerfReport::build(
-            "sydney",
-            5,
-            vec![],
-            vec![],
-            Path::new("/"),
-            &auth("Bearer right"),
-            Some("right"),
+            PerfSubject {
+                node: "sydney",
+                uptime_s: 5,
+                pools: vec![],
+                url_backends: vec![],
+                host_path: Path::new("/"),
+            },
+            PerfAccess {
+                headers: &auth("Bearer right"),
+                configured_token: Some("right"),
+            },
             snap,
         );
         let (_, _, body) = out.into_response();
@@ -629,13 +667,17 @@ mod tests {
     #[test]
     fn perf_is_401_with_a_scheme_hint_when_credentials_are_wrong() {
         let out = PerfReport::build(
-            "sydney",
-            5,
-            vec![],
-            vec![],
-            Path::new("/"),
-            &auth("Bearer wrong"),
-            Some("right"),
+            PerfSubject {
+                node: "sydney",
+                uptime_s: 5,
+                pools: vec![],
+                url_backends: vec![],
+                host_path: Path::new("/"),
+            },
+            PerfAccess {
+                headers: &auth("Bearer wrong"),
+                configured_token: Some("right"),
+            },
             snap,
         );
         let (code, headers, _) = out.into_response();
@@ -656,13 +698,17 @@ mod tests {
             snap()
         };
         let _ = PerfReport::build(
-            "sydney",
-            5,
-            vec![],
-            vec![],
-            Path::new("/"),
-            &[],
-            Some("tok"),
+            PerfSubject {
+                node: "sydney",
+                uptime_s: 5,
+                pools: vec![],
+                url_backends: vec![],
+                host_path: Path::new("/"),
+            },
+            PerfAccess {
+                headers: &[],
+                configured_token: Some("tok"),
+            },
             counting,
         );
         assert!(!taken, "snapshot must not be taken without authorisation");
@@ -671,13 +717,17 @@ mod tests {
     #[test]
     fn perf_returns_metrics_when_authorised() {
         let out = PerfReport::build(
-            "sydney",
-            11,
-            vec![pool("m6-html", 1, 1)],
-            vec!["origin".to_string()],
-            Path::new("/"),
-            &auth("Bearer tok"),
-            Some("tok"),
+            PerfSubject {
+                node: "sydney",
+                uptime_s: 11,
+                pools: vec![pool("m6-html", 1, 1)],
+                url_backends: vec!["origin".to_string()],
+                host_path: Path::new("/"),
+            },
+            PerfAccess {
+                headers: &auth("Bearer tok"),
+                configured_token: Some("tok"),
+            },
             snap,
         );
         let (code, _, body) = out.into_response();
@@ -687,7 +737,7 @@ mod tests {
         assert_eq!(parsed["uptime_s"], 11);
         assert_eq!(parsed["metrics"]["requests_total"], 0);
         assert!(parsed["metrics"]["hit_samples"].is_number());
-        // The detail that /health used to publish to anyone lives here now.
+        // The detail that /health must not publish to anyone lives here.
         assert_eq!(parsed["pools"][0]["name"], "m6-html");
         assert_eq!(parsed["url_backends"][0], "origin");
         // And the machine underneath, so an aggregator gets a node in one
