@@ -164,26 +164,6 @@ fn make_rustls_config(skip_verify: bool) -> Arc<ClientConfig> {
     }
 }
 
-#[allow(dead_code)]
-fn make_rustls_config_h2(skip_verify: bool) -> Arc<ClientConfig> {
-    if skip_verify {
-        Arc::new(
-            ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(NoVerify))
-                .with_no_client_auth(),
-        )
-    } else {
-        let mut roots = rustls::RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let mut cfg = ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        cfg.alpn_protocols = vec![b"h2".to_vec()];
-        Arc::new(cfg)
-    }
-}
-
 // ── Statistics ────────────────────────────────────────────────────────────────
 
 struct Sample {
