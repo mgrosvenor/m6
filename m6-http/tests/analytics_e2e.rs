@@ -309,8 +309,6 @@ struct AnalyticsLine {
     cache_state: String,
     session_id: String,
     session_new: bool,
-    // Parsed for completeness / debug output; no test currently asserts on it.
-    #[allow(dead_code)]
     client_ip: String,
     path: String,
 }
@@ -356,10 +354,10 @@ impl Server {
 
     /// Open a TCP connection, or `None` if the server is not accepting yet.
     ///
-    /// **A refused connect does not mean the server died**, which is what this
-    /// used to assume before panicking. `assert_alive` is still checked first
-    /// and still fails loudly, with the exit status and stderr, when the
-    /// process really is gone. What is left over is the other case, and it is
+    /// **A refused connect does not mean the server died**, so this must not
+    /// panic on one. `assert_alive` is checked first and fails loudly, with the
+    /// exit status and stderr, when the process really is gone. What is left
+    /// over is the other case, and it is
     /// the common one: m6-http is alive and has not bound the listener yet.
     /// There is a real window for it, because the port is held by a
     /// [`PortClaim`] that is released so m6-http can bind it.
@@ -609,6 +607,14 @@ fn session_cookie_minted_once_and_reused_h1() {
         lines[1].session_id, session_id,
         "second request should log the SAME session id, not a fresh one"
     );
+    // Part of what an analytics line promises: one that recorded an empty or
+    // placeholder address would satisfy every other assertion here.
+    for line in &lines {
+        assert_eq!(
+            line.client_ip, "127.0.0.1",
+            "every analytics line must record the client address it served"
+        );
+    }
 }
 
 /// Same property over HTTP/3 — the protocol whose analytics code path is

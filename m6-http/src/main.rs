@@ -3,19 +3,17 @@
 // HTTP/3 over QUIC/UDP using quiche (sans-I/O) + single-threaded epoll.
 // Standard POSIX UDP socket + epoll, accelerated transparently by
 // OpenOnload/ExaSock at deployment. No async runtime, no threads.
-#![allow(unused_imports, dead_code)]
 
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use anyhow::Context;
 use bytes::Bytes;
 use quiche::h3::NameValue;
-use rand::{thread_rng, RngCore};
+use rand::RngCore;
 use tracing::{debug, error, info, warn};
 
 use m6_http_lib::analytics;
@@ -28,7 +26,7 @@ use m6_http_lib::cache::{
 use m6_http_lib::config::{self, Config};
 use m6_http_lib::error::{self as error, ErrorMode};
 use m6_http_lib::fields::validate_request_header_bytes;
-use m6_http_lib::forward::{self, HttpRequest, HttpResponse};
+use m6_http_lib::forward::{self, HttpResponse};
 use m6_http_lib::health;
 use m6_http_lib::rate_limit::RateLimiter;
 use m6_http_lib::stats::Stats;
@@ -321,10 +319,10 @@ fn seed_cache_warm(state: &mut ServerState) {
 // signals and waits for them on a dedicated thread, so nothing runs in signal
 // context.
 //
-// The epoll loop still needs waking. It used to get that from `epoll_pwait`
-// with a signal mask, which closes the window between checking the shutdown
-// flag and sleeping -- but only on Linux, because the kqueue path ignores the
-// mask entirely, so the race it was meant to close was still open on macOS.
+// The epoll loop still needs waking. `epoll_pwait` with a signal mask closes
+// the window between checking the shutdown flag and sleeping, but only on
+// Linux: the kqueue path ignores the mask entirely, so the race it is meant to
+// close stays open on macOS.
 //
 // A self-pipe registered with the poller does the same job on every platform:
 // the shutdown hook writes one byte, the next `wait()` returns immediately
@@ -819,12 +817,14 @@ fn event_loop(
                                 state.config.analytics.enabled,
                                 &mut headers,
                                 &req.headers,
-                                &state.config.node.name,
-                                &req.path,
-                                412,
-                                cache_state,
-                                client_ip,
-                                Some(elapsed_ns),
+                                &analytics::Event {
+                                    node: &state.config.node.name,
+                                    path: &req.path,
+                                    status: 412,
+                                    cache_state,
+                                    client_ip,
+                                    latency_ns: Some(elapsed_ns),
+                                },
                             );
                             return RequestOutcome::Ready(
                                 412,
@@ -860,12 +860,14 @@ fn event_loop(
                                 state.config.analytics.enabled,
                                 &mut headers,
                                 &req.headers,
-                                &state.config.node.name,
-                                &req.path,
-                                304,
-                                cache_state,
-                                client_ip,
-                                Some(elapsed_ns),
+                                &analytics::Event {
+                                    node: &state.config.node.name,
+                                    path: &req.path,
+                                    status: 304,
+                                    cache_state,
+                                    client_ip,
+                                    latency_ns: Some(elapsed_ns),
+                                },
                             );
                             return RequestOutcome::Ready(
                                 304,
@@ -899,12 +901,14 @@ fn event_loop(
                             state.config.analytics.enabled,
                             &mut headers,
                             &req.headers,
-                            &state.config.node.name,
-                            &req.path,
-                            cached.status,
-                            cache_state,
-                            client_ip,
-                            Some(elapsed_ns),
+                            &analytics::Event {
+                                node: &state.config.node.name,
+                                path: &req.path,
+                                status: cached.status,
+                                cache_state,
+                                client_ip,
+                                latency_ns: Some(elapsed_ns),
+                            },
                         );
                         return RequestOutcome::Ready(
                             cached.status,
@@ -1117,12 +1121,14 @@ fn event_loop(
                                 state.config.analytics.enabled,
                                 &mut headers,
                                 &req.headers,
-                                &state.config.node.name,
-                                &req.path,
-                                412,
-                                cache_state,
-                                client_ip,
-                                Some(elapsed_ns),
+                                &analytics::Event {
+                                    node: &state.config.node.name,
+                                    path: &req.path,
+                                    status: 412,
+                                    cache_state,
+                                    client_ip,
+                                    latency_ns: Some(elapsed_ns),
+                                },
                             );
                             return RequestOutcome::Ready(
                                 412,
@@ -1158,12 +1164,14 @@ fn event_loop(
                                 state.config.analytics.enabled,
                                 &mut headers,
                                 &req.headers,
-                                &state.config.node.name,
-                                &req.path,
-                                304,
-                                cache_state,
-                                client_ip,
-                                Some(elapsed_ns),
+                                &analytics::Event {
+                                    node: &state.config.node.name,
+                                    path: &req.path,
+                                    status: 304,
+                                    cache_state,
+                                    client_ip,
+                                    latency_ns: Some(elapsed_ns),
+                                },
                             );
                             return RequestOutcome::Ready(
                                 304,
@@ -1195,12 +1203,14 @@ fn event_loop(
                             state.config.analytics.enabled,
                             &mut headers,
                             &req.headers,
-                            &state.config.node.name,
-                            &req.path,
-                            cached.status,
-                            cache_state,
-                            client_ip,
-                            Some(elapsed_ns),
+                            &analytics::Event {
+                                node: &state.config.node.name,
+                                path: &req.path,
+                                status: cached.status,
+                                cache_state,
+                                client_ip,
+                                latency_ns: Some(elapsed_ns),
+                            },
                         );
                         return RequestOutcome::Ready(
                             cached.status,
@@ -1963,12 +1973,14 @@ fn handle_h3_request(
             let set_cookie = analytics::record(
                 state.config.analytics.enabled,
                 &H3Headers(&req.headers),
-                &state.config.node.name,
-                path_str,
-                304,
-                cache_state,
-                &client_ip,
-                Some(elapsed_ns),
+                &analytics::Event {
+                    node: &state.config.node.name,
+                    path: path_str,
+                    status: 304,
+                    cache_state,
+                    client_ip: &client_ip,
+                    latency_ns: Some(elapsed_ns),
+                },
             );
             let html = analytics::is_html_response(&cached.headers);
             let mut headers = not_modified_headers(&cached.headers);
@@ -2012,12 +2024,14 @@ fn handle_h3_request(
         let set_cookie = analytics::record(
             state.config.analytics.enabled,
             &H3Headers(&req.headers),
-            &state.config.node.name,
-            path_str,
-            cached.status,
-            cache_state,
-            &client_ip,
-            Some(elapsed_ns),
+            &analytics::Event {
+                node: &state.config.node.name,
+                path: path_str,
+                status: cached.status,
+                cache_state,
+                client_ip: &client_ip,
+                latency_ns: Some(elapsed_ns),
+            },
         );
 
         if !cached.hints.is_empty() {
@@ -2364,10 +2378,10 @@ fn synth_refresh_request(r: &Refresh) -> forward::HttpRequest {
 
 /// Cache-miss entry point for every protocol path.
 ///
-/// This wrapper exists for one reason: `Vary: Accept-Encoding` used to be
-/// emitted **only when replaying a cache hit**, so the very first client to ask
-/// for any URL — every fresh visitor, and every downstream shared cache
-/// populating itself — got a compressed body with nothing saying the body
+/// This wrapper exists for one reason. Emitted **only when replaying a cache
+/// hit**, `Vary: Accept-Encoding` reaches every client except the first to ask
+/// for a URL — so every fresh visitor, and every downstream shared cache
+/// populating itself, gets a compressed body with nothing saying the body
 /// depends on `Accept-Encoding`. That is the worse of the two orderings.
 ///
 /// The header belongs on all four server paths and on all eleven of
@@ -2577,13 +2591,17 @@ fn handle_request_inner(
             })
             .collect();
         let outcome = health::PerfReport::build(
-            &state.config.node.name,
-            state.started.elapsed().as_secs(),
-            pools,
-            state.pool_manager.url_backend_names(),
-            &state.config.site_dir,
-            &req.headers,
-            state.config.health.metrics_token.as_deref(),
+            health::PerfSubject {
+                node: &state.config.node.name,
+                uptime_s: state.started.elapsed().as_secs(),
+                pools,
+                url_backends: state.pool_manager.url_backend_names(),
+                host_path: &state.config.site_dir,
+            },
+            health::PerfAccess {
+                headers: &req.headers,
+                configured_token: state.config.health.metrics_token.as_deref(),
+            },
             || state.stats.snapshot(),
         );
         let (code, headers, body) = outcome.into_response();
@@ -2963,24 +2981,24 @@ fn handle_request_inner(
         // and a backend's 401 with no `WWW-Authenticate`. See
         // `error::PRESERVED_ERROR_HEADERS`.
         error::preserve_actionable_headers(&resp_headers, &mut h);
-        // Bug fix: this early return used to skip analytics for every
-        // backend-returned error status uniformly — unlike its async sibling
-        // (finalize_url_response), which deliberately logs a backend-returned
-        // 4xx/5xx and only skips for a genuine connection failure. No
-        // equivalent reasoning applied here; it looked like an accidental
-        // omission from copy-pasted control flow, not intent — a plain
-        // backend 404 should be visible in analytics like any other request.
+        // This early return must not skip analytics for backend-returned
+        // error statuses. Its async sibling (finalize_url_response)
+        // deliberately logs a backend-returned 4xx/5xx and skips only for a
+        // genuine connection failure, and no different reasoning applies here:
+        // a plain backend 404 belongs in analytics like any other request.
         let backend_ns = backend_start.elapsed().as_nanos() as u64;
         analytics::finish_response(
             analytics_enabled,
             &mut h,
             &req.headers,
-            &state.config.node.name,
-            &req.path,
-            s,
-            "MISS",
-            client_ip,
-            Some(backend_ns),
+            &analytics::Event {
+                node: &state.config.node.name,
+                path: &req.path,
+                status: s,
+                cache_state: "MISS",
+                client_ip,
+                latency_ns: Some(backend_ns),
+            },
         );
         return RequestOutcome::Ready(s, h, b, n, std::sync::Arc::new(vec![]));
     }
@@ -3001,12 +3019,14 @@ fn handle_request_inner(
         analytics_enabled,
         &mut resp_headers,
         &req.headers,
-        &state.config.node.name,
-        &req.path,
-        status,
-        "MISS",
-        client_ip,
-        Some(backend_ns),
+        &analytics::Event {
+            node: &state.config.node.name,
+            path: &req.path,
+            status,
+            cache_state: "MISS",
+            client_ip,
+            latency_ns: Some(backend_ns),
+        },
     );
 
     RequestOutcome::Ready(status, resp_headers, body, backend_name, hints_arc)
@@ -3100,15 +3120,10 @@ fn dispatch_custom_error_async(
             state.config.analytics.enabled,
             &mut headers,
             &req.headers,
-            &state.config.node.name,
-            &req.path,
-            status,
-            // Neither HIT nor MISS: the response cache was not consulted and
+            &analytics::Event { node: &state.config.node.name, path: &req.path, status, cache_state: // Neither HIT nor MISS: the response cache was not consulted and
             // no backend was contacted. Labelling it either would corrupt the
             // hit rate in both directions.
-            "LOCAL",
-            client_ip,
-            Some(latency_ns),
+            "LOCAL", client_ip, latency_ns: Some(latency_ns) },
         );
         return Some(RequestOutcome::Ready(
             status,
@@ -3655,12 +3670,14 @@ fn finalize_url_response_inner(
                     analytics_on,
                     &mut headers,
                     &req.headers,
-                    &state.config.node.name,
-                    &req.path,
-                    original_status,
-                    "MISS",
-                    &ctx.client_ip,
-                    Some(latency_ns),
+                    &analytics::Event {
+                        node: &state.config.node.name,
+                        path: &req.path,
+                        status: original_status,
+                        cache_state: "MISS",
+                        client_ip: &ctx.client_ip,
+                        latency_ns: Some(latency_ns),
+                    },
                 );
                 (
                     original_status,
@@ -3688,12 +3705,14 @@ fn finalize_url_response_inner(
                     analytics_on,
                     &mut headers,
                     &req.headers,
-                    &state.config.node.name,
-                    &req.path,
-                    original_status,
-                    "MISS",
-                    &ctx.client_ip,
-                    Some(latency_ns),
+                    &analytics::Event {
+                        node: &state.config.node.name,
+                        path: &req.path,
+                        status: original_status,
+                        cache_state: "MISS",
+                        client_ip: &ctx.client_ip,
+                        latency_ns: Some(latency_ns),
+                    },
                 );
                 (
                     original_status,
@@ -3786,12 +3805,14 @@ fn finalize_url_response_inner(
             analytics_on,
             &mut h,
             &req.headers,
-            &state.config.node.name,
-            &req.path,
-            s,
-            "MISS",
-            &ctx.client_ip,
-            Some(latency_ns),
+            &analytics::Event {
+                node: &state.config.node.name,
+                path: &req.path,
+                status: s,
+                cache_state: "MISS",
+                client_ip: &ctx.client_ip,
+                latency_ns: Some(latency_ns),
+            },
         );
         return (s, h, b, n, std::sync::Arc::new(vec![]));
     }
@@ -3820,12 +3841,14 @@ fn finalize_url_response_inner(
         analytics_on,
         &mut headers_with_altsvc,
         &req.headers,
-        &state.config.node.name,
-        &req.path,
-        status,
-        "MISS",
-        &ctx.client_ip,
-        Some(latency_ns),
+        &analytics::Event {
+            node: &state.config.node.name,
+            path: &req.path,
+            status,
+            cache_state: "MISS",
+            client_ip: &ctx.client_ip,
+            latency_ns: Some(latency_ns),
+        },
     );
 
     (status, headers_with_altsvc, body, used_backend, hints_arc)

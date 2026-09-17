@@ -103,7 +103,6 @@
 //! the pool's `drain` waits on, rather than the process exiting under whatever
 //! requests happen to be in flight. A service that drops work on SIGTERM turns
 //! every deploy into a handful of failed requests.
-#![allow(dead_code)]
 
 use std::any::Any;
 use std::cell::RefCell;
@@ -285,7 +284,7 @@ pub struct CompiledRoute {
     ///
     /// Shared with every request on this route rather than copied into each
     /// one. On the real site this is `data/content.json`, 68KB and 1,364
-    /// nodes, and it used to be deep-copied per request several times over.
+    /// nodes, so a deep copy per request costs several times that.
     pub base_dict: Arc<Map<String, Value>>,
 }
 
@@ -500,10 +499,6 @@ impl ParamsCache {
     fn insert(&self, key: String, val: Arc<Map<String, Value>>) {
         self.inner.lock().unwrap().put(key, val);
     }
-
-    fn clear(&self) {
-        self.inner.lock().unwrap().clear();
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -512,8 +507,8 @@ impl ParamsCache {
 
 struct FrameworkState {
     /// Behind an `Arc` because it is immutable between reloads and every
-    /// request needs to read it. It used to be owned here, and the two maps a
-    /// request actually wanted -- `compression` and `minification` -- were
+    /// request needs to read it. Owned here instead, the two maps a request
+    /// actually wants -- `compression` and `minification` -- have to be
     /// deep-cloned out from under the read lock, per request, because the
     /// pipeline uses them after the lock is released. An `Arc` clone is a
     /// refcount bump and carries the whole config rather than two fields of it.
@@ -522,11 +517,17 @@ struct FrameworkState {
     /// does not change between reloads.
     site_dir: Arc<PathBuf>,
     /// Shared rather than owned, so a request can route outside the read lock
-    /// without copying the route it matched. `find_route` returns a borrow,
-    /// and the borrow used to be turned into an owned `CompiledRoute` purely
-    /// to outlive the guard.
+    /// without copying the route it matched. `find_route` returns a borrow, and
+    /// owning the table here would mean turning that borrow into an owned
+    /// `CompiledRoute` purely to outlive the guard.
     routes: Arc<Vec<CompiledRoute>>,
+    /// Test-only. Steps 1 to 3 of the dictionary build are merged once per
+    /// reload into `route.base_dict`, so no serving path reads either of these.
+    /// `dict_cost` measures per-request assembly against that base, which is
+    /// what they are kept for. A release build carries neither.
+    #[cfg(test)]
     global_params_data: Map<String, Value>,
+    #[cfg(test)]
     static_params: HashMap<String, Arc<Map<String, Value>>>,
     params_cache: Arc<ParamsCache>,
     renderer: Box<dyn Renderer>,
@@ -638,14 +639,11 @@ impl FrameworkState {
             // The date is derived from templates and params files, so it is
             // only meaningful for a route that renders from them.
             //
-            // This loop used to run over every route, which quietly included
-            // the code routes it was never meant to touch: their
-            // `params_files` is empty, so nothing skipped them and they took
-            // the newest template's mtime as their own. The comment at the
-            // emit site already said "skipped when the route has no honest
-            // date -- a code route", and that was true of the intent and not
-            // of the code. A handler's answer is computed per request and is
-            // not dated by a template it may never read.
+            // Config routes only. Run over every route, this quietly includes
+            // the code routes it is not meant to touch: their `params_files` is
+            // empty, so nothing skips them and they take the newest template's
+            // mtime as their own. A handler's answer is computed per request and
+            // is not dated by a template it may never read.
             if route.template.is_none() {
                 continue;
             }
@@ -765,7 +763,7 @@ impl FrameworkState {
                 //
                 // A file already merged as a global param is skipped rather
                 // than merged a second time over itself. The production config
-                // names `data/content.json` as both, which used to cost a
+                // names `data/content.json` as both, so merging twice costs a
                 // second full copy of it for identical values.
                 for pf in &static_files {
                     if config.global_params.contains(pf) {
@@ -808,7 +806,9 @@ impl FrameworkState {
             config: Arc::new(config),
             site_dir: Arc::new(site_dir),
             routes: Arc::new(routes),
+            #[cfg(test)]
             global_params_data,
+            #[cfg(test)]
             static_params,
             params_cache,
             renderer,
@@ -1015,10 +1015,9 @@ impl FrameworkState {
         if let Some(template_name) = resp.template_name.clone() {
             // No copy on the common path. A response that supplied its own
             // context is rendered against that; one that did not is rendered
-            // against the request's dictionary, which is this argument. It
-            // used to clone the dict here unconditionally and then merge into
-            // it a context that, for a config template route, was a copy of
-            // the same dict.
+            // against the request's dictionary, which is this argument. Cloning
+            // the dict here unconditionally would then merge into it a context
+            // that, for a config template route, is a copy of the same dict.
             let ctx: &Dict = match &resp.template_dict {
                 Some(supplied) => supplied,
                 None => dict,
@@ -1098,17 +1097,6 @@ fn generate_csrf_token() -> String {
 // ---------------------------------------------------------------------------
 // Stateful run_app variants
 // ---------------------------------------------------------------------------
-
-/// Helper: downcast TLS and call the typed destroy.
-fn drain_thread_state_typed<T: Any + Send + 'static>(destroy: &Arc<dyn Fn(T) + Send + Sync>) {
-    THREAD_STATE.with(|cell| {
-        if let Some(boxed) = cell.borrow_mut().take() {
-            if let Ok(t) = boxed.downcast::<T>() {
-                destroy(*t);
-            }
-        }
-    });
-}
 
 /// Run with global state only.
 fn run_app_global<G: Send + Sync + 'static>(
@@ -1523,9 +1511,8 @@ impl ThreadPool {
 /// `socket` is what gives this loop the two behaviours it did not have. The
 /// self-connect returns the parked `accept()` at once, instead of the 100 ms
 /// poll timeout it relied on before; and the socket is unlinked on the way out,
-/// which no render app did. The only `remove_file` in this file used to be at
-/// startup, clearing a stale socket before `bind`, which is the workaround for
-/// the missing cleanup rather than the cleanup.
+/// which no render app did. Clearing a stale socket at startup before `bind` is
+/// the workaround for missing cleanup rather than the cleanup itself.
 fn install_shutdown(socket_path: &std::path::Path) -> crate::signal::ShutdownHandle {
     let name = std::env::args()
         .next()
@@ -2250,8 +2237,8 @@ pub struct Invocation {
 /// `--dump-config` loads the configuration exactly as the service would, prints
 /// what it resolved to, and exits: **0 if this binary can serve this config, 2
 /// if it cannot.** That is the check `deploy-platform.sh` runs against the new
-/// binary on every node before installing it, and it used to cover m6-http
-/// alone even though every service loads its config through the same function.
+/// binary on every node before installing it, and it covers every service:
+/// they all load their config through this same function.
 ///
 /// It is not a formality. The `App` migrations changed m6-file's config format,
 /// and the old binary against the new config and the new binary against the old
@@ -2800,11 +2787,10 @@ fn handle_request<W: std::io::Write>(
     // we need so that a concurrent hot reload can proceed promptly.
     //
     // What leaves the lock is shared, not copied. The pipeline below runs
-    // outside the lock and needs the compression and minification settings,
-    // which used to be deep-cloned here per request along with the site
-    // directory. They do not vary between reloads, so an `Arc` clone is the
-    // honest way to carry them out: two refcount bumps instead of two
-    // `HashMap`s and a `PathBuf`.
+    // outside the lock and needs the compression and minification settings.
+    // They do not vary between reloads, so an `Arc` clone is the honest way to
+    // carry them out: two refcount bumps instead of deep-copying two
+    // `HashMap`s and a `PathBuf` per request.
     let (routes, site_dir, config) = {
         let fs_r = fs.read().unwrap();
         (
@@ -2816,9 +2802,8 @@ fn handle_request<W: std::io::Write>(
     let compression = &config.compression;
     let minification = &config.minification;
 
-    // Routing happens outside the lock now, against the shared route table.
-    // It used to happen inside, and the matched route was then cloned purely
-    // so it could outlive the guard.
+    // Routing happens outside the lock, against the shared route table. Inside
+    // it, the matched route would have to be cloned purely to outlive the guard.
     let route_match = find_route(raw.path(), raw.method(), &routes);
 
     // Populated from `dict["csrf_token"]` inside the matched-route arm below
@@ -2927,12 +2912,11 @@ fn handle_request<W: std::io::Write>(
             }
 
             // Add Cache-Control header. route.cache is a free-form string
-            // (config.rs parses it as-is, defaulting to "public") — this
-            // used to collapse anything that wasn't literally "no-store"
-            // down to a bare "public", silently discarding any max-age or
-            // other directive a site actually configured (e.g.
-            // "public, max-age=60, must-revalidate"). Pass it through as
-            // configured instead.
+            // (config.rs parses it as-is, defaulting to "public") and is
+            // passed through exactly as configured. Collapsing anything that
+            // is not literally "no-store" down to a bare "public" would
+            // silently discard the max-age and other directives a site
+            // configured, e.g. "public, max-age=60, must-revalidate".
             // A default, not an override. A handler that decided its own
             // caching has decided it per request in a way a static route
             // setting cannot express -- m6-file answers `immutable` for a
@@ -2981,14 +2965,14 @@ fn handle_request<W: std::io::Write>(
         if !has_csrf {
             // Reuse the exact token build_dict already put in dict["csrf_token"]
             // (captured above as csrf_token_for_cookie) rather than generating
-            // a second, independent one here. Those used to be two unrelated
-            // random values: the page's hidden csrf_token field carried
-            // whatever build_dict generated, while the cookie actually sent
-            // to the browser carried a *different* token generated
-            // independently right here — so for any visitor without an
-            // existing _csrf cookie (i.e. every first-time visitor), the
-            // submitted field could never match the cookie and verify_csrf()
-            // would reject every legitimate submission. Falls back to a
+            // a second, independent one here. Two unrelated random values is
+            // what that costs: the page's hidden csrf_token field carries
+            // whatever build_dict generated, while the cookie sent to the
+            // browser carries a *different* token generated independently
+            // here — so for any visitor without an existing _csrf cookie
+            // (i.e. every first-time visitor), the submitted field can never
+            // match the cookie and verify_csrf() rejects every legitimate
+            // submission. Falls back to a
             // fresh token only for routes with no dict (e.g. an unmatched
             // path's 404), where there's no rendered form to have carried one.
             let token = csrf_token_for_cookie.unwrap_or_else(generate_csrf_token);
@@ -3073,8 +3057,8 @@ fn handle_request<W: std::io::Write>(
             // Ask the client what it will actually accept, rather than testing
             // whether a coding name appears anywhere in the header.
             //
-            // This used to be `ae_contains`, a raw substring match, and it was
-            // wrong three ways at once. Measured against production on
+            // A raw substring match such as `ae_contains` is wrong three ways
+            // at once. Measured against production on
             // 2026-09-10: `gzip, br;q=0` was served **br**, so a client that
             // had explicitly refused brotli got brotli (RFC 9110 12.4.2 makes
             // `q=0` "not acceptable", not "least preferred"); `notbr` was
@@ -3570,8 +3554,8 @@ mod tests {
         assert_ne!(t1, t2);
     }
 
-    // The two `verify_csrf` tests that used to live here have moved to
-    // `crate::request`, next to the method they exercise.
+    // The two `verify_csrf` tests live in `crate::request`, next to the
+    // method they exercise.
     //
     // They had not compiled since Phase 4. Both built a `RawRequest` with
     // `query: String` and no `version`, which was m6-render's own type before
@@ -4315,8 +4299,8 @@ mod dict_cost {
     ///     M6_REAL_CONTENT_JSON=/path/to/data/content.json \
     ///       cargo test -p m6-core build_dict_against_the_real_content_json -- --ignored
     ///
-    /// This used to join `../<deployment-repo>/data/content.json`, one
-    /// particular site, from a generic library's test suite.
+    /// Named by the environment rather than joined from a path inside one
+    /// particular deployment: this is a generic library's test suite.
     #[test]
     #[ignore = "a measurement; set M6_REAL_CONTENT_JSON to a content file"]
     fn build_dict_against_the_real_content_json() {

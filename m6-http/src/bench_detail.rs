@@ -225,8 +225,8 @@ fn make_quiche_cfg(skip_verify: bool) -> quiche::Config {
 struct BoxStats {
     label: String,
     n: usize,
-    #[allow(dead_code)]
-    min: f64,
+    /// The lower whisker is p5, not the minimum: a single fastest sample says
+    /// more about scheduling luck than about the phase being measured.
     p5: f64,
     p25: f64,
     p50: f64,
@@ -251,7 +251,6 @@ impl BoxStats {
         BoxStats {
             label: label.into(),
             n,
-            min: v[0],
             p5: pct(5.0),
             p25: pct(25.0),
             p50: pct(50.0),
