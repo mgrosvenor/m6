@@ -154,14 +154,32 @@ fn https_exchange(
     }
 
     let text = String::from_utf8_lossy(&raw);
-    let end = text.find("\r\n\r\n").unwrap_or(raw.len());
-    let headers = text[..end].to_string();
-    let status = headers
-        .lines()
-        .next()
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+
+    // RFC 9110 15.2: a client MUST be able to parse one or more 1xx responses
+    // before the final one. m6 sends `103 Early Hints` ahead of any response
+    // carrying preload hints, so the first header block on the wire is often
+    // informational and the real status is in a later one.
+    //
+    // Reading only the first block reports 103 as the response, which is what
+    // a browser would never do and what this harness did until early hints
+    // started firing.
+    let mut rest = text.as_ref();
+    let (headers, status) = loop {
+        let end = rest.find("\r\n\r\n").unwrap_or(rest.len());
+        let block = &rest[..end];
+        let code: u16 = block
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let consumed = (end + 4).min(rest.len());
+        if (100..200).contains(&code) && consumed < rest.len() {
+            rest = &rest[consumed..];
+            continue;
+        }
+        break (block.to_string(), code);
+    };
     HttpResponse { status, headers }
 }
 

@@ -5,7 +5,16 @@
 //! Results are stored in `CachedResponse.hints` and reused on subsequent hits.
 
 /// Return the `as=` attribute value for a URL based on its extension.
+///
+/// The query string is not part of the extension. Asset URLs are cache-busted
+/// (`/assets/css/style.css?v=ae331def`), so testing the raw URL answers "no
+/// recognised extension" for every asset on a site that does that, and a
+/// `Link: rel=preload` without an `as=` is ignored by browsers.
 fn preload_as(url: &str) -> &'static str {
+    let url = match url.find('?') {
+        Some(q) => &url[..q],
+        None => url,
+    };
     if url.ends_with(".css") {
         "style"
     } else if url.ends_with(".js") {
@@ -31,60 +40,85 @@ fn preload_as(url: &str) -> &'static str {
 /// `.jpg`, `.jpeg`, `.webp`, `.gif`, `.svg` extensions are hinted.
 ///
 /// Returns an empty `Vec` if `content_type` is not `text/html`.
+///
+/// # The value may be unquoted, and usually is
+///
+/// HTML5 allows an attribute value with no quotes, ending at whitespace or `>`,
+/// and m6's own minifier emits exactly that: a minified page carries
+/// `href=/assets/css/style.css?v=ae331def`, not `href="..."`. A parser that
+/// requires quotes therefore finds nothing on any page this server minifies,
+/// which is every page on a deployment with minification on. Both forms are
+/// read here.
+///
+/// # The URL is emitted as written
+///
+/// What goes in the hint is what the page asked for, query string and all,
+/// because m6 keys its cache on the full path including the query: a hint
+/// naming `/assets/css/style.css` when the page requests
+/// `/assets/css/style.css?v=ae331def` preloads an entry no page will ask for,
+/// and the visitor still pays for the miss. `preload_as` ignores the query when
+/// it reads the extension.
 pub fn extract_hints(body: &[u8], content_type: &str) -> Vec<String> {
     if !content_type.contains("text/html") {
         return vec![];
     }
 
-    // Avoid UTF-8 parsing for speed: work entirely on bytes. Only need ASCII
-    // patterns (`href="`, `src="`, `href='`, `src='`).
+    // Bytes throughout, not UTF-8 parsing: the patterns are ASCII and this runs
+    // on the cache-miss path for every HTML response.
     let mut hints: Vec<String> = Vec::new();
 
-    for pattern in &[
-        b"href=\"".as_ref(),
-        b"src=\"".as_ref(),
-        b"href='".as_ref(),
-        b"src='".as_ref(),
-    ] {
-        let close = if pattern.ends_with(b"\"") {
-            b'"'
-        } else {
-            b'\''
-        };
+    for name in [b"href=".as_ref(), b"src=".as_ref()] {
         let mut pos = 0usize;
         while pos < body.len() {
-            // Find next occurrence of pattern.
-            let Some(rel) = find_bytes(&body[pos..], pattern) else {
+            let Some(rel) = find_bytes(&body[pos..], name) else {
                 break;
             };
-            let value_start = pos + rel + pattern.len();
-            let rest = &body[value_start..];
-            // Find closing quote.
-            let Some(end) = rest.iter().position(|&b| b == close) else {
-                break;
+            let at = pos + rel;
+            pos = at + name.len();
+
+            // An attribute name is preceded by whitespace. Without this,
+            // `data-href=` and `xlink:href=` are read as `href=` and their
+            // values hinted.
+            if at > 0 && !body[at - 1].is_ascii_whitespace() {
+                continue;
+            }
+
+            let rest = &body[pos..];
+            let url_bytes = match rest.first() {
+                None => break,
+                // Quoted: the value runs to the matching quote. An unterminated
+                // quote is malformed markup, so give up on this attribute
+                // rather than reading to the end of the document.
+                Some(&q) if q == b'"' || q == b'\'' => {
+                    let Some(end) = rest[1..].iter().position(|&b| b == q) else {
+                        break;
+                    };
+                    pos += 1 + end + 1;
+                    &rest[1..1 + end]
+                }
+                // Unquoted: HTML5 ends the value at whitespace or `>`.
+                Some(_) => {
+                    let end = rest
+                        .iter()
+                        .position(|&b| b.is_ascii_whitespace() || b == b'>')
+                        .unwrap_or(rest.len());
+                    pos += end;
+                    &rest[..end]
+                }
             };
-            let url_bytes = &rest[..end];
-            pos = value_start + end + 1;
 
             // Only absolute paths.
             if url_bytes.first() != Some(&b'/') {
                 continue;
             }
-            // Must have a recognised extension worth hinting.
             let url_str = match std::str::from_utf8(url_bytes) {
                 Ok(s) => s,
                 Err(_) => continue,
             };
-            // Strip query string before checking extension so that
-            // URLs like `/style.css?v=1` are recognised correctly.
-            let clean = match url_str.find('?') {
-                Some(q) => &url_str[..q],
-                None => url_str,
-            };
-            if preload_as(clean).is_empty() {
+            if preload_as(url_str).is_empty() {
                 continue;
             }
-            hints.push(clean.to_string());
+            hints.push(url_str.to_string());
         }
     }
 
@@ -147,11 +181,87 @@ mod tests {
         assert!(hints.is_empty());
     }
 
+    /// The cache keys on the full path including the query, so a hint has to
+    /// name what the page will actually request. Stripping `?v=123` here
+    /// preloads an entry nothing asks for and the visitor still pays the miss.
     #[test]
-    fn test_query_string_stripped() {
+    fn a_hint_keeps_the_query_the_page_will_request() {
         let html = br#"<link href="/assets/style.css?v=123" rel="stylesheet">"#;
         let hints = extract_hints(html, "text/html");
-        assert_eq!(hints, vec!["/assets/style.css"]);
+        assert_eq!(hints, vec!["/assets/style.css?v=123"]);
+    }
+
+    /// ...and the header still has to say what kind of resource it is. A
+    /// `rel=preload` with no `as=` is ignored by browsers, so reading the
+    /// extension has to see past the query.
+    #[test]
+    fn a_cache_busted_url_still_gets_its_as_value() {
+        assert_eq!(
+            link_header("/assets/css/style.css?v=ae331def"),
+            "</assets/css/style.css?v=ae331def>; rel=preload; as=style"
+        );
+    }
+
+    /// HTML5 allows an unquoted attribute value, ending at whitespace or `>`.
+    #[test]
+    fn unquoted_attribute_values_are_read() {
+        let html = br#"<link href=/assets/style.css?v=ae331def rel=stylesheet><script src=/assets/app.js></script><img src=/a.webp>"#;
+        let hints = extract_hints(html, "text/html");
+        assert_eq!(
+            hints,
+            vec!["/a.webp", "/assets/app.js", "/assets/style.css?v=ae331def"]
+        );
+    }
+
+    /// `data-href` and `xlink:href` are not `href`. An attribute name is
+    /// preceded by whitespace, which is what separates them.
+    #[test]
+    fn attributes_that_merely_end_in_href_are_not_read() {
+        let html = br#"<div data-href=/not-a-hint.css></div><use xlink:href=/also-not.svg />"#;
+        let hints = extract_hints(html, "text/html");
+        assert!(
+            hints.is_empty(),
+            "matched something it should not: {hints:?}"
+        );
+    }
+
+    /// **The fixture is what the server emits, not what the parser wants.**
+    ///
+    /// Every other test here writes its own HTML, and every one of them wrote
+    /// it with quotes. They all passed while this function returned nothing at
+    /// all for every page on a deployment with minification on, because m6's
+    /// own minifier strips attribute quotes. So this one does not write the
+    /// input: it runs the same `minify_html` production runs, and asserts on
+    /// what comes out the other side.
+    #[test]
+    fn hints_survive_the_minifier_this_server_runs() {
+        let source = br#"
+            <html><head>
+              <link href="/assets/css/style.css?v=ae331def" rel="stylesheet">
+              <link rel="preload" href="/assets/fonts/montserrat.woff2" as="font" crossorigin>
+            </head><body>
+              <img src="/assets/icons/logo.svg?v=50f21795" width="80" height="80" alt="Logo">
+              <script src="/assets/js/nav.js?v=9577f6ad" type="module"></script>
+            </body></html>"#;
+
+        let minified = m6_core::minify::minify_html(source, false);
+        let rendered = String::from_utf8_lossy(&minified);
+        assert!(
+            !rendered.contains("href=\""),
+            "this test is pointless if the minifier kept the quotes: {rendered}"
+        );
+
+        let hints = extract_hints(&minified, "text/html; charset=utf-8");
+        assert_eq!(
+            hints,
+            vec![
+                "/assets/css/style.css?v=ae331def",
+                "/assets/fonts/montserrat.woff2",
+                "/assets/icons/logo.svg?v=50f21795",
+                "/assets/js/nav.js?v=9577f6ad",
+            ],
+            "minified output: {rendered}"
+        );
     }
 
     #[test]
