@@ -11,7 +11,7 @@
 //! responses out of the site traffic counters.
 
 pub use m6_core::monitoring::{
-    metrics_authorised, HealthReport, PerfOutcome, PerfReport, PoolHealth,
+    metrics_authorised, HealthReport, PerfAccess, PerfOutcome, PerfReport, PerfSubject, PoolHealth,
 };
 
 /// Backend name tagged onto a `/health` response.
