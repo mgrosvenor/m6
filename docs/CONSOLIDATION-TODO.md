@@ -13,11 +13,84 @@ generalise belongs in core, and core should be the only thing a service links.
 
 ---
 
-## STATUS, 2026-09-13
+## STATUS, 2026-09-17
 
-**Branch state 2026-09-13:** `develop` is at `9abfebe` with the CI work merged
-and everything passing on the build host. `main` is 133 commits behind and
-none of it is deployed.
+**Branch state:** `develop` is at `be5456e`. `main` is at `40bd699`, **2 commits
+behind develop**, and those two are the only unreleased work:
+
+```
+be5456e  m6-http warms its own cache on startup (#63)
+551cda3  Run shellcheck, and fix the 16 findings it had (#61)
+```
+
+**Production runs 1.7.0** on syd, lon and chi, identical binaries
+(`f4e5b0c2b97d92bffb66b10342045259`), verified uniform by `cargo xtask verify-fleet`
+against the build artefact. The freeze is long over; releases now go out through
+`tag.sh`, which publishes the GitHub release, and the site repo's pin is the only
+thing that decides what reaches production.
+
+**1.0 was cut and is five releases behind us.** The road-to-1.0 table that used to be
+here is kept below under "The road to 1.0, as it turned out" because the reasoning in
+it is still the only record of why some things are shaped as they are.
+
+### What is owed, 2026-09-17
+
+| # | item | issue |
+|---|---|---|
+| 1 | **Cut 1.8.0.** Two commits sit on develop, and one of them is what lets `dr-grosvenor-site` delete `warm-local.sh` and its timer from every node. Needs a CHANGELOG section first. | #64 |
+| 2 | **Log footprint in the report.** Journal disk usage and analytics file size on `/perf`. This is the coverage the retired python health check had and `m6-monitor` does not: on-box loopback TTFB and the TLS split, analytics ndjson size, `journalctl --disk-usage`. Every health check run has to say these are not measured. | #34 |
+| 3 | **m6-auth-server path resolution.** `[storage]` resolves against the config file's directory and `[keys]` against the site root, which is two rules for one idea. Not running in production, so there is no live migration. | #16 |
+| 4 | **Debian package from CI.** Blocked: needs a GPG key from the owner. | #25 |
+| 5 | **Branch protection on `main`.** Confirmed absent 2026-09-17 (`/branches/main/protection` returns 404). `.githooks/pre-push` refuses a direct push, which is a local convention and not enforcement: it protects whoever installed the hook. | #65 |
+| 6 | **Four `cargo deny` advisories** whose reachability has never been established. | #3 |
+| 7 | **`FrameworkState::build_dict` is private**, so the twelve ordered steps are not reusable by a service not using `App`. §1. | #66 |
+
+### Closed since the last status, and how
+
+Six issues were open on 2026-09-17 with the work already finished and merged to `main`.
+`Closes #N` only fires on a default-branch merge, so they had never closed themselves:
+
+| issue | what shipped | first released in |
+|---|---|---|
+| #26 | `m6-monitor --check` is the health report; the ssh script is gone | v1.0.0 |
+| #28 | certificate chain compression (RFC 8879), amplification factor back to the conforming 3 | v1.4.0 |
+| #32 | the monitor polls on a schedule and serves the stored snapshot | v1.2.0 |
+| #50 | `tag.sh` publishes the release instead of printing a URL to one that does not exist | v1.6.0 |
+
+#60 and #62 stay open: their work is on `develop` and not in `main`, which is a
+different case and is now noted on both.
+
+### Items that were "still owed" and are not any more
+
+- ~~`deploy/health-check.py` is not retired yet.~~ **Retired.** Neither
+  `deploy/health-check.py` nor `tools/health-check.py` exists. `m6-monitor --check`, or
+  `GET /check` over the build host's socket, produces the whole A-to-G report with no ssh
+  to any production node. The residual coverage gap is #34, above.
+- ~~Staging cannot exercise the cache role.~~ **It can, as of 2026-09-17.** The build host
+  runs `m6-http-cache` on `:8443` in front of its own origin, from **production's unit
+  file** rather than a staging copy, and the site's 19-check suite passes 19/19 through it.
+  Before that, staging wrote its own units and three of five had drifted into being more
+  permissive than production, which is the failure mode staging exists to prevent.
+- ~~The hourly prompt's `hit_p50_ns` baseline is wrong now that §3a is understood.~~
+  **Corrected in the standing order**, which now states that ~3.9us at 50-70 hits is
+  expected and that latency is load-dependent, and requires the sample count beside every
+  percentile.
+- ~~`m6-monitor` and the firewall stats collector are deployed nowhere.~~ Both deployed
+  2026-09-15.
+
+### Deferred by the owner, not in 1.0 and still deferred
+
+The **event loop** and the **handler contract**, explicitly. The IO layer is in scope as
+low-touch consolidation but is not started. See §3b.
+
+---
+
+## The road to 1.0, as it turned out
+
+Kept verbatim from the 2026-09-13 status block. Items 3 and 5 read as "not started" and
+"blocked" and both are **done**: the renderers take m6-core as a git dependency pinned to
+a tag (`dr-grosvenor-site/Cargo.toml` pins `v1.7.0`), and the deploy happened, five
+releases ago. The rest is accurate and is the only record of the reasoning.
 
 ### The road to 1.0, in agreed order
 
@@ -52,34 +125,6 @@ deployed.
 | **§3d decided** | A configured-but-failed bind is fatal; an unconfigured listener is not a bind. |
 | **Production hardening** | `UMask=0027`, `LimitNOFILE=65535` (site repo, undeployed). |
 | **Documentation** | 16 module docs written, `docs/PERFORMANCE.md`, `docs/LESSONS.md`, `docs/SESSION-NOTES.md`, `CLAUDE.md`. |
-
-### Deferred by the owner, not in 1.0
-
-The **event loop** and the **handler contract**, explicitly. The IO layer is in
-scope as low-touch consolidation but is not started. See §3b.
-
-### Still owed, not on the 1.0 path
-
-- `FrameworkState::build_dict` is private; the twelve ordered steps are not
-  reusable by a service not using `App`. §1.
-- ~~`m6-monitor` and the firewall stats collector are deployed nowhere.~~ **Both
-  deployed 2026-09-15**: the monitor on the build host, the collector on all
-  three nodes.
-- The deployment's `deploy/health-check.py` is not retired yet. The three reasons
-  this used to give were all stale and are corrected in the detail entry below;
-  what remains is a post-1.0.0 binary on the nodes and a field-by-field
-  comparison of the two reports. It moved out of m6 on 2026-09-14: a generic web
-  system does not carry one fleet's health check.
-- Staging cannot exercise the cache role.
-- The hourly prompt's `hit_p50_ns` baseline is wrong now that §3a is
-  understood. Owner's file to change.
-- Four `cargo deny` advisories whose reachability has never been established
-  (issue #3).
-- GitHub branch protection on `main`.
-
----
-
----
 
 ## Done, 2026-09-11
 
