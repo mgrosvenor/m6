@@ -37,7 +37,7 @@ it is still the only record of why some things are shaped as they are.
 
 | # | item | issue |
 |---|---|---|
-| 1 | **Cut 1.8.0.** Two commits sit on develop, and one of them is what lets `dr-grosvenor-site` delete `warm-local.sh` and its timer from every node. Needs a CHANGELOG section first. | #64 |
+| 1 | **Cut 1.8.0.** Two commits sit on develop, and one of them is what lets the deployment delete its `warm-local.sh` and the timer that runs it on every node. Needs a CHANGELOG section first. | #64 |
 | 2 | **Log footprint in the report.** Journal disk usage and analytics file size on `/perf`. This is the coverage the retired python health check had and `m6-monitor` does not: on-box loopback TTFB and the TLS split, analytics ndjson size, `journalctl --disk-usage`. Every health check run has to say these are not measured. | #34 |
 | 3 | **m6-auth-server path resolution.** `[storage]` resolves against the config file's directory and `[keys]` against the site root, which is two rules for one idea. Not running in production, so there is no live migration. | #16 |
 | 4 | **Debian package from CI.** Blocked: needs a GPG key from the owner. | #25 |
@@ -89,7 +89,7 @@ low-touch consolidation but is not started. See §3b.
 
 Kept verbatim from the 2026-09-13 status block. Items 3 and 5 read as "not started" and
 "blocked" and both are **done**: the renderers take m6-core as a git dependency pinned to
-a tag (`dr-grosvenor-site/Cargo.toml` pins `v1.7.0`), and the deploy happened, five
+a tag (the deployment's `Cargo.toml` pins `v1.7.0`), and the deploy happened, five
 releases ago. The rest is accurate and is the only record of the reasoning.
 
 ### The road to 1.0, in agreed order
