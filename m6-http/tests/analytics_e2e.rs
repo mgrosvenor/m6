@@ -154,14 +154,32 @@ fn https_exchange(
     }
 
     let text = String::from_utf8_lossy(&raw);
-    let end = text.find("\r\n\r\n").unwrap_or(raw.len());
-    let headers = text[..end].to_string();
-    let status = headers
-        .lines()
-        .next()
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+
+    // RFC 9110 15.2: a client MUST be able to parse one or more 1xx responses
+    // before the final one. m6 sends `103 Early Hints` ahead of any response
+    // carrying preload hints, so the first header block on the wire is often
+    // informational and the real status is in a later one.
+    //
+    // Reading only the first block reports 103 as the response, which is what
+    // a browser would never do and what this harness did until early hints
+    // started firing.
+    let mut rest = text.as_ref();
+    let (headers, status) = loop {
+        let end = rest.find("\r\n\r\n").unwrap_or(rest.len());
+        let block = &rest[..end];
+        let code: u16 = block
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let consumed = (end + 4).min(rest.len());
+        if (100..200).contains(&code) && consumed < rest.len() {
+            rest = &rest[consumed..];
+            continue;
+        }
+        break (block.to_string(), code);
+    };
     HttpResponse { status, headers }
 }
 
@@ -309,8 +327,6 @@ struct AnalyticsLine {
     cache_state: String,
     session_id: String,
     session_new: bool,
-    // Parsed for completeness / debug output; no test currently asserts on it.
-    #[allow(dead_code)]
     client_ip: String,
     path: String,
 }
@@ -356,10 +372,10 @@ impl Server {
 
     /// Open a TCP connection, or `None` if the server is not accepting yet.
     ///
-    /// **A refused connect does not mean the server died**, which is what this
-    /// used to assume before panicking. `assert_alive` is still checked first
-    /// and still fails loudly, with the exit status and stderr, when the
-    /// process really is gone. What is left over is the other case, and it is
+    /// **A refused connect does not mean the server died**, so this must not
+    /// panic on one. `assert_alive` is checked first and fails loudly, with the
+    /// exit status and stderr, when the process really is gone. What is left
+    /// over is the other case, and it is
     /// the common one: m6-http is alive and has not bound the listener yet.
     /// There is a real window for it, because the port is held by a
     /// [`PortClaim`] that is released so m6-http can bind it.
@@ -609,6 +625,14 @@ fn session_cookie_minted_once_and_reused_h1() {
         lines[1].session_id, session_id,
         "second request should log the SAME session id, not a fresh one"
     );
+    // Part of what an analytics line promises: one that recorded an empty or
+    // placeholder address would satisfy every other assertion here.
+    for line in &lines {
+        assert_eq!(
+            line.client_ip, "127.0.0.1",
+            "every analytics line must record the client address it served"
+        );
+    }
 }
 
 /// Same property over HTTP/3 — the protocol whose analytics code path is
