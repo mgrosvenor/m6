@@ -113,6 +113,23 @@ pub fn parse_referer(raw: &str) -> (Option<String>, Option<String>) {
     }
 }
 
+/// What happened to one request on one node.
+///
+/// One thing, not six: no call site has a reason to supply some of these and
+/// not the rest, and every function in this module wants all of them.
+///
+/// Borrowed rather than owned. Every caller is in the middle of handling the
+/// request these describe and already holds them; an owned `Event` would mean
+/// five `String` allocations on a path that runs once per request.
+pub struct Event<'a> {
+    pub node: &'a str,
+    pub path: &'a str,
+    pub status: u16,
+    pub cache_state: &'a str,
+    pub client_ip: &'a str,
+    pub latency_ns: Option<u64>,
+}
+
 /// Fields extracted from the request headers, ready to log.
 pub struct RequestFeatures {
     pub referer_host: Option<String>,
@@ -142,33 +159,17 @@ fn extract_features(headers: &(impl HeaderSource + ?Sized)) -> RequestFeatures {
 /// mints a fresh random id whenever no session cookie is present yet, so two
 /// independent calls for the same still-cookie-less request produce two
 /// different ids.
-#[allow(clippy::too_many_arguments)]
 pub fn record(
     enabled: bool,
     request_headers: &(impl HeaderSource + ?Sized),
-    node: &str,
-    path: &str,
-    status: u16,
-    cache_state: &str,
-    client_ip: &str,
-    latency_ns: Option<u64>,
+    ev: &Event<'_>,
 ) -> Option<String> {
     if !enabled {
         return None;
     }
     let (session_id, session_new) = get_or_create_session(request_headers);
     let features = extract_features(request_headers);
-    log_request(
-        node,
-        path,
-        status,
-        cache_state,
-        client_ip,
-        &session_id,
-        session_new,
-        &features,
-        latency_ns,
-    );
+    log_request(ev, &session_id, session_new, &features);
     session_new.then(|| session_cookie_header_value(&session_id))
 }
 
@@ -188,29 +189,14 @@ pub fn is_html_response(resp_headers: &[(String, String)]) -> bool {
 /// The session is still minted/logged for every request regardless of
 /// content type (so analytics stay accurate) — only the `Set-Cookie` write
 /// itself is scoped to HTML responses, per [`is_html_response`].
-#[allow(clippy::too_many_arguments)]
 pub fn finish_response(
     enabled: bool,
     resp_headers: &mut Vec<(String, String)>,
     request_headers: &(impl HeaderSource + ?Sized),
-    node: &str,
-    path: &str,
-    status: u16,
-    cache_state: &str,
-    client_ip: &str,
-    latency_ns: Option<u64>,
+    ev: &Event<'_>,
 ) {
     let html = is_html_response(resp_headers);
-    if let Some(sc) = record(
-        enabled,
-        request_headers,
-        node,
-        path,
-        status,
-        cache_state,
-        client_ip,
-        latency_ns,
-    ) {
+    if let Some(sc) = record(enabled, request_headers, ev) {
         if html {
             resp_headers.push(("Set-Cookie".to_string(), sc));
         }
@@ -254,90 +240,52 @@ fn session_from_response_headers(resp_headers: &[(String, String)]) -> Option<St
 /// the actual point of edge analytics is preserved — without adding a
 /// second, conflicting Set-Cookie. Otherwise behaves exactly like
 /// `finish_response`.
-#[allow(clippy::too_many_arguments)]
 pub fn finish_proxied_response(
     enabled: bool,
     resp_headers: &mut Vec<(String, String)>,
     request_headers: &(impl HeaderSource + ?Sized),
-    node: &str,
-    path: &str,
-    status: u16,
-    cache_state: &str,
-    client_ip: &str,
-    latency_ns: Option<u64>,
+    ev: &Event<'_>,
 ) {
     if !enabled {
         return;
     }
     if let Some(session_id) = session_from_response_headers(resp_headers) {
         let features = extract_features(request_headers);
-        log_request(
-            node,
-            path,
-            status,
-            cache_state,
-            client_ip,
-            &session_id,
-            false,
-            &features,
-            latency_ns,
-        );
+        log_request(ev, &session_id, false, &features);
         return;
     }
-    finish_response(
-        enabled,
-        resp_headers,
-        request_headers,
-        node,
-        path,
-        status,
-        cache_state,
-        client_ip,
-        latency_ns,
-    );
+    finish_response(enabled, resp_headers, request_headers, ev);
 }
 
 /// Emit one structured analytics line. Routed by `m6_core::log`'s
 /// `target: "analytics"` filter to its own file, independent of the main
 /// operational log — see `m6-core/src/log.rs::init_with_analytics`.
-#[allow(clippy::too_many_arguments)]
-fn log_request(
-    node: &str,
-    path: &str,
-    status: u16,
-    cache_state: &str,
-    client_ip: &str,
-    session_id: &str,
-    session_new: bool,
-    features: &RequestFeatures,
-    latency_ns: Option<u64>,
-) {
+fn log_request(ev: &Event<'_>, session_id: &str, session_new: bool, features: &RequestFeatures) {
     tracing::info!(
         target: "analytics",
-        node = node,
-        path = path,
-        status = status,
-        cache_state = cache_state,
-        client_ip = client_ip,
+        node = ev.node,
+        path = ev.path,
+        status = ev.status,
+        cache_state = ev.cache_state,
+        client_ip = ev.client_ip,
         session_id = session_id,
         session_new = session_new,
         referer_host = features.referer_host.as_deref(),
         referer_path = features.referer_path.as_deref(),
         user_agent = features.user_agent.as_deref(),
-        latency_ns = latency_ns,
+        latency_ns = ev.latency_ns,
         "request"
     );
 }
 
 /// Record a poll of `/health` or `/perf`.
 ///
-/// These used to appear nowhere at all. They short-circuit inside
-/// `handle_request` and return before the analytics call further down, so the
-/// request log had no row for them, and the stats counters skipped them at
-/// three separate call sites. That kept site traffic honest and made the
-/// monitoring itself invisible: a check that had silently stopped looked
-/// exactly like a check that was passing, and a flood aimed at `/health` was
-/// not recorded anywhere.
+/// They short-circuit inside `handle_request` and return before the analytics
+/// call further down, and the stats counters skip them at three separate call
+/// sites. Without a row of their own they appear nowhere at all, which keeps
+/// site traffic honest but makes the monitoring itself invisible: a check that
+/// has silently stopped looks exactly like a check that is passing, and a flood
+/// aimed at `/health` is recorded nowhere.
 ///
 /// Emitted with `message = "monitor"` rather than `"request"`, which is what
 /// keeps it out of site traffic. Every existing consumer already filters on
@@ -555,7 +503,18 @@ mod tests {
     #[test]
     fn record_returns_none_when_disabled() {
         let headers = Vec::<(String, String)>::new();
-        let sc = record(false, &headers, "node", "/p", 200, "HIT", "1.2.3.4", None);
+        let sc = record(
+            false,
+            &headers,
+            &Event {
+                node: "node",
+                path: "/p",
+                status: 200,
+                cache_state: "HIT",
+                client_ip: "1.2.3.4",
+                latency_ns: None,
+            },
+        );
         assert!(sc.is_none());
     }
 
@@ -565,12 +524,14 @@ mod tests {
         let sc = record(
             true,
             &headers,
-            "node",
-            "/p",
-            200,
-            "HIT",
-            "1.2.3.4",
-            Some(123),
+            &Event {
+                node: "node",
+                path: "/p",
+                status: 200,
+                cache_state: "HIT",
+                client_ip: "1.2.3.4",
+                latency_ns: Some(123),
+            },
         );
         assert!(
             sc.is_some(),
@@ -585,12 +546,14 @@ mod tests {
         let sc = record(
             true,
             &headers,
-            "node",
-            "/p",
-            200,
-            "HIT",
-            "1.2.3.4",
-            Some(123),
+            &Event {
+                node: "node",
+                path: "/p",
+                status: 200,
+                cache_state: "HIT",
+                client_ip: "1.2.3.4",
+                latency_ns: Some(123),
+            },
         );
         assert!(
             sc.is_none(),
@@ -609,14 +572,27 @@ mod tests {
         let vec_sc = record(
             true,
             &vec_headers,
-            "node",
-            "/p",
-            200,
-            "HIT",
-            "1.2.3.4",
-            None,
+            &Event {
+                node: "node",
+                path: "/p",
+                status: 200,
+                cache_state: "HIT",
+                client_ip: "1.2.3.4",
+                latency_ns: None,
+            },
         );
-        let h3_sc = record(true, &h3_headers, "node", "/p", 200, "HIT", "1.2.3.4", None);
+        let h3_sc = record(
+            true,
+            &h3_headers,
+            &Event {
+                node: "node",
+                path: "/p",
+                status: 200,
+                cache_state: "HIT",
+                client_ip: "1.2.3.4",
+                latency_ns: None,
+            },
+        );
         assert_eq!(
             vec_sc, None,
             "vec-backed request with existing session should reuse it"
@@ -638,12 +614,14 @@ mod tests {
             true,
             &mut resp_headers,
             &req_headers,
-            "node",
-            "/p",
-            200,
-            "HIT",
-            "1.2.3.4",
-            None,
+            &Event {
+                node: "node",
+                path: "/p",
+                status: 200,
+                cache_state: "HIT",
+                client_ip: "1.2.3.4",
+                latency_ns: None,
+            },
         );
         assert_eq!(
             resp_headers.len(),
@@ -661,12 +639,14 @@ mod tests {
             true,
             &mut resp_headers,
             &req_headers,
-            "node",
-            "/p",
-            200,
-            "HIT",
-            "1.2.3.4",
-            None,
+            &Event {
+                node: "node",
+                path: "/p",
+                status: 200,
+                cache_state: "HIT",
+                client_ip: "1.2.3.4",
+                latency_ns: None,
+            },
         );
         assert_eq!(
             resp_headers.len(),
@@ -683,12 +663,14 @@ mod tests {
             false,
             &mut resp_headers,
             &req_headers,
-            "node",
-            "/p",
-            200,
-            "HIT",
-            "1.2.3.4",
-            None,
+            &Event {
+                node: "node",
+                path: "/p",
+                status: 200,
+                cache_state: "HIT",
+                client_ip: "1.2.3.4",
+                latency_ns: None,
+            },
         );
         assert_eq!(
             resp_headers.len(),
@@ -743,12 +725,14 @@ mod tests {
             true,
             &mut resp_headers,
             &req_headers,
-            "edge-node",
-            "/p",
-            200,
-            "MISS",
-            "1.2.3.4",
-            None,
+            &Event {
+                node: "edge-node",
+                path: "/p",
+                status: 200,
+                cache_state: "MISS",
+                client_ip: "1.2.3.4",
+                latency_ns: None,
+            },
         );
 
         let set_cookies: Vec<&(String, String)> = resp_headers
@@ -772,12 +756,14 @@ mod tests {
             true,
             &mut resp_headers,
             &req_headers,
-            "origin",
-            "/p",
-            200,
-            "MISS",
-            "1.2.3.4",
-            None,
+            &Event {
+                node: "origin",
+                path: "/p",
+                status: 200,
+                cache_state: "MISS",
+                client_ip: "1.2.3.4",
+                latency_ns: None,
+            },
         );
         assert_eq!(
             resp_headers.len(),
@@ -798,12 +784,14 @@ mod tests {
             false,
             &mut resp_headers,
             &req_headers,
-            "edge-node",
-            "/p",
-            200,
-            "MISS",
-            "1.2.3.4",
-            None,
+            &Event {
+                node: "edge-node",
+                path: "/p",
+                status: 200,
+                cache_state: "MISS",
+                client_ip: "1.2.3.4",
+                latency_ns: None,
+            },
         );
         assert_eq!(
             resp_headers.len(),

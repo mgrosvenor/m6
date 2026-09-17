@@ -30,7 +30,6 @@ pub struct FsEvent {
 
 /// Filesystem watcher. Platform-specific implementation below.
 pub struct FsWatcher {
-    #[allow(dead_code)]
     inner: FsWatcherInner,
 }
 

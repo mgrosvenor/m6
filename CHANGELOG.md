@@ -14,6 +14,182 @@ releases only; work happens on `develop`. See `CONTRIBUTING.md`.
 
 ## Unreleased
 
+## 1.8.0 — 2026-09-17
+
+### Added
+
+**`[server] warm_on_start`: m6-http seeds its own cache at startup.** Off by default.
+When on, the server puts one entry per warmable route per encoding into its
+background-fetch queue as it starts.
+
+This replaces a shell script. The script was copied onto every node, run there by a
+systemd unit, and found the warmable routes by running a regular expression over the
+node's own `site.toml`. The server has that file already parsed. It knows its route
+table, its error path and which routes are no-store, so it is better placed to make the
+decision than anything outside it, and moving the decision here retires a script, a unit
+and a regex TOML parser together.
+
+Selection matches what the script did, on better evidence than a regex:
+
+- concrete paths only, because `/assets/{*relpath}` is a pattern and not a URL
+- never the configured error path. A public listener refuses that request by design, so
+  warming it would put a 404 body in the cache
+- nothing marked no-store, because the answer is not cacheable and the fetch is pure
+  cost
+
+One entry per encoding, identity plus gzip plus br, because the cache keys on encoding.
+Warming identity alone leaves a gzip visitor paying for the miss anyway. Identity is the
+empty string, which is how the cache key spells "no content-encoding".
+
+**It queues, it does not fetch.** The queue drains one entry per event-loop iteration
+and is the same mechanism that refreshes stale entries, so warming cannot delay startup,
+cannot block serving, and cannot stampede the origin. A fleet restarting together does
+not all reach across the backbone at once.
+
+Off by default, because a server should not do network I/O at boot unless it is asked
+to. The system config wins over the site config: warming is a property of the node, and
+a cache node wants it where a laptop serving the site locally does not.
+
+Verified by four tests over the decision, which is a pure function so it can be driven
+without a `ServerState`: a plain route is warmed, a pattern is not, the error page is
+not (and a site with no error page configured has nothing to exclude), and no-store is
+not, including with surrounding whitespace.
+
+### Fixed
+
+**HTTP/2 server push sent oversized DATA frames and ignored per-stream flow control.**
+A hinted asset between 16 KB and the connection window went out as a single DATA frame,
+which RFC 9113 4.2 requires the peer to treat as a **connection** error of type
+`FRAME_SIZE_ERROR`. One stylesheet took down the connection, for any client that had
+not disabled push.
+
+m6 pushes early-hinted assets whenever a client has not sent
+`SETTINGS_ENABLE_PUSH=0`; 103 Early Hints is the fallback for clients that have. The
+push path wrote `PUSH_PROMISE`, `HEADERS` and the whole body directly, debiting only
+the connection window, because it never registered the pushed stream at all. So it
+obeyed neither the peer's `SETTINGS_MAX_FRAME_SIZE` nor the per-stream window that RFC
+9113 6.9 requires, and a client's `RST_STREAM` declining a push was ignored rather than
+seen.
+
+The promised stream is now registered in `reserved (local)` before the promise goes
+out, moves to `half-closed (remote)` when its HEADERS are sent, and its body is
+delivered by the same flow-controlled sender as every ordinary response. Framing, both
+windows and stream reaping are that one path now.
+
+**Who this affected.** Chrome 106 and later disable push, so the overwhelming majority
+of real traffic takes the 103 branch and never reached this. That is also why it
+survived 146/146 HTTP/2 conformance: h2spec does not drive server push with an
+oversized body.
+
+**A second defect, found by fixing the first.** Routing pushes through the reaping path
+meant `last_stream_id` could advance to an even, server-initiated id. It is the
+**peer's** high-water mark, used to tell an unopened stream (idle) from a finished one
+(closed), so a client's next legal odd stream would derive `Closed` and be answered
+`STREAM_CLOSED`. It is bumped for client-initiated streams only.
+
+Verified by four tests: DATA is split to the peer's maximum frame size, the per-stream
+window bounds a push, a push does not move the peer's high-water mark, and a client may
+decline a push with `RST_STREAM`.
+
+**Early hints, and therefore server push, did nothing at all on any site m6 minifies.**
+`hints::extract_hints` matched only quoted HTML attributes: `href="`, `src="`, `href='`
+and `src='`. m6's own minifier strips attribute quotes, so the extractor found nothing
+in the output of the server it ships with. Measured against a live homepage, fetched as
+identity so the body is the real thing: **0 quoted `href="`, 0 quoted `src="`, 182
+unquoted `href=`, 108 unquoted `src=`**.
+
+Everything downstream was inert: no `Link: rel=preload`, no `103 Early Hints` on h2 or
+h3, no prefetch of hinted assets into the cache, and no server push, whose branch is
+guarded on the hint list being non-empty. A performance feature with tests, a config
+surface and two protocol paths, doing nothing.
+
+HTML5 allows an unquoted attribute value, ending at whitespace or `>`. Both forms are
+read now, and an attribute name must be preceded by whitespace so that `data-href` and
+`xlink:href` are not mistaken for `href`.
+
+**A hint now names what the page will actually request.** The URL was emitted with its
+query string removed, so a hint read `/assets/css/style.css` while the page asked for
+`/assets/css/style.css?v=ae331def`. m6 keys the cache on the full path including the
+query, so the preload warmed an entry nothing would ask for and the visitor paid the
+miss anyway. The query is ignored where it should be, which is reading the extension to
+decide the `as=` value, and kept everywhere else.
+
+**The existing tests could not have caught this.** Every one of them wrote its own
+fixture, and every one wrote it with quotes, so they passed against input the server
+never produces. The new test does not write its input: it runs the same `minify_html`
+production runs and asserts on what comes out, with a guard that fails if the minifier
+ever stops stripping quotes and makes the test vacuous.
+
+**Two real defects in the conformance gate, found by running shellcheck for the first
+time.** The repository has 10 shell scripts, several carrying shellcheck disable
+directives, and nothing had ever run shellcheck: not CI, not
+`tools/build-host-tests.sh`. The directives were decoration, and they made the
+repository look linted. First run: 2 errors and 14 warnings.
+
+Both errors were in the path that kills the harness's own child processes:
+
+```sh
+for p in ${PIDS[@]:-}; do kill "$p" 2>/dev/null || true; done
+```
+
+An unquoted array expansion, so an element containing whitespace re-splits and the loop
+kills the wrong thing or nothing at all. `${PIDS[@]+"${PIDS[@]}"}` is what `:-` was
+reaching for and does not achieve under `set -u`. Seven more findings were `PIDS+=($pid)`,
+the same class one step milder.
+
+`bench.sh` set `SKIP_VERIFY` in two places and read it nowhere, because `BENCH_PASS`
+already carries `--skip-verify` unconditionally. A flag that looks like it does
+something and does not, now removed.
+
+Two SC2034s in `tools/conformance.sh` are annotated rather than deleted. `H2C_PORT` and
+`EDGE_BRIDGE_PORT` are unused as variables, but they are the only record of which ports
+the harness reserves, and deleting them would lose the note that stops something else
+picking a colliding one.
+
+**Gated in CI at warning level, not style.** Style is 100+ findings of preference in
+this repository, and a gate that reports preference gets ignored, which is exactly how
+two real errors survived in a repository whose own rule is that a check which cannot
+measure must fail.
+
+Verified against the running harness rather than the source, because the conformance
+gate is what was edited: h1 32/32 four times, h2 146/146, h3 47/49, every target
+measured.
+
+### Changed
+
+**Every `#[allow]` in the workspace is gone, and clippy's zero is now real.**
+`tools/clippy.sh` runs `-D warnings` and reported zero. An `#[allow]` in source
+overrides a lint level given on the command line, so that zero was measured over code
+that had been told to stay quiet: 13 attributes hiding 22 findings, two of them blanket
+attributes over a whole binary crate and a whole module.
+
+The push defect above is what one of them was hiding. Its stated reason, that this
+server never pushes, was false, and it explained away the symptom: the `ReservedLocal`
+state was never constructed because the push path bypassed the state machine entirely.
+
+The rest were a dead subprocess test harness whose helpers returned success when the
+binary was not built, four `too_many_arguments` on functions whose six shared
+parameters became one `analytics::Event`, a `PerfReport::build` that now takes what to
+report on and who is asking, dead fields, unused imports, and one attribute that was
+simply stale.
+
+No public API of `m6-core` changes. `m6-http`'s internal analytics helpers take an
+`Event` rather than six positional arguments.
+
+**The build host refuses to check the examples when it cannot measure them.** The
+05-cms end-to-end suite binds 127.0.0.1:8443 and waited only for a 200 on that port. A
+staging node on the same box bound to `0.0.0.0:8443` satisfies that probe just as well,
+so the suite could measure a server nobody had changed and report its failures as the
+example's. It now refuses to start when the port is held, naming the process, and
+confirms the answering server is the example before believing 98 assertions about it.
+
+### Note for deployments running a warm script
+
+Setting `warm_on_start` needs this release on the node first. A 1.7.0 binary does not
+know the key, and on m6's config rules an unknown key is a config error, so setting it
+ahead of the rollout buys a failure on every node at once. Roll 1.8.0 out, then turn it
+on, then retire the script and its timer.
+
 ## 1.7.0 — 2026-09-16
 
 ### Fixed

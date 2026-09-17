@@ -160,32 +160,39 @@ const MAX_REFUSED_STREAK: u32 = 50;
 
 // ── Stream state ──────────────────────────────────────────────────────────────
 
-/// RFC 9113 5.1. All seven states.
+/// RFC 9113 5.1.
 ///
-/// Three of these used to exist (`Open`, `HalfClosedRemote`, `Closed`) and the
-/// absence of the rest was the single largest source of conformance failures:
-/// without `Idle` there is no way to tell a frame arriving on a stream that
-/// was never opened from one on a live stream, and without `Closed` being
-/// *derivable* there is no way to reject a frame on a stream that has already
-/// finished.
+/// `Idle` and a derivable `Closed` are what make the table enforceable: without
+/// `Idle` there is no telling a frame on a stream that was never opened from one
+/// on a live stream, and without `Closed` no rejecting a frame on a stream that
+/// has already finished.
 ///
-/// `ReservedLocal`/`ReservedRemote` exist only via PUSH_PROMISE. This server
-/// never pushes and rejects a client PUSH_PROMISE outright, so neither is
-/// reachable today -- they are present because the transition table below is
-/// meant to be checkable against the RFC line by line, and a table missing two
-/// of its rows cannot be.
+/// `ReservedLocal` is entered when this server sends PUSH_PROMISE, which it
+/// does for early-hinted assets whenever the client has not set
+/// SETTINGS_ENABLE_PUSH=0. See `dispatch_h2_response`.
+///
+/// All seven of the RFC's states are listed below. Six are live; reserved
+/// (remote) is present as a commented row, for the reason given against it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(
-    dead_code,
-    reason = "ReservedLocal/ReservedRemote are reachable only via PUSH_PROMISE, \
-              which this server never sends and rejects on receipt. They are \
-              present so the 5.1 transition table can be checked against the \
-              RFC in full; a table missing two of its seven rows cannot be."
-)]
 enum StreamState {
     Idle,
     ReservedLocal,
-    ReservedRemote,
+    // ReservedRemote,
+    //
+    // RFC 9113 5.1's seventh state: a stream the PEER reserved by pushing to
+    // us. Kept as a row so this table can still be read against the RFC line by
+    // line, and kept commented because nothing can enter it.
+    //
+    // Only a server may push. RFC 9113 8.4 makes receipt of a PUSH_PROMISE a
+    // connection error of type PROTOCOL_ERROR, and `process_frame` answers it
+    // at the frame level before any stream object exists, so there is no path
+    // that could construct this. Live, it would be dead code, and an exception
+    // to keep that quiet sits over the whole enum and can hide a real finding
+    // on a neighbouring row.
+    //
+    // If m6 ever accepts a pushed stream, this is the row to uncomment, and
+    // `frame_verdict` needs an arm for it: HEADERS, RST_STREAM and PRIORITY are
+    // the only frames legal from the peer in that state.
     Open,
     HalfClosedLocal,
     HalfClosedRemote,
@@ -459,13 +466,13 @@ impl Http2Conn {
                     // Handlers that detect a connection error send their own
                     // GOAWAY with the code the RFC names -- ENHANCE_YOUR_CALM
                     // for a flood, COMPRESSION_ERROR for a poisoned HPACK
-                    // table -- and then return Err to stop the loop. This arm
-                    // used to append a second GOAWAY unconditionally, so the
-                    // last code the peer actually read was PROTOCOL_ERROR
-                    // every time and the precise one was never the final word.
-                    // RFC 9113 5.4.1 makes the code the whole content of a
-                    // connection error; overwriting it is worse than not
-                    // having it, because it reports the wrong cause.
+                    // table -- and then return Err to stop the loop. A second,
+                    // unconditional GOAWAY here would make PROTOCOL_ERROR the
+                    // last code the peer reads every time, so the precise one
+                    // would never be the final word. RFC 9113 5.4.1 makes the
+                    // code the whole content of a connection error; overwriting
+                    // it is worse than not having it, because it reports the
+                    // wrong cause.
                     if !self.goaway_sent {
                         self.send_goaway(ERR_PROTOCOL_ERROR);
                     }
@@ -1044,13 +1051,23 @@ impl Http2Conn {
                     _ => FrameVerdict::ConnectionError(ERR_STREAM_CLOSED),
                 },
 
-                // Reserved states are reachable only through PUSH_PROMISE.
-                // This server never pushes and rejects a client PUSH_PROMISE
-                // outright, so neither can occur; treat as protocol error
-                // rather than silently allowing an impossible state through.
-                StreamState::ReservedLocal | StreamState::ReservedRemote => {
-                    FrameVerdict::ConnectionError(ERR_PROTOCOL_ERROR)
-                }
+                // 5.1 reserved (local): this server has sent PUSH_PROMISE and
+                // has not yet sent the pushed response's HEADERS. "A PRIORITY
+                // or WINDOW_UPDATE frame MAY be received in this state.
+                // Receiving any type of frame other than RST_STREAM, PRIORITY,
+                // or WINDOW_UPDATE on a stream in this state MUST be treated as
+                // a connection error of type PROTOCOL_ERROR."
+                //
+                // RST_STREAM here is the ordinary case: it is how a client that
+                // does not want a pushed asset declines it. PRIORITY is allowed
+                // further up, for every state at once.
+                StreamState::ReservedLocal => match ftype {
+                    TYPE_WINDOW_UPDATE | TYPE_RST_STREAM => FrameVerdict::Allow,
+                    _ => FrameVerdict::ConnectionError(ERR_PROTOCOL_ERROR),
+                },
+                // No reserved (remote) arm: that row is commented out in
+                // `StreamState`, because a client PUSH_PROMISE is refused as a
+                // connection error before a stream could enter it.
             },
         }
     }
@@ -1288,12 +1305,12 @@ impl Http2Conn {
 
         // Flag-dependent prefixes, bounds-checked BEFORE slicing.
         //
-        // `pos += 5; &payload[pos..]` used to run unguarded, so a HEADERS frame
-        // with PRIORITY set and a payload shorter than five bytes panicked on
-        // an out-of-range slice. That is a remotely reachable panic from a
-        // three-byte frame -- no handshake beyond the preface required.
-        // RFC 9113 6.2 says a HEADERS frame shorter than the fields its flags
-        // declare is a FRAME_SIZE_ERROR, so that is what it now is.
+        // Unguarded, `pos += 5; &payload[pos..]` panics on an out-of-range
+        // slice for a HEADERS frame with PRIORITY set and a payload shorter
+        // than five bytes: a remotely reachable panic from a three-byte frame,
+        // no handshake beyond the preface required. RFC 9113 6.2 makes a
+        // HEADERS frame shorter than the fields its flags declare a
+        // FRAME_SIZE_ERROR, which is what it is answered with.
         //
         // Padding is also stripped from the END. It never was: the pad bytes
         // were left on the header block and handed to the HPACK decoder as
@@ -1369,12 +1386,13 @@ impl Http2Conn {
                 // END_STREAM is therefore neither trailers nor a second
                 // request; it is malformed.
                 //
-                // m6 used to decode it and wait for an END_STREAM that a
-                // conforming peer will never send, so the stream sat open until
-                // the idle timeout and h2spec saw a plain timeout. The block is
-                // still decoded above before we get here, deliberately: the
-                // HPACK dynamic table is connection-wide, so skipping a block
-                // would desynchronise every later one on a healthy stream.
+                // Waiting for an END_STREAM that a conforming peer will never
+                // send leaves the stream open until the idle timeout, which
+                // h2spec sees as a plain timeout rather than as the rejection it
+                // should be. The block is still decoded above before we get
+                // here, deliberately: the HPACK dynamic table is
+                // connection-wide, so skipping a block would desynchronise every
+                // later one on a healthy stream.
                 if flags & FLAG_END_STREAM == 0 {
                     tracing::debug!(stream_id, "h2: second HEADERS frame without END_STREAM");
                     self.push_frame(
@@ -1470,7 +1488,7 @@ impl Http2Conn {
         }
 
         // PADDED with an empty payload has nowhere to put the pad-length byte.
-        // This used to fall through and treat the frame as unpadded.
+        // Refused rather than treated as unpadded.
         if flags & FLAG_PADDED != 0 && payload.is_empty() {
             return Err("DATA: PADDED set but no pad-length byte");
         }
@@ -1499,8 +1517,8 @@ impl Http2Conn {
             let inc = DEFAULT_WINDOW as i32 - self.conn_recv_window;
             self.conn_recv_window += inc;
             // An increment of 0 is itself a PROTOCOL_ERROR (RFC 9113 6.9), so
-            // never emit one -- an empty DATA frame used to produce exactly
-            // that.
+            // never emit one. An empty DATA frame is the case that reaches here
+            // with nothing to credit back.
             if inc > 0 {
                 self.push_window_update(0, inc as u32);
             }
@@ -1686,14 +1704,25 @@ impl Http2Conn {
                 // as a 2xx by on_request), send:
                 //   1. PUSH_PROMISE on the request stream  (so the browser
                 //      knows not to request it separately)
-                //   2. HEADERS + DATA on a new server-initiated push stream
+                //   2. HEADERS on a new server-initiated push stream, then the
+                //      body through the ordinary flow-controlled sender
                 //
-                // Chrome 106+ removed push support; Firefox still honours it.
-                // Browsers that don't support push will send RST_STREAM on the
-                // push stream, which we ignore (the stream isn't in self.streams).
+                // A pushed stream is a stream: it is registered in `reserved
+                // (local)` before the promise goes out, moves to `half-closed
+                // (remote)` when its HEADERS are sent, and its body is handed to
+                // `flush_pending_streams` like any other. That is what keeps it
+                // inside RFC 9113 4.2 (DATA may not exceed the peer's
+                // SETTINGS_MAX_FRAME_SIZE) and 6.9 (DATA is subject to the
+                // per-stream window as well as the connection window), and it is
+                // what lets a client decline a push with RST_STREAM.
+                //
+                // `push_budget` bounds how much body is queued in memory for one
+                // response. Nothing caps `hints`, and this site's home page names
+                // about 105 assets. It is a memory bound only; the wire is
+                // governed by flow control.
+                let mut push_budget = self.conn_send_window;
                 for hint_url in hints.iter() {
-                    // Bail early if the connection send window is exhausted.
-                    if self.conn_send_window <= 0 {
+                    if push_budget <= 0 {
                         break;
                     }
 
@@ -1712,13 +1741,21 @@ impl Http2Conn {
                     if !(200..300).contains(&ps) {
                         continue;
                     }
-                    // Skip if the body exceeds the current connection send window.
-                    if pb.len() as i32 > self.conn_send_window {
+                    if pb.len() as i32 > push_budget {
                         continue;
                     }
+                    push_budget -= pb.len() as i32;
 
                     let push_stream_id = self.next_push_id;
                     self.next_push_id += 2;
+
+                    // RFC 9113 5.1: sending PUSH_PROMISE puts the promised
+                    // stream in reserved (local). Registered before the promise
+                    // is written, so the stream exists in the state machine from
+                    // the moment the peer is told about it.
+                    let mut pushed = H2Stream::new(self.peer_initial_window);
+                    pushed.state = StreamState::ReservedLocal;
+                    self.streams.insert(push_stream_id, pushed);
 
                     // PUSH_PROMISE on the request stream.
                     {
@@ -1738,7 +1775,12 @@ impl Http2Conn {
                         );
                     }
 
-                    // HEADERS on the push stream.
+                    // HEADERS on the push stream. RFC 9113 5.1: reserved
+                    // (local) plus HEADERS sent is half-closed (remote). A
+                    // client cannot send on a pushed stream, so it is finished
+                    // from its side the moment it is promised, and that is the
+                    // state `flush_pending_streams` needs to see in order to
+                    // reap the stream once the body has gone out.
                     let push_hdr_block = self.encode_response_headers(ps, &ph, pb.len());
                     self.push_frame(
                         TYPE_HEADERS,
@@ -1746,10 +1788,11 @@ impl Http2Conn {
                         push_stream_id,
                         &push_hdr_block,
                     );
-
-                    // DATA + END_STREAM on the push stream.
-                    self.push_frame(TYPE_DATA, FLAG_END_STREAM, push_stream_id, &pb);
-                    self.conn_send_window -= pb.len() as i32;
+                    if let Some(s) = self.streams.get_mut(&push_stream_id) {
+                        s.state = StreamState::HalfClosedRemote;
+                        s.resp_body = Some(pb);
+                        s.resp_sent = 0;
+                    }
                 }
             } else {
                 // Push disabled by client — fall back to 103 Early Hints.
@@ -1934,7 +1977,18 @@ impl Http2Conn {
                         .unwrap_or(true);
                     if peer_done {
                         self.close_stream_remembering_window(stream_id);
-                        self.last_stream_id = self.last_stream_id.max(stream_id);
+                        // Client-initiated streams only. `last_stream_id` is the
+                        // high-water mark of what the PEER has opened: it is what
+                        // `stream_state` uses to tell "not yet opened" (idle)
+                        // from "opened and finished" (closed), and what GOAWAY
+                        // reports. Pushed streams are server-initiated and
+                        // even-numbered, and push ids start at 2 and climb, so
+                        // counting one here would leave `last_stream_id` at 6
+                        // while the client's next legal HEADERS on stream 3
+                        // derived Closed and was answered STREAM_CLOSED.
+                        if stream_id % 2 == 1 {
+                            self.last_stream_id = self.last_stream_id.max(stream_id);
+                        }
                     } else if let Some(s) = self.streams.get_mut(&stream_id) {
                         s.state = StreamState::HalfClosedLocal;
                     }
@@ -2424,12 +2478,11 @@ mod frame_validation_tests {
         frame(TYPE_HEADERS, FLAG_END_HEADERS, stream_id, &block)
     }
 
-    /// The panic. A HEADERS frame declaring PRIORITY but carrying fewer than
-    /// the five bytes the priority fields require used to run
-    /// `&payload[pos..]` with `pos` past the end and abort the process.
-    ///
-    /// Reachable from a three-byte frame immediately after the preface, with no
-    /// other setup. Must be an error, never a panic.
+    /// A HEADERS frame declaring PRIORITY but carrying fewer than the five
+    /// bytes the priority fields require must be an error, never a panic:
+    /// unguarded, it slices `&payload[pos..]` past the end and aborts the
+    /// process. Reachable from a three-byte frame immediately after the
+    /// preface, with no other setup.
     #[test]
     fn short_priority_headers_frame_does_not_panic() {
         for short in 0..5usize {
@@ -2464,8 +2517,8 @@ mod frame_validation_tests {
         assert!(feed(&f).is_ok());
     }
 
-    /// PADDED with an empty payload has nowhere to put the pad-length byte.
-    /// This used to be silently treated as an unpadded frame.
+    /// PADDED with an empty payload has nowhere to put the pad-length byte, so
+    /// it must be refused rather than silently treated as unpadded.
     #[test]
     fn padded_data_with_empty_payload_is_rejected() {
         let mut f = open_stream(1);
@@ -2481,7 +2534,7 @@ mod frame_validation_tests {
         assert!(feed(&f).is_err());
     }
 
-    /// An empty DATA frame used to make the server emit WINDOW_UPDATE with an
+    /// An empty DATA frame must not make the server emit WINDOW_UPDATE with an
     /// increment of zero, which is itself a PROTOCOL_ERROR (RFC 9113 6.9).
     #[test]
     fn empty_data_never_emits_a_zero_window_update() {
@@ -2817,13 +2870,12 @@ mod stream_state_tests {
 
     /// The precise code must survive the driver's generic error handling.
     ///
-    /// `drive()`'s `Err` arm used to append `GOAWAY(PROTOCOL_ERROR)` whatever
-    /// the handler had already sent, so ENHANCE_YOUR_CALM and
-    /// COMPRESSION_ERROR were both overwritten on the wire and the peer's last
-    /// word was always PROTOCOL_ERROR. The tests here could not see it: they
-    /// call `process_frame` directly and never reach that loop, which is
-    /// exactly why the flood above was measured against a real socket too.
-    /// This pins the flag that arm now consults.
+    /// An unconditional `GOAWAY(PROTOCOL_ERROR)` in `drive()`'s `Err` arm would
+    /// overwrite ENHANCE_YOUR_CALM and COMPRESSION_ERROR on the wire and make
+    /// PROTOCOL_ERROR the peer's last word every time. The tests here cannot
+    /// see that on their own: they call `process_frame` directly and never
+    /// reach that loop, which is why the flood above is measured against a real
+    /// socket too. This pins the flag that arm consults.
     #[test]
     fn a_specific_goaway_marks_the_connection_as_already_told() {
         let mut c = Http2Conn::new();
@@ -3065,9 +3117,9 @@ mod f005_regression {
     }
 
     /// F-005 defect 1. A 200 KB frame is twelve times the RFC 9113 4.2 default
-    /// of 16384, which applies because we advertise exactly that. It used to be
-    /// buffered in full; the length is a u24, so frames up to ~16 MiB were
-    /// accepted.
+    /// of 16384, which applies because we advertise exactly that. It must be
+    /// refused before it is buffered: the length field is a u24, so accepting
+    /// one on faith admits frames up to ~16 MiB.
     #[test]
     fn oversized_frame_is_refused_before_buffering() {
         let mut c = Http2Conn::new();
@@ -3723,12 +3775,12 @@ mod issue_7_intermittent_conformance {
     /// any special behavior". h2spec sends GOAWAY, then a PING, and expects
     /// either a clean close or a PING ACK.
     ///
-    /// We used to take `Phase::GoingAway` on receipt, which with no streams open
-    /// becomes `Phase::Done` in the same `drive` call, and the caller then closed
-    /// the socket. The PING arriving immediately afterwards hit a closed socket,
-    /// so the kernel answered RST and h2spec reported "connection reset by peer".
-    /// It failed or passed depending on whether the PING landed before our close,
-    /// which is the whole of why it looked intermittent.
+    /// Taking `Phase::GoingAway` on receipt is what must not happen: with no
+    /// streams open it becomes `Phase::Done` in the same `drive` call, the
+    /// caller closes the socket, and the PING arriving immediately afterwards
+    /// hits a closed one. The kernel answers RST and h2spec reports "connection
+    /// reset by peer", passing or failing on whether the PING lands before the
+    /// close, which is the whole of why that shape looks intermittent.
     #[test]
     fn a_received_goaway_does_not_close_the_connection() {
         let mut c = Http2Conn::new();
@@ -3887,5 +3939,148 @@ mod issue_7_intermittent_conformance {
         v.extend_from_slice(&stream_id.to_be_bytes());
         v.extend_from_slice(payload);
         v
+    }
+}
+
+#[cfg(test)]
+mod server_push_tests {
+    use super::stream_state_tests::sent_frames;
+    use super::*;
+    use std::sync::Arc;
+
+    /// Larger than `DEFAULT_MAX_FRAME` and smaller than the connection window,
+    /// so it must span several frames and cannot be written as one.
+    const ASSET: usize = 40_000;
+
+    fn conn_with_open_stream() -> Http2Conn {
+        let mut c = Http2Conn::new();
+        c.phase = Phase::Active;
+        let w = c.peer_initial_window;
+        c.streams.insert(1, H2Stream::new(w));
+        c.last_stream_id = 1;
+        c
+    }
+
+    /// Serve a response on stream 1 that hints one cacheable asset, with push
+    /// enabled, so exactly one asset is pushed on stream 2.
+    fn serve_with_one_hint(c: &mut Http2Conn) {
+        let hints = Arc::new(vec!["/assets/style.css".to_string()]);
+        let mut on_request = |_: &HttpRequest, _: &str| {
+            RequestOutcome::Ready(
+                200,
+                vec![],
+                vec![b'x'; ASSET],
+                "cache".to_string(),
+                Arc::new(vec![]),
+            )
+        };
+        c.dispatch_h2_response(
+            1,
+            H2Response {
+                status: 200,
+                headers: vec![],
+                body: b"<html></html>".to_vec(),
+                hints,
+            },
+            &mut on_request,
+            "1.2.3.4",
+            "GET",
+        );
+    }
+
+    /// RFC 9113 4.2: a DATA frame may not exceed the peer's
+    /// SETTINGS_MAX_FRAME_SIZE, and exceeding it is a CONNECTION error of type
+    /// FRAME_SIZE_ERROR -- the whole connection, not the stream.
+    ///
+    /// The push path wrote the asset body as one frame, so any hinted asset
+    /// between 16 KB and the connection window killed the connection of every
+    /// client that had push enabled.
+    #[test]
+    fn pushed_data_is_split_to_the_peers_max_frame_size() {
+        let mut c = conn_with_open_stream();
+        serve_with_one_hint(&mut c);
+
+        let pushed: Vec<_> = sent_frames(&c.send_buf, TYPE_DATA)
+            .into_iter()
+            .filter(|(sid, _)| *sid == 2)
+            .collect();
+
+        assert!(
+            !pushed.is_empty(),
+            "nothing was pushed on stream 2, so this test is measuring nothing"
+        );
+        for (_, payload) in &pushed {
+            assert!(
+                payload.len() <= DEFAULT_MAX_FRAME as usize,
+                "pushed DATA frame of {} bytes exceeds SETTINGS_MAX_FRAME_SIZE {}",
+                payload.len(),
+                DEFAULT_MAX_FRAME
+            );
+        }
+        assert!(
+            pushed.len() > 1,
+            "a {ASSET} byte asset must span more than one frame at a {DEFAULT_MAX_FRAME} byte limit"
+        );
+        let total: usize = pushed.iter().map(|(_, p)| p.len()).sum();
+        assert_eq!(total, ASSET, "the pushed asset must arrive whole");
+    }
+
+    /// The pushed stream is a real stream, so it is subject to the per-stream
+    /// send window (RFC 9113 6.9) rather than the connection window alone.
+    #[test]
+    fn a_push_is_bounded_by_the_per_stream_window() {
+        let mut c = conn_with_open_stream();
+        c.peer_initial_window = 1_000;
+        serve_with_one_hint(&mut c);
+
+        let sent: usize = sent_frames(&c.send_buf, TYPE_DATA)
+            .into_iter()
+            .filter(|(sid, _)| *sid == 2)
+            .map(|(_, p)| p.len())
+            .sum();
+        assert_eq!(
+            sent, 1_000,
+            "a pushed stream may not send past its own window before WINDOW_UPDATE"
+        );
+    }
+
+    /// `last_stream_id` is the high-water mark of what the PEER has opened.
+    /// A pushed stream is server-initiated and even-numbered, and counting one
+    /// would make the client's next legal odd stream derive Closed.
+    #[test]
+    fn a_push_does_not_move_the_peer_stream_high_water_mark() {
+        let mut c = conn_with_open_stream();
+        serve_with_one_hint(&mut c);
+
+        assert_eq!(
+            c.last_stream_id, 1,
+            "a server-initiated push must not advance the peer's high-water mark"
+        );
+        assert_eq!(
+            c.stream_state(3),
+            StreamState::Idle,
+            "the client's next stream must still be openable"
+        );
+    }
+
+    /// RFC 9113 5.1 reserved (local): RST_STREAM, PRIORITY and WINDOW_UPDATE
+    /// are legal from the peer. Declining a push is the ordinary way a client
+    /// says it already has the asset.
+    #[test]
+    fn a_client_may_decline_a_push() {
+        let mut c = Http2Conn::new();
+        c.phase = Phase::Active;
+        let w = c.peer_initial_window;
+        let mut pushed = H2Stream::new(w);
+        pushed.state = StreamState::ReservedLocal;
+        c.streams.insert(2, pushed);
+
+        assert_eq!(c.frame_verdict(TYPE_RST_STREAM, 2), FrameVerdict::Allow);
+        assert_eq!(c.frame_verdict(TYPE_WINDOW_UPDATE, 2), FrameVerdict::Allow);
+        assert_eq!(
+            c.frame_verdict(TYPE_DATA, 2),
+            FrameVerdict::ConnectionError(ERR_PROTOCOL_ERROR),
+            "anything else on a reserved stream is a connection error"
+        );
     }
 }
