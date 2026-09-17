@@ -2921,13 +2921,19 @@ fn handle_request_inner(
                         m6_core::headers::get(&http_resp.headers[..], "content-type").unwrap_or("");
                     let hint_paths = hints::extract_hints(&http_resp.body, content_type);
                     // Queue any hints not already in the cache for prefetch.
+                    //
+                    // Split, because a hint carries the page's cache-busting
+                    // query and the key builders strip the path at `?`. Passing
+                    // the whole string as a path keys `/a.css?v=1` as `/a.css`
+                    // while still fetching the versioned resource.
                     for hp in &hint_paths {
+                        let (hpath, hquery) = hints::split_url(hp);
                         let mut kbuf = [0u8; 512];
-                        let lk = make_lookup_key(hp, None, "", &mut kbuf);
+                        let lk = make_lookup_key(hpath, hquery, "", &mut kbuf);
                         if state.cache.get(lk).is_none() {
                             state.queue_refresh(Refresh {
-                                path: hp.clone(),
-                                query: None,
+                                path: hpath.to_string(),
+                                query: hquery.map(str::to_string),
                                 enc: String::new(),
                             });
                         }
@@ -3739,12 +3745,14 @@ fn finalize_url_response_inner(
                     m6_core::headers::get(&http_resp.headers[..], "content-type").unwrap_or("");
                 let hint_paths = hints::extract_hints(&http_resp.body, content_type);
                 for hp in &hint_paths {
+                    // Split: see the socket-backend prefetch above.
+                    let (hpath, hquery) = hints::split_url(hp);
                     let mut kbuf = [0u8; 512];
-                    let lk = make_lookup_key(hp, None, "", &mut kbuf);
+                    let lk = make_lookup_key(hpath, hquery, "", &mut kbuf);
                     if state.cache.get(lk).is_none() {
                         state.queue_refresh(Refresh {
-                            path: hp.clone(),
-                            query: None,
+                            path: hpath.to_string(),
+                            query: hquery.map(str::to_string),
                             enc: String::new(),
                         });
                     }

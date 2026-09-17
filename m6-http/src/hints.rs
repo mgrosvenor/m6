@@ -127,6 +127,23 @@ pub fn extract_hints(body: &[u8], content_type: &str) -> Vec<String> {
     hints
 }
 
+/// Split a hint URL into the path and query a request is built from.
+///
+/// A hint is a URL as the page wrote it, so it carries its cache-busting query:
+/// `/assets/css/style.css?v=ae331def`. Anything turning one into a request must
+/// pass those as two parts, because the cache key builders strip the path at
+/// `?` and read the query only from their own argument. Hand them the whole
+/// string as a path and `/a.css?v=1` keys identically to `/a.css`, while the
+/// request still fetches the versioned resource: the versioned response is then
+/// stored under the unversioned key.
+pub fn split_url(url: &str) -> (&str, Option<&str>) {
+    match url.split_once('?') {
+        Some((path, query)) if !query.is_empty() => (path, Some(query)),
+        Some((path, _)) => (path, None),
+        None => (url, None),
+    }
+}
+
 /// Build the `Link:` header value for one hint URL.
 /// e.g. `</assets/style.css>; rel=preload; as=style`
 pub fn link_header(url: &str) -> String {
@@ -200,6 +217,25 @@ mod tests {
             link_header("/assets/css/style.css?v=ae331def"),
             "</assets/css/style.css?v=ae331def>; rel=preload; as=style"
         );
+    }
+
+    /// A hint is a URL, and anything building a request from one needs its two
+    /// parts separately. See `split_url` for what passing the whole string as a
+    /// path costs.
+    #[test]
+    fn a_hint_splits_into_the_path_and_query_a_request_needs() {
+        assert_eq!(
+            split_url("/assets/css/style.css?v=ae331def"),
+            ("/assets/css/style.css", Some("v=ae331def"))
+        );
+        assert_eq!(
+            split_url("/assets/fonts/montserrat.woff2"),
+            ("/assets/fonts/montserrat.woff2", None)
+        );
+        // A trailing `?` with nothing after it is not a query.
+        assert_eq!(split_url("/a.css?"), ("/a.css", None));
+        // Only the first `?` separates; the rest belongs to the query.
+        assert_eq!(split_url("/a.css?a=1?b=2"), ("/a.css", Some("a=1?b=2")));
     }
 
     /// HTML5 allows an unquoted attribute value, ending at whitespace or `>`.
