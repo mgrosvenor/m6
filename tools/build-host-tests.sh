@@ -387,6 +387,26 @@ cargo build --release -p render-cms 2>&1 | tail -1
 (cd "$M6_DIR" && cargo build --workspace --release 2>&1 | tail -1)
 
 cd examples/05-cms || exit 1
+
+# ── The port has to be ours ───────────────────────────────────────────────────
+#
+# This example binds 127.0.0.1:8443. Anything else already holding that port, or
+# holding 0.0.0.0:8443, which covers loopback, answers the readiness probe below
+# exactly as well as the example would, and the suite then measures a server
+# nobody has changed. A build host that doubles as a staging box has something on
+# 8443 as a matter of course.
+#
+# Refused rather than detected later, because the symptom is unreadable: whether
+# the example wins its bind is a race, so the same collision reports a different
+# number of assertion failures each run, none of which mention a port.
+if ss -ltnH 'sport = :8443' 2>/dev/null | grep -q .; then
+    echo "EG_CMS_STATUS=1"
+    echo "port 8443 is already bound on this host, so 05-cms cannot be measured:"
+    ss -ltnpH 'sport = :8443' 2>/dev/null | sed 's/^/    /'
+    echo "Stop whatever holds it, or move it, and run again."
+    exit 0
+fi
+
 M6="$M6_DIR" M6_NO_BROWSER=1 ./dev.sh --no-open > /tmp/eg-cms-dev.log 2>&1 &
 DEV_PID=$!
 up=0
@@ -403,6 +423,13 @@ if [ "$up" != "1" ]; then
     tail -30 /tmp/eg-cms-dev.log
     echo "--- service logs ---"
     tail -20 logs/*.log 2>/dev/null
+# A 200 says something is serving, not that it is the thing under test. Prove it
+# is this example before believing 98 assertions about it: the home page lists
+# recent posts, and nothing else on this host renders that.
+elif ! curl -sk --http1.1 https://127.0.0.1:8443/ 2>/dev/null | grep -q 'Recent Posts'; then
+    echo "EG_CMS_STATUS=1"
+    echo "something answered 200 on 8443 but it is not 05-cms, so nothing here was measured:"
+    ss -ltnpH 'sport = :8443' 2>/dev/null | sed 's/^/    /'
 else
     ./test.sh > /tmp/eg-cms-test.log 2>&1
     echo "EG_CMS_STATUS=$?"
