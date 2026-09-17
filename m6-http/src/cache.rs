@@ -1154,6 +1154,38 @@ pub fn strip_set_cookie(headers: &[(String, String)]) -> Vec<(String, String)> {
 mod tests {
     use super::*;
 
+    /// **A caller that does not split its URL gets one key for two resources.**
+    ///
+    /// Both key builders strip the path at `?` and read the query only from
+    /// their own argument, which stops a stray `?` smuggling one request's
+    /// query into another's key. The cost is this: hand the whole URL in as a
+    /// path and the version disappears from the key while the request still
+    /// fetches the versioned resource, so the versioned response is stored
+    /// where an unversioned request will find it.
+    ///
+    /// That reached production on 2026-09-17 as `Cache-Control: immutable` on
+    /// unversioned assets at both edges, once early hints started producing
+    /// URLs for the prefetch to fetch. Pinned here rather than left as a
+    /// comment, so the next caller meets it as a failing assumption.
+    #[test]
+    fn a_url_passed_whole_as_a_path_keys_the_same_as_the_unversioned_url() {
+        let mut a = [0u8; 512];
+        let mut b = [0u8; 512];
+        assert_eq!(
+            make_lookup_key("/a.css?v=1", None, "", &mut a),
+            make_lookup_key("/a.css", None, "", &mut b),
+            "the stripping is deliberate; callers must split before they get here"
+        );
+
+        // Split properly, and the two are distinct, which is the whole point.
+        let mut c = [0u8; 512];
+        let mut d = [0u8; 512];
+        assert_ne!(
+            make_lookup_key("/a.css", Some("v=1"), "", &mut c),
+            make_lookup_key("/a.css", None, "", &mut d)
+        );
+    }
+
     fn make_response(status: u16, cc: &str) -> (u16, Vec<(String, String)>, Vec<u8>) {
         let headers = if cc.is_empty() {
             vec![]
