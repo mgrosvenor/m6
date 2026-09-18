@@ -77,9 +77,17 @@ pub struct HandshakeSample {
     ///
     /// Reported separately and never blended with full handshakes: a resumed one
     /// skips the certificate and the signature, so mixing them gives a figure that
-    /// tracks the returning-visitor mix rather than the cost of either. rustls
-    /// with the `std` feature defaults to a 256-session store, so this happens in
-    /// production without anything being configured for it.
+    /// tracks the returning-visitor mix rather than the cost of either.
+    ///
+    /// This used to say resumption "happens in production without anything being
+    /// configured for it", on the strength of rustls' default 256-session store.
+    /// That was the assumption that let the defect sit: 256 entries is nothing on
+    /// a node taking hundreds of handshakes an hour, so the store evicted every
+    /// browser before it came back and this field read 0% on the http/2 channel
+    /// across the whole fleet while reading 90% on http/1.1, where the only
+    /// clients were a monitor polling on repeat. `make_tls_server_config` now
+    /// installs a ticketer, which is what makes resumption stateless and this
+    /// number mean something.
     pub resumed: bool,
 }
 
