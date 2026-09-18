@@ -907,8 +907,7 @@ fn event_loop(
                     let mut outcome = handle_request(
                         req, client_ip, enc_str, state, false, /* from_internal */ false,
                     );
-                    if let RequestOutcome::Ready(status, ref mut headers, _, ref backend) =
-                        outcome
+                    if let RequestOutcome::Ready(status, ref mut headers, _, ref backend) = outcome
                     {
                         set_alt_svc(headers, quic_port);
                         // /health and /perf are separated inside
@@ -1203,8 +1202,7 @@ fn event_loop(
                         false,
                         state.h2c_iface == Iface::Internal,
                     );
-                    if let RequestOutcome::Ready(status, ref mut headers, _, ref backend) =
-                        outcome
+                    if let RequestOutcome::Ready(status, ref mut headers, _, ref backend) = outcome
                     {
                         set_alt_svc(headers, quic_port);
                         // /health and /perf are separated inside
@@ -2447,12 +2445,7 @@ fn handle_request_inner(
         } else {
             b"Not Implemented"
         };
-        return RequestOutcome::Ready(
-            status,
-            headers,
-            body.to_vec(),
-            "method-check".to_string(),
-        );
+        return RequestOutcome::Ready(status, headers, body.to_vec(), "method-check".to_string());
     }
 
     // ── Health endpoint, ahead of routing/cache/backends ────────────────────
@@ -2491,12 +2484,7 @@ fn handle_request_inner(
             client_ip,
             None,
         );
-        return RequestOutcome::Ready(
-            code,
-            headers,
-            body,
-            health::HEALTH_BACKEND.to_string(),
-        );
+        return RequestOutcome::Ready(code, headers, body, health::HEALTH_BACKEND.to_string());
     }
 
     // ── Metrics endpoint, deliberately a separate path from /health ─────────
@@ -2546,12 +2534,7 @@ fn handle_request_inner(
             client_ip,
             None,
         );
-        return RequestOutcome::Ready(
-            code,
-            headers,
-            body,
-            health::PERF_BACKEND.to_string(),
-        );
+        return RequestOutcome::Ready(code, headers, body, health::PERF_BACKEND.to_string());
     }
 
     // ── Traffic summary, the third monitoring path ──────────────────────────
@@ -2578,12 +2561,7 @@ fn handle_request_inner(
             client_ip,
             None,
         );
-        return RequestOutcome::Ready(
-            code,
-            headers,
-            body,
-            health::PERF_BACKEND.to_string(),
-        );
+        return RequestOutcome::Ready(code, headers, body, health::PERF_BACKEND.to_string());
     }
 
     // The custom-error render route takes `status`/`from` (and optional
@@ -2627,12 +2605,7 @@ fn handle_request_inner(
                     ("Location".to_string(), location),
                     ("Content-Type".to_string(), "text/html".to_string()),
                 ];
-                return RequestOutcome::Ready(
-                    301,
-                    headers,
-                    vec![],
-                    "redirect".to_string(),
-                );
+                return RequestOutcome::Ready(301, headers, vec![], "redirect".to_string());
             }
             // Prefer fetching the real custom error page over the local
             // socket-pool path (`apply_error_mode`/`forward_to_backend` only
@@ -2673,12 +2646,7 @@ fn handle_request_inner(
                             ("Location".to_string(), redirect_url),
                             ("Content-Type".to_string(), "text/html".to_string()),
                         ];
-                        return RequestOutcome::Ready(
-                            302,
-                            headers,
-                            vec![],
-                            "auth".to_string(),
-                        );
+                        return RequestOutcome::Ready(302, headers, vec![], "auth".to_string());
                     }
                     let ctx = error::ErrorContext {
                         route: Some(route.path.clone()),
@@ -3611,12 +3579,7 @@ fn finalize_url_response_inner(
                         latency_ns: Some(latency_ns),
                     },
                 );
-                (
-                    original_status,
-                    headers,
-                    body,
-                    "error".to_string(),
-                )
+                (original_status, headers, body, "error".to_string())
             }
         };
     }
