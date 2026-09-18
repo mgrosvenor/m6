@@ -91,17 +91,9 @@ where
             listener.drive_all(
                 |req, client_ip| {
                     let (s, h, b, be) = handler(req, client_ip);
-                    RequestOutcome::Ready(s, h, b, be, std::sync::Arc::new(vec![]))
+                    RequestOutcome::Ready(s, h, b, be)
                 },
-                |_resp, _ctx| {
-                    (
-                        503,
-                        vec![],
-                        vec![],
-                        "none".to_string(),
-                        std::sync::Arc::new(vec![]),
-                    )
-                },
+                |_resp, _ctx| (503, vec![], vec![], "none".to_string()),
                 &poller,
             );
             thread::sleep(Duration::from_millis(2));

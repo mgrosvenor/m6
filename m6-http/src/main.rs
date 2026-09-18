@@ -47,15 +47,10 @@ type CachedErrorPage = (std::time::Instant, Vec<(String, String)>, Vec<u8>);
 
 /// What finalizing a URL-backend response yields: the status, the response
 /// headers, the body, the name of the backend that served it, and the early
-/// hints URLs to advertise. Returned by both `finalize_url_response` and its
-/// inner half, which is why it is worth a name.
-type FinalizedResponse = (
-    u16,
-    Vec<(String, String)>,
-    Vec<u8>,
-    String,
-    std::sync::Arc<Vec<String>>,
-);
+/// Returned by both `finalize_url_response` and its inner half, which is why it
+/// is worth a name. It used to carry a fifth element, the hint URLs to
+/// advertise; see issue #93 for why those are gone.
+type FinalizedResponse = (u16, Vec<(String, String)>, Vec<u8>, String);
 
 /// How long a fetched error document is reused before being re-fetched.
 /// Short enough that a redeployed error page appears promptly, long enough
@@ -64,7 +59,6 @@ const ERROR_PAGE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 use m6_http_lib::auth::PublicKey;
 use m6_http_lib::h2c_client::H2cClientPool;
 use m6_http_lib::h2s_client::H2sTlsClientPool;
-use m6_http_lib::hints;
 use m6_http_lib::http11::{make_tls_server_config, H2cListener, Http11Listener, RequestOutcome};
 use m6_http_lib::poller::{Poller, Token, WakeReader, WakeWriter};
 use m6_http_lib::pool::{self, PoolManager};
@@ -754,7 +748,6 @@ fn event_loop(
                             headers,
                             Vec::new(),
                             "cache".to_string(),
-                            std::sync::Arc::new(vec![]),
                         );
                     }
                     // Serve stale immediately and refresh behind the request:
@@ -831,7 +824,6 @@ fn event_loop(
                                 headers,
                                 Vec::new(),
                                 "cache".to_string(),
-                                cached.hints.clone(),
                             );
                         }
                         if precond == Precondition::NotModified {
@@ -874,16 +866,10 @@ fn event_loop(
                                 headers,
                                 Vec::new(),
                                 "cache".to_string(),
-                                cached.hints.clone(),
                             );
                         }
 
                         let mut headers: Vec<(String, String)> = (*cached.headers).clone();
-                        // Add Link: preload headers to the 200 response for clients/CDNs
-                        // that strip 1xx informational responses.
-                        for url in cached.hints.iter() {
-                            headers.push(("link".to_string(), hints::link_header(url)));
-                        }
                         set_alt_svc(&mut headers, quic_port);
                         set_vary_accept_encoding(&mut headers, true);
                         set_age(&mut headers, age);
@@ -915,15 +901,13 @@ fn event_loop(
                             headers,
                             cached.body.to_vec(),
                             "cache".to_string(),
-                            cached.hints.clone(),
                         );
                     } // end cache hit
 
                     let mut outcome = handle_request(
                         req, client_ip, enc_str, state, false, /* from_internal */ false,
                     );
-                    if let RequestOutcome::Ready(status, ref mut headers, _, ref backend, _) =
-                        outcome
+                    if let RequestOutcome::Ready(status, ref mut headers, _, ref backend) = outcome
                     {
                         set_alt_svc(headers, quic_port);
                         // /health and /perf are separated inside
@@ -969,12 +953,8 @@ fn event_loop(
                 },
                 |http_result, ctx| {
                     let state = unsafe { &mut *state_ptr };
-                    let (status, mut headers, body, backend_name, hints) =
+                    let (status, headers, body, backend_name) =
                         finalize_url_response(http_result, ctx, quic_port, state);
-                    // Add Link: preload headers to the response (fallback for proxies/CDNs).
-                    for url in hints.iter() {
-                        headers.push(("link".to_string(), hints::link_header(url)));
-                    }
                     let elapsed_ns = ctx.start.elapsed().as_nanos() as u64;
                     let chan =
                         Channel::new(HttpVersion::from_wire(&ctx.req.version), state.tls_iface);
@@ -990,7 +970,7 @@ fn event_loop(
                         cache_hit = false,
                         "request complete (async url backend)"
                     );
-                    (status, headers, body, backend_name, hints)
+                    (status, headers, body, backend_name)
                 },
                 &poller,
             );
@@ -1065,7 +1045,6 @@ fn event_loop(
                             headers,
                             Vec::new(),
                             "cache".to_string(),
-                            std::sync::Arc::new(vec![]),
                         );
                     }
                     // Serve stale now, refresh behind the request — see the
@@ -1135,7 +1114,6 @@ fn event_loop(
                                 headers,
                                 Vec::new(),
                                 "cache".to_string(),
-                                cached.hints.clone(),
                             );
                         }
                         if precond == Precondition::NotModified {
@@ -1178,14 +1156,10 @@ fn event_loop(
                                 headers,
                                 Vec::new(),
                                 "cache".to_string(),
-                                cached.hints.clone(),
                             );
                         }
 
                         let mut headers: Vec<(String, String)> = (*cached.headers).clone();
-                        for url in cached.hints.iter() {
-                            headers.push(("link".to_string(), hints::link_header(url)));
-                        }
                         set_alt_svc(&mut headers, quic_port);
                         set_vary_accept_encoding(&mut headers, true);
                         set_age(&mut headers, age);
@@ -1217,7 +1191,6 @@ fn event_loop(
                             headers,
                             cached.body.to_vec(),
                             "cache".to_string(),
-                            cached.hints.clone(),
                         );
                     } // end cache hit
 
@@ -1229,8 +1202,7 @@ fn event_loop(
                         false,
                         state.h2c_iface == Iface::Internal,
                     );
-                    if let RequestOutcome::Ready(status, ref mut headers, _, ref backend, _) =
-                        outcome
+                    if let RequestOutcome::Ready(status, ref mut headers, _, ref backend) = outcome
                     {
                         set_alt_svc(headers, quic_port);
                         // /health and /perf are separated inside
@@ -1277,11 +1249,8 @@ fn event_loop(
                 },
                 |http_result, ctx| {
                     let state = unsafe { &mut *state_ptr2 };
-                    let (status, mut headers, body, backend_name, hints) =
+                    let (status, headers, body, backend_name) =
                         finalize_url_response(http_result, ctx, quic_port, state);
-                    for url in hints.iter() {
-                        headers.push(("link".to_string(), hints::link_header(url)));
-                    }
                     let elapsed_ns = ctx.start.elapsed().as_nanos() as u64;
                     let chan = Channel::new(HttpVersion::Http2, state.h2c_iface);
                     state
@@ -1296,7 +1265,7 @@ fn event_loop(
                         cache_hit = false,
                         "request complete (async url backend)"
                     );
-                    (status, headers, body, backend_name, hints)
+                    (status, headers, body, backend_name)
                 },
                 &poller,
             );
@@ -1335,15 +1304,8 @@ fn event_loop(
                     };
                 if let Some(http_result) = result {
                     let (_, ctx) = qconn.pending_url.remove(&sid).unwrap();
-                    let (status, mut resp_headers, body, _, hints) =
+                    let (status, resp_headers, body, _) =
                         finalize_url_response(http_result, &ctx, quic_port, state);
-                    // Add Link: preload headers.
-                    for url in hints.iter() {
-                        resp_headers.push(("link".to_string(), hints::link_header(url)));
-                    }
-                    if !hints.is_empty() {
-                        send_h3_early_hints(sid, qconn, &hints);
-                    }
                     send_h3_response(
                         sid,
                         qconn,
@@ -1828,7 +1790,7 @@ fn handle_h3_request(
                 .then(|| std::str::from_utf8(h.value()).ok().map(str::to_string))
                 .flatten()
         });
-        if let Some(RequestOutcome::Ready(status, headers, body, _, _)) =
+        if let Some(RequestOutcome::Ready(status, headers, body, _)) =
             check_rate_limit(state, &client_ip, path_str, ua_owned.as_deref())
         {
             // Rate-limit rejection: tiny body, but a HEAD still must not carry one.
@@ -2033,19 +1995,12 @@ fn handle_h3_request(
                 latency_ns: Some(elapsed_ns),
             },
         );
-
-        if !cached.hints.is_empty() {
-            send_h3_early_hints(stream_id, qconn, &cached.hints);
-        }
         // Build headers with Link: preload / Vary / Set-Cookie appended as
         // needed. Vary is now always added on a cache hit (the cache key is
         // already segmented by encoding, so this just documents that to
         // downstream/shared caches), so this always takes the owned-Vec
         // branch rather than reusing `&cached.headers` unmodified.
         let mut headers_with_links: Vec<(String, String)> = (*cached.headers).clone();
-        for url in cached.hints.iter() {
-            headers_with_links.push(("link".to_string(), hints::link_header(url)));
-        }
         set_vary_accept_encoding(&mut headers_with_links, true);
         set_age(&mut headers_with_links, age);
         set_describedby_link(&mut headers_with_links, &state.config.site.describedby);
@@ -2101,11 +2056,7 @@ fn handle_h3_request(
     match handle_request(
         &http_req, &client_ip, enc_str, state, false, /* from_internal */ false,
     ) {
-        RequestOutcome::Ready(status, mut resp_headers, body, backend_name, hints) => {
-            // Add Link: preload headers to the response (fallback for proxies/CDNs).
-            for url in hints.iter() {
-                resp_headers.push(("link".to_string(), hints::link_header(url)));
-            }
+        RequestOutcome::Ready(status, mut resp_headers, body, backend_name) => {
             // Add alt-svc header.
             set_alt_svc(&mut resp_headers, quic_port);
 
@@ -2124,10 +2075,6 @@ fn handle_h3_request(
                 cache_hit = false,
                 "request complete"
             );
-
-            if !hints.is_empty() {
-                send_h3_early_hints(stream_id, qconn, &hints);
-            }
             send_h3_response(
                 stream_id,
                 qconn,
@@ -2159,22 +2106,6 @@ fn write_decimal(mut n: usize, buf: &mut [u8; 20]) -> &[u8] {
         n /= 10;
     }
     &buf[pos..]
-}
-
-fn send_h3_early_hints(stream_id: u64, qconn: &mut QuicConn, hint_urls: &[String]) {
-    let h3 = match qconn.h3_conn.as_mut() {
-        Some(h) => h,
-        None => return,
-    };
-    let link_values: Vec<String> = hint_urls.iter().map(|u| hints::link_header(u)).collect();
-    let mut h3_headers: Vec<quiche::h3::Header> = Vec::with_capacity(link_values.len() + 1);
-    h3_headers.push(quiche::h3::Header::new(b":status", b"103"));
-    for lv in &link_values {
-        h3_headers.push(quiche::h3::Header::new(b"link", lv.as_bytes()));
-    }
-    if let Err(e) = h3.send_response(&mut qconn.conn, stream_id, &h3_headers, false) {
-        warn!("h3 early hints send error: {}", e);
-    }
 }
 
 fn send_h3_response(
@@ -2341,7 +2272,6 @@ fn www_redirect(req: &forward::HttpRequest, config: &config::Config) -> Option<R
         www_redirect_headers(location),
         vec![],
         "www-redirect".to_string(),
-        std::sync::Arc::new(vec![]),
     ))
 }
 
@@ -2409,7 +2339,7 @@ fn handle_request(
         is_prefetch,
         from_internal,
     );
-    if let RequestOutcome::Ready(status, ref mut headers, _, ref backend, _) = outcome {
+    if let RequestOutcome::Ready(status, ref mut headers, _, ref backend) = outcome {
         let compresses = state.config.backend_compresses(backend);
         set_vary_accept_encoding(headers, compresses);
         set_date(headers);
@@ -2515,13 +2445,7 @@ fn handle_request_inner(
         } else {
             b"Not Implemented"
         };
-        return RequestOutcome::Ready(
-            status,
-            headers,
-            body.to_vec(),
-            "method-check".to_string(),
-            std::sync::Arc::new(vec![]),
-        );
+        return RequestOutcome::Ready(status, headers, body.to_vec(), "method-check".to_string());
     }
 
     // ── Health endpoint, ahead of routing/cache/backends ────────────────────
@@ -2560,13 +2484,7 @@ fn handle_request_inner(
             client_ip,
             None,
         );
-        return RequestOutcome::Ready(
-            code,
-            headers,
-            body,
-            health::HEALTH_BACKEND.to_string(),
-            std::sync::Arc::new(vec![]),
-        );
+        return RequestOutcome::Ready(code, headers, body, health::HEALTH_BACKEND.to_string());
     }
 
     // ── Metrics endpoint, deliberately a separate path from /health ─────────
@@ -2616,13 +2534,7 @@ fn handle_request_inner(
             client_ip,
             None,
         );
-        return RequestOutcome::Ready(
-            code,
-            headers,
-            body,
-            health::PERF_BACKEND.to_string(),
-            std::sync::Arc::new(vec![]),
-        );
+        return RequestOutcome::Ready(code, headers, body, health::PERF_BACKEND.to_string());
     }
 
     // ── Traffic summary, the third monitoring path ──────────────────────────
@@ -2649,13 +2561,7 @@ fn handle_request_inner(
             client_ip,
             None,
         );
-        return RequestOutcome::Ready(
-            code,
-            headers,
-            body,
-            health::PERF_BACKEND.to_string(),
-            std::sync::Arc::new(vec![]),
-        );
+        return RequestOutcome::Ready(code, headers, body, health::PERF_BACKEND.to_string());
     }
 
     // The custom-error render route takes `status`/`from` (and optional
@@ -2679,7 +2585,7 @@ fn handle_request_inner(
     // forwarded client address is trusted on that listener.
     if error::refuses_custom_error_path(&state.error_mode, &req.path, from_internal) {
         let (s, h, b, n) = apply_error_mode(404, req, client_ip, state, None);
-        return RequestOutcome::Ready(s, h, b, n, std::sync::Arc::new(vec![]));
+        return RequestOutcome::Ready(s, h, b, n);
     }
 
     // Route lookup
@@ -2699,13 +2605,7 @@ fn handle_request_inner(
                     ("Location".to_string(), location),
                     ("Content-Type".to_string(), "text/html".to_string()),
                 ];
-                return RequestOutcome::Ready(
-                    301,
-                    headers,
-                    vec![],
-                    "redirect".to_string(),
-                    std::sync::Arc::new(vec![]),
-                );
+                return RequestOutcome::Ready(301, headers, vec![], "redirect".to_string());
             }
             // Prefer fetching the real custom error page over the local
             // socket-pool path (`apply_error_mode`/`forward_to_backend` only
@@ -2717,7 +2617,7 @@ fn handle_request_inner(
                 return outcome;
             }
             let (s, h, b, n) = apply_error_mode(404, req, client_ip, state, None);
-            return RequestOutcome::Ready(s, h, b, n, std::sync::Arc::new(vec![]));
+            return RequestOutcome::Ready(s, h, b, n);
         }
     };
 
@@ -2746,13 +2646,7 @@ fn handle_request_inner(
                             ("Location".to_string(), redirect_url),
                             ("Content-Type".to_string(), "text/html".to_string()),
                         ];
-                        return RequestOutcome::Ready(
-                            302,
-                            headers,
-                            vec![],
-                            "auth".to_string(),
-                            std::sync::Arc::new(vec![]),
-                        );
+                        return RequestOutcome::Ready(302, headers, vec![], "auth".to_string());
                     }
                     let ctx = error::ErrorContext {
                         route: Some(route.path.clone()),
@@ -2760,7 +2654,7 @@ fn handle_request_inner(
                         detail: Some("no token".to_string()),
                     };
                     let (s, h, b, n) = apply_error_mode(401, req, client_ip, state, Some(&ctx));
-                    return RequestOutcome::Ready(s, h, b, n, std::sync::Arc::new(vec![]));
+                    return RequestOutcome::Ready(s, h, b, n);
                 }
                 Some(token) => match pk.verify(token) {
                     Err(e) => {
@@ -2771,7 +2665,7 @@ fn handle_request_inner(
                             detail: Some(e.to_string()),
                         };
                         let (s, h, b, n) = apply_error_mode(401, req, client_ip, state, Some(&ctx));
-                        return RequestOutcome::Ready(s, h, b, n, std::sync::Arc::new(vec![]));
+                        return RequestOutcome::Ready(s, h, b, n);
                     }
                     Ok(claims) => {
                         if !auth::check_require(&claims, require) {
@@ -2787,7 +2681,7 @@ fn handle_request_inner(
                             };
                             let (s, h, b, n) =
                                 apply_error_mode(403, req, client_ip, state, Some(&ctx));
-                            return RequestOutcome::Ready(s, h, b, n, std::sync::Arc::new(vec![]));
+                            return RequestOutcome::Ready(s, h, b, n);
                         }
                         // Forward verified claims to backend as X-Auth-Claims header
                         // (base64-encoded JSON so renderers can inspect them).
@@ -2858,7 +2752,7 @@ fn handle_request_inner(
                         detail: Some(e.to_string()),
                     };
                     let (s, h, b, n) = apply_error_mode(502, req, client_ip, state, Some(&ctx));
-                    return RequestOutcome::Ready(s, h, b, n, std::sync::Arc::new(vec![]));
+                    return RequestOutcome::Ready(s, h, b, n);
                 }
             }
         } else if url.starts_with("h2s://") {
@@ -2876,7 +2770,7 @@ fn handle_request_inner(
                         detail: Some(e.to_string()),
                     };
                     let (s, h, b, n) = apply_error_mode(502, req, client_ip, state, Some(&ctx));
-                    return RequestOutcome::Ready(s, h, b, n, std::sync::Arc::new(vec![]));
+                    return RequestOutcome::Ready(s, h, b, n);
                 }
             }
         } else {
@@ -2914,30 +2808,6 @@ fn handle_request_inner(
                     && request_permits_storage(&req.headers)
                     && should_cache(http_resp.status, &http_resp.headers)
                 {
-                    // Extract early-hints from the response body (HTML only).
-                    // This is done ONLY on the cache-miss path to keep the
-                    // cache-hit path at <10 µs.
-                    let content_type =
-                        m6_core::headers::get(&http_resp.headers[..], "content-type").unwrap_or("");
-                    let hint_paths = hints::extract_hints(&http_resp.body, content_type);
-                    // Queue any hints not already in the cache for prefetch.
-                    //
-                    // Split, because a hint carries the page's cache-busting
-                    // query and the key builders strip the path at `?`. Passing
-                    // the whole string as a path keys `/a.css?v=1` as `/a.css`
-                    // while still fetching the versioned resource.
-                    for hp in &hint_paths {
-                        let (hpath, hquery) = hints::split_url(hp);
-                        let mut kbuf = [0u8; 512];
-                        let lk = make_lookup_key(hpath, hquery, "", &mut kbuf);
-                        if state.cache.get(lk).is_none() {
-                            state.queue_refresh(Refresh {
-                                path: hpath.to_string(),
-                                query: hquery.map(str::to_string),
-                                enc: String::new(),
-                            });
-                        }
-                    }
                     let key = CacheKey::new(&req.path, req.query.as_deref(), content_encoding);
                     state.cache.insert(
                         key,
@@ -2954,7 +2824,6 @@ fn handle_request_inner(
                             // future Set-Cookie-emitting backend happens to use.
                             headers: std::sync::Arc::new(strip_set_cookie(&http_resp.headers)),
                             body: Bytes::from(http_resp.body.clone()),
-                            hints: std::sync::Arc::new(hint_paths),
                         },
                     );
                 }
@@ -3006,19 +2875,8 @@ fn handle_request_inner(
                 latency_ns: Some(backend_ns),
             },
         );
-        return RequestOutcome::Ready(s, h, b, n, std::sync::Arc::new(vec![]));
+        return RequestOutcome::Ready(s, h, b, n);
     }
-
-    // Retrieve hints from cache (populated above if cacheable).
-    let hints_arc = {
-        let mut kbuf = [0u8; 512];
-        let lk = make_lookup_key(&req.path, req.query.as_deref(), content_encoding, &mut kbuf);
-        state
-            .cache
-            .get(lk)
-            .map(|c| c.hints.clone())
-            .unwrap_or_else(|| std::sync::Arc::new(vec![]))
-    };
 
     let backend_ns = backend_start.elapsed().as_nanos() as u64;
     analytics::finish_response(
@@ -3035,7 +2893,7 @@ fn handle_request_inner(
         },
     );
 
-    RequestOutcome::Ready(status, resp_headers, body, backend_name, hints_arc)
+    RequestOutcome::Ready(status, resp_headers, body, backend_name)
 }
 
 /// Check the per-IP rate limit ahead of everything else (cache lookup,
@@ -3070,7 +2928,6 @@ fn check_rate_limit(
         headers,
         b"Too Many Requests".to_vec(),
         "rate-limit".to_string(),
-        std::sync::Arc::new(vec![]),
     ))
 }
 
@@ -3136,7 +2993,6 @@ fn dispatch_custom_error_async(
             headers,
             body,
             "error-local".to_string(),
-            std::sync::Arc::new(vec![]),
         ));
     }
 
@@ -3581,8 +3437,12 @@ fn is_registered_method(method: &str) -> bool {
 /// Same duplication hazard as `set_alt_svc`: a cache node's backend is the
 /// origin, which already added this header before the response was forwarded
 /// and cached, so the node would otherwise emit two. Existing `describedby`
-/// links are dropped first — and *only* those, because `Link` is also carrying
-/// the preload hints, which must survive untouched.
+/// links are dropped first, and *only* those, because `Link` may be carrying
+/// anything else a backend set and none of it is ours to discard. Until
+/// 2026-09-18 the thing it had to protect was this server's own preload hints;
+/// those are gone (issue #93), but a backend or an author may still declare
+/// `Link` headers of their own, so the rule is unchanged and now rests on a
+/// better reason: selective replacement is correct regardless of who set them.
 fn set_describedby_link(headers: &mut Vec<(String, String)>, target: &str) {
     if target.is_empty() || !analytics::is_html_response(headers) {
         return;
@@ -3597,7 +3457,7 @@ fn set_describedby_link(headers: &mut Vec<(String, String)>, target: &str) {
 }
 
 /// Called when a URL-backend I/O thread returns its result.  Handles cache
-/// insertion, hints extraction, alt-svc injection, and error mode application.
+/// insertion, alt-svc injection, and error mode application.
 ///
 /// Wrapped for the same reason as `handle_request`: this is the async
 /// completion path, so it never passes through that wrapper, and a response
@@ -3690,7 +3550,6 @@ fn finalize_url_response_inner(
                     headers,
                     http_resp.body,
                     "error".to_string(),
-                    std::sync::Arc::new(vec![]),
                 )
             }
             Err(e) => {
@@ -3720,13 +3579,7 @@ fn finalize_url_response_inner(
                         latency_ns: Some(latency_ns),
                     },
                 );
-                (
-                    original_status,
-                    headers,
-                    body,
-                    "error".to_string(),
-                    std::sync::Arc::new(vec![]),
-                )
+                (original_status, headers, body, "error".to_string())
             }
         };
     }
@@ -3741,22 +3594,6 @@ fn finalize_url_response_inner(
                 && request_permits_storage(&ctx.req.headers)
                 && should_cache(http_resp.status, &http_resp.headers)
             {
-                let content_type =
-                    m6_core::headers::get(&http_resp.headers[..], "content-type").unwrap_or("");
-                let hint_paths = hints::extract_hints(&http_resp.body, content_type);
-                for hp in &hint_paths {
-                    // Split: see the socket-backend prefetch above.
-                    let (hpath, hquery) = hints::split_url(hp);
-                    let mut kbuf = [0u8; 512];
-                    let lk = make_lookup_key(hpath, hquery, "", &mut kbuf);
-                    if state.cache.get(lk).is_none() {
-                        state.queue_refresh(Refresh {
-                            path: hpath.to_string(),
-                            query: hquery.map(str::to_string),
-                            enc: String::new(),
-                        });
-                    }
-                }
                 let key = CacheKey::new(&req.path, req.query.as_deref(), enc);
                 // strip_set_cookie matters here specifically: this backend
                 // can itself be another m6-http instance (a cache node's
@@ -3771,7 +3608,6 @@ fn finalize_url_response_inner(
                         status: http_resp.status,
                         headers: std::sync::Arc::new(strip_set_cookie(&http_resp.headers)),
                         body: Bytes::from(http_resp.body.clone()),
-                        hints: std::sync::Arc::new(hint_paths),
                     },
                 );
             }
@@ -3822,19 +3658,8 @@ fn finalize_url_response_inner(
                 latency_ns: Some(latency_ns),
             },
         );
-        return (s, h, b, n, std::sync::Arc::new(vec![]));
+        return (s, h, b, n);
     }
-
-    // Retrieve hints from cache (populated above if cacheable).
-    let hints_arc = {
-        let mut kbuf = [0u8; 512];
-        let lk = make_lookup_key(&req.path, req.query.as_deref(), enc, &mut kbuf);
-        state
-            .cache
-            .get(lk)
-            .map(|c| c.hints.clone())
-            .unwrap_or_else(|| std::sync::Arc::new(vec![]))
-    };
 
     let mut headers_with_altsvc = resp_headers;
     set_alt_svc(&mut headers_with_altsvc, quic_port);
@@ -3859,7 +3684,7 @@ fn finalize_url_response_inner(
         },
     );
 
-    (status, headers_with_altsvc, body, used_backend, hints_arc)
+    (status, headers_with_altsvc, body, used_backend)
 }
 
 // ── QUIC packet flush helpers ─────────────────────────────────────────────────
@@ -4841,8 +4666,10 @@ mod describedby_tests {
         assert_eq!(links(&h).len(), 1);
     }
 
-    /// The one that would be easy to break: `Link` also carries the preload
-    /// hints. Only the describedby entry may be replaced.
+    /// The one that would be easy to break: `Link` may carry preloads a backend
+    /// or an author declared. Only the describedby entry may be replaced. m6 no
+    /// longer generates preload links itself (issue #93), but relaying someone
+    /// else's is exactly the case this has to keep getting right.
     #[test]
     fn preserves_preload_link_headers() {
         let mut h = hdrs(&[

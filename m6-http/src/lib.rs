@@ -9,7 +9,6 @@ pub mod forward;
 pub mod h2c_client;
 pub mod h2s_client;
 pub mod health;
-pub mod hints;
 pub mod http11;
 pub mod http2;
 pub mod poller;
