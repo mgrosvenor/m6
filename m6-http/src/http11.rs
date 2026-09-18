@@ -31,13 +31,7 @@ use crate::poller::{Poller, Token};
 /// The result of dispatching a request to a backend.
 pub enum RequestOutcome {
     /// Response is available immediately (cache hit, socket backend, auth error, etc.)
-    Ready(
-        u16,
-        Vec<(String, String)>,
-        Vec<u8>,
-        String,
-        std::sync::Arc<Vec<String>>,
-    ),
+    Ready(u16, Vec<(String, String)>, Vec<u8>, String),
     /// URL backend I/O dispatched to a thread; poll `rx` with `try_recv()`.
     Pending {
         rx: std::sync::mpsc::Receiver<std::io::Result<HttpResponse>>,
@@ -324,13 +318,7 @@ impl Http11Listener {
         G: FnMut(
             std::io::Result<HttpResponse>,
             &PendingUrlContext,
-        ) -> (
-            u16,
-            Vec<(String, String)>,
-            Vec<u8>,
-            String,
-            std::sync::Arc<Vec<String>>,
-        ),
+        ) -> (u16, Vec<(String, String)>, Vec<u8>, String),
     {
         // `Vec::new()` does not allocate until something is pushed, and most
         // wakeups complete no handshake at all, so the common path here is free.
@@ -464,13 +452,7 @@ impl H2cListener {
         G: FnMut(
             std::io::Result<HttpResponse>,
             &PendingUrlContext,
-        ) -> (
-            u16,
-            Vec<(String, String)>,
-            Vec<u8>,
-            String,
-            std::sync::Arc<Vec<String>>,
-        ),
+        ) -> (u16, Vec<(String, String)>, Vec<u8>, String),
     {
         for conn in &mut self.conns {
             conn.h2.drive(
@@ -499,13 +481,7 @@ where
     G: FnMut(
         std::io::Result<HttpResponse>,
         &PendingUrlContext,
-    ) -> (
-        u16,
-        Vec<(String, String)>,
-        Vec<u8>,
-        String,
-        std::sync::Arc<Vec<String>>,
-    ),
+    ) -> (u16, Vec<(String, String)>, Vec<u8>, String),
 {
     // Plaintext connection: HTTP/1.1 only, straight to the state machine. No
     // handshake to pump and no ALPN to dispatch on.
@@ -739,13 +715,7 @@ where
     G: FnMut(
         std::io::Result<HttpResponse>,
         &PendingUrlContext,
-    ) -> (
-        u16,
-        Vec<(String, String)>,
-        Vec<u8>,
-        String,
-        std::sync::Arc<Vec<String>>,
-    ),
+    ) -> (u16, Vec<(String, String)>, Vec<u8>, String),
 {
     if h1.created.elapsed().as_secs() > READ_TIMEOUT_SECS {
         h1.state = H1State::Done;
@@ -862,18 +832,10 @@ where
                         h1.keep_alive =
                             wants_keep_alive(&req) && h1.served + 1 < MAX_REQUESTS_PER_CONN;
                         match on_request(&req, &h1.client_ip) {
-                            RequestOutcome::Ready(status, resp_headers, body, _, hints) => {
+                            RequestOutcome::Ready(status, resp_headers, body, _) => {
+                                // No 103 Early Hints here. See issue #93 and the
+                                // note in http2.rs where the h2 version lived.
                                 let mut buf = Vec::new();
-                                if !hints.is_empty() {
-                                    buf.extend_from_slice(b"HTTP/1.1 103 Early Hints\r\n");
-                                    for url in hints.iter() {
-                                        let lh = crate::hints::link_header(url);
-                                        buf.extend_from_slice(b"link: ");
-                                        buf.extend_from_slice(lh.as_bytes());
-                                        buf.extend_from_slice(b"\r\n");
-                                    }
-                                    buf.extend_from_slice(b"\r\n");
-                                }
                                 buf.extend_from_slice(&build_response(
                                     status,
                                     &resp_headers,
@@ -913,18 +875,8 @@ where
                         "url backend thread died",
                     )),
                 };
-                let (status, resp_headers, body, _, hints) = on_response(http_result, &ctx);
+                let (status, resp_headers, body, _) = on_response(http_result, &ctx);
                 let mut buf = Vec::new();
-                if !hints.is_empty() {
-                    buf.extend_from_slice(b"HTTP/1.1 103 Early Hints\r\n");
-                    for url in hints.iter() {
-                        let lh = crate::hints::link_header(url);
-                        buf.extend_from_slice(b"link: ");
-                        buf.extend_from_slice(lh.as_bytes());
-                        buf.extend_from_slice(b"\r\n");
-                    }
-                    buf.extend_from_slice(b"\r\n");
-                }
                 buf.extend_from_slice(&build_response(
                     status,
                     &resp_headers,

@@ -215,7 +215,6 @@ fn finding_5_distinct_query_strings_must_not_share_a_cache_entry() {
             status: 200,
             headers: std::sync::Arc::new(vec![("cache-control".to_string(), "public".to_string())]),
             body: bytes::Bytes::from_static(b"ATTACKER CONTROLLED"),
-            hints: std::sync::Arc::new(vec![]),
         },
     );
 
