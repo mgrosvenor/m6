@@ -366,7 +366,6 @@ mod phase11 {
             status: 200,
             headers: std::sync::Arc::new(headers.clone()),
             body: bytes::Bytes::from_static(b"cached"),
-            hints: std::sync::Arc::new(vec![]),
         };
         cache.insert(key.clone(), resp);
         assert!(cache.get(&key).is_some());
@@ -380,7 +379,6 @@ mod phase11 {
             status: 200,
             headers: std::sync::Arc::new(vec![("cache-control".to_string(), "public".to_string())]),
             body: bytes::Bytes::from_static(b"body"),
-            hints: std::sync::Arc::new(vec![]),
         };
         cache.insert(key.clone(), resp);
 
@@ -417,7 +415,6 @@ mod phase11 {
                     "gzip".to_string(),
                 )]),
                 body: bytes::Bytes::from_static(b"gzip-body"),
-                hints: std::sync::Arc::new(vec![]),
             },
         );
 
@@ -433,7 +430,6 @@ mod phase11 {
                     "br".to_string(),
                 )]),
                 body: bytes::Bytes::from_static(b"br-body"),
-                hints: std::sync::Arc::new(vec![]),
             },
         );
 
@@ -472,7 +468,6 @@ mod phase11 {
                     "public".to_string(),
                 )]),
                 body: bytes::Bytes::from_static(b"hello world post"),
-                hints: std::sync::Arc::new(vec![]),
             },
         );
 

@@ -7,15 +7,11 @@ use std::borrow::Borrow;
 /// `headers` and `hints` are `Arc<Vec<...>>` so clone is a single atomic
 /// refcount bump — no string copies on the cache-hit hot path.
 ///
-/// `hints` contains absolute-path URLs extracted from the response body on the
-/// first (cache-miss) pass.  They are used to send `103 Early Hints` on every
-/// subsequent request, including cache hits, without re-scanning the body.
 #[derive(Debug, Clone)]
 pub struct CachedResponse {
     pub status: u16,
     pub headers: std::sync::Arc<Vec<(String, String)>>,
     pub body: bytes::Bytes,
-    pub hints: std::sync::Arc<Vec<String>>,
 }
 // Conditional requests and preconditions live in `m6_core::conditional`.
 // They are version-independent semantics with two consumers, and the second
@@ -969,8 +965,7 @@ fn entry_footprint(key: &CacheKey, response: &CachedResponse) -> usize {
         .iter()
         .map(|(k, v)| k.len() + v.len() + 2)
         .sum();
-    let hints: usize = response.hints.iter().map(|h| h.len()).sum();
-    key.0.len() + response.body.len() + headers + hints + std::mem::size_of::<CacheEntry>()
+    key.0.len() + response.body.len() + headers + std::mem::size_of::<CacheEntry>()
 }
 
 /// Determine whether a response should be cached.
@@ -1275,7 +1270,6 @@ mod tests {
             status: 200,
             headers: std::sync::Arc::new(vec![]),
             body: bytes::Bytes::from_static(b"world"),
-            hints: std::sync::Arc::new(vec![]),
         };
         cache.insert(key.clone(), resp);
 
@@ -1302,7 +1296,6 @@ mod tests {
             status: 200,
             headers: std::sync::Arc::new(headers),
             body: bytes::Bytes::from_static(b"world"),
-            hints: std::sync::Arc::new(vec![]),
         }
     }
 
@@ -1479,7 +1472,6 @@ mod tests {
             status: 200,
             headers: std::sync::Arc::new(vec![]),
             body: bytes::Bytes::new(),
-            hints: std::sync::Arc::new(vec![]),
         };
         cache.insert(k1.clone(), resp.clone());
         cache.insert(k2.clone(), resp.clone());
@@ -1510,7 +1502,6 @@ mod tests {
             status: 200,
             headers: std::sync::Arc::new(vec![]),
             body: bytes::Bytes::new(),
-            hints: std::sync::Arc::new(vec![]),
         };
         cache.insert(k.clone(), resp);
         // evict with query — should still evict
@@ -1530,7 +1521,6 @@ mod tests {
             status: 200,
             headers: std::sync::Arc::new(vec![("cache-control".to_string(), "public".to_string())]),
             body: bytes::Bytes::from_static(b"cached body"),
-            hints: std::sync::Arc::new(vec![]),
         };
 
         // First: check miss
@@ -1569,7 +1559,6 @@ mod tests {
             status: 200,
             headers: std::sync::Arc::new(headers),
             body: bytes::Bytes::from_static(body),
-            hints: std::sync::Arc::new(vec![]),
         }
     }
 
@@ -1707,7 +1696,6 @@ mod tests {
             status: 200,
             headers: std::sync::Arc::new(vec![]),
             body: bytes::Bytes::new(),
-            hints: std::sync::Arc::new(vec![]),
         };
         cache.insert(CacheKey::new("/page", Some("a=1"), ""), resp.clone());
         cache.insert(CacheKey::new("/page", Some("a=2"), "gzip"), resp.clone());
@@ -1833,7 +1821,6 @@ mod method_gate_tests {
                 status: 200,
                 headers: std::sync::Arc::new(vec![]),
                 body: bytes::Bytes::from_static(b"full GET body"),
-                hints: std::sync::Arc::new(vec![]),
             },
         );
 
@@ -2025,7 +2012,6 @@ mod age_tests {
                     .collect(),
             ),
             body: bytes::Bytes::from_static(b"x"),
-            hints: std::sync::Arc::new(vec![]),
         }
     }
 
@@ -2116,7 +2102,6 @@ mod heuristic_freshness_tests {
             status: 200,
             headers: std::sync::Arc::new(vec![("cache-control".into(), cc.into())]),
             body: bytes::Bytes::from_static(b"x"),
-            hints: std::sync::Arc::new(vec![]),
         }
     }
 
@@ -2184,7 +2169,6 @@ mod expires_tests {
                 status: 200,
                 headers: std::sync::Arc::new(headers),
                 body: bytes::Bytes::from_static(b"x"),
-                hints: std::sync::Arc::new(vec![]),
             },
         );
         let map = c.map.read().unwrap();
@@ -2428,7 +2412,6 @@ mod request_directive_tests {
             status: 200,
             headers: std::sync::Arc::new(vec![("cache-control".into(), cc.into())]),
             body: bytes::Bytes::from_static(b"body"),
-            hints: std::sync::Arc::new(vec![]),
         };
         cache.insert(key.clone(), resp);
         (cache, key)
@@ -2493,7 +2476,6 @@ mod corrected_age_tests {
                     .collect(),
             ),
             body: bytes::Bytes::from_static(b"x"),
-            hints: std::sync::Arc::new(vec![]),
         }
     }
     fn http_date_ago(secs: u64) -> String {
@@ -2653,7 +2635,6 @@ mod capacity_tests {
                 "public, max-age=86400".to_string(),
             )]),
             body: bytes::Bytes::from(vec![0u8; body_len]),
-            hints: std::sync::Arc::new(vec![]),
         }
     }
 
@@ -2749,7 +2730,6 @@ mod capacity_accounting_tests {
                 "public, max-age=86400".to_string(),
             )]),
             body: bytes::Bytes::from(vec![0u8; n]),
-            hints: std::sync::Arc::new(vec![]),
         }
     }
 
