@@ -14,6 +14,8 @@ releases only; work happens on `develop`. See `CONTRIBUTING.md`.
 
 ## Unreleased
 
+## 1.10.0 — 2026-09-19
+
 ### Removed
 
 **HTTP/2 server push and 103 Early Hints, and with them the hint extractor.**
