@@ -180,11 +180,16 @@ fn tag_defers_loading(body: &[u8], attr_pos: usize) -> bool {
     // this runs on the cache-miss path for every HTML response.
     const MAX_TAG: usize = 4096;
 
-    let start = body[..attr_pos]
-        .iter()
-        .rposition(|&b| b == b'<')
-        .filter(|s| attr_pos - s <= MAX_TAG);
-    let Some(start) = start else { return false };
+    // Search only the last MAX_TAG bytes, rather than searching all of them and
+    // then rejecting a far-away answer. The difference matters: this runs once
+    // per hinted attribute, and the homepage that prompted the change carries
+    // 105 of them, so an unbounded backward scan is 105 walks toward the start
+    // of a 54KB document on every cache miss.
+    let window = attr_pos.saturating_sub(MAX_TAG);
+    let Some(rel) = body[window..attr_pos].iter().rposition(|&b| b == b'<') else {
+        return false;
+    };
+    let start = window + rel;
     let end = body[attr_pos..]
         .iter()
         .position(|&b| b == b'>')
@@ -459,6 +464,20 @@ mod tests {
         // would drop every hint on any page that lazy-loads anything.
         let html = br#"<img src=/a/logo.jpg loading=lazy><img src=/a/hero.jpg>"#;
         assert_eq!(extract_hints(html, "text/html"), vec!["/a/hero.jpg"]);
+    }
+
+    #[test]
+    fn lazy_is_still_seen_far_into_a_large_document() {
+        // The backward walk looks at a bounded window, so a page big enough to
+        // exceed it must still get the right answer for tags inside it. 105 img
+        // tags in 54KB is the real shape this came from.
+        let mut html = Vec::new();
+        for i in 0..2000 {
+            html.extend_from_slice(format!("<p>filler paragraph number {i}</p>\n").as_bytes());
+        }
+        html.extend_from_slice(br#"<img src=/a/logo.jpg loading=lazy>"#);
+        html.extend_from_slice(br#"<img src=/a/hero.jpg>"#);
+        assert_eq!(extract_hints(&html, "text/html"), vec!["/a/hero.jpg"]);
     }
 
     #[test]
