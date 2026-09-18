@@ -176,7 +176,12 @@ const MAX_REFUSED_STREAK: u32 = 50;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamState {
     Idle,
-    ReservedLocal,
+    // ReservedLocal,
+    //
+    // RFC 9113 5.1's sixth state: a stream THIS server reserved by sending
+    // PUSH_PROMISE. Commented, not deleted, for the same reason as the row
+    // below: the table should still read against the RFC line by line. Nothing
+    // can enter it because this server does not push (issue #93).
     // ReservedRemote,
     //
     // RFC 9113 5.1's seventh state: a stream the PEER reserved by pushing to
@@ -224,7 +229,6 @@ struct H2Response {
     status: u16,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
-    hints: std::sync::Arc<Vec<String>>,
 }
 
 struct H2Stream {
@@ -355,9 +359,7 @@ pub struct Http2Conn {
 
     /// Next server-initiated (push) stream ID.  Server-initiated streams are
     /// even-numbered; starts at 2, incremented by 2 per push.
-    next_push_id: u32,
     /// False when the client sends SETTINGS_ENABLE_PUSH=0.
-    enable_push: bool,
     /// Whether this connection's peer may assert a client address on behalf of
     /// someone else. `Never` unless the listener explicitly granted it, so a
     /// connection that forgets to say anything is safe.
@@ -392,8 +394,6 @@ impl Http2Conn {
             peer_max_frame: DEFAULT_MAX_FRAME,
             conn_recv_window: DEFAULT_WINDOW as i32,
             conn_send_window: DEFAULT_WINDOW as i32,
-            next_push_id: 2,
-            enable_push: true,
             forwarded_trust: crate::forward::ForwardedTrust::Never,
         }
     }
@@ -430,7 +430,6 @@ impl Http2Conn {
             Vec<(String, String)>,
             Vec<u8>,
             String,
-            std::sync::Arc<Vec<String>>,
         ),
     {
         if self.phase == Phase::Done {
@@ -1051,23 +1050,19 @@ impl Http2Conn {
                     _ => FrameVerdict::ConnectionError(ERR_STREAM_CLOSED),
                 },
 
-                // 5.1 reserved (local): this server has sent PUSH_PROMISE and
-                // has not yet sent the pushed response's HEADERS. "A PRIORITY
-                // or WINDOW_UPDATE frame MAY be received in this state.
-                // Receiving any type of frame other than RST_STREAM, PRIORITY,
-                // or WINDOW_UPDATE on a stream in this state MUST be treated as
-                // a connection error of type PROTOCOL_ERROR."
+                // No reserved (local) or reserved (remote) arm. Both rows are
+                // commented out in `StreamState`:
                 //
-                // RST_STREAM here is the ordinary case: it is how a client that
-                // does not want a pushed asset declines it. PRIORITY is allowed
-                // further up, for every state at once.
-                StreamState::ReservedLocal => match ftype {
-                    TYPE_WINDOW_UPDATE | TYPE_RST_STREAM => FrameVerdict::Allow,
-                    _ => FrameVerdict::ConnectionError(ERR_PROTOCOL_ERROR),
-                },
-                // No reserved (remote) arm: that row is commented out in
-                // `StreamState`, because a client PUSH_PROMISE is refused as a
-                // connection error before a stream could enter it.
+                // - reserved (local) is entered by SENDING PUSH_PROMISE, and
+                //   this server does not push (issue #93).
+                // - reserved (remote) is entered by RECEIVING one, which RFC
+                //   9113 8.4 makes a connection error, answered at the frame
+                //   level before a stream object exists.
+                //
+                // Neither is reachable, so neither has an arm here. If push is
+                // ever reintroduced, 5.1's rule for reserved (local) is that
+                // only RST_STREAM, PRIORITY and WINDOW_UPDATE may arrive, and
+                // anything else is a PROTOCOL_ERROR.
             },
         }
     }
@@ -1108,10 +1103,15 @@ impl Http2Conn {
                         .set_max_table_size((val as usize).min(HPACK_MAX_TABLE_SIZE));
                 }
                 SETTING_ENABLE_PUSH => {
+                    // Still validated, never stored. RFC 9113 6.5.2 makes any
+                    // value other than 0 or 1 a connection error, and that is
+                    // true whether or not this server pushes. It does not: see
+                    // issue #93. There is nothing to remember, because the
+                    // answer to "may I push?" is no regardless of what the
+                    // client permits.
                     if val > 1 {
                         return Err("invalid ENABLE_PUSH");
                     }
-                    self.enable_push = val == 1;
                 }
                 SETTING_INITIAL_WINDOW_SIZE => {
                     if val > 0x7fff_ffff {
@@ -1656,7 +1656,7 @@ impl Http2Conn {
         .to_string();
 
         match on_request(&req, &client_ip) {
-            RequestOutcome::Ready(status, resp_headers, resp_body, _, hints) => {
+            RequestOutcome::Ready(status, resp_headers, resp_body, _) => {
                 let method = req.method.clone();
                 self.dispatch_h2_response(
                     stream_id,
@@ -1664,10 +1664,7 @@ impl Http2Conn {
                         status,
                         headers: resp_headers,
                         body: resp_body,
-                        hints,
                     },
-                    on_request,
-                    &client_ip,
                     &method,
                 );
             }
@@ -1681,139 +1678,49 @@ impl Http2Conn {
 
     /// Complete a synchronous (Ready) H2 response: send server push, encode headers,
     /// store body, and flush.
-    fn dispatch_h2_response<F>(
-        &mut self,
-        stream_id: u32,
-        resp: H2Response,
-        on_request: &mut F,
-        client_ip: &str,
-        method: &str,
-    ) where
-        F: FnMut(&HttpRequest, &str) -> RequestOutcome,
-    {
+    /// `on_request` and `client_ip` were parameters until 2026-09-18: push
+    /// re-entered the request handler to fetch each hinted asset. With push gone
+    /// this only writes the response it was handed. See issue #93.
+    fn dispatch_h2_response(&mut self, stream_id: u32, resp: H2Response, method: &str) {
         let H2Response {
             status,
             headers: resp_headers,
             body: resp_body,
-            hints,
         } = resp;
-        if !hints.is_empty() {
-            if self.enable_push {
-                // ── HTTP/2 Server Push ─────────────────────────────────────
-                // For each hinted asset that is already in the cache (returned
-                // as a 2xx by on_request), send:
-                //   1. PUSH_PROMISE on the request stream  (so the browser
-                //      knows not to request it separately)
-                //   2. HEADERS on a new server-initiated push stream, then the
-                //      body through the ordinary flow-controlled sender
-                //
-                // A pushed stream is a stream: it is registered in `reserved
-                // (local)` before the promise goes out, moves to `half-closed
-                // (remote)` when its HEADERS are sent, and its body is handed to
-                // `flush_pending_streams` like any other. That is what keeps it
-                // inside RFC 9113 4.2 (DATA may not exceed the peer's
-                // SETTINGS_MAX_FRAME_SIZE) and 6.9 (DATA is subject to the
-                // per-stream window as well as the connection window), and it is
-                // what lets a client decline a push with RST_STREAM.
-                //
-                // `push_budget` bounds how much body is queued in memory for one
-                // response. Nothing caps `hints`, and this site's home page names
-                // about 105 assets. It is a memory bound only; the wire is
-                // governed by flow control.
-                let mut push_budget = self.conn_send_window;
-                for hint_url in hints.iter() {
-                    if push_budget <= 0 {
-                        break;
-                    }
-
-                    // Split the hint: it carries the page's cache-busting query,
-                    // and the cache key builders strip the path at `?`. Passing
-                    // the whole URL as a path keys `/a.css?v=1` as `/a.css`
-                    // while still fetching the versioned resource, so the
-                    // versioned response lands under the unversioned key.
-                    let (hint_path, hint_query) = crate::hints::split_url(hint_url);
-                    let push_req = HttpRequest {
-                        method: "GET".to_string(),
-                        path: hint_path.to_string(),
-                        query: hint_query.map(str::to_string),
-                        version: "HTTP/2.0".to_string(),
-                        headers: vec![],
-                        body: vec![],
-                    };
-                    let (ps, ph, pb) = match on_request(&push_req, client_ip) {
-                        RequestOutcome::Ready(ps, ph, pb, _, _) => (ps, ph, pb),
-                        RequestOutcome::Pending { .. } => continue, // can't push async assets
-                    };
-                    if !(200..300).contains(&ps) {
-                        continue;
-                    }
-                    if pb.len() as i32 > push_budget {
-                        continue;
-                    }
-                    push_budget -= pb.len() as i32;
-
-                    let push_stream_id = self.next_push_id;
-                    self.next_push_id += 2;
-
-                    // RFC 9113 5.1: sending PUSH_PROMISE puts the promised
-                    // stream in reserved (local). Registered before the promise
-                    // is written, so the stream exists in the state machine from
-                    // the moment the peer is told about it.
-                    let mut pushed = H2Stream::new(self.peer_initial_window);
-                    pushed.state = StreamState::ReservedLocal;
-                    self.streams.insert(push_stream_id, pushed);
-
-                    // PUSH_PROMISE on the request stream.
-                    {
-                        let promised_id_bytes = (push_stream_id & 0x7fff_ffff).to_be_bytes();
-                        let hpack_req = self.hpack_enc.encode(vec![
-                            (b":method".as_ref(), b"GET".as_ref()),
-                            (b":path".as_ref(), hint_url.as_bytes()),
-                            (b":scheme".as_ref(), b"https".as_ref()),
-                        ]);
-                        let mut promise_payload = promised_id_bytes.to_vec();
-                        promise_payload.extend_from_slice(&hpack_req);
-                        self.push_frame(
-                            TYPE_PUSH_PROMISE,
-                            FLAG_END_HEADERS,
-                            stream_id,
-                            &promise_payload,
-                        );
-                    }
-
-                    // HEADERS on the push stream. RFC 9113 5.1: reserved
-                    // (local) plus HEADERS sent is half-closed (remote). A
-                    // client cannot send on a pushed stream, so it is finished
-                    // from its side the moment it is promised, and that is the
-                    // state `flush_pending_streams` needs to see in order to
-                    // reap the stream once the body has gone out.
-                    let push_hdr_block = self.encode_response_headers(ps, &ph, pb.len());
-                    self.push_frame(
-                        TYPE_HEADERS,
-                        FLAG_END_HEADERS,
-                        push_stream_id,
-                        &push_hdr_block,
-                    );
-                    if let Some(s) = self.streams.get_mut(&push_stream_id) {
-                        s.state = StreamState::HalfClosedRemote;
-                        s.resp_body = Some(pb);
-                        s.resp_sent = 0;
-                    }
-                }
-            } else {
-                // Push disabled by client — fall back to 103 Early Hints.
-                let early_block = {
-                    let mut pairs: Vec<(&[u8], &[u8])> = vec![(b":status", b"103")];
-                    let link_values: Vec<String> =
-                        hints.iter().map(|u| crate::hints::link_header(u)).collect();
-                    for lv in &link_values {
-                        pairs.push((b"link", lv.as_bytes()));
-                    }
-                    self.hpack_enc.encode(pairs)
-                };
-                self.push_frame(TYPE_HEADERS, FLAG_END_HEADERS, stream_id, &early_block);
-            }
-        }
+        // ── No server push, and no 103 Early Hints ───────────────────────
+        //
+        // Both were implemented here and removed on 2026-09-18. Neither is
+        // coming back without a measurement that justifies it, so the reasoning
+        // stays where the code was.
+        //
+        // HTTP/2 PUSH_PROMISE is a dead feature. The server cannot see the
+        // client's cache, so it ships bytes to a returning visitor who already
+        // has them; cache digests were proposed to close that and never
+        // shipped. Chrome removed push in 106, Firefox disabled it, and
+        // RFC 9113 dropped it from the specification.
+        //
+        // 103 Early Hints exists to fill the gap between a request arriving and
+        // the response being ready, so a browser can fetch subresources during
+        // backend think-time. m6 caches server side, so on a cache hit there is
+        // no gap: the 103 and the final response go out microseconds apart. The
+        // secondary argument, that it beats the HTML parser to the subresources,
+        // does not hold either, because `<link>` lives in `<head>` and a
+        // browser's preload scanner reaches it in the first kilobyte.
+        //
+        // The implementation also had to GUESS what to hint, by scanning the
+        // body for `href=`/`src=` and filtering on file extension, which cannot
+        // tell an `<img src>` from an `<a href>`. It preloaded images the page
+        // had marked `loading=lazy`, overriding the author, and a cache node
+        // emitted every hint twice.
+        //
+        // If a deployment ever has a slow uncached backend and wants this, build
+        // a RELAY, not an oracle: read the author's own `<link rel=preload>` and
+        // `rel=modulepreload` from `<head>` and promote those, which is what
+        // Cloudflare and Fastly do. It needs no guessing and cannot contradict
+        // the page. See issue #93.
+        //
+        // Receipt of a PUSH_PROMISE from a client is still a connection error
+        // (RFC 9113 8.4) and is still enforced, above.
 
         // Encode HPACK headers (needs &mut self.hpack_enc — no stream borrow active).
         // content-length still describes what a GET would have returned; the
@@ -1851,7 +1758,6 @@ impl Http2Conn {
             Vec<(String, String)>,
             Vec<u8>,
             String,
-            std::sync::Arc<Vec<String>>,
         ),
     {
         use std::sync::mpsc::TryRecvError;
@@ -1881,9 +1787,7 @@ impl Http2Conn {
                     .and_then(|s| s.pending_rx.take())
                     .map(|(_, ctx)| ctx);
                 if let Some(ctx) = ctx {
-                    let (status, resp_headers, resp_body, _, _hints) =
-                        on_response(http_result, &ctx);
-                    // No server push for async responses (hints only exist for cached assets which are Ready).
+                    let (status, resp_headers, resp_body, _) = on_response(http_result, &ctx);
                     // Same HEAD framing as the sync path above.
                     let advertised_len = resp_body.len();
                     let resp_body = if ctx.req.method.eq_ignore_ascii_case("HEAD") {
@@ -2424,7 +2328,6 @@ mod frame_validation_tests {
                 vec![],
                 b"ok".to_vec(),
                 "test".to_string(),
-                std::sync::Arc::new(vec![]),
             )
         };
         loop {
@@ -2553,7 +2456,6 @@ mod frame_validation_tests {
                 vec![],
                 vec![],
                 "t".to_string(),
-                std::sync::Arc::new(vec![]),
             )
         };
         let _ = c.process_frame(&mut on_request, "127.0.0.1");
@@ -2747,7 +2649,6 @@ mod stream_state_tests {
                 vec![],
                 b"ok".to_vec(),
                 "test".to_string(),
-                std::sync::Arc::new(vec![]),
             )
         };
         loop {
@@ -3044,7 +2945,6 @@ mod stream_state_tests {
                 vec![],
                 b"ok".to_vec(),
                 "t".to_string(),
-                std::sync::Arc::new(vec![]),
             )
         };
         while let Ok(true) = c.process_frame(&mut on_request, "127.0.0.1") {}
@@ -3110,7 +3010,6 @@ mod f005_regression {
                 vec![],
                 b"ok".to_vec(),
                 "t".to_string(),
-                std::sync::Arc::new(vec![]),
             )
         };
         loop {
@@ -3529,7 +3428,6 @@ mod hpack_table_size_setting_tests {
                 vec![],
                 b"ok".to_vec(),
                 "t".to_string(),
-                std::sync::Arc::new(vec![]),
             )
         };
         loop {
@@ -3605,7 +3503,6 @@ mod forwarded_client_ip_tests {
                     vec![],
                     b"ok".to_vec(),
                     "test".to_string(),
-                    std::sync::Arc::new(vec![]),
                 )
             };
             while let Ok(true) = c.process_frame(&mut on_request, peer_ip) {}
@@ -3952,44 +3849,46 @@ mod issue_7_intermittent_conformance {
 mod server_push_tests {
     use super::stream_state_tests::sent_frames;
     use super::*;
-    use std::sync::Arc;
 
     /// Larger than `DEFAULT_MAX_FRAME` and smaller than the connection window,
     /// so it must span several frames and cannot be written as one.
     const ASSET: usize = 40_000;
 
     fn conn_with_open_stream() -> Http2Conn {
+        conn_with_open_stream_windowed(None)
+    }
+
+    /// `peer_initial_window` has to be set BEFORE the stream is created, because
+    /// `H2Stream::new` copies it. Setting it afterwards leaves the stream on the
+    /// old window and the test measures the default instead of the value it set.
+    fn conn_with_open_stream_windowed(window: Option<i32>) -> Http2Conn {
         let mut c = Http2Conn::new();
         c.phase = Phase::Active;
+        if let Some(w) = window {
+            c.peer_initial_window = w;
+        }
         let w = c.peer_initial_window;
         c.streams.insert(1, H2Stream::new(w));
         c.last_stream_id = 1;
         c
     }
 
-    /// Serve a response on stream 1 that hints one cacheable asset, with push
-    /// enabled, so exactly one asset is pushed on stream 2.
-    fn serve_with_one_hint(c: &mut Http2Conn) {
-        let hints = Arc::new(vec!["/assets/style.css".to_string()]);
-        let mut on_request = |_: &HttpRequest, _: &str| {
-            RequestOutcome::Ready(
-                200,
-                vec![],
-                vec![b'x'; ASSET],
-                "cache".to_string(),
-                Arc::new(vec![]),
-            )
-        };
+    /// Serve one ordinary response on stream 1, big enough to span several
+    /// DATA frames.
+    ///
+    /// This was `serve_with_one_hint`, which pushed an asset on stream 2 so the
+    /// two tests below could measure outbound framing and flow control against
+    /// a pushed stream. Push is gone (issue #93), but both rules apply to every
+    /// response this server writes, so the tests were kept and pointed at an
+    /// ordinary one rather than deleted with the feature.
+    fn serve_a_large_response(c: &mut Http2Conn) {
         c.dispatch_h2_response(
             1,
             H2Response {
                 status: 200,
                 headers: vec![],
-                body: b"<html></html>".to_vec(),
-                hints,
+                body: vec![b'x'; ASSET],
             },
-            &mut on_request,
-            "1.2.3.4",
             "GET",
         );
     }
@@ -3998,95 +3897,55 @@ mod server_push_tests {
     /// SETTINGS_MAX_FRAME_SIZE, and exceeding it is a CONNECTION error of type
     /// FRAME_SIZE_ERROR -- the whole connection, not the stream.
     ///
-    /// The push path wrote the asset body as one frame, so any hinted asset
-    /// between 16 KB and the connection window killed the connection of every
-    /// client that had push enabled.
+    /// Found on the push path, where a body was written as one frame and any
+    /// asset between 16 KB and the connection window killed the connection. The
+    /// rule is not specific to push: it governs every DATA frame this server
+    /// writes, which is why this outlived the feature that exposed it.
     #[test]
-    fn pushed_data_is_split_to_the_peers_max_frame_size() {
+    fn outbound_data_is_split_to_the_peers_max_frame_size() {
         let mut c = conn_with_open_stream();
-        serve_with_one_hint(&mut c);
+        serve_a_large_response(&mut c);
 
         let pushed: Vec<_> = sent_frames(&c.send_buf, TYPE_DATA)
             .into_iter()
-            .filter(|(sid, _)| *sid == 2)
+            .filter(|(sid, _)| *sid == 1)
             .collect();
 
         assert!(
             !pushed.is_empty(),
-            "nothing was pushed on stream 2, so this test is measuring nothing"
+            "nothing was sent on stream 1, so this test is measuring nothing"
         );
         for (_, payload) in &pushed {
             assert!(
                 payload.len() <= DEFAULT_MAX_FRAME as usize,
-                "pushed DATA frame of {} bytes exceeds SETTINGS_MAX_FRAME_SIZE {}",
+                "DATA frame of {} bytes exceeds SETTINGS_MAX_FRAME_SIZE {}",
                 payload.len(),
                 DEFAULT_MAX_FRAME
             );
         }
         assert!(
             pushed.len() > 1,
-            "a {ASSET} byte asset must span more than one frame at a {DEFAULT_MAX_FRAME} byte limit"
+            "a {ASSET} byte body must span more than one frame at a {DEFAULT_MAX_FRAME} byte limit"
         );
         let total: usize = pushed.iter().map(|(_, p)| p.len()).sum();
-        assert_eq!(total, ASSET, "the pushed asset must arrive whole");
+        assert_eq!(total, ASSET, "the body must arrive whole");
     }
 
-    /// The pushed stream is a real stream, so it is subject to the per-stream
-    /// send window (RFC 9113 6.9) rather than the connection window alone.
+    /// A response is subject to the per-stream send window (RFC 9113 6.9), not
+    /// the connection window alone.
     #[test]
-    fn a_push_is_bounded_by_the_per_stream_window() {
-        let mut c = conn_with_open_stream();
-        c.peer_initial_window = 1_000;
-        serve_with_one_hint(&mut c);
+    fn a_response_is_bounded_by_the_per_stream_window() {
+        let mut c = conn_with_open_stream_windowed(Some(1_000));
+        serve_a_large_response(&mut c);
 
         let sent: usize = sent_frames(&c.send_buf, TYPE_DATA)
             .into_iter()
-            .filter(|(sid, _)| *sid == 2)
+            .filter(|(sid, _)| *sid == 1)
             .map(|(_, p)| p.len())
             .sum();
         assert_eq!(
             sent, 1_000,
-            "a pushed stream may not send past its own window before WINDOW_UPDATE"
-        );
-    }
-
-    /// `last_stream_id` is the high-water mark of what the PEER has opened.
-    /// A pushed stream is server-initiated and even-numbered, and counting one
-    /// would make the client's next legal odd stream derive Closed.
-    #[test]
-    fn a_push_does_not_move_the_peer_stream_high_water_mark() {
-        let mut c = conn_with_open_stream();
-        serve_with_one_hint(&mut c);
-
-        assert_eq!(
-            c.last_stream_id, 1,
-            "a server-initiated push must not advance the peer's high-water mark"
-        );
-        assert_eq!(
-            c.stream_state(3),
-            StreamState::Idle,
-            "the client's next stream must still be openable"
-        );
-    }
-
-    /// RFC 9113 5.1 reserved (local): RST_STREAM, PRIORITY and WINDOW_UPDATE
-    /// are legal from the peer. Declining a push is the ordinary way a client
-    /// says it already has the asset.
-    #[test]
-    fn a_client_may_decline_a_push() {
-        let mut c = Http2Conn::new();
-        c.phase = Phase::Active;
-        let w = c.peer_initial_window;
-        let mut pushed = H2Stream::new(w);
-        pushed.state = StreamState::ReservedLocal;
-        c.streams.insert(2, pushed);
-
-        assert_eq!(c.frame_verdict(TYPE_RST_STREAM, 2), FrameVerdict::Allow);
-        assert_eq!(c.frame_verdict(TYPE_WINDOW_UPDATE, 2), FrameVerdict::Allow);
-        assert_eq!(
-            c.frame_verdict(TYPE_DATA, 2),
-            FrameVerdict::ConnectionError(ERR_PROTOCOL_ERROR),
-            "anything else on a reserved stream is a connection error"
+            "a stream may not send past its own window before WINDOW_UPDATE"
         );
     }
 }
