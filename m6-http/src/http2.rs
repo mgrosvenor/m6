@@ -425,12 +425,7 @@ impl Http2Conn {
         G: FnMut(
             std::io::Result<HttpResponse>,
             &PendingUrlContext,
-        ) -> (
-            u16,
-            Vec<(String, String)>,
-            Vec<u8>,
-            String,
-        ),
+        ) -> (u16, Vec<(String, String)>, Vec<u8>, String),
     {
         if self.phase == Phase::Done {
             return;
@@ -1049,7 +1044,6 @@ impl Http2Conn {
                     _ if self.was_reset(stream_id) => FrameVerdict::StreamError(ERR_STREAM_CLOSED),
                     _ => FrameVerdict::ConnectionError(ERR_STREAM_CLOSED),
                 },
-
                 // No reserved (local) or reserved (remote) arm. Both rows are
                 // commented out in `StreamState`:
                 //
@@ -1753,12 +1747,7 @@ impl Http2Conn {
         G: FnMut(
             std::io::Result<HttpResponse>,
             &PendingUrlContext,
-        ) -> (
-            u16,
-            Vec<(String, String)>,
-            Vec<u8>,
-            String,
-        ),
+        ) -> (u16, Vec<(String, String)>, Vec<u8>, String),
     {
         use std::sync::mpsc::TryRecvError;
         let stream_ids: Vec<u32> = self.streams.keys().copied().collect();
@@ -2323,12 +2312,7 @@ mod frame_validation_tests {
         c.phase = Phase::Active;
         c.recv_buf.extend_from_slice(frames);
         let mut on_request = |_: &HttpRequest, _: &str| -> RequestOutcome {
-            RequestOutcome::Ready(
-                200,
-                vec![],
-                b"ok".to_vec(),
-                "test".to_string(),
-            )
+            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string())
         };
         loop {
             match c.process_frame(&mut on_request, "127.0.0.1") {
@@ -2451,12 +2435,7 @@ mod frame_validation_tests {
         c.phase = Phase::Active;
         c.recv_buf.extend_from_slice(&frame(TYPE_DATA, 0, 1, &[]));
         let mut on_request = |_: &HttpRequest, _: &str| -> RequestOutcome {
-            RequestOutcome::Ready(
-                200,
-                vec![],
-                vec![],
-                "t".to_string(),
-            )
+            RequestOutcome::Ready(200, vec![], vec![], "t".to_string())
         };
         let _ = c.process_frame(&mut on_request, "127.0.0.1");
 
@@ -2644,12 +2623,7 @@ mod stream_state_tests {
     fn run(c: &mut Http2Conn, bytes: &[u8]) -> Result<(), &'static str> {
         c.recv_buf.extend_from_slice(bytes);
         let mut on_request = |_: &HttpRequest, _: &str| -> RequestOutcome {
-            RequestOutcome::Ready(
-                200,
-                vec![],
-                b"ok".to_vec(),
-                "test".to_string(),
-            )
+            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string())
         };
         loop {
             match c.process_frame(&mut on_request, "127.0.0.1") {
@@ -2940,12 +2914,7 @@ mod stream_state_tests {
         c.phase = Phase::Active;
         c.recv_buf.extend_from_slice(&f);
         let mut on_request = |_: &HttpRequest, _: &str| -> RequestOutcome {
-            RequestOutcome::Ready(
-                200,
-                vec![],
-                b"ok".to_vec(),
-                "t".to_string(),
-            )
+            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "t".to_string())
         };
         while let Ok(true) = c.process_frame(&mut on_request, "127.0.0.1") {}
         assert_eq!(
@@ -3005,12 +2974,7 @@ mod f005_regression {
 
     fn drain_buf(c: &mut Http2Conn) -> Result<(), &'static str> {
         let mut on_request = |_: &HttpRequest, _: &str| -> RequestOutcome {
-            RequestOutcome::Ready(
-                200,
-                vec![],
-                b"ok".to_vec(),
-                "t".to_string(),
-            )
+            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "t".to_string())
         };
         loop {
             match c.process_frame(&mut on_request, "127.0.0.1") {
@@ -3423,12 +3387,7 @@ mod hpack_table_size_setting_tests {
         c.recv_buf
             .extend_from_slice(&settings(SETTING_HEADER_TABLE_SIZE, u32::MAX));
         let mut on_request = |_: &HttpRequest, _: &str| -> RequestOutcome {
-            RequestOutcome::Ready(
-                200,
-                vec![],
-                b"ok".to_vec(),
-                "t".to_string(),
-            )
+            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "t".to_string())
         };
         loop {
             match c.process_frame(&mut on_request, "127.0.0.1") {
@@ -3498,12 +3457,7 @@ mod forwarded_client_ip_tests {
                     .iter()
                     .any(|(k, _)| k.eq_ignore_ascii_case("x-forwarded-for"));
                 *seen.borrow_mut() = (ip.to_string(), survived);
-                RequestOutcome::Ready(
-                    200,
-                    vec![],
-                    b"ok".to_vec(),
-                    "test".to_string(),
-                )
+                RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string())
             };
             while let Ok(true) = c.process_frame(&mut on_request, peer_ip) {}
         }

@@ -59,12 +59,7 @@ fn host_is_safe(h: &str) -> bool {
 const ALLOW: &str = "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS";
 
 fn ready(status: u16, headers: Vec<(String, String)>) -> RequestOutcome {
-    RequestOutcome::Ready(
-        status,
-        headers,
-        Vec::new(),
-        String::new(),
-    )
+    RequestOutcome::Ready(status, headers, Vec::new(), String::new())
 }
 
 /// The whole of the redirect: one status, one header.
@@ -166,14 +161,7 @@ pub fn run(bind: &str) -> anyhow::Result<()> {
         listener.drive_all(
             |req, _client_ip| redirect_for(req),
             // No URL backends here, so no pending response can ever arrive.
-            |_resp, _ctx| {
-                (
-                    500,
-                    Vec::new(),
-                    Vec::new(),
-                    String::new(),
-                )
-            },
+            |_resp, _ctx| (500, Vec::new(), Vec::new(), String::new()),
             &poller,
         );
 

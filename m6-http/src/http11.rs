@@ -318,12 +318,7 @@ impl Http11Listener {
         G: FnMut(
             std::io::Result<HttpResponse>,
             &PendingUrlContext,
-        ) -> (
-            u16,
-            Vec<(String, String)>,
-            Vec<u8>,
-            String,
-        ),
+        ) -> (u16, Vec<(String, String)>, Vec<u8>, String),
     {
         // `Vec::new()` does not allocate until something is pushed, and most
         // wakeups complete no handshake at all, so the common path here is free.
@@ -457,12 +452,7 @@ impl H2cListener {
         G: FnMut(
             std::io::Result<HttpResponse>,
             &PendingUrlContext,
-        ) -> (
-            u16,
-            Vec<(String, String)>,
-            Vec<u8>,
-            String,
-        ),
+        ) -> (u16, Vec<(String, String)>, Vec<u8>, String),
     {
         for conn in &mut self.conns {
             conn.h2.drive(
@@ -491,12 +481,7 @@ where
     G: FnMut(
         std::io::Result<HttpResponse>,
         &PendingUrlContext,
-    ) -> (
-        u16,
-        Vec<(String, String)>,
-        Vec<u8>,
-        String,
-    ),
+    ) -> (u16, Vec<(String, String)>, Vec<u8>, String),
 {
     // Plaintext connection: HTTP/1.1 only, straight to the state machine. No
     // handshake to pump and no ALPN to dispatch on.
@@ -730,12 +715,7 @@ where
     G: FnMut(
         std::io::Result<HttpResponse>,
         &PendingUrlContext,
-    ) -> (
-        u16,
-        Vec<(String, String)>,
-        Vec<u8>,
-        String,
-    ),
+    ) -> (u16, Vec<(String, String)>, Vec<u8>, String),
 {
     if h1.created.elapsed().as_secs() > READ_TIMEOUT_SECS {
         h1.state = H1State::Done;

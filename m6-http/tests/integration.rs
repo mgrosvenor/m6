@@ -93,14 +93,7 @@ where
                     let (s, h, b, be) = handler(req, client_ip);
                     RequestOutcome::Ready(s, h, b, be)
                 },
-                |_resp, _ctx| {
-                    (
-                        503,
-                        vec![],
-                        vec![],
-                        "none".to_string(),
-                    )
-                },
+                |_resp, _ctx| (503, vec![], vec![], "none".to_string()),
                 &poller,
             );
             thread::sleep(Duration::from_millis(2));
