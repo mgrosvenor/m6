@@ -14,6 +14,93 @@ releases only; work happens on `develop`. See `CONTRIBUTING.md`.
 
 ## Unreleased
 
+## 1.9.0 — 2026-09-18
+
+Early hints stop overriding the page, and TLS connections stop paying for a full
+handshake every time. Both were found by measuring a live fleet rather than by
+reading the source, and both had been true for as long as the features existed.
+
+### Fixed
+
+**Every TLS connection did a full handshake, because the server issued session
+tickets and then had nowhere to match them.** `make_tls_server_config` took
+rustls' defaults, and for a public server they are the wrong ones:
+
+    session_storage: ServerSessionMemoryCache::new(256)   server/builder.rs:113
+    ticketer:        NeverProducesTickets                 server/builder.rs:116
+
+With no ticketer, TLS 1.3 resumption is **stateful**: the session is held
+server-side and the client gets a handle back, so every returning client needs
+its own entry still to be in a 256-entry cache. What the fleet's own monitor
+measured, in one hour:
+
+| node | channel | handshakes | resumed |
+|---|---|---:|---:|
+| origin | http/1.1/external | 451 | 90% |
+| origin | http/2/external | 197 | **0%** |
+| edge-a | http/2/external | 157 | **0%** |
+| edge-b | http/2/external | 165 | **0%** |
+
+Those look contradictory and are not. HTTP/1.1 there is a handful of clients
+polling on repeat, so their few entries stay resident. HTTP/2 is browsers: many
+distinct clients against 256 slots, evicted long before any of them returns.
+origin took 648 handshakes in that hour. The channel that resumed is the one that
+did not need to; the channel carrying visitors resumed never, and paid two extra
+round trips on every connection. A resumed handshake on that fleet ran **p50
+0.78ms against 207ms** for a full one.
+
+A `Ticketer` makes resumption stateless, so there is nothing per-client to evict
+and the cache size stops governing whether a browser resumes. `session_storage`
+is deliberately left at 256: TLS 1.3 never reads it once the ticketer exists, and
+`new(n)` allocates `HashMap::with_capacity(n)` plus `VecDeque::with_capacity(n)`
+up front, which is memory bought for a TLS 1.2 session-id path that carries
+scanners rather than visitors.
+
+**Verified with rustls on both ends** (`tests/tls_resumption.rs`), where
+`handshake_kind()` is the protocol's own answer. Not with `openssl s_client`,
+which was tried first and is useless here: macOS ships **LibreSSL 3.3.6** as
+`/usr/bin/openssl`, whose TLS 1.3 client resumption is incomplete, and it reports
+a full handshake even against a server that does resume. That was established by
+running it against a local build that resumes, not assumed.
+
+**Early hints preloaded images the page had marked `loading=lazy`.** On one live
+site, 17 of 17 lazy images were preloaded anyway: the page said "do not fetch
+this until it is needed", the server said "fetch it now" in the same response,
+and the hint won because it arrived first. Lazy loading on such a page was inert.
+`extract_hints` scanned for `href=`/`src=` and never looked at the rest of the
+enclosing tag. `fetchpriority=low` is honoured too, for the same reason.
+
+A server overriding an explicit, standardised author instruction is wrong whether
+or not it is faster, so this is not gated on showing a latency win.
+
+Only the enclosing tag is examined, over a bounded window. A document-wide search
+for `loading=lazy` would drop every hint on any page that lazy-loads anything;
+there is a test for exactly that.
+
+### Changed
+
+**Hints are ordered by what the resource is, not by its directory name.**
+`hints.sort()` was lexicographic over the URL, so on one site
+`/assets/company-logos/` sorted ahead of `/assets/css/` and the render-blocking
+stylesheet was announced 18th, behind 17 logos. Ranking on `preload_as` needs
+nothing about a site's layout, since `as=` is the standard's own statement of a
+resource's role.
+
+Stated honestly: browsers assign preload priority from `as=` rather than from
+header order, so this is unlikely to be worth much on its own. It is here because
+ordering by accident is not a decision anyone made.
+
+### Internal
+
+**`backends_contract` leaked a 95MB scratch directory into `/tmp` on every run.**
+Named by process id and never removed, holding the compiled C, C++ and Go
+backends plus `GOCACHE`. `/tmp` on the build host is a 3.7GB **tmpfs**, which that
+fills in roughly 39 runs, and it did: found at 82%, where it failed the merge gate
+twice without either failure naming a disk. One was a Go link dying on ENOSPC; the
+other was `render:minimal` reading 31% over its ceiling, which looks exactly like
+a real regression and is not. Stale directories are now swept by age before a new
+one is made, tested against a tempdir rather than the real `/tmp`.
+
 ## 1.8.1 — 2026-09-18
 
 ### Fixed
