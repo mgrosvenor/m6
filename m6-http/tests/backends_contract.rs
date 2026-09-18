@@ -147,6 +147,84 @@ fn require_all() -> bool {
     std::env::var("M6_BACKENDS_REQUIRE_ALL").is_ok_and(|v| v == "1")
 }
 
+/// How long a scratch directory can be untouched before it is assumed abandoned.
+///
+/// Generous on purpose. This file's own run takes about two minutes, so six
+/// hours cannot catch a live one even on a machine building from cold under
+/// heavy load, and the cost of being wrong is asymmetric: deleting a live run's
+/// binaries breaks that run, while leaving a dead one costs 95MB until the next
+/// invocation sweeps it.
+const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+
+/// Remove scratch directories left behind by runs that are over.
+///
+/// The directory below is named by process id and nothing used to remove it, so
+/// every run of this test binary leaked about 95MB: the compiled C, C++ and Go
+/// backends plus `GOCACHE`. `/tmp` on the build host is a 3.7GB **tmpfs**, which
+/// that fills in roughly 39 runs.
+///
+/// It did. Found at 82% on 2026-09-18, and it failed the gate twice over without
+/// either failure naming a disk:
+///
+///     boom_is_relayed_as_a_backend_error -> go link: no space left on device
+///     FAIL render:minimal: 264877ns against 201827ns, over the 20% margin
+///
+/// The performance one is the trap. A 31% regression on a RAM-backed filesystem
+/// that is nearly full looks exactly like a real regression, and the run before
+/// it on the same commit had passed. Clearing the directories made it pass
+/// again. It also gets worse on its own: a fuller tmpfs is less RAM, so the
+/// measurement degrades before it breaks.
+///
+/// Swept by age rather than by asking whether the owning pid is alive. Process
+/// ids are recycled, so a liveness check can be wrong in the direction that
+/// deletes a running build's output; an age check cannot. Per-process naming is
+/// kept, because two concurrent runs must not share an output path -- the
+/// comment in `built_binary` records a collision of exactly that shape.
+///
+/// Best effort throughout. A test that cannot tidy up is not a test that should
+/// fail, and a second runner sweeping at the same moment will find entries
+/// already gone.
+fn sweep_stale_build_dirs() {
+    sweep_stale_build_dirs_in(Path::new("/tmp"), STALE_AFTER);
+}
+
+/// The sweep, over a named directory and threshold so it can be tested.
+///
+/// Split out because the alternative is a test that writes into the real `/tmp`
+/// and deletes things there, which is the kind of test that is correct until the
+/// day it runs somewhere unexpected.
+fn sweep_stale_build_dirs_in(root: &Path, stale_after: std::time::Duration) {
+    let now = std::time::SystemTime::now();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with("m6bx-build-") && !name.starts_with("m6bx-") {
+            continue;
+        }
+        // Never anything this process owns, whatever its timestamp says. Both
+        // shapes carry the pid: `m6bx-build-<pid>` here, and `m6bx-<pid>-<tag>-<n>`
+        // from `Scratch::new`. Matching on the pid rather than on one exact name
+        // covers both, so a long run cannot sweep its own per-backend scratch.
+        let own = format!("-{}", std::process::id());
+        if name.starts_with(&format!("m6bx-build{own}")) || name.starts_with(&format!("m6bx{own}-"))
+        {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|age| age > stale_after);
+        if stale {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
 /// Compile each language once per test binary, not once per test.
 ///
 /// Seven tests times three compiled languages was twenty-one invocations of a
@@ -169,6 +247,8 @@ fn built_binary(lang: Lang, src: &Path) -> PathBuf {
     if let Some(p) = guard.get(lang.dir()) {
         return p.clone();
     }
+
+    sweep_stale_build_dirs();
 
     let dir = PathBuf::from(format!("/tmp/m6bx-build-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("build dir");
@@ -739,4 +819,73 @@ fn sigterm_drains_removes_the_socket_and_exits_zero() {
 extern "C" {
     #[link_name = "kill"]
     fn libc_kill(pid: i32, sig: i32) -> i32;
+}
+
+#[cfg(test)]
+mod scratch_sweeping {
+    use super::sweep_stale_build_dirs_in;
+    use std::time::Duration;
+
+    /// Backdate a directory's modification time so the sweep sees it as old.
+    fn backdate(p: &std::path::Path, secs: u64) {
+        let when = std::time::SystemTime::now() - Duration::from_secs(secs);
+        let _ = filetime::set_file_mtime(p, filetime::FileTime::from_system_time(when));
+    }
+
+    #[test]
+    fn a_stale_build_dir_is_removed_and_a_fresh_one_is_not() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let old = root.path().join("m6bx-build-999999");
+        let new = root.path().join("m6bx-build-999998");
+        std::fs::create_dir_all(old.join("gocache")).unwrap();
+        std::fs::write(old.join("go"), b"binary").unwrap();
+        std::fs::create_dir_all(&new).unwrap();
+        backdate(&old, 60 * 60 * 24);
+
+        sweep_stale_build_dirs_in(root.path(), Duration::from_secs(6 * 60 * 60));
+
+        assert!(!old.exists(), "a day-old scratch directory must be swept");
+        assert!(new.exists(), "a fresh one must be left alone");
+    }
+
+    #[test]
+    fn this_processes_own_directories_are_never_swept() {
+        // The guard that matters. Both shapes carry the pid, and a run long
+        // enough to pass the threshold must not delete its own binaries out
+        // from under itself.
+        let root = tempfile::tempdir().expect("tempdir");
+        let pid = std::process::id();
+        let build = root.path().join(format!("m6bx-build-{pid}"));
+        let scratch = root.path().join(format!("m6bx-{pid}-go-0"));
+        std::fs::create_dir_all(&build).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
+        backdate(&build, 60 * 60 * 24 * 7);
+        backdate(&scratch, 60 * 60 * 24 * 7);
+
+        sweep_stale_build_dirs_in(root.path(), Duration::from_secs(6 * 60 * 60));
+
+        assert!(build.exists(), "our own build dir must survive any age");
+        assert!(scratch.exists(), "our own scratch dir must survive any age");
+    }
+
+    #[test]
+    fn unrelated_directories_are_left_alone() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let other = root.path().join("somebody-elses-data");
+        std::fs::create_dir_all(&other).unwrap();
+        backdate(&other, 60 * 60 * 24 * 30);
+
+        sweep_stale_build_dirs_in(root.path(), Duration::from_secs(6 * 60 * 60));
+
+        assert!(other.exists(), "the sweep must only touch its own names");
+    }
+
+    #[test]
+    fn a_missing_root_is_not_an_error() {
+        // Best effort: a test that cannot tidy up must not fail the run.
+        sweep_stale_build_dirs_in(
+            std::path::Path::new("/nonexistent-dir-for-this-test"),
+            Duration::from_secs(1),
+        );
+    }
 }
