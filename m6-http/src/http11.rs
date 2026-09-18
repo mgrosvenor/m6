@@ -1237,6 +1237,68 @@ pub fn make_tls_server_config(
     // Advertise h2 first so capable clients use HTTP/2; fall back to HTTP/1.1.
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
+    // ── Session resumption, which did not work at all before this ────────────
+    //
+    // rustls' defaults make a server that never resumes under real traffic:
+    //
+    //     ticketer:        NeverProducesTickets          (builder.rs:116)
+    //     session_storage: ServerSessionMemoryCache(256) (builder.rs:113)
+    //
+    // With no ticketer, resumption is STATEFUL: rustls stores the session
+    // server-side and hands the client a handle. Every returning client needs
+    // its own entry still to be in a 256-entry cache. origin took 648 handshakes
+    // in one hour, so entries are evicted long before anyone comes back, and
+    // the cache does nothing but cost memory.
+    //
+    // What the fleet's own monitor measured, which is the evidence for this:
+    //
+    //     channel               handshakes   resumed
+    //     http/1.1/external     451          90%       origin
+    //     http/2/external       197           0%       origin
+    //     http/2/external       157           0%       edge-a
+    //     http/2/external       165           0%       edge-b
+    //
+    // Those two numbers look contradictory and are not. http/1.1 there is a
+    // handful of distinct clients polling repeatedly -- the build host's monitor
+    // -- so their few entries stay resident and resume. http/2 is browsers: many
+    // distinct clients, 256 slots, evicted long before any of them returns. The
+    // channel that resumes is the one that does not need to.
+    //
+    // NOT established by `openssl s_client -sess_out/-sess_in`, which was tried
+    // first and reported a full handshake every time. That evidence was
+    // worthless: macOS ships LibreSSL 3.3.6 as /usr/bin/openssl, whose TLS 1.3
+    // client resumption is incomplete, so it reports "New" whatever the server
+    // does. The test beside this (tests/tls_resumption.rs) uses rustls on both
+    // ends for that reason.
+    //
+    // A Ticketer makes resumption STATELESS. The session state is encrypted into
+    // the ticket with ChaCha20Poly1305 under a key the server keeps, so there is
+    // no per-client server storage to evict and the cache size stops mattering.
+    // Keys are generated randomly and rotate on a 12 hour life, so a ticket
+    // cannot outlive its key, and a restart invalidates outstanding tickets:
+    // clients then do one full handshake and resume from there.
+    //
+    // Cost of not having it, from this fleet's own monitor: a full handshake ran
+    // p50 652ms on origin's http/1.1 channel against 0.77ms for a resumed one, and
+    // two extra round trips on every new browser connection.
+    //
+    // `ring`, matching the provider this crate builds rustls with
+    // (m6-http/Cargo.toml: features = ["ring", "std"]).
+    config.ticketer = rustls::crypto::ring::Ticketer::new()
+        .map_err(|e| anyhow::anyhow!("tls ticketer: {}", e))?;
+
+    // `session_storage` is deliberately LEFT at the default 256.
+    //
+    // Raising it was the first instinct and it is the wrong change. With the
+    // ticketer above, TLS 1.3 resumption is stateless and never reads this cache
+    // at all; the only thing still using it is a TLS 1.2 client resuming by
+    // session id, which on this fleet means old scanners rather than visitors.
+    //
+    // `ServerSessionMemoryCache::new(n)` is `HashMap::with_capacity(n)` plus
+    // `VecDeque::with_capacity(n)` (rustls limited_cache.rs:63), so it allocates
+    // up front. 4096 entries is roughly 350KB per config bought for a path that
+    // does not carry anyone who matters, on an origin with 950MB.
+
     Ok(Arc::new(config))
 }
 
