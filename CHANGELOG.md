@@ -14,6 +14,52 @@ releases only; work happens on `develop`. See `CONTRIBUTING.md`.
 
 ## Unreleased
 
+### Removed
+
+**HTTP/2 server push and 103 Early Hints, and with them the hint extractor.**
+Owner's decision. The reasoning is in `README.md` under "Why there is no server
+push or 103 Early Hints", and in issue #93, because the absence is a decision
+and the next person to notice it should find the argument rather than rebuild
+the feature.
+
+In short: push cannot see the client's cache, so it sends bytes to visitors who
+already have them, and it is gone from Chrome, Firefox and RFC 9113. A 103 fills
+the gap between a request arriving and the response being ready, and a
+cache-first server does not have one: measured on a production fleet, the origin
+answered in about 7ms and an edge hit from memory, so the 103 and the final
+response went out microseconds apart.
+
+The implementation compounded it. Hints were derived by scanning the response
+body for `href=` and `src=` and filtering on file extension, which cannot tell an
+`<img src>` from an `<a href>`. It preloaded images the page had marked
+`loading=lazy`, a cache node emitted every hint twice (89 `Link` headers for 45
+distinct values), and none of it could be measured because there was no way to
+turn it off.
+
+Gone: `hints.rs`, `CachedResponse.hints`, `H2Response.hints`, the fifth element
+of `RequestOutcome::Ready` and `FinalizedResponse`, the 103 emission on h1, h2
+and h3, the `PUSH_PROMISE` send path, and the one prefetch site that queued
+hinted assets.
+
+Kept, deliberately:
+
+- **Refusing a client `PUSH_PROMISE`.** RFC 9113 8.4 makes it a connection error
+  whether or not this server pushes.
+- **Validating `SETTINGS_ENABLE_PUSH`.** RFC 9113 6.5.2 makes a value other than
+  0 or 1 a connection error. The value is no longer stored, because the answer to
+  "may I push?" is now no regardless of what the client permits.
+- **The prefetch queue.** Four of its five call sites are stale-refresh and route
+  warming, which have nothing to do with hints.
+- **Selective `Link` replacement** in `set_describedby_link`. m6 no longer emits
+  preload links, but a backend or an author may, and discarding someone else's
+  headers would be wrong.
+
+Two HTTP/2 tests that measured outbound DATA framing and the per-stream send
+window through a pushed stream were **converted rather than deleted**: both rules
+(RFC 9113 4.2 and 6.9) govern every response this server writes, so they now
+exercise an ordinary one. Two that tested only server-initiated streams were
+removed, because nothing can create one.
+
 ## 1.9.0 — 2026-09-18
 
 Early hints stop overriding the page, and TLS connections stop paying for a full

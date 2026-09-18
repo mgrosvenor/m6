@@ -35,7 +35,6 @@ use crate::forward::HttpRequest;
 use crate::http11::{Http11Listener, RequestOutcome};
 use crate::poller::{Poller, Token};
 use std::io::ErrorKind;
-use std::sync::Arc;
 use tracing::{info, warn};
 
 const TOKEN_LISTENER: Token = Token(0);
@@ -65,7 +64,6 @@ fn ready(status: u16, headers: Vec<(String, String)>) -> RequestOutcome {
         headers,
         Vec::new(),
         String::new(),
-        Arc::new(Vec::new()),
     )
 }
 
@@ -174,7 +172,6 @@ pub fn run(bind: &str) -> anyhow::Result<()> {
                     Vec::new(),
                     Vec::new(),
                     String::new(),
-                    Arc::new(Vec::new()),
                 )
             },
             &poller,

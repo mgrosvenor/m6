@@ -628,6 +628,50 @@ amounts of work. **This decision gates a 1.0 release.**
 - Built-in OAuth2 / OIDC provider
 - MFA / WebAuthn
 - Horizontal scaling of m6-http itself (scales vertically via caching; global scale via edge nodes)
+- **HTTP/2 server push** and **103 Early Hints** — both were implemented and removed on 2026-09-18. See below.
+
+### Why there is no server push or 103 Early Hints
+
+Both existed in m6 until 1.9.0 and were removed. They are listed here rather than
+left as a gap, because "m6 does not do this" is a decision and the next person to
+notice the absence should find the reasoning instead of rebuilding it.
+
+**HTTP/2 push is a dead feature.** The server cannot see the client's cache, so it
+sends bytes to a returning visitor who already has them. Cache digests were
+proposed to close that gap and never shipped. Chrome removed push in 106, Firefox
+disabled it, and RFC 9113 dropped it from the specification. Receipt of a
+`PUSH_PROMISE` from a client is still refused as a connection error, per RFC 9113
+8.4; that is required and stays.
+
+**103 Early Hints has nothing to fill in a server shaped like this.** Its value is
+the gap between a request arriving and the response being ready, so a browser can
+start fetching subresources during backend think-time. m6 caches server side: on a
+cache hit the response is ready immediately, and the 103 and the final response go
+out microseconds apart. Measured on a production fleet, the origin answered in about
+7ms and an edge hit from memory. There is no dead time to exploit. The secondary
+argument, that a 103 beats the HTML parser to the subresources, does not hold either:
+`<link>` lives in `<head>`, so a browser's preload scanner reaches it in the first
+kilobyte.
+
+**The implementation also had to guess.** It derived the hint list by scanning the
+response body for `href=` and `src=` and filtering on file extension, which cannot
+distinguish an `<img src>` from an `<a href>`, or from text inside a `<script>`,
+`<template>` or comment. It preloaded images the page had explicitly marked
+`loading=lazy`, overriding the author; a cache node emitted every hint twice, 89
+`Link` headers for 45 distinct values; and it ordered them by directory name, so a
+render-blocking stylesheet was announced behind seventeen logos. None of that was
+measurable, because there was no switch to turn the feature off and compare.
+
+**If you need this, build a relay, not an oracle.** The standard answer is for the
+author to declare what the page needs, using `<link rel=preload>` and
+`rel=modulepreload` with their own `as=`, `type` and `crossorigin`, and for the
+server to promote those existing declarations into `Link` response headers or a
+103. That is what Cloudflare and Fastly do. It requires no guessing, cannot
+contradict the page, and is a much smaller piece of code than the one removed. It
+is worth building only where there is genuine backend think-time to fill, which a
+cache-first server usually does not have.
+
+See issue #93 for the full reasoning and the measurements.
 
 ---
 

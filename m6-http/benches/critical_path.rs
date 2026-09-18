@@ -28,7 +28,6 @@ fn make_cache_with_entry() -> (Cache, &'static str, &'static str) {
             ("vary".to_string(), "accept-encoding".to_string()),
         ]),
         body: bytes::Bytes::from_static(b"<html><body>hello world</body></html>"),
-        hints: std::sync::Arc::new(vec![]),
     };
     cache.insert(key, resp);
     (cache, path, enc)
