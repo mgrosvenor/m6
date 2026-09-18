@@ -417,7 +417,7 @@ impl Response {
             <Hmac<Sha256> as Mac>::new_from_slice(secret).expect("HMAC accepts any key length");
         mac.update(msg_b64.as_bytes());
         let sig_bytes = mac.finalize().into_bytes();
-        let sig_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&sig_bytes);
+        let sig_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig_bytes);
 
         let cookie_val = format!("{}.{}", msg_b64, sig_b64);
         let mut s = self;
