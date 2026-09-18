@@ -40,7 +40,7 @@ resolver = "2"
 # release, because it needs a tag to pin to. See docs/CONSOLIDATION-TODO.md for
 # what remains, and CHANGELOG.md's 1.0.0 entry for what is knowingly not fixed.
 [workspace.package]
-version      = "1.9.0"
+version      = "1.10.0"
 edition      = "2021"
 # The oldest toolchain we test. Declared because declaring one and not testing
 # it is a claim rather than a fact: CI builds the whole workspace with exactly
