@@ -112,15 +112,42 @@ pub fn tls_config(alpn: &[u8]) -> Arc<ClientConfig> {
     Arc::new(cfg)
 }
 
-/// One TLS handshake, timed. Returns the duration and the negotiated ALPN.
+/// What one TLS handshake achieved.
+///
+/// A struct rather than a tuple for the same reason [`ZeroRtt`] is one: the
+/// duration alone cannot tell a full handshake from a resumed one, and those are
+/// the two things being told apart. m6-http reports them as separate channels on
+/// `/perf` and never blends them, so a probe that returned one number could not
+/// be compared with it.
+#[derive(Debug, Clone)]
+pub struct Handshake {
+    /// After TCP connect, to handshake complete. Matches what the server's
+    /// h1/h2 figure spans.
+    pub elapsed: Duration,
+    /// The ALPN the server actually chose, for the caller to assert.
+    pub alpn: Option<Vec<u8>>,
+    /// Whether the server RESUMED a session rather than doing full key exchange.
+    ///
+    /// From rustls' own `handshake_kind()`, which is the client's view of what
+    /// happened, not an inference from timing. This is the field the fleet's
+    /// 0%-resumed reading needs checking against: m6-http's `resumed` counter is
+    /// the server's claim about the same handshake, and until something
+    /// independent agrees, "0% resumed" could equally mean the server never
+    /// resumes or the counter never observes it. m6 issue #101.
+    pub resumed: bool,
+}
+
+/// One TLS handshake, timed, with the ALPN and whether it resumed.
 ///
 /// The ALPN comes back so the caller can ASSERT it rather than assume it. A
 /// probe that asked for `h2`, silently got `http/1.1`, and reported the figure
 /// under an "h2" heading would be the same class of error as trusting h3spec.
-pub fn tls_handshake(
-    addr: &str,
-    cfg: Arc<ClientConfig>,
-) -> io::Result<(Duration, Option<Vec<u8>>)> {
+///
+/// Pass the SAME `cfg` across calls to measure resumption: rustls' default
+/// `ClientConfig` carries an in-memory session store, so a shared config keeps
+/// the ticket from one handshake and offers it on the next. A fresh config per
+/// call measures full handshakes only.
+pub fn tls_handshake(addr: &str, cfg: Arc<ClientConfig>) -> io::Result<Handshake> {
     // TCP connect happens BEFORE the clock starts, matching what the server's
     // h1/h2 figure excludes.
     let (host, peer) = resolve(addr)?;
@@ -186,6 +213,43 @@ pub fn tls_handshake(
     }
     let elapsed = t0.elapsed();
     let alpn = conn.alpn_protocol().map(|p| p.to_vec());
+    // rustls' own account of what this handshake was, read after completion.
+    // `Resumed` is the only variant that means the server accepted a ticket;
+    // `FullWithHelloRetryRequest` is still a full handshake and is counted as one.
+    let resumed = matches!(conn.handshake_kind(), Some(rustls::HandshakeKind::Resumed));
+
+    // ── Collect the ticket, AFTER the clock stops ────────────────────────────
+    //
+    // In TLS 1.3 the server sends `NewSessionTicket` once the handshake is
+    // complete, as application-phase data. This function used to stop reading
+    // the instant `is_handshaking()` went false, so rustls never ingested the
+    // ticket, nothing went into the session store, and the next connection had
+    // nothing to offer.
+    //
+    // That is not a small omission: it made the probe report
+    // `RESUMPTION: none` against every node on both channels on 2026-09-19,
+    // which read as a server defect and was a defect in the measuring tool. It
+    // is the same class of error as the missing flush above -- a client that
+    // reports a property of itself as a property of the peer -- one step later
+    // in the sequence.
+    //
+    // OUTSIDE the timed region on purpose. Waiting for a ticket is not part of
+    // the handshake and must not enter a figure compared against the server's.
+    //
+    // Bounded, and short. The ticket normally arrives in the same flight as the
+    // server's Finished and is already in the socket buffer, so this usually
+    // returns without waiting at all; the timeout exists so a server that sends
+    // none cannot hang the probe.
+    let _ = sock.set_read_timeout(Some(Duration::from_millis(500)));
+    // ONE read, not a loop. The ticket arrives in the flight that follows the
+    // server's Finished, so a single `read_tls` plus `process_new_packets` is
+    // what stores it; every branch of a loop here would break on its first pass,
+    // which clippy's `never_loop` correctly objects to.
+    if let Ok(n) = conn.read_tls(&mut sock) {
+        if n > 0 {
+            let _ = conn.process_new_packets();
+        }
+    }
 
     // Send the close_notify rather than dropping the socket on the server's face.
     // A bare FIN mid-stream is indistinguishable from a truncation attack and
@@ -194,7 +258,11 @@ pub fn tls_handshake(
     while conn.wants_write() {
         conn.write_tls(&mut sock)?;
     }
-    Ok((elapsed, alpn))
+    Ok(Handshake {
+        elapsed,
+        alpn,
+        resumed,
+    })
 }
 
 /// Flush everything quiche wants to send, returning (datagrams, bytes).
@@ -849,6 +917,33 @@ pub fn report(label: &str, mut samples: Vec<Duration>, failures: usize) {
     }
 }
 
+/// Whether a resumption run is a FAILURE, given what the run observed.
+///
+/// A function with tests rather than three conditions inlined in two `main`s,
+/// for two reasons. It is the same decision in the h1 and h2 probes, and it is
+/// what `tools/conformance.sh` gates on, so it has to mean the same thing in
+/// both. And the failing case cannot be produced against a healthy server: m6
+/// resumes, so a live run can only ever exercise the passing branch. A gate
+/// whose failure path has never run is a claim, which is the exact fault this
+/// project has been paying for all week -- a check reporting success while
+/// measuring nothing.
+///
+/// `no_resume` means the caller deliberately asked for fresh configs per
+/// connection, so no ticket was ever offered and an all-full run is correct.
+pub fn resumption_failed(no_resume: bool, full: usize, resumed: usize) -> bool {
+    // Nothing handshook at all: the server is absent or refused every attempt.
+    // A failure regardless of what was being asked.
+    if full + resumed == 0 {
+        return true;
+    }
+    if no_resume {
+        return false;
+    }
+    // A ticket is only offered from the SECOND handshake onward, so a single
+    // connection cannot resume and must not be read as a server that will not.
+    full + resumed > 1 && resumed == 0
+}
+
 /// `--addr HOST:PORT` and `--n COUNT`, and nothing else.
 pub fn args(default_addr: &str, default_n: usize) -> (String, usize) {
     let mut addr = default_addr.to_string();
@@ -865,8 +960,16 @@ pub fn args(default_addr: &str, default_n: usize) -> (String, usize) {
                 n = raw[i + 1].parse().unwrap_or(default_n);
                 i += 2;
             }
+            // Accepted and ignored here: the resumption probes read it
+            // themselves, because it changes how they build the client config
+            // rather than which address or how many connections. Without this
+            // arm the strict `other` branch below rejected the flag with exit 2,
+            // so `--no-resume` looked like a failing probe.
+            "--no-resume" => i += 1,
             other => {
-                eprintln!("usage: [--addr HOST:PORT] [--n COUNT]   (unexpected: {other})");
+                eprintln!(
+                    "usage: [--addr HOST:PORT] [--n COUNT] [--no-resume]   (unexpected: {other})"
+                );
                 std::process::exit(2);
             }
         }
@@ -933,5 +1036,46 @@ mod tests {
         getrandom_scid(&mut a);
         getrandom_scid(&mut b);
         assert_ne!(a, b, "two connection IDs came out identical");
+    }
+}
+
+#[cfg(test)]
+mod resumption_decision_tests {
+    use super::resumption_failed;
+
+    /// The healthy shape: one full handshake to earn the ticket, the rest
+    /// resumed. This is what every live run against m6 produces.
+    #[test]
+    fn one_full_then_resumed_is_a_pass() {
+        assert!(!resumption_failed(false, 1, 4));
+    }
+
+    /// The case m6 issue #101 was about, and the one a live server cannot
+    /// produce: tickets offered from the second connection onward and none
+    /// accepted.
+    #[test]
+    fn all_full_with_tickets_offered_is_a_failure() {
+        assert!(resumption_failed(false, 5, 0));
+    }
+
+    /// A single connection had no earlier handshake to get a ticket from, so
+    /// "no resumption" is arithmetic rather than a finding.
+    #[test]
+    fn one_handshake_alone_cannot_resume_and_is_not_a_failure() {
+        assert!(!resumption_failed(false, 1, 0));
+    }
+
+    /// `--no-resume` asks for full handshakes on purpose.
+    #[test]
+    fn no_resume_mode_expects_all_full() {
+        assert!(!resumption_failed(true, 5, 0));
+    }
+
+    /// Nothing measured is a failure in every mode, which is this repository's
+    /// standing rule about gates.
+    #[test]
+    fn nothing_measured_fails_even_when_not_asking_to_resume() {
+        assert!(resumption_failed(true, 0, 0));
+        assert!(resumption_failed(false, 0, 0));
     }
 }
