@@ -538,3 +538,51 @@ New 2026-09-12:
     Knowing the lesson is not the same as having the habit. **If the exit code
     matters, nothing goes after the command — redirect to a file, echo `$?` on its
     own line, and read the file.**
+
+50. **A measuring tool can lie in the direction that looks like a server bug, and
+    that is the dangerous direction.** m6 1.9.0 installed a TLS session ticketer.
+    The fleet read 0% resumed on the browser channel for a day, so `m6-probe-h2`
+    was extended to offer a ticket deliberately and report what came back. It
+    reported `RESUMPTION: none` against all three production nodes on both
+    channels.
+
+    That was the probe. `tls_handshake` stopped reading the instant
+    `is_handshaking()` went false, and TLS 1.3 sends `NewSessionTicket` AFTER
+    Finished as application-phase data, so rustls never ingested a ticket and had
+    nothing to offer on the next connection. Every handshake was full because the
+    client never asked to resume.
+
+    The server was correct all along: with the ticket collected, 7 of 8 h2
+    handshakes resumed, and the origin's own counter incremented by exactly that
+    many. Had the first result been reported, it would have started a hunt for a
+    defect in the TLS code.
+
+    What caught it was a **disagreement between two measurements** rather than
+    suspicion of the tool: the probe said the h1 channel never resumed while the
+    server's counter said 88-96%. Two measurements that disagree are a fact about
+    the measurements. The same function already carried lesson 5's scar tissue for
+    a missing flush one step earlier in the same sequence, which is worth noticing
+    too: a tool can be fixed against one failure mode and still report a property
+    of itself as a property of the peer.
+
+51. **A rollout that REMOVES a wire feature must deploy the origin first.** The
+    deploy takes edges before the origin, because a broken edge degrades one
+    region and rolls back on its own while a broken origin takes every region at
+    once. That is right for risk and exactly wrong for a release that drops
+    something the origin still sends.
+
+    m6 1.10.0 removed 103 Early Hints. Rolled edges-first, a 1.10.0 edge fetched
+    from a 1.8.1 origin that still emitted them, and `forward.rs:1670` lists 204,
+    304, 100 and 101 as bodyless and not 103, so the edge mis-framed the stream:
+    **502 on about one miss in five**, 8 backend errors in 118 requests, nine of
+    them reaching European visitors. Converging the origin next fixed it where it
+    stood, because the reverse mismatch is harmless: an old edge understands a
+    feature a new origin simply never sends.
+
+    Two general parts. Removing the ability to SEND something is a product
+    decision; being unable to RECEIVE it is a conformance defect, and a
+    cache-first edge fetches from an origin it does not control (issue #100).
+    And **staging cannot catch this class of defect at all**: it converges every
+    instance in one run and ends uniform, so a mixed-version fleet is a state it
+    never holds. "Staging validated the artefact" was true and said nothing about
+    the rollout.
