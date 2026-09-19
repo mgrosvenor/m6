@@ -496,7 +496,7 @@ matching the newest tag. Bump them in `Cargo.toml` in the release pull request.
 | 3 | **Phase 7: renderers onto a git tag** | below |
 | 4 | ~~**Phase 8: six `/status` implementations**~~ | **done 2026-09-13, issue #6.** All six conform, 13 tests in the gate, Go installed. The measurement: **linking m6-core costs 36% of throughput and +37us p50**, 8.8x RSS, 56.7x binary. §4 below |
 | 5 | ~~**The examples are built by the checks**~~ | **done 2026-09-14, issue #11.** They did not compile at all, and five more defects were underneath that. `build-host-tests.sh` now builds them and runs example 05's end-to-end suite; `find-deployment.sh` is deleted. See §2 and lesson 41 |
-| 6 | **Deploy, lifting the freeze** | the deployment repository's business; §6. Not a code task. |
+| 6 | ~~**Deploy, lifting the freeze**~~ | **done 2026-09-19.** m6 1.10.0 on all three production nodes, md5 `17ef4e5bef36`, 19/19 checks each, promoted rather than rebuilt. The rollout found one platform defect, #100, still open: a 1.10.0 edge answers 502 when a backend sends a 103, which cost nine 502s to European visitors because the deploy takes edges before the origin. §0 |
 
 **The two performance numbers are recorded.** `render:capabilities` measured a
 deployment's content and is removed; `render:minimal` (201827ns) and
