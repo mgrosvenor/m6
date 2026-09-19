@@ -349,6 +349,47 @@ where h3 with 0-RTT answers in 6.4 ms.
 
 **Never conclude anything about protocol choice from a loopback number.**
 
+### Resumption, and the 1.9.0 handshake win, measured on production
+
+Added 2026-09-19, after the probes learned to offer a session ticket. Before
+this the probes could only measure FULL handshakes, and because they shared one
+`ClientConfig` across N connections they were in fact measuring a mix of one
+full and N-1 attempted resumptions under a single heading. Both are separated
+now, and the split is what makes the numbers below comparable with `/perf`.
+
+**A resumed handshake is cheaper than a full one by the certificate and the
+signature, not by a round trip.** TLS 1.3 completes in one round trip either
+way, so the saving is crypto and it is sub-millisecond on a fast path. Against
+the production origin from a laptop in Australia:
+
+| | p50 | n |
+|---|---|---|
+| h2 full | 7.153 ms | 1 |
+| h2 resumed | 6.634 ms | 7 |
+
+On the server's side of the same channel the gap is far larger, because its full
+figure includes slow and hostile clients that a probe is not: `/perf` on the
+origin read h1 full p50 **161.65 ms** against resumed **0.76 ms** over 34 and
+422 samples. Those are different populations, not a different protocol, and it
+is the reason the two are never blended into one "handshake p50".
+
+**What 1.9.0 delivered, measured across the 1.10.0 deploy.** Origin
+`http/2/external`, the server's own figure, before and after:
+
+| | before (1.8.1) | after (1.10.0) |
+|---|---|---|
+| full p50 | 13.95 ms | **3.40 ms** |
+| full p99 | 1339.00 ms | **34.04 ms** |
+| full mean | 119.08 ms | **6.38 ms** |
+
+**Resumption itself reads 0% on `http/2/external` in production and that is
+correct.** A browser opens one h2 connection per visit and multiplexes it, so
+resumption needs a RETURN visit inside the ticket's lifetime. The `http/1.1`
+channel reads 88-96% only because its repeat client is a monitor polling on a
+loop. Do not read the zero as a fault; issue #101 has the full argument, and
+`tools/conformance.sh resume` now proves the capability on h1, h2 and h3 on
+every push so the question cannot stay open again.
+
 ### An extra round trip on every new h3 connection, and how it was misdiagnosed twice
 
 **Fixed 2026-09-15** by `cfg.set_max_amplification_factor(4)`, which is temporary
