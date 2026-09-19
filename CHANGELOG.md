@@ -14,6 +14,52 @@ releases only; work happens on `develop`. See `CONTRIBUTING.md`.
 
 ## Unreleased
 
+### Added
+
+**TLS session resumption is measured, and gated on h1, h2 and h3.**
+`tools/conformance.sh` gains a `resume` stage; CI runs the suite with no flags,
+so it gates every pull request, and `tools/build-host-tests.sh` and the laptop's
+pre-push hook run it too. It is the only conformance stage that needs no
+external tester, which makes it the first real protocol check a laptop run
+performs: h2spec and h3spec are not installed there and every other stage skips.
+
+Why it was needed. 1.9.0 installed a session ticketer so browser sessions could
+resume, and nothing anywhere could tell whether it worked. The production
+monitor read 0% resumed on `http/2/external` across all three nodes for a day
+after the 1.10.0 deploy, which looks identical whether the ticketer is broken or
+the traffic has no returning connections. Issue #101, closed: the server resumes
+on every protocol, the counter is accurate, and the 0% was the traffic, because
+a browser opens ONE h2 connection per visit and resumption needs a return visit
+inside the ticket's lifetime.
+
+Verified against production: 7 of 8 h2 handshakes resumed and 7 of 8 h1, on all
+three nodes, with the origin's own `resumed` counter incrementing by exactly the
+number the client observed.
+
+### Fixed
+
+**`probe::tls_handshake` never collected the session ticket.** It stopped
+reading the instant `is_handshaking()` went false, and TLS 1.3 sends
+`NewSessionTicket` after Finished as application-phase data, so rustls never
+stored one and the next connection had nothing to offer. The probe therefore
+reported `RESUMPTION: none` against a fleet that resumes correctly, which reads
+as a server defect and was a defect in the measuring tool. It now does one
+bounded `read_tls` after the handshake, outside the timed region so the figure
+stays comparable with the server's own. `docs/LESSONS.md` lesson 50.
+
+### Changed
+
+**`m6-probe-h1` and `m6-probe-h2` report full and resumed separately**, and exit
+non-zero when a ticket was offered and never accepted. Both had always shared
+one `ClientConfig` across their N connections, so every run was one full
+handshake plus N-1 attempted resumptions reported as a single distribution,
+while the header claimed the figure was comparable to a `/perf` channel that
+separates them. `--no-resume` reproduces the old behaviour.
+
+`probe::resumption_failed` holds the gate's decision, with five unit tests: the
+failing branch cannot be produced against a server that resumes, and a gate
+whose failure path has never run is a claim.
+
 ## 1.10.0 — 2026-09-19
 
 ### Removed
