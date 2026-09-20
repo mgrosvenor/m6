@@ -25,6 +25,25 @@ number, it does.
   103 Early Hints removed). The lines above this one said "do not deploy, 135
   commits are undeployed" until that day; that is history now, and the next
   release is an ordinary release.
+- **#105 is written, green and NOT merged.** PR
+  [#106](https://github.com/mgrosvenor/m6/pull/106) into `develop`, branch
+  `feat/105-health-reports-binary-hash`, four commits, CI green and the full
+  build-host gate passed (1145 tests, clippy silent, cargo-deny ok including the
+  new `md-5`, h1/h2/h3 and performance ok, examples and the CMS end-to-end
+  suite green).
+
+  `PerfReport`'s `version: String` becomes `build: BuildId { name, version, hash }`,
+  so `/perf` says which BUILD is running and not only which release it claims to
+  be. `/health` is untouched and still publishes exactly `status` and `node`: a
+  bare hash there was proposed, and rejected because an opaque number on its own
+  tells a reader nothing. `m6-monitor` reports build drift when versions agree
+  and hashes differ, which is the 2026-09-20 case a version comparison cannot
+  see. Nothing breaks: `serde(default)` on both sides, and no other consumer read
+  the field.
+
+  It is held because the deployment repository is mid-refactor. Rolling it needs
+  a staging monitor, and staging has never had one (site #89). Merging and
+  releasing 1.11.0 is safe whenever that is ready.
 - **`main` IS what is running**, as of this release, which is the point of the
   branch model. Confirm it the same way as always: the newest entry in the
   deployment repository's `docs/RELEASES.md` names the commit, and
