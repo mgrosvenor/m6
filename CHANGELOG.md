@@ -43,10 +43,12 @@ produced rather than what it means, and naming the field after it would make
 changing it a wire break. It is md5 today, because that is the number the rest
 of the estate already compares.
 
-**This is a wire change, so the monitor and the fleet move together.** A new
-monitor against an old node reads "unknown", which is correct. An old monitor
-against a new node silently sees no version at all, so deploy the monitor at or
-after the fleet, never before.
+**No existing tool breaks.** `serde(default)` on both sides means a new monitor
+against an old node reads "unknown", and an old monitor against a new node reads
+"unknown" too, rather than failing to parse. Nothing else consumed the field:
+the deployment's `ops.sh` takes the version from `m6-http --version` and
+`perf-report.py` never read it. The only cost of a mixed fleet is a few minutes
+of the monitor saying "unknown" for nodes it has not caught up with.
 
 Verified: the build hash equals `md5sum` of the running executable, asserted
 against a hash taken in the test rather than a constant; the binary name comes
