@@ -53,7 +53,15 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 SCORES="$HERE/conformance-scores.txt"
-WORK="${CONFORMANCE_WORK:-/tmp/m6-conformance}"
+# Per-account, because /tmp is shared and sticky. It was a bare
+# `/tmp/m6-conformance`, one directory for every account that has ever run this,
+# and on the build host that meant a root-owned directory the `admin` account
+# could not write to after the box was hardened. Every write inside it failed
+# with "Permission denied", the edge backend never bound its socket, and the run
+# reported `FAIL h3:m6-http: the edge never came up, so nothing was measured` --
+# which is honest about not measuring, and still indistinguishable from a real
+# regression to anyone reading the summary.
+WORK="${CONFORMANCE_WORK:-/tmp/m6-conformance-$(id -un)}"
 TLS_PORT=10443
 # shellcheck disable=SC2034  # unused, but records the reserved port
 H2C_PORT=18080
