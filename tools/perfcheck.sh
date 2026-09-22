@@ -40,7 +40,10 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 BASELINE="$HERE/perf-baseline.txt"
-WORK="${PERFCHECK_WORK:-/tmp/m6-perfcheck}"
+# Per-account. See the same change in tools/conformance.sh: a bare
+# /tmp/m6-perfcheck is one directory shared by every account, and a root-owned
+# one is unwritable to the account that runs the gate on a hardened build host.
+WORK="${PERFCHECK_WORK:-/tmp/m6-perfcheck-$(id -un)}"
 
 # ── What is measured, and where it comes from ─────────────────────────────────
 #
