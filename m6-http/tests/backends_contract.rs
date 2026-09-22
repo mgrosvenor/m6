@@ -188,7 +188,7 @@ fn sweep_stale_build_dirs() {
     // BOTH roots, because the two kinds of scratch live on different
     // filesystems now. See BUILD_ROOT_DIR for why.
     sweep_stale_build_dirs_in(Path::new("/tmp"), STALE_AFTER);
-    sweep_stale_build_dirs_in(Path::new(BUILD_ROOT_DIR), STALE_AFTER);
+    sweep_stale_build_dirs_in(&build_root_dir(), STALE_AFTER);
 }
 
 /// Where the COMPILED example binaries go, which is not where the sockets go.
@@ -217,7 +217,11 @@ fn sweep_stale_build_dirs() {
 /// nearly full. `/var/tmp` is disk-backed, so the big artefacts stop competing
 /// with RAM. The sweep still runs, because unbounded growth on disk is only
 /// slower, not fine.
-const BUILD_ROOT_DIR: &str = "/var/tmp";
+/// Resolved once, from m6-core's testkit, because two test files need it and
+/// that is the point at which a third copy becomes inevitable. Standing rule 11.
+fn build_root_dir() -> std::path::PathBuf {
+    m6_core::testkit::exec_scratch_root()
+}
 
 /// The sweep, over a named directory and threshold so it can be tested.
 ///
@@ -281,7 +285,7 @@ fn built_binary(lang: Lang, src: &Path) -> PathBuf {
 
     sweep_stale_build_dirs();
 
-    let dir = PathBuf::from(format!("{BUILD_ROOT_DIR}/m6bx-build-{}", std::process::id()));
+    let dir = build_root_dir().join(format!("m6bx-build-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("build dir");
     let bin = dir.join(lang.dir());
 
@@ -854,7 +858,7 @@ extern "C" {
 
 #[cfg(test)]
 mod build_dir_is_usable {
-    use super::BUILD_ROOT_DIR;
+    use super::build_root_dir;
 
     /// The directory the compiled examples go in must permit exec.
     ///
@@ -878,12 +882,12 @@ mod build_dir_is_usable {
         use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = std::path::Path::new(BUILD_ROOT_DIR);
+        let dir = build_root_dir();
         let probe = dir.join(format!("m6bx-execprobe-{}", std::process::id()));
 
         let mut f = match std::fs::File::create(&probe) {
             Ok(f) => f,
-            Err(e) => panic!("cannot write to the build directory {BUILD_ROOT_DIR}: {e}"),
+            Err(e) => panic!("cannot write to the build directory {}: {e}", dir.display()),
         };
         f.write_all(b"#!/bin/sh\nexit 7\n").expect("write probe");
         drop(f);
@@ -894,11 +898,12 @@ mod build_dir_is_usable {
 
         let status = result.unwrap_or_else(|e| {
             panic!(
-                "{BUILD_ROOT_DIR} does not permit exec: {e}\n\
+                "{} does not permit exec: {e}\n\
                  The backend example binaries are built there and must be\n\
                  spawnable. A noexec mount here fails as \"cannot spawn <lang>\n\
                  example: Permission denied\", which reads as a broken example\n\
-                 rather than as a mount option. See BUILD_ROOT_DIR."
+                 rather than as a mount option. See exec_scratch_root.",
+                dir.display()
             )
         });
         assert_eq!(
