@@ -103,8 +103,10 @@ pub fn binary(name: &str) -> PathBuf {
 /// not: the hardened baseline mounts it `noexec` (site issue #98), and on
 /// 2026-09-22 that failed fourteen tests across two files with
 ///
-///     cannot spawn c example: Permission denied (os error 13)
-///     c: spawn: Permission denied (os error 13)
+/// ```text
+/// cannot spawn c example: Permission denied (os error 13)
+/// c: spawn: Permission denied (os error 13)
+/// ```
 ///
 /// Both messages name the example rather than the mount, so the first reading
 /// is that the backend examples are broken. They were not; the filesystem
