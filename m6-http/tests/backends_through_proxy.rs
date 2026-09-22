@@ -313,7 +313,18 @@ impl Stack {
             return None;
         }
 
-        let tmp = tempfile::tempdir().unwrap();
+        // NOT `tempfile::tempdir()`: that lands under /tmp, which the
+        // hardened baseline mounts noexec (site #98), and `base` is where the
+        // C, C++ and Go backends are COMPILED and then SPAWNED. On 2026-09-22
+        // all seven tests in this file failed with
+        //     c: spawn: Permission denied (os error 13)
+        // which names the language rather than the mount. The socket below
+        // still goes under /tmp, because that requirement is the opposite one:
+        // short, not executable.
+        let tmp = tempfile::Builder::new()
+            .prefix("m6px-")
+            .tempdir_in(m6_core::testkit::exec_scratch_root())
+            .unwrap();
         let base = tmp.path();
 
         // The socket goes under /tmp with a short name, NOT in the temp dir:
