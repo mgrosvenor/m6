@@ -64,6 +64,14 @@ filetime    = "0.2"
 chrono      = { version = "0.4", features = ["serde"] }
 lru         = "0.18"
 slug        = "0.1"
+# The running binary's identity for /health. md5 and not sha2, which is already
+# here behind `flash`, because the value has to be the SAME NUMBER the deploy
+# already compares: deploy/estate/*.json records md5, `ops.sh capture` writes
+# md5, and the promotion gate refuses on md5. A second hash of the same bytes
+# under a different algorithm gives an operator two numbers both called "the
+# binary" and answers none of the questions this is for. Same RustCrypto family
+# as sha2, so it shares `digest` and adds one crate.
+md-5        = "0.10"
 
 tera          = { version = "1",    optional = true }
 comrak        = { version = "0.21", optional = true, default-features = false }

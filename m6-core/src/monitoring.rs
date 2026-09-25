@@ -76,6 +76,15 @@
 //! version on a public URL tells a scanner which vulnerabilities are worth trying.
 //! That has not changed.
 //!
+//! It was very nearly changed on 2026-09-20, and the reason it was not is worth
+//! keeping. Issue #105 wanted the running binary's identity visible, and the
+//! first attempt put a bare `hash` on `/health` on the argument that a hash is
+//! not a version and so discloses nothing. The disclosure argument holds. The
+//! usefulness argument does not: **a hash on its own tells a reader nothing at
+//! all.** It could be a hash of anything. An identity is a hash keyed to the
+//! name and version of the thing it identifies, and the place those already live
+//! is `/perf`. Owner's decision. See `BuildId`.
+//!
 //! `/perf` does report the release, from 2026-09-16. This reverses "no version at
 //! any tier", so the reasoning is recorded rather than left as a silent edit.
 //!
@@ -202,6 +211,109 @@ pub struct HealthReport {
     pub node: String,
 }
 
+/// What is running: the binary's name, its version, and a hash of its bytes.
+///
+/// **A hash alone is not an identity.** That was the first shape of #105 and it
+/// was wrong: an opaque number on its own could be a hash of anything, and a
+/// reader who sees two of them differ learns that something differs, not what.
+/// Keyed to the name and the version it becomes the answer to a question an
+/// operator actually asks, which is "what is this node running".
+///
+/// The three carry different information and none is redundant:
+///
+/// - `name` says WHICH binary. A node runs several, and "the node is on 1.10.0"
+///   has never been one fact: on 2026-09-16 this fleet had m6-http and the
+///   renderers built from different trees and nothing could express that.
+/// - `version` says which release it claims to be. It is what an operator reads
+///   and what release notes are written against.
+/// - `hash` says which BUILD it actually is. Rust is not byte-reproducible, so
+///   one tag built twice gives two binaries reporting one version. On
+///   2026-09-20 staging ran one build of `v1.10.0` and production another, every
+///   reading said the fleet agreed, and it was found by running `md5sum` on four
+///   machines.
+///
+/// `hash` and not `md5`: the algorithm is how the value is produced, not what it
+/// means, and naming the field after it makes changing it a wire break for every
+/// reader. It IS md5 today, because that is the number the rest of the estate
+/// already compares: `deploy/estate/*.json` records md5, `ops.sh capture` writes
+/// md5, and the promotion gate refuses on md5. A second hash of the same bytes
+/// under another algorithm would give an operator two numbers and answer nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildId {
+    /// The binary's own name, e.g. `"m6-http"`, from its crate at compile time.
+    pub name: String,
+    /// The m6 release this was built against. Same value, and the same
+    /// reasoning, as the `version` field this replaced.
+    pub version: String,
+    /// Hex md5 of the running executable. Empty when it could not be read, which
+    /// the monitor renders as unknown and counts as drift rather than agreement.
+    pub hash: String,
+}
+
+/// This process's own [`BuildId`], computed once.
+///
+/// Computed once and cached for the life of the process, which is correct and
+/// not merely cheap: a deploy replaces the file on disk while this process keeps
+/// running the bytes it started with, and the bytes it started with are the
+/// honest answer to "what is serving". Re-reading per request would report the
+/// NEW binary while still running the old one, which is exactly the lie this is
+/// here to prevent.
+///
+/// The name comes from the running executable rather than from a compile-time
+/// constant, because the constant available to a library is m6-core's own name
+/// and the answer wanted is the binary's. The version is m6-core's, which is the
+/// m6 release: for the workspace binaries that is their own version, and for a
+/// service linking core from a git tag it is that tag, which is the more useful
+/// answer for a service whose own version means nothing to this fleet.
+pub fn build_id() -> &'static BuildId {
+    static BUILD: std::sync::OnceLock<BuildId> = std::sync::OnceLock::new();
+    BUILD.get_or_init(|| BuildId {
+        name: std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
+            .unwrap_or_default(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        hash: executable_md5(),
+    })
+}
+
+/// Hex md5 of this process's own executable, or empty if it cannot be read.
+///
+/// Read in chunks rather than with `fs::read`, which would allocate the whole
+/// binary: m6-http is tens of megabytes and this runs on a 1 cpu node with the
+/// event loop about to start.
+///
+/// Empty on any failure, which is a real possibility under confinement and must
+/// never take `/perf` down: a node that cannot say what it is running is still a
+/// node that can report its latency. The monitor reads an empty hash as unknown
+/// and counts it as drift rather than as agreement.
+fn executable_md5() -> String {
+    use md5::{Digest, Md5};
+    use std::io::Read;
+
+    let Ok(path) = std::env::current_exe() else {
+        return String::new();
+    };
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    let mut hasher = Md5::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => hasher.update(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            // A partial read is worse than none: it produces a
+            // plausible-looking hash of a prefix, which compares unequal
+            // across two nodes running identical binaries and reports drift
+            // that is not there.
+            Err(_) => return String::new(),
+        }
+    }
+    format!("{:x}", hasher.finalize())
+}
+
 impl HealthReport {
     /// Build a report and the HTTP status that should carry it.
     ///
@@ -272,28 +384,31 @@ impl HealthReport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PerfReport {
     pub node: String,
-    /// The m6 release this node is running.
+    /// What this node is running: name, version and build hash.
     ///
-    /// Without this the only way to learn what a node runs is to ssh in and ask
-    /// the binary, so "every node runs the pinned release" was an invariant
-    /// nothing could check. On 2026-09-16 four written records disagreed about
-    /// this fleet and none of them matched it: the deployment repo's pin said
-    /// v1.2.0, its captured config said 1.2.0 with an md5 matching nothing
-    /// running, its release log named v1.1.0, and all three nodes were serving
-    /// 1.3.0. No node was faulty. Nothing could observe the truth, so the
-    /// records rotted without anyone being wrong on purpose.
+    /// This was a bare `version: String` until 2026-09-20 (#105), and the
+    /// version is still in it, unchanged in meaning. What it could not do is
+    /// tell two builds of one tag apart, and that is not a hypothetical: on
+    /// 2026-09-20 staging ran one build of `v1.10.0` and production another,
+    /// every reading said the fleet agreed, and it took `md5sum` on four
+    /// machines to see it.
     ///
-    /// This is m6-core's own version, taken at compile time. For m6-http that is
-    /// the same number the binary reports, because the workspace shares one
-    /// version and core is a path dependency. For a service that links core from
-    /// git at a tag, it is that tag: "which m6 was this built against", which is
-    /// the more useful answer for a service whose own version means nothing here.
+    /// Why the version alone was already worth having, kept because the argument
+    /// still applies to the whole structure: without it the only way to learn
+    /// what a node runs was to ssh in and ask the binary, so "every node runs the
+    /// pinned release" was an invariant nothing could check. On 2026-09-16 four
+    /// written records disagreed about this fleet and none matched it: the
+    /// deployment repo's pin said v1.2.0, its captured config said 1.2.0 with an
+    /// md5 matching nothing running, its release log named v1.1.0, and all three
+    /// nodes served 1.3.0. No node was faulty. Nothing could observe the truth,
+    /// so the records rotted without anyone being wrong on purpose.
     ///
     /// `serde(default)` so a node older than this change deserialises to an empty
-    /// string instead of making the whole payload unparseable to an aggregator.
-    /// The monitor renders that as "too old to say" rather than as agreement.
+    /// `BuildId` instead of making the whole payload unparseable to an
+    /// aggregator. The monitor renders that as "too old to say" rather than as
+    /// agreement.
     #[serde(default)]
-    pub version: String,
+    pub build: BuildId,
     /// This process's uptime. `host.uptime_s` is the machine's, and the two
     /// differing is how a service restart is told apart from a reboot.
     pub uptime_s: u64,
@@ -392,7 +507,7 @@ impl PerfReport {
                 // anonymous caller never causes a /proc read either.
                 PerfOutcome::Ok(Box::new(PerfReport {
                     node: node.to_string(),
-                    version: env!("CARGO_PKG_VERSION").to_string(),
+                    build: build_id().clone(),
                     uptime_s,
                     pools,
                     url_backends,
@@ -610,10 +725,12 @@ mod tests {
         assert!(!String::from_utf8_lossy(&body).contains("unauthorised"));
     }
 
-    /// The version reaches the wire, and it is the crate's real version rather
-    /// than a placeholder. An aggregator cannot report drift it never receives.
+    /// The build identity reaches the wire, whole. An aggregator cannot report
+    /// drift it never receives, and each of the three parts answers a different
+    /// question: which binary, which release it claims to be, which build it
+    /// actually is.
     #[test]
-    fn perf_reports_the_running_version() {
+    fn perf_reports_the_running_build_identity() {
         let out = PerfReport::build(
             PerfSubject {
                 node: "sydney",
@@ -631,15 +748,72 @@ mod tests {
         let (code, _, body) = out.into_response();
         assert_eq!(code, 200);
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v["version"].as_str(), Some(env!("CARGO_PKG_VERSION")));
-        assert!(!v["version"].as_str().unwrap().is_empty());
+        assert_eq!(
+            v["build"]["version"].as_str(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        assert!(!v["build"]["version"].as_str().unwrap().is_empty());
+
+        // The name is the RUNNING binary's, not m6-core's. A library cannot
+        // know the binary's name at compile time, so this reads the executable,
+        // and a regression here would silently label every service "m6-core".
+        let name = v["build"]["name"].as_str().expect("a name");
+        assert!(!name.is_empty());
+        assert_ne!(
+            name, "m6-core",
+            "the name must come from the running executable, not from the \
+             library's own CARGO_PKG_NAME: every service would report m6-core"
+        );
+
+        // The hash is the md5 of this very binary. Checked against a hash taken
+        // here rather than against a constant, which would pin whatever the
+        // code produced on the day and prove only that it has not changed.
+        // This is the property that makes the field worth having: it must equal
+        // `md5sum` of the artefact, which is what deploy/estate/*.json records
+        // and what the promotion gate compares.
+        use md5::{Digest, Md5};
+        let exe = std::env::current_exe().expect("a test binary has a path");
+        let expected = format!("{:x}", Md5::digest(std::fs::read(&exe).unwrap()));
+        assert_eq!(v["build"]["hash"].as_str(), Some(expected.as_str()));
+        assert_eq!(expected.len(), 32, "hex md5 is 32 characters");
+    }
+
+    /// Two builds of one tag report the same version and different hashes. That
+    /// is the whole reason the hash is there, so it is asserted rather than
+    /// assumed: a version comparison cannot see this and a hash comparison can.
+    ///
+    /// Simulated by hashing two different byte strings, because the real case
+    /// needs two compilations of one source and Rust gives no way to force that
+    /// in a unit test. What is being pinned is the CLAIM: same version, different
+    /// bytes, and only the hash distinguishes them.
+    #[test]
+    fn one_version_two_builds_differ_only_in_the_hash() {
+        use md5::{Digest, Md5};
+        let a = BuildId {
+            name: "m6-http".into(),
+            version: "1.10.0".into(),
+            hash: format!("{:x}", Md5::digest(b"build one")),
+        };
+        let b = BuildId {
+            hash: format!("{:x}", Md5::digest(b"build two")),
+            ..a.clone()
+        };
+
+        assert_eq!(a.version, b.version, "same tag");
+        assert_eq!(a.name, b.name, "same binary");
+        assert_ne!(a.hash, b.hash, "different bytes");
+        assert_ne!(
+            a, b,
+            "a fleet holding these two is NOT uniform, and comparing versions \
+             alone would call it uniform. That is what happened on 2026-09-20."
+        );
     }
 
     /// A payload without the field still parses, because the fleet is upgraded one
     /// node at a time and an aggregator that cannot read an older node learns
     /// nothing about the node it most needs to ask about.
     #[test]
-    fn a_perf_payload_without_a_version_still_parses() {
+    fn a_perf_payload_without_a_build_still_parses() {
         // A real payload with the field taken out, rather than a hand-written
         // fixture: a fixture only proves the fixture parses, and the first attempt
         // at one failed on unrelated required fields of StatsSnapshot.
@@ -659,9 +833,13 @@ mod tests {
         );
         let (_, _, body) = out.into_response();
         let mut v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(v.as_object_mut().unwrap().remove("version").is_some());
+        assert!(v.as_object_mut().unwrap().remove("build").is_some());
         let p: PerfReport = serde_json::from_value(v).expect("older node must parse");
-        assert_eq!(p.version, "");
+        assert_eq!(p.build, BuildId::default());
+        assert_eq!(
+            p.build.version, "",
+            "and it reads as unknown, not as agreement"
+        );
     }
 
     #[test]

@@ -14,6 +14,57 @@ releases only; work happens on `develop`. See `CONTRIBUTING.md`.
 
 ## Unreleased
 
+### Changed
+
+**`/perf` reports what is running: name, version and build hash.** Issue #105.
+`PerfReport`'s `version: String` becomes `build: BuildId { name, version, hash }`.
+The version is unchanged in meaning and moved inside rather than duplicated
+beside it. `serde(default)`, so a node older than this parses to an empty
+`BuildId` and the monitor reads it as unknown rather than as agreement.
+
+Why. A version string cannot tell two builds of one tag apart. Rust is not
+byte-reproducible, so `v1.10.0` built twice gives different binaries both
+reporting `1.10.0`. On 2026-09-20 staging ran one build of `v1.10.0` and
+production another; every reading an operator had said the fleet agreed, and it
+took `md5sum` on four machines to find. Each part of the identity answers a
+different question: `name` says which binary, because a node runs several and
+"the node is on 1.10.0" has never been one fact; `version` says which release it
+claims to be; `hash` says which build it actually is.
+
+`/health` is unchanged and still publishes exactly `status` and `node`. A bare
+hash was proposed there first and rejected: it is defensible on disclosure
+grounds, since a hash names one build rather than a release and cannot be turned
+back into one when the build is not reproducible and no binaries are published,
+but an opaque number on its own could be a hash of anything. An identity is a
+hash keyed to a name and a version, and those already live on `/perf`.
+
+The field is `hash` and not `md5` because the algorithm is how the value is
+produced rather than what it means, and naming the field after it would make
+changing it a wire break. It is md5 today, because that is the number the rest
+of the estate already compares.
+
+**No existing tool breaks.** `serde(default)` on both sides means a new monitor
+against an old node reads "unknown", and an old monitor against a new node reads
+"unknown" too, rather than failing to parse. Nothing else consumed the field:
+the deployment's `ops.sh` takes the version from `m6-http --version` and
+`perf-report.py` never read it. The only cost of a mixed fleet is a few minutes
+of the monitor saying "unknown" for nodes it has not caught up with.
+
+Verified: the build hash equals `md5sum` of the running executable, asserted
+against a hash taken in the test rather than a constant; the binary name comes
+from the executable and not from the library's `CARGO_PKG_NAME`, which would
+label every service `m6-core`; and a payload with the field removed still
+parses. Read once at first use and cached, because a deploy replaces the file
+while the process keeps serving the bytes it started with.
+
+**`m6-monitor` reports build drift.** Section C reads
+`m6-http 1.10.0 build 0123456789ab` per node, and a new fleet finding fires when
+the versions agree and the hashes do not, which is exactly the case a version
+comparison cannot see. Reported separately from version drift and only when
+versions match: different releases have different binaries by construction, so
+naming that as a second fault sends an operator to two places for one problem.
+Both new guards were watched go red against the unfixed code.
+
 ### Added
 
 **TLS session resumption is measured, and gated on h1, h2 and h3.**
