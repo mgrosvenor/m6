@@ -25,10 +25,20 @@ resolver = "2"
 # Shared by every crate in the workspace, so they cannot drift apart. Each
 # member inherits with `version.workspace = true` and friends.
 #
-# The version matches the newest tag. Bump it HERE, on develop, before running
-# `tools/release.sh` — that script merges, tags and pushes, and does NOT touch
-# this line. An earlier comment here said it did, which is the kind of claim that
-# is only tested once, at a release, and this was that release.
+# The version matches the newest tag. Bump it HERE, on develop, and do it FIRST:
+# the develop -> main pull request that is the release reads this line to decide
+# what CHANGELOG.md and HANDOVER.md must mention, and to check the version is not
+# already tagged. `./tag.sh v<version>` then tags the merge and does NOT touch
+# this line.
+#
+# This said `tools/release.sh` until 2026-09-26, and that script was deleted on
+# 2026-09-14 when a pull request became the only way from develop to main. Issue
+# #118: the same deleted name was in both of the pre-push hook's tag refusals and
+# in the pull request template. It is the shape to watch for, because all four
+# sites are read at exactly one moment -- while cutting a release -- and none of
+# them is read at any other time, so being wrong costs nothing until it costs
+# something. An earlier comment here also claimed that script bumped this line,
+# which it did not; that claim was likewise only ever tested at a release.
 #
 # Before any of this the tag said v0.2.0 and every crate said 0.1.0.
 #
@@ -40,7 +50,7 @@ resolver = "2"
 # release, because it needs a tag to pin to. See docs/CONSOLIDATION-TODO.md for
 # what remains, and CHANGELOG.md's 1.0.0 entry for what is knowingly not fixed.
 [workspace.package]
-version      = "1.11.1"
+version      = "1.11.2"
 edition      = "2021"
 # The oldest toolchain we test. Declared because declaring one and not testing
 # it is a claim rather than a fact: CI builds the whole workspace with exactly
