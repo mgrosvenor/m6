@@ -32,11 +32,25 @@ number, it does.
   two builds of one tag apart and Rust is not byte-reproducible. A monitor newer
   than a node reads "unknown" rather than failing to parse, which is the
   `serde(default)` behaviour and not a fault.
-- **1.11.1 is released and is NOT deployed, and that is correct.** It is a
-  documentation release: no library or binary change, so there is nothing in it
-  for a node to run. The fleet stays on 1.11.0 at `4fefd42cf7a8` and is not
-  behind; the deployment repository's pin stays at `v1.11.0` deliberately. Do not
-  "catch production up" to 1.11.1.
+- **1.11.1 AND 1.11.2 are released and are NOT deployed, and that is correct.**
+  Both are documentation releases: no library or binary change, so there is
+  nothing in either for a node to run. The fleet stays on 1.11.0 at
+  `4fefd42cf7a8` and is not behind; the deployment repository's pin stays at
+  `v1.11.0` deliberately. Do not "catch production up" to 1.11.2.
+- **1.11.2 exists because a gate was lying to whoever reads it.** Both of the
+  pre-push hook's tag refusals told you to run `./tools/release.sh`, deleted on
+  2026-09-14, ten lines below the header recording the deletion. The same dead
+  name was in the pull request template and in `Cargo.toml`'s comment beside the
+  version line. All four are read at one moment, while cutting a release, and at
+  no other, so being wrong cost nothing until it cost something. Issue #118, and
+  it is a release rather than a `develop` commit because `main` is what a fresh
+  clone gets.
+
+  Two tests now hold it: `every_script_offered_as_a_remedy_exists` fails if the
+  hook or the pull request template names a script that is not on disk, comments
+  exempt, and `a_tag_refusal_names_tag_sh` asserts the refusals name `./tag.sh`.
+  CI's shellcheck also found `*.sh` alone, so the hook itself had never been
+  checked; `.githooks` is in that `find` now.
 - **A RELEASE IS NOW GATED ON THIS FILE.** A pull request into `main` fails unless
   `HANDOVER.md` mentions the version being released, beside the existing
   requirement that `CHANGELOG.md` has a section for it. Owner's rule, 2026-09-25:
@@ -261,9 +275,10 @@ push could break every example and CI stayed green.
 | site | `develop` | `0b04e67`, 2 ahead of `main`, pushed |
 
 **The table above is a point-in-time record and its SHAs are superseded.** As of
-2026-09-25 both repositories are at two branches, `main` and `develop`, level with
-each other and with origin, and m6's `main` is `v1.11.0`, which is what production
-runs. Nothing is unreleased and nothing is undeployed.
+2026-09-26 both repositories are at two branches, `main` and `develop`, level with
+each other and with origin. m6's `main` is **`v1.11.2`**; production runs
+**1.11.0**, and the gap is two documentation releases with nothing in them for a
+node to run. Nothing is unreleased; nothing is undeployed that could be.
 
 **Two different numbers used to get confused here, so keep them apart when they
 reappear.** Commits behind `develop` is UNRELEASED work; commits measured from the
@@ -290,10 +305,15 @@ would make the staging pass prove nothing.
 
 1.10.0 held that place from 2026-09-19, at md5 `17ef4e5bef36`.
 
-Recompute what is unreleased, never trust a number written here:
+1.11.1 and 1.11.2 are released and deliberately not deployed: both are
+documentation, and a node has nothing to run from either.
+
+Recompute what is unreleased, never trust a number written here, and note that
+the tag to measure from is the newest one rather than the deployed one:
 
 ```sh
-git -C ~/m6 log --oneline v1.11.0..develop | wc -l
+git -C ~/m6 describe --tags --abbrev=0 main            # newest release
+git -C ~/m6 log --oneline "$(git -C ~/m6 describe --tags --abbrev=0 main)"..develop | wc -l
 ```
 
 **The site side is now recorded too**, which it was not when this section said

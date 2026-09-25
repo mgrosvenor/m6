@@ -604,13 +604,20 @@ running server rather than inferred from the source:
 
 ### The structural question
 
-The audit's own recommendation, and the honest position: either replace the
-hand-written HTTP/2 machinery with a maintained codec and keep m6's routing and
-cache around it, or commit to hand-written H2 as a project goal and build it
-out properly — a frame-validation table, complete stream state machine,
+The audit's own recommendation, and the honest position at the time: either
+replace the hand-written HTTP/2 machinery with a maintained codec and keep m6's
+routing and cache around it, or commit to hand-written H2 as a project goal and
+build it out properly — a frame-validation table, complete stream state machine,
 connection and stream flow-control ledgers, HPACK directionality, fragmentation
-handling, fuzzing, and h2spec. Both are defensible; they are very different
-amounts of work. **This decision gates a 1.0 release.**
+handling, fuzzing, and h2spec.
+
+**ANSWERED, and this paragraph said "this decision gates a 1.0 release" until
+2026-09-26, twelve days after 1.0 was cut.** The second option was taken and
+built out: h2spec is **146/146** and h3spec **47/49**, both with recorded floors
+that CI enforces on every pull request, and `docs/H2-PLAN.md` carries the seven
+phases and what each one fixed. 1.0.0 was released on 2026-09-14. The two
+remaining h3spec failures are QPACK stream errors inside quiche, accepted
+deliberately; `tools/conformance-scores.txt` argues that one in full.
 
 ## Known Limitations
 

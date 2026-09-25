@@ -12,6 +12,85 @@ releases only; work happens on `develop`. See `CONTRIBUTING.md`.
 
 ---
 
+## 1.11.2 — 2026-09-26
+
+Documentation, one CI gate and two tests. **No library or binary change, so there is
+nothing in it for a node to run**: the fleet stays on 1.11.0 and the deployment
+repository's pin stays at `v1.11.0`, exactly as for 1.11.1.
+
+It is a release rather than a commit on `develop` for the reason 1.11.1 exists: `main`
+takes releases only, and `main` is what a fresh clone gets. Everything below is text a
+person reads while doing something, and the reader who most needs it is the one who has
+just cloned the repository.
+
+### Fixed
+
+**Both of the pre-push hook's tag refusals told you to run a script deleted twelve days
+earlier.** `./tools/release.sh` went on 2026-09-14 with `tools/merge.sh`, when a pull
+request became the only way into `develop` and the only way from `develop` to `main`.
+The hook's own header records that deletion **ten lines above** the first refusal, and
+its `main` guidance correctly says `./tag.sh`. One short file disagreed with itself.
+
+The logic was right throughout. What was wrong is the only part anyone reads. Nobody
+reads a hook, they read its refusal, and these two fire while somebody is cutting a
+release and is least inclined to stop and check whether the remedy exists. Following it
+gets `no such file or directory`, from the tool whose whole job is to be believed.
+
+The second refusal was worse than merely wrong: it named `tools/release.sh` as the thing
+that sets `M6_RELEASE`, when `./tag.sh` is what sets it. It misdirected on the single
+fact it exists to convey. Both now give the real sequence, and the second says what
+`./tag.sh` checks, which is the argument for using it.
+
+**The same deleted script was in two more places, and all four are read at the same
+moment.** `.github/pull_request_template.md` put it in front of the author of every pull
+request. `Cargo.toml`'s own comment, beside the version line, told you to run it after
+bumping, which is the first step of a release. That is the shape: every one of these
+sites is read while cutting a release and at no other time, so being wrong costs nothing
+until it costs something. Issue #118.
+
+**`.githooks/pre-push` had never been checked by anything.** CI's shellcheck step found
+`*.sh`, and a git hook does not get an extension, so the one shell file in this
+repository that runs on every developer's machine was the one file excluded. It had an
+unused-variable warning sitting in it. A gate that selects its inputs by file extension
+misses exactly the files that never get one. The `find` now includes `.githooks`: 11
+scripts, clean at warning level.
+
+**Four documents stated things that had stopped being true.**
+
+- `CONTRIBUTING.md` said clippy is held "at or under its recorded count". Clippy has been
+  `-D warnings` with no ceiling since 2026-09-13, and the ceiling was removed precisely
+  because a number in a file reads as an allowance.
+- The pull request template said the same thing, to every author.
+- `README.md` closed its structural-question section with "this decision gates a 1.0
+  release", twelve days after 1.0 was cut. The question was answered by taking the
+  second option and building it out: h2spec 146/146, h3spec 47/49, both with floors CI
+  enforces.
+- `docs/H2-PLAN.md` led with h3spec **37/49** and "all 12 remaining failures inside
+  quiche". It has been 47/49 since 2026-09-13, and the two that remain are QPACK stream
+  errors that are a deliberate upstream decision rather than a defect. That is the
+  status line of the document named for any HTTP/2 or HTTP/3 work.
+
+### Added
+
+**The hook's refusals are tested, because text a program prints is program behaviour.**
+
+- `every_script_offered_as_a_remedy_exists` walks the hook's non-comment lines and the
+  whole pull request template and fails if a path named there is not on disk. Comments
+  are exempt, deliberately, so the header can go on recording what was deleted and why.
+- `a_tag_refusal_names_tag_sh` asserts the positive. Naming no deleted script is not yet
+  naming the right one.
+
+Both were watched red against the old text before being trusted, each half separately.
+
+### Verified
+
+Build host, against the tree: **1148 passed, 0 failed**, 0 warnings on release and test
+builds, clippy ok, conformance h1+h2+h3 ok, performance ok. 1146 before, so the two new
+tests are the difference. CI on the pull request: build/tests/clippy, conformance,
+examples, MSRV, cargo-deny and shell scripts all pass.
+
+Recorded as lesson 53.
+
 ## 1.11.1 — 2026-09-25
 
 A documentation release, and the reason it had to be a release is the lesson.

@@ -3,13 +3,65 @@
 **`HANDOVER.md` is what is true. This is what is owed.** Read that first; it is
 written for someone with no prior context.
 
-Status block below rewritten 2026-09-13. The sections after it are the detailed
-history, kept because the reasoning in them is usually the only record of why
-something is shaped the way it is.
+**The top status block is the current one and everything below it is history**,
+kept because the reasoning in it is usually the only record of why something is
+shaped the way it is. Read the dates: a block that is not today's is a claim
+about a day that has passed, and this file has twice been read as current when
+it was nine days and four releases out. That is #67.
 
 Ordering principle, the owner's: **m6-core is the PHP of m6, a box of blocks a
 service is assembled from.** Anything that can reasonably be expected to
 generalise belongs in core, and core should be the only thing a service links.
+
+---
+
+## STATUS, 2026-09-26
+
+**This block is the current one.** Everything below it, starting with the 2026-09-17
+block, is a point-in-time record: accurate about its own day and superseded on the
+numbers.
+
+This file going stale is **#67**, which is still open and is about this file. The
+2026-09-17 block sat here for nine days saying production ran **1.7.0** when it has run
+**1.11.0** since 2026-09-25, and listing "cut 1.8.0" as the first thing owed when 1.8.0
+through 1.11.2 have all shipped. That is the second time, and the first time is what
+opened the issue. **Re-date this block or delete it; a dated block nobody re-dates is
+the failure mode, not the fix.**
+
+| | |
+|---|---|
+| released | **1.11.2**, 2026-09-26. `main` = `develop`, two branches, both level with origin |
+| in production | **1.11.0**, syd + lon + chi, md5 `4fefd42cf7a8`, since 2026-09-25 |
+| the gap | 1.11.1 and 1.11.2 are documentation releases. Nothing in either for a node to run, so the fleet is not behind and the deployment repository's pin stays at `v1.11.0` |
+| conformance | h1 32/32 per backend, h2 **146/146**, h3 **47/49**, all with floors CI enforces |
+| tests | 1148 on the build host, 0 failed, 0 warnings, clippy silent |
+
+### What is owed, 2026-09-26
+
+| # | item | issue |
+|---|---|---|
+| 1 | **Log footprint in the report.** Journal disk usage and analytics file size on `/perf`: the coverage the retired python health check had and `m6-monitor` does not. Every health check run has to say these are not measured. | #34 |
+| 2 | **Branch protection on `main`.** `.githooks/pre-push` refuses a direct push, which is a local convention and not enforcement: it protects whoever installed the hook, and a fresh clone has no hook at all until `core.hooksPath` is set. | #65 |
+| 3 | **Stats conflate three populations**: monitor, internal backbone and real external traffic. | #107 |
+| 4 | **A 1.10.0 edge answers 502 when a backend sends 103.** Open, and now worth re-testing against 1.11.x. | #100 |
+| 5 | **`m6-http` silently ignores unknown keys in `[server]`**, so a typo'd option is accepted and does nothing. | #81 |
+| 6 | **`site.toml` and the app toml should share one parse.** | #98 |
+| 7 | **`FrameworkState::build_dict` is private**, so the twelve ordered steps are not reusable by a service not using `App`. | #66 |
+| 8 | **m6-auth-server path resolution**: `[storage]` resolves against the config file's directory and `[keys]` against the site root, two rules for one idea. Not running in production, so no live migration. | #16 |
+| 9 | **Debian package from CI.** Blocked: needs a GPG key from the owner. | #25 |
+| 10 | **The 05-cms check can measure staging instead of the example** and call it a pass. | #71 |
+| 11 | **`render:minimal` fails intermittently**: its 20% margin is inside the noise of measuring right after a full build. | #89 |
+| 12 | **Should `stale-while-revalidate=600` extend to unversioned assets?** Owner's question. | #99 |
+| 13 | **This file, and `HANDOVER.md`, go stale silently.** | #67 |
+
+Closed since the 2026-09-17 block, all of them by work that shipped: #3 (the four
+advisories), #50 (`tag.sh` publishes the release), #60 (shellcheck runs), #62 (m6-http
+warms its own cache), #64 (1.8.0 cut), #105 (the fleet reports its own build), #118 (the
+pre-push hook named a deleted script). Recompute rather than trusting this list:
+
+```sh
+gh issue list --repo mgrosvenor/m6 --state open
+```
 
 ---
 
