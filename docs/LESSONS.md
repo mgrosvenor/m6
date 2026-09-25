@@ -613,3 +613,32 @@ New 2026-09-12:
     script's four cases, a check that cannot measure honestly must not pretend to.
     What this one guarantees is that the file is opened at the one moment the author
     knows what is true.
+
+53. **A gate's refusal text is its entire user interface, and it is the part that
+    goes stale without anyone noticing.** `.githooks/pre-push` told anyone who tried
+    to push a tag to run `./tools/release.sh`. That script was deleted on 2026-09-14,
+    when a pull request became the only way into `develop` and the only way from
+    `develop` to `main`. The hook's own header records the deletion **ten lines
+    above** the first refusal that names it, and its `main` guidance correctly says
+    `./tag.sh`. So one short file disagreed with itself for twelve days.
+
+    The logic was right the whole time. What was wrong was the one part that is ever
+    read: nobody reads a hook, they read its refusal, and a refusal is read at the
+    worst possible moment. These two fire while someone is cutting a release, which
+    is exactly when they are least inclined to stop and check whether the remedy
+    exists, and following it gets `no such file or directory` from the tool whose
+    whole job is to be believed. The second refusal was worse than wrong: it named
+    `tools/release.sh` as the thing that sets `M6_RELEASE`, when `./tag.sh` is what
+    sets it, so it misdirected on the single fact it existed to convey.
+
+    The same deleted script was in `.github/pull_request_template.md`, in front of
+    the author of every pull request, next to a clippy "recorded count" that stopped
+    existing on 2026-09-13 when clippy went to `-D warnings` with no ceiling.
+
+    Two general parts. **Deleting a tool means deleting every instruction to run
+    it**, and a grep for the name finds those in seconds, which is why this cost
+    twelve days rather than two minutes: nobody looked. And **text a program prints
+    is program behaviour and gets tested like it** -- `every_script_offered_as_a_remedy_exists`
+    now walks the refusal strings and the pull request template and fails if a path
+    named there is not on disk, while comments are exempt so the header can go on
+    recording what was deleted and why.
