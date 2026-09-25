@@ -19,18 +19,40 @@ number, it does.
 
 ## 0. If you read nothing else
 
-- **THE FREEZE IS OVER. m6 1.10.0 is deployed to production**, 2026-09-19, on
-  all three nodes (syd, lon, chi), md5 `17ef4e5bef36e36205230cf21db5faa6`, 19/19
-  checks each. It carries 1.9.0 (the TLS session ticketer) and 1.10.0 (push and
-  103 Early Hints removed). The lines above this one said "do not deploy, 135
-  commits are undeployed" until that day; that is history now, and the next
-  release is an ordinary release.
-- **#105 is written, green and NOT merged.** PR
-  [#106](https://github.com/mgrosvenor/m6/pull/106) into `develop`, branch
-  `feat/105-health-reports-binary-hash`, four commits, CI green and the full
-  build-host gate passed (1145 tests, clippy silent, cargo-deny ok including the
-  new `md-5`, h1/h2/h3 and performance ok, examples and the CMS end-to-end
-  suite green).
+- **m6 1.11.0 IS DEPLOYED TO PRODUCTION**, 2026-09-25, on all three nodes (syd,
+  lon, chi), md5 `4fefd42cf7a8584fccdfd5b7fee93657`, 19/19 checks each, with
+  `bd5c3efd659a` as the rollback in `.prev`. `mon` runs m6-monitor 1.11.0. It
+  was promoted rather than rebuilt: production takes the artefact staging ran,
+  matched by md5.
+- **THE FLEET REPORTS ITS OWN BUILD NOW, so stop ssh-ing a node to ask.** #105
+  shipped in 1.11.0, and the monitor's section C reads
+  `m6-http 1.11.0 build 4fefd42cf7a8` per node. That hash was validated once
+  against `md5sum` on all three boxes on 2026-09-25. Before it, confirming the
+  fleet ran one binary took three ssh connections, because a version cannot tell
+  two builds of one tag apart and Rust is not byte-reproducible. A monitor newer
+  than a node reads "unknown" rather than failing to parse, which is the
+  `serde(default)` behaviour and not a fault.
+- **1.11.1 is released and is NOT deployed, and that is correct.** It is a
+  documentation release: no library or binary change, so there is nothing in it
+  for a node to run. The fleet stays on 1.11.0 at `4fefd42cf7a8` and is not
+  behind; the deployment repository's pin stays at `v1.11.0` deliberately. Do not
+  "catch production up" to 1.11.1.
+- **A RELEASE IS NOW GATED ON THIS FILE.** A pull request into `main` fails unless
+  `HANDOVER.md` mentions the version being released, beside the existing
+  requirement that `CHANGELOG.md` has a section for it. Owner's rule, 2026-09-25:
+  docs being up to date is a fundamental part of a release, not a follow-up to
+  one. It exists because 1.11.0 shipped and was deployed while this file's first
+  bullet still said "m6 1.10.0 is deployed to production" with the wrong md5, and
+  the correction could not reach `main` without a release, because a docs-only
+  pull request fails the tag check. 1.11.1 was cut for documentation alone as a
+  result. The check only asks that the version is mentioned: nothing here can know
+  what is deployed, and a check that cannot fail honestly is worse than none.
+- 1.10.0 was deployed on 2026-09-19, md5 `17ef4e5bef36`, and the freeze that
+  preceded it is long over. The lines above this one once said "do not deploy,
+  135 commits are undeployed"; that is history.
+- **#105 IS MERGED AND RELEASED in 1.11.0**, PR
+  [#106](https://github.com/mgrosvenor/m6/pull/106), and it is deployed. This
+  entry said "written, green and NOT merged" until 2026-09-25.
 
   `PerfReport`'s `version: String` becomes `build: BuildId { name, version, hash }`,
   so `/perf` says which BUILD is running and not only which release it claims to
@@ -41,9 +63,10 @@ number, it does.
   see. Nothing breaks: `serde(default)` on both sides, and no other consumer read
   the field.
 
-  It is held because the deployment repository is mid-refactor. Rolling it needs
-  a staging monitor, and staging has never had one (site #89). Merging and
-  releasing 1.11.0 is safe whenever that is ready.
+  It was held because the deployment repository was mid-refactor and rolling it
+  needed a staging monitor, which staging did not have (site #89). Both are done:
+  staging has its own monitor, and on 2026-09-25 this went staging, then
+  production, mon first as the canary.
 - **`main` IS what is running**, as of this release, which is the point of the
   branch model. Confirm it the same way as always: the newest entry in the
   deployment repository's `docs/RELEASES.md` names the commit, and
@@ -228,10 +251,15 @@ push could break every example and CI stayed green.
 | site | `main` | `e9f11c2` |
 | site | `develop` | `0b04e67`, 2 ahead of `main`, pushed |
 
-**Two different numbers get confused here, so keep them apart.** `main` is 12
-commits behind `develop`: that is unreleased work. 135 commits are undeployed:
-that is measured from the deployed commit, which is far behind `main`. An
-earlier version of this table printed 135 in the `main` row and was wrong.
+**The table above is a point-in-time record and its SHAs are superseded.** As of
+2026-09-25 both repositories are at two branches, `main` and `develop`, level with
+each other and with origin, and m6's `main` is `v1.11.0`, which is what production
+runs. Nothing is unreleased and nothing is undeployed.
+
+**Two different numbers used to get confused here, so keep them apart when they
+reappear.** Commits behind `develop` is UNRELEASED work; commits measured from the
+deployed commit is UNDEPLOYED work, and they are not the same number. An earlier
+version of this table printed the second in the `main` row and was wrong.
 
 **CI runs on `develop` now**, from 2026-09-13, and before that push it had
 never run there. **Two runs have gone green end to end**, all five jobs: build,
@@ -245,16 +273,18 @@ testers. Watch with `gh run list --branch develop`.
 
 ### What is deployed
 
-**m6 1.10.0, on all three production nodes, since 2026-09-19.** The tag is
-`v1.10.0`; the artefact is md5 `17ef4e5bef36e36205230cf21db5faa6`, and
-production promoted the binary staging had run rather than rebuilding it,
-because Rust is not byte-reproducible and a rebuild would make the staging pass
-prove nothing.
+**m6 1.11.0, on all three production nodes, since 2026-09-25.** The tag is
+`v1.11.0`; the artefact is md5 `4fefd42cf7a8584fccdfd5b7fee93657`, the rollback
+in `.prev` is `bd5c3efd659a`, and production promoted the binary staging had run
+rather than rebuilding it, because Rust is not byte-reproducible and a rebuild
+would make the staging pass prove nothing.
+
+1.10.0 held that place from 2026-09-19, at md5 `17ef4e5bef36`.
 
 Recompute what is unreleased, never trust a number written here:
 
 ```sh
-git -C ~/m6 log --oneline v1.10.0..develop | wc -l
+git -C ~/m6 log --oneline v1.11.0..develop | wc -l
 ```
 
 **The site side is now recorded too**, which it was not when this section said

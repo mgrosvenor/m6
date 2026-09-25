@@ -12,6 +12,47 @@ releases only; work happens on `develop`. See `CONTRIBUTING.md`.
 
 ---
 
+## 1.11.1 — 2026-09-25
+
+A documentation release, and the reason it had to be a release is the lesson.
+
+### Fixed
+
+**`HANDOVER.md` named the wrong deployed version, on `main`, for hours.** Its first
+bullet read "m6 1.10.0 is deployed to production" with md5 `17ef4e5bef36` while the
+fleet had been running 1.11.0 at `4fefd42cf7a8` since earlier the same day. That is
+the first thing a cold session reads, and `main` is the default branch.
+
+The correction existed on `develop` immediately and **could not reach `main`**: a
+docs-only `develop` to `main` pull request fails the "version is not already tagged"
+check, because `v1.11.0` existed. So the stale text was stuck on the default branch
+until some later release happened to carry it, which is why this release exists.
+
+### Changed
+
+**A release is now gated on the handover, not only the changelog.** Owner's rule:
+docs being up to date is a fundamental part of a release, not a follow-up to one. A
+pull request into `main` now additionally requires `HANDOVER.md` to mention the
+version being released, and the job says both jobs out loud: "the release says what
+changed and the handover says what is true". `CONTRIBUTING.md` states the rule beside
+the other gates.
+
+The check is mechanical on purpose. Nothing inside this repository can know what is
+deployed, since the deployed artefact is recorded in the deployment repository's
+`deploy/estate/prod.json`. What it can require is that the handover mentions the
+release at all, which cannot be satisfied without opening the file at the moment the
+author knows what is true. A cleverer check would be one that cannot fail honestly,
+and this repository's own trap list is mostly those.
+
+### Not a deployment
+
+No library or binary change. The fleet stays on 1.11.0 at `4fefd42cf7a8` and is not
+behind: there is nothing in 1.11.1 for a node to run. The deployment repository's pin
+stays at `v1.11.0` deliberately.
+
+Verified: this release is the first thing the new gate ran against, and it passes only
+because `HANDOVER.md` names 1.11.1.
+
 ## 1.11.0 — 2026-09-25
 
 ### Changed
