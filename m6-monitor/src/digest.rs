@@ -75,6 +75,18 @@ pub struct NodeDigest {
     /// a fleet where one node is silent about its version is exactly the case the
     /// drift check must not call uniform.
     pub version: Option<String>,
+    /// Which binary reported the version, from `/perf`. A node runs several and
+    /// "the node is on 1.10.0" has never been one fact.
+    pub binary: Option<String>,
+    /// The hash of the build actually running, from `/perf`.
+    ///
+    /// This is what the version cannot say. Rust is not byte-reproducible, so
+    /// one tag built twice gives two binaries reporting one version: on
+    /// 2026-09-20 staging ran one build of `v1.10.0` and production another, and
+    /// every reading available to an operator said the fleet agreed. `None` on a
+    /// node too old to say, which counts as drift rather than agreement for the
+    /// same reason the version does.
+    pub hash: Option<String>,
     pub uptime_s: Option<u64>,
     pub host_uptime_s: Option<u64>,
     pub requests_total: Option<u64>,
@@ -120,6 +132,8 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
             reported_node: r.health.as_ref().map(|h| h.node.clone()),
             rtt_ms: r.rtt.map(|d| d.as_secs_f64() * 1000.0),
             version: None,
+            binary: None,
+            hash: None,
             uptime_s: None,
             host_uptime_s: None,
             requests_total: None,
@@ -162,13 +176,21 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
         }
 
         if let Some(p) = &r.perf {
-            // Empty rather than absent on a node older than the field, so it is
-            // reported as unknown instead of as an empty version string.
-            d.version = if p.version.is_empty() {
-                None
-            } else {
-                Some(p.version.clone())
+            // Empty rather than absent on a node older than the field, so each
+            // part is reported as unknown instead of as an empty string. The
+            // three are taken separately on purpose: a node can legitimately
+            // know its version and not its hash, because the hash is read from
+            // the executable at startup and confinement can refuse that.
+            let empty_to_none = |s: &String| {
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s.clone())
+                }
             };
+            d.version = empty_to_none(&p.build.version);
+            d.binary = empty_to_none(&p.build.name);
+            d.hash = empty_to_none(&p.build.hash);
             d.uptime_s = Some(p.uptime_s);
             d.requests_total = Some(p.metrics.requests_total);
             d.backend_errors = Some(p.metrics.backend_errors_total);
@@ -363,6 +385,54 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
                 ),
             });
         }
+
+        // ── one version is not one binary ────────────────────────────────────
+        //
+        // Checked SEPARATELY from the version above, and reported separately,
+        // because the two are different faults with different causes and the
+        // combined message would name neither.
+        //
+        // Version drift means somebody deployed different releases. Build drift
+        // means one release was BUILT TWICE and the fleet holds both: same
+        // source, same tag, different bytes, because Rust is not
+        // byte-reproducible. That is not a hypothetical and it is not rare. It
+        // happened on 2026-09-20, it was invisible to every reading an operator
+        // had, and it took `md5sum` on four machines to find. The whole reason
+        // the hash is on the wire is so that this check can exist.
+        //
+        // Reported only when the versions agree. When they do not, the version
+        // finding above already says the fleet is not uniform and the hashes
+        // differing is a consequence of it, not a second fault.
+        let versions_agree = seen.len() == 1;
+        let mut hashes: Vec<&str> = reporting
+            .iter()
+            .map(|n| n.hash.as_deref().unwrap_or("unknown"))
+            .collect();
+        hashes.sort_unstable();
+        hashes.dedup();
+        if versions_agree && hashes.len() > 1 {
+            let detail = reporting
+                .iter()
+                .map(|n| {
+                    // Twelve characters, which is what an operator reading a
+                    // handover or an estate file is looking at. The full value
+                    // is in the JSON digest for anything that wants to compare
+                    // exactly.
+                    let h = n.hash.as_deref().unwrap_or("unknown");
+                    format!("{} {}", n.name, &h[..h.len().min(12)])
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            findings.push(Finding {
+                level: Level::Warn,
+                node: "fleet".to_string(),
+                text: format!(
+                    "build drift across the fleet, all reporting the same version: {detail}. \
+                     One release built more than once, so the fleet is running different \
+                     binaries from identical source. The version cannot see this."
+                ),
+            });
+        }
     }
 
     findings.sort_by_key(|f| std::cmp::Reverse(f.level));
@@ -386,7 +456,11 @@ mod tests {
     fn perf(host: HostSnapshot, pools: Vec<PoolHealth>) -> PerfReport {
         PerfReport {
             node: "sydney".into(),
-            version: "1.4.0".into(),
+            build: m6_core::monitoring::BuildId {
+                name: "m6-http".into(),
+                version: "1.4.0".into(),
+                hash: "0".repeat(32),
+            },
             uptime_s: 100,
             pools,
             url_backends: vec![],
@@ -430,7 +504,16 @@ mod tests {
 
     fn perf_at(version: &str) -> PerfReport {
         let mut p = perf(plain_host(), vec![]);
-        p.version = version.into();
+        p.build.version = version.into();
+        p
+    }
+
+    /// Same version, a build hash of the caller's choosing. This is the shape
+    /// the 2026-09-20 drift had and the shape a version comparison cannot see.
+    fn perf_built(version: &str, hash: &str) -> PerfReport {
+        let mut p = perf(plain_host(), vec![]);
+        p.build.version = version.into();
+        p.build.hash = hash.into();
         p
     }
 
@@ -457,6 +540,106 @@ mod tests {
         assert_eq!(drift[0].level, Level::Warn);
         assert!(drift[0].text.contains("syd 1.4.0"), "{}", drift[0].text);
         assert!(drift[0].text.contains("lon 1.3.0"), "{}", drift[0].text);
+    }
+
+    /// **The case this whole change exists for.** Same version on every node,
+    /// different builds, which is what a fleet looks like when one release has
+    /// been built twice. Rust is not byte-reproducible, so this is the ordinary
+    /// consequence of rebuilding rather than promoting.
+    ///
+    /// On 2026-09-20 staging ran one build of `v1.10.0` and production another.
+    /// Every reading an operator had said the fleet agreed, and it was found by
+    /// running `md5sum` on four machines. This test is the thing that would have
+    /// said so.
+    ///
+    /// Verified red before being trusted, per the standing rule: with the hash
+    /// comparison removed it reports nothing at all, because the versions match.
+    #[test]
+    fn one_version_across_two_builds_is_reported_as_build_drift() {
+        let d = build(
+            &[
+                reading("syd", "ok", Some(perf_built("1.10.0", &"a".repeat(32)))),
+                reading("lon", "ok", Some(perf_built("1.10.0", &"b".repeat(32)))),
+            ],
+            &Thresholds::default(),
+            now(),
+        );
+
+        assert!(
+            !d.findings.iter().any(|f| f.text.contains("version drift")),
+            "the versions agree, so the VERSION finding must stay quiet: {:?}",
+            d.findings
+        );
+
+        let drift: Vec<_> = d
+            .findings
+            .iter()
+            .filter(|f| f.text.contains("build drift"))
+            .collect();
+        assert_eq!(drift.len(), 1, "{:?}", d.findings);
+        assert_eq!(drift[0].level, Level::Warn);
+        assert!(
+            drift[0].text.contains("syd aaaaaaaaaaaa"),
+            "{}",
+            drift[0].text
+        );
+        assert!(
+            drift[0].text.contains("lon bbbbbbbbbbbb"),
+            "{}",
+            drift[0].text
+        );
+    }
+
+    /// A node too old to report a hash counts as drift, not as agreement. Two
+    /// nodes agreeing while a third is silent is an unknown fleet, not a uniform
+    /// one, and the version check already takes this position.
+    #[test]
+    fn a_node_that_cannot_say_its_build_is_drift_not_agreement() {
+        let d = build(
+            &[
+                reading("syd", "ok", Some(perf_built("1.10.0", &"a".repeat(32)))),
+                // Empty hash: a node older than the field, or one whose
+                // confinement refused it the read.
+                reading("lon", "ok", Some(perf_built("1.10.0", ""))),
+            ],
+            &Thresholds::default(),
+            now(),
+        );
+        assert!(
+            d.findings.iter().any(|f| f.text.contains("build drift")),
+            "a silent node must not be read as agreement: {:?}",
+            d.findings
+        );
+    }
+
+    /// Version drift is reported ONCE, not twice. Different releases have
+    /// different binaries by construction, so reporting build drift beside it
+    /// would name a consequence as a second fault and tell an operator to look
+    /// in two places for one problem.
+    #[test]
+    fn version_drift_does_not_also_report_build_drift() {
+        let d = build(
+            &[
+                reading("syd", "ok", Some(perf_built("1.10.0", &"a".repeat(32)))),
+                reading("lon", "ok", Some(perf_built("1.9.0", &"b".repeat(32)))),
+            ],
+            &Thresholds::default(),
+            now(),
+        );
+        assert_eq!(
+            d.findings
+                .iter()
+                .filter(|f| f.text.contains("version drift"))
+                .count(),
+            1,
+            "{:?}",
+            d.findings
+        );
+        assert!(
+            !d.findings.iter().any(|f| f.text.contains("build drift")),
+            "the hashes differ because the versions do; that is one fault: {:?}",
+            d.findings
+        );
     }
 
     /// A uniform fleet says nothing, which is the whole point of the check being

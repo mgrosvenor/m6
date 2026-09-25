@@ -185,7 +185,42 @@ const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(6 * 60 *
 /// fail, and a second runner sweeping at the same moment will find entries
 /// already gone.
 fn sweep_stale_build_dirs() {
+    // BOTH roots, because the two kinds of scratch live on different
+    // filesystems now. See BUILD_ROOT_DIR for why.
     sweep_stale_build_dirs_in(Path::new("/tmp"), STALE_AFTER);
+    sweep_stale_build_dirs_in(&build_root_dir(), STALE_AFTER);
+}
+
+/// Where the COMPILED example binaries go, which is not where the sockets go.
+///
+/// `/var/tmp`, not `/tmp`, since 2026-09-22. The build host was hardened that
+/// day and the baseline mounts `/tmp` **noexec** (site issue #98), so every
+/// compiled backend became unspawnable the moment it was built:
+///
+///     cannot spawn c example: Permission denied (os error 13)
+///
+/// 14 tests failed that way, and the message names the example rather than the
+/// mount, so it reads as a broken example.
+///
+/// The two requirements were never the same and had merely been satisfied by
+/// one directory. SOCKETS need a SHORT path, because `sockaddr_un::sun_path`
+/// caps at 104 bytes on macOS and 108 on Linux; they stay in `/tmp`.
+/// EXECUTABLES need a filesystem that permits exec; they come here. Measured on
+/// the hardened box rather than assumed: `/tmp` EXEC BLOCKED, `/var/tmp` EXEC
+/// OK.
+///
+/// It is the better home for them anyway, and fixes a second problem this file
+/// already documents. `/tmp` on the build host is a 3.7GB tmpfs, each run
+/// leaves about 95MB of compiled C, C++ and Go plus GOCACHE, and that fills it
+/// in roughly 39 runs -- which it did, producing a "no space left on device"
+/// link failure and a 31% phantom performance regression on a RAM disk that was
+/// nearly full. `/var/tmp` is disk-backed, so the big artefacts stop competing
+/// with RAM. The sweep still runs, because unbounded growth on disk is only
+/// slower, not fine.
+/// Resolved once, from m6-core's testkit, because two test files need it and
+/// that is the point at which a third copy becomes inevitable. Standing rule 11.
+fn build_root_dir() -> std::path::PathBuf {
+    m6_core::testkit::exec_scratch_root()
 }
 
 /// The sweep, over a named directory and threshold so it can be tested.
@@ -250,7 +285,7 @@ fn built_binary(lang: Lang, src: &Path) -> PathBuf {
 
     sweep_stale_build_dirs();
 
-    let dir = PathBuf::from(format!("/tmp/m6bx-build-{}", std::process::id()));
+    let dir = build_root_dir().join(format!("m6bx-build-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("build dir");
     let bin = dir.join(lang.dir());
 
@@ -819,6 +854,64 @@ fn sigterm_drains_removes_the_socket_and_exits_zero() {
 extern "C" {
     #[link_name = "kill"]
     fn libc_kill(pid: i32, sig: i32) -> i32;
+}
+
+#[cfg(test)]
+mod build_dir_is_usable {
+    use super::build_root_dir;
+
+    /// The directory the compiled examples go in must permit exec.
+    ///
+    /// This test exists because nothing caught the day it stopped. The build
+    /// host was hardened on 2026-09-22 and the baseline mounts `/tmp` noexec
+    /// (site #98), where the compiled backends then lived. Fourteen tests
+    /// failed with
+    ///
+    ///     cannot spawn c example: Permission denied (os error 13)
+    ///
+    /// which names the example and not the mount, so the first reading is that
+    /// the C example is broken. It was not; the filesystem had changed under
+    /// it.
+    ///
+    /// Asserted by ACTUALLY EXECUTING something rather than by reading mount
+    /// options: `findmnt` returned nothing at all on that box for these paths,
+    /// and a check that cannot see is a check that lies. This one runs a file
+    /// or fails.
+    #[test]
+    fn the_build_directory_permits_exec() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = build_root_dir();
+        let probe = dir.join(format!("m6bx-execprobe-{}", std::process::id()));
+
+        let mut f = match std::fs::File::create(&probe) {
+            Ok(f) => f,
+            Err(e) => panic!("cannot write to the build directory {}: {e}", dir.display()),
+        };
+        f.write_all(b"#!/bin/sh\nexit 7\n").expect("write probe");
+        drop(f);
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let result = std::process::Command::new(&probe).status();
+        let _ = std::fs::remove_file(&probe);
+
+        let status = result.unwrap_or_else(|e| {
+            panic!(
+                "{} does not permit exec: {e}\n\
+                 The backend example binaries are built there and must be\n\
+                 spawnable. A noexec mount here fails as \"cannot spawn <lang>\n\
+                 example: Permission denied\", which reads as a broken example\n\
+                 rather than as a mount option. See exec_scratch_root.",
+                dir.display()
+            )
+        });
+        assert_eq!(
+            status.code(),
+            Some(7),
+            "the probe ran but did not report its own exit code"
+        );
+    }
 }
 
 #[cfg(test)]
