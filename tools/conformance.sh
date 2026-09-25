@@ -53,7 +53,15 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 SCORES="$HERE/conformance-scores.txt"
-WORK="${CONFORMANCE_WORK:-/tmp/m6-conformance}"
+# Per-account, because /tmp is shared and sticky. It was a bare
+# `/tmp/m6-conformance`, one directory for every account that has ever run this,
+# and on the build host that meant a root-owned directory the `admin` account
+# could not write to after the box was hardened. Every write inside it failed
+# with "Permission denied", the edge backend never bound its socket, and the run
+# reported `FAIL h3:m6-http: the edge never came up, so nothing was measured` --
+# which is honest about not measuring, and still indistinguishable from a real
+# regression to anyone reading the summary.
+WORK="${CONFORMANCE_WORK:-/tmp/m6-conformance-$(id -un)}"
 TLS_PORT=10443
 # shellcheck disable=SC2034  # unused, but records the reserved port
 H2C_PORT=18080
@@ -70,8 +78,8 @@ for arg in "$@"; do
   case "$arg" in
     --update) UPDATE=true ;;
     --allow-missing-tools) ALLOW_MISSING=true ;;
-    h1|h2|h3) ONLY="$arg" ;;
-    *) echo "usage: $0 [h1|h2|h3] [--update] [--allow-missing-tools]"; exit 2 ;;
+    h1|h2|h3|resume) ONLY="$arg" ;;
+    *) echo "usage: $0 [h1|h2|h3|resume] [--update] [--allow-missing-tools]"; exit 2 ;;
   esac
 done
 
@@ -617,6 +625,99 @@ run_h3() {
   measured_or_fail "h3:m6-http" "$got" "${total:-0}" "$log"
 }
 
+# ── TLS session resumption, h1 / h2 / h3 ─────────────────────────────────────
+#
+# Our own clients, not an external tester, and the only stage here that can run
+# on the laptop: h2spec and h3spec are not installed there, so until this stage
+# existed a laptop run measured no protocol behaviour at all.
+#
+# WHAT IT EXISTS FOR, plainly. m6 1.9.0 installed a session ticketer so browser
+# sessions could resume. Nothing in this suite could tell whether it worked, and
+# nothing in the fleet could either: the monitor read 0% resumed on
+# `http/2/external` across all three production nodes for a day after the
+# release, which is exactly what a broken ticketer looks like AND exactly what a
+# working one looks like on a site whose h2 visitors never come back on a second
+# connection. Those were separated on 2026-09-19 by a client that deliberately
+# offered a ticket, which is what these probes now do. The server was fine. The
+# measurement did not exist. m6 issue #101.
+#
+# Resumption is a latency property, not a nicety: a full handshake costs the
+# certificate and a signature, and on this fleet a resumed one runs p50 0.76ms
+# against 161ms full on the origin's own h1 channel.
+#
+# ALL THREE PROTOCOLS, because they resume by different machinery: h1 and h2
+# share rustls' TLS 1.3 tickets, h3 uses QUIC's own resumption, and a ticketer
+# installed on one path proves nothing about the other. The owner's standing
+# instruction is to test h1, h2 and h3, and a resumption gate that covered only
+# TCP would have been a third of a check.
+#
+# No floor in conformance-scores.txt: this is not a score out of a total, it is
+# a property that either holds or does not. `check` is for testers that count.
+run_resume() {
+  info "TLS resumption — our own clients, h1 / h2 / h3"
+  start_edge || {
+    fail "resume: the edge never came up, so nothing was measured"
+    RESULT=1
+    return 1
+  }
+
+  # The probes are workspace binaries, so unlike h2spec they are always present
+  # after a release build. Missing means the build did not happen, which is a
+  # failure and not a skip.
+  local missing=""
+  for b in m6-probe-h1 m6-probe-h2 m6-probe-h3; do
+    [[ -x "$ROOT/target/release/$b" ]] || missing="$missing $b"
+  done
+  if [[ -n "$missing" ]]; then
+    fail "resume: no release build of$missing — a gate that cannot measure must fail."
+    info "  run: cargo build --workspace --release"
+    RESULT=1
+    return 1
+  fi
+
+  # ── h1 and h2: a ticket offered from the second handshake onward ───────────
+  #
+  # Five sequential connections sharing one client config. Handshake 1 earns the
+  # ticket, 2..5 offer it, and the probe exits non-zero if none was accepted.
+  local r_log ok_all=0
+  for proto in h1 h2; do
+    r_log="$WORK/resume-$proto.out"
+    if "$ROOT/target/release/m6-probe-$proto" \
+        --addr "127.0.0.1:$TLS_PORT" --n 5 > "$r_log" 2>&1; then
+      pass "resume:$proto  $(grep -a -m1 'RESUMPTION:' "$r_log" || echo 'resumed')"
+    else
+      fail "resume:$proto  the server accepted no ticket. Output: $r_log"
+      grep -a -m1 'RESUMPTION:' "$r_log" || true
+      ok_all=1
+    fi
+  done
+
+  # ── h3: QUIC resumption, and whether early data was actually used ─────────
+  #
+  # A different mechanism and a different claim. The probe makes one cold
+  # connection to earn a ticket, then resumes and sends its request in the first
+  # flight. `/` is warmed by the cold connection's own request, which matters:
+  # m6-http answers 425 Too Early in early data unless it holds a fresh cache
+  # entry, deliberately, because a replayed request reaching a backend could
+  # have side effects. A 425 with early data used is a PASS for the safety gate.
+  r_log="$WORK/resume-h3.out"
+  if "$ROOT/target/release/m6-probe-h3" \
+      --addr "127.0.0.1:$TLS_PORT" --0rtt / > "$r_log" 2>&1; then
+    pass "resume:h3  $(grep -a -m1 'early data actually used' "$r_log" || echo 'resumed')"
+  else
+    if grep -qa 'NO RESUMPTION TICKET issued' "$r_log"; then
+      fail "resume:h3  the server issued no ticket: QUIC resumption is impossible, not merely off."
+    else
+      fail "resume:h3  resumed, but early data was not used. Output: $r_log"
+    fi
+    grep -a -E 'cold handshake|early data actually used|425' "$r_log" || true
+    ok_all=1
+  fi
+
+  [[ "$ok_all" -eq 0 ]] || RESULT=1
+  return "$ok_all"
+}
+
 # ── Run ───────────────────────────────────────────────────────────────────────
 
 mkdir -p "$WORK"
@@ -624,7 +725,10 @@ case "$ONLY" in
   h1) run_h1 ;;
   h2) run_h2 ;;
   h3) run_h3 ;;
-  *)  run_h1; run_h2; run_h3 ;;
+  resume) run_resume ;;
+  # Resumption last: it is the only stage that needs no external tester, so a
+  # laptop run reaches it after the three skips and still measures something.
+  *)  run_h1; run_h2; run_h3; run_resume ;;
 esac
 
 if [[ "$UPDATE" == "true" ]]; then
