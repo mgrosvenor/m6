@@ -12,7 +12,9 @@
 #
 # Owner's decision, 2026-09-14: a pull request is the only way into develop and
 # the only way from develop to main. tools/merge.sh and tools/release.sh, which
-# did both locally, are deleted.
+# did both locally, are deleted. **Nothing in this file may name either of them
+# as a remedy**, which is issue #118: both tag refusals did, for twelve days,
+# ten lines below this paragraph. `./tag.sh` is what pushes a release tag.
 #
 # What this hook refuses:
 #
@@ -80,7 +82,12 @@ checks_for=""
 # has nothing to do with the push.
 if [[ ${#refs[@]} -gt 0 ]]; then
 for entry in "${refs[@]}"; do
-  read -r local_ref local_sha remote_ref remote_sha <<< "$entry"
+  # `_` for the remote sha: it is the fourth field git sends and this hook has no
+  # use for it, but it has to be READ, or `remote_ref` would absorb the rest of
+  # the line. Named `_` rather than `remote_sha` so shellcheck does not report an
+  # unused variable, which it did the first time anything ran shellcheck over this
+  # file -- see the CI step, which found `*.sh` and therefore never found a hook.
+  read -r local_ref local_sha remote_ref _ <<< "$entry"
   [[ -z "${local_ref:-}" ]] && continue
   # A deletion. Not this hook's business.
   [[ "$local_sha" =~ ^0+$ ]] && continue
@@ -95,21 +102,37 @@ for entry in "${refs[@]}"; do
   # on 2026-09-13 and v1.0.0 was the first tag pushed after it: release.sh merged
   # main, pushed it, and then died on the tag, leaving the release half done.
   #
-  # A release tag is `v<major>.<minor>.<patch>` and only release.sh pushes one, so
+  # A release tag is `v<major>.<minor>.<patch>` and only ./tag.sh pushes one, so
   # the same M6_RELEASE guard that protects main protects this.
+  #
+  # BOTH REFUSALS BELOW NAMED tools/release.sh UNTIL 2026-09-26, and it had been
+  # deleted on 2026-09-14 with tools/merge.sh, ten lines above where the header
+  # already says so. A refusal is the only part of a hook anybody reads, and these
+  # two fire at the exact moment someone is cutting a release and is least inclined
+  # to go and check whether the remedy exists. Following it got "no such file or
+  # directory", from the tool whose whole job is to be believed. Issue #118.
   if [[ "$remote_ref" == refs/tags/* ]]; then
     tag="${remote_ref#refs/tags/}"
     if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
       refuse "tag '$tag' is not a release tag.
 
   Tags on this repository are versions: v1.0.0, v1.2.3. Nothing else is pushed.
-  If you are cutting a release:   ./tools/release.sh <version>"
+  If you are cutting a release, merge develop into main by pull request first,
+  then tag the merge:
+
+      git fetch origin && git checkout main && git pull
+      ./tag.sh v<version>"
     fi
     if [[ "${M6_RELEASE:-}" != "1" ]]; then
       refuse "tag '$tag' looks like a release tag but M6_RELEASE is not set.
 
-  Release tags are created by tools/release.sh, which sets it. A tag pushed by
-  hand has not been through the checks."
+  ./tag.sh is what sets it, and it checks what a tag can still get wrong: the
+  branch, a dirty tree, a version that disagrees with Cargo.toml, a tag that
+  already exists, and a main that is behind the remote. A tag pushed by hand has
+  been through none of that.
+
+      git fetch origin && git checkout main && git pull
+      ./tag.sh $tag"
     fi
     note "release tag $tag"
     continue
