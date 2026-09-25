@@ -1,9 +1,19 @@
 # Completing the HTTP/2 implementation
 
 > **STATUS 2026-09-10 — DONE, with one addition since.** h2spec **146/146**,
-> h3spec **37/49** (all 12 remaining failures inside quiche, none attributable
-> to m6). All phases below are complete, including Phase 6 (Rapid Reset), which
-> is **deployed to the fleet** (`m6 438bdb3`).
+> h3spec **47/49**. All phases below are complete, including Phase 6 (Rapid
+> Reset), which is **deployed to the fleet** (`m6 438bdb3`).
+>
+> **h3 was 37/49 here until 2026-09-26, three days after it stopped being
+> true.** It moved to 47/49 on 2026-09-13 by pinning a quiche fork carrying two
+> unmerged upstream pull requests, #2521 and #2575, which clear ten of the
+> twelve. The remaining two are QPACK stream errors and are **not** upstream
+> bugs: quiche discards QPACK instructions by design, and closing the gap means
+> writing new connection-path validation ourselves. Owner's decision,
+> 2026-09-13: 47/49 is good enough, and it is not an open task.
+> `tools/conformance-scores.txt` is the authoritative record and carries the
+> whole argument, including how to rebuild the fork. The floors are gates: a run
+> below one fails.
 >
 > **Phase 7, added, completed and DEPLOYED 2026-09-10 (`m6 b32e837`, fleet md5
 > `aced7223`): send-side flow control on the backbone clients.** h2spec exercises m6 as a *server* and so
@@ -114,9 +124,14 @@ Note the 132 -> 142 step was never a change: it is what phase 3 was already
 worth. 132 was measured before phase 3 landed and then sat in the docs as if
 current. **Re-measure before quoting a number.**
 
-`h3spec` is at **37/49**, and all 12 remaining failures are inside quiche (10
-QUIC transport, 2 QPACK stream errors). No h3spec failure is attributable to
-m6 any more.
+`h3spec` is at **47/49**. It was 37/49 with all twelve failures inside quiche,
+and the ten QUIC transport ones were cleared on 2026-09-13 by pinning a quiche
+fork that carries two unmerged upstream pull requests; the version bump that was
+expected to fix them moved the score by nothing, which is the part worth
+remembering. The two that remain are QPACK stream errors, they are a deliberate
+upstream decision rather than a defect, and they are accepted. No h3spec failure
+is attributable to m6. See `tools/conformance-scores.txt`, which is where the
+numbers and the reasoning live, and lesson 40.
 
 Independent verification runs alongside both: nghttp2's `nghttp` client and
 `h2load` (200/200 succeeded, 0 errored). h2spec alone proved insufficient in

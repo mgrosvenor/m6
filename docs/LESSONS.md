@@ -631,9 +631,15 @@ New 2026-09-12:
     `tools/release.sh` as the thing that sets `M6_RELEASE`, when `./tag.sh` is what
     sets it, so it misdirected on the single fact it existed to convey.
 
-    The same deleted script was in `.github/pull_request_template.md`, in front of
-    the author of every pull request, next to a clippy "recorded count" that stopped
-    existing on 2026-09-13 when clippy went to `-D warnings` with no ceiling.
+    **It was in four places, and they have one thing in common.**
+    `.github/pull_request_template.md`, in front of the author of every pull request,
+    next to a clippy "recorded count" that stopped existing on 2026-09-13 when clippy
+    went to `-D warnings` with no ceiling. And `Cargo.toml`'s own comment, beside the
+    version line, saying to run it after bumping, which is the first step of a
+    release. Every one of those sites is read while cutting a release and at no other
+    time. That is what let them rot: a string nobody reads on an ordinary day is a
+    string nobody proofreads either, and the reader who finally arrives is mid-task
+    and trusting.
 
     Two general parts. **Deleting a tool means deleting every instruction to run
     it**, and a grep for the name finds those in seconds, which is why this cost
