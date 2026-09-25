@@ -40,6 +40,29 @@ All of it, on Linux, before anything merges into `develop`:
 
 CI runs them on the pull request. `tools/build-host-tests.sh` runs the same ground plus the performance check, which a shared runner cannot measure.
 
+### A release also has to be documented, and that is enforced
+
+A pull request into `main` **is** the release, and two more checks apply to it:
+
+- `CHANGELOG.md` has a `## <version>` section: what changed, why it mattered, and how it
+  was verified.
+- `HANDOVER.md` mentions `<version>`.
+
+**Docs being up to date is a fundamental part of a release, not a follow-up to one.**
+Owner's rule, 2026-09-25, and it was earned: 1.11.0 shipped and was deployed while
+`main`'s `HANDOVER.md` still opened with "m6 1.10.0 is deployed to production" and the
+wrong artefact md5, in the first bullet of the first section a cold session reads. The
+correction existed on `develop` and could not reach `main`, because a docs-only
+`develop` → `main` pull request fails the "version is not already tagged" check. So the
+stale text sat on the default branch until a later release happened to carry it, and
+1.11.1 had to be cut for documentation alone.
+
+The handover check is deliberately mechanical: it asks only that the file mentions the
+version, because nothing here can know what is actually deployed (that lives in the
+deployment repository's `deploy/estate/prod.json`). What it guarantees is that you open
+the file while cutting the release, which is when you know what is true. A cleverer check
+would be one that cannot fail honestly.
+
 ### If you make something faster
 
 Record the new number, in the commit that earned it:

@@ -346,10 +346,19 @@ jobs:
           done
 
   changelog:
-    name: the release says what changed
+    name: the release says what changed and the handover says what is true
     # Only for a release: a pull request into main IS the release now, so this is
     # where `release.sh`'s changelog guard lives. It refused to cut a release
     # without an entry for the version; that script is gone, and the guard is not.
+    #
+    # The handover check joined it on 2026-09-25, owner's rule: DOCS BEING UP TO
+    # DATE IS A FUNDAMENTAL PART OF A RELEASE, not a follow-up to one. 1.11.0
+    # shipped and was deployed while main's HANDOVER.md still opened with "m6
+    # 1.10.0 is deployed to production" and the wrong artefact md5, in the first
+    # bullet of the first section a cold session reads. The fix existed on develop
+    # and could not reach main, because a docs-only develop -> main pull request
+    # fails the tag check below, so the stale text was stuck on the default branch
+    # until some later release happened to carry it.
     if: github.base_ref == 'main'
     runs-on: ubuntu-latest
     steps:
@@ -369,6 +378,29 @@ jobs:
           fi
           echo "found the entry:"
           sed -n "/^## \+\[\?${v}/,/^## /p" CHANGELOG.md | head -20
+
+      - name: HANDOVER.md names this version
+        # Mechanical on purpose. A check cannot know what is deployed from inside
+        # this repository; the deployed artefact is recorded in the deployment
+        # repo's deploy/estate/prod.json. What it CAN require is that the handover
+        # mentions the release at all, which cannot be satisfied without opening
+        # the file at the moment the author knows what is true.
+        #
+        # Anything more ambitious would be a check that cannot fail honestly, and
+        # this estate has enough of those in its history.
+        run: |
+          v=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if ! grep -qF "$v" HANDOVER.md; then
+            echo "::error::HANDOVER.md does not mention ${v}."
+            echo "A release says what changed; the handover says what is now TRUE."
+            echo "Update HANDOVER.md before merging to main: the deployed version, the"
+            echo "artefact, and anything this release makes stale. Its first section is"
+            echo "what a cold session reads first, and it is the one document kept"
+            echo "current against the running system."
+            exit 1
+          fi
+          echo "HANDOVER.md mentions ${v}:"
+          grep -nF "$v" HANDOVER.md | head -5
 
       - name: the version is not already tagged
         run: |
