@@ -266,6 +266,151 @@ fn the_hook_says_what_it_did_not_check() {
     );
 }
 
+// ── Defect 4: a refusal named a script that had been deleted ─────────────────
+
+/// Every script this hook offers as a remedy has to exist.
+///
+/// Issue #118. Both tag refusals said `./tools/release.sh`, which was deleted on
+/// 2026-09-14 along with `tools/merge.sh` when a pull request became the only way
+/// into `develop` and the only way from `develop` to `main`. The hook's own header
+/// records that deletion ten lines above the first refusal, and its `main` guidance
+/// correctly says `./tag.sh`. So the file disagreed with itself for twelve days, and
+/// it disagreed in the only part of a hook anybody ever reads.
+///
+/// **A refusal is the entire user interface of a gate.** These two fire at the moment
+/// someone is cutting a release, which is exactly when they are least inclined to go
+/// and check whether the remedy exists, and following it gets `no such file or
+/// directory` from the tool whose whole job is to be believed.
+///
+/// COMMENTS ARE EXEMPT, and deliberately. The header names both deleted scripts to
+/// say that they are gone, which is the record of why the rules are what they are.
+/// What may not name them is the text the hook PRINTS, and every refusal string sits
+/// on a non-comment line.
+///
+/// `.github/pull_request_template.md` is held to the same rule and is scanned whole,
+/// having no comments. It told the author of every pull request to run
+/// `./tools/merge.sh <branch>`, which is the same deleted script in front of a far
+/// larger audience.
+#[test]
+fn every_script_offered_as_a_remedy_exists() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("m6-core has a parent")
+        .to_path_buf();
+
+    // `#` comments are skipped for the hook and not for the template, which has
+    // none: a `#` there is a markdown heading and carries instructions.
+    let sources: [(&str, bool); 2] = [
+        (".githooks/pre-push", true),
+        (".github/pull_request_template.md", false),
+    ];
+
+    let mut missing = Vec::new();
+    for (rel, skip_comments) in sources {
+        let path = root.join(rel);
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("could not read {}: {e}", path.display()));
+
+        for (n, line) in text.lines().enumerate() {
+            if skip_comments && line.trim_start().starts_with('#') {
+                continue;
+            }
+            for script in scripts_named(line) {
+                // Relative to the repository root, which is how every one of
+                // these is written and how a reader would run it.
+                if !root.join(&script).is_file() {
+                    missing.push(format!("{rel}:{}: {script}", n + 1));
+                }
+            }
+        }
+    }
+
+    assert!(
+        missing.is_empty(),
+        "{} reference(s) to a script that does not exist:\n  {}\n\n\
+         These files are pure instruction: every path in them is something a person \
+         is being told to run. `tools/merge.sh` and `tools/release.sh` were deleted \
+         on 2026-09-14 and a pull request replaced both. Use `./tag.sh` for a \
+         release tag and `./tools/branch.sh` for a work branch. Issue #118.",
+        missing.len(),
+        missing.join("\n  ")
+    );
+}
+
+/// The tag refusals name the tool that actually pushes a tag.
+///
+/// The other half of #118, and it needs saying separately: a refusal that merely
+/// avoids naming a deleted script is not yet a refusal that helps. `./tag.sh` is also
+/// what sets `M6_RELEASE`, so the second refusal was naming the wrong script for the
+/// one fact it exists to convey.
+#[test]
+fn a_tag_refusal_names_tag_sh() {
+    for (refs, release, what) in [
+        (tag("nightly"), true, "a tag that is not a version"),
+        (tag("v1.0.0"), false, "a release tag without M6_RELEASE"),
+    ] {
+        let r = run(&[&refs], release);
+        assert!(!r.allowed, "expected {what} to be refused:\n{}", r.output);
+        assert!(
+            r.output.contains("tag.sh"),
+            "the refusal for {what} does not name ./tag.sh, which is what pushes a \
+             release tag and what sets M6_RELEASE. It named ./tools/release.sh, \
+             deleted on 2026-09-14, until 2026-09-26. Issue #118. It said:\n{}",
+            r.output
+        );
+        assert!(
+            !r.output.contains("release.sh"),
+            "the refusal for {what} still names a deleted script:\n{}",
+            r.output
+        );
+    }
+}
+
+/// Pull `*.sh` paths out of one line.
+///
+/// Hand-rolled rather than a regex, because this test crate has no regex
+/// dependency and adding one to read four lines of shell would be the larger
+/// change. It walks back from each `.sh` over the characters a path may contain,
+/// which stops at a quote, a backtick or a space and so takes `./tools/branch.sh`
+/// out of `Create one with:  ./tools/branch.sh <issue> <slug>`.
+fn scripts_named(line: &str) -> Vec<String> {
+    let c: Vec<char> = line.chars().collect();
+    let mut found = Vec::new();
+    let mut i = 0;
+    while i + 3 <= c.len() {
+        if c[i] == '.' && c[i + 1] == 's' && c[i + 2] == 'h' {
+            // `.shell` is not a script; `.sh's` and `.sh,` are.
+            let ends = c.get(i + 3).is_none_or(|ch| !ch.is_alphanumeric());
+            if ends {
+                let mut j = i;
+                while j > 0 {
+                    let prev = c[j - 1];
+                    if prev.is_alphanumeric() || prev == '-' || prev == '_' || prev == '/' {
+                        j -= 1;
+                    } else {
+                        break;
+                    }
+                }
+                let raw: String = c[j..i + 3].iter().collect();
+                // Everything here is written relative to the repository root, as
+                // `./tag.sh` or `tools/branch.sh`. The leading `.` stops the walk
+                // above (it is not a path character for this purpose), so the
+                // slash it left behind comes off here.
+                //
+                // A bare `.sh` is prose about the extension rather than a path.
+                let rel = raw.trim_start_matches('/');
+                if rel.len() > 3 {
+                    found.push(rel.to_string());
+                }
+            }
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    found
+}
+
 /// The hook must be fast, and that is a correctness property rather than a
 /// preference.
 ///
