@@ -208,15 +208,26 @@ pub fn render(d: &Digest, readings: &[NodeReading]) -> String {
                 .unwrap_or_else(|| "-".into()),
             n.uptime_s.map(fmt_dur).unwrap_or_else(|| "-".into()),
         );
-        // The release each node runs, on the line with load and disk rather than
-        // in a section of its own: the question "is this node the one that is
-        // behind" is asked at the same moment as "is this node the busy one".
+        // What each node runs, on the line with load and disk rather than in a
+        // section of its own: the question "is this node the one that is behind"
+        // is asked at the same moment as "is this node the busy one".
+        //
+        // Name, version AND build hash, because the version alone cannot tell
+        // two builds of one tag apart and reading three identical version
+        // strings is exactly what "the fleet agrees" looked like on 2026-09-20
+        // while it did not. Twelve characters of the hash: enough to compare by
+        // eye and the same prefix the estate file and the handover quote.
         let _ = writeln!(
             o,
-            "        m6 {}",
+            "        {} {} build {}",
+            n.binary.as_deref().unwrap_or("m6"),
             n.version
                 .as_deref()
                 .unwrap_or("unknown (node too old to report it)"),
+            n.hash
+                .as_deref()
+                .map(|h| &h[..h.len().min(12)])
+                .unwrap_or("unknown"),
         );
     }
 

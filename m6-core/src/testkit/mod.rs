@@ -48,7 +48,7 @@ pub mod process;
 pub mod response;
 pub mod wait;
 
-pub use paths::binary;
+pub use paths::{binary, exec_scratch_root};
 pub use port::{claim_port, PortClaim};
 pub use process::{assert_app_lifecycle, assert_lifecycle_logged, Service};
 pub use response::read_one;
