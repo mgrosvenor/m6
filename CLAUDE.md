@@ -23,11 +23,19 @@ Types: `feat` `fix` `perf` `docs` `refactor` `test` `chore`.
 push to it. `main` moves only when a pull request is merged on GitHub; the tag
 that follows is pushed by `./tag.sh`, which sets the one variable the hook accepts.
 
-> **Note on the transition, 2026-09-13.** `main` currently holds ~120 commits
-> that have never been deployed, because this model was adopted mid-project.
-> From the next release onwards `main` only advances at a release. Until then,
-> do not read `main` as "what is running": the deployed commit is whatever the
-> newest entry in `the deployment repository/docs/RELEASES.md` names.
+> **The transition is over.** This note said `main` held ~120 undeployed commits
+> from the model being adopted mid-project, and that `main` could not be read as
+> what is running. That stopped being true at 1.0 on 2026-09-14: `main` advances
+> only at a release, and it is the release line.
+>
+> **`main` is still not the same fact as what is deployed, and it never will
+> be.** Releasing and deploying are separate decisions and the deployment
+> repository owns the second one: it pins a tag, and a release with nothing in it
+> for a node to run is deliberately not pinned. 1.11.1 and 1.11.2 are both
+> documentation releases, so `main` is `v1.11.2` while production runs 1.11.0,
+> and that is correct rather than a lag. What is deployed is
+> `deploy/estate/prod.json` in the deployment repository, and the newest entry in
+> its `docs/RELEASES.md` says how it got there.
 
 ### The cycle
 

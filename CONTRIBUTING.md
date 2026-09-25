@@ -34,7 +34,11 @@ All of it, on Linux, before anything merges into `develop`:
 - the whole test suite
 - **zero compiler warnings**, release and test builds, including ones that were
   already there
-- clippy, at or under its recorded count
+- clippy **silent**: `-D warnings`, no ceiling, since 2026-09-13. This said "at
+  or under its recorded count" until 2026-09-26, which was the old model and had
+  been replaced because a number in a file reads as an allowance and has to be
+  maintained by hand. A new lint from a toolchain upgrade gets fixed, or gets a
+  targeted `#[allow]` naming the lint with the reason argued in the commit.
 - h1, h2 and h3 conformance, at or above their recorded scores
 - the performance check, within its margin
 

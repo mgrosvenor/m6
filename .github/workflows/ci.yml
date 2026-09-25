@@ -148,6 +148,13 @@ jobs:
       # Warning level, not style: style is 100+ findings of preference across this
       # repo, and a gate that reports preference gets ignored, which is how the two
       # real errors survived.
+      #
+      # THE GIT HOOKS ARE SHELL AND ARE NOT NAMED `*.sh`. This found `*.sh` alone
+      # until 2026-09-26, so `.githooks/pre-push` -- the script that decides what may
+      # be pushed where, and the one shell file in this repository that runs on every
+      # developer's machine -- was the one never checked. It had an unused-variable
+      # warning sitting in it the whole time. A gate selecting its inputs by file
+      # extension misses exactly the files that do not get one, and hooks never do.
       - name: shellcheck
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
@@ -156,7 +163,7 @@ jobs:
           while IFS= read -r f; do
             COUNT=$((COUNT + 1))
             if ! shellcheck -S warning "$f"; then FAIL=1; fi
-          done < <(find . -name '*.sh' -not -path './target/*' -not -path './.git/*')
+          done < <(find . \( -name '*.sh' -o -path './.githooks/*' \) -type f -not -path './target/*' -not -path './.git/*')
           echo "checked $COUNT shell script(s)"
           exit $FAIL
 
