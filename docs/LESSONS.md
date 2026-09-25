@@ -586,3 +586,30 @@ New 2026-09-12:
     instance in one run and ends uniform, so a mixed-version fleet is a state it
     never holds. "Staging validated the artefact" was true and said nothing about
     the rollout.
+
+52. **A release gate that checks the changelog and not the handover lets a release
+    ship a lie about itself.** 1.11.0 was released and deployed on 2026-09-25 while
+    `main`'s `HANDOVER.md` still opened with "m6 1.10.0 is deployed to production"
+    and md5 `0123456789ab`. First bullet, first section, default branch, and the
+    document this repository names as the one to read first.
+
+    The branch model then made it unfixable on its own. `main` takes releases only,
+    and a docs-only `develop` to `main` pull request fails the "version is not
+    already tagged" check, so the correction sat on `develop` waiting for some later
+    release to carry it. **1.11.1 had to be cut for documentation alone.**
+
+    Two general parts. A release is a claim about what is now true, so the checks on
+    it have to include the document that states what is true, not only the one that
+    lists what changed: `CHANGELOG.md` says what a release contains and
+    `HANDOVER.md` says what the world looks like afterwards, and only the first was
+    gated. And **a branch model that admits only releases to the default branch
+    makes documentation staleness structural**, because the cheapest kind of fix is
+    exactly the kind it refuses.
+
+    The gate added is deliberately mechanical: it requires that `HANDOVER.md`
+    mentions the version being released, and nothing more. Nothing inside this
+    repository can know what is deployed, since that lives in the deployment
+    repository's `deploy/estate/prod.json`, and per lesson 45 and the conformance
+    script's four cases, a check that cannot measure honestly must not pretend to.
+    What this one guarantees is that the file is opened at the one moment the author
+    knows what is true.
