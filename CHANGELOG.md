@@ -12,7 +12,7 @@ releases only; work happens on `develop`. See `CONTRIBUTING.md`.
 
 ---
 
-## Unreleased
+## 1.11.0 — 2026-09-25
 
 ### Changed
 
