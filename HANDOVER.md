@@ -144,6 +144,15 @@ milliseconds: the content checks are CI's job, and a hook that took ten minutes
 killed every push with SIGPIPE by idling out git's connection. Do not put a suite
 back into it.
 
+**Its refusals are tested, from 2026-09-26.** Both tag refusals told you to run
+`./tools/release.sh`, deleted twelve days earlier, ten lines below the header
+that records the deletion; the pull request template said `./tools/merge.sh`.
+A refusal is the only part of a hook anyone reads, and these fire while you are
+cutting a release. `every_script_offered_as_a_remedy_exists` in
+`m6-core/tests/pre_push_hook.rs` now fails if either file names a script that is
+not on disk, comments excepted so the header can keep saying what was deleted.
+Issue #118, lesson 53.
+
 ```sh
 ./tools/branch.sh 42 some-slug --type fix   # off develop; checks the issue exists
 git push origin fix/42-some-slug
