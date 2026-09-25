@@ -32,6 +32,21 @@ number, it does.
   two builds of one tag apart and Rust is not byte-reproducible. A monitor newer
   than a node reads "unknown" rather than failing to parse, which is the
   `serde(default)` behaviour and not a fault.
+- **1.11.1 is released and is NOT deployed, and that is correct.** It is a
+  documentation release: no library or binary change, so there is nothing in it
+  for a node to run. The fleet stays on 1.11.0 at `4fefd42cf7a8` and is not
+  behind; the deployment repository's pin stays at `v1.11.0` deliberately. Do not
+  "catch production up" to 1.11.1.
+- **A RELEASE IS NOW GATED ON THIS FILE.** A pull request into `main` fails unless
+  `HANDOVER.md` mentions the version being released, beside the existing
+  requirement that `CHANGELOG.md` has a section for it. Owner's rule, 2026-09-25:
+  docs being up to date is a fundamental part of a release, not a follow-up to
+  one. It exists because 1.11.0 shipped and was deployed while this file's first
+  bullet still said "m6 1.10.0 is deployed to production" with the wrong md5, and
+  the correction could not reach `main` without a release, because a docs-only
+  pull request fails the tag check. 1.11.1 was cut for documentation alone as a
+  result. The check only asks that the version is mentioned: nothing here can know
+  what is deployed, and a check that cannot fail honestly is worse than none.
 - 1.10.0 was deployed on 2026-09-19, md5 `17ef4e5bef36`, and the freeze that
   preceded it is long over. The lines above this one once said "do not deploy,
   135 commits are undeployed"; that is history.
