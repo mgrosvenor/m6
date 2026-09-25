@@ -95,3 +95,53 @@ pub fn binary(name: &str) -> PathBuf {
         fallback.display(),
     );
 }
+
+/// A scratch directory a test can COMPILE INTO AND THEN EXECUTE FROM.
+///
+/// `std::env::temp_dir()` and `tempfile::tempdir()` both land under `/tmp`, and
+/// `/tmp` is not guaranteed to permit exec. On this estate it provably does
+/// not: the hardened baseline mounts it `noexec` (site issue #98), and on
+/// 2026-09-22 that failed fourteen tests across two files with
+///
+/// ```text
+/// cannot spawn c example: Permission denied (os error 13)
+/// c: spawn: Permission denied (os error 13)
+/// ```
+///
+/// Both messages name the example rather than the mount, so the first reading
+/// is that the backend examples are broken. They were not; the filesystem
+/// changed underneath them when the box was hardened.
+///
+/// Here rather than in either test file because two of them need it, which is
+/// the point at which a third copy becomes inevitable. Standing rule 11.
+///
+/// ── What this is NOT for ─────────────────────────────────────────────────
+///
+/// Unix sockets. `sockaddr_un::sun_path` caps at 104 bytes on macOS and 108 on
+/// Linux, and a socket under here would be longer than one under `/tmp`. The
+/// two requirements pull in opposite directions and must not be served by one
+/// directory: short paths for sockets, exec-permitting paths for binaries.
+///
+/// `TMPDIR` is deliberately ignored. On macOS it is a long
+/// `/var/folders/...` path, and the caller that wants short is asking for
+/// something else anyway.
+pub fn exec_scratch_root() -> PathBuf {
+    // /var/tmp: disk-backed, and not among the mounts the hardening restricts.
+    // Measured on the hardened build host rather than assumed, because
+    // `findmnt` returned nothing at all for these paths there and a check that
+    // cannot see is a check that lies: /tmp EXEC BLOCKED, /var/tmp EXEC OK.
+    let var_tmp = PathBuf::from("/var/tmp");
+    if var_tmp.is_dir() {
+        return var_tmp;
+    }
+    std::env::temp_dir()
+}
+
+// No `exec_tempdir()` helper here on purpose. `tempfile` is a dev-dependency of
+// this crate while `testkit` is a real feature-gated module, so returning a
+// `TempDir` would pull a new runtime dependency into m6-core to save callers
+// one line. What generalises is knowing WHERE exec is permitted; the temp-dir
+// plumbing does not. Callers write:
+//
+//     tempfile::Builder::new()
+//         .tempdir_in(m6_core::testkit::exec_scratch_root())

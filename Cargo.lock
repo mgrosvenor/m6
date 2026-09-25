@@ -679,7 +679,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d045de693cb712d0b22c6a64be5b953f67b3ce00ab5ad3dd5d8b441886ab8e1a"
 dependencies = [
  "quote",
- "syn 2.0.119",
+ "syn 3.0.5",
 ]
 
 [[package]]
@@ -1786,7 +1786,7 @@ dependencies = [
 
 [[package]]
 name = "m6-auth"
-version = "1.10.0"
+version = "1.11.0"
 dependencies = [
  "anyhow",
  "bcrypt",
@@ -1803,7 +1803,7 @@ dependencies = [
 
 [[package]]
 name = "m6-auth-cli"
-version = "1.10.0"
+version = "1.11.0"
 dependencies = [
  "anyhow",
  "m6-auth",
@@ -1816,7 +1816,7 @@ dependencies = [
 
 [[package]]
 name = "m6-auth-server"
-version = "1.10.0"
+version = "1.11.0"
 dependencies = [
  "anyhow",
  "hex",
@@ -1836,7 +1836,7 @@ dependencies = [
 
 [[package]]
 name = "m6-core"
-version = "1.10.0"
+version = "1.11.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1854,6 +1854,7 @@ dependencies = [
  "lettre",
  "libc",
  "lru",
+ "md-5",
  "minify-html",
  "minify-js",
  "multer",
@@ -1877,18 +1878,18 @@ dependencies = [
 
 [[package]]
 name = "m6-example-rust-m6core"
-version = "1.10.0"
+version = "1.11.0"
 dependencies = [
  "m6-core",
 ]
 
 [[package]]
 name = "m6-example-rust-plain"
-version = "1.10.0"
+version = "1.11.0"
 
 [[package]]
 name = "m6-file"
-version = "1.10.0"
+version = "1.11.0"
 dependencies = [
  "anyhow",
  "criterion",
@@ -1905,7 +1906,7 @@ dependencies = [
 
 [[package]]
 name = "m6-html"
-version = "1.10.0"
+version = "1.11.0"
 dependencies = [
  "anyhow",
  "brotli 6.0.0",
@@ -1916,7 +1917,7 @@ dependencies = [
 
 [[package]]
 name = "m6-http"
-version = "1.10.0"
+version = "1.11.0"
 dependencies = [
  "ahash 0.8.12",
  "anyhow",
@@ -1956,7 +1957,7 @@ dependencies = [
 
 [[package]]
 name = "m6-md"
-version = "1.10.0"
+version = "1.11.0"
 dependencies = [
  "anyhow",
  "comrak",
@@ -1971,7 +1972,7 @@ dependencies = [
 
 [[package]]
 name = "m6-monitor"
-version = "1.10.0"
+version = "1.11.0"
 dependencies = [
  "anyhow",
  "m6-core",
@@ -2003,6 +2004,16 @@ name = "matchit"
 version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2f926ade0c4e170215ae43342bf13b9310a437609c81f29f86c5df6657582ef9"
+
+[[package]]
+name = "md-5"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
+dependencies = [
+ "cfg-if",
+ "digest",
+]
 
 [[package]]
 name = "memchr"
@@ -3298,7 +3309,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
