@@ -766,7 +766,7 @@ mod tests {
         assert_eq!(l.total, 231);
     }
 
-    /// Real output from syd. These are 950MB boxes, so the numbers matter.
+    /// Real output from origin. These are 950MB boxes, so the numbers matter.
     #[test]
     fn parses_a_real_meminfo_and_prefers_available_over_free() {
         let s = "MemTotal:         973352 kB\n\
@@ -930,7 +930,7 @@ enp1s0: 2929071615 3102200    0    0    0     0          0         0 3105995619 
         assert_eq!(d[0].name, "vda");
     }
 
-    /// Real PSI output from syd.
+    /// Real PSI output from origin.
     #[test]
     fn parses_real_pressure() {
         let p = parse_pressure(

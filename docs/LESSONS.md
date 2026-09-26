@@ -70,7 +70,7 @@ New this session:
     origin's backbone listener is h2c-only and the cache nodes have none.
 20. **A monitor inside the thing it monitors cannot report the failure that
     matters.** It was specified for the central node until the owner asked
-    where it should run. Run it on origin and the fleet digest dies with syd.
+    where it should run. Run it on origin and the fleet digest dies with origin.
     Related: a client that builds a fresh connection per request pays a cold
     TLS handshake each time, which over a long link is most of the measurement
     (828ms to edge-a, versus 27ms to origin, and the difference is the handshake).
@@ -587,11 +587,11 @@ New 2026-09-12:
     never holds. "Staging validated the artefact" was true and said nothing about
     the rollout.
 
-52. **A release gate that checks the changelog and not the handover lets a release
-    ship a lie about itself.** 1.11.0 was released and deployed on 2026-09-25 while
-    `main`'s `HANDOVER.md` still opened with "m6 1.10.0 is deployed to production"
-    and md5 `0123456789ab`. First bullet, first section, default branch, and the
-    document this repository names as the one to read first.
+52. **A release gate that checks the changelog and not the rest of the docs lets a
+    release ship a lie about itself.** 1.11.0 was released on 2026-09-25 while a
+    working document on `main` still named the previous release as current. First
+    bullet, first section, default branch, and the document this repository then named
+    as the one to read first.
 
     The branch model then made it unfixable on its own. `main` takes releases only,
     and a docs-only `develop` to `main` pull request fails the "version is not

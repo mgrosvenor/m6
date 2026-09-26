@@ -15,8 +15,8 @@
 > whole argument, including how to rebuild the fork. The floors are gates: a run
 > below one fails.
 >
-> **Phase 7, added, completed and DEPLOYED 2026-09-10 (`m6 b32e837`, fleet md5
-> `aced7223`): send-side flow control on the backbone clients.** h2spec exercises m6 as a *server* and so
+> **Phase 7, added and completed 2026-09-10 (`m6 b32e837`): send-side flow control
+> on the backbone clients.** h2spec exercises m6 as a *server* and so
 > never covered `h2c_client`/`h2s_client`, which had no send-side flow control
 > at all — `conn_send_window` was incremented on WINDOW_UPDATE and never read,
 > there was no per-stream send window, and stream-level WINDOW_UPDATE frames
