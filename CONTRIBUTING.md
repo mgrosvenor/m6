@@ -1,8 +1,8 @@
 # Contributing to m6
 
-m6 is a small HTTP stack written for one site, and built so that other sites
-could use it. Contributions are welcome; so are bug reports that simply say
-what you saw.
+m6 is a small, self-contained HTTP stack: an origin, an edge cache, a renderer
+and a monitor, meant to serve a website from your own servers. Contributions are
+welcome; so are bug reports that simply say what you saw.
 
 ## The short version
 
@@ -50,22 +50,31 @@ A pull request into `main` **is** the release, and two more checks apply to it:
 
 - `CHANGELOG.md` has a `## <version>` section: what changed, why it mattered, and how it
   was verified.
-- `HANDOVER.md` mentions `<version>`.
+- m6's own documents still hold. The ones making current-state claims are
+  `README.md`, this file, `docs/H2-PLAN.md`, `docs/PERFORMANCE.md` and
+  `docs/LESSONS.md`. The release checklist in the pull request template asks for
+  this, because freshness is judgement and CI cannot decide it.
+
+  This was a check on `HANDOVER.md` until 2026-09-26, requiring it to mention the
+  version. That file states which of one particular deployment's boxes runs what,
+  so it is not a public document and now lives in the private deployment
+  repository, where a workflow here cannot read it. **The rule did not move with
+  it**: a release is a claim about what is now true, so the documents that say
+  what is true are part of the release.
 
 **Docs being up to date is a fundamental part of a release, not a follow-up to one.**
-Owner's rule, 2026-09-25, and it was earned: 1.11.0 shipped and was deployed while
-`main`'s `HANDOVER.md` still opened with "m6 1.10.0 is deployed to production" and the
-wrong artefact md5, in the first bullet of the first section a cold session reads. The
-correction existed on `develop` and could not reach `main`, because a docs-only
-`develop` → `main` pull request fails the "version is not already tagged" check. So the
-stale text sat on the default branch until a later release happened to carry it, and
-1.11.1 had to be cut for documentation alone.
+Owner's rule, 2026-09-25, and it was earned: 1.11.0 shipped while a working document
+on `main` still named the previous release as current, in the first bullet of the first
+section a cold reader opens. The correction existed on `develop` and could not reach
+`main`, because a docs-only `develop` to `main` pull request fails the "version is not
+already tagged" check, so the stale text sat on the default branch until a later
+release happened to carry it. 1.11.1 had to be cut for documentation alone.
 
-The handover check is deliberately mechanical: it asks only that the file mentions the
-version, because nothing here can know what is actually deployed (that lives in the
-deployment repository's `deploy/estate/prod.json`). What it guarantees is that you open
-the file while cutting the release, which is when you know what is true. A cleverer check
-would be one that cannot fail honestly.
+The checklist is deliberately judgement and not machinery. Nothing here can know what
+any deployment is running, and a check that cannot perform its measurement must not
+pretend to: this repository's trap list is mostly those. What the checklist guarantees
+is that you open the files while cutting the release, which is when you know what is
+true.
 
 ### If you make something faster
 
@@ -112,6 +121,11 @@ against a running server.
 
 Say what you did, what you expected, and what happened. A packet capture, a log
 line with its timestamp, or a `curl -v` is worth more than a description of
-either. If it involves the edge, say which node.
+either. If it involves the edge, say which role: origin, edge cache or monitor.
+
+**Reproduce it against something a reader can run**, not against your own live
+server. `m6-examples`, example 05's end-to-end suite, and h2spec or h3spec against
+a loopback instance all work. Evidence from a private deployment cannot be re-run
+by anyone else, which makes it an assertion rather than evidence.
 
 Security issues go to `SECURITY.md`, not to the issue tracker.

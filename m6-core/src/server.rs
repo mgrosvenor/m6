@@ -107,8 +107,7 @@ pub struct PollReady {
 /// submits to a bounded thread pool and answers 503 when it is full, the other
 /// sends down a channel to a fixed worker set and counts in-flight requests
 /// itself. Those are two concurrency models, not two copies of one, and
-/// merging them is the separate piece of work in `CONSOLIDATION-TODO.md`
-/// §3b-later.
+/// merging them is a separate piece of work, tracked outside this repository.
 pub fn poll_listener_and_watcher(
     listener_fd: std::os::fd::RawFd,
     watcher_fd: Option<std::os::fd::RawFd>,

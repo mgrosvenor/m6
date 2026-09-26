@@ -15,8 +15,9 @@ releases only; work happens on `develop`. See `CONTRIBUTING.md`.
 ## 1.11.2 — 2026-09-26
 
 Documentation, one CI gate and two tests. **No library or binary change, so there is
-nothing in it for a node to run**: the fleet stays on 1.11.0 and the deployment
-repository's pin stays at `v1.11.0`, exactly as for 1.11.1.
+nothing in it for a node to run**, so a deployment has no reason to move to it.
+Whether to pin a release is the deployment's decision, not this repository's, and a
+documentation release is normally not worth pinning.
 
 It is a release rather than a commit on `develop` for the reason 1.11.1 exists: `main`
 takes releases only, and `main` is what a fresh clone gets. Everything below is text a
@@ -97,10 +98,9 @@ A documentation release, and the reason it had to be a release is the lesson.
 
 ### Fixed
 
-**`HANDOVER.md` named the wrong deployed version, on `main`, for hours.** Its first
-bullet read "m6 1.10.0 is deployed to production" with md5 `0123456789ab` while the
-fleet had been running 1.11.0 at `0123456789ab` since earlier the same day. That is
-the first thing a cold session reads, and `main` is the default branch.
+**A working document on `main` stated the previous release as current, for hours.**
+It named a version that had been superseded earlier the same day, in its first
+bullet, on the default branch, in the file a cold reader opens first.
 
 The correction existed on `develop` immediately and **could not reach `main`**: a
 docs-only `develop` to `main` pull request fails the "version is not already tagged"
@@ -109,28 +109,27 @@ until some later release happened to carry it, which is why this release exists.
 
 ### Changed
 
-**A release is now gated on the handover, not only the changelog.** Owner's rule:
-docs being up to date is a fundamental part of a release, not a follow-up to one. A
-pull request into `main` now additionally requires `HANDOVER.md` to mention the
-version being released, and the job says both jobs out loud: "the release says what
-changed and the handover says what is true". `CONTRIBUTING.md` states the rule beside
-the other gates.
+**A release is now gated on the documentation, not only the changelog.** Owner's
+rule: docs being up to date is a fundamental part of a release, not a follow-up to
+one. A pull request into `main` carries a second requirement beside the changelog
+entry, and the job says both halves out loud: the release says what changed and the
+docs say what is true. `CONTRIBUTING.md` states it beside the other gates.
 
-The check is mechanical on purpose. Nothing inside this repository can know what is
-deployed, since the deployed artefact is recorded in the deployment repository's
-`deploy/estate/prod.json`. What it can require is that the handover mentions the
-release at all, which cannot be satisfied without opening the file at the moment the
-author knows what is true. A cleverer check would be one that cannot fail honestly,
-and this repository's own trap list is mostly those.
+(1.11.2 repointed this at m6's own documents. The file it originally checked was a
+working document belonging to one deployment, and it is no longer in this
+repository.)
 
-### Not a deployment
+The check is mechanical on purpose. Nothing inside this repository can know what any
+deployment is running. What it can require is that the document is opened at the
+moment the author knows what is true. A cleverer check would be one that cannot fail
+honestly, and this repository's own trap list is mostly those.
 
-No library or binary change. The fleet stays on 1.11.0 at `0123456789ab` and is not
-behind: there is nothing in 1.11.1 for a node to run. The deployment repository's pin
-stays at `v1.11.0` deliberately.
+### Nothing for a node to run
 
-Verified: this release is the first thing the new gate ran against, and it passes only
-because `HANDOVER.md` names 1.11.1.
+No library or binary change, so a deployment has no reason to move to it.
+
+Verified: this release is the first thing the new gate ran against, and it passed only
+because the document it checked named the version.
 
 ## 1.11.0 — 2026-09-25
 
@@ -178,7 +177,7 @@ parses. Read once at first use and cached, because a deploy replaces the file
 while the process keeps serving the bytes it started with.
 
 **`m6-monitor` reports build drift.** Section C reads
-`m6-http 1.10.0 build 0123456789ab` per node, and a new fleet finding fires when
+`m6-http 1.2.3 build 0123456789ab` per node, and a new fleet finding fires when
 the versions agree and the hashes do not, which is exactly the case a version
 comparison cannot see. Reported separately from version drift and only when
 versions match: different releases have different binaries by construction, so
@@ -1246,7 +1245,6 @@ The first release. Everything under this heading was on `develop` unreleased and
 undeployed, some of it for months.
 
 `docs/PERFORMANCE.md` has the measured performance story by commit.
-`docs/CONSOLIDATION-TODO.md` has what is done and what is owed.
 
 ### What this repository is
 
