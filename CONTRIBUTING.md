@@ -102,8 +102,12 @@ as a result. `tools/conformance.sh`'s header lists the four and what each cost.
 
 ## Style
 
-- The code aligns struct fields and match arms by hand. `cargo fmt` is **not**
-  run over this tree; it would undo that throughout. Match the file you are in.
+- **Run `cargo fmt --all`.** CI runs `cargo fmt --all --check` and the build
+  fails on a difference. This file said the opposite until 2026-09-26, that
+  `cargo fmt` is "not run over this tree" because the code aligned struct fields
+  by hand: that was true until 2026-09-13, when the tree was formatted and the
+  owner's call was to run it and accept the result. Formatting has one answer
+  now and nobody has to hold it in their head.
 - Comments explain *why*, and especially why something is not the obvious
   thing. The best comments in this codebase name the defect that made the code
   look the way it does.
