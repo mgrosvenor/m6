@@ -1,14 +1,23 @@
-# Laying out a site: one root per app
+# Laying out a site
 
-An m6 site is usually several processes: m6-http routing, m6-file serving static
-files, m6-html rendering pages, and whatever custom renderers the site needs. Each of
-them is started with a directory.
+A site running several m6 apps must give each app its own root directory.
+That is the conclusion of this document, and the reason is that a root is a security boundary rather than a convenience.
+We begin by giving the layout.
+We then show why one shared root is wrong, why m6-http is the exception, and the two traps that catch people building this for the first time.
 
-This document is about which directory, because the obvious answer — give them all the
-site root — is the wrong one, and the reason is worth understanding before you build
-the tree.
+## Contents
 
-## The layout
+1. [The layout](#1-the-layout)
+2. [Why not one root for everything](#2-why-not-one-root-for-everything)
+3. [Why m6-http gets the top](#3-why-m6-http-gets-the-top)
+4. [Two traps](#4-two-traps)
+5. [Building the tree](#5-building-the-tree)
+6. [Summary](#6-summary)
+
+## 1. The layout
+
+Every app gets its own directory under `apps/`, and nothing else.
+The tree below is the whole scheme.
 
 ```
 <site>/                 m6-http's root: the whole site
@@ -22,78 +31,84 @@ the tree.
   bin/                  custom renderer binaries
 ```
 
-Each app is started with its own directory under `apps/` and can reach nothing else.
+Three properties follow from that shape:
 
-## Why not one root for everything
+- each app can reach its own material and no other app's.
+- `configs/` sits outside every app root, because each config is passed by absolute path.
+- m6-http alone is given the top, for the reason in section 3.
 
-Because a root is a boundary, and sharing one throws the boundary away.
+The rest of this document argues for those three.
 
-Take a site with a contact form. The renderer behind it needs a mail relay password, so
-the password is a file somewhere in the tree. Now consider m6-file, which serves static
-assets and whose routes are narrowly scoped to `assets/` and `static/`.
+## 2. Why not one root for everything
 
-If both are rooted at the site root, then the only thing standing between the file
-service and the mail password is that no route in `m6-file.conf` happens to point at
-it. That is a real defence and it is tested — m6-file refuses a path that traverses a
-symlink out of its root, and its test suite covers the traversal cases — but it is
-**confinement by configuration**. Four `root` values in a config file are what keeps
-the password unreachable, and nothing structural does.
+One shared root throws away the only boundary you have.
+Take a site with a contact form, whose renderer needs a mail relay password.
+The password is therefore a file in the tree.
+Now add m6-file, which serves static assets and whose routes point only at `assets/` and `static/`.
 
-Give each app its own root and the question stops being asked. The file service cannot
-serve the password because the password is not under its root, and it cannot read it
-either. A path-handling regression has nothing to find.
+Root both apps at the site root and one thing keeps the password away from the file server: no route in `m6-file.conf` happens to point at it.
+That is confinement by configuration.
+m6-file does refuse a path traversing a symbolic link out of its root, and its tests cover the traversal cases, so the defence is real.
+It is still four `root` values in a config file, and nothing structural.
 
-The same argument applies in every direction: the HTML renderer has no business reading
-the file service's assets, and the file service has no business reading templates.
-Neither needs the other's material, so neither should be able to see it.
+Give each app its own root and the question stops being asked.
+m6-file cannot serve the password, because the password is not under its root.
+m6-file cannot read the password either.
+A path-handling regression therefore has nothing to find.
 
-### It costs nothing in configuration
+The same argument runs in every direction.
+m6-html has no reason to read the file server's assets, and m6-file has no reason to read templates.
+Neither app needs the other's material, so neither app should see it.
 
-Each app's config paths are already relative to that app's own root:
+### 2.1. It costs nothing in configuration
+
+Splitting the roots changes no app config at all.
+Each config already names paths relative to its own app's root:
 
 ```toml
 # m6-file.conf        root = "assets/"
-# m6-html.conf        template = "templates/experience.html"
+# m6-html.conf        template = "templates/page.html"
 # render-contact.conf secrets_file = "keys/relay-secrets.toml"
 ```
 
-So moving from one shared root to one root per app changes **no app config at all**.
-That is a useful sign you have the boundary in the right place: if splitting the roots
-forces you to rewrite paths, the paths were encoding the shared root rather than the
-app's own.
+That is a useful test of whether the boundary is in the right place.
+If splitting the roots forces you to rewrite paths, those paths were encoding the shared root rather than the app's own.
 
-### Enforce it in the supervisor as well
+### 2.2. Enforce it in the supervisor
 
-Systemd can make the separation structural rather than conventional:
+Systemd makes the separation structural rather than conventional.
 
 ```ini
-# the file service
 ExecStart=/usr/local/bin/m6-file /srv/site/apps/file /srv/site/configs/m6-file.conf
 ReadOnlyPaths=/srv/site
 InaccessiblePaths=/srv/site/apps/contact /srv/site/apps/html
 ```
 
-The root argument means it cannot *serve* another app's files. `InaccessiblePaths`
-means it cannot *read* them.
+The root argument stops m6-file serving another app's files.
+`InaccessiblePaths` stops it reading them.
+Together they move the boundary out of config and into the process.
 
-## Why m6-http gets the top
+## 3. Why m6-http gets the top
 
-m6-http serves nothing from disk. It reads `site.toml`, globs filenames to work out
-which routes exist, and forwards every request to a backend over a unix socket. It is
-the one process that legitimately needs to see the whole tree, and giving it a narrow
-root would only mean symlinking things into view.
+m6-http is the one app given the whole site, because it serves nothing from disk.
+It reads `site.toml`, globs filenames to work out which routes exist, then forwards every request to a backend over a unix socket.
+Seeing the tree is its job.
+Giving it a narrow root would only mean symbolic links into view, which section 4 explains is the trap to avoid.
 
-## The two traps
+## 4. Two traps
 
-### 1. A route_group's glob and the file it names are resolved by different processes
+Two mistakes catch almost everyone building this layout for the first time.
+The first produces a route that exists over a backend that returns 404.
+The second silently disables cache warming.
 
-`[[route_group]]` lives in `site.toml`, so its glob is relative to **m6-http's** root.
-The file it eventually names is resolved by **m6-file**, relative to m6-file's root and
-that route's own `root`. In this layout those are different directories, and the glob
-has to say so:
+### 4.1. A glob and the file it names are resolved by different processes
+
+`[[route_group]]` lives in `site.toml`, so its glob is relative to m6-http's root.
+The file it names is resolved by m6-file, relative to m6-file's root and that route's own `root`.
+Those are different directories in this layout, so the glob must say so.
 
 ```toml
-# site.toml — the glob is relative to m6-http's root, which is the site root
+# site.toml: the glob is relative to m6-http's root, the site root
 [[route_group]]
 glob    = "apps/file/assets/**/*"
 path    = "/assets/{relpath}"
@@ -101,55 +116,71 @@ backend = "m6-file"
 ```
 
 ```toml
-# m6-file.conf — root is relative to m6-file's root, which is apps/file
+# m6-file.conf: root is relative to m6-file's root, apps/file
 [[route]]
 path    = "/assets/{*relpath}"
 handler = "files"
 root    = "assets/"
 ```
 
-Get the glob wrong and the routes never exist. Get `root` wrong and the routes exist
-while every request 404s. Neither log says which. See [`m6-file.md`](m6-file.md).
+The two failure modes differ:
 
-**If you ever find yourself symlinking one app's directory into another's so a glob can
-see it, that is this trap.** The symlink will work, and its failure mode is silent: a
-reload with the link missing expands the glob against an empty directory, so every
-asset route disappears and the reload reports success.
+| mistake | result |
+|---|---|
+| wrong glob | the routes never exist |
+| wrong `root` | the routes exist and every request returns 404 |
 
-### 2. Prefer a route_group to a wildcard for static assets
+Neither log says which.
+[`m6-file.md`](m6-file.md) covers the resolution in full.
 
-A `[[route_group]]` is expanded at config load into one **concrete** route per matched
-file. A wildcard route is one route with a parameter. That difference decides whether
-the cache can be warmed:
+**If you find yourself adding a symbolic link so a glob can see another app's directory, this is the trap.**
+The link works, and its failure mode is silent.
+A reload with the link missing expands the glob against an empty directory, so every route disappears and the reload reports success.
+Fix the glob instead.
 
-`is_warmable` skips any route whose path contains `{` — its own comment names
-`/assets/{*relpath}` as the example — because a pattern is not a URL and there is
-nothing to fetch. So a wildcard silently means static assets are never pre-warmed.
+### 4.2. Prefer a route_group to a wildcard for static assets
 
-On a single node that costs one slow first request per file. On a deployment with edge
-nodes it costs a round trip to the origin per file per edge, paid by whichever visitor
-arrives first after a restart.
+A `[[route_group]]` expands at config load into one concrete route per matched file.
+A wildcard route is one route holding a parameter.
+That difference decides whether the cache can be warmed.
 
-Use a wildcard where enumeration is impossible — a directory whose contents appear at
-runtime, such as ACME challenge tokens — and a `route_group` everywhere else. A
-short-lived path is exactly the one you would not want warmed anyway.
+`is_warmable` skips any route whose path contains `{`, naming `/assets/{*relpath}` as its example, because a pattern is not a *URL* (Uniform Resource Locator) and there is nothing to fetch.
+A wildcard therefore means static assets are never pre-warmed.
 
-## Building the tree
+The cost scales with the deployment:
 
-The layout is an output, not something maintained by hand. Build it from your sources
-into an output directory and deploy that directory, the way a Makefile produces a
-build: then a node holds a built site rather than a checkout, and nothing on it is a
-source file.
+| deployment | cost of a wildcard |
+|---|---|
+| one node | one slow first request per file |
+| edge nodes | one round trip to the origin per file, per edge, paid by the first visitor after a restart |
 
-The practical test is whether deploying means copying one directory. If it means
-copying a repository and then rearranging it in place — creating directories, moving
-things, symlinking — the layout is being assembled on the target, and every step of
-that is a step that can half-fail on a live box.
+Use a wildcard only where enumeration is impossible, such as a directory whose contents appear at runtime.
+*ACME* (Automatic Certificate Management Environment) challenge tokens are the clear case, and a short-lived path is one you would not want warmed anyway.
+Everything else takes a `route_group`.
 
-## See also
+## 5. Building the tree
 
-- [`m6-file.md`](m6-file.md) — the static file service and its own route table
-- [`m6-site-toml.md`](m6-site-toml.md) — m6-http's route table
-- [`m6-app-anatomy.md`](m6-app-anatomy.md) — writing an app of your own
-- [`m6-user-guide.md`](m6-user-guide.md) — the worked examples, which build this
-  layout up one piece at a time
+Build the layout as an output, never maintain it by hand.
+Compile it from your sources into an output directory, then deploy that directory, the way a Makefile produces a build.
+A node then holds a built site rather than a checkout, and nothing on it is a source file.
+
+The practical test is what deploying means.
+Copying one directory is right.
+Copying a repository and then rearranging it in place, creating directories and moving and linking files, means the layout is being assembled on the target.
+Every step of that assembly is a step that can half-fail on a live box.
+
+## 6. Summary
+
+A site running several m6 apps must give each app its own root directory, because a root is a security boundary rather than a convenience.
+One shared root leaves a mail relay password one config line away from a static file server, and splitting the roots costs no config change at all.
+m6-http is the single exception, because it serves nothing from disk and its job is to see the tree.
+Two traps remain: a glob and its file are resolved by different processes, and a wildcard route silently disables cache warming.
+
+Related reading:
+
+| document | covers |
+|---|---|
+| [`m6-file.md`](m6-file.md) | the static file service and its own route table |
+| [`m6-site-toml.md`](m6-site-toml.md) | m6-http's route table |
+| [`m6-app-anatomy.md`](m6-app-anatomy.md) | writing an app of your own |
+| [`m6-user-guide.md`](m6-user-guide.md) | the worked examples, which build this layout up one piece at a time |
