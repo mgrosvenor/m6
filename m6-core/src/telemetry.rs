@@ -830,7 +830,7 @@ mod tests {
     #[test]
     fn a_scanner_claiming_to_be_googlebot_is_not_googlebot() {
         let ua = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
-        // The paths it actually asked for, from the 09:17 burst on lon.
+        // The paths it actually asked for, from the 09:17 burst on edge-a.
         let paths = [
             "/.aws/credentials",
             "/.env.backup",

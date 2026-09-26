@@ -62,7 +62,7 @@ is wrong. We are paying to guard against a bug class the other model deletes.
 
 Both spawn external processes, both have failed exactly once "inside a loaded
 full-workspace run", neither reproduces in isolation. That is the signature of
-a timing-dependent defect. See `HANDOVER.md` §7.
+a timing-dependent defect.
 
 ### The pool was widened reactively, not calculated
 
@@ -272,7 +272,7 @@ An event loop is also the only model in which admission control is
 **This design is agreed. It is not the near-term work.**
 
 The near-term work is the minimal set that makes the shapes roughly agree,
-tracked in `CONSOLIDATION-TODO.md` §3b-now: a read timeout in `App`, a socket
+tracked outside this repository: a read timeout in `App`, a socket
 permissions config key, optionally extracting the shared accept loop, plus the
 free `send_with_length` fix. Half a day to a day, near-zero risk, no migration
 and no contract change.

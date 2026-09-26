@@ -5,6 +5,57 @@ by anyone remembering them.
 
 ---
 
+## RULE ZERO: m6 IS A GENERIC WEB HOSTING ENGINE
+
+**It must not in any way be tied to one particular site.** Owner's rule, stated
+plainly on 2026-09-26 and placed first because it was broken repeatedly while
+being written down elsewhere.
+
+This repository is **public**. One instance of m6 happens to be the owner's own
+site, in its own private repository. That instance is a USER of this software and
+nothing more. Nothing about it belongs here.
+
+**Never in this repository. Not in code, not in tests, not in comments, not in
+docs, not in the changelog, not in issues, not in commit messages.**
+
+| forbidden | use instead |
+|---|---|
+| any real domain or hostname | `example.com`, `www.example.com` |
+| any real IP address or ssh port | `localhost`, `127.0.0.1`, or `<host>` |
+| real node names | `origin`, `edge-a`, `edge-b`, `monitor` |
+| an email address | nothing. `SECURITY.md` uses GitHub private reporting |
+| a repository name of a deployment | nothing |
+| an artefact md5, or which version is deployed where | nothing. That is the deployment's record, not m6's |
+| per-node measurements taken off someone's live fleet | numbers from a loopback instance or an example |
+| "my site needs X" | "a website might want to X" |
+
+**Issues and documents cover generic features only.** Write a feature request
+abstractly: *a website might want to ...*. A defect report gets the finding plus
+a reproduction any reader can run.
+
+**And the reason that last part is not a style preference.** Evidence measured
+against a private production instance is **unreproducible by anyone else**, so it
+is not evidence, only an assertion that looks authoritative. "Verified means
+measured against something running" is satisfied without touching anyone's fleet:
+`m6-examples`, example 05's end-to-end suite, h2spec and h3spec against a
+loopback instance, and `tools/build-host-tests.sh`. Use those.
+
+**How this was broken, so it is not repeated.** By 2026-09-26 this public
+repository had accumulated: a working handover and a ledger stating which of one
+deployment's boxes ran which version at which md5, that deployment's node names
+in 19 source and doc files, a server's public IP in older revisions, the owner's
+personal email in `SECURITY.md`'s history, and 19 public issues carrying node
+names, artefact hashes, live-fleet measurements and two server IPs with their
+roles. A test existed to prevent exactly this and could not: it had to spell the
+identity it banned, so it published what it guarded, and it only ever checked
+files, never the issue tracker.
+
+**So this rule is care and judgement, not machinery.** There is no check that
+will catch it for you. Read what you are about to write and ask whether a
+stranger running m6 on their own server would find it relevant.
+
+---
+
 ## Branches
 
 | branch | what it is |
@@ -174,12 +225,35 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 
 | file | what it holds |
 |---|---|
-| `HANDOVER.md` | **start here.** What is true right now, written for someone with no prior context |
-| `docs/CONSOLIDATION-TODO.md` | what is done and what is owed, with the 1.0 list at the top |
+| `CHANGELOG.md` | **start here.** What changed in each release, newest first, with how it was verified |
+| `README.md` | what m6 is, what it does, and how to run one |
+| `docs/m6-core-reference.md` | every core module and its interface |
 | `docs/PERFORMANCE.md` | every performance number, how it was measured, on what |
 | `docs/LESSONS.md` | the things that cost something to learn |
-| `docs/SESSION-NOTES.md` | point-in-time records. Not maintained; the handover wins |
-| `docs/m6-core-reference.md` | every core module and its interface |
-| `CHANGELOG.md` | what changed in each release |
+| `docs/H2-PLAN.md` | HTTP/2 and HTTP/3: the conformance status, then the phase history |
+| `tools/conformance-scores.txt` | the floors, and the whole argument behind the h3 number |
 
-`HANDOVER.md` is what is true. Where it and the ledger disagree, it wins.
+### The working documents are not here, deliberately
+
+**`HANDOVER.md`, `docs/CONSOLIDATION-TODO.md` and the session notes were removed
+on 2026-09-26.** Owner's rule: handover and todo are not public documents, only
+release notes are.
+
+They stated the operational state of one particular deployment, which is
+private: which version was in production and since when, artefact md5s, node
+names, deploy sequencing, and in older revisions a server's public IP address.
+This repository is a generic web system; that material belongs to the deployment
+that owns it, and it now lives in the private deployment repository under
+`docs/m6-internal/`, byte-for-byte, with its provenance recorded.
+
+**The rule this leaves you with.** m6's docs, issues and changelog entries cover
+GENERIC features only. Write a feature issue abstractly, "a website might want
+to ...", never "my site needs". Never put a domain, hostname, IP address, email
+address, node name, artefact hash or deployment state in this repository.
+
+And note what that rules out, because it is the trap this repository walked into
+19 issues deep: **evidence measured against a private production instance is
+unreproducible by anyone else**, so it is not evidence. "Verified means measured
+against something running" is satisfied by `m6-examples`, example 05's
+end-to-end suite, h2spec and h3spec against a loopback instance, and
+`tools/build-host-tests.sh`. Use those.
