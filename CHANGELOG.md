@@ -12,6 +12,86 @@ releases only; work happens on `develop`. See `CONTRIBUTING.md`.
 
 ---
 
+## 1.11.3 — 2026-09-26
+
+**m6 is a generic web hosting engine, and this release is what makes the repository
+say so.** Rule Zero, now the first thing in `CLAUDE.md`, above the branch model: m6
+must not in any way be tied to one particular site.
+
+This repository is public. One instance of m6 is its author's own site, in a separate
+private repository, and that instance is a user of this software and nothing more.
+
+### Removed
+
+**Four working documents that belonged to one deployment, not to m6.** `HANDOVER.md`
+and `docs/CONSOLIDATION-TODO.md` stated which of that deployment's machines ran which
+version at which artefact md5, the order they were deployed in, and what was deployed
+as against merely released. Two session-record files went with them, one carrying a
+server's public IP address in older revisions. They are preserved in full, outside
+this repository, by the deployment that owns them.
+
+**`m6-core/tests/generic_system.rs`, and the reason is the interesting part.** That
+test existed to keep one deployment's identity out of this repository, and it could
+not do the job: a banned list has to spell what it bans, so the file published two
+domains and a private repository's name, split into string fragments purely so the
+test would not match its own source. That hides them from a grep, not from a reader.
+It also only ever read files, so it had nothing to say about the issue tracker, where
+the same material had accumulated while the test passed on every run.
+
+The rule it was standing in for is care and judgement, and it is written down instead.
+
+### Changed
+
+**Node names became role names** throughout the source, the tests and the docs:
+`origin`, `edge-a`, `edge-b`. 113 of them, in test fixtures and in provenance
+comments of the form "real output from <node>".
+
+**Artefact hashes and deployment state are out of the changelog, the lessons and the
+HTTP/2 plan.** A release note says what changed in a version of m6. It does not say
+whose machines are running it.
+
+**`SECURITY.md` takes GitHub private vulnerability reporting only.** It also linked a
+contact form, which was a link to one particular site, so it published which site the
+maintainer runs.
+
+**`CONTRIBUTING.md` describes m6 by what it is** rather than as "a small HTTP stack
+written for one site", and asks that a bug report be reproducible against something
+the reader can run. That is not a style preference: evidence measured against a
+private production instance cannot be re-run by anyone else, so it is an assertion
+rather than evidence. `m6-examples`, example 05's end-to-end suite, and h2spec or
+h3spec against a loopback instance all serve.
+
+### Fixed
+
+**The release gate checked a document that is no longer here, so it now checks the
+ones that are.** It required `HANDOVER.md` to mention the version being released.
+That file has left, and a workflow cannot read a private repository, but the rule did
+not leave with it: a release is a claim about what is now true, so the documents that
+state what is true are part of it. m6's own docs go stale in exactly the same way. A
+sweep for this release found `docs/H2-PLAN.md` leading with h3spec 37/49 thirteen days
+after it became 47/49, `CONTRIBUTING.md` describing a clippy ceiling removed on
+2026-09-13, `README.md` saying a decision "gates a 1.0 release" twelve days after 1.0
+was cut, and `CONTRIBUTING.md` telling contributors that `cargo fmt` is not run over
+this tree while CI has run `cargo fmt --all --check` since the day it was formatted.
+
+Freshness is judgement, so it is a release checklist in the pull request template, at
+the moment the author knows the answer. That is all the previous check ever did: it
+never verified the document was true, only that someone opened it.
+
+A mechanical "no document names a script that does not exist" check was written for
+CI and discarded after being measured: 87 findings, roughly 80 of them legitimate,
+because m6's docs reference a deployment's scripts, the examples repository's, and
+scripts a user writes in their own project. A gate at that signal-to-noise gets muted,
+which is how the two real errors in this repository's shell survived for months.
+
+### Verified
+
+Build host: 1146 passed, 0 failed, 0 warnings on release and test builds, clippy ok,
+conformance h1+h2+h3 ok, performance ok. 1148 before, less the two tests in the
+deleted file. CI green on all six jobs.
+
+Nothing in this release changes behaviour. There is nothing in it for a server to run.
+
 ## 1.11.2 — 2026-09-26
 
 Documentation, one CI gate and two tests. **No library or binary change, so there is
