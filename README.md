@@ -728,6 +728,8 @@ All detailed documentation lives in [`docs/`](docs/):
 |---|---|
 | [`docs/m6-user-guide.md`](docs/m6-user-guide.md) | Eleven worked examples, start here |
 | [`docs/m6-site-toml.md`](docs/m6-site-toml.md) | `site.toml` reference |
+| [`docs/m6-site-layout.md`](docs/m6-site-layout.md) | Laying out a site: one root per app |
+| [`docs/m6-file.md`](docs/m6-file.md) | m6-file static file service reference |
 | [`docs/m6-http.md`](docs/m6-http.md) | m6-http internals |
 | [`docs/m6-auth.md`](docs/m6-auth.md) | m6-auth-server reference |
 | [`docs/m6-auth-cli.md`](docs/m6-auth-cli.md) | m6-auth-cli reference |
