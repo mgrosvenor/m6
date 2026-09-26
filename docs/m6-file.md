@@ -1,9 +1,56 @@
-# m6-file — the static file service
+# m6-file
 
-m6-file serves files from disk. It is an `App` service with exactly one handler,
-registered under the name `files`, and **every route it answers comes from its own
-config**. That last point is the one this document exists for: it is the thing most
-easily got wrong, and until now it was readable only in the source.
+m6-file serves files from disk.
+It is an *App* (a service built on m6-core's application framework) with one handler, registered under the name `files`.
+Every route it answers comes from its own config, not from m6-http's.
+That last point causes most m6-file problems, and until now it was readable only in the source.
+This document covers its two route tables, how it resolves a path, what its handler owns, and how to configure it.
+
+## Contents
+
+1. [The shape of a request](#1-the-shape-of-a-request)
+2. [Two route tables](#2-two-route-tables)
+3. [How a path is resolved](#3-how-a-path-is-resolved)
+4. [What the handler owns](#4-what-the-handler-owns)
+5. [Refusing to serve outside its root](#5-refusing-to-serve-outside-its-root)
+6. [Configuration](#6-configuration)
+7. [Summary](#7-summary)
+
+## 1. The shape of a request
+
+A static file request passes through two processes, each with its own route table.
+m6-http decides which backend gets the request.
+m6-file then decides which file to return.
+Neither reads the other's table, which is why a file needs an entry in both.
+
+```
+client ──► m6-http ──► m6-file ──► disk
+           site.toml   m6-file.conf
+           which       which
+           backend     file
+```
+
+The rest of this document is about that split and its consequences.
+
+## 2. Two route tables
+
+A static file needs a route in both configs, and each config answers a different question.
+Omit the m6-http half and nothing is forwarded.
+Omit the m6-file half and every request returns 404, with neither log saying which half is wrong.
+
+| config | whose | decides |
+|---|---|---|
+| `site.toml` | m6-http | which backend receives the request |
+| `m6-file.conf` | m6-file | which file is returned |
+
+A minimal pair looks like this.
+
+```toml
+# site.toml
+[[route]]
+path    = "/assets/{relpath}"
+backend = "m6-file"
+```
 
 ```toml
 # m6-file.conf
@@ -13,136 +60,107 @@ handler = "files"
 root    = "assets/"
 ```
 
-## Two route tables, and they do different jobs
+With both in place, the request reaches m6-file and m6-file knows what to open.
 
-A request for a static file passes through two configs, and confusing them produces a
-route that exists over a backend that 404s, with nothing in either log saying which
-half is wrong.
+## 3. How a path is resolved
 
-| config | whose | what it decides |
-|---|---|---|
-| `site.toml` | m6-http's | **which backend** gets the request |
-| `m6-file.conf` | m6-file's | **which file** is returned |
+m6-file builds a filesystem path from three parts, and none of them is the *URL* (Uniform Resource Locator) directly.
 
-m6-http matches the request against its route table and forwards it to the named
-backend over a unix socket. m6-file then matches the request against *its* route table
-and resolves a path. Neither knows the other's table.
+| part | comes from |
+|---|---|
+| m6-file's own root | the first argument the process was started with |
+| the route's `root` | `m6-file.conf` |
+| `relpath` or `filename` | the matched route parameter |
 
-So a static file needs an entry in **both**:
-
-```toml
-# site.toml — m6-http: send this path to the file service
-[[route]]
-path    = "/assets/{relpath}"
-backend = "m6-file"
-
-# m6-file.conf — m6-file: and here is the file it means
-[[route]]
-path    = "/assets/{*relpath}"
-handler = "files"
-root    = "assets/"
-```
-
-Add only the first and every request 404s. Add only the second and m6-http never
-forwards anything.
-
-## How a file path is resolved
-
-`resolve_fs_path` joins three things:
-
-1. **m6-file's own root**, the first positional argument the process was started with.
-2. **the route's `root`**, from `m6-file.conf`.
-3. **the matched `relpath` or `filename`** parameter.
+The three are joined in that order.
 
 ```
 <m6-file's root> / <route's root> / <relpath>
 ```
 
-Nothing in that comes from the URL directly. A route can map any URL to any directory,
-which is what makes `root` worth setting narrowly: it is the only thing bounding what
-that route can reach.
+A route can therefore map any URL to any directory, which is why `root` should name the narrowest directory that works.
+It is the only thing bounding what that route can reach.
 
-`root` may also contain `{param}` placeholders, which are substituted from the request
-dict, and it may name a single file rather than a directory:
+Two further points:
 
-```toml
-[[route]]
-path    = "/robots.txt"
-handler = "files"
-root    = "static/robots.txt"
-```
+- `root` may contain `{param}` placeholders, substituted from the request.
+- `root` may name a single file instead of a directory, as in `root = "static/robots.txt"`.
 
-### The wildcard is explicit
+Those three parts fix the file, but only if the route parameter spans the whole remaining path.
+The next subsection covers when it does.
 
-`{*relpath}` spans several path segments. A bare trailing `{relpath}` does **not** —
-core does not make the last parameter implicitly greedy, because that would silently
-change the meaning of every route already written. A route that needs to span segments
-says so.
+### 3.1. The wildcard is explicit
 
-This is a real failure and not a hypothetical one: with a non-greedy matcher,
-`/assets/style.css` keeps serving while `/assets/css/style.css` returns 404, so a
-check that only fetches a top-level file passes while the site is broken. Test a path
-at least two segments deep.
+`{*relpath}` spans several path segments.
+A bare trailing `{relpath}` does not, because m6-core does not make the last parameter implicitly greedy.
+Making it greedy would silently change the meaning of every route already written.
 
-## What the handler owns
+This matters in practice.
+With a non-greedy matcher, `/assets/style.css` keeps serving while `/assets/css/style.css` returns 404.
+A check that fetches only a top-level file therefore passes while the site is broken, so test a path at least two segments deep.
 
-**m6-file builds its own representation.** It negotiates the content coding,
-compresses, and constructs an ETag naming the result, so every response it returns is
-final and core's pipeline leaves it alone. Letting core compress afterwards would put
-brotli bytes on the wire under a tag asserting identity.
+Path resolution ends there, with the file chosen.
+What m6-file then does with that file is the subject of the next section.
 
-Consequences worth knowing:
+## 4. What the handler owns
 
-- the ETag covers the **encoding**, not just mtime and size. Without that, brotli,
-  gzip and identity of one file share a tag, and a cache can hand a client bytes in a
-  coding it did not ask for.
+m6-file builds its own representation of a response, which is unusual and worth knowing.
+It negotiates the content coding, compresses, and constructs an *ETag* (Entity Tag, a cache validator) naming the result.
+Every response it returns is final, and m6-core's pipeline leaves it alone.
+Letting m6-core compress afterwards would put Brotli bytes on the wire under a tag asserting identity encoding.
+
+Two consequences follow:
+
+- the ETag covers the encoding, not just modification time and size, so Brotli, gzip and identity copies of one file do not share a tag.
 - negotiation happens before the ETag is built, in that order and deliberately.
 
-### Cache-Control is computed from the query string
+### 4.1. Cache-Control is computed from the query string
+
+m6-file sets `Cache-Control` itself, from the query string alone.
 
 | request | header |
 |---|---|
 | `?v=<hash>` present | `public, max-age=31536000, immutable` |
 | anything else | `public, max-age=60, s-maxage=86400, stale-while-revalidate=60` |
 
-A `?v=` URL addresses one exact version — changed bytes mean a changed hash and so a
-different URL — which is what makes a year and `immutable` safe, and also stops a
-browser revalidating on reload.
+A `?v=` URL addresses one exact version, because changed bytes mean a changed hash and so a different URL.
+That is what makes a year and `immutable` safe, and it also stops a browser revalidating on reload.
 
-For everything else the two audiences are split on purpose. `max-age` and
-`stale-while-revalidate` are honoured by **browsers**, and no invalidation can reach a
-browser cache, so they stay short and a deploy is visible promptly. `s-maxage` is
-honoured only by **shared caches** (RFC 9110 5.2.2.10), so it lengthens just the edge's
-copy, which an invalidation can evict.
+For everything else the two audiences are split deliberately:
 
-**There is currently no way for a route to override this.** `cache` on the route is not
-read for it, `cache` on a `[[route_group]]` in `site.toml` is ignored with a warning,
-and `headers` is appended rather than substituted, so it yields two `Cache-Control`
-headers. That matters for anything short-lived served from disk — a one-time download,
-an ACME HTTP-01 challenge token. See issue #126.
+- `max-age` and `stale-while-revalidate` are honoured by browsers, and no invalidation can reach a browser cache, so they stay short and a deploy is visible promptly.
+- `s-maxage` is honoured only by shared caches, per *RFC* (Request for Comments) 9110 section 5.2.2.10, so it lengthens just the edge copy, which an invalidation can evict.
 
-## It refuses to serve outside its root
+No route can currently override this, and three things that look like they would do not work:
 
-A path that is, or traverses, a symlink resolving outside m6-file's root returns 404.
-The check only pays for `canonicalize` when a symlink is actually present, so ordinary
-files are not slowed by it, and a path that cannot be resolved at all is treated as
-escaping because it would 404 either way.
+| attempt | result |
+|---|---|
+| `cache` on the m6-file route | not read for this |
+| `cache` on a `[[route_group]]` in `site.toml` | ignored, with a warning |
+| `headers` on the route | appended, so two `Cache-Control` headers |
 
-That is a backstop, not the boundary. **The boundary is the root the process is started
-with**, which is why it is worth making that directory hold only what this service
-serves. See [`m6-site-layout.md`](m6-site-layout.md).
+That gap matters for anything short-lived served from disk, such as a one-time download or an *ACME* (Automatic Certificate Management Environment) challenge token.
+It is tracked as issue #126.
 
-## Methods
+So the handler decides the bytes, the encoding, the validator and the caching, and a route decides none of them.
+What a route does bound is which files can be reached at all, which is the next section.
 
-`GET` and `HEAD`. Anything else returns 405.
+## 5. Refusing to serve outside its root
 
-## Configuration
+m6-file returns 404 for a path that is, or traverses, a symbolic link resolving outside its root.
+The check pays for canonicalisation only when a link is present, so ordinary files are not slowed.
+A path that cannot be resolved at all counts as escaping, because it would return 404 either way.
+
+This is a backstop, not the boundary.
+The boundary is the root the process was started with, so that directory should hold only what this service serves.
+[`m6-site-layout.md`](m6-site-layout.md) covers how to arrange that.
+
+## 6. Configuration
+
+m6-file accepts two arguments, a root and a config path, and reads its thread pool size and routes from the config.
 
 ```toml
 [thread_pool]
-# Defaults to the CPU count, which a page firing dozens of concurrent image
-# requests exhausts easily; each queued request surfaces as a "pool empty"
-# backend error and a slow or broken image.
 size = 32
 
 [[route]]
@@ -151,16 +169,28 @@ handler = "files"
 root    = "assets/"
 ```
 
-A route naming a handler the binary does not have is **fatal**: the service exits 2 at
-startup, and a reload is refused with the previous routes left serving.
+Three facts about that config:
 
-Routes are rebuilt on every config reload, so an asset tree can be added without
-restarting the service.
+- the pool defaults to the *CPU* (Central Processing Unit) count, which a page firing dozens of concurrent image requests exhausts easily, surfacing as "pool empty" backend errors.
+- a route naming a handler the binary does not have is fatal, so the service exits 2 at startup and a reload is refused with the previous routes left serving.
+- routes are rebuilt on every config reload, so an asset tree can be added without a restart.
 
-## See also
+m6-file answers `GET` and `HEAD`, and returns 405 for anything else.
 
-- [`m6-site-layout.md`](m6-site-layout.md) — where m6-file's root belongs relative to
-  the other apps, and why
-- [`m6-site-toml.md`](m6-site-toml.md) — m6-http's route table, including
-  `[[route_group]]`
-- [`m6-app-anatomy.md`](m6-app-anatomy.md) — writing an `App` service of your own
+Those two arguments and this one config are the whole interface.
+The summary below collects what they imply.
+
+## 7. Summary
+
+m6-file is a small service with one handler and its own route table.
+The table is the part to remember, because a static file needs a route in `site.toml` to reach m6-file and a route in `m6-file.conf` to reach the disk.
+Its handler owns the whole response, including the ETag and `Cache-Control`, which no route can currently override.
+Its root bounds what it can serve, which is why the layout document treats that root as a security boundary rather than a convenience.
+
+Related reading:
+
+| document | covers |
+|---|---|
+| [`m6-site-layout.md`](m6-site-layout.md) | where m6-file's root belongs relative to other apps |
+| [`m6-site-toml.md`](m6-site-toml.md) | m6-http's route table, including `[[route_group]]` |
+| [`m6-app-anatomy.md`](m6-app-anatomy.md) | writing an App of your own |
