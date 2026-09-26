@@ -132,7 +132,9 @@ M6_BUILD_HOST=root@<box> ./tools/build-host-tests.sh
 | the examples build | zero warnings, clippy silent, their tests pass, every config parses | the `m6-examples` repository |
 | the examples work | example 05's end-to-end suite over the whole running stack | `examples/05-cms/test.sh` |
 
-**CI runs all of it on the pull request.** `tools/build-host-tests.sh` runs the
+**CI runs all of it on the pull request**, and on every push to `main` and
+`develop` and on release tags, so a merge and a force-push are both built.
+`tools/build-host-tests.sh` runs the
 same ground plus the two things a shared runner cannot do: the performance check,
 which needs a quiet machine, and conformance against a real h2spec/h3spec install.
 Run it before opening the pull request when the change could touch either.
