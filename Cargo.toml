@@ -27,8 +27,7 @@ resolver = "2"
 #
 # The version matches the newest tag. Bump it HERE, on develop, and do it FIRST:
 # the develop -> main pull request that is the release reads this line to decide
-# what CHANGELOG.md and HANDOVER.md must mention, and to check the version is not
-# already tagged. `./tag.sh v<version>` then tags the merge and does NOT touch
+# what CHANGELOG.md must mention, and to check the version is not already tagged. `./tag.sh v<version>` then tags the merge and does NOT touch
 # this line.
 #
 # This said `tools/release.sh` until 2026-09-26, and that script was deleted on
@@ -47,10 +46,10 @@ resolver = "2"
 # the m6-core overhead measurement they existed for, and the advisories resolved.
 #
 # Phase 7 (the renderers pinned to a tag rather than a path) is sequenced AT the
-# release, because it needs a tag to pin to. See docs/CONSOLIDATION-TODO.md for
-# what remains, and CHANGELOG.md's 1.0.0 entry for what is knowingly not fixed.
+# release, because it needs a tag to pin to. See CHANGELOG.md's 1.0.0 entry for
+# what is knowingly not fixed.
 [workspace.package]
-version      = "1.11.2"
+version      = "1.11.3"
 edition      = "2021"
 # The oldest toolchain we test. Declared because declaring one and not testing
 # it is a claim rather than a fact: CI builds the whole workspace with exactly

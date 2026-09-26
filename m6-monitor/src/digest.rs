@@ -683,7 +683,11 @@ mod tests {
             .filter(|f| f.text.contains("version drift"))
             .collect();
         assert_eq!(drift.len(), 1, "{:?}", d.findings);
-        assert!(drift[0].text.contains("edge-a unknown"), "{}", drift[0].text);
+        assert!(
+            drift[0].text.contains("edge-a unknown"),
+            "{}",
+            drift[0].text
+        );
     }
 
     /// One node cannot drift from itself. A single-node fleet on an unknown

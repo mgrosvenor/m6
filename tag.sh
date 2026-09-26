@@ -153,10 +153,12 @@ echo ""
 echo -e "${GREEN}Released $TAG, tag and GitHub release.${RESET}"
 echo "  https://github.com/mgrosvenor/m6/releases/tag/$TAG"
 echo ""
-# Deliberately NOT naming a deployment here. m6 is a generic web system and
-# m6-core's generic_system test fails when one particular deployment's identity
-# appears anywhere in the repository. The first version of these lines named one and
-# the test caught it, which is the test working.
+# Deliberately NOT naming a deployment here. m6 is a generic web system, and a
+# release of it says nothing about whose boxes run it. The first version of these
+# lines named one deployment; a test used to catch that, and the test is gone
+# because it had to spell the identity it banned in order to ban it. The rule is
+# unchanged and is now in CLAUDE.md: no domain, host, address or deployment state
+# in this repository.
 echo "This tag is not deployed anywhere yet. A deployment moves to it by:"
 echo "  1. bumping its own m6 pin to $TAG"
 echo "  2. merging that"

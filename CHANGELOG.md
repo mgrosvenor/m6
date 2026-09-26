@@ -12,11 +12,92 @@ releases only; work happens on `develop`. See `CONTRIBUTING.md`.
 
 ---
 
+## 1.11.3 — 2026-09-26
+
+**m6 is a generic web hosting engine, and this release is what makes the repository
+say so.** Rule Zero, now the first thing in `CLAUDE.md`, above the branch model: m6
+must not in any way be tied to one particular site.
+
+This repository is public. One instance of m6 is its author's own site, in a separate
+private repository, and that instance is a user of this software and nothing more.
+
+### Removed
+
+**Four working documents that belonged to one deployment, not to m6.** `HANDOVER.md`
+and `docs/CONSOLIDATION-TODO.md` stated which of that deployment's machines ran which
+version at which artefact md5, the order they were deployed in, and what was deployed
+as against merely released. Two session-record files went with them, one carrying a
+server's public IP address in older revisions. They are preserved in full, outside
+this repository, by the deployment that owns them.
+
+**`m6-core/tests/generic_system.rs`, and the reason is the interesting part.** That
+test existed to keep one deployment's identity out of this repository, and it could
+not do the job: a banned list has to spell what it bans, so the file published two
+domains and a private repository's name, split into string fragments purely so the
+test would not match its own source. That hides them from a grep, not from a reader.
+It also only ever read files, so it had nothing to say about the issue tracker, where
+the same material had accumulated while the test passed on every run.
+
+The rule it was standing in for is care and judgement, and it is written down instead.
+
+### Changed
+
+**Node names became role names** throughout the source, the tests and the docs:
+`origin`, `edge-a`, `edge-b`. 113 of them, in test fixtures and in provenance
+comments of the form "real output from <node>".
+
+**Artefact hashes and deployment state are out of the changelog, the lessons and the
+HTTP/2 plan.** A release note says what changed in a version of m6. It does not say
+whose machines are running it.
+
+**`SECURITY.md` takes GitHub private vulnerability reporting only.** It also linked a
+contact form, which was a link to one particular site, so it published which site the
+maintainer runs.
+
+**`CONTRIBUTING.md` describes m6 by what it is** rather than as "a small HTTP stack
+written for one site", and asks that a bug report be reproducible against something
+the reader can run. That is not a style preference: evidence measured against a
+private production instance cannot be re-run by anyone else, so it is an assertion
+rather than evidence. `m6-examples`, example 05's end-to-end suite, and h2spec or
+h3spec against a loopback instance all serve.
+
+### Fixed
+
+**The release gate checked a document that is no longer here, so it now checks the
+ones that are.** It required `HANDOVER.md` to mention the version being released.
+That file has left, and a workflow cannot read a private repository, but the rule did
+not leave with it: a release is a claim about what is now true, so the documents that
+state what is true are part of it. m6's own docs go stale in exactly the same way. A
+sweep for this release found `docs/H2-PLAN.md` leading with h3spec 37/49 thirteen days
+after it became 47/49, `CONTRIBUTING.md` describing a clippy ceiling removed on
+2026-09-13, `README.md` saying a decision "gates a 1.0 release" twelve days after 1.0
+was cut, and `CONTRIBUTING.md` telling contributors that `cargo fmt` is not run over
+this tree while CI has run `cargo fmt --all --check` since the day it was formatted.
+
+Freshness is judgement, so it is a release checklist in the pull request template, at
+the moment the author knows the answer. That is all the previous check ever did: it
+never verified the document was true, only that someone opened it.
+
+A mechanical "no document names a script that does not exist" check was written for
+CI and discarded after being measured: 87 findings, roughly 80 of them legitimate,
+because m6's docs reference a deployment's scripts, the examples repository's, and
+scripts a user writes in their own project. A gate at that signal-to-noise gets muted,
+which is how the two real errors in this repository's shell survived for months.
+
+### Verified
+
+Build host: 1146 passed, 0 failed, 0 warnings on release and test builds, clippy ok,
+conformance h1+h2+h3 ok, performance ok. 1148 before, less the two tests in the
+deleted file. CI green on all six jobs.
+
+Nothing in this release changes behaviour. There is nothing in it for a server to run.
+
 ## 1.11.2 — 2026-09-26
 
 Documentation, one CI gate and two tests. **No library or binary change, so there is
-nothing in it for a node to run**: the fleet stays on 1.11.0 and the deployment
-repository's pin stays at `v1.11.0`, exactly as for 1.11.1.
+nothing in it for a node to run**, so a deployment has no reason to move to it.
+Whether to pin a release is the deployment's decision, not this repository's, and a
+documentation release is normally not worth pinning.
 
 It is a release rather than a commit on `develop` for the reason 1.11.1 exists: `main`
 takes releases only, and `main` is what a fresh clone gets. Everything below is text a
@@ -97,10 +178,9 @@ A documentation release, and the reason it had to be a release is the lesson.
 
 ### Fixed
 
-**`HANDOVER.md` named the wrong deployed version, on `main`, for hours.** Its first
-bullet read "m6 1.10.0 is deployed to production" with md5 `0123456789ab` while the
-fleet had been running 1.11.0 at `0123456789ab` since earlier the same day. That is
-the first thing a cold session reads, and `main` is the default branch.
+**A working document on `main` stated the previous release as current, for hours.**
+It named a version that had been superseded earlier the same day, in its first
+bullet, on the default branch, in the file a cold reader opens first.
 
 The correction existed on `develop` immediately and **could not reach `main`**: a
 docs-only `develop` to `main` pull request fails the "version is not already tagged"
@@ -109,28 +189,27 @@ until some later release happened to carry it, which is why this release exists.
 
 ### Changed
 
-**A release is now gated on the handover, not only the changelog.** Owner's rule:
-docs being up to date is a fundamental part of a release, not a follow-up to one. A
-pull request into `main` now additionally requires `HANDOVER.md` to mention the
-version being released, and the job says both jobs out loud: "the release says what
-changed and the handover says what is true". `CONTRIBUTING.md` states the rule beside
-the other gates.
+**A release is now gated on the documentation, not only the changelog.** Owner's
+rule: docs being up to date is a fundamental part of a release, not a follow-up to
+one. A pull request into `main` carries a second requirement beside the changelog
+entry, and the job says both halves out loud: the release says what changed and the
+docs say what is true. `CONTRIBUTING.md` states it beside the other gates.
 
-The check is mechanical on purpose. Nothing inside this repository can know what is
-deployed, since the deployed artefact is recorded in the deployment repository's
-`deploy/estate/prod.json`. What it can require is that the handover mentions the
-release at all, which cannot be satisfied without opening the file at the moment the
-author knows what is true. A cleverer check would be one that cannot fail honestly,
-and this repository's own trap list is mostly those.
+(1.11.2 repointed this at m6's own documents. The file it originally checked was a
+working document belonging to one deployment, and it is no longer in this
+repository.)
 
-### Not a deployment
+The check is mechanical on purpose. Nothing inside this repository can know what any
+deployment is running. What it can require is that the document is opened at the
+moment the author knows what is true. A cleverer check would be one that cannot fail
+honestly, and this repository's own trap list is mostly those.
 
-No library or binary change. The fleet stays on 1.11.0 at `0123456789ab` and is not
-behind: there is nothing in 1.11.1 for a node to run. The deployment repository's pin
-stays at `v1.11.0` deliberately.
+### Nothing for a node to run
 
-Verified: this release is the first thing the new gate ran against, and it passes only
-because `HANDOVER.md` names 1.11.1.
+No library or binary change, so a deployment has no reason to move to it.
+
+Verified: this release is the first thing the new gate ran against, and it passed only
+because the document it checked named the version.
 
 ## 1.11.0 — 2026-09-25
 
@@ -178,7 +257,7 @@ parses. Read once at first use and cached, because a deploy replaces the file
 while the process keeps serving the bytes it started with.
 
 **`m6-monitor` reports build drift.** Section C reads
-`m6-http 1.10.0 build 0123456789ab` per node, and a new fleet finding fires when
+`m6-http 1.2.3 build 0123456789ab` per node, and a new fleet finding fires when
 the versions agree and the hashes do not, which is exactly the case a version
 comparison cannot see. Reported separately from version drift and only when
 versions match: different releases have different binaries by construction, so
@@ -1246,7 +1325,6 @@ The first release. Everything under this heading was on `develop` unreleased and
 undeployed, some of it for months.
 
 `docs/PERFORMANCE.md` has the measured performance story by commit.
-`docs/CONSOLIDATION-TODO.md` has what is done and what is owed.
 
 ### What this repository is
 
