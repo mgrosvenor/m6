@@ -21,7 +21,7 @@
 //! It also cannot tell you *which* node is unwell. Checks against the apex go
 //! wherever GeoDNS sends the checking region, so one dead node can hide
 //! behind two healthy ones. `/health` is per-node by construction: point the
-//! monitor at `syd.`/`lon.`/`chi.` and the answer names the node that
+//! monitor at `origin.`/`edge-a.`/`edge-b.` and the answer names the node that
 //! produced it.
 //!
 //! # Health means "this node can serve", not "the fleet is fine"

@@ -10,7 +10,7 @@ Companion documents: `m6-core-reference.md` for what each component does, and
 
 ## 1. The whole app
 
-This is `m6-html`, in production on three nodes, complete and unabridged:
+This is `m6-html`, complete and unabridged, and it is what a real deployment runs:
 
 ```rust
 use m6_core::prelude::*;
