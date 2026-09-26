@@ -43,7 +43,9 @@
 # because two things already cover them and both are stricter:
 #
 #   - a PULL REQUEST runs the full set in CI, and a pull request is the only way
-#     work reaches develop or main
+#     work reaches develop or main. CI also runs on the push to main or develop
+#     that merges it, and on release tags, so nothing lands on either branch
+#     unbuilt -- including a force-push, which no pull request ever covers
 #   - a MERGE runs tools/build-host-tests.sh on a real Linux box, which tests
 #     strictly more than either: it has h2spec and h3spec installed, and it is
 #     quiet enough for the performance numbers to mean something
@@ -192,7 +194,7 @@ fi
 # Say what was NOT checked here, because a gate that stays quiet about its scope
 # gets mistaken for one that covered everything. Same rule as tools/conformance.sh.
 if [[ $run_checks -eq 1 ]]; then
-  note "pushing $checks_for — branch rules only; tests, clippy and conformance run in CI on the pull request"
+  note "pushing $checks_for — branch rules only; tests, clippy and conformance run in CI"
   note "  to run them here first:  ./check.sh"
 fi
 

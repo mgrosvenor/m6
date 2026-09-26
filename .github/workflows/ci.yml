@@ -1,28 +1,46 @@
 name: CI
 
-# Pull requests, not pushes. Owner's call.
+# Pull requests AND the branches that matter, as of 2026-09-26.
 #
-# The local checks are what a push goes through: `.githooks/pre-push` runs
-# `check.sh`, and a merge into develop has already been through
-# `tools/build-host-tests.sh` on a real Linux box, which tests strictly more than
-# a runner can -- it has h2spec and h3spec installed and it is quiet enough to
-# measure. Running the same ground again on every push spends runner minutes to
-# re-confirm what the build host already said.
+# This said "pull requests, not pushes" and gave a reason that had stopped being
+# true: that a push already goes through `.githooks/pre-push` running `check.sh`.
+# The hook was cut down to branch rules alone when a ten-minute hook was found to
+# break pushing outright -- it now prints "branch rules only; tests, clippy and
+# conformance run in CI on the pull request" -- so from that day nothing checked a
+# push at all, and the comment went on asserting that something did.
 #
-# A pull request is different: it is the point where someone else's change arrives
-# and nothing local has vouched for it.
+# WHAT THAT LEFT UNCHECKED, and it is not hypothetical. `main` had never once been
+# built by CI. Not on a merge, not on a release, not on a tag. On 2026-09-26 the
+# entire history of this repository was rewritten and force-pushed to `main` and
+# `develop`, and zero workflow runs fired. A force-push is exactly the case where
+# you want a build, because it is the one operation that can change what is on a
+# branch without a pull request ever existing.
 #
-# WHAT IS NOT HERE: the performance check. A wall-clock measurement on a shared
-# runner measures the runner, not the code. It stays on the build host, which
-# is quiet and is where the recorded numbers in tools/perf-baseline.txt were
-# taken. See CLAUDE.md, "Why the build host and not the laptop" -- the same
-# argument applies twice over to a runner shared with the rest of the world.
+# So: pushes to main and develop, and release tags, are built. Feature branches are
+# not listed, so a push to one still runs nothing until its pull request opens, and
+# there is no double run.
+#
+# The performance check is still NOT here. A wall-clock measurement on a shared
+# runner measures the runner, not the code. It stays on the build host, which is
+# quiet and is where the recorded numbers in tools/perf-baseline.txt were taken.
+# See CLAUDE.md, "Why the build host and not the laptop" -- the same argument
+# applies twice over to a runner shared with the rest of the world.
 
 on:
   pull_request:
     branches: [main, develop]
+  push:
+    branches: [main, develop]
+    tags: ['v*']
   # Manual, for re-running against a branch without opening a pull request.
   workflow_dispatch:
+
+# One run per ref. A second push supersedes the first rather than queueing behind
+# it, which matters on a 12-minute job. Never cancels a tag build: a release is
+# built once and the result is the record of it.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 env:
   CARGO_TERM_COLOR: always
