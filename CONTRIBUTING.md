@@ -42,7 +42,9 @@ All of it, on Linux, before anything merges into `develop`:
 - h1, h2 and h3 conformance, at or above their recorded scores
 - the performance check, within its margin
 
-CI runs them on the pull request. `tools/build-host-tests.sh` runs the same ground plus the performance check, which a shared runner cannot measure.
+CI runs them on the pull request, and again on the push to `main` or `develop`
+that merges it, and on a release tag. `tools/build-host-tests.sh` runs the same
+ground plus the performance check, which a shared runner cannot measure.
 
 ### A release also has to be documented, and that is enforced
 
