@@ -166,6 +166,39 @@ not skip, and it does not print a number it did not take. See
 
 ---
 
+## Documentation style
+
+**Every document in this repository follows one ruleset, R0 to R8.** It applies to
+`README.md`, `CHANGELOG.md`, everything under `docs/`, and every new page. R0 comes
+before the others and R8 overrules all of them.
+
+| rule | what it asks |
+|---|---|
+| R0, less is more | Brevity first. Prefer a diagram, bullet list or table to prose. Cut padding. A reader who cannot follow us is our failure, not theirs |
+| R1, paragraph topic sentence | Every paragraph opens with what it covers and what it concludes. Destination before journey |
+| R2, sentence chaining | Every sentence links to the one before it through a shared word or idea. No link means a new paragraph |
+| R3, paragraph closing sentence | The last sentence consolidates the paragraph and hooks the next |
+| R4, sentence length and word choice | Short, plain sentences. Two short beat one long. Define acronyms in *italics* on first use and at the start of every major section |
+| R5, punctuation and formatting | `,` `()` and `:` before lists. **No semicolons and no double dashes.** Numbered headings, a table of contents past four sections, one sentence per line in Markdown |
+| R6, section framing | Every major section opens and closes with a framing paragraph |
+| R7, document framing | The document opens and closes with framing sections |
+| R8, clarity overrules all | Any rule may be broken where following it would reduce clarity. Deliberately, and rarely |
+
+**Four habits the rules do not state, and they matter as much:**
+
+- **Forward signposting.** Say what comes next. "We begin by ... We then ..."
+- **Claim before evidence.** State the conclusion, then support it.
+- **Exact figures, never adjectives.** Write `596ns` and `16x`, not "extremely fast" or "dramatically worse".
+- **One term per concept.** Never rotate synonyms. If it is a route, it is a route everywhere.
+
+**Hedging is banned.** No "it seems", "arguably", "perhaps", "it could be said". State
+the claim, or do not make it.
+
+Existing documents predate this and do not all comply. Retrofitting them is issue #127,
+and a page being edited for any other reason should be brought into line while it is open.
+
+---
+
 ## Standing rules that do not lapse
 
 - **Never use em dashes** in prose written for the owner.
