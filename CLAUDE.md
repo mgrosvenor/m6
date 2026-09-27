@@ -175,12 +175,12 @@ before the others and R10 overrules all of them.
 | rule | what it asks |
 |---|---|
 | R0, less is more | Brevity first. Prefer a diagram, bullet list or table to prose. Cut padding. A reader who cannot follow us is our failure, not theirs |
-| R1, number and caption figures | Every table, diagram and image is numbered and captioned. Each caption stands alone without the surrounding text. Every figure is referenced from the text, saying what it shows |
+| R1, figures, tables and images | Every table, diagram, chart and image is numbered by type, captioned and referenced. A caption stands alone: the reader understands the figure from the figure and its caption. The text reference says what the figure shows and what to take from it |
 | R2, paragraph topic sentence | Every paragraph opens with what it covers and what it concludes. Destination before journey |
 | R3, sentence chaining | Every sentence links to the one before it through a shared word or idea. No link means a new paragraph |
 | R4, paragraph closing sentence | The last sentence consolidates the paragraph and hooks the next |
 | R5, sentence length and word choice | Short, plain sentences. Two short beat one long. Define acronyms in *italics* on first use and at the start of every major section |
-| R6, no weasel words | Delete every weasel word, or replace it with a fact, a number or a source. "Most", "often", "almost everyone" and "easily" are claims without evidence |
+| R6, eliminate weasel words | Delete each weasel word, or replace it with a fact, a number or a named source. Hedges, vague quantities, softeners, empty intensifiers, fake precision, hidden sources, unsupported certainty and marketing puffery. A word is only a weasel word when it replaces something statable precisely: "may" is fine for permission |
 | R7, punctuation and formatting | `,` `()` and `:` before lists. **No semicolons and no double dashes.** Numbered headings, a table of contents past four sections, one sentence per line in Markdown |
 | R8, section framing | Every major section opens and closes with a framing paragraph |
 | R9, document framing | The document opens and closes with framing sections |
