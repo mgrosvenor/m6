@@ -32,6 +32,12 @@
 # reading of one process is a reading of the afternoon. See the m6 handover's
 # lesson 7 and docs/PERFORMANCE.md.
 #
+# This paragraph said median while the code took the MINIMUM, from the day it was
+# written until 2026-09-27. Owner's decision that day settled it in favour of what
+# the comment already said: work with medians. A minimum is the best reading the
+# machine ever managed, which is not what anyone's request costs. The median is
+# the typical cost, and typical is what a latency number is for.
+#
 # WHERE IT RUNS. The build host, and not the
 # laptop's pre-push hook. A wall-clock measurement needs a quiet machine: this
 # laptop sits at load 20-30 with the owner's own dev servers and preview
@@ -183,12 +189,15 @@ measure_one() {
     return 1
   fi
 
-  local sock="$WORK/render.sock" best="" all=""
-  # $RUNS rounds, take the minimum. The minimum is the least contaminated by
-  # whatever else the machine was doing, which is the question being asked:
-  # what the code costs, not what the box was busy with.
+  local sock="$WORK/render.sock"
+  local -a readings=()
+  # $RUNS rounds, take the MEDIAN. Owner's decision, 2026-09-27.
   #
-  # Every reading is kept, not only the winner. A minimum alone cannot separate a
+  # A minimum is the best reading the machine ever managed and no request costs
+  # that. A maximum is whatever else the box was doing. The median is the typical
+  # cost, which is the number a latency floor should be made of.
+  #
+  # Every reading is kept, not only the median. A single figure cannot separate a
   # run that read 157us, 158us, 159us from one that read 157us, 340us, 890us, and
   # those two say very different things about the machine.
   for _ in $(seq 1 "$RUNS"); do
@@ -209,12 +218,25 @@ measure_one() {
     kill "$pid" 2>/dev/null
     wait "$pid" 2>/dev/null
     if [[ -n "$got" ]]; then
-      [[ -z "$best" || "$got" -lt "$best" ]] && best="$got"
-      all="${all:+$all }$got"
+      readings+=("$got")
     fi
   done
+
+  local all="${readings[*]:-}"
   printf '%s %s\n' "$key" "$all" >> "$RAW"
   info "$key: $RUNS rounds, ns: $all"
+
+  # The median. For an even count, the mean of the two middle readings, which is
+  # why this is integer arithmetic on nanoseconds rather than picking a side.
+  local best=""
+  if (( ${#readings[@]} > 0 )); then
+    best="$(printf '%s\n' "${readings[@]}" | sort -n | awk '
+      { a[NR] = $1 }
+      END {
+        if (NR % 2) { print a[(NR + 1) / 2] }
+        else        { print int((a[NR / 2] + a[NR / 2 + 1]) / 2) }
+      }')"
+  fi
 
   if [[ -z "$best" ]]; then
     fail "$key — measured nothing. A check that cannot measure must fail."

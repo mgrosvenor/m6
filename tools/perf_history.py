@@ -12,6 +12,7 @@ It is called once, at the end of a run, from tools/perfcheck.sh:
                     <margin> <runs> <load-before> <load-after>
 
 `raw-file` is one line per target: "<key> <ns> <ns> ...", every reading kept.
+The median is the headline figure, matching what perfcheck.sh gates on.
 
 WHAT IS DELIBERATELY ABSENT. No hostname, no address, no domain, no account
 name. What class of machine a number came from, and how busy it was, is the
@@ -85,6 +86,30 @@ def git(*args):
     return sh("git", *args)
 
 
+def commit():
+    """The commit these readings belong to.
+
+    `git rev-parse` works on a checkout. It returns nothing on the build host,
+    because the tree there arrives by rsync without `.git`, and a record with no
+    commit cannot be tied to code at all. tools/build-host-tests.sh therefore
+    exports M6_PERF_COMMIT from the checkout it synced FROM, and that is the
+    authority when it is set.
+    """
+    return os.environ.get("M6_PERF_COMMIT") or git("rev-parse", "HEAD")
+
+
+def dirty():
+    """Whether the measured tree had uncommitted changes.
+
+    On the build host the answer comes from the machine that synced, because the
+    guard there refuses to sync a dirty tree at all. M6_PERF_DIRTY carries it.
+    """
+    env = os.environ.get("M6_PERF_DIRTY")
+    if env is not None:
+        return env not in ("", "0", "false")
+    return bool(git("status", "--porcelain"))
+
+
 def baselines(path):
     """The recorded numbers, so a record says what it was compared against."""
     found = {}
@@ -117,13 +142,23 @@ def read_targets(raw_path, recorded):
         if not values:
             # A target that measured nothing is recorded as such. A gap in the
             # history is worse than a record saying the run failed here.
-            targets[key] = {"readings": [], "min_ns": None, "baseline_ns": recorded.get(key)}
+            targets[key] = {"readings": [], "median_ns": None, "baseline_ns": recorded.get(key)}
             continue
+        ordered = sorted(values)
+        mid = len(ordered) // 2
+        if len(ordered) % 2:
+            median = ordered[mid]
+        else:
+            median = (ordered[mid - 1] + ordered[mid]) // 2
         targets[key] = {
+            # The median is the headline, because it is what the gate compares.
+            # min and max stay so a later reader can see the spread without
+            # re-deriving it from the readings.
+            "median_ns": median,
             "readings": values,
-            "min_ns": min(values),
-            "max_ns": max(values),
-            "spread_pct": round((max(values) - min(values)) * 100 / min(values), 1),
+            "min_ns": ordered[0],
+            "max_ns": ordered[-1],
+            "spread_pct": round((ordered[-1] - ordered[0]) * 100 / ordered[0], 1),
             "baseline_ns": recorded.get(key),
         }
     return targets
@@ -138,8 +173,8 @@ def main():
     recorded = baselines(baseline)
     record = {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "commit": git("rev-parse", "HEAD"),
-        "dirty": bool(git("status", "--porcelain")),
+        "commit": commit(),
+        "dirty": dirty(),
         "toolchain": sh("rustc", "--version"),
         "profile": "release",
         "machine": {

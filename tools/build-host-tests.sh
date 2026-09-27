@@ -179,7 +179,13 @@ fi
 # ── Run ──────────────────────────────────────────────────────────────────────
 info "m6: release build, warnings, clippy, cargo-deny, tests, conformance"
 # shellcheck disable=SC2086
-ssh $SSH_OPTS "$BUILD_HOST" "M6_DIR=$BUILD_ROOT/m6 bash -s" > "$LOG" 2>&1 <<'REMOTE' || true
+# PERF_COMMIT is read here, from the checkout being synced, because the remote
+# tree has no `.git`. PERF_DIRTY is 0 by construction: the clean-tree guard above
+# refuses to sync a dirty tree at all.
+PERF_COMMIT="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+ssh $SSH_OPTS "$BUILD_HOST" \
+    "M6_DIR=$BUILD_ROOT/m6 M6_PERF_COMMIT=$PERF_COMMIT M6_PERF_DIRTY=0 bash -s" \
+    > "$LOG" 2>&1 <<'REMOTE' || true
 set -uo pipefail
 # `/root/.local/bin` is where `uv` installs, and h1spec is delivered through
 # `uvx`. It was missing from PATH once, so every run reported "h1: skipped, uvx
@@ -252,6 +258,10 @@ echo "### performance"
 # Against the recorded numbers in tools/perf-baseline.txt, taken on this machine.
 # A run slower than its number by more than the margin fails; a faster one prints
 # the reading and asks for it to be recorded deliberately.
+# M6_PERF_COMMIT and M6_PERF_DIRTY arrive in the environment from the ssh
+# invocation, set from the checkout that synced. The tree up here has no `.git`,
+# so `git rev-parse` finds nothing, and a performance record that cannot name its
+# commit cannot be compared with anything later.
 ./tools/perfcheck.sh > /tmp/perf.out 2>&1
 echo "PERF_STATUS=$?"
 grep -E 'render:|PASS|FAIL' /tmp/perf.out | tail -6
