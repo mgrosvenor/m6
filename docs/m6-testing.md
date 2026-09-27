@@ -14,7 +14,7 @@ Four of its five traps report a failure that is not there.
 2. [Running the checks](#2-running-the-checks)
 3. [The shared harness](#3-the-shared-harness)
 4. [Conformance: h1spec, h2spec and h3spec](#4-conformance-h1spec-h2spec-and-h3spec)
-5. [What each service is held to](#5-what-each-service-is-held-to)
+5. [Where the tests are](#5-where-the-tests-are)
 6. [End to end](#6-end-to-end)
 7. [Summary](#7-summary)
 
@@ -156,18 +156,10 @@ Two of them need more than a row:
   h2spec deliberately sends malformed frames, and a three-byte frame could once kill this process outright (F076 in [`CHANGELOG.md`](../CHANGELOG.md)).
   A result measured against a private live site is also unreproducible by anyone else, which makes it an assertion.
 
-## 5. What each service is held to
+## 5. Where the tests are
 
-The lists below are grouped into levels, L1 upward.
-They were written before the code, and no row has been checked against the suites that exist, which is issue #165.
-Until that is done, read a row as what m6 intends and Table 6 as where to find the test.
-
-**Nothing in this repository runs a sanitiser, and nothing fuzzes it.**
-Three rows below name a sanitiser run that no script, workflow or command performs.
-Those rows are marked, and the gap is issue #164.
-
-Table 6 gives the suites that do exist.
-Take from it where to look for the test behind a row.
+Table 6 gives the integration suites, by crate.
+Take from it that every suite is named, so a claim about m6's behaviour can be traced to the file that checks it.
 
 | crate | integration suites |
 |---|---|
@@ -183,314 +175,21 @@ Take from it where to look for the test behind a row.
 Unit tests are not listed, because they sit in `src/` beside the code they cover.
 
 Each crate carries its own fixtures under `<crate>/tests/fixtures/`.
+m6-html's holds `site.toml`, `configs/`, `templates/`, `content/posts/` and `data/`.
+m6-file's holds a config and an `assets/` tree.
+m6-http's holds a `site/` directory with `site.toml` and a certificate, plus `system.toml`, because m6-http takes both a site directory and a system config.
 
-### 5.1. m6-html
+### 5.1. What this document does not list, and why
 
-m6-html's seven levels are Table 7 start and stop, Table 8 route matching, Table 9 the params merge, Table 10 path parameter expansion, Table 11 built-in keys, Table 12 status and cache, and Table 13 compression.
-Take from them that everything m6-html does is decided by config and request, and that it holds no state of its own.
+A per-service list of behaviours used to sit here, about 120 rows over four services, written before the code as a plan.
+No row had ever been checked against the suites above, so a reader took a line like "SIGTERM twice, immediate exit" as a test that runs.
+Three of those rows named a run under the address and leak sanitisers, and **nothing in this repository runs a sanitiser**, which is issue #164.
 
-| test | expected |
-|---|---|
-| Valid config, no `secrets_file` | Starts using config values |
-| Valid config, `secrets_file` present | Starts using merged values, secrets file wins on conflict |
-| `secrets_file` declared but file absent | Silently ignored, starts with config values |
-| Local key overrides global | Starts, warning in stdout |
-| SIGTERM | Finish in-flight, exit 0 |
-| SIGTERM twice | Immediate exit |
-| SIGINT | Same as SIGTERM |
+**That list is issue #165 now.**
+An unverified specification in `docs/` reads as a statement about what m6 does, and this one was wrong in at least four places.
+It is kept in full on the issue, and it comes back here row by row as each row is checked against a suite in Table 6.
 
-**Table 7: m6-html L1, start and stop.**
-A missing secrets file is not an error, and a second SIGTERM stops waiting.
-
-| test | expected |
-|---|---|
-| `/blog` with `/blog` and `/blog/{stem}` declared | Exact `/blog` matched |
-| `/blog/hello-world` | Parameterised, stem is `hello-world` |
-| No matching route | 404, empty body |
-| Equal specificity tie | First declaration wins, warning logged |
-
-**Table 8: m6-html L2, route matching.**
-An exact route beats a parameterised one, and a tie goes to declaration order.
-
-| test | expected |
-|---|---|
-| `global_params` and route `params`, conflicting key | Route params win |
-| Three files, left to right | Last file wins |
-| Missing params file | 500, error in stdout |
-| Built-in key in params file (`site_name`) | Built-in overwrites, injected last |
-
-**Table 9: m6-html L3, the params merge.**
-Precedence runs global, then route, then built-in, with built-ins injected last so nothing can shadow them.
-
-| test | expected |
-|---|---|
-| `/blog/hello-world` to `content/posts/{stem}.json` | Reads `hello-world.json` |
-| `{stem}` containing `..` | 400 |
-| `{stem}` containing `/` | 400 |
-| `{relpath}` with subdirectory | Allowed |
-
-**Table 10: m6-html L4, path parameter expansion.**
-A `{stem}` may hold neither a separator nor a parent reference, and a `{relpath}` may hold a separator by design.
-
-| test | expected |
-|---|---|
-| `site_name` in template | From `[site] name` |
-| `request_path` | Matches request path |
-| `query.foo` for `?foo=bar` | `"bar"` |
-| `/error?status=404&from=/x` | Template receives `error_status` and `error_from` |
-
-**Table 11: m6-html L5, built-in keys.**
-Every built-in comes from the request or from `site.toml`, so a template never has to be told them.
-
-| test | expected |
-|---|---|
-| Route `status = 404` | Response status 404 |
-| `cache = "public"` | `Cache-Control: public` |
-| `cache = "no-store"` | `Cache-Control: no-store` |
-
-**Table 12: m6-html L6, status and cache.**
-A route sets its own status and cacheability, which is what makes an error route a route like any other.
-
-| test | expected |
-|---|---|
-| `Accept-Encoding: br` | `Content-Encoding: br`, decompresses to correct HTML |
-| `Accept-Encoding: gzip` | `Content-Encoding: gzip` |
-| No `Accept-Encoding` | Identity |
-
-**Table 13: m6-html L7, compression.**
-Brotli is preferred when offered, and no header means identity.
-
-L8 is integration: 100 concurrent requests across all routes with no errors, and a content update picked up after modifying `data/site.json` and restarting.
-Its sanitiser clause (1000 requests, SIGTERM, no leaks) **does not run anywhere.**
-
-### 5.2. m6-file
-
-m6-file's L1 is m6-html's L1, in Table 7, because start and stop behaviour is shared.
-What is specific to m6-file is Table 14 path resolution and Table 15 compression by type.
-Take from them that path resolution is the level that matters, because it is where a static file service gets exploited.
-
-| test | expected |
-|---|---|
-| Existing file | Correct bytes, correct `Content-Type` |
-| Nonexistent file | 404 |
-| `../` traversal in the URL | 404 |
-| `{relpath}` with subdirectory | Correct file |
-| Symlink pointing outside the root | 404 |
-
-**Table 14: m6-file L2, path resolution.**
-Traversal and a symlink out of the root both answer 404, so the response never says which of the two happened.
-
-| test | expected |
-|---|---|
-| `text/css` requested | Compressed, brotli or gzip per `Accept-Encoding` |
-| `image/jpeg` requested | Not compressed |
-| `font/woff2` requested | Not compressed |
-
-**Table 15: m6-file L3, compression by type.**
-Already-compressed formats are served as they are, because compressing them spends time to add bytes.
-
-L4 is `Cache-Control`, and its current behaviour is in [`m6-file.md`](m6-file.md), which is the service reference and is kept current.
-L5 is a sanitiser run that **does not run anywhere.**
-
-### 5.3. m6-http
-
-m6-http's ten levels are Table 16 start and stop, Table 17 routing, Table 18 public routes, Table 19 protected routes, Table 20 the login endpoint, Table 21 refresh and logout, Table 22 pool management, Table 23 caching, Table 24 error handling, Table 25 error modes, and Table 26 hot reload.
-Take from them that auth is the largest part of m6-http's checking, and that the first thing checked about it is that a public route runs none of it.
-
-| test | expected |
-|---|---|
-| No arguments | Exit 2 |
-| Site dir only, no system config | Exit 2, second argument required |
-| Both args, valid system config | Starts, `[server]` from system config |
-| Both args, system config has a non-`[server]` key | Warning logged, key ignored, starts |
-| `[server]` absent from `site.toml`, present in system config | Starts, validation runs after the merge |
-| `[server]` absent from both | Exit 2 |
-| System config missing or unparseable | Exit 2 |
-| `[auth]` declared, public key not found | Exit 2 |
-| `require` on a route with no `[auth]` | Exit 2 |
-| `--dump-config` | Effective merged config to stdout, exit 0 |
-| SIGTERM | Drain in-flight, exit 0 |
-| SIGTERM twice | Immediate |
-| SIGTERM during an active request | In-flight completes, then exit |
-
-**Table 16: m6-http L1, start and stop.**
-Every configuration error is exit 2 and none is a warning, because a proxy that starts with auth misconfigured is worse than one that refuses.
-
-| test | expected |
-|---|---|
-| Exact path | Correct backend |
-| Parameterised path | Correct backend |
-| No match | 404 per `[errors] mode` |
-
-**Table 17: m6-http L2, routing.**
-A miss is handled by `[errors] mode`.
-
-| test | expected |
-|---|---|
-| Public route, no *JWT* (JSON Web Token) | Forwarded, no auth check |
-| Public route, any JWT | Forwarded, no auth check |
-| Cached public route | Served from cache, zero auth code executed |
-
-**Table 18: m6-http L3, public routes, the hot path.**
-A public route runs no auth code at all, including when a token is present, and this level is verified by instrumenting the verification function and asserting a call count of zero.
-
-| test | expected |
-|---|---|
-| No token, API client | 401 |
-| No token, no refresh cookie, browser | 302 to `/login?next=<path>` |
-| No session cookie, valid refresh cookie, browser | 302 to `POST /auth/refresh`, new cookies, original path |
-| No session cookie, expired refresh cookie, browser | 302 to `/login?next=<path>` |
-| Invalid JWT, bad signature | 401 or 302 |
-| Expired JWT, no refresh cookie | 401, or 302 to login |
-| Valid JWT in `Authorization` header | Forwarded |
-| Valid JWT in session cookie | Forwarded |
-| Both header and cookie present | Header takes precedence |
-| Valid JWT, wrong group | 403 |
-| Valid JWT, correct group | Forwarded with `X-Auth-Claims` |
-| `X-Auth-Claims` content | Base64-decoded JSON matches the token claims |
-
-**Table 19: m6-http L4, protected routes.**
-An API client gets a status and a browser gets a redirect from the same failure, and a wrong group is 403 while a bad token is 401.
-
-| test | expected |
-|---|---|
-| `POST /auth/login` form, valid credentials | 302 to `next`, two HttpOnly cookies set |
-| `POST /auth/login` form, invalid credentials | 302 to `/login?error=invalid&next=<next>` |
-| `POST /auth/login` form, `next` is an external URL | 302 to `/`, `next` ignored |
-| `POST /auth/login` form, `next` absent | 302 to `/` |
-| `POST /auth/login` JSON, valid credentials | 200, JSON tokens, no cookies |
-| `POST /auth/login` JSON, invalid credentials | 401 |
-| `POST /auth/login`, rate limited | 429 with `Retry-After` |
-| `session` cookie `Path` | Sent on all requests |
-| `refresh` cookie `Path` | Sent only to `/auth/refresh` |
-
-**Table 20: m6-http L4, the login endpoint.**
-A form login answers with cookies and a JSON login with tokens. An external `next` is dropped, which is what stops a login link becoming an open redirect.
-
-| test | expected |
-|---|---|
-| `POST /auth/refresh`, valid refresh cookie | 302 to `Referer`, new session cookie |
-| `POST /auth/refresh`, expired refresh cookie | 302 to `/login` |
-| `POST /auth/refresh` JSON, valid token | 200, new access token |
-| `POST /auth/refresh` JSON, expired token | 401 |
-| `POST /auth/logout` form | 302 to `/`, both cookies cleared with `Max-Age=0` |
-| `POST /auth/logout` API | 204, refresh token revoked |
-
-**Table 21: m6-http L4, refresh and logout.**
-Logout revokes the refresh token, so a copied token stops working too.
-
-| test | expected |
-|---|---|
-| Socket appears matching the glob | Added to the pool, requests routed to it |
-| Socket disappears | Removed from the pool |
-| All sockets gone | 503 per `[errors] mode` |
-| One socket fails, others healthy | Traffic shifts to the healthy sockets |
-| Failed socket retried after backoff | Rejoins the pool when available |
-
-**Table 22: m6-http L5, pool management.**
-A backend joins and leaves by its socket appearing and disappearing, with no restart and no registration step.
-
-| test | expected |
-|---|---|
-| `Cache-Control: public` | Cached |
-| `Cache-Control: no-store` | Not cached |
-| Cache key is (path, encoding) | `br` and `gzip` are separate entries |
-| Query strings stripped | `?a=1` and `?a=2` share a cache key |
-| No eager pre-fetch | One request makes one cache entry |
-
-**Table 23: m6-http L6, caching.**
-The backend decides cacheability and m6-http decides the key, and the key is the path and the encoding only.
-
-| test | expected |
-|---|---|
-| Backend returns 404 | Fetches `/_errors?status=404&from=/original-path`, returns 404 and HTML |
-| Backend returns 500 | Fetches `/_errors?status=500&from=/original-path`, returns 500 and HTML |
-| No `[errors] path` configured | Returns status per `[errors] mode` |
-| The error page fetch itself fails | Falls back to `[errors] mode`, no loop |
-| Request already to the error path | Returns status per `[errors] mode`, no recursion |
-| Pool unreachable | 503 per `[errors] mode` |
-
-**Table 24: m6-http L7, error handling.**
-An error page is fetched like any other page, and every way that fetch can fail ends at `[errors] mode`.
-
-| mode | response when the pool is unreachable |
-|---|---|
-| `"status"` | 503, empty body |
-| `"internal"` | 503, m6-http's own minimal HTML |
-| `"custom"` | 503, error page fetched from `[errors] path` |
-
-**Table 25: m6-http L8, `[errors] mode`.**
-The three modes trade a dependency for a better page, and `"status"` is the one that depends on nothing.
-
-| change | expected |
-|---|---|
-| `site.toml` modified | Route table updated, no restart |
-| TLS certificate modified | Context reloaded |
-| Data file modified | Affected cache entries evicted |
-| New socket appears | Added to the pool, no restart |
-
-**Table 26: m6-http L9, hot reload.**
-Config, certificates, data and backends all change without a restart, which is what makes a certificate renewal invisible to traffic.
-
-L10 is load: 1000 concurrent requests over mixed routes and mixed auth, SIGTERM mid-load, no deadlocks, and the pool reflecting socket state throughout.
-Its no-leaks clause **does not run anywhere.**
-
-### 5.4. m6-auth-server
-
-Four of m6-auth-server's six levels are Table 27 start and stop, Table 28 login, Table 29 token refresh, and Table 30 verification.
-Take from them that verification is checked on m6-http's side, because that is where it happens.
-
-| test | expected |
-|---|---|
-| Valid config | Starts, socket appears |
-| Missing private key | Exit 2 |
-| Missing database directory | Exit 2, or create |
-| SIGTERM | Exit 0 |
-
-**Table 27: m6-auth-server L1, start and stop.**
-A missing key is a refusal to start, in keeping with Table 16.
-
-| test | expected |
-|---|---|
-| Correct credentials | 200, access and refresh tokens in the JSON body |
-| Correct credentials | `Set-Cookie: session=<jwt>`, HttpOnly, Secure, SameSite=Strict |
-| Wrong password | 401, no cookie set |
-| Unknown user | 401, the same response as a wrong password |
-| 6th attempt within 15 minutes | 429 with `Retry-After` |
-| After the rate-limit window | Login succeeds again |
-
-**Table 28: m6-auth-server L2, login.**
-An unknown user and a wrong password give the same answer, so the endpoint does not confirm which accounts exist.
-
-| test | expected |
-|---|---|
-| Valid refresh token | 200, new access token |
-| Expired refresh token | 401 |
-| Invalid token | 401 |
-| After logout | 401, revoked |
-
-**Table 29: m6-auth-server L3, token refresh.**
-Revocation is checked at refresh, which is what bounds how long a stolen refresh token is worth anything.
-
-| test | expected |
-|---|---|
-| Token signed with the correct key | Verified locally |
-| Token signed with the wrong key | 401 |
-| Token `exp` in the past | 401 |
-| Token `iss` mismatch | 401 |
-| Token groups match `require` | Forwarded |
-| Token groups do not match | 403 |
-
-**Table 30: m6-auth-server L4, JWT verification, done in m6-http.**
-Verification is local to m6-http and makes no call to m6-auth-server, so a protected route costs one signature check.
-
-L5 is user and group management.
-Every endpoint needs a `role:admin` token and answers 403 without one.
-A created user exists, a new group membership appears in the next login token, a deleted user cannot log in, and a deleted group removes its memberships.
-
-L6 is key rotation.
-A token issued under key A stays valid until it expires after a rotation to key B.
-A token under key B is accepted at once, and a token under neither is rejected.
+Until then, Table 6 is the answer to what checks m6: the suites, and the code in them.
 
 ## 6. End to end
 
@@ -539,10 +238,10 @@ Two gaps are open, and neither is a documentation problem:
 
 - **No sanitiser and no fuzzing**, anywhere in `check.sh`, `tools/build-host-tests.sh` or CI, in a codebase that hand-writes three protocol parsers.
   Issue #164.
-- **The lists in section 5 have never been checked against the suites** in Table 6.
-  Issue #165.
+- **The per-service behaviour lists are issue #165**, because no row had been checked
+  against the suites in Table 6 and at least four were wrong.
 
-Table 31 gives the documents that own what this one leaves out.
+Table 7 gives the documents that own what this one leaves out.
 Take from it that every number omitted here has a file responsible for it.
 
 | document | covers |
@@ -553,5 +252,5 @@ Take from it that every number omitted here has a file responsible for it.
 | [`../CONTRIBUTING.md`](../CONTRIBUTING.md) | what has to pass before a change merges |
 | [`m6-user-guide.md`](m6-user-guide.md) | the eleven examples, including example 05's end-to-end suite |
 
-**Table 31: further reading, and what each document covers.**
+**Table 7: further reading, and what each document covers.**
 The first two are the files a conformance or performance claim has to be checked against.
