@@ -61,3 +61,40 @@ rust-version = "1.88"
 license      = "BSD-3-Clause"
 authors      = ["Matthew P. Grosvenor"]
 repository   = "https://github.com/mgrosvenor/m6"
+
+# ── Release profile ─────────────────────────────────────────────────────────
+#
+# This section did not exist until 2026-09-27, so every release ever built took
+# cargo's defaults: opt-level 3 and no debug assertions, which is a real release
+# build, with lto off, codegen-units at 16, symbols kept and overflow checks off.
+#
+# WHY IT MATTERS HERE MORE THAN MOST. m6-file's dependency graph is 222 crates
+# and m6-http's is 285. With lto off, nothing is eliminated across a crate
+# boundary, so each binary carries code no path reaches. The binaries were 25 to
+# 29 MB, and a node runs five m6 services plus a site's renderers at once. That
+# is resident memory and instruction cache the request path is competing with.
+#
+# `cargo install --git` uses THIS file's profile, not the installing
+# repository's, which is how the deployment repository ended up with the full
+# profile for its three renderers while the seven m6 binaries had none.
+[profile.release]
+opt-level     = 3          # cargo's default, written down so it cannot drift
+lto           = "fat"      # across all 222 crates, not just within one
+codegen-units = 1          # 16 splits the crate and blocks inlining across the splits
+strip         = "symbols"  # 3.6 MB per binary, measured
+panic         = "abort"    # no unwind tables. `catch_unwind` here is #[cfg(test)] only
+
+# OVERFLOW CHECKS ARE ON IN RELEASE, deliberately, at a few percent.
+#
+# Owner's decision, 2026-09-27: "Why use rust without them?"
+#
+# The argument is in CHANGELOG.md under F-005. An external report described
+# unbounded HTTP/2 flow-control arithmetic as "wraps and stalls". Its proof of
+# concept did not wrap, it PANICKED, because the unchecked `+=` on an `i32` is
+# checked in a debug build. Release wrapped silently, and nothing detected it.
+#
+# Every integer in this workspace that a peer can influence sits in a
+# hand-written protocol parser: window sizes, frame lengths, header list sizes,
+# stream identifiers. A wrap there is a security bug that presents as a stall.
+# An abort is a denial of service on one connection and is visible.
+overflow-checks = true

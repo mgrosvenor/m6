@@ -33,16 +33,16 @@ actually opened the files:
       mattered, how it was verified
 - [ ] every document that makes a CURRENT-STATE claim still holds. The ones that
       do: `README.md` (what m6 is and does), `CONTRIBUTING.md` (the gates),
-      `docs/H2-PLAN.md` (the conformance status line),
-      `docs/PERFORMANCE.md` (the numbers), `docs/LESSONS.md`
+      `tools/conformance-scores.txt` (the conformance floors and the h3 argument),
+      `docs/PERFORMANCE.md` (the numbers)
 - [ ] no document tells a reader to run something that no longer exists
 
 CI checks the changelog entry and that the version is untagged. It cannot check
 freshness, which is why these are here: a checkbox read while you know the answer
 is the only mechanism that has ever worked on this.
 
-Why it is asked at all: on 2026-09-26 a sweep found `docs/H2-PLAN.md` leading
-with h3spec 37/49 thirteen days after it became 47/49, `CONTRIBUTING.md`
+Why it is asked at all: on 2026-09-26 a sweep found the since-retired
+`docs/H2-PLAN.md` leading with h3spec 37/49 thirteen days after it became 47/49, `CONTRIBUTING.md`
 describing a clippy ceiling removed on 2026-09-13, and `README.md` saying a
 decision "gates a 1.0 release" twelve days after 1.0 was cut.
 
