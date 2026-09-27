@@ -736,6 +736,7 @@ All detailed documentation lives in [`docs/`](docs/):
 | [`docs/m6-render.md`](docs/m6-render.md) | m6-render custom renderer guide |
 | [`docs/m6-render-lib.md`](docs/m6-render-lib.md) | m6-render library API |
 | [`docs/m6-md.md`](docs/m6-md.md) | m6-md Markdown processor |
+| [`docs/m6-testing.md`](docs/m6-testing.md) | What checks m6, how to run it, and the h2spec and h3spec procedure |
 | [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) | Raw benchmark numbers |
 | [`docs/POSITIONING.md`](docs/POSITIONING.md) | Competitive analysis |
 

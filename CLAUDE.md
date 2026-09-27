@@ -186,6 +186,15 @@ before the others and R10 overrules all of them.
 | R9, document framing | The document opens and closes with framing sections |
 | R10, clarity overrules all | Any rule may be broken where following it would reduce clarity. Deliberately, and rarely |
 
+**When a document is rewritten, applying R0 to R10 IS the job.** The ruleset is not a
+style laid over a content edit at the end. A rewrite that corrects facts, adds
+sections and leaves half the rules unapplied has not been done, however accurate it
+reads. Apply them from the first line written.
+
+**"Shorter" is not the test of compliance.** R0 says cut and R1 says number, caption
+and reference every table, and on a table-heavy page R1 costs more lines than R0 saves.
+Judge a rewrite rule by rule, not by line count.
+
 **Four habits the rules do not state, and they matter as much:**
 
 - **Forward signposting.** Say what comes next. "We begin by ... We then ..."

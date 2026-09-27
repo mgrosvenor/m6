@@ -46,6 +46,10 @@ CI runs them on the pull request, and again on the push to `main` or `develop`
 that merges it, and on a release tag. `tools/build-host-tests.sh` runs the same
 ground plus the performance check, which a shared runner cannot measure.
 
+[`docs/m6-testing.md`](docs/m6-testing.md) covers what each check proves and how
+to run it, including the procedure for running h2spec or h3spec by hand and the
+five traps that come with it.
+
 ### A release also has to be documented, and that is enforced
 
 A pull request into `main` **is** the release, and two more checks apply to it:
