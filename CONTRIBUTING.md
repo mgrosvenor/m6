@@ -53,9 +53,9 @@ A pull request into `main` **is** the release, and two more checks apply to it:
 - `CHANGELOG.md` has a `## <version>` section: what changed, why it mattered, and how it
   was verified.
 - m6's own documents still hold. The ones making current-state claims are
-  `README.md`, this file, `docs/H2-PLAN.md`, `docs/PERFORMANCE.md` and
-  `docs/LESSONS.md`. The release checklist in the pull request template asks for
-  this, because freshness is judgement and CI cannot decide it.
+  `README.md`, this file, `docs/PERFORMANCE.md` and
+  `tools/conformance-scores.txt`. The release checklist in the pull request template
+  asks for this, because freshness is judgement and CI cannot decide it.
 
   This was a check on `HANDOVER.md` until 2026-09-26, requiring it to mention the
   version. That file states which of one particular deployment's boxes runs what,

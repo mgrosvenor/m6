@@ -143,7 +143,7 @@ Run it before opening the pull request when the change could touch either.
 checks that uses m6's interfaces, and until 2026-09-14 nothing built it: it had
 stopped compiling entirely, and five more defects were sitting underneath that
 where nobody could see them. A change to m6 lands with the examples building, or
-it does not land. See `docs/LESSONS.md` lesson 41.
+it does not land.
 
 ### Why the build host and not the laptop
 
@@ -266,8 +266,6 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 | `README.md` | what m6 is, what it does, and how to run one |
 | `docs/m6-core-reference.md` | every core module and its interface |
 | `docs/PERFORMANCE.md` | every performance number, how it was measured, on what |
-| `docs/LESSONS.md` | the things that cost something to learn |
-| `docs/H2-PLAN.md` | HTTP/2 and HTTP/3: the conformance status, then the phase history |
 | `tools/conformance-scores.txt` | the floors, and the whole argument behind the h3 number |
 
 ### The working documents are not here, deliberately
