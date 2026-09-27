@@ -12,6 +12,109 @@ releases only; work happens on `develop`. See `CONTRIBUTING.md`.
 
 ---
 
+## 1.12.0 — 2026-09-27
+
+**m6 had no release profile, and now it has one.** Every release before this took
+cargo's defaults. That is a genuine optimised build, opt-level 3 with debug assertions
+off, and it left LTO off, codegen-units at 16, symbols unstripped and **overflow checks
+disabled**.
+
+Turning them on made the binaries smaller and the hot paths faster at the same time.
+
+### Changed
+
+**`[profile.release]` in `Cargo.toml`:** `lto = "fat"`, `codegen-units = 1`,
+`strip = "symbols"`, `panic = "abort"`, and `overflow-checks = true`.
+
+`cargo install --git` uses the installed crate's own profile, so a deployment cannot
+supply this from outside. That is why it went unnoticed: a deployment repository had the
+full profile for its own binaries while every m6 binary it installed had none.
+
+| binary | before | after |
+|---|---|---|
+| m6-http | 11.14 MB | **7.08 MB, -36.5%** |
+| m6-md | 6.59 MB | 3.85 MB, -41.6% |
+| m6-monitor | 33.11 MB | 25.17 MB, -24.0% |
+| m6-file | 30.08 MB | 23.20 MB, -22.9% |
+| m6-html | 30.00 MB | 23.16 MB, -22.8% |
+| m6-auth-server | 33.46 MB | 25.94 MB, -22.5% |
+
+Binary size is a latency property here. A node runs five m6 services at once, and 30 MB
+of text per service is resident memory and instruction cache the request path competes
+with. m6-http, which is in every request path, lost 36.5%.
+
+| recorded path | before | after |
+|---|---|---|
+| `render:minimal` | 201827 ns | **174101 ns, -13.7%** |
+| `render:blog-index` | 1784823 ns | **1454253 ns, -18.5%** |
+
+Both figures are medians over six runs on a quiet 2-core Linux build host, and both
+recorded minimums in `tools/perf-baseline.txt` moved down with the argument beside them.
+
+**Overflow checks are on in release**, at a few percent that the LTO gain more than
+covers. `CHANGELOG.md`'s F-005 entry is the reason: an external report described the
+HTTP/2 flow-control arithmetic as "wraps and stalls", and its proof of concept panicked
+instead, because an unchecked `+=` on an `i32` is checked in a debug build and not in a
+release one. Every integer a peer can influence in this workspace sits in a hand-written
+protocol parser: window sizes, frame lengths, header list sizes, stream identifiers. A
+wrap there is a security defect that presents as a stall. An abort is one visible
+connection failure.
+
+### Fixed
+
+**`check.sh` said "All checks passed." for a run that tested neither HTTP/2 nor
+HTTP/3.** `tools/conformance.sh` prints "INCOMPLETE, NOT TESTED" and "do not read it as a
+pass", then exits 0, because with `--allow-missing-tools` nothing regressed: it never
+ran. `check.sh` tested only the exit code. Its own comment claimed the summary "refuses
+to say pass", which it did not. The run now ends on "Checks INCOMPLETE: conformance did
+not run in full. This run is not a gate."
+
+**The benchmark comparison aged silently.** `target/criterion` is untracked and
+`cargo clean` erases it. One baseline was found six months old while `check.sh`'s header
+told a reader to investigate any change over 30%, and a documentation-only change printed
++562% against it. The baseline's age is printed on every run, and past 14 days the
+comparison is dropped.
+
+**`tools/perfcheck.sh` took the minimum while its own header said median.** That
+paragraph had claimed "WHY MEDIAN OF SEVERAL ROUNDS" since it was written. The minimum is
+the best reading a machine ever managed and no request costs that. It takes the median
+now, `--runs N` sets the round count, and every reading is kept.
+
+**`tools/build-host-tests.sh` reported the wrong disk.** Its debug-cache check looked at a
+hardcoded path, so a run with `M6_BUILD_ROOT` set elsewhere reported "0 tree(s)" while
+gigabytes sat in the tree it had just built, and its arithmetic summed `du -sh` strings
+like "9.9G" and then discarded the total.
+
+### Added
+
+**`tools/perf-history.jsonl`**, one JSON record per performance run, in git: the commit,
+the toolchain, the CPU model, physical core count, OS, architecture, total memory, the
+load average before **and** after, and per target the median, every raw reading, the
+minimum, the maximum and the spread. A number without the conditions it was taken under
+cannot be compared with anything later. One record showed a 40.9% spread on an idle
+machine, which is why a single reading settles nothing.
+
+It carries no hostname, address or domain.
+
+**`docs/m6-testing.md`**, rewritten: what checks m6, the commands, the shared test
+harness, and the h2spec and h3spec procedure with its five traps. Four of those traps
+report a conformance failure that is not there, and two of them were not written down
+anywhere before.
+
+**A documentation ruleset, R0 to R10**, stated in `CLAUDE.md` so a contributor who cannot
+read a private skill still has it. `docs/m6-site-layout.md` and `docs/m6-file.md` are
+written to it, the latter having been missing entirely.
+
+### Verified
+
+`tools/build-host-tests.sh` on a Linux build host, with the profile in place: 1146 tests
+passed and 0 failed, zero warnings in release and test builds, clippy silent, cargo-deny
+clean, h1spec 32/32 on all four targets, h2spec 146/146, h3spec 47/49, TLS resumption
+green on all three protocols, performance within margin, the examples 58 passed with
+every config parsing, and example 05's end-to-end suite 98 passed over the running stack.
+
+---
+
 ## 1.11.3 — 2026-09-26
 
 **m6 is a generic web hosting engine, and this release is what makes the repository

@@ -51,6 +51,16 @@ CRITERION_BENCHES=(
 # ── Colours ───────────────────────────────────────────────────────────────────
 GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; RESET='\033[0m'
 pass() { echo -e "${GREEN}PASS${RESET} $1"; }
+# The last line a reader sees, and the one that used to lie. m6 #166.
+summary() {
+  echo ""
+  if [[ -n "${INCOMPLETE:-}" ]]; then
+    echo -e "${YELLOW}Checks INCOMPLETE: ${INCOMPLETE} did not run in full.${RESET}"
+    echo -e "${YELLOW}This run is not a gate. tools/build-host-tests.sh is.${RESET}"
+  else
+    echo -e "${GREEN}All checks passed.${RESET}"
+  fi
+}
 fail() { echo -e "${RED}FAIL${RESET} $1"; exit 1; }
 info() { echo -e "${YELLOW}----${RESET} $1"; }
 warn() { echo -e "${YELLOW}WARN${RESET} $1"; }
@@ -96,9 +106,15 @@ fi
 # never applied to the other implementation, because nothing measured it.
 #
 # `--allow-missing-tools` is for THIS gate only, and it is not a pass: an
-# absent tester is reported in red as NOT TESTED, and the summary refuses to
-# say "pass". A laptop without h2spec still gets the h1 gate, and the run says
-# plainly what it did not do.
+# absent tester is reported as NOT TESTED, and the summary says "Checks
+# INCOMPLETE" rather than "All checks passed". A laptop without h2spec still gets
+# the h1 gate, and the run says plainly what it did not do.
+#
+# THAT SECOND SENTENCE WAS FALSE UNTIL 2026-09-27. It claimed the summary refused
+# to say pass while the code printed PASS and then "All checks passed." on a run
+# that tested neither h2 nor h3. m6 #166. A comment describing an intention next
+# to code doing something else is read as the code, which is the third time this
+# repository has paid for that shape.
 #
 # The full checks (`tools/build-host-tests.sh`, on the Linux build host where both
 # testers are installed) runs WITHOUT the flag, so the path to a deploy cannot
@@ -112,18 +128,37 @@ else
   cargo fmt --all --check 2>&1 | head -20
 fi
 
+# A SKIPPED TESTER MUST NOT BECOME "All checks passed." -- m6 #166.
+#
+# tools/conformance.sh prints "INCOMPLETE, NOT TESTED" and "do not read it as a
+# pass", then exits 0, because with --allow-missing-tools nothing regressed: it
+# just never ran. This block used to test only the exit code, print PASS, and let
+# the script end on "All checks passed." having tested neither h2 nor h3. The
+# comment above claimed the summary "refuses to say pass". It did not.
+#
+# Now the skip is carried to the end of the run in INCOMPLETE and the summary says
+# so. The exit code stays 0 on a laptop, deliberately: a developer's run is still
+# useful and still not a gate.
+INCOMPLETE=""
 info "Running conformance (h1spec / h2spec / h3spec)..."
-if ./tools/conformance.sh --allow-missing-tools 2>&1; then
-  pass "Conformance (nothing went backwards)"
+CONF_OUT="$(mktemp)"
+if ./tools/conformance.sh --allow-missing-tools 2>&1 | tee "$CONF_OUT"; then
+  if grep -q 'NOT TESTED' "$CONF_OUT"; then
+    NOT_TESTED="$(grep -o 'NOT TESTED:.*' "$CONF_OUT" | tail -1)"
+    warn "Conformance INCOMPLETE — ${NOT_TESTED:-a tester was absent}"
+    INCOMPLETE="conformance"
+  else
+    pass "Conformance (every target measured, nothing went backwards)"
+  fi
 else
   fail "Conformance regressed — see above, and tools/conformance-scores.txt"
 fi
+rm -f "$CONF_OUT"
 
 # ── 5. Performance (informational) ────────────────────────────────────────────
 if [[ "$RUN_BENCH" == "false" ]]; then
   info "Skipping benchmarks (--no-bench)"
-  echo ""
-  echo -e "${GREEN}All checks passed.${RESET}"
+  summary
   exit 0
 fi
 
@@ -141,9 +176,30 @@ fi
 
 info "Running benchmarks (informational — will not block push)..."
 
+# THE BASELINE'S AGE IS PRINTED, OR THE BASELINE IS NOT USED -- m6 #167.
+#
+# target/criterion is untracked and `cargo clean` erases it, so this comparison
+# silently ages. One was found six months old, and check.sh's header tells a
+# reader to investigate any change over 30%: a documentation-only change printed
+# +562% against it. A percentage against an undated artefact is worse than no
+# percentage.
+#
+# Over CRITERION_BASELINE_MAX_DAYS the comparison is dropped rather than shown,
+# because a stale number invites exactly the investigation it cannot support.
+CRITERION_BASELINE_MAX_DAYS="${CRITERION_BASELINE_MAX_DAYS:-14}"
 BASELINE_DIR="target/criterion/$BASELINE_NAME"
 if [[ -d "$BASELINE_DIR" ]]; then
-  BENCH_ARGS="-- --baseline $BASELINE_NAME"
+  # stat differs between GNU and BSD, so try both and fall back to using it.
+  BASE_EPOCH="$(stat -c %Y "$BASELINE_DIR" 2>/dev/null || stat -f %m "$BASELINE_DIR" 2>/dev/null || echo 0)"
+  BASE_DAYS=$(( ( $(date +%s) - BASE_EPOCH ) / 86400 ))
+  if (( BASE_EPOCH > 0 && BASE_DAYS > CRITERION_BASELINE_MAX_DAYS )); then
+    warn "criterion baseline '$BASELINE_NAME' is ${BASE_DAYS} days old — NOT comparing against it"
+    info "  it lives in target/criterion, which is untracked. Re-take it with --save-baseline"
+    BENCH_ARGS=""
+  else
+    info "comparing against criterion baseline '$BASELINE_NAME', ${BASE_DAYS} days old"
+    BENCH_ARGS="-- --baseline $BASELINE_NAME"
+  fi
 else
   info "No baseline yet — run './check.sh --save-baseline' to create one"
   BENCH_ARGS=""
@@ -163,5 +219,4 @@ fi
 
 rm -f "$BENCH_OUT"
 
-echo ""
-echo -e "${GREEN}All checks passed.${RESET}"
+summary
