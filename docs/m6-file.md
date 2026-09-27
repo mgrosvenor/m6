@@ -3,7 +3,7 @@
 m6-file serves files from disk.
 It is an *App* (a service built on m6-core's application framework) with one handler, registered under the name `files`.
 Every route it answers comes from its own config, not from m6-http's.
-That last point causes most m6-file problems, and until now it was readable only in the source.
+Until now that was readable only in the source.
 This document covers its two route tables, how it resolves a path, what its handler owns, and how to configure it.
 
 ## Contents
@@ -23,12 +23,16 @@ m6-http decides which backend gets the request.
 m6-file then decides which file to return.
 Neither reads the other's table, which is why a file needs an entry in both.
 
+Figure 1 shows the two hops and which config governs each.
+
 ```
 client ──► m6-http ──► m6-file ──► disk
            site.toml   m6-file.conf
            which       which
            backend     file
 ```
+
+**Figure 1: a static file request crosses two processes.** m6-http matches `site.toml` to pick a backend. m6-file then matches `m6-file.conf` to pick a file.
 
 The rest of this document is about that split and its consequences.
 
@@ -38,10 +42,14 @@ A static file needs a route in both configs, and each config answers a different
 Omit the m6-http half and nothing is forwarded.
 Omit the m6-file half and every request returns 404, with neither log saying which half is wrong.
 
+Table 1 names the two configs and what each one decides.
+
 | config | whose | decides |
 |---|---|---|
 | `site.toml` | m6-http | which backend receives the request |
 | `m6-file.conf` | m6-file | which file is returned |
+
+**Table 1: the two route tables serving one static file request.** Each config answers a different question, and neither process reads the other's table.
 
 A minimal pair looks like this.
 
@@ -66,11 +74,15 @@ With both in place, the request reaches m6-file and m6-file knows what to open.
 
 m6-file builds a filesystem path from three parts, and none of them is the *URL* (Uniform Resource Locator) directly.
 
+Table 2 lists the three parts and their sources.
+
 | part | comes from |
 |---|---|
 | m6-file's own root | the first argument the process was started with |
 | the route's `root` | `m6-file.conf` |
 | `relpath` or `filename` | the matched route parameter |
+
+**Table 2: the three inputs to a resolved filesystem path.** None of the three is the request URL.
 
 The three are joined in that order.
 
@@ -91,7 +103,7 @@ The next subsection covers when it does.
 
 ### 3.1. The wildcard is explicit
 
-`{*relpath}` spans several path segments.
+`{*relpath}` spans more than one path segment.
 A bare trailing `{relpath}` does not, because m6-core does not make the last parameter implicitly greedy.
 Making it greedy would silently change the meaning of every route already written.
 
@@ -104,7 +116,7 @@ What m6-file then does with that file is the subject of the next section.
 
 ## 4. What the handler owns
 
-m6-file builds its own representation of a response, which is unusual and worth knowing.
+m6-file builds its own representation of a response.
 It negotiates the content coding, compresses, and constructs an *ETag* (Entity Tag, a cache validator) naming the result.
 Every response it returns is final, and m6-core's pipeline leaves it alone.
 Letting m6-core compress afterwards would put Brotli bytes on the wire under a tag asserting identity encoding.
@@ -118,10 +130,14 @@ Two consequences follow:
 
 m6-file sets `Cache-Control` itself, from the query string alone.
 
+Table 3 gives the header for each case.
+
 | request | header |
 |---|---|
 | `?v=<hash>` present | `public, max-age=31536000, immutable` |
 | anything else | `public, max-age=60, s-maxage=86400, stale-while-revalidate=60` |
+
+**Table 3: `Cache-Control` by request, decided from the query string alone.** A versioned request is pinned for a year. Everything else is held for 60 seconds by browsers and 86400 seconds by shared caches.
 
 A `?v=` URL addresses one exact version, because changed bytes mean a changed hash and so a different URL.
 That is what makes a year and `immutable` safe, and it also stops a browser revalidating on reload.
@@ -133,11 +149,15 @@ For everything else the two audiences are split deliberately:
 
 No route can currently override this, and three things that look like they would do not work:
 
+Table 4 lists the three attempts and why each fails.
+
 | attempt | result |
 |---|---|
 | `cache` on the m6-file route | not read for this |
 | `cache` on a `[[route_group]]` in `site.toml` | ignored, with a warning |
 | `headers` on the route | appended, so two `Cache-Control` headers |
+
+**Table 4: three ways to override `Cache-Control` per route, none of which work.** The handler computes the header itself, and no route input reaches that decision.
 
 That gap matters for anything short-lived served from disk, such as a one-time download or an *ACME* (Automatic Certificate Management Environment) challenge token.
 It is tracked as issue #126.
@@ -171,7 +191,7 @@ root    = "assets/"
 
 Three facts about that config:
 
-- the pool defaults to the *CPU* (Central Processing Unit) count, which a page firing dozens of concurrent image requests exhausts easily, surfacing as "pool empty" backend errors.
+- the pool defaults to the *CPU* (Central Processing Unit) count. A page requesting more assets at once than the pool has threads queues the surplus, which surfaces as "pool empty" backend errors.
 - a route naming a handler the binary does not have is fatal, so the service exits 2 at startup and a reload is refused with the previous routes left serving.
 - routes are rebuilt on every config reload, so an asset tree can be added without a restart.
 
@@ -194,3 +214,5 @@ Related reading:
 | [`m6-site-layout.md`](m6-site-layout.md) | where m6-file's root belongs relative to other apps |
 | [`m6-site-toml.md`](m6-site-toml.md) | m6-http's route table, including `[[route_group]]` |
 | [`m6-app-anatomy.md`](m6-app-anatomy.md) | writing an App of your own |
+
+**Table 5: further reading, and what each document covers.**
