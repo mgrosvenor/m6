@@ -555,16 +555,26 @@ fi
 # Reported rather than deleted. This script is a GATE, and a gate that quietly
 # removes 65G of build cache makes the next run slow for reasons the operator did
 # not choose. The number and the command are enough.
+# TWO BUGS FIXED HERE ON 2026-09-27, both found by reading the output against the
+# box. This block looked at a HARDCODED /root/build, so a run with M6_BUILD_ROOT
+# set elsewhere reported "debug caches in 0 tree(s)" while 12 GB sat in the tree
+# it had just built. And its awk summed `du -sh` output, which is strings like
+# "9.9G", then printed only the count and never used the total.
+#
+# It reports $BUILD_ROOT now, and it reports the SIZE in megabytes, which is a
+# number that can be compared with the next run's.
 # shellcheck disable=SC2086
 DISK="$(ssh $SSH_OPTS "$BUILD_HOST" "df -h / | awk 'NR==2 {print \$5\" of \"\$2\" used\"}'" 2>/dev/null)"
 # shellcheck disable=SC2086
-DEBUG_SZ="$(ssh $SSH_OPTS "$BUILD_HOST" "du -sh /root/build/*/target/debug 2>/dev/null | awk '{s+=\$1} END {print NR\" tree(s)\"}'" 2>/dev/null)"
+DEBUG_SZ="$(ssh $SSH_OPTS "$BUILD_HOST" \
+    "du -sm $BUILD_ROOT/*/target/debug 2>/dev/null | awk '{s+=\$1; n++} END {if (n) printf \"%d tree(s), %.1f GB\", n, s/1024}'" \
+    2>/dev/null)"
 echo
-echo "   build host disk: ${DISK:-unknown}${DEBUG_SZ:+, debug caches in $DEBUG_SZ}"
+echo "   build host disk: ${DISK:-unknown}${DEBUG_SZ:+, debug caches: $DEBUG_SZ}"
 case "${DISK%% *}" in
     8[0-9]%|9[0-9]%|100%)
-        echo "${YELLOW}   above 80%. Reclaim the debug caches, which deploys do not use:${RESET}"
-        echo "${YELLOW}     ssh $SSH_OPTS $BUILD_HOST 'rm -rf /root/build/*/target/debug'${RESET}" ;;
+        echo "${YELLOW}   above 80%. Reclaim the debug caches, which no deploy reads:${RESET}"
+        echo "${YELLOW}     ssh $SSH_OPTS $BUILD_HOST 'rm -rf $BUILD_ROOT/*/target/debug'${RESET}" ;;
 esac
 
 if [[ $FAILED -eq 0 ]]; then
