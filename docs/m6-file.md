@@ -23,7 +23,7 @@ m6-http decides which backend gets the request.
 m6-file then decides which file to return.
 Neither reads the other's table, which is why a file needs an entry in both.
 
-Figure 1 shows the two hops and which config governs each.
+Figure 1 shows the two hops a request makes and which config governs each. Take from it that one file needs a route in both.
 
 ```
 client ──► m6-http ──► m6-file ──► disk
@@ -42,7 +42,7 @@ A static file needs a route in both configs, and each config answers a different
 Omit the m6-http half and nothing is forwarded.
 Omit the m6-file half and every request returns 404, with neither log saying which half is wrong.
 
-Table 1 names the two configs and what each one decides.
+Table 1 names the two configs and what each decides. Take from it that omitting either one breaks the request.
 
 | config | whose | decides |
 |---|---|---|
@@ -74,7 +74,7 @@ With both in place, the request reaches m6-file and m6-file knows what to open.
 
 m6-file builds a filesystem path from three parts, and none of them is the *URL* (Uniform Resource Locator) directly.
 
-Table 2 lists the three parts and their sources.
+Table 2 lists the three parts of a resolved path and where each comes from. Take from it that the request URL is not one of them.
 
 | part | comes from |
 |---|---|
@@ -130,7 +130,7 @@ Two consequences follow:
 
 m6-file sets `Cache-Control` itself, from the query string alone.
 
-Table 3 gives the header for each case.
+Table 3 gives the header for each case. Take from it that a versioned request is pinned for a year and everything else is not.
 
 | request | header |
 |---|---|
@@ -149,7 +149,7 @@ For everything else the two audiences are split deliberately:
 
 No route can currently override this, and three things that look like they would do not work:
 
-Table 4 lists the three attempts and why each fails.
+Table 4 lists the three ways to override the header and why each fails. Take from it that no route input reaches the decision.
 
 | attempt | result |
 |---|---|

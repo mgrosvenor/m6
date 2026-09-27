@@ -17,7 +17,7 @@ We then show why one shared root is wrong, why m6-http is the exception, and the
 ## 1. The layout
 
 Every app gets its own directory under `apps/`, and nothing else.
-Figure 1 gives the whole scheme.
+Figure 1 gives the whole scheme. Take from it that no app root contains another app root.
 
 ```
 <site>/                 m6-http's root: the whole site
@@ -125,7 +125,7 @@ handler = "files"
 root    = "assets/"
 ```
 
-Table 1 separates the two failure modes.
+Table 1 separates the two failure modes. Take from it that a wrong glob and a wrong `root` need different fixes.
 
 | mistake | result |
 |---|---|
@@ -151,7 +151,7 @@ That difference decides whether the cache can be warmed.
 `is_warmable` skips any route whose path contains `{`, naming `/assets/{*relpath}` as its example, because a pattern is not a *URL* (Uniform Resource Locator) and there is nothing to fetch.
 A wildcard therefore means static assets are never pre-warmed.
 
-Table 2 gives the cost of a wildcard by deployment size.
+Table 2 gives the cost of a wildcard by deployment size. Take from it that the cost multiplies with the number of edges.
 
 | deployment | cost of a wildcard |
 |---|---|
