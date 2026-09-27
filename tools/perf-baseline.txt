@@ -10,6 +10,31 @@
 # in the commit that earned it. Recording a slower number is a decision to
 # accept a regression and has to be argued for in the commit message.
 #
+# ── 2026-09-27: both numbers moved, and why these values ─────────────────────
+#
+# The release profile landed (m6 4ce64a9: lto = "fat", codegen-units = 1,
+# strip = "symbols", panic = "abort", overflow-checks = true). m6 had no
+# [profile.release] at all before it, so every release ever built took cargo's
+# defaults.
+#
+#   render:minimal     201827 -> 166299
+#   render:blog-index 1784823 -> 1417854
+#
+# FOUR RUNS on the build host at load 0.12, five readings each, 20 readings per
+# target. Every minimum beat the old number:
+#
+#   render:minimal     157627  157481  161793  166299
+#   render:blog-index 1417854 1412852 1386017 1399216
+#
+# THESE ARE THE SLOWEST OF THE FOUR MINIMA, not the fastest. A recorded number is
+# a floor that a later run has to clear, so recording the best reading ever seen
+# makes the gate fail on a slightly busier box for no gain. The slowest minimum
+# is still 17.6% and 20.6% better than what it replaces, and it leaves the margin
+# doing its job. Run 3 read 166299 to 234618 on render:minimal inside one run on
+# an idle machine, which is the spread these numbers have to survive.
+#
+# Every reading is in tools/perf-history.jsonl with the box it came from.
+
 # docs/PERFORMANCE.md has the real production-shaped measurements and how they
 # were taken. These are here to catch a change that makes something markedly
 # slower, nothing more.
@@ -65,5 +90,5 @@
 # host's and comparing the two tells you nothing.
 #
 # target                     ns
-render:minimal              201827
-render:blog-index          1784823
+render:minimal              166299
+render:blog-index          1417854
