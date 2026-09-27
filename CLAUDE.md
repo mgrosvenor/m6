@@ -168,21 +168,23 @@ not skip, and it does not print a number it did not take. See
 
 ## Documentation style
 
-**Every document in this repository follows one ruleset, R0 to R8.** It applies to
+**Every document in this repository follows one ruleset, R0 to R10.** It applies to
 `README.md`, `CHANGELOG.md`, everything under `docs/`, and every new page. R0 comes
-before the others and R8 overrules all of them.
+before the others and R10 overrules all of them.
 
 | rule | what it asks |
 |---|---|
 | R0, less is more | Brevity first. Prefer a diagram, bullet list or table to prose. Cut padding. A reader who cannot follow us is our failure, not theirs |
-| R1, paragraph topic sentence | Every paragraph opens with what it covers and what it concludes. Destination before journey |
-| R2, sentence chaining | Every sentence links to the one before it through a shared word or idea. No link means a new paragraph |
-| R3, paragraph closing sentence | The last sentence consolidates the paragraph and hooks the next |
-| R4, sentence length and word choice | Short, plain sentences. Two short beat one long. Define acronyms in *italics* on first use and at the start of every major section |
-| R5, punctuation and formatting | `,` `()` and `:` before lists. **No semicolons and no double dashes.** Numbered headings, a table of contents past four sections, one sentence per line in Markdown |
-| R6, section framing | Every major section opens and closes with a framing paragraph |
-| R7, document framing | The document opens and closes with framing sections |
-| R8, clarity overrules all | Any rule may be broken where following it would reduce clarity. Deliberately, and rarely |
+| R1, number and caption figures | Every table, diagram and image is numbered and captioned. Each caption stands alone without the surrounding text. Every figure is referenced from the text, saying what it shows |
+| R2, paragraph topic sentence | Every paragraph opens with what it covers and what it concludes. Destination before journey |
+| R3, sentence chaining | Every sentence links to the one before it through a shared word or idea. No link means a new paragraph |
+| R4, paragraph closing sentence | The last sentence consolidates the paragraph and hooks the next |
+| R5, sentence length and word choice | Short, plain sentences. Two short beat one long. Define acronyms in *italics* on first use and at the start of every major section |
+| R6, no weasel words | Delete every weasel word, or replace it with a fact, a number or a source. "Most", "often", "almost everyone" and "easily" are claims without evidence |
+| R7, punctuation and formatting | `,` `()` and `:` before lists. **No semicolons and no double dashes.** Numbered headings, a table of contents past four sections, one sentence per line in Markdown |
+| R8, section framing | Every major section opens and closes with a framing paragraph |
+| R9, document framing | The document opens and closes with framing sections |
+| R10, clarity overrules all | Any rule may be broken where following it would reduce clarity. Deliberately, and rarely |
 
 **Four habits the rules do not state, and they matter as much:**
 
