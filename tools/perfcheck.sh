@@ -10,6 +10,16 @@
 #   tools/perfcheck.sh            # measure and compare
 #   tools/perfcheck.sh --update   # record the measured numbers as the new ones
 #   tools/perfcheck.sh --margin 15
+#   tools/perfcheck.sh --runs 9   # rounds per target, default 5, minimum wins
+#
+# EVERY RUN APPENDS ONE LINE TO tools/perf-history.jsonl, in git. A number
+# without the conditions it was taken under cannot be compared with anything
+# later, so the record carries the commit, the toolchain, the CPU model and core
+# count, the OS, total memory, and the load average BEFORE and AFTER the run. It
+# keeps every raw reading, not only the minimum, so the spread is visible.
+#
+# It carries no hostname, address or domain. What class of machine, and how busy,
+# is the question. Which machine is not.
 #
 # WHY A MARGIN. These are wall-clock numbers on a shared machine, so they move
 # a few percent between runs for reasons that have nothing to do with the code.
@@ -62,14 +72,22 @@ EXAMPLES="${PERFCHECK_EXAMPLES:-$(cd "$ROOT/.." 2>/dev/null && pwd)/m6-examples}
 SITE="${PERFCHECK_SITE:-}"
 UPDATE=false
 MARGIN=20
+RUNS=5
+HISTORY="$HERE/perf-history.jsonl"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --update) UPDATE=true; shift ;;
     --margin) MARGIN="$2"; shift 2 ;;
-    *) echo "usage: $0 [--update] [--margin PERCENT]"; exit 2 ;;
+    --runs)   RUNS="$2"; shift 2 ;;
+    *) echo "usage: $0 [--update] [--margin PERCENT] [--runs N]"; exit 2 ;;
   esac
 done
+
+if ! [[ "$RUNS" =~ ^[0-9]+$ ]] || (( RUNS < 1 )); then
+  echo "--runs takes a positive integer, got '$RUNS'" >&2
+  exit 2
+fi
 
 GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; RESET='\033[0m'
 pass() { echo -e "${GREEN}PASS${RESET} $*"; }
@@ -78,8 +96,16 @@ info() { echo -e "${YELLOW}----${RESET} $*"; }
 
 mkdir -p "$WORK"
 MEASURED="$WORK/measured.txt"
+RAW="$WORK/raw.txt"
 : > "$MEASURED"
+: > "$RAW"
 RESULT=0
+
+# The load average BEFORE anything starts, because the measurement raises it
+# itself. A reader needs what the box was already doing, not what this script
+# did to it.
+load_now() { uptime | sed 's/.*load average[s]*: *//; s/,.*//' | tr -d ' '; }
+LOAD_BEFORE="$(load_now)"
 
 PIDS=()
 cleanup() { for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done; }
@@ -157,11 +183,15 @@ measure_one() {
     return 1
   fi
 
-  local sock="$WORK/render.sock" best=""
-  # Five rounds, take the minimum. The minimum is the least contaminated by
+  local sock="$WORK/render.sock" best="" all=""
+  # $RUNS rounds, take the minimum. The minimum is the least contaminated by
   # whatever else the machine was doing, which is the question being asked:
   # what the code costs, not what the box was busy with.
-  for _ in 1 2 3 4 5; do
+  #
+  # Every reading is kept, not only the winner. A minimum alone cannot separate a
+  # run that read 157us, 158us, 159us from one that read 157us, 340us, 890us, and
+  # those two say very different things about the machine.
+  for _ in $(seq 1 "$RUNS"); do
     rm -f "$sock"
     M6_SOCKET_OVERRIDE="$sock" "$bin" "$site" "$conf" --log-level error \
       > "$WORK/render.log" 2>&1 &
@@ -180,8 +210,11 @@ measure_one() {
     wait "$pid" 2>/dev/null
     if [[ -n "$got" ]]; then
       [[ -z "$best" || "$got" -lt "$best" ]] && best="$got"
+      all="${all:+$all }$got"
     fi
   done
+  printf '%s %s\n' "$key" "$all" >> "$RAW"
+  info "$key: $RUNS rounds, ns: $all"
 
   if [[ -z "$best" ]]; then
     fail "$key — measured nothing. A check that cannot measure must fail."
@@ -202,6 +235,24 @@ else
     "$EXAMPLES/examples/01-static/configs/m6-html.conf" /
   measure_one "render:blog-index" "$EXAMPLES/examples/05-cms" \
     "$EXAMPLES/examples/05-cms/configs/m6-html.conf" /blog
+fi
+
+# ── The history record ────────────────────────────────────────────────────────
+#
+# Written on every run, pass or fail, before the verdict is printed. A run that
+# failed is exactly the run a later reader wants the conditions for.
+#
+# It never blocks the check. A gate that fails because its bookkeeping failed is
+# a gate that gets skipped, so a problem here is reported and the exit code is
+# still the measurement's.
+LOAD_AFTER="$(load_now)"
+if have python3; then
+  if python3 "$HERE/perf_history.py" "$HISTORY" "$RAW" "$BASELINE" \
+       "$MARGIN" "$RUNS" "$LOAD_BEFORE" "$LOAD_AFTER"; then
+    info "recorded in $(basename "$HISTORY"), load ${LOAD_BEFORE} before, ${LOAD_AFTER} after"
+  else
+    info "the history record failed to write. The measurement above still stands."
+  fi
 fi
 
 if [[ "$UPDATE" == "true" ]]; then
