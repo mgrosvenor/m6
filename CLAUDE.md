@@ -132,7 +132,9 @@ M6_BUILD_HOST=root@<box> ./tools/build-host-tests.sh
 | the examples build | zero warnings, clippy silent, their tests pass, every config parses | the `m6-examples` repository |
 | the examples work | example 05's end-to-end suite over the whole running stack | `examples/05-cms/test.sh` |
 
-**CI runs all of it on the pull request.** `tools/build-host-tests.sh` runs the
+**CI runs all of it on the pull request**, and on every push to `main` and
+`develop` and on release tags, so a merge and a force-push are both built.
+`tools/build-host-tests.sh` runs the
 same ground plus the two things a shared runner cannot do: the performance check,
 which needs a quiet machine, and conformance against a real h2spec/h3spec install.
 Run it before opening the pull request when the change could touch either.
@@ -141,7 +143,7 @@ Run it before opening the pull request when the change could touch either.
 checks that uses m6's interfaces, and until 2026-09-14 nothing built it: it had
 stopped compiling entirely, and five more defects were sitting underneath that
 where nobody could see them. A change to m6 lands with the examples building, or
-it does not land. See `docs/LESSONS.md` lesson 41.
+it does not land.
 
 ### Why the build host and not the laptop
 
@@ -161,6 +163,50 @@ This is the rule the conformance script broke four different ways, reporting
 success each time. If a check cannot run its measurement, it fails. It does
 not skip, and it does not print a number it did not take. See
 `tools/conformance.sh`'s header for the four cases and what each one cost.
+
+---
+
+## Documentation style
+
+**Every document in this repository follows one ruleset, R0 to R10.** It applies to
+`README.md`, `CHANGELOG.md`, everything under `docs/`, and every new page. R0 comes
+before the others and R10 overrules all of them.
+
+| rule | what it asks |
+|---|---|
+| R0, less is more | Brevity first. Prefer a diagram, bullet list or table to prose. Cut padding. A reader who cannot follow us is our failure, not theirs |
+| R1, figures, tables and images | Every table, diagram, chart and image is numbered by type, captioned and referenced. A caption stands alone: the reader understands the figure from the figure and its caption. The text reference says what the figure shows and what to take from it |
+| R2, paragraph topic sentence | Every paragraph opens with what it covers and what it concludes. Destination before journey |
+| R3, sentence chaining | Every sentence links to the one before it through a shared word or idea. No link means a new paragraph |
+| R4, paragraph closing sentence | The last sentence consolidates the paragraph and hooks the next |
+| R5, sentence length and word choice | Short, plain sentences. Two short beat one long. Define acronyms in *italics* on first use and at the start of every major section |
+| R6, eliminate weasel words and machine register | Delete each weasel word, or replace it with a fact, a number or a named source. Hedges, vague quantities, softeners, empty intensifiers, fake precision, hidden sources, unsupported certainty and marketing puffery. A word is only a weasel word when it replaces something statable precisely: "may" is fine for permission. **Also banned: "load-bearing", "blast radius", "footgun", "yak shaving", "bespoke", "ergonomics", "table stakes"**, and every preamble ("it is worth noting", "to be clear", "in essence"). **No antithesis**: state what a thing IS, never what it is not. "It is not X, but rather Y", "Y, not X" and "Y rather than X" are all written "it is Y". Shortness is not a defence: a negation only helps a reader already holding X, so unless X is under discussion at length it costs a clause and adds nothing. A sentence carrying no fact, number or instruction is deleted |
+| R7, punctuation and formatting | `,` `()` and `:` before lists. **No semicolons and no double dashes.** Numbered headings, a table of contents past four sections, one sentence per line in Markdown |
+| R8, section framing | Every major section opens and closes with a framing paragraph |
+| R9, document framing | The document opens and closes with framing sections |
+| R10, clarity overrules all | Any rule may be broken where following it would reduce clarity. Deliberately, and rarely |
+
+**When a document is rewritten, applying R0 to R10 IS the job.** The ruleset is not a
+style laid over a content edit at the end. A rewrite that corrects facts, adds
+sections and leaves half the rules unapplied has not been done, however accurate it
+reads. Apply them from the first line written.
+
+**"Shorter" is not the test of compliance.** R0 says cut and R1 says number, caption
+and reference every table, and on a table-heavy page R1 costs more lines than R0 saves.
+Judge a rewrite rule by rule, not by line count.
+
+**Four habits the rules do not state, and they matter as much:**
+
+- **Forward signposting.** Say what comes next. "We begin by ... We then ..."
+- **Claim before evidence.** State the conclusion, then support it.
+- **Exact figures, never adjectives.** Write `596ns` and `16x`, not "extremely fast" or "dramatically worse".
+- **One term per concept.** Never rotate synonyms. If it is a route, it is a route everywhere.
+
+**Hedging is banned.** No "it seems", "arguably", "perhaps", "it could be said". State
+the claim, or do not make it.
+
+Existing documents predate this and do not all comply. Retrofitting them is issue #127,
+and a page being edited for any other reason should be brought into line while it is open.
 
 ---
 
@@ -229,8 +275,6 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 | `README.md` | what m6 is, what it does, and how to run one |
 | `docs/m6-core-reference.md` | every core module and its interface |
 | `docs/PERFORMANCE.md` | every performance number, how it was measured, on what |
-| `docs/LESSONS.md` | the things that cost something to learn |
-| `docs/H2-PLAN.md` | HTTP/2 and HTTP/3: the conformance status, then the phase history |
 | `tools/conformance-scores.txt` | the floors, and the whole argument behind the h3 number |
 
 ### The working documents are not here, deliberately

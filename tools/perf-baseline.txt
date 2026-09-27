@@ -10,6 +10,45 @@
 # in the commit that earned it. Recording a slower number is a decision to
 # accept a regression and has to be argued for in the commit message.
 #
+# ── 2026-09-27: both numbers moved, and why these values ─────────────────────
+#
+# The release profile landed (m6 4ce64a9: lto = "fat", codegen-units = 1,
+# strip = "symbols", panic = "abort", overflow-checks = true). m6 had no
+# [profile.release] at all before it, so every release ever built took cargo's
+# defaults.
+#
+#   render:minimal     201827 -> 174101   -13.7%
+#   render:blog-index 1784823 -> 1454253   -18.5%
+#
+# THREE RUNS on the build host at load 0.12, five readings each, plus an earlier
+# gate run. Every reading is in tools/perf-history.jsonl. The readings:
+#
+#   render:minimal     180204 170456 162619 194755 157481
+#                      197936 161793 196141 167908 174101
+#                      166299 170732 189051 184965 234618
+#   render:blog-index 1412852 1436586 1464478 1470098 1454253
+#                    1491985 1386017 1485902 1441406 1393243
+#                    1459256 1415412 1399216 1477220 1532813
+#
+# THESE ARE MEDIANS. Owner's decision, 2026-09-27: work with medians, not minima
+# or maxima. A minimum is the best reading the machine ever managed and no request
+# costs that. A maximum is whatever else the box was doing. The median is the
+# typical cost, and a latency floor should be made of typical.
+#
+# The three run medians, and the median of them, which is what is recorded:
+#
+#   render:minimal     170456 174101 184965  ->  174101
+#   render:blog-index 1454253 1441406 1459256 -> 1454253
+#
+# ON MINIMA THE SAME RUNS CLAIMED MORE: -17.6% and -20.6%, against -13.7% and
+# -18.5% here. The minimum flattered the result by about four points, which is
+# the reason for the change rather than an argument against it.
+#
+# Run 3 read 166299 to 234618 on render:minimal inside one run on an idle machine,
+# a 41% spread, which is what the 20% margin exists to absorb.
+#
+# Every reading is in tools/perf-history.jsonl with the box it came from.
+
 # docs/PERFORMANCE.md has the real production-shaped measurements and how they
 # were taken. These are here to catch a change that makes something markedly
 # slower, nothing more.
@@ -65,5 +104,5 @@
 # host's and comparing the two tells you nothing.
 #
 # target                     ns
-render:minimal              201827
-render:blog-index          1784823
+render:minimal              174101
+render:blog-index          1454253

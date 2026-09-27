@@ -364,6 +364,18 @@ Error responses are never cached regardless of mode.
 | `backend` | string | yes | Name of a declared `[[backend]]` |
 | `require` | string | no | Same as `[[route]]` |
 
+**The glob is relative to m6-http's site directory, and the file it names is resolved
+by the backend relative to the BACKEND's root.** Those are different directories in a
+site that gives each app its own root, so the glob has to account for it: a glob of
+`apps/file/assets/**/*` producing the URL `/assets/{relpath}`, against an m6-file route
+whose own `root` is `assets/`. Get the glob wrong and the routes never exist; get the
+backend's `root` wrong and the routes exist while every request 404s. See
+[`m6-site-layout.md`](m6-site-layout.md) and [`m6-file.md`](m6-file.md).
+
+**Prefer a `[[route_group]]` to a wildcard route for static files.** A route_group
+expands into one concrete route per file, and cache warming skips any route path
+containing `{`, so a wildcard silently means those files are never pre-warmed.
+
 Glob is expanded at startup and on `site.toml` reload. New files matching the glob require a `site.toml` reload to become routable — renderers that create new content files (e.g. a CMS publish action) should touch `site.toml` after writing to trigger the reload.
 
 ### Glob Variables
