@@ -31,7 +31,7 @@ Take from it that only the first runs usefully on a laptop.
 | performance | a change did not cost latency | build host only, needs a quiet machine |
 
 **Table 1: the four layers, what each proves, and where each runs.**
-The third column is a constraint, not a preference: a layer runs only where what it needs is present.
+The third column is a constraint: a layer runs only where what it needs is present.
 
 Conformance is judged by three implementations nobody here wrote.
 A test written by the same hand as the code repeats the same misreading of the RFC twice and passes both times.
@@ -57,12 +57,12 @@ Three rules apply to all of them:
 - **`--test-threads=1` is not caution.**
   Three of m6-http's suites (`edge_proxy.rs`, `security_e2e.rs`, `analytics_e2e.rs`) start real processes on fixed loopback ports.
   Run them concurrently and their test functions race for those ports, then fail with 502s that have nothing to do with the code.
-- **The build host, not the laptop.**
+- **Run the gate on the build host.**
   The performance check failed its own second run on a laptop because a release build was going at the same time, which moved the readings by half.
   The conformance testers are not installed on a laptop at all.
-- **A check that cannot measure must fail, not pass.**
+- **A check that cannot measure must fail.**
   `tools/conformance.sh --allow-missing-tools` reports an absent tester as NOT TESTED and says the run proves nothing about that protocol.
-  `check.sh` prints `PASS Conformance` and `All checks passed.` anyway, which is issue #166, so a laptop run is not a conformance result whatever its last line says.
+  `check.sh` prints `PASS Conformance` and `All checks passed.` anyway, which is issue #166, so a laptop run tells you nothing about h2 or h3 whatever its last line says.
   `build-host-tests.sh` runs without the flag, so the path to a release cannot skip h2 or h3.
 
 ## 3. The shared harness
@@ -134,7 +134,7 @@ h3spec -n 127.0.0.1 8443
 `-t` runs h2spec over *TLS* (Transport Layer Security), `-k` accepts the loopback certificate, and `-n` skips h3spec's certificate name check.
 
 Table 5 gives the five traps.
-Take from it that four of them produce a confident wrong answer rather than an error.
+Take from it that four of them answer confidently and wrongly, with no error to warn you.
 
 | # | trap | what it makes a reader believe |
 |---|---|---|
@@ -149,12 +149,12 @@ Trap 1 is a missing flag, trap 2 a configuration default, traps 3 and 4 are read
 
 Two of them need more than a row:
 
-- **Trap 2 is a default, not a mistake.**
+- **Trap 2 is set by a configuration default.**
   `tools/conformance.sh` writes `[rate_limit] enabled = false` into its fixture, and a hand-run instance needs the same, or `requests_per_min` raised and restored after.
   The same trap invalidated the first benchmark run this project took.
 - **Trap 5 risks more than the reading.**
   h2spec deliberately sends malformed frames, and a three-byte frame could once kill this process outright (F076 in [`CHANGELOG.md`](../CHANGELOG.md)).
-  A result measured against a private live site is also unreproducible by anyone else, which makes it an assertion rather than evidence.
+  A result measured against a private live site is also unreproducible by anyone else, which makes it an assertion.
 
 ## 5. What each service is held to
 
@@ -182,7 +182,7 @@ Take from it where to look for the test behind a row.
 **Table 6: the integration suites, by crate.**
 Unit tests are not listed, because they sit in `src/` beside the code they cover.
 
-Each crate carries its own fixtures under `<crate>/tests/fixtures/`, rather than one shared fixture site.
+Each crate carries its own fixtures under `<crate>/tests/fixtures/`.
 
 ### 5.1. m6-html
 
@@ -210,7 +210,7 @@ A missing secrets file is not an error, and a second SIGTERM stops waiting.
 | Equal specificity tie | First declaration wins, warning logged |
 
 **Table 8: m6-html L2, route matching.**
-An exact route beats a parameterised one, and a tie goes to declaration order rather than being left undefined.
+An exact route beats a parameterised one, and a tie goes to declaration order.
 
 | test | expected |
 |---|---|
@@ -258,7 +258,7 @@ A route sets its own status and cacheability, which is what makes an error route
 | No `Accept-Encoding` | Identity |
 
 **Table 13: m6-html L7, compression.**
-Brotli is preferred when offered, and no header means no encoding rather than a guess.
+Brotli is preferred when offered, and no header means identity.
 
 L8 is integration: 100 concurrent requests across all routes with no errors, and a content update picked up after modifying `data/site.json` and restarting.
 Its sanitiser clause (1000 requests, SIGTERM, no leaks) **does not run anywhere.**
@@ -278,7 +278,7 @@ Take from them that path resolution is the level that matters, because it is whe
 | Symlink pointing outside the root | 404 |
 
 **Table 14: m6-file L2, path resolution.**
-Traversal and a symlink out of the root both answer 404, rather than an error that tells the two apart.
+Traversal and a symlink out of the root both answer 404, so the response never says which of the two happened.
 
 | test | expected |
 |---|---|
@@ -323,7 +323,7 @@ Every configuration error is exit 2 and none is a warning, because a proxy that 
 | No match | 404 per `[errors] mode` |
 
 **Table 17: m6-http L2, routing.**
-A miss is handled by the error mode rather than by a hard-coded page.
+A miss is handled by `[errors] mode`.
 
 | test | expected |
 |---|---|
@@ -365,7 +365,7 @@ An API client gets a status and a browser gets a redirect from the same failure,
 | `refresh` cookie `Path` | Sent only to `/auth/refresh` |
 
 **Table 20: m6-http L4, the login endpoint.**
-A form login answers with cookies, a JSON login with tokens, and an external `next` is dropped rather than followed, which is what stops a login link becoming an open redirect.
+A form login answers with cookies and a JSON login with tokens. An external `next` is dropped, which is what stops a login link becoming an open redirect.
 
 | test | expected |
 |---|---|
@@ -377,7 +377,7 @@ A form login answers with cookies, a JSON login with tokens, and an external `ne
 | `POST /auth/logout` API | 204, refresh token revoked |
 
 **Table 21: m6-http L4, refresh and logout.**
-Logout revokes the refresh token rather than only clearing the cookies, so a copied token stops working too.
+Logout revokes the refresh token, so a copied token stops working too.
 
 | test | expected |
 |---|---|
@@ -411,7 +411,7 @@ The backend decides cacheability and m6-http decides the key, and the key is the
 | Pool unreachable | 503 per `[errors] mode` |
 
 **Table 24: m6-http L7, error handling.**
-An error page is fetched like any other page, and every way that fetch can fail ends at `[errors] mode` rather than in a loop.
+An error page is fetched like any other page, and every way that fetch can fail ends at `[errors] mode`.
 
 | mode | response when the pool is unreachable |
 |---|---|
@@ -482,7 +482,7 @@ Revocation is checked at refresh, which is what bounds how long a stolen refresh
 | Token groups do not match | 403 |
 
 **Table 30: m6-auth-server L4, JWT verification, done in m6-http.**
-Verification is local to m6-http and makes no call to m6-auth-server, so a protected route costs a signature check rather than a round trip.
+Verification is local to m6-http and makes no call to m6-auth-server, so a protected route costs one signature check.
 
 L5 is user and group management.
 Every endpoint needs a `role:admin` token and answers 403 without one.
