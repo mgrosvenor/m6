@@ -43,7 +43,7 @@ This section gives the premise, what reality adds, why microseconds are not the 
 ### 1.1 The premise: a path is a symbol
 
 **A trading engine measures tick to trade, and its job in that window is a symbol lookup and a write.**
-On bare metal with a kernel-bypass network stack that window is under a microsecond, and the reference class is the ExaNIC family with its `exasock` sockets library, now sold as the Cisco Nexus SmartNIC.
+On bare metal with a kernel-bypass network stack that window is **just** under a microsecond, and the reference class is the ExaNIC family with its `exasock` sockets library, now sold as the Cisco Nexus SmartNIC.
 Table 1 gives its published latencies.
 
 | path | measured | how |
@@ -53,13 +53,14 @@ Table 1 gives its published latencies.
 | `exasock`, UDP | 880 ns | `sockperf`, through the socket acceleration library |
 
 **Table 1: published ExaNIC latencies, which are the floor m6's design was aimed at.**
-Take from it that a sub-microsecond request to response is achievable with hardware assistance and kernel bypass, which is what makes a microsecond the right order of magnitude to aim a server design at.
+Take from it that 930 ns is *just* under a microsecond, so a purpose-built card with kernel bypass only barely breaks the figure, and a microsecond is therefore the state of the art rather than a comfortable goal.
 
 `exasock` reaches those figures by intercepting the Linux socket calls and sending directly to the card, with no change to the application.
 Sources: the [ExaNIC sockets guide](https://exablaze.com/docs/exanic/user-guide/sockets/), the [ExaNIC benchmarking guide](https://exablaze.com/docs/exanic/user-guide/benchmarking/) and [cisco/exanic-software](https://github.com/cisco/exanic-software).
 
-**That floor is hardware-assisted, and m6 is a userspace server on a general-purpose stack.**
-So it is the target the design was aimed at rather than a figure m6 claims, and §1.2 gives the distance.
+**That matters for how the target should be read.**
+A microsecond is not a round number chosen for convenience, it is roughly where dedicated hardware tops out, and m6 is a userspace server on a general-purpose stack with TLS and three HTTP versions in front of the lookup.
+So 1 µs is an upper bound on ambition rather than a figure m6 claims or expects to reach, and §1.2 gives the distance from it.
 
 **HTTP has the same shape, and most assets on most sites are static.**
 A path is a symbol. A response is the trade. So serving a page should be a hash map lookup and one write of a buffer and a length.
@@ -84,7 +85,7 @@ Table 2 states what each number is, because the difference between a target, a c
 
 | figure | what it is | status |
 |---|---|---|
-| ~1 µs | tick to trade on bare metal with a kernel-bypass network stack | the design target, never measured in m6 |
+| 930 ns | the best measured kernel-bypass TCP round trip, on a purpose-built card (§1.1) | the state of the art, and the upper bound on ambition. Never measured in m6 |
 | ~2.2 µs | a cache hit inside m6, on m6's own timer | measured, component cost, excludes TLS and the network |
 | ~13 µs | a Unix socket round trip | measured, and the reason for §1.3 |
 | ~226 µs | an HTTP/2 cache hit end to end on the benchmark host | measured, includes TLS, loopback and the client |
@@ -93,7 +94,7 @@ Table 2 states what each number is, because the difference between a target, a c
 **Table 2: the figures this section uses, what each one measures, and which are targets.**
 Take from it that the microsecond figures are component costs and the millisecond figure is the goal, so quoting any of them as another is the mistake to avoid.
 
-The 2.2 µs cache hit is the trading-engine window and it sits within roughly twice the target.
+The 2.2 µs cache hit is the trading-engine window, and it sits within roughly two to three times a figure that dedicated hardware only just reaches.
 The 226 µs is what a client on the same machine sees, and almost all of the distance between the two is TLS and the protocol stack rather than the lookup.
 There is understood to be around a further order of magnitude available at that boundary, and closing it is not a solved problem.
 
