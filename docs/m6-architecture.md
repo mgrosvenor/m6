@@ -207,26 +207,35 @@ Everything in the rest of this document follows from §1.1 and §1.4, starting w
 
 ## 2. The shape that follows
 
-**m6 is six serving binaries, each with one job, wired by `site.toml` over Unix sockets, with one of them on the public port.**
-This section is the shape in brief, so the reasoning from §3 onwards has something to refer to.
-Table 6 names each binary and its job.
+**The process split is derived from §1 rather than chosen.**
+Table 6 gives the three constraints that decide it and what each one forces.
 
-| binary | one job |
+| constraint from §1 | what it forces |
 |---|---|
-| `m6-http` | terminate TLS, rate limit, cache, route, enforce route authentication, proxy to backends |
-| `m6-http` in redirect mode | answer `:80` with a redirect to HTTPS, as its own process |
-| `m6-html` | render HTML from templates and JSON data |
-| `m6-file` | serve files from the filesystem |
-| `m6-auth-server` | verify credentials and sign *JWTs* (*JSON Web Tokens*) |
-| `m6-monitor` | poll each node's health and performance endpoints and serve one report |
+| a cache hit must not cross a process boundary (§1.3) | TLS termination and the response cache live in one process, and that process holds the public port |
+| a backend may be written in any language (§1.6) | the boundary below the edge is a protocol and not a function call, so everything else is a separate process reached over HTTP/1.1 on a Unix socket |
+| one stack that knows about itself (§1.6) | one shared configuration describes the whole set, so no part has to be told about another by hand |
 
-**Table 6: the six serving binaries and the one job each has.**
-Take from it that only `m6-http` is reachable from the internet, in either of its two modes, and that every other process answers HTTP/1.1 on a Unix socket behind it.
+**Table 6: the three constraints from §1 and what each forces about the shape.**
+Take from it that the first constraint puts TLS and the cache together, the second puts everything else outside, and the third is what makes the result one system rather than five programs on a host.
 
-Two command line tools sit outside that set: `m6-md` converts a directory of Markdown into one JSON file, and `m6-auth-cli` manages users and groups against the auth database.
+Table 7 names what that produces.
 
-A site is data and configuration only: `site.toml`, one config file per backend process, templates, assets, and content as JSON.
-There are no binaries in a site and no log directory, because binaries are found through the system path and every process logs to stdout.
+| binary | one job | where it sits |
+|---|---|---|
+| `m6-http` | terminate TLS, rate limit, cache, route, enforce route authentication, proxy to backends | the public port. A second process of the same binary answers `:80` with a redirect to HTTPS |
+| `m6-html` | render HTML from templates and JSON data | behind the edge |
+| `m6-file` | serve files from the filesystem | behind the edge |
+| `m6-auth-server` | verify credentials and sign *JWTs* (*JSON Web Tokens*) | behind the edge |
+| `m6-monitor` | poll each node's health and performance endpoints and serve one report | behind the edge |
+
+**Table 7: the five serving binaries, the one job each has, and where each sits.**
+Take from it that only `m6-http` is reachable from the internet, that it is one binary running in two modes rather than two programs, and that everything else answers HTTP/1.1 on a Unix socket behind it.
+
+Two command line tools sit outside that set and serve nothing: `m6-md` converts a directory of Markdown into one JSON file, and `m6-auth-cli` manages users and groups against the auth database.
+
+**A site is therefore data and configuration only**, which is the third constraint showing up in the filesystem: `site.toml`, one config file per backend process, templates, assets, and content as JSON.
+No binaries live in a site, because they are found through the system path, and no log directory, because every process logs to stdout for the supervisor to capture (§3.3).
 
 ---
 
@@ -283,7 +292,7 @@ This section says why the protocol burden is concentrated there, why it runs one
 ### 4.1 Why the protocol burden is concentrated
 
 **One process terminating TLS and three HTTP versions means one place to get them right.**
-Conformance is measured, and Table 7 is the current position.
+Conformance is measured, and Table 8 is the current position.
 
 | suite | target | score |
 |---|---|---|
@@ -291,7 +300,7 @@ Conformance is measured, and Table 7 is the current position.
 | h2spec | `m6-http` | 146/146 |
 | h3spec | `m6-http` | 47/49 |
 
-**Table 7: the recorded conformance floors, from `tools/conformance-scores.txt`.**
+**Table 8: the recorded conformance floors, from `tools/conformance-scores.txt`.**
 Take from it that HTTP/1.1 is measured on four binaries because four of them speak it, and that HTTP/3 is the only suite short of full marks.
 
 A backend never terminates TLS, never parses a frame layer and never implements *HPACK* (*HTTP/2 header compression*), so the defect-dense code has one home and one test surface.
@@ -398,7 +407,7 @@ The test of whether that is working is that a new service is small: `m6-html` is
 Breadth is paid for by feature gates.
 A service names what it wants, so the weight of core is what a binary uses rather than what core contains, which keeps a command line tool such as `m6-md` from acquiring a QUIC stack or a TLS library by depending on it.
 
-Table 8 gives the sorts of component core holds, in brief.
+Table 9 gives the sorts of component core holds, in brief.
 
 | sort of component | what it covers |
 |---|---|
@@ -413,7 +422,7 @@ Table 8 gives the sorts of component core holds, in brief.
 | Test kit | standing a service up, claiming a socket without a race, driving it and tearing it down |
 | Errors and helpers | the one error type and the status each variant becomes, dates and slugs |
 
-**Table 8: the sorts of component `m6-core` holds.**
+**Table 9: the sorts of component `m6-core` holds.**
 Take from it that core spans the HTTP specification, the service lifecycle and the operational surface, which is the breadth this section argues for, and that a service links only the sorts it names.
 
 `m6-core-reference.md` is where each of these is broken out module by module with its interface, and this table stays deliberately coarse so the two documents do not drift.
@@ -421,7 +430,7 @@ Take from it that core spans the HTTP specification, the service lifecycle and t
 ### 6.2 Why each thing in core exists exactly once
 
 **The duplicates had already diverged, and four of them were answering incorrectly on the wire.**
-Table 9 is the evidence, and it is why the rule below is worth enforcing.
+Table 10 is the evidence, and it is why the rule below is worth enforcing.
 
 | what existed more than once | what the copies disagreed about |
 |---|---|
@@ -433,7 +442,7 @@ Table 9 is the evidence, and it is why the rule below is worth enforcing.
 | four signal handlers | whether a service unlinked its socket, and whether it logged that it had stopped |
 | three route matchers | precedence, so one route table could resolve differently in two services |
 
-**Table 9: what was implemented more than once, and what the copies disagreed about.**
+**Table 10: what was implemented more than once, and what the copies disagreed about.**
 Take from it that four of the seven were producing a wrong answer to a real request, which is why one implementation per concept is a rule.
 
 **The rule: code moves into core when it has more than one consumer, and single-consumer code stays with its consumer.**
@@ -559,7 +568,7 @@ The trust boundary is the edge, which is the concentration §4.4 relies on.
 
 The decisions above shape the system.
 These shape working with it, and each is small enough that the reason matters more than the rule.
-Table 10 gives them by area.
+Table 11 gives them by area.
 
 | area | decision | why |
 |---|---|---|
@@ -586,7 +595,7 @@ Table 10 gives them by area.
 | auth | login is throttled per address | it is the one endpoint where guessing is the attack |
 | auth | a requirement is spelled as a group or a role, and an unknown form denies | a typo in a requirement must fail closed |
 
-**Table 10: the remaining decisions by area, each with the reason behind it.**
+**Table 11: the remaining decisions by area, each with the reason behind it.**
 Take from it that most exist because the alternative had already produced a defect, and that the pattern across them is failing closed and failing loudly.
 
 ---
@@ -594,7 +603,7 @@ Take from it that most exist because the alternative had already produced a defe
 ## 10. What is deliberately absent
 
 Naming what m6 does not do is how a reader tells a gap from an omission.
-Table 11 lists what is absent and the reason, and the last row is the one to read.
+Table 12 lists what is absent and the reason, and the last row is the one to read.
 
 | absent | why |
 |---|---|
@@ -606,7 +615,7 @@ Table 11 lists what is absent and the reason, and the last row is the one to rea
 | a computed admission control bound | m6 sheds at queue-full, which is not admitting work against a bound. A latency bound comes from the second, and maximum handler time is unbounded today, so there is no epoch to rate-limit against. An event loop is the model in which admission control is expressible, because a loop can decline work while a full queue can only report that it is full |
 | **RFC 9218 extensible priorities** | **no decision.** Not implemented and not mentioned anywhere in the tree. Every other gap here was weighed and declined, and this one was not |
 
-**Table 11: what m6 does not do, and why.**
+**Table 12: what m6 does not do, and why.**
 Take from it that all but the last were decided, and that the last is a gap rather than a choice.
 
 ---
