@@ -301,7 +301,7 @@ Conformance is measured, and Table 8 is the current position.
 | h3spec | `m6-http` | 47/49 |
 
 **Table 8: the recorded conformance floors, from `tools/conformance-scores.txt`.**
-Take from it that HTTP/1.1 is measured on four binaries because four of them speak it, and that HTTP/3 is the only suite short of full marks.
+Take from it that HTTP/1.1 is measured on four separate targets because everything behind the edge speaks it, and that HTTP/3 is the only suite short of full marks.
 
 A backend never terminates TLS, never parses a frame layer and never implements *HPACK* (*HTTP/2 header compression*), so the defect-dense code has one home and one test surface.
 That concentration is what makes §4.4 possible: a rule applied once at the edge holds for every backend behind it, in whatever language.
@@ -360,14 +360,28 @@ What covers the window instead is a mode: a status code with an empty body, the 
 
 ## 5. Why authentication sits where it does
 
-Authentication is enforced at the edge, verified without a network call, and absent from the code path of a public request.
+Authentication is enforced at the edge, verified without a network call, and costs a public route almost nothing.
 Each of those was a decision and none is obvious.
 
-### 5.1 Why auth is absent rather than skipped
+### 5.1 Why a public route costs almost nothing
 
-**A static site is the base case and must be as fast as m6 can make it, so a public route executes no authentication code at all.**
-Routes compile into distinct types at startup, and a public route is a different code path from a protected one.
-A conditional check on every request would cost something even where the branch is never taken, in branch prediction, in unwrapping an option and in cache lines touched, and on a path measured in microseconds that is a cost with no return for most sites.
+**A static site is the base case, so authentication has to cost as near to nothing as possible on a route that has none.**
+Three things make it cheap, and only the first is genuine absence.
+
+**A site with no protected route loads no key.**
+No `[auth]` section is needed, no public key is read from disk, and no auth process need run.
+The verification path is then unreachable, because there is no key to verify against, so authentication is an absent feature for that site and absence has no configuration to get wrong.
+
+**The caching decision short-circuits on one flag.**
+Whether a response may enter the shared cache turns on whether its route requires authentication, and the route table carries a single boolean saying whether any route does.
+A site with none answers that question without a route lookup at all, which matters because it is asked before every cache lookup on every protocol.
+
+**A protected route is then one check on the route already matched.**
+`require` is an optional field on the route entry, so the cost on a public route is a single branch.
+
+**Stated plainly, that last one is a conditional and not two distinct code paths.**
+A public route on a site that protects something elsewhere pays a branch that a purely static site does not.
+That is the price of one route table instead of two, and at one branch against a path measured in microseconds it is the right trade.
 
 A site with no route requiring authentication therefore needs no auth section in `site.toml`, no public key on disk, and no auth process running.
 Authentication is an absent feature for that site, and absence has no configuration to get wrong.
@@ -622,17 +636,25 @@ Take from it that all but the last were decided, and that the last is a gap rath
 
 ## 11. Summary
 
-m6 exists because serving a fast website conventionally means assembling a stack, and the assembly is most of the cost.
-A multi-process server cannot keep its cache in its own heap, so every cache hit pays serialisation, a lock and an inter-process round trip, and that is a consequence of the concurrency model rather than a tuning problem.
-m6 puts the whole hot path on one thread in one process with the cache in the same heap, so a hit costs a hash lookup and a reference count, and it collapses the rest of the stack into small single-job processes behind one wire contract with one `site.toml` describing the set.
+m6 began as a question: what does it look like to treat an HTTP server like a high performance trading engine?
+A trading engine's job in its tick-to-trade window is a symbol lookup and a write, and purpose-built hardware with kernel bypass gets that to 930 ns.
+HTTP has the same shape, a path is a symbol and a response is the trade, and most assets on most sites are static, so a page should be answered by a hash map lookup and one write of a buffer already in memory and already compressed.
+
+What reality adds is TLS and three wire formats, and m6 is a userspace server on a general-purpose stack, so a microsecond was always an upper bound on ambition.
+The figure that governs is 5 ms request to response for a real user, because a host network stack is milliseconds and saved microseconds are invisible against it.
+Microsecond work earns its place by leaving that budget to the network, and a site runs its own edge to spend the budget on distance rather than on a second system that believes it knows what the site contains.
+
+**One measurement decides most of the architecture.**
+A process boundary costs about 13 µs against a 2.2 µs cache lookup, so a cache hit must not leave the process.
+That puts TLS termination and the cache in one process on the public port, which puts the protocol burden and the trust boundary there too, which is why one strip of client-supplied headers protects every backend behind it.
+Everything else sits behind a wire contract so it can be written in any language, and one shared configuration describes the set so the parts can know about each other well enough to answer a health check cheaply, measure the site without evicting it, and warm the cache from the route table the edge already holds.
 
 What that gives up is stated rather than hidden: one core per process, HTTP/1.1 throughput against a mature server, zero-copy file serving, and kernel TLS.
 A site dominated by HTTP/1.1 or by large files is better served elsewhere.
 
-Everything else follows from those two facts.
-The boundary between processes is a protocol so a backend can be written in any language, and one process faces the internet so TLS, three HTTP versions, the cache and the trust boundary have one home.
-Authentication is absent from a public request rather than skipped, because a branch costs even when it is not taken.
+The rest follows.
+Authentication costs a public route one branch, and nothing at all on a site that protects nothing, because no key is loaded and the verification path is unreachable.
 `m6-core` is wide on purpose and singular by rule, because the duplicates had diverged and four of them were answering incorrectly on the wire.
-HTTP/2, HTTP/3 and the caching rules stay at the edge because they have one consumer permanently.
+HTTP/2, HTTP/3 and the caching rules stay at the edge because they have one consumer permanently, and a library with one consumer is that consumer's code in another directory.
 
 Changing any of this means answering the reason rather than editing the rule.
