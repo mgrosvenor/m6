@@ -1,245 +1,90 @@
-# m6, architecture
+# m6, design and architecture
 
-m6 serves a website with a family of Unix processes, one job each, wired together by `site.toml` over Unix sockets.
-One process faces the internet and terminates *TLS* (*Transport Layer Security*), HTTP/1.1, HTTP/2 and HTTP/3.
-Every other process answers HTTP/1.1 on a Unix socket behind it, and is assembled from one library.
+This document holds the reasons.
+`README.md` says what m6 is and how to run one, `m6-core-reference.md` names every component, `m6-site-toml.md` gives every configuration key, `m6-backend-protocol.md` specifies the wire contract, and `PERFORMANCE.md` and `BENCHMARKS.md` carry the numbers.
+None of them says why m6 is built this way, and that is what is written down here.
 
-This document is the architecture as built, with the reason for each decision beside it.
-We begin with the processes and the shape of a site (§1).
-We then follow a request through the edge (§2) and state which protocol specifications the edge implements and how far (§3).
-§4 draws the boundary between the library and the applications that link it, §5 is the shape every application has, and §6 is configuration.
-§7 summarises.
+A decision recorded without its reason is a rule nobody can safely change.
+Someone reading only the shape of the system will reasonably conclude that a branch could be added here, a lock moved there, a file introduced to cover an error case, and each of those undoes something that was decided for a reason.
+So every section below asks a question and answers it, and the mechanism appears only as far as the reason needs it.
 
-Four things live elsewhere.
-Component interfaces are in `m6-core-reference.md`, configuration keys in `m6-site-toml.md`, the backend wire contract in `m6-backend-protocol.md`, and measured performance in `PERFORMANCE.md` and `BENCHMARKS.md`.
+We begin with why m6 is several processes at all (§1) and why only one of them faces the internet (§2).
+We then cover why authentication sits where it does (§3), why `m6-core` exists and where its boundary falls (§4), why every service has one shape (§5), and why configuration is split the way it is (§6).
+§7 states what is deliberately absent and why, and §8 summarises.
+
 Where this document and the code disagree, the code is right and this document is a defect.
 
 ## Contents
 
-1. [The processes](#1-the-processes)
-2. [The edge](#2-the-edge)
-3. [Protocol coverage](#3-protocol-coverage)
-4. [The m6-core boundary](#4-the-m6-core-boundary)
-5. [The service shape](#5-the-service-shape)
-6. [Configuration](#6-configuration)
-7. [Summary](#7-summary)
+1. [Why a family of processes](#1-why-a-family-of-processes)
+2. [Why one process faces the internet](#2-why-one-process-faces-the-internet)
+3. [Why authentication sits where it does](#3-why-authentication-sits-where-it-does)
+4. [Why m6-core exists, and where its boundary falls](#4-why-m6-core-exists-and-where-its-boundary-falls)
+5. [Why every service has one shape](#5-why-every-service-has-one-shape)
+6. [Why configuration is split the way it is](#6-why-configuration-is-split-the-way-it-is)
+7. [What is deliberately absent](#7-what-is-deliberately-absent)
+8. [Summary](#8-summary)
 
 ---
 
-## 1. The processes
+## 1. Why a family of processes
 
-m6 is six serving binaries and two command line tools, and one of the six is reachable from the internet.
-Each serving process takes two positional arguments (`<site-dir> <config>`), logs structured JSON to stdout, and is started and restarted by systemd.
-This section names them, gives the three combinations a site uses, and shows the directory they all read.
+m6 could have been one binary that listens, renders and serves files.
+It is six, each with one job, wired by `site.toml` over Unix sockets, and this section says what that buys.
+Four reasons: a backend can be written in any language, a crash is contained, the process manager already exists, and capacity is added without editing configuration.
 
-### 1.1 What runs
+### 1.1 Why the boundary is a wire contract
 
-Table 1 names every binary and the one job it has.
+**A backend is reached over HTTP/1.1 on a Unix socket, so it can be written in any language.**
+That is the whole reason the boundary is a protocol rather than a function call.
+`m6-backend-protocol.md` is small enough to implement from scratch in under a hundred lines, and six reference backends in C, C++, Go, Python and Rust are built and tested from it on every run.
 
-| binary | one job | reachable from the internet |
-|---|---|---|
-| `m6-http` | Terminate TLS, rate limit, cache, route, enforce route auth, proxy to backends. | yes |
-| `m6-http` in redirect mode | Answer `:80` with a 301 to HTTPS. Its own process, with no TLS, QUIC, cache or route table built. | yes |
-| `m6-html` | Render HTML from Tera templates and JSON data. | no |
-| `m6-file` | Serve files from the filesystem. | no |
-| `m6-auth-server` | Verify credentials and sign *JWTs* (*JSON Web Tokens*). Four routes. | no |
-| `m6-monitor` | Poll every node's `/health` and `/perf` and serve one page saying how the fleet is. | no |
-| `m6-md` | Convert a directory of Markdown into one JSON file. A command line tool. | no |
-| `m6-auth-cli` | Manage users and groups directly against the auth database. A command line tool. | no |
+This ordering has a consequence that constrains everything in §4: `m6-core` is a convenience for Rust and must never become the only readable definition of any part of the contract.
+Behaviour a backend depends on that exists only as Rust is a hole in the specification, and the fix is to specify it.
 
-**Table 1: every m6 binary and the one job it has.**
-Take from it that two processes listen on public ports and both are `m6-http`, and that everything else answers HTTP/1.1 on a Unix socket or runs from a shell.
+### 1.2 Why one job each
 
-`m6-html`, `m6-file`, `m6-auth-server` and `m6-monitor` are default apps, which means they ship with m6 and are assembled from `m6-core`.
-`m6-html` is six lines because everything it does is core's.
-`m6-file` adds a request handler, `m6-auth-server` adds four handlers and a state builder, and `m6-monitor` adds a poller, each over the same loop.
-A site adds backends of its own beside them, in any language, and `m6-http` treats all of them the same way, because the only thing it knows about a backend is the wire contract.
+**A process with one job can be restarted without taking anything else down.**
+A template that fails to compile stops HTML rendering and leaves static files and *TLS* (*Transport Layer Security*) serving.
+The `:80` listener that answers a redirect runs as its own process for the same reason, so a slow client there cannot stall the process holding TLS connections, and it never builds a QUIC stack, a cache or a route table it has no use for.
 
-### 1.2 Tiers
+**One job also means one config, one log stream and one unit per instance.**
+`m6-html` takes a route table in its config and serves every HTML route in it.
+Splitting it per route type would multiply units and log streams while leaving each config describing a fragment, and a complete picture of what serves what is worth more than that separation.
 
-A site uses as much of m6 as it needs, and Table 2 gives the three combinations.
+### 1.3 Why systemd owns the lifecycle
 
-| tier | processes | content comes from | build step |
-|---|---|---|---|
-| 1, static | `m6-http`, `m6-html`, `m6-file` | JSON and templates in the site directory | none |
-| 2, generated static | tier 1 plus a tool such as `m6-md` | the tool writes the JSON | outside m6 |
-| 3, dynamic | tier 1 or 2 plus backends of the site's own | handler code | outside m6 |
+**systemd is a better process manager than anything `m6-http` could implement, and it is already on the machine.**
+Restart policy, resource limits, dependency ordering, log capture and service isolation are all its job, and reimplementing them inside a proxy would add substantial code for worse results.
+So `m6-http` spawns nothing, monitors nothing and restarts nothing, and expects its backends to be running.
 
-**Table 2: the three tiers of m6 site, by which processes run and where content comes from.**
-Take from it that m6 has no build step at any tier, and that moving up a tier adds processes without changing the ones below.
+Two consequences follow.
+Every process logs structured JSON to stdout and journald captures it, so a site has no log directory and no log rotation of its own.
+And because a crashed backend is restarted in seconds, the window in which every member of a pool is down is short, which is what makes §2.5 affordable.
 
-### 1.3 The site directory
+### 1.4 Why pool membership is discovered rather than declared
 
-The layout is fixed, and Figure 1 gives it in full.
+**Scaling a backend should not require editing configuration.**
+A pool is declared as a socket glob, and membership comes from rescanning that glob every 2 seconds, so starting another systemd instance adds a member and stopping one removes it.
+An explicit list of sockets would mean a config edit and a reload to add capacity, which is ceremony in the path of the one operation an operator performs under load.
 
-```
-my-site/
-├── site.toml          routing, backend pools, auth, logging
-├── configs/           one config per backend process
-│   ├── m6-html.conf
-│   └── m6-file.conf
-├── templates/
-├── assets/
-├── content/           JSON, written by hand or by a tier 2 tool
-└── data/
-```
+The 2-second window is the cost of not watching the socket directory, and it is the honest figure: a new instance is not in the pool for up to 2 seconds, and a stopped one is retried into its backoff for up to 2 seconds.
+Requests go to the member holding the fewest connections, which is the only signal of load available locally, and a member that fails is retried after 1, 2, 4, 8, 16 and then 30 seconds so a restarting backend is not hammered.
 
-**Figure 1: the m6 site directory.**
-Take from it that a site is data and configuration only, with no binaries and no log directory, because binaries are found through `PATH` or an absolute path in a systemd unit and every process logs to stdout.
-
-`site.toml` holds routing, pools, auth and logging for every process in the tree, and §6.1 covers what it deliberately does not hold.
-The process that reads it first is the one facing the internet.
+Those four reasons, a protocol boundary, one job each, an existing process manager and discovered membership, describe a system of peers.
+The next section is about the one process that is not a peer.
 
 ---
 
-## 2. The edge
+## 2. Why one process faces the internet
 
-`m6-http` is a single-threaded event loop that terminates *TLS*, three HTTP versions and *QUIC* (*Quick UDP Internet Connections*), answers from a bounded cache, and proxies what it cannot answer to a pool of backends.
-One thread runs the loop and owns every connection's state, so nothing on the request path waits on another thread.
-This section follows a request through it, then covers the cache, the backend pools and reload.
+`m6-http` is the only process on a public port, and everything about its design follows from being the only one.
+This section says why the protocol burden is concentrated there, why it runs one thread, why the cache is shaped as it is, and why it distrusts its own clients.
 
-### 2.1 The request path
+### 2.1 Why the protocol burden is concentrated
 
-A request crosses the edge in a fixed order, and the cheapest answers come earliest.
-Table 3 gives the order and what each step costs.
-
-| step | what happens | outcome |
-|---|---|---|
-| 1 | Accept a TCP connection, terminate TLS, and pick HTTP/1.1 or HTTP/2 by *ALPN* (*Application-Layer Protocol Negotiation*). HTTP/3 arrives instead as QUIC on UDP. | a parsed request |
-| 2 | Check the per-IP rate limit, ahead of cache lookup and all backend work. | 429, or continue |
-| 3 | Validate the method against `allowed_methods`. | 405 with `Allow` for a known method, 501 for an unrecognised one |
-| 4 | Answer `/health` and `/perf` from local state. `/perf`'s metrics block needs a bearer token, and the token defaults to absent, so forgetting to configure it serves no metrics. | a JSON verdict, touching no route, cache or backend |
-| 5 | Look up the cache, keyed on path, query and content coding. | a stored response, or a miss |
-| 6 | Match the route, most specific first. | a backend name, or 404 |
-| 7 | Verify the JWT locally and check the route's `require`. | 401, 403, or continue |
-| 8 | Proxy to the least loaded pool member over HTTP/1.1 on a Unix socket. | a backend response |
-| 9 | Store the response when it may be cached, add the security headers and `Alt-Svc`, record analytics. | the answer |
-
-**Table 3: the order a request crosses `m6-http`, and what each step can answer.**
-Take from it that a cache hit returns at step 5 having touched no route table and no backend, and that a health check returns at step 4 having touched even less.
-
-Steps 3 and 4 are ordered deliberately.
-Method validation runs first so that a health path refuses `PUT` like every other path.
-`/health` then answers before routing, the cache and any backend, so that what a monitor measures is whether the node is up.
-
-### 2.2 What the edge refuses to take from a client
-
-Three rules hold on every protocol, and the first is the one that carries the most weight.
-
-**Headers the proxy generates are stripped from every inbound request.**
-`x-auth-claims` and `x-forwarded-for` are statements about a request that only the edge can make truthfully.
-Backends resolve a repeated header by first match, and the proxy appends its own value after the client's, so a client that sent its own copy would win.
-Dropping them at ingress is what makes `x-auth-claims` an authentication decision and `x-forwarded-for` a rate-limiting key.
-Hop-by-hop headers are removed in the same pass.
-
-**Security response headers are applied at serialisation.**
-They are filled in for every response, including cache hits, backend responses, generated error pages and rate-limit refusals, and a backend that sets its own value for one of them wins.
-
-**A malformed request ends the connection.**
-After a framing error there is no way to know where the next request starts.
-
-### 2.3 The cache
-
-The cache is in memory, bounded, and invalidated from the site's own declarations.
-Table 4 gives its shape.
-
-| property | value |
-|---|---|
-| key | path, query string and content coding, in one allocation |
-| stored | a response the RFC 9111 rules say may be stored |
-| bound | 128MB of total response footprint by default |
-| eviction | when the bound is passed, down to 87.5% of it |
-| invalidation | `[[route_group]]` globs map a file to its URLs, and a backend config's `params` declarations map a data file to every route that reads it |
-| swap | behind an `Arc`, replaced atomically |
-
-**Table 4: what the response cache keys on, what bounds it, and how it is invalidated.**
-Take from it that the query string is part of the key, so two query strings are two entries, and that the cache has a ceiling of 128MB.
-
-Two rules decide what may be stored at all.
-**A response that varies on anything except `Accept-Encoding` is never stored**, because the key cannot express another dimension and storing it would replay one client's variant to everyone.
-**Whether a backend compresses is declared once in `site.toml` and checked on both sides.**
-`[[backend]] compresses` tells the edge whether to advertise an encoding dimension, and the backend reads the same key and refuses to start when it disagrees with what it actually does.
-The dangerous direction is a backend that compresses while the declaration says it does not, because the edge then stops varying on `Accept-Encoding` and a compressed body can be stored and replayed to a client that asked for identity.
-
-Invalidation is derived from the site's own declarations.
-`m6-http` reads each backend config at startup to build the map, and never for routing.
-A data file changing evicts the paths that read it, and every entry for a path is evicted together.
-The map is rebuilt when `site.toml` reloads, which is also when a `[[route_group]]` glob is expanded again, so a backend that writes a new content file touches `site.toml` to make it routable.
-
-### 2.4 Backend pools
-
-A backend is a pool of Unix sockets declared as a glob.
-
-```toml
-[[backend]]
-name    = "m6-html"
-sockets = "/run/m6/m6-html-*.sock"
-```
-
-**Figure 2: a backend pool, declared as a socket glob in `site.toml`.**
-Take from it that a pool names a glob, which is what lets a pool change size without a config edit.
-
-Membership comes from rescanning the glob every 2 seconds.
-Starting another systemd instance therefore adds a member within that window, and stopping one removes it, with no config change and no reload.
-Requests go to the member holding the fewest connections.
-A member that fails is retried after 1, 2, 4, 8, 16 and then 30 seconds, and an empty pool answers per `[errors] mode`.
-
-A site may also declare a URL backend, which is a single upstream reached over TLS with ALPN.
-
-### 2.5 Errors and reload
-
-One route renders every error, and `[errors] mode` decides what happens when it cannot.
-
-| mode | answer when no error page can be fetched |
-|---|---|
-| `status` | the status code with an empty body |
-| `internal` | the status code with minimal HTML that `m6-http` generates |
-| `custom` | the error page fetched from `[errors] path`, falling back to `internal` when no path is configured |
-
-**Table 5: the three `[errors] mode` values and what each returns.**
-Take from it that a site always gets a status code, and that the richest mode degrades to the simplest one.
-
-For a backend 4xx or 5xx, `m6-http` fetches `[errors] path` with `status` and `from` as query parameters and returns the rendered HTML under the original status code.
-A request already on the error path is answered directly, which is how recursion is refused.
-
-`site.toml` is watched, and a change reloads routing, pools, auth configuration, the invalidation map and the security headers with no restart.
-The TLS certificate and key are watched as well.
-That covers what the edge does, and the next section states how much of each protocol specification it implements.
-
----
-
-## 3. Protocol coverage
-
-m6 implements HTTP/1.1 and HTTP/2 itself and reaches HTTP/3 through *QUIC* (*Quick UDP Internet Connections*) provided by quiche.
-Coverage is measured by three independent conformance testers.
-This section gives the specifications, the scores, and the gaps.
-
-### 3.1 What implements which specification
-
-Table 6 maps each specification to the code that implements it.
-
-| specification | what it covers | where |
-|---|---|---|
-| RFC 9110, semantics | methods, status, field validation, conditional requests, content negotiation, HEAD, hop-by-hop | `m6-core`: `conditional`, `negotiate`, `headers`, `h1`, `http`, `mime`. `m6-http`: `cache`, `forward`, `http11`, `http2`, `error` |
-| RFC 9111, caching | storability, freshness, age, directives, revalidation | `m6-http/cache.rs` |
-| RFC 9112, HTTP/1.1 | parse, serialise, chunked coding, framing | `m6-core/h1.rs`, the one parser, used by every backend and by the edge |
-| RFC 9113, HTTP/2 | frame layer, stream state machine, flow control, error taxonomy, SETTINGS, CONTINUATION, GOAWAY, field validation | `m6-http/http2.rs`, `m6-http/fields.rs` |
-| RFC 7541, *HPACK* (*HTTP/2 header compression*) | prefixed integers, string literals, dynamic table size updates, indexed fields | `m6-http/http2.rs`, with the `hpack` crate for the table |
-| RFC 9114, HTTP/3 | request and response mapping, field validation | `m6-http/fields.rs` shared with HTTP/2, and quiche |
-| RFC 9204, *QPACK* (*HTTP/3 header compression*) | encoder and decoder instruction streams | quiche, static table only |
-| RFC 9000, 9001, 9002, QUIC | transport, TLS, loss recovery | quiche |
-| RFC 6265, cookies | `Set-Cookie` construction, and the rule against folding it | `m6-core/cookie.rs`, `m6-core/headers.rs` |
-| RFC 7838, Alt-Svc | HTTP/3 discovery | `m6-http/main.rs`, advertised on every response |
-
-**Table 6: each protocol specification and the module that implements it.**
-Take from it that field validation is shared between HTTP/2 and HTTP/3 because RFC 9114 4.3 restates RFC 9113 8.3, and that everything below HTTP/3's field layer belongs to quiche.
-
-Most of the edge is protocol code: `m6-http` is 33,124 lines, and the frame layers, the stream state machine and the parsers are the bulk of it.
-Across the serving crates, RFC 9110 is cited 94 times, RFC 9113 78 times, RFC 9112 37 times and RFC 9111 27 times.
-
-### 3.2 Measured conformance
-
-Table 7 gives the recorded floors, which a run must meet.
+**One process terminating TLS, HTTP/1.1, HTTP/2 and HTTP/3 means one place to get them right.**
+Conformance is measured, and Table 1 is the current position.
 
 | suite | target | score |
 |---|---|---|
@@ -247,286 +92,289 @@ Table 7 gives the recorded floors, which a run must meet.
 | h2spec | `m6-http` | 146/146 |
 | h3spec | `m6-http` | 47/49 |
 
-**Table 7: the recorded conformance floors, from `tools/conformance-scores.txt`.**
-Take from it that HTTP/1.1 is measured on four separate binaries because four of them speak it, and that HTTP/3 is the only suite not at full marks.
+**Table 1: the recorded conformance floors, from `tools/conformance-scores.txt`.**
+Take from it that HTTP/1.1 is measured on four binaries because four of them speak it, and that HTTP/3 is the only suite short of full marks.
 
-A run below a floor fails the gate.
-A run above one asks for the floor to be raised in the commit that earned it.
+A backend never terminates TLS, never parses a frame layer and never implements *HPACK* (*HTTP/2 header compression*), so the defect-dense code has one home and one test surface.
+That concentration is also what makes §2.4 possible: a rule applied once at the edge holds for every backend behind it, whatever language it is written in.
 
-### 3.3 The gaps
+### 2.2 Why one thread and no async runtime
 
-Three gaps remain, and Table 8 states each with its standing.
+**A cache hit is a hash map lookup and a write, and an async runtime adds overhead to that.**
+One thread runs the loop and owns every connection's state, so the request path has no cross-thread synchronisation to contend for, and the header scan on the cache-hit path allocates nothing.
+Network descriptors, backend descriptors and the file watcher all sit in one readiness set, so there is nothing to coordinate between.
 
-| gap | standing |
-|---|---|
-| QPACK 4.1.3 and 4.4.3, the last two h3spec tests | Accepted. quiche reads the peer's QPACK instruction streams and discards them, running a static table only. Closing it means new validation on the connection path, with per-stream buffering for instructions split across reads, which is where a careless version becomes unbounded memory on a stream a peer controls |
-| The QUIC stack is a fork of quiche, pinned by revision | Accepted, with an exit condition. Released quiche scores 37/49, and two open upstream pull requests take it to 47/49. The fork is quiche master plus those two. It is pinned by revision so the dependency cannot move under a build that claims to be reproducible, and it is dropped when upstream releases the fixes |
-| RFC 9218, extensible priorities | Not implemented. HTTP/2 priority handling is limited to refusing a stream that depends on itself |
+The trade is stated plainly: a state machine over one loop is harder to write correctly than a thread per request, and far simpler to reason about under load, because there is no interleaving to consider.
+Latency is the measure m6 is judged on, and `BENCHMARKS.md` holds the method for proving a change has not cost any.
 
-**Table 8: the three protocol gaps and where each one stands.**
-Take from it that two gaps are decided and recorded with their reasoning, and that RFC 9218 is the one gap with no decision behind it.
+### 2.3 Why the cache keys and bounds as it does
 
-Protocol work is the largest body of code in m6, and it is also the part that depends least on the rest.
-The library every other process is built from is the subject of the next section.
+**Two responses that differ in bytes are two entries, and everything else about the key follows from that.**
+The key is the path, the query string and the content coding.
+Each coding is a different body, so it is a different entry, and each is stored only when a client asks for it rather than fetched eagerly for codings nobody wants.
+The query string is part of what identifies the resource, so it is part of the key.
 
----
+**The cache has a ceiling because memory does.**
+It holds 128MB of response footprint by default and evicts to 87.5% of that when passed, so a large site degrades to a lower hit rate instead of exhausting the machine.
 
-## 4. The m6-core boundary
+**Two rules decide what may be stored at all, and both exist to stop one client's response reaching another.**
+A response varying on anything except `Accept-Encoding` is never stored, because the key cannot express another dimension.
+And whether a backend compresses is declared once in `site.toml`, read by the edge to decide whether to advertise an encoding dimension and read by the backend itself, which refuses to start when the declaration disagrees with what it does.
+The dangerous direction is a backend that compresses while the declaration says it does not, because the edge then stops varying on `Accept-Encoding` and a compressed body can be replayed to a client that asked for identity and cannot read it.
 
-`m6-core` is the box of blocks a service is assembled from, and the only crate a service links.
-It is 32 modules and 19,937 lines, linked by the edge, by the default apps, and optionally by a site's own Rust backends.
-This section states the rule that decides what goes in, what is in, what stays out, and what linking it costs.
+### 2.4 Why the edge distrusts its own clients
 
-### 4.1 What core is for, and the rule for what goes in
+**A header the proxy generates is a statement only the proxy can make truthfully, so a client's copy is removed on the way in.**
+`x-auth-claims` and `x-forwarded-for` are both stripped from every inbound request, on every protocol, before routing.
 
-**`m6-core` is the PHP of m6: a generic library of components for building web applications.**
-Breadth is the intent.
-A component a website might want belongs in core, which is why it holds templating, compression, minification, cookies, multipart bodies, an SMTP client, an outbound HTTP client, host metrics and firewall reporting beside the HTTP layers.
-A service assembles what it needs from one dependency, and the feature gates in §4.5 decide what it pays for.
+The reason is specific.
+Backends resolve a repeated header by first match, and a proxy appends its own value after the client's, so a forged copy would be the one that wins.
+That makes `x-auth-claims` an authentication bypass, since any client could assert membership of any group, and `x-forwarded-for` a rate-limit bypass, since rotating the value defeats a per-address counter.
+Every per-address decision in the system, including `m6-auth-server`'s login throttle, rests on that strip.
 
-**What decides whether a given piece of code belongs there is consumer count: more than one consumer moves it in, and single-consumer code stays with its consumer.**
-Breadth and singularity are separate questions.
-Core is wide on purpose, and each thing in it exists exactly once.
+**Two more rules hold for the same reason: the edge is the only place they can be applied once.**
+The security response header set is filled in at serialisation, so cache hits, backend responses, generated error pages and refusals all carry it, and a backend that sets its own value for one of them wins.
+A request whose framing does not parse ends the connection, because after a framing error there is no way to know where the next request starts, and guessing is how a smuggled request gets through.
 
-A library with one consumer is that consumer's code in another directory.
-The rule is what keeps HTTP/2, HTTP/3 and the RFC 9111 caching rules in `m6-http`: the edge is the only process that terminates a public connection and the only process that is a cache, and by the architecture nothing else ever will be.
-It is also what puts the shutdown sequence, logging, HTTP/1.1, path validation, content coding negotiation and conditional requests in core, which have five, four, four, two, two and two consumers.
+### 2.5 Why there is one error route and no fallback file
 
-### 4.2 Where core sits
+**One route means one template, and adding a new piece of error context costs no configuration change.**
+The edge fetches the configured error path with `status` and `from` as query parameters and returns the rendered HTML under the original status code.
+A request already on the error path is answered directly, which is how recursion is refused without tracking depth.
 
-Figure 3 shows core beside both sides of the wire contract.
+**There is no static fallback file, because systemd makes one unnecessary.**
+A crashed backend is restarted in seconds (§1.3), so the window in which no pool member can render an error page is short, and a clean status code covers it.
+Maintaining an HTML file, validating its presence at startup, holding it in memory and serving it correctly for every content type is work that solves a problem a supervised deployment barely has.
+What covers the window instead is a mode: a status code with an empty body, the same with minimal generated HTML, or the configured error page, with the richest degrading to the simplest.
 
-```
-                        ┌──────────────────────────────┐
-   public traffic  ───► │  m6-http                     │
-   TLS, h1, h2, h3      │  listener, rate limit, cache │
-                        │  routing, auth, proxy policy │
-                        └───────────────┬──────────────┘
-                                        │  HTTP/1.1 over a Unix socket
-                                        │  (the wire contract)
-                        ┌───────────────▼──────────────┐
-                        │  application                 │
-                        │  m6-html, m6-file, m6-auth,  │
-                        │  m6-monitor, or any language │
-                        └──────────────────────────────┘
-
-   m6-core is linked by m6-http and by the applications. It is a library,
-   never a process, and it never appears in the request path by itself.
-```
-
-**Figure 3: where `m6-core` sits relative to the wire contract.**
-Take from it that core is linked by the processes on both sides of the contract and is not a hop between them.
-
-The wire contract outranks the library.
-`m6-backend-protocol.md` is small enough to implement from scratch in any language in well under a hundred lines, and six reference backends in C, C++, Go, Python and Rust are built and tested from it.
-Core is a convenience for Rust, so behaviour a backend depends on must be readable in the specification, and behaviour that exists only as Rust is a hole in the specification.
-
-### 4.3 What is in core
-
-Table 9 groups them by what they answer.
-
-| group | modules | what they own |
-|---|---|---|
-| Semantics | `conditional`, `negotiate`, `headers`, `http`, `mime` | RFC 9110 rules: preconditions, coding negotiation, repeated fields, content types with charset |
-| HTTP/1.1 | `h1`, `parse` | the one parser and response writer, and the blocking read adapter over it |
-| Service | `app`, `server`, `signal` | the socket server, the accept loop, routing, the thread pool, the shutdown sequence |
-| Configuration | `config`, `watcher` | TOML parsing, secrets merging, and a pollable file-change descriptor |
-| Content | `compress`, `minify`, `template`, `render` | gzip and brotli, HTML, CSS, JSON and JavaScript minification, and the renderer seam |
-| Request and response | `request`, `response`, `dict`, `cookie`, `multipart` | what a handler receives and returns, the layered request dictionary, `Set-Cookie` construction |
-| Safety | `path`, `random`, `parse` | path parameter validation and traversal refusal, cryptographic token generation, and the request caps: 8KB of headers and a 16MB body, answered with 413 |
-| Observability | `log`, `telemetry`, `monitoring`, `host`, `firewall`, `ndjson` | logging setup, the analytics record format, `/health` and `/perf`, host load, memory, disk and temperature, nftables block counters |
-| Test kit | `testkit` | standing a service up, claiming a socket without a race, driving it, tearing it down |
-
-**Table 9: the nine groups of module in `m6-core`.**
-Take from it that core owns the questions an external specification answers and the questions every service asks, and that observability is one of them because every deployment of m6 publishes the same endpoints.
-
-**Safety is grouped alone because a security boundary with two implementations has two behaviours.**
-Path validation allows alphanumerics, `-`, `_`, `.`, and `/` when the route's parameter spans segments, and it refuses `..` anywhere as a substring, a leading or trailing slash, and every other byte including space and NUL.
-A rejected traversal answers 404 and a merely malformed value answers 400, because naming a traversal as a traversal tells the sender their payload reached the router.
-
-**The test kit is in core because core owns conformance.**
-The crate that proves a rule is the crate that owns the harness proving it.
-
-### 4.4 What stays outside
-
-Table 10 gives what looks like core and is a deployment decision.
-
-| stays in `m6-http` | why |
-|---|---|
-| the TLS listener and certificates | a deployment decision, and an application never terminates TLS |
-| the event loop | the edge's concurrency model. Applications use the thread pool (§5.2) |
-| cache storage and eviction | RFC 9111 defines freshness, and not how many megabytes to keep |
-| the route table and matching policy | which paths exist is site configuration |
-| rate limiting | a policy choice about whom to refuse |
-| proxy and pool logic | specific to being the front door |
-| HTTP/2 and HTTP/3 | one consumer, permanently (§4.1) |
-
-**Table 10: what stays in `m6-http`, and the reason for each.**
-Take from it that the split is what a specification requires against what one deployment does.
-
-### 4.5 What linking core costs
-
-**Core must stay linkable by a command line tool.**
-`m6-md` is a Markdown converter and must not acquire a QUIC stack or a TLS library by depending on core.
-With HTTP/2 and HTTP/3 outside, that holds by construction, because nothing in core's scope needs `quiche`, `rustls` or `ring`.
-
-Table 11 gives the feature gates.
-
-| feature | default | adds |
-|---|---|---|
-| `templates` | on | Tera and comrak, behind the renderer seam |
-| `testkit` | off | the integration harness and raw socket clients |
-| `multipart` | off | `multipart/form-data` body parsing |
-| `flash` | off | one-shot messages signed with an *HMAC* (*hash-based message authentication code*) |
-| `csrf` | off | *CSRF* (*cross-site request forgery*) double-submit token generation and checking |
-| `email` | off | an SMTP client |
-| `http-client` | off | an outbound HTTP client |
-
-**Table 11: `m6-core`'s seven feature gates.**
-Take from it that templating is the only one on by default, so a service that renders nothing sets `default-features = false` to avoid linking a template engine.
+The edge is therefore where protocol, caching, trust and error policy all live.
+The next section is about the work it deliberately does not do on a public request.
 
 ---
 
-## 5. The service shape
+## 3. Why authentication sits where it does
 
-Every m6 service except the edge is an `App`: a Unix socket server with a fixed thread pool, a bounded queue, and routes that come from config.
-The shape is the same for a six-line default app and for a site's own backend.
-This section gives the whole of a minimal app, the four ways to hold state, the concurrency model, the request dictionary and the lifecycle.
+Authentication is enforced at the edge, verified without a network call, and absent from the code path of a public request.
+This section says why each of those three is true, because each was a decision and none is obvious.
 
-### 5.1 The whole app
+### 3.1 Why auth is absent rather than skipped
 
-Figure 4 is `m6-html`, complete.
+**A static site is the base case and must be as fast as m6 can make it, so a public route executes no authentication code at all.**
+Routes compile into distinct types at startup, and a public route is a different code path from a protected one.
+A conditional check on every request would cost something even where the branch is never taken, in branch prediction, in unwrapping an option and in cache lines touched, and on a path measured in microseconds that is a cost with no return for the majority of sites.
 
-```rust
-use m6_core::prelude::*;
+A site with no route requiring authentication needs no auth section in `site.toml`, no public key on disk, and no `m6-auth-server` process running.
+Authentication is an absent feature for that site, and absence has no configuration to get wrong.
 
-fn main() -> anyhow::Result<()> {
-    App::new().run()?;
-    Ok(())
-}
-```
+### 3.2 Why verification is local
 
-**Figure 4: `m6-html` in full, which renders every HTML page a site serves.**
-Take from it that a default app supplies no code of its own, because routing, templating, the request dictionary, compression and the lifecycle all come from core.
+**A network call per authenticated request would add latency to every protected route, and signature verification needs no network.**
+The edge holds `m6-auth-server`'s public key and checks the signature, expiry and issuer itself, which is local arithmetic with no I/O.
+The auth service is contacted only for operations that change state: login, refresh and logout.
 
-A service that needs code registers a handler by name, and config binds a route to it.
+Key rotation therefore needs no coordination.
+The signing service starts using a new key immediately, the edge reloads the public key when the file changes, and tokens signed with the old key expire on their own within their lifetime.
+Nothing has to be sequenced, because nothing holds a cached decision.
 
-```toml
-[[route]]
-path    = "/assets/{*relpath}"
-handler = "files"
-root    = "assets/"
-```
+### 3.3 Why enforcement happens twice
 
-**Figure 5: a config route bound to a handler registered in code.**
-Take from it that the handler is code and the route is configuration, so an asset tree is added by editing config and reloading.
+**Route-level enforcement at the edge is a boundary that does not depend on every backend implementing authentication correctly.**
+An unauthenticated request to a protected route never reaches a backend, and the requirement is declared once in `site.toml` rather than reimplemented per backend, in whatever language each is written in.
 
-A route naming a handler that no code registered is refused: startup exits 2, and a reload keeps the previous routes serving.
-
-### 5.2 State and concurrency
-
-Table 12 gives the four entry points.
-
-| entry point | for |
-|---|---|
-| `App::new()` | no state |
-| `App::with_global(init)` | one value shared by every worker, behind an `Arc` |
-| `App::with_thread_state(init)` | one value per worker thread, with no synchronisation |
-| `App::with_state(g, t)` | both |
-
-**Table 12: the four `App` entry points, by what state a service holds.**
-Take from it that a service declares its state shape once and the builder's type carries it, so a handler receives its state with the real type.
-
-The concurrency model is a fixed thread pool over a bounded queue.
-The pool defaults to the CPU count and the queue to eight times the pool.
-A full queue answers 503 immediately, which is how backpressure reaches the edge.
-Scaling is by starting another systemd instance, which the edge picks up within 2 seconds (§2.4).
-
-Routing is by specificity, decided when a route is compiled.
-A literal segment beats a parameter, a parameter beats a wildcard, and `{*name}` captures the rest of the path and is legal only in the last position.
-
-### 5.3 The request dictionary
-
-A request becomes a map that a template or handler reads, assembled in a fixed order from a shared base and a per-request overlay.
-Table 13 gives the order.
-
-| layer | source |
-|---|---|
-| base, built once per route per reload | config keys, then global params files, then the route's static params files |
-| overlay, per request | params files whose path holds a placeholder, path params, query, form fields, cookies, **the built-ins**, auth claims, flash, CSRF token |
-
-**Table 13: the two layers of the request dictionary and what goes in each.**
-Take from it that the base is shared behind an `Arc` and never copied per request, and that the overlay always wins over the base.
-
-The built-ins go in after every params file.
-`request_path`, `datetime` and `year` describe the request, and a content file that could redefine them could make a page lie about which URL it is.
-Only `application/x-www-form-urlencoded` bodies are decoded, and a POST carrying any other body type is logged loudly with its content type.
-
-### 5.4 Lifecycle
-
-**`m6_core::signal::block()` is the first statement of `main`.**
-A thread inherits the signal mask as it stands when it is created, and a service's logging writer is a thread.
-A writer thread created before the mask is set takes SIGTERM at its default disposition, which kills the process.
-`ShutdownHandle::install` asserts the mask is already set and refuses to start otherwise.
-
-There is one shutdown sequence for every service, and what a service supplies is data: the name used in every lifecycle line, the socket to self-connect and unlink on every exit path, and a wake descriptor for a loop parked in epoll or kqueue.
-Core owns the lifecycle log lines, so `journalctl -u <unit> | grep shutdown` means the same thing for every unit.
-
-SIGTERM and SIGINT are identical.
-The first drains in-flight work and exits 0, and the second exits immediately.
-
-| code | meaning |
-|---|---|
-| 0 | clean shutdown |
-| 1 | runtime error |
-| 2 | configuration or usage error, before binding |
-
-**Table 14: the three exit codes every m6 binary uses.**
-Take from it that a supervisor can tell a bad config from a crash, because exit 2 happens before anything binds.
+**Resource-level checks stay in the backend because a route cannot express them.**
+Whether this user may read this document depends on the document, not on the path that addressed it.
+Verified claims are forwarded to the backend so it can answer that question without re-verifying the token, which is why the forwarding header is the one that matters most in §2.4.
 
 ---
 
-## 6. Configuration
+## 4. Why m6-core exists, and where its boundary falls
 
-A site is configured by `site.toml`, one config file per backend process, and one system config holding what differs between environments.
-Secrets live outside the site directory and each key has exactly one owner.
-This section covers the layering, the secrets rule and the reload semantics.
+`m6-core` is the PHP of m6: a generic library of components a service assembles a web application from.
+Breadth is the intent, and singularity is the rule.
+This section says why those two are different questions, why some things stay outside, and why the one exception to all of it is a forked dependency.
 
-### 6.1 Layering and secrets
+### 4.1 Why breadth is the intent
 
-`site.toml` travels with the site under version control and contains no password and no certificate path.
-The system config is a required second positional argument and holds `[server]` alone, which is the bind address and the TLS paths.
-`[server]` is the only section that differs between environments, so restricting the file keeps its purpose obvious.
-The system config wins on conflict, so a deploy that overwrites the site tree cannot change the bind address or the certificate path.
+**A service should be able to build what it needs from one dependency.**
+So core holds templating, compression, minification, cookies, multipart bodies, an SMTP client, an outbound HTTP client, host metrics and firewall reporting beside the HTTP layers, and a component a website might want belongs in it.
+The test of whether that is working is that a new service is small: `m6-html` is six lines and renders every HTML page a site serves.
 
-A backend's secrets come from `secrets_file`, a path outside the site directory.
+Breadth is paid for by feature gates.
+A service names what it wants, so the weight of core is what a given binary uses rather than what core contains, which is what keeps a command line tool such as `m6-md` from acquiring a QUIC stack or a TLS library by depending on it.
 
-**A key set in both a config and its secrets file is refused at startup.**
-A file that is overridden is indistinguishable from a file that is correct when you are reading one file.
-The way to make a missing required value fail loudly is for the value to be absent, which names the key.
+### 4.2 Why each thing in core exists exactly once
 
-### 6.2 Reload
+**The duplicates had already diverged, and four of them were answering incorrectly on the wire.**
+Table 2 is the evidence, and it is the reason the rule below is worth enforcing.
 
-Every service watches its own config file and `site.toml` through one pollable descriptor folded into the loop it already runs, using inotify on Linux and kqueue on the BSDs.
-A reload rebuilds routes, templates and the request dictionary base, and swaps them atomically.
-A reload that fails to parse, fails to compile a template, or names an unregistered handler is refused with the previous state left serving.
+| what existed more than once | what the copies disagreed about |
+|---|---|
+| four HTTP/1.1 parsers | conformance, scoring between 14/32 and 27/32 against the same suite |
+| three path validators | one performed no character validation at all for a parameter of a particular name, accepting spaces, control bytes and NUL |
+| two precondition implementations | one compared ETags strongly where the specification requires weak comparison, answering 200 where 304 was required |
+| three content-coding negotiators | one matched coding names as substrings, so a client that refused brotli with `q=0` was sent brotli |
+| four cookie formatters | which cookies carried `HttpOnly` and `Secure` |
+| four signal handlers | whether a service unlinked its socket, and whether it logged that it had stopped |
+| three route matchers | precedence, so one route table could resolve differently in two services |
 
-Connection settings are read once at startup, because they are applied to a socket at accept time.
-The read timeout defaults to 30 seconds and the socket mode to `0660`.
+**Table 2: what was implemented more than once, and what the copies disagreed about.**
+Take from it that four of the seven were producing a wrong answer to a real request, which is why one implementation per concept is a rule.
 
-`--dump-config` loads the configuration exactly as the service would, prints how every route would be served, and exits 0 when the binary can serve the config and 2 when it cannot.
-That is what validates a new binary against a config before it is installed.
+**The rule: code moves into core when it has more than one consumer, and single-consumer code stays with its consumer.**
+A library with one consumer is that consumer's code in another directory, and moving it there buys an abstraction boundary nobody crosses.
+
+Path validation is the clearest case of why this matters, and it is why validation is grouped as a security boundary: **a security boundary with two implementations has two behaviours.**
+There is now one, allowing alphanumerics, `-`, `_`, `.`, and `/` only where a route's parameter spans segments, and refusing `..` anywhere as a substring.
+A rejected traversal answers 404 and a merely malformed value answers 400, because answering 400 to a traversal confirms to the sender that it was recognised as one, which tells them their payload reached the router and is worth varying.
+
+### 4.3 Why HTTP/2 and HTTP/3 stay at the edge
+
+**They have exactly one consumer, permanently, because `m6-http` is the only process that terminates a public connection.**
+That is the architecture rather than a current limitation, so the consumer count will not change.
+
+The shared-code argument for moving them was measured and did not hold.
+The HTTP/3 path imports exactly one symbol from the HTTP/2 module, and nothing else: no frame layer, no HPACK, no stream state machine.
+HPACK and *QPACK* (*HTTP/3 header compression*) are different algorithms and HTTP/2 frames and QUIC streams are different transports, so the only thing the two versions genuinely share is version-independent semantics, which is in core, so they still share it with neither wire format moving.
+
+**What this costs is worth stating, because it is a real cost.**
+The edge keeps the largest and most defect-dense body of code in the project, and conformance to the HTTP/2 and HTTP/3 specifications remains its property rather than core's.
+That is accepted deliberately in exchange for not maintaining a feature matrix and a large migration for a boundary exactly one caller would ever cross.
+If a second consumer ever appears, a backend that terminates HTTP/2 itself, this is the decision to revisit rather than work around.
+
+The same reasoning keeps the RFC 9111 caching rules at the edge.
+Nothing outside `m6-http` parses or evaluates `Cache-Control`, and by the architecture nothing ever will, because the edge is the cache and the backends sit behind it.
+
+### 4.4 Why the QUIC stack is a fork
+
+**The HTTP/3 conformance gap was upstream rather than ours, and measurement is what established that.**
+Released quiche scores 37/49 on h3spec.
+Twelve failures were traced to the layer below m6: eight where a first-flight transport error leaves a correctly built connection close unsendable, two where reserved packet bits are accepted without validation, and two in QPACK.
+None was reachable through quiche's public interface, so none could be fixed in m6.
+
+Two open upstream pull requests close ten of the twelve, which is 47/49, and the fork is quiche master plus those two, pinned by revision so the dependency cannot move under a build that claims to be reproducible.
+That the transport of a public edge carries community changes upstream has not reviewed is the price, it is recorded as such, and the exit condition is upstream releasing the fixes.
+
+The remaining two failures are QPACK, and they stay.
+quiche reads the peer's QPACK instruction streams and discards them, running a static table only, which is a decision upstream made rather than a defect.
+Closing the gap would mean new validation on the connection path with per-stream buffering for instructions split across reads, which is where a careless implementation becomes unbounded memory on a stream a peer controls.
+That trade was declined for two tests about how politely a hostile peer is refused.
 
 ---
 
-## 7. Summary
+## 5. Why every service has one shape
 
-m6 is six serving binaries with one job each, wired by `site.toml` over Unix sockets, with `m6-http` the only one on a public port in either of its two modes, and every other process answering HTTP/1.1 behind it.
-The edge terminates three HTTP versions, answers from a 128MB cache keyed on path, query and coding, and refuses to accept from a client any header it generates itself.
-Conformance is measured: 32/32 on HTTP/1.1 across four binaries, 146/146 on HTTP/2, and 47/49 on HTTP/3.
+Every m6 service except the edge is an `App`: a Unix socket server with a fixed thread pool, a bounded queue, and routes from configuration.
+This section says why one shape at all, why that concurrency model, why the request dictionary is layered, and why startup and shutdown are not each service's business.
 
-`m6-core` is the PHP of m6, a generic library of components a service assembles a web application from, so its breadth is the intent.
-What decides whether a given piece of code belongs there is consumer count: more than one consumer moves it in, and one consumer keeps it with its consumer, which is why HTTP/2, HTTP/3 and the caching rules stay at the edge, permanently.
-Every service except the edge is the same `App`, and a default app supplies no code of its own.
+### 5.1 Why a fixed pool with a bounded queue
 
-The decisions here are in force with their reasons attached, so changing one means answering its reason.
+**A bounded queue refuses work in a way the edge can act on.**
+The pool defaults to the CPU count and the queue to eight times the pool, and a full queue answers 503 immediately.
+An unbounded queue would accept work it cannot finish, turning an overload into growing latency and eventually memory exhaustion, and a 503 under overload is correct behaviour rather than a failure: it is how backpressure reaches the proxy, which can then answer from cache or shed.
+
+Scaling is by starting another instance rather than by growing one pool, which is why §1.4 made membership discovered.
+
+**State comes in two tiers so that sharing costs as little as possible.**
+A value shared across workers sits behind one reference count, so a request pays one atomic increment and no copy.
+A value per worker is owned by its thread and needs no synchronisation at all, which is what lets a database connection per worker run in parallel with no lock.
+A service declares which it needs once, and the builder's type carries it, so a handler receives its state with the real type rather than casting.
+
+### 5.2 Why the request dictionary is layered
+
+**Most of what a template reads is identical for every request, so it is built once and shared.**
+Configuration keys, global parameter files and a route's static parameter files are merged once per reload and shared behind a reference count, and only what genuinely varies per request is allocated per request.
+Building the whole map per request meant deep-copying the site's content for every page view, and `PERFORMANCE.md` records what that cost.
+
+**The order within it is a security property, not a convenience.**
+Built-in keys such as the request path and the current date go in after every parameter file, so a parameter file cannot override them.
+A content file that could redefine the request path could make a page lie about which URL it is, and moving that step earlier would look like a tidy-up while opening exactly that.
+
+### 5.3 Why startup and shutdown belong to core
+
+**A service that drops work on SIGTERM turns every deploy into a handful of failed requests.**
+So the first signal drains and exits 0, the second exits immediately, and the sequence is core's rather than each service's.
+What a service supplies is data: the name in its lifecycle lines, the socket to unlink on every exit path, and a descriptor to wake a loop that is parked.
+
+**One sequence exists because several diverged.**
+With three ways to install a handler, one service of five unlinked its socket, two logged that they had stopped, and three logged a name that was not their own, and none of that difference was required by anything the services do.
+Core owning the lifecycle lines is what makes searching a journal for a shutdown mean the same thing for every unit.
+
+**Blocking signals is the first statement of `main`, and this is the one ordering rule in m6 that cannot be relaxed.**
+A thread inherits the signal mask as it stands when the thread is created, and a service's logging writer is a thread.
+A writer started before the mask is set has SIGTERM unblocked, the kernel delivers a process-directed signal there, and the default disposition kills the process instead of draining it.
+A supervisor counts death by the signal it sent as a clean stop, so the only symptoms are a missing log line, requests cut rather than drained, and a socket file left behind for the edge to keep in a pool.
+The install asserts the mask is already set and refuses to start otherwise, because nothing else about that failure is visible.
+
+**Exit codes separate a bad configuration from a crash**: 0 for a clean stop, 1 for a runtime error, and 2 for a configuration or usage error, always before anything binds.
+That distinction is what lets a deploy validate a new binary against an existing configuration and refuse to install rather than discover the disagreement in production.
+
+---
+
+## 6. Why configuration is split the way it is
+
+A site is configured by `site.toml`, one file per backend process, and one system configuration holding what differs between environments.
+This section says why that third file exists, why it wins, and why a secret may have only one home.
+
+### 6.1 Why the system configuration holds one section and wins
+
+**The operator and the developer own different things, and the split is what keeps them apart.**
+The bind address and the TLS certificate paths are the only values that genuinely differ between environments, so the system configuration holds that one section and nothing else, which keeps its purpose obvious.
+It is a required argument rather than an optional one, because one code path is simpler to specify and test than a branch for whether it was supplied.
+
+**It wins on conflict so that a deploy cannot change where a server listens or which certificate it presents.**
+An operator needs that to hold regardless of what is deployed over the top of it, and everything else, routes, backends, authentication and logging, comes from `site.toml` unchanged.
+
+The result is that `site.toml` carries no password and no certificate path, which is what lets a site's repository be published.
+
+### 6.2 Why a key may have only one owner
+
+**A key set in both a configuration and its secrets file is refused at startup, because a file that is overridden is indistinguishable from a file that is correct when you are reading one file.**
+A deployed configuration once stated a mail relay, a sender and a port, all four of which were inert because the secrets file replaced them, and an audit read the deployed file and believed it.
+
+The intent behind that overlap was sound: a missing secrets file should fail loudly rather than quietly succeed against the wrong host.
+The mechanism inverted it, because a value that is present and deliberately wrong is what made the configuration lie.
+An absent required value fails loudly by itself and names the key that is missing, which is what the refusal now produces.
+
+### 6.3 Why TLS is always on, and only at the edge
+
+**HTTP/3 requires TLS, so supporting plain HTTP would mean two code paths for one saving.**
+Development uses a locally trusted certificate, which makes it a two-command setup and leaves development and production identical in the one layer most likely to behave differently.
+
+**Traffic between the edge and a backend crosses a Unix socket with no TLS**, because a Unix socket is local, faster than loopback TCP, and has no network exposure.
+The trust boundary is therefore the edge, which is the same concentration that §2.4 relies on.
+
+---
+
+## 7. What is deliberately absent
+
+Naming what m6 does not do is how a reader tells a gap from an omission.
+Table 3 lists what is absent and the reason for each, and the last row is the one to read.
+
+| absent | why |
+|---|---|
+| a build step | content authoring is not web serving. Coupling them would force m6 to hold opinions about content formats, build tools and file pipelines, and a separate tool that understands the site directory needs no m6 internals |
+| Windows | the deployment model is systemd units and Unix sockets |
+| a built-in OAuth2 or OIDC provider, MFA, WebAuthn | out of scope at 1.0 |
+| horizontal scaling of the edge itself | it runs as a single instance per node and scales through caching |
+| HTTP/2 server push | the specification deprecated it, and receipt of a push promise is correctly an error |
+| a computed admission control bound | m6 sheds at queue-full, which is not the same as admitting work against a bound. A latency bound comes from the second, and maximum handler time is unbounded today, so there is no epoch to rate-limit against. An event loop is the model in which admission control is expressible, because a loop can decline work while a full queue can only report that it is full |
+| **RFC 9218 extensible priorities** | **no decision.** Not implemented and not mentioned anywhere in the tree. Every other gap here was weighed and declined, and this one was not, which is why it is named rather than left out |
+
+**Table 3: what m6 does not do, and why.**
+Take from it that all but the last were decided, and that the last is a gap rather than a choice.
+
+---
+
+## 8. Summary
+
+m6 is several processes rather than one because the boundary between them is a wire contract, which is what lets a backend be written in any language, and because one job per process means a restart is contained.
+Only one process faces the internet, which concentrates TLS and three HTTP versions in one place to get right, lets one strip of client-supplied headers protect every backend behind it, and puts the cache where the request already arrives.
+That process runs a single thread because a cache hit is a hash lookup, and its cache is bounded because memory is.
+
+Authentication is absent from a public request rather than skipped, because a branch costs even when it is not taken, and it is verified locally because a network hop per request would cost every protected route.
+`m6-core` is wide on purpose and singular by rule: a service assembles a web application from one dependency, and each thing in it exists exactly once, because the duplicates had diverged and four of those divergences were correctness or security defects.
+HTTP/2, HTTP/3 and the caching rules stay at the edge because they have one consumer permanently, and a library with one consumer is that consumer's code in another directory.
+
+Every service has one shape so that one bounded queue, one state model and one shutdown sequence serve all of them, and the two ordering rules inside that shape each carry a reason recorded beside them: built-ins go in after parameter files so a content file cannot rewrite the request, and signals are blocked before anything spawns a thread so the process drains instead of dying.
+
+Changing any of this means answering the reason rather than editing the rule.
