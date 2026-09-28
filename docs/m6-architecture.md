@@ -107,6 +107,25 @@ So any design that crosses a process boundary to reach its cache spends roughly 
 That is why the response cache lives in the same address space as the TLS stack, and it is the single decision the rest of the edge is built around.
 It is also why a conventional stack cannot meet the premise: a separate cache tier is a process boundary by construction, and §6.1 is the same argument applied to code rather than to requests.
 
+**Which answers the obvious question, why not assemble this from what exists.**
+Table 3 is the set of servers that could have served the purpose.
+**Read it as an architectural comparison and not a benchmark.** The capability columns are from each project's own documentation, none of it was run like-for-like on one machine against one payload, and the figures are indicative of scale rather than measurements this repository stands behind. `BENCHMARKS.md` is the only authority for a number about m6.
+
+| option | in-process cache | terminates TLS | what stops it |
+|---|---|---|---|
+| Varnish plus nginx or hitch | yes, best in class | only in the separate terminator | the cache and the terminator are separate processes, so every hit crosses a boundary of the kind measured at ~13 µs in §1.3 before TLS can send. Against a 2.2 µs lookup that is the dominant cost |
+| H2O | none general-purpose | yes, and the fastest reported, with kernel TLS | the fastest TLS available with no cache to hit |
+| HAProxy | yes, in memory | yes | multi-process, so the cache is shared memory behind a lock |
+| OpenResty | partial, string values in a shared dictionary | yes | needs Lua, and the shared dictionary across workers needs a lock |
+| Envoy | experimental | yes | much heavier per request by its own accounting |
+| Pingora | experimental | yes | a library rather than a binary, and its caching interface is unstable |
+
+**Table 3: the options that could have answered §1.1, and what stops each.**
+Take from it that no row has both halves in one process: the best cache does not terminate TLS, the best TLS has no cache, and the ones with both share the cache behind a lock.
+
+The nearest equivalent to what m6 does is reported to be an internal deployment rather than any open-source configuration, so this is a gap in what is available rather than a wheel being reinvented.
+Shipping two of these together would not close it, because the boundary that costs the crossing is the process boundary itself.
+
 ### 1.4 Why microseconds are not the target on their own
 
 **A host network stack is measured in milliseconds, and a page reaching a person takes several more.**
@@ -138,7 +157,7 @@ The single-source-of-truth half is structural and holds without a measurement.
 Six things to learn, six to configure, and an author writing code and configuration in all of them.
 
 **m6 is one stack from Markdown to the edge, and the parts know about each other.**
-Table 3 gives three things that awareness buys, each of which is in the code today.
+Table 4 gives three things that awareness buys, each of which is in the code today.
 
 | what a mutually aware stack can do | how m6 does it |
 |---|---|
@@ -146,7 +165,7 @@ Table 3 gives three things that awareness buys, each of which is in the code tod
 | measure the site without changing it | a request carrying `no-cache` misses and reaches the backend, and the stored entry survives untouched. Monitoring responses are excluded from the traffic counters, and a warming fetch mints no session and logs no miss, so measuring does not move what is measured |
 | warm itself | the edge already holds its parsed route table, so it queues one fetch per concrete route per encoding, skipping patterns, the error path and anything marked `no-store`. It drains one per loop iteration, so warming cannot delay startup or stampede the origin |
 
-**Table 3: three things a mutually aware stack can do, and how m6 does each.**
+**Table 4: three things a mutually aware stack can do, and how m6 does each.**
 Take from it that every row needs one part of the stack to act on something another part owns, which six independently developed products have no way to do.
 
 The warming row is the clearest measure of what integration is worth.
@@ -164,7 +183,7 @@ One protocol to debug, secure, log and measure, and any process in the system ca
 ### 1.8 What this gives up
 
 Stating the cost is part of the design, because a reader choosing m6 needs to know when not to.
-Table 4 gives what the single-threaded, single-process-cache model surrenders.
+Table 5 gives what the single-threaded, single-process-cache model surrenders.
 
 | given up | why it follows from the design |
 |---|---|
@@ -173,7 +192,7 @@ Table 4 gives what the single-threaded, single-process-cache model surrenders.
 | zero-copy file serving | content is copied through userspace buffers, so a server using `sendfile()` pulls ahead as responses grow past a few kilobytes |
 | kernel TLS | pushing encryption into the kernel is a Linux feature not yet in the TLS stack m6 uses, and it is the largest remaining piece of the gap in §1.2 |
 
-**Table 4: what m6's design surrenders, and why each follows from it.**
+**Table 5: what m6's design surrenders, and why each follows from it.**
 Take from it that every entry is a consequence of one thread owning the hot path and the cache living in its address space, and that none is a defect to be fixed without changing that premise.
 
 ### 1.9 When m6 is the wrong choice
@@ -190,7 +209,7 @@ Everything in the rest of this document follows from §1.1 and §1.4, starting w
 
 **m6 is six serving binaries, each with one job, wired by `site.toml` over Unix sockets, with one of them on the public port.**
 This section is the shape in brief, so the reasoning from §3 onwards has something to refer to.
-Table 5 names each binary and its job.
+Table 6 names each binary and its job.
 
 | binary | one job |
 |---|---|
@@ -201,7 +220,7 @@ Table 5 names each binary and its job.
 | `m6-auth-server` | verify credentials and sign *JWTs* (*JSON Web Tokens*) |
 | `m6-monitor` | poll each node's health and performance endpoints and serve one report |
 
-**Table 5: the six serving binaries and the one job each has.**
+**Table 6: the six serving binaries and the one job each has.**
 Take from it that only `m6-http` is reachable from the internet, in either of its two modes, and that every other process answers HTTP/1.1 on a Unix socket behind it.
 
 Two command line tools sit outside that set: `m6-md` converts a directory of Markdown into one JSON file, and `m6-auth-cli` manages users and groups against the auth database.
@@ -264,7 +283,7 @@ This section says why the protocol burden is concentrated there, why it runs one
 ### 4.1 Why the protocol burden is concentrated
 
 **One process terminating TLS and three HTTP versions means one place to get them right.**
-Conformance is measured, and Table 6 is the current position.
+Conformance is measured, and Table 7 is the current position.
 
 | suite | target | score |
 |---|---|---|
@@ -272,7 +291,7 @@ Conformance is measured, and Table 6 is the current position.
 | h2spec | `m6-http` | 146/146 |
 | h3spec | `m6-http` | 47/49 |
 
-**Table 6: the recorded conformance floors, from `tools/conformance-scores.txt`.**
+**Table 7: the recorded conformance floors, from `tools/conformance-scores.txt`.**
 Take from it that HTTP/1.1 is measured on four binaries because four of them speak it, and that HTTP/3 is the only suite short of full marks.
 
 A backend never terminates TLS, never parses a frame layer and never implements *HPACK* (*HTTP/2 header compression*), so the defect-dense code has one home and one test surface.
@@ -382,7 +401,7 @@ A service names what it wants, so the weight of core is what a binary uses rathe
 ### 6.2 Why each thing in core exists exactly once
 
 **The duplicates had already diverged, and four of them were answering incorrectly on the wire.**
-Table 7 is the evidence, and it is why the rule below is worth enforcing.
+Table 8 is the evidence, and it is why the rule below is worth enforcing.
 
 | what existed more than once | what the copies disagreed about |
 |---|---|
@@ -394,11 +413,13 @@ Table 7 is the evidence, and it is why the rule below is worth enforcing.
 | four signal handlers | whether a service unlinked its socket, and whether it logged that it had stopped |
 | three route matchers | precedence, so one route table could resolve differently in two services |
 
-**Table 7: what was implemented more than once, and what the copies disagreed about.**
+**Table 8: what was implemented more than once, and what the copies disagreed about.**
 Take from it that four of the seven were producing a wrong answer to a real request, which is why one implementation per concept is a rule.
 
 **The rule: code moves into core when it has more than one consumer, and single-consumer code stays with its consumer.**
 A library with one consumer is that consumer's code in another directory, and moving it there buys an abstraction boundary nobody crosses.
+
+Route matching is the one entry with an implementation exception open against it, recorded in §9 with its issue number.
 
 Path validation is why validation is grouped as a security boundary: **a security boundary with two implementations has two behaviours.**
 There is now one, allowing alphanumerics, `-`, `_`, `.`, and `/` only where a route's parameter spans segments, and refusing `..` anywhere as a substring.
@@ -519,7 +540,7 @@ The trust boundary is the edge, which is the concentration §4.4 relies on.
 
 The decisions above shape the system.
 These shape working with it, and each is small enough that the reason matters more than the rule.
-Table 8 gives them by area.
+Table 9 gives them by area.
 
 | area | decision | why |
 |---|---|---|
@@ -528,6 +549,7 @@ Table 8 gives them by area.
 | routing | `{*name}` spans segments and is legal only last | a wildcard in the middle has no single correct split, and making the last parameter implicitly greedy would change the meaning of every route already written |
 | routing | a route naming a handler no code registered is fatal at startup and refused on reload | a route that 404s while the config says it should serve is an outage that looks like a missing page |
 | routing | the same parameter syntax in `site.toml` and in a backend's config | one syntax to learn, and one matcher to be correct |
+| routing | one specification for route matching, with one implementation to come. The edge uses `matchit` and core its own compiled segments today | the two agree on every pattern a site writes, and `m6-http/tests/route_matcher_agreement.rs` pins the three paths where they do not, so the gap cannot widen unnoticed. Issue #177 closes it by core adopting `matchit`, whose stricter reading of a trailing slash and a doubled slash is the correct one |
 | request data | path parameters are validated before use, and a traversal answers 404 while a malformed value answers 400 | answering 400 to a traversal confirms it was recognised as one, which tells the sender their payload reached the router and is worth varying |
 | request data | only `application/x-www-form-urlencoded` bodies are decoded, and any other body on a POST is logged loudly | a client that switched to multipart once produced empty fields everywhere, which looked downstream like a failed check with nothing in any log to say a body had been skipped |
 | request data | query parameters appear at the top level and as a nested map | a template wants one and a handler iterating wants the other |
@@ -546,7 +568,7 @@ Table 8 gives them by area.
 | auth | login is throttled per address | it is the one endpoint where guessing is the attack |
 | auth | a requirement is spelled as a group or a role, and an unknown form denies | a typo in a requirement must fail closed |
 
-**Table 8: the remaining decisions by area, each with the reason behind it.**
+**Table 9: the remaining decisions by area, each with the reason behind it.**
 Take from it that most exist because the alternative had already produced a defect, and that the pattern across them is failing closed and failing loudly.
 
 ---
@@ -554,7 +576,7 @@ Take from it that most exist because the alternative had already produced a defe
 ## 10. What is deliberately absent
 
 Naming what m6 does not do is how a reader tells a gap from an omission.
-Table 9 lists what is absent and the reason, and the last row is the one to read.
+Table 10 lists what is absent and the reason, and the last row is the one to read.
 
 | absent | why |
 |---|---|
@@ -566,7 +588,7 @@ Table 9 lists what is absent and the reason, and the last row is the one to read
 | a computed admission control bound | m6 sheds at queue-full, which is not admitting work against a bound. A latency bound comes from the second, and maximum handler time is unbounded today, so there is no epoch to rate-limit against. An event loop is the model in which admission control is expressible, because a loop can decline work while a full queue can only report that it is full |
 | **RFC 9218 extensible priorities** | **no decision.** Not implemented and not mentioned anywhere in the tree. Every other gap here was weighed and declined, and this one was not |
 
-**Table 9: what m6 does not do, and why.**
+**Table 10: what m6 does not do, and why.**
 Take from it that all but the last were decided, and that the last is a gap rather than a choice.
 
 ---
