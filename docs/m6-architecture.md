@@ -43,8 +43,23 @@ This section gives the premise, what reality adds, why microseconds are not the 
 ### 1.1 The premise: a path is a symbol
 
 **A trading engine measures tick to trade, and its job in that window is a symbol lookup and a write.**
-On bare metal, with a kernel-bypass network stack of the ExaNIC and ExaSOCK class, that window is about a microsecond.
-That is the number m6's design was aimed at.
+On bare metal with a kernel-bypass network stack that window is under a microsecond, and the reference class is the ExaNIC family with its `exasock` sockets library, now sold as the Cisco Nexus SmartNIC.
+Table 1 gives its published latencies.
+
+| path | measured | how |
+|---|---|---|
+| native API, small Ethernet frame | 780 ns application to application | direct access to the card |
+| `exasock`, TCP | 930 ns | `sockperf`, through the socket acceleration library |
+| `exasock`, UDP | 880 ns | `sockperf`, through the socket acceleration library |
+
+**Table 1: published ExaNIC latencies, which are the floor m6's design was aimed at.**
+Take from it that a sub-microsecond request to response is achievable with hardware assistance and kernel bypass, which is what makes a microsecond the right order of magnitude to aim a server design at.
+
+`exasock` reaches those figures by intercepting the Linux socket calls and sending directly to the card, with no change to the application.
+Sources: the [ExaNIC sockets guide](https://exablaze.com/docs/exanic/user-guide/sockets/), the [ExaNIC benchmarking guide](https://exablaze.com/docs/exanic/user-guide/benchmarking/) and [cisco/exanic-software](https://github.com/cisco/exanic-software).
+
+**That floor is hardware-assisted, and m6 is a userspace server on a general-purpose stack.**
+So it is the target the design was aimed at rather than a figure m6 claims, and §1.2 gives the distance.
 
 **HTTP has the same shape, and most assets on most sites are static.**
 A path is a symbol. A response is the trade. So serving a page should be a hash map lookup and one write of a buffer and a length.
@@ -64,7 +79,7 @@ Four rules follow, and they are the whole of m6's hot path:
 None of that is optional for a public site, and all of it sits between the symbol lookup and the client.
 
 **Every figure in this section is an order of magnitude with its conditions attached, and none is a guarantee.**
-Table 1 states what each number is, because the difference between a target, a component cost and an end-to-end measurement is what made this repository's numbers drift once already.
+Table 2 states what each number is, because the difference between a target, a component cost and an end-to-end measurement is what made this repository's numbers drift once already.
 `BENCHMARKS.md` is authoritative for every measured figure, and a number appearing anywhere without the conditions that produced it is to be treated as wrong.
 
 | figure | what it is | status |
@@ -75,7 +90,7 @@ Table 1 states what each number is, because the difference between a target, a c
 | ~226 µs | an HTTP/2 cache hit end to end on the benchmark host | measured, includes TLS, loopback and the client |
 | 5 ms | request to response for a real user | the target that governs every latency decision (§1.4) |
 
-**Table 1: the figures this section uses, what each one measures, and which are targets.**
+**Table 2: the figures this section uses, what each one measures, and which are targets.**
 Take from it that the microsecond figures are component costs and the millisecond figure is the goal, so quoting any of them as another is the mistake to avoid.
 
 The 2.2 µs cache hit is the trading-engine window and it sits within roughly twice the target.
@@ -122,7 +137,7 @@ The single-source-of-truth half is structural and holds without a measurement.
 Six things to learn, six to configure, and an author writing code and configuration in all of them.
 
 **m6 is one stack from Markdown to the edge, and the parts know about each other.**
-Table 2 gives three things that awareness buys, each of which is in the code today.
+Table 3 gives three things that awareness buys, each of which is in the code today.
 
 | what a mutually aware stack can do | how m6 does it |
 |---|---|
@@ -130,7 +145,7 @@ Table 2 gives three things that awareness buys, each of which is in the code tod
 | measure the site without changing it | a request carrying `no-cache` misses and reaches the backend, and the stored entry survives untouched. Monitoring responses are excluded from the traffic counters, and a warming fetch mints no session and logs no miss, so measuring does not move what is measured |
 | warm itself | the edge already holds its parsed route table, so it queues one fetch per concrete route per encoding, skipping patterns, the error path and anything marked `no-store`. It drains one per loop iteration, so warming cannot delay startup or stampede the origin |
 
-**Table 2: three things a mutually aware stack can do, and how m6 does each.**
+**Table 3: three things a mutually aware stack can do, and how m6 does each.**
 Take from it that every row needs one part of the stack to act on something another part owns, which six independently developed products have no way to do.
 
 The warming row is the clearest measure of what integration is worth.
@@ -148,7 +163,7 @@ One protocol to debug, secure, log and measure, and any process in the system ca
 ### 1.8 What this gives up
 
 Stating the cost is part of the design, because a reader choosing m6 needs to know when not to.
-Table 3 gives what the single-threaded, single-process-cache model surrenders.
+Table 4 gives what the single-threaded, single-process-cache model surrenders.
 
 | given up | why it follows from the design |
 |---|---|
@@ -157,7 +172,7 @@ Table 3 gives what the single-threaded, single-process-cache model surrenders.
 | zero-copy file serving | content is copied through userspace buffers, so a server using `sendfile()` pulls ahead as responses grow past a few kilobytes |
 | kernel TLS | pushing encryption into the kernel is a Linux feature not yet in the TLS stack m6 uses, and it is the largest remaining piece of the gap in §1.2 |
 
-**Table 3: what m6's design surrenders, and why each follows from it.**
+**Table 4: what m6's design surrenders, and why each follows from it.**
 Take from it that every entry is a consequence of one thread owning the hot path and the cache living in its address space, and that none is a defect to be fixed without changing that premise.
 
 ### 1.9 When m6 is the wrong choice
@@ -174,7 +189,7 @@ Everything in the rest of this document follows from §1.1 and §1.4, starting w
 
 **m6 is six serving binaries, each with one job, wired by `site.toml` over Unix sockets, with one of them on the public port.**
 This section is the shape in brief, so the reasoning from §3 onwards has something to refer to.
-Table 4 names each binary and its job.
+Table 5 names each binary and its job.
 
 | binary | one job |
 |---|---|
@@ -185,7 +200,7 @@ Table 4 names each binary and its job.
 | `m6-auth-server` | verify credentials and sign *JWTs* (*JSON Web Tokens*) |
 | `m6-monitor` | poll each node's health and performance endpoints and serve one report |
 
-**Table 4: the six serving binaries and the one job each has.**
+**Table 5: the six serving binaries and the one job each has.**
 Take from it that only `m6-http` is reachable from the internet, in either of its two modes, and that every other process answers HTTP/1.1 on a Unix socket behind it.
 
 Two command line tools sit outside that set: `m6-md` converts a directory of Markdown into one JSON file, and `m6-auth-cli` manages users and groups against the auth database.
@@ -248,7 +263,7 @@ This section says why the protocol burden is concentrated there, why it runs one
 ### 4.1 Why the protocol burden is concentrated
 
 **One process terminating TLS and three HTTP versions means one place to get them right.**
-Conformance is measured, and Table 5 is the current position.
+Conformance is measured, and Table 6 is the current position.
 
 | suite | target | score |
 |---|---|---|
@@ -256,7 +271,7 @@ Conformance is measured, and Table 5 is the current position.
 | h2spec | `m6-http` | 146/146 |
 | h3spec | `m6-http` | 47/49 |
 
-**Table 5: the recorded conformance floors, from `tools/conformance-scores.txt`.**
+**Table 6: the recorded conformance floors, from `tools/conformance-scores.txt`.**
 Take from it that HTTP/1.1 is measured on four binaries because four of them speak it, and that HTTP/3 is the only suite short of full marks.
 
 A backend never terminates TLS, never parses a frame layer and never implements *HPACK* (*HTTP/2 header compression*), so the defect-dense code has one home and one test surface.
@@ -366,7 +381,7 @@ A service names what it wants, so the weight of core is what a binary uses rathe
 ### 6.2 Why each thing in core exists exactly once
 
 **The duplicates had already diverged, and four of them were answering incorrectly on the wire.**
-Table 6 is the evidence, and it is why the rule below is worth enforcing.
+Table 7 is the evidence, and it is why the rule below is worth enforcing.
 
 | what existed more than once | what the copies disagreed about |
 |---|---|
@@ -378,7 +393,7 @@ Table 6 is the evidence, and it is why the rule below is worth enforcing.
 | four signal handlers | whether a service unlinked its socket, and whether it logged that it had stopped |
 | three route matchers | precedence, so one route table could resolve differently in two services |
 
-**Table 6: what was implemented more than once, and what the copies disagreed about.**
+**Table 7: what was implemented more than once, and what the copies disagreed about.**
 Take from it that four of the seven were producing a wrong answer to a real request, which is why one implementation per concept is a rule.
 
 **The rule: code moves into core when it has more than one consumer, and single-consumer code stays with its consumer.**
@@ -503,7 +518,7 @@ The trust boundary is the edge, which is the concentration §4.4 relies on.
 
 The decisions above shape the system.
 These shape working with it, and each is small enough that the reason matters more than the rule.
-Table 7 gives them by area.
+Table 8 gives them by area.
 
 | area | decision | why |
 |---|---|---|
@@ -530,7 +545,7 @@ Table 7 gives them by area.
 | auth | login is throttled per address | it is the one endpoint where guessing is the attack |
 | auth | a requirement is spelled as a group or a role, and an unknown form denies | a typo in a requirement must fail closed |
 
-**Table 7: the remaining decisions by area, each with the reason behind it.**
+**Table 8: the remaining decisions by area, each with the reason behind it.**
 Take from it that most exist because the alternative had already produced a defect, and that the pattern across them is failing closed and failing loudly.
 
 ---
@@ -538,7 +553,7 @@ Take from it that most exist because the alternative had already produced a defe
 ## 10. What is deliberately absent
 
 Naming what m6 does not do is how a reader tells a gap from an omission.
-Table 8 lists what is absent and the reason, and the last row is the one to read.
+Table 9 lists what is absent and the reason, and the last row is the one to read.
 
 | absent | why |
 |---|---|
@@ -550,7 +565,7 @@ Table 8 lists what is absent and the reason, and the last row is the one to read
 | a computed admission control bound | m6 sheds at queue-full, which is not admitting work against a bound. A latency bound comes from the second, and maximum handler time is unbounded today, so there is no epoch to rate-limit against. An event loop is the model in which admission control is expressible, because a loop can decline work while a full queue can only report that it is full |
 | **RFC 9218 extensible priorities** | **no decision.** Not implemented and not mentioned anywhere in the tree. Every other gap here was weighed and declined, and this one was not |
 
-**Table 8: what m6 does not do, and why.**
+**Table 9: what m6 does not do, and why.**
 Take from it that all but the last were decided, and that the last is a gap rather than a choice.
 
 ---
