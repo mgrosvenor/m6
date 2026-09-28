@@ -128,7 +128,12 @@ fn the_two_matchers_agree_on_what_sites_actually_write() {
 /// parameter in both, and it does.
 #[test]
 fn the_two_matchers_agree_that_a_literal_beats_a_parameter() {
-    let patterns = &["/blog/feed", "/blog/{stem}", "/assets/style.css", "/assets/{name}"];
+    let patterns = &[
+        "/blog/feed",
+        "/blog/{stem}",
+        "/assets/style.css",
+        "/assets/{name}",
+    ];
     let paths = &[
         "/blog/feed",
         "/blog/anything",
