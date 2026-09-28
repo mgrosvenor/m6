@@ -525,8 +525,8 @@ m6 is six serving binaries with one job each, wired by `site.toml` over Unix soc
 The edge terminates three HTTP versions, answers from a 128MB cache keyed on path, query and coding, and refuses to accept from a client any header it generates itself.
 Conformance is measured: 32/32 on HTTP/1.1 across four binaries, 146/146 on HTTP/2, and 47/49 on HTTP/3.
 
-`m6-core` holds what an external specification answers and what every service needs, and the rule that decides is consumer count.
-More than one consumer moves code into core, and one consumer keeps it with its consumer, which is why HTTP/2, HTTP/3 and the caching rules stay at the edge, permanently.
+`m6-core` is the PHP of m6, a generic library of components a service assembles a web application from, so its breadth is the intent.
+What decides whether a given piece of code belongs there is consumer count: more than one consumer moves it in, and one consumer keeps it with its consumer, which is why HTTP/2, HTTP/3 and the caching rules stay at the edge, permanently.
 Every service except the edge is the same `App`, and a default app supplies no code of its own.
 
 The decisions here are in force with their reasons attached, so changing one means answering its reason.
