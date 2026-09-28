@@ -384,7 +384,7 @@ pool and may have several requests in flight to one member at once.
 A backend MUST be able to accept a new connection while handling another. It
 MAY do so with threads, processes, or an event loop.
 
-The reference model, per `m6-decisions.md`, is a **fixed thread pool with a
+The reference model, per `m6-architecture.md` §5.2, is a **fixed thread pool with a
 bounded queue**: pool size defaults to the CPU count, queue depth to pool size
 times eight, and a full queue returns `503` immediately rather than queueing
 without limit. Returning `503` under overload is correct behaviour and is how
