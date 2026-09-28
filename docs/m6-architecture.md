@@ -398,10 +398,30 @@ The test of whether that is working is that a new service is small: `m6-html` is
 Breadth is paid for by feature gates.
 A service names what it wants, so the weight of core is what a binary uses rather than what core contains, which keeps a command line tool such as `m6-md` from acquiring a QUIC stack or a TLS library by depending on it.
 
+Table 8 gives the sorts of component core holds, in brief.
+
+| sort of component | what it covers |
+|---|---|
+| HTTP semantics | the version-independent rules: conditional requests, content negotiation, repeated header fields, content types with charset |
+| HTTP/1.1 | the one request parser and response writer, and the blocking read adapter over it |
+| Service scaffolding | the socket server, the accept loop, routing, the thread pool, the shutdown sequence |
+| Configuration | parsing and validation, secrets merging, and a pollable file-change descriptor for reload |
+| Request and response | what a handler receives and returns, the layered request dictionary, cookie construction, multipart bodies |
+| Content | gzip and brotli, HTML, CSS, JSON and JavaScript minification, and the renderer seam with its template implementation behind it |
+| Safety | path parameter validation and traversal refusal, request size caps, cryptographic token generation |
+| Observability | logging setup, the analytics record format, the health and performance endpoints, host load, memory, disk and temperature, firewall counters, newline-delimited JSON |
+| Test kit | standing a service up, claiming a socket without a race, driving it and tearing it down |
+| Errors and helpers | the one error type and the status each variant becomes, dates and slugs |
+
+**Table 8: the sorts of component `m6-core` holds.**
+Take from it that core spans the HTTP specification, the service lifecycle and the operational surface, which is the breadth this section argues for, and that a service links only the sorts it names.
+
+`m6-core-reference.md` is where each of these is broken out module by module with its interface, and this table stays deliberately coarse so the two documents do not drift.
+
 ### 6.2 Why each thing in core exists exactly once
 
 **The duplicates had already diverged, and four of them were answering incorrectly on the wire.**
-Table 8 is the evidence, and it is why the rule below is worth enforcing.
+Table 9 is the evidence, and it is why the rule below is worth enforcing.
 
 | what existed more than once | what the copies disagreed about |
 |---|---|
@@ -413,13 +433,12 @@ Table 8 is the evidence, and it is why the rule below is worth enforcing.
 | four signal handlers | whether a service unlinked its socket, and whether it logged that it had stopped |
 | three route matchers | precedence, so one route table could resolve differently in two services |
 
-**Table 8: what was implemented more than once, and what the copies disagreed about.**
+**Table 9: what was implemented more than once, and what the copies disagreed about.**
 Take from it that four of the seven were producing a wrong answer to a real request, which is why one implementation per concept is a rule.
 
 **The rule: code moves into core when it has more than one consumer, and single-consumer code stays with its consumer.**
 A library with one consumer is that consumer's code in another directory, and moving it there buys an abstraction boundary nobody crosses.
 
-Route matching is the one entry with an implementation exception open against it, recorded in §9 with its issue number.
 
 Path validation is why validation is grouped as a security boundary: **a security boundary with two implementations has two behaviours.**
 There is now one, allowing alphanumerics, `-`, `_`, `.`, and `/` only where a route's parameter spans segments, and refusing `..` anywhere as a substring.
@@ -540,7 +559,7 @@ The trust boundary is the edge, which is the concentration §4.4 relies on.
 
 The decisions above shape the system.
 These shape working with it, and each is small enough that the reason matters more than the rule.
-Table 9 gives them by area.
+Table 10 gives them by area.
 
 | area | decision | why |
 |---|---|---|
@@ -549,7 +568,6 @@ Table 9 gives them by area.
 | routing | `{*name}` spans segments and is legal only last | a wildcard in the middle has no single correct split, and making the last parameter implicitly greedy would change the meaning of every route already written |
 | routing | a route naming a handler no code registered is fatal at startup and refused on reload | a route that 404s while the config says it should serve is an outage that looks like a missing page |
 | routing | the same parameter syntax in `site.toml` and in a backend's config | one syntax to learn, and one matcher to be correct |
-| routing | one specification for route matching, with one implementation to come. The edge uses `matchit` and core its own compiled segments today | the two agree on every pattern a site writes, and `m6-http/tests/route_matcher_agreement.rs` pins the three paths where they do not, so the gap cannot widen unnoticed. Issue #177 closes it by core adopting `matchit`, whose stricter reading of a trailing slash and a doubled slash is the correct one |
 | request data | path parameters are validated before use, and a traversal answers 404 while a malformed value answers 400 | answering 400 to a traversal confirms it was recognised as one, which tells the sender their payload reached the router and is worth varying |
 | request data | only `application/x-www-form-urlencoded` bodies are decoded, and any other body on a POST is logged loudly | a client that switched to multipart once produced empty fields everywhere, which looked downstream like a failed check with nothing in any log to say a body had been skipped |
 | request data | query parameters appear at the top level and as a nested map | a template wants one and a handler iterating wants the other |
@@ -568,7 +586,7 @@ Table 9 gives them by area.
 | auth | login is throttled per address | it is the one endpoint where guessing is the attack |
 | auth | a requirement is spelled as a group or a role, and an unknown form denies | a typo in a requirement must fail closed |
 
-**Table 9: the remaining decisions by area, each with the reason behind it.**
+**Table 10: the remaining decisions by area, each with the reason behind it.**
 Take from it that most exist because the alternative had already produced a defect, and that the pattern across them is failing closed and failing loudly.
 
 ---
@@ -576,7 +594,7 @@ Take from it that most exist because the alternative had already produced a defe
 ## 10. What is deliberately absent
 
 Naming what m6 does not do is how a reader tells a gap from an omission.
-Table 10 lists what is absent and the reason, and the last row is the one to read.
+Table 11 lists what is absent and the reason, and the last row is the one to read.
 
 | absent | why |
 |---|---|
@@ -588,7 +606,7 @@ Table 10 lists what is absent and the reason, and the last row is the one to rea
 | a computed admission control bound | m6 sheds at queue-full, which is not admitting work against a bound. A latency bound comes from the second, and maximum handler time is unbounded today, so there is no epoch to rate-limit against. An event loop is the model in which admission control is expressible, because a loop can decline work while a full queue can only report that it is full |
 | **RFC 9218 extensible priorities** | **no decision.** Not implemented and not mentioned anywhere in the tree. Every other gap here was weighed and declined, and this one was not |
 
-**Table 10: what m6 does not do, and why.**
+**Table 11: what m6 does not do, and why.**
 Take from it that all but the last were decided, and that the last is a gap rather than a choice.
 
 ---
