@@ -5,13 +5,13 @@ Why m6 exists, what problem it solves, how it solves it, and the reason behind e
 
 Four other documents answer what, and this one does not repeat them.
 `README.md` says what m6 is and how to run one, `m6-core-reference.md` names every component and interface, `m6-site-toml.md` gives every configuration key, and `m6-backend-protocol.md` specifies the wire contract.
-`PERFORMANCE.md`, `BENCHMARKS.md` and `POSITIONING.md` carry the measurements, including the comparison against other servers.
+`BENCHMARKS.md` is authoritative for every measured number, and `PERFORMANCE.md` carries the per-component costs.
 
 A decision recorded without its reason is a rule nobody can safely change.
 Someone reading only the shape of m6 will reasonably conclude that a branch could be added here, a lock moved there, a file introduced to cover an error case, and each of those undoes something decided for a reason.
 So every section asks a question and answers it, and mechanism appears only as far as a reason needs it.
 
-We begin with the problem m6 exists to solve and what solving it that way costs (§1), then the shape that follows (§2).
+We begin with the question m6 was built to answer, what reality added to it, and what it gives up (§1), then the shape that follows (§2).
 §3 to §8 take each part of that shape and give the reasoning: the process family, the edge, authentication, the library, the service shape, and configuration.
 §9 holds the remaining decisions with a reason each, §10 states what is deliberately absent, and §11 summarises.
 
@@ -19,7 +19,7 @@ Where this document and the code disagree, the code is right and this document i
 
 ## Contents
 
-1. [The problem m6 solves](#1-the-problem-m6-solves)
+1. [The question m6 answers](#1-the-question-m6-answers)
 2. [The shape that follows](#2-the-shape-that-follows)
 3. [Why a family of processes](#3-why-a-family-of-processes)
 4. [Why one process faces the internet](#4-why-one-process-faces-the-internet)
@@ -33,85 +33,140 @@ Where this document and the code disagree, the code is right and this document i
 
 ---
 
-## 1. The problem m6 solves
+## 1. The question m6 answers
 
-**m6 exists because no widely deployed proxy combines an in-process response cache with *TLS* (*Transport Layer Security*) termination in a single-threaded event loop.**
-Every mature option has one half of that and reaches the other half across a process boundary or a lock.
+**m6 began as a question: what does it look like to treat an HTTP server like a high performance trading engine?**
+Everything in this document is the answer to that, plus what reality did to it.
 
-This section states what m6 is built to do, which existing options were considered and why each falls short, why that shortfall is structural, what m6 does instead, what doing it that way gives up, and when m6 is the wrong choice.
+This section gives the premise, what reality adds, why microseconds are not the target on their own, why a site runs its own edge, what an integrated stack buys, and where m6 is the wrong choice.
 
-### 1.1 What m6 is built to do
+### 1.1 The premise: a path is a symbol
 
-**Answer a cache hit over TLS, with HTTP/2 or HTTP/3, in tens of microseconds, and describe the whole stack in one file.**
-The measured figure for the round trip m6 is built around is about 22 microseconds at the median for an HTTP/2 cache hit, and `BENCHMARKS.md` and `POSITIONING.md` hold the method and the comparisons.
+**A trading engine measures tick to trade, and its job in that window is a symbol lookup and a write.**
+On bare metal, with a kernel-bypass network stack of the ExaNIC and ExaSOCK class, that window is about a microsecond.
+That is the number m6's design was aimed at.
 
-That number is the whole design constraint, because it is small enough that a single inter-process hop is not a detail.
-An answer assembled from separate products has to cross at least one such hop before the bytes can be encrypted and sent, and at this scale that hop is larger than the work.
+**HTTP has the same shape, and most assets on most sites are static.**
+A path is a symbol. A response is the trade. So serving a page should be a hash map lookup and one write of a buffer and a length.
 
-### 1.2 Which options were considered, and why each falls short
+Four rules follow, and they are the whole of m6's hot path:
 
-Table 1 is the set of existing servers that could have served this purpose, and what stops each.
+- the page is **already in memory**, so nothing is read from disk to answer
+- the page is **already compressed**, so nothing is encoded per request
+- **nothing allocates** on the critical path
+- **no compute happens** that the answer does not require
 
-| option | in-process cache | terminates TLS | what stops it |
-|---|---|---|---|
-| Varnish plus nginx or hitch | yes, best in class | only in the separate terminator | the cache and the terminator are separate processes, so every hit crosses a Unix socket round trip of 20 to 50 microseconds before TLS can send. Against a 22 microsecond total that more than doubles it |
-| H2O | no general-purpose in-memory cache | yes, and the fastest measured, with kernel TLS | the fastest TLS available with no cache to hit |
-| HAProxy | yes, in memory | yes | multi-process, so the cache is shared memory behind a lock |
-| OpenResty | partial, string values in a shared dictionary | yes | needs Lua, and the shared dictionary across workers needs a lock |
-| Envoy | experimental | yes | much heavier per request, around 26,000 requests per second on HTTP/1.1 as a baseline |
-| Pingora | experimental | yes | a library rather than a binary, and its caching interface is unstable |
+§4.2 and §4.3 are those four rules as implementation, and §1.3's refusal to cross a process boundary is the same rules defended.
 
-**Table 1: the existing options considered, and what stops each from answering a TLS cache hit without leaving the process.**
-Take from it that no row has both halves in one process: the best cache does not terminate TLS, the best TLS has no cache, and the ones that have both share the cache behind a lock.
+### 1.2 What reality adds, and where m6 actually is
 
-The nearest production equivalent to what m6 does is Cloudflare's internal Pingora deployment, which is not the open-source version.
-So this is a gap in what is available rather than a wheel being reinvented, and §1.3 is why the gap is not a packaging accident that someone could close by shipping the two together.
+**TLS adds round trips before the first byte, and supporting HTTP/1.1, HTTP/2 and HTTP/3 adds three wire formats with three sets of conformance rules.**
+None of that is optional for a public site, and all of it sits between the symbol lookup and the client.
 
-### 1.3 Why that shortfall is structural
+**Every figure in this section is an order of magnitude with its conditions attached, and none is a guarantee.**
+Table 1 states what each number is, because the difference between a target, a component cost and an end-to-end measurement is what made this repository's numbers drift once already.
+`BENCHMARKS.md` is authoritative for every measured figure, and a number appearing anywhere without the conditions that produced it is to be treated as wrong.
 
-**A multi-process or multi-threaded server cannot keep its cache in its own heap, and everything follows from that.**
-Each worker has its own address space, so a shared cache has to live somewhere all of them can reach: shared memory, a separate daemon such as Redis or memcached, or disk.
-Reaching it costs serialisation, a lock, and at minimum one inter-process round trip on every cache lookup.
+| figure | what it is | status |
+|---|---|---|
+| ~1 µs | tick to trade on bare metal with a kernel-bypass network stack | the design target, never measured in m6 |
+| ~2.2 µs | a cache hit inside m6, on m6's own timer | measured, component cost, excludes TLS and the network |
+| ~13 µs | a Unix socket round trip | measured, and the reason for §1.3 |
+| ~226 µs | an HTTP/2 cache hit end to end on the benchmark host | measured, includes TLS, loopback and the client |
+| 5 ms | request to response for a real user | the target that governs every latency decision (§1.4) |
 
-That is not a tuning problem.
-It is a consequence of the concurrency model, so no amount of configuration removes it, and it is paid on the most common request a website serves, which is a hit on something already rendered.
-Shipping Varnish and nginx in one package would not change it either, because the boundary that costs the hop is the process boundary itself.
+**Table 1: the figures this section uses, what each one measures, and which are targets.**
+Take from it that the microsecond figures are component costs and the millisecond figure is the goal, so quoting any of them as another is the mistake to avoid.
 
-### 1.4 What m6 does instead
+The 2.2 µs cache hit is the trading-engine window and it sits within roughly twice the target.
+The 226 µs is what a client on the same machine sees, and almost all of the distance between the two is TLS and the protocol stack rather than the lookup.
+There is understood to be around a further order of magnitude available at that boundary, and closing it is not a solved problem.
 
-**One process owns the whole hot path on one thread, so a cache hit never leaves the address space.**
-Receiving, TLS decryption, route lookup, cache lookup, TLS encryption and sending all happen in one process on one thread, and the cache is a reference-counted structure in the same heap.
+### 1.3 Why a cache hit must not leave the process
 
-A hit therefore costs a hash lookup and a reference count increment.
-The encrypted record is written from the same allocation the response was stored in on the first request, so there is no copy, no lock, and no inter-process round trip.
-`BENCHMARKS.md` holds what that measures at and `POSITIONING.md` places it against other servers.
+**m6's own measurements make this arithmetic, not taste.**
+A Unix socket round trip measures about **13 microseconds** at the median in m6's benchmark set, against the 2.2 microsecond internal cache hit from §1.2.
 
-**The rest of the stack collapses the same way.**
-Rendering, static files, authentication and content conversion are small single-job processes behind one wire contract, and one `site.toml` configures the set.
-A site is therefore one platform with one description, and not an integration of five products each of which has to be separately understood.
+So any design that crosses a process boundary to reach its cache spends roughly six times as long on the crossing as on the answer.
+That is why the response cache lives in the same address space as the TLS stack, and it is the single decision the rest of the edge is built around.
+It is also why a conventional stack cannot meet the premise: a separate cache tier is a process boundary by construction, and §6.1 is the same argument applied to code rather than to requests.
 
-### 1.5 What this gives up
+### 1.4 Why microseconds are not the target on their own
+
+**A host network stack is measured in milliseconds, and a page reaching a person takes several more.**
+Against that, ten microseconds of saved work is invisible.
+
+**So the target that matters is 5 milliseconds from request to response, for a real user.**
+The microsecond work earns its place by leaving that budget to the network rather than spending it on the server.
+Every latency decision in this document is answerable to the 5 millisecond figure, and the microsecond figures are only how the server keeps out of the way.
+
+### 1.5 Why a site runs its own edge
+
+**A cache-only node near the user solves two problems, and the second is the stronger one.**
+
+**Proximity.** Most of the 5 millisecond budget is distance, so a node close to the reader is most of the answer.
+
+**One source of truth.** A cache-only node holds no content of its own, so nothing in the system can disagree about what the site is.
+That is a distributed systems position rather than a performance one: content has exactly one origin, every other node is a copy with no authority, and there is no second system that believes it knows what the site contains.
+A commercial content delivery network answers the first problem and introduces the second, because it is a system with its own view of the site that can and does diverge from the origin's.
+
+An edge node is not a different program.
+It is `m6-http` with no content behind it, which is why §4 has one edge to reason about rather than two.
+
+**This has not been measured against a commercial network**, so the proximity half is a reasoned expectation rather than a result.
+The single-source-of-truth half is structural and holds without a measurement.
+
+### 1.6 The second question: what does an integrated stack look like?
+
+**A conventional stack for the same site is six systems: a content delivery network, a cache, a web server, a language runtime, a database, and an authoring framework.**
+Six things to learn, six to configure, and an author writing code and configuration in all of them.
+
+**m6 is one stack from Markdown to the edge, and the parts know about each other.**
+Table 2 gives three things that awareness buys, each of which is in the code today.
+
+| what a mutually aware stack can do | how m6 does it |
+|---|---|
+| answer a monitor without rendering a page | `/health` is answered before routing, the cache and any backend, so a check costs a JSON serialisation. A monitor pointed at the homepage instead would pay a full render every time and would be measuring template speed rather than whether the node is up |
+| measure the site without changing it | a request carrying `no-cache` misses and reaches the backend, and the stored entry survives untouched. Monitoring responses are excluded from the traffic counters, and a warming fetch mints no session and logs no miss, so measuring does not move what is measured |
+| warm itself | the edge already holds its parsed route table, so it queues one fetch per concrete route per encoding, skipping patterns, the error path and anything marked `no-store`. It drains one per loop iteration, so warming cannot delay startup or stampede the origin |
+
+**Table 2: three things a mutually aware stack can do, and how m6 does each.**
+Take from it that every row needs one part of the stack to act on something another part owns, which six independently developed products have no way to do.
+
+The warming row is the clearest measure of what integration is worth.
+It replaced a shell script that a systemd timer ran on each node, which found the warmable routes by running a regular expression over `site.toml`, because nothing that already understood the routes was in a position to act on them.
+
+### 1.7 The third question: HTTP as the only dynamic protocol
+
+**The only dynamic communication between m6 processes is HTTP.**
+No message bus, no remote procedure call, no shared memory, and no database between services.
+What is shared is static: one site-wide configuration file that sets the routes.
+
+This began as an experiment and it has been efficient.
+One protocol to debug, secure, log and measure, and any process in the system can be replaced by anything that speaks it, in any language (§3.1).
+
+### 1.8 What this gives up
 
 Stating the cost is part of the design, because a reader choosing m6 needs to know when not to.
-Table 2 gives what the single-threaded model surrenders.
+Table 3 gives what the single-threaded, single-process-cache model surrenders.
 
 | given up | why it follows from the design |
 |---|---|
 | multi-core use within one process | one thread cannot occupy several cores. m6 scales by running more instances, or more backend workers, which is why §3.4 makes pool membership automatic |
 | HTTP/1.1 throughput against a mature server | a new connection per request pays a TLS handshake each time, and the h1 path makes a blocking backend call on a miss, which stalls the loop |
 | zero-copy file serving | content is copied through userspace buffers, so a server using `sendfile()` pulls ahead as responses grow past a few kilobytes |
-| kernel TLS | pushing encryption into the kernel is a Linux feature not yet in the TLS stack m6 uses, and it is the whole of the remaining gap to the fastest single-core server measured |
+| kernel TLS | pushing encryption into the kernel is a Linux feature not yet in the TLS stack m6 uses, and it is the largest remaining piece of the gap in §1.2 |
 
-**Table 2: what m6's single-threaded design gives up, and why each follows from it.**
-Take from it that every entry is a consequence of one thread owning the hot path, and that none is a defect to be fixed without changing that premise.
+**Table 3: what m6's design surrenders, and why each follows from it.**
+Take from it that every entry is a consequence of one thread owning the hot path and the cache living in its address space, and that none is a defect to be fixed without changing that premise.
 
-### 1.6 When m6 is the wrong choice
+### 1.9 When m6 is the wrong choice
 
 **A site dominated by HTTP/1.1 traffic or by large file responses is better served by a mature conventional server.**
 So is a deployment that must saturate many cores from one process.
-m6 is for a site where the common request is a cache hit over HTTP/2 or HTTP/3, where sub-millisecond response matters, and where one description of the whole stack is worth more than the last increment of raw throughput.
+m6 is for a site where most assets are static, where the common request is a cache hit over HTTP/2 or HTTP/3, and where one stack that understands itself is worth more than the last increment of raw throughput.
 
-Everything in the rest of this document follows from that choice, starting with the shape it produces.
+Everything in the rest of this document follows from §1.1 and §1.4, starting with the shape they produce.
 
 ---
 
@@ -119,6 +174,7 @@ Everything in the rest of this document follows from that choice, starting with 
 
 **m6 is six serving binaries, each with one job, wired by `site.toml` over Unix sockets, with one of them on the public port.**
 This section is the shape in brief, so the reasoning from §3 onwards has something to refer to.
+Table 4 names each binary and its job.
 
 | binary | one job |
 |---|---|
@@ -129,7 +185,7 @@ This section is the shape in brief, so the reasoning from §3 onwards has someth
 | `m6-auth-server` | verify credentials and sign *JWTs* (*JSON Web Tokens*) |
 | `m6-monitor` | poll each node's health and performance endpoints and serve one report |
 
-**Table 3: the six serving binaries and the one job each has.**
+**Table 4: the six serving binaries and the one job each has.**
 Take from it that only `m6-http` is reachable from the internet, in either of its two modes, and that every other process answers HTTP/1.1 on a Unix socket behind it.
 
 Two command line tools sit outside that set: `m6-md` converts a directory of Markdown into one JSON file, and `m6-auth-cli` manages users and groups against the auth database.
@@ -141,7 +197,7 @@ There are no binaries in a site and no log directory, because binaries are found
 
 ## 3. Why a family of processes
 
-m6 could have been the one process §1.4 describes and nothing else.
+m6 could have been the one process §1.3 describes and nothing else.
 It is a family, and this section says what the other processes buy: a backend in any language, a contained crash, an existing process manager, and capacity added without editing configuration.
 
 ### 3.1 Why the boundary is a wire contract
@@ -175,7 +231,7 @@ And a crashed backend restarts in seconds, which is what makes §4.5 affordable.
 
 ### 3.4 Why pool membership is discovered rather than declared
 
-**Scaling a backend should not require editing configuration**, and §1.5 makes scaling the answer to load.
+**Scaling a backend should not require editing configuration**, and §1.8 makes scaling the answer to load.
 A pool is declared as a socket glob, and membership comes from rescanning that glob every 2 seconds, so starting another systemd instance adds a member and stopping one removes it.
 An explicit list would mean a config edit and a reload to add capacity, which is ceremony in the path of the one operation an operator performs under pressure.
 
@@ -192,7 +248,7 @@ This section says why the protocol burden is concentrated there, why it runs one
 ### 4.1 Why the protocol burden is concentrated
 
 **One process terminating TLS and three HTTP versions means one place to get them right.**
-Conformance is measured, and Table 4 is the current position.
+Conformance is measured, and Table 5 is the current position.
 
 | suite | target | score |
 |---|---|---|
@@ -200,7 +256,7 @@ Conformance is measured, and Table 4 is the current position.
 | h2spec | `m6-http` | 146/146 |
 | h3spec | `m6-http` | 47/49 |
 
-**Table 4: the recorded conformance floors, from `tools/conformance-scores.txt`.**
+**Table 5: the recorded conformance floors, from `tools/conformance-scores.txt`.**
 Take from it that HTTP/1.1 is measured on four binaries because four of them speak it, and that HTTP/3 is the only suite short of full marks.
 
 A backend never terminates TLS, never parses a frame layer and never implements *HPACK* (*HTTP/2 header compression*), so the defect-dense code has one home and one test surface.
@@ -209,7 +265,7 @@ That concentration is what makes §4.4 possible: a rule applied once at the edge
 ### 4.2 Why one thread and no async runtime
 
 **A cache hit is a hash map lookup and a write, and an async runtime adds overhead to that.**
-This is §1.4 as an implementation rule.
+This is §1.1's four rules as an implementation.
 One thread runs the loop and owns every connection's state, so the request path has no cross-thread synchronisation to contend for, and the header scan on the hit path allocates nothing.
 Network descriptors, backend descriptors and the file watcher sit in one readiness set, so there is nothing to coordinate between.
 
@@ -300,7 +356,7 @@ Breadth is the intent and singularity is the rule, and this section says why tho
 
 ### 6.1 Why breadth is the intent
 
-**A service should be able to build what it needs from one dependency**, which is §1.4 applied to the code rather than to the request path.
+**A service should be able to build what it needs from one dependency**, which is §1.6 applied to the code rather than to the request path.
 So core holds templating, compression, minification, cookies, multipart bodies, an SMTP client, an outbound HTTP client, host metrics and firewall reporting beside the HTTP layers, and a component a website might want belongs in it.
 The test of whether that is working is that a new service is small: `m6-html` is six lines and renders every HTML page a site serves.
 
@@ -310,7 +366,7 @@ A service names what it wants, so the weight of core is what a binary uses rathe
 ### 6.2 Why each thing in core exists exactly once
 
 **The duplicates had already diverged, and four of them were answering incorrectly on the wire.**
-Table 5 is the evidence, and it is why the rule below is worth enforcing.
+Table 6 is the evidence, and it is why the rule below is worth enforcing.
 
 | what existed more than once | what the copies disagreed about |
 |---|---|
@@ -322,7 +378,7 @@ Table 5 is the evidence, and it is why the rule below is worth enforcing.
 | four signal handlers | whether a service unlinked its socket, and whether it logged that it had stopped |
 | three route matchers | precedence, so one route table could resolve differently in two services |
 
-**Table 5: what was implemented more than once, and what the copies disagreed about.**
+**Table 6: what was implemented more than once, and what the copies disagreed about.**
 Take from it that four of the seven were producing a wrong answer to a real request, which is why one implementation per concept is a rule.
 
 **The rule: code moves into core when it has more than one consumer, and single-consumer code stays with its consumer.**
@@ -447,7 +503,7 @@ The trust boundary is the edge, which is the concentration §4.4 relies on.
 
 The decisions above shape the system.
 These shape working with it, and each is small enough that the reason matters more than the rule.
-Table 6 gives them by area.
+Table 7 gives them by area.
 
 | area | decision | why |
 |---|---|---|
@@ -474,7 +530,7 @@ Table 6 gives them by area.
 | auth | login is throttled per address | it is the one endpoint where guessing is the attack |
 | auth | a requirement is spelled as a group or a role, and an unknown form denies | a typo in a requirement must fail closed |
 
-**Table 6: the remaining decisions by area, each with the reason behind it.**
+**Table 7: the remaining decisions by area, each with the reason behind it.**
 Take from it that most exist because the alternative had already produced a defect, and that the pattern across them is failing closed and failing loudly.
 
 ---
@@ -482,19 +538,19 @@ Take from it that most exist because the alternative had already produced a defe
 ## 10. What is deliberately absent
 
 Naming what m6 does not do is how a reader tells a gap from an omission.
-Table 7 lists what is absent and the reason, and the last row is the one to read.
+Table 8 lists what is absent and the reason, and the last row is the one to read.
 
 | absent | why |
 |---|---|
 | a build step | content authoring is not web serving. Coupling them would force m6 to hold opinions about content formats, build tools and file pipelines, and a separate tool that understands the site directory needs no m6 internals |
 | Windows | the deployment model is systemd units and Unix sockets |
 | a built-in OAuth2 or OIDC provider, MFA, WebAuthn | out of scope at 1.0 |
-| horizontal scaling of the edge itself | it is one process per node by design (§1.5) and scales through caching and more nodes |
+| horizontal scaling of the edge itself | it is one process per node by design (§1.8) and scales through caching and more nodes |
 | HTTP/2 server push | the specification deprecated it, and receipt of a push promise is correctly an error |
 | a computed admission control bound | m6 sheds at queue-full, which is not admitting work against a bound. A latency bound comes from the second, and maximum handler time is unbounded today, so there is no epoch to rate-limit against. An event loop is the model in which admission control is expressible, because a loop can decline work while a full queue can only report that it is full |
 | **RFC 9218 extensible priorities** | **no decision.** Not implemented and not mentioned anywhere in the tree. Every other gap here was weighed and declined, and this one was not |
 
-**Table 7: what m6 does not do, and why.**
+**Table 8: what m6 does not do, and why.**
 Take from it that all but the last were decided, and that the last is a gap rather than a choice.
 
 ---
