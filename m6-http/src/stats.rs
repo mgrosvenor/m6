@@ -645,7 +645,8 @@ impl Stats {
             backend_errors = self.window_backend_errors,
             pool_members = pool_members,
             // The sample count beside the percentiles, not just the numbers.
-            // `hit_p50_ns` is load-dependent (docs/PERFORMANCE.md §4: 3,900ns at
+            // `hit_p50_ns` is load-dependent (docs/PERFORMANCE.md §4, "Cache-hit
+            // latency, and why it is load dependent": 3,900ns at
             // 50-70 hits in a window, 1,064ns at ~1,200), so a percentile with no
             // count attached cannot be compared to anything, and a p50 over one
             // sample reads exactly like a p50 over a thousand. This is also not
@@ -706,7 +707,8 @@ impl Stats {
     /// The percentiles here now span **the most recent up to `RESERVOIR`
     /// samples, not a period of time.** On a quiet node that can reach back
     /// hours and will blend idle and busy traffic, which matters because this
-    /// number is load-dependent (`docs/PERFORMANCE.md` §4). `hit_samples` is
+    /// number is load-dependent (`docs/PERFORMANCE.md` §4, "Cache-hit latency,
+    /// and why it is load dependent"). `hit_samples` is
     /// reported beside it for exactly that reason: it is the only thing that
     /// makes the percentile interpretable, and zero samples means "not
     /// measured" rather than "zero nanoseconds". For the fine-grained view, the
