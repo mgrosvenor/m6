@@ -96,7 +96,8 @@ pub struct NodeDigest {
     /// How many samples the percentiles above were taken over.
     ///
     /// Carried because `hit_p50_ns` cannot be read without it. The number is
-    /// **load-dependent** -- `docs/PERFORMANCE.md` §4: the same binary on the
+    /// **load-dependent** -- `docs/PERFORMANCE.md` §4, "Cache-hit latency, and
+    /// why it is load dependent": the same binary on the
     /// same node reads 3,900ns over a window of 50-70 hits and 1,064ns over
     /// ~1,200, because the cache-hit path goes cold between requests on a
     /// near-idle VM. A percentile with no count beside it looks like a
