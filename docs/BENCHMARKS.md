@@ -228,9 +228,9 @@ in both arms equally and subtracts out, which works on a busy machine and needs
 no infrastructure change. `tools/paired_bench.sh` is the harness.
 
 An absolute number quoted on its own is only meaningful with the host and the
-date attached, and is not comparable to one taken on a different machine. The
-Phase 0 baseline table in `m6-core-implementation-plan.md` was taken on the
-laptop and must not be compared against build-host figures.
+date attached, and is not comparable to one taken on a different machine. A
+figure taken on the laptop must never be compared against a build-host figure,
+whichever document either of them appears in.
 
 ### Two traps in the harness itself
 

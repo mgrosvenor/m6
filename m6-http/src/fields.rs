@@ -1,10 +1,9 @@
 //! Request field validation shared by HTTP/2 and HTTP/3.
 //!
 //! **Every rule here is RFC 9113 or RFC 9114, not RFC 9110.** That matters for
-//! where this lives. `m6-decisions.md` used to justify keeping h2 and h3 in
-//! `m6-http` by claiming the one symbol the H3 path imports from `http2.rs` is
-//! "RFC 9110 semantics, not h2 wire format". Checked against the code, that is
-//! backwards: the rules are 8.2.1 (lowercase field names), 8.2.2
+//! where this lives, and `m6-architecture.md` §6.3, "why HTTP/2 and HTTP/3 stay
+//! at the edge", is the rule it answers to.
+//! The rules are 8.2.1 (lowercase field names), 8.2.2
 //! (connection-specific fields and `TE: trailers`), 8.3 (pseudo-header set,
 //! ordering, at-most-once) and 8.3.1 (CONNECT, `:path`, `:authority`/`Host`).
 //! HTTP/1.1 has none of those concepts; it has no pseudo-headers, it allows
