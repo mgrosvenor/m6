@@ -725,7 +725,7 @@ All detailed documentation lives in [`docs/`](docs/):
 
 | Document | Contents |
 |---|---|
-| [`docs/m6-architecture.md`](docs/m6-architecture.md) | The architecture as built: the processes, the request path, protocol coverage, the m6-core boundary, and the decisions behind them |
+| [`docs/m6-architecture.md`](docs/m6-architecture.md) | **Why m6 is built this way.** The question it answers, what it gives up, and the reason behind every design decision |
 | [`docs/m6-user-guide.md`](docs/m6-user-guide.md) | Eleven worked examples, start here |
 | [`docs/m6-site-toml.md`](docs/m6-site-toml.md) | `site.toml` reference |
 | [`docs/m6-site-layout.md`](docs/m6-site-layout.md) | Laying out a site: one root per app |
