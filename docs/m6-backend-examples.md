@@ -12,7 +12,7 @@ disagreement rather than either side quietly winning.
 
 ## 1. Why
 
-`m6-overview.md` promises that a renderer can be "any HTTP/1.1+ server, written
+`m6-architecture.md` promises that a renderer can be "any HTTP/1.1+ server, written
 in any language". Today that promise is written down and never exercised. Every
 backend in the tree is Rust, and most link `m6-render`, so nothing would fail
 if the multi-language contract quietly stopped being true.

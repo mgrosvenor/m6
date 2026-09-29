@@ -4,12 +4,11 @@
 lines.** Where this disagrees with the code, the code is right and this file is
 a bug.
 
-Three documents cover m6-core and they do different jobs:
+Two documents cover m6-core and they do different jobs:
 
 | file | job |
 |---|---|
-| `m6-core.md` | **Design.** What the crate is for and where its boundary is. Written before the migration, so its §9 "current state" describes a crate that no longer exists. |
-| `m6-core-implementation-plan.md` | **The migration.** Phases, gates, rollback. |
+| `m6-architecture.md` | **Design.** What the crate is for, where its boundary is, and the rule that decides what goes in. |
 | this file | **Reference.** Every component and its interface. |
 
 `m6-render-lib.md` is superseded. It documents a crate that has been deleted,
