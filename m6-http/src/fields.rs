@@ -1,7 +1,8 @@
 //! Request field validation shared by HTTP/2 and HTTP/3.
 //!
 //! **Every rule here is RFC 9113 or RFC 9114, not RFC 9110.** That matters for
-//! where this lives, and `m6-architecture.md` §4.1 is the rule it answers to.
+//! where this lives, and `m6-architecture.md` §6.3, "why HTTP/2 and HTTP/3 stay
+//! at the edge", is the rule it answers to.
 //! The rules are 8.2.1 (lowercase field names), 8.2.2
 //! (connection-specific fields and `TE: trailers`), 8.3 (pseudo-header set,
 //! ordering, at-most-once) and 8.3.1 (CONNECT, `:path`, `:authority`/`Host`).

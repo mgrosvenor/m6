@@ -4,7 +4,7 @@
 followed from a repository that is not this one.**
 
 Companion documents: `m6-core-reference.md` for what each component does, and
-`m6-architecture.md` §4 for why the boundary is where it is.
+`m6-architecture.md` §6, "why m6-core exists and where its boundary falls".
 
 ---
 
@@ -259,7 +259,8 @@ Listed because apps have re-implemented several of these before:
 > thread, one event loop, a switch over connection state, everything
 > non-blocking, and anything that must block on its own sync thread signalling
 > the loop through an fd.** m6-http is already that shape; the `App` services
-> are not. `m6-architecture.md` §5 states the shape as built. Read this section
+> are not. `m6-architecture.md` §7, "why every service has one shape", states it as
+> built. Read this section
 > as a snapshot of a system mid-migration.
 
 **There is one app family and one edge. Everything else is unfinished.**
@@ -290,7 +291,8 @@ said they were until it was measured:
   only capability it needs that `App` does not offer is `chmod 0666` on the
   socket, which is a config key rather than an architecture.
 
-Closing both is owed work. **`m6-architecture.md` §5 is the target shape**: five
+Closing both is owed work. **`m6-architecture.md` §7, "why every service has one
+shape", is the target**: five
 core enhancements, two of which fix live defects in services that are already
 the right shape, and a sequence that keeps the hot path untouched. Until then,
 note that the divergence is historical: neither is a divergent
