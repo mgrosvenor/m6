@@ -46,6 +46,42 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # `main` takes a pull request from `develop` and from nothing else, which
+  # CLAUDE.md has said since 2026-09-14 and nothing checked until #196.
+  #
+  # Neither of the other two mechanisms can close this. `.githooks/pre-push` runs
+  # on a developer's machine at push time, and `main` does not move by a push: it
+  # moves by a merge on GitHub. A branch ruleset can require a pull request and can
+  # require checks to pass, and it has no rule for the source branch. So a check
+  # that reads the pull request's head is the only place the constraint fits.
+  #
+  # The job below the release gate tests `base_ref == 'main'`, which asks where a
+  # pull request is going. Nothing asked where it came from, so a work branch aimed
+  # straight at `main` passed every check and was offered for merge. A green run on
+  # a broken branch model is the same shape of defect as a conformance script that
+  # skips a protocol and reports success.
+  #
+  # No checkout, deliberately: this must fail in seconds, not after the build.
+  branch-source:
+    name: main takes develop only
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: The head branch must be develop
+        run: |
+          if [ "${{ github.head_ref }}" != "develop" ]; then
+            echo "::error::main takes pull requests from develop only."
+            echo "This pull request is from '${{ github.head_ref }}'."
+            echo ""
+            echo "main is the release line. Merge into develop first, then"
+            echo "open develop -> main as the release:"
+            echo "  gh pr create --base develop --head ${{ github.head_ref }}"
+            echo "  # merge that, bump the version and write the CHANGELOG entry, then:"
+            echo "  gh pr create --base main --head develop --title 'Release X.Y.Z'"
+            exit 1
+          fi
+          echo "head is develop, allowed"
+
   build-and-test:
     name: build, tests, clippy
     runs-on: ubuntu-latest
