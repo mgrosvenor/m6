@@ -727,6 +727,7 @@ All detailed documentation lives in [`docs/`](docs/):
 |---|---|
 | [`docs/m6-architecture.md`](docs/m6-architecture.md) | **Why m6 is built this way.** The question it answers, what it gives up, and the reason behind every design decision |
 | [`docs/m6-user-guide.md`](docs/m6-user-guide.md) | Eleven worked examples, start here |
+| [`docs/m6-app-anatomy.md`](docs/m6-app-anatomy.md) | **How to write one.** The shape every m6 service has, and the four contracts it honours |
 | [`docs/m6-site-toml.md`](docs/m6-site-toml.md) | `site.toml` reference |
 | [`docs/m6-site-layout.md`](docs/m6-site-layout.md) | Laying out a site: one root per app |
 | [`docs/m6-file.md`](docs/m6-file.md) | m6-file static file service reference |
