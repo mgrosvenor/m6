@@ -283,8 +283,9 @@ pub struct CompiledRoute {
     /// params files, merged once per reload in that order.
     ///
     /// Shared with every request on this route rather than copied into each
-    /// one. On the real site this is `data/content.json`, 68KB and 1,364
-    /// nodes, so a deep copy per request costs several times that.
+    /// one. A content-driven site puts its whole catalogue here, which runs to
+    /// tens of kilobytes and thousands of nodes, so a deep copy per request
+    /// costs several times that for a value nothing mutates.
     pub base_dict: Arc<Map<String, Value>>,
 }
 
@@ -317,7 +318,8 @@ pub enum Segment {
     /// works because its own matcher makes the final parameter greedy. Core
     /// does not copy that: making the last `{param}` implicitly span several
     /// segments would silently change the meaning of every route already
-    /// written, including every one in production. The star is explicit.
+    /// written, everywhere, including the ones already serving. The star is
+    /// explicit.
     Wildcard(String),
 }
 
@@ -762,9 +764,10 @@ impl FrameworkState {
                 // 3. This route's static params files, in declaration order.
                 //
                 // A file already merged as a global param is skipped rather
-                // than merged a second time over itself. The production config
-                // names `data/content.json` as both, so merging twice costs a
-                // second full copy of it for identical values.
+                // than merged a second time over itself. Naming one file as
+                // both a global and a route param is an ordinary thing to do,
+                // and merging it twice costs a second full copy of it for
+                // identical values.
                 for pf in &static_files {
                     if config.global_params.contains(pf) {
                         continue;
@@ -2171,8 +2174,8 @@ fn unknown_handlers(
             Some(_) => {}
             // A config route with no template and no handler can still be
             // served by a code route registered on the same pattern, which is
-            // how the site's renderers carry `cache` and `methods` for an
-            // endpoint implemented in Rust. With no such route it can serve
+            // how a renderer carries `cache` and `methods` for an endpoint
+            // implemented in Rust. With no such route it can serve
             // nothing, and the only symptom is a 404 that looks like a missing
             // page. That is exactly what an out-of-step config and binary
             // produce, so it is refused here rather than discovered in
@@ -2236,9 +2239,9 @@ pub struct Invocation {
 ///
 /// `--dump-config` loads the configuration exactly as the service would, prints
 /// what it resolved to, and exits: **0 if this binary can serve this config, 2
-/// if it cannot.** That is the check `deploy-platform.sh` runs against the new
-/// binary on every node before installing it, and it covers every service:
-/// they all load their config through this same function.
+/// if it cannot.** That is the check a deploy runs against a new binary on each
+/// node before installing it, and it covers every service: they all load their
+/// config through this same function.
 ///
 /// It is not a formality. The `App` migrations changed m6-file's config format,
 /// and the old binary against the new config and the new binary against the old
@@ -3058,8 +3061,8 @@ fn handle_request<W: std::io::Write>(
             // whether a coding name appears anywhere in the header.
             //
             // A raw substring match such as `ae_contains` is wrong three ways
-            // at once. Measured against production on
-            // 2026-09-10: `gzip, br;q=0` was served **br**, so a client that
+            // at once, each reproducible with one `curl -H` against a loopback
+            // instance: `gzip, br;q=0` was served **br**, so a client that
             // had explicitly refused brotli got brotli (RFC 9110 12.4.2 makes
             // `q=0` "not acceptable", not "least preferred"); `notbr` was
             // served **br**, matching the substring inside an unrelated token;
@@ -3743,7 +3746,7 @@ mod wildcard_route_tests {
     }
 
     /// The guard that stops this being a behaviour change: an ordinary
-    /// parameter is still exactly one segment. Every route in production is
+    /// parameter is still exactly one segment. Almost every route ever written is
     /// written this way, and if `{p}` had quietly become greedy they would all
     /// have changed meaning at once.
     #[test]
@@ -4125,8 +4128,9 @@ mod dict_cost {
     //! | `chrono::Utc::now()` + two `strftime` | 708 |
     //! | **cloning 20 config keys** | **2,750** |
     //!
-    //! Against the site's real `data/content.json`, 68KB and 1,364 nodes, the
-    //! same shape costs far more, because that file is loaded as *both* the
+    //! Against a real content catalogue, tens of kilobytes and thousands of
+    //! nodes, the same shape costs far more, because such a file is commonly
+    //! loaded as *both* the
     //! global params and the route's params and is then cloned a third time by
     //! `render_response`:
     //!

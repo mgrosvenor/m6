@@ -79,14 +79,14 @@ pub struct Fleet {
     /// not. Absent means `/perf` is not polled, and the report says so rather
     /// than showing an empty fleet.
     ///
-    /// In this deployment every node has a distinct token, so each one names
-    /// its own and this is mostly a convenience for a fleet that does share.
+    /// A fleet whose nodes each have a distinct token names one per node and
+    /// leaves this unset. It is the convenience for a fleet that does share.
     #[serde(default)]
     pub perf_token_file: Option<String>,
     /// How long to wait for one node before giving up on it.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
-    /// Response headers this deployment expects on particular paths.
+    /// Response headers the fleet config expects on particular paths.
     ///
     /// **Declared by the deployment, not by m6.** A cache policy is a property of
     /// a site: `max-age=60, s-maxage=86400` is right for one page and wrong for

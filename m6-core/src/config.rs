@@ -360,7 +360,7 @@ fn parse_config(tv: toml::Value, _site_dir: &Path) -> anyhow::Result<RendererCon
     // the `[server]` section is the one place it would hurt most.
     //
     // 30 seconds is not a new number: m6-file and m6-auth-server each picked it
-    // by hand for the same reason, so it is the value this fleet already runs.
+    // by hand for the same reason, so it is the value already in service.
     let read_timeout_s = match tv.get("server").and_then(|t| t.get("read_timeout_s")) {
         None => crate::server::DEFAULT_READ_TIMEOUT_SECS as i64,
         Some(v) => {
@@ -665,7 +665,7 @@ queue_size = 32
     }
 
     /// The defaults are the contract for every config that says nothing, which
-    /// is every config in production today.
+    /// is most of them: the [server] section is optional in full.
     #[test]
     fn server_defaults_are_thirty_seconds_and_0660() {
         let mut f = NamedTempFile::new().unwrap();

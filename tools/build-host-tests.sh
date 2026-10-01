@@ -29,7 +29,7 @@
 # ── Configuration ────────────────────────────────────────────────────────────
 #
 #   M6_BUILD_HOST      required. user@host for ssh and rsync.
-#   M6_BUILD_SSH_OPTS  optional ssh options, e.g. "-p 4022". Default none.
+#   M6_BUILD_SSH_OPTS  optional ssh options, e.g. "-p 2222". Default none.
 #   M6_BUILD_ROOT      optional remote directory. Default /root/build.
 #   M6_ALLOW_DIRTY     optional. Skip the clean-tree guard, for local iteration.
 #   M6_EXAMPLES        optional path to the m6-examples checkout. Default: a
@@ -95,7 +95,7 @@ BUILD_HOST="${M6_BUILD_HOST:-}"
   machine is yours.
 
       export M6_BUILD_HOST=root@198.51.100.7
-      export M6_BUILD_SSH_OPTS='-p 4022'      # if it is not on 22"
+      export M6_BUILD_SSH_OPTS='-p 2222'      # if it is not on 22"
 
 SSH_OPTS="${M6_BUILD_SSH_OPTS:-} -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15"
 BUILD_ROOT="${M6_BUILD_ROOT:-/root/build}"

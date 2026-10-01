@@ -110,9 +110,10 @@ impl FirewallState {
                         .and_then(|f| f.as_str())
                         == Some("saddr");
                     // Only a plain string right-hand side. A set or a prefix
-                    // is a range rule, and this deployment does not use them
-                    // (see BLOCKLIST.md: per-IP only, no CIDR), so reporting
-                    // one as a single address would be a lie.
+                    // is a range rule covering many addresses, so reporting
+                    // one as a single blocked address would be a lie. A
+                    // deployment with a per-IP-only policy has none of them,
+                    // and one that uses ranges needs them reported as ranges.
                     if is_saddr {
                         address = m.get("right").and_then(|r| r.as_str()).map(String::from);
                     }
@@ -172,12 +173,18 @@ impl FirewallState {
 mod tests {
     use super::*;
 
-    /// A real rule from origin, 2026-09-11, byte for byte.
+    /// A per-IP block in the shape `nft -j list ruleset` emits it.
+    ///
+    /// Kept as a literal in nftables' own output format, metainfo envelope
+    /// included, because that envelope is what the parser has to walk past and
+    /// a hand-simplified fixture would not exercise it. Reproduce it with
+    /// `nft add rule ip filter input ip saddr 203.0.113.249 drop` followed by
+    /// `nft -j list ruleset` on any host.
     const REAL_RULE: &str = r#"{"nftables":[
       {"metainfo":{"version":"1.1.6","release_name":"Commodore Bullmoose #7","json_schema_version":1}},
       {"rule":{"family":"ip","table":"filter","chain":"ufw-user-input","handle":1381,
-        "comment":"spoofed Googlebot sweep 2026-09-09 see BLOCKLIST.md",
-        "expr":[{"match":{"op":"==","left":{"payload":{"protocol":"ip","field":"saddr"}},"right":"94.154.46.249"}},
+        "comment":"spoofed Googlebot sweep 2026-09-09",
+        "expr":[{"match":{"op":"==","left":{"payload":{"protocol":"ip","field":"saddr"}},"right":"203.0.113.249"}},
                 {"counter":{"packets":17,"bytes":1020}},
                 {"drop":null}]}}
     ]}"#;
@@ -187,7 +194,7 @@ mod tests {
         let s = FirewallState::from_nft_json(REAL_RULE).unwrap();
         assert_eq!(s.blocks.len(), 1);
         let b = &s.blocks[0];
-        assert_eq!(b.address, "94.154.46.249");
+        assert_eq!(b.address, "203.0.113.249");
         assert_eq!(b.packets, 17);
         assert_eq!(b.bytes, 1020);
         assert_eq!(b.chain, "ufw-user-input");
@@ -227,15 +234,14 @@ mod tests {
         assert!(s.blocks.is_empty());
     }
 
-    /// A range rule is not a single address. This deployment is per-IP only
-    /// by policy (BLOCKLIST.md), and a `/24` reported as one address would
-    /// hide 255 others.
+    /// A range rule is not a single address. A `/24` reported as one address
+    /// would hide 255 others.
     #[test]
     fn a_prefix_rule_is_not_reported_as_an_address() {
         let json = r#"{"nftables":[
           {"rule":{"family":"ip","table":"filter","chain":"ufw-user-input","handle":5,
             "expr":[{"match":{"op":"==","left":{"payload":{"protocol":"ip","field":"saddr"}},
-                     "right":{"prefix":{"addr":"94.154.46.0","len":24}}}},
+                     "right":{"prefix":{"addr":"203.0.113.0","len":24}}}},
                     {"counter":{"packets":1,"bytes":60}},{"drop":null}]}}
         ]}"#;
         let s = FirewallState::from_nft_json(json).unwrap();

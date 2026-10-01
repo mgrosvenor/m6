@@ -219,7 +219,7 @@ mod traffic_endpoint_tests {
 
     fn row(ts: &str, ip: &str, path: &str, status: u16, ua: &str) -> String {
         format!(
-            r#"{{"timestamp":"{ts}","level":"INFO","fields":{{"message":"request","node":"sydney","path":"{path}","status":{status},"client_ip":"{ip}","user_agent":"{ua}"}}}}"#
+            r#"{{"timestamp":"{ts}","level":"INFO","fields":{{"message":"request","node":"origin","path":"{path}","status":{status},"client_ip":"{ip}","user_agent":"{ua}"}}}}"#
         )
     }
 
@@ -233,7 +233,7 @@ mod traffic_endpoint_tests {
     #[test]
     fn an_unauthorised_caller_never_reaches_the_log() {
         let out = traffic(
-            "sydney",
+            "origin",
             "/definitely/not/a/file",
             60,
             Duration::from_secs(60),
@@ -246,7 +246,7 @@ mod traffic_endpoint_tests {
 
     #[test]
     fn no_token_configured_means_the_endpoint_does_not_exist() {
-        let out = traffic("sydney", "/nope", 60, Duration::from_secs(60), &[], None);
+        let out = traffic("origin", "/nope", 60, Duration::from_secs(60), &[], None);
         assert!(matches!(out, PerfOutcome::Disabled));
         let (code, _, _) = out.into_response();
         assert_eq!(code, 404, "404 not 401: it must not advertise a door");
@@ -258,7 +258,7 @@ mod traffic_endpoint_tests {
     #[test]
     fn an_unreadable_log_is_a_503_with_a_reason() {
         let out = traffic(
-            "sydney",
+            "origin",
             "/definitely/not/a/file",
             60,
             Duration::from_secs(0),
@@ -297,7 +297,7 @@ mod traffic_endpoint_tests {
         f.flush().unwrap();
 
         let out = traffic(
-            "sydney",
+            "origin",
             f.path().to_str().unwrap(),
             60,
             Duration::from_secs(0),
@@ -307,7 +307,7 @@ mod traffic_endpoint_tests {
         let (code, headers, body) = out.into_response();
         assert_eq!(code, 200);
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v["node"], "sydney");
+        assert_eq!(v["node"], "origin");
         assert_eq!(v["total_requests"], 2);
         assert!(v["crawlers"][0]["user_agent"]
             .as_str()
