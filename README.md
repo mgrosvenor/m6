@@ -705,7 +705,7 @@ comparison, and presenting it as one was the least defensible thing in this
 file.
 
 **Two different quantities, both true, easily confused:** a cache hit costs
-**~2.2 µs** inside m6 (its own timer, confirmed on production), while an
+**~2.2 µs** inside m6 (its own timer, confirmed against a running server), while an
 end-to-end HTTP/2 request on the benchmark host is **~230 µs** — TLS, loopback
 and the client included. Quoting the first as if it were the second is how the
 old numbers drifted.

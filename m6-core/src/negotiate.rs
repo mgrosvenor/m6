@@ -10,8 +10,8 @@
 //!   response cache key, so `gzip` and `gzip, deflate, br, zstd` were separate
 //!   entries for one byte-identical response.
 //!
-//! Measured on production 2026-09-10, against the HTML path served by
-//! `m6-render`:
+//! What each implementation served, against the HTML path. Every row is
+//! reproducible against a loopback instance with one `curl -H`:
 //!
 //! | Accept-Encoding        | correct  | served |
 //! |------------------------|----------|--------|

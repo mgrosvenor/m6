@@ -1238,9 +1238,9 @@ pub fn make_tls_server_config(
     // cannot outlive its key, and a restart invalidates outstanding tickets:
     // clients then do one full handshake and resume from there.
     //
-    // Cost of not having it, from this fleet's own monitor: a full handshake ran
-    // p50 652ms on origin's http/1.1 channel against 0.77ms for a resumed one, and
-    // two extra round trips on every new browser connection.
+    // Cost of not having it: a full handshake against a resumed one is three
+    // orders of magnitude of difference once a real network path is involved,
+    // plus two extra round trips on every new browser connection.
     //
     // `ring`, matching the provider this crate builds rustls with
     // (m6-http/Cargo.toml: features = ["ring", "std"]).
@@ -1252,7 +1252,7 @@ pub fn make_tls_server_config(
     // Raising it was the first instinct and it is the wrong change. With the
     // ticketer above, TLS 1.3 resumption is stateless and never reads this cache
     // at all; the only thing still using it is a TLS 1.2 client resuming by
-    // session id, which on this fleet means old scanners rather than visitors.
+    // session id, which in practice means old scanners rather than visitors.
     //
     // `ServerSessionMemoryCache::new(n)` is `HashMap::with_capacity(n)` plus
     // `VecDeque::with_capacity(n)` (rustls limited_cache.rs:63), so it allocates

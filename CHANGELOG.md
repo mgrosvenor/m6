@@ -377,17 +377,17 @@ external tester, which makes it the first real protocol check a laptop run
 performs: h2spec and h3spec are not installed there and every other stage skips.
 
 Why it was needed. 1.9.0 installed a session ticketer so browser sessions could
-resume, and nothing anywhere could tell whether it worked. The production
-monitor read 0% resumed on `http/2/external` across all three nodes for a day
-after the 1.10.0 deploy, which looks identical whether the ticketer is broken or
+resume, and nothing anywhere could tell whether it worked. A monitor read 0%
+resumed on `http/2/external` across a whole fleet for a day after the 1.10.0
+deploy, which looks identical whether the ticketer is broken or
 the traffic has no returning connections. Issue #101, closed: the server resumes
 on every protocol, the counter is accurate, and the 0% was the traffic, because
 a browser opens ONE h2 connection per visit and resumption needs a return visit
 inside the ticket's lifetime.
 
-Verified against production: 7 of 8 h2 handshakes resumed and 7 of 8 h1, on all
-three nodes, with the origin's own `resumed` counter incrementing by exactly the
-number the client observed.
+Verified against a running server: 7 of 8 h2 handshakes resumed and 7 of 8 h1,
+with the server's own `resumed` counter incrementing by exactly the number the
+client observed.
 
 ### Fixed
 
@@ -876,12 +876,12 @@ end, h3 handshake p50 against a 4.9 ms path:
 
 A kilobyte saved is worth nothing against ten milliseconds of CPU.
 
-**On the long paths this was invisible.** edge-a at 308 ms and edge-b at 211 ms both
-measured 1.00 and 1.05 round trips after the 1.4.0 deploy, because a round trip hides
-ten milliseconds completely. origin serves its own city over a 5 ms path from a
-single-core VM, and there it was the whole cost: 9.5 ms under 1.3.0, 14.6 ms under
-1.4.0. It was found by measuring production after the rollout, not by any gate.
-Neither CI nor conformance measures handshake CPU on a short path.
+**On a long path this was invisible.** At 211 ms and 308 ms of round-trip time the
+handshake measured 1.00 and 1.05 round trips after the 1.4.0 deploy, because a round
+trip hides ten milliseconds completely. On a 5 ms path from a single-core VM it was
+the whole cost: 9.5 ms under 1.3.0, 14.6 ms under 1.4.0. It was found by measuring a
+running server after the rollout, not by any gate. Neither CI nor conformance measures
+handshake CPU on a short path.
 
 The compressed chain is now cached for the life of the process, keyed by the
 uncompressed bytes so a collision cannot serve one host's chain in place of another's,
@@ -899,10 +899,10 @@ the only way to learn what a node was running was to ssh in and ask the binary. 
 node runs the release we think it does" was an invariant nothing could check remotely.
 
 On 2026-09-16 four written records disagreed about the deployment fleet and none of
-them matched it: the deployment repository's m6 pin said v1.2.0, its captured config
-said 1.2.0 with an md5 matching nothing running, its release log named v1.1.0 as the
-newest deploy, and all three nodes were serving 1.3.0 with an identical md5. No node
-was faulty. Nothing could observe the truth, so the records rotted quietly.
+them matched it: a deploy repository pinning one tag, its captured config naming
+that tag with an artefact hash matching nothing running, a release log naming an
+older tag as the newest deploy, and every node serving a fourth. No node has to be
+faulty for that. Nothing can observe the truth, so the records rot quietly.
 
 The monitor now prints the version per node and raises a warning when the reporting
 nodes disagree, naming each. **A node that cannot report its version counts as drift,
@@ -953,8 +953,8 @@ staging origin, same probe and path, only compression changing:
 | brotli | **2859 B** | 3 | no stall, 1.16x |
 
 2859 against a 3600 budget, so the flight fits at the **conforming factor of 3** with
-headroom for a chain that grows. On the edge-a and edge-b paths, where a round trip
-is 270 to 300 ms, that round trip was the single largest avoidable cost in setting up
+headroom for a chain that grows. On an intercontinental path, where a round trip is
+270 to 300 ms, that round trip was the single largest avoidable cost in setting up
 a new connection.
 
 ### zlib is accepted, never offered
@@ -1114,7 +1114,7 @@ for absent sample counts.
 
 ### Security
 
-**The quiche revision production depended on was unreferenced.** 1.2.0 pinned
+**The pinned quiche revision was unreferenced.** 1.2.0 pinned
 `916a5a25`, which sat on no branch and no tag in the fork and was reachable only by
 raw SHA. GitHub garbage-collects unreferenced objects; when that happened every
 build would have failed, CI included, and the commit would have been unrecoverable.
@@ -1626,7 +1626,8 @@ existed and failed the moment it was fixed. It is now split so each status
 asserts its own rule: 200 carries the header, 204 must not. A test can pin wrong
 behaviour just as firmly as right behaviour, and this one did.
 
-Found by reading a 304 off a raw socket on production, not from the source.
+Found by reading a 304 off a raw socket against a running server, not from the
+source.
 
 694 workspace tests pass. Zero warnings.
 
@@ -1690,7 +1691,7 @@ the wrong seam.
 **Consequence worth stating plainly:** honouring these makes reloads slower, by
 design. A reload that previously replayed from cache in ~2us now reaches the
 backend. On the origin that is a couple of milliseconds; from a cache node it
-is a round trip to origin. That is what the client asked for -- the whole point
+is a round trip to the origin. That is what the client asked for -- the whole point
 of `no-cache` is to bypass the cache -- and it is the only way "force refresh"
 can work at all, but it is a real change in behaviour for reloads and not a
 free correctness win.

@@ -663,11 +663,13 @@ mod tests {
         }
     }
 
-    /// The exact envelope m6-http emits, byte for byte from production.
+    /// The exact envelope m6-http emits, field for field.
     ///
     /// Pinned as a literal because every consumer so far has re-derived the
     /// shape by eye and at least one read it as `ts` and a top-level
     /// `user_agent`, which parses to nothing and looks like a quiet hour.
+    /// Reproduce it by serving one request from a loopback instance with
+    /// analytics on and reading the first line of the log.
     #[test]
     fn parses_the_real_envelope() {
         let line = r#"{"timestamp":"2026-09-11T06:05:14.986903Z","level":"INFO","fields":{"message":"request","node":"origin","path":"/capabilities","status":200,"cache_state":"HIT","client_ip":"198.51.100.23","session_id":"0f1e2d3c4b5a69788796a5b4c3d2e1f0","session_new":true,"user_agent":"curl/8.7.1","latency_ns":3360}}"#;
@@ -1138,9 +1140,9 @@ pub struct ChannelSnapshot {
     /// either is unchanged. That is not a measurement of anything.
     ///
     /// This is not hypothetical here. rustls with the `std` feature defaults to a
-    /// 256-session in-memory store, so h1 and h2 resumption is already happening
-    /// in production, and h3 resumption became common once 0-RTT was enabled on
-    /// 2026-09-15.
+    /// 256-session in-memory store, so h1 and h2 resumption happens whether or
+    /// not anyone configured it, and h3 resumption becomes common as soon as
+    /// 0-RTT is enabled.
     ///
     /// The ratio of the two `total` fields IS the resumption rate, so nothing is
     /// lost by splitting: a reader who wants the mix can compute it, where a

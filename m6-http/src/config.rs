@@ -57,11 +57,12 @@ pub struct SiteConfig {
     pub describedby: String,
 }
 
-/// This deployment's node identity (e.g. "origin", "edge-a") — distinct from
-/// `[site].name`, which is the site's own display name and is identical
-/// across every node (they all serve the same site, from the same
-/// byte-for-byte site.toml). Comes from the per-node *system* config
-/// (`configs/cache-<city>.toml` / `configs/origin.toml`) instead.
+/// This deployment's node identity, for example "origin" or "edge-a".
+///
+/// Distinct from `[site].name`, which is the site's own display name and is
+/// identical across every node: they all serve the same site, from the same
+/// byte-for-byte site.toml. The node identity comes from the per-node *system*
+/// config instead, one file per node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeConfig {
     pub name: String,
@@ -123,14 +124,14 @@ pub struct ServerConfig {
     /// with an `Allow` header, before routing, cache lookup or backend
     /// dispatch.
     ///
-    /// Default is GET, HEAD, POST: everything this site actually does. POST is
-    /// present because the contact form needs it; it is never cached (see
+    /// Default is GET, HEAD, POST, which is everything a site with forms and
+    /// no write API does. POST is never cached (see
     /// `cache::method_may_write_cache`), only forwarded.
     ///
     /// Nothing validated the method before this existed, so every verb --
     /// PUT, DELETE, TRACE, and entirely invented ones like FOO -- was answered
     /// 200 with the cached page. TRACE especially should never be served: it
-    /// is a cross-site tracing vector and this site has no use for it.
+    /// is a cross-site tracing vector and a content site has no use for it.
     ///
     /// Configurable rather than hard-coded because the CMS routes (currently
     /// disabled) need PUT and DELETE when they come back.
@@ -541,8 +542,8 @@ pub struct BackendConfig {
     /// reads the SAME key and refuses to start if it disagrees with what it can
     /// actually do (`m6_core::compress::check_declared_support`).
     ///
-    /// DEFAULT TRUE, deliberately. Every backend in this fleet is built on
-    /// m6-core, which compresses by default, so true is what is already
+    /// DEFAULT TRUE, deliberately. A backend built on m6-core compresses by
+    /// default, and that is the ordinary case, so true matches what is already
     /// running. A backend that does not compress says so, and then the edge
     /// stops advertising an encoding dimension that has exactly one value.
     #[serde(default = "default_compresses")]

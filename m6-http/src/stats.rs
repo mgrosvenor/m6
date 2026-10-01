@@ -73,10 +73,10 @@ impl Version {
 ///
 /// The origin serves two completely different populations and pooling them
 /// makes both numbers meaningless: real visitors arrive on the public NIC
-/// over TLS or QUIC, while cache-miss forwards from edge-a and edge-b
-/// arrive over the WireGuard tunnel as h2c. The second group carries
-/// intercontinental RTT (~200-300ms) that has nothing to do with how fast
-/// this node is.
+/// over TLS or QUIC, while cache-miss forwards from the cache nodes arrive
+/// over a private tunnel as h2c. Where a cache node is on another continent
+/// the second group carries 200-300ms of RTT that has nothing to do with how
+/// fast this node is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Iface {
     /// Public network interface.
@@ -359,7 +359,8 @@ pub struct Stats {
     /// between noticing silent mail loss and not.
     ///
     /// A small map rather than a fixed array: backend names come from config and
-    /// this deployment has six. Only backends that have actually errored appear.
+    /// a deployment commonly has several. Only backends that have actually errored
+    /// appear.
     backend_errors_by_name: std::collections::BTreeMap<String, u64>,
 
     // Window counters (reset each emit)
@@ -538,7 +539,7 @@ impl Stats {
         //
         // Observed for nine consecutive hours: a bot sending an unrecognised
         // verb gets 501 Not Implemented from method validation, no backend is
-        // ever contacted, and `backend_errors_total` rose on all three nodes.
+        // ever contacted, and `backend_errors_total` rose on every node.
         // An operator watching that counter would go looking for a failing
         // renderer that was never involved.
         let backend_error = status >= 500 && !is_self_generated(backend);
@@ -1200,8 +1201,8 @@ mod backend_error_attribution_tests {
         Channel::new(Version::Http2, Iface::External)
     }
 
-    /// The regression this closes, seen on all three nodes for nine
-    /// consecutive hours: a bot sends an unrecognised verb, method validation
+    /// The regression this closes, which ran for hours across a whole fleet
+    /// before anyone looked: a bot sends an unrecognised verb, method validation
     /// answers 501 without contacting anything, and backend_errors_total
     /// rises. An operator watching that counter goes hunting for a failing
     /// renderer that was never involved.
