@@ -1189,6 +1189,24 @@ pub fn make_tls_server_config(
     let key = PrivateKeyDer::from_pem_file(key_path)
         .map_err(|e| anyhow::anyhow!("parse key {}: {}", key_path, e))?;
 
+    // Record the chain's expiry before rustls takes ownership of it, so /perf
+    // can report how long the certificate being served has left. Here because
+    // this is the one place that holds the loaded material: reading the file
+    // again at report time would answer about the path, and a renewal that
+    // wrote a new certificate without a reload is exactly the case where the
+    // path and the running server disagree. Issue #176.
+    //
+    // A certificate whose notAfter cannot be read is logged and left out of
+    // the report, never a reason to refuse to serve. rustls accepted it below
+    // or there would be no server at all, so the honest outcome is that the
+    // monitor says "cannot say" for that one rather than a number nobody took.
+    for (depth, e) in m6_core::tls::record_loaded(&certs) {
+        warn!(
+            cert = cert_path, depth, error = %e,
+            "could not read the certificate's expiry; it will not be reported"
+        );
+    }
+
     let mut config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)

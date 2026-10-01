@@ -87,6 +87,12 @@ sha2          = { version = "0.10", optional = true }
 [dev-dependencies]
 tempfile  = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
+# For `tls`'s tests, which parse real certificates rather than a fixture: a
+# checked-in certificate expires, and a test that starts failing on a date is a
+# test that gets deleted. `time` comes with them because rcgen's `not_after` is
+# a `time::OffsetDateTime` and rcgen does not re-export the type.
+rcgen     = "0.13"
+time      = "0.3"
 
 [[bench]]
 name    = "critical_path"

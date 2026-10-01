@@ -418,6 +418,21 @@ pub struct PerfReport {
     /// a network round trip inside a monitoring endpoint, which is how a
     /// monitoring endpoint learns to hang.
     pub url_backends: Vec<String>,
+    /// The TLS chain this process loaded, and how long each certificate has
+    /// left. Leaf first, so `tls[0]` is the certificate an *ACME* client
+    /// renews. Empty on a process serving no TLS.
+    ///
+    /// From the loaded material rather than from a file on disk, which is the
+    /// whole value of reporting it here: a renewal that wrote a new certificate
+    /// and never reloaded the server leaves the two facts disagreeing, and the
+    /// one that matters is what is being served.
+    ///
+    /// `serde(default)` so a node older than this field stays parseable to an
+    /// aggregator, in the shape `build` already uses. An empty list from an old
+    /// node and an empty list from a plaintext process are the same payload, so
+    /// a reader that needs to tell them apart reads `build.version` too.
+    #[serde(default)]
+    pub tls: Vec<crate::tls::TlsCertificate>,
     pub metrics: StatsSnapshot,
     /// The machine underneath: load, memory, disk, temperature, uptime.
     ///
@@ -511,6 +526,11 @@ impl PerfReport {
                     uptime_s,
                     pools,
                     url_backends,
+                    // Read from the registry the TLS loader wrote, not from
+                    // the certificate file: no path is opened to answer this,
+                    // so a monitoring endpoint cannot be made to do disk work
+                    // by being polled.
+                    tls: crate::tls::loaded(),
                     metrics: snapshot(),
                     host: crate::host::snapshot(host_path),
                 }))

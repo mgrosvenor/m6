@@ -19,6 +19,21 @@ pub struct Thresholds {
     /// comparison is against the number of CPUs.
     pub load_per_cpu: f64,
     pub thermal_celsius: f32,
+    /// Days left on the served certificate below which this warns.
+    ///
+    /// m6-http reports the number and this decides what is too few, which is
+    /// the split the rest of this file keeps: core reports, the monitor judges.
+    ///
+    /// The default is 21 days, and the reasoning is about renewal attempts
+    /// rather than about the certificate. An *ACME* (Automatic Certificate
+    /// Management Environment) client on the common 90-day certificate starts
+    /// renewing at 30 days left and retries daily. A threshold at 21 therefore
+    /// means renewal has been failing for about nine days and nine attempts
+    /// before anyone is told, which is the point: a threshold inside the
+    /// renewal window fires on the first transient failure and gets ignored,
+    /// and an ignored warning is the same as no warning. A deployment renewing
+    /// on a different schedule sets its own.
+    pub cert_expiry_days: i64,
 }
 
 impl Default for Thresholds {
@@ -28,6 +43,7 @@ impl Default for Thresholds {
             memory_used: 0.90,
             load_per_cpu: 2.0,
             thermal_celsius: 80.0,
+            cert_expiry_days: 21,
         }
     }
 }
@@ -113,6 +129,16 @@ pub struct NodeDigest {
     pub disk_used: Option<f64>,
     pub disk_total_bytes: Option<u64>,
     pub thermal_max_c: Option<f32>,
+    /// Seconds left on the soonest-expiring certificate the node is serving,
+    /// from `/perf`.
+    ///
+    /// The soonest rather than the leaf's, because a chain is only good until
+    /// its first expiry and an operator wants one number per node. Negative on
+    /// a certificate that has already expired. `None` when the node reported no
+    /// certificate at all, which reads as "cannot say" and never as "plenty of
+    /// time": a node silent about its expiry is the exact case this check must
+    /// not call healthy, for the reason `version` and `hash` give above.
+    pub cert_expires_in_seconds: Option<i64>,
     pub perf_error: Option<String>,
 }
 
@@ -151,6 +177,7 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
             disk_used: None,
             disk_total_bytes: None,
             thermal_max_c: None,
+            cert_expires_in_seconds: None,
             perf_error: r.perf_error.clone(),
         };
 
@@ -193,6 +220,11 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
             d.binary = empty_to_none(&p.build.name);
             d.hash = empty_to_none(&p.build.hash);
             d.uptime_s = Some(p.uptime_s);
+            // The soonest expiry in the chain. `min` over an empty list is
+            // `None`, which is the answer for a node too old to report the
+            // field and is left to say "cannot say" rather than collapsing to
+            // a number.
+            d.cert_expires_in_seconds = p.tls.iter().map(|c| c.expires_in_seconds).min();
             d.requests_total = Some(p.metrics.requests_total);
             d.backend_errors = Some(p.metrics.backend_errors_total);
             let hits = p.metrics.cache_hits_total;
@@ -319,6 +351,61 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
                         text: format!("{} at {:.1}C", z.name, z.celsius),
                     });
                 }
+            }
+
+            // ── The served certificate ───────────────────────────────────────
+            //
+            // The failure this exists to catch is a silent one: renewal is done
+            // by a client outside m6 on a timer, and a timer that fails keeps
+            // firing and keeps failing. Nothing looks, so the first signal is
+            // the node refusing connections on the day the certificate expires.
+            //
+            // Gated on the polled URL being TLS rather than on the node
+            // reporting a certificate, so the two silences stay apart: a
+            // plaintext node has nothing to report and must not warn, and a TLS
+            // node that reports nothing is a node this check cannot see and
+            // must warn. Reading an absence as healthy is the shape of mistake
+            // the build-drift check above was written to stop making.
+            let expects_tls = r
+                .url
+                .split_once("://")
+                .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("https"));
+            match (expects_tls, d.cert_expires_in_seconds) {
+                (true, Some(secs)) if secs < 0 => {
+                    findings.push(Finding {
+                        level: Level::Fault,
+                        node: r.name.clone(),
+                        text: format!(
+                            "certificate EXPIRED {} days ago and is still being served",
+                            -secs / 86_400
+                        ),
+                    });
+                }
+                (true, Some(secs)) if secs / 86_400 < t.cert_expiry_days => {
+                    findings.push(Finding {
+                        level: Level::Warn,
+                        node: r.name.clone(),
+                        text: format!(
+                            "certificate expires in {} days, under the {} day threshold",
+                            secs / 86_400,
+                            t.cert_expiry_days
+                        ),
+                    });
+                }
+                (true, None) => {
+                    findings.push(Finding {
+                        level: Level::Warn,
+                        node: r.name.clone(),
+                        // Two causes and the same consequence, so the text
+                        // names the consequence: the node predates the field,
+                        // or it loaded a certificate whose notAfter m6-http
+                        // could not read and said so in its own log.
+                        text: "node reports no certificate expiry, so a failed renewal \
+                               cannot be seen from here"
+                            .to_string(),
+                    });
+                }
+                _ => {}
             }
 
             // A node whose own name disagrees with the fleet config is either
@@ -465,9 +552,43 @@ mod tests {
             uptime_s: 100,
             pools,
             url_backends: vec![],
+            tls: vec![],
             metrics: StatsSnapshot::default(),
             host,
         }
+    }
+
+    /// A reading from a node polled over TLS, reporting a chain whose soonest
+    /// certificate has `days` left. `days` may be negative, for a certificate
+    /// that has already expired and is still being served.
+    ///
+    /// The URL is what decides whether a certificate is expected, so this is
+    /// the only helper here that uses an `https://` one. Every other test in
+    /// this module polls `http://x` and therefore never reaches the check.
+    fn tls_reading(name: &str, days: Option<i64>) -> NodeReading {
+        let mut p = perf(plain_host(), vec![]);
+        p.tls = days
+            .map(|d| {
+                let expires_in_seconds = d * 86_400;
+                vec![
+                    // Leaf, and an intermediate with far longer left: the
+                    // reported number must be the soonest, not the first.
+                    m6_core::tls::TlsCertificate {
+                        depth: 0,
+                        not_after_unix: 0,
+                        expires_in_seconds,
+                    },
+                    m6_core::tls::TlsCertificate {
+                        depth: 1,
+                        not_after_unix: 0,
+                        expires_in_seconds: expires_in_seconds + 10_000 * 86_400,
+                    },
+                ]
+            })
+            .unwrap_or_default();
+        let mut r = reading(name, "ok", Some(p));
+        r.url = "https://x".into();
+        r
     }
 
     fn reading(name: &str, status: &str, perf: Option<PerfReport>) -> NodeReading {
@@ -892,5 +1013,105 @@ mod tests {
         );
         assert_eq!(d.nodes[0].hit_p50_ns, None);
         assert_eq!(d.nodes[0].hit_rate, None);
+    }
+
+    // ── The served certificate, issue #176 ───────────────────────────────────
+
+    /// A certificate with plenty of time left is reported and judged healthy.
+    /// The number is the soonest in the chain, which is the leaf here and is
+    /// deliberately not the first thing a naive read would return.
+    #[test]
+    fn a_healthy_certificate_is_reported_and_raises_nothing() {
+        let d = build(
+            &[tls_reading("origin", Some(60))],
+            &Thresholds::default(),
+            now(),
+        );
+        assert_eq!(d.nodes[0].cert_expires_in_seconds, Some(60 * 86_400));
+        assert_eq!(d.level, Level::Ok);
+        assert!(d.findings.is_empty(), "{:?}", d.findings);
+    }
+
+    /// Under the threshold is a warning, and the text says how long is left
+    /// rather than only that something is wrong.
+    #[test]
+    fn a_certificate_under_the_threshold_warns() {
+        let d = build(
+            &[tls_reading("origin", Some(9))],
+            &Thresholds::default(),
+            now(),
+        );
+        assert_eq!(d.level, Level::Warn);
+        assert!(
+            d.findings[0].text.contains("expires in 9 days"),
+            "{:?}",
+            d.findings[0].text
+        );
+    }
+
+    /// The boundary, stated so a later edit cannot move it by accident. The
+    /// default threshold is 21 days, so 21 is fine and 20 warns.
+    #[test]
+    fn the_threshold_is_a_floor_not_a_ceiling() {
+        let t = Thresholds::default();
+        assert!(build(&[tls_reading("origin", Some(21))], &t, now())
+            .findings
+            .is_empty());
+        assert!(!build(&[tls_reading("origin", Some(20))], &t, now())
+            .findings
+            .is_empty());
+    }
+
+    /// An expired certificate is a fault rather than a warning: the node is
+    /// refusing connections, so this is not a thing to look at next week.
+    #[test]
+    fn an_expired_certificate_is_a_fault() {
+        let d = build(
+            &[tls_reading("origin", Some(-3))],
+            &Thresholds::default(),
+            now(),
+        );
+        assert_eq!(d.level, Level::Fault);
+        assert!(
+            d.findings[0].text.contains("EXPIRED 3 days ago"),
+            "{:?}",
+            d.findings[0].text
+        );
+        assert_eq!(d.nodes[0].cert_expires_in_seconds, Some(-3 * 86_400));
+    }
+
+    /// The case this check exists for, and the one easiest to get wrong. A TLS
+    /// node that reports no certificate is a node whose renewal cannot be
+    /// watched from here, and reading that absence as healthy is the whole
+    /// failure mode. It warns, and the per-node line shows "-" rather than a
+    /// number nobody measured.
+    #[test]
+    fn a_tls_node_reporting_no_certificate_warns() {
+        let d = build(
+            &[tls_reading("origin", None)],
+            &Thresholds::default(),
+            now(),
+        );
+        assert_eq!(d.level, Level::Warn);
+        assert!(
+            d.findings[0].text.contains("no certificate expiry"),
+            "{:?}",
+            d.findings[0].text
+        );
+        assert_eq!(d.nodes[0].cert_expires_in_seconds, None);
+    }
+
+    /// And the other silence, which must stay silent. A node polled over
+    /// plaintext has no certificate to report, so the absence is an answer and
+    /// not a gap.
+    #[test]
+    fn a_plaintext_node_is_not_warned_about() {
+        let d = build(
+            &[reading("origin", "ok", Some(perf(plain_host(), vec![])))],
+            &Thresholds::default(),
+            now(),
+        );
+        assert_eq!(d.nodes[0].cert_expires_in_seconds, None);
+        assert!(d.findings.is_empty(), "{:?}", d.findings);
     }
 }

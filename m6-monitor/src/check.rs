@@ -217,9 +217,15 @@ pub fn render(d: &Digest, readings: &[NodeReading]) -> String {
         // strings is exactly what "the fleet agrees" looked like on 2026-09-20
         // while it did not. Twelve characters of the hash: enough to compare by
         // eye and the same prefix the estate file and the handover quote.
+        //
+        // The certificate is on this line too, for the same reason: "how long
+        // has this node got" is asked beside "what is it running", and a
+        // certificate reported anywhere an operator does not already look is
+        // reported nowhere. From the certificate m6-http loaded, so it is what
+        // the node is serving rather than what is on its disk.
         let _ = writeln!(
             o,
-            "        {} {} build {}",
+            "        {} {} build {} cert {}",
             n.binary.as_deref().unwrap_or("m6"),
             n.version
                 .as_deref()
@@ -228,6 +234,9 @@ pub fn render(d: &Digest, readings: &[NodeReading]) -> String {
                 .as_deref()
                 .map(|h| &h[..h.len().min(12)])
                 .unwrap_or("unknown"),
+            n.cert_expires_in_seconds
+                .map(fmt_cert_expiry)
+                .unwrap_or_else(|| "-".into()),
         );
     }
 
@@ -581,6 +590,21 @@ fn fmt_dur(secs: u64) -> String {
     }
 }
 
+/// Seconds left on a certificate, as days.
+///
+/// Days because that is the unit renewal is discussed in, and a bare `12d` next
+/// to a build hash is read correctly without a legend. Separate from `fmt_dur`
+/// because this number goes negative and that one cannot: an expired
+/// certificate reads `EXPIRED 3d ago`, which is a different sentence from a
+/// small positive number and has to look like one on a line being skimmed.
+fn fmt_cert_expiry(secs: i64) -> String {
+    if secs < 0 {
+        format!("EXPIRED {}d ago", -secs / 86_400)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -778,5 +802,21 @@ mod header_check_tests {
         assert!(out.contains("none declared"), "{out}");
         // And it is not a fault: declaring none is a choice, not a failure.
         assert!(out.contains("ALL CLEAR"), "{out}");
+    }
+
+    /// Certificate expiry on the per-node line, in days and with the sign
+    /// handled. Integer division truncates toward zero, so an expired
+    /// certificate must be negated before the division and not after: `-1 /
+    /// 86400` is 0 either way, and `EXPIRED 0d ago` is the right answer for
+    /// something that lapsed an hour ago.
+    #[test]
+    fn certificate_expiry_renders_in_days_with_the_sign_kept() {
+        assert_eq!(fmt_cert_expiry(60 * 86_400), "60d");
+        assert_eq!(fmt_cert_expiry(0), "0d");
+        // Part of a day left still reads as a day count, rounded down, which is
+        // the honest direction for a deadline.
+        assert_eq!(fmt_cert_expiry(86_399), "0d");
+        assert_eq!(fmt_cert_expiry(-3 * 86_400), "EXPIRED 3d ago");
+        assert_eq!(fmt_cert_expiry(-1), "EXPIRED 0d ago");
     }
 }
