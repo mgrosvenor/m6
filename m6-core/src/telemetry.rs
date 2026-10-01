@@ -330,6 +330,47 @@ pub fn claims_to_be_bot(user_agent: &str) -> bool {
     matches_any(user_agent, BOT_MARKERS)
 }
 
+/// The domain a bot user agent says it belongs to, if it says.
+///
+/// Crawler user agents carry their own contact, by convention as a URL or an
+/// email address in parentheses: `(+http://www.example.com/bot.html)` or
+/// `(+bot@example.com)`. That string is the claim, and it is what a reverse
+/// lookup is checked against, so extracting it is the first half of
+/// verification. See [`crate::resolve::Ptr::verifies`] for the second.
+///
+/// Returns the registrable-looking host with any `www.` stripped, because a
+/// crawler's PTR records sit under the bare domain far more often than under
+/// the `www` host its documentation page happens to live on.
+///
+/// `None` when the agent names nothing, which is itself worth reporting: an
+/// agent claiming to be a crawler and giving no way to check is a weaker
+/// claim than one that does.
+pub fn claimed_domain(user_agent: &str) -> Option<String> {
+    // A URL first, then an email. Both appear, and an agent carrying both
+    // puts the URL first in every convention seen.
+    const STOP: [char; 5] = ['/', ')', ' ', ';', ','];
+    let host = match user_agent.find("://") {
+        Some(i) => user_agent[i + 3..].split(STOP).next()?,
+        None => {
+            let i = user_agent.find('@')?;
+            user_agent[i + 1..].split(STOP).next()?
+        }
+    };
+    // Strip a port and any credentials a malformed agent might carry.
+    let host = host.rsplit('@').next()?;
+    let host = host.split(':').next()?;
+    let host = host.trim_end_matches('.').trim().to_ascii_lowercase();
+    let host = host.strip_prefix("www.").unwrap_or(&host).to_string();
+    // A domain needs at least one dot. Anything else is not checkable and
+    // saying so is better than returning something a suffix match would
+    // accept too easily.
+    if host.contains('.') && !host.is_empty() {
+        Some(host)
+    } else {
+        None
+    }
+}
+
 /// Probe shapes, checked raw and decoded, for the same reason as
 /// [`looks_like_injection`]: `..%2F` is a traversal and `%2E%65nv` is `.env`.
 pub fn looks_like_probe(path: &str) -> bool {
@@ -421,6 +462,16 @@ pub struct CrawlerSighting {
     pub requests: u64,
     pub client_ips: Vec<String>,
     pub paths: Vec<(String, u64)>,
+    /// When the counted requests began and ended, as the timestamps appear in
+    /// the log.
+    ///
+    /// Without these a sighting cannot be placed against anything else in a
+    /// report: a crawler fetching a sitemap means one thing an hour after a
+    /// deploy and another during a burst, and the records being aggregated
+    /// carry the time all along. They span only the addresses that survived
+    /// the forgery check, matching `requests`.
+    pub first_seen: String,
+    pub last_seen: String,
 }
 
 /// An hour of traffic, summarised.
@@ -482,8 +533,21 @@ impl TrafficSummary {
         #[derive(Default)]
         struct UaAcc {
             n: u64,
-            ips: HashMap<String, u64>,
+            ips: HashMap<String, IpAcc>,
             paths: HashMap<String, u64>,
+        }
+        /// One address under one user agent: how many, and when.
+        ///
+        /// Per address rather than per user agent because a sighting counts
+        /// only the addresses that survived the forgery check, and its window
+        /// has to be the window of the requests it counted. Folding the times
+        /// in at the user-agent level would let an address excluded as a
+        /// forger widen the span reported for the genuine ones.
+        #[derive(Default)]
+        struct IpAcc {
+            n: u64,
+            first: String,
+            last: String,
         }
         let mut per_ip: HashMap<String, Acc> = HashMap::new();
         let mut per_ua: HashMap<String, UaAcc> = HashMap::new();
@@ -518,7 +582,21 @@ impl TrafficSummary {
 
             let e = per_ua.entry(rec.user_agent().to_string()).or_default();
             e.n += 1;
-            *e.ips.entry(f.client_ip.clone()).or_default() += 1;
+            let ip_acc = e.ips.entry(f.client_ip.clone()).or_insert_with(|| IpAcc {
+                n: 0,
+                first: rec.timestamp.clone(),
+                last: rec.timestamp.clone(),
+            });
+            ip_acc.n += 1;
+            // String comparison is time comparison here: the timestamps are
+            // fixed-width RFC 3339 in UTC, which is the same property
+            // `parse_analytics` relies on to select a window.
+            if rec.timestamp < ip_acc.first {
+                ip_acc.first = rec.timestamp.clone();
+            }
+            if rec.timestamp > ip_acc.last {
+                ip_acc.last = rec.timestamp.clone();
+            }
             *e.paths.entry(f.path.clone()).or_default() += 1;
         }
 
@@ -555,16 +633,29 @@ impl TrafficSummary {
             if !claims_to_be_bot(&ua) {
                 continue;
             }
-            let genuine: Vec<(String, u64)> = ips
-                .iter()
-                .filter(|(ip, _)| !forgers.contains(*ip))
-                .map(|(ip, c)| (ip.clone(), *c))
+            let genuine: Vec<(String, IpAcc)> = ips
+                .into_iter()
+                .filter(|(ip, _)| !forgers.contains(ip))
                 .collect();
-            let genuine_n: u64 = genuine.iter().map(|(_, c)| c).sum();
+            let genuine_n: u64 = genuine.iter().map(|(_, a)| a.n).sum();
             summary.forged_bot_requests += n - genuine_n;
             if genuine_n == 0 {
                 continue;
             }
+            // The window of the requests actually counted, across the
+            // addresses actually counted.
+            let first_seen = genuine
+                .iter()
+                .map(|(_, a)| a.first.as_str())
+                .min()
+                .unwrap_or_default()
+                .to_string();
+            let last_seen = genuine
+                .iter()
+                .map(|(_, a)| a.last.as_str())
+                .max()
+                .unwrap_or_default()
+                .to_string();
             let mut ip_list: Vec<String> = genuine.into_iter().map(|(ip, _)| ip).collect();
             ip_list.sort();
             let mut p: Vec<(String, u64)> = paths.into_iter().collect();
@@ -575,6 +666,8 @@ impl TrafficSummary {
                 requests: genuine_n,
                 client_ips: ip_list,
                 paths: p,
+                first_seen,
+                last_seen,
             });
         }
         summary
@@ -872,6 +965,72 @@ mod tests {
     /// mostly getting 404s, because it is re-crawling links that no longer
     /// exist, is still a genuine crawler. Error ratio is not evidence of
     /// forgery; asking for credentials is.
+    /// The claim a user agent makes about itself, which is half of
+    /// verification. Issue #205.
+    #[test]
+    fn the_domain_a_bot_claims_is_extracted_from_its_own_string() {
+        let d = |ua: &str| claimed_domain(ua);
+        // The URL form, which is the common one, with `www.` stripped because
+        // PTR records sit under the bare domain far more often.
+        assert_eq!(
+            d("Mozilla/5.0 (compatible; ExampleBot/2.1; +http://www.example.com/bot.html)"),
+            Some("example.com".into())
+        );
+        assert_eq!(
+            d("Mozilla/5.0 (compatible; ExampleBot/1.0; +https://example.com/crawler)"),
+            Some("example.com".into())
+        );
+        // The email form.
+        assert_eq!(
+            d("Mozilla/5.0 (compatible; ExampleBot/1.0; +bot@example.com)"),
+            Some("example.com".into())
+        );
+        // A port must not end up in the domain.
+        assert_eq!(
+            d("ExampleBot/1.0 (+http://example.com:8080/bot)"),
+            Some("example.com".into())
+        );
+        // An agent that names nothing checkable says so, rather than
+        // producing something a suffix match would accept.
+        assert_eq!(d("ExampleBot/1.0"), None);
+        assert_eq!(
+            d("Mozilla/5.0 (compatible; ExampleBot/1.0; +http://localhost/)"),
+            None
+        );
+        assert_eq!(d(""), None);
+    }
+
+    /// A sighting carries the window of the requests it counted, and a forger
+    /// excluded from the count must not widen it. Issue #205.
+    #[test]
+    fn a_sighting_reports_the_window_of_the_requests_it_counted() {
+        let ua = "Mozilla/5.0 (compatible; ExampleBot/1.0; +http://example.com/bot)";
+        let mut records = vec![
+            rec("2026-10-01T09:00:00Z", "198.51.100.11", "/a", 200, ua),
+            rec("2026-10-01T09:05:00Z", "198.51.100.11", "/b", 200, ua),
+        ];
+        // A forger presenting the same agent, later, and also scanning. Its
+        // requests are excluded from the count, so they must also be excluded
+        // from the window.
+        records.push(rec(
+            "2026-10-01T11:00:00Z",
+            "203.0.113.41",
+            "/.aws/credentials",
+            404,
+            ua,
+        ));
+
+        let s = TrafficSummary::from_records(&records);
+        assert_eq!(s.crawlers.len(), 1);
+        let c = &s.crawlers[0];
+        assert_eq!(c.requests, 2, "the forger's request is not counted");
+        assert_eq!(c.first_seen, "2026-10-01T09:00:00Z");
+        assert_eq!(
+            c.last_seen, "2026-10-01T09:05:00Z",
+            "the excluded forger must not widen the reported window"
+        );
+    }
+
     #[test]
     fn a_crawler_hitting_dead_links_is_still_a_crawler() {
         let ua = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";

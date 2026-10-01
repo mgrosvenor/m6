@@ -391,8 +391,16 @@ pub fn render(d: &Digest, readings: &[NodeReading]) -> String {
         }
     }
 
-    let _ = writeln!(o, "\nE. CRAWLERS  (reported every run, even a quiet one)");
+    let _ = writeln!(
+        o,
+        "\nE. CRAWLERS  (reported every run, even a quiet one; a user agent is a claim)"
+    );
     let mut any = false;
+    // One lookup per distinct address per run, not per sighting. The same
+    // address commonly appears under one agent on several nodes, and a report
+    // must not multiply its own DNS traffic by the size of the fleet.
+    let mut ptr_cache: std::collections::HashMap<String, m6_core::resolve::Ptr> =
+        std::collections::HashMap::new();
     for r in readings {
         let Some(t) = &r.traffic else { continue };
         if t.forged_bot_requests > 0 {
@@ -434,6 +442,12 @@ pub fn render(d: &Digest, readings: &[NodeReading]) -> String {
             );
             let _ = writeln!(o, "        UA: {}", c.user_agent);
             let _ = writeln!(o, "        paths: {}", c.paths.join(", "));
+            if !c.first_seen.is_empty() {
+                let _ = writeln!(o, "        seen: {} .. {}", c.first_seen, c.last_seen);
+            }
+            for line in verdict_lines(c, &mut ptr_cache) {
+                let _ = writeln!(o, "        {line}");
+            }
         }
     }
     if !any {
@@ -571,6 +585,55 @@ pub fn render(d: &Digest, readings: &[NodeReading]) -> String {
     o
 }
 
+/// Whether each address behind a sighting supports the agent's claim.
+///
+/// One line per address, because a sighting with three addresses where two
+/// verify and one does not is a different thing from three that all verify,
+/// and a single summary verdict would hide which.
+///
+/// The three outcomes are kept apart deliberately. "No PTR record" is
+/// unverified and may be an honest crawler behind a provider that publishes
+/// none. "Lookup failed" says nothing about the address at all. Reporting
+/// either as a forgery would be a confident answer nobody measured, and
+/// reporting either as a pass is the failure this section exists to stop.
+fn verdict_lines(
+    c: &m6_core::monitoring::CrawlerReport,
+    cache: &mut std::collections::HashMap<String, m6_core::resolve::Ptr>,
+) -> Vec<String> {
+    use m6_core::resolve::{reverse_default, Ptr};
+
+    let claim = c.claimed_domain.trim();
+    let mut out = Vec::new();
+    for ip in c.client_ips.iter().take(3) {
+        let ptr = cache
+            .entry(ip.clone())
+            .or_insert_with(|| reverse_default(ip))
+            .clone();
+        let line = match &ptr {
+            // The agent names no domain, so there is nothing to check
+            // against. The name is still worth printing: it says who the
+            // address actually belongs to.
+            Ptr::Name(n) if claim.is_empty() => {
+                format!("{ip} -> {n}  UNVERIFIABLE: the agent names no domain")
+            }
+            Ptr::Name(n) if ptr.verifies(claim) => {
+                format!("{ip} -> {n}  verified against {claim}")
+            }
+            Ptr::Name(n) => format!("{ip} -> {n}  MISMATCH: claims {claim}"),
+            Ptr::None => format!("{ip} -> no PTR record  UNVERIFIED"),
+            Ptr::Failed => format!("{ip} -> lookup failed  UNVERIFIED"),
+        };
+        out.push(line);
+    }
+    if c.client_ips.len() > 3 {
+        out.push(format!(
+            "(+{} more address(es) not checked)",
+            c.client_ips.len() - 3
+        ));
+    }
+    out
+}
+
 fn fmt_dur(secs: u64) -> String {
     let d = secs / 86_400;
     let h = (secs % 86_400) / 3_600;
@@ -699,6 +762,108 @@ mod tests {
         );
         assert!(out.contains("E. CRAWLERS"));
         assert!(out.contains("no genuine crawler traffic in the window"));
+    }
+
+    // ── Crawler verification, issue #205 ─────────────────────────────────────
+
+    fn crawler(ips: &[&str], claim: &str) -> m6_core::monitoring::CrawlerReport {
+        m6_core::monitoring::CrawlerReport {
+            user_agent: "Mozilla/5.0 (compatible; ExampleBot/1.0; +http://example.com/bot)".into(),
+            requests: 3,
+            client_ips: ips.iter().map(|s| s.to_string()).collect(),
+            paths: vec!["/robots.txt".into()],
+            first_seen: "2026-10-01T09:00:00Z".into(),
+            last_seen: "2026-10-01T09:05:00Z".into(),
+            claimed_domain: claim.into(),
+        }
+    }
+
+    /// The cache is pre-populated so no test does a real lookup: this is about
+    /// how each outcome is reported, not about the resolver.
+    #[test]
+    fn each_verification_outcome_is_reported_as_itself() {
+        use m6_core::resolve::Ptr;
+        let mut cache = std::collections::HashMap::new();
+        cache.insert("192.0.2.1".to_string(), Ptr::Name("a.example.com".into()));
+        cache.insert("192.0.2.2".to_string(), Ptr::Name("a.attacker.net".into()));
+        cache.insert("192.0.2.3".to_string(), Ptr::None);
+        cache.insert("192.0.2.4".to_string(), Ptr::Failed);
+
+        let out = verdict_lines(&crawler(&["192.0.2.1"], "example.com"), &mut cache);
+        assert_eq!(
+            out,
+            vec!["192.0.2.1 -> a.example.com  verified against example.com"]
+        );
+
+        // A name that resolves to someone else is the one case we can call
+        // false, and it names who it actually was.
+        let out = verdict_lines(&crawler(&["192.0.2.2"], "example.com"), &mut cache);
+        assert!(out[0].contains("MISMATCH"), "{out:?}");
+        assert!(out[0].contains("a.attacker.net"), "{out:?}");
+
+        // No PTR and a failed lookup are both UNVERIFIED and neither is a
+        // mismatch: an honest crawler can sit behind a provider publishing no
+        // PTR, and a dead resolver says nothing about the address at all.
+        let out = verdict_lines(&crawler(&["192.0.2.3"], "example.com"), &mut cache);
+        assert!(
+            out[0].contains("no PTR record") && out[0].contains("UNVERIFIED"),
+            "{out:?}"
+        );
+        assert!(!out[0].contains("MISMATCH"), "{out:?}");
+        let out = verdict_lines(&crawler(&["192.0.2.4"], "example.com"), &mut cache);
+        assert!(
+            out[0].contains("lookup failed") && out[0].contains("UNVERIFIED"),
+            "{out:?}"
+        );
+        assert!(!out[0].contains("MISMATCH"), "{out:?}");
+
+        // An agent naming no domain cannot be checked, and that is a third
+        // thing again: the name resolved fine, there was just no claim.
+        let out = verdict_lines(&crawler(&["192.0.2.1"], ""), &mut cache);
+        assert!(out[0].contains("UNVERIFIABLE"), "{out:?}");
+        assert!(out[0].contains("a.example.com"), "{out:?}");
+    }
+
+    /// Every address gets its own line, because two verifying and one not is
+    /// a different fact from three verifying.
+    #[test]
+    fn each_address_is_reported_separately_and_the_rest_are_counted() {
+        use m6_core::resolve::Ptr;
+        let mut cache = std::collections::HashMap::new();
+        for ip in ["192.0.2.1", "192.0.2.2", "192.0.2.3", "192.0.2.4"] {
+            cache.insert(ip.to_string(), Ptr::Name("a.example.com".into()));
+        }
+        cache.insert("192.0.2.2".to_string(), Ptr::None);
+
+        let c = crawler(
+            &["192.0.2.1", "192.0.2.2", "192.0.2.3", "192.0.2.4"],
+            "example.com",
+        );
+        let out = verdict_lines(&c, &mut cache);
+        assert_eq!(out.len(), 4, "three addresses plus the count: {out:?}");
+        assert!(out[0].contains("verified"), "{out:?}");
+        assert!(out[1].contains("UNVERIFIED"), "{out:?}");
+        assert!(out[3].contains("+1 more"), "{out:?}");
+    }
+
+    /// Section E now carries the window and the verdict, and still appears on
+    /// a quiet run.
+    #[test]
+    fn the_crawler_section_carries_times_and_a_verdict() {
+        let mut r = reading("origin", None);
+        let mut t = traffic(LoggingHealth {
+            events_total: 1,
+            seconds_since_last: Some(1),
+        });
+        t.crawlers = vec![crawler(&["192.0.2.1"], "example.com")];
+        r.traffic = Some(t);
+        let out = render(&digest(), &[r]);
+        assert!(out.contains("a user agent is a claim"), "{out}");
+        assert!(
+            out.contains("seen: 2026-10-01T09:00:00Z .. 2026-10-01T09:05:00Z"),
+            "{out}"
+        );
+        assert!(out.contains("192.0.2.1 ->"), "{out}");
     }
 }
 
