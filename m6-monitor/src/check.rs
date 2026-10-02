@@ -588,7 +588,7 @@ mod tests {
 
     fn traffic(logging: LoggingHealth) -> TrafficReport {
         TrafficReport {
-            node: "sydney".into(),
+            node: "origin".into(),
             window_minutes: 60,
             total_requests: 0,
             status: Default::default(),
@@ -607,7 +607,7 @@ mod tests {
         NodeReading {
             name: name.into(),
             role: "origin".into(),
-            url: "https://x".into(),
+            url: "https://origin.example.com".into(),
             health: None,
             health_status: None,
             perf: None,

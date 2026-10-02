@@ -47,7 +47,7 @@ Take from it that only the last one runs everything.
 | `./check.sh` | release build, clippy, tests, formatting, conformance, benchmarks |
 | `./check.sh --no-bench` | the same without the benchmarks |
 | `tools/conformance.sh [h1\|h2\|h3\|resume]` | one protocol, or all of them with no argument |
-| `M6_BUILD_HOST=root@your-linux-box ./tools/build-host-tests.sh` | all of it, on Linux, with the testers installed |
+| `M6_BUILD_HOST=user@example.com ./tools/build-host-tests.sh` | all of it, on Linux, with the testers installed |
 
 **Table 2: the five commands, and what each one runs.**
 `cargo test` is the loop while writing code, `check.sh` is the local gate, and `build-host-tests.sh` is what gates a merge, because it adds the performance check and real conformance.

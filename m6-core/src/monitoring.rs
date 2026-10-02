@@ -13,14 +13,15 @@
 //! 2. Are this node's backends present?
 //! 3. Does the site render?
 //!
-//! Measured on 2026-09-09, rendering `/` costs ~6 ms of Tera work on the
-//! origin (105 images, ~43 us of per-image manifest work each), and a monitor
-//! that sends `Cache-Control: no-cache` forces every check to pay it. That is
-//! a large, variable answer to what should be a small, constant question.
+//! Rendering a homepage is template work proportional to what is on it: an
+//! image-heavy index costs milliseconds of it, roughly 43 us per image of
+//! manifest work, and a monitor that sends `Cache-Control: no-cache` forces
+//! every check to pay the whole bill. That is a large, variable answer to what
+//! should be a small, constant question.
 //!
 //! It also cannot tell you *which* node is unwell. Checks against the apex go
 //! wherever GeoDNS sends the checking region, so one dead node can hide
-//! behind two healthy ones. `/health` is per-node by construction: point the
+//! behind the healthy ones. `/health` is per-node by construction: point the
 //! monitor at `origin.`/`edge-a.`/`edge-b.` and the answer names the node that
 //! produced it.
 //!
@@ -34,7 +35,7 @@
 //!   is degraded.
 //! - A **cache node** has one URL backend (the origin over h2c) and *no*
 //!   socket pools at all. `total_active_members()` counts only socket pools,
-//!   so it reads 0 on London and Chicago permanently.
+//!   so it reads 0 on every cache node permanently.
 //!
 //! A naive "0 members means unhealthy" check would therefore report both edge
 //! nodes as permanently down. Worse, it would be wrong in the other direction
@@ -66,9 +67,10 @@
 //! attacking you. An attacker probing for a resource-exhaustion path is
 //! normally blind: they cannot tell whether a request is expensive or whether
 //! their load is landing. Publishing hit and miss percentiles tells them
-//! exactly which requests cost 2.8us and which cost 7.8ms, about 2800 to 1 on
-//! this deployment, and `backend_errors_total` then confirms in real time
-//! when they have found something that hurts. That turns a blind probe into a
+//! exactly which requests are cheap and which are expensive, and the ratio
+//! between a cache hit and a backend miss runs to three orders of magnitude,
+//! so the ranking is unambiguous. `backend_errors_total` then confirms in real
+//! time when they have found something that hurts. That turns a blind probe into a
 //! tuning loop. Gating it also means an anonymous scrape loop can never reach
 //! the sort.
 //!
@@ -96,11 +98,11 @@
 //! secret we already treat as sensitive.
 //!
 //! Against that: with no version anywhere, "every node runs the release we think
-//! it does" was an invariant nothing could check without ssh, and on 2026-09-16
-//! four written records disagreed about this fleet while all three nodes served
-//! something none of them named. An operator cannot act on a fleet they cannot
-//! observe, and a silent version turned a deploy defect into four months of
-//! plausible-looking bookkeeping. The version goes behind the token, not on
+//! it does" is an invariant nothing can check without ssh. Four written records
+//! can disagree about one fleet while every node serves something none of them
+//! names, and nothing in the system is able to say so. An operator cannot act on
+//! a fleet they cannot observe, and a silent version turns a deploy defect into
+//! months of plausible-looking bookkeeping. The version goes behind the token, not on
 //! `/health`, which keeps the public surface exactly as it was.
 //!
 //! With no token configured `/perf` does not exist at all (404, not 401), so
@@ -206,7 +208,7 @@ pub struct HealthReport {
     /// `String` rather than `&'static str` because an aggregator reads this
     /// back off the wire and cannot produce a `'static` one.
     pub status: String,
-    /// This node's identity, e.g. `"sydney"`. The reason to have the endpoint
+    /// This node's identity, e.g. `"origin"`. The reason to have the endpoint
     /// at all: the answer says which node produced it.
     pub node: String,
 }
@@ -222,8 +224,8 @@ pub struct HealthReport {
 /// The three carry different information and none is redundant:
 ///
 /// - `name` says WHICH binary. A node runs several, and "the node is on 1.10.0"
-///   has never been one fact: on 2026-09-16 this fleet had m6-http and the
-///   renderers built from different trees and nothing could express that.
+///   has never been one fact. A fleet can have m6-http and its renderers built
+///   from different trees, and before this nothing could express that.
 /// - `version` says which release it claims to be. It is what an operator reads
 ///   and what release notes are written against.
 /// - `hash` says which BUILD it actually is. Rust is not byte-reproducible, so
@@ -264,7 +266,8 @@ pub struct BuildId {
 /// and the answer wanted is the binary's. The version is m6-core's, which is the
 /// m6 release: for the workspace binaries that is their own version, and for a
 /// service linking core from a git tag it is that tag, which is the more useful
-/// answer for a service whose own version means nothing to this fleet.
+/// answer for a service whose own version says nothing about which m6 it is
+/// built against.
 pub fn build_id() -> &'static BuildId {
     static BUILD: std::sync::OnceLock<BuildId> = std::sync::OnceLock::new();
     BUILD.get_or_init(|| BuildId {
@@ -396,12 +399,13 @@ pub struct PerfReport {
     /// Why the version alone was already worth having, kept because the argument
     /// still applies to the whole structure: without it the only way to learn
     /// what a node runs was to ssh in and ask the binary, so "every node runs the
-    /// pinned release" was an invariant nothing could check. On 2026-09-16 four
-    /// written records disagreed about this fleet and none matched it: the
-    /// deployment repo's pin said v1.2.0, its captured config said 1.2.0 with an
-    /// md5 matching nothing running, its release log named v1.1.0, and all three
-    /// nodes served 1.3.0. No node was faulty. Nothing could observe the truth,
-    /// so the records rotted without anyone being wrong on purpose.
+    /// pinned release" was an invariant nothing could check. Four written records
+    /// can disagree about one fleet with none of them matching it: a deploy
+    /// repository pinning one tag, its captured config naming that tag with an
+    /// artefact hash matching nothing running, a release log naming an older
+    /// tag, and every node serving a fourth. No node has to be faulty for that.
+    /// Nothing can observe the truth, so the records rot without anyone being
+    /// wrong on purpose.
     ///
     /// `serde(default)` so a node older than this change deserialises to an empty
     /// `BuildId` instead of making the whole payload unparseable to an
@@ -575,20 +579,20 @@ mod tests {
     #[test]
     fn origin_with_live_pools_is_ok() {
         let (code, report) =
-            HealthReport::build("sydney", &[pool("m6-html", 1, 1), pool("m6-file", 2, 2)]);
+            HealthReport::build("origin", &[pool("m6-html", 1, 1), pool("m6-file", 2, 2)]);
         assert_eq!(code, 200);
         assert_eq!(report.status, "ok");
-        assert_eq!(report.node, "sydney");
+        assert_eq!(report.node, "origin");
     }
 
     /// The regression this endpoint most needs to not have.
     ///
     /// A cache node has no socket pools at all, so `total_active_members()`
-    /// is 0 on London and Chicago at all times. Deriving health from that
-    /// count alone reports both edge nodes as permanently down.
+    /// reads 0 on a cache node at all times. Deriving health from that count alone
+    /// reports every cache node as permanently down.
     #[test]
     fn cache_node_with_no_socket_pools_is_ok_not_degraded() {
-        let (code, report) = HealthReport::build("london", &[]);
+        let (code, report) = HealthReport::build("edge-a", &[]);
         assert_eq!(
             code, 200,
             "a cache node has no socket pools and is not degraded for it"
@@ -599,7 +603,7 @@ mod tests {
     #[test]
     fn an_empty_pool_degrades_the_node() {
         let (code, report) = HealthReport::build(
-            "sydney",
+            "origin",
             &[pool("m6-html", 1, 1), pool("render-contact", 0, 1)],
         );
         assert_eq!(code, 503);
@@ -611,13 +615,13 @@ mod tests {
     /// `active` would call this healthy.
     #[test]
     fn members_present_but_all_failed_is_degraded() {
-        let (code, _) = HealthReport::build("sydney", &[pool("m6-html", 0, 3)]);
+        let (code, _) = HealthReport::build("origin", &[pool("m6-html", 0, 3)]);
         assert_eq!(code, 503);
     }
 
     #[test]
     fn response_is_never_stored_and_never_indexed() {
-        let (code, report) = HealthReport::build("sydney", &[]);
+        let (code, report) = HealthReport::build("origin", &[]);
         let (code, headers, body) = report.into_response(code);
         assert_eq!(code, 200);
         let get = |k: &str| {
@@ -632,7 +636,7 @@ mod tests {
 
         let parsed: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
         assert_eq!(parsed["status"], "ok");
-        assert_eq!(parsed["node"], "sydney");
+        assert_eq!(parsed["node"], "origin");
     }
 
     /// Traffic volume and build identity are not public. If a future change
@@ -708,7 +712,7 @@ mod tests {
         // opened: 404, not 401.
         let out = PerfReport::build(
             PerfSubject {
-                node: "sydney",
+                node: "origin",
                 uptime_s: 5,
                 pools: vec![],
                 url_backends: vec![],
@@ -733,7 +737,7 @@ mod tests {
     fn perf_reports_the_running_build_identity() {
         let out = PerfReport::build(
             PerfSubject {
-                node: "sydney",
+                node: "origin",
                 uptime_s: 5,
                 pools: vec![],
                 url_backends: vec![],
@@ -819,7 +823,7 @@ mod tests {
         // at one failed on unrelated required fields of StatsSnapshot.
         let out = PerfReport::build(
             PerfSubject {
-                node: "sydney",
+                node: "origin",
                 uptime_s: 5,
                 pools: vec![],
                 url_backends: vec![],
@@ -846,7 +850,7 @@ mod tests {
     fn perf_is_401_with_a_scheme_hint_when_credentials_are_wrong() {
         let out = PerfReport::build(
             PerfSubject {
-                node: "sydney",
+                node: "origin",
                 uptime_s: 5,
                 pools: vec![],
                 url_backends: vec![],
@@ -877,7 +881,7 @@ mod tests {
         };
         let _ = PerfReport::build(
             PerfSubject {
-                node: "sydney",
+                node: "origin",
                 uptime_s: 5,
                 pools: vec![],
                 url_backends: vec![],
@@ -896,7 +900,7 @@ mod tests {
     fn perf_returns_metrics_when_authorised() {
         let out = PerfReport::build(
             PerfSubject {
-                node: "sydney",
+                node: "origin",
                 uptime_s: 11,
                 pools: vec![pool("m6-html", 1, 1)],
                 url_backends: vec!["origin".to_string()],
@@ -911,7 +915,7 @@ mod tests {
         let (code, _, body) = out.into_response();
         assert_eq!(code, 200);
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(parsed["node"], "sydney");
+        assert_eq!(parsed["node"], "origin");
         assert_eq!(parsed["uptime_s"], 11);
         assert_eq!(parsed["metrics"]["requests_total"], 0);
         assert!(parsed["metrics"]["hit_samples"].is_number());
@@ -941,7 +945,7 @@ mod tests {
     /// test whose name says why that is a decision and not a formality.
     #[test]
     fn public_payload_is_exactly_status_and_node() {
-        let (code, report) = HealthReport::build("sydney", &[pool("m6-html", 1, 1)]);
+        let (code, report) = HealthReport::build("origin", &[pool("m6-html", 1, 1)]);
         let (_, _, body) = report.into_response(code);
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let object = parsed.as_object().expect("object");
@@ -1160,7 +1164,7 @@ mod traffic_tests {
 
     fn row(ts: &str, ip: &str, path: &str, status: u16, ua: &str) -> String {
         format!(
-            r#"{{"timestamp":"{ts}","level":"INFO","fields":{{"message":"request","node":"sydney","path":"{path}","status":{status},"client_ip":"{ip}","user_agent":"{ua}"}}}}"#
+            r#"{{"timestamp":"{ts}","level":"INFO","fields":{{"message":"request","node":"origin","path":"{path}","status":{status},"client_ip":"{ip}","user_agent":"{ua}"}}}}"#
         )
     }
 
@@ -1202,7 +1206,7 @@ mod traffic_tests {
                 "curl/8",
             ));
         }
-        let r = TrafficReport::build("sydney", &lines.join("\n"), "", 60);
+        let r = TrafficReport::build("origin", &lines.join("\n"), "", 60);
 
         assert_eq!(r.total_requests, 6);
         assert_eq!(r.crawlers.len(), 1);

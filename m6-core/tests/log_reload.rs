@@ -1,8 +1,8 @@
 //! A config reload must not silence logging.
 //!
-//! This exists because it happened in production. On 2026-09-06 every m6-http
-//! node stopped logging the moment a deploy touched `site.toml`: `periodic
-//! stats`, pool events, warnings and errors all vanished, while the server kept
+//! This exists because it has happened on a running fleet. Every m6-http node
+//! stopped logging the moment a deploy touched `site.toml`: `periodic stats`,
+//! pool events, warnings and errors all vanished, while the server kept
 //! serving traffic and reporting itself healthy. Only the `analytics` layer
 //! survived, because it has its own writer that reload never touches.
 //!

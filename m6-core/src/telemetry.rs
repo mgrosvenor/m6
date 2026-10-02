@@ -524,12 +524,13 @@ impl TrafficSummary {
 
         // Who has disqualified their own claim.
         //
-        // Rotation is one way. Scanning is the other, and it was missed until
-        // 2026-09-11, when 94.154.46.250 requested /.aws/credentials,
-        // /settings.php, /composer.json and /config.js while presenting a
-        // single, unchanging `Googlebot/2.1` user agent. The rotation check
-        // saw one user agent and believed it, so the same address appeared in
-        // one report both as a credential scanner and as a Googlebot visit.
+        // Rotation is one way. Scanning is the other, and it was missed at
+        // first: one address asking for /.aws/credentials, /settings.php,
+        // /composer.json and /config.js while presenting a single, unchanging
+        // `Googlebot/2.1` user agent. The rotation check saw one user agent
+        // and believed it, so the same address appeared in one report both as
+        // a credential scanner and as a Googlebot visit. The test
+        // `a_credential_scanner_is_not_a_crawler` below is that shape.
         //
         // Googlebot does not look for AWS credentials. An address asking for
         // probe paths is not the crawler it says it is, whether it says so
@@ -653,7 +654,7 @@ mod tests {
             level: "INFO".to_string(),
             fields: AnalyticsFields {
                 message: "request".to_string(),
-                node: "sydney".to_string(),
+                node: "origin".to_string(),
                 path: path.to_string(),
                 status,
                 client_ip: ip.to_string(),
@@ -663,19 +664,21 @@ mod tests {
         }
     }
 
-    /// The exact envelope m6-http emits, byte for byte from production.
+    /// The exact envelope m6-http emits, field for field.
     ///
     /// Pinned as a literal because every consumer so far has re-derived the
     /// shape by eye and at least one read it as `ts` and a top-level
     /// `user_agent`, which parses to nothing and looks like a quiet hour.
+    /// Reproduce it by serving one request from a loopback instance with
+    /// analytics on and reading the first line of the log.
     #[test]
     fn parses_the_real_envelope() {
-        let line = r#"{"timestamp":"2026-09-11T06:05:14.986903Z","level":"INFO","fields":{"message":"request","node":"sydney","path":"/capabilities","status":200,"cache_state":"HIT","client_ip":"220.233.79.92","session_id":"494a54891b104c46bd7cdaecab0f202f","session_new":true,"user_agent":"curl/8.7.1","latency_ns":3360}}"#;
+        let line = r#"{"timestamp":"2026-09-11T06:05:14.986903Z","level":"INFO","fields":{"message":"request","node":"origin","path":"/capabilities","status":200,"cache_state":"HIT","client_ip":"198.51.100.23","session_id":"0f1e2d3c4b5a69788796a5b4c3d2e1f0","session_new":true,"user_agent":"curl/8.7.1","latency_ns":3360}}"#;
         let recs: Vec<_> = parse_analytics(line, "").collect();
         assert_eq!(recs.len(), 1);
         let r = &recs[0];
         assert!(r.is_request());
-        assert_eq!(r.fields.node, "sydney");
+        assert_eq!(r.fields.node, "origin");
         assert_eq!(r.fields.path, "/capabilities");
         assert_eq!(r.fields.status, 200);
         assert_eq!(r.fields.cache_state, "HIT");
@@ -770,7 +773,7 @@ mod tests {
         {
             records.push(rec(
                 &format!("2026-09-11T05:47:{:02}Z", i),
-                "34.91.241.0",
+                "203.0.113.41",
                 "/fetch",
                 404,
                 &format!("Mozilla/5.0 (compatible; {name})"),
@@ -779,14 +782,14 @@ mod tests {
         for i in 0..20 {
             records.push(rec(
                 &format!("2026-09-11T05:48:{:02}Z", i),
-                "34.91.241.0",
+                "203.0.113.41",
                 "/.env",
                 404,
                 &format!("Mozilla/5.0 (filler-{i})"),
             ));
         }
         // A real crawler, one user agent from several addresses.
-        for (i, ip) in ["18.205.91.101", "34.194.233.48", "52.203.152.231"]
+        for (i, ip) in ["198.51.100.11", "198.51.100.12", "198.51.100.13"]
             .iter()
             .enumerate()
         {
@@ -801,7 +804,7 @@ mod tests {
 
         let s = TrafficSummary::from_records(&records);
 
-        assert_eq!(s.forgers, vec!["34.91.241.0".to_string()]);
+        assert_eq!(s.forgers, vec!["203.0.113.41".to_string()]);
         assert_eq!(
             s.crawlers.len(),
             1,
@@ -816,7 +819,7 @@ mod tests {
         // And the rotator is surfaced on its own terms.
         let sus = s.suspicious(100);
         assert_eq!(sus.len(), 1);
-        assert_eq!(sus[0].0, "34.91.241.0");
+        assert_eq!(sus[0].0, "203.0.113.41");
         assert!(sus[0].1.is_rotating_user_agents);
         assert!(!sus[0].1.probe_paths.is_empty());
     }
@@ -846,7 +849,7 @@ mod tests {
             .map(|(i, p)| {
                 rec(
                     &format!("2026-09-11T09:17:{:02}Z", i),
-                    "94.154.46.250",
+                    "203.0.113.250",
                     p,
                     404,
                     ua,
@@ -860,7 +863,7 @@ mod tests {
             "a credential scanner must not be reported as a crawler sighting: {:?}",
             s.crawlers.iter().map(|c| &c.user_agent).collect::<Vec<_>>()
         );
-        assert_eq!(s.forgers, vec!["94.154.46.250".to_string()]);
+        assert_eq!(s.forgers, vec!["203.0.113.250".to_string()]);
         assert_eq!(s.forged_bot_requests, paths.len() as u64);
         // And it is still reported as what it is. One probe path is enough to
         // disqualify the crawler claim; escalating to a fault still wants the
@@ -934,7 +937,7 @@ mod tests {
     fn a_single_refused_probe_is_not_notable() {
         let s = TrafficSummary::from_records(&[rec(
             "2026-09-11T08:09:22Z",
-            "137.184.111.53",
+            "203.0.113.37",
             "/.git/config",
             404,
             "curl/8",
@@ -977,7 +980,7 @@ mod tests {
             .map(|i| {
                 rec(
                     &format!("2026-09-11T06:34:{:02}Z", i),
-                    "185.19.40.146",
+                    "203.0.113.46",
                     "//xmlrpc.php",
                     404,
                     "curl/8",
@@ -986,7 +989,7 @@ mod tests {
             .collect();
         records.push(rec(
             "2026-09-11T06:34:59Z",
-            "185.19.40.146",
+            "203.0.113.46",
             "/",
             200,
             "curl/8",
@@ -1006,7 +1009,7 @@ mod tests {
             .map(|i| {
                 rec(
                     &format!("2026-09-11T06:{:02}:00Z", i % 60),
-                    "220.233.79.92",
+                    "198.51.100.23",
                     "/capabilities",
                     200,
                     "curl/8.7.1",
@@ -1138,9 +1141,9 @@ pub struct ChannelSnapshot {
     /// either is unchanged. That is not a measurement of anything.
     ///
     /// This is not hypothetical here. rustls with the `std` feature defaults to a
-    /// 256-session in-memory store, so h1 and h2 resumption is already happening
-    /// in production, and h3 resumption became common once 0-RTT was enabled on
-    /// 2026-09-15.
+    /// 256-session in-memory store, so h1 and h2 resumption happens whether or
+    /// not anyone configured it, and h3 resumption becomes common as soon as
+    /// 0-RTT is enabled.
     ///
     /// The ratio of the two `total` fields IS the resumption rate, so nothing is
     /// lost by splitting: a reader who wants the mix can compute it, where a

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # build-host-tests.sh — run m6's own checks on a Linux build host.
 #
-#   M6_BUILD_HOST=root@198.51.100.7 ./tools/build-host-tests.sh
+#   M6_BUILD_HOST=user@example.com ./tools/build-host-tests.sh
 #
 # ── Why m6 has its own ───────────────────────────────────────────────────────
 #
@@ -28,9 +28,10 @@
 #
 # ── Configuration ────────────────────────────────────────────────────────────
 #
-#   M6_BUILD_HOST      required. user@host for ssh and rsync.
-#   M6_BUILD_SSH_OPTS  optional ssh options, e.g. "-p 4022". Default none.
-#   M6_BUILD_ROOT      optional remote directory. Default /root/build.
+#   M6_BUILD_HOST      required. The ssh target, as user@example.com.
+#   M6_BUILD_SSH_OPTS  optional ssh options, e.g. "-p 2222". Default none.
+#   M6_BUILD_ROOT      optional remote directory, relative to the login
+#                      directory unless absolute. Default m6-build.
 #   M6_ALLOW_DIRTY     optional. Skip the clean-tree guard, for local iteration.
 #   M6_EXAMPLES        optional path to the m6-examples checkout. Default: a
 #                      sibling directory named m6-examples. Set M6_SKIP_EXAMPLES=1
@@ -94,11 +95,13 @@ BUILD_HOST="${M6_BUILD_HOST:-}"
   backend-example runtimes (cc, c++, python3, go) on it. m6 does not know which
   machine is yours.
 
-      export M6_BUILD_HOST=root@198.51.100.7
-      export M6_BUILD_SSH_OPTS='-p 4022'      # if it is not on 22"
+      export M6_BUILD_HOST=user@example.com"
 
 SSH_OPTS="${M6_BUILD_SSH_OPTS:-} -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15"
-BUILD_ROOT="${M6_BUILD_ROOT:-/root/build}"
+# Relative, so the remote login directory decides where it lands. NOT `~/...`:
+# the value is used inside `cd "$M6_DIR"` on the far side, and a quoted tilde
+# is not expanded, so it would resolve to a literal directory named `~`.
+BUILD_ROOT="${M6_BUILD_ROOT:-m6-build}"
 LOG=/tmp/m6-build-host-tests.log
 EXAMPLES_LOG=/tmp/m6-build-host-examples.log
 

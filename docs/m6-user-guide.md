@@ -1682,17 +1682,17 @@ password = "live-api-token"   # in configs/render-contact.conf
 **Deploying over `data/posts.json` — wipes published posts:**
 ```bash
 # Wrong
-rsync -av ./ user@server:/var/www/my-blog/
+rsync -av ./ user@example.com:/var/www/my-blog/
 
 # Right — always exclude server-managed state
 rsync -av --exclude 'content/drafts/' --exclude 'data/posts.json' --exclude 'data/auth.db' \
-  ./ user@server:/var/www/my-blog/
+  ./ user@example.com:/var/www/my-blog/
 ```
 
 **Editing `site.toml` on the server directly:**
 ```bash
 # Wrong — next deploy overwrites it
-ssh server vim /var/www/my-blog/site.toml
+ssh user@example.com vim /var/www/my-blog/site.toml
 
 # Right — edit locally and deploy
 # Server-specific overrides belong in /etc/m6/my-blog.toml
@@ -1718,7 +1718,7 @@ cd examples/08-logviewer
 
 `examples/09-global-deployment/`
 
-A multi-region Vultr deployment: an origin node runs the full m6 stack, and multiple cache nodes around the world run m6-http in pure proxy mode. A WireGuard mesh connects all nodes. Cache invalidation propagates from origin to all cache nodes on publish. Demonstrates horizontal scale-out across regions without a CDN.
+A multi-region deployment: an origin node runs the full m6 stack, and multiple cache nodes around the world run m6-http in pure proxy mode. A private mesh network connects all nodes. Cache invalidation propagates from origin to all cache nodes on publish. Demonstrates horizontal scale-out across regions without a CDN.
 
 ```bash
 cd examples/09-global-deployment
