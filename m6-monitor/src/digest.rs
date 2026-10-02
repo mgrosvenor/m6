@@ -474,7 +474,7 @@ mod tests {
         NodeReading {
             name: name.into(),
             role: "origin".into(),
-            url: "http://x".into(),
+            url: "http://origin.example.com".into(),
             health: Some(HealthReport {
                 status: status.into(),
                 node: "origin".into(),

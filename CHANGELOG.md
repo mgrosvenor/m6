@@ -1163,7 +1163,7 @@ which is the only reason that flag existed. The health check is now one fetch ov
 a forwarded socket, with no ssh to any node:
 
 ```sh
-ssh -fN -L /tmp/m6mon.sock:/run/m6/m6-monitor.sock root@<build-host>
+ssh -fN -L /tmp/m6mon.sock:/run/m6/m6-monitor.sock user@example.com
 curl --unix-socket /tmp/m6mon.sock http://localhost/check
 ```
 

@@ -83,7 +83,7 @@ pub struct ServerConfig {
     #[serde(default = "default_backend_timeout_secs")]
     pub backend_timeout_secs: u64,
     /// Optional H2C (HTTP/2 cleartext) listener address.
-    /// Intended for use over WireGuard tunnels or trusted private networks.
+    /// Intended for use over a private backbone between nodes.
     #[serde(default)]
     pub h2c_bind: Option<String>,
     /// Run this process as a plain-HTTP redirector on this address instead of
@@ -223,8 +223,9 @@ pub struct HealthConfig {
     /// The *path* is configuration and belongs in git; the *contents* are a
     /// secret and must not. site.toml is rendered from a committed template
     /// and shipped byte-identically to every node, so a token written inline
-    /// there would be a secret in the repository. Same pattern as the a DNS provider's
-    /// credentials at /etc/m6/credentials.env: 0600, root-only, on the box.
+    /// there would be a secret in the repository. The same split applies to
+    /// every other credential a node needs: the file is mode 0600, owned by
+    /// root, and exists only on the box.
     #[serde(default)]
     pub metrics_token_file: Option<String>,
     /// The resolved token, read from `metrics_token_file` at load.

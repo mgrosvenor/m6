@@ -588,7 +588,7 @@ mod tests {
     /// The regression this endpoint most needs to not have.
     ///
     /// A cache node has no socket pools at all, so `total_active_members()`
-    /// is 0 on one at all times. Deriving health from that count alone
+    /// reads 0 on a cache node at all times. Deriving health from that count alone
     /// reports every cache node as permanently down.
     #[test]
     fn cache_node_with_no_socket_pools_is_ok_not_degraded() {

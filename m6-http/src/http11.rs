@@ -353,9 +353,10 @@ struct H2cPlainConn {
 
 /// Whether an h2c listener on `addr` may believe a forwarded client address.
 ///
-/// Derived from the bind address, not configured. In production this listener
-/// is the WireGuard backbone and the only peers that can reach it are our own
-/// cache nodes, which is what makes their `x-forwarded-for` worth believing.
+/// Derived from the bind address, not configured. On a private address this
+/// listener is the backbone between nodes, and the only peers that can reach
+/// it are the deployment's own cache nodes, which is what makes their
+/// `x-forwarded-for` worth believing.
 /// Bound to a public address it is just another listener, and trusting it
 /// there would hand every client a rate-limit bypass.
 ///
@@ -375,9 +376,10 @@ pub struct H2cListener {
     conns: Vec<H2cPlainConn>,
     /// Whether a peer here may assert a client address for someone else.
     ///
-    /// Derived from the bind address, not configured. This listener is the
-    /// WireGuard backbone in production and the only peers that can reach it
-    /// are our own cache nodes, which is what makes their
+    /// Derived from the bind address, not configured. On a private address
+    /// this listener is the backbone between nodes, and the only peers that
+    /// can reach it are the deployment's own cache nodes, which is what
+    /// makes their
     /// `x-forwarded-for` worth believing -- see
     /// `crate::forward::ForwardedTrust`. Bound to a public address it is just
     /// another listener, and trusting it there would hand every client a
@@ -1664,7 +1666,7 @@ mod h2c_trust_tests {
 
     /// The trust is derived from where the listener is bound, so there is no
     /// config key to set wrong and no peer list to keep in step with the
-    /// WireGuard topology.
+    /// private-backbone topology.
     #[test]
     fn only_a_private_bind_is_trusted() {
         for private in [

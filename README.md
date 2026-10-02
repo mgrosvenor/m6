@@ -73,7 +73,7 @@ actually used, and they are the first place a change to them breaks. m6's own
 checks do this for you:
 
 ```sh
-M6_BUILD_HOST=root@your-linux-box ./tools/build-host-tests.sh
+M6_BUILD_HOST=user@example.com ./tools/build-host-tests.sh
 ```
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md).

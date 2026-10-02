@@ -81,7 +81,7 @@ impl Version {
 pub enum Iface {
     /// Public network interface.
     External,
-    /// WireGuard tunnel between nodes.
+    /// Private backbone between nodes.
     Internal,
 }
 
@@ -89,7 +89,7 @@ impl Iface {
     /// Classify a listener by its bind address.
     ///
     /// Derived rather than hardcoded per listener: h2c is *conventionally*
-    /// the WireGuard listener here, but that is deployment configuration, not
+    /// the backbone listener here, but that is deployment configuration, not
     /// a property of the protocol, and a future node that exposes h2c
     /// publicly should not be silently labelled internal.
     pub fn for_bind(bind: &str) -> Iface {
@@ -1021,7 +1021,7 @@ mod channel_tests {
 
     #[test]
     fn interface_is_classified_from_the_bind_address() {
-        // The WireGuard backbone between nodes.
+        // The private backbone between nodes.
         assert_eq!(Iface::for_bind("10.0.0.1:80"), Iface::Internal);
         assert_eq!(Iface::for_bind("192.168.1.5:80"), Iface::Internal);
         assert_eq!(Iface::for_bind("172.16.0.1:80"), Iface::Internal);
@@ -1047,7 +1047,7 @@ mod channel_tests {
     }
 
     /// The point of the whole exercise: an origin's public visitor traffic and
-    /// its WireGuard cache-miss forwards must not land in the same bucket.
+    /// its backbone cache-miss forwards must not land in the same bucket.
     #[test]
     fn traffic_is_separated_by_version_and_interface() {
         let mut stats = Stats::new();
@@ -1559,7 +1559,7 @@ mod handshake_tests {
     }
 
     /// External and internal are different events even on one protocol: a
-    /// browser handshake and one from the WireGuard backbone.
+    /// browser handshake and one from the private backbone.
     #[test]
     fn interface_separates_them_too() {
         let mut s = Stats::new();

@@ -183,12 +183,12 @@ timeout_ms = 2000
 
 [[monitor.nodes]]
 name = "origin"
-url  = "http://192.0.2.1:8080"
+url  = "http://origin.example.com:8080"
 role = "origin"
 
 [[monitor.nodes]]
 name = "edge-a"
-url  = "http://192.0.2.4:8080"
+url  = "http://edge-b.example.com:8080"
 role = "cache"
 "#
         )
@@ -215,7 +215,7 @@ role = "cache"
         let mut f = tempfile::NamedTempFile::new().unwrap();
         write!(
             f,
-            "[monitor]\nperf_token_file = {:?}\n\n[[monitor.nodes]]\nname=\"a\"\nurl=\"http://x\"\n",
+            "[monitor]\nperf_token_file = {:?}\n\n[[monitor.nodes]]\nname=\"a\"\nurl=\"http://origin.example.com\"\n",
             tok.path()
         )
         .unwrap();
@@ -236,7 +236,7 @@ role = "cache"
 
         let n = Node {
             name: "edge-a".into(),
-            url: "https://edge-a".into(),
+            url: "https://edge-a.example.com".into(),
             role: "cache".into(),
             perf_token_file: Some(per_node.path().to_string_lossy().to_string()),
         };
@@ -247,7 +247,7 @@ role = "cache"
 
         let bare = Node {
             name: "origin".into(),
-            url: "https://origin".into(),
+            url: "https://origin.example.com".into(),
             role: "origin".into(),
             perf_token_file: None,
         };
@@ -263,7 +263,7 @@ role = "cache"
         let mut f = tempfile::NamedTempFile::new().unwrap();
         write!(
             f,
-            "[monitor]\nperf_token_file = \"/no/such/file\"\n\n[[monitor.nodes]]\nname=\"a\"\nurl=\"http://x\"\n"
+            "[monitor]\nperf_token_file = \"/no/such/file\"\n\n[[monitor.nodes]]\nname=\"a\"\nurl=\"http://origin.example.com\"\n"
         )
         .unwrap();
         let fleet = Fleet::from_config(f.path()).unwrap();

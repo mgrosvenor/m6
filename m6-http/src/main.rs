@@ -402,9 +402,11 @@ fn make_quiche_config(server_config: &config::ServerConfig) -> anyhow::Result<qu
     //
     // A returning visitor sends its request in the FIRST flight, so the response
     // costs zero round trips instead of one. On loopback that saves about a
-    // millisecond and looks unimportant. On an intercontinental path it is the
-    // single largest latency win available: a cache node 300ms from its origin
-    // saves 300ms on a round trip, and no amount of local tuning recovers it.
+    // millisecond and looks unimportant. For a visitor on a long path it is the
+    // single largest latency win available: at 300ms of round-trip time the
+    // saved round trip is 300ms that no amount of local tuning recovers. This
+    // setting is the QUIC listener that serves VISITORS. A cache node fetching
+    // from its origin goes over h2c on TCP and is not affected by it.
     //
     // For comparison, over TCP the same visitor pays TWO round trips before any
     // application data: one for the TCP handshake and one for TLS. Measured on
@@ -1240,7 +1242,7 @@ fn event_loop(
                         // gap survived: any check of the h3 path looked fine.
                         let elapsed_ns = start.elapsed().as_nanos() as u64;
                         // h2c is HTTP/2 by definition; the interface class comes
-                        // from its bind address (the WireGuard tunnel here).
+                        // from its bind address (the private backbone here).
                         let chan = Channel::new(HttpVersion::Http2, state.h2c_iface);
                         state.stats.record(elapsed_ns, false, status, chan, backend);
                     }
@@ -1273,7 +1275,7 @@ fn event_loop(
             // above, with its own `drive_all` that returns nothing because there
             // is no handshake to time. h2c is the backbone path from the cache
             // nodes, which carry their own TLS to the visitor and reach the
-            // origin in the clear over WireGuard.
+            // origin in the clear over the private backbone.
         }
 
         // Drive connection timeouts and flush pending sends
@@ -3292,9 +3294,8 @@ fn set_vary_accept_encoding(headers: &mut Vec<(String, String)>, backend_compres
 ///
 /// A successful POST/PUT/DELETE means the stored representation of that URI is
 /// now wrong, and nothing invalidated it: the cache kept serving the old copy
-/// until it expired on its own. For this site that is a live concern the
-/// moment the CMS returns — edit a page, and the edge keeps serving the
-/// previous one.
+/// until it expired on its own. That is a live concern for any site with an
+/// editing interface: edit a page, and the edge keeps serving the previous one.
 ///
 /// "Non-error status" is the RFC's condition: a 4xx/5xx means the state change
 /// did not happen, so the cached copy is still correct and must be left alone.
@@ -4346,7 +4347,7 @@ mod www_redirect_tests {
         }
     }
 
-    /// `www.` prefixing a *different* domain is not this site's www alias.
+    /// `www.` prefixing a *different* domain is not the configured site's www alias.
     #[test]
     fn www_of_another_domain_is_not_our_alias() {
         let c = cfg("example.com", true);

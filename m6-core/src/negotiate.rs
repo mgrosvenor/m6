@@ -10,8 +10,11 @@
 //!   response cache key, so `gzip` and `gzip, deflate, br, zstd` were separate
 //!   entries for one byte-identical response.
 //!
-//! What each implementation served, against the HTML path. Every row is
-//! reproducible against a loopback instance with one `curl -H`:
+//! What each implementation served, against the HTML path. The `served`
+//! column is what the `ae_contains` substring match produced, which this
+//! module replaced, so it is a record of the defect rather than something a
+//! current build reproduces. The `correct` column is what this code answers
+//! now, and `negotiate`'s own tests below assert it:
 //!
 //! | Accept-Encoding        | correct  | served |
 //! |------------------------|----------|--------|
