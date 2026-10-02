@@ -71,7 +71,7 @@ pub fn socket_path_from_config(config_path: &Path) -> PathBuf {
 ///
 /// Not a fresh guess: `m6-file` and `m6-auth-server` had each hand-written
 /// `set_read_timeout(Some(Duration::from_secs(30)))` into their own accept
-/// path, so 30 is what this fleet already runs. The five services built on
+/// path, so 30 is the value already in service. The five services built on
 /// [`crate::app::App`] had no timeout at all.
 pub const DEFAULT_READ_TIMEOUT_SECS: u64 = 30;
 
@@ -155,15 +155,15 @@ pub fn poll_listener_and_watcher(
 /// Default mode for a service's unix socket.
 ///
 /// `0o660`, not the `0o666` that `m6-file` and `m6-auth-server` each set by
-/// hand. Every unit on this fleet runs `User=m6` and every socket lives in
-/// `/run/m6`, which systemd creates `0750` and owns as `m6`, so the world bits
-/// grant nothing that the directory does not already deny. They were free, and
-/// a permission that is free today is the one nobody re-examines when the
-/// directory mode changes.
+/// hand. The intended arrangement is every unit under one service user with
+/// its sockets in a directory that user owns, typically `0750`, where the
+/// world bits grant nothing the directory does not already deny. They were
+/// free, and a permission that is free today is the one nobody re-examines
+/// when the directory mode changes.
 ///
-/// Owner and group are what is actually used: the service creates the socket as
-/// `m6` and every consumer connects as `m6`, so this is the boundary the fleet
-/// already relies on, written down rather than inferred from a umask.
+/// Owner and group are the boundary that actually does the work: the service
+/// creates the socket and its consumers connect as the same user. This writes
+/// that down rather than leaving it inferred from a umask.
 pub const DEFAULT_SOCKET_MODE: u32 = 0o660;
 
 /// Apply the socket mode after bind, in one place.

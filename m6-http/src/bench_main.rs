@@ -4,7 +4,7 @@
 ///   --http11-only       only run HTTP/1.1 suites
 ///   --http2-only        only run HTTP/2 suites
 ///   --http3-only        only run HTTP/3 suites
-///   --h2c-only          only run H2C suites (HTTP/2 cleartext, for WireGuard tunnels)
+///   --h2c-only          only run H2C suites (HTTP/2 cleartext, for a private backbone)
 ///   --url-only          only run URL-backend suites (h2 inbound, http/https/h2c/h2s outbound)
 ///   --h2c               include H2C suites alongside the selected protocols
 ///   --url               include URL-backend suites alongside the selected protocols
@@ -833,7 +833,7 @@ fn bench_http2_throughput_path(
 // ── H2C (HTTP/2 cleartext) helpers ────────────────────────────────────────────
 //
 // Mirrors H2Client but connects over plain TCP without TLS.
-// Intended for the h2c_bind port (e.g. 127.0.0.1:8080) used over WireGuard tunnels.
+// Intended for the h2c_bind port (e.g. 127.0.0.1:8080) used over a private backbone.
 
 /// Persistent HTTP/2 cleartext client over plain TCP.
 struct H2cClient {

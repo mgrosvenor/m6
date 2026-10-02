@@ -2,8 +2,9 @@
 //!
 //! Building a request's dictionary used to start from an empty map and copy
 //! the whole of the service's static configuration into it, per request. On
-//! the real site that is the config file's keys plus `data/content.json`,
-//! 68KB and 1,364 nodes, deep-copied several times to produce a map that was
+//! a content-driven site that is the config file's keys plus its whole
+//! catalogue, tens of kilobytes and thousands of nodes, deep-copied several
+//! times to produce a map that was
 //! identical for every request until the next config reload.
 //!
 //! Nothing in that is per-request. So it is not copied per request: the base

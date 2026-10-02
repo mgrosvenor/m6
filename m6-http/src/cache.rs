@@ -198,8 +198,8 @@ fn expires_lifetime(headers: &[(String, String)]) -> Option<std::time::Duration>
 /// A day keeps the model intact — deploys invalidate far more often than
 /// this, so in normal operation it never expires anything the pipeline was not
 /// going to clear anyway — while making "the invalidation was missed" a
-/// bounded fault instead of a permanent one. Nothing this site serves relies
-/// on it: every route and asset carries an explicit `max-age`.
+/// bounded fault instead of a permanent one. A site whose every route and
+/// asset carries an explicit `max-age` never relies on it at all.
 const HEURISTIC_MAX_LIFETIME: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
 /// What a response's own `Cache-Control` asks this cache to do.
@@ -1021,9 +1021,9 @@ fn status_is_storable(status: u16) -> bool {
     // uncacheable no matter what its headers said.
     //
     // That is not merely conservative, it costs real work: on a cache node a
-    // 404 that cannot be stored is a round trip to the origin every time. The
-    // measured cost on this deployment was ~207ms from edge-b and ~282ms
-    // from edge-a, paid thousands of times a day for junk paths.
+    // 404 that cannot be stored is a round trip to the origin every time. On
+    // an intercontinental link that is 200-300ms, paid again for every junk
+    // path a scanner asks for, and scanners ask for thousands a day.
     //
     // 206 is excluded deliberately: a partial response is only meaningful
     // with the Range request that produced it, and the cache key carries no

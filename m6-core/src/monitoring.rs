@@ -13,14 +13,15 @@
 //! 2. Are this node's backends present?
 //! 3. Does the site render?
 //!
-//! Measured on 2026-09-09, rendering `/` costs ~6 ms of Tera work on the
-//! origin (105 images, ~43 us of per-image manifest work each), and a monitor
-//! that sends `Cache-Control: no-cache` forces every check to pay it. That is
-//! a large, variable answer to what should be a small, constant question.
+//! Rendering a homepage is template work proportional to what is on it: an
+//! image-heavy index costs milliseconds of it, roughly 43 us per image of
+//! manifest work, and a monitor that sends `Cache-Control: no-cache` forces
+//! every check to pay the whole bill. That is a large, variable answer to what
+//! should be a small, constant question.
 //!
 //! It also cannot tell you *which* node is unwell. Checks against the apex go
 //! wherever GeoDNS sends the checking region, so one dead node can hide
-//! behind two healthy ones. `/health` is per-node by construction: point the
+//! behind the healthy ones. `/health` is per-node by construction: point the
 //! monitor at `origin.`/`edge-a.`/`edge-b.` and the answer names the node that
 //! produced it.
 //!
@@ -34,7 +35,7 @@
 //!   is degraded.
 //! - A **cache node** has one URL backend (the origin over h2c) and *no*
 //!   socket pools at all. `total_active_members()` counts only socket pools,
-//!   so it reads 0 on edge-a and edge-b permanently.
+//!   so it reads 0 on every cache node permanently.
 //!
 //! A naive "0 members means unhealthy" check would therefore report both edge
 //! nodes as permanently down. Worse, it would be wrong in the other direction
@@ -66,9 +67,10 @@
 //! attacking you. An attacker probing for a resource-exhaustion path is
 //! normally blind: they cannot tell whether a request is expensive or whether
 //! their load is landing. Publishing hit and miss percentiles tells them
-//! exactly which requests cost 2.8us and which cost 7.8ms, about 2800 to 1 on
-//! this deployment, and `backend_errors_total` then confirms in real time
-//! when they have found something that hurts. That turns a blind probe into a
+//! exactly which requests are cheap and which are expensive, and the ratio
+//! between a cache hit and a backend miss runs to three orders of magnitude,
+//! so the ranking is unambiguous. `backend_errors_total` then confirms in real
+//! time when they have found something that hurts. That turns a blind probe into a
 //! tuning loop. Gating it also means an anonymous scrape loop can never reach
 //! the sort.
 //!
@@ -96,11 +98,11 @@
 //! secret we already treat as sensitive.
 //!
 //! Against that: with no version anywhere, "every node runs the release we think
-//! it does" was an invariant nothing could check without ssh, and on 2026-09-16
-//! four written records disagreed about this fleet while all three nodes served
-//! something none of them named. An operator cannot act on a fleet they cannot
-//! observe, and a silent version turned a deploy defect into four months of
-//! plausible-looking bookkeeping. The version goes behind the token, not on
+//! it does" is an invariant nothing can check without ssh. Four written records
+//! can disagree about one fleet while every node serves something none of them
+//! names, and nothing in the system is able to say so. An operator cannot act on
+//! a fleet they cannot observe, and a silent version turns a deploy defect into
+//! months of plausible-looking bookkeeping. The version goes behind the token, not on
 //! `/health`, which keeps the public surface exactly as it was.
 //!
 //! With no token configured `/perf` does not exist at all (404, not 401), so
@@ -222,8 +224,8 @@ pub struct HealthReport {
 /// The three carry different information and none is redundant:
 ///
 /// - `name` says WHICH binary. A node runs several, and "the node is on 1.10.0"
-///   has never been one fact: on 2026-09-16 this fleet had m6-http and the
-///   renderers built from different trees and nothing could express that.
+///   has never been one fact. A fleet can have m6-http and its renderers built
+///   from different trees, and before this nothing could express that.
 /// - `version` says which release it claims to be. It is what an operator reads
 ///   and what release notes are written against.
 /// - `hash` says which BUILD it actually is. Rust is not byte-reproducible, so
@@ -264,7 +266,8 @@ pub struct BuildId {
 /// and the answer wanted is the binary's. The version is m6-core's, which is the
 /// m6 release: for the workspace binaries that is their own version, and for a
 /// service linking core from a git tag it is that tag, which is the more useful
-/// answer for a service whose own version means nothing to this fleet.
+/// answer for a service whose own version says nothing about which m6 it is
+/// built against.
 pub fn build_id() -> &'static BuildId {
     static BUILD: std::sync::OnceLock<BuildId> = std::sync::OnceLock::new();
     BUILD.get_or_init(|| BuildId {
@@ -396,12 +399,13 @@ pub struct PerfReport {
     /// Why the version alone was already worth having, kept because the argument
     /// still applies to the whole structure: without it the only way to learn
     /// what a node runs was to ssh in and ask the binary, so "every node runs the
-    /// pinned release" was an invariant nothing could check. On 2026-09-16 four
-    /// written records disagreed about this fleet and none matched it: the
-    /// deployment repo's pin said v1.2.0, its captured config said 1.2.0 with an
-    /// md5 matching nothing running, its release log named v1.1.0, and all three
-    /// nodes served 1.3.0. No node was faulty. Nothing could observe the truth,
-    /// so the records rotted without anyone being wrong on purpose.
+    /// pinned release" was an invariant nothing could check. Four written records
+    /// can disagree about one fleet with none of them matching it: a deploy
+    /// repository pinning one tag, its captured config naming that tag with an
+    /// artefact hash matching nothing running, a release log naming an older
+    /// tag, and every node serving a fourth. No node has to be faulty for that.
+    /// Nothing can observe the truth, so the records rot without anyone being
+    /// wrong on purpose.
     ///
     /// `serde(default)` so a node older than this change deserialises to an empty
     /// `BuildId` instead of making the whole payload unparseable to an
@@ -584,8 +588,8 @@ mod tests {
     /// The regression this endpoint most needs to not have.
     ///
     /// A cache node has no socket pools at all, so `total_active_members()`
-    /// is 0 on edge-a and edge-b at all times. Deriving health from that
-    /// count alone reports both edge nodes as permanently down.
+    /// reads 0 on a cache node at all times. Deriving health from that count alone
+    /// reports every cache node as permanently down.
     #[test]
     fn cache_node_with_no_socket_pools_is_ok_not_degraded() {
         let (code, report) = HealthReport::build("edge-a", &[]);

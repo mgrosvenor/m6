@@ -176,10 +176,10 @@ struct ServerState {
     /// One rendered error document per status, held locally.
     ///
     /// A cache node routes `/_errors` to the origin, so before this every
-    /// route miss dispatched a fetch across the WireGuard link -- ~207ms from
-    /// edge-b, ~282ms from edge-a -- to render a page that is byte-identical
-    /// every time. Measured 2026-09-09: four requests to nonexistent paths on
-    /// edge-b each took 0.86-1.07s, with no improvement on repeat.
+    /// route miss dispatched a fetch across the private link to render a page
+    /// that is byte-identical every time. Over an intercontinental link that
+    /// fetch is 200-300ms and a request to a nonexistent path took most of a
+    /// second, with no improvement on repeat.
     ///
     /// Caching that response by URL would not have helped. The cache key is
     /// (path, query, encoding), so a wordlist of 647 unique junk paths is 647
@@ -402,10 +402,11 @@ fn make_quiche_config(server_config: &config::ServerConfig) -> anyhow::Result<qu
     //
     // A returning visitor sends its request in the FIRST flight, so the response
     // costs zero round trips instead of one. On loopback that saves about a
-    // millisecond and looks unimportant. On the paths this fleet actually serves
-    // it is the single largest latency win available: edge-a and edge-b are
-    // roughly 300ms from the origin origin, and a saved round trip is 300ms that
-    // no amount of local tuning can recover.
+    // millisecond and looks unimportant. For a visitor on a long path it is the
+    // single largest latency win available: at 300ms of round-trip time the
+    // saved round trip is 300ms that no amount of local tuning recovers. This
+    // setting is the QUIC listener that serves VISITORS. A cache node fetching
+    // from its origin goes over h2c on TCP and is not affected by it.
     //
     // For comparison, over TCP the same visitor pays TWO round trips before any
     // application data: one for the TCP handshake and one for TLS. Measured on
@@ -427,9 +428,9 @@ fn make_quiche_config(server_config: &config::ServerConfig) -> anyhow::Result<qu
     // methods" advice: only a FRESH CACHE HIT is served in early data. A replayed
     // cache read re-sends bytes and does nothing else.
     //
-    // "GET is safe" would NOT have been good enough here. This site's analytics
-    // beacon is a fire-and-forget GET (assets/js/nav-timing.js), so a replayed
-    // 0-RTT GET would inflate a page-view counter. m6-http cannot recognise that
+    // "GET is safe" would NOT have been good enough here. An analytics beacon is
+    // commonly a fire-and-forget GET, so a replayed 0-RTT GET would inflate a
+    // page-view counter. m6-http cannot recognise such a
     // route -- it is proxied like any other -- which is the reason the rule is
     // about where the answer comes from rather than about a list of paths.
     //
@@ -514,7 +515,7 @@ fn make_quiche_config(server_config: &config::ServerConfig) -> anyhow::Result<qu
     // 3600-byte budget, and the uncompressed handshake flight was 4082 -- 482 over,
     // so the server sent 3600, stopped, and waited a full round trip for an ACK.
     //
-    // Measured on this deployment's own chain:
+    // Measured on a typical two-certificate chain:
     //
     //     uncompressed  3429 bytes
     //     brotli        2258 bytes  66%
@@ -1241,7 +1242,7 @@ fn event_loop(
                         // gap survived: any check of the h3 path looked fine.
                         let elapsed_ns = start.elapsed().as_nanos() as u64;
                         // h2c is HTTP/2 by definition; the interface class comes
-                        // from its bind address (the WireGuard tunnel here).
+                        // from its bind address (the private backbone here).
                         let chan = Channel::new(HttpVersion::Http2, state.h2c_iface);
                         state.stats.record(elapsed_ns, false, status, chan, backend);
                     }
@@ -1274,7 +1275,7 @@ fn event_loop(
             // above, with its own `drive_all` that returns nothing because there
             // is no handshake to time. h2c is the backbone path from the cache
             // nodes, which carry their own TLS to the visitor and reach the
-            // origin in the clear over WireGuard.
+            // origin in the clear over the private backbone.
         }
 
         // Drive connection timeouts and flush pending sends
@@ -1858,8 +1859,8 @@ fn handle_h3_request(
     // ── 0-RTT gate B: only a FRESH cache hit is answered in early data ────────
     //
     // Gate A already refused replayable methods. This refuses everything else a
-    // replay could act on, and it is what makes 0-RTT defensible on this site
-    // rather than merely RFC-compliant:
+    // replay could act on, and it is what makes 0-RTT defensible at all rather
+    // than merely RFC-compliant:
     //
     //   - A backend request may have side effects. The analytics beacon is a
     //     fire-and-forget GET, so "the method is safe" does not mean "replaying it
@@ -2451,11 +2452,11 @@ fn handle_request_inner(
     // ── Health endpoint, ahead of routing/cache/backends ────────────────────
     // Placed here on purpose. Below this point a request touches the router,
     // the cache and then a backend; the whole value of a health check is that
-    // it answers from local state without any of that. Rendering `/` costs
-    // ~6ms of Tera work on the origin and a monitor sending
-    // `Cache-Control: no-cache` pays it on every single check, which makes
-    // the monitor's latency graph a measure of template rendering rather than
-    // of whether the node is up.
+    // it answers from local state without any of that. Rendering a homepage is
+    // milliseconds of template work, and a monitor sending
+    // `Cache-Control: no-cache` pays it on every single check, which makes the
+    // monitor's latency graph a measure of template rendering rather than of
+    // whether the node is up.
     //
     // It sits *after* method validation so a health path still refuses PUT
     // and friends like every other path, rather than becoming a hole in it.
@@ -2573,8 +2574,8 @@ fn handle_request_inner(
     // any caller spoof an arbitrary status/from pair. Refuse it exactly like
     // any other route miss.
     //
-    // UNLESS it arrived on an internal listener. A cache node of this deployment
-    // fetches the error page from the origin over h2c on the WireGuard backbone,
+    // UNLESS it arrived on an internal listener. A cache node fetches the error
+    // page from the origin over h2c on the private backbone,
     // and refusing it there broke custom error pages across a proxy hop entirely:
     // the edge asked, the origin refused it exactly like a stranger, and the edge
     // fell back to the built-in page. Every config was correct and the mechanism
@@ -3293,9 +3294,8 @@ fn set_vary_accept_encoding(headers: &mut Vec<(String, String)>, backend_compres
 ///
 /// A successful POST/PUT/DELETE means the stored representation of that URI is
 /// now wrong, and nothing invalidated it: the cache kept serving the old copy
-/// until it expired on its own. For this site that is a live concern the
-/// moment the CMS returns — edit a page, and the edge keeps serving the
-/// previous one.
+/// until it expired on its own. That is a live concern for any site with an
+/// editing interface: edit a page, and the edge keeps serving the previous one.
 ///
 /// "Non-error status" is the RFC's condition: a 4xx/5xx means the state change
 /// did not happen, so the cached copy is still correct and must be left alone.
@@ -4347,7 +4347,7 @@ mod www_redirect_tests {
         }
     }
 
-    /// `www.` prefixing a *different* domain is not this site's www alias.
+    /// `www.` prefixing a *different* domain is not the configured site's www alias.
     #[test]
     fn www_of_another_domain_is_not_our_alias() {
         let c = cfg("example.com", true);

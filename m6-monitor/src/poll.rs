@@ -32,12 +32,13 @@ pub struct NodeReading {
     ///
     /// This is a network measurement, not the node's own latency. It is the
     /// cost of reaching the node from wherever the monitor runs, and over a
-    /// long link the handshake dominates it: from the build host in origin,
-    /// origin answers in 27ms and edge-a in 828ms, and almost all of that difference
-    /// is the handshake rather than anything either node did. Do not compare
-    /// it with the loopback TTFB, which measures the opposite thing.
+    /// long link the handshake dominates it. A near node and an
+    /// intercontinental one can differ by a factor of thirty here with almost
+    /// all of the difference being the handshake rather than anything either
+    /// node did. Do not compare it with the loopback TTFB, which measures the
+    /// opposite thing.
     pub rtt: Option<Duration>,
-    /// Outcome of each `[[monitor.header_check]]` this deployment declared.
+    /// Outcome of each `[[monitor.header_check]]` the fleet config declared.
     ///
     /// Empty when none are declared, which the report states rather than
     /// rendering as a pass: "nothing configured" and "everything correct" must
@@ -340,7 +341,7 @@ mod tests {
         NodeReading {
             name: "origin".into(),
             role: "origin".into(),
-            url: "http://x".into(),
+            url: "http://origin.example.com".into(),
             health: status.map(|s| HealthReport {
                 status: s.to_string(),
                 node: "origin".into(),
