@@ -129,6 +129,7 @@ Thirty modules. Grouped by what you would be doing when you reach for one.
 | `telemetry` | m6's own formats read back: `AnalyticsRecord`, `PeriodicStats`, `TrafficSummary`, and the probe and crawler heuristics. |
 | `monitoring` | `/health` and `/perf`: `HealthReport`, `PerfReport`, `TrafficReport`, `LoggingHealth`. |
 | `host` | What the machine is doing. Load, memory, disk, thermal, net, diskstats, pressure, TCP, fds. |
+| `tls` | How long the loaded certificate has left: `not_after_unix`, `record_loaded`, `loaded`, `TlsCertificate`. |
 | `firewall` | `FirewallState` from nftables' own JSON. |
 | `ndjson` | Newline-delimited JSON, read and written, tolerant of torn lines. |
 
@@ -533,6 +534,11 @@ the entire point of having edges.
 `PerfReport::build(...)`, `PerfOutcome`, `metrics_authorised(...)`,
 `is_monitoring_endpoint(backend)`, `HEALTH_BACKEND`, `PERF_BACKEND`.
 
+`PerfReport.tls` carries the served certificate chain and how long each
+certificate has left, from `tls::loaded()`. It is `serde(default)`, so a node
+older than the field stays parseable to an aggregator rather than making the
+whole payload unreadable, which is the treatment `build` already gets.
+
 `TrafficReport::build(node, ndjson, since, window_minutes)` is the `/traffic`
 endpoint: the node does the analysis and the log stays put. `LoggingHealth::read()`
 with `QUIET_SECONDS` (40) and `is_blind()` is the silent-log fault.
@@ -575,6 +581,56 @@ Two readings are easy to get wrong and invisible when wrong:
 
 There is no threshold anywhere in this module. Core says what the number is; a
 monitoring service decides what 80% means.
+
+### `tls`
+
+**`not_after_unix(der) -> Result<i64, CertificateError>`** reads `notAfter` out
+of a DER certificate as seconds since the Unix epoch.
+**`record_loaded(chain)`** stores a loaded chain and returns the certificates it
+could not read, by depth and reason.
+**`loaded()`** and **`loaded_at(now_unix)`** return the stored chain as
+`Vec<TlsCertificate>`, leaf first, each carrying `depth`, `not_after_unix` and
+`expires_in_seconds`.
+
+This module exists because certificate renewal fails silently.
+Renewal is done by an *ACME* (Automatic Certificate Management Environment)
+client on a timer outside m6, and a timer that fails keeps firing and keeps
+failing.
+Nothing looks, so the first signal is the server refusing connections on the day
+the certificate expires.
+A server already holds the answer, which makes it the cheapest place to ask.
+
+**It reports the loaded material, never a file.**
+A path on disk and the certificate a running process is serving are different
+facts, and a renewal that wrote a new file without reloading the server is
+exactly the case where they disagree.
+`record_loaded` is therefore called by whatever loads the certificate, and
+`loaded()` opens nothing, so polling a monitoring endpoint cannot be made to do
+disk work.
+
+| behaviour | why |
+|---|---|
+| a chain, leaf first | `depth` 0 is what an *ACME* client renews, and intermediates expire too. A chain is good until its soonest expiry |
+| `expires_in_seconds` goes negative | how long ago separates a renewal that failed last night from one that stopped running in March |
+| an unreadable certificate is returned, not recorded | rustls accepted it or there would be no server, so refusing to serve is the worse failure. A reported absence lets a monitor say "cannot say" |
+| a later `record_loaded` replaces the earlier one | so a reload can correct it. **No caller does this yet**: `handle_tls_reload` rebuilds the quiche config alone, so the registry holds the startup chain, which is what h1 and h2 serve and is stale for h3. m6 #210 |
+
+The last two rows are the ones to keep: an absence and a measured number must
+not look alike, and a stale number is worse than either.
+
+There is no threshold here, for the reason `host` gives.
+Core reports how many seconds are left and a monitoring service decides what is
+too few.
+
+**The parse is written out rather than imported.** `rustls` hands over
+`CertificateDer` and parses no validity from it, and `rustls-webpki` keeps its
+own parse private, so one integer field meant either eight crates of general
+ASN.1 or a walk over a known shape. `notAfter` sits at a fixed structural
+position in every X.509 certificate, so the walk steps over six elements by
+length and reads the seventh. Every length is checked against the buffer and a
+test runs every truncation of a real certificate through it. The dates go
+through `chrono`, because civil-from-days arithmetic is the mistake
+`util::iso_date_from` records.
 
 ### `firewall`
 
