@@ -12,6 +12,76 @@ releases only; work happens on `develop`. See `CONTRIBUTING.md`.
 
 ---
 
+## 1.12.1 — 2026-10-02
+
+**A documentation and comment release. No behaviour changes to any shipped binary.**
+
+RULE ZERO says nothing about one particular deployment belongs in this repository,
+in code, tests, comments, docs or the changelog. This removes what was still there,
+and corrects three comments that a previous pass made wrong while removing other
+things.
+
+### Removed
+
+One deployment's node names, in both source and prose. A credentials file path and
+the DNS provider it belonged to, used as a worked example. A hosting provider,
+named in the benchmark host table with the machine's specification, in a deployment
+walkthrough and in a README pointer. A visitor's address and session identifier,
+carried in a test fixture captured from a live log. A firewall rule copied verbatim
+from a running ruleset, counters included. An ssh port, which appeared only as a
+worked example and therefore only ever recorded that its author deviates from the
+default. Twenty-odd comments asserting measurements taken against one private
+instance, which no reader can reproduce and which are therefore assertions rather
+than evidence.
+
+Addresses that had to stay addresses, such as a client address in a log fixture,
+are now RFC 5737 documentation ranges.
+
+### Changed
+
+**One host, everywhere.** `user@example.com` is the only ssh and rsync target,
+replacing five competing conventions. `example.com` and its subdomains are the only
+http, https, h2c and h2s hosts.
+
+**"WireGuard" is now "private backbone",** in 16 places across 9 files. The
+transport between nodes is the operator's choice. m6 requires only that the
+listener is on a private address.
+
+**`M6_BUILD_ROOT` defaults to `m6-build`,** relative to the login directory, rather
+than a path only a root login can write.
+
+### Fixed
+
+Three comments that an earlier pass rewrote into something incorrect, which is
+worse than the unverifiable claim each replaced:
+
+- The 0-RTT comment credited QUIC early data for the cache-to-origin hop. That hop
+  is h2c over TCP. The setting configures the listener that serves visitors.
+- Two comments claimed a table was reproducible with one `curl -H`. The column
+  described is what the replaced implementation produced, so following the
+  instruction contradicts the table.
+- A dated narrative kept its date and swapped only its address, leaving a comment
+  asserting that a documentation address made a real request on a real day.
+
+### Verified
+
+`cargo test --workspace` 1150 passed and 0 failed, clippy silent, zero compiler
+warnings, `cargo fmt` clean, `shellcheck -S warning` clean, and the examples
+workspace builds with clippy silent against this tree. CI passed h1, h2 and h3
+conformance, the examples suite, cargo-deny and the MSRV check.
+
+### What this release does not do
+
+**The history is untouched.** Every string removed here remains reachable in any
+clone, and removing it from the working tree does not retract it. That is a
+separate decision about a published repository.
+
+**The default is still wrong.** The full checks still want a remote Linux host,
+which is #207, and is why a contributor's connection settings were in this
+repository to be removed in the first place.
+
+---
+
 ## 1.12.0 — 2026-09-27
 
 **m6 had no release profile, and now it has one.** Every release before this took
