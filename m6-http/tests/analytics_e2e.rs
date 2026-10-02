@@ -1043,7 +1043,7 @@ name = "test-node"
     assert_eq!(lines[0].cache_state, "MISS");
 }
 
-/// The bug this test guards against was found live, in production, via this
+/// The bug this test guards against was found on a running fleet, via this
 /// exact topology: a two-tier deployment where an "edge" m6-http's only
 /// backend is another m6-http instance ("origin"), exactly like a real cache
 /// node relaying to the real origin over H2C (approximated here with a plain

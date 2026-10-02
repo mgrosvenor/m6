@@ -68,6 +68,14 @@ stranger running m6 on their own server would find it relevant.
 to `main`.** Owner's decision, 2026-09-14. `tools/merge.sh` and
 `tools/release.sh` merged locally and are deleted.
 
+**`main` TAKES A PULL REQUEST FROM `develop` AND FROM NOTHING ELSE**, and CI
+checks it as of #196. A work branch aimed straight at `main` fails the
+`main takes develop only` job in about three seconds, before any build starts.
+That job exists because this rule was stated here from 2026-09-14 and enforced
+nowhere: the pre-push hook runs at push time and `main` moves by a merge, and a
+branch ruleset can require a pull request without constraining where it came
+from. A check on the pull request's head is the only place the rule fits.
+
 Types: `feat` `fix` `perf` `docs` `refactor` `test` `chore`.
 
 **Nothing is pushed to `main` by hand.** The pre-push hook refuses any direct
@@ -112,7 +120,7 @@ The build host is still worth running by hand before opening a pull request, bec
 it tests more than a runner can:
 
 ```sh
-M6_BUILD_HOST=root@<box> ./tools/build-host-tests.sh
+M6_BUILD_HOST=user@example.com ./tools/build-host-tests.sh
 ```
 
 ---

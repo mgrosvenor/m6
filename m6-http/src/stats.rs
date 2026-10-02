@@ -73,15 +73,15 @@ impl Version {
 ///
 /// The origin serves two completely different populations and pooling them
 /// makes both numbers meaningless: real visitors arrive on the public NIC
-/// over TLS or QUIC, while cache-miss forwards from edge-a and edge-b
-/// arrive over the WireGuard tunnel as h2c. The second group carries
-/// intercontinental RTT (~200-300ms) that has nothing to do with how fast
-/// this node is.
+/// over TLS or QUIC, while cache-miss forwards from the cache nodes arrive
+/// over a private tunnel as h2c. Where a cache node is on another continent
+/// the second group carries 200-300ms of RTT that has nothing to do with how
+/// fast this node is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Iface {
     /// Public network interface.
     External,
-    /// WireGuard tunnel between nodes.
+    /// Private backbone between nodes.
     Internal,
 }
 
@@ -89,7 +89,7 @@ impl Iface {
     /// Classify a listener by its bind address.
     ///
     /// Derived rather than hardcoded per listener: h2c is *conventionally*
-    /// the WireGuard listener here, but that is deployment configuration, not
+    /// the backbone listener here, but that is deployment configuration, not
     /// a property of the protocol, and a future node that exposes h2c
     /// publicly should not be silently labelled internal.
     pub fn for_bind(bind: &str) -> Iface {
@@ -359,7 +359,8 @@ pub struct Stats {
     /// between noticing silent mail loss and not.
     ///
     /// A small map rather than a fixed array: backend names come from config and
-    /// this deployment has six. Only backends that have actually errored appear.
+    /// a deployment commonly has several. Only backends that have actually errored
+    /// appear.
     backend_errors_by_name: std::collections::BTreeMap<String, u64>,
 
     // Window counters (reset each emit)
@@ -538,7 +539,7 @@ impl Stats {
         //
         // Observed for nine consecutive hours: a bot sending an unrecognised
         // verb gets 501 Not Implemented from method validation, no backend is
-        // ever contacted, and `backend_errors_total` rose on all three nodes.
+        // ever contacted, and `backend_errors_total` rose on every node.
         // An operator watching that counter would go looking for a failing
         // renderer that was never involved.
         let backend_error = status >= 500 && !is_self_generated(backend);
@@ -645,7 +646,8 @@ impl Stats {
             backend_errors = self.window_backend_errors,
             pool_members = pool_members,
             // The sample count beside the percentiles, not just the numbers.
-            // `hit_p50_ns` is load-dependent (docs/PERFORMANCE.md §4: 3,900ns at
+            // `hit_p50_ns` is load-dependent (docs/PERFORMANCE.md §4, "Cache-hit
+            // latency, and why it is load dependent": 3,900ns at
             // 50-70 hits in a window, 1,064ns at ~1,200), so a percentile with no
             // count attached cannot be compared to anything, and a p50 over one
             // sample reads exactly like a p50 over a thousand. This is also not
@@ -706,7 +708,8 @@ impl Stats {
     /// The percentiles here now span **the most recent up to `RESERVOIR`
     /// samples, not a period of time.** On a quiet node that can reach back
     /// hours and will blend idle and busy traffic, which matters because this
-    /// number is load-dependent (`docs/PERFORMANCE.md` §4). `hit_samples` is
+    /// number is load-dependent (`docs/PERFORMANCE.md` §4, "Cache-hit latency,
+    /// and why it is load dependent"). `hit_samples` is
     /// reported beside it for exactly that reason: it is the only thing that
     /// makes the percentile interpretable, and zero samples means "not
     /// measured" rather than "zero nanoseconds". For the fine-grained view, the
@@ -1018,7 +1021,7 @@ mod channel_tests {
 
     #[test]
     fn interface_is_classified_from_the_bind_address() {
-        // The WireGuard backbone between nodes.
+        // The private backbone between nodes.
         assert_eq!(Iface::for_bind("10.0.0.1:80"), Iface::Internal);
         assert_eq!(Iface::for_bind("192.168.1.5:80"), Iface::Internal);
         assert_eq!(Iface::for_bind("172.16.0.1:80"), Iface::Internal);
@@ -1044,7 +1047,7 @@ mod channel_tests {
     }
 
     /// The point of the whole exercise: an origin's public visitor traffic and
-    /// its WireGuard cache-miss forwards must not land in the same bucket.
+    /// its backbone cache-miss forwards must not land in the same bucket.
     #[test]
     fn traffic_is_separated_by_version_and_interface() {
         let mut stats = Stats::new();
@@ -1198,8 +1201,8 @@ mod backend_error_attribution_tests {
         Channel::new(Version::Http2, Iface::External)
     }
 
-    /// The regression this closes, seen on all three nodes for nine
-    /// consecutive hours: a bot sends an unrecognised verb, method validation
+    /// The regression this closes, which ran for hours across a whole fleet
+    /// before anyone looked: a bot sends an unrecognised verb, method validation
     /// answers 501 without contacting anything, and backend_errors_total
     /// rises. An operator watching that counter goes hunting for a failing
     /// renderer that was never involved.
@@ -1556,7 +1559,7 @@ mod handshake_tests {
     }
 
     /// External and internal are different events even on one protocol: a
-    /// browser handshake and one from the WireGuard backbone.
+    /// browser handshake and one from the private backbone.
     #[test]
     fn interface_separates_them_too() {
         let mut s = Stats::new();

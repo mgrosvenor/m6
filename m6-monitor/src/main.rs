@@ -182,7 +182,7 @@ fn snapshot_digest(st: &MonitorState) -> anyhow::Result<digest::Digest> {
 /// over an ssh-forwarded socket:
 ///
 /// ```text
-/// ssh -fN -L /tmp/m6mon.sock:/run/m6/m6-monitor.sock root@<build-host>
+/// ssh -fN -L /tmp/m6mon.sock:/run/m6/m6-monitor.sock user@example.com
 /// curl --unix-socket /tmp/m6mon.sock http://localhost/check
 /// ```
 fn check_text(_req: &Request, st: &MonitorState) -> Result<Response> {

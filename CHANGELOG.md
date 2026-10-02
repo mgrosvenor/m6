@@ -12,6 +12,76 @@ releases only; work happens on `develop`. See `CONTRIBUTING.md`.
 
 ---
 
+## 1.12.1 — 2026-10-02
+
+**A documentation and comment release. No behaviour changes to any shipped binary.**
+
+RULE ZERO says nothing about one particular deployment belongs in this repository,
+in code, tests, comments, docs or the changelog. This removes what was still there,
+and corrects three comments that a previous pass made wrong while removing other
+things.
+
+### Removed
+
+One deployment's node names, in both source and prose. A credentials file path and
+the DNS provider it belonged to, used as a worked example. A hosting provider,
+named in the benchmark host table with the machine's specification, in a deployment
+walkthrough and in a README pointer. A visitor's address and session identifier,
+carried in a test fixture captured from a live log. A firewall rule copied verbatim
+from a running ruleset, counters included. An ssh port, which appeared only as a
+worked example and therefore only ever recorded that its author deviates from the
+default. Twenty-odd comments asserting measurements taken against one private
+instance, which no reader can reproduce and which are therefore assertions rather
+than evidence.
+
+Addresses that had to stay addresses, such as a client address in a log fixture,
+are now RFC 5737 documentation ranges.
+
+### Changed
+
+**One host, everywhere.** `user@example.com` is the only ssh and rsync target,
+replacing five competing conventions. `example.com` and its subdomains are the only
+http, https, h2c and h2s hosts.
+
+**"WireGuard" is now "private backbone",** in 16 places across 9 files. The
+transport between nodes is the operator's choice. m6 requires only that the
+listener is on a private address.
+
+**`M6_BUILD_ROOT` defaults to `m6-build`,** relative to the login directory, rather
+than a path only a root login can write.
+
+### Fixed
+
+Three comments that an earlier pass rewrote into something incorrect, which is
+worse than the unverifiable claim each replaced:
+
+- The 0-RTT comment credited QUIC early data for the cache-to-origin hop. That hop
+  is h2c over TCP. The setting configures the listener that serves visitors.
+- Two comments claimed a table was reproducible with one `curl -H`. The column
+  described is what the replaced implementation produced, so following the
+  instruction contradicts the table.
+- A dated narrative kept its date and swapped only its address, leaving a comment
+  asserting that a documentation address made a real request on a real day.
+
+### Verified
+
+`cargo test --workspace` 1150 passed and 0 failed, clippy silent, zero compiler
+warnings, `cargo fmt` clean, `shellcheck -S warning` clean, and the examples
+workspace builds with clippy silent against this tree. CI passed h1, h2 and h3
+conformance, the examples suite, cargo-deny and the MSRV check.
+
+### What this release does not do
+
+**The history is untouched.** Every string removed here remains reachable in any
+clone, and removing it from the working tree does not retract it. That is a
+separate decision about a published repository.
+
+**The default is still wrong.** The full checks still want a remote Linux host,
+which is #207, and is why a contributor's connection settings were in this
+repository to be removed in the first place.
+
+---
+
 ## 1.12.0 — 2026-09-27
 
 **m6 had no release profile, and now it has one.** Every release before this took
@@ -377,17 +447,17 @@ external tester, which makes it the first real protocol check a laptop run
 performs: h2spec and h3spec are not installed there and every other stage skips.
 
 Why it was needed. 1.9.0 installed a session ticketer so browser sessions could
-resume, and nothing anywhere could tell whether it worked. The production
-monitor read 0% resumed on `http/2/external` across all three nodes for a day
-after the 1.10.0 deploy, which looks identical whether the ticketer is broken or
+resume, and nothing anywhere could tell whether it worked. A monitor read 0%
+resumed on `http/2/external` across a whole fleet for a day after the 1.10.0
+deploy, which looks identical whether the ticketer is broken or
 the traffic has no returning connections. Issue #101, closed: the server resumes
 on every protocol, the counter is accurate, and the 0% was the traffic, because
 a browser opens ONE h2 connection per visit and resumption needs a return visit
 inside the ticket's lifetime.
 
-Verified against production: 7 of 8 h2 handshakes resumed and 7 of 8 h1, on all
-three nodes, with the origin's own `resumed` counter incrementing by exactly the
-number the client observed.
+Verified against a running server: 7 of 8 h2 handshakes resumed and 7 of 8 h1,
+with the server's own `resumed` counter incrementing by exactly the number the
+client observed.
 
 ### Fixed
 
@@ -876,12 +946,12 @@ end, h3 handshake p50 against a 4.9 ms path:
 
 A kilobyte saved is worth nothing against ten milliseconds of CPU.
 
-**On the long paths this was invisible.** edge-a at 308 ms and edge-b at 211 ms both
-measured 1.00 and 1.05 round trips after the 1.4.0 deploy, because a round trip hides
-ten milliseconds completely. origin serves its own city over a 5 ms path from a
-single-core VM, and there it was the whole cost: 9.5 ms under 1.3.0, 14.6 ms under
-1.4.0. It was found by measuring production after the rollout, not by any gate.
-Neither CI nor conformance measures handshake CPU on a short path.
+**On a long path this was invisible.** At 211 ms and 308 ms of round-trip time the
+handshake measured 1.00 and 1.05 round trips after the 1.4.0 deploy, because a round
+trip hides ten milliseconds completely. On a 5 ms path from a single-core VM it was
+the whole cost: 9.5 ms under 1.3.0, 14.6 ms under 1.4.0. It was found by measuring a
+running server after the rollout, not by any gate. Neither CI nor conformance measures
+handshake CPU on a short path.
 
 The compressed chain is now cached for the life of the process, keyed by the
 uncompressed bytes so a collision cannot serve one host's chain in place of another's,
@@ -899,10 +969,10 @@ the only way to learn what a node was running was to ssh in and ask the binary. 
 node runs the release we think it does" was an invariant nothing could check remotely.
 
 On 2026-09-16 four written records disagreed about the deployment fleet and none of
-them matched it: the deployment repository's m6 pin said v1.2.0, its captured config
-said 1.2.0 with an md5 matching nothing running, its release log named v1.1.0 as the
-newest deploy, and all three nodes were serving 1.3.0 with an identical md5. No node
-was faulty. Nothing could observe the truth, so the records rotted quietly.
+them matched it: a deploy repository pinning one tag, its captured config naming
+that tag with an artefact hash matching nothing running, a release log naming an
+older tag as the newest deploy, and every node serving a fourth. No node has to be
+faulty for that. Nothing can observe the truth, so the records rot quietly.
 
 The monitor now prints the version per node and raises a warning when the reporting
 nodes disagree, naming each. **A node that cannot report its version counts as drift,
@@ -953,8 +1023,8 @@ staging origin, same probe and path, only compression changing:
 | brotli | **2859 B** | 3 | no stall, 1.16x |
 
 2859 against a 3600 budget, so the flight fits at the **conforming factor of 3** with
-headroom for a chain that grows. On the edge-a and edge-b paths, where a round trip
-is 270 to 300 ms, that round trip was the single largest avoidable cost in setting up
+headroom for a chain that grows. On an intercontinental path, where a round trip is
+270 to 300 ms, that round trip was the single largest avoidable cost in setting up
 a new connection.
 
 ### zlib is accepted, never offered
@@ -1114,7 +1184,7 @@ for absent sample counts.
 
 ### Security
 
-**The quiche revision production depended on was unreferenced.** 1.2.0 pinned
+**The pinned quiche revision was unreferenced.** 1.2.0 pinned
 `916a5a25`, which sat on no branch and no tag in the fork and was reachable only by
 raw SHA. GitHub garbage-collects unreferenced objects; when that happened every
 build would have failed, CI included, and the commit would have been unrecoverable.
@@ -1163,7 +1233,7 @@ which is the only reason that flag existed. The health check is now one fetch ov
 a forwarded socket, with no ssh to any node:
 
 ```sh
-ssh -fN -L /tmp/m6mon.sock:/run/m6/m6-monitor.sock root@<build-host>
+ssh -fN -L /tmp/m6mon.sock:/run/m6/m6-monitor.sock user@example.com
 curl --unix-socket /tmp/m6mon.sock http://localhost/check
 ```
 
@@ -1626,7 +1696,8 @@ existed and failed the moment it was fixed. It is now split so each status
 asserts its own rule: 200 carries the header, 204 must not. A test can pin wrong
 behaviour just as firmly as right behaviour, and this one did.
 
-Found by reading a 304 off a raw socket on production, not from the source.
+Found by reading a 304 off a raw socket against a running server, not from the
+source.
 
 694 workspace tests pass. Zero warnings.
 
@@ -1690,7 +1761,7 @@ the wrong seam.
 **Consequence worth stating plainly:** honouring these makes reloads slower, by
 design. A reload that previously replayed from cache in ~2us now reaches the
 backend. On the origin that is a couple of milliseconds; from a cache node it
-is a round trip to origin. That is what the client asked for -- the whole point
+is a round trip to the origin. That is what the client asked for -- the whole point
 of `no-cache` is to bypass the cache -- and it is the only way "force refresh"
 can work at all, but it is a real change in behaviour for reloads and not a
 free correctness win.

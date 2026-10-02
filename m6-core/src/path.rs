@@ -85,12 +85,11 @@ pub fn validate_path_param(value: &str, allow_slash: bool) -> Result<&str, PathP
 // than kept for later.
 //
 // They were a lexical root-confinement check with no callers anywhere in the
-// workspace. `m6-core.md` section 4.5 does want "filesystem path resolution
-// confined to a root" in core, but the version that should fill that slot is
-// `m6-file`'s, which is symlink-aware: it canonicalises when a symlink is
-// actually present, and a purely lexical check cannot see a symlink pointing
-// out of the root at all. Promoting the weaker one now, on the grounds that it
-// happened to be here, is how a second implementation appears.
+// workspace. Root confinement does belong in core, and the version that should
+// fill that slot is `m6-file`'s, which is symlink-aware: it canonicalises when
+// a symlink is actually present, and a purely lexical check cannot see one
+// pointing out of the root at all. Promoting the weaker one now, on the
+// grounds that it happened to be here, is how a second implementation appears.
 //
 // Recoverable from git if the lexical form is ever wanted for paths that do
 // not exist on disk.

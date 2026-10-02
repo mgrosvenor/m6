@@ -6,7 +6,7 @@
 //! half belongs to the route, and the paths and config are behind `Arc`s.
 //!
 //! That was not always true. Building one used to clone the whole request and
-//! the whole dictionary, which on this site meant copying a 68KB content file
+//! the whole dictionary, which for a content-driven site means copying its whole catalogue
 //! per request. See `crate::dict` and `docs/PERFORMANCE.md`.
 //!
 //! The file helpers resolve against the site directory and refuse to leave it.
@@ -527,7 +527,7 @@ pub fn parse_form_body(body: &[u8]) -> Vec<(String, String)> {
 ///
 /// This corrupted every non-ASCII character any visitor typed, in every form
 /// and every query string, before a handler ever saw it. It reached production
-/// via the contact form: a curly apostrophe (U+2019, sent as `%E2%80%99`)
+/// via a contact form: a curly apostrophe (U+2019, sent as `%E2%80%99`)
 /// arrived as U+00E2 U+0080 U+0099, so "I'm not sure" was emailed as
 /// "Ia<80><99>m not sure". Emoji, being four bytes, came out as four wrong
 /// characters.
@@ -760,7 +760,7 @@ mod tests {
     /// and every non-ASCII character a visitor typed was corrupted on the way
     /// in, before any handler saw it.
     ///
-    /// It reached production through the contact form: a curly apostrophe
+    /// It reached production through a contact form: a curly apostrophe
     /// (U+2019, sent as `%E2%80%99`) became U+00E2 U+0080 U+0099, so "I'm not
     /// sure" was emailed as "Ia<80><99>m not sure".
     ///
@@ -895,7 +895,7 @@ mod tests {
     }
 
     /// Encode then decode must be the identity, including for the input that
-    /// broke the contact form.
+    /// broke a contact form.
     #[test]
     fn encode_decode_round_trips() {
         for case in [

@@ -73,7 +73,7 @@ actually used, and they are the first place a change to them breaks. m6's own
 checks do this for you:
 
 ```sh
-M6_BUILD_HOST=root@your-linux-box ./tools/build-host-tests.sh
+M6_BUILD_HOST=user@example.com ./tools/build-host-tests.sh
 ```
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md).
@@ -705,7 +705,7 @@ comparison, and presenting it as one was the least defensible thing in this
 file.
 
 **Two different quantities, both true, easily confused:** a cache hit costs
-**~2.2 µs** inside m6 (its own timer, confirmed on production), while an
+**~2.2 µs** inside m6 (its own timer, confirmed against a running server), while an
 end-to-end HTTP/2 request on the benchmark host is **~230 µs** — TLS, loopback
 and the client included. Quoting the first as if it were the second is how the
 old numbers drifted.
@@ -725,7 +725,9 @@ All detailed documentation lives in [`docs/`](docs/):
 
 | Document | Contents |
 |---|---|
+| [`docs/m6-architecture.md`](docs/m6-architecture.md) | **Why m6 is built this way.** The question it answers, what it gives up, and the reason behind every design decision |
 | [`docs/m6-user-guide.md`](docs/m6-user-guide.md) | Eleven worked examples, start here |
+| [`docs/m6-app-anatomy.md`](docs/m6-app-anatomy.md) | **How to write one.** The shape every m6 service has, and the four contracts it honours |
 | [`docs/m6-site-toml.md`](docs/m6-site-toml.md) | `site.toml` reference |
 | [`docs/m6-site-layout.md`](docs/m6-site-layout.md) | Laying out a site: one root per app |
 | [`docs/m6-file.md`](docs/m6-file.md) | m6-file static file service reference |
@@ -737,7 +739,8 @@ All detailed documentation lives in [`docs/`](docs/):
 | [`docs/m6-render-lib.md`](docs/m6-render-lib.md) | m6-render library API |
 | [`docs/m6-md.md`](docs/m6-md.md) | m6-md Markdown processor |
 | [`docs/m6-testing.md`](docs/m6-testing.md) | What checks m6, how to run it, and the h2spec and h3spec procedure |
-| [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) | Raw benchmark numbers |
+| [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) | Raw benchmark numbers, end to end |
+| [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) | What each component costs, which change changed it, and the conditions every figure was taken under |
 | [`docs/POSITIONING.md`](docs/POSITIONING.md) | Competitive analysis |
 
 ---

@@ -96,7 +96,8 @@ pub struct NodeDigest {
     /// How many samples the percentiles above were taken over.
     ///
     /// Carried because `hit_p50_ns` cannot be read without it. The number is
-    /// **load-dependent** -- `docs/PERFORMANCE.md` §4: the same binary on the
+    /// **load-dependent** -- `docs/PERFORMANCE.md` §4, "Cache-hit latency, and
+    /// why it is load dependent": the same binary on the
     /// same node reads 3,900ns over a window of 50-70 hits and 1,064ns over
     /// ~1,200, because the cache-hit path goes cold between requests on a
     /// near-idle VM. A percentile with no count beside it looks like a
@@ -348,14 +349,14 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
     // ── the fleet runs one release, or it does not ───────────────────────────
     //
     // A per-node version is only half the answer. The question an operator has is
-    // "is this fleet uniform", and answering it per node means comparing three
-    // lines by eye and being right every time.
+    // "is this fleet uniform", and answering it per node means comparing one
+    // line per node by eye and being right every time.
     //
     // Drift here is not cosmetic. It means requests are being served by different
     // code depending on which region answered, so a defect reproduces in one
     // region and not another, and a measurement means different things per node.
-    // On 2026-09-10 this fleet ran three distinct m6-http binaries for about
-    // twenty minutes and it was not noticed, because nothing compared them.
+    // A fleet can run a distinct m6-http binary per node unnoticed for as long
+    // as nobody looks, because until this nothing compared them.
     //
     // A node that cannot say counts as drift rather than as agreement: two nodes
     // agreeing while the third is silent is not a uniform fleet, it is an unknown
@@ -473,7 +474,7 @@ mod tests {
         NodeReading {
             name: name.into(),
             role: "origin".into(),
-            url: "http://x".into(),
+            url: "http://origin.example.com".into(),
             health: Some(HealthReport {
                 status: status.into(),
                 node: "origin".into(),
@@ -519,8 +520,8 @@ mod tests {
 
     /// Two nodes on different releases is a warning, and it names both.
     ///
-    /// On 2026-09-10 this fleet ran three distinct m6-http binaries for twenty
-    /// minutes without anyone noticing, because nothing compared them.
+    /// A fleet can run a distinct m6-http binary per node for as long as
+    /// nobody looks, because until this nothing compared them.
     #[test]
     fn version_drift_across_the_fleet_is_reported() {
         let d = build(
