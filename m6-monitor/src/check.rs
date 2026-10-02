@@ -607,7 +607,7 @@ mod tests {
         NodeReading {
             name: name.into(),
             role: "origin".into(),
-            url: "https://x".into(),
+            url: "https://origin.example.com".into(),
             health: None,
             health_status: None,
             perf: None,

@@ -120,7 +120,7 @@ The build host is still worth running by hand before opening a pull request, bec
 it tests more than a runner can:
 
 ```sh
-M6_BUILD_HOST=root@<box> ./tools/build-host-tests.sh
+M6_BUILD_HOST=user@example.com ./tools/build-host-tests.sh
 ```
 
 ---

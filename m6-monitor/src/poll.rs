@@ -341,7 +341,7 @@ mod tests {
         NodeReading {
             name: "origin".into(),
             role: "origin".into(),
-            url: "http://x".into(),
+            url: "http://origin.example.com".into(),
             health: status.map(|s| HealthReport {
                 status: s.to_string(),
                 node: "origin".into(),

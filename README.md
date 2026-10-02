@@ -73,7 +73,7 @@ actually used, and they are the first place a change to them breaks. m6's own
 checks do this for you:
 
 ```sh
-M6_BUILD_HOST=root@your-linux-box ./tools/build-host-tests.sh
+M6_BUILD_HOST=user@example.com ./tools/build-host-tests.sh
 ```
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md).
@@ -460,7 +460,7 @@ wait
 
 **Scaling:** start additional instances (e.g. `m6-html-2.service`). The socket `/run/m6/m6-html-2.sock` appears; m6-http detects it via inotify and adds it to the pool. No config change needed.
 
-**Global deployment:** run m6-http at each edge location. Configure it with a `h2s://` URL backend pointing to the origin. Each edge node caches independently. See [Example 09](docs/m6-user-guide.md#example-09--global-deployment) and the Vultr multi-region deployment walkthrough.
+**Global deployment:** run m6-http at each edge location. Configure it with a `h2s://` URL backend pointing to the origin. Each edge node caches independently. See [Example 09](docs/m6-user-guide.md#example-09--global-deployment) and the multi-region deployment walkthrough.
 
 ---
 
