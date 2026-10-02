@@ -207,11 +207,35 @@ fn element(buf: &[u8]) -> Result<(u8, &[u8], &[u8]), CertificateError> {
 
 /// `notAfter` for each certificate the server has loaded, leaf first.
 ///
-/// A `RwLock` rather than a `OnceLock` because a certificate is loaded at
-/// startup and can be loaded again on reload, and the whole point of this
-/// module is to report what is being served now. Written once per load and read
-/// once per monitoring request, so the lock is never contended.
-static LOADED: RwLock<Vec<i64>> = RwLock::new(Vec::new());
+/// A `RwLock` rather than a `OnceLock` so a second load can replace the first.
+/// Written once per load and read once per monitoring request, so the lock is
+/// never contended.
+///
+/// **What this holds today is the chain loaded at startup, and that is exactly
+/// what HTTP/1.1 and HTTP/2 are serving.** The claim that it tracks reloads was
+/// written before it was checked and is false: `m6-http`'s `handle_tls_reload`
+/// rebuilds the quiche config alone, so after a renewal HTTP/3 serves the new
+/// certificate while rustls keeps the old one, and nothing re-records. So the
+/// number reported here is correct for h1 and h2 and stale for h3, which is a
+/// divergence in the server rather than in this registry. m6 #210.
+/// Each entry is `(depth as loaded, notAfter)`, and an unreadable certificate
+/// leaves a GAP rather than shifting everything after it.
+///
+/// A bare `Vec<i64>` re-derived depth from the vector position, so a chain
+/// whose leaf failed to parse reported its intermediate as `depth: 0`, which
+/// every doc here calls the certificate an ACME client renews. An operator
+/// would read a multi-year expiry for the one that actually needed renewing.
+static LOADED: RwLock<Vec<(usize, i64)>> = RwLock::new(Vec::new());
+
+/// How many certificates in the loaded chain could not be read.
+///
+/// Carried separately because the list above cannot express it: a chain with
+/// an unreadable member and a chain that is simply shorter look identical
+/// once the failures are dropped. A monitor needs to tell "every certificate
+/// reported" from "some certificate is unaccounted for", and reading the
+/// second as the first is the absence-as-health failure this module exists to
+/// prevent.
+static UNREADABLE: RwLock<usize> = RwLock::new(0);
 
 /// Record the chain the server has just loaded, replacing any earlier one.
 ///
@@ -226,10 +250,13 @@ pub fn record_loaded<T: AsRef<[u8]>>(chain: &[T]) -> Vec<(usize, CertificateErro
     let mut failures = Vec::new();
     for (depth, der) in chain.iter().enumerate() {
         match not_after_unix(der.as_ref()) {
-            Ok(secs) => not_after.push(secs),
+            // The depth is recorded, not implied by position, so a failure
+            // earlier in the chain cannot renumber what follows it.
+            Ok(secs) => not_after.push((depth, secs)),
             Err(e) => failures.push((depth, e)),
         }
     }
+    *UNREADABLE.write().unwrap_or_else(|e| e.into_inner()) = failures.len();
     // A poisoned lock means another thread panicked while holding it. The value
     // behind it is a plain `Vec<i64>` that no panic can leave half written, so
     // the recovery is to take it anyway rather than to propagate.
@@ -246,13 +273,22 @@ pub fn record_loaded<T: AsRef<[u8]>>(chain: &[T]) -> Vec<(usize, CertificateErro
 pub fn loaded_at(now_unix: i64) -> Vec<TlsCertificate> {
     let slot = LOADED.read().unwrap_or_else(|e| e.into_inner());
     slot.iter()
-        .enumerate()
-        .map(|(depth, &not_after_unix)| TlsCertificate {
+        .map(|&(depth, not_after_unix)| TlsCertificate {
             depth,
             not_after_unix,
             expires_in_seconds: not_after_unix - now_unix,
         })
         .collect()
+}
+
+/// How many certificates in the loaded chain could not be read.
+///
+/// Non-zero means the report is incomplete and a reader must say so rather
+/// than judging the certificates it did get. A chain whose leaf is unreadable
+/// and whose intermediate expires in two years is not a healthy chain, and
+/// taking the minimum of what parsed would call it one.
+pub fn unreadable() -> usize {
+    *UNREADABLE.read().unwrap_or_else(|e| e.into_inner())
 }
 
 /// The loaded chain's expiries, measured against the clock now.
@@ -479,5 +515,29 @@ mod tests {
         // is what makes the report say what is being served now.
         assert!(record_loaded::<Vec<u8>>(&[]).is_empty());
         assert!(loaded_at(0).is_empty());
+
+        // THE DEPTH IS THE POSITION AS LOADED, so a failure earlier in the
+        // chain cannot renumber what follows it. The previous test only ever
+        // failed at depth 1, which structurally cannot catch this: a leaf that
+        // does not parse used to report the INTERMEDIATE as depth 0, and every
+        // document here calls depth 0 the certificate an ACME client renews.
+        let (intermediate, intermediate_not_after) = certificate(400);
+        let failures = record_loaded(&[vec![0x02, 0x01, 0x01], intermediate]);
+        assert_eq!(failures.len(), 1, "the leaf is the one that failed");
+        assert_eq!(failures[0].0, 0);
+        let loaded = loaded_at(0);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(
+            loaded[0].depth, 1,
+            "an unreadable leaf must leave a gap, never promote the intermediate to depth 0"
+        );
+        assert_eq!(loaded[0].not_after_unix, intermediate_not_after);
+        assert_eq!(unreadable(), 1, "the unreadable leaf must be counted");
+
+        // And the count resets with a clean load, so it describes the chain
+        // in hand rather than accumulating.
+        let (leaf, _) = certificate(30);
+        assert!(record_loaded(&[leaf]).is_empty());
+        assert_eq!(unreadable(), 0);
     }
 }

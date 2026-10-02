@@ -613,7 +613,7 @@ disk work.
 | a chain, leaf first | `depth` 0 is what an *ACME* client renews, and intermediates expire too. A chain is good until its soonest expiry |
 | `expires_in_seconds` goes negative | how long ago separates a renewal that failed last night from one that stopped running in March |
 | an unreadable certificate is returned, not recorded | rustls accepted it or there would be no server, so refusing to serve is the worse failure. A reported absence lets a monitor say "cannot say" |
-| a later `record_loaded` replaces the earlier one | the report has to say what is being served now, which is the point of the module |
+| a later `record_loaded` replaces the earlier one | so a reload can correct it. **No caller does this yet**: `handle_tls_reload` rebuilds the quiche config alone, so the registry holds the startup chain, which is what h1 and h2 serve and is stale for h3. m6 #210 |
 
 The last two rows are the ones to keep: an absence and a measured number must
 not look alike, and a stale number is worse than either.

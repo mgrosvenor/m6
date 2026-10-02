@@ -437,6 +437,14 @@ pub struct PerfReport {
     /// a reader that needs to tell them apart reads `build.version` too.
     #[serde(default)]
     pub tls: Vec<crate::tls::TlsCertificate>,
+    /// Certificates in the loaded chain whose `notAfter` could not be read.
+    ///
+    /// Without this, `tls` being short and `tls` being complete are the same
+    /// payload, and an aggregator taking the soonest expiry of what it got
+    /// would call a chain healthy on the strength of an intermediate while
+    /// the leaf is unaccounted for.
+    #[serde(default)]
+    pub tls_unreadable: usize,
     pub metrics: StatsSnapshot,
     /// The machine underneath: load, memory, disk, temperature, uptime.
     ///
@@ -535,6 +543,7 @@ impl PerfReport {
                     // so a monitoring endpoint cannot be made to do disk work
                     // by being polled.
                     tls: crate::tls::loaded(),
+                    tls_unreadable: crate::tls::unreadable(),
                     metrics: snapshot(),
                     host: crate::host::snapshot(host_path),
                 }))

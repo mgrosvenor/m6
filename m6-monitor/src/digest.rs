@@ -224,7 +224,16 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
             // `None`, which is the answer for a node too old to report the
             // field and is left to say "cannot say" rather than collapsing to
             // a number.
-            d.cert_expires_in_seconds = p.tls.iter().map(|c| c.expires_in_seconds).min();
+            // The soonest expiry, but ONLY when the whole chain was readable.
+            // `min` over what parsed would report an intermediate's multi-year
+            // expiry as the node's figure while the leaf is unaccounted for,
+            // and every threshold below would then pass. An incomplete chain
+            // is "cannot say", which is the branch that warns.
+            d.cert_expires_in_seconds = if p.tls_unreadable == 0 {
+                p.tls.iter().map(|c| c.expires_in_seconds).min()
+            } else {
+                None
+            };
             d.requests_total = Some(p.metrics.requests_total);
             d.backend_errors = Some(p.metrics.backend_errors_total);
             let hits = p.metrics.cache_hits_total;
@@ -366,10 +375,19 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
             // node that reports nothing is a node this check cannot see and
             // must warn. Reading an absence as healthy is the shape of mistake
             // the build-drift check above was written to stop making.
+            // Either signal means a certificate is expected. Keying on the
+            // polled URL alone silences the check on a node polled over the
+            // backbone in plaintext, which `fleet.rs` actively recommends
+            // ("point this at the backbone address, not the public one") and
+            // which m6-http supports through `h2c_bind`. Such a node serves
+            // TLS publicly and reports its chain, so a reported chain counts
+            // as expecting one.
             let expects_tls = r
                 .url
                 .split_once("://")
-                .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("https"));
+                .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("https"))
+                || !p.tls.is_empty()
+                || p.tls_unreadable > 0;
             match (expects_tls, d.cert_expires_in_seconds) {
                 (true, Some(secs)) if secs < 0 => {
                     findings.push(Finding {
@@ -553,6 +571,7 @@ mod tests {
             pools,
             url_backends: vec![],
             tls: vec![],
+            tls_unreadable: 0,
             metrics: StatsSnapshot::default(),
             host,
         }
@@ -1099,6 +1118,65 @@ mod tests {
             d.findings[0].text
         );
         assert_eq!(d.nodes[0].cert_expires_in_seconds, None);
+    }
+
+    /// AN INCOMPLETE CHAIN IS "CANNOT SAY", NOT THE MINIMUM OF WHAT PARSED.
+    ///
+    /// The case the review found: m6-http cannot read the leaf's notAfter, so
+    /// it reports only the intermediate, which is years out. Taking `min` of
+    /// what arrived returns that long number, both threshold arms fall
+    /// through, and the digest says ALL CLEAR while nothing in the fleet knows
+    /// when the served leaf expires. That is absence read as health, which is
+    /// the exact failure this check exists to prevent.
+    #[test]
+    fn a_chain_with_an_unreadable_member_cannot_say_rather_than_passing() {
+        let mut p = perf(plain_host(), vec![]);
+        p.tls = vec![m6_core::tls::TlsCertificate {
+            depth: 1,
+            not_after_unix: 0,
+            expires_in_seconds: 900 * 86_400,
+        }];
+        p.tls_unreadable = 1;
+        let mut r = reading("origin", "ok", Some(p));
+        r.url = "https://origin.example.com".into();
+
+        let d = build(&[r], &Thresholds::default(), now());
+        assert_eq!(
+            d.nodes[0].cert_expires_in_seconds, None,
+            "a 900-day intermediate must not stand in for an unreadable leaf"
+        );
+        assert_eq!(d.level, Level::Warn);
+        assert!(
+            d.findings[0].text.contains("no certificate expiry"),
+            "{:?}",
+            d.findings[0].text
+        );
+    }
+
+    /// A node polled over the backbone in plaintext still serves TLS publicly,
+    /// and `fleet.rs` actively recommends pointing the poll URL at the
+    /// backbone. Gating on the URL scheme alone silenced the check on exactly
+    /// that node, so a reported chain counts as expecting one.
+    #[test]
+    fn a_plaintext_polled_node_that_reports_a_chain_is_still_checked() {
+        let mut p = perf(plain_host(), vec![]);
+        p.tls = vec![m6_core::tls::TlsCertificate {
+            depth: 0,
+            not_after_unix: 0,
+            expires_in_seconds: 3 * 86_400,
+        }];
+        let r = reading("origin", "ok", Some(p)); // url is http://origin.example.com
+        let d = build(&[r], &Thresholds::default(), now());
+        assert_eq!(
+            d.level,
+            Level::Warn,
+            "3 days left must warn even over a plaintext poll"
+        );
+        assert!(
+            d.findings[0].text.contains("expires in 3 days"),
+            "{:?}",
+            d.findings[0].text
+        );
     }
 
     /// And the other silence, which must stay silent. A node polled over
