@@ -73,7 +73,7 @@ actually used, and they are the first place a change to them breaks. m6's own
 checks do this for you:
 
 ```sh
-M6_BUILD_HOST=root@your-linux-box ./tools/build-host-tests.sh
+M6_BUILD_HOST=user@example.com ./tools/build-host-tests.sh
 ```
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md).
@@ -705,7 +705,7 @@ comparison, and presenting it as one was the least defensible thing in this
 file.
 
 **Two different quantities, both true, easily confused:** a cache hit costs
-**~2.2 µs** inside m6 (its own timer, confirmed on production), while an
+**~2.2 µs** inside m6 (its own timer, confirmed against a running server), while an
 end-to-end HTTP/2 request on the benchmark host is **~230 µs** — TLS, loopback
 and the client included. Quoting the first as if it were the second is how the
 old numbers drifted.

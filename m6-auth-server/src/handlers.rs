@@ -4,7 +4,7 @@ use m6_auth::Db;
 use m6_core::http::{RawRequest, RawResponse};
 // Form parsing, percent coding and cookie lookup are core's. This file had its
 // own of each; `url_decode` in particular was a second copy of the Latin-1
-// defect that reached production through the contact form, and it had to be
+// defect that reached production through a contact form, and it had to be
 // found and fixed twice. That is the argument for consolidating, so they are
 // gone rather than merely correct.
 use m6_core::request::{cookie, parse_form_body, url_encode_path};

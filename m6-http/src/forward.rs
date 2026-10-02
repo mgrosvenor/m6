@@ -60,7 +60,7 @@ pub const UNTRUSTED_INBOUND: &[&str] = &[
 /// downstream has ever been allowed to look at it.
 ///
 /// That is right for the public listener and wrong for the backbone. A cache
-/// node forwards to origin over `h2c://192.0.2.1:80` and already sends the real
+/// node forwards to origin over `h2c://origin.example.com:80` and already sends the real
 /// client IP (`h2c_client.rs`), so origin was stripping the one accurate
 /// answer it had and attributing every relayed request to the tunnel address.
 /// The visible cost was analytics: three of five crawler sightings in an hour
@@ -72,8 +72,8 @@ pub const UNTRUSTED_INBOUND: &[&str] = &[
 pub enum ForwardedTrust {
     /// A forwarded client IP here is a forgery attempt. The public listener.
     Never,
-    /// The peer is one of our own cache nodes, reachable only over the
-    /// WireGuard tunnel. Granted by the listener, never by a header, and never
+    /// The peer is one of the deployment's own cache nodes, reachable only over the
+    /// private backbone. Granted by the listener, never by a header, and never
     /// on a listener bound to a public address -- see `H2cListener::bind`.
     Backbone,
 }
@@ -962,8 +962,8 @@ pub fn parse_request(data: &[u8]) -> Result<HttpRequest, String> {
 
 /// Forward a request to a URL backend over HTTP/1.1.
 ///
-/// `base_url` must be `https://host[:port]` (HTTP/1.1 over TLS) or
-/// `http://host[:port]` (HTTP/1.1 plain).
+/// `base_url` must be `https://example.com[:port]` (HTTP/1.1 over TLS) or
+/// `http://example.com[:port]` (HTTP/1.1 plain).
 ///
 /// `h2c://` and `h2s://` backends are dispatched via their respective
 /// persistent client pools (`H2cClientPool` / `H2sTlsClientPool`) and must
