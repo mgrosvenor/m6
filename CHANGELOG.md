@@ -12,6 +12,85 @@ releases only; work happens on `develop`. See `CONTRIBUTING.md`.
 
 ---
 
+## 1.13.0 — 2026-10-02
+
+**A server that terminates TLS now says how long its certificate has left.**
+
+Certificate renewal is done by an *ACME* (Automatic Certificate Management Environment)
+client outside m6, on a timer, and the documented failure mode of that arrangement is
+silence: the renewal fails, the timer keeps firing and keeps failing, nothing looks, and
+the first signal is the server refusing connections on the day the certificate expires.
+A server already holds the answer, so it is the cheapest place to ask.
+
+### Added
+
+**`m6-core::tls`**, a new module. `not_after_unix(der)` reads `notAfter` out of a DER
+certificate. `record_loaded(chain)` stores what a server loaded and returns what it could
+not read. `loaded()` reports the chain as `TlsCertificate`, leaf first, each carrying
+`depth`, `not_after_unix` and `expires_in_seconds`. `unreadable()` counts what failed.
+
+**`PerfReport.tls` and `PerfReport.tls_unreadable`** on `/perf`, both `serde(default)` so
+an older node stays parseable to an aggregator rather than making the whole payload
+unreadable.
+
+**m6-monitor prints days remaining** on the per-node line beside the version and build,
+and warns below `Thresholds::cert_expiry_days`, default 21. That default is about renewal
+attempts rather than the certificate: a client on a 90-day certificate starts renewing at
+30 days and retries daily, so 21 means renewal has failed about nine times before anyone
+is told. A threshold inside the renewal window fires on the first transient failure and
+gets ignored, and an ignored warning is the same as no warning.
+
+### It reports the loaded material, never a file
+
+A path on disk and the certificate a running process is serving are different facts, and
+a renewal that wrote a new file without reloading the server is exactly where they
+disagree. `loaded()` opens nothing, so polling a monitoring endpoint cannot be made to do
+disk work.
+
+### The parse is written out rather than imported
+
+`rustls` parses no validity from `CertificateDer` and `rustls-webpki` keeps its own parse
+private, so one integer field meant either eight crates of general ASN.1 or a walk over a
+known shape. `notAfter` sits at a fixed structural position in every X.509 certificate, so
+the walk steps over six elements by length and reads the seventh. Every length is checked
+against the buffer, and a test runs every truncation of a real certificate through it.
+Dates go through `chrono`, because civil-from-days arithmetic is the mistake
+`util::iso_date_from` already records.
+
+### Absence and a measurement must not look alike
+
+Three defects found in review, all in the direction of reading silence as health.
+
+| defect | consequence |
+|---|---|
+| `depth` derived from position after dropping failures | a chain whose leaf could not be read reported its intermediate as `depth: 0`, which every document calls the certificate an ACME client renews |
+| `min()` over a partially-read chain | an unreadable leaf plus a multi-year intermediate gave a long number, every threshold passed, and the digest said ALL CLEAR while nothing knew when the served leaf expired |
+| gating the check on an `https://` poll URL | a node polled over the backbone in plaintext serves TLS publicly and reports its chain, and every arm was skipped |
+
+**Table 1: what review caught before release, and what each would have cost.** Take from
+it that a check written to notice an absence can itself read absence as health.
+
+### Known limitation, recorded rather than hidden
+
+`handle_tls_reload` rebuilds the quiche configuration alone, so after a renewal HTTP/3
+serves the new certificate while rustls keeps the old one, and nothing re-records. The
+number reported is therefore correct for HTTP/1.1 and HTTP/2 and stale for HTTP/3. That is
+a server defect rather than a reporting one and is **m6 #210**. Earlier drafts of this
+module's documentation claimed a reload re-records; no caller does, and the documents now
+say so.
+
+### Verified
+
+`cargo test --workspace` with the new tests, clippy silent, zero compiler warnings,
+`cargo fmt` clean, the examples workspace building with clippy silent, and CI green on
+h1, h2 and h3 conformance, cargo-deny and the MSRV check. The parse is tested against
+rcgen-generated certificates rather than a fixture that would expire: a future expiry read
+back exactly, an expired one reading negative, a v1 certificate with no version field, an
+impossible date, DER's forbidden indefinite length, and every truncation of a real
+certificate.
+
+---
+
 ## 1.12.1 — 2026-10-02
 
 **A documentation and comment release. No behaviour changes to any shipped binary.**
