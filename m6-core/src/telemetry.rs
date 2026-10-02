@@ -330,6 +330,284 @@ pub fn claims_to_be_bot(user_agent: &str) -> bool {
     matches_any(user_agent, BOT_MARKERS)
 }
 
+// ── Verifying a crawler's claim ───────────────────────────────────────────────
+//
+// **A crawler's documentation URL is not its PTR domain, and assuming it was
+// is a defect this code was written with and corrected before release.**
+//
+// The first version of this took the domain out of the agent's own URL and
+// compared the reverse lookup against it. Checked against real traffic that
+// marked three genuine crawlers as forgeries:
+//
+//     agent says                     actually resolves to
+//     developer.amazon.com           crawl.amazonbot.amazon
+//     bing.com/bingbot.htm           search.msn.com
+//     google.com/bot.html            googlebot.com
+//
+// A verifier that accuses the real ones is worse than no verifier, because its
+// output gets ignored and then so does a true finding. The expectation has to
+// come from the operator's own documented method, which is what the table
+// below holds.
+//
+// The other half of the correction: **not every operator uses PTR records.**
+// Some publish a list of address ranges instead, and for those a reverse
+// lookup can neither confirm nor deny. That is a third answer, not a failure,
+// and reporting it as a mismatch would be the same mistake again.
+
+/// How a crawler's operator says to check that a request is really theirs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrawlerVerification {
+    /// The operator publishes PTR records, and a genuine address resolves to a
+    /// name under one of these suffixes.
+    Ptr(&'static [&'static str]),
+    /// The operator publishes a list of address ranges rather than PTR
+    /// records. A reverse lookup says nothing either way. The string names
+    /// where the list is published, so a reader knows what would settle it.
+    PublishedRanges(&'static str),
+}
+
+/// A crawler we know how to check, and how.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KnownCrawler {
+    /// What to call it in a report.
+    pub name: &'static str,
+    /// Lowercase substring of the user agent that identifies it.
+    pub marker: &'static str,
+    pub verification: CrawlerVerification,
+}
+
+/// Crawlers whose operator documents how to verify them.
+///
+/// Each entry is the operator's own published method. An agent that matches
+/// nothing here is reported as unrecognised rather than guessed at: inventing
+/// an expectation is how the first version of this came to accuse Amazonbot.
+///
+/// Longest markers first where one contains another, so `claude-searchbot`
+/// cannot be swallowed by a shorter `claudebot`.
+pub const KNOWN_CRAWLERS: &[KnownCrawler] = &[
+    // Google documents reverse-then-forward DNS resolving under googlebot.com,
+    // google.com or googleusercontent.com.
+    KnownCrawler {
+        name: "Googlebot",
+        marker: "googlebot",
+        verification: CrawlerVerification::Ptr(&[
+            "googlebot.com",
+            "google.com",
+            "googleusercontent.com",
+        ]),
+    },
+    KnownCrawler {
+        name: "Google-InspectionTool",
+        marker: "google-inspectiontool",
+        verification: CrawlerVerification::Ptr(&["googlebot.com", "google.com"]),
+    },
+    // Microsoft documents search.msn.com, NOT bing.com, which is what the
+    // agent's own URL names.
+    KnownCrawler {
+        name: "bingbot",
+        marker: "bingbot",
+        verification: CrawlerVerification::Ptr(&["search.msn.com"]),
+    },
+    KnownCrawler {
+        name: "BingPreview",
+        marker: "bingpreview",
+        verification: CrawlerVerification::Ptr(&["search.msn.com"]),
+    },
+    // Amazon documents crawl.amazonbot.amazon, not developer.amazon.com.
+    KnownCrawler {
+        name: "Amazonbot",
+        marker: "amazonbot",
+        verification: CrawlerVerification::Ptr(&["crawl.amazonbot.amazon"]),
+    },
+    KnownCrawler {
+        name: "Applebot",
+        marker: "applebot",
+        verification: CrawlerVerification::Ptr(&["applebot.apple.com"]),
+    },
+    KnownCrawler {
+        name: "YandexBot",
+        marker: "yandex",
+        verification: CrawlerVerification::Ptr(&["yandex.ru", "yandex.net", "yandex.com"]),
+    },
+    KnownCrawler {
+        name: "Baiduspider",
+        marker: "baiduspider",
+        verification: CrawlerVerification::Ptr(&["baidu.com", "baidu.jp"]),
+    },
+    KnownCrawler {
+        name: "PetalBot",
+        marker: "petalbot",
+        verification: CrawlerVerification::Ptr(&["petalsearch.com"]),
+    },
+    // These publish address ranges instead of PTR records, so a reverse
+    // lookup cannot settle them in either direction.
+    KnownCrawler {
+        name: "OAI-SearchBot",
+        marker: "oai-searchbot",
+        verification: CrawlerVerification::PublishedRanges(
+            "openai.com/searchbot.json (published address ranges)",
+        ),
+    },
+    KnownCrawler {
+        name: "GPTBot",
+        marker: "gptbot",
+        verification: CrawlerVerification::PublishedRanges(
+            "openai.com/gptbot.json (published address ranges)",
+        ),
+    },
+    KnownCrawler {
+        name: "ChatGPT-User",
+        marker: "chatgpt-user",
+        verification: CrawlerVerification::PublishedRanges(
+            "openai.com/chatgpt-user.json (published address ranges)",
+        ),
+    },
+    KnownCrawler {
+        name: "ClaudeBot",
+        marker: "claudebot",
+        verification: CrawlerVerification::PublishedRanges(
+            "anthropic.com published address ranges",
+        ),
+    },
+    KnownCrawler {
+        name: "Claude-User",
+        marker: "claude-user",
+        verification: CrawlerVerification::PublishedRanges(
+            "anthropic.com published address ranges",
+        ),
+    },
+];
+
+/// The table entry for a user agent, if there is one.
+pub fn known_crawler(user_agent: &str) -> Option<&'static KnownCrawler> {
+    let ua = user_agent.to_ascii_lowercase();
+    // Longest marker wins, so an agent matching both a specific and a general
+    // marker is checked against the specific one.
+    KNOWN_CRAWLERS
+        .iter()
+        .filter(|k| ua.contains(k.marker))
+        .max_by_key(|k| k.marker.len())
+}
+
+/// What a reverse lookup settled about a crawler's claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CrawlerVerdict {
+    /// The name resolves under a suffix the operator documents.
+    Verified {
+        name: &'static str,
+        resolved: String,
+    },
+    /// The name resolves, and under nothing the operator documents. This is
+    /// the only outcome that calls a claim false, and it names what the
+    /// address actually is.
+    Mismatch {
+        name: &'static str,
+        resolved: String,
+        expected: &'static [&'static str],
+    },
+    /// The operator publishes address ranges rather than PTR records, so this
+    /// method cannot settle it. Not a mismatch and not a pass.
+    NotCheckableByPtr {
+        name: &'static str,
+        how: &'static str,
+        resolved: Option<String>,
+    },
+    /// No entry in the table. The lookup result is reported without a verdict,
+    /// because there is no published expectation to judge it against.
+    Unrecognised { resolved: Option<String> },
+    /// The address has no PTR record.
+    NoPtr { name: Option<&'static str> },
+    /// The lookup did not complete. Says nothing about the address.
+    LookupFailed { name: Option<&'static str> },
+}
+
+/// Settle a crawler's claim against a reverse lookup.
+///
+/// The expectation comes from [`KNOWN_CRAWLERS`], never from the agent's own
+/// string. See the note above the table for what that correction cost.
+pub fn verify_crawler(user_agent: &str, ptr: &crate::resolve::Ptr) -> CrawlerVerdict {
+    use crate::resolve::Ptr;
+
+    let known = known_crawler(user_agent);
+    let name = known.map(|k| k.name);
+
+    match (known, ptr) {
+        // An operator who publishes ranges tells us nothing by PTR, whether
+        // or not a name came back.
+        (Some(k), p) => match k.verification {
+            CrawlerVerification::PublishedRanges(how) => CrawlerVerdict::NotCheckableByPtr {
+                name: k.name,
+                how,
+                resolved: p.name().map(str::to_string),
+            },
+            CrawlerVerification::Ptr(expected) => match p {
+                Ptr::Name(resolved) => {
+                    if expected.iter().any(|d| p.verifies(d)) {
+                        CrawlerVerdict::Verified {
+                            name: k.name,
+                            resolved: resolved.clone(),
+                        }
+                    } else {
+                        CrawlerVerdict::Mismatch {
+                            name: k.name,
+                            resolved: resolved.clone(),
+                            expected,
+                        }
+                    }
+                }
+                Ptr::None => CrawlerVerdict::NoPtr { name },
+                Ptr::Failed => CrawlerVerdict::LookupFailed { name },
+            },
+        },
+        (None, Ptr::Name(resolved)) => CrawlerVerdict::Unrecognised {
+            resolved: Some(resolved.clone()),
+        },
+        (None, Ptr::None) => CrawlerVerdict::NoPtr { name: None },
+        (None, Ptr::Failed) => CrawlerVerdict::LookupFailed { name: None },
+    }
+}
+
+/// The domain a bot user agent says it belongs to, if it says.
+///
+/// Crawler user agents carry their own contact, by convention as a URL or an
+/// email address in parentheses: `(+http://www.example.com/bot.html)` or
+/// `(+bot@example.com)`. That string is the claim, and it is what a reverse
+/// lookup is checked against, so extracting it is the first half of
+/// verification. See [`crate::resolve::Ptr::verifies`] for the second.
+///
+/// Returns the registrable-looking host with any `www.` stripped, because a
+/// crawler's PTR records sit under the bare domain far more often than under
+/// the `www` host its documentation page happens to live on.
+///
+/// `None` when the agent names nothing, which is itself worth reporting: an
+/// agent claiming to be a crawler and giving no way to check is a weaker
+/// claim than one that does.
+pub fn claimed_domain(user_agent: &str) -> Option<String> {
+    // A URL first, then an email. Both appear, and an agent carrying both
+    // puts the URL first in every convention seen.
+    const STOP: [char; 5] = ['/', ')', ' ', ';', ','];
+    let host = match user_agent.find("://") {
+        Some(i) => user_agent[i + 3..].split(STOP).next()?,
+        None => {
+            let i = user_agent.find('@')?;
+            user_agent[i + 1..].split(STOP).next()?
+        }
+    };
+    // Strip a port and any credentials a malformed agent might carry.
+    let host = host.rsplit('@').next()?;
+    let host = host.split(':').next()?;
+    let host = host.trim_end_matches('.').trim().to_ascii_lowercase();
+    let host = host.strip_prefix("www.").unwrap_or(&host).to_string();
+    // A domain needs at least one dot. Anything else is not checkable and
+    // saying so is better than returning something a suffix match would
+    // accept too easily.
+    if host.contains('.') && !host.is_empty() {
+        Some(host)
+    } else {
+        None
+    }
+}
+
 /// Probe shapes, checked raw and decoded, for the same reason as
 /// [`looks_like_injection`]: `..%2F` is a traversal and `%2E%65nv` is `.env`.
 pub fn looks_like_probe(path: &str) -> bool {
@@ -421,6 +699,16 @@ pub struct CrawlerSighting {
     pub requests: u64,
     pub client_ips: Vec<String>,
     pub paths: Vec<(String, u64)>,
+    /// When the counted requests began and ended, as the timestamps appear in
+    /// the log.
+    ///
+    /// Without these a sighting cannot be placed against anything else in a
+    /// report: a crawler fetching a sitemap means one thing an hour after a
+    /// deploy and another during a burst, and the records being aggregated
+    /// carry the time all along. They span only the addresses that survived
+    /// the forgery check, matching `requests`.
+    pub first_seen: String,
+    pub last_seen: String,
 }
 
 /// An hour of traffic, summarised.
@@ -482,8 +770,21 @@ impl TrafficSummary {
         #[derive(Default)]
         struct UaAcc {
             n: u64,
-            ips: HashMap<String, u64>,
+            ips: HashMap<String, IpAcc>,
             paths: HashMap<String, u64>,
+        }
+        /// One address under one user agent: how many, and when.
+        ///
+        /// Per address rather than per user agent because a sighting counts
+        /// only the addresses that survived the forgery check, and its window
+        /// has to be the window of the requests it counted. Folding the times
+        /// in at the user-agent level would let an address excluded as a
+        /// forger widen the span reported for the genuine ones.
+        #[derive(Default)]
+        struct IpAcc {
+            n: u64,
+            first: String,
+            last: String,
         }
         let mut per_ip: HashMap<String, Acc> = HashMap::new();
         let mut per_ua: HashMap<String, UaAcc> = HashMap::new();
@@ -518,7 +819,21 @@ impl TrafficSummary {
 
             let e = per_ua.entry(rec.user_agent().to_string()).or_default();
             e.n += 1;
-            *e.ips.entry(f.client_ip.clone()).or_default() += 1;
+            let ip_acc = e.ips.entry(f.client_ip.clone()).or_insert_with(|| IpAcc {
+                n: 0,
+                first: rec.timestamp.clone(),
+                last: rec.timestamp.clone(),
+            });
+            ip_acc.n += 1;
+            // String comparison is time comparison here: the timestamps are
+            // fixed-width RFC 3339 in UTC, which is the same property
+            // `parse_analytics` relies on to select a window.
+            if rec.timestamp < ip_acc.first {
+                ip_acc.first = rec.timestamp.clone();
+            }
+            if rec.timestamp > ip_acc.last {
+                ip_acc.last = rec.timestamp.clone();
+            }
             *e.paths.entry(f.path.clone()).or_default() += 1;
         }
 
@@ -556,16 +871,29 @@ impl TrafficSummary {
             if !claims_to_be_bot(&ua) {
                 continue;
             }
-            let genuine: Vec<(String, u64)> = ips
-                .iter()
-                .filter(|(ip, _)| !forgers.contains(*ip))
-                .map(|(ip, c)| (ip.clone(), *c))
+            let genuine: Vec<(String, IpAcc)> = ips
+                .into_iter()
+                .filter(|(ip, _)| !forgers.contains(ip))
                 .collect();
-            let genuine_n: u64 = genuine.iter().map(|(_, c)| c).sum();
+            let genuine_n: u64 = genuine.iter().map(|(_, a)| a.n).sum();
             summary.forged_bot_requests += n - genuine_n;
             if genuine_n == 0 {
                 continue;
             }
+            // The window of the requests actually counted, across the
+            // addresses actually counted.
+            let first_seen = genuine
+                .iter()
+                .map(|(_, a)| a.first.as_str())
+                .min()
+                .unwrap_or_default()
+                .to_string();
+            let last_seen = genuine
+                .iter()
+                .map(|(_, a)| a.last.as_str())
+                .max()
+                .unwrap_or_default()
+                .to_string();
             let mut ip_list: Vec<String> = genuine.into_iter().map(|(ip, _)| ip).collect();
             ip_list.sort();
             let mut p: Vec<(String, u64)> = paths.into_iter().collect();
@@ -576,6 +904,8 @@ impl TrafficSummary {
                 requests: genuine_n,
                 client_ips: ip_list,
                 paths: p,
+                first_seen,
+                last_seen,
             });
         }
         summary
@@ -875,6 +1205,147 @@ mod tests {
     /// mostly getting 404s, because it is re-crawling links that no longer
     /// exist, is still a genuine crawler. Error ratio is not evidence of
     /// forgery; asking for credentials is.
+    /// The claim a user agent makes about itself, which is half of
+    /// verification. Issue #205.
+    #[test]
+    fn the_domain_a_bot_claims_is_extracted_from_its_own_string() {
+        let d = |ua: &str| claimed_domain(ua);
+        // The URL form, which is the common one, with `www.` stripped because
+        // PTR records sit under the bare domain far more often.
+        assert_eq!(
+            d("Mozilla/5.0 (compatible; ExampleBot/2.1; +http://www.example.com/bot.html)"),
+            Some("example.com".into())
+        );
+        assert_eq!(
+            d("Mozilla/5.0 (compatible; ExampleBot/1.0; +https://example.com/crawler)"),
+            Some("example.com".into())
+        );
+        // The email form.
+        assert_eq!(
+            d("Mozilla/5.0 (compatible; ExampleBot/1.0; +bot@example.com)"),
+            Some("example.com".into())
+        );
+        // A port must not end up in the domain.
+        assert_eq!(
+            d("ExampleBot/1.0 (+http://example.com:8080/bot)"),
+            Some("example.com".into())
+        );
+        // An agent that names nothing checkable says so, rather than
+        // producing something a suffix match would accept.
+        assert_eq!(d("ExampleBot/1.0"), None);
+        assert_eq!(
+            d("Mozilla/5.0 (compatible; ExampleBot/1.0; +http://localhost/)"),
+            None
+        );
+        assert_eq!(d(""), None);
+    }
+
+    /// THE TRAP, pinned so it cannot be walked into twice.
+    ///
+    /// A crawler's documentation URL is not where its operator publishes PTR
+    /// records. This asserts the gap directly, for real agent strings and the
+    /// PTR names real traffic produced, so any future attempt to verify by
+    /// comparing the two fails here with the reason attached.
+    #[test]
+    fn a_documentation_url_is_not_a_ptr_domain() {
+        use crate::resolve::Ptr;
+        let cases = [
+            (
+                "Mozilla/5.0 (compatible; Amazonbot/0.1; +https://developer.amazon.com/support/amazonbot)",
+                "18-211-148-239.crawl.amazonbot.amazon",
+            ),
+            (
+                "Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)",
+                "msnbot-52-167-144-179.search.msn.com",
+            ),
+            (
+                "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+                "crawl-66-249-66-1.googlebot.com",
+            ),
+        ];
+        for (ua, ptr_name) in cases {
+            let claimed = claimed_domain(ua).expect("these agents all name a domain");
+            let ptr = Ptr::Name(ptr_name.to_string());
+            assert!(
+                !ptr.verifies(&claimed),
+                "{ptr_name} does NOT live under {claimed}, so verifying against the \
+                 agent's own URL marks this genuine crawler a forgery"
+            );
+            // And the table gets it right, which is the whole point.
+            assert!(
+                matches!(verify_crawler(ua, &ptr), CrawlerVerdict::Verified { .. }),
+                "the operator's documented suffix must verify {ptr_name}"
+            );
+        }
+    }
+
+    /// The table is matched longest-marker-first, so a specific agent is not
+    /// swallowed by a more general one that is a substring of it.
+    #[test]
+    fn the_longest_marker_wins() {
+        assert_eq!(
+            known_crawler("Mozilla/5.0 (compatible; Google-InspectionTool/1.0)").map(|k| k.name),
+            Some("Google-InspectionTool")
+        );
+        assert_eq!(
+            known_crawler("Mozilla/5.0 (compatible; Googlebot/2.1)").map(|k| k.name),
+            Some("Googlebot")
+        );
+        assert_eq!(known_crawler("Mozilla/5.0 (NeverHeardOfItBot/1.0)"), None);
+    }
+
+    /// An operator that publishes ranges is uncheckable by PTR whether or not
+    /// a name came back, and must never read as a mismatch.
+    #[test]
+    fn a_ranges_operator_is_uncheckable_either_way() {
+        use crate::resolve::Ptr;
+        let ua = "Mozilla/5.0 (compatible; ClaudeBot/1.0; +claudebot@anthropic.com)";
+        for ptr in [
+            Ptr::None,
+            Ptr::Failed,
+            Ptr::Name("something.example.net".into()),
+        ] {
+            assert!(
+                matches!(
+                    verify_crawler(ua, &ptr),
+                    CrawlerVerdict::NotCheckableByPtr { .. }
+                ),
+                "{ptr:?} must be uncheckable rather than judged"
+            );
+        }
+    }
+
+    /// A sighting carries the window of the requests it counted, and a forger
+    /// excluded from the count must not widen it. Issue #205.
+    #[test]
+    fn a_sighting_reports_the_window_of_the_requests_it_counted() {
+        let ua = "Mozilla/5.0 (compatible; ExampleBot/1.0; +http://example.com/bot)";
+        let mut records = vec![
+            rec("2026-10-01T09:00:00Z", "198.51.100.11", "/a", 200, ua),
+            rec("2026-10-01T09:05:00Z", "198.51.100.11", "/b", 200, ua),
+        ];
+        // A forger presenting the same agent, later, and also scanning. Its
+        // requests are excluded from the count, so they must also be excluded
+        // from the window.
+        records.push(rec(
+            "2026-10-01T11:00:00Z",
+            "203.0.113.41",
+            "/.aws/credentials",
+            404,
+            ua,
+        ));
+
+        let s = TrafficSummary::from_records(&records);
+        assert_eq!(s.crawlers.len(), 1);
+        let c = &s.crawlers[0];
+        assert_eq!(c.requests, 2, "the forger's request is not counted");
+        assert_eq!(c.first_seen, "2026-10-01T09:00:00Z");
+        assert_eq!(
+            c.last_seen, "2026-10-01T09:05:00Z",
+            "the excluded forger must not widen the reported window"
+        );
+    }
+
     #[test]
     fn a_crawler_hitting_dead_links_is_still_a_crawler() {
         let ua = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
