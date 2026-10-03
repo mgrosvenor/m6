@@ -60,8 +60,8 @@ and the login throttle including its recovery.
   96 passed  0 failed  (96 checks)
 ```
 
-Anything other than that is a real answer about your install, not noise. The
-suite has no skipped checks and nothing in it passes on more than one answer.
+Anything other than that is a real answer about your install. No check is
+skipped, and every check has exactly one passing result.
 
 Then read [`docs/m6-user-guide.md`](docs/m6-user-guide.md), which walks the
 eleven examples from a static site up to a global fleet.
@@ -447,7 +447,12 @@ public_key = "/run/m6/auth.pub"
 
 ## Process Management
 
-All processes are independent. m6-http does not start or monitor anything.
+Each process is started and supervised on its own by the service manager,
+systemd on the production target. Start them in any order. m6-http watches
+`/run/m6/` with inotify, so a backend joins its pool when the socket appears
+and leaves when it goes, whether that is a first start, a restart, or a new
+instance added for scale. None of that needs a config change or a restart of
+m6-http.
 
 ```bash
 # Development (shell script, see m6-examples/m6-run-eg)
@@ -522,7 +527,8 @@ Pool empty       →  status per [errors] mode:
 ## Security
 
 - TLS always required; m6-http terminates; internal communication over Unix sockets or TLS URL backends
-- JWT verified locally on every request — no per-request network hop to m6-auth
+- JWT verified on every request against m6-auth's public key, which m6-http
+  holds locally. No request reaches m6-auth, so it is not in the serving path
 - Path traversal: `..` in any URL path → 404; `..` in a route param → 400
 - Symlink guard: resolves symlinks at request time; symlinks escaping `site_dir` → 404
 - Rate limiting on login: 5 attempts / 15 min / IP
@@ -680,8 +686,9 @@ See issue #93 for the full reasoning and the measurements.
 
 m6-http is a **single-threaded, in-process-cached, TLS-terminating reverse proxy**.
 The response cache is an `Arc<Bytes>` LRU in the same heap as the TLS stack — a
-cache hit is a hash lookup, a reference-count increment, and an AES-GCM seal. No
-IPC, no lock, no copy.
+cache hit is a hash lookup, a reference-count increment, and an AES-GCM seal.
+A cache held in a separate process, or in shared memory, adds a round trip or a
+lock to that path. This one has neither, and the bytes are never copied.
 
 **Throughput** — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for the measured
 figures, the hardware, and the exact commands. Summary: HTTP/2 is about 3×
