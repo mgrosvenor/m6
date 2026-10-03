@@ -151,7 +151,7 @@ Client → m6-http (epoll, single-thread)
 Reverse proxy, cache, and router. The only process that listens on a public port.
 
 **Architecture:**
-- Single-threaded `epoll` event loop (no Tokio, no async runtime)
+- Single-threaded `epoll` event loop
 - HTTP/3 over QUIC (`quiche`) and HTTP/2 + HTTP/1.1 on the same port
 - Response cache keyed by `(path, content-encoding)` — each encoding variant cached independently
 - JWT verified locally with m6-auth's public key — no per-request network hop
