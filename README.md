@@ -7,7 +7,7 @@ m6 is a platform for building and deploying fast websites — covering the full 
 ## Install
 
 Four steps. The last one is the point: it runs the whole stack and checks it,
-so you finish knowing the install works rather than assuming it.
+so you finish knowing the install works.
 
 **1. Build the binaries.**
 
@@ -543,13 +543,10 @@ Pool empty       →  status per [errors] mode:
 ## RFC compliance
 
 m6 was audited clause-by-clause against RFC 9110/9111/9112/9113/9114 in
-September 2026: **180 checks, 38 passing, 119 failing, 23 ambiguous.** That
-result is published rather than summarised away, because a hand-written HTTP
-stack claiming compliance without an audit behind it is exactly the kind of
-claim this project should not make.
+September 2026: **180 checks, 38 passing, 119 failing, 23 ambiguous.**
 
 Everything below has since been fixed, with tests, and verified against a
-running server rather than inferred from the source:
+running server:
 
 **Message framing and smuggling**
 - Bare `LF` accepted as a line terminator on ingress (`httparse` permits it)
@@ -597,10 +594,10 @@ running server rather than inferred from the source:
 - Most of the H2 frame/stream/flow-control cluster (F064–F098 beyond the
   panics and flow-control fixes already made), H2 client behaviour
   (F099–F109), H3 integration (F110–F114), auth extensions (F115–F119)
-- The cache key omits scheme and authority (F044). Verified safe for this
-  deployment rather than fixed: no response varies by Host, and `should_cache`
+- The cache key omits scheme and authority (F044). Not fixed. Safe for the
+  audited configuration, where no response varies by Host and `should_cache`
   refuses to store anything whose `Vary` names a field other than
-  `Accept-Encoding`. It would not be safe for multi-tenant use.
+  `Accept-Encoding`. Unsafe for multi-tenant use.
 
 ### The structural question
 
@@ -638,9 +635,7 @@ deliberately; `tools/conformance-scores.txt` argues that one in full.
 
 ### Why there is no server push or 103 Early Hints
 
-Both existed in m6 until 1.9.0 and were removed. They are listed here rather than
-left as a gap, because "m6 does not do this" is a decision and the next person to
-notice the absence should find the reasoning instead of rebuilding it.
+Both existed in m6 until 1.9.0 and were removed.
 
 **HTTP/2 push is a dead feature.** The server cannot see the client's cache, so it
 sends bytes to a returning visitor who already has them. Cache digests were
@@ -692,17 +687,14 @@ IPC, no lock, no copy.
 figures, the hardware, and the exact commands. Summary: HTTP/2 is about 3×
 HTTP/1.1 on this hardware, on both latency and throughput.
 
-This section previously carried a second throughput table that contradicted the
-one above — 158,323 req/s for HTTP/2 against 28,797 — while claiming identical
-conditions. At least one was wrong and a reader had no way to tell which, so
-both were deleted and re-measured rather than reconciled. Neither recorded a
-commit, hardware, payload or command line.
+Figures published here before September 2026 are withdrawn. A second
+throughput table contradicted the one above, 158,323 req/s for HTTP/2 against
+28,797, both claiming identical conditions and neither recording a commit,
+hardware, payload or command line. Both were deleted and re-measured.
 
-It also compared m6 against nginx, LiteSpeed and H2O using figures taken from
-elsewhere rather than run like-for-like. Those comparisons are gone too. A
-number produced on someone else's hardware, with another payload, is not a
-comparison, and presenting it as one was the least defensible thing in this
-file.
+There are no comparisons against nginx, LiteSpeed or H2O. The ones published
+here took their figures from elsewhere, on other hardware with other payloads,
+which does not compare anything.
 
 **Two different quantities, both true, easily confused:** a cache hit costs
 **~2.2 µs** inside m6 (its own timer, confirmed against a running server), while an
