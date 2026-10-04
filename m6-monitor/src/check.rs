@@ -440,8 +440,16 @@ pub fn render(d: &Digest, readings: &[NodeReading]) -> String {
         }
     }
 
-    let _ = writeln!(o, "\nE. CRAWLERS  (reported every run, even a quiet one)");
+    let _ = writeln!(
+        o,
+        "\nE. CRAWLERS  (reported every run, even a quiet one; a user agent is a claim)"
+    );
     let mut any = false;
+    // One lookup per distinct address per run, not per sighting. The same
+    // address commonly appears under one agent on several nodes, and a report
+    // must not multiply its own DNS traffic by the size of the fleet.
+    let mut ptr_cache: std::collections::HashMap<String, m6_core::resolve::Ptr> =
+        std::collections::HashMap::new();
     for r in readings {
         let Some(t) = &r.traffic else { continue };
         if t.forged_bot_requests > 0 {
@@ -483,6 +491,12 @@ pub fn render(d: &Digest, readings: &[NodeReading]) -> String {
             );
             let _ = writeln!(o, "        UA: {}", c.user_agent);
             let _ = writeln!(o, "        paths: {}", c.paths.join(", "));
+            if !c.first_seen.is_empty() {
+                let _ = writeln!(o, "        seen: {} .. {}", c.first_seen, c.last_seen);
+            }
+            for line in verdict_lines(c, &mut ptr_cache) {
+                let _ = writeln!(o, "        {line}");
+            }
         }
     }
     if !any {
@@ -618,6 +632,84 @@ pub fn render(d: &Digest, readings: &[NodeReading]) -> String {
     }
     let _ = writeln!(o, "{bar}");
     o
+}
+
+/// Whether each address behind a sighting supports the agent's claim.
+///
+/// One line per address, because a sighting with three addresses where two
+/// verify and one does not is a different thing from three that all verify,
+/// and a single summary verdict would hide which.
+///
+/// **The expectation comes from the operator's documented method, never from
+/// the agent's own URL.** An earlier version of this compared the lookup
+/// against the domain in the user agent and marked genuine Googlebot, bingbot
+/// and Amazonbot as forgeries, because none of the three publishes PTR records
+/// under the domain its agent string advertises. See the note above
+/// `telemetry::KNOWN_CRAWLERS`.
+///
+/// Every outcome is kept distinct. Only a name that resolves under nothing the
+/// operator documents is called a mismatch. "No PTR record" may be an honest
+/// crawler behind a provider that publishes none; "checked against published
+/// ranges" means this method cannot settle it at all; "no published method"
+/// means we have no expectation to judge against. Reporting any of those as a
+/// forgery would be a confident answer nobody measured, and reporting any as a
+/// pass is the failure this section exists to stop.
+fn verdict_lines(
+    c: &m6_core::monitoring::CrawlerReport,
+    cache: &mut std::collections::HashMap<String, m6_core::resolve::Ptr>,
+) -> Vec<String> {
+    use m6_core::resolve::reverse_default;
+    use m6_core::telemetry::{verify_crawler, CrawlerVerdict};
+
+    let mut out = Vec::new();
+    for ip in c.client_ips.iter().take(3) {
+        let ptr = cache
+            .entry(ip.clone())
+            .or_insert_with(|| reverse_default(ip))
+            .clone();
+        let line = match verify_crawler(&c.user_agent, &ptr) {
+            CrawlerVerdict::Verified { name, resolved } => {
+                format!("{ip} -> {resolved}  VERIFIED as {name}")
+            }
+            CrawlerVerdict::Mismatch {
+                name,
+                resolved,
+                expected,
+            } => format!(
+                "{ip} -> {resolved}  MISMATCH: claims {name}, which resolves under {}",
+                expected.join(" or ")
+            ),
+            CrawlerVerdict::NotCheckableByPtr {
+                name,
+                how,
+                resolved,
+            } => {
+                let seen = resolved
+                    .map(|r| format!(" -> {r}"))
+                    .unwrap_or_else(|| " -> no PTR record".into());
+                format!("{ip}{seen}  UNVERIFIED: {name} is checked against {how}")
+            }
+            CrawlerVerdict::Unrecognised { resolved } => match resolved {
+                Some(r) => format!("{ip} -> {r}  no published method for this agent"),
+                None => format!("{ip} -> no PTR record  no published method for this agent"),
+            },
+            CrawlerVerdict::NoPtr { name } => match name {
+                Some(n) => format!("{ip} -> no PTR record  UNVERIFIED, claims {n}"),
+                None => format!("{ip} -> no PTR record  UNVERIFIED"),
+            },
+            CrawlerVerdict::LookupFailed { .. } => {
+                format!("{ip} -> lookup failed  UNVERIFIED")
+            }
+        };
+        out.push(line);
+    }
+    if c.client_ips.len() > 3 {
+        out.push(format!(
+            "(+{} more address(es) not checked)",
+            c.client_ips.len() - 3
+        ));
+    }
+    out
 }
 
 fn fmt_dur(secs: u64) -> String {
@@ -871,6 +963,195 @@ mod tests {
         );
         assert!(out.contains("E. CRAWLERS"));
         assert!(out.contains("no genuine crawler traffic in the window"));
+    }
+
+    // ── Crawler verification, issue #205 ─────────────────────────────────────
+
+    fn crawler(ua: &str, ips: &[&str]) -> m6_core::monitoring::CrawlerReport {
+        m6_core::monitoring::CrawlerReport {
+            user_agent: ua.into(),
+            requests: 3,
+            client_ips: ips.iter().map(|s| s.to_string()).collect(),
+            paths: vec!["/robots.txt".into()],
+            first_seen: "2026-10-01T09:00:00Z".into(),
+            last_seen: "2026-10-01T09:05:00Z".into(),
+            claimed_domain: m6_core::telemetry::claimed_domain(ua).unwrap_or_default(),
+        }
+    }
+
+    /// THE REGRESSION THIS CLOSES, and it is the whole reason the table exists.
+    ///
+    /// These three user agents and these three PTR names are what real traffic
+    /// produced. Every one of them advertises a documentation domain that is
+    /// NOT where its operator publishes PTR records, so comparing the lookup
+    /// against the agent's own URL marks all three as forgeries. A verifier
+    /// that accuses the genuine ones gets ignored, and then so does a true
+    /// finding.
+    ///
+    /// The cache is pre-populated, so none of this touches a resolver.
+    #[test]
+    fn genuine_crawlers_whose_ptr_differs_from_their_url_are_not_called_forgeries() {
+        use m6_core::resolve::Ptr;
+        let cases = [
+            (
+                "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; Amazonbot/0.1; +https://developer.amazon.com/support/amazonbot) Chrome/119.0",
+                "18-211-148-239.crawl.amazonbot.amazon",
+                "Amazonbot",
+            ),
+            (
+                "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm) Chrome/116.0",
+                "msnbot-52-167-144-179.search.msn.com",
+                "bingbot",
+            ),
+            (
+                "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+                "crawl-66-249-66-1.googlebot.com",
+                "Googlebot",
+            ),
+        ];
+        for (ua, ptr, name) in cases {
+            let mut cache = std::collections::HashMap::new();
+            cache.insert("192.0.2.1".to_string(), Ptr::Name(ptr.into()));
+            let out = verdict_lines(&crawler(ua, &["192.0.2.1"]), &mut cache);
+            assert!(
+                out[0].contains("VERIFIED") && out[0].contains(name),
+                "{name} must verify against {ptr}, got {out:?}"
+            );
+            assert!(!out[0].contains("MISMATCH"), "{name}: {out:?}");
+        }
+    }
+
+    /// An operator that publishes address ranges instead of PTR records cannot
+    /// be settled this way, and that is a third answer. Both of today's
+    /// unverified sightings are this case, not a forgery and not a pass.
+    #[test]
+    fn an_operator_publishing_ranges_is_reported_as_uncheckable_not_forged() {
+        use m6_core::resolve::Ptr;
+        let mut cache = std::collections::HashMap::new();
+        cache.insert("192.0.2.1".to_string(), Ptr::None);
+        for ua in [
+            "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; ClaudeBot/1.0; +claudebot@anthropic.com)",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36; compatible; OAI-SearchBot/1.0; +https://openai.com/searchbot",
+        ] {
+            let out = verdict_lines(&crawler(ua, &["192.0.2.1"]), &mut cache);
+            assert!(out[0].contains("UNVERIFIED"), "{out:?}");
+            assert!(out[0].contains("published address ranges"), "{out:?}");
+            assert!(!out[0].contains("MISMATCH"), "{out:?}");
+        }
+    }
+
+    /// A forgery still has to be called one. An address claiming a crawler
+    /// whose operator documents PTR records, resolving somewhere else, is the
+    /// one case this can call false, and it says what the address actually is.
+    #[test]
+    fn a_real_forgery_is_still_called_a_mismatch() {
+        use m6_core::resolve::Ptr;
+        let mut cache = std::collections::HashMap::new();
+        cache.insert(
+            "192.0.2.9".to_string(),
+            Ptr::Name("vps-1234.cheap-hosting.example".into()),
+        );
+        let out = verdict_lines(
+            &crawler(
+                "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+                &["192.0.2.9"],
+            ),
+            &mut cache,
+        );
+        assert!(out[0].contains("MISMATCH"), "{out:?}");
+        assert!(out[0].contains("vps-1234.cheap-hosting.example"), "{out:?}");
+        assert!(
+            out[0].contains("googlebot.com"),
+            "expected domains named: {out:?}"
+        );
+    }
+
+    /// An agent in no table gets its lookup reported and no verdict, because
+    /// there is no published expectation to judge it against. Inventing one is
+    /// what produced the regression above.
+    #[test]
+    fn an_unrecognised_agent_gets_no_verdict() {
+        use m6_core::resolve::Ptr;
+        let mut cache = std::collections::HashMap::new();
+        cache.insert(
+            "192.0.2.1".to_string(),
+            Ptr::Name("host.example.net".into()),
+        );
+        let out = verdict_lines(
+            &crawler(
+                "Mozilla/5.0 (compatible; NeverHeardOfItBot/1.0)",
+                &["192.0.2.1"],
+            ),
+            &mut cache,
+        );
+        assert!(out[0].contains("no published method"), "{out:?}");
+        assert!(!out[0].contains("MISMATCH"), "{out:?}");
+        assert!(!out[0].contains("VERIFIED"), "{out:?}");
+    }
+
+    /// No PTR for a PTR-documented crawler is unverified and names the claim.
+    #[test]
+    fn a_missing_ptr_for_a_ptr_documented_crawler_is_unverified() {
+        use m6_core::resolve::Ptr;
+        let mut cache = std::collections::HashMap::new();
+        cache.insert("192.0.2.1".to_string(), Ptr::None);
+        cache.insert("192.0.2.2".to_string(), Ptr::Failed);
+        let ua = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
+        let out = verdict_lines(&crawler(ua, &["192.0.2.1"]), &mut cache);
+        assert!(
+            out[0].contains("no PTR record") && out[0].contains("UNVERIFIED"),
+            "{out:?}"
+        );
+        assert!(out[0].contains("Googlebot"), "{out:?}");
+        let out = verdict_lines(&crawler(ua, &["192.0.2.2"]), &mut cache);
+        assert!(
+            out[0].contains("lookup failed") && out[0].contains("UNVERIFIED"),
+            "{out:?}"
+        );
+        assert!(!out[0].contains("MISMATCH"), "{out:?}");
+    }
+
+    /// Every address gets its own line, because two verifying and one not is
+    /// a different fact from three verifying.
+    #[test]
+    fn each_address_is_reported_separately_and_the_rest_are_counted() {
+        use m6_core::resolve::Ptr;
+        let ua = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
+        let mut cache = std::collections::HashMap::new();
+        for ip in ["192.0.2.1", "192.0.2.3", "192.0.2.4"] {
+            cache.insert(ip.to_string(), Ptr::Name("crawl.googlebot.com".into()));
+        }
+        cache.insert("192.0.2.2".to_string(), Ptr::None);
+
+        let c = crawler(ua, &["192.0.2.1", "192.0.2.2", "192.0.2.3", "192.0.2.4"]);
+        let out = verdict_lines(&c, &mut cache);
+        assert_eq!(out.len(), 4, "three addresses plus the count: {out:?}");
+        assert!(out[0].contains("VERIFIED"), "{out:?}");
+        assert!(out[1].contains("UNVERIFIED"), "{out:?}");
+        assert!(out[3].contains("+1 more"), "{out:?}");
+    }
+
+    /// Section E carries the window and the verdict, and still appears on a
+    /// quiet run.
+    #[test]
+    fn the_crawler_section_carries_times_and_a_verdict() {
+        let mut r = reading("origin", None);
+        let mut t = traffic(LoggingHealth {
+            events_total: 1,
+            seconds_since_last: Some(1),
+        });
+        t.crawlers = vec![crawler(
+            "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+            &["192.0.2.1"],
+        )];
+        r.traffic = Some(t);
+        let out = render(&digest(), &[r]);
+        assert!(out.contains("a user agent is a claim"), "{out}");
+        assert!(
+            out.contains("seen: 2026-10-01T09:00:00Z .. 2026-10-01T09:05:00Z"),
+            "{out}"
+        );
+        assert!(out.contains("192.0.2.1 ->"), "{out}");
     }
 }
 
