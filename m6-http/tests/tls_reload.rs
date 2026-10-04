@@ -222,6 +222,10 @@ struct Server {
     port: u16,
     token: String,
     site: std::path::PathBuf,
+    layout: Layout,
+    /// Which archive generation the lineage is on, so a renewal writes the next
+    /// one rather than overwriting the file the link already points at.
+    generation: std::cell::Cell<u32>,
     proc: Service,
     _dir: tempfile::TempDir,
     _claim: PortClaim,
@@ -238,8 +242,9 @@ impl Server {
     /// succeeds. Ordering the writes this way exercises that sequence rather
     /// than hiding it.
     fn install(&self, cert: &Cert) {
-        std::fs::write(self.site.join("key.pem"), &cert.key_pem).expect("write key");
-        std::fs::write(self.site.join("cert.pem"), &cert.cert_pem).expect("write cert");
+        let gen = self.generation.get() + 1;
+        self.generation.set(gen);
+        write_material(&self.site, cert, self.layout, gen);
     }
 
     /// `notAfter` as `/perf` reports it, for the leaf.
@@ -305,12 +310,28 @@ impl Server {
 }
 
 /// Start m6-http serving `first`, with `/perf` reachable.
+/// Where the server's configured certificate path actually points.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Layout {
+    /// `cert.pem` and `key.pem`, written in place. The simplest shape, and the
+    /// only one the first version of this file tested.
+    Flat,
+    /// `live/<name>/fullchain.pem` as a SYMLINK into `archive/`, which is the
+    /// layout `docs/m6-site-toml.md` prescribes and the one certbot produces. A
+    /// renewal writes a new archive file and repoints the link, so the inode
+    /// behind the configured path changes and is never written through.
+    CertbotLineage,
+}
+
 fn start(first: &Cert) -> Server {
+    start_with(first, Layout::Flat)
+}
+
+fn start_with(first: &Cert, layout: Layout) -> Server {
     let dir = tempfile::tempdir().expect("tempdir");
     let site = dir.path().to_path_buf();
 
-    std::fs::write(site.join("cert.pem"), &first.cert_pem).expect("cert");
-    std::fs::write(site.join("key.pem"), &first.key_pem).expect("key");
+    let (cert_path, key_path) = write_material(&site, first, layout, 1);
     let token = "tls-reload-test-token".to_string();
     let token_file = site.join("perf-token");
     std::fs::write(&token_file, &token).expect("token file");
@@ -337,8 +358,8 @@ fn start(first: &Cert) -> Server {
         format!(
             "[server]\nbind = \"127.0.0.1:{port}\"\ntls_cert = \"{cert}\"\ntls_key = \"{key}\"\n\n\
              [node]\nname = \"tls-reload\"\n",
-            cert = site.join("cert.pem").display(),
-            key = site.join("key.pem").display(),
+            cert = cert_path.display(),
+            key = key_path.display(),
         ),
     )
     .expect("system.toml");
@@ -355,9 +376,60 @@ fn start(first: &Cert) -> Server {
         port,
         token,
         site,
+        layout,
+        generation: std::cell::Cell::new(1),
         proc,
         _dir: dir,
         _claim: claim,
+    }
+}
+
+/// Put `cert` on disk in `layout`, and return the paths the server is configured
+/// with.
+///
+/// For a lineage, `generation` names the archive file, and the symlink is
+/// replaced by `rename` rather than removed and recreated. That is what certbot
+/// does and it matters: a remove-then-create leaves a window with no
+/// certificate at all, and `rename` is atomic, so a reader either sees the old
+/// target or the new one.
+fn write_material(
+    site: &std::path::Path,
+    cert: &Cert,
+    layout: Layout,
+    generation: u32,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    match layout {
+        Layout::Flat => {
+            let c = site.join("cert.pem");
+            let k = site.join("key.pem");
+            std::fs::write(site.join("key.pem"), &cert.key_pem).expect("write key");
+            std::fs::write(&c, &cert.cert_pem).expect("write cert");
+            (c, k)
+        }
+        Layout::CertbotLineage => {
+            let archive = site.join("archive/node");
+            let live = site.join("live/node");
+            std::fs::create_dir_all(&archive).expect("archive dir");
+            std::fs::create_dir_all(&live).expect("live dir");
+
+            let ac = archive.join(format!("fullchain{generation}.pem"));
+            let ak = archive.join(format!("privkey{generation}.pem"));
+            std::fs::write(&ac, &cert.cert_pem).expect("write archive cert");
+            std::fs::write(&ak, &cert.key_pem).expect("write archive key");
+
+            let lc = live.join("fullchain.pem");
+            let lk = live.join("privkey.pem");
+            for (link, target) in [(&lc, &ac), (&lk, &ak)] {
+                // Written beside the link and renamed over it, because
+                // `symlink` fails on an existing path and removing it first
+                // would leave a gap where the server has no certificate.
+                let tmp = link.with_extension("pem.new");
+                let _ = std::fs::remove_file(&tmp);
+                std::os::unix::fs::symlink(target, &tmp).expect("symlink");
+                std::fs::rename(&tmp, link).expect("rename symlink into place");
+            }
+            (lc, lk)
+        }
     }
 }
 
@@ -462,5 +534,78 @@ fn a_reload_moves_http1_http2_and_http3_to_the_new_certificate() {
         status.success(),
         "m6-http should still stop cleanly after a reload, got {status}\n--- output ---\n{}",
         srv.proc.output()
+    );
+}
+
+/// A renewal that repoints a symlink reaches every protocol too.
+///
+/// This is the shape `docs/m6-site-toml.md` prescribes and the one certbot
+/// produces: the configured path is `live/<name>/fullchain.pem`, a symlink into
+/// `archive/`, and a renewal writes a new archive file and moves the link. The
+/// file behind the configured path is never written through.
+///
+/// The first version of the kqueue fix watched the certificate PATH with
+/// `open(O_EVTONLY)`, which resolves the symlink and then holds the inode it
+/// landed on. It saw an in-place overwrite, which is what the test above does,
+/// and saw nothing at all when the link moved. So the fix passed its own test
+/// and missed the only renewal this project performs, which is the kind of gap
+/// a test written from the same assumption as the code cannot find.
+#[test]
+fn a_renewal_that_repoints_a_symlink_also_reaches_every_protocol() {
+    let first = cert_expiring_in(2030);
+    let second = cert_expiring_in(2035);
+    assert_ne!(first.not_after, second.not_after);
+
+    let mut srv = start_with(&first, Layout::CertbotLineage);
+    let h1_tls = || client_trusting_both(&first, &second, &[b"http/1.1"]);
+    let h2_tls = || client_trusting_both(&first, &second, &[b"h2"]);
+
+    // The configured path is a symlink, and the server resolved it at startup.
+    assert!(
+        srv.site.join("live/node/fullchain.pem").is_symlink(),
+        "the test is only meaningful if the configured path really is a link"
+    );
+    assert_eq!(
+        h1_leaf(srv.port, h1_tls()).expect("h1 before the renewal"),
+        first.der
+    );
+
+    // Renew: a new archive generation, and the link moved onto it.
+    srv.install(&second);
+    assert!(
+        std::fs::read_link(srv.site.join("live/node/fullchain.pem"))
+            .expect("still a link")
+            .ends_with("fullchain2.pem"),
+        "the renewal must have repointed the link, not written through it"
+    );
+
+    let reloaded = m6_core::testkit::wait::until(Duration::from_secs(30), || {
+        h1_leaf(srv.port, h1_tls()).as_deref() == Ok(second.der.as_slice())
+    });
+    srv.proc.assert_alive("after the lineage was renewed");
+    assert!(
+        reloaded,
+        "HTTP/1.1 never picked up a certificate installed by repointing the \
+         symlink. The watch resolves the link and holds the inode behind it, so \
+         it needs the certificate's PARENT DIRECTORY watched to see the link \
+         move.\n--- server output ---\n{}",
+        srv.proc.output()
+    );
+
+    for (proto, got) in [
+        ("HTTP/1.1", h1_leaf(srv.port, h1_tls()).expect("h1")),
+        ("HTTP/2", h2_leaf(srv.port, h2_tls()).expect("h2")),
+        ("HTTP/3", h3_leaf(srv.port).expect("h3")),
+    ] {
+        assert_eq!(
+            got, second.der,
+            "{proto} is serving the pre-renewal certificate after the link moved"
+        );
+    }
+
+    let status = srv.proc.terminate(Duration::from_secs(10));
+    assert!(
+        status.success(),
+        "clean stop after a lineage renewal, got {status}"
     );
 }

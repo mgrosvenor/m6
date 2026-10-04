@@ -27,6 +27,31 @@ pub enum FsEventKind {
     TlsCertChanged,
 }
 
+/// Which event a watched path produces when its fingerprint moves.
+///
+/// Only meaningful on the kqueue branch, where the wake carries no filename and
+/// the path has to say for itself what it is.
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchKind {
+    SiteToml,
+    TlsMaterial,
+}
+
+/// One watched path, and what it looked like when it was last examined.
+///
+/// A struct rather than a tuple because clippy refused the tuple as too
+/// complex, and it was right: `(WatchKind, PathBuf, Option<(SystemTime, u64)>)`
+/// says nothing at a call site about which half is the fingerprint.
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
+struct Watched {
+    kind: WatchKind,
+    path: PathBuf,
+    /// `None` when the path could not be read, which covers absent and
+    /// unreadable alike. Both mean nothing can be said about the contents.
+    seen: Option<(std::time::SystemTime, u64)>,
+}
+
 #[derive(Debug, Clone)]
 pub struct FsEvent {
     pub path: PathBuf,
@@ -61,16 +86,23 @@ struct FsWatcherInner {
     pipe_write: RawFd,
     /// Background thread kept alive for process lifetime.
     _thread: std::thread::JoinHandle<()>,
-    /// The certificate and key, and when each was last seen to change.
+    /// The certificate, the key and `site.toml`, each with what it last looked
+    /// like.
     ///
-    /// The kqueue wake carries no filename, so this branch cannot tell a
-    /// certificate write from a content write the way the inotify branch can.
-    /// It compares modification times instead, which is the smallest thing
-    /// that distinguishes them. Without it this platform emitted
-    /// `SiteTomlChanged` alone and a certificate change reached the server
-    /// never: a renewal on a BSD node was invisible until the process
-    /// restarted. m6 #210.
-    tls_watch: Vec<(PathBuf, Option<std::time::SystemTime>)>,
+    /// The kqueue wake carries no filename, so this branch cannot tell which
+    /// file moved the way the inotify branch can. It compares fingerprints
+    /// instead, which is the smallest thing that distinguishes them. Without it
+    /// this platform emitted `SiteTomlChanged` alone and a certificate change
+    /// reached the server never: a renewal on a BSD node was invisible until
+    /// the process restarted. m6 #210.
+    ///
+    /// `site.toml` is in here for the opposite reason. The branch used to emit
+    /// `SiteTomlChanged` on EVERY wake, and `handle_site_reload` rebuilds the
+    /// route table, the pools and the invalidation map and then calls
+    /// `cache.clear()`. So once the certificate was watched, a renewal also
+    /// emptied the response cache, once per file written. Keying on the file's
+    /// own fingerprint is what the inotify branch already does, by filename.
+    watch: Vec<Watched>,
 }
 
 // No-op fallback
@@ -172,22 +204,57 @@ impl FsWatcher {
 
             // Recorded before the thread starts, so the first wake compares
             // against the state the server loaded from.
-            let tls_watch: Vec<(PathBuf, Option<std::time::SystemTime>)> = [
+            let mut watch: Vec<Watched> = Vec::new();
+            let site_toml = site_dir.join("site.toml");
+            watch.push(Watched {
+                kind: WatchKind::SiteToml,
+                seen: file_fingerprint(&site_toml),
+                path: site_toml,
+            });
+            for p in [
                 config.server.tls_cert.as_ref(),
                 config.server.tls_key.as_ref(),
             ]
             .into_iter()
             .flatten()
-            .map(|p| {
+            {
                 let path = PathBuf::from(p);
-                (path.clone(), mtime_of(&path))
-            })
-            .collect();
+                watch.push(Watched {
+                    kind: WatchKind::TlsMaterial,
+                    seen: file_fingerprint(&path),
+                    path,
+                });
+            }
 
-            let watch_files: Vec<PathBuf> = tls_watch.iter().map(|(p, _)| p.clone()).collect();
+            // ── The DIRECTORIES, not just the files ─────────────────────────
+            //
+            // An `open(O_EVTONLY)` watch follows a symlink and then holds the
+            // inode it resolved to, so it sees a write THROUGH the link and
+            // never sees the link being repointed. A certbot lineage is exactly
+            // that shape: `live/<name>/fullchain.pem` is a symlink into
+            // `archive/`, and a renewal writes a new archive file and moves the
+            // link. `docs/m6-site-toml.md` prescribes that path.
+            //
+            // So the file watch alone covered an in-place overwrite of one inode
+            // and missed the renewal this project actually performs. The
+            // directory watch fires on the link being replaced, because that
+            // changes a directory entry, and the fingerprint comparison then
+            // resolves the link afresh and sees the new target. The inotify
+            // branch has watched each certificate's parent directory from the
+            // start, for the same reason.
+            let mut dirs: Vec<PathBuf> = vec![site_dir.clone()];
+            for w in &watch {
+                if let Some(parent) = w.path.parent() {
+                    let parent = parent.to_path_buf();
+                    if !dirs.contains(&parent) {
+                        dirs.push(parent);
+                    }
+                }
+            }
+            let watch_files: Vec<PathBuf> = watch.iter().map(|w| w.path.clone()).collect();
             let thread = std::thread::Builder::new()
                 .name("m6-kqueue-watcher".into())
-                .spawn(move || kqueue_watch_site_dir(site_dir, watch_files, pipe_write))
+                .spawn(move || kqueue_watch_paths(dirs, watch_files, pipe_write))
                 .map_err(|e| anyhow::anyhow!("spawn kqueue watcher: {e}"))?;
 
             Ok(FsWatcher {
@@ -195,7 +262,7 @@ impl FsWatcher {
                     pipe_read,
                     pipe_write,
                     _thread: thread,
-                    tls_watch,
+                    watch,
                 },
             })
         }
@@ -314,29 +381,21 @@ impl FsWatcher {
         }
 
         // ── macOS / FreeBSD / OpenBSD ──────────────────────────────────────────
-        // The kqueue thread signals us via the pipe whenever any write/delete/create
-        // event fires on the site directory, on site.toml, or on the certificate
-        // and key. We drain the pipe and emit a SiteTomlChanged event on EVERY
-        // wake, because the wake does not say which file it came from. The cost
-        // is that a certificate write re-reads site.toml and clears the response
-        // cache as well: `handle_site_reload` rebuilds unconditionally and does
-        // not compare the config it read with the one it holds.
         //
-        // A TLS event is emitted too, but only when the certificate or key has
-        // actually been written, because the wake carries no filename and a
-        // content deploy writes into the same directory. Without the mtime
-        // comparison every write would rebuild the TLS configuration; without
-        // the event at all, which is how this branch read until m6 #210, a
-        // renewal reached the server on no BSD platform.
+        // The kqueue thread writes a byte whenever anything fires on the site
+        // directory, on a certificate's parent directory, or on one of the
+        // watched files. The wake carries NO filename, so this branch cannot do
+        // what the inotify branch does and key on one. It compares each watched
+        // path's fingerprint against what that path looked like last time, and
+        // emits an event only for the paths that moved.
         //
-        // The wake itself comes from a watch on the certificate and the key
-        // themselves, so a path outside the site directory is seen. What this
-        // does not cover is a path whose INODE is replaced: the watch holds the
-        // inode it was opened on, and `open(O_EVTONLY)` resolves symlinks, so a
-        // lineage shaped `live/<name>/cert.pem -> archive/<name>/cert3.pem`
-        // gets no wake when the link is repointed. The inotify branch covers
-        // that because it watches the parent directory. `kqueue_watch_site_dir`
-        // says the same where the watch is registered.
+        // That is a change from emitting `SiteTomlChanged` on every wake. Doing
+        // so was harmless while nothing else was watched, and stopped being
+        // harmless the moment the certificate was: `handle_site_reload`
+        // rebuilds the route table, the pools and the invalidation map and then
+        // calls `cache.clear()`, so a renewal emptied the response cache once
+        // per file it wrote. Keying on the file is what the inotify branch has
+        // always done.
         #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
         {
             let mut buf = [0u8; 64];
@@ -353,26 +412,37 @@ impl FsWatcher {
                 }
             }
 
-            let mut result = vec![FsEvent {
-                path: PathBuf::from("site.toml"),
-                kind: FsEventKind::SiteTomlChanged,
-            }];
-            // One event however many of the two files moved. A renewal writes
-            // both, and two events would mean two rebuilds of one configuration
-            // where the second can only agree with the first.
-            let mut changed: Option<PathBuf> = None;
-            for (path, seen) in self.inner.tls_watch.iter_mut() {
-                let now = mtime_of(path);
+            let mut site_changed = false;
+            // One TLS event however many of the two files moved. A renewal
+            // writes both, and two events would mean two rebuilds of one
+            // configuration where the second can only agree with the first.
+            let mut tls_changed: Option<PathBuf> = None;
+            for w in self.inner.watch.iter_mut() {
+                let now = file_fingerprint(&w.path);
                 // `None` to `None` is a file that is still absent, which is not
                 // a change. Every other transition is, a file appearing and a
                 // file vanishing included: a certificate replaced by a rename
                 // passes through both.
-                if now != *seen {
-                    *seen = now;
-                    changed = changed.or_else(|| Some(path.clone()));
+                if now == w.seen {
+                    continue;
+                }
+                w.seen = now;
+                match w.kind {
+                    WatchKind::SiteToml => site_changed = true,
+                    WatchKind::TlsMaterial => {
+                        tls_changed = tls_changed.take().or_else(|| Some(w.path.clone()))
+                    }
                 }
             }
-            if let Some(path) = changed {
+
+            let mut result = Vec::new();
+            if site_changed {
+                result.push(FsEvent {
+                    path: PathBuf::from("site.toml"),
+                    kind: FsEventKind::SiteTomlChanged,
+                });
+            }
+            if let Some(path) = tls_changed {
                 result.push(FsEvent {
                     path,
                     kind: FsEventKind::TlsCertChanged,
@@ -404,15 +474,32 @@ impl Drop for FsWatcher {
     }
 }
 
-/// A file's modification time, or `None` when it cannot be read.
+/// What a file looked like, as modification time AND size.
 ///
-/// An unreadable file and a missing one are one answer on purpose. The caller
-/// compares this value with the previous one to decide whether a certificate
-/// moved, and both causes answer that question the same way: nothing can be
-/// said about the contents, so a later successful read is a change.
+/// `None` when it cannot be read. An unreadable file and a missing one are one
+/// answer on purpose: the caller compares this value with the previous one to
+/// decide whether a certificate moved, and both causes answer that question the
+/// same way, so a later successful read is a change.
+///
+/// ── The SIZE is what makes a failed reload retry ────────────────────────────
+///
+/// With the time alone, `cp new.pem cert.pem` is missed. `cp` truncates and
+/// then writes, so the first wake sees an EMPTY file with the new time, the
+/// reload fails on it, and the stored time has already advanced. The content
+/// write that follows lands in the same timestamp tick wherever the filesystem
+/// has one-second granularity, which HFS+ does, so nothing differs and no
+/// further event is emitted. The old certificate is then served until the
+/// process restarts.
+///
+/// Size changes between those two observations even when the time does not, so
+/// the pair detects the second write and the reload runs again. It does not
+/// make every failed reload retry -- a write that lands identical bytes at an
+/// identical time is still one observation -- and that case cannot be a
+/// renewal.
 #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
-fn mtime_of(path: &std::path::Path) -> Option<std::time::SystemTime> {
-    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+fn file_fingerprint(path: &std::path::Path) -> Option<(std::time::SystemTime, u64)> {
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.modified().ok()?, m.len()))
 }
 
 // ── macOS/BSD kqueue watcher thread ──────────────────────────────────────────
@@ -437,36 +524,49 @@ fn mtime_of(path: &std::path::Path) -> Option<std::time::SystemTime> {
 /// certificate's parent directory, as the inotify branch does, is what would
 /// cover it.
 #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
-fn kqueue_watch_site_dir(site_dir: PathBuf, files: Vec<PathBuf>, pipe_write: RawFd) {
+fn kqueue_watch_paths(dirs: Vec<PathBuf>, files: Vec<PathBuf>, pipe_write: RawFd) {
     let kq = unsafe { libc::kqueue() };
     if kq < 0 {
         return;
     }
 
-    let dir_cstr = match std::ffi::CString::new(site_dir.as_os_str().as_encoded_bytes()) {
-        Ok(s) => s,
-        Err(_) => {
-            unsafe { libc::close(kq) };
-            return;
+    // ── Every directory, then every file ────────────────────────────────────
+    //
+    // The directories are the site directory plus each watched file's parent.
+    // A directory watch is what sees a NAME change: a rename over a path, and a
+    // certbot lineage repointing `live/<name>/cert.pem` at a new file in
+    // `archive/`. A file watch cannot, because `open(O_EVTONLY)` resolves the
+    // symlink and then holds the inode it landed on.
+    //
+    // The fds are deliberately never closed. This thread runs for the life of
+    // the process and a watch ends when its fd does, so there is one fd per
+    // watched path and no more.
+    let mut registered = 0usize;
+    for dir in &dirs {
+        let Ok(cstr) = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()) else {
+            continue;
+        };
+        let dir_fd = unsafe { libc::open(cstr.as_ptr(), libc::O_EVTONLY) };
+        if dir_fd < 0 {
+            continue;
         }
-    };
-
-    let dir_fd = unsafe { libc::open(dir_cstr.as_ptr(), libc::O_EVTONLY) };
-    if dir_fd < 0 {
+        let ev_dir = libc::kevent {
+            ident: dir_fd as libc::uintptr_t,
+            filter: libc::EVFILT_VNODE,
+            flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_CLEAR,
+            fflags: libc::NOTE_WRITE | libc::NOTE_EXTEND | libc::NOTE_ATTRIB | libc::NOTE_LINK,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        };
+        unsafe { libc::kevent(kq, &ev_dir, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
+        registered += 1;
+    }
+    // Not one directory opening is a watcher that wakes for nothing, which
+    // reads from outside as a fleet whose configuration never reloads.
+    if registered == 0 {
         unsafe { libc::close(kq) };
         return;
     }
-
-    // Watch the site directory for file creation/deletion.
-    let ev_dir = libc::kevent {
-        ident: dir_fd as libc::uintptr_t,
-        filter: libc::EVFILT_VNODE,
-        flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_CLEAR,
-        fflags: libc::NOTE_WRITE | libc::NOTE_EXTEND | libc::NOTE_ATTRIB | libc::NOTE_LINK,
-        data: 0,
-        udata: std::ptr::null_mut(),
-    };
-    unsafe { libc::kevent(kq, &ev_dir, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
 
     // Also watch each file directly: NOTE_ATTRIB fires on `touch`, NOTE_WRITE
     // fires on content writes, NOTE_RENAME/DELETE fires on atomic overwrites.
@@ -474,7 +574,10 @@ fn kqueue_watch_site_dir(site_dir: PathBuf, files: Vec<PathBuf>, pipe_write: Raw
     // The fds are deliberately not closed. This thread runs for the life of the
     // process and a watch ends when its fd does, so there is one fd per watched
     // file and no more: site.toml, the certificate and the key.
-    for path in std::iter::once(site_dir.join("site.toml")).chain(files) {
+    // `files` already carries site.toml, the certificate and the key: `new()`
+    // builds the list the fingerprint comparison reads, and this watches
+    // exactly that, so the two cannot drift apart.
+    for path in files {
         let Ok(cstr) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else {
             continue;
         };
