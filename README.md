@@ -448,11 +448,10 @@ public_key = "/run/m6/auth.pub"
 ## Process Management
 
 Each process is started and supervised on its own by the service manager,
-systemd on the production target. Start them in any order. m6-http watches
-`/run/m6/` with inotify, so a backend joins its pool when the socket appears
-and leaves when it goes, whether that is a first start, a restart, or a new
-instance added for scale. None of that needs a config change or a restart of
-m6-http.
+systemd on the production target. Start them in any order: m6-http takes a
+backend into its pool when the socket appears and drops it when the socket
+goes, whether that is a first start, a restart, or a new instance added for
+scale. None of that needs a config change or a restart of m6-http.
 
 ```bash
 # Development (shell script, see m6-examples/m6-run-eg)
@@ -463,7 +462,7 @@ m6-http         $SITE_DIR $SITE_TOML &
 wait
 ```
 
-**Scaling:** start additional instances (e.g. `m6-html-2.service`). The socket `/run/m6/m6-html-2.sock` appears; m6-http detects it via inotify and adds it to the pool. No config change needed.
+**Scaling:** start additional instances (e.g. `m6-html-2.service`). The socket `/run/m6/m6-html-2.sock` appears and m6-http adds it to the pool. On Linux it sees the socket at once, from an inotify watch on the directory the backend's `sockets` glob names. On macOS and the BSDs a periodic rescan of the glob picks it up. No config change needed.
 
 **Global deployment:** run m6-http at each edge location. Configure it with a `h2s://` URL backend pointing to the origin. Each edge node caches independently. See [Example 09](docs/m6-user-guide.md#example-09--global-deployment) and the multi-region deployment walkthrough.
 
@@ -528,7 +527,8 @@ Pool empty       →  status per [errors] mode:
 
 - TLS always required; m6-http terminates; internal communication over Unix sockets or TLS URL backends
 - JWT verified on every request against m6-auth's public key, which m6-http
-  holds locally. No request reaches m6-auth, so it is not in the serving path
+  holds locally, so verification costs no network hop to m6-auth. Only login
+  and refresh reach m6-auth-server
 - Path traversal: `..` in any URL path → 404; `..` in a route param → 400
 - Symlink guard: resolves symlinks at request time; symlinks escaping `site_dir` → 404
 - Rate limiting on login: 5 attempts / 15 min / IP
@@ -601,9 +601,9 @@ running server:
   panics and flow-control fixes already made), H2 client behaviour
   (F099–F109), H3 integration (F110–F114), auth extensions (F115–F119)
 - The cache key omits scheme and authority (F044). Not fixed. Safe for the
-  audited configuration, where no response varies by Host and `should_cache`
+  audited configuration, where no response varies by Host. `should_cache`
   refuses to store anything whose `Vary` names a field other than
-  `Accept-Encoding`. Unsafe for multi-tenant use.
+  `Accept-Encoding`, in every configuration. Unsafe for multi-tenant use.
 
 ### The structural question
 
@@ -687,21 +687,23 @@ See issue #93 for the full reasoning and the measurements.
 m6-http is a **single-threaded, in-process-cached, TLS-terminating reverse proxy**.
 The response cache is an `Arc<Bytes>` LRU in the same heap as the TLS stack — a
 cache hit is a hash lookup, a reference-count increment, and an AES-GCM seal.
-A cache held in a separate process, or in shared memory, adds a round trip or a
-lock to that path. This one has neither, and the bytes are never copied.
+A cache held in a separate process, or in shared memory, adds an IPC round trip
+or a lock to that path. This one has neither, and the cached body reaches the
+TLS writer without an intermediate copy.
 
 **Throughput** — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for the measured
 figures, the hardware, and the exact commands. Summary: HTTP/2 is about 3×
 HTTP/1.1 on this hardware, on both latency and throughput.
 
-Figures published here before September 2026 are withdrawn. A second
-throughput table contradicted the one above, 158,323 req/s for HTTP/2 against
-28,797, both claiming identical conditions and neither recording a commit,
-hardware, payload or command line. Both were deleted and re-measured.
+Figures published here before September 2026 are withdrawn. Two throughput
+tables contradicted each other, 158,323 req/s for HTTP/2 against 28,797, both
+claiming identical conditions and neither recording a commit, hardware,
+payload or command line. Both were deleted and re-measured, and the measured
+figure in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) is well under either.
 
 There are no comparisons against nginx, LiteSpeed or H2O. The ones published
-here took their figures from elsewhere, on other hardware with other payloads,
-which does not compare anything.
+here until September 2026 took their figures from elsewhere, on other hardware
+with other payloads, which does not compare anything.
 
 **Two different quantities, both true, easily confused:** a cache hit costs
 **~2.2 µs** inside m6 (its own timer, confirmed against a running server), while an
