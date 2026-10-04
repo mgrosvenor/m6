@@ -232,6 +232,33 @@ impl Http11Listener {
         self.listener.as_raw_fd()
     }
 
+    /// Does this listener terminate TLS at all?
+    ///
+    /// Read before a reload tries to replace the configuration, so a plaintext
+    /// listener is told apart from one whose material is stale.
+    pub fn terminates_tls(&self) -> bool {
+        self.tls_config.is_some()
+    }
+
+    /// Replace the configuration future connections are served under.
+    ///
+    /// Connections already established keep the configuration they handshook
+    /// with, which is the only thing they can do: the keys are in use on a live
+    /// session. So a reload takes effect on the next connection, and a renewal
+    /// reaches a client within one keep-alive.
+    ///
+    /// A plaintext listener is left alone and says so. Turning the `:80`
+    /// listener into a TLS one on a certificate change would take the redirect
+    /// off the air, and a caller reaching here with one has a defect worth
+    /// seeing instead of a silent no-op.
+    pub fn replace_tls_config(&mut self, tls_config: Arc<rustls::ServerConfig>) {
+        if self.tls_config.is_none() {
+            warn!("a plaintext HTTP/1.1 listener was asked to adopt a TLS configuration; ignored");
+            return;
+        }
+        self.tls_config = Some(tls_config);
+    }
+
     pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
         self.listener.local_addr()
     }
@@ -1165,10 +1192,44 @@ fn status_reason(status: u16) -> &'static str {
 
 // ── TLS server config factory ─────────────────────────────────────────────────
 
-pub fn make_tls_server_config(
-    cert_path: &str,
-    key_path: &str,
-) -> anyhow::Result<Arc<rustls::ServerConfig>> {
+/// A TLS server configuration and the certificate chain it was built from.
+///
+/// The chain is held so the expiry registry is written when a configuration is
+/// PUT IN USE, and not when it is merely built. A reload builds the rustls
+/// configuration and the quiche one and either can fail, so recording during
+/// the build reported the new certificate's expiry while every protocol was
+/// still serving the old one. m6 #210.
+pub struct TlsMaterial {
+    pub config: Arc<rustls::ServerConfig>,
+    chain: Vec<rustls_pki_types::CertificateDer<'static>>,
+}
+
+impl TlsMaterial {
+    /// Record this chain's expiry as what the server is now serving.
+    ///
+    /// Called once the configuration is installed, so `/perf` reports the
+    /// material in use. A certificate whose `notAfter` cannot be read is logged
+    /// and left out of the report, never a reason to refuse to serve: rustls
+    /// accepted it or there would be no server at all, so the honest outcome is
+    /// that the monitor says "cannot say" for that one rather than a number
+    /// nobody took.
+    pub fn record(&self, cert_path: &str) {
+        for (depth, e) in m6_core::tls::record_loaded(&self.chain) {
+            warn!(
+                cert = cert_path, depth, error = %e,
+                "could not read the certificate's expiry; it will not be reported"
+            );
+        }
+    }
+}
+
+/// Load a certificate and key into a rustls server configuration.
+///
+/// Records nothing, so a caller that has more than one listener to rebuild can
+/// build them all and record only once every one of them is carrying the new
+/// material. `make_tls_server_config` is this plus the recording, for the
+/// startup path where building and installing are the same step.
+pub fn load_tls_material(cert_path: &str, key_path: &str) -> anyhow::Result<TlsMaterial> {
     // `rustls_pki_types::pem`, not the `rustls-pemfile` crate. That crate is
     // unmaintained (RUSTSEC-2025-0134, archived August 2025) and its own
     // advisory points here: the last release of it was a thin wrapper around
@@ -1191,23 +1252,13 @@ pub fn make_tls_server_config(
     let key = PrivateKeyDer::from_pem_file(key_path)
         .map_err(|e| anyhow::anyhow!("parse key {}: {}", key_path, e))?;
 
-    // Record the chain's expiry before rustls takes ownership of it, so /perf
-    // can report how long the certificate being served has left. Here because
-    // this is the one place that holds the loaded material: reading the file
-    // again at report time would answer about the path, and a renewal that
-    // wrote a new certificate without a reload is exactly the case where the
-    // path and the running server disagree. Issue #176.
-    //
-    // A certificate whose notAfter cannot be read is logged and left out of
-    // the report, never a reason to refuse to serve. rustls accepted it below
-    // or there would be no server at all, so the honest outcome is that the
-    // monitor says "cannot say" for that one rather than a number nobody took.
-    for (depth, e) in m6_core::tls::record_loaded(&certs) {
-        warn!(
-            cert = cert_path, depth, error = %e,
-            "could not read the certificate's expiry; it will not be reported"
-        );
-    }
+    // The chain is kept alongside the configuration so its expiry can be
+    // recorded once the configuration is installed, which is what `/perf` must
+    // report: reading the file again at report time would answer about the
+    // path, and a renewal that wrote a new certificate without a reload is
+    // exactly the case where the path and the running server disagree. Issue
+    // #176, and #210 for why the recording moved out of this function.
+    let chain = certs.clone();
 
     let mut config = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -1279,7 +1330,23 @@ pub fn make_tls_server_config(
     // up front. 4096 entries is roughly 350KB per config bought for a path that
     // does not carry anyone who matters, on an origin with 950MB.
 
-    Ok(Arc::new(config))
+    Ok(TlsMaterial {
+        config: Arc::new(config),
+        chain,
+    })
+}
+
+/// Load a certificate and key, and record what was loaded.
+///
+/// The startup path and the tests, where there is one listener and building it
+/// is installing it.
+pub fn make_tls_server_config(
+    cert_path: &str,
+    key_path: &str,
+) -> anyhow::Result<Arc<rustls::ServerConfig>> {
+    let material = load_tls_material(cert_path, key_path)?;
+    material.record(cert_path);
+    Ok(material.config)
 }
 
 #[cfg(test)]
