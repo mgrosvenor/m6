@@ -139,6 +139,17 @@ pub struct NodeDigest {
     /// time": a node silent about its expiry is the exact case this check must
     /// not call healthy, for the reason `version` and `hash` give above.
     pub cert_expires_in_seconds: Option<i64>,
+    /// `notAfter` of the soonest-expiring certificate the node is serving, as
+    /// an absolute time.
+    ///
+    /// Carried beside the countdown above because the two answer different
+    /// questions. A countdown is what one node has left, and it is measured
+    /// against the moment that node was polled, so two nodes serving one
+    /// certificate report figures that differ by the seconds between their
+    /// polls. An absolute `notAfter` is a property of the certificate, so
+    /// comparing it ACROSS nodes is exact, and that comparison is the only way
+    /// to see a fleet whose nodes have stopped agreeing about what they serve.
+    pub cert_not_after_unix: Option<i64>,
     pub perf_error: Option<String>,
 }
 
@@ -178,6 +189,7 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
             disk_total_bytes: None,
             thermal_max_c: None,
             cert_expires_in_seconds: None,
+            cert_not_after_unix: None,
             perf_error: r.perf_error.clone(),
         };
 
@@ -231,6 +243,16 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
             // is "cannot say", which is the branch that warns.
             d.cert_expires_in_seconds = if p.tls_unreadable == 0 {
                 p.tls.iter().map(|c| c.expires_in_seconds).min()
+            } else {
+                None
+            };
+            // The same certificate as the countdown above, by the same rule: the
+            // soonest in the chain, and only when the whole chain was readable.
+            // Both derived here from one reading so the fleet comparison and the
+            // per-node threshold can never be talking about different
+            // certificates.
+            d.cert_not_after_unix = if p.tls_unreadable == 0 {
+                p.tls.iter().map(|c| c.not_after_unix).min()
             } else {
                 None
             };
@@ -539,6 +561,63 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
                 ),
             });
         }
+
+        // ── the fleet serves one certificate, or it does not ─────────────────
+        //
+        // A fleet where every node serves the same names from one certificate
+        // has one renewal and one expiry. When a node is left behind by a
+        // renewal it keeps serving the superseded certificate, which is well
+        // formed, valid, trusted by every client, and expires sooner than the
+        // one the operator installed. Nothing in a per-node reading can see
+        // that: each node reports a certificate with time left on it, every
+        // threshold passes, and the fleet is reported healthy right up to the
+        // day the stale node starts refusing connections.
+        //
+        // So it is checked the same way version drift is: by comparing the
+        // nodes to each other rather than each node to a limit. A renewal moves
+        // `notAfter` forward, so a node that missed one disagrees here on the
+        // day the renewal happened, which is the day there is time to fix it.
+        //
+        // Only nodes that reported a certificate are compared. A node silent
+        // about its chain is already a finding of its own above, and counting
+        // it again here would report one silence as two faults and name the
+        // cause in neither.
+        let certified: Vec<&NodeDigest> = reporting
+            .iter()
+            .copied()
+            .filter(|n| n.cert_not_after_unix.is_some())
+            .collect();
+        let mut expiries: Vec<i64> = certified
+            .iter()
+            .filter_map(|n| n.cert_not_after_unix)
+            .collect();
+        expiries.sort_unstable();
+        expiries.dedup();
+        if certified.len() > 1 && expiries.len() > 1 {
+            let detail = certified
+                .iter()
+                .map(|n| {
+                    // Days, because that is the unit an operator decides in,
+                    // and the exact `notAfter` is in the JSON digest for
+                    // anything comparing precisely.
+                    match n.cert_expires_in_seconds {
+                        Some(s) => format!("{} {}d", n.name, s / 86_400),
+                        None => format!("{} unknown", n.name),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            findings.push(Finding {
+                level: Level::Warn,
+                node: "fleet".to_string(),
+                text: format!(
+                    "the fleet is serving {} different certificates: {detail}. A node left \
+                     behind by a renewal serves a valid certificate that expires sooner \
+                     than the one that was installed, and no per-node threshold can see it.",
+                    expiries.len()
+                ),
+            });
+        }
     }
 
     findings.sort_by_key(|f| std::cmp::Reverse(f.level));
@@ -584,6 +663,14 @@ mod tests {
     /// The URL is what decides whether a certificate is expected, so this is
     /// the only helper here that uses an `https://` one. Every other test in
     /// this module polls `http://x` and therefore never reaches the check.
+    /// The instant the generated chains are measured against.
+    ///
+    /// A fixed base so `not_after_unix` and `expires_in_seconds` in a generated
+    /// chain describe the same certificate. They used to be independent, with
+    /// `not_after_unix` left at 0 on every entry, and a fleet comparison over
+    /// absolute expiries then sees one value whatever the nodes are serving.
+    const CHAIN_BASE_UNIX: i64 = 1_789_000_000;
+
     fn tls_reading(name: &str, days: Option<i64>) -> NodeReading {
         let mut p = perf(plain_host(), vec![]);
         p.tls = days
@@ -594,12 +681,12 @@ mod tests {
                     // reported number must be the soonest, not the first.
                     m6_core::tls::TlsCertificate {
                         depth: 0,
-                        not_after_unix: 0,
+                        not_after_unix: CHAIN_BASE_UNIX + expires_in_seconds,
                         expires_in_seconds,
                     },
                     m6_core::tls::TlsCertificate {
                         depth: 1,
-                        not_after_unix: 0,
+                        not_after_unix: CHAIN_BASE_UNIX + expires_in_seconds + 10_000 * 86_400,
                         expires_in_seconds: expires_in_seconds + 10_000 * 86_400,
                     },
                 ]
@@ -1191,5 +1278,152 @@ mod tests {
         );
         assert_eq!(d.nodes[0].cert_expires_in_seconds, None);
         assert!(d.findings.is_empty(), "{:?}", d.findings);
+    }
+
+    // ── the fleet serves one certificate, or it does not ─────────────────────
+
+    /// **The case this check exists for.** One node renews, the others keep the
+    /// certificate they had. Every node reports time left, every per-node
+    /// threshold passes, and before this nothing compared them.
+    ///
+    /// Verified red before being trusted: with the comparison removed the
+    /// digest reports no finding at all and `level` is `Ok`, because 60 and 30
+    /// days are both over the 21-day threshold.
+    #[test]
+    fn a_node_left_behind_by_a_renewal_is_reported_as_fleet_certificate_drift() {
+        let d = build(
+            &[
+                tls_reading("origin", Some(89)),
+                tls_reading("edge-a", Some(30)),
+                tls_reading("edge-b", Some(30)),
+            ],
+            &Thresholds::default(),
+            now(),
+        );
+        let drift: Vec<_> = d
+            .findings
+            .iter()
+            .filter(|f| f.text.contains("different certificates"))
+            .collect();
+        assert_eq!(drift.len(), 1, "{:?}", d.findings);
+        assert_eq!(drift[0].level, Level::Warn);
+        assert_eq!(drift[0].node, "fleet");
+        assert!(
+            drift[0].text.contains("2 different certificates"),
+            "two distinct expiries across three nodes is two certificates: {}",
+            drift[0].text
+        );
+        for expect in ["origin 89d", "edge-a 30d", "edge-b 30d"] {
+            assert!(
+                drift[0].text.contains(expect),
+                "the finding must name every node and what it is serving, missing {expect}: {}",
+                drift[0].text
+            );
+        }
+    }
+
+    /// A fleet that renewed everywhere says nothing. The countdowns are
+    /// measured per poll and can differ by seconds for one certificate, which
+    /// is why the comparison is over `notAfter` and not over the countdown.
+    #[test]
+    fn a_fleet_serving_one_certificate_reports_no_drift() {
+        let d = build(
+            &[
+                tls_reading("origin", Some(60)),
+                tls_reading("edge-a", Some(60)),
+                tls_reading("edge-b", Some(60)),
+            ],
+            &Thresholds::default(),
+            now(),
+        );
+        assert!(
+            !d.findings
+                .iter()
+                .any(|f| f.text.contains("different certificates")),
+            "{:?}",
+            d.findings
+        );
+        assert_eq!(d.level, Level::Ok, "{:?}", d.findings);
+    }
+
+    /// One node is not a fleet, and a fleet of one cannot disagree with itself.
+    #[test]
+    fn a_single_node_never_drifts_on_its_certificate() {
+        let d = build(
+            &[tls_reading("origin", Some(60))],
+            &Thresholds::default(),
+            now(),
+        );
+        assert!(
+            !d.findings
+                .iter()
+                .any(|f| f.text.contains("different certificates")),
+            "{:?}",
+            d.findings
+        );
+    }
+
+    /// A node silent about its chain is one finding, not two.
+    ///
+    /// It already warns per node that its renewal cannot be watched. Counting
+    /// the silence as drift as well would report one cause as two faults and
+    /// name it in neither, so only nodes that reported a certificate are
+    /// compared.
+    #[test]
+    fn a_node_reporting_no_certificate_is_not_also_counted_as_drift() {
+        let d = build(
+            &[
+                tls_reading("origin", Some(60)),
+                tls_reading("edge-a", Some(60)),
+                tls_reading("edge-b", None),
+            ],
+            &Thresholds::default(),
+            now(),
+        );
+        assert!(
+            !d.findings
+                .iter()
+                .any(|f| f.text.contains("different certificates")),
+            "the two nodes that can say agree, so the only finding is the silent one: {:?}",
+            d.findings
+        );
+        let silent: Vec<_> = d
+            .findings
+            .iter()
+            .filter(|f| f.text.contains("no certificate expiry"))
+            .collect();
+        assert_eq!(silent.len(), 1, "{:?}", d.findings);
+        assert_eq!(silent[0].node, "edge-b");
+    }
+
+    /// An expired certificate on one node is both faults at once: the node is
+    /// serving something expired, and the fleet has stopped agreeing. Both are
+    /// reported, because fixing the first does not tell an operator the second
+    /// was ever true.
+    #[test]
+    fn an_expired_certificate_on_one_node_is_a_fault_and_also_drift() {
+        let d = build(
+            &[
+                tls_reading("origin", Some(89)),
+                tls_reading("edge-a", Some(-2)),
+            ],
+            &Thresholds::default(),
+            now(),
+        );
+        assert_eq!(d.level, Level::Fault, "{:?}", d.findings);
+        assert!(
+            d.findings
+                .iter()
+                .any(|f| f.text.contains("EXPIRED") && f.node == "edge-a"),
+            "{:?}",
+            d.findings
+        );
+        assert!(
+            d.findings
+                .iter()
+                .any(|f| f.text.contains("different certificates")),
+            "{:?}",
+            d.findings
+        );
     }
 }
