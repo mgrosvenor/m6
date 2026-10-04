@@ -7,7 +7,7 @@ m6 is a platform for building and deploying fast websites — covering the full 
 ## Install
 
 Four steps. The last one is the point: it runs the whole stack and checks it,
-so you finish knowing the install works rather than assuming it.
+so you finish knowing the install works.
 
 **1. Build the binaries.**
 
@@ -60,8 +60,8 @@ and the login throttle including its recovery.
   96 passed  0 failed  (96 checks)
 ```
 
-Anything other than that is a real answer about your install, not noise. The
-suite has no skipped checks and nothing in it passes on more than one answer.
+Anything other than that is a real answer about your install. No check is
+skipped, and every check has exactly one passing result.
 
 Then read [`docs/m6-user-guide.md`](docs/m6-user-guide.md), which walks the
 eleven examples from a static site up to a global fleet.
@@ -151,7 +151,7 @@ Client → m6-http (epoll, single-thread)
 Reverse proxy, cache, and router. The only process that listens on a public port.
 
 **Architecture:**
-- Single-threaded `epoll` event loop (no Tokio, no async runtime)
+- Single-threaded `epoll` event loop
 - HTTP/3 over QUIC (`quiche`) and HTTP/2 + HTTP/1.1 on the same port
 - Response cache keyed by `(path, content-encoding)` — each encoding variant cached independently
 - JWT verified locally with m6-auth's public key — no per-request network hop
@@ -447,7 +447,11 @@ public_key = "/run/m6/auth.pub"
 
 ## Process Management
 
-All processes are independent. m6-http does not start or monitor anything.
+Each process is started and supervised on its own by the service manager,
+systemd on the production target. Start them in any order: m6-http takes a
+backend into its pool when the socket appears and drops it when the socket
+goes, whether that is a first start, a restart, or a new instance added for
+scale. None of that needs a config change or a restart of m6-http.
 
 ```bash
 # Development (shell script, see m6-examples/m6-run-eg)
@@ -458,7 +462,7 @@ m6-http         $SITE_DIR $SITE_TOML &
 wait
 ```
 
-**Scaling:** start additional instances (e.g. `m6-html-2.service`). The socket `/run/m6/m6-html-2.sock` appears; m6-http detects it via inotify and adds it to the pool. No config change needed.
+**Scaling:** start additional instances (e.g. `m6-html-2.service`). The socket `/run/m6/m6-html-2.sock` appears and m6-http adds it to the pool. On Linux it sees the socket at once, from an inotify watch on the directory the backend's `sockets` glob names. On macOS and the BSDs a periodic rescan of the glob picks it up. No config change needed.
 
 **Global deployment:** run m6-http at each edge location. Configure it with a `h2s://` URL backend pointing to the origin. Each edge node caches independently. See [Example 09](docs/m6-user-guide.md#example-09--global-deployment) and the multi-region deployment walkthrough.
 
@@ -522,7 +526,9 @@ Pool empty       →  status per [errors] mode:
 ## Security
 
 - TLS always required; m6-http terminates; internal communication over Unix sockets or TLS URL backends
-- JWT verified locally on every request — no per-request network hop to m6-auth
+- JWT verified on every request against m6-auth's public key, which m6-http
+  holds locally, so verification costs no network hop to m6-auth. Only login
+  and refresh reach m6-auth-server
 - Path traversal: `..` in any URL path → 404; `..` in a route param → 400
 - Symlink guard: resolves symlinks at request time; symlinks escaping `site_dir` → 404
 - Rate limiting on login: 5 attempts / 15 min / IP
@@ -543,13 +549,10 @@ Pool empty       →  status per [errors] mode:
 ## RFC compliance
 
 m6 was audited clause-by-clause against RFC 9110/9111/9112/9113/9114 in
-September 2026: **180 checks, 38 passing, 119 failing, 23 ambiguous.** That
-result is published rather than summarised away, because a hand-written HTTP
-stack claiming compliance without an audit behind it is exactly the kind of
-claim this project should not make.
+September 2026: **180 checks, 38 passing, 119 failing, 23 ambiguous.**
 
 Everything below has since been fixed, with tests, and verified against a
-running server rather than inferred from the source:
+running server:
 
 **Message framing and smuggling**
 - Bare `LF` accepted as a line terminator on ingress (`httparse` permits it)
@@ -597,10 +600,10 @@ running server rather than inferred from the source:
 - Most of the H2 frame/stream/flow-control cluster (F064–F098 beyond the
   panics and flow-control fixes already made), H2 client behaviour
   (F099–F109), H3 integration (F110–F114), auth extensions (F115–F119)
-- The cache key omits scheme and authority (F044). Verified safe for this
-  deployment rather than fixed: no response varies by Host, and `should_cache`
+- The cache key omits scheme and authority (F044). Not fixed. Safe for the
+  audited configuration, where no response varies by Host. `should_cache`
   refuses to store anything whose `Vary` names a field other than
-  `Accept-Encoding`. It would not be safe for multi-tenant use.
+  `Accept-Encoding`, in every configuration. Unsafe for multi-tenant use.
 
 ### The structural question
 
@@ -638,9 +641,7 @@ deliberately; `tools/conformance-scores.txt` argues that one in full.
 
 ### Why there is no server push or 103 Early Hints
 
-Both existed in m6 until 1.9.0 and were removed. They are listed here rather than
-left as a gap, because "m6 does not do this" is a decision and the next person to
-notice the absence should find the reasoning instead of rebuilding it.
+Both existed in m6 until 1.9.0 and were removed.
 
 **HTTP/2 push is a dead feature.** The server cannot see the client's cache, so it
 sends bytes to a returning visitor who already has them. Cache digests were
@@ -685,24 +686,24 @@ See issue #93 for the full reasoning and the measurements.
 
 m6-http is a **single-threaded, in-process-cached, TLS-terminating reverse proxy**.
 The response cache is an `Arc<Bytes>` LRU in the same heap as the TLS stack — a
-cache hit is a hash lookup, a reference-count increment, and an AES-GCM seal. No
-IPC, no lock, no copy.
+cache hit is a hash lookup, a reference-count increment, and an AES-GCM seal.
+A cache held in a separate process, or in shared memory, adds an IPC round trip
+or a lock to that path. This one has neither, and the cached body reaches the
+TLS writer without an intermediate copy.
 
 **Throughput** — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for the measured
 figures, the hardware, and the exact commands. Summary: HTTP/2 is about 3×
 HTTP/1.1 on this hardware, on both latency and throughput.
 
-This section previously carried a second throughput table that contradicted the
-one above — 158,323 req/s for HTTP/2 against 28,797 — while claiming identical
-conditions. At least one was wrong and a reader had no way to tell which, so
-both were deleted and re-measured rather than reconciled. Neither recorded a
-commit, hardware, payload or command line.
+Figures published here before September 2026 are withdrawn. Two throughput
+tables contradicted each other, 158,323 req/s for HTTP/2 against 28,797, both
+claiming identical conditions and neither recording a commit, hardware,
+payload or command line. Both were deleted and re-measured, and the measured
+figure in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) is well under either.
 
-It also compared m6 against nginx, LiteSpeed and H2O using figures taken from
-elsewhere rather than run like-for-like. Those comparisons are gone too. A
-number produced on someone else's hardware, with another payload, is not a
-comparison, and presenting it as one was the least defensible thing in this
-file.
+There are no comparisons against nginx, LiteSpeed or H2O. The ones published
+here until September 2026 took their figures from elsewhere, on other hardware
+with other payloads, which does not compare anything.
 
 **Two different quantities, both true, easily confused:** a cache hit costs
 **~2.2 µs** inside m6 (its own timer, confirmed against a running server), while an
