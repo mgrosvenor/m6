@@ -360,6 +360,16 @@ pub fn looks_like_injection(path: &str) -> bool {
 pub struct ClientSummary {
     pub requests: u64,
     pub distinct_user_agents: usize,
+    /// A sample of the agents this client presented, at most
+    /// [`USER_AGENTS_KEPT`] of them.
+    ///
+    /// The count above used to be all that survived, which left a reader with
+    /// `1 UA` and no way to learn which. A user agent is a claim rather than a
+    /// fact, and the claim is evidence about intent even when it is false: a
+    /// source sweeping credential paths while presenting a search engine's
+    /// name has said something a path list cannot, which is that it expects
+    /// user-agent allowlisting to exist and is trying to pass it. m6 #219.
+    pub user_agents: Vec<String>,
     pub status: BTreeMap<u16, u64>,
     pub paths: Vec<(String, u64)>,
     pub probe_paths: Vec<(String, u64)>,
@@ -464,6 +474,46 @@ pub const UA_ROTATION_THRESHOLD: usize = 10;
 /// Below this volume, many user agents is more likely a shared egress than a
 /// rotator, so the address is not accused.
 pub const UA_ROTATION_MIN_REQUESTS: u64 = 20;
+
+/// How many of a client's user agents to carry, and how much of each.
+///
+/// A sample rather than the set, because the set is unbounded by anything this
+/// code controls: one address presented 526 distinct agents on 2026-09-11, and
+/// carrying them would have put that client's rotation in every report and
+/// every JSON payload that mentions it. A user agent is also a header the
+/// client chooses, so its length is theirs to decide and not ours to trust.
+///
+/// The count stays beside the sample in `distinct_user_agents`, which is what
+/// makes the sample readable: four agents out of four is the set, and four out
+/// of 526 is a glimpse of a rotator.
+pub const USER_AGENTS_KEPT: usize = 4;
+/// Characters kept per user agent. Real ones run to about 150.
+pub const USER_AGENT_MAX_CHARS: usize = 160;
+
+/// A capped, deterministic sample of a client's user agents.
+///
+/// Sorted before truncating, so the same input gives the same sample. A
+/// `HashSet` iterates in an order that varies per process, and a report whose
+/// contents change between two runs over identical data is a report nobody can
+/// diff.
+///
+/// Truncated by CHARACTER and not by byte: a user agent is attacker-controlled
+/// text that need not be ASCII, and slicing a multi-byte sequence in half
+/// panics.
+fn sample_user_agents<'a>(uas: impl IntoIterator<Item = &'a String>) -> Vec<String> {
+    let mut v: Vec<&String> = uas.into_iter().collect();
+    v.sort();
+    v.truncate(USER_AGENTS_KEPT);
+    v.into_iter()
+        .map(|ua| {
+            if ua.chars().count() > USER_AGENT_MAX_CHARS {
+                ua.chars().take(USER_AGENT_MAX_CHARS).collect()
+            } else {
+                ua.clone()
+            }
+        })
+        .collect()
+}
 
 impl TrafficSummary {
     pub fn from_records<'a>(records: impl IntoIterator<Item = &'a AnalyticsRecord>) -> Self {
@@ -605,6 +655,7 @@ impl TrafficSummary {
                     ClientSummary {
                         requests: a.n,
                         distinct_user_agents: a.uas.len(),
+                        user_agents: sample_user_agents(&a.uas),
                         status: a.status,
                         paths,
                         probe_paths,
@@ -822,6 +873,89 @@ mod tests {
         assert_eq!(sus[0].0, "203.0.113.41");
         assert!(sus[0].1.is_rotating_user_agents);
         assert!(!sus[0].1.probe_paths.is_empty());
+
+        // The agents it wore are carried, as a sample. m6 #219: the count on
+        // its own told a reader how many names the source used and not one of
+        // them, which is the half that says what it was pretending to be.
+        assert_eq!(
+            sus[0].1.user_agents.len(),
+            USER_AGENTS_KEPT,
+            "a rotator presents more agents than are kept, so the sample is full: {:?}",
+            sus[0].1.user_agents
+        );
+        assert!(
+            sus[0].1.distinct_user_agents > sus[0].1.user_agents.len(),
+            "and the count must still exceed the sample, or a reader cannot tell \
+             a full set from a glimpse of a rotation"
+        );
+    }
+
+    /// A client's agents are carried, and the sample is bounded and stable.
+    ///
+    /// Three properties in one test because they are one decision: what a
+    /// report says about an attacker-controlled header.
+    #[test]
+    fn a_clients_user_agents_are_sampled_capped_and_deterministic() {
+        // Enough agents to exceed the cap, and enough requests to be notable,
+        // which is what puts this client in a report at all.
+        let mut records = Vec::new();
+        for i in 0..40 {
+            records.push(rec(
+                "2026-10-04T02:00:00Z",
+                "203.0.113.77",
+                "/.env",
+                404,
+                &format!("agent-{i:03}"),
+            ));
+        }
+        let first = TrafficSummary::from_records(&records);
+        let second = TrafficSummary::from_records(&records);
+
+        let a = &first.clients[0].1;
+        assert_eq!(a.distinct_user_agents, 40, "the count is the true total");
+        assert_eq!(
+            a.user_agents.len(),
+            USER_AGENTS_KEPT,
+            "the sample is capped: an address presented 526 agents on 2026-09-11, \
+             and carrying them would put one rotation in every report that names it"
+        );
+        assert_eq!(
+            a.user_agents, second.clients[0].1.user_agents,
+            "the same input must give the same sample. A HashSet iterates in an \
+             order that varies per process, and a report whose contents change \
+             between two runs over identical data cannot be diffed"
+        );
+        assert_eq!(
+            a.user_agents,
+            vec!["agent-000", "agent-001", "agent-002", "agent-003"],
+            "sorted before truncating, which is what makes it stable"
+        );
+    }
+
+    /// A long agent is cut by CHARACTER, not by byte.
+    ///
+    /// A user agent is attacker-controlled text and need not be ASCII, so
+    /// slicing at a byte offset can land inside a multi-byte sequence and
+    /// panic. A panic here is in the path that builds a security report about
+    /// the client who chose the header, which is the worst place to put one.
+    #[test]
+    fn a_long_multibyte_user_agent_is_truncated_without_panicking() {
+        let ua: String = "é".repeat(USER_AGENT_MAX_CHARS * 2);
+        let records: Vec<_> = (0..25)
+            .map(|_| rec("2026-10-04T02:00:00Z", "203.0.113.78", "/.env", 404, &ua))
+            .collect();
+        let s = TrafficSummary::from_records(&records);
+        let kept = &s.clients[0].1.user_agents;
+        assert_eq!(kept.len(), 1);
+        assert_eq!(
+            kept[0].chars().count(),
+            USER_AGENT_MAX_CHARS,
+            "cut to the character cap"
+        );
+        assert!(
+            kept[0].chars().all(|c| c == 'é'),
+            "and every character survived intact"
+        );
     }
 
     /// The 2026-09-11 case that the rotation check alone missed.

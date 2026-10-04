@@ -257,7 +257,7 @@ pub fn render(d: &Digest, readings: &[NodeReading]) -> String {
                 h.requests,
                 h.top_path,
                 h.error_ratio * 100.0,
-                h.user_agents
+                h.distinct_user_agents
             );
         }
         for c in &t.notable {
@@ -276,6 +276,37 @@ pub fn render(d: &Digest, readings: &[NodeReading]) -> String {
                     "        {} distinct user agents (rotating)",
                     c.distinct_user_agents
                 );
+            }
+            // ── The agents it presented, which the count alone could not say
+            //
+            // A line reading `1 UA` left a reader knowing how many claims a
+            // source made and not one of them. m6 #219.
+            //
+            // The count goes beside the sample whenever the sample is partial,
+            // because four agents out of four is the set and four out of 526 is
+            // a glimpse of a rotator, and the two mean opposite things about
+            // what the lines below are evidence of.
+            if !c.user_agents.is_empty() {
+                if c.user_agents.len() < c.distinct_user_agents {
+                    let _ = writeln!(
+                        o,
+                        "        agents ({} of {}):",
+                        c.user_agents.len(),
+                        c.distinct_user_agents
+                    );
+                } else {
+                    let _ = writeln!(o, "        agents:");
+                }
+                for ua in &c.user_agents {
+                    // An empty agent is a client that sent no User-Agent
+                    // header at all, which is itself worth seeing: a browser
+                    // always sends one.
+                    if ua.is_empty() {
+                        let _ = writeln!(o, "          <none sent>");
+                    } else {
+                        let _ = writeln!(o, "          {ua}");
+                    }
+                }
             }
             for p in c.probe_paths.iter().take(8) {
                 let _ = writeln!(o, "        probe {p}");
@@ -625,6 +656,114 @@ mod tests {
             logging,
             firewall: None,
         }
+    }
+
+    /// A notable client that presented `agents`, out of `distinct` in total.
+    fn probing_client(
+        ip: &str,
+        agents: &[&str],
+        distinct: usize,
+    ) -> m6_core::monitoring::NotableClient {
+        m6_core::monitoring::NotableClient {
+            ip: ip.into(),
+            requests: 7,
+            distinct_user_agents: distinct,
+            user_agents: agents.iter().map(|a| a.to_string()).collect(),
+            status: Default::default(),
+            probe_paths: vec!["/.env".into(), "/.git/config".into()],
+            injection_paths: vec![],
+            rotating_user_agents: distinct >= 10,
+            first_seen: "2026-10-04T01:20:54Z".into(),
+            last_seen: "2026-10-04T01:20:58Z".into(),
+        }
+    }
+
+    /// The report names what a prober claimed to be.
+    ///
+    /// Before m6 #219 this section printed the probe paths and a count of
+    /// agents, so a reader learned how many claims the source made and not one
+    /// of them. The agent is a claim rather than a fact, and the claim is
+    /// evidence about intent even when it is false.
+    #[test]
+    fn a_notable_clients_user_agents_are_printed() {
+        let mut t = traffic(LoggingHealth {
+            events_total: 100,
+            seconds_since_last: Some(1),
+        });
+        t.notable = vec![probing_client("203.0.113.9", &["curl/8.4.0"], 1)];
+        let out = render_for_test(t);
+
+        assert!(
+            out.contains("curl/8.4.0"),
+            "the agent itself must appear, not just a count:\n{out}"
+        );
+        assert!(
+            !out.contains("agents (1 of 1)"),
+            "a complete set needs no 'x of y', which only means something when \
+             the sample is partial:\n{out}"
+        );
+    }
+
+    /// A sample says it is a sample.
+    ///
+    /// Four agents out of four is the set; four out of 526 is a glimpse of a
+    /// rotator. They mean opposite things about what the listed agents are
+    /// evidence of, so the report cannot print them identically.
+    #[test]
+    fn a_partial_sample_of_agents_says_how_many_there_were() {
+        let mut t = traffic(LoggingHealth {
+            events_total: 100,
+            seconds_since_last: Some(1),
+        });
+        t.notable = vec![probing_client(
+            "203.0.113.41",
+            &[
+                "Googlebot/2.1",
+                "GPTBot/1.0",
+                "curl/8.4.0",
+                "python-requests/2",
+            ],
+            526,
+        )];
+        let out = render_for_test(t);
+
+        assert!(
+            out.contains("agents (4 of 526)"),
+            "a partial sample has to say so:\n{out}"
+        );
+        assert!(
+            out.contains("526 distinct user agents (rotating)"),
+            "and the rotation finding stays, because it is a different claim \
+             from the sample:\n{out}"
+        );
+    }
+
+    /// A client that sent no `User-Agent` header at all.
+    ///
+    /// Worth seeing rather than rendering as a blank line: every browser sends
+    /// one, so its absence is itself a signal about the client.
+    #[test]
+    fn a_client_that_sent_no_user_agent_is_said_to_have_sent_none() {
+        let mut t = traffic(LoggingHealth {
+            events_total: 100,
+            seconds_since_last: Some(1),
+        });
+        t.notable = vec![probing_client("203.0.113.50", &[""], 1)];
+        let out = render_for_test(t);
+        assert!(
+            out.contains("<none sent>"),
+            "an empty agent must be named, not printed as whitespace:\n{out}"
+        );
+    }
+
+    fn render_for_test(t: TrafficReport) -> String {
+        let r = reading("origin", Some(t));
+        let d = crate::digest::build(
+            std::slice::from_ref(&r),
+            &crate::digest::Thresholds::default(),
+            "2026-10-04T02:16:31Z".into(),
+        );
+        render(&d, std::slice::from_ref(&r))
     }
 
     pub(super) fn reading(name: &str, t: Option<TrafficReport>) -> NodeReading {

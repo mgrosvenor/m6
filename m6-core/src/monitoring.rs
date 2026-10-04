@@ -1087,6 +1087,11 @@ pub struct NotableClient {
     pub ip: String,
     pub requests: u64,
     pub distinct_user_agents: usize,
+    /// A sample of the agents this client presented. Empty on a node too old
+    /// to report them, which is why the count above stays: a reader has to be
+    /// able to tell "presented none we recorded" from "this node cannot say".
+    #[serde(default)]
+    pub user_agents: Vec<String>,
     pub status: std::collections::BTreeMap<u16, u64>,
     pub probe_paths: Vec<String>,
     pub injection_paths: Vec<String>,
@@ -1100,7 +1105,12 @@ pub struct HeavyHitter {
     pub ip: String,
     pub requests: u64,
     pub top_path: String,
-    pub user_agents: usize,
+    /// Renamed from `user_agents`, which held this count while the field a
+    /// reader wanted did not exist. The strings now have that name.
+    pub distinct_user_agents: usize,
+    /// A sample of the agents, at most [`crate::telemetry::USER_AGENTS_KEPT`].
+    #[serde(default)]
+    pub user_agents: Vec<String>,
     /// Share of responses that were 4xx or 5xx, so a loud client that is
     /// being served is distinguishable from one that is being refused.
     pub error_ratio: f64,
@@ -1132,6 +1142,7 @@ impl TrafficReport {
                 ip: ip.clone(),
                 requests: c.requests,
                 distinct_user_agents: c.distinct_user_agents,
+                user_agents: c.user_agents.clone(),
                 status: c.status.clone(),
                 probe_paths: c.probe_paths.iter().map(|(p, _)| p.clone()).collect(),
                 injection_paths: c.injection_paths.iter().map(|(p, _)| p.clone()).collect(),
@@ -1156,7 +1167,8 @@ impl TrafficReport {
                 ip: ip.clone(),
                 requests: c.requests,
                 top_path: c.paths.first().map(|(p, _)| p.clone()).unwrap_or_default(),
-                user_agents: c.distinct_user_agents,
+                distinct_user_agents: c.distinct_user_agents,
+                user_agents: c.user_agents.clone(),
                 error_ratio: c.error_ratio(),
             })
             .collect();
