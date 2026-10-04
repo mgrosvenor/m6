@@ -59,7 +59,9 @@ const ERROR_PAGE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 use m6_http_lib::auth::PublicKey;
 use m6_http_lib::h2c_client::H2cClientPool;
 use m6_http_lib::h2s_client::H2sTlsClientPool;
-use m6_http_lib::http11::{make_tls_server_config, H2cListener, Http11Listener, RequestOutcome};
+use m6_http_lib::http11::{
+    load_tls_material, make_tls_server_config, H2cListener, Http11Listener, RequestOutcome,
+};
 use m6_http_lib::poller::{Poller, Token, WakeReader, WakeWriter};
 use m6_http_lib::pool::{self, PoolManager};
 use m6_http_lib::router::{self, RouteTable};
@@ -687,7 +689,10 @@ fn event_loop(
                 TOKEN_INOTIFY => {
                     if let Some(ref mut w) = watcher {
                         for event in w.read_events() {
-                            handle_fs_event(&event, state, quiche_config, log_handle);
+                            // `tcp` goes in because a certificate change has to
+                            // rebuild the rustls configuration this listener
+                            // holds, not only the quiche one. m6 #210.
+                            handle_fs_event(&event, state, quiche_config, tcp.as_mut(), log_handle);
                         }
                     }
                 }
@@ -3799,6 +3804,7 @@ fn handle_fs_event(
     event: &FsEvent,
     state: &mut ServerState,
     quiche_config: &mut quiche::Config,
+    tcp: Option<&mut Http11Listener>,
     log_handle: &m6_core::log::LogHandle,
 ) {
     match event.kind {
@@ -3812,7 +3818,7 @@ fn handle_fs_event(
             handle_site_reload(state, log_handle);
         }
         FsEventKind::TlsCertChanged => {
-            handle_tls_reload(state, quiche_config);
+            handle_tls_reload(state, quiche_config, tcp);
         }
     }
 }
@@ -3868,16 +3874,85 @@ fn handle_site_reload(state: &mut ServerState, log_handle: &m6_core::log::LogHan
     }
 }
 
-fn handle_tls_reload(state: &ServerState, quiche_config: &mut quiche::Config) {
+/// Rebuild every listener's TLS material, or none of it.
+///
+/// This used to rebuild the quiche configuration alone, so after a renewal
+/// HTTP/3 served the new certificate while HTTP/1.1 and HTTP/2 kept the old one
+/// until the process restarted. One server answered with two different
+/// certificates at the same time, chosen by the protocol the client negotiated,
+/// and the log said `TLS config reloaded`, which was true of the one protocol it
+/// had reloaded. m6 #210.
+///
+/// **Both configurations are built before either is installed.** A reload that
+/// swapped them one at a time would leave the protocols disagreeing whenever the
+/// second build failed, which is the state this function exists to end. On a
+/// failure every protocol keeps the material it already had, and the next write
+/// to the certificate tries again.
+///
+/// Each build reads the files itself, a moment apart, so material written
+/// between the two reads reaches one and not the other. The write that lands
+/// there generates its own event, and this runs again and settles both on it. A
+/// renewal writes a certificate and a key as two files, so a read catching one
+/// of them half done is the ordinary case rather than a rare one, and the
+/// mismatched pair fails the rustls build and keeps every protocol where it was.
+fn handle_tls_reload(
+    state: &ServerState,
+    quiche_config: &mut quiche::Config,
+    tcp: Option<&mut Http11Listener>,
+) {
     info!("TLS config reload: cert/key file changed");
-    match make_quiche_config(&state.config.server) {
-        Ok(new_cfg) => {
-            *quiche_config = new_cfg;
-            info!("TLS config reloaded");
+
+    // Both are Some outside redirect mode, which runs its own loop and never
+    // reaches here. Erroring keeps a config failure diagnosable instead of a
+    // panic if this ever moves.
+    let (cert_path, key_path) = match (&state.config.server.tls_cert, &state.config.server.tls_key)
+    {
+        (Some(c), Some(k)) => (c, k),
+        _ => {
+            warn!("TLS config reload: no certificate is configured, keeping old config");
+            return;
         }
+    };
+
+    let material = match load_tls_material(cert_path, key_path) {
+        Ok(m) => m,
         Err(e) => {
-            warn!(error = %e, "TLS config reload failed, keeping old config");
+            warn!(error = %e, "TLS config reload failed for HTTP/1.1 and HTTP/2, keeping old config on every protocol");
+            return;
         }
+    };
+    let new_quiche = match make_quiche_config(&state.config.server) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "TLS config reload failed for HTTP/3, keeping old config on every protocol");
+            return;
+        }
+    };
+
+    // Installed together. Past this point nothing can fail.
+    *quiche_config = new_quiche;
+    let tls_listener_reloaded = match tcp {
+        Some(t) if t.terminates_tls() => {
+            t.replace_tls_config(material.config.clone());
+            true
+        }
+        // A node serving QUIC with no TLS listener is not a configuration this
+        // project runs, and recording still answers for what h3 is serving.
+        Some(_) | None => false,
+    };
+
+    // After the swap, so the reported expiry is the material being served
+    // rather than the material that was read off disk.
+    material.record(cert_path);
+
+    // The line names the protocols it actually replaced. Half of what #210 cost
+    // was a log that said `TLS config reloaded` for a reload that reached one
+    // protocol, so a success line claiming all three on the path that rebuilt
+    // one is the same defect moved a few lines down.
+    if tls_listener_reloaded {
+        info!("TLS config reloaded on HTTP/1.1, HTTP/2 and HTTP/3");
+    } else {
+        warn!("TLS config reloaded on HTTP/3 alone: there is no HTTP/1.1 TLS listener to rebuild");
     }
 }
 
