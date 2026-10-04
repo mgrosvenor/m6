@@ -1116,12 +1116,18 @@ pub struct HeavyHitter {
     /// `firewall` and `PerfReport.tls` are documented as avoiding.
     #[serde(rename = "user_agents")]
     pub distinct_user_agents: usize,
-    /// A sample of the agents, at most [`crate::telemetry::USER_AGENTS_KEPT`].
+    /// A heavy hitter carries the COUNT and no sample, deliberately.
     ///
-    /// Under its own wire name for the reason above, and `serde(default)` so a
-    /// node too old to send it stays parseable.
-    #[serde(default, rename = "user_agent_sample")]
-    pub user_agents: Vec<String>,
+    /// The agents are on [`NotableClient`], which is the list this change
+    /// exists for: a notable client is one the report is accusing of
+    /// something, and what it claimed to be is evidence. A heavy hitter is
+    /// merely loud, and the loudest source on a node is routinely the
+    /// monitor's own polling.
+    ///
+    /// A sample was added here first and carried in every payload for up to
+    /// eight clients per node while nothing read it. Rendering it instead
+    /// would have buried the section: thirty-two agent lines per node, mostly
+    /// describing traffic nobody is asking about.
     /// Share of responses that were 4xx or 5xx, so a loud client that is
     /// being served is distinguishable from one that is being refused.
     pub error_ratio: f64,
@@ -1179,7 +1185,6 @@ impl TrafficReport {
                 requests: c.requests,
                 top_path: c.paths.first().map(|(p, _)| p.clone()).unwrap_or_default(),
                 distinct_user_agents: c.distinct_user_agents,
-                user_agents: c.user_agents.clone(),
                 error_ratio: c.error_ratio(),
             })
             .collect();
@@ -1324,10 +1329,9 @@ mod traffic_tests {
         let r: TrafficReport = serde_json::from_str(old).expect("an older payload must parse");
         assert_eq!(r.heavy_hitters[0].distinct_user_agents, 3);
         assert!(
-            r.heavy_hitters[0].user_agents.is_empty(),
+            r.notable[0].user_agents.is_empty(),
             "no sample from a node that cannot send one"
         );
-        assert!(r.notable[0].user_agents.is_empty());
 
         // And the count still goes out under the name an older reader expects.
         let json = serde_json::to_value(&r).unwrap();
