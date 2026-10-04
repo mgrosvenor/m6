@@ -582,39 +582,99 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
         // about its chain is already a finding of its own above, and counting
         // it again here would report one silence as two faults and name the
         // cause in neither.
-        let certified: Vec<&NodeDigest> = reporting
+        // Both figures or neither, so there is no half-answer to describe. An
+        // earlier version admitted a node on `cert_not_after_unix.is_some()`
+        // and then matched on `cert_expires_in_seconds`, with an `unknown` arm
+        // that could not be reached: the two are set together under one
+        // `tls_unreadable == 0` guard. A reader had to prove that invariant to
+        // know the arm was dead, so the tuple now requires both and the
+        // impossible case cannot be written.
+        let certified: Vec<(&str, i64, i64)> = reporting
             .iter()
-            .copied()
-            .filter(|n| n.cert_not_after_unix.is_some())
+            .filter_map(|n| {
+                Some((
+                    n.name.as_str(),
+                    n.cert_not_after_unix?,
+                    n.cert_expires_in_seconds?,
+                ))
+            })
             .collect();
-        let mut expiries: Vec<i64> = certified
-            .iter()
-            .filter_map(|n| n.cert_not_after_unix)
-            .collect();
-        expiries.sort_unstable();
-        expiries.dedup();
-        if certified.len() > 1 && expiries.len() > 1 {
-            let detail = certified
+        // ── PARTIAL agreement is the signal, not disagreement ────────────────
+        //
+        // The first version of this warned whenever the certified nodes did not
+        // all agree, which is wrong for any fleet that does not share one
+        // certificate. m6 is a generic web engine: `fleet.rs` records that "an
+        // origin and a cache node do not always agree", and the user guide
+        // documents per-node `certbot certonly`. A fleet whose nodes each run
+        // their own ACME client renews them hours or days apart by
+        // construction, so that version warned on every poll, forever, and a
+        // permanent warning in an hourly check is the same as no warning.
+        //
+        // The distinguishing shape is not "they differ", it is "some of them
+        // AGREE and one does not". Nodes sharing a `notAfter` are serving one
+        // certificate, which is a fact about the fleet rather than an
+        // assumption about it, and a node outside that group has been left
+        // behind by the renewal the others got.
+        //
+        //   every node distinct          per-node certificates. Silent
+        //   all nodes equal              one certificate, in step. Silent
+        //   two or more equal, one not   one certificate, one node behind. WARN
+        //
+        // What this cannot see is a TWO-node fleet sharing one certificate
+        // where one node lags: two distinct values, no group of two, so it
+        // stays silent. That is the honest cost of deriving the expectation
+        // from the data instead of being told it, and it fails quiet rather
+        // than crying wolf.
+        let mut by_expiry: std::collections::BTreeMap<i64, Vec<&str>> =
+            std::collections::BTreeMap::new();
+        for &(name, at, _) in &certified {
+            by_expiry.entry(at).or_default().push(name);
+        }
+        let largest = by_expiry.values().map(|v| v.len()).max().unwrap_or(0);
+        if by_expiry.len() > 1 && largest > 1 {
+            // ── The NEWEST certificate is the right one, not the commonest ───
+            //
+            // An earlier version named the majority as correct and everything
+            // else as behind, which is backwards for the case this check
+            // exists for. When an origin renews and two cache nodes are not
+            // told, the majority is the STALE pair and the single renewed node
+            // is the one that is right. Naming the renewed node as the problem
+            // would send an operator to fix the only node that did not need
+            // fixing.
+            //
+            // A renewal moves `notAfter` forward and nothing moves it back, so
+            // the latest expiry is the certificate that was installed and
+            // anything earlier has been left behind. Group size decides only
+            // whether to look at all, above.
+            let newest = by_expiry
+                .keys()
+                .next_back()
+                .copied()
+                .expect("by_expiry is not empty");
+            let behind: Vec<String> = certified
                 .iter()
-                .map(|n| {
+                .filter(|&&(_, at, _)| at < newest)
+                .map(|&(name, at, left)| {
                     // Days, because that is the unit an operator decides in,
-                    // and the exact `notAfter` is in the JSON digest for
-                    // anything comparing precisely.
-                    match n.cert_expires_in_seconds {
-                        Some(s) => format!("{} {}d", n.name, s / 86_400),
-                        None => format!("{} unknown", n.name),
-                    }
+                    // AND `notAfter` itself, because days alone cannot show
+                    // the disagreement this finding reports. Two certificates
+                    // issued twelve hours apart have the same number of whole
+                    // days left, so a line reading "origin 89d, edge-a 89d"
+                    // under a claim they differ tells an operator nothing and
+                    // reads as a defect in the check.
+                    format!("{name} {}d (notAfter {at})", left / 86_400)
                 })
-                .collect::<Vec<_>>()
-                .join(", ");
+                .collect();
             findings.push(Finding {
                 level: Level::Warn,
                 node: "fleet".to_string(),
                 text: format!(
-                    "the fleet is serving {} different certificates: {detail}. A node left \
-                     behind by a renewal serves a valid certificate that expires sooner \
-                     than the one that was installed, and no per-node threshold can see it.",
-                    expiries.len()
+                    "{} node(s) are behind the newest certificate on the fleet, which \
+                     expires at {newest}: {}. A node left behind by a renewal serves a \
+                     valid certificate that expires sooner than the one that was \
+                     installed, and no per-node threshold can see it.",
+                    behind.len(),
+                    behind.join(", ")
                 ),
             });
         }
@@ -1303,23 +1363,89 @@ mod tests {
         let drift: Vec<_> = d
             .findings
             .iter()
-            .filter(|f| f.text.contains("different certificates"))
+            .filter(|f| f.text.contains("are behind the newest"))
             .collect();
         assert_eq!(drift.len(), 1, "{:?}", d.findings);
         assert_eq!(drift[0].level, Level::Warn);
         assert_eq!(drift[0].node, "fleet");
         assert!(
-            drift[0].text.contains("2 different certificates"),
-            "two distinct expiries across three nodes is two certificates: {}",
+            drift[0].text.contains("2 node(s) are behind"),
+            "two of the three are behind the newest certificate: {}",
             drift[0].text
         );
-        for expect in ["origin 89d", "edge-a 30d", "edge-b 30d"] {
+        for expect in ["edge-a 30d", "edge-b 30d"] {
             assert!(
                 drift[0].text.contains(expect),
-                "the finding must name every node and what it is serving, missing {expect}: {}",
+                "the finding must name each node that is behind, missing {expect}: {}",
                 drift[0].text
             );
         }
+        assert!(
+            !drift[0].text.contains("origin"),
+            "origin holds the NEWEST certificate and is the one node that needs \
+             nothing done to it. Naming it would send an operator to fix the only \
+             node that was right: {}",
+            drift[0].text
+        );
+    }
+
+    /// A FLEET THAT DOES NOT SHARE A CERTIFICATE IS NEVER WARNED ABOUT.
+    ///
+    /// The reason this check keys on partial agreement rather than on
+    /// disagreement. m6 is a generic web engine: `fleet.rs` records that an
+    /// origin and a cache node do not always agree, and the user guide
+    /// documents per-node `certbot certonly`. A fleet whose nodes each run
+    /// their own ACME client renews them days apart by construction, and an
+    /// earlier version of this check warned about that on every poll, forever.
+    /// A permanent warning in an hourly check is the same as no warning.
+    ///
+    /// Every node distinct means per-node certificates, so there is no
+    /// majority to be behind and nothing to report.
+    #[test]
+    fn a_fleet_running_per_node_certificates_is_not_warned_about() {
+        let d = build(
+            &[
+                tls_reading("origin", Some(83)),
+                tls_reading("edge-a", Some(61)),
+                tls_reading("edge-b", Some(47)),
+            ],
+            &Thresholds::default(),
+            now(),
+        );
+        assert!(
+            !d.findings
+                .iter()
+                .any(|f| f.text.contains("are behind the newest")),
+            "three nodes on three certificates is three ACME clients, not drift: {:?}",
+            d.findings
+        );
+        assert_eq!(d.level, Level::Ok, "{:?}", d.findings);
+    }
+
+    /// Two nodes cannot be told apart, and that is stated rather than hidden.
+    ///
+    /// With two certified nodes on different certificates there is no group of
+    /// two to form a majority, so this cannot distinguish one node lagging from
+    /// a two-node fleet running its own certificates. It stays silent. That is
+    /// the cost of deriving the expectation from the data instead of being told
+    /// it, and it fails quiet rather than crying wolf on every poll.
+    #[test]
+    fn a_two_node_fleet_cannot_tell_a_lag_from_per_node_certificates() {
+        let d = build(
+            &[
+                tls_reading("origin", Some(89)),
+                tls_reading("edge-a", Some(30)),
+            ],
+            &Thresholds::default(),
+            now(),
+        );
+        assert!(
+            !d.findings
+                .iter()
+                .any(|f| f.text.contains("are behind the newest")),
+            "a two-node fleet has no majority, so this must stay silent: {:?}",
+            d.findings
+        );
     }
 
     /// A fleet that renewed everywhere says nothing. The countdowns are
@@ -1339,7 +1465,7 @@ mod tests {
         assert!(
             !d.findings
                 .iter()
-                .any(|f| f.text.contains("different certificates")),
+                .any(|f| f.text.contains("are behind the newest")),
             "{:?}",
             d.findings
         );
@@ -1357,7 +1483,7 @@ mod tests {
         assert!(
             !d.findings
                 .iter()
-                .any(|f| f.text.contains("different certificates")),
+                .any(|f| f.text.contains("are behind the newest")),
             "{:?}",
             d.findings
         );
@@ -1383,7 +1509,7 @@ mod tests {
         assert!(
             !d.findings
                 .iter()
-                .any(|f| f.text.contains("different certificates")),
+                .any(|f| f.text.contains("are behind the newest")),
             "the two nodes that can say agree, so the only finding is the silent one: {:?}",
             d.findings
         );
@@ -1402,10 +1528,15 @@ mod tests {
     /// was ever true.
     #[test]
     fn an_expired_certificate_on_one_node_is_a_fault_and_also_drift() {
+        // Three nodes, not two: with two the fleet comparison cannot tell one
+        // node lagging from a fleet running per-node certificates, and stays
+        // silent by design. `a_two_node_fleet_cannot_tell_a_lag_from_per_node_certificates`
+        // covers that.
         let d = build(
             &[
                 tls_reading("origin", Some(89)),
-                tls_reading("edge-a", Some(-2)),
+                tls_reading("edge-a", Some(89)),
+                tls_reading("edge-b", Some(-2)),
             ],
             &Thresholds::default(),
             now(),
@@ -1414,14 +1545,14 @@ mod tests {
         assert!(
             d.findings
                 .iter()
-                .any(|f| f.text.contains("EXPIRED") && f.node == "edge-a"),
+                .any(|f| f.text.contains("EXPIRED") && f.node == "edge-b"),
             "{:?}",
             d.findings
         );
         assert!(
             d.findings
                 .iter()
-                .any(|f| f.text.contains("different certificates")),
+                .any(|f| f.text.contains("are behind the newest")),
             "{:?}",
             d.findings
         );
