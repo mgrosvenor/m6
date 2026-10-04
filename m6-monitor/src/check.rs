@@ -287,17 +287,26 @@ pub fn render(d: &Digest, readings: &[NodeReading]) -> String {
             // a glimpse of a rotator, and the two mean opposite things about
             // what the lines below are evidence of.
             if !c.user_agents.is_empty() {
-                if c.user_agents.len() < c.distinct_user_agents {
+                // Bounded here as well as at the producer, for the reason
+                // every other list in this section is: the lines come from a
+                // node's JSON over the network, and a digest a reader scrolls
+                // is not the place to find out a payload was longer than
+                // expected. The header counts what is printed, so the number
+                // and the lines under it cannot disagree.
+                let shown = c
+                    .user_agents
+                    .len()
+                    .min(m6_core::telemetry::USER_AGENTS_KEPT);
+                if shown < c.distinct_user_agents {
                     let _ = writeln!(
                         o,
                         "        agents ({} of {}):",
-                        c.user_agents.len(),
-                        c.distinct_user_agents
+                        shown, c.distinct_user_agents
                     );
                 } else {
                     let _ = writeln!(o, "        agents:");
                 }
-                for ua in &c.user_agents {
+                for ua in c.user_agents.iter().take(shown) {
                     // An empty agent is a client that sent no User-Agent
                     // header at all, which is itself worth seeing: a browser
                     // always sends one.

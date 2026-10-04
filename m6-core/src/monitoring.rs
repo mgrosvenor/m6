@@ -1106,10 +1106,21 @@ pub struct HeavyHitter {
     pub requests: u64,
     pub top_path: String,
     /// Renamed from `user_agents`, which held this count while the field a
-    /// reader wanted did not exist. The strings now have that name.
+    /// reader wanted did not exist.
+    ///
+    /// The WIRE name stays `user_agents`, because the count has been published
+    /// under it since this struct existed and an aggregator reads `/traffic`
+    /// from nodes on other versions. Giving the strings that key instead would
+    /// make a payload from any node on the other side of this change a type
+    /// error rather than a partly readable report, which is the treatment
+    /// `firewall` and `PerfReport.tls` are documented as avoiding.
+    #[serde(rename = "user_agents")]
     pub distinct_user_agents: usize,
     /// A sample of the agents, at most [`crate::telemetry::USER_AGENTS_KEPT`].
-    #[serde(default)]
+    ///
+    /// Under its own wire name for the reason above, and `serde(default)` so a
+    /// node too old to send it stays parseable.
+    #[serde(default, rename = "user_agent_sample")]
     pub user_agents: Vec<String>,
     /// Share of responses that were 4xx or 5xx, so a loud client that is
     /// being served is distinguishable from one that is being refused.
@@ -1287,5 +1298,39 @@ mod traffic_tests {
             quiet.is_blind(),
             "ten minutes of silence from a 10s heartbeat"
         );
+    }
+
+    /// A `/traffic` payload from a node on another version still parses.
+    ///
+    /// The aggregator reads this endpoint over the network, and a rollout has
+    /// nodes on both sides of a field change at once. A node that publishes
+    /// `user_agents` as the COUNT must stay readable here, and the count must
+    /// keep that wire name so an aggregator older than the sample reads it
+    /// too. Both directions, because a type error on one field loses the whole
+    /// report: notable clients, logging health and firewall state with it.
+    #[test]
+    fn a_traffic_payload_without_the_agent_sample_still_parses() {
+        let old = r#"{
+            "node":"origin","window_minutes":60,"total_requests":12,"status":{"200":12},
+            "notable":[{"ip":"203.0.113.9","requests":7,"distinct_user_agents":3,
+                "status":{"404":7},"probe_paths":["/.env"],"injection_paths":[],
+                "rotating_user_agents":false,
+                "first_seen":"2026-10-04T01:20:54Z","last_seen":"2026-10-04T01:20:58Z"}],
+            "heavy_hitters":[{"ip":"203.0.113.9","requests":7,"top_path":"/.env",
+                "user_agents":3,"error_ratio":1.0}],
+            "crawlers":[],"forged_bot_requests":0,"forgers":[],"probe_noise":[],
+            "logging":{"events_total":100,"seconds_since_last":1}
+        }"#;
+        let r: TrafficReport = serde_json::from_str(old).expect("an older payload must parse");
+        assert_eq!(r.heavy_hitters[0].distinct_user_agents, 3);
+        assert!(
+            r.heavy_hitters[0].user_agents.is_empty(),
+            "no sample from a node that cannot send one"
+        );
+        assert!(r.notable[0].user_agents.is_empty());
+
+        // And the count still goes out under the name an older reader expects.
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["heavy_hitters"][0]["user_agents"], 3);
     }
 }
