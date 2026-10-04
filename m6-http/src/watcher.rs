@@ -5,10 +5,10 @@
 ///
 /// On Linux: uses inotify on the site directory and on each certificate's own
 /// parent directory, so events carry a filename and are told apart by it.
-/// On macOS/FreeBSD/OpenBSD: uses kqueue EVFILT_VNODE on the site directory.
-/// The wake carries no filename, so a certificate change is told from a content
-/// write by comparing modification times, and a certificate outside the site
-/// directory is not seen at all.
+/// On macOS/FreeBSD/OpenBSD: uses kqueue EVFILT_VNODE on the site directory and
+/// on the certificate and key as files, wherever they live. The wake carries no
+/// filename, so a certificate change is told from a content write by comparing
+/// modification times.
 /// On other platforms: returns an error from `new()`, hot reload disabled.
 ///
 /// Socket pool membership is managed separately via periodic rescan, so this
@@ -315,9 +315,12 @@ impl FsWatcher {
 
         // ── macOS / FreeBSD / OpenBSD ──────────────────────────────────────────
         // The kqueue thread signals us via the pipe whenever any write/delete/create
-        // event fires on the site directory. We drain the pipe and emit a
-        // SiteTomlChanged event — the reload handler re-reads the file and checks
-        // whether the config actually changed, so spurious events are harmless.
+        // event fires on the site directory, on site.toml, or on the certificate
+        // and key. We drain the pipe and emit a SiteTomlChanged event on EVERY
+        // wake, because the wake does not say which file it came from. The cost
+        // is that a certificate write re-reads site.toml and clears the response
+        // cache as well: `handle_site_reload` rebuilds unconditionally and does
+        // not compare the config it read with the one it holds.
         //
         // A TLS event is emitted too, but only when the certificate or key has
         // actually been written, because the wake carries no filename and a
@@ -326,10 +329,14 @@ impl FsWatcher {
         // the event at all, which is how this branch read until m6 #210, a
         // renewal reached the server on no BSD platform.
         //
-        // What this still does not cover: a certificate OUTSIDE the site
-        // directory, which gets no kqueue wake here at all. The inotify branch
-        // watches each certificate's own parent directory and this one does
-        // not.
+        // The wake itself comes from a watch on the certificate and the key
+        // themselves, so a path outside the site directory is seen. What this
+        // does not cover is a path whose INODE is replaced: the watch holds the
+        // inode it was opened on, and `open(O_EVTONLY)` resolves symlinks, so a
+        // lineage shaped `live/<name>/cert.pem -> archive/<name>/cert3.pem`
+        // gets no wake when the link is repointed. The inotify branch covers
+        // that because it watches the parent directory. `kqueue_watch_site_dir`
+        // says the same where the watch is registered.
         #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
         {
             let mut buf = [0u8; 64];
@@ -421,9 +428,14 @@ fn mtime_of(path: &std::path::Path) -> Option<std::time::SystemTime> {
 /// this platform: the directory's entries did not change and nothing watched
 /// the file. m6 #210.
 ///
-/// A watch is registered once, on the file that is there at startup. A path
-/// REPLACED by a rename is a new inode and the watch does not follow it, which
-/// is true of `site.toml` here as well and is not fixed by this change.
+/// A watch is registered once, on the inode that is there at startup, and
+/// `O_EVTONLY` resolves symlinks. So a path whose inode is replaced loses its
+/// watch: a rename over it, and a lineage of the shape
+/// `live/<name>/cert.pem -> archive/<name>/cert3.pem` whose link is repointed,
+/// both leave the watch on a file nobody writes again. The same is true of
+/// `site.toml` here, and neither is fixed by this change. Watching each
+/// certificate's parent directory, as the inotify branch does, is what would
+/// cover it.
 #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
 fn kqueue_watch_site_dir(site_dir: PathBuf, files: Vec<PathBuf>, pipe_write: RawFd) {
     let kq = unsafe { libc::kqueue() };

@@ -247,38 +247,60 @@ impl Server {
     /// This is the half of #210 that defeated expiry reporting: the registry was
     /// written where the configuration was built, so a monitor kept reading the
     /// certificate loaded at startup however many times the material changed.
-    fn reported_not_after(&self, tls: Arc<rustls::ClientConfig>) -> Option<i64> {
-        let tcp = TcpStream::connect(("127.0.0.1", self.port)).ok()?;
-        tcp.set_read_timeout(Some(Duration::from_secs(10))).ok()?;
-        let name = rustls::pki_types::ServerName::try_from("127.0.0.1".to_string()).ok()?;
-        let conn = rustls::ClientConnection::new(tls, name).ok()?;
+    ///
+    /// Every failure carries its cause, because the subject of this file is a
+    /// number nobody took being read as a number. A helper answering the same
+    /// nothing to a refused connection, a 401, a body with no leaf in it and an
+    /// unparsable digit makes the assertion below report an absent measurement
+    /// as a wrong one.
+    fn reported_not_after(&self, tls: Arc<rustls::ClientConfig>) -> Result<i64, String> {
+        let tcp =
+            TcpStream::connect(("127.0.0.1", self.port)).map_err(|e| format!("connect: {e}"))?;
+        tcp.set_read_timeout(Some(Duration::from_secs(10)))
+            .map_err(|e| format!("read timeout: {e}"))?;
+        let name = rustls::pki_types::ServerName::try_from("127.0.0.1".to_string())
+            .map_err(|e| format!("server name: {e}"))?;
+        let conn =
+            rustls::ClientConnection::new(tls, name).map_err(|e| format!("client config: {e}"))?;
         let mut stream = rustls::StreamOwned::new(conn, tcp);
         let req = format!(
             "GET /perf HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer {}\r\n\
              Connection: close\r\n\r\n",
             self.port, self.token
         );
-        stream.write_all(req.as_bytes()).ok()?;
-        stream.flush().ok()?;
+        stream
+            .write_all(req.as_bytes())
+            .map_err(|e| format!("write: {e}"))?;
+        stream.flush().map_err(|e| format!("flush: {e}"))?;
         let mut raw = Vec::new();
         match stream.read_to_end(&mut raw) {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
-            Err(_) => return None,
+            Err(e) => return Err(format!("read: {e}")),
         }
         let text = String::from_utf8_lossy(&raw);
         // Hand-scanned rather than parsed: the test asserts one number and
         // pulling in a JSON dependency to find it would be the larger change.
         // `"depth":0` is the leaf, and `not_after_unix` follows it.
-        let body = text.split("\r\n\r\n").nth(1)?;
-        let at = body.find("\"depth\":0")?;
+        let body = text
+            .split("\r\n\r\n")
+            .nth(1)
+            .ok_or_else(|| format!("/perf answered with no body: {text}"))?;
+        let at = body
+            .find("\"depth\":0")
+            .ok_or_else(|| format!("/perf reported no leaf certificate: {body}"))?;
         let rest = &body[at..];
-        let key = rest.find("\"not_after_unix\":")? + "\"not_after_unix\":".len();
+        let key = rest
+            .find("\"not_after_unix\":")
+            .ok_or_else(|| format!("/perf's leaf carries no notAfter: {rest}"))?
+            + "\"not_after_unix\":".len();
         let digits: String = rest[key..]
             .chars()
             .take_while(|c| c.is_ascii_digit() || *c == '-')
             .collect();
-        digits.parse().ok()
+        digits
+            .parse()
+            .map_err(|e| format!("notAfter {digits:?} is not a number: {e}"))
     }
 }
 
@@ -382,7 +404,7 @@ fn a_reload_moves_http1_http2_and_http3_to_the_new_certificate() {
     );
     assert_eq!(
         srv.reported_not_after(h1_tls()),
-        Some(first.not_after),
+        Ok(first.not_after),
         "/perf must report the expiry of the certificate loaded at startup"
     );
 
@@ -430,7 +452,7 @@ fn a_reload_moves_http1_http2_and_http3_to_the_new_certificate() {
 
     assert_eq!(
         srv.reported_not_after(h1_tls()),
-        Some(second.not_after),
+        Ok(second.not_after),
         "/perf must report the expiry of the material now being served. Reporting the \
          startup certificate is what made a renewal invisible to a monitor."
     );

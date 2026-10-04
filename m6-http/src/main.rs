@@ -59,7 +59,9 @@ const ERROR_PAGE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 use m6_http_lib::auth::PublicKey;
 use m6_http_lib::h2c_client::H2cClientPool;
 use m6_http_lib::h2s_client::H2sTlsClientPool;
-use m6_http_lib::http11::{make_tls_server_config, H2cListener, Http11Listener, RequestOutcome};
+use m6_http_lib::http11::{
+    load_tls_material, make_tls_server_config, H2cListener, Http11Listener, RequestOutcome,
+};
 use m6_http_lib::poller::{Poller, Token, WakeReader, WakeWriter};
 use m6_http_lib::pool::{self, PoolManager};
 use m6_http_lib::router::{self, RouteTable};
@@ -3912,7 +3914,7 @@ fn handle_tls_reload(
         }
     };
 
-    let material = match m6_http_lib::http11::load_tls_material(cert_path, key_path) {
+    let material = match load_tls_material(cert_path, key_path) {
         Ok(m) => m,
         Err(e) => {
             warn!(error = %e, "TLS config reload failed for HTTP/1.1 and HTTP/2, keeping old config on every protocol");
@@ -3929,21 +3931,29 @@ fn handle_tls_reload(
 
     // Installed together. Past this point nothing can fail.
     *quiche_config = new_quiche;
-    match tcp {
-        Some(t) if t.terminates_tls() => t.replace_tls_config(material.config.clone()),
+    let tls_listener_reloaded = match tcp {
+        Some(t) if t.terminates_tls() => {
+            t.replace_tls_config(material.config.clone());
+            true
+        }
         // A node serving QUIC with no TLS listener is not a configuration this
         // project runs, and recording still answers for what h3 is serving.
-        Some(_) | None => {
-            warn!(
-                "TLS config reload: no HTTP/1.1 TLS listener to rebuild; HTTP/3 alone was reloaded"
-            )
-        }
-    }
+        Some(_) | None => false,
+    };
 
     // After the swap, so the reported expiry is the material being served
     // rather than the material that was read off disk.
     material.record(cert_path);
-    info!("TLS config reloaded on HTTP/1.1, HTTP/2 and HTTP/3");
+
+    // The line names the protocols it actually replaced. Half of what #210 cost
+    // was a log that said `TLS config reloaded` for a reload that reached one
+    // protocol, so a success line claiming all three on the path that rebuilt
+    // one is the same defect moved a few lines down.
+    if tls_listener_reloaded {
+        info!("TLS config reloaded on HTTP/1.1, HTTP/2 and HTTP/3");
+    } else {
+        warn!("TLS config reloaded on HTTP/3 alone: there is no HTTP/1.1 TLS listener to rebuild");
+    }
 }
 
 // ── CLI ────────────────────────────────────────────────────────────────────────
