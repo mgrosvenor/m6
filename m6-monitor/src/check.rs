@@ -50,22 +50,17 @@ pub fn render(d: &Digest, readings: &[NodeReading]) -> String {
         match (&r.traffic, &r.traffic_error) {
             (Some(t), _) => {
                 let l = &t.logging;
-                match l.seconds_since_last {
+                match crate::digest::quiet_log_text(l) {
+                    Some(fault) => {
+                        let _ = writeln!(o, "  {:<5} FAULT  {fault}", r.name);
+                    }
                     None => {
-                        let _ = writeln!(o, "  {:<5} FAULT  nothing has ever been logged", r.name);
-                    }
-                    Some(s) if l.is_blind() => {
-                        let _ = writeln!(
-                            o,
-                            "  {:<5} FAULT  main log silent for {}s ({} events since start)",
-                            r.name, s, l.events_total
-                        );
-                    }
-                    Some(s) => {
                         let _ = writeln!(
                             o,
                             "  {:<5} ok     last event {}s ago, {} since start",
-                            r.name, s, l.events_total
+                            r.name,
+                            l.seconds_since_last.unwrap_or(0),
+                            l.events_total
                         );
                     }
                 }

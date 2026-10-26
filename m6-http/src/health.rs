@@ -147,36 +147,12 @@ const FIREWALL_JSON: &str = "/var/lib/m6/firewall.json";
 /// would be almost entirely wasted work. 24MB is a wide margin over the
 /// busiest hour observed (370KB, during a 890-request probe).
 fn build_report(node: &str, path: &str, window_minutes: u64) -> anyhow::Result<TrafficReport> {
-    use std::io::{Read, Seek, SeekFrom};
+    const TAIL_BYTES: usize = 24 * 1024 * 1024;
 
-    const TAIL_BYTES: u64 = 24 * 1024 * 1024;
-
-    let mut f = std::fs::File::open(path)?;
-    let len = f.metadata()?.len();
-    if len > TAIL_BYTES {
-        f.seek(SeekFrom::Start(len - TAIL_BYTES))?;
-    }
-    let mut live = String::new();
-    f.read_to_string(&mut live)?;
-    // A mid-record start is expected after a seek, and `ndjson::read_str`
-    // skips what it cannot parse, so the partial first line costs nothing.
-
-    // Right after a rotation the live file holds only minutes of the window.
-    // The newest rotated file holds the rest, so read it first and the
-    // summary spans the rotation. A rotated file that cannot be read costs
-    // that history and nothing else.
-    let mut buf = String::new();
-    if let Some(rotated) = m6_core::log::newest_rotated(std::path::Path::new(path)) {
-        if let Ok(mut text) = m6_core::log::read_tail(&rotated, TAIL_BYTES as usize) {
-            // The cut may leave half a record, which would run into the live
-            // file's first line.
-            if !text.ends_with('\n') {
-                text.push('\n');
-            }
-            buf = text;
-        }
-    }
-    buf.push_str(&live);
+    // The newest rotated file is read before the live one, so the summary
+    // spans a rotation. A mid-record start is expected after a cut, and
+    // `ndjson::read_str` skips what it cannot parse, so it costs nothing.
+    let buf = m6_core::log::read_recent(std::path::Path::new(path), TAIL_BYTES)?;
 
     let since = m6_core::util::iso8601_minutes_ago(window_minutes);
     let mut report = TrafficReport::build(node, &buf, &since, window_minutes);

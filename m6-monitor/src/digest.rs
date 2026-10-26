@@ -406,20 +406,24 @@ fn log_reopen_findings(
     }
 }
 
-/// The faults for a main log that has gone quiet, from `/traffic`.
+/// The fault text for a main log that has gone quiet, from `/traffic`, or
+/// `None` while it is emitting.
 ///
-/// Section A of the check prints the same condition in its own words. It is a
-/// finding here too, so the verdict counts it.
-fn quiet_log_findings(node: &str, l: &m6_core::monitoring::LoggingHealth) -> Option<Finding> {
-    let text = match l.seconds_since_last {
-        None => "nothing has ever been logged".to_string(),
-        Some(s) if l.is_blind() => format!(
+/// Section A of the check prints this text and the verdict counts it as a
+/// finding, so both say the same thing.
+pub(crate) fn quiet_log_text(l: &m6_core::monitoring::LoggingHealth) -> Option<String> {
+    match l.seconds_since_last {
+        None => Some("nothing has ever been logged".to_string()),
+        Some(s) if l.is_blind() => Some(format!(
             "main log silent for {s}s ({} events since start)",
             l.events_total
-        ),
-        Some(_) => return None,
-    };
-    Some(Finding {
+        )),
+        Some(_) => None,
+    }
+}
+
+fn quiet_log_findings(node: &str, l: &m6_core::monitoring::LoggingHealth) -> Option<Finding> {
+    quiet_log_text(l).map(|text| Finding {
         level: Level::Fault,
         node: node.to_string(),
         text,

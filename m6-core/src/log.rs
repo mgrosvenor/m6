@@ -342,19 +342,24 @@ pub fn newest_rotated(live: &Path) -> Option<std::path::PathBuf> {
     best.map(|(_, _, path)| path)
 }
 
-/// The last `max_bytes` of a plain or gzip file, as text.
+/// Append the last `max_bytes` of a plain or gzip file to `out`.
 ///
+/// A plain file is read from a seek, so only the tail is read.
+/// A gzip file cannot seek and is decoded from the start.
 /// A gzip file that is cut short yields what decoded before the cut.
-/// A first line that starts mid-record is expected and is the caller's to skip.
-pub fn read_tail(path: &Path, max_bytes: usize) -> std::io::Result<String> {
-    use std::io::Read;
-    let file = std::fs::File::open(path)?;
-    let gz = path.extension().is_some_and(|e| e == "gz");
-    let mut reader: Box<dyn Read> = if gz {
-        Box::new(flate2::read::GzDecoder::new(file))
-    } else {
-        Box::new(file)
-    };
+fn append_tail(path: &Path, max_bytes: usize, out: &mut Vec<u8>) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    if !path.extension().is_some_and(|e| e == "gz") {
+        let len = file.metadata()?.len();
+        let max = max_bytes as u64;
+        if len > max {
+            file.seek(SeekFrom::Start(len - max))?;
+        }
+        file.read_to_end(out)?;
+        return Ok(());
+    }
+    let mut reader = flate2::read::GzDecoder::new(file);
     let mut kept: Vec<u8> = Vec::new();
     let mut chunk = vec![0u8; 64 * 1024];
     loop {
@@ -362,7 +367,7 @@ pub fn read_tail(path: &Path, max_bytes: usize) -> std::io::Result<String> {
             Ok(0) => break,
             Ok(n) => n,
             // A gzip file cut short ends the read, it is not a failure.
-            Err(_) if gz && !kept.is_empty() => break,
+            Err(_) if !kept.is_empty() => break,
             Err(e) => return Err(e),
         };
         kept.extend_from_slice(&chunk[..n]);
@@ -370,10 +375,48 @@ pub fn read_tail(path: &Path, max_bytes: usize) -> std::io::Result<String> {
             kept.drain(..kept.len() - max_bytes);
         }
     }
-    if kept.len() > max_bytes {
-        kept.drain(..kept.len() - max_bytes);
+    let skip = kept.len().saturating_sub(max_bytes);
+    out.extend_from_slice(&kept[skip..]);
+    Ok(())
+}
+
+fn into_text(bytes: Vec<u8>) -> String {
+    String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+}
+
+/// The last `max_bytes` of a plain or gzip file, as text.
+///
+/// A gzip file that is cut short yields what decoded before the cut.
+/// A first line that starts mid-record is expected and is the caller's to skip.
+pub fn read_tail(path: &Path, max_bytes: usize) -> std::io::Result<String> {
+    let mut out = Vec::new();
+    append_tail(path, max_bytes, &mut out)?;
+    Ok(into_text(out))
+}
+
+/// The recent end of a log file across its last rotation, as text.
+///
+/// The tail of the newest rotated sibling (see [`newest_rotated`]) comes first,
+/// then the tail of the live file, each at most `max_bytes`.
+/// Right after a rotation the live file holds only minutes, so a reader of a
+/// time window needs both.
+/// A rotated file that cannot be read costs that history and nothing else.
+/// A first line, or the first line after the join, that starts mid-record is
+/// expected and is the caller's to skip.
+pub fn read_recent(live: &Path, max_bytes: usize) -> std::io::Result<String> {
+    let mut out = Vec::new();
+    if let Some(rotated) = newest_rotated(live) {
+        if append_tail(&rotated, max_bytes, &mut out).is_err() {
+            out.clear();
+        }
+        // The cut may leave half a record, which would run into the live
+        // file's first line.
+        if out.last().is_some_and(|&b| b != b'\n') {
+            out.push(b'\n');
+        }
     }
-    Ok(String::from_utf8_lossy(&kept).into_owned())
+    append_tail(live, max_bytes, &mut out)?;
+    Ok(into_text(out))
 }
 
 /// A layer that does nothing but count. Composed with the format layer
@@ -826,6 +869,18 @@ mod reopen_tests {
         let bytes = std::fs::read(&gz).unwrap();
         std::fs::write(&gz, &bytes[..bytes.len() / 2]).unwrap();
         assert!(!read_tail(&gz, 1 << 20).unwrap().is_empty());
+    }
+
+    #[test]
+    fn read_recent_joins_the_rotated_tail_before_the_live_tail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let live = tmp.path().join("a.ndjson");
+        std::fs::write(&live, "live\n").unwrap();
+        assert_eq!(read_recent(&live, 1 << 20).unwrap(), "live\n");
+        // A rotated file cut mid-record still ends its own line.
+        std::fs::write(tmp.path().join("a.ndjson-2026102601"), "old\nhal").unwrap();
+        assert_eq!(read_recent(&live, 1 << 20).unwrap(), "old\nhal\nlive\n");
+        assert_eq!(read_recent(&live, 3).unwrap(), "hal\nve\n");
     }
 
     #[test]
