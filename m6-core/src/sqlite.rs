@@ -68,7 +68,8 @@
 //!
 //! [`used_bytes`] reports the bytes of the file that hold data, and
 //! [`prune_oldest`] deletes the oldest rows of a table in short transactions
-//! until the file is at or under a target. Deleted pages go to SQLite's free
+//! until the file is at or under a target. The target counts the whole file, so
+//! [`Pruned::cap_met`] tells the caller whether it was reached. Deleted pages go to SQLite's free
 //! list and are reused, so the file does not shrink, and `used_bytes` is the
 //! number to compare with a cap.
 //!
@@ -329,9 +330,27 @@ pub fn used_bytes(conn: &Connection) -> Result<u64, SqliteError> {
     Ok(pages.saturating_sub(free) * size)
 }
 
+/// The result of [`prune_oldest`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pruned {
+    /// Rows deleted from the table.
+    pub rows_deleted: u64,
+    /// Whether [`used_bytes`] is at or under the target when the call returns.
+    /// It is false when the table ran out of rows first.
+    pub cap_met: bool,
+}
+
 /// Delete the oldest rows of `table` (lowest `rowid` first), `batch` rows per
 /// transaction, until [`used_bytes`] is at or under `target_bytes` or the table
-/// is empty. Returns the number of rows deleted.
+/// is empty.
+///
+/// The cap counts the whole file, but the rows come from one table. If the
+/// other tables use more than the target, this empties `table` and returns with
+/// [`Pruned::cap_met`] false. The caller must check that field.
+///
+/// Deleting rows frees index pages more slowly than table pages, because an
+/// index page is released only when it is empty. The call may therefore delete
+/// more rows than the bare target needs.
 ///
 /// A `batch` of 0 is treated as 1. The table needs a `rowid`, and must not be
 /// append-only: the rule refuses the delete and the call returns the error.
@@ -340,13 +359,13 @@ pub fn prune_oldest(
     table: &str,
     batch: u32,
     target_bytes: u64,
-) -> Result<u64, SqliteError> {
+) -> Result<Pruned, SqliteError> {
     let t = checked_name(table)?;
     let sql = format!(
         "DELETE FROM \"{t}\" WHERE rowid IN (SELECT rowid FROM \"{t}\" ORDER BY rowid LIMIT ?1)"
     );
     let batch = batch.max(1);
-    let mut deleted = 0u64;
+    let mut rows_deleted = 0u64;
     while used_bytes(conn)? > target_bytes {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let n = tx.execute(&sql, [batch])?;
@@ -354,9 +373,12 @@ pub fn prune_oldest(
         if n == 0 {
             break;
         }
-        deleted += n as u64;
+        rows_deleted += n as u64;
     }
-    Ok(deleted)
+    Ok(Pruned {
+        rows_deleted,
+        cap_met: used_bytes(conn)? <= target_bytes,
+    })
 }
 
 /// What can go wrong opening, migrating or guarding a database.
@@ -935,8 +957,10 @@ mod tests {
         filled(&mut c, 400);
         let full = used_bytes(&c).unwrap();
         let target = full / 2;
-        let n = prune_oldest(&mut c, "log", 10, target).unwrap();
+        let pruned = prune_oldest(&mut c, "log", 10, target).unwrap();
+        let n = pruned.rows_deleted;
         assert!(n > 0);
+        assert!(pruned.cap_met);
         assert!(used_bytes(&c).unwrap() <= target);
         assert_eq!(count(&c, "SELECT max(id) FROM log"), 400);
         assert_eq!(
@@ -944,7 +968,9 @@ mod tests {
             n as i64 + 1,
             "the oldest rows go first"
         );
-        assert_eq!(prune_oldest(&mut c, "log", 10, target).unwrap(), 0);
+        let again = prune_oldest(&mut c, "log", 10, target).unwrap();
+        assert_eq!(again.rows_deleted, 0);
+        assert!(again.cap_met);
     }
 
     // U3
@@ -953,8 +979,8 @@ mod tests {
         let (_d, path) = db();
         let mut c = open(&path).unwrap();
         filled(&mut c, 20);
-        let n = prune_oldest(&mut c, "log", 0, 0).unwrap();
-        assert_eq!(n, 20);
+        let pruned = prune_oldest(&mut c, "log", 0, 0).unwrap();
+        assert_eq!(pruned.rows_deleted, 20);
         assert_eq!(count(&c, "SELECT count(*) FROM log"), 0);
     }
 
@@ -970,6 +996,31 @@ mod tests {
             Err(SqliteError::Sqlite(_))
         ));
         assert_eq!(count(&c, "SELECT count(*) FROM log"), 20);
+    }
+
+    // U6
+    #[test]
+    fn prune_oldest_reports_a_cap_it_cannot_meet() {
+        let (_d, path) = db();
+        let mut c = open(&path).unwrap();
+        filled(&mut c, 20);
+        c.execute_batch("CREATE TABLE big(id INTEGER PRIMARY KEY, body TEXT);")
+            .unwrap();
+        let tx = c.transaction().unwrap();
+        for i in 1..=400 {
+            tx.execute(
+                "INSERT INTO big(id, body) VALUES (?1, ?2)",
+                params![i, "y".repeat(500)],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+        let cap = used_bytes(&c).unwrap() / 2;
+        let pruned = prune_oldest(&mut c, "log", 5, cap).unwrap();
+        assert_eq!(pruned.rows_deleted, 20);
+        assert_eq!(count(&c, "SELECT count(*) FROM log"), 0);
+        assert_eq!(count(&c, "SELECT count(*) FROM big"), 400);
+        assert!(!pruned.cap_met);
     }
 
     // U5
