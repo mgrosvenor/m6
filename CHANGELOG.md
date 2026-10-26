@@ -12,6 +12,25 @@ releases only; work happens on `develop`. See `CONTRIBUTING.md`.
 
 ---
 
+## Unreleased
+
+Changes merged to `develop` since the last release. The section is renamed to
+the version when the release is cut.
+
+### Security
+
+**Four dependencies moved up a patch version to clear seven RustSec advisories
+(#230).** rustls 0.23.45 to 0.23.46, rustls-webpki 0.103.15 to 0.103.16, tokio
+1.53.1 to 1.53.3, and webpki-roots 1.0.9 to 1.0.10. This clears
+RUSTSEC-2026-0346, -0347, -0348, -0349, -0381, -0382 and -0386, which had turned
+CI's `cargo deny` job red on every open pull request. Only `Cargo.lock` changes;
+no `Cargo.toml` requirement moved.
+
+Verified: `cargo deny check` passes, and the release build has no warnings. The
+workspace tests pass with 0 failures, h3 and QUIC included.
+
+---
+
 ## 1.13.0 — 2026-10-02
 
 **A server that terminates TLS now says how long its certificate has left.**
