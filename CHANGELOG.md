@@ -83,7 +83,7 @@ time of 0 means the peer never completed a handshake, a missing file is
 `m6-monitor` row of Table 7 in `docs/m6-architecture.md` describe both.
 
 Verified: `cargo test -p m6-monitor -p m6-core` passes for the wireguard tests
-(7), the m6-monitor unit tests (78) and the m6-monitor integration tests that
+(7), the m6-monitor unit tests (87) and the m6-monitor integration tests that
 include the loopback tunnel probe, with 0 failures and no warnings. Not run
 locally: conformance and the MSRV build, which CI covers.
 
