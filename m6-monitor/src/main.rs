@@ -355,7 +355,8 @@ fn render(d: &digest::Digest) -> String {
         };
         h.push_str(&format!(
             "<div class='{cls}'><b>{}</b> &middot; {}</div>",
-            f.node, f.text
+            m6_core::util::html_escape(&f.node),
+            m6_core::util::html_escape(&f.text)
         ));
     }
 
@@ -383,9 +384,9 @@ fn render(d: &digest::Digest) -> String {
             "<tr><td>{}</td><td class=dim>{}</td><td>{}</td><td>{}</td>\
              <td>{}</td><td>{}</td><td>{}</td><td>{}</td>\
              <td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-            n.name,
-            n.role,
-            n.status,
+            m6_core::util::html_escape(&n.name),
+            m6_core::util::html_escape(&n.role),
+            m6_core::util::html_escape(&n.status),
             n.rtt_ms
                 .map(|v| format!("{v:.1}ms"))
                 .unwrap_or_else(|| "-".into()),
@@ -433,7 +434,8 @@ fn render(d: &digest::Digest) -> String {
         };
         h.push_str(&format!(
             "<tr><td>{}</td><td style='text-align:left'>{}</td></tr>",
-            n.name, pools
+            m6_core::util::html_escape(&n.name),
+            pools
         ));
     }
     h.push_str("</table></div>");
@@ -489,5 +491,30 @@ mod tests {
             "{html}"
         );
         assert!(html.contains("no tunnel"), "{html}");
+    }
+
+    /// Node name, role and status come from config and from the nodes, and
+    /// reach the page as HTML.
+    #[test]
+    fn the_page_escapes_node_name_role_and_status() {
+        let mut d = digest::build(&[], &digest::Thresholds::default(), "now".into());
+        let mut n = node_digest("<i>edge</i>", None);
+        n.role = "<b>cache</b>".into();
+        n.status = "<u>ok</u>".into();
+        d.nodes = vec![n];
+        d.findings.push(digest::Finding {
+            level: digest::Level::Fault,
+            node: "<s>monitor</s>".into(),
+            text: "file </p>/x is old".into(),
+        });
+        let html = render(&d);
+        assert!(!html.contains("<s>monitor"), "{html}");
+        assert!(html.contains("file &lt;/p&gt;/x is old"), "{html}");
+        assert!(!html.contains("<i>edge"), "{html}");
+        assert!(!html.contains("<b>cache"), "{html}");
+        assert!(!html.contains("<u>ok"), "{html}");
+        assert!(html.contains("&lt;i&gt;edge&lt;/i&gt;"), "{html}");
+        assert!(html.contains("&lt;b&gt;cache&lt;/b&gt;"), "{html}");
+        assert!(html.contains("&lt;u&gt;ok&lt;/u&gt;"), "{html}");
     }
 }
