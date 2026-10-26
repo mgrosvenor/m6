@@ -28,6 +28,7 @@ pub mod telemetry;
 pub mod tls;
 pub mod util;
 pub mod watcher;
+pub mod wireguard;
 
 /// Shared integration-test harness. Behind a feature so it is never compiled
 /// into a production binary; enable it in `dev-dependencies` only.
