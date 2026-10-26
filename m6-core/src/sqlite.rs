@@ -50,10 +50,13 @@
 //!   for each (child table, parent table) pair. If any pair has more after
 //!   than before, the migration is rolled back and [`migrate`] returns
 //!   [`SqliteError::ForeignKeyCheck`], naming the child and the parent table.
-//!   A dangling reference already in the file does not block a migration, so an
-//!   orphan row left by an earlier connection is safe. The one case the check
-//!   does not catch is a migration that removes one dangling reference and adds
-//!   another between the same two tables. When [`migrate`] returns, foreign keys
+//!   A dangling reference already in the file does not block a migration that
+//!   keeps both table names, so an orphan row left by an earlier connection is
+//!   safe there. Renaming the child or the parent table moves an existing
+//!   orphan to a new pair, so that migration is refused. Delete the orphan rows
+//!   first, in an earlier migration, and then rename. The check does not catch
+//!   a migration that removes one dangling reference and adds another between
+//!   the same two tables. When [`migrate`] returns, foreign keys
 //!   are back to the setting they had on entry. The check is skipped when the
 //!   connection was opened with foreign keys off.
 //! - A migration may not contain statements that SQLite refuses or ignores

@@ -65,7 +65,8 @@ Each migration runs in its own `BEGIN IMMEDIATE` transaction, so connections tha
 A file newer than the migration list is refused with `NewerThanCode`, both before the first migration and again inside each transaction, so a newer process that migrates the file meanwhile is also refused.
 `migrate` switches `foreign_keys` off before each migration, because SQLite ignores that pragma inside a transaction, and so a migration can rebuild a table that others point at without losing their rows.
 It runs `PRAGMA foreign_key_check` before and after each migration's SQL, inside its transaction, and fails with `ForeignKeyCheck` naming the child and parent table if any (child table, parent table) pair has more dangling references after than before.
-A dangling reference already in the file does not block a migration.
+A dangling reference already in the file does not block a migration that keeps both table names.
+Renaming a table that holds one is refused, so delete the orphan rows in an earlier migration first.
 A migration that removes one dangling reference and adds another between the same two tables is not caught.
 `foreign_keys` is restored to its earlier setting when `migrate` returns.
 `append_only(&conn, table)` adds triggers that refuse UPDATE and DELETE on a named table, and `is_append_only` reports them.
