@@ -144,9 +144,13 @@ jobs:
           [ "$n" -eq 0 ] || { echo "::error::$n warning(s) building m6-core --all-features"; exit 1; }
           # The integration tests need built binaries, so only the library tests
           # and the doctests run here.
-          { cargo test -p m6-core --lib --all-features; cargo test -p m6-core --doc --all-features; } > feat.log 2>&1 || true
+          # The status is kept, so a test that aborts or crashes fails the step
+          # even though it prints no `failures:` line.
+          status=0
+          { cargo test -p m6-core --lib --all-features && cargo test -p m6-core --doc --all-features; } > feat.log 2>&1 || status=$?
           grep -E '^test result:' feat.log || true
           if grep -q '^failures:' feat.log; then sed -n '/^failures:/,$p' feat.log | head -80; echo "::error::m6-core --all-features tests failed"; exit 1; fi
+          [ "$status" -eq 0 ] || { tail -80 feat.log; echo "::error::m6-core --all-features tests exited with status $status"; exit 1; }
 
       # Clippy must be silent: `-D warnings`, no ceiling. It went to zero on
       # 2026-09-13 and is held there the same way rustc warnings are. A new
