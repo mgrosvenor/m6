@@ -194,6 +194,8 @@ impl Default for LogConfig {
 /// Per-request traffic logging (session cookie, referrer, UA, cache state,
 /// node identity, ...) — separate from operational `[log]` above. Written to
 /// its own file via `m6_core::log::init_with_analytics`, always JSON.
+///
+/// Rotate by renaming the file and sending SIGUSR1: the process reopens the path.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalyticsConfig {
     #[serde(default = "default_true")]

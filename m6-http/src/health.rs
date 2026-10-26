@@ -140,6 +140,8 @@ const FIREWALL_JSON: &str = "/var/lib/m6/firewall.json";
 
 /// Read the last `window_minutes` of the analytics log and summarise it.
 ///
+/// The newest rotated file is read as well, so the window survives a rotation.
+///
 /// The tail is bounded rather than reading the whole file: an hour of traffic
 /// is at most a few hundred KB and the file is tens of MB, so reading it all
 /// would be almost entirely wasted work. 24MB is a wide margin over the
@@ -154,10 +156,27 @@ fn build_report(node: &str, path: &str, window_minutes: u64) -> anyhow::Result<T
     if len > TAIL_BYTES {
         f.seek(SeekFrom::Start(len - TAIL_BYTES))?;
     }
-    let mut buf = String::new();
-    f.read_to_string(&mut buf)?;
+    let mut live = String::new();
+    f.read_to_string(&mut live)?;
     // A mid-record start is expected after a seek, and `ndjson::read_str`
     // skips what it cannot parse, so the partial first line costs nothing.
+
+    // Right after a rotation the live file holds only minutes of the window.
+    // The newest rotated file holds the rest, so read it first and the
+    // summary spans the rotation. A rotated file that cannot be read costs
+    // that history and nothing else.
+    let mut buf = String::new();
+    if let Some(rotated) = m6_core::log::newest_rotated(std::path::Path::new(path)) {
+        if let Ok(mut text) = m6_core::log::read_tail(&rotated, TAIL_BYTES as usize) {
+            // The cut may leave half a record, which would run into the live
+            // file's first line.
+            if !text.ends_with('\n') {
+                text.push('\n');
+            }
+            buf = text;
+        }
+    }
+    buf.push_str(&live);
 
     let since = m6_core::util::iso8601_minutes_ago(window_minutes);
     let mut report = TrafficReport::build(node, &buf, &since, window_minutes);
@@ -318,5 +337,42 @@ mod traffic_endpoint_tests {
         assert!(headers
             .iter()
             .any(|(k, val)| k.eq_ignore_ascii_case("cache-control") && val == "no-store"));
+    }
+
+    /// After an hourly rotation the live file is nearly empty, and the
+    /// monitor's sixty minute sections must not shrink with it.
+    #[test]
+    fn the_window_spans_the_newest_rotated_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = m6_core::util::now_iso8601();
+        let ts = now.trim_end_matches('Z');
+        let live = dir.path().join("analytics.ndjson");
+        std::fs::write(
+            &live,
+            format!(
+                "{}\n",
+                row(&format!("{ts}.300Z"), "1.2.3.4", "/c", 200, "x")
+            ),
+        )
+        .unwrap();
+        let rotated = format!(
+            "{}\n{}\n",
+            row(&format!("{ts}.100Z"), "1.2.3.4", "/a", 200, "x"),
+            row(&format!("{ts}.200Z"), "1.2.3.4", "/b", 200, "x")
+        );
+        // Plain here. The gzip path is covered by `m6_core::log`'s tests.
+        std::fs::write(dir.path().join("analytics.ndjson-2026010101"), rotated).unwrap();
+        let out = traffic(
+            "origin",
+            live.to_str().unwrap(),
+            60,
+            Duration::from_secs(0),
+            &auth("Bearer tok"),
+            Some("tok"),
+        );
+        let (code, _, body) = out.into_response();
+        assert_eq!(code, 200);
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["total_requests"], 3);
     }
 }

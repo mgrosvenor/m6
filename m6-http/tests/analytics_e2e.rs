@@ -52,6 +52,8 @@ fn tls_client_config(cert_der: &[u8]) -> Arc<rustls::ClientConfig> {
 struct HttpResponse {
     status: u16,
     headers: String,
+    /// Everything after the final header block.
+    body: String,
 }
 
 impl HttpResponse {
@@ -93,6 +95,7 @@ fn no_response(reason: impl std::fmt::Display) -> HttpResponse {
     HttpResponse {
         status: 0,
         headers: format!("<no response: {reason}>"),
+        body: String::new(),
     }
 }
 
@@ -180,7 +183,15 @@ fn https_exchange(
         }
         break (block.to_string(), code);
     };
-    HttpResponse { status, headers }
+    let body = text
+        .split_once(headers.as_str())
+        .map(|(_, after)| after.trim_start_matches("\r\n\r\n").to_string())
+        .unwrap_or_default();
+    HttpResponse {
+        status,
+        headers,
+        body,
+    }
 }
 
 // ── HTTP/3 client ─────────────────────────────────────────────────────────────
@@ -359,6 +370,8 @@ struct Server {
     port: u16,
     cert_der: Vec<u8>,
     analytics_log: PathBuf,
+    /// The `[health] metrics_token_file` token, which `/perf` requires.
+    token: String,
     http: std::cell::RefCell<Service>,
     _file: Service,
     _dir: tempfile::TempDir,
@@ -404,6 +417,16 @@ impl Server {
             Some(tcp) => https_exchange(tcp, self.port, path, extra, self.tls()),
             None => no_response("tcp connect refused while m6-http was alive"),
         }
+    }
+
+    /// `/perf` as JSON. Needs the bearer token the fixture configures.
+    fn perf_json(&self) -> serde_json::Value {
+        let auth = format!("Bearer {}", self.token);
+        let r = self.get("/perf", &[("Authorization", auth.as_str())]);
+        assert_eq!(r.status, 200, "/perf answered {}\n{}", r.status, r.headers);
+        let start = r.body.find('{').expect("a JSON body");
+        let end = r.body.rfind('}').expect("a JSON body");
+        serde_json::from_str(&r.body[start..=end]).expect("/perf is JSON")
     }
 
     /// Wait until a request actually reaches the backend, then clear the log.
@@ -474,6 +497,9 @@ fn start_server() -> Server {
     let sock = dir.path().join("m6-file-1.sock");
     let sock_glob = dir.path().join("m6-file-*.sock");
     let analytics_log = dir.path().join("analytics.ndjson");
+    let token = "analytics-e2e-token".to_string();
+    let token_file = dir.path().join("perf-token");
+    std::fs::write(&token_file, &token).unwrap();
 
     std::fs::write(
         site.join("site.toml"),
@@ -484,7 +510,7 @@ name   = "analytics-e2e"
 domain = "localhost"
 
 [log]
-level  = "warn"
+level  = "info"
 format = "text"
 
 [errors]
@@ -492,6 +518,9 @@ mode = "internal"
 
 [analytics]
 log_path = "{log_path}"
+
+[health]
+metrics_token_file = "{token_file}"
 
 [rate_limit]
 enabled = false
@@ -506,6 +535,7 @@ backend = "m6-file"
 "#,
             sock_glob = sock_glob.display(),
             log_path = analytics_log.display(),
+            token_file = token_file.display(),
         ),
     )
     .unwrap();
@@ -562,6 +592,7 @@ name = "test-node"
         port,
         cert_der,
         analytics_log,
+        token,
         http: std::cell::RefCell::new(http_proc),
         _file: file_proc,
         _dir: dir,
@@ -572,6 +603,80 @@ name = "test-node"
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
+
+fn request_lines(srv: &Server) -> usize {
+    read_analytics_lines(&srv.analytics_log).len()
+}
+
+fn wait_for_request_lines(srv: &Server, want: usize) {
+    let ok = m6_core::testkit::wait::until(Duration::from_secs(10), || request_lines(srv) >= want);
+    assert!(
+        ok,
+        "expected {want} request lines, saw {}",
+        request_lines(srv)
+    );
+}
+
+/// Rotation by rename and signal loses nothing: five requests land in the
+/// renamed file, five in the new one, the process keeps serving, and `/perf`
+/// reports the reopen.
+#[test]
+fn sigusr1_reopens_the_analytics_log_and_loses_no_line() {
+    let srv = start_server();
+
+    let before = srv.perf_json();
+    let reopen = &before["logging"]["reopen"];
+    assert_eq!(reopen["reopens_total"], 0, "{before}");
+    assert!(reopen["seconds_since_last_reopen"].is_null());
+
+    for _ in 0..5 {
+        assert_eq!(srv.get("/public/plain.html", &[]).status, 200);
+    }
+    wait_for_request_lines(&srv, 5);
+
+    let rotated = srv.analytics_log.with_extension("ndjson.1");
+    std::fs::rename(&srv.analytics_log, &rotated).unwrap();
+    srv.http.borrow().signal(libc::SIGUSR1);
+    let back = m6_core::testkit::wait::until(Duration::from_secs(5), || srv.analytics_log.exists());
+    assert!(back, "the live path never reappeared");
+
+    for _ in 0..5 {
+        assert_eq!(srv.get("/public/plain.html", &[]).status, 200);
+    }
+    wait_for_request_lines(&srv, 5);
+    srv.http.borrow_mut().assert_alive("after SIGUSR1");
+
+    assert_eq!(read_analytics_lines(&rotated).len(), 5);
+    assert_eq!(read_analytics_lines(&srv.analytics_log).len(), 5);
+
+    let after = srv.perf_json();
+    let reopen = &after["logging"]["reopen"];
+    assert_eq!(reopen["reopens_total"], 1, "{after}");
+    assert!(reopen["seconds_since_last_reopen"].as_u64().unwrap() < 60);
+    assert!(reopen["last_reopen_unix"].as_u64().is_some());
+    assert!(srv.http.borrow().output().contains("log file reopened"));
+}
+
+/// SIGUSR1 used to kill the process, and as a handled signal it must not
+/// count as the first of the two signals that force an exit.
+#[test]
+fn reopen_signals_never_count_toward_a_forced_shutdown() {
+    let srv = start_server();
+    // One at a time: a standard signal sent while the same one is pending is
+    // merged into it, so two sent back to back may be one reopen.
+    for want in 1..=2u64 {
+        srv.http.borrow().signal(libc::SIGUSR1);
+        let reopened = m6_core::testkit::wait::until(Duration::from_secs(5), || {
+            srv.perf_json()["logging"]["reopen"]["reopens_total"] == want
+        });
+        assert!(reopened, "reopen {want} should have been handled");
+    }
+    srv.http.borrow_mut().assert_alive("after two SIGUSR1");
+    srv.http.borrow_mut().terminate(Duration::from_secs(10));
+    let out = srv.http.borrow().output();
+    assert!(out.contains("shutdown complete"), "{out}");
+    assert!(!out.contains("shutdown forced"), "{out}");
+}
 
 /// The core regression test: a request with no session cookie gets exactly
 /// one `Set-Cookie`; replaying with that cookie gets none, and reuses the
