@@ -2388,7 +2388,7 @@ fn handle_request_inner(
     // True when this request arrived on the h2c listener and [server]
     // internal_binds names it, meaning one of our own nodes over the backbone
     // rather than a public client. Granted by the listener, never by a header, so a public
-    // client cannot claim it. Only the error-path guard reads it.
+    // client cannot claim it. The error-path guard and the metrics gate read it.
     from_internal: bool,
 ) -> RequestOutcome {
     // Prefetch requests are synthetic (no real client, client_ip is a
@@ -2504,34 +2504,41 @@ fn handle_request_inner(
     // the split is what keeps the health answer cheap. `snapshot` is passed
     // as a closure and is not called until authorisation passes.
     if state.config.health.enabled && req.path == state.config.health.perf_path {
-        // Pool occupancy is gathered here rather than on `/health`, which
-        // publishes neither. It costs a lock-free read of the pool manager and
-        // happens before the token check, which is fine: it is bounded work,
-        // unlike the reservoir sort in `snapshot`.
-        let pools: Vec<health::PoolHealth> = state
-            .pool_manager
-            .pool_health()
-            .into_iter()
-            .map(|(name, active, total)| health::PoolHealth {
-                name,
-                active,
-                total,
-            })
-            .collect();
-        let outcome = health::PerfReport::build(
-            health::PerfSubject {
-                node: &state.config.node.name,
-                uptime_s: state.started.elapsed().as_secs(),
-                pools,
-                url_backends: state.pool_manager.url_backend_names(),
-                host_path: &state.config.site_dir,
-            },
-            health::PerfAccess {
-                headers: &req.headers,
-                configured_token: state.config.health.metrics_token.as_deref(),
-            },
-            || state.stats.snapshot(),
-        );
+        let outcome = match health::metrics_gate(
+            &state.config.health,
+            state.public_key.as_ref(),
+            &req.headers,
+            client_ip,
+            from_internal,
+        ) {
+            health::Gate::Refused(refused) => refused,
+            health::Gate::Open => {
+                // Pool occupancy is gathered here rather than on `/health`,
+                // which publishes neither, and only after the gate has passed.
+                // It costs a lock-free read of the pool manager, unlike the
+                // reservoir sort in `snapshot`.
+                let pools: Vec<health::PoolHealth> = state
+                    .pool_manager
+                    .pool_health()
+                    .into_iter()
+                    .map(|(name, active, total)| health::PoolHealth {
+                        name,
+                        active,
+                        total,
+                    })
+                    .collect();
+                health::PerfReport::build_authorised(
+                    health::PerfSubject {
+                        node: &state.config.node.name,
+                        uptime_s: state.started.elapsed().as_secs(),
+                        pools,
+                        url_backends: state.pool_manager.url_backend_names(),
+                        host_path: &state.config.site_dir,
+                    },
+                    || state.stats.snapshot(),
+                )
+            }
+        };
         let (code, headers, body) = outcome.into_response();
         // Same treatment as /health above. A 401 here is worth seeing: it
         // means something is probing the metrics endpoint without the token.
@@ -2553,14 +2560,21 @@ fn handle_request_inner(
     // rather than of a header on a cheaper one. Cached, so a polling monitor
     // cannot make the node re-read the log on every scrape.
     if state.config.health.enabled && req.path == state.config.health.traffic_path {
-        let outcome = health::traffic(
-            &state.config.node.name,
-            &state.config.analytics.log_path,
-            60,
-            std::time::Duration::from_secs(state.config.health.traffic_cache_s),
+        let outcome = match health::metrics_gate(
+            &state.config.health,
+            state.public_key.as_ref(),
             &req.headers,
-            state.config.health.metrics_token.as_deref(),
-        );
+            client_ip,
+            from_internal,
+        ) {
+            health::Gate::Refused(refused) => refused,
+            health::Gate::Open => health::traffic_authorised(
+                &state.config.node.name,
+                &state.config.analytics.log_path,
+                60,
+                std::time::Duration::from_secs(state.config.health.traffic_cache_s),
+            ),
+        };
         let (code, headers, body) = outcome.into_response();
         analytics::log_monitor(
             state.config.analytics.enabled,

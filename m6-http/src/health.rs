@@ -10,6 +10,11 @@
 //! backend name a monitoring response is tagged with, and keeping those
 //! responses out of the site traffic counters.
 
+use std::net::IpAddr;
+
+use crate::auth::{self, PublicKey, Refusal};
+use crate::config::HealthConfig;
+
 pub use m6_core::monitoring::{
     metrics_authorised, HealthReport, PerfAccess, PerfOutcome, PerfReport, PerfSubject, PoolHealth,
 };
@@ -53,6 +58,9 @@ mod token_file_tests {
             traffic_cache_s: 60,
             metrics_token_file: Some("/etc/m6/perf-token".to_string()),
             metrics_token: Some("super-secret-value".to_string()),
+            metrics_require: None,
+            metrics_peers: None,
+            metrics_peer_ips: Vec::new(),
         };
         let dumped = serde_json::to_string(&health).expect("serialisable");
         assert!(
@@ -188,14 +196,27 @@ pub fn traffic(
     headers: &[(String, String)],
     configured_token: Option<&str>,
 ) -> PerfOutcome {
-    match configured_token.filter(|t| !t.is_empty()) {
-        None => return PerfOutcome::Disabled,
-        Some(_) if !metrics_authorised(headers, configured_token) => {
-            return PerfOutcome::Unauthorised
-        }
-        Some(_) => {}
+    if let Some(refused) = (PerfAccess {
+        headers,
+        configured_token,
+    })
+    .refusal()
+    {
+        return refused;
     }
+    traffic_authorised(node, log_path, window_minutes, cache_for)
+}
 
+/// The `/traffic` summary for a caller some gate has already authorised.
+///
+/// Everything `traffic` does after its token check: the cached summary, or one
+/// bounded read of the analytics tail.
+pub fn traffic_authorised(
+    node: &str,
+    log_path: &str,
+    window_minutes: u64,
+    cache_for: Duration,
+) -> PerfOutcome {
     let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((built, report)) = cache.as_ref() {
         if built.elapsed() < cache_for {
@@ -208,6 +229,69 @@ pub fn traffic(
             PerfOutcome::Traffic(Box::new(r))
         }
         Err(e) => PerfOutcome::TrafficError(format!("{e}")),
+    }
+}
+
+/// The verdict of the metrics gate for one request.
+pub enum Gate {
+    /// Serve the report.
+    Open,
+    /// Answer with this and do nothing else.
+    Refused(PerfOutcome),
+}
+
+/// Decide whether `/perf` or `/traffic` may be served to this request.
+///
+/// Two rules, in this order:
+///
+/// 1. `metrics_peers`, when set: the request must not have arrived on an
+///    internal h2c listener (there the client address is a forwarded claim),
+///    and its peer address must be listed. Otherwise `Disabled`, the 404 an
+///    unconfigured endpoint gives, before any token is looked at.
+/// 2. `metrics_require`, when set: an API token that passes the claim check
+///    (`Unauthorised` for none or a bad one, `Forbidden` for the wrong claim).
+///    When unset, the legacy `metrics_token_file` gate.
+///
+/// The address rule allocates nothing: one parse of the peer address and a
+/// scan of a short slice, and only on these two paths.
+pub fn metrics_gate(
+    h: &HealthConfig,
+    key: Option<&PublicKey>,
+    headers: &[(String, String)],
+    client_ip: &str,
+    from_internal: bool,
+) -> Gate {
+    if h.metrics_peers.is_some() {
+        let listed = !from_internal
+            && client_ip
+                .parse::<IpAddr>()
+                .is_ok_and(|ip| h.metrics_peer_ips.contains(&ip.to_canonical()));
+        if !listed {
+            return Gate::Refused(PerfOutcome::Disabled);
+        }
+    }
+    match h.metrics_require.as_deref() {
+        Some(require) => {
+            let Some(key) = key else {
+                return Gate::Refused(PerfOutcome::Unauthorised);
+            };
+            match auth::authorise(key, headers, require) {
+                Ok(_) => Gate::Open,
+                Err(Refusal::Insufficient) => Gate::Refused(PerfOutcome::Forbidden),
+                Err(Refusal::NoToken | Refusal::Invalid(_)) => {
+                    Gate::Refused(PerfOutcome::Unauthorised)
+                }
+            }
+        }
+        None => match (PerfAccess {
+            headers,
+            configured_token: h.metrics_token.as_deref(),
+        })
+        .refusal()
+        {
+            Some(refused) => Gate::Refused(refused),
+            None => Gate::Open,
+        },
     }
 }
 
@@ -354,5 +438,193 @@ mod traffic_endpoint_tests {
         assert_eq!(code, 200);
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["total_requests"], 3);
+    }
+}
+
+#[cfg(test)]
+mod metrics_gate_tests {
+    use super::*;
+    use jsonwebtoken::{Algorithm, EncodingKey, Header};
+
+    fn keypair() -> (tempfile::TempDir, PublicKey, String) {
+        let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("ec keypair");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pub.pem");
+        std::fs::write(&path, kp.public_key_pem()).unwrap();
+        (
+            dir,
+            PublicKey::from_pem_file(&path).unwrap(),
+            kp.serialize_pem(),
+        )
+    }
+
+    fn token(private_pem: &str, roles: &[&str]) -> Vec<(String, String)> {
+        #[derive(serde::Serialize)]
+        struct C {
+            exp: u64,
+            roles: Vec<String>,
+        }
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        let claims = C {
+            exp,
+            roles: roles.iter().map(|r| r.to_string()).collect(),
+        };
+        let key = EncodingKey::from_ec_pem(private_pem.as_bytes()).unwrap();
+        let t = jsonwebtoken::encode(&Header::new(Algorithm::ES256), &claims, &key).unwrap();
+        vec![("authorization".to_string(), format!("Bearer {t}"))]
+    }
+
+    fn health(peers: Option<&[&str]>, require: Option<&str>, legacy: Option<&str>) -> HealthConfig {
+        HealthConfig {
+            metrics_require: require.map(str::to_string),
+            metrics_peers: peers.map(|p| p.iter().map(|s| s.to_string()).collect()),
+            metrics_peer_ips: peers
+                .unwrap_or(&[])
+                .iter()
+                .map(|s| s.parse::<IpAddr>().unwrap().to_canonical())
+                .collect(),
+            metrics_token: legacy.map(str::to_string),
+            ..HealthConfig::default()
+        }
+    }
+
+    fn is_disabled(g: &Gate) -> bool {
+        matches!(g, Gate::Refused(PerfOutcome::Disabled))
+    }
+
+    #[test]
+    fn an_unlisted_peer_is_404_before_any_token_check() {
+        let (_d, key, private) = keypair();
+        let h = health(Some(&["10.0.0.9"]), Some("role:monitor"), None);
+        let good = token(&private, &["monitor"]);
+        for ip in ["203.0.113.7", "2001:db8::1", "10.0.0.8"] {
+            let g = metrics_gate(&h, Some(&key), &good, ip, false);
+            assert!(is_disabled(&g), "{ip} must get 404 even with a valid token");
+        }
+        // No token and an unlisted peer is still 404, not 401: a stranger
+        // learns nothing about the credential.
+        assert!(is_disabled(&metrics_gate(
+            &h,
+            Some(&key),
+            &[],
+            "203.0.113.7",
+            false
+        )));
+    }
+
+    #[test]
+    fn a_listed_peer_passes_the_address_rule() {
+        let (_d, key, private) = keypair();
+        let h = health(Some(&["10.0.0.9"]), Some("role:monitor"), None);
+        let good = token(&private, &["monitor"]);
+        assert!(matches!(
+            metrics_gate(&h, Some(&key), &good, "10.0.0.9", false),
+            Gate::Open
+        ));
+        // An IPv4-mapped IPv6 peer is the same host, so the comparison is canonical.
+        assert!(matches!(
+            metrics_gate(&h, Some(&key), &good, "::ffff:10.0.0.9", false),
+            Gate::Open
+        ));
+    }
+
+    #[test]
+    fn an_unparseable_client_address_is_refused() {
+        let (_d, key, private) = keypair();
+        let h = health(Some(&["10.0.0.9"]), Some("role:monitor"), None);
+        let good = token(&private, &["monitor"]);
+        for ip in ["", "unknown", "10.0.0.9:443", "10.0.0.9, 1.2.3.4"] {
+            assert!(
+                is_disabled(&metrics_gate(&h, Some(&key), &good, ip, false)),
+                "{ip:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_listed_peer_on_an_internal_listener_is_refused() {
+        let (_d, key, private) = keypair();
+        let h = health(Some(&["10.0.0.9"]), Some("role:monitor"), None);
+        let good = token(&private, &["monitor"]);
+        assert!(is_disabled(&metrics_gate(
+            &h,
+            Some(&key),
+            &good,
+            "10.0.0.9",
+            true
+        )));
+    }
+
+    #[test]
+    fn a_listed_peer_with_a_valid_token_but_wrong_role_is_403() {
+        let (_d, key, private) = keypair();
+        let h = health(Some(&["10.0.0.9"]), Some("role:monitor"), None);
+        let reader = token(&private, &["reader"]);
+        assert!(matches!(
+            metrics_gate(&h, Some(&key), &reader, "10.0.0.9", false),
+            Gate::Refused(PerfOutcome::Forbidden)
+        ));
+    }
+
+    #[test]
+    fn metrics_require_without_a_loaded_key_fails_closed() {
+        let h = health(None, Some("role:monitor"), None);
+        assert!(matches!(
+            metrics_gate(&h, None, &[], "10.0.0.9", false),
+            Gate::Refused(PerfOutcome::Unauthorised)
+        ));
+    }
+
+    #[test]
+    fn metrics_require_refuses_the_legacy_bearer_string() {
+        let (_d, key, _) = keypair();
+        let h = health(None, Some("role:monitor"), Some("legacy-secret"));
+        let legacy = vec![(
+            "authorization".to_string(),
+            "Bearer legacy-secret".to_string(),
+        )];
+        assert!(matches!(
+            metrics_gate(&h, Some(&key), &legacy, "10.0.0.9", false),
+            Gate::Refused(PerfOutcome::Unauthorised)
+        ));
+    }
+
+    #[test]
+    fn without_new_keys_the_gate_is_todays() {
+        let h = health(None, None, Some("right"));
+        let ok = vec![("authorization".to_string(), "Bearer right".to_string())];
+        let bad = vec![("authorization".to_string(), "Bearer wrong".to_string())];
+        // Any peer, internal or not: there is no address rule.
+        for (ip, internal) in [("203.0.113.7", false), ("10.0.0.9", true)] {
+            assert!(matches!(
+                metrics_gate(&h, None, &ok, ip, internal),
+                Gate::Open
+            ));
+            assert!(matches!(
+                metrics_gate(&h, None, &bad, ip, internal),
+                Gate::Refused(PerfOutcome::Unauthorised)
+            ));
+        }
+        let none = health(None, None, None);
+        assert!(is_disabled(&metrics_gate(
+            &none, None, &ok, "10.0.0.9", false
+        )));
+    }
+
+    #[test]
+    fn traffic_authorised_reads_the_log_without_a_token_check() {
+        // The path does not exist, so a 503 proves the read was attempted and
+        // no token was asked for.
+        let out = traffic_authorised(
+            "origin",
+            "/definitely/not/a/file/for/the/gate",
+            60,
+            Duration::from_secs(0),
+        );
+        assert!(matches!(out, PerfOutcome::TrafficError(_)));
     }
 }
