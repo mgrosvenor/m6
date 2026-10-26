@@ -66,9 +66,11 @@ pub struct ProbeResult {
 ///
 /// Each connect is given what is left of the budget. A connect that times out
 /// has waited out everything it was given, so nothing is left and the probe
-/// ends. A dead tunnel therefore costs one `timeout`. A reading goes stale
-/// when one poll takes longer than twice the poll interval, so `timeout` must
-/// stay well under that.
+/// ends. A dead tunnel therefore costs one `timeout`. A poll runs the HTTPS
+/// requests first and this probe after them, all on the same timeout, so a
+/// node that is down can cost up to four timeouts in one poll. A reading goes
+/// stale when one poll takes longer than twice the poll interval, so the
+/// timeout must stay under half of the poll interval.
 ///
 /// One connect that gets through means the tunnel answered, so the outcome is
 /// `Connected` and the samples are the connects that got through. The sample

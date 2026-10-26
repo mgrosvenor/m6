@@ -46,7 +46,8 @@ Only a poll where no connect gets through is `no_answer`.
 The probe of a node has one deadline of `timeout_ms`.
 Up to three connects run one after another, each given what is left of that time, and a connect that times out ends the probe.
 A dead tunnel therefore costs one `timeout_ms`.
-A reading goes stale when one poll takes longer than twice `poll_interval_s`, so `timeout_ms` must stay well under that.
+A poll runs the HTTPS requests first and the probe after them, all on `timeout_ms`, so a node that is down can cost up to four `timeout_ms` in one poll.
+A reading goes stale when one poll takes longer than twice `poll_interval_s`, so keep `timeout_ms` under half of `poll_interval_s`.
 
 The handshake is read from a file because `wg show` needs `CAP_NET_ADMIN`.
 A privileged timer writes the output of `wg show <interface> latest-handshakes` to the file and m6-monitor reads it as data.
