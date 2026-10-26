@@ -2661,7 +2661,8 @@ fn handle_request_inner(
                         backend: Some(route.backend.clone()),
                         detail: Some("no token".to_string()),
                     };
-                    let (s, h, b, n) = apply_error_mode(401, req, client_ip, state, Some(&ctx));
+                    let (s, mut h, b, n) = apply_error_mode(401, req, client_ip, state, Some(&ctx));
+                    add_bearer_challenge(&mut h);
                     return RequestOutcome::Ready(s, h, b, n);
                 }
                 Err(auth::Refusal::Invalid(e)) => {
@@ -2671,7 +2672,8 @@ fn handle_request_inner(
                         backend: Some(route.backend.clone()),
                         detail: Some(e.to_string()),
                     };
-                    let (s, h, b, n) = apply_error_mode(401, req, client_ip, state, Some(&ctx));
+                    let (s, mut h, b, n) = apply_error_mode(401, req, client_ip, state, Some(&ctx));
+                    add_bearer_challenge(&mut h);
                     return RequestOutcome::Ready(s, h, b, n);
                 }
                 Err(auth::Refusal::Insufficient) => {
@@ -3050,6 +3052,18 @@ fn dispatch_custom_error_async(
         )
     };
     Some(RequestOutcome::Pending { rx, ctx })
+}
+
+/// RFC 9110 11.6.1: a 401 names the authentication scheme that would pass.
+/// Keeps a `WWW-Authenticate` a backend already supplied, since the error
+/// path preserves it.
+fn add_bearer_challenge(headers: &mut Vec<(String, String)>) {
+    if !headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("www-authenticate"))
+    {
+        headers.push(("WWW-Authenticate".to_string(), "Bearer".to_string()));
+    }
 }
 
 /// Apply the configured error mode for a given status code.
