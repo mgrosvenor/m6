@@ -229,8 +229,9 @@ and a page being edited for any other reason should be brought into line while i
   lint with the reason argued in the commit. Never a global allowance.
 - **Test locally, commit, then deploy.** Never deploy from an uncommitted tree.
 - **Secrets never enter git.** Only `.example` files, paths, documented shape.
-- Any change to **layout, copy, or rendering** needs individual approval before
-  it ships.
+- Any change to **layout, copy, or rendering that a visitor sees** needs
+  individual approval before it ships. An internal operator view, such as a
+  monitor's status page, does not.
 - Image resizing is the owner's job.
 - Firewall blocks are **per-IP only**, no CIDR rules.
 - **Blocking an address is a write.** Propose candidates; never apply without
@@ -266,12 +267,6 @@ against a deployed artefact.
 A commit that fixes a defect should say what the defect actually did, in terms
 of what a user or an operator would have seen. A commit that changes a recorded
 minimum or a performance number must argue for it.
-
-Every commit ends with:
-
-```
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
-```
 
 ---
 
