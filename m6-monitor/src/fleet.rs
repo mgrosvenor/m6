@@ -137,8 +137,9 @@ pub struct Fleet {
     #[serde(default)]
     pub wg_handshakes_file: Option<String>,
     /// Seconds since a peer's last WireGuard handshake above which the monitor
-    /// reports a fault. Optional, default 600. With a tunnel configured it must exceed the top-level
-    /// `poll_interval_s` by at least 180 seconds, and loading the config fails otherwise.
+    /// reports a fault. Optional, default 600. With a tunnel configured it must be at
+    /// least the top-level `poll_interval_s` plus `timeout_ms` rounded up to
+    /// whole seconds plus 180, and loading the config fails otherwise.
     ///
     /// WireGuard rekeys about every 120 seconds while traffic flows, and the
     /// probe each poll is that traffic. The limit must also cover the wait for
@@ -161,7 +162,8 @@ pub fn poll_interval_s(get: impl Fn(&str) -> Option<u64>) -> u64 {
     get("poll_interval_s").unwrap_or(crate::DEFAULT_POLL_SECS)
 }
 
-/// How far `tunnel_handshake_max_age_s` must exceed `poll_interval_s`, in seconds.
+/// How far `tunnel_handshake_max_age_s` must exceed `poll_interval_s` plus the
+/// probe timeout rounded up to whole seconds, in seconds.
 pub const MIN_HANDSHAKE_MARGIN_S: u64 = 180;
 
 fn default_tunnel_handshake_max_age_s() -> u64 {
@@ -230,16 +232,21 @@ impl Fleet {
                 .and_then(|v| v.as_integer())
                 .and_then(|i| u64::try_from(i).ok())
         });
-        let min = poll_interval_s.saturating_add(MIN_HANDSHAKE_MARGIN_S);
+        let timeout_s = fleet.timeout_ms.div_ceil(1000);
+        let min = poll_interval_s
+            .saturating_add(timeout_s)
+            .saturating_add(MIN_HANDSHAKE_MARGIN_S);
         let has_tunnel = fleet.nodes.iter().any(|n| n.tunnel.is_some());
         if has_tunnel && fleet.tunnel_handshake_max_age_s < min {
             anyhow::bail!(
-                "[monitor] tunnel_handshake_max_age_s = {} is too low for the top-level poll_interval_s = {}: \
-                 it must be at least poll_interval_s + {MIN_HANDSHAKE_MARGIN_S} = {min}, \
+                "[monitor] tunnel_handshake_max_age_s = {} is too low for the top-level \
+                 poll_interval_s = {poll_interval_s} and timeout_ms = {}: \
+                 it must be at least poll_interval_s + ceil(timeout_ms / 1000) \
+                 + {MIN_HANDSHAKE_MARGIN_S} = {min}, \
                  because WireGuard rekeys every 120 seconds only while traffic flows \
                  and the probe each poll is that traffic",
                 fleet.tunnel_handshake_max_age_s,
-                poll_interval_s
+                fleet.timeout_ms
             );
         }
         for n in &fleet.nodes {
@@ -381,7 +388,7 @@ role = "cache"
             r#"
 [monitor]
 wg_handshakes_file = "/var/lib/m6-monitor/wg-handshakes"
-tunnel_handshake_max_age_s = 210
+tunnel_handshake_max_age_s = 215
 
 [[monitor.nodes]]
 name = "edge-a"
@@ -397,7 +404,7 @@ tunnel = { address = "192.0.2.2:443", public_key = "KEY" }
             fleet.wg_handshakes_file.as_deref(),
             Some("/var/lib/m6-monitor/wg-handshakes")
         );
-        assert_eq!(fleet.tunnel_handshake_max_age_s, 210);
+        assert_eq!(fleet.tunnel_handshake_max_age_s, 215);
     }
 
     #[test]
@@ -416,7 +423,7 @@ tunnel = { address = "192.0.2.2:443", public_key = "KEY" }
     fn a_handshake_limit_too_close_to_the_poll_interval_is_a_config_error() {
         let node = "[[monitor.nodes]]\nname = \"a\"\nurl = \"http://x.example.com\"\n\
                     tunnel = { address = \"192.0.2.2:443\", public_key = \"K\" }\n";
-        for (poll, limit) in [(30, 90), (30, 209), (60, 239), (30, 0)] {
+        for (poll, limit) in [(30, 90), (30, 214), (60, 244), (30, 0)] {
             let e = load(&format!(
                 "poll_interval_s = {poll}\n[monitor]\ntunnel_handshake_max_age_s = {limit}\n{node}"
             ))
@@ -424,9 +431,9 @@ tunnel = { address = "192.0.2.2:443", public_key = "KEY" }
             .to_string();
             assert!(e.contains("tunnel_handshake_max_age_s"), "{e}");
             assert!(e.contains("poll_interval_s"), "{e}");
-            assert!(e.contains(&format!("{}", poll + 180)), "{e}");
+            assert!(e.contains(&format!("{}", poll + 185)), "{e}");
         }
-        for (poll, limit) in [(30, 210), (60, 240), (30, 600)] {
+        for (poll, limit) in [(30, 215), (60, 245), (30, 600)] {
             load(&format!(
                 "poll_interval_s = {poll}\n[monitor]\ntunnel_handshake_max_age_s = {limit}\n{node}"
             ))
@@ -437,7 +444,29 @@ tunnel = { address = "192.0.2.2:443", public_key = "KEY" }
             .unwrap();
         // A long poll interval with the default limit.
         let e = load(&format!("poll_interval_s = 600\n[monitor]\n{node}")).unwrap_err();
-        assert!(e.to_string().contains("780"), "{e}");
+        assert!(e.to_string().contains("785"), "{e}");
+    }
+
+    #[test]
+    fn the_handshake_floor_includes_the_probe_timeout() {
+        let node = "[[monitor.nodes]]\nname = \"a\"\nurl = \"http://x.example.com\"\n\
+                    tunnel = { address = \"192.0.2.2:443\", public_key = \"K\" }\n";
+        let cfg = |poll: u64, timeout: u64, limit: u64| {
+            load(&format!(
+                "poll_interval_s = {poll}\n[monitor]\ntimeout_ms = {timeout}\n\
+                 tunnel_handshake_max_age_s = {limit}\n{node}"
+            ))
+        };
+        // 30 + ceil(2500 / 1000) + 180 = 213
+        assert!(cfg(30, 2500, 212).is_err());
+        cfg(30, 2500, 213).unwrap();
+        // 60 + 20 + 180 = 260
+        assert!(cfg(60, 20_000, 259).is_err());
+        cfg(60, 20_000, 260).unwrap();
+        let e = cfg(60, 20_000, 100).unwrap_err().to_string();
+        for needle in ["poll_interval_s = 60", "timeout_ms = 20000", "= 260"] {
+            assert!(e.contains(needle), "{needle}: {e}");
+        }
     }
 
     #[test]
@@ -449,7 +478,7 @@ tunnel = { address = "192.0.2.2:443", public_key = "KEY" }
         load(&format!("[monitor]\npoll_interval_s = 600\n{node}")).unwrap();
         // The top-level key is the one the poller uses, so the check uses it too.
         let e = load(&format!("poll_interval_s = 600\n[monitor]\n{node}")).unwrap_err();
-        assert!(e.to_string().contains("780"), "{e}");
+        assert!(e.to_string().contains("785"), "{e}");
         // One function reads both representations of the config.
         let toml_cfg: toml::Value =
             toml::from_str("poll_interval_s = 45\n[monitor]\npoll_interval_s = 9\n").unwrap();

@@ -28,15 +28,15 @@
 //! and the existing backend-error finding reports them.
 //!
 //! All of this runs on the background poller, after the HTTPS polls, so the
-//! monitor's own TLS work does not distort the round trip. Nothing runs in a
-//! request handler.
+//! monitor's own TLS work does not distort the round trip. `--check` runs the
+//! same probe once, in its own process. Nothing runs in a request handler.
 
 use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use m6_core::wireguard::Handshakes;
 
-/// Connects per poll.
+/// The most connects per poll.
 ///
 /// The first SYN after a WireGuard session has lapsed also carries a WireGuard
 /// handshake, so one sample mixes two costs. Three samples let the minimum show
@@ -61,28 +61,41 @@ pub struct ProbeResult {
     pub outcome: Probe,
 }
 
-/// Time `PROBES_PER_POLL` connects, one after another.
+/// Time up to `PROBES_PER_POLL` connects, one after another, inside one
+/// deadline of `timeout` for the whole probe.
+///
+/// Each connect is given what is left of the budget. A connect that times out
+/// has waited out everything it was given, so nothing is left and the probe
+/// ends. A dead tunnel therefore costs one `timeout`, which keeps a poll
+/// inside the poller's stale limit however large `timeout` is.
 ///
 /// One connect that gets through means the tunnel answered, so the outcome is
 /// `Connected` and the samples are the connects that got through. The sample
 /// count shows a partial loss. Only a poll with no successful connect is
-/// `NoAnswer` or `Failed`. A dead tunnel therefore costs `PROBES_PER_POLL`
-/// timeouts. The stream is dropped at once and nothing is sent.
+/// `NoAnswer` or `Failed`. The stream is dropped at once and nothing is sent.
 pub fn probe(addr: SocketAddr, timeout: Duration) -> ProbeResult {
-    probe_with(timeout, || {
-        TcpStream::connect_timeout(&addr, timeout).map(drop)
+    probe_with(timeout, |remaining| {
+        TcpStream::connect_timeout(&addr, remaining).map(drop)
     })
 }
 
-fn probe_with(timeout: Duration, mut connect: impl FnMut() -> std::io::Result<()>) -> ProbeResult {
+fn probe_with(
+    timeout: Duration,
+    mut connect: impl FnMut(Duration) -> std::io::Result<()>,
+) -> ProbeResult {
     let mut samples = Vec::with_capacity(PROBES_PER_POLL);
     let mut connected = 0;
     let mut refused = 0;
     let mut timed_out = false;
     let mut other_error = None;
+    let deadline = Instant::now() + timeout;
     for _ in 0..PROBES_PER_POLL {
         let started = Instant::now();
-        match connect() {
+        let remaining = deadline.saturating_duration_since(started);
+        if remaining.is_zero() {
+            break;
+        }
+        match connect(remaining) {
             Ok(()) => {
                 samples.push(started.elapsed());
                 connected += 1;
@@ -98,6 +111,8 @@ fn probe_with(timeout: Duration, mut connect: impl FnMut() -> std::io::Result<()
                 ) =>
             {
                 timed_out = true;
+                // It waited out the whole budget it was given.
+                break;
             }
             Err(e) => other_error = Some(e.to_string()),
         }
@@ -308,7 +323,47 @@ mod tests {
 
     fn scripted(results: Vec<std::io::Result<()>>) -> ProbeResult {
         let mut it = results.into_iter();
-        probe_with(T, move || it.next().unwrap())
+        probe_with(T, move |_| it.next().unwrap())
+    }
+
+    /// Run the probe with the scripted results and return the sum of the
+    /// timeouts it handed to the connect, with the result.
+    fn budget_used(results: Vec<std::io::Result<()>>) -> (Duration, ProbeResult) {
+        let mut it = results.into_iter();
+        let mut total = Duration::ZERO;
+        let r = probe_with(T, |t| {
+            total += t;
+            it.next().unwrap_or_else(lost)
+        });
+        (total, r)
+    }
+
+    #[test]
+    fn a_dead_tunnel_costs_one_timeout_in_total() {
+        let (total, r) = budget_used(vec![lost(), lost(), lost()]);
+        assert!(matches!(r.outcome, Probe::NoAnswer(_)), "{r:?}");
+        assert!(total <= T, "handed out {total:?} of a {T:?} budget");
+    }
+
+    #[test]
+    fn two_quick_successes_then_a_loss_is_connected() {
+        let (total, r) = budget_used(vec![Ok(()), Ok(()), lost()]);
+        assert_eq!(r.outcome, Probe::Connected, "{r:?}");
+        assert_eq!(r.samples.len(), 2, "{r:?}");
+        assert!(total <= T * 3, "{total:?}");
+    }
+
+    #[test]
+    fn a_connect_is_never_given_more_than_what_is_left() {
+        let mut seen = Vec::new();
+        probe_with(T, |t| {
+            seen.push(t);
+            std::thread::sleep(Duration::from_millis(20));
+            Ok(())
+        });
+        assert_eq!(seen.len(), PROBES_PER_POLL);
+        assert!(seen.windows(2).all(|w| w[1] < w[0]), "{seen:?}");
+        assert!(seen.iter().all(|t| *t <= T));
     }
 
     fn lost() -> std::io::Result<()> {
@@ -316,15 +371,14 @@ mod tests {
     }
 
     #[test]
-    fn one_lost_connect_among_good_ones_still_means_the_tunnel_answered() {
-        for results in [
-            vec![Ok(()), lost(), Ok(())],
-            vec![lost(), Ok(()), Ok(())],
-            vec![Ok(()), Ok(()), lost()],
+    fn a_lost_connect_after_a_good_one_still_means_the_tunnel_answered() {
+        for (results, n) in [
+            (vec![Ok(()), lost(), Ok(())], 1),
+            (vec![Ok(()), Ok(()), lost()], 2),
         ] {
             let r = scripted(results);
             assert_eq!(r.outcome, Probe::Connected, "{r:?}");
-            assert_eq!(r.samples.len(), 2, "{r:?}");
+            assert_eq!(r.samples.len(), n, "{r:?}");
         }
     }
 
