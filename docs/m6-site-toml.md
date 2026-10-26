@@ -276,8 +276,8 @@ With `[server]` in the system config and credentials in secrets files, `site.tom
 | `bind` | string | yes | `"address:port"` |
 | `tls_cert` | string | yes | Absolute path, PEM chain |
 | `tls_key` | string | yes | Absolute path, PEM key |
-| `h2c_bind` | string | no | `"ip:port"`. Plain-TCP HTTP/2 listener for a private backbone. Needs `internal_binds` |
-| `internal_binds` | list of strings | when `h2c_bind` is set | The h2c listener, if internal: `"ip:port"` equal to `h2c_bind`, in a local range. `[]` means none |
+| `h2c_bind` | string | no | `"ip:port"`. Plain-TCP HTTP/2 listener for a private backbone, which needs `internal_binds` |
+| `internal_binds` | list of strings | when `h2c_bind` is set | Set to `h2c_bind`, an `"ip:port"` in a local range, to make the h2c listener internal. `[]` means none |
 
 TLS cert and key watched via inotify — reloaded on change without restart.
 
