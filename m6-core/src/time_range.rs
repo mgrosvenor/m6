@@ -38,7 +38,7 @@
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::request::{url_decode, Request};
+use crate::request::{single_query_value, url_decode, RepeatedKey, Request};
 use crate::response::Response;
 
 /// The longest range accepted unless a service asks for another: 31 days.
@@ -76,26 +76,16 @@ pub enum TimeRangeError {
 impl TimeRangeError {
     /// A 400 with a plain-text explanation that never echoes the input.
     pub fn to_response(&self) -> Response {
-        Response::text(&format!("{self}\n"))
-            .with_status(400)
-            .header("Cache-Control", "no-store")
-            .header("X-Content-Type-Options", "nosniff")
+        Response::refusal(self)
     }
 }
 
 /// The value of the one query key `key`, url-decoded.
 fn single(query: &str, key: &'static str) -> Result<String, TimeRangeError> {
-    let mut found: Option<&str> = None;
-    for pair in query.split('&') {
-        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-        if k == key {
-            if found.is_some() {
-                return Err(TimeRangeError::Repeated(key));
-            }
-            found = Some(v);
-        }
-    }
-    found.map(url_decode).ok_or(TimeRangeError::Missing(key))
+    single_query_value(query, key)
+        .map_err(|RepeatedKey| TimeRangeError::Repeated(key))?
+        .map(url_decode)
+        .ok_or(TimeRangeError::Missing(key))
 }
 
 fn parse_utc(value: &str, name: &'static str) -> Result<SystemTime, TimeRangeError> {

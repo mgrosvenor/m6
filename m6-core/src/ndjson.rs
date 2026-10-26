@@ -355,10 +355,7 @@ pub enum CursorError {
 impl CursorError {
     /// A 400 that does not echo the value.
     pub fn to_response(&self) -> Response {
-        Response::text(&format!("{self}\n"))
-            .with_status(400)
-            .header("Cache-Control", "no-store")
-            .header("X-Content-Type-Options", "nosniff")
+        Response::refusal(self)
     }
 }
 
@@ -385,16 +382,8 @@ impl Cursor {
     /// The cursor in a raw query string: `None` when absent, an error when it
     /// is repeated, empty or malformed.
     pub fn from_query(query: &str) -> Result<Option<Self>, CursorError> {
-        let mut found: Option<&str> = None;
-        for pair in query.split('&') {
-            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-            if k == CURSOR_PARAM {
-                if found.is_some() {
-                    return Err(CursorError::Repeated);
-                }
-                found = Some(v);
-            }
-        }
+        let found = crate::request::single_query_value(query, CURSOR_PARAM)
+            .map_err(|_| CursorError::Repeated)?;
         found.map(Self::new).transpose()
     }
 }
