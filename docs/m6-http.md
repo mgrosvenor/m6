@@ -26,9 +26,9 @@ Logs to stdout as structured JSON.
 ## Startup Sequence
 
 1. Load `site.toml` from site directory
-2. Load `<system-config>` and merge — system config `[server]` keys win
+2. Load `<system-config>` and merge. It may carry `[server]`, `[node]`, `[auth]` and the `[health]` keys `metrics_require` and `metrics_peers`. Its `[server]` and `[health]` keys win
 3. Validate merged config — exit 2 on error, before binding
-4. If `[auth]` declared, load public key for local JWT verification
+4. If `[auth]` is declared (in either file, never both), load the public key for local JWT verification. `backend` is optional
 5. Expand `[[route_group]]` globs against site directory — builds route table entries and invalidation map
 6. Read renderer configs to build params-file → URL invalidation map entries
 7. Register inotify on site directory (`site.toml`), system config, and `/run/m6/` (socket discovery)
@@ -143,12 +143,50 @@ If a route declares `require`, m6-http enforces before forwarding:
 4. Check claims against `require` declaration (`group:<n>` or `role:<n>`)
 5. Reject with 401 (no token / invalid token) or 403 (insufficient claims)
 
+One function, `auth::authorise`, does steps 1 to 4 for route `require` and for the monitoring endpoints below, so both accept the same tokens and refuse the same ways.
+A 401 from m6-http itself carries `WWW-Authenticate: Bearer` (RFC 9110 section 11.6.1).
+A `WWW-Authenticate` header a backend already supplied is kept.
+
 Valid requests are forwarded with the verified token intact. Renderers may perform additional fine-grained checks using the auth claims available in the request dictionary.
 
 **401 handling:** When a browser request (`Accept: text/html`) to a protected route has no token or an expired token, m6-http checks whether a `refresh` cookie is present. If so, it redirects to `POST /auth/refresh` — if the refresh token is still valid, new cookies are set and the browser is redirected back to the original path transparently. If the refresh token is also expired or absent, m6-http redirects to `/login?next=<original-path>`. API clients (non-`text/html` Accept) always receive 401 directly.
 
 ---
 
+
+## Monitoring Endpoints
+
+m6-http answers `/health`, `/perf` and `/traffic` itself, ahead of routing, the cache and every backend.
+A refusal never reaches routing or the cache, so a catch-all route can never answer `/perf` and a built-in path never enters the cache.
+`/health` is public.
+`/perf` and `/traffic` are gated by the `[health]` keys in Table 1.
+
+| Key | Where | Meaning |
+|---|---|---|
+| `[auth] public_key` | `site.toml` or system config, not both | Key that verifies API tokens. Absolute path in the system config |
+| `[health] metrics_require` | either file, system config wins | `role:<name>` or `group:<name>`. An API token with the claim is required |
+| `[health] metrics_peers` | either file, system config wins | IP addresses in a local range. Any other peer gets 404 |
+| `[health] metrics_token_file` | `site.toml` | Legacy bearer string. Ignored when `metrics_require` is set |
+
+*Table 1: the keys that decide who reads `/perf` and `/traffic`. With none of them set, only the legacy file gate applies.*
+
+The checks run in this order, as Table 2 shows.
+
+| Step | Check | Refusal |
+|---|---|---|
+| 1 | `metrics_peers` set: not on an internal h2c listener, and the peer address is listed | 404, the body of a disabled endpoint, before any token is read |
+| 2 | `metrics_require` set: API token verifies and holds the claim | 401 for no or a bad token, 403 for the wrong claim |
+| 2 | `metrics_require` unset: the legacy bearer string matches | 404 when no string is configured, 401 when it does not match |
+
+*Table 2: the metrics gate, in order. A request reaches the report only when every step that applies passes.*
+
+Step 1 reads the peer address a completed TCP or QUIC handshake proved.
+It is never read from a header, so a forged `X-Forwarded-For` does not open the endpoints.
+An internal h2c listener believes `X-Forwarded-For`, so it never serves them.
+The cost is one address parse and a scan of a short list, and only on these two paths.
+The cache-hit path is unchanged.
+
+---
 
 ## Hot Reload
 
@@ -157,7 +195,7 @@ Valid requests are forwarded with the verified token intact. Renderers may perfo
 | Change | Response |
 |---|---|
 | `site.toml` touched or modified | Reload routing, pools, auth config, invalidation map |
-| System config modified | Re-merge `[server]` with `site.toml`, reload TLS context |
+| System config modified | Re-merge `[server]` with `site.toml`, reload TLS context. `[auth]` and `[health]` keys in it apply on restart or on the next `site.toml` reload |
 | TLS cert/key file modified | Reload TLS context |
 | Socket appears in `/run/m6/` matching a pool glob | Add to pool |
 | Socket disappears from `/run/m6/` | Remove from pool |

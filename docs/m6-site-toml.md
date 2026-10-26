@@ -165,9 +165,16 @@ m6-http "$SITE" "$SITE/configs/m6-http-dev.toml"
 ExecStart=/usr/local/bin/m6-http /var/www/my-blog /etc/m6/my-blog.toml
 ```
 
-The system config contains only `[server]`. Everything else — routes, backends, site identity, log level, auth — comes from `site.toml` unchanged.
+The system config may contain `[server]`, `[node]`, `[auth]` and two `[health]` keys, `metrics_require` and `metrics_peers`.
+Everything else (routes, backends, site identity, log level) comes from `site.toml` unchanged.
 
-**Merge semantics:** system config is loaded after `site.toml`. Its `[server]` keys win on conflict. Any non-`[server]` keys in the system config are ignored with a warning. Validation runs after merge.
+**Merge semantics:** system config is loaded after `site.toml`.
+Its `[server]` keys win on conflict, and so do its two `[health]` keys.
+`[auth]` must be declared in one file only, and declaring it in both is a startup error.
+A system-config `[auth] public_key` must be an absolute path, because a relative path would resolve against the site directory.
+Any other key in the system config is ignored with a warning, and any other `[health]` key there fails to parse.
+Validation runs after merge.
+A system config edit takes effect on restart or on the next `site.toml` reload.
 
 **`site.toml` — in version control:**
 
@@ -205,7 +212,7 @@ tls_cert = "/etc/letsencrypt/live/example.com/fullchain.pem"
 tls_key  = "/etc/letsencrypt/live/example.com/privkey.pem"
 ```
 
-Only `[server]`. Nothing else.
+Only the sections listed above. Nothing else.
 
 ### Renderer secrets
 
@@ -252,6 +259,7 @@ to       = "owner@example.com"
 | Setting | Location | Reason |
 |---|---|---|
 | `[server]` bind, tls_cert, tls_key | System config `/etc/m6/*.toml` | Differs per environment |
+| `[auth]` and `[health]` `metrics_require` / `metrics_peers` | System config when they differ per node, otherwise `site.toml` | Which peers may read a node's metrics is a property of the node |
 | SMTP credentials | `secrets_file` → `/etc/m6/*.toml` | Secret, must not be in repo |
 | All routes and backends | `site.toml` | Identical in dev and production |
 | Log level and format | `site.toml` | Not secret, fine in repo |
@@ -350,8 +358,59 @@ Error responses are never cached regardless of mode.
 
 | Key | Type | Required | Notes |
 |---|---|---|---|
-| `backend` | string | yes | Name of a declared `[[backend]]` |
+| `backend` | string | no | Name of a declared `[[backend]]`. Checked when given. Verification does not use it |
 | `public_key` | string | yes | Path to m6-auth's public key for local JWT verification |
+
+`[auth]` may sit in `site.toml` or in the system config, never both.
+A config that only verifies tokens needs `public_key` alone.
+
+### `[health]`
+
+The monitoring endpoints, answered inside m6-http ahead of routing, the cache and every backend.
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `enabled` | bool | `true` | Turns all three endpoints off |
+| `path` | string | `"/health"` | Always public |
+| `perf_path` | string | `"/perf"` | Counters, latency percentiles and host facts |
+| `traffic_path` | string | `"/traffic"` | Summary of the last hour of the analytics log |
+| `traffic_cache_s` | integer | `60` | Seconds a `/traffic` summary is reused |
+| `metrics_token_file` | string | none | The legacy gate. Path to a file holding a bearer string. Ignored when `metrics_require` is set |
+| `metrics_require` | string | none | `"role:<name>"` or `"group:<name>"`. An API token with this claim opens `/perf` and `/traffic` |
+| `metrics_peers` | list of strings | none | IP addresses allowed to read `/perf` and `/traffic`. Anyone else gets 404 |
+
+The system config accepts `metrics_require` and `metrics_peers` only.
+
+**Who may read `/perf` and `/traffic`.**
+A request is served only when both rules pass, checked in this order.
+
+1. `metrics_peers`, when set: the request did not arrive on an internal h2c listener, and its peer address is one of the listed addresses.
+   Otherwise the answer is 404 with the body of an endpoint that is not enabled, before any token is read.
+2. `metrics_require`, when set: the request carries an API token that `[auth] public_key` verifies and that holds the claim.
+   No token or a bad token is 401 with `WWW-Authenticate: Bearer`.
+   A valid token without the claim is 403.
+   When `metrics_require` is unset, the legacy `metrics_token_file` gate applies.
+   Without either, the endpoints answer 404.
+
+The peer address is the one a completed TCP or QUIC handshake proved, never a header.
+That is why the endpoints are refused on an internal h2c listener, where the client address is the `X-Forwarded-For` value the listener believes.
+An entry in `metrics_peers` is an IP address in a local range (`m6_core::net::is_private_ip`).
+Names are never resolved, ranges are not accepted, and a public or wildcard address is a startup error.
+An IPv4-mapped IPv6 peer matches the IPv4 entry.
+
+`metrics_peers` composes with either gate.
+`/health` ignores both keys.
+On a host where a public interface could receive packets with a listed source address, filter them (reverse-path filtering), because a peer address that arrives on the wrong interface is still a completed handshake.
+With none of the new keys set, behaviour is the legacy gate alone.
+
+```toml
+[auth]
+public_key = "/etc/m6/api-auth.pub"
+
+[health]
+metrics_require = "role:monitor"
+metrics_peers   = ["10.0.0.5"]
+```
 
 ### `[[backend]]`
 
@@ -458,7 +517,12 @@ Exit 2 on:
 - Duplicate `path` values across `[[route]]`
 - `[log] level` unrecognised
 - `[auth]` declared but `public_key` file not found
-- `[auth]` declared but `backend` not declared in `[[backend]]`
+- `[auth]` declared with a `backend` that is not declared in `[[backend]]`
+- `[auth]` declared in both `site.toml` and the system config
+- `[auth] public_key` in the system config that is not an absolute path
+- `[health] metrics_peers` empty, or an entry that is not an IP address (names are never resolved, ranges and ports are refused)
+- `[health] metrics_peers` entry that is not in a local range
+- `[health] metrics_require` without `[auth]`, or not `role:<name>` or `group:<name>`
 - `require` on a route but no `[auth]` declared
 - `internal_binds` entry that is not an IP address and port (names are never resolved)
 - `internal_binds` entry that is not in a local range

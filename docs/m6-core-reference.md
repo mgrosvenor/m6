@@ -591,6 +591,12 @@ the entire point of having edges.
 `PerfReport::build(...)`, `PerfOutcome`, `metrics_authorised(...)`,
 `is_monitoring_endpoint(backend)`, `HEALTH_BACKEND`, `PERF_BACKEND`.
 
+A caller with its own gate uses two more pieces.
+`PerfAccess::refusal()` returns the legacy bearer gate's verdict: `Some(Disabled)` with no token configured, `Some(Unauthorised)` for a wrong one, `None` to pass.
+`PerfReport::build_authorised(subject, snapshot)` builds the report with no access check, for a caller that has already authorised the request.
+`PerfOutcome::Forbidden` answers 403 `{"error":"forbidden"}` with no `WWW-Authenticate`, for a valid token that lacks the required claim.
+m6-http uses these for `[health] metrics_require` and `metrics_peers`, described in `docs/m6-http.md`.
+
 `PerfReport.tls` carries the served certificate chain and how long each
 certificate has left, from `tls::loaded()`. It is `serde(default)`, so a node
 older than the field stays parseable to an aggregator rather than making the
