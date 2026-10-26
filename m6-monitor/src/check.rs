@@ -15,7 +15,10 @@
 //! wherever it happens to run, is unavoidable and is labelled instead.
 //!
 //! Section H measures the tunnel to each node with a TCP connect and a
-//! WireGuard handshake age, and sends no request.
+//! WireGuard handshake age, and sends no request. The handshake age comes from
+//! the file a separate privileged timer writes, so `--check` from cron judges
+//! it only while that timer runs. A file older than
+//! `tunnel_handshake_max_age_s` is itself a fault.
 //!
 //! Exit status is 1 when there are faults, so it works as a cron check.
 
