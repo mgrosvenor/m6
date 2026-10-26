@@ -96,6 +96,39 @@ Verified: `cargo test --workspace -- --test-threads=1` passes 1390 tests with 0 
 The three `// end cache hit` blocks in `m6-http/src/main.rs` are byte-identical to `develop` (735 lines, empty diff), and the only functions touched in that file are `handle_request_inner` and a new helper beside the error path.
 `cache_hit` measures 47.0 ns and `full_cache_hit_path` 45.6 ns on a loaded laptop (informational).
 
+**m6-core has an opt-in `sqlite` feature (#227).**
+A service that wants one SQLite file can enable `sqlite` on m6-core and link nothing else, because the feature re-exports `rusqlite` in the prelude.
+`m6_core::sqlite::open(path)` opens the file with `journal_mode=DELETE`, a 5 second `busy_timeout`, `foreign_keys` on and `recursive_triggers` on, reads each setting back, and returns an error if one does not take effect.
+`OpenOptions` changes the busy timeout, the journal mode and foreign keys.
+SQLite cannot leave WAL mode while another connection is using the file, so every connection to a file should use the same journal mode.
+Opening a WAL file with the default rollback journal then fails with `SQLITE_BUSY`.
+`migrate` applies a numbered list of migrations and keeps the version in `PRAGMA user_version`.
+Each migration runs in its own `BEGIN IMMEDIATE` transaction, so connections that open at once apply each one once, and a failing migration rolls back.
+A file newer than the migration list is refused with `NewerThanCode`, both before the first migration and again inside each transaction, so a newer process that migrates the file meanwhile is also refused.
+`migrate` switches `foreign_keys` off before each migration, because SQLite ignores that pragma inside a transaction, and so a migration can rebuild a table that others point at without losing their rows.
+It runs `PRAGMA foreign_key_check` before and after each migration's SQL, inside its transaction, and fails with `ForeignKeyCheck` naming the child and parent table if any (child table, parent table) pair has more dangling references after than before.
+A dangling reference already in the file does not block a migration that keeps both table names.
+Renaming a table that holds one is refused, so delete the orphan rows in an earlier migration first.
+A migration that removes one dangling reference and adds another between the same two tables is not caught.
+`foreign_keys` is restored to its earlier setting when `migrate` returns.
+`append_only(&conn, table)` adds triggers that refuse UPDATE and DELETE on a named table, and `is_append_only` reports them.
+`used_bytes` and `prune_oldest` keep a table that is not append-only under a size cap.
+The cap counts the whole file, so `prune_oldest` returns the rows deleted and `cap_met`, which is false when the table was emptied and the file is still over the cap.
+
+A service can now use this one way to open, migrate and guard a file.
+m6-auth still opens SQLite itself and moves to it later.
+The feature is off by default.
+`cargo tree -p m6-http` shows no rusqlite, and `Cargo.lock` gains one line, `"rusqlite"` under m6-core.
+Nothing in the workspace turns the feature on, so `cargo test --workspace` never builds it.
+CI therefore has a step that builds and tests m6-core with `--all-features`, and `tools/clippy.sh` has a second pass that lints it the same way.
+That also covers `email` and `multipart`, which nothing in the workspace turns on either.
+
+Verified: `cargo test -p m6-core --lib --features sqlite` passes 417 tests with 0 failures, including 34 in the `sqlite` module that run against real files.
+The doctests pass with the feature on.
+`cargo test -p m6-core --features sqlite,testkit` builds with no warnings and passes.
+`cargo build --workspace --release`, `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `./tools/clippy.sh` and `cargo test --workspace` all pass with no warnings.
+This was run on unit and file-backed tests only, and no request-path code changed.
+
 **`/perf` and `/traffic` report the last log reopen, and m6-monitor faults when it is too old (#234).**
 `logging.reopen` gives `reopens_total`, `failures_total`, `seconds_since_last_reopen`, `last_reopen_unix` and `seconds_since_last_failure`.
 `seconds_since_last_reopen` is `null` until the first reopen, which is not the same as zero.

@@ -132,6 +132,26 @@ jobs:
             exit 1
           fi
 
+      # Nothing in the workspace turns on some off-by-default core features
+      # (`sqlite`, `email`, `multipart`), so `cargo test --workspace` never
+      # compiles or runs their code. That is the `templates` scar (two csrf
+      # tests stayed broken), so m6-core is built, warned on and tested here
+      # with every feature on, and a new feature is covered without an edit.
+      - name: Opt-in core features, zero warnings and tests
+        run: |
+          cargo test -p m6-core --lib --all-features --no-run 2>&1 | tee featbuild.log
+          n=$(grep -c '^warning' featbuild.log || true)
+          [ "$n" -eq 0 ] || { echo "::error::$n warning(s) building m6-core --all-features"; exit 1; }
+          # The integration tests need built binaries, so only the library tests
+          # and the doctests run here.
+          # The status is kept, so a test that aborts or crashes fails the step
+          # even though it prints no `failures:` line.
+          status=0
+          { cargo test -p m6-core --lib --all-features && cargo test -p m6-core --doc --all-features; } > feat.log 2>&1 || status=$?
+          grep -E '^test result:' feat.log || true
+          if grep -q '^failures:' feat.log; then sed -n '/^failures:/,$p' feat.log | head -80; echo "::error::m6-core --all-features tests failed"; exit 1; fi
+          [ "$status" -eq 0 ] || { tail -80 feat.log; echo "::error::m6-core --all-features tests exited with status $status"; exit 1; }
+
       # Clippy must be silent: `-D warnings`, no ceiling. It went to zero on
       # 2026-09-13 and is held there the same way rustc warnings are. A new
       # lint from a toolchain upgrade fails this, which is intended.
