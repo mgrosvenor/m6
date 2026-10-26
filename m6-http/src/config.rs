@@ -678,9 +678,19 @@ fn validate_internal_binds(
     h2c_bind: Option<&str>,
 ) -> anyhow::Result<()> {
     if let (Some(h2c), None) = (h2c_bind, internal_binds) {
-        anyhow::bail!(
-            "config error: [server].h2c_bind = \"{h2c}\" is set but [server].internal_binds is not. m6-http no longer decides from an address whether a listener is internal. Add internal_binds = [\"{h2c}\"] to keep trusting it as the private backbone (forwarded client addresses believed, the custom error path allowed, statistics labelled internal), or internal_binds = [] to treat it as public"
-        );
+        let what = "m6-http no longer decides from an address whether a listener is internal";
+        let public = "internal_binds = [] to treat it as public";
+        match h2c.parse::<std::net::SocketAddr>() {
+            Err(_) => anyhow::bail!(
+                "config error: [server].h2c_bind = \"{h2c}\" is set but [server].internal_binds is not. {what}. An internal h2c listener needs an IP address and port such as \"10.0.0.1:8080\", and \"{h2c}\" is not one. Bind h2c_bind to an IP address and name it in internal_binds, or add {public}"
+            ),
+            Ok(sa) if !m6_core::net::is_private_ip(sa.ip()) => anyhow::bail!(
+                "config error: [server].h2c_bind = \"{h2c}\" is set but [server].internal_binds is not. {what}. To be internal the listener must be bound to a local address (loopback, private, link-local, shared or unique-local), and \"{h2c}\" is not. Bind it to a local address and name it in internal_binds, or add {public}"
+            ),
+            Ok(_) => anyhow::bail!(
+                "config error: [server].h2c_bind = \"{h2c}\" is set but [server].internal_binds is not. {what}. Add internal_binds = [\"{h2c}\"] to keep trusting it as the private backbone (forwarded client addresses believed, the custom error path allowed, statistics labelled internal), or {public}"
+            ),
+        }
     }
     let listener = |s: &str| s.parse::<std::net::SocketAddr>().ok();
     for e in internal_binds.unwrap_or_default() {
@@ -1632,6 +1642,24 @@ backend_timeout_secs = 120
         assert!(e.starts_with("config error:"), "{e}");
         assert!(e.contains("internal_binds = [\"127.0.0.1:18080\"]"), "{e}");
         assert!(e.contains("internal_binds = []"), "{e}");
+    }
+
+    #[test]
+    fn the_migration_error_for_a_host_name_does_not_suggest_that_name() {
+        let e = load_error("h2c_bind = \"localhost:8080\"\n");
+        assert!(!e.contains("internal_binds = [\"localhost:8080\"]"), "{e}");
+        assert!(e.contains("needs an IP address and port"), "{e}");
+        assert!(e.contains("internal_binds = []"), "{e}");
+    }
+
+    #[test]
+    fn the_migration_error_for_a_non_local_address_does_not_suggest_it() {
+        for h2c in ["0.0.0.0:8080", "203.0.113.7:8080"] {
+            let e = load_error(&format!("h2c_bind = \"{h2c}\"\n"));
+            assert!(!e.contains(&format!("internal_binds = [\"{h2c}\"]")), "{h2c}: {e}");
+            assert!(e.contains("must be bound to a local address"), "{h2c}: {e}");
+            assert!(e.contains("internal_binds = []"), "{h2c}: {e}");
+        }
     }
 
     #[test]
