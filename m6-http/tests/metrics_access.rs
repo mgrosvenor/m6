@@ -99,12 +99,8 @@ fn mint(private_pem: &str, roles: &[&str], exp_offset_s: i64) -> String {
 const LEGACY_TOKEN: &str = "legacy-secret-token-0123456789abcdef";
 
 /// `[auth]` with a verify key only, and a route that needs a role.
-const AUTH: &str = "[auth]\nbackend = \"b\"\npublic_key = \"{KEY}\"\n\n\
+const AUTH: &str = "[auth]\npublic_key = \"{KEY}\"\n\n\
     [[route]]\npath = \"/private/{relpath}\"\nbackend = \"b\"\nrequire = \"role:monitor\"\n";
-
-/// The metrics gate, for the listed peer 127.0.0.1.
-const GATE: &str =
-    "[health]\nmetrics_require = \"role:monitor\"\nmetrics_peers = [\"127.0.0.1\"]\n";
 
 /// The files and ports one test needs, written but not yet running.
 struct Fixture {
@@ -112,12 +108,9 @@ struct Fixture {
     site: std::path::PathBuf,
     system: std::path::PathBuf,
     port: PortClaim,
-    h2c: PortClaim,
     cert_der: Vec<u8>,
     /// Signing key whose public half is `auth-public.pem`.
     private_pem: String,
-    /// A signing key the site does not trust.
-    other_private_pem: String,
 }
 
 impl Fixture {
@@ -136,7 +129,6 @@ impl Fixture {
         std::fs::write(d.join("cert.pem"), ck.cert.pem()).unwrap();
         std::fs::write(d.join("key.pem"), ck.key_pair.serialize_pem()).unwrap();
         let (private_pem, public_pem) = keypair();
-        let (other_private_pem, _) = keypair();
         std::fs::write(d.join("auth-public.pem"), public_pem).unwrap();
         std::fs::write(d.join("metrics.token"), LEGACY_TOKEN).unwrap();
         std::fs::write(d.join("analytics.ndjson"), "").unwrap();
@@ -185,10 +177,8 @@ impl Fixture {
             site: site_dir,
             system: system_path,
             port,
-            h2c,
             cert_der: ck.cert.der().to_vec(),
             private_pem,
-            other_private_pem,
             dir,
         }
     }
@@ -544,4 +534,31 @@ fn a_require_route_401_carries_www_authenticate() {
     let bad = run.h1("/private/x", &[("Authorization", "Bearer not.a.token")]);
     assert_eq!(bad.status, 401);
     assert_eq!(bad.header("www-authenticate"), Some("Bearer"));
+}
+
+/// `[auth]` without a `backend` still verifies for a `require` route: no token
+/// is 401, a token with the role passes the check and reaches the (absent)
+/// backend, which is a 502 or 503.
+#[test]
+fn a_require_route_is_enforced_with_a_verify_only_auth() {
+    let run = Fixture::new(AUTH, "", "").start();
+    assert_eq!(run.h1("/private/x", &[]).status, 401);
+    let token = run.token(&["monitor"]);
+    let r = run.h1("/private/x", &[("Authorization", &bearer(&token))]);
+    assert!(
+        r.status != 401 && r.status != 403,
+        "a valid token must pass the check, got {}",
+        r.status
+    );
+    let wrong = run.token(&["reader"]);
+    let r = run.h1("/private/x", &[("Authorization", &bearer(&wrong))]);
+    assert_eq!(r.status, 403);
+}
+
+#[test]
+fn auth_in_both_files_refuses_to_start() {
+    let fx = Fixture::new(AUTH, "", "[auth]\npublic_key = \"{KEY}\"\n");
+    let (code, output) = fx.run_until_exit();
+    assert_eq!(code, Some(2), "output:\n{output}");
+    assert!(output.contains("declare it in one"), "output:\n{output}");
 }

@@ -532,7 +532,10 @@ impl SecurityConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthConfig {
-    pub backend: String,
+    /// Optional. When given it must name a `[[backend]]`. Nothing reads it
+    /// beyond that check: verification needs only `public_key`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
     pub public_key: String,
 }
 
@@ -666,6 +669,10 @@ struct RawServerSection {
 struct RawSystemToml {
     server: Option<RawServerSection>,
     node: Option<NodeConfig>,
+    /// `[auth]` may live here instead of site.toml (never both), so the
+    /// verify key's path is owned by the same file as the node's other
+    /// credentials.
+    auth: Option<AuthConfig>,
 }
 
 // ── Loading ─────────────────────────────────────────────────────────────────
@@ -738,7 +745,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
     // Warn on unexpected sections in system config (we only check for unknown
     // top-level keys by seeing if extra keys exist; toml parsing uses deny_unknown_fields
     // is opt-in, but the spec says warn and ignore instead of error).
-    // We rely on RawSystemToml only accepting `server`/`node`.
+    // We rely on RawSystemToml only accepting `server`/`node`/`auth`.
 
     // Build merged server config:
     // site.toml [server] provides base values, system config [server] overrides.
@@ -940,8 +947,25 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         }
     }
 
-    // Validate auth
-    let auth = site_parsed.auth;
+    // Validate auth. One owner: declaring [auth] in both files would make a
+    // whole-section override silently change which key verifies every route.
+    let auth = match (site_parsed.auth, system_parsed.auth) {
+        (Some(_), Some(_)) => anyhow::bail!(
+            "config error: [auth] is declared in both site.toml and the system config; declare it in one"
+        ),
+        (None, Some(a)) => {
+            // A relative path here would resolve against the site directory,
+            // which is surprising for a file that sits beside the system config.
+            if !Path::new(&a.public_key).is_absolute() {
+                anyhow::bail!(
+                    "config error: [auth].public_key in the system config must be an absolute path, got \"{}\"",
+                    a.public_key
+                );
+            }
+            Some(a)
+        }
+        (site, None) => site,
+    };
     if let Some(ref a) = auth {
         let key_path = resolve_path(site_dir, &a.public_key);
         if !key_path.exists() {
@@ -950,11 +974,10 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
                 key_path.display()
             );
         }
-        if !backend_names.contains(a.backend.as_str()) {
-            anyhow::bail!(
-                "config error: [auth].backend `{}` not in [[backend]]",
-                a.backend
-            );
+        if let Some(ref b) = a.backend {
+            if !backend_names.contains(b.as_str()) {
+                anyhow::bail!("config error: [auth].backend `{}` not in [[backend]]", b);
+            }
         }
     }
 
@@ -1071,11 +1094,11 @@ pub fn warn_system_config_extra_keys(system_config_path: &Path) {
     if let Ok(raw) = std::fs::read_to_string(system_config_path) {
         if let Ok(toml::Value::Table(tbl)) = raw.parse::<toml::Value>() {
             for key in tbl.keys() {
-                if key != "server" && key != "node" {
+                if key != "server" && key != "node" && key != "auth" {
                     warn!(
                         key = %key,
                         file = %system_config_path.display(),
-                        "system config: ignoring non-[server]/[node] key"
+                        "system config: ignoring key other than [server], [node], [auth]"
                     );
                 }
             }
@@ -1772,5 +1795,76 @@ internal_binds = ["203.0.113.7:80"]
         write_file(dir.path(), "system.toml", "");
         let cfg = load(dir.path(), &dir.path().join("system.toml")).unwrap();
         assert_eq!(cfg.server.redirect_bind.as_deref(), Some("0.0.0.0:80"));
+    }
+
+    /// Load with `site_extra` appended to site.toml and `sys_extra` appended
+    /// to system.toml. A verify key exists as `auth.pem` in the test directory.
+    fn load_with(site_extra: &str, sys_extra: &str) -> (TempDir, anyhow::Result<Config>) {
+        let dir = make_test_dir();
+        setup_minimal(dir.path());
+        write_file(dir.path(), "auth.pem", "dummy");
+        let mut site = minimal_site_toml();
+        site.push_str(&site_extra.replace("{DIR}", &dir.path().display().to_string()));
+        write_file(dir.path(), "site.toml", &site);
+        let mut sys = minimal_system_toml();
+        sys.push_str(&sys_extra.replace("{DIR}", &dir.path().display().to_string()));
+        write_file(dir.path(), "system.toml", &sys);
+        let result = load(dir.path(), &dir.path().join("system.toml"));
+        (dir, result)
+    }
+
+    #[test]
+    fn auth_without_backend_loads() {
+        let (_d, cfg) = load_with("\n[auth]\npublic_key = \"auth.pem\"\n", "");
+        let cfg = cfg.unwrap();
+        let auth = cfg.auth.expect("auth present");
+        assert_eq!(auth.backend, None);
+        assert_eq!(auth.public_key, "auth.pem");
+    }
+
+    #[test]
+    fn auth_backend_when_given_must_be_declared() {
+        let (_d, r) = load_with(
+            "\n[auth]\nbackend = \"nope\"\npublic_key = \"auth.pem\"\n",
+            "",
+        );
+        assert!(r
+            .unwrap_err()
+            .to_string()
+            .contains("[auth].backend `nope` not in [[backend]]"));
+        let (_d, ok) = load_with(
+            "\n[auth]\nbackend = \"m6-html\"\npublic_key = \"auth.pem\"\n",
+            "",
+        );
+        assert!(ok.is_ok());
+    }
+
+    #[test]
+    fn auth_from_the_system_config_is_used() {
+        let (_d, r) = load_with("", "\n[auth]\npublic_key = \"{DIR}/auth.pem\"\n");
+        let auth = r.unwrap().auth.expect("auth present");
+        assert!(auth.public_key.ends_with("/auth.pem"));
+        assert_eq!(auth.backend, None);
+    }
+
+    #[test]
+    fn auth_in_both_files_is_refused() {
+        let (_d, r) = load_with(
+            "\n[auth]\npublic_key = \"auth.pem\"\n",
+            "\n[auth]\npublic_key = \"{DIR}/auth.pem\"\n",
+        );
+        assert_eq!(
+            r.unwrap_err().to_string(),
+            "config error: [auth] is declared in both site.toml and the system config; declare it in one"
+        );
+    }
+
+    #[test]
+    fn a_relative_public_key_in_the_system_config_is_refused() {
+        let (_d, r) = load_with("", "\n[auth]\npublic_key = \"auth.pem\"\n");
+        assert_eq!(
+            r.unwrap_err().to_string(),
+            "config error: [auth].public_key in the system config must be an absolute path, got \"auth.pem\""
+        );
     }
 }
