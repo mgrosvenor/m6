@@ -26,6 +26,7 @@ mod check;
 mod digest;
 mod fleet;
 mod poll;
+mod tunnel;
 
 use std::time::Duration;
 
@@ -93,12 +94,9 @@ impl MonitorState {
 
 /// Build the shared state and start the poller.
 fn build_state(ctx: &AppContext) -> Result<MonitorState> {
-    let interval = Duration::from_secs(
-        ctx.config
-            .get("poll_interval_s")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(DEFAULT_POLL_SECS),
-    );
+    let interval = Duration::from_secs(fleet::poll_interval_s(|k| {
+        ctx.config.get(k).and_then(|v| v.as_u64())
+    }));
     let latest: std::sync::Arc<std::sync::RwLock<Option<Snapshot>>> =
         std::sync::Arc::new(std::sync::RwLock::new(None));
 
@@ -149,13 +147,23 @@ fn collect_from(
 ) -> anyhow::Result<(digest::Digest, Vec<poll::NodeReading>)> {
     let fleet = fleet::Fleet::from_config(config_path)?;
     let token = fleet.perf_token();
-    let readings = poll::fleet(
+    let mut readings = poll::fleet(
         &fleet.nodes,
         token.as_deref(),
         Duration::from_millis(fleet.timeout_ms),
         &fleet.header_check,
     );
-    let d = digest::build(&readings, &digest::Thresholds::default(), now_iso8601());
+    // Sequential with the HTTPS polls on purpose: the round trip is not taken
+    // while this host is doing its own TLS work.
+    let tunnels = tunnel::fleet(&fleet, Duration::from_millis(fleet.timeout_ms));
+    for (r, t) in readings.iter_mut().zip(tunnels) {
+        r.tunnel = t;
+    }
+    let thresholds = digest::Thresholds {
+        tunnel_handshake_age_s: fleet.tunnel_handshake_max_age_s,
+        ..Default::default()
+    };
+    let d = digest::build(&readings, &thresholds, now_iso8601());
     Ok((d, readings))
 }
 
@@ -175,7 +183,7 @@ fn snapshot_digest(st: &MonitorState) -> anyhow::Result<digest::Digest> {
     Ok(snap.digest.clone())
 }
 
-/// The whole A-to-G report, as text, from the latest snapshot.
+/// The whole A-to-H report, as text, from the latest snapshot.
 ///
 /// This is what `--check` printed, and the only reason that flag existed: the
 /// report had no route out. With this it is reachable the way everything else is,
@@ -344,7 +352,8 @@ fn render(d: &digest::Digest) -> String {
         };
         h.push_str(&format!(
             "<div class='{cls}'><b>{}</b> &middot; {}</div>",
-            f.node, f.text
+            m6_core::util::html_escape(&f.node),
+            m6_core::util::html_escape(&f.text)
         ));
     }
 
@@ -353,7 +362,7 @@ fn render(d: &digest::Digest) -> String {
          <th>node</th><th>role</th><th>status</th><th>rtt</th>\
          <th>reqs</th><th>hit rate</th><th>p50</th><th>p99</th>\
          <th>load</th><th>mem</th><th>disk</th><th>temp</th>\
-         <th>svc up</th><th>host up</th></tr>",
+         <th>svc up</th><th>host up</th><th>tunnel</th></tr>",
     );
     for n in &d.nodes {
         let load = match (n.load_one, n.cpus) {
@@ -371,10 +380,10 @@ fn render(d: &digest::Digest) -> String {
         h.push_str(&format!(
             "<tr><td>{}</td><td class=dim>{}</td><td>{}</td><td>{}</td>\
              <td>{}</td><td>{}</td><td>{}</td><td>{}</td>\
-             <td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-            n.name,
-            n.role,
-            n.status,
+             <td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            m6_core::util::html_escape(&n.name),
+            m6_core::util::html_escape(&n.role),
+            m6_core::util::html_escape(&n.status),
             n.rtt_ms
                 .map(|v| format!("{v:.1}ms"))
                 .unwrap_or_else(|| "-".into()),
@@ -396,6 +405,15 @@ fn render(d: &digest::Digest) -> String {
                 .unwrap_or_else(|| "-".into()),
             n.uptime_s.map(dur).unwrap_or_else(|| "-".into()),
             n.host_uptime_s.map(dur).unwrap_or_else(|| "-".into()),
+            // The same wording as /check section H.
+            match &n.tunnel {
+                Some(t) => m6_core::util::html_escape(&format!(
+                    "{} handshake {}",
+                    t.rtt_text(),
+                    t.handshake_text()
+                )),
+                None => "<span class=dim>no tunnel</span>".to_string(),
+            },
         ));
     }
     h.push_str("</table></div>");
@@ -413,9 +431,87 @@ fn render(d: &digest::Digest) -> String {
         };
         h.push_str(&format!(
             "<tr><td>{}</td><td style='text-align:left'>{}</td></tr>",
-            n.name, pools
+            m6_core::util::html_escape(&n.name),
+            pools
         ));
     }
     h.push_str("</table></div>");
     h
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node_digest(name: &str, tunnel: Option<digest::TunnelDigest>) -> digest::NodeDigest {
+        let r = poll::NodeReading {
+            name: name.into(),
+            role: "cache".into(),
+            url: "http://edge-a.example.com".into(),
+            health: None,
+            health_status: None,
+            perf: None,
+            perf_error: None,
+            traffic: None,
+            traffic_error: None,
+            header_checks: Vec::new(),
+            rtt: None,
+            unreachable: None,
+            tunnel: None,
+        };
+        let mut d = digest::build(&[r], &digest::Thresholds::default(), "now".into());
+        let mut n = d.nodes.remove(0);
+        n.tunnel = tunnel;
+        n
+    }
+
+    /// The page carries the tunnel column in the wording of /check section H,
+    /// and says "no tunnel" for a node without one.
+    #[test]
+    fn the_page_has_a_tunnel_column_and_says_no_tunnel_without_one() {
+        let t = digest::TunnelDigest {
+            address: "192.0.2.2:443".into(),
+            rtt_ms: Some(0.4),
+            rtt_samples_ms: vec![0.4, 0.5, 0.6],
+            probe: digest::ProbeState::Connected,
+            probe_error: None,
+            handshake: digest::HandshakeState::Ok,
+            handshake_age_s: Some(42),
+            handshake_detail: None,
+        };
+        let mut d = digest::build(&[], &digest::Thresholds::default(), "now".into());
+        d.nodes = vec![node_digest("edge-a", Some(t)), node_digest("edge-b", None)];
+        let html = render(&d);
+        assert!(html.contains("<th>tunnel</th>"), "{html}");
+        assert!(
+            html.contains("rtt 0.40ms (n 3, connected) handshake 42s ago"),
+            "{html}"
+        );
+        assert!(html.contains("no tunnel"), "{html}");
+    }
+
+    /// Node name, role and status come from config and from the nodes, and
+    /// reach the page as HTML.
+    #[test]
+    fn the_page_escapes_node_name_role_and_status() {
+        let mut d = digest::build(&[], &digest::Thresholds::default(), "now".into());
+        let mut n = node_digest("<i>edge</i>", None);
+        n.role = "<b>cache</b>".into();
+        n.status = "<u>ok</u>".into();
+        d.nodes = vec![n];
+        d.findings.push(digest::Finding {
+            level: digest::Level::Fault,
+            node: "<s>monitor</s>".into(),
+            text: "file </p>/x is old".into(),
+        });
+        let html = render(&d);
+        assert!(!html.contains("<s>monitor"), "{html}");
+        assert!(html.contains("file &lt;/p&gt;/x is old"), "{html}");
+        assert!(!html.contains("<i>edge"), "{html}");
+        assert!(!html.contains("<b>cache"), "{html}");
+        assert!(!html.contains("<u>ok"), "{html}");
+        assert!(html.contains("&lt;i&gt;edge&lt;/i&gt;"), "{html}");
+        assert!(html.contains("&lt;b&gt;cache&lt;/b&gt;"), "{html}");
+        assert!(html.contains("&lt;u&gt;ok&lt;/u&gt;"), "{html}");
+    }
 }
