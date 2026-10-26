@@ -502,6 +502,29 @@ pub fn parse_query_string(query: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// A query key that appeared more than once where one was expected.
+pub(crate) struct RepeatedKey;
+
+/// The raw, undecoded value of the single query key `key`: `None` when it is
+/// absent, [`RepeatedKey`] when it appears twice. A key with no `=` has the
+/// value `""`.
+pub(crate) fn single_query_value<'a>(
+    query: &'a str,
+    key: &str,
+) -> std::result::Result<Option<&'a str>, RepeatedKey> {
+    let mut found = None;
+    for pair in query.split('&') {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        if k == key {
+            if found.is_some() {
+                return Err(RepeatedKey);
+            }
+            found = Some(v);
+        }
+    }
+    Ok(found)
+}
+
 pub fn parse_form_body(body: &[u8]) -> Vec<(String, String)> {
     // `from_utf8(..).unwrap_or("")` threw away the ENTIRE body on a single
     // invalid byte, yielding a submission with no fields and no explanation --

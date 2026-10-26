@@ -1265,6 +1265,14 @@ pub fn build_response(
 mod tests {
     use super::*;
 
+    /// A full JSON Lines page from `m6_core::ndjson` must fit in a backend body
+    /// this edge will accept, or a service honouring its own page limit would
+    /// still be refused here.
+    #[test]
+    fn a_full_ndjson_page_fits_under_the_backend_body_cap() {
+        const { assert!(m6_core::ndjson::MAX_PAGE_BYTES < MAX_BACKEND_BODY) };
+    }
+
     #[test]
     fn test_parse_status_line() {
         let (status, reason) = parse_status_line("HTTP/1.1 200 OK").unwrap();
