@@ -34,7 +34,19 @@ pub struct Thresholds {
     /// and an ignored warning is the same as no warning. A deployment renewing
     /// on a different schedule sets its own.
     pub cert_expiry_days: i64,
+    /// Seconds since a peer's latest WireGuard handshake above which the
+    /// tunnel is a fault. Read from `[monitor] tunnel_handshake_max_age_s`.
+    ///
+    /// WireGuard re-handshakes about every 120 seconds on a session that
+    /// carries traffic, and the monitor's own probe sends traffic every poll.
+    /// A collector writing once a minute adds up to 60 seconds. 600 therefore
+    /// means several missed re-handshakes. The time is the last SUCCESSFUL
+    /// handshake, so it is the slow signal and the probe is the fast one.
+    pub tunnel_handshake_age_s: u64,
 }
+
+/// The default for `Thresholds::tunnel_handshake_age_s`, in seconds.
+pub const DEFAULT_TUNNEL_HANDSHAKE_AGE_S: u64 = 600;
 
 impl Default for Thresholds {
     fn default() -> Self {
@@ -44,6 +56,7 @@ impl Default for Thresholds {
             load_per_cpu: 2.0,
             thermal_celsius: 80.0,
             cert_expiry_days: 21,
+            tunnel_handshake_age_s: DEFAULT_TUNNEL_HANDSHAKE_AGE_S,
         }
     }
 }
@@ -151,6 +164,97 @@ pub struct NodeDigest {
     /// to see a fleet whose nodes have stopped agreeing about what they serve.
     pub cert_not_after_unix: Option<i64>,
     pub perf_error: Option<String>,
+    /// The WireGuard tunnel from the monitor host to this node, if configured.
+    pub tunnel: Option<TunnelDigest>,
+}
+
+/// One node's tunnel, as figures and states.
+#[derive(Debug, Clone, Serialize)]
+pub struct TunnelDigest {
+    pub address: String,
+    /// The minimum of the samples, in milliseconds.
+    pub rtt_ms: Option<f64>,
+    pub rtt_samples_ms: Vec<f64>,
+    /// `connected`, `refused`, `no_answer` or `failed`.
+    pub probe: &'static str,
+    pub probe_error: Option<String>,
+    /// `ok` (a timestamp exists, staleness is a finding), `never`,
+    /// `peer_absent`, `not_configured`, `file_missing` or `file_error`.
+    pub handshake: &'static str,
+    pub handshake_age_s: Option<u64>,
+    pub handshake_detail: Option<String>,
+    pub handshake_file_age_s: Option<u64>,
+}
+
+impl TunnelDigest {
+    /// `rtt 0.40ms (n 3, connected)`, the wording of /check section H and the page.
+    pub fn rtt_text(&self) -> String {
+        match self.rtt_ms {
+            Some(min) => format!(
+                "rtt {min:.2}ms (n {}, {})",
+                self.rtt_samples_ms.len(),
+                self.probe
+            ),
+            None => format!(
+                "rtt -  ({}: {})",
+                self.probe,
+                self.probe_error.as_deref().unwrap_or("no samples")
+            ),
+        }
+    }
+
+    /// `42s ago`, `never` and the other states, in one wording for both views.
+    pub fn handshake_text(&self) -> String {
+        match self.handshake {
+            "ok" => match self.handshake_age_s {
+                Some(a) => format!("{a}s ago"),
+                None => "ok".to_string(),
+            },
+            "never" => "never".to_string(),
+            "peer_absent" => "peer not on this host's interface".to_string(),
+            "not_configured" => format!(
+                "not configured ({})",
+                self.handshake_detail.as_deref().unwrap_or("-")
+            ),
+            "file_missing" => "file missing".to_string(),
+            _ => "file unreadable".to_string(),
+        }
+    }
+}
+
+fn tunnel_digest(t: &crate::tunnel::TunnelReading) -> TunnelDigest {
+    use crate::tunnel::{Handshake, Probe};
+    let (probe, probe_error) = match &t.probe.outcome {
+        Probe::Connected => ("connected", None),
+        Probe::Refused => ("refused", None),
+        Probe::NoAnswer(e) => ("no_answer", Some(e.clone())),
+        Probe::Failed(e) => ("failed", Some(e.clone())),
+    };
+    let ms: Vec<f64> = t
+        .probe
+        .samples
+        .iter()
+        .map(|d| d.as_secs_f64() * 1000.0)
+        .collect();
+    let (handshake, handshake_age_s, handshake_detail) = match &t.handshake {
+        Handshake::NotConfigured(why) => ("not_configured", None, Some((*why).to_string())),
+        Handshake::FileMissing(p) => ("file_missing", None, Some(p.clone())),
+        Handshake::FileError(e) => ("file_error", None, Some(e.clone())),
+        Handshake::PeerAbsent => ("peer_absent", None, None),
+        Handshake::Never => ("never", None, None),
+        Handshake::At { age_s } => ("ok", Some(*age_s), None),
+    };
+    TunnelDigest {
+        address: t.address.clone(),
+        rtt_ms: ms.iter().copied().reduce(f64::min),
+        rtt_samples_ms: ms,
+        probe,
+        probe_error,
+        handshake,
+        handshake_age_s,
+        handshake_detail,
+        handshake_file_age_s: t.file_age_s,
+    }
 }
 
 fn pct(v: f64) -> String {
@@ -160,6 +264,9 @@ fn pct(v: f64) -> String {
 pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
     let mut findings = Vec::new();
     let mut nodes = Vec::new();
+    // The handshake file is one fact about the monitor host, so a missing file
+    // is one finding, not one per node.
+    let mut handshake_file_problem: Option<String> = None;
 
     for r in readings {
         let mut d = NodeDigest {
@@ -191,7 +298,67 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
             cert_expires_in_seconds: None,
             cert_not_after_unix: None,
             perf_error: r.perf_error.clone(),
+            tunnel: r.tunnel.as_ref().map(tunnel_digest),
         };
+
+        // Before the unreachable `continue` below: a node whose HTTPS poll
+        // fails still reports its tunnel, and that is when it matters most.
+        if let Some(td) = &d.tunnel {
+            let mut fault = |text: String| {
+                findings.push(Finding {
+                    level: Level::Fault,
+                    node: r.name.clone(),
+                    text,
+                });
+            };
+            if matches!(td.probe, "no_answer" | "failed") {
+                fault(format!(
+                    "tunnel {} did not answer: {}",
+                    td.address,
+                    td.probe_error.as_deref().unwrap_or("no reason given")
+                ));
+            }
+            match td.handshake {
+                "never" => fault(
+                    "tunnel peer has never completed a WireGuard handshake with this host"
+                        .to_string(),
+                ),
+                "peer_absent" => {
+                    let key = r
+                        .tunnel
+                        .as_ref()
+                        .and_then(|t| t.key_prefix.as_deref())
+                        .unwrap_or("?");
+                    fault(format!(
+                        "public key {key}... is not a peer on this host's WireGuard interface"
+                    ));
+                }
+                "ok" => {
+                    if let Some(age) = td.handshake_age_s {
+                        if age > t.tunnel_handshake_age_s {
+                            fault(format!(
+                                "last WireGuard handshake {age}s ago, over the {}s threshold",
+                                t.tunnel_handshake_age_s
+                            ));
+                        }
+                    }
+                }
+                "file_missing" | "file_error" if handshake_file_problem.is_none() => {
+                    handshake_file_problem = Some(if td.handshake == "file_missing" {
+                        format!(
+                                "WireGuard handshake file {} is missing, so no handshake age can be read: is its collector installed?",
+                                td.handshake_detail.as_deref().unwrap_or("-")
+                            )
+                    } else {
+                        format!(
+                            "WireGuard handshake file unreadable: {}",
+                            td.handshake_detail.as_deref().unwrap_or("-")
+                        )
+                    });
+                }
+                _ => {}
+            }
+        }
 
         if !r.is_up() {
             let why = r.unreachable.as_deref().unwrap_or("no reason given");
@@ -680,6 +847,14 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
         }
     }
 
+    if let Some(text) = handshake_file_problem {
+        findings.push(Finding {
+            level: Level::Fault,
+            node: "monitor".into(),
+            text,
+        });
+    }
+
     findings.sort_by_key(|f| std::cmp::Reverse(f.level));
     let level = findings.iter().map(|f| f.level).max().unwrap_or(Level::Ok);
     Digest {
@@ -692,13 +867,13 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use m6_core::host::{Disk, HostSnapshot, LoadAverage, Memory, MemorySource};
     use m6_core::monitoring::{HealthReport, PerfReport, PoolHealth};
     use m6_core::telemetry::StatsSnapshot;
 
-    fn perf(host: HostSnapshot, pools: Vec<PoolHealth>) -> PerfReport {
+    pub(crate) fn perf(host: HostSnapshot, pools: Vec<PoolHealth>) -> PerfReport {
         PerfReport {
             node: "origin".into(),
             build: m6_core::monitoring::BuildId {
@@ -774,6 +949,7 @@ mod tests {
             header_checks: Vec::new(),
             rtt: Some(std::time::Duration::from_millis(3)),
             unreachable: None,
+            tunnel: None,
         }
     }
 
@@ -1556,5 +1732,213 @@ mod tests {
             "{:?}",
             d.findings
         );
+    }
+
+    // ── tunnels ──────────────────────────────────────────────────────────────
+
+    use crate::tunnel::{Handshake, Probe, ProbeResult, TunnelReading};
+
+    fn tunnel(outcome: Probe, handshake: Handshake) -> TunnelReading {
+        let ms = |n| std::time::Duration::from_micros(n);
+        TunnelReading {
+            address: "192.0.2.2:443".into(),
+            key_prefix: Some("AAAAAAAA".into()),
+            probe: ProbeResult {
+                samples: match outcome {
+                    Probe::Connected | Probe::Refused => vec![ms(600), ms(400), ms(500)],
+                    _ => vec![],
+                },
+                outcome,
+            },
+            handshake,
+            file_age_s: Some(7),
+        }
+    }
+
+    fn with_tunnel(name: &str, t: TunnelReading) -> NodeReading {
+        let mut r = reading(name, "ok", None);
+        r.tunnel = Some(t);
+        r
+    }
+
+    fn tunnel_findings(d: &Digest) -> Vec<&Finding> {
+        d.findings
+            .iter()
+            .filter(|f| {
+                f.text.contains("tunnel") || f.text.contains("WireGuard") || f.text.contains("peer")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_healthy_tunnel_raises_nothing_and_reports_rtt_and_age() {
+        let r = with_tunnel(
+            "edge-a",
+            tunnel(Probe::Connected, Handshake::At { age_s: 42 }),
+        );
+        let d = build(&[r], &Thresholds::default(), now());
+        assert!(tunnel_findings(&d).is_empty(), "{:?}", d.findings);
+        let t = d.nodes[0].tunnel.as_ref().unwrap();
+        assert!((t.rtt_ms.unwrap() - 0.4).abs() < 1e-9);
+        assert_eq!(t.rtt_samples_ms.len(), 3);
+        assert_eq!(t.handshake_age_s, Some(42));
+    }
+
+    #[test]
+    fn a_tunnel_that_never_handshook_is_a_fault() {
+        let r = with_tunnel("edge-a", tunnel(Probe::Connected, Handshake::Never));
+        let d = build(&[r], &Thresholds::default(), now());
+        let f = tunnel_findings(&d);
+        assert_eq!(f.len(), 1, "{:?}", d.findings);
+        assert_eq!(f[0].level, Level::Fault);
+        assert!(f[0].text.contains("never completed"));
+    }
+
+    #[test]
+    fn a_stale_handshake_faults_above_the_threshold() {
+        let at = |age_s| {
+            let r = with_tunnel("edge-a", tunnel(Probe::Connected, Handshake::At { age_s }));
+            build(&[r], &Thresholds::default(), now())
+        };
+        let over = at(601);
+        let f = tunnel_findings(&over);
+        assert_eq!(f.len(), 1, "{:?}", over.findings);
+        assert_eq!(f[0].level, Level::Fault);
+        assert!(f[0].text.contains("601s ago, over the 600s threshold"));
+        assert!(tunnel_findings(&at(600)).is_empty());
+    }
+
+    #[test]
+    fn the_staleness_threshold_comes_from_the_thresholds_value() {
+        let r = with_tunnel(
+            "edge-a",
+            tunnel(Probe::Connected, Handshake::At { age_s: 100 }),
+        );
+        let t = Thresholds {
+            tunnel_handshake_age_s: 90,
+            ..Default::default()
+        };
+        let d = build(&[r], &t, now());
+        assert_eq!(tunnel_findings(&d).len(), 1, "{:?}", d.findings);
+    }
+
+    #[test]
+    fn a_peer_missing_from_the_interface_is_a_fault() {
+        let r = with_tunnel("edge-a", tunnel(Probe::Connected, Handshake::PeerAbsent));
+        let d = build(&[r], &Thresholds::default(), now());
+        let f = tunnel_findings(&d);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].level, Level::Fault);
+        assert!(f[0].text.contains("AAAAAAAA... is not a peer"));
+    }
+
+    #[test]
+    fn an_unanswered_tunnel_probe_is_a_fault() {
+        let r = with_tunnel(
+            "edge-a",
+            tunnel(
+                Probe::NoAnswer("no answer in 500ms".into()),
+                Handshake::At { age_s: 5 },
+            ),
+        );
+        let d = build(&[r], &Thresholds::default(), now());
+        let f = tunnel_findings(&d);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].level, Level::Fault);
+        assert!(f[0].text.contains("did not answer"));
+        assert!(d.nodes[0].tunnel.as_ref().unwrap().rtt_ms.is_none());
+    }
+
+    #[test]
+    fn a_refusal_is_a_round_trip_and_raises_nothing() {
+        let r = with_tunnel("edge-a", tunnel(Probe::Refused, Handshake::At { age_s: 5 }));
+        let d = build(&[r], &Thresholds::default(), now());
+        assert!(tunnel_findings(&d).is_empty(), "{:?}", d.findings);
+        assert_eq!(d.nodes[0].tunnel.as_ref().unwrap().probe, "refused");
+    }
+
+    /// The guard on the unreachable `continue`: a node whose HTTPS poll failed
+    /// still reports its tunnel.
+    #[test]
+    fn an_unreachable_node_still_reports_its_tunnel() {
+        let mut r = with_tunnel("edge-a", tunnel(Probe::Connected, Handshake::Never));
+        r.unreachable = Some("connection refused".into());
+        let d = build(&[r], &Thresholds::default(), now());
+        assert!(d.nodes[0].tunnel.is_some());
+        assert!(d
+            .findings
+            .iter()
+            .any(|f| f.text.contains("never completed")));
+        assert!(d.findings.iter().any(|f| f.text.contains("unreachable")));
+    }
+
+    #[test]
+    fn a_missing_handshake_file_is_one_fault_not_one_per_node() {
+        let missing = || tunnel(Probe::Connected, Handshake::FileMissing("/x/wg".into()));
+        let rs = [
+            with_tunnel("origin", missing()),
+            with_tunnel("edge-a", missing()),
+            with_tunnel("edge-b", missing()),
+        ];
+        let d = build(&rs, &Thresholds::default(), now());
+        let f = tunnel_findings(&d);
+        assert_eq!(f.len(), 1, "{:?}", d.findings);
+        assert_eq!(f[0].node, "monitor");
+        assert_eq!(f[0].level, Level::Fault);
+        assert!(f[0].text.contains("/x/wg is missing"));
+    }
+
+    #[test]
+    fn an_unreadable_handshake_file_is_one_fault_on_the_monitor() {
+        let r = with_tunnel(
+            "edge-a",
+            tunnel(Probe::Connected, Handshake::FileError("/x: line 2".into())),
+        );
+        let d = build(&[r], &Thresholds::default(), now());
+        let f = tunnel_findings(&d);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].node, "monitor");
+        assert_eq!(f[0].level, Level::Fault);
+        assert!(f[0].text.contains("unreadable"));
+    }
+
+    #[test]
+    fn a_node_with_no_tunnel_configured_raises_nothing() {
+        let d = build(
+            &[reading("edge-a", "ok", None)],
+            &Thresholds::default(),
+            now(),
+        );
+        assert!(d.nodes[0].tunnel.is_none());
+        assert!(tunnel_findings(&d).is_empty());
+    }
+
+    #[test]
+    fn a_tunnel_with_no_public_key_raises_nothing() {
+        let r = with_tunnel(
+            "edge-a",
+            tunnel(
+                Probe::Connected,
+                Handshake::NotConfigured("no public_key for this node"),
+            ),
+        );
+        let d = build(&[r], &Thresholds::default(), now());
+        assert!(tunnel_findings(&d).is_empty(), "{:?}", d.findings);
+    }
+
+    #[test]
+    fn the_json_digest_carries_tunnel_rtt_and_handshake_age() {
+        let r = with_tunnel(
+            "edge-a",
+            tunnel(Probe::Connected, Handshake::At { age_s: 42 }),
+        );
+        let d = build(&[r], &Thresholds::default(), now());
+        let v = serde_json::to_value(&d).unwrap();
+        let t = &v["nodes"][0]["tunnel"];
+        assert!(t["rtt_ms"].is_number());
+        assert_eq!(t["rtt_samples_ms"].as_array().unwrap().len(), 3);
+        assert_eq!(t["handshake_age_s"], 42);
+        assert_eq!(t["handshake_file_age_s"], 7);
+        assert_eq!(v["thresholds"]["tunnel_handshake_age_s"], 600);
     }
 }

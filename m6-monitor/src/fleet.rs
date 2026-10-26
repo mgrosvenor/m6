@@ -40,6 +40,34 @@ pub struct Node {
     /// not the fleet's.
     #[serde(default)]
     pub perf_token_file: Option<String>,
+    /// The WireGuard tunnel from this host to the node, if there is one.
+    ///
+    /// Absent means "no tunnel configured", which the report says out loud and
+    /// never counts as a fault.
+    #[serde(default)]
+    pub tunnel: Option<Tunnel>,
+}
+
+/// A WireGuard tunnel from the monitor host to one node.
+///
+/// ```toml
+/// tunnel = { address = "192.0.2.2:443", public_key = "<peer public key>" }
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Tunnel {
+    /// An IP address and port on the tunnel, such as `192.0.2.2:443`. An IP
+    /// literal, never a name, so a probe cannot depend on DNS.
+    ///
+    /// Point it at any TCP port the peer listens on over the tunnel. A closed
+    /// port that answers with a reset still gives a round trip, and the report
+    /// says `refused`. A port the peer's firewall drops gives "no answer".
+    pub address: String,
+    /// The peer's WireGuard public key, as `wg show` prints it.
+    ///
+    /// Optional. Without it the round trip is still measured and the handshake
+    /// age is reported as not configured.
+    #[serde(default)]
+    pub public_key: Option<String>,
 }
 
 impl Node {
@@ -99,6 +127,26 @@ pub struct Fleet {
     /// the report says so rather than silently passing.
     #[serde(default)]
     pub header_check: Vec<HeaderCheck>,
+    /// A file holding the output of `wg show <interface> latest-handshakes`,
+    /// written by a privileged timer, for example
+    /// `wg show wg0 latest-handshakes > <file>.tmp && mv -f <file>.tmp <file>`.
+    ///
+    /// Optional. Without it no handshake age is read. **Never use `wg show ...
+    /// dump`**: it includes the interface private key.
+    #[serde(default)]
+    pub wg_handshakes_file: Option<String>,
+    /// Seconds since a peer's last WireGuard handshake above which the monitor
+    /// reports a fault. Optional, default 600.
+    ///
+    /// The time is the last SUCCESSFUL handshake, so it is the slow signal: it
+    /// stops moving the moment a tunnel breaks and stays recent for minutes.
+    /// The round trip to the tunnel address is the fast one.
+    #[serde(default = "default_tunnel_handshake_max_age_s")]
+    pub tunnel_handshake_max_age_s: u64,
+}
+
+fn default_tunnel_handshake_max_age_s() -> u64 {
+    crate::digest::DEFAULT_TUNNEL_HANDSHAKE_AGE_S
 }
 
 /// One "this path must answer with this header" assertion.
@@ -155,6 +203,17 @@ impl Fleet {
         let fleet: Fleet = section.clone().try_into()?;
         if fleet.nodes.is_empty() {
             anyhow::bail!("[monitor] lists no nodes");
+        }
+        for n in &fleet.nodes {
+            if let Some(t) = &n.tunnel {
+                if t.address.parse::<std::net::SocketAddr>().is_err() {
+                    anyhow::bail!(
+                        "node {:?}: tunnel.address {:?} is not an IP address and port, for example 192.0.2.2:443",
+                        n.name,
+                        t.address
+                    );
+                }
+            }
         }
         Ok(fleet)
     }
@@ -239,6 +298,7 @@ role = "cache"
             url: "https://edge-a.example.com".into(),
             role: "cache".into(),
             perf_token_file: Some(per_node.path().to_string_lossy().to_string()),
+            tunnel: None,
         };
         assert_eq!(
             n.perf_token(Some("fleet-token")).as_deref(),
@@ -250,6 +310,7 @@ role = "cache"
             url: "https://origin.example.com".into(),
             role: "origin".into(),
             perf_token_file: None,
+            tunnel: None,
         };
         assert_eq!(
             bare.perf_token(Some("fleet-token")).as_deref(),
@@ -268,5 +329,58 @@ role = "cache"
         .unwrap();
         let fleet = Fleet::from_config(f.path()).unwrap();
         assert!(fleet.perf_token().is_none());
+    }
+
+    fn load(text: &str) -> anyhow::Result<Fleet> {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(f, "{text}").unwrap();
+        Fleet::from_config(f.path())
+    }
+
+    #[test]
+    fn a_node_with_a_tunnel_reads_its_address_and_key() {
+        let fleet = load(
+            r#"
+[monitor]
+wg_handshakes_file = "/var/lib/m6-monitor/wg-handshakes"
+tunnel_handshake_max_age_s = 90
+
+[[monitor.nodes]]
+name = "edge-a"
+url  = "https://edge-a.example.com"
+tunnel = { address = "192.0.2.2:443", public_key = "KEY" }
+"#,
+        )
+        .unwrap();
+        let t = fleet.nodes[0].tunnel.as_ref().unwrap();
+        assert_eq!(t.address, "192.0.2.2:443");
+        assert_eq!(t.public_key.as_deref(), Some("KEY"));
+        assert_eq!(
+            fleet.wg_handshakes_file.as_deref(),
+            Some("/var/lib/m6-monitor/wg-handshakes")
+        );
+        assert_eq!(fleet.tunnel_handshake_max_age_s, 90);
+    }
+
+    #[test]
+    fn a_tunnel_address_that_is_not_ip_and_port_is_a_config_error() {
+        for bad in ["edge-a.example.com:443", "192.0.2.2"] {
+            let e = load(&format!(
+                "[[monitor.nodes]]\nname = \"edge-a\"\nurl = \"http://x.example.com\"\n\
+                 tunnel = {{ address = {bad:?} }}\n"
+            ))
+            .unwrap_err();
+            assert!(e.to_string().contains("edge-a"), "{e}");
+        }
+    }
+
+    #[test]
+    fn a_node_without_a_tunnel_has_none() {
+        let fleet =
+            load("[[monitor.nodes]]\nname = \"origin\"\nurl = \"http://origin.example.com\"\n")
+                .unwrap();
+        assert!(fleet.nodes[0].tunnel.is_none());
+        assert!(fleet.wg_handshakes_file.is_none());
+        assert_eq!(fleet.tunnel_handshake_max_age_s, 600);
     }
 }
