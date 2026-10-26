@@ -44,7 +44,7 @@ http-client = ["dep:ureq"]
 # table rule. Off by default, so a service that does not use it links nothing
 # new. It uses the same rusqlite version and `bundled` feature as the rest of
 # the workspace, so the lockfile gains no package. Nothing in the workspace
-# turns it on, so CI tests and lints it with a dedicated step.
+# turns it on, so CI tests and lints m6-core with --all-features.
 sqlite = ["dep:rusqlite"]
 
 [dependencies]

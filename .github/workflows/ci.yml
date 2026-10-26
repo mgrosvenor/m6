@@ -132,20 +132,21 @@ jobs:
             exit 1
           fi
 
-      # Nothing in the workspace turns on an off-by-default core feature, so
-      # `cargo test --workspace` never compiles or runs its code. That is the
-      # `templates` scar (two csrf tests stayed broken) applied to `sqlite`, so
-      # it is built, warned on and tested by name here.
+      # Nothing in the workspace turns on some off-by-default core features
+      # (`sqlite`, `email`, `multipart`), so `cargo test --workspace` never
+      # compiles or runs their code. That is the `templates` scar (two csrf
+      # tests stayed broken), so m6-core is built, warned on and tested here
+      # with every feature on, and a new feature is covered without an edit.
       - name: Opt-in core features, zero warnings and tests
         run: |
-          cargo test -p m6-core --lib --features sqlite --no-run 2>&1 | tee featbuild.log
+          cargo test -p m6-core --lib --all-features --no-run 2>&1 | tee featbuild.log
           n=$(grep -c '^warning' featbuild.log || true)
-          [ "$n" -eq 0 ] || { echo "::error::$n warning(s) building m6-core --features sqlite"; exit 1; }
+          [ "$n" -eq 0 ] || { echo "::error::$n warning(s) building m6-core --all-features"; exit 1; }
           # The integration tests need built binaries, so only the library tests
           # and the doctests run here.
-          { cargo test -p m6-core --lib --features sqlite; cargo test -p m6-core --doc --features sqlite; } > feat.log 2>&1 || true
+          { cargo test -p m6-core --lib --all-features; cargo test -p m6-core --doc --all-features; } > feat.log 2>&1 || true
           grep -E '^test result:' feat.log || true
-          if grep -q '^failures:' feat.log; then sed -n '/^failures:/,$p' feat.log | head -80; echo "::error::m6-core sqlite tests failed"; exit 1; fi
+          if grep -q '^failures:' feat.log; then sed -n '/^failures:/,$p' feat.log | head -80; echo "::error::m6-core --all-features tests failed"; exit 1; fi
 
       # Clippy must be silent: `-D warnings`, no ceiling. It went to zero on
       # 2026-09-13 and is held there the same way rustc warnings are. A new

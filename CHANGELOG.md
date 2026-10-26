@@ -69,7 +69,8 @@ These are now made once, in m6-core.
 The feature is off by default.
 `cargo tree -p m6-http` shows no rusqlite, and `Cargo.lock` gains one line, `"rusqlite"` under m6-core.
 Nothing in the workspace turns the feature on, so `cargo test --workspace` never builds it.
-CI therefore has a step that builds and tests it by name, and `tools/clippy.sh` has a second pass that lints it.
+CI therefore has a step that builds and tests m6-core with `--all-features`, and `tools/clippy.sh` has a second pass that lints it the same way.
+That also covers `email` and `multipart`, which nothing in the workspace turns on either.
 
 Verified: `cargo test -p m6-core --lib --features sqlite` passes 410 tests with 0 failures, including 27 in the `sqlite` module that run against real files.
 The doctests pass with the feature on.
