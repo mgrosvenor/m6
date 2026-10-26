@@ -36,7 +36,10 @@
 //! - A migration is never edited once released. A change is a new migration.
 //! - A failing migration rolls back, and the file stays at the previous version.
 //! - A file newer than the list is refused with [`SqliteError::NewerThanCode`],
-//!   so an older binary never writes into a schema it does not know.
+//!   so an older binary never writes into a schema it does not know. The
+//!   version is checked before the first migration and again inside each
+//!   transaction, so a newer process that migrates the file meanwhile is also
+//!   refused.
 //! - A migration may rebuild a table that other tables point at, as SQLite's
 //!   documented procedure does: create the new table, copy the rows, drop the
 //!   old table and rename the new one. SQLite ignores `PRAGMA foreign_keys`
@@ -236,6 +239,9 @@ pub fn migrate(conn: &mut Connection, migrations: &[Migration]) -> Result<u32, S
             let now: u32 = tx
                 .pragma_query_value(None, "user_version", |r| r.get(0))
                 .map_err(fail)?;
+            if now > code {
+                return Err(SqliteError::NewerThanCode { db: now, code });
+            }
             if now >= m.version {
                 continue;
             }
@@ -261,7 +267,11 @@ pub fn migrate(conn: &mut Connection, migrations: &[Migration]) -> Result<u32, S
     let restored = conn.pragma_update(None, "foreign_keys", fk_was_on);
     ran?;
     restored?;
-    schema_version(conn)
+    let last = schema_version(conn)?;
+    if last > code {
+        return Err(SqliteError::NewerThanCode { db: last, code });
+    }
+    Ok(last)
 }
 
 /// `[A-Za-z_][A-Za-z0-9_]*`, the only table names placed into SQL here.
@@ -706,6 +716,31 @@ mod tests {
             .unwrap();
         migrate(&mut c, &[M1]).unwrap();
         assert_eq!(pragma_s(&c, "foreign_keys"), "0");
+    }
+
+    // V4
+    #[test]
+    fn migrate_refuses_when_another_process_moves_the_version_past_the_code() {
+        let (_d, path) = db();
+        let mut c = open(&path).unwrap();
+        // Another connection holds the write lock, so the transaction in
+        // migrate waits. The first read of the version has already happened.
+        let other = open(&path).unwrap();
+        other.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let worker = std::thread::spawn(move || {
+            let r = migrate(&mut c, &[M1, M2]);
+            (r, c)
+        });
+        std::thread::sleep(Duration::from_millis(400));
+        other.pragma_update(None, "user_version", 7).unwrap();
+        other.execute_batch("COMMIT").unwrap();
+        let (r, c) = worker.join().unwrap();
+        match r {
+            Err(SqliteError::NewerThanCode { db: 7, code: 2 }) => {}
+            other => panic!("expected NewerThanCode, got {other:?}"),
+        }
+        assert_eq!(schema_version(&c).unwrap(), 7);
+        assert!(!table_exists(&c, "a"));
     }
 
     // T14
