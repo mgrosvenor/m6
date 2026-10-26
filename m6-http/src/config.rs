@@ -1656,7 +1656,10 @@ backend_timeout_secs = 120
     fn the_migration_error_for_a_non_local_address_does_not_suggest_it() {
         for h2c in ["0.0.0.0:8080", "203.0.113.7:8080"] {
             let e = load_error(&format!("h2c_bind = \"{h2c}\"\n"));
-            assert!(!e.contains(&format!("internal_binds = [\"{h2c}\"]")), "{h2c}: {e}");
+            assert!(
+                !e.contains(&format!("internal_binds = [\"{h2c}\"]")),
+                "{h2c}: {e}"
+            );
             assert!(e.contains("must be bound to a local address"), "{h2c}: {e}");
             assert!(e.contains("internal_binds = []"), "{h2c}: {e}");
         }
@@ -1684,7 +1687,10 @@ backend_timeout_secs = 120
     fn an_internal_binding_that_names_the_tls_bind_is_refused() {
         let e = load_error("internal_binds = [\"127.0.0.1:8443\"]\n");
         assert!(e.starts_with("config error:"), "{e}");
-        assert!(e.contains("Only the h2c_bind listener can be internal"), "{e}");
+        assert!(
+            e.contains("Only the h2c_bind listener can be internal"),
+            "{e}"
+        );
         assert!(e.contains("\"127.0.0.1:8443\""), "{e}");
     }
 
