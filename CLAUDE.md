@@ -229,9 +229,9 @@ and a page being edited for any other reason should be brought into line while i
   lint with the reason argued in the commit. Never a global allowance.
 - **Test locally, commit, then deploy.** Never deploy from an uncommitted tree.
 - **Secrets never enter git.** Only `.example` files, paths, documented shape.
-- Any change to **layout, copy, or rendering that a visitor sees** needs
-  individual approval before it ships. An internal operator view, such as a
-  monitor's status page, does not.
+- Any change to **layout, copy, or rendering that a visitor can reach** needs
+  individual approval before it ships. A page no visitor can reach, such as
+  m6-monitor's own page on its private socket, does not.
 - Image resizing is the owner's job.
 - Firewall blocks are **per-IP only**, no CIDR rules.
 - **Blocking an address is a write.** Propose candidates; never apply without
