@@ -40,6 +40,13 @@ csrf      = []
 email       = ["dep:lettre"]
 http-client = ["dep:ureq"]
 
+# One SQLite file with house settings, versioned migrations and an append-only
+# table rule. Off by default, so a service that does not use it links nothing
+# new. It uses the same rusqlite version and `bundled` feature as the rest of
+# the workspace, so the lockfile gains no package. Nothing in the workspace
+# turns it on, so CI tests and lints it with a dedicated step.
+sqlite = ["dep:rusqlite"]
+
 [dependencies]
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -84,6 +91,7 @@ lettre        = { version = "0.11", optional = true, features = ["smtp-transport
 ureq          = { version = "2",    optional = true, features = ["json"] }
 hmac          = { version = "0.12", optional = true }
 sha2          = { version = "0.10", optional = true }
+rusqlite      = { version = "0.31", optional = true, features = ["bundled"] }
 
 [dev-dependencies]
 tempfile  = "3"

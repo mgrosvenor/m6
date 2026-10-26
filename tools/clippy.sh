@@ -63,7 +63,11 @@ fi
 OUT="$(mktemp)"
 trap 'rm -f "$OUT"' EXIT
 
-if cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tee "$OUT" >/dev/null; then
+# Second pass: opt-in core features are linted by name, because nothing in the
+# workspace turns them on and so the workspace pass never compiles them. The
+# testkit feature goes with it, because m6-core's integration tests need it.
+if cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tee "$OUT" >/dev/null &&
+  cargo clippy -p m6-core --all-targets --features sqlite,testkit -- -D warnings 2>&1 | tee -a "$OUT" >/dev/null; then
   echo "clippy: silent on $(uname -s) ($(cargo clippy --version))"
   exit 0
 fi

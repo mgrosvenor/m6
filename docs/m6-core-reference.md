@@ -1,6 +1,6 @@
 # m6-core, component reference
 
-**Status: reference. Describes the crate as it is, at 30 modules and ~13,400
+**Status: reference. Describes the crate as it is, at 31 modules and ~13,400
 lines.** Where this disagrees with the code, the code is right and this file is
 a bug.
 
@@ -35,7 +35,7 @@ The prelude is deliberately small: `App`, `Error`, `Result`, `Request`,
 `Response`, the three time and slug helpers from `util`, and `serde_json`'s
 `json!`, `Map` and `Value`. Feature-gated additions appear in it only when the
 feature is on (`Upload`, `TeraFactory`, `TeraRenderer`, `lettre`'s mail types,
-`ureq`).
+`ureq`, `rusqlite`).
 
 A service that renders no templates says so, and stops linking Tera:
 
@@ -67,6 +67,7 @@ feature is missing.
 | `csrf` | off | `Request::verify_csrf`, token generation in the request dictionary. No new dependencies. |
 | `email` | off | `lettre` in the prelude. |
 | `http-client` | off | `ureq` in the prelude. |
+| `sqlite` | off | `sqlite` module: `open`, `migrate`, `append_only`, `used_bytes`, `prune_oldest`, and `rusqlite` in the prelude. Pulls rusqlite 0.31 with bundled SQLite. |
 
 `templates` is on by default on purpose, and the reason is a scar: a feature
 that hides code from `cargo test --workspace` is how two `csrf` tests stayed
@@ -74,9 +75,12 @@ broken from Phase 4 to Phase 5. chrono and lru are unconditional dependencies
 for the same reason. A binary that wants none of it sets
 `default-features = false`.
 
+The off-by-default features `sqlite` and `multipart` are invisible to
+`cargo test --workspace`, and `sqlite` is tested by its own CI step.
+
 ## 3. Component index
 
-Thirty modules. Grouped by what you would be doing when you reach for one.
+Thirty-one modules. Grouped by what you would be doing when you reach for one.
 
 **Building a service**
 
@@ -132,6 +136,12 @@ Thirty modules. Grouped by what you would be doing when you reach for one.
 | `tls` | How long the loaded certificate has left: `not_after_unix`, `record_loaded`, `loaded`, `TlsCertificate`. |
 | `firewall` | `FirewallState` from nftables' own JSON. |
 | `ndjson` | Newline-delimited JSON, read and written, tolerant of torn lines. |
+
+**Storage**
+
+| module | what it is |
+|---|---|
+| `sqlite` | One SQLite file with the house settings, versioned migrations, append-only tables. Feature `sqlite`. |
 
 **Everything else**
 
@@ -469,6 +479,38 @@ two lengths. Both were correct; the hazard is the third one, written by someone
 who reaches for `rand::random()` and produces something that looks identical at
 a glance.
 
+### `sqlite`
+
+Feature `sqlite`. Re-exports `rusqlite`. `open(path)` opens one database file
+with the settings in Table 7.1. `migrate(&mut conn, &[Migration])` applies a
+versioned list kept in `PRAGMA user_version`, and `schema_version` reads it.
+`append_only(&conn, table)` adds triggers that refuse UPDATE and DELETE, and
+`is_append_only` reports them. `used_bytes` and `prune_oldest` keep a table
+under a size cap. `OpenOptions` changes the busy timeout, the journal mode
+(`Journal::Rollback` or `Journal::Wal`) and foreign keys.
+
+| setting | value | reason |
+|---|---|---|
+| `journal_mode` | `DELETE` | The database is one file at rest. WAL leaves `-wal` and `-shm` beside it, and a copy of the main file alone can miss committed work. |
+| `busy_timeout` | 5 s | A second connection waits for a lock instead of failing with `SQLITE_BUSY`. Set explicitly, because rusqlite documents its own default as subject to change. |
+| `foreign_keys` | on | SQLite has them off in every new connection. The value is read back. |
+| `recursive_triggers` | on | `INSERT OR REPLACE` fires DELETE triggers only with this on, so the append-only rule needs it. |
+
+*Table 7.1: the settings `open` applies, and why. A journal mode that does not
+take effect is an error.*
+
+**Migrations** number 1, 2, 3 in order, and the list is checked before anything
+runs. Each runs in its own `BEGIN IMMEDIATE` transaction with the version
+re-read inside it, so connections that open at once apply each migration once.
+A failing migration rolls back. A file newer than the list is refused with
+`NewerThanCode`. A released migration is never edited.
+
+**Append-only** triggers are named `<table>_append_only_update` and
+`<table>_append_only_delete`. Call `append_only` after `migrate` on every open,
+and it restores triggers that were dropped. The triggers guard against mistakes
+in code. Anyone who can write the file can drop them. A table that is pruned
+must not be append-only.
+
 ---
 
 ## 8. Observability
@@ -691,10 +733,10 @@ brochure.
 - **`FrameworkState::build_dict` is private.** Twelve ordered steps of real
   knowledge that a service not using `App` cannot reach. This is the open
   "header to dict" item.
-- **Seventeen of thirty modules have no module-level doc comment**: `app` has a
+- **Seventeen of thirty-one modules have no module-level doc comment**: `app` has a
   one-line stub, and `compress`, `config`, `error`, `http`, `log`, `mime`,
   `minify`, `multipart`, `parse`, `path`, `request`, `response`, `server`,
-  `signal`, `template`, `util` and `watcher` have none. The thirteen that do are
+  `signal`, `template`, `util` and `watcher` have none. The fourteen that do are
   the best documentation in the repository, which makes the gap sharper rather
   than softer.
 - **`h1`'s module doc calls `parse.rs` "(deleted)".** The file exists and is on

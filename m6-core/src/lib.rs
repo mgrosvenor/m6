@@ -37,6 +37,10 @@ pub mod testkit;
 #[cfg(feature = "multipart")]
 pub mod multipart;
 
+/// One SQLite file with the house settings, migrations and append-only tables. Off by default; see the `sqlite` feature in Cargo.toml.
+#[cfg(feature = "sqlite")]
+pub mod sqlite;
+
 /// Tera templating and the site filters that go with it. On by default;
 /// see the `templates` feature in Cargo.toml.
 #[cfg(feature = "templates")]
@@ -115,6 +119,9 @@ pub mod prelude {
 
     #[cfg(feature = "multipart")]
     pub use crate::multipart::Upload;
+
+    #[cfg(feature = "sqlite")]
+    pub use rusqlite;
 
     #[cfg(feature = "templates")]
     pub use crate::template::{TeraFactory, TeraRenderer};
