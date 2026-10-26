@@ -3,11 +3,15 @@
 //!
 //! The unit tests in `config.rs` cover the rules through `load`. These cover
 //! the part a unit test cannot: the real binary refuses with exit code 2 and
-//! a message that names the key, and a valid declaration starts the listeners
-//! and says so in the startup log.
+//! a message that names the key, and a declared h2c listener is really internal, shown by whether it
+//! believes a forwarded client address.
 
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
+use m6_http_lib::forward::HttpRequest;
+use m6_http_lib::h2c_client::H2cClientConn;
 
 use m6_core::testkit;
 
@@ -19,7 +23,8 @@ fn write_site(dir: &std::path::Path) -> std::path::PathBuf {
         site.join("site.toml"),
         "[site]\nname = \"internal-binds\"\ndomain = \"localhost\"\n\n\
          [[backend]]\nname = \"b\"\nsockets = \"/nonexistent/b-*.sock\"\n\n\
-         [[route]]\npath = \"/\"\nbackend = \"b\"\n",
+         [[route]]\npath = \"/\"\nbackend = \"b\"\n\n\
+         [rate_limit]\nrequests_per_min = 2\n",
     )
     .expect("site.toml");
     site
@@ -121,20 +126,29 @@ fn a_public_internal_binding_refuses_to_start() {
     assert!(output.contains("not in a local range"), "output:\n{output}");
 }
 
-#[test]
-fn a_declared_h2c_listener_starts() {
+/// Start m6-http with the given `[server]` lines for the h2c listener, send
+/// `n` requests over h2c from this one peer, each asserting a different client
+/// address in `X-Forwarded-For`, and return the status of each.
+///
+/// The site allows two requests per minute per client address. A listener
+/// that believes the forwarded address gives each request its own address and
+/// so its own allowance. A listener that does not believe it attributes all of
+/// them to this peer and answers 429 from the third.
+fn statuses_over_h2c(declare: bool, n: usize) -> Vec<u16> {
     let tls = testkit::claim_port();
     let h2c = testkit::claim_port();
     let dir = tempfile::tempdir().expect("tempdir");
     let site = write_site(dir.path());
     let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("rcgen");
+    let declaration = if declare {
+        format!("internal_binds = [\"{}\"]\n", h2c.addr())
+    } else {
+        "internal_binds = []\n".to_string()
+    };
     let config = write_system(
         dir.path(),
         &tls.addr(),
-        &format!(
-            "h2c_bind = \"{0}\"\ninternal_binds = [\"{0}\"]\n",
-            h2c.addr()
-        ),
+        &format!("h2c_bind = \"{}\"\n{declaration}", h2c.addr()),
         &ck.cert.pem(),
         &ck.key_pair.serialize_pem(),
     );
@@ -145,9 +159,61 @@ fn a_declared_h2c_listener_starts() {
     svc.wait_for_tcp(tls.port(), Duration::from_secs(10));
     svc.wait_for_tcp(h2c.port(), Duration::from_secs(10));
 
+    let mut conn = H2cClientConn::connect("127.0.0.1", h2c.port()).expect("connect over h2c");
+    let settle = Instant::now() + Duration::from_millis(250);
+    while Instant::now() < settle {
+        conn.drive();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let mut statuses = Vec::new();
+    for i in 0..n {
+        let req = HttpRequest {
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            query: None,
+            version: "HTTP/1.1".to_string(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        let client = format!("203.0.113.{}", i + 1);
+        let rx = conn
+            .dispatch(&req, "127.0.0.1", &client, "localhost")
+            .expect("dispatch");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let resp = loop {
+            conn.drive();
+            match rx.try_recv() {
+                Ok(r) => break r.expect("response"),
+                Err(mpsc::TryRecvError::Empty) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(e) => panic!("no response: {e:?}\n{}", svc.output()),
+            }
+        };
+        statuses.push(resp.status);
+    }
+
     let status = svc.terminate(Duration::from_secs(5));
     let output = svc.output();
     assert!(status.success(), "exit {status}\n{output}");
-    assert!(output.contains("m6-http listeners bound"), "{output}");
-    assert!(output.contains("internal_binds"), "{output}");
+    statuses
+}
+
+#[test]
+fn a_declared_h2c_listener_believes_the_forwarded_address() {
+    let statuses = statuses_over_h2c(true, 5);
+    assert!(
+        !statuses.contains(&429),
+        "each forwarded address has its own allowance on an internal listener: {statuses:?}"
+    );
+}
+
+#[test]
+fn an_h2c_listener_declared_public_ignores_the_forwarded_address() {
+    let statuses = statuses_over_h2c(false, 5);
+    assert_eq!(
+        statuses.iter().filter(|s| **s == 429).count(),
+        3,
+        "all requests count against the relaying peer: {statuses:?}"
+    );
 }
