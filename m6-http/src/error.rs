@@ -144,8 +144,8 @@ pub fn internal_error_html(
 /// page instead. Every layer of config was correct and the mechanism was dead, which
 /// is worse than unsupported, because it looks configured.
 ///
-/// `from_internal` comes from the listener's bind address and never from a header,
-/// so a public client cannot claim it.
+/// `from_internal` is true only on a listener named in `[server] internal_binds`,
+/// never set from a header, so a public client cannot claim it.
 pub fn refuses_custom_error_path(mode: &ErrorMode, path: &str, from_internal: bool) -> bool {
     match mode {
         ErrorMode::Custom { path: error_path } => path == error_path && !from_internal,
@@ -391,8 +391,8 @@ mod tests {
     /// A public caller is refused the error path; one of our own nodes is not.
     ///
     /// This is the whole of issue #55. The origin already knew which listener a
-    /// request arrived on -- `Iface::for_bind` classifies a private bind as internal
-    /// and the h2c listener is granted `ForwardedTrust::Backbone` on that basis --
+    /// request arrived on -- the listener is declared internal and the h2c
+    /// listener is granted `ForwardedTrust::Backbone` on that basis --
     /// and the fact simply never reached this decision, so the origin refused its own
     /// cache nodes and custom error pages could not cross a proxy hop.
     #[test]

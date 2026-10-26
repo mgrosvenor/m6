@@ -17,6 +17,29 @@ releases only; work happens on `develop`. See `CONTRIBUTING.md`.
 Changes merged to `develop` since the last release. The section is renamed to
 the version when the release is cut.
 
+### Changed
+
+**A listener is internal only when the config says so (#232).**
+m6-http used to decide from a listener's bind address whether it was internal.
+Three things followed from that guess: the statistics label, whether the h2c listener believed the client address a cache node forwards, and whether the custom error path was served.
+`[server] internal_binds` now names the internal listener by address.
+m6-http refuses an entry that is not an IP address and port, is not in a local range (`m6_core::net::is_private_ip`), or is not its `h2c_bind`.
+Only the h2c listener can be internal.
+An entry that equals `bind` is refused, because the TLS and QUIC listener faces clients and stays external.
+
+**Migration.**
+A config with `h2c_bind` must add `internal_binds`, or m6-http exits 2 and says what to add.
+`internal_binds = ["<h2c_bind>"]` keeps today's behaviour for an h2c listener on a local IP address, and `internal_binds = []` treats it as public.
+An h2c listener bound to a host name or a public address can only be declared public.
+Add the key before upgrading, because older versions ignore it.
+A `bind` on a private address is now labelled `external` in `/perf`.
+
+Verified: `cargo test --workspace` gives 1297 passed and 0 failed, clippy is silent with `-D warnings`, and the release and test builds have no warnings.
+Thirteen new config tests, two rewritten h2c trust tests and four tests that run the real binary cover every refusal, both migration messages and a valid start.
+Two of the binary tests send requests over h2c under a rate limit and show that a declared listener believes the forwarded address and a public one does not.
+A diff of the three cache-hit blocks in `m6-http/src/main.rs` against the base is empty, so the request path for a cache hit is untouched.
+Example 09's integration test in m6-examples ran to "All assertions passed" with no `SKIP` against an earlier build of this change, with its h2c listener declared the same way.
+
 ### Security
 
 **Four dependencies moved up a patch version to clear seven RustSec advisories

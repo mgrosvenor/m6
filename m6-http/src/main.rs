@@ -168,8 +168,9 @@ struct ServerState {
     h2s_pool: H2sTlsClientPool,
     /// Per-IP request throttle — general traffic, ahead of cache/routing.
     rate_limiter: RateLimiter,
-    /// Interface class of the public TLS/QUIC listener, and of the h2c
-    /// listener, computed once at startup from their bind addresses.
+    /// Interface class of the TLS/QUIC listener (always external), and of the
+    /// h2c listener (internal when `[server] internal_binds` names it),
+    /// computed once at startup.
     ///
     /// Precomputed rather than derived per request: classification parses an
     /// address, and this sits on the hot path for every single request.
@@ -2381,10 +2382,10 @@ fn handle_request_inner(
     content_encoding: &str,
     state: &mut ServerState,
     is_prefetch: bool,
-    // True when this request arrived on a listener bound to a private address,
-    // meaning one of our own nodes over the backbone rather than a public client.
-    // Granted by the listener, never by a header, so a public client cannot claim
-    // it. Only the error-path guard reads it.
+    // True when this request arrived on the h2c listener and [server]
+    // internal_binds names it, meaning one of our own nodes over the backbone
+    // rather than a public client. Granted by the listener, never by a header, so a public
+    // client cannot claim it. Only the error-path guard reads it.
     from_internal: bool,
 ) -> RequestOutcome {
     // Prefetch requests are synthetic (no real client, client_ip is a
@@ -2586,7 +2587,7 @@ fn handle_request_inner(
     // fell back to the built-in page. Every config was correct and the mechanism
     // was dead, which is worse than unsupported because it looks configured.
     //
-    // `from_internal` is granted by the listener's bind address, never by a header,
+    // `from_internal` is granted by the listener's declaration, never by a header,
     // so a public client cannot claim it -- the same rule that decides whether a
     // forwarded client address is trusted on that listener.
     if error::refuses_custom_error_path(&state.error_mode, &req.path, from_internal) {
@@ -3861,6 +3862,11 @@ fn handle_site_reload(state: &mut ServerState, log_handle: &m6_core::log::LogHan
             state.invalidation_map = new_inv_map;
             state.error_mode = new_error_mode;
             state.public_key = new_public_key;
+            if new_config.server.internal_binds != state.config.server.internal_binds {
+                warn!(
+                    "config reload: [server].internal_binds changed; restart m6-http to apply it"
+                );
+            }
             state.config = new_config;
             m6_http_lib::security::configure(&state.config.security);
             state.cache.clear();
@@ -4244,7 +4250,7 @@ fn run(args: Vec<String>) -> i32 {
     };
 
     let h2c_listener = if let Some(ref h2c_bind) = config.server.h2c_bind {
-        match H2cListener::bind(h2c_bind) {
+        match H2cListener::bind(h2c_bind, config.server.is_internal(h2c_bind)) {
             Ok(l) => {
                 info!(bind = %h2c_bind, "H2C (HTTP/2 cleartext) listener started");
                 Some(l)
@@ -4265,18 +4271,26 @@ fn run(args: Vec<String>) -> i32 {
     info!(
         bind = %config.server.bind,
         h2c_bind = ?config.server.h2c_bind,
+        internal_binds = ?config.server.internal_binds,
         site = %config.site.name,
         "m6-http listeners bound"
     );
 
-    // Classified before the struct literal, which moves `config`.
-    let tls_iface = Iface::for_bind(&config.server.bind);
-    let h2c_iface = config
+    // Only the h2c listener can be internal, and only when [server]
+    // internal_binds names it. The TLS and QUIC listener faces clients, so it is
+    // always external. Without an h2c listener the h2c value is never read.
+    // Computed before the struct literal, which moves `config`.
+    let tls_iface = Iface::External;
+    let h2c_iface = if config
         .server
         .h2c_bind
         .as_deref()
-        .map(Iface::for_bind)
-        .unwrap_or(Iface::Internal);
+        .is_some_and(|b| config.server.is_internal(b))
+    {
+        Iface::Internal
+    } else {
+        Iface::External
+    };
     let mut state = ServerState {
         config,
         system_config_path: cli.system_config.clone(),
@@ -4342,6 +4356,7 @@ mod www_redirect_tests {
                 tls_key: Some("/tmp/key.pem".to_string()),
                 backend_timeout_secs: 30,
                 h2c_bind: None,
+                internal_binds: Vec::new(),
                 redirect_bind: None,
                 warm_on_start: false,
                 allowed_methods: vec!["GET".into(), "HEAD".into(), "POST".into()],
