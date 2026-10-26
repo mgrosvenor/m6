@@ -492,8 +492,8 @@ address, and gives `None` for a host name. Names are never resolved.
 | IPv6 | `::1`, `fc00::/7`, `fe80::/10` |
 
 An IPv4-mapped IPv6 address is classified by its IPv4 form. `0.0.0.0` and `::`
-are not private. m6-http uses this to classify a listener by its bind address,
-and forwarded-address trust follows that classification.
+are not private. A check on a peer address only means something on a socket
+that faces the client directly; behind a proxy the peer is the proxy.
 
 ---
 

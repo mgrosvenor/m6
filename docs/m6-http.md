@@ -202,8 +202,6 @@ h2c_bind = "127.0.0.1:8080"   # plain-TCP HTTP/2 on this address
 
 The H2C listener accepts plain TCP connections and speaks HTTP/2 framing directly (no TLS record layer). The request is then routed and handled identically to a TLS request.
 
-A listener counts as private, and forwarded-address headers are trusted on it, only when its bind address is a literal private IP as defined by `m6_core::net::is_private_ip` (loopback, RFC 1918, `169.254.0.0/16`, `100.64.0.0/10`, `::1`, `fc00::/7` and `fe80::/10`). A host name is never resolved and is never private.
-
 **Outbound H2C** — use the `h2c://` scheme in a backend URL:
 
 ```toml

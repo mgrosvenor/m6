@@ -1,10 +1,9 @@
 //! What counts as a private address.
 //!
-//! One definition, so every part of m6 that has to decide "is this our own
-//! network" decides it the same way. m6-http uses it to classify a listener by
-//! its bind address (and so to decide whether to trust forwarded-address
-//! headers on it), and a service can use it to decide whether a peer address
-//! belongs to its own network.
+//! One definition of "is this our own network". A service can use it to decide whether a
+//! peer address belongs to its own network. A check on a peer address only
+//! means something on a socket that faces the client directly; behind a proxy
+//! the peer is the proxy.
 //!
 //! # What is private
 //!
