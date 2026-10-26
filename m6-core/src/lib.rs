@@ -26,6 +26,7 @@ pub mod response;
 pub mod server;
 pub mod signal;
 pub mod telemetry;
+pub mod time_range;
 pub mod tls;
 pub mod util;
 pub mod watcher;
