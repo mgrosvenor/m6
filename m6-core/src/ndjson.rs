@@ -21,9 +21,11 @@
 //! # Pages for responses
 //!
 //! A service that answers a request with rows builds a [`Page`]. A page holds
-//! at most [`PageLimits::max_bytes`] bytes and [`PageLimits::max_rows`] rows, so
-//! the memory a request can take is bounded before the first row is read. When
-//! a row does not fit, [`Page::push`] says [`Pushed::Full`], the service stores
+//! at most [`PageLimits::max_bytes`] bytes and [`PageLimits::max_rows`] rows,
+//! and those limits cannot be set above [`MAX_PAGE_BYTES`]. A row is written to
+//! the buffer before its size is checked, and removed again if it does not fit,
+//! so the peak memory of a page is the byte limit plus the largest single row.
+//! A single row over [`MAX_PAGE_BYTES`] is an error. When a row does not fit, [`Page::push`] says [`Pushed::Full`], the service stores
 //! the key of that row in a [`Cursor`], and [`Page::into_response`] sends a
 //! `Link: <...>; rel="next"` header naming the next request. The client follows
 //! the link until a response has none.
@@ -160,8 +162,8 @@ pub const MAX_CURSOR_LEN: usize = 128;
 /// How much one page may hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PageLimits {
-    pub max_bytes: usize,
-    pub max_rows: usize,
+    max_bytes: usize,
+    max_rows: usize,
 }
 
 impl Default for PageLimits {
@@ -181,6 +183,16 @@ impl PageLimits {
             max_bytes: max_bytes.clamp(1, MAX_PAGE_BYTES),
             max_rows: max_rows.max(1),
         }
+    }
+
+    /// The byte limit, never more than [`MAX_PAGE_BYTES`].
+    pub fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+
+    /// The row limit, at least 1.
+    pub fn max_rows(&self) -> usize {
+        self.max_rows
     }
 }
 
@@ -571,11 +583,27 @@ mod tests {
     #[test]
     fn limits_are_clamped_to_the_maximum_page() {
         let l = PageLimits::new(usize::MAX, 0);
-        assert_eq!(l.max_bytes, MAX_PAGE_BYTES);
-        assert_eq!(l.max_rows, 1);
-        assert_eq!(PageLimits::new(0, 5).max_bytes, 1);
-        assert_eq!(PageLimits::default().max_bytes, DEFAULT_PAGE_BYTES);
-        assert_eq!(PageLimits::default().max_rows, DEFAULT_PAGE_ROWS);
+        assert_eq!(l.max_bytes(), MAX_PAGE_BYTES);
+        assert_eq!(l.max_rows(), 1);
+        assert_eq!(PageLimits::new(0, 5).max_bytes(), 1);
+        assert_eq!(PageLimits::default().max_bytes(), DEFAULT_PAGE_BYTES);
+        assert_eq!(PageLimits::default().max_rows(), DEFAULT_PAGE_ROWS);
+    }
+
+    #[test]
+    fn no_caller_can_build_limits_above_the_maximum_page() {
+        // The fields are private, so `new` and `default` are the only ways in.
+        for asked in [
+            0,
+            1,
+            DEFAULT_PAGE_BYTES,
+            MAX_PAGE_BYTES,
+            MAX_PAGE_BYTES + 1,
+            usize::MAX,
+        ] {
+            assert!(PageLimits::new(asked, usize::MAX).max_bytes() <= MAX_PAGE_BYTES);
+        }
+        assert!(PageLimits::default().max_bytes() <= MAX_PAGE_BYTES);
     }
 
     #[test]
