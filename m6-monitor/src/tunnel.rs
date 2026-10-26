@@ -103,9 +103,17 @@ pub enum Handshake {
     NotConfigured(&'static str),
     FileMissing(String),
     FileError(String),
+    /// The file is older than `tunnel_handshake_max_age_s`, so its collector
+    /// has probably stopped and its contents say nothing about now.
+    FileStale {
+        path: String,
+        age_s: u64,
+    },
     PeerAbsent,
     Never,
-    At { age_s: u64 },
+    At {
+        age_s: u64,
+    },
 }
 
 /// The handshake file as loaded, with its age in seconds, or the state every
@@ -113,7 +121,10 @@ pub enum Handshake {
 pub type HandshakeSource = Result<(Handshakes, Option<u64>), Handshake>;
 
 /// Read the handshake file once per poll.
-pub fn load(path: Option<&str>) -> HandshakeSource {
+///
+/// A file last written more than `max_age_s` ago is `FileStale`. Its
+/// timestamps are not judged, because they were true when it was written.
+pub fn load(path: Option<&str>, max_age_s: u64) -> HandshakeSource {
     let Some(path) = path else {
         return Err(Handshake::NotConfigured("no wg_handshakes_file configured"));
     };
@@ -126,7 +137,13 @@ pub fn load(path: Option<&str>) -> HandshakeSource {
                 .ok()
                 .and_then(|t| SystemTime::now().duration_since(t).ok())
                 .map(|d| d.as_secs());
-            Ok((handshakes, file_age_s))
+            match file_age_s {
+                Some(age_s) if age_s > max_age_s => Err(Handshake::FileStale {
+                    path: path.to_string(),
+                    age_s,
+                }),
+                _ => Ok((handshakes, file_age_s)),
+            }
         }
     }
 }
@@ -182,8 +199,15 @@ fn key_prefix(key: Option<&str>) -> Option<String> {
 
 /// One entry per node, in order, `None` for a node with no tunnel.
 pub fn fleet(f: &crate::fleet::Fleet, timeout: Duration) -> Vec<Option<TunnelReading>> {
-    let src = load(f.wg_handshakes_file.as_deref());
-    let file_age_s = src.as_ref().ok().and_then(|(_, age)| *age);
+    let src = load(
+        f.wg_handshakes_file.as_deref(),
+        f.tunnel_handshake_max_age_s,
+    );
+    let file_age_s = match &src {
+        Ok((_, age)) => *age,
+        Err(Handshake::FileStale { age_s, .. }) => Some(*age_s),
+        Err(_) => None,
+    };
     let now_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -285,9 +309,26 @@ mod tests {
             Handshake::NotConfigured(_)
         ));
         assert!(matches!(
-            handshake_for(&load(None), Some("K"), 10),
+            handshake_for(&load(None, 600), Some("K"), 10),
             Handshake::NotConfigured(_)
         ));
+    }
+
+    #[test]
+    fn a_file_older_than_the_limit_is_stale_and_names_its_path() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(f.path(), "K\t1\n").unwrap();
+        let old = SystemTime::now() - Duration::from_secs(900);
+        f.as_file().set_modified(old).unwrap();
+        let path = f.path().to_str().unwrap();
+        match load(Some(path), 600) {
+            Err(Handshake::FileStale { path: p, age_s }) => {
+                assert_eq!(p, path);
+                assert!((900..910).contains(&age_s), "{age_s}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(load(Some(path), 1200).is_ok());
     }
 
     #[test]

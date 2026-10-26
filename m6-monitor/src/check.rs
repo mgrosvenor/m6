@@ -593,12 +593,7 @@ pub fn render(d: &Digest, readings: &[NodeReading]) -> String {
             "  none configured. Add tunnel = {{ address = \"ip:port\", public_key = \"...\" }} to a [[monitor.nodes]] entry."
         );
     } else {
-        if let Some(age) = d
-            .nodes
-            .iter()
-            .filter_map(|n| n.tunnel.as_ref()?.handshake_file_age_s)
-            .next()
-        {
+        if let Some(age) = d.handshake_file_age_s {
             let _ = writeln!(o, "  handshake file written {age}s ago");
         }
         for n in &d.nodes {

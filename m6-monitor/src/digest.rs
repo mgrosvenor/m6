@@ -84,6 +84,9 @@ pub struct Digest {
     /// Worst level across the fleet.
     pub level: Level,
     pub thresholds: Thresholds,
+    /// Seconds since the WireGuard handshakes file was last written. One fact
+    /// about the monitor host, `None` when there is no readable file.
+    pub handshake_file_age_s: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -180,7 +183,6 @@ pub struct TunnelDigest {
     pub handshake: HandshakeState,
     pub handshake_age_s: Option<u64>,
     pub handshake_detail: Option<String>,
-    pub handshake_file_age_s: Option<u64>,
 }
 
 /// How the tunnel probe ended, serialised as `connected`, `refused`,
@@ -216,6 +218,8 @@ pub enum HandshakeState {
     NotConfigured,
     FileMissing,
     FileError,
+    /// The handshakes file is older than the limit, so no age is judged.
+    FileStale,
 }
 
 impl TunnelDigest {
@@ -250,6 +254,7 @@ impl TunnelDigest {
             ),
             HandshakeState::FileMissing => "file missing".to_string(),
             HandshakeState::FileError => "file unreadable".to_string(),
+            HandshakeState::FileStale => "unknown (handshakes file is stale)".to_string(),
         }
     }
 }
@@ -276,6 +281,7 @@ fn tunnel_digest(t: &crate::tunnel::TunnelReading) -> TunnelDigest {
         ),
         Handshake::FileMissing(p) => (HandshakeState::FileMissing, None, Some(p.clone())),
         Handshake::FileError(e) => (HandshakeState::FileError, None, Some(e.clone())),
+        Handshake::FileStale { path, .. } => (HandshakeState::FileStale, None, Some(path.clone())),
         Handshake::PeerAbsent => (HandshakeState::PeerAbsent, None, None),
         Handshake::Never => (HandshakeState::Never, None, None),
         Handshake::At { age_s } => (HandshakeState::Ok, Some(*age_s), None),
@@ -289,7 +295,6 @@ fn tunnel_digest(t: &crate::tunnel::TunnelReading) -> TunnelDigest {
         handshake,
         handshake_age_s,
         handshake_detail,
-        handshake_file_age_s: t.file_age_s,
     }
 }
 
@@ -391,7 +396,16 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
                         td.handshake_detail.as_deref().unwrap_or("-")
                     ));
                 }
-                HandshakeState::FileMissing
+                HandshakeState::FileStale if handshake_file_problem.is_none() => {
+                    let age = r.tunnel.as_ref().and_then(|t| t.file_age_s).unwrap_or(0);
+                    handshake_file_problem = Some(format!(
+                        "WireGuard handshakes file {} is {age}s old, over the {}s limit, so its collector has probably stopped and no handshake age is judged",
+                        td.handshake_detail.as_deref().unwrap_or("-"),
+                        t.tunnel_handshake_age_s
+                    ));
+                }
+                HandshakeState::FileStale
+                | HandshakeState::FileMissing
                 | HandshakeState::FileError
                 | HandshakeState::NotConfigured => {}
             }
@@ -900,6 +914,10 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
         findings,
         level,
         thresholds: t.clone(),
+        handshake_file_age_s: readings
+            .iter()
+            .filter_map(|r| r.tunnel.as_ref()?.file_age_s)
+            .next(),
     }
 }
 
@@ -1943,6 +1961,44 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_stale_handshake_file_is_one_fault_naming_the_file_and_judges_no_node() {
+        let stale = || {
+            let mut t = tunnel(
+                Probe::Connected,
+                Handshake::FileStale {
+                    path: "/x/wg".into(),
+                    age_s: 900,
+                },
+            );
+            t.file_age_s = Some(900);
+            t
+        };
+        let rs = [
+            with_tunnel("origin", stale()),
+            with_tunnel("edge-a", stale()),
+        ];
+        let d = build(&rs, &Thresholds::default(), now());
+        let f = tunnel_findings(&d);
+        assert_eq!(f.len(), 1, "{:?}", d.findings);
+        assert_eq!(f[0].node, "monitor");
+        assert_eq!(f[0].level, Level::Fault);
+        assert!(f[0].text.contains("/x/wg"), "{}", f[0].text);
+        assert!(f[0].text.contains("900s old"), "{}", f[0].text);
+        assert!(f[0].text.contains("collector has probably stopped"));
+        for n in &d.nodes {
+            let t = n.tunnel.as_ref().unwrap();
+            assert_eq!(t.handshake, HandshakeState::FileStale);
+            assert_eq!(t.handshake_age_s, None);
+            assert!(
+                t.handshake_text().contains("unknown"),
+                "{}",
+                t.handshake_text()
+            );
+        }
+        assert_eq!(d.handshake_file_age_s, Some(900));
+    }
+
+    #[test]
     fn a_node_with_no_tunnel_configured_raises_nothing() {
         let d = build(
             &[reading("edge-a", "ok", None)],
@@ -1978,7 +2034,8 @@ pub(crate) mod tests {
         assert!(t["rtt_ms"].is_number());
         assert_eq!(t["rtt_samples_ms"].as_array().unwrap().len(), 3);
         assert_eq!(t["handshake_age_s"], 42);
-        assert_eq!(t["handshake_file_age_s"], 7);
+        assert!(t.get("handshake_file_age_s").is_none(), "{t}");
+        assert_eq!(v["handshake_file_age_s"], 7);
         assert_eq!(t["probe"], "connected");
         assert_eq!(t["handshake"], "ok");
         assert_eq!(v["thresholds"]["tunnel_handshake_age_s"], 600);

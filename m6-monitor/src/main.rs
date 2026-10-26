@@ -479,7 +479,6 @@ mod tests {
             handshake: digest::HandshakeState::Ok,
             handshake_age_s: Some(42),
             handshake_detail: None,
-            handshake_file_age_s: Some(3),
         };
         let mut d = digest::build(&[], &digest::Thresholds::default(), "now".into());
         d.nodes = vec![node_digest("edge-a", Some(t)), node_digest("edge-b", None)];
