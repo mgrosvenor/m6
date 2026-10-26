@@ -20,8 +20,8 @@
 //! | 3 | `foreign_keys` | on | SQLite has them off in every new connection, so `ON DELETE CASCADE` does nothing without it. The value is read back after it is set |
 //! | 4 | `recursive_triggers` | on | SQLite fires DELETE triggers for rows removed by `INSERT OR REPLACE` only with this on. Without it the append-only rule can be bypassed |
 //!
-//! *Table 1: the settings [`open`] applies. The journal mode is read back, and
-//! a mode that did not take effect is an error.*
+//! *Table 1: the settings [`open`] applies. Every one is read back, and a
+//! setting that did not take effect is an error.*
 //!
 //! # Migrations
 //!
@@ -163,6 +163,8 @@ impl OpenOptions {
 
     /// Open the file, creating it if it is missing, and apply the settings.
     ///
+    /// Each setting is read back, and one that did not take effect is an error.
+    ///
     /// Changing the journal mode needs the file to itself. If another
     /// connection is using the file in WAL mode, a request for a different mode
     /// fails with `SQLITE_BUSY` once the busy timeout runs out. Open every connection to a file
@@ -178,6 +180,10 @@ impl OpenOptions {
         // First, so that changing the journal mode waits for a lock instead of
         // failing at once.
         conn.busy_timeout(self.busy_timeout)?;
+        let ms: i64 = conn.pragma_query_value(None, "busy_timeout", |r| r.get(0))?;
+        if u128::try_from(ms).ok() != Some(self.busy_timeout.as_millis()) {
+            return Err(SqliteError::BusyTimeout);
+        }
 
         let wanted = match self.journal {
             Journal::Rollback => "delete",
@@ -196,6 +202,10 @@ impl OpenOptions {
         }
 
         conn.pragma_update(None, "recursive_triggers", true)?;
+        let rt: bool = conn.pragma_query_value(None, "recursive_triggers", |r| r.get(0))?;
+        if !rt {
+            return Err(SqliteError::RecursiveTriggers);
+        }
         Ok(conn)
     }
 }
@@ -406,6 +416,10 @@ pub enum SqliteError {
     JournalMode { wanted: &'static str, got: String },
     #[error("foreign_keys did not take effect")]
     ForeignKeys,
+    #[error("busy_timeout did not take effect")]
+    BusyTimeout,
+    #[error("recursive_triggers did not take effect")]
+    RecursiveTriggers,
     #[error("migration list entry {index} has version {version}, expected {}", index + 1)]
     MigrationList { index: usize, version: u32 },
     #[error("database is at schema version {db}, this code knows up to {code}")]
