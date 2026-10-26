@@ -61,24 +61,35 @@ pub struct ProbeResult {
     pub outcome: Probe,
 }
 
-/// Time up to `PROBES_PER_POLL` connects, one after another.
+/// Time `PROBES_PER_POLL` connects, one after another.
 ///
-/// Stops at the first timeout or error, so a dead tunnel costs one timeout.
-/// The stream is dropped at once and nothing is sent.
+/// One connect that gets through means the tunnel answered, so the outcome is
+/// `Connected` and the samples are the connects that got through. The sample
+/// count shows a partial loss. Only a poll with no successful connect is
+/// `NoAnswer` or `Failed`. A dead tunnel therefore costs `PROBES_PER_POLL`
+/// timeouts. The stream is dropped at once and nothing is sent.
 pub fn probe(addr: SocketAddr, timeout: Duration) -> ProbeResult {
+    probe_with(timeout, || {
+        TcpStream::connect_timeout(&addr, timeout).map(drop)
+    })
+}
+
+fn probe_with(timeout: Duration, mut connect: impl FnMut() -> std::io::Result<()>) -> ProbeResult {
     let mut samples = Vec::with_capacity(PROBES_PER_POLL);
-    let mut outcome = Probe::Connected;
+    let mut connected = 0;
+    let mut refused = 0;
+    let mut timed_out = false;
+    let mut other_error = None;
     for _ in 0..PROBES_PER_POLL {
         let started = Instant::now();
-        match TcpStream::connect_timeout(&addr, timeout) {
-            Ok(s) => {
+        match connect() {
+            Ok(()) => {
                 samples.push(started.elapsed());
-                drop(s);
-                outcome = Probe::Connected;
+                connected += 1;
             }
             Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
                 samples.push(started.elapsed());
-                outcome = Probe::Refused;
+                refused += 1;
             }
             Err(e)
                 if matches!(
@@ -86,15 +97,20 @@ pub fn probe(addr: SocketAddr, timeout: Duration) -> ProbeResult {
                     std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
                 ) =>
             {
-                outcome = Probe::NoAnswer(format!("no answer in {}ms", timeout.as_millis()));
-                break;
+                timed_out = true;
             }
-            Err(e) => {
-                outcome = Probe::Failed(e.to_string());
-                break;
-            }
+            Err(e) => other_error = Some(e.to_string()),
         }
     }
+    let outcome = if connected > 0 {
+        Probe::Connected
+    } else if refused > 0 {
+        Probe::Refused
+    } else if timed_out {
+        Probe::NoAnswer(format!("no answer in {}ms", timeout.as_millis()))
+    } else {
+        Probe::Failed(other_error.unwrap_or_else(|| "no connect attempted".to_string()))
+    };
     ProbeResult { samples, outcome }
 }
 
@@ -281,6 +297,45 @@ mod tests {
         let r = probe(addr, T);
         assert_eq!(r.outcome, Probe::Refused, "{r:?}");
         assert!(!r.samples.is_empty());
+    }
+
+    fn scripted(results: Vec<std::io::Result<()>>) -> ProbeResult {
+        let mut it = results.into_iter();
+        probe_with(T, move || it.next().unwrap())
+    }
+
+    fn lost() -> std::io::Result<()> {
+        Err(std::io::ErrorKind::TimedOut.into())
+    }
+
+    #[test]
+    fn one_lost_connect_among_good_ones_still_means_the_tunnel_answered() {
+        for results in [
+            vec![Ok(()), lost(), Ok(())],
+            vec![lost(), Ok(()), Ok(())],
+            vec![Ok(()), Ok(()), lost()],
+        ] {
+            let r = scripted(results);
+            assert_eq!(r.outcome, Probe::Connected, "{r:?}");
+            assert_eq!(r.samples.len(), 2, "{r:?}");
+        }
+    }
+
+    #[test]
+    fn only_zero_successes_is_no_answer() {
+        let r = scripted(vec![lost(), lost(), lost()]);
+        assert!(matches!(r.outcome, Probe::NoAnswer(_)), "{r:?}");
+        assert!(r.samples.is_empty());
+    }
+
+    #[test]
+    fn an_other_error_with_no_success_is_failed() {
+        let r = scripted(vec![
+            Err(std::io::ErrorKind::NetworkUnreachable.into()),
+            Err(std::io::ErrorKind::NetworkUnreachable.into()),
+            Err(std::io::ErrorKind::NetworkUnreachable.into()),
+        ]);
+        assert!(matches!(r.outcome, Probe::Failed(_)), "{r:?}");
     }
 
     fn src_with(key: &str, ts: u64) -> HandshakeSource {
