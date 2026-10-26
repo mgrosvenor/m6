@@ -468,6 +468,7 @@ impl From<rusqlite::Error> for crate::Error {
 mod tests {
     use super::*;
     use rusqlite::ErrorCode;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier};
 
     fn db() -> (tempfile::TempDir, PathBuf) {
@@ -820,11 +821,29 @@ mod tests {
         // migrate waits. The first read of the version has already happened.
         let other = open(&path).unwrap();
         other.execute_batch("BEGIN IMMEDIATE").unwrap();
+        // The worker's busy handler sets a flag each time it has to wait, so
+        // the main thread knows the worker is blocked before it moves the
+        // version. The handler returns true, so the worker keeps waiting.
+        static WAITING: AtomicBool = AtomicBool::new(false);
+        WAITING.store(false, Ordering::SeqCst);
+        fn on_busy(_: i32) -> bool {
+            WAITING.store(true, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(1));
+            true
+        }
+        c.busy_handler(Some(on_busy)).unwrap();
         let worker = std::thread::spawn(move || {
             let r = migrate(&mut c, &[M1, M2]);
             (r, c)
         });
-        std::thread::sleep(Duration::from_millis(400));
+        let start = std::time::Instant::now();
+        while !WAITING.load(Ordering::SeqCst) {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "the worker never waited on the lock"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
         other.pragma_update(None, "user_version", 7).unwrap();
         other.execute_batch("COMMIT").unwrap();
         let (r, c) = worker.join().unwrap();
