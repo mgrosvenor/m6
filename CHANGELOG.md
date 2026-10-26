@@ -64,7 +64,8 @@ Opening a WAL file with the default rollback journal then fails with `SQLITE_BUS
 Each migration runs in its own `BEGIN IMMEDIATE` transaction, so connections that open at once apply each one once, and a failing migration rolls back.
 A file newer than the migration list is refused with `NewerThanCode`, both before the first migration and again inside each transaction, so a newer process that migrates the file meanwhile is also refused.
 `migrate` switches `foreign_keys` off before each migration, because SQLite ignores that pragma inside a transaction, and so a migration can rebuild a table that others point at without losing their rows.
-Before the commit it runs `PRAGMA foreign_key_check`, and a migration that leaves a dangling reference is rolled back with `ForeignKeyCheck`.
+It runs `PRAGMA foreign_key_check` before each migration and again after it, and a migration that adds a dangling reference is rolled back with `ForeignKeyCheck`.
+A dangling reference already in the file before the migration is not counted.
 `foreign_keys` is restored to its earlier setting when `migrate` returns.
 `append_only(&conn, table)` adds triggers that refuse UPDATE and DELETE on a named table, and `is_append_only` reports them.
 `used_bytes` and `prune_oldest` keep a table that is not append-only under a size cap.
@@ -78,7 +79,7 @@ Nothing in the workspace turns the feature on, so `cargo test --workspace` never
 CI therefore has a step that builds and tests m6-core with `--all-features`, and `tools/clippy.sh` has a second pass that lints it the same way.
 That also covers `email` and `multipart`, which nothing in the workspace turns on either.
 
-Verified: `cargo test -p m6-core --lib --features sqlite` passes 416 tests with 0 failures, including 33 in the `sqlite` module that run against real files.
+Verified: `cargo test -p m6-core --lib --features sqlite` passes 417 tests with 0 failures, including 34 in the `sqlite` module that run against real files.
 The doctests pass with the feature on.
 `cargo test -p m6-core --features sqlite,testkit` builds with no warnings and passes.
 `cargo build --workspace --release`, `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `./tools/clippy.sh` and `cargo test --workspace` all pass with no warnings.

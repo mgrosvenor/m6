@@ -45,9 +45,11 @@
 //!   old table and rename the new one. SQLite ignores `PRAGMA foreign_keys`
 //!   inside a transaction, so [`migrate`] switches foreign keys off before each
 //!   transaction. Dropping the old table then deletes no child rows. Before the
-//!   commit, [`migrate`] runs `PRAGMA foreign_key_check`. A migration that
-//!   leaves a row pointing at a missing row is rolled back and returns
-//!   [`SqliteError::ForeignKeyCheck`]. When [`migrate`] returns, foreign keys
+//!   commit, [`migrate`] runs `PRAGMA foreign_key_check` before the migration
+//!   and again after it. A migration that adds a row pointing at a missing row
+//!   is rolled back and returns [`SqliteError::ForeignKeyCheck`]. A dangling
+//!   reference already in the file before the migration is not counted, so an
+//!   orphan row left by an earlier connection does not block later migrations. When [`migrate`] returns, foreign keys
 //!   are back to the setting they had on entry. The check is skipped when the
 //!   connection was opened with foreign keys off.
 //! - A migration may not contain statements that SQLite refuses or ignores
@@ -266,16 +268,18 @@ pub fn migrate(conn: &mut Connection, migrations: &[Migration]) -> Result<u32, S
             if now >= m.version {
                 continue;
             }
+            let before = if fk_was_on {
+                violations(&tx).map_err(fail)?
+            } else {
+                Vec::new()
+            };
             tx.execute_batch(m.sql).map_err(fail)?;
             if fk_was_on {
-                let dangling: Option<String> = tx
-                    .query_row("PRAGMA foreign_key_check", [], |r| r.get(0))
-                    .optional()
-                    .map_err(fail)?;
-                if let Some(table) = dangling {
+                let after = violations(&tx).map_err(fail)?;
+                if let Some(added) = after.into_iter().find(|v| !before.contains(v)) {
                     return Err(SqliteError::ForeignKeyCheck {
                         version: m.version,
-                        table,
+                        table: added.0,
                     });
                 }
             }
@@ -293,6 +297,16 @@ pub fn migrate(conn: &mut Connection, migrations: &[Migration]) -> Result<u32, S
         return Err(SqliteError::NewerThanCode { db: last, code });
     }
     Ok(last)
+}
+
+/// One row of `PRAGMA foreign_key_check`: table, rowid, parent table and
+/// foreign key id. The rowid is `None` for a WITHOUT ROWID table.
+type Violation = (String, Option<i64>, String, i64);
+
+fn violations(conn: &Connection) -> rusqlite::Result<Vec<Violation>> {
+    let mut stmt = conn.prepare("PRAGMA foreign_key_check")?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+    rows.collect()
 }
 
 /// `[A-Za-z_][A-Za-z0-9_]*`, the only table names placed into SQL here.
@@ -740,6 +754,39 @@ mod tests {
         }
         assert_eq!(schema_version(&c).unwrap(), 1);
         assert_eq!(count(&c, "SELECT count(*) FROM p"), 1);
+    }
+
+    #[test]
+    fn an_orphan_row_already_in_the_file_does_not_block_migration() {
+        let (_d, path) = db();
+        let mut off = OpenOptions::default()
+            .foreign_keys(false)
+            .open(&path)
+            .unwrap();
+        let m1 = Migration {
+            version: 1,
+            sql: "CREATE TABLE p(id INTEGER PRIMARY KEY); \
+                  CREATE TABLE ch(pid INTEGER REFERENCES p(id));",
+        };
+        migrate(&mut off, &[m1]).unwrap();
+        off.execute_batch("INSERT INTO ch VALUES (99)").unwrap();
+        drop(off);
+        let m2 = Migration {
+            version: 2,
+            sql: "CREATE TABLE other(id INTEGER);",
+        };
+        let m3 = Migration {
+            version: 3,
+            sql: "INSERT INTO ch VALUES (98);",
+        };
+        let mut c = open(&path).unwrap();
+        assert_eq!(migrate(&mut c, &[m1, m2]).unwrap(), 2);
+        match migrate(&mut c, &[m1, m2, m3]) {
+            Err(SqliteError::ForeignKeyCheck { version: 3, table }) => assert_eq!(table, "ch"),
+            other => panic!("expected ForeignKeyCheck, got {other:?}"),
+        }
+        assert_eq!(schema_version(&c).unwrap(), 2);
+        assert_eq!(count(&c, "SELECT count(*) FROM ch"), 1);
     }
 
     // V3
