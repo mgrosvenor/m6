@@ -16,11 +16,13 @@ pub struct Node {
     pub name: String,
     /// Base URL, scheme and authority.
     ///
-    /// Point this at the backbone address, not the public one. `/perf` is
-    /// token-gated because it faces the internet; between nodes on a private
-    /// mesh the exposure is different and the round trip is shorter. Polling
-    /// a node through its own public edge also measures the edge rather than
-    /// the node.
+    /// The node's public address. `/health` and the header checks are fetched
+    /// from here, because what a visitor receives is what they assert on, and
+    /// its host name is the name the node's certificate is checked against.
+    /// `/perf` and `/traffic` come from here too unless `metrics_over_tunnel`
+    /// moves them to the tunnel, so `/perf` no longer has to face the
+    /// internet. Polling a node through its own public edge also measures the
+    /// edge rather than the node.
     pub url: String,
     /// Role, for the report only. A cache node legitimately has no socket
     /// pools and a low hit rate relative to origin, and reporting it next to
@@ -46,6 +48,17 @@ pub struct Node {
     /// never counts as a fault.
     #[serde(default)]
     pub tunnel: Option<Tunnel>,
+    /// Fetch `/perf` and `/traffic` through `tunnel.address` instead of the
+    /// public address. Default false.
+    ///
+    /// `tunnel.address` must then be the node's HTTPS port on its tunnel
+    /// address, because the request is TLS to that socket. The URL's host name
+    /// still names the certificate, so the node's public certificate is checked
+    /// as usual. The node answers these paths only to peers it lists
+    /// (`[health] metrics_peers`) and only for an API token, so this is the
+    /// supported way to keep them off the public interface.
+    #[serde(default)]
+    pub metrics_over_tunnel: bool,
 }
 
 /// A WireGuard tunnel from the monitor host to one node.
@@ -267,6 +280,12 @@ impl Fleet {
             );
         }
         for n in &fleet.nodes {
+            if n.metrics_over_tunnel && n.tunnel.is_none() {
+                anyhow::bail!(
+                    "node {:?}: metrics_over_tunnel needs tunnel.address, the node's HTTPS port on its tunnel address",
+                    n.name
+                );
+            }
             if let Some(t) = &n.tunnel {
                 if t.address.parse::<std::net::SocketAddr>().is_err() {
                     anyhow::bail!(
@@ -361,6 +380,7 @@ role = "cache"
             role: "cache".into(),
             perf_token_file: Some(per_node.path().to_string_lossy().to_string()),
             tunnel: None,
+            metrics_over_tunnel: false,
         };
         assert_eq!(
             n.perf_token(Some("fleet-token")).as_deref(),
@@ -373,6 +393,7 @@ role = "cache"
             role: "origin".into(),
             perf_token_file: None,
             tunnel: None,
+            metrics_over_tunnel: false,
         };
         assert_eq!(
             bare.perf_token(Some("fleet-token")).as_deref(),
@@ -533,5 +554,34 @@ tunnel = { address = "192.0.2.2:443", public_key = "KEY" }
         assert_eq!(set.log_reopen_max_age_s, Some(7200));
         let unset = load(node).unwrap();
         assert_eq!(unset.log_reopen_max_age_s, None);
+    }
+
+    #[test]
+    fn metrics_over_tunnel_defaults_off() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            f,
+            "[[monitor.nodes]]\nname = \"a\"\nurl = \"http://a.example.com\"\n\
+             tunnel = {{ address = \"192.0.2.2:443\" }}\n"
+        )
+        .unwrap();
+        let fleet = Fleet::from_config(f.path()).unwrap();
+        assert!(!fleet.nodes[0].metrics_over_tunnel);
+    }
+
+    #[test]
+    fn metrics_over_tunnel_needs_a_tunnel() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            f,
+            "[[monitor.nodes]]\nname = \"a\"\nurl = \"http://a.example.com\"\n\
+             metrics_over_tunnel = true\n"
+        )
+        .unwrap();
+        let e = Fleet::from_config(f.path()).unwrap_err().to_string();
+        assert!(
+            e.contains("metrics_over_tunnel needs tunnel.address"),
+            "{e}"
+        );
     }
 }

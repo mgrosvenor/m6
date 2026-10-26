@@ -1,8 +1,14 @@
 //! Fetching one node's view of itself.
 //!
-//! Two requests per node: `/health` for the verdict, `/perf` for everything
-//! else. They are separate endpoints on purpose (see `m6_core::monitoring`),
-//! and an aggregator is exactly the caller that wants both.
+//! Three requests per node: `/health` for the verdict, `/perf` for everything
+//! else and `/traffic` for the node's own view of its visitors. They are
+//! separate endpoints on purpose (see `m6_core::monitoring`), and an
+//! aggregator is exactly the caller that wants all three.
+//!
+//! `/health` and the header checks always use the node's public URL.
+//! `/perf` and `/traffic` use it too, unless the node sets
+//! `metrics_over_tunnel`, which sends them to its tunnel address with the
+//! same token.
 
 use std::time::{Duration, Instant};
 
@@ -87,6 +93,20 @@ fn agent_for(timeout: Duration) -> ureq::Agent {
         // A monitor that follows redirects can be walked somewhere else by a
         // node it is supposed to be observing.
         .redirects(0)
+        .build()
+}
+
+/// An agent that connects to `addr` whatever host name the URL carries.
+///
+/// A separate agent, so no pooled connection to the public address is reused.
+/// Only the socket address comes from the resolver. The TLS server name still
+/// comes from the URL host, so the node's public certificate is verified as
+/// usual.
+fn tunnel_agent(timeout: Duration, addr: std::net::SocketAddr) -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout(timeout)
+        .redirects(0)
+        .resolver(move |_: &str| Ok(vec![addr]))
         .build()
 }
 
@@ -223,28 +243,53 @@ pub fn node(
 
     let base = n.url.trim_end_matches('/');
 
-    match get(&agent, &format!("{base}/perf"), Some(token)) {
+    // The address was validated when the fleet was read.
+    let tunnel_addr = n
+        .tunnel
+        .as_ref()
+        .filter(|_| n.metrics_over_tunnel)
+        .and_then(|t| t.address.parse::<std::net::SocketAddr>().ok());
+    let tunnel;
+    let metrics_agent = match tunnel_addr {
+        Some(addr) => {
+            tunnel = tunnel_agent(timeout, addr);
+            &tunnel
+        }
+        None => &agent,
+    };
+
+    match get(metrics_agent, &format!("{base}/perf"), Some(token)) {
         Ok((200, body)) => match serde_json::from_str::<PerfReport>(&body) {
             Ok(p) => reading.perf = Some(p),
             Err(e) => reading.perf_error = Some(format!("unparseable: {e}")),
         },
         Ok((401, _)) => reading.perf_error = Some("401: token rejected by this node".to_string()),
+        Ok((403, _)) => reading.perf_error = Some("403: token lacks the required role".to_string()),
         Ok((404, _)) => {
-            reading.perf_error = Some("404: /perf not enabled on this node".to_string())
+            reading.perf_error = Some(
+                "404: /perf not enabled on this node, or not served to this address".to_string(),
+            )
         }
         Ok((code, _)) => reading.perf_error = Some(format!("unexpected status {code}")),
         Err(e) => reading.perf_error = Some(format!("{e}")),
     }
 
-    match get(&agent, &format!("{base}/traffic"), Some(token)) {
+    match get(metrics_agent, &format!("{base}/traffic"), Some(token)) {
         Ok((200, body)) => match serde_json::from_str::<TrafficReport>(&body) {
             Ok(t) => reading.traffic = Some(t),
             Err(e) => reading.traffic_error = Some(format!("unparseable: {e}")),
         },
+        Ok((403, _)) => {
+            reading.traffic_error = Some("403: token lacks the required role".to_string())
+        }
         Ok((404, _)) => {
-            // An older node without the endpoint. Worth saying, because a
-            // silent absence is indistinguishable from a quiet hour.
-            reading.traffic_error = Some("404: /traffic not available on this node".to_string())
+            // An older node without the endpoint, or one that does not serve
+            // it to this address. Worth saying, because a silent absence is
+            // indistinguishable from a quiet hour.
+            reading.traffic_error = Some(
+                "404: /traffic not available on this node, or not served to this address"
+                    .to_string(),
+            )
         }
         Ok((503, body)) => {
             let why = serde_json::from_str::<serde_json::Value>(&body)
@@ -376,5 +421,103 @@ mod tests {
         assert_eq!(reading(None, Some("ok")).status(), "ok");
         assert_eq!(reading(None, Some("degraded")).status(), "degraded");
         assert_eq!(reading(None, None).status(), "unknown");
+    }
+
+    /// A one-connection-per-request HTTP/1.1 server on a loopback port. It
+    /// answers `n` requests with `reply(path)` and returns what it saw as
+    /// (request line, authorization header or empty).
+    fn serve(
+        n: usize,
+        reply: fn(&str) -> (u16, &'static str),
+    ) -> (u16, std::thread::JoinHandle<Vec<(String, String)>>) {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for stream in listener.incoming().take(n) {
+                let mut stream = stream.unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let mut auth = String::new();
+                loop {
+                    let mut h = String::new();
+                    reader.read_line(&mut h).unwrap();
+                    if h == "\r\n" || h.is_empty() {
+                        break;
+                    }
+                    if h.to_ascii_lowercase().starts_with("authorization:") {
+                        auth = h["authorization:".len()..].trim().to_string();
+                    }
+                }
+                let path = line.split_whitespace().nth(1).unwrap_or("").to_string();
+                let (code, body) = reply(&path);
+                write!(
+                    stream,
+                    "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+                seen.push((line.trim().to_string(), auth));
+            }
+            seen
+        });
+        (port, handle)
+    }
+
+    fn tunnel_node(public: u16, tunnel: u16) -> Node {
+        Node {
+            name: "origin".into(),
+            url: format!("http://127.0.0.1:{public}"),
+            role: "origin".into(),
+            perf_token_file: None,
+            tunnel: Some(crate::fleet::Tunnel {
+                address: format!("127.0.0.1:{tunnel}"),
+                public_key: None,
+            }),
+            metrics_over_tunnel: true,
+        }
+    }
+
+    #[test]
+    fn perf_and_traffic_go_to_the_tunnel_and_health_to_the_url() {
+        let (public, public_seen) = serve(1, |_| (200, r#"{"status":"ok","node":"origin"}"#));
+        let (tunnel, tunnel_seen) = serve(2, |_| (404, r#"{"error":"not found"}"#));
+        let n = tunnel_node(public, tunnel);
+        let r = node(&n, Some("tok"), Duration::from_secs(5), &[]);
+        assert_eq!(r.health.as_ref().map(|h| h.status.as_str()), Some("ok"));
+
+        let public_seen = public_seen.join().unwrap();
+        assert_eq!(public_seen.len(), 1);
+        assert_eq!(public_seen[0].0, "GET /health HTTP/1.1");
+        assert_eq!(public_seen[0].1, "", "/health carries no token");
+
+        let tunnel_seen = tunnel_seen.join().unwrap();
+        assert_eq!(tunnel_seen[0].0, "GET /perf HTTP/1.1");
+        assert_eq!(tunnel_seen[1].0, "GET /traffic HTTP/1.1");
+        assert!(tunnel_seen.iter().all(|(_, a)| a == "Bearer tok"));
+        assert_eq!(
+            r.perf_error.as_deref(),
+            Some("404: /perf not enabled on this node, or not served to this address")
+        );
+    }
+
+    #[test]
+    fn a_403_says_the_token_lacks_the_role() {
+        let (public, public_seen) = serve(1, |_| (200, r#"{"status":"ok","node":"origin"}"#));
+        let (tunnel, tunnel_seen) = serve(2, |_| (403, r#"{"error":"forbidden"}"#));
+        let n = tunnel_node(public, tunnel);
+        let r = node(&n, Some("tok"), Duration::from_secs(5), &[]);
+        public_seen.join().unwrap();
+        tunnel_seen.join().unwrap();
+        assert_eq!(
+            r.perf_error.as_deref(),
+            Some("403: token lacks the required role")
+        );
+        assert_eq!(
+            r.traffic_error.as_deref(),
+            Some("403: token lacks the required role")
+        );
     }
 }
