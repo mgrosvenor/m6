@@ -1284,14 +1284,14 @@ journalctl -u m6-http --since "2024-01-15 09:00" --until "2024-01-15 10:00"
 
 `m6-http` writes the analytics log to one file and reopens it when it receives SIGUSR1.
 Rotation renames the file and sends the signal, so no line is lost, and `copytruncate` is not needed.
-This logrotate stanza rotates the file every hour.
+This logrotate stanza rotates the file every hour and keeps the last 48 files, two days.
 
 ```
 /var/www/example/logs/analytics.ndjson {
     hourly
     dateext
     dateformat -%Y%m%d%H
-    rotate -1
+    rotate 48
     compress
     missingok
     notifempty
@@ -1302,6 +1302,24 @@ This logrotate stanza rotates the file every hour.
 }
 ```
 
+`rotate` is a finite count because every kept file uses disk, and `/traffic` lists the directory to find the newest rotated file.
+`rotate -1` keeps files forever and is not suitable.
+Choose a count that fits the disk at your traffic.
+
+`hourly` only takes effect if logrotate itself runs every hour, and distributions run it once a day.
+Run it hourly with a systemd timer override.
+
+```
+# systemctl edit logrotate.timer
+[Timer]
+OnCalendar=
+OnCalendar=hourly
+AccuracySec=1m
+```
+
+On a system that uses cron instead, add `/etc/cron.hourly/logrotate` containing `#!/bin/sh` and `exec /usr/sbin/logrotate /etc/logrotate.conf`, and make it executable.
+Keep the daily run too if other stanzas use `daily`, which is harmless because logrotate skips a file that is not due.
+
 There is no `create` line, because `m6-http` creates the file itself.
 The wait in `postrotate` is a proof.
 The log writer cannot write to the renamed file once the new file exists, so the old file is finished before logrotate compresses it.
@@ -1311,8 +1329,10 @@ If the reopen fails, the wait times out and `postrotate` fails.
 `/perf` reports the last reopen as `logging.reopen`, with the seconds since the last reopen, how many reopens succeeded and failed, and the age of the last failure.
 `m6-monitor` shows it for each node in section A of `/check` and in `/digest`.
 Setting `[monitor] log_reopen_max_age_s` makes it a fault when a node's last reopen is older than that many seconds.
-A limit of twice the rotation interval suits an hourly rotation.
-`/traffic` reads the newest rotated file next to the log, so its sixty minute window does not shrink just after a rotation.
+A limit of twice the rotation interval suits an hourly rotation, so 7200 seconds with the schedule above.
+The limit is only as true as the schedule, so set it after logrotate runs hourly.
+`/traffic` reads the newest rotated file next to the log when the live file does not cover its window, so its sixty minute window does not shrink just after a rotation.
+It skips a rotated file last written before the window, and a `.gz` file larger than the 24 MB read budget on disk or once decoded.
 
 ---
 
