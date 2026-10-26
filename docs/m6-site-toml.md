@@ -276,8 +276,19 @@ With `[server]` in the system config and credentials in secrets files, `site.tom
 | `bind` | string | yes | `"address:port"` |
 | `tls_cert` | string | yes | Absolute path, PEM chain |
 | `tls_key` | string | yes | Absolute path, PEM key |
+| `h2c_bind` | string | no | `"ip:port"`. Plain-TCP HTTP/2 listener for a private backbone. Needs `internal_binds` |
+| `internal_binds` | list of strings | when `h2c_bind` is set | Listeners treated as internal, each `"ip:port"` equal to `bind` or `h2c_bind`, in a local range. `[]` means none |
 
 TLS cert and key watched via inotify — reloaded on change without restart.
+
+An internal listener is one that `internal_binds` names. m6-http never infers it from an address. On an internal listener the statistics channel is labelled `internal`, and the custom error path is served to the caller. On an internal `h2c_bind` listener m6-http also believes the client address in the `X-Forwarded-For` that a cache node sends, so each visitor behind a cache node keeps their own rate limit. A TLS or QUIC `bind` that is named is labelled and may fetch the error path, and it does not gain forwarded-address trust. Every entry must be in a local range, which means loopback, private (RFC 1918), link-local, shared (100.64.0.0/10) or IPv6 unique-local. Host names are never resolved and a wildcard address such as `0.0.0.0` is refused. The list is read at startup, so a change needs a restart. The system config wins, and its list replaces the one in `site.toml` as a whole. A redirect-mode config ignores the key.
+
+```toml
+[server]
+bind           = "0.0.0.0:443"
+h2c_bind       = "10.0.0.1:8080"
+internal_binds = ["10.0.0.1:8080"]
+```
 
 ### `[log]`
 
@@ -440,6 +451,10 @@ Exit 2 on:
 - `[auth]` declared but `public_key` file not found
 - `[auth]` declared but `backend` not declared in `[[backend]]`
 - `require` on a route but no `[auth]` declared
+- `internal_binds` entry that is not an IP address and port (names are never resolved)
+- `internal_binds` entry that is not in a local range
+- `internal_binds` entry that is not equal to `bind` or `h2c_bind`
+- `h2c_bind` set and `internal_binds` absent (`internal_binds = []` is the explicit answer for a public listener)
 
 Warnings (not fatal):
 

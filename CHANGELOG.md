@@ -17,6 +17,33 @@ releases only; work happens on `develop`. See `CONTRIBUTING.md`.
 Changes merged to `develop` since the last release. The section is renamed to
 the version when the release is cut.
 
+### Changed
+
+**A listener is internal only when the config says so (#232).** m6-http used
+to decide from a listener's bind address whether it was internal, and three
+things followed from that guess: the statistics label, whether the h2c
+listener believed the client address a cache node forwards, and whether
+the custom error path was served. `[server] internal_binds` now names the
+internal listeners by address, and m6-http refuses an entry that is not in
+a local range (`m6_core::net::is_private_ip`) or is not one of its
+listeners. A TLS `bind` named there is internal too: its statistics say so
+and it may fetch the custom error path.
+
+**Migration.** A config with `h2c_bind` must add `internal_binds`, or
+m6-http exits 2 with the line to add. `internal_binds = ["<h2c_bind>"]`
+keeps today's behaviour for a private h2c listener, and `internal_binds = []`
+treats it as public. Add it before upgrading, because older versions ignore
+the key. A `bind` on a private address that is not declared is now labelled
+`external` in `/perf`.
+
+Verified: the workspace tests pass with 1242 passed and 0 failed, clippy is
+silent with `-D warnings`, and the release and test builds have no warnings.
+Eleven new config tests, two rewritten h2c trust tests and three tests that run the real binary cover every
+refusal and a valid start. A diff of the three cache-hit blocks in
+`m6-http/src/main.rs` against the base is empty, so the request path for a
+cache hit is untouched. Example 09's integration test in m6-examples runs to
+"All assertions passed" with no `SKIP` against this build.
+
 ### Security
 
 **Four dependencies moved up a patch version to clear seven RustSec advisories
