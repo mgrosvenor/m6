@@ -45,7 +45,8 @@ The outcome is then `connected`, the round trip is the minimum of the connects t
 Only a poll where no connect gets through is `no_answer`.
 The probe of a node has one deadline of `timeout_ms`.
 Up to three connects run one after another, each given what is left of that time, and a connect that times out ends the probe.
-A dead tunnel therefore costs one `timeout_ms`, which keeps a poll inside the poller's stale limit.
+A dead tunnel therefore costs one `timeout_ms`.
+A reading goes stale when one poll takes longer than twice `poll_interval_s`, so `timeout_ms` must stay well under that.
 
 The handshake is read from a file because `wg show` needs `CAP_NET_ADMIN`.
 A privileged timer writes the output of `wg show <interface> latest-handshakes` to the file and m6-monitor reads it as data.
