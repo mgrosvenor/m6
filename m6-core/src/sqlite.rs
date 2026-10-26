@@ -120,6 +120,11 @@ pub enum Journal {
 
 /// Settings for [`OpenOptions::open`]. The default is Table 1 in the module
 /// documentation.
+///
+/// Use the same [`Journal`] for every connection to a file. SQLite cannot leave
+/// WAL mode while another connection has the file open, so opening a WAL file
+/// with the default rollback journal fails with `SQLITE_BUSY` while another
+/// connection is using it.
 #[derive(Debug, Clone)]
 pub struct OpenOptions {
     busy_timeout: Duration,
@@ -157,6 +162,11 @@ impl OpenOptions {
     }
 
     /// Open the file, creating it if it is missing, and apply the settings.
+    ///
+    /// Changing the journal mode needs the file to itself. If another
+    /// connection is using the file in WAL mode, a request for a different mode
+    /// fails with `SQLITE_BUSY` once the busy timeout runs out. Open every connection to a file
+    /// with the same [`Journal`].
     pub fn open(&self, path: &Path) -> Result<Connection, SqliteError> {
         let conn = Connection::open(path).map_err(|source| SqliteError::Open {
             path: path.to_path_buf(),
@@ -763,6 +773,30 @@ mod tests {
         }
         assert_eq!(schema_version(&c).unwrap(), 7);
         assert!(!table_exists(&c, "a"));
+    }
+
+    // V5
+    #[test]
+    fn open_with_another_journal_is_busy_while_a_wal_connection_is_in_use() {
+        let (_d, path) = db();
+        let wal = OpenOptions::default()
+            .journal(Journal::Wal)
+            .busy_timeout(Duration::from_millis(50))
+            .open(&path)
+            .unwrap();
+        wal.execute_batch("CREATE TABLE a(x); INSERT INTO a VALUES (1); BEGIN; SELECT * FROM a;")
+            .unwrap();
+        let r = OpenOptions::default()
+            .busy_timeout(Duration::from_millis(50))
+            .open(&path);
+        assert!(
+            matches!(
+                &r,
+                Err(SqliteError::Sqlite(rusqlite::Error::SqliteFailure(f, _)))
+                    if f.code == ErrorCode::DatabaseBusy
+            ),
+            "{r:?}"
+        );
     }
 
     // T14
