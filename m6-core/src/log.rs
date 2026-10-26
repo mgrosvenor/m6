@@ -12,6 +12,12 @@
 //!
 //! It is also why a line logged after the shutdown flag is set can be lost:
 //! process exit discards whatever is still queued. See the `signal` module.
+//!
+//! **The analytics file can be reopened.**
+//! A rotation tool renames the file and sends SIGUSR1 (see `signal`), and the signal thread calls [`reopen_log_file`].
+//! The reopen opens the new file while holding the lock the writer takes for every line.
+//! The writer therefore cannot write to the old file once the lock is released, so the live path reappearing proves the renamed file is finished.
+//! If the open fails, the old handle stays in place and the failure is recorded.
 
 use anyhow::Result;
 use std::path::Path;
@@ -104,6 +110,402 @@ fn elapsed_ms() -> u64 {
 /// The process-wide log heartbeat.
 pub fn pulse() -> &'static LogPulse {
     &PULSE
+}
+
+// ── Reopening the log file ──
+
+fn open_append(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+}
+
+/// The log file and the absolute path it was opened at.
+///
+/// The path is made absolute once, so a later change of working directory
+/// cannot redirect a reopen.
+struct ReopenableFile {
+    path: std::path::PathBuf,
+    file: std::sync::Mutex<std::fs::File>,
+}
+
+impl ReopenableFile {
+    fn open(path: &Path) -> std::io::Result<Self> {
+        let path = std::path::absolute(path)?;
+        let file = open_append(&path)?;
+        Ok(Self {
+            path,
+            file: std::sync::Mutex::new(file),
+        })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, std::fs::File> {
+        self.file
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Open the path afresh and swap it in. On failure the old handle stays.
+    ///
+    /// The open happens under the lock on purpose. While this thread holds
+    /// the lock the writer cannot write to the old file, so once the new file
+    /// exists no further line will reach the renamed one.
+    fn reopen(&self) -> std::io::Result<()> {
+        let mut guard = self.lock();
+        let fresh = open_append(&self.path)?;
+        let old = std::mem::replace(&mut *guard, fresh);
+        drop(guard);
+        drop(old);
+        Ok(())
+    }
+}
+
+/// The writer `tracing_appender` owns for the analytics file.
+#[derive(Clone)]
+struct FileWriter(std::sync::Arc<ReopenableFile>);
+
+impl std::io::Write for FileWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().write(buf)
+    }
+
+    /// `tracing_appender` calls this once per event, so taking the lock once
+    /// here means a swap lands between lines and never inside one.
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        self.0.lock().write_all(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.lock().flush()
+    }
+}
+
+/// When the log file was last reopened, and when a reopen last failed.
+///
+/// Atomics only, like [`LogPulse`]. A count of zero means "never".
+pub struct ReopenRecord {
+    ok: std::sync::atomic::AtomicU64,
+    failed: std::sync::atomic::AtomicU64,
+    /// Milliseconds since process start, at the last success.
+    last_ok_ms: std::sync::atomic::AtomicU64,
+    /// Unix seconds at the last success.
+    last_ok_unix: std::sync::atomic::AtomicU64,
+    /// Milliseconds since process start, at the last failure.
+    last_fail_ms: std::sync::atomic::AtomicU64,
+}
+
+impl ReopenRecord {
+    const fn new() -> Self {
+        Self {
+            ok: std::sync::atomic::AtomicU64::new(0),
+            failed: std::sync::atomic::AtomicU64::new(0),
+            last_ok_ms: std::sync::atomic::AtomicU64::new(0),
+            last_ok_unix: std::sync::atomic::AtomicU64::new(0),
+            last_fail_ms: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn record_success(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        self.last_ok_ms.store(elapsed_ms(), Relaxed);
+        self.last_ok_unix.store(unix, Relaxed);
+        self.ok.fetch_add(1, Relaxed);
+    }
+
+    fn record_failure(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.last_fail_ms.store(elapsed_ms(), Relaxed);
+        self.failed.fetch_add(1, Relaxed);
+    }
+
+    /// Reopens that succeeded since start.
+    pub fn successes(&self) -> u64 {
+        self.ok.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Reopens that failed since start.
+    pub fn failures(&self) -> u64 {
+        self.failed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Seconds since the last successful reopen, or `None` if there was none.
+    pub fn seconds_since_last_success(&self) -> Option<u64> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.ok.load(Relaxed) == 0 {
+            return None;
+        }
+        Some(elapsed_ms().saturating_sub(self.last_ok_ms.load(Relaxed)) / 1000)
+    }
+
+    /// Unix time of the last successful reopen, or `None` if there was none.
+    pub fn last_success_unix(&self) -> Option<u64> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.ok.load(Relaxed) == 0 {
+            return None;
+        }
+        Some(self.last_ok_unix.load(Relaxed)).filter(|&u| u != 0)
+    }
+
+    /// Seconds since the last failed reopen, or `None` if there was none.
+    pub fn seconds_since_last_failure(&self) -> Option<u64> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.failed.load(Relaxed) == 0 {
+            return None;
+        }
+        Some(elapsed_ms().saturating_sub(self.last_fail_ms.load(Relaxed)) / 1000)
+    }
+}
+
+static LOG_FILE: std::sync::OnceLock<std::sync::Arc<ReopenableFile>> = std::sync::OnceLock::new();
+static REOPENS: ReopenRecord = ReopenRecord::new();
+
+/// What a reopen request did.
+#[derive(Debug)]
+pub enum Reopened {
+    /// This process writes no log file.
+    NoFile,
+    /// The path was opened afresh.
+    Done(std::path::PathBuf),
+    /// The open failed. The previous file is still being written.
+    Failed(std::path::PathBuf, std::io::Error),
+}
+
+fn reopen_in(slot: Option<&ReopenableFile>, rec: &ReopenRecord) -> Reopened {
+    let Some(f) = slot else {
+        return Reopened::NoFile;
+    };
+    match f.reopen() {
+        Ok(()) => {
+            rec.record_success();
+            Reopened::Done(f.path.clone())
+        }
+        Err(e) => {
+            rec.record_failure();
+            Reopened::Failed(f.path.clone(), e)
+        }
+    }
+}
+
+/// Reopen the analytics file at its path. Called on [`crate::signal::REOPEN_SIGNAL`].
+pub fn reopen_log_file() -> Reopened {
+    reopen_in(LOG_FILE.get().map(|a| &**a), &REOPENS)
+}
+
+/// When this process last reopened its log file.
+pub fn reopens() -> &'static ReopenRecord {
+    &REOPENS
+}
+
+/// Whether this process writes a log file that can be reopened.
+pub fn writes_log_file() -> bool {
+    LOG_FILE.get().is_some()
+}
+
+/// The newest rotated sibling of a log file, if there is one.
+///
+/// A rotation tool that renames the live file with a date extension leaves
+/// `<name>-YYYYmmddHH`, which is what logrotate's `dateext` produces for an
+/// hourly rotation, and compression adds `.gz`.
+/// The highest stamp is the newest.
+/// An uncompressed file is preferred when both exist, because the `.gz` may still be written.
+pub fn newest_rotated(live: &Path) -> Option<std::path::PathBuf> {
+    let dir = live.parent().filter(|d| !d.as_os_str().is_empty());
+    let dir = dir.unwrap_or_else(|| Path::new("."));
+    let name = live.file_name()?.to_str()?;
+    let prefix = format!("{name}-");
+    let mut best: Option<(String, bool, std::path::PathBuf)> = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let file = entry.file_name();
+        let Some(file) = file.to_str() else { continue };
+        let Some(rest) = file.strip_prefix(&prefix) else {
+            continue;
+        };
+        let (stamp, gz) = match rest.strip_suffix(".gz") {
+            Some(stamp) => (stamp, true),
+            None => (rest, false),
+        };
+        if stamp.len() != 10 || !stamp.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let better = match &best {
+            None => true,
+            Some((s, was_gz, _)) => stamp > s.as_str() || (stamp == s.as_str() && *was_gz && !gz),
+        };
+        if better {
+            best = Some((stamp.to_string(), gz, entry.path()));
+        }
+    }
+    best.map(|(_, _, path)| path)
+}
+
+/// Append the last `max_bytes` of a plain or gzip file to `out`.
+///
+/// A plain file is read from a seek, so only the tail is read.
+/// A gzip file cannot seek and is decoded from the start.
+/// A gzip file that is cut short yields what decoded before the cut.
+fn append_tail(path: &Path, max_bytes: usize, out: &mut Vec<u8>) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    if !path.extension().is_some_and(|e| e == "gz") {
+        let len = file.metadata()?.len();
+        let max = max_bytes as u64;
+        if len > max {
+            file.seek(SeekFrom::Start(len - max))?;
+        }
+        file.read_to_end(out)?;
+        return Ok(());
+    }
+    let mut reader = flate2::read::GzDecoder::new(file);
+    let mut kept: Vec<u8> = Vec::new();
+    let mut chunk = vec![0u8; 64 * 1024];
+    loop {
+        let n = match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => n,
+            // A gzip file cut short ends the read, it is not a failure.
+            Err(_) if !kept.is_empty() => break,
+            Err(e) => return Err(e),
+        };
+        kept.extend_from_slice(&chunk[..n]);
+        if kept.len() > max_bytes * 2 {
+            kept.drain(..kept.len() - max_bytes);
+        }
+    }
+    let skip = kept.len().saturating_sub(max_bytes);
+    out.extend_from_slice(&kept[skip..]);
+    Ok(())
+}
+
+fn into_text(bytes: Vec<u8>) -> String {
+    String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+}
+
+/// The last `max_bytes` of a plain or gzip file, as text.
+///
+/// A gzip file that is cut short yields what decoded before the cut.
+/// A first line that starts mid-record is expected and is the caller's to skip.
+pub fn read_tail(path: &Path, max_bytes: usize) -> std::io::Result<String> {
+    let mut out = Vec::new();
+    append_tail(path, max_bytes, &mut out)?;
+    Ok(into_text(out))
+}
+
+/// What [`read_recent_counted`] did with the rotated file.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct RecentStats {
+    /// Whether the rotated file was opened.
+    pub rotated_opened: bool,
+    /// Bytes taken from the rotated file: file bytes for a plain file, decoded bytes for a gzip file.
+    pub rotated_bytes: u64,
+}
+
+/// Append the tail of a rotated file, doing a bounded amount of work.
+///
+/// A plain file is read from a seek, so at most `max_bytes` are read.
+/// A gzip file cannot seek, so it is read only when it is cheap.
+/// Its size on disk and the uncompressed size in its trailer (ISIZE, the last four bytes, modulo 2^32) must both be at most `max_bytes`.
+/// The decoder is also stopped one byte past `max_bytes`, and what it produced is discarded, because a damaged or hostile trailer can lie.
+/// A file that is skipped adds nothing, and that is not an error.
+fn append_rotated(
+    path: &Path,
+    max_bytes: usize,
+    out: &mut Vec<u8>,
+    stats: &mut RecentStats,
+) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    stats.rotated_opened = true;
+    let len = file.metadata()?.len();
+    let max = max_bytes as u64;
+    if !path.extension().is_some_and(|e| e == "gz") {
+        if len > max {
+            file.seek(SeekFrom::Start(len - max))?;
+        }
+        let before = out.len();
+        file.take(max).read_to_end(out)?;
+        stats.rotated_bytes = (out.len() - before) as u64;
+        return Ok(());
+    }
+    if len > max || len < 4 {
+        return Ok(());
+    }
+    file.seek(SeekFrom::Start(len - 4))?;
+    let mut isize_bytes = [0u8; 4];
+    file.read_exact(&mut isize_bytes)?;
+    if u64::from(u32::from_le_bytes(isize_bytes)) > max {
+        return Ok(());
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let mut decoded = Vec::new();
+    let result = flate2::read::GzDecoder::new(file)
+        .take(max + 1)
+        .read_to_end(&mut decoded);
+    stats.rotated_bytes = decoded.len() as u64;
+    if decoded.len() as u64 > max {
+        return Ok(());
+    }
+    // A gzip file cut short yields what decoded before the cut.
+    if let Err(e) = result {
+        if decoded.is_empty() {
+            return Err(e);
+        }
+    }
+    out.extend_from_slice(&decoded);
+    Ok(())
+}
+
+/// The recent end of a log file across its last rotation, as text.
+///
+/// See [`read_recent_counted`].
+pub fn read_recent(
+    live: &Path,
+    max_bytes: usize,
+    since: std::time::SystemTime,
+) -> std::io::Result<String> {
+    read_recent_counted(live, max_bytes, since).map(|(text, _)| text)
+}
+
+/// The recent end of a log file across its last rotation, as text, with what it cost.
+///
+/// The tail of the live file is at most `max_bytes`.
+/// Right after a rotation the live file holds only minutes, so the tail of the newest rotated sibling (see [`newest_rotated`]) comes before it, also at most `max_bytes`.
+/// The rotated file is left alone when it adds nothing the caller can use:
+/// when the live tail already filled `max_bytes`,
+/// when the rotated file was last written before `since`,
+/// or when it is a gzip file too large to decode within the bound (see [`append_rotated`]).
+/// This runs on a request thread, so the work is bounded by `max_bytes` whatever the size of the files.
+/// A rotated file that cannot be read costs that history and nothing else.
+/// A first line, or the first line after the join, that starts mid-record is expected and is the caller's to skip.
+pub fn read_recent_counted(
+    live: &Path,
+    max_bytes: usize,
+    since: std::time::SystemTime,
+) -> std::io::Result<(String, RecentStats)> {
+    let mut stats = RecentStats::default();
+    let mut live_tail = Vec::new();
+    append_tail(live, max_bytes, &mut live_tail)?;
+    let mut out = Vec::new();
+    if live_tail.len() < max_bytes {
+        if let Some(rotated) = newest_rotated(live) {
+            let recent = std::fs::metadata(&rotated)
+                .and_then(|m| m.modified())
+                .is_ok_and(|mtime| mtime >= since);
+            if recent && append_rotated(&rotated, max_bytes, &mut out, &mut stats).is_err() {
+                out.clear();
+            }
+            // The cut may leave half a record, which would run into the live
+            // file's first line.
+            if out.last().is_some_and(|&b| b != b'\n') {
+                out.push(b'\n');
+            }
+        }
+    }
+    out.extend_from_slice(&live_tail);
+    Ok((into_text(out), stats))
 }
 
 /// A layer that does nothing but count. Composed with the format layer
@@ -238,11 +640,11 @@ fn make_analytics_layer(path: &Path) -> Result<(BoxedLayer, WorkerGuard)> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    let (writer, guard) = tracing_appender::non_blocking(file);
+    let file = std::sync::Arc::new(ReopenableFile::open(path)?);
+    // The subscriber is installed once per process (`try_init`), so only the
+    // first registration is reopenable.
+    let _ = LOG_FILE.set(std::sync::Arc::clone(&file));
+    let (writer, guard) = tracing_appender::non_blocking(FileWriter(file));
     let filter = filter_fn(|meta| meta.target() == ANALYTICS_TARGET);
     let layer: BoxedLayer = Box::new(
         fmt::layer()
@@ -277,7 +679,8 @@ pub fn init(format: &str, level: &str) -> Result<LogHandle> {
 ///
 /// `analytics_path` should point outside any directory that gets wiped on
 /// redeploy (e.g. not inside a rendered/generated site tree) — the file is
-/// opened in append mode and grown across restarts.
+/// opened in append mode and grown across restarts. Rotate it by renaming the
+/// file and sending SIGUSR1: the process then reopens the path.
 pub fn init_with_analytics(
     format: &str,
     level: &str,
@@ -399,5 +802,285 @@ mod pulse_tests {
         p.record();
         assert_eq!(p.events(), 2);
         assert_eq!(p.seconds_since_last(), Some(0));
+    }
+}
+
+#[cfg(test)]
+mod reopen_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn read(p: &Path) -> String {
+        std::fs::read_to_string(p).unwrap()
+    }
+
+    #[test]
+    fn a_reopen_after_a_rename_sends_new_lines_to_the_new_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("a.ndjson");
+        let f = std::sync::Arc::new(ReopenableFile::open(&path).unwrap());
+        let mut w = FileWriter(std::sync::Arc::clone(&f));
+        w.write_all(b"a\n").unwrap();
+        let moved = tmp.path().join("a.ndjson.1");
+        std::fs::rename(&path, &moved).unwrap();
+        f.reopen().unwrap();
+        w.write_all(b"b\n").unwrap();
+        assert_eq!(read(&moved), "a\n");
+        assert_eq!(read(&path), "b\n");
+    }
+
+    #[test]
+    fn concurrent_reopens_lose_tear_and_duplicate_nothing() {
+        const LINES: usize = 20_000;
+        const REOPENS: usize = 20;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("a.ndjson");
+        let f = std::sync::Arc::new(ReopenableFile::open(&path).unwrap());
+        let mut w = FileWriter(std::sync::Arc::clone(&f));
+        let writer = std::thread::spawn(move || {
+            for i in 0..LINES {
+                w.write_all(format!("{i:06}\n").as_bytes()).unwrap();
+            }
+        });
+        for k in 0..REOPENS {
+            std::fs::rename(&path, tmp.path().join(format!("a.ndjson.{k}"))).unwrap();
+            f.reopen().unwrap();
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+        writer.join().unwrap();
+        let mut seen = vec![0u8; LINES];
+        for entry in std::fs::read_dir(tmp.path()).unwrap() {
+            let text = read(&entry.unwrap().path());
+            let mut last: Option<usize> = None;
+            for line in text.split_inclusive('\n') {
+                assert_eq!(line.len(), 7, "torn line {line:?}");
+                let n: usize = line.trim_end().parse().expect("a number");
+                assert!(last.is_none_or(|l| n > l), "out of order within a file");
+                last = Some(n);
+                seen[n] += 1;
+            }
+        }
+        assert!(
+            seen.iter().all(|&c| c == 1),
+            "a line was lost or duplicated"
+        );
+    }
+
+    #[test]
+    fn a_failed_reopen_keeps_writing_to_the_old_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let path = sub.join("a.ndjson");
+        let f = std::sync::Arc::new(ReopenableFile::open(&path).unwrap());
+        let mut w = FileWriter(std::sync::Arc::clone(&f));
+        w.write_all(b"a\n").unwrap();
+        let moved = tmp.path().join("moved");
+        std::fs::rename(&path, &moved).unwrap();
+        std::fs::remove_dir(&sub).unwrap();
+        assert!(f.reopen().is_err());
+        w.write_all(b"b\n").unwrap();
+        assert_eq!(read(&moved), "a\nb\n");
+    }
+
+    #[test]
+    fn the_record_says_never_until_a_reopen_succeeds() {
+        let rec = ReopenRecord::new();
+        assert_eq!(rec.seconds_since_last_success(), None);
+        assert_eq!(rec.last_success_unix(), None);
+        assert_eq!(rec.successes(), 0);
+        assert_eq!(rec.seconds_since_last_failure(), None);
+        rec.record_success();
+        assert_eq!(rec.seconds_since_last_success(), Some(0));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(now.abs_diff(rec.last_success_unix().unwrap()) <= 5);
+        rec.record_failure();
+        assert_eq!(rec.failures(), 1);
+        assert_eq!(rec.seconds_since_last_failure(), Some(0));
+    }
+
+    #[test]
+    fn reopen_with_no_log_file_says_so() {
+        let rec = ReopenRecord::new();
+        assert!(matches!(reopen_in(None, &rec), Reopened::NoFile));
+        assert_eq!(rec.successes(), 0);
+        assert_eq!(rec.failures(), 0);
+    }
+
+    #[test]
+    fn newest_rotated_picks_the_highest_stamp_and_prefers_the_plain_twin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let live = tmp.path().join("a.ndjson");
+        for n in [
+            "a.ndjson",
+            "a.ndjson.1",
+            "a.ndjson-2026102600.gz",
+            "a.ndjson-2026102601.gz",
+            "a.ndjson-2026102601",
+            "a.ndjson-short.gz",
+            "other.ndjson-2026102609.gz",
+        ] {
+            std::fs::write(tmp.path().join(n), b"").unwrap();
+        }
+        assert_eq!(
+            newest_rotated(&live),
+            Some(tmp.path().join("a.ndjson-2026102601"))
+        );
+        std::fs::remove_file(tmp.path().join("a.ndjson-2026102601")).unwrap();
+        assert_eq!(
+            newest_rotated(&live),
+            Some(tmp.path().join("a.ndjson-2026102601.gz"))
+        );
+        assert_eq!(newest_rotated(&tmp.path().join("none.log")), None);
+    }
+
+    #[test]
+    fn read_tail_reads_plain_and_gzip_and_keeps_only_the_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let text: String = (0..1000).map(|i| format!("{i:04}\n")).collect();
+        let plain = tmp.path().join("p");
+        std::fs::write(&plain, &text).unwrap();
+        let gz = tmp.path().join("g.gz");
+        let mut enc = flate2::write::GzEncoder::new(
+            std::fs::File::create(&gz).unwrap(),
+            flate2::Compression::default(),
+        );
+        enc.write_all(text.as_bytes()).unwrap();
+        enc.finish().unwrap();
+        assert_eq!(read_tail(&plain, 1 << 20).unwrap(), text);
+        assert_eq!(read_tail(&gz, 1 << 20).unwrap(), text);
+        let tail = read_tail(&gz, 50).unwrap();
+        assert_eq!(tail, &text[text.len() - 50..]);
+        // Cut short: what decoded is kept.
+        let bytes = std::fs::read(&gz).unwrap();
+        std::fs::write(&gz, &bytes[..bytes.len() / 2]).unwrap();
+        assert!(!read_tail(&gz, 1 << 20).unwrap().is_empty());
+    }
+
+    fn gz_bytes(text: &[u8]) -> Vec<u8> {
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(text).unwrap();
+        enc.finish().unwrap()
+    }
+
+    fn long_ago() -> std::time::SystemTime {
+        std::time::UNIX_EPOCH
+    }
+
+    #[test]
+    fn read_recent_joins_the_rotated_tail_before_the_live_tail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let live = tmp.path().join("a.ndjson");
+        std::fs::write(&live, "live\n").unwrap();
+        assert_eq!(read_recent(&live, 1 << 20, long_ago()).unwrap(), "live\n");
+        // A rotated file cut mid-record still ends its own line.
+        std::fs::write(tmp.path().join("a.ndjson-2026102601"), "old\nhal").unwrap();
+        assert_eq!(
+            read_recent(&live, 1 << 20, long_ago()).unwrap(),
+            "old\nhal\nlive\n"
+        );
+        assert_eq!(
+            read_recent(&live, 6, long_ago()).unwrap(),
+            "ld\nhal\nlive\n"
+        );
+    }
+
+    #[test]
+    fn a_full_live_tail_means_the_rotated_file_is_not_opened() {
+        let tmp = tempfile::tempdir().unwrap();
+        let live = tmp.path().join("a.ndjson");
+        std::fs::write(&live, "0123456789\n").unwrap();
+        std::fs::write(tmp.path().join("a.ndjson-2026102601"), "old\n").unwrap();
+        let (text, stats) = read_recent_counted(&live, 8, long_ago()).unwrap();
+        assert_eq!(text, "3456789\n");
+        assert_eq!(stats, RecentStats::default());
+    }
+
+    #[test]
+    fn an_old_rotated_file_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let live = tmp.path().join("a.ndjson");
+        std::fs::write(&live, "live\n").unwrap();
+        std::fs::write(tmp.path().join("a.ndjson-2026102601"), "old\n").unwrap();
+        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        let (text, stats) = read_recent_counted(&live, 1 << 20, future).unwrap();
+        assert_eq!(text, "live\n");
+        assert_eq!(stats, RecentStats::default());
+    }
+
+    #[test]
+    fn a_small_recent_rotated_file_is_still_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let live = tmp.path().join("a.ndjson");
+        std::fs::write(&live, "live\n").unwrap();
+        std::fs::write(
+            tmp.path().join("a.ndjson-2026102601.gz"),
+            gz_bytes(b"old\n"),
+        )
+        .unwrap();
+        let since = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let (text, stats) = read_recent_counted(&live, 1 << 20, since).unwrap();
+        assert_eq!(text, "old\nlive\n");
+        assert!(stats.rotated_opened);
+        assert_eq!(stats.rotated_bytes, 4);
+    }
+
+    #[test]
+    fn a_gzip_file_whose_isize_is_over_the_bound_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let live = tmp.path().join("a.ndjson");
+        std::fs::write(&live, "live\n").unwrap();
+        // 200 MB of zeros compresses to about 200 KB.
+        let big = vec![0u8; 200 * 1024 * 1024];
+        let gz = gz_bytes(&big);
+        assert!(gz.len() < 1 << 20);
+        std::fs::write(tmp.path().join("a.ndjson-2026102601.gz"), gz).unwrap();
+        let (text, stats) = read_recent_counted(&live, 1 << 20, long_ago()).unwrap();
+        assert_eq!(text, "live\n");
+        assert_eq!(stats.rotated_bytes, 0, "nothing was decoded");
+    }
+
+    #[test]
+    fn a_gzip_stream_that_inflates_past_the_bound_stops_at_the_bound() {
+        let tmp = tempfile::tempdir().unwrap();
+        let live = tmp.path().join("a.ndjson");
+        std::fs::write(&live, "live\n").unwrap();
+        // A trailer that understates the size, as a hostile or damaged file can.
+        let mut gz = gz_bytes(&vec![b'x'; 10 * 1024 * 1024]);
+        let n = gz.len();
+        gz[n - 4..].copy_from_slice(&100u32.to_le_bytes());
+        std::fs::write(tmp.path().join("a.ndjson-2026102601.gz"), gz).unwrap();
+        let (text, stats) = read_recent_counted(&live, 1 << 20, long_ago()).unwrap();
+        assert_eq!(text, "live\n", "an over-long stream is discarded");
+        assert!(stats.rotated_bytes <= (1 << 20) + 1);
+    }
+
+    #[test]
+    fn a_huge_plain_rotated_file_costs_at_most_the_bound() {
+        let tmp = tempfile::tempdir().unwrap();
+        let live = tmp.path().join("a.ndjson");
+        std::fs::write(&live, "live\n").unwrap();
+        let f = std::fs::File::create(tmp.path().join("a.ndjson-2026102601")).unwrap();
+        f.set_len(200 * 1024 * 1024).unwrap();
+        let (_, stats) = read_recent_counted(&live, 1 << 20, long_ago()).unwrap();
+        assert_eq!(stats.rotated_bytes, 1 << 20);
+    }
+
+    #[test]
+    fn the_reopen_path_is_absolute() {
+        let tmp = tempfile::tempdir().unwrap();
+        let abs = tmp.path().join("a.ndjson");
+        let f = ReopenableFile::open(&abs).unwrap();
+        assert!(f.path.is_absolute());
+        // A relative path is made absolute against the working directory,
+        // which the test does not change, so use a name that exists nowhere.
+        let rel = Path::new("m6-reopen-test-relative.ndjson");
+        let g = ReopenableFile::open(rel).unwrap();
+        assert!(g.path.is_absolute());
+        drop(g);
+        let _ = std::fs::remove_file(std::env::current_dir().unwrap().join(rel));
     }
 }

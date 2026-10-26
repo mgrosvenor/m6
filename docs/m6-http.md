@@ -173,6 +173,13 @@ No restart needed for any of the above.
 | Signal | First receipt | Second receipt |
 |---|---|---|
 | `SIGTERM` or `SIGINT` | Stop accepting, drain in-flight, exit 0 | Immediate exit |
+| `SIGUSR1` | Reopen the analytics log file | Same again, and never a step toward exit |
+
+Rotate the analytics file by renaming it and sending `SIGUSR1`.
+The process creates the file at its path again, and the path reappearing means the renamed file is finished.
+If the reopen fails, the process keeps writing to the previous file and logs an error.
+`/perf` reports the last reopen under `logging.reopen`.
+`/traffic` also reads the newest rotated file next to the log (`<name>-YYYYmmddHH`, plain or `.gz`), so its window spans a rotation.
 
 ---
 

@@ -46,6 +46,13 @@ pub struct Thresholds {
     /// inside the 180 seconds. The time is the last SUCCESSFUL handshake, so it
     /// is the slow signal and the probe is the fast one.
     pub tunnel_handshake_age_s: u64,
+    /// Seconds since a node last reopened its log file above which the monitor
+    /// reports a fault. Read from `[monitor] log_reopen_max_age_s`.
+    ///
+    /// `None` means no limit: the age is shown and never judged. There is no
+    /// default, because analytics logging is on by default and a deployment
+    /// that does not rotate would otherwise fault two hours after every start.
+    pub log_reopen_age_s: Option<u64>,
 }
 
 /// The default for `Thresholds::tunnel_handshake_age_s`, in seconds.
@@ -60,6 +67,7 @@ impl Default for Thresholds {
             thermal_celsius: 80.0,
             cert_expiry_days: 21,
             tunnel_handshake_age_s: DEFAULT_TUNNEL_HANDSHAKE_AGE_S,
+            log_reopen_age_s: None,
         }
     }
 }
@@ -172,6 +180,54 @@ pub struct NodeDigest {
     pub perf_error: Option<String>,
     /// The WireGuard tunnel from the monitor host to this node, if configured.
     pub tunnel: Option<TunnelDigest>,
+    /// When the node last reopened its log file, from `/perf`.
+    pub log_reopen: LogReopenDigest,
+}
+
+/// When a node last reopened its log file, as figures and a state.
+///
+/// `state` is `ok` when it has reopened since start, `never` when it has not,
+/// `no_log_file` when the process writes none and `unknown` when the node did
+/// not say, with `detail` giving the reason.
+#[derive(Debug, Clone, Serialize)]
+pub struct LogReopenDigest {
+    pub state: &'static str,
+    pub age_s: Option<u64>,
+    pub last_unix: Option<u64>,
+    pub reopens: Option<u64>,
+    pub failures: Option<u64>,
+    pub last_failure_age_s: Option<u64>,
+    pub detail: Option<String>,
+}
+
+impl LogReopenDigest {
+    fn unknown(detail: &str) -> Self {
+        Self {
+            state: "unknown",
+            age_s: None,
+            last_unix: None,
+            reopens: None,
+            failures: None,
+            last_failure_age_s: None,
+            detail: Some(detail.to_string()),
+        }
+    }
+
+    fn from_health(h: &m6_core::monitoring::LogReopenHealth) -> Self {
+        Self {
+            state: if h.seconds_since_last_reopen.is_some() {
+                "ok"
+            } else {
+                "never"
+            },
+            age_s: h.seconds_since_last_reopen,
+            last_unix: h.last_reopen_unix,
+            reopens: Some(h.reopens_total),
+            failures: Some(h.failures_total),
+            last_failure_age_s: h.seconds_since_last_failure,
+            detail: None,
+        }
+    }
 }
 
 /// One node's tunnel, as figures and states.
@@ -310,6 +366,70 @@ fn pct(v: f64) -> String {
     format!("{:.0}%", v * 100.0)
 }
 
+/// The faults for one node's log reopen, when a limit is set.
+fn log_reopen_findings(
+    node: &str,
+    uptime_s: u64,
+    l: &LogReopenDigest,
+    max: u64,
+    findings: &mut Vec<Finding>,
+) {
+    let mut fault = |text: String| {
+        findings.push(Finding {
+            level: Level::Fault,
+            node: node.to_string(),
+            text,
+        });
+    };
+    match l.state {
+        "unknown" => fault(
+            "cannot say when it last reopened its log file: the node is too old to report it"
+                .to_string(),
+        ),
+        "never" if uptime_s > max => fault(format!(
+            "has never reopened its log file in {uptime_s}s since start, over the {max}s limit: \
+             is log rotation installed and signalling it?"
+        )),
+        "ok" if l.age_s.is_some_and(|age| age > max) => fault(format!(
+            "last reopened its log file {}s ago, over the {max}s limit: log rotation has stopped",
+            l.age_s.unwrap_or(0)
+        )),
+        _ => {}
+    }
+    if let Some(f) = l.last_failure_age_s {
+        if l.age_s.is_none_or(|ok| f < ok) {
+            fault(format!(
+                "its last log reopen failed {f}s ago and none has succeeded since, \
+                 so it is still writing to the previous file"
+            ));
+        }
+    }
+}
+
+/// The fault text for a main log that has gone quiet, from `/traffic`, or
+/// `None` while it is emitting.
+///
+/// Section A of the check prints this text and the verdict counts it as a
+/// finding, so both say the same thing.
+pub(crate) fn quiet_log_text(l: &m6_core::monitoring::LoggingHealth) -> Option<String> {
+    match l.seconds_since_last {
+        None => Some("nothing has ever been logged".to_string()),
+        Some(s) if l.is_blind() => Some(format!(
+            "main log silent for {s}s ({} events since start)",
+            l.events_total
+        )),
+        Some(_) => None,
+    }
+}
+
+fn quiet_log_findings(node: &str, l: &m6_core::monitoring::LoggingHealth) -> Option<Finding> {
+    quiet_log_text(l).map(|text| Finding {
+        level: Level::Fault,
+        node: node.to_string(),
+        text,
+    })
+}
+
 pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
     let mut findings = Vec::new();
     let mut nodes = Vec::new();
@@ -348,6 +468,7 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
             cert_not_after_unix: None,
             perf_error: r.perf_error.clone(),
             tunnel: r.tunnel.as_ref().map(tunnel_digest),
+            log_reopen: LogReopenDigest::unknown("no /perf reading"),
         };
 
         // Before the unreachable `continue` below: a node whose HTTPS poll
@@ -469,6 +590,19 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
             d.binary = empty_to_none(&p.build.name);
             d.hash = empty_to_none(&p.build.hash);
             d.uptime_s = Some(p.uptime_s);
+            d.log_reopen = match &p.logging {
+                None => LogReopenDigest::unknown("node too old to report log reopening"),
+                Some(l) => match &l.reopen {
+                    None => LogReopenDigest {
+                        state: "no_log_file",
+                        ..LogReopenDigest::unknown("")
+                    },
+                    Some(h) => LogReopenDigest::from_health(h),
+                },
+            };
+            if let Some(max) = t.log_reopen_age_s {
+                log_reopen_findings(&r.name, p.uptime_s, &d.log_reopen, max, &mut findings);
+            }
             // The soonest expiry in the chain. `min` over an empty list is
             // `None`, which is the answer for a node too old to report the
             // field and is left to say "cannot say" rather than collapsing to
@@ -705,6 +839,10 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
                     r.perf_error.as_deref().unwrap_or("")
                 ),
             });
+        }
+
+        if let Some(t) = &r.traffic {
+            findings.extend(quiet_log_findings(&r.name, &t.logging));
         }
 
         nodes.push(d);
@@ -949,6 +1087,7 @@ pub(crate) mod tests {
 
     pub(crate) fn perf(host: HostSnapshot, pools: Vec<PoolHealth>) -> PerfReport {
         PerfReport {
+            logging: None,
             node: "origin".into(),
             build: m6_core::monitoring::BuildId {
                 name: "m6-http".into(),
@@ -2069,5 +2208,171 @@ pub(crate) mod tests {
         assert_eq!(t["probe"], "connected");
         assert_eq!(t["handshake"], "ok");
         assert_eq!(v["thresholds"]["tunnel_handshake_age_s"], 600);
+    }
+
+    // ── log reopen ───────────────────────────────────────────────────────────
+
+    use m6_core::monitoring::{LogReopenHealth, LoggingHealth};
+
+    fn reopen_health(age: Option<u64>, reopens: u64, failure_age: Option<u64>) -> LogReopenHealth {
+        LogReopenHealth {
+            reopens_total: reopens,
+            failures_total: u64::from(failure_age.is_some()),
+            seconds_since_last_reopen: age,
+            last_reopen_unix: age.map(|a| 1_789_000_000 - a),
+            seconds_since_last_failure: failure_age,
+        }
+    }
+
+    fn with_reopen(uptime_s: u64, logging: Option<Option<LogReopenHealth>>) -> NodeReading {
+        let mut p = perf(plain_host(), vec![]);
+        p.uptime_s = uptime_s;
+        p.logging = logging.map(|reopen| LoggingHealth {
+            events_total: 10,
+            seconds_since_last: Some(1),
+            reopen,
+        });
+        reading("origin", "ok", Some(p))
+    }
+
+    fn limit(max: Option<u64>) -> Thresholds {
+        Thresholds {
+            log_reopen_age_s: max,
+            ..Default::default()
+        }
+    }
+
+    fn reopen_findings(d: &Digest) -> Vec<&Finding> {
+        d.findings
+            .iter()
+            .filter(|f| f.text.contains("reopen"))
+            .collect()
+    }
+
+    #[test]
+    fn a_recent_log_reopen_raises_nothing_and_reports_its_age() {
+        let r = with_reopen(9000, Some(Some(reopen_health(Some(60), 3, None))));
+        let d = build(&[r], &limit(Some(7200)), now());
+        assert!(reopen_findings(&d).is_empty(), "{:?}", d.findings);
+        let l = &d.nodes[0].log_reopen;
+        assert_eq!(l.state, "ok");
+        assert_eq!(l.age_s, Some(60));
+        assert_eq!(l.reopens, Some(3));
+    }
+
+    #[test]
+    fn a_log_reopen_older_than_the_limit_faults() {
+        let over = with_reopen(99_999, Some(Some(reopen_health(Some(7201), 3, None))));
+        let d = build(&[over], &limit(Some(7200)), now());
+        let f = reopen_findings(&d);
+        assert_eq!(f.len(), 1, "{:?}", d.findings);
+        assert_eq!(f[0].level, Level::Fault);
+        assert!(f[0].text.contains("rotation has stopped"), "{}", f[0].text);
+        let at = with_reopen(99_999, Some(Some(reopen_health(Some(7200), 3, None))));
+        let d = build(&[at], &limit(Some(7200)), now());
+        assert!(reopen_findings(&d).is_empty(), "{:?}", d.findings);
+    }
+
+    #[test]
+    fn never_reopened_is_its_own_state_and_faults_only_past_the_limit() {
+        let young = with_reopen(100, Some(Some(reopen_health(None, 0, None))));
+        let d = build(&[young], &limit(Some(7200)), now());
+        assert_eq!(d.nodes[0].log_reopen.state, "never");
+        assert!(reopen_findings(&d).is_empty(), "{:?}", d.findings);
+        let old = with_reopen(7201, Some(Some(reopen_health(None, 0, None))));
+        let d = build(&[old], &limit(Some(7200)), now());
+        let f = reopen_findings(&d);
+        assert_eq!(f.len(), 1, "{:?}", d.findings);
+        assert!(f[0].text.contains("never reopened"), "{}", f[0].text);
+    }
+
+    #[test]
+    fn no_limit_configured_judges_nothing() {
+        let r = with_reopen(99_999, Some(Some(reopen_health(Some(1_000_000), 1, None))));
+        let d = build(&[r], &limit(None), now());
+        assert!(reopen_findings(&d).is_empty(), "{:?}", d.findings);
+        assert_eq!(d.nodes[0].log_reopen.state, "ok");
+        let r = with_reopen(99_999, None);
+        let d = build(&[r], &limit(None), now());
+        assert!(reopen_findings(&d).is_empty(), "{:?}", d.findings);
+    }
+
+    #[test]
+    fn a_node_that_writes_no_log_file_is_not_faulted() {
+        let r = with_reopen(99_999, Some(None));
+        let d = build(&[r], &limit(Some(7200)), now());
+        assert_eq!(d.nodes[0].log_reopen.state, "no_log_file");
+        assert!(reopen_findings(&d).is_empty(), "{:?}", d.findings);
+    }
+
+    #[test]
+    fn a_node_too_old_to_report_reopens_faults_when_a_limit_is_set() {
+        let r = with_reopen(100, None);
+        let d = build(&[r], &limit(Some(7200)), now());
+        assert_eq!(d.nodes[0].log_reopen.state, "unknown");
+        let f = reopen_findings(&d);
+        assert_eq!(f.len(), 1, "{:?}", d.findings);
+        assert!(f[0].text.contains("too old"), "{}", f[0].text);
+        assert_eq!(f[0].level, Level::Fault);
+    }
+
+    #[test]
+    fn a_failed_reopen_newer_than_the_last_success_faults() {
+        let r = with_reopen(99_999, Some(Some(reopen_health(Some(3000), 2, Some(10)))));
+        let d = build(&[r], &limit(Some(7200)), now());
+        let f = reopen_findings(&d);
+        assert_eq!(f.len(), 1, "{:?}", d.findings);
+        assert!(
+            f[0].text.contains("still writing to the previous file"),
+            "{}",
+            f[0].text
+        );
+        // An old failure followed by a success is history, not a fault.
+        let r = with_reopen(99_999, Some(Some(reopen_health(Some(10), 2, Some(3000)))));
+        let d = build(&[r], &limit(Some(7200)), now());
+        assert!(reopen_findings(&d).is_empty(), "{:?}", d.findings);
+    }
+
+    #[test]
+    fn the_json_digest_carries_the_log_reopen_state() {
+        let r = with_reopen(99_999, Some(Some(reopen_health(Some(60), 3, None))));
+        let d = build(&[r], &limit(Some(7200)), now());
+        let v = serde_json::to_value(&d).unwrap();
+        assert_eq!(v["nodes"][0]["log_reopen"]["state"], "ok");
+        assert_eq!(v["nodes"][0]["log_reopen"]["age_s"], 60);
+        assert!(v["nodes"][0]["log_reopen"]["last_unix"].is_u64());
+        assert_eq!(v["thresholds"]["log_reopen_age_s"], 7200);
+    }
+
+    #[test]
+    fn a_silent_main_log_is_a_digest_finding_so_the_verdict_counts_it() {
+        let mut r = reading("origin", "ok", Some(perf(plain_host(), vec![])));
+        let t = m6_core::monitoring::TrafficReport {
+            node: "origin".into(),
+            window_minutes: 60,
+            total_requests: 0,
+            status: Default::default(),
+            notable: vec![],
+            heavy_hitters: vec![],
+            crawlers: vec![],
+            forged_bot_requests: 0,
+            forgers: vec![],
+            probe_noise: vec![],
+            logging: LoggingHealth {
+                events_total: 5000,
+                seconds_since_last: Some(600),
+                reopen: None,
+            },
+            firewall: None,
+        };
+        r.traffic = Some(t);
+        let d = build(&[r], &Thresholds::default(), now());
+        assert!(
+            d.findings
+                .iter()
+                .any(|f| f.level == Level::Fault && f.text.contains("main log silent for 600s")),
+            "{:?}",
+            d.findings
+        );
     }
 }

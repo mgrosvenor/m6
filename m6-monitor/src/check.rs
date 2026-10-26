@@ -20,6 +20,9 @@
 //! it only while that timer runs. A file older than
 //! `tunnel_handshake_max_age_s` is itself a fault.
 //!
+//! Section A also shows each node's last log reopen, and the limit it is
+//! judged against when `log_reopen_max_age_s` is set.
+//!
 //! Exit status is 1 when there are faults, so it works as a cron check.
 
 use std::fmt::Write as _;
@@ -47,22 +50,17 @@ pub fn render(d: &Digest, readings: &[NodeReading]) -> String {
         match (&r.traffic, &r.traffic_error) {
             (Some(t), _) => {
                 let l = &t.logging;
-                match l.seconds_since_last {
+                match crate::digest::quiet_log_text(l) {
+                    Some(fault) => {
+                        let _ = writeln!(o, "  {:<5} FAULT  {fault}", r.name);
+                    }
                     None => {
-                        let _ = writeln!(o, "  {:<5} FAULT  nothing has ever been logged", r.name);
-                    }
-                    Some(s) if l.is_blind() => {
-                        let _ = writeln!(
-                            o,
-                            "  {:<5} FAULT  main log silent for {}s ({} events since start)",
-                            r.name, s, l.events_total
-                        );
-                    }
-                    Some(s) => {
                         let _ = writeln!(
                             o,
                             "  {:<5} ok     last event {}s ago, {} since start",
-                            r.name, s, l.events_total
+                            r.name,
+                            l.seconds_since_last.unwrap_or(0),
+                            l.events_total
                         );
                     }
                 }
@@ -78,6 +76,61 @@ pub fn render(d: &Digest, readings: &[NodeReading]) -> String {
                     r.unreachable
                         .as_deref()
                         .unwrap_or("no traffic summary and no reason given")
+                );
+            }
+        }
+    }
+
+    match d.thresholds.log_reopen_age_s {
+        Some(max) => {
+            let _ = writeln!(
+                o,
+                "  log file reopen (rotation renames the file and signals): limit {max}s"
+            );
+        }
+        None => {
+            let _ = writeln!(
+                o,
+                "  log file reopen (rotation renames the file and signals): \
+                 no limit configured, shown and not judged"
+            );
+        }
+    }
+    for n in &d.nodes {
+        let l = &n.log_reopen;
+        let uptime = n
+            .uptime_s
+            .map_or_else(|| "-".to_string(), |u| u.to_string());
+        match l.state {
+            "ok" => {
+                let _ = write!(
+                    o,
+                    "  {:<5} reopened {}s ago, {} since start",
+                    n.name,
+                    l.age_s.unwrap_or(0),
+                    l.reopens.unwrap_or(0)
+                );
+                if l.failures.unwrap_or(0) > 0 {
+                    let _ = write!(o, ", {} failed", l.failures.unwrap_or(0));
+                }
+                let _ = writeln!(o);
+            }
+            "never" => {
+                let _ = writeln!(
+                    o,
+                    "  {:<5} never reopened since start (up {uptime}s)",
+                    n.name
+                );
+            }
+            "no_log_file" => {
+                let _ = writeln!(o, "  {:<5} writes no log file", n.name);
+            }
+            _ => {
+                let _ = writeln!(
+                    o,
+                    "  {:<5} unknown  {}",
+                    n.name,
+                    l.detail.as_deref().unwrap_or("")
                 );
             }
         }
@@ -754,6 +807,7 @@ mod tests {
         let mut t = traffic(LoggingHealth {
             events_total: 100,
             seconds_since_last: Some(1),
+            reopen: None,
         });
         t.notable = vec![probing_client("203.0.113.9", &["curl/8.4.0"], 1)];
         let out = render_for_test(t);
@@ -779,6 +833,7 @@ mod tests {
         let mut t = traffic(LoggingHealth {
             events_total: 100,
             seconds_since_last: Some(1),
+            reopen: None,
         });
         t.notable = vec![probing_client(
             "203.0.113.41",
@@ -812,6 +867,7 @@ mod tests {
         let mut t = traffic(LoggingHealth {
             events_total: 100,
             seconds_since_last: Some(1),
+            reopen: None,
         });
         t.notable = vec![probing_client("203.0.113.50", &[""], 1)];
         let out = render_for_test(t);
@@ -876,6 +932,7 @@ mod tests {
         let quiet = traffic(LoggingHealth {
             events_total: 5000,
             seconds_since_last: Some(600),
+            reopen: None,
         });
         let out = render(&digest(), &[reading("origin", Some(quiet))]);
         assert!(out.contains("FAULT  main log silent for 600s"), "{out}");
@@ -886,6 +943,7 @@ mod tests {
         let alive = traffic(LoggingHealth {
             events_total: 5000,
             seconds_since_last: Some(4),
+            reopen: None,
         });
         let out = render(&digest(), &[reading("origin", Some(alive))]);
         assert!(out.contains("ok     last event 4s ago"), "{out}");
@@ -897,6 +955,7 @@ mod tests {
         let never = traffic(LoggingHealth {
             events_total: 0,
             seconds_since_last: None,
+            reopen: None,
         });
         let out = render(&digest(), &[reading("origin", Some(never))]);
         assert!(out.contains("nothing has ever been logged"), "{out}");
@@ -923,6 +982,7 @@ mod tests {
                 Some(traffic(LoggingHealth {
                     events_total: 1,
                     seconds_since_last: Some(1),
+                    reopen: None,
                 })),
             )],
         );
@@ -1109,5 +1169,95 @@ mod tunnel_tests {
         r.perf = Some(crate::digest::tests::perf(host, vec![]));
         let o = out(&[r]);
         assert!(o.contains("wg0 drops rx 3 tx 4"), "{o}");
+    }
+
+    // ── log reopen ───────────────────────────────────────────────────────────
+
+    use m6_core::monitoring::{LogReopenHealth, LoggingHealth, PerfReport};
+
+    /// A node whose `/perf` carries `reopen`, with the given uptime.
+    fn reopen_reading(uptime_s: u64, reopen: Option<LogReopenHealth>) -> NodeReading {
+        let mut r = reading("origin", None);
+        r.health = Some(m6_core::monitoring::HealthReport {
+            status: "ok".into(),
+            node: "origin".into(),
+        });
+        r.health_status = Some(200);
+        let mut p: PerfReport = crate::digest::tests::perf(
+            m6_core::host::HostSnapshot {
+                cpus: 1,
+                ..Default::default()
+            },
+            vec![],
+        );
+        p.uptime_s = uptime_s;
+        p.logging = Some(LoggingHealth {
+            events_total: 10,
+            seconds_since_last: Some(1),
+            reopen,
+        });
+        r.perf = Some(p);
+        r
+    }
+
+    fn render_reopen(r: NodeReading, max: Option<u64>) -> String {
+        let d = crate::digest::build(
+            std::slice::from_ref(&r),
+            &crate::digest::Thresholds {
+                log_reopen_age_s: max,
+                ..Default::default()
+            },
+            "now".into(),
+        );
+        render(&d, std::slice::from_ref(&r))
+    }
+
+    fn health(age: Option<u64>, reopens: u64) -> LogReopenHealth {
+        LogReopenHealth {
+            reopens_total: reopens,
+            failures_total: 0,
+            seconds_since_last_reopen: age,
+            last_reopen_unix: age.map(|a| 1_789_000_000 - a),
+            seconds_since_last_failure: None,
+        }
+    }
+
+    #[test]
+    fn section_a_shows_each_nodes_last_log_reopen_age() {
+        let o = render_reopen(reopen_reading(9000, Some(health(Some(60), 3))), Some(7200));
+        assert!(o.contains("reopened 60s ago, 3 since start"), "{o}");
+        assert!(o.contains("limit 7200s"), "{o}");
+    }
+
+    #[test]
+    fn section_a_says_never_reopened_since_start_distinctly() {
+        let o = render_reopen(reopen_reading(100, Some(health(None, 0))), Some(7200));
+        assert!(o.contains("never reopened since start (up 100s)"), "{o}");
+    }
+
+    #[test]
+    fn a_stale_log_reopen_removes_all_clear() {
+        let o = render_reopen(
+            reopen_reading(99_999, Some(health(Some(7300), 3))),
+            Some(7200),
+        );
+        assert!(!o.contains("ALL CLEAR"), "{o}");
+        assert!(o.contains("FAULTS (1)"), "{o}");
+        assert!(
+            o.contains("- origin: last reopened its log file 7300s ago"),
+            "{o}"
+        );
+    }
+
+    #[test]
+    fn section_a_says_when_no_limit_is_configured() {
+        let o = render_reopen(reopen_reading(9000, Some(health(Some(60), 3))), None);
+        assert!(o.contains("no limit configured"), "{o}");
+    }
+
+    #[test]
+    fn section_a_says_a_node_writes_no_log_file() {
+        let o = render_reopen(reopen_reading(9000, None), None);
+        assert!(o.contains("writes no log file"), "{o}");
     }
 }

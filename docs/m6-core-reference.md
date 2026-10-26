@@ -90,7 +90,7 @@ Thirty-seven modules. Grouped by what you would be doing when you reach for one.
 | `app` | The `App` builder, routing, the thread pool, the request dictionary, the service lifecycle. The largest module at ~2,700 lines. |
 | `config` | `RendererConfig` and the TOML that produces it. |
 | `server` | `UnixServer` and `serve_connection`, the socket-backend loop. |
-| `signal` | `block()`, `Service`, `ShutdownHandle`. Signal-safe shutdown. |
+| `signal` | `block()`, `Service`, `ShutdownHandle`. Signal-safe shutdown, and SIGUSR1 to reopen the log file. |
 | `render` | The `Renderer` and `RendererFactory` traits, plus `NoTemplates`. The only thing the loop needs from a template engine. |
 | `template` | The Tera implementation of those traits, and the site filters. Feature `templates`. |
 | `watcher` | `ConfigWatcher`, inotify on Linux and kqueue on the BSDs. |
@@ -288,6 +288,14 @@ signal it sent as a clean stop.
 the handler; it asserts the mask is set and refuses to start otherwise.
 `complete()`, `is_shutdown()` and `wait()` are the lifecycle; `is_shutdown()` is
 also re-exported from `app`.
+
+`REOPEN_SIGNAL` is SIGUSR1.
+`block()` blocks it with SIGTERM and SIGINT, and the signal thread handles it before it counts a shutdown signal, so a reopen is never a step toward a forced exit.
+The thread calls `log::reopen_log_file()` and logs what happened.
+The reopen opens the new file while holding the lock the log writer takes for every line.
+So once the path exists again no further line can reach the renamed file.
+If the open fails, the old handle stays in place, the process keeps writing to the previous file and an error is logged.
+SIGHUP stays free for a future configuration reload.
 
 ### `render` and `template`
 
@@ -578,6 +586,11 @@ return a `LogHandle`, whose `reload(format, level)` re-reads on config change.
 `seconds_since_last()` answers "has anything been logged recently", which is how
 a silent log becomes a fault rather than a zero.
 
+`reopen_log_file() -> Reopened` reopens the analytics file at the absolute path it was opened with.
+`reopens() -> &'static ReopenRecord` answers how many reopens succeeded and failed, and how long ago the last of each was.
+`writes_log_file()` says whether this process has a file to reopen.
+`newest_rotated(live)` and `read_tail(path, max_bytes)` find and read the newest rotated sibling of a log file, plain or gzip.
+
 ### `telemetry`
 
 The write side had no struct: `m6-http` emits analytics with
@@ -633,6 +646,11 @@ the entire point of having edges.
 certificate has left, from `tls::loaded()`. It is `serde(default)`, so a node
 older than the field stays parseable to an aggregator rather than making the
 whole payload unreadable, which is the treatment `build` already gets.
+
+`PerfReport.logging` carries `LoggingHealth`, which is also on `/traffic`.
+Its `reopen` field is a `LogReopenHealth`: reopens and failures since start, the age of the last reopen, its unix time and the age of the last failure.
+`reopen` is `None` for a process that writes no log file, and `seconds_since_last_reopen` is `None` until the first reopen.
+Both are `serde(default)`, so a node older than the fields still parses.
 
 `TrafficReport::build(node, ndjson, since, window_minutes)` is the `/traffic`
 endpoint: the node does the analysis and the log stays put. `LoggingHealth::read()`

@@ -161,6 +161,7 @@ fn collect_from(
     }
     let thresholds = digest::Thresholds {
         tunnel_handshake_age_s: fleet.tunnel_handshake_max_age_s,
+        log_reopen_age_s: fleet.log_reopen_max_age_s,
         ..Default::default()
     };
     let d = digest::build(&readings, &thresholds, now_iso8601());
