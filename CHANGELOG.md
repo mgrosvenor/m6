@@ -54,6 +54,29 @@ workspace tests pass with 0 failures, h3 and QUIC included.
 
 ### Added
 
+**m6-core has an opt-in `sqlite` feature (#227).**
+A service that wants one SQLite file can enable `sqlite` on m6-core and link nothing else, because the feature re-exports `rusqlite` in the prelude.
+`m6_core::sqlite::open(path)` opens the file with `journal_mode=DELETE`, a 5 second `busy_timeout`, `foreign_keys` on and `recursive_triggers` on, and returns an error if a setting does not take effect.
+`OpenOptions` changes the busy timeout, the journal mode and foreign keys.
+`migrate` applies a numbered list of migrations and keeps the version in `PRAGMA user_version`.
+Each migration runs in its own `BEGIN IMMEDIATE` transaction, so connections that open at once apply each one once, and a failing migration rolls back.
+A file newer than the migration list is refused with `NewerThanCode`.
+`append_only(&conn, table)` adds triggers that refuse UPDATE and DELETE on a named table, and `is_append_only` reports them.
+`used_bytes` and `prune_oldest` keep a table that is not append-only under a size cap.
+
+Services each opened SQLite their own way, with their own settings and their own schema bookkeeping.
+These are now made once, in m6-core.
+The feature is off by default.
+`cargo tree -p m6-http` shows no rusqlite, and `Cargo.lock` gains one line, `"rusqlite"` under m6-core.
+Nothing in the workspace turns the feature on, so `cargo test --workspace` never builds it.
+CI therefore has a step that builds and tests it by name, and `tools/clippy.sh` has a second pass that lints it.
+
+Verified: `cargo test -p m6-core --lib --features sqlite` passes 410 tests with 0 failures, including 27 in the `sqlite` module that run against real files.
+The doctests pass with the feature on.
+`cargo test -p m6-core --features sqlite,testkit` builds with no warnings and passes.
+`cargo build --workspace --release`, `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `./tools/clippy.sh` and `cargo test --workspace` all pass with no warnings.
+This was run on unit and file-backed tests only, and no request-path code changed.
+
 **m6-monitor reports each node's tunnel round trip and WireGuard handshake age
 (#226).**
 For each node that has a `tunnel` configured, the monitor host times up to three TCP connects to the node's tunnel address and reads the age of that peer's latest WireGuard handshake.
