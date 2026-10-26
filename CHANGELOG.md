@@ -29,6 +29,51 @@ no `Cargo.toml` requirement moved.
 Verified: `cargo deny check` passes, and the release build has no warnings. The
 workspace tests pass with 0 failures, h3 and QUIC included.
 
+### Added
+
+**m6-monitor reports each node's tunnel round trip and WireGuard handshake age
+(#226).** For each node that has a `tunnel` configured, the monitor host times
+a TCP connect to the node's tunnel address (three connects, the minimum shown
+with the sample count) and reads the age of that peer's latest WireGuard
+handshake. Both appear in `/check` section H, in `/digest` as `nodes[].tunnel`
+(`rtt_ms`, `rtt_samples_ms`, `handshake_age_s`, `handshake_file_age_s`, with
+`thresholds.tunnel_handshake_age_s`), and as a tunnel column on the HTML page.
+Section H also prints `wg` interface drops from a node's `/perf` `host.net`
+when it reports them.
+
+The round trip is a TCP connect rather than ICMP, because ICMP needs
+`CAP_NET_RAW`; a reset still measures the path. The handshake is read from a
+file because `wg show` needs `CAP_NET_ADMIN`: a privileged timer writes the
+output of `wg show <interface> latest-handshakes` to the file, and m6-monitor
+reads it as data. `wg show <interface> dump` must not be used, because it
+carries the interface private key. A handshake time is the last successful one,
+so the age is the slow signal and the probe is the fast one.
+
+Every tunnel finding is a Fault: no answer, never handshaken, peer absent from
+the interface, handshake older than the limit, and a missing or unreadable
+handshake file. Findings are computed before the unreachable-node case, so a
+node whose HTTP poll failed still reports its tunnel. Probing runs on the
+background poller only; no request handler changed.
+
+Configuration is all optional. `[monitor]` takes `wg_handshakes_file` and
+`tunnel_handshake_max_age_s` (default 600). Each `[[monitor.nodes]]` takes
+`tunnel = { address = "<ip>:<port>", public_key = "<peer public key>" }`, where
+the address must be an IP literal and a port, and a name or a bad value is a
+config error. A node with no tunnel is reported as not configured, never as a
+fault.
+
+**`m6-core::wireguard`**, a new module. `Handshakes::parse_latest_handshakes`,
+`from_file`, `find` and `PeerHandshake` read the `latest-handshakes` output. A
+time of 0 means the peer never completed a handshake, a missing file is
+`Ok(None)`, and a malformed line is an error naming the line.
+`docs/m6-core-reference.md` (component index and module section) and the
+`m6-monitor` row of Table 7 in `docs/m6-architecture.md` describe both.
+
+Verified: `cargo test -p m6-monitor -p m6-core` passes for the wireguard tests
+(7), the m6-monitor unit tests (78) and the m6-monitor integration tests that
+include the loopback tunnel probe, with 0 failures and no warnings. Not run
+locally: conformance and the MSRV build, which CI covers.
+
 ---
 
 ## 1.13.0 — 2026-10-02
