@@ -92,18 +92,11 @@ impl Iface {
     /// the backbone listener here, but that is deployment configuration, not
     /// a property of the protocol, and a future node that exposes h2c
     /// publicly should not be silently labelled internal.
+    ///
+    /// "Private" is [`m6_core::net::is_private_ip`], the one definition. A host
+    /// name is never resolved and is therefore External.
     pub fn for_bind(bind: &str) -> Iface {
-        let host = bind.rsplit_once(':').map(|(h, _)| h).unwrap_or(bind);
-        let host = host.trim_start_matches('[').trim_end_matches(']');
-        let octets: Vec<u8> = host.split('.').filter_map(|o| o.parse().ok()).collect();
-        let private = match octets.as_slice() {
-            [10, ..] => true,
-            [172, b, ..] if (16..=31).contains(b) => true,
-            [192, 168, ..] => true,
-            [127, ..] => true,
-            _ => host.starts_with("fd") || host.starts_with("fc") || host == "::1",
-        };
-        if private {
+        if m6_core::net::bind_ip(bind).is_some_and(m6_core::net::is_private_ip) {
             Iface::Internal
         } else {
             Iface::External
@@ -1033,6 +1026,15 @@ mod channel_tests {
         // 172/8 as private would misclassify real public addresses.
         assert_eq!(Iface::for_bind("172.32.0.1:443"), Iface::External);
         assert_eq!(Iface::for_bind("172.15.0.1:443"), Iface::External);
+        // The wider private set in m6_core::net: link-local, shared (tunnel
+        // backbone) space, IPv6 link-local and IPv4-mapped private addresses.
+        assert_eq!(Iface::for_bind("169.254.1.1:80"), Iface::Internal);
+        assert_eq!(Iface::for_bind("100.64.0.1:80"), Iface::Internal);
+        assert_eq!(Iface::for_bind("[fe80::1]:80"), Iface::Internal);
+        assert_eq!(Iface::for_bind("[::ffff:10.0.0.1]:80"), Iface::Internal);
+        // A host name is never resolved, and one that merely starts with the
+        // letters of a unique-local prefix is not an address.
+        assert_eq!(Iface::for_bind("fdexample.com:80"), Iface::External);
     }
 
     #[test]

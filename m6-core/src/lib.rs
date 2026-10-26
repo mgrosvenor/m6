@@ -16,6 +16,7 @@ pub mod minify;
 pub mod monitoring;
 pub mod ndjson;
 pub mod negotiate;
+pub mod net;
 pub mod parse;
 pub mod path;
 pub mod random;
