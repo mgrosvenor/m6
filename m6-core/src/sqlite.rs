@@ -37,9 +37,18 @@
 //! - A failing migration rolls back, and the file stays at the previous version.
 //! - A file newer than the list is refused with [`SqliteError::NewerThanCode`],
 //!   so an older binary never writes into a schema it does not know.
+//! - A migration may rebuild a table that other tables point at, as SQLite's
+//!   documented procedure does: create the new table, copy the rows, drop the
+//!   old table and rename the new one. SQLite ignores `PRAGMA foreign_keys`
+//!   inside a transaction, so [`migrate`] switches foreign keys off before each
+//!   transaction. Dropping the old table then deletes no child rows. Before the
+//!   commit, [`migrate`] runs `PRAGMA foreign_key_check`. A migration that
+//!   leaves a row pointing at a missing row is rolled back and returns
+//!   [`SqliteError::ForeignKeyCheck`]. When [`migrate`] returns, foreign keys
+//!   are back to the setting they had on entry. The check is skipped when the
+//!   connection was opened with foreign keys off.
 //! - A migration may not contain statements that SQLite refuses or ignores
-//!   inside a transaction (`PRAGMA journal_mode`, `PRAGMA foreign_keys`,
-//!   `VACUUM`).
+//!   inside a transaction (`PRAGMA journal_mode`, `VACUUM`).
 //!
 //! # Append-only tables
 //!
@@ -210,25 +219,48 @@ pub fn migrate(conn: &mut Connection, migrations: &[Migration]) -> Result<u32, S
     if cur > code {
         return Err(SqliteError::NewerThanCode { db: cur, code });
     }
-    for m in migrations.iter().filter(|m| m.version > cur) {
-        let fail = |source| SqliteError::Migration {
-            version: m.version,
-            source,
-        };
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(fail)?;
-        let now: u32 = tx
-            .pragma_query_value(None, "user_version", |r| r.get(0))
-            .map_err(fail)?;
-        if now >= m.version {
-            continue;
+    // PRAGMA foreign_keys is a no-op inside a transaction, so it is switched
+    // off here, outside each one, and put back after the last.
+    let fk_was_on: bool = conn.pragma_query_value(None, "foreign_keys", |r| r.get(0))?;
+    let ran = (|| {
+        for m in migrations.iter().filter(|m| m.version > cur) {
+            let fail = |source| SqliteError::Migration {
+                version: m.version,
+                source,
+            };
+            conn.pragma_update(None, "foreign_keys", false)
+                .map_err(fail)?;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(fail)?;
+            let now: u32 = tx
+                .pragma_query_value(None, "user_version", |r| r.get(0))
+                .map_err(fail)?;
+            if now >= m.version {
+                continue;
+            }
+            tx.execute_batch(m.sql).map_err(fail)?;
+            if fk_was_on {
+                let dangling: Option<String> = tx
+                    .query_row("PRAGMA foreign_key_check", [], |r| r.get(0))
+                    .optional()
+                    .map_err(fail)?;
+                if let Some(table) = dangling {
+                    return Err(SqliteError::ForeignKeyCheck {
+                        version: m.version,
+                        table,
+                    });
+                }
+            }
+            tx.pragma_update(None, "user_version", m.version)
+                .map_err(fail)?;
+            tx.commit().map_err(fail)?;
         }
-        tx.execute_batch(m.sql).map_err(fail)?;
-        tx.pragma_update(None, "user_version", m.version)
-            .map_err(fail)?;
-        tx.commit().map_err(fail)?;
-    }
+        Ok(())
+    })();
+    let restored = conn.pragma_update(None, "foreign_keys", fk_was_on);
+    ran?;
+    restored?;
     schema_version(conn)
 }
 
@@ -342,6 +374,8 @@ pub enum SqliteError {
         #[source]
         source: rusqlite::Error,
     },
+    #[error("migration {version} left rows in {table} that point at missing rows")]
+    ForeignKeyCheck { version: u32, table: String },
     #[error("not a plain table name: {0:?}")]
     BadName(String),
     #[error(transparent)]
@@ -603,6 +637,75 @@ mod tests {
         }
         assert_eq!(schema_version(&c).unwrap(), 3);
         assert!(!table_exists(&c, "a"));
+    }
+
+    // V1
+    #[test]
+    fn a_parent_rebuild_keeps_the_child_rows() {
+        let (_d, path) = db();
+        let mut c = open(&path).unwrap();
+        let m1 = Migration {
+            version: 1,
+            sql: "CREATE TABLE p(id INTEGER PRIMARY KEY, name TEXT); \
+                  CREATE TABLE ch(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) ON DELETE CASCADE); \
+                  INSERT INTO p VALUES (1, 'a'), (2, 'b'); \
+                  INSERT INTO ch VALUES (10, 1), (11, 1), (12, 2);",
+        };
+        let m2 = Migration {
+            version: 2,
+            sql: "CREATE TABLE p_new(id INTEGER PRIMARY KEY, name TEXT NOT NULL DEFAULT ''); \
+                  INSERT INTO p_new SELECT id, name FROM p; \
+                  DROP TABLE p; \
+                  ALTER TABLE p_new RENAME TO p;",
+        };
+        assert_eq!(migrate(&mut c, &[m1, m2]).unwrap(), 2);
+        assert_eq!(count(&c, "SELECT count(*) FROM p"), 2);
+        assert_eq!(count(&c, "SELECT count(*) FROM ch"), 3);
+    }
+
+    // V2
+    #[test]
+    fn a_migration_that_leaves_a_dangling_reference_is_rolled_back() {
+        let (_d, path) = db();
+        let mut c = open(&path).unwrap();
+        let m1 = Migration {
+            version: 1,
+            sql: "CREATE TABLE p(id INTEGER PRIMARY KEY); \
+                  CREATE TABLE ch(pid INTEGER REFERENCES p(id)); \
+                  INSERT INTO p VALUES (1); INSERT INTO ch VALUES (1);",
+        };
+        let m2 = Migration {
+            version: 2,
+            sql: "DELETE FROM p;",
+        };
+        match migrate(&mut c, &[m1, m2]) {
+            Err(SqliteError::ForeignKeyCheck { version: 2, table }) => assert_eq!(table, "ch"),
+            other => panic!("expected ForeignKeyCheck, got {other:?}"),
+        }
+        assert_eq!(schema_version(&c).unwrap(), 1);
+        assert_eq!(count(&c, "SELECT count(*) FROM p"), 1);
+    }
+
+    // V3
+    #[test]
+    fn migrate_leaves_foreign_keys_as_it_found_them() {
+        let (_d, path) = db();
+        let mut c = open(&path).unwrap();
+        migrate(&mut c, &[M1]).unwrap();
+        assert_eq!(pragma_s(&c, "foreign_keys"), "1");
+        let bad = Migration {
+            version: 2,
+            sql: "THIS IS NOT SQL;",
+        };
+        assert!(migrate(&mut c, &[M1, bad]).is_err());
+        assert_eq!(pragma_s(&c, "foreign_keys"), "1");
+        let (_d2, path2) = db();
+        let mut c = OpenOptions::default()
+            .foreign_keys(false)
+            .open(&path2)
+            .unwrap();
+        migrate(&mut c, &[M1]).unwrap();
+        assert_eq!(pragma_s(&c, "foreign_keys"), "0");
     }
 
     // T14
