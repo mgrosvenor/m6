@@ -24,10 +24,11 @@ to decide from a listener's bind address whether it was internal, and three
 things followed from that guess: the statistics label, whether the h2c
 listener believed the client address a cache node forwards, and whether
 the custom error path was served. `[server] internal_binds` now names the
-internal listeners by address, and m6-http refuses an entry that is not in
-a local range (`m6_core::net::is_private_ip`) or is not one of its
-listeners. A TLS `bind` named there is internal too: its statistics say so
-and it may fetch the custom error path.
+internal listener by address, and m6-http refuses an entry that is not in
+a local range (`m6_core::net::is_private_ip`) or is not its `h2c_bind`.
+Only the h2c listener can be internal.
+An entry that equals `bind` is refused, because the TLS and QUIC listener
+faces clients and stays external.
 
 **Migration.** A config with `h2c_bind` must add `internal_binds`, or
 m6-http exits 2 with the line to add. `internal_binds = ["<h2c_bind>"]`

@@ -671,7 +671,7 @@ struct RawSystemToml {
 /// Check `[server] internal_binds` against the listeners and the local ranges.
 ///
 /// Order: the `h2c_bind` migration guard, then each entry in list order for an
-/// IP and port, a local range and a listener. Host names are never resolved.
+/// IP and port, not the TLS bind, a local range and the h2c listener. Host names are never resolved.
 fn validate_internal_binds(
     internal_binds: Option<&[String]>,
     bind: &str,
@@ -689,14 +689,19 @@ fn validate_internal_binds(
                 "config error: [server].internal_binds entry \"{e}\" is not an IP address and port such as \"10.0.0.1:8080\" or \"[fd00::1]:8080\"; names are never resolved"
             );
         };
+        if listener(bind) == Some(sa) && h2c_bind.and_then(listener) != Some(sa) {
+            anyhow::bail!(
+                "config error: [server].internal_binds entry \"{e}\" is [server].bind, the TLS and QUIC listener. Only the h2c_bind listener can be internal, because the TLS and QUIC listener faces clients"
+            );
+        }
         if !m6_core::net::is_private_ip(sa.ip()) {
             anyhow::bail!(
                 "config error: [server].internal_binds entry \"{e}\" is not in a local range; an internal binding must be a loopback, private (RFC 1918), link-local, shared (100.64.0.0/10) or IPv6 unique-local address"
             );
         }
-        if listener(bind) != Some(sa) && h2c_bind.and_then(listener) != Some(sa) {
+        if h2c_bind.and_then(listener) != Some(sa) {
             anyhow::bail!(
-                "config error: [server].internal_binds entry \"{e}\" is not one of this server's listeners; it must equal [server].bind or [server].h2c_bind"
+                "config error: [server].internal_binds entry \"{e}\" is not this server's h2c listener; it must equal [server].h2c_bind"
             );
         }
     }
@@ -1648,9 +1653,11 @@ backend_timeout_secs = 120
     }
 
     #[test]
-    fn a_declared_tls_bind_is_internal() {
-        let cfg = load_with_system_server("internal_binds = [\"127.0.0.1:8443\"]\n").unwrap();
-        assert!(cfg.server.is_internal(&cfg.server.bind));
+    fn an_internal_binding_that_names_the_tls_bind_is_refused() {
+        let e = load_error("internal_binds = [\"127.0.0.1:8443\"]\n");
+        assert!(e.starts_with("config error:"), "{e}");
+        assert!(e.contains("Only the h2c_bind listener can be internal"), "{e}");
+        assert!(e.contains("\"127.0.0.1:8443\""), "{e}");
     }
 
     #[test]
@@ -1674,10 +1681,10 @@ backend_timeout_secs = 120
     }
 
     #[test]
-    fn an_internal_binding_must_name_a_listener() {
+    fn an_internal_binding_must_name_the_h2c_listener() {
         let e = load_error("h2c_bind = \"10.0.0.1:8080\"\ninternal_binds = [\"10.0.0.9:8080\"]\n");
-        assert!(e.contains("is not one of this server's listeners"), "{e}");
-        assert!(e.contains("[server].bind or [server].h2c_bind"), "{e}");
+        assert!(e.contains("is not this server's h2c listener"), "{e}");
+        assert!(e.contains("it must equal [server].h2c_bind"), "{e}");
     }
 
     #[test]

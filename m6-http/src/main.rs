@@ -168,8 +168,9 @@ struct ServerState {
     h2s_pool: H2sTlsClientPool,
     /// Per-IP request throttle — general traffic, ahead of cache/routing.
     rate_limiter: RateLimiter,
-    /// Interface class of the TLS/QUIC listener, and of the h2c listener,
-    /// computed once at startup from `[server] internal_binds`.
+    /// Interface class of the TLS/QUIC listener (always external), and of the
+    /// h2c listener (internal when `[server] internal_binds` names it),
+    /// computed once at startup.
     ///
     /// Precomputed rather than derived per request: classification parses an
     /// address, and this sits on the hot path for every single request.
@@ -910,9 +911,9 @@ fn event_loop(
                         );
                     } // end cache hit
 
-                    let from_internal = state.tls_iface == Iface::Internal;
-                    let mut outcome =
-                        handle_request(req, client_ip, enc_str, state, false, from_internal);
+                    let mut outcome = handle_request(
+                        req, client_ip, enc_str, state, false, /* from_internal */ false,
+                    );
                     if let RequestOutcome::Ready(status, ref mut headers, _, ref backend) = outcome
                     {
                         set_alt_svc(headers, quic_port);
@@ -2059,8 +2060,9 @@ fn handle_h3_request(
         body: req.body,
     };
 
-    let from_internal = state.tls_iface == Iface::Internal;
-    match handle_request(&http_req, &client_ip, enc_str, state, false, from_internal) {
+    match handle_request(
+        &http_req, &client_ip, enc_str, state, false, /* from_internal */ false,
+    ) {
         RequestOutcome::Ready(status, mut resp_headers, body, backend_name) => {
             // Add alt-svc header.
             set_alt_svc(&mut resp_headers, quic_port);
@@ -2380,9 +2382,9 @@ fn handle_request_inner(
     content_encoding: &str,
     state: &mut ServerState,
     is_prefetch: bool,
-    // True when this request arrived on a listener named in [server]
-    // internal_binds, meaning one of our own nodes over the backbone rather than
-    // a public client. Granted by the listener, never by a header, so a public
+    // True when this request arrived on the h2c listener and [server]
+    // internal_binds names it, meaning one of our own nodes over the backbone
+    // rather than a public client. Granted by the listener, never by a header, so a public
     // client cannot claim it. Only the error-path guard reads it.
     from_internal: bool,
 ) -> RequestOutcome {
@@ -4274,23 +4276,21 @@ fn run(args: Vec<String>) -> i32 {
         "m6-http listeners bound"
     );
 
-    // Declared by [server] internal_binds, never inferred from an address.
-    // Without an h2c listener the value is never read. Computed before the
-    // struct literal, which moves `config`.
-    let iface = |b: &str| {
-        if config.server.is_internal(b) {
-            Iface::Internal
-        } else {
-            Iface::External
-        }
-    };
-    let tls_iface = iface(&config.server.bind);
-    let h2c_iface = config
+    // Only the h2c listener can be internal, and only when [server]
+    // internal_binds names it. The TLS and QUIC listener faces clients, so it is
+    // always external. Without an h2c listener the h2c value is never read.
+    // Computed before the struct literal, which moves `config`.
+    let tls_iface = Iface::External;
+    let h2c_iface = if config
         .server
         .h2c_bind
         .as_deref()
-        .map(iface)
-        .unwrap_or(Iface::External);
+        .is_some_and(|b| config.server.is_internal(b))
+    {
+        Iface::Internal
+    } else {
+        Iface::External
+    };
     let mut state = ServerState {
         config,
         system_config_path: cli.system_config.clone(),
