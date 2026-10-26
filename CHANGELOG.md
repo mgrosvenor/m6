@@ -59,6 +59,71 @@ workspace tests pass with 0 failures, h3 and QUIC included.
 
 ### Added
 
+**m6-monitor reports each node's tunnel round trip and WireGuard handshake age
+(#226).**
+For each node that has a `tunnel` configured, the monitor host times up to three TCP connects to the node's tunnel address and reads the age of that peer's latest WireGuard handshake.
+Both appear in `/check` section H, in `/digest` as `nodes[].tunnel` (`rtt_ms`, `rtt_samples_ms`, `probe`, `probe_error`, `handshake`, `handshake_age_s`, `handshake_detail`) and as a tunnel column on the HTML page.
+`/digest` also carries `handshake_file_age_s` once for the monitor, and `thresholds.tunnel_handshake_age_s`.
+Section H prints the `wg` interface drops from a node's `/perf` `host.net` when that node reports them, and only when at least one node has a tunnel.
+
+The round trip is a TCP connect because ICMP needs `CAP_NET_RAW`, which the monitor's unit does not hold.
+A reset from a closed port still measures the path.
+One connect that gets through in a poll means the tunnel answered.
+The outcome is then `connected`, the round trip is the minimum of the connects that got through, and the sample count shows a partial loss.
+Only a poll where no connect gets through is `no_answer`.
+The probe of a node has one deadline of `timeout_ms`.
+Up to three connects run one after another, each given what is left of that time, and a connect that times out ends the probe.
+A dead tunnel therefore costs one `timeout_ms`.
+A poll runs the HTTPS requests first and the probe after them, all on `timeout_ms`, so a node that is down can cost up to four `timeout_ms` in one poll.
+A reading goes stale when one poll takes longer than twice `poll_interval_s`, so keep `timeout_ms` under half of `poll_interval_s`.
+
+The handshake is read from a file because `wg show` needs `CAP_NET_ADMIN`.
+A privileged timer writes the output of `wg show <interface> latest-handshakes` to the file and m6-monitor reads it as data.
+That timer must run for the handshake age to be judged, including under `--check` from cron.
+`wg show <interface> dump` must not be used because it carries the interface private key.
+A handshake time is the last successful one, so the age is the slow signal and the probe is the fast one.
+
+Every tunnel finding is a Fault:
+
+- a probe with no answer
+- a peer that never handshook
+- a peer absent from the interface
+- a handshake older than the limit
+- a handshakes file that is missing or unreadable
+- a handshakes file older than the limit, which is one monitor-level fault naming the file and saying its collector has probably stopped, and the node handshakes then read as unknown
+- a node with a `tunnel` and no `public_key`
+- tunnels configured with no `wg_handshakes_file`, which is one monitor-level fault
+
+Findings are computed before the unreachable-node case, so a node whose HTTP poll failed still reports its tunnel.
+Probing runs on the background poller, and in `--check` in its own process.
+No request handler changed.
+
+Configuration is optional except where a tunnel needs it.
+`[monitor]` takes `wg_handshakes_file`, which any node with a `tunnel` needs, and `tunnel_handshake_max_age_s` (default 600).
+With a tunnel configured, loading the config fails when `tunnel_handshake_max_age_s` is below the top-level `poll_interval_s` plus `timeout_ms` rounded up to whole seconds plus 180.
+The error names all three inputs and the minimum.
+The poller and this check read the same top-level `poll_interval_s` through one function, and a `poll_interval_s` under `[monitor]` is not read.
+WireGuard rekeys every 120 seconds only while traffic flows, and the probe each poll is that traffic.
+The 180 seconds also has to hold the period of the timer that writes the handshakes file.
+The monitor does not know that period, so it must fit inside the 180 seconds.
+Each `[[monitor.nodes]]` takes `tunnel = { address = "<ip>:<port>", public_key = "<peer public key>" }`, where the address must be an IP literal and a port, and a name or a bad value is a config error.
+A node with no tunnel is reported as not configured.
+
+The HTML page escapes node name, role, status, findings and the tunnel column with `m6_core::util::html_escape`.
+That function escapes `&`, `<`, `>` and `"`, and the m6-http error page now calls it in place of a private copy.
+
+**`m6-core::wireguard`**, a new module. `Handshakes::parse_latest_handshakes`,
+`from_file`, `find` and `PeerHandshake` read the `latest-handshakes` output. A
+time of 0 means the peer never completed a handshake, a missing file is
+`Ok(None)`, and a malformed line is an error naming the line.
+`docs/m6-core-reference.md` (component index and module section) and the
+`m6-monitor` row of Table 7 in `docs/m6-architecture.md` describe both.
+
+Verified: `cargo test -p m6-monitor -p m6-core` passes for the wireguard tests
+(7), the m6-monitor unit tests (87) and the m6-monitor integration tests that
+include the loopback tunnel probe, with 0 failures and no warnings. Not run
+locally: conformance and the MSRV build, which CI covers.
+
 **Small APIs can now return the rows for a time range as JSON Lines, a page at a
 time (#225).** Three additions to m6-core. `m6_core::net` has `is_private_ip` and
 `bind_ip`, one definition of a private address. `m6_core::time_range` reads
