@@ -32,35 +32,48 @@ workspace tests pass with 0 failures, h3 and QUIC included.
 ### Added
 
 **m6-monitor reports each node's tunnel round trip and WireGuard handshake age
-(#226).** For each node that has a `tunnel` configured, the monitor host times
-a TCP connect to the node's tunnel address (three connects, the minimum shown
-with the sample count) and reads the age of that peer's latest WireGuard
-handshake. Both appear in `/check` section H, in `/digest` as `nodes[].tunnel`
-(`rtt_ms`, `rtt_samples_ms`, `handshake_age_s`, `handshake_file_age_s`, with
-`thresholds.tunnel_handshake_age_s`), and as a tunnel column on the HTML page.
-Section H also prints `wg` interface drops from a node's `/perf` `host.net`
-when it reports them.
+(#226).**
+For each node that has a `tunnel` configured, the monitor host times three TCP connects to the node's tunnel address and reads the age of that peer's latest WireGuard handshake.
+Both appear in `/check` section H, in `/digest` as `nodes[].tunnel` (`rtt_ms`, `rtt_samples_ms`, `probe`, `probe_error`, `handshake`, `handshake_age_s`, `handshake_detail`) and as a tunnel column on the HTML page.
+`/digest` also carries `handshake_file_age_s` once for the monitor, and `thresholds.tunnel_handshake_age_s`.
+Section H prints the `wg` interface drops from a node's `/perf` `host.net` when that node reports them, and only when at least one node has a tunnel.
 
-The round trip is a TCP connect rather than ICMP, because ICMP needs
-`CAP_NET_RAW`; a reset still measures the path. The handshake is read from a
-file because `wg show` needs `CAP_NET_ADMIN`: a privileged timer writes the
-output of `wg show <interface> latest-handshakes` to the file, and m6-monitor
-reads it as data. `wg show <interface> dump` must not be used, because it
-carries the interface private key. A handshake time is the last successful one,
-so the age is the slow signal and the probe is the fast one.
+The round trip is a TCP connect because ICMP needs `CAP_NET_RAW`, which the monitor's unit does not hold.
+A reset from a closed port still measures the path.
+One connect that gets through in a poll means the tunnel answered.
+The outcome is then `connected`, the round trip is the minimum of the connects that got through, and the sample count shows a partial loss.
+Only a poll where no connect gets through is `no_answer`, so a dead tunnel costs three timeouts.
 
-Every tunnel finding is a Fault: no answer, never handshaken, peer absent from
-the interface, handshake older than the limit, and a missing or unreadable
-handshake file. Findings are computed before the unreachable-node case, so a
-node whose HTTP poll failed still reports its tunnel. Probing runs on the
-background poller only; no request handler changed.
+The handshake is read from a file because `wg show` needs `CAP_NET_ADMIN`.
+A privileged timer writes the output of `wg show <interface> latest-handshakes` to the file and m6-monitor reads it as data.
+That timer must run for the handshake age to be judged, including under `--check` from cron.
+`wg show <interface> dump` must not be used because it carries the interface private key.
+A handshake time is the last successful one, so the age is the slow signal and the probe is the fast one.
 
-Configuration is all optional. `[monitor]` takes `wg_handshakes_file` and
-`tunnel_handshake_max_age_s` (default 600). Each `[[monitor.nodes]]` takes
-`tunnel = { address = "<ip>:<port>", public_key = "<peer public key>" }`, where
-the address must be an IP literal and a port, and a name or a bad value is a
-config error. A node with no tunnel is reported as not configured, never as a
-fault.
+Every tunnel finding is a Fault:
+
+- a probe with no answer
+- a peer that never handshook
+- a peer absent from the interface
+- a handshake older than the limit
+- a handshakes file that is missing or unreadable
+- a handshakes file older than the limit, which is one monitor-level fault naming the file and saying its collector has probably stopped, and the node handshakes then read as unknown
+- a node with a `tunnel` and no `public_key`
+- tunnels configured with no `wg_handshakes_file`, which is one monitor-level fault
+
+Findings are computed before the unreachable-node case, so a node whose HTTP poll failed still reports its tunnel.
+Probing runs on the background poller only and no request handler changed.
+
+Configuration is optional except where a tunnel needs it.
+`[monitor]` takes `wg_handshakes_file`, which any node with a `tunnel` needs, and `tunnel_handshake_max_age_s` (default 600).
+With a tunnel configured, loading the config fails when `tunnel_handshake_max_age_s` is below `poll_interval_s` plus 180.
+The error names both keys and the minimum.
+WireGuard rekeys every 120 seconds only while traffic flows, and the probe each poll is that traffic.
+Each `[[monitor.nodes]]` takes `tunnel = { address = "<ip>:<port>", public_key = "<peer public key>" }`, where the address must be an IP literal and a port, and a name or a bad value is a config error.
+A node with no tunnel is reported as not configured.
+
+The HTML page escapes node name, role, status, findings and the tunnel column with `m6_core::util::html_escape`.
+That function escapes `&`, `<`, `>` and `"`, and the m6-http error page now calls it in place of a private copy.
 
 **`m6-core::wireguard`**, a new module. `Handshakes::parse_latest_handshakes`,
 `from_file`, `find` and `PeerHandshake` read the `latest-handshakes` output. A
