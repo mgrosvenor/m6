@@ -2637,14 +2637,12 @@ fn handle_request_inner(
     // Auth check — only if route has `require`
     if let Some(ref require) = route.require {
         if let Some(ref pk) = state.public_key {
-            let auth_header = m6_core::headers::get(&req.headers[..], "authorization");
-            let cookie_header_owned = auth::combined_cookie_header(&req.headers);
-            let cookie_header = cookie_header_owned.as_deref();
-            let accept_header = m6_core::headers::get(&req.headers[..], "accept");
-
-            match auth::extract_token(auth_header, cookie_header) {
-                None => {
+            match auth::authorise(pk, &req.headers, require) {
+                Err(auth::Refusal::NoToken) => {
                     warn!(path = %req.path, "auth: no token");
+                    let cookie_header_owned = auth::combined_cookie_header(&req.headers);
+                    let cookie_header = cookie_header_owned.as_deref();
+                    let accept_header = m6_core::headers::get(&req.headers[..], "accept");
                     if auth::is_browser_request(accept_header) {
                         let refresh = auth::extract_refresh_cookie(cookie_header);
                         let redirect_url = if refresh.is_some() {
@@ -2666,38 +2664,33 @@ fn handle_request_inner(
                     let (s, h, b, n) = apply_error_mode(401, req, client_ip, state, Some(&ctx));
                     return RequestOutcome::Ready(s, h, b, n);
                 }
-                Some(token) => match pk.verify(token) {
-                    Err(e) => {
-                        warn!(path = %req.path, error = %e, "auth: token verification failed");
-                        let ctx = error::ErrorContext {
-                            route: Some(route.path.clone()),
-                            backend: Some(route.backend.clone()),
-                            detail: Some(e.to_string()),
-                        };
-                        let (s, h, b, n) = apply_error_mode(401, req, client_ip, state, Some(&ctx));
-                        return RequestOutcome::Ready(s, h, b, n);
-                    }
-                    Ok(claims) => {
-                        if !auth::check_require(&claims, require) {
-                            warn!(
-                                path = %req.path,
-                                require = %require,
-                                "auth: insufficient claims"
-                            );
-                            let ctx = error::ErrorContext {
-                                route: Some(route.path.clone()),
-                                backend: Some(route.backend.clone()),
-                                detail: Some(format!("requires: {require}")),
-                            };
-                            let (s, h, b, n) =
-                                apply_error_mode(403, req, client_ip, state, Some(&ctx));
-                            return RequestOutcome::Ready(s, h, b, n);
-                        }
-                        // Forward verified claims to backend as X-Auth-Claims header
-                        // (base64-encoded JSON so renderers can inspect them).
-                        verified_claims = Some(claims);
-                    }
-                },
+                Err(auth::Refusal::Invalid(e)) => {
+                    warn!(path = %req.path, error = %e, "auth: token verification failed");
+                    let ctx = error::ErrorContext {
+                        route: Some(route.path.clone()),
+                        backend: Some(route.backend.clone()),
+                        detail: Some(e.to_string()),
+                    };
+                    let (s, h, b, n) = apply_error_mode(401, req, client_ip, state, Some(&ctx));
+                    return RequestOutcome::Ready(s, h, b, n);
+                }
+                Err(auth::Refusal::Insufficient) => {
+                    warn!(
+                        path = %req.path,
+                        require = %require,
+                        "auth: insufficient claims"
+                    );
+                    let ctx = error::ErrorContext {
+                        route: Some(route.path.clone()),
+                        backend: Some(route.backend.clone()),
+                        detail: Some(format!("requires: {require}")),
+                    };
+                    let (s, h, b, n) = apply_error_mode(403, req, client_ip, state, Some(&ctx));
+                    return RequestOutcome::Ready(s, h, b, n);
+                }
+                // Forward verified claims to backend as X-Auth-Claims header
+                // (base64-encoded JSON so renderers can inspect them).
+                Ok(claims) => verified_claims = Some(claims),
             }
         }
     }
