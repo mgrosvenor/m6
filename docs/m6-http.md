@@ -203,7 +203,9 @@ internal_binds = ["127.0.0.1:8080"]
 
 The H2C listener accepts plain TCP connections and speaks HTTP/2 framing directly (no TLS record layer). The request is then routed and handled identically to a TLS request.
 
-The listener is internal, and trusts the `X-Forwarded-For` a cache node sends, only when `[server] internal_binds` names it. m6-http refuses to start with `h2c_bind` set and `internal_binds` absent. `internal_binds = []` declares the listener public.
+The listener is internal, and trusts the `X-Forwarded-For` a cache node sends, only when `[server] internal_binds` names it.
+m6-http refuses to start with `h2c_bind` set and `internal_binds` absent.
+`internal_binds = []` declares the listener public.
 
 **Outbound H2C** — use the `h2c://` scheme in a backend URL:
 

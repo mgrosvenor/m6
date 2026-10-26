@@ -281,7 +281,16 @@ With `[server]` in the system config and credentials in secrets files, `site.tom
 
 TLS cert and key watched via inotify — reloaded on change without restart.
 
-An internal listener is one that `internal_binds` names. m6-http never infers it from an address. On an internal listener the statistics channel is labelled `internal`, and the custom error path is served to the caller. On an internal `h2c_bind` listener m6-http also believes the client address in the `X-Forwarded-For` that a cache node sends, so each visitor behind a cache node keeps their own rate limit. Only the h2c listener can be internal, so an entry that equals `bind` is refused. Every entry must be in a local range, which means loopback, private (RFC 1918), link-local, shared (100.64.0.0/10) or IPv6 unique-local. Host names are never resolved and a wildcard address such as `0.0.0.0` is refused. The list is read at startup, so a change needs a restart. The system config wins, and its list replaces the one in `site.toml` as a whole. A redirect-mode config ignores the key.
+An internal listener is one that `internal_binds` names.
+m6-http never infers it from an address.
+On an internal listener the statistics channel is labelled `internal`, and the custom error path is served to the caller.
+On an internal `h2c_bind` listener m6-http also believes the client address in the `X-Forwarded-For` that a cache node sends, so each visitor behind a cache node keeps their own rate limit.
+Only the h2c listener can be internal, so an entry that equals `bind` is refused.
+Every entry must be in a local range, which means loopback, private (RFC 1918), link-local, shared (100.64.0.0/10) or IPv6 unique-local.
+Host names are never resolved and a wildcard address such as `0.0.0.0` is refused.
+The list is read at startup, so a change needs a restart.
+The system config wins, and its list replaces the one in `site.toml` as a whole.
+A redirect-mode config ignores the key.
 
 ```toml
 [server]
