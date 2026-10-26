@@ -394,29 +394,118 @@ pub fn read_tail(path: &Path, max_bytes: usize) -> std::io::Result<String> {
     Ok(into_text(out))
 }
 
-/// The recent end of a log file across its last rotation, as text.
+/// What [`read_recent_counted`] did with the rotated file.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct RecentStats {
+    /// Whether the rotated file was opened.
+    pub rotated_opened: bool,
+    /// Bytes taken from the rotated file: file bytes for a plain file, decoded bytes for a gzip file.
+    pub rotated_bytes: u64,
+}
+
+/// Append the tail of a rotated file, doing a bounded amount of work.
 ///
-/// The tail of the newest rotated sibling (see [`newest_rotated`]) comes first,
-/// then the tail of the live file, each at most `max_bytes`.
-/// Right after a rotation the live file holds only minutes, so a reader of a
-/// time window needs both.
-/// A rotated file that cannot be read costs that history and nothing else.
-/// A first line, or the first line after the join, that starts mid-record is
-/// expected and is the caller's to skip.
-pub fn read_recent(live: &Path, max_bytes: usize) -> std::io::Result<String> {
-    let mut out = Vec::new();
-    if let Some(rotated) = newest_rotated(live) {
-        if append_tail(&rotated, max_bytes, &mut out).is_err() {
-            out.clear();
+/// A plain file is read from a seek, so at most `max_bytes` are read.
+/// A gzip file cannot seek, so it is read only when it is cheap.
+/// Its size on disk and the uncompressed size in its trailer (ISIZE, the last four bytes, modulo 2^32) must both be at most `max_bytes`.
+/// The decoder is also stopped one byte past `max_bytes`, and what it produced is discarded, because a damaged or hostile trailer can lie.
+/// A file that is skipped adds nothing, and that is not an error.
+fn append_rotated(
+    path: &Path,
+    max_bytes: usize,
+    out: &mut Vec<u8>,
+    stats: &mut RecentStats,
+) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    stats.rotated_opened = true;
+    let len = file.metadata()?.len();
+    let max = max_bytes as u64;
+    if !path.extension().is_some_and(|e| e == "gz") {
+        if len > max {
+            file.seek(SeekFrom::Start(len - max))?;
         }
-        // The cut may leave half a record, which would run into the live
-        // file's first line.
-        if out.last().is_some_and(|&b| b != b'\n') {
-            out.push(b'\n');
+        let before = out.len();
+        file.take(max).read_to_end(out)?;
+        stats.rotated_bytes = (out.len() - before) as u64;
+        return Ok(());
+    }
+    if len > max || len < 4 {
+        return Ok(());
+    }
+    file.seek(SeekFrom::Start(len - 4))?;
+    let mut isize_bytes = [0u8; 4];
+    file.read_exact(&mut isize_bytes)?;
+    if u64::from(u32::from_le_bytes(isize_bytes)) > max {
+        return Ok(());
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let mut decoded = Vec::new();
+    let result = flate2::read::GzDecoder::new(file)
+        .take(max + 1)
+        .read_to_end(&mut decoded);
+    stats.rotated_bytes = decoded.len() as u64;
+    if decoded.len() as u64 > max {
+        return Ok(());
+    }
+    // A gzip file cut short yields what decoded before the cut.
+    if let Err(e) = result {
+        if decoded.is_empty() {
+            return Err(e);
         }
     }
-    append_tail(live, max_bytes, &mut out)?;
-    Ok(into_text(out))
+    out.extend_from_slice(&decoded);
+    Ok(())
+}
+
+/// The recent end of a log file across its last rotation, as text.
+///
+/// See [`read_recent_counted`].
+pub fn read_recent(
+    live: &Path,
+    max_bytes: usize,
+    since: std::time::SystemTime,
+) -> std::io::Result<String> {
+    read_recent_counted(live, max_bytes, since).map(|(text, _)| text)
+}
+
+/// The recent end of a log file across its last rotation, as text, with what it cost.
+///
+/// The tail of the live file is at most `max_bytes`.
+/// Right after a rotation the live file holds only minutes, so the tail of the newest rotated sibling (see [`newest_rotated`]) comes before it, also at most `max_bytes`.
+/// The rotated file is left alone when it adds nothing the caller can use:
+/// when the live tail already filled `max_bytes`,
+/// when the rotated file was last written before `since`,
+/// or when it is a gzip file too large to decode within the bound (see [`append_rotated`]).
+/// This runs on a request thread, so the work is bounded by `max_bytes` whatever the size of the files.
+/// A rotated file that cannot be read costs that history and nothing else.
+/// A first line, or the first line after the join, that starts mid-record is expected and is the caller's to skip.
+pub fn read_recent_counted(
+    live: &Path,
+    max_bytes: usize,
+    since: std::time::SystemTime,
+) -> std::io::Result<(String, RecentStats)> {
+    let mut stats = RecentStats::default();
+    let mut live_tail = Vec::new();
+    append_tail(live, max_bytes, &mut live_tail)?;
+    let mut out = Vec::new();
+    if live_tail.len() < max_bytes {
+        if let Some(rotated) = newest_rotated(live) {
+            let recent = std::fs::metadata(&rotated)
+                .and_then(|m| m.modified())
+                .is_ok_and(|mtime| mtime >= since);
+            if recent && append_rotated(&rotated, max_bytes, &mut out, &mut stats).is_err() {
+                out.clear();
+            }
+            // The cut may leave half a record, which would run into the live
+            // file's first line.
+            if out.last().is_some_and(|&b| b != b'\n') {
+                out.push(b'\n');
+            }
+        }
+    }
+    out.extend_from_slice(&live_tail);
+    Ok((into_text(out), stats))
 }
 
 /// A layer that does nothing but count. Composed with the format layer
@@ -871,16 +960,113 @@ mod reopen_tests {
         assert!(!read_tail(&gz, 1 << 20).unwrap().is_empty());
     }
 
+    fn gz_bytes(text: &[u8]) -> Vec<u8> {
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(text).unwrap();
+        enc.finish().unwrap()
+    }
+
+    fn long_ago() -> std::time::SystemTime {
+        std::time::UNIX_EPOCH
+    }
+
     #[test]
     fn read_recent_joins_the_rotated_tail_before_the_live_tail() {
         let tmp = tempfile::tempdir().unwrap();
         let live = tmp.path().join("a.ndjson");
         std::fs::write(&live, "live\n").unwrap();
-        assert_eq!(read_recent(&live, 1 << 20).unwrap(), "live\n");
+        assert_eq!(read_recent(&live, 1 << 20, long_ago()).unwrap(), "live\n");
         // A rotated file cut mid-record still ends its own line.
         std::fs::write(tmp.path().join("a.ndjson-2026102601"), "old\nhal").unwrap();
-        assert_eq!(read_recent(&live, 1 << 20).unwrap(), "old\nhal\nlive\n");
-        assert_eq!(read_recent(&live, 3).unwrap(), "hal\nve\n");
+        assert_eq!(
+            read_recent(&live, 1 << 20, long_ago()).unwrap(),
+            "old\nhal\nlive\n"
+        );
+        assert_eq!(
+            read_recent(&live, 6, long_ago()).unwrap(),
+            "ld\nhal\nlive\n"
+        );
+    }
+
+    #[test]
+    fn a_full_live_tail_means_the_rotated_file_is_not_opened() {
+        let tmp = tempfile::tempdir().unwrap();
+        let live = tmp.path().join("a.ndjson");
+        std::fs::write(&live, "0123456789\n").unwrap();
+        std::fs::write(tmp.path().join("a.ndjson-2026102601"), "old\n").unwrap();
+        let (text, stats) = read_recent_counted(&live, 8, long_ago()).unwrap();
+        assert_eq!(text, "3456789\n");
+        assert_eq!(stats, RecentStats::default());
+    }
+
+    #[test]
+    fn an_old_rotated_file_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let live = tmp.path().join("a.ndjson");
+        std::fs::write(&live, "live\n").unwrap();
+        std::fs::write(tmp.path().join("a.ndjson-2026102601"), "old\n").unwrap();
+        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        let (text, stats) = read_recent_counted(&live, 1 << 20, future).unwrap();
+        assert_eq!(text, "live\n");
+        assert_eq!(stats, RecentStats::default());
+    }
+
+    #[test]
+    fn a_small_recent_rotated_file_is_still_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let live = tmp.path().join("a.ndjson");
+        std::fs::write(&live, "live\n").unwrap();
+        std::fs::write(
+            tmp.path().join("a.ndjson-2026102601.gz"),
+            gz_bytes(b"old\n"),
+        )
+        .unwrap();
+        let since = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let (text, stats) = read_recent_counted(&live, 1 << 20, since).unwrap();
+        assert_eq!(text, "old\nlive\n");
+        assert!(stats.rotated_opened);
+        assert_eq!(stats.rotated_bytes, 4);
+    }
+
+    #[test]
+    fn a_gzip_file_whose_isize_is_over_the_bound_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let live = tmp.path().join("a.ndjson");
+        std::fs::write(&live, "live\n").unwrap();
+        // 200 MB of zeros compresses to about 200 KB.
+        let big = vec![0u8; 200 * 1024 * 1024];
+        let gz = gz_bytes(&big);
+        assert!(gz.len() < 1 << 20);
+        std::fs::write(tmp.path().join("a.ndjson-2026102601.gz"), gz).unwrap();
+        let (text, stats) = read_recent_counted(&live, 1 << 20, long_ago()).unwrap();
+        assert_eq!(text, "live\n");
+        assert_eq!(stats.rotated_bytes, 0, "nothing was decoded");
+    }
+
+    #[test]
+    fn a_gzip_stream_that_inflates_past_the_bound_stops_at_the_bound() {
+        let tmp = tempfile::tempdir().unwrap();
+        let live = tmp.path().join("a.ndjson");
+        std::fs::write(&live, "live\n").unwrap();
+        // A trailer that understates the size, as a hostile or damaged file can.
+        let mut gz = gz_bytes(&vec![b'x'; 10 * 1024 * 1024]);
+        let n = gz.len();
+        gz[n - 4..].copy_from_slice(&100u32.to_le_bytes());
+        std::fs::write(tmp.path().join("a.ndjson-2026102601.gz"), gz).unwrap();
+        let (text, stats) = read_recent_counted(&live, 1 << 20, long_ago()).unwrap();
+        assert_eq!(text, "live\n", "an over-long stream is discarded");
+        assert!(stats.rotated_bytes <= (1 << 20) + 1);
+    }
+
+    #[test]
+    fn a_huge_plain_rotated_file_costs_at_most_the_bound() {
+        let tmp = tempfile::tempdir().unwrap();
+        let live = tmp.path().join("a.ndjson");
+        std::fs::write(&live, "live\n").unwrap();
+        let f = std::fs::File::create(tmp.path().join("a.ndjson-2026102601")).unwrap();
+        f.set_len(200 * 1024 * 1024).unwrap();
+        let (_, stats) = read_recent_counted(&live, 1 << 20, long_ago()).unwrap();
+        assert_eq!(stats.rotated_bytes, 1 << 20);
     }
 
     #[test]

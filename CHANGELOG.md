@@ -32,6 +32,11 @@ If the open fails, the process keeps writing to the previous file, logs an error
 The path is made absolute once at start, so a later change of working directory cannot redirect a reopen.
 
 `/traffic` also reads the newest rotated file next to the live log, named `<name>-YYYYmmddHH` with or without `.gz`, so its window does not shrink just after an hourly rotation.
+`m6_core::log::read_recent` does the read, and `/traffic` runs it on the event loop, so the work is bounded.
+A plain rotated file is read from a seek, so at most 24 MB are read however large the file is.
+The rotated file is skipped when the live tail already filled that budget, and when it was last written before the start of the `/traffic` window.
+A `.gz` file is decoded only when it is no larger than the budget on disk and the uncompressed size in its trailer is no larger than the budget, and the decoder stops at the budget whatever the trailer says.
+A skipped rotated file means the report covers the live file.
 
 **A listener is internal only when the config says so (#232).**
 m6-http used to decide from a listener's bind address whether it was internal.

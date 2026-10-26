@@ -141,6 +141,8 @@ const FIREWALL_JSON: &str = "/var/lib/m6/firewall.json";
 /// Read the last `window_minutes` of the analytics log and summarise it.
 ///
 /// The newest rotated file is read as well, so the window survives a rotation.
+/// It is read only when the live tail did not fill the budget and the file was written inside the window, and a gzip file only when it is small (see `m6_core::log::read_recent_counted`).
+/// This runs inline on the event loop, so the work is bounded.
 ///
 /// The tail is bounded rather than reading the whole file: an hour of traffic
 /// is at most a few hundred KB and the file is tens of MB, so reading it all
@@ -152,7 +154,9 @@ fn build_report(node: &str, path: &str, window_minutes: u64) -> anyhow::Result<T
     // The newest rotated file is read before the live one, so the summary
     // spans a rotation. A mid-record start is expected after a cut, and
     // `ndjson::read_str` skips what it cannot parse, so it costs nothing.
-    let buf = m6_core::log::read_recent(std::path::Path::new(path), TAIL_BYTES)?;
+    let since_time =
+        std::time::SystemTime::now() - Duration::from_secs(window_minutes.saturating_mul(60));
+    let buf = m6_core::log::read_recent(std::path::Path::new(path), TAIL_BYTES, since_time)?;
 
     let since = m6_core::util::iso8601_minutes_ago(window_minutes);
     let mut report = TrafficReport::build(node, &buf, &since, window_minutes);
