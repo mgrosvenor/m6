@@ -710,8 +710,8 @@ row and calls `page.into_response(req.query(), next.as_ref())`.
   `DEFAULT_PAGE_ROWS`). `PageLimits::new` clamps the bytes to at most
   `MAX_PAGE_BYTES`, 64 MiB.
 - That maximum is half of the 128 MiB that m6-http will buffer from a backend.
-  m6-http holds every backend body in memory, so a response is a page and not a
-  stream. A test in m6-http keeps the maximum under that cap.
+  m6-http holds every backend body in memory, so a page is one complete response
+  body that is sent whole. A test in m6-http keeps the maximum under that cap.
 - The first row of a page is kept even when it is bigger than `max_bytes`, so a
   client can always make progress. A row bigger than `MAX_PAGE_BYTES` is an
   `InvalidData` error.
@@ -761,12 +761,6 @@ brochure.
 - **`FrameworkState::build_dict` is private.** Twelve ordered steps of real
   knowledge that a service not using `App` cannot reach. This is the open
   "header to dict" item.
-- **Seventeen of thirty-two modules have no module-level doc comment**: `app` has a
-  one-line stub, and `compress`, `config`, `error`, `http`, `log`, `mime`,
-  `minify`, `multipart`, `parse`, `path`, `request`, `response`, `server`,
-  `signal`, `template`, `util` and `watcher` have none. The fifteen that do are
-  the best documentation in the repository, which makes the gap sharper rather
-  than softer.
 - **`h1`'s module doc calls `parse.rs` "(deleted)".** The file exists and is on
   the production path of every socket backend. What was deleted is the parser
   that used to be in it; it is now the stream adapter described in §6.

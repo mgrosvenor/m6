@@ -30,7 +30,7 @@
 //! `Link: <...>; rel="next"` header naming the next request. The client follows
 //! the link until a response has none.
 //!
-//! A page is a response, not a stream: m6-http buffers every backend body (up
+//! A page is one complete response body: m6-http buffers every backend body (up
 //! to 128 MiB), so streaming from behind it gains nothing. For the same reason
 //! a page skips [`write_one`]'s one `Vec` per row. `write_one` builds each line
 //! apart so a record and its newline reach a file in one write. A response body

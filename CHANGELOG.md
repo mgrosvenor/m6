@@ -29,6 +29,31 @@ no `Cargo.toml` requirement moved.
 Verified: `cargo deny check` passes, and the release build has no warnings. The
 workspace tests pass with 0 failures, h3 and QUIC included.
 
+### Added
+
+**Small APIs can now return the rows for a time range as JSON Lines, a page at a
+time (#225).** Three additions to m6-core. `m6_core::net` has `is_private_ip` and
+`bind_ip`, one definition of a private address. `m6_core::time_range` reads
+required `from` and `to` query keys as RFC 3339 UTC times for a half-open range
+`[from, to)`, with a longest span (31 days unless the service asks for another)
+and a 400 that says what to fix without repeating what the client sent.
+`m6_core::ndjson` gains `Page`, which a service fills with rows until it says
+`Full`. The service then sends the key of the next row as a `Cursor`, and the
+response carries it in a `Link: <...>; rel="next"` header. `PageLimits` default
+to 4 MiB and 10,000 rows and cannot exceed 64 MiB, half of the 128 MiB that
+m6-http will buffer from a backend; a test in m6-http keeps that true. m6-http's
+rule for which listeners are internal is unchanged.
+
+Why: a website that serves a log or a report for a period needs the same
+decisions each time: the time format, whether the end is included, how long a
+range may be, how big a response may be, and how a client asks for the rest.
+These are now made once, in m6-core.
+
+Verified: `cargo fmt --check` and `cargo clippy --workspace --all-targets -- -D
+warnings` pass with no warnings, and `cargo test --workspace` passes with 0
+failures. This was run against unit tests only; no page was served from a
+running m6-http.
+
 ---
 
 ## 1.13.0 — 2026-10-02
