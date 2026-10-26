@@ -44,12 +44,16 @@
 //!   documented procedure does: create the new table, copy the rows, drop the
 //!   old table and rename the new one. SQLite ignores `PRAGMA foreign_keys`
 //!   inside a transaction, so [`migrate`] switches foreign keys off before each
-//!   transaction. Dropping the old table then deletes no child rows. Before the
-//!   commit, [`migrate`] runs `PRAGMA foreign_key_check` before the migration
-//!   and again after it. A migration that adds a row pointing at a missing row
-//!   is rolled back and returns [`SqliteError::ForeignKeyCheck`]. A dangling
-//!   reference already in the file before the migration is not counted, so an
-//!   orphan row left by an earlier connection does not block later migrations. When [`migrate`] returns, foreign keys
+//!   transaction. Dropping the old table then deletes no child rows. The
+//!   check runs `PRAGMA foreign_key_check` before and after the migration's
+//!   SQL, inside its transaction. [`migrate`] counts the dangling references
+//!   for each (child table, parent table) pair. If any pair has more after
+//!   than before, the migration is rolled back and [`migrate`] returns
+//!   [`SqliteError::ForeignKeyCheck`], naming the child and the parent table.
+//!   A dangling reference already in the file does not block a migration, so an
+//!   orphan row left by an earlier connection is safe. The one case the check
+//!   does not catch is a migration that removes one dangling reference and adds
+//!   another between the same two tables. When [`migrate`] returns, foreign keys
 //!   are back to the setting they had on entry. The check is skipped when the
 //!   connection was opened with foreign keys off.
 //! - A migration may not contain statements that SQLite refuses or ignores
@@ -100,6 +104,7 @@
 //! per worker through `App::with_thread_state`. Both are safe with the busy
 //! timeout and the migration rules above.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -271,15 +276,22 @@ pub fn migrate(conn: &mut Connection, migrations: &[Migration]) -> Result<u32, S
             let before = if fk_was_on {
                 violations(&tx).map_err(fail)?
             } else {
-                Vec::new()
+                HashMap::new()
             };
             tx.execute_batch(m.sql).map_err(fail)?;
             if fk_was_on {
                 let after = violations(&tx).map_err(fail)?;
-                if let Some(added) = after.into_iter().find(|v| !before.contains(v)) {
+                let mut grown: Vec<_> = after
+                    .into_iter()
+                    .filter(|(pair, n)| *n > before.get(pair).copied().unwrap_or(0))
+                    .map(|(pair, _)| pair)
+                    .collect();
+                grown.sort();
+                if let Some((table, parent)) = grown.into_iter().next() {
                     return Err(SqliteError::ForeignKeyCheck {
                         version: m.version,
-                        table: added.0,
+                        table,
+                        parent,
                     });
                 }
             }
@@ -299,14 +311,20 @@ pub fn migrate(conn: &mut Connection, migrations: &[Migration]) -> Result<u32, S
     Ok(last)
 }
 
-/// One row of `PRAGMA foreign_key_check`: table, rowid, parent table and
-/// foreign key id. The rowid is `None` for a WITHOUT ROWID table.
-type Violation = (String, Option<i64>, String, i64);
+/// Dangling references counted per (child table, parent table) pair.
+type Violations = HashMap<(String, String), u64>;
 
-fn violations(conn: &Connection) -> rusqlite::Result<Vec<Violation>> {
+/// Runs `PRAGMA foreign_key_check` and counts its rows per pair. The rowid and
+/// the foreign key id are ignored, because a table rebuild renumbers rowids
+/// and a WITHOUT ROWID table has none.
+fn violations(conn: &Connection) -> rusqlite::Result<Violations> {
     let mut stmt = conn.prepare("PRAGMA foreign_key_check")?;
-    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
-    rows.collect()
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(2)?)))?;
+    let mut counts = Violations::new();
+    for row in rows {
+        *counts.entry(row?).or_insert(0) += 1;
+    }
+    Ok(counts)
 }
 
 /// `[A-Za-z_][A-Za-z0-9_]*`, the only table names placed into SQL here.
@@ -444,8 +462,12 @@ pub enum SqliteError {
         #[source]
         source: rusqlite::Error,
     },
-    #[error("migration {version} left rows in {table} that point at missing rows")]
-    ForeignKeyCheck { version: u32, table: String },
+    #[error("migration {version} added rows in {table} that point at missing rows in {parent}")]
+    ForeignKeyCheck {
+        version: u32,
+        table: String,
+        parent: String,
+    },
     #[error("not a plain table name: {0:?}")]
     BadName(String),
     #[error(transparent)]
@@ -750,7 +772,9 @@ mod tests {
             sql: "DELETE FROM p;",
         };
         match migrate(&mut c, &[m1, m2]) {
-            Err(SqliteError::ForeignKeyCheck { version: 2, table }) => assert_eq!(table, "ch"),
+            Err(SqliteError::ForeignKeyCheck {
+                version: 2, table, ..
+            }) => assert_eq!(table, "ch"),
             other => panic!("expected ForeignKeyCheck, got {other:?}"),
         }
         assert_eq!(schema_version(&c).unwrap(), 1);
@@ -783,10 +807,82 @@ mod tests {
         let mut c = open(&path).unwrap();
         assert_eq!(migrate(&mut c, &[m1, m2]).unwrap(), 2);
         match migrate(&mut c, &[m1, m2, m3]) {
-            Err(SqliteError::ForeignKeyCheck { version: 3, table }) => assert_eq!(table, "ch"),
+            Err(SqliteError::ForeignKeyCheck {
+                version: 3, table, ..
+            }) => assert_eq!(table, "ch"),
             other => panic!("expected ForeignKeyCheck, got {other:?}"),
         }
         assert_eq!(schema_version(&c).unwrap(), 2);
+        assert_eq!(count(&c, "SELECT count(*) FROM ch"), 1);
+    }
+
+    #[test]
+    fn rebuilding_a_child_table_that_holds_an_orphan_succeeds() {
+        let (_d, path) = db();
+        let mut off = OpenOptions::default()
+            .foreign_keys(false)
+            .open(&path)
+            .unwrap();
+        let m1 = Migration {
+            version: 1,
+            sql: "CREATE TABLE p(id INTEGER PRIMARY KEY); \
+                  CREATE TABLE ch(pid INTEGER REFERENCES p(id)); \
+                  INSERT INTO p VALUES (1); \
+                  INSERT INTO ch VALUES (1); INSERT INTO ch VALUES (1); \
+                  INSERT INTO ch VALUES (99);",
+        };
+        migrate(&mut off, &[m1]).unwrap();
+        off.execute_batch("DELETE FROM ch WHERE rowid IN (1, 2)")
+            .unwrap();
+        assert_eq!(count(&off, "SELECT rowid FROM ch"), 3);
+        drop(off);
+        let m2 = Migration {
+            version: 2,
+            sql: "CREATE TABLE ch_new(pid INTEGER REFERENCES p(id), note TEXT); \
+                  INSERT INTO ch_new(pid) SELECT pid FROM ch; \
+                  DROP TABLE ch; \
+                  ALTER TABLE ch_new RENAME TO ch;",
+        };
+        let mut c = open(&path).unwrap();
+        assert_eq!(migrate(&mut c, &[m1, m2]).unwrap(), 2);
+        assert_eq!(count(&c, "SELECT rowid FROM ch"), 1);
+        assert_eq!(count(&c, "SELECT count(*) FROM ch"), 1);
+    }
+
+    #[test]
+    fn a_second_orphan_in_a_without_rowid_table_is_rolled_back() {
+        let (_d, path) = db();
+        let mut off = OpenOptions::default()
+            .foreign_keys(false)
+            .open(&path)
+            .unwrap();
+        let m1 = Migration {
+            version: 1,
+            sql: "CREATE TABLE p(id INTEGER PRIMARY KEY); \
+                  CREATE TABLE ch(k INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id)) \
+                  WITHOUT ROWID; \
+                  INSERT INTO ch VALUES (1, 99);",
+        };
+        migrate(&mut off, &[m1]).unwrap();
+        drop(off);
+        let m2 = Migration {
+            version: 2,
+            sql: "INSERT INTO ch VALUES (2, 98);",
+        };
+        let mut c = open(&path).unwrap();
+        assert_eq!(migrate(&mut c, &[m1]).unwrap(), 1);
+        match migrate(&mut c, &[m1, m2]) {
+            Err(SqliteError::ForeignKeyCheck {
+                version: 2,
+                table,
+                parent,
+            }) => {
+                assert_eq!(table, "ch");
+                assert_eq!(parent, "p");
+            }
+            other => panic!("expected ForeignKeyCheck, got {other:?}"),
+        }
+        assert_eq!(schema_version(&c).unwrap(), 1);
         assert_eq!(count(&c, "SELECT count(*) FROM ch"), 1);
     }
 

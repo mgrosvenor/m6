@@ -64,8 +64,9 @@ Opening a WAL file with the default rollback journal then fails with `SQLITE_BUS
 Each migration runs in its own `BEGIN IMMEDIATE` transaction, so connections that open at once apply each one once, and a failing migration rolls back.
 A file newer than the migration list is refused with `NewerThanCode`, both before the first migration and again inside each transaction, so a newer process that migrates the file meanwhile is also refused.
 `migrate` switches `foreign_keys` off before each migration, because SQLite ignores that pragma inside a transaction, and so a migration can rebuild a table that others point at without losing their rows.
-It runs `PRAGMA foreign_key_check` before each migration and again after it, and a migration that adds a dangling reference is rolled back with `ForeignKeyCheck`.
-A dangling reference already in the file before the migration is not counted.
+It runs `PRAGMA foreign_key_check` before and after each migration's SQL, inside its transaction, and fails with `ForeignKeyCheck` naming the child and parent table if any (child table, parent table) pair has more dangling references after than before.
+A dangling reference already in the file does not block a migration.
+A migration that removes one dangling reference and adds another between the same two tables is not caught.
 `foreign_keys` is restored to its earlier setting when `migrate` returns.
 `append_only(&conn, table)` adds triggers that refuse UPDATE and DELETE on a named table, and `is_append_only` reports them.
 `used_bytes` and `prune_oldest` keep a table that is not append-only under a size cap.
