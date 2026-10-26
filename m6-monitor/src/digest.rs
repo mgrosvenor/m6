@@ -175,15 +175,47 @@ pub struct TunnelDigest {
     /// The minimum of the samples, in milliseconds.
     pub rtt_ms: Option<f64>,
     pub rtt_samples_ms: Vec<f64>,
-    /// `connected`, `refused`, `no_answer` or `failed`.
-    pub probe: &'static str,
+    pub probe: ProbeState,
     pub probe_error: Option<String>,
-    /// `ok` (a timestamp exists, staleness is a finding), `never`,
-    /// `peer_absent`, `not_configured`, `file_missing` or `file_error`.
-    pub handshake: &'static str,
+    pub handshake: HandshakeState,
     pub handshake_age_s: Option<u64>,
     pub handshake_detail: Option<String>,
     pub handshake_file_age_s: Option<u64>,
+}
+
+/// How the tunnel probe ended, serialised as `connected`, `refused`,
+/// `no_answer` or `failed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeState {
+    Connected,
+    Refused,
+    NoAnswer,
+    Failed,
+}
+
+impl ProbeState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Connected => "connected",
+            Self::Refused => "refused",
+            Self::NoAnswer => "no_answer",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// The handshake state. `Ok` means a timestamp exists, and its staleness is a
+/// finding of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HandshakeState {
+    Ok,
+    Never,
+    PeerAbsent,
+    NotConfigured,
+    FileMissing,
+    FileError,
 }
 
 impl TunnelDigest {
@@ -193,11 +225,11 @@ impl TunnelDigest {
             Some(min) => format!(
                 "rtt {min:.2}ms (n {}, {})",
                 self.rtt_samples_ms.len(),
-                self.probe
+                self.probe.as_str()
             ),
             None => format!(
                 "rtt -  ({}: {})",
-                self.probe,
+                self.probe.as_str(),
                 self.probe_error.as_deref().unwrap_or("no samples")
             ),
         }
@@ -206,18 +238,18 @@ impl TunnelDigest {
     /// `42s ago`, `never` and the other states, in one wording for both views.
     pub fn handshake_text(&self) -> String {
         match self.handshake {
-            "ok" => match self.handshake_age_s {
+            HandshakeState::Ok => match self.handshake_age_s {
                 Some(a) => format!("{a}s ago"),
                 None => "ok".to_string(),
             },
-            "never" => "never".to_string(),
-            "peer_absent" => "peer not on this host's interface".to_string(),
-            "not_configured" => format!(
+            HandshakeState::Never => "never".to_string(),
+            HandshakeState::PeerAbsent => "peer not on this host's interface".to_string(),
+            HandshakeState::NotConfigured => format!(
                 "not configured ({})",
                 self.handshake_detail.as_deref().unwrap_or("-")
             ),
-            "file_missing" => "file missing".to_string(),
-            _ => "file unreadable".to_string(),
+            HandshakeState::FileMissing => "file missing".to_string(),
+            HandshakeState::FileError => "file unreadable".to_string(),
         }
     }
 }
@@ -225,10 +257,10 @@ impl TunnelDigest {
 fn tunnel_digest(t: &crate::tunnel::TunnelReading) -> TunnelDigest {
     use crate::tunnel::{Handshake, Probe};
     let (probe, probe_error) = match &t.probe.outcome {
-        Probe::Connected => ("connected", None),
-        Probe::Refused => ("refused", None),
-        Probe::NoAnswer(e) => ("no_answer", Some(e.clone())),
-        Probe::Failed(e) => ("failed", Some(e.clone())),
+        Probe::Connected => (ProbeState::Connected, None),
+        Probe::Refused => (ProbeState::Refused, None),
+        Probe::NoAnswer(e) => (ProbeState::NoAnswer, Some(e.clone())),
+        Probe::Failed(e) => (ProbeState::Failed, Some(e.clone())),
     };
     let ms: Vec<f64> = t
         .probe
@@ -237,12 +269,16 @@ fn tunnel_digest(t: &crate::tunnel::TunnelReading) -> TunnelDigest {
         .map(|d| d.as_secs_f64() * 1000.0)
         .collect();
     let (handshake, handshake_age_s, handshake_detail) = match &t.handshake {
-        Handshake::NotConfigured(why) => ("not_configured", None, Some((*why).to_string())),
-        Handshake::FileMissing(p) => ("file_missing", None, Some(p.clone())),
-        Handshake::FileError(e) => ("file_error", None, Some(e.clone())),
-        Handshake::PeerAbsent => ("peer_absent", None, None),
-        Handshake::Never => ("never", None, None),
-        Handshake::At { age_s } => ("ok", Some(*age_s), None),
+        Handshake::NotConfigured(why) => (
+            HandshakeState::NotConfigured,
+            None,
+            Some((*why).to_string()),
+        ),
+        Handshake::FileMissing(p) => (HandshakeState::FileMissing, None, Some(p.clone())),
+        Handshake::FileError(e) => (HandshakeState::FileError, None, Some(e.clone())),
+        Handshake::PeerAbsent => (HandshakeState::PeerAbsent, None, None),
+        Handshake::Never => (HandshakeState::Never, None, None),
+        Handshake::At { age_s } => (HandshakeState::Ok, Some(*age_s), None),
     };
     TunnelDigest {
         address: t.address.clone(),
@@ -311,7 +347,7 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
                     text,
                 });
             };
-            if matches!(td.probe, "no_answer" | "failed") {
+            if matches!(td.probe, ProbeState::NoAnswer | ProbeState::Failed) {
                 fault(format!(
                     "tunnel {} did not answer: {}",
                     td.address,
@@ -319,11 +355,11 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
                 ));
             }
             match td.handshake {
-                "never" => fault(
+                HandshakeState::Never => fault(
                     "tunnel peer has never completed a WireGuard handshake with this host"
                         .to_string(),
                 ),
-                "peer_absent" => {
+                HandshakeState::PeerAbsent => {
                     let key = r
                         .tunnel
                         .as_ref()
@@ -333,7 +369,7 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
                         "public key {key}... is not a peer on this host's WireGuard interface"
                     ));
                 }
-                "ok" => {
+                HandshakeState::Ok => {
                     if let Some(age) = td.handshake_age_s {
                         if age > t.tunnel_handshake_age_s {
                             fault(format!(
@@ -343,20 +379,21 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
                         }
                     }
                 }
-                "file_missing" | "file_error" if handshake_file_problem.is_none() => {
-                    handshake_file_problem = Some(if td.handshake == "file_missing" {
-                        format!(
-                                "WireGuard handshake file {} is missing, so no handshake age can be read: is its collector installed?",
-                                td.handshake_detail.as_deref().unwrap_or("-")
-                            )
-                    } else {
-                        format!(
-                            "WireGuard handshake file unreadable: {}",
-                            td.handshake_detail.as_deref().unwrap_or("-")
-                        )
-                    });
+                HandshakeState::FileMissing if handshake_file_problem.is_none() => {
+                    handshake_file_problem = Some(format!(
+                        "WireGuard handshake file {} is missing, so no handshake age can be read: is its collector installed?",
+                        td.handshake_detail.as_deref().unwrap_or("-")
+                    ));
                 }
-                _ => {}
+                HandshakeState::FileError if handshake_file_problem.is_none() => {
+                    handshake_file_problem = Some(format!(
+                        "WireGuard handshake file unreadable: {}",
+                        td.handshake_detail.as_deref().unwrap_or("-")
+                    ));
+                }
+                HandshakeState::FileMissing
+                | HandshakeState::FileError
+                | HandshakeState::NotConfigured => {}
             }
         }
 
@@ -1854,7 +1891,10 @@ pub(crate) mod tests {
         let r = with_tunnel("edge-a", tunnel(Probe::Refused, Handshake::At { age_s: 5 }));
         let d = build(&[r], &Thresholds::default(), now());
         assert!(tunnel_findings(&d).is_empty(), "{:?}", d.findings);
-        assert_eq!(d.nodes[0].tunnel.as_ref().unwrap().probe, "refused");
+        assert_eq!(
+            d.nodes[0].tunnel.as_ref().unwrap().probe,
+            ProbeState::Refused
+        );
     }
 
     /// The guard on the unreachable `continue`: a node whose HTTPS poll failed
@@ -1939,6 +1979,8 @@ pub(crate) mod tests {
         assert_eq!(t["rtt_samples_ms"].as_array().unwrap().len(), 3);
         assert_eq!(t["handshake_age_s"], 42);
         assert_eq!(t["handshake_file_age_s"], 7);
+        assert_eq!(t["probe"], "connected");
+        assert_eq!(t["handshake"], "ok");
         assert_eq!(v["thresholds"]["tunnel_handshake_age_s"], 600);
     }
 }

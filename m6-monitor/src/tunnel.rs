@@ -108,34 +108,25 @@ pub enum Handshake {
     At { age_s: u64 },
 }
 
-pub enum HandshakeSource {
-    NotConfigured,
-    Missing(String),
-    Error(String),
-    Loaded {
-        handshakes: Handshakes,
-        file_age_s: Option<u64>,
-    },
-}
+/// The handshake file as loaded, with its age in seconds, or the state every
+/// node with a public key reports when it could not be loaded.
+pub type HandshakeSource = Result<(Handshakes, Option<u64>), Handshake>;
 
 /// Read the handshake file once per poll.
 pub fn load(path: Option<&str>) -> HandshakeSource {
     let Some(path) = path else {
-        return HandshakeSource::NotConfigured;
+        return Err(Handshake::NotConfigured("no wg_handshakes_file configured"));
     };
     match Handshakes::from_file(std::path::Path::new(path)) {
-        Ok(None) => HandshakeSource::Missing(path.to_string()),
-        Err(e) => HandshakeSource::Error(format!("{path}: {e:#}")),
+        Ok(None) => Err(Handshake::FileMissing(path.to_string())),
+        Err(e) => Err(Handshake::FileError(format!("{path}: {e:#}"))),
         Ok(Some(handshakes)) => {
             let file_age_s = std::fs::metadata(path)
                 .and_then(|m| m.modified())
                 .ok()
                 .and_then(|t| SystemTime::now().duration_since(t).ok())
                 .map(|d| d.as_secs());
-            HandshakeSource::Loaded {
-                handshakes,
-                file_age_s,
-            }
+            Ok((handshakes, file_age_s))
         }
     }
 }
@@ -145,12 +136,8 @@ pub fn handshake_for(src: &HandshakeSource, public_key: Option<&str>, now_unix: 
         return Handshake::NotConfigured("no public_key for this node");
     };
     match src {
-        HandshakeSource::NotConfigured => {
-            Handshake::NotConfigured("no wg_handshakes_file configured")
-        }
-        HandshakeSource::Missing(p) => Handshake::FileMissing(p.clone()),
-        HandshakeSource::Error(e) => Handshake::FileError(e.clone()),
-        HandshakeSource::Loaded { handshakes, .. } => match handshakes.find(key) {
+        Err(h) => h.clone(),
+        Ok((handshakes, _)) => match handshakes.find(key) {
             None => Handshake::PeerAbsent,
             Some(p) => match p.latest_unix {
                 None => Handshake::Never,
@@ -173,6 +160,22 @@ pub struct TunnelReading {
     pub file_age_s: Option<u64>,
 }
 
+impl TunnelReading {
+    /// The reading for a tunnel whose probe thread panicked.
+    fn panicked(address: String) -> Self {
+        Self {
+            address,
+            key_prefix: None,
+            probe: ProbeResult {
+                samples: Vec::new(),
+                outcome: Probe::Failed("probe thread panicked".to_string()),
+            },
+            handshake: Handshake::NotConfigured("probe thread panicked"),
+            file_age_s: None,
+        }
+    }
+}
+
 fn key_prefix(key: Option<&str>) -> Option<String> {
     key.map(|k| k.trim().chars().take(8).collect())
 }
@@ -180,10 +183,7 @@ fn key_prefix(key: Option<&str>) -> Option<String> {
 /// One entry per node, in order, `None` for a node with no tunnel.
 pub fn fleet(f: &crate::fleet::Fleet, timeout: Duration) -> Vec<Option<TunnelReading>> {
     let src = load(f.wg_handshakes_file.as_deref());
-    let file_age_s = match &src {
-        HandshakeSource::Loaded { file_age_s, .. } => *file_age_s,
-        _ => None,
-    };
+    let file_age_s = src.as_ref().ok().and_then(|(_, age)| *age);
     let now_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -219,19 +219,13 @@ pub fn fleet(f: &crate::fleet::Fleet, timeout: Duration) -> Vec<Option<TunnelRea
             .zip(&f.nodes)
             .map(|(h, n)| {
                 h.map(|h| {
-                    h.join().unwrap_or_else(|_| TunnelReading {
-                        address: n
-                            .tunnel
-                            .as_ref()
-                            .map(|t| t.address.clone())
-                            .unwrap_or_default(),
-                        key_prefix: None,
-                        probe: ProbeResult {
-                            samples: Vec::new(),
-                            outcome: Probe::Failed("probe thread panicked".to_string()),
-                        },
-                        handshake: Handshake::NotConfigured("probe thread panicked"),
-                        file_age_s: None,
+                    h.join().unwrap_or_else(|_| {
+                        TunnelReading::panicked(
+                            n.tunnel
+                                .as_ref()
+                                .map(|t| t.address.clone())
+                                .unwrap_or_default(),
+                        )
                     })
                 })
             })
@@ -266,10 +260,10 @@ mod tests {
     }
 
     fn src_with(key: &str, ts: u64) -> HandshakeSource {
-        HandshakeSource::Loaded {
-            handshakes: Handshakes::parse_latest_handshakes(&format!("{key}\t{ts}\n")).unwrap(),
-            file_age_s: Some(5),
-        }
+        Ok((
+            Handshakes::parse_latest_handshakes(&format!("{key}\t{ts}\n")).unwrap(),
+            Some(5),
+        ))
     }
 
     #[test]
@@ -291,14 +285,14 @@ mod tests {
             Handshake::NotConfigured(_)
         ));
         assert!(matches!(
-            handshake_for(&HandshakeSource::NotConfigured, Some("K"), 10),
+            handshake_for(&load(None), Some("K"), 10),
             Handshake::NotConfigured(_)
         ));
     }
 
     #[test]
     fn a_missing_file_and_an_absent_peer_are_different_states() {
-        let missing = handshake_for(&HandshakeSource::Missing("/x".into()), Some("K"), 10);
+        let missing = handshake_for(&Err(Handshake::FileMissing("/x".into())), Some("K"), 10);
         assert_eq!(missing, Handshake::FileMissing("/x".into()));
         let absent = handshake_for(&src_with("OTHER", 1), Some("K"), 10);
         assert_eq!(absent, Handshake::PeerAbsent);
