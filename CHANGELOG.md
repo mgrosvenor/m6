@@ -54,6 +54,23 @@ warnings` pass with no warnings, and `cargo test --workspace` passes with 0
 failures. This was run against unit tests only; no page was served from a
 running m6-http.
 
+### Docs
+
+**Two contributor rules in CLAUDE.md corrected (#223).** The rule that a change
+to layout, copy or rendering needs individual approval now applies only to
+changes a visitor can reach. A page no visitor can reach, such as m6-monitor's
+own page on its private socket, does not need that approval. The rule that every
+commit ends with a fixed `Co-Authored-By` line is removed, because the line
+named one model version and went stale each time the model changed.
+
+The first rule, read literally, asked for sign-off on every page m6 renders,
+including operator pages that only the operator's own tools can open. The second
+told contributors to write a trailer that was wrong as soon as it was written.
+
+Verified by reading the diff: it touches only `CLAUDE.md`, replacing one bullet
+and deleting one paragraph with its code block. No code and no other document
+changes, and no tests were run.
+
 ---
 
 ## 1.13.0 — 2026-10-02
