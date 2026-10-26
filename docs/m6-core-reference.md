@@ -118,7 +118,7 @@ Thirty-one modules. Grouped by what you would be doing when you reach for one.
 |---|---|
 | `compress` | brotli and gzip, compress and decompress. |
 | `minify` | HTML, JS, CSS, JSON. |
-| `util` | `slugify`, `now_iso8601`, `today_iso8601`, `iso8601_minutes_ago`. |
+| `util` | `slugify`, `now_iso8601`, `today_iso8601`, `iso8601_minutes_ago`, `html_escape`. |
 | `random` | `random_hex_token::<N>()`. One CSPRNG token generator, so there is never a third. |
 
 **Observability**
@@ -463,7 +463,7 @@ is one now.
 `minify`: `minify_html(data, minify_inline_js)`, `minify_js`, `minify_css`,
 `minify_json`.
 
-`util`: `slugify`, `today_iso8601`, `now_iso8601`, `iso8601_minutes_ago`.
+`util`: `slugify`, `today_iso8601`, `now_iso8601`, `iso8601_minutes_ago`, `html_escape`.
 
 `random`: `random_hex_token::<N>()`. There were two byte-identical copies at
 two lengths. Both were correct; the hazard is the third one, written by someone

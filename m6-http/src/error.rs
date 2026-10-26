@@ -1,5 +1,6 @@
 /// Error mode handling: status, internal, custom.
 use crate::config::ErrorsConfig;
+use m6_core::util::html_escape;
 
 /// Generate an error response based on the configured mode.
 pub enum ErrorMode {
@@ -32,13 +33,6 @@ pub struct ErrorContext {
     pub backend: Option<String>,
     /// Specific error detail (e.g. token parse error, require clause).
     pub detail: Option<String>,
-}
-
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
 }
 
 /// (detail, hint) for verbose internal error pages.

@@ -300,13 +300,6 @@ fn bytes(n: u64) -> String {
     unreachable!()
 }
 
-/// Escape text that can carry an error string into the page.
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
-
 fn opt<T: std::fmt::Display>(v: Option<T>) -> String {
     // An absent reading is a dash, never a zero. A zero is a measurement.
     v.map(|x| x.to_string()).unwrap_or_else(|| "-".to_string())
@@ -416,7 +409,7 @@ fn render(d: &digest::Digest) -> String {
             n.host_uptime_s.map(dur).unwrap_or_else(|| "-".into()),
             // The same wording as /check section H.
             match &n.tunnel {
-                Some(t) => html_escape(&format!(
+                Some(t) => m6_core::util::html_escape(&format!(
                     "{} handshake {}",
                     t.rtt_text(),
                     t.handshake_text()
