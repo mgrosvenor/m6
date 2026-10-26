@@ -76,7 +76,7 @@ for the same reason. A binary that wants none of it sets
 
 ## 3. Component index
 
-Thirty modules. Grouped by what you would be doing when you reach for one.
+Thirty-one modules. Grouped by what you would be doing when you reach for one.
 
 **Building a service**
 
@@ -131,6 +131,7 @@ Thirty modules. Grouped by what you would be doing when you reach for one.
 | `host` | What the machine is doing. Load, memory, disk, thermal, net, diskstats, pressure, TCP, fds. |
 | `tls` | How long the loaded certificate has left: `not_after_unix`, `record_loaded`, `loaded`, `TlsCertificate`. |
 | `firewall` | `FirewallState` from nftables' own JSON. |
+| `wireguard` | `Handshakes` from `wg show <if> latest-handshakes` output. |
 | `ndjson` | Newline-delimited JSON, read and written, tolerant of torn lines. |
 
 **Everything else**
@@ -646,6 +647,21 @@ ordinary data.
 It reports the deliberate blocks and whether they are still being hit. It does
 not report "180 packets from 10 sources", which never changed and never prompted
 an action.
+
+### `wireguard`
+
+`Handshakes::parse_latest_handshakes(text)`, `from_file(path)`, `find(key)`, and `PeerHandshake`.
+
+It reads a file because WireGuard state needs `CAP_NET_ADMIN`.
+A systemd timer writes the output of `wg show <if> latest-handshakes`, and m6 reads it as ordinary data.
+A time of 0 means the peer never completed a handshake.
+A missing file is `Ok(None)`, and a malformed line is an error naming the line.
+
+Do not use `wg show <if> dump`, because it carries the interface private key.
+
+The time is the last successful handshake.
+After a key changes under a tunnel it stops moving, and it still looks recent for minutes.
+An age is therefore the slow signal, and a probe over the tunnel is the fast one.
 
 ### `ndjson`
 
