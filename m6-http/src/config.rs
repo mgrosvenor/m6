@@ -86,6 +86,12 @@ pub struct ServerConfig {
     /// Intended for use over a private backbone between nodes.
     #[serde(default)]
     pub h2c_bind: Option<String>,
+    /// Listeners this server treats as internal, by address. See
+    /// docs/m6-site-toml.md. Validated by `load`: each entry is an IP and port
+    /// in a local range (`m6_core::net::is_private_ip`) equal to `bind` or
+    /// `h2c_bind`. Read at startup; a change needs a restart.
+    #[serde(default)]
+    pub internal_binds: Vec<String>,
     /// Run this process as a plain-HTTP redirector on this address instead of
     /// a normal server: every request is answered 301 to https://<Host><path>.
     ///
@@ -137,6 +143,20 @@ pub struct ServerConfig {
     /// disabled) need PUT and DELETE when they come back.
     #[serde(default = "default_allowed_methods")]
     pub allowed_methods: Vec<String>,
+}
+
+impl ServerConfig {
+    /// True when `listener` (a bind string from this config) is named in
+    /// `internal_binds`. Compared as socket addresses, so `[::1]:80` equals
+    /// `[0:0:0:0:0:0:0:1]:80`. A listener given as a host name never matches.
+    pub fn is_internal(&self, listener: &str) -> bool {
+        let Ok(l) = listener.parse::<std::net::SocketAddr>() else {
+            return false;
+        };
+        self.internal_binds
+            .iter()
+            .any(|e| e.parse::<std::net::SocketAddr>().is_ok_and(|a| a == l))
+    }
 }
 
 fn default_allowed_methods() -> Vec<String> {
@@ -635,6 +655,7 @@ struct RawServerSection {
     tls_key: Option<String>,
     backend_timeout_secs: Option<u64>,
     h2c_bind: Option<String>,
+    internal_binds: Option<Vec<String>>,
     redirect_bind: Option<String>,
     allowed_methods: Option<Vec<String>>,
 }
@@ -646,6 +667,41 @@ struct RawSystemToml {
 }
 
 // ── Loading ─────────────────────────────────────────────────────────────────
+
+/// Check `[server] internal_binds` against the listeners and the local ranges.
+///
+/// Order: the `h2c_bind` migration guard, then each entry in list order for an
+/// IP and port, a local range and a listener. Host names are never resolved.
+fn validate_internal_binds(
+    internal_binds: Option<&[String]>,
+    bind: &str,
+    h2c_bind: Option<&str>,
+) -> anyhow::Result<()> {
+    if let (Some(h2c), None) = (h2c_bind, internal_binds) {
+        anyhow::bail!(
+            "config error: [server].h2c_bind = \"{h2c}\" is set but [server].internal_binds is not. m6-http no longer decides from an address whether a listener is internal. Add internal_binds = [\"{h2c}\"] to keep trusting it as the private backbone (forwarded client addresses believed, the custom error path allowed, statistics labelled internal), or internal_binds = [] to treat it as public"
+        );
+    }
+    let listener = |s: &str| s.parse::<std::net::SocketAddr>().ok();
+    for e in internal_binds.unwrap_or_default() {
+        let Ok(sa) = e.parse::<std::net::SocketAddr>() else {
+            anyhow::bail!(
+                "config error: [server].internal_binds entry \"{e}\" is not an IP address and port such as \"10.0.0.1:8080\" or \"[fd00::1]:8080\"; names are never resolved"
+            );
+        };
+        if !m6_core::net::is_private_ip(sa.ip()) {
+            anyhow::bail!(
+                "config error: [server].internal_binds entry \"{e}\" is not in a local range; an internal binding must be a loopback, private (RFC 1918), link-local, shared (100.64.0.0/10) or IPv6 unique-local address"
+            );
+        }
+        if listener(bind) != Some(sa) && h2c_bind.and_then(listener) != Some(sa) {
+            anyhow::bail!(
+                "config error: [server].internal_binds entry \"{e}\" is not one of this server's listeners; it must equal [server].bind or [server].h2c_bind"
+            );
+        }
+    }
+    Ok(())
+}
 
 /// Load and merge configs. Returns Config on success. Returns error with
 /// message suitable for exit-2 on any validation failure.
@@ -676,6 +732,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         tls_key: None,
         backend_timeout_secs: None,
         h2c_bind: None,
+        internal_binds: None,
         redirect_bind: None,
         allowed_methods: None,
     });
@@ -686,6 +743,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         tls_key: None,
         backend_timeout_secs: None,
         h2c_bind: None,
+        internal_binds: None,
         redirect_bind: None,
         allowed_methods: None,
     });
@@ -724,6 +782,14 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         .or(site_server.backend_timeout_secs)
         .unwrap_or(30);
     let h2c_bind = sys_server.h2c_bind.or(site_server.h2c_bind);
+    // Nothing is inferred from an address: a listener is internal only when
+    // this list names it. A redirector binds nothing the list could name, so a
+    // site.toml shared with one must not break it.
+    let internal_binds = sys_server.internal_binds.or(site_server.internal_binds);
+    if redirect_bind.is_none() {
+        validate_internal_binds(internal_binds.as_deref(), &bind, h2c_bind.as_deref())?;
+    }
+    let internal_binds = internal_binds.unwrap_or_default();
 
     // Resolve TLS cert/key paths relative to site_dir if not absolute.
     let tls_cert_path = tls_cert.as_deref().map(|c| resolve_path(site_dir, c));
@@ -766,6 +832,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
             .map(|p| p.to_string_lossy().into_owned()),
         backend_timeout_secs,
         h2c_bind,
+        internal_binds,
         warm_on_start,
         redirect_bind: redirect_bind.clone(),
         // Uppercased once at load so the hot-path check is a plain comparison
@@ -1525,5 +1592,142 @@ backend_timeout_secs = 120
         );
         let cfg = load(dir.path(), &dir.path().join("system.toml")).unwrap();
         assert_eq!(cfg.server.backend_timeout_secs, 120);
+    }
+
+    // ── [server] internal_binds ─────────────────────────────────────────────
+
+    /// Load the minimal site with `extra` appended to the system config's
+    /// `[server]` table.
+    fn load_with_system_server(extra: &str) -> anyhow::Result<Config> {
+        let dir = make_test_dir();
+        setup_minimal(dir.path());
+        let mut sys = minimal_system_toml();
+        sys.push_str(extra);
+        write_file(dir.path(), "system.toml", &sys);
+        load(dir.path(), &dir.path().join("system.toml"))
+    }
+
+    fn load_error(extra: &str) -> String {
+        load_with_system_server(extra)
+            .expect_err("load must refuse")
+            .to_string()
+    }
+
+    #[test]
+    fn no_internal_binds_without_h2c_loads_and_nothing_is_internal() {
+        let cfg = load_with_system_server("").unwrap();
+        assert!(cfg.server.internal_binds.is_empty());
+        // A loopback bind is no longer internal by address.
+        assert!(!cfg.server.is_internal("127.0.0.1:8443"));
+    }
+
+    #[test]
+    fn an_h2c_bind_without_internal_binds_refuses_to_start() {
+        let e = load_error("h2c_bind = \"127.0.0.1:18080\"\n");
+        assert!(e.starts_with("config error:"), "{e}");
+        assert!(e.contains("internal_binds = [\"127.0.0.1:18080\"]"), "{e}");
+        assert!(e.contains("internal_binds = []"), "{e}");
+    }
+
+    #[test]
+    fn an_empty_internal_binds_accepts_an_undeclared_h2c() {
+        let cfg = load_with_system_server("h2c_bind = \"127.0.0.1:18080\"\ninternal_binds = []\n")
+            .unwrap();
+        assert!(cfg.server.internal_binds.is_empty());
+        assert!(!cfg.server.is_internal("127.0.0.1:18080"));
+    }
+
+    #[test]
+    fn a_declared_h2c_bind_is_internal_and_the_tls_bind_is_not() {
+        let cfg = load_with_system_server(
+            "h2c_bind = \"127.0.0.1:18080\"\ninternal_binds = [\"127.0.0.1:18080\"]\n",
+        )
+        .unwrap();
+        assert!(cfg.server.is_internal("127.0.0.1:18080"));
+        assert!(!cfg.server.is_internal(&cfg.server.bind));
+    }
+
+    #[test]
+    fn a_declared_tls_bind_is_internal() {
+        let cfg = load_with_system_server("internal_binds = [\"127.0.0.1:8443\"]\n").unwrap();
+        assert!(cfg.server.is_internal(&cfg.server.bind));
+    }
+
+    #[test]
+    fn an_internal_binding_must_be_an_ip_and_port() {
+        for entry in ["localhost:8080", "10.0.0.1", "fdexample.com:80"] {
+            let e = load_error(&format!("internal_binds = [\"{entry}\"]\n"));
+            assert!(e.contains("is not an IP address and port"), "{entry}: {e}");
+            assert!(e.contains(&format!("\"{entry}\"")), "{entry}: {e}");
+        }
+    }
+
+    #[test]
+    fn an_internal_binding_must_be_in_a_local_range() {
+        // Same address as h2c_bind, so only the range check can refuse it.
+        for entry in ["203.0.113.7:8080", "0.0.0.0:8080"] {
+            let e = load_error(&format!(
+                "h2c_bind = \"{entry}\"\ninternal_binds = [\"{entry}\"]\n"
+            ));
+            assert!(e.contains("is not in a local range"), "{entry}: {e}");
+        }
+    }
+
+    #[test]
+    fn an_internal_binding_must_name_a_listener() {
+        let e = load_error("h2c_bind = \"10.0.0.1:8080\"\ninternal_binds = [\"10.0.0.9:8080\"]\n");
+        assert!(e.contains("is not one of this server's listeners"), "{e}");
+        assert!(e.contains("[server].bind or [server].h2c_bind"), "{e}");
+    }
+
+    #[test]
+    fn ipv6_internal_bindings_match_as_socket_addresses() {
+        let cfg = load_with_system_server(
+            "h2c_bind = \"[::1]:8080\"\ninternal_binds = [\"[0:0:0:0:0:0:0:1]:8080\"]\n",
+        )
+        .unwrap();
+        assert!(cfg.server.is_internal("[::1]:8080"));
+        let cfg = load_with_system_server(
+            "h2c_bind = \"[fd00::1]:80\"\ninternal_binds = [\"[fd00::1]:80\"]\n",
+        )
+        .unwrap();
+        assert!(cfg.server.is_internal("[fd00::1]:80"));
+    }
+
+    #[test]
+    fn system_internal_binds_replace_site_internal_binds() {
+        let dir = make_test_dir();
+        setup_minimal(dir.path());
+        let mut site = minimal_site_toml();
+        site = site.replace(
+            "tls_key  = \"key.pem\"\n",
+            "tls_key  = \"key.pem\"\ninternal_binds = []\n",
+        );
+        write_file(dir.path(), "site.toml", &site);
+        let mut sys = minimal_system_toml();
+        sys.push_str("h2c_bind = \"127.0.0.1:18080\"\ninternal_binds = [\"127.0.0.1:18080\"]\n");
+        write_file(dir.path(), "system.toml", &sys);
+        let cfg = load(dir.path(), &dir.path().join("system.toml")).unwrap();
+        assert!(cfg.server.is_internal("127.0.0.1:18080"));
+    }
+
+    #[test]
+    fn redirect_mode_ignores_internal_binds() {
+        let dir = make_test_dir();
+        write_file(
+            dir.path(),
+            "site.toml",
+            r#"
+[site]
+name   = "Test"
+domain = "test.example.com"
+[server]
+redirect_bind = "0.0.0.0:80"
+internal_binds = ["203.0.113.7:80"]
+"#,
+        );
+        write_file(dir.path(), "system.toml", "");
+        let cfg = load(dir.path(), &dir.path().join("system.toml")).unwrap();
+        assert_eq!(cfg.server.redirect_bind.as_deref(), Some("0.0.0.0:80"));
     }
 }

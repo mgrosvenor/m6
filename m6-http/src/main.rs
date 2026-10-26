@@ -4342,6 +4342,7 @@ mod www_redirect_tests {
                 tls_key: Some("/tmp/key.pem".to_string()),
                 backend_timeout_secs: 30,
                 h2c_bind: None,
+                internal_binds: Vec::new(),
                 redirect_bind: None,
                 warm_on_start: false,
                 allowed_methods: vec!["GET".into(), "HEAD".into(), "POST".into()],
