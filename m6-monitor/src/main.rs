@@ -94,12 +94,9 @@ impl MonitorState {
 
 /// Build the shared state and start the poller.
 fn build_state(ctx: &AppContext) -> Result<MonitorState> {
-    let interval = Duration::from_secs(
-        ctx.config
-            .get("poll_interval_s")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(DEFAULT_POLL_SECS),
-    );
+    let interval = Duration::from_secs(fleet::poll_interval_s(|k| {
+        ctx.config.get(k).and_then(|v| v.as_u64())
+    }));
     let latest: std::sync::Arc<std::sync::RwLock<Option<Snapshot>>> =
         std::sync::Arc::new(std::sync::RwLock::new(None));
 

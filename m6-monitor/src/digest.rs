@@ -39,7 +39,7 @@ pub struct Thresholds {
     ///
     /// WireGuard rekeys about every 120 seconds while traffic flows, and the
     /// monitor's own probe each poll is that traffic. Config loading therefore
-    /// refuses a limit that does not exceed `poll_interval_s` by at least 180
+    /// refuses a limit that does not exceed the top-level `poll_interval_s` by at least 180
     /// seconds, which covers the wait for a poll, one rekey and a minute of
     /// slack. The time is the last SUCCESSFUL handshake, so it is the slow
     /// signal and the probe is the fast one.
