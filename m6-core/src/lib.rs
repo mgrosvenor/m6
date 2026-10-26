@@ -40,7 +40,6 @@ pub mod testkit;
 #[cfg(feature = "multipart")]
 pub mod multipart;
 
-/// One SQLite file with the house settings, migrations and append-only tables. Off by default; see the `sqlite` feature in Cargo.toml.
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 
