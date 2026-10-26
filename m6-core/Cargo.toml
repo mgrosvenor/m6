@@ -95,6 +95,13 @@ criterion = { version = "0.5", features = ["html_reports"] }
 rcgen     = "0.13"
 time      = "0.3"
 
+# Its own `main`: the signal mask is inherited only by threads created after
+# `block()`, and the libtest harness has already started one by the time a test
+# function runs.
+[[test]]
+name    = "log_reopen"
+harness = false
+
 [[bench]]
 name    = "critical_path"
 harness = false

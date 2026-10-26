@@ -445,6 +445,12 @@ pub struct PerfReport {
     /// the leaf is unaccounted for.
     #[serde(default)]
     pub tls_unreadable: usize,
+    /// Whether the log is emitting and when the log file was last reopened.
+    ///
+    /// `None` means a node older than this field, which is not the same as a
+    /// node that writes no log file. That case is `Some` with no `reopen`.
+    #[serde(default)]
+    pub logging: Option<LoggingHealth>,
     pub metrics: StatsSnapshot,
     /// The machine underneath: load, memory, disk, temperature, uptime.
     ///
@@ -544,6 +550,7 @@ impl PerfReport {
                     // by being polled.
                     tls: crate::tls::loaded(),
                     tls_unreadable: crate::tls::unreadable(),
+                    logging: Some(LoggingHealth::read()),
                     metrics: snapshot(),
                     host: crate::host::snapshot(host_path),
                 }))
@@ -875,6 +882,57 @@ mod tests {
         );
     }
 
+    fn authorised_perf_json() -> serde_json::Value {
+        let out = PerfReport::build(
+            PerfSubject {
+                node: "origin",
+                uptime_s: 5,
+                pools: vec![],
+                url_backends: vec![],
+                host_path: Path::new("/"),
+            },
+            PerfAccess {
+                headers: &auth("Bearer right"),
+                configured_token: Some("right"),
+            },
+            snap,
+        );
+        let (_, _, body) = out.into_response();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[test]
+    fn perf_carries_logging_with_reopen_state() {
+        let v = authorised_perf_json();
+        let p: PerfReport = serde_json::from_value(v.clone()).unwrap();
+        assert!(p.logging.is_some());
+        assert!(v["logging"].get("events_total").is_some());
+    }
+
+    #[test]
+    fn a_perf_payload_from_a_node_older_than_logging_still_parses() {
+        let mut v = authorised_perf_json();
+        assert!(v.as_object_mut().unwrap().remove("logging").is_some());
+        let p: PerfReport = serde_json::from_value(v).expect("older node must parse");
+        assert!(p.logging.is_none());
+        let l: LoggingHealth =
+            serde_json::from_str(r#"{"events_total":3,"seconds_since_last":1}"#).unwrap();
+        assert!(l.reopen.is_none());
+    }
+
+    #[test]
+    fn log_reopen_health_says_never_rather_than_zero() {
+        let h = LogReopenHealth {
+            reopens_total: 0,
+            failures_total: 0,
+            seconds_since_last_reopen: None,
+            last_reopen_unix: None,
+            seconds_since_last_failure: None,
+        };
+        let json = serde_json::to_string(&h).unwrap();
+        assert!(json.contains(r#""seconds_since_last_reopen":null"#));
+    }
+
     #[test]
     fn perf_is_401_with_a_scheme_hint_when_credentials_are_wrong() {
         let out = PerfReport::build(
@@ -1060,6 +1118,44 @@ pub struct LoggingHealth {
     /// `None` means nothing has ever been emitted, which is not the same as
     /// "emitted zero seconds ago" and must not be reported as healthy.
     pub seconds_since_last: Option<u64>,
+    /// The log file's reopen record. `None` means this process writes no log
+    /// file, or is a node older than the field.
+    #[serde(default)]
+    pub reopen: Option<LogReopenHealth>,
+}
+
+/// When a process last reopened its log file, so a reader can tell whether
+/// rotation is still running.
+///
+/// The node computes the ages itself, so clock skew between the node and its
+/// reader does not matter. `last_reopen_unix` is for a reader that stores
+/// history.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LogReopenHealth {
+    pub reopens_total: u64,
+    pub failures_total: u64,
+    /// `None` means never reopened since start, which is not the same as
+    /// "reopened zero seconds ago".
+    pub seconds_since_last_reopen: Option<u64>,
+    pub last_reopen_unix: Option<u64>,
+    pub seconds_since_last_failure: Option<u64>,
+}
+
+impl LogReopenHealth {
+    /// `None` when this process writes no log file.
+    pub fn read() -> Option<Self> {
+        if !crate::log::writes_log_file() {
+            return None;
+        }
+        let r = crate::log::reopens();
+        Some(Self {
+            reopens_total: r.successes(),
+            failures_total: r.failures(),
+            seconds_since_last_reopen: r.seconds_since_last_success(),
+            last_reopen_unix: r.last_success_unix(),
+            seconds_since_last_failure: r.seconds_since_last_failure(),
+        })
+    }
 }
 
 impl LoggingHealth {
@@ -1067,6 +1163,7 @@ impl LoggingHealth {
         Self {
             events_total: crate::log::pulse().events(),
             seconds_since_last: crate::log::pulse().seconds_since_last(),
+            reopen: LogReopenHealth::read(),
         }
     }
 
@@ -1285,12 +1382,14 @@ mod traffic_tests {
         let never = LoggingHealth {
             events_total: 0,
             seconds_since_last: None,
+            reopen: None,
         };
         assert!(never.is_blind());
 
         let alive = LoggingHealth {
             events_total: 5000,
             seconds_since_last: Some(3),
+            reopen: None,
         };
         assert!(!alive.is_blind());
 
@@ -1298,6 +1397,7 @@ mod traffic_tests {
         let quiet = LoggingHealth {
             events_total: 5000,
             seconds_since_last: Some(600),
+            reopen: None,
         };
         assert!(
             quiet.is_blind(),

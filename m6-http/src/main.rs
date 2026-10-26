@@ -325,6 +325,9 @@ fn seed_cache_warm(state: &mut ServerState) {
 // the shutdown hook writes one byte, the next `wait()` returns immediately
 // whatever timeout it was given, and the loop re-checks the flag. Two file
 // descriptors, created once.
+//
+// SIGUSR1 reopens the analytics log. Core handles it on the same thread, so
+// the epoll loop never sees it.
 
 fn setup_signals(wake: &WakeWriter) -> m6_core::signal::ShutdownHandle {
     // No `socket`: m6-http listens on TCP and UDP, not a unix socket, so there

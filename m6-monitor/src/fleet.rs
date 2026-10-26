@@ -150,6 +150,23 @@ pub struct Fleet {
     /// The round trip to the tunnel address is the fast one.
     #[serde(default = "default_tunnel_handshake_max_age_s")]
     pub tunnel_handshake_max_age_s: u64,
+    /// Seconds since a node last reopened its log file above which the monitor
+    /// reports a fault. Optional, with no default.
+    ///
+    /// A process reopens its log file when log rotation renames it and sends
+    /// SIGUSR1, and each node reports the age of its last reopen on `/perf`.
+    /// With this set, an age over the limit is a fault, and so is a node that
+    /// has not reopened at all in more than this many seconds since it
+    /// started, and so is a node too old to report the age.
+    /// Without it the age is shown in the check and the digest and never
+    /// judged.
+    ///
+    /// There is no default because analytics logging is on by default, and a
+    /// deployment that does not rotate would otherwise be faulted after every
+    /// start. A site that rotates every hour does well with twice the
+    /// interval, which is 7200.
+    #[serde(default)]
+    pub log_reopen_max_age_s: Option<u64>,
 }
 
 /// The seconds between polls, read from the top level of the service config.
@@ -507,5 +524,14 @@ tunnel = { address = "192.0.2.2:443", public_key = "KEY" }
         assert!(fleet.nodes[0].tunnel.is_none());
         assert!(fleet.wg_handshakes_file.is_none());
         assert_eq!(fleet.tunnel_handshake_max_age_s, 600);
+    }
+
+    #[test]
+    fn log_reopen_max_age_s_is_read_and_absent_means_none() {
+        let node = "[[monitor.nodes]]\nname = \"origin\"\nurl = \"http://origin.example.com\"\n";
+        let set = load(&format!("[monitor]\nlog_reopen_max_age_s = 7200\n{node}")).unwrap();
+        assert_eq!(set.log_reopen_max_age_s, Some(7200));
+        let unset = load(node).unwrap();
+        assert_eq!(unset.log_reopen_max_age_s, None);
     }
 }

@@ -19,6 +19,25 @@ the version when the release is cut.
 
 ### Changed
 
+**m6 services reopen their log file on SIGUSR1 (#234).**
+Before this change SIGUSR1 killed every m6 process at the default disposition, and `m6-http` opened its analytics file once and never reopened it, so rotation had to use `copytruncate`, which can lose the lines written between the copy and the truncate.
+SIGUSR1 now joins SIGTERM and SIGINT in the signals `m6_core::signal::block()` blocks.
+The signal thread handles it before it counts toward a forced exit, so any number of reopen signals never shut a process down.
+A process that writes no log file logs one line and carries on.
+
+Rotation renames the file and sends SIGUSR1.
+The reopen opens the new file while holding the lock the log writer takes for every line, and the writer takes that lock once per event.
+No line is lost or split, no request thread waits, and the path reappearing proves the renamed file is finished.
+If the open fails, the process keeps writing to the previous file, logs an error and records the failure.
+The path is made absolute once at start, so a later change of working directory cannot redirect a reopen.
+
+`/traffic` also reads the newest rotated file next to the live log, named `<name>-YYYYmmddHH` with or without `.gz`, so its window does not shrink just after an hourly rotation.
+`m6_core::log::read_recent` does the read, and `/traffic` runs it on the event loop, so the work is bounded.
+A plain rotated file is read from a seek, so at most 24 MB are read however large the file is.
+The rotated file is skipped when the live tail already filled that budget, and when it was last written before the start of the `/traffic` window.
+A `.gz` file is decoded only when it is no larger than the budget on disk and the uncompressed size in its trailer is no larger than the budget, and the decoder stops at the budget whatever the trailer says.
+A skipped rotated file means the report covers the live file.
+
 **A listener is internal only when the config says so (#232).**
 m6-http used to decide from a listener's bind address whether it was internal.
 Three things followed from that guess: the statistics label, whether the h2c listener believed the client address a cache node forwards, and whether the custom error path was served.
@@ -53,6 +72,26 @@ Verified: `cargo deny check` passes, and the release build has no warnings. The
 workspace tests pass with 0 failures, h3 and QUIC included.
 
 ### Added
+
+**`/perf` and `/traffic` report the last log reopen, and m6-monitor faults when it is too old (#234).**
+`logging.reopen` gives `reopens_total`, `failures_total`, `seconds_since_last_reopen`, `last_reopen_unix` and `seconds_since_last_failure`.
+`seconds_since_last_reopen` is `null` until the first reopen, which is not the same as zero.
+`reopen` is `null` for a process that writes no log file.
+`/perf` gains a `logging` block, and a node older than the field still parses.
+
+m6-monitor shows the age for each node in `/check` section A and in `/digest` as `nodes[].log_reopen` (`state`, `age_s`, `last_unix`, `reopens`, `failures`, `last_failure_age_s`, `detail`).
+The new `[monitor] log_reopen_max_age_s` is optional and has no default, because analytics logging is on by default and a deployment that does not rotate would otherwise fault two hours after every start.
+`/digest` carries it as `thresholds.log_reopen_age_s`.
+With it set, these are Faults:
+
+- a last reopen older than the limit
+- a node that has not reopened in more than the limit since it started
+- a last reopen that failed and has no success after it
+- a node too old to report the age
+
+Without it the state is shown and never judged.
+
+A main log that has gone quiet, which section A already printed as a FAULT, is now also a digest finding, so the verdict counts it and `ALL CLEAR` no longer appears above it.
 
 **m6-monitor reports each node's tunnel round trip and WireGuard handshake age
 (#226).**
