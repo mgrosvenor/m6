@@ -50,6 +50,9 @@ pub struct NodeReading {
     pub traffic_error: Option<String>,
     /// Set when the node could not be reached at all.
     pub unreachable: Option<String>,
+    /// The WireGuard tunnel to this node. Filled by `tunnel::fleet` after the
+    /// HTTP poll, and `None` when no tunnel is configured.
+    pub tunnel: Option<crate::tunnel::TunnelReading>,
 }
 
 impl NodeReading {
@@ -173,6 +176,7 @@ pub fn node(
         header_checks: Vec::new(),
         rtt: None,
         unreachable: None,
+        tunnel: None,
     };
 
     let agent = agent_for(timeout);
@@ -327,6 +331,7 @@ pub fn fleet(
                     header_checks: Vec::new(),
                     rtt: None,
                     unreachable: Some("poll thread panicked".to_string()),
+                    tunnel: None,
                 })
             })
             .collect()
@@ -354,6 +359,7 @@ mod tests {
             header_checks: Vec::new(),
             rtt: None,
             unreachable: unreachable.map(|s| s.to_string()),
+            tunnel: None,
         }
     }
 

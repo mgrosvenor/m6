@@ -186,6 +186,7 @@ cat > "$BENCH_DIR/system.toml" <<EOF
 [server]
 bind     = "$BENCH_ADDR"
 h2c_bind = "$H2C_BENCH_ADDR"
+internal_binds = ["$H2C_BENCH_ADDR"]
 tls_cert = "cert.pem"
 tls_key  = "key.pem"
 EOF

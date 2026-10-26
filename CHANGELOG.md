@@ -12,6 +12,155 @@ releases only; work happens on `develop`. See `CONTRIBUTING.md`.
 
 ---
 
+## Unreleased
+
+Changes merged to `develop` since the last release. The section is renamed to
+the version when the release is cut.
+
+### Changed
+
+**A listener is internal only when the config says so (#232).**
+m6-http used to decide from a listener's bind address whether it was internal.
+Three things followed from that guess: the statistics label, whether the h2c listener believed the client address a cache node forwards, and whether the custom error path was served.
+`[server] internal_binds` now names the internal listener by address.
+m6-http refuses an entry that is not an IP address and port, is not in a local range (`m6_core::net::is_private_ip`), or is not its `h2c_bind`.
+Only the h2c listener can be internal.
+An entry that equals `bind` is refused, because the TLS and QUIC listener faces clients and stays external.
+
+**Migration.**
+A config with `h2c_bind` must add `internal_binds`, or m6-http exits 2 and says what to add.
+`internal_binds = ["<h2c_bind>"]` keeps today's behaviour for an h2c listener on a local IP address, and `internal_binds = []` treats it as public.
+An h2c listener bound to a host name or a public address can only be declared public.
+Add the key before upgrading, because older versions ignore it.
+A `bind` on a private address is now labelled `external` in `/perf`.
+
+Verified: `cargo test --workspace` gives 1297 passed and 0 failed, clippy is silent with `-D warnings`, and the release and test builds have no warnings.
+Thirteen new config tests, two rewritten h2c trust tests and four tests that run the real binary cover every refusal, both migration messages and a valid start.
+Two of the binary tests send requests over h2c under a rate limit and show that a declared listener believes the forwarded address and a public one does not.
+A diff of the three cache-hit blocks in `m6-http/src/main.rs` against the base is empty, so the request path for a cache hit is untouched.
+Example 09's integration test in m6-examples ran to "All assertions passed" with no `SKIP` against an earlier build of this change, with its h2c listener declared the same way.
+
+### Security
+
+**Four dependencies moved up a patch version to clear seven RustSec advisories
+(#230).** rustls 0.23.45 to 0.23.46, rustls-webpki 0.103.15 to 0.103.16, tokio
+1.53.1 to 1.53.3, and webpki-roots 1.0.9 to 1.0.10. This clears
+RUSTSEC-2026-0346, -0347, -0348, -0349, -0381, -0382 and -0386, which had turned
+CI's `cargo deny` job red on every open pull request. Only `Cargo.lock` changes;
+no `Cargo.toml` requirement moved.
+
+Verified: `cargo deny check` passes, and the release build has no warnings. The
+workspace tests pass with 0 failures, h3 and QUIC included.
+
+### Added
+
+**m6-monitor reports each node's tunnel round trip and WireGuard handshake age
+(#226).**
+For each node that has a `tunnel` configured, the monitor host times up to three TCP connects to the node's tunnel address and reads the age of that peer's latest WireGuard handshake.
+Both appear in `/check` section H, in `/digest` as `nodes[].tunnel` (`rtt_ms`, `rtt_samples_ms`, `probe`, `probe_error`, `handshake`, `handshake_age_s`, `handshake_detail`) and as a tunnel column on the HTML page.
+`/digest` also carries `handshake_file_age_s` once for the monitor, and `thresholds.tunnel_handshake_age_s`.
+Section H prints the `wg` interface drops from a node's `/perf` `host.net` when that node reports them, and only when at least one node has a tunnel.
+
+The round trip is a TCP connect because ICMP needs `CAP_NET_RAW`, which the monitor's unit does not hold.
+A reset from a closed port still measures the path.
+One connect that gets through in a poll means the tunnel answered.
+The outcome is then `connected`, the round trip is the minimum of the connects that got through, and the sample count shows a partial loss.
+Only a poll where no connect gets through is `no_answer`.
+The probe of a node has one deadline of `timeout_ms`.
+Up to three connects run one after another, each given what is left of that time, and a connect that times out ends the probe.
+A dead tunnel therefore costs one `timeout_ms`.
+A poll runs the HTTPS requests first and the probe after them, all on `timeout_ms`, so a node that is down can cost up to four `timeout_ms` in one poll.
+A reading goes stale when one poll takes longer than twice `poll_interval_s`, so keep `timeout_ms` under half of `poll_interval_s`.
+
+The handshake is read from a file because `wg show` needs `CAP_NET_ADMIN`.
+A privileged timer writes the output of `wg show <interface> latest-handshakes` to the file and m6-monitor reads it as data.
+That timer must run for the handshake age to be judged, including under `--check` from cron.
+`wg show <interface> dump` must not be used because it carries the interface private key.
+A handshake time is the last successful one, so the age is the slow signal and the probe is the fast one.
+
+Every tunnel finding is a Fault:
+
+- a probe with no answer
+- a peer that never handshook
+- a peer absent from the interface
+- a handshake older than the limit
+- a handshakes file that is missing or unreadable
+- a handshakes file older than the limit, which is one monitor-level fault naming the file and saying its collector has probably stopped, and the node handshakes then read as unknown
+- a node with a `tunnel` and no `public_key`
+- tunnels configured with no `wg_handshakes_file`, which is one monitor-level fault
+
+Findings are computed before the unreachable-node case, so a node whose HTTP poll failed still reports its tunnel.
+Probing runs on the background poller, and in `--check` in its own process.
+No request handler changed.
+
+Configuration is optional except where a tunnel needs it.
+`[monitor]` takes `wg_handshakes_file`, which any node with a `tunnel` needs, and `tunnel_handshake_max_age_s` (default 600).
+With a tunnel configured, loading the config fails when `tunnel_handshake_max_age_s` is below the top-level `poll_interval_s` plus `timeout_ms` rounded up to whole seconds plus 180.
+The error names all three inputs and the minimum.
+The poller and this check read the same top-level `poll_interval_s` through one function, and a `poll_interval_s` under `[monitor]` is not read.
+WireGuard rekeys every 120 seconds only while traffic flows, and the probe each poll is that traffic.
+The 180 seconds also has to hold the period of the timer that writes the handshakes file.
+The monitor does not know that period, so it must fit inside the 180 seconds.
+Each `[[monitor.nodes]]` takes `tunnel = { address = "<ip>:<port>", public_key = "<peer public key>" }`, where the address must be an IP literal and a port, and a name or a bad value is a config error.
+A node with no tunnel is reported as not configured.
+
+The HTML page escapes node name, role, status, findings and the tunnel column with `m6_core::util::html_escape`.
+That function escapes `&`, `<`, `>` and `"`, and the m6-http error page now calls it in place of a private copy.
+
+**`m6-core::wireguard`**, a new module. `Handshakes::parse_latest_handshakes`,
+`from_file`, `find` and `PeerHandshake` read the `latest-handshakes` output. A
+time of 0 means the peer never completed a handshake, a missing file is
+`Ok(None)`, and a malformed line is an error naming the line.
+`docs/m6-core-reference.md` (component index and module section) and the
+`m6-monitor` row of Table 7 in `docs/m6-architecture.md` describe both.
+
+Verified: `cargo test -p m6-monitor -p m6-core` passes for the wireguard tests
+(7), the m6-monitor unit tests (87) and the m6-monitor integration tests that
+include the loopback tunnel probe, with 0 failures and no warnings. Not run
+locally: conformance and the MSRV build, which CI covers.
+
+**Small APIs can now return the rows for a time range as JSON Lines, a page at a
+time (#225).** Three additions to m6-core. `m6_core::net` has `is_private_ip` and
+`bind_ip`, one definition of a private address. `m6_core::time_range` reads
+required `from` and `to` query keys as RFC 3339 UTC times for a half-open range
+`[from, to)`, with a longest span (31 days unless the service asks for another)
+and a 400 that says what to fix without repeating what the client sent.
+`m6_core::ndjson` gains `Page`, which a service fills with rows until it says
+`Full`. The service then sends the key of the next row as a `Cursor`, and the
+response carries it in a `Link: <...>; rel="next"` header. `PageLimits` default
+to 4 MiB and 10,000 rows and cannot exceed 64 MiB, half of the 128 MiB that
+m6-http will buffer from a backend; a test in m6-http keeps that true. m6-http's
+rule for which listeners are internal is unchanged.
+
+Why: a website that serves a log or a report for a period needs the same
+decisions each time: the time format, whether the end is included, how long a
+range may be, how big a response may be, and how a client asks for the rest.
+These are now made once, in m6-core.
+
+Verified: `cargo fmt --check` and `cargo clippy --workspace --all-targets -- -D
+warnings` pass with no warnings, and `cargo test --workspace` passes with 0
+failures. This was run against unit tests only; no page was served from a
+running m6-http.
+
+### Docs
+
+**Two contributor rules in CLAUDE.md corrected (#223).** The rule that a change
+to layout, copy or rendering needs individual approval now applies only to
+changes a visitor can reach. A page no visitor can reach, such as m6-monitor's
+own page on its private socket, does not need that approval. The rule that every
+commit ends with a fixed `Co-Authored-By` line is removed, because the line
+named one model version and went stale each time the model changed.
+
+The first rule, read literally, asked for sign-off on every page m6 renders,
+including operator pages that only the operator's own tools can open. The second
+told contributors to write a trailer that was wrong as soon as it was written.
+
+Verified by reading the diff: it touches only `CLAUDE.md`, replacing one bullet
+and deleting one paragraph with its code block. No code and no other document
+changes, and no tests were run.
+
+---
+
 ## 1.13.0 — 2026-10-02
 
 **A server that terminates TLS now says how long its certificate has left.**

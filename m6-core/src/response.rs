@@ -353,6 +353,15 @@ impl Response {
         }
     }
 
+    /// A 400 refusing a request parameter: `message` and a newline as plain
+    /// text, `no-store` and `nosniff`. The message must not echo client input.
+    pub(crate) fn refusal(message: &dyn std::fmt::Display) -> Self {
+        Self::text(&format!("{message}\n"))
+            .with_status(400)
+            .header("Cache-Control", "no-store")
+            .header("X-Content-Type-Options", "nosniff")
+    }
+
     pub fn status(code: u16) -> Self {
         Self {
             status: code,

@@ -1,6 +1,6 @@
 # m6-core, component reference
 
-**Status: reference. Describes the crate as it is, at 31 modules and ~13,400
+**Status: reference. Describes the crate as it is, at 37 modules and ~13,400
 lines.** Where this disagrees with the code, the code is right and this file is
 a bug.
 
@@ -80,7 +80,7 @@ The off-by-default features `sqlite` and `multipart` are invisible to
 
 ## 3. Component index
 
-Thirty-one modules. Grouped by what you would be doing when you reach for one.
+Thirty-seven modules. Grouped by what you would be doing when you reach for one.
 
 **Building a service**
 
@@ -98,12 +98,14 @@ Thirty-one modules. Grouped by what you would be doing when you reach for one.
 
 | module | what it is |
 |---|---|
+| `dict` | The request dictionary: a shared base plus a per-request overlay. |
 | `request` | `Request`, the handler's view: the dictionary, body access, file I/O helpers, query and form parsing, URL coding. |
 | `response` | `Response`, every constructor a handler needs, and `send`. |
 | `http` | `RawRequest`, `RawResponse`, `Method`, the `HeaderSource` trait, `is_same_origin_path`. |
 | `headers` | Reading and writing a header list, once. `get`, `get_all`, `combine`, `set`, `append`, `remove`. |
 | `cookie` | `Cookie` and `SameSite`. One place that says what a cookie can be. |
 | `multipart` | `Upload` and `parse_upload`. Feature `multipart`. |
+| `time_range` | `TimeRange`, the `from` and `to` of a query read as a half-open UTC range, and `rfc3339_utc_ms`. |
 
 **HTTP semantics**
 
@@ -122,7 +124,7 @@ Thirty-one modules. Grouped by what you would be doing when you reach for one.
 |---|---|
 | `compress` | brotli and gzip, compress and decompress. |
 | `minify` | HTML, JS, CSS, JSON. |
-| `util` | `slugify`, `now_iso8601`, `today_iso8601`, `iso8601_minutes_ago`. |
+| `util` | `slugify`, `now_iso8601`, `today_iso8601`, `iso8601_minutes_ago`, `html_escape`. |
 | `random` | `random_hex_token::<N>()`. One CSPRNG token generator, so there is never a third. |
 
 **Observability**
@@ -135,7 +137,8 @@ Thirty-one modules. Grouped by what you would be doing when you reach for one.
 | `host` | What the machine is doing. Load, memory, disk, thermal, net, diskstats, pressure, TCP, fds. |
 | `tls` | How long the loaded certificate has left: `not_after_unix`, `record_loaded`, `loaded`, `TlsCertificate`. |
 | `firewall` | `FirewallState` from nftables' own JSON. |
-| `ndjson` | Newline-delimited JSON, read and written, tolerant of torn lines. |
+| `wireguard` | `Handshakes` from `wg show <if> latest-handshakes` output. |
+| `ndjson` | Newline-delimited JSON, read and written, tolerant of torn lines, and served as bounded pages with a cursor. |
 
 **Storage**
 
@@ -147,6 +150,7 @@ Thirty-one modules. Grouped by what you would be doing when you reach for one.
 
 | module | what it is |
 |---|---|
+| `net` | `is_private_ip` and `bind_ip`. The one definition of a private address. |
 | `error` | `Error` and `Result`. Eighteen lines. |
 | `testkit` | The shared integration harness. Feature `testkit`. |
 
@@ -387,6 +391,32 @@ This does not decide policy. It makes "which of our cookies are HttpOnly?" a
 question with an answer, which it was not when four `format!` calls with
 different attribute sets were the implementation.
 
+### `time_range`
+
+`TimeRange::from_query(query, max_span)` and `TimeRange::from_request(req,
+max_span)` read `from` and `to`. `DEFAULT_MAX_SPAN` is 31 days.
+
+- Both keys are required and each may appear once. Other keys are ignored, so a
+  cursor or a filter passes through.
+- A value is RFC 3339 in UTC with an uppercase `T` and a final `Z`, such as
+  `2026-01-01T00:00:00Z`. Fractions of a second are accepted. An offset such as
+  `+10:00` is refused.
+- The range is half open, `[from, to)`. `contains(t)` is `from <= t < to`, so
+  two adjacent ranges never share a row.
+- `from` is not before 1970, `to` is later than `from`, and the span is at most
+  `max_span`.
+- `from_unix_ms`, `to_unix_ms`, `from_unix_s` and `to_unix_s` round up, so for
+  integer timestamps `from_ms <= t < to_ms` is exactly `[from, to)`.
+
+`TimeRangeError::to_response()` is a 400 in plain text with `no-store` and
+`nosniff`. It says which parameter to fix and never repeats the value the
+client sent.
+
+`rfc3339_utc_ms(unix_ms)` formats a millisecond timestamp as
+`2026-01-01T00:00:00.123Z`. It returns a value that formats when displayed, so a
+row can carry it without a `String` per line. A negative or out-of-range input
+gives the epoch.
+
 ---
 
 ## 6. HTTP semantics
@@ -462,6 +492,21 @@ entries for one byte-identical response.
 is a security boundary and it existed three times, with three behaviours. There
 is one now.
 
+### `net`
+
+`is_private_ip(ip)` is the one answer to "is this on a private network".
+`bind_ip(bind)` pulls the address out of `ip:port`, `[v6]:port` or a bare
+address, and gives `None` for a host name. Names are never resolved.
+
+| family | private |
+|---|---|
+| IPv4 | `127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16`, `100.64.0.0/10` |
+| IPv6 | `::1`, `fc00::/7`, `fe80::/10` |
+
+An IPv4-mapped IPv6 address is classified by its IPv4 form. `0.0.0.0` and `::`
+are not private. A check on a peer address only means something on a socket
+that faces the client directly; behind a proxy the peer is the proxy.
+
 ---
 
 ## 7. Content
@@ -472,7 +517,7 @@ is one now.
 `minify`: `minify_html(data, minify_inline_js)`, `minify_js`, `minify_css`,
 `minify_json`.
 
-`util`: `slugify`, `today_iso8601`, `now_iso8601`, `iso8601_minutes_ago`.
+`util`: `slugify`, `today_iso8601`, `now_iso8601`, `iso8601_minutes_ago`, `html_escape`.
 
 `random`: `random_hex_token::<N>()`. There were two byte-identical copies at
 two lengths. Both were correct; the hazard is the third one, written by someone
@@ -689,6 +734,21 @@ It reports the deliberate blocks and whether they are still being hit. It does
 not report "180 packets from 10 sources", which never changed and never prompted
 an action.
 
+### `wireguard`
+
+`Handshakes::parse_latest_handshakes(text)`, `from_file(path)`, `find(key)`, and `PeerHandshake`.
+
+It reads a file because WireGuard state needs `CAP_NET_ADMIN`.
+A systemd timer writes the output of `wg show <if> latest-handshakes`, and m6 reads it as ordinary data.
+A time of 0 means the peer never completed a handshake.
+A missing file is `Ok(None)`, and a malformed line is an error naming the line.
+
+Do not use `wg show <if> dump`, because it carries the interface private key.
+
+The time is the last successful handshake.
+After a key changes under a tunnel it stops moving, and it still looks recent for minutes.
+An age is therefore the slow signal, and a probe over the tunnel is the fast one.
+
 ### `ndjson`
 
 `read_str(text)`, `Reader::new(r)` with `skipped()` and `read_count()`,
@@ -698,6 +758,33 @@ an action.
 appended to while it is read, so the last line can be half-written and a reader
 that fails the whole stream on one bad line fails whenever it reads during a
 write. Readers skip what they cannot parse; `skipped()` is how you find out.
+
+**Pages for responses.** A service that answers with rows builds a `Page` from
+`PageLimits` and calls `push(&row)` for each row. A row must serialise to a JSON
+object. `push` returns `Pushed::Full`, without writing, when the row would pass
+the byte or row limit. The service then makes a `Cursor` from the key of that
+row and calls `page.into_response(req.query(), next.as_ref())`.
+
+- The defaults are 4 MiB and 10,000 rows (`DEFAULT_PAGE_BYTES`,
+  `DEFAULT_PAGE_ROWS`). `PageLimits::new` clamps the bytes to at most
+  `MAX_PAGE_BYTES`, 64 MiB.
+- That maximum is half of the 128 MiB that m6-http will buffer from a backend.
+  m6-http holds every backend body in memory, so a page is one complete response
+  body that is sent whole. A test in m6-http keeps the maximum under that cap.
+- The first row of a page is kept even when it is bigger than `max_bytes`, so a
+  client can always make progress. A row bigger than `MAX_PAGE_BYTES` is an
+  `InvalidData` error.
+- The response is 200 with `Content-Type: application/x-ndjson`, `no-store` and
+  `nosniff`. It is framed with `Content-Length`, has no ETag and is not
+  compressed.
+- With a next cursor, the response has `Link: <?QUERY>; rel="next"`. QUERY is the
+  request's query with any `cursor` removed and the new one added, and bytes
+  outside the URI query set are percent-encoded. A client follows the link until
+  a response has none.
+- `Cursor::new(s)` takes 1 to 128 bytes of `A-Za-z0-9-._~`, so it needs no
+  encoding. `Cursor::from_query(query)` gives `None` when the key is absent, and
+  a `CursorError` when it is repeated, empty or malformed. `to_response()` is a
+  400 that does not repeat the value.
 
 ---
 
@@ -733,12 +820,6 @@ brochure.
 - **`FrameworkState::build_dict` is private.** Twelve ordered steps of real
   knowledge that a service not using `App` cannot reach. This is the open
   "header to dict" item.
-- **Seventeen of thirty-one modules have no module-level doc comment**: `app` has a
-  one-line stub, and `compress`, `config`, `error`, `http`, `log`, `mime`,
-  `minify`, `multipart`, `parse`, `path`, `request`, `response`, `server`,
-  `signal`, `template`, `util` and `watcher` have none. The fourteen that do are
-  the best documentation in the repository, which makes the gap sharper rather
-  than softer.
 - **`h1`'s module doc calls `parse.rs` "(deleted)".** The file exists and is on
   the production path of every socket backend. What was deleted is the parser
   that used to be in it; it is now the stream adapter described in §6.

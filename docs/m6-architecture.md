@@ -227,7 +227,7 @@ Table 7 names what that produces.
 | `m6-html` | render HTML from templates and JSON data | behind the edge |
 | `m6-file` | serve files from the filesystem | behind the edge |
 | `m6-auth-server` | verify credentials and sign *JWTs* (*JSON Web Tokens*) | behind the edge |
-| `m6-monitor` | poll each node's health and performance endpoints and serve one report | behind the edge |
+| `m6-monitor` | poll each node's health and performance endpoints, and where configured its tunnel round trip and WireGuard handshake age, and serve one report | behind the edge |
 
 **Table 7: the five serving binaries, the one job each has, and where each sits.**
 Take from it that only `m6-http` is reachable from the internet, that it is one binary running in two modes rather than two programs, and that everything else answers HTTP/1.1 on a Unix socket behind it.

@@ -14,6 +14,12 @@
 //! generates no load and runs no scans. The third, that it is measuring from
 //! wherever it happens to run, is unavoidable and is labelled instead.
 //!
+//! Section H measures the tunnel to each node with a TCP connect and a
+//! WireGuard handshake age, and sends no request. The handshake age comes from
+//! the file a separate privileged timer writes, so `--check` from cron judges
+//! it only while that timer runs. A file older than
+//! `tunnel_handshake_max_age_s` is itself a fault.
+//!
 //! Exit status is 1 when there are faults, so it works as a cron check.
 
 use std::fmt::Write as _;
@@ -579,6 +585,56 @@ pub fn render(d: &Digest, readings: &[NodeReading]) -> String {
         );
     }
 
+    // ── H. tunnels ───────────────────────────────────────────────────────────
+    let _ = writeln!(
+        o,
+        "\nH. TUNNELS  (TCP connect from this host to each tunnel address; no request is sent)"
+    );
+    if d.nodes.iter().all(|n| n.tunnel.is_none()) {
+        let _ = writeln!(
+            o,
+            "  none configured. Add tunnel = {{ address = \"ip:port\", public_key = \"...\" }} to a [[monitor.nodes]] entry."
+        );
+    } else {
+        if let Some(age) = d.handshake_file_age_s {
+            let _ = writeln!(o, "  handshake file written {age}s ago");
+        }
+        for n in &d.nodes {
+            match &n.tunnel {
+                None => {
+                    let _ = writeln!(o, "  {:<5} no tunnel configured", n.name);
+                }
+                Some(t) => {
+                    let _ = writeln!(
+                        o,
+                        "  {:<5} {}  {}  handshake {}",
+                        n.name,
+                        t.address,
+                        t.rtt_text(),
+                        t.handshake_text()
+                    );
+                }
+            }
+        }
+        // The kernel's own count of what the tunnel interface refused to carry,
+        // from each node's /perf, when the node reported it.
+        for (n, r) in d.nodes.iter().zip(readings) {
+            let Some(p) = &r.perf else { continue };
+            for dev in p.host.net.iter().filter(|dev| dev.name.starts_with("wg")) {
+                let _ = writeln!(
+                    o,
+                    "  {:<5} {} drops rx {} tx {} (errors rx {} tx {})",
+                    n.name, dev.name, dev.rx_drop, dev.tx_drop, dev.rx_errs, dev.tx_errs
+                );
+            }
+        }
+    }
+    let _ = writeln!(
+        o,
+        "  The rtt is the tunnel path from this host, unlike section B's HTTPS rtt.\n  \
+         It is not the node's own latency."
+    );
+
     // ── verdict ──────────────────────────────────────────────────────────────
     let _ = writeln!(o, "\n{bar}");
     let faults: Vec<_> = d
@@ -789,6 +845,7 @@ mod tests {
             header_checks: Vec::new(),
             rtt: None,
             unreachable: None,
+            tunnel: None,
         }
     }
 
@@ -966,5 +1023,91 @@ mod header_check_tests {
         assert_eq!(fmt_cert_expiry(86_399), "0d");
         assert_eq!(fmt_cert_expiry(-3 * 86_400), "EXPIRED 3d ago");
         assert_eq!(fmt_cert_expiry(-1), "EXPIRED 0d ago");
+    }
+}
+
+#[cfg(test)]
+mod tunnel_tests {
+    use super::tests::{digest, reading};
+    use super::*;
+    use crate::tunnel::{Handshake, Probe, ProbeResult, TunnelReading};
+    use std::time::Duration;
+
+    fn with_tunnel(name: &str, handshake: Handshake) -> NodeReading {
+        let mut r = reading(name, None);
+        r.tunnel = Some(TunnelReading {
+            address: "192.0.2.2:443".into(),
+            key_prefix: Some("AAAAAAAA".into()),
+            probe: ProbeResult {
+                samples: vec![Duration::from_micros(400); 3],
+                outcome: Probe::Connected,
+            },
+            handshake,
+            file_age_s: Some(7),
+        });
+        r
+    }
+
+    fn out(rs: &[NodeReading]) -> String {
+        let d = crate::digest::build(rs, &crate::digest::Thresholds::default(), "now".into());
+        render(&d, rs)
+    }
+
+    #[test]
+    fn the_tunnel_section_is_always_printed() {
+        let o = render(&digest(), &[reading("origin", None)]);
+        assert!(o.contains("H. TUNNELS"), "{o}");
+        assert!(o.contains("none configured"), "{o}");
+        assert!(o.contains("ALL CLEAR"), "{o}");
+    }
+
+    #[test]
+    fn a_tunnel_line_shows_rtt_with_its_sample_count_and_handshake_age() {
+        let o = out(&[with_tunnel("edge-a", Handshake::At { age_s: 42 })]);
+        assert!(o.contains("rtt 0.40ms (n 3, connected)"), "{o}");
+        assert!(o.contains("handshake 42s ago"), "{o}");
+        assert!(o.contains("handshake file written 7s ago"), "{o}");
+    }
+
+    #[test]
+    fn a_peer_with_no_handshake_says_never_and_removes_all_clear() {
+        let o = out(&[with_tunnel("edge-a", Handshake::Never)]);
+        assert!(o.contains("handshake never"), "{o}");
+        assert!(!o.contains("ALL CLEAR"), "{o}");
+    }
+
+    #[test]
+    fn a_tunnel_with_no_handshake_source_removes_all_clear() {
+        let o = out(&[with_tunnel("edge-a", Handshake::NoPublicKey)]);
+        assert!(o.contains("public_key"), "{o}");
+        assert!(!o.contains("ALL CLEAR"), "{o}");
+        let o = out(&[with_tunnel("edge-a", Handshake::NoHandshakesFile)]);
+        assert!(o.contains("wg_handshakes_file"), "{o}");
+        assert!(!o.contains("ALL CLEAR"), "{o}");
+    }
+
+    #[test]
+    fn a_node_without_a_tunnel_says_so_beside_one_that_has_one() {
+        let o = out(&[
+            with_tunnel("edge-a", Handshake::At { age_s: 1 }),
+            reading("edge-b", None),
+        ]);
+        assert!(o.contains("192.0.2.2:443"), "{o}");
+        assert!(o.contains("edge-b no tunnel configured"), "{o}");
+    }
+
+    #[test]
+    fn wg_interface_drops_are_shown_when_the_node_reports_them() {
+        let mut r = with_tunnel("edge-a", Handshake::At { age_s: 1 });
+        let mut host = m6_core::host::HostSnapshot::default();
+        host.net.push(m6_core::host::NetDevice {
+            name: "wg0".into(),
+            rx_drop: 3,
+            tx_drop: 4,
+            ..Default::default()
+        });
+        r.perf = Some(crate::digest::tests::perf(host, vec![]));
+        let o = out(&[r]);
+        assert!(o.contains("wg0 drops rx 3 tx 4"), "{o}");
     }
 }
