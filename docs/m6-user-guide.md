@@ -1280,6 +1280,42 @@ journalctl -u m6-http --since "2024-01-15 09:00" --until "2024-01-15 10:00"
 
 ---
 
+### Rotating the analytics log
+
+`m6-http` writes the analytics log to one file and reopens it when it receives SIGUSR1.
+Rotation renames the file and sends the signal, so no line is lost, and `copytruncate` is not needed.
+This logrotate stanza rotates the file every hour.
+
+```
+/var/www/example/logs/analytics.ndjson {
+    hourly
+    dateext
+    dateformat -%Y%m%d%H
+    rotate -1
+    compress
+    missingok
+    notifempty
+    postrotate
+        systemctl kill --kill-whom=main --signal=SIGUSR1 m6-http.service
+        timeout 10 sh -c 'until test -e "$1"; do sleep 0.1; done' sh "$1"
+    endscript
+}
+```
+
+There is no `create` line, because `m6-http` creates the file itself.
+The wait in `postrotate` is a proof.
+The log writer cannot write to the renamed file once the new file exists, so the old file is finished before logrotate compresses it.
+If the reopen fails, the wait times out and `postrotate` fails.
+`--kill-whom=` needs systemd 252 or later, and older systemd spells it `--kill-who=`.
+
+`/perf` reports the last reopen as `logging.reopen`, with the seconds since the last reopen, how many reopens succeeded and failed, and the age of the last failure.
+`m6-monitor` shows it for each node in section A of `/check` and in `/digest`.
+Setting `[monitor] log_reopen_max_age_s` makes it a fault when a node's last reopen is older than that many seconds.
+A limit of twice the rotation interval suits an hourly rotation.
+`/traffic` reads the newest rotated file next to the log, so its sixty minute window does not shrink just after a rotation.
+
+---
+
 ### Deploy updates
 
 ```bash

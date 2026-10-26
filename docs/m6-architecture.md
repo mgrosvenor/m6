@@ -235,7 +235,8 @@ Take from it that only `m6-http` is reachable from the internet, that it is one 
 Two command line tools sit outside that set and serve nothing: `m6-md` converts a directory of Markdown into one JSON file, and `m6-auth-cli` manages users and groups against the auth database.
 
 **A site is therefore data and configuration only**, which is the third constraint showing up in the filesystem: `site.toml`, one config file per backend process, templates, assets, and content as JSON.
-No binaries live in a site, because they are found through the system path, and no log directory, because every process logs to stdout for the supervisor to capture (§3.3).
+No binaries live in a site, because they are found through the system path.
+No process keeps a log directory except `m6-http`, whose analytics file is the one exception, because every other process logs to stdout for the supervisor to capture (§3.3).
 
 ---
 
@@ -270,7 +271,9 @@ Restart policy, resource limits, dependency ordering, log capture and service is
 So `m6-http` spawns nothing, monitors nothing and restarts nothing, and expects its backends to be running.
 
 Two consequences follow.
-Every process logs structured JSON to stdout and journald captures it, so a site has no log directory and no rotation of its own.
+Every process logs structured JSON to stdout and journald captures it.
+The one exception is the analytics file that `m6-http` writes.
+A site rotates that file by renaming it and sending `m6-http` SIGUSR1, and the process reopens the path.
 And a crashed backend restarts in seconds, which is what makes §4.5 affordable.
 
 ### 3.4 Why pool membership is discovered rather than declared
