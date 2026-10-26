@@ -116,7 +116,12 @@ fn probe_with(timeout: Duration, mut connect: impl FnMut() -> std::io::Result<()
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Handshake {
-    NotConfigured(&'static str),
+    /// The node has a `tunnel` but no `public_key`, so no peer can be looked up.
+    NoPublicKey,
+    /// Tunnels are configured but `wg_handshakes_file` is not set.
+    NoHandshakesFile,
+    /// The handshake could not be read for a reason already reported elsewhere.
+    Unknown(&'static str),
     FileMissing(String),
     FileError(String),
     /// The file is older than `tunnel_handshake_max_age_s`, so its collector
@@ -142,7 +147,7 @@ pub type HandshakeSource = Result<(Handshakes, Option<u64>), Handshake>;
 /// timestamps are not judged, because they were true when it was written.
 pub fn load(path: Option<&str>, max_age_s: u64) -> HandshakeSource {
     let Some(path) = path else {
-        return Err(Handshake::NotConfigured("no wg_handshakes_file configured"));
+        return Err(Handshake::NoHandshakesFile);
     };
     match Handshakes::from_file(std::path::Path::new(path)) {
         Ok(None) => Err(Handshake::FileMissing(path.to_string())),
@@ -165,18 +170,20 @@ pub fn load(path: Option<&str>, max_age_s: u64) -> HandshakeSource {
 }
 
 pub fn handshake_for(src: &HandshakeSource, public_key: Option<&str>, now_unix: u64) -> Handshake {
-    let Some(key) = public_key else {
-        return Handshake::NotConfigured("no public_key for this node");
+    // A file problem is the monitor's and is reported first.
+    let (handshakes, _) = match src {
+        Err(h) => return h.clone(),
+        Ok(ok) => ok,
     };
-    match src {
-        Err(h) => h.clone(),
-        Ok((handshakes, _)) => match handshakes.find(key) {
-            None => Handshake::PeerAbsent,
-            Some(p) => match p.latest_unix {
-                None => Handshake::Never,
-                Some(ts) => Handshake::At {
-                    age_s: now_unix.saturating_sub(ts),
-                },
+    let Some(key) = public_key else {
+        return Handshake::NoPublicKey;
+    };
+    match handshakes.find(key) {
+        None => Handshake::PeerAbsent,
+        Some(p) => match p.latest_unix {
+            None => Handshake::Never,
+            Some(ts) => Handshake::At {
+                age_s: now_unix.saturating_sub(ts),
             },
         },
     }
@@ -203,7 +210,7 @@ impl TunnelReading {
                 samples: Vec::new(),
                 outcome: Probe::Failed("probe thread panicked".to_string()),
             },
-            handshake: Handshake::NotConfigured("probe thread panicked"),
+            handshake: Handshake::Unknown("probe thread panicked"),
             file_age_s: None,
         }
     }
@@ -358,15 +365,20 @@ mod tests {
     }
 
     #[test]
-    fn no_public_key_and_no_file_are_not_configured_rather_than_absent() {
-        assert!(matches!(
+    fn a_node_with_no_public_key_and_a_tunnel_with_no_file_say_which_is_missing() {
+        assert_eq!(
             handshake_for(&src_with("K", 1), None, 10),
-            Handshake::NotConfigured(_)
-        ));
-        assert!(matches!(
+            Handshake::NoPublicKey
+        );
+        assert_eq!(
             handshake_for(&load(None, 600), Some("K"), 10),
-            Handshake::NotConfigured(_)
-        ));
+            Handshake::NoHandshakesFile
+        );
+        // A missing file is the monitor's problem and is reported first.
+        assert_eq!(
+            handshake_for(&load(None, 600), None, 10),
+            Handshake::NoHandshakesFile
+        );
     }
 
     #[test]

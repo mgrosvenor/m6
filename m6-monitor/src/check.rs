@@ -1077,6 +1077,16 @@ mod tunnel_tests {
     }
 
     #[test]
+    fn a_tunnel_with_no_handshake_source_removes_all_clear() {
+        let o = out(&[with_tunnel("edge-a", Handshake::NoPublicKey)]);
+        assert!(o.contains("public_key"), "{o}");
+        assert!(!o.contains("ALL CLEAR"), "{o}");
+        let o = out(&[with_tunnel("edge-a", Handshake::NoHandshakesFile)]);
+        assert!(o.contains("wg_handshakes_file"), "{o}");
+        assert!(!o.contains("ALL CLEAR"), "{o}");
+    }
+
+    #[test]
     fn a_node_without_a_tunnel_says_so_beside_one_that_has_one() {
         let o = out(&[
             with_tunnel("edge-a", Handshake::At { age_s: 1 }),

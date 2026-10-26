@@ -64,8 +64,8 @@ pub struct Tunnel {
     pub address: String,
     /// The peer's WireGuard public key, as `wg show` prints it.
     ///
-    /// Optional. Without it the round trip is still measured and the handshake
-    /// age is reported as not configured.
+    /// Without it the round trip is still measured, and the monitor reports a
+    /// fault for this node because its handshake cannot be checked.
     #[serde(default)]
     pub public_key: Option<String>,
 }
@@ -131,7 +131,8 @@ pub struct Fleet {
     /// written by a privileged timer, for example
     /// `wg show wg0 latest-handshakes > <file>.tmp && mv -f <file>.tmp <file>`.
     ///
-    /// Optional. Without it no handshake age is read. **Never use `wg show ...
+    /// Required when any node has a `tunnel`, and the monitor reports a fault
+    /// without it. **Never use `wg show ...
     /// dump`**: it includes the interface private key.
     #[serde(default)]
     pub wg_handshakes_file: Option<String>,

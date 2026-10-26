@@ -216,7 +216,12 @@ pub enum HandshakeState {
     Ok,
     Never,
     PeerAbsent,
-    NotConfigured,
+    /// The node has a tunnel but no `public_key`.
+    NoPublicKey,
+    /// Tunnels are configured but `wg_handshakes_file` is not set.
+    NoHandshakesFile,
+    /// Not read, for a reason reported by another finding.
+    Unknown,
     FileMissing,
     FileError,
     /// The handshakes file is older than the limit, so no age is judged.
@@ -249,8 +254,10 @@ impl TunnelDigest {
             },
             HandshakeState::Never => "never".to_string(),
             HandshakeState::PeerAbsent => "peer not on this host's interface".to_string(),
-            HandshakeState::NotConfigured => format!(
-                "not configured ({})",
+            HandshakeState::NoPublicKey => "unknown (no public_key)".to_string(),
+            HandshakeState::NoHandshakesFile => "unknown (no wg_handshakes_file)".to_string(),
+            HandshakeState::Unknown => format!(
+                "unknown ({})",
                 self.handshake_detail.as_deref().unwrap_or("-")
             ),
             HandshakeState::FileMissing => "file missing".to_string(),
@@ -275,11 +282,9 @@ fn tunnel_digest(t: &crate::tunnel::TunnelReading) -> TunnelDigest {
         .map(|d| d.as_secs_f64() * 1000.0)
         .collect();
     let (handshake, handshake_age_s, handshake_detail) = match &t.handshake {
-        Handshake::NotConfigured(why) => (
-            HandshakeState::NotConfigured,
-            None,
-            Some((*why).to_string()),
-        ),
+        Handshake::NoPublicKey => (HandshakeState::NoPublicKey, None, None),
+        Handshake::NoHandshakesFile => (HandshakeState::NoHandshakesFile, None, None),
+        Handshake::Unknown(why) => (HandshakeState::Unknown, None, Some((*why).to_string())),
         Handshake::FileMissing(p) => (HandshakeState::FileMissing, None, Some(p.clone())),
         Handshake::FileError(e) => (HandshakeState::FileError, None, Some(e.clone())),
         Handshake::FileStale { path, .. } => (HandshakeState::FileStale, None, Some(path.clone())),
@@ -405,10 +410,21 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
                         t.tunnel_handshake_age_s
                     ));
                 }
-                HandshakeState::FileStale
+                HandshakeState::NoPublicKey => fault(
+                    "tunnel has no public_key, so its WireGuard handshake cannot be checked: set public_key in this node's tunnel"
+                        .to_string(),
+                ),
+                HandshakeState::NoHandshakesFile if handshake_file_problem.is_none() => {
+                    handshake_file_problem = Some(
+                        "tunnels are configured but wg_handshakes_file is not set, so no WireGuard handshake can be checked"
+                            .to_string(),
+                    );
+                }
+                HandshakeState::NoHandshakesFile
+                | HandshakeState::FileStale
                 | HandshakeState::FileMissing
                 | HandshakeState::FileError
-                | HandshakeState::NotConfigured => {}
+                | HandshakeState::Unknown => {}
             }
         }
 
@@ -2011,16 +2027,27 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_tunnel_with_no_public_key_raises_nothing() {
-        let r = with_tunnel(
-            "edge-a",
-            tunnel(
-                Probe::Connected,
-                Handshake::NotConfigured("no public_key for this node"),
-            ),
-        );
+    fn a_tunnel_with_no_public_key_is_a_fault_naming_the_setting() {
+        let r = with_tunnel("edge-a", tunnel(Probe::Connected, Handshake::NoPublicKey));
         let d = build(&[r], &Thresholds::default(), now());
-        assert!(tunnel_findings(&d).is_empty(), "{:?}", d.findings);
+        let f = tunnel_findings(&d);
+        assert_eq!(f.len(), 1, "{:?}", d.findings);
+        assert_eq!(f[0].node, "edge-a");
+        assert_eq!(f[0].level, Level::Fault);
+        assert!(f[0].text.contains("public_key"), "{}", f[0].text);
+        assert_eq!(d.level, Level::Fault);
+    }
+
+    #[test]
+    fn tunnels_with_no_handshakes_file_are_one_fault_on_the_monitor() {
+        let none = || tunnel(Probe::Connected, Handshake::NoHandshakesFile);
+        let rs = [with_tunnel("origin", none()), with_tunnel("edge-a", none())];
+        let d = build(&rs, &Thresholds::default(), now());
+        let f = tunnel_findings(&d);
+        assert_eq!(f.len(), 1, "{:?}", d.findings);
+        assert_eq!(f[0].node, "monitor");
+        assert_eq!(f[0].level, Level::Fault);
+        assert!(f[0].text.contains("wg_handshakes_file"), "{}", f[0].text);
     }
 
     #[test]
