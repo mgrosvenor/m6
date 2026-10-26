@@ -56,23 +56,29 @@ workspace tests pass with 0 failures, h3 and QUIC included.
 
 **m6-core has an opt-in `sqlite` feature (#227).**
 A service that wants one SQLite file can enable `sqlite` on m6-core and link nothing else, because the feature re-exports `rusqlite` in the prelude.
-`m6_core::sqlite::open(path)` opens the file with `journal_mode=DELETE`, a 5 second `busy_timeout`, `foreign_keys` on and `recursive_triggers` on, and returns an error if a setting does not take effect.
+`m6_core::sqlite::open(path)` opens the file with `journal_mode=DELETE`, a 5 second `busy_timeout`, `foreign_keys` on and `recursive_triggers` on, reads each setting back, and returns an error if one does not take effect.
 `OpenOptions` changes the busy timeout, the journal mode and foreign keys.
+SQLite cannot leave WAL mode while another connection is using the file, so every connection to a file should use the same journal mode.
+Opening a WAL file with the default rollback journal then fails with `SQLITE_BUSY`.
 `migrate` applies a numbered list of migrations and keeps the version in `PRAGMA user_version`.
 Each migration runs in its own `BEGIN IMMEDIATE` transaction, so connections that open at once apply each one once, and a failing migration rolls back.
-A file newer than the migration list is refused with `NewerThanCode`.
+A file newer than the migration list is refused with `NewerThanCode`, both before the first migration and again inside each transaction, so a newer process that migrates the file meanwhile is also refused.
+`migrate` switches `foreign_keys` off before each migration, because SQLite ignores that pragma inside a transaction, and so a migration can rebuild a table that others point at without losing their rows.
+Before the commit it runs `PRAGMA foreign_key_check`, and a migration that leaves a dangling reference is rolled back with `ForeignKeyCheck`.
+`foreign_keys` is restored to its earlier setting when `migrate` returns.
 `append_only(&conn, table)` adds triggers that refuse UPDATE and DELETE on a named table, and `is_append_only` reports them.
 `used_bytes` and `prune_oldest` keep a table that is not append-only under a size cap.
+The cap counts the whole file, so `prune_oldest` returns the rows deleted and `cap_met`, which is false when the table was emptied and the file is still over the cap.
 
-Services each opened SQLite their own way, with their own settings and their own schema bookkeeping.
-These are now made once, in m6-core.
+A service can now use this one way to open, migrate and guard a file.
+m6-auth still opens SQLite itself and moves to it later.
 The feature is off by default.
 `cargo tree -p m6-http` shows no rusqlite, and `Cargo.lock` gains one line, `"rusqlite"` under m6-core.
 Nothing in the workspace turns the feature on, so `cargo test --workspace` never builds it.
 CI therefore has a step that builds and tests m6-core with `--all-features`, and `tools/clippy.sh` has a second pass that lints it the same way.
 That also covers `email` and `multipart`, which nothing in the workspace turns on either.
 
-Verified: `cargo test -p m6-core --lib --features sqlite` passes 410 tests with 0 failures, including 27 in the `sqlite` module that run against real files.
+Verified: `cargo test -p m6-core --lib --features sqlite` passes 416 tests with 0 failures, including 33 in the `sqlite` module that run against real files.
 The doctests pass with the feature on.
 `cargo test -p m6-core --features sqlite,testkit` builds with no warnings and passes.
 `cargo build --workspace --release`, `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `./tools/clippy.sh` and `cargo test --workspace` all pass with no warnings.

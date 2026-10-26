@@ -1,6 +1,6 @@
 # m6-core, component reference
 
-**Status: reference. Describes the crate as it is, at 37 modules and ~13,400
+**Status: reference. Describes the crate as it is, at 37 modules and ~23,200
 lines.** Where this disagrees with the code, the code is right and this file is
 a bug.
 
@@ -75,8 +75,9 @@ broken from Phase 4 to Phase 5. chrono and lru are unconditional dependencies
 for the same reason. A binary that wants none of it sets
 `default-features = false`.
 
-The off-by-default features `sqlite` and `multipart` are invisible to
-`cargo test --workspace`, and `sqlite` is tested by its own CI step.
+The off-by-default features `sqlite`, `email` and `multipart` are invisible to
+`cargo test --workspace`. A CI step builds and tests m6-core with
+`--all-features` to cover them.
 
 ## 3. Component index
 
@@ -531,7 +532,8 @@ with the settings in Table 7.1. `migrate(&mut conn, &[Migration])` applies a
 versioned list kept in `PRAGMA user_version`, and `schema_version` reads it.
 `append_only(&conn, table)` adds triggers that refuse UPDATE and DELETE, and
 `is_append_only` reports them. `used_bytes` and `prune_oldest` keep a table
-under a size cap. `OpenOptions` changes the busy timeout, the journal mode
+under a size cap. The cap counts the whole file, and `prune_oldest` returns
+`Pruned { rows_deleted, cap_met }`. `OpenOptions` changes the busy timeout, the journal mode
 (`Journal::Rollback` or `Journal::Wal`) and foreign keys.
 
 | setting | value | reason |
@@ -541,14 +543,20 @@ under a size cap. `OpenOptions` changes the busy timeout, the journal mode
 | `foreign_keys` | on | SQLite has them off in every new connection. The value is read back. |
 | `recursive_triggers` | on | `INSERT OR REPLACE` fires DELETE triggers only with this on, so the append-only rule needs it. |
 
-*Table 7.1: the settings `open` applies, and why. A journal mode that does not
-take effect is an error.*
+*Table 7.1: the settings `open` applies, and why. Each is read back, and a
+setting that does not take effect is an error.*
 
 **Migrations** number 1, 2, 3 in order, and the list is checked before anything
 runs. Each runs in its own `BEGIN IMMEDIATE` transaction with the version
 re-read inside it, so connections that open at once apply each migration once.
 A failing migration rolls back. A file newer than the list is refused with
-`NewerThanCode`. A released migration is never edited.
+`NewerThanCode`, before the first migration and again inside each transaction.
+`migrate` switches `foreign_keys` off before each migration, so a migration can
+rebuild a table that others point at. It runs `PRAGMA foreign_key_check` before
+the commit, rolls back with `ForeignKeyCheck` on any dangling row, and restores
+the setting afterwards. A released migration is never edited. Use one journal
+mode for every connection to a file, because SQLite cannot leave WAL while
+another connection is using it.
 
 **Append-only** triggers are named `<table>_append_only_update` and
 `<table>_append_only_delete`. Call `append_only` after `migrate` on every open,
