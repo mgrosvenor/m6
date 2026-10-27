@@ -28,7 +28,8 @@
 //! should have been deciding for itself.
 
 use std::os::unix::io::{AsFd, AsRawFd, RawFd};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// The directories and files to watch, deduplicated.
 ///
@@ -303,6 +304,229 @@ impl ConfigWatcher {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// ConfigReloader: both of a process's files, with a debounce and a poll
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// How long after the last change the reloader waits before reporting.
+///
+/// A writer that writes a certificate, then a key, then touches the config
+/// produces one report. The wait delays only when a new config takes effect and
+/// is on no request path.
+pub const RELOAD_DEBOUNCE: Duration = Duration::from_millis(100);
+
+/// How often the reloader compares fingerprints whatever the watcher says, and
+/// the longest a batch of changes is held back.
+///
+/// A watch that has been lost, a replaced directory, or a kqueue watch left on
+/// an unlinked inode after an atomic rename all stop delivering events. This
+/// poll is two `stat` calls a second and finds the change anyway.
+pub const RELOAD_POLL: Duration = Duration::from_secs(1);
+
+/// Which of a process's two files changed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Changed {
+    /// `site.toml` changed.
+    pub site: bool,
+    /// The process's own config changed.
+    pub process: bool,
+}
+
+impl Changed {
+    /// True when either file changed.
+    pub fn any(self) -> bool {
+        self.site || self.process
+    }
+}
+
+/// What `stat` says about a file, followed through a symlink.
+///
+/// Two fingerprints are equal when the same bytes are in the same file with the
+/// same times. A touch moves `ctime` even when nothing else moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fingerprint {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mtime_ns: i128,
+    ctime_ns: i128,
+}
+
+impl Fingerprint {
+    /// The fingerprint of `path`, or `None` when it cannot be read.
+    pub fn of(path: &Path) -> Option<Fingerprint> {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(path).ok()?;
+        Some(Fingerprint {
+            dev: m.dev(),
+            ino: m.ino(),
+            len: m.len(),
+            mtime_ns: i128::from(m.mtime()) * 1_000_000_000 + i128::from(m.mtime_nsec()),
+            ctime_ns: i128::from(m.ctime()) * 1_000_000_000 + i128::from(m.ctime_nsec()),
+        })
+    }
+}
+
+/// The fingerprints of both files as last seen.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Seen {
+    /// `site.toml`.
+    pub site: Option<Fingerprint>,
+    /// The process config.
+    pub process: Option<Fingerprint>,
+}
+
+impl Seen {
+    /// Fingerprint both files. Call this before the first read of either, so a
+    /// change between that read and the reloader's creation is reported on its
+    /// first tick instead of lost.
+    pub fn read(site_toml: &Path, process: &Path) -> Seen {
+        Seen {
+            site: Fingerprint::of(site_toml),
+            process: Fingerprint::of(process),
+        }
+    }
+}
+
+/// Watches `site.toml` and a process's own config and reports which changed.
+///
+/// A [`ConfigWatcher`] wakes the loop. The fingerprints decide what changed, so
+/// the answer is the same on inotify and kqueue and ignores other files in a
+/// shared directory. The loop calls [`on_readable`](Self::on_readable) when
+/// [`raw_fd`](Self::raw_fd) is readable and [`tick`](Self::tick) on every
+/// iteration, idle or not. No thread, no allocation in `tick`.
+pub struct ConfigReloader {
+    watcher: Option<ConfigWatcher>,
+    site_toml: PathBuf,
+    process: PathBuf,
+    same_file: bool,
+    seen: Seen,
+    pending: Changed,
+    first: Option<Instant>,
+    due: Option<Instant>,
+    next_poll: Instant,
+    site_name: String,
+    process_name: String,
+}
+
+impl ConfigReloader {
+    /// Watch both files. `seen` is what the caller fingerprinted before it first
+    /// read them. Without a working watcher the reloader still polls.
+    pub fn new(site_toml: &Path, process: &Path, seen: Seen) -> ConfigReloader {
+        let watcher = match ConfigWatcher::new(&[process, site_toml]) {
+            Ok(w) => Some(w),
+            Err(e) => {
+                tracing::warn!("config watch unavailable, polling every second: {e}");
+                None
+            }
+        };
+        Self::with_watcher(watcher, site_toml, process, seen)
+    }
+
+    fn with_watcher(
+        watcher: Option<ConfigWatcher>,
+        site_toml: &Path,
+        process: &Path,
+        seen: Seen,
+    ) -> ConfigReloader {
+        let same_file = match (site_toml.canonicalize(), process.canonicalize()) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => site_toml == process,
+        };
+        let name = |p: &Path| {
+            p.file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        ConfigReloader {
+            watcher,
+            site_toml: site_toml.to_path_buf(),
+            process: process.to_path_buf(),
+            same_file,
+            seen,
+            pending: Changed::default(),
+            first: None,
+            due: None,
+            next_poll: Instant::now() + RELOAD_POLL,
+            site_name: name(site_toml),
+            process_name: name(process),
+        }
+    }
+
+    /// A reloader with no watcher, so only the poll can find a change.
+    #[cfg(test)]
+    fn polling_only(site_toml: &Path, process: &Path, seen: Seen) -> ConfigReloader {
+        Self::with_watcher(None, site_toml, process, seen)
+    }
+
+    /// Make the next `tick` poll, whatever the time.
+    #[cfg(test)]
+    fn next_poll_for_test(&mut self, now: Instant) {
+        self.next_poll = now;
+    }
+
+    /// The descriptor to add to the loop's `poll(2)`, if there is a watcher.
+    pub fn raw_fd(&self) -> Option<RawFd> {
+        self.watcher.as_ref().and_then(|w| w.raw_fd())
+    }
+
+    /// Call when [`raw_fd`](Self::raw_fd) is readable.
+    pub fn on_readable(&mut self, now: Instant) {
+        if let Some(w) = self.watcher.as_mut() {
+            // The fingerprints decide what changed, not the event name.
+            let _ = w.read_events(&[&self.site_name, &self.process_name]);
+        }
+        self.compare(now);
+    }
+
+    /// Call on every loop iteration. Returns the change once it has settled.
+    pub fn tick(&mut self, now: Instant) -> Option<Changed> {
+        if now >= self.next_poll {
+            self.compare(now);
+            self.next_poll = now + RELOAD_POLL;
+        }
+        match self.due {
+            Some(due) if now >= due => {
+                self.first = None;
+                self.due = None;
+                Some(std::mem::take(&mut self.pending))
+            }
+            _ => None,
+        }
+    }
+
+    /// Fingerprint both files and mark each that moved. The new fingerprint is
+    /// stored at once, so a file that fails to load is not retried until it is
+    /// written again.
+    fn compare(&mut self, now: Instant) {
+        let site = Fingerprint::of(&self.site_toml);
+        let process = Fingerprint::of(&self.process);
+        let mut hit = false;
+        if site != self.seen.site {
+            self.seen.site = site;
+            self.pending.site = true;
+            hit = true;
+        }
+        if process != self.seen.process {
+            self.seen.process = process;
+            self.pending.process = true;
+            hit = true;
+        }
+        if !hit {
+            return;
+        }
+        if self.same_file {
+            self.pending = Changed {
+                site: true,
+                process: true,
+            };
+        }
+        let first = *self.first.get_or_insert(now);
+        self.due = Some((now + RELOAD_DEBOUNCE).min(first + RELOAD_POLL));
+    }
+}
+
 // ---------------------------------------------------------------------------
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
@@ -498,5 +722,190 @@ mod tests {
             );
         }
         let _ = woke;
+    }
+
+    // ── ConfigReloader ───────────────────────────────────────────────────
+
+    /// Write `body` to `path`. Callers vary the length so a change never
+    /// depends on the filesystem's timestamp granularity.
+    fn put(path: &Path, body: &str) {
+        write_file(path, body);
+    }
+
+    /// Two files in one temp directory, written, with their fingerprints taken.
+    fn pair() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        Seen,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let site = dir.path().join("site.toml");
+        let proc = dir.path().join("app.conf");
+        put(&site, "a = 1\n");
+        put(&proc, "b = 1\n");
+        let seen = Seen::read(&site, &proc);
+        (dir, site, proc, seen)
+    }
+
+    /// Run the loop's two calls until a change is due or `ms` real time passes.
+    fn wait_for_change(r: &mut ConfigReloader, ms: u64) -> Option<Changed> {
+        let end = Instant::now() + Duration::from_millis(ms);
+        while Instant::now() < end {
+            if let Some(fd) = r.raw_fd() {
+                if crate::server::poll_listener_and_watcher(fd, None, 20).listener {
+                    r.on_readable(Instant::now());
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            if let Some(c) = r.tick(Instant::now()) {
+                return Some(c);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn a_touch_of_the_process_config_is_reported_as_process() {
+        let (_d, site, proc, seen) = pair();
+        let mut r = ConfigReloader::new(&site, &proc, seen);
+        let now = filetime::FileTime::now();
+        filetime::set_file_times(&proc, now, now).expect("touch");
+        let c = wait_for_change(&mut r, 5_000).expect("a touch is a change");
+        assert!(c.process, "{c:?}");
+        assert!(!c.site, "{c:?}");
+    }
+
+    #[test]
+    fn a_rename_over_site_toml_is_reported_as_site() {
+        let (d, site, proc, seen) = pair();
+        let mut r = ConfigReloader::new(&site, &proc, seen);
+        let tmp = d.path().join("site.toml.new");
+        put(&tmp, "a = 22222\n");
+        std::fs::rename(&tmp, &site).expect("rename");
+        let c = wait_for_change(&mut r, 5_000).expect("a rename is a change");
+        assert!(c.site, "{c:?}");
+        assert!(!c.process, "{c:?}");
+    }
+
+    #[test]
+    fn three_writes_within_the_debounce_are_one_change() {
+        let (_d, site, proc, seen) = pair();
+        let mut r = ConfigReloader::polling_only(&site, &proc, seen);
+        let t0 = Instant::now() + RELOAD_POLL;
+        put(&proc, "b = 12\n");
+        assert_eq!(r.tick(t0), None);
+        put(&proc, "b = 123\n");
+        assert_eq!(r.tick(t0 + Duration::from_millis(10)), None);
+        put(&proc, "b = 1234\n");
+        assert_eq!(r.tick(t0 + Duration::from_millis(20)), None);
+        // The poll has not run again, so only the deadline matters now.
+        let c = r.tick(t0 + Duration::from_millis(500));
+        assert_eq!(
+            c,
+            Some(Changed {
+                site: false,
+                process: true
+            })
+        );
+        assert_eq!(r.tick(t0 + Duration::from_millis(600)), None);
+    }
+
+    #[test]
+    fn a_change_is_reported_no_sooner_than_the_debounce() {
+        let (_d, site, proc, seen) = pair();
+        let mut r = ConfigReloader::polling_only(&site, &proc, seen);
+        let t0 = Instant::now() + RELOAD_POLL;
+        put(&site, "a = 12\n");
+        assert_eq!(r.tick(t0), None, "reported with no debounce");
+        assert_eq!(
+            r.tick(t0 + RELOAD_DEBOUNCE - Duration::from_millis(1)),
+            None,
+            "reported before the debounce"
+        );
+        let c = r.tick(t0 + RELOAD_DEBOUNCE).expect("due at the debounce");
+        assert!(c.site && !c.process, "{c:?}");
+    }
+
+    #[test]
+    fn a_writer_that_never_stops_still_gets_a_change_each_second() {
+        let (_d, site, proc, seen) = pair();
+        let mut r = ConfigReloader::polling_only(&site, &proc, seen);
+        let t0 = Instant::now() + RELOAD_POLL;
+        let mut reported = 0;
+        // A write every 50 ms for just over two seconds, polled every 50 ms, so
+        // the deadline is re-armed before it is ever reached.
+        for i in 0..=45u64 {
+            let now = t0 + Duration::from_millis(50 * i);
+            put(&proc, &format!("b = {}\n", "1".repeat(2 + i as usize)));
+            // The poll runs once a second, so make the loop poll every step.
+            r.next_poll_for_test(now);
+            if r.tick(now).is_some() {
+                reported += 1;
+            }
+        }
+        assert!(
+            reported >= 2,
+            "a writer that never stops starved the reload: {reported}"
+        );
+    }
+
+    #[test]
+    fn another_file_in_the_same_directory_is_not_a_change() {
+        let (d, site, proc, seen) = pair();
+        let mut r = ConfigReloader::new(&site, &proc, seen);
+        put(&d.path().join("other.toml"), "x = 1\n");
+        assert_eq!(wait_for_change(&mut r, 400), None);
+    }
+
+    #[test]
+    fn one_file_for_both_reports_both() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let one = dir.path().join("site.toml");
+        put(&one, "a = 1\n");
+        let seen = Seen::read(&one, &one);
+        let mut r = ConfigReloader::new(&one, &one, seen);
+        put(&one, "a = 22\n");
+        let c = wait_for_change(&mut r, 5_000).expect("change");
+        assert!(c.site && c.process, "{c:?}");
+    }
+
+    #[test]
+    fn the_poll_finds_a_change_with_no_watcher() {
+        let (_d, site, proc, seen) = pair();
+        let mut r = ConfigReloader::polling_only(&site, &proc, seen);
+        assert_eq!(r.raw_fd(), None);
+        put(&proc, "b = 99999\n");
+        let t0 = Instant::now() + RELOAD_POLL;
+        assert_eq!(r.tick(t0), None);
+        let c = r.tick(t0 + RELOAD_DEBOUNCE).expect("the poll saw it");
+        assert!(c.process && !c.site, "{c:?}");
+    }
+
+    #[test]
+    fn a_change_before_the_reloader_existed_is_reported_on_the_first_tick() {
+        let (_d, site, proc, seen) = pair();
+        // Seeded first, then written, then the reloader built: the write is in
+        // the gap a watcher created afterwards would never see.
+        put(&site, "a = 4444\n");
+        let mut r = ConfigReloader::polling_only(&site, &proc, seen);
+        let t0 = Instant::now() + RELOAD_POLL;
+        assert_eq!(r.tick(t0), None);
+        let c = r.tick(t0 + RELOAD_DEBOUNCE).expect("reported");
+        assert!(c.site && !c.process, "{c:?}");
+    }
+
+    #[test]
+    fn a_failed_load_is_not_retried_until_the_next_write() {
+        let (_d, site, proc, seen) = pair();
+        let mut r = ConfigReloader::polling_only(&site, &proc, seen);
+        put(&proc, "b = 5555\n");
+        let t0 = Instant::now() + RELOAD_POLL;
+        r.tick(t0);
+        assert!(r.tick(t0 + RELOAD_DEBOUNCE).is_some());
+        // Nothing written since: the next polls report nothing.
+        assert_eq!(r.tick(t0 + RELOAD_POLL * 2), None);
+        assert_eq!(r.tick(t0 + RELOAD_POLL * 3), None);
     }
 }
