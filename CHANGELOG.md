@@ -73,6 +73,39 @@ workspace tests pass with 0 failures, h3 and QUIC included.
 
 ### Added
 
+**`/perf` and `/traffic` for listed peers only, with a token (#237).**
+`[health] metrics_peers` lists the IP addresses allowed to read `/perf` and `/traffic`.
+Each entry must be in a local range (`m6_core::net::is_private_ip`), and names and ranges are refused.
+The peer address is the one the TCP or QUIC handshake proved, so the endpoints are refused on an internal h2c listener, which believes `X-Forwarded-For`.
+Any other peer gets 404.
+`[health] metrics_require` takes `role:<name>` or `group:<name>` and checks a token with `[auth] public_key`.
+The token comes from the Authorization header or the session cookie, as route `require` reads it.
+No or a bad token gets 401 and the wrong claim gets 403.
+`metrics_token_file` stays as the legacy gate and is ignored when `metrics_require` is set.
+`[auth] backend` is optional, and `[auth]` and the two new keys may be set in the system config.
+The proxy's own 401 from route `require` now carries `WWW-Authenticate: Bearer`.
+m6-monitor's `metrics_over_tunnel` fetches `/perf` and `/traffic` through a node's `tunnel.address` while `/health` stays on the public URL.
+
+**Migration.**
+A system config that holds only `[server]` and `[node]` is unaffected.
+A system config that carries `[auth]` or `[health]` used to have them ignored with a warning.
+Now `[auth]` is read, and `[health]` there accepts only the two new keys.
+A config that breaks these rules stops m6-http starting with exit 2.
+On a running node a reload fails the same way and keeps the old config until a restart.
+Check each system config for these three cases before the upgrade:
+
+- `[auth]` declared in both the system config and `site.toml`. Keep it in one file and delete it from the other.
+- A relative `[auth] public_key` in the system config. Make it an absolute path.
+- A `[health]` key in the system config other than `metrics_require` and `metrics_peers`, for example `metrics_token_file`. Move it to `site.toml` or delete it.
+
+When both arguments name the same file, it is read twice and the system-side `[auth]` and `[health]` are ignored, so it is not a second declaration.
+Older versions ignore the new keys, so a config can carry them before the upgrade, but the endpoints stay on the legacy gate until it.
+Verified: `cargo test --workspace -- --test-threads=1` passes 1388 tests with 0 failures and 0 warnings on the release and test builds.
+`cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `tools/clippy.sh` and `cargo deny check` are silent.
+`m6-http/tests/metrics_access.rs` runs the real binary and covers h1, h2 and h3.
+The three `// end cache hit` blocks in `m6-http/src/main.rs` are byte-identical to `develop` (735 lines, empty diff), and the only functions touched in that file are `handle_request_inner` and a new helper beside the error path.
+`cache_hit` measures 47.0 ns and `full_cache_hit_path` 45.6 ns on a loaded laptop (informational).
+
 **m6-core has an opt-in `sqlite` feature (#227).**
 A service that wants one SQLite file can enable `sqlite` on m6-core and link nothing else, because the feature re-exports `rusqlite` in the prelude.
 `m6_core::sqlite::open(path)` opens the file with `journal_mode=DELETE`, a 5 second `busy_timeout`, `foreign_keys` on and `recursive_triggers` on, reads each setting back, and returns an error if one does not take effect.

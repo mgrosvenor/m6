@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use tracing::warn;
+use tracing::{info, warn};
 
 /// Full merged configuration for m6-http.
 #[derive(Debug, Clone, Serialize)]
@@ -281,6 +281,27 @@ pub struct HealthConfig {
     /// answer that changes slowly. The check that consumes this runs hourly.
     #[serde(default = "default_traffic_cache_s")]
     pub traffic_cache_s: u64,
+    /// `role:<name>` or `group:<name>`. When set, `/perf` and `/traffic` need
+    /// an API token that carries this claim, verified with `[auth] public_key`
+    /// exactly as a route `require` is: 401 for no or a bad token, 403 for the
+    /// wrong claim. It wins over `metrics_token_file`.
+    #[serde(default)]
+    pub metrics_require: Option<String>,
+    /// The IP addresses allowed to read `/perf` and `/traffic`, as written.
+    /// Any other peer gets 404. Unset means no address rule.
+    ///
+    /// Each entry must be an IP address in a local range
+    /// (`m6_core::net::is_private_ip`). Names and ranges are refused. The
+    /// peer address is the one a completed TCP or QUIC handshake proved, and
+    /// the endpoints are refused on an internal h2c listener, where the
+    /// address is a forwarded claim.
+    #[serde(default)]
+    pub metrics_peers: Option<Vec<String>>,
+    /// `metrics_peers`, parsed and canonical (an IPv4-mapped IPv6 address is
+    /// stored as IPv4), filled by `load`. The gate reads only this: `None`
+    /// means no address rule. Compared on the request path with no allocation.
+    #[serde(skip)]
+    pub metrics_peer_ips: Option<Vec<std::net::IpAddr>>,
 }
 
 fn default_perf_path() -> String {
@@ -309,6 +330,9 @@ impl Default for HealthConfig {
             perf_path: default_perf_path(),
             traffic_path: default_traffic_path(),
             traffic_cache_s: default_traffic_cache_s(),
+            metrics_require: None,
+            metrics_peers: None,
+            metrics_peer_ips: None,
         }
     }
 }
@@ -532,7 +556,10 @@ impl SecurityConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthConfig {
-    pub backend: String,
+    /// Optional. When given it must name a `[[backend]]`. Nothing reads it
+    /// beyond that check: verification needs only `public_key`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
     pub public_key: String,
 }
 
@@ -666,6 +693,59 @@ struct RawServerSection {
 struct RawSystemToml {
     server: Option<RawServerSection>,
     node: Option<NodeConfig>,
+    /// `[auth]` may live here instead of site.toml (never both), so the
+    /// verify key's path is owned by the same file as the node's other
+    /// credentials.
+    auth: Option<AuthConfig>,
+    /// Only the access keys: a node's own credentials and peers belong to the
+    /// node, not to the site that is shipped to every node.
+    /// Kept as a raw value so a site.toml passed as its own system config
+    /// (one file for both, as a development script does) is not rejected for
+    /// the `[health]` keys only site.toml may carry. It is parsed strictly
+    /// into `RawSystemHealth` when the two files differ.
+    health: Option<toml::Value>,
+}
+
+/// The `[health]` keys the system config may carry. Anything else fails to
+/// parse, so a misplaced key is loud instead of ignored.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSystemHealth {
+    metrics_require: Option<String>,
+    metrics_peers: Option<Vec<String>>,
+}
+
+/// Parse `[health] metrics_peers` into canonical addresses.
+///
+/// Only an IP literal in a local range is accepted. A name is never resolved,
+/// a range is not a peer, and a public or wildcard address could never be a
+/// private monitor, so each is a load error.
+fn validate_metrics_peers(
+    peers: Option<&[String]>,
+) -> anyhow::Result<Option<Vec<std::net::IpAddr>>> {
+    let Some(peers) = peers else {
+        return Ok(None);
+    };
+    if peers.is_empty() {
+        anyhow::bail!(
+            "config error: [health].metrics_peers is empty; list the peers allowed to read /perf and /traffic, or remove the key"
+        );
+    }
+    let mut ips = Vec::with_capacity(peers.len());
+    for e in peers {
+        let ip: std::net::IpAddr = e.parse().map_err(|_| {
+            anyhow::anyhow!(
+                "config error: [health].metrics_peers entry \"{e}\" is not an IP address such as \"10.0.0.5\" or \"fd00::5\"; names are never resolved and ranges are not accepted"
+            )
+        })?;
+        if !m6_core::net::is_private_ip(ip) {
+            anyhow::bail!(
+                "config error: [health].metrics_peers entry \"{e}\" is not in a local range; a metrics peer must be a loopback, private (RFC 1918), link-local, shared (100.64.0.0/10) or IPv6 unique-local address"
+            );
+        }
+        ips.push(ip.to_canonical());
+    }
+    Ok(Some(ips))
 }
 
 // ── Loading ─────────────────────────────────────────────────────────────────
@@ -732,13 +812,32 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
 
     let system_raw = std::fs::read_to_string(system_config_path)
         .with_context(|| format!("reading {}", system_config_path.display()))?;
-    let system_parsed: RawSystemToml = toml::from_str(&system_raw)
+    let mut system_parsed: RawSystemToml = toml::from_str(&system_raw)
         .with_context(|| format!("parsing {}", system_config_path.display()))?;
+    // One file given as both site.toml and the system config is read once:
+    // its [auth] and [health] are site.toml's, not a second declaration.
+    let one_file = match (
+        std::fs::canonicalize(&site_toml_path),
+        std::fs::canonicalize(system_config_path),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    };
+    if one_file {
+        system_parsed.auth = None;
+        system_parsed.health = None;
+    }
+    let system_health: Option<RawSystemHealth> = system_parsed
+        .health
+        .take()
+        .map(|v| v.try_into())
+        .transpose()
+        .with_context(|| format!("parsing [health] in {}", system_config_path.display()))?;
 
     // Warn on unexpected sections in system config (we only check for unknown
     // top-level keys by seeing if extra keys exist; toml parsing uses deny_unknown_fields
     // is opt-in, but the spec says warn and ignore instead of error).
-    // We rely on RawSystemToml only accepting `server`/`node`.
+    // We rely on RawSystemToml only accepting `server`/`node`/`auth`/`health`.
 
     // Build merged server config:
     // site.toml [server] provides base values, system config [server] overrides.
@@ -879,6 +978,12 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
             .map(|t| t.trim().to_string())
             .filter(|t| !t.is_empty());
     }
+    // The system config wins key by key, as [server] keys do.
+    if let Some(sys) = system_health {
+        health.metrics_require = sys.metrics_require.or(health.metrics_require);
+        health.metrics_peers = sys.metrics_peers.or(health.metrics_peers);
+    }
+    health.metrics_peer_ips = validate_metrics_peers(health.metrics_peers.as_deref())?;
     let rate_limit = site_parsed.rate_limit.unwrap_or_default();
     let errors = site_parsed.errors.unwrap_or_default();
     let security = site_parsed.security.unwrap_or_default();
@@ -940,8 +1045,25 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         }
     }
 
-    // Validate auth
-    let auth = site_parsed.auth;
+    // Validate auth. One owner: declaring [auth] in both files would make a
+    // whole-section override silently change which key verifies every route.
+    let auth = match (site_parsed.auth, system_parsed.auth) {
+        (Some(_), Some(_)) => anyhow::bail!(
+            "config error: [auth] is declared in both site.toml and the system config; declare it in one"
+        ),
+        (None, Some(a)) => {
+            // A relative path here would resolve against the site directory,
+            // which is surprising for a file that sits beside the system config.
+            if !Path::new(&a.public_key).is_absolute() {
+                anyhow::bail!(
+                    "config error: [auth].public_key in the system config must be an absolute path, got \"{}\"",
+                    a.public_key
+                );
+            }
+            Some(a)
+        }
+        (site, None) => site,
+    };
     if let Some(ref a) = auth {
         let key_path = resolve_path(site_dir, &a.public_key);
         if !key_path.exists() {
@@ -950,11 +1072,10 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
                 key_path.display()
             );
         }
-        if !backend_names.contains(a.backend.as_str()) {
-            anyhow::bail!(
-                "config error: [auth].backend `{}` not in [[backend]]",
-                a.backend
-            );
+        if let Some(ref b) = a.backend {
+            if !backend_names.contains(b.as_str()) {
+                anyhow::bail!("config error: [auth].backend `{}` not in [[backend]]", b);
+            }
         }
     }
 
@@ -972,6 +1093,21 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
             anyhow::bail!(
                 "config error: route_group {} has `require` but no [auth] declared",
                 rg.path
+            );
+        }
+    }
+
+    if let Some(ref r) = health.metrics_require {
+        if auth.is_none() {
+            anyhow::bail!("config error: [health].metrics_require needs [auth] with a public_key");
+        }
+        let named = matches!(
+            crate::auth::Require::parse(r),
+            Some(crate::auth::Require::Role(n) | crate::auth::Require::Group(n)) if !n.is_empty()
+        );
+        if !named {
+            anyhow::bail!(
+                "config error: [health].metrics_require = \"{r}\" must be \"role:<name>\" or \"group:<name>\""
             );
         }
     }
@@ -1058,11 +1194,22 @@ pub fn warn_ignored_route_cache_keys(config: &Config) {
 /// exists, because it is what supplies the log level.
 pub fn warn_health_token(health: &HealthConfig) {
     if let Some(ref path) = health.metrics_token_file {
-        if health.metrics_token.is_none() {
-            warn!(
+        if health.metrics_require.is_some() {
+            info!(
                 file = %path,
-                "health: metrics token file missing or empty -- /perf will answer 404"
+                "health: metrics_require is set, so metrics_token_file is ignored"
             );
+        } else {
+            info!(
+                file = %path,
+                "health: metrics_token_file is the legacy gate; metrics_require checks an API token instead"
+            );
+            if health.metrics_token.is_none() {
+                warn!(
+                    file = %path,
+                    "health: metrics token file missing or empty -- /perf will answer 404"
+                );
+            }
         }
     }
 }
@@ -1071,11 +1218,11 @@ pub fn warn_system_config_extra_keys(system_config_path: &Path) {
     if let Ok(raw) = std::fs::read_to_string(system_config_path) {
         if let Ok(toml::Value::Table(tbl)) = raw.parse::<toml::Value>() {
             for key in tbl.keys() {
-                if key != "server" && key != "node" {
+                if !matches!(key.as_str(), "server" | "node" | "auth" | "health") {
                     warn!(
                         key = %key,
                         file = %system_config_path.display(),
-                        "system config: ignoring non-[server]/[node] key"
+                        "system config: ignoring key other than [server], [node], [auth], [health]"
                     );
                 }
             }
@@ -1772,5 +1919,216 @@ internal_binds = ["203.0.113.7:80"]
         write_file(dir.path(), "system.toml", "");
         let cfg = load(dir.path(), &dir.path().join("system.toml")).unwrap();
         assert_eq!(cfg.server.redirect_bind.as_deref(), Some("0.0.0.0:80"));
+    }
+
+    /// Load with `site_extra` appended to site.toml and `sys_extra` appended
+    /// to system.toml. A verify key exists as `auth.pem` in the test directory.
+    fn load_with(site_extra: &str, sys_extra: &str) -> (TempDir, anyhow::Result<Config>) {
+        let dir = make_test_dir();
+        setup_minimal(dir.path());
+        write_file(dir.path(), "auth.pem", "dummy");
+        let mut site = minimal_site_toml();
+        site.push_str(&site_extra.replace("{DIR}", &dir.path().display().to_string()));
+        write_file(dir.path(), "site.toml", &site);
+        let mut sys = minimal_system_toml();
+        sys.push_str(&sys_extra.replace("{DIR}", &dir.path().display().to_string()));
+        write_file(dir.path(), "system.toml", &sys);
+        let result = load(dir.path(), &dir.path().join("system.toml"));
+        (dir, result)
+    }
+
+    #[test]
+    fn auth_without_backend_loads() {
+        let (_d, cfg) = load_with("\n[auth]\npublic_key = \"auth.pem\"\n", "");
+        let cfg = cfg.unwrap();
+        let auth = cfg.auth.expect("auth present");
+        assert_eq!(auth.backend, None);
+        assert_eq!(auth.public_key, "auth.pem");
+    }
+
+    #[test]
+    fn auth_backend_when_given_must_be_declared() {
+        let (_d, r) = load_with(
+            "\n[auth]\nbackend = \"nope\"\npublic_key = \"auth.pem\"\n",
+            "",
+        );
+        assert!(r
+            .unwrap_err()
+            .to_string()
+            .contains("[auth].backend `nope` not in [[backend]]"));
+        let (_d, ok) = load_with(
+            "\n[auth]\nbackend = \"m6-html\"\npublic_key = \"auth.pem\"\n",
+            "",
+        );
+        assert!(ok.is_ok());
+    }
+
+    #[test]
+    fn auth_from_the_system_config_is_used() {
+        let (_d, r) = load_with("", "\n[auth]\npublic_key = \"{DIR}/auth.pem\"\n");
+        let auth = r.unwrap().auth.expect("auth present");
+        assert!(auth.public_key.ends_with("/auth.pem"));
+        assert_eq!(auth.backend, None);
+    }
+
+    #[test]
+    fn auth_in_both_files_is_refused() {
+        let (_d, r) = load_with(
+            "\n[auth]\npublic_key = \"auth.pem\"\n",
+            "\n[auth]\npublic_key = \"{DIR}/auth.pem\"\n",
+        );
+        assert_eq!(
+            r.unwrap_err().to_string(),
+            "config error: [auth] is declared in both site.toml and the system config; declare it in one"
+        );
+    }
+
+    #[test]
+    fn a_relative_public_key_in_the_system_config_is_refused() {
+        let (_d, r) = load_with("", "\n[auth]\npublic_key = \"auth.pem\"\n");
+        assert_eq!(
+            r.unwrap_err().to_string(),
+            "config error: [auth].public_key in the system config must be an absolute path, got \"auth.pem\""
+        );
+    }
+
+    fn peers_error(entries: &str) -> String {
+        let (_d, r) = load_with(&format!("\n[health]\nmetrics_peers = [{entries}]\n"), "");
+        r.expect_err("must refuse").to_string()
+    }
+
+    #[test]
+    fn metrics_peers_accepts_local_addresses() {
+        let (_d, r) = load_with(
+            "\n[health]\nmetrics_peers = [\"10.0.0.9\", \"127.0.0.1\", \"fd00::5\", \"100.64.0.1\"]\n",
+            "",
+        );
+        let h = r.unwrap().health;
+        let ips = h.metrics_peer_ips.expect("peers set");
+        assert_eq!(ips.len(), 4);
+        assert!(ips.contains(&"fd00::5".parse().unwrap()));
+    }
+
+    #[test]
+    fn metrics_peers_are_stored_canonical() {
+        let (_d, r) = load_with("\n[health]\nmetrics_peers = [\"::ffff:10.0.0.9\"]\n", "");
+        let h = r.unwrap().health;
+        assert_eq!(
+            h.metrics_peer_ips,
+            Some(vec!["10.0.0.9".parse::<std::net::IpAddr>().unwrap()])
+        );
+    }
+
+    #[test]
+    fn metrics_peers_refuses_names_ranges_and_ports() {
+        for entry in ["localhost", "10.0.0.0/24", "10.0.0.9:443"] {
+            let e = peers_error(&format!("\"{entry}\""));
+            assert!(
+                e.contains(&format!(
+                    "metrics_peers entry \"{entry}\" is not an IP address"
+                )),
+                "{entry}: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn metrics_peers_refuses_public_and_wildcard() {
+        for entry in ["203.0.113.7", "0.0.0.0", "::"] {
+            let e = peers_error(&format!("\"{entry}\""));
+            assert!(e.contains("is not in a local range"), "{entry}: {e}");
+        }
+    }
+
+    #[test]
+    fn an_empty_metrics_peers_is_refused() {
+        assert!(peers_error("").contains("metrics_peers is empty"));
+    }
+
+    #[test]
+    fn metrics_require_needs_auth() {
+        let (_d, r) = load_with("\n[health]\nmetrics_require = \"role:monitor\"\n", "");
+        assert_eq!(
+            r.unwrap_err().to_string(),
+            "config error: [health].metrics_require needs [auth] with a public_key"
+        );
+    }
+
+    #[test]
+    fn metrics_require_must_name_a_role_or_group() {
+        for bad in ["admin", "role:", "group:", "user:x"] {
+            let (_d, r) = load_with(
+                &format!(
+                    "\n[auth]\npublic_key = \"auth.pem\"\n\n[health]\nmetrics_require = \"{bad}\"\n"
+                ),
+                "",
+            );
+            let e = r.unwrap_err().to_string();
+            assert!(
+                e.contains("must be \"role:<name>\" or \"group:<name>\""),
+                "{bad}: {e}"
+            );
+        }
+        let (_d, ok) = load_with(
+            "\n[auth]\npublic_key = \"auth.pem\"\n\n[health]\nmetrics_require = \"group:ops\"\n",
+            "",
+        );
+        assert!(ok.is_ok());
+    }
+
+    #[test]
+    fn system_health_keys_win_over_site_health_keys() {
+        let (_d, r) = load_with(
+            "\n[auth]\npublic_key = \"auth.pem\"\n\n[health]\nmetrics_require = \"role:site\"\nmetrics_peers = [\"10.0.0.1\"]\n",
+            "\n[health]\nmetrics_require = \"role:system\"\nmetrics_peers = [\"10.0.0.2\"]\n",
+        );
+        let h = r.unwrap().health;
+        assert_eq!(h.metrics_require.as_deref(), Some("role:system"));
+        assert_eq!(
+            h.metrics_peer_ips,
+            Some(vec!["10.0.0.2".parse::<std::net::IpAddr>().unwrap()])
+        );
+    }
+
+    #[test]
+    fn a_system_health_key_alone_keeps_the_other_from_the_site() {
+        let (_d, r) = load_with(
+            "\n[auth]\npublic_key = \"auth.pem\"\n\n[health]\nmetrics_require = \"role:site\"\n",
+            "\n[health]\nmetrics_peers = [\"10.0.0.2\"]\n",
+        );
+        let h = r.unwrap().health;
+        assert_eq!(h.metrics_require.as_deref(), Some("role:site"));
+        assert_eq!(h.metrics_peer_ips.map(|p| p.len()), Some(1));
+    }
+
+    #[test]
+    fn an_unknown_health_key_in_the_system_config_fails_to_parse() {
+        let (_d, r) = load_with("", "\n[health]\nperf_path = \"/p\"\n");
+        let e = format!("{:#}", r.unwrap_err());
+        assert!(e.contains("perf_path"), "{e}");
+    }
+
+    #[test]
+    fn health_defaults_have_no_require_and_no_peers() {
+        let (_d, r) = load_with("", "");
+        let h = r.unwrap().health;
+        assert_eq!(h.metrics_require, None);
+        assert_eq!(h.metrics_peers, None);
+        assert_eq!(h.metrics_peer_ips, None);
+    }
+
+    #[test]
+    fn one_file_given_as_both_is_read_once() {
+        let dir = make_test_dir();
+        setup_minimal(dir.path());
+        write_file(dir.path(), "auth.pem", "dummy");
+        let mut site = minimal_site_toml();
+        site.push_str("\n[auth]\npublic_key = \"auth.pem\"\n\n[health]\nperf_path = \"/p\"\nmetrics_peers = [\"10.0.0.5\"]\n");
+        write_file(dir.path(), "site.toml", &site);
+        let same = dir.path().join("site.toml");
+        let cfg = load(dir.path(), &same).expect("one file for both loads");
+        assert_eq!(cfg.auth.expect("auth").public_key, "auth.pem");
+        assert_eq!(cfg.health.perf_path, "/p");
+        assert_eq!(cfg.health.metrics_peer_ips.map(|p| p.len()), Some(1));
     }
 }
