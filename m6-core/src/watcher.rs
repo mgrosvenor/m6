@@ -305,14 +305,16 @@ impl ConfigWatcher {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ConfigReloader: both of a process's files, with a debounce and a poll
+// ConfigReloader: both of a process's files, with a settle window and a poll
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// How long after the last change the reloader waits before reporting.
+/// The settle window after a report.
 ///
-/// A writer that writes a certificate, then a key, then touches the config
-/// produces one report. The wait delays only when a new config takes effect and
-/// is on no request path.
+/// The first change after quiet is reported at once. A change that arrives
+/// within this window of a report is held and reported once more when the
+/// window of quiet ends, so a burst is at most two reports and a single write
+/// is exactly one. Reporting at once keeps a backend from reloading later than
+/// an edge that cleared its cache on the same change.
 pub const RELOAD_DEBOUNCE: Duration = Duration::from_millis(100);
 
 /// How often the reloader compares fingerprints whatever the watcher says, and
@@ -404,6 +406,7 @@ pub struct ConfigReloader {
     pending: Changed,
     first: Option<Instant>,
     due: Option<Instant>,
+    window_end: Option<Instant>,
     next_poll: Instant,
     site_name: String,
     process_name: String,
@@ -448,6 +451,7 @@ impl ConfigReloader {
             pending: Changed::default(),
             first: None,
             due: None,
+            window_end: None,
             next_poll: Instant::now() + RELOAD_POLL,
             site_name: name(site_toml),
             process_name: name(process),
@@ -480,7 +484,7 @@ impl ConfigReloader {
         self.compare(now);
     }
 
-    /// Call on every loop iteration. Returns the change once it has settled.
+    /// Call on every loop iteration. Returns the change when a report is due.
     pub fn tick(&mut self, now: Instant) -> Option<Changed> {
         if now >= self.next_poll {
             self.compare(now);
@@ -488,11 +492,20 @@ impl ConfigReloader {
         }
         match self.due {
             Some(due) if now >= due => {
-                self.first = None;
+                // Every report opens a window. A change inside it is held for
+                // one more report when it settles.
+                self.first = Some(now);
                 self.due = None;
+                self.window_end = Some(now + RELOAD_DEBOUNCE);
                 Some(std::mem::take(&mut self.pending))
             }
-            _ => None,
+            _ => {
+                if self.due.is_none() && self.window_end.is_some_and(|w| now >= w) {
+                    self.first = None;
+                    self.window_end = None;
+                }
+                None
+            }
         }
     }
 
@@ -522,8 +535,14 @@ impl ConfigReloader {
                 process: true,
             };
         }
-        let first = *self.first.get_or_insert(now);
-        self.due = Some((now + RELOAD_DEBOUNCE).min(first + RELOAD_POLL));
+        self.due = Some(match (self.window_end, self.first) {
+            // A change inside the window of an earlier report: one more report
+            // when the burst settles, and never later than a second after the
+            // window opened.
+            (Some(_), Some(first)) => (now + RELOAD_DEBOUNCE).min(first + RELOAD_POLL).max(now),
+            // The first change after quiet: report at once.
+            _ => now,
+        });
     }
 }
 
@@ -790,18 +809,27 @@ mod tests {
     }
 
     #[test]
-    fn three_writes_within_the_debounce_are_one_change() {
+    fn a_burst_of_writes_is_at_most_two_reloads() {
         let (_d, site, proc, seen) = pair();
         let mut r = ConfigReloader::polling_only(&site, &proc, seen);
         let t0 = Instant::now() + RELOAD_POLL;
         put(&proc, "b = 12\n");
-        assert_eq!(r.tick(t0), None);
+        // The first change is reported at once.
+        assert_eq!(
+            r.tick(t0),
+            Some(Changed {
+                site: false,
+                process: true
+            })
+        );
         put(&proc, "b = 123\n");
+        r.next_poll_for_test(t0 + Duration::from_millis(10));
         assert_eq!(r.tick(t0 + Duration::from_millis(10)), None);
         put(&proc, "b = 1234\n");
+        r.next_poll_for_test(t0 + Duration::from_millis(20));
         assert_eq!(r.tick(t0 + Duration::from_millis(20)), None);
-        // The poll has not run again, so only the deadline matters now.
-        let c = r.tick(t0 + Duration::from_millis(500));
+        // One more when the burst has settled, and then nothing.
+        let c = r.tick(t0 + Duration::from_millis(20) + RELOAD_DEBOUNCE);
         assert_eq!(
             c,
             Some(Changed {
@@ -813,19 +841,17 @@ mod tests {
     }
 
     #[test]
-    fn a_change_is_reported_no_sooner_than_the_debounce() {
+    fn a_single_write_is_one_reload_with_no_delay() {
         let (_d, site, proc, seen) = pair();
         let mut r = ConfigReloader::polling_only(&site, &proc, seen);
         let t0 = Instant::now() + RELOAD_POLL;
         put(&site, "a = 12\n");
-        assert_eq!(r.tick(t0), None, "reported with no debounce");
-        assert_eq!(
-            r.tick(t0 + RELOAD_DEBOUNCE - Duration::from_millis(1)),
-            None,
-            "reported before the debounce"
-        );
-        let c = r.tick(t0 + RELOAD_DEBOUNCE).expect("due at the debounce");
+        let c = r.tick(t0).expect("reported at once");
         assert!(c.site && !c.process, "{c:?}");
+        for ms in [50, 100, 150, 400, 900] {
+            r.next_poll_for_test(t0 + Duration::from_millis(ms));
+            assert_eq!(r.tick(t0 + Duration::from_millis(ms)), None, "{ms} ms");
+        }
     }
 
     #[test]
@@ -878,8 +904,7 @@ mod tests {
         assert_eq!(r.raw_fd(), None);
         put(&proc, "b = 99999\n");
         let t0 = Instant::now() + RELOAD_POLL;
-        assert_eq!(r.tick(t0), None);
-        let c = r.tick(t0 + RELOAD_DEBOUNCE).expect("the poll saw it");
+        let c = r.tick(t0).expect("the poll saw it");
         assert!(c.process && !c.site, "{c:?}");
     }
 
@@ -891,8 +916,7 @@ mod tests {
         put(&site, "a = 4444\n");
         let mut r = ConfigReloader::polling_only(&site, &proc, seen);
         let t0 = Instant::now() + RELOAD_POLL;
-        assert_eq!(r.tick(t0), None);
-        let c = r.tick(t0 + RELOAD_DEBOUNCE).expect("reported");
+        let c = r.tick(t0).expect("reported");
         assert!(c.site && !c.process, "{c:?}");
     }
 
@@ -902,8 +926,7 @@ mod tests {
         let mut r = ConfigReloader::polling_only(&site, &proc, seen);
         put(&proc, "b = 5555\n");
         let t0 = Instant::now() + RELOAD_POLL;
-        r.tick(t0);
-        assert!(r.tick(t0 + RELOAD_DEBOUNCE).is_some());
+        assert!(r.tick(t0).is_some());
         // Nothing written since: the next polls report nothing.
         assert_eq!(r.tick(t0 + RELOAD_POLL * 2), None);
         assert_eq!(r.tick(t0 + RELOAD_POLL * 3), None);

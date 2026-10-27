@@ -230,7 +230,9 @@ A service reads two files, its own configuration and `site.toml`, and a change t
 One `ConfigReloader` in core watches both.
 It takes the change from the platform's watcher when there is one and, whatever the watcher says, compares the two files' size, times and identity once a second.
 A lost watch, a replaced directory or a watcher that stopped reporting therefore delays a reload by at most a second and no longer prevents it.
-A change settles for 100 ms before it reloads, and for at most one second under a writer that never stops, so a writer that writes a file and then touches the configuration is one reload.
+The first change after quiet reloads at once.
+A change that arrives within 100 ms of a reload is held and reloads once more when the burst has settled, no later than a second after the window opened.
+A single write is therefore one reload with no delay, and a burst of writes is at most two.
 A touch alone, with no change to the bytes, reloads.
 Table 5 says what that reload reaches.
 

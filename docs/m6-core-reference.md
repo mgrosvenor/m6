@@ -325,12 +325,14 @@ template signals a 404 from inside rendering.
 `ConfigReloader::new(site_toml, process, seen)` owns a `ConfigWatcher` on a
 service's two files and reports which of them changed. The loop calls
 `on_readable(now)` when `raw_fd()` is readable and `tick(now)` on every
-iteration. `tick` returns `Some(Changed { site, process })` once a change has
-settled. Which file changed is decided by a `Fingerprint` (device, inode,
+iteration. `tick` returns `Some(Changed { site, process })` when a report is
+due. Which file changed is decided by a `Fingerprint` (device, inode,
 length, mtime and ctime). The event name plays no part, so inotify and kqueue
 give the same answer and a file beside the config in the same directory is
-ignored. A change settles for `RELOAD_DEBOUNCE` (100 ms), capped at
-`RELOAD_POLL` (one second) under a writer that never stops. The fingerprints are
+ignored. The first change after quiet is reported at once. A change within
+`RELOAD_DEBOUNCE` (100 ms) of a report is held and reported once more when the
+burst settles, capped at `RELOAD_POLL` (one second). A burst is at most two
+reports. The fingerprints are
 also compared every `RELOAD_POLL` whatever the watcher says, which finds a lost
 watch. Take a `Seen` from `Seen::read` before the first read of either file so a
 change in between is reported on the first tick. With no watcher the poll alone

@@ -293,13 +293,35 @@ fn a_touch_alone_reloads() {
 }
 
 #[test]
-fn a_burst_of_writes_is_one_reload() {
+fn a_burst_of_writes_is_at_most_two_reloads() {
     let r = start("");
     for pad in ["", "# a", "# bb"] {
         std::fs::write(r.conf(), conf_body(pad, 2)).unwrap();
         std::thread::sleep(Duration::from_millis(10));
     }
     assert!(wait_for(&r, "Reload complete", 1), "{}", r.svc.output());
+    std::thread::sleep(Duration::from_millis(1_500));
+    let n = r.count("Reload complete");
+    assert!((1..=2).contains(&n), "{n} reloads\n{}", r.svc.output());
+}
+
+#[test]
+fn a_single_write_is_one_reload_with_no_delay() {
+    let r = start("");
+    let t = std::time::Instant::now();
+    // Written beside it and renamed over, as a careful writer does. A plain
+    // `fs::write` truncates first, which is two changes to the file.
+    let tmp = r.root().join("m6-file.conf.new");
+    std::fs::write(&tmp, conf_body("# one", 2)).unwrap();
+    std::fs::rename(&tmp, r.conf()).unwrap();
+    assert!(wait_for(&r, "Reload complete", 1), "{}", r.svc.output());
+    // The poll loop wakes every 100 ms at most; a debounce before the first
+    // report would add its own 100 ms on top.
+    assert!(
+        t.elapsed() < Duration::from_millis(250),
+        "first report took {:?}",
+        t.elapsed()
+    );
     std::thread::sleep(Duration::from_millis(1_500));
     assert_eq!(r.count("Reload complete"), 1, "{}", r.svc.output());
 }

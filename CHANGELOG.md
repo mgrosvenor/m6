@@ -27,7 +27,10 @@ State that `init_global` built from the config had no way to reload.
 
 `m6_core::ConfigReloader` now watches both files.
 It takes the change from the platform watcher and, whatever the watcher says, compares the two files' identity, size and times once a second.
-A change settles for 100 ms, and for at most one second under a writer that never stops, so a writer that writes a file and then touches the config is one reload.
+The first change after quiet is reported at once.
+A change that arrives within 100 ms of a report is held and reported once more when the burst has settled, no later than a second after the window opened.
+A single write is one reload with no delay and a burst of writes is at most two.
+Reporting at once matters when an edge clears its cache on the same change, because a backend that reloads late would otherwise leave a stale page cached.
 A touch alone reloads.
 A file that failed to load is not tried again until it is written again.
 
