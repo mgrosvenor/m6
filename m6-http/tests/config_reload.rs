@@ -398,3 +398,77 @@ fn a_process_change_after_a_refused_site_reload_keeps_the_running_routes() {
     );
     s.proc.terminate(Duration::from_secs(10));
 }
+
+/// The microseconds since the epoch of a log line's leading RFC 3339 stamp.
+fn stamp_us(line: &str) -> i64 {
+    let t = line.split_whitespace().next().expect("a stamped line");
+    // 2026-10-27T13:26:12.480335Z
+    let (date, time) = t.trim_end_matches('Z').split_once('T').expect("T");
+    let mut d = date.split('-').map(|x| x.parse::<i64>().unwrap());
+    let (y, m, day) = (d.next().unwrap(), d.next().unwrap(), d.next().unwrap());
+    let (hms, frac) = time.split_once('.').unwrap_or((time, "0"));
+    let mut h = hms.split(':').map(|x| x.parse::<i64>().unwrap());
+    let (hh, mm, ss) = (h.next().unwrap(), h.next().unwrap(), h.next().unwrap());
+    let us: i64 = format!("{frac:0<6}")[..6].parse().unwrap();
+    // Days from civil, enough for ordering and differences.
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe;
+    ((days * 24 + hh) * 3600 + mm * 60 + ss) * 1_000_000 + us
+}
+
+/// The settle window starts when the first clear is done.
+///
+/// A reload that takes a while must not use up the window. The site has 20000
+/// files under a route group, which makes the reload take far longer than the
+/// 100 ms window, and the second clear has to come a full window after the
+/// reload finished, not a window after it started.
+#[test]
+fn the_second_clear_comes_a_full_window_after_a_slow_reload() {
+    let mut s = Stack::start();
+    let posts = s.site.join("posts");
+    std::fs::create_dir_all(&posts).expect("posts dir");
+    for i in 0..20_000 {
+        std::fs::write(posts.join(format!("p{i}.json")), "{}").expect("post");
+    }
+    let extra =
+        "\n[[route_group]]\nglob = \"posts/*.json\"\npath = \"/p/{stem}\"\nbackend = \"counter\"\n";
+    std::fs::write(
+        s.site.join("site.toml"),
+        Stack::site_toml(s.backend_port, extra),
+    )
+    .expect("rewrite site.toml");
+    assert!(
+        s.wait_for_log("cache cleared again after the settle window", 1),
+        "no second clear\n{}",
+        s.log()
+    );
+    let log = s.log();
+    let done = log
+        .lines()
+        .find(|l| l.contains("config reload: complete"))
+        .expect("complete line");
+    let again = log
+        .lines()
+        .find(|l| l.contains("cache cleared again"))
+        .expect("second clear line");
+    let elapsed_us: i64 = done
+        .split("elapsed_us=")
+        .nth(1)
+        .and_then(|r| r.split_whitespace().next())
+        .and_then(|n| n.parse().ok())
+        .expect("elapsed_us");
+    assert!(
+        elapsed_us > 100_000,
+        "the reload took {elapsed_us} us, which is not slow enough to test the window"
+    );
+    let gap_us = stamp_us(again) - stamp_us(done);
+    assert!(
+        gap_us >= 95_000,
+        "the second clear came {gap_us} us after the reload finished, under the 100 ms window"
+    );
+    s.proc.terminate(Duration::from_secs(10));
+}

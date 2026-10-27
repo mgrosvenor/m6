@@ -1443,7 +1443,9 @@ fn event_loop(
         if let Some(changed) = reloader.tick(now) {
             let r = handle_config_change(changed, state, quiche_config, tcp.as_mut(), log_handle);
             if r.cache_cleared {
-                second_clear = Some(now + CACHE_SECOND_CLEAR);
+                // From the end of the reload, not from before it: a slow
+                // reload must not use up the settle window.
+                second_clear = Some(std::time::Instant::now() + CACHE_SECOND_CLEAR);
             }
             if r.tls_failed {
                 let d = reloader.retry(
