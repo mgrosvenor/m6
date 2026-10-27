@@ -596,7 +596,10 @@ a silent log becomes a fault rather than a zero.
 `reopen_log_file() -> Reopened` reopens the analytics file at the absolute path it was opened with.
 `reopens() -> &'static ReopenRecord` answers how many reopens succeeded and failed, and how long ago the last of each was.
 `writes_log_file()` says whether this process has a file to reopen.
-`newest_rotated(live)` and `read_tail(path, max_bytes)` find and read the newest rotated sibling of a log file, plain or gzip.
+`newest_rotated(live)` finds the newest rotated sibling of a log file, plain or gzip.
+`read_tail(path, max_bytes)` reads the end of one file.
+`read_recent(live, max_bytes, since)` reads the live file and, when it adds history, the newest rotated sibling before it.
+`read_recent_counted` does the same and also returns what the read cost.
 
 ### `telemetry`
 
