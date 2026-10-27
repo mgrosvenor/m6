@@ -112,7 +112,7 @@ impl<'a> Require<'a> {
 }
 
 /// Check if claims satisfy the `require` string.
-/// Format: "group:<name>" or "role:<name>". Any other form denies.
+/// Format: `group:<name>` or `role:<name>`. Any other form denies.
 pub fn check_require(claims: &Claims, require: &str) -> bool {
     let (list, name) = match Require::parse(require) {
         Some(Require::Group(g)) => (&claims.groups, g),

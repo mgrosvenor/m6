@@ -107,7 +107,7 @@ pub fn read() -> Option<HeadersGuard> {
 
 /// Append the configured security headers to `headers`, skipping any the
 /// response already sets. Allocates; prefer [`write_h1_headers`] or
-/// [`with_absent_headers`] on hot paths.
+/// [`HeadersGuard::absent_from`] on hot paths.
 pub fn apply(headers: &mut Vec<(String, String)>) {
     let Some(guard) = read() else { return };
     let extra: Vec<(String, String)> = guard

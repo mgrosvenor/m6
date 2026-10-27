@@ -93,7 +93,7 @@ pub struct ServerConfig {
     #[serde(default)]
     pub internal_binds: Vec<String>,
     /// Run this process as a plain-HTTP redirector on this address instead of
-    /// a normal server: every request is answered 301 to https://<Host><path>.
+    /// a normal server: every request is answered 301 to `https://<Host><path>`.
     ///
     /// Meant for a **second m6-http process** alongside the real one, not for
     /// the `:443` instance to also listen here. Different port, different
@@ -568,7 +568,7 @@ pub struct BackendConfig {
     pub name: String,
     /// Unix socket glob, e.g. "/run/m6/m6-html-*.sock"
     pub sockets: Option<String>,
-    /// URL upstream, e.g. "https://api.example.com"
+    /// URL upstream, e.g. `https://api.example.com`
     pub url: Option<String>,
     /// Skip TLS certificate verification for URL backends.
     /// For testing with self-signed certs only — do not use in production.

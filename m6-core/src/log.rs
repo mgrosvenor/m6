@@ -476,7 +476,7 @@ pub fn read_recent(
 /// The rotated file is left alone when it adds nothing the caller can use:
 /// when the live tail already filled `max_bytes`,
 /// when the rotated file was last written before `since`,
-/// or when it is a gzip file too large to decode within the bound (see [`append_rotated`]).
+/// or when it is a gzip file too large to decode within the bound.
 /// This runs on a request thread, so the work is bounded by `max_bytes` whatever the size of the files.
 /// A rotated file that cannot be read costs that history and nothing else.
 /// A first line, or the first line after the join, that starts mid-record is expected and is the caller's to skip.
