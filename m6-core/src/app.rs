@@ -170,6 +170,14 @@ type InitThread<G, T> = Arc<dyn Fn(&Map<String, Value>, &G) -> Result<T> + Send 
 /// nothing that needs an explicit drop, and the option is what says so.
 type Destroy<S> = Option<Arc<dyn Fn(S) + Send + Sync>>;
 
+/// Called after a reload has swapped in the new state, with the new config. A
+/// service's own state built in `init_global` is reloaded here. `None` is the
+/// common case.
+type OnReload<G> = Option<Arc<dyn Fn(&G, &AppContext) -> Result<()> + Send + Sync>>;
+
+/// [`OnReload`] with the global state already bound, as the run loop holds it.
+type ReloadHook = Arc<dyn Fn(&AppContext) -> Result<()> + Send + Sync>;
+
 /// Global thread-init function — set at startup before any threads are created.
 static THREAD_INIT_FN: OnceLock<ThreadInitFn> = OnceLock::new();
 
@@ -1107,6 +1115,7 @@ fn run_app_global<G: Send + Sync + 'static>(
     raw_named: Vec<GlobalRawNamed<G>>,
     init_global: InitGlobal<G>,
     destroy_global: Destroy<G>,
+    on_reload: OnReload<G>,
     renderer: Arc<dyn RendererFactory>,
 ) -> Result<()> {
     // Before anything else, and before `init_global` below, which is allowed
@@ -1182,6 +1191,8 @@ fn run_app_global<G: Send + Sync + 'static>(
         b
     });
 
+    let reload_hook = bind_reload_hook(on_reload, &arc_g);
+
     run_app_with_shutdown(
         Handlers {
             routes: code_routes,
@@ -1189,11 +1200,43 @@ fn run_app_global<G: Send + Sync + 'static>(
         },
         config_path,
         site_dir,
-        on_shutdown,
-        None,
+        RunHooks {
+            on_shutdown,
+            on_thread_exit: None,
+            on_reload: reload_hook,
+        },
         cli_log_level,
         renderer,
     )
+}
+
+/// The three optional hooks of a service with global and per-thread state.
+struct StateHooks<G, T> {
+    destroy_thread: Destroy<T>,
+    destroy_global: Destroy<G>,
+    on_reload: OnReload<G>,
+}
+
+/// What a runner hands the run loop to call at the three points a service can
+/// hook: after a reload, at shutdown, and as each worker thread ends.
+#[derive(Default)]
+struct RunHooks {
+    on_shutdown: Option<Box<dyn FnOnce() + Send>>,
+    on_thread_exit: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
+    on_reload: Option<ReloadHook>,
+}
+
+/// Close a service's `on_reload` over its global state, so the run loop can
+/// call it with only the context.
+fn bind_reload_hook<G: Send + Sync + 'static>(
+    on_reload: OnReload<G>,
+    global: &Arc<G>,
+) -> Option<ReloadHook> {
+    on_reload.map(|f| {
+        let g = global.clone();
+        let hook: ReloadHook = Arc::new(move |ctx: &AppContext| f(&g, ctx));
+        hook
+    })
 }
 
 /// Run with per-thread state only (no global).
@@ -1275,8 +1318,10 @@ fn run_app_thread_state<T: Any + Send + 'static>(
         },
         config_path,
         site_dir,
-        None,
-        Some(on_thread_exit),
+        RunHooks {
+            on_thread_exit: Some(on_thread_exit),
+            ..RunHooks::default()
+        },
         cli_log_level,
         renderer,
     )
@@ -1289,9 +1334,13 @@ fn run_app_state<G: Send + Sync + 'static, T: Any + Send + 'static>(
     renderer: Arc<dyn RendererFactory>,
     init_global: InitGlobal<G>,
     init_thread: InitThread<G, T>,
-    destroy_thread: Destroy<T>,
-    destroy_global: Destroy<G>,
+    hooks: StateHooks<G, T>,
 ) -> Result<()> {
+    let StateHooks {
+        destroy_thread,
+        destroy_global,
+        on_reload,
+    } = hooks;
     // Before anything else, and before `init_global` below, which is allowed
     // to spawn threads and in m6-auth-server's case does: the mask is
     // inherited only by threads created after this call, so a watcher started
@@ -1392,8 +1441,11 @@ fn run_app_state<G: Send + Sync + 'static, T: Any + Send + 'static>(
         },
         config_path,
         site_dir,
-        on_shutdown,
-        Some(on_thread_exit),
+        RunHooks {
+            on_shutdown,
+            on_thread_exit: Some(on_thread_exit),
+            on_reload: bind_reload_hook(on_reload, &arc_g),
+        },
         cli_log_level,
         renderer,
     )
@@ -1812,12 +1864,28 @@ pub struct AppWithGlobal<G: Send + Sync + 'static> {
     raw_named: Vec<GlobalRawNamed<G>>,
     init_global: InitGlobal<G>,
     destroy_global: Destroy<G>,
+    on_reload: OnReload<G>,
     renderer: Arc<dyn RendererFactory>,
 }
 
 impl<G: Send + Sync + 'static> AppWithGlobal<G> {
     pub fn on_destroy(mut self, f: impl Fn(G) + Send + Sync + 'static) -> Self {
         self.destroy_global = Some(Arc::new(f));
+        self
+    }
+
+    /// Re-read state that `init_global` built from the config.
+    ///
+    /// Called after every successful reload, once the new routes are serving,
+    /// with the global state and a context carrying the new config. A reload
+    /// is triggered by a change to the service's config or to `site.toml`.
+    /// On `Err` the service logs it at error level and keeps serving: the hook
+    /// is expected to leave its own state as it was.
+    pub fn on_reload(
+        mut self,
+        f: impl Fn(&G, &AppContext) -> Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        self.on_reload = Some(Arc::new(f));
         self
     }
 
@@ -1903,6 +1971,7 @@ impl<G: Send + Sync + 'static> AppWithGlobal<G> {
             self.raw_named,
             self.init_global,
             self.destroy_global,
+            self.on_reload,
             self.renderer,
         )
     }
@@ -1923,6 +1992,7 @@ impl App {
             raw_named: vec![],
             init_global: Arc::new(init_global),
             destroy_global: None,
+            on_reload: None,
             renderer: default_renderer(),
         }
     }
@@ -1950,6 +2020,7 @@ impl App {
             init_thread: Arc::new(init_thread),
             destroy_thread: None,
             destroy_global: None,
+            on_reload: None,
             renderer: default_renderer(),
         }
     }
@@ -2102,6 +2173,7 @@ pub struct AppWithState<G: Send + Sync + 'static, T: Any + Send + 'static> {
     init_thread: InitThread<G, T>,
     destroy_thread: Destroy<T>,
     destroy_global: Destroy<G>,
+    on_reload: OnReload<G>,
     renderer: Arc<dyn RendererFactory>,
 }
 
@@ -2113,6 +2185,16 @@ impl<G: Send + Sync + 'static, T: Any + Send + 'static> AppWithState<G, T> {
 
     pub fn on_destroy(mut self, f: impl Fn(G) + Send + Sync + 'static) -> Self {
         self.destroy_global = Some(Arc::new(f));
+        self
+    }
+
+    /// Re-read state that `init_global` built from the config.
+    /// See [`AppWithGlobal::on_reload`].
+    pub fn on_reload(
+        mut self,
+        f: impl Fn(&G, &AppContext) -> Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        self.on_reload = Some(Arc::new(f));
         self
     }
 
@@ -2199,8 +2281,11 @@ impl<G: Send + Sync + 'static, T: Any + Send + 'static> AppWithState<G, T> {
             self.renderer,
             self.init_global,
             self.init_thread,
-            self.destroy_thread,
-            self.destroy_global,
+            StateHooks {
+                destroy_thread: self.destroy_thread,
+                destroy_global: self.destroy_global,
+                on_reload: self.on_reload,
+            },
         )
     }
 }
@@ -2455,6 +2540,35 @@ fn dump_config(
     0
 }
 
+/// The keys that changed between the running state and `new` and cannot be
+/// applied without a restart.
+fn restart_only_changes_against(
+    fs: &std::sync::RwLock<FrameworkState>,
+    new: &crate::config::RendererConfig,
+    site_dir: &std::path::Path,
+) -> Vec<&'static str> {
+    crate::config::restart_only_changes(&fs.read().unwrap().config, new, site_dir)
+}
+
+/// Apply the log level a reload asks for, with the same precedence as start:
+/// the command line, then the service's `[log]`, then `site.toml`'s `[log]`.
+///
+/// `site.toml` is read again here, which is how a level moved there reaches a
+/// running service.
+fn apply_reloaded_log_level(
+    handle: &crate::log::LogHandle,
+    site_toml: &std::path::Path,
+    config_log: &crate::config::LogConfig,
+    cli_log_level: Option<&str>,
+) {
+    let (site_level, site_format) = crate::log::read_site_log_config(site_toml);
+    let format = config_log.format.as_deref().unwrap_or(&site_format);
+    let level = cli_log_level
+        .or(config_log.level.as_deref())
+        .unwrap_or(&site_level);
+    handle.reload(format, level);
+}
+
 pub fn run_app(
     code_routes: Vec<CodeRoute>,
     named: Vec<NamedHandler>,
@@ -2486,8 +2600,7 @@ pub fn run_app(
         },
         config_path,
         site_dir,
-        None,
-        None,
+        RunHooks::default(),
         cli_log_level,
         renderer,
     )
@@ -2497,11 +2610,19 @@ fn run_app_with_shutdown(
     handlers: Handlers,
     config_path: PathBuf,
     site_dir: PathBuf,
-    on_shutdown: Option<Box<dyn FnOnce() + Send>>,
-    on_thread_exit: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
+    hooks: RunHooks,
     cli_log_level: Option<String>,
     renderer: Arc<dyn RendererFactory>,
 ) -> Result<()> {
+    let RunHooks {
+        on_shutdown,
+        on_thread_exit,
+        on_reload,
+    } = hooks;
+    // Fingerprint the process config before the first read of it, so a change
+    // between that read and the reloader's creation is reported, not lost.
+    let process_fp = crate::watcher::Fingerprint::of(&config_path);
+
     // Load config.
     let config = crate::config::load(&config_path, &site_dir).unwrap_or_else(|e| {
         eprintln!("Config error: {e}");
@@ -2509,6 +2630,7 @@ fn run_app_with_shutdown(
     });
 
     let site_toml = site_toml_or_exit(&config, &site_dir);
+    let site_fp = crate::watcher::Fingerprint::of(&site_toml);
 
     // Does site.toml tell the edge the truth about whether we compress?
     //
@@ -2521,11 +2643,13 @@ fn run_app_with_shutdown(
     // The backend name is the config file's stem, which is the same convention
     // `socket_path_from_config` uses to derive /run/m6/<stem>.sock, so the name
     // in site.toml's `[[backend]]` and the name here are the same string.
+    let backend_name = config_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("m6-default")
+        .to_string();
     {
-        let backend_name = config_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("m6-default");
+        let backend_name = backend_name.as_str();
         // "Compresses" means at least one MIME type has a non-zero level. The
         // defaults give text types real levels and images zero, so a service
         // that has not opted out does compress.
@@ -2556,7 +2680,7 @@ fn run_app_with_shutdown(
         .unwrap_or(&site_level)
         .to_string();
     let level = cli_log_level.as_deref().unwrap_or(&cfg_level).to_string();
-    let _log_guard = crate::log::init(&format, &level).unwrap_or_else(|e| {
+    let log_handle = crate::log::init(&format, &level).unwrap_or_else(|e| {
         eprintln!("logging init error: {e}");
         std::process::exit(1);
     });
@@ -2672,125 +2796,146 @@ fn run_app_with_shutdown(
     let pool = Arc::new(ThreadPool::new_with_exit(tp_size, tp_queue, on_thread_exit));
 
     // ── Hot-reload setup ──────────────────────────────────────────────────
-    // ConfigWatcher watches the directories containing config_path and
-    // site.toml; its fd is added to the poll(2) call so reloads happen
-    // within milliseconds of a file write when supported.
-    // When raw_fd() returns None (fallback platform or init failure): fall
-    // back to mtime polling at ~1-second intervals via the poll(2) timeout
-    // countdown.
-    let site_toml_path = site_toml.clone();
-    let mut watcher = crate::ConfigWatcher::new(&[&config_path, &site_toml_path]).ok();
-
-    // Mtime fallback state — only meaningful when watcher.raw_fd() is None.
-    let mut config_mtime = file_mtime(&config_path);
-    let mut site_toml_mtime = file_mtime(&site_toml_path);
-    let mut reload_countdown: u8 = 10;
-
-    // Filename (not path) used to match watcher events.
-    let config_filename = config_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_string();
-
-    let site_toml_filename = site_toml
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("site.toml")
-        .to_string();
+    // One reloader watches both files. Its descriptor is added to the poll(2)
+    // call, so a change is seen within milliseconds when the platform has a
+    // watcher, and within a second by the fingerprint poll when it does not or
+    // when the watch has been lost. It settles for a short debounce, so a
+    // writer that writes several files and then touches the config is one
+    // reload.
+    let mut reloader = crate::watcher::ConfigReloader::new(
+        &site_toml,
+        &config_path,
+        crate::watcher::Seen {
+            site: site_fp,
+            process: process_fp,
+        },
+    );
 
     use std::os::unix::io::AsRawFd;
     let listener_fd = listener.as_raw_fd();
 
     loop {
         // ── poll(2) ─────────────────────────────────────────────────────
-        // When inotify is available we poll two fds (listener + inotify).
         // The 100 ms timeout ensures we catch shutdown signals promptly
         // even when the server is completely idle.
-        let watcher_fd = watcher.as_ref().and_then(|w| w.raw_fd());
-        let ready = crate::server::poll_listener_and_watcher(listener_fd, watcher_fd, 100);
-        let (listener_ready, inotify_fired) = (ready.listener, ready.watcher);
+        let ready = crate::server::poll_listener_and_watcher(listener_fd, reloader.raw_fd(), 100);
+        let listener_ready = ready.listener;
+        let now = std::time::Instant::now();
 
-        // ── Determine whether a reload is needed ─────────────────────────
-        let mut should_reload = false;
-
-        // Neither fd fired: a timeout, or a signal interrupted the wait.
-        if ready.idle {
-            if is_shutdown() {
-                info!("Shutdown signal received, draining...");
-                pool.drain();
-                if let Some(f) = on_shutdown_cell.take() {
-                    f();
-                }
-                info!("Clean shutdown");
-                break;
-            }
-            // Mtime fallback: check every ~10 timeouts (≈1 s).
-            if watcher_fd.is_none() {
-                reload_countdown = reload_countdown.saturating_sub(1);
-                if reload_countdown == 0 {
-                    reload_countdown = 10;
-                    let nm = file_mtime(&config_path);
-                    let ns = file_mtime(&site_toml_path);
-                    if nm != config_mtime || ns != site_toml_mtime {
-                        config_mtime = nm;
-                        site_toml_mtime = ns;
-                        should_reload = true;
-                    }
-                }
-            }
-            if !should_reload {
-                continue;
-            }
+        if ready.watcher {
+            reloader.on_readable(now);
         }
 
-        // Watcher fired — drain events and check for our watched files.
-        if inotify_fired {
-            should_reload = watcher
-                .as_mut()
-                .is_some_and(|w| w.read_events(&[&config_filename, &site_toml_filename]));
+        // Neither fd fired: a timeout, or a signal interrupted the wait.
+        if ready.idle && is_shutdown() {
+            info!("Shutdown signal received, draining...");
+            pool.drain();
+            if let Some(f) = on_shutdown_cell.take() {
+                f();
+            }
+            info!("Clean shutdown");
+            break;
         }
 
         // ── Hot reload ───────────────────────────────────────────────────
-        if should_reload {
-            info!("Config change detected, reloading...");
+        // Every iteration, idle or not: the debounce deadline and the
+        // fingerprint poll are both decided here.
+        if let Some(changed) = reloader.tick(now) {
+            info!(
+                site = changed.site,
+                process = changed.process,
+                "Config change detected, reloading..."
+            );
             let reload_start = std::time::Instant::now();
             match crate::config::load(&config_path, &site_dir) {
                 Err(e) => {
                     error!("Reload failed (config parse error): {e}");
                 }
                 Ok(new_config) => {
-                    match FrameworkState::build(
-                        new_config,
-                        site_dir.clone(),
-                        &code_route_signatures,
-                        &*renderer,
-                    ) {
-                        Err(e) => {
-                            error!("Reload failed (template/state error): {e}");
-                        }
-                        Ok(new_state) => {
-                            // The new config may have added a route naming a
-                            // handler this binary does not have. Refuse the
-                            // whole state rather than swap in one that cannot
-                            // serve a route it advertises: the previous routes
-                            // keep serving, which is what makes a typo in a
-                            // live config recoverable.
-                            let missing = unknown_handlers(
-                                &new_state.routes,
-                                &named_handlers,
-                                &code_patterns,
-                            );
-                            if !missing.is_empty() {
-                                error!(
-                                    "Reload refused, route names an unregistered handler: {}",
-                                    describe_unknown(&missing, &registered_names)
+                    // The same refusals as at start: a named `site_toml` that
+                    // is gone or does not parse, and a compress declaration
+                    // that disagrees with this service. Either keeps the old
+                    // state, so a bad edit of `site.toml` is recoverable.
+                    let refusal = check_site_toml(&new_config, &site_dir).err().or_else(|| {
+                        let compresses = new_config
+                            .compression
+                            .values()
+                            .any(|c| c.brotli > 0 || c.gzip > 0);
+                        crate::compress::check_declared_support(
+                            &site_toml,
+                            &backend_name,
+                            compresses,
+                        )
+                        .err()
+                    });
+                    if let Some(msg) = refusal {
+                        error!("Reload refused: {msg}");
+                    } else {
+                        let changed_keys =
+                            restart_only_changes_against(&fs, &new_config, &site_dir);
+                        let new_log = new_config.log.clone();
+                        match FrameworkState::build(
+                            new_config,
+                            site_dir.clone(),
+                            &code_route_signatures,
+                            &*renderer,
+                        ) {
+                            Err(e) => {
+                                error!("Reload failed (template/state error): {e}");
+                            }
+                            Ok(new_state) => {
+                                // The new config may have added a route naming a
+                                // handler this binary does not have. Refuse the
+                                // whole state rather than swap in one that cannot
+                                // serve a route it advertises: the previous routes
+                                // keep serving, which is what makes a typo in a
+                                // live config recoverable.
+                                let missing = unknown_handlers(
+                                    &new_state.routes,
+                                    &named_handlers,
+                                    &code_patterns,
                                 );
-                            } else {
-                                let routes = new_state.routes.len();
-                                *fs.write().unwrap() = new_state;
-                                let elapsed = reload_start.elapsed().as_millis();
-                                info!(elapsed_ms = elapsed, routes = routes, "Reload complete");
+                                if !missing.is_empty() {
+                                    error!(
+                                        "Reload refused, route names an unregistered handler: {}",
+                                        describe_unknown(&missing, &registered_names)
+                                    );
+                                } else {
+                                    let routes = new_state.routes.len();
+                                    *fs.write().unwrap() = new_state;
+                                    for k in changed_keys {
+                                        warn!(
+                                            key = k,
+                                            "config reload: {k} changed; restart this service to apply it"
+                                        );
+                                    }
+                                    apply_reloaded_log_level(
+                                        &log_handle,
+                                        &site_toml,
+                                        &new_log,
+                                        cli_log_level.as_deref(),
+                                    );
+                                    if let Some(hook) = &on_reload {
+                                        let state = fs.read().unwrap();
+                                        let ctx = AppContext {
+                                            config: &state.config.user_config,
+                                            site_dir: &site_dir,
+                                            config_path: &config_path,
+                                            site_toml: &site_toml,
+                                        };
+                                        if let Err(e) = hook(&ctx) {
+                                            error!("Reload hook failed: {e:#}");
+                                        }
+                                    }
+                                    let elapsed = reload_start.elapsed().as_millis();
+                                    info!(
+                                        elapsed_ms = elapsed,
+                                        routes = routes,
+                                        site = changed.site,
+                                        process = changed.process,
+                                        "Reload complete"
+                                    );
+                                }
                             }
                         }
                     }

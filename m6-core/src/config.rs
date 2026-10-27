@@ -143,6 +143,36 @@ impl RendererConfig {
     }
 }
 
+/// The keys whose new value a reload cannot apply, by name, for each one that
+/// differs between the running config and the one just loaded.
+///
+/// They are read once at start: the pool dimensions size threads and a queue,
+/// the read timeout and socket mode are applied to a socket as it is accepted
+/// or bound, and `site_toml` names a file the watch was built on.
+pub(crate) fn restart_only_changes(
+    old: &RendererConfig,
+    new: &RendererConfig,
+    site_dir: &Path,
+) -> Vec<&'static str> {
+    let mut changed = Vec::new();
+    if old.thread_pool.size != new.thread_pool.size {
+        changed.push("thread_pool.size");
+    }
+    if old.thread_pool.queue_size != new.thread_pool.queue_size {
+        changed.push("thread_pool.queue_size");
+    }
+    if old.server.read_timeout != new.server.read_timeout {
+        changed.push("server.read_timeout_s");
+    }
+    if old.server.socket_mode != new.server.socket_mode {
+        changed.push("server.socket_mode");
+    }
+    if old.resolve_site_toml(site_dir) != new.resolve_site_toml(site_dir) {
+        changed.push("site_toml");
+    }
+    changed
+}
+
 /// Per-MIME-type minification enable flag.
 #[derive(Debug, Clone, Default)]
 pub struct MinificationConfig {
@@ -660,6 +690,30 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn restart_only_changes_names_each_key_that_moved() {
+        let site_dir = Path::new("/site");
+        let a = RendererConfig::default();
+        assert!(restart_only_changes(&a, &a.clone(), site_dir).is_empty());
+
+        let mut b = a.clone();
+        b.thread_pool.size += 1;
+        b.thread_pool.queue_size += 1;
+        b.server.read_timeout = Some(std::time::Duration::from_secs(9));
+        b.server.socket_mode = a.server.socket_mode ^ 0o1;
+        b.site_toml = Some(PathBuf::from("other.toml"));
+        assert_eq!(
+            restart_only_changes(&a, &b, site_dir),
+            [
+                "thread_pool.size",
+                "thread_pool.queue_size",
+                "server.read_timeout_s",
+                "server.socket_mode",
+                "site_toml"
+            ]
+        );
+    }
 
     #[test]
     fn test_basic_config() {
