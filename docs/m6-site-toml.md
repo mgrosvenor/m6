@@ -353,11 +353,12 @@ The internal h2c listener is for relaying nodes.
 A monitor polls a node over its TLS listener.
 So `internal_peers` both admits a peer and trusts the client addresses that peer forwards.
 An address that is listed must be one the peer connects from, and the list needs at least one address of the bind's IP family.
-The log writes a line for the first refused connection from each of the first 256 addresses, then at most one line per address every 60 seconds with the count since the last line.
-Across all addresses it writes at most 32 of those lines in 60 seconds.
-Refusals past that limit, and refusals from addresses beyond the first 256, are counted.
-The first refusal after the 60 seconds ends writes one summary line with the counts and the number of distinct addresses behind them, up to 1024.
-The list of tracked addresses lasts until the process restarts.
+The log writes a line for the first refused connection from each address, then at most one line per address every 60 seconds with the count since the last line.
+It remembers 256 addresses.
+A new address past that takes the place of the remembered address whose last line is oldest, when that line is more than 60 seconds old and no count is owed.
+When no remembered address qualifies, refusals from the new address are counted.
+Across all addresses it writes at most 32 of those lines in 60 seconds, and refusals past that limit are counted.
+The first refusal after the 60 seconds ends writes one summary line with the counts, the number of distinct counted addresses (up to 1024) and the most recent counted address.
 The list is read at startup, and the system config's list replaces the one in `site.toml` as a whole.
 
 ```toml

@@ -402,9 +402,10 @@ const MAX_ACCEPTS_PER_WAKE: usize = 64;
 /// length of the window that `REFUSAL_LOG_MAX_LINES` and the summary line use.
 const REFUSAL_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// The most peers `RefusalLog` tracks. A peer is never dropped to make room.
-/// Once the table is full, refusals from an address that is not in it are
-/// counted into one total instead.
+/// The most peers `RefusalLog` tracks. When the table is full, a new address
+/// takes the slot of the stalest peer whose last line is older than the
+/// interval and that owes no count. When there is no such peer, refusals from
+/// the new address are counted into one total instead.
 const REFUSAL_LOG_MAX_PEERS: usize = 256;
 
 /// The most per-peer lines written in one window across all peers. A host that
@@ -424,6 +425,8 @@ struct RefusalSummary {
     other_refusals: u64,
     /// Distinct addresses among those, up to `REFUSAL_LOG_MAX_OTHERS`.
     other_addresses: u64,
+    /// The most recent of those addresses, so the line names one.
+    sample: Option<std::net::IpAddr>,
     /// Refusals from tracked addresses whose line the window limit withheld.
     over_limit: u64,
 }
@@ -441,8 +444,10 @@ struct RefusalVerdict {
 /// A tracked peer gets a line on its first refusal, then at most one per
 /// `interval` carrying the count since its last line.
 /// Across all peers a window of `interval` holds at most `REFUSAL_LOG_MAX_LINES` such lines.
-/// When the table holds `max_peers` peers, a new address is counted into a
-/// total and the first refusal after the window ends returns one summary.
+/// When the table holds `max_peers` peers, a new address takes the slot of the
+/// stalest peer that owes nothing, or else is counted into a total with the
+/// most recent such address kept as a sample. The first refusal after the
+/// window ends returns one summary.
 /// Memory is bounded and a refusal allocates nothing once the tables are full.
 struct RefusalLog {
     interval: std::time::Duration,
@@ -500,8 +505,9 @@ impl RefusalLog {
             return verdict;
         }
 
-        if self.peers.len() >= self.max_peers {
+        if self.peers.len() >= self.max_peers && !self.evict_stale(now) {
             self.summary.other_refusals += 1;
+            self.summary.sample = Some(peer);
             if self.others.len() < REFUSAL_LOG_MAX_OTHERS && self.others.insert(peer) {
                 self.summary.other_addresses += 1;
             }
@@ -515,6 +521,32 @@ impl RefusalLog {
             verdict.peer_line = Some(0);
         }
         verdict
+    }
+}
+
+impl RefusalLog {
+    /// Drop the stalest tracked peer whose last line is older than `interval`
+    /// and that has no suppressed count owed. Returns whether it dropped one.
+    /// Such a peer has nothing left to report, and the window line limit keeps
+    /// a rotating host from turning the freed slots back into a line per refusal.
+    fn evict_stale(&mut self, now: Instant) -> bool {
+        let stalest = self
+            .peers
+            .iter()
+            .filter_map(|(ip, (last, suppressed))| match last {
+                Some(l) if *suppressed == 0 && now.duration_since(*l) >= self.interval => {
+                    Some((*l, *ip))
+                }
+                _ => None,
+            })
+            .min_by_key(|(l, _)| *l);
+        match stalest {
+            Some((_, ip)) => {
+                self.peers.remove(&ip);
+                true
+            }
+            None => false,
+        }
     }
 }
 
@@ -582,6 +614,7 @@ impl H2cListener {
                             warn!(
                                 other_refusals = s.other_refusals,
                                 other_addresses = s.other_addresses,
+                                sample = ?s.sample,
                                 over_limit = s.over_limit,
                                 "h2c: refused connections in the last interval that no line named, \
                                  from addresses beyond the tracked peers or past the line limit"
@@ -1997,6 +2030,7 @@ mod h2c_admit_tests {
             Some(RefusalSummary {
                 other_refusals: 3,
                 other_addresses: 2,
+                sample: Some(v4(10)),
                 over_limit: 0
             })
         );
@@ -2026,6 +2060,7 @@ mod h2c_admit_tests {
             Some(RefusalSummary {
                 other_refusals: 44,
                 other_addresses: 44,
+                sample: Some(v4(299)),
                 over_limit: 300 - 44 - 32
             })
         );
@@ -2043,6 +2078,54 @@ mod h2c_admit_tests {
         let v = log.record(v4(39), t0 + 61 * SEC);
         assert_eq!(v.peer_line, Some(1));
         assert_eq!(v.summary.map(|s| s.over_limit), Some(8));
+    }
+
+    #[test]
+    fn a_new_address_is_named_once_stale_entries_free_a_slot() {
+        let t0 = Instant::now();
+        let mut log = RefusalLog::new(60 * SEC, 3);
+        for n in 1..=3 {
+            assert_eq!(log.record(v4(n), t0 + n * SEC).peer_line, Some(0));
+        }
+        // Every entry's line is older than the interval and none is pending.
+        let later = t0 + 100 * SEC;
+        let v = log.record(v4(9), later);
+        assert_eq!(v.peer_line, Some(0));
+        assert_eq!(log.peers.len(), 3);
+        // The stalest entry, v4(1), made room.
+        assert!(!log.peers.contains_key(&v4(1)));
+        assert!(log.peers.contains_key(&v4(2)) && log.peers.contains_key(&v4(3)));
+    }
+
+    #[test]
+    fn with_no_stale_entry_a_new_address_is_counted_and_sampled() {
+        let t0 = Instant::now();
+        let mut log = RefusalLog::new(60 * SEC, 3);
+        for n in 1..=3 {
+            log.record(v4(n), t0);
+        }
+        // v4(1) has a count pending, so it is not stale even though its line is old.
+        log.record(v4(1), t0 + 10 * SEC);
+        let later = t0 + 61 * SEC;
+        // v4(2) and v4(3) are stale, so one of them makes room.
+        assert_eq!(log.record(v4(8), later).peer_line, Some(0));
+        assert!(log.peers.contains_key(&v4(1)));
+        // With every entry recent or pending, nothing makes room.
+        let mut log = RefusalLog::new(60 * SEC, 3);
+        for n in 1..=3 {
+            log.record(v4(n), t0);
+        }
+        for n in 1..=3 {
+            log.record(v4(n), t0 + 10 * SEC);
+        }
+        let v = log.record(v4(8), t0 + 61 * SEC);
+        assert_eq!(v.peer_line, None);
+        assert_eq!(log.peers.len(), 3);
+        assert!(log.peers.contains_key(&v4(1)));
+        let v = log.record(v4(9), t0 + 62 * SEC);
+        assert_eq!(v.peer_line, None);
+        assert_eq!(log.summary.sample, Some(v4(9)));
+        assert_eq!(log.summary.other_addresses, 2);
     }
 
     /// With more connections pending than the cap, one call returns after the
