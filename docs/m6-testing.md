@@ -92,8 +92,11 @@ Two rules come with it, and both are quiet when broken:
 - **`Service` drains stdout as well as stderr**, because m6's services log to stdout.
 
 **`binary` builds what it returns.**
-It runs `cargo build --release --workspace --bin <name>` once per test process, so a test always runs the binary built from the source in the tree.
+It runs `cargo build --quiet --release --workspace --bin <name> --target-dir <target>` once per binary name per test process, so a test always runs the binary built from the source in the tree.
 The first test after a change pays the release build, which is minutes for m6-http.
+The scripts do not use `binary`.
+`tools/conformance.sh` and `tools/perfcheck.sh` run `target/release` directly and refuse to start when it is missing, so run `cargo build --workspace --release` before them.
+`bench.sh` builds the release binaries it needs itself.
 
 ## 4. Conformance: h1spec, h2spec and h3spec
 
