@@ -11,7 +11,7 @@ use m6_core::request::{cookie, parse_form_body, url_encode_path};
 use tracing::{info, warn};
 
 use crate::jwt::{hash_token, now_secs, AccessClaims, RefreshClaims};
-use crate::key_watch::KeyMaterial;
+use crate::keys::KeyMaterial;
 use crate::rate_limit::RateLimiter;
 
 pub struct AppState {
@@ -20,6 +20,11 @@ pub struct AppState {
     pub access_ttl: u64,
     pub refresh_ttl: u64,
     pub issuer: String,
+    /// What the config said at start, kept so a reload can name a change that
+    /// only a restart applies.
+    pub db_path: std::path::PathBuf,
+    pub rate_limit_max_attempts: u32,
+    pub rate_limit_window_secs: u64,
     pub rate_limiter: Mutex<RateLimiter>,
 }
 

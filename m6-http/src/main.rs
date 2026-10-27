@@ -56,6 +56,7 @@ type FinalizedResponse = (u16, Vec<(String, String)>, Vec<u8>, String);
 /// Short enough that a redeployed error page appears promptly, long enough
 /// that a sustained sweep costs one fetch a minute rather than one per path.
 const ERROR_PAGE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+use m6_core::watcher::{Changed, ConfigReloader, Seen};
 use m6_http_lib::auth::PublicKey;
 use m6_http_lib::h2c_client::H2cClientPool;
 use m6_http_lib::h2s_client::H2sTlsClientPool;
@@ -77,6 +78,41 @@ const TOKEN_H2C: Token = Token(3);
 const TOKEN_H2C_CLIENT: Token = Token(4);
 const TOKEN_H2S_CLIENT: Token = Token(5);
 const TOKEN_WAKE: Token = Token(6);
+const TOKEN_CONFIG: Token = Token(7);
+/// Time given to a backend to finish a reload after it has seen the change.
+///
+/// A backend under `ConfigReloader` reloads at once on the first change, or up
+/// to `RELOAD_DEBOUNCE` later when a second report is held, or up to
+/// `RELOAD_POLL` later when only the once-a-second poll finds the change. The
+/// reload itself then takes time. This margin is added to each of those.
+const CACHE_RELOAD_MARGIN: std::time::Duration = std::time::Duration::from_millis(80);
+
+/// The two later clears after a `site.toml` reload, measured from the end of
+/// the reload.
+///
+/// A backend that reloads after m6-http can answer a request in the gap with
+/// the old page, and that response is cached. m6-http clears at once, then
+/// again once a debounced report has reloaded the backend, then again once the
+/// poll would have found the change. Each delay derives from m6-core's
+/// constants, so it follows them if they change. The cost is one extra cache
+/// miss per page about a second after a content change, and none on the hit
+/// path. A second `site.toml` change re-arms both.
+const CACHE_LATER_CLEARS: [(std::time::Duration, &str); 2] = [
+    (
+        std::time::Duration::from_millis(
+            m6_core::watcher::RELOAD_DEBOUNCE.as_millis() as u64
+                + CACHE_RELOAD_MARGIN.as_millis() as u64,
+        ),
+        "config reload: cache cleared again after the settle window",
+    ),
+    (
+        std::time::Duration::from_millis(
+            m6_core::watcher::RELOAD_POLL.as_millis() as u64
+                + CACHE_RELOAD_MARGIN.as_millis() as u64,
+        ),
+        "config reload: cache cleared a third time after the poll interval",
+    ),
+];
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
 // ── Shutdown flags ───────────────────────────────────────────────────────────
@@ -547,16 +583,19 @@ fn make_quiche_config(server_config: &config::ServerConfig) -> anyhow::Result<qu
 
 /// Everything the event loop polls, owned for its lifetime.
 ///
-/// These five arrived as five separate arguments, which put `event_loop` at
-/// eight. They are not five unrelated values: they are the set of things the
+/// These six arrived as separate arguments, which put `event_loop` at
+/// eight. They are not unrelated values: they are the set of things the
 /// loop waits on, which is why the poller registers every one of them in the
 /// same breath. `tcp`, `h2c` and `watcher` are optional because a node's role
-/// decides whether it has them at all.
+/// decides whether it has them at all. `reloader` watches `site.toml` and the
+/// system config and has a descriptor only when the OS watch could be built;
+/// without one it still polls the two files once a second.
 struct EventLoopIo {
     udp: UdpSocket,
     tcp: Option<Http11Listener>,
     h2c: Option<H2cListener>,
     watcher: Option<FsWatcher>,
+    reloader: ConfigReloader,
     wake_reader: WakeReader,
 }
 
@@ -573,6 +612,7 @@ fn event_loop(
         mut tcp,
         mut h2c,
         mut watcher,
+        mut reloader,
         wake_reader,
     } = io;
     let poller = match Poller::new() {
@@ -597,6 +637,10 @@ fn event_loop(
         if let Some(fd) = w.raw_fd() {
             let _ = poller.add(fd, TOKEN_INOTIFY);
         }
+    }
+
+    if let Some(fd) = reloader.raw_fd() {
+        let _ = poller.add(fd, TOKEN_CONFIG);
     }
 
     // Wake pipe: the shutdown hook writes to it so a blocked `wait()` returns
@@ -624,6 +668,8 @@ fn event_loop(
     // When no filesystem watcher is available (e.g. macOS), rescan backend
     // socket globs every 2 seconds so new workers are picked up automatically.
     let rescan_interval = std::time::Duration::from_secs(2);
+    // When the cache is to be emptied again after a `site.toml` reload.
+    let mut later_clears: [Option<std::time::Instant>; 2] = [None, None];
     let mut last_rescan = std::time::Instant::now()
         .checked_sub(rescan_interval)
         .unwrap_or_else(std::time::Instant::now);
@@ -690,13 +736,11 @@ fn event_loop(
                         h.accept_pending(&poller, TOKEN_H2C);
                     }
                 }
+                TOKEN_CONFIG => reloader.on_readable(std::time::Instant::now()),
                 TOKEN_INOTIFY => {
                     if let Some(ref mut w) = watcher {
                         for event in w.read_events() {
-                            // `tcp` goes in because a certificate change has to
-                            // rebuild the rustls configuration this listener
-                            // holds, not only the quiche one. m6 #210.
-                            handle_fs_event(&event, state, quiche_config, tcp.as_mut(), log_handle);
+                            handle_fs_event(&event, state);
                         }
                     }
                 }
@@ -1413,9 +1457,45 @@ fn event_loop(
         // Periodic rescan of backend socket globs to pick up newly started or
         // removed workers. On Linux, inotify also fires per-socket events, but
         // the rescan is a cheap belt-and-suspenders check for any missed events.
-        if last_rescan.elapsed() >= rescan_interval {
+        let now = std::time::Instant::now();
+        if now.duration_since(last_rescan) >= rescan_interval {
             state.pool_manager.rescan_all();
-            last_rescan = std::time::Instant::now();
+            last_rescan = now;
+        }
+
+        // A change to `site.toml` or the system config. One clock read serves
+        // this and the rescan above; `tick` allocates nothing and costs two
+        // comparisons when nothing changed.
+        if let Some(changed) = reloader.tick(now) {
+            let r = handle_config_change(changed, state, quiche_config, tcp.as_mut(), log_handle);
+            if r.cache_cleared {
+                // From the end of the reload, not from before it: a slow
+                // reload must not use up the settle window.
+                let end = std::time::Instant::now();
+                for (slot, (after, _)) in later_clears.iter_mut().zip(CACHE_LATER_CLEARS) {
+                    *slot = Some(end + after);
+                }
+            }
+            if r.tls_failed {
+                let d = reloader.retry(
+                    Changed {
+                        site: false,
+                        process: true,
+                    },
+                    std::time::Instant::now(),
+                );
+                warn!(
+                    retry_s = d.as_secs(),
+                    "TLS reload failed after a process config change; trying again"
+                );
+            }
+        }
+        for (slot, (_, line)) in later_clears.iter_mut().zip(CACHE_LATER_CLEARS) {
+            if slot.is_some_and(|t| now >= t) {
+                state.cache.clear();
+                *slot = None;
+                info!("{line}");
+            }
         }
     }
 
@@ -3825,13 +3905,7 @@ fn flush_all(udp: &UdpSocket, connections: &mut HashMap<Vec<u8>, QuicConn>) {
 
 // ── Filesystem event handling ─────────────────────────────────────────────────
 
-fn handle_fs_event(
-    event: &FsEvent,
-    state: &mut ServerState,
-    quiche_config: &mut quiche::Config,
-    tcp: Option<&mut Http11Listener>,
-    log_handle: &m6_core::log::LogHandle,
-) {
+fn handle_fs_event(event: &FsEvent, state: &mut ServerState) {
     match event.kind {
         FsEventKind::SocketCreated => {
             state.pool_manager.socket_appeared(&event.path);
@@ -3839,72 +3913,131 @@ fn handle_fs_event(
         FsEventKind::SocketDeleted => {
             state.pool_manager.socket_disappeared(&event.path);
         }
-        FsEventKind::SiteTomlChanged => {
-            handle_site_reload(state, log_handle);
-        }
-        FsEventKind::TlsCertChanged => {
-            handle_tls_reload(state, quiche_config, tcp);
-        }
     }
 }
 
-fn handle_site_reload(state: &mut ServerState, log_handle: &m6_core::log::LogHandle) {
-    info!("config reload: site.toml changed");
+/// What a config reload did that the event loop has to act on.
+#[derive(Default)]
+struct Reloaded {
+    /// The response cache was emptied.
+    cache_cleared: bool,
+    /// A process-config change asked for TLS to be re-read and the rebuild failed.
+    tls_failed: bool,
+}
 
-    match config::load(&state.config.site_dir, &state.system_config_path) {
-        Ok(new_config) => {
-            // A reload is the likeliest moment for an inert `cache` key to be
-            // introduced — someone editing site.toml on the node.
-            config::warn_ignored_route_cache_keys(&new_config);
-            let new_route_table = match RouteTable::from_config(&new_config) {
-                Ok(t) => t,
-                Err(e) => {
-                    warn!(error = %e, "config reload: route table error");
-                    return;
-                }
-            };
-            let new_pools = PoolManager::from_config(&new_config.backends);
-            let new_inv_map = router::build_invalidation_map(&new_config);
-            let new_error_mode = ErrorMode::from_config(&new_config.errors);
+/// Apply a change to `site.toml`, to the system config, or to both.
+///
+/// A `site.toml` change rebuilds routes, pools, the invalidation map and the
+/// error mode and empties the cache, as it always has. A system-config change
+/// on its own takes only the keys that file owns (`take_process_owned`), keeps
+/// the cache, and re-reads TLS material on HTTP/1.1, HTTP/2 and HTTP/3. A
+/// change to both runs both.
+///
+/// A process-config change re-reads TLS even when the merged load fails: the
+/// touch means new material is on disk, and a `site.toml` that is mid-edit must
+/// not hold a renewal back. The paths in use are those already running.
+fn handle_config_change(
+    changed: Changed,
+    state: &mut ServerState,
+    quiche_config: &mut quiche::Config,
+    mut tcp: Option<&mut Http11Listener>,
+    log_handle: &m6_core::log::LogHandle,
+) -> Reloaded {
+    let start = std::time::Instant::now();
+    let mut out = Reloaded::default();
 
-            let new_public_key = match &new_config.auth {
-                Some(auth_cfg) => {
-                    let key_path = config::resolve_path(&new_config.site_dir, &auth_cfg.public_key);
-                    match PublicKey::from_pem_file(&key_path) {
-                        Ok(k) => Some(k),
-                        Err(e) => {
-                            warn!(error = %e, "config reload: auth key load failed, keeping current key");
-                            state.public_key.take()
-                        }
-                    }
-                }
-                None => None,
-            };
-
-            state.route_table = new_route_table;
-            state.pool_manager = new_pools;
-            state.invalidation_map = new_inv_map;
-            state.error_mode = new_error_mode;
-            state.public_key = new_public_key;
-            if new_config.server.internal_binds != state.config.server.internal_binds {
-                warn!(
-                    "config reload: [server].internal_binds changed; restart m6-http to apply it"
-                );
-            }
-            if new_config.server.internal_peers != state.config.server.internal_peers {
-                warn!(
-                    "config reload: [server].internal_peers changed; restart m6-http to apply it"
-                );
-            }
-            state.config = new_config;
-            m6_http_lib::security::configure(&state.config.security);
-            state.cache.clear();
-
-            log_handle.reload(&state.config.log.format, &state.config.log.level);
-            info!("config reload: complete, cache cleared");
-        }
+    let loaded = match config::load(&state.config.site_dir, &state.system_config_path) {
+        Ok(c) => c,
         Err(e) => {
-            warn!(error = %e, "config reload: failed, keeping current config");
+            warn!(
+                error = %e,
+                site = changed.site,
+                process = changed.process,
+                "config reload: failed, keeping current config"
+            );
+            if changed.process {
+                out.tls_failed = !handle_tls_reload(state, quiche_config, tcp.as_deref_mut());
+            }
+            return out;
+        }
+    };
+
+    let mut new = if changed.site {
+        loaded
+    } else {
+        config::take_process_owned(&state.config, loaded)
+    };
+    for key in config::carry_restart_only(&state.config, &mut new) {
+        warn!("config reload: {key} changed; restart m6-http to apply it");
+    }
+
+    let mut site_items = None;
+    if changed.site {
+        // A reload is the likeliest moment for an inert `cache` key to be
+        // introduced: someone editing site.toml on the node.
+        config::warn_ignored_route_cache_keys(&new);
+        let route_table = match RouteTable::from_config(&new) {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(error = %e, "config reload: route table error, keeping current config");
+                if changed.process {
+                    out.tls_failed = !handle_tls_reload(state, quiche_config, tcp.as_deref_mut());
+                }
+                return out;
+            }
+        };
+        site_items = Some((
+            route_table,
+            PoolManager::from_config(&new.backends),
+            router::build_invalidation_map(&new),
+            ErrorMode::from_config(&new.errors),
+        ));
+    }
+
+    let public_key = reload_public_key(state, &new);
+
+    if let Some((route_table, pools, inv_map, error_mode)) = site_items {
+        state.route_table = route_table;
+        state.pool_manager = pools;
+        state.invalidation_map = inv_map;
+        state.error_mode = error_mode;
+    }
+    state.public_key = public_key;
+    state.config = new;
+    config::warn_health_token(&state.config.health);
+    if changed.site {
+        m6_http_lib::security::configure(&state.config.security);
+        state.cache.clear();
+        out.cache_cleared = true;
+        log_handle.reload(&state.config.log.format, &state.config.log.level);
+    }
+
+    if changed.process {
+        out.tls_failed = !handle_tls_reload(state, quiche_config, tcp);
+    }
+
+    info!(
+        site = changed.site,
+        process = changed.process,
+        cache_cleared = out.cache_cleared,
+        elapsed_us = start.elapsed().as_micros() as u64,
+        "config reload: complete"
+    );
+    out
+}
+
+/// The verify key for `new`, read from its `[auth]` section.
+///
+/// Keeps the running key when the file cannot be read, so a half-written key
+/// does not turn every token away. Returns `None` when `new` has no `[auth]`.
+fn reload_public_key(state: &mut ServerState, new: &config::Config) -> Option<PublicKey> {
+    let auth_cfg = new.auth.as_ref()?;
+    let key_path = config::resolve_path(&new.site_dir, &auth_cfg.public_key);
+    match PublicKey::from_pem_file(&key_path) {
+        Ok(k) => Some(k),
+        Err(e) => {
+            warn!(error = %e, "config reload: auth key load failed, keeping current key");
+            state.public_key.take()
         }
     }
 }
@@ -3921,21 +4054,23 @@ fn handle_site_reload(state: &mut ServerState, log_handle: &m6_core::log::LogHan
 /// **Both configurations are built before either is installed.** A reload that
 /// swapped them one at a time would leave the protocols disagreeing whenever the
 /// second build failed, which is the state this function exists to end. On a
-/// failure every protocol keeps the material it already had, and the next write
-/// to the certificate tries again.
+/// failure every protocol keeps the material it already had, and the reload is
+/// tried again after a growing delay and at once on the next touch.
 ///
-/// Each build reads the files itself, a moment apart, so material written
-/// between the two reads reaches one and not the other. The write that lands
-/// there generates its own event, and this runs again and settles both on it. A
-/// renewal writes a certificate and a key as two files, so a read catching one
-/// of them half done is the ordinary case rather than a rare one, and the
-/// mismatched pair fails the rustls build and keeps every protocol where it was.
+/// This runs when the system config changes, not when a certificate file does.
+/// A renewal writes the certificate and the key, then touches the system
+/// config, so the pair is complete when it is read. Each build reads the files
+/// itself, a moment apart, so material written between the two reads reaches
+/// one and not the other. A touch that arrives before the key is written fails
+/// the rustls pair check and keeps every protocol where it was, and the retry
+/// settles both on the finished pair. Returns `false` when nothing was
+/// installed.
 fn handle_tls_reload(
     state: &ServerState,
     quiche_config: &mut quiche::Config,
     tcp: Option<&mut Http11Listener>,
-) {
-    info!("TLS config reload: cert/key file changed");
+) -> bool {
+    info!("TLS config reload: system config changed");
 
     // Both are Some outside redirect mode, which runs its own loop and never
     // reaches here. Erroring keeps a config failure diagnosable instead of a
@@ -3945,7 +4080,7 @@ fn handle_tls_reload(
         (Some(c), Some(k)) => (c, k),
         _ => {
             warn!("TLS config reload: no certificate is configured, keeping old config");
-            return;
+            return false;
         }
     };
 
@@ -3953,14 +4088,14 @@ fn handle_tls_reload(
         Ok(m) => m,
         Err(e) => {
             warn!(error = %e, "TLS config reload failed for HTTP/1.1 and HTTP/2, keeping old config on every protocol");
-            return;
+            return false;
         }
     };
     let new_quiche = match make_quiche_config(&state.config.server) {
         Ok(c) => c,
         Err(e) => {
             warn!(error = %e, "TLS config reload failed for HTTP/3, keeping old config on every protocol");
-            return;
+            return false;
         }
     };
 
@@ -3989,6 +4124,7 @@ fn handle_tls_reload(
     } else {
         warn!("TLS config reloaded on HTTP/3 alone: there is no HTTP/1.1 TLS listener to rebuild");
     }
+    true
 }
 
 // ── CLI ────────────────────────────────────────────────────────────────────────
@@ -4093,6 +4229,12 @@ fn run(args: Vec<String>) -> i32 {
             return 2;
         }
     };
+
+    // Fingerprint both config files before the first read of either, so a
+    // change between that read and the reloader's creation is reported on its
+    // first tick instead of lost.
+    let site_toml = cli.site_dir.join("site.toml");
+    let seen = Seen::read(&site_toml, &cli.system_config);
 
     // Load config before initialising logging so we can read [log] from site.toml.
     let config = match config::load(&cli.site_dir, &cli.system_config) {
@@ -4234,10 +4376,12 @@ fn run(args: Vec<String>) -> i32 {
     let watcher = match FsWatcher::new(&config) {
         Ok(w) => Some(w),
         Err(e) => {
-            warn!(error = %e, "fs watcher setup failed, hot reload disabled");
+            info!(error = %e, "backend socket watch unavailable; the 2-second rescan finds sockets");
             None
         }
     };
+
+    let reloader = ConfigReloader::new(&site_toml, &cli.system_config, seen);
 
     // Build TLS config for HTTP/1.1 and bind TCP listener on the same port.
     // Both are Some on this path: redirect mode returned above, and every other
@@ -4360,6 +4504,7 @@ fn run(args: Vec<String>) -> i32 {
             tcp: tcp_listener,
             h2c: h2c_listener,
             watcher,
+            reloader,
             wake_reader,
         },
         &mut state,

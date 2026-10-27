@@ -790,3 +790,83 @@ fn a_public_metrics_peer_refuses_to_start() {
     assert_eq!(code, Some(2), "output:\n{output}");
     assert!(output.contains("not in a local range"), "output:\n{output}");
 }
+
+// ── Reload ────────────────────────────────────────────────────────────────────
+
+/// The system config: a verify key, the role gate, and `peer` as the one peer.
+fn system_gate(peer: &str) -> String {
+    format!(
+        "[auth]\npublic_key = \"{{KEY}}\"\n\n\
+         [health]\nmetrics_require = \"role:monitor\"\nmetrics_peers = [\"{peer}\"]\n"
+    )
+}
+
+/// Set the modified time of `path` to now, which is all a `touch` does.
+fn touch(path: &std::path::Path) {
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .expect("open for touch")
+        .set_modified(std::time::SystemTime::now())
+        .expect("set modified time");
+}
+
+/// A `[health]` access key in the system config applies when that file changes,
+/// with no `site.toml` change and no restart.
+#[test]
+fn metrics_peers_in_the_system_config_apply_without_a_restart() {
+    let run = Fixture::new("", "", &system_gate("10.0.0.9")).start();
+    let auth = bearer(&run.token(&["monitor"]));
+    for (proto, r) in run.all("/perf", &[("Authorization", &auth)]) {
+        assert_eq!(r.status, 404, "{proto} before the edit: {}", r.text());
+    }
+
+    let before = std::fs::read_to_string(&run.fx.system).expect("read system.toml");
+    std::fs::write(&run.fx.system, before.replace("10.0.0.9", "127.0.0.1"))
+        .expect("rewrite system.toml");
+
+    let opened = testkit::wait::until(Duration::from_secs(3), || {
+        run.h1("/perf", &[("Authorization", &auth)]).status == 200
+    });
+    assert!(
+        opened,
+        "/perf stayed closed after the system config named the peer\n{}",
+        run.svc.output()
+    );
+    for (proto, r) in run.all("/perf", &[("Authorization", &auth)]) {
+        assert_report(proto, &r);
+    }
+}
+
+/// A new verify key is read when the system config is touched, not when the key
+/// file is written.
+#[test]
+fn a_rotated_auth_key_verifies_after_a_touch() {
+    let run = Fixture::new("", "", &system_gate("127.0.0.1")).start();
+    let (second_private, second_public) = keypair();
+    let auth = bearer(&mint(&second_private, &["monitor"], 3600));
+    assert_eq!(
+        run.h1("/perf", &[("Authorization", &auth)]).status,
+        401,
+        "a token from a key the site does not trust"
+    );
+
+    std::fs::write(run.fx.dir.path().join("auth-public.pem"), second_public)
+        .expect("write the new public key");
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        run.h1("/perf", &[("Authorization", &auth)]).status,
+        401,
+        "the key file is not watched, so writing it changes nothing"
+    );
+
+    touch(&run.fx.system);
+    let accepted = testkit::wait::until(Duration::from_secs(3), || {
+        run.h1("/perf", &[("Authorization", &auth)]).status == 200
+    });
+    assert!(
+        accepted,
+        "the new key was not read after the touch\n{}",
+        run.svc.output()
+    );
+}

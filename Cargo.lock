@@ -1822,7 +1822,6 @@ dependencies = [
  "anyhow",
  "hex",
  "jsonwebtoken",
- "libc",
  "m6-auth",
  "m6-core",
  "nix 0.27.1",

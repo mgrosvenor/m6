@@ -260,6 +260,7 @@ A configuration that does not parse, a template that does not build, a route nam
 A file that failed to load is not tried again until it is written again.
 
 `AppWithGlobal::on_reload` and `AppWithState::on_reload` register `Fn(&G, &AppContext) -> Result<()>` for state that `init_global` built from the configuration.
+m6-auth-server uses it to re-read its signing keys and m6-monitor uses it to name its restart-only keys.
 Core calls it with the new configuration in the context, after the new state has been built and checked and before it is installed.
 If the hook returns `Err`, core logs it at error level with the delay before the next attempt and keeps the previous routes and log level.
 The reload is tried again after 1 s, then 2 s, 4 s and so on up to 60 s, and at once when either file is written again, so the hook must be safe to run twice on the same configuration.
