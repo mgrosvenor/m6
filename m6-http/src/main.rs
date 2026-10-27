@@ -2388,7 +2388,7 @@ fn handle_request_inner(
     // True when this request arrived on the h2c listener and [server]
     // internal_binds names it, meaning one of our own nodes over the backbone
     // rather than a public client. Granted by the listener, never by a header, so a public
-    // client cannot claim it. Only the error-path guard reads it.
+    // client cannot claim it. The error-path guard and the metrics gate read it.
     from_internal: bool,
 ) -> RequestOutcome {
     // Prefetch requests are synthetic (no real client, client_ip is a
@@ -2504,34 +2504,41 @@ fn handle_request_inner(
     // the split is what keeps the health answer cheap. `snapshot` is passed
     // as a closure and is not called until authorisation passes.
     if state.config.health.enabled && req.path == state.config.health.perf_path {
-        // Pool occupancy is gathered here rather than on `/health`, which
-        // publishes neither. It costs a lock-free read of the pool manager and
-        // happens before the token check, which is fine: it is bounded work,
-        // unlike the reservoir sort in `snapshot`.
-        let pools: Vec<health::PoolHealth> = state
-            .pool_manager
-            .pool_health()
-            .into_iter()
-            .map(|(name, active, total)| health::PoolHealth {
-                name,
-                active,
-                total,
-            })
-            .collect();
-        let outcome = health::PerfReport::build(
-            health::PerfSubject {
-                node: &state.config.node.name,
-                uptime_s: state.started.elapsed().as_secs(),
-                pools,
-                url_backends: state.pool_manager.url_backend_names(),
-                host_path: &state.config.site_dir,
-            },
-            health::PerfAccess {
-                headers: &req.headers,
-                configured_token: state.config.health.metrics_token.as_deref(),
-            },
-            || state.stats.snapshot(),
-        );
+        let outcome = match health::metrics_gate(
+            &state.config.health,
+            state.public_key.as_ref(),
+            &req.headers,
+            client_ip,
+            from_internal,
+        ) {
+            health::Gate::Refused(refused) => refused,
+            health::Gate::Open => {
+                // Pool occupancy is gathered here rather than on `/health`,
+                // which publishes neither, and only after the gate has passed.
+                // It costs a lock-free read of the pool manager, unlike the
+                // reservoir sort in `snapshot`.
+                let pools: Vec<health::PoolHealth> = state
+                    .pool_manager
+                    .pool_health()
+                    .into_iter()
+                    .map(|(name, active, total)| health::PoolHealth {
+                        name,
+                        active,
+                        total,
+                    })
+                    .collect();
+                health::PerfReport::build_authorised(
+                    health::PerfSubject {
+                        node: &state.config.node.name,
+                        uptime_s: state.started.elapsed().as_secs(),
+                        pools,
+                        url_backends: state.pool_manager.url_backend_names(),
+                        host_path: &state.config.site_dir,
+                    },
+                    || state.stats.snapshot(),
+                )
+            }
+        };
         let (code, headers, body) = outcome.into_response();
         // Same treatment as /health above. A 401 here is worth seeing: it
         // means something is probing the metrics endpoint without the token.
@@ -2553,14 +2560,21 @@ fn handle_request_inner(
     // rather than of a header on a cheaper one. Cached, so a polling monitor
     // cannot make the node re-read the log on every scrape.
     if state.config.health.enabled && req.path == state.config.health.traffic_path {
-        let outcome = health::traffic(
-            &state.config.node.name,
-            &state.config.analytics.log_path,
-            60,
-            std::time::Duration::from_secs(state.config.health.traffic_cache_s),
+        let outcome = match health::metrics_gate(
+            &state.config.health,
+            state.public_key.as_ref(),
             &req.headers,
-            state.config.health.metrics_token.as_deref(),
-        );
+            client_ip,
+            from_internal,
+        ) {
+            health::Gate::Refused(refused) => refused,
+            health::Gate::Open => health::traffic_authorised(
+                &state.config.node.name,
+                &state.config.analytics.log_path,
+                60,
+                std::time::Duration::from_secs(state.config.health.traffic_cache_s),
+            ),
+        };
         let (code, headers, body) = outcome.into_response();
         analytics::log_monitor(
             state.config.analytics.enabled,
@@ -2637,14 +2651,12 @@ fn handle_request_inner(
     // Auth check — only if route has `require`
     if let Some(ref require) = route.require {
         if let Some(ref pk) = state.public_key {
-            let auth_header = m6_core::headers::get(&req.headers[..], "authorization");
-            let cookie_header_owned = auth::combined_cookie_header(&req.headers);
-            let cookie_header = cookie_header_owned.as_deref();
-            let accept_header = m6_core::headers::get(&req.headers[..], "accept");
-
-            match auth::extract_token(auth_header, cookie_header) {
-                None => {
+            match auth::authorise(pk, &req.headers, require) {
+                Err(auth::Refusal::NoToken) => {
                     warn!(path = %req.path, "auth: no token");
+                    let cookie_header_owned = auth::combined_cookie_header(&req.headers);
+                    let cookie_header = cookie_header_owned.as_deref();
+                    let accept_header = m6_core::headers::get(&req.headers[..], "accept");
                     if auth::is_browser_request(accept_header) {
                         let refresh = auth::extract_refresh_cookie(cookie_header);
                         let redirect_url = if refresh.is_some() {
@@ -2663,41 +2675,38 @@ fn handle_request_inner(
                         backend: Some(route.backend.clone()),
                         detail: Some("no token".to_string()),
                     };
-                    let (s, h, b, n) = apply_error_mode(401, req, client_ip, state, Some(&ctx));
+                    let (s, mut h, b, n) = apply_error_mode(401, req, client_ip, state, Some(&ctx));
+                    add_bearer_challenge(&mut h);
                     return RequestOutcome::Ready(s, h, b, n);
                 }
-                Some(token) => match pk.verify(token) {
-                    Err(e) => {
-                        warn!(path = %req.path, error = %e, "auth: token verification failed");
-                        let ctx = error::ErrorContext {
-                            route: Some(route.path.clone()),
-                            backend: Some(route.backend.clone()),
-                            detail: Some(e.to_string()),
-                        };
-                        let (s, h, b, n) = apply_error_mode(401, req, client_ip, state, Some(&ctx));
-                        return RequestOutcome::Ready(s, h, b, n);
-                    }
-                    Ok(claims) => {
-                        if !auth::check_require(&claims, require) {
-                            warn!(
-                                path = %req.path,
-                                require = %require,
-                                "auth: insufficient claims"
-                            );
-                            let ctx = error::ErrorContext {
-                                route: Some(route.path.clone()),
-                                backend: Some(route.backend.clone()),
-                                detail: Some(format!("requires: {require}")),
-                            };
-                            let (s, h, b, n) =
-                                apply_error_mode(403, req, client_ip, state, Some(&ctx));
-                            return RequestOutcome::Ready(s, h, b, n);
-                        }
-                        // Forward verified claims to backend as X-Auth-Claims header
-                        // (base64-encoded JSON so renderers can inspect them).
-                        verified_claims = Some(claims);
-                    }
-                },
+                Err(auth::Refusal::Invalid(e)) => {
+                    warn!(path = %req.path, error = %e, "auth: token verification failed");
+                    let ctx = error::ErrorContext {
+                        route: Some(route.path.clone()),
+                        backend: Some(route.backend.clone()),
+                        detail: Some(e.to_string()),
+                    };
+                    let (s, mut h, b, n) = apply_error_mode(401, req, client_ip, state, Some(&ctx));
+                    add_bearer_challenge(&mut h);
+                    return RequestOutcome::Ready(s, h, b, n);
+                }
+                Err(auth::Refusal::Insufficient) => {
+                    warn!(
+                        path = %req.path,
+                        require = %require,
+                        "auth: insufficient claims"
+                    );
+                    let ctx = error::ErrorContext {
+                        route: Some(route.path.clone()),
+                        backend: Some(route.backend.clone()),
+                        detail: Some(format!("requires: {require}")),
+                    };
+                    let (s, h, b, n) = apply_error_mode(403, req, client_ip, state, Some(&ctx));
+                    return RequestOutcome::Ready(s, h, b, n);
+                }
+                // Forward verified claims to backend as X-Auth-Claims header
+                // (base64-encoded JSON so renderers can inspect them).
+                Ok(claims) => verified_claims = Some(claims),
             }
         }
     }
@@ -3057,6 +3066,18 @@ fn dispatch_custom_error_async(
         )
     };
     Some(RequestOutcome::Pending { rx, ctx })
+}
+
+/// RFC 9110 11.6.1: a 401 names the authentication scheme that would pass.
+/// Keeps a `WWW-Authenticate` a backend already supplied, since the error
+/// path preserves it.
+fn add_bearer_challenge(headers: &mut Vec<(String, String)>) {
+    if !headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("www-authenticate"))
+    {
+        headers.push(("WWW-Authenticate".to_string(), "Bearer".to_string()));
+    }
 }
 
 /// Apply the configured error mode for a given status code.

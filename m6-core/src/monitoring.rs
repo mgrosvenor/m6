@@ -486,6 +486,8 @@ pub enum PerfOutcome {
     Disabled,
     /// Configured, but the caller presented no or wrong credentials.
     Unauthorised,
+    /// The token is valid but lacks the required claim.
+    Forbidden,
     /// Boxed for the same reason as `Traffic`: `PerfReport` is 608 bytes
     /// against the 24 of the largest error variant, and an inline copy made
     /// every `PerfOutcome` that size.
@@ -513,10 +515,37 @@ pub struct PerfAccess<'a> {
     pub configured_token: Option<&'a str>,
 }
 
+impl PerfAccess<'_> {
+    /// Why the legacy bearer gate refuses this caller, or `None` when it
+    /// passes. No token configured is `Disabled`, a wrong or missing one is
+    /// `Unauthorised`.
+    pub fn refusal(&self) -> Option<PerfOutcome> {
+        match self.configured_token.filter(|t| !t.is_empty()) {
+            None => Some(PerfOutcome::Disabled),
+            Some(_) if !metrics_authorised(self.headers, self.configured_token) => {
+                Some(PerfOutcome::Unauthorised)
+            }
+            Some(_) => None,
+        }
+    }
+}
+
 impl PerfReport {
     pub fn build(
         subject: PerfSubject<'_>,
         access: PerfAccess<'_>,
+        snapshot: impl FnOnce() -> StatsSnapshot,
+    ) -> PerfOutcome {
+        match access.refusal() {
+            Some(outcome) => outcome,
+            None => Self::build_authorised(subject, snapshot),
+        }
+    }
+
+    /// The report itself, for a caller that has already been authorised by
+    /// some other gate. Nothing here checks access.
+    pub fn build_authorised(
+        subject: PerfSubject<'_>,
         snapshot: impl FnOnce() -> StatsSnapshot,
     ) -> PerfOutcome {
         let PerfSubject {
@@ -526,36 +555,26 @@ impl PerfReport {
             url_backends,
             host_path,
         } = subject;
-        let PerfAccess {
-            headers,
-            configured_token,
-        } = access;
-        match configured_token.filter(|t| !t.is_empty()) {
-            None => PerfOutcome::Disabled,
-            Some(_) if !metrics_authorised(headers, configured_token) => PerfOutcome::Unauthorised,
-            Some(_) => {
-                // `snapshot` is a closure so the reservoir sort happens only
-                // after authorisation passes, never for an anonymous caller.
-                // Read after authorisation, like the reservoir sort: an
-                // anonymous caller never causes a /proc read either.
-                PerfOutcome::Ok(Box::new(PerfReport {
-                    node: node.to_string(),
-                    build: build_id().clone(),
-                    uptime_s,
-                    pools,
-                    url_backends,
-                    // Read from the registry the TLS loader wrote, not from
-                    // the certificate file: no path is opened to answer this,
-                    // so a monitoring endpoint cannot be made to do disk work
-                    // by being polled.
-                    tls: crate::tls::loaded(),
-                    tls_unreadable: crate::tls::unreadable(),
-                    logging: Some(LoggingHealth::read()),
-                    metrics: snapshot(),
-                    host: crate::host::snapshot(host_path),
-                }))
-            }
-        }
+        // `snapshot` is a closure so the reservoir sort happens only
+        // after authorisation passes, never for an anonymous caller.
+        // Read after authorisation, like the reservoir sort: an
+        // anonymous caller never causes a /proc read either.
+        PerfOutcome::Ok(Box::new(PerfReport {
+            node: node.to_string(),
+            build: build_id().clone(),
+            uptime_s,
+            pools,
+            url_backends,
+            // Read from the registry the TLS loader wrote, not from
+            // the certificate file: no path is opened to answer this,
+            // so a monitoring endpoint cannot be made to do disk work
+            // by being polled.
+            tls: crate::tls::loaded(),
+            tls_unreadable: crate::tls::unreadable(),
+            logging: Some(LoggingHealth::read()),
+            metrics: snapshot(),
+            host: crate::host::snapshot(host_path),
+        }))
     }
 }
 
@@ -577,6 +596,7 @@ impl PerfOutcome {
                 headers.push(("WWW-Authenticate".to_string(), "Bearer".to_string()));
                 (401, headers, br#"{"error":"unauthorised"}"#.to_vec())
             }
+            PerfOutcome::Forbidden => (403, headers, br#"{"error":"forbidden"}"#.to_vec()),
             PerfOutcome::Ok(report) => {
                 let body = serde_json::to_vec(&report)
                     .unwrap_or_else(|_| br#"{"error":"serialisation failed"}"#.to_vec());
@@ -931,6 +951,56 @@ mod tests {
         };
         let json = serde_json::to_string(&h).unwrap();
         assert!(json.contains(r#""seconds_since_last_reopen":null"#));
+    }
+
+    #[test]
+    fn refusal_matches_the_legacy_gate() {
+        let none = PerfAccess {
+            headers: &auth("Bearer x"),
+            configured_token: None,
+        };
+        assert!(matches!(none.refusal(), Some(PerfOutcome::Disabled)));
+        let wrong = PerfAccess {
+            headers: &auth("Bearer wrong"),
+            configured_token: Some("right"),
+        };
+        assert!(matches!(wrong.refusal(), Some(PerfOutcome::Unauthorised)));
+        let right = PerfAccess {
+            headers: &auth("Bearer right"),
+            configured_token: Some("right"),
+        };
+        assert!(right.refusal().is_none());
+    }
+
+    #[test]
+    fn build_authorised_reports_without_a_token() {
+        let out = PerfReport::build_authorised(
+            PerfSubject {
+                node: "origin",
+                uptime_s: 5,
+                pools: vec![],
+                url_backends: vec![],
+                host_path: Path::new("/"),
+            },
+            snap,
+        );
+        let (code, _, body) = out.into_response();
+        assert_eq!(code, 200);
+        let p: PerfReport = serde_json::from_slice(&body).expect("a report");
+        assert_eq!(p.node, "origin");
+    }
+
+    #[test]
+    fn forbidden_is_a_403_with_no_store_and_no_www_authenticate() {
+        let (code, headers, body) = PerfOutcome::Forbidden.into_response();
+        assert_eq!(code, 403);
+        assert_eq!(body, br#"{"error":"forbidden"}"#);
+        let has = |name: &str| headers.iter().any(|(n, _)| n.eq_ignore_ascii_case(name));
+        assert!(has("X-Robots-Tag"));
+        assert!(!has("WWW-Authenticate"));
+        assert!(headers
+            .iter()
+            .any(|(n, v)| n == "Cache-Control" && v == "no-store"));
     }
 
     #[test]
