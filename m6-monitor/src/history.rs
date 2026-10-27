@@ -20,6 +20,11 @@
 //! exit status 2. Any other failure to open or write the file switches history
 //! off without stopping the poller, and adds one Warn on node `monitor`.
 //!
+//! On Unix the monitor creates a missing directory with mode 0700 and the file
+//! with mode 0600, and sets an existing file to 0600. A directory that already
+//! exists keeps its mode. The file holds client addresses, so only the
+//! monitor's user should read it.
+//!
 //! # What is stored
 //!
 //! Each poll writes, in one transaction:
@@ -651,6 +656,34 @@ struct Written {
     newest_ms: Option<i64>,
 }
 
+/// Create the directory (mode 0700 when new) and the empty file (mode 0600)
+/// before SQLite does, and tighten a file left by an earlier start. SQLite
+/// gives its journal the mode of the database file. Mode bits do not exist off
+/// Unix, so there the files take the platform default.
+fn make_private(file: &Path) -> anyhow::Result<()> {
+    if let Some(dir) = file.parent().filter(|p| !p.as_os_str().is_empty()) {
+        let mut b = std::fs::DirBuilder::new();
+        b.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+        b.create(dir)
+            .map_err(|e| anyhow::anyhow!("creating {}: {e}", dir.display()))?;
+    }
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    o.open(file)
+        .map_err(|e| anyhow::anyhow!("creating {}: {e}", file.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| anyhow::anyhow!("securing {}: {e}", file.display()))?;
+    }
+    Ok(())
+}
+
 /// True when the error means the process must not go on: a file from a newer
 /// release, or a migration list that is not in order.
 fn is_fatal(e: &anyhow::Error) -> bool {
@@ -662,10 +695,7 @@ fn is_fatal(e: &anyhow::Error) -> bool {
 
 impl Store {
     fn open(cfg: &Config) -> anyhow::Result<Self> {
-        if let Some(dir) = cfg.file.parent().filter(|p| !p.as_os_str().is_empty()) {
-            std::fs::create_dir_all(dir)
-                .map_err(|e| anyhow::anyhow!("creating {}: {e}", dir.display()))?;
-        }
+        make_private(&cfg.file)?;
         let mut conn = sqlite::open(&cfg.file)?;
         sqlite::migrate(&mut conn, MIGRATIONS)?;
         for t in LOOKUP_TABLES {
@@ -3218,5 +3248,47 @@ mod tests {
         assert!(f.text.contains("over its cap"), "{}", f.text);
         assert!(!f.text.contains("missing"), "{}", f.text);
         assert!(d.last_error.unwrap().contains("over its cap"));
+    }
+
+    #[cfg(unix)]
+    fn mode(p: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_history_directory_and_file_are_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = cfg(dir.path(), 1);
+        let s = Store::open(&c).unwrap();
+        assert_eq!(mode(c.file.parent().unwrap()), 0o700);
+        assert_eq!(mode(&c.file), 0o600);
+        drop(s);
+        // A file from an earlier start is tightened. A directory that was
+        // already there is not the monitor's to change.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&c.file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(
+            c.file.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        Store::open(&c).unwrap();
+        assert_eq!(mode(&c.file), 0o600);
+        assert_eq!(mode(c.file.parent().unwrap()), 0o755);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_journal_beside_the_history_file_is_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = cfg(dir.path(), 1);
+        let mut s = Store::open(&c).unwrap();
+        s.write(&make(T0, &[reading("a")])).unwrap();
+        for entry in std::fs::read_dir(c.file.parent().unwrap()).unwrap() {
+            let p = entry.unwrap().path();
+            assert_eq!(mode(&p) & 0o077, 0, "{}", p.display());
+        }
     }
 }
