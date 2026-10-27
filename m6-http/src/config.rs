@@ -862,7 +862,7 @@ fn validate_internal_peers(
                     ("IPv6", "IPv4")
                 };
                 anyhow::bail!(
-                    "config error: [server].internal_binds \"{b}\" is {bind_family} but every [server].internal_peers entry is {peer_family}, so every connection would be refused. Add a {bind_family} peer address, the one each cache node connects from"
+                    "config error: [server].internal_binds \"{b}\" is {bind_family} but every [server].internal_peers entry is {peer_family}, so every connection would be refused. Add an internal_peers entry in the {bind_family} address each cache node connects from"
                 );
             }
             Ok(parsed)
@@ -2061,12 +2061,12 @@ backend_timeout_secs = 120
     #[test]
     fn ipv6_internal_bindings_match_as_socket_addresses() {
         let cfg = load_with_system_server(
-            "h2c_bind = \"[::1]:8080\"\ninternal_binds = [\"[0:0:0:0:0:0:0:1]:8080\"]\ninternal_peers = [\"127.0.0.1\"]\n",
+            "h2c_bind = \"[::1]:8080\"\ninternal_binds = [\"[0:0:0:0:0:0:0:1]:8080\"]\ninternal_peers = [\"::1\"]\n",
         )
         .unwrap();
         assert!(cfg.server.is_internal("[::1]:8080"));
         let cfg = load_with_system_server(
-            "h2c_bind = \"[fd00::1]:80\"\ninternal_binds = [\"[fd00::1]:80\"]\ninternal_peers = [\"127.0.0.1\"]\n",
+            "h2c_bind = \"[fd00::1]:80\"\ninternal_binds = [\"[fd00::1]:80\"]\ninternal_peers = [\"fd00::2\"]\n",
         )
         .unwrap();
         assert!(cfg.server.is_internal("[fd00::1]:80"));
