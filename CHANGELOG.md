@@ -94,9 +94,11 @@ An entry that equals `bind` is refused, because the TLS and QUIC listener faces 
 
 **Migration.**
 A config with `h2c_bind` must add `internal_binds`, or m6-http exits 2 and says what to add.
-`internal_binds = ["<h2c_bind>"]` keeps today's behaviour for an h2c listener on a local IP address, and `internal_binds = []` treats it as public.
+A listener declared internal must also list its peers in `internal_peers` (#246), or m6-http exits 2 again.
+For an h2c listener on a local IP address, write both keys: `internal_binds = ["<h2c_bind>"]` and `internal_peers = ["<ip of each peer allowed to connect>"]`.
+`internal_binds = []` treats the listener as public, and then `internal_peers` is not needed.
 An h2c listener bound to a host name or a public address can only be declared public.
-Add the key before upgrading, because older versions ignore it.
+Add the keys before upgrading, because older versions ignore them.
 A `bind` on a private address is now labelled `external` in `/perf`.
 
 Verified: `cargo test --workspace` gives 1297 passed and 0 failed, clippy is silent with `-D warnings`, and the release and test builds have no warnings.
@@ -147,7 +149,7 @@ A service reads the context a handler or initialiser is given and does not build
 Migration: a caller of the two functions or of `AuthConfig::load` passes the `site.toml` path.
 Code that builds an `AppContext` by hand adds the field.
 A service that does not set `site_toml` behaves as before, and a misplaced key keeps working and is named in a warning.
-A relative `[auth] public_key` or `[health] metrics_token_file` in the system config resolves against the site directory.
+The system config's relative paths resolve against the site directory, as described above.
 
 **Verified** by unit tests for the key, its resolution and its refusals, by m6-file starting on a per-app root and exiting 2 on the compression disagreement it could only see through `site_toml`, by m6-auth-server taking its issuer from the named file, by m6-core tests for a named `site.toml` that is a directory, unreadable or invalid and for `touch("site.toml")` with a file outside the site directory, and by m6-http tests for the relative key paths, the `[node]` warning, and one table-driven test that every misplaced key warns in the wrong file and not in the right one.
 
@@ -201,9 +203,11 @@ The first refusal after the 60 seconds ends writes one summary line with the cou
 One call to accept handles at most 64 connections, so a peer that connects in a loop cannot hold the event loop.
 The check runs once per connection, and every request on an admitted connection is served as before.
 A peer list with no address of the internal bind's IP family is refused at load.
+
 **Migration.**
 A config with a non-empty `internal_binds` must add `internal_peers`, or m6-http exits 2 and says what to add.
-Earlier releases ignore the key, so add it before upgrading.
+The migration note for `internal_binds` under #232 gives both keys together.
+
 **Verified** by unit tests for each refusal and for canonical addresses, and by real-binary tests over h2c: a listed peer is served and believed, an unlisted peer's connection is closed with no response, and a config without the key refuses to start.
 
 **Tests run the binary built from the source they test (#245).**
@@ -212,6 +216,7 @@ It now asks cargo to build `<name>` in release with workspace features, once per
 A build that is current costs one cargo call, and a stale one is rebuilt first.
 It no longer falls back to a debug binary.
 m6-auth-cli's tests use it instead of their own lookup.
+
 **Verified** by a unit test that changes a scratch binary's source between two calls and sees the new output, and by the whole suite.
 
 ### Fixed
@@ -422,9 +427,12 @@ A config that breaks the rule below stops m6-http starting with exit 2.
 On a running node a reload fails the same way and keeps the old config until a restart.
 Check each system config for `[auth]` declared in both the system config and `site.toml` before the upgrade.
 Keep it in one file and delete it from the other.
+A `[health]` key in the system config other than `metrics_require`, `metrics_peers` and `metrics_token_file` stops m6-http starting with exit 2.
+Move any other key (`enabled`, `perf_path`, `traffic_path`, `traffic_cache_s`) to `site.toml`.
 
 When both arguments name the same file, its `[auth]` and `[health]` are the site config's and the system-side copy is ignored.
 Older versions ignore the new keys, so a config can carry them before the upgrade, but the endpoints stay on the legacy gate until it.
+
 Verified: `cargo test --workspace -- --test-threads=1` passes 1388 tests with 0 failures and 0 warnings on the release and test builds.
 `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `tools/clippy.sh` and `cargo deny check` are silent.
 `m6-http/tests/metrics_access.rs` runs the real binary and covers h1, h2 and h3.
