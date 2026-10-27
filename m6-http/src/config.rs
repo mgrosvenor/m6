@@ -962,16 +962,17 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
     // this list names it. A redirector binds nothing the list could name, so a
     // site.toml shared with one must not break it.
     let internal_binds = sys_server.internal_binds.or(site_server.internal_binds);
-    if redirect_bind.is_none() {
-        validate_internal_binds(internal_binds.as_deref(), &bind, h2c_bind.as_deref())?;
-    }
-    let internal_binds = internal_binds.unwrap_or_default();
     let internal_peers = sys_server.internal_peers.or(site_server.internal_peers);
     let internal_peers = if redirect_bind.is_none() {
-        validate_internal_peers(internal_peers.as_deref(), &internal_binds)?
+        validate_internal_binds(internal_binds.as_deref(), &bind, h2c_bind.as_deref())?;
+        validate_internal_peers(
+            internal_peers.as_deref(),
+            internal_binds.as_deref().unwrap_or_default(),
+        )?
     } else {
         Vec::new()
     };
+    let internal_binds = internal_binds.unwrap_or_default();
 
     // Resolve TLS cert/key paths relative to site_dir if not absolute.
     let tls_cert_path = tls_cert.as_deref().map(|c| resolve_path(site_dir, c));
