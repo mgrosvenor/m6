@@ -50,7 +50,7 @@ The cache-hit path is unchanged: the three cache-hit blocks in `m6-http/src/main
 
 **m6-auth-server re-reads its signing keys on reload, and m6-monitor names its restart-only keys (#252).**
 The key-watching thread in m6-auth-server is gone, and with it the `libc` dependency it alone used.
-The service's `on_reload` hook loads the private and public key before it swaps either, so a key that fails to load leaves the running keys serving and is retried.
+The service's `on_reload` hook loads the private and public key before it swaps either, so a key that fails to load, or a private key that is not the pair of the public key, leaves the running keys serving and is retried.
 A changed `[storage] path`, token lifetime, issuer or rate limit is named in a warning that says to restart.
 m6-monitor warns when `poll_interval_s`, `[monitor] history_file` or `history_max_mb` changes, because it reads them once at start.
 
@@ -59,6 +59,8 @@ m6-http no longer watches its certificate and key files, and m6-auth-server no l
 Anyone renewing certificates must touch the process config after writing them, for example with a certbot deploy hook that runs `touch /etc/m6/system.toml`.
 Until the touch, m6-http keeps serving the previous certificate.
 Rotate an m6-auth-server key by writing both files and then touching its config.
+After an auth key rotation, touch m6-http's system config as well, because m6-http takes the new public key only on that touch, and until it does new tokens get 401.
+A renewal hook that touches `site.toml` no longer reloads the certificate and only empties the cache, so touch the process config instead.
 
 ### Verified
 
