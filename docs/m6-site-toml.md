@@ -279,7 +279,7 @@ A system config with no `[node]` logs a warning that the node name falls back to
 |---|---|---|
 | `[site]` name, domain, redirect_www, describedby | `site.toml` | The identity every node shares |
 | `[node]` name | System config | Names this node |
-| `[server]` bind, tls_cert, tls_key, h2c_bind, internal_binds, redirect_bind, warm_on_start | System config | Differs per node |
+| `[server]` bind, tls_cert, tls_key, h2c_bind, internal_binds, internal_peers, redirect_bind, warm_on_start | System config | Differs per node |
 | `[server]` backend_timeout_secs, allowed_methods | `site.toml` | How the site's routes are served, the same on every node |
 | `[auth]` | System config | A verify key path is a credential path |
 | `[health]` metrics_require, metrics_peers | System config | Which peers may read a node's metrics is a property of the node |
@@ -331,6 +331,7 @@ With `[server]` in the system config and credentials in secrets files, `site.tom
 | `tls_key` | string | yes | Absolute path, PEM key |
 | `h2c_bind` | string | no | `"ip:port"`. Plain-TCP HTTP/2 listener for a private backbone, which needs `internal_binds` |
 | `internal_binds` | list of strings | when `h2c_bind` is set | Set to `h2c_bind`, an `"ip:port"` in a local range, to make the h2c listener internal. `[]` means none |
+| `internal_peers` | list of strings | when `internal_binds` is not empty | IP addresses in a local range. The only peers the internal h2c listener accepts, and a connection from any other address is closed |
 
 TLS cert and key watched via inotify — reloaded on change without restart.
 
@@ -345,11 +346,27 @@ The list is read at startup, so a change needs a restart.
 The system config wins, and its list replaces the one in `site.toml` as a whole.
 A redirect-mode config ignores the key.
 
+An internal listener accepts a connection only from an address in `internal_peers`, and closes any other before reading a request.
+So forwarded addresses are believed only from the peers the config names, whether or not a firewall is in place.
+Each entry is an IP address in a local range, without a port.
+The internal h2c listener is for relaying nodes.
+A monitor polls a node over its TLS listener.
+So `internal_peers` both admits a peer and trusts the client addresses that peer forwards.
+An address that is listed must be one the peer connects from, and the list needs at least one address of the bind's IP family.
+The log writes a line for the first refused connection from each address, then at most one line per address every 60 seconds with the count since the last line.
+It remembers 256 addresses.
+A new address past that takes the place of the remembered address whose last line is oldest, when that line is more than 60 seconds old and no count is owed.
+When no remembered address qualifies, refusals from the new address are counted.
+Across all addresses it writes at most 32 of those lines in 60 seconds, and refusals past that limit are counted.
+The first refusal after the 60 seconds ends writes one summary line with the counts, the number of distinct counted addresses (up to 1024) and the most recent counted address.
+The list is read at startup, and the system config's list replaces the one in `site.toml` as a whole.
+
 ```toml
 [server]
 bind           = "0.0.0.0:443"
 h2c_bind       = "10.0.0.1:8080"
 internal_binds = ["10.0.0.1:8080"]
+internal_peers = ["10.0.0.2", "10.0.0.3"]
 ```
 
 ### `[log]`
@@ -574,6 +591,12 @@ Exit 2 on:
 - `internal_binds` entry that equals `bind` (only the h2c listener can be internal)
 - `internal_binds` entry that is not equal to `h2c_bind`
 - `h2c_bind` set and `internal_binds` absent (`internal_binds = []` is the explicit answer for a public listener)
+- `internal_binds` not empty and `internal_peers` absent
+- `internal_peers` empty
+- `internal_peers` entry that is not an IP address (names are never resolved, ranges and ports are refused)
+- `internal_peers` entry that is not in a local range
+- `internal_peers` set with no internal listener
+- `internal_peers` with no address of the internal bind's IP family (an IPv4-mapped bind is IPv4)
 
 Warnings (not fatal):
 

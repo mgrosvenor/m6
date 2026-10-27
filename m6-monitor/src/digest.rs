@@ -802,12 +802,12 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
             // must warn. Reading an absence as healthy is the shape of mistake
             // the build-drift check above was written to stop making.
             // Either signal means a certificate is expected. Keying on the
-            // polled URL alone silences the check on a node polled over the
-            // backbone in plaintext, which `fleet.rs` actively recommends
-            // ("point this at the backbone address, not the public one") and
-            // which m6-http supports through `h2c_bind`. Such a node serves
-            // TLS publicly and reports its chain, so a reported chain counts
-            // as expecting one.
+            // polled URL alone silences the check on a node polled over a
+            // plain-HTTP URL, such as a loopback or test address. A node
+            // polled over its TLS listener reports its chain, and a reported
+            // chain counts as expecting one. A monitor polls a node over its
+            // TLS listener, because the internal h2c listener is for relaying
+            // cache nodes and admits only the peers in `internal_peers`.
             let expects_tls = r
                 .url
                 .split_once("://")

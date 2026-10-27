@@ -381,29 +381,197 @@ struct H2cPlainConn {
 pub struct H2cListener {
     listener: TcpListener,
     conns: Vec<H2cPlainConn>,
-    /// Whether a peer here may assert a client address for someone else.
-    ///
-    /// Declared by `[server] internal_binds`, which load only accepts in a
-    /// local range. A declared listener is the backbone between nodes, and
-    /// the only peers that can reach it are the deployment's own cache nodes,
-    /// which is what makes their `x-forwarded-for` worth believing -- see
-    /// `crate::forward::ForwardedTrust`. An undeclared listener is just
-    /// another listener, and trusting it would hand every client a rate-limit
-    /// bypass.
-    trust: crate::forward::ForwardedTrust,
+    /// The peers this listener accepts, when it is internal
+    /// (`[server] internal_binds`). `None`: not internal, every peer served
+    /// and none trusted to forward a client address. `Some`: only these peers
+    /// are accepted, and their forwarded address is believed; any other
+    /// connection is closed at accept. The firewall is a second fence, not
+    /// the one this trust rests on. See `crate::forward::ForwardedTrust`.
+    peers: Option<Vec<std::net::IpAddr>>,
+    /// Throttles the log line for refused connections, one peer at a time.
+    refusals: RefusalLog,
+}
+
+/// The most connections one `accept_pending` call handles. A peer that
+/// connects and closes in a loop would otherwise keep the single event loop
+/// in `accept` and starve the other listeners. What is left stays in the
+/// kernel queue and the poller wakes this listener again.
+const MAX_ACCEPTS_PER_WAKE: usize = 64;
+
+/// The fewest seconds between two log lines for one refused peer, and the
+/// length of the window that `REFUSAL_LOG_MAX_LINES` and the summary line use.
+const REFUSAL_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The most peers `RefusalLog` tracks. When the table is full, a new address
+/// takes the slot of the stalest peer whose last line is older than the
+/// interval and that owes no count. When there is no such peer, refusals from
+/// the new address are counted into one total instead.
+const REFUSAL_LOG_MAX_PEERS: usize = 256;
+
+/// The most per-peer lines written in one window across all peers. A host that
+/// rotates through source addresses gets a fresh first line for each one, so
+/// the number of lines needs its own ceiling. Refusals past it are counted
+/// into the next summary line.
+const REFUSAL_LOG_MAX_LINES: u32 = 32;
+
+/// The most distinct untracked addresses `RefusalLog` remembers in one window
+/// to count them. Past it the count of distinct addresses stops at this value.
+const REFUSAL_LOG_MAX_OTHERS: usize = 1024;
+
+/// What the log owes for the refusals of one window that no line carried.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RefusalSummary {
+    /// Refusals from addresses the full table could not track.
+    other_refusals: u64,
+    /// Distinct addresses among those, up to `REFUSAL_LOG_MAX_OTHERS`.
+    other_addresses: u64,
+    /// The most recent of those addresses, so the line names one.
+    sample: Option<std::net::IpAddr>,
+    /// Refusals from tracked addresses whose line the window limit withheld.
+    over_limit: u64,
+}
+
+/// What `RefusalLog::record` tells the caller to write.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RefusalVerdict {
+    /// A line for this peer, carrying the refusals suppressed since its last line.
+    peer_line: Option<u64>,
+    /// A summary of the window that just ended, when it had anything to report.
+    summary: Option<RefusalSummary>,
+}
+
+/// Decides which refused connections get a log line.
+/// A tracked peer gets a line on its first refusal, then at most one per
+/// `interval` carrying the count since its last line.
+/// Across all peers a window of `interval` holds at most `REFUSAL_LOG_MAX_LINES` such lines.
+/// When the table holds `max_peers` peers, a new address takes the slot of the
+/// stalest peer that owes nothing, or else is counted into a total with the
+/// most recent such address kept as a sample. The first refusal after the
+/// window ends returns one summary.
+/// Memory is bounded and a refusal allocates nothing once the tables are full.
+struct RefusalLog {
+    interval: std::time::Duration,
+    max_peers: usize,
+    /// Per peer: when it was last logged (`None` while its first line is
+    /// withheld by the window limit), and the refusals counted since.
+    peers: std::collections::HashMap<std::net::IpAddr, (Option<Instant>, u64)>,
+    /// When the current window began. `None` until the first refusal.
+    window_start: Option<Instant>,
+    lines_in_window: u32,
+    summary: RefusalSummary,
+    others: std::collections::HashSet<std::net::IpAddr>,
+}
+
+impl RefusalLog {
+    fn new(interval: std::time::Duration, max_peers: usize) -> Self {
+        RefusalLog {
+            interval,
+            max_peers,
+            peers: std::collections::HashMap::with_capacity(max_peers),
+            window_start: None,
+            lines_in_window: 0,
+            summary: RefusalSummary::default(),
+            others: std::collections::HashSet::with_capacity(REFUSAL_LOG_MAX_OTHERS),
+        }
+    }
+
+    /// Record a refusal of `peer` at `now` and say what to write.
+    fn record(&mut self, peer: std::net::IpAddr, now: Instant) -> RefusalVerdict {
+        let mut verdict = RefusalVerdict::default();
+        match self.window_start {
+            Some(start) if now.duration_since(start) < self.interval => {}
+            started => {
+                if started.is_some() && self.summary != RefusalSummary::default() {
+                    verdict.summary = Some(std::mem::take(&mut self.summary));
+                }
+                self.window_start = Some(now);
+                self.lines_in_window = 0;
+                self.others.clear();
+            }
+        }
+
+        if let Some((last, suppressed)) = self.peers.get_mut(&peer) {
+            if last.is_some_and(|l| now.duration_since(l) < self.interval) {
+                *suppressed += 1;
+            } else if self.lines_in_window >= REFUSAL_LOG_MAX_LINES {
+                *suppressed += 1;
+                self.summary.over_limit += 1;
+            } else {
+                self.lines_in_window += 1;
+                verdict.peer_line = Some(*suppressed);
+                *last = Some(now);
+                *suppressed = 0;
+            }
+            return verdict;
+        }
+
+        if self.peers.len() >= self.max_peers && !self.evict_stale(now) {
+            self.summary.other_refusals += 1;
+            self.summary.sample = Some(peer);
+            if self.others.len() < REFUSAL_LOG_MAX_OTHERS && self.others.insert(peer) {
+                self.summary.other_addresses += 1;
+            }
+        } else if self.lines_in_window >= REFUSAL_LOG_MAX_LINES {
+            // Tracked, with its first line owed once the window turns.
+            self.peers.insert(peer, (None, 1));
+            self.summary.over_limit += 1;
+        } else {
+            self.lines_in_window += 1;
+            self.peers.insert(peer, (Some(now), 0));
+            verdict.peer_line = Some(0);
+        }
+        verdict
+    }
+}
+
+impl RefusalLog {
+    /// Drop the stalest tracked peer whose last line is older than `interval`
+    /// and that has no suppressed count owed. Returns whether it dropped one.
+    /// Such a peer has nothing left to report, and the window line limit keeps
+    /// a rotating host from turning the freed slots back into a line per refusal.
+    fn evict_stale(&mut self, now: Instant) -> bool {
+        let stalest = self
+            .peers
+            .iter()
+            .filter_map(|(ip, (last, suppressed))| match last {
+                Some(l) if *suppressed == 0 && now.duration_since(*l) >= self.interval => {
+                    Some((*l, *ip))
+                }
+                _ => None,
+            })
+            .min_by_key(|(l, _)| *l);
+        match stalest {
+            Some((_, ip)) => {
+                self.peers.remove(&ip);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// What a connection from `peer` gets on an h2c listener: `None` refuses it.
+/// `peers` is `None` for a listener that is not internal, which serves
+/// everyone and trusts no one.
+fn admit(
+    peers: Option<&[std::net::IpAddr]>,
+    peer: std::net::IpAddr,
+) -> Option<crate::forward::ForwardedTrust> {
+    match peers {
+        None => Some(crate::forward::ForwardedTrust::Never),
+        Some(p) if p.contains(&peer.to_canonical()) => {
+            Some(crate::forward::ForwardedTrust::Backbone)
+        }
+        Some(_) => None,
+    }
 }
 
 impl H2cListener {
-    pub fn bind(addr: &str, internal: bool) -> anyhow::Result<Self> {
+    pub fn bind(addr: &str, internal_peers: Option<Vec<std::net::IpAddr>>) -> anyhow::Result<Self> {
         let listener = m6_core::server::bind_tcp_reuseaddr(resolve_bind(addr)?)?;
         listener.set_nonblocking(true)?;
 
-        let trust = if internal {
-            crate::forward::ForwardedTrust::Backbone
-        } else {
-            crate::forward::ForwardedTrust::Never
-        };
-        if trust == crate::forward::ForwardedTrust::Never {
+        if internal_peers.is_none() {
             warn!(
                 bind = %addr,
                 "h2c listener is not named in [server] internal_binds: forwarded \
@@ -415,7 +583,8 @@ impl H2cListener {
         Ok(H2cListener {
             listener,
             conns: Vec::new(),
-            trust,
+            peers: internal_peers,
+            refusals: RefusalLog::new(REFUSAL_LOG_INTERVAL, REFUSAL_LOG_MAX_PEERS),
         })
     }
 
@@ -428,16 +597,46 @@ impl H2cListener {
     }
 
     pub fn accept_pending(&mut self, poller: &Poller, token: Token) {
-        loop {
+        self.accept_up_to(poller, token, MAX_ACCEPTS_PER_WAKE);
+    }
+
+    /// Handle at most `max` pending connections, refused ones included, and
+    /// return how many it handled.
+    fn accept_up_to(&mut self, poller: &Poller, token: Token, max: usize) -> usize {
+        let mut handled = 0;
+        while handled < max {
             match self.listener.accept() {
                 Ok((stream, peer)) => {
+                    handled += 1;
+                    let Some(trust) = admit(self.peers.as_deref(), peer.ip()) else {
+                        let verdict = self.refusals.record(peer.ip(), Instant::now());
+                        if let Some(s) = verdict.summary {
+                            warn!(
+                                other_refusals = s.other_refusals,
+                                other_addresses = s.other_addresses,
+                                sample = ?s.sample,
+                                over_limit = s.over_limit,
+                                "h2c: refused connections in the last interval that no line named, \
+                                 from addresses beyond the tracked peers or past the line limit"
+                            );
+                        }
+                        if let Some(suppressed) = verdict.peer_line {
+                            warn!(
+                                peer = %peer.ip(),
+                                suppressed,
+                                "h2c: refused a connection from a peer not in [server] internal_peers"
+                            );
+                        }
+                        drop(stream);
+                        continue;
+                    };
                     if let Err(e) = stream.set_nonblocking(true) {
                         warn!("h2c set_nonblocking: {e}");
                         continue;
                     }
                     stream.set_nodelay(true).ok();
                     poller.add(stream.as_raw_fd(), token).ok();
-                    let h2 = match self.trust {
+                    let h2 = match trust {
                         crate::forward::ForwardedTrust::Backbone => {
                             Http2Conn::new().trusting_forwarded_for()
                         }
@@ -456,6 +655,7 @@ impl H2cListener {
                 }
             }
         }
+        handled
     }
 
     pub fn drive_all<F, G>(&mut self, mut on_request: F, mut on_response: G, poller: &Poller)
@@ -1728,23 +1928,219 @@ mod keep_alive_tests {
 }
 
 #[cfg(test)]
-mod h2c_trust_tests {
-    use super::H2cListener;
+mod h2c_admit_tests {
+    use super::{
+        admit, H2cListener, RefusalLog, RefusalSummary, RefusalVerdict, REFUSAL_LOG_MAX_LINES,
+        REFUSAL_LOG_MAX_PEERS,
+    };
     use crate::forward::ForwardedTrust;
+    use crate::poller::{Poller, Token};
+    use std::net::{IpAddr, TcpStream};
+    use std::time::Instant;
 
-    /// A listener declared in `[server] internal_binds` is the backbone, so a
-    /// cache node's forwarded client address is believed.
-    #[test]
-    fn a_declared_h2c_listener_trusts_forwarded_addresses() {
-        let l = H2cListener::bind("127.0.0.1:0", true).unwrap();
-        assert_eq!(l.trust, ForwardedTrust::Backbone);
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
     }
 
-    /// The address no longer decides. Loopback was trusted by address before;
-    /// undeclared, it gets no trust.
+    /// A listener that is not named in `[server] internal_binds` is just
+    /// another listener: it serves everyone and believes no forwarded address.
     #[test]
-    fn an_undeclared_h2c_listener_never_trusts_even_on_loopback() {
-        let l = H2cListener::bind("127.0.0.1:0", false).unwrap();
-        assert_eq!(l.trust, ForwardedTrust::Never);
+    fn a_listener_that_is_not_internal_serves_everyone_and_trusts_no_one() {
+        assert_eq!(admit(None, ip("192.0.2.1")), Some(ForwardedTrust::Never));
+    }
+
+    #[test]
+    fn a_listed_peer_is_admitted_and_trusted() {
+        let peers = [ip("10.0.0.2")];
+        assert_eq!(
+            admit(Some(&peers), ip("10.0.0.2")),
+            Some(ForwardedTrust::Backbone)
+        );
+    }
+
+    #[test]
+    fn an_unlisted_peer_is_refused() {
+        let peers = [ip("10.0.0.2")];
+        assert_eq!(admit(Some(&peers), ip("10.0.0.3")), None);
+    }
+
+    #[test]
+    fn a_v4_mapped_peer_matches_its_v4_entry() {
+        let peers = [ip("10.0.0.2")];
+        assert_eq!(
+            admit(Some(&peers), ip("::ffff:10.0.0.2")),
+            Some(ForwardedTrust::Backbone)
+        );
+    }
+
+    const SEC: std::time::Duration = std::time::Duration::from_secs(1);
+
+    fn v4(n: u32) -> IpAddr {
+        IpAddr::from(std::net::Ipv4Addr::from(n))
+    }
+
+    #[test]
+    fn the_first_refusal_of_a_peer_is_logged_and_repeats_are_counted() {
+        let t0 = Instant::now();
+        let mut log = RefusalLog::new(60 * SEC, 8);
+        let a = ip("10.0.0.3");
+        assert_eq!(log.record(a, t0).peer_line, Some(0));
+        assert_eq!(log.record(a, t0 + SEC).peer_line, None);
+        assert_eq!(log.record(a, t0 + 59 * SEC).peer_line, None);
+        // Another peer has its own first line.
+        assert_eq!(log.record(ip("10.0.0.4"), t0).peer_line, Some(0));
+    }
+
+    #[test]
+    fn a_line_after_the_interval_carries_the_suppressed_count() {
+        let t0 = Instant::now();
+        let mut log = RefusalLog::new(60 * SEC, 8);
+        let a = ip("10.0.0.3");
+        assert_eq!(log.record(a, t0).peer_line, Some(0));
+        for s in 1..=5 {
+            assert_eq!(log.record(a, t0 + s * SEC).peer_line, None);
+        }
+        let later = t0 + 61 * SEC;
+        assert_eq!(log.record(a, later).peer_line, Some(5));
+        // The count starts again from the line just written.
+        assert_eq!(log.record(a, later + SEC).peer_line, None);
+        assert_eq!(log.record(a, later + 61 * SEC).peer_line, Some(1));
+    }
+
+    #[test]
+    fn a_full_table_keeps_its_peers_and_counts_new_addresses() {
+        let t0 = Instant::now();
+        let mut log = RefusalLog::new(60 * SEC, 3);
+        for n in 1..=3 {
+            assert_eq!(log.record(v4(n), t0).peer_line, Some(0));
+        }
+        // Neither a new address nor a repeat of it gets a line, and nothing is evicted.
+        assert_eq!(log.record(v4(9), t0 + SEC), RefusalVerdict::default());
+        assert_eq!(log.record(v4(9), t0 + 2 * SEC), RefusalVerdict::default());
+        assert_eq!(log.record(v4(10), t0 + 3 * SEC), RefusalVerdict::default());
+        assert_eq!(log.peers.len(), 3);
+        assert!(log.peers.contains_key(&v4(1)));
+        // A tracked address still counts its repeats.
+        assert_eq!(log.record(v4(1), t0 + 4 * SEC).peer_line, None);
+        // The first refusal after the window carries the summary and its own line.
+        let v = log.record(v4(1), t0 + 61 * SEC);
+        assert_eq!(v.peer_line, Some(1));
+        assert_eq!(
+            v.summary,
+            Some(RefusalSummary {
+                other_refusals: 3,
+                other_addresses: 2,
+                sample: Some(v4(10)),
+                over_limit: 0
+            })
+        );
+        // The summary is reported once.
+        assert_eq!(log.record(v4(1), t0 + 62 * SEC).summary, None);
+    }
+
+    #[test]
+    fn rotating_addresses_cannot_defeat_the_line_limit() {
+        let t0 = Instant::now();
+        let mut log = RefusalLog::new(60 * SEC, REFUSAL_LOG_MAX_PEERS);
+        let mut lines = 0;
+        let mut summaries = 0;
+        for n in 0..300 {
+            let v = log.record(v4(n), t0 + SEC);
+            lines += usize::from(v.peer_line.is_some());
+            summaries += usize::from(v.summary.is_some());
+        }
+        // 256 tracked addresses fill the table, 32 get a line and 224 wait for
+        // one, and 44 are untracked.
+        assert_eq!(lines, REFUSAL_LOG_MAX_LINES as usize);
+        assert_eq!(summaries, 0);
+        assert!(log.peers.len() <= REFUSAL_LOG_MAX_PEERS);
+        let v = log.record(v4(0), t0 + 61 * SEC);
+        assert_eq!(
+            v.summary,
+            Some(RefusalSummary {
+                other_refusals: 44,
+                other_addresses: 44,
+                sample: Some(v4(299)),
+                over_limit: 300 - 44 - 32
+            })
+        );
+        assert_eq!(v.peer_line, Some(0));
+    }
+
+    #[test]
+    fn a_withheld_peer_gets_its_line_in_the_next_window() {
+        let t0 = Instant::now();
+        let mut log = RefusalLog::new(60 * SEC, 256);
+        for n in 0..40 {
+            log.record(v4(n), t0);
+        }
+        // Address 39 was over the limit: its first line comes with the count.
+        let v = log.record(v4(39), t0 + 61 * SEC);
+        assert_eq!(v.peer_line, Some(1));
+        assert_eq!(v.summary.map(|s| s.over_limit), Some(8));
+    }
+
+    #[test]
+    fn a_new_address_is_named_once_stale_entries_free_a_slot() {
+        let t0 = Instant::now();
+        let mut log = RefusalLog::new(60 * SEC, 3);
+        for n in 1..=3 {
+            assert_eq!(log.record(v4(n), t0 + n * SEC).peer_line, Some(0));
+        }
+        // Every entry's line is older than the interval and none is pending.
+        let later = t0 + 100 * SEC;
+        let v = log.record(v4(9), later);
+        assert_eq!(v.peer_line, Some(0));
+        assert_eq!(log.peers.len(), 3);
+        // The stalest entry, v4(1), made room.
+        assert!(!log.peers.contains_key(&v4(1)));
+        assert!(log.peers.contains_key(&v4(2)) && log.peers.contains_key(&v4(3)));
+    }
+
+    #[test]
+    fn with_no_stale_entry_a_new_address_is_counted_and_sampled() {
+        let t0 = Instant::now();
+        let mut log = RefusalLog::new(60 * SEC, 3);
+        for n in 1..=3 {
+            log.record(v4(n), t0);
+        }
+        // v4(1) has a count pending, so it is not stale even though its line is old.
+        log.record(v4(1), t0 + 10 * SEC);
+        let later = t0 + 61 * SEC;
+        // v4(2) and v4(3) are stale, so one of them makes room.
+        assert_eq!(log.record(v4(8), later).peer_line, Some(0));
+        assert!(log.peers.contains_key(&v4(1)));
+        // With every entry recent or pending, nothing makes room.
+        let mut log = RefusalLog::new(60 * SEC, 3);
+        for n in 1..=3 {
+            log.record(v4(n), t0);
+        }
+        for n in 1..=3 {
+            log.record(v4(n), t0 + 10 * SEC);
+        }
+        let v = log.record(v4(8), t0 + 61 * SEC);
+        assert_eq!(v.peer_line, None);
+        assert_eq!(log.peers.len(), 3);
+        assert!(log.peers.contains_key(&v4(1)));
+        let v = log.record(v4(9), t0 + 62 * SEC);
+        assert_eq!(v.peer_line, None);
+        assert_eq!(log.summary.sample, Some(v4(9)));
+        assert_eq!(log.summary.other_addresses, 2);
+    }
+
+    /// With more connections pending than the cap, one call returns after the
+    /// cap and the rest wait for the next call.
+    #[test]
+    fn accept_returns_after_the_cap_with_more_pending() {
+        // 127.0.0.1 is not listed, so every connection is refused.
+        let mut l = H2cListener::bind("127.0.0.1:0", Some(vec![ip("10.9.9.9")])).unwrap();
+        let addr = l.local_addr().unwrap();
+        let poller = Poller::new().unwrap();
+        let clients: Vec<TcpStream> = (0..12).map(|_| TcpStream::connect(addr).unwrap()).collect();
+        assert_eq!(l.accept_up_to(&poller, Token(1), 5), 5);
+        assert_eq!(l.accept_up_to(&poller, Token(1), 5), 5);
+        assert_eq!(l.accept_up_to(&poller, Token(1), 5), 2);
+        assert_eq!(l.accept_up_to(&poller, Token(1), 5), 0);
+        drop(clients);
     }
 }

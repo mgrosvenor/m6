@@ -72,10 +72,11 @@ pub const UNTRUSTED_INBOUND: &[&str] = &[
 pub enum ForwardedTrust {
     /// A forwarded client IP here is a forgery attempt. The public listener.
     Never,
-    /// The peer is one of the deployment's own cache nodes, reachable only over the
-    /// private backbone. Granted by the listener, never by a header, and only
-    /// on an h2c listener named in `[server] internal_binds`, which load accepts
-    /// only in a local range -- see `H2cListener::bind`.
+    /// The peer is one of the deployment's own cache nodes, accepted only from
+    /// the addresses in `[server] internal_peers`. Granted by the listener,
+    /// never by a header, and only on an h2c listener named in `[server]
+    /// internal_binds`, which load accepts only in a local range -- see
+    /// `H2cListener::bind`.
     Backbone,
 }
 
