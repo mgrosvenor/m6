@@ -47,8 +47,11 @@ It logs `config reload: <key> changed; restart this service to apply it` for `th
 
 `AppWithGlobal::on_reload` and `AppWithState::on_reload` register `Fn(&G, &AppContext) -> Result<()>`.
 Core calls it with the new config before installing the new state, so a service can re-read the state it built in `init_global`.
-If the hook returns `Err` or panics, core logs it, keeps the previous routes and log level, and tries the reload again within a second.
+If the hook returns `Err`, core logs it with the delay before the next attempt, keeps the previous routes and log level, and tries the reload again after 1 s, then 2 s, 4 s and so on up to 60 s.
+A real write to either file reloads at once and starts the delay again at one second.
 The hook must be safe to run twice on one config.
+A panic in the hook is not caught, because the release profile aborts on panic.
+It ends the process and the service manager restarts it, so return `Err` for anything recoverable.
 
 m6-http is not changed by this.
 It keeps its own watcher until it moves onto `ConfigReloader`.

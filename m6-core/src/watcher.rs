@@ -350,6 +350,9 @@ pub const RELOAD_DEBOUNCE: Duration = Duration::from_millis(20);
 /// poll is two `stat` calls a second and finds the change anyway.
 pub const RELOAD_POLL: Duration = Duration::from_secs(1);
 
+/// The longest delay before a failed reload is retried.
+pub const RETRY_CAP: Duration = Duration::from_secs(60);
+
 /// Which of a process's two files changed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Changed {
@@ -444,6 +447,10 @@ pub struct ConfigReloader {
     /// it, or one arriving while a report is still due, is held.
     last_report: Option<Instant>,
     next_poll: Instant,
+    /// Consecutive failed reloads that were asked to be retried.
+    failures: u32,
+    /// True while `due` is a retry and not a change.
+    retrying: bool,
 }
 
 impl ConfigReloader {
@@ -477,6 +484,8 @@ impl ConfigReloader {
             due: None,
             last_report: None,
             next_poll: Instant::now() + RELOAD_POLL,
+            failures: 0,
+            retrying: false,
         }
     }
 
@@ -525,16 +534,23 @@ impl ConfigReloader {
         self.compare(now, forced);
     }
 
-    /// Ask for `changed` to be reported again. The fingerprints are forgotten,
-    /// so the next poll sees the files as changed. Use it when a reload failed
-    /// for a reason that is not the file's fault and a retry may succeed.
-    pub fn retry(&mut self, changed: Changed) {
-        if changed.site {
-            self.seen.site = None;
-        }
-        if changed.process {
-            self.seen.process = None;
-        }
+    /// Ask for `changed` to be reported again after a delay, and return the
+    /// delay. Use it when a reload failed for a reason that is not the file's
+    /// fault and a retry may succeed.
+    ///
+    /// The delay doubles with each consecutive failure, from one second to
+    /// [`RETRY_CAP`]. A real change to either file reports as usual and starts
+    /// the delay again at one second.
+    pub fn retry(&mut self, changed: Changed, now: Instant) -> Duration {
+        let delay = RELOAD_POLL
+            .saturating_mul(1u32 << self.failures.min(6))
+            .min(RETRY_CAP);
+        self.failures = self.failures.saturating_add(1);
+        self.pending.site |= changed.site;
+        self.pending.process |= changed.process;
+        self.due = Some(now + delay);
+        self.retrying = true;
+        delay
     }
 
     /// Call on every loop iteration. Returns the change when a report is due.
@@ -547,6 +563,7 @@ impl ConfigReloader {
             // Every report opens a window. A change inside it is held for one
             // more report when it settles.
             self.due = None;
+            self.retrying = false;
             self.last_report = Some(now);
             return Some(std::mem::take(&mut self.pending));
         }
@@ -580,11 +597,15 @@ impl ConfigReloader {
                 process: true,
             };
         }
+        // A real change, not a retry: the backoff starts again.
+        self.failures = 0;
+        let held_by_a_change = self.due.is_some() && !self.retrying;
+        self.retrying = false;
         self.due = Some(match self.last_report {
             // A change inside the window of an earlier report: one more report
             // when the burst settles, and never later than a second after that
             // report.
-            Some(last) if now < last + RELOAD_DEBOUNCE || self.due.is_some() => {
+            Some(last) if now < last + RELOAD_DEBOUNCE || held_by_a_change => {
                 (now + RELOAD_DEBOUNCE).min(last + RELOAD_POLL).max(now)
             }
             // The first change after quiet: report at once.
@@ -951,17 +972,43 @@ mod tests {
     }
 
     #[test]
-    fn a_retried_change_is_reported_again_by_the_poll() {
+    fn retries_back_off_to_a_cap() {
         let (_d, site, proc, seen) = pair();
         let mut r = ConfigReloader::polling_only(&site, &proc, seen);
         put(&proc, "b = 12\n");
-        let t0 = Instant::now() + RELOAD_POLL;
-        let c = r.tick(t0).expect("reported");
-        // The reload failed and asks to be tried again.
-        r.retry(c);
-        let t1 = t0 + RELOAD_POLL;
-        let again = r.tick(t1).expect("the poll reports it again");
-        assert!(again.process && !again.site, "{again:?}");
+        let mut now = Instant::now() + RELOAD_POLL;
+        let mut c = r.tick(now).expect("reported");
+        let mut delays = Vec::new();
+        for _ in 0..9 {
+            let d = r.retry(c, now);
+            delays.push(d.as_secs());
+            // Not before the delay, then reported.
+            assert_eq!(r.tick(now + d - Duration::from_millis(1)), None);
+            now += d;
+            c = r.tick(now).expect("the retry is reported when due");
+        }
+        assert_eq!(delays, [1, 2, 4, 8, 16, 32, 60, 60, 60]);
+    }
+
+    #[test]
+    fn a_real_write_after_failures_is_reported_at_once_and_resets_the_backoff() {
+        let (_d, site, proc, seen) = pair();
+        let mut r = ConfigReloader::polling_only(&site, &proc, seen);
+        put(&proc, "b = 12\n");
+        let mut now = Instant::now() + RELOAD_POLL;
+        let c = r.tick(now).expect("reported");
+        assert_eq!(r.retry(c, now), Duration::from_secs(1));
+        now += Duration::from_secs(1);
+        let c = r.tick(now).unwrap();
+        assert_eq!(r.retry(c, now), Duration::from_secs(2));
+        // A real write, long before the 2 s retry is due.
+        put(&proc, "b = 123456\n");
+        now += Duration::from_millis(300);
+        r.next_poll_for_test(now);
+        let c = r.tick(now + RELOAD_DEBOUNCE).expect("reported at once");
+        assert!(c.process);
+        // And the next failure starts from one second again.
+        assert_eq!(r.retry(c, now), Duration::from_secs(1));
     }
 
     #[test]

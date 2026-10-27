@@ -1881,10 +1881,15 @@ impl<G: Send + Sync + 'static> AppWithGlobal<G> {
     /// state and log level are installed. A reload is triggered by a change to
     /// the service's config or to `site.toml`.
     ///
-    /// On `Err`, or if the hook panics, the service logs it at error level and
-    /// keeps serving the previous routes and log level, and the reload is tried
-    /// again within a second without a new write. The hook has run by then, so
-    /// it must be safe to run again on the same config.
+    /// On `Err` the service logs it at error level and keeps serving the
+    /// previous routes and log level. The reload is tried again after 1 s,
+    /// then 2 s, 4 s and so on up to 60 s, and at once when either file is
+    /// written again. The hook has run by then, so it must be safe to run again
+    /// on the same config.
+    ///
+    /// A panic in the hook is not caught. The release profile aborts on panic,
+    /// so it ends the process and the service manager restarts it. Return
+    /// `Err` for anything that can be recovered from.
     pub fn on_reload(
         mut self,
         f: impl Fn(&G, &AppContext) -> Result<()> + Send + Sync + 'static,
@@ -2551,7 +2556,8 @@ enum ReloadError {
     Skipped(String),
     /// The new config was refused or did not build. The next write reloads.
     Failed(String),
-    /// `on_reload` failed. Nothing was changed, and the poll tries again.
+    /// `on_reload` returned `Err`. Nothing was changed, and the reload is
+    /// tried again after a growing delay.
     HookFailed(String),
 }
 
@@ -2559,14 +2565,6 @@ impl From<String> for ReloadError {
     fn from(msg: String) -> Self {
         ReloadError::Failed(msg)
     }
-}
-
-/// The message of a caught panic.
-fn panic_message(p: &(dyn Any + Send)) -> &str {
-    p.downcast_ref::<&str>()
-        .copied()
-        .or_else(|| p.downcast_ref::<String>().map(String::as_str))
-        .unwrap_or("no message")
 }
 
 /// Whether `site.toml` declares the compression `config` does, for the backend
@@ -2893,19 +2891,10 @@ fn run_app_with_shutdown(
                 config_path: &config_path,
                 site_toml: &site_toml,
             };
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook(&ctx))) {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    return Err(ReloadError::HookFailed(format!(
-                        "Reload hook failed: {e:#}"
-                    )))
-                }
-                Err(p) => {
-                    return Err(ReloadError::HookFailed(format!(
-                        "Reload hook failed: panicked: {}",
-                        panic_message(&*p)
-                    )))
-                }
+            if let Err(e) = hook(&ctx) {
+                return Err(ReloadError::HookFailed(format!(
+                    "Reload hook failed: {e:#}"
+                )));
             }
         }
         *fs.write().unwrap() = new_state;
@@ -2962,8 +2951,8 @@ fn run_app_with_shutdown(
                 Err(ReloadError::Skipped(msg)) => warn!("{msg}"),
                 Err(ReloadError::Failed(msg)) => error!("{msg}"),
                 Err(ReloadError::HookFailed(msg)) => {
-                    error!("{msg}");
-                    reloader.retry(changed);
+                    let delay = reloader.retry(changed, std::time::Instant::now());
+                    error!("{msg}; retrying in {}s", delay.as_secs());
                 }
                 Ok(routes) => {
                     let elapsed = reload_start.elapsed().as_millis();

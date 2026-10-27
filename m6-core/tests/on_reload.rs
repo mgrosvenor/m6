@@ -47,8 +47,6 @@ fn main() {
     }
     the_hook_sees_the_new_config_and_an_error_is_survived();
     println!("the_hook_sees_the_new_config_and_an_error_is_survived ... ok");
-    a_panicking_hook_is_survived_and_changes_nothing();
-    println!("a_panicking_hook_is_survived_and_changes_nothing ... ok");
     a_failed_hook_leaves_the_previous_state_and_is_retried();
     println!("a_failed_hook_leaves_the_previous_state_and_is_retried ... ok");
 }
@@ -65,9 +63,6 @@ fn service() {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            if marker == "panic" {
-                panic!("marker was panic");
-            }
             if marker == "bad" {
                 return Err(Error::from(anyhow::anyhow!("marker was bad")));
             }
@@ -190,34 +185,6 @@ fn request(dir: &Path) {
     s.read_to_string(&mut buf).ok();
 }
 
-/// A panic in the hook is a hook failure. It used to unwind through the accept
-/// loop and kill the service.
-fn a_panicking_hook_is_survived_and_changes_nothing() {
-    let (dir, mut child, conf, marker_file, log) = start(&conf_text("one"));
-    let read_log = || std::fs::read_to_string(&log).unwrap_or_default();
-
-    std::fs::write(&conf, conf_text("panic")).unwrap();
-    assert!(
-        until(Duration::from_secs(10), || read_log()
-            .contains("Reload hook failed")),
-        "a panicking hook was not logged as a failure\n{}",
-        read_log()
-    );
-    assert!(child.try_wait().unwrap().is_none(), "the service exited");
-
-    std::fs::write(&conf, conf_text("after")).unwrap();
-    assert!(
-        until(Duration::from_secs(10), || {
-            std::fs::read_to_string(&marker_file).is_ok_and(|s| s == "after")
-        }),
-        "the service stopped reloading after a panic\n{}",
-        read_log()
-    );
-    request(dir.path());
-    child.kill().ok();
-    child.wait().ok();
-}
-
 /// A reload whose hook fails changes nothing and is tried again without a new
 /// write. The new `[log] level` is part of "nothing": it is not applied.
 fn a_failed_hook_leaves_the_previous_state_and_is_retried() {
@@ -235,7 +202,8 @@ fn a_failed_hook_leaves_the_previous_state_and_is_retried() {
         "a failing hook was not logged\n{}",
         read_log()
     );
-    // Not consumed: with no further write the poll tries again.
+    // Not consumed: with no further write it is tried again, and the log says
+    // when.
     assert!(
         until(Duration::from_secs(10), || read_log()
             .matches("Reload hook failed")
@@ -244,6 +212,7 @@ fn a_failed_hook_leaves_the_previous_state_and_is_retried() {
         "the failed reload was not retried\n{}",
         read_log()
     );
+    assert!(read_log().contains("retrying in 1s"), "{}", read_log());
     // And the debug level of the failed config was not applied.
     request(dir.path());
     std::thread::sleep(Duration::from_millis(300));
