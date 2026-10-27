@@ -18,7 +18,7 @@ cargo build --release --workspace
 export PATH="$PWD/target/release:$PATH"
 ```
 
-Rust 1.75 or newer. Linux is the production target (epoll, inotify); macOS works
+Rust 1.88 or newer. Linux is the production target (epoll, inotify); macOS works
 for development.
 
 **2. A development certificate.** m6-http is HTTPS only, so there is no way to
@@ -752,6 +752,6 @@ All detailed documentation lives in [`docs/`](docs/):
 cargo build --release --workspace
 ```
 
-Requires Rust 1.75+. Production target: Linux (epoll, inotify). macOS supported for development.
+Requires Rust 1.88+. Production target: Linux (epoll, inotify). macOS supported for development.
 
 For development TLS: [mkcert](https://github.com/FiloSottile/mkcert).
