@@ -279,7 +279,7 @@ A system config with no `[node]` logs a warning that the node name falls back to
 |---|---|---|
 | `[site]` name, domain, redirect_www, describedby | `site.toml` | The identity every node shares |
 | `[node]` name | System config | Names this node |
-| `[server]` bind, tls_cert, tls_key, h2c_bind, internal_binds, redirect_bind, warm_on_start | System config | Differs per node |
+| `[server]` bind, tls_cert, tls_key, h2c_bind, internal_binds, internal_peers, redirect_bind, warm_on_start | System config | Differs per node |
 | `[server]` backend_timeout_secs, allowed_methods | `site.toml` | How the site's routes are served, the same on every node |
 | `[auth]` | System config | A verify key path is a credential path |
 | `[health]` metrics_require, metrics_peers | System config | Which peers may read a node's metrics is a property of the node |
@@ -331,6 +331,7 @@ With `[server]` in the system config and credentials in secrets files, `site.tom
 | `tls_key` | string | yes | Absolute path, PEM key |
 | `h2c_bind` | string | no | `"ip:port"`. Plain-TCP HTTP/2 listener for a private backbone, which needs `internal_binds` |
 | `internal_binds` | list of strings | when `h2c_bind` is set | Set to `h2c_bind`, an `"ip:port"` in a local range, to make the h2c listener internal. `[]` means none |
+| `internal_peers` | list of strings | when `internal_binds` is not empty | IP addresses in a local range. The only peers the internal h2c listener accepts, and a connection from any other address is closed |
 
 TLS cert and key watched via inotify — reloaded on change without restart.
 
@@ -345,11 +346,17 @@ The list is read at startup, so a change needs a restart.
 The system config wins, and its list replaces the one in `site.toml` as a whole.
 A redirect-mode config ignores the key.
 
+An internal listener accepts a connection only from an address in `internal_peers`, and closes any other before reading a request.
+So forwarded addresses are believed only from the peers the config names, whether or not a firewall is in place.
+Each entry is an IP address in a local range, without a port.
+The list is read at startup, and the system config's list replaces the one in `site.toml` as a whole.
+
 ```toml
 [server]
 bind           = "0.0.0.0:443"
 h2c_bind       = "10.0.0.1:8080"
 internal_binds = ["10.0.0.1:8080"]
+internal_peers = ["10.0.0.2", "10.0.0.3"]
 ```
 
 ### `[log]`
@@ -574,6 +581,11 @@ Exit 2 on:
 - `internal_binds` entry that equals `bind` (only the h2c listener can be internal)
 - `internal_binds` entry that is not equal to `h2c_bind`
 - `h2c_bind` set and `internal_binds` absent (`internal_binds = []` is the explicit answer for a public listener)
+- `internal_binds` set and `internal_peers` absent
+- `internal_peers` empty
+- `internal_peers` entry that is not an IP address (names are never resolved, ranges and ports are refused)
+- `internal_peers` entry that is not in a local range
+- `internal_peers` set with no internal listener
 
 Warnings (not fatal):
 

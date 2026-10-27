@@ -32,7 +32,7 @@ Logs to stdout as structured JSON.
 5. Expand `[[route_group]]` globs against site directory — builds route table entries and invalidation map
 6. Read renderer configs to build params-file → URL invalidation map entries
 7. Register inotify on site directory (`site.toml`), system config, and `/run/m6/` (socket discovery)
-8. Bind TLS listener; if `h2c_bind` is set, bind H2C (plain-TCP HTTP/2) listener on that address, which is internal when `internal_binds` names it
+8. Bind TLS listener; if `h2c_bind` is set, bind H2C (plain-TCP HTTP/2) listener on that address, which is internal when `internal_binds` names it and then accepts only the peers in `internal_peers`
 9. Start epoll event loop
 
 ---
@@ -244,6 +244,7 @@ tls_cert = "cert.pem"
 tls_key  = "key.pem"
 h2c_bind = "127.0.0.1:8080"   # plain-TCP HTTP/2 on this address
 internal_binds = ["127.0.0.1:8080"]
+internal_peers = ["127.0.0.1"]   # the only peers it accepts
 ```
 
 The H2C listener accepts plain TCP connections and speaks HTTP/2 framing directly (no TLS record layer). The request is then routed and handled identically to a TLS request.
@@ -251,6 +252,7 @@ The H2C listener accepts plain TCP connections and speaks HTTP/2 framing directl
 The listener is internal, and trusts the `X-Forwarded-For` a cache node sends, only when `[server] internal_binds` names it.
 m6-http refuses to start with `h2c_bind` set and `internal_binds` absent.
 `internal_binds = []` declares the listener public.
+An internal listener closes a connection from any address not in `[server] internal_peers`, and m6-http refuses to start with `internal_binds` set and `internal_peers` absent.
 
 **Outbound H2C** — use the `h2c://` scheme in a backend URL:
 

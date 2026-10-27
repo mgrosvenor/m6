@@ -19,6 +19,16 @@ the version when the release is cut.
 
 ### Changed
 
+**An internal listener accepts only the peers its config names (#246).**
+An h2c listener named in `[server] internal_binds` believed the `X-Forwarded-For` of any peer that reached it, so a firewall was the only thing between a forged client address and the rate limiter.
+`[server] internal_peers` now lists the IP addresses it accepts, each in a local range.
+A connection from any other address is closed at accept and logged with the peer's address.
+The check runs once per connection and requests are not touched.
+**Migration.**
+A config with a non-empty `internal_binds` must add `internal_peers`, or m6-http exits 2 and says what to add.
+Earlier releases ignore the key, so add it before upgrading.
+**Verified** by unit tests for each refusal and for canonical addresses, and by real-binary tests over h2c: a listed peer is served and believed, an unlisted peer's connection is closed with no response, and a config without the key refuses to start.
+
 **Each key goes in the file it belongs to, and an app can say where `site.toml` is (#242).**
 Every m6 process reads two files.
 `site.toml` holds the state every process of the site shares.
