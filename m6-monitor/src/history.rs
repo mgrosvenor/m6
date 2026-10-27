@@ -132,9 +132,13 @@
 //! `crawlers`, each crawler being `user_agent`, `requests`, `client_ips` and
 //! `paths`, and `sightings_dropped`.
 //!
-//! The reader opens its own read-only connection, copies the page's rows out
-//! with one indexed query, and closes the connection before it serialises, so
-//! it holds a lock only for that query.
+//! The reader opens its own read-only connection and reads a whole page inside
+//! one read transaction, so a prune that commits meanwhile cannot leave a row
+//! without its channels, interfaces or findings. It copies the rows out and
+//! closes the connection before it serialises. The file uses a rollback
+//! journal, so the writer waits for the page's reads to end, up to its busy
+//! timeout of 5 seconds. A write that waits longer fails and that poll is not
+//! stored.
 //!
 //! # Caveats
 //!
@@ -1455,6 +1459,33 @@ WHERE h.at_ms >= ?1 AND h.at_ms < ?2 AND (?3 IS NULL OR h.node_id = ?3) \
 AND (?4 IS NULL OR h.at_ms > ?4 OR (h.at_ms = ?4 AND h.id >= ?5)) \
 ORDER BY h.at_ms, h.id LIMIT ?6";
 
+#[cfg(test)]
+thread_local! {
+    /// Runs after a page's main query, so a test can change the file between
+    /// the statements of one page.
+    static AFTER_ROWS: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn after_rows() {
+    #[cfg(test)]
+    AFTER_ROWS.with(|h| {
+        if let Some(f) = h.borrow_mut().as_mut() {
+            f();
+        }
+    });
+}
+
+/// Begin a deferred read transaction unless the caller already holds one, so
+/// every statement of a page sees the same file even if a prune commits.
+fn snapshot(conn: &Connection) -> rusqlite::Result<Option<Transaction<'_>>> {
+    if conn.is_autocommit() {
+        conn.unchecked_transaction().map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
 fn none_if_empty(s: Option<String>) -> Option<String> {
     s.filter(|s| !s.is_empty())
 }
@@ -1469,6 +1500,7 @@ pub fn health_page(
     after: Option<(i64, i64)>,
     rows: usize,
 ) -> rusqlite::Result<Vec<PageRow>> {
+    let _snapshot = snapshot(conn)?;
     let mut out: Vec<PageRow> = {
         let mut stmt = conn.prepare(HEALTH_SELECT)?;
         let (a_at, a_id) = after.unzip();
@@ -1553,6 +1585,7 @@ pub fn health_page(
         })?;
         mapped.collect::<rusqlite::Result<_>>()?
     };
+    after_rows();
     let (Some(first), Some(last)) = (
         out.iter().map(|r| r.id).min(),
         out.iter().map(|r| r.id).max(),
@@ -1687,6 +1720,7 @@ pub fn crawl_page(
     after: Option<(i64, i64)>,
     rows: usize,
 ) -> rusqlite::Result<Vec<CrawlOut>> {
+    let _snapshot = snapshot(conn)?;
     let mut out: Vec<CrawlOut> = {
         let mut stmt = conn.prepare(
             "SELECT w.id, w.at_ms, n.name, w.window_minutes, w.total_requests, \
@@ -1714,6 +1748,7 @@ pub fn crawl_page(
         })?;
         mapped.collect::<rusqlite::Result<_>>()?
     };
+    after_rows();
     let (Some(first), Some(last)) = (
         out.iter().map(|r| r.id).min(),
         out.iter().map(|r| r.id).max(),
@@ -2780,5 +2815,58 @@ mod tests {
             )
             .unwrap();
         assert_eq!(unused, 0, "an agent nothing references was kept");
+    }
+
+    /// Run `f` with a prune of every poll, by a second connection, tried
+    /// after the main query of each page read. The file uses a rollback
+    /// journal, so the prune fails at once while the page holds a read
+    /// transaction and succeeds when the page reads in autocommit.
+    fn with_prune_between_statements<R>(path: &Path, f: impl FnOnce() -> R) -> R {
+        let path = path.to_path_buf();
+        AFTER_ROWS.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                let w = sqlite::OpenOptions::default()
+                    .busy_timeout(std::time::Duration::from_millis(1))
+                    .open(&path)
+                    .unwrap();
+                let _ = w.execute("DELETE FROM poll", []);
+            }));
+        });
+        let r = f();
+        AFTER_ROWS.with(|h| *h.borrow_mut() = None);
+        r
+    }
+
+    #[test]
+    fn a_history_page_reads_one_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(dir.path());
+        let rs = [reading("a"), unreachable("b")];
+        let d = digest::build(&rs, &Thresholds::default(), "t".into());
+        s.write(&batch(T0, &rs, &d)).unwrap();
+        let file = cfg(dir.path(), 1).file;
+        let reader = sqlite::open_reader(&file).unwrap();
+        let rows = with_prune_between_statements(&file, || {
+            health_page(&reader, T0, T0 + 1000, None, None, 10).unwrap()
+        });
+        let a = rows.iter().find(|r| r.node == "a").unwrap();
+        assert_eq!(a.channels.len(), 2, "channels of a pruned poll are kept");
+        assert_eq!(a.net.len(), 1);
+        assert_eq!(a.findings.len(), 1);
+    }
+
+    #[test]
+    fn a_crawler_page_reads_one_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(dir.path());
+        s.write(&make(T0, &[reading("a")])).unwrap();
+        let file = cfg(dir.path(), 1).file;
+        let reader = sqlite::open_reader(&file).unwrap();
+        let rows = with_prune_between_statements(&file, || {
+            crawl_page(&reader, T0, T0 + 1000, None, None, 10).unwrap()
+        });
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status.len(), 2);
+        assert_eq!(rows[0].crawlers.len(), 1);
     }
 }

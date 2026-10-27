@@ -227,8 +227,8 @@ fn crawlers_ndjson(req: &Request, st: &MonitorState) -> Result<Response> {
 
 /// The shared read path of `/history` and `/crawlers`.
 ///
-/// The connection is closed before any row is serialised, so the shared lock
-/// is held for one indexed query and no longer.
+/// One page reads inside one read transaction (see `history::health_page`).
+/// The connection is closed before any row is serialised.
 fn paged<T: history::Keyed>(
     req: &Request,
     st: &MonitorState,
