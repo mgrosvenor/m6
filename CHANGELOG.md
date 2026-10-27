@@ -78,18 +78,25 @@ workspace tests pass with 0 failures, h3 and QUIC included.
 Each entry must be in a local range (`m6_core::net::is_private_ip`), and names and ranges are refused.
 The peer address is the one the TCP or QUIC handshake proved, so the endpoints are refused on an internal h2c listener, which believes `X-Forwarded-For`.
 Any other peer gets 404.
-`[health] metrics_require` takes `role:<name>` or `group:<name>` and checks an API token with `[auth] public_key`, as route `require` does: 401 for no or bad token, 403 for the wrong claim.
+`[health] metrics_require` takes `role:<name>` or `group:<name>` and checks a token with `[auth] public_key`. The token comes from the Authorization header or the session cookie, as route `require` reads it: 401 for no or bad token, 403 for the wrong claim.
 `metrics_token_file` stays as the legacy gate and is ignored when `metrics_require` is set.
 `[auth] backend` is optional, and `[auth]` and the two new keys may be set in the system config.
 The proxy's own 401 from route `require` now carries `WWW-Authenticate: Bearer`.
 m6-monitor's `metrics_over_tunnel` fetches `/perf` and `/traffic` through a node's `tunnel.address` while `/health` stays on the public URL.
 
 **Migration.**
-Nothing changes without the new keys.
-A system config that carried `[auth]` or `[health]` used to be ignored with a warning.
+A system config that holds only `[server]` and `[node]` is unaffected.
+A system config that carries `[auth]` or `[health]` used to have them ignored with a warning.
 Now `[auth]` is read, and `[health]` there accepts only the two new keys.
-`[auth]` in both files is refused.
-A file given as both arguments is read once, so it is not a second declaration.
+A config that breaks these rules stops m6-http starting with exit 2.
+On a running node a reload fails the same way and keeps the old config until a restart.
+Check each system config for these three cases before the upgrade:
+
+- `[auth]` declared in both the system config and `site.toml`. Keep it in one file and delete it from the other.
+- A relative `[auth] public_key` in the system config. Make it an absolute path.
+- A `[health]` key in the system config other than `metrics_require` and `metrics_peers`, for example `metrics_token_file`. Move it to `site.toml` or delete it.
+
+When both arguments name the same file, it is read twice and the system-side `[auth]` and `[health]` are ignored, so it is not a second declaration.
 Older versions ignore the new keys, so a config can carry them before the upgrade, but the endpoints stay on the legacy gate until it.
 Verified: `cargo test --workspace -- --test-threads=1` passes 1390 tests with 0 failures and 0 warnings on the release and test builds.
 `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `tools/clippy.sh` and `cargo deny check` are silent.
