@@ -704,10 +704,7 @@ fn event_loop(
                 TOKEN_INOTIFY => {
                     if let Some(ref mut w) = watcher {
                         for event in w.read_events() {
-                            // `tcp` goes in because a certificate change has to
-                            // rebuild the rustls configuration this listener
-                            // holds, not only the quiche one. m6 #210.
-                            handle_fs_event(&event, state, quiche_config, tcp.as_mut());
+                            handle_fs_event(&event, state);
                         }
                     }
                 }
@@ -3857,24 +3854,13 @@ fn flush_all(udp: &UdpSocket, connections: &mut HashMap<Vec<u8>, QuicConn>) {
 
 // ── Filesystem event handling ─────────────────────────────────────────────────
 
-fn handle_fs_event(
-    event: &FsEvent,
-    state: &mut ServerState,
-    quiche_config: &mut quiche::Config,
-    tcp: Option<&mut Http11Listener>,
-) {
+fn handle_fs_event(event: &FsEvent, state: &mut ServerState) {
     match event.kind {
         FsEventKind::SocketCreated => {
             state.pool_manager.socket_appeared(&event.path);
         }
         FsEventKind::SocketDeleted => {
             state.pool_manager.socket_disappeared(&event.path);
-        }
-        // `site.toml` is read by the config reloader, which also sees the
-        // system config.
-        FsEventKind::SiteTomlChanged => {}
-        FsEventKind::TlsCertChanged => {
-            handle_tls_reload(state, quiche_config, tcp);
         }
     }
 }
@@ -4017,21 +4003,23 @@ fn reload_public_key(state: &mut ServerState, new: &config::Config) -> Option<Pu
 /// **Both configurations are built before either is installed.** A reload that
 /// swapped them one at a time would leave the protocols disagreeing whenever the
 /// second build failed, which is the state this function exists to end. On a
-/// failure every protocol keeps the material it already had, and the next write
-/// to the certificate tries again.
+/// failure every protocol keeps the material it already had, and the reload is
+/// tried again after a growing delay and at once on the next touch.
 ///
-/// Each build reads the files itself, a moment apart, so material written
-/// between the two reads reaches one and not the other. The write that lands
-/// there generates its own event, and this runs again and settles both on it. A
-/// renewal writes a certificate and a key as two files, so a read catching one
-/// of them half done is the ordinary case rather than a rare one, and the
-/// mismatched pair fails the rustls build and keeps every protocol where it was.
+/// This runs when the system config changes, not when a certificate file does.
+/// A renewal writes the certificate and the key, then touches the system
+/// config, so the pair is complete when it is read. Each build reads the files
+/// itself, a moment apart, so material written between the two reads reaches
+/// one and not the other. A touch that arrives before the key is written fails
+/// the rustls pair check and keeps every protocol where it was, and the retry
+/// settles both on the finished pair. Returns `false` when nothing was
+/// installed.
 fn handle_tls_reload(
     state: &ServerState,
     quiche_config: &mut quiche::Config,
     tcp: Option<&mut Http11Listener>,
 ) -> bool {
-    info!("TLS config reload: cert/key file changed");
+    info!("TLS config reload: system config changed");
 
     // Both are Some outside redirect mode, which runs its own loop and never
     // reaches here. Erroring keeps a config failure diagnosable instead of a
@@ -4337,7 +4325,7 @@ fn run(args: Vec<String>) -> i32 {
     let watcher = match FsWatcher::new(&config) {
         Ok(w) => Some(w),
         Err(e) => {
-            warn!(error = %e, "fs watcher setup failed, hot reload disabled");
+            info!(error = %e, "backend socket watch unavailable; the 2-second rescan finds sockets");
             None
         }
     };
