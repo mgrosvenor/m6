@@ -116,6 +116,14 @@ gh pr create --base main --head develop --title "Release 1.1.0"
 git checkout main && git pull && ./tag.sh v1.1.0
 ```
 
+Choose the next version number from the policy under Versions in
+`CONTRIBUTING.md`, without asking. In short:
+
+- X is a major architectural change.
+- Y is a breaking change to an API, configuration, library or behaviour, or a major new feature.
+- Z is bug fixes, minor updates or minor new features.
+- A config or behaviour change that needs a migration note is a Y bump, not an X bump.
+
 The build host is still worth running by hand before opening a pull request, because
 it tests more than a runner can:
 

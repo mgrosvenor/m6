@@ -7,8 +7,8 @@ Each entry records what changed, why it mattered, and how it was verified.
 source: several defects in this list were invisible in the code and only showed
 up against the deployed artefact.
 
-Versions follow [semantic versioning](https://semver.org). `main` holds
-releases only; work happens on `develop`. See `CONTRIBUTING.md`.
+The version number follows the policy under Versions in `CONTRIBUTING.md`.
+`main` holds releases only; work happens on `develop`.
 
 ---
 
