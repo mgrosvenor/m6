@@ -90,3 +90,24 @@ fn dump_config_names_the_site_toml() {
         .unwrap_or_else(|| panic!("no site.toml line in:\n{stdout}"));
     assert!(line.ends_with("(absent)"), "{line}");
 }
+
+#[test]
+fn dump_config_refuses_a_site_toml_the_start_would_refuse() {
+    let tmp = tree("");
+    let root = tmp.path().join("apps/file");
+
+    // Missing.
+    let conf = config(&root, "site_toml = \"../../nowhere.toml\"");
+    let out = run(&root, &conf, Some("--dump-config"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("does not exist"), "{stderr}");
+
+    // Invalid TOML.
+    std::fs::write(tmp.path().join("bad.toml"), "[server\n").unwrap();
+    let conf = config(&root, "site_toml = \"../../bad.toml\"");
+    let out = run(&root, &conf, Some("--dump-config"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("not valid TOML"), "{stderr}");
+}

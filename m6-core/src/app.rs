@@ -2375,6 +2375,13 @@ fn dump_config(
         }
     };
 
+    // The same refusal the start makes, so a deploy that validates with
+    // --dump-config learns what the start would say.
+    if let Err(msg) = check_site_toml(&config, site_dir) {
+        eprintln!("Config error: {msg}");
+        return 2;
+    }
+
     println!("site_dir    {}", site_dir.display());
     println!("config      {}", config_path.display());
     {
