@@ -428,7 +428,7 @@ On a running node a reload fails the same way and keeps the old config until a r
 Check each system config for `[auth]` declared in both the system config and `site.toml` before the upgrade.
 Keep it in one file and delete it from the other.
 A `[health]` key in the system config other than `metrics_require`, `metrics_peers` and `metrics_token_file` stops m6-http starting with exit 2.
-Move any other key (`enabled`, `perf_path`, `traffic_path`, `traffic_cache_s`) to `site.toml`.
+Move any other key (`enabled`, `path`, `perf_path`, `traffic_path`, `traffic_cache_s`) to `site.toml`.
 
 When both arguments name the same file, its `[auth]` and `[health]` are the site config's and the system-side copy is ignored.
 Older versions ignore the new keys, so a config can carry them before the upgrade, but the endpoints stay on the legacy gate until it.
