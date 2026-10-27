@@ -164,10 +164,14 @@ fn status_of(socket: &Path, path: &str) -> Option<String> {
 }
 
 fn start(site_toml_body: &str) -> Running {
+    start_with(site_toml_body, &conf_body("", 2))
+}
+
+fn start_with(site_toml_body: &str, conf: &str) -> Running {
     let tmp = tree(site_toml_body);
     std::fs::write(tmp.path().join("apps/file/assets/a.txt"), b"asset").unwrap();
     let root = tmp.path().join("apps/file");
-    std::fs::write(root.join("m6-file.conf"), conf_body("", 2)).unwrap();
+    std::fs::write(root.join("m6-file.conf"), conf).unwrap();
     let socket = root.join("reload.sock");
     let mut svc = Service::spawn(
         "m6-file",
@@ -323,4 +327,82 @@ fn a_single_write_is_one_reload_with_no_delay() {
     );
     std::thread::sleep(Duration::from_millis(1_500));
     assert_eq!(r.count("Reload complete"), 1, "{}", r.svc.output());
+}
+
+#[test]
+fn an_empty_process_config_is_skipped_and_the_next_write_reloads() {
+    let r = start("");
+    std::fs::write(r.conf(), "").unwrap();
+    assert!(
+        wait_for(&r, "Reload skipped", 1),
+        "an empty config was not skipped\n{}",
+        r.svc.output()
+    );
+    assert_eq!(r.count("Reload complete"), 0, "{}", r.svc.output());
+    // Every route would be a 404 if the empty config had been loaded.
+    assert!(status_of(&r.socket, "/assets/a.txt")
+        .unwrap()
+        .contains("200"));
+    std::fs::write(r.conf(), conf_body("# full", 3)).unwrap();
+    assert!(
+        wait_for(&r, "Reload complete", 1),
+        "the full write did not reload\n{}",
+        r.svc.output()
+    );
+}
+
+#[test]
+fn an_empty_site_toml_is_skipped_and_keeps_the_log_level() {
+    let r = start("[log]\nlevel = \"debug\"\n");
+    std::fs::write(r.site_toml(), "").unwrap();
+    assert!(
+        wait_for(&r, "Reload skipped", 1),
+        "an empty site.toml was not skipped\n{}",
+        r.svc.output()
+    );
+    assert_eq!(r.count("Reload complete"), 0, "{}", r.svc.output());
+    // Still debug: a request is logged.
+    assert!(status_of(&r.socket, "/assets/a.txt")
+        .unwrap()
+        .contains("200"));
+    assert!(
+        wait_for(&r, "request complete", 1),
+        "the level was reset\n{}",
+        r.svc.output()
+    );
+    std::fs::write(r.site_toml(), "[log]\nlevel = \"info\"\n").unwrap();
+    assert!(wait_for(&r, "Reload complete", 1), "{}", r.svc.output());
+}
+
+#[test]
+fn a_site_toml_that_does_not_parse_is_refused_when_site_toml_is_not_named() {
+    let conf = "[thread_pool]\nsize = 2\n\n".to_string() + ROUTE;
+    let r = start_with("", &conf);
+    // With no `site_toml` key the file is at the site directory.
+    let at_root = r.root().join("site.toml");
+    std::fs::write(&at_root, "[server\n").unwrap();
+    std::fs::write(r.conf(), format!("{conf}# edit\n")).unwrap();
+    assert!(
+        wait_for(&r, "Reload refused", 1),
+        "a site.toml that does not parse was accepted\n{}",
+        r.svc.output()
+    );
+    assert_eq!(r.count("Reload complete"), 0, "{}", r.svc.output());
+}
+
+#[test]
+fn restart_only_warnings_compare_with_the_running_values() {
+    let r = start("");
+    for pool in [3, 2, 3] {
+        let before = r.count("Reload complete");
+        std::fs::write(r.conf(), conf_body("", pool)).unwrap();
+        assert!(
+            wait_for(&r, "Reload complete", before + 1),
+            "{}",
+            r.svc.output()
+        );
+    }
+    // Started at 2: the reload to 3 warns, the one back to 2 does not, the
+    // last to 3 warns again.
+    assert_eq!(r.count("thread_pool.size changed"), 2, "{}", r.svc.output());
 }

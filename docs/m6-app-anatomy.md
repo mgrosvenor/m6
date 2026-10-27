@@ -232,8 +232,11 @@ It takes the change from the platform's watcher when there is one and, whatever 
 A lost watch, a replaced directory or a watcher that stopped reporting therefore delays a reload by at most a second and no longer prevents it.
 The first change after quiet reloads at once.
 A change that arrives within 20 ms of a reload is held and reloads once more when the burst has settled, no later than a second after the window opened.
-A single write is therefore one reload with no delay, and a burst of writes is at most two.
+A write that replaces the file in one step is therefore one reload with no delay, and a burst of writes is at most two.
+A write that truncates the file first can report twice, because the truncation is seen as a change of its own.
+A file seen at length 0 is not loaded: the reload is skipped with a warning and the write that fills the file reloads.
 A touch alone, with no change to the bytes, reloads.
+On Linux an event that names one of the two files is a change even when the file's size and times are unchanged, which coarse filesystem timestamps can cause.
 Table 5 says what that reload reaches.
 
 | reloaded on a change to either file | fixed until a restart |
@@ -249,16 +252,17 @@ Table 5 says what that reload reaches.
 **Table 5: what a change to either file reloads, and what needs a restart.**
 Take from it that a reload re-reads both files every time, whichever one changed, because a service has no cache that a rebuild would lose.
 
-A key that needs a restart keeps its running value.
+A key that needs a restart keeps its running value, and the warning compares the new file with the values the process started with.
 The reload logs `config reload: <key> changed; restart this service to apply it` for each one that differs.
 
 A reload that fails is refused whole.
-A configuration that does not parse, a template that does not build, a route naming an unregistered handler, a `site_toml` that is gone or not valid TOML, and a `compresses` declaration that disagrees with the service each leave the previous state serving and log the reason, which is what makes a typo in a live configuration recoverable.
+A configuration that does not parse, a template that does not build, a route naming an unregistered handler, a `site_toml` that is gone, or a `site.toml` that is not valid TOML whether or not `site_toml` names it, and a `compresses` declaration that disagrees with the service each leave the previous state serving and log the reason, which is what makes a typo in a live configuration recoverable.
 A file that failed to load is not tried again until it is written again.
 
 `AppWithGlobal::on_reload` and `AppWithState::on_reload` register `Fn(&G, &AppContext) -> Result<()>` for state that `init_global` built from the configuration.
-Core calls it after a successful reload, once the new routes are serving, with the new configuration in the context.
-An `Err` is logged at error level and the service keeps serving, so the hook is expected to leave its own state as it was.
+Core calls it with the new configuration in the context, after the new state has been built and checked and before it is installed.
+If the hook returns `Err` or panics, core logs it at error level and keeps the previous routes and log level.
+The reload is then tried again within a second without a new write, so the hook must be safe to run twice on the same configuration.
 
 The route table is the part of that configuration a service writes code against, and §5 is how the two meet.
 

@@ -29,22 +29,26 @@ State that `init_global` built from the config had no way to reload.
 It takes the change from the platform watcher and, whatever the watcher says, compares the two files' identity, size and times once a second.
 The first change after quiet is reported at once.
 A change that arrives within 20 ms of a report is held and reported once more when the burst has settled, no later than a second after the window opened.
-A single write is one reload with no delay and a burst of writes is at most two.
+A write that replaces the file in one step is one reload with no delay and a burst of writes is at most two.
+A write that truncates the file first can report twice.
+A file seen at length 0 is skipped with a warning, and the write that fills it reloads.
 Reporting at once matters when an edge clears its cache on the same change, because a backend that reloads late would otherwise leave a stale page cached.
 A touch alone reloads.
+On Linux an event that names one of the files is a change even when its size and times are equal, which coarse timestamps can cause.
 A file that failed to load is not tried again until it is written again.
 
 An App reload now re-reads `site.toml` every time.
 It applies the log level with the same precedence as start: the command line, then the service's `[log]`, then `site.toml`'s `[log]`.
 It checks the `compresses` agreement again and refuses the reload on a disagreement.
-It refuses a named `site_toml` that is gone or not valid TOML.
+It refuses a `site_toml` that is gone and a `site.toml` that is not valid TOML, whether or not `site_toml` names it.
 The previous state keeps serving after any refusal.
 It logs `config reload: <key> changed; restart this service to apply it` for `thread_pool.size`, `thread_pool.queue_size`, `server.read_timeout_s`, `server.socket_mode` and `site_toml`, which keep their running values.
 `Reload complete` gains `site` and `process` fields saying which file changed.
 
 `AppWithGlobal::on_reload` and `AppWithState::on_reload` register `Fn(&G, &AppContext) -> Result<()>`.
-Core calls it after a successful reload with the new config, so a service can re-read the state it built in `init_global`.
-An `Err` is logged and the service keeps serving.
+Core calls it with the new config before installing the new state, so a service can re-read the state it built in `init_global`.
+If the hook returns `Err` or panics, core logs it, keeps the previous routes and log level, and tries the reload again within a second.
+The hook must be safe to run twice on one config.
 
 m6-http is not changed by this.
 It keeps its own watcher until it moves onto `ConfigReloader`.

@@ -47,6 +47,10 @@ fn main() {
     }
     the_hook_sees_the_new_config_and_an_error_is_survived();
     println!("the_hook_sees_the_new_config_and_an_error_is_survived ... ok");
+    a_panicking_hook_is_survived_and_changes_nothing();
+    println!("a_panicking_hook_is_survived_and_changes_nothing ... ok");
+    a_failed_hook_leaves_the_previous_state_and_is_retried();
+    println!("a_failed_hook_leaves_the_previous_state_and_is_retried ... ok");
 }
 
 /// The service: a global state that records the `marker` key of the config it
@@ -61,6 +65,9 @@ fn service() {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
+            if marker == "panic" {
+                panic!("marker was panic");
+            }
             if marker == "bad" {
                 return Err(Error::from(anyhow::anyhow!("marker was bad")));
             }
@@ -131,6 +138,120 @@ fn the_hook_sees_the_new_config_and_an_error_is_survived() {
         read_log()
     );
 
+    child.kill().ok();
+    child.wait().ok();
+}
+
+/// Start the service on a fresh directory with `conf`, and wait for its socket.
+fn start(
+    conf_body: &str,
+) -> (
+    tempfile::TempDir,
+    std::process::Child,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let conf = dir.path().join("hook.conf");
+    let socket = dir.path().join("hook.sock");
+    let marker_file = dir.path().join("marker.txt");
+    let log = dir.path().join("out.log");
+    std::fs::write(&conf, conf_body).unwrap();
+    let logfile = std::fs::File::create(&log).unwrap();
+    let child = Command::new(std::env::current_exe().unwrap())
+        .arg(dir.path())
+        .arg(&conf)
+        .env(CHILD_ENV, "1")
+        .env("HOOK_OUT", &marker_file)
+        .env("M6_SOCKET_OVERRIDE", &socket)
+        .stdout(Stdio::from(logfile.try_clone().unwrap()))
+        .stderr(Stdio::from(logfile))
+        .spawn()
+        .expect("spawn service");
+    assert!(
+        until(Duration::from_secs(10), || socket.exists()),
+        "the service never bound its socket"
+    );
+    (dir, child, conf, marker_file, log)
+}
+
+/// One request to the service's socket, so a debug line would be logged.
+fn request(dir: &Path) {
+    use std::io::{Read, Write};
+    let mut s = std::os::unix::net::UnixStream::connect(dir.join("hook.sock")).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    write!(
+        s,
+        "GET /nothing HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut buf = String::new();
+    s.read_to_string(&mut buf).ok();
+}
+
+/// A panic in the hook is a hook failure. It used to unwind through the accept
+/// loop and kill the service.
+fn a_panicking_hook_is_survived_and_changes_nothing() {
+    let (dir, mut child, conf, marker_file, log) = start(&conf_text("one"));
+    let read_log = || std::fs::read_to_string(&log).unwrap_or_default();
+
+    std::fs::write(&conf, conf_text("panic")).unwrap();
+    assert!(
+        until(Duration::from_secs(10), || read_log()
+            .contains("Reload hook failed")),
+        "a panicking hook was not logged as a failure\n{}",
+        read_log()
+    );
+    assert!(child.try_wait().unwrap().is_none(), "the service exited");
+
+    std::fs::write(&conf, conf_text("after")).unwrap();
+    assert!(
+        until(Duration::from_secs(10), || {
+            std::fs::read_to_string(&marker_file).is_ok_and(|s| s == "after")
+        }),
+        "the service stopped reloading after a panic\n{}",
+        read_log()
+    );
+    request(dir.path());
+    child.kill().ok();
+    child.wait().ok();
+}
+
+/// A reload whose hook fails changes nothing and is tried again without a new
+/// write. The new `[log] level` is part of "nothing": it is not applied.
+fn a_failed_hook_leaves_the_previous_state_and_is_retried() {
+    let (dir, mut child, conf, _marker, log) = start(&conf_text("one"));
+    let read_log = || std::fs::read_to_string(&log).unwrap_or_default();
+
+    std::fs::write(
+        &conf,
+        format!("{}[log]\nlevel = \"debug\"\n", conf_text("bad")),
+    )
+    .unwrap();
+    assert!(
+        until(Duration::from_secs(10), || read_log()
+            .contains("Reload hook failed")),
+        "a failing hook was not logged\n{}",
+        read_log()
+    );
+    // Not consumed: with no further write the poll tries again.
+    assert!(
+        until(Duration::from_secs(10), || read_log()
+            .matches("Reload hook failed")
+            .count()
+            >= 2),
+        "the failed reload was not retried\n{}",
+        read_log()
+    );
+    // And the debug level of the failed config was not applied.
+    request(dir.path());
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !read_log().contains("request complete"),
+        "the level of a failed reload was applied\n{}",
+        read_log()
+    );
     child.kill().ok();
     child.wait().ok();
 }
