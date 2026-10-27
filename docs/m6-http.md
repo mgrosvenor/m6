@@ -10,7 +10,7 @@ Reverse proxy, cache, and router. The only process in an m6 deployment that list
 m6-http <site-dir> <system-config>
 ```
 
-Both arguments required. Development uses a minimal local system config (e.g. `configs/system.toml`). Production uses `/etc/m6/my-blog.toml`. The system config contains only `[server]` — bind address and TLS paths that differ per environment. Everything else comes from `site.toml` unchanged.
+Both arguments required. Development uses a minimal local system config (e.g. `configs/system.toml`). Production uses `/etc/m6/my-blog.toml`. The system config holds the node's own state: the `[server]` node keys (bind address and TLS paths), `[node]`, `[auth]` and the `[health]` access keys. Everything else comes from `site.toml` unchanged.
 
 Optional flags:
 
@@ -163,10 +163,10 @@ A refusal never reaches routing or the cache, so a catch-all route can never ans
 
 | Key | Where | Meaning |
 |---|---|---|
-| `[auth] public_key` | `site.toml` or system config, not both | Key that verifies API tokens. Absolute path in the system config |
+| `[auth] public_key` | `site.toml` or system config, not both | Key that verifies API tokens. A relative path in the system config resolves against the site directory |
 | `[health] metrics_require` | either file, system config wins | `role:<name>` or `group:<name>`. A token with the claim is required, from the Authorization header or the session cookie, as route `require` reads it |
 | `[health] metrics_peers` | either file, system config wins | IP addresses in a local range. Any other peer gets 404 |
-| `[health] metrics_token_file` | `site.toml` | Legacy bearer string. Ignored when `metrics_require` is set |
+| `[health] metrics_token_file` | either file, system config wins | Legacy bearer string. A relative path in the system config resolves against the site directory. Ignored when `metrics_require` is set |
 
 *Table 1: the keys that decide who reads `/perf` and `/traffic`. With none of them set, only the legacy file gate applies.*
 

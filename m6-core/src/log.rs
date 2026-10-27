@@ -724,10 +724,9 @@ pub fn init_with_analytics(
     })
 }
 
-/// Read `[log]` from `site_dir/site.toml`. Returns `(level, format)`.
+/// Read `[log]` from the `site.toml` at `site_toml`. Returns `(level, format)`.
 /// Falls back to `("info", "json")` if the file is absent or unparseable.
-pub fn read_site_log_config(site_dir: &Path) -> (String, String) {
-    let site_toml = site_dir.join("site.toml");
+pub fn read_site_log_config(site_toml: &Path) -> (String, String) {
     if let Ok(text) = std::fs::read_to_string(site_toml) {
         if let Ok(val) = text.parse::<toml::Value>() {
             let level = val

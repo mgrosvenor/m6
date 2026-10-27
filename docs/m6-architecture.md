@@ -550,12 +550,20 @@ The install asserts the mask is already set and refuses to start otherwise, beca
 
 ## 8. Why configuration is split the way it is
 
-A site is configured by `site.toml`, one file per backend process, and one system configuration holding what differs between environments.
+Every process reads two files.
+`site.toml` holds the state every process of the site shares.
+The process config holds that process's own state.
+For m6-http the process config is the system configuration, which holds what differs between nodes and environments.
+For a backend it is the backend's own config, and the reserved key `site_toml` says where `site.toml` is.
 The split exists because an operator and a developer own different things.
 
-### 8.1 Why the system configuration holds one section and wins
+### 8.1 Why the system configuration holds node state and wins
 
-**The bind address and the TLS certificate paths are the only values that genuinely differ between environments**, so the system configuration holds that one section and nothing else, which keeps its purpose obvious.
+**The bind address and the TLS certificate paths genuinely differ between environments**, so the system configuration holds them.
+It holds the rest of a node's own state too, which means `[node]`, `[auth]` and the `[health]` access keys.
+Each of those names the node or a credential path, and none of them is shared by every node of the site.
+`site.toml` holds the state every node shares.
+m6-http warns at start when a key sits in the other file.
 It is a required argument rather than an optional one, because one code path is simpler to specify and test than a branch for whether it was supplied.
 
 **It wins on conflict so that a deploy cannot change where a server listens or which certificate it presents.**

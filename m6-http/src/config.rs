@@ -708,11 +708,15 @@ struct RawSystemToml {
 
 /// The `[health]` keys the system config may carry. Anything else fails to
 /// parse, so a misplaced key is loud instead of ignored.
+/// `NODE_HEALTH_KEYS` lists the same keys for `misplaced_keys`; change both together.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawSystemHealth {
     metrics_require: Option<String>,
     metrics_peers: Option<Vec<String>>,
+    /// A credential path, so it belongs to the node. Absolute only, as
+    /// `[auth].public_key` is in this file.
+    metrics_token_file: Option<String>,
 }
 
 /// Parse `[health] metrics_peers` into canonical addresses.
@@ -800,6 +804,18 @@ fn validate_internal_binds(
     Ok(())
 }
 
+/// Whether `site.toml` and the system config are one file (one-file mode, as a
+/// development script runs). A path that cannot be resolved is not one file.
+fn is_one_file(site_toml: &Path, system_config: &Path) -> bool {
+    match (
+        std::fs::canonicalize(site_toml),
+        std::fs::canonicalize(system_config),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// Load and merge configs. Returns Config on success. Returns error with
 /// message suitable for exit-2 on any validation failure.
 pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config> {
@@ -816,14 +832,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         .with_context(|| format!("parsing {}", system_config_path.display()))?;
     // When both arguments name the same file, its [auth] and [health] belong
     // to the site config alone, not to a second declaration.
-    let one_file = match (
-        std::fs::canonicalize(&site_toml_path),
-        std::fs::canonicalize(system_config_path),
-    ) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
-    };
-    if one_file {
+    if is_one_file(&site_toml_path, system_config_path) {
         system_parsed.auth = None;
         system_parsed.health = None;
     }
@@ -926,16 +935,12 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         .ok_or_else(|| anyhow::anyhow!("config error: [site].domain is required"))?;
 
     // Node identity comes from system config, not site.toml (see NodeConfig
-    // doc comment) — falls back to [site].name with a warning so an older
+    // doc comment) — falls back to [site].name, with a warning from main, so an older
     // system config without [node] still starts up instead of hard-failing.
-    let node = system_parsed.node.unwrap_or_else(|| {
-        warn!(
-            file = %system_config_path.display(),
-            "system config: no [node].name set, falling back to [site].name for node identity"
-        );
-        NodeConfig {
-            name: site_name.clone(),
-        }
+    // The fallback is reported by `warn_node_fallback` from main, because
+    // warn! inside load() goes to a subscriber that does not exist yet.
+    let node = system_parsed.node.unwrap_or_else(|| NodeConfig {
+        name: site_name.clone(),
     });
 
     let server = ServerConfig {
@@ -965,8 +970,21 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
     let log = site_parsed.log.unwrap_or_default();
     let analytics = site_parsed.analytics.unwrap_or_default();
     let mut health = site_parsed.health.unwrap_or_default();
+    // The system config wins key by key, as [server] keys do.
+    if let Some(sys) = system_health {
+        health.metrics_require = sys.metrics_require.or(health.metrics_require);
+        health.metrics_peers = sys.metrics_peers.or(health.metrics_peers);
+        if let Some(p) = sys.metrics_token_file {
+            // A relative path resolves against the site directory, as
+            // `tls_cert` does, so the service does not depend on the working
+            // directory it was started from.
+            let p = resolve_path(site_dir, &p).to_string_lossy().into_owned();
+            health.metrics_token_file = Some(p);
+        }
+    }
     // Read the token here so the running server never touches the file on the
-    // request path. Failure is deliberately not fatal: a missing token file
+    // request path. It is read after the merge so that a path from either file
+    // is the one read. Failure is deliberately not fatal: a missing token file
     // means /perf answers 404 (fails closed), and refusing to boot the whole
     // server over a metrics credential would be disproportionate -- the same
     // call made for the inert `cache =` route key. It is reported by
@@ -977,11 +995,6 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
             .ok()
             .map(|t| t.trim().to_string())
             .filter(|t| !t.is_empty());
-    }
-    // The system config wins key by key, as [server] keys do.
-    if let Some(sys) = system_health {
-        health.metrics_require = sys.metrics_require.or(health.metrics_require);
-        health.metrics_peers = sys.metrics_peers.or(health.metrics_peers);
     }
     health.metrics_peer_ips = validate_metrics_peers(health.metrics_peers.as_deref())?;
     let rate_limit = site_parsed.rate_limit.unwrap_or_default();
@@ -1052,14 +1065,8 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
             "config error: [auth] is declared in both site.toml and the system config; declare it in one"
         ),
         (None, Some(a)) => {
-            // A relative path here would resolve against the site directory,
-            // which is surprising for a file that sits beside the system config.
-            if !Path::new(&a.public_key).is_absolute() {
-                anyhow::bail!(
-                    "config error: [auth].public_key in the system config must be an absolute path, got \"{}\"",
-                    a.public_key
-                );
-            }
+            // A relative `public_key` resolves against the site directory below,
+            // as `tls_cert` does.
             Some(a)
         }
         (site, None) => site,
@@ -1211,6 +1218,110 @@ pub fn warn_health_token(health: &HealthConfig) {
                 );
             }
         }
+    }
+}
+
+/// Keys that are this node's own state. They belong in the system config.
+const NODE_SERVER_KEYS: &[&str] = &[
+    "bind",
+    "tls_cert",
+    "tls_key",
+    "h2c_bind",
+    "internal_binds",
+    "redirect_bind",
+    "warm_on_start",
+];
+/// The fields of `RawSystemHealth`; change both together.
+const NODE_HEALTH_KEYS: &[&str] = &["metrics_token_file", "metrics_require", "metrics_peers"];
+/// Whole sections that are node state. They belong in the system config.
+///
+/// `RawSiteToml` has no `[node]` field, so a `[node]` in `site.toml` is
+/// dropped without a word unless it is named here.
+const NODE_SECTIONS: &[&str] = &["auth", "node"];
+/// Keys that describe how the site's routes are served. They belong in
+/// `site.toml`.
+const SITE_SERVER_KEYS: &[&str] = &["backend_timeout_secs", "allowed_methods"];
+
+/// Name every key that sits in the file it does not belong to.
+///
+/// Both files accept most of these keys and the system config wins, so a
+/// misplaced key works and says nothing. Each message names the key and the
+/// file it belongs in. The rule: `site.toml` holds state every node of the site
+/// shares, and the system config holds this node's own state (binds,
+/// certificates, credential paths, per-node security).
+///
+/// Returns nothing when both paths name one file (one-file mode, as a
+/// development script runs) or when either file cannot be read or parsed, since
+/// `load` reports those.
+pub fn misplaced_keys(site_dir: &Path, system_config_path: &Path) -> Vec<String> {
+    let site_toml_path = site_dir.join("site.toml");
+    if is_one_file(&site_toml_path, system_config_path) {
+        return Vec::new();
+    }
+    let read = |p: &Path| -> Option<toml::Value> {
+        std::fs::read_to_string(p).ok()?.parse::<toml::Value>().ok()
+    };
+    let (Some(site), Some(system)) = (read(&site_toml_path), read(system_config_path)) else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    let in_site = |section: &str, key: &str| site.get(section).and_then(|t| t.get(key)).is_some();
+    for key in NODE_SERVER_KEYS {
+        if in_site("server", key) {
+            out.push(node_state_message("server", Some(key), system_config_path));
+        }
+    }
+    for section in NODE_SECTIONS {
+        if site.get(section).is_some() {
+            out.push(node_state_message(section, None, system_config_path));
+        }
+    }
+    for key in NODE_HEALTH_KEYS {
+        if in_site("health", key) {
+            out.push(node_state_message("health", Some(key), system_config_path));
+        }
+    }
+    for key in SITE_SERVER_KEYS {
+        if system.get("server").and_then(|t| t.get(key)).is_some() {
+            out.push(format!(
+                "the system config sets [server].{key}, which is site-wide and belongs in site.toml"
+            ));
+        }
+    }
+    out
+}
+
+fn node_state_message(section: &str, key: Option<&str>, system_config_path: &Path) -> String {
+    let name = match key {
+        Some(k) => format!("[{section}].{k}"),
+        None => format!("[{section}]"),
+    };
+    format!(
+        "site.toml sets {name}, which is this node's own state and belongs in the system config {}",
+        system_config_path.display()
+    )
+}
+
+/// True when the system config names no `[node]`, so the node identity falls
+/// back to `[site].name`.
+pub fn node_falls_back(system_config_path: &Path) -> bool {
+    std::fs::read_to_string(system_config_path)
+        .ok()
+        .and_then(|raw| raw.parse::<toml::Table>().ok())
+        .is_some_and(|t| !t.contains_key("node"))
+}
+
+/// Warn that the node identity fell back to `[site].name`.
+///
+/// Called from `main` after logging is initialised, for the reason given on
+/// [`warn_ignored_route_cache_keys`].
+pub fn warn_node_fallback(system_config_path: &Path) {
+    if node_falls_back(system_config_path) {
+        warn!(
+            file = %system_config_path.display(),
+            "system config: no [node].name set, falling back to [site].name for node identity"
+        );
     }
 }
 
@@ -1984,11 +2095,20 @@ internal_binds = ["203.0.113.7:80"]
     }
 
     #[test]
-    fn a_relative_public_key_in_the_system_config_is_refused() {
+    fn a_relative_public_key_in_the_system_config_resolves_against_the_site_dir() {
         let (_d, r) = load_with("", "\n[auth]\npublic_key = \"auth.pem\"\n");
-        assert_eq!(
-            r.unwrap_err().to_string(),
-            "config error: [auth].public_key in the system config must be an absolute path, got \"auth.pem\""
+        // load_with writes auth.pem into the site directory.
+        let auth = r.unwrap().auth.expect("auth present");
+        assert_eq!(auth.public_key, "auth.pem");
+    }
+
+    #[test]
+    fn a_relative_public_key_in_the_system_config_must_exist_in_the_site_dir() {
+        let (_d, r) = load_with("", "\n[auth]\npublic_key = \"missing.pem\"\n");
+        let e = r.unwrap_err().to_string();
+        assert!(
+            e.contains("[auth].public_key file not found") && e.ends_with("/missing.pem"),
+            "{e}"
         );
     }
 
@@ -2130,5 +2250,207 @@ internal_binds = ["203.0.113.7:80"]
         assert_eq!(cfg.auth.expect("auth").public_key, "auth.pem");
         assert_eq!(cfg.health.perf_path, "/p");
         assert_eq!(cfg.health.metrics_peer_ips.map(|p| p.len()), Some(1));
+    }
+
+    // --- misplaced_keys and metrics_token_file placement ---
+
+    #[test]
+    fn metrics_token_file_in_the_system_config_wins() {
+        let dir = make_test_dir();
+        setup_minimal(dir.path());
+        let site_token = dir.path().join("site-token");
+        let sys_token = dir.path().join("sys-token");
+        std::fs::write(&site_token, "from-site\n").unwrap();
+        std::fs::write(&sys_token, "from-system\n").unwrap();
+        let mut site = minimal_site_toml();
+        site.push_str(&format!(
+            "\n[health]\nmetrics_token_file = \"{}\"\n",
+            site_token.display()
+        ));
+        write_file(dir.path(), "site.toml", &site);
+        let mut sys = minimal_system_toml();
+        sys.push_str(&format!(
+            "\n[health]\nmetrics_token_file = \"{}\"\n",
+            sys_token.display()
+        ));
+        write_file(dir.path(), "system.toml", &sys);
+        let h = load(dir.path(), &dir.path().join("system.toml"))
+            .unwrap()
+            .health;
+        assert_eq!(h.metrics_token_file.as_deref(), sys_token.to_str());
+        assert_eq!(h.metrics_token.as_deref(), Some("from-system"));
+
+        // Alone in the system config it is read too.
+        write_file(dir.path(), "site.toml", &minimal_site_toml());
+        let h = load(dir.path(), &dir.path().join("system.toml"))
+            .unwrap()
+            .health;
+        assert_eq!(h.metrics_token.as_deref(), Some("from-system"));
+    }
+
+    #[test]
+    fn a_relative_metrics_token_file_in_the_system_config_resolves_against_the_site_dir() {
+        let dir = make_test_dir();
+        setup_minimal(dir.path());
+        std::fs::write(dir.path().join("token"), "from-site-dir\n").unwrap();
+        write_file(dir.path(), "site.toml", &minimal_site_toml());
+        let mut sys = minimal_system_toml();
+        sys.push_str("\n[health]\nmetrics_token_file = \"token\"\n");
+        write_file(dir.path(), "system.toml", &sys);
+        let h = load(dir.path(), &dir.path().join("system.toml"))
+            .unwrap()
+            .health;
+        assert_eq!(
+            h.metrics_token_file.as_deref(),
+            dir.path().join("token").to_str()
+        );
+        assert_eq!(h.metrics_token.as_deref(), Some("from-site-dir"));
+    }
+
+    /// Write `site` and `system` into a fresh directory and name the misplaced keys.
+    fn misplaced(site: &str, system: &str) -> Vec<String> {
+        let dir = make_test_dir();
+        write_file(dir.path(), "site.toml", site);
+        write_file(dir.path(), "system.toml", system);
+        misplaced_keys(dir.path(), &dir.path().join("system.toml"))
+    }
+
+    #[test]
+    fn misplaced_keys_names_a_bind_in_site_toml() {
+        let m = misplaced(
+            "[server]\nbind = \"0.0.0.0:443\"\n\n[auth]\npublic_key = \"k\"\n\n[health]\nmetrics_peers = [\"10.0.0.1\"]\n",
+            "[server]\nbind = \"0.0.0.0:443\"\n",
+        );
+        assert_eq!(m.len(), 3, "{m:?}");
+        assert!(m[0].starts_with("site.toml sets [server].bind, which is this node's own state"));
+        assert!(m[0].contains("belongs in the system config "), "{}", m[0]);
+        assert!(m.iter().any(|x| x.contains("sets [auth],")));
+        assert!(m.iter().any(|x| x.contains("sets [health].metrics_peers,")));
+    }
+
+    #[test]
+    fn misplaced_keys_names_allowed_methods_in_the_system_config() {
+        let m = misplaced(
+            "",
+            "[server]\nallowed_methods = [\"GET\"]\nbackend_timeout_secs = 5\nbind = \"0.0.0.0:443\"\n",
+        );
+        assert_eq!(m.len(), 2, "{m:?}");
+        assert!(m
+            .iter()
+            .all(|x| x.contains("is site-wide and belongs in site.toml")));
+        assert!(m.iter().any(|x| x.contains("[server].allowed_methods")));
+        assert!(m
+            .iter()
+            .any(|x| x.contains("[server].backend_timeout_secs")));
+    }
+
+    #[test]
+    fn misplaced_keys_is_silent_in_one_file_mode() {
+        let dir = make_test_dir();
+        write_file(
+            dir.path(),
+            "site.toml",
+            "[server]\nbind = \"0.0.0.0:443\"\nallowed_methods = [\"GET\"]\n\n[auth]\npublic_key = \"k\"\n",
+        );
+        let same = dir.path().join("site.toml");
+        assert!(misplaced_keys(dir.path(), &same).is_empty());
+    }
+
+    #[test]
+    fn misplaced_keys_is_silent_for_a_clean_pair() {
+        let m = misplaced(
+            "[server]\nallowed_methods = [\"GET\"]\nbackend_timeout_secs = 5\n\n[health]\nperf_path = \"/p\"\n",
+            "[server]\nbind = \"0.0.0.0:443\"\n\n[auth]\npublic_key = \"/k\"\n\n[health]\nmetrics_token_file = \"/t\"\n",
+        );
+        assert!(m.is_empty(), "{m:?}");
+    }
+
+    #[test]
+    fn misplaced_keys_names_a_node_section_in_site_toml() {
+        let m = misplaced("[node]\nname = \"edge-a\"\n", "[node]\nname = \"edge-a\"\n");
+        assert_eq!(m.len(), 1, "{m:?}");
+        assert!(m[0].starts_with("site.toml sets [node],"), "{}", m[0]);
+    }
+
+    #[test]
+    fn the_node_fallback_is_detected_for_the_caller_to_warn_about() {
+        let dir = make_test_dir();
+        let with = dir.path().join("with.toml");
+        let without = dir.path().join("without.toml");
+        write_file(dir.path(), "with.toml", "[node]\nname = \"edge-a\"\n");
+        write_file(dir.path(), "without.toml", "[server]\nbind = \"x\"\n");
+        assert!(!node_falls_back(&with));
+        assert!(node_falls_back(&without));
+    }
+
+    /// Every key `misplaced_keys` knows, as (section, key, belongs in system config).
+    /// A whole-section entry has no key.
+    fn every_placed_key() -> Vec<(&'static str, Option<&'static str>, bool)> {
+        let mut all = Vec::new();
+        all.extend(NODE_SERVER_KEYS.iter().map(|k| ("server", Some(*k), true)));
+        all.extend(NODE_HEALTH_KEYS.iter().map(|k| ("health", Some(*k), true)));
+        all.extend(SITE_SERVER_KEYS.iter().map(|k| ("server", Some(*k), false)));
+        all.extend(NODE_SECTIONS.iter().map(|s| (*s, None, true)));
+        all
+    }
+
+    #[test]
+    fn every_misplaced_key_warns_in_the_wrong_file_and_not_in_the_right_one() {
+        let all = every_placed_key();
+        // Every field of `RawServerSection` and `RawSystemHealth` is placed
+        // in one list or another. Dropping a key from a list fails here.
+        let mut server: Vec<&str> = NODE_SERVER_KEYS
+            .iter()
+            .chain(SITE_SERVER_KEYS)
+            .copied()
+            .collect();
+        server.sort_unstable();
+        assert_eq!(
+            server,
+            [
+                "allowed_methods",
+                "backend_timeout_secs",
+                "bind",
+                "h2c_bind",
+                "internal_binds",
+                "redirect_bind",
+                "tls_cert",
+                "tls_key",
+                "warm_on_start",
+            ]
+        );
+        let mut health = NODE_HEALTH_KEYS.to_vec();
+        health.sort_unstable();
+        assert_eq!(
+            health,
+            ["metrics_peers", "metrics_require", "metrics_token_file"]
+        );
+        assert_eq!(NODE_SECTIONS, ["auth", "node"]);
+        assert_eq!(all.len(), 9 + 3 + 2);
+        for (section, key, belongs_in_system) in all {
+            let body = match key {
+                Some(k) => format!("[{section}]\n{k} = 1\n"),
+                None => format!("[{section}]\nname = 1\n"),
+            };
+            let name = match key {
+                Some(k) => format!("[{section}].{k}"),
+                None => format!("[{section}]"),
+            };
+            let (wrong_site, wrong_system, right_site, right_system) = if belongs_in_system {
+                (body.as_str(), "", "", body.as_str())
+            } else {
+                ("", body.as_str(), body.as_str(), "")
+            };
+            let wrong = misplaced(wrong_site, wrong_system);
+            assert_eq!(wrong.len(), 1, "{name} in the wrong file: {wrong:?}");
+            assert!(
+                wrong[0].contains(&format!("sets {name},"))
+                    || wrong[0].contains(&format!("sets {name} ")),
+                "{name}: {}",
+                wrong[0]
+            );
+            let right = misplaced(right_site, right_system);
+            assert!(right.is_empty(), "{name} in the right file: {right:?}");
+        }
     }
 }

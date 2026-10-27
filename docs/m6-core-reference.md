@@ -232,8 +232,15 @@ pub struct RendererConfig {
     pub compression:   HashMap<String, CompressionLevel>,  // per-mime brotli/gzip
     pub minification:  MinificationConfig,   // per-mime enabled, inline_js
     pub log:           LogConfig,            // level, format
+    pub site_toml:     Option<PathBuf>,      // the reserved key site_toml
 }
 ```
+
+`site_toml` names the `site.toml` this service reads.
+`RendererConfig::resolve_site_toml(site_dir)` returns the path: `<site_dir>/site.toml` when the key is absent, the value as given when it is absolute, and `site_dir` joined with it when it is relative.
+A non-string or empty value fails `config::load`.
+`AppContext::site_toml` carries the resolved path to the global initialiser, set whether or not the file exists.
+A service that names a `site_toml` that does not exist, cannot be read or is not valid TOML exits 2 at start.
 
 A `RouteConfig` carries `path`, `template`, `params`, `status`, `cache`,
 `methods` and `headers`. `MinificationConfig::is_enabled(mime)` answers the
@@ -254,9 +261,8 @@ Neither key silently falls back. A value that cannot be understood, a negative
 timeout or a mode above `0777`, fails `config::load` and the service does not
 start. A service that will not start says so on the first line of its journal;
 a service running at a socket mode nobody chose looks exactly like one running
-at the right mode. Note that `--dump-config` is m6-http only, so an App
-service's config is **not** validated at deploy time by
-`deploy-platform.sh`.
+at the right mode. An App service answers `--dump-config` too, so a deploy can
+validate its config before starting it. It exits 2 when the config is refused.
 
 ### `server`
 
@@ -587,7 +593,7 @@ must not be append-only.
 
 `init(format, level)` and `init_with_analytics(format, level, analytics_path)`
 return a `LogHandle`, whose `reload(format, level)` re-reads on config change.
-`read_site_log_config(site_dir)` and `parse_level(s)` are the config side.
+`read_site_log_config(site_toml)` and `parse_level(s)` are the config side. `read_site_log_config` takes the path of the file, which `RendererConfig::resolve_site_toml` gives.
 
 `pulse() -> &'static LogPulse` is the liveness signal: `events()` counts, and
 `seconds_since_last()` answers "has anything been logged recently", which is how

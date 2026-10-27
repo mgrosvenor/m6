@@ -1134,10 +1134,12 @@ fn run_app_global<G: Send + Sync + 'static>(
     });
 
     // Call init_global with the user config.
+    let site_toml = site_toml_or_exit(&config, &site_dir);
     let g = init_global(&AppContext {
         config: &config.user_config,
         site_dir: &site_dir,
         config_path: &config_path,
+        site_toml: &site_toml,
     })
     .unwrap_or_else(|e| {
         eprintln!("init_global failed: {e:#}");
@@ -1313,10 +1315,12 @@ fn run_app_state<G: Send + Sync + 'static, T: Any + Send + 'static>(
         std::process::exit(2);
     });
 
+    let site_toml = site_toml_or_exit(&config, &site_dir);
     let g = init_global(&AppContext {
         config: &config.user_config,
         site_dir: &site_dir,
         config_path: &config_path,
+        site_toml: &site_toml,
     })
     .unwrap_or_else(|e| {
         eprintln!("init_global failed: {e:#}");
@@ -1538,6 +1542,65 @@ pub fn is_shutdown() -> bool {
 // App builder — no state
 // ---------------------------------------------------------------------------
 
+/// Resolve `site.toml` for `config` and refuse a path that was named but is
+/// not there. Exit 2, the configuration error code, before anything binds.
+///
+/// No `site_toml` key means `<site_dir>/site.toml`, which may legitimately be
+/// absent (a service under test). A key that names a file is a statement that
+/// the file exists, so a missing one is a mistake the operator wants to hear
+/// about on the first line.
+fn site_toml_or_exit(
+    config: &crate::config::RendererConfig,
+    site_dir: &std::path::Path,
+) -> PathBuf {
+    match check_site_toml(config, site_dir) {
+        Ok(path) => path,
+        Err(msg) => {
+            eprintln!("Config error: {msg}");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// The checking half of [`site_toml_or_exit`].
+///
+/// A named `site_toml` is read and parsed once here. A directory, a file that
+/// cannot be read and a file that is not valid TOML are all refused, because
+/// the readers of `site.toml` fall back to defaults on any of them and would
+/// hide a disagreement the operator wants to hear about.
+fn check_site_toml(
+    config: &crate::config::RendererConfig,
+    site_dir: &std::path::Path,
+) -> std::result::Result<PathBuf, String> {
+    let site_toml = config.resolve_site_toml(site_dir);
+    if config.site_toml.is_none() {
+        return Ok(site_toml);
+    }
+    let text = match std::fs::read_to_string(&site_toml) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!(
+                "site_toml = {} does not exist",
+                site_toml.display()
+            ));
+        }
+        Err(e) => {
+            return Err(format!(
+                "site_toml = {} cannot be read: {e}",
+                site_toml.display()
+            ));
+        }
+    };
+    if let Err(e) = text.parse::<toml::Table>() {
+        return Err(format!(
+            "site_toml = {} is not valid TOML: {}",
+            site_toml.display(),
+            e.message()
+        ));
+    }
+    Ok(site_toml)
+}
+
 /// What a service was started with, for building its shared state.
 ///
 /// A struct rather than a widening argument list. The initialiser first took
@@ -1554,6 +1617,10 @@ pub struct AppContext<'a> {
     pub site_dir: &'a std::path::Path,
     /// The config file this service was started with.
     pub config_path: &'a std::path::Path,
+    /// The `site.toml` this service reads: the path named by the `site_toml`
+    /// key, or `<site_dir>/site.toml` when the key is absent. Always set,
+    /// whether or not the file exists.
+    pub site_toml: &'a std::path::Path,
 }
 
 /// Handler function entries: (pattern, method, handler).
@@ -2308,8 +2375,23 @@ fn dump_config(
         }
     };
 
+    // The same refusal the start makes, so a deploy that validates with
+    // --dump-config learns what the start would say.
+    if let Err(msg) = check_site_toml(&config, site_dir) {
+        eprintln!("Config error: {msg}");
+        return 2;
+    }
+
     println!("site_dir    {}", site_dir.display());
     println!("config      {}", config_path.display());
+    {
+        let site_toml = config.resolve_site_toml(site_dir);
+        if site_toml.exists() {
+            println!("site.toml   {}", site_toml.display());
+        } else {
+            println!("site.toml   {} (absent)", site_toml.display());
+        }
+    }
     println!(
         "socket      {}",
         crate::socket_path_from_config(config_path).display()
@@ -2426,6 +2508,8 @@ fn run_app_with_shutdown(
         std::process::exit(2);
     });
 
+    let site_toml = site_toml_or_exit(&config, &site_dir);
+
     // Does site.toml tell the edge the truth about whether we compress?
     //
     // Before logging is up, because it exits 2 and that is a configuration error
@@ -2450,7 +2534,7 @@ fn run_app_with_shutdown(
             .values()
             .any(|c| c.brotli > 0 || c.gzip > 0);
         if let Err(msg) =
-            crate::compress::check_declared_support(&site_dir, backend_name, compresses)
+            crate::compress::check_declared_support(&site_toml, backend_name, compresses)
         {
             eprintln!("Config error: {msg}");
             std::process::exit(2);
@@ -2458,7 +2542,7 @@ fn run_app_with_shutdown(
     }
 
     // Init logging: site.toml base → renderer config [log] → CLI --log-level.
-    let (site_level, site_format) = crate::log::read_site_log_config(&site_dir);
+    let (site_level, site_format) = crate::log::read_site_log_config(&site_toml);
     let format = config
         .log
         .format
@@ -2594,7 +2678,7 @@ fn run_app_with_shutdown(
     // When raw_fd() returns None (fallback platform or init failure): fall
     // back to mtime polling at ~1-second intervals via the poll(2) timeout
     // countdown.
-    let site_toml_path = site_dir.join("site.toml");
+    let site_toml_path = site_toml.clone();
     let mut watcher = crate::ConfigWatcher::new(&[&config_path, &site_toml_path]).ok();
 
     // Mtime fallback state — only meaningful when watcher.raw_fd() is None.
@@ -2607,6 +2691,12 @@ fn run_app_with_shutdown(
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("")
+        .to_string();
+
+    let site_toml_filename = site_toml
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("site.toml")
         .to_string();
 
     use std::os::unix::io::AsRawFd;
@@ -2658,7 +2748,7 @@ fn run_app_with_shutdown(
         if inotify_fired {
             should_reload = watcher
                 .as_mut()
-                .is_some_and(|w| w.read_events(&[&config_filename, "site.toml"]));
+                .is_some_and(|w| w.read_events(&[&config_filename, &site_toml_filename]));
         }
 
         // ── Hot reload ───────────────────────────────────────────────────
@@ -3129,6 +3219,83 @@ fn handle_request<W: std::io::Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A renderer config that names `site_toml`, or does not when `None`.
+    fn config_naming(
+        dir: &std::path::Path,
+        site_toml: Option<&str>,
+    ) -> crate::config::RendererConfig {
+        let cfg = dir.join("app.toml");
+        let body = match site_toml {
+            Some(p) => format!("site_toml = \"{p}\"\n"),
+            None => "site_name = \"x\"\n".to_string(),
+        };
+        std::fs::write(&cfg, body).unwrap();
+        crate::config::load(&cfg, dir).unwrap()
+    }
+
+    #[test]
+    fn named_site_toml_that_is_valid_passes() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("s.toml"), "[server]\ncompresses = true\n").unwrap();
+        let cfg = config_naming(d.path(), Some("s.toml"));
+        assert_eq!(
+            check_site_toml(&cfg, d.path()).unwrap(),
+            d.path().join("s.toml")
+        );
+    }
+
+    #[test]
+    fn named_site_toml_missing_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = config_naming(d.path(), Some("absent.toml"));
+        let e = check_site_toml(&cfg, d.path()).unwrap_err();
+        assert!(e.contains("does not exist"), "{e}");
+    }
+
+    #[test]
+    fn named_site_toml_that_is_a_directory_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir(d.path().join("s.toml")).unwrap();
+        let cfg = config_naming(d.path(), Some("s.toml"));
+        let e = check_site_toml(&cfg, d.path()).unwrap_err();
+        assert!(e.contains("cannot be read"), "{e}");
+    }
+
+    #[test]
+    fn named_site_toml_that_is_unreadable_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        // root reads any file, so the test would prove nothing.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("s.toml");
+        std::fs::write(&f, "[server]\n").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let cfg = config_naming(d.path(), Some("s.toml"));
+        let e = check_site_toml(&cfg, d.path()).unwrap_err();
+        assert!(e.contains("cannot be read"), "{e}");
+    }
+
+    #[test]
+    fn named_site_toml_that_is_not_toml_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("s.toml"), "[server\ncompresses = \n").unwrap();
+        let cfg = config_naming(d.path(), Some("s.toml"));
+        let e = check_site_toml(&cfg, d.path()).unwrap_err();
+        assert!(e.contains("not valid TOML"), "{e}");
+    }
+
+    #[test]
+    fn unnamed_site_toml_keeps_its_tolerance() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = config_naming(d.path(), None);
+        // Absent, a directory and invalid TOML at the default path all pass.
+        assert!(check_site_toml(&cfg, d.path()).is_ok());
+        std::fs::write(d.path().join("site.toml"), "[server\n").unwrap();
+        assert!(check_site_toml(&cfg, d.path()).is_ok());
+    }
 
     #[test]
     fn test_compile_pattern() {
