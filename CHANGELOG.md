@@ -12,6 +12,53 @@ releases only; work happens on `develop`. See `CONTRIBUTING.md`.
 
 ---
 
+## Unreleased
+
+Changes merged to `develop` since the last release. The section is renamed to
+the version when the release is cut.
+
+### Changed
+
+**Each key goes in the file it belongs to, and an app can say where `site.toml` is (#242).**
+Every m6 process reads two files.
+`site.toml` holds the state every process of the site shares.
+The process config holds that process's own state, which means node identity, binds, certificates, credential paths and per-node security.
+Three things stopped that rule from holding.
+
+An `App` looked for `site.toml` only at `<site_dir>/site.toml`.
+`docs/m6-site-layout.md` gives each app its own root under `apps/`, with `site.toml` at the top of the tree.
+In that layout an app read no `site.toml`.
+The `[[backend]] compresses` agreement passed without checking, `[log]` fell back to its defaults, and the watch was on a directory that never held the file.
+A new reserved config key, `site_toml`, names the file.
+A relative value resolves against `site_dir`, an absolute value is used as given, and no key means `<site_dir>/site.toml` as before.
+A named file that does not exist is exit 2 at start.
+`--dump-config` prints the resolved path.
+`AppContext` gains a `site_toml` field, and m6-auth-server reads its issuer fallback from that file.
+
+m6-http's system config refused `[health] metrics_token_file`, a credential path, so the path could only be written in `site.toml`.
+The system config now accepts it as an absolute path, and it wins over `site.toml` like the other `[health]` keys.
+The token is read after the two files are merged.
+
+m6-http accepted node keys in `site.toml` and site-wide keys in the system config without a word, because the system config wins and the result worked.
+It now logs a warning at start for each key in the wrong file.
+The node keys are `[server]` `bind`, `tls_cert`, `tls_key`, `h2c_bind`, `internal_binds`, `redirect_bind` and `warm_on_start`, `[auth]`, and `[health]` `metrics_token_file`, `metrics_require` and `metrics_peers`.
+They belong in the system config.
+The site-wide keys are `[server]` `backend_timeout_secs` and `allowed_methods`.
+They belong in `site.toml`.
+The warning is silent when both arguments name one file.
+The docs list which file each key belongs in.
+
+**Two signatures changed.**
+`m6_core::compress::check_declared_support` and `m6_core::log::read_site_log_config` take the path of `site.toml` where they took the site directory.
+`AuthConfig::load` in m6-auth-server takes it as a third argument.
+
+Migration: none is required.
+A service that does not set `site_toml` behaves as before, and a misplaced key keeps working and is named in a warning.
+
+**Verified** by unit tests for the key, its resolution and its refusals, by m6-file starting on a per-app root and exiting 2 on the compression disagreement it could only see through `site_toml`, by m6-auth-server taking its issuer from the named file, and by m6-http tests for the token file and for each warning.
+
+---
+
 ## 1.14.0 — 2026-10-27
 
 **Log reopen on SIGUSR1, declared internal listeners, token-gated metrics, a monitor history and tunnel health, new m6-core blocks including an opt-in SQLite feature, a fleet certificate comparison, the user agents of notable clients, and a TLS reload that now replaces the certificate every listener serves, which fixes the limitation 1.13.0 recorded.**

@@ -155,7 +155,7 @@ Those paths are decided before the socket exists, which is why §4 comes next: t
 
 ## 4. The configuration
 
-**Core reserves twelve top-level keys and hands the service everything else.**
+**Core reserves thirteen top-level keys and hands the service everything else.**
 This section gives the reserved keys and their defaults, the name that ties the configuration file to the socket and to `site.toml`, and what a reload changes.
 
 Table 4 is the reserved set, and a key in it never reaches a template.
@@ -172,10 +172,11 @@ Table 4 is the reserved set, and a key in it never reaches a template.
 | `global_params` | core | JSON files merged into every request dictionary |
 | `secrets_file` | core | a second TOML file merged with this one, so a secret stays out of the tracked configuration. One key, one owner: a key set in both files is refused with an error naming every clash |
 | `flash_secret` | core, feature `flash` | the HMAC key for flash cookies. Absent with the feature on is exit 2 |
+| `site_toml` | core | the path of `site.toml`. Absolute as given, relative to `site_dir`, default `<site_dir>/site.toml`. A named file that does not exist is exit 2 |
 | `[errors]` | `m6-http`, in `site.toml` | reserved, so it does not reach the request dictionary. The section itself belongs to `site.toml` |
 | `[multipart]` | nothing | reserved and read by no code in this repository. `m6-render-lib.md` documents `max_size_mb` under it and nothing enforces it |
 
-**Table 4: the twelve reserved keys, who reads each, and its default.**
+**Table 4: the thirteen reserved keys, who reads each, and its default.**
 Take from it that every value core reads has a working default, and that `[server]` refuses a value it cannot parse, because a service that started with a deadline nobody chose looks healthy.
 
 Every other top-level key lands in `RendererConfig::user_config` and is readable from the request dictionary.
@@ -188,6 +189,11 @@ The format has the first two.
 
 **The configuration file's stem is the service's name, its socket's name, and its name in `site.toml`.**
 Nothing derives that from the binary or from a configuration key, so a renamed configuration file moves the socket and the edge stops finding it.
+
+The service finds `site.toml` through the reserved key `site_toml`.
+Without the key it reads `<site_dir>/site.toml`.
+An app that has its own root under `apps/` sets `site_toml = "../../site.toml"`, because the file sits at the top of the tree and not in the app root.
+Without it the app reads no `site.toml`, so the compression agreement below passes unchecked and `[log]` falls back to its defaults.
 
 Figure 1 is the chain.
 
@@ -331,7 +337,7 @@ An initialiser returns `Result`, so a service that cannot build its state exits 
 `on_destroy` and `on_destroy_thread` register the reverse, for state that owns something worth closing.
 
 **Only the global initialiser receives an `AppContext`.**
-`AppContext` carries the parsed configuration, the site directory and the configuration file's path, because a configuration that names files has to resolve them against the same roots the rest of the service uses.
+`AppContext` carries the parsed configuration, the site directory, the configuration file's path and the resolved path of `site.toml`, because a configuration that names files has to resolve them against the same roots the rest of the service uses.
 A per-thread initialiser receives the configuration map and the global value, so per-thread state whose configuration names a file has no site directory to resolve it against.
 
 `m6-auth-server` is the worked example: 122 lines, one global holding the database, the signing keys, the token lifetimes and a rate limiter, and four routes on literal paths.

@@ -149,6 +149,12 @@ backend = "remote-api"
 
 Server-specific values (`[server]` bind address, TLS cert paths) live in a system config — a required second argument to m6-http. Renderer secrets (SMTP credentials etc.) are referenced via a `secrets_file` key in the renderer config.
 
+Every m6 process reads two config files.
+`site.toml` holds the state every process of the site shares.
+The process config holds that process's own state, which means node identity, binds, certificates, credential paths and per-node security.
+For m6-http the process config is the system config.
+For an app it is the app's own config.
+
 ### m6-http system config
 
 ```
@@ -165,13 +171,14 @@ m6-http "$SITE" "$SITE/configs/m6-http-dev.toml"
 ExecStart=/usr/local/bin/m6-http /var/www/my-blog /etc/m6/my-blog.toml
 ```
 
-The system config may contain `[server]`, `[node]`, `[auth]` and two `[health]` keys, `metrics_require` and `metrics_peers`.
+The system config may contain `[server]`, `[node]`, `[auth]` and three `[health]` keys, `metrics_require`, `metrics_peers` and `metrics_token_file`.
 Everything else (routes, backends, site identity, log level) comes from `site.toml` unchanged.
 
 **Merge semantics:** system config is loaded after `site.toml`.
-Its `[server]` keys win on conflict, and so do its two `[health]` keys.
+Its `[server]` keys win on conflict, and so do its three `[health]` keys.
 `[auth]` must be declared in one file only, and declaring it in both is a startup error.
 A system-config `[auth] public_key` must be an absolute path, because a relative path would resolve against the site directory.
+A system-config `[health] metrics_token_file` must be an absolute path for the same reason.
 Any other key in the system config is ignored with a warning, and any other `[health]` key there fails to parse.
 Validation runs after merge.
 When both arguments name the same file, as a development script may do, its `[auth]` and `[health]` belong to the site config alone.
@@ -257,14 +264,46 @@ to       = "owner@example.com"
 
 ### What belongs where
 
-| Setting | Location | Reason |
+The rule: a key that every node of the site shares belongs in `site.toml`.
+A key that describes one node belongs in the process config.
+m6-http accepts most of these keys in either file, and the system config wins.
+It cannot tell a deliberate override from a mistake, so at start it logs a warning for each key that sits in the file it does not belong to.
+The warning names the key and the file it belongs in.
+The warning is silent when both arguments name one file.
+
+| Setting | File it belongs in | Reason |
 |---|---|---|
-| `[server]` bind, tls_cert, tls_key | System config `/etc/m6/*.toml` | Differs per environment |
-| `[auth]` and `[health]` `metrics_require` / `metrics_peers` | System config when they differ per node, otherwise `site.toml` | Which peers may read a node's metrics is a property of the node |
+| `[site]` name, domain, redirect_www, describedby | `site.toml` | The identity every node shares |
+| `[node]` name | System config | Names this node |
+| `[server]` bind, tls_cert, tls_key, h2c_bind, internal_binds, redirect_bind, warm_on_start | System config | Differs per node |
+| `[server]` backend_timeout_secs, allowed_methods | `site.toml` | How the site's routes are served, the same on every node |
+| `[auth]` | System config | A verify key path is a credential path |
+| `[health]` metrics_require, metrics_peers | System config | Which peers may read a node's metrics is a property of the node |
+| `[health]` metrics_token_file | System config | A credential path. Absolute only |
+| `[health]` enabled, path, perf_path, traffic_path, traffic_cache_s | `site.toml` | The endpoint layout every node and the monitor share |
+| `[log]`, `[analytics]`, `[rate_limit]`, `[errors]`, `[security]` | `site.toml` | Identical on every node |
+| `[[backend]]`, `[[route]]`, `[[route_group]]` | `site.toml` | Identical in dev and production |
+| App `[thread_pool]`, `[params_cache]`, `[server]`, `[compression]`, `[minification]`, `[[route]]`, `global_params` | App config | The app's own state |
+| App `[log]` | Both | `site.toml` sets the site default and the app config overrides it |
+| App `site_toml` | App config | Says where `site.toml` is |
 | SMTP credentials | `secrets_file` → `/etc/m6/*.toml` | Secret, must not be in repo |
-| All routes and backends | `site.toml` | Identical in dev and production |
-| Log level and format | `site.toml` | Not secret, fine in repo |
-| Templates, params | Renderer configs in `configs/` | Identical in dev and production |
+
+A secrets file is part of its process config.
+
+### Where an app finds `site.toml`
+
+An app reads `<site_dir>/site.toml` unless its config sets the reserved key `site_toml`.
+A relative value resolves against `site_dir`.
+An absolute value is used as given.
+An app that has its own root under `apps/` sets it to reach the `site.toml` at the top of the tree.
+
+```toml
+# apps/file/m6-file.conf
+site_toml = "../../site.toml"
+```
+
+A named file that does not exist stops the app at start with exit 2.
+`--dump-config` prints the resolved path on a `site.toml` line.
 
 ### `site.toml` is clean
 
@@ -376,7 +415,7 @@ The monitoring endpoints, answered inside m6-http ahead of routing, the cache an
 | `perf_path` | string | `"/perf"` | Counters, latency percentiles and host facts |
 | `traffic_path` | string | `"/traffic"` | Summary of the last hour of the analytics log |
 | `traffic_cache_s` | integer | `60` | Seconds a `/traffic` summary is reused |
-| `metrics_token_file` | string | none | The legacy gate. Path to a file holding a bearer string. Ignored when `metrics_require` is set |
+| `metrics_token_file` | string | none | The legacy gate. Path to a file holding a bearer string. May also sit in the system config, as an absolute path, where it wins. Ignored when `metrics_require` is set |
 | `metrics_require` | string | none | `"role:<name>"` or `"group:<name>"`. A token with this claim opens `/perf` and `/traffic`. It comes from the Authorization header or the session cookie, as route `require` reads it |
 | `metrics_peers` | list of strings | none | IP addresses allowed to read `/perf` and `/traffic`. Anyone else gets 404 |
 
