@@ -349,6 +349,11 @@ A redirect-mode config ignores the key.
 An internal listener accepts a connection only from an address in `internal_peers`, and closes any other before reading a request.
 So forwarded addresses are believed only from the peers the config names, whether or not a firewall is in place.
 Each entry is an IP address in a local range, without a port.
+The internal h2c listener is for relaying nodes.
+A monitor polls a node over its TLS listener.
+So `internal_peers` both admits a peer and trusts the client addresses that peer forwards.
+An address that is listed must be one the peer connects from, and the list needs at least one address of the bind's IP family.
+The log names the first refused connection from each address, then at most one line per address every 60 seconds with the count since the last line.
 The list is read at startup, and the system config's list replaces the one in `site.toml` as a whole.
 
 ```toml
@@ -581,11 +586,12 @@ Exit 2 on:
 - `internal_binds` entry that equals `bind` (only the h2c listener can be internal)
 - `internal_binds` entry that is not equal to `h2c_bind`
 - `h2c_bind` set and `internal_binds` absent (`internal_binds = []` is the explicit answer for a public listener)
-- `internal_binds` set and `internal_peers` absent
+- `internal_binds` not empty and `internal_peers` absent
 - `internal_peers` empty
 - `internal_peers` entry that is not an IP address (names are never resolved, ranges and ports are refused)
 - `internal_peers` entry that is not in a local range
 - `internal_peers` set with no internal listener
+- `internal_peers` with no address of the internal bind's IP family (an IPv4-mapped bind is IPv4)
 
 Warnings (not fatal):
 

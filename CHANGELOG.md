@@ -22,8 +22,11 @@ the version when the release is cut.
 **An internal listener accepts only the peers its config names (#246).**
 An h2c listener named in `[server] internal_binds` believed the `X-Forwarded-For` of any peer that reached it, so a firewall was the only thing between a forged client address and the rate limiter.
 `[server] internal_peers` now lists the IP addresses it accepts, each in a local range.
-A connection from any other address is closed at accept and logged with the peer's address.
-The check runs once per connection and requests are not touched.
+A connection from any other address is closed at accept.
+The log names the first refused connection from each address, then at most one line per address every 60 seconds with the number of refusals since the last line.
+One call to accept handles at most 64 connections, so a peer that connects in a loop cannot hold the event loop.
+The check runs once per connection, and every request on an admitted connection is served as before.
+A peer list with no address of the internal bind's IP family is refused at load.
 **Migration.**
 A config with a non-empty `internal_binds` must add `internal_peers`, or m6-http exits 2 and says what to add.
 Earlier releases ignore the key, so add it before upgrading.
@@ -56,7 +59,7 @@ The token is read after the two files are merged.
 
 m6-http accepted node keys in `site.toml` and site-wide keys in the system config without a word, because the system config wins and the result worked.
 It now logs a warning at start for each key in the wrong file.
-The node keys are `[server]` `bind`, `tls_cert`, `tls_key`, `h2c_bind`, `internal_binds`, `redirect_bind` and `warm_on_start`, `[auth]`, `[node]`, and `[health]` `metrics_token_file`, `metrics_require` and `metrics_peers`.
+The node keys are `[server]` `bind`, `tls_cert`, `tls_key`, `h2c_bind`, `internal_binds`, `internal_peers`, `redirect_bind` and `warm_on_start`, `[auth]`, `[node]`, and `[health]` `metrics_token_file`, `metrics_require` and `metrics_peers`.
 They belong in the system config.
 The site-wide keys are `[server]` `backend_timeout_secs` and `allowed_methods`.
 They belong in `site.toml`.
