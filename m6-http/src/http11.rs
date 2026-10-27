@@ -381,29 +381,37 @@ struct H2cPlainConn {
 pub struct H2cListener {
     listener: TcpListener,
     conns: Vec<H2cPlainConn>,
-    /// Whether a peer here may assert a client address for someone else.
-    ///
-    /// Declared by `[server] internal_binds`, which load only accepts in a
-    /// local range. A declared listener is the backbone between nodes, and
-    /// the only peers that can reach it are the deployment's own cache nodes,
-    /// which is what makes their `x-forwarded-for` worth believing -- see
-    /// `crate::forward::ForwardedTrust`. An undeclared listener is just
-    /// another listener, and trusting it would hand every client a rate-limit
-    /// bypass.
-    trust: crate::forward::ForwardedTrust,
+    /// The peers this listener accepts, when it is internal
+    /// (`[server] internal_binds`). `None`: not internal, every peer served
+    /// and none trusted to forward a client address. `Some`: only these peers
+    /// are accepted, and their forwarded address is believed; any other
+    /// connection is closed at accept. The firewall is a second fence, not
+    /// the one this trust rests on. See `crate::forward::ForwardedTrust`.
+    peers: Option<Vec<std::net::IpAddr>>,
+}
+
+/// What a connection from `peer` gets on an h2c listener: `None` refuses it.
+/// `peers` is `None` for a listener that is not internal, which serves
+/// everyone and trusts no one.
+fn admit(
+    peers: Option<&[std::net::IpAddr]>,
+    peer: std::net::IpAddr,
+) -> Option<crate::forward::ForwardedTrust> {
+    match peers {
+        None => Some(crate::forward::ForwardedTrust::Never),
+        Some(p) if p.contains(&peer.to_canonical()) => {
+            Some(crate::forward::ForwardedTrust::Backbone)
+        }
+        Some(_) => None,
+    }
 }
 
 impl H2cListener {
-    pub fn bind(addr: &str, internal: bool) -> anyhow::Result<Self> {
+    pub fn bind(addr: &str, internal_peers: Option<Vec<std::net::IpAddr>>) -> anyhow::Result<Self> {
         let listener = m6_core::server::bind_tcp_reuseaddr(resolve_bind(addr)?)?;
         listener.set_nonblocking(true)?;
 
-        let trust = if internal {
-            crate::forward::ForwardedTrust::Backbone
-        } else {
-            crate::forward::ForwardedTrust::Never
-        };
-        if trust == crate::forward::ForwardedTrust::Never {
+        if internal_peers.is_none() {
             warn!(
                 bind = %addr,
                 "h2c listener is not named in [server] internal_binds: forwarded \
@@ -415,7 +423,7 @@ impl H2cListener {
         Ok(H2cListener {
             listener,
             conns: Vec::new(),
-            trust,
+            peers: internal_peers,
         })
     }
 
@@ -431,13 +439,21 @@ impl H2cListener {
         loop {
             match self.listener.accept() {
                 Ok((stream, peer)) => {
+                    let Some(trust) = admit(self.peers.as_deref(), peer.ip()) else {
+                        warn!(
+                            peer = %peer.ip(),
+                            "h2c: refused a connection from a peer not in [server] internal_peers"
+                        );
+                        drop(stream);
+                        continue;
+                    };
                     if let Err(e) = stream.set_nonblocking(true) {
                         warn!("h2c set_nonblocking: {e}");
                         continue;
                     }
                     stream.set_nodelay(true).ok();
                     poller.add(stream.as_raw_fd(), token).ok();
-                    let h2 = match self.trust {
+                    let h2 = match trust {
                         crate::forward::ForwardedTrust::Backbone => {
                             Http2Conn::new().trusting_forwarded_for()
                         }
@@ -1728,23 +1744,43 @@ mod keep_alive_tests {
 }
 
 #[cfg(test)]
-mod h2c_trust_tests {
-    use super::H2cListener;
+mod h2c_admit_tests {
+    use super::admit;
     use crate::forward::ForwardedTrust;
+    use std::net::IpAddr;
 
-    /// A listener declared in `[server] internal_binds` is the backbone, so a
-    /// cache node's forwarded client address is believed.
-    #[test]
-    fn a_declared_h2c_listener_trusts_forwarded_addresses() {
-        let l = H2cListener::bind("127.0.0.1:0", true).unwrap();
-        assert_eq!(l.trust, ForwardedTrust::Backbone);
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
     }
 
-    /// The address no longer decides. Loopback was trusted by address before;
-    /// undeclared, it gets no trust.
+    /// A listener that is not named in `[server] internal_binds` is just
+    /// another listener: it serves everyone and believes no forwarded address.
     #[test]
-    fn an_undeclared_h2c_listener_never_trusts_even_on_loopback() {
-        let l = H2cListener::bind("127.0.0.1:0", false).unwrap();
-        assert_eq!(l.trust, ForwardedTrust::Never);
+    fn a_listener_that_is_not_internal_serves_everyone_and_trusts_no_one() {
+        assert_eq!(admit(None, ip("192.0.2.1")), Some(ForwardedTrust::Never));
+    }
+
+    #[test]
+    fn a_listed_peer_is_admitted_and_trusted() {
+        let peers = [ip("10.0.0.2")];
+        assert_eq!(
+            admit(Some(&peers), ip("10.0.0.2")),
+            Some(ForwardedTrust::Backbone)
+        );
+    }
+
+    #[test]
+    fn an_unlisted_peer_is_refused() {
+        let peers = [ip("10.0.0.2")];
+        assert_eq!(admit(Some(&peers), ip("10.0.0.3")), None);
+    }
+
+    #[test]
+    fn a_v4_mapped_peer_matches_its_v4_entry() {
+        let peers = [ip("10.0.0.2")];
+        assert_eq!(
+            admit(Some(&peers), ip("::ffff:10.0.0.2")),
+            Some(ForwardedTrust::Backbone)
+        );
     }
 }

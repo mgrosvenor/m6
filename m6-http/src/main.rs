@@ -3891,6 +3891,11 @@ fn handle_site_reload(state: &mut ServerState, log_handle: &m6_core::log::LogHan
                     "config reload: [server].internal_binds changed; restart m6-http to apply it"
                 );
             }
+            if new_config.server.internal_peers != state.config.server.internal_peers {
+                warn!(
+                    "config reload: [server].internal_peers changed; restart m6-http to apply it"
+                );
+            }
             state.config = new_config;
             m6_http_lib::security::configure(&state.config.security);
             state.cache.clear();
@@ -4278,7 +4283,11 @@ fn run(args: Vec<String>) -> i32 {
     };
 
     let h2c_listener = if let Some(ref h2c_bind) = config.server.h2c_bind {
-        match H2cListener::bind(h2c_bind, config.server.is_internal(h2c_bind)) {
+        let internal_peers = config
+            .server
+            .is_internal(h2c_bind)
+            .then(|| config.server.internal_peers.clone());
+        match H2cListener::bind(h2c_bind, internal_peers) {
             Ok(l) => {
                 info!(bind = %h2c_bind, "H2C (HTTP/2 cleartext) listener started");
                 Some(l)
@@ -4300,6 +4309,7 @@ fn run(args: Vec<String>) -> i32 {
         bind = %config.server.bind,
         h2c_bind = ?config.server.h2c_bind,
         internal_binds = ?config.server.internal_binds,
+        internal_peers = ?config.server.internal_peers,
         site = %config.site.name,
         "m6-http listeners bound"
     );
@@ -4385,6 +4395,7 @@ mod www_redirect_tests {
                 backend_timeout_secs: 30,
                 h2c_bind: None,
                 internal_binds: Vec::new(),
+                internal_peers: Vec::new(),
                 redirect_bind: None,
                 warm_on_start: false,
                 allowed_methods: vec!["GET".into(), "HEAD".into(), "POST".into()],
