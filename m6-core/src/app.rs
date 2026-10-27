@@ -2540,33 +2540,41 @@ fn dump_config(
     0
 }
 
-/// The keys that changed between the running state and `new` and cannot be
-/// applied without a restart.
-fn restart_only_changes_against(
-    fs: &std::sync::RwLock<FrameworkState>,
-    new: &crate::config::RendererConfig,
-    site_dir: &std::path::Path,
-) -> Vec<&'static str> {
-    crate::config::restart_only_changes(&fs.read().unwrap().config, new, site_dir)
+/// Whether `site.toml` declares the compression `config` does, for the backend
+/// named `backend_name`. Checked at start and on every reload.
+///
+/// "Compresses" means at least one MIME type has a non-zero level. The
+/// defaults give text types real levels and images zero, so a service that has
+/// not opted out does compress.
+fn check_compress_declared(
+    config: &crate::config::RendererConfig,
+    site_toml: &std::path::Path,
+    backend_name: &str,
+) -> std::result::Result<(), String> {
+    let compresses = config
+        .compression
+        .values()
+        .any(|c| c.brotli > 0 || c.gzip > 0);
+    crate::compress::check_declared_support(site_toml, backend_name, compresses)
 }
 
-/// Apply the log level a reload asks for, with the same precedence as start:
-/// the command line, then the service's `[log]`, then `site.toml`'s `[log]`.
+/// The log format and level, in order of precedence: the command line, then
+/// the service's `[log]`, then `site.toml`'s `[log]`.
 ///
-/// `site.toml` is read again here, which is how a level moved there reaches a
-/// running service.
-fn apply_reloaded_log_level(
-    handle: &crate::log::LogHandle,
+/// Used at start and on every reload. `site.toml` is read each time, which is
+/// how a level moved there reaches a running service.
+fn resolve_log(
     site_toml: &std::path::Path,
     config_log: &crate::config::LogConfig,
     cli_log_level: Option<&str>,
-) {
+) -> (String, String) {
     let (site_level, site_format) = crate::log::read_site_log_config(site_toml);
-    let format = config_log.format.as_deref().unwrap_or(&site_format);
+    let format = config_log.format.clone().unwrap_or(site_format);
     let level = cli_log_level
-        .or(config_log.level.as_deref())
-        .unwrap_or(&site_level);
-    handle.reload(format, level);
+        .map(str::to_string)
+        .or_else(|| config_log.level.clone())
+        .unwrap_or(site_level);
+    (format, level)
 }
 
 pub fn run_app(
@@ -2648,38 +2656,13 @@ fn run_app_with_shutdown(
         .and_then(|s| s.to_str())
         .unwrap_or("m6-default")
         .to_string();
-    {
-        let backend_name = backend_name.as_str();
-        // "Compresses" means at least one MIME type has a non-zero level. The
-        // defaults give text types real levels and images zero, so a service
-        // that has not opted out does compress.
-        let compresses = config
-            .compression
-            .values()
-            .any(|c| c.brotli > 0 || c.gzip > 0);
-        if let Err(msg) =
-            crate::compress::check_declared_support(&site_toml, backend_name, compresses)
-        {
-            eprintln!("Config error: {msg}");
-            std::process::exit(2);
-        }
+    if let Err(msg) = check_compress_declared(&config, &site_toml, &backend_name) {
+        eprintln!("Config error: {msg}");
+        std::process::exit(2);
     }
 
     // Init logging: site.toml base → renderer config [log] → CLI --log-level.
-    let (site_level, site_format) = crate::log::read_site_log_config(&site_toml);
-    let format = config
-        .log
-        .format
-        .as_deref()
-        .unwrap_or(&site_format)
-        .to_string();
-    let cfg_level = config
-        .log
-        .level
-        .as_deref()
-        .unwrap_or(&site_level)
-        .to_string();
-    let level = cli_log_level.as_deref().unwrap_or(&cfg_level).to_string();
+    let (format, level) = resolve_log(&site_toml, &config.log, cli_log_level.as_deref());
     let log_handle = crate::log::init(&format, &level).unwrap_or_else(|e| {
         eprintln!("logging init error: {e}");
         std::process::exit(1);
@@ -2811,14 +2794,69 @@ fn run_app_with_shutdown(
         },
     );
 
+    // One reload, returning the route count or the message to log. The same
+    // refusals as at start: a named `site_toml` that is gone or does not
+    // parse, a compress declaration that disagrees with this service, and a
+    // route naming a handler this binary does not have. Each keeps the old
+    // state serving, so a bad edit of either file is recoverable.
+    let reload = || -> std::result::Result<usize, String> {
+        let new_config = crate::config::load(&config_path, &site_dir)
+            .map_err(|e| format!("Reload failed (config parse error): {e}"))?;
+        check_site_toml(&new_config, &site_dir)
+            .and_then(|_| check_compress_declared(&new_config, &site_toml, &backend_name))
+            .map_err(|msg| format!("Reload refused: {msg}"))?;
+        let changed_keys =
+            crate::config::restart_only_changes(&fs.read().unwrap().config, &new_config, &site_dir);
+        let (format, level) = resolve_log(&site_toml, &new_config.log, cli_log_level.as_deref());
+        let new_state = FrameworkState::build(
+            new_config,
+            site_dir.clone(),
+            &code_route_signatures,
+            &*renderer,
+        )
+        .map_err(|e| format!("Reload failed (template/state error): {e}"))?;
+        let missing = unknown_handlers(&new_state.routes, &named_handlers, &code_patterns);
+        if !missing.is_empty() {
+            return Err(format!(
+                "Reload refused, route names an unregistered handler: {}",
+                describe_unknown(&missing, &registered_names)
+            ));
+        }
+        let routes = new_state.routes.len();
+        *fs.write().unwrap() = new_state;
+        for k in changed_keys {
+            warn!(
+                key = k,
+                "config reload: {k} changed; restart this service to apply it"
+            );
+        }
+        log_handle.reload(&format, &level);
+        if let Some(hook) = &on_reload {
+            let state = fs.read().unwrap();
+            let ctx = AppContext {
+                config: &state.config.user_config,
+                site_dir: &site_dir,
+                config_path: &config_path,
+                site_toml: &site_toml,
+            };
+            if let Err(e) = hook(&ctx) {
+                error!("Reload hook failed: {e:#}");
+            }
+        }
+        Ok(routes)
+    };
+
     use std::os::unix::io::AsRawFd;
     let listener_fd = listener.as_raw_fd();
 
     loop {
         // ── poll(2) ─────────────────────────────────────────────────────
         // The 100 ms timeout ensures we catch shutdown signals promptly
-        // even when the server is completely idle.
-        let ready = crate::server::poll_listener_and_watcher(listener_fd, reloader.raw_fd(), 100);
+        // even when the server is completely idle. It is shorter while the
+        // reloader holds a report, so that report is made on time.
+        let timeout = reloader.timeout_ms(std::time::Instant::now(), 100);
+        let ready =
+            crate::server::poll_listener_and_watcher(listener_fd, reloader.raw_fd(), timeout);
         let listener_ready = ready.listener;
         let now = std::time::Instant::now();
 
@@ -2847,98 +2885,17 @@ fn run_app_with_shutdown(
                 "Config change detected, reloading..."
             );
             let reload_start = std::time::Instant::now();
-            match crate::config::load(&config_path, &site_dir) {
-                Err(e) => {
-                    error!("Reload failed (config parse error): {e}");
-                }
-                Ok(new_config) => {
-                    // The same refusals as at start: a named `site_toml` that
-                    // is gone or does not parse, and a compress declaration
-                    // that disagrees with this service. Either keeps the old
-                    // state, so a bad edit of `site.toml` is recoverable.
-                    let refusal = check_site_toml(&new_config, &site_dir).err().or_else(|| {
-                        let compresses = new_config
-                            .compression
-                            .values()
-                            .any(|c| c.brotli > 0 || c.gzip > 0);
-                        crate::compress::check_declared_support(
-                            &site_toml,
-                            &backend_name,
-                            compresses,
-                        )
-                        .err()
-                    });
-                    if let Some(msg) = refusal {
-                        error!("Reload refused: {msg}");
-                    } else {
-                        let changed_keys =
-                            restart_only_changes_against(&fs, &new_config, &site_dir);
-                        let new_log = new_config.log.clone();
-                        match FrameworkState::build(
-                            new_config,
-                            site_dir.clone(),
-                            &code_route_signatures,
-                            &*renderer,
-                        ) {
-                            Err(e) => {
-                                error!("Reload failed (template/state error): {e}");
-                            }
-                            Ok(new_state) => {
-                                // The new config may have added a route naming a
-                                // handler this binary does not have. Refuse the
-                                // whole state rather than swap in one that cannot
-                                // serve a route it advertises: the previous routes
-                                // keep serving, which is what makes a typo in a
-                                // live config recoverable.
-                                let missing = unknown_handlers(
-                                    &new_state.routes,
-                                    &named_handlers,
-                                    &code_patterns,
-                                );
-                                if !missing.is_empty() {
-                                    error!(
-                                        "Reload refused, route names an unregistered handler: {}",
-                                        describe_unknown(&missing, &registered_names)
-                                    );
-                                } else {
-                                    let routes = new_state.routes.len();
-                                    *fs.write().unwrap() = new_state;
-                                    for k in changed_keys {
-                                        warn!(
-                                            key = k,
-                                            "config reload: {k} changed; restart this service to apply it"
-                                        );
-                                    }
-                                    apply_reloaded_log_level(
-                                        &log_handle,
-                                        &site_toml,
-                                        &new_log,
-                                        cli_log_level.as_deref(),
-                                    );
-                                    if let Some(hook) = &on_reload {
-                                        let state = fs.read().unwrap();
-                                        let ctx = AppContext {
-                                            config: &state.config.user_config,
-                                            site_dir: &site_dir,
-                                            config_path: &config_path,
-                                            site_toml: &site_toml,
-                                        };
-                                        if let Err(e) = hook(&ctx) {
-                                            error!("Reload hook failed: {e:#}");
-                                        }
-                                    }
-                                    let elapsed = reload_start.elapsed().as_millis();
-                                    info!(
-                                        elapsed_ms = elapsed,
-                                        routes = routes,
-                                        site = changed.site,
-                                        process = changed.process,
-                                        "Reload complete"
-                                    );
-                                }
-                            }
-                        }
-                    }
+            match reload() {
+                Err(msg) => error!("{msg}"),
+                Ok(routes) => {
+                    let elapsed = reload_start.elapsed().as_millis();
+                    info!(
+                        elapsed_ms = elapsed,
+                        routes = routes,
+                        site = changed.site,
+                        process = changed.process,
+                        "Reload complete"
+                    );
                 }
             }
             // Don't skip accept — the listener may also be ready.

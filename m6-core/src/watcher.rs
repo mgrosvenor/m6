@@ -407,15 +407,14 @@ pub struct ConfigReloader {
     watcher: Option<ConfigWatcher>,
     site_toml: PathBuf,
     process: PathBuf,
-    same_file: bool,
     seen: Seen,
     pending: Changed,
-    first: Option<Instant>,
+    /// When the pending change is to be reported.
     due: Option<Instant>,
-    window_end: Option<Instant>,
+    /// When the last report was made. A change within [`RELOAD_DEBOUNCE`] of
+    /// it, or one arriving while a report is still due, is held.
+    last_report: Option<Instant>,
     next_poll: Instant,
-    site_name: String,
-    process_name: String,
 }
 
 impl ConfigReloader {
@@ -438,29 +437,15 @@ impl ConfigReloader {
         process: &Path,
         seen: Seen,
     ) -> ConfigReloader {
-        let same_file = match (site_toml.canonicalize(), process.canonicalize()) {
-            (Ok(a), Ok(b)) => a == b,
-            _ => site_toml == process,
-        };
-        let name = |p: &Path| {
-            p.file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_string()
-        };
         ConfigReloader {
             watcher,
             site_toml: site_toml.to_path_buf(),
             process: process.to_path_buf(),
-            same_file,
             seen,
             pending: Changed::default(),
-            first: None,
             due: None,
-            window_end: None,
+            last_report: None,
             next_poll: Instant::now() + RELOAD_POLL,
-            site_name: name(site_toml),
-            process_name: name(process),
         }
     }
 
@@ -481,11 +466,20 @@ impl ConfigReloader {
         self.watcher.as_ref().and_then(|w| w.raw_fd())
     }
 
+    /// The `poll(2)` timeout to use, at most `max_ms`: shorter when a held
+    /// report falls due sooner, so it is made on time on an idle loop.
+    pub fn timeout_ms(&self, now: Instant, max_ms: u16) -> u16 {
+        self.due.map_or(max_ms, |due| {
+            let us = due.saturating_duration_since(now).as_micros();
+            u16::try_from(us.div_ceil(1000)).map_or(max_ms, |ms| ms.min(max_ms))
+        })
+    }
+
     /// Call when [`raw_fd`](Self::raw_fd) is readable.
     pub fn on_readable(&mut self, now: Instant) {
         if let Some(w) = self.watcher.as_mut() {
-            // The fingerprints decide what changed, not the event name.
-            let _ = w.read_events(&[&self.site_name, &self.process_name]);
+            // Drain only. The fingerprints decide what changed.
+            w.read_events(&[]);
         }
         self.compare(now);
     }
@@ -496,23 +490,14 @@ impl ConfigReloader {
             self.compare(now);
             self.next_poll = now + RELOAD_POLL;
         }
-        match self.due {
-            Some(due) if now >= due => {
-                // Every report opens a window. A change inside it is held for
-                // one more report when it settles.
-                self.first = Some(now);
-                self.due = None;
-                self.window_end = Some(now + RELOAD_DEBOUNCE);
-                Some(std::mem::take(&mut self.pending))
-            }
-            _ => {
-                if self.due.is_none() && self.window_end.is_some_and(|w| now >= w) {
-                    self.first = None;
-                    self.window_end = None;
-                }
-                None
-            }
+        if self.due.is_some_and(|due| now >= due) {
+            // Every report opens a window. A change inside it is held for one
+            // more report when it settles.
+            self.due = None;
+            self.last_report = Some(now);
+            return Some(std::mem::take(&mut self.pending));
         }
+        None
     }
 
     /// Fingerprint both files and mark each that moved. The new fingerprint is
@@ -535,25 +520,23 @@ impl ConfigReloader {
         if !hit {
             return;
         }
-        if self.same_file {
+        // One file serving as both: a change to it is a change to both.
+        if site.is_some() && site == process {
             self.pending = Changed {
                 site: true,
                 process: true,
             };
         }
-        self.due = Some(
-            match (
-                self.window_end.filter(|w| now < *w || self.due.is_some()),
-                self.first,
-            ) {
-                // A change inside the window of an earlier report: one more report
-                // when the burst settles, and never later than a second after the
-                // window opened.
-                (Some(_), Some(first)) => (now + RELOAD_DEBOUNCE).min(first + RELOAD_POLL).max(now),
-                // The first change after quiet: report at once.
-                _ => now,
-            },
-        );
+        self.due = Some(match self.last_report {
+            // A change inside the window of an earlier report: one more report
+            // when the burst settles, and never later than a second after that
+            // report.
+            Some(last) if now < last + RELOAD_DEBOUNCE || self.due.is_some() => {
+                (now + RELOAD_DEBOUNCE).min(last + RELOAD_POLL).max(now)
+            }
+            // The first change after quiet: report at once.
+            _ => now,
+        });
     }
 }
 
@@ -849,6 +832,23 @@ mod tests {
             })
         );
         assert_eq!(r.tick(t0 + Duration::from_millis(600)), None);
+    }
+
+    #[test]
+    fn the_poll_timeout_shrinks_to_a_held_report() {
+        let (_d, site, proc, seen) = pair();
+        let mut r = ConfigReloader::polling_only(&site, &proc, seen);
+        let t0 = Instant::now() + RELOAD_POLL;
+        assert_eq!(r.timeout_ms(t0, 100), 100, "nothing held");
+        put(&proc, "b = 12\n");
+        assert!(r.tick(t0).is_some());
+        put(&proc, "b = 123\n");
+        let at = t0 + Duration::from_millis(5);
+        r.next_poll_for_test(at);
+        assert_eq!(r.tick(at), None);
+        // Held until `at + RELOAD_DEBOUNCE`, so the loop must wake by then.
+        assert_eq!(r.timeout_ms(at, 100), 20);
+        assert_eq!(r.timeout_ms(at, 10), 10);
     }
 
     #[test]
