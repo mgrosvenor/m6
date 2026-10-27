@@ -45,7 +45,7 @@ The token is read after the two files are merged.
 
 m6-http accepted node keys in `site.toml` and site-wide keys in the system config without a word, because the system config wins and the result worked.
 It now logs a warning at start for each key in the wrong file.
-The node keys are `[server]` `bind`, `tls_cert`, `tls_key`, `h2c_bind`, `internal_binds`, `redirect_bind` and `warm_on_start`, `[auth]`, and `[health]` `metrics_token_file`, `metrics_require` and `metrics_peers`.
+The node keys are `[server]` `bind`, `tls_cert`, `tls_key`, `h2c_bind`, `internal_binds`, `redirect_bind` and `warm_on_start`, `[auth]`, `[node]`, and `[health]` `metrics_token_file`, `metrics_require` and `metrics_peers`.
 They belong in the system config.
 The site-wide keys are `[server]` `backend_timeout_secs` and `allowed_methods`.
 They belong in `site.toml`.

@@ -935,16 +935,12 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         .ok_or_else(|| anyhow::anyhow!("config error: [site].domain is required"))?;
 
     // Node identity comes from system config, not site.toml (see NodeConfig
-    // doc comment) — falls back to [site].name with a warning so an older
+    // doc comment) — falls back to [site].name, with a warning from main, so an older
     // system config without [node] still starts up instead of hard-failing.
-    let node = system_parsed.node.unwrap_or_else(|| {
-        warn!(
-            file = %system_config_path.display(),
-            "system config: no [node].name set, falling back to [site].name for node identity"
-        );
-        NodeConfig {
-            name: site_name.clone(),
-        }
+    // The fallback is reported by `warn_node_fallback` from main, because
+    // warn! inside load() goes to a subscriber that does not exist yet.
+    let node = system_parsed.node.unwrap_or_else(|| NodeConfig {
+        name: site_name.clone(),
     });
 
     let server = ServerConfig {
@@ -1237,6 +1233,11 @@ const NODE_SERVER_KEYS: &[&str] = &[
 ];
 /// The fields of `RawSystemHealth`; change both together.
 const NODE_HEALTH_KEYS: &[&str] = &["metrics_token_file", "metrics_require", "metrics_peers"];
+/// Whole sections that are node state. They belong in the system config.
+///
+/// `RawSiteToml` has no `[node]` field, so a `[node]` in `site.toml` is
+/// dropped without a word unless it is named here.
+const NODE_SECTIONS: &[&str] = &["auth", "node"];
 /// Keys that describe how the site's routes are served. They belong in
 /// `site.toml`.
 const SITE_SERVER_KEYS: &[&str] = &["backend_timeout_secs", "allowed_methods"];
@@ -1271,8 +1272,10 @@ pub fn misplaced_keys(site_dir: &Path, system_config_path: &Path) -> Vec<String>
             out.push(node_state_message("server", Some(key), system_config_path));
         }
     }
-    if site.get("auth").is_some() {
-        out.push(node_state_message("auth", None, system_config_path));
+    for section in NODE_SECTIONS {
+        if site.get(section).is_some() {
+            out.push(node_state_message(section, None, system_config_path));
+        }
     }
     for key in NODE_HEALTH_KEYS {
         if in_site("health", key) {
@@ -1298,6 +1301,28 @@ fn node_state_message(section: &str, key: Option<&str>, system_config_path: &Pat
         "site.toml sets {name}, which is this node's own state and belongs in the system config {}",
         system_config_path.display()
     )
+}
+
+/// True when the system config names no `[node]`, so the node identity falls
+/// back to `[site].name`.
+pub fn node_falls_back(system_config_path: &Path) -> bool {
+    std::fs::read_to_string(system_config_path)
+        .ok()
+        .and_then(|raw| raw.parse::<toml::Table>().ok())
+        .is_some_and(|t| !t.contains_key("node"))
+}
+
+/// Warn that the node identity fell back to `[site].name`.
+///
+/// Called from `main` after logging is initialised, for the reason given on
+/// [`warn_ignored_route_cache_keys`].
+pub fn warn_node_fallback(system_config_path: &Path) {
+    if node_falls_back(system_config_path) {
+        warn!(
+            file = %system_config_path.display(),
+            "system config: no [node].name set, falling back to [site].name for node identity"
+        );
+    }
 }
 
 pub fn warn_system_config_extra_keys(system_config_path: &Path) {
@@ -2338,5 +2363,23 @@ internal_binds = ["203.0.113.7:80"]
             "[server]\nbind = \"0.0.0.0:443\"\n\n[auth]\npublic_key = \"/k\"\n\n[health]\nmetrics_token_file = \"/t\"\n",
         );
         assert!(m.is_empty(), "{m:?}");
+    }
+
+    #[test]
+    fn misplaced_keys_names_a_node_section_in_site_toml() {
+        let m = misplaced("[node]\nname = \"edge-a\"\n", "[node]\nname = \"edge-a\"\n");
+        assert_eq!(m.len(), 1, "{m:?}");
+        assert!(m[0].starts_with("site.toml sets [node],"), "{}", m[0]);
+    }
+
+    #[test]
+    fn the_node_fallback_is_detected_for_the_caller_to_warn_about() {
+        let dir = make_test_dir();
+        let with = dir.path().join("with.toml");
+        let without = dir.path().join("without.toml");
+        write_file(dir.path(), "with.toml", "[node]\nname = \"edge-a\"\n");
+        write_file(dir.path(), "without.toml", "[server]\nbind = \"x\"\n");
+        assert!(!node_falls_back(&with));
+        assert!(node_falls_back(&without));
     }
 }

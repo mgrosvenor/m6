@@ -272,6 +272,8 @@ m6-http accepts most of these keys in either file, and the system config wins.
 It cannot tell a deliberate override from a mistake, so at start it logs a warning for each key that sits in the file it does not belong to.
 The warning names the key and the file it belongs in.
 The warning is silent when both arguments name one file.
+A `[node]` in `site.toml` is never read, so it is warned about too.
+A system config with no `[node]` logs a warning that the node name falls back to `[site].name`.
 
 | Setting | File it belongs in | Reason |
 |---|---|---|
@@ -281,7 +283,7 @@ The warning is silent when both arguments name one file.
 | `[server]` backend_timeout_secs, allowed_methods | `site.toml` | How the site's routes are served, the same on every node |
 | `[auth]` | System config | A verify key path is a credential path |
 | `[health]` metrics_require, metrics_peers | System config | Which peers may read a node's metrics is a property of the node |
-| `[health]` metrics_token_file | System config | A credential path. Absolute only |
+| `[health]` metrics_token_file | System config | A credential path. A relative path resolves against the site directory |
 | `[health]` enabled, path, perf_path, traffic_path, traffic_cache_s | `site.toml` | The endpoint layout every node and the monitor share |
 | `[log]`, `[analytics]`, `[rate_limit]`, `[errors]`, `[security]` | `site.toml` | Identical on every node |
 | `[[backend]]`, `[[route]]`, `[[route_group]]` | `site.toml` | Identical in dev and production |

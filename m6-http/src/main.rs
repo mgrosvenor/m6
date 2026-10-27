@@ -4117,6 +4117,7 @@ fn run(args: Vec<String>) -> i32 {
     };
 
     config::warn_system_config_extra_keys(&cli.system_config);
+    config::warn_node_fallback(&cli.system_config);
     for m in config::misplaced_keys(&cli.site_dir, &cli.system_config) {
         warn!("{m}");
     }
