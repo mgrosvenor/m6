@@ -12,128 +12,9 @@ releases only; work happens on `develop`. See `CONTRIBUTING.md`.
 
 ---
 
-## Unreleased
-
-Changes merged to `develop` since the last release. The section is renamed to
-the version when the release is cut.
-
-### Changed
-
-**Tests run the binary built from the source they test (#245).**
-`m6_core::testkit::binary` returned `target/release/<name>` whatever its age, so a `cargo test` after an edit could spawn a binary from before the edit and report a correct change as broken.
-It now asks cargo to build `<name>` in release with workspace features, once per binary name per test process, and returns that binary.
-A build that is current costs one cargo call, and a stale one is rebuilt first.
-It no longer falls back to a debug binary.
-m6-auth-cli's tests use it instead of their own lookup.
-**Verified** by a unit test that changes a scratch binary's source between two calls and sees the new output, and by the whole suite.
-
-**An `App` reloads when either of its two files changes, and a lost watch no longer stops it (#244, closes #185 and #198).**
-An `App` service watched both its config and `site.toml` but rebuilt only from its own config.
-`site.toml`'s `[log]` level and its `[[backend]] compresses` declaration were read once at start, so editing the log level there changed nothing (#198).
-A watcher that stopped delivering events left a service that never reloaded, because the one-second modification-time check ran only when there was no watcher at all (#185).
-State that `init_global` built from the config had no way to reload.
-
-`m6_core::ConfigReloader` now watches both files.
-It takes the change from the platform watcher and, whatever the watcher says, compares the two files' identity, size and times once a second.
-The first change after quiet is reported at once.
-A change that arrives within 20 ms of a report is held and reported once more when the burst has settled, no later than a second after the window opened.
-A write that replaces the file in one step is one reload with no delay and a burst of writes is at most two.
-A write that truncates the file first can report twice.
-A file seen at length 0 is skipped with a warning, and the write that fills it reloads.
-Reporting at once matters when an edge clears its cache on the same change, because a backend that reloads late would otherwise leave a stale page cached.
-A touch alone reloads.
-On Linux an event that names one of the files is a change even when its size and times are equal, which coarse timestamps can cause.
-A file that failed to load is not tried again until it is written again.
-
-An App reload now re-reads `site.toml` every time.
-It applies the log level with the same precedence as start: the command line, then the service's `[log]`, then `site.toml`'s `[log]`.
-It checks the `compresses` agreement again and refuses the reload on a disagreement.
-It refuses a `site_toml` that is gone and a `site.toml` that is not valid TOML, whether or not `site_toml` names it.
-The previous state keeps serving after any refusal.
-It logs `config reload: <key> changed; restart this service to apply it` for `thread_pool.size`, `thread_pool.queue_size`, `server.read_timeout_s`, `server.socket_mode` and `site_toml`, which keep their running values.
-`Reload complete` gains `site` and `process` fields saying which file changed.
-
-`AppWithGlobal::on_reload` and `AppWithState::on_reload` register `Fn(&G, &AppContext) -> Result<()>`.
-Core calls it with the new config before installing the new state, so a service can re-read the state it built in `init_global`.
-If the hook returns `Err`, core logs it with the delay before the next attempt, keeps the previous routes and log level, and tries the reload again after 1 s, then 2 s, 4 s and so on up to 60 s.
-A real write to either file reloads at once and starts the delay again at one second.
-The hook must be safe to run twice on one config.
-A panic in the hook is not caught, because the release profile aborts on panic.
-It ends the process and the service manager restarts it, so return `Err` for anything recoverable.
-
-m6-http is not changed by this.
-It keeps its own watcher until it moves onto `ConfigReloader`.
-
-**An internal listener accepts only the peers its config names (#246).**
-An h2c listener named in `[server] internal_binds` believed the `X-Forwarded-For` of any peer that reached it, so a firewall was the only thing between a forged client address and the rate limiter.
-`[server] internal_peers` now lists the IP addresses it accepts, each in a local range.
-A connection from any other address is closed at accept.
-The log writes a line for the first refused connection from each address, then at most one line per address every 60 seconds with the number of refusals since the last line.
-It remembers 256 addresses.
-A new address past that takes the place of the remembered address whose last line is oldest, when that line is more than 60 seconds old and no count is owed.
-When no remembered address qualifies, refusals from the new address are counted.
-Across all addresses it writes at most 32 of those lines in 60 seconds, and refusals past that limit are counted.
-The first refusal after the 60 seconds ends writes one summary line with the counts, the number of distinct counted addresses (up to 1024) and the most recent counted address.
-One call to accept handles at most 64 connections, so a peer that connects in a loop cannot hold the event loop.
-The check runs once per connection, and every request on an admitted connection is served as before.
-A peer list with no address of the internal bind's IP family is refused at load.
-**Migration.**
-A config with a non-empty `internal_binds` must add `internal_peers`, or m6-http exits 2 and says what to add.
-Earlier releases ignore the key, so add it before upgrading.
-**Verified** by unit tests for each refusal and for canonical addresses, and by real-binary tests over h2c: a listed peer is served and believed, an unlisted peer's connection is closed with no response, and a config without the key refuses to start.
-
-**Each key goes in the file it belongs to, and an app can say where `site.toml` is (#242).**
-Every m6 process reads two files.
-`site.toml` holds the state every process of the site shares.
-The process config holds that process's own state, which means node identity, binds, certificates, credential paths and per-node security.
-Three things stopped that rule from holding.
-
-An `App` looked for `site.toml` only at `<site_dir>/site.toml`.
-`docs/m6-site-layout.md` gives each app its own root under `apps/`, with `site.toml` at the top of the tree.
-In that layout an app read no `site.toml`.
-The `[[backend]] compresses` agreement passed without checking, `[log]` fell back to its defaults, and the watch was on a directory that never held the file.
-A new reserved config key, `site_toml`, names the file.
-A relative value resolves against `site_dir`, an absolute value is used as given, and no key means `<site_dir>/site.toml` as before.
-A named file that does not exist, cannot be read or is not valid TOML is exit 2 at start.
-A file at the default path keeps its tolerance.
-`--dump-config` prints the resolved path.
-`Request::touch("site.toml")` touches that file, so the documented edge invalidation reloads the file the app reads.
-`AppContext` gains a `site_toml` field, and m6-auth-server reads its issuer fallback from that file.
-
-m6-http's system config refused `[health] metrics_token_file`, a credential path, so the path could only be written in `site.toml`.
-The system config now accepts it, and it wins over `site.toml` like the other `[health]` keys.
-A relative path there resolves against the site directory, as `tls_cert` does.
-The same rule now applies to `[auth] public_key` in the system config, which 1.14.0 required to be absolute.
-A relative `metrics_token_file` in `site.toml` still resolves against the working directory.
-The token is read after the two files are merged.
-
-m6-http accepted node keys in `site.toml` and site-wide keys in the system config without a word, because the system config wins and the result worked.
-It now logs a warning at start for each key in the wrong file.
-The node keys are `[server]` `bind`, `tls_cert`, `tls_key`, `h2c_bind`, `internal_binds`, `internal_peers`, `redirect_bind` and `warm_on_start`, `[auth]`, `[node]`, and `[health]` `metrics_token_file`, `metrics_require` and `metrics_peers`.
-They belong in the system config.
-The site-wide keys are `[server]` `backend_timeout_secs` and `allowed_methods`.
-They belong in `site.toml`.
-The warning is silent when both arguments name one file.
-The docs list which file each key belongs in.
-
-**Two signatures changed.**
-`m6_core::compress::check_declared_support` and `m6_core::log::read_site_log_config` take the path of `site.toml` where they took the site directory.
-`AuthConfig::load` in m6-auth-server takes it as a third argument.
-The public struct `AppContext` gained a `site_toml` field, so a struct literal of it outside m6-core no longer compiles.
-A service reads the context a handler or initialiser is given and does not build one, so this reaches only code that builds an `AppContext` by hand.
-
-Migration: a caller of the two functions or of `AuthConfig::load` passes the `site.toml` path.
-Code that builds an `AppContext` by hand adds the field.
-A service that does not set `site_toml` behaves as before, and a misplaced key keeps working and is named in a warning.
-A system config that holds a relative `[auth] public_key` or `[health] metrics_token_file` no longer fails to start, and its path now resolves against the site directory.
-
-**Verified** by unit tests for the key, its resolution and its refusals, by m6-file starting on a per-app root and exiting 2 on the compression disagreement it could only see through `site_toml`, by m6-auth-server taking its issuer from the named file, by m6-core tests for a named `site.toml` that is a directory, unreadable or invalid and for `touch("site.toml")` with a file outside the site directory, and by m6-http tests for the relative key paths, the `[node]` warning, and one table-driven test that every misplaced key warns in the wrong file and not in the right one.
-
----
-
 ## 1.14.0 — 2026-10-27
 
-**Log reopen on SIGUSR1, declared internal listeners, token-gated metrics, a monitor history and tunnel health, new m6-core blocks including an opt-in SQLite feature, a fleet certificate comparison, the user agents of notable clients, and a TLS reload that now replaces the certificate every listener serves, which fixes the limitation 1.13.0 recorded.**
+**Log reopen on SIGUSR1, declared internal listeners that accept only the peers a config names, token-gated metrics, a monitor history and tunnel health, new m6-core blocks including an opt-in SQLite feature and a config reloader, a fleet certificate comparison, the user agents of notable clients, each config key in the file it belongs to, test binaries built from the source under test, and a TLS reload that now replaces the certificate every listener serves, which fixes the limitation 1.13.0 recorded.**
 
 ### Changed
 
@@ -213,9 +94,11 @@ An entry that equals `bind` is refused, because the TLS and QUIC listener faces 
 
 **Migration.**
 A config with `h2c_bind` must add `internal_binds`, or m6-http exits 2 and says what to add.
-`internal_binds = ["<h2c_bind>"]` keeps today's behaviour for an h2c listener on a local IP address, and `internal_binds = []` treats it as public.
+A listener declared internal must also list its peers in `internal_peers` (#246), or m6-http exits 2 again.
+For an h2c listener on a local IP address, write both keys: `internal_binds = ["<h2c_bind>"]` and `internal_peers = ["<ip of each peer allowed to connect>"]`.
+`internal_binds = []` treats the listener as public, and then `internal_peers` is not needed.
 An h2c listener bound to a host name or a public address can only be declared public.
-Add the key before upgrading, because older versions ignore it.
+Add the keys before upgrading, because older versions ignore them.
 A `bind` on a private address is now labelled `external` in `/perf`.
 
 Verified: `cargo test --workspace` gives 1297 passed and 0 failed, clippy is silent with `-D warnings`, and the release and test builds have no warnings.
@@ -223,6 +106,118 @@ Thirteen new config tests, two rewritten h2c trust tests and four tests that run
 Two of the binary tests send requests over h2c under a rate limit and show that a declared listener believes the forwarded address and a public one does not.
 A diff of the three cache-hit blocks in `m6-http/src/main.rs` against the base is empty, so the request path for a cache hit is untouched.
 Example 09's integration test in m6-examples ran to "All assertions passed" with no `SKIP` against an earlier build of this change, with its h2c listener declared the same way.
+
+**Each key goes in the file it belongs to, and an app can say where `site.toml` is (#242).**
+Every m6 process reads two files.
+`site.toml` holds the state every process of the site shares.
+The process config holds that process's own state, which means node identity, binds, certificates, credential paths and per-node security.
+Three things stopped that rule from holding.
+
+An `App` looked for `site.toml` only at `<site_dir>/site.toml`.
+`docs/m6-site-layout.md` gives each app its own root under `apps/`, with `site.toml` at the top of the tree.
+In that layout an app read no `site.toml`.
+The `[[backend]] compresses` agreement passed without checking, `[log]` fell back to its defaults, and the watch was on a directory that never held the file.
+A new reserved config key, `site_toml`, names the file.
+A relative value resolves against `site_dir`, an absolute value is used as given, and no key means `<site_dir>/site.toml` as before.
+A named file that does not exist, cannot be read or is not valid TOML is exit 2 at start.
+A file at the default path keeps its tolerance.
+`--dump-config` prints the resolved path.
+`Request::touch("site.toml")` touches that file, so the documented edge invalidation reloads the file the app reads.
+`AppContext` gains a `site_toml` field, and m6-auth-server reads its issuer fallback from that file.
+
+The system config accepts `[health] metrics_token_file`, a credential path, and it wins over `site.toml` like the other `[health]` keys.
+A relative path there resolves against the site directory, as `tls_cert` does.
+The same rule applies to `[auth] public_key` in the system config.
+A relative `metrics_token_file` in `site.toml` still resolves against the working directory.
+The token is read after the two files are merged.
+
+m6-http accepted node keys in `site.toml` and site-wide keys in the system config without a word, because the system config wins and the result worked.
+It now logs a warning at start for each key in the wrong file.
+The node keys are `[server]` `bind`, `tls_cert`, `tls_key`, `h2c_bind`, `internal_binds`, `internal_peers`, `redirect_bind` and `warm_on_start`, `[auth]`, `[node]`, and `[health]` `metrics_token_file`, `metrics_require` and `metrics_peers`.
+They belong in the system config.
+The site-wide keys are `[server]` `backend_timeout_secs` and `allowed_methods`.
+They belong in `site.toml`.
+The warning is silent when both arguments name one file.
+The docs list which file each key belongs in.
+
+**Two signatures changed.**
+`m6_core::compress::check_declared_support` and `m6_core::log::read_site_log_config` take the path of `site.toml` where they took the site directory.
+`AuthConfig::load` in m6-auth-server takes it as a third argument.
+The public struct `AppContext` gained a `site_toml` field, so a struct literal of it outside m6-core no longer compiles.
+A service reads the context a handler or initialiser is given and does not build one, so this reaches only code that builds an `AppContext` by hand.
+
+Migration: a caller of the two functions or of `AuthConfig::load` passes the `site.toml` path.
+Code that builds an `AppContext` by hand adds the field.
+A service that does not set `site_toml` behaves as before, and a misplaced key keeps working and is named in a warning.
+The system config's relative paths resolve against the site directory, as described above.
+
+**Verified** by unit tests for the key, its resolution and its refusals, by m6-file starting on a per-app root and exiting 2 on the compression disagreement it could only see through `site_toml`, by m6-auth-server taking its issuer from the named file, by m6-core tests for a named `site.toml` that is a directory, unreadable or invalid and for `touch("site.toml")` with a file outside the site directory, and by m6-http tests for the relative key paths, the `[node]` warning, and one table-driven test that every misplaced key warns in the wrong file and not in the right one.
+
+**An `App` reloads when either of its two files changes, and a lost watch no longer stops it (#244, closes #185 and #198).**
+An `App` service watched both its config and `site.toml` but rebuilt only from its own config.
+`site.toml`'s `[log]` level and its `[[backend]] compresses` declaration were read once at start, so editing the log level there changed nothing (#198).
+A watcher that stopped delivering events left a service that never reloaded, because the one-second modification-time check ran only when there was no watcher at all (#185).
+State that `init_global` built from the config had no way to reload.
+
+`m6_core::ConfigReloader` now watches both files.
+It takes the change from the platform watcher and, whatever the watcher says, compares the two files' identity, size and times once a second.
+The first change after quiet is reported at once.
+A change that arrives within 20 ms of a report is held and reported once more when the burst has settled, no later than a second after the window opened.
+A write that replaces the file in one step is one reload with no delay and a burst of writes is at most two.
+A write that truncates the file first can report twice.
+A file seen at length 0 is skipped with a warning, and the write that fills it reloads.
+Reporting at once matters when an edge clears its cache on the same change, because a backend that reloads late would otherwise leave a stale page cached.
+A touch alone reloads.
+On Linux an event that names one of the files is a change even when its size and times are equal, which coarse timestamps can cause.
+A file that failed to load is not tried again until it is written again.
+
+An App reload now re-reads `site.toml` every time.
+It applies the log level with the same precedence as start: the command line, then the service's `[log]`, then `site.toml`'s `[log]`.
+It checks the `compresses` agreement again and refuses the reload on a disagreement.
+It refuses a `site_toml` that is gone and a `site.toml` that is not valid TOML, whether or not `site_toml` names it.
+The previous state keeps serving after any refusal.
+It logs `config reload: <key> changed; restart this service to apply it` for `thread_pool.size`, `thread_pool.queue_size`, `server.read_timeout_s`, `server.socket_mode` and `site_toml`, which keep their running values.
+`Reload complete` gains `site` and `process` fields saying which file changed.
+
+`AppWithGlobal::on_reload` and `AppWithState::on_reload` register `Fn(&G, &AppContext) -> Result<()>`.
+Core calls it with the new config before installing the new state, so a service can re-read the state it built in `init_global`.
+If the hook returns `Err`, core logs it with the delay before the next attempt, keeps the previous routes and log level, and tries the reload again after 1 s, then 2 s, 4 s and so on up to 60 s.
+A real write to either file reloads at once and starts the delay again at one second.
+The hook must be safe to run twice on one config.
+A panic in the hook is not caught, because the release profile aborts on panic.
+It ends the process and the service manager restarts it, so return `Err` for anything recoverable.
+
+m6-http is not changed by this.
+It keeps its own watcher until it moves onto `ConfigReloader`.
+
+**An internal listener accepts only the peers its config names (#246).**
+An h2c listener named in `[server] internal_binds` believed the `X-Forwarded-For` of any peer that reached it, so a firewall was the only thing between a forged client address and the rate limiter.
+`[server] internal_peers` now lists the IP addresses it accepts, each in a local range.
+A connection from any other address is closed at accept.
+The log writes a line for the first refused connection from each address, then at most one line per address every 60 seconds with the number of refusals since the last line.
+It remembers 256 addresses.
+A new address past that takes the place of the remembered address whose last line is oldest, when that line is more than 60 seconds old and no count is owed.
+When no remembered address qualifies, refusals from the new address are counted.
+Across all addresses it writes at most 32 of those lines in 60 seconds, and refusals past that limit are counted.
+The first refusal after the 60 seconds ends writes one summary line with the counts, the number of distinct counted addresses (up to 1024) and the most recent counted address.
+One call to accept handles at most 64 connections, so a peer that connects in a loop cannot hold the event loop.
+The check runs once per connection, and every request on an admitted connection is served as before.
+A peer list with no address of the internal bind's IP family is refused at load.
+
+**Migration.**
+A config with a non-empty `internal_binds` must add `internal_peers`, or m6-http exits 2 and says what to add.
+The migration note for `internal_binds` under #232 gives both keys together.
+
+**Verified** by unit tests for each refusal and for canonical addresses, and by real-binary tests over h2c: a listed peer is served and believed, an unlisted peer's connection is closed with no response, and a config without the key refuses to start.
+
+**Tests run the binary built from the source they test (#245).**
+`m6_core::testkit::binary` returned `target/release/<name>` whatever its age, so a `cargo test` after an edit could spawn a binary from before the edit and report a correct change as broken.
+It now asks cargo to build `<name>` in release with workspace features, once per binary name per test process, and returns that binary.
+A build that is current costs one cargo call, and a stale one is rebuilt first.
+It no longer falls back to a debug binary.
+m6-auth-cli's tests use it instead of their own lookup.
+
+**Verified** by a unit test that changes a scratch binary's source between two calls and sees the new output, and by the whole suite.
 
 ### Fixed
 
@@ -427,17 +422,17 @@ m6-monitor's `metrics_over_tunnel` fetches `/perf` and `/traffic` through a node
 **Migration.**
 A system config that holds only `[server]` and `[node]` is unaffected.
 A system config that carries `[auth]` or `[health]` used to have them ignored with a warning.
-Now `[auth]` is read, and `[health]` there accepts only the two new keys.
-A config that breaks these rules stops m6-http starting with exit 2.
+Now `[auth]` is read, and `[health]` there accepts `metrics_require`, `metrics_peers` and `metrics_token_file`.
+A config that breaks the rule below stops m6-http starting with exit 2.
 On a running node a reload fails the same way and keeps the old config until a restart.
-Check each system config for these three cases before the upgrade:
-
-- `[auth]` declared in both the system config and `site.toml`. Keep it in one file and delete it from the other.
-- A relative `[auth] public_key` in the system config. Make it an absolute path.
-- A `[health]` key in the system config other than `metrics_require` and `metrics_peers`, for example `metrics_token_file`. Move it to `site.toml` or delete it.
+Check each system config for `[auth]` declared in both the system config and `site.toml` before the upgrade.
+Keep it in one file and delete it from the other.
+A `[health]` key in the system config other than `metrics_require`, `metrics_peers` and `metrics_token_file` stops m6-http starting with exit 2.
+Move any other key (`enabled`, `path`, `perf_path`, `traffic_path`, `traffic_cache_s`) to `site.toml`.
 
 When both arguments name the same file, its `[auth]` and `[health]` are the site config's and the system-side copy is ignored.
 Older versions ignore the new keys, so a config can carry them before the upgrade, but the endpoints stay on the legacy gate until it.
+
 Verified: `cargo test --workspace -- --test-threads=1` passes 1388 tests with 0 failures and 0 warnings on the release and test builds.
 `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `tools/clippy.sh` and `cargo deny check` are silent.
 `m6-http/tests/metrics_access.rs` runs the real binary and covers h1, h2 and h3.
