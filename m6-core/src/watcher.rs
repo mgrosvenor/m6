@@ -120,7 +120,13 @@ impl ConfigWatcher {
 
     /// Drain pending events, returning true if any names a watched file.
     pub fn read_events(&mut self, filenames: &[&str]) -> bool {
-        let mut matched = false;
+        self.read_matched(filenames).contains(&true)
+    }
+
+    /// Drain pending events, returning for each of `filenames` whether an
+    /// event named it.
+    pub fn read_matched(&mut self, filenames: &[&str]) -> Vec<bool> {
+        let mut matched = vec![false; filenames.len()];
         // One `read` per call, so loop until the queue is empty. An empty
         // non-blocking queue is `EAGAIN`, which is the normal way out rather
         // than an error to report.
@@ -130,8 +136,10 @@ impl ConfigWatcher {
                 Ok(events) => {
                     for ev in events {
                         if let Some(name) = ev.name.as_ref().and_then(|n| n.to_str()) {
-                            if filenames.contains(&name) {
-                                matched = true;
+                            for (i, f) in filenames.iter().enumerate() {
+                                if *f == name {
+                                    matched[i] = true;
+                                }
                             }
                         }
                     }
@@ -261,6 +269,13 @@ impl ConfigWatcher {
         }
         any
     }
+
+    /// Drain pending events. kqueue does not say which file, so nothing is
+    /// reported as named and the caller falls back to its fingerprints.
+    pub fn read_matched(&mut self, filenames: &[&str]) -> Vec<bool> {
+        self.read_events(&[]);
+        vec![false; filenames.len()]
+    }
 }
 
 /// Poll the queue rather than wait on it: the service's own `poll(2)` has
@@ -301,6 +316,10 @@ impl ConfigWatcher {
 
     pub fn read_events(&mut self, _filenames: &[&str]) -> bool {
         false
+    }
+
+    pub fn read_matched(&mut self, filenames: &[&str]) -> Vec<bool> {
+        vec![false; filenames.len()]
     }
 }
 
@@ -345,6 +364,13 @@ impl Changed {
     pub fn any(self) -> bool {
         self.site || self.process
     }
+}
+
+fn file_name(p: &Path) -> String {
+    p.file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string()
 }
 
 /// What `stat` says about a file, followed through a symlink.
@@ -408,6 +434,9 @@ pub struct ConfigReloader {
     site_toml: PathBuf,
     process: PathBuf,
     seen: Seen,
+    /// The file names events are matched against.
+    site_name: String,
+    process_name: String,
     pending: Changed,
     /// When the pending change is to be reported.
     due: Option<Instant>,
@@ -442,6 +471,8 @@ impl ConfigReloader {
             site_toml: site_toml.to_path_buf(),
             process: process.to_path_buf(),
             seen,
+            site_name: file_name(site_toml),
+            process_name: file_name(process),
             pending: Changed::default(),
             due: None,
             last_report: None,
@@ -477,17 +508,27 @@ impl ConfigReloader {
 
     /// Call when [`raw_fd`](Self::raw_fd) is readable.
     pub fn on_readable(&mut self, now: Instant) {
-        if let Some(w) = self.watcher.as_mut() {
-            // Drain only. The fingerprints decide what changed.
-            w.read_events(&[]);
-        }
-        self.compare(now);
+        // An event that names a file is a change even when its fingerprint
+        // is equal: with coarse timestamps a same-length rewrite, or two
+        // renames that reuse an inode within one tick, leave the fingerprint
+        // as it was, and the poll compares only fingerprints.
+        let forced = match self.watcher.as_mut() {
+            Some(w) => {
+                let m = w.read_matched(&[&self.site_name, &self.process_name]);
+                Changed {
+                    site: m[0],
+                    process: m[1],
+                }
+            }
+            None => Changed::default(),
+        };
+        self.compare(now, forced);
     }
 
     /// Call on every loop iteration. Returns the change when a report is due.
     pub fn tick(&mut self, now: Instant) -> Option<Changed> {
         if now >= self.next_poll {
-            self.compare(now);
+            self.compare(now, Changed::default());
             self.next_poll = now + RELOAD_POLL;
         }
         if self.due.is_some_and(|due| now >= due) {
@@ -503,16 +544,16 @@ impl ConfigReloader {
     /// Fingerprint both files and mark each that moved. The new fingerprint is
     /// stored at once, so a file that fails to load is not retried until it is
     /// written again.
-    fn compare(&mut self, now: Instant) {
+    fn compare(&mut self, now: Instant, forced: Changed) {
         let site = Fingerprint::of(&self.site_toml);
         let process = Fingerprint::of(&self.process);
         let mut hit = false;
-        if site != self.seen.site {
+        if forced.site || site != self.seen.site {
             self.seen.site = site;
             self.pending.site = true;
             hit = true;
         }
-        if process != self.seen.process {
+        if forced.process || process != self.seen.process {
             self.seen.process = process;
             self.pending.process = true;
             hit = true;
@@ -879,6 +920,22 @@ mod tests {
         let at = t0 + Duration::from_millis(40);
         r.next_poll_for_test(at);
         assert!(r.tick(at).is_some(), "a change 40 ms later was held back");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_event_naming_a_file_is_a_change_even_when_its_fingerprint_is_equal() {
+        let (_d, site, proc, seen) = pair();
+        let mut r = ConfigReloader::new(&site, &proc, seen);
+        put(&proc, "b = 2\n");
+        // Coarse timestamps can leave the fingerprint of a same-length rewrite
+        // equal. Make it so: the reloader already holds the post-write one.
+        r.seen = Seen::read(&site, &proc);
+        let fd = r.raw_fd().unwrap();
+        assert!(crate::server::poll_listener_and_watcher(fd, None, 5_000).listener);
+        r.on_readable(Instant::now());
+        let c = r.tick(Instant::now()).expect("the event was a change");
+        assert!(c.process && !c.site, "{c:?}");
     }
 
     #[test]
