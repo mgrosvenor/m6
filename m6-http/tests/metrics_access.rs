@@ -677,7 +677,7 @@ fn a_forwarded_address_naming_a_listed_peer_does_not_open_perf() {
 fn perf_is_refused_on_an_internal_h2c_listener() {
     let run = Fixture::new(
         &gated(),
-        "h2c_bind = \"{H2C}\"\ninternal_binds = [\"{H2C}\"]\n",
+        "h2c_bind = \"{H2C}\"\ninternal_binds = [\"{H2C}\"]\ninternal_peers = [\"127.0.0.1\"]\n",
         "",
     )
     .start();
