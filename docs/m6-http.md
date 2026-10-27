@@ -164,7 +164,7 @@ A refusal never reaches routing or the cache, so a catch-all route can never ans
 | Key | Where | Meaning |
 |---|---|---|
 | `[auth] public_key` | `site.toml` or system config, not both | Key that verifies API tokens. Absolute path in the system config |
-| `[health] metrics_require` | either file, system config wins | `role:<name>` or `group:<name>`. An API token with the claim is required |
+| `[health] metrics_require` | either file, system config wins | `role:<name>` or `group:<name>`. A token with the claim is required, from the Authorization header or the session cookie, as route `require` reads it |
 | `[health] metrics_peers` | either file, system config wins | IP addresses in a local range. Any other peer gets 404 |
 | `[health] metrics_token_file` | `site.toml` | Legacy bearer string. Ignored when `metrics_require` is set |
 
@@ -175,7 +175,7 @@ The checks run in this order, as Table 2 shows.
 | Step | Check | Refusal |
 |---|---|---|
 | 1 | `metrics_peers` set: not on an internal h2c listener, and the peer address is listed | 404, the body of a disabled endpoint, before any token is read |
-| 2 | `metrics_require` set: API token verifies and holds the claim | 401 for no or a bad token, 403 for the wrong claim |
+| 2 | `metrics_require` set: the token (Authorization header or session cookie) verifies and holds the claim | 401 for no or a bad token, 403 for the wrong claim |
 | 2 | `metrics_require` unset: the legacy bearer string matches | 404 when no string is configured, 401 when it does not match |
 
 *Table 2: the metrics gate, in order. A request reaches the report only when every step that applies passes.*
@@ -195,7 +195,7 @@ The cache-hit path is unchanged.
 | Change | Response |
 |---|---|
 | `site.toml` touched or modified | Reload routing, pools, auth config, invalidation map |
-| System config modified | Re-merge `[server]` with `site.toml`, reload TLS context. `[auth]` and `[health]` keys in it apply on restart or on the next `site.toml` reload |
+| System config modified | Not watched. A change applies on the next `site.toml` reload or on a restart |
 | TLS cert/key file modified | Reload TLS context |
 | Socket appears in `/run/m6/` matching a pool glob | Add to pool |
 | Socket disappears from `/run/m6/` | Remove from pool |

@@ -377,7 +377,7 @@ The monitoring endpoints, answered inside m6-http ahead of routing, the cache an
 | `traffic_path` | string | `"/traffic"` | Summary of the last hour of the analytics log |
 | `traffic_cache_s` | integer | `60` | Seconds a `/traffic` summary is reused |
 | `metrics_token_file` | string | none | The legacy gate. Path to a file holding a bearer string. Ignored when `metrics_require` is set |
-| `metrics_require` | string | none | `"role:<name>"` or `"group:<name>"`. An API token with this claim opens `/perf` and `/traffic` |
+| `metrics_require` | string | none | `"role:<name>"` or `"group:<name>"`. A token with this claim opens `/perf` and `/traffic`. It comes from the Authorization header or the session cookie, as route `require` reads it |
 | `metrics_peers` | list of strings | none | IP addresses allowed to read `/perf` and `/traffic`. Anyone else gets 404 |
 
 The system config accepts `metrics_require` and `metrics_peers` only.
@@ -387,7 +387,7 @@ A request is served only when both rules pass, checked in this order.
 
 1. `metrics_peers`, when set: the request did not arrive on an internal h2c listener, and its peer address is one of the listed addresses.
    Otherwise the answer is 404 with the body of an endpoint that is not enabled, before any token is read.
-2. `metrics_require`, when set: the request carries an API token that `[auth] public_key` verifies and that holds the claim.
+2. `metrics_require`, when set: the request carries a token, from the Authorization header or the session cookie as route `require` reads it, that `[auth] public_key` verifies and that holds the claim.
    No token or a bad token is 401 with `WWW-Authenticate: Bearer`.
    A valid token without the claim is 403.
    When `metrics_require` is unset, the legacy `metrics_token_file` gate applies.
