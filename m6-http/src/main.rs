@@ -79,6 +79,14 @@ const TOKEN_H2C_CLIENT: Token = Token(4);
 const TOKEN_H2S_CLIENT: Token = Token(5);
 const TOKEN_WAKE: Token = Token(6);
 const TOKEN_CONFIG: Token = Token(7);
+/// How long after a `site.toml` reload the cache is emptied a second time.
+///
+/// A backend that reloads after m6-http can answer a request in the gap with
+/// the old page, and that response is cached. The second clear, one settle
+/// window after the first, removes it, whichever order the reloads landed in.
+/// It costs one extra cache clear about 100 ms after a content change. A
+/// second `site.toml` change inside the window re-arms it.
+const CACHE_SECOND_CLEAR: std::time::Duration = std::time::Duration::from_millis(100);
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
 // ── Shutdown flags ───────────────────────────────────────────────────────────
@@ -634,6 +642,8 @@ fn event_loop(
     // When no filesystem watcher is available (e.g. macOS), rescan backend
     // socket globs every 2 seconds so new workers are picked up automatically.
     let rescan_interval = std::time::Duration::from_secs(2);
+    // When the cache is to be emptied again after a `site.toml` reload.
+    let mut second_clear: Option<std::time::Instant> = None;
     let mut last_rescan = std::time::Instant::now()
         .checked_sub(rescan_interval)
         .unwrap_or_else(std::time::Instant::now);
@@ -1432,6 +1442,9 @@ fn event_loop(
         // comparisons when nothing changed.
         if let Some(changed) = reloader.tick(now) {
             let r = handle_config_change(changed, state, quiche_config, tcp.as_mut(), log_handle);
+            if r.cache_cleared {
+                second_clear = Some(now + CACHE_SECOND_CLEAR);
+            }
             if r.tls_failed {
                 let d = reloader.retry(
                     Changed {
@@ -1445,6 +1458,11 @@ fn event_loop(
                     "TLS reload failed after a process config change; trying again"
                 );
             }
+        }
+        if second_clear.is_some_and(|t| now >= t) {
+            state.cache.clear();
+            second_clear = None;
+            info!("config reload: cache cleared again after the settle window");
         }
     }
 
