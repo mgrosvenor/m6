@@ -42,8 +42,15 @@
 //! rate is computed on output. A percentile is `NULL` when its sample count
 //! is 0, and an absent figure is `null` in the output and never 0.
 //!
-//! Names of nodes, channels, interfaces, user agents and builds sit in lookup
-//! tables that are append-only, so an id is never rewritten.
+//! Names of nodes, channels, interfaces and builds sit in lookup tables that
+//! are append-only, so an id is never rewritten. A user agent is text a visitor
+//! chooses, so its table is not append-only. Pruning deletes the user agents
+//! that no remaining sighting names.
+//!
+//! One node window stores at most 100 crawler sightings, the ones with the
+//! most requests, and each user agent is cut to 256 bytes. Agents that are
+//! equal after the cut share one sighting. `crawl_window.sightings_dropped`
+//! and the `/crawlers` key `sightings_dropped` say how many were left out.
 //!
 //! ## Crawler cadence
 //!
@@ -123,7 +130,7 @@
 //! `at_unix_ms`, `node`, `window_minutes`, `total_requests`, `status` (a map
 //! from response code to count), `forged_bot_requests`, `forgers` and
 //! `crawlers`, each crawler being `user_agent`, `requests`, `client_ips` and
-//! `paths`.
+//! `paths`, and `sightings_dropped`.
 //!
 //! The reader opens its own read-only connection, copies the page's rows out
 //! with one indexed query, and closes the connection before it serialises, so
@@ -142,6 +149,7 @@
 //! To start fresh, stop the service, delete the file and start it again.
 //! Migration 1 is permanent: a later release adds columns in migration 2.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -221,7 +229,8 @@ CREATE TABLE crawl_window (
   poll_id INTEGER NOT NULL REFERENCES poll(id) ON DELETE CASCADE,
   at_ms INTEGER NOT NULL, node_id INTEGER NOT NULL REFERENCES node(id),
   window_minutes INTEGER NOT NULL, total_requests INTEGER NOT NULL,
-  forged_bot_requests INTEGER NOT NULL, forgers TEXT NOT NULL) STRICT;
+  forged_bot_requests INTEGER NOT NULL, forgers TEXT NOT NULL,
+  sightings_dropped INTEGER NOT NULL DEFAULT 0) STRICT;
 CREATE INDEX crawl_window_poll ON crawl_window (poll_id);
 CREATE INDEX crawl_window_at ON crawl_window (at_ms);
 CREATE INDEX crawl_window_node_at ON crawl_window (node_id, at_ms);
@@ -241,7 +250,14 @@ const MIGRATIONS: &[Migration] = &[Migration {
     sql: SCHEMA_V1,
 }];
 
-const LOOKUP_TABLES: [&str; 5] = ["node", "channel", "iface", "agent", "build"];
+/// Lookup tables that are never pruned. `agent` is not here: a user agent is
+/// text a visitor chooses, so its rows go when no sighting names them.
+const LOOKUP_TABLES: [&str; 4] = ["node", "channel", "iface", "build"];
+
+/// The longest user agent stored, in bytes.
+const MAX_AGENT_BYTES: usize = 256;
+/// The most crawler sightings stored for one node window.
+const MAX_SIGHTINGS: usize = 100;
 
 // ── configuration ────────────────────────────────────────────────────────────
 
@@ -642,6 +658,10 @@ impl Store {
         for t in LOOKUP_TABLES {
             sqlite::append_only(&conn, t)?;
         }
+        conn.execute_batch(
+            "DROP TRIGGER IF EXISTS agent_append_only_update; \
+             DROP TRIGGER IF EXISTS agent_append_only_delete;",
+        )?;
         let mut last_crawl_at = HashMap::new();
         {
             let mut stmt =
@@ -804,21 +824,40 @@ impl Store {
             }
         }
         tx.commit()?;
+        // A user agent is not kept for the next poll: most never come back.
+        self.agents.ids.clear();
         for (n, at) in crawled {
             self.last_crawl_at.insert(n, at);
         }
         Ok(w)
     }
 
-    /// Delete the oldest polls when the file's used bytes pass the cap.
+    /// Delete the oldest polls when the file's used bytes pass the cap, and
+    /// with each batch the user agents no sighting names any more.
     fn prune(&mut self, w: &mut Written) -> anyhow::Result<()> {
         let mut used = sqlite::used_bytes(&self.conn)?;
         if used > self.max_bytes {
             let target = self.max_bytes - self.max_bytes / 20;
-            let p = sqlite::prune_oldest(&mut self.conn, "poll", PRUNE_BATCH, target)?;
-            w.pruned = p.rows_deleted;
-            w.cap_unmet = !p.cap_met;
-            used = sqlite::used_bytes(&self.conn)?;
+            while used > target {
+                let tx = self
+                    .conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let n = tx.execute(
+                    "DELETE FROM poll WHERE id IN (SELECT id FROM poll ORDER BY id LIMIT ?1)",
+                    [PRUNE_BATCH],
+                )?;
+                tx.execute(
+                    "DELETE FROM agent WHERE id NOT IN (SELECT agent_id FROM crawl_sighting)",
+                    [],
+                )?;
+                tx.commit()?;
+                if n == 0 {
+                    break;
+                }
+                w.pruned += n as u64;
+                used = sqlite::used_bytes(&self.conn)?;
+            }
+            w.cap_unmet = used > target;
         }
         w.used_bytes = used;
         w.file_bytes = std::fs::metadata(&self.path).map_or(0, |m| m.len());
@@ -833,6 +872,67 @@ impl Store {
     }
 }
 
+/// A crawler sighting as stored: the agent cut to [`MAX_AGENT_BYTES`].
+struct Capped<'a> {
+    user_agent: &'a str,
+    requests: i64,
+    client_ips: Cow<'a, [String]>,
+    paths: Cow<'a, [String]>,
+}
+
+/// The longest prefix of `s` of at most `max` bytes that ends on a character.
+fn truncate_utf8(s: &str, max: usize) -> &str {
+    let mut n = max.min(s.len());
+    while !s.is_char_boundary(n) {
+        n -= 1;
+    }
+    &s[..n]
+}
+
+fn merge_list(into: &mut Cow<'_, [String]>, more: &[String]) {
+    let v = into.to_mut();
+    for s in more {
+        if !v.contains(s) {
+            v.push(s.clone());
+        }
+    }
+}
+
+/// The sightings a window stores, busiest first, and how many were left out.
+///
+/// Agents that are equal once cut share one sighting, with their requests
+/// added. At most [`MAX_SIGHTINGS`] stay. Ties go to the lower agent text, so
+/// the choice is the same on every run.
+fn cap_sightings(crawlers: &[CrawlerReport]) -> (Vec<Capped<'_>>, i64) {
+    let mut out: Vec<Capped> = Vec::with_capacity(crawlers.len().min(MAX_SIGHTINGS * 2));
+    let mut at: HashMap<&str, usize> = HashMap::with_capacity(crawlers.len());
+    for c in crawlers {
+        let ua = truncate_utf8(&c.user_agent, MAX_AGENT_BYTES);
+        if let Some(&k) = at.get(ua) {
+            let m = &mut out[k];
+            m.requests = m.requests.saturating_add(i(c.requests));
+            merge_list(&mut m.client_ips, &c.client_ips);
+            merge_list(&mut m.paths, &c.paths);
+        } else {
+            at.insert(ua, out.len());
+            out.push(Capped {
+                user_agent: ua,
+                requests: i(c.requests),
+                client_ips: Cow::Borrowed(&c.client_ips),
+                paths: Cow::Borrowed(&c.paths),
+            });
+        }
+    }
+    out.sort_by(|a, b| {
+        b.requests
+            .cmp(&a.requests)
+            .then_with(|| a.user_agent.cmp(b.user_agent))
+    });
+    let dropped = out.len().saturating_sub(MAX_SIGHTINGS);
+    out.truncate(MAX_SIGHTINGS);
+    (out, iu(dropped))
+}
+
 fn insert_window(
     agents: &mut Interner,
     tx: &Transaction,
@@ -841,9 +941,10 @@ fn insert_window(
     node_id: i64,
     c: &CrawlSnapshot,
 ) -> anyhow::Result<()> {
+    let (sightings, dropped) = cap_sightings(&c.crawlers);
     tx.prepare_cached(
         "INSERT INTO crawl_window (poll_id, at_ms, node_id, window_minutes, total_requests, \
-         forged_bot_requests, forgers) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+         forged_bot_requests, forgers, sightings_dropped) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
     )?
     .execute(params![
         poll_id,
@@ -852,7 +953,8 @@ fn insert_window(
         c.window_minutes,
         c.total_requests,
         c.forged_bot_requests,
-        serde_json::to_string(&c.forgers)?
+        serde_json::to_string(&c.forgers)?,
+        dropped
     ])?;
     let window_id = tx.last_insert_rowid();
     for (code, n) in &c.status {
@@ -861,8 +963,8 @@ fn insert_window(
         )?
         .execute(params![window_id, code, n])?;
     }
-    for s in &c.crawlers {
-        let agent_id = agents.id(tx, &[&s.user_agent])?;
+    for s in &sightings {
+        let agent_id = agents.id(tx, &[s.user_agent])?;
         tx.prepare_cached(
             "INSERT INTO crawl_sighting (window_id, agent_id, requests, client_ips, paths) \
              VALUES (?1,?2,?3,?4,?5)",
@@ -870,7 +972,7 @@ fn insert_window(
         .execute(params![
             window_id,
             agent_id,
-            i(s.requests),
+            s.requests,
             serde_json::to_string(&s.client_ips)?,
             serde_json::to_string(&s.paths)?
         ])?;
@@ -1561,6 +1663,7 @@ pub struct CrawlOut {
     pub forged_bot_requests: i64,
     pub forgers: Vec<String>,
     pub crawlers: Vec<SightingOut>,
+    pub sightings_dropped: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -1587,7 +1690,7 @@ pub fn crawl_page(
     let mut out: Vec<CrawlOut> = {
         let mut stmt = conn.prepare(
             "SELECT w.id, w.at_ms, n.name, w.window_minutes, w.total_requests, \
-             w.forged_bot_requests, w.forgers FROM crawl_window w JOIN node n ON n.id = w.node_id \
+             w.forged_bot_requests, w.forgers, w.sightings_dropped FROM crawl_window w JOIN node n ON n.id = w.node_id \
              WHERE w.at_ms >= ?1 AND w.at_ms < ?2 AND (?3 IS NULL OR w.node_id = ?3) \
              AND (?4 IS NULL OR w.at_ms > ?4 OR (w.at_ms = ?4 AND w.id >= ?5)) \
              ORDER BY w.at_ms, w.id LIMIT ?6",
@@ -1606,6 +1709,7 @@ pub fn crawl_page(
                 forged_bot_requests: r.get(5)?,
                 forgers: json_list(&r.get::<_, String>(6)?),
                 crawlers: Vec::new(),
+                sightings_dropped: r.get(7)?,
             })
         })?;
         mapped.collect::<rusqlite::Result<_>>()?
@@ -1836,6 +1940,7 @@ mod tests {
             assert!(sqlite::is_append_only(&s.conn, t).unwrap(), "{t}");
         }
         for t in [
+            "agent",
             "poll",
             "health",
             "health_channel",
@@ -2363,7 +2468,7 @@ mod tests {
             keys(&v),
             words(
                 "id at at_unix_ms node window_minutes total_requests status \
-                 forged_bot_requests forgers crawlers"
+                 forged_bot_requests forgers crawlers sightings_dropped"
             )
         );
         assert_eq!(v["status"]["404"], 100);
@@ -2561,5 +2666,119 @@ mod tests {
             "the history writer has stopped, so no history is being kept"
         );
         assert_eq!(h.digest().state, "stopped");
+    }
+
+    fn crawl_reading(name: &str, crawlers: Vec<CrawlerReport>) -> NodeReading {
+        let mut r = reading(name);
+        r.traffic = Some(traffic(60, crawlers));
+        r
+    }
+
+    fn sighting(ua: String, requests: u64) -> CrawlerReport {
+        CrawlerReport {
+            user_agent: ua,
+            requests,
+            ..crawler("x")
+        }
+    }
+
+    #[test]
+    fn one_window_stores_at_most_100_sightings_of_at_most_256_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(dir.path());
+        let crawlers: Vec<CrawlerReport> = (0..150u64)
+            .map(|k| sighting(format!("{k:04}-{}", "\u{e9}".repeat(300)), k + 1))
+            .collect();
+        s.write(&make(T0, &[crawl_reading("a", crawlers)])).unwrap();
+        assert_eq!(count(&s, "crawl_sighting"), 100);
+        assert_eq!(count(&s, "agent"), 100);
+        let longest: i64 = s
+            .conn
+            .query_row(
+                "SELECT max(length(CAST(user_agent AS BLOB))) FROM agent",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(longest <= 256, "{longest}");
+        let fewest: i64 = s
+            .conn
+            .query_row("SELECT min(requests) FROM crawl_sighting", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fewest, 51, "the busiest 100 are kept");
+        let dropped: i64 = s
+            .conn
+            .query_row("SELECT sightings_dropped FROM crawl_window", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(dropped, 50);
+        let rows = crawl_page(&s.conn, T0, T0 + 1000, None, None, 10).unwrap();
+        assert_eq!(rows[0].sightings_dropped, 50);
+        assert_eq!(rows[0].crawlers.len(), 100);
+    }
+
+    #[test]
+    fn agents_that_match_after_truncation_are_one_sighting() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(dir.path());
+        let prefix = "p".repeat(300);
+        let crawlers = vec![
+            sighting(format!("{prefix}one"), 5),
+            sighting(format!("{prefix}two"), 7),
+        ];
+        s.write(&make(T0, &[crawl_reading("a", crawlers)])).unwrap();
+        assert_eq!(count(&s, "crawl_sighting"), 1);
+        let (n, dropped): (i64, i64) = s
+            .conn
+            .query_row(
+                "SELECT s.requests, w.sightings_dropped FROM crawl_sighting s \
+                 JOIN crawl_window w ON w.id = s.window_id",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((n, dropped), (12, 0));
+    }
+
+    #[test]
+    fn unique_agents_across_many_windows_keep_the_file_under_its_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Store::open(&cfg(dir.path(), 8)).unwrap();
+        let mut pruned = 0;
+        let windows = 1500i64;
+        for k in 0..windows {
+            let crawlers = (0..20u64)
+                .map(|j| sighting(format!("bot-{k}-{j}-{}", "x".repeat(300)), 1 + j))
+                .collect();
+            let w = s
+                .write(&make(T0 + k * 3_600_000, &[crawl_reading("a", crawlers)]))
+                .unwrap();
+            assert!(!w.cap_unmet, "window {k}: the cap could not be met");
+            pruned += w.pruned;
+        }
+        assert!(pruned > 0, "the cap was never reached");
+        assert!(
+            file_len(dir.path()) <= (8 << 20) + 65_536,
+            "{}",
+            file_len(dir.path())
+        );
+        let (polls, newest): (i64, i64) = s
+            .conn
+            .query_row("SELECT count(*), max(at_ms) FROM poll", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert!(polls >= 100, "{polls}");
+        assert_eq!(newest, T0 + (windows - 1) * 3_600_000);
+        let unused: i64 = s
+            .conn
+            .query_row(
+                "SELECT count(*) FROM agent WHERE id NOT IN (SELECT agent_id FROM crawl_sighting)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unused, 0, "an agent nothing references was kept");
     }
 }
