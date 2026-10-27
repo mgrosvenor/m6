@@ -1553,15 +1553,52 @@ fn site_toml_or_exit(
     config: &crate::config::RendererConfig,
     site_dir: &std::path::Path,
 ) -> PathBuf {
-    let site_toml = config.resolve_site_toml(site_dir);
-    if config.site_toml.is_some() && !site_toml.exists() {
-        eprintln!(
-            "Config error: site_toml = {} does not exist",
-            site_toml.display()
-        );
-        std::process::exit(2);
+    match check_site_toml(config, site_dir) {
+        Ok(path) => path,
+        Err(msg) => {
+            eprintln!("Config error: {msg}");
+            std::process::exit(2);
+        }
     }
-    site_toml
+}
+
+/// The checking half of [`site_toml_or_exit`].
+///
+/// A named `site_toml` is read and parsed once here. A directory, a file that
+/// cannot be read and a file that is not valid TOML are all refused, because
+/// the readers of `site.toml` fall back to defaults on any of them and would
+/// hide a disagreement the operator wants to hear about.
+fn check_site_toml(
+    config: &crate::config::RendererConfig,
+    site_dir: &std::path::Path,
+) -> std::result::Result<PathBuf, String> {
+    let site_toml = config.resolve_site_toml(site_dir);
+    if config.site_toml.is_none() {
+        return Ok(site_toml);
+    }
+    let text = match std::fs::read_to_string(&site_toml) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!(
+                "site_toml = {} does not exist",
+                site_toml.display()
+            ));
+        }
+        Err(e) => {
+            return Err(format!(
+                "site_toml = {} cannot be read: {e}",
+                site_toml.display()
+            ));
+        }
+    };
+    if let Err(e) = text.parse::<toml::Table>() {
+        return Err(format!(
+            "site_toml = {} is not valid TOML: {}",
+            site_toml.display(),
+            e.message()
+        ));
+    }
+    Ok(site_toml)
 }
 
 /// What a service was started with, for building its shared state.
@@ -3175,6 +3212,83 @@ fn handle_request<W: std::io::Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A renderer config that names `site_toml`, or does not when `None`.
+    fn config_naming(
+        dir: &std::path::Path,
+        site_toml: Option<&str>,
+    ) -> crate::config::RendererConfig {
+        let cfg = dir.join("app.toml");
+        let body = match site_toml {
+            Some(p) => format!("site_toml = \"{p}\"\n"),
+            None => "site_name = \"x\"\n".to_string(),
+        };
+        std::fs::write(&cfg, body).unwrap();
+        crate::config::load(&cfg, dir).unwrap()
+    }
+
+    #[test]
+    fn named_site_toml_that_is_valid_passes() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("s.toml"), "[server]\ncompresses = true\n").unwrap();
+        let cfg = config_naming(d.path(), Some("s.toml"));
+        assert_eq!(
+            check_site_toml(&cfg, d.path()).unwrap(),
+            d.path().join("s.toml")
+        );
+    }
+
+    #[test]
+    fn named_site_toml_missing_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = config_naming(d.path(), Some("absent.toml"));
+        let e = check_site_toml(&cfg, d.path()).unwrap_err();
+        assert!(e.contains("does not exist"), "{e}");
+    }
+
+    #[test]
+    fn named_site_toml_that_is_a_directory_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir(d.path().join("s.toml")).unwrap();
+        let cfg = config_naming(d.path(), Some("s.toml"));
+        let e = check_site_toml(&cfg, d.path()).unwrap_err();
+        assert!(e.contains("cannot be read"), "{e}");
+    }
+
+    #[test]
+    fn named_site_toml_that_is_unreadable_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        // root reads any file, so the test would prove nothing.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("s.toml");
+        std::fs::write(&f, "[server]\n").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let cfg = config_naming(d.path(), Some("s.toml"));
+        let e = check_site_toml(&cfg, d.path()).unwrap_err();
+        assert!(e.contains("cannot be read"), "{e}");
+    }
+
+    #[test]
+    fn named_site_toml_that_is_not_toml_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("s.toml"), "[server\ncompresses = \n").unwrap();
+        let cfg = config_naming(d.path(), Some("s.toml"));
+        let e = check_site_toml(&cfg, d.path()).unwrap_err();
+        assert!(e.contains("not valid TOML"), "{e}");
+    }
+
+    #[test]
+    fn unnamed_site_toml_keeps_its_tolerance() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = config_naming(d.path(), None);
+        // Absent, a directory and invalid TOML at the default path all pass.
+        assert!(check_site_toml(&cfg, d.path()).is_ok());
+        std::fs::write(d.path().join("site.toml"), "[server\n").unwrap();
+        assert!(check_site_toml(&cfg, d.path()).is_ok());
+    }
 
     #[test]
     fn test_compile_pattern() {
