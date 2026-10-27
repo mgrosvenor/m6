@@ -708,6 +708,7 @@ struct RawSystemToml {
 
 /// The `[health]` keys the system config may carry. Anything else fails to
 /// parse, so a misplaced key is loud instead of ignored.
+/// `NODE_HEALTH_KEYS` lists the same keys for `misplaced_keys`; change both together.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawSystemHealth {
@@ -803,6 +804,18 @@ fn validate_internal_binds(
     Ok(())
 }
 
+/// Whether `site.toml` and the system config are one file (one-file mode, as a
+/// development script runs). A path that cannot be resolved is not one file.
+fn is_one_file(site_toml: &Path, system_config: &Path) -> bool {
+    match (
+        std::fs::canonicalize(site_toml),
+        std::fs::canonicalize(system_config),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// Load and merge configs. Returns Config on success. Returns error with
 /// message suitable for exit-2 on any validation failure.
 pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config> {
@@ -819,14 +832,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         .with_context(|| format!("parsing {}", system_config_path.display()))?;
     // When both arguments name the same file, its [auth] and [health] belong
     // to the site config alone, not to a second declaration.
-    let one_file = match (
-        std::fs::canonicalize(&site_toml_path),
-        std::fs::canonicalize(system_config_path),
-    ) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
-    };
-    if one_file {
+    if is_one_file(&site_toml_path, system_config_path) {
         system_parsed.auth = None;
         system_parsed.health = None;
     }
@@ -1239,6 +1245,7 @@ const NODE_SERVER_KEYS: &[&str] = &[
     "redirect_bind",
     "warm_on_start",
 ];
+/// The fields of `RawSystemHealth`; change both together.
 const NODE_HEALTH_KEYS: &[&str] = &["metrics_token_file", "metrics_require", "metrics_peers"];
 /// Keys that describe how the site's routes are served. They belong in
 /// `site.toml`.
@@ -1257,13 +1264,8 @@ const SITE_SERVER_KEYS: &[&str] = &["backend_timeout_secs", "allowed_methods"];
 /// `load` reports those.
 pub fn misplaced_keys(site_dir: &Path, system_config_path: &Path) -> Vec<String> {
     let site_toml_path = site_dir.join("site.toml");
-    if let (Ok(a), Ok(b)) = (
-        std::fs::canonicalize(&site_toml_path),
-        std::fs::canonicalize(system_config_path),
-    ) {
-        if a == b {
-            return Vec::new();
-        }
+    if is_one_file(&site_toml_path, system_config_path) {
+        return Vec::new();
     }
     let read = |p: &Path| -> Option<toml::Value> {
         std::fs::read_to_string(p).ok()?.parse::<toml::Value>().ok()

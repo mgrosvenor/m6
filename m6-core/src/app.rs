@@ -1227,8 +1227,6 @@ fn run_app_thread_state<T: Any + Send + 'static>(
         std::process::exit(2);
     });
 
-    let _ = site_toml_or_exit(&config, &site_dir);
-
     // Set up TLS init fn (closes over config dict).
     let cfg_clone: Map<String, Value> = config.user_config.clone();
     let init_fn = init_thread.clone();
