@@ -979,14 +979,10 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         health.metrics_require = sys.metrics_require.or(health.metrics_require);
         health.metrics_peers = sys.metrics_peers.or(health.metrics_peers);
         if let Some(p) = sys.metrics_token_file {
-            // A relative path here would resolve against the process's working
-            // directory, which is surprising for a file named beside the
-            // system config.
-            if !Path::new(&p).is_absolute() {
-                anyhow::bail!(
-                    "config error: [health].metrics_token_file in the system config must be an absolute path, got \"{p}\""
-                );
-            }
+            // A relative path resolves against the site directory, as
+            // `tls_cert` does, so the service does not depend on the working
+            // directory it was started from.
+            let p = resolve_path(site_dir, &p).to_string_lossy().into_owned();
             health.metrics_token_file = Some(p);
         }
     }
@@ -1073,14 +1069,8 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
             "config error: [auth] is declared in both site.toml and the system config; declare it in one"
         ),
         (None, Some(a)) => {
-            // A relative path here would resolve against the site directory,
-            // which is surprising for a file that sits beside the system config.
-            if !Path::new(&a.public_key).is_absolute() {
-                anyhow::bail!(
-                    "config error: [auth].public_key in the system config must be an absolute path, got \"{}\"",
-                    a.public_key
-                );
-            }
+            // A relative `public_key` resolves against the site directory below,
+            // as `tls_cert` does.
             Some(a)
         }
         (site, None) => site,
@@ -2080,11 +2070,20 @@ internal_binds = ["203.0.113.7:80"]
     }
 
     #[test]
-    fn a_relative_public_key_in_the_system_config_is_refused() {
+    fn a_relative_public_key_in_the_system_config_resolves_against_the_site_dir() {
         let (_d, r) = load_with("", "\n[auth]\npublic_key = \"auth.pem\"\n");
-        assert_eq!(
-            r.unwrap_err().to_string(),
-            "config error: [auth].public_key in the system config must be an absolute path, got \"auth.pem\""
+        // load_with writes auth.pem into the site directory.
+        let auth = r.unwrap().auth.expect("auth present");
+        assert_eq!(auth.public_key, "auth.pem");
+    }
+
+    #[test]
+    fn a_relative_public_key_in_the_system_config_must_exist_in_the_site_dir() {
+        let (_d, r) = load_with("", "\n[auth]\npublic_key = \"missing.pem\"\n");
+        let e = r.unwrap_err().to_string();
+        assert!(
+            e.contains("[auth].public_key file not found") && e.ends_with("/missing.pem"),
+            "{e}"
         );
     }
 
@@ -2265,13 +2264,22 @@ internal_binds = ["203.0.113.7:80"]
     }
 
     #[test]
-    fn a_relative_metrics_token_file_in_the_system_config_is_refused() {
-        let (_d, r) = load_with("", "\n[health]\nmetrics_token_file = \"token\"\n");
-        let e = format!("{:#}", r.unwrap_err());
-        assert!(
-            e.contains("metrics_token_file in the system config must be an absolute path"),
-            "{e}"
+    fn a_relative_metrics_token_file_in_the_system_config_resolves_against_the_site_dir() {
+        let dir = make_test_dir();
+        setup_minimal(dir.path());
+        std::fs::write(dir.path().join("token"), "from-site-dir\n").unwrap();
+        write_file(dir.path(), "site.toml", &minimal_site_toml());
+        let mut sys = minimal_system_toml();
+        sys.push_str("\n[health]\nmetrics_token_file = \"token\"\n");
+        write_file(dir.path(), "system.toml", &sys);
+        let h = load(dir.path(), &dir.path().join("system.toml"))
+            .unwrap()
+            .health;
+        assert_eq!(
+            h.metrics_token_file.as_deref(),
+            dir.path().join("token").to_str()
         );
+        assert_eq!(h.metrics_token.as_deref(), Some("from-site-dir"));
     }
 
     /// Write `site` and `system` into a fresh directory and name the misplaced keys.

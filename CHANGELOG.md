@@ -31,12 +31,16 @@ In that layout an app read no `site.toml`.
 The `[[backend]] compresses` agreement passed without checking, `[log]` fell back to its defaults, and the watch was on a directory that never held the file.
 A new reserved config key, `site_toml`, names the file.
 A relative value resolves against `site_dir`, an absolute value is used as given, and no key means `<site_dir>/site.toml` as before.
-A named file that does not exist is exit 2 at start.
+A named file that does not exist, cannot be read or is not valid TOML is exit 2 at start.
+A file at the default path keeps its tolerance.
 `--dump-config` prints the resolved path.
 `AppContext` gains a `site_toml` field, and m6-auth-server reads its issuer fallback from that file.
 
 m6-http's system config refused `[health] metrics_token_file`, a credential path, so the path could only be written in `site.toml`.
-The system config now accepts it as an absolute path, and it wins over `site.toml` like the other `[health]` keys.
+The system config now accepts it, and it wins over `site.toml` like the other `[health]` keys.
+A relative path there resolves against the site directory, as `tls_cert` does.
+The same rule now applies to `[auth] public_key` in the system config, which 1.14.0 required to be absolute.
+A relative `metrics_token_file` in `site.toml` still resolves against the working directory.
 The token is read after the two files are merged.
 
 m6-http accepted node keys in `site.toml` and site-wide keys in the system config without a word, because the system config wins and the result worked.

@@ -177,8 +177,10 @@ Everything else (routes, backends, site identity, log level) comes from `site.to
 **Merge semantics:** system config is loaded after `site.toml`.
 Its `[server]` keys win on conflict, and so do its three `[health]` keys.
 `[auth]` must be declared in one file only, and declaring it in both is a startup error.
-A system-config `[auth] public_key` must be an absolute path, because a relative path would resolve against the site directory.
-A system-config `[health] metrics_token_file` must be an absolute path for the same reason.
+A relative `[auth] public_key` in the system config resolves against the site directory, as `tls_cert` does.
+A relative `[health] metrics_token_file` in the system config resolves against the site directory too.
+An absolute path is used as given.
+A relative `metrics_token_file` in `site.toml` resolves against the working directory of the process, so write it as an absolute path there or put it in the system config.
 Any other key in the system config is ignored with a warning, and any other `[health]` key there fails to parse.
 Validation runs after merge.
 When both arguments name the same file, as a development script may do, its `[auth]` and `[health]` belong to the site config alone.
@@ -415,7 +417,7 @@ The monitoring endpoints, answered inside m6-http ahead of routing, the cache an
 | `perf_path` | string | `"/perf"` | Counters, latency percentiles and host facts |
 | `traffic_path` | string | `"/traffic"` | Summary of the last hour of the analytics log |
 | `traffic_cache_s` | integer | `60` | Seconds a `/traffic` summary is reused |
-| `metrics_token_file` | string | none | The legacy gate. Path to a file holding a bearer string. May also sit in the system config, as an absolute path, where it wins. Ignored when `metrics_require` is set |
+| `metrics_token_file` | string | none | The legacy gate. Path to a file holding a bearer string. May also sit in the system config, where it wins and a relative path resolves against the site directory. In `site.toml` a relative path resolves against the working directory, so use an absolute path. Ignored when `metrics_require` is set |
 | `metrics_require` | string | none | `"role:<name>"` or `"group:<name>"`. A token with this claim opens `/perf` and `/traffic`. It comes from the Authorization header or the session cookie, as route `require` reads it |
 | `metrics_peers` | list of strings | none | IP addresses allowed to read `/perf` and `/traffic`. Anyone else gets 404 |
 
@@ -559,7 +561,6 @@ Exit 2 on:
 - `[auth]` declared but `public_key` file not found
 - `[auth]` declared with a `backend` that is not declared in `[[backend]]`
 - `[auth]` declared in both `site.toml` and the system config
-- `[auth] public_key` in the system config that is not an absolute path
 - `[health] metrics_peers` empty, or an entry that is not an IP address (names are never resolved, ranges and ports are refused)
 - `[health] metrics_peers` entry that is not in a local range
 - `[health] metrics_require` without `[auth]`, or not `role:<name>` or `group:<name>`
