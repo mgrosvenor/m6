@@ -41,12 +41,12 @@ A renewal writes both files, then touches the system config, and m6-http reads b
 A touch that arrives before the key is written fails the pair check, keeps the running certificate on every protocol, and is retried after 1 s, doubling to 60 s.
 A system config change reloads TLS even when `site.toml` fails to load, so a `site.toml` that is mid-edit does not hold a renewal back.
 
-**A `site.toml` reload empties the cache again after 100 ms (#252).**
+**A `site.toml` reload empties the cache twice more, 100 ms and about 1 s after it ends (#252).**
 A backend that reloads after m6-http can answer a request in the gap with the old page, and m6-http caches it.
-The second clear removes it, whichever order the reloads land in.
-It costs one extra cache clear about 100 ms after a content change.
-A second change inside the window re-arms it.
-The cache-hit path is unchanged: the three cache-hit blocks in `m6-http/src/main.rs` are byte-identical to the previous release.
+m6-http now clears the cache again 100 ms after the reload ends, for a backend that held the change for the 20 ms window, and once more 1.08 s after it ends, for a backend that found the change only on its once-a-second poll.
+The delays are `RELOAD_DEBOUNCE` and `RELOAD_POLL` from m6-core plus 80 ms for the backend's own reload, and the window starts when the reload ends, so a slow reload does not use it up.
+A second change re-arms both.
+It costs one extra cache miss per page about a second after a content change, and nothing on the cache-hit path, where the three cache-hit blocks in `m6-http/src/main.rs` are byte-identical to the previous release.
 
 **m6-auth-server re-reads its signing keys on reload, and m6-monitor names its restart-only keys (#252).**
 The key-watching thread in m6-auth-server is gone, and with it the `libc` dependency it alone used.
@@ -62,12 +62,22 @@ Rotate an m6-auth-server key by writing both files and then touching its config.
 After an auth key rotation, touch m6-http's system config as well, because m6-http takes the new public key only on that touch, and until it does new tokens get 401.
 A renewal hook that touches `site.toml` no longer reloads the certificate and only empties the cache, so touch the process config instead.
 
+### Fixed
+
+**A `site.toml` change could leave a stale page in the cache when a backend reloaded after m6-http had cleared it (introduced in 1.14.0 by #244).**
+m6-http clears its cache as soon as it sees the change.
+A backend under `ConfigReloader` can hold a second report for 20 ms, and on Linux one `Request::touch` produces two reports, so the backend reloaded after the clear.
+A request in between cached the old page, and a `Cache-Control: public` page stays cached for up to 24 hours.
+The cache is now cleared twice more, as described above.
+m6-auth-server also refuses a private key that is not the pair of the public key, so a rotation caught between its two writes keeps the running keys and is retried.
+
 ### Verified
 
 - `tls_reload`: the certificate moves on HTTP/1.1, HTTP/2 and HTTP/3 after the touch, flat and through a certbot-style symlink. Writing the certificate without a touch changes nothing for 3 s. A broken `site.toml` does not hold a certificate back. A touch before the key is written lands through the retry.
 - `config_reload`: a system config touch keeps the cache and logs `cache_cleared=false`. A `site.toml` change clears it twice. A bind change is named and not applied. A system config change after a refused `site.toml` reload keeps the running routes.
 - `metrics_access`: `[health] metrics_peers` in the system config applies on HTTP/1.1, HTTP/2 and HTTP/3 without a restart, and a rotated `[auth]` key verifies after a touch and not before.
-- m6-auth-server: a rotated signing key is served after the config is touched and not before, and a garbage key leaves the old one serving.
+- `config_reload` with a real `m6-html` backend that holds the change: the new page is served within 500 ms. The second clear comes a full window after a slow reload ends, and a third clear removes a page cached after the second.
+- m6-auth-server: a mismatched key pair is refused and the matching pair lands on the retry. A rotated signing key is served after the config is touched and not before, and a garbage key leaves the old one serving.
 - m6-monitor: a changed `poll_interval_s` is named and the service keeps running.
 
 ---

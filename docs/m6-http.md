@@ -198,7 +198,7 @@ Table 1 says what each change reloads.
 
 | Change | Response |
 |---|---|
-| `site.toml` touched or modified | Reload routing, pools, the invalidation map, the error mode, the security headers, the log level and the auth key. The cache is cleared, and cleared again 100 ms later |
+| `site.toml` touched or modified | Reload routing, pools, the invalidation map, the error mode, the security headers, the log level and the auth key. The cache is cleared, and cleared again 100 ms and 1.08 s after the reload ends |
 | System config touched or modified | Reload TLS on HTTP/1.1, HTTP/2 and HTTP/3 from the configured paths, the auth key, the `[health]` access keys, the node name, `allowed_methods` and `backend_timeout_secs`. The cache is kept |
 | Both files in one burst | The union of the two rows |
 | Certificate or key file written | Nothing, until the system config is touched |
@@ -208,8 +208,11 @@ Table 1 says what each change reloads.
 **Table 1: what a change to each file or directory reloads in m6-http.**
 Take from it that only a `site.toml` change empties the cache, and that new key material needs a touch of the system config.
 
-The second cache clear covers a backend that reloads after m6-http.
-A request in that gap can fill the cache with the old page, and the clear 100 ms later removes it.
+The later cache clears cover a backend that reloads after m6-http.
+A request in that gap can fill the cache with the old page.
+The clear 100 ms after the reload ends covers a backend that held the change for its 20 ms window, and the clear 1.08 s after covers a backend that found the change only on its once-a-second poll.
+Each delay is the m6-core constant (`RELOAD_DEBOUNCE`, `RELOAD_POLL`) plus 80 ms for the backend's own reload.
+The cost is one extra cache miss per page about a second after a content change.
 The cache-hit path is unchanged.
 
 A reload logs `config reload: complete` with the fields `site`, `process`, `cache_cleared` and `elapsed_us`.
