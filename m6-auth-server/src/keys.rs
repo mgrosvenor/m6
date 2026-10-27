@@ -41,10 +41,34 @@ impl KeyMaterial {
             )
         })?;
 
-        let jwt = JwtEngine::new(&private_pem, &public_pem, issuer)?;
+        let jwt = JwtEngine::new(&private_pem, &public_pem, issuer.clone())?;
+        check_pair(&jwt, &issuer)?;
         Ok(KeyMaterial {
             jwt,
             public_key_pem: public_pem,
         })
     }
+}
+
+/// Sign a probe token with the private key and verify it with the public key.
+///
+/// Both files parse on their own, so a rotation caught between its two writes
+/// loads a private key beside the previous public key without an error. Every
+/// token signed afterwards would then fail to verify. An `Err` here keeps the
+/// running keys, and core retries the reload with a growing delay.
+fn check_pair(jwt: &JwtEngine, issuer: &str) -> anyhow::Result<()> {
+    let now = crate::jwt::now_secs();
+    let claims = crate::jwt::AccessClaims {
+        iss: issuer.to_string(),
+        sub: "key-pair-check".to_string(),
+        exp: now + 60,
+        iat: now,
+        username: String::new(),
+        groups: Vec::new(),
+        roles: Vec::new(),
+    };
+    let token = jwt.encode_access(&claims)?;
+    jwt.decode_access(&token)
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("the private and public key are not a pair: {e}"))
 }

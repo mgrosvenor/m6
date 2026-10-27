@@ -755,3 +755,34 @@ fn a_bad_new_key_keeps_the_old_one() {
         "a bad key replaced the good one"
     );
 }
+
+/// Writing the private key and the public key is two writes, and a touch
+/// between them must not install a mismatched pair.
+#[test]
+fn a_mismatched_key_pair_is_refused_and_the_matching_one_lands_on_retry() {
+    let env = setup_test_env("rotate-mismatch");
+    let guard = spawn_server(&env);
+    let key_a = public_key_body(&env);
+
+    let (private_b, public_b) = generate_test_rsa_keys();
+    // The new private key beside the old public key.
+    std::fs::write(env._key_dir.path().join("auth.pem"), &private_b).unwrap();
+    touch(&env.config_path);
+    assert!(
+        wait::until(Duration::from_secs(5), || guard
+            .output()
+            .contains("Reload hook failed")),
+        "a mismatched pair was installed\n--- output ---\n{}",
+        guard.output()
+    );
+    assert_eq!(public_key_body(&env), key_a);
+
+    // The second write arrives. No touch: core's retry finds the pair.
+    std::fs::write(env._key_dir.path().join("auth.pub"), &public_b).unwrap();
+    assert!(
+        wait::until(Duration::from_secs(10), || public_key_body(&env)
+            == public_b),
+        "the matching pair never loaded on the retry\n--- output ---\n{}",
+        guard.output()
+    );
+}
