@@ -1340,18 +1340,23 @@ It skips a rotated file last written before the window, and a `.gz` file larger 
 
 `m6-monitor` keeps a history of every poll when `[monitor] history_file` is set, and serves it as JSON Lines.
 We cover the keys, the two endpoints, paging, how to protect them and what the history leaves out.
+Table 1 gives the two keys, which are read once at start.
 
 | key (`[monitor]`) | default | rule |
 |---|---|---|
 | `history_file` | absent, so no history | a non-empty path, relative to the site directory |
 | `history_max_mb` | 256 | 1 to 1048576 |
 
-**Table: the history keys.**
-Both are read at start, so a change needs a restart.
+**Table 1: the two `[monitor]` keys that switch the history on and cap it, with their defaults and rules.**
+A change to either needs a restart.
 
 The file holds one row per node per poll, one row per channel and interface, the text of every finding, and once per `/traffic` window the response status counts and crawler sightings of each node.
 When the file passes `history_max_mb`, the oldest polls are deleted until it is 5% under the cap, and nothing expires by age.
+One window of one node stores at most 100 crawler sightings, the ones with the most requests, and cuts each user agent to 256 bytes.
+The `/crawlers` key `sightings_dropped` says how many were left out.
+On Unix the monitor creates the directory with mode 0700 and the file with mode 0600, because the file holds client addresses.
 A write that fails is a warning on node `monitor` and never stops polling.
+A prune that fails, or a cap that deleting every earlier poll cannot meet, is its own warning, and the poll is still stored.
 To start fresh, stop the service, delete the file and start it again.
 
 `GET /history` and `GET /crawlers` answer on the service's unix socket and nowhere else.
@@ -1375,17 +1380,18 @@ sockets = "/run/m6/m6-monitor.sock"
 path    = "/history"
 backend = "monitor"
 require = "role:admin"
-cache   = "no-store"
 
 [[route]]
 path    = "/crawlers"
 backend = "monitor"
 require = "role:admin"
-cache   = "no-store"
 ```
 
-The node's own `periodic stats` log is not a substitute.
-It sits in the node's journal, which is capped, and it has no channels, reachability, host figures or tunnel.
+The monitor sends `Cache-Control: no-store` on every page itself, so the routes need no `cache` key.
+
+The node's own `periodic stats` log is a 10 second series that sits in the node's journal, which is capped.
+It has no channels, reachability, host figures or tunnel, and it disappears while a node is down.
+Only the history keeps those, and it keeps them through an outage.
 Channel counters include the monitor's own polls and header checks (issue #107), and `monitor_requests` on each node row says how many.
 
 ---

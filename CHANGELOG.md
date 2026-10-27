@@ -82,22 +82,31 @@ A bad key, or a file written by a newer release, stops the start with exit statu
 Each poll is one transaction holding the poll's verdict and the text of every finding, one row per node and one row per channel and interface.
 A node row holds reachability, the node's own verdict, the build, uptime, request, cache and backend error counters, hit and miss percentiles with their sample counts, the host figures, the tunnel figures and the log reopen state.
 Once per node per `/traffic` window the history also keeps the response status counts and the crawler sightings.
+A window stores at most 100 sightings, the ones with the most requests, and cuts each user agent to 256 bytes.
+Agents that are equal after the cut share one sighting, and `sightings_dropped` on each `/crawlers` line says how many were left out.
 A node's window is stored again only after `window_minutes` have passed, so the stored windows tile time without repeating a sighting about 120 times.
 Counters are stored as the node reports them, and the hit rate is computed on output.
 An absent figure is `null`, never 0.
 
 When the file's used bytes pass the cap, the oldest polls are deleted 256 at a time until the file is 5% under it, and every row of a poll goes with it.
+Each batch also deletes the user agents that no remaining sighting names, because a visitor chooses that text and could otherwise grow the file without bound.
+The names of nodes, channels, interfaces and builds come from the fleet, stay in append-only tables and are never pruned.
 There is no time expiry and no vacuum, so the file stops growing near the cap.
-This uses `m6_core::sqlite::used_bytes` and `prune_oldest`.
+This uses `m6_core::sqlite::used_bytes`.
 The poller hands each poll to a writer thread through a queue of 8 and never waits.
 A full queue drops the poll and counts it, and a failed write adds one Warn on node `monitor`.
+A prune that fails is the state `prune_failed`, and a cap that deleting every earlier poll cannot meet is `over_cap`.
+Each has its own Warn and a line in section I of `/check`, and the poll is still stored and counted as written.
+On Unix the directory is created with mode 0700 and the file with mode 0600, and an existing file is set to 0600.
 Measured on 6 channels and one interface, a node row costs 639 bytes with its channels and interface rows.
 
 `GET /history` and `GET /crawlers` take `from` and `to` (RFC 3339 UTC, half open, at most 31 days) and an optional `node`.
 They answer `application/x-ndjson` with `Cache-Control: no-store`, one page of at most 4 MiB and 10,000 rows, and a `Link: rel="next"` header while more rows match.
 Both answer on the unix socket only.
 The monitor has no listener and no token code, so a website puts an m6-http in front of the socket and protects the routes with `require`.
-The reader opens its own read-only connection, copies one page out and closes it before it serialises.
+The reader opens its own read-only connection and reads a whole page inside one read transaction, so a prune cannot leave a row without its channels, interfaces or findings.
+It reads 256 rows at a time with their children, found by the exact ids of the chunk, and stops when the page is full, so a 4 MiB page reads about the 1,500 to 4,000 rows it holds.
+The file uses a rollback journal, so the writer waits for the transaction to end, up to its 5 second busy timeout.
 m6-http links no SQLite.
 
 Three m6-core blocks became public for this, so the monitor reads its `node` parameter and refuses it exactly as core reads `from`, `to` and `cursor`.
@@ -108,7 +117,9 @@ Three m6-core blocks became public for this, so the monitor reads its `node` par
 Why not the periodic stats log: it lives in each node's journal, which is capped, it has no channels, reachability, host figures or tunnel, and it disappears while a node is down, which is when a history is wanted.
 Channel counters include the monitor's own polls and header checks (#107), and `monitor_requests` says how many.
 
-Verified: unit tests cover the schema, the transaction, the cap, the crawler tiling, the cursor and the exact keys of both line shapes, and integration tests run the real binary with an unreachable node.
+Verified: unit tests cover the schema, the transaction, the cap, the crawler tiling, the cursor and the exact keys of both line shapes.
+They also cover unique long user agents across many windows staying under the cap, the per-window caps, one snapshot per page with a prune tried between statements, a page that fills in the middle of a chunk, the plans of the child queries, the two prune states and the file modes.
+Integration tests run the real binary with an unreachable node.
 They check both endpoints on the socket, the 400 and 503 answers, a failed open, a file newer than the binary, a clean shutdown and that the process listens on no TCP port.
 
 **m6-core has an opt-in `sqlite` feature (#227).**

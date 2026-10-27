@@ -103,14 +103,15 @@
 //! path    = "/history"
 //! backend = "monitor"
 //! require = "role:<role>"
-//! cache   = "no-store"
 //!
 //! [[route]]
 //! path    = "/crawlers"
 //! backend = "monitor"
 //! require = "role:<role>"
-//! cache   = "no-store"
 //! ```
+//!
+//! The monitor sets `Cache-Control: no-store` on every page itself, so a route
+//! needs no `cache` key.
 //!
 //! `GET /history?from=<t>&to=<t>[&node=<name>][&cursor=<c>]` and
 //! `GET /crawlers` with the same query answer `application/x-ndjson`, one JSON
