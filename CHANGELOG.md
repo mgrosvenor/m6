@@ -12,10 +12,9 @@ releases only; work happens on `develop`. See `CONTRIBUTING.md`.
 
 ---
 
-## Unreleased
+## 1.14.0 — 2026-10-27
 
-Changes merged to `develop` since the last release. The section is renamed to
-the version when the release is cut.
+**Monitor tunnel health, log reopen and history, internal bindings, private metrics, core helpers and an opt-in SQLite feature.**
 
 ### Changed
 
@@ -32,7 +31,7 @@ If the open fails, the process keeps writing to the previous file, logs an error
 The path is made absolute once at start, so a later change of working directory cannot redirect a reopen.
 
 `/traffic` also reads the newest rotated file next to the live log, named `<name>-YYYYmmddHH` with or without `.gz`, so its window does not shrink just after an hourly rotation.
-`m6_core::log::read_recent` does the read, and `/traffic` runs it on the event loop, so the work is bounded.
+`m6_core::log::read_recent` does the read, and `/traffic` runs it on the event loop, so the work must be bounded and is.
 A plain rotated file is read from a seek, so at most 24 MB are read however large the file is.
 The rotated file is skipped when the live tail already filled that budget, and when it was last written before the start of the `/traffic` window.
 A `.gz` file is decoded only when it is no larger than the budget on disk and the uncompressed size in its trailer is no larger than the budget, and the decoder stops at the budget whatever the trailer says.
@@ -54,7 +53,7 @@ Add the key before upgrading, because older versions ignore it.
 A `bind` on a private address is now labelled `external` in `/perf`.
 
 Verified: `cargo test --workspace` gives 1297 passed and 0 failed, clippy is silent with `-D warnings`, and the release and test builds have no warnings.
-Thirteen new config tests, two rewritten h2c trust tests and four tests that run the real binary cover every refusal, both migration messages and a valid start.
+Thirteen new config tests, two rewritten h2c trust tests and four tests that run the real binary cover every refusal, the migration messages and a valid start.
 Two of the binary tests send requests over h2c under a rate limit and show that a declared listener believes the forwarded address and a public one does not.
 A diff of the three cache-hit blocks in `m6-http/src/main.rs` against the base is empty, so the request path for a cache hit is untouched.
 Example 09's integration test in m6-examples ran to "All assertions passed" with no `SKIP` against an earlier build of this change, with its h2c listener declared the same way.
@@ -147,7 +146,7 @@ Check each system config for these three cases before the upgrade:
 - A relative `[auth] public_key` in the system config. Make it an absolute path.
 - A `[health]` key in the system config other than `metrics_require` and `metrics_peers`, for example `metrics_token_file`. Move it to `site.toml` or delete it.
 
-When both arguments name the same file, it is read twice and the system-side `[auth]` and `[health]` are ignored, so it is not a second declaration.
+When both arguments name the same file, its `[auth]` and `[health]` are the site config's and the system-side copy is ignored.
 Older versions ignore the new keys, so a config can carry them before the upgrade, but the endpoints stay on the legacy gate until it.
 Verified: `cargo test --workspace -- --test-threads=1` passes 1388 tests with 0 failures and 0 warnings on the release and test builds.
 `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `tools/clippy.sh` and `cargo deny check` are silent.
