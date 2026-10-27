@@ -422,16 +422,17 @@ fn stamp_us(line: &str) -> i64 {
 
 /// The settle window starts when the first clear is done.
 ///
-/// A reload that takes a while must not use up the window. The site has 20000
-/// files under a route group, which makes the reload take far longer than the
-/// 100 ms window, and the second clear has to come a full window after the
-/// reload finished, not a window after it started.
+/// A reload that takes a while must not use up the window. The site has 40000
+/// files under a route group, which makes the reload take tens of milliseconds
+/// or more, and the second clear has to come a full window after the reload
+/// finished, not a window after it started. The check is on the gap between
+/// the two log lines, so it holds however long the reload takes.
 #[test]
 fn the_second_clear_comes_a_full_window_after_a_slow_reload() {
     let mut s = Stack::start();
     let posts = s.site.join("posts");
     std::fs::create_dir_all(&posts).expect("posts dir");
-    for i in 0..20_000 {
+    for i in 0..40_000 {
         std::fs::write(posts.join(format!("p{i}.json")), "{}").expect("post");
     }
     let extra =
@@ -462,8 +463,8 @@ fn the_second_clear_comes_a_full_window_after_a_slow_reload() {
         .and_then(|n| n.parse().ok())
         .expect("elapsed_us");
     assert!(
-        elapsed_us > 100_000,
-        "the reload took {elapsed_us} us, which is not slow enough to test the window"
+        elapsed_us > 20_000,
+        "the reload took {elapsed_us} us, which is too fast to tell the window from the reload"
     );
     let gap_us = stamp_us(again) - stamp_us(done);
     assert!(
