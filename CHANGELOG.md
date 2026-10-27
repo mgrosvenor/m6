@@ -19,6 +19,43 @@ the version when the release is cut.
 
 ### Changed
 
+**An `App` reloads when either of its two files changes, and a lost watch no longer stops it (#244, closes #185 and #198).**
+An `App` service watched both its config and `site.toml` but rebuilt only from its own config.
+`site.toml`'s `[log]` level and its `[[backend]] compresses` declaration were read once at start, so editing the log level there changed nothing (#198).
+A watcher that stopped delivering events left a service that never reloaded, because the one-second modification-time check ran only when there was no watcher at all (#185).
+State that `init_global` built from the config had no way to reload.
+
+`m6_core::ConfigReloader` now watches both files.
+It takes the change from the platform watcher and, whatever the watcher says, compares the two files' identity, size and times once a second.
+The first change after quiet is reported at once.
+A change that arrives within 20 ms of a report is held and reported once more when the burst has settled, no later than a second after the window opened.
+A write that replaces the file in one step is one reload with no delay and a burst of writes is at most two.
+A write that truncates the file first can report twice.
+A file seen at length 0 is skipped with a warning, and the write that fills it reloads.
+Reporting at once matters when an edge clears its cache on the same change, because a backend that reloads late would otherwise leave a stale page cached.
+A touch alone reloads.
+On Linux an event that names one of the files is a change even when its size and times are equal, which coarse timestamps can cause.
+A file that failed to load is not tried again until it is written again.
+
+An App reload now re-reads `site.toml` every time.
+It applies the log level with the same precedence as start: the command line, then the service's `[log]`, then `site.toml`'s `[log]`.
+It checks the `compresses` agreement again and refuses the reload on a disagreement.
+It refuses a `site_toml` that is gone and a `site.toml` that is not valid TOML, whether or not `site_toml` names it.
+The previous state keeps serving after any refusal.
+It logs `config reload: <key> changed; restart this service to apply it` for `thread_pool.size`, `thread_pool.queue_size`, `server.read_timeout_s`, `server.socket_mode` and `site_toml`, which keep their running values.
+`Reload complete` gains `site` and `process` fields saying which file changed.
+
+`AppWithGlobal::on_reload` and `AppWithState::on_reload` register `Fn(&G, &AppContext) -> Result<()>`.
+Core calls it with the new config before installing the new state, so a service can re-read the state it built in `init_global`.
+If the hook returns `Err`, core logs it with the delay before the next attempt, keeps the previous routes and log level, and tries the reload again after 1 s, then 2 s, 4 s and so on up to 60 s.
+A real write to either file reloads at once and starts the delay again at one second.
+The hook must be safe to run twice on one config.
+A panic in the hook is not caught, because the release profile aborts on panic.
+It ends the process and the service manager restarts it, so return `Err` for anything recoverable.
+
+m6-http is not changed by this.
+It keeps its own watcher until it moves onto `ConfigReloader`.
+
 **An internal listener accepts only the peers its config names (#246).**
 An h2c listener named in `[server] internal_binds` believed the `X-Forwarded-For` of any peer that reached it, so a firewall was the only thing between a forged client address and the rate limiter.
 `[server] internal_peers` now lists the IP addresses it accepts, each in a local range.

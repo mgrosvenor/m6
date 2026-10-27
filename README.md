@@ -221,7 +221,7 @@ Tera template renderer. Handles all HTML routes.
 
 **Architecture (via m6-render library):**
 - Fixed thread pool (default: CPU count) + bounded request queue
-- `FrameworkState` in `Arc<RwLock<...>>` — hot-reloaded atomically on config change (~1 s mtime poll)
+- `FrameworkState` in `Arc<RwLock<...>>`, hot-reloaded atomically when the config or `site.toml` changes (watcher, plus a fingerprint poll every second)
 - Two-tier state: `Global` (shared, `Arc` clone per request) and `ThreadLocal` (zero sync overhead)
 - JSON params loaded from disk at startup; static params stored as `Arc<Map>` — pointer clone per request, no Map copy
 - Dynamic `{stem}`-keyed params resolved and LRU-cached
@@ -343,7 +343,7 @@ Framework library for writing custom renderers in Rust. Used by `m6-html` and an
 - Request routing with path parameters (`{id}`, `{relpath}`)
 - `Request` / `Response` / `Error` types
 - Thread pool + bounded queue managed by the framework
-- Hot-reload triggered by config file mtime changes
+- Hot-reload triggered by a change to the config file or `site.toml`
 
 ```rust
 fn main() {
@@ -505,7 +505,7 @@ Browser                  m6-http                  m6-auth-server
 | m6-http | Socket appears/disappears in `/run/m6/` | Backend pool membership |
 | m6-http | TLS cert/key changed (inotify) | TLS context (including QUIC) |
 | m6-auth-server | Key file changed (inotify) | JWT signing key |
-| m6-html | Config file written (inotify on Linux, mtime poll on macOS) | Templates, routes, params |
+| m6-html | Config file or `site.toml` changed (inotify on Linux, kqueue on macOS, and a fingerprint poll every second) | Templates, routes, params, log level |
 
 ---
 

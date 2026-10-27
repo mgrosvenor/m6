@@ -110,6 +110,12 @@ time      = "0.3"
 name    = "log_reopen"
 harness = false
 
+# Its own `main`: an `App` reads its site directory and config path from the
+# process's arguments, so the test re-runs itself as the service.
+[[test]]
+name    = "on_reload"
+harness = false
+
 [[bench]]
 name    = "critical_path"
 harness = false
