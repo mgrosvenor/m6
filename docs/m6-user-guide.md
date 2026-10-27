@@ -967,7 +967,7 @@ This hook does it, and certbot runs it after each renewal:
 ```sh
 # /etc/letsencrypt/renewal-hooks/deploy/m6-touch.sh, mode 0755
 #!/bin/sh
-touch /etc/m6/system.toml
+touch /etc/m6/my-blog.toml
 ```
 
 The touch is what makes m6-http read the new files, and until it runs m6-http keeps serving the previous certificate.
