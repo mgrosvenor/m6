@@ -2690,6 +2690,9 @@ fn run_app_with_shutdown(
     let mut registered_names: Vec<String> = named_handlers.keys().cloned().collect();
     registered_names.sort();
 
+    // What the process started with. The keys a reload cannot apply are
+    // compared with these, not with the last config that was loaded.
+    let startup_config = config.clone();
     let framework_state =
         FrameworkState::build(config, site_dir.clone(), &code_route_signatures, &*renderer)
             .unwrap_or_else(|e| {
@@ -2808,7 +2811,7 @@ fn run_app_with_shutdown(
             .and_then(|_| check_compress_declared(&new_config, &site_toml, &backend_name))
             .map_err(|msg| format!("Reload refused: {msg}"))?;
         let changed_keys =
-            crate::config::restart_only_changes(&fs.read().unwrap().config, &new_config, &site_dir);
+            crate::config::restart_only_changes(&startup_config, &new_config, &site_dir);
         let (format, level) = resolve_log(&site_toml, &new_config.log, cli_log_level.as_deref());
         let new_state = FrameworkState::build(
             new_config,
