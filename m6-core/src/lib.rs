@@ -16,6 +16,7 @@ pub mod minify;
 pub mod monitoring;
 pub mod ndjson;
 pub mod negotiate;
+pub mod net;
 pub mod parse;
 pub mod path;
 pub mod random;
@@ -25,17 +26,22 @@ pub mod response;
 pub mod server;
 pub mod signal;
 pub mod telemetry;
+pub mod time_range;
 pub mod tls;
 pub mod util;
 pub mod watcher;
+pub mod wireguard;
 
-/// Shared integration-test harness. Behind a feature so it is never compiled
-/// into a production binary; enable it in `dev-dependencies` only.
+// Behind a feature so it is never compiled into a production binary.
+// Enable it in `dev-dependencies` only. The module's own `//!` doc describes it.
 #[cfg(feature = "testkit")]
 pub mod testkit;
 
 #[cfg(feature = "multipart")]
 pub mod multipart;
+
+#[cfg(feature = "sqlite")]
+pub mod sqlite;
 
 /// Tera templating and the site filters that go with it. On by default;
 /// see the `templates` feature in Cargo.toml.
@@ -66,7 +72,7 @@ pub use request::Request;
 pub use response::{Body, Response};
 pub use server::{socket_path_from_config, UnixServer};
 pub use signal::ShutdownHandle;
-pub use watcher::ConfigWatcher;
+pub use watcher::{Changed, ConfigReloader, ConfigWatcher, Fingerprint, Seen};
 
 /// Everything a service normally wants, in one line.
 ///
@@ -115,6 +121,9 @@ pub mod prelude {
 
     #[cfg(feature = "multipart")]
     pub use crate::multipart::Upload;
+
+    #[cfg(feature = "sqlite")]
+    pub use rusqlite;
 
     #[cfg(feature = "templates")]
     pub use crate::template::{TeraFactory, TeraRenderer};

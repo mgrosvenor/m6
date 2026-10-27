@@ -1,10 +1,17 @@
 //! `m6-monitor`: one page that says how the fleet is.
 //!
 //! Runs at origin, polls every node's `/health` and `/perf` over the backbone,
-//! and serves the digest. Two routes:
+//! and serves the digest. These routes:
 //!
 //!   GET /          the page
 //!   GET /digest    the same thing as JSON, for anything that is not a person
+//!   GET /check     the hourly health check, as text
+//!   GET /history   the poll history as paged JSON Lines, when `history_file` is set
+//!   GET /crawlers  the crawler sightings as paged JSON Lines, likewise
+//!
+//! Every route answers on the unix socket only. The monitor has no listener and
+//! no token code. Access control is the `require` rule of the m6-http placed in
+//! front of the socket. See `history.rs` for the history and a front example.
 //!
 //! It is an ordinary m6 service. It links `m6-core` and nothing else, gets its
 //! server loop, routing, templating and config from there, and is configured
@@ -25,7 +32,9 @@
 mod check;
 mod digest;
 mod fleet;
+mod history;
 mod poll;
+mod tunnel;
 
 use std::time::Duration;
 
@@ -49,6 +58,8 @@ fn main() -> anyhow::Result<()> {
         .route_get("/", page)
         .route_get("/digest", digest_json)
         .route_get("/check", check_text)
+        .route_get("/history", history_ndjson)
+        .route_get("/crawlers", crawlers_ndjson)
         .run()?;
     Ok(())
 }
@@ -77,6 +88,7 @@ struct MonitorState {
     /// claims and this file already makes that distinction for sample counts.
     latest: std::sync::Arc<std::sync::RwLock<Option<Snapshot>>>,
     interval: Duration,
+    history: history::HistoryHandle,
 }
 
 impl MonitorState {
@@ -93,12 +105,9 @@ impl MonitorState {
 
 /// Build the shared state and start the poller.
 fn build_state(ctx: &AppContext) -> Result<MonitorState> {
-    let interval = Duration::from_secs(
-        ctx.config
-            .get("poll_interval_s")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(DEFAULT_POLL_SECS),
-    );
+    let interval = Duration::from_secs(fleet::poll_interval_s(|k| {
+        ctx.config.get(k).and_then(|v| v.as_u64())
+    }));
     let latest: std::sync::Arc<std::sync::RwLock<Option<Snapshot>>> =
         std::sync::Arc::new(std::sync::RwLock::new(None));
 
@@ -107,8 +116,14 @@ fn build_state(ctx: &AppContext) -> Result<MonitorState> {
     // an argument position.
     let path = ctx.config_path.to_path_buf();
     let writer = std::sync::Arc::clone(&latest);
+    // A bad key or a file from a newer release stops the start here (exit 2).
+    let (recorder, handle) = history::start(history::config_from(
+        ctx.config.get("monitor"),
+        ctx.site_dir,
+    )?)?;
+    let poller_handle = handle.clone();
     std::thread::spawn(move || loop {
-        match collect_from(&path) {
+        match collect_from(&path, Some((&recorder, &poller_handle))) {
             Ok((digest, readings)) => {
                 let snap = Snapshot {
                     digest,
@@ -130,12 +145,16 @@ fn build_state(ctx: &AppContext) -> Result<MonitorState> {
         std::thread::sleep(interval);
     });
 
-    Ok(MonitorState { latest, interval })
+    Ok(MonitorState {
+        latest,
+        interval,
+        history: handle,
+    })
 }
 
 /// Poll the fleet, print the check, exit 1 on faults.
 fn run_check(config_path: &std::path::Path) -> anyhow::Result<()> {
-    let (d, readings) = collect_from(config_path)?;
+    let (d, readings) = collect_from(config_path, None)?;
     print!("{}", check::render(&d, &readings));
     if d.level == digest::Level::Fault {
         std::process::exit(1);
@@ -144,19 +163,127 @@ fn run_check(config_path: &std::path::Path) -> anyhow::Result<()> {
 }
 
 /// Poll the fleet and build a digest, or explain why not.
+///
+/// With a recorder, the poll is also handed to the history writer. The history
+/// finding is added before the poll is recorded, so the stored verdict equals
+/// the one `/check` shows.
 fn collect_from(
     config_path: &std::path::Path,
+    history: Option<(&history::Recorder, &history::HistoryHandle)>,
 ) -> anyhow::Result<(digest::Digest, Vec<poll::NodeReading>)> {
     let fleet = fleet::Fleet::from_config(config_path)?;
     let token = fleet.perf_token();
-    let readings = poll::fleet(
+    let mut readings = poll::fleet(
         &fleet.nodes,
         token.as_deref(),
         Duration::from_millis(fleet.timeout_ms),
         &fleet.header_check,
     );
-    let d = digest::build(&readings, &digest::Thresholds::default(), now_iso8601());
+    // Sequential with the HTTPS polls on purpose: the round trip is not taken
+    // while this host is doing its own TLS work.
+    let tunnels = tunnel::fleet(&fleet, Duration::from_millis(fleet.timeout_ms));
+    for (r, t) in readings.iter_mut().zip(tunnels) {
+        r.tunnel = t;
+    }
+    let thresholds = digest::Thresholds {
+        tunnel_handshake_age_s: fleet.tunnel_handshake_max_age_s,
+        log_reopen_age_s: fleet.log_reopen_max_age_s,
+        ..Default::default()
+    };
+    let at_ms = unix_ms();
+    let mut d = digest::build(&readings, &thresholds, now_iso8601());
+    if let Some((recorder, handle)) = history {
+        let h = handle.digest();
+        if let Some(f) = history::finding(&h) {
+            d.add_finding(f);
+        }
+        d.history = Some(h);
+        recorder.record(history::batch(at_ms, &readings, &d));
+    }
     Ok((d, readings))
+}
+
+fn unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
+/// A plain-text answer that no cache may keep.
+fn plain(status: u16, text: &str) -> Response {
+    Response::text(text)
+        .with_status(status)
+        .header("Cache-Control", "no-store")
+        .header("X-Content-Type-Options", "nosniff")
+}
+
+fn history_ndjson(req: &Request, st: &MonitorState) -> Result<Response> {
+    paged(req, st, history::health_page)
+}
+
+fn crawlers_ndjson(req: &Request, st: &MonitorState) -> Result<Response> {
+    paged(req, st, history::crawl_page)
+}
+
+/// The shared read path of `/history` and `/crawlers`.
+///
+/// One page reads inside one read transaction (see `history::fill_page`), in
+/// chunks of 256 rows, and stops reading when the page is full.
+fn paged<T: history::Keyed>(
+    req: &Request,
+    st: &MonitorState,
+    read: history::PageFn<T>,
+) -> Result<Response> {
+    use m6_core::ndjson::{Cursor, PageLimits};
+
+    let Some(path) = st.history.file() else {
+        return Ok(plain(
+            503,
+            "history is off: set [monitor] history_file to keep one\n",
+        ));
+    };
+    let range = match m6_core::time_range::TimeRange::from_request(
+        req,
+        m6_core::time_range::DEFAULT_MAX_SPAN,
+    ) {
+        Ok(r) => r,
+        Err(e) => return Ok(e.to_response()),
+    };
+    let after = match Cursor::from_query(req.query()) {
+        Ok(None) => None,
+        Ok(Some(c)) => match history::parse_cursor(c.as_str()) {
+            Some(k) => Some(k),
+            None => return Ok(m6_core::ndjson::CursorError::Malformed.to_response()),
+        },
+        Err(e) => return Ok(e.to_response()),
+    };
+    let node = match history::node_param(req.query()) {
+        Ok(n) => n,
+        Err(msg) => return Ok(Response::refusal(&msg)),
+    };
+    let unavailable =
+        |e: &dyn std::fmt::Display| plain(503, &format!("history is unavailable: {e}\n"));
+    let conn = match m6_core::sqlite::open_reader(path) {
+        Ok(c) => c,
+        Err(e) => return Ok(unavailable(&e)),
+    };
+    let node_id = match &node {
+        None => None,
+        Some(name) => match history::node_id(&conn, name) {
+            Ok(Some(id)) => Some(id),
+            Ok(None) => return Ok(Response::refusal(&"`node` names no node in the history")),
+            Err(e) => return Ok(unavailable(&e)),
+        },
+    };
+    let range = (range.from_unix_ms(), range.to_unix_ms());
+    let (page, next) =
+        match history::fill_page(&conn, range, node_id, after, PageLimits::default(), read) {
+            Ok(p) => p,
+            Err(history::PageError::Db(e)) => return Ok(unavailable(&e)),
+            Err(history::PageError::Build(e)) => return Err(e.into()),
+        };
+    drop(conn);
+    Ok(page.into_response(req.query(), next.as_ref()))
 }
 
 /// The digest from the latest snapshot, for the HTML page.
@@ -175,7 +302,7 @@ fn snapshot_digest(st: &MonitorState) -> anyhow::Result<digest::Digest> {
     Ok(snap.digest.clone())
 }
 
-/// The whole A-to-G report, as text, from the latest snapshot.
+/// The whole A-to-H report, as text, from the latest snapshot.
 ///
 /// This is what `--check` printed, and the only reason that flag existed: the
 /// report had no route out. With this it is reachable the way everything else is,
@@ -344,7 +471,8 @@ fn render(d: &digest::Digest) -> String {
         };
         h.push_str(&format!(
             "<div class='{cls}'><b>{}</b> &middot; {}</div>",
-            f.node, f.text
+            m6_core::util::html_escape(&f.node),
+            m6_core::util::html_escape(&f.text)
         ));
     }
 
@@ -353,7 +481,7 @@ fn render(d: &digest::Digest) -> String {
          <th>node</th><th>role</th><th>status</th><th>rtt</th>\
          <th>reqs</th><th>hit rate</th><th>p50</th><th>p99</th>\
          <th>load</th><th>mem</th><th>disk</th><th>temp</th>\
-         <th>svc up</th><th>host up</th></tr>",
+         <th>svc up</th><th>host up</th><th>tunnel</th></tr>",
     );
     for n in &d.nodes {
         let load = match (n.load_one, n.cpus) {
@@ -371,10 +499,10 @@ fn render(d: &digest::Digest) -> String {
         h.push_str(&format!(
             "<tr><td>{}</td><td class=dim>{}</td><td>{}</td><td>{}</td>\
              <td>{}</td><td>{}</td><td>{}</td><td>{}</td>\
-             <td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-            n.name,
-            n.role,
-            n.status,
+             <td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            m6_core::util::html_escape(&n.name),
+            m6_core::util::html_escape(&n.role),
+            m6_core::util::html_escape(&n.status),
             n.rtt_ms
                 .map(|v| format!("{v:.1}ms"))
                 .unwrap_or_else(|| "-".into()),
@@ -396,6 +524,15 @@ fn render(d: &digest::Digest) -> String {
                 .unwrap_or_else(|| "-".into()),
             n.uptime_s.map(dur).unwrap_or_else(|| "-".into()),
             n.host_uptime_s.map(dur).unwrap_or_else(|| "-".into()),
+            // The same wording as /check section H.
+            match &n.tunnel {
+                Some(t) => m6_core::util::html_escape(&format!(
+                    "{} handshake {}",
+                    t.rtt_text(),
+                    t.handshake_text()
+                )),
+                None => "<span class=dim>no tunnel</span>".to_string(),
+            },
         ));
     }
     h.push_str("</table></div>");
@@ -413,9 +550,87 @@ fn render(d: &digest::Digest) -> String {
         };
         h.push_str(&format!(
             "<tr><td>{}</td><td style='text-align:left'>{}</td></tr>",
-            n.name, pools
+            m6_core::util::html_escape(&n.name),
+            pools
         ));
     }
     h.push_str("</table></div>");
     h
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node_digest(name: &str, tunnel: Option<digest::TunnelDigest>) -> digest::NodeDigest {
+        let r = poll::NodeReading {
+            name: name.into(),
+            role: "cache".into(),
+            url: "http://edge-a.example.com".into(),
+            health: None,
+            health_status: None,
+            perf: None,
+            perf_error: None,
+            traffic: None,
+            traffic_error: None,
+            header_checks: Vec::new(),
+            rtt: None,
+            unreachable: None,
+            tunnel: None,
+        };
+        let mut d = digest::build(&[r], &digest::Thresholds::default(), "now".into());
+        let mut n = d.nodes.remove(0);
+        n.tunnel = tunnel;
+        n
+    }
+
+    /// The page carries the tunnel column in the wording of /check section H,
+    /// and says "no tunnel" for a node without one.
+    #[test]
+    fn the_page_has_a_tunnel_column_and_says_no_tunnel_without_one() {
+        let t = digest::TunnelDigest {
+            address: "192.0.2.2:443".into(),
+            rtt_ms: Some(0.4),
+            rtt_samples_ms: vec![0.4, 0.5, 0.6],
+            probe: digest::ProbeState::Connected,
+            probe_error: None,
+            handshake: digest::HandshakeState::Ok,
+            handshake_age_s: Some(42),
+            handshake_detail: None,
+        };
+        let mut d = digest::build(&[], &digest::Thresholds::default(), "now".into());
+        d.nodes = vec![node_digest("edge-a", Some(t)), node_digest("edge-b", None)];
+        let html = render(&d);
+        assert!(html.contains("<th>tunnel</th>"), "{html}");
+        assert!(
+            html.contains("rtt 0.40ms (n 3, connected) handshake 42s ago"),
+            "{html}"
+        );
+        assert!(html.contains("no tunnel"), "{html}");
+    }
+
+    /// Node name, role and status come from config and from the nodes, and
+    /// reach the page as HTML.
+    #[test]
+    fn the_page_escapes_node_name_role_and_status() {
+        let mut d = digest::build(&[], &digest::Thresholds::default(), "now".into());
+        let mut n = node_digest("<i>edge</i>", None);
+        n.role = "<b>cache</b>".into();
+        n.status = "<u>ok</u>".into();
+        d.nodes = vec![n];
+        d.findings.push(digest::Finding {
+            level: digest::Level::Fault,
+            node: "<s>monitor</s>".into(),
+            text: "file </p>/x is old".into(),
+        });
+        let html = render(&d);
+        assert!(!html.contains("<s>monitor"), "{html}");
+        assert!(html.contains("file &lt;/p&gt;/x is old"), "{html}");
+        assert!(!html.contains("<i>edge"), "{html}");
+        assert!(!html.contains("<b>cache"), "{html}");
+        assert!(!html.contains("<u>ok"), "{html}");
+        assert!(html.contains("&lt;i&gt;edge&lt;/i&gt;"), "{html}");
+        assert!(html.contains("&lt;b&gt;cache&lt;/b&gt;"), "{html}");
+        assert!(html.contains("&lt;u&gt;ok&lt;/u&gt;"), "{html}");
+    }
 }

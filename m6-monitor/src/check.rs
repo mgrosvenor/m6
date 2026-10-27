@@ -14,6 +14,17 @@
 //! generates no load and runs no scans. The third, that it is measuring from
 //! wherever it happens to run, is unavoidable and is labelled instead.
 //!
+//! Section H measures the tunnel to each node with a TCP connect and a
+//! WireGuard handshake age, and sends no request. The handshake age comes from
+//! the file a separate privileged timer writes, so `--check` from cron judges
+//! it only while that timer runs. A file older than
+//! `tunnel_handshake_max_age_s` is itself a fault.
+//!
+//! Section I shows the state of the poll history (`history.rs`).
+//!
+//! Section A also shows each node's last log reopen, and the limit it is
+//! judged against when `log_reopen_max_age_s` is set.
+//!
 //! Exit status is 1 when there are faults, so it works as a cron check.
 
 use std::fmt::Write as _;
@@ -41,22 +52,17 @@ pub fn render(d: &Digest, readings: &[NodeReading]) -> String {
         match (&r.traffic, &r.traffic_error) {
             (Some(t), _) => {
                 let l = &t.logging;
-                match l.seconds_since_last {
+                match crate::digest::quiet_log_text(l) {
+                    Some(fault) => {
+                        let _ = writeln!(o, "  {:<5} FAULT  {fault}", r.name);
+                    }
                     None => {
-                        let _ = writeln!(o, "  {:<5} FAULT  nothing has ever been logged", r.name);
-                    }
-                    Some(s) if l.is_blind() => {
-                        let _ = writeln!(
-                            o,
-                            "  {:<5} FAULT  main log silent for {}s ({} events since start)",
-                            r.name, s, l.events_total
-                        );
-                    }
-                    Some(s) => {
                         let _ = writeln!(
                             o,
                             "  {:<5} ok     last event {}s ago, {} since start",
-                            r.name, s, l.events_total
+                            r.name,
+                            l.seconds_since_last.unwrap_or(0),
+                            l.events_total
                         );
                     }
                 }
@@ -72,6 +78,61 @@ pub fn render(d: &Digest, readings: &[NodeReading]) -> String {
                     r.unreachable
                         .as_deref()
                         .unwrap_or("no traffic summary and no reason given")
+                );
+            }
+        }
+    }
+
+    match d.thresholds.log_reopen_age_s {
+        Some(max) => {
+            let _ = writeln!(
+                o,
+                "  log file reopen (rotation renames the file and signals): limit {max}s"
+            );
+        }
+        None => {
+            let _ = writeln!(
+                o,
+                "  log file reopen (rotation renames the file and signals): \
+                 no limit configured, shown and not judged"
+            );
+        }
+    }
+    for n in &d.nodes {
+        let l = &n.log_reopen;
+        let uptime = n
+            .uptime_s
+            .map_or_else(|| "-".to_string(), |u| u.to_string());
+        match l.state {
+            "ok" => {
+                let _ = write!(
+                    o,
+                    "  {:<5} reopened {}s ago, {} since start",
+                    n.name,
+                    l.age_s.unwrap_or(0),
+                    l.reopens.unwrap_or(0)
+                );
+                if l.failures.unwrap_or(0) > 0 {
+                    let _ = write!(o, ", {} failed", l.failures.unwrap_or(0));
+                }
+                let _ = writeln!(o);
+            }
+            "never" => {
+                let _ = writeln!(
+                    o,
+                    "  {:<5} never reopened since start (up {uptime}s)",
+                    n.name
+                );
+            }
+            "no_log_file" => {
+                let _ = writeln!(o, "  {:<5} writes no log file", n.name);
+            }
+            _ => {
+                let _ = writeln!(
+                    o,
+                    "  {:<5} unknown  {}",
+                    n.name,
+                    l.detail.as_deref().unwrap_or("")
                 );
             }
         }
@@ -257,7 +318,7 @@ pub fn render(d: &Digest, readings: &[NodeReading]) -> String {
                 h.requests,
                 h.top_path,
                 h.error_ratio * 100.0,
-                h.user_agents
+                h.distinct_user_agents
             );
         }
         for c in &t.notable {
@@ -276,6 +337,46 @@ pub fn render(d: &Digest, readings: &[NodeReading]) -> String {
                     "        {} distinct user agents (rotating)",
                     c.distinct_user_agents
                 );
+            }
+            // ── The agents it presented, which the count alone could not say
+            //
+            // A line reading `1 UA` left a reader knowing how many claims a
+            // source made and not one of them. m6 #219.
+            //
+            // The count goes beside the sample whenever the sample is partial,
+            // because four agents out of four is the set and four out of 526 is
+            // a glimpse of a rotator, and the two mean opposite things about
+            // what the lines below are evidence of.
+            if !c.user_agents.is_empty() {
+                // Bounded here as well as at the producer, for the reason
+                // every other list in this section is: the lines come from a
+                // node's JSON over the network, and a digest a reader scrolls
+                // is not the place to find out a payload was longer than
+                // expected. The header counts what is printed, so the number
+                // and the lines under it cannot disagree.
+                let shown = c
+                    .user_agents
+                    .len()
+                    .min(m6_core::telemetry::USER_AGENTS_KEPT);
+                if shown < c.distinct_user_agents {
+                    let _ = writeln!(
+                        o,
+                        "        agents ({} of {}):",
+                        shown, c.distinct_user_agents
+                    );
+                } else {
+                    let _ = writeln!(o, "        agents:");
+                }
+                for ua in c.user_agents.iter().take(shown) {
+                    // An empty agent is a client that sent no User-Agent
+                    // header at all, which is itself worth seeing: a browser
+                    // always sends one.
+                    if ua.is_empty() {
+                        let _ = writeln!(o, "          <none sent>");
+                    } else {
+                        let _ = writeln!(o, "          {ua}");
+                    }
+                }
             }
             for p in c.probe_paths.iter().take(8) {
                 let _ = writeln!(o, "        probe {p}");
@@ -539,6 +640,101 @@ pub fn render(d: &Digest, readings: &[NodeReading]) -> String {
         );
     }
 
+    // ── H. tunnels ───────────────────────────────────────────────────────────
+    let _ = writeln!(
+        o,
+        "\nH. TUNNELS  (TCP connect from this host to each tunnel address; no request is sent)"
+    );
+    if d.nodes.iter().all(|n| n.tunnel.is_none()) {
+        let _ = writeln!(
+            o,
+            "  none configured. Add tunnel = {{ address = \"ip:port\", public_key = \"...\" }} to a [[monitor.nodes]] entry."
+        );
+    } else {
+        if let Some(age) = d.handshake_file_age_s {
+            let _ = writeln!(o, "  handshake file written {age}s ago");
+        }
+        for n in &d.nodes {
+            match &n.tunnel {
+                None => {
+                    let _ = writeln!(o, "  {:<5} no tunnel configured", n.name);
+                }
+                Some(t) => {
+                    let _ = writeln!(
+                        o,
+                        "  {:<5} {}  {}  handshake {}",
+                        n.name,
+                        t.address,
+                        t.rtt_text(),
+                        t.handshake_text()
+                    );
+                }
+            }
+        }
+        // The kernel's own count of what the tunnel interface refused to carry,
+        // from each node's /perf, when the node reported it.
+        for (n, r) in d.nodes.iter().zip(readings) {
+            let Some(p) = &r.perf else { continue };
+            for dev in p.host.net.iter().filter(|dev| dev.name.starts_with("wg")) {
+                let _ = writeln!(
+                    o,
+                    "  {:<5} {} drops rx {} tx {} (errors rx {} tx {})",
+                    n.name, dev.name, dev.rx_drop, dev.tx_drop, dev.rx_errs, dev.tx_errs
+                );
+            }
+        }
+    }
+    let _ = writeln!(
+        o,
+        "  The rtt is the tunnel path from this host, unlike section B's HTTPS rtt.\n  \
+         It is not the node's own latency."
+    );
+
+    // ── I. history ───────────────────────────────────────────────────────────
+    let _ = writeln!(o, "\nI. HISTORY  (one row per node per poll, in SQLite)");
+    match &d.history {
+        None => {
+            let _ = writeln!(o, "  not kept by --check; the running service keeps it");
+        }
+        Some(h) if h.state == "off" => {
+            let _ = writeln!(o, "  off. Set [monitor] history_file to keep one.");
+        }
+        Some(h) => {
+            let mb = |b: Option<u64>| {
+                b.map_or_else(
+                    || "-".to_string(),
+                    |b| format!("{:.1}", b as f64 / 1_048_576.0),
+                )
+            };
+            let dash = |v: &Option<String>| v.clone().unwrap_or_else(|| "-".to_string());
+            let _ = writeln!(o, "  file {}", h.file.as_deref().unwrap_or("-"));
+            let _ = writeln!(
+                o,
+                "  {} MB used of the {} MB cap (file {} MB); oldest {}, newest {}",
+                mb(h.used_bytes),
+                mb(h.max_bytes),
+                mb(h.file_bytes),
+                dash(&h.oldest_at),
+                dash(&h.newest_at)
+            );
+            let _ = writeln!(
+                o,
+                "  {} polls and {} crawler windows written, last {}s ago; {} pruned at the cap; \
+                 {} dropped; {} failed",
+                h.writes,
+                h.crawl_windows,
+                h.last_write_age_s
+                    .map_or_else(|| "-".to_string(), |a| a.to_string()),
+                h.pruned,
+                h.dropped,
+                h.failures
+            );
+            if let Some(e) = &h.last_error {
+                let _ = writeln!(o, "  last error: {e}");
+            }
+        }
+    }
+
     // ── verdict ──────────────────────────────────────────────────────────────
     let _ = writeln!(o, "\n{bar}");
     let faults: Vec<_> = d
@@ -627,6 +823,117 @@ mod tests {
         }
     }
 
+    /// A notable client that presented `agents`, out of `distinct` in total.
+    fn probing_client(
+        ip: &str,
+        agents: &[&str],
+        distinct: usize,
+    ) -> m6_core::monitoring::NotableClient {
+        m6_core::monitoring::NotableClient {
+            ip: ip.into(),
+            requests: 7,
+            distinct_user_agents: distinct,
+            user_agents: agents.iter().map(|a| a.to_string()).collect(),
+            status: Default::default(),
+            probe_paths: vec!["/.env".into(), "/.git/config".into()],
+            injection_paths: vec![],
+            rotating_user_agents: distinct >= 10,
+            first_seen: "2026-10-04T01:20:54Z".into(),
+            last_seen: "2026-10-04T01:20:58Z".into(),
+        }
+    }
+
+    /// The report names what a prober claimed to be.
+    ///
+    /// Before m6 #219 this section printed the probe paths and a count of
+    /// agents, so a reader learned how many claims the source made and not one
+    /// of them. The agent is a claim rather than a fact, and the claim is
+    /// evidence about intent even when it is false.
+    #[test]
+    fn a_notable_clients_user_agents_are_printed() {
+        let mut t = traffic(LoggingHealth {
+            events_total: 100,
+            seconds_since_last: Some(1),
+            reopen: None,
+        });
+        t.notable = vec![probing_client("203.0.113.9", &["curl/8.4.0"], 1)];
+        let out = render_for_test(t);
+
+        assert!(
+            out.contains("curl/8.4.0"),
+            "the agent itself must appear, not just a count:\n{out}"
+        );
+        assert!(
+            !out.contains("agents (1 of 1)"),
+            "a complete set needs no 'x of y', which only means something when \
+             the sample is partial:\n{out}"
+        );
+    }
+
+    /// A sample says it is a sample.
+    ///
+    /// Four agents out of four is the set; four out of 526 is a glimpse of a
+    /// rotator. They mean opposite things about what the listed agents are
+    /// evidence of, so the report cannot print them identically.
+    #[test]
+    fn a_partial_sample_of_agents_says_how_many_there_were() {
+        let mut t = traffic(LoggingHealth {
+            events_total: 100,
+            seconds_since_last: Some(1),
+            reopen: None,
+        });
+        t.notable = vec![probing_client(
+            "203.0.113.41",
+            &[
+                "Googlebot/2.1",
+                "GPTBot/1.0",
+                "curl/8.4.0",
+                "python-requests/2",
+            ],
+            526,
+        )];
+        let out = render_for_test(t);
+
+        assert!(
+            out.contains("agents (4 of 526)"),
+            "a partial sample has to say so:\n{out}"
+        );
+        assert!(
+            out.contains("526 distinct user agents (rotating)"),
+            "and the rotation finding stays, because it is a different claim \
+             from the sample:\n{out}"
+        );
+    }
+
+    /// A client that sent no `User-Agent` header at all.
+    ///
+    /// Worth seeing rather than rendering as a blank line: every browser sends
+    /// one, so its absence is itself a signal about the client.
+    #[test]
+    fn a_client_that_sent_no_user_agent_is_said_to_have_sent_none() {
+        let mut t = traffic(LoggingHealth {
+            events_total: 100,
+            seconds_since_last: Some(1),
+            reopen: None,
+        });
+        t.notable = vec![probing_client("203.0.113.50", &[""], 1)];
+        let out = render_for_test(t);
+        assert!(
+            out.contains("<none sent>"),
+            "an empty agent must be named, not printed as whitespace:\n{out}"
+        );
+    }
+
+    fn render_for_test(t: TrafficReport) -> String {
+        let r = reading("origin", Some(t));
+        let d = crate::digest::build(
+            std::slice::from_ref(&r),
+            &crate::digest::Thresholds::default(),
+            "2026-10-04T02:16:31Z".into(),
+        );
+        render(&d, std::slice::from_ref(&r))
+    }
+
     pub(super) fn reading(name: &str, t: Option<TrafficReport>) -> NodeReading {
         NodeReading {
             name: name.into(),
@@ -641,6 +948,7 @@ mod tests {
             header_checks: Vec::new(),
             rtt: None,
             unreachable: None,
+            tunnel: None,
         }
     }
 
@@ -671,6 +979,7 @@ mod tests {
         let quiet = traffic(LoggingHealth {
             events_total: 5000,
             seconds_since_last: Some(600),
+            reopen: None,
         });
         let out = render(&digest(), &[reading("origin", Some(quiet))]);
         assert!(out.contains("FAULT  main log silent for 600s"), "{out}");
@@ -681,6 +990,7 @@ mod tests {
         let alive = traffic(LoggingHealth {
             events_total: 5000,
             seconds_since_last: Some(4),
+            reopen: None,
         });
         let out = render(&digest(), &[reading("origin", Some(alive))]);
         assert!(out.contains("ok     last event 4s ago"), "{out}");
@@ -692,6 +1002,7 @@ mod tests {
         let never = traffic(LoggingHealth {
             events_total: 0,
             seconds_since_last: None,
+            reopen: None,
         });
         let out = render(&digest(), &[reading("origin", Some(never))]);
         assert!(out.contains("nothing has ever been logged"), "{out}");
@@ -718,6 +1029,7 @@ mod tests {
                 Some(traffic(LoggingHealth {
                     events_total: 1,
                     seconds_since_last: Some(1),
+                    reopen: None,
                 })),
             )],
         );
@@ -818,5 +1130,320 @@ mod header_check_tests {
         assert_eq!(fmt_cert_expiry(86_399), "0d");
         assert_eq!(fmt_cert_expiry(-3 * 86_400), "EXPIRED 3d ago");
         assert_eq!(fmt_cert_expiry(-1), "EXPIRED 0d ago");
+    }
+}
+
+#[cfg(test)]
+mod tunnel_tests {
+    use super::tests::{digest, reading};
+    use super::*;
+    use crate::tunnel::{Handshake, Probe, ProbeResult, TunnelReading};
+    use std::time::Duration;
+
+    fn with_tunnel(name: &str, handshake: Handshake) -> NodeReading {
+        let mut r = reading(name, None);
+        r.tunnel = Some(TunnelReading {
+            address: "192.0.2.2:443".into(),
+            key_prefix: Some("AAAAAAAA".into()),
+            probe: ProbeResult {
+                samples: vec![Duration::from_micros(400); 3],
+                outcome: Probe::Connected,
+            },
+            handshake,
+            file_age_s: Some(7),
+        });
+        r
+    }
+
+    fn out(rs: &[NodeReading]) -> String {
+        let d = crate::digest::build(rs, &crate::digest::Thresholds::default(), "now".into());
+        render(&d, rs)
+    }
+
+    #[test]
+    fn the_tunnel_section_is_always_printed() {
+        let o = render(&digest(), &[reading("origin", None)]);
+        assert!(o.contains("H. TUNNELS"), "{o}");
+        assert!(o.contains("none configured"), "{o}");
+        assert!(o.contains("ALL CLEAR"), "{o}");
+    }
+
+    #[test]
+    fn a_tunnel_line_shows_rtt_with_its_sample_count_and_handshake_age() {
+        let o = out(&[with_tunnel("edge-a", Handshake::At { age_s: 42 })]);
+        assert!(o.contains("rtt 0.40ms (n 3, connected)"), "{o}");
+        assert!(o.contains("handshake 42s ago"), "{o}");
+        assert!(o.contains("handshake file written 7s ago"), "{o}");
+    }
+
+    #[test]
+    fn a_peer_with_no_handshake_says_never_and_removes_all_clear() {
+        let o = out(&[with_tunnel("edge-a", Handshake::Never)]);
+        assert!(o.contains("handshake never"), "{o}");
+        assert!(!o.contains("ALL CLEAR"), "{o}");
+    }
+
+    #[test]
+    fn a_tunnel_with_no_handshake_source_removes_all_clear() {
+        let o = out(&[with_tunnel("edge-a", Handshake::NoPublicKey)]);
+        assert!(o.contains("public_key"), "{o}");
+        assert!(!o.contains("ALL CLEAR"), "{o}");
+        let o = out(&[with_tunnel("edge-a", Handshake::NoHandshakesFile)]);
+        assert!(o.contains("wg_handshakes_file"), "{o}");
+        assert!(!o.contains("ALL CLEAR"), "{o}");
+    }
+
+    #[test]
+    fn a_node_without_a_tunnel_says_so_beside_one_that_has_one() {
+        let o = out(&[
+            with_tunnel("edge-a", Handshake::At { age_s: 1 }),
+            reading("edge-b", None),
+        ]);
+        assert!(o.contains("192.0.2.2:443"), "{o}");
+        assert!(o.contains("edge-b no tunnel configured"), "{o}");
+    }
+
+    #[test]
+    fn wg_interface_drops_are_shown_when_the_node_reports_them() {
+        let mut r = with_tunnel("edge-a", Handshake::At { age_s: 1 });
+        let mut host = m6_core::host::HostSnapshot::default();
+        host.net.push(m6_core::host::NetDevice {
+            name: "wg0".into(),
+            rx_drop: 3,
+            tx_drop: 4,
+            ..Default::default()
+        });
+        r.perf = Some(crate::digest::tests::perf(host, vec![]));
+        let o = out(&[r]);
+        assert!(o.contains("wg0 drops rx 3 tx 4"), "{o}");
+    }
+
+    // ── log reopen ───────────────────────────────────────────────────────────
+
+    use m6_core::monitoring::{LogReopenHealth, LoggingHealth, PerfReport};
+
+    /// A node whose `/perf` carries `reopen`, with the given uptime.
+    fn reopen_reading(uptime_s: u64, reopen: Option<LogReopenHealth>) -> NodeReading {
+        let mut r = reading("origin", None);
+        r.health = Some(m6_core::monitoring::HealthReport {
+            status: "ok".into(),
+            node: "origin".into(),
+        });
+        r.health_status = Some(200);
+        let mut p: PerfReport = crate::digest::tests::perf(
+            m6_core::host::HostSnapshot {
+                cpus: 1,
+                ..Default::default()
+            },
+            vec![],
+        );
+        p.uptime_s = uptime_s;
+        p.logging = Some(LoggingHealth {
+            events_total: 10,
+            seconds_since_last: Some(1),
+            reopen,
+        });
+        r.perf = Some(p);
+        r
+    }
+
+    fn render_reopen(r: NodeReading, max: Option<u64>) -> String {
+        let d = crate::digest::build(
+            std::slice::from_ref(&r),
+            &crate::digest::Thresholds {
+                log_reopen_age_s: max,
+                ..Default::default()
+            },
+            "now".into(),
+        );
+        render(&d, std::slice::from_ref(&r))
+    }
+
+    fn health(age: Option<u64>, reopens: u64) -> LogReopenHealth {
+        LogReopenHealth {
+            reopens_total: reopens,
+            failures_total: 0,
+            seconds_since_last_reopen: age,
+            last_reopen_unix: age.map(|a| 1_789_000_000 - a),
+            seconds_since_last_failure: None,
+        }
+    }
+
+    #[test]
+    fn section_a_shows_each_nodes_last_log_reopen_age() {
+        let o = render_reopen(reopen_reading(9000, Some(health(Some(60), 3))), Some(7200));
+        assert!(o.contains("reopened 60s ago, 3 since start"), "{o}");
+        assert!(o.contains("limit 7200s"), "{o}");
+    }
+
+    #[test]
+    fn section_a_says_never_reopened_since_start_distinctly() {
+        let o = render_reopen(reopen_reading(100, Some(health(None, 0))), Some(7200));
+        assert!(o.contains("never reopened since start (up 100s)"), "{o}");
+    }
+
+    #[test]
+    fn a_stale_log_reopen_removes_all_clear() {
+        let o = render_reopen(
+            reopen_reading(99_999, Some(health(Some(7300), 3))),
+            Some(7200),
+        );
+        assert!(!o.contains("ALL CLEAR"), "{o}");
+        assert!(o.contains("FAULTS (1)"), "{o}");
+        assert!(
+            o.contains("- origin: last reopened its log file 7300s ago"),
+            "{o}"
+        );
+    }
+
+    #[test]
+    fn section_a_says_when_no_limit_is_configured() {
+        let o = render_reopen(reopen_reading(9000, Some(health(Some(60), 3))), None);
+        assert!(o.contains("no limit configured"), "{o}");
+    }
+
+    #[test]
+    fn section_a_says_a_node_writes_no_log_file() {
+        let o = render_reopen(reopen_reading(9000, None), None);
+        assert!(o.contains("writes no log file"), "{o}");
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::tests::{digest, reading};
+    use super::*;
+    use crate::history::HistoryDigest;
+
+    fn history(state: &'static str) -> HistoryDigest {
+        HistoryDigest {
+            state,
+            file: Some("/var/lib/m6-monitor/history.sqlite3".into()),
+            max_bytes: Some(256 << 20),
+            file_bytes: Some(3 << 20),
+            used_bytes: Some(2 << 20),
+            oldest_at: Some("2027-01-01T00:00:00.000Z".into()),
+            newest_at: Some("2027-01-02T00:00:00.000Z".into()),
+            last_write_age_s: Some(4),
+            writes: 120,
+            crawl_windows: 6,
+            failures: 1,
+            dropped: 2,
+            pruned: 0,
+            last_error: None,
+        }
+    }
+
+    fn out(h: Option<HistoryDigest>) -> String {
+        let mut d = digest();
+        d.history = h;
+        render(&d, &[reading("origin", None)])
+    }
+
+    #[test]
+    fn section_i_says_history_is_off() {
+        let o = out(Some(HistoryDigest {
+            state: "off",
+            file: None,
+            max_bytes: None,
+            file_bytes: None,
+            used_bytes: None,
+            oldest_at: None,
+            newest_at: None,
+            last_write_age_s: None,
+            writes: 0,
+            crawl_windows: 0,
+            failures: 0,
+            dropped: 0,
+            pruned: 0,
+            last_error: None,
+        }));
+        assert!(o.contains("I. HISTORY"), "{o}");
+        assert!(
+            o.contains("off. Set [monitor] history_file to keep one."),
+            "{o}"
+        );
+    }
+
+    #[test]
+    fn section_i_shows_the_cap_and_the_last_write() {
+        let o = out(Some(history("ok")));
+        assert!(
+            o.contains("file /var/lib/m6-monitor/history.sqlite3"),
+            "{o}"
+        );
+        assert!(
+            o.contains("2.0 MB used of the 256.0 MB cap (file 3.0 MB); oldest 2027-01-01T00:00:00.000Z, newest 2027-01-02T00:00:00.000Z"),
+            "{o}"
+        );
+        assert!(
+            o.contains("120 polls and 6 crawler windows written, last 4s ago; 0 pruned at the cap; 2 dropped; 1 failed"),
+            "{o}"
+        );
+        assert!(!o.contains("last error"), "{o}");
+    }
+
+    #[test]
+    fn section_i_uses_dashes_for_absent_figures_and_shows_the_last_error() {
+        let mut h = history("failing");
+        h.used_bytes = None;
+        h.oldest_at = None;
+        h.last_write_age_s = None;
+        h.last_error = Some("disk full".into());
+        let o = out(Some(h));
+        assert!(o.contains("- MB used of the 256.0 MB cap"), "{o}");
+        assert!(o.contains("oldest -, newest"), "{o}");
+        assert!(o.contains("written, last -s ago"), "{o}");
+        assert!(o.contains("last error: disk full"), "{o}");
+    }
+
+    #[test]
+    fn a_prune_failure_and_an_unmet_cap_are_not_a_missing_poll() {
+        for (state, error, said) in [
+            (
+                "prune_failed",
+                "polls are kept",
+                "could not delete old polls",
+            ),
+            (
+                "over_cap",
+                "the history is over its cap",
+                "is over its cap of",
+            ),
+        ] {
+            let mut h = history(state);
+            h.last_error = Some(error.into());
+            let mut d = digest();
+            d.history = Some(h.clone());
+            d.add_finding(crate::history::finding(&h).expect("a finding"));
+            let o = render(&d, &[reading("origin", None)]);
+            assert!(!o.contains("ALL CLEAR"), "{o}");
+            assert!(o.contains(said), "{o}");
+            assert!(o.contains(&format!("last error: {error}")), "{o}");
+            assert!(!o.contains("that poll is missing"), "{o}");
+        }
+    }
+
+    #[test]
+    fn a_failing_history_write_removes_all_clear() {
+        let h = history("failing");
+        let mut d = digest();
+        d.history = Some(h.clone());
+        d.add_finding(crate::history::finding(&h).expect("a finding"));
+        let o = render(&d, &[reading("origin", None)]);
+        assert!(!o.contains("ALL CLEAR"), "{o}");
+        assert!(
+            o.contains("- monitor: the last history write failed"),
+            "{o}"
+        );
+    }
+
+    #[test]
+    fn check_one_shot_says_history_is_kept_by_the_service() {
+        let o = out(None);
+        assert!(
+            o.contains("not kept by --check; the running service keeps it"),
+            "{o}"
+        );
     }
 }

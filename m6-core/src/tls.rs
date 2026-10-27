@@ -211,13 +211,16 @@ fn element(buf: &[u8]) -> Result<(u8, &[u8], &[u8]), CertificateError> {
 /// Written once per load and read once per monitoring request, so the lock is
 /// never contended.
 ///
-/// **What this holds today is the chain loaded at startup, and that is exactly
-/// what HTTP/1.1 and HTTP/2 are serving.** The claim that it tracks reloads was
-/// written before it was checked and is false: `m6-http`'s `handle_tls_reload`
-/// rebuilds the quiche config alone, so after a renewal HTTP/3 serves the new
-/// certificate while rustls keeps the old one, and nothing re-records. So the
-/// number reported here is correct for h1 and h2 and stale for h3, which is a
-/// divergence in the server rather than in this registry. m6 #210.
+/// **What this holds is the chain every protocol is serving.** A reload writes
+/// it again, and `m6-http`'s `handle_tls_reload` writes it after the new
+/// material is installed on both the rustls listener and the quiche
+/// configuration, so a build that fails leaves the previous chain recorded and
+/// still being served.
+///
+/// It was not always so. Until m6 #210 a reload rebuilt the quiche
+/// configuration alone and re-recorded nothing, so after a renewal HTTP/3
+/// served the new certificate, HTTP/1.1 and HTTP/2 served the old one, and the
+/// number here was correct for the second pair and stale for the first.
 /// Each entry is `(depth as loaded, notAfter)`, and an unreadable certificate
 /// leaves a GAP rather than shifting everything after it.
 ///

@@ -14,6 +14,13 @@ BENCH_PORT="${BENCH_PORT:-8443}"
 BENCH_ADDR="${BENCH_ADDR:-127.0.0.1:${BENCH_PORT}}"
 H2C_BENCH_PORT="${H2C_BENCH_PORT:-8080}"
 H2C_BENCH_ADDR="${H2C_BENCH_ADDR:-127.0.0.1:${H2C_BENCH_PORT}}"
+# H2C_BENCH_PEER is the address the load generator connects from, which the
+# internal h2c listener admits. It defaults to the host part of H2C_BENCH_ADDR,
+# which is right when the load generator runs on the same host. Set it when
+# the load generator runs on another host.
+if [[ -z "${H2C_BENCH_PEER:-}" ]]; then
+  H2C_BENCH_PEER="${H2C_BENCH_ADDR%:*}"; H2C_BENCH_PEER="${H2C_BENCH_PEER#[}"; H2C_BENCH_PEER="${H2C_BENCH_PEER%]}"
+fi
 BENCH_DIR="/tmp/m6-bench"
 SITE_DIR="$BENCH_DIR/site"
 HTML_SOCK="$BENCH_DIR/m6-html-bench.sock"
@@ -186,6 +193,8 @@ cat > "$BENCH_DIR/system.toml" <<EOF
 [server]
 bind     = "$BENCH_ADDR"
 h2c_bind = "$H2C_BENCH_ADDR"
+internal_binds = ["$H2C_BENCH_ADDR"]
+internal_peers = ["$H2C_BENCH_PEER"]
 tls_cert = "cert.pem"
 tls_key  = "key.pem"
 EOF

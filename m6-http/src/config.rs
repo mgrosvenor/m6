@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use tracing::warn;
+use tracing::{info, warn};
 
 /// Full merged configuration for m6-http.
 #[derive(Debug, Clone, Serialize)]
@@ -86,8 +86,19 @@ pub struct ServerConfig {
     /// Intended for use over a private backbone between nodes.
     #[serde(default)]
     pub h2c_bind: Option<String>,
+    /// Listeners this server treats as internal, by address. See
+    /// docs/m6-site-toml.md. Validated by `load`: each entry is an IP and port
+    /// in a local range (`m6_core::net::is_private_ip`) equal to `bind` or
+    /// `h2c_bind`. Read at startup; a change needs a restart.
+    #[serde(default)]
+    pub internal_binds: Vec<String>,
+    /// The peers the internal h2c listener accepts, canonical. Filled by
+    /// `load` from `[server] internal_peers`; empty when no listener is
+    /// internal. Read at startup; a change needs a restart.
+    #[serde(default)]
+    pub internal_peers: Vec<std::net::IpAddr>,
     /// Run this process as a plain-HTTP redirector on this address instead of
-    /// a normal server: every request is answered 301 to https://<Host><path>.
+    /// a normal server: every request is answered 301 to `https://<Host><path>`.
     ///
     /// Meant for a **second m6-http process** alongside the real one, not for
     /// the `:443` instance to also listen here. Different port, different
@@ -139,6 +150,20 @@ pub struct ServerConfig {
     pub allowed_methods: Vec<String>,
 }
 
+impl ServerConfig {
+    /// True when `listener` (a bind string from this config) is named in
+    /// `internal_binds`. Compared as socket addresses, so `[::1]:80` equals
+    /// `[0:0:0:0:0:0:0:1]:80`. A listener given as a host name never matches.
+    pub fn is_internal(&self, listener: &str) -> bool {
+        let Ok(l) = listener.parse::<std::net::SocketAddr>() else {
+            return false;
+        };
+        self.internal_binds
+            .iter()
+            .any(|e| e.parse::<std::net::SocketAddr>().is_ok_and(|a| a == l))
+    }
+}
+
 fn default_allowed_methods() -> Vec<String> {
     vec!["GET".to_string(), "HEAD".to_string(), "POST".to_string()]
 }
@@ -174,6 +199,8 @@ impl Default for LogConfig {
 /// Per-request traffic logging (session cookie, referrer, UA, cache state,
 /// node identity, ...) — separate from operational `[log]` above. Written to
 /// its own file via `m6_core::log::init_with_analytics`, always JSON.
+///
+/// Rotate by renaming the file and sending SIGUSR1: the process reopens the path.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalyticsConfig {
     #[serde(default = "default_true")]
@@ -259,6 +286,27 @@ pub struct HealthConfig {
     /// answer that changes slowly. The check that consumes this runs hourly.
     #[serde(default = "default_traffic_cache_s")]
     pub traffic_cache_s: u64,
+    /// `role:<name>` or `group:<name>`. When set, `/perf` and `/traffic` need
+    /// an API token that carries this claim, verified with `[auth] public_key`
+    /// exactly as a route `require` is: 401 for no or a bad token, 403 for the
+    /// wrong claim. It wins over `metrics_token_file`.
+    #[serde(default)]
+    pub metrics_require: Option<String>,
+    /// The IP addresses allowed to read `/perf` and `/traffic`, as written.
+    /// Any other peer gets 404. Unset means no address rule.
+    ///
+    /// Each entry must be an IP address in a local range
+    /// (`m6_core::net::is_private_ip`). Names and ranges are refused. The
+    /// peer address is the one a completed TCP or QUIC handshake proved, and
+    /// the endpoints are refused on an internal h2c listener, where the
+    /// address is a forwarded claim.
+    #[serde(default)]
+    pub metrics_peers: Option<Vec<String>>,
+    /// `metrics_peers`, parsed and canonical (an IPv4-mapped IPv6 address is
+    /// stored as IPv4), filled by `load`. The gate reads only this: `None`
+    /// means no address rule. Compared on the request path with no allocation.
+    #[serde(skip)]
+    pub metrics_peer_ips: Option<Vec<std::net::IpAddr>>,
 }
 
 fn default_perf_path() -> String {
@@ -287,6 +335,9 @@ impl Default for HealthConfig {
             perf_path: default_perf_path(),
             traffic_path: default_traffic_path(),
             traffic_cache_s: default_traffic_cache_s(),
+            metrics_require: None,
+            metrics_peers: None,
+            metrics_peer_ips: None,
         }
     }
 }
@@ -510,7 +561,10 @@ impl SecurityConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthConfig {
-    pub backend: String,
+    /// Optional. When given it must name a `[[backend]]`. Nothing reads it
+    /// beyond that check: verification needs only `public_key`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
     pub public_key: String,
 }
 
@@ -519,7 +573,7 @@ pub struct BackendConfig {
     pub name: String,
     /// Unix socket glob, e.g. "/run/m6/m6-html-*.sock"
     pub sockets: Option<String>,
-    /// URL upstream, e.g. "https://api.example.com"
+    /// URL upstream, e.g. `https://api.example.com`
     pub url: Option<String>,
     /// Skip TLS certificate verification for URL backends.
     /// For testing with self-signed certs only — do not use in production.
@@ -635,6 +689,8 @@ struct RawServerSection {
     tls_key: Option<String>,
     backend_timeout_secs: Option<u64>,
     h2c_bind: Option<String>,
+    internal_binds: Option<Vec<String>>,
+    internal_peers: Option<Vec<String>>,
     redirect_bind: Option<String>,
     allowed_methods: Option<Vec<String>>,
 }
@@ -643,9 +699,188 @@ struct RawServerSection {
 struct RawSystemToml {
     server: Option<RawServerSection>,
     node: Option<NodeConfig>,
+    /// `[auth]` may live here instead of site.toml (never both), so the
+    /// verify key's path is owned by the same file as the node's other
+    /// credentials.
+    auth: Option<AuthConfig>,
+    /// Only the access keys: a node's own credentials and peers belong to the
+    /// node, not to the site that is shipped to every node.
+    /// Kept as a raw value so a site.toml passed as its own system config
+    /// (one file for both, as a development script does) is not rejected for
+    /// the `[health]` keys only site.toml may carry. It is parsed strictly
+    /// into `RawSystemHealth` when the two files differ.
+    health: Option<toml::Value>,
+}
+
+/// The `[health]` keys the system config may carry. Anything else fails to
+/// parse, so a misplaced key is loud instead of ignored.
+/// `NODE_HEALTH_KEYS` lists the same keys for `misplaced_keys`; change both together.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSystemHealth {
+    metrics_require: Option<String>,
+    metrics_peers: Option<Vec<String>>,
+    /// A credential path, so it belongs to the node. Absolute only, as
+    /// `[auth].public_key` is in this file.
+    metrics_token_file: Option<String>,
+}
+
+/// Parse a list of peer addresses into canonical form.
+///
+/// Only an IP literal in a local range is accepted. A name is never resolved,
+/// a range is not a peer, and a public or wildcard address could never be a
+/// private peer, so each is a load error. `key` names the setting in the
+/// messages, `role` says what the entry is, and `empty_hint` says what to do
+/// about an empty list.
+fn parse_local_peers(
+    key: &str,
+    role: &str,
+    empty_hint: &str,
+    peers: &[String],
+) -> anyhow::Result<Vec<std::net::IpAddr>> {
+    if peers.is_empty() {
+        anyhow::bail!("config error: {key} is empty; {empty_hint}");
+    }
+    let mut ips = Vec::with_capacity(peers.len());
+    for e in peers {
+        let ip: std::net::IpAddr = e.parse().map_err(|_| {
+            anyhow::anyhow!(
+                "config error: {key} entry \"{e}\" is not an IP address such as \"10.0.0.5\" or \"fd00::5\"; names are never resolved and ranges are not accepted"
+            )
+        })?;
+        if !m6_core::net::is_private_ip(ip) {
+            anyhow::bail!(
+                "config error: {key} entry \"{e}\" is not in a local range; {role} must be a loopback, private (RFC 1918), link-local, shared (100.64.0.0/10) or IPv6 unique-local address"
+            );
+        }
+        ips.push(ip.to_canonical());
+    }
+    Ok(ips)
+}
+
+/// Parse `[health] metrics_peers` into canonical addresses.
+fn validate_metrics_peers(
+    peers: Option<&[String]>,
+) -> anyhow::Result<Option<Vec<std::net::IpAddr>>> {
+    let Some(peers) = peers else {
+        return Ok(None);
+    };
+    parse_local_peers(
+        "[health].metrics_peers",
+        "a metrics peer",
+        "list the peers allowed to read /perf and /traffic, or remove the key",
+        peers,
+    )
+    .map(Some)
 }
 
 // ── Loading ─────────────────────────────────────────────────────────────────
+
+/// Check `[server] internal_binds` against the listeners and the local ranges.
+///
+/// Order: the `h2c_bind` migration guard, then each entry in list order for an
+/// IP and port, not the TLS bind, a local range and the h2c listener. Host names are never resolved.
+fn validate_internal_binds(
+    internal_binds: Option<&[String]>,
+    bind: &str,
+    h2c_bind: Option<&str>,
+) -> anyhow::Result<()> {
+    if let (Some(h2c), None) = (h2c_bind, internal_binds) {
+        let what = "m6-http no longer decides from an address whether a listener is internal";
+        let public = "internal_binds = [] to treat it as public";
+        match h2c.parse::<std::net::SocketAddr>() {
+            Err(_) => anyhow::bail!(
+                "config error: [server].h2c_bind = \"{h2c}\" is set but [server].internal_binds is not. {what}. An internal h2c listener needs an IP address and port such as \"10.0.0.1:8080\", and \"{h2c}\" is not one. Bind h2c_bind to an IP address and name it in internal_binds, or add {public}"
+            ),
+            Ok(sa) if !m6_core::net::is_private_ip(sa.ip()) => anyhow::bail!(
+                "config error: [server].h2c_bind = \"{h2c}\" is set but [server].internal_binds is not. {what}. To be internal the listener must be bound to a local address (loopback, private, link-local, shared or unique-local), and \"{h2c}\" is not. Bind it to a local address and name it in internal_binds, or add {public}"
+            ),
+            Ok(_) => anyhow::bail!(
+                "config error: [server].h2c_bind = \"{h2c}\" is set but [server].internal_binds is not. {what}. Add internal_binds = [\"{h2c}\"] to keep trusting it as the private backbone (forwarded client addresses believed, the custom error path allowed, statistics labelled internal), or {public}"
+            ),
+        }
+    }
+    let listener = |s: &str| s.parse::<std::net::SocketAddr>().ok();
+    for e in internal_binds.unwrap_or_default() {
+        let Ok(sa) = e.parse::<std::net::SocketAddr>() else {
+            anyhow::bail!(
+                "config error: [server].internal_binds entry \"{e}\" is not an IP address and port such as \"10.0.0.1:8080\" or \"[fd00::1]:8080\"; names are never resolved"
+            );
+        };
+        if listener(bind) == Some(sa) && h2c_bind.and_then(listener) != Some(sa) {
+            anyhow::bail!(
+                "config error: [server].internal_binds entry \"{e}\" is [server].bind, the TLS and QUIC listener. Only the h2c_bind listener can be internal, because the TLS and QUIC listener faces clients"
+            );
+        }
+        if !m6_core::net::is_private_ip(sa.ip()) {
+            anyhow::bail!(
+                "config error: [server].internal_binds entry \"{e}\" is not in a local range; an internal binding must be a loopback, private (RFC 1918), link-local, shared (100.64.0.0/10) or IPv6 unique-local address"
+            );
+        }
+        if h2c_bind.and_then(listener) != Some(sa) {
+            anyhow::bail!(
+                "config error: [server].internal_binds entry \"{e}\" is not this server's h2c listener; it must equal [server].h2c_bind"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Check `[server] internal_peers` against the listeners that are internal.
+///
+/// A listener that is internal believes the client address its peer forwards,
+/// so it must say which peers it accepts. The key is required then, and
+/// refused when no listener is internal because it would do nothing.
+/// `internal_binds` is already validated, so a non-empty list names `h2c_bind`.
+fn validate_internal_peers(
+    internal_peers: Option<&[String]>,
+    internal_binds: &[String],
+) -> anyhow::Result<Vec<std::net::IpAddr>> {
+    match (internal_binds.first(), internal_peers) {
+        (None, None) => Ok(Vec::new()),
+        (None, Some(_)) => anyhow::bail!(
+            "config error: [server].internal_peers is set but no listener is internal; remove it, or name the h2c listener in [server].internal_binds"
+        ),
+        (Some(b), None) => anyhow::bail!(
+            "config error: [server].internal_binds names \"{b}\" but [server].internal_peers is not set. An internal listener believes the client address a peer forwards, so it accepts only the peers it names. Add internal_peers = [\"<peer IP>\", ...] with the address each cache node connects from; any other peer is refused"
+        ),
+        (Some(b), Some(peers)) => {
+            let parsed = parse_local_peers(
+                "[server].internal_peers",
+                "an internal peer",
+                "list the peers allowed to connect to the internal h2c listener, or set internal_binds = [] to make the listener public",
+                peers,
+            )?;
+            // A connection arrives from the bind's own IP family, and an
+            // IPv4-mapped bind is IPv4. A list with no peer of that family
+            // would refuse every connection.
+            let bind_ip = b.parse::<std::net::SocketAddr>()?.ip().to_canonical();
+            if !parsed.iter().any(|p| p.is_ipv4() == bind_ip.is_ipv4()) {
+                let (bind_family, peer_family) = if bind_ip.is_ipv4() {
+                    ("IPv4", "IPv6")
+                } else {
+                    ("IPv6", "IPv4")
+                };
+                anyhow::bail!(
+                    "config error: [server].internal_binds \"{b}\" is {bind_family} but every [server].internal_peers entry is {peer_family}, so every connection would be refused. Add an internal_peers entry in the {bind_family} address each cache node connects from"
+                );
+            }
+            Ok(parsed)
+        }
+    }
+}
+
+/// Whether `site.toml` and the system config are one file (one-file mode, as a
+/// development script runs). A path that cannot be resolved is not one file.
+fn is_one_file(site_toml: &Path, system_config: &Path) -> bool {
+    match (
+        std::fs::canonicalize(site_toml),
+        std::fs::canonicalize(system_config),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
 
 /// Load and merge configs. Returns Config on success. Returns error with
 /// message suitable for exit-2 on any validation failure.
@@ -659,13 +894,25 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
 
     let system_raw = std::fs::read_to_string(system_config_path)
         .with_context(|| format!("reading {}", system_config_path.display()))?;
-    let system_parsed: RawSystemToml = toml::from_str(&system_raw)
+    let mut system_parsed: RawSystemToml = toml::from_str(&system_raw)
         .with_context(|| format!("parsing {}", system_config_path.display()))?;
+    // When both arguments name the same file, its [auth] and [health] belong
+    // to the site config alone, not to a second declaration.
+    if is_one_file(&site_toml_path, system_config_path) {
+        system_parsed.auth = None;
+        system_parsed.health = None;
+    }
+    let system_health: Option<RawSystemHealth> = system_parsed
+        .health
+        .take()
+        .map(|v| v.try_into())
+        .transpose()
+        .with_context(|| format!("parsing [health] in {}", system_config_path.display()))?;
 
     // Warn on unexpected sections in system config (we only check for unknown
     // top-level keys by seeing if extra keys exist; toml parsing uses deny_unknown_fields
     // is opt-in, but the spec says warn and ignore instead of error).
-    // We rely on RawSystemToml only accepting `server`/`node`.
+    // We rely on RawSystemToml only accepting `server`/`node`/`auth`/`health`.
 
     // Build merged server config:
     // site.toml [server] provides base values, system config [server] overrides.
@@ -676,6 +923,8 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         tls_key: None,
         backend_timeout_secs: None,
         h2c_bind: None,
+        internal_binds: None,
+        internal_peers: None,
         redirect_bind: None,
         allowed_methods: None,
     });
@@ -686,6 +935,8 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         tls_key: None,
         backend_timeout_secs: None,
         h2c_bind: None,
+        internal_binds: None,
+        internal_peers: None,
         redirect_bind: None,
         allowed_methods: None,
     });
@@ -724,6 +975,21 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         .or(site_server.backend_timeout_secs)
         .unwrap_or(30);
     let h2c_bind = sys_server.h2c_bind.or(site_server.h2c_bind);
+    // Nothing is inferred from an address: a listener is internal only when
+    // this list names it. A redirector binds nothing the list could name, so a
+    // site.toml shared with one must not break it.
+    let internal_binds = sys_server.internal_binds.or(site_server.internal_binds);
+    let internal_peers = sys_server.internal_peers.or(site_server.internal_peers);
+    let internal_peers = if redirect_bind.is_none() {
+        validate_internal_binds(internal_binds.as_deref(), &bind, h2c_bind.as_deref())?;
+        validate_internal_peers(
+            internal_peers.as_deref(),
+            internal_binds.as_deref().unwrap_or_default(),
+        )?
+    } else {
+        Vec::new()
+    };
+    let internal_binds = internal_binds.unwrap_or_default();
 
     // Resolve TLS cert/key paths relative to site_dir if not absolute.
     let tls_cert_path = tls_cert.as_deref().map(|c| resolve_path(site_dir, c));
@@ -744,16 +1010,12 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         .ok_or_else(|| anyhow::anyhow!("config error: [site].domain is required"))?;
 
     // Node identity comes from system config, not site.toml (see NodeConfig
-    // doc comment) — falls back to [site].name with a warning so an older
+    // doc comment) — falls back to [site].name, with a warning from main, so an older
     // system config without [node] still starts up instead of hard-failing.
-    let node = system_parsed.node.unwrap_or_else(|| {
-        warn!(
-            file = %system_config_path.display(),
-            "system config: no [node].name set, falling back to [site].name for node identity"
-        );
-        NodeConfig {
-            name: site_name.clone(),
-        }
+    // The fallback is reported by `warn_node_fallback` from main, because
+    // warn! inside load() goes to a subscriber that does not exist yet.
+    let node = system_parsed.node.unwrap_or_else(|| NodeConfig {
+        name: site_name.clone(),
     });
 
     let server = ServerConfig {
@@ -766,6 +1028,8 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
             .map(|p| p.to_string_lossy().into_owned()),
         backend_timeout_secs,
         h2c_bind,
+        internal_binds,
+        internal_peers,
         warm_on_start,
         redirect_bind: redirect_bind.clone(),
         // Uppercased once at load so the hot-path check is a plain comparison
@@ -782,8 +1046,21 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
     let log = site_parsed.log.unwrap_or_default();
     let analytics = site_parsed.analytics.unwrap_or_default();
     let mut health = site_parsed.health.unwrap_or_default();
+    // The system config wins key by key, as [server] keys do.
+    if let Some(sys) = system_health {
+        health.metrics_require = sys.metrics_require.or(health.metrics_require);
+        health.metrics_peers = sys.metrics_peers.or(health.metrics_peers);
+        if let Some(p) = sys.metrics_token_file {
+            // A relative path resolves against the site directory, as
+            // `tls_cert` does, so the service does not depend on the working
+            // directory it was started from.
+            let p = resolve_path(site_dir, &p).to_string_lossy().into_owned();
+            health.metrics_token_file = Some(p);
+        }
+    }
     // Read the token here so the running server never touches the file on the
-    // request path. Failure is deliberately not fatal: a missing token file
+    // request path. It is read after the merge so that a path from either file
+    // is the one read. Failure is deliberately not fatal: a missing token file
     // means /perf answers 404 (fails closed), and refusing to boot the whole
     // server over a metrics credential would be disproportionate -- the same
     // call made for the inert `cache =` route key. It is reported by
@@ -795,6 +1072,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
             .map(|t| t.trim().to_string())
             .filter(|t| !t.is_empty());
     }
+    health.metrics_peer_ips = validate_metrics_peers(health.metrics_peers.as_deref())?;
     let rate_limit = site_parsed.rate_limit.unwrap_or_default();
     let errors = site_parsed.errors.unwrap_or_default();
     let security = site_parsed.security.unwrap_or_default();
@@ -856,8 +1134,19 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         }
     }
 
-    // Validate auth
-    let auth = site_parsed.auth;
+    // Validate auth. One owner: declaring [auth] in both files would make a
+    // whole-section override silently change which key verifies every route.
+    let auth = match (site_parsed.auth, system_parsed.auth) {
+        (Some(_), Some(_)) => anyhow::bail!(
+            "config error: [auth] is declared in both site.toml and the system config; declare it in one"
+        ),
+        (None, Some(a)) => {
+            // A relative `public_key` resolves against the site directory below,
+            // as `tls_cert` does.
+            Some(a)
+        }
+        (site, None) => site,
+    };
     if let Some(ref a) = auth {
         let key_path = resolve_path(site_dir, &a.public_key);
         if !key_path.exists() {
@@ -866,11 +1155,10 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
                 key_path.display()
             );
         }
-        if !backend_names.contains(a.backend.as_str()) {
-            anyhow::bail!(
-                "config error: [auth].backend `{}` not in [[backend]]",
-                a.backend
-            );
+        if let Some(ref b) = a.backend {
+            if !backend_names.contains(b.as_str()) {
+                anyhow::bail!("config error: [auth].backend `{}` not in [[backend]]", b);
+            }
         }
     }
 
@@ -888,6 +1176,21 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
             anyhow::bail!(
                 "config error: route_group {} has `require` but no [auth] declared",
                 rg.path
+            );
+        }
+    }
+
+    if let Some(ref r) = health.metrics_require {
+        if auth.is_none() {
+            anyhow::bail!("config error: [health].metrics_require needs [auth] with a public_key");
+        }
+        let named = matches!(
+            crate::auth::Require::parse(r),
+            Some(crate::auth::Require::Role(n) | crate::auth::Require::Group(n)) if !n.is_empty()
+        );
+        if !named {
+            anyhow::bail!(
+                "config error: [health].metrics_require = \"{r}\" must be \"role:<name>\" or \"group:<name>\""
             );
         }
     }
@@ -974,12 +1277,128 @@ pub fn warn_ignored_route_cache_keys(config: &Config) {
 /// exists, because it is what supplies the log level.
 pub fn warn_health_token(health: &HealthConfig) {
     if let Some(ref path) = health.metrics_token_file {
-        if health.metrics_token.is_none() {
-            warn!(
+        if health.metrics_require.is_some() {
+            info!(
                 file = %path,
-                "health: metrics token file missing or empty -- /perf will answer 404"
+                "health: metrics_require is set, so metrics_token_file is ignored"
             );
+        } else {
+            info!(
+                file = %path,
+                "health: metrics_token_file is the legacy gate; metrics_require checks an API token instead"
+            );
+            if health.metrics_token.is_none() {
+                warn!(
+                    file = %path,
+                    "health: metrics token file missing or empty -- /perf will answer 404"
+                );
+            }
         }
+    }
+}
+
+/// Keys that are this node's own state. They belong in the system config.
+const NODE_SERVER_KEYS: &[&str] = &[
+    "bind",
+    "tls_cert",
+    "tls_key",
+    "h2c_bind",
+    "internal_binds",
+    "internal_peers",
+    "redirect_bind",
+    "warm_on_start",
+];
+/// The fields of `RawSystemHealth`; change both together.
+const NODE_HEALTH_KEYS: &[&str] = &["metrics_token_file", "metrics_require", "metrics_peers"];
+/// Whole sections that are node state. They belong in the system config.
+///
+/// `RawSiteToml` has no `[node]` field, so a `[node]` in `site.toml` is
+/// dropped without a word unless it is named here.
+const NODE_SECTIONS: &[&str] = &["auth", "node"];
+/// Keys that describe how the site's routes are served. They belong in
+/// `site.toml`.
+const SITE_SERVER_KEYS: &[&str] = &["backend_timeout_secs", "allowed_methods"];
+
+/// Name every key that sits in the file it does not belong to.
+///
+/// Both files accept most of these keys and the system config wins, so a
+/// misplaced key works and says nothing. Each message names the key and the
+/// file it belongs in. The rule: `site.toml` holds state every node of the site
+/// shares, and the system config holds this node's own state (binds,
+/// certificates, credential paths, per-node security).
+///
+/// Returns nothing when both paths name one file (one-file mode, as a
+/// development script runs) or when either file cannot be read or parsed, since
+/// `load` reports those.
+pub fn misplaced_keys(site_dir: &Path, system_config_path: &Path) -> Vec<String> {
+    let site_toml_path = site_dir.join("site.toml");
+    if is_one_file(&site_toml_path, system_config_path) {
+        return Vec::new();
+    }
+    let read = |p: &Path| -> Option<toml::Value> {
+        std::fs::read_to_string(p).ok()?.parse::<toml::Value>().ok()
+    };
+    let (Some(site), Some(system)) = (read(&site_toml_path), read(system_config_path)) else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    let in_site = |section: &str, key: &str| site.get(section).and_then(|t| t.get(key)).is_some();
+    for key in NODE_SERVER_KEYS {
+        if in_site("server", key) {
+            out.push(node_state_message("server", Some(key), system_config_path));
+        }
+    }
+    for section in NODE_SECTIONS {
+        if site.get(section).is_some() {
+            out.push(node_state_message(section, None, system_config_path));
+        }
+    }
+    for key in NODE_HEALTH_KEYS {
+        if in_site("health", key) {
+            out.push(node_state_message("health", Some(key), system_config_path));
+        }
+    }
+    for key in SITE_SERVER_KEYS {
+        if system.get("server").and_then(|t| t.get(key)).is_some() {
+            out.push(format!(
+                "the system config sets [server].{key}, which is site-wide and belongs in site.toml"
+            ));
+        }
+    }
+    out
+}
+
+fn node_state_message(section: &str, key: Option<&str>, system_config_path: &Path) -> String {
+    let name = match key {
+        Some(k) => format!("[{section}].{k}"),
+        None => format!("[{section}]"),
+    };
+    format!(
+        "site.toml sets {name}, which is this node's own state and belongs in the system config {}",
+        system_config_path.display()
+    )
+}
+
+/// True when the system config names no `[node]`, so the node identity falls
+/// back to `[site].name`.
+pub fn node_falls_back(system_config_path: &Path) -> bool {
+    std::fs::read_to_string(system_config_path)
+        .ok()
+        .and_then(|raw| raw.parse::<toml::Table>().ok())
+        .is_some_and(|t| !t.contains_key("node"))
+}
+
+/// Warn that the node identity fell back to `[site].name`.
+///
+/// Called from `main` after logging is initialised, for the reason given on
+/// [`warn_ignored_route_cache_keys`].
+pub fn warn_node_fallback(system_config_path: &Path) {
+    if node_falls_back(system_config_path) {
+        warn!(
+            file = %system_config_path.display(),
+            "system config: no [node].name set, falling back to [site].name for node identity"
+        );
     }
 }
 
@@ -987,11 +1406,11 @@ pub fn warn_system_config_extra_keys(system_config_path: &Path) {
     if let Ok(raw) = std::fs::read_to_string(system_config_path) {
         if let Ok(toml::Value::Table(tbl)) = raw.parse::<toml::Value>() {
             for key in tbl.keys() {
-                if key != "server" && key != "node" {
+                if !matches!(key.as_str(), "server" | "node" | "auth" | "health") {
                     warn!(
                         key = %key,
                         file = %system_config_path.display(),
-                        "system config: ignoring non-[server]/[node] key"
+                        "system config: ignoring key other than [server], [node], [auth], [health]"
                     );
                 }
             }
@@ -1525,5 +1944,736 @@ backend_timeout_secs = 120
         );
         let cfg = load(dir.path(), &dir.path().join("system.toml")).unwrap();
         assert_eq!(cfg.server.backend_timeout_secs, 120);
+    }
+
+    // ── [server] internal_binds ─────────────────────────────────────────────
+
+    /// Load the minimal site with `extra` appended to the system config's
+    /// `[server]` table.
+    fn load_with_system_server(extra: &str) -> anyhow::Result<Config> {
+        let dir = make_test_dir();
+        setup_minimal(dir.path());
+        let mut sys = minimal_system_toml();
+        sys.push_str(extra);
+        write_file(dir.path(), "system.toml", &sys);
+        load(dir.path(), &dir.path().join("system.toml"))
+    }
+
+    fn load_error(extra: &str) -> String {
+        load_with_system_server(extra)
+            .expect_err("load must refuse")
+            .to_string()
+    }
+
+    #[test]
+    fn no_internal_binds_without_h2c_loads_and_nothing_is_internal() {
+        let cfg = load_with_system_server("").unwrap();
+        assert!(cfg.server.internal_binds.is_empty());
+        // A loopback bind is no longer internal by address.
+        assert!(!cfg.server.is_internal("127.0.0.1:8443"));
+    }
+
+    #[test]
+    fn an_h2c_bind_without_internal_binds_refuses_to_start() {
+        let e = load_error("h2c_bind = \"127.0.0.1:18080\"\n");
+        assert!(e.starts_with("config error:"), "{e}");
+        assert!(e.contains("internal_binds = [\"127.0.0.1:18080\"]"), "{e}");
+        assert!(e.contains("internal_binds = []"), "{e}");
+    }
+
+    #[test]
+    fn the_migration_error_for_a_host_name_does_not_suggest_that_name() {
+        let e = load_error("h2c_bind = \"localhost:8080\"\n");
+        assert!(!e.contains("internal_binds = [\"localhost:8080\"]"), "{e}");
+        assert!(e.contains("needs an IP address and port"), "{e}");
+        assert!(e.contains("internal_binds = []"), "{e}");
+    }
+
+    #[test]
+    fn the_migration_error_for_a_non_local_address_does_not_suggest_it() {
+        for h2c in ["0.0.0.0:8080", "203.0.113.7:8080"] {
+            let e = load_error(&format!("h2c_bind = \"{h2c}\"\n"));
+            assert!(
+                !e.contains(&format!("internal_binds = [\"{h2c}\"]")),
+                "{h2c}: {e}"
+            );
+            assert!(e.contains("must be bound to a local address"), "{h2c}: {e}");
+            assert!(e.contains("internal_binds = []"), "{h2c}: {e}");
+        }
+    }
+
+    #[test]
+    fn an_empty_internal_binds_accepts_an_undeclared_h2c() {
+        let cfg = load_with_system_server("h2c_bind = \"127.0.0.1:18080\"\ninternal_binds = []\n")
+            .unwrap();
+        assert!(cfg.server.internal_binds.is_empty());
+        assert!(!cfg.server.is_internal("127.0.0.1:18080"));
+    }
+
+    #[test]
+    fn a_declared_h2c_bind_is_internal_and_the_tls_bind_is_not() {
+        let cfg = load_with_system_server(
+            "h2c_bind = \"127.0.0.1:18080\"\ninternal_binds = [\"127.0.0.1:18080\"]\ninternal_peers = [\"127.0.0.1\"]\n",
+        )
+        .unwrap();
+        assert!(cfg.server.is_internal("127.0.0.1:18080"));
+        assert!(!cfg.server.is_internal(&cfg.server.bind));
+    }
+
+    #[test]
+    fn an_internal_binding_that_names_the_tls_bind_is_refused() {
+        let e = load_error("internal_binds = [\"127.0.0.1:8443\"]\n");
+        assert!(e.starts_with("config error:"), "{e}");
+        assert!(
+            e.contains("Only the h2c_bind listener can be internal"),
+            "{e}"
+        );
+        assert!(e.contains("\"127.0.0.1:8443\""), "{e}");
+    }
+
+    #[test]
+    fn an_internal_binding_must_be_an_ip_and_port() {
+        for entry in ["localhost:8080", "10.0.0.1", "fdexample.com:80"] {
+            let e = load_error(&format!("internal_binds = [\"{entry}\"]\n"));
+            assert!(e.contains("is not an IP address and port"), "{entry}: {e}");
+            assert!(e.contains(&format!("\"{entry}\"")), "{entry}: {e}");
+        }
+    }
+
+    #[test]
+    fn an_internal_binding_must_be_in_a_local_range() {
+        // Same address as h2c_bind, so only the range check can refuse it.
+        for entry in ["203.0.113.7:8080", "0.0.0.0:8080"] {
+            let e = load_error(&format!(
+                "h2c_bind = \"{entry}\"\ninternal_binds = [\"{entry}\"]\n"
+            ));
+            assert!(e.contains("is not in a local range"), "{entry}: {e}");
+        }
+    }
+
+    #[test]
+    fn an_internal_binding_must_name_the_h2c_listener() {
+        let e = load_error("h2c_bind = \"10.0.0.1:8080\"\ninternal_binds = [\"10.0.0.9:8080\"]\n");
+        assert!(e.contains("is not this server's h2c listener"), "{e}");
+        assert!(e.contains("it must equal [server].h2c_bind"), "{e}");
+    }
+
+    #[test]
+    fn ipv6_internal_bindings_match_as_socket_addresses() {
+        let cfg = load_with_system_server(
+            "h2c_bind = \"[::1]:8080\"\ninternal_binds = [\"[0:0:0:0:0:0:0:1]:8080\"]\ninternal_peers = [\"::1\"]\n",
+        )
+        .unwrap();
+        assert!(cfg.server.is_internal("[::1]:8080"));
+        let cfg = load_with_system_server(
+            "h2c_bind = \"[fd00::1]:80\"\ninternal_binds = [\"[fd00::1]:80\"]\ninternal_peers = [\"fd00::2\"]\n",
+        )
+        .unwrap();
+        assert!(cfg.server.is_internal("[fd00::1]:80"));
+    }
+
+    #[test]
+    fn system_internal_binds_replace_site_internal_binds() {
+        let dir = make_test_dir();
+        setup_minimal(dir.path());
+        let mut site = minimal_site_toml();
+        site = site.replace(
+            "tls_key  = \"key.pem\"\n",
+            "tls_key  = \"key.pem\"\ninternal_binds = []\n",
+        );
+        write_file(dir.path(), "site.toml", &site);
+        let mut sys = minimal_system_toml();
+        sys.push_str("h2c_bind = \"127.0.0.1:18080\"\ninternal_binds = [\"127.0.0.1:18080\"]\ninternal_peers = [\"127.0.0.1\"]\n");
+        write_file(dir.path(), "system.toml", &sys);
+        let cfg = load(dir.path(), &dir.path().join("system.toml")).unwrap();
+        assert!(cfg.server.is_internal("127.0.0.1:18080"));
+    }
+
+    #[test]
+    fn redirect_mode_ignores_internal_binds() {
+        let dir = make_test_dir();
+        write_file(
+            dir.path(),
+            "site.toml",
+            r#"
+[site]
+name   = "Test"
+domain = "test.example.com"
+[server]
+redirect_bind = "0.0.0.0:80"
+internal_binds = ["203.0.113.7:80"]
+"#,
+        );
+        write_file(dir.path(), "system.toml", "");
+        let cfg = load(dir.path(), &dir.path().join("system.toml")).unwrap();
+        assert_eq!(cfg.server.redirect_bind.as_deref(), Some("0.0.0.0:80"));
+    }
+
+    // ── [server] internal_peers ─────────────────────────────────────────────
+
+    /// An internal h2c listener, so `internal_peers` is in play.
+    const INTERNAL_H2C: &str =
+        "h2c_bind = \"127.0.0.1:18080\"\ninternal_binds = [\"127.0.0.1:18080\"]\n";
+
+    #[test]
+    fn internal_peers_are_required_when_a_listener_is_internal() {
+        let e = load_error(INTERNAL_H2C);
+        assert!(e.starts_with("config error:"), "{e}");
+        assert!(e.contains("[server].internal_peers is not set"), "{e}");
+        assert!(e.contains("127.0.0.1:18080"), "{e}");
+    }
+
+    #[test]
+    fn internal_peers_without_an_internal_listener_is_refused() {
+        let with_public_h2c =
+            "h2c_bind = \"127.0.0.1:18080\"\ninternal_binds = []\ninternal_peers = [\"127.0.0.1\"]\n";
+        for extra in [with_public_h2c, "internal_peers = [\"127.0.0.1\"]\n"] {
+            let e = load_error(extra);
+            assert!(
+                e.contains("[server].internal_peers is set but no listener is internal"),
+                "{extra}: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn peers_of_the_other_ip_family_than_the_internal_bind_are_refused() {
+        let v6 = "h2c_bind = \"[fd00::1]:18080\"\ninternal_binds = [\"[fd00::1]:18080\"]\n";
+        let e = load_error(&format!("{v6}internal_peers = [\"10.0.0.2\"]\n"));
+        assert!(e.contains("[server].internal_peers"), "{e}");
+        assert!(e.contains("IPv6") && e.contains("fd00::1"), "{e}");
+        let v4 = "h2c_bind = \"10.0.0.1:18080\"\ninternal_binds = [\"10.0.0.1:18080\"]\n";
+        let e = load_error(&format!("{v4}internal_peers = [\"fd00::2\"]\n"));
+        assert!(e.contains("IPv4") && e.contains("10.0.0.1"), "{e}");
+        // An IPv4-mapped bind is IPv4, and a mapped peer is stored as IPv4.
+        let mapped = "h2c_bind = \"[::ffff:10.0.0.1]:18080\"\ninternal_binds = [\"[::ffff:10.0.0.1]:18080\"]\n";
+        let e = load_error(&format!("{mapped}internal_peers = [\"fd00::2\"]\n"));
+        assert!(e.contains("IPv4"), "{e}");
+    }
+
+    #[test]
+    fn one_peer_of_the_bind_family_is_enough() {
+        let v6 = "h2c_bind = \"[fd00::1]:18080\"\ninternal_binds = [\"[fd00::1]:18080\"]\n";
+        let cfg = load_with_system_server(&format!(
+            "{v6}internal_peers = [\"10.0.0.2\", \"fd00::2\"]\n"
+        ))
+        .unwrap();
+        assert_eq!(cfg.server.internal_peers.len(), 2);
+    }
+
+    #[test]
+    fn internal_peers_must_not_be_empty() {
+        let e = load_error(&format!("{INTERNAL_H2C}internal_peers = []\n"));
+        assert!(e.contains("[server].internal_peers is empty"), "{e}");
+        assert!(e.contains("internal_binds = []"), "{e}");
+    }
+
+    #[test]
+    fn an_internal_peer_must_be_an_ip() {
+        for entry in ["localhost", "10.0.0.0/24", "10.0.0.2:80"] {
+            let e = load_error(&format!("{INTERNAL_H2C}internal_peers = [\"{entry}\"]\n"));
+            assert!(
+                e.contains(&format!(
+                    "[server].internal_peers entry \"{entry}\" is not an IP address"
+                )),
+                "{entry}: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_internal_peer_must_be_in_a_local_range() {
+        for entry in ["203.0.113.7", "0.0.0.0", "::"] {
+            let e = load_error(&format!("{INTERNAL_H2C}internal_peers = [\"{entry}\"]\n"));
+            assert!(
+                e.contains(&format!(
+                    "[server].internal_peers entry \"{entry}\" is not in a local range"
+                )),
+                "{entry}: {e}"
+            );
+            assert!(
+                e.contains("an internal peer must be a loopback"),
+                "{entry}: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn internal_peers_are_stored_canonical() {
+        let cfg = load_with_system_server(&format!(
+            "{INTERNAL_H2C}internal_peers = [\"::ffff:10.0.0.2\", \"fd00::5\"]\n"
+        ))
+        .unwrap();
+        let want: Vec<std::net::IpAddr> =
+            vec!["10.0.0.2".parse().unwrap(), "fd00::5".parse().unwrap()];
+        assert_eq!(cfg.server.internal_peers, want);
+    }
+
+    #[test]
+    fn no_internal_listener_means_no_internal_peers() {
+        let cfg = load_with_system_server("").unwrap();
+        assert!(cfg.server.internal_peers.is_empty());
+    }
+
+    #[test]
+    fn system_internal_peers_replace_site_internal_peers() {
+        let dir = make_test_dir();
+        setup_minimal(dir.path());
+        let mut site = minimal_site_toml();
+        site = site.replace(
+            "tls_key  = \"key.pem\"\n",
+            "tls_key  = \"key.pem\"\ninternal_peers = [\"10.0.0.9\"]\n",
+        );
+        write_file(dir.path(), "site.toml", &site);
+        let mut sys = minimal_system_toml();
+        sys.push_str(INTERNAL_H2C);
+        sys.push_str("internal_peers = [\"127.0.0.1\"]\n");
+        write_file(dir.path(), "system.toml", &sys);
+        let cfg = load(dir.path(), &dir.path().join("system.toml")).unwrap();
+        let want: Vec<std::net::IpAddr> = vec!["127.0.0.1".parse().unwrap()];
+        assert_eq!(cfg.server.internal_peers, want);
+    }
+
+    #[test]
+    fn redirect_mode_ignores_internal_peers() {
+        let dir = make_test_dir();
+        write_file(
+            dir.path(),
+            "site.toml",
+            r#"
+[site]
+name   = "Test"
+domain = "test.example.com"
+[server]
+redirect_bind = "0.0.0.0:80"
+internal_peers = ["203.0.113.7"]
+"#,
+        );
+        write_file(dir.path(), "system.toml", "");
+        let cfg = load(dir.path(), &dir.path().join("system.toml")).unwrap();
+        assert!(cfg.server.internal_peers.is_empty());
+    }
+
+    /// Load with `site_extra` appended to site.toml and `sys_extra` appended
+    /// to system.toml. A verify key exists as `auth.pem` in the test directory.
+    fn load_with(site_extra: &str, sys_extra: &str) -> (TempDir, anyhow::Result<Config>) {
+        let dir = make_test_dir();
+        setup_minimal(dir.path());
+        write_file(dir.path(), "auth.pem", "dummy");
+        let mut site = minimal_site_toml();
+        site.push_str(&site_extra.replace("{DIR}", &dir.path().display().to_string()));
+        write_file(dir.path(), "site.toml", &site);
+        let mut sys = minimal_system_toml();
+        sys.push_str(&sys_extra.replace("{DIR}", &dir.path().display().to_string()));
+        write_file(dir.path(), "system.toml", &sys);
+        let result = load(dir.path(), &dir.path().join("system.toml"));
+        (dir, result)
+    }
+
+    #[test]
+    fn auth_without_backend_loads() {
+        let (_d, cfg) = load_with("\n[auth]\npublic_key = \"auth.pem\"\n", "");
+        let cfg = cfg.unwrap();
+        let auth = cfg.auth.expect("auth present");
+        assert_eq!(auth.backend, None);
+        assert_eq!(auth.public_key, "auth.pem");
+    }
+
+    #[test]
+    fn auth_backend_when_given_must_be_declared() {
+        let (_d, r) = load_with(
+            "\n[auth]\nbackend = \"nope\"\npublic_key = \"auth.pem\"\n",
+            "",
+        );
+        assert!(r
+            .unwrap_err()
+            .to_string()
+            .contains("[auth].backend `nope` not in [[backend]]"));
+        let (_d, ok) = load_with(
+            "\n[auth]\nbackend = \"m6-html\"\npublic_key = \"auth.pem\"\n",
+            "",
+        );
+        assert!(ok.is_ok());
+    }
+
+    #[test]
+    fn auth_from_the_system_config_is_used() {
+        let (_d, r) = load_with("", "\n[auth]\npublic_key = \"{DIR}/auth.pem\"\n");
+        let auth = r.unwrap().auth.expect("auth present");
+        assert!(auth.public_key.ends_with("/auth.pem"));
+        assert_eq!(auth.backend, None);
+    }
+
+    #[test]
+    fn auth_in_both_files_is_refused() {
+        let (_d, r) = load_with(
+            "\n[auth]\npublic_key = \"auth.pem\"\n",
+            "\n[auth]\npublic_key = \"{DIR}/auth.pem\"\n",
+        );
+        assert_eq!(
+            r.unwrap_err().to_string(),
+            "config error: [auth] is declared in both site.toml and the system config; declare it in one"
+        );
+    }
+
+    #[test]
+    fn a_relative_public_key_in_the_system_config_resolves_against_the_site_dir() {
+        let (_d, r) = load_with("", "\n[auth]\npublic_key = \"auth.pem\"\n");
+        // load_with writes auth.pem into the site directory.
+        let auth = r.unwrap().auth.expect("auth present");
+        assert_eq!(auth.public_key, "auth.pem");
+    }
+
+    #[test]
+    fn a_relative_public_key_in_the_system_config_must_exist_in_the_site_dir() {
+        let (_d, r) = load_with("", "\n[auth]\npublic_key = \"missing.pem\"\n");
+        let e = r.unwrap_err().to_string();
+        assert!(
+            e.contains("[auth].public_key file not found") && e.ends_with("/missing.pem"),
+            "{e}"
+        );
+    }
+
+    fn peers_error(entries: &str) -> String {
+        let (_d, r) = load_with(&format!("\n[health]\nmetrics_peers = [{entries}]\n"), "");
+        r.expect_err("must refuse").to_string()
+    }
+
+    #[test]
+    fn metrics_peers_accepts_local_addresses() {
+        let (_d, r) = load_with(
+            "\n[health]\nmetrics_peers = [\"10.0.0.9\", \"127.0.0.1\", \"fd00::5\", \"100.64.0.1\"]\n",
+            "",
+        );
+        let h = r.unwrap().health;
+        let ips = h.metrics_peer_ips.expect("peers set");
+        assert_eq!(ips.len(), 4);
+        assert!(ips.contains(&"fd00::5".parse().unwrap()));
+    }
+
+    #[test]
+    fn metrics_peers_are_stored_canonical() {
+        let (_d, r) = load_with("\n[health]\nmetrics_peers = [\"::ffff:10.0.0.9\"]\n", "");
+        let h = r.unwrap().health;
+        assert_eq!(
+            h.metrics_peer_ips,
+            Some(vec!["10.0.0.9".parse::<std::net::IpAddr>().unwrap()])
+        );
+    }
+
+    #[test]
+    fn metrics_peers_refuses_names_ranges_and_ports() {
+        for entry in ["localhost", "10.0.0.0/24", "10.0.0.9:443"] {
+            let e = peers_error(&format!("\"{entry}\""));
+            assert!(
+                e.contains(&format!(
+                    "metrics_peers entry \"{entry}\" is not an IP address"
+                )),
+                "{entry}: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn metrics_peers_refuses_public_and_wildcard() {
+        for entry in ["203.0.113.7", "0.0.0.0", "::"] {
+            let e = peers_error(&format!("\"{entry}\""));
+            assert!(e.contains("is not in a local range"), "{entry}: {e}");
+        }
+    }
+
+    #[test]
+    fn an_empty_metrics_peers_is_refused() {
+        assert!(peers_error("").contains("metrics_peers is empty"));
+    }
+
+    #[test]
+    fn metrics_require_needs_auth() {
+        let (_d, r) = load_with("\n[health]\nmetrics_require = \"role:monitor\"\n", "");
+        assert_eq!(
+            r.unwrap_err().to_string(),
+            "config error: [health].metrics_require needs [auth] with a public_key"
+        );
+    }
+
+    #[test]
+    fn metrics_require_must_name_a_role_or_group() {
+        for bad in ["admin", "role:", "group:", "user:x"] {
+            let (_d, r) = load_with(
+                &format!(
+                    "\n[auth]\npublic_key = \"auth.pem\"\n\n[health]\nmetrics_require = \"{bad}\"\n"
+                ),
+                "",
+            );
+            let e = r.unwrap_err().to_string();
+            assert!(
+                e.contains("must be \"role:<name>\" or \"group:<name>\""),
+                "{bad}: {e}"
+            );
+        }
+        let (_d, ok) = load_with(
+            "\n[auth]\npublic_key = \"auth.pem\"\n\n[health]\nmetrics_require = \"group:ops\"\n",
+            "",
+        );
+        assert!(ok.is_ok());
+    }
+
+    #[test]
+    fn system_health_keys_win_over_site_health_keys() {
+        let (_d, r) = load_with(
+            "\n[auth]\npublic_key = \"auth.pem\"\n\n[health]\nmetrics_require = \"role:site\"\nmetrics_peers = [\"10.0.0.1\"]\n",
+            "\n[health]\nmetrics_require = \"role:system\"\nmetrics_peers = [\"10.0.0.2\"]\n",
+        );
+        let h = r.unwrap().health;
+        assert_eq!(h.metrics_require.as_deref(), Some("role:system"));
+        assert_eq!(
+            h.metrics_peer_ips,
+            Some(vec!["10.0.0.2".parse::<std::net::IpAddr>().unwrap()])
+        );
+    }
+
+    #[test]
+    fn a_system_health_key_alone_keeps_the_other_from_the_site() {
+        let (_d, r) = load_with(
+            "\n[auth]\npublic_key = \"auth.pem\"\n\n[health]\nmetrics_require = \"role:site\"\n",
+            "\n[health]\nmetrics_peers = [\"10.0.0.2\"]\n",
+        );
+        let h = r.unwrap().health;
+        assert_eq!(h.metrics_require.as_deref(), Some("role:site"));
+        assert_eq!(h.metrics_peer_ips.map(|p| p.len()), Some(1));
+    }
+
+    #[test]
+    fn an_unknown_health_key_in_the_system_config_fails_to_parse() {
+        let (_d, r) = load_with("", "\n[health]\nperf_path = \"/p\"\n");
+        let e = format!("{:#}", r.unwrap_err());
+        assert!(e.contains("perf_path"), "{e}");
+    }
+
+    #[test]
+    fn health_defaults_have_no_require_and_no_peers() {
+        let (_d, r) = load_with("", "");
+        let h = r.unwrap().health;
+        assert_eq!(h.metrics_require, None);
+        assert_eq!(h.metrics_peers, None);
+        assert_eq!(h.metrics_peer_ips, None);
+    }
+
+    #[test]
+    fn one_file_given_as_both_is_read_once() {
+        let dir = make_test_dir();
+        setup_minimal(dir.path());
+        write_file(dir.path(), "auth.pem", "dummy");
+        let mut site = minimal_site_toml();
+        site.push_str("\n[auth]\npublic_key = \"auth.pem\"\n\n[health]\nperf_path = \"/p\"\nmetrics_peers = [\"10.0.0.5\"]\n");
+        write_file(dir.path(), "site.toml", &site);
+        let same = dir.path().join("site.toml");
+        let cfg = load(dir.path(), &same).expect("one file for both loads");
+        assert_eq!(cfg.auth.expect("auth").public_key, "auth.pem");
+        assert_eq!(cfg.health.perf_path, "/p");
+        assert_eq!(cfg.health.metrics_peer_ips.map(|p| p.len()), Some(1));
+    }
+
+    // --- misplaced_keys and metrics_token_file placement ---
+
+    #[test]
+    fn metrics_token_file_in_the_system_config_wins() {
+        let dir = make_test_dir();
+        setup_minimal(dir.path());
+        let site_token = dir.path().join("site-token");
+        let sys_token = dir.path().join("sys-token");
+        std::fs::write(&site_token, "from-site\n").unwrap();
+        std::fs::write(&sys_token, "from-system\n").unwrap();
+        let mut site = minimal_site_toml();
+        site.push_str(&format!(
+            "\n[health]\nmetrics_token_file = \"{}\"\n",
+            site_token.display()
+        ));
+        write_file(dir.path(), "site.toml", &site);
+        let mut sys = minimal_system_toml();
+        sys.push_str(&format!(
+            "\n[health]\nmetrics_token_file = \"{}\"\n",
+            sys_token.display()
+        ));
+        write_file(dir.path(), "system.toml", &sys);
+        let h = load(dir.path(), &dir.path().join("system.toml"))
+            .unwrap()
+            .health;
+        assert_eq!(h.metrics_token_file.as_deref(), sys_token.to_str());
+        assert_eq!(h.metrics_token.as_deref(), Some("from-system"));
+
+        // Alone in the system config it is read too.
+        write_file(dir.path(), "site.toml", &minimal_site_toml());
+        let h = load(dir.path(), &dir.path().join("system.toml"))
+            .unwrap()
+            .health;
+        assert_eq!(h.metrics_token.as_deref(), Some("from-system"));
+    }
+
+    #[test]
+    fn a_relative_metrics_token_file_in_the_system_config_resolves_against_the_site_dir() {
+        let dir = make_test_dir();
+        setup_minimal(dir.path());
+        std::fs::write(dir.path().join("token"), "from-site-dir\n").unwrap();
+        write_file(dir.path(), "site.toml", &minimal_site_toml());
+        let mut sys = minimal_system_toml();
+        sys.push_str("\n[health]\nmetrics_token_file = \"token\"\n");
+        write_file(dir.path(), "system.toml", &sys);
+        let h = load(dir.path(), &dir.path().join("system.toml"))
+            .unwrap()
+            .health;
+        assert_eq!(
+            h.metrics_token_file.as_deref(),
+            dir.path().join("token").to_str()
+        );
+        assert_eq!(h.metrics_token.as_deref(), Some("from-site-dir"));
+    }
+
+    /// Write `site` and `system` into a fresh directory and name the misplaced keys.
+    fn misplaced(site: &str, system: &str) -> Vec<String> {
+        let dir = make_test_dir();
+        write_file(dir.path(), "site.toml", site);
+        write_file(dir.path(), "system.toml", system);
+        misplaced_keys(dir.path(), &dir.path().join("system.toml"))
+    }
+
+    #[test]
+    fn misplaced_keys_names_a_bind_in_site_toml() {
+        let m = misplaced(
+            "[server]\nbind = \"0.0.0.0:443\"\n\n[auth]\npublic_key = \"k\"\n\n[health]\nmetrics_peers = [\"10.0.0.1\"]\n",
+            "[server]\nbind = \"0.0.0.0:443\"\n",
+        );
+        assert_eq!(m.len(), 3, "{m:?}");
+        assert!(m[0].starts_with("site.toml sets [server].bind, which is this node's own state"));
+        assert!(m[0].contains("belongs in the system config "), "{}", m[0]);
+        assert!(m.iter().any(|x| x.contains("sets [auth],")));
+        assert!(m.iter().any(|x| x.contains("sets [health].metrics_peers,")));
+    }
+
+    #[test]
+    fn misplaced_keys_names_allowed_methods_in_the_system_config() {
+        let m = misplaced(
+            "",
+            "[server]\nallowed_methods = [\"GET\"]\nbackend_timeout_secs = 5\nbind = \"0.0.0.0:443\"\n",
+        );
+        assert_eq!(m.len(), 2, "{m:?}");
+        assert!(m
+            .iter()
+            .all(|x| x.contains("is site-wide and belongs in site.toml")));
+        assert!(m.iter().any(|x| x.contains("[server].allowed_methods")));
+        assert!(m
+            .iter()
+            .any(|x| x.contains("[server].backend_timeout_secs")));
+    }
+
+    #[test]
+    fn misplaced_keys_is_silent_in_one_file_mode() {
+        let dir = make_test_dir();
+        write_file(
+            dir.path(),
+            "site.toml",
+            "[server]\nbind = \"0.0.0.0:443\"\nallowed_methods = [\"GET\"]\n\n[auth]\npublic_key = \"k\"\n",
+        );
+        let same = dir.path().join("site.toml");
+        assert!(misplaced_keys(dir.path(), &same).is_empty());
+    }
+
+    #[test]
+    fn misplaced_keys_is_silent_for_a_clean_pair() {
+        let m = misplaced(
+            "[server]\nallowed_methods = [\"GET\"]\nbackend_timeout_secs = 5\n\n[health]\nperf_path = \"/p\"\n",
+            "[server]\nbind = \"0.0.0.0:443\"\n\n[auth]\npublic_key = \"/k\"\n\n[health]\nmetrics_token_file = \"/t\"\n",
+        );
+        assert!(m.is_empty(), "{m:?}");
+    }
+
+    #[test]
+    fn misplaced_keys_names_a_node_section_in_site_toml() {
+        let m = misplaced("[node]\nname = \"edge-a\"\n", "[node]\nname = \"edge-a\"\n");
+        assert_eq!(m.len(), 1, "{m:?}");
+        assert!(m[0].starts_with("site.toml sets [node],"), "{}", m[0]);
+    }
+
+    #[test]
+    fn the_node_fallback_is_detected_for_the_caller_to_warn_about() {
+        let dir = make_test_dir();
+        let with = dir.path().join("with.toml");
+        let without = dir.path().join("without.toml");
+        write_file(dir.path(), "with.toml", "[node]\nname = \"edge-a\"\n");
+        write_file(dir.path(), "without.toml", "[server]\nbind = \"x\"\n");
+        assert!(!node_falls_back(&with));
+        assert!(node_falls_back(&without));
+    }
+
+    /// Every key `misplaced_keys` knows, as (section, key, belongs in system config).
+    /// A whole-section entry has no key.
+    fn every_placed_key() -> Vec<(&'static str, Option<&'static str>, bool)> {
+        let mut all = Vec::new();
+        all.extend(NODE_SERVER_KEYS.iter().map(|k| ("server", Some(*k), true)));
+        all.extend(NODE_HEALTH_KEYS.iter().map(|k| ("health", Some(*k), true)));
+        all.extend(SITE_SERVER_KEYS.iter().map(|k| ("server", Some(*k), false)));
+        all.extend(NODE_SECTIONS.iter().map(|s| (*s, None, true)));
+        all
+    }
+
+    #[test]
+    fn every_misplaced_key_warns_in_the_wrong_file_and_not_in_the_right_one() {
+        let all = every_placed_key();
+        // Every field of `RawServerSection` and `RawSystemHealth` is placed
+        // in one list or another. Dropping a key from a list fails here.
+        let mut server: Vec<&str> = NODE_SERVER_KEYS
+            .iter()
+            .chain(SITE_SERVER_KEYS)
+            .copied()
+            .collect();
+        server.sort_unstable();
+        assert_eq!(
+            server,
+            [
+                "allowed_methods",
+                "backend_timeout_secs",
+                "bind",
+                "h2c_bind",
+                "internal_binds",
+                "internal_peers",
+                "redirect_bind",
+                "tls_cert",
+                "tls_key",
+                "warm_on_start",
+            ]
+        );
+        let mut health = NODE_HEALTH_KEYS.to_vec();
+        health.sort_unstable();
+        assert_eq!(
+            health,
+            ["metrics_peers", "metrics_require", "metrics_token_file"]
+        );
+        assert_eq!(NODE_SECTIONS, ["auth", "node"]);
+        assert_eq!(all.len(), 10 + 3 + 2);
+        for (section, key, belongs_in_system) in all {
+            let body = match key {
+                Some(k) => format!("[{section}]\n{k} = 1\n"),
+                None => format!("[{section}]\nname = 1\n"),
+            };
+            let name = match key {
+                Some(k) => format!("[{section}].{k}"),
+                None => format!("[{section}]"),
+            };
+            let (wrong_site, wrong_system, right_site, right_system) = if belongs_in_system {
+                (body.as_str(), "", "", body.as_str())
+            } else {
+                ("", body.as_str(), body.as_str(), "")
+            };
+            let wrong = misplaced(wrong_site, wrong_system);
+            assert_eq!(wrong.len(), 1, "{name} in the wrong file: {wrong:?}");
+            assert!(
+                wrong[0].contains(&format!("sets {name},"))
+                    || wrong[0].contains(&format!("sets {name} ")),
+                "{name}: {}",
+                wrong[0]
+            );
+            let right = misplaced(right_site, right_system);
+            assert!(right.is_empty(), "{name} in the right file: {right:?}");
+        }
     }
 }

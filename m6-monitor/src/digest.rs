@@ -34,7 +34,29 @@ pub struct Thresholds {
     /// and an ignored warning is the same as no warning. A deployment renewing
     /// on a different schedule sets its own.
     pub cert_expiry_days: i64,
+    /// Seconds since a peer's latest WireGuard handshake above which the
+    /// tunnel is a fault. Read from `[monitor] tunnel_handshake_max_age_s`.
+    ///
+    /// WireGuard rekeys about every 120 seconds while traffic flows, and the
+    /// monitor's own probe each poll is that traffic. Config loading therefore
+    /// refuses a limit below the top-level `poll_interval_s` plus `timeout_ms`
+    /// rounded up to whole seconds plus 180. The 180 covers one rekey and a
+    /// minute of slack, and also the period of the timer that writes the
+    /// handshakes file: that period is not known to the monitor, so it must fit
+    /// inside the 180 seconds. The time is the last SUCCESSFUL handshake, so it
+    /// is the slow signal and the probe is the fast one.
+    pub tunnel_handshake_age_s: u64,
+    /// Seconds since a node last reopened its log file above which the monitor
+    /// reports a fault. Read from `[monitor] log_reopen_max_age_s`.
+    ///
+    /// `None` means no limit: the age is shown and never judged. There is no
+    /// default, because analytics logging is on by default and a deployment
+    /// that does not rotate would otherwise fault two hours after every start.
+    pub log_reopen_age_s: Option<u64>,
 }
+
+/// The default for `Thresholds::tunnel_handshake_age_s`, in seconds.
+pub const DEFAULT_TUNNEL_HANDSHAKE_AGE_S: u64 = 600;
 
 impl Default for Thresholds {
     fn default() -> Self {
@@ -44,6 +66,8 @@ impl Default for Thresholds {
             load_per_cpu: 2.0,
             thermal_celsius: 80.0,
             cert_expiry_days: 21,
+            tunnel_handshake_age_s: DEFAULT_TUNNEL_HANDSHAKE_AGE_S,
+            log_reopen_age_s: None,
         }
     }
 }
@@ -71,6 +95,25 @@ pub struct Digest {
     /// Worst level across the fleet.
     pub level: Level,
     pub thresholds: Thresholds,
+    /// Seconds since the WireGuard handshakes file was last written. One fact
+    /// about the monitor host, `None` when there is no readable file.
+    pub handshake_file_age_s: Option<u64>,
+    /// The state of the poll history. `None` under `--check`, which keeps none.
+    pub history: Option<crate::history::HistoryDigest>,
+}
+
+impl Digest {
+    /// Add a finding after the build, keeping faults first and the level true.
+    pub fn add_finding(&mut self, f: Finding) {
+        self.findings.push(f);
+        self.findings.sort_by_key(|f| std::cmp::Reverse(f.level));
+        self.level = self
+            .findings
+            .iter()
+            .map(|f| f.level)
+            .max()
+            .unwrap_or(Level::Ok);
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -139,16 +182,293 @@ pub struct NodeDigest {
     /// time": a node silent about its expiry is the exact case this check must
     /// not call healthy, for the reason `version` and `hash` give above.
     pub cert_expires_in_seconds: Option<i64>,
+    /// `notAfter` of the soonest-expiring certificate the node is serving, as
+    /// an absolute time.
+    ///
+    /// Carried beside the countdown above because the two answer different
+    /// questions. A countdown is what one node has left, and it is measured
+    /// against the moment that node was polled, so two nodes serving one
+    /// certificate report figures that differ by the seconds between their
+    /// polls. An absolute `notAfter` is a property of the certificate, so
+    /// comparing it ACROSS nodes is exact, and that comparison is the only way
+    /// to see a fleet whose nodes have stopped agreeing about what they serve.
+    pub cert_not_after_unix: Option<i64>,
     pub perf_error: Option<String>,
+    /// The WireGuard tunnel from the monitor host to this node, if configured.
+    pub tunnel: Option<TunnelDigest>,
+    /// When the node last reopened its log file, from `/perf`.
+    pub log_reopen: LogReopenDigest,
+}
+
+/// When a node last reopened its log file, as figures and a state.
+///
+/// `state` is `ok` when it has reopened since start, `never` when it has not,
+/// `no_log_file` when the process writes none and `unknown` when the node did
+/// not say, with `detail` giving the reason.
+#[derive(Debug, Clone, Serialize)]
+pub struct LogReopenDigest {
+    pub state: &'static str,
+    pub age_s: Option<u64>,
+    pub last_unix: Option<u64>,
+    pub reopens: Option<u64>,
+    pub failures: Option<u64>,
+    pub last_failure_age_s: Option<u64>,
+    pub detail: Option<String>,
+}
+
+impl LogReopenDigest {
+    fn unknown(detail: &str) -> Self {
+        Self {
+            state: "unknown",
+            age_s: None,
+            last_unix: None,
+            reopens: None,
+            failures: None,
+            last_failure_age_s: None,
+            detail: Some(detail.to_string()),
+        }
+    }
+
+    fn from_health(h: &m6_core::monitoring::LogReopenHealth) -> Self {
+        Self {
+            state: if h.seconds_since_last_reopen.is_some() {
+                "ok"
+            } else {
+                "never"
+            },
+            age_s: h.seconds_since_last_reopen,
+            last_unix: h.last_reopen_unix,
+            reopens: Some(h.reopens_total),
+            failures: Some(h.failures_total),
+            last_failure_age_s: h.seconds_since_last_failure,
+            detail: None,
+        }
+    }
+}
+
+/// One node's tunnel, as figures and states.
+#[derive(Debug, Clone, Serialize)]
+pub struct TunnelDigest {
+    pub address: String,
+    /// The minimum of the samples, in milliseconds.
+    pub rtt_ms: Option<f64>,
+    pub rtt_samples_ms: Vec<f64>,
+    pub probe: ProbeState,
+    pub probe_error: Option<String>,
+    pub handshake: HandshakeState,
+    pub handshake_age_s: Option<u64>,
+    pub handshake_detail: Option<String>,
+}
+
+/// How the tunnel probe ended, serialised as `connected`, `refused`,
+/// `no_answer` or `failed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeState {
+    Connected,
+    Refused,
+    NoAnswer,
+    Failed,
+}
+
+impl ProbeState {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Connected => "connected",
+            Self::Refused => "refused",
+            Self::NoAnswer => "no_answer",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// The handshake state. `Ok` means a timestamp exists, and its staleness is a
+/// finding of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HandshakeState {
+    Ok,
+    Never,
+    PeerAbsent,
+    /// The node has a tunnel but no `public_key`.
+    NoPublicKey,
+    /// Tunnels are configured but `wg_handshakes_file` is not set.
+    NoHandshakesFile,
+    /// Not read, for a reason reported by another finding.
+    Unknown,
+    FileMissing,
+    FileError,
+    /// The handshakes file is older than the limit, so no age is judged.
+    FileStale,
+}
+
+impl HandshakeState {
+    /// The serialised name, for the history.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Never => "never",
+            Self::PeerAbsent => "peer_absent",
+            Self::NoPublicKey => "no_public_key",
+            Self::NoHandshakesFile => "no_handshakes_file",
+            Self::Unknown => "unknown",
+            Self::FileMissing => "file_missing",
+            Self::FileError => "file_error",
+            Self::FileStale => "file_stale",
+        }
+    }
+}
+
+impl TunnelDigest {
+    /// `rtt 0.40ms (n 3, connected)`, the wording of /check section H and the page.
+    pub fn rtt_text(&self) -> String {
+        match self.rtt_ms {
+            Some(min) => format!(
+                "rtt {min:.2}ms (n {}, {})",
+                self.rtt_samples_ms.len(),
+                self.probe.as_str()
+            ),
+            None => format!(
+                "rtt -  ({}: {})",
+                self.probe.as_str(),
+                self.probe_error.as_deref().unwrap_or("no samples")
+            ),
+        }
+    }
+
+    /// `42s ago`, `never` and the other states, in one wording for both views.
+    pub fn handshake_text(&self) -> String {
+        match self.handshake {
+            HandshakeState::Ok => match self.handshake_age_s {
+                Some(a) => format!("{a}s ago"),
+                None => "ok".to_string(),
+            },
+            HandshakeState::Never => "never".to_string(),
+            HandshakeState::PeerAbsent => "peer not on this host's interface".to_string(),
+            HandshakeState::NoPublicKey => "unknown (no public_key)".to_string(),
+            HandshakeState::NoHandshakesFile => "unknown (no wg_handshakes_file)".to_string(),
+            HandshakeState::Unknown => format!(
+                "unknown ({})",
+                self.handshake_detail.as_deref().unwrap_or("-")
+            ),
+            HandshakeState::FileMissing => "file missing".to_string(),
+            HandshakeState::FileError => "file unreadable".to_string(),
+            HandshakeState::FileStale => "unknown (handshakes file is stale)".to_string(),
+        }
+    }
+}
+
+fn tunnel_digest(t: &crate::tunnel::TunnelReading) -> TunnelDigest {
+    use crate::tunnel::{Handshake, Probe};
+    let (probe, probe_error) = match &t.probe.outcome {
+        Probe::Connected => (ProbeState::Connected, None),
+        Probe::Refused => (ProbeState::Refused, None),
+        Probe::NoAnswer(e) => (ProbeState::NoAnswer, Some(e.clone())),
+        Probe::Failed(e) => (ProbeState::Failed, Some(e.clone())),
+    };
+    let ms: Vec<f64> = t
+        .probe
+        .samples
+        .iter()
+        .map(|d| d.as_secs_f64() * 1000.0)
+        .collect();
+    let (handshake, handshake_age_s, handshake_detail) = match &t.handshake {
+        Handshake::NoPublicKey => (HandshakeState::NoPublicKey, None, None),
+        Handshake::NoHandshakesFile => (HandshakeState::NoHandshakesFile, None, None),
+        Handshake::Unknown(why) => (HandshakeState::Unknown, None, Some((*why).to_string())),
+        Handshake::FileMissing(p) => (HandshakeState::FileMissing, None, Some(p.clone())),
+        Handshake::FileError(e) => (HandshakeState::FileError, None, Some(e.clone())),
+        Handshake::FileStale { path, .. } => (HandshakeState::FileStale, None, Some(path.clone())),
+        Handshake::PeerAbsent => (HandshakeState::PeerAbsent, None, None),
+        Handshake::Never => (HandshakeState::Never, None, None),
+        Handshake::At { age_s } => (HandshakeState::Ok, Some(*age_s), None),
+    };
+    TunnelDigest {
+        address: t.address.clone(),
+        rtt_ms: ms.iter().copied().reduce(f64::min),
+        rtt_samples_ms: ms,
+        probe,
+        probe_error,
+        handshake,
+        handshake_age_s,
+        handshake_detail,
+    }
 }
 
 fn pct(v: f64) -> String {
     format!("{:.0}%", v * 100.0)
 }
 
+/// The faults for one node's log reopen, when a limit is set.
+fn log_reopen_findings(
+    node: &str,
+    uptime_s: u64,
+    l: &LogReopenDigest,
+    max: u64,
+    findings: &mut Vec<Finding>,
+) {
+    let mut fault = |text: String| {
+        findings.push(Finding {
+            level: Level::Fault,
+            node: node.to_string(),
+            text,
+        });
+    };
+    match l.state {
+        "unknown" => fault(
+            "cannot say when it last reopened its log file: the node is too old to report it"
+                .to_string(),
+        ),
+        "never" if uptime_s > max => fault(format!(
+            "has never reopened its log file in {uptime_s}s since start, over the {max}s limit: \
+             is log rotation installed and signalling it?"
+        )),
+        "ok" if l.age_s.is_some_and(|age| age > max) => fault(format!(
+            "last reopened its log file {}s ago, over the {max}s limit: log rotation has stopped",
+            l.age_s.unwrap_or(0)
+        )),
+        _ => {}
+    }
+    if let Some(f) = l.last_failure_age_s {
+        if l.age_s.is_none_or(|ok| f < ok) {
+            fault(format!(
+                "its last log reopen failed {f}s ago and none has succeeded since, \
+                 so it is still writing to the previous file"
+            ));
+        }
+    }
+}
+
+/// The fault text for a main log that has gone quiet, from `/traffic`, or
+/// `None` while it is emitting.
+///
+/// Section A of the check prints this text and the verdict counts it as a
+/// finding, so both say the same thing.
+pub(crate) fn quiet_log_text(l: &m6_core::monitoring::LoggingHealth) -> Option<String> {
+    match l.seconds_since_last {
+        None => Some("nothing has ever been logged".to_string()),
+        Some(s) if l.is_blind() => Some(format!(
+            "main log silent for {s}s ({} events since start)",
+            l.events_total
+        )),
+        Some(_) => None,
+    }
+}
+
+fn quiet_log_findings(node: &str, l: &m6_core::monitoring::LoggingHealth) -> Option<Finding> {
+    quiet_log_text(l).map(|text| Finding {
+        level: Level::Fault,
+        node: node.to_string(),
+        text,
+    })
+}
+
 pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
     let mut findings = Vec::new();
     let mut nodes = Vec::new();
+    // The handshake file is one fact about the monitor host, so a missing file
+    // is one finding, not one per node.
+    let mut handshake_file_problem: Option<String> = None;
 
     for r in readings {
         let mut d = NodeDigest {
@@ -178,8 +498,91 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
             disk_total_bytes: None,
             thermal_max_c: None,
             cert_expires_in_seconds: None,
+            cert_not_after_unix: None,
             perf_error: r.perf_error.clone(),
+            tunnel: r.tunnel.as_ref().map(tunnel_digest),
+            log_reopen: LogReopenDigest::unknown("no /perf reading"),
         };
+
+        // Before the unreachable `continue` below: a node whose HTTPS poll
+        // fails still reports its tunnel, and that is when it matters most.
+        if let Some(td) = &d.tunnel {
+            let mut fault = |text: String| {
+                findings.push(Finding {
+                    level: Level::Fault,
+                    node: r.name.clone(),
+                    text,
+                });
+            };
+            if matches!(td.probe, ProbeState::NoAnswer | ProbeState::Failed) {
+                fault(format!(
+                    "tunnel {} did not answer: {}",
+                    td.address,
+                    td.probe_error.as_deref().unwrap_or("no reason given")
+                ));
+            }
+            match td.handshake {
+                HandshakeState::Never => fault(
+                    "tunnel peer has never completed a WireGuard handshake with this host"
+                        .to_string(),
+                ),
+                HandshakeState::PeerAbsent => {
+                    let key = r
+                        .tunnel
+                        .as_ref()
+                        .and_then(|t| t.key_prefix.as_deref())
+                        .unwrap_or("?");
+                    fault(format!(
+                        "public key {key}... is not a peer on this host's WireGuard interface"
+                    ));
+                }
+                HandshakeState::Ok => {
+                    if let Some(age) = td.handshake_age_s {
+                        if age > t.tunnel_handshake_age_s {
+                            fault(format!(
+                                "last WireGuard handshake {age}s ago, over the {}s threshold",
+                                t.tunnel_handshake_age_s
+                            ));
+                        }
+                    }
+                }
+                HandshakeState::FileMissing if handshake_file_problem.is_none() => {
+                    handshake_file_problem = Some(format!(
+                        "WireGuard handshake file {} is missing, so no handshake age can be read: is its collector installed?",
+                        td.handshake_detail.as_deref().unwrap_or("-")
+                    ));
+                }
+                HandshakeState::FileError if handshake_file_problem.is_none() => {
+                    handshake_file_problem = Some(format!(
+                        "WireGuard handshake file unreadable: {}",
+                        td.handshake_detail.as_deref().unwrap_or("-")
+                    ));
+                }
+                HandshakeState::FileStale if handshake_file_problem.is_none() => {
+                    let age = r.tunnel.as_ref().and_then(|t| t.file_age_s).unwrap_or(0);
+                    handshake_file_problem = Some(format!(
+                        "WireGuard handshakes file {} is {age}s old, over the {}s limit, so its collector has probably stopped and no handshake age is judged",
+                        td.handshake_detail.as_deref().unwrap_or("-"),
+                        t.tunnel_handshake_age_s
+                    ));
+                }
+                HandshakeState::NoPublicKey => fault(
+                    "tunnel has no public_key, so its WireGuard handshake cannot be checked: set public_key in this node's tunnel"
+                        .to_string(),
+                ),
+                HandshakeState::NoHandshakesFile if handshake_file_problem.is_none() => {
+                    handshake_file_problem = Some(
+                        "tunnels are configured but wg_handshakes_file is not set, so no WireGuard handshake can be checked"
+                            .to_string(),
+                    );
+                }
+                HandshakeState::NoHandshakesFile
+                | HandshakeState::FileStale
+                | HandshakeState::FileMissing
+                | HandshakeState::FileError
+                | HandshakeState::Unknown => {}
+            }
+        }
 
         if !r.is_up() {
             let why = r.unreachable.as_deref().unwrap_or("no reason given");
@@ -220,6 +623,19 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
             d.binary = empty_to_none(&p.build.name);
             d.hash = empty_to_none(&p.build.hash);
             d.uptime_s = Some(p.uptime_s);
+            d.log_reopen = match &p.logging {
+                None => LogReopenDigest::unknown("node too old to report log reopening"),
+                Some(l) => match &l.reopen {
+                    None => LogReopenDigest {
+                        state: "no_log_file",
+                        ..LogReopenDigest::unknown("")
+                    },
+                    Some(h) => LogReopenDigest::from_health(h),
+                },
+            };
+            if let Some(max) = t.log_reopen_age_s {
+                log_reopen_findings(&r.name, p.uptime_s, &d.log_reopen, max, &mut findings);
+            }
             // The soonest expiry in the chain. `min` over an empty list is
             // `None`, which is the answer for a node too old to report the
             // field and is left to say "cannot say" rather than collapsing to
@@ -231,6 +647,16 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
             // is "cannot say", which is the branch that warns.
             d.cert_expires_in_seconds = if p.tls_unreadable == 0 {
                 p.tls.iter().map(|c| c.expires_in_seconds).min()
+            } else {
+                None
+            };
+            // The same certificate as the countdown above, by the same rule: the
+            // soonest in the chain, and only when the whole chain was readable.
+            // Both derived here from one reading so the fleet comparison and the
+            // per-node threshold can never be talking about different
+            // certificates.
+            d.cert_not_after_unix = if p.tls_unreadable == 0 {
+                p.tls.iter().map(|c| c.not_after_unix).min()
             } else {
                 None
             };
@@ -376,12 +802,12 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
             // must warn. Reading an absence as healthy is the shape of mistake
             // the build-drift check above was written to stop making.
             // Either signal means a certificate is expected. Keying on the
-            // polled URL alone silences the check on a node polled over the
-            // backbone in plaintext, which `fleet.rs` actively recommends
-            // ("point this at the backbone address, not the public one") and
-            // which m6-http supports through `h2c_bind`. Such a node serves
-            // TLS publicly and reports its chain, so a reported chain counts
-            // as expecting one.
+            // polled URL alone silences the check on a node polled over a
+            // plain-HTTP URL, such as a loopback or test address. A node
+            // polled over its TLS listener reports its chain, and a reported
+            // chain counts as expecting one. A monitor polls a node over its
+            // TLS listener, because the internal h2c listener is for relaying
+            // cache nodes and admits only the peers in `internal_peers`.
             let expects_tls = r
                 .url
                 .split_once("://")
@@ -446,6 +872,10 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
                     r.perf_error.as_deref().unwrap_or("")
                 ),
             });
+        }
+
+        if let Some(t) = &r.traffic {
+            findings.extend(quiet_log_findings(&r.name, &t.logging));
         }
 
         nodes.push(d);
@@ -539,6 +969,131 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
                 ),
             });
         }
+
+        // ── the fleet serves one certificate, or it does not ─────────────────
+        //
+        // A fleet where every node serves the same names from one certificate
+        // has one renewal and one expiry. When a node is left behind by a
+        // renewal it keeps serving the superseded certificate, which is well
+        // formed, valid, trusted by every client, and expires sooner than the
+        // one the operator installed. Nothing in a per-node reading can see
+        // that: each node reports a certificate with time left on it, every
+        // threshold passes, and the fleet is reported healthy right up to the
+        // day the stale node starts refusing connections.
+        //
+        // So it is checked the same way version drift is: by comparing the
+        // nodes to each other rather than each node to a limit. A renewal moves
+        // `notAfter` forward, so a node that missed one disagrees here on the
+        // day the renewal happened, which is the day there is time to fix it.
+        //
+        // Only nodes that reported a certificate are compared. A node silent
+        // about its chain is already a finding of its own above, and counting
+        // it again here would report one silence as two faults and name the
+        // cause in neither.
+        // Both figures or neither, so there is no half-answer to describe. An
+        // earlier version admitted a node on `cert_not_after_unix.is_some()`
+        // and then matched on `cert_expires_in_seconds`, with an `unknown` arm
+        // that could not be reached: the two are set together under one
+        // `tls_unreadable == 0` guard. A reader had to prove that invariant to
+        // know the arm was dead, so the tuple now requires both and the
+        // impossible case cannot be written.
+        let certified: Vec<(&str, i64, i64)> = reporting
+            .iter()
+            .filter_map(|n| {
+                Some((
+                    n.name.as_str(),
+                    n.cert_not_after_unix?,
+                    n.cert_expires_in_seconds?,
+                ))
+            })
+            .collect();
+        // ── PARTIAL agreement is the signal, not disagreement ────────────────
+        //
+        // The first version of this warned whenever the certified nodes did not
+        // all agree, which is wrong for any fleet that does not share one
+        // certificate. m6 is a generic web engine: `fleet.rs` records that "an
+        // origin and a cache node do not always agree", and the user guide
+        // documents per-node `certbot certonly`. A fleet whose nodes each run
+        // their own ACME client renews them hours or days apart by
+        // construction, so that version warned on every poll, forever, and a
+        // permanent warning in an hourly check is the same as no warning.
+        //
+        // The distinguishing shape is not "they differ", it is "some of them
+        // AGREE and one does not". Nodes sharing a `notAfter` are serving one
+        // certificate, which is a fact about the fleet rather than an
+        // assumption about it, and a node outside that group has been left
+        // behind by the renewal the others got.
+        //
+        //   every node distinct          per-node certificates. Silent
+        //   all nodes equal              one certificate, in step. Silent
+        //   two or more equal, one not   one certificate, one node behind. WARN
+        //
+        // What this cannot see is a TWO-node fleet sharing one certificate
+        // where one node lags: two distinct values, no group of two, so it
+        // stays silent. That is the honest cost of deriving the expectation
+        // from the data instead of being told it, and it fails quiet rather
+        // than crying wolf.
+        let mut by_expiry: std::collections::BTreeMap<i64, Vec<&str>> =
+            std::collections::BTreeMap::new();
+        for &(name, at, _) in &certified {
+            by_expiry.entry(at).or_default().push(name);
+        }
+        let largest = by_expiry.values().map(|v| v.len()).max().unwrap_or(0);
+        if by_expiry.len() > 1 && largest > 1 {
+            // ── The NEWEST certificate is the right one, not the commonest ───
+            //
+            // An earlier version named the majority as correct and everything
+            // else as behind, which is backwards for the case this check
+            // exists for. When an origin renews and two cache nodes are not
+            // told, the majority is the STALE pair and the single renewed node
+            // is the one that is right. Naming the renewed node as the problem
+            // would send an operator to fix the only node that did not need
+            // fixing.
+            //
+            // A renewal moves `notAfter` forward and nothing moves it back, so
+            // the latest expiry is the certificate that was installed and
+            // anything earlier has been left behind. Group size decides only
+            // whether to look at all, above.
+            let newest = by_expiry
+                .keys()
+                .next_back()
+                .copied()
+                .expect("by_expiry is not empty");
+            let behind: Vec<String> = certified
+                .iter()
+                .filter(|&&(_, at, _)| at < newest)
+                .map(|&(name, at, left)| {
+                    // Days, because that is the unit an operator decides in,
+                    // AND `notAfter` itself, because days alone cannot show
+                    // the disagreement this finding reports. Two certificates
+                    // issued twelve hours apart have the same number of whole
+                    // days left, so a line reading "origin 89d, edge-a 89d"
+                    // under a claim they differ tells an operator nothing and
+                    // reads as a defect in the check.
+                    format!("{name} {}d (notAfter {at})", left / 86_400)
+                })
+                .collect();
+            findings.push(Finding {
+                level: Level::Warn,
+                node: "fleet".to_string(),
+                text: format!(
+                    "{} node(s) are behind the newest certificate on the fleet, which \
+                     expires at {newest}: {}. A node left behind by a renewal serves a \
+                     valid certificate that expires sooner than the one that was \
+                     installed, and no per-node threshold can see it.",
+                    behind.len(),
+                    behind.join(", ")
+                ),
+            });
+        }
+    }
+
+    if let Some(text) = handshake_file_problem {
+        findings.push(Finding {
+            level: Level::Fault,
+            node: "monitor".into(),
+            text,
+        });
     }
 
     findings.sort_by_key(|f| std::cmp::Reverse(f.level));
@@ -549,18 +1104,24 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
         findings,
         level,
         thresholds: t.clone(),
+        handshake_file_age_s: readings
+            .iter()
+            .filter_map(|r| r.tunnel.as_ref()?.file_age_s)
+            .next(),
+        history: None,
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use m6_core::host::{Disk, HostSnapshot, LoadAverage, Memory, MemorySource};
     use m6_core::monitoring::{HealthReport, PerfReport, PoolHealth};
     use m6_core::telemetry::StatsSnapshot;
 
-    fn perf(host: HostSnapshot, pools: Vec<PoolHealth>) -> PerfReport {
+    pub(crate) fn perf(host: HostSnapshot, pools: Vec<PoolHealth>) -> PerfReport {
         PerfReport {
+            logging: None,
             node: "origin".into(),
             build: m6_core::monitoring::BuildId {
                 name: "m6-http".into(),
@@ -584,6 +1145,14 @@ mod tests {
     /// The URL is what decides whether a certificate is expected, so this is
     /// the only helper here that uses an `https://` one. Every other test in
     /// this module polls `http://x` and therefore never reaches the check.
+    /// The instant the generated chains are measured against.
+    ///
+    /// A fixed base so `not_after_unix` and `expires_in_seconds` in a generated
+    /// chain describe the same certificate. They used to be independent, with
+    /// `not_after_unix` left at 0 on every entry, and a fleet comparison over
+    /// absolute expiries then sees one value whatever the nodes are serving.
+    const CHAIN_BASE_UNIX: i64 = 1_789_000_000;
+
     fn tls_reading(name: &str, days: Option<i64>) -> NodeReading {
         let mut p = perf(plain_host(), vec![]);
         p.tls = days
@@ -594,12 +1163,12 @@ mod tests {
                     // reported number must be the soonest, not the first.
                     m6_core::tls::TlsCertificate {
                         depth: 0,
-                        not_after_unix: 0,
+                        not_after_unix: CHAIN_BASE_UNIX + expires_in_seconds,
                         expires_in_seconds,
                     },
                     m6_core::tls::TlsCertificate {
                         depth: 1,
-                        not_after_unix: 0,
+                        not_after_unix: CHAIN_BASE_UNIX + expires_in_seconds + 10_000 * 86_400,
                         expires_in_seconds: expires_in_seconds + 10_000 * 86_400,
                     },
                 ]
@@ -627,6 +1196,7 @@ mod tests {
             header_checks: Vec::new(),
             rtt: Some(std::time::Duration::from_millis(3)),
             unreachable: None,
+            tunnel: None,
         }
     }
 
@@ -1191,5 +1761,708 @@ mod tests {
         );
         assert_eq!(d.nodes[0].cert_expires_in_seconds, None);
         assert!(d.findings.is_empty(), "{:?}", d.findings);
+    }
+
+    // ── the fleet serves one certificate, or it does not ─────────────────────
+
+    /// **The case this check exists for.** One node renews, the others keep the
+    /// certificate they had. Every node reports time left, every per-node
+    /// threshold passes, and before this nothing compared them.
+    ///
+    /// Verified red before being trusted: with the comparison removed the
+    /// digest reports no finding at all and `level` is `Ok`, because 60 and 30
+    /// days are both over the 21-day threshold.
+    #[test]
+    fn a_node_left_behind_by_a_renewal_is_reported_as_fleet_certificate_drift() {
+        let d = build(
+            &[
+                tls_reading("origin", Some(89)),
+                tls_reading("edge-a", Some(30)),
+                tls_reading("edge-b", Some(30)),
+            ],
+            &Thresholds::default(),
+            now(),
+        );
+        let drift: Vec<_> = d
+            .findings
+            .iter()
+            .filter(|f| f.text.contains("are behind the newest"))
+            .collect();
+        assert_eq!(drift.len(), 1, "{:?}", d.findings);
+        assert_eq!(drift[0].level, Level::Warn);
+        assert_eq!(drift[0].node, "fleet");
+        assert!(
+            drift[0].text.contains("2 node(s) are behind"),
+            "two of the three are behind the newest certificate: {}",
+            drift[0].text
+        );
+        for expect in ["edge-a 30d", "edge-b 30d"] {
+            assert!(
+                drift[0].text.contains(expect),
+                "the finding must name each node that is behind, missing {expect}: {}",
+                drift[0].text
+            );
+        }
+        assert!(
+            !drift[0].text.contains("origin"),
+            "origin holds the NEWEST certificate and is the one node that needs \
+             nothing done to it. Naming it would send an operator to fix the only \
+             node that was right: {}",
+            drift[0].text
+        );
+    }
+
+    /// A FLEET THAT DOES NOT SHARE A CERTIFICATE IS NEVER WARNED ABOUT.
+    ///
+    /// The reason this check keys on partial agreement rather than on
+    /// disagreement. m6 is a generic web engine: `fleet.rs` records that an
+    /// origin and a cache node do not always agree, and the user guide
+    /// documents per-node `certbot certonly`. A fleet whose nodes each run
+    /// their own ACME client renews them days apart by construction, and an
+    /// earlier version of this check warned about that on every poll, forever.
+    /// A permanent warning in an hourly check is the same as no warning.
+    ///
+    /// Every node distinct means per-node certificates, so there is no
+    /// majority to be behind and nothing to report.
+    #[test]
+    fn a_fleet_running_per_node_certificates_is_not_warned_about() {
+        let d = build(
+            &[
+                tls_reading("origin", Some(83)),
+                tls_reading("edge-a", Some(61)),
+                tls_reading("edge-b", Some(47)),
+            ],
+            &Thresholds::default(),
+            now(),
+        );
+        assert!(
+            !d.findings
+                .iter()
+                .any(|f| f.text.contains("are behind the newest")),
+            "three nodes on three certificates is three ACME clients, not drift: {:?}",
+            d.findings
+        );
+        assert_eq!(d.level, Level::Ok, "{:?}", d.findings);
+    }
+
+    /// Two nodes cannot be told apart, and that is stated rather than hidden.
+    ///
+    /// With two certified nodes on different certificates there is no group of
+    /// two to form a majority, so this cannot distinguish one node lagging from
+    /// a two-node fleet running its own certificates. It stays silent. That is
+    /// the cost of deriving the expectation from the data instead of being told
+    /// it, and it fails quiet rather than crying wolf on every poll.
+    #[test]
+    fn a_two_node_fleet_cannot_tell_a_lag_from_per_node_certificates() {
+        let d = build(
+            &[
+                tls_reading("origin", Some(89)),
+                tls_reading("edge-a", Some(30)),
+            ],
+            &Thresholds::default(),
+            now(),
+        );
+        assert!(
+            !d.findings
+                .iter()
+                .any(|f| f.text.contains("are behind the newest")),
+            "a two-node fleet has no majority, so this must stay silent: {:?}",
+            d.findings
+        );
+    }
+
+    /// A fleet that renewed everywhere says nothing. The countdowns are
+    /// measured per poll and can differ by seconds for one certificate, which
+    /// is why the comparison is over `notAfter` and not over the countdown.
+    #[test]
+    fn a_fleet_serving_one_certificate_reports_no_drift() {
+        let d = build(
+            &[
+                tls_reading("origin", Some(60)),
+                tls_reading("edge-a", Some(60)),
+                tls_reading("edge-b", Some(60)),
+            ],
+            &Thresholds::default(),
+            now(),
+        );
+        assert!(
+            !d.findings
+                .iter()
+                .any(|f| f.text.contains("are behind the newest")),
+            "{:?}",
+            d.findings
+        );
+        assert_eq!(d.level, Level::Ok, "{:?}", d.findings);
+    }
+
+    /// One node is not a fleet, and a fleet of one cannot disagree with itself.
+    #[test]
+    fn a_single_node_never_drifts_on_its_certificate() {
+        let d = build(
+            &[tls_reading("origin", Some(60))],
+            &Thresholds::default(),
+            now(),
+        );
+        assert!(
+            !d.findings
+                .iter()
+                .any(|f| f.text.contains("are behind the newest")),
+            "{:?}",
+            d.findings
+        );
+    }
+
+    /// A node silent about its chain is one finding, not two.
+    ///
+    /// It already warns per node that its renewal cannot be watched. Counting
+    /// the silence as drift as well would report one cause as two faults and
+    /// name it in neither, so only nodes that reported a certificate are
+    /// compared.
+    #[test]
+    fn a_node_reporting_no_certificate_is_not_also_counted_as_drift() {
+        let d = build(
+            &[
+                tls_reading("origin", Some(60)),
+                tls_reading("edge-a", Some(60)),
+                tls_reading("edge-b", None),
+            ],
+            &Thresholds::default(),
+            now(),
+        );
+        assert!(
+            !d.findings
+                .iter()
+                .any(|f| f.text.contains("are behind the newest")),
+            "the two nodes that can say agree, so the only finding is the silent one: {:?}",
+            d.findings
+        );
+        let silent: Vec<_> = d
+            .findings
+            .iter()
+            .filter(|f| f.text.contains("no certificate expiry"))
+            .collect();
+        assert_eq!(silent.len(), 1, "{:?}", d.findings);
+        assert_eq!(silent[0].node, "edge-b");
+    }
+
+    /// An expired certificate on one node is both faults at once: the node is
+    /// serving something expired, and the fleet has stopped agreeing. Both are
+    /// reported, because fixing the first does not tell an operator the second
+    /// was ever true.
+    #[test]
+    fn an_expired_certificate_on_one_node_is_a_fault_and_also_drift() {
+        // Three nodes, not two: with two the fleet comparison cannot tell one
+        // node lagging from a fleet running per-node certificates, and stays
+        // silent by design. `a_two_node_fleet_cannot_tell_a_lag_from_per_node_certificates`
+        // covers that.
+        let d = build(
+            &[
+                tls_reading("origin", Some(89)),
+                tls_reading("edge-a", Some(89)),
+                tls_reading("edge-b", Some(-2)),
+            ],
+            &Thresholds::default(),
+            now(),
+        );
+        assert_eq!(d.level, Level::Fault, "{:?}", d.findings);
+        assert!(
+            d.findings
+                .iter()
+                .any(|f| f.text.contains("EXPIRED") && f.node == "edge-b"),
+            "{:?}",
+            d.findings
+        );
+        assert!(
+            d.findings
+                .iter()
+                .any(|f| f.text.contains("are behind the newest")),
+            "{:?}",
+            d.findings
+        );
+    }
+
+    // ── tunnels ──────────────────────────────────────────────────────────────
+
+    use crate::tunnel::{Handshake, Probe, ProbeResult, TunnelReading};
+
+    fn tunnel(outcome: Probe, handshake: Handshake) -> TunnelReading {
+        let ms = |n| std::time::Duration::from_micros(n);
+        TunnelReading {
+            address: "192.0.2.2:443".into(),
+            key_prefix: Some("AAAAAAAA".into()),
+            probe: ProbeResult {
+                samples: match outcome {
+                    Probe::Connected | Probe::Refused => vec![ms(600), ms(400), ms(500)],
+                    _ => vec![],
+                },
+                outcome,
+            },
+            handshake,
+            file_age_s: Some(7),
+        }
+    }
+
+    fn with_tunnel(name: &str, t: TunnelReading) -> NodeReading {
+        let mut r = reading(name, "ok", None);
+        r.tunnel = Some(t);
+        r
+    }
+
+    fn tunnel_findings(d: &Digest) -> Vec<&Finding> {
+        d.findings
+            .iter()
+            .filter(|f| {
+                f.text.contains("tunnel") || f.text.contains("WireGuard") || f.text.contains("peer")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_healthy_tunnel_raises_nothing_and_reports_rtt_and_age() {
+        let r = with_tunnel(
+            "edge-a",
+            tunnel(Probe::Connected, Handshake::At { age_s: 42 }),
+        );
+        let d = build(&[r], &Thresholds::default(), now());
+        assert!(tunnel_findings(&d).is_empty(), "{:?}", d.findings);
+        let t = d.nodes[0].tunnel.as_ref().unwrap();
+        assert!((t.rtt_ms.unwrap() - 0.4).abs() < 1e-9);
+        assert_eq!(t.rtt_samples_ms.len(), 3);
+        assert_eq!(t.handshake_age_s, Some(42));
+    }
+
+    #[test]
+    fn a_tunnel_that_never_handshook_is_a_fault() {
+        let r = with_tunnel("edge-a", tunnel(Probe::Connected, Handshake::Never));
+        let d = build(&[r], &Thresholds::default(), now());
+        let f = tunnel_findings(&d);
+        assert_eq!(f.len(), 1, "{:?}", d.findings);
+        assert_eq!(f[0].level, Level::Fault);
+        assert!(f[0].text.contains("never completed"));
+    }
+
+    #[test]
+    fn a_stale_handshake_faults_above_the_threshold() {
+        let at = |age_s| {
+            let r = with_tunnel("edge-a", tunnel(Probe::Connected, Handshake::At { age_s }));
+            build(&[r], &Thresholds::default(), now())
+        };
+        let over = at(601);
+        let f = tunnel_findings(&over);
+        assert_eq!(f.len(), 1, "{:?}", over.findings);
+        assert_eq!(f[0].level, Level::Fault);
+        assert!(f[0].text.contains("601s ago, over the 600s threshold"));
+        assert!(tunnel_findings(&at(600)).is_empty());
+    }
+
+    #[test]
+    fn the_staleness_threshold_comes_from_the_thresholds_value() {
+        let r = with_tunnel(
+            "edge-a",
+            tunnel(Probe::Connected, Handshake::At { age_s: 100 }),
+        );
+        let t = Thresholds {
+            tunnel_handshake_age_s: 90,
+            ..Default::default()
+        };
+        let d = build(&[r], &t, now());
+        assert_eq!(tunnel_findings(&d).len(), 1, "{:?}", d.findings);
+    }
+
+    #[test]
+    fn a_peer_missing_from_the_interface_is_a_fault() {
+        let r = with_tunnel("edge-a", tunnel(Probe::Connected, Handshake::PeerAbsent));
+        let d = build(&[r], &Thresholds::default(), now());
+        let f = tunnel_findings(&d);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].level, Level::Fault);
+        assert!(f[0].text.contains("AAAAAAAA... is not a peer"));
+    }
+
+    #[test]
+    fn an_unanswered_tunnel_probe_is_a_fault() {
+        let r = with_tunnel(
+            "edge-a",
+            tunnel(
+                Probe::NoAnswer("no answer in 500ms".into()),
+                Handshake::At { age_s: 5 },
+            ),
+        );
+        let d = build(&[r], &Thresholds::default(), now());
+        let f = tunnel_findings(&d);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].level, Level::Fault);
+        assert!(f[0].text.contains("did not answer"));
+        assert!(d.nodes[0].tunnel.as_ref().unwrap().rtt_ms.is_none());
+    }
+
+    #[test]
+    fn a_refusal_is_a_round_trip_and_raises_nothing() {
+        let r = with_tunnel("edge-a", tunnel(Probe::Refused, Handshake::At { age_s: 5 }));
+        let d = build(&[r], &Thresholds::default(), now());
+        assert!(tunnel_findings(&d).is_empty(), "{:?}", d.findings);
+        assert_eq!(
+            d.nodes[0].tunnel.as_ref().unwrap().probe,
+            ProbeState::Refused
+        );
+    }
+
+    /// The guard on the unreachable `continue`: a node whose HTTPS poll failed
+    /// still reports its tunnel.
+    #[test]
+    fn an_unreachable_node_still_reports_its_tunnel() {
+        let mut r = with_tunnel("edge-a", tunnel(Probe::Connected, Handshake::Never));
+        r.unreachable = Some("connection refused".into());
+        let d = build(&[r], &Thresholds::default(), now());
+        assert!(d.nodes[0].tunnel.is_some());
+        assert!(d
+            .findings
+            .iter()
+            .any(|f| f.text.contains("never completed")));
+        assert!(d.findings.iter().any(|f| f.text.contains("unreachable")));
+    }
+
+    #[test]
+    fn a_missing_handshake_file_is_one_fault_not_one_per_node() {
+        let missing = || tunnel(Probe::Connected, Handshake::FileMissing("/x/wg".into()));
+        let rs = [
+            with_tunnel("origin", missing()),
+            with_tunnel("edge-a", missing()),
+            with_tunnel("edge-b", missing()),
+        ];
+        let d = build(&rs, &Thresholds::default(), now());
+        let f = tunnel_findings(&d);
+        assert_eq!(f.len(), 1, "{:?}", d.findings);
+        assert_eq!(f[0].node, "monitor");
+        assert_eq!(f[0].level, Level::Fault);
+        assert!(f[0].text.contains("/x/wg is missing"));
+    }
+
+    #[test]
+    fn an_unreadable_handshake_file_is_one_fault_on_the_monitor() {
+        let r = with_tunnel(
+            "edge-a",
+            tunnel(Probe::Connected, Handshake::FileError("/x: line 2".into())),
+        );
+        let d = build(&[r], &Thresholds::default(), now());
+        let f = tunnel_findings(&d);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].node, "monitor");
+        assert_eq!(f[0].level, Level::Fault);
+        assert!(f[0].text.contains("unreadable"));
+    }
+
+    #[test]
+    fn a_stale_handshake_file_is_one_fault_naming_the_file_and_judges_no_node() {
+        let stale = || {
+            let mut t = tunnel(
+                Probe::Connected,
+                Handshake::FileStale {
+                    path: "/x/wg".into(),
+                    age_s: 900,
+                },
+            );
+            t.file_age_s = Some(900);
+            t
+        };
+        let rs = [
+            with_tunnel("origin", stale()),
+            with_tunnel("edge-a", stale()),
+        ];
+        let d = build(&rs, &Thresholds::default(), now());
+        let f = tunnel_findings(&d);
+        assert_eq!(f.len(), 1, "{:?}", d.findings);
+        assert_eq!(f[0].node, "monitor");
+        assert_eq!(f[0].level, Level::Fault);
+        assert!(f[0].text.contains("/x/wg"), "{}", f[0].text);
+        assert!(f[0].text.contains("900s old"), "{}", f[0].text);
+        assert!(f[0].text.contains("collector has probably stopped"));
+        for n in &d.nodes {
+            let t = n.tunnel.as_ref().unwrap();
+            assert_eq!(t.handshake, HandshakeState::FileStale);
+            assert_eq!(t.handshake_age_s, None);
+            assert!(
+                t.handshake_text().contains("unknown"),
+                "{}",
+                t.handshake_text()
+            );
+        }
+        assert_eq!(d.handshake_file_age_s, Some(900));
+    }
+
+    #[test]
+    fn a_node_with_no_tunnel_configured_raises_nothing() {
+        let d = build(
+            &[reading("edge-a", "ok", None)],
+            &Thresholds::default(),
+            now(),
+        );
+        assert!(d.nodes[0].tunnel.is_none());
+        assert!(tunnel_findings(&d).is_empty());
+    }
+
+    #[test]
+    fn a_tunnel_with_no_public_key_is_a_fault_naming_the_setting() {
+        let r = with_tunnel("edge-a", tunnel(Probe::Connected, Handshake::NoPublicKey));
+        let d = build(&[r], &Thresholds::default(), now());
+        let f = tunnel_findings(&d);
+        assert_eq!(f.len(), 1, "{:?}", d.findings);
+        assert_eq!(f[0].node, "edge-a");
+        assert_eq!(f[0].level, Level::Fault);
+        assert!(f[0].text.contains("public_key"), "{}", f[0].text);
+        assert_eq!(d.level, Level::Fault);
+    }
+
+    #[test]
+    fn tunnels_with_no_handshakes_file_are_one_fault_on_the_monitor() {
+        let none = || tunnel(Probe::Connected, Handshake::NoHandshakesFile);
+        let rs = [with_tunnel("origin", none()), with_tunnel("edge-a", none())];
+        let d = build(&rs, &Thresholds::default(), now());
+        let f = tunnel_findings(&d);
+        assert_eq!(f.len(), 1, "{:?}", d.findings);
+        assert_eq!(f[0].node, "monitor");
+        assert_eq!(f[0].level, Level::Fault);
+        assert!(f[0].text.contains("wg_handshakes_file"), "{}", f[0].text);
+    }
+
+    #[test]
+    fn the_json_digest_carries_tunnel_rtt_and_handshake_age() {
+        let r = with_tunnel(
+            "edge-a",
+            tunnel(Probe::Connected, Handshake::At { age_s: 42 }),
+        );
+        let d = build(&[r], &Thresholds::default(), now());
+        let v = serde_json::to_value(&d).unwrap();
+        let t = &v["nodes"][0]["tunnel"];
+        assert!(t["rtt_ms"].is_number());
+        assert_eq!(t["rtt_samples_ms"].as_array().unwrap().len(), 3);
+        assert_eq!(t["handshake_age_s"], 42);
+        assert!(t.get("handshake_file_age_s").is_none(), "{t}");
+        assert_eq!(v["handshake_file_age_s"], 7);
+        assert_eq!(t["probe"], "connected");
+        assert_eq!(t["handshake"], "ok");
+        assert_eq!(v["thresholds"]["tunnel_handshake_age_s"], 600);
+    }
+
+    // ── log reopen ───────────────────────────────────────────────────────────
+
+    use m6_core::monitoring::{LogReopenHealth, LoggingHealth};
+
+    fn reopen_health(age: Option<u64>, reopens: u64, failure_age: Option<u64>) -> LogReopenHealth {
+        LogReopenHealth {
+            reopens_total: reopens,
+            failures_total: u64::from(failure_age.is_some()),
+            seconds_since_last_reopen: age,
+            last_reopen_unix: age.map(|a| 1_789_000_000 - a),
+            seconds_since_last_failure: failure_age,
+        }
+    }
+
+    fn with_reopen(uptime_s: u64, logging: Option<Option<LogReopenHealth>>) -> NodeReading {
+        let mut p = perf(plain_host(), vec![]);
+        p.uptime_s = uptime_s;
+        p.logging = logging.map(|reopen| LoggingHealth {
+            events_total: 10,
+            seconds_since_last: Some(1),
+            reopen,
+        });
+        reading("origin", "ok", Some(p))
+    }
+
+    fn limit(max: Option<u64>) -> Thresholds {
+        Thresholds {
+            log_reopen_age_s: max,
+            ..Default::default()
+        }
+    }
+
+    fn reopen_findings(d: &Digest) -> Vec<&Finding> {
+        d.findings
+            .iter()
+            .filter(|f| f.text.contains("reopen"))
+            .collect()
+    }
+
+    #[test]
+    fn a_recent_log_reopen_raises_nothing_and_reports_its_age() {
+        let r = with_reopen(9000, Some(Some(reopen_health(Some(60), 3, None))));
+        let d = build(&[r], &limit(Some(7200)), now());
+        assert!(reopen_findings(&d).is_empty(), "{:?}", d.findings);
+        let l = &d.nodes[0].log_reopen;
+        assert_eq!(l.state, "ok");
+        assert_eq!(l.age_s, Some(60));
+        assert_eq!(l.reopens, Some(3));
+    }
+
+    #[test]
+    fn a_log_reopen_older_than_the_limit_faults() {
+        let over = with_reopen(99_999, Some(Some(reopen_health(Some(7201), 3, None))));
+        let d = build(&[over], &limit(Some(7200)), now());
+        let f = reopen_findings(&d);
+        assert_eq!(f.len(), 1, "{:?}", d.findings);
+        assert_eq!(f[0].level, Level::Fault);
+        assert!(f[0].text.contains("rotation has stopped"), "{}", f[0].text);
+        let at = with_reopen(99_999, Some(Some(reopen_health(Some(7200), 3, None))));
+        let d = build(&[at], &limit(Some(7200)), now());
+        assert!(reopen_findings(&d).is_empty(), "{:?}", d.findings);
+    }
+
+    #[test]
+    fn never_reopened_is_its_own_state_and_faults_only_past_the_limit() {
+        let young = with_reopen(100, Some(Some(reopen_health(None, 0, None))));
+        let d = build(&[young], &limit(Some(7200)), now());
+        assert_eq!(d.nodes[0].log_reopen.state, "never");
+        assert!(reopen_findings(&d).is_empty(), "{:?}", d.findings);
+        let old = with_reopen(7201, Some(Some(reopen_health(None, 0, None))));
+        let d = build(&[old], &limit(Some(7200)), now());
+        let f = reopen_findings(&d);
+        assert_eq!(f.len(), 1, "{:?}", d.findings);
+        assert!(f[0].text.contains("never reopened"), "{}", f[0].text);
+    }
+
+    #[test]
+    fn no_limit_configured_judges_nothing() {
+        let r = with_reopen(99_999, Some(Some(reopen_health(Some(1_000_000), 1, None))));
+        let d = build(&[r], &limit(None), now());
+        assert!(reopen_findings(&d).is_empty(), "{:?}", d.findings);
+        assert_eq!(d.nodes[0].log_reopen.state, "ok");
+        let r = with_reopen(99_999, None);
+        let d = build(&[r], &limit(None), now());
+        assert!(reopen_findings(&d).is_empty(), "{:?}", d.findings);
+    }
+
+    #[test]
+    fn a_node_that_writes_no_log_file_is_not_faulted() {
+        let r = with_reopen(99_999, Some(None));
+        let d = build(&[r], &limit(Some(7200)), now());
+        assert_eq!(d.nodes[0].log_reopen.state, "no_log_file");
+        assert!(reopen_findings(&d).is_empty(), "{:?}", d.findings);
+    }
+
+    #[test]
+    fn a_node_too_old_to_report_reopens_faults_when_a_limit_is_set() {
+        let r = with_reopen(100, None);
+        let d = build(&[r], &limit(Some(7200)), now());
+        assert_eq!(d.nodes[0].log_reopen.state, "unknown");
+        let f = reopen_findings(&d);
+        assert_eq!(f.len(), 1, "{:?}", d.findings);
+        assert!(f[0].text.contains("too old"), "{}", f[0].text);
+        assert_eq!(f[0].level, Level::Fault);
+    }
+
+    #[test]
+    fn a_failed_reopen_newer_than_the_last_success_faults() {
+        let r = with_reopen(99_999, Some(Some(reopen_health(Some(3000), 2, Some(10)))));
+        let d = build(&[r], &limit(Some(7200)), now());
+        let f = reopen_findings(&d);
+        assert_eq!(f.len(), 1, "{:?}", d.findings);
+        assert!(
+            f[0].text.contains("still writing to the previous file"),
+            "{}",
+            f[0].text
+        );
+        // An old failure followed by a success is history, not a fault.
+        let r = with_reopen(99_999, Some(Some(reopen_health(Some(10), 2, Some(3000)))));
+        let d = build(&[r], &limit(Some(7200)), now());
+        assert!(reopen_findings(&d).is_empty(), "{:?}", d.findings);
+    }
+
+    #[test]
+    fn the_json_digest_carries_the_log_reopen_state() {
+        let r = with_reopen(99_999, Some(Some(reopen_health(Some(60), 3, None))));
+        let d = build(&[r], &limit(Some(7200)), now());
+        let v = serde_json::to_value(&d).unwrap();
+        assert_eq!(v["nodes"][0]["log_reopen"]["state"], "ok");
+        assert_eq!(v["nodes"][0]["log_reopen"]["age_s"], 60);
+        assert!(v["nodes"][0]["log_reopen"]["last_unix"].is_u64());
+        assert_eq!(v["thresholds"]["log_reopen_age_s"], 7200);
+    }
+
+    #[test]
+    fn a_silent_main_log_is_a_digest_finding_so_the_verdict_counts_it() {
+        let mut r = reading("origin", "ok", Some(perf(plain_host(), vec![])));
+        let t = m6_core::monitoring::TrafficReport {
+            node: "origin".into(),
+            window_minutes: 60,
+            total_requests: 0,
+            status: Default::default(),
+            notable: vec![],
+            heavy_hitters: vec![],
+            crawlers: vec![],
+            forged_bot_requests: 0,
+            forgers: vec![],
+            probe_noise: vec![],
+            logging: LoggingHealth {
+                events_total: 5000,
+                seconds_since_last: Some(600),
+                reopen: None,
+            },
+            firewall: None,
+        };
+        r.traffic = Some(t);
+        let d = build(&[r], &Thresholds::default(), now());
+        assert!(
+            d.findings
+                .iter()
+                .any(|f| f.level == Level::Fault && f.text.contains("main log silent for 600s")),
+            "{:?}",
+            d.findings
+        );
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+
+    fn empty() -> Digest {
+        build(&[], &Thresholds::default(), "now".into())
+    }
+
+    fn finding(level: Level, text: &str) -> Finding {
+        Finding {
+            level,
+            node: "monitor".into(),
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn add_finding_keeps_faults_first_and_raises_the_level() {
+        let mut d = empty();
+        assert_eq!(d.level, Level::Ok);
+        d.add_finding(finding(Level::Warn, "w"));
+        assert_eq!(d.level, Level::Warn);
+        d.add_finding(finding(Level::Fault, "f"));
+        d.add_finding(finding(Level::Warn, "w2"));
+        assert_eq!(d.level, Level::Fault);
+        let texts: Vec<&str> = d.findings.iter().map(|f| f.text.as_str()).collect();
+        assert_eq!(texts, ["f", "w", "w2"]);
+    }
+
+    #[test]
+    fn the_json_digest_carries_the_history_state() {
+        let mut d = empty();
+        assert!(serde_json::to_value(&d).unwrap()["history"].is_null());
+        d.history = Some(crate::history::HistoryDigest {
+            state: "behind",
+            file: Some("h.sqlite3".into()),
+            max_bytes: Some(1 << 20),
+            file_bytes: None,
+            used_bytes: None,
+            oldest_at: None,
+            newest_at: None,
+            last_write_age_s: None,
+            writes: 1,
+            crawl_windows: 0,
+            failures: 0,
+            dropped: 3,
+            pruned: 0,
+            last_error: None,
+        });
+        let v = serde_json::to_value(&d).unwrap();
+        assert_eq!(v["history"]["state"], "behind");
+        assert_eq!(v["history"]["dropped"], 3);
+        assert_eq!(v["history"]["file"], "h.sqlite3");
     }
 }

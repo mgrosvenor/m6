@@ -445,6 +445,12 @@ pub struct PerfReport {
     /// the leaf is unaccounted for.
     #[serde(default)]
     pub tls_unreadable: usize,
+    /// Whether the log is emitting and when the log file was last reopened.
+    ///
+    /// `None` means a node older than this field, which is not the same as a
+    /// node that writes no log file. That case is `Some` with no `reopen`.
+    #[serde(default)]
+    pub logging: Option<LoggingHealth>,
     pub metrics: StatsSnapshot,
     /// The machine underneath: load, memory, disk, temperature, uptime.
     ///
@@ -480,6 +486,8 @@ pub enum PerfOutcome {
     Disabled,
     /// Configured, but the caller presented no or wrong credentials.
     Unauthorised,
+    /// The token is valid but lacks the required claim.
+    Forbidden,
     /// Boxed for the same reason as `Traffic`: `PerfReport` is 608 bytes
     /// against the 24 of the largest error variant, and an inline copy made
     /// every `PerfOutcome` that size.
@@ -507,10 +515,37 @@ pub struct PerfAccess<'a> {
     pub configured_token: Option<&'a str>,
 }
 
+impl PerfAccess<'_> {
+    /// Why the legacy bearer gate refuses this caller, or `None` when it
+    /// passes. No token configured is `Disabled`, a wrong or missing one is
+    /// `Unauthorised`.
+    pub fn refusal(&self) -> Option<PerfOutcome> {
+        match self.configured_token.filter(|t| !t.is_empty()) {
+            None => Some(PerfOutcome::Disabled),
+            Some(_) if !metrics_authorised(self.headers, self.configured_token) => {
+                Some(PerfOutcome::Unauthorised)
+            }
+            Some(_) => None,
+        }
+    }
+}
+
 impl PerfReport {
     pub fn build(
         subject: PerfSubject<'_>,
         access: PerfAccess<'_>,
+        snapshot: impl FnOnce() -> StatsSnapshot,
+    ) -> PerfOutcome {
+        match access.refusal() {
+            Some(outcome) => outcome,
+            None => Self::build_authorised(subject, snapshot),
+        }
+    }
+
+    /// The report itself, for a caller that has already been authorised by
+    /// some other gate. Nothing here checks access.
+    pub fn build_authorised(
+        subject: PerfSubject<'_>,
         snapshot: impl FnOnce() -> StatsSnapshot,
     ) -> PerfOutcome {
         let PerfSubject {
@@ -520,35 +555,26 @@ impl PerfReport {
             url_backends,
             host_path,
         } = subject;
-        let PerfAccess {
-            headers,
-            configured_token,
-        } = access;
-        match configured_token.filter(|t| !t.is_empty()) {
-            None => PerfOutcome::Disabled,
-            Some(_) if !metrics_authorised(headers, configured_token) => PerfOutcome::Unauthorised,
-            Some(_) => {
-                // `snapshot` is a closure so the reservoir sort happens only
-                // after authorisation passes, never for an anonymous caller.
-                // Read after authorisation, like the reservoir sort: an
-                // anonymous caller never causes a /proc read either.
-                PerfOutcome::Ok(Box::new(PerfReport {
-                    node: node.to_string(),
-                    build: build_id().clone(),
-                    uptime_s,
-                    pools,
-                    url_backends,
-                    // Read from the registry the TLS loader wrote, not from
-                    // the certificate file: no path is opened to answer this,
-                    // so a monitoring endpoint cannot be made to do disk work
-                    // by being polled.
-                    tls: crate::tls::loaded(),
-                    tls_unreadable: crate::tls::unreadable(),
-                    metrics: snapshot(),
-                    host: crate::host::snapshot(host_path),
-                }))
-            }
-        }
+        // `snapshot` is a closure so the reservoir sort happens only
+        // after authorisation passes, never for an anonymous caller.
+        // Read after authorisation, like the reservoir sort: an
+        // anonymous caller never causes a /proc read either.
+        PerfOutcome::Ok(Box::new(PerfReport {
+            node: node.to_string(),
+            build: build_id().clone(),
+            uptime_s,
+            pools,
+            url_backends,
+            // Read from the registry the TLS loader wrote, not from
+            // the certificate file: no path is opened to answer this,
+            // so a monitoring endpoint cannot be made to do disk work
+            // by being polled.
+            tls: crate::tls::loaded(),
+            tls_unreadable: crate::tls::unreadable(),
+            logging: Some(LoggingHealth::read()),
+            metrics: snapshot(),
+            host: crate::host::snapshot(host_path),
+        }))
     }
 }
 
@@ -570,6 +596,7 @@ impl PerfOutcome {
                 headers.push(("WWW-Authenticate".to_string(), "Bearer".to_string()));
                 (401, headers, br#"{"error":"unauthorised"}"#.to_vec())
             }
+            PerfOutcome::Forbidden => (403, headers, br#"{"error":"forbidden"}"#.to_vec()),
             PerfOutcome::Ok(report) => {
                 let body = serde_json::to_vec(&report)
                     .unwrap_or_else(|_| br#"{"error":"serialisation failed"}"#.to_vec());
@@ -875,6 +902,107 @@ mod tests {
         );
     }
 
+    fn authorised_perf_json() -> serde_json::Value {
+        let out = PerfReport::build(
+            PerfSubject {
+                node: "origin",
+                uptime_s: 5,
+                pools: vec![],
+                url_backends: vec![],
+                host_path: Path::new("/"),
+            },
+            PerfAccess {
+                headers: &auth("Bearer right"),
+                configured_token: Some("right"),
+            },
+            snap,
+        );
+        let (_, _, body) = out.into_response();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[test]
+    fn perf_carries_logging_with_reopen_state() {
+        let v = authorised_perf_json();
+        let p: PerfReport = serde_json::from_value(v.clone()).unwrap();
+        assert!(p.logging.is_some());
+        assert!(v["logging"].get("events_total").is_some());
+    }
+
+    #[test]
+    fn a_perf_payload_from_a_node_older_than_logging_still_parses() {
+        let mut v = authorised_perf_json();
+        assert!(v.as_object_mut().unwrap().remove("logging").is_some());
+        let p: PerfReport = serde_json::from_value(v).expect("older node must parse");
+        assert!(p.logging.is_none());
+        let l: LoggingHealth =
+            serde_json::from_str(r#"{"events_total":3,"seconds_since_last":1}"#).unwrap();
+        assert!(l.reopen.is_none());
+    }
+
+    #[test]
+    fn log_reopen_health_says_never_rather_than_zero() {
+        let h = LogReopenHealth {
+            reopens_total: 0,
+            failures_total: 0,
+            seconds_since_last_reopen: None,
+            last_reopen_unix: None,
+            seconds_since_last_failure: None,
+        };
+        let json = serde_json::to_string(&h).unwrap();
+        assert!(json.contains(r#""seconds_since_last_reopen":null"#));
+    }
+
+    #[test]
+    fn refusal_matches_the_legacy_gate() {
+        let none = PerfAccess {
+            headers: &auth("Bearer x"),
+            configured_token: None,
+        };
+        assert!(matches!(none.refusal(), Some(PerfOutcome::Disabled)));
+        let wrong = PerfAccess {
+            headers: &auth("Bearer wrong"),
+            configured_token: Some("right"),
+        };
+        assert!(matches!(wrong.refusal(), Some(PerfOutcome::Unauthorised)));
+        let right = PerfAccess {
+            headers: &auth("Bearer right"),
+            configured_token: Some("right"),
+        };
+        assert!(right.refusal().is_none());
+    }
+
+    #[test]
+    fn build_authorised_reports_without_a_token() {
+        let out = PerfReport::build_authorised(
+            PerfSubject {
+                node: "origin",
+                uptime_s: 5,
+                pools: vec![],
+                url_backends: vec![],
+                host_path: Path::new("/"),
+            },
+            snap,
+        );
+        let (code, _, body) = out.into_response();
+        assert_eq!(code, 200);
+        let p: PerfReport = serde_json::from_slice(&body).expect("a report");
+        assert_eq!(p.node, "origin");
+    }
+
+    #[test]
+    fn forbidden_is_a_403_with_no_store_and_no_www_authenticate() {
+        let (code, headers, body) = PerfOutcome::Forbidden.into_response();
+        assert_eq!(code, 403);
+        assert_eq!(body, br#"{"error":"forbidden"}"#);
+        let has = |name: &str| headers.iter().any(|(n, _)| n.eq_ignore_ascii_case(name));
+        assert!(has("X-Robots-Tag"));
+        assert!(!has("WWW-Authenticate"));
+        assert!(headers
+            .iter()
+            .any(|(n, v)| n == "Cache-Control" && v == "no-store"));
+    }
+
     #[test]
     fn perf_is_401_with_a_scheme_hint_when_credentials_are_wrong() {
         let out = PerfReport::build(
@@ -1060,6 +1188,44 @@ pub struct LoggingHealth {
     /// `None` means nothing has ever been emitted, which is not the same as
     /// "emitted zero seconds ago" and must not be reported as healthy.
     pub seconds_since_last: Option<u64>,
+    /// The log file's reopen record. `None` means this process writes no log
+    /// file, or is a node older than the field.
+    #[serde(default)]
+    pub reopen: Option<LogReopenHealth>,
+}
+
+/// When a process last reopened its log file, so a reader can tell whether
+/// rotation is still running.
+///
+/// The node computes the ages itself, so clock skew between the node and its
+/// reader does not matter. `last_reopen_unix` is for a reader that stores
+/// history.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LogReopenHealth {
+    pub reopens_total: u64,
+    pub failures_total: u64,
+    /// `None` means never reopened since start, which is not the same as
+    /// "reopened zero seconds ago".
+    pub seconds_since_last_reopen: Option<u64>,
+    pub last_reopen_unix: Option<u64>,
+    pub seconds_since_last_failure: Option<u64>,
+}
+
+impl LogReopenHealth {
+    /// `None` when this process writes no log file.
+    pub fn read() -> Option<Self> {
+        if !crate::log::writes_log_file() {
+            return None;
+        }
+        let r = crate::log::reopens();
+        Some(Self {
+            reopens_total: r.successes(),
+            failures_total: r.failures(),
+            seconds_since_last_reopen: r.seconds_since_last_success(),
+            last_reopen_unix: r.last_success_unix(),
+            seconds_since_last_failure: r.seconds_since_last_failure(),
+        })
+    }
 }
 
 impl LoggingHealth {
@@ -1067,6 +1233,7 @@ impl LoggingHealth {
         Self {
             events_total: crate::log::pulse().events(),
             seconds_since_last: crate::log::pulse().seconds_since_last(),
+            reopen: LogReopenHealth::read(),
         }
     }
 
@@ -1087,6 +1254,11 @@ pub struct NotableClient {
     pub ip: String,
     pub requests: u64,
     pub distinct_user_agents: usize,
+    /// A sample of the agents this client presented. Empty on a node too old
+    /// to report them, which is why the count above stays: a reader has to be
+    /// able to tell "presented none we recorded" from "this node cannot say".
+    #[serde(default)]
+    pub user_agents: Vec<String>,
     pub status: std::collections::BTreeMap<u16, u64>,
     pub probe_paths: Vec<String>,
     pub injection_paths: Vec<String>,
@@ -1100,7 +1272,29 @@ pub struct HeavyHitter {
     pub ip: String,
     pub requests: u64,
     pub top_path: String,
-    pub user_agents: usize,
+    /// Renamed from `user_agents`, which held this count while the field a
+    /// reader wanted did not exist.
+    ///
+    /// The WIRE name stays `user_agents`, because the count has been published
+    /// under it since this struct existed and an aggregator reads `/traffic`
+    /// from nodes on other versions. Giving the strings that key instead would
+    /// make a payload from any node on the other side of this change a type
+    /// error rather than a partly readable report, which is the treatment
+    /// `firewall` and `PerfReport.tls` are documented as avoiding.
+    #[serde(rename = "user_agents")]
+    pub distinct_user_agents: usize,
+    /// A heavy hitter carries the COUNT and no sample, deliberately.
+    ///
+    /// The agents are on [`NotableClient`], which is the list this change
+    /// exists for: a notable client is one the report is accusing of
+    /// something, and what it claimed to be is evidence. A heavy hitter is
+    /// merely loud, and the loudest source on a node is routinely the
+    /// monitor's own polling.
+    ///
+    /// A sample was added here first and carried in every payload for up to
+    /// eight clients per node while nothing read it. Rendering it instead
+    /// would have buried the section: thirty-two agent lines per node, mostly
+    /// describing traffic nobody is asking about.
     /// Share of responses that were 4xx or 5xx, so a loud client that is
     /// being served is distinguishable from one that is being refused.
     pub error_ratio: f64,
@@ -1132,6 +1326,7 @@ impl TrafficReport {
                 ip: ip.clone(),
                 requests: c.requests,
                 distinct_user_agents: c.distinct_user_agents,
+                user_agents: c.user_agents.clone(),
                 status: c.status.clone(),
                 probe_paths: c.probe_paths.iter().map(|(p, _)| p.clone()).collect(),
                 injection_paths: c.injection_paths.iter().map(|(p, _)| p.clone()).collect(),
@@ -1156,7 +1351,7 @@ impl TrafficReport {
                 ip: ip.clone(),
                 requests: c.requests,
                 top_path: c.paths.first().map(|(p, _)| p.clone()).unwrap_or_default(),
-                user_agents: c.distinct_user_agents,
+                distinct_user_agents: c.distinct_user_agents,
                 error_ratio: c.error_ratio(),
             })
             .collect();
@@ -1257,12 +1452,14 @@ mod traffic_tests {
         let never = LoggingHealth {
             events_total: 0,
             seconds_since_last: None,
+            reopen: None,
         };
         assert!(never.is_blind());
 
         let alive = LoggingHealth {
             events_total: 5000,
             seconds_since_last: Some(3),
+            reopen: None,
         };
         assert!(!alive.is_blind());
 
@@ -1270,10 +1467,44 @@ mod traffic_tests {
         let quiet = LoggingHealth {
             events_total: 5000,
             seconds_since_last: Some(600),
+            reopen: None,
         };
         assert!(
             quiet.is_blind(),
             "ten minutes of silence from a 10s heartbeat"
         );
+    }
+
+    /// A `/traffic` payload from a node on another version still parses.
+    ///
+    /// The aggregator reads this endpoint over the network, and a rollout has
+    /// nodes on both sides of a field change at once. A node that publishes
+    /// `user_agents` as the COUNT must stay readable here, and the count must
+    /// keep that wire name so an aggregator older than the sample reads it
+    /// too. Both directions, because a type error on one field loses the whole
+    /// report: notable clients, logging health and firewall state with it.
+    #[test]
+    fn a_traffic_payload_without_the_agent_sample_still_parses() {
+        let old = r#"{
+            "node":"origin","window_minutes":60,"total_requests":12,"status":{"200":12},
+            "notable":[{"ip":"203.0.113.9","requests":7,"distinct_user_agents":3,
+                "status":{"404":7},"probe_paths":["/.env"],"injection_paths":[],
+                "rotating_user_agents":false,
+                "first_seen":"2026-10-04T01:20:54Z","last_seen":"2026-10-04T01:20:58Z"}],
+            "heavy_hitters":[{"ip":"203.0.113.9","requests":7,"top_path":"/.env",
+                "user_agents":3,"error_ratio":1.0}],
+            "crawlers":[],"forged_bot_requests":0,"forgers":[],"probe_noise":[],
+            "logging":{"events_total":100,"seconds_since_last":1}
+        }"#;
+        let r: TrafficReport = serde_json::from_str(old).expect("an older payload must parse");
+        assert_eq!(r.heavy_hitters[0].distinct_user_agents, 3);
+        assert!(
+            r.notable[0].user_agents.is_empty(),
+            "no sample from a node that cannot send one"
+        );
+
+        // And the count still goes out under the name an older reader expects.
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["heavy_hitters"][0]["user_agents"], 3);
     }
 }

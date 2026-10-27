@@ -69,7 +69,9 @@ impl Version {
     }
 }
 
-/// Which network the request arrived on.
+/// Which network the request arrived on, as declared by `[server]
+/// internal_binds`. A listener that list names is internal, every other is
+/// external. Nothing is inferred from an address.
 ///
 /// The origin serves two completely different populations and pooling them
 /// makes both numbers meaningless: real visitors arrive on the public NIC
@@ -86,30 +88,6 @@ pub enum Iface {
 }
 
 impl Iface {
-    /// Classify a listener by its bind address.
-    ///
-    /// Derived rather than hardcoded per listener: h2c is *conventionally*
-    /// the backbone listener here, but that is deployment configuration, not
-    /// a property of the protocol, and a future node that exposes h2c
-    /// publicly should not be silently labelled internal.
-    pub fn for_bind(bind: &str) -> Iface {
-        let host = bind.rsplit_once(':').map(|(h, _)| h).unwrap_or(bind);
-        let host = host.trim_start_matches('[').trim_end_matches(']');
-        let octets: Vec<u8> = host.split('.').filter_map(|o| o.parse().ok()).collect();
-        let private = match octets.as_slice() {
-            [10, ..] => true,
-            [172, b, ..] if (16..=31).contains(b) => true,
-            [192, 168, ..] => true,
-            [127, ..] => true,
-            _ => host.starts_with("fd") || host.starts_with("fc") || host == "::1",
-        };
-        if private {
-            Iface::Internal
-        } else {
-            Iface::External
-        }
-    }
-
     pub fn as_str(self) -> &'static str {
         match self {
             Iface::External => "external",
@@ -1017,22 +995,6 @@ mod channel_tests {
         assert_eq!(Version::from_wire("HTTP/3"), Version::Http3);
         // Unknown falls back to 1.1 rather than panicking on hostile input.
         assert_eq!(Version::from_wire("garbage"), Version::Http11);
-    }
-
-    #[test]
-    fn interface_is_classified_from_the_bind_address() {
-        // The private backbone between nodes.
-        assert_eq!(Iface::for_bind("10.0.0.1:80"), Iface::Internal);
-        assert_eq!(Iface::for_bind("192.168.1.5:80"), Iface::Internal);
-        assert_eq!(Iface::for_bind("172.16.0.1:80"), Iface::Internal);
-        assert_eq!(Iface::for_bind("127.0.0.1:8080"), Iface::Internal);
-        // Public listeners.
-        assert_eq!(Iface::for_bind("203.0.113.7:443"), Iface::External);
-        assert_eq!(Iface::for_bind("0.0.0.0:443"), Iface::External);
-        // 172.32 is OUTSIDE the private 172.16/12 block; treating the whole
-        // 172/8 as private would misclassify real public addresses.
-        assert_eq!(Iface::for_bind("172.32.0.1:443"), Iface::External);
-        assert_eq!(Iface::for_bind("172.15.0.1:443"), Iface::External);
     }
 
     #[test]

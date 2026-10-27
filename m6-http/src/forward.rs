@@ -72,9 +72,11 @@ pub const UNTRUSTED_INBOUND: &[&str] = &[
 pub enum ForwardedTrust {
     /// A forwarded client IP here is a forgery attempt. The public listener.
     Never,
-    /// The peer is one of the deployment's own cache nodes, reachable only over the
-    /// private backbone. Granted by the listener, never by a header, and never
-    /// on a listener bound to a public address -- see `H2cListener::bind`.
+    /// The peer is one of the deployment's own cache nodes, accepted only from
+    /// the addresses in `[server] internal_peers`. Granted by the listener,
+    /// never by a header, and only on an h2c listener named in `[server]
+    /// internal_binds`, which load accepts only in a local range -- see
+    /// `H2cListener::bind`.
     Backbone,
 }
 
@@ -1264,6 +1266,14 @@ pub fn build_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A full JSON Lines page from `m6_core::ndjson` must fit in a backend body
+    /// this edge will accept, or a service honouring its own page limit would
+    /// still be refused here.
+    #[test]
+    fn a_full_ndjson_page_fits_under_the_backend_body_cap() {
+        const { assert!(m6_core::ndjson::MAX_PAGE_BYTES < MAX_BACKEND_BODY) };
+    }
 
     #[test]
     fn test_parse_status_line() {

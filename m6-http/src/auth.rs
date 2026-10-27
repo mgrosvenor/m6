@@ -92,23 +92,34 @@ impl PublicKey {
     }
 }
 
+/// A `require` string: the claim list it reads and the name that must be in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Require<'a> {
+    Role(&'a str),
+    Group(&'a str),
+}
+
+impl<'a> Require<'a> {
+    /// Parse `"role:<name>"` or `"group:<name>"`. `None` for any other form.
+    /// The one definition of the format, read by the request-path check and
+    /// by config validation.
+    pub fn parse(require: &'a str) -> Option<Self> {
+        if let Some(group) = require.strip_prefix("group:") {
+            return Some(Self::Group(group));
+        }
+        require.strip_prefix("role:").map(Self::Role)
+    }
+}
+
 /// Check if claims satisfy the `require` string.
-/// Format: "group:<name>" or "role:<name>"
+/// Format: `group:<name>` or `role:<name>`. Any other form denies.
 pub fn check_require(claims: &Claims, require: &str) -> bool {
-    if let Some(group) = require.strip_prefix("group:") {
-        if let Some(ref groups) = claims.groups {
-            return groups.iter().any(|g| g == group);
-        }
-        return false;
-    }
-    if let Some(role) = require.strip_prefix("role:") {
-        if let Some(ref roles) = claims.roles {
-            return roles.iter().any(|r| r == role);
-        }
-        return false;
-    }
-    // Unknown require format — deny
-    false
+    let (list, name) = match Require::parse(require) {
+        Some(Require::Group(g)) => (&claims.groups, g),
+        Some(Require::Role(r)) => (&claims.roles, r),
+        None => return false,
+    };
+    list.as_ref().is_some_and(|l| l.iter().any(|v| v == name))
 }
 
 /// Extract JWT token from Authorization header or session cookie.
@@ -141,6 +152,39 @@ pub fn extract_token<'a>(
     None
 }
 
+/// Why a request failed the `require` check.
+#[derive(Debug)]
+pub enum Refusal {
+    /// No `Authorization: Bearer` header and no session cookie.
+    NoToken,
+    /// A token was sent but did not verify.
+    Invalid(AuthError),
+    /// The token verified but lacks the required role or group.
+    Insufficient,
+}
+
+/// Extract, verify and check a request's token against a `require` string.
+///
+/// Shared by route `require` and the metrics gate, so both accept the same
+/// tokens and refuse the same ways. It never redirects: a browser redirect is
+/// the route block's choice, made on its own refusal path.
+pub fn authorise(
+    key: &PublicKey,
+    headers: &[(String, String)],
+    require: &str,
+) -> Result<Claims, Refusal> {
+    let auth = m6_core::headers::get(headers, "authorization");
+    let cookies = combined_cookie_header(headers);
+    match extract_token(auth, cookies.as_deref()) {
+        None => Err(Refusal::NoToken),
+        Some(t) => match key.verify(t) {
+            Err(e) => Err(Refusal::Invalid(e)),
+            Ok(c) if check_require(&c, require) => Ok(c),
+            Ok(_) => Err(Refusal::Insufficient),
+        },
+    }
+}
+
 /// Encode claims as base64 JSON for X-Auth-Claims header.
 pub fn encode_claims_header(claims: &Claims) -> String {
     let json = serde_json::to_string(claims).unwrap_or_default();
@@ -169,6 +213,7 @@ pub fn extract_refresh_cookie(cookie_header: Option<&str>) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+    use super::test_keys::{bearer, keypair, mint};
     use super::*;
 
     #[test]
@@ -301,5 +346,99 @@ mod tests {
         );
         assert_eq!(extract_refresh_cookie(Some("session=abc")), None);
         assert_eq!(extract_refresh_cookie(None), None);
+    }
+
+    #[test]
+    fn authorise_without_a_token_is_no_token() {
+        let (_d, key, _) = keypair();
+        let r = authorise(&key, &[], "role:monitor");
+        assert!(matches!(r, Err(Refusal::NoToken)));
+    }
+
+    #[test]
+    fn authorise_with_another_keys_signature_is_invalid() {
+        let (_d, key, _) = keypair();
+        let (_d2, _, other_private) = keypair();
+        let t = mint(&other_private, &["monitor"], 3600);
+        let r = authorise(&key, &bearer(&t), "role:monitor");
+        assert!(matches!(r, Err(Refusal::Invalid(_))));
+    }
+
+    #[test]
+    fn authorise_an_expired_token_is_invalid() {
+        let (_d, key, private) = keypair();
+        // An hour ago, well beyond the verifier's 60 s leeway.
+        let t = mint(&private, &["monitor"], -3600);
+        let r = authorise(&key, &bearer(&t), "role:monitor");
+        assert!(matches!(r, Err(Refusal::Invalid(_))));
+    }
+
+    #[test]
+    fn authorise_the_wrong_role_is_insufficient() {
+        let (_d, key, private) = keypair();
+        let t = mint(&private, &["reader"], 3600);
+        let r = authorise(&key, &bearer(&t), "role:monitor");
+        assert!(matches!(r, Err(Refusal::Insufficient)));
+    }
+
+    #[test]
+    fn authorise_the_right_role_passes() {
+        let (_d, key, private) = keypair();
+        let t = mint(&private, &["monitor"], 3600);
+        let claims = authorise(&key, &bearer(&t), "role:monitor").expect("passes");
+        assert_eq!(claims.sub.as_deref(), Some("t"));
+    }
+
+    #[test]
+    fn authorise_reads_the_session_cookie_like_routes() {
+        let (_d, key, private) = keypair();
+        let t = mint(&private, &["monitor"], 3600);
+        let headers = vec![
+            ("cookie".to_string(), "_m6sid=abc".to_string()),
+            ("cookie".to_string(), format!("session={t}")),
+        ];
+        assert!(authorise(&key, &headers, "role:monitor").is_ok());
+    }
+}
+
+/// ES256 fixtures shared by this crate's unit tests.
+#[cfg(test)]
+pub(crate) mod test_keys {
+    use super::PublicKey;
+
+    /// A verify key on disk, plus the matching signing key.
+    pub(crate) fn keypair() -> (tempfile::TempDir, PublicKey, String) {
+        let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("ec keypair");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pub.pem");
+        std::fs::write(&path, kp.public_key_pem()).unwrap();
+        let key = PublicKey::from_pem_file(&path).unwrap();
+        (dir, key, kp.serialize_pem())
+    }
+
+    /// Mint an ES256 token with `roles`, expiring `exp_offset_s` from now.
+    pub(crate) fn mint(private_pem: &str, roles: &[&str], exp_offset_s: i64) -> String {
+        #[derive(serde::Serialize)]
+        struct C {
+            sub: String,
+            exp: i64,
+            roles: Vec<String>,
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let claims = C {
+            sub: "t".to_string(),
+            exp: now + exp_offset_s,
+            roles: roles.iter().map(|r| r.to_string()).collect(),
+        };
+        let key = jsonwebtoken::EncodingKey::from_ec_pem(private_pem.as_bytes()).unwrap();
+        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
+        jsonwebtoken::encode(&header, &claims, &key).unwrap()
+    }
+
+    pub(crate) fn bearer(token: &str) -> Vec<(String, String)> {
+        vec![("authorization".to_string(), format!("Bearer {token}"))]
     }
 }

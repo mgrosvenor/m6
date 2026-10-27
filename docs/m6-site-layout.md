@@ -33,6 +33,10 @@ Figure 1 gives the whole scheme. Take from it that no app root contains another 
 
 **Figure 1: one root per app, with m6-http given the site root.** Each app reads only the directory it is started with. `configs/` and `bin/` sit outside every app root.
 
+An app started on `apps/<app>` does not find `site.toml` by itself, because the file is two levels up.
+Each app's config therefore sets `site_toml = "../../site.toml"`, which resolves against the app root.
+Without it the app reads no `site.toml`, so the `[[backend]] compresses` agreement passes unchecked and `[log]` falls back to its defaults.
+
 Three properties follow from that shape:
 
 - each app can reach its own material and no other app's.

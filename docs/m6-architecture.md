@@ -227,7 +227,7 @@ Table 7 names what that produces.
 | `m6-html` | render HTML from templates and JSON data | behind the edge |
 | `m6-file` | serve files from the filesystem | behind the edge |
 | `m6-auth-server` | verify credentials and sign *JWTs* (*JSON Web Tokens*) | behind the edge |
-| `m6-monitor` | poll each node's health and performance endpoints and serve one report | behind the edge |
+| `m6-monitor` | poll each node's health and performance endpoints, and where configured its tunnel round trip and WireGuard handshake age, keep a size-capped history of every poll and of crawler sightings in one SQLite file, and serve one report and the history | behind the edge |
 
 **Table 7: the five serving binaries, the one job each has, and where each sits.**
 Take from it that only `m6-http` is reachable from the internet, that it is one binary running in two modes rather than two programs, and that everything else answers HTTP/1.1 on a Unix socket behind it.
@@ -235,7 +235,8 @@ Take from it that only `m6-http` is reachable from the internet, that it is one 
 Two command line tools sit outside that set and serve nothing: `m6-md` converts a directory of Markdown into one JSON file, and `m6-auth-cli` manages users and groups against the auth database.
 
 **A site is therefore data and configuration only**, which is the third constraint showing up in the filesystem: `site.toml`, one config file per backend process, templates, assets, and content as JSON.
-No binaries live in a site, because they are found through the system path, and no log directory, because every process logs to stdout for the supervisor to capture (§3.3).
+No binaries live in a site, because they are found through the system path.
+No process keeps a log directory except `m6-http`, whose analytics file is the one exception, because every other process logs to stdout for the supervisor to capture (§3.3).
 
 ---
 
@@ -270,7 +271,9 @@ Restart policy, resource limits, dependency ordering, log capture and service is
 So `m6-http` spawns nothing, monitors nothing and restarts nothing, and expects its backends to be running.
 
 Two consequences follow.
-Every process logs structured JSON to stdout and journald captures it, so a site has no log directory and no rotation of its own.
+Every process logs structured JSON to stdout and journald captures it.
+The one exception is the analytics file that `m6-http` writes.
+A site rotates that file by renaming it and sending `m6-http` SIGUSR1, and the process reopens the path.
 And a crashed backend restarts in seconds, which is what makes §4.5 affordable.
 
 ### 3.4 Why pool membership is discovered rather than declared
@@ -547,12 +550,20 @@ The install asserts the mask is already set and refuses to start otherwise, beca
 
 ## 8. Why configuration is split the way it is
 
-A site is configured by `site.toml`, one file per backend process, and one system configuration holding what differs between environments.
+Every process reads two files.
+`site.toml` holds the state every process of the site shares.
+The process config holds that process's own state.
+For m6-http the process config is the system configuration, which holds what differs between nodes and environments.
+For a backend it is the backend's own config, and the reserved key `site_toml` says where `site.toml` is.
 The split exists because an operator and a developer own different things.
 
-### 8.1 Why the system configuration holds one section and wins
+### 8.1 Why the system configuration holds node state and wins
 
-**The bind address and the TLS certificate paths are the only values that genuinely differ between environments**, so the system configuration holds that one section and nothing else, which keeps its purpose obvious.
+**The bind address and the TLS certificate paths genuinely differ between environments**, so the system configuration holds them.
+It holds the rest of a node's own state too, which means `[node]`, `[auth]` and the `[health]` access keys.
+Each of those names the node or a credential path, and none of them is shared by every node of the site.
+`site.toml` holds the state every node shares.
+m6-http warns at start when a key sits in the other file.
 It is a required argument rather than an optional one, because one code path is simpler to specify and test than a branch for whether it was supplied.
 
 **It wins on conflict so that a deploy cannot change where a server listens or which certificate it presents.**

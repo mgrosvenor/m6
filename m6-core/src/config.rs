@@ -121,6 +121,56 @@ pub struct RendererConfig {
     pub minification: MinificationConfig,
     /// Logging settings from `[log]` in the config file.
     pub log: LogConfig,
+    /// Where `site.toml` is, from the reserved key `site_toml`.
+    ///
+    /// A relative path resolves against `site_dir`. `None` means
+    /// `<site_dir>/site.toml`. See [`RendererConfig::resolve_site_toml`].
+    pub site_toml: Option<PathBuf>,
+}
+
+impl RendererConfig {
+    /// The path of `site.toml` for a process started on `site_dir`.
+    ///
+    /// No `site_toml` key gives `<site_dir>/site.toml`. An absolute value is
+    /// used as given and a relative one resolves against `site_dir`, the way
+    /// every other relative path in a process config does.
+    pub fn resolve_site_toml(&self, site_dir: &Path) -> PathBuf {
+        match &self.site_toml {
+            None => site_dir.join("site.toml"),
+            Some(p) if p.is_absolute() => p.clone(),
+            Some(p) => site_dir.join(p),
+        }
+    }
+}
+
+/// The keys whose new value a reload cannot apply, by name, for each one that
+/// differs between the running config and the one just loaded.
+///
+/// They are read once at start: the pool dimensions size threads and a queue,
+/// the read timeout and socket mode are applied to a socket as it is accepted
+/// or bound, and `site_toml` names a file the watch was built on.
+pub(crate) fn restart_only_changes(
+    old: &RendererConfig,
+    new: &RendererConfig,
+    site_dir: &Path,
+) -> Vec<&'static str> {
+    let mut changed = Vec::new();
+    if old.thread_pool.size != new.thread_pool.size {
+        changed.push("thread_pool.size");
+    }
+    if old.thread_pool.queue_size != new.thread_pool.queue_size {
+        changed.push("thread_pool.queue_size");
+    }
+    if old.server.read_timeout != new.server.read_timeout {
+        changed.push("server.read_timeout_s");
+    }
+    if old.server.socket_mode != new.server.socket_mode {
+        changed.push("server.socket_mode");
+    }
+    if old.resolve_site_toml(site_dir) != new.resolve_site_toml(site_dir) {
+        changed.push("site_toml");
+    }
+    changed
 }
 
 /// Per-MIME-type minification enable flag.
@@ -178,6 +228,7 @@ const FRAMEWORK_KEYS: &[&str] = &[
     "errors",
     "multipart",
     "flash_secret",
+    "site_toml",
 ];
 
 /// Load and merge config + optional secrets file.
@@ -461,6 +512,16 @@ fn parse_config(tv: toml::Value, _site_dir: &Path) -> anyhow::Result<RendererCon
             .map(|s| s.to_string()),
     };
 
+    // --- site_toml ---
+    let site_toml = match tv.get("site_toml") {
+        None => None,
+        Some(toml::Value::String(s)) if s.is_empty() => {
+            anyhow::bail!("site_toml must not be empty")
+        }
+        Some(toml::Value::String(s)) => Some(PathBuf::from(s)),
+        Some(v) => anyhow::bail!("site_toml must be a path string, got {v}"),
+    };
+
     Ok(RendererConfig {
         user_config,
         global_params,
@@ -477,6 +538,7 @@ fn parse_config(tv: toml::Value, _site_dir: &Path) -> anyhow::Result<RendererCon
         compression,
         minification,
         log,
+        site_toml,
     })
 }
 
@@ -630,6 +692,30 @@ mod tests {
     use tempfile::NamedTempFile;
 
     #[test]
+    fn restart_only_changes_names_each_key_that_moved() {
+        let site_dir = Path::new("/site");
+        let a = RendererConfig::default();
+        assert!(restart_only_changes(&a, &a.clone(), site_dir).is_empty());
+
+        let mut b = a.clone();
+        b.thread_pool.size += 1;
+        b.thread_pool.queue_size += 1;
+        b.server.read_timeout = Some(std::time::Duration::from_secs(9));
+        b.server.socket_mode = a.server.socket_mode ^ 0o1;
+        b.site_toml = Some(PathBuf::from("other.toml"));
+        assert_eq!(
+            restart_only_changes(&a, &b, site_dir),
+            [
+                "thread_pool.size",
+                "thread_pool.queue_size",
+                "server.read_timeout_s",
+                "server.socket_mode",
+                "site_toml"
+            ]
+        );
+    }
+
+    #[test]
     fn test_basic_config() {
         let mut f = NamedTempFile::new().unwrap();
         write!(
@@ -655,6 +741,51 @@ queue_size = 32
         assert_eq!(cfg.thread_pool.size, 4);
         assert_eq!(cfg.thread_pool.queue_size, 32);
         assert_eq!(cfg.user_config.get("site_name").unwrap(), "Test");
+    }
+
+    /// Load a config whose whole text is `body`.
+    fn load_text(body: &str) -> anyhow::Result<RendererConfig> {
+        let mut f = NamedTempFile::new().unwrap();
+        write!(f, "{body}").unwrap();
+        load(f.path(), Path::new("/tmp"))
+    }
+
+    #[test]
+    fn site_toml_absent_resolves_to_the_site_dir() {
+        let cfg = load_text("site_name = \"x\"\n").unwrap();
+        assert_eq!(cfg.site_toml, None);
+        assert_eq!(
+            cfg.resolve_site_toml(Path::new("/srv/site")),
+            PathBuf::from("/srv/site/site.toml")
+        );
+    }
+
+    #[test]
+    fn site_toml_relative_resolves_against_the_site_dir() {
+        let cfg = load_text("site_toml = \"../../site.toml\"\n").unwrap();
+        assert_eq!(
+            cfg.resolve_site_toml(Path::new("/srv/site/apps/file")),
+            PathBuf::from("/srv/site/apps/file/../../site.toml")
+        );
+        // The key is reserved, so it is not a template variable.
+        assert!(!cfg.user_config.contains_key("site_toml"));
+    }
+
+    #[test]
+    fn site_toml_absolute_is_used_as_given() {
+        let cfg = load_text("site_toml = \"/etc/m6/site.toml\"\n").unwrap();
+        assert_eq!(
+            cfg.resolve_site_toml(Path::new("/srv/site")),
+            PathBuf::from("/etc/m6/site.toml")
+        );
+    }
+
+    #[test]
+    fn a_non_string_site_toml_is_refused() {
+        let err = load_text("site_toml = 3\n").unwrap_err().to_string();
+        assert!(err.contains("site_toml must be a path string"), "{err}");
+        let err = load_text("site_toml = \"\"\n").unwrap_err().to_string();
+        assert!(err.contains("site_toml must not be empty"), "{err}");
     }
 
     /// Parse a `[server]` body, or return the refusal message.

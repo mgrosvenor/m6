@@ -1,6 +1,6 @@
 # m6-core, component reference
 
-**Status: reference. Describes the crate as it is, at 30 modules and ~13,400
+**Status: reference. Describes the crate as it is, at 37 modules and ~23,200
 lines.** Where this disagrees with the code, the code is right and this file is
 a bug.
 
@@ -35,7 +35,7 @@ The prelude is deliberately small: `App`, `Error`, `Result`, `Request`,
 `Response`, the three time and slug helpers from `util`, and `serde_json`'s
 `json!`, `Map` and `Value`. Feature-gated additions appear in it only when the
 feature is on (`Upload`, `TeraFactory`, `TeraRenderer`, `lettre`'s mail types,
-`ureq`).
+`ureq`, `rusqlite`).
 
 A service that renders no templates says so, and stops linking Tera:
 
@@ -67,6 +67,7 @@ feature is missing.
 | `csrf` | off | `Request::verify_csrf`, token generation in the request dictionary. No new dependencies. |
 | `email` | off | `lettre` in the prelude. |
 | `http-client` | off | `ureq` in the prelude. |
+| `sqlite` | off | `sqlite` module: `open`, `open_reader`, `migrate`, `append_only`, `used_bytes`, `prune_oldest`, and `rusqlite` in the prelude. Pulls rusqlite 0.31 with bundled SQLite. |
 
 `templates` is on by default on purpose, and the reason is a scar: a feature
 that hides code from `cargo test --workspace` is how two `csrf` tests stayed
@@ -74,9 +75,13 @@ broken from Phase 4 to Phase 5. chrono and lru are unconditional dependencies
 for the same reason. A binary that wants none of it sets
 `default-features = false`.
 
+The off-by-default features `sqlite`, `email` and `multipart` are invisible to
+`cargo test --workspace`. A CI step builds and tests m6-core with
+`--all-features` to cover them.
+
 ## 3. Component index
 
-Thirty modules. Grouped by what you would be doing when you reach for one.
+Thirty-seven modules. Grouped by what you would be doing when you reach for one.
 
 **Building a service**
 
@@ -85,21 +90,23 @@ Thirty modules. Grouped by what you would be doing when you reach for one.
 | `app` | The `App` builder, routing, the thread pool, the request dictionary, the service lifecycle. The largest module at ~2,700 lines. |
 | `config` | `RendererConfig` and the TOML that produces it. |
 | `server` | `UnixServer` and `serve_connection`, the socket-backend loop. |
-| `signal` | `block()`, `Service`, `ShutdownHandle`. Signal-safe shutdown. |
+| `signal` | `block()`, `Service`, `ShutdownHandle`. Signal-safe shutdown, and SIGUSR1 to reopen the log file. |
 | `render` | The `Renderer` and `RendererFactory` traits, plus `NoTemplates`. The only thing the loop needs from a template engine. |
 | `template` | The Tera implementation of those traits, and the site filters. Feature `templates`. |
-| `watcher` | `ConfigWatcher`, inotify on Linux and kqueue on the BSDs. |
+| `watcher` | `ConfigWatcher`, inotify on Linux and kqueue on the BSDs, and `ConfigReloader`, which watches a service's two files. |
 
 **Request and response**
 
 | module | what it is |
 |---|---|
+| `dict` | The request dictionary: a shared base plus a per-request overlay. |
 | `request` | `Request`, the handler's view: the dictionary, body access, file I/O helpers, query and form parsing, URL coding. |
 | `response` | `Response`, every constructor a handler needs, and `send`. |
 | `http` | `RawRequest`, `RawResponse`, `Method`, the `HeaderSource` trait, `is_same_origin_path`. |
 | `headers` | Reading and writing a header list, once. `get`, `get_all`, `combine`, `set`, `append`, `remove`. |
 | `cookie` | `Cookie` and `SameSite`. One place that says what a cookie can be. |
 | `multipart` | `Upload` and `parse_upload`. Feature `multipart`. |
+| `time_range` | `TimeRange`, the `from` and `to` of a query read as a half-open UTC range, and `rfc3339_utc_ms`. |
 
 **HTTP semantics**
 
@@ -118,7 +125,7 @@ Thirty modules. Grouped by what you would be doing when you reach for one.
 |---|---|
 | `compress` | brotli and gzip, compress and decompress. |
 | `minify` | HTML, JS, CSS, JSON. |
-| `util` | `slugify`, `now_iso8601`, `today_iso8601`, `iso8601_minutes_ago`. |
+| `util` | `slugify`, `now_iso8601`, `today_iso8601`, `iso8601_minutes_ago`, `html_escape`. |
 | `random` | `random_hex_token::<N>()`. One CSPRNG token generator, so there is never a third. |
 
 **Observability**
@@ -131,12 +138,20 @@ Thirty modules. Grouped by what you would be doing when you reach for one.
 | `host` | What the machine is doing. Load, memory, disk, thermal, net, diskstats, pressure, TCP, fds. |
 | `tls` | How long the loaded certificate has left: `not_after_unix`, `record_loaded`, `loaded`, `TlsCertificate`. |
 | `firewall` | `FirewallState` from nftables' own JSON. |
-| `ndjson` | Newline-delimited JSON, read and written, tolerant of torn lines. |
+| `wireguard` | `Handshakes` from `wg show <if> latest-handshakes` output. |
+| `ndjson` | Newline-delimited JSON, read and written, tolerant of torn lines, and served as bounded pages with a cursor. |
+
+**Storage**
+
+| module | what it is |
+|---|---|
+| `sqlite` | One SQLite file with the house settings, versioned migrations, append-only tables. Feature `sqlite`. |
 
 **Everything else**
 
 | module | what it is |
 |---|---|
+| `net` | `is_private_ip` and `bind_ip`. The one definition of a private address. |
 | `error` | `Error` and `Result`. Eighteen lines. |
 | `testkit` | The shared integration harness. Feature `testkit`. |
 
@@ -163,7 +178,8 @@ state shape once and the type carries it:
 
 The `init` closures receive the config map (`&Map<String, Value>`) and return
 `Result`, so a service that cannot build its state fails at startup rather than
-on the first request. `.on_destroy(...)` gives the global a teardown hook.
+on the first request. `.on_destroy(...)` gives the global a teardown hook, and `.on_reload(...)` a
+hook that runs after each successful reload with the new `AppContext`.
 
 **Routing.** `compile_pattern` turns `/blog/{stem}` into `Vec<Segment>`;
 `route_specificity` scores a compiled route so that a literal beats a
@@ -217,8 +233,15 @@ pub struct RendererConfig {
     pub compression:   HashMap<String, CompressionLevel>,  // per-mime brotli/gzip
     pub minification:  MinificationConfig,   // per-mime enabled, inline_js
     pub log:           LogConfig,            // level, format
+    pub site_toml:     Option<PathBuf>,      // the reserved key site_toml
 }
 ```
+
+`site_toml` names the `site.toml` this service reads.
+`RendererConfig::resolve_site_toml(site_dir)` returns the path: `<site_dir>/site.toml` when the key is absent, the value as given when it is absolute, and `site_dir` joined with it when it is relative.
+A non-string or empty value fails `config::load`.
+`AppContext::site_toml` carries the resolved path to the global initialiser, set whether or not the file exists.
+A service that names a `site_toml` that does not exist, cannot be read or is not valid TOML exits 2 at start.
 
 A `RouteConfig` carries `path`, `template`, `params`, `status`, `cache`,
 `methods` and `headers`. `MinificationConfig::is_enabled(mime)` answers the
@@ -239,9 +262,8 @@ Neither key silently falls back. A value that cannot be understood, a negative
 timeout or a mode above `0777`, fails `config::load` and the service does not
 start. A service that will not start says so on the first line of its journal;
 a service running at a socket mode nobody chose looks exactly like one running
-at the right mode. Note that `--dump-config` is m6-http only, so an App
-service's config is **not** validated at deploy time by
-`deploy-platform.sh`.
+at the right mode. An App service answers `--dump-config` too, so a deploy can
+validate its config before starting it. It exits 2 when the config is refused.
 
 ### `server`
 
@@ -274,6 +296,14 @@ the handler; it asserts the mask is set and refuses to start otherwise.
 `complete()`, `is_shutdown()` and `wait()` are the lifecycle; `is_shutdown()` is
 also re-exported from `app`.
 
+`REOPEN_SIGNAL` is SIGUSR1.
+`block()` blocks it with SIGTERM and SIGINT, and the signal thread handles it before it counts a shutdown signal, so a reopen is never a step toward a forced exit.
+The thread calls `log::reopen_log_file()` and logs what happened.
+The reopen opens the new file while holding the lock the log writer takes for every line.
+So once the path exists again no further line can reach the renamed file.
+If the open fails, the old handle stays in place, the process keeps writing to the previous file and an error is logged.
+SIGHUP stays free for a future configuration reload.
+
 ### `render` and `template`
 
 `render` is the seam, and it is 89 lines. A route that names a template
@@ -291,6 +321,22 @@ template signals a 404 from inside rendering.
 
 `ConfigWatcher::new(paths)`, `raw_fd()` to fold into an existing `poll(2)` set,
 `read_events(filenames)` to drain and report whether anything relevant changed.
+
+`ConfigReloader::new(site_toml, process, seen)` owns a `ConfigWatcher` on a
+service's two files and reports which of them changed. The loop calls
+`on_readable(now)` when `raw_fd()` is readable and `tick(now)` on every
+iteration. `tick` returns `Some(Changed { site, process })` when a report is
+due. Which file changed is decided by a `Fingerprint` (device, inode,
+length, mtime and ctime). The event name plays no part, so inotify and kqueue
+give the same answer and a file beside the config in the same directory is
+ignored. The first change after quiet is reported at once. A change within
+`RELOAD_DEBOUNCE` (20 ms) of a report is held and reported once more when the
+burst settles, capped at `RELOAD_POLL` (one second). A burst is at most two
+reports. The fingerprints are
+also compared every `RELOAD_POLL` whatever the watcher says, which finds a lost
+watch. Take a `Seen` from `Seen::read` before the first read of either file so a
+change in between is reported on the first tick. With no watcher the poll alone
+does the job. There is no thread and `tick` does not allocate.
 
 Three implementations behind `cfg`: **inotify on Linux**, kqueue on
 macOS/FreeBSD/OpenBSD, and a stub elsewhere that never reports a change. The
@@ -321,7 +367,10 @@ for when a reader may be running.
 
 Free functions, all used by the framework and all worth knowing: `parse_query_string`,
 `parse_form_body`, `url_decode`, `url_encode`, `url_encode_path`, `cookie`,
-`parse_cookies`, `parse_auth_claims`, `validate_path_param`.
+`parse_cookies`, `parse_auth_claims`, `validate_path_param`, `single_query_value`.
+
+`single_query_value(query, key)` returns the raw value of a key that may appear once: `None` when absent, `RepeatedKey` when repeated.
+`time_range`, `ndjson::Cursor` and a service's own filter parameters all read through it, so one query string follows one rule.
 
 `url_encode` exists because core could percent-decode and not encode, so callers
 wrote their own encoder. Encoding and decoding are two halves of one block.
@@ -330,7 +379,10 @@ wrote their own encoder. Encoding and decoding are two halves of one block.
 
 Constructors: `render`, `render_with`, `render_status`, `render_dict`,
 `redirect`, `redirect_permanent`, `json`, `json_status`, `html`, `text`,
-`status`, `not_found`, `forbidden`, `bad_request`.
+`status`, `not_found`, `forbidden`, `bad_request`, `refusal`.
+
+`refusal(&message)` is the 400 for a refused request parameter: the message and a newline as plain text, `no-store` and `nosniff`.
+The message must not echo client input.
 
 Builders: `body`, `with_status`, `header`, `cookie`, `flash` (feature `flash`).
 
@@ -376,6 +428,32 @@ and silently loses the other. `may_combine(name)` asks in advance.
 This does not decide policy. It makes "which of our cookies are HttpOnly?" a
 question with an answer, which it was not when four `format!` calls with
 different attribute sets were the implementation.
+
+### `time_range`
+
+`TimeRange::from_query(query, max_span)` and `TimeRange::from_request(req,
+max_span)` read `from` and `to`. `DEFAULT_MAX_SPAN` is 31 days.
+
+- Both keys are required and each may appear once. Other keys are ignored, so a
+  cursor or a filter passes through.
+- A value is RFC 3339 in UTC with an uppercase `T` and a final `Z`, such as
+  `2026-01-01T00:00:00Z`. Fractions of a second are accepted. An offset such as
+  `+10:00` is refused.
+- The range is half open, `[from, to)`. `contains(t)` is `from <= t < to`, so
+  two adjacent ranges never share a row.
+- `from` is not before 1970, `to` is later than `from`, and the span is at most
+  `max_span`.
+- `from_unix_ms`, `to_unix_ms`, `from_unix_s` and `to_unix_s` round up, so for
+  integer timestamps `from_ms <= t < to_ms` is exactly `[from, to)`.
+
+`TimeRangeError::to_response()` is a 400 in plain text with `no-store` and
+`nosniff`. It says which parameter to fix and never repeats the value the
+client sent.
+
+`rfc3339_utc_ms(unix_ms)` formats a millisecond timestamp as
+`2026-01-01T00:00:00.123Z`. It returns a value that formats when displayed, so a
+row can carry it without a `String` per line. A negative or out-of-range input
+gives the epoch.
 
 ---
 
@@ -452,6 +530,21 @@ entries for one byte-identical response.
 is a security boundary and it existed three times, with three behaviours. There
 is one now.
 
+### `net`
+
+`is_private_ip(ip)` is the one answer to "is this on a private network".
+`bind_ip(bind)` pulls the address out of `ip:port`, `[v6]:port` or a bare
+address, and gives `None` for a host name. Names are never resolved.
+
+| family | private |
+|---|---|
+| IPv4 | `127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16`, `100.64.0.0/10` |
+| IPv6 | `::1`, `fc00::/7`, `fe80::/10` |
+
+An IPv4-mapped IPv6 address is classified by its IPv4 form. `0.0.0.0` and `::`
+are not private. A check on a peer address only means something on a socket
+that faces the client directly; behind a proxy the peer is the proxy.
+
 ---
 
 ## 7. Content
@@ -462,12 +555,52 @@ is one now.
 `minify`: `minify_html(data, minify_inline_js)`, `minify_js`, `minify_css`,
 `minify_json`.
 
-`util`: `slugify`, `today_iso8601`, `now_iso8601`, `iso8601_minutes_ago`.
+`util`: `slugify`, `today_iso8601`, `now_iso8601`, `iso8601_minutes_ago`, `html_escape`.
 
 `random`: `random_hex_token::<N>()`. There were two byte-identical copies at
 two lengths. Both were correct; the hazard is the third one, written by someone
 who reaches for `rand::random()` and produces something that looks identical at
 a glance.
+
+### `sqlite`
+
+Feature `sqlite`. Re-exports `rusqlite`. `open(path)` opens one database file
+with the settings in Table 7.1. `migrate(&mut conn, &[Migration])` applies a
+versioned list kept in `PRAGMA user_version`, and `schema_version` reads it.
+`append_only(&conn, table)` adds triggers that refuse UPDATE and DELETE, and
+`is_append_only` reports them. `used_bytes` and `prune_oldest` keep a table
+under a size cap. The cap counts the whole file, and `prune_oldest` returns
+`Pruned { rows_deleted, cap_met }`. `OpenOptions` changes the busy timeout, the journal mode
+(`Journal::Rollback` or `Journal::Wal`) and foreign keys.
+`open_reader(path)` opens an existing file read-only with the busy timeout and nothing else, for a reader beside the writer.
+
+| setting | value | reason |
+|---|---|---|
+| `journal_mode` | `DELETE` | The database is one file at rest. WAL leaves `-wal` and `-shm` beside it, and a copy of the main file alone can miss committed work. |
+| `busy_timeout` | 5 s | A second connection waits for a lock instead of failing with `SQLITE_BUSY`. Set explicitly, because rusqlite documents its own default as subject to change. |
+| `foreign_keys` | on | SQLite has them off in every new connection. The value is read back. |
+| `recursive_triggers` | on | `INSERT OR REPLACE` fires DELETE triggers only with this on, so the append-only rule needs it. |
+
+*Table 7.1: the settings `open` applies, and why. Each is read back, and a
+setting that does not take effect is an error.*
+
+**Migrations** number 1, 2, 3 in order, and the list is checked before anything
+runs. Each runs in its own `BEGIN IMMEDIATE` transaction with the version
+re-read inside it, so connections that open at once apply each migration once.
+A failing migration rolls back. A file newer than the list is refused with
+`NewerThanCode`, before the first migration and again inside each transaction.
+`migrate` switches `foreign_keys` off before each migration, so a migration can
+rebuild a table that others point at. It runs `PRAGMA foreign_key_check` before
+the commit, rolls back with `ForeignKeyCheck` on any dangling row, and restores
+the setting afterwards. A released migration is never edited. Use one journal
+mode for every connection to a file, because SQLite cannot leave WAL while
+another connection is using it.
+
+**Append-only** triggers are named `<table>_append_only_update` and
+`<table>_append_only_delete`. Call `append_only` after `migrate` on every open,
+and it restores triggers that were dropped. The triggers guard against mistakes
+in code. Anyone who can write the file can drop them. A table that is pruned
+must not be append-only.
 
 ---
 
@@ -477,11 +610,19 @@ a glance.
 
 `init(format, level)` and `init_with_analytics(format, level, analytics_path)`
 return a `LogHandle`, whose `reload(format, level)` re-reads on config change.
-`read_site_log_config(site_dir)` and `parse_level(s)` are the config side.
+`read_site_log_config(site_toml)` and `parse_level(s)` are the config side. `read_site_log_config` takes the path of the file, which `RendererConfig::resolve_site_toml` gives.
 
 `pulse() -> &'static LogPulse` is the liveness signal: `events()` counts, and
 `seconds_since_last()` answers "has anything been logged recently", which is how
 a silent log becomes a fault rather than a zero.
+
+`reopen_log_file() -> Reopened` reopens the analytics file at the absolute path it was opened with.
+`reopens() -> &'static ReopenRecord` answers how many reopens succeeded and failed, and how long ago the last of each was.
+`writes_log_file()` says whether this process has a file to reopen.
+`newest_rotated(live)` finds the newest rotated sibling of a log file, plain or gzip.
+`read_tail(path, max_bytes)` reads the end of one file.
+`read_recent(live, max_bytes, since)` reads the live file and, when it adds history, the newest rotated sibling before it.
+`read_recent_counted` does the same and also returns what the read cost.
 
 ### `telemetry`
 
@@ -534,10 +675,21 @@ the entire point of having edges.
 `PerfReport::build(...)`, `PerfOutcome`, `metrics_authorised(...)`,
 `is_monitoring_endpoint(backend)`, `HEALTH_BACKEND`, `PERF_BACKEND`.
 
+A caller with its own gate uses two more pieces.
+`PerfAccess::refusal()` returns the legacy bearer gate's verdict: `Some(Disabled)` with no token configured, `Some(Unauthorised)` for a wrong one, `None` to pass.
+`PerfReport::build_authorised(subject, snapshot)` builds the report with no access check, for a caller that has already authorised the request.
+`PerfOutcome::Forbidden` answers 403 `{"error":"forbidden"}` with no `WWW-Authenticate`, for a valid token that lacks the required claim.
+m6-http uses these for `[health] metrics_require` and `metrics_peers`, described in `docs/m6-http.md`.
+
 `PerfReport.tls` carries the served certificate chain and how long each
 certificate has left, from `tls::loaded()`. It is `serde(default)`, so a node
 older than the field stays parseable to an aggregator rather than making the
 whole payload unreadable, which is the treatment `build` already gets.
+
+`PerfReport.logging` carries `LoggingHealth`, which is also on `/traffic`.
+Its `reopen` field is a `LogReopenHealth`: reopens and failures since start, the age of the last reopen, its unix time and the age of the last failure.
+`reopen` is `None` for a process that writes no log file, and `seconds_since_last_reopen` is `None` until the first reopen.
+Both are `serde(default)`, so a node older than the fields still parses.
 
 `TrafficReport::build(node, ndjson, since, window_minutes)` is the `/traffic`
 endpoint: the node does the analysis and the log stays put. `LoggingHealth::read()`
@@ -613,7 +765,7 @@ disk work.
 | a chain, leaf first | `depth` 0 is what an *ACME* client renews, and intermediates expire too. A chain is good until its soonest expiry |
 | `expires_in_seconds` goes negative | how long ago separates a renewal that failed last night from one that stopped running in March |
 | an unreadable certificate is returned, not recorded | rustls accepted it or there would be no server, so refusing to serve is the worse failure. A reported absence lets a monitor say "cannot say" |
-| a later `record_loaded` replaces the earlier one | so a reload can correct it. **No caller does this yet**: `handle_tls_reload` rebuilds the quiche config alone, so the registry holds the startup chain, which is what h1 and h2 serve and is stale for h3. m6 #210 |
+| a later `record_loaded` replaces the earlier one | so a reload corrects it. `m6-http`'s `handle_tls_reload` records after the new material is installed on both the rustls listener and the quiche configuration, so the registry holds what every protocol serves and a failed build leaves the previous chain recorded. Until m6 #210 a reload rebuilt the quiche configuration alone and recorded nothing, so the number was correct for h1 and h2 and stale for h3 |
 
 The last two rows are the ones to keep: an absence and a measured number must
 not look alike, and a stale number is worse than either.
@@ -647,6 +799,21 @@ It reports the deliberate blocks and whether they are still being hit. It does
 not report "180 packets from 10 sources", which never changed and never prompted
 an action.
 
+### `wireguard`
+
+`Handshakes::parse_latest_handshakes(text)`, `from_file(path)`, `find(key)`, and `PeerHandshake`.
+
+It reads a file because WireGuard state needs `CAP_NET_ADMIN`.
+A systemd timer writes the output of `wg show <if> latest-handshakes`, and m6 reads it as ordinary data.
+A time of 0 means the peer never completed a handshake.
+A missing file is `Ok(None)`, and a malformed line is an error naming the line.
+
+Do not use `wg show <if> dump`, because it carries the interface private key.
+
+The time is the last successful handshake.
+After a key changes under a tunnel it stops moving, and it still looks recent for minutes.
+An age is therefore the slow signal, and a probe over the tunnel is the fast one.
+
 ### `ndjson`
 
 `read_str(text)`, `Reader::new(r)` with `skipped()` and `read_count()`,
@@ -656,6 +823,33 @@ an action.
 appended to while it is read, so the last line can be half-written and a reader
 that fails the whole stream on one bad line fails whenever it reads during a
 write. Readers skip what they cannot parse; `skipped()` is how you find out.
+
+**Pages for responses.** A service that answers with rows builds a `Page` from
+`PageLimits` and calls `push(&row)` for each row. A row must serialise to a JSON
+object. `push` returns `Pushed::Full`, without writing, when the row would pass
+the byte or row limit. The service then makes a `Cursor` from the key of that
+row and calls `page.into_response(req.query(), next.as_ref())`.
+
+- The defaults are 4 MiB and 10,000 rows (`DEFAULT_PAGE_BYTES`,
+  `DEFAULT_PAGE_ROWS`). `PageLimits::new` clamps the bytes to at most
+  `MAX_PAGE_BYTES`, 64 MiB.
+- That maximum is half of the 128 MiB that m6-http will buffer from a backend.
+  m6-http holds every backend body in memory, so a page is one complete response
+  body that is sent whole. A test in m6-http keeps the maximum under that cap.
+- The first row of a page is kept even when it is bigger than `max_bytes`, so a
+  client can always make progress. A row bigger than `MAX_PAGE_BYTES` is an
+  `InvalidData` error.
+- The response is 200 with `Content-Type: application/x-ndjson`, `no-store` and
+  `nosniff`. It is framed with `Content-Length`, has no ETag and is not
+  compressed.
+- With a next cursor, the response has `Link: <?QUERY>; rel="next"`. QUERY is the
+  request's query with any `cursor` removed and the new one added, and bytes
+  outside the URI query set are percent-encoded. A client follows the link until
+  a response has none.
+- `Cursor::new(s)` takes 1 to 128 bytes of `A-Za-z0-9-._~`, so it needs no
+  encoding. `Cursor::from_query(query)` gives `None` when the key is absent, and
+  a `CursorError` when it is repeated, empty or malformed. `to_response()` is a
+  400 that does not repeat the value.
 
 ---
 
@@ -677,7 +871,7 @@ links it.
 - `testkit::port::claim_port() -> PortClaim`, which holds the port until dropped
   so two tests cannot race for it.
 - `testkit::wait`: `for_path`, `for_tcp`, `for_unix`, `until`. 25 ms poll.
-- `testkit::paths::binary(name)` resolves a built binary.
+- `testkit::paths::binary(name)` builds the release binary from the current source, once per name per test process, and returns its path.
 - `testkit::response::read_one(r, method)` reads exactly one response, HEAD
   included.
 
@@ -691,12 +885,6 @@ brochure.
 - **`FrameworkState::build_dict` is private.** Twelve ordered steps of real
   knowledge that a service not using `App` cannot reach. This is the open
   "header to dict" item.
-- **Seventeen of thirty modules have no module-level doc comment**: `app` has a
-  one-line stub, and `compress`, `config`, `error`, `http`, `log`, `mime`,
-  `minify`, `multipart`, `parse`, `path`, `request`, `response`, `server`,
-  `signal`, `template`, `util` and `watcher` have none. The thirteen that do are
-  the best documentation in the repository, which makes the gap sharper rather
-  than softer.
 - **`h1`'s module doc calls `parse.rs` "(deleted)".** The file exists and is on
   the production path of every socket backend. What was deleted is the parser
   that used to be in it; it is now the stream adapter described in §6.
