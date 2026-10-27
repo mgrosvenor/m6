@@ -92,6 +92,11 @@ pub struct ServerConfig {
     /// `h2c_bind`. Read at startup; a change needs a restart.
     #[serde(default)]
     pub internal_binds: Vec<String>,
+    /// The peers the internal h2c listener accepts, canonical. Filled by
+    /// `load` from `[server] internal_peers`; empty when no listener is
+    /// internal. Read at startup; a change needs a restart.
+    #[serde(default)]
+    pub internal_peers: Vec<std::net::IpAddr>,
     /// Run this process as a plain-HTTP redirector on this address instead of
     /// a normal server: every request is answered 301 to `https://<Host><path>`.
     ///
@@ -685,6 +690,7 @@ struct RawServerSection {
     backend_timeout_secs: Option<u64>,
     h2c_bind: Option<String>,
     internal_binds: Option<Vec<String>>,
+    internal_peers: Option<Vec<String>>,
     redirect_bind: Option<String>,
     allowed_methods: Option<Vec<String>>,
 }
@@ -719,37 +725,53 @@ struct RawSystemHealth {
     metrics_token_file: Option<String>,
 }
 
-/// Parse `[health] metrics_peers` into canonical addresses.
+/// Parse a list of peer addresses into canonical form.
 ///
 /// Only an IP literal in a local range is accepted. A name is never resolved,
 /// a range is not a peer, and a public or wildcard address could never be a
-/// private monitor, so each is a load error.
+/// private peer, so each is a load error. `key` names the setting in the
+/// messages, `role` says what the entry is, and `empty_hint` says what to do
+/// about an empty list.
+fn parse_local_peers(
+    key: &str,
+    role: &str,
+    empty_hint: &str,
+    peers: &[String],
+) -> anyhow::Result<Vec<std::net::IpAddr>> {
+    if peers.is_empty() {
+        anyhow::bail!("config error: {key} is empty; {empty_hint}");
+    }
+    let mut ips = Vec::with_capacity(peers.len());
+    for e in peers {
+        let ip: std::net::IpAddr = e.parse().map_err(|_| {
+            anyhow::anyhow!(
+                "config error: {key} entry \"{e}\" is not an IP address such as \"10.0.0.5\" or \"fd00::5\"; names are never resolved and ranges are not accepted"
+            )
+        })?;
+        if !m6_core::net::is_private_ip(ip) {
+            anyhow::bail!(
+                "config error: {key} entry \"{e}\" is not in a local range; {role} must be a loopback, private (RFC 1918), link-local, shared (100.64.0.0/10) or IPv6 unique-local address"
+            );
+        }
+        ips.push(ip.to_canonical());
+    }
+    Ok(ips)
+}
+
+/// Parse `[health] metrics_peers` into canonical addresses.
 fn validate_metrics_peers(
     peers: Option<&[String]>,
 ) -> anyhow::Result<Option<Vec<std::net::IpAddr>>> {
     let Some(peers) = peers else {
         return Ok(None);
     };
-    if peers.is_empty() {
-        anyhow::bail!(
-            "config error: [health].metrics_peers is empty; list the peers allowed to read /perf and /traffic, or remove the key"
-        );
-    }
-    let mut ips = Vec::with_capacity(peers.len());
-    for e in peers {
-        let ip: std::net::IpAddr = e.parse().map_err(|_| {
-            anyhow::anyhow!(
-                "config error: [health].metrics_peers entry \"{e}\" is not an IP address such as \"10.0.0.5\" or \"fd00::5\"; names are never resolved and ranges are not accepted"
-            )
-        })?;
-        if !m6_core::net::is_private_ip(ip) {
-            anyhow::bail!(
-                "config error: [health].metrics_peers entry \"{e}\" is not in a local range; a metrics peer must be a loopback, private (RFC 1918), link-local, shared (100.64.0.0/10) or IPv6 unique-local address"
-            );
-        }
-        ips.push(ip.to_canonical());
-    }
-    Ok(Some(ips))
+    parse_local_peers(
+        "[health].metrics_peers",
+        "a metrics peer",
+        "list the peers allowed to read /perf and /traffic, or remove the key",
+        peers,
+    )
+    .map(Some)
 }
 
 // ── Loading ─────────────────────────────────────────────────────────────────
@@ -802,6 +824,33 @@ fn validate_internal_binds(
         }
     }
     Ok(())
+}
+
+/// Check `[server] internal_peers` against the listeners that are internal.
+///
+/// A listener that is internal believes the client address its peer forwards,
+/// so it must say which peers it accepts. The key is required then, and
+/// refused when no listener is internal because it would do nothing.
+/// `internal_binds` is already validated, so a non-empty list names `h2c_bind`.
+fn validate_internal_peers(
+    internal_peers: Option<&[String]>,
+    internal_binds: &[String],
+) -> anyhow::Result<Vec<std::net::IpAddr>> {
+    match (internal_binds.first(), internal_peers) {
+        (None, None) => Ok(Vec::new()),
+        (None, Some(_)) => anyhow::bail!(
+            "config error: [server].internal_peers is set but no listener is internal; remove it, or name the h2c listener in [server].internal_binds"
+        ),
+        (Some(b), None) => anyhow::bail!(
+            "config error: [server].internal_binds names \"{b}\" but [server].internal_peers is not set. An internal listener believes the client address a peer forwards, so it accepts only the peers it names. Add internal_peers = [\"<peer IP>\", ...] with the address each cache node connects from; any other peer is refused"
+        ),
+        (Some(_), Some(peers)) => parse_local_peers(
+            "[server].internal_peers",
+            "an internal peer",
+            "list the peers allowed to connect to the internal h2c listener, or set internal_binds = [] to make the listener public",
+            peers,
+        ),
+    }
 }
 
 /// Whether `site.toml` and the system config are one file (one-file mode, as a
@@ -858,6 +907,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         backend_timeout_secs: None,
         h2c_bind: None,
         internal_binds: None,
+        internal_peers: None,
         redirect_bind: None,
         allowed_methods: None,
     });
@@ -869,6 +919,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         backend_timeout_secs: None,
         h2c_bind: None,
         internal_binds: None,
+        internal_peers: None,
         redirect_bind: None,
         allowed_methods: None,
     });
@@ -915,6 +966,12 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         validate_internal_binds(internal_binds.as_deref(), &bind, h2c_bind.as_deref())?;
     }
     let internal_binds = internal_binds.unwrap_or_default();
+    let internal_peers = sys_server.internal_peers.or(site_server.internal_peers);
+    let internal_peers = if redirect_bind.is_none() {
+        validate_internal_peers(internal_peers.as_deref(), &internal_binds)?
+    } else {
+        Vec::new()
+    };
 
     // Resolve TLS cert/key paths relative to site_dir if not absolute.
     let tls_cert_path = tls_cert.as_deref().map(|c| resolve_path(site_dir, c));
@@ -954,6 +1011,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         backend_timeout_secs,
         h2c_bind,
         internal_binds,
+        internal_peers,
         warm_on_start,
         redirect_bind: redirect_bind.clone(),
         // Uppercased once at load so the hot-path check is a plain comparison
@@ -1228,6 +1286,7 @@ const NODE_SERVER_KEYS: &[&str] = &[
     "tls_key",
     "h2c_bind",
     "internal_binds",
+    "internal_peers",
     "redirect_bind",
     "warm_on_start",
 ];
@@ -1936,7 +1995,7 @@ backend_timeout_secs = 120
     #[test]
     fn a_declared_h2c_bind_is_internal_and_the_tls_bind_is_not() {
         let cfg = load_with_system_server(
-            "h2c_bind = \"127.0.0.1:18080\"\ninternal_binds = [\"127.0.0.1:18080\"]\n",
+            "h2c_bind = \"127.0.0.1:18080\"\ninternal_binds = [\"127.0.0.1:18080\"]\ninternal_peers = [\"127.0.0.1\"]\n",
         )
         .unwrap();
         assert!(cfg.server.is_internal("127.0.0.1:18080"));
@@ -1984,12 +2043,12 @@ backend_timeout_secs = 120
     #[test]
     fn ipv6_internal_bindings_match_as_socket_addresses() {
         let cfg = load_with_system_server(
-            "h2c_bind = \"[::1]:8080\"\ninternal_binds = [\"[0:0:0:0:0:0:0:1]:8080\"]\n",
+            "h2c_bind = \"[::1]:8080\"\ninternal_binds = [\"[0:0:0:0:0:0:0:1]:8080\"]\ninternal_peers = [\"127.0.0.1\"]\n",
         )
         .unwrap();
         assert!(cfg.server.is_internal("[::1]:8080"));
         let cfg = load_with_system_server(
-            "h2c_bind = \"[fd00::1]:80\"\ninternal_binds = [\"[fd00::1]:80\"]\n",
+            "h2c_bind = \"[fd00::1]:80\"\ninternal_binds = [\"[fd00::1]:80\"]\ninternal_peers = [\"127.0.0.1\"]\n",
         )
         .unwrap();
         assert!(cfg.server.is_internal("[fd00::1]:80"));
@@ -2006,7 +2065,7 @@ backend_timeout_secs = 120
         );
         write_file(dir.path(), "site.toml", &site);
         let mut sys = minimal_system_toml();
-        sys.push_str("h2c_bind = \"127.0.0.1:18080\"\ninternal_binds = [\"127.0.0.1:18080\"]\n");
+        sys.push_str("h2c_bind = \"127.0.0.1:18080\"\ninternal_binds = [\"127.0.0.1:18080\"]\ninternal_peers = [\"127.0.0.1\"]\n");
         write_file(dir.path(), "system.toml", &sys);
         let cfg = load(dir.path(), &dir.path().join("system.toml")).unwrap();
         assert!(cfg.server.is_internal("127.0.0.1:18080"));
@@ -2030,6 +2089,126 @@ internal_binds = ["203.0.113.7:80"]
         write_file(dir.path(), "system.toml", "");
         let cfg = load(dir.path(), &dir.path().join("system.toml")).unwrap();
         assert_eq!(cfg.server.redirect_bind.as_deref(), Some("0.0.0.0:80"));
+    }
+
+    // ── [server] internal_peers ─────────────────────────────────────────────
+
+    /// An internal h2c listener, so `internal_peers` is in play.
+    const INTERNAL_H2C: &str =
+        "h2c_bind = \"127.0.0.1:18080\"\ninternal_binds = [\"127.0.0.1:18080\"]\n";
+
+    #[test]
+    fn internal_peers_are_required_when_a_listener_is_internal() {
+        let e = load_error(INTERNAL_H2C);
+        assert!(e.starts_with("config error:"), "{e}");
+        assert!(e.contains("[server].internal_peers is not set"), "{e}");
+        assert!(e.contains("127.0.0.1:18080"), "{e}");
+    }
+
+    #[test]
+    fn internal_peers_without_an_internal_listener_is_refused() {
+        let with_public_h2c =
+            "h2c_bind = \"127.0.0.1:18080\"\ninternal_binds = []\ninternal_peers = [\"127.0.0.1\"]\n";
+        for extra in [with_public_h2c, "internal_peers = [\"127.0.0.1\"]\n"] {
+            let e = load_error(extra);
+            assert!(
+                e.contains("[server].internal_peers is set but no listener is internal"),
+                "{extra}: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn internal_peers_must_not_be_empty() {
+        let e = load_error(&format!("{INTERNAL_H2C}internal_peers = []\n"));
+        assert!(e.contains("[server].internal_peers is empty"), "{e}");
+        assert!(e.contains("internal_binds = []"), "{e}");
+    }
+
+    #[test]
+    fn an_internal_peer_must_be_an_ip() {
+        for entry in ["localhost", "10.0.0.0/24", "10.0.0.2:80"] {
+            let e = load_error(&format!("{INTERNAL_H2C}internal_peers = [\"{entry}\"]\n"));
+            assert!(
+                e.contains(&format!(
+                    "[server].internal_peers entry \"{entry}\" is not an IP address"
+                )),
+                "{entry}: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_internal_peer_must_be_in_a_local_range() {
+        for entry in ["203.0.113.7", "0.0.0.0", "::"] {
+            let e = load_error(&format!("{INTERNAL_H2C}internal_peers = [\"{entry}\"]\n"));
+            assert!(
+                e.contains(&format!(
+                    "[server].internal_peers entry \"{entry}\" is not in a local range"
+                )),
+                "{entry}: {e}"
+            );
+            assert!(
+                e.contains("an internal peer must be a loopback"),
+                "{entry}: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn internal_peers_are_stored_canonical() {
+        let cfg = load_with_system_server(&format!(
+            "{INTERNAL_H2C}internal_peers = [\"::ffff:10.0.0.2\", \"fd00::5\"]\n"
+        ))
+        .unwrap();
+        let want: Vec<std::net::IpAddr> =
+            vec!["10.0.0.2".parse().unwrap(), "fd00::5".parse().unwrap()];
+        assert_eq!(cfg.server.internal_peers, want);
+    }
+
+    #[test]
+    fn no_internal_listener_means_no_internal_peers() {
+        let cfg = load_with_system_server("").unwrap();
+        assert!(cfg.server.internal_peers.is_empty());
+    }
+
+    #[test]
+    fn system_internal_peers_replace_site_internal_peers() {
+        let dir = make_test_dir();
+        setup_minimal(dir.path());
+        let mut site = minimal_site_toml();
+        site = site.replace(
+            "tls_key  = \"key.pem\"\n",
+            "tls_key  = \"key.pem\"\ninternal_peers = [\"10.0.0.9\"]\n",
+        );
+        write_file(dir.path(), "site.toml", &site);
+        let mut sys = minimal_system_toml();
+        sys.push_str(INTERNAL_H2C);
+        sys.push_str("internal_peers = [\"127.0.0.1\"]\n");
+        write_file(dir.path(), "system.toml", &sys);
+        let cfg = load(dir.path(), &dir.path().join("system.toml")).unwrap();
+        let want: Vec<std::net::IpAddr> = vec!["127.0.0.1".parse().unwrap()];
+        assert_eq!(cfg.server.internal_peers, want);
+    }
+
+    #[test]
+    fn redirect_mode_ignores_internal_peers() {
+        let dir = make_test_dir();
+        write_file(
+            dir.path(),
+            "site.toml",
+            r#"
+[site]
+name   = "Test"
+domain = "test.example.com"
+[server]
+redirect_bind = "0.0.0.0:80"
+internal_peers = ["203.0.113.7"]
+"#,
+        );
+        write_file(dir.path(), "system.toml", "");
+        let cfg = load(dir.path(), &dir.path().join("system.toml")).unwrap();
+        assert!(cfg.server.internal_peers.is_empty());
     }
 
     /// Load with `site_extra` appended to site.toml and `sys_extra` appended
@@ -2413,6 +2592,7 @@ internal_binds = ["203.0.113.7:80"]
                 "bind",
                 "h2c_bind",
                 "internal_binds",
+                "internal_peers",
                 "redirect_bind",
                 "tls_cert",
                 "tls_key",
@@ -2426,7 +2606,7 @@ internal_binds = ["203.0.113.7:80"]
             ["metrics_peers", "metrics_require", "metrics_token_file"]
         );
         assert_eq!(NODE_SECTIONS, ["auth", "node"]);
-        assert_eq!(all.len(), 9 + 3 + 2);
+        assert_eq!(all.len(), 10 + 3 + 2);
         for (section, key, belongs_in_system) in all {
             let body = match key {
                 Some(k) => format!("[{section}]\n{k} = 1\n"),
