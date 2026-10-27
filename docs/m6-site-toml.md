@@ -174,6 +174,7 @@ Its `[server]` keys win on conflict, and so do its two `[health]` keys.
 A system-config `[auth] public_key` must be an absolute path, because a relative path would resolve against the site directory.
 Any other key in the system config is ignored with a warning, and any other `[health]` key there fails to parse.
 Validation runs after merge.
+When both arguments name the same file, as a development script may do, the file is read once and its `[auth]` and `[health]` are not a second declaration.
 A system config edit takes effect on restart or on the next `site.toml` reload.
 
 **`site.toml` — in version control:**

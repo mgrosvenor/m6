@@ -699,7 +699,11 @@ struct RawSystemToml {
     auth: Option<AuthConfig>,
     /// Only the access keys: a node's own credentials and peers belong to the
     /// node, not to the site that is shipped to every node.
-    health: Option<RawSystemHealth>,
+    /// Kept as a raw value so a site.toml passed as its own system config
+    /// (one file for both, as a development script does) is not rejected for
+    /// the `[health]` keys only site.toml may carry. It is parsed strictly
+    /// into `RawSystemHealth` when the two files differ.
+    health: Option<toml::Value>,
 }
 
 /// The `[health]` keys the system config may carry. Anything else fails to
@@ -806,8 +810,27 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
 
     let system_raw = std::fs::read_to_string(system_config_path)
         .with_context(|| format!("reading {}", system_config_path.display()))?;
-    let system_parsed: RawSystemToml = toml::from_str(&system_raw)
+    let mut system_parsed: RawSystemToml = toml::from_str(&system_raw)
         .with_context(|| format!("parsing {}", system_config_path.display()))?;
+    // One file given as both site.toml and the system config is read once:
+    // its [auth] and [health] are site.toml's, not a second declaration.
+    let one_file = match (
+        std::fs::canonicalize(&site_toml_path),
+        std::fs::canonicalize(system_config_path),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    };
+    if one_file {
+        system_parsed.auth = None;
+        system_parsed.health = None;
+    }
+    let system_health: Option<RawSystemHealth> = system_parsed
+        .health
+        .take()
+        .map(|v| v.try_into())
+        .transpose()
+        .with_context(|| format!("parsing [health] in {}", system_config_path.display()))?;
 
     // Warn on unexpected sections in system config (we only check for unknown
     // top-level keys by seeing if extra keys exist; toml parsing uses deny_unknown_fields
@@ -954,7 +977,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
             .filter(|t| !t.is_empty());
     }
     // The system config wins key by key, as [server] keys do.
-    if let Some(sys) = system_parsed.health {
+    if let Some(sys) = system_health {
         health.metrics_require = sys.metrics_require.or(health.metrics_require);
         health.metrics_peers = sys.metrics_peers.or(health.metrics_peers);
     }
@@ -2089,5 +2112,20 @@ internal_binds = ["203.0.113.7:80"]
         assert_eq!(h.metrics_require, None);
         assert_eq!(h.metrics_peers, None);
         assert!(h.metrics_peer_ips.is_empty());
+    }
+
+    #[test]
+    fn one_file_given_as_both_is_read_once() {
+        let dir = make_test_dir();
+        setup_minimal(dir.path());
+        write_file(dir.path(), "auth.pem", "dummy");
+        let mut site = minimal_site_toml();
+        site.push_str("\n[auth]\npublic_key = \"auth.pem\"\n\n[health]\nperf_path = \"/p\"\nmetrics_peers = [\"10.0.0.5\"]\n");
+        write_file(dir.path(), "site.toml", &site);
+        let same = dir.path().join("site.toml");
+        let cfg = load(dir.path(), &same).expect("one file for both loads");
+        assert_eq!(cfg.auth.expect("auth").public_key, "auth.pem");
+        assert_eq!(cfg.health.perf_path, "/p");
+        assert_eq!(cfg.health.metrics_peer_ips.len(), 1);
     }
 }
