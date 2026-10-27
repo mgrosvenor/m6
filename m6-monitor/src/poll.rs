@@ -279,6 +279,9 @@ pub fn node(
             Ok(t) => reading.traffic = Some(t),
             Err(e) => reading.traffic_error = Some(format!("unparseable: {e}")),
         },
+        Ok((401, _)) => {
+            reading.traffic_error = Some("401: token rejected by this node".to_string())
+        }
         Ok((403, _)) => {
             reading.traffic_error = Some("403: token lacks the required role".to_string())
         }
@@ -518,6 +521,24 @@ mod tests {
         assert_eq!(
             r.traffic_error.as_deref(),
             Some("403: token lacks the required role")
+        );
+    }
+
+    #[test]
+    fn a_401_says_the_token_was_rejected_for_perf_and_traffic() {
+        let (public, public_seen) = serve(1, |_| (200, r#"{"status":"ok","node":"origin"}"#));
+        let (tunnel, tunnel_seen) = serve(2, |_| (401, r#"{"error":"unauthorized"}"#));
+        let n = tunnel_node(public, tunnel);
+        let r = node(&n, Some("tok"), Duration::from_secs(5), &[]);
+        public_seen.join().unwrap();
+        tunnel_seen.join().unwrap();
+        assert_eq!(
+            r.perf_error.as_deref(),
+            Some("401: token rejected by this node")
+        );
+        assert_eq!(
+            r.traffic_error.as_deref(),
+            Some("401: token rejected by this node")
         );
     }
 }
