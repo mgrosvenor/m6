@@ -134,9 +134,11 @@
 //!
 //! The reader opens its own read-only connection and reads a whole page inside
 //! one read transaction, so a prune that commits meanwhile cannot leave a row
-//! without its channels, interfaces or findings. It copies the rows out and
-//! closes the connection before it serialises. The file uses a rollback
-//! journal, so the writer waits for the page's reads to end, up to its busy
+//! without its channels, interfaces or findings. It reads 256 rows at a time,
+//! each with its children, and writes them into the page until the page is
+//! full or the range ends. A page of 4 MiB usually fills after 1,500 to 4,000
+//! rows, so the rest of the range is not read. The file uses a rollback
+//! journal, so the writer waits for the transaction to end, up to its busy
 //! timeout of 5 seconds. A write that waits longer fails and that poll is not
 //! stored.
 //!
@@ -1788,6 +1790,69 @@ pub fn crawl_page(
     Ok(out)
 }
 
+/// Why [`fill_page`] failed.
+#[derive(Debug)]
+pub enum PageError {
+    /// The database could not be read. The service answers 503.
+    Db(rusqlite::Error),
+    /// A row could not be written into the page.
+    Build(anyhow::Error),
+}
+
+impl From<rusqlite::Error> for PageError {
+    fn from(e: rusqlite::Error) -> Self {
+        Self::Db(e)
+    }
+}
+
+/// Rows read from the database at a time while a page fills.
+pub const CHUNK_ROWS: usize = 256;
+
+/// Fill one page from `read`, and return it with the cursor of the next page.
+///
+/// All reads run in one read transaction. The rows come [`CHUNK_ROWS`] at a
+/// time, each chunk with its children, and go into the page until it says it
+/// is full or the range ends. A page of 4 MiB usually fills after a few
+/// thousand rows, so the rest of the range is never read.
+///
+/// Each read asks for one row more than a chunk. The extra row starts the next
+/// chunk, and when the page fills on it, it is where the next page starts.
+pub fn fill_page<T: Keyed>(
+    conn: &Connection,
+    range: (i64, i64),
+    node: Option<i64>,
+    mut after: Option<(i64, i64)>,
+    limits: m6_core::ndjson::PageLimits,
+    mut read: impl FnMut(
+        &Connection,
+        i64,
+        i64,
+        Option<i64>,
+        Option<(i64, i64)>,
+        usize,
+    ) -> rusqlite::Result<Vec<T>>,
+) -> Result<(m6_core::ndjson::Page, Option<m6_core::ndjson::Cursor>), PageError> {
+    use m6_core::ndjson::{Cursor, Page, Pushed};
+    let build = |e: std::io::Error| PageError::Build(anyhow::Error::from(e));
+    let _snapshot = snapshot(conn)?;
+    let mut page = Page::new(limits);
+    loop {
+        let rows = read(conn, range.0, range.1, node, after, CHUNK_ROWS + 1)?;
+        for r in rows.iter().take(CHUNK_ROWS) {
+            if page.push(r).map_err(build)? == Pushed::Full {
+                let (at_ms, id) = r.key();
+                let next = Cursor::new(cursor_text(at_ms, id))
+                    .map_err(|e| PageError::Build(anyhow::Error::from(e)))?;
+                return Ok((page, Some(next)));
+            }
+        }
+        match rows.get(CHUNK_ROWS) {
+            Some(start) => after = Some(start.key()),
+            None => return Ok((page, None)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2434,7 +2499,7 @@ mod tests {
     }
 
     #[test]
-    fn a_page_does_not_hold_the_lock_while_serialising() {
+    fn a_page_read_releases_the_lock_when_it_returns() {
         let dir = tempfile::tempdir().unwrap();
         let mut s = open(dir.path());
         fill(&mut s, 3);
@@ -2868,5 +2933,89 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status.len(), 2);
         assert_eq!(rows[0].crawlers.len(), 1);
+    }
+
+    /// Follow every cursor of a `/history` feed and return the rows of each
+    /// page and the rows the database was asked for.
+    fn walk(
+        conn: &Connection,
+        node: Option<i64>,
+        limits: m6_core::ndjson::PageLimits,
+    ) -> (Vec<usize>, usize) {
+        let mut asked = 0;
+        let mut after = None;
+        let mut pages = Vec::new();
+        loop {
+            let (page, next) = fill_page(
+                conn,
+                (T0, T0 + 10_000_000),
+                node,
+                after,
+                limits,
+                |c, f, t, n, a, rows| {
+                    let r = health_page(c, f, t, n, a, rows);
+                    asked += r.as_ref().map_or(0, Vec::len);
+                    r
+                },
+            )
+            .ok()
+            .unwrap();
+            pages.push(page.rows());
+            match next {
+                Some(c) => after = Some(parse_cursor(c.as_str()).unwrap()),
+                None => return (pages, asked),
+            }
+        }
+    }
+
+    fn fill_two_nodes(s: &mut Store, polls: i64) {
+        for k in 0..polls {
+            s.write(&make(T0 + k * 1000, &[reading("a"), reading("b")]))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn a_page_that_fills_mid_chunk_reads_one_chunk_and_loses_no_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(dir.path());
+        fill_two_nodes(&mut s, 617);
+        let reader = sqlite::open_reader(&cfg(dir.path(), 1).file).unwrap();
+        // 1234 rows. Pages of 300 rows fill in the middle of the second chunk.
+        let (pages, asked) = walk(
+            &reader,
+            None,
+            m6_core::ndjson::PageLimits::new(1 << 20, 300),
+        );
+        assert_eq!(pages, [300, 300, 300, 300, 34]);
+        assert_eq!(pages.iter().sum::<usize>(), 1234);
+        // Each page reads two chunks of 257, never the 10,001 rows of a full page.
+        assert!(asked <= 5 * 2 * (CHUNK_ROWS + 1), "{asked}");
+    }
+
+    #[test]
+    fn a_page_that_fills_on_bytes_stops_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(dir.path());
+        fill_two_nodes(&mut s, 617);
+        let reader = sqlite::open_reader(&cfg(dir.path(), 1).file).unwrap();
+        let (pages, asked) = walk(
+            &reader,
+            None,
+            m6_core::ndjson::PageLimits::new(40_000, 10_000),
+        );
+        assert_eq!(pages.iter().sum::<usize>(), 1234);
+        assert!(pages.iter().all(|n| *n < CHUNK_ROWS), "{pages:?}");
+        assert!(asked <= pages.len() * (CHUNK_ROWS + 1), "{asked}");
+    }
+
+    #[test]
+    fn a_range_that_ends_exactly_on_a_chunk_has_no_next_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(dir.path());
+        fill_two_nodes(&mut s, 128);
+        let reader = sqlite::open_reader(&cfg(dir.path(), 1).file).unwrap();
+        let (pages, _) = walk(&reader, None, m6_core::ndjson::PageLimits::default());
+        assert_eq!(pages, [256]);
     }
 }

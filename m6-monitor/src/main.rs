@@ -227,14 +227,14 @@ fn crawlers_ndjson(req: &Request, st: &MonitorState) -> Result<Response> {
 
 /// The shared read path of `/history` and `/crawlers`.
 ///
-/// One page reads inside one read transaction (see `history::health_page`).
-/// The connection is closed before any row is serialised.
+/// One page reads inside one read transaction (see `history::fill_page`), in
+/// chunks of 256 rows, and stops reading when the page is full.
 fn paged<T: history::Keyed>(
     req: &Request,
     st: &MonitorState,
     read: history::PageFn<T>,
 ) -> Result<Response> {
-    use m6_core::ndjson::{Cursor, Page, PageLimits, Pushed};
+    use m6_core::ndjson::{Cursor, PageLimits};
 
     let Some(path) = st.history.file() else {
         return Ok(plain(
@@ -275,30 +275,14 @@ fn paged<T: history::Keyed>(
             Err(e) => return Ok(unavailable(&e)),
         },
     };
-    let limits = PageLimits::default();
-    // One more row than a page holds, so a full page knows where the next starts.
-    let want = limits.max_rows().saturating_add(1);
-    let rows = match read(
-        &conn,
-        range.from_unix_ms(),
-        range.to_unix_ms(),
-        node_id,
-        after,
-        want,
-    ) {
-        Ok(r) => r,
-        Err(e) => return Ok(unavailable(&e)),
-    };
+    let range = (range.from_unix_ms(), range.to_unix_ms());
+    let (page, next) =
+        match history::fill_page(&conn, range, node_id, after, PageLimits::default(), read) {
+            Ok(p) => p,
+            Err(history::PageError::Db(e)) => return Ok(unavailable(&e)),
+            Err(history::PageError::Build(e)) => return Err(e.into()),
+        };
     drop(conn);
-    let mut page = Page::new(limits);
-    let mut next: Option<Cursor> = None;
-    for r in &rows {
-        if page.push(r).map_err(anyhow::Error::from)? == Pushed::Full {
-            let (at_ms, id) = r.key();
-            next = Some(Cursor::new(history::cursor_text(at_ms, id)).map_err(anyhow::Error::from)?);
-            break;
-        }
-    }
     Ok(page.into_response(req.query(), next.as_ref()))
 }
 
