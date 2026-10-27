@@ -270,7 +270,7 @@ mod tests {
         probe(dir.path(), "fn main() {}");
         let err =
             build_release(&cargo, dir.path(), &dir.path().join("target"), "nosuch").unwrap_err();
-        assert!(err.contains("nosuch"), "{err}");
+        assert!(err.contains("--bin nosuch failed"), "{err}");
     }
 
     #[test]
