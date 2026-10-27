@@ -1478,6 +1478,38 @@ fn after_rows() {
     });
 }
 
+const CHANNELS_SELECT: &str = "SELECT hc.health_id, c.label, hc.requests, hc.hits, hc.misses, \
+hc.backend_errors, hc.hit_samples, hc.hit_p50_ns, hc.hit_p99_ns, hc.miss_samples, hc.miss_p50_ns, \
+hc.miss_p99_ns FROM health_channel hc JOIN channel c ON c.id = hc.channel_id";
+const CHANNELS_ORDER: &str = "ORDER BY hc.health_id, c.label";
+const NET_SELECT: &str = "SELECT hn.health_id, i.name, hn.rx_bytes, hn.rx_errs, hn.rx_drop, \
+hn.tx_bytes, hn.tx_errs, hn.tx_drop FROM health_net hn JOIN iface i ON i.id = hn.iface_id";
+const NET_ORDER: &str = "ORDER BY hn.health_id, i.name";
+const FINDINGS_SELECT: &str = "SELECT poll_id, level, polled, node, text FROM poll_finding";
+const FINDINGS_ORDER: &str = "ORDER BY poll_id, level DESC, id";
+const STATUS_SELECT: &str = "SELECT window_id, code, requests FROM crawl_status";
+const SIGHTINGS_SELECT: &str =
+    "SELECT s.window_id, a.user_agent, s.requests, s.client_ips, s.paths \
+FROM crawl_sighting s JOIN agent a ON a.id = s.agent_id";
+const SIGHTINGS_ORDER: &str = "ORDER BY s.window_id, s.requests DESC, a.user_agent";
+
+/// A child query for the rows whose `column` is one of `n` ids, which the
+/// caller binds in order. A chunk holds at most `CHUNK_ROWS + 1` ids, so the
+/// list is short and each id is one probe of the index.
+fn children_sql(select: &str, column: &str, n: usize, order: &str) -> String {
+    let mut sql = String::with_capacity(select.len() + column.len() + order.len() + 2 * n + 16);
+    sql.push_str(select);
+    sql.push_str(" WHERE ");
+    sql.push_str(column);
+    sql.push_str(" IN (");
+    for k in 0..n {
+        sql.push_str(if k == 0 { "?" } else { ",?" });
+    }
+    sql.push_str(") ");
+    sql.push_str(order);
+    sql
+}
+
 /// Begin a deferred read transaction unless the caller already holds one, so
 /// every statement of a page sees the same file even if a prune commits.
 fn snapshot(conn: &Connection) -> rusqlite::Result<Option<Transaction<'_>>> {
@@ -1588,21 +1620,19 @@ pub fn health_page(
         mapped.collect::<rusqlite::Result<_>>()?
     };
     after_rows();
-    let (Some(first), Some(last)) = (
-        out.iter().map(|r| r.id).min(),
-        out.iter().map(|r| r.id).max(),
-    ) else {
+    if out.is_empty() {
         return Ok(out);
-    };
+    }
+    let ids: Vec<i64> = out.iter().map(|r| r.id).collect();
     let index: HashMap<i64, usize> = out.iter().enumerate().map(|(k, r)| (r.id, k)).collect();
     {
-        let mut stmt = conn.prepare(
-            "SELECT hc.health_id, c.label, hc.requests, hc.hits, hc.misses, hc.backend_errors, \
-             hc.hit_samples, hc.hit_p50_ns, hc.hit_p99_ns, hc.miss_samples, hc.miss_p50_ns, \
-             hc.miss_p99_ns FROM health_channel hc JOIN channel c ON c.id = hc.channel_id \
-             WHERE hc.health_id BETWEEN ?1 AND ?2 ORDER BY hc.health_id, c.label",
-        )?;
-        let mut rows = stmt.query(params![first, last])?;
+        let mut stmt = conn.prepare(&children_sql(
+            CHANNELS_SELECT,
+            "hc.health_id",
+            ids.len(),
+            CHANNELS_ORDER,
+        ))?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(&ids))?;
         while let Some(r) = rows.next()? {
             let Some(&k) = index.get(&r.get::<_, i64>(0)?) else {
                 continue;
@@ -1625,12 +1655,13 @@ pub fn health_page(
         }
     }
     {
-        let mut stmt = conn.prepare(
-            "SELECT hn.health_id, i.name, hn.rx_bytes, hn.rx_errs, hn.rx_drop, hn.tx_bytes, \
-             hn.tx_errs, hn.tx_drop FROM health_net hn JOIN iface i ON i.id = hn.iface_id \
-             WHERE hn.health_id BETWEEN ?1 AND ?2 ORDER BY hn.health_id, i.name",
-        )?;
-        let mut rows = stmt.query(params![first, last])?;
+        let mut stmt = conn.prepare(&children_sql(
+            NET_SELECT,
+            "hn.health_id",
+            ids.len(),
+            NET_ORDER,
+        ))?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(&ids))?;
         while let Some(r) = rows.next()? {
             let Some(&k) = index.get(&r.get::<_, i64>(0)?) else {
                 continue;
@@ -1646,17 +1677,18 @@ pub fn health_page(
             });
         }
     }
-    let (p_first, p_last) = (
-        out.iter().map(|r| r.poll_id).min().unwrap_or(0),
-        out.iter().map(|r| r.poll_id).max().unwrap_or(0),
-    );
+    let mut poll_ids: Vec<i64> = out.iter().map(|r| r.poll_id).collect();
+    poll_ids.sort_unstable();
+    poll_ids.dedup();
     let mut by_poll: HashMap<i64, Vec<(i64, bool, String, String)>> = HashMap::new();
     {
-        let mut stmt = conn.prepare(
-            "SELECT poll_id, level, polled, node, text FROM poll_finding \
-             WHERE poll_id BETWEEN ?1 AND ?2 ORDER BY poll_id, level DESC, id",
-        )?;
-        let mut rows = stmt.query(params![p_first, p_last])?;
+        let mut stmt = conn.prepare(&children_sql(
+            FINDINGS_SELECT,
+            "poll_id",
+            poll_ids.len(),
+            FINDINGS_ORDER,
+        ))?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(&poll_ids))?;
         while let Some(r) = rows.next()? {
             by_poll.entry(r.get(0)?).or_default().push((
                 r.get(1)?,
@@ -1751,18 +1783,14 @@ pub fn crawl_page(
         mapped.collect::<rusqlite::Result<_>>()?
     };
     after_rows();
-    let (Some(first), Some(last)) = (
-        out.iter().map(|r| r.id).min(),
-        out.iter().map(|r| r.id).max(),
-    ) else {
+    if out.is_empty() {
         return Ok(out);
-    };
+    }
+    let ids: Vec<i64> = out.iter().map(|r| r.id).collect();
     let index: HashMap<i64, usize> = out.iter().enumerate().map(|(k, r)| (r.id, k)).collect();
     {
-        let mut stmt = conn.prepare(
-            "SELECT window_id, code, requests FROM crawl_status WHERE window_id BETWEEN ?1 AND ?2",
-        )?;
-        let mut rows = stmt.query(params![first, last])?;
+        let mut stmt = conn.prepare(&children_sql(STATUS_SELECT, "window_id", ids.len(), ""))?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(&ids))?;
         while let Some(r) = rows.next()? {
             if let Some(&k) = index.get(&r.get::<_, i64>(0)?) {
                 out[k].status.insert(r.get(1)?, r.get(2)?);
@@ -1770,12 +1798,13 @@ pub fn crawl_page(
         }
     }
     {
-        let mut stmt = conn.prepare(
-            "SELECT s.window_id, a.user_agent, s.requests, s.client_ips, s.paths \
-             FROM crawl_sighting s JOIN agent a ON a.id = s.agent_id \
-             WHERE s.window_id BETWEEN ?1 AND ?2 ORDER BY s.window_id, s.requests DESC, a.user_agent",
-        )?;
-        let mut rows = stmt.query(params![first, last])?;
+        let mut stmt = conn.prepare(&children_sql(
+            SIGHTINGS_SELECT,
+            "s.window_id",
+            ids.len(),
+            SIGHTINGS_ORDER,
+        ))?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(&ids))?;
         while let Some(r) = rows.next()? {
             if let Some(&k) = index.get(&r.get::<_, i64>(0)?) {
                 out[k].crawlers.push(SightingOut {
@@ -3017,5 +3046,68 @@ mod tests {
         let reader = sqlite::open_reader(&cfg(dir.path(), 1).file).unwrap();
         let (pages, _) = walk(&reader, None, m6_core::ndjson::PageLimits::default());
         assert_eq!(pages, [256]);
+    }
+
+    /// The plan of a child query, one line per step.
+    fn plan(conn: &Connection, sql: &str, n: usize) -> String {
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let ids: Vec<i64> = (1..=n as i64).collect();
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(&ids), |r| r.get::<_, String>(3))
+            .unwrap();
+        rows.map(Result::unwrap).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn child_queries_probe_the_exact_ids_of_the_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = open(dir.path());
+        for (select, col, order, probe) in [
+            (
+                CHANNELS_SELECT,
+                "hc.health_id",
+                CHANNELS_ORDER,
+                "health_id=?",
+            ),
+            (NET_SELECT, "hn.health_id", NET_ORDER, "health_id=?"),
+            (FINDINGS_SELECT, "poll_id", FINDINGS_ORDER, "poll_id=?"),
+            (STATUS_SELECT, "window_id", "", "window_id=?"),
+            (
+                SIGHTINGS_SELECT,
+                "s.window_id",
+                SIGHTINGS_ORDER,
+                "window_id=?",
+            ),
+        ] {
+            let sql = children_sql(select, col, 3, order);
+            assert_eq!(sql.matches('?').count(), 3, "{sql}");
+            let p = plan(&s.conn, &sql, 3);
+            assert!(p.contains(probe), "{col}: {p}");
+            assert!(!p.contains(">?"), "{col} reads a range: {p}");
+        }
+    }
+
+    #[test]
+    fn a_node_page_returns_only_that_nodes_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(dir.path());
+        for k in 0..5 {
+            let rs = [reading("a"), unreachable("b"), reading("c")];
+            let d = digest::build(&rs, &Thresholds::default(), "t".into());
+            s.write(&batch(T0 + k * 1000, &rs, &d)).unwrap();
+        }
+        let b = node_id(&s.conn, "b").unwrap().unwrap();
+        let rows = health_page(&s.conn, T0, T0 + 10_000, Some(b), None, 100).unwrap();
+        assert_eq!(rows.len(), 5);
+        assert!(rows.iter().all(|r| r.node == "b"));
+        assert!(rows
+            .iter()
+            .all(|r| r.channels.is_empty() && r.net.is_empty()));
+        assert!(rows.iter().all(|r| r.findings.len() == 1));
+        let c = node_id(&s.conn, "c").unwrap().unwrap();
+        let rows = health_page(&s.conn, T0, T0 + 10_000, Some(c), None, 100).unwrap();
+        assert!(rows
+            .iter()
+            .all(|r| r.channels.len() == 2 && r.net.len() == 1));
     }
 }
