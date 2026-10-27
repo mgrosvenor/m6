@@ -671,8 +671,9 @@ fn issuer_falls_back_to_the_configured_site_toml() {
     let req = "GET /auth/public-key HTTP/1.1\r\nHost: localhost\r\n\r\n";
     let pk_resp = http_request(&env.socket_path, req);
     let pk_start = pk_resp.find("\r\n\r\n").map(|i| i + 4).unwrap();
-    let decoding_key = jsonwebtoken::DecodingKey::from_rsa_pem(pk_resp[pk_start..].as_bytes())
-        .expect("parse public key from PEM");
+    let decoding_key =
+        jsonwebtoken::DecodingKey::from_rsa_pem(pk_resp.split_at(pk_start).1.as_bytes())
+            .expect("parse public key from PEM");
     let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
     validation.set_issuer(&["site.example.com"]);
     let result =
