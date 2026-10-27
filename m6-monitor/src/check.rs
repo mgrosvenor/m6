@@ -20,6 +20,8 @@
 //! it only while that timer runs. A file older than
 //! `tunnel_handshake_max_age_s` is itself a fault.
 //!
+//! Section I shows the state of the poll history (`history.rs`).
+//!
 //! Section A also shows each node's last log reopen, and the limit it is
 //! judged against when `log_reopen_max_age_s` is set.
 //!
@@ -688,6 +690,51 @@ pub fn render(d: &Digest, readings: &[NodeReading]) -> String {
          It is not the node's own latency."
     );
 
+    // ── I. history ───────────────────────────────────────────────────────────
+    let _ = writeln!(o, "\nI. HISTORY  (one row per node per poll, in SQLite)");
+    match &d.history {
+        None => {
+            let _ = writeln!(o, "  not kept by --check; the running service keeps it");
+        }
+        Some(h) if h.state == "off" => {
+            let _ = writeln!(o, "  off. Set [monitor] history_file to keep one.");
+        }
+        Some(h) => {
+            let mb = |b: Option<u64>| {
+                b.map_or_else(
+                    || "-".to_string(),
+                    |b| format!("{:.1}", b as f64 / 1_048_576.0),
+                )
+            };
+            let dash = |v: &Option<String>| v.clone().unwrap_or_else(|| "-".to_string());
+            let _ = writeln!(o, "  file {}", h.file.as_deref().unwrap_or("-"));
+            let _ = writeln!(
+                o,
+                "  {} MB used of the {} MB cap (file {} MB); oldest {}, newest {}",
+                mb(h.used_bytes),
+                mb(h.max_bytes),
+                mb(h.file_bytes),
+                dash(&h.oldest_at),
+                dash(&h.newest_at)
+            );
+            let _ = writeln!(
+                o,
+                "  {} polls and {} crawler windows written, last {}s ago; {} pruned at the cap; \
+                 {} dropped; {} failed",
+                h.writes,
+                h.crawl_windows,
+                h.last_write_age_s
+                    .map_or_else(|| "-".to_string(), |a| a.to_string()),
+                h.pruned,
+                h.dropped,
+                h.failures
+            );
+            if let Some(e) = &h.last_error {
+                let _ = writeln!(o, "  last error: {e}");
+            }
+        }
+    }
+
     // ── verdict ──────────────────────────────────────────────────────────────
     let _ = writeln!(o, "\n{bar}");
     let faults: Vec<_> = d
@@ -1259,5 +1306,144 @@ mod tunnel_tests {
     fn section_a_says_a_node_writes_no_log_file() {
         let o = render_reopen(reopen_reading(9000, None), None);
         assert!(o.contains("writes no log file"), "{o}");
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::tests::{digest, reading};
+    use super::*;
+    use crate::history::HistoryDigest;
+
+    fn history(state: &'static str) -> HistoryDigest {
+        HistoryDigest {
+            state,
+            file: Some("/var/lib/m6-monitor/history.sqlite3".into()),
+            max_bytes: Some(256 << 20),
+            file_bytes: Some(3 << 20),
+            used_bytes: Some(2 << 20),
+            oldest_at: Some("2027-01-01T00:00:00.000Z".into()),
+            newest_at: Some("2027-01-02T00:00:00.000Z".into()),
+            last_write_age_s: Some(4),
+            writes: 120,
+            crawl_windows: 6,
+            failures: 1,
+            dropped: 2,
+            pruned: 0,
+            last_error: None,
+        }
+    }
+
+    fn out(h: Option<HistoryDigest>) -> String {
+        let mut d = digest();
+        d.history = h;
+        render(&d, &[reading("origin", None)])
+    }
+
+    #[test]
+    fn section_i_says_history_is_off() {
+        let o = out(Some(HistoryDigest {
+            state: "off",
+            file: None,
+            max_bytes: None,
+            file_bytes: None,
+            used_bytes: None,
+            oldest_at: None,
+            newest_at: None,
+            last_write_age_s: None,
+            writes: 0,
+            crawl_windows: 0,
+            failures: 0,
+            dropped: 0,
+            pruned: 0,
+            last_error: None,
+        }));
+        assert!(o.contains("I. HISTORY"), "{o}");
+        assert!(
+            o.contains("off. Set [monitor] history_file to keep one."),
+            "{o}"
+        );
+    }
+
+    #[test]
+    fn section_i_shows_the_cap_and_the_last_write() {
+        let o = out(Some(history("ok")));
+        assert!(
+            o.contains("file /var/lib/m6-monitor/history.sqlite3"),
+            "{o}"
+        );
+        assert!(
+            o.contains("2.0 MB used of the 256.0 MB cap (file 3.0 MB); oldest 2027-01-01T00:00:00.000Z, newest 2027-01-02T00:00:00.000Z"),
+            "{o}"
+        );
+        assert!(
+            o.contains("120 polls and 6 crawler windows written, last 4s ago; 0 pruned at the cap; 2 dropped; 1 failed"),
+            "{o}"
+        );
+        assert!(!o.contains("last error"), "{o}");
+    }
+
+    #[test]
+    fn section_i_uses_dashes_for_absent_figures_and_shows_the_last_error() {
+        let mut h = history("failing");
+        h.used_bytes = None;
+        h.oldest_at = None;
+        h.last_write_age_s = None;
+        h.last_error = Some("disk full".into());
+        let o = out(Some(h));
+        assert!(o.contains("- MB used of the 256.0 MB cap"), "{o}");
+        assert!(o.contains("oldest -, newest"), "{o}");
+        assert!(o.contains("written, last -s ago"), "{o}");
+        assert!(o.contains("last error: disk full"), "{o}");
+    }
+
+    #[test]
+    fn a_prune_failure_and_an_unmet_cap_are_not_a_missing_poll() {
+        for (state, error, said) in [
+            (
+                "prune_failed",
+                "polls are kept",
+                "could not delete old polls",
+            ),
+            (
+                "over_cap",
+                "the history is over its cap",
+                "is over its cap of",
+            ),
+        ] {
+            let mut h = history(state);
+            h.last_error = Some(error.into());
+            let mut d = digest();
+            d.history = Some(h.clone());
+            d.add_finding(crate::history::finding(&h).expect("a finding"));
+            let o = render(&d, &[reading("origin", None)]);
+            assert!(!o.contains("ALL CLEAR"), "{o}");
+            assert!(o.contains(said), "{o}");
+            assert!(o.contains(&format!("last error: {error}")), "{o}");
+            assert!(!o.contains("that poll is missing"), "{o}");
+        }
+    }
+
+    #[test]
+    fn a_failing_history_write_removes_all_clear() {
+        let h = history("failing");
+        let mut d = digest();
+        d.history = Some(h.clone());
+        d.add_finding(crate::history::finding(&h).expect("a finding"));
+        let o = render(&d, &[reading("origin", None)]);
+        assert!(!o.contains("ALL CLEAR"), "{o}");
+        assert!(
+            o.contains("- monitor: the last history write failed"),
+            "{o}"
+        );
+    }
+
+    #[test]
+    fn check_one_shot_says_history_is_kept_by_the_service() {
+        let o = out(None);
+        assert!(
+            o.contains("not kept by --check; the running service keeps it"),
+            "{o}"
+        );
     }
 }

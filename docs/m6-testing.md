@@ -169,7 +169,7 @@ Take from it that every suite is named, so a claim about m6's behaviour can be t
 | m6-file | `integration.rs`, `dynamic_routes.rs`, `security_regressions.rs` |
 | m6-auth-server | `integration.rs`, `security_regressions.rs` |
 | m6-auth-cli | `integration.rs` |
-| m6-monitor | `lifecycle.rs` |
+| m6-monitor | `lifecycle.rs`, `tunnel.rs`, `history.rs` |
 
 **Table 6: the integration suites, by crate.**
 Unit tests are not listed, because they sit in `src/` beside the code they cover.

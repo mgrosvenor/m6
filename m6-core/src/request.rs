@@ -503,12 +503,13 @@ pub fn parse_query_string(query: &str) -> Vec<(String, String)> {
 }
 
 /// A query key that appeared more than once where one was expected.
-pub(crate) struct RepeatedKey;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepeatedKey;
 
 /// The raw, undecoded value of the single query key `key`: `None` when it is
 /// absent, [`RepeatedKey`] when it appears twice. A key with no `=` has the
 /// value `""`.
-pub(crate) fn single_query_value<'a>(
+pub fn single_query_value<'a>(
     query: &'a str,
     key: &str,
 ) -> std::result::Result<Option<&'a str>, RepeatedKey> {

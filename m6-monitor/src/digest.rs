@@ -98,6 +98,22 @@ pub struct Digest {
     /// Seconds since the WireGuard handshakes file was last written. One fact
     /// about the monitor host, `None` when there is no readable file.
     pub handshake_file_age_s: Option<u64>,
+    /// The state of the poll history. `None` under `--check`, which keeps none.
+    pub history: Option<crate::history::HistoryDigest>,
+}
+
+impl Digest {
+    /// Add a finding after the build, keeping faults first and the level true.
+    pub fn add_finding(&mut self, f: Finding) {
+        self.findings.push(f);
+        self.findings.sort_by_key(|f| std::cmp::Reverse(f.level));
+        self.level = self
+            .findings
+            .iter()
+            .map(|f| f.level)
+            .max()
+            .unwrap_or(Level::Ok);
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -256,7 +272,7 @@ pub enum ProbeState {
 }
 
 impl ProbeState {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Connected => "connected",
             Self::Refused => "refused",
@@ -284,6 +300,23 @@ pub enum HandshakeState {
     FileError,
     /// The handshakes file is older than the limit, so no age is judged.
     FileStale,
+}
+
+impl HandshakeState {
+    /// The serialised name, for the history.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Never => "never",
+            Self::PeerAbsent => "peer_absent",
+            Self::NoPublicKey => "no_public_key",
+            Self::NoHandshakesFile => "no_handshakes_file",
+            Self::Unknown => "unknown",
+            Self::FileMissing => "file_missing",
+            Self::FileError => "file_error",
+            Self::FileStale => "file_stale",
+        }
+    }
 }
 
 impl TunnelDigest {
@@ -1075,6 +1108,7 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
             .iter()
             .filter_map(|r| r.tunnel.as_ref()?.file_age_s)
             .next(),
+        history: None,
     }
 }
 
@@ -2374,5 +2408,61 @@ pub(crate) mod tests {
             "{:?}",
             d.findings
         );
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+
+    fn empty() -> Digest {
+        build(&[], &Thresholds::default(), "now".into())
+    }
+
+    fn finding(level: Level, text: &str) -> Finding {
+        Finding {
+            level,
+            node: "monitor".into(),
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn add_finding_keeps_faults_first_and_raises_the_level() {
+        let mut d = empty();
+        assert_eq!(d.level, Level::Ok);
+        d.add_finding(finding(Level::Warn, "w"));
+        assert_eq!(d.level, Level::Warn);
+        d.add_finding(finding(Level::Fault, "f"));
+        d.add_finding(finding(Level::Warn, "w2"));
+        assert_eq!(d.level, Level::Fault);
+        let texts: Vec<&str> = d.findings.iter().map(|f| f.text.as_str()).collect();
+        assert_eq!(texts, ["f", "w", "w2"]);
+    }
+
+    #[test]
+    fn the_json_digest_carries_the_history_state() {
+        let mut d = empty();
+        assert!(serde_json::to_value(&d).unwrap()["history"].is_null());
+        d.history = Some(crate::history::HistoryDigest {
+            state: "behind",
+            file: Some("h.sqlite3".into()),
+            max_bytes: Some(1 << 20),
+            file_bytes: None,
+            used_bytes: None,
+            oldest_at: None,
+            newest_at: None,
+            last_write_age_s: None,
+            writes: 1,
+            crawl_windows: 0,
+            failures: 0,
+            dropped: 3,
+            pruned: 0,
+            last_error: None,
+        });
+        let v = serde_json::to_value(&d).unwrap();
+        assert_eq!(v["history"]["state"], "behind");
+        assert_eq!(v["history"]["dropped"], 3);
+        assert_eq!(v["history"]["file"], "h.sqlite3");
     }
 }

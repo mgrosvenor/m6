@@ -1,10 +1,17 @@
 //! `m6-monitor`: one page that says how the fleet is.
 //!
 //! Runs at origin, polls every node's `/health` and `/perf` over the backbone,
-//! and serves the digest. Two routes:
+//! and serves the digest. These routes:
 //!
 //!   GET /          the page
 //!   GET /digest    the same thing as JSON, for anything that is not a person
+//!   GET /check     the hourly health check, as text
+//!   GET /history   the poll history as paged JSON Lines, when `history_file` is set
+//!   GET /crawlers  the crawler sightings as paged JSON Lines, likewise
+//!
+//! Every route answers on the unix socket only. The monitor has no listener and
+//! no token code. Access control is the `require` rule of the m6-http placed in
+//! front of the socket. See `history.rs` for the history and a front example.
 //!
 //! It is an ordinary m6 service. It links `m6-core` and nothing else, gets its
 //! server loop, routing, templating and config from there, and is configured
@@ -25,6 +32,7 @@
 mod check;
 mod digest;
 mod fleet;
+mod history;
 mod poll;
 mod tunnel;
 
@@ -50,6 +58,8 @@ fn main() -> anyhow::Result<()> {
         .route_get("/", page)
         .route_get("/digest", digest_json)
         .route_get("/check", check_text)
+        .route_get("/history", history_ndjson)
+        .route_get("/crawlers", crawlers_ndjson)
         .run()?;
     Ok(())
 }
@@ -78,6 +88,7 @@ struct MonitorState {
     /// claims and this file already makes that distinction for sample counts.
     latest: std::sync::Arc<std::sync::RwLock<Option<Snapshot>>>,
     interval: Duration,
+    history: history::HistoryHandle,
 }
 
 impl MonitorState {
@@ -105,8 +116,14 @@ fn build_state(ctx: &AppContext) -> Result<MonitorState> {
     // an argument position.
     let path = ctx.config_path.to_path_buf();
     let writer = std::sync::Arc::clone(&latest);
+    // A bad key or a file from a newer release stops the start here (exit 2).
+    let (recorder, handle) = history::start(history::config_from(
+        ctx.config.get("monitor"),
+        ctx.site_dir,
+    )?)?;
+    let poller_handle = handle.clone();
     std::thread::spawn(move || loop {
-        match collect_from(&path) {
+        match collect_from(&path, Some((&recorder, &poller_handle))) {
             Ok((digest, readings)) => {
                 let snap = Snapshot {
                     digest,
@@ -128,12 +145,16 @@ fn build_state(ctx: &AppContext) -> Result<MonitorState> {
         std::thread::sleep(interval);
     });
 
-    Ok(MonitorState { latest, interval })
+    Ok(MonitorState {
+        latest,
+        interval,
+        history: handle,
+    })
 }
 
 /// Poll the fleet, print the check, exit 1 on faults.
 fn run_check(config_path: &std::path::Path) -> anyhow::Result<()> {
-    let (d, readings) = collect_from(config_path)?;
+    let (d, readings) = collect_from(config_path, None)?;
     print!("{}", check::render(&d, &readings));
     if d.level == digest::Level::Fault {
         std::process::exit(1);
@@ -142,8 +163,13 @@ fn run_check(config_path: &std::path::Path) -> anyhow::Result<()> {
 }
 
 /// Poll the fleet and build a digest, or explain why not.
+///
+/// With a recorder, the poll is also handed to the history writer. The history
+/// finding is added before the poll is recorded, so the stored verdict equals
+/// the one `/check` shows.
 fn collect_from(
     config_path: &std::path::Path,
+    history: Option<(&history::Recorder, &history::HistoryHandle)>,
 ) -> anyhow::Result<(digest::Digest, Vec<poll::NodeReading>)> {
     let fleet = fleet::Fleet::from_config(config_path)?;
     let token = fleet.perf_token();
@@ -164,8 +190,100 @@ fn collect_from(
         log_reopen_age_s: fleet.log_reopen_max_age_s,
         ..Default::default()
     };
-    let d = digest::build(&readings, &thresholds, now_iso8601());
+    let at_ms = unix_ms();
+    let mut d = digest::build(&readings, &thresholds, now_iso8601());
+    if let Some((recorder, handle)) = history {
+        let h = handle.digest();
+        if let Some(f) = history::finding(&h) {
+            d.add_finding(f);
+        }
+        d.history = Some(h);
+        recorder.record(history::batch(at_ms, &readings, &d));
+    }
     Ok((d, readings))
+}
+
+fn unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
+/// A plain-text answer that no cache may keep.
+fn plain(status: u16, text: &str) -> Response {
+    Response::text(text)
+        .with_status(status)
+        .header("Cache-Control", "no-store")
+        .header("X-Content-Type-Options", "nosniff")
+}
+
+fn history_ndjson(req: &Request, st: &MonitorState) -> Result<Response> {
+    paged(req, st, history::health_page)
+}
+
+fn crawlers_ndjson(req: &Request, st: &MonitorState) -> Result<Response> {
+    paged(req, st, history::crawl_page)
+}
+
+/// The shared read path of `/history` and `/crawlers`.
+///
+/// One page reads inside one read transaction (see `history::fill_page`), in
+/// chunks of 256 rows, and stops reading when the page is full.
+fn paged<T: history::Keyed>(
+    req: &Request,
+    st: &MonitorState,
+    read: history::PageFn<T>,
+) -> Result<Response> {
+    use m6_core::ndjson::{Cursor, PageLimits};
+
+    let Some(path) = st.history.file() else {
+        return Ok(plain(
+            503,
+            "history is off: set [monitor] history_file to keep one\n",
+        ));
+    };
+    let range = match m6_core::time_range::TimeRange::from_request(
+        req,
+        m6_core::time_range::DEFAULT_MAX_SPAN,
+    ) {
+        Ok(r) => r,
+        Err(e) => return Ok(e.to_response()),
+    };
+    let after = match Cursor::from_query(req.query()) {
+        Ok(None) => None,
+        Ok(Some(c)) => match history::parse_cursor(c.as_str()) {
+            Some(k) => Some(k),
+            None => return Ok(m6_core::ndjson::CursorError::Malformed.to_response()),
+        },
+        Err(e) => return Ok(e.to_response()),
+    };
+    let node = match history::node_param(req.query()) {
+        Ok(n) => n,
+        Err(msg) => return Ok(Response::refusal(&msg)),
+    };
+    let unavailable =
+        |e: &dyn std::fmt::Display| plain(503, &format!("history is unavailable: {e}\n"));
+    let conn = match m6_core::sqlite::open_reader(path) {
+        Ok(c) => c,
+        Err(e) => return Ok(unavailable(&e)),
+    };
+    let node_id = match &node {
+        None => None,
+        Some(name) => match history::node_id(&conn, name) {
+            Ok(Some(id)) => Some(id),
+            Ok(None) => return Ok(Response::refusal(&"`node` names no node in the history")),
+            Err(e) => return Ok(unavailable(&e)),
+        },
+    };
+    let range = (range.from_unix_ms(), range.to_unix_ms());
+    let (page, next) =
+        match history::fill_page(&conn, range, node_id, after, PageLimits::default(), read) {
+            Ok(p) => p,
+            Err(history::PageError::Db(e)) => return Ok(unavailable(&e)),
+            Err(history::PageError::Build(e)) => return Err(e.into()),
+        };
+    drop(conn);
+    Ok(page.into_response(req.query(), next.as_ref()))
 }
 
 /// The digest from the latest snapshot, for the HTML page.
