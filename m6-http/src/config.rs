@@ -844,12 +844,29 @@ fn validate_internal_peers(
         (Some(b), None) => anyhow::bail!(
             "config error: [server].internal_binds names \"{b}\" but [server].internal_peers is not set. An internal listener believes the client address a peer forwards, so it accepts only the peers it names. Add internal_peers = [\"<peer IP>\", ...] with the address each cache node connects from; any other peer is refused"
         ),
-        (Some(_), Some(peers)) => parse_local_peers(
-            "[server].internal_peers",
-            "an internal peer",
-            "list the peers allowed to connect to the internal h2c listener, or set internal_binds = [] to make the listener public",
-            peers,
-        ),
+        (Some(b), Some(peers)) => {
+            let parsed = parse_local_peers(
+                "[server].internal_peers",
+                "an internal peer",
+                "list the peers allowed to connect to the internal h2c listener, or set internal_binds = [] to make the listener public",
+                peers,
+            )?;
+            // A connection arrives from the bind's own IP family, and an
+            // IPv4-mapped bind is IPv4. A list with no peer of that family
+            // would refuse every connection.
+            let bind_ip = b.parse::<std::net::SocketAddr>()?.ip().to_canonical();
+            if !parsed.iter().any(|p| p.is_ipv4() == bind_ip.is_ipv4()) {
+                let (bind_family, peer_family) = if bind_ip.is_ipv4() {
+                    ("IPv4", "IPv6")
+                } else {
+                    ("IPv6", "IPv4")
+                };
+                anyhow::bail!(
+                    "config error: [server].internal_binds \"{b}\" is {bind_family} but every [server].internal_peers entry is {peer_family}, so every connection would be refused. Add a {bind_family} peer address, the one each cache node connects from"
+                );
+            }
+            Ok(parsed)
+        }
     }
 }
 
@@ -2117,6 +2134,31 @@ internal_binds = ["203.0.113.7:80"]
                 "{extra}: {e}"
             );
         }
+    }
+
+    #[test]
+    fn peers_of_the_other_ip_family_than_the_internal_bind_are_refused() {
+        let v6 = "h2c_bind = \"[fd00::1]:18080\"\ninternal_binds = [\"[fd00::1]:18080\"]\n";
+        let e = load_error(&format!("{v6}internal_peers = [\"10.0.0.2\"]\n"));
+        assert!(e.contains("[server].internal_peers"), "{e}");
+        assert!(e.contains("IPv6") && e.contains("fd00::1"), "{e}");
+        let v4 = "h2c_bind = \"10.0.0.1:18080\"\ninternal_binds = [\"10.0.0.1:18080\"]\n";
+        let e = load_error(&format!("{v4}internal_peers = [\"fd00::2\"]\n"));
+        assert!(e.contains("IPv4") && e.contains("10.0.0.1"), "{e}");
+        // An IPv4-mapped bind is IPv4, and a mapped peer is stored as IPv4.
+        let mapped = "h2c_bind = \"[::ffff:10.0.0.1]:18080\"\ninternal_binds = [\"[::ffff:10.0.0.1]:18080\"]\n";
+        let e = load_error(&format!("{mapped}internal_peers = [\"fd00::2\"]\n"));
+        assert!(e.contains("IPv4"), "{e}");
+    }
+
+    #[test]
+    fn one_peer_of_the_bind_family_is_enough() {
+        let v6 = "h2c_bind = \"[fd00::1]:18080\"\ninternal_binds = [\"[fd00::1]:18080\"]\n";
+        let cfg = load_with_system_server(&format!(
+            "{v6}internal_peers = [\"10.0.0.2\", \"fd00::2\"]\n"
+        ))
+        .unwrap();
+        assert_eq!(cfg.server.internal_peers.len(), 2);
     }
 
     #[test]
