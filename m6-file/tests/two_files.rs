@@ -395,12 +395,17 @@ fn restart_only_warnings_compare_with_the_running_values() {
     let r = start("");
     for pool in [3, 2, 3] {
         let before = r.count("Reload complete");
-        std::fs::write(r.conf(), conf_body("", pool)).unwrap();
+        // Renamed over, so each step is one change and not a truncation and a
+        // write. The pause lets the settle window close before the next step.
+        let tmp = r.root().join("m6-file.conf.new");
+        std::fs::write(&tmp, conf_body("", pool)).unwrap();
+        std::fs::rename(&tmp, r.conf()).unwrap();
         assert!(
             wait_for(&r, "Reload complete", before + 1),
             "{}",
             r.svc.output()
         );
+        std::thread::sleep(Duration::from_millis(300));
     }
     // Started at 2: the reload to 3 warns, the one back to 2 does not, the
     // last to 3 warns again.
