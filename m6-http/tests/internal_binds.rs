@@ -141,7 +141,10 @@ fn statuses_over_h2c(declare: bool, n: usize) -> Vec<u16> {
     let site = write_site(dir.path());
     let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("rcgen");
     let declaration = if declare {
-        format!("internal_binds = [\"{}\"]\n", h2c.addr())
+        format!(
+            "internal_binds = [\"{}\"]\ninternal_peers = [\"127.0.0.1\"]\n",
+            h2c.addr()
+        )
     } else {
         "internal_binds = []\n".to_string()
     };
@@ -216,4 +219,110 @@ fn an_h2c_listener_declared_public_ignores_the_forwarded_address() {
         3,
         "all requests count against the relaying peer: {statuses:?}"
     );
+}
+
+#[test]
+fn an_internal_listener_without_internal_peers_refuses_to_start() {
+    let tls = testkit::claim_port();
+    let h2c = testkit::claim_port();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let site = write_site(dir.path());
+    // Empty certificate files: the refusal fires before TLS is read.
+    let config = write_system(
+        dir.path(),
+        &tls.addr(),
+        &format!(
+            "h2c_bind = \"{0}\"\ninternal_binds = [\"{0}\"]\n",
+            h2c.addr()
+        ),
+        "",
+        "",
+    );
+
+    let (code, output) = run_until_exit(&site, &config);
+
+    assert_eq!(code, Some(2), "output:\n{output}");
+    assert!(output.contains("internal_peers"), "output:\n{output}");
+}
+
+/// The listener names 127.0.0.2 and never uses it, so a connection from
+/// 127.0.0.1 is from an unlisted peer. No second loopback address is needed.
+#[test]
+fn an_unlisted_peer_is_refused_at_connect() {
+    let tls = testkit::claim_port();
+    let h2c = testkit::claim_port();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let site = write_site(dir.path());
+    let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("rcgen");
+    let config = write_system(
+        dir.path(),
+        &tls.addr(),
+        &format!(
+            "h2c_bind = \"{0}\"\ninternal_binds = [\"{0}\"]\ninternal_peers = [\"127.0.0.2\"]\n",
+            h2c.addr()
+        ),
+        &ck.cert.pem(),
+        &ck.key_pair.serialize_pem(),
+    );
+
+    let mut cmd = Command::new(testkit::binary("m6-http"));
+    cmd.arg(&site).arg(&config).env("RUST_LOG", "info");
+    let mut svc = testkit::Service::spawn("m6-http-internal-peers", &mut cmd);
+    svc.wait_for_tcp(tls.port(), Duration::from_secs(10));
+    svc.wait_for_tcp(h2c.port(), Duration::from_secs(10));
+
+    // The TCP handshake completes in the kernel, so connect succeeds and the
+    // server then closes the socket without reading a byte.
+    let outcome = match H2cClientConn::connect("127.0.0.1", h2c.port()) {
+        Err(e) => Err(format!("connect: {e}")),
+        Ok(mut conn) => {
+            let settle = Instant::now() + Duration::from_millis(250);
+            while Instant::now() < settle {
+                conn.drive();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let req = HttpRequest {
+                method: "GET".to_string(),
+                path: "/".to_string(),
+                query: None,
+                version: "HTTP/1.1".to_string(),
+                headers: Vec::new(),
+                body: Vec::new(),
+            };
+            match conn.dispatch(&req, "127.0.0.1", "203.0.113.1", "localhost") {
+                Err(e) => Err(format!("dispatch: {e}")),
+                Ok(rx) => {
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    loop {
+                        conn.drive();
+                        match rx.try_recv() {
+                            Ok(Ok(r)) => break Ok(r.status),
+                            Ok(Err(e)) => break Err(format!("response: {e}")),
+                            Err(mpsc::TryRecvError::Empty) if Instant::now() < deadline => {
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                            Err(e) => break Err(format!("receiver: {e:?}")),
+                        }
+                    }
+                }
+            }
+        }
+    };
+    assert!(
+        outcome.is_err(),
+        "an unlisted peer must get no response: {outcome:?}\n{}",
+        svc.output()
+    );
+
+    let status = svc.terminate(Duration::from_secs(5));
+    let output = svc.output();
+    assert!(
+        status.success(),
+        "the server must survive a refusal: {status}\n{output}"
+    );
+    assert!(
+        output.contains("not in [server] internal_peers"),
+        "{output}"
+    );
+    assert!(output.contains("127.0.0.1"), "{output}");
 }
