@@ -67,14 +67,14 @@ Three rules apply to all of them:
 
 ## 3. The shared harness
 
-Every integration suite does the same four things: find a free port, find the release binary, start a service and wait for it to be ready, then read a response at the byte level.
+Every integration suite does the same four things: find a free port, build and find the release binary, start a service and wait for it to be ready, then read a response at the byte level.
 `m6-core::testkit` is the five modules that do them once.
 Table 3 gives them.
 Take from it that a suite doing any of this itself is a suite reintroducing a failure already fixed.
 
 | module | provides | the failure it closes |
 |---|---|---|
-| `paths` | `binary`, `exec_scratch_root` | each suite guessing where the release binary is |
+| `paths` | `binary`, `exec_scratch_root` | each suite guessing where the binary is, and a stale release binary run in place of the code under test |
 | `port` | `claim_port`, `PortClaim` | `TcpListener::bind(":0")` read back after the listener drops, which frees the port before the child claims it |
 | `process` | `Service`, killed on drop, both streams drained | a child that outlogs one pipe buffer blocks in `write`, and a dead child's last words go with the pipe |
 | `wait` | `for_tcp`, `for_path` | a fixed sleep, long enough on an idle laptop and not when a dozen stacks start at once |
@@ -90,6 +90,13 @@ Two rules come with it, and both are quiet when broken:
 - **Hold a `PortClaim` as long as the service holds the port.**
   Dropping it early reopens the race it exists to close, which is why it is `#[must_use]` and stored beside its `Service`.
 - **`Service` drains stdout as well as stderr**, because m6's services log to stdout.
+
+**`binary` builds what it returns.**
+It runs `cargo build --quiet --release --workspace --bin <name> --target-dir <target>` once per binary name per test process, so a test always runs the binary built from the source in the tree.
+The first test after a change pays the release build, which is minutes for m6-http.
+The scripts do not use `binary`.
+`tools/conformance.sh` and `tools/perfcheck.sh` run `target/release` directly and refuse to start when it is missing, so run `cargo build --workspace --release` before them.
+`bench.sh` builds the release binaries it needs itself.
 
 ## 4. Conformance: h1spec, h2spec and h3spec
 
