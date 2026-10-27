@@ -170,9 +170,9 @@ type InitThread<G, T> = Arc<dyn Fn(&Map<String, Value>, &G) -> Result<T> + Send 
 /// nothing that needs an explicit drop, and the option is what says so.
 type Destroy<S> = Option<Arc<dyn Fn(S) + Send + Sync>>;
 
-/// Called after a reload has swapped in the new state, with the new config. A
-/// service's own state built in `init_global` is reloaded here. `None` is the
-/// common case.
+/// Called during a reload, with the new config, before the new routes and log
+/// level are installed. A service's own state built in `init_global` is
+/// reloaded here. `None` is the common case.
 type OnReload<G> = Option<Arc<dyn Fn(&G, &AppContext) -> Result<()> + Send + Sync>>;
 
 /// [`OnReload`] with the global state already bound, as the run loop holds it.
@@ -1876,11 +1876,15 @@ impl<G: Send + Sync + 'static> AppWithGlobal<G> {
 
     /// Re-read state that `init_global` built from the config.
     ///
-    /// Called after every successful reload, once the new routes are serving,
-    /// with the global state and a context carrying the new config. A reload
-    /// is triggered by a change to the service's config or to `site.toml`.
-    /// On `Err` the service logs it at error level and keeps serving: the hook
-    /// is expected to leave its own state as it was.
+    /// Called on every reload that has built and checked its new state, with
+    /// the global state and a context carrying the new config, before that new
+    /// state and log level are installed. A reload is triggered by a change to
+    /// the service's config or to `site.toml`.
+    ///
+    /// On `Err`, or if the hook panics, the service logs it at error level and
+    /// keeps serving the previous routes and log level, and the reload is tried
+    /// again within a second without a new write. The hook has run by then, so
+    /// it must be safe to run again on the same config.
     pub fn on_reload(
         mut self,
         f: impl Fn(&G, &AppContext) -> Result<()> + Send + Sync + 'static,
@@ -2540,6 +2544,23 @@ fn dump_config(
     0
 }
 
+/// Why a reload did not happen.
+enum ReloadError {
+    /// A file is mid-write. Nothing to retry: the write that fills it is a
+    /// change of its own.
+    Skipped(String),
+    /// The new config was refused or did not build. The next write reloads.
+    Failed(String),
+    /// `on_reload` failed. Nothing was changed, and the poll tries again.
+    HookFailed(String),
+}
+
+impl From<String> for ReloadError {
+    fn from(msg: String) -> Self {
+        ReloadError::Failed(msg)
+    }
+}
+
 /// The message of a caught panic.
 fn panic_message(p: &(dyn Any + Send)) -> &str {
     p.downcast_ref::<&str>()
@@ -2812,17 +2833,17 @@ fn run_app_with_shutdown(
     // parse, a compress declaration that disagrees with this service, and a
     // route naming a handler this binary does not have. Each keeps the old
     // state serving, so a bad edit of either file is recoverable.
-    let reload = |changed: crate::watcher::Changed| -> std::result::Result<usize, String> {
+    let reload = |changed: crate::watcher::Changed| -> std::result::Result<usize, ReloadError> {
         // A file that a writer has truncated and not yet written is empty. An
         // empty process config loads with no routes and an empty `site.toml`
         // resets the log level, so neither is loaded. The write that fills the
         // file is a change of its own and reloads.
         for (file, path) in [(changed.process, &config_path), (changed.site, &site_toml)] {
             if file && std::fs::metadata(path).is_ok_and(|m| m.len() == 0) {
-                return Err(format!(
+                return Err(ReloadError::Skipped(format!(
                     "Reload skipped: {} is empty, keeping the current state",
                     path.display()
-                ));
+                )));
             }
         }
         let new_config = crate::config::load(&config_path, &site_dir)
@@ -2838,7 +2859,8 @@ fn run_app_with_shutdown(
                     "Reload refused: {} is not valid TOML: {}",
                     site_toml.display(),
                     e.message()
-                ));
+                )
+                .into());
             }
         }
         let changed_keys =
@@ -2856,9 +2878,36 @@ fn run_app_with_shutdown(
             return Err(format!(
                 "Reload refused, route names an unregistered handler: {}",
                 describe_unknown(&missing, &registered_names)
-            ));
+            )
+            .into());
         }
         let routes = new_state.routes.len();
+        // The hook runs first, on the new config, and the new state and log
+        // level are installed only when it succeeds. A failed hook therefore
+        // leaves the routes and the level as they were, and the change is
+        // asked for again.
+        if let Some(hook) = &on_reload {
+            let ctx = AppContext {
+                config: &new_state.config.user_config,
+                site_dir: &site_dir,
+                config_path: &config_path,
+                site_toml: &site_toml,
+            };
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook(&ctx))) {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    return Err(ReloadError::HookFailed(format!(
+                        "Reload hook failed: {e:#}"
+                    )))
+                }
+                Err(p) => {
+                    return Err(ReloadError::HookFailed(format!(
+                        "Reload hook failed: panicked: {}",
+                        panic_message(&*p)
+                    )))
+                }
+            }
+        }
         *fs.write().unwrap() = new_state;
         for k in changed_keys {
             warn!(
@@ -2867,20 +2916,6 @@ fn run_app_with_shutdown(
             );
         }
         log_handle.reload(&format, &level);
-        if let Some(hook) = &on_reload {
-            let state = fs.read().unwrap();
-            let ctx = AppContext {
-                config: &state.config.user_config,
-                site_dir: &site_dir,
-                config_path: &config_path,
-                site_toml: &site_toml,
-            };
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook(&ctx))) {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => error!("Reload hook failed: {e:#}"),
-                Err(p) => error!("Reload hook failed: panicked: {}", panic_message(&*p)),
-            }
-        }
         Ok(routes)
     };
 
@@ -2924,8 +2959,12 @@ fn run_app_with_shutdown(
             );
             let reload_start = std::time::Instant::now();
             match reload(changed) {
-                Err(msg) if msg.starts_with("Reload skipped") => warn!("{msg}"),
-                Err(msg) => error!("{msg}"),
+                Err(ReloadError::Skipped(msg)) => warn!("{msg}"),
+                Err(ReloadError::Failed(msg)) => error!("{msg}"),
+                Err(ReloadError::HookFailed(msg)) => {
+                    error!("{msg}");
+                    reloader.retry(changed);
+                }
                 Ok(routes) => {
                     let elapsed = reload_start.elapsed().as_millis();
                     info!(

@@ -525,6 +525,18 @@ impl ConfigReloader {
         self.compare(now, forced);
     }
 
+    /// Ask for `changed` to be reported again. The fingerprints are forgotten,
+    /// so the next poll sees the files as changed. Use it when a reload failed
+    /// for a reason that is not the file's fault and a retry may succeed.
+    pub fn retry(&mut self, changed: Changed) {
+        if changed.site {
+            self.seen.site = None;
+        }
+        if changed.process {
+            self.seen.process = None;
+        }
+    }
+
     /// Call on every loop iteration. Returns the change when a report is due.
     pub fn tick(&mut self, now: Instant) -> Option<Changed> {
         if now >= self.next_poll {
@@ -936,6 +948,20 @@ mod tests {
         r.on_readable(Instant::now());
         let c = r.tick(Instant::now()).expect("the event was a change");
         assert!(c.process && !c.site, "{c:?}");
+    }
+
+    #[test]
+    fn a_retried_change_is_reported_again_by_the_poll() {
+        let (_d, site, proc, seen) = pair();
+        let mut r = ConfigReloader::polling_only(&site, &proc, seen);
+        put(&proc, "b = 12\n");
+        let t0 = Instant::now() + RELOAD_POLL;
+        let c = r.tick(t0).expect("reported");
+        // The reload failed and asks to be tried again.
+        r.retry(c);
+        let t1 = t0 + RELOAD_POLL;
+        let again = r.tick(t1).expect("the poll reports it again");
+        assert!(again.process && !again.site, "{again:?}");
     }
 
     #[test]
