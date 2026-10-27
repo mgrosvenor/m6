@@ -315,7 +315,13 @@ impl ConfigWatcher {
 /// window of quiet ends, so a burst is at most two reports and a single write
 /// is exactly one. Reporting at once keeps a backend from reloading later than
 /// an edge that cleared its cache on the same change.
-pub const RELOAD_DEBOUNCE: Duration = Duration::from_millis(100);
+///
+/// The window is short on purpose. It has to cover a writer that truncates a
+/// file and then writes it, which the first report can land between, and it
+/// must not hold back a second touch that follows the first by a few tens of
+/// milliseconds, because every held change is time in which an edge's cache can
+/// refill from a backend that has not reloaded.
+pub const RELOAD_DEBOUNCE: Duration = Duration::from_millis(20);
 
 /// How often the reloader compares fingerprints whatever the watcher says, and
 /// the longest a batch of changes is held back.
@@ -535,14 +541,19 @@ impl ConfigReloader {
                 process: true,
             };
         }
-        self.due = Some(match (self.window_end, self.first) {
-            // A change inside the window of an earlier report: one more report
-            // when the burst settles, and never later than a second after the
-            // window opened.
-            (Some(_), Some(first)) => (now + RELOAD_DEBOUNCE).min(first + RELOAD_POLL).max(now),
-            // The first change after quiet: report at once.
-            _ => now,
-        });
+        self.due = Some(
+            match (
+                self.window_end.filter(|w| now < *w || self.due.is_some()),
+                self.first,
+            ) {
+                // A change inside the window of an earlier report: one more report
+                // when the burst settles, and never later than a second after the
+                // window opened.
+                (Some(_), Some(first)) => (now + RELOAD_DEBOUNCE).min(first + RELOAD_POLL).max(now),
+                // The first change after quiet: report at once.
+                _ => now,
+            },
+        );
     }
 }
 
@@ -852,6 +863,22 @@ mod tests {
             r.next_poll_for_test(t0 + Duration::from_millis(ms));
             assert_eq!(r.tick(t0 + Duration::from_millis(ms)), None, "{ms} ms");
         }
+    }
+
+    #[test]
+    fn a_change_soon_after_a_report_is_not_held_for_long() {
+        // A publisher that touches the config twice in quick succession needs
+        // the second reload promptly: an edge clears its cache on each touch,
+        // and a backend that reloads late leaves a stale page cached.
+        let (_d, site, proc, seen) = pair();
+        let mut r = ConfigReloader::polling_only(&site, &proc, seen);
+        let t0 = Instant::now() + RELOAD_POLL;
+        put(&proc, "b = 12\n");
+        assert!(r.tick(t0).is_some());
+        put(&proc, "b = 123\n");
+        let at = t0 + Duration::from_millis(40);
+        r.next_poll_for_test(at);
+        assert!(r.tick(at).is_some(), "a change 40 ms later was held back");
     }
 
     #[test]

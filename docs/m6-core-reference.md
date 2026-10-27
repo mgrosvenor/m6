@@ -330,7 +330,7 @@ due. Which file changed is decided by a `Fingerprint` (device, inode,
 length, mtime and ctime). The event name plays no part, so inotify and kqueue
 give the same answer and a file beside the config in the same directory is
 ignored. The first change after quiet is reported at once. A change within
-`RELOAD_DEBOUNCE` (100 ms) of a report is held and reported once more when the
+`RELOAD_DEBOUNCE` (20 ms) of a report is held and reported once more when the
 burst settles, capped at `RELOAD_POLL` (one second). A burst is at most two
 reports. The fingerprints are
 also compared every `RELOAD_POLL` whatever the watcher says, which finds a lost

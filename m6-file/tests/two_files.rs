@@ -315,10 +315,9 @@ fn a_single_write_is_one_reload_with_no_delay() {
     std::fs::write(&tmp, conf_body("# one", 2)).unwrap();
     std::fs::rename(&tmp, r.conf()).unwrap();
     assert!(wait_for(&r, "Reload complete", 1), "{}", r.svc.output());
-    // The poll loop wakes every 100 ms at most; a debounce before the first
-    // report would add its own 100 ms on top.
+    // The first report is not delayed by the settle window.
     assert!(
-        t.elapsed() < Duration::from_millis(250),
+        t.elapsed() < Duration::from_millis(150),
         "first report took {:?}",
         t.elapsed()
     );
