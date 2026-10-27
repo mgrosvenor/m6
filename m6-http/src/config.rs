@@ -298,10 +298,10 @@ pub struct HealthConfig {
     #[serde(default)]
     pub metrics_peers: Option<Vec<String>>,
     /// `metrics_peers`, parsed and canonical (an IPv4-mapped IPv6 address is
-    /// stored as IPv4), filled by `load`. Compared on the request path with no
-    /// allocation.
+    /// stored as IPv4), filled by `load`. The gate reads only this: `None`
+    /// means no address rule. Compared on the request path with no allocation.
     #[serde(skip)]
-    pub metrics_peer_ips: Vec<std::net::IpAddr>,
+    pub metrics_peer_ips: Option<Vec<std::net::IpAddr>>,
 }
 
 fn default_perf_path() -> String {
@@ -332,7 +332,7 @@ impl Default for HealthConfig {
             traffic_cache_s: default_traffic_cache_s(),
             metrics_require: None,
             metrics_peers: None,
-            metrics_peer_ips: Vec::new(),
+            metrics_peer_ips: None,
         }
     }
 }
@@ -720,9 +720,11 @@ struct RawSystemHealth {
 /// Only an IP literal in a local range is accepted. A name is never resolved,
 /// a range is not a peer, and a public or wildcard address could never be a
 /// private monitor, so each is a load error.
-fn validate_metrics_peers(peers: Option<&[String]>) -> anyhow::Result<Vec<std::net::IpAddr>> {
+fn validate_metrics_peers(
+    peers: Option<&[String]>,
+) -> anyhow::Result<Option<Vec<std::net::IpAddr>>> {
     let Some(peers) = peers else {
-        return Ok(Vec::new());
+        return Ok(None);
     };
     if peers.is_empty() {
         anyhow::bail!(
@@ -743,7 +745,7 @@ fn validate_metrics_peers(peers: Option<&[String]>) -> anyhow::Result<Vec<std::n
         }
         ips.push(ip.to_canonical());
     }
-    Ok(ips)
+    Ok(Some(ips))
 }
 
 // ── Loading ─────────────────────────────────────────────────────────────────
@@ -1099,10 +1101,10 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         if auth.is_none() {
             anyhow::bail!("config error: [health].metrics_require needs [auth] with a public_key");
         }
-        let named = r
-            .strip_prefix("role:")
-            .or_else(|| r.strip_prefix("group:"))
-            .is_some_and(|n| !n.is_empty());
+        let named = matches!(
+            crate::auth::Require::parse(r),
+            Some(crate::auth::Require::Role(n) | crate::auth::Require::Group(n)) if !n.is_empty()
+        );
         if !named {
             anyhow::bail!(
                 "config error: [health].metrics_require = \"{r}\" must be \"role:<name>\" or \"group:<name>\""
@@ -2002,8 +2004,9 @@ internal_binds = ["203.0.113.7:80"]
             "",
         );
         let h = r.unwrap().health;
-        assert_eq!(h.metrics_peer_ips.len(), 4);
-        assert!(h.metrics_peer_ips.contains(&"fd00::5".parse().unwrap()));
+        let ips = h.metrics_peer_ips.expect("peers set");
+        assert_eq!(ips.len(), 4);
+        assert!(ips.contains(&"fd00::5".parse().unwrap()));
     }
 
     #[test]
@@ -2012,7 +2015,7 @@ internal_binds = ["203.0.113.7:80"]
         let h = r.unwrap().health;
         assert_eq!(
             h.metrics_peer_ips,
-            vec!["10.0.0.9".parse::<std::net::IpAddr>().unwrap()]
+            Some(vec!["10.0.0.9".parse::<std::net::IpAddr>().unwrap()])
         );
     }
 
@@ -2083,7 +2086,7 @@ internal_binds = ["203.0.113.7:80"]
         assert_eq!(h.metrics_require.as_deref(), Some("role:system"));
         assert_eq!(
             h.metrics_peer_ips,
-            vec!["10.0.0.2".parse::<std::net::IpAddr>().unwrap()]
+            Some(vec!["10.0.0.2".parse::<std::net::IpAddr>().unwrap()])
         );
     }
 
@@ -2095,7 +2098,7 @@ internal_binds = ["203.0.113.7:80"]
         );
         let h = r.unwrap().health;
         assert_eq!(h.metrics_require.as_deref(), Some("role:site"));
-        assert_eq!(h.metrics_peer_ips.len(), 1);
+        assert_eq!(h.metrics_peer_ips.map(|p| p.len()), Some(1));
     }
 
     #[test]
@@ -2111,7 +2114,7 @@ internal_binds = ["203.0.113.7:80"]
         let h = r.unwrap().health;
         assert_eq!(h.metrics_require, None);
         assert_eq!(h.metrics_peers, None);
-        assert!(h.metrics_peer_ips.is_empty());
+        assert_eq!(h.metrics_peer_ips, None);
     }
 
     #[test]
@@ -2126,6 +2129,6 @@ internal_binds = ["203.0.113.7:80"]
         let cfg = load(dir.path(), &same).expect("one file for both loads");
         assert_eq!(cfg.auth.expect("auth").public_key, "auth.pem");
         assert_eq!(cfg.health.perf_path, "/p");
-        assert_eq!(cfg.health.metrics_peer_ips.len(), 1);
+        assert_eq!(cfg.health.metrics_peer_ips.map(|p| p.len()), Some(1));
     }
 }

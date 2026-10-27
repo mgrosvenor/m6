@@ -16,7 +16,7 @@ use quiche::h3::NameValue as _;
 use rustls::StreamOwned;
 
 use m6_core::testkit::{self, claim_port, PortClaim, Service};
-use m6_http_lib::forward::HttpRequest;
+use m6_http_lib::forward::{HttpRequest, HttpResponse};
 use m6_http_lib::h2c_client::H2cClientConn;
 use m6_http_lib::h2s_client::H2sTlsClientConn;
 
@@ -248,6 +248,51 @@ impl Fixture {
     }
 }
 
+/// A GET for `path` with `extra` headers, as the h2 and h2c clients take it.
+fn get_req(path: &str, extra: &[(&str, &str)], version: &str) -> HttpRequest {
+    HttpRequest {
+        method: "GET".to_string(),
+        path: path.to_string(),
+        query: None,
+        version: version.to_string(),
+        headers: extra
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        body: Vec::new(),
+    }
+}
+
+/// Drive a client connection until `rx` answers, or ten seconds pass.
+fn await_resp(
+    label: &str,
+    rx: &mpsc::Receiver<std::io::Result<HttpResponse>>,
+    mut drive: impl FnMut(),
+) -> Resp {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        drive();
+        match rx.try_recv() {
+            Ok(Ok(r)) => {
+                return Resp {
+                    status: r.status,
+                    headers: r
+                        .headers
+                        .iter()
+                        .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
+                        .collect(),
+                    body: r.body,
+                }
+            }
+            Ok(Err(e)) => return no_response(format!("{label} response: {e}")),
+            Err(mpsc::TryRecvError::Empty) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(e) => return no_response(format!("{label} wait: {e:?}")),
+        }
+    }
+}
+
 struct Running {
     svc: Service,
     fx: Fixture,
@@ -283,43 +328,16 @@ impl Running {
             conn.drive();
             std::thread::sleep(Duration::from_millis(1));
         }
-        let req = HttpRequest {
-            method: "GET".to_string(),
-            path: path.to_string(),
-            query: None,
-            version: "HTTP/1.1".to_string(),
-            headers: extra
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
-            body: Vec::new(),
-        };
-        let rx = match conn.dispatch(&req, "127.0.0.1", client_ip, "localhost") {
+        let rx = match conn.dispatch(
+            &get_req(path, extra, "HTTP/1.1"),
+            "127.0.0.1",
+            client_ip,
+            "localhost",
+        ) {
             Ok(rx) => rx,
             Err(e) => return no_response(format!("h2c dispatch: {e}")),
         };
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            conn.drive();
-            match rx.try_recv() {
-                Ok(Ok(r)) => {
-                    return Resp {
-                        status: r.status,
-                        headers: r
-                            .headers
-                            .iter()
-                            .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
-                            .collect(),
-                        body: r.body,
-                    }
-                }
-                Ok(Err(e)) => return no_response(format!("h2c response: {e}")),
-                Err(mpsc::TryRecvError::Empty) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                Err(e) => return no_response(format!("h2c wait: {e:?}")),
-            }
-        }
+        await_resp("h2c", &rx, || conn.drive())
     }
 
     /// One HTTP/1.1 GET over TLS on a fresh connection.
@@ -386,43 +404,16 @@ impl Running {
             Ok(c) => c,
             Err(e) => return no_response(format!("h2 connect: {e}")),
         };
-        let req = HttpRequest {
-            method: "GET".to_string(),
-            path: path.to_string(),
-            query: None,
-            version: "HTTP/2".to_string(),
-            headers: extra
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
-            body: Vec::new(),
-        };
-        let rx = match conn.dispatch(&req, "localhost", client_ip, "localhost") {
+        let rx = match conn.dispatch(
+            &get_req(path, extra, "HTTP/2"),
+            "localhost",
+            client_ip,
+            "localhost",
+        ) {
             Ok(rx) => rx,
             Err(e) => return no_response(format!("h2 dispatch: {e}")),
         };
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            conn.drive();
-            match rx.try_recv() {
-                Ok(Ok(r)) => {
-                    return Resp {
-                        status: r.status,
-                        headers: r
-                            .headers
-                            .iter()
-                            .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
-                            .collect(),
-                        body: r.body,
-                    }
-                }
-                Ok(Err(e)) => return no_response(format!("h2 response: {e}")),
-                Err(mpsc::TryRecvError::Empty) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                Err(e) => return no_response(format!("h2 wait: {e:?}")),
-            }
-        }
+        await_resp("h2", &rx, || conn.drive())
     }
 
     /// One HTTP/3 GET over QUIC.
@@ -646,27 +637,12 @@ fn assert_report(proto: &str, r: &Resp) {
 }
 
 #[test]
-fn perf_answers_a_listed_peer_with_the_role_over_h1() {
+fn perf_answers_a_listed_peer_with_the_role_over_h1_h2_h3() {
     let run = Fixture::new(&gated(), "", "").start();
     let auth = bearer(&run.token(&["monitor"]));
-    assert_report("h1", &run.h1("/perf", &[("Authorization", &auth)]));
-}
-
-#[test]
-fn perf_answers_a_listed_peer_with_the_role_over_h2() {
-    let run = Fixture::new(&gated(), "", "").start();
-    let auth = bearer(&run.token(&["monitor"]));
-    assert_report(
-        "h2",
-        &run.h2("/perf", &[("Authorization", &auth)], "127.0.0.1"),
-    );
-}
-
-#[test]
-fn perf_answers_a_listed_peer_with_the_role_over_h3() {
-    let run = Fixture::new(&gated(), "", "").start();
-    let auth = bearer(&run.token(&["monitor"]));
-    assert_report("h3", &run.h3("/perf", &[("Authorization", &auth)]));
+    for (proto, r) in run.all("/perf", &[("Authorization", &auth)]) {
+        assert_report(proto, &r);
+    }
 }
 
 #[test]
@@ -763,15 +739,14 @@ fn traffic_follows_the_same_rule() {
     let run = Fixture::new(&gated(), "", "").start();
     let good = bearer(&run.token(&["monitor"]));
     let reader = bearer(&run.token(&["reader"]));
-    for proto in ["h1", "h2", "h3"] {
-        let get = |extra: &[(&str, &str)]| match proto {
-            "h1" => run.h1("/traffic", extra),
-            "h2" => run.h2("/traffic", extra, "127.0.0.1"),
-            _ => run.h3("/traffic", extra),
-        };
-        assert_eq!(get(&[("Authorization", &good)]).status, 200, "{proto}");
-        assert_eq!(get(&[]).status, 401, "{proto}");
-        assert_eq!(get(&[("Authorization", &reader)]).status, 403, "{proto}");
+    for (want, extra) in [
+        (200, vec![("Authorization", good.as_str())]),
+        (401, vec![]),
+        (403, vec![("Authorization", reader.as_str())]),
+    ] {
+        for (proto, r) in run.all("/traffic", &extra) {
+            assert_eq!(r.status, want, "{proto}: {}", r.text());
+        }
     }
 }
 

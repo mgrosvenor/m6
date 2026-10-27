@@ -92,23 +92,34 @@ impl PublicKey {
     }
 }
 
+/// A `require` string: the claim list it reads and the name that must be in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Require<'a> {
+    Role(&'a str),
+    Group(&'a str),
+}
+
+impl<'a> Require<'a> {
+    /// Parse `"role:<name>"` or `"group:<name>"`. `None` for any other form.
+    /// The one definition of the format, read by the request-path check and
+    /// by config validation.
+    pub fn parse(require: &'a str) -> Option<Self> {
+        if let Some(group) = require.strip_prefix("group:") {
+            return Some(Self::Group(group));
+        }
+        require.strip_prefix("role:").map(Self::Role)
+    }
+}
+
 /// Check if claims satisfy the `require` string.
-/// Format: "group:<name>" or "role:<name>"
+/// Format: "group:<name>" or "role:<name>". Any other form denies.
 pub fn check_require(claims: &Claims, require: &str) -> bool {
-    if let Some(group) = require.strip_prefix("group:") {
-        if let Some(ref groups) = claims.groups {
-            return groups.iter().any(|g| g == group);
-        }
-        return false;
-    }
-    if let Some(role) = require.strip_prefix("role:") {
-        if let Some(ref roles) = claims.roles {
-            return roles.iter().any(|r| r == role);
-        }
-        return false;
-    }
-    // Unknown require format — deny
-    false
+    let (list, name) = match Require::parse(require) {
+        Some(Require::Group(g)) => (&claims.groups, g),
+        Some(Require::Role(r)) => (&claims.roles, r),
+        None => return false,
+    };
+    list.as_ref().is_some_and(|l| l.iter().any(|v| v == name))
 }
 
 /// Extract JWT token from Authorization header or session cookie.
@@ -202,6 +213,7 @@ pub fn extract_refresh_cookie(cookie_header: Option<&str>) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+    use super::test_keys::{bearer, keypair, mint};
     use super::*;
 
     #[test]
@@ -336,42 +348,6 @@ mod tests {
         assert_eq!(extract_refresh_cookie(None), None);
     }
 
-    /// A verify key on disk, plus the matching signing key.
-    fn keypair() -> (tempfile::TempDir, PublicKey, String) {
-        let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("ec keypair");
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pub.pem");
-        std::fs::write(&path, kp.public_key_pem()).unwrap();
-        let key = PublicKey::from_pem_file(&path).unwrap();
-        (dir, key, kp.serialize_pem())
-    }
-
-    /// Mint an ES256 token with `roles`, expiring `exp_offset_s` from now.
-    fn mint(private_pem: &str, roles: &[&str], exp_offset_s: i64) -> String {
-        #[derive(serde::Serialize)]
-        struct C {
-            sub: String,
-            exp: i64,
-            roles: Vec<String>,
-        }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-        let claims = C {
-            sub: "t".to_string(),
-            exp: now + exp_offset_s,
-            roles: roles.iter().map(|r| r.to_string()).collect(),
-        };
-        let key = jsonwebtoken::EncodingKey::from_ec_pem(private_pem.as_bytes()).unwrap();
-        let header = jsonwebtoken::Header::new(Algorithm::ES256);
-        jsonwebtoken::encode(&header, &claims, &key).unwrap()
-    }
-
-    fn bearer(token: &str) -> Vec<(String, String)> {
-        vec![("authorization".to_string(), format!("Bearer {token}"))]
-    }
-
     #[test]
     fn authorise_without_a_token_is_no_token() {
         let (_d, key, _) = keypair();
@@ -422,5 +398,47 @@ mod tests {
             ("cookie".to_string(), format!("session={t}")),
         ];
         assert!(authorise(&key, &headers, "role:monitor").is_ok());
+    }
+}
+
+/// ES256 fixtures shared by this crate's unit tests.
+#[cfg(test)]
+pub(crate) mod test_keys {
+    use super::PublicKey;
+
+    /// A verify key on disk, plus the matching signing key.
+    pub(crate) fn keypair() -> (tempfile::TempDir, PublicKey, String) {
+        let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("ec keypair");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pub.pem");
+        std::fs::write(&path, kp.public_key_pem()).unwrap();
+        let key = PublicKey::from_pem_file(&path).unwrap();
+        (dir, key, kp.serialize_pem())
+    }
+
+    /// Mint an ES256 token with `roles`, expiring `exp_offset_s` from now.
+    pub(crate) fn mint(private_pem: &str, roles: &[&str], exp_offset_s: i64) -> String {
+        #[derive(serde::Serialize)]
+        struct C {
+            sub: String,
+            exp: i64,
+            roles: Vec<String>,
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let claims = C {
+            sub: "t".to_string(),
+            exp: now + exp_offset_s,
+            roles: roles.iter().map(|r| r.to_string()).collect(),
+        };
+        let key = jsonwebtoken::EncodingKey::from_ec_pem(private_pem.as_bytes()).unwrap();
+        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
+        jsonwebtoken::encode(&header, &claims, &key).unwrap()
+    }
+
+    pub(crate) fn bearer(token: &str) -> Vec<(String, String)> {
+        vec![("authorization".to_string(), format!("Bearer {token}"))]
     }
 }
