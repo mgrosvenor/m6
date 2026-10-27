@@ -172,7 +172,7 @@ Table 4 is the reserved set, and a key in it never reaches a template.
 | `global_params` | core | JSON files merged into every request dictionary |
 | `secrets_file` | core | a second TOML file merged with this one, so a secret stays out of the tracked configuration. One key, one owner: a key set in both files is refused with an error naming every clash |
 | `flash_secret` | core, feature `flash` | the HMAC key for flash cookies. Absent with the feature on is exit 2 |
-| `site_toml` | core | the path of `site.toml`. Absolute as given, relative to `site_dir`, default `<site_dir>/site.toml`. A named file that does not exist is exit 2 |
+| `site_toml` | core | the path of `site.toml`. Absolute as given, relative to `site_dir`, default `<site_dir>/site.toml`. A named file that does not exist, cannot be read or is not valid TOML is exit 2 |
 | `[errors]` | `m6-http`, in `site.toml` | reserved, so it does not reach the request dictionary. The section itself belongs to `site.toml` |
 | `[multipart]` | nothing | reserved and read by no code in this repository. `m6-render-lib.md` documents `max_size_mb` under it and nothing enforces it |
 

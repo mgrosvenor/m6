@@ -56,11 +56,15 @@ The docs list which file each key belongs in.
 **Two signatures changed.**
 `m6_core::compress::check_declared_support` and `m6_core::log::read_site_log_config` take the path of `site.toml` where they took the site directory.
 `AuthConfig::load` in m6-auth-server takes it as a third argument.
+The public struct `AppContext` gained a `site_toml` field, so a struct literal of it outside m6-core no longer compiles.
+A service reads the context a handler or initialiser is given and does not build one, so this reaches only code that builds an `AppContext` by hand.
 
-Migration: none is required.
+Migration: a caller of the two functions or of `AuthConfig::load` passes the `site.toml` path.
+Code that builds an `AppContext` by hand adds the field.
 A service that does not set `site_toml` behaves as before, and a misplaced key keeps working and is named in a warning.
+A system config that holds a relative `[auth] public_key` or `[health] metrics_token_file` no longer fails to start, and its path now resolves against the site directory.
 
-**Verified** by unit tests for the key, its resolution and its refusals, by m6-file starting on a per-app root and exiting 2 on the compression disagreement it could only see through `site_toml`, by m6-auth-server taking its issuer from the named file, and by m6-http tests for the token file and for each warning.
+**Verified** by unit tests for the key, its resolution and its refusals, by m6-file starting on a per-app root and exiting 2 on the compression disagreement it could only see through `site_toml`, by m6-auth-server taking its issuer from the named file, by m6-core tests for a named `site.toml` that is a directory, unreadable or invalid and for `touch("site.toml")` with a file outside the site directory, and by m6-http tests for the relative key paths, the `[node]` warning, and one table-driven test that every misplaced key warns in the wrong file and not in the right one.
 
 ---
 

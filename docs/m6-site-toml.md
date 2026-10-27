@@ -306,7 +306,8 @@ An app that has its own root under `apps/` sets it to reach the `site.toml` at t
 site_toml = "../../site.toml"
 ```
 
-A named file that does not exist stops the app at start with exit 2.
+A named file that does not exist, cannot be read or is not valid TOML stops the app at start with exit 2.
+A file at the default path may be absent or invalid, as before.
 `--dump-config` prints the resolved path on a `site.toml` line.
 
 ### `site.toml` is clean
