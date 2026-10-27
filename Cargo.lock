@@ -1807,6 +1807,7 @@ version = "1.14.0"
 dependencies = [
  "anyhow",
  "m6-auth",
+ "m6-core",
  "rpassword",
  "serde",
  "serde_json",
