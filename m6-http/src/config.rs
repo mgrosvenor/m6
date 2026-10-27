@@ -814,8 +814,8 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         .with_context(|| format!("reading {}", system_config_path.display()))?;
     let mut system_parsed: RawSystemToml = toml::from_str(&system_raw)
         .with_context(|| format!("parsing {}", system_config_path.display()))?;
-    // One file given as both site.toml and the system config is read once:
-    // its [auth] and [health] are site.toml's, not a second declaration.
+    // When both arguments name the same file, its [auth] and [health] belong
+    // to the site config alone, not to a second declaration.
     let one_file = match (
         std::fs::canonicalize(&site_toml_path),
         std::fs::canonicalize(system_config_path),

@@ -447,7 +447,7 @@ static READ_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 use std::sync::{Arc, RwLock};
 
 /// Cache backed by `Arc<RwLock<HashMap>>` — swap the whole map atomically.
-/// Clone is cheap — just clones the Arc.
+/// Clone is cheap, as it only clones the Arc.
 #[derive(Clone)]
 pub struct Cache {
     map: Arc<RwLock<CacheMap>>,

@@ -477,7 +477,8 @@ pub fn read_recent(
 /// when the live tail already filled `max_bytes`,
 /// when the rotated file was last written before `since`,
 /// or when it is a gzip file too large to decode within the bound.
-/// This runs on a request thread, so the work is bounded by `max_bytes` whatever the size of the files.
+/// This runs on its caller's thread, so the work is bounded by `max_bytes` whatever the size of the files.
+/// A `.gz` file is decoded only when its size on disk and the size in its trailer are within `max_bytes`, and decoding stops at `max_bytes`.
 /// A rotated file that cannot be read costs that history and nothing else.
 /// A first line, or the first line after the join, that starts mid-record is expected and is the caller's to skip.
 pub fn read_recent_counted(
