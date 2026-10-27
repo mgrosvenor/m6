@@ -2397,14 +2397,36 @@ internal_binds = ["203.0.113.7:80"]
     #[test]
     fn every_misplaced_key_warns_in_the_wrong_file_and_not_in_the_right_one() {
         let all = every_placed_key();
-        // The tables must not shrink without this test noticing.
+        // Every field of `RawServerSection` and `RawSystemHealth` is placed
+        // in one list or another. Dropping a key from a list fails here.
+        let mut server: Vec<&str> = NODE_SERVER_KEYS
+            .iter()
+            .chain(SITE_SERVER_KEYS)
+            .copied()
+            .collect();
+        server.sort_unstable();
         assert_eq!(
-            all.len(),
-            NODE_SERVER_KEYS.len()
-                + NODE_HEALTH_KEYS.len()
-                + SITE_SERVER_KEYS.len()
-                + NODE_SECTIONS.len()
+            server,
+            [
+                "allowed_methods",
+                "backend_timeout_secs",
+                "bind",
+                "h2c_bind",
+                "internal_binds",
+                "redirect_bind",
+                "tls_cert",
+                "tls_key",
+                "warm_on_start",
+            ]
         );
+        let mut health = NODE_HEALTH_KEYS.to_vec();
+        health.sort_unstable();
+        assert_eq!(
+            health,
+            ["metrics_peers", "metrics_require", "metrics_token_file"]
+        );
+        assert_eq!(NODE_SECTIONS, ["auth", "node"]);
+        assert_eq!(all.len(), 9 + 3 + 2);
         for (section, key, belongs_in_system) in all {
             let body = match key {
                 Some(k) => format!("[{section}]\n{k} = 1\n"),
