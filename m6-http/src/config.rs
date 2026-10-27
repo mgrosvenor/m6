@@ -713,6 +713,9 @@ struct RawSystemToml {
 struct RawSystemHealth {
     metrics_require: Option<String>,
     metrics_peers: Option<Vec<String>>,
+    /// A credential path, so it belongs to the node. Absolute only, as
+    /// `[auth].public_key` is in this file.
+    metrics_token_file: Option<String>,
 }
 
 /// Parse `[health] metrics_peers` into canonical addresses.
@@ -965,8 +968,25 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
     let log = site_parsed.log.unwrap_or_default();
     let analytics = site_parsed.analytics.unwrap_or_default();
     let mut health = site_parsed.health.unwrap_or_default();
+    // The system config wins key by key, as [server] keys do.
+    if let Some(sys) = system_health {
+        health.metrics_require = sys.metrics_require.or(health.metrics_require);
+        health.metrics_peers = sys.metrics_peers.or(health.metrics_peers);
+        if let Some(p) = sys.metrics_token_file {
+            // A relative path here would resolve against the process's working
+            // directory, which is surprising for a file named beside the
+            // system config.
+            if !Path::new(&p).is_absolute() {
+                anyhow::bail!(
+                    "config error: [health].metrics_token_file in the system config must be an absolute path, got \"{p}\""
+                );
+            }
+            health.metrics_token_file = Some(p);
+        }
+    }
     // Read the token here so the running server never touches the file on the
-    // request path. Failure is deliberately not fatal: a missing token file
+    // request path. It is read after the merge so that a path from either file
+    // is the one read. Failure is deliberately not fatal: a missing token file
     // means /perf answers 404 (fails closed), and refusing to boot the whole
     // server over a metrics credential would be disproportionate -- the same
     // call made for the inert `cache =` route key. It is reported by
@@ -977,11 +997,6 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
             .ok()
             .map(|t| t.trim().to_string())
             .filter(|t| !t.is_empty());
-    }
-    // The system config wins key by key, as [server] keys do.
-    if let Some(sys) = system_health {
-        health.metrics_require = sys.metrics_require.or(health.metrics_require);
-        health.metrics_peers = sys.metrics_peers.or(health.metrics_peers);
     }
     health.metrics_peer_ips = validate_metrics_peers(health.metrics_peers.as_deref())?;
     let rate_limit = site_parsed.rate_limit.unwrap_or_default();
@@ -2130,5 +2145,51 @@ internal_binds = ["203.0.113.7:80"]
         assert_eq!(cfg.auth.expect("auth").public_key, "auth.pem");
         assert_eq!(cfg.health.perf_path, "/p");
         assert_eq!(cfg.health.metrics_peer_ips.map(|p| p.len()), Some(1));
+    }
+
+    // --- misplaced_keys and metrics_token_file placement ---
+
+    #[test]
+    fn metrics_token_file_in_the_system_config_wins() {
+        let dir = make_test_dir();
+        setup_minimal(dir.path());
+        let site_token = dir.path().join("site-token");
+        let sys_token = dir.path().join("sys-token");
+        std::fs::write(&site_token, "from-site\n").unwrap();
+        std::fs::write(&sys_token, "from-system\n").unwrap();
+        let mut site = minimal_site_toml();
+        site.push_str(&format!(
+            "\n[health]\nmetrics_token_file = \"{}\"\n",
+            site_token.display()
+        ));
+        write_file(dir.path(), "site.toml", &site);
+        let mut sys = minimal_system_toml();
+        sys.push_str(&format!(
+            "\n[health]\nmetrics_token_file = \"{}\"\n",
+            sys_token.display()
+        ));
+        write_file(dir.path(), "system.toml", &sys);
+        let h = load(dir.path(), &dir.path().join("system.toml"))
+            .unwrap()
+            .health;
+        assert_eq!(h.metrics_token_file.as_deref(), sys_token.to_str());
+        assert_eq!(h.metrics_token.as_deref(), Some("from-system"));
+
+        // Alone in the system config it is read too.
+        write_file(dir.path(), "site.toml", &minimal_site_toml());
+        let h = load(dir.path(), &dir.path().join("system.toml"))
+            .unwrap()
+            .health;
+        assert_eq!(h.metrics_token.as_deref(), Some("from-system"));
+    }
+
+    #[test]
+    fn a_relative_metrics_token_file_in_the_system_config_is_refused() {
+        let (_d, r) = load_with("", "\n[health]\nmetrics_token_file = \"token\"\n");
+        let e = format!("{:#}", r.unwrap_err());
+        assert!(
+            e.contains("metrics_token_file in the system config must be an absolute path"),
+            "{e}"
+        );
     }
 }
