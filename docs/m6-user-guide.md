@@ -1336,6 +1336,60 @@ It skips a rotated file last written before the window, and a `.gz` file larger 
 
 ---
 
+### Monitor history
+
+`m6-monitor` keeps a history of every poll when `[monitor] history_file` is set, and serves it as JSON Lines.
+We cover the keys, the two endpoints, paging, how to protect them and what the history leaves out.
+
+| key (`[monitor]`) | default | rule |
+|---|---|---|
+| `history_file` | absent, so no history | a non-empty path, relative to the site directory |
+| `history_max_mb` | 256 | 1 to 1048576 |
+
+**Table: the history keys.**
+Both are read at start, so a change needs a restart.
+
+The file holds one row per node per poll, one row per channel and interface, the text of every finding, and once per `/traffic` window the response status counts and crawler sightings of each node.
+When the file passes `history_max_mb`, the oldest polls are deleted until it is 5% under the cap, and nothing expires by age.
+A write that fails is a warning on node `monitor` and never stops polling.
+To start fresh, stop the service, delete the file and start it again.
+
+`GET /history` and `GET /crawlers` answer on the service's unix socket and nowhere else.
+Both take `from` and `to` as RFC 3339 UTC times, the range `[from, to)` is at most 31 days, and `node` limits the answer to one node.
+A page holds at most 4 MiB and 10,000 rows, and a `Link: <...>; rel="next"` header names the next page until the last one.
+
+```
+curl --unix-socket /run/m6/m6-monitor.sock \
+  'http://localhost/history?from=2026-01-01T00:00:00Z&to=2026-01-02T00:00:00Z&node=edge-a'
+```
+
+The monitor has no listener and no token code.
+Put an m6-http in front of the socket and protect the routes with `require`, the way Example 11 protects its API:
+
+```toml
+[[backend]]
+name    = "monitor"
+sockets = "/run/m6/m6-monitor.sock"
+
+[[route]]
+path    = "/history"
+backend = "monitor"
+require = "role:admin"
+cache   = "no-store"
+
+[[route]]
+path    = "/crawlers"
+backend = "monitor"
+require = "role:admin"
+cache   = "no-store"
+```
+
+The node's own `periodic stats` log is not a substitute.
+It sits in the node's journal, which is capped, and it has no channels, reachability, host figures or tunnel.
+Channel counters include the monitor's own polls and header checks (issue #107), and `monitor_requests` on each node row says how many.
+
+---
+
 ### Deploy updates
 
 ```bash

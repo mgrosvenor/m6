@@ -73,6 +73,39 @@ workspace tests pass with 0 failures, h3 and QUIC included.
 
 ### Added
 
+**m6-monitor keeps a size-capped history of every poll and of crawler sightings, and serves it as paged JSON Lines (#238).**
+A website that runs a fleet monitor can now ask what a node looked like an hour ago or last week.
+Setting `[monitor] history_file` writes every poll to one SQLite file, and `history_max_mb` (default 256, range 1 to 1048576) caps it.
+Without `history_file` nothing is written, `/history` and `/crawlers` answer 503 and section I of `/check` says "off".
+A bad key, or a file written by a newer release, stops the start with exit status 2.
+
+Each poll is one transaction holding the poll's verdict and the text of every finding, one row per node and one row per channel and interface.
+A node row holds reachability, the node's own verdict, the build, uptime, request, cache and backend error counters, hit and miss percentiles with their sample counts, the host figures, the tunnel figures and the log reopen state.
+Once per node per `/traffic` window the history also keeps the response status counts and the crawler sightings.
+A node's window is stored again only after `window_minutes` have passed, so the stored windows tile time without repeating a sighting about 120 times.
+Counters are stored as the node reports them, and the hit rate is computed on output.
+An absent figure is `null`, never 0.
+
+When the file's used bytes pass the cap, the oldest polls are deleted 256 at a time until the file is 5% under it, and every row of a poll goes with it.
+There is no time expiry and no vacuum, so the file stops growing near the cap.
+This uses `m6_core::sqlite::used_bytes` and `prune_oldest`.
+The poller hands each poll to a writer thread through a queue of 8 and never waits.
+A full queue drops the poll and counts it, and a failed write adds one Warn on node `monitor`.
+Measured on 6 channels and one interface, a node row costs 639 bytes with its channels and interface rows.
+
+`GET /history` and `GET /crawlers` take `from` and `to` (RFC 3339 UTC, half open, at most 31 days) and an optional `node`.
+They answer `application/x-ndjson` with `Cache-Control: no-store`, one page of at most 4 MiB and 10,000 rows, and a `Link: rel="next"` header while more rows match.
+Both answer on the unix socket only.
+The monitor has no listener and no token code, so a website puts an m6-http in front of the socket and protects the routes with `require`.
+The reader opens its own read-only connection, copies one page out and closes it before it serialises.
+m6-http links no SQLite.
+
+Why not the periodic stats log: it lives in each node's journal, which is capped, it has no channels, reachability, host figures or tunnel, and it disappears while a node is down, which is when a history is wanted.
+Channel counters include the monitor's own polls and header checks (#107), and `monitor_requests` says how many.
+
+Verified: unit tests cover the schema, the transaction, the cap, the crawler tiling, the cursor and the exact keys of both line shapes, and integration tests run the real binary with an unreachable node.
+They check both endpoints on the socket, the 400 and 503 answers, a failed open, a file newer than the binary, a clean shutdown and that the process listens on no TCP port.
+
 **m6-core has an opt-in `sqlite` feature (#227).**
 A service that wants one SQLite file can enable `sqlite` on m6-core and link nothing else, because the feature re-exports `rusqlite` in the prelude.
 `m6_core::sqlite::open(path)` opens the file with `journal_mode=DELETE`, a 5 second `busy_timeout`, `foreign_keys` on and `recursive_triggers` on, reads each setting back, and returns an error if one does not take effect.
