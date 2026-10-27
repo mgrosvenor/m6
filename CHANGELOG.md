@@ -23,7 +23,10 @@ the version when the release is cut.
 An h2c listener named in `[server] internal_binds` believed the `X-Forwarded-For` of any peer that reached it, so a firewall was the only thing between a forged client address and the rate limiter.
 `[server] internal_peers` now lists the IP addresses it accepts, each in a local range.
 A connection from any other address is closed at accept.
-The log names the first refused connection from each address, then at most one line per address every 60 seconds with the number of refusals since the last line.
+The log writes a line for the first refused connection from each of the first 256 addresses, then at most one line per address every 60 seconds with the number of refusals since the last line.
+Across all addresses it writes at most 32 of those lines in 60 seconds.
+Refusals past that limit, and refusals from addresses beyond the first 256, are counted.
+The first refusal after the 60 seconds ends writes one summary line with the counts and the number of distinct addresses behind them, up to 1024.
 One call to accept handles at most 64 connections, so a peer that connects in a loop cannot hold the event loop.
 The check runs once per connection, and every request on an admitted connection is served as before.
 A peer list with no address of the internal bind's IP family is refused at load.
