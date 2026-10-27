@@ -2382,4 +2382,53 @@ internal_binds = ["203.0.113.7:80"]
         assert!(!node_falls_back(&with));
         assert!(node_falls_back(&without));
     }
+
+    /// Every key `misplaced_keys` knows, as (section, key, belongs in system config).
+    /// A whole-section entry has no key.
+    fn every_placed_key() -> Vec<(&'static str, Option<&'static str>, bool)> {
+        let mut all = Vec::new();
+        all.extend(NODE_SERVER_KEYS.iter().map(|k| ("server", Some(*k), true)));
+        all.extend(NODE_HEALTH_KEYS.iter().map(|k| ("health", Some(*k), true)));
+        all.extend(SITE_SERVER_KEYS.iter().map(|k| ("server", Some(*k), false)));
+        all.extend(NODE_SECTIONS.iter().map(|s| (*s, None, true)));
+        all
+    }
+
+    #[test]
+    fn every_misplaced_key_warns_in_the_wrong_file_and_not_in_the_right_one() {
+        let all = every_placed_key();
+        // The tables must not shrink without this test noticing.
+        assert_eq!(
+            all.len(),
+            NODE_SERVER_KEYS.len()
+                + NODE_HEALTH_KEYS.len()
+                + SITE_SERVER_KEYS.len()
+                + NODE_SECTIONS.len()
+        );
+        for (section, key, belongs_in_system) in all {
+            let body = match key {
+                Some(k) => format!("[{section}]\n{k} = 1\n"),
+                None => format!("[{section}]\nname = 1\n"),
+            };
+            let name = match key {
+                Some(k) => format!("[{section}].{k}"),
+                None => format!("[{section}]"),
+            };
+            let (wrong_site, wrong_system, right_site, right_system) = if belongs_in_system {
+                (body.as_str(), "", "", body.as_str())
+            } else {
+                ("", body.as_str(), body.as_str(), "")
+            };
+            let wrong = misplaced(wrong_site, wrong_system);
+            assert_eq!(wrong.len(), 1, "{name} in the wrong file: {wrong:?}");
+            assert!(
+                wrong[0].contains(&format!("sets {name},"))
+                    || wrong[0].contains(&format!("sets {name} ")),
+                "{name}: {}",
+                wrong[0]
+            );
+            let right = misplaced(right_site, right_system);
+            assert!(right.is_empty(), "{name} in the right file: {right:?}");
+        }
+    }
 }
