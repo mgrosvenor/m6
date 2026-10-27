@@ -67,7 +67,7 @@ feature is missing.
 | `csrf` | off | `Request::verify_csrf`, token generation in the request dictionary. No new dependencies. |
 | `email` | off | `lettre` in the prelude. |
 | `http-client` | off | `ureq` in the prelude. |
-| `sqlite` | off | `sqlite` module: `open`, `migrate`, `append_only`, `used_bytes`, `prune_oldest`, and `rusqlite` in the prelude. Pulls rusqlite 0.31 with bundled SQLite. |
+| `sqlite` | off | `sqlite` module: `open`, `open_reader`, `migrate`, `append_only`, `used_bytes`, `prune_oldest`, and `rusqlite` in the prelude. Pulls rusqlite 0.31 with bundled SQLite. |
 
 `templates` is on by default on purpose, and the reason is a scar: a feature
 that hides code from `cargo test --workspace` is how two `csrf` tests stayed
@@ -344,7 +344,10 @@ for when a reader may be running.
 
 Free functions, all used by the framework and all worth knowing: `parse_query_string`,
 `parse_form_body`, `url_decode`, `url_encode`, `url_encode_path`, `cookie`,
-`parse_cookies`, `parse_auth_claims`, `validate_path_param`.
+`parse_cookies`, `parse_auth_claims`, `validate_path_param`, `single_query_value`.
+
+`single_query_value(query, key)` returns the raw value of a key that may appear once: `None` when absent, `RepeatedKey` when repeated.
+`time_range`, `ndjson::Cursor` and a service's own filter parameters all read through it, so one query string follows one rule.
 
 `url_encode` exists because core could percent-decode and not encode, so callers
 wrote their own encoder. Encoding and decoding are two halves of one block.
@@ -353,7 +356,10 @@ wrote their own encoder. Encoding and decoding are two halves of one block.
 
 Constructors: `render`, `render_with`, `render_status`, `render_dict`,
 `redirect`, `redirect_permanent`, `json`, `json_status`, `html`, `text`,
-`status`, `not_found`, `forbidden`, `bad_request`.
+`status`, `not_found`, `forbidden`, `bad_request`, `refusal`.
+
+`refusal(&message)` is the 400 for a refused request parameter: the message and a newline as plain text, `no-store` and `nosniff`.
+The message must not echo client input.
 
 Builders: `body`, `with_status`, `header`, `cookie`, `flash` (feature `flash`).
 
@@ -543,6 +549,7 @@ versioned list kept in `PRAGMA user_version`, and `schema_version` reads it.
 under a size cap. The cap counts the whole file, and `prune_oldest` returns
 `Pruned { rows_deleted, cap_met }`. `OpenOptions` changes the busy timeout, the journal mode
 (`Journal::Rollback` or `Journal::Wal`) and foreign keys.
+`open_reader(path)` opens an existing file read-only with the busy timeout and nothing else, for a reader beside the writer.
 
 | setting | value | reason |
 |---|---|---|

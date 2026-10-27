@@ -225,6 +225,26 @@ pub fn open(path: &Path) -> Result<Connection, SqliteError> {
     OpenOptions::default().open(path)
 }
 
+/// Open an existing file read-only, for a reader beside the writer.
+///
+/// [`open`] refuses a read-only connection and changes the journal mode, which
+/// a reader must not do. This sets only the [`BUSY_TIMEOUT`], read back, so a
+/// reader waits for the writer's commit like any other connection. A missing
+/// file is an error: a reader never creates one.
+pub fn open_reader(path: &Path) -> Result<Connection, SqliteError> {
+    let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|source| SqliteError::Open {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    let ms: i64 = conn.pragma_query_value(None, "busy_timeout", |r| r.get(0))?;
+    if u128::try_from(ms).ok() != Some(BUSY_TIMEOUT.as_millis()) {
+        return Err(SqliteError::BusyTimeout);
+    }
+    Ok(conn)
+}
+
 /// One step of a schema. `version` counts 1, 2, 3 down the list.
 #[derive(Debug, Clone, Copy)]
 pub struct Migration {
@@ -500,6 +520,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.db");
         (dir, path)
+    }
+
+    #[test]
+    fn a_reader_reads_waits_and_cannot_write() {
+        let (_d, path) = db();
+        assert!(matches!(open_reader(&path), Err(SqliteError::Open { .. })));
+        assert!(!path.exists(), "a reader never creates the file");
+        let w = open(&path).unwrap();
+        w.execute_batch("CREATE TABLE t (x); INSERT INTO t VALUES (1);")
+            .unwrap();
+        let r = open_reader(&path).unwrap();
+        assert_eq!(count(&r, "SELECT count(*) FROM t"), 1);
+        assert_eq!(pragma_s(&r, "busy_timeout"), "5000");
+        let e = r.execute("INSERT INTO t VALUES (2)", []).unwrap_err();
+        assert_eq!(e.sqlite_error_code(), Some(ErrorCode::ReadOnly));
     }
 
     fn count(c: &Connection, sql: &str) -> i64 {

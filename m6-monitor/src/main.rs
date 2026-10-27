@@ -217,25 +217,23 @@ fn plain(status: u16, text: &str) -> Response {
         .header("X-Content-Type-Options", "nosniff")
 }
 
-/// Which table a paged endpoint reads.
-enum Feed {
-    History,
-    Crawlers,
-}
-
 fn history_ndjson(req: &Request, st: &MonitorState) -> Result<Response> {
-    paged(req, st, Feed::History)
+    paged(req, st, history::health_page)
 }
 
 fn crawlers_ndjson(req: &Request, st: &MonitorState) -> Result<Response> {
-    paged(req, st, Feed::Crawlers)
+    paged(req, st, history::crawl_page)
 }
 
 /// The shared read path of `/history` and `/crawlers`.
 ///
 /// The connection is closed before any row is serialised, so the shared lock
 /// is held for one indexed query and no longer.
-fn paged(req: &Request, st: &MonitorState, feed: Feed) -> Result<Response> {
+fn paged<T: history::Keyed>(
+    req: &Request,
+    st: &MonitorState,
+    read: history::PageFn<T>,
+) -> Result<Response> {
     use m6_core::ndjson::{Cursor, Page, PageLimits, Pushed};
 
     let Some(path) = st.history.file() else {
@@ -261,47 +259,45 @@ fn paged(req: &Request, st: &MonitorState, feed: Feed) -> Result<Response> {
     };
     let node = match history::node_param(req.query()) {
         Ok(n) => n,
-        Err(msg) => return Ok(plain(400, &format!("{msg}\n"))),
+        Err(msg) => return Ok(Response::refusal(&msg)),
     };
-    let conn = match history::open_reader(path) {
+    let unavailable =
+        |e: &dyn std::fmt::Display| plain(503, &format!("history is unavailable: {e}\n"));
+    let conn = match m6_core::sqlite::open_reader(path) {
         Ok(c) => c,
-        Err(e) => return Ok(plain(503, &format!("history is unavailable: {e}\n"))),
+        Err(e) => return Ok(unavailable(&e)),
     };
     let node_id = match &node {
         None => None,
         Some(name) => match history::node_id(&conn, name) {
             Ok(Some(id)) => Some(id),
-            Ok(None) => return Ok(plain(400, "`node` names no node in the history\n")),
-            Err(e) => return Ok(plain(503, &format!("history is unavailable: {e}\n"))),
+            Ok(None) => return Ok(Response::refusal(&"`node` names no node in the history")),
+            Err(e) => return Ok(unavailable(&e)),
         },
     };
     let limits = PageLimits::default();
     // One more row than a page holds, so a full page knows where the next starts.
     let want = limits.max_rows().saturating_add(1);
-    let (from, to) = (range.from_unix_ms(), range.to_unix_ms());
+    let rows = match read(
+        &conn,
+        range.from_unix_ms(),
+        range.to_unix_ms(),
+        node_id,
+        after,
+        want,
+    ) {
+        Ok(r) => r,
+        Err(e) => return Ok(unavailable(&e)),
+    };
+    drop(conn);
     let mut page = Page::new(limits);
     let mut next: Option<Cursor> = None;
-    // Each arm copies its rows out, drops the connection, then serialises.
-    macro_rules! fill {
-        ($rows:expr) => {{
-            let rows = match $rows {
-                Ok(r) => r,
-                Err(e) => return Ok(plain(503, &format!("history is unavailable: {e}\n"))),
-            };
-            drop(conn);
-            for r in &rows {
-                let pushed = page.push(r).map_err(anyhow::Error::from)?;
-                if pushed == Pushed::Full {
-                    let c = history::cursor_text(r.at_unix_ms, r.id);
-                    next = Some(Cursor::new(c).map_err(anyhow::Error::from)?);
-                    break;
-                }
-            }
-        }};
-    }
-    match feed {
-        Feed::History => fill!(history::health_page(&conn, from, to, node_id, after, want)),
-        Feed::Crawlers => fill!(history::crawl_page(&conn, from, to, node_id, after, want)),
+    for r in &rows {
+        if page.push(r).map_err(anyhow::Error::from)? == Pushed::Full {
+            let (at_ms, id) = r.key();
+            next = Some(Cursor::new(history::cursor_text(at_ms, id)).map_err(anyhow::Error::from)?);
+            break;
+        }
     }
     Ok(page.into_response(req.query(), next.as_ref()))
 }

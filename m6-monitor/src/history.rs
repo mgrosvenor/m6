@@ -152,7 +152,7 @@ use std::time::Instant;
 use m6_core::monitoring::CrawlerReport;
 use m6_core::sqlite::{
     self,
-    rusqlite::{self, named_params, params, Connection, OpenFlags, OptionalExtension, Transaction},
+    rusqlite::{self, named_params, params, Connection, OptionalExtension, Transaction},
     Migration, SqliteError,
 };
 use m6_core::time_range::rfc3339_utc_ms;
@@ -325,7 +325,7 @@ pub struct TunnelRow {
     pub handshake_detail: Option<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ReopenRow {
     pub state: String,
     pub age_s: Option<i64>,
@@ -351,7 +351,7 @@ pub struct ChannelRow {
     pub miss_p99_ns: Option<i64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct NetRow {
     pub iface: String,
     pub rx_bytes: i64,
@@ -1189,28 +1189,12 @@ fn spawn_writer(rx: Receiver<Batch>, mut w: Writer) -> anyhow::Result<()> {
 
 // ── reading ──────────────────────────────────────────────────────────────────
 
-/// A read-only connection that waits for a lock like the writer does.
-pub fn open_reader(path: &Path) -> rusqlite::Result<Connection> {
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    conn.busy_timeout(sqlite::BUSY_TIMEOUT)?;
-    Ok(conn)
-}
-
 /// The one `node` value of a query string, url-decoded.
 pub fn node_param(query: &str) -> Result<Option<String>, &'static str> {
-    let mut found = None;
-    for pair in query.split('&') {
-        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-        if k == "node" {
-            if found.is_some() {
-                return Err("`node` given more than once");
-            }
-            found = Some(m6_core::request::url_decode(v));
-        }
-    }
-    match found {
-        Some(s) if s.is_empty() => Err("`node` is empty"),
-        other => Ok(other),
+    match m6_core::request::single_query_value(query, "node") {
+        Err(m6_core::request::RepeatedKey) => Err("`node` given more than once"),
+        Ok(Some("")) => Err("`node` is empty"),
+        Ok(v) => Ok(v.map(m6_core::request::url_decode)),
     }
 }
 
@@ -1255,17 +1239,6 @@ pub struct TunnelOut {
 }
 
 #[derive(Debug, Serialize)]
-pub struct ReopenOut {
-    pub state: String,
-    pub age_s: Option<i64>,
-    pub last_unix: Option<i64>,
-    pub reopens: Option<i64>,
-    pub failures: Option<i64>,
-    pub last_failure_age_s: Option<i64>,
-    pub detail: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
 pub struct ChannelOut {
     pub channel: String,
     pub requests: i64,
@@ -1282,23 +1255,33 @@ pub struct ChannelOut {
 }
 
 #[derive(Debug, Serialize)]
-pub struct NetOut {
-    pub iface: String,
-    pub rx_bytes: i64,
-    pub rx_errs: i64,
-    pub rx_drop: i64,
-    pub tx_bytes: i64,
-    pub tx_errs: i64,
-    pub tx_drop: i64,
-}
-
-#[derive(Debug, Serialize)]
 pub struct FindingOut {
     #[serde(serialize_with = "ser_level")]
     pub level: i64,
     pub node: String,
     pub text: String,
 }
+
+/// A row of a paged feed: its `(at_unix_ms, id)` is where a page starting at it begins.
+pub trait Keyed: Serialize {
+    fn key(&self) -> (i64, i64);
+}
+
+impl Keyed for PageRow {
+    fn key(&self) -> (i64, i64) {
+        (self.at_unix_ms, self.id)
+    }
+}
+
+impl Keyed for CrawlOut {
+    fn key(&self) -> (i64, i64) {
+        (self.at_unix_ms, self.id)
+    }
+}
+
+/// [`health_page`] or [`crawl_page`]: `(conn, from_ms, to_ms, node, after, rows)`.
+pub type PageFn<T> =
+    fn(&Connection, i64, i64, Option<i64>, Option<(i64, i64)>, usize) -> rusqlite::Result<Vec<T>>;
 
 /// One `/history` line, copied out of the database so the connection can close
 /// before it is serialised.
@@ -1345,8 +1328,8 @@ pub struct PageRow {
     pub cert_not_after_unix: Option<i64>,
     pub cert_expires_in_s: Option<i64>,
     pub tunnel: Option<TunnelOut>,
-    pub log_reopen: Option<ReopenOut>,
-    pub net: Vec<NetOut>,
+    pub log_reopen: Option<ReopenRow>,
+    pub net: Vec<NetRow>,
     pub channels: Vec<ChannelOut>,
     pub findings: Vec<FindingOut>,
     pub other_findings: Vec<FindingOut>,
@@ -1409,7 +1392,7 @@ pub fn health_page(
             let reopen_state: Option<String> = r.get(41)?;
             let log_reopen = match reopen_state {
                 None => None,
-                Some(state) => Some(ReopenOut {
+                Some(state) => Some(ReopenRow {
                     state,
                     age_s: r.get(42)?,
                     last_unix: r.get(43)?,
@@ -1515,7 +1498,7 @@ pub fn health_page(
             let Some(&k) = index.get(&r.get::<_, i64>(0)?) else {
                 continue;
             };
-            out[k].net.push(NetOut {
+            out[k].net.push(NetRow {
                 iface: r.get(1)?,
                 rx_bytes: r.get(2)?,
                 rx_errs: r.get(3)?,
@@ -2315,7 +2298,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut s = open(dir.path());
         fill(&mut s, 3);
-        let reader = open_reader(&cfg(dir.path(), 1).file).unwrap();
+        let reader = sqlite::open_reader(&cfg(dir.path(), 1).file).unwrap();
         let rows = health_page(&reader, T0, T0 + 10_000, None, None, 100).unwrap();
         // The rows are in memory. A second connection can write now, with a
         // short busy timeout, while the reader connection is still open.

@@ -100,6 +100,11 @@ The monitor has no listener and no token code, so a website puts an m6-http in f
 The reader opens its own read-only connection, copies one page out and closes it before it serialises.
 m6-http links no SQLite.
 
+Three m6-core blocks became public for this, so the monitor reads its `node` parameter and refuses it exactly as core reads `from`, `to` and `cursor`.
+`m6_core::request::single_query_value` returns the one raw value of a query key, or `RepeatedKey`.
+`Response::refusal` is the plain-text 400 with `no-store` and `nosniff` that `TimeRangeError` and `CursorError` already return.
+`m6_core::sqlite::open_reader` opens an existing file read-only with the 5 second busy timeout, read back.
+
 Why not the periodic stats log: it lives in each node's journal, which is capped, it has no channels, reachability, host figures or tunnel, and it disappears while a node is down, which is when a history is wanted.
 Channel counters include the monitor's own polls and header checks (#107), and `monitor_requests` says how many.
 
