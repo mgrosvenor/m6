@@ -56,6 +56,24 @@ It ends the process and the service manager restarts it, so return `Err` for any
 m6-http is not changed by this.
 It keeps its own watcher until it moves onto `ConfigReloader`.
 
+**An internal listener accepts only the peers its config names (#246).**
+An h2c listener named in `[server] internal_binds` believed the `X-Forwarded-For` of any peer that reached it, so a firewall was the only thing between a forged client address and the rate limiter.
+`[server] internal_peers` now lists the IP addresses it accepts, each in a local range.
+A connection from any other address is closed at accept.
+The log writes a line for the first refused connection from each address, then at most one line per address every 60 seconds with the number of refusals since the last line.
+It remembers 256 addresses.
+A new address past that takes the place of the remembered address whose last line is oldest, when that line is more than 60 seconds old and no count is owed.
+When no remembered address qualifies, refusals from the new address are counted.
+Across all addresses it writes at most 32 of those lines in 60 seconds, and refusals past that limit are counted.
+The first refusal after the 60 seconds ends writes one summary line with the counts, the number of distinct counted addresses (up to 1024) and the most recent counted address.
+One call to accept handles at most 64 connections, so a peer that connects in a loop cannot hold the event loop.
+The check runs once per connection, and every request on an admitted connection is served as before.
+A peer list with no address of the internal bind's IP family is refused at load.
+**Migration.**
+A config with a non-empty `internal_binds` must add `internal_peers`, or m6-http exits 2 and says what to add.
+Earlier releases ignore the key, so add it before upgrading.
+**Verified** by unit tests for each refusal and for canonical addresses, and by real-binary tests over h2c: a listed peer is served and believed, an unlisted peer's connection is closed with no response, and a config without the key refuses to start.
+
 **Each key goes in the file it belongs to, and an app can say where `site.toml` is (#242).**
 Every m6 process reads two files.
 `site.toml` holds the state every process of the site shares.
@@ -83,7 +101,7 @@ The token is read after the two files are merged.
 
 m6-http accepted node keys in `site.toml` and site-wide keys in the system config without a word, because the system config wins and the result worked.
 It now logs a warning at start for each key in the wrong file.
-The node keys are `[server]` `bind`, `tls_cert`, `tls_key`, `h2c_bind`, `internal_binds`, `redirect_bind` and `warm_on_start`, `[auth]`, `[node]`, and `[health]` `metrics_token_file`, `metrics_require` and `metrics_peers`.
+The node keys are `[server]` `bind`, `tls_cert`, `tls_key`, `h2c_bind`, `internal_binds`, `internal_peers`, `redirect_bind` and `warm_on_start`, `[auth]`, `[node]`, and `[health]` `metrics_token_file`, `metrics_require` and `metrics_peers`.
 They belong in the system config.
 The site-wide keys are `[server]` `backend_timeout_secs` and `allowed_methods`.
 They belong in `site.toml`.
