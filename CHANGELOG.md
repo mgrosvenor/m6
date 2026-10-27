@@ -89,6 +89,7 @@ Nothing changes without the new keys.
 A system config that carried `[auth]` or `[health]` used to be ignored with a warning.
 Now `[auth]` is read, and `[health]` there accepts only the two new keys.
 `[auth]` in both files is refused.
+A file given as both arguments is read once, so it is not a second declaration.
 Older versions ignore the new keys, so a config can carry them before the upgrade, but the endpoints stay on the legacy gate until it.
 Verified: `cargo test --workspace -- --test-threads=1` passes 1390 tests with 0 failures and 0 warnings on the release and test builds.
 `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `tools/clippy.sh` and `cargo deny check` are silent.
