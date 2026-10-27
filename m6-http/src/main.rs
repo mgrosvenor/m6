@@ -4117,6 +4117,9 @@ fn run(args: Vec<String>) -> i32 {
     };
 
     config::warn_system_config_extra_keys(&cli.system_config);
+    for m in config::misplaced_keys(&cli.site_dir, &cli.system_config) {
+        warn!("{m}");
+    }
     config::warn_health_token(&config.health);
     config::warn_ignored_route_cache_keys(&config);
 

@@ -1229,6 +1229,85 @@ pub fn warn_health_token(health: &HealthConfig) {
     }
 }
 
+/// Keys that are this node's own state. They belong in the system config.
+const NODE_SERVER_KEYS: &[&str] = &[
+    "bind",
+    "tls_cert",
+    "tls_key",
+    "h2c_bind",
+    "internal_binds",
+    "redirect_bind",
+    "warm_on_start",
+];
+const NODE_HEALTH_KEYS: &[&str] = &["metrics_token_file", "metrics_require", "metrics_peers"];
+/// Keys that describe how the site's routes are served. They belong in
+/// `site.toml`.
+const SITE_SERVER_KEYS: &[&str] = &["backend_timeout_secs", "allowed_methods"];
+
+/// Name every key that sits in the file it does not belong to.
+///
+/// Both files accept most of these keys and the system config wins, so a
+/// misplaced key works and says nothing. Each message names the key and the
+/// file it belongs in. The rule: `site.toml` holds state every node of the site
+/// shares, and the system config holds this node's own state (binds,
+/// certificates, credential paths, per-node security).
+///
+/// Returns nothing when both paths name one file (one-file mode, as a
+/// development script runs) or when either file cannot be read or parsed, since
+/// `load` reports those.
+pub fn misplaced_keys(site_dir: &Path, system_config_path: &Path) -> Vec<String> {
+    let site_toml_path = site_dir.join("site.toml");
+    if let (Ok(a), Ok(b)) = (
+        std::fs::canonicalize(&site_toml_path),
+        std::fs::canonicalize(system_config_path),
+    ) {
+        if a == b {
+            return Vec::new();
+        }
+    }
+    let read = |p: &Path| -> Option<toml::Value> {
+        std::fs::read_to_string(p).ok()?.parse::<toml::Value>().ok()
+    };
+    let (Some(site), Some(system)) = (read(&site_toml_path), read(system_config_path)) else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    let in_site = |section: &str, key: &str| site.get(section).and_then(|t| t.get(key)).is_some();
+    for key in NODE_SERVER_KEYS {
+        if in_site("server", key) {
+            out.push(node_state_message("server", Some(key), system_config_path));
+        }
+    }
+    if site.get("auth").is_some() {
+        out.push(node_state_message("auth", None, system_config_path));
+    }
+    for key in NODE_HEALTH_KEYS {
+        if in_site("health", key) {
+            out.push(node_state_message("health", Some(key), system_config_path));
+        }
+    }
+    for key in SITE_SERVER_KEYS {
+        if system.get("server").and_then(|t| t.get(key)).is_some() {
+            out.push(format!(
+                "the system config sets [server].{key}, which is site-wide and belongs in site.toml"
+            ));
+        }
+    }
+    out
+}
+
+fn node_state_message(section: &str, key: Option<&str>, system_config_path: &Path) -> String {
+    let name = match key {
+        Some(k) => format!("[{section}].{k}"),
+        None => format!("[{section}]"),
+    };
+    format!(
+        "site.toml sets {name}, which is this node's own state and belongs in the system config {}",
+        system_config_path.display()
+    )
+}
+
 pub fn warn_system_config_extra_keys(system_config_path: &Path) {
     if let Ok(raw) = std::fs::read_to_string(system_config_path) {
         if let Ok(toml::Value::Table(tbl)) = raw.parse::<toml::Value>() {
@@ -2191,5 +2270,63 @@ internal_binds = ["203.0.113.7:80"]
             e.contains("metrics_token_file in the system config must be an absolute path"),
             "{e}"
         );
+    }
+
+    /// Write `site` and `system` into a fresh directory and name the misplaced keys.
+    fn misplaced(site: &str, system: &str) -> Vec<String> {
+        let dir = make_test_dir();
+        write_file(dir.path(), "site.toml", site);
+        write_file(dir.path(), "system.toml", system);
+        misplaced_keys(dir.path(), &dir.path().join("system.toml"))
+    }
+
+    #[test]
+    fn misplaced_keys_names_a_bind_in_site_toml() {
+        let m = misplaced(
+            "[server]\nbind = \"0.0.0.0:443\"\n\n[auth]\npublic_key = \"k\"\n\n[health]\nmetrics_peers = [\"10.0.0.1\"]\n",
+            "[server]\nbind = \"0.0.0.0:443\"\n",
+        );
+        assert_eq!(m.len(), 3, "{m:?}");
+        assert!(m[0].starts_with("site.toml sets [server].bind, which is this node's own state"));
+        assert!(m[0].contains("belongs in the system config "), "{}", m[0]);
+        assert!(m.iter().any(|x| x.contains("sets [auth],")));
+        assert!(m.iter().any(|x| x.contains("sets [health].metrics_peers,")));
+    }
+
+    #[test]
+    fn misplaced_keys_names_allowed_methods_in_the_system_config() {
+        let m = misplaced(
+            "",
+            "[server]\nallowed_methods = [\"GET\"]\nbackend_timeout_secs = 5\nbind = \"0.0.0.0:443\"\n",
+        );
+        assert_eq!(m.len(), 2, "{m:?}");
+        assert!(m
+            .iter()
+            .all(|x| x.contains("is site-wide and belongs in site.toml")));
+        assert!(m.iter().any(|x| x.contains("[server].allowed_methods")));
+        assert!(m
+            .iter()
+            .any(|x| x.contains("[server].backend_timeout_secs")));
+    }
+
+    #[test]
+    fn misplaced_keys_is_silent_in_one_file_mode() {
+        let dir = make_test_dir();
+        write_file(
+            dir.path(),
+            "site.toml",
+            "[server]\nbind = \"0.0.0.0:443\"\nallowed_methods = [\"GET\"]\n\n[auth]\npublic_key = \"k\"\n",
+        );
+        let same = dir.path().join("site.toml");
+        assert!(misplaced_keys(dir.path(), &same).is_empty());
+    }
+
+    #[test]
+    fn misplaced_keys_is_silent_for_a_clean_pair() {
+        let m = misplaced(
+            "[server]\nallowed_methods = [\"GET\"]\nbackend_timeout_secs = 5\n\n[health]\nperf_path = \"/p\"\n",
+            "[server]\nbind = \"0.0.0.0:443\"\n\n[auth]\npublic_key = \"/k\"\n\n[health]\nmetrics_token_file = \"/t\"\n",
+        );
+        assert!(m.is_empty(), "{m:?}");
     }
 }
