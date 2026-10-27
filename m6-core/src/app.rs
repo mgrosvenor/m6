@@ -2637,8 +2637,10 @@ fn run_app_with_shutdown(
         std::process::exit(2);
     });
 
+    // Before `site_toml_or_exit`, which reads a named `site_toml`: a change
+    // between that read and this fingerprint would otherwise be lost.
+    let site_fp = crate::watcher::Fingerprint::of(&config.resolve_site_toml(&site_dir));
     let site_toml = site_toml_or_exit(&config, &site_dir);
-    let site_fp = crate::watcher::Fingerprint::of(&site_toml);
 
     // Does site.toml tell the edge the truth about whether we compress?
     //
