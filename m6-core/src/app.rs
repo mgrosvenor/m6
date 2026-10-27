@@ -2540,6 +2540,14 @@ fn dump_config(
     0
 }
 
+/// The message of a caught panic.
+fn panic_message(p: &(dyn Any + Send)) -> &str {
+    p.downcast_ref::<&str>()
+        .copied()
+        .or_else(|| p.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("no message")
+}
+
 /// Whether `site.toml` declares the compression `config` does, for the backend
 /// named `backend_name`. Checked at start and on every reload.
 ///
@@ -2867,8 +2875,10 @@ fn run_app_with_shutdown(
                 config_path: &config_path,
                 site_toml: &site_toml,
             };
-            if let Err(e) = hook(&ctx) {
-                error!("Reload hook failed: {e:#}");
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook(&ctx))) {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => error!("Reload hook failed: {e:#}"),
+                Err(p) => error!("Reload hook failed: panicked: {}", panic_message(&*p)),
             }
         }
         Ok(routes)
