@@ -19,6 +19,14 @@ the version when the release is cut.
 
 ### Changed
 
+**Tests run the binary built from the source they test (#245).**
+`m6_core::testkit::binary` returned `target/release/<name>` whatever its age, so a `cargo test` after an edit could spawn a binary from before the edit and report a correct change as broken.
+It now asks cargo to build `<name>` in release with workspace features, once per test process, and returns that binary.
+A build that is current costs one cargo call, and a stale one is rebuilt first.
+It no longer falls back to a debug binary.
+m6-auth-cli's tests use it instead of their own lookup.
+**Verified** by a unit test that changes a scratch binary's source between two calls and sees the new output, and by the whole suite.
+
 **Each key goes in the file it belongs to, and an app can say where `site.toml` is (#242).**
 Every m6 process reads two files.
 `site.toml` holds the state every process of the site shares.
