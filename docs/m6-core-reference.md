@@ -871,7 +871,7 @@ links it.
 - `testkit::port::claim_port() -> PortClaim`, which holds the port until dropped
   so two tests cannot race for it.
 - `testkit::wait`: `for_path`, `for_tcp`, `for_unix`, `until`. 25 ms poll.
-- `testkit::paths::binary(name)` resolves a built binary.
+- `testkit::paths::binary(name)` builds the release binary from the current source, once per name per test process, and returns its path.
 - `testkit::response::read_one(r, method)` reads exactly one response, HEAD
   included.
 
