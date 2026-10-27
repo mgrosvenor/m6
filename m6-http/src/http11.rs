@@ -388,6 +388,71 @@ pub struct H2cListener {
     /// connection is closed at accept. The firewall is a second fence, not
     /// the one this trust rests on. See `crate::forward::ForwardedTrust`.
     peers: Option<Vec<std::net::IpAddr>>,
+    /// Throttles the log line for refused connections, one peer at a time.
+    refusals: RefusalLog,
+}
+
+/// The most connections one `accept_pending` call handles. A peer that
+/// connects and closes in a loop would otherwise keep the single event loop
+/// in `accept` and starve the other listeners. What is left stays in the
+/// kernel queue and the poller wakes this listener again.
+const MAX_ACCEPTS_PER_WAKE: usize = 64;
+
+/// The fewest seconds between two log lines for one refused peer.
+const REFUSAL_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The most peers `RefusalLog` tracks. At the limit the peer that was logged
+/// longest ago is dropped, so the map stays bounded however many addresses
+/// connect.
+const REFUSAL_LOG_MAX_PEERS: usize = 256;
+
+/// Decides which refused connections get a log line.
+/// The first refusal from a peer is logged.
+/// Later ones are counted, and the next line after `interval` carries the
+/// count since the last line.
+struct RefusalLog {
+    interval: std::time::Duration,
+    max_peers: usize,
+    /// Per peer: when it was last logged, and the refusals counted since.
+    peers: std::collections::HashMap<std::net::IpAddr, (Instant, u64)>,
+}
+
+impl RefusalLog {
+    fn new(interval: std::time::Duration, max_peers: usize) -> Self {
+        RefusalLog {
+            interval,
+            max_peers,
+            peers: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Record a refusal of `peer` at `now`. Returns `Some(n)` when a line is
+    /// due, where `n` is the number of refusals suppressed since the last
+    /// line for this peer (0 for the first), and `None` when it is not.
+    fn record(&mut self, peer: std::net::IpAddr, now: Instant) -> Option<u64> {
+        if let Some((last, suppressed)) = self.peers.get_mut(&peer) {
+            if now.duration_since(*last) < self.interval {
+                *suppressed += 1;
+                return None;
+            }
+            let n = *suppressed;
+            *last = now;
+            *suppressed = 0;
+            return Some(n);
+        }
+        if self.peers.len() >= self.max_peers {
+            if let Some(oldest) = self
+                .peers
+                .iter()
+                .min_by_key(|(_, (last, _))| *last)
+                .map(|(ip, _)| *ip)
+            {
+                self.peers.remove(&oldest);
+            }
+        }
+        self.peers.insert(peer, (now, 0));
+        Some(0)
+    }
 }
 
 /// What a connection from `peer` gets on an h2c listener: `None` refuses it.
@@ -424,6 +489,7 @@ impl H2cListener {
             listener,
             conns: Vec::new(),
             peers: internal_peers,
+            refusals: RefusalLog::new(REFUSAL_LOG_INTERVAL, REFUSAL_LOG_MAX_PEERS),
         })
     }
 
@@ -436,14 +502,25 @@ impl H2cListener {
     }
 
     pub fn accept_pending(&mut self, poller: &Poller, token: Token) {
-        loop {
+        self.accept_up_to(poller, token, MAX_ACCEPTS_PER_WAKE);
+    }
+
+    /// Handle at most `max` pending connections, refused ones included, and
+    /// return how many it handled.
+    fn accept_up_to(&mut self, poller: &Poller, token: Token, max: usize) -> usize {
+        let mut handled = 0;
+        while handled < max {
             match self.listener.accept() {
                 Ok((stream, peer)) => {
+                    handled += 1;
                     let Some(trust) = admit(self.peers.as_deref(), peer.ip()) else {
-                        warn!(
-                            peer = %peer.ip(),
-                            "h2c: refused a connection from a peer not in [server] internal_peers"
-                        );
+                        if let Some(suppressed) = self.refusals.record(peer.ip(), Instant::now()) {
+                            warn!(
+                                peer = %peer.ip(),
+                                suppressed,
+                                "h2c: refused a connection from a peer not in [server] internal_peers"
+                            );
+                        }
                         drop(stream);
                         continue;
                     };
@@ -472,6 +549,7 @@ impl H2cListener {
                 }
             }
         }
+        handled
     }
 
     pub fn drive_all<F, G>(&mut self, mut on_request: F, mut on_response: G, poller: &Poller)
@@ -1745,9 +1823,11 @@ mod keep_alive_tests {
 
 #[cfg(test)]
 mod h2c_admit_tests {
-    use super::admit;
+    use super::{admit, H2cListener, RefusalLog};
     use crate::forward::ForwardedTrust;
-    use std::net::IpAddr;
+    use crate::poller::{Poller, Token};
+    use std::net::{IpAddr, TcpStream};
+    use std::time::Instant;
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
@@ -1782,5 +1862,89 @@ mod h2c_admit_tests {
             admit(Some(&peers), ip("::ffff:10.0.0.2")),
             Some(ForwardedTrust::Backbone)
         );
+    }
+
+    #[test]
+    fn the_first_refusal_of_a_peer_is_logged_and_repeats_are_counted() {
+        let t0 = Instant::now();
+        let mut log = RefusalLog::new(std::time::Duration::from_secs(60), 8);
+        let a = ip("10.0.0.3");
+        assert_eq!(log.record(a, t0), Some(0));
+        assert_eq!(log.record(a, t0 + std::time::Duration::from_secs(1)), None);
+        assert_eq!(log.record(a, t0 + std::time::Duration::from_secs(59)), None);
+        // Another peer has its own first line.
+        assert_eq!(log.record(ip("10.0.0.4"), t0), Some(0));
+    }
+
+    #[test]
+    fn a_line_after_the_interval_carries_the_suppressed_count() {
+        let t0 = Instant::now();
+        let mut log = RefusalLog::new(std::time::Duration::from_secs(60), 8);
+        let a = ip("10.0.0.3");
+        assert_eq!(log.record(a, t0), Some(0));
+        for s in 1..=5 {
+            assert_eq!(log.record(a, t0 + std::time::Duration::from_secs(s)), None);
+        }
+        let later = t0 + std::time::Duration::from_secs(61);
+        assert_eq!(log.record(a, later), Some(5));
+        // The count starts again from the line just written.
+        assert_eq!(
+            log.record(a, later + std::time::Duration::from_secs(1)),
+            None
+        );
+        assert_eq!(
+            log.record(a, later + std::time::Duration::from_secs(61)),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn the_refusal_map_is_bounded_and_drops_the_oldest_peer() {
+        let t0 = Instant::now();
+        let mut log = RefusalLog::new(std::time::Duration::from_secs(60), 3);
+        for n in 0..3u64 {
+            let peer = ip(&format!("10.0.0.{}", n + 1));
+            assert_eq!(
+                log.record(peer, t0 + std::time::Duration::from_secs(n)),
+                Some(0)
+            );
+        }
+        assert_eq!(log.peers.len(), 3);
+        // A fourth peer evicts 10.0.0.1, the one logged longest ago.
+        assert_eq!(
+            log.record(ip("10.0.0.9"), t0 + std::time::Duration::from_secs(3)),
+            Some(0)
+        );
+        assert_eq!(log.peers.len(), 3);
+        assert!(!log.peers.contains_key(&ip("10.0.0.1")));
+        // The evicted peer is new again, so its next refusal is logged.
+        assert_eq!(
+            log.record(ip("10.0.0.1"), t0 + std::time::Duration::from_secs(4)),
+            Some(0)
+        );
+        assert_eq!(log.peers.len(), 3);
+        for n in 0..1000u32 {
+            log.record(
+                std::net::IpAddr::from(std::net::Ipv4Addr::from(n)),
+                t0 + std::time::Duration::from_secs(5),
+            );
+        }
+        assert_eq!(log.peers.len(), 3);
+    }
+
+    /// With more connections pending than the cap, one call returns after the
+    /// cap and the rest wait for the next call.
+    #[test]
+    fn accept_returns_after_the_cap_with_more_pending() {
+        // 127.0.0.1 is not listed, so every connection is refused.
+        let mut l = H2cListener::bind("127.0.0.1:0", Some(vec![ip("10.9.9.9")])).unwrap();
+        let addr = l.local_addr().unwrap();
+        let poller = Poller::new().unwrap();
+        let clients: Vec<TcpStream> = (0..12).map(|_| TcpStream::connect(addr).unwrap()).collect();
+        assert_eq!(l.accept_up_to(&poller, Token(1), 5), 5);
+        assert_eq!(l.accept_up_to(&poller, Token(1), 5), 5);
+        assert_eq!(l.accept_up_to(&poller, Token(1), 5), 2);
+        assert_eq!(l.accept_up_to(&poller, Token(1), 5), 0);
+        drop(clients);
     }
 }
