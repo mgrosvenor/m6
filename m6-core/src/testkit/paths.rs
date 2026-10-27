@@ -221,7 +221,9 @@ mod tests {
             eprintln!("CARGO is not set; skipping");
             return;
         };
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::Builder::new()
+            .tempdir_in(exec_scratch_root())
+            .unwrap();
         let target = dir.path().join("target");
         probe(dir.path(), "fn main() { println!(\"one\"); }");
         let first = build_release(&cargo, dir.path(), &target, "j18probe").unwrap();
@@ -242,7 +244,9 @@ mod tests {
             eprintln!("CARGO is not set; skipping");
             return;
         };
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::Builder::new()
+            .tempdir_in(exec_scratch_root())
+            .unwrap();
         probe(dir.path(), "fn main( {");
         let err =
             build_release(&cargo, dir.path(), &dir.path().join("target"), "j18probe").unwrap_err();
@@ -258,7 +262,9 @@ mod tests {
             eprintln!("CARGO is not set; skipping");
             return;
         };
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::Builder::new()
+            .tempdir_in(exec_scratch_root())
+            .unwrap();
         probe(dir.path(), "fn main() {}");
         let err =
             build_release(&cargo, dir.path(), &dir.path().join("target"), "nosuch").unwrap_err();
