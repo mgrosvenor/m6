@@ -2804,12 +2804,35 @@ fn run_app_with_shutdown(
     // parse, a compress declaration that disagrees with this service, and a
     // route naming a handler this binary does not have. Each keeps the old
     // state serving, so a bad edit of either file is recoverable.
-    let reload = || -> std::result::Result<usize, String> {
+    let reload = |changed: crate::watcher::Changed| -> std::result::Result<usize, String> {
+        // A file that a writer has truncated and not yet written is empty. An
+        // empty process config loads with no routes and an empty `site.toml`
+        // resets the log level, so neither is loaded. The write that fills the
+        // file is a change of its own and reloads.
+        for (file, path) in [(changed.process, &config_path), (changed.site, &site_toml)] {
+            if file && std::fs::metadata(path).is_ok_and(|m| m.len() == 0) {
+                return Err(format!(
+                    "Reload skipped: {} is empty, keeping the current state",
+                    path.display()
+                ));
+            }
+        }
         let new_config = crate::config::load(&config_path, &site_dir)
             .map_err(|e| format!("Reload failed (config parse error): {e}"))?;
         check_site_toml(&new_config, &site_dir)
             .and_then(|_| check_compress_declared(&new_config, &site_toml, &backend_name))
             .map_err(|msg| format!("Reload refused: {msg}"))?;
+        // A `site.toml` that does not parse keeps the current state whether or
+        // not `site_toml` names it. At start the default path is tolerant.
+        if let Ok(text) = std::fs::read_to_string(&site_toml) {
+            if let Err(e) = text.parse::<toml::Table>() {
+                return Err(format!(
+                    "Reload refused: {} is not valid TOML: {}",
+                    site_toml.display(),
+                    e.message()
+                ));
+            }
+        }
         let changed_keys =
             crate::config::restart_only_changes(&startup_config, &new_config, &site_dir);
         let (format, level) = resolve_log(&site_toml, &new_config.log, cli_log_level.as_deref());
@@ -2890,7 +2913,8 @@ fn run_app_with_shutdown(
                 "Config change detected, reloading..."
             );
             let reload_start = std::time::Instant::now();
-            match reload() {
+            match reload(changed) {
+                Err(msg) if msg.starts_with("Reload skipped") => warn!("{msg}"),
                 Err(msg) => error!("{msg}"),
                 Ok(routes) => {
                     let elapsed = reload_start.elapsed().as_millis();
