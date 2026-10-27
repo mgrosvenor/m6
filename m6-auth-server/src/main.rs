@@ -37,7 +37,7 @@ use rate_limit::RateLimiter;
 /// Returns `Err` rather than exiting, so `App` reports it the same way it
 /// reports every other startup failure.
 fn build_state(ctx: &AppContext) -> Result<AppState> {
-    let cfg = AuthConfig::load(ctx.site_dir, ctx.config_path)
+    let cfg = AuthConfig::load(ctx.site_dir, ctx.config_path, ctx.site_toml)
         .map_err(|e| Error::Other(e.context("loading auth config")))?;
 
     let key_material = KeyMaterial::load(

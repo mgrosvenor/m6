@@ -636,3 +636,50 @@ fn sigterm_shuts_down_and_removes_the_socket() {
         &env.socket_path,
     );
 }
+
+/// With no `[tokens] issuer`, the issuer comes from `[site] domain` in the
+/// `site.toml` that the `site_toml` key names, which need not sit in `site_dir`.
+#[test]
+fn issuer_falls_back_to_the_configured_site_toml() {
+    let env = setup_test_env("issuer-site-toml");
+
+    let site_toml = env._key_dir.path().join("site.toml");
+    std::fs::write(&site_toml, "[site]\ndomain = \"site.example.com\"\n").unwrap();
+
+    let config = std::fs::read_to_string(&env.config_path).unwrap();
+    assert!(config.contains("issuer      = \"test.example.com\"\n"));
+    let config = config.replace("issuer      = \"test.example.com\"\n", "");
+    let config = format!("site_toml = \"{}\"\n{config}", site_toml.display());
+    std::fs::write(&env.config_path, config).unwrap();
+
+    seed_user(&env.site_dir, "ivy", "ivypw");
+    let _guard = spawn_server(&env);
+
+    let body = r#"{"username":"ivy","password":"ivypw"}"#;
+    let login_resp = http_request_with_body(
+        &env.socket_path,
+        "POST",
+        "/auth/login",
+        "application/json",
+        body,
+    );
+    assert_eq!(parse_status(&login_resp), 200, "{login_resp}");
+    let body_start = login_resp.find("\r\n\r\n").map(|i| i + 4).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&login_resp[body_start..]).unwrap();
+    let access_token = json["access_token"].as_str().unwrap();
+
+    let req = "GET /auth/public-key HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    let pk_resp = http_request(&env.socket_path, req);
+    let pk_start = pk_resp.find("\r\n\r\n").map(|i| i + 4).unwrap();
+    let decoding_key = jsonwebtoken::DecodingKey::from_rsa_pem(pk_resp[pk_start..].as_bytes())
+        .expect("parse public key from PEM");
+    let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
+    validation.set_issuer(&["site.example.com"]);
+    let result =
+        jsonwebtoken::decode::<serde_json::Value>(access_token, &decoding_key, &validation);
+    assert!(
+        result.is_ok(),
+        "issuer was not site.example.com: {:?}",
+        result.err()
+    );
+}

@@ -1134,10 +1134,12 @@ fn run_app_global<G: Send + Sync + 'static>(
     });
 
     // Call init_global with the user config.
+    let site_toml = site_toml_or_exit(&config, &site_dir);
     let g = init_global(&AppContext {
         config: &config.user_config,
         site_dir: &site_dir,
         config_path: &config_path,
+        site_toml: &site_toml,
     })
     .unwrap_or_else(|e| {
         eprintln!("init_global failed: {e:#}");
@@ -1224,6 +1226,8 @@ fn run_app_thread_state<T: Any + Send + 'static>(
         eprintln!("Config error: {e}");
         std::process::exit(2);
     });
+
+    let _ = site_toml_or_exit(&config, &site_dir);
 
     // Set up TLS init fn (closes over config dict).
     let cfg_clone: Map<String, Value> = config.user_config.clone();
@@ -1313,10 +1317,12 @@ fn run_app_state<G: Send + Sync + 'static, T: Any + Send + 'static>(
         std::process::exit(2);
     });
 
+    let site_toml = site_toml_or_exit(&config, &site_dir);
     let g = init_global(&AppContext {
         config: &config.user_config,
         site_dir: &site_dir,
         config_path: &config_path,
+        site_toml: &site_toml,
     })
     .unwrap_or_else(|e| {
         eprintln!("init_global failed: {e:#}");
@@ -1538,6 +1544,28 @@ pub fn is_shutdown() -> bool {
 // App builder — no state
 // ---------------------------------------------------------------------------
 
+/// Resolve `site.toml` for `config` and refuse a path that was named but is
+/// not there. Exit 2, the configuration error code, before anything binds.
+///
+/// No `site_toml` key means `<site_dir>/site.toml`, which may legitimately be
+/// absent (a service under test). A key that names a file is a statement that
+/// the file exists, so a missing one is a mistake the operator wants to hear
+/// about on the first line.
+fn site_toml_or_exit(
+    config: &crate::config::RendererConfig,
+    site_dir: &std::path::Path,
+) -> PathBuf {
+    let site_toml = config.resolve_site_toml(site_dir);
+    if config.site_toml.is_some() && !site_toml.exists() {
+        eprintln!(
+            "Config error: site_toml = {} does not exist",
+            site_toml.display()
+        );
+        std::process::exit(2);
+    }
+    site_toml
+}
+
 /// What a service was started with, for building its shared state.
 ///
 /// A struct rather than a widening argument list. The initialiser first took
@@ -1554,6 +1582,10 @@ pub struct AppContext<'a> {
     pub site_dir: &'a std::path::Path,
     /// The config file this service was started with.
     pub config_path: &'a std::path::Path,
+    /// The `site.toml` this service reads: the path named by the `site_toml`
+    /// key, or `<site_dir>/site.toml` when the key is absent. Always set,
+    /// whether or not the file exists.
+    pub site_toml: &'a std::path::Path,
 }
 
 /// Handler function entries: (pattern, method, handler).
@@ -2310,6 +2342,14 @@ fn dump_config(
 
     println!("site_dir    {}", site_dir.display());
     println!("config      {}", config_path.display());
+    {
+        let site_toml = config.resolve_site_toml(site_dir);
+        if site_toml.exists() {
+            println!("site.toml   {}", site_toml.display());
+        } else {
+            println!("site.toml   {} (absent)", site_toml.display());
+        }
+    }
     println!(
         "socket      {}",
         crate::socket_path_from_config(config_path).display()
@@ -2426,6 +2466,8 @@ fn run_app_with_shutdown(
         std::process::exit(2);
     });
 
+    let site_toml = site_toml_or_exit(&config, &site_dir);
+
     // Does site.toml tell the edge the truth about whether we compress?
     //
     // Before logging is up, because it exits 2 and that is a configuration error
@@ -2450,7 +2492,7 @@ fn run_app_with_shutdown(
             .values()
             .any(|c| c.brotli > 0 || c.gzip > 0);
         if let Err(msg) =
-            crate::compress::check_declared_support(&site_dir, backend_name, compresses)
+            crate::compress::check_declared_support(&site_toml, backend_name, compresses)
         {
             eprintln!("Config error: {msg}");
             std::process::exit(2);
@@ -2458,7 +2500,7 @@ fn run_app_with_shutdown(
     }
 
     // Init logging: site.toml base → renderer config [log] → CLI --log-level.
-    let (site_level, site_format) = crate::log::read_site_log_config(&site_dir);
+    let (site_level, site_format) = crate::log::read_site_log_config(&site_toml);
     let format = config
         .log
         .format
@@ -2594,7 +2636,7 @@ fn run_app_with_shutdown(
     // When raw_fd() returns None (fallback platform or init failure): fall
     // back to mtime polling at ~1-second intervals via the poll(2) timeout
     // countdown.
-    let site_toml_path = site_dir.join("site.toml");
+    let site_toml_path = site_toml.clone();
     let mut watcher = crate::ConfigWatcher::new(&[&config_path, &site_toml_path]).ok();
 
     // Mtime fallback state — only meaningful when watcher.raw_fd() is None.
@@ -2607,6 +2649,12 @@ fn run_app_with_shutdown(
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("")
+        .to_string();
+
+    let site_toml_filename = site_toml
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("site.toml")
         .to_string();
 
     use std::os::unix::io::AsRawFd;
@@ -2658,7 +2706,7 @@ fn run_app_with_shutdown(
         if inotify_fired {
             should_reload = watcher
                 .as_mut()
-                .is_some_and(|w| w.read_events(&[&config_filename, "site.toml"]));
+                .is_some_and(|w| w.read_events(&[&config_filename, &site_toml_filename]));
         }
 
         // ── Hot reload ───────────────────────────────────────────────────

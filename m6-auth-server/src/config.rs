@@ -77,7 +77,7 @@ pub struct AuthConfig {
 }
 
 impl AuthConfig {
-    pub fn load(site_dir: &Path, config_path: &Path) -> Result<Self> {
+    pub fn load(site_dir: &Path, config_path: &Path, site_toml: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(config_path)
             .with_context(|| format!("reading config: {}", config_path.display()))?;
 
@@ -114,8 +114,8 @@ impl AuthConfig {
 
         // Issuer: from config, or try to derive from site.toml
         let issuer = tokens.issuer.unwrap_or_else(|| {
-            // Try reading site.toml from the site_dir
-            try_issuer_from_site_toml(site_dir).unwrap_or_else(|| "localhost".to_string())
+            // Try reading the site's site.toml, wherever `site_toml` puts it.
+            try_issuer_from_site_toml(site_toml).unwrap_or_else(|| "localhost".to_string())
         });
 
         let private_key_path = site_dir.join(&raw.keys.private_key);
@@ -145,8 +145,7 @@ impl AuthConfig {
     }
 }
 
-fn try_issuer_from_site_toml(site_dir: &Path) -> Option<String> {
-    let site_toml = site_dir.join("site.toml");
+fn try_issuer_from_site_toml(site_toml: &Path) -> Option<String> {
     let text = std::fs::read_to_string(site_toml).ok()?;
     let val: toml::Value = text.parse().ok()?;
     val.get("site")?
