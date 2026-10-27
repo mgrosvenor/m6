@@ -77,6 +77,11 @@
 //! waits. A write that fails drops the connection, and the next poll opens it
 //! again. The state `behind` lasts until a write succeeds after a drop.
 //!
+//! A prune that fails, or that deletes every earlier poll and is still over the
+//! cap, does not lose the poll just written. The states are `prune_failed` and
+//! `over_cap`, each with its own Warn, and the next write that prunes cleanly
+//! clears them.
+//!
 //! # Reading it
 //!
 //! Both endpoints answer on the service's unix socket only. The monitor has no
@@ -638,6 +643,8 @@ struct Written {
     crawl_windows: u64,
     pruned: u64,
     cap_unmet: bool,
+    /// Why pruning failed. The poll itself was written.
+    prune_error: Option<String>,
     used_bytes: u64,
     file_bytes: u64,
     oldest_ms: Option<i64>,
@@ -726,7 +733,12 @@ impl Store {
             self.clear_caches();
         }
         let mut w = r?;
-        self.prune(&mut w)?;
+        // The poll is committed. A prune that fails is reported on its own.
+        let pruned = self.prune(&mut w);
+        let measured = self.measure(&mut w);
+        if let Err(e) = pruned.and(measured) {
+            w.prune_error = Some(format!("{e:#}"));
+        }
         Ok(w)
     }
 
@@ -865,7 +877,12 @@ impl Store {
             }
             w.cap_unmet = used > target;
         }
-        w.used_bytes = used;
+        Ok(())
+    }
+
+    /// Fill in the figures the status shows.
+    fn measure(&mut self, w: &mut Written) -> anyhow::Result<()> {
+        w.used_bytes = sqlite::used_bytes(&self.conn)?;
         w.file_bytes = std::fs::metadata(&self.path).map_or(0, |m| m.len());
         let (oldest, newest): (Option<i64>, Option<i64>) =
             self.conn
@@ -1008,6 +1025,8 @@ reopen_last_failure_age_s, reopen_detail) VALUES (:poll_id, :at_ms, :node_id, :l
 struct Status {
     open_error: Option<String>,
     last_error: Option<String>,
+    prune_error: Option<String>,
+    over_cap: bool,
     writes: u64,
     crawl_windows: u64,
     failures: u64,
@@ -1036,7 +1055,9 @@ impl Shared {
 /// The history as the digest reports it.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct HistoryDigest {
-    /// `off`, `ok`, `not_open`, `failing`, `behind` or `stopped`.
+    /// `off`, `ok`, `not_open`, `failing`, `prune_failed`, `over_cap`, `behind`
+    /// or `stopped`. In `failing` a poll was not written. In `prune_failed` and
+    /// `over_cap` it was, and the file may pass its cap.
     pub state: &'static str,
     pub file: Option<String>,
     pub max_bytes: Option<u64>,
@@ -1073,6 +1094,10 @@ impl HistoryHandle {
             "not_open"
         } else if s.last_error.is_some() {
             "failing"
+        } else if s.prune_error.is_some() {
+            "prune_failed"
+        } else if s.over_cap {
+            "over_cap"
         } else if dropped > s.dropped_acked {
             "behind"
         } else {
@@ -1093,10 +1118,18 @@ impl HistoryHandle {
             failures: s.failures,
             dropped,
             pruned: s.pruned,
-            last_error: s.open_error.clone().or_else(|| s.last_error.clone()),
+            last_error: s
+                .open_error
+                .clone()
+                .or_else(|| s.last_error.clone())
+                .or_else(|| s.prune_error.clone())
+                .or_else(|| s.over_cap.then(|| OVER_CAP.to_string())),
         }
     }
 }
+
+const OVER_CAP: &str =
+    "the history is over its cap and deleting every earlier poll cannot get under it";
 
 /// The Warn that goes on node `monitor` when history is not working.
 pub fn finding(h: &HistoryDigest) -> Option<Finding> {
@@ -1108,6 +1141,14 @@ pub fn finding(h: &HistoryDigest) -> Option<Finding> {
         ),
         "failing" => format!(
             "the last history write failed, so that poll is missing from the history: {err}"
+        ),
+        "prune_failed" => format!(
+            "the history could not delete old polls, so the file may grow past its cap: {err}"
+        ),
+        "over_cap" => format!(
+            "the history file is over its cap of {} MB even with every earlier poll deleted, \
+             so history_max_mb is too small",
+            h.max_bytes.unwrap_or(0) >> 20
         ),
         "behind" => format!(
             "the history writer is behind and has dropped {} poll(s) since start: \
@@ -1175,7 +1216,7 @@ impl Writer {
         match store.write(b) {
             Ok(w) => {
                 let mut st = self.shared.status();
-                if !w.cap_unmet && st.last_error.take().is_some() {
+                if st.last_error.take().is_some() {
                     tracing::info!("history writes recovered");
                 }
                 st.writes += 1;
@@ -1187,14 +1228,14 @@ impl Writer {
                 st.oldest_ms = w.oldest_ms;
                 st.newest_ms = w.newest_ms;
                 st.dropped_acked = self.shared.dropped.load(Ordering::Relaxed);
-                if w.cap_unmet {
-                    drop(st);
-                    self.fail(
-                        "the history is over its cap and pruning every poll cannot get under it"
-                            .to_string(),
-                        false,
-                    );
+                if w.prune_error.is_some() && w.prune_error != st.prune_error {
+                    tracing::error!(error = ?w.prune_error, "history could not prune");
                 }
+                if w.cap_unmet && !st.over_cap {
+                    tracing::error!("{OVER_CAP}");
+                }
+                st.prune_error = w.prune_error;
+                st.over_cap = w.cap_unmet;
             }
             Err(e) => {
                 self.store = None;
@@ -3109,5 +3150,73 @@ mod tests {
         assert!(rows
             .iter()
             .all(|r| r.channels.len() == 2 && r.net.len() == 1));
+    }
+
+    /// A config whose cap leaves room for `spare` bytes over one poll.
+    fn tight(dir: &Path, spare: u64) -> Config {
+        let probe = tempfile::tempdir().unwrap();
+        let mut s = open(probe.path());
+        let w = s.write(&make(T0, &[reading("a")])).unwrap();
+        Config {
+            max_bytes: w.used_bytes + spare,
+            ..cfg(dir, 1)
+        }
+    }
+
+    #[test]
+    fn a_failed_prune_is_not_a_lost_poll() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = tight(dir.path(), 20_000);
+        let (mut w, h) = writer(c.clone());
+        w.handle(&make(T0, &[reading("a")]));
+        let blocker = sqlite::open(&c.file).unwrap();
+        blocker
+            .execute_batch(
+                "CREATE TRIGGER keep_polls BEFORE DELETE ON poll \
+                 BEGIN SELECT RAISE(ABORT, 'polls are kept'); END",
+            )
+            .unwrap();
+        let mut writes = 1;
+        for k in 1..200 {
+            w.handle(&make(T0 + k * 1000, &[reading("a")]));
+            writes += 1;
+            if h.digest().state != "ok" {
+                break;
+            }
+        }
+        let d = h.digest();
+        assert_eq!(d.state, "prune_failed");
+        assert_eq!((d.writes, d.failures), (writes, 0), "the poll was written");
+        assert!(d.last_error.unwrap().contains("polls are kept"));
+        let f = finding(&h.digest()).unwrap().text;
+        assert!(f.contains("could not delete old polls"), "{f}");
+        assert!(!f.contains("missing"), "{f}");
+        let polls: i64 = blocker
+            .query_row("SELECT count(*) FROM poll", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(polls, writes as i64);
+        blocker.execute_batch("DROP TRIGGER keep_polls").unwrap();
+        w.handle(&make(T0 + 1_000_000, &[reading("a")]));
+        let d = h.digest();
+        assert_eq!(d.state, "ok", "{d:?}");
+        assert!(d.pruned > 0);
+        assert_eq!(d.last_error, None);
+    }
+
+    #[test]
+    fn a_cap_that_cannot_be_met_is_over_cap_and_keeps_the_poll() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut w, h) = writer(Config {
+            max_bytes: 4096,
+            ..cfg(dir.path(), 1)
+        });
+        w.handle(&make(T0, &[reading("a")]));
+        let d = h.digest();
+        assert_eq!((d.state, d.writes, d.failures), ("over_cap", 1, 0));
+        let f = finding(&d).unwrap();
+        assert_eq!(f.level, Level::Warn);
+        assert!(f.text.contains("over its cap"), "{}", f.text);
+        assert!(!f.text.contains("missing"), "{}", f.text);
+        assert!(d.last_error.unwrap().contains("over its cap"));
     }
 }

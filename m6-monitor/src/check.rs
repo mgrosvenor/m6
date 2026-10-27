@@ -1398,6 +1398,33 @@ mod history_tests {
     }
 
     #[test]
+    fn a_prune_failure_and_an_unmet_cap_are_not_a_missing_poll() {
+        for (state, error, said) in [
+            (
+                "prune_failed",
+                "polls are kept",
+                "could not delete old polls",
+            ),
+            (
+                "over_cap",
+                "the history is over its cap",
+                "is over its cap of",
+            ),
+        ] {
+            let mut h = history(state);
+            h.last_error = Some(error.into());
+            let mut d = digest();
+            d.history = Some(h.clone());
+            d.add_finding(crate::history::finding(&h).expect("a finding"));
+            let o = render(&d, &[reading("origin", None)]);
+            assert!(!o.contains("ALL CLEAR"), "{o}");
+            assert!(o.contains(said), "{o}");
+            assert!(o.contains(&format!("last error: {error}")), "{o}");
+            assert!(!o.contains("that poll is missing"), "{o}");
+        }
+    }
+
+    #[test]
     fn a_failing_history_write_removes_all_clear() {
         let h = history("failing");
         let mut d = digest();
