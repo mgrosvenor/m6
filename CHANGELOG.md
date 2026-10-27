@@ -34,6 +34,7 @@ A relative value resolves against `site_dir`, an absolute value is used as given
 A named file that does not exist, cannot be read or is not valid TOML is exit 2 at start.
 A file at the default path keeps its tolerance.
 `--dump-config` prints the resolved path.
+`Request::touch("site.toml")` touches that file, so the documented edge invalidation reloads the file the app reads.
 `AppContext` gains a `site_toml` field, and m6-auth-server reads its issuer fallback from that file.
 
 m6-http's system config refused `[health] metrics_token_file`, a credential path, so the path could only be written in `site.toml`.

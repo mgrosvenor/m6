@@ -500,6 +500,7 @@ expands into one concrete route per file, and cache warming skips any route path
 containing `{`, so a wildcard silently means those files are never pre-warmed.
 
 Glob is expanded at startup and on `site.toml` reload. New files matching the glob require a `site.toml` reload to become routable — renderers that create new content files (e.g. a CMS publish action) should touch `site.toml` after writing to trigger the reload.
+In an app, `req.touch("site.toml")` touches the file the app reads, which is the one its `site_toml` key names.
 
 ### Glob Variables
 
