@@ -79,14 +79,40 @@ const TOKEN_H2C_CLIENT: Token = Token(4);
 const TOKEN_H2S_CLIENT: Token = Token(5);
 const TOKEN_WAKE: Token = Token(6);
 const TOKEN_CONFIG: Token = Token(7);
-/// How long after a `site.toml` reload the cache is emptied a second time.
+/// Time given to a backend to finish a reload after it has seen the change.
+///
+/// A backend under `ConfigReloader` reloads at once on the first change, or up
+/// to `RELOAD_DEBOUNCE` later when a second report is held, or up to
+/// `RELOAD_POLL` later when only the once-a-second poll finds the change. The
+/// reload itself then takes time. This margin is added to each of those.
+const CACHE_RELOAD_MARGIN: std::time::Duration = std::time::Duration::from_millis(80);
+
+/// The two later clears after a `site.toml` reload, measured from the end of
+/// the reload.
 ///
 /// A backend that reloads after m6-http can answer a request in the gap with
-/// the old page, and that response is cached. The second clear, one settle
-/// window after the first, removes it, whichever order the reloads landed in.
-/// It costs one extra cache clear about 100 ms after a content change. A
-/// second `site.toml` change inside the window re-arms it.
-const CACHE_SECOND_CLEAR: std::time::Duration = std::time::Duration::from_millis(100);
+/// the old page, and that response is cached. m6-http clears at once, then
+/// again once a debounced report has reloaded the backend, then again once the
+/// poll would have found the change. Each delay derives from m6-core's
+/// constants, so it follows them if they change. The cost is one extra cache
+/// miss per page about a second after a content change, and none on the hit
+/// path. A second `site.toml` change re-arms both.
+const CACHE_LATER_CLEARS: [(std::time::Duration, &str); 2] = [
+    (
+        std::time::Duration::from_millis(
+            m6_core::watcher::RELOAD_DEBOUNCE.as_millis() as u64
+                + CACHE_RELOAD_MARGIN.as_millis() as u64,
+        ),
+        "config reload: cache cleared again after the settle window",
+    ),
+    (
+        std::time::Duration::from_millis(
+            m6_core::watcher::RELOAD_POLL.as_millis() as u64
+                + CACHE_RELOAD_MARGIN.as_millis() as u64,
+        ),
+        "config reload: cache cleared a third time after the poll interval",
+    ),
+];
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
 // ── Shutdown flags ───────────────────────────────────────────────────────────
@@ -643,7 +669,7 @@ fn event_loop(
     // socket globs every 2 seconds so new workers are picked up automatically.
     let rescan_interval = std::time::Duration::from_secs(2);
     // When the cache is to be emptied again after a `site.toml` reload.
-    let mut second_clear: Option<std::time::Instant> = None;
+    let mut later_clears: [Option<std::time::Instant>; 2] = [None, None];
     let mut last_rescan = std::time::Instant::now()
         .checked_sub(rescan_interval)
         .unwrap_or_else(std::time::Instant::now);
@@ -1445,7 +1471,10 @@ fn event_loop(
             if r.cache_cleared {
                 // From the end of the reload, not from before it: a slow
                 // reload must not use up the settle window.
-                second_clear = Some(std::time::Instant::now() + CACHE_SECOND_CLEAR);
+                let end = std::time::Instant::now();
+                for (slot, (after, _)) in later_clears.iter_mut().zip(CACHE_LATER_CLEARS) {
+                    *slot = Some(end + after);
+                }
             }
             if r.tls_failed {
                 let d = reloader.retry(
@@ -1461,10 +1490,12 @@ fn event_loop(
                 );
             }
         }
-        if second_clear.is_some_and(|t| now >= t) {
-            state.cache.clear();
-            second_clear = None;
-            info!("config reload: cache cleared again after the settle window");
+        for (slot, (_, line)) in later_clears.iter_mut().zip(CACHE_LATER_CLEARS) {
+            if slot.is_some_and(|t| now >= t) {
+                state.cache.clear();
+                *slot = None;
+                info!("{line}");
+            }
         }
     }
 

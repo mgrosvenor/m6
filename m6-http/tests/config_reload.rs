@@ -472,3 +472,222 @@ fn the_second_clear_comes_a_full_window_after_a_slow_reload() {
     );
     s.proc.terminate(Duration::from_secs(10));
 }
+
+// ── A real backend that holds a change ───────────────────────────────────────
+
+/// m6-http in front of a real `m6-html`, which renders `data/page.json` into
+/// `/` and reloads under `ConfigReloader` like every `App`.
+///
+/// The backend holds a change that follows another within 20 ms, so it can
+/// reload after m6-http has already cleared its cache. `slow` adds a 40 MB
+/// params file to the backend, which makes each of its reloads take a few
+/// hundred milliseconds.
+struct HtmlStack {
+    port: u16,
+    site: std::path::PathBuf,
+    http: Service,
+    _html: Service,
+    _dir: tempfile::TempDir,
+    _claim: PortClaim,
+    sock: std::path::PathBuf,
+}
+
+impl Drop for HtmlStack {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.sock);
+    }
+}
+
+impl HtmlStack {
+    fn start(slow: bool) -> HtmlStack {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let site = dir.path().to_path_buf();
+        let sock = std::path::PathBuf::from(format!(
+            "/tmp/m6cr-{}-{}.sock",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_file(&sock);
+        let ck = rcgen::generate_simple_self_signed(vec![
+            "localhost".to_string(),
+            "127.0.0.1".to_string(),
+        ])
+        .expect("certificate");
+        std::fs::write(site.join("cert.pem"), ck.cert.pem()).expect("cert");
+        std::fs::write(site.join("key.pem"), ck.key_pair.serialize_pem()).expect("key");
+
+        std::fs::create_dir_all(site.join("templates")).expect("templates");
+        std::fs::create_dir_all(site.join("data")).expect("data");
+        std::fs::write(site.join("templates/page.html"), "<p>{{ title }}</p>\n").expect("template");
+        std::fs::write(site.join("data/page.json"), "{\"title\": \"v1\"}").expect("params");
+        let mut conf = String::new();
+        if slow {
+            // Parsed on every reload of the backend.
+            let item = "{\"k\": \"0123456789abcdef0123456789abcdef\", \"n\": 1234567}";
+            let body = vec![item; 600_000].join(",");
+            std::fs::write(site.join("data/big.json"), format!("{{\"big\": [{body}]}}"))
+                .expect("big params");
+            conf.push_str("global_params = [\"data/big.json\"]\n\n");
+        }
+        conf.push_str(
+            "[[route]]\npath = \"/\"\ntemplate = \"templates/page.html\"\nparams = [\"data/page.json\"]\n\n\
+             [log]\nlevel = \"info\"\nformat = \"text\"\n",
+        );
+        std::fs::write(site.join("html.conf"), conf).expect("html.conf");
+        std::fs::write(
+            site.join("site.toml"),
+            format!(
+                "[site]\nname = \"config-reload\"\ndomain = \"localhost\"\n\n\
+                 [log]\nlevel = \"info\"\nformat = \"text\"\n\n\
+                 [analytics]\nenabled = false\n\n[rate_limit]\nenabled = false\n\n\
+                 [[backend]]\nname = \"html\"\nsockets = \"{}\"\n\n\
+                 [[route]]\npath = \"/\"\nbackend = \"html\"\n",
+                sock.display()
+            ),
+        )
+        .expect("site.toml");
+
+        let html = Service::spawn(
+            "m6-html",
+            Command::new(binary("m6-html"))
+                .arg(&site)
+                .arg(site.join("html.conf"))
+                .env("M6_SOCKET_OVERRIDE", &sock),
+        );
+        assert!(
+            wait::for_unix(&sock, Duration::from_secs(30)),
+            "m6-html never listened\n{}",
+            html.output()
+        );
+
+        let claim = claim_port();
+        let port = claim.port();
+        std::fs::write(
+            site.join("system.toml"),
+            system_toml(
+                port,
+                &site.join("cert.pem").display().to_string(),
+                &site.join("key.pem").display().to_string(),
+                "html",
+            ),
+        )
+        .expect("system.toml");
+        let mut http = Service::spawn(
+            "m6-http",
+            Command::new(binary("m6-http"))
+                .arg(&site)
+                .arg(site.join("system.toml")),
+        );
+        http.wait_for_tcp(port, Duration::from_secs(20));
+        HtmlStack {
+            port,
+            site,
+            http,
+            _html: html,
+            _dir: dir,
+            _claim: claim,
+            sock,
+        }
+    }
+
+    fn touch_site(&self) {
+        std::fs::File::options()
+            .write(true)
+            .open(self.site.join("site.toml"))
+            .expect("open site.toml")
+            .set_modified(std::time::SystemTime::now())
+            .expect("touch site.toml");
+    }
+
+    /// The page body, trimmed.
+    fn page(&self) -> String {
+        let (status, body) = get(self.port, "/").expect("GET /");
+        assert_eq!(status, 200, "{body}");
+        body.trim().to_string()
+    }
+
+    /// Publish v2 the way a renderer does: touch, change the data, touch again
+    /// 10 ms later. The backend holds the second report.
+    fn publish_v2(&self) {
+        self.touch_site();
+        std::thread::sleep(Duration::from_millis(10));
+        std::fs::write(self.site.join("data/page.json"), "{\"title\": \"v2\"}").expect("params v2");
+        self.touch_site();
+    }
+}
+
+/// A backend that holds a change must not leave a stale page behind.
+///
+/// m6-http clears its cache on the change. The backend, which holds a second
+/// report for 20 ms, reloads afterwards, and a request in between caches the
+/// old page. The later clears remove it.
+#[test]
+fn a_backend_that_holds_a_change_does_not_leave_a_stale_page() {
+    let s = HtmlStack::start(false);
+    assert_eq!(s.page(), "<p>v1</p>");
+
+    s.publish_v2();
+    let start = std::time::Instant::now();
+    let _at_once = s.page();
+    let fresh = wait::until(Duration::from_millis(500), || s.page() == "<p>v2</p>");
+    assert!(
+        fresh,
+        "still {:?} {} ms after the change\n--- m6-http ---\n{}",
+        s.page(),
+        start.elapsed().as_millis(),
+        s.http.output()
+    );
+}
+
+/// A backend whose reload takes a few hundred milliseconds ends up serving the
+/// new page, with the backend and m6-http both reloading the held change.
+///
+/// This does not isolate the third clear: m6-http blocks on the backend while
+/// it reloads, so the request that would cache the old page waits for the new
+/// state. The third clear has its own test below.
+#[test]
+fn a_backend_with_a_slow_reload_serves_the_new_page_within_three_seconds() {
+    let s = HtmlStack::start(true);
+    assert_eq!(s.page(), "<p>v1</p>");
+
+    s.publish_v2();
+    let _at_once = s.page();
+    let fresh = wait::until(Duration::from_secs(3), || s.page() == "<p>v2</p>");
+    assert!(
+        fresh,
+        "still {:?} 3 s after the change\n--- m6-http ---\n{}",
+        s.page(),
+        s.http.output()
+    );
+}
+
+/// A backend that finds the change only on its once-a-second poll reloads up to
+/// `RELOAD_POLL` after m6-http cleared. A page cached in between is removed by
+/// the clear one poll interval after the reload.
+#[test]
+fn a_site_toml_change_clears_the_cache_a_third_time_after_the_poll_interval() {
+    let mut s = Stack::start();
+    std::fs::write(
+        s.site.join("site.toml"),
+        Stack::site_toml(s.backend_port, "\n# edited\n"),
+    )
+    .expect("rewrite site.toml");
+    assert!(s.wait_for_log("config reload: complete", 1), "{}", s.log());
+    // Past the second clear, before the third.
+    std::thread::sleep(Duration::from_millis(500));
+    let cached = body(s.port);
+    assert_eq!(body(s.port), cached, "the page must be cached by now");
+
+    assert!(
+        s.wait_for_log("cache cleared a third time", 1),
+        "no third clear\n{}",
+        s.log()
+    );
+    assert_ne!(
+        body(s.port),
+        cached,
+        "the page cached between the second and third clear survived the third"
+    );
+    s.proc.terminate(Duration::from_secs(10));
+}
