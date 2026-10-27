@@ -199,15 +199,21 @@ pub fn exec_scratch_root() -> PathBuf {
 mod tests {
     use super::*;
 
-    /// A one-package workspace named `j18probe` whose binary prints `body`.
+    /// A one-package workspace named `rebuild_probe` whose binary prints `body`.
     fn probe(dir: &Path, main_rs: &str) {
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::write(
             dir.join("Cargo.toml"),
-            "[workspace]\n\n[package]\nname = \"j18probe\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+            "[workspace]\n\n[package]\nname = \"rebuild_probe\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
         )
         .unwrap();
         std::fs::write(dir.join("src/main.rs"), main_rs).unwrap();
+    }
+
+    /// The cargo that `cargo test` runs under, or `cargo` on PATH as `binary()`
+    /// falls back to, so these tests always run.
+    fn cargo_for_tests() -> std::ffi::OsString {
+        std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into())
     }
 
     fn run(path: &Path) -> String {
@@ -217,16 +223,13 @@ mod tests {
 
     #[test]
     fn build_release_rebuilds_after_the_source_changes() {
-        let Some(cargo) = std::env::var_os("CARGO") else {
-            eprintln!("CARGO is not set; skipping");
-            return;
-        };
+        let cargo = cargo_for_tests();
         let dir = tempfile::Builder::new()
             .tempdir_in(exec_scratch_root())
             .unwrap();
         let target = dir.path().join("target");
         probe(dir.path(), "fn main() { println!(\"one\"); }");
-        let first = build_release(&cargo, dir.path(), &target, "j18probe").unwrap();
+        let first = build_release(&cargo, dir.path(), &target, "rebuild_probe").unwrap();
         assert_eq!(run(&first), "one");
 
         std::fs::write(
@@ -234,34 +237,33 @@ mod tests {
             "fn main() { println!(\"two\"); }",
         )
         .unwrap();
-        let second = build_release(&cargo, dir.path(), &target, "j18probe").unwrap();
+        let second = build_release(&cargo, dir.path(), &target, "rebuild_probe").unwrap();
         assert_eq!(run(&second), "two");
     }
 
     #[test]
     fn build_release_names_the_failing_command() {
-        let Some(cargo) = std::env::var_os("CARGO") else {
-            eprintln!("CARGO is not set; skipping");
-            return;
-        };
+        let cargo = cargo_for_tests();
         let dir = tempfile::Builder::new()
             .tempdir_in(exec_scratch_root())
             .unwrap();
         probe(dir.path(), "fn main( {");
-        let err =
-            build_release(&cargo, dir.path(), &dir.path().join("target"), "j18probe").unwrap_err();
+        let err = build_release(
+            &cargo,
+            dir.path(),
+            &dir.path().join("target"),
+            "rebuild_probe",
+        )
+        .unwrap_err();
         assert!(
-            err.contains("cargo build --release --workspace --bin j18probe failed"),
+            err.contains("cargo build --release --workspace --bin rebuild_probe failed"),
             "{err}"
         );
     }
 
     #[test]
     fn build_release_refuses_an_unknown_binary() {
-        let Some(cargo) = std::env::var_os("CARGO") else {
-            eprintln!("CARGO is not set; skipping");
-            return;
-        };
+        let cargo = cargo_for_tests();
         let dir = tempfile::Builder::new()
             .tempdir_in(exec_scratch_root())
             .unwrap();
