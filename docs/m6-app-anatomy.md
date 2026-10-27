@@ -226,25 +226,37 @@ A service that compresses where `site.toml` says it does not lets the edge cache
 
 ### 4.2 What a reload changes
 
-Core watches the directories holding the configuration file and `site.toml`, and reloads within milliseconds of a write.
-Where no change descriptor is available it falls back to polling the modification times at roughly one second.
+A service reads two files, its own configuration and `site.toml`, and a change to either reloads it.
+One `ConfigReloader` in core watches both.
+It takes the change from the platform's watcher when there is one and, whatever the watcher says, compares the two files' size, times and identity once a second.
+A lost watch, a replaced directory or a watcher that stopped reporting therefore delays a reload by at most a second and no longer prevents it.
+A change settles for 100 ms before it reloads, and for at most one second under a writer that never stops, so a writer that writes a file and then touches the configuration is one reload.
+A touch alone, with no change to the bytes, reloads.
 Table 5 says what that reload reaches.
 
-| reloaded on a write | fixed until a restart |
+| reloaded on a change to either file | fixed until a restart |
 |---|---|
 | routes, both the code-bound set and the configuration-declared one | `[thread_pool]` size and queue, read once at startup |
 | templates | `[server] read_timeout_s`, applied to a socket at accept time |
 | the base request dictionary: `global_params`, static params files and the service's own keys | `[server] socket_mode`, applied to the socket once after binding |
-| compression and minification levels | `[log]` level and format |
+| compression and minification levels | `site_toml`, which names the file the watch is built on |
+| the `[log]` level, from the command line, the service's `[log]` or `site.toml`'s `[log]`, in that order | `[log]` format |
+| the `[[backend]] compresses` agreement with `site.toml` | |
+| state built in `init_global`, through `on_reload` | |
 
-**Table 5: what a configuration write changes, and what needs a restart.**
-Take from it that everything about a request is reloadable and everything about the process is not, with one exception: `[log]` is a process setting that core can reload and an app never does.
+**Table 5: what a change to either file reloads, and what needs a restart.**
+Take from it that a reload re-reads both files every time, whichever one changed, because a service has no cache that a rebuild would lose.
 
-`m6_core::log::init` returns a `LogHandle` whose `reload` changes the level, and `m6-http` calls it on every configuration change.
-An `App` service binds that handle to `_log_guard` and never calls it, so editing `[log] level` in an app's configuration and waiting for the reload changes nothing.
+A key that needs a restart keeps its running value.
+The reload logs `config reload: <key> changed; restart this service to apply it` for each one that differs.
 
 A reload that fails is refused whole.
-A configuration that does not parse, a template that does not build, and a route naming an unregistered handler each leave the previous state serving and log the reason, which is what makes a typo in a live configuration recoverable.
+A configuration that does not parse, a template that does not build, a route naming an unregistered handler, a `site_toml` that is gone or not valid TOML, and a `compresses` declaration that disagrees with the service each leave the previous state serving and log the reason, which is what makes a typo in a live configuration recoverable.
+A file that failed to load is not tried again until it is written again.
+
+`AppWithGlobal::on_reload` and `AppWithState::on_reload` register `Fn(&G, &AppContext) -> Result<()>` for state that `init_global` built from the configuration.
+Core calls it after a successful reload, once the new routes are serving, with the new configuration in the context.
+An `Err` is logged at error level and the service keeps serving, so the hook is expected to leave its own state as it was.
 
 The route table is the part of that configuration a service writes code against, and §5 is how the two meet.
 
@@ -335,6 +347,7 @@ Take from it that per-thread state is handed to a handler as `&mut` and shared s
 
 An initialiser returns `Result`, so a service that cannot build its state exits 2 at startup.
 `on_destroy` and `on_destroy_thread` register the reverse, for state that owns something worth closing.
+`on_reload` re-reads state that the initialiser built from the configuration (§4.2).
 
 **Only the global initialiser receives an `AppContext`.**
 `AppContext` carries the parsed configuration, the site directory, the configuration file's path and the resolved path of `site.toml`, because a configuration that names files has to resolve them against the same roots the rest of the service uses.

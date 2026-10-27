@@ -93,7 +93,7 @@ Thirty-seven modules. Grouped by what you would be doing when you reach for one.
 | `signal` | `block()`, `Service`, `ShutdownHandle`. Signal-safe shutdown, and SIGUSR1 to reopen the log file. |
 | `render` | The `Renderer` and `RendererFactory` traits, plus `NoTemplates`. The only thing the loop needs from a template engine. |
 | `template` | The Tera implementation of those traits, and the site filters. Feature `templates`. |
-| `watcher` | `ConfigWatcher`, inotify on Linux and kqueue on the BSDs. |
+| `watcher` | `ConfigWatcher`, inotify on Linux and kqueue on the BSDs, and `ConfigReloader`, which watches a service's two files. |
 
 **Request and response**
 
@@ -178,7 +178,8 @@ state shape once and the type carries it:
 
 The `init` closures receive the config map (`&Map<String, Value>`) and return
 `Result`, so a service that cannot build its state fails at startup rather than
-on the first request. `.on_destroy(...)` gives the global a teardown hook.
+on the first request. `.on_destroy(...)` gives the global a teardown hook, and `.on_reload(...)` a
+hook that runs after each successful reload with the new `AppContext`.
 
 **Routing.** `compile_pattern` turns `/blog/{stem}` into `Vec<Segment>`;
 `route_specificity` scores a compiled route so that a literal beats a
@@ -320,6 +321,20 @@ template signals a 404 from inside rendering.
 
 `ConfigWatcher::new(paths)`, `raw_fd()` to fold into an existing `poll(2)` set,
 `read_events(filenames)` to drain and report whether anything relevant changed.
+
+`ConfigReloader::new(site_toml, process, seen)` owns a `ConfigWatcher` on a
+service's two files and reports which of them changed. The loop calls
+`on_readable(now)` when `raw_fd()` is readable and `tick(now)` on every
+iteration. `tick` returns `Some(Changed { site, process })` once a change has
+settled. Which file changed is decided by a `Fingerprint` (device, inode,
+length, mtime and ctime). The event name plays no part, so inotify and kqueue
+give the same answer and a file beside the config in the same directory is
+ignored. A change settles for `RELOAD_DEBOUNCE` (100 ms), capped at
+`RELOAD_POLL` (one second) under a writer that never stops. The fingerprints are
+also compared every `RELOAD_POLL` whatever the watcher says, which finds a lost
+watch. Take a `Seen` from `Seen::read` before the first read of either file so a
+change in between is reported on the first tick. With no watcher the poll alone
+does the job. There is no thread and `tick` does not allocate.
 
 Three implementations behind `cfg`: **inotify on Linux**, kqueue on
 macOS/FreeBSD/OpenBSD, and a stub elsewhere that never reports a change. The

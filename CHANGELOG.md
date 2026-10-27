@@ -19,6 +19,33 @@ the version when the release is cut.
 
 ### Changed
 
+**An `App` reloads when either of its two files changes, and a lost watch no longer stops it (#244, closes #185 and #198).**
+An `App` service watched both its config and `site.toml` but rebuilt only from its own config.
+`site.toml`'s `[log]` level and its `[[backend]] compresses` declaration were read once at start, so editing the log level there changed nothing (#198).
+A watcher that stopped delivering events left a service that never reloaded, because the one-second modification-time check ran only when there was no watcher at all (#185).
+State that `init_global` built from the config had no way to reload.
+
+`m6_core::ConfigReloader` now watches both files.
+It takes the change from the platform watcher and, whatever the watcher says, compares the two files' identity, size and times once a second.
+A change settles for 100 ms, and for at most one second under a writer that never stops, so a writer that writes a file and then touches the config is one reload.
+A touch alone reloads.
+A file that failed to load is not tried again until it is written again.
+
+An App reload now re-reads `site.toml` every time.
+It applies the log level with the same precedence as start: the command line, then the service's `[log]`, then `site.toml`'s `[log]`.
+It checks the `compresses` agreement again and refuses the reload on a disagreement.
+It refuses a named `site_toml` that is gone or not valid TOML.
+The previous state keeps serving after any refusal.
+It logs `config reload: <key> changed; restart this service to apply it` for `thread_pool.size`, `thread_pool.queue_size`, `server.read_timeout_s`, `server.socket_mode` and `site_toml`, which keep their running values.
+`Reload complete` gains `site` and `process` fields saying which file changed.
+
+`AppWithGlobal::on_reload` and `AppWithState::on_reload` register `Fn(&G, &AppContext) -> Result<()>`.
+Core calls it after a successful reload with the new config, so a service can re-read the state it built in `init_global`.
+An `Err` is logged and the service keeps serving.
+
+m6-http is not changed by this.
+It keeps its own watcher until it moves onto `ConfigReloader`.
+
 **Each key goes in the file it belongs to, and an app can say where `site.toml` is (#242).**
 Every m6 process reads two files.
 `site.toml` holds the state every process of the site shares.
