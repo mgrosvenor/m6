@@ -647,6 +647,8 @@ struct Store {
 #[derive(Debug, Default)]
 struct Written {
     crawl_windows: u64,
+    /// The id of the poll just written. Pruning never deletes it.
+    poll_id: i64,
     pruned: u64,
     cap_unmet: bool,
     /// Why pruning failed. The poll itself was written.
@@ -765,7 +767,8 @@ impl Store {
         }
         let mut w = r?;
         // The poll is committed. A prune that fails is reported on its own.
-        let pruned = self.prune(&mut w);
+        let keep_from = w.poll_id;
+        let pruned = self.prune(&mut w, keep_from);
         let measured = self.measure(&mut w);
         if let Err(e) = pruned.and(measured) {
             w.prune_error = Some(format!("{e:#}"));
@@ -784,6 +787,7 @@ impl Store {
         )?
         .execute(params![b.at_ms, b.level, b.faults, b.warns])?;
         let poll_id = tx.last_insert_rowid();
+        w.poll_id = poll_id;
         for f in &b.findings {
             tx.prepare_cached(
                 "INSERT INTO poll_finding (poll_id, level, node, polled, text) \
@@ -882,8 +886,9 @@ impl Store {
     }
 
     /// Delete the oldest polls when the file's used bytes pass the cap, and
-    /// with each batch the user agents no sighting names any more.
-    fn prune(&mut self, w: &mut Written) -> anyhow::Result<()> {
+    /// with each batch the user agents no sighting names any more. A poll with
+    /// an id of `keep_from` or more is never deleted.
+    fn prune(&mut self, w: &mut Written, keep_from: i64) -> anyhow::Result<()> {
         let mut used = sqlite::used_bytes(&self.conn)?;
         if used > self.max_bytes {
             let target = self.max_bytes - self.max_bytes / 20;
@@ -892,8 +897,9 @@ impl Store {
                     .conn
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 let n = tx.execute(
-                    "DELETE FROM poll WHERE id IN (SELECT id FROM poll ORDER BY id LIMIT ?1)",
-                    [PRUNE_BATCH],
+                    "DELETE FROM poll WHERE id IN \
+                     (SELECT id FROM poll WHERE id < ?1 ORDER BY id LIMIT ?2)",
+                    params![keep_from, PRUNE_BATCH],
                 )?;
                 tx.execute(
                     "DELETE FROM agent WHERE id NOT IN (SELECT agent_id FROM crawl_sighting)",
@@ -3249,6 +3255,37 @@ mod tests {
         assert!(f.text.contains("over its cap"), "{}", f.text);
         assert!(!f.text.contains("missing"), "{}", f.text);
         assert!(d.last_error.unwrap().contains("over its cap"));
+        // Only the poll just written is left, and it is that one.
+        let c = rusqlite::Connection::open(dir.path().join("sub").join("history.sqlite3")).unwrap();
+        let rows: Vec<i64> = c
+            .prepare("SELECT at_ms FROM poll")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows, vec![T0]);
+    }
+
+    #[test]
+    fn a_cap_that_cannot_be_met_keeps_only_the_newest_poll() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Config {
+            max_bytes: 4096,
+            ..cfg(dir.path(), 1)
+        };
+        let mut s = Store::open(&c).unwrap();
+        s.write(&make(T0, &[reading("a")])).unwrap();
+        s.write(&make(T0 + 30_000, &[reading("a")])).unwrap();
+        let rows: Vec<i64> = s
+            .conn
+            .prepare("SELECT at_ms FROM poll")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows, vec![T0 + 30_000]);
     }
 
     #[cfg(unix)]
