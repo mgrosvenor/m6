@@ -73,12 +73,14 @@ workspace tests pass with 0 failures, h3 and QUIC included.
 
 ### Added
 
-**`/perf` and `/traffic` for listed peers only, with an API token (#237).**
+**`/perf` and `/traffic` for listed peers only, with a token (#237).**
 `[health] metrics_peers` lists the IP addresses allowed to read `/perf` and `/traffic`.
 Each entry must be in a local range (`m6_core::net::is_private_ip`), and names and ranges are refused.
 The peer address is the one the TCP or QUIC handshake proved, so the endpoints are refused on an internal h2c listener, which believes `X-Forwarded-For`.
 Any other peer gets 404.
-`[health] metrics_require` takes `role:<name>` or `group:<name>` and checks a token with `[auth] public_key`. The token comes from the Authorization header or the session cookie, as route `require` reads it: 401 for no or bad token, 403 for the wrong claim.
+`[health] metrics_require` takes `role:<name>` or `group:<name>` and checks a token with `[auth] public_key`.
+The token comes from the Authorization header or the session cookie, as route `require` reads it.
+No or a bad token gets 401 and the wrong claim gets 403.
 `metrics_token_file` stays as the legacy gate and is ignored when `metrics_require` is set.
 `[auth] backend` is optional, and `[auth]` and the two new keys may be set in the system config.
 The proxy's own 401 from route `require` now carries `WWW-Authenticate: Bearer`.
@@ -98,7 +100,7 @@ Check each system config for these three cases before the upgrade:
 
 When both arguments name the same file, it is read twice and the system-side `[auth]` and `[health]` are ignored, so it is not a second declaration.
 Older versions ignore the new keys, so a config can carry them before the upgrade, but the endpoints stay on the legacy gate until it.
-Verified: `cargo test --workspace -- --test-threads=1` passes 1390 tests with 0 failures and 0 warnings on the release and test builds.
+Verified: `cargo test --workspace -- --test-threads=1` passes 1388 tests with 0 failures and 0 warnings on the release and test builds.
 `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `tools/clippy.sh` and `cargo deny check` are silent.
 `m6-http/tests/metrics_access.rs` runs the real binary and covers h1, h2 and h3.
 The three `// end cache hit` blocks in `m6-http/src/main.rs` are byte-identical to `develop` (735 lines, empty diff), and the only functions touched in that file are `handle_request_inner` and a new helper beside the error path.
