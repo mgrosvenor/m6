@@ -12,6 +12,64 @@ releases only; work happens on `develop`. See `CONTRIBUTING.md`.
 
 ---
 
+## Unreleased
+
+**m6-http reloads when its system config changes without clearing the cache, reads new TLS material when the system config is touched and no longer watches the certificate files, empties the cache a second time after a `site.toml` reload, and m6-auth-server and m6-monitor use the reload hook.**
+
+### Changed
+
+**m6-http watches its system config as well as `site.toml`, on one `ConfigReloader` (#252).**
+Before this change m6-http watched `site.toml` and its certificate files and did not watch its system config.
+A change there applied at the next `site.toml` reload, which also emptied the response cache.
+m6-http now runs the same `ConfigReloader` as every `App`, over both files.
+
+A change to `site.toml` rebuilds routes, pools, the invalidation map, the error mode and the security headers, and clears the cache, as before.
+A change to the system config alone takes only the keys that file owns, keeps the cache and re-reads TLS on HTTP/1.1, HTTP/2 and HTTP/3, the `[auth]` key, the `[health]` access keys, the node name, `allowed_methods` and `backend_timeout_secs`.
+The system config alone never replaces routes, so a refused `site.toml` reload cannot leave the config describing one site while the route table serves another.
+A change to both files runs both.
+`config reload: complete` now carries `site`, `process`, `cache_cleared` and `elapsed_us`.
+
+The keys m6-http reads only at start keep their running value on a reload and are named.
+They are `[server]` `bind`, `h2c_bind`, `internal_binds`, `internal_peers`, `redirect_bind` and `warm_on_start`, and `[analytics]` `enabled` and `log_path`.
+The log says `config reload: [server].bind changed; restart m6-http to apply it`, and `/perf` and `--dump-config` describe what is running.
+
+**TLS is read when the system config is touched, and the certificate files are not watched (#252).**
+A renewal writes the certificate and the key as two files, so the first event could read a certificate beside the previous key, fail the pair check and wait for another event.
+The second watcher, a thread with a self-pipe off Linux, is gone.
+`FsWatcher` now watches only the backend socket directory, on Linux.
+A renewal writes both files, then touches the system config, and m6-http reads both on the touch.
+A touch that arrives before the key is written fails the pair check, keeps the running certificate on every protocol, and is retried after 1 s, doubling to 60 s.
+A system config change reloads TLS even when `site.toml` fails to load, so a `site.toml` that is mid-edit does not hold a renewal back.
+
+**A `site.toml` reload empties the cache again after 100 ms (#252).**
+A backend that reloads after m6-http can answer a request in the gap with the old page, and m6-http caches it.
+The second clear removes it, whichever order the reloads land in.
+It costs one extra cache clear about 100 ms after a content change.
+A second change inside the window re-arms it.
+The cache-hit path is unchanged: the three cache-hit blocks in `m6-http/src/main.rs` are byte-identical to the previous release.
+
+**m6-auth-server re-reads its signing keys on reload, and m6-monitor names its restart-only keys (#252).**
+The key-watching thread in m6-auth-server is gone, and with it the `libc` dependency it alone used.
+The service's `on_reload` hook loads the private and public key before it swaps either, so a key that fails to load leaves the running keys serving and is retried.
+A changed `[storage] path`, token lifetime, issuer or rate limit is named in a warning that says to restart.
+m6-monitor warns when `poll_interval_s`, `[monitor] history_file` or `history_max_mb` changes, because it reads them once at start.
+
+**Migration.**
+m6-http no longer watches its certificate and key files, and m6-auth-server no longer watches its signing keys.
+Anyone renewing certificates must touch the process config after writing them, for example with a certbot deploy hook that runs `touch /etc/m6/system.toml`.
+Until the touch, m6-http keeps serving the previous certificate.
+Rotate an m6-auth-server key by writing both files and then touching its config.
+
+### Verified
+
+- `tls_reload`: the certificate moves on HTTP/1.1, HTTP/2 and HTTP/3 after the touch, flat and through a certbot-style symlink. Writing the certificate without a touch changes nothing for 3 s. A broken `site.toml` does not hold a certificate back. A touch before the key is written lands through the retry.
+- `config_reload`: a system config touch keeps the cache and logs `cache_cleared=false`. A `site.toml` change clears it twice. A bind change is named and not applied. A system config change after a refused `site.toml` reload keeps the running routes.
+- `metrics_access`: `[health] metrics_peers` in the system config applies on HTTP/1.1, HTTP/2 and HTTP/3 without a restart, and a rotated `[auth]` key verifies after a touch and not before.
+- m6-auth-server: a rotated signing key is served after the config is touched and not before, and a garbage key leaves the old one serving.
+- m6-monitor: a changed `poll_interval_s` is named and the service keeps running.
+
+---
+
 ## 1.14.0 — 2026-10-27
 
 **Log reopen on SIGUSR1, declared internal listeners that accept only the peers a config names, token-gated metrics, a monitor history and tunnel health, new m6-core blocks including an opt-in SQLite feature and a config reloader, a fleet certificate comparison, the user agents of notable clients, each config key in the file it belongs to, test binaries built from the source under test, and a TLS reload that now replaces the certificate every listener serves, which fixes the limitation 1.13.0 recorded.**

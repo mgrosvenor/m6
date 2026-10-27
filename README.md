@@ -157,7 +157,7 @@ Reverse proxy, cache, and router. The only process that listens on a public port
 - JWT verified locally with m6-auth's public key — no per-request network hop
 - Backend pools: Unix socket globs (local) or URL backends (`http://`, `https://`, `h2c://`, `h2s://`)
 - inotify watches `/run/m6/` for pool membership changes (new sockets added without config reload)
-- `site.toml` and TLS cert/key watched via inotify — hot-reload with no restart
+- `site.toml` and the system config watched, with no restart. Touch the system config after renewing a certificate, and m6-http keeps its cache
 - `Cache-Control: public` responses cached; `no-store` / `private` skipped
 - Error pages fetched from configured `[errors] path` backend on 4xx/5xx
 
@@ -501,10 +501,10 @@ Browser                  m6-http                  m6-auth-server
 
 | Component | Trigger | What reloads |
 |-----------|---------|-------------|
-| m6-http | `site.toml` changed (inotify) | Routes, backends, cache invalidation map |
+| m6-http | `site.toml` changed | Routes, backends, cache invalidation map. The cache is cleared |
 | m6-http | Socket appears/disappears in `/run/m6/` | Backend pool membership |
-| m6-http | TLS cert/key changed (inotify) | TLS context (including QUIC) |
-| m6-auth-server | Key file changed (inotify) | JWT signing key |
+| m6-http | System config changed or touched | TLS context (including QUIC), auth key, `[health]` access keys. The cache is kept |
+| m6-auth-server | Its config changed or touched | Signing keys, re-read from the key files |
 | m6-html | Config file or `site.toml` changed (inotify on Linux, kqueue on macOS, and a fingerprint poll every second) | Templates, routes, params, log level |
 
 ---

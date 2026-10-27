@@ -14,7 +14,7 @@
 //! same certificate, and is it the new one?**
 //!
 //! It is a process test rather than a unit test deliberately. The reload is
-//! driven by a filesystem event and crosses the event loop, the rustls
+//! driven by a touch of the system config and crosses the event loop, the rustls
 //! listener and the quiche configuration, and a unit test of any one of those
 //! is a test of the half that already worked.
 //!
