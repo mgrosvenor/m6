@@ -382,7 +382,7 @@ The paragraph on withdrawn benchmarks keeps what a reader needs, which is that f
 F044 now reads "Not fixed. Safe for the audited configuration", which also stops a generic server's README referring to a deployment.
 No figure, score or claim changed, and the audit result and the conformance counts are as they were.
 
-Verified by reading the diff: the PR records 15 insertions and 23 deletions in the README.
+Verified by reading the merged diff: README only, no code and no tests.
 No code changed and no tests were run.
 
 **Two contributor rules in CLAUDE.md corrected (#223).** The rule that a change
