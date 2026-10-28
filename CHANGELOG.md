@@ -8,11 +8,12 @@ source: several defects in this list were invisible in the code and only showed
 up against the deployed artefact.
 
 The version number follows the policy under Versions in `CONTRIBUTING.md`.
-`main` holds releases only; work happens on `develop`.
+`main` holds releases only.
+Work happens on `develop`.
 
 ---
 
-## 1.15.0 — 2026-10-27
+## 1.15.0 — 2026-10-29
 
 **m6-http reloads its system config, and TLS on HTTP/1.1, HTTP/2 and HTTP/3, when the process config is touched, and keeps its cache while it does. Certificate files are no longer watched, so a renewal must touch the process config after it writes them. m6-auth-server re-reads its keys on reload and refuses a private key that is not the pair of the public key. A `site.toml` change clears the cache again once the backends' settle window has passed and once more after the poll interval, which fixes the stale cached page that 1.14.0 introduced in #244 (#254).**
 
@@ -24,8 +25,10 @@ m6-http no longer watches its certificate and key files, and m6-auth-server no l
 Anyone renewing certificates must touch the process config after writing them, for example with a certbot deploy hook that runs `touch /etc/m6/system.toml`.
 Until the touch, m6-http keeps serving the previous certificate.
 Rotate an m6-auth-server key by writing both files and then touching its config.
-After an auth key rotation, touch m6-http's system config as well, because m6-http takes the new public key only on that touch, and until it does new tokens get 401.
-A renewal hook that touches `site.toml` no longer reloads the certificate and only empties the cache, so touch the process config instead.
+After an auth key rotation, touch m6-http's system config as well, because m6-http takes the new public key when either of its files is reloaded, and until it reloads new tokens get 401.
+A renewal hook that touches `site.toml` does not reload the certificate and only empties the cache, so touch the process config instead.
+`[analytics] enabled`, `[analytics] log_path` and the `[server]` binds now apply only on a restart.
+In 1.14.0, turning `[analytics] enabled` off took effect on a `site.toml` reload, and now m6-http keeps the running value and warns.
 
 ### Changed
 

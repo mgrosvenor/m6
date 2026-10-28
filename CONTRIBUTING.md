@@ -94,7 +94,8 @@ A version is `X.Y.Z`, and what changed decides which number moves (Table 1).
 
 *Table 1: the three version numbers and what moves each. A release that does two things takes the larger move.*
 
-A change to configuration or behaviour that needs a migration note is a Y change, not an X change. It carries a Migration section in its `CHANGELOG.md` entry, ahead of the list of changes.
+A change to configuration or behaviour that needs a migration note is a Y change.
+It carries a Migration section in its `CHANGELOG.md` entry, ahead of the list of changes.
 
 ### If you make something faster
 
