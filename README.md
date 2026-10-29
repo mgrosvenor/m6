@@ -107,7 +107,7 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md).
     │ renderer │       │ Brotli/    │     │ JWT refresh  │   │ Rust:       │
     │          │       │ gzip       │     │ Login/logout │   │ m6-render   │
     │ Hot      │       │ Symlink    │     │ Rate limit   │   │ library     │
-    │ reload   │       │ guard      │     │ Key watch    │   │             │
+    │ reload   │       │ guard      │     │ Key reload   │   │             │
     └────┬─────┘       └────────────┘     └──────┬───────┘   └─────────────┘
          │  m6-render library (Rust)             │  m6-auth library (Rust)
          └───────────────────────────────────────┘
@@ -316,7 +316,7 @@ Auth service. Issues and verifies JWTs, manages sessions.
 **Architecture:**
 - Four HTTP endpoints: `POST /auth/login`, `POST /auth/refresh`, `POST /auth/logout`, `GET /auth/public-key`
 - RS256 or ES256 JWT signing (EC recommended); access token TTL 15 min, refresh token TTL 30 days
-- Key pair watched via inotify — key rotation without restart
+- Key pair re-read when its config is touched, so a key rotation needs no restart. A key that fails to load, or a private key that is not the pair of the public key, leaves the running keys serving
 - Rate limiting: 5 login attempts / 15 min / IP
 - Delegates credential and ACL storage to m6-auth library (SQLite, WAL mode)
 - Never logs passwords, tokens, or key material

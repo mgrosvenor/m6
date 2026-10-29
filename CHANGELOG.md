@@ -7,14 +7,28 @@ Each entry records what changed, why it mattered, and how it was verified.
 source: several defects in this list were invisible in the code and only showed
 up against the deployed artefact.
 
-Versions follow [semantic versioning](https://semver.org). `main` holds
-releases only; work happens on `develop`. See `CONTRIBUTING.md`.
+The version number follows the policy under Versions in `CONTRIBUTING.md`.
+`main` holds releases only.
+Work happens on `develop`.
 
 ---
 
-## Unreleased
+## 1.15.0 — 2026-10-29
 
-**m6-http reloads when its system config changes without clearing the cache, reads new TLS material when the system config is touched and no longer watches the certificate files, empties the cache a second time after a `site.toml` reload, and m6-auth-server and m6-monitor use the reload hook.**
+**m6-http reloads its system config, and TLS on HTTP/1.1, HTTP/2 and HTTP/3, when the process config is touched, and keeps its cache while it does. Certificate files are no longer watched, so a renewal must touch the process config after it writes them. m6-auth-server re-reads its keys on reload and refuses a private key that is not the pair of the public key. A `site.toml` change clears the cache again once the backends' settle window has passed and once more after the poll interval, which fixes the stale cached page that 1.14.0 introduced in #244 (#254).**
+
+Migration is required for anyone who renews certificates or rotates auth keys. The steps are under Migration below.
+
+### Migration
+
+m6-http no longer watches its certificate and key files, and m6-auth-server no longer watches its signing keys.
+Anyone renewing certificates must touch the process config after writing them, for example with a certbot deploy hook that runs `touch /etc/m6/system.toml`.
+Until the touch, m6-http keeps serving the previous certificate.
+Rotate an m6-auth-server key by writing both files and then touching its config.
+After an auth key rotation, touch m6-http's system config as well, because m6-http takes the new public key when either of its files is reloaded, and until it reloads new tokens get 401.
+A renewal hook that touches `site.toml` does not reload the certificate and only empties the cache, so touch the process config instead.
+`[analytics] enabled`, `[analytics] log_path` and the `[server]` binds now apply only on a restart.
+In 1.14.0, turning `[analytics] enabled` off took effect on a `site.toml` reload, and now m6-http keeps the running value and warns.
 
 ### Changed
 
@@ -54,17 +68,9 @@ The service's `on_reload` hook loads the private and public key before it swaps 
 A changed `[storage] path`, token lifetime, issuer or rate limit is named in a warning that says to restart.
 m6-monitor warns when `poll_interval_s`, `[monitor] history_file` or `history_max_mb` changes, because it reads them once at start.
 
-**Migration.**
-m6-http no longer watches its certificate and key files, and m6-auth-server no longer watches its signing keys.
-Anyone renewing certificates must touch the process config after writing them, for example with a certbot deploy hook that runs `touch /etc/m6/system.toml`.
-Until the touch, m6-http keeps serving the previous certificate.
-Rotate an m6-auth-server key by writing both files and then touching its config.
-After an auth key rotation, touch m6-http's system config as well, because m6-http takes the new public key only on that touch, and until it does new tokens get 401.
-A renewal hook that touches `site.toml` no longer reloads the certificate and only empties the cache, so touch the process config instead.
-
 ### Fixed
 
-**A `site.toml` change could leave a stale page in the cache when a backend reloaded after m6-http had cleared it (introduced in 1.14.0 by #244).**
+**A `site.toml` change could leave a stale page in the cache when a backend reloaded after m6-http had cleared it (#254, introduced in 1.14.0 by #244).**
 m6-http clears its cache as soon as it sees the change.
 A backend under `ConfigReloader` can hold a second report for 20 ms, and on Linux one `Request::touch` produces two reports, so the backend reloaded after the clear.
 A request in between cached the old page, and a `Cache-Control: public` page stays cached for up to 24 hours.
