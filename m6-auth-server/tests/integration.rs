@@ -684,3 +684,105 @@ fn issuer_falls_back_to_the_configured_site_toml() {
         result.err()
     );
 }
+
+/// The body of `GET /auth/public-key`.
+fn public_key_body(env: &TestEnv) -> String {
+    let req = "GET /auth/public-key HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    let resp = http_request(&env.socket_path, req);
+    let at = resp.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
+    resp[at..].to_string()
+}
+
+/// Set the modified time of `path` to now, which is all a `touch` does.
+fn touch(path: &Path) {
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .expect("open for touch")
+        .set_modified(std::time::SystemTime::now())
+        .expect("set modified time");
+}
+
+/// A rotation is: write both key files, then touch the config. The key files
+/// are not watched, so nothing changes until the touch.
+#[test]
+fn a_rotated_signing_key_signs_after_the_config_is_touched() {
+    let env = setup_test_env("rotate");
+    let guard = spawn_server(&env);
+    let key_a = public_key_body(&env);
+    assert!(key_a.contains("PUBLIC KEY"), "{key_a}");
+
+    let (private_b, public_b) = generate_test_rsa_keys();
+    assert_ne!(public_b, key_a);
+    std::fs::write(env._key_dir.path().join("auth.pem"), &private_b).unwrap();
+    std::fs::write(env._key_dir.path().join("auth.pub"), &public_b).unwrap();
+
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        public_key_body(&env),
+        key_a,
+        "writing the key files changed the key without a touch"
+    );
+
+    touch(&env.config_path);
+    assert!(
+        wait::until(Duration::from_secs(5), || public_key_body(&env) == public_b),
+        "the new key was not served after the config was touched\n--- output ---\n{}",
+        guard.output()
+    );
+}
+
+/// A new key that does not load is refused and the running key stays.
+#[test]
+fn a_bad_new_key_keeps_the_old_one() {
+    let env = setup_test_env("rotate-bad");
+    let guard = spawn_server(&env);
+    let key_a = public_key_body(&env);
+
+    std::fs::write(env._key_dir.path().join("auth.pem"), "not a key\n").unwrap();
+    touch(&env.config_path);
+
+    assert!(
+        wait::until(Duration::from_secs(5), || guard
+            .output()
+            .contains("Reload hook failed")),
+        "the failed reload was not reported\n--- output ---\n{}",
+        guard.output()
+    );
+    assert_eq!(
+        public_key_body(&env),
+        key_a,
+        "a bad key replaced the good one"
+    );
+}
+
+/// Writing the private key and the public key is two writes, and a touch
+/// between them must not install a mismatched pair.
+#[test]
+fn a_mismatched_key_pair_is_refused_and_the_matching_one_lands_on_retry() {
+    let env = setup_test_env("rotate-mismatch");
+    let guard = spawn_server(&env);
+    let key_a = public_key_body(&env);
+
+    let (private_b, public_b) = generate_test_rsa_keys();
+    // The new private key beside the old public key.
+    std::fs::write(env._key_dir.path().join("auth.pem"), &private_b).unwrap();
+    touch(&env.config_path);
+    assert!(
+        wait::until(Duration::from_secs(5), || guard
+            .output()
+            .contains("Reload hook failed")),
+        "a mismatched pair was installed\n--- output ---\n{}",
+        guard.output()
+    );
+    assert_eq!(public_key_body(&env), key_a);
+
+    // The second write arrives. No touch: core's retry finds the pair.
+    std::fs::write(env._key_dir.path().join("auth.pub"), &public_b).unwrap();
+    assert!(
+        wait::until(Duration::from_secs(10), || public_key_body(&env)
+            == public_b),
+        "the matching pair never loaded on the retry\n--- output ---\n{}",
+        guard.output()
+    );
+}

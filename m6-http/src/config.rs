@@ -1380,6 +1380,96 @@ fn node_state_message(section: &str, key: Option<&str>, system_config_path: &Pat
     )
 }
 
+/// Copy the running value of every key that is read only at start into `new`,
+/// and name each one whose value differed.
+///
+/// These are `[server]` `bind`, `h2c_bind`, `internal_binds`, `internal_peers`,
+/// `redirect_bind` and `warm_on_start`, and `[analytics]` `enabled` and
+/// `log_path`. The listeners are bound, the peer list is built and the
+/// analytics log is opened once, before the event loop starts (`main.rs`,
+/// `run`), so a reload cannot apply a new value. Keeping the running value in
+/// `new` makes `/perf` and `--dump-config` describe what is running, and the
+/// returned name goes into a warning that says to restart. The log format is
+/// named by `LogHandle::reload`.
+pub fn carry_restart_only(running: &Config, new: &mut Config) -> Vec<&'static str> {
+    let mut named = Vec::new();
+    if new.server.bind != running.server.bind {
+        named.push("[server].bind");
+        new.server.bind.clone_from(&running.server.bind);
+    }
+    if new.server.h2c_bind != running.server.h2c_bind {
+        named.push("[server].h2c_bind");
+        new.server.h2c_bind.clone_from(&running.server.h2c_bind);
+    }
+    if new.server.internal_binds != running.server.internal_binds {
+        named.push("[server].internal_binds");
+        new.server
+            .internal_binds
+            .clone_from(&running.server.internal_binds);
+    }
+    if new.server.internal_peers != running.server.internal_peers {
+        named.push("[server].internal_peers");
+        new.server
+            .internal_peers
+            .clone_from(&running.server.internal_peers);
+    }
+    if new.server.redirect_bind != running.server.redirect_bind {
+        named.push("[server].redirect_bind");
+        new.server
+            .redirect_bind
+            .clone_from(&running.server.redirect_bind);
+    }
+    if new.server.warm_on_start != running.server.warm_on_start {
+        named.push("[server].warm_on_start");
+        new.server.warm_on_start = running.server.warm_on_start;
+    }
+    if new.analytics.enabled != running.analytics.enabled {
+        named.push("[analytics].enabled");
+        new.analytics.enabled = running.analytics.enabled;
+    }
+    if new.analytics.log_path != running.analytics.log_path {
+        named.push("[analytics].log_path");
+        new.analytics
+            .log_path
+            .clone_from(&running.analytics.log_path);
+    }
+    named
+}
+
+/// The running config with only the keys the process config owns taken from
+/// `loaded`.
+///
+/// A reload that follows a touch of the system config alone has no business
+/// changing the site. If an earlier `site.toml` reload was refused (a route
+/// naming an unknown backend, say), the file on disk differs from what is
+/// running, and swapping in all of `loaded` would leave `state.config`
+/// describing one site while the route table serves another. So this starts
+/// from `running` and copies in `node`, `auth`, the certificate and key paths,
+/// `allowed_methods`, `backend_timeout_secs`, the six restart-only `[server]`
+/// keys (which `carry_restart_only` then puts back and names) and the
+/// `[health]` access keys with the token they resolve to.
+pub fn take_process_owned(running: &Config, loaded: Config) -> Config {
+    let mut c = running.clone();
+    c.node = loaded.node;
+    c.auth = loaded.auth;
+    c.server.tls_cert = loaded.server.tls_cert;
+    c.server.tls_key = loaded.server.tls_key;
+    c.server.allowed_methods = loaded.server.allowed_methods;
+    c.server.backend_timeout_secs = loaded.server.backend_timeout_secs;
+    c.server.bind = loaded.server.bind;
+    c.server.h2c_bind = loaded.server.h2c_bind;
+    c.server.internal_binds = loaded.server.internal_binds;
+    c.server.internal_peers = loaded.server.internal_peers;
+    c.server.redirect_bind = loaded.server.redirect_bind;
+    c.server.warm_on_start = loaded.server.warm_on_start;
+    c.health.metrics_token_file = loaded.health.metrics_token_file;
+    c.health.metrics_token = loaded.health.metrics_token;
+    c.health.metrics_require = loaded.health.metrics_require;
+    c.health.metrics_peers = loaded.health.metrics_peers;
+    c.health.metrics_peer_ips = loaded.health.metrics_peer_ips;
+    c
+}
+
 /// True when the system config names no `[node]`, so the node identity falls
 /// back to `[site].name`.
 pub fn node_falls_back(system_config_path: &Path) -> bool {
@@ -2675,5 +2765,60 @@ internal_peers = ["203.0.113.7"]
             let right = misplaced(right_site, right_system);
             assert!(right.is_empty(), "{name} in the right file: {right:?}");
         }
+    }
+
+    /// A config loaded from the minimal pair, to be changed field by field.
+    fn minimal_loaded() -> Config {
+        let dir = make_test_dir();
+        setup_minimal(dir.path());
+        load(dir.path(), &dir.path().join("system.toml")).unwrap()
+    }
+
+    #[test]
+    fn carry_restart_only_keeps_the_running_bind_and_names_it() {
+        let running = minimal_loaded();
+        let mut new = running.clone();
+        new.server.bind = "127.0.0.1:9443".to_string();
+        new.analytics.log_path = "elsewhere.ndjson".to_string();
+        let named = carry_restart_only(&running, &mut new);
+        assert_eq!(named, vec!["[server].bind", "[analytics].log_path"]);
+        assert_eq!(new.server.bind, "127.0.0.1:8443");
+        assert_eq!(new.analytics.log_path, running.analytics.log_path);
+    }
+
+    #[test]
+    fn carry_restart_only_names_internal_peers() {
+        let running = minimal_loaded();
+        let mut new = running.clone();
+        new.server.internal_peers = vec!["10.0.0.2".parse().unwrap()];
+        let named = carry_restart_only(&running, &mut new);
+        assert_eq!(named, vec!["[server].internal_peers"]);
+        assert!(new.server.internal_peers.is_empty());
+    }
+
+    #[test]
+    fn carry_restart_only_is_empty_for_identical_configs() {
+        let running = minimal_loaded();
+        let mut new = running.clone();
+        assert!(carry_restart_only(&running, &mut new).is_empty());
+    }
+
+    #[test]
+    fn take_process_owned_keeps_the_running_routes_and_takes_the_node_keys() {
+        let running = minimal_loaded();
+        let mut loaded = running.clone();
+        loaded.routes.clear();
+        loaded.site.name = "Edited".to_string();
+        loaded.node.name = "renamed".to_string();
+        loaded.server.tls_cert = Some("new-cert.pem".to_string());
+        loaded.server.allowed_methods = vec!["GET".to_string()];
+        loaded.health.metrics_require = Some("token".to_string());
+        let c = take_process_owned(&running, loaded);
+        assert_eq!(c.routes.len(), 1, "routes stay as running");
+        assert_eq!(c.site.name, "Test", "site keys stay as running");
+        assert_eq!(c.node.name, "renamed");
+        assert_eq!(c.server.tls_cert.as_deref(), Some("new-cert.pem"));
+        assert_eq!(c.server.allowed_methods, vec!["GET".to_string()]);
+        assert_eq!(c.health.metrics_require.as_deref(), Some("token"));
     }
 }

@@ -55,6 +55,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     App::with_global(build_state)
+        .on_reload(note_restart_only)
         .route_get("/", page)
         .route_get("/digest", digest_json)
         .route_get("/check", check_text)
@@ -89,6 +90,10 @@ struct MonitorState {
     latest: std::sync::Arc<std::sync::RwLock<Option<Snapshot>>>,
     interval: Duration,
     history: history::HistoryHandle,
+    /// What the config said at start for the keys read only then: the poll
+    /// interval in seconds and the history settings. A reload compares against
+    /// it to name a change that only a restart applies.
+    started: (u64, Option<history::Config>),
 }
 
 impl MonitorState {
@@ -105,9 +110,8 @@ impl MonitorState {
 
 /// Build the shared state and start the poller.
 fn build_state(ctx: &AppContext) -> Result<MonitorState> {
-    let interval = Duration::from_secs(fleet::poll_interval_s(|k| {
-        ctx.config.get(k).and_then(|v| v.as_u64())
-    }));
+    let interval_s = fleet::poll_interval_s(|k| ctx.config.get(k).and_then(|v| v.as_u64()));
+    let interval = Duration::from_secs(interval_s);
     let latest: std::sync::Arc<std::sync::RwLock<Option<Snapshot>>> =
         std::sync::Arc::new(std::sync::RwLock::new(None));
 
@@ -117,10 +121,8 @@ fn build_state(ctx: &AppContext) -> Result<MonitorState> {
     let path = ctx.config_path.to_path_buf();
     let writer = std::sync::Arc::clone(&latest);
     // A bad key or a file from a newer release stops the start here (exit 2).
-    let (recorder, handle) = history::start(history::config_from(
-        ctx.config.get("monitor"),
-        ctx.site_dir,
-    )?)?;
+    let history_config = history::config_from(ctx.config.get("monitor"), ctx.site_dir)?;
+    let (recorder, handle) = history::start(history_config.clone())?;
     let poller_handle = handle.clone();
     std::thread::spawn(move || loop {
         match collect_from(&path, Some((&recorder, &poller_handle))) {
@@ -149,7 +151,55 @@ fn build_state(ctx: &AppContext) -> Result<MonitorState> {
         latest,
         interval,
         history: handle,
+        started: (interval_s, history_config),
     })
+}
+
+/// The keys of a reloaded config that differ from what was read at start.
+///
+/// The poller thread captured the interval and the history writer was opened
+/// with its file and size cap, so none of the three can change while the
+/// service runs.
+fn restart_only_changes(
+    started: &(u64, Option<history::Config>),
+    interval_s: u64,
+    history: &Option<history::Config>,
+) -> Vec<&'static str> {
+    let mut named = Vec::new();
+    if interval_s != started.0 {
+        named.push("poll_interval_s");
+    }
+    let file = |c: &Option<history::Config>| c.as_ref().map(|c| c.file.clone());
+    let cap = |c: &Option<history::Config>| c.as_ref().map(|c| c.max_bytes);
+    if file(history) != file(&started.1) {
+        named.push("[monitor].history_file");
+    }
+    if cap(history) != cap(&started.1) {
+        named.push("[monitor].history_max_mb");
+    }
+    named
+}
+
+/// Name a changed key that needs a restart.
+///
+/// The fleet in `[monitor]` is read again on every poll, so a change to it
+/// applies by itself. The poll interval and the history settings are read once.
+/// An invalid history key is a warning and not an `Err`: those keys are not
+/// applied live, and an `Err` would make core retry the reload every minute for
+/// nothing.
+fn note_restart_only(state: &MonitorState, ctx: &AppContext) -> Result<()> {
+    let interval_s = fleet::poll_interval_s(|k| ctx.config.get(k).and_then(|v| v.as_u64()));
+    let history = match history::config_from(ctx.config.get("monitor"), ctx.site_dir) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!(error = %e, "config reload: the history keys are invalid and are ignored");
+            state.started.1.clone()
+        }
+    };
+    for key in restart_only_changes(&state.started, interval_s, &history) {
+        tracing::warn!("config reload: {key} changed; restart m6-monitor to apply it");
+    }
+    Ok(())
 }
 
 /// Poll the fleet, print the check, exit 1 on faults.

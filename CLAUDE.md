@@ -116,6 +116,9 @@ gh pr create --base main --head develop --title "Release 1.1.0"
 git checkout main && git pull && ./tag.sh v1.1.0
 ```
 
+Choose the next version number from the policy under Versions in
+`CONTRIBUTING.md`, which is the one definition, without asking.
+
 The build host is still worth running by hand before opening a pull request, because
 it tests more than a runner can:
 

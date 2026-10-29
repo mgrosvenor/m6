@@ -184,7 +184,8 @@ A relative `metrics_token_file` in `site.toml` resolves against the working dire
 Any other key in the system config is ignored with a warning, and any other `[health]` key there fails to parse.
 Validation runs after merge.
 When both arguments name the same file, as a development script may do, its `[auth]` and `[health]` belong to the site config alone.
-A system config edit takes effect on restart or on the next `site.toml` reload.
+A system config edit or touch applies within a second and does not clear the cache.
+A key that is read only at start keeps its running value, and the log names it and says to restart.
 
 **`site.toml` — in version control:**
 
@@ -333,7 +334,9 @@ With `[server]` in the system config and credentials in secrets files, `site.tom
 | `internal_binds` | list of strings | when `h2c_bind` is set | Set to `h2c_bind`, an `"ip:port"` in a local range, to make the h2c listener internal. `[]` means none |
 | `internal_peers` | list of strings | when `internal_binds` is not empty | IP addresses in a local range. The only peers the internal h2c listener accepts, and a connection from any other address is closed |
 
-TLS cert and key watched via inotify — reloaded on change without restart.
+The certificate and key files are not watched.
+A renewal writes both, then touches the system config, and m6-http reads them on the touch, on HTTP/1.1, HTTP/2 and HTTP/3.
+Until the touch, m6-http keeps serving the previous certificate.
 
 An internal listener is one that `internal_binds` names.
 m6-http never infers it from an address.

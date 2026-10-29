@@ -14,7 +14,7 @@
 //! same certificate, and is it the new one?**
 //!
 //! It is a process test rather than a unit test deliberately. The reload is
-//! driven by a filesystem event and crosses the event loop, the rustls
+//! driven by a touch of the system config and crosses the event loop, the rustls
 //! listener and the quiche configuration, and a unit test of any one of those
 //! is a test of the half that already worked.
 //!
@@ -232,19 +232,26 @@ struct Server {
 }
 
 impl Server {
-    /// Write a certificate and key over the paths the running server watches.
+    /// Write a certificate and key over the paths the running server reads.
     ///
-    /// The key goes first. certbot writes a lineage then runs its hooks, and
-    /// each file arriving is its own filesystem event, so a reload can catch a
-    /// new certificate beside the previous key. That pair does not match and
-    /// the rebuild fails, which must leave every protocol on the material it
-    /// already had; the second write then fires another event and the reload
-    /// succeeds. Ordering the writes this way exercises that sequence rather
-    /// than hiding it.
+    /// The server does not watch these files. It reads them when its system
+    /// config is touched, so a caller follows this with `touch_system`, after
+    /// both files are written, as a renewal hook does.
     fn install(&self, cert: &Cert) {
         let gen = self.generation.get() + 1;
         self.generation.set(gen);
         write_material(&self.site, cert, self.layout, gen);
+    }
+
+    /// Touch the system config, which is what tells the server that new
+    /// material is on disk.
+    fn touch_system(&self) {
+        std::fs::File::options()
+            .write(true)
+            .open(self.site.join("system.toml"))
+            .expect("open system.toml")
+            .set_modified(std::time::SystemTime::now())
+            .expect("touch system.toml");
     }
 
     /// `notAfter` as `/perf` reports it, for the leaf.
@@ -481,8 +488,9 @@ fn a_reload_moves_http1_http2_and_http3_to_the_new_certificate() {
     );
 
     srv.install(&second);
+    srv.touch_system();
 
-    // The reload is a filesystem event, so it is not instantaneous. Polling on
+    // The reload follows the touch, so it is not instantaneous. Polling on
     // HTTP/1.1 because that is the protocol the defect left behind: HTTP/3
     // would pass this wait on the unfixed code.
     let reloaded = m6_core::testkit::wait::until(Duration::from_secs(30), || {
@@ -572,6 +580,7 @@ fn a_renewal_that_repoints_a_symlink_also_reaches_every_protocol() {
 
     // Renew: a new archive generation, and the link moved onto it.
     srv.install(&second);
+    srv.touch_system();
     assert!(
         std::fs::read_link(srv.site.join("live/node/fullchain.pem"))
             .expect("still a link")
@@ -586,9 +595,7 @@ fn a_renewal_that_repoints_a_symlink_also_reaches_every_protocol() {
     assert!(
         reloaded,
         "HTTP/1.1 never picked up a certificate installed by repointing the \
-         symlink. The watch resolves the link and holds the inode behind it, so \
-         it needs the certificate's PARENT DIRECTORY watched to see the link \
-         move.\n--- server output ---\n{}",
+         symlink and touching the system config.\n--- server output ---\n{}",
         srv.proc.output()
     );
 
@@ -608,4 +615,111 @@ fn a_renewal_that_repoints_a_symlink_also_reaches_every_protocol() {
         status.success(),
         "clean stop after a lineage renewal, got {status}"
     );
+}
+
+/// True when h1, h2 and h3 all present `want`.
+fn all_present(srv: &Server, want: &Cert, a: &Cert, b: &Cert) -> bool {
+    let h1 = client_trusting_both(a, b, &[b"http/1.1"]);
+    let h2 = client_trusting_both(a, b, &[b"h2"]);
+    h1_leaf(srv.port, h1).as_deref() == Ok(want.der.as_slice())
+        && h2_leaf(srv.port, h2).as_deref() == Ok(want.der.as_slice())
+        && h3_leaf(srv.port).as_deref() == Ok(want.der.as_slice())
+}
+
+/// New material changes nothing until the system config is touched.
+///
+/// The certificate and key files are not watched. The touch is the one trigger,
+/// and it comes after both files are written, so the server never reads half of
+/// a renewal.
+#[test]
+fn writing_the_certificate_without_a_touch_changes_nothing() {
+    let first = cert_expiring_in(2030);
+    let second = cert_expiring_in(2035);
+    let mut srv = start(&first);
+    let h1_tls = || client_trusting_both(&first, &second, &[b"http/1.1"]);
+
+    srv.install(&second);
+    // Three fingerprint polls, so a watch that only the poll could miss is
+    // still given every chance to fire.
+    std::thread::sleep(Duration::from_secs(3));
+
+    assert_eq!(
+        h1_leaf(srv.port, h1_tls()).expect("h1"),
+        first.der,
+        "HTTP/1.1 changed certificate without a touch"
+    );
+    assert_eq!(
+        h2_leaf(srv.port, client_trusting_both(&first, &second, &[b"h2"])).expect("h2"),
+        first.der,
+        "HTTP/2 changed certificate without a touch"
+    );
+    assert_eq!(
+        h3_leaf(srv.port).expect("h3"),
+        first.der,
+        "HTTP/3 changed certificate without a touch"
+    );
+    assert_eq!(
+        srv.reported_not_after(h1_tls()),
+        Ok(first.not_after),
+        "/perf changed expiry without a touch"
+    );
+    srv.proc.terminate(Duration::from_secs(10));
+}
+
+/// A `site.toml` that is mid-edit does not hold a renewal back.
+#[test]
+fn a_broken_site_toml_does_not_hold_a_certificate_back() {
+    let first = cert_expiring_in(2030);
+    let second = cert_expiring_in(2035);
+    let mut srv = start(&first);
+
+    std::fs::write(srv.site.join("site.toml"), "[[[").expect("break site.toml");
+    srv.install(&second);
+    srv.touch_system();
+
+    let ok = m6_core::testkit::wait::until(Duration::from_secs(5), || {
+        all_present(&srv, &second, &first, &second)
+    });
+    srv.proc
+        .assert_alive("after a renewal with a broken site.toml");
+    assert!(
+        ok,
+        "a protocol still serves the first certificate\n--- server output ---\n{}",
+        srv.proc.output()
+    );
+    srv.proc.terminate(Duration::from_secs(10));
+}
+
+/// A touch that arrives before the key is written is retried.
+///
+/// The new certificate beside the old key fails the pair check, so every
+/// protocol keeps the first certificate. Nothing touches the config
+/// afterwards, so only the retry can install the second.
+#[test]
+fn a_touch_before_the_key_is_written_still_lands() {
+    let first = cert_expiring_in(2030);
+    let second = cert_expiring_in(2035);
+    let mut srv = start(&first);
+    let h1_tls = || client_trusting_both(&first, &second, &[b"http/1.1"]);
+
+    std::fs::write(srv.site.join("cert.pem"), &second.cert_pem).expect("write cert");
+    srv.touch_system();
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        h1_leaf(srv.port, h1_tls()).expect("h1"),
+        first.der,
+        "a certificate without its key was installed"
+    );
+
+    std::fs::write(srv.site.join("key.pem"), &second.key_pem).expect("write key");
+    let ok = m6_core::testkit::wait::until(Duration::from_secs(5), || {
+        all_present(&srv, &second, &first, &second)
+    });
+    srv.proc.assert_alive("after the key arrived");
+    assert!(
+        ok,
+        "the retry never installed the finished pair\n--- server output ---\n{}",
+        srv.proc.output()
+    );
+    srv.proc.terminate(Duration::from_secs(10));
 }
