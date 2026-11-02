@@ -424,16 +424,8 @@ fn make_quiche_config(server_config: &config::ServerConfig) -> anyhow::Result<qu
     // marked temporary from the day it shipped, and certificate compression below is
     // what removes the need for it.
     //
-    // The client sends 2467 bytes, so the budget is 3600. With the probe and
-    // path fixed and only the compression changing:
-    //
-    //     no compression    server sent 4081B   stalls at 3600, 4 datagrams
-    //     brotli            server sent 2859B   no stall, 3 datagrams
-    //
-    // 2859 against 3600 leaves room for a chain that grows, and the handshake now
-    // completes in one round trip while satisfying RFC 9000 8.1 rather than
-    // deviating from it. Both numbers are the whole server flight before the
-    // address is validated, not the certificate alone.
+    // The budget is 3 times the bytes received. A client's opening Initial is
+    // padded to 1200 bytes, so the budget is 3600.
     //
     // The flight is brotli, not zlib, and that is deliberate: see the comment on
     // the zlib registration in the quiche fork. Offering zlib breaks any peer that
@@ -562,10 +554,6 @@ fn make_quiche_config(server_config: &config::ServerConfig) -> anyhow::Result<qu
     //     brotli        2258 bytes  66%
     //     zstd          2308 bytes  67%
     //     zlib          2359 bytes  69%
-    //
-    // End to end, the whole server flight went from 4081 bytes to 2859 with
-    // brotli, a 1222-byte saving, and that is what deletes the amplification
-    // factor override above.
     //
     // Verified against third parties too, which is what proved our client really
     // advertises rather than merely supports: Cloudflare's flight went from 4198 to
