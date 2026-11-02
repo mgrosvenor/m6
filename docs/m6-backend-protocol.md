@@ -64,8 +64,10 @@ The backend MUST, in this order:
    backend that starts cleanly and is never contacted.
 4. **Listen**, with a backlog SHOULD be at least 64.
 
-The backend SHOULD create the parent directory if it does not exist, with mode
-`0750` or `0710` and the proxy's group.
+The service manager normally creates the parent directory, for example systemd's
+`RuntimeDirectory=` with `RuntimeDirectoryMode=0750`, and the m6 `App` relies on
+that. A backend that creates the directory itself SHOULD use mode `0750` and the
+proxy's group, because the proxy lists the directory to find sockets.
 
 ### 1.3 Connection lifetime
 
