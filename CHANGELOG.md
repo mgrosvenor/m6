@@ -63,6 +63,11 @@ When the thread's signal mask cannot be read, a service now refuses to start ins
 
 **`docs/m6-core-reference.md` sections 1 to 5 follow the documentation ruleset, and the module and line counts, the `RouteConfig` fields and the watcher description now match the code (#144).**
 
+**`docs/m6-http.md` documents m6-http's HTTP/2 denial-of-service behaviour: the Rapid Reset concurrency cap, send-side flow control on the backbone clients, the five-state stream machine and the known gaps (#160).**
+Documentation only. Each claim names the function or test that enforces it.
+
+**The m6-auth-cli reference follows the documentation ruleset, and its token defaults, config keys, key format and exit codes now match the binary (#138).**
+
 **The m6-md reference follows the documentation ruleset, and its params snapshot and watch-mode first pass now match the binary (#150).**
 
 ### Verified
