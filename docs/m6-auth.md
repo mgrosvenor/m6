@@ -464,7 +464,7 @@ A request that fails after startup returns a 4xx or 5xx response, and the proces
 ### 11.3. Logging
 
 The service writes one line per event to stdout, in JSON by default.
-It logs the startup configuration, the route outcomes, key reloads and the core lifecycle lines.
+It logs the route outcomes, key reloads and the core lifecycle lines.
 Table 10 gives the events.
 Take from it that every login attempt is recorded with the address and every failure with a reason.
 
