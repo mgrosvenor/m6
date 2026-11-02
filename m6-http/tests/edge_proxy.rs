@@ -607,11 +607,9 @@ fn test_static_file_cache_hit() {
 
     // Assert the cache state, not the clock.
     //
-    // This used to be `hit_latency < 5ms`, which measures the machine. It is
-    // named in the site handover's traps as the wall-clock example, and on
-    // 2026-09-12 it duly failed on the loaded Linux build box while the code
-    // was perfectly correct. A test that fails when the machine is busy tells
-    // you about the machine.
+    // This used to be `hit_latency < 5ms`, which measures the machine: it
+    // failed on a loaded build machine while the code was correct. A test that
+    // fails when the machine is busy tells you about the machine.
     //
     // `Age` is the structural answer and it discriminates exactly: the edge
     // adds it when it serves from its own store, so a miss carries no `age`
