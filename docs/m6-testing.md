@@ -190,7 +190,7 @@ m6-http's holds a `site/` directory with `site.toml` and a certificate, plus `sy
 
 A per-service list of behaviours used to sit here, about 120 rows over four services, written before the code as a plan.
 No row had ever been checked against the suites above, so a reader took a line like "SIGTERM twice, immediate exit" as a test that runs.
-Three of those rows named a run under the address and leak sanitisers, and **nothing in this repository runs a sanitiser**, which is issue #164.
+Three of those rows named a run under the address and leak sanitisers, which now run in `.github/workflows/sanitizer.yml` (issue #164).
 
 **That list is issue #165 now.**
 An unverified specification in `docs/` reads as a statement about what m6 does, and this one was wrong in at least four places.
@@ -243,8 +243,8 @@ Running a tester by hand needs Table 5 first.
 
 Two gaps are open, and neither is a documentation problem:
 
-- **No sanitiser and no fuzzing**, anywhere in `check.sh`, `tools/build-host-tests.sh` or CI, in a codebase that hand-writes three protocol parsers.
-  Issue #164.
+- **No fuzzing**, anywhere in `check.sh`, `tools/build-host-tests.sh` or CI, in a codebase that hand-writes three protocol parsers.
+  The address and leak sanitisers have their own workflow, `.github/workflows/sanitizer.yml`, on pushes to `develop` and by hand with `--test-threads=1`.
 - **The per-service behaviour lists are issue #165**, because no row had been checked
   against the suites in Table 6 and at least four were wrong.
 
