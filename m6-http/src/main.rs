@@ -3324,14 +3324,14 @@ fn set_alt_svc(headers: &mut Vec<(String, String)>, quic_port: u16) {
 /// otherwise double it up. Hence collapsing to one header rather than pushing.
 ///
 /// This merges the field names. It previously dropped every existing `Vary` and
-/// wrote `Accept-Encoding` in its place, which was harmless only because it ran
-/// solely on the cache-hit path, where `should_cache` had already refused
-/// anything varying on more than encoding. It is now also called on the miss
-/// path: an overwriting version would rewrite a backend's `Vary: Cookie` to
-/// `Vary: Accept-Encoding`, `should_cache` would see a cacheable response, and
-/// one client's private variant would be stored and replayed to everyone.
-/// Preserving the other field names keeps that response uncacheable, which is
-/// the whole reason `should_cache` inspects `Vary` at all.
+/// wrote `Accept-Encoding` in its place, which was harmless while it ran solely
+/// on the cache-hit path. It is now also called on the miss path, after
+/// `handle_request_inner` has made the local cache decision. An overwriting
+/// version would send a backend's `Vary: Cookie` to the client as
+/// `Vary: Accept-Encoding`, so a downstream shared cache could store one
+/// client's private variant and replay it to everyone. Preserving the other
+/// field names keeps that response uncacheable downstream, the same rule
+/// `should_cache` applies locally.
 fn set_vary_accept_encoding(headers: &mut Vec<(String, String)>, backend_compresses: bool) {
     // A backend that does not compress has exactly ONE representation, so there
     // is no encoding dimension to vary on and saying otherwise is a promise of
