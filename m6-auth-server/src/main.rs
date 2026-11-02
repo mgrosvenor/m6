@@ -80,10 +80,13 @@ fn build_state(ctx: &AppContext) -> Result<AppState> {
 
 /// One database connection for the worker thread that opens it.
 ///
-/// `App` calls this once per worker thread, before that thread's first
-/// request. Every connection to one file must use the same journal mode, and
-/// `m6_auth::Db::open` is the one place that sets WAL, the busy timeout and
-/// foreign keys, so every connection goes through it.
+/// `App` calls this while handling that thread's first request. Core panics
+/// when this returns `Err`, and the release profile aborts, so `build_state`
+/// opens the database once first: that applies the schema and switches the
+/// file to WAL before any worker exists, and a worker's open then reopens a
+/// file already known to work. Every connection to one file must use the same
+/// journal mode, and `m6_auth::Db::open` is the one place that sets WAL, the
+/// busy timeout and foreign keys, so every connection goes through it.
 fn open_worker_db(_config: &Map<String, Value>, state: &AppState) -> Result<m6_auth::Db> {
     m6_auth::Db::open(&state.db_path)
         .map_err(|e| Error::Other(anyhow::anyhow!("opening auth database: {e}")))

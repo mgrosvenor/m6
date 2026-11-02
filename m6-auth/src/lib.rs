@@ -112,7 +112,8 @@ impl Db {
     /// and nowhere else. Switching a new file to WAL takes a short exclusive
     /// lock, and SQLite answers `SQLITE_BUSY` for that pragma without waiting
     /// on the busy timeout. Workers that open one new database at the same
-    /// time therefore retry the switch until one of them has made it.
+    /// time therefore retry the switch until one of them has made it or the
+    /// wait runs out.
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
