@@ -357,7 +357,7 @@ One second stays inside legitimate browser behaviour, because a browser may canc
 
 `tools/rapidreset.py` is the raw-socket reproducer that sends the frames a well-behaved client library will not.
 `python3 tools/rapidreset.py [attempts] [host] [h2c-port]` defaults to 200 attempts against an *H2C* (HTTP/2 cleartext) listener on loopback.
-Its docstring records the expected result against a fixed server: the first refusal at stream 101, 50 REFUSED_STREAM replies, and one GOAWAY carrying 0xb (ENHANCE_YOUR_CALM).
+Its docstring records the expected result against a fixed server: the first refusal at the 101st attempt (stream 201), 50 REFUSED_STREAM replies, and one GOAWAY carrying 0xb (ENHANCE_YOUR_CALM).
 The four tests above are the evidence that runs on a laptop without a listener.
 
 ### Send-side flow control on the backbone clients
