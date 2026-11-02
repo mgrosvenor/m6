@@ -20,7 +20,7 @@ This document gives its public interface: the database it opens, the rows it ret
 ## 1. What the crate is
 
 **`m6-auth` is the storage library for m6's users, groups and tokens.**
-It owns the *SQL* (Structured Query Language) database, the password hashes, the token records and the JWT engine, and it holds no socket and no *HTTP* (Hypertext Transfer Protocol) request handling.
+It owns the *SQL* (Structured Query Language) database, the password hashes, the token records and the *JWT* (JSON Web Token) engine, and it holds no socket and no *HTTP* (Hypertext Transfer Protocol) request handling.
 The package is `m6-auth` and the library target is `m6_auth`, so code writes `use m6_auth::Db`.
 
 Table 1 gives the crates that link it.
@@ -58,7 +58,7 @@ Take from it that the journal mode and the busy timeout make concurrent access w
 
 | pragma | value | why it is set |
 |---|---|---|
-| `journal_mode` | `WAL` | readers and one writer proceed together, so a login can read while the CLI writes |
+| `journal_mode` | `WAL` | the *WAL* (write-ahead log) lets readers and one writer proceed together, so a login can read while the CLI writes |
 | `busy_timeout` | `5000` | a statement waits 5 s for a lock before it returns `SQLITE_BUSY` |
 | `foreign_keys` | `ON` | SQLite starts every connection with the cascade off, and section 7 relies on it |
 
@@ -74,7 +74,7 @@ Section 7 gives the tables.
 A process that holds one handle for its life can leave `close` to the operating system when it exits.
 A renderer whose worker owns a handle calls `close` when the worker is destroyed, as section 8 shows.
 
-The operations in sections 3 to 6 all take `&self`, so one open handle serves every call on its worker.
+The operations in sections 3 to 5 all take `&self`, so one open handle serves every call on its worker.
 Section 3 starts with users.
 
 ## 3. Users
@@ -227,7 +227,7 @@ Take from it that the engine picks its algorithm from the key it is given, and t
 
 | item | what it is |
 |---|---|
-| `JwtEngine::new(private_pem, public_pem, issuer)` | reads a PEM key pair and picks `ES256` (ECDSA on P-256) for an EC private key or `RS256` (RSA with SHA-256) for an RSA one |
+| `JwtEngine::new(private_pem, public_pem, issuer)` | reads a *PEM* (Privacy-Enhanced Mail) key pair and picks `ES256` (*ECDSA*, Elliptic Curve Digital Signature Algorithm, on P-256) for an elliptic-curve private key or `RS256` (*RSA*, Rivest-Shamir-Adleman, with SHA-256) for an RSA one |
 | `encode_access`, `encode_refresh` | sign a token from the matching claims type |
 | `decode_access`, `decode_refresh` | verify the signature, the issuer and `exp`, and return the claims |
 | `AccessClaims` | `iss`, `sub` (the user id), `exp`, `iat`, `username`, `groups`, `roles` |
@@ -239,16 +239,18 @@ Take from it that the engine picks its algorithm from the key it is given, and t
 **Table 7: the public items in `m6_auth::jwt`, and what each one is.**
 The claims types are the JSON bodies of the tokens, and `hash_token` is what keeps a token out of the database.
 
-`JwtEngine::new` tries the EC parser first and the RSA parser second, and an error names the parser that failed.
+`JwtEngine::new` tries the elliptic-curve parser first and the RSA parser second.
+The private-key error names both attempts, and a public-key error names the type it failed on.
 `decode_access` and `decode_refresh` use the engine's algorithm and issuer and the library's default check of `exp`, so a token from another issuer or an expired token fails.
 
 `hash_token` returns a plain SHA-256 digest, which suits a signed token with high entropy.
 
-The crate reports every failure through one error type, and section 6 gives it.
+The `Db` operations in sections 3 to 5 report every failure through `AuthError`, and the `jwt` module returns `anyhow::Result`.
+Section 6 gives `AuthError`.
 
 ## 6. Errors
 
-**`AuthError` is the crate's only error type, and `Result<T>` is `std::result::Result<T, AuthError>`.**
+**`AuthError` is the error type for `Db::open` and every operation in sections 3 to 5, and `Result<T>` there is `std::result::Result<T, AuthError>`.**
 
 ```rust
 #[derive(Debug, thiserror::Error)]
@@ -281,7 +283,7 @@ Take from it that five variants name a row, and the other two wrap a failure fro
 
 | variant | meaning | returned by |
 |---|---|---|
-| `UserNotFound` | no user has that name or id | `user_delete`, `user_set_password`, `user_set_roles`, `user_groups`, a membership call naming an unknown user, `api_token_list` |
+| `UserNotFound` | no user has that username | `user_delete`, `user_set_password`, `user_set_roles`, `user_groups`, a membership call naming an unknown user, `api_token_list` |
 | `UserExists` | the username is taken | `user_create` |
 | `GroupNotFound` | no group has that name | `group_delete`, a membership call naming an unknown group |
 | `GroupExists` | the group name is taken | `group_create` |
@@ -294,6 +296,7 @@ The first five are answers about a row, and the last two carry a dependency's ow
 
 `AuthError` implements `std::error::Error` through `thiserror`, so a caller converts it with one `map_err`, as section 8 does.
 The `Db` and `Bcrypt` variants convert with `?` inside the crate, so a dependency failure needs no wrapping at each call site.
+The five fallible `jwt` functions return `anyhow::Result`, so a caller that uses both APIs handles `AuthError` from `Db` and `anyhow::Error` from the token engine.
 
 The rows these errors name live in five tables, and section 7 gives them.
 
@@ -342,7 +345,7 @@ Take from it that every foreign key cascades from a user or a group, so a delete
 
 | table | holds | rows removed by |
 |---|---|---|
-| `users` | one row per user, with the bcrypt hash, the roles JSON and `created_at` | `user_delete` |
+| `users` | one row per user, with the bcrypt hash at cost 12, the roles JSON and `created_at` | `user_delete` |
 | `groups` | one row per group | `group_delete` |
 | `memberships` | one row per user in a group, keyed by `(user_id, group_id)` | `user_delete` or `group_delete` |
 | `refresh_tokens` | one row per refresh token, keyed by its hash | `user_delete`, or a revoke call |
