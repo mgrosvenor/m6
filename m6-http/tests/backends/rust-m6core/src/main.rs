@@ -21,8 +21,8 @@
 //!
 //! What the pair file writes by hand and this one does not write at all:
 //!
-//! - the binding sequence of spec §1.2, including the `chmod 0666` that is the
-//!   single most common cause of a backend that starts and is never contacted
+//! - the binding sequence of spec §1.2, including the socket `chmod`, which is
+//!   the single most common cause of a backend that starts and is never contacted
 //! - `signal(2)` handling, the shutdown flag, and the unlink on the way out
 //! - accepting connections and a thread per connection
 //! - parsing a request line and header section by hand, and draining exactly

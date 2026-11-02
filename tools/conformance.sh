@@ -257,10 +257,9 @@ start_edge() {
   if [[ "$EDGE_UP" == "true" ]]; then
     return 0
   fi
-  # Self-contained: builds its own site, cert and backend. The alternative is
-  # the manual one-time setup in the site HANDOVER, which is fine for a person
-  # and useless in CI, and which was once measured while pointing at a stale
-  # staging binary.
+  # Self-contained: builds its own site, cert and backend. The alternative is a
+  # hand-configured long-running instance, which is fine for a person and
+  # useless in CI, and which was once measured while running a stale binary.
   local site="$WORK/edge-site"
   mkdir -p "$site/public" "$site/configs"
 
@@ -633,13 +632,14 @@ run_h3() {
 #
 # WHAT IT EXISTS FOR, plainly. m6 1.9.0 installed a session ticketer so browser
 # sessions could resume. Nothing in this suite could tell whether it worked, and
-# nothing in the fleet could either: the monitor read 0% resumed on
-# `http/2/external` across all three production nodes for a day after the
-# release, which is exactly what a broken ticketer looks like AND exactly what a
-# working one looks like on a site whose h2 visitors never come back on a second
-# connection. Those were separated on 2026-09-19 by a client that deliberately
-# offered a ticket, which is what these probes now do. The server was fine. The
-# measurement did not exist. m6 issue #101.
+# nothing outside it did either: a broken ticketer and a working one look the
+# same in a resumption count when the visitors never come back on a second
+# connection. A client that deliberately offers a ticket separates them, which
+# is what these probes do. The server was fine. The measurement did not exist.
+# m6 issue #101.
+#
+# `conformance.sh resume` proves the property on every CI run, so a regression
+# fails the run.
 #
 # Resumption is a latency property, not a nicety: a full handshake costs the
 # certificate and a signature, and a resumed one skips both. Over a real

@@ -426,8 +426,8 @@ type CacheMap = AHashMap<CacheKey, CacheEntry>;
 /// twice.
 ///
 /// Measured: 10,000 such entries against `/` held ~518 MB, and nothing was
-/// evicted. The fleet nodes have 950 MB of RAM and around 600 MB free, so
-/// roughly 11,000 requests exhausted a node — about 36 minutes from a single
+/// evicted. A small-memory host (under 1 GB of RAM, with around 600 MB free)
+/// is exhausted by roughly 11,000 requests: about 36 minutes from a single
 /// IP inside the 300-per-minute rate limit, ending in the OOM killer choosing
 /// whichever process had grown the most.
 ///
@@ -1158,9 +1158,8 @@ mod tests {
     /// fetches the versioned resource, so the versioned response is stored
     /// where an unversioned request will find it.
     ///
-    /// That reached production on 2026-09-17 as `Cache-Control: immutable` on
-    /// unversioned assets at both edges, once early hints started producing
-    /// URLs for the prefetch to fetch. Pinned here rather than left as a
+    /// That showed up as `Cache-Control: immutable` on unversioned assets,
+    /// once early hints started producing URLs for the prefetch to fetch. Pinned here rather than left as a
     /// comment, so the next caller meets it as a failing assumption.
     #[test]
     fn a_url_passed_whole_as_a_path_keys_the_same_as_the_unversioned_url() {
@@ -2642,8 +2641,8 @@ mod capacity_tests {
     /// entry per variation, each holding a full response body.
     ///
     /// Before the bound, 10,000 such entries against `/` held ~518 MB and
-    /// nothing was evicted. The fleet nodes have 950 MB of RAM and about
-    /// 600 MB free, so roughly 11,000 requests exhausted a node: about 36
+    /// nothing was evicted. A small-memory host (under 1 GB of RAM, with
+    /// about 600 MB free) is exhausted by roughly 11,000 requests: about 36
     /// minutes from one IP inside the 300-per-minute rate limit.
     #[test]
     fn a_flood_of_distinct_encodings_cannot_grow_without_bound() {
