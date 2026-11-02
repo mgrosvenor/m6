@@ -57,7 +57,7 @@ Googlebot verifies only under `googlebot.com` and `google.com`. A name under `go
 ### Changed
 
 **m6-http's benchmark dependencies are no longer production dependencies (#188).**
-The cold-start benchmark is now a `[[bench]]` (`cargo bench -p m6-http --bench bench_coldstart -- <flags>`), and `tokio`, `tokio-rustls`, `h2` and `http` moved to dev-dependencies. The `m6-bench-coldstart` binary is gone.
+The cold-start benchmark is now a `[[bench]]` (`cargo bench -p m6-http --bench bench_coldstart -- --addr <host:port> <flags>`, and without `--addr` it prints a note and exits 0), and `tokio`, `tokio-rustls`, `h2` and `http` moved to dev-dependencies. The `m6-bench-coldstart` binary is gone.
 
 ### Verified
 
