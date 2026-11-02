@@ -1,4 +1,4 @@
-# m6 backend examples — Design
+# m6 backend examples: Design
 
 **Status: implemented, 2026-09-13.** All six exist under
 `m6-http/tests/backends/`, all six conform, and the shared assertion set of §7
@@ -74,7 +74,7 @@ README so the reader can tell whether they are in the right place.
 This section is guidance about fit, not a ranking. Every one of them satisfies
 the contract completely.
 
-### C — constrained and close to the metal
+### C: constrained and close to the metal
 
 For backends where the runtime itself is the problem: no allocator you did not
 choose, no garbage collector, no interpreter, a static binary measured in tens
@@ -82,7 +82,7 @@ of kilobytes.
 
 The case that motivates it is **IoT with `m6-http` as the front door**. A
 sensor or controller on an ESP32 or a small Linux board serves a handful of
-endpoints; `m6-http` sits in front holding TLS, HTTP/2, caching and rate
+endpoints. `m6-http` sits in front holding TLS, HTTP/2, caching and rate
 limiting, none of which the device could reasonably implement. The device
 speaks the simplest possible HTTP/1.1 over a socket and nothing else. The
 contract exists in the shape it does partly so this is possible.
@@ -91,7 +91,7 @@ Also the right choice for **direct kernel interface work**: `io_uring`, raw
 sockets, `netlink`, device files, anything where a language runtime sits
 between you and the syscall you actually want.
 
-### C++ — stateful, in-memory, performance-critical
+### C++: stateful, in-memory, performance-critical
 
 For backends that hold **substantial state in memory** and answer from it. A
 Redis-shaped service: an in-memory index, a cache, a graph, a time series
@@ -102,7 +102,7 @@ destruction, and no GC pause between a request arriving and being answered.
 When the work is "look it up in a large structure and serialise the answer",
 this is a natural fit and the language is not fighting you.
 
-### Go — concurrent I/O and operational simplicity
+### Go: concurrent I/O and operational simplicity
 
 For backends whose work is mostly **waiting on other things**: fanning out to
 several upstream APIs, calling cloud services, handling webhooks, aggregating
@@ -118,7 +118,7 @@ It is also the example that **tests the contract hardest**, because
 `net.Listen("unix", …)` with `http.Serve` puts a mature, strict HTTP
 implementation behind it rather than a parser written for the occasion.
 
-### Python — native compute behind a thin dispatch layer
+### Python: native compute behind a thin dispatch layer
 
 The usual framing of "Python is slow but has libraries" is wrong for this use
 case, and worth stating properly.
@@ -126,7 +126,7 @@ case, and worth stating properly.
 For numerical and scientific backends, **the work does not happen in Python.**
 `numpy` dispatches into BLAS and LAPACK, `scipy` into Fortran kernels, `torch`
 and `onnxruntime` into optimised native code or a GPU. Python is the
-orchestration layer; the array operation runs at native speed with SIMD, often
+orchestration layer. The array operation runs at native speed with SIMD, often
 faster than a straightforward hand-written C loop doing the same thing, because
 those kernels have had decades of attention.
 
@@ -139,7 +139,7 @@ So the fit is: **the request is small, the computation is large, and the
 computation has a native implementation someone else has already optimised.**
 Model inference, a statistical summary over a dataset, an image transform, a
 similarity search over embeddings. `m6-http` in front handles TLS, HTTP/2 and
-caching; the backend does one `numpy` call and returns.
+caching. The backend does one `numpy` call and returns.
 
 The same argument covers the wider ecosystem: if the good client library for
 the thing you need exists only in Python, that is a real engineering reason and
@@ -151,7 +151,7 @@ cost and there is nothing native to dispatch into. §5 will show that clearly,
 and the `/status` benchmark is deliberately that shape, so read Python's number
 as the floor of what dispatch costs rather than as a verdict on the language.
 
-### Rust without `m6-core` — predictable latency, hostile input
+### Rust without `m6-core`: predictable latency, hostile input
 
 For backends that must be **both fast and safe**, with no GC pause between
 arrival and answer, and where the input is untrusted or the parsing is
@@ -161,7 +161,7 @@ It is also the honest control for the project. If this example is much harder
 than the Go one, the contract has drifted toward Rust and something is wrong
 with the platform, not with the example.
 
-### Rust with `m6-core` — the default inside the ecosystem
+### Rust with `m6-core`: the default inside the ecosystem
 
 The same, with socket lifecycle, thread pool, signals, config, logging and
 content handling supplied rather than written.
@@ -273,7 +273,7 @@ m6-http/tests/backends/
 ```
 
 Under `tests/` rather than `examples/` so they are part of the gate rather than
-decoration. `docs/` links to them; the code is never duplicated into prose.
+decoration. `docs/` links to them. The code is never duplicated into prose.
 
 ## 7. How they are tested
 
@@ -323,7 +323,7 @@ absent, rather than letting a language go untested.
   version.
 - **The libraries that motivate a choice.** The Python example does not import
   `numpy`, even though §4 argues that is the reason to pick Python. The example
-  demonstrates the *contract*; the reader supplies the payload. Adding a
+  demonstrates the *contract*. The reader supplies the payload. Adding a
   numerical dependency would make the example about `numpy` and would put a
   wheel build in the gate.
 - **Databases, templating, sessions.** Application concerns, not contract
@@ -341,27 +341,19 @@ absent, rather than letting a language go untested.
 Writing the examples found contradictions between normative documents. They are
 recorded here rather than resolved by whichever file was edited last.
 
-### 10.1 Socket mode: 0666 in the spec, 0660 in core and in production
+### 10.1 Socket mode: 0666 for a separate user, 0660 for a shared group
 
-`m6-backend-protocol.md` §1.2 step 3 says the backend MUST `chmod 0666`, and
-explains why: the proxy runs as a different user and cannot connect otherwise.
-It calls this the single most common cause of a backend that starts cleanly and
-is never contacted.
+`m6-backend-protocol.md` §1.2 step 3 states the requirement: the proxy's user
+MUST be able to connect to the socket. It gives `0666` as the simplest way when
+the backend runs as its own user. The m6 `App` default is `0660`, which works
+when the proxy and the service share a group.
 
-**`m6-core` defaults to `0660`, and production runs `0660`.** The m6 handover
-records the move to 0660 as a deliberate hardening, away from a 0755 that came
-from the umask by accident. So the fleet contradicts the MUST and works, because
-the proxy is in the socket's group.
+The examples use `0666` so each can run as its own user. The `rust-m6core`
+example sets `socket_mode = "0666"` in its own config to match them, so the
+shared test can assert one value. Core keeps its `0660` default.
 
-The four hand-written examples implement 0666 as the spec states. The
-`rust-m6core` example sets `socket_mode = "0666"` in its own config to match
-them, so the shared test can assert one value. Nothing here changes core's
-default.
-
-**This wants a decision.** Either the spec should say 0660 with a note that the
-proxy must share the group, which is what actually runs and is tighter, or core
-should default to 0666, which is looser and would undo a deliberate hardening.
-The first looks right, and it is the owner's call, not a documentation tidy-up.
+**Resolved, owner's decision: the protocol states the requirement and gives
+`0666` as the cross-user method.** The examples keep 0666 and core keeps 0660.
 
 ### 10.2 A bare 404 has no body
 
@@ -411,7 +403,7 @@ becomes `internal` (`m6-http/src/error.rs:22`). The first version of the
 through-proxy test wrote exactly that and spent a while looking like a proxy
 bug.
 
-### 10.5 The proxy does not compress — RESOLVED 2026-09-13
+### 10.5 The proxy does not compress: RESOLVED 2026-09-13
 
 This is the largest of the disagreements and the one with a consequence for
 anyone writing a backend.
@@ -466,7 +458,7 @@ What changed:
 
 The gap is now explicit and visible rather than closed, which is what was asked
 for. A non-Rust backend still serves uncompressed bytes if it chooses not to
-compress — but it chooses that knowingly, the config records it, and nothing
+compress, but it chooses that knowingly, the config records it, and nothing
 promises otherwise.
 
 ---
@@ -493,7 +485,7 @@ promises otherwise.
 - ~~The through-the-proxy half of §7~~ **done 2026-09-13**,
   `m6-http/tests/backends_through_proxy.rs`: six tests, each example behind a
   real m6-http over TLS. Two of the behaviours §7 promised turned out not to
-  happen; §10.5 is now resolved and §10.4 is recorded rather than asserted. The
+  happen. §10.5 is now resolved and §10.4 is recorded rather than asserted. The
   `X-Forwarded-For` and `Via` checks are deliberately not duplicated here:
   `security_regressions.rs` already asserts them against the forwarded request
   itself, which is a better layer than inferring them from a backend's reply,
@@ -504,6 +496,6 @@ promises otherwise.
   measured numbers are. The module-level comment in each source file carries the
   same argument at the point where someone is reading the code.
 
-Nothing else on this document is outstanding. What remains are the two decisions
-in §10.1 and §10.4. §10.5 is settled: the proxy is a cache, not a transformer,
-and the two sides now agree in config.
+Nothing else on this document is outstanding. What remains is the decision in
+§10.4. §10.1 and §10.5 are settled: the protocol states the socket requirement,
+and the proxy is a cache, not a transformer.
