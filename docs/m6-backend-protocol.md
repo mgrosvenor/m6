@@ -51,15 +51,17 @@ The backend MUST, in this order:
    exit will otherwise cause `bind` to fail with `EADDRINUSE`.
 2. **Bind** the socket.
 3. **Make the socket reachable by the proxy's user.** The proxy's user MUST be
-   able to connect to the socket. A backend SHOULD set `0660` and give the
-   socket a group that includes the proxy's user, whether or not the two run as
-   different users. The m6 `App` default is `0660`. A backend MAY set `0666`
-   only when the socket's parent directory restricts access (mode `0750` or
-   `0710`, with the proxy's group). With `0666` and a `0755` directory, any
-   local user on the host can connect to the socket and bypass the edge,
-   including by forging `X-Forwarded-*` headers. The socket is not reachable
-   from the network. A socket the proxy cannot connect to is the single most
-   common cause of a backend that starts cleanly and is never contacted.
+   able to connect to the socket. A group used to admit the proxy MUST contain
+   only users trusted as the proxy is trusted, because every user who can
+   connect can send the proxy-owned headers in §2.5. With `0666` and a `0755`
+   directory, any local user on the host can connect and bypass the edge. The
+   socket is not reachable from the network. The m6 `App` default is
+   `0660`, which lets the proxy connect when its user is in the socket's group.
+   A backend that runs as its own user SHOULD set `0666` only when the parent
+   directory limits traversal to the same trusted users. A backend that any
+   user outside that set can reach MUST NOT trust the §2.2 fields (§2.5). A
+   socket the proxy cannot connect to is the single most common cause of a
+   backend that starts cleanly and is never contacted.
 4. **Listen**, with a backlog SHOULD be at least 64.
 
 The backend SHOULD create the parent directory if it does not exist, with mode
@@ -455,7 +457,7 @@ the socket disappearing and reappearing is handled by the pool.
 Everything a backend MUST do, as a checklist:
 
 - [ ] Remove stale socket, bind a Unix `SOCK_STREAM` socket matching the glob
-- [ ] Make the socket reachable by the proxy's user: `0660` with a group that includes it, `0666` only inside a `0750` or `0710` directory
+- [ ] Make the socket reachable by the proxy's user: `0660` with a trusted group, `0666` only behind a trusted directory
 - [ ] Accept connections and serve requests
 - [ ] Parse an HTTP/1.1 request line and header section
 - [ ] Read exactly `Content-Length` body bytes, if any

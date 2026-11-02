@@ -408,10 +408,6 @@ The signal line is written before the shutdown flag is published, because the fl
 A connection is served until the peer closes it or 100 requests have gone by, and the read deadline from `[server] read_timeout_s` is applied at accept time, so a silent peer holds a worker for exactly that long.
 A full queue answers 503 immediately, which is how backpressure reaches the edge.
 
-**These defaults meet `m6-backend-protocol.md` §1.2 step 3 and §1.3.**
-An `App` service defaults to `0660`, because the edge and the service share a group and the mode grants no other user access to the socket.
-It serves up to 100 requests per connection, and `m6-http/src/forward.rs` sends `Connection: close` on every request it forwards, so each forwarded connection carries one request.
-
 The systemd unit has to supply four things: the two positional arguments, the user and group the socket directory is owned by, `RuntimeDirectory=m6` with `RuntimeDirectoryMode=0750`, and `ReadWritePaths` naming what this service actually writes.
 `m6-user-guide.md`, "Example 06, Production with systemd", carries a complete unit per service and this document does not repeat them.
 

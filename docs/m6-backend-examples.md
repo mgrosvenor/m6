@@ -343,10 +343,12 @@ recorded here rather than resolved by whichever file was edited last.
 
 ### 10.1 Socket mode
 
-`m6-backend-protocol.md` §1.2 step 3 states the rule. The examples use `0666`
-because each runs as its own user. The `rust-m6core` example sets
-`socket_mode = "0666"` in its own config so the shared test asserts one value.
-Core keeps its `0660` default.
+The examples use `0666` so each can run as its own user. The `rust-m6core`
+example sets `socket_mode = "0666"` in its own config to match them, so the
+shared test can assert one value. Core keeps its `0660` default.
+
+**Resolved in `m6-backend-protocol.md` §1.2 step 3.** The protocol states the
+requirement and the conditions on `0660` and `0666`.
 
 ### 10.2 A bare 404 has no body
 
