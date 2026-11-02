@@ -215,7 +215,7 @@ Take from it that create and list work by user, and revoke works by token id.
 
 **Revoking an API token does not make it stop working.**
 A request is authorised by the JWT signature and `exp` alone, and nothing reads `api_tokens` to authorise it, so a revoked token, or one whose user `user_delete` removed, stays valid until its `exp`.
-`m6-auth-cli token create` sets `exp` 365 days ahead unless `--ttl-days` says otherwise, so a short TTL is the only way to bound a token that leaks.
+`m6-auth-cli token create` sets `exp` 365 days ahead unless `--ttl-days` says otherwise, so a short TTL bounds a token that leaks. The only way to end one early is to replace the signing key pair, which ends every token for every user.
 The same holds for an access token after logout or `user_delete`, because logout revokes refresh tokens only.
 Only a refresh token is checked against the database, through `refresh_token_verify`, so revoking it takes effect at once.
 
