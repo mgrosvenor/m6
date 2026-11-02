@@ -1,18 +1,18 @@
 //! The hourly health check, printed.
 //!
-//! This is what `tools/health-check.py` did, from the binary instead. The
-//! script sshed to three nodes, ran `journalctl`, `systemctl`, `df` and a
-//! loopback `curl` on each, and parsed the analytics log over the wire. All of
-//! that is now either a field on `/perf` or a field on `/traffic`, computed by
-//! the node that owns the data.
+//! Apart from section H's tunnel check, this takes every figure from the
+//! nodes' own HTTP endpoints. It does not log in
+//! to any node or run `journalctl`, `systemctl`, `df` or `curl` there, and it
+//! does not parse an analytics log over the wire. Each figure is a field on
+//! `/perf` or `/traffic`, computed by the node that owns the data.
 //!
-//! What the script kept getting wrong, three separate times, was measuring its
-//! own effect on the fleet: it flagged its own load generator as a security
-//! incident, read a latency regression off a single sample taken during that
-//! load, and timed a 4ms loopback call immediately after its own 24-hour
-//! journal scan. Two of those are gone here by construction, because this
-//! generates no load and runs no scans. The third, that it is measuring from
-//! wherever it happens to run, is unavoidable and is labelled instead.
+//! A health check that measures its own effect on the nodes gives wrong
+//! answers. Three ways it goes wrong: it flags its own load generator as a
+//! security incident, it reads a latency regression off a single sample taken
+//! during that load, and it times a fast loopback call straight after its own
+//! journal scan. The first two cannot happen here, because this generates no
+//! load and runs no scans. The third, that it measures from wherever it
+//! happens to run, is unavoidable and is labelled instead.
 //!
 //! Section H measures the tunnel to each node with a TCP connect and a
 //! WireGuard handshake age, and sends no request. The handshake age comes from
@@ -295,7 +295,7 @@ pub fn render(d: &Digest, readings: &[NodeReading], verdicts: &Verdicts) -> Stri
     // look bad, so the aggregate alone invites a wrong conclusion. This was the last
     // thing a health check had to leave the monitor for: the data was already in the
     // same /perf response and simply was not rendered, so every run ended with an
-    // ssh to each production node for figures already in hand.
+    // ssh to each node for figures already in hand.
     //
     //   http/2/internal    the backbone. A cache node forwards to origin only when
     //                      it has already missed, so this is majority-miss by
@@ -386,9 +386,9 @@ pub fn render(d: &Digest, readings: &[NodeReading], verdicts: &Verdicts) -> Stri
         //
         // Name, version AND build hash, because the version alone cannot tell
         // two builds of one tag apart and reading three identical version
-        // strings is exactly what "the fleet agrees" looked like on 2026-09-20
-        // while it did not. Twelve characters of the hash: enough to compare by
-        // eye and the same prefix the estate file and the handover quote.
+        // strings is exactly what "the fleet agrees" looks like while it
+        // does not. Twelve characters of the hash: enough to compare by
+        // eye and the prefix an operator's notes would quote.
         //
         // The certificate is on this line too, for the same reason: "how long
         // has this node got" is asked beside "what is it running", and a

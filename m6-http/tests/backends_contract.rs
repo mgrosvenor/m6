@@ -403,9 +403,9 @@ impl Backend {
                 let conf = scratch.path().join("example.toml");
                 std::fs::write(
                     &conf,
-                    // 0666 because protocol §1.2 step 3 requires it. Core's
-                    // default is 0660; see docs/m6-backend-examples.md §10 for
-                    // why the two documents disagree.
+                    // 0666 is the test convention shared by every example (see
+                    // docs/m6-backend-examples.md §10.1), not a protocol
+                    // requirement. Core's default is 0660.
                     "[log]\nlevel = \"warn\"\n\n[server]\nsocket_mode = \"0666\"\n",
                 )
                 .unwrap();
@@ -745,9 +745,9 @@ fn head_sends_the_length_but_no_body() {
 
 #[test]
 fn the_socket_is_world_read_write() {
-    // Spec §1.2 step 3, called out there as "the single most common cause of a
-    // backend that starts cleanly and is never contacted": the proxy runs as a
-    // different user and cannot connect otherwise.
+    // Test convention, not a protocol requirement: every example runs as its
+    // own user and uses 0666 so the proxy's user can connect (docs/
+    // m6-backend-examples.md §10.1). Protocol §1.2 step 3 sets the rule.
     use std::os::unix::fs::PermissionsExt;
     for_each_backend(|b| {
         let mode = std::fs::metadata(&b.sock)
@@ -758,7 +758,7 @@ fn the_socket_is_world_read_write() {
         assert_eq!(
             mode,
             0o666,
-            "{}: socket mode is {mode:04o}, spec §1.2 step 3 requires 0666",
+            "{}: socket mode is {mode:04o}, the examples use 0666 as a test convention",
             b.lang.dir()
         );
     });

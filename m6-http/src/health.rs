@@ -92,7 +92,7 @@ mod monitoring_exclusion_tests {
     /// Regression guard. The cache-miss accounting on the serving paths fires
     /// on any `Ready` outcome, and /health and /perf both return Ready. Left
     /// uncounted for, every health check was recorded as a cache miss: 10
-    /// checks moved requests_total by 11 on the live origin.
+    /// checks moved requests_total by 11.
     ///
     /// That defeats the counter's purpose. A monitor polling every 30s would
     /// keep requests_total rising through a total traffic stall, so "the

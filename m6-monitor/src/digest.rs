@@ -140,9 +140,9 @@ pub struct NodeDigest {
     /// The hash of the build actually running, from `/perf`.
     ///
     /// This is what the version cannot say. Rust is not byte-reproducible, so
-    /// one tag built twice gives two binaries reporting one version: on
-    /// 2026-09-20 staging ran one build of `v1.10.0` and production another, and
-    /// every reading available to an operator said the fleet agreed. `None` on a
+    /// one tag built twice gives two binaries reporting one version: two
+    /// hosts can run different builds of `v1.10.0` while every reading
+    /// available to an operator says the fleet agrees. `None` on a
     /// node too old to say, which counts as drift rather than agreement for the
     /// same reason the version does.
     pub hash: Option<String>,
@@ -950,8 +950,8 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
             let detail = reporting
                 .iter()
                 .map(|n| {
-                    // Twelve characters, which is what an operator reading a
-                    // handover or an estate file is looking at. The full value
+                    // Twelve characters, which is what an operator reading their
+                    // own notes is looking at. The full value
                     // is in the JSON digest for anything that wants to compare
                     // exactly.
                     let h = n.hash.as_deref().unwrap_or("unknown");
@@ -1258,10 +1258,9 @@ pub(crate) mod tests {
     /// been built twice. Rust is not byte-reproducible, so this is the ordinary
     /// consequence of rebuilding rather than promoting.
     ///
-    /// On 2026-09-20 staging ran one build of `v1.10.0` and production another.
-    /// Every reading an operator had said the fleet agreed, and it was found by
-    /// running `md5sum` on four machines. This test is the thing that would have
-    /// said so.
+    /// Two hosts can run different builds of `v1.10.0` while every reading an
+    /// operator has says the fleet agrees, and the difference is found only by
+    /// running `md5sum` on each machine. This test is the thing that says so.
     ///
     /// Verified red before being trusted, per the standing rule: with the hash
     /// comparison removed it reports nothing at all, because the versions match.

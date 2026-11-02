@@ -55,6 +55,9 @@ pub enum AuthError {
     #[error("database error: {0}")]
     Db(#[from] rusqlite::Error),
 
+    #[error("opening the database: {0}")]
+    Open(#[from] m6_core::sqlite::SqliteError),
+
     #[error("password hashing error: {0}")]
     Bcrypt(#[from] bcrypt::BcryptError),
 }
@@ -106,15 +109,18 @@ const BCRYPT_COST: u32 = 12;
 pub struct Db(Connection);
 
 impl Db {
+    /// Open a connection and apply the schema.
+    ///
+    /// The connection comes from `m6_core::sqlite`, in WAL mode with a five
+    /// second busy timeout and foreign keys on. Every connection to one file
+    /// uses WAL, so the journal mode is set there and nowhere else. Workers
+    /// that open one new database at the same time are covered by the retry
+    /// of the WAL switch in that opener. The opener refuses a read-only file
+    /// with `AuthError::Open` and turns on `recursive_triggers`.
     pub fn open(path: &Path) -> Result<Self> {
-        let conn = Connection::open(path)?;
-        conn.execute_batch(
-            "
-            PRAGMA journal_mode=WAL;
-            PRAGMA busy_timeout=5000;
-            PRAGMA foreign_keys=ON;
-        ",
-        )?;
+        let conn = m6_core::sqlite::OpenOptions::default()
+            .journal(m6_core::sqlite::Journal::Wal)
+            .open(path)?;
         conn.execute_batch(SCHEMA)?;
         Ok(Db(conn))
     }

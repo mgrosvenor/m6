@@ -10,6 +10,7 @@ repository.workspace   = true
 name = "m6_auth"
 
 [dependencies]
+m6-core      = { path = "../m6-core", features = ["sqlite"] }
 rusqlite     = { version = "0.31", features = ["bundled"] }
 bcrypt       = "0.15"
 serde        = { version = "1", features = ["derive"] }

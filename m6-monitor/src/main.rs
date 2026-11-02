@@ -41,9 +41,8 @@ use std::time::Duration;
 use m6_core::prelude::*;
 
 fn main() -> anyhow::Result<()> {
-    // `m6-monitor --check <config>` prints the hourly health check and exits,
-    // which is what `tools/health-check.py` used to do over ssh. Same code
-    // path as the page, so the two cannot disagree.
+    // `m6-monitor --check <config>` prints the hourly health check and exits.
+    // Same code path as the page, so the two cannot disagree.
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--check") {
         let config = args
@@ -68,7 +67,7 @@ fn main() -> anyhow::Result<()> {
 /// How often the background poller refreshes the fleet view.
 ///
 /// Every request used to poll the whole fleet itself, which meant load on the
-/// production nodes scaled with how often anyone LOOKED at the monitor, two
+/// nodes scaled with how often anyone LOOKED at the monitor, two
 /// requests moments apart could disagree because they came from different polls,
 /// and a plain `/digest` fetch took 2.9 to 3.6 seconds. A monitoring endpoint
 /// should answer instantly from a recent reading.
