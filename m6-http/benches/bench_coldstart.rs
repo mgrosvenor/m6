@@ -97,6 +97,9 @@ impl Args {
                     a.http2 = false;
                     a.http3 = true;
                 }
+                // Cargo appends --bench to a bench executable. It is not a
+                // flag of this tool.
+                "--bench" => {}
                 other => {
                     eprintln!("unknown flag: {other}");
                     std::process::exit(1);
