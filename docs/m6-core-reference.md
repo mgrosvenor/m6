@@ -1,18 +1,14 @@
 # m6-core, component reference
 
 **Status: reference.**
-This document describes m6-core at 38 modules, four of them behind features, and 25,584 lines of Rust.
-One of the 38 is the prelude, a module of re-exports described in section 1, and the other 37 are the components in section 3.
+This document describes every module in m6-core.
 Where it and the code disagree, the code is right and this document is a defect.
 
 m6-core is the crate every m6 service links.
 It supplies the server loop, routing, configuration, the request dictionary and the response helpers, so a service that wants one of those does not write it again.
 
 This document is the reference for that crate: every module and the interface it exposes.
-It answers what is here and how to call it, and `m6-architecture.md` answers why it is here and where its boundary falls.
-
-Table 1 gives the two documents and the job each one does.
-Take from it that this file is the lookup and the architecture document is the reason.
+Table 1 gives the two m6-core documents and the job each one does.
 
 | file | job |
 |---|---|
@@ -121,13 +117,13 @@ Section 3 lists the modules those features compile.
 
 ## 3. Component index
 
-Thirty-seven component modules, grouped by the task that sends a reader to one.
-The prelude in section 1 is the thirty-eighth `pub mod` in `lib.rs`, and it re-exports the items the other modules implement.
+Thirty-eight component modules, four of them behind features, grouped by the task that sends a reader to one.
+The prelude in section 1 is the thirty-ninth `pub mod` in `lib.rs`, and it re-exports the items the other modules implement.
 Table 3 is the index, and it uses six abbreviations: *HTTP* (Hypertext Transfer Protocol), *RFC* (Request for Comments), *TCP* (Transmission Control Protocol), *JSON* (JavaScript Object Notation), *UTC* (Coordinated Universal Time) and *CSPRNG* (cryptographically secure pseudorandom number generator).
 
 | group | module | what it is |
 |---|---|---|
-| **Building a service** | `app` | The `App` builder, routing, the thread pool, the request dictionary and the service lifecycle. The largest module at 4,905 lines. |
+| **Building a service** | `app` | The `App` builder, routing, the thread pool, the request dictionary and the service lifecycle. The largest module. |
 | | `config` | `RendererConfig` and the configuration file that produces it. |
 | | `server` | `UnixServer` and `serve_connection`, the socket-backend loop. |
 | | `signal` | `block()`, `Service` and `ShutdownHandle`. Signal-safe shutdown, and SIGUSR1 to reopen the log file. |
@@ -155,6 +151,7 @@ Table 3 is the index, and it uses six abbreviations: *HTTP* (Hypertext Transfer 
 | **Observability** | `log` | `init`, `init_with_analytics`, `LogHandle` and `LogPulse`. Tracing setup and the liveness pulse. |
 | | `telemetry` | m6's own formats read back: `AnalyticsRecord`, `PeriodicStats`, `TrafficSummary`, and the probe and crawler heuristics. |
 | | `monitoring` | `/health` and `/perf`: `HealthReport`, `PerfReport`, `TrafficReport` and `LoggingHealth`. |
+| | `resolve` | Reverse DNS with forward confirmation, `reverse_confirmed`, on a bounded number of lookup threads. |
 | | `host` | What the machine is doing. Load, memory, disk, thermal, net, diskstats, pressure, *TCP* and file descriptors. |
 | | `tls` | How long the loaded certificate has left: `not_after_unix`, `record_loaded`, `loaded` and `TlsCertificate`. |
 | | `firewall` | `FirewallState` from nftables' own JSON. |
@@ -162,10 +159,10 @@ Table 3 is the index, and it uses six abbreviations: *HTTP* (Hypertext Transfer 
 | | `ndjson` | Newline-delimited JSON, read and written, tolerant of torn lines, and served as bounded pages with a cursor. |
 | **Storage** | `sqlite` | One SQLite file with the house settings, versioned migrations and append-only tables. Feature `sqlite`. |
 | **Everything else** | `net` | `is_private_ip` and `bind_ip`. The one definition of a private address. |
-| | `error` | `Error` and `Result`. 28 lines. |
+| | `error` | `Error` and `Result`. |
 | | `testkit` | The shared integration harness. Feature `testkit`. |
 
-**Table 3: the 37 modules, their group and one line on what each holds.**
+**Table 3: the 38 component modules, their group and one line on what each holds.**
 Take from it that the group names the task, and the module name is the string to search for in the section that follows.
 
 The index is the map for the rest of the document.
@@ -183,7 +180,6 @@ The builder is `App::new()`, then `.route(...)` or a method-specific variant (`r
 
 Four entry points choose what state the service needs, and each returns a different builder type with the same routing surface, so a service declares its state shape once and the type carries it.
 Table 4 gives the four.
-Take from it that the entry point is the state declaration, and every later call is the same on all four types.
 
 | entry point | builder | for |
 |---|---|---|
@@ -304,7 +300,7 @@ SIGHUP stays free for a future configuration reload.
 
 ### 4.5. `render` and `template`
 
-`render` is the seam, and it is 87 lines.
+`render` is the seam.
 A route that names a template produces a `Response` carrying `template_name` and `template_dict`, a `Renderer` turns that into bytes, and a `RendererFactory` builds one per reload, shared by every worker.
 `NoTemplates` implements both traits and errors if anything asks it to render, which is how the site renderers that render nothing stopped linking Tera, comrak and pest in order to get a server loop.
 
@@ -318,7 +314,7 @@ A route that names a template produces a `Response` carrying `template_name` and
 The loop calls `on_readable(now)` when `raw_fd()` is readable and `tick(now)` on every iteration, and `tick` returns `Some(Changed { site, process })` when a report is due.
 A `Fingerprint` of device, inode, length, mtime and ctime decides which file changed.
 On Linux an event that names a file forces a report even when the fingerprint is equal, which catches a same-length rewrite and two renames that reuse an inode.
-On kqueue the watcher reports the directory, so an unrelated write beside the config costs one spurious report and the fingerprints decide the result.
+On kqueue the watcher sees the directory, so an unrelated write beside the config wakes the loop, and the unchanged fingerprints mean no report is made.
 
 The first change after quiet is reported at once.
 A change within `RELOAD_DEBOUNCE` (20 ms) of a report is held and reported once more when the burst settles, capped at `RELOAD_POLL` (one second), so a burst is at most two reports.
@@ -346,9 +342,10 @@ It ends with the rules each helper enforces, and section 6 turns to the parsers 
 `field(name)` reads a form or query field.
 `get(key)` and `Index<&str>` read the dictionary, and `dict()` borrows the whole thing.
 
-File I/O is on `Request` on purpose, scoped to the site directory: `site_path(rel)` resolves a path, and `read_json`, `write_json`, `write_json_atomic`, `list_json` and `touch` read and write there.
+File I/O is on `Request` on purpose, relative to the site directory: `site_path(rel)` joins a path to it, and `read_json`, `write_json`, `write_json_atomic`, `list_json` and `touch` read and write there.
 `write_bytes` does the same and needs the `multipart` feature.
-The readers and writers refuse a `..` component, and `write_json_atomic` is the one to reach for when a reader may be running.
+The readers and writers refuse a `..` component but not an absolute path, which replaces the site directory, and `site_path` checks nothing, so a handler that builds a path from request input validates it first with `path::validate_path_param`.
+`write_json_atomic` is the one to reach for when a reader may be running.
 
 `verify_csrf()` (feature `csrf`) and `file(name) -> Upload` (feature `multipart`).
 
@@ -666,7 +663,7 @@ with `QUIET_SECONDS` (40) and `is_blind()` is the silent-log fault.
 `NotableClient`, `HeavyHitter`, `CrawlerReport` are its parts.
 `CrawlerReport` carries `first_seen` and `last_seen`, both `serde(default)`.
 
-### `resolve`
+### 8.4. `resolve`
 
 Reverse DNS with a deadline, for checking a claim against its source.
 It runs in a monitor and never in a serving path, because a lookup is a network round trip.
@@ -687,7 +684,7 @@ Table 2: the outcomes of a confirmed reverse lookup.
 At most `MAX_LOOKUP_THREADS` (8) lookup threads are alive at once, counting those abandoned at their deadline, and a lookup with no free slot reads `Failed` at once.
 `telemetry::verify_crawler(user_agent, &ptr)` turns a `Ptr` into a `CrawlerVerdict` using the operator's documented method.
 
-### 8.4. `host`
+### 8.5. `host`
 
 Parsing is separated from reading. The `parse_*` functions are pure over the
 text these files contain and are tested on any platform; the readers are thin
@@ -725,7 +722,7 @@ Two readings are easy to get wrong and invisible when wrong:
 There is no threshold anywhere in this module. Core says what the number is; a
 monitoring service decides what 80% means.
 
-### 8.5. `tls`
+### 8.6. `tls`
 
 **`not_after_unix(der) -> Result<i64, CertificateError>`** reads `notAfter` out
 of a DER certificate as seconds since the Unix epoch.
@@ -775,7 +772,7 @@ test runs every truncation of a real certificate through it. The dates go
 through `chrono`, because civil-from-days arithmetic is the mistake
 `util::iso_date_from` records.
 
-### 8.6. `firewall`
+### 8.7. `firewall`
 
 `FirewallState::from_nft_json(text)`, `from_file(path)`,
 `blocked_addresses()`, `active()`, and `Block`.
@@ -790,7 +787,7 @@ It reports the deliberate blocks and whether they are still being hit. It does
 not report "180 packets from 10 sources", which never changed and never prompted
 an action.
 
-### 8.7. `wireguard`
+### 8.8. `wireguard`
 
 `Handshakes::parse_latest_handshakes(text)`, `from_file(path)`, `find(key)`, and `PeerHandshake`.
 
@@ -805,7 +802,7 @@ The time is the last successful handshake.
 After a key changes under a tunnel it stops moving, and it still looks recent for minutes.
 An age is therefore the slow signal, and a probe over the tunnel is the fast one.
 
-### 8.8. `ndjson`
+### 8.9. `ndjson`
 
 `read_str(text)`, `Reader::new(r)` with `skipped()` and `read_count()`,
 `write_one`, `write_all`, `to_string`.
