@@ -92,12 +92,21 @@ impl Slots {
     }
 
     fn acquire(self: &Arc<Self>) -> Option<Slot> {
-        self.live
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < self.limit).then_some(n + 1)
-            })
-            .ok()
-            .map(|_| Slot(Arc::clone(self)))
+        // A compare-exchange loop, because `fetch_update` is renamed in newer
+        // toolchains and the new name is not in the minimum supported one.
+        let mut n = self.live.load(Ordering::Acquire);
+        loop {
+            if n >= self.limit {
+                return None;
+            }
+            match self
+                .live
+                .compare_exchange_weak(n, n + 1, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return Some(Slot(Arc::clone(self))),
+                Err(now) => n = now,
+            }
+        }
     }
 }
 
