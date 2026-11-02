@@ -19,7 +19,7 @@ use crate::rate_limit::RateLimiter;
 ///
 /// Each worker thread opens its own database connection instead, so a login
 /// hashing a password never holds a lock another request needs. See
-/// `main::open_worker_db`.
+/// `main::WorkerDb`.
 pub struct AppState {
     pub keys: Arc<RwLock<KeyMaterial>>,
     pub access_ttl: u64,
@@ -498,7 +498,7 @@ fn issue_tokens(
     Ok((access_jwt, refresh_jwt))
 }
 
-fn internal_error() -> RawResponse {
+pub fn internal_error() -> RawResponse {
     RawResponse::new(500)
         .content_type("application/json")
         .body(r#"{"error":"internal_error"}"#)

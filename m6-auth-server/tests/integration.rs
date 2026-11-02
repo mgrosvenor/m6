@@ -966,3 +966,55 @@ fn workers_opening_an_empty_database_at_once_produce_one_schema() {
         .expect("read the journal mode");
     assert_eq!(journal_mode, "wal", "a connection is not in WAL mode");
 }
+
+/// A worker that cannot open its database answers 500 and the service stays
+/// up. The next request opens the database again.
+///
+/// The service opens the database once at startup, so no worker has a
+/// connection yet. The file is then replaced by a directory, which no open
+/// can use. Core panics when a worker's first-use setup fails and the release
+/// profile aborts, so before the fix the first request killed the process.
+#[test]
+fn a_worker_that_cannot_open_the_database_answers_500_and_retries() {
+    let env = setup_test_env("db-open-fails");
+    seed_user(&env.site_dir, "alice", "correct_pass");
+    let guard = spawn_server(&env);
+
+    let db_path = env.site_dir.join("data/auth.db");
+    let parked = env.site_dir.join("data/auth.db.parked");
+    std::fs::rename(&db_path, &parked).expect("move the database aside");
+    std::fs::create_dir(&db_path).expect("put a directory where the database was");
+
+    let login_body = r#"{"username":"alice","password":"correct_pass"}"#;
+    let login = || {
+        http_request_with_body(
+            &env.socket_path,
+            "POST",
+            "/auth/login",
+            "application/json",
+            login_body,
+        )
+    };
+
+    // Twice: the second request shows the failure left no half-built state.
+    for _ in 0..2 {
+        let resp = login();
+        assert_eq!(
+            parse_status(&resp),
+            500,
+            "a failed database open was not answered with a 500\n{resp}\n--- output ---\n{}",
+            guard.output()
+        );
+    }
+
+    std::fs::remove_dir(&db_path).expect("remove the directory");
+    std::fs::rename(&parked, &db_path).expect("put the database back");
+
+    let resp = login();
+    assert_eq!(
+        parse_status(&resp),
+        200,
+        "the open was not retried after the database came back\n{resp}\n--- output ---\n{}",
+        guard.output()
+    );
+}

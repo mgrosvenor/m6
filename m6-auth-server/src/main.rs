@@ -1,7 +1,7 @@
 //! The authentication service.
 //!
 //! An `App` service with two state layers: one database connection per worker
-//! thread, and the signing keys, token lifetimes and rate limiter shared by
+//! thread, opened on the thread's first request, and the signing keys, token lifetimes and rate limiter shared by
 //! all of them. Four routes, all literal paths.
 //!
 //! This file used to be 246 lines of CLI parsing, logging setup, socket bind
@@ -78,18 +78,39 @@ fn build_state(ctx: &AppContext) -> Result<AppState> {
     })
 }
 
-/// One database connection for the worker thread that opens it.
+/// One worker thread's database connection, opened on first use.
 ///
-/// `App` calls this while handling that thread's first request. Core panics
-/// when this returns `Err`, and the release profile aborts, so `build_state`
-/// opens the database once first: that applies the schema and switches the
-/// file to WAL before any worker exists, and a worker's open then reopens a
-/// file already known to work. Every connection to one file must use the same
-/// journal mode, and `m6_auth::Db::open` is the one place that sets WAL, the
-/// busy timeout and foreign keys, so every connection goes through it.
-fn open_worker_db(_config: &Map<String, Value>, state: &AppState) -> Result<m6_auth::Db> {
-    m6_auth::Db::open(&state.db_path)
-        .map_err(|e| Error::Other(anyhow::anyhow!("opening auth database: {e}")))
+/// `App` builds this value while it handles the thread's first request, and
+/// core panics when that build returns `Err`. The release profile aborts on a
+/// panic, so a failed open there would end the whole service. The value is
+/// therefore built empty and cannot fail. [`WorkerDb::get`] makes the real
+/// open, and a failure becomes an ordinary 500 for that one request. The next
+/// request on the thread tries the open again.
+///
+/// Every connection to one file must use the same journal mode, and
+/// `m6_auth::Db::open` is the one place that sets it, so every connection goes
+/// through it.
+struct WorkerDb(Option<m6_auth::Db>);
+
+impl WorkerDb {
+    /// The connection, opening it first if this thread has none. `None` when
+    /// the open fails.
+    fn get(&mut self, path: &std::path::Path) -> Option<&m6_auth::Db> {
+        if self.0.is_none() {
+            match m6_auth::Db::open(path) {
+                Ok(db) => self.0 = Some(db),
+                Err(e) => {
+                    tracing::error!(error = %e, "opening auth database for a worker");
+                    return None;
+                }
+            }
+        }
+        self.0.as_ref()
+    }
+}
+
+fn open_worker_db(_config: &Map<String, Value>, _state: &AppState) -> Result<WorkerDb> {
+    Ok(WorkerDb(None))
 }
 
 /// Re-read the signing keys when the service's config is touched.
@@ -156,15 +177,19 @@ fn peer_ip(req: &Request) -> String {
 /// flags), and a migration is the wrong time to rewrite them. `RawResponse`
 /// lifts into `Response` verbatim.
 ///
-/// The route receives the shared state and the worker's own `Db`, in that
-/// order, which is the shape `App::with_state` hands a handler.
+/// The route receives the shared state and the worker's own [`WorkerDb`], in
+/// that order, which is the shape `App::with_state` hands a handler. It opens
+/// the connection on first use and answers 500 when that fails.
 macro_rules! route {
     ($app:expr, $method:ident, $path:literal, $f:expr) => {
         $app.$method(
             $path,
-            move |req: &Request, state: &AppState, db: &mut m6_auth::Db| {
+            move |req: &Request, state: &AppState, slot: &mut WorkerDb| {
                 let f: fn(&Request, &AppState, &m6_auth::Db, &str) -> RawResponse = $f;
-                Ok(f(req, state, db, &peer_ip(req)).into())
+                match slot.get(&state.db_path) {
+                    Some(db) => Ok(f(req, state, db, &peer_ip(req)).into()),
+                    None => Ok(handlers::internal_error().into()),
+                }
             },
         )
     };
