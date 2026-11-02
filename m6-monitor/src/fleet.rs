@@ -1,7 +1,7 @@
 //! Which nodes there are, and how to reach them.
 //!
-//! A fleet is configuration, not code. example.com is three nodes named
-//! origin, edge-a and edge-b; that is one deployment of m6 and nothing here knows it.
+//! A fleet is configuration, not code. The nodes, their names and roles all come
+//! from the config file, and nothing here knows any particular deployment.
 
 use std::path::Path;
 
@@ -31,11 +31,10 @@ pub struct Node {
     pub role: String,
     /// This node's `/perf` bearer token, if it has its own.
     ///
-    /// **The nodes do not share a token.** Measured 2026-09-11: origin, edge-a, edge-b
-    /// and the build host each have a different `/etc/m6/perf-token`. The
-    /// docs said otherwise and were wrong, and the failure is quiet: the
-    /// monitor polls with one token and two of three nodes answer 401 with
-    /// nothing to say why.
+    /// **The nodes need not share a token.** Each node can have its own
+    /// `/etc/m6/perf-token`. The failure when they differ is quiet: the
+    /// monitor polls with one token and the nodes that do not accept it
+    /// answer 401 with nothing to say why.
     ///
     /// Distinct tokens are the better property, so this follows reality
     /// rather than changing it: a leaked token exposes one node's `/perf`,

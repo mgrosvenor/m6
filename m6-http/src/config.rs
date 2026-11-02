@@ -605,7 +605,7 @@ pub struct BackendConfig {
     pub compresses: bool,
 }
 
-/// See [`BackendConfig::compresses`]. True because that is what the fleet does.
+/// See [`BackendConfig::compresses`]. True because a backend built on m6-core compresses by default.
 fn default_compresses() -> bool {
     true
 }

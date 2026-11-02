@@ -455,8 +455,9 @@ mod tests {
 
     #[test]
     fn header_source_vec_and_quiche_agree_on_find_all_multi_occurrence() {
-        // RFC 7540 §8.1.2.5: HTTP/2+ clients may split Cookie across several
-        // header fields — find_all must see every one, not just the first.
+        // RFC 9113 8.2.3 and RFC 9114 4.2.1: HTTP/2 and HTTP/3 clients may
+        // split Cookie across several header fields, so find_all must see
+        // every one, not just the first.
         let vec_headers = vec![
             ("cookie".to_string(), "a=1".to_string()),
             ("cookie".to_string(), "b=2".to_string()),
