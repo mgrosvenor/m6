@@ -457,7 +457,7 @@ else
     # No "test result:" line is echoed: the report below sums those lines for the
     # unit-test count and takes the last "N passed" as the suite's count.
     echo "rust end-to-end exit status $rust_rc"
-    grep -E '^test .* FAILED|panicked' /tmp/eg-cms-rust.log | tail -25
+    grep -E '^test [^r].* FAILED|panicked' /tmp/eg-cms-rust.log | tail -25
     if [ "$cms_rc" != "0" ] || [ "$rust_rc" != "0" ]; then
         echo "EG_CMS_STATUS=1"
     else
