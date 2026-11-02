@@ -31,6 +31,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # One value each, so the probe and the suite cannot drift apart.
+  SANITISER_FLAGS: "-Z sanitizer=address,leak"
+  SANITISER_TARGET: x86_64-unknown-linux-gnu
 
 # One run per ref, as in ci.yml. A newer push replaces a run that is already
 # superseded.
@@ -55,7 +58,7 @@ jobs:
       - name: Nightly toolchain and the Linux target
         uses: dtolnay/rust-toolchain@nightly
         with:
-          targets: x86_64-unknown-linux-gnu
+          targets: ${{ env.SANITISER_TARGET }}
 
       - uses: Swatinem/rust-cache@v2
 
@@ -68,8 +71,8 @@ jobs:
           rustup target list --installed --toolchain nightly
           probe="$RUNNER_TEMP/sanitizer-probe"
           printf 'fn main() {}\n' > "$probe.rs"
-          if ! rustc +nightly -Z sanitizer=address,leak --target x86_64-unknown-linux-gnu "$probe.rs" -o "$probe"; then
-            echo "::error::nightly rejected -Z sanitizer=address,leak for x86_64-unknown-linux-gnu"
+          if ! rustc +nightly $SANITISER_FLAGS --target "$SANITISER_TARGET" "$probe.rs" -o "$probe"; then
+            echo "::error::nightly rejected $SANITISER_FLAGS for $SANITISER_TARGET"
             echo "The sanitiser is unavailable. This job fails rather than pass without it."
             exit 1
           fi
@@ -86,12 +89,12 @@ jobs:
           # instrumented rlib, so it needs the same flag. Without it the
           # doctest link fails on undefined sanitiser symbols, and cargo test
           # runs doctests even with an explicit host --target.
-          RUSTFLAGS: "-Z sanitizer=address,leak"
+          RUSTFLAGS: ${{ env.SANITISER_FLAGS }}
+          RUSTDOCFLAGS: ${{ env.SANITISER_FLAGS }}
           # An explicit target keeps RUSTFLAGS off proc macros and build
           # scripts, which must stay uninstrumented. The environment variable
           # rather than --target reaches the cargo that testkit::binary runs
           # to build the services, so that build gets the same treatment.
-          CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
-          RUSTDOCFLAGS: "-Z sanitizer=address,leak"
+          CARGO_BUILD_TARGET: ${{ env.SANITISER_TARGET }}
         run: |
           time cargo +nightly test --workspace -- --test-threads=1
