@@ -106,15 +106,32 @@ const BCRYPT_COST: u32 = 12;
 pub struct Db(Connection);
 
 impl Db {
+    /// Open a connection and apply the schema.
+    ///
+    /// Every connection to one file uses WAL, so the journal mode is set here
+    /// and nowhere else. Switching a new file to WAL takes a short exclusive
+    /// lock, and SQLite answers `SQLITE_BUSY` for that pragma without waiting
+    /// on the busy timeout. Workers that open one new database at the same
+    /// time therefore retry the switch until one of them has made it.
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
-        conn.execute_batch(
-            "
-            PRAGMA journal_mode=WAL;
-            PRAGMA busy_timeout=5000;
-            PRAGMA foreign_keys=ON;
-        ",
-        )?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match conn.pragma_update(None, "journal_mode", "wal") {
+                Ok(()) => break,
+                Err(rusqlite::Error::SqliteFailure(e, _))
+                    if e.code == rusqlite::ErrorCode::DatabaseBusy
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
         conn.execute_batch(SCHEMA)?;
         Ok(Db(conn))
     }
