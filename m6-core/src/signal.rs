@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use nix::errno::Errno;
 use nix::sys::signal::{SigSet, Signal};
 
 /// Global shutdown state. Global rather than per-handle so every clone, and
@@ -63,15 +64,24 @@ pub fn block() {
     let _ = managed().thread_block();
 }
 
-/// Whether the calling thread currently blocks the signals this module owns.
-fn blocked_here() -> bool {
-    match SigSet::thread_get_mask() {
+/// Whether a signal-mask reading proves the calling thread blocks the signals
+/// this module owns.
+///
+/// A reading that fails returns `false`, so [`ShutdownHandle::install`] refuses
+/// to start. A guard that cannot check must refuse to start, per m6's rule that
+/// a check that cannot measure fails.
+fn mask_ok(r: Result<SigSet, Errno>) -> bool {
+    match r {
         Ok(m) => {
             m.contains(Signal::SIGTERM) && m.contains(Signal::SIGINT) && m.contains(REOPEN_SIGNAL)
         }
-        // If the mask cannot be read, do not turn that into a startup failure.
-        Err(_) => true,
+        Err(_) => false,
     }
+}
+
+/// Whether the calling thread currently blocks the signals this module owns.
+fn blocked_here() -> bool {
+    mask_ok(SigSet::thread_get_mask())
 }
 
 /// Reopen the log file for [`REOPEN_SIGNAL`] and say what happened.
@@ -400,6 +410,28 @@ mod tests {
         block();
         assert!(blocked_here());
         let _ = managed().thread_unblock();
+    }
+
+    #[test]
+    fn an_unreadable_mask_is_not_ok() {
+        assert!(!mask_ok(Err(Errno::EINVAL)));
+    }
+
+    #[test]
+    fn a_mask_holding_every_managed_signal_is_ok() {
+        assert!(mask_ok(Ok(managed())));
+    }
+
+    #[test]
+    fn a_mask_missing_a_managed_signal_is_not_ok() {
+        for missing in [Signal::SIGTERM, Signal::SIGINT, REOPEN_SIGNAL] {
+            let mut mask = managed();
+            mask.remove(missing);
+            assert!(
+                !mask_ok(Ok(mask)),
+                "a mask missing {missing:?} must not pass"
+            );
+        }
     }
 
     #[test]

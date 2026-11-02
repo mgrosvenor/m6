@@ -54,6 +54,11 @@ An address past the cap, or not yet reached, reads `not looked up yet  UNVERIFIE
 Googlebot verifies only under `googlebot.com` and `google.com`. A name under `googleusercontent.com` does not verify it, because every cloud customer's virtual machine gets a reverse name there that also resolves forward.
 `telemetry::CrawlerVerdict` gains `ForwardMismatch`, so a `match` over it needs a new arm.
 
+### Fixed
+
+**The signal-mask guard fails closed (#178).**
+When the thread's signal mask cannot be read, a service now refuses to start instead of assuming SIGTERM is blocked.
+
 ### Docs
 
 **Source comments in m6-http, m6-monitor and `tools/conformance.sh` no longer carry one deployment's hosts or measurements, and the HTTP/1.1 module header states the keep-alive the code implements (#190, #189 in part).**
