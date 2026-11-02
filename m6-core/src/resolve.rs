@@ -133,8 +133,11 @@ fn bounded<T: Send + 'static>(
     std::thread::Builder::new()
         .name("m6-resolve".into())
         .spawn(move || {
-            let _slot = slot;
-            let _ = tx.send(f());
+            let result = f();
+            // Release the slot before the send. The caller wakes on the send,
+            // and its next lookup must not find this slot still held.
+            drop(slot);
+            let _ = tx.send(result);
         })
         .ok()?;
     rx.recv_timeout(timeout).ok()
@@ -226,21 +229,6 @@ impl Ptr {
 /// report, later.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Look up the PTR name for an address, giving up after `timeout`.
-///
-/// This is the reverse half only and does not confirm the name. Use
-/// [`reverse_confirmed`] to check a claim.
-///
-/// `addr` is parsed rather than passed through: `getnameinfo` is being asked
-/// about a numeric address, so anything that is not one is a caller error and
-/// is reported as [`Ptr::Failed`] rather than sent to a resolver.
-pub fn reverse(addr: &str, timeout: Duration) -> Ptr {
-    let Ok(ip) = addr.parse::<IpAddr>() else {
-        return Ptr::Failed;
-    };
-    bounded(global_slots(), timeout, move || blocking_reverse(ip)).unwrap_or(Ptr::Failed)
-}
-
 /// Look up the PTR name for an address and confirm it forward.
 ///
 /// One deadline covers both lookups. The result is [`Ptr::Name`] only when
@@ -275,11 +263,6 @@ fn confirm(ip: IpAddr, timeout: Duration, lookup: Arc<dyn Lookup>, slots: &Arc<S
         }
         Some(Forward::Failed) | None => Ptr::Failed,
     }
-}
-
-/// Look up the PTR name for an address with the default deadline.
-pub fn reverse_default(addr: &str) -> Ptr {
-    reverse(addr, DEFAULT_TIMEOUT)
 }
 
 /// [`reverse_confirmed`] with the default deadline.
@@ -363,6 +346,21 @@ fn blocking_reverse(ip: IpAddr) -> Ptr {
     }
 }
 
+/// Whether a `getaddrinfo` error means the name has no address.
+///
+/// `EAI_NONAME` is the answer for a name that does not exist. glibc answers
+/// `EAI_NODATA` for a name that exists with no A or AAAA record. Both are a
+/// completed lookup with an empty answer, so a PTR name that resolves to no
+/// address is a false claim and not a failed lookup. `EAI_NODATA` is defined
+/// only where the C library has it.
+fn is_no_address(rc: libc::c_int) -> bool {
+    #[cfg(any(all(target_os = "linux", target_env = "gnu"), target_os = "android"))]
+    if rc == libc::EAI_NODATA {
+        return true;
+    }
+    rc == libc::EAI_NONAME
+}
+
 /// The blocking forward call.
 ///
 /// Returns every address `name` resolves to. `EAI_NONAME` means the name
@@ -380,7 +378,7 @@ fn blocking_forward(name: &str) -> Forward {
     // initialised, and `res` is a valid out-pointer.
     let rc = unsafe { libc::getaddrinfo(cname.as_ptr(), std::ptr::null(), &hints, &mut res) };
     if rc != 0 {
-        return if rc == libc::EAI_NONAME {
+        return if is_no_address(rc) {
             Forward::Addrs(Vec::new())
         } else {
             Forward::Failed
@@ -467,9 +465,15 @@ mod tests {
     /// reaches a resolver.
     #[test]
     fn a_non_address_is_not_looked_up() {
-        assert_eq!(reverse("not-an-address", DEFAULT_TIMEOUT), Ptr::Failed);
-        assert_eq!(reverse("", DEFAULT_TIMEOUT), Ptr::Failed);
-        assert_eq!(reverse("example.com", DEFAULT_TIMEOUT), Ptr::Failed);
+        assert_eq!(
+            reverse_confirmed("not-an-address", DEFAULT_TIMEOUT),
+            Ptr::Failed
+        );
+        assert_eq!(reverse_confirmed("", DEFAULT_TIMEOUT), Ptr::Failed);
+        assert_eq!(
+            reverse_confirmed("example.com", DEFAULT_TIMEOUT),
+            Ptr::Failed
+        );
     }
 
     /// The deadline is honoured rather than advisory. A zero timeout cannot
@@ -479,7 +483,7 @@ mod tests {
     #[test]
     fn a_deadline_that_cannot_be_met_reports_failure_rather_than_waiting() {
         let started = std::time::Instant::now();
-        let got = reverse("192.0.2.1", Duration::from_millis(0));
+        let got = reverse_confirmed("192.0.2.1", Duration::from_millis(0));
         assert_eq!(got, Ptr::Failed);
         assert!(
             started.elapsed() < Duration::from_secs(1),
@@ -496,7 +500,7 @@ mod tests {
     fn a_real_lookup_returns_within_its_deadline() {
         for addr in ["127.0.0.1", "::1"] {
             let started = std::time::Instant::now();
-            let got = reverse(addr, Duration::from_secs(3));
+            let got = reverse_confirmed(addr, Duration::from_secs(3));
             assert!(
                 started.elapsed() < Duration::from_secs(5),
                 "{addr} exceeded its deadline"
@@ -504,6 +508,37 @@ mod tests {
             if let Ptr::Name(n) = &got {
                 assert!(!n.is_empty(), "{addr} returned an empty name");
             }
+        }
+    }
+
+    /// The C library's "no such name" and "name without an address" answers
+    /// are both a completed empty lookup, and a resolver failure is not.
+    #[test]
+    fn no_name_and_no_data_both_read_as_an_empty_answer() {
+        assert!(is_no_address(libc::EAI_NONAME));
+        #[cfg(any(all(target_os = "linux", target_env = "gnu"), target_os = "android"))]
+        assert!(is_no_address(libc::EAI_NODATA));
+        assert!(!is_no_address(libc::EAI_AGAIN));
+        assert!(!is_no_address(0));
+    }
+
+    /// The worker frees its slot before it sends, so a caller that wakes on
+    /// the result can take a slot at once. With one slot, the forward lookup
+    /// of a confirmation needs the slot the reverse lookup just used.
+    #[test]
+    fn a_slot_is_free_by_the_time_the_caller_has_the_result() {
+        let slots = Slots::new(1);
+        for _ in 0..500 {
+            let l = stub(
+                "192.0.2.7",
+                Ptr::Name("crawl.example.com".into()),
+                "crawl.example.com",
+                Forward::Addrs(vec!["192.0.2.7".parse().unwrap()]),
+            );
+            assert_eq!(
+                confirm("192.0.2.7".parse().unwrap(), T, l, &slots),
+                Ptr::Name("crawl.example.com".into())
+            );
         }
     }
 
