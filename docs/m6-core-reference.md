@@ -1,25 +1,56 @@
 # m6-core, component reference
 
-**Status: reference. Describes the crate as it is, at 37 modules and ~23,200
-lines.** Where this disagrees with the code, the code is right and this file is
-a bug.
+**Status: reference.**
+This document describes m6-core at 38 modules, four of them behind features, and 25,584 lines of Rust.
+One of the 38 is the prelude, a module of re-exports described in section 1, and the other 37 are the components in section 3.
+Where it and the code disagree, the code is right and this document is a defect.
 
-Two documents cover m6-core and they do different jobs:
+m6-core is the crate every m6 service links.
+It supplies the server loop, routing, configuration, the request dictionary and the response helpers, so a service that wants one of those does not write it again.
+
+This document is the reference for that crate: every module and the interface it exposes.
+It answers what is here and how to call it, and `m6-architecture.md` answers why it is here and where its boundary falls.
+
+Table 1 gives the two documents and the job each one does.
+Take from it that this file is the lookup and the architecture document is the reason.
 
 | file | job |
 |---|---|
 | `m6-architecture.md` | **Design.** What the crate is for, where its boundary is, and the rule that decides what goes in. |
 | this file | **Reference.** Every component and its interface. |
 
-`m6-render-lib.md` is superseded. It documents a crate that has been deleted,
-and most of what it described now lives here.
+**Table 1: the two m6-core documents and the job each one does.**
+Take from it that a question about why a module exists belongs in the design document, and a question about a function's name or argument belongs here.
+
+`m6-render-lib.md` is superseded.
+It describes a crate that has been deleted, and most of what it described now lives here.
+
+The document follows the shape of a service.
+Sections 1 to 3 cover the ways into the crate, its feature flags and its module list.
+Sections 4 and 5 cover the modules that build a service and the modules that read a request and write a response.
+Sections 6 to 11 cover HTTP semantics, content, observability, errors, the test kit and the gaps this crate still has.
+
+**Contents**
+
+1. [Using it](#1-using-it)
+2. [Feature flags](#2-feature-flags)
+3. [Component index](#3-component-index)
+4. [Building a service](#4-building-a-service)
+5. [Request and response](#5-request-and-response)
+6. [HTTP semantics](#6-http-semantics)
+7. [Content](#7-content)
+8. [Observability](#8-observability)
+9. [Errors](#9-errors)
+10. [Test kit](#10-test-kit)
+11. [Known gaps in this crate](#11-known-gaps-in-this-crate)
 
 ---
 
 ## 1. Using it
 
-m6-core is the only crate an m6 service links. The intended first line is the
-prelude:
+This section shows the two shapes a service takes, the prelude and the hand-built loop, and what the prelude gives by default.
+
+m6-core is the only crate an m6 service links, and the intended first line is the prelude.
 
 ```rust
 use m6_core::prelude::*;
@@ -31,143 +62,128 @@ fn main() -> Result<()> {
 }
 ```
 
-The prelude is deliberately small: `App`, `Error`, `Result`, `Request`,
-`Response`, the three time and slug helpers from `util`, and `serde_json`'s
-`json!`, `Map` and `Value`. Feature-gated additions appear in it only when the
-feature is on (`Upload`, `TeraFactory`, `TeraRenderer`, `lettre`'s mail types,
-`ureq`, `rusqlite`).
+The prelude is deliberately small.
+It exports `App` and `AppContext`, `Dict`, `Error` and `Result`, `Request` and `Response`, the three helpers `now_iso8601`, `slugify` and `today_iso8601` from `util`, and `serde_json`'s `json!`, `Map` and `Value`.
+Feature-gated additions appear in it only when the feature is on: `Upload`, `TeraFactory` and `TeraRenderer`, lettre's `Message`, `SmtpTransport` and `Transport`, `ureq`, and `rusqlite`.
 
-A service that renders no templates says so, and stops linking Tera:
+A service that renders no templates says so, and stops linking Tera.
 
 ```rust
-App::new()
-    .renderer(NoTemplates)
-    .route("/healthz", |_req| Ok(Response::text("ok")))
-    .run()
+use m6_core::prelude::*;
+use m6_core::render::NoTemplates;
+
+fn main() -> Result<()> {
+    App::new()
+        .renderer(NoTemplates)
+        .route("/healthz", |_req| Ok(Response::text("ok")))
+        .run()
+}
 ```
 
-There is a second shape. Not every consumer wants the `App` loop: `m6-http` is
-a proxy, `m6-auth-server` binds its own socket, and the monitoring tools only
-want the parsers. Every module is public and usable on its own, so m6-core is a
-library first and a framework second.
+There is a second shape.
+`m6-http` is a proxy with its own event loop and datagram sockets, and a tool can use the parsers in `telemetry` and `ndjson` without a server at all.
+Every module is public, and most of the crate can be used without the `App` loop, so m6-core is a library first and a framework second.
+One part is not reachable that way: `FrameworkState::build_dict` is private, which section 4 records as an open item.
+
+Both shapes link one crate, and the difference is where the service loop comes from.
+Section 2 gives the features that decide which parts compile.
 
 ## 2. Feature flags
 
-**Features and modules are different axes, and two features have no module at
-all.** `flash` and `csrf` gate methods on `App`, `Request` and `Response`; a
-reader who greps for a `csrf` module finds nothing and wrongly concludes the
-feature is missing.
+Features and modules are different axes, and `flash` and `csrf` have no module at all.
+They gate code inside `App` and one method each, `Response::flash` and `Request::verify_csrf`.
+A reader who greps for a `csrf` module finds nothing and wrongly concludes the feature is missing.
+Table 2 gives the eight features.
 
 | feature | default | what it adds |
 |---|---|---|
 | `templates` | **on** | `template` module, `TeraFactory`, `TeraRenderer`. Pulls tera and comrak. |
 | `testkit` | off | The `testkit` module. Enable from `[dev-dependencies]` only. |
 | `multipart` | off | `multipart` module, `Request::file`. Pulls multer, tokio, bytes, futures-util. |
-| `flash` | off | `Response::flash`, HMAC-signed one-shot messages. Pulls hmac, sha2. |
-| `csrf` | off | `Request::verify_csrf`, token generation in the request dictionary. No new dependencies. |
+| `flash` | off | `Response::flash` and *HMAC* (hash-based message authentication code) signed one-shot messages. Pulls hmac, sha2. |
+| `csrf` | off | *CSRF* (cross-site request forgery) token generation in the request dictionary, and `Request::verify_csrf`. No new dependencies. |
 | `email` | off | `lettre` in the prelude. |
 | `http-client` | off | `ureq` in the prelude. |
 | `sqlite` | off | `sqlite` module: `open`, `open_reader`, `migrate`, `append_only`, `used_bytes`, `prune_oldest`, and `rusqlite` in the prelude. Pulls rusqlite 0.31 with bundled SQLite. |
 
-`templates` is on by default on purpose, and the reason is a scar: a feature
-that hides code from `cargo test --workspace` is how two `csrf` tests stayed
-broken from Phase 4 to Phase 5. chrono and lru are unconditional dependencies
-for the same reason. A binary that wants none of it sets
-`default-features = false`.
+**Table 2: the eight features, their defaults and what each one compiles.**
+Take from it that only `templates` is on by default, six features pull a dependency and two add code only.
 
-The off-by-default features `sqlite`, `email` and `multipart` are invisible to
-`cargo test --workspace`. A CI step builds and tests m6-core with
-`--all-features` to cover them.
+`templates` is on by default because a feature that hides code from `cargo test --workspace` is how two `csrf` tests stayed broken from Phase 4 to Phase 5.
+`chrono` and `lru` are unconditional dependencies for the same reason.
+A binary that wants none of it sets `default-features = false`.
+
+Every off-by-default feature is invisible to `cargo test --workspace`: `testkit`, `multipart`, `flash`, `csrf`, `email`, `http-client` and `sqlite`.
+A *CI* (continuous integration) step builds and tests m6-core with `--all-features` to cover them.
+
+The two defaults are the whole of the choice: templating arrives without asking, and every other block is opt-in.
+Section 3 lists the modules those features compile.
 
 ## 3. Component index
 
-Thirty-seven modules. Grouped by what you would be doing when you reach for one.
+Thirty-seven component modules, grouped by the task that sends a reader to one.
+The prelude in section 1 is the thirty-eighth `pub mod` in `lib.rs`, and it re-exports the items the other modules implement.
+Table 3 is the index, and it uses six abbreviations: *HTTP* (Hypertext Transfer Protocol), *RFC* (Request for Comments), *TCP* (Transmission Control Protocol), *JSON* (JavaScript Object Notation), *UTC* (Coordinated Universal Time) and *CSPRNG* (cryptographically secure pseudorandom number generator).
 
-**Building a service**
+| group | module | what it is |
+|---|---|---|
+| **Building a service** | `app` | The `App` builder, routing, the thread pool, the request dictionary and the service lifecycle. The largest module at 4,905 lines. |
+| | `config` | `RendererConfig` and the configuration file that produces it. |
+| | `server` | `UnixServer` and `serve_connection`, the socket-backend loop. |
+| | `signal` | `block()`, `Service` and `ShutdownHandle`. Signal-safe shutdown, and SIGUSR1 to reopen the log file. |
+| | `render` | The `Renderer` and `RendererFactory` traits, plus `NoTemplates`. The only thing the loop needs from a template engine. |
+| | `template` | The Tera implementation of those traits, and the site filters. Feature `templates`. |
+| | `watcher` | `ConfigWatcher`, inotify on Linux and kqueue on macOS, FreeBSD and OpenBSD, and `ConfigReloader`, which watches a service's two files. |
+| **Request and response** | `dict` | The request dictionary: a shared base plus a per-request overlay. |
+| | `request` | `Request`, the handler's view: the dictionary, body access, file I/O helpers, query and form parsing, and percent-encoding. |
+| | `response` | `Response`, every constructor a handler needs, and `send`. |
+| | `http` | `RawRequest`, `RawResponse`, `Method`, the `HeaderSource` trait and `is_same_origin_path`. |
+| | `headers` | Reading and writing a header list, once. `get`, `get_all`, `combine`, `set`, `append`, `remove`. |
+| | `cookie` | `Cookie` and `SameSite`. One place that says what a cookie can be. |
+| | `multipart` | `Upload` and `parse_upload`. Feature `multipart`. |
+| | `time_range` | `TimeRange`, the `from` and `to` of a query read as a half-open UTC range, and `rfc3339_utc_ms`. |
+| **HTTP semantics** | `h1` | The HTTP/1.1 parser, plus `Responder`, `keep_alive`, `status_reason` and `Expectation`. |
+| | `parse` | The stream adapter over `h1`. Reads bytes until `h1` says the message is complete. |
+| | `conditional` | RFC 9110 13.2 preconditions. `evaluate_preconditions` and `is_not_modified`. |
+| | `negotiate` | Content-coding negotiation, RFC 9110 12.5.3, with real q-values. |
+| | `mime` | `mime_from_path` and `should_compress_default`. |
+| | `path` | `validate_path_param`. A security boundary. |
+| **Content** | `compress` | brotli and gzip, compress and decompress. |
+| | `minify` | The four minifiers: markup, JavaScript, stylesheets and JSON. |
+| | `util` | `slugify`, `now_iso8601`, `today_iso8601`, `iso8601_minutes_ago` and `html_escape`. |
+| | `random` | `random_hex_token::<N>()`. One CSPRNG token generator, so there is never a third. |
+| **Observability** | `log` | `init`, `init_with_analytics`, `LogHandle` and `LogPulse`. Tracing setup and the liveness pulse. |
+| | `telemetry` | m6's own formats read back: `AnalyticsRecord`, `PeriodicStats`, `TrafficSummary`, and the probe and crawler heuristics. |
+| | `monitoring` | `/health` and `/perf`: `HealthReport`, `PerfReport`, `TrafficReport` and `LoggingHealth`. |
+| | `host` | What the machine is doing. Load, memory, disk, thermal, net, diskstats, pressure, *TCP* and file descriptors. |
+| | `tls` | How long the loaded certificate has left: `not_after_unix`, `record_loaded`, `loaded` and `TlsCertificate`. |
+| | `firewall` | `FirewallState` from nftables' own JSON. |
+| | `wireguard` | `Handshakes` from `wg show <if> latest-handshakes` output. |
+| | `ndjson` | Newline-delimited JSON, read and written, tolerant of torn lines, and served as bounded pages with a cursor. |
+| **Storage** | `sqlite` | One SQLite file with the house settings, versioned migrations and append-only tables. Feature `sqlite`. |
+| **Everything else** | `net` | `is_private_ip` and `bind_ip`. The one definition of a private address. |
+| | `error` | `Error` and `Result`. 28 lines. |
+| | `testkit` | The shared integration harness. Feature `testkit`. |
 
-| module | what it is |
-|---|---|
-| `app` | The `App` builder, routing, the thread pool, the request dictionary, the service lifecycle. The largest module at ~2,700 lines. |
-| `config` | `RendererConfig` and the TOML that produces it. |
-| `server` | `UnixServer` and `serve_connection`, the socket-backend loop. |
-| `signal` | `block()`, `Service`, `ShutdownHandle`. Signal-safe shutdown, and SIGUSR1 to reopen the log file. |
-| `render` | The `Renderer` and `RendererFactory` traits, plus `NoTemplates`. The only thing the loop needs from a template engine. |
-| `template` | The Tera implementation of those traits, and the site filters. Feature `templates`. |
-| `watcher` | `ConfigWatcher`, inotify on Linux and kqueue on the BSDs, and `ConfigReloader`, which watches a service's two files. |
+**Table 3: the 37 modules, their group and one line on what each holds.**
+Take from it that the group names the task, and the module name is the string to search for in the section that follows.
 
-**Request and response**
-
-| module | what it is |
-|---|---|
-| `dict` | The request dictionary: a shared base plus a per-request overlay. |
-| `request` | `Request`, the handler's view: the dictionary, body access, file I/O helpers, query and form parsing, URL coding. |
-| `response` | `Response`, every constructor a handler needs, and `send`. |
-| `http` | `RawRequest`, `RawResponse`, `Method`, the `HeaderSource` trait, `is_same_origin_path`. |
-| `headers` | Reading and writing a header list, once. `get`, `get_all`, `combine`, `set`, `append`, `remove`. |
-| `cookie` | `Cookie` and `SameSite`. One place that says what a cookie can be. |
-| `multipart` | `Upload` and `parse_upload`. Feature `multipart`. |
-| `time_range` | `TimeRange`, the `from` and `to` of a query read as a half-open UTC range, and `rfc3339_utc_ms`. |
-
-**HTTP semantics**
-
-| module | what it is |
-|---|---|
-| `h1` | **The** HTTP/1.1 parser, plus `Responder`, `keep_alive`, `status_reason`, `Expectation`. |
-| `parse` | The stream adapter over `h1`. Reads bytes until `h1` says the message is complete. |
-| `conditional` | RFC 9110 13.2 preconditions. `evaluate_preconditions`, `is_not_modified`. |
-| `negotiate` | Content-coding negotiation, RFC 9110 12.5.3, with real q-values. |
-| `mime` | `mime_from_path`, `should_compress_default`. |
-| `path` | `validate_path_param`. A security boundary. |
-
-**Content**
-
-| module | what it is |
-|---|---|
-| `compress` | brotli and gzip, compress and decompress. |
-| `minify` | HTML, JS, CSS, JSON. |
-| `util` | `slugify`, `now_iso8601`, `today_iso8601`, `iso8601_minutes_ago`, `html_escape`. |
-| `random` | `random_hex_token::<N>()`. One CSPRNG token generator, so there is never a third. |
-
-**Observability**
-
-| module | what it is |
-|---|---|
-| `log` | `init`, `init_with_analytics`, `LogHandle`, `LogPulse`. Tracing setup and the liveness pulse. |
-| `telemetry` | m6's own formats read back: `AnalyticsRecord`, `PeriodicStats`, `TrafficSummary`, and the probe and crawler heuristics. |
-| `monitoring` | `/health` and `/perf`: `HealthReport`, `PerfReport`, `TrafficReport`, `LoggingHealth`. |
-| `host` | What the machine is doing. Load, memory, disk, thermal, net, diskstats, pressure, TCP, fds. |
-| `tls` | How long the loaded certificate has left: `not_after_unix`, `record_loaded`, `loaded`, `TlsCertificate`. |
-| `firewall` | `FirewallState` from nftables' own JSON. |
-| `wireguard` | `Handshakes` from `wg show <if> latest-handshakes` output. |
-| `ndjson` | Newline-delimited JSON, read and written, tolerant of torn lines, and served as bounded pages with a cursor. |
-
-**Storage**
-
-| module | what it is |
-|---|---|
-| `sqlite` | One SQLite file with the house settings, versioned migrations, append-only tables. Feature `sqlite`. |
-
-**Everything else**
-
-| module | what it is |
-|---|---|
-| `net` | `is_private_ip` and `bind_ip`. The one definition of a private address. |
-| `error` | `Error` and `Result`. Eighteen lines. |
-| `testkit` | The shared integration harness. Feature `testkit`. |
-
----
+The index is the map for the rest of the document.
+Sections 4 and 5 take the two largest groups in turn, and sections 6 to 10 take the rest.
 
 ## 4. Building a service
 
-### `app`
+This section covers the modules that build a service: the `App` builder and its state, the configuration it reads, the socket loop, signal handling, the renderer seam and the config watcher.
+It uses *HTTP* (Hypertext Transfer Protocol) for the wire protocol and *TOML* (Tom's Obvious, Minimal Language) for the configuration format.
 
-The builder is `App::new()`, then `.route(...)` or a method-specific variant
-(`route_get`, `route_post`, `route_put`, `route_patch`, `route_delete`), then
-`.run()`. `.renderer(...)` supplies the template implementation.
+### 4.1. `app`
 
-**Four entry points, by what state the service needs.** Each returns a
-different builder type with the same routing surface, so a service declares its
-state shape once and the type carries it:
+The builder is `App::new()`, then `.route(...)` or a method-specific variant (`route_get`, `route_post`, `route_put`, `route_patch`, `route_delete`), then `.run()`.
+`.renderer(...)` supplies the template implementation.
+
+Four entry points choose what state the service needs, and each returns a different builder type with the same routing surface, so a service declares its state shape once and the type carries it.
+Table 4 gives the four.
+Take from it that the entry point is the state declaration, and every later call is the same on all four types.
 
 | entry point | builder | for |
 |---|---|---|
@@ -176,51 +192,50 @@ state shape once and the type carries it:
 | `App::with_thread_state(init)` | `AppWithThreadState<T>` | a `T` per worker thread |
 | `App::with_state(init_global, init_thread)` | `AppWithState<G, T>` | both |
 
-The `init` closures receive the config map (`&Map<String, Value>`) and return
-`Result`, so a service that cannot build its state fails at startup rather than
-on the first request. `.on_destroy(...)` gives the global a teardown hook, and `.on_reload(...)` a
-hook that runs after each successful reload with the new `AppContext`.
+**Table 4: the four `App` entry points and the state each one carries.**
+Take from it that the global value is shared and the thread value is per worker.
 
-**Routing.** `compile_pattern` turns `/blog/{stem}` into `Vec<Segment>`;
-`route_specificity` scores a compiled route so that a literal beats a
-parameter; `match_route` returns `PathParams` (a `Vec<(String, String)>`, not a
-map, because order is meaningful and duplicates are possible);
-`find_route` picks the winner. Route matching existed three times before this,
-twice hand-rolled with different specificity rules, so the same route table
-could resolve differently in two services.
+The global initialiser receives an `AppContext`, which carries the config map, the site directory, the config path and the resolved `site.toml`.
+A thread initialiser receives the config map and the global state, or `()` when there is none.
+Both return `Result`, so a service that cannot build its state fails at startup, before the first request.
 
-**The thread pool.** `ThreadPool::new(size, queue_size)`, or `new_with_exit`
-when the pool must be able to end the process. `submit` returns `false` rather
-than blocking when the queue is full, which is how the loop sheds load with a
-503 instead of growing a backlog. `try_submit` carries a result back,
-`in_flight` reports depth, `drain` waits.
+`.on_destroy(...)` gives the global a teardown hook and `.on_destroy_thread(...)` gives the thread value one.
+`.on_reload(...)` runs after a reload has built and checked the new state, before that state and log level are installed, so a hook that returns `Err` keeps the previous configuration serving.
 
-**The request dictionary.** `FrameworkState::build_dict` is where the real
-knowledge lives, and it is **private**, which is the outstanding item on this
-module: a service not using `App` cannot reuse any of it. Twelve ordered steps,
-and the order is load-bearing:
+Routing: `compile_pattern` turns `/blog/{stem}` into `Vec<Segment>`, `route_specificity` scores a compiled route so a literal beats a parameter, and `match_route` returns `PathParams` as a `Vec<(String, String)>` because order is meaningful and duplicates are possible.
+`find_route` picks the winner.
+Route matching existed three times before this, twice hand-rolled with different specificity rules, so the same route table could resolve differently in two services.
 
-1. Config keys.
-2. Global params files.
-3. Route params files.
-4. Path params.
-5. Query params, inserted both at top level and as a nested `query` map.
-6. POST form fields.
-7. Cookies, top level and as a nested `cookies` map.
-8. **Built-ins: `request_path`, `datetime`, `year`.** After the params files, so
-   a params file cannot override them. This is the load-bearing step.
-9. Auth keys.
-10. Error keys.
-11. Flash message: verify the HMAC, insert `flash`, clear the cookie. Feature
-    `flash`.
-12. CSRF token: reuse from the cookie or generate, insert `csrf_token`. Feature
-    `csrf`.
+The thread pool: `ThreadPool::new(size, queue_size)`, or `new_with_exit(size, queue_size, on_thread_exit)` to run a callback when each worker thread ends.
+`submit` returns `false` when the queue is full, which is how the loop sheds load with a 503 instead of growing a backlog.
+`try_submit(resource, f)` hands a resource to the work and returns it back when the queue is full.
+`in_flight` reports depth and `drain` waits.
+
+The request dictionary: `FrameworkState::build_dict` is where the real knowledge lives, and it is **private**, which is the outstanding item on this module, because a service not using `App` cannot reuse any of it.
+Three layers no longer run per request: config keys, global params files and a route's static params files are merged once per reload into `route.base_dict`.
+The per-request order is:
+
+- Params files whose path holds a `{placeholder}`.
+- Path params, each validated.
+  A `{*name}` capture may span segments and a `{name}` capture may not.
+- Query params, inserted at top level and as a nested `query` map.
+- POST form fields, from `application/x-www-form-urlencoded` only.
+  A non-empty body of any other type logs a warning.
+- Cookies, as a nested `cookies` map.
+- Built-ins `request_path`, `datetime` and `year`, after the params files so a params file cannot override them.
+- Auth claims from `x-auth-claims`.
+- Flash message, when the feature is on: verify the HMAC, insert `flash`, and the response path adds the removal cookie.
+- CSRF token, when the feature is on and the dictionary holds none: reuse the `_csrf` cookie or generate one, and insert it.
+  A submitted form token stays in place for `verify_csrf` to compare.
+
+Error keys need no step, because they arrive as query parameters at the query step.
 
 `is_shutdown()` is a free function for handlers that run long enough to care.
 
-### `config`
+### 4.2. `config`
 
-`config::load(config_path, site_dir) -> RendererConfig`. The struct:
+`config::load(config_path, site_dir) -> anyhow::Result<RendererConfig>`.
+The struct is:
 
 ```rust
 pub struct RendererConfig {
@@ -243,223 +258,177 @@ A non-string or empty value fails `config::load`.
 `AppContext::site_toml` carries the resolved path to the global initialiser, set whether or not the file exists.
 A service that names a `site_toml` that does not exist, cannot be read or is not valid TOML exits 2 at start.
 
-A `RouteConfig` carries `path`, `template`, `params`, `status`, `cache`,
-`methods` and `headers`. `MinificationConfig::is_enabled(mime)` answers the
-per-type question. `toml_to_json` is the conversion used throughout.
+A `RouteConfig` carries nine fields: `path`, `template`, `params`, `status`, `cache`, `methods`, `headers`, `handler` and `settings`.
+`handler` names a code handler registered with `App::handler`, and `settings` keeps the per-route keys core does not define.
+`MinificationConfig::is_enabled(mime)` answers the per-type question, and `toml_to_json` is the conversion used throughout.
 
-`[server] read_timeout_s` is the read deadline applied to every accepted
-connection, defaulting to `server::DEFAULT_READ_TIMEOUT_SECS` (30). `0` means
-no timeout, which is what every `App` service did before the key existed. Read
-once at startup, like the pool dimensions: it is set on a socket at accept
-time, so a reload cannot retune connections already being served.
+`[server] read_timeout_s` is the read deadline applied to every accepted connection, defaulting to `server::DEFAULT_READ_TIMEOUT_SECS` (30).
+`0` means no timeout, which is what every `App` service did before the key existed.
+It is read once at startup, like the pool dimensions: it is set on a socket at accept time, so a reload cannot retune connections already being served.
 
-`[server] socket_mode` is the mode applied to the unix socket after bind,
-defaulting to `server::DEFAULT_SOCKET_MODE` (`0o660`). It is an **octal
-string**, as systemd writes it, because TOML has no octal literal and `660`
-as a decimal integer is `0o1224`.
+`[server] socket_mode` is the mode applied to the unix socket after bind, defaulting to `server::DEFAULT_SOCKET_MODE` (`0o660`).
+It is an **octal string**, as systemd writes it, because TOML has no octal literal and `660` as a decimal integer is `0o1224`.
 
-Neither key silently falls back. A value that cannot be understood, a negative
-timeout or a mode above `0777`, fails `config::load` and the service does not
-start. A service that will not start says so on the first line of its journal;
-a service running at a socket mode nobody chose looks exactly like one running
-at the right mode. An App service answers `--dump-config` too, so a deploy can
-validate its config before starting it. It exits 2 when the config is refused.
+Neither key silently falls back.
+A value that cannot be understood, a negative timeout or a mode above `0777` fails `config::load` and the service does not start.
+A service that will not start says so on the first line of its journal, and a service running at a socket mode nobody chose looks exactly like one running at the right mode.
+An App service answers `--dump-config` too, so a deploy can validate its config before starting it, and it exits 2 when the config is refused.
 
-### `server`
+### 4.3. `server`
 
 `UnixServer::bind(path)` claims a unix socket and unlinks it on `Drop`.
-`accept_one(handler)` takes one connection; `listener()` exposes the raw
-`UnixListener` for a service running its own `poll(2)` loop, which is what
-`m6-file` does.
+`accept_one(handler)` takes one connection, and `listener()` exposes the raw `UnixListener` for a service running its own `poll(2)` loop.
 
-`serve_connection(stream, handler)` is the loop itself. It hands the handler a
-`&RawRequest` and a `&mut h1::Responder` rather than the stream, so a handler
-cannot write an ill-framed response. `MAX_REQUESTS_PER_CONN` is 100.
+`serve_connection(stream, handler)` is the loop itself.
+It hands the handler a `RawRequest` and a `&mut h1::Responder`, so a handler writes through the response writer and cannot frame one itself.
+`MAX_REQUESTS_PER_CONN` is 100.
 
-`socket_path_from_config(config_path)` derives the socket path so that services
-and deploy scripts agree without a second convention.
+`socket_path_from_config(config_path)` derives the socket path so that services and deploy scripts agree without a second convention.
 
-### `signal`
+### 4.4. `signal`
 
-**`signal::block()` must be the first statement of every `main`, before
-logging.** This is not a style preference. Blocking a signal is per-thread and
-threads inherit the mask at creation; `tracing_appender::non_blocking` spawns a
-writer thread, so a `main` that initialises logging first has already created a
-thread with SIGTERM unblocked. The kernel delivers process-directed SIGTERM
-there, the default disposition kills the process, and the `sigwait` thread never
-receives a signal in its life. On origin this meant `m6-file` had not logged a
-shutdown line in thirty days, invisibly, because systemd counts death by the
-signal it sent as a clean stop.
+**`signal::block()` must be the first statement of every `main`, before logging.**
+Blocking a signal is per-thread and threads inherit the mask at creation, and `tracing_appender::non_blocking` spawns a writer thread, so a `main` that initialises logging first has already created a thread with SIGTERM unblocked.
+The kernel delivers process-directed SIGTERM there, the default disposition kills the process, and the `sigwait` thread never receives a signal in its life.
+A service that started that way could lose its shutdown line invisibly, because systemd counts death by the signal it sent as a clean stop.
 
-`ShutdownHandle::install(Service::new("name").socket(path).wake_fd(fd))` sets up
-the handler; it asserts the mask is set and refuses to start otherwise.
-`complete()`, `is_shutdown()` and `wait()` are the lifecycle; `is_shutdown()` is
-also re-exported from `app`.
+`ShutdownHandle::install(Service::new("name").socket(path).wake_fd(fd))` sets up the handler, and it asserts that the mask is set and refuses to start otherwise.
+`complete()`, `is_shutdown()` and `wait()` are the lifecycle, and `is_shutdown()` is also re-exported from `app`.
 
 `REOPEN_SIGNAL` is SIGUSR1.
 `block()` blocks it with SIGTERM and SIGINT, and the signal thread handles it before it counts a shutdown signal, so a reopen is never a step toward a forced exit.
 The thread calls `log::reopen_log_file()` and logs what happened.
-The reopen opens the new file while holding the lock the log writer takes for every line.
-So once the path exists again no further line can reach the renamed file.
+The reopen opens the new file while holding the lock the log writer takes for every line, so once the path exists again no further line can reach the renamed file.
 If the open fails, the old handle stays in place, the process keeps writing to the previous file and an error is logged.
 SIGHUP stays free for a future configuration reload.
 
-### `render` and `template`
+### 4.5. `render` and `template`
 
-`render` is the seam, and it is 89 lines. A route that names a template
-produces a `Response` carrying `template_name` and `template_dict`; a
-`Renderer` turns that into bytes; a `RendererFactory` builds one per worker.
-`NoTemplates` implements both and errors if anything asks it to render, which
-is how the three site renderers stopped linking Tera, comrak and pest in order
-to get a server loop.
+`render` is the seam, and it is 87 lines.
+A route that names a template produces a `Response` carrying `template_name` and `template_dict`, a `Renderer` turns that into bytes, and a `RendererFactory` builds one per reload, shared by every worker.
+`NoTemplates` implements both traits and errors if anything asks it to render, which is how the site renderers that render nothing stopped linking Tera, comrak and pest in order to get a server loop.
 
-`template` is the Tera implementation: `build_tera`, `build_tera_from_paths`,
-`TeraRenderer`, `TeraFactory`, and `NOT_FOUND_SENTINEL`, which is how a
-template signals a 404 from inside rendering.
+`template` is the Tera implementation: `build_tera`, `build_tera_from_paths`, `TeraRenderer`, `TeraFactory` and `NOT_FOUND_SENTINEL`, which is how a template signals a 404 from inside rendering.
 
-### `watcher`
+### 4.6. `watcher`
 
-`ConfigWatcher::new(paths)`, `raw_fd()` to fold into an existing `poll(2)` set,
-`read_events(filenames)` to drain and report whether anything relevant changed.
+`ConfigWatcher::new(paths)`, `raw_fd()` to fold into an existing `poll(2)` set, and `read_events(filenames)` to drain and report whether anything relevant changed.
 
-`ConfigReloader::new(site_toml, process, seen)` owns a `ConfigWatcher` on a
-service's two files and reports which of them changed. The loop calls
-`on_readable(now)` when `raw_fd()` is readable and `tick(now)` on every
-iteration. `tick` returns `Some(Changed { site, process })` when a report is
-due. Which file changed is decided by a `Fingerprint` (device, inode,
-length, mtime and ctime). The event name plays no part, so inotify and kqueue
-give the same answer and a file beside the config in the same directory is
-ignored. The first change after quiet is reported at once. A change within
-`RELOAD_DEBOUNCE` (20 ms) of a report is held and reported once more when the
-burst settles, capped at `RELOAD_POLL` (one second). A burst is at most two
-reports. The fingerprints are
-also compared every `RELOAD_POLL` whatever the watcher says, which finds a lost
-watch. Take a `Seen` from `Seen::read` before the first read of either file so a
-change in between is reported on the first tick. With no watcher the poll alone
-does the job. There is no thread and `tick` does not allocate.
+`ConfigReloader::new(site_toml, process, seen)` owns a `ConfigWatcher` on a service's two files and reports which of them changed.
+The loop calls `on_readable(now)` when `raw_fd()` is readable and `tick(now)` on every iteration, and `tick` returns `Some(Changed { site, process })` when a report is due.
+A `Fingerprint` of device, inode, length, mtime and ctime decides which file changed.
+On Linux an event that names a file forces a report even when the fingerprint is equal, which catches a same-length rewrite and two renames that reuse an inode.
+On kqueue the watcher reports the directory, so an unrelated write beside the config costs one spurious report and the fingerprints decide the result.
 
-Three implementations behind `cfg`: **inotify on Linux**, kqueue on
-macOS/FreeBSD/OpenBSD, and a stub elsewhere that never reports a change. The
-Linux path reads into a `#[repr(align(8))]` buffer because `inotify_event`
-contains a `c_int` and a bare `[u8; N]` has alignment 1; a stack array is
-almost always well aligned in practice, which is the kind of bug that works
-until it does not.
+The first change after quiet is reported at once.
+A change within `RELOAD_DEBOUNCE` (20 ms) of a report is held and reported once more when the burst settles, capped at `RELOAD_POLL` (one second), so a burst is at most two reports.
+The fingerprints are also compared every `RELOAD_POLL` whatever the watcher says, which finds a lost watch.
+Take a `Seen` from `Seen::read` before the first read of either file so a change in between is reported on the first tick.
+With no watcher the poll alone does the job, there is no thread, and `tick` does not allocate.
+
+Three implementations sit behind `cfg`: **inotify on Linux**, kqueue on macOS, FreeBSD and OpenBSD, and a stub elsewhere that never reports a change.
+The Linux path uses `nix::sys::inotify`, which copies each event header into an aligned `MaybeUninit`, so the unaligned read the old hand-written arm risked cannot happen.
+
+Those six modules are a service's own parts: the builder, its configuration, its socket, its signals, its renderer and its reload.
+Section 5 turns to the objects a handler receives and returns.
 
 ---
 
 ## 5. Request and response
 
-### `request`
+This section covers the objects a handler touches: the request, the response, the *HTTP* (Hypertext Transfer Protocol) types behind them, the header and cookie helpers, and the time range a query can ask for.
+It ends with the rules each helper enforces, and section 6 turns to the parsers those objects read from.
 
-`Request` is what a handler receives. `method()`, `path()`, `header(name)`,
-`content_type()`, `body_raw()`, `body_json()`.
+### 5.1. `request`
 
-`field(name)` reads a form or query field. `get(key)` and `Index<&str>` read the
-dictionary; `dict()` borrows the whole thing.
+`Request` is what a handler receives: `method()`, `path()`, `header(name)`, `content_type()`, `body_raw()` and `body_json()`.
 
-**File I/O is on `Request` on purpose**, scoped to the site directory:
-`site_path(rel)` resolves, `read_json`, `write_json`, `write_json_atomic`,
-`list_json`, `write_bytes`, `touch`. `write_json_atomic` is the one to reach
-for when a reader may be running.
+`field(name)` reads a form or query field.
+`get(key)` and `Index<&str>` read the dictionary, and `dict()` borrows the whole thing.
 
-`verify_csrf()` (feature `csrf`) and `file(name) -> Upload` (feature
-`multipart`).
+File I/O is on `Request` on purpose, scoped to the site directory: `site_path(rel)` resolves a path, and `read_json`, `write_json`, `write_json_atomic`, `list_json` and `touch` read and write there.
+`write_bytes` does the same and needs the `multipart` feature.
+The readers and writers refuse a `..` component, and `write_json_atomic` is the one to reach for when a reader may be running.
 
-Free functions, all used by the framework and all worth knowing: `parse_query_string`,
-`parse_form_body`, `url_decode`, `url_encode`, `url_encode_path`, `cookie`,
-`parse_cookies`, `parse_auth_claims`, `validate_path_param`, `single_query_value`.
+`verify_csrf()` (feature `csrf`) and `file(name) -> Upload` (feature `multipart`).
+
+Free functions, all used by the framework and all worth knowing: `parse_query_string`, `parse_form_body`, `url_decode`, `url_encode`, `url_encode_path`, `cookie`, `parse_cookies`, `parse_auth_claims`, `validate_path_param` and `single_query_value`.
 
 `single_query_value(query, key)` returns the raw value of a key that may appear once: `None` when absent, `RepeatedKey` when repeated.
 `time_range`, `ndjson::Cursor` and a service's own filter parameters all read through it, so one query string follows one rule.
 
-`url_encode` exists because core could percent-decode and not encode, so callers
-wrote their own encoder. Encoding and decoding are two halves of one block.
+The *URL* (Uniform Resource Locator) coders `url_encode` and `url_decode` exist because core could percent-decode and not encode, so callers wrote their own encoder.
+Encoding and decoding are two halves of one block.
 
-### `response`
+### 5.2. `response`
 
-Constructors: `render`, `render_with`, `render_status`, `render_dict`,
-`redirect`, `redirect_permanent`, `json`, `json_status`, `html`, `text`,
-`status`, `not_found`, `forbidden`, `bad_request`, `refusal`.
+Constructors: `render`, `render_with`, `render_status`, `render_dict`, `redirect`, `redirect_permanent`, `json`, `json_status`, `html`, `text`, `status`, `not_found`, `forbidden`, `bad_request` and `refusal`.
 
-`refusal(&message)` is the 400 for a refused request parameter: the message and a newline as plain text, `no-store` and `nosniff`.
+`refusal(&message)` is the 400 for a refused request parameter: the message and a newline as plain text, with `no-store` and `nosniff`.
 The message must not echo client input.
 
-Builders: `body`, `with_status`, `header`, `cookie`, `flash` (feature `flash`).
+Builders: `body`, `with_status`, `header`, `cookie` and `flash` (feature `flash`).
 
-`send(w, ...)` writes it. `error_to_response(&Error)` is the default mapping
-from an error to a response.
+`send(&mut h1::Responder)` writes it, and `error_to_response(&Error)` is the default mapping from an error to a response.
 
-### `http`
+### 5.3. `http`
 
-`RawRequest` is the parsed wire request: `method()`, `path()`, `query()`,
-`header()`, `content_type()`, `accept()`. `RawResponse::new(status)` with
-`.header()`, `.body()`, `.content_type()`, then `send` or `to_bytes`.
+`RawRequest` is the parsed wire request: `method()`, `path()`, `query()`, `header()`, `content_type()` and `accept()`.
+`RawResponse::new(status)` with `.header()`, `.body()`, `.content_type()`, then `send` or `to_bytes`.
 
 `Method` is a newtype over `&'static str` with the six constants.
 
-`HeaderSource` is the trait that lets header lookup work over both
-`[(String, String)]` and `Vec<(String, String)>`, and `header(headers, name)` is
-the case-insensitive first-match lookup.
+`HeaderSource` is the trait that lets header lookup work over both `[(String, String)]` and `Vec<(String, String)>`, and `header(headers, name)` is the case-insensitive first-match lookup.
 
-`is_same_origin_path(candidate)` is the redirect guard: it answers whether a
-path is safe to redirect to without leaving the origin.
+`is_same_origin_path(candidate)` is the redirect guard: it answers whether a path is safe to redirect to without leaving the origin.
 
-### `headers`
+### 5.4. `headers`
 
-Use this rather than `http::header` when the question is harder than
-first-match. Eight or more sites across the workspace wrote
-`.find(|(k, _)| k.eq_ignore_ascii_case(name))` inline, several of them inside
-core, and that idiom hides two real questions.
+Use this module when the question is harder than first-match.
+Eight or more sites across the workspace wrote `.find(|(k, _)| k.eq_ignore_ascii_case(name))` inline, several of them inside core, and that idiom hides two real questions.
 
-`get`, `get_all`, `contains`, `set`, `append`, `set_if_absent`, `remove`.
+`get`, `get_all`, `contains`, `set`, `append`, `set_if_absent` and `remove`.
 
-`combine(headers, name)` folds repeated field lines into one comma-separated
-value, and **refuses when the field must not be folded**. `NEVER_COMBINED` is
-the list and `set-cookie` is on it: RFC 6265 3 is explicit, cookie values may
-contain commas, so joining two `Set-Cookie` lines produces one malformed cookie
-and silently loses the other. `may_combine(name)` asks in advance.
+`combine(headers, name)` folds repeated field lines into one comma-separated value and **refuses when the field must not be folded**.
+`NEVER_COMBINED` is the list and `set-cookie` is on it: *RFC* (Request for Comments) 6265 3 is explicit that cookie values may contain commas, so joining two `Set-Cookie` lines produces one malformed cookie and silently loses the other.
+`may_combine(name)` asks in advance.
 
-### `cookie`
+### 5.5. `cookie`
 
-`Cookie::new(name, value)` then `.max_age()`, `.path()`, `.domain()`,
-`.secure()`, `.http_only()`, `.same_site(SameSite::...)`, then
-`to_header_value()` or `to_header()`. `Cookie::removal(name)` for expiry.
+`Cookie::new(name, value)` then `.max_age()`, `.path()`, `.domain()`, `.secure()`, `.http_only()`, `.same_site(SameSite::...)`, then `to_header_value()` or `to_header()`.
+`Cookie::removal(name)` builds an expiry.
 
-This does not decide policy. It makes "which of our cookies are HttpOnly?" a
-question with an answer, which it was not when four `format!` calls with
-different attribute sets were the implementation.
+This module builds and parses cookies.
+Before it, four `format!` calls with different attribute sets were the implementation, and none of them could answer "which of our cookies are HttpOnly?".
 
-### `time_range`
+### 5.6. `time_range`
 
-`TimeRange::from_query(query, max_span)` and `TimeRange::from_request(req,
-max_span)` read `from` and `to`. `DEFAULT_MAX_SPAN` is 31 days.
+`TimeRange::from_query(query, max_span)` and `TimeRange::from_request(req, max_span)` read `from` and `to`.
+`DEFAULT_MAX_SPAN` is 31 days.
 
-- Both keys are required and each may appear once. Other keys are ignored, so a
-  cursor or a filter passes through.
-- A value is RFC 3339 in UTC with an uppercase `T` and a final `Z`, such as
-  `2026-01-01T00:00:00Z`. Fractions of a second are accepted. An offset such as
-  `+10:00` is refused.
-- The range is half open, `[from, to)`. `contains(t)` is `from <= t < to`, so
-  two adjacent ranges never share a row.
-- `from` is not before 1970, `to` is later than `from`, and the span is at most
-  `max_span`.
-- `from_unix_ms`, `to_unix_ms`, `from_unix_s` and `to_unix_s` round up, so for
-  integer timestamps `from_ms <= t < to_ms` is exactly `[from, to)`.
+- Both keys are required and each may appear once.
+  Other keys are ignored, so a cursor or a filter passes through.
+- A value is *RFC* 3339 in *UTC* (Coordinated Universal Time) with an uppercase `T` and a final `Z`, such as `2026-01-01T00:00:00Z`.
+  Fractions of a second are accepted, and an offset such as `+10:00` is refused.
+- The range is half open, `[from, to)`.
+  `contains(t)` is `from <= t < to`, so two adjacent ranges never share a row.
+- `from` is not before 1970, `to` is later than `from`, and the span is at most `max_span`.
+- `from_unix_ms`, `to_unix_ms`, `from_unix_s` and `to_unix_s` round up, so for integer timestamps `from_ms <= t < to_ms` is exactly `[from, to)`.
 
-`TimeRangeError::to_response()` is a 400 in plain text with `no-store` and
-`nosniff`. It says which parameter to fix and never repeats the value the
-client sent.
+`TimeRangeError::to_response()` is a 400 in plain text with `no-store` and `nosniff`.
+It says which parameter to fix and never repeats the value the client sent.
 
-`rfc3339_utc_ms(unix_ms)` formats a millisecond timestamp as
-`2026-01-01T00:00:00.123Z`. It returns a value that formats when displayed, so a
-row can carry it without a `String` per line. A negative or out-of-range input
-gives the epoch.
+`rfc3339_utc_ms(unix_ms)` formats a millisecond timestamp as `2026-01-01T00:00:00.123Z`.
+It returns a value that formats when displayed, so a row can carry it without a `String` per line, and a negative or out-of-range input gives the epoch.
+
+Those six modules are the handler's whole surface: one request, one response, the wire types they are built from, and the three helpers for headers, cookies and time ranges.
+Section 6 turns to the parsers and the HTTP rules those objects implement.
 
 ---
 
 ## 6. HTTP semantics
 
-### `h1`
+### 6.1. `h1`
 
 `parse_request(buf) -> ParseResult` is the one HTTP/1.1 parser, and it is
 **pure**: it does not strip proxy-owned headers, because that is ingress policy
@@ -481,7 +450,7 @@ onto it is what caught that. All four targets now score 32/32 and
 the body on a HEAD, which the three hand-written writers it replaced did not
 reliably do, so every 404, 405, 400 and 412 answering a HEAD went out with one.
 
-### `parse`
+### 6.2. `parse`
 
 `parse_request(stream) -> Result<RawRequest, ParseError>`.
 
@@ -498,7 +467,7 @@ with nothing buffering.
 
 `ParseError::status()` and `.reason()` give the response for a parse failure.
 
-### `conditional`
+### 6.3. `conditional`
 
 `evaluate_preconditions(...) -> Precondition`, `is_not_modified(...)`,
 `not_modified_headers(cached)`.
@@ -510,7 +479,7 @@ went with cache state, because a hit was answered correctly by the good copy
 and only a miss reached the bad one. A defect that correlates with cache state
 reads as noise.
 
-### `negotiate`
+### 6.4. `negotiate`
 
 `coding_quality(accept_encoding, coding) -> Option<f32>`,
 `preferred_coding(accept_encoding, candidates)`,
@@ -522,7 +491,7 @@ client that explicitly refused it. `canonical_coding` is what makes a cache key
 out of a header, so that `gzip` and `gzip, deflate, br, zstd` stop being two
 entries for one byte-identical response.
 
-### `mime` and `path`
+### 6.5. `mime` and `path`
 
 `mime_from_path(path)`, `should_compress_default(mime)`.
 
@@ -530,7 +499,7 @@ entries for one byte-identical response.
 is a security boundary and it existed three times, with three behaviours. There
 is one now.
 
-### `net`
+### 6.6. `net`
 
 `is_private_ip(ip)` is the one answer to "is this on a private network".
 `bind_ip(bind)` pulls the address out of `ip:port`, `[v6]:port` or a bare
@@ -562,7 +531,7 @@ two lengths. Both were correct; the hazard is the third one, written by someone
 who reaches for `rand::random()` and produces something that looks identical at
 a glance.
 
-### `sqlite`
+### 7.1. `sqlite`
 
 Feature `sqlite`. Re-exports `rusqlite`. `open(path)` opens one database file
 with the settings in Table 7.1. `migrate(&mut conn, &[Migration])` applies a
@@ -606,7 +575,7 @@ must not be append-only.
 
 ## 8. Observability
 
-### `log`
+### 8.1. `log`
 
 `init(format, level)` and `init_with_analytics(format, level, analytics_path)`
 return a `LogHandle`, whose `reload(format, level)` re-reads on config change.
@@ -624,7 +593,7 @@ a silent log becomes a fault rather than a zero.
 `read_recent(live, max_bytes, since)` reads the live file and, when it adds history, the newest rotated sibling before it.
 `read_recent_counted` does the same and also returns what the read cost.
 
-### `telemetry`
+### 8.2. `telemetry`
 
 The write side had no struct: `m6-http` emits analytics with
 `tracing::info!(target: "analytics", ...)` and the JSON comes out of the
@@ -655,7 +624,7 @@ fault: the same rule once fired on 185 requests from the operator's own address
 and on a single 404 to `/.git/config`. A fault list only works if everything on
 it is a fault.
 
-### `monitoring`
+### 8.3. `monitoring`
 
 `/health` answers up or down and is constant-cost by construction. `/perf`
 answers counters and percentiles and is token-gated, **and not out of modesty
@@ -718,7 +687,7 @@ Table 2: the outcomes of a confirmed reverse lookup.
 At most `MAX_LOOKUP_THREADS` (8) lookup threads are alive at once, counting those abandoned at their deadline, and a lookup with no free slot reads `Failed` at once.
 `telemetry::verify_crawler(user_agent, &ptr)` turns a `Ptr` into a `CrawlerVerdict` using the operator's documented method.
 
-### `host`
+### 8.4. `host`
 
 Parsing is separated from reading. The `parse_*` functions are pure over the
 text these files contain and are tested on any platform; the readers are thin
@@ -756,7 +725,7 @@ Two readings are easy to get wrong and invisible when wrong:
 There is no threshold anywhere in this module. Core says what the number is; a
 monitoring service decides what 80% means.
 
-### `tls`
+### 8.5. `tls`
 
 **`not_after_unix(der) -> Result<i64, CertificateError>`** reads `notAfter` out
 of a DER certificate as seconds since the Unix epoch.
@@ -806,7 +775,7 @@ test runs every truncation of a real certificate through it. The dates go
 through `chrono`, because civil-from-days arithmetic is the mistake
 `util::iso_date_from` records.
 
-### `firewall`
+### 8.6. `firewall`
 
 `FirewallState::from_nft_json(text)`, `from_file(path)`,
 `blocked_addresses()`, `active()`, and `Block`.
@@ -821,7 +790,7 @@ It reports the deliberate blocks and whether they are still being hit. It does
 not report "180 packets from 10 sources", which never changed and never prompted
 an action.
 
-### `wireguard`
+### 8.7. `wireguard`
 
 `Handshakes::parse_latest_handshakes(text)`, `from_file(path)`, `find(key)`, and `PeerHandshake`.
 
@@ -836,7 +805,7 @@ The time is the last successful handshake.
 After a key changes under a tunnel it stops moving, and it still looks recent for minutes.
 An age is therefore the slow signal, and a probe over the tunnel is the fast one.
 
-### `ndjson`
+### 8.8. `ndjson`
 
 `read_str(text)`, `Reader::new(r)` with `skipped()` and `read_count()`,
 `write_one`, `write_all`, `to_string`.
