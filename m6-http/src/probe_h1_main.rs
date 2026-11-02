@@ -7,8 +7,8 @@
 //! and which also reports full and resumed separately.
 //!
 //! The split is here for the same reason as in m6-probe-h2, and this channel is
-//! the control for that one: the fleet reads 88-96% resumed on http/1.1 and 0%
-//! on http/2, so a probe that agrees with the server here and disagrees there
+//! the control for that one: a server can read high on resumed http/1.1
+//! handshakes and 0% on http/2, so a probe that agrees with the server here and disagrees there
 //! localises the disagreement. See m6 issue #101. `--no-resume` builds a fresh
 //! config per connection and measures full handshakes only.
 //!
@@ -87,7 +87,7 @@ fn main() {
     //
     // The second is the one that matters here. m6 1.9.0 installed a ticketer for
     // browser resumption and nothing in the suite could tell whether it worked;
-    // the fleet read 0% resumed for a day and that was indistinguishable from a
+    // the server read 0% resumed for a day and that was indistinguishable from a
     // broken ticketer until a client offered one deliberately. m6 issue #101.
     if probe::resumption_failed(no_resume, n_full, n_resumed) {
         std::process::exit(1);

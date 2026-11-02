@@ -308,9 +308,10 @@ fn bind(path: &str) -> std::io::Result<UnixListener> {
     // 2. Bind, and 4. listen. `UnixListener::bind` does both, with a backlog of
     //    128 on Linux and macOS, which satisfies the SHOULD of 64.
     let listener = UnixListener::bind(path)?;
-    // 3. chmod 0666. The proxy runs as a different user and cannot connect
-    //    otherwise. The spec calls this the single most common cause of a
-    //    backend that starts cleanly and is never contacted.
+    // 3. chmod 0666: a test convention. The example runs as its own user, so
+    //    this lets the proxy's user connect. Protocol §1.2 step 3 sets the rule, and
+    //    0666 in a 0755 directory lets any local user connect. A deployment uses
+    //    0660 with a trusted group.
     fs::set_permissions(path, fs::Permissions::from_mode(0o666))?;
     Ok(listener)
 }

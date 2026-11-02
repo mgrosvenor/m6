@@ -10,7 +10,7 @@ raw-socket harness the H2 plan's open items 4 (HEAD framing) and 9 (h1spec)
 want. Keep it.
 
 Usage:
-    # against the loopback conformance instance (see deploy HANDOVER.md 3)
+    # against the loopback conformance instance (see the conformance script)
     python3 rapidreset.py [attempts] [host] [h2c-port]
 
 Defaults: 200 attempts, 127.0.0.1:18080. Expected against a fixed server:

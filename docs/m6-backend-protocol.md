@@ -1,11 +1,11 @@
-# m6 Backend Protocol — Specification
+# m6 Backend Protocol: Specification
 
 **The contract between `m6-http` and a backend.** Language agnostic and
 normative. Anything that satisfies this document is a valid m6 backend,
 whatever it is written in.
 
 This is the primary interface of the platform. `m6-core` and `m6-render` are
-conveniences for writing Rust backends against it; neither is required, and
+conveniences for writing Rust backends against it. Neither is required, and
 neither may be used to justify a change that would make a non-Rust backend
 harder to write.
 
@@ -13,7 +13,7 @@ harder to write.
 in the RFC 2119 sense. "The proxy" means `m6-http`. "The backend" means the
 process implementing this specification.
 
-**Version:** 1. Additions will be backward compatible; anything else is a new
+**Version:** 1. Additions will be backward compatible. Anything else is a new
 version number.
 
 ---
@@ -40,7 +40,7 @@ have several members: `my-renderer-1.sock`, `my-renderer-2.sock` and so on,
 typically one per systemd instance.
 
 The proxy discovers sockets by scanning the glob and watching the directory. A
-socket appearing is added to the pool; a socket disappearing is removed. No
+socket appearing is added to the pool. A socket disappearing is removed. No
 restart or configuration reload is needed on either side.
 
 ### 1.2 Binding sequence
@@ -50,20 +50,36 @@ The backend MUST, in this order:
 1. **Remove any existing file at the path.** A stale socket from an unclean
    exit will otherwise cause `bind` to fail with `EADDRINUSE`.
 2. **Bind** the socket.
-3. **Set permissions to `0666`.** The proxy runs as a different user (`m6` in
-   the reference deployment) and cannot connect otherwise. This is the single
-   most common cause of a backend that starts cleanly and is never contacted.
+3. **Make the socket reachable by the proxy's user.** The proxy's user MUST be
+   able to connect to the socket. A group used to admit the proxy MUST contain
+   only users trusted as the proxy is trusted, because every user who can
+   connect can send the proxy-owned headers in §2.5. With `0666` and a `0755`
+   directory, any local user on the host can connect and bypass the edge. The
+   socket is not reachable from the network. The m6 `App` default is
+   `0660`, which lets the proxy connect when its user is in the socket's group.
+   A backend that runs as its own user SHOULD set `0666` only when the parent
+   directory limits traversal to the same trusted users. A backend that any
+   user outside that set can reach MUST NOT trust the §2.2 fields (§2.5). A
+   socket the proxy cannot connect to is the single most common cause of a
+   backend that starts cleanly and is never contacted.
 4. **Listen**, with a backlog SHOULD be at least 64.
 
-The backend SHOULD create the parent directory if it does not exist.
+The service manager normally creates the parent directory, for example systemd's
+`RuntimeDirectory=` with `RuntimeDirectoryMode=0750`, and the m6 `App` relies on
+that. A backend that creates the directory itself SHOULD use mode `0750` and the
+proxy's group, because the proxy lists the directory to find sockets.
 
 ### 1.3 Connection lifetime
 
-**One request per connection.** The proxy opens a connection, writes exactly
-one request, reads exactly one response, and closes.
+**The proxy closes after every response.** It opens a connection, writes
+exactly one request, reads exactly one response, and closes. Every request it
+forwards carries `Connection: close`.
 
-The backend MUST NOT expect connection reuse and MUST NOT keep the connection
-open after responding. Pipelining does not occur and MUST NOT be relied on.
+A backend MAY support persistent connections for clients that ask for them.
+The proxy sends `Connection: close`, and the backend MUST close the connection
+after responding to a request that carries it (RFC 9112 §9.6). The backend MUST
+also handle the proxy closing the connection after each response.
+Pipelining does not occur and MUST NOT be relied on.
 
 A backend MAY handle connections concurrently. See §7.
 
@@ -84,7 +100,7 @@ CRLF
 ```
 
 The version token is always `HTTP/1.1`, regardless of the version the client
-used. A request that arrived over HTTP/2 or HTTP/3 is translated; see §2.4.
+used. A request that arrived over HTTP/2 or HTTP/3 is translated. See §2.4.
 
 The request-target is in **origin-form**: an absolute path, optionally followed
 by `?` and a query string. It is **not** percent-decoded by the proxy. The
@@ -153,7 +169,7 @@ by any other path MUST NOT trust them.
 ### 2.6 Request body
 
 Present if and only if `Content-Length` is present and non-zero. The proxy does
-not use chunked transfer coding towards backends; `Transfer-Encoding` is never
+not use chunked transfer coding towards backends. `Transfer-Encoding` is never
 sent.
 
 The backend MUST read exactly `Content-Length` bytes. Reading beyond that will
@@ -175,7 +191,7 @@ CRLF
 [ message-body ]
 ```
 
-The status line MUST begin `HTTP/1.1`. The reason phrase MAY be empty; it is
+The status line MUST begin `HTTP/1.1`. The reason phrase MAY be empty. It is
 not interpreted.
 
 ### 3.2 Framing
@@ -197,10 +213,10 @@ it is what the reference examples do.
 The proxy **refuses** a response that:
 
 - carries both `Transfer-Encoding` and `Content-Length` (RFC 9112 §6.1 forbids
-  sending both);
-- carries two `Content-Length` fields with different values;
-- carries a `Content-Length` that is not a valid non-negative integer;
-- has a header section larger than **8192 bytes**;
+  sending both).
+- carries two `Content-Length` fields with different values.
+- carries a `Content-Length` that is not a valid non-negative integer.
+- has a header section larger than **8192 bytes**.
 - declares or delivers a body larger than **128 MiB**.
 
 A refused response is reported to the client as a backend error (§5).
@@ -229,7 +245,7 @@ The backend SHOULD send `Content-Type` on every response with a body, and MUST
 include a `charset` parameter on textual types.
 
 Omitting the charset is not cosmetic. Clients fall back to Latin-1 and render
-UTF-8 as mojibake; this has happened in production, to every Markdown file and
+UTF-8 as mojibake. This has happened in production, to every Markdown file and
 to `llms.txt`, with correct bytes and a missing label.
 
 ### 3.5 Caching
@@ -266,7 +282,7 @@ So:
   `Content-Encoding`, and it MUST honour `Accept-Encoding` correctly, including
   `q=0` meaning "not acceptable".
 - A backend that does not compress is serving one representation, and that is a
-  legitimate choice — a device backend has better uses for its cycles.
+  legitimate choice: a device backend has better uses for its cycles.
 - **Either way it MUST say which, in config**, so the proxy and the backend
   agree. See §3.6.1.
 
@@ -285,7 +301,7 @@ compresses = false          # default: true
 a backend that does not compress there is exactly one representation, so
 `Vary: Accept-Encoding` would promise variants that can never exist and every
 shared cache downstream would fragment its storage on a header that cannot
-change the body. A `Vary` the backend sent itself is left alone; this is about
+change the body. A `Vary` the backend sent itself is left alone. This is about
 what the proxy adds.
 
 **The backend** reads the same key and MUST refuse to start if it disagrees
@@ -296,7 +312,7 @@ directions are faults, and the second is the dangerous one:
 
 | declared | reality | what goes wrong |
 |---|---|---|
-| `true` | compresses nothing | the proxy advertises variants that never exist; downstream caches fragment for nothing |
+| `true` | compresses nothing | the proxy advertises variants that never exist, and downstream caches fragment for nothing |
 | `false` | compresses | the proxy stops varying on `Accept-Encoding`, so a compressed body can be cached and replayed to a client that asked for identity and cannot read it |
 
 **Default is `true`**, because every backend in the reference deployment is
@@ -330,7 +346,7 @@ to know which failures are survivable.
 
 | Condition | Proxy behaviour |
 |---|---|
-| Socket does not exist | Member not in the pool; another member is used, or `502` |
+| Socket does not exist | Member not in the pool. Another member is used, or `502` |
 | `connect` refused | `502`, member marked unhealthy |
 | No response within `backend_timeout_secs` (default **30**) | Connection dropped, `504` |
 | Malformed status line or headers | `502` |
@@ -360,9 +376,9 @@ controlled: the target, the query string, and every client-supplied header.
 A backend MUST:
 
 - reject or sanitise path traversal (`..`, encoded variants, absolute paths)
-  before using any request-derived value in a filesystem path;
+  before using any request-derived value in a filesystem path.
 - treat the request target as bytes until it has validated them, since it is
-  not percent-decoded by the proxy;
+  not percent-decoded by the proxy.
 - bound anything derived from the request that it allocates.
 
 ### 6.3 Header injection
@@ -443,15 +459,15 @@ the socket disappearing and reappearing is handled by the pool.
 Everything a backend MUST do, as a checklist:
 
 - [ ] Remove stale socket, bind a Unix `SOCK_STREAM` socket matching the glob
-- [ ] `chmod 0666`
-- [ ] Accept connections, one request each
+- [ ] Make the socket reachable by the proxy's user: `0660` with a trusted group, `0666` only behind a trusted directory
+- [ ] Accept connections and serve requests
 - [ ] Parse an HTTP/1.1 request line and header section
 - [ ] Read exactly `Content-Length` body bytes, if any
 - [ ] Emit an `HTTP/1.1` status line
 - [ ] Emit an accurate `Content-Length`
 - [ ] Emit `Content-Type` with a charset on text
 - [ ] Send no body for `HEAD`, `1xx`, `204`, `304`
-- [ ] Close the connection
+- [ ] Close the connection after responding to a request with `Connection: close`
 - [ ] On `SIGTERM`: drain, unlink the socket, exit `0`
 
 There is no requirement to implement TLS, HTTP/2, HTTP/3, chunked encoding,
