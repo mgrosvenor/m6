@@ -86,6 +86,11 @@ The examples unit-test step skips `blog_site_end_to_end`, which needs certificat
 **The m6-auth-cli integration tests assert that each setup command succeeds, and print its stderr when one does not (#258).**
 A failed setup command used to surface later as an unrelated count assertion.
 
+**m6-auth-server opens one database connection per worker, so login, refresh and logout no longer queue behind a single connection lock (#182).**
+A login held that lock while bcrypt verified the password. A worker opens its connection on first use, and a failed open answers 500 and is tried again on the next request.
+`m6_core::sqlite::OpenOptions::open` now retries the switch to WAL until the busy timeout passes, because SQLite answers busy for that pragma without honouring the timeout when several processes or threads open a new database at once. `m6_auth::Db::open` uses that opener, so it now refuses a read-only file and turns on `recursive_triggers`.
+`m6_auth::AuthError` gains `Open`, so a `match` over it needs a new arm.
+
 ### Verified
 
 - Unit tests with stub resolvers cover a confirmed name, a PTR whose forward lookup returns other addresses, a name with no forward answer, a failed forward lookup, no PTR, a name with no address (EAI_NONAME and EAI_NODATA), a slot free by the time the caller has the result, the per-poll lookup cap, expiry and cache bound, a report that reads stored results and resolves nothing, a resolver that never answers, and the thread bound (eight blocked lookups, then fifty more that return at once and start no thread, then slots free again).
