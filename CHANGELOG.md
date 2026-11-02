@@ -70,6 +70,8 @@ Documentation only. Each claim names the function or test that enforces it.
 
 **The m6-md reference follows the documentation ruleset, and its params snapshot and watch-mode first pass now match the binary (#150).**
 
+**`docs/m6-auth-lib.md` follows the documentation ruleset, and its storage description now matches the code (#139).**
+
 ### Verified
 
 - Unit tests with stub resolvers cover a confirmed name, a PTR whose forward lookup returns other addresses, a name with no forward answer, a failed forward lookup, no PTR, a name with no address (EAI_NONAME and EAI_NODATA), a slot free by the time the caller has the result, the per-poll lookup cap, expiry and cache bound, a report that reads stored results and resolves nothing, a resolver that never answers, and the thread bound (eight blocked lookups, then fifty more that return at once and start no thread, then slots free again).
