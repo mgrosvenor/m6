@@ -4,11 +4,6 @@
 `m6-auth-server` and `m6-auth-cli` link it, and a renderer can link it to create users itself.
 This document gives its public interface: the database it opens, the rows it returns, every operation, and the rules a caller keeps.
 
-Section 1 says what the crate is and which crates use it.
-Sections 2 to 7 give the database, the users, the groups, the tokens, the errors and the schema.
-Sections 8 and 9 show a renderer that links it and the rules for sharing one database.
-Section 10 collects the document.
-
 **Contents**
 
 1. [What the crate is](#1-what-the-crate-is)
@@ -40,29 +35,7 @@ Take from it that every caller reaches one database file through the same `Db::o
 **Table 1: the crates that link `m6-auth`, and what each one uses it for.**
 The first two are in this workspace, and the third is any renderer a site writes.
 
-`m6-auth` is one member of the m6 workspace.
-The root `Cargo.toml` lists every member, and `m6-auth-server` and `m6-auth-cli` are two of them.
-The crate's own `Cargo.toml` inherits the version, edition, minimum Rust version, licence and repository from `[workspace.package]` in the root manifest.
-
-The crate has one submodule, `jwt`, beside the root interface.
-Table 2 gives its dependencies and what each one is for.
-
-| dependency | version | what it is for |
-|---|---|---|
-| `rusqlite` | 0.31, `bundled` | the SQLite driver, with SQLite compiled into the binary |
-| `bcrypt` | 0.15 | hashing and checking passwords |
-| `serde` | 1, `derive` | the `Serialize` and `Deserialize` derives on the row types |
-| `serde_json` | 1 | the roles column and the row types |
-| `uuid` | 1, `v4` | the identifiers for users, groups and API tokens |
-| `thiserror` | 1 | the `AuthError` type |
-| `jsonwebtoken` | 9 | encoding and verifying JWTs |
-| `sha2` | 0.10 | the SHA-256 digest behind `hash_token` |
-| `hex` | 0.4 | the hexadecimal form of that digest |
-| `anyhow` | 1 | the error type the JWT engine returns |
-| `tempfile` | 3, `dev-dependencies` | temporary databases in the unit tests |
-
-**Table 2: the crate's dependencies and what each one is for.**
-`rusqlite` and `bcrypt` carry the storage and password work, and the other eight runtime dependencies support the row types and the token engine.
+SQLite is bundled through `rusqlite`, passwords are hashed with `bcrypt`, and the full dependency list is in `m6-auth/Cargo.toml`.
 
 A caller adds `m6-auth` and gets the row types, the error type and the JWT engine through it.
 Section 2 opens the database those types describe.
@@ -80,7 +53,7 @@ pub fn close(self) -> std::result::Result<(), Box<(Connection, rusqlite::Error)>
 `Db` is a newtype over one `rusqlite::Connection`, and `open` creates the file when it is absent.
 The parent directory has to exist, because SQLite creates the file and leaves the directory to the caller.
 `open` sets three pragmas, applies the schema from section 7, and returns the handle.
-Table 3 gives the pragmas.
+Table 2 gives the pragmas.
 Take from it that the journal mode and the busy timeout make concurrent access work, and the foreign-key setting is what makes a delete cascade.
 
 | pragma | value | why it is set |
@@ -89,7 +62,7 @@ Take from it that the journal mode and the busy timeout make concurrent access w
 | `busy_timeout` | `5000` | a statement waits 5 s for a lock before it returns `SQLITE_BUSY` |
 | `foreign_keys` | `ON` | SQLite starts every connection with the cascade off, and section 7 relies on it |
 
-**Table 3: the three pragmas `Db::open` sets, and why each one matters.**
+**Table 2: the three pragmas `Db::open` sets, and why each one matters.**
 The busy timeout is in milliseconds, so 5000 is 5 s.
 
 `Db::open` runs `CREATE TABLE IF NOT EXISTS` for each table in the schema.
@@ -125,7 +98,7 @@ The fields map to the `users` row, and `groups` is the one field that comes from
 `roles` is the user's role list, stored in the row as a *JSON* (JavaScript Object Notation) array.
 `groups` is filled on every read, because each read joins `memberships`, and `user_create` returns an empty list because the new user is in no group.
 
-Table 4 gives the eight user operations.
+Table 3 gives the eight user operations.
 Take from it that the three reads return `None` for an absent name, and the writes return `UserNotFound` or `UserExists`.
 
 | method | signature | what it does |
@@ -134,12 +107,12 @@ Take from it that the three reads return `None` for an absent name, and the writ
 | `user_get` | `(&self, username: &str) -> Result<Option<User>>` | reads one user by name, with groups |
 | `user_get_by_id` | `(&self, id: &str) -> Result<Option<User>>` | reads one user by id, with groups |
 | `user_list` | `(&self) -> Result<Vec<User>>` | reads every user, ordered by username |
-| `user_delete` | `(&self, username: &str) -> Result<()>` | deletes the row and returns `UserNotFound` when no row matched, and the foreign keys delete its memberships, refresh tokens and API tokens |
+| `user_delete` | `(&self, username: &str) -> Result<()>` | deletes the row and returns `UserNotFound` when no row matched, and the foreign keys delete its memberships, refresh-token rows and API-token rows, but not the tokens already issued, which stay valid until `exp` (see section 5.2) |
 | `user_set_password` | `(&self, username: &str, password: &str) -> Result<()>` | replaces the hash with a new one at cost 12 |
 | `user_set_roles` | `(&self, username: &str, roles: &[&str]) -> Result<()>` | replaces the whole role list, and an empty slice clears every role |
-| `user_verify_password` | `(&self, username: &str, password: &str) -> Result<Option<User>>` | returns the user on a matching password, and `None` for a wrong password or an unknown user without saying which |
+| `user_verify_password` | `(&self, username: &str, password: &str) -> Result<Option<User>>` | returns the user on a matching password, and `None` for a wrong password or an unknown user, and an unknown user returns without running bcrypt, so response time reveals whether a username exists |
 
-**Table 4: the eight user operations, their signatures and what each one does.**
+**Table 3: the eight user operations, their signatures and what each one does.**
 `user_verify_password` is the login primitive, and `m6-auth-server` calls it on `POST /auth/login`.
 
 The membership rows behind `groups` have their own operations, and section 4 gives them.
@@ -161,7 +134,7 @@ The fields map to the `groups` row, and `members` comes from a join.
 `id` is a v4 UUID string that `group_create` generates.
 `members` holds usernames, is filled on every read, and is empty for a new group.
 
-Table 5 gives the eight group operations.
+Table 4 gives the eight group operations.
 Take from it that a read returns `None` for an absent name, and a membership call names a missing group or user with `GroupNotFound` or `UserNotFound`.
 
 | method | signature | what it does |
@@ -175,7 +148,7 @@ Take from it that a read returns `None` for an absent name, and a membership cal
 | `group_members` | `(&self, group: &str) -> Result<Vec<User>>` | returns the members as users, ordered by username |
 | `user_groups` | `(&self, username: &str) -> Result<Vec<String>>` | returns the names of the groups a user belongs to |
 
-**Table 5: the eight group operations, their signatures and what each one does.**
+**Table 4: the eight group operations, their signatures and what each one does.**
 `group_members` returns `User` rows, so each member carries its roles and its own group list.
 
 Tokens are the other rows with operations, and section 5 gives both kinds.
@@ -191,7 +164,7 @@ Section 5.1 gives refresh tokens, section 5.2 API tokens, and section 5.3 the en
 **A refresh token is a long-lived JWT whose row lets the server revoke it.**
 
 `m6-auth-server` stores the hash when a login succeeds, verifies it on refresh, and revokes it on logout.
-Table 6 gives the four operations.
+Table 5 gives the four operations.
 Take from it that verification answers with the user id, and an expired row answers `None`.
 
 | method | signature | what it does |
@@ -201,7 +174,7 @@ Take from it that verification answers with the user id, and an expired row answ
 | `refresh_token_revoke` | `(&self, token_hash: &str) -> Result<()>` | deletes the row, and an absent hash is not an error |
 | `refresh_tokens_revoke_all` | `(&self, user_id: &str) -> Result<()>` | deletes every refresh-token row for one user |
 
-**Table 6: the four refresh-token operations, their signatures and what each one does.**
+**Table 5: the four refresh-token operations, their signatures and what each one does.**
 The hash is the key, so the table never holds a usable token.
 
 `refresh_token_verify` compares `expires_at` with the current Unix time and leaves an expired row in place.
@@ -209,7 +182,7 @@ The hash is the key, so the table never holds a usable token.
 
 ### 5.2. API tokens
 
-**An API token is a long-lived JWT that a CLI creates for a user, names, and lists or revokes later.**
+**An API token is a long-lived JWT that a CLI creates for a user, names, and lists later, and whose record the CLI can delete.**
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -228,22 +201,28 @@ The fields map to the `api_tokens` row.
 `username` is the name the caller passed, and the row stores `user_id`.
 `token_hash` is not part of the type, so a listing never returns it.
 
-Table 7 gives the three operations.
+Table 6 gives the three operations.
 Take from it that create and list work by user, and revoke works by token id.
 
 | method | signature | what it does |
 |---|---|---|
 | `api_token_create` | `(&self, user_id: &str, username: &str, name: &str, token_hash: &str, expires_at: i64) -> Result<ApiToken>` | inserts the row and returns the new token record |
 | `api_token_list` | `(&self, username: &str) -> Result<Vec<ApiToken>>` | returns a user's tokens, newest first, and `UserNotFound` for an unknown name |
-| `api_token_revoke` | `(&self, token_id: &str) -> Result<()>` | deletes the row and returns `ApiTokenNotFound` when the id is absent |
+| `api_token_revoke` | `(&self, token_id: &str) -> Result<()>` | deletes the row and returns `ApiTokenNotFound` when the id is absent, and the token stays valid until `exp` |
 
-**Table 7: the three API-token operations, their signatures and what each one does.**
+**Table 6: the three API-token operations, their signatures and what each one does.**
 `m6-auth-cli` mints the token with the JWT engine, stores its hash through `api_token_create`, and prints the token once.
+
+**Revoking an API token does not make it stop working.**
+A request is authorised by the JWT signature and `exp` alone, and nothing reads `api_tokens` to authorise it, so a revoked token, or one whose user `user_delete` removed, stays valid until its `exp`.
+`m6-auth-cli token create` sets `exp` 365 days ahead unless `--ttl-days` says otherwise, so a short TTL is the only way to bound a token that leaks.
+The same holds for an access token after logout or `user_delete`, because logout revokes refresh tokens only.
+Only a refresh token is checked against the database, through `refresh_token_verify`, so revoking it takes effect at once.
 
 ### 5.3. The JWT engine
 
 **`m6_auth::jwt` is the one part of the crate that knows about JWTs, the server mints and verifies tokens with it, and the CLI mints them.**
-Table 8 gives its public items.
+Table 7 gives its public items.
 Take from it that the engine picks its algorithm from the key it is given, and the hash function is what the two token tables store.
 
 | item | what it is |
@@ -257,7 +236,7 @@ Take from it that the engine picks its algorithm from the key it is given, and t
 | `now_secs()` | the current Unix time in seconds |
 | `KeyAlgo` | `Rs256` or `Es256`, the algorithm the engine detected |
 
-**Table 8: the public items in `m6_auth::jwt`, and what each one is.**
+**Table 7: the public items in `m6_auth::jwt`, and what each one is.**
 The claims types are the JSON bodies of the tokens, and `hash_token` is what keeps a token out of the database.
 
 `JwtEngine::new` tries the EC parser first and the RSA parser second, and an error names the parser that failed.
@@ -297,7 +276,7 @@ pub enum AuthError {
 }
 ```
 
-Table 9 gives the seven variants and the calls that return each.
+Table 8 gives the seven variants and the calls that return each.
 Take from it that five variants name a row, and the other two wrap a failure from a dependency.
 
 | variant | meaning | returned by |
@@ -310,7 +289,7 @@ Take from it that five variants name a row, and the other two wrap a failure fro
 | `Db` | SQLite returned an error | any call that reads or writes |
 | `Bcrypt` | the password hash or check failed | `user_create`, `user_set_password`, `user_verify_password` |
 
-**Table 9: the seven `AuthError` variants, what each one means and which calls return it.**
+**Table 8: the seven `AuthError` variants, what each one means and which calls return it.**
 The first five are answers about a row, and the last two carry a dependency's own error through `#[from]`.
 
 `AuthError` implements `std::error::Error` through `thiserror`, so a caller converts it with one `map_err`, as section 8 does.
@@ -358,7 +337,7 @@ CREATE TABLE IF NOT EXISTS api_tokens (
 );
 ```
 
-Table 10 gives what each table holds and what deletes its rows.
+Table 9 gives what each table holds and what deletes its rows.
 Take from it that every foreign key cascades from a user or a group, so a deleted row leaves no orphan.
 
 | table | holds | rows removed by |
@@ -369,13 +348,11 @@ Take from it that every foreign key cascades from a user or a group, so a delete
 | `refresh_tokens` | one row per refresh token, keyed by its hash | `user_delete`, or a revoke call |
 | `api_tokens` | one row per API token, keyed by its id, with a unique hash | `user_delete`, or `api_token_revoke` |
 
-**Table 10: the five tables, what each one holds and what removes its rows.**
-The cascade runs because `Db::open` sets `foreign_keys` to `ON`, and a connection that leaves it off gets no cascade.
+**Table 9: the five tables, what each one holds and what removes its rows.**
+The cascade depends on the `foreign_keys` pragma in Table 2.
 
 `users.password` holds a bcrypt hash at cost 12, and `users.roles` holds a JSON array of strings.
 The two `token_hash` columns hold the lowercase hex SHA-256 that `hash_token` returns, and `api_tokens.token_hash` has a UNIQUE constraint so one token cannot be stored twice.
-
-The schema has no version table and no migration list, so the warning in section 2 about an existing file applies here.
 
 Section 8 puts these tables and the operations together in a renderer.
 
@@ -466,16 +443,7 @@ The processes above share one file, and section 9 gives the rules that keep that
 ## 9. Concurrent access
 
 **One database file serves every process that links this crate, and `Db::open` sets the pragmas that make that safe.**
-`Db::open` sets `journal_mode=WAL`, the write-ahead log, which lets readers and one writer proceed together.
-A second writer waits up to the 5 s busy timeout, and a statement that still cannot take the lock returns a `Db` error.
-
-`Db::open` also sets `foreign_keys=ON`, and that setting is per connection.
-Every process that opens the file through `Db::open` gets the cascade, and a raw `rusqlite::Connection` that leaves the pragma off gets none.
-A caller that opens the file another way has to set the pragma itself.
-
-`Db` is `Send` and not `Sync`, because `rusqlite::Connection` is the same.
-`App::with_thread_state` gives each worker its own `Db`, and `App::with_global` needs a `Mutex<Db>` to share one.
-Section 8 shows the per-worker form, and `m6-auth-server` uses the mutex form.
+Table 2 gives the pragmas, and section 8 gives how a worker holds its handle.
 
 The crate keeps no copy of user data in memory.
 Every call reads or writes SQLite, so a user created by `m6-auth-cli` or a renderer is visible to the server's next query.
@@ -487,10 +455,10 @@ Section 10 collects the document and points at the documents that own what this 
 
 **A caller of `m6-auth` opens one database, asks for the row it needs through `Db`, and converts an `AuthError` into its own error type.**
 The schema is the crate's contract, and `Db::open` applies it without a migration step.
-One file serves every process, and the WAL journal, the 5 s busy timeout and the foreign-key setting are what make that work.
+One file serves every process, under the pragmas in Table 2.
 Every write is visible to the next query, so a renderer and the auth service agree on a user as soon as it is created.
 
-Table 11 gives the documents that own what this one leaves out.
+Table 10 gives the documents that own what this one leaves out.
 Take from it that the server and the CLI have their own references, and the lifecycle a renderer follows is in the anatomy document.
 
 | document | what it owns |
@@ -500,7 +468,7 @@ Take from it that the server and the CLI have their own references, and the life
 | `m6-app-anatomy.md` | the app lifecycle, the state tiers and how a renderer links core from another repository |
 | `../README.md` | where this document sits in the documentation table |
 
-**Table 11: further reading, and what each document owns.**
+**Table 10: further reading, and what each document owns.**
 The first two are the references for the two crates in Table 1, and the third is the shape a renderer follows.
 
 The schema in section 7 is the place to check before writing a row of your own.
