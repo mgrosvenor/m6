@@ -343,12 +343,16 @@ recorded here rather than resolved by whichever file was edited last.
 
 ### 10.1 Socket mode
 
-The examples use `0666` so each can run as its own user. The `rust-m6core`
-example sets `socket_mode = "0666"` in its own config to match them, so the
-shared test can assert one value. Core keeps its `0660` default.
+The `0666` socket and `0755` directory in the examples are a test convention.
+Each example runs as its own user, and `0666` lets the proxy's user connect
+without a shared group. Under that pair any local user can connect, so a
+deployment does not copy it. `m6-backend-protocol.md` §1.2 step 3 sets the
+rule: `0660` with a trusted group, or `0666` only behind a directory that
+admits the same trusted users.
 
-**Resolved in `m6-backend-protocol.md` §1.2 step 3.** The protocol states the
-requirement and the conditions on `0660` and `0666`.
+The `rust-m6core` example sets `socket_mode = "0666"` in its own config to
+match the others, so the shared test can assert one value. Core keeps its
+`0660` default.
 
 ### 10.2 A bare 404 has no body
 

@@ -340,9 +340,10 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // 3. chmod 0666. The proxy runs as a different user and cannot connect
-    //    otherwise. The spec calls this the single most common cause of a
-    //    backend that starts cleanly and is never contacted.
+    // 3. chmod 0666: a test convention. The example runs as its own user, so
+    //    this lets the proxy's user connect. Protocol §1.2 step 3 sets the rule, and
+    //    0666 in a 0755 directory lets any local user connect. A deployment uses
+    //    0660 with a trusted group.
     if (::chmod(g_sock_path, 0666) < 0) {
         std::fprintf(stderr, "chmod %s: %s\n", g_sock_path, std::strerror(errno));
         return 1;
