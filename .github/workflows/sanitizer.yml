@@ -3,9 +3,9 @@ name: Sanitisers
 # The address and leak sanitisers, in a workflow of their own so the required
 # checks in ci.yml are untouched until this job is promoted to one.
 #
-# It runs on pushes to develop, and by hand once the file is on main. A pull request does not trigger it
-# yet, because a finding in code that predates a pull request would block a
-# merge that did not cause it.
+# It runs on pushes to `develop` and on pull requests to it. The job is not a
+# required check, so a finding in code that predates a pull request does not
+# block a merge that did not cause it.
 #
 # The triage rule is beside `continue-on-error` below.
 #
@@ -25,8 +25,8 @@ on:
     branches: [develop]
   push:
     branches: [develop]
-  # By hand, once this file is on main. GitHub only offers a manual run for a
-  # workflow file on the default branch.
+  # For a re-run or a branch. GitHub offers it only once this file is on the
+  # default branch, `main`.
   workflow_dispatch:
 
 env:
@@ -82,7 +82,11 @@ jobs:
           fi
           echo "the sanitiser runtime linked and loaded"
 
-      # The command from issue #164, with the serial flag the tests need.
+      # The command from issue #164, with the serial flag the tests need. Four
+      # off-by-default m6-core features (`multipart`, `email`, `flash`, `csrf`)
+      # are not enabled by any workspace member, so this build does not compile
+      # or instrument that code. `ci.yml` covers it with `-p m6-core
+      # --all-features`, without the sanitiser.
       - name: Tests under the address and leak sanitisers
         env:
           # Rustdoc compiles each doctest as a separate crate and links the
