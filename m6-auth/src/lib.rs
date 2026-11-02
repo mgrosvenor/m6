@@ -115,7 +115,8 @@ impl Db {
     /// second busy timeout and foreign keys on. Every connection to one file
     /// uses WAL, so the journal mode is set there and nowhere else. Workers
     /// that open one new database at the same time are covered by the retry
-    /// of the WAL switch in that opener.
+    /// of the WAL switch in that opener. The opener refuses a read-only file
+    /// with `AuthError::Open` and turns on `recursive_triggers`.
     pub fn open(path: &Path) -> Result<Self> {
         let conn = m6_core::sqlite::OpenOptions::default()
             .journal(m6_core::sqlite::Journal::Wal)

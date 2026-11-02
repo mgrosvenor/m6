@@ -57,7 +57,9 @@ Googlebot verifies only under `googlebot.com` and `google.com`. A name under `go
 ### Changed
 
 **m6-auth-server opens one database connection per worker, so login, refresh and logout no longer queue behind a single connection lock (#182).**
-A login held that lock while bcrypt verified the password. `m6_auth::Db::open` now sets the busy timeout before switching to WAL and retries the switch for up to 5 seconds, because SQLite answers busy for that pragma without honouring the timeout when several workers open a new database at once.
+A login held that lock while bcrypt verified the password. A worker opens its connection on first use, and a failed open answers 500 and is tried again on the next request.
+`m6_core::sqlite::OpenOptions::open` now retries the switch to WAL until the busy timeout passes, because SQLite answers busy for that pragma without honouring the timeout when several processes or threads open a new database at once. `m6_auth::Db::open` uses that opener, so it now refuses a read-only file and turns on `recursive_triggers`.
+`m6_auth::AuthError` gains `Open`, so a `match` over it needs a new arm.
 
 ### Verified
 
