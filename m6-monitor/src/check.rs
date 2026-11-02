@@ -1153,8 +1153,8 @@ mod tests {
 
     /// THE REGRESSION THIS CLOSES, and it is the whole reason the table exists.
     ///
-    /// These three user agents and these three PTR names are what real traffic
-    /// produced. Every one of them advertises a documentation domain that is
+    /// These three user agents and PTR names follow the shape each operator
+    /// publishes. Every one of them advertises a documentation domain that is
     /// NOT where its operator publishes PTR records, so comparing the lookup
     /// against the agent's own URL marks all three as forgeries. A verifier
     /// that accuses the genuine ones gets ignored, and then so does a true
@@ -1167,17 +1167,17 @@ mod tests {
         let cases = [
             (
                 "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; Amazonbot/0.1; +https://developer.amazon.com/support/amazonbot) Chrome/119.0",
-                "18-211-148-239.crawl.amazonbot.amazon",
+                "192-0-2-1.crawl.amazonbot.amazon",
                 "Amazonbot",
             ),
             (
                 "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm) Chrome/116.0",
-                "msnbot-52-167-144-179.search.msn.com",
+                "msnbot-192-0-2-2.search.msn.com",
                 "bingbot",
             ),
             (
                 "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
-                "crawl-66-249-66-1.googlebot.com",
+                "crawl-192-0-2-3.googlebot.com",
                 "Googlebot",
             ),
         ];
@@ -1194,8 +1194,7 @@ mod tests {
     }
 
     /// An operator that publishes address ranges instead of PTR records cannot
-    /// be settled this way, and that is a third answer. Both of today's
-    /// unverified sightings are this case, not a forgery and not a pass.
+    /// be settled this way, and that is a third answer: not a forgery and not a pass.
     #[test]
     fn an_operator_publishing_ranges_is_reported_as_uncheckable_not_forged() {
         use m6_core::resolve::Ptr;
@@ -1246,7 +1245,7 @@ mod tests {
         let mut cache = std::collections::HashMap::new();
         cache.insert(
             "192.0.2.9".to_string(),
-            Ptr::Unconfirmed("crawl-66-249-66-1.googlebot.com".into()),
+            Ptr::Unconfirmed("crawl-192-0-2-3.googlebot.com".into()),
         );
         let out = verdict_lines(
             &crawler(

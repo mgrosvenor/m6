@@ -336,7 +336,7 @@ pub fn claims_to_be_bot(user_agent: &str) -> bool {
 // is a defect this code was written with and corrected before release.**
 //
 // The first version of this took the domain out of the agent's own URL and
-// compared the reverse lookup against it. Checked against real traffic that
+// compared the reverse lookup against it. That
 // marked three genuine crawlers as forgeries:
 //
 //     agent says                     actually resolves to
@@ -1469,8 +1469,8 @@ mod tests {
     /// THE TRAP, pinned so it cannot be walked into twice.
     ///
     /// A crawler's documentation URL is not where its operator publishes PTR
-    /// records. This asserts the gap directly, for real agent strings and the
-    /// PTR names real traffic produced, so any future attempt to verify by
+    /// records. This asserts the gap directly, for the user agent strings these
+    /// operators publish and the PTR names they use, so any future attempt to verify by
     /// comparing the two fails here with the reason attached.
     #[test]
     fn a_documentation_url_is_not_a_ptr_domain() {
@@ -1478,15 +1478,15 @@ mod tests {
         let cases = [
             (
                 "Mozilla/5.0 (compatible; Amazonbot/0.1; +https://developer.amazon.com/support/amazonbot)",
-                "18-211-148-239.crawl.amazonbot.amazon",
+                "192-0-2-1.crawl.amazonbot.amazon",
             ),
             (
                 "Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)",
-                "msnbot-52-167-144-179.search.msn.com",
+                "msnbot-192-0-2-2.search.msn.com",
             ),
             (
                 "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
-                "crawl-66-249-66-1.googlebot.com",
+                "crawl-192-0-2-3.googlebot.com",
             ),
         ];
         for (ua, ptr_name) in cases {
@@ -1547,7 +1547,7 @@ mod tests {
     #[test]
     fn an_unconfirmed_ptr_is_a_forward_mismatch_not_a_pass() {
         use crate::resolve::Ptr;
-        let ptr = Ptr::Unconfirmed("crawl-66-249-66-1.googlebot.com".into());
+        let ptr = Ptr::Unconfirmed("crawl-192-0-2-3.googlebot.com".into());
         let g = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
         assert!(matches!(
             verify_crawler(g, &ptr),
