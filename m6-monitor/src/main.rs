@@ -219,8 +219,8 @@ fn note_restart_only(state: &MonitorState, ctx: &AppContext) -> Result<()> {
 /// Poll the fleet, print the check, exit 1 on faults.
 fn run_check(config_path: &std::path::Path) -> anyhow::Result<()> {
     let (d, readings) = collect_from(config_path, None)?;
-    // One run, one cache: the lookups are capped like a poll's.
-    let verdicts = check::VerdictCache::new().refresh(
+    // One run, one cache, with the wider one-shot cap.
+    let verdicts = check::VerdictCache::with_cap(check::MAX_LOOKUPS_PER_CHECK).refresh(
         &readings,
         std::time::Instant::now(),
         &m6_core::resolve::reverse_confirmed_default,

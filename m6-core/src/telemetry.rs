@@ -385,16 +385,14 @@ pub struct KnownCrawler {
 /// Longest markers first where one contains another, so `claude-searchbot`
 /// cannot be swallowed by a shorter `claudebot`.
 pub const KNOWN_CRAWLERS: &[KnownCrawler] = &[
-    // Google documents reverse-then-forward DNS resolving under googlebot.com,
-    // google.com or googleusercontent.com.
+    // Google documents reverse-then-forward DNS resolving under googlebot.com
+    // or google.com for Googlebot. googleusercontent.com is not accepted: every
+    // cloud customer's virtual machine gets a reverse name under it that also
+    // resolves forward, so it would verify anyone who rents one.
     KnownCrawler {
         name: "Googlebot",
         marker: "googlebot",
-        verification: CrawlerVerification::Ptr(&[
-            "googlebot.com",
-            "google.com",
-            "googleusercontent.com",
-        ]),
+        verification: CrawlerVerification::Ptr(&["googlebot.com", "google.com"]),
     },
     KnownCrawler {
         name: "Google-InspectionTool",
@@ -1531,6 +1529,23 @@ mod tests {
     /// A PTR name that does not resolve back to the address is a false claim
     /// for a PTR-documented operator, and is never a pass. Ranges operators
     /// stay uncheckable.
+    #[test]
+    fn a_cloud_customer_name_does_not_verify_googlebot() {
+        use crate::resolve::Ptr;
+        // A rented virtual machine's reverse name, which resolves forward.
+        let ptr = Ptr::Name("7.2.0.192.bc.googleusercontent.com".into());
+        let g = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
+        assert!(!matches!(
+            verify_crawler(g, &ptr),
+            CrawlerVerdict::Verified { .. }
+        ));
+        let real = Ptr::Name("crawl-192-0-2-7.googlebot.com".into());
+        assert!(matches!(
+            verify_crawler(g, &real),
+            CrawlerVerdict::Verified { .. }
+        ));
+    }
+
     #[test]
     fn an_unconfirmed_ptr_is_a_forward_mismatch_not_a_pass() {
         use crate::resolve::Ptr;

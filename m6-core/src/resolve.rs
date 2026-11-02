@@ -246,7 +246,11 @@ fn confirm(ip: IpAddr, timeout: Duration, lookup: Arc<dyn Lookup>, slots: &Arc<S
     let started = Instant::now();
     let rev = Arc::clone(&lookup);
     let name = match bounded(slots, timeout, move || rev.reverse(ip)) {
-        Some(Ptr::Name(n)) => n,
+        Some(Ptr::Name(n)) if is_host_name(&n) => n,
+        // A reverse zone is written by whoever holds the address. A name with
+        // characters no host name has is not looked up forward or reported,
+        // so it cannot forge or hide report lines on any platform.
+        Some(Ptr::Name(_)) => return Ptr::Failed,
         Some(other) => return other,
         None => return Ptr::Failed,
     };
@@ -263,6 +267,16 @@ fn confirm(ip: IpAddr, timeout: Duration, lookup: Arc<dyn Lookup>, slots: &Arc<S
         }
         Some(Forward::Failed) | None => Ptr::Failed,
     }
+}
+
+/// Letters, digits, `-`, `_` and `.`, at most 253 characters: the shape of a
+/// host name as a resolver returns it, with or without the trailing dot.
+fn is_host_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 254
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
 /// [`reverse_confirmed`] with the default deadline.
@@ -592,6 +606,27 @@ mod tests {
             ]),
         );
         assert_eq!(run("192.0.2.7", l), Ptr::Name("crawl.example.com".into()));
+    }
+
+    #[test]
+    fn a_ptr_that_is_not_a_host_name_is_not_used() {
+        // The forward answer would confirm it, so only the name check stops it.
+        for bad in [
+            "crawl.example.com\nVERIFIED",
+            "crawl example.com",
+            "\u{1b}[2Jx.example.com",
+            "",
+        ] {
+            let l = stub(
+                "192.0.2.7",
+                Ptr::Name(bad.into()),
+                bad,
+                Forward::Addrs(vec!["192.0.2.7".parse().unwrap()]),
+            );
+            assert_eq!(run("192.0.2.7", l), Ptr::Failed, "{bad:?}");
+        }
+        assert!(is_host_name("crawl-192-0-2-7.example.com."));
+        assert!(is_host_name("a_b.example.com"));
     }
 
     #[test]

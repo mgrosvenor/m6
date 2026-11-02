@@ -42,6 +42,7 @@ A completed forward lookup without the address returns the new `Ptr::Unconfirmed
 One deadline covers both lookups.
 At most `MAX_LOOKUP_THREADS` (8) lookup threads are alive at once, counting threads abandoned at their deadline.
 A lookup that finds no free slot returns `Ptr::Failed` at once without starting a thread.
+A PTR name with any character other than letters, digits, `-`, `_` and `.` returns `Ptr::Failed` and is never looked up forward or printed.
 Lookups run in the monitor only, never on the serving path, and add no dependency.
 
 **The monitor's poller makes the lookups, and `/check` only reads them.**
@@ -49,7 +50,8 @@ After each fleet poll the poller looks up at most `MAX_LOOKUPS_PER_POLL` (8) add
 A completed result is kept for one hour and a failed one for five minutes, and at most 512 addresses are kept.
 An address past the cap, or not yet reached, reads `not looked up yet  UNVERIFIED` until a later poll covers it.
 `check::render` takes the stored results as data and resolves nothing, so a resolver that never answers delays the next poll by at most 16 seconds and never a request to `/check`.
-`--check` makes its own lookups under the same cap.
+`--check` has no later poll, so it makes its own lookups under the wider `MAX_LOOKUPS_PER_CHECK` (64).
+Googlebot verifies only under `googlebot.com` and `google.com`. A name under `googleusercontent.com` does not verify it, because every cloud customer's virtual machine gets a reverse name there that also resolves forward.
 `telemetry::CrawlerVerdict` gains `ForwardMismatch`, so a `match` over it needs a new arm.
 
 ### Verified

@@ -43,6 +43,11 @@ pub type Verdicts = std::collections::HashMap<String, m6_core::resolve::Ptr>;
 /// "not looked up" in this poll and is tried in the next.
 pub const MAX_LOOKUPS_PER_POLL: usize = 8;
 
+/// The lookups one `--check` run makes. A one-shot run has no later poll to
+/// cover what it skips, and it is already waiting on a full fleet poll, so it
+/// takes a wider cap than the daemon's poller.
+pub const MAX_LOOKUPS_PER_CHECK: usize = 64;
+
 /// How long a completed lookup is kept before the address is looked up again.
 pub const VERDICT_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
 
@@ -59,18 +64,33 @@ pub const MAX_CACHED_VERDICTS: usize = 512;
 /// The poller thread calls [`VerdictCache::refresh`] before it takes the
 /// snapshot's write lock. [`render`] never resolves anything, so `/check`
 /// cannot be stalled by a resolver and cannot hold up the poller.
-#[derive(Default)]
 pub struct VerdictCache {
     entries: std::collections::HashMap<String, (std::time::Instant, m6_core::resolve::Ptr)>,
+    cap: usize,
+}
+
+impl Default for VerdictCache {
+    fn default() -> Self {
+        Self::with_cap(MAX_LOOKUPS_PER_POLL)
+    }
 }
 
 impl VerdictCache {
+    /// A cache for the poller: at most [`MAX_LOOKUPS_PER_POLL`] lookups a poll.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// A cache that makes at most `cap` lookups per refresh.
+    pub fn with_cap(cap: usize) -> Self {
+        Self {
+            entries: std::collections::HashMap::new(),
+            cap,
+        }
+    }
+
     /// Look up the crawler addresses in `readings` that are not cached or
-    /// have expired, at most [`MAX_LOOKUPS_PER_POLL`] of them, and return the
+    /// have expired, at most the cache's cap of them, and return the
     /// results for every address the report will show.
     pub fn refresh(
         &mut self,
@@ -91,7 +111,7 @@ impl VerdictCache {
             if out.contains_key(ip) {
                 continue;
             }
-            if !self.entries.contains_key(ip) && looked_up < MAX_LOOKUPS_PER_POLL {
+            if !self.entries.contains_key(ip) && looked_up < self.cap {
                 looked_up += 1;
                 let ptr = lookup(ip);
                 let ttl = if ptr == Ptr::Failed {
@@ -1395,6 +1415,29 @@ mod tests {
         seen.sort();
         seen.dedup();
         assert_eq!(seen.len(), 12, "no address looked up twice");
+    }
+
+    #[test]
+    fn a_one_shot_check_looks_up_past_the_poll_cap() {
+        use m6_core::resolve::Ptr;
+        let calls = std::cell::Cell::new(0usize);
+        let lookup = |_: &str| {
+            calls.set(calls.get() + 1);
+            Ptr::None
+        };
+        let mut readings = Vec::new();
+        for n in 0..4 {
+            let ips: Vec<String> = (1..=3).map(|k| format!("192.0.2.{}", n * 3 + k)).collect();
+            let ips: Vec<&str> = ips.iter().map(String::as_str).collect();
+            readings.extend(sighted(&ips));
+        }
+        let v = VerdictCache::with_cap(MAX_LOOKUPS_PER_CHECK).refresh(
+            &readings,
+            std::time::Instant::now(),
+            &lookup,
+        );
+        assert_eq!(calls.get(), 12);
+        assert_eq!(v.len(), 12);
     }
 
     /// A stored result is reused until it expires, a failure expires sooner,
