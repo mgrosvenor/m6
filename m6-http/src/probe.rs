@@ -46,8 +46,8 @@ use rustls::ClientConfig;
 
 /// Accepts any certificate.
 ///
-/// These probes are pointed at loopback and at staging, whose certificate names
-/// an IP address. Verification is not what is being measured, and refusing to
+/// These probes are pointed at loopback and at test hosts whose certificate
+/// names an IP address. Verification is not what is being measured, and refusing to
 /// run without a valid chain would mean the tool could not check the box it most
 /// needs to check.
 #[derive(Debug)]
@@ -129,7 +129,7 @@ pub struct Handshake {
     /// Whether the server RESUMED a session rather than doing full key exchange.
     ///
     /// From rustls' own `handshake_kind()`, which is the client's view of what
-    /// happened, not an inference from timing. This is the field the fleet's
+    /// happened, not an inference from timing. This is the field a
     /// 0%-resumed reading needs checking against: m6-http's `resumed` counter is
     /// the server's claim about the same handshake, and until something
     /// independent agrees, "0% resumed" could equally mean the server never
@@ -694,10 +694,9 @@ pub fn quic_handshake_shape(addr: &str) -> io::Result<HandshakeShape> {
     // Unidirectional streams, which h3 needs for its control stream and the two
     // QPACK streams. Omitting this leaves the limit at the default of 0, so the
     // server cannot open them and `h3::Connection::with_transport` fails with
-    // StreamLimit -- which it then LOGS. Probing production wrote four
-    // `h3 init error: TransportError(StreamLimit)` warnings into edge-a's journal
-    // and the same into edge-b's, and they turned up in a health check as an
-    // unexplained new error on two nodes.
+    // StreamLimit -- which it then LOGS. Probing a running server wrote
+    // `h3 init error: TransportError(StreamLimit)` warnings into its journal,
+    // and they turned up in a health check as an unexplained new error.
     //
     // The handshake figure was unaffected, because QUIC establishment completes
     // before h3 is set up. But a measuring tool that makes the thing it measures

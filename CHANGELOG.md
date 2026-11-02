@@ -75,6 +75,9 @@ Documentation only. Each claim names the function or test that enforces it.
 **`docs/m6-backend-protocol.md` no longer states two MUSTs that the reference `App` does not meet (#200).**
 The proxy's user must be able to connect to the backend socket, with `0660` and a shared group preferred and `0666` allowed only inside a restricted directory. A backend may support persistent connections for clients that ask for them, and must close after responding to a request that carries `Connection: close`, which the proxy sends. `docs/m6-backend-examples.md` and `docs/m6-app-anatomy.md` now say the same.
 
+**Source comments in m6-http, m6-monitor and `tools/conformance.sh` no longer carry one deployment's hosts or measurements, and the HTTP/1.1 module header states the keep-alive the code implements (#190, #189 in part).**
+Comments only.
+
 ### Verified
 
 - Unit tests with stub resolvers cover a confirmed name, a PTR whose forward lookup returns other addresses, a name with no forward answer, a failed forward lookup, no PTR, a name with no address (EAI_NONAME and EAI_NODATA), a slot free by the time the caller has the result, the per-poll lookup cap, expiry and cache bound, a report that reads stored results and resolves nothing, a resolver that never answers, and the thread bound (eight blocked lookups, then fifty more that return at once and start no thread, then slots free again).

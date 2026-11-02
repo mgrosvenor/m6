@@ -29,8 +29,8 @@
 # config for months and nothing noticed.
 #
 # WHY MEDIAN OF SEVERAL ROUNDS, INTERLEAVED WHERE THERE ARE TWO SIDES. One
-# reading of one process is a reading of the afternoon. See the m6 handover's
-# lesson 7 and docs/PERFORMANCE.md.
+# reading of one process is a reading of the afternoon. See
+# docs/PERFORMANCE.md.
 #
 # This paragraph said median while the code took the MINIMUM, from the day it was
 # written until 2026-09-27. Owner's decision that day settled it in favour of what

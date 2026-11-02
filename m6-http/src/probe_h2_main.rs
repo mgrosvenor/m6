@@ -120,7 +120,7 @@ fn main() {
     //
     // The second is the one that matters here. m6 1.9.0 installed a ticketer for
     // browser resumption and nothing in the suite could tell whether it worked;
-    // the fleet read 0% resumed for a day and that was indistinguishable from a
+    // the server read 0% resumed for a day and that was indistinguishable from a
     // broken ticketer until a client offered one deliberately. m6 issue #101.
     if probe::resumption_failed(no_resume, n_full, n_resumed) {
         std::process::exit(1);
