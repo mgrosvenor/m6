@@ -61,6 +61,8 @@ When the thread's signal mask cannot be read, a service now refuses to start ins
 
 ### Docs
 
+**`docs/m6-core-reference.md` sections 1 to 5 follow the documentation ruleset, and the module and line counts, the `RouteConfig` fields and the watcher description now match the code (#144).**
+
 **Source comments in m6-http, m6-monitor and `tools/conformance.sh` no longer carry one deployment's hosts or measurements, and the HTTP/1.1 module header states the keep-alive the code implements (#190, #189 in part).**
 Comments only.
 
