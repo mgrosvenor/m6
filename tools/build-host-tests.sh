@@ -305,7 +305,9 @@ CARGO_TARGET_DIR=target/clippy cargo clippy --workspace --all-targets --release 
     | grep '^warning' | head -5
 
 echo "### examples unit tests"
-cargo test --workspace > /tmp/eg-tests.log 2>&1
+# Not blog_site_end_to_end: it needs certificates and example 05's stack, and
+# fails without them. It runs below, after that stack is up.
+cargo test --workspace -- --skip blog_site_end_to_end > /tmp/eg-tests.log 2>&1
 echo "EG_TEST_STATUS=$?"
 grep -E '^test result:' /tmp/eg-tests.log || true
 sed -n '/^failures:/,$p' /tmp/eg-tests.log | head -40
@@ -445,8 +447,22 @@ elif ! curl -sk --http1.1 https://127.0.0.1:8443/ 2>/dev/null | grep -q 'Recent 
     ss -ltnpH 'sport = :8443' 2>/dev/null | sed 's/^/    /'
 else
     ./test.sh > /tmp/eg-cms-test.log 2>&1
-    echo "EG_CMS_STATUS=$?"
+    cms_rc=$?
     grep -E 'passed|FAIL' /tmp/eg-cms-test.log | sed 's/\x1b\[[0-9;]*m//g' | tail -25
+    # The Rust end-to-end test needs this stack, so it runs here and its
+    # failure counts into the same status.
+    echo "### 05-cms rust end-to-end"
+    cargo test -p render-cms --test integration > /tmp/eg-cms-rust.log 2>&1
+    rust_rc=$?
+    # No "test result:" line is echoed: the report below sums those lines for the
+    # unit-test count and takes the last "N passed" as the suite's count.
+    echo "rust end-to-end exit status $rust_rc"
+    grep -E '^test .* FAILED|panicked' /tmp/eg-cms-rust.log | tail -25
+    if [ "$cms_rc" != "0" ] || [ "$rust_rc" != "0" ]; then
+        echo "EG_CMS_STATUS=1"
+    else
+        echo "EG_CMS_STATUS=0"
+    fi
 fi
 kill $DEV_PID 2>/dev/null
 # The stack's own children: dev.sh's trap handles them, but it is not given long
