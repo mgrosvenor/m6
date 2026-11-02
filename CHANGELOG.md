@@ -7,8 +7,737 @@ Each entry records what changed, why it mattered, and how it was verified.
 source: several defects in this list were invisible in the code and only showed
 up against the deployed artefact.
 
-Versions follow [semantic versioning](https://semver.org). `main` holds
-releases only; work happens on `develop`. See `CONTRIBUTING.md`.
+The version number follows the policy under Versions in `CONTRIBUTING.md`.
+`main` holds releases only.
+Work happens on `develop`.
+
+---
+
+## 1.15.0 — 2026-10-29
+
+**m6-http reloads its system config, and TLS on HTTP/1.1, HTTP/2 and HTTP/3, when the process config is touched, and keeps its cache while it does. Certificate files are no longer watched, so a renewal must touch the process config after it writes them. m6-auth-server re-reads its keys on reload and refuses a private key that is not the pair of the public key. A `site.toml` change clears the cache again once the backends' settle window has passed and once more after the poll interval, which fixes the stale cached page that 1.14.0 introduced in #244 (#254).**
+
+Migration is required for anyone who renews certificates or rotates auth keys. The steps are under Migration below.
+
+### Migration
+
+m6-http no longer watches its certificate and key files, and m6-auth-server no longer watches its signing keys.
+Anyone renewing certificates must touch the process config after writing them, for example with a certbot deploy hook that runs `touch /etc/m6/system.toml`.
+Until the touch, m6-http keeps serving the previous certificate.
+Rotate an m6-auth-server key by writing both files and then touching its config.
+After an auth key rotation, touch m6-http's system config as well, because m6-http takes the new public key when either of its files is reloaded, and until it reloads new tokens get 401.
+A renewal hook that touches `site.toml` does not reload the certificate and only empties the cache, so touch the process config instead.
+`[analytics] enabled`, `[analytics] log_path` and the `[server]` binds now apply only on a restart.
+In 1.14.0, turning `[analytics] enabled` off took effect on a `site.toml` reload, and now m6-http keeps the running value and warns.
+
+### Changed
+
+**m6-http watches its system config as well as `site.toml`, on one `ConfigReloader` (#252).**
+Before this change m6-http watched `site.toml` and its certificate files and did not watch its system config.
+A change there applied at the next `site.toml` reload, which also emptied the response cache.
+m6-http now runs the same `ConfigReloader` as every `App`, over both files.
+
+A change to `site.toml` rebuilds routes, pools, the invalidation map, the error mode and the security headers, and clears the cache, as before.
+A change to the system config alone takes only the keys that file owns, keeps the cache and re-reads TLS on HTTP/1.1, HTTP/2 and HTTP/3, the `[auth]` key, the `[health]` access keys, the node name, `allowed_methods` and `backend_timeout_secs`.
+The system config alone never replaces routes, so a refused `site.toml` reload cannot leave the config describing one site while the route table serves another.
+A change to both files runs both.
+`config reload: complete` now carries `site`, `process`, `cache_cleared` and `elapsed_us`.
+
+The keys m6-http reads only at start keep their running value on a reload and are named.
+They are `[server]` `bind`, `h2c_bind`, `internal_binds`, `internal_peers`, `redirect_bind` and `warm_on_start`, and `[analytics]` `enabled` and `log_path`.
+The log says `config reload: [server].bind changed; restart m6-http to apply it`, and `/perf` and `--dump-config` describe what is running.
+
+**TLS is read when the system config is touched, and the certificate files are not watched (#252).**
+A renewal writes the certificate and the key as two files, so the first event could read a certificate beside the previous key, fail the pair check and wait for another event.
+The second watcher, a thread with a self-pipe off Linux, is gone.
+`FsWatcher` now watches only the backend socket directory, on Linux.
+A renewal writes both files, then touches the system config, and m6-http reads both on the touch.
+A touch that arrives before the key is written fails the pair check, keeps the running certificate on every protocol, and is retried after 1 s, doubling to 60 s.
+A system config change reloads TLS even when `site.toml` fails to load, so a `site.toml` that is mid-edit does not hold a renewal back.
+
+**A `site.toml` reload empties the cache twice more, 100 ms and about 1 s after it ends (#252).**
+A backend that reloads after m6-http can answer a request in the gap with the old page, and m6-http caches it.
+m6-http now clears the cache again 100 ms after the reload ends, for a backend that held the change for the 20 ms window, and once more 1.08 s after it ends, for a backend that found the change only on its once-a-second poll.
+The delays are `RELOAD_DEBOUNCE` and `RELOAD_POLL` from m6-core plus 80 ms for the backend's own reload, and the window starts when the reload ends, so a slow reload does not use it up.
+A second change re-arms both.
+It costs one extra cache miss per page about a second after a content change, and nothing on the cache-hit path, where the three cache-hit blocks in `m6-http/src/main.rs` are byte-identical to the previous release.
+
+**m6-auth-server re-reads its signing keys on reload, and m6-monitor names its restart-only keys (#252).**
+The key-watching thread in m6-auth-server is gone, and with it the `libc` dependency it alone used.
+The service's `on_reload` hook loads the private and public key before it swaps either, so a key that fails to load, or a private key that is not the pair of the public key, leaves the running keys serving and is retried.
+A changed `[storage] path`, token lifetime, issuer or rate limit is named in a warning that says to restart.
+m6-monitor warns when `poll_interval_s`, `[monitor] history_file` or `history_max_mb` changes, because it reads them once at start.
+
+### Fixed
+
+**A `site.toml` change could leave a stale page in the cache when a backend reloaded after m6-http had cleared it (#254, introduced in 1.14.0 by #244).**
+m6-http clears its cache as soon as it sees the change.
+A backend under `ConfigReloader` can hold a second report for 20 ms, and on Linux one `Request::touch` produces two reports, so the backend reloaded after the clear.
+A request in between cached the old page, and a `Cache-Control: public` page stays cached for up to 24 hours.
+The cache is now cleared twice more, as described above.
+m6-auth-server also refuses a private key that is not the pair of the public key, so a rotation caught between its two writes keeps the running keys and is retried.
+
+### Verified
+
+- `tls_reload`: the certificate moves on HTTP/1.1, HTTP/2 and HTTP/3 after the touch, flat and through a certbot-style symlink. Writing the certificate without a touch changes nothing for 3 s. A broken `site.toml` does not hold a certificate back. A touch before the key is written lands through the retry.
+- `config_reload`: a system config touch keeps the cache and logs `cache_cleared=false`. A `site.toml` change clears it twice. A bind change is named and not applied. A system config change after a refused `site.toml` reload keeps the running routes.
+- `metrics_access`: `[health] metrics_peers` in the system config applies on HTTP/1.1, HTTP/2 and HTTP/3 without a restart, and a rotated `[auth]` key verifies after a touch and not before.
+- `config_reload` with a real `m6-html` backend that holds the change: the new page is served within 500 ms. The second clear comes a full window after a slow reload ends, and a third clear removes a page cached after the second.
+- m6-auth-server: a mismatched key pair is refused and the matching pair lands on the retry. A rotated signing key is served after the config is touched and not before, and a garbage key leaves the old one serving.
+- m6-monitor: a changed `poll_interval_s` is named and the service keeps running.
+
+---
+
+## 1.14.0 — 2026-10-27
+
+**Log reopen on SIGUSR1, declared internal listeners that accept only the peers a config names, token-gated metrics, a monitor history and tunnel health, new m6-core blocks including an opt-in SQLite feature and a config reloader, a fleet certificate comparison, the user agents of notable clients, each config key in the file it belongs to, test binaries built from the source under test, and a TLS reload that now replaces the certificate every listener serves, which fixes the limitation 1.13.0 recorded.**
+
+### Changed
+
+**m6 services reopen their log file on SIGUSR1 (#234).**
+Before this change SIGUSR1 killed every m6 process at the default disposition, and `m6-http` opened its analytics file once and never reopened it, so rotation had to use `copytruncate`, which can lose the lines written between the copy and the truncate.
+SIGUSR1 now joins SIGTERM and SIGINT in the signals `m6_core::signal::block()` blocks.
+The signal thread handles it before it counts toward a forced exit, so any number of reopen signals never shut a process down.
+A process that writes no log file logs one line and carries on.
+
+Rotation renames the file and sends SIGUSR1.
+The reopen opens the new file while holding the lock the log writer takes for every line, and the writer takes that lock once per event.
+No line is lost or split, no request thread waits, and the path reappearing proves the renamed file is finished.
+If the open fails, the process keeps writing to the previous file, logs an error and records the failure.
+The path is made absolute once at start, so a later change of working directory cannot redirect a reopen.
+
+`/traffic` also reads the newest rotated file next to the live log, named `<name>-YYYYmmddHH` with or without `.gz`, so its window does not shrink just after an hourly rotation.
+`m6_core::log::read_recent` does the read, and `/traffic` runs it on the event loop, so the read is capped at 24 MB.
+A plain rotated file is read from a seek, so the cap holds however large the file is.
+The rotated file is skipped when the live tail already filled that budget, and when it was last written before the start of the `/traffic` window.
+A `.gz` file is decoded only when it is no larger than the budget on disk and the uncompressed size in its trailer is no larger than the budget, and the decoder stops at the budget whatever the trailer says.
+A skipped rotated file means the report covers the live file.
+
+**`/perf` and `/traffic` report the last log reopen, and m6-monitor faults when it is too old (#234).**
+`logging.reopen` gives `reopens_total`, `failures_total`, `seconds_since_last_reopen`, `last_reopen_unix` and `seconds_since_last_failure`.
+`seconds_since_last_reopen` is `null` until the first reopen, which is not the same as zero.
+`reopen` is `null` for a process that writes no log file.
+`/perf` gains a `logging` block, and a node older than the field still parses.
+
+m6-monitor shows the age for each node in `/check` section A and in `/digest` as `nodes[].log_reopen` (`state`, `age_s`, `last_unix`, `reopens`, `failures`, `last_failure_age_s`, `detail`).
+The new `[monitor] log_reopen_max_age_s` is optional and has no default, because analytics logging is on by default and a deployment that does not rotate would otherwise fault two hours after every start.
+`/digest` carries it as `thresholds.log_reopen_age_s`.
+With it set, these are Faults:
+
+- a last reopen older than the limit
+- a node that has not reopened in more than the limit since it started
+- a last reopen that failed and has no success after it
+- a node too old to report the age
+
+Without it the state is shown and never judged.
+
+A main log that has gone quiet, which section A already printed as a FAULT, is now also a digest finding, so the verdict counts it and `ALL CLEAR` no longer appears above it.
+
+**`/traffic` reports the user agents a notable client presented, and renames the count in m6-core (#221, part of #219).**
+`ClientSummary` counted the user agents an address presented and threw the strings away, so a report read `1 UA` and not which one.
+Three rotating agents and three that are all `curl/8.4.0` are different findings, and only the strings tell them apart.
+`notable[].user_agents` in the `/traffic` payload is new, and it is an array of strings.
+It is `serde(default)`, so a payload from a node that predates it still parses and reads as empty.
+`notable[].distinct_user_agents` stays beside it as the true count.
+
+Payload change for consumers: a reader of `notable[]` now finds an array under `user_agents`.
+On `heavy_hitters[]`, `user_agents` is still the count under that wire name, because an aggregator reads `/traffic` from nodes on other versions.
+Only the Rust field was renamed, from `HeavyHitter.user_agents` to `HeavyHitter.distinct_user_agents`, with `serde(rename = "user_agents")`.
+A test parses an older payload and checks that the count still goes out under the old name.
+A heavy hitter carries the count and no sample, because it is merely loud and the loudest source on a node is often the monitor's own polling.
+
+The sample is capped by `m6_core::telemetry::USER_AGENTS_KEPT` (4 agents) and `USER_AGENT_MAX_CHARS` (160 characters).
+A longer agent ends in `USER_AGENT_TRUNCATED` (`...`).
+The cap exists because one address presented 526 distinct agents, and a client chooses the length of the header.
+The sample is sorted before it is cut, so two runs over the same data give the same report.
+The cut is by character, because a byte slice can land inside a multi-byte sequence and panic.
+m6-monitor prints `agents (4 of 526)` when the sample is partial and `agents:` when it is the whole set.
+An empty agent prints as `<none sent>`.
+Which protocol a client spoke is not in this change and stays open in #219.
+
+Verified: three new tests in m6-core cover the cap, the determinism and a multi-byte agent, and three in m6-monitor cover the printed block, a partial sample and a missing header.
+The multi-byte test panics with byte slicing.
+The PR records `cargo test --workspace` at 1172 passed with 0 failed, `tools/clippy.sh` silent and `cargo fmt --check` clean, on a laptop.
+It records that nothing in the tree read `heavy_hitters[].user_agents` as an array.
+
+**A listener is internal only when the config says so (#232).**
+m6-http used to decide from a listener's bind address whether it was internal.
+Three things followed from that guess: the statistics label, whether the h2c listener believed the client address a cache node forwards, and whether the custom error path was served.
+`[server] internal_binds` now names the internal listener by address.
+m6-http refuses an entry that is not an IP address and port, is not in a local range (`m6_core::net::is_private_ip`), or is not its `h2c_bind`.
+Only the h2c listener can be internal.
+An entry that equals `bind` is refused, because the TLS and QUIC listener faces clients and stays external.
+
+**Migration.**
+A config with `h2c_bind` must add `internal_binds`, or m6-http exits 2 and says what to add.
+A listener declared internal must also list its peers in `internal_peers` (#246), or m6-http exits 2 again.
+For an h2c listener on a local IP address, write both keys: `internal_binds = ["<h2c_bind>"]` and `internal_peers = ["<ip of each peer allowed to connect>"]`.
+`internal_binds = []` treats the listener as public, and then `internal_peers` is not needed.
+An h2c listener bound to a host name or a public address can only be declared public.
+Add the keys before upgrading, because older versions ignore them.
+A `bind` on a private address is now labelled `external` in `/perf`.
+
+Verified: `cargo test --workspace` gives 1297 passed and 0 failed, clippy is silent with `-D warnings`, and the release and test builds have no warnings.
+Thirteen new config tests, two rewritten h2c trust tests and four tests that run the real binary cover every refusal, the migration messages and a valid start.
+Two of the binary tests send requests over h2c under a rate limit and show that a declared listener believes the forwarded address and a public one does not.
+A diff of the three cache-hit blocks in `m6-http/src/main.rs` against the base is empty, so the request path for a cache hit is untouched.
+Example 09's integration test in m6-examples ran to "All assertions passed" with no `SKIP` against an earlier build of this change, with its h2c listener declared the same way.
+
+**Each key goes in the file it belongs to, and an app can say where `site.toml` is (#242).**
+Every m6 process reads two files.
+`site.toml` holds the state every process of the site shares.
+The process config holds that process's own state, which means node identity, binds, certificates, credential paths and per-node security.
+Three things stopped that rule from holding.
+
+An `App` looked for `site.toml` only at `<site_dir>/site.toml`.
+`docs/m6-site-layout.md` gives each app its own root under `apps/`, with `site.toml` at the top of the tree.
+In that layout an app read no `site.toml`.
+The `[[backend]] compresses` agreement passed without checking, `[log]` fell back to its defaults, and the watch was on a directory that never held the file.
+A new reserved config key, `site_toml`, names the file.
+A relative value resolves against `site_dir`, an absolute value is used as given, and no key means `<site_dir>/site.toml` as before.
+A named file that does not exist, cannot be read or is not valid TOML is exit 2 at start.
+A file at the default path keeps its tolerance.
+`--dump-config` prints the resolved path.
+`Request::touch("site.toml")` touches that file, so the documented edge invalidation reloads the file the app reads.
+`AppContext` gains a `site_toml` field, and m6-auth-server reads its issuer fallback from that file.
+
+The system config accepts `[health] metrics_token_file`, a credential path, and it wins over `site.toml` like the other `[health]` keys.
+A relative path there resolves against the site directory, as `tls_cert` does.
+The same rule applies to `[auth] public_key` in the system config.
+A relative `metrics_token_file` in `site.toml` still resolves against the working directory.
+The token is read after the two files are merged.
+
+m6-http accepted node keys in `site.toml` and site-wide keys in the system config without a word, because the system config wins and the result worked.
+It now logs a warning at start for each key in the wrong file.
+The node keys are `[server]` `bind`, `tls_cert`, `tls_key`, `h2c_bind`, `internal_binds`, `internal_peers`, `redirect_bind` and `warm_on_start`, `[auth]`, `[node]`, and `[health]` `metrics_token_file`, `metrics_require` and `metrics_peers`.
+They belong in the system config.
+The site-wide keys are `[server]` `backend_timeout_secs` and `allowed_methods`.
+They belong in `site.toml`.
+The warning is silent when both arguments name one file.
+The docs list which file each key belongs in.
+
+**Two signatures changed.**
+`m6_core::compress::check_declared_support` and `m6_core::log::read_site_log_config` take the path of `site.toml` where they took the site directory.
+`AuthConfig::load` in m6-auth-server takes it as a third argument.
+The public struct `AppContext` gained a `site_toml` field, so a struct literal of it outside m6-core no longer compiles.
+A service reads the context a handler or initialiser is given and does not build one, so this reaches only code that builds an `AppContext` by hand.
+
+Migration: a caller of the two functions or of `AuthConfig::load` passes the `site.toml` path.
+Code that builds an `AppContext` by hand adds the field.
+A service that does not set `site_toml` behaves as before, and a misplaced key keeps working and is named in a warning.
+The system config's relative paths resolve against the site directory, as described above.
+
+**Verified** by unit tests for the key, its resolution and its refusals, by m6-file starting on a per-app root and exiting 2 on the compression disagreement it could only see through `site_toml`, by m6-auth-server taking its issuer from the named file, by m6-core tests for a named `site.toml` that is a directory, unreadable or invalid and for `touch("site.toml")` with a file outside the site directory, and by m6-http tests for the relative key paths, the `[node]` warning, and one table-driven test that every misplaced key warns in the wrong file and not in the right one.
+
+**An `App` reloads when either of its two files changes, and a lost watch no longer stops it (#244, closes #185 and #198).**
+An `App` service watched both its config and `site.toml` but rebuilt only from its own config.
+`site.toml`'s `[log]` level and its `[[backend]] compresses` declaration were read once at start, so editing the log level there changed nothing (#198).
+A watcher that stopped delivering events left a service that never reloaded, because the one-second modification-time check ran only when there was no watcher at all (#185).
+State that `init_global` built from the config had no way to reload.
+
+`m6_core::ConfigReloader` now watches both files.
+It takes the change from the platform watcher and, whatever the watcher says, compares the two files' identity, size and times once a second.
+The first change after quiet is reported at once.
+A change that arrives within 20 ms of a report is held and reported once more when the burst has settled, no later than a second after the window opened.
+A write that replaces the file in one step is one reload with no delay and a burst of writes is at most two.
+A write that truncates the file first can report twice.
+A file seen at length 0 is skipped with a warning, and the write that fills it reloads.
+Reporting at once matters when an edge clears its cache on the same change, because a backend that reloads late would otherwise leave a stale page cached.
+A touch alone reloads.
+On Linux an event that names one of the files is a change even when its size and times are equal, which coarse timestamps can cause.
+A file that failed to load is not tried again until it is written again.
+
+An App reload now re-reads `site.toml` every time.
+It applies the log level with the same precedence as start: the command line, then the service's `[log]`, then `site.toml`'s `[log]`.
+It checks the `compresses` agreement again and refuses the reload on a disagreement.
+It refuses a `site_toml` that is gone and a `site.toml` that is not valid TOML, whether or not `site_toml` names it.
+The previous state keeps serving after any refusal.
+It logs `config reload: <key> changed; restart this service to apply it` for `thread_pool.size`, `thread_pool.queue_size`, `server.read_timeout_s`, `server.socket_mode` and `site_toml`, which keep their running values.
+`Reload complete` gains `site` and `process` fields saying which file changed.
+
+`AppWithGlobal::on_reload` and `AppWithState::on_reload` register `Fn(&G, &AppContext) -> Result<()>`.
+Core calls it with the new config before installing the new state, so a service can re-read the state it built in `init_global`.
+If the hook returns `Err`, core logs it with the delay before the next attempt, keeps the previous routes and log level, and tries the reload again after 1 s, then 2 s, 4 s and so on up to 60 s.
+A real write to either file reloads at once and starts the delay again at one second.
+The hook must be safe to run twice on one config.
+A panic in the hook is not caught, because the release profile aborts on panic.
+It ends the process and the service manager restarts it, so return `Err` for anything recoverable.
+
+m6-http is not changed by this.
+It keeps its own watcher until it moves onto `ConfigReloader`.
+
+**An internal listener accepts only the peers its config names (#246).**
+An h2c listener named in `[server] internal_binds` believed the `X-Forwarded-For` of any peer that reached it, so a firewall was the only thing between a forged client address and the rate limiter.
+`[server] internal_peers` now lists the IP addresses it accepts, each in a local range.
+A connection from any other address is closed at accept.
+The log writes a line for the first refused connection from each address, then at most one line per address every 60 seconds with the number of refusals since the last line.
+It remembers 256 addresses.
+A new address past that takes the place of the remembered address whose last line is oldest, when that line is more than 60 seconds old and no count is owed.
+When no remembered address qualifies, refusals from the new address are counted.
+Across all addresses it writes at most 32 of those lines in 60 seconds, and refusals past that limit are counted.
+The first refusal after the 60 seconds ends writes one summary line with the counts, the number of distinct counted addresses (up to 1024) and the most recent counted address.
+One call to accept handles at most 64 connections, so a peer that connects in a loop cannot hold the event loop.
+The check runs once per connection, and every request on an admitted connection is served as before.
+A peer list with no address of the internal bind's IP family is refused at load.
+
+**Migration.**
+A config with a non-empty `internal_binds` must add `internal_peers`, or m6-http exits 2 and says what to add.
+The migration note for `internal_binds` under #232 gives both keys together.
+
+**Verified** by unit tests for each refusal and for canonical addresses, and by real-binary tests over h2c: a listed peer is served and believed, an unlisted peer's connection is closed with no response, and a config without the key refuses to start.
+
+**Tests run the binary built from the source they test (#245).**
+`m6_core::testkit::binary` returned `target/release/<name>` whatever its age, so a `cargo test` after an edit could spawn a binary from before the edit and report a correct change as broken.
+It now asks cargo to build `<name>` in release with workspace features, once per binary name per test process, and returns that binary.
+A build that is current costs one cargo call, and a stale one is rebuilt first.
+It no longer falls back to a debug binary.
+m6-auth-cli's tests use it instead of their own lookup.
+
+**Verified** by a unit test that changes a scratch binary's source between two calls and sees the new output, and by the whole suite.
+
+### Fixed
+
+**A TLS reload now replaces the certificate every listener serves, and the limitation 1.13.0 recorded is fixed (#217, closes #210).**
+`handle_tls_reload` used to rebuild the quiche configuration alone.
+The rustls configuration behind the HTTP/1.1 and HTTP/2 listener was built once at start and never replaced.
+After a renewal wrote new material, HTTP/3 served the new certificate and HTTP/1.1 and HTTP/2 served the old one until the process restarted.
+The log said `TLS config reloaded`, which was true of one protocol.
+`/perf` also kept reporting the certificate loaded at start, so a renewal was invisible to a monitor.
+This is the known limitation the 1.13.0 notes record, and it is fixed.
+h1 and h2 now serve the renewed certificate, and all three protocols agree.
+
+`Http11Listener::replace_tls_config` swaps the configuration that future connections are served under, and `terminates_tls` says whether there is one to swap.
+Connections already established keep the certificate they handshook with.
+A plaintext listener is left alone, because turning a redirect listener into a TLS one on a certificate change would take the redirect off the air.
+`load_tls_material` loads without recording, and `TlsMaterial::record` records once the material is installed.
+Before, a reload that built the rustls configuration and then failed to build the quiche one reported the new expiry while every protocol still served the old certificate.
+`handle_tls_reload` now builds both configurations before it installs either, and on any failure every protocol keeps the material it had.
+
+The macOS, FreeBSD and OpenBSD file watcher emitted `SiteTomlChanged` alone, so a certificate change reached the server on none of those platforms.
+The kqueue thread now watches the certificate and key the way it already watched `site.toml`.
+The wake carries no filename, so the thread tells a certificate write from a content write by comparing modification times, and a content deploy does not rebuild TLS on every file it writes.
+A certificate outside the site directory is still not seen there, and a path replaced by a rename still loses its watch.
+Both were already true of `site.toml`.
+
+Verified: `m6-http/tests/tls_reload.rs` starts m6-http on one certificate, replaces it on disk, and reads the leaf back over HTTP/1.1, HTTP/2 and HTTP/3.
+It asserts that all three present the new certificate, that they agree on one `notAfter`, and that `/perf` reports the material in use.
+With the listener swap and the recording removed, the HTTP/1.1 poll times out after 30 seconds while HTTP/3 has already moved, which is the defect.
+The PR records `cargo test --workspace` at 1168 tests with 0 failures, `tools/clippy.sh` silent and `cargo fmt --check` clean, all on a laptop.
+Conformance and performance were left to CI and the build host.
+
+### Security
+
+**Four dependencies moved up a patch version to clear seven RustSec advisories
+(#230).** rustls 0.23.45 to 0.23.46, rustls-webpki 0.103.15 to 0.103.16, tokio
+1.53.1 to 1.53.3, and webpki-roots 1.0.9 to 1.0.10. This clears
+RUSTSEC-2026-0346, -0347, -0348, -0349, -0381, -0382 and -0386, which had turned
+CI's `cargo deny` job red on every open pull request. Only `Cargo.lock` changes,
+and no `Cargo.toml` requirement moved.
+
+Verified: `cargo deny check` passes, and the release build has no warnings. The
+workspace tests pass with 0 failures, h3 and QUIC included.
+
+### Added
+
+**Small APIs can now return the rows for a time range as JSON Lines, a page at a
+time (#225).** Three additions to m6-core. `m6_core::net` has `is_private_ip` and
+`bind_ip`, one definition of a private address. `m6_core::time_range` reads
+required `from` and `to` query keys as RFC 3339 UTC times for a half-open range
+`[from, to)`, with a longest span (31 days unless the service asks for another)
+and a 400 that says what to fix without repeating what the client sent.
+`m6_core::ndjson` gains `Page`, which a service fills with rows until it says
+`Full`. The service then sends the key of the next row as a `Cursor`, and the
+response carries it in a `Link: <...>; rel="next"` header. `PageLimits` default
+to 4 MiB and 10,000 rows and cannot exceed 64 MiB, half of the 128 MiB that
+m6-http will buffer from a backend. A test in m6-http keeps that true.
+
+Why: a website that serves a log or a report for a period needs the same
+decisions each time: the time format, whether the end is included, how long a
+range may be, how big a response may be, and how a client asks for the rest.
+These are now made once, in m6-core.
+
+Verified: `cargo fmt --check` and `cargo clippy --workspace --all-targets -- -D
+warnings` pass with no warnings, and `cargo test --workspace` passes with 0
+failures. This was run against unit tests only, and no page was served from a
+running m6-http.
+
+**m6-core has an opt-in `sqlite` feature (#227).**
+A service that wants one SQLite file can enable `sqlite` on m6-core and link nothing else, because the feature re-exports `rusqlite` in the prelude.
+`m6_core::sqlite::open(path)` opens the file with `journal_mode=DELETE`, a 5 second `busy_timeout`, `foreign_keys` on and `recursive_triggers` on, reads each setting back, and returns an error if one does not take effect.
+`OpenOptions` changes the busy timeout, the journal mode and foreign keys.
+SQLite cannot leave WAL mode while another connection is using the file, so every connection to a file should use the same journal mode.
+Opening a WAL file with the default rollback journal then fails with `SQLITE_BUSY`.
+`migrate` applies a numbered list of migrations and keeps the version in `PRAGMA user_version`.
+Each migration runs in its own `BEGIN IMMEDIATE` transaction, so connections that open at once apply each one once, and a failing migration rolls back.
+A file newer than the migration list is refused with `NewerThanCode`, both before the first migration and again inside each transaction, so a newer process that migrates the file meanwhile is also refused.
+`migrate` switches `foreign_keys` off before each migration, because SQLite ignores that pragma inside a transaction, and so a migration can rebuild a table that others point at without losing their rows.
+It runs `PRAGMA foreign_key_check` before and after each migration's SQL, inside its transaction, and fails with `ForeignKeyCheck` naming the child and parent table if any (child table, parent table) pair has more dangling references after than before.
+A dangling reference already in the file does not block a migration that keeps both table names.
+Renaming a table that holds one is refused, so delete the orphan rows in an earlier migration first.
+A migration that removes one dangling reference and adds another between the same two tables is not caught.
+`foreign_keys` is restored to its earlier setting when `migrate` returns.
+`append_only(&conn, table)` adds triggers that refuse UPDATE and DELETE on a named table, and `is_append_only` reports them.
+`used_bytes` and `prune_oldest` keep a table that is not append-only under a size cap.
+The cap counts the whole file, so `prune_oldest` returns the rows deleted and `cap_met`, which is false when the table was emptied and the file is still over the cap.
+
+A service can now use this one way to open, migrate and guard a file.
+m6-auth still opens SQLite itself and moves to it later.
+The feature is off by default.
+`cargo tree -p m6-http` shows no rusqlite, and `Cargo.lock` gains one line, `"rusqlite"` under m6-core.
+Nothing in the workspace turns the feature on, so `cargo test --workspace` never builds it.
+CI therefore has a step that builds and tests m6-core with `--all-features`, and `tools/clippy.sh` has a second pass that lints it the same way.
+That also covers `email` and `multipart`, which nothing in the workspace turns on either.
+
+Verified: `cargo test -p m6-core --lib --features sqlite` passes 417 tests with 0 failures, including 34 in the `sqlite` module that run against real files.
+The doctests pass with the feature on.
+`cargo test -p m6-core --features sqlite,testkit` builds with no warnings and passes.
+`cargo build --workspace --release`, `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `./tools/clippy.sh` and `cargo test --workspace` all pass with no warnings.
+This was run on unit and file-backed tests only, and no request-path code changed.
+
+**m6-monitor reports each node's tunnel round trip and WireGuard handshake age
+(#226).**
+For each node that has a `tunnel` configured, the monitor host times up to three TCP connects to the node's tunnel address and reads the age of that peer's latest WireGuard handshake.
+Both appear in `/check` section H, in `/digest` as `nodes[].tunnel` (`rtt_ms`, `rtt_samples_ms`, `probe`, `probe_error`, `handshake`, `handshake_age_s`, `handshake_detail`) and as a tunnel column on the HTML page.
+`/digest` also carries `handshake_file_age_s` once for the monitor, and `thresholds.tunnel_handshake_age_s`.
+Section H prints the `wg` interface drops from a node's `/perf` `host.net` when that node reports them, and only when at least one node has a tunnel.
+
+The round trip is a TCP connect because ICMP needs `CAP_NET_RAW`, which the monitor's unit does not hold.
+A reset from a closed port still measures the path.
+One connect that gets through in a poll means the tunnel answered.
+The outcome is then `connected`, the round trip is the minimum of the connects that got through, and the sample count shows a partial loss.
+Only a poll where no connect gets through is `no_answer`.
+The probe of a node has one deadline of `timeout_ms`.
+Up to three connects run one after another, each given what is left of that time, and a connect that times out ends the probe.
+A dead tunnel therefore costs one `timeout_ms`.
+A poll runs the HTTPS requests first and the probe after them, all on `timeout_ms`, so a node that is down can cost up to four `timeout_ms` in one poll.
+A reading goes stale when one poll takes longer than twice `poll_interval_s`, so keep `timeout_ms` under half of `poll_interval_s`.
+
+The handshake is read from a file because `wg show` needs `CAP_NET_ADMIN`.
+A privileged timer writes the output of `wg show <interface> latest-handshakes` to the file and m6-monitor reads it as data.
+That timer must run for the handshake age to be judged, including under `--check` from cron.
+`wg show <interface> dump` must not be used because it carries the interface private key.
+A handshake time is the last successful one, so the age is the slow signal and the probe is the fast one.
+
+Every tunnel finding is a Fault:
+
+- a probe with no answer
+- a peer that never handshook
+- a peer absent from the interface
+- a handshake older than the limit
+- a handshakes file that is missing or unreadable
+- a handshakes file older than the limit, which is one monitor-level fault naming the file and saying its collector has probably stopped, and the node handshakes then read as unknown
+- a node with a `tunnel` and no `public_key`
+- tunnels configured with no `wg_handshakes_file`, which is one monitor-level fault
+
+Findings are computed before the unreachable-node case, so a node whose HTTP poll failed still reports its tunnel.
+Probing runs on the background poller, and in `--check` in its own process.
+No request handler changed.
+
+Configuration is optional except where a tunnel needs it.
+`[monitor]` takes `wg_handshakes_file`, which any node with a `tunnel` needs, and `tunnel_handshake_max_age_s` (default 600).
+With a tunnel configured, loading the config fails when `tunnel_handshake_max_age_s` is below the top-level `poll_interval_s` plus `timeout_ms` rounded up to whole seconds plus 180.
+The error names all three inputs and the minimum.
+The poller and this check read the same top-level `poll_interval_s` through one function, and a `poll_interval_s` under `[monitor]` is not read.
+WireGuard rekeys every 120 seconds only while traffic flows, and the probe each poll is that traffic.
+The 180 seconds also has to hold the period of the timer that writes the handshakes file.
+The monitor does not know that period, so it must fit inside the 180 seconds.
+Each `[[monitor.nodes]]` takes `tunnel = { address = "<ip>:<port>", public_key = "<peer public key>" }`, where the address must be an IP literal and a port, and a name or a bad value is a config error.
+A node with no tunnel is reported as not configured.
+
+The HTML page escapes node name, role, status, findings and the tunnel column with `m6_core::util::html_escape`.
+That function escapes `&`, `<`, `>` and `"`, and the m6-http error page now calls it in place of a private copy.
+
+**`m6-core::wireguard`**, a new module. `Handshakes::parse_latest_handshakes`,
+`from_file`, `find` and `PeerHandshake` read the `latest-handshakes` output. A
+time of 0 means the peer never completed a handshake, a missing file is
+`Ok(None)`, and a malformed line is an error naming the line.
+`docs/m6-core-reference.md` (component index and module section) and the
+`m6-monitor` row of Table 7 in `docs/m6-architecture.md` describe both.
+
+Verified: `cargo test -p m6-monitor -p m6-core` passes for the wireguard tests
+(7), the m6-monitor unit tests (87) and the m6-monitor integration tests that
+include the loopback tunnel probe, with 0 failures and no warnings. Not run
+locally: conformance and the MSRV build, which CI covers.
+
+**m6-monitor warns when the nodes of a fleet serve different certificates (#218, closes #216).**
+The monitor judged each node's certificate against a threshold and never compared the nodes with each other.
+A node that missed a renewal keeps serving the superseded certificate, which is valid, trusted by every client and expiring sooner than the one installed.
+The per-node expiry, the `cert_expiry_days` threshold and the digest all passed on every node, because each node alone was healthy.
+The first signal was the stale node refusing connections.
+
+`NodeDigest.cert_not_after_unix` is the leaf's `notAfter`, beside the countdown that was already there.
+The countdown is measured from the moment each node was polled, so two nodes serving one certificate differ by the seconds between their polls.
+`notAfter` belongs to the certificate, so comparing it across nodes is exact.
+Both figures come from one reading, so the fleet comparison and the per-node threshold cannot describe different certificates.
+When the nodes that reported a certificate disagree, the monitor warns and names every node and what it serves.
+It is checked and reported the way version and build drift already are.
+Only nodes that reported a certificate are compared, because a node that is silent about its chain already warns on its own.
+A renewal moves `notAfter` forward, so a node that missed one disagrees on the day of the renewal, which is the day there is time to fix it.
+
+The `tls_reading` test helper left `not_after_unix` at 0 on every entry while it set `expires_in_seconds` from its argument.
+It now derives both from one base.
+
+Verified: five new tests.
+With the comparison disabled, the two that assert the finding fail and the three negative ones stay green.
+The PR records `cargo test -p m6-monitor` at 48 tests with 0 failures, `tools/clippy.sh` silent and `cargo fmt --check` clean.
+The change is contained to m6-monitor, so the full workspace suite was left to CI.
+
+**`/perf` and `/traffic` for listed peers only, with a token (#237).**
+`[health] metrics_peers` lists the IP addresses allowed to read `/perf` and `/traffic`.
+Each entry must be in a local range (`m6_core::net::is_private_ip`), and names and ranges are refused.
+The peer address is the one the TCP or QUIC handshake proved, so the endpoints are refused on an internal h2c listener, which believes `X-Forwarded-For`.
+Any other peer gets 404.
+`[health] metrics_require` takes `role:<name>` or `group:<name>` and checks a token with `[auth] public_key`.
+The token comes from the Authorization header or the session cookie, as route `require` reads it.
+No or a bad token gets 401 and the wrong claim gets 403.
+`metrics_token_file` stays as the legacy gate and is ignored when `metrics_require` is set.
+`[auth] backend` is optional, and `[auth]` and the two new keys may be set in the system config.
+The proxy's own 401 from route `require` now carries `WWW-Authenticate: Bearer`.
+m6-monitor's `metrics_over_tunnel` fetches `/perf` and `/traffic` through a node's `tunnel.address` while `/health` stays on the public URL.
+
+**Migration.**
+A system config that holds only `[server]` and `[node]` is unaffected.
+A system config that carries `[auth]` or `[health]` used to have them ignored with a warning.
+Now `[auth]` is read, and `[health]` there accepts `metrics_require`, `metrics_peers` and `metrics_token_file`.
+A config that breaks the rule below stops m6-http starting with exit 2.
+On a running node a reload fails the same way and keeps the old config until a restart.
+Check each system config for `[auth]` declared in both the system config and `site.toml` before the upgrade.
+Keep it in one file and delete it from the other.
+A `[health]` key in the system config other than `metrics_require`, `metrics_peers` and `metrics_token_file` stops m6-http starting with exit 2.
+Move any other key (`enabled`, `path`, `perf_path`, `traffic_path`, `traffic_cache_s`) to `site.toml`.
+
+When both arguments name the same file, its `[auth]` and `[health]` are the site config's and the system-side copy is ignored.
+Older versions ignore the new keys, so a config can carry them before the upgrade, but the endpoints stay on the legacy gate until it.
+
+Verified: `cargo test --workspace -- --test-threads=1` passes 1388 tests with 0 failures and 0 warnings on the release and test builds.
+`cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `tools/clippy.sh` and `cargo deny check` are silent.
+`m6-http/tests/metrics_access.rs` runs the real binary and covers h1, h2 and h3.
+The three `// end cache hit` blocks in `m6-http/src/main.rs` are byte-identical to `develop` (735 lines, empty diff), and the only functions touched in that file are `handle_request_inner` and a new helper beside the error path.
+`cache_hit` measures 47.0 ns and `full_cache_hit_path` 45.6 ns on a loaded laptop (informational).
+
+**m6-monitor keeps a size-capped history of every poll and of crawler sightings, and serves it as paged JSON Lines (#238).**
+A website that runs a fleet monitor can now ask what a node looked like an hour ago or last week.
+Setting `[monitor] history_file` writes every poll to one SQLite file, and `history_max_mb` (default 256, range 1 to 1048576) caps it.
+Without `history_file` nothing is written, `/history` and `/crawlers` answer 503 and section I of `/check` says "off".
+A bad key, or a file written by a newer release, stops the start with exit status 2.
+
+Each poll is one transaction holding the poll's verdict and the text of every finding, one row per node and one row per channel and interface.
+A node row holds reachability, the node's own verdict, the build, uptime, request, cache and backend error counters, hit and miss percentiles with their sample counts, the host figures, the tunnel figures and the log reopen state.
+Once per node per `/traffic` window the history also keeps the response status counts and the crawler sightings.
+A window stores at most 100 sightings, the ones with the most requests, and cuts each user agent to 256 bytes.
+Agents that are equal after the cut share one sighting, and `sightings_dropped` on each `/crawlers` line says how many were left out.
+A node's window is stored again only after `window_minutes` have passed, so the stored windows tile time without repeating a sighting about 120 times.
+Counters are stored as the node reports them, and the hit rate is computed on output.
+An absent figure is `null`, never 0.
+
+When the file's used bytes pass the cap, the oldest polls are deleted 256 at a time until the file is 5% under it, and every row of a poll goes with it.
+Each batch also deletes the user agents that no remaining sighting names, because a visitor chooses that text and could otherwise grow the file without bound.
+The names of nodes, channels, interfaces and builds come from the fleet, stay in append-only tables and are never pruned.
+There is no time expiry and no vacuum, so the file stops growing near the cap.
+This uses `m6_core::sqlite::used_bytes`.
+The poller hands each poll to a writer thread through a queue of 8 and never waits.
+A full queue drops the poll and counts it, and a failed write adds one Warn on node `monitor`.
+A prune that fails is the state `prune_failed`, and a cap that deleting every earlier poll cannot meet is `over_cap`.
+Each has its own Warn and a line in section I of `/check`, and the poll is still stored and counted as written.
+On Unix the directory is created with mode 0700 and the file with mode 0600, and an existing file is set to 0600.
+Measured on 6 channels and one interface, a node row costs 639 bytes with its channels and interface rows.
+
+`GET /history` and `GET /crawlers` take `from` and `to` (RFC 3339 UTC, half open, at most 31 days) and an optional `node`.
+They answer `application/x-ndjson` with `Cache-Control: no-store`, one page of at most 4 MiB and 10,000 rows, and a `Link: rel="next"` header while more rows match.
+Both answer on the unix socket only.
+The monitor has no listener and no token code, so a website puts an m6-http in front of the socket and protects the routes with `require`.
+The reader opens its own read-only connection and reads a whole page inside one read transaction, so a prune cannot leave a row without its channels, interfaces or findings.
+It reads 256 rows at a time with their children, found by the exact ids of the chunk, and stops when the page is full, so a 4 MiB page reads about the 1,500 to 4,000 rows it holds.
+The file uses a rollback journal, so the writer waits for the transaction to end, up to its 5 second busy timeout.
+m6-http links no SQLite.
+
+Three m6-core blocks became public for this, so the monitor reads its `node` parameter and refuses it exactly as core reads `from`, `to` and `cursor`.
+`m6_core::request::single_query_value` returns the one raw value of a query key, or `RepeatedKey`.
+`Response::refusal` is the plain-text 400 with `no-store` and `nosniff` that `TimeRangeError` and `CursorError` already return.
+`m6_core::sqlite::open_reader` opens an existing file read-only with the 5 second busy timeout, read back.
+
+Why not the periodic stats log: it lives in each node's journal, which is capped, it has no channels, reachability, host figures or tunnel, and it disappears while a node is down, which is when a history is wanted.
+Channel counters include the monitor's own polls and header checks (#107), and `monitor_requests` says how many.
+
+Verified: unit tests cover the schema, the transaction, the cap, the crawler tiling, the cursor and the exact keys of both line shapes.
+They also cover unique long user agents across many windows staying under the cap, the per-window caps, one snapshot per page with a prune tried between statements, a page that fills in the middle of a chunk, the plans of the child queries, the two prune states and the file modes.
+Integration tests run the real binary with an unreachable node.
+They check both endpoints on the socket, the 400 and 503 answers, a failed open, a file newer than the binary, a clean shutdown and that the process listens on no TCP port.
+
+### Docs
+
+**README: five passages that explained why the README says what it says were cut (#215, closes #214).**
+Each passage explained its own reasoning or assessed the README, or stated a point twice by contrasting it with its opposite.
+The paragraph on withdrawn benchmarks keeps what a reader needs, which is that figures published before September 2026 are withdrawn and why they could not be trusted.
+F044 now reads "Not fixed. Safe for the audited configuration", which also stops a generic server's README referring to a deployment.
+No figure, score or claim changed, and the audit result and the conformance counts are as they were.
+
+Verified by reading the merged diff, which changes only the README.
+No code changed and no tests were run.
+
+**Two contributor rules in CLAUDE.md corrected (#223).** The rule that a change
+to layout, copy or rendering needs individual approval now applies only to
+changes a visitor can reach. A page no visitor can reach, such as m6-monitor's
+own page on its private socket, does not need that approval. The rule that every
+commit ends with a fixed `Co-Authored-By` line is removed, because the line
+named one model version and went stale each time the model changed.
+
+The first rule, read literally, asked for sign-off on every page m6 renders,
+including operator pages that only the operator's own tools can open. The second
+told contributors to write a trailer that was wrong as soon as it was written.
+
+Verified by reading the diff: it touches only `CLAUDE.md`, replacing one bullet
+and deleting one paragraph with its code block. No code and no other document
+changes, and no tests were run.
+
+---
+
+## 1.13.0 — 2026-10-02
+
+**A server that terminates TLS now says how long its certificate has left.**
+
+Certificate renewal is done by an *ACME* (Automatic Certificate Management Environment)
+client outside m6, on a timer, and the documented failure mode of that arrangement is
+silence: the renewal fails, the timer keeps firing and keeps failing, nothing looks, and
+the first signal is the server refusing connections on the day the certificate expires.
+A server already holds the answer, so it is the cheapest place to ask.
+
+### Added
+
+**`m6-core::tls`**, a new module. `not_after_unix(der)` reads `notAfter` out of a DER
+certificate. `record_loaded(chain)` stores what a server loaded and returns what it could
+not read. `loaded()` reports the chain as `TlsCertificate`, leaf first, each carrying
+`depth`, `not_after_unix` and `expires_in_seconds`. `unreadable()` counts what failed.
+
+**`PerfReport.tls` and `PerfReport.tls_unreadable`** on `/perf`, both `serde(default)` so
+an older node stays parseable to an aggregator rather than making the whole payload
+unreadable.
+
+**m6-monitor prints days remaining** on the per-node line beside the version and build,
+and warns below `Thresholds::cert_expiry_days`, default 21. That default is about renewal
+attempts rather than the certificate: a client on a 90-day certificate starts renewing at
+30 days and retries daily, so 21 means renewal has failed about nine times before anyone
+is told. A threshold inside the renewal window fires on the first transient failure and
+gets ignored, and an ignored warning is the same as no warning.
+
+### It reports the loaded material, never a file
+
+A path on disk and the certificate a running process is serving are different facts, and
+a renewal that wrote a new file without reloading the server is exactly where they
+disagree. `loaded()` opens nothing, so polling a monitoring endpoint cannot be made to do
+disk work.
+
+### The parse is written out rather than imported
+
+`rustls` parses no validity from `CertificateDer` and `rustls-webpki` keeps its own parse
+private, so one integer field meant either eight crates of general ASN.1 or a walk over a
+known shape. `notAfter` sits at a fixed structural position in every X.509 certificate, so
+the walk steps over six elements by length and reads the seventh. Every length is checked
+against the buffer, and a test runs every truncation of a real certificate through it.
+Dates go through `chrono`, because civil-from-days arithmetic is the mistake
+`util::iso_date_from` already records.
+
+### Absence and a measurement must not look alike
+
+Three defects found in review, all in the direction of reading silence as health.
+
+| defect | consequence |
+|---|---|
+| `depth` derived from position after dropping failures | a chain whose leaf could not be read reported its intermediate as `depth: 0`, which every document calls the certificate an ACME client renews |
+| `min()` over a partially-read chain | an unreadable leaf plus a multi-year intermediate gave a long number, every threshold passed, and the digest said ALL CLEAR while nothing knew when the served leaf expired |
+| gating the check on an `https://` poll URL | a node polled over the backbone in plaintext serves TLS publicly and reports its chain, and every arm was skipped |
+
+**Table 1: what review caught before release, and what each would have cost.** Take from
+it that a check written to notice an absence can itself read absence as health.
+
+### Known limitation, recorded rather than hidden
+
+`handle_tls_reload` rebuilds the quiche configuration alone, so after a renewal HTTP/3
+serves the new certificate while rustls keeps the old one, and nothing re-records. The
+number reported is therefore correct for HTTP/1.1 and HTTP/2 and stale for HTTP/3. That is
+a server defect rather than a reporting one and is **m6 #210**. Earlier drafts of this
+module's documentation claimed a reload re-records; no caller does, and the documents now
+say so.
+
+### Verified
+
+`cargo test --workspace` with the new tests, clippy silent, zero compiler warnings,
+`cargo fmt` clean, the examples workspace building with clippy silent, and CI green on
+h1, h2 and h3 conformance, cargo-deny and the MSRV check. The parse is tested against
+rcgen-generated certificates rather than a fixture that would expire: a future expiry read
+back exactly, an expired one reading negative, a v1 certificate with no version field, an
+impossible date, DER's forbidden indefinite length, and every truncation of a real
+certificate.
+
+---
+
+## 1.12.1 — 2026-10-02
+
+**A documentation and comment release. No behaviour changes to any shipped binary.**
+
+RULE ZERO says nothing about one particular deployment belongs in this repository,
+in code, tests, comments, docs or the changelog. This removes what was still there,
+and corrects three comments that a previous pass made wrong while removing other
+things.
+
+### Removed
+
+One deployment's node names, in both source and prose. A credentials file path and
+the DNS provider it belonged to, used as a worked example. A hosting provider,
+named in the benchmark host table with the machine's specification, in a deployment
+walkthrough and in a README pointer. A visitor's address and session identifier,
+carried in a test fixture captured from a live log. A firewall rule copied verbatim
+from a running ruleset, counters included. An ssh port, which appeared only as a
+worked example and therefore only ever recorded that its author deviates from the
+default. Twenty-odd comments asserting measurements taken against one private
+instance, which no reader can reproduce and which are therefore assertions rather
+than evidence.
+
+Addresses that had to stay addresses, such as a client address in a log fixture,
+are now RFC 5737 documentation ranges.
+
+### Changed
+
+**One host, everywhere.** `user@example.com` is the only ssh and rsync target,
+replacing five competing conventions. `example.com` and its subdomains are the only
+http, https, h2c and h2s hosts.
+
+**"WireGuard" is now "private backbone",** in 16 places across 9 files. The
+transport between nodes is the operator's choice. m6 requires only that the
+listener is on a private address.
+
+**`M6_BUILD_ROOT` defaults to `m6-build`,** relative to the login directory, rather
+than a path only a root login can write.
+
+### Fixed
+
+Three comments that an earlier pass rewrote into something incorrect, which is
+worse than the unverifiable claim each replaced:
+
+- The 0-RTT comment credited QUIC early data for the cache-to-origin hop. That hop
+  is h2c over TCP. The setting configures the listener that serves visitors.
+- Two comments claimed a table was reproducible with one `curl -H`. The column
+  described is what the replaced implementation produced, so following the
+  instruction contradicts the table.
+- A dated narrative kept its date and swapped only its address, leaving a comment
+  asserting that a documentation address made a real request on a real day.
+
+### Verified
+
+`cargo test --workspace` 1150 passed and 0 failed, clippy silent, zero compiler
+warnings, `cargo fmt` clean, `shellcheck -S warning` clean, and the examples
+workspace builds with clippy silent against this tree. CI passed h1, h2 and h3
+conformance, the examples suite, cargo-deny and the MSRV check.
+
+### What this release does not do
+
+**The history is untouched.** Every string removed here remains reachable in any
+clone, and removing it from the working tree does not retract it. That is a
+separate decision about a published repository.
+
+**The default is still wrong.** The full checks still want a remote Linux host,
+which is #207, and is why a contributor's connection settings were in this
+repository to be removed in the first place.
 
 ---
 
@@ -377,17 +1106,17 @@ external tester, which makes it the first real protocol check a laptop run
 performs: h2spec and h3spec are not installed there and every other stage skips.
 
 Why it was needed. 1.9.0 installed a session ticketer so browser sessions could
-resume, and nothing anywhere could tell whether it worked. The production
-monitor read 0% resumed on `http/2/external` across all three nodes for a day
-after the 1.10.0 deploy, which looks identical whether the ticketer is broken or
+resume, and nothing anywhere could tell whether it worked. A monitor read 0%
+resumed on `http/2/external` across a whole fleet for a day after the 1.10.0
+deploy, which looks identical whether the ticketer is broken or
 the traffic has no returning connections. Issue #101, closed: the server resumes
 on every protocol, the counter is accurate, and the 0% was the traffic, because
 a browser opens ONE h2 connection per visit and resumption needs a return visit
 inside the ticket's lifetime.
 
-Verified against production: 7 of 8 h2 handshakes resumed and 7 of 8 h1, on all
-three nodes, with the origin's own `resumed` counter incrementing by exactly the
-number the client observed.
+Verified against a running server: 7 of 8 h2 handshakes resumed and 7 of 8 h1,
+with the server's own `resumed` counter incrementing by exactly the number the
+client observed.
 
 ### Fixed
 
@@ -876,12 +1605,12 @@ end, h3 handshake p50 against a 4.9 ms path:
 
 A kilobyte saved is worth nothing against ten milliseconds of CPU.
 
-**On the long paths this was invisible.** edge-a at 308 ms and edge-b at 211 ms both
-measured 1.00 and 1.05 round trips after the 1.4.0 deploy, because a round trip hides
-ten milliseconds completely. origin serves its own city over a 5 ms path from a
-single-core VM, and there it was the whole cost: 9.5 ms under 1.3.0, 14.6 ms under
-1.4.0. It was found by measuring production after the rollout, not by any gate.
-Neither CI nor conformance measures handshake CPU on a short path.
+**On a long path this was invisible.** At 211 ms and 308 ms of round-trip time the
+handshake measured 1.00 and 1.05 round trips after the 1.4.0 deploy, because a round
+trip hides ten milliseconds completely. On a 5 ms path from a single-core VM it was
+the whole cost: 9.5 ms under 1.3.0, 14.6 ms under 1.4.0. It was found by measuring a
+running server after the rollout, not by any gate. Neither CI nor conformance measures
+handshake CPU on a short path.
 
 The compressed chain is now cached for the life of the process, keyed by the
 uncompressed bytes so a collision cannot serve one host's chain in place of another's,
@@ -899,10 +1628,10 @@ the only way to learn what a node was running was to ssh in and ask the binary. 
 node runs the release we think it does" was an invariant nothing could check remotely.
 
 On 2026-09-16 four written records disagreed about the deployment fleet and none of
-them matched it: the deployment repository's m6 pin said v1.2.0, its captured config
-said 1.2.0 with an md5 matching nothing running, its release log named v1.1.0 as the
-newest deploy, and all three nodes were serving 1.3.0 with an identical md5. No node
-was faulty. Nothing could observe the truth, so the records rotted quietly.
+them matched it: a deploy repository pinning one tag, its captured config naming
+that tag with an artefact hash matching nothing running, a release log naming an
+older tag as the newest deploy, and every node serving a fourth. No node has to be
+faulty for that. Nothing can observe the truth, so the records rot quietly.
 
 The monitor now prints the version per node and raises a warning when the reporting
 nodes disagree, naming each. **A node that cannot report its version counts as drift,
@@ -953,8 +1682,8 @@ staging origin, same probe and path, only compression changing:
 | brotli | **2859 B** | 3 | no stall, 1.16x |
 
 2859 against a 3600 budget, so the flight fits at the **conforming factor of 3** with
-headroom for a chain that grows. On the edge-a and edge-b paths, where a round trip
-is 270 to 300 ms, that round trip was the single largest avoidable cost in setting up
+headroom for a chain that grows. On an intercontinental path, where a round trip is
+270 to 300 ms, that round trip was the single largest avoidable cost in setting up
 a new connection.
 
 ### zlib is accepted, never offered
@@ -1114,7 +1843,7 @@ for absent sample counts.
 
 ### Security
 
-**The quiche revision production depended on was unreferenced.** 1.2.0 pinned
+**The pinned quiche revision was unreferenced.** 1.2.0 pinned
 `916a5a25`, which sat on no branch and no tag in the fork and was reachable only by
 raw SHA. GitHub garbage-collects unreferenced objects; when that happened every
 build would have failed, CI included, and the commit would have been unrecoverable.
@@ -1163,7 +1892,7 @@ which is the only reason that flag existed. The health check is now one fetch ov
 a forwarded socket, with no ssh to any node:
 
 ```sh
-ssh -fN -L /tmp/m6mon.sock:/run/m6/m6-monitor.sock root@<build-host>
+ssh -fN -L /tmp/m6mon.sock:/run/m6/m6-monitor.sock user@example.com
 curl --unix-socket /tmp/m6mon.sock http://localhost/check
 ```
 
@@ -1626,7 +2355,8 @@ existed and failed the moment it was fixed. It is now split so each status
 asserts its own rule: 200 carries the header, 204 must not. A test can pin wrong
 behaviour just as firmly as right behaviour, and this one did.
 
-Found by reading a 304 off a raw socket on production, not from the source.
+Found by reading a 304 off a raw socket against a running server, not from the
+source.
 
 694 workspace tests pass. Zero warnings.
 
@@ -1690,7 +2420,7 @@ the wrong seam.
 **Consequence worth stating plainly:** honouring these makes reloads slower, by
 design. A reload that previously replayed from cache in ~2us now reaches the
 backend. On the origin that is a couple of milliseconds; from a cache node it
-is a round trip to origin. That is what the client asked for -- the whole point
+is a round trip to the origin. That is what the client asked for -- the whole point
 of `no-cache` is to bypass the cache -- and it is the only way "force refresh"
 can work at all, but it is a real change in behaviour for reloads and not a
 free correctness win.

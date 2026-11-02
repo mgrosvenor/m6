@@ -642,8 +642,8 @@ run_h3() {
 # measurement did not exist. m6 issue #101.
 #
 # Resumption is a latency property, not a nicety: a full handshake costs the
-# certificate and a signature, and on this fleet a resumed one runs p50 0.76ms
-# against 161ms full on the origin's own h1 channel.
+# certificate and a signature, and a resumed one skips both. Over a real
+# network path the two differ by orders of magnitude.
 #
 # ALL THREE PROTOCOLS, because they resume by different machinery: h1 and h2
 # share rustls' TLS 1.3 tickets, h3 uses QUIC's own resumption, and a ticketer

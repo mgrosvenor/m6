@@ -864,7 +864,7 @@ fn h2_data_frame_at_max_frame_size_must_get_a_response() {
 /// measured on a **cold cache key**. m6-http's own implementation was always
 /// correct, so a warm key returns 304 whether or not m6-file is fixed; only a
 /// miss reaches m6-file, which did strong comparison and answered 200 with the
-/// whole body. That is why the symptom came and went on production and read as
+/// whole body. That is why the symptom came and went under real traffic and read as
 /// noise.
 ///
 /// The cold key here is a fresh query string. The cache key includes the

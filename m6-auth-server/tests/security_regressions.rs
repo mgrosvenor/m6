@@ -36,7 +36,7 @@ fn is_offsite(location: &str) -> bool {
 
 // ── Finding 8: open redirect after login ─────────────────────────────────────
 
-/// Original defect: `?next=//evil.com` starts with `/`, so it passed the
+/// Original defect: `?next=//evil.example.com` starts with `/`, so it passed the
 /// `starts_with('/')` check and was used verbatim as the post-login
 /// `Location`. Browsers resolve a protocol-relative URL against the current
 /// scheme and navigate off-site.
@@ -44,7 +44,7 @@ fn is_offsite(location: &str) -> bool {
 /// Property: a post-login redirect must stay on this origin.
 #[test]
 fn finding_8_login_next_must_not_allow_protocol_relative_redirect() {
-    let next = validate_next(Some("//evil.com/phish"));
+    let next = validate_next(Some("//evil.example.com/phish"));
 
     assert!(
         !is_offsite(&next),
@@ -61,11 +61,11 @@ fn finding_8_login_next_must_not_allow_protocol_relative_redirect() {
 /// Property: `/\host` must not be accepted as a same-origin path.
 #[test]
 fn finding_8b_login_next_must_not_allow_backslash_redirect() {
-    let next = validate_next(Some(r"/\evil.com"));
+    let next = validate_next(Some(r"/\evil.example.com"));
 
     assert!(
         !is_offsite(&next),
-        "`{next}` is normalised to `//evil.com` by browsers and escapes the origin"
+        "`{next}` is normalised to `//evil.example.com` by browsers and escapes the origin"
     );
     assert_eq!(next, "/");
 }
@@ -76,7 +76,7 @@ fn finding_8b_login_next_must_not_allow_backslash_redirect() {
 /// Property: the refresh redirect must stay on this origin.
 #[test]
 fn finding_8c_refresh_referer_must_not_allow_protocol_relative_redirect() {
-    let location = refresh_redirect_location(Some("//evil.com/phish"));
+    let location = refresh_redirect_location(Some("//evil.example.com/phish"));
 
     assert!(
         !is_offsite(&location),
@@ -99,6 +99,6 @@ fn finding_8_legitimate_relative_paths_still_accepted() {
     );
 
     // Absolute URLs and missing values fall back to the site root.
-    assert_eq!(validate_next(Some("https://evil.com")), "/");
+    assert_eq!(validate_next(Some("https://evil.example.com")), "/");
     assert_eq!(validate_next(None), "/");
 }

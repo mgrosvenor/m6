@@ -10,8 +10,11 @@
 //!   response cache key, so `gzip` and `gzip, deflate, br, zstd` were separate
 //!   entries for one byte-identical response.
 //!
-//! Measured on production 2026-09-10, against the HTML path served by
-//! `m6-render`:
+//! What each implementation served, against the HTML path. The `served`
+//! column is what the `ae_contains` substring match produced, which this
+//! module replaced, so it is a record of the defect rather than something a
+//! current build reproduces. The `correct` column is what this code answers
+//! now, and `negotiate`'s own tests below assert it:
 //!
 //! | Accept-Encoding        | correct  | served |
 //! |------------------------|----------|--------|

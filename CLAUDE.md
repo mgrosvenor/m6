@@ -116,11 +116,14 @@ gh pr create --base main --head develop --title "Release 1.1.0"
 git checkout main && git pull && ./tag.sh v1.1.0
 ```
 
+Choose the next version number from the policy under Versions in
+`CONTRIBUTING.md`, which is the one definition, without asking.
+
 The build host is still worth running by hand before opening a pull request, because
 it tests more than a runner can:
 
 ```sh
-M6_BUILD_HOST=root@<box> ./tools/build-host-tests.sh
+M6_BUILD_HOST=user@example.com ./tools/build-host-tests.sh
 ```
 
 ---
@@ -229,8 +232,9 @@ and a page being edited for any other reason should be brought into line while i
   lint with the reason argued in the commit. Never a global allowance.
 - **Test locally, commit, then deploy.** Never deploy from an uncommitted tree.
 - **Secrets never enter git.** Only `.example` files, paths, documented shape.
-- Any change to **layout, copy, or rendering** needs individual approval before
-  it ships.
+- Any change to **layout, copy, or rendering that a visitor can reach** needs
+  individual approval before it ships. A page no visitor can reach, such as
+  m6-monitor's own page on its private socket, does not.
 - Image resizing is the owner's job.
 - Firewall blocks are **per-IP only**, no CIDR rules.
 - **Blocking an address is a write.** Propose candidates; never apply without
@@ -266,12 +270,6 @@ against a deployed artefact.
 A commit that fixes a defect should say what the defect actually did, in terms
 of what a user or an operator would have seen. A commit that changes a recorded
 minimum or a performance number must argue for it.
-
-Every commit ends with:
-
-```
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
-```
 
 ---
 

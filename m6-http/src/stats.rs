@@ -69,47 +69,25 @@ impl Version {
     }
 }
 
-/// Which network the request arrived on.
+/// Which network the request arrived on, as declared by `[server]
+/// internal_binds`. A listener that list names is internal, every other is
+/// external. Nothing is inferred from an address.
 ///
 /// The origin serves two completely different populations and pooling them
 /// makes both numbers meaningless: real visitors arrive on the public NIC
-/// over TLS or QUIC, while cache-miss forwards from edge-a and edge-b
-/// arrive over the WireGuard tunnel as h2c. The second group carries
-/// intercontinental RTT (~200-300ms) that has nothing to do with how fast
-/// this node is.
+/// over TLS or QUIC, while cache-miss forwards from the cache nodes arrive
+/// over a private tunnel as h2c. Where a cache node is on another continent
+/// the second group carries 200-300ms of RTT that has nothing to do with how
+/// fast this node is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Iface {
     /// Public network interface.
     External,
-    /// WireGuard tunnel between nodes.
+    /// Private backbone between nodes.
     Internal,
 }
 
 impl Iface {
-    /// Classify a listener by its bind address.
-    ///
-    /// Derived rather than hardcoded per listener: h2c is *conventionally*
-    /// the WireGuard listener here, but that is deployment configuration, not
-    /// a property of the protocol, and a future node that exposes h2c
-    /// publicly should not be silently labelled internal.
-    pub fn for_bind(bind: &str) -> Iface {
-        let host = bind.rsplit_once(':').map(|(h, _)| h).unwrap_or(bind);
-        let host = host.trim_start_matches('[').trim_end_matches(']');
-        let octets: Vec<u8> = host.split('.').filter_map(|o| o.parse().ok()).collect();
-        let private = match octets.as_slice() {
-            [10, ..] => true,
-            [172, b, ..] if (16..=31).contains(b) => true,
-            [192, 168, ..] => true,
-            [127, ..] => true,
-            _ => host.starts_with("fd") || host.starts_with("fc") || host == "::1",
-        };
-        if private {
-            Iface::Internal
-        } else {
-            Iface::External
-        }
-    }
-
     pub fn as_str(self) -> &'static str {
         match self {
             Iface::External => "external",
@@ -359,7 +337,8 @@ pub struct Stats {
     /// between noticing silent mail loss and not.
     ///
     /// A small map rather than a fixed array: backend names come from config and
-    /// this deployment has six. Only backends that have actually errored appear.
+    /// a deployment commonly has several. Only backends that have actually errored
+    /// appear.
     backend_errors_by_name: std::collections::BTreeMap<String, u64>,
 
     // Window counters (reset each emit)
@@ -538,7 +517,7 @@ impl Stats {
         //
         // Observed for nine consecutive hours: a bot sending an unrecognised
         // verb gets 501 Not Implemented from method validation, no backend is
-        // ever contacted, and `backend_errors_total` rose on all three nodes.
+        // ever contacted, and `backend_errors_total` rose on every node.
         // An operator watching that counter would go looking for a failing
         // renderer that was never involved.
         let backend_error = status >= 500 && !is_self_generated(backend);
@@ -1019,22 +998,6 @@ mod channel_tests {
     }
 
     #[test]
-    fn interface_is_classified_from_the_bind_address() {
-        // The WireGuard backbone between nodes.
-        assert_eq!(Iface::for_bind("10.0.0.1:80"), Iface::Internal);
-        assert_eq!(Iface::for_bind("192.168.1.5:80"), Iface::Internal);
-        assert_eq!(Iface::for_bind("172.16.0.1:80"), Iface::Internal);
-        assert_eq!(Iface::for_bind("127.0.0.1:8080"), Iface::Internal);
-        // Public listeners.
-        assert_eq!(Iface::for_bind("203.0.113.7:443"), Iface::External);
-        assert_eq!(Iface::for_bind("0.0.0.0:443"), Iface::External);
-        // 172.32 is OUTSIDE the private 172.16/12 block; treating the whole
-        // 172/8 as private would misclassify real public addresses.
-        assert_eq!(Iface::for_bind("172.32.0.1:443"), Iface::External);
-        assert_eq!(Iface::for_bind("172.15.0.1:443"), Iface::External);
-    }
-
-    #[test]
     fn channel_index_round_trips_for_every_combination() {
         for version in [Version::Http11, Version::Http2, Version::Http3] {
             for iface in [Iface::External, Iface::Internal] {
@@ -1046,7 +1009,7 @@ mod channel_tests {
     }
 
     /// The point of the whole exercise: an origin's public visitor traffic and
-    /// its WireGuard cache-miss forwards must not land in the same bucket.
+    /// its backbone cache-miss forwards must not land in the same bucket.
     #[test]
     fn traffic_is_separated_by_version_and_interface() {
         let mut stats = Stats::new();
@@ -1200,8 +1163,8 @@ mod backend_error_attribution_tests {
         Channel::new(Version::Http2, Iface::External)
     }
 
-    /// The regression this closes, seen on all three nodes for nine
-    /// consecutive hours: a bot sends an unrecognised verb, method validation
+    /// The regression this closes, which ran for hours across a whole fleet
+    /// before anyone looked: a bot sends an unrecognised verb, method validation
     /// answers 501 without contacting anything, and backend_errors_total
     /// rises. An operator watching that counter goes hunting for a failing
     /// renderer that was never involved.
@@ -1558,7 +1521,7 @@ mod handshake_tests {
     }
 
     /// External and internal are different events even on one protocol: a
-    /// browser handshake and one from the WireGuard backbone.
+    /// browser handshake and one from the private backbone.
     #[test]
     fn interface_separates_them_too() {
         let mut s = Stats::new();

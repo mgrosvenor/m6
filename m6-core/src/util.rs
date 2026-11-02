@@ -42,6 +42,14 @@ pub fn iso_date_from(t: std::time::SystemTime) -> String {
         .to_string()
 }
 
+/// Escape `&`, `<`, `>` and `"` so text can sit in HTML content or a quoted attribute.
+pub fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
 /// Current datetime in ISO 8601 format: "2024-01-15T10:30:00Z"
 pub fn now_iso8601() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
@@ -65,6 +73,14 @@ pub fn iso8601_minutes_ago(minutes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn html_escape_covers_markup_and_quotes() {
+        assert_eq!(
+            html_escape(r#"<a href="x">&</a>"#),
+            "&lt;a href=&quot;x&quot;&gt;&amp;&lt;/a&gt;"
+        );
+    }
 
     #[test]
     fn test_slugify() {

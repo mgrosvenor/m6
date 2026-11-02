@@ -610,7 +610,7 @@ fn the_five_routes_answer_as_specified() {
             Some("text/html; charset=utf-8"),
             "{lang}: / needs a textual Content-Type WITH a charset (spec §3.4). \
              Omitting the charset makes clients fall back to Latin-1 and render \
-             UTF-8 as mojibake, which has happened in production here."
+             UTF-8 as mojibake, which has happened on a running server."
         );
 
         let health = b.get("/health");

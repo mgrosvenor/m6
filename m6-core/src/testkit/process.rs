@@ -85,14 +85,27 @@ impl Service {
         }
     }
 
+    /// Send `sig` to the child.
+    ///
+    /// Panics with the name and pid if the child has already been reaped.
+    pub fn signal(&self, sig: libc::c_int) {
+        let child = self
+            .child
+            .as_ref()
+            .unwrap_or_else(|| panic!("{} was already reaped; cannot signal it", self.name));
+        // SAFETY: `kill` takes a pid and a signal number and touches no
+        // memory of ours.
+        unsafe { libc::kill(child.id() as libc::pid_t, sig) };
+    }
+
     /// Send SIGTERM and wait for the child to exit, returning its status.
     ///
     /// This is how to test a service's shutdown path: SIGTERM, then assert on
     /// what it did. Panics if the child is still running after `timeout`,
     /// which is itself the failure a graceful-shutdown test is looking for.
     pub fn terminate(&mut self, timeout: Duration) -> ExitStatus {
+        self.signal(libc::SIGTERM);
         let child = self.child.as_mut().expect("service already reaped");
-        unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
         let deadline = Instant::now() + timeout;
         loop {
             if let Some(status) = child.try_wait().ok().flatten() {

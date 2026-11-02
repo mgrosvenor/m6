@@ -10,6 +10,11 @@
 //! backend name a monitoring response is tagged with, and keeping those
 //! responses out of the site traffic counters.
 
+use std::net::IpAddr;
+
+use crate::auth::{self, PublicKey, Refusal};
+use crate::config::HealthConfig;
+
 pub use m6_core::monitoring::{
     metrics_authorised, HealthReport, PerfAccess, PerfOutcome, PerfReport, PerfSubject, PoolHealth,
 };
@@ -53,6 +58,9 @@ mod token_file_tests {
             traffic_cache_s: 60,
             metrics_token_file: Some("/etc/m6/perf-token".to_string()),
             metrics_token: Some("super-secret-value".to_string()),
+            metrics_require: None,
+            metrics_peers: None,
+            metrics_peer_ips: None,
         };
         let dumped = serde_json::to_string(&health).expect("serialisable");
         assert!(
@@ -140,24 +148,23 @@ const FIREWALL_JSON: &str = "/var/lib/m6/firewall.json";
 
 /// Read the last `window_minutes` of the analytics log and summarise it.
 ///
+/// The newest rotated file is read as well, so the window survives a rotation.
+/// It is read only when the live tail did not fill the budget and the file was written inside the window, and a gzip file only when it is small (see `m6_core::log::read_recent_counted`).
+/// This runs inline on the event loop, so the work is bounded.
+///
 /// The tail is bounded rather than reading the whole file: an hour of traffic
 /// is at most a few hundred KB and the file is tens of MB, so reading it all
 /// would be almost entirely wasted work. 24MB is a wide margin over the
 /// busiest hour observed (370KB, during a 890-request probe).
 fn build_report(node: &str, path: &str, window_minutes: u64) -> anyhow::Result<TrafficReport> {
-    use std::io::{Read, Seek, SeekFrom};
+    const TAIL_BYTES: usize = 24 * 1024 * 1024;
 
-    const TAIL_BYTES: u64 = 24 * 1024 * 1024;
-
-    let mut f = std::fs::File::open(path)?;
-    let len = f.metadata()?.len();
-    if len > TAIL_BYTES {
-        f.seek(SeekFrom::Start(len - TAIL_BYTES))?;
-    }
-    let mut buf = String::new();
-    f.read_to_string(&mut buf)?;
-    // A mid-record start is expected after a seek, and `ndjson::read_str`
-    // skips what it cannot parse, so the partial first line costs nothing.
+    // The newest rotated file is read before the live one, so the summary
+    // spans a rotation. A mid-record start is expected after a cut, and
+    // `ndjson::read_str` skips what it cannot parse, so it costs nothing.
+    let since_time =
+        std::time::SystemTime::now() - Duration::from_secs(window_minutes.saturating_mul(60));
+    let buf = m6_core::log::read_recent(std::path::Path::new(path), TAIL_BYTES, since_time)?;
 
     let since = m6_core::util::iso8601_minutes_ago(window_minutes);
     let mut report = TrafficReport::build(node, &buf, &since, window_minutes);
@@ -169,10 +176,11 @@ fn build_report(node: &str, path: &str, window_minutes: u64) -> anyhow::Result<T
     Ok(report)
 }
 
-/// Serve `/traffic`: this node's summary of its own traffic.
+/// Serve `/traffic` to a caller [`metrics_gate`] has already let through:
+/// this node's summary of its own traffic.
 ///
-/// Same token as `/perf`, and the same order of operations: authorise first,
-/// then work. An anonymous caller never causes a file read.
+/// Gate first, then work, as for `/perf`, so an anonymous caller never causes
+/// a file read.
 ///
 /// The cache is what makes a file read safe to expose at all. Without it a
 /// monitor polling every thirty seconds makes every node re-read its analytics
@@ -181,22 +189,12 @@ fn build_report(node: &str, path: &str, window_minutes: u64) -> anyhow::Result<T
 /// endpoint is scraped. The lock is held across the read deliberately: a
 /// second caller arriving mid-read waits for the first answer rather than
 /// starting a second tail.
-pub fn traffic(
+pub fn traffic_authorised(
     node: &str,
     log_path: &str,
     window_minutes: u64,
     cache_for: Duration,
-    headers: &[(String, String)],
-    configured_token: Option<&str>,
 ) -> PerfOutcome {
-    match configured_token.filter(|t| !t.is_empty()) {
-        None => return PerfOutcome::Disabled,
-        Some(_) if !metrics_authorised(headers, configured_token) => {
-            return PerfOutcome::Unauthorised
-        }
-        Some(_) => {}
-    }
-
     let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((built, report)) = cache.as_ref() {
         if built.elapsed() < cache_for {
@@ -212,6 +210,69 @@ pub fn traffic(
     }
 }
 
+/// The verdict of the metrics gate for one request.
+pub enum Gate {
+    /// Serve the report.
+    Open,
+    /// Answer with this and do nothing else.
+    Refused(PerfOutcome),
+}
+
+/// Decide whether `/perf` or `/traffic` may be served to this request.
+///
+/// Two rules, in this order:
+///
+/// 1. `metrics_peers`, when set: the request must not have arrived on an
+///    internal h2c listener (there the client address is a forwarded claim),
+///    and its peer address must be listed. Otherwise `Disabled`, the 404 an
+///    unconfigured endpoint gives, before any token is looked at.
+/// 2. `metrics_require`, when set: an API token that passes the claim check
+///    (`Unauthorised` for none or a bad one, `Forbidden` for the wrong claim).
+///    When unset, the legacy `metrics_token_file` gate.
+///
+/// The address rule allocates nothing: one parse of the peer address and a
+/// scan of a short slice, and only on these two paths.
+pub fn metrics_gate(
+    h: &HealthConfig,
+    key: Option<&PublicKey>,
+    headers: &[(String, String)],
+    client_ip: &str,
+    from_internal: bool,
+) -> Gate {
+    if let Some(peers) = &h.metrics_peer_ips {
+        let listed = !from_internal
+            && client_ip
+                .parse::<IpAddr>()
+                .is_ok_and(|ip| peers.contains(&ip.to_canonical()));
+        if !listed {
+            return Gate::Refused(PerfOutcome::Disabled);
+        }
+    }
+    match h.metrics_require.as_deref() {
+        Some(require) => {
+            let Some(key) = key else {
+                return Gate::Refused(PerfOutcome::Unauthorised);
+            };
+            match auth::authorise(key, headers, require) {
+                Ok(_) => Gate::Open,
+                Err(Refusal::Insufficient) => Gate::Refused(PerfOutcome::Forbidden),
+                Err(Refusal::NoToken | Refusal::Invalid(_)) => {
+                    Gate::Refused(PerfOutcome::Unauthorised)
+                }
+            }
+        }
+        None => match (PerfAccess {
+            headers,
+            configured_token: h.metrics_token.as_deref(),
+        })
+        .refusal()
+        {
+            Some(refused) => Gate::Refused(refused),
+            None => Gate::Open,
+        },
+    }
+}
+
 #[cfg(test)]
 mod traffic_endpoint_tests {
     use super::*;
@@ -223,33 +284,27 @@ mod traffic_endpoint_tests {
         )
     }
 
-    fn auth(v: &str) -> Vec<(String, String)> {
-        vec![("Authorization".to_string(), v.to_string())]
-    }
-
-    /// Authorisation happens before any file is opened. An anonymous caller
-    /// must not be able to make a node read its analytics log, which is the
-    /// whole reason the expensive endpoints are gated.
+    /// No token configured means the endpoint does not exist: a 404, so it
+    /// does not advertise a door. A wrong token is refused by the gate,
+    /// which runs before `traffic_authorised` and so before any file is
+    /// opened.
     #[test]
-    fn an_unauthorised_caller_never_reaches_the_log() {
-        let out = traffic(
-            "origin",
-            "/definitely/not/a/file",
-            60,
-            Duration::from_secs(60),
-            &auth("Bearer wrong"),
-            Some("right"),
-        );
-        // Unauthorised, not TrafficError: it never tried to open the path.
-        assert!(matches!(out, PerfOutcome::Unauthorised));
-    }
+    fn the_legacy_gate_refuses_before_the_log_is_read() {
+        let none = HealthConfig::default();
+        let Gate::Refused(out) = metrics_gate(&none, None, &[], "127.0.0.1", false) else {
+            panic!("no token configured must refuse");
+        };
+        assert_eq!(out.into_response().0, 404);
 
-    #[test]
-    fn no_token_configured_means_the_endpoint_does_not_exist() {
-        let out = traffic("origin", "/nope", 60, Duration::from_secs(60), &[], None);
-        assert!(matches!(out, PerfOutcome::Disabled));
-        let (code, _, _) = out.into_response();
-        assert_eq!(code, 404, "404 not 401: it must not advertise a door");
+        let h = HealthConfig {
+            metrics_token: Some("right".to_string()),
+            ..HealthConfig::default()
+        };
+        let wrong = vec![("Authorization".to_string(), "Bearer wrong".to_string())];
+        assert!(matches!(
+            metrics_gate(&h, None, &wrong, "127.0.0.1", false),
+            Gate::Refused(PerfOutcome::Unauthorised)
+        ));
     }
 
     /// An unreadable log is reported, not silently served as a quiet hour.
@@ -257,13 +312,11 @@ mod traffic_endpoint_tests {
     /// path looked exactly like a feature switched off.
     #[test]
     fn an_unreadable_log_is_a_503_with_a_reason() {
-        let out = traffic(
+        let out = traffic_authorised(
             "origin",
             "/definitely/not/a/file",
             60,
             Duration::from_secs(0),
-            &auth("Bearer tok"),
-            Some("tok"),
         );
         let (code, _, body) = out.into_response();
         assert_eq!(code, 503);
@@ -296,13 +349,11 @@ mod traffic_endpoint_tests {
         .unwrap();
         f.flush().unwrap();
 
-        let out = traffic(
+        let out = traffic_authorised(
             "origin",
             f.path().to_str().unwrap(),
             60,
             Duration::from_secs(0),
-            &auth("Bearer tok"),
-            Some("tok"),
         );
         let (code, headers, body) = out.into_response();
         assert_eq!(code, 200);
@@ -318,5 +369,181 @@ mod traffic_endpoint_tests {
         assert!(headers
             .iter()
             .any(|(k, val)| k.eq_ignore_ascii_case("cache-control") && val == "no-store"));
+    }
+
+    /// After an hourly rotation the live file is nearly empty, and the
+    /// monitor's sixty minute sections must not shrink with it.
+    #[test]
+    fn the_window_spans_the_newest_rotated_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = m6_core::util::now_iso8601();
+        let ts = now.trim_end_matches('Z');
+        let live = dir.path().join("analytics.ndjson");
+        std::fs::write(
+            &live,
+            format!(
+                "{}\n",
+                row(&format!("{ts}.300Z"), "1.2.3.4", "/c", 200, "x")
+            ),
+        )
+        .unwrap();
+        let rotated = format!(
+            "{}\n{}\n",
+            row(&format!("{ts}.100Z"), "1.2.3.4", "/a", 200, "x"),
+            row(&format!("{ts}.200Z"), "1.2.3.4", "/b", 200, "x")
+        );
+        // Plain here. The gzip path is covered by `m6_core::log`'s tests.
+        std::fs::write(dir.path().join("analytics.ndjson-2026010101"), rotated).unwrap();
+        let out = traffic_authorised("origin", live.to_str().unwrap(), 60, Duration::from_secs(0));
+        let (code, _, body) = out.into_response();
+        assert_eq!(code, 200);
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["total_requests"], 3);
+    }
+}
+
+#[cfg(test)]
+mod metrics_gate_tests {
+    use super::*;
+    use crate::auth::test_keys::{bearer, keypair, mint};
+
+    fn token(private_pem: &str, roles: &[&str]) -> Vec<(String, String)> {
+        bearer(&mint(private_pem, roles, 3600))
+    }
+
+    fn health(peers: Option<&[&str]>, require: Option<&str>, legacy: Option<&str>) -> HealthConfig {
+        HealthConfig {
+            metrics_require: require.map(str::to_string),
+            metrics_peer_ips: peers.map(|p| {
+                p.iter()
+                    .map(|s| s.parse::<IpAddr>().unwrap().to_canonical())
+                    .collect()
+            }),
+            metrics_token: legacy.map(str::to_string),
+            ..HealthConfig::default()
+        }
+    }
+
+    fn is_disabled(g: &Gate) -> bool {
+        matches!(g, Gate::Refused(PerfOutcome::Disabled))
+    }
+
+    #[test]
+    fn an_unlisted_peer_is_404_before_any_token_check() {
+        let (_d, key, private) = keypair();
+        let h = health(Some(&["10.0.0.9"]), Some("role:monitor"), None);
+        let good = token(&private, &["monitor"]);
+        for ip in ["203.0.113.7", "2001:db8::1", "10.0.0.8"] {
+            let g = metrics_gate(&h, Some(&key), &good, ip, false);
+            assert!(is_disabled(&g), "{ip} must get 404 even with a valid token");
+        }
+        // No token and an unlisted peer is still 404, not 401: a stranger
+        // learns nothing about the credential.
+        assert!(is_disabled(&metrics_gate(
+            &h,
+            Some(&key),
+            &[],
+            "203.0.113.7",
+            false
+        )));
+    }
+
+    #[test]
+    fn a_listed_peer_passes_the_address_rule() {
+        let (_d, key, private) = keypair();
+        let h = health(Some(&["10.0.0.9"]), Some("role:monitor"), None);
+        let good = token(&private, &["monitor"]);
+        assert!(matches!(
+            metrics_gate(&h, Some(&key), &good, "10.0.0.9", false),
+            Gate::Open
+        ));
+        // An IPv4-mapped IPv6 peer is the same host, so the comparison is canonical.
+        assert!(matches!(
+            metrics_gate(&h, Some(&key), &good, "::ffff:10.0.0.9", false),
+            Gate::Open
+        ));
+    }
+
+    #[test]
+    fn an_unparseable_client_address_is_refused() {
+        let (_d, key, private) = keypair();
+        let h = health(Some(&["10.0.0.9"]), Some("role:monitor"), None);
+        let good = token(&private, &["monitor"]);
+        for ip in ["", "unknown", "10.0.0.9:443", "10.0.0.9, 1.2.3.4"] {
+            assert!(
+                is_disabled(&metrics_gate(&h, Some(&key), &good, ip, false)),
+                "{ip:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_listed_peer_on_an_internal_listener_is_refused() {
+        let (_d, key, private) = keypair();
+        let h = health(Some(&["10.0.0.9"]), Some("role:monitor"), None);
+        let good = token(&private, &["monitor"]);
+        assert!(is_disabled(&metrics_gate(
+            &h,
+            Some(&key),
+            &good,
+            "10.0.0.9",
+            true
+        )));
+    }
+
+    #[test]
+    fn a_listed_peer_with_a_valid_token_but_wrong_role_is_403() {
+        let (_d, key, private) = keypair();
+        let h = health(Some(&["10.0.0.9"]), Some("role:monitor"), None);
+        let reader = token(&private, &["reader"]);
+        assert!(matches!(
+            metrics_gate(&h, Some(&key), &reader, "10.0.0.9", false),
+            Gate::Refused(PerfOutcome::Forbidden)
+        ));
+    }
+
+    #[test]
+    fn metrics_require_without_a_loaded_key_fails_closed() {
+        let h = health(None, Some("role:monitor"), None);
+        assert!(matches!(
+            metrics_gate(&h, None, &[], "10.0.0.9", false),
+            Gate::Refused(PerfOutcome::Unauthorised)
+        ));
+    }
+
+    #[test]
+    fn metrics_require_refuses_the_legacy_bearer_string() {
+        let (_d, key, _) = keypair();
+        let h = health(None, Some("role:monitor"), Some("legacy-secret"));
+        let legacy = vec![(
+            "authorization".to_string(),
+            "Bearer legacy-secret".to_string(),
+        )];
+        assert!(matches!(
+            metrics_gate(&h, Some(&key), &legacy, "10.0.0.9", false),
+            Gate::Refused(PerfOutcome::Unauthorised)
+        ));
+    }
+
+    #[test]
+    fn without_new_keys_the_gate_is_todays() {
+        let h = health(None, None, Some("right"));
+        let ok = vec![("authorization".to_string(), "Bearer right".to_string())];
+        let bad = vec![("authorization".to_string(), "Bearer wrong".to_string())];
+        // Any peer, internal or not: there is no address rule.
+        for (ip, internal) in [("203.0.113.7", false), ("10.0.0.9", true)] {
+            assert!(matches!(
+                metrics_gate(&h, None, &ok, ip, internal),
+                Gate::Open
+            ));
+            assert!(matches!(
+                metrics_gate(&h, None, &bad, ip, internal),
+                Gate::Refused(PerfOutcome::Unauthorised)
+            ));
+        }
+        let none = health(None, None, None);
+        assert!(is_disabled(&metrics_gate(
+            &none, None, &ok, "10.0.0.9", false
+        )));
     }
 }

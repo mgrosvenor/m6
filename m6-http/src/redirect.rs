@@ -100,8 +100,8 @@ fn redirect_for(req: &HttpRequest) -> RequestOutcome {
         .unwrap_or("");
 
     // The query is part of the target and must survive the hop. It did not:
-    // `req.path` is the path alone, so `http://host/x?v=1` redirected to
-    // `https://host/x` and every query parameter on an http:// link was
+    // `req.path` is the path alone, so `http://example.com/x?v=1` redirected to
+    // `https://example.com/x` and every query parameter on an http:// link was
     // silently dropped -- a versioned asset URL, a tracking parameter, a form
     // GET. Found by a test written for the OPTIONS/CONNECT work above.
     let target = match req.query.as_deref() {

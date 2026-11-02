@@ -17,6 +17,8 @@
 //! A `ShutdownHandle` also self-connects to wake a parked `accept`, and
 //! unlinks the socket on the way out so m6-http does not keep a dead member in
 //! its backend pool.
+//!
+//! SIGUSR1 reopens the log file and never counts toward shutdown.
 
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
@@ -30,15 +32,24 @@ use nix::sys::signal::{SigSet, Signal};
 static SHUTDOWN_FLAG: AtomicBool = AtomicBool::new(false);
 static SIGNAL_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-/// The signals this module owns.
+/// The signal that makes a process reopen its log file.
+///
+/// A rotation tool renames the file and sends this signal.
+/// SIGHUP is the usual "reload configuration" signal and also arrives when a terminal closes, so it stays free.
+/// SIGUSR1 is the reopen convention logrotate users already know.
+/// Before this constant existed SIGUSR1 killed every m6 process at the default disposition.
+pub const REOPEN_SIGNAL: Signal = Signal::SIGUSR1;
+
+/// The signals this module owns: shutdown and log reopen.
 fn managed() -> SigSet {
     let mut mask = SigSet::empty();
     mask.add(Signal::SIGTERM);
     mask.add(Signal::SIGINT);
+    mask.add(REOPEN_SIGNAL);
     mask
 }
 
-/// Block SIGTERM and SIGINT in the calling thread.
+/// Block SIGTERM, SIGINT and SIGUSR1 in the calling thread.
 ///
 /// **This must be the first statement of `main`.** Not the first interesting
 /// statement: the first one, before logging, before any pool, before anything
@@ -55,9 +66,30 @@ pub fn block() {
 /// Whether the calling thread currently blocks the signals this module owns.
 fn blocked_here() -> bool {
     match SigSet::thread_get_mask() {
-        Ok(m) => m.contains(Signal::SIGTERM) && m.contains(Signal::SIGINT),
+        Ok(m) => {
+            m.contains(Signal::SIGTERM) && m.contains(Signal::SIGINT) && m.contains(REOPEN_SIGNAL)
+        }
         // If the mask cannot be read, do not turn that into a startup failure.
         Err(_) => true,
+    }
+}
+
+/// Reopen the log file for [`REOPEN_SIGNAL`] and say what happened.
+fn reopen_on_signal(name: &str) {
+    match crate::log::reopen_log_file() {
+        crate::log::Reopened::NoFile => {
+            tracing::info!("{name} log reopen requested; this process writes no log file");
+        }
+        crate::log::Reopened::Done(p) => {
+            tracing::info!(path = %p.display(), "{name} log file reopened");
+        }
+        crate::log::Reopened::Failed(p, e) => {
+            tracing::error!(
+                path = %p.display(),
+                error = %e,
+                "{name} log reopen failed; still writing to the previous file"
+            );
+        }
     }
 }
 
@@ -206,7 +238,13 @@ impl ShutdownHandle {
                 let sock = thread_socket.as_deref().map(|p| p.as_path());
                 let name = &*thread_name;
 
-                while let Ok(_sig) = wait_mask.wait() {
+                while let Ok(sig) = wait_mask.wait() {
+                    // Before `SIGNAL_COUNT`, so a reopen is never a step
+                    // toward a forced exit.
+                    if sig == REOPEN_SIGNAL {
+                        reopen_on_signal(name);
+                        continue;
+                    }
                     let count = SIGNAL_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
                     if count >= 2 {
                         finish(name, sock, "forced");
@@ -353,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn block_blocks_both_signals_this_module_owns() {
+    fn block_blocks_every_signal_this_module_owns() {
         let _ = managed().thread_unblock();
         assert!(
             !blocked_here(),

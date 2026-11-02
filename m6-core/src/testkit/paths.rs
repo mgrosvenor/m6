@@ -1,6 +1,10 @@
 //! Locating the build output from inside a test.
 
+use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 
 /// The cargo target directory, derived from the running test binary.
 ///
@@ -24,76 +28,121 @@ pub(super) fn target_dir() -> PathBuf {
         .to_path_buf()
 }
 
-/// The profile the running test was built with: `debug`, `release`, or a
-/// custom profile name.
-fn test_profile() -> String {
-    let exe = std::env::current_exe().expect("current_exe");
-    exe.parent()
-        .and_then(Path::parent)
-        .and_then(|p| p.file_name())
-        .and_then(|s| s.to_str())
-        .unwrap_or("debug")
-        .to_string()
+/// True for the variables `cargo test` adds to a test process's environment.
+///
+/// A nested cargo that inherits them treats the workspace as a different build
+/// from the one `cargo build --workspace --release` made, so the two rebuild
+/// each other's artefacts and the "no-op" check costs a full release build
+/// each time.
+fn is_test_run_variable(name: &str) -> bool {
+    name.starts_with("CARGO_PKG_")
+        || name.starts_with("CARGO_BIN_EXE_")
+        || matches!(
+            name,
+            "CARGO_MANIFEST_DIR"
+                | "CARGO_MANIFEST_PATH"
+                | "CARGO_CRATE_NAME"
+                | "CARGO_BIN_NAME"
+                | "CARGO_PRIMARY_PACKAGE"
+                | "CARGO_TARGET_TMPDIR"
+        )
+}
+
+/// Builds `name` in the release profile into `target` and returns its path.
+///
+/// Runs from `manifest_dir` so cargo finds the workspace of the test crate.
+/// The inputs are parameters so a unit test can point it at a scratch
+/// workspace.
+fn build_release(
+    cargo: &OsStr,
+    manifest_dir: &Path,
+    target: &Path,
+    name: &str,
+) -> Result<PathBuf, String> {
+    let mut cmd = Command::new(cargo);
+    cmd.args([
+        "build",
+        "--quiet",
+        "--release",
+        "--workspace",
+        "--bin",
+        name,
+    ])
+    .arg("--target-dir")
+    .arg(target)
+    .current_dir(manifest_dir)
+    .stdin(Stdio::null());
+    for (var, _) in std::env::vars_os() {
+        if var.to_str().is_some_and(is_test_run_variable) {
+            cmd.env_remove(var);
+        }
+    }
+    let status = cmd
+        .status()
+        .map_err(|e| format!("cannot run {cargo:?} to build {name:?}: {e}"))?;
+    if !status.success() {
+        return Err(format!(
+            "cargo build --release --workspace --bin {name} failed ({status}); its errors are printed above"
+        ));
+    }
+    let path = target.join("release").join(name);
+    if !path.is_file() {
+        return Err(format!(
+            "cargo built {name:?} but {} does not exist",
+            path.display()
+        ));
+    }
+    Ok(path)
 }
 
 /// Path to a built workspace binary, for tests that spawn real services.
 ///
-/// **Release first, always, whatever profile the test itself was built with.**
+/// **Release, always, whatever profile the test itself was built with.**
 /// `check.sh` builds the workspace with `--release` and then runs `cargo test`
 /// without it, so the test binary is a debug build while the services it is
-/// meant to exercise are release builds. `cargo test` also builds each
-/// package's `bin` targets in debug as a side effect, so a `target/debug/m6-file`
-/// exists whether or not anyone wanted one.
+/// meant to exercise are release builds. On the Linux build box a debug
+/// `m6-file` started too slowly for `m6-http`'s backend rescan window and five
+/// `analytics_e2e` tests failed with 502. Debug binaries are also not the
+/// artefact being validated.
 ///
-/// Preferring the test's own profile therefore silently swapped every spawned
-/// service for its debug build. On a fast laptop that only made the suite
-/// slower; on the Linux build box a debug `m6-file` started too slowly for
-/// `m6-http`'s backend rescan window and five `analytics_e2e` tests failed with
-/// 502. Debug binaries are also not the artefact being validated.
+/// **The binary is built before its path is returned.** The first call for a
+/// name in a test process runs
+/// `cargo build --quiet --release --workspace --bin <name>` from the test
+/// crate's directory and lets cargo's own fingerprints decide whether anything
+/// needs compiling. A stale release binary is rebuilt before it is spawned, so
+/// a plain `cargo test` after an edit runs the edited code. Later calls for the
+/// same name return the same path without running cargo again.
 ///
-/// Debug remains the fallback for `cargo test` run on its own with no release
-/// build present.
+/// Two costs follow. The first call after a change pays the release build,
+/// which uses fat LTO and takes minutes for `m6-http`. A build that is current
+/// costs one cargo call that does nothing. `--workspace` keeps feature
+/// resolution the same as `cargo build --workspace --release`, so that build
+/// and this one produce the same binary.
 ///
-/// # The trap that comes with it
+/// The name must be a binary of the test crate's own workspace. A name from a
+/// dependency fetched from git fails with cargo's "no bin target named" error.
 ///
-/// **A stale `target/release/<name>` is preferred over a fresh source tree, and
-/// nothing says so.** `cargo test` rebuilds the lib and the test binary from
-/// current source, then spawns a service binary that may be hours old, so a fix
-/// that is present in the code under test is absent from the process being
-/// tested. That reads as the fix not working: on 2026-09-12 a correct read
-/// timeout was measured as broken twice, and the same mechanism will just as
-/// happily report a broken change as fixed.
-///
-/// There is no reliable mtime check to add here. In the intended workflow
-/// (`cargo build --release` then `cargo test`) cargo relinks the test binary
-/// *after* the release binaries, so "release is older than the test binary" is
-/// the normal case and not a staleness signal.
-///
-/// So the rule is procedural: **`cargo build --workspace --release` before
-/// `cargo test`**, every time, and when an end-to-end test contradicts what the
-/// source plainly says, check the binary's timestamp before debugging the code.
-/// `deploy/run-tests.sh` does the release build itself and is not exposed.
-///
-/// Panics with both paths and the build command to run, because "missing
-/// binary" is the single most common first-run failure and a bare `NotFound`
-/// says nothing about the fix.
+/// Panics if the build fails, with the cargo errors printed above the panic
+/// message.
 pub fn binary(name: &str) -> PathBuf {
-    let target = target_dir();
-
-    let release = target.join("release").join(name);
-    if release.exists() {
-        return release;
+    static BUILT: OnceLock<Mutex<HashMap<String, Result<PathBuf, String>>>> = OnceLock::new();
+    let mut built = BUILT
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let result = built.entry(name.to_string()).or_insert_with(|| {
+        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR").unwrap_or_else(|| {
+            panic!(
+                "m6_core::testkit::binary: CARGO_MANIFEST_DIR is not set; run the test with cargo test"
+            )
+        });
+        build_release(&cargo, Path::new(&manifest_dir), &target_dir(), name)
+    });
+    match result {
+        Ok(p) => p.clone(),
+        Err(e) => panic!("{e}"),
     }
-    let fallback = target.join(test_profile()).join(name);
-    if fallback.exists() {
-        return fallback;
-    }
-    panic!(
-        "missing binary {name:?}\n  looked in: {}\n  looked in: {}\n  \
-         build it first: cargo build --workspace --release",
-        release.display(),
-        fallback.display(),
-    );
 }
 
 /// A scratch directory a test can COMPILE INTO AND THEN EXECUTE FROM.
@@ -145,3 +194,110 @@ pub fn exec_scratch_root() -> PathBuf {
 //
 //     tempfile::Builder::new()
 //         .tempdir_in(m6_core::testkit::exec_scratch_root())
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A one-package workspace named `rebuild_probe` whose binary prints `body`.
+    fn probe(dir: &Path, main_rs: &str) {
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[workspace]\n\n[package]\nname = \"rebuild_probe\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/main.rs"), main_rs).unwrap();
+    }
+
+    /// The cargo that `cargo test` runs under, or `cargo` on PATH as `binary()`
+    /// falls back to, so these tests always run.
+    fn cargo_for_tests() -> std::ffi::OsString {
+        std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into())
+    }
+
+    fn run(path: &Path) -> String {
+        let out = Command::new(path).output().unwrap();
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    #[test]
+    fn build_release_rebuilds_after_the_source_changes() {
+        let cargo = cargo_for_tests();
+        let dir = tempfile::Builder::new()
+            .tempdir_in(exec_scratch_root())
+            .unwrap();
+        let target = dir.path().join("target");
+        probe(dir.path(), "fn main() { println!(\"one\"); }");
+        let first = build_release(&cargo, dir.path(), &target, "rebuild_probe").unwrap();
+        assert_eq!(run(&first), "one");
+
+        std::fs::write(
+            dir.path().join("src/main.rs"),
+            "fn main() { println!(\"two\"); }",
+        )
+        .unwrap();
+        let second = build_release(&cargo, dir.path(), &target, "rebuild_probe").unwrap();
+        assert_eq!(run(&second), "two");
+    }
+
+    #[test]
+    fn build_release_names_the_failing_command() {
+        let cargo = cargo_for_tests();
+        let dir = tempfile::Builder::new()
+            .tempdir_in(exec_scratch_root())
+            .unwrap();
+        probe(dir.path(), "fn main( {");
+        let err = build_release(
+            &cargo,
+            dir.path(),
+            &dir.path().join("target"),
+            "rebuild_probe",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("cargo build --release --workspace --bin rebuild_probe failed"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn build_release_refuses_an_unknown_binary() {
+        let cargo = cargo_for_tests();
+        let dir = tempfile::Builder::new()
+            .tempdir_in(exec_scratch_root())
+            .unwrap();
+        probe(dir.path(), "fn main() {}");
+        let err =
+            build_release(&cargo, dir.path(), &dir.path().join("target"), "nosuch").unwrap_err();
+        assert!(err.contains("--bin nosuch failed"), "{err}");
+    }
+
+    #[test]
+    fn only_the_variables_cargo_test_adds_are_dropped() {
+        for name in [
+            "CARGO_PKG_NAME",
+            "CARGO_PKG_VERSION",
+            "CARGO_BIN_EXE_m6-file",
+            "CARGO_MANIFEST_DIR",
+            "CARGO_MANIFEST_PATH",
+            "CARGO_CRATE_NAME",
+            "CARGO_BIN_NAME",
+            "CARGO_PRIMARY_PACKAGE",
+            "CARGO_TARGET_TMPDIR",
+        ] {
+            assert!(is_test_run_variable(name), "{name}");
+        }
+        for name in [
+            "CARGO",
+            "CARGO_HOME",
+            "CARGO_TARGET_DIR",
+            "CARGO_NET_OFFLINE",
+            "CARGO_REGISTRIES_X_TOKEN",
+            "PATH",
+            "HOME",
+        ] {
+            assert!(!is_test_run_variable(name), "{name}");
+        }
+    }
+}

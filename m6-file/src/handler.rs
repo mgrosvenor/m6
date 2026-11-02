@@ -957,7 +957,7 @@ mod charset_tests {
         }
     }
 
-    /// The table must cover every extension this site actually serves, or the
+    /// The table must cover every extension a site actually serves, or the
     /// swap away from mime_guess would silently downgrade files to
     /// application/octet-stream.
     #[test]

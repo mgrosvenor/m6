@@ -20,10 +20,9 @@
 //! and N-1 attempted resumptions, reported as a single figure and described in
 //! this comment as comparable to a channel that separates them.
 //!
-//! That mattered on 2026-09-19. m6 1.9.0 installed a ticketer specifically so
-//! browser sessions could resume, the fleet was upgraded, and the monitor still
-//! read **0% resumed on `http/2/external` on all three nodes** while reading
-//! 88-96% on `http/1.1`. Two explanations fit that equally well:
+//! That mattered in 1.9.0, which installed a ticketer specifically so browser
+//! sessions could resume. After the upgrade a monitor can still read **0%
+//! resumed on `http/2/external`** while reading most of `http/1.1` as resumed. Two explanations fit that equally well:
 //!
 //!   1. the server does not resume, and 1.9.0's ticketer is not effective; or
 //!   2. the server resumes fine and no real h2 client offers a ticket, because a

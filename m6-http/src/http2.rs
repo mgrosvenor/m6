@@ -16,7 +16,7 @@ use crate::fields::validate_request_headers;
 use crate::forward::{HttpRequest, HttpResponse, PendingUrlContext};
 use crate::http11::RequestOutcome;
 
-/// I/O abstraction: TLS (HTTPS) or plain TCP (H2C over WireGuard).
+/// I/O abstraction: TLS (HTTPS) or plain TCP (H2C over a private backbone).
 pub enum H2Io<'a> {
     Tls {
         tls: &'a mut rustls::ServerConnection,
@@ -398,7 +398,7 @@ impl Http2Conn {
         }
     }
 
-    /// Mark this connection as coming from one of our own cache nodes, so a
+    /// Mark this connection as coming from one of the deployment's own cache nodes, so a
     /// client address it forwards is believed rather than discarded.
     ///
     /// Opt-in, and granted only by [`crate::http11::H2cListener`] after it has

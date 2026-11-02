@@ -67,7 +67,7 @@ public_key  = "/etc/m6/auth.pub"   # Corresponding public key
 | `private_key` | string | yes | Absolute path to PEM private key |
 | `public_key` | string | yes | Absolute path to PEM public key |
 
-Keys watched via inotify — reloaded on rotation without restart. On rotation, m6-auth begins signing with the new key immediately. Previously issued tokens with valid signatures from the old key continue to be accepted by m6-http until they expire naturally, provided m6-http is updated with the new public key (also via inotify reload).
+The key files are not watched. Rotate by writing both key files, then touching the m6-auth-server config. m6-auth-server reads both files again and begins signing with the new key immediately, and a key that fails to load leaves the running key serving and is retried. Previously issued tokens with valid signatures from the old key continue to be accepted by m6-http until they expire naturally, provided m6-http has the new public key. m6-http takes a new public key when its system config is touched.
 
 ---
 

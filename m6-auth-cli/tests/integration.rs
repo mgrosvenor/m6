@@ -1,20 +1,7 @@
-use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use tempfile::TempDir;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-fn binary_path() -> PathBuf {
-    let mut p = std::env::current_exe().expect("current_exe");
-    // Strip the test binary name and go up to target/debug/
-    p.pop();
-    // Sometimes tests run in deps/ subdirectory
-    if p.ends_with("deps") {
-        p.pop();
-    }
-    p.push("m6-auth-cli");
-    p
-}
 
 // ── TestEnv ───────────────────────────────────────────────────────────────────
 
@@ -97,7 +84,7 @@ impl TestEnv {
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        let bin = binary_path();
+        let bin = m6_core::testkit::binary("m6-auth-cli");
         let mut cmd = Command::new(&bin);
         cmd.arg(self.config());
         for a in args {
@@ -286,7 +273,7 @@ fn test_user_del_unknown_exits_1() {
 
 #[test]
 fn test_config_not_found_exits_2() {
-    let bin = binary_path();
+    let bin = m6_core::testkit::binary("m6-auth-cli");
     let out = Command::new(&bin)
         .args(["/nonexistent/path/m6-auth.conf", "user", "ls"])
         .output()
@@ -302,7 +289,7 @@ fn test_config_not_found_exits_2() {
 
 #[test]
 fn test_no_arguments_exits_2() {
-    let bin = binary_path();
+    let bin = m6_core::testkit::binary("m6-auth-cli");
     let out = Command::new(&bin).output().expect("run");
     assert_eq!(out.status.code(), Some(2), "stdout: {}", stdout(&out));
     // Should print usage to stderr

@@ -82,6 +82,21 @@ pretend to: this repository's trap list is mostly those. What the checklist guar
 is that you open the files while cutting the release, which is when you know what is
 true.
 
+### Versions
+
+A version is `X.Y.Z`, and what changed decides which number moves (Table 1).
+
+| number | moves when | example |
+|---|---|---|
+| X | a major architectural change | a new process model |
+| Y | a breaking change to an API, configuration, library or behaviour, or a major new feature | a config key renamed, or a new protocol |
+| Z | bug fixes, minor updates or minor new features | a corrected cache clear |
+
+*Table 1: the three version numbers and what moves each. A release that does two things takes the larger move.*
+
+A change to configuration or behaviour that needs a migration note is a Y change.
+It carries a Migration section in its `CHANGELOG.md` entry, ahead of the list of changes.
+
 ### If you make something faster
 
 Record the new number, in the commit that earned it:

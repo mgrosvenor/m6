@@ -6,7 +6,7 @@
 //! half belongs to the route, and the paths and config are behind `Arc`s.
 //!
 //! That was not always true. Building one used to clone the whole request and
-//! the whole dictionary, which on this site meant copying a 68KB content file
+//! the whole dictionary, which for a content-driven site means copying its whole catalogue
 //! per request. See `crate::dict` and `docs/PERFORMANCE.md`.
 //!
 //! The file helpers resolve against the site directory and refuse to leave it.
@@ -349,12 +349,24 @@ impl Request {
         Ok(out)
     }
 
-    /// Touch a file (update mtime), creating it if it doesn't exist.
+    /// The file `touch` acts on. `site.toml` is the file the service reads, which
+    /// `site_toml` may place outside `site_dir`. Any other path is relative to
+    /// `site_dir` and may not climb out of it.
+    fn touch_path(&self, rel: &str) -> Result<PathBuf> {
+        match (rel, &self.config) {
+            ("site.toml", Some(config)) => Ok(config.resolve_site_toml(&self.site_dir)),
+            _ => self.validated_path(rel),
+        }
+    }
+
     /// Update a file's timestamps so a watching service reloads it.
     ///
     /// The documented way for a renderer to invalidate the edge after writing
     /// new content: write the file, then `touch("site.toml")`. See
     /// `docs/m6-site-toml.md`.
+    ///
+    /// `touch("site.toml")` touches the file the service reads, which is the one
+    /// the config key `site_toml` names. The file is created when it is missing.
     ///
     /// ## Why it opens the file as well as setting the times
     ///
@@ -386,7 +398,7 @@ impl Request {
     /// fallback compares and what `Last-Modified` is derived from. Opening a file
     /// for writing without writing to it does not move its mtime.
     pub fn touch(&self, rel: &str) -> Result<()> {
-        let path = self.validated_path(rel)?;
+        let path = self.touch_path(rel)?;
         if path.exists() {
             let now = filetime::FileTime::now();
             filetime::set_file_times(&path, now, now)
@@ -502,6 +514,30 @@ pub fn parse_query_string(query: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// A query key that appeared more than once where one was expected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepeatedKey;
+
+/// The raw, undecoded value of the single query key `key`: `None` when it is
+/// absent, [`RepeatedKey`] when it appears twice. A key with no `=` has the
+/// value `""`.
+pub fn single_query_value<'a>(
+    query: &'a str,
+    key: &str,
+) -> std::result::Result<Option<&'a str>, RepeatedKey> {
+    let mut found = None;
+    for pair in query.split('&') {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        if k == key {
+            if found.is_some() {
+                return Err(RepeatedKey);
+            }
+            found = Some(v);
+        }
+    }
+    Ok(found)
+}
+
 pub fn parse_form_body(body: &[u8]) -> Vec<(String, String)> {
     // `from_utf8(..).unwrap_or("")` threw away the ENTIRE body on a single
     // invalid byte, yielding a submission with no fields and no explanation --
@@ -527,7 +563,7 @@ pub fn parse_form_body(body: &[u8]) -> Vec<(String, String)> {
 ///
 /// This corrupted every non-ASCII character any visitor typed, in every form
 /// and every query string, before a handler ever saw it. It reached production
-/// via the contact form: a curly apostrophe (U+2019, sent as `%E2%80%99`)
+/// via a contact form: a curly apostrophe (U+2019, sent as `%E2%80%99`)
 /// arrived as U+00E2 U+0080 U+0099, so "I'm not sure" was emailed as
 /// "Ia<80><99>m not sure". Emoji, being four bytes, came out as four wrong
 /// characters.
@@ -760,7 +796,7 @@ mod tests {
     /// and every non-ASCII character a visitor typed was corrupted on the way
     /// in, before any handler saw it.
     ///
-    /// It reached production through the contact form: a curly apostrophe
+    /// It reached production through a contact form: a curly apostrophe
     /// (U+2019, sent as `%E2%80%99`) became U+00E2 U+0080 U+0099, so "I'm not
     /// sure" was emailed as "Ia<80><99>m not sure".
     ///
@@ -895,7 +931,7 @@ mod tests {
     }
 
     /// Encode then decode must be the identity, including for the input that
-    /// broke the contact form.
+    /// broke a contact form.
     #[test]
     fn encode_decode_round_trips() {
         for case in [
@@ -985,6 +1021,45 @@ mod tests {
                 "{name}: valid"
             );
         }
+    }
+
+    /// A site.toml named outside `site_dir` by `site_toml` is the file an app's
+    /// edge invalidation must touch, and no file may appear in `site_dir`.
+    #[test]
+    fn touch_site_toml_touches_the_file_the_app_reads() {
+        let root = tempfile::tempdir().unwrap();
+        let site_dir = root.path().join("apps").join("app");
+        std::fs::create_dir_all(&site_dir).unwrap();
+        let real = root.path().join("site.toml");
+        std::fs::write(&real, "[server]\n").unwrap();
+        let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+        filetime::set_file_times(&real, old, old).unwrap();
+        let cfg_path = site_dir.join("app.toml");
+        std::fs::write(&cfg_path, "site_toml = \"../../site.toml\"\n").unwrap();
+        let config = crate::config::load(&cfg_path, &site_dir).unwrap();
+        let req = Request::new(
+            RawRequest {
+                version: "HTTP/1.1".to_string(),
+                method: "GET".to_string(),
+                path: "/".to_string(),
+                query: None,
+                headers: vec![],
+                body: vec![],
+            },
+            Map::new(),
+            site_dir.clone(),
+        )
+        .with_config(std::sync::Arc::new(config));
+        req.touch("site.toml").unwrap();
+        let after =
+            filetime::FileTime::from_last_modification_time(&std::fs::metadata(&real).unwrap());
+        assert!(after > old, "the named site.toml was not touched");
+        assert!(
+            !site_dir.join("site.toml").exists(),
+            "an empty site.toml was created in site_dir"
+        );
+        // Other paths are still refused when they climb out of site_dir.
+        assert!(req.touch("../site.toml").is_err());
     }
 
     #[test]

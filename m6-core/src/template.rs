@@ -8,9 +8,9 @@
 //! **The engine copies the context into itself.** `tera::Context::insert`
 //! serialises each value into its own map, so the cost scales with the size of
 //! the context rather than with what the template reads: a page touching three
-//! keys still pays to copy everything the route was given. On this site that
-//! is the largest remaining per-request cost and it is accepted. See
-//! `docs/PERFORMANCE.md`.
+//! keys still pays to copy everything the route was given. For a route with a
+//! large `base_dict` that is the largest remaining per-request cost, and it is
+//! accepted. See `docs/PERFORMANCE.md`.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -179,9 +179,9 @@ fn collect_image_dimensions(root: &Path, dir: &Path, out: &mut HashMap<String, (
 
 /// Intrinsic size of an image from its header bytes.
 ///
-/// Hand-rolled for the four formats this site actually ships (PNG, JPEG,
+/// Hand-rolled for the four formats the web actually uses (PNG, JPEG,
 /// WebP, SVG) rather than pulling in an image crate: the alternative is a
-/// dependency and a pile of decoders for formats that are never used, in a
+/// dependency and a pile of decoders for formats a site never ships, in a
 /// platform where the whole point is having few moving parts. Returns None for
 /// anything unrecognised or truncated, and the caller then simply omits the
 /// attributes.

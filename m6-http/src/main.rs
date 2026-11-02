@@ -56,10 +56,13 @@ type FinalizedResponse = (u16, Vec<(String, String)>, Vec<u8>, String);
 /// Short enough that a redeployed error page appears promptly, long enough
 /// that a sustained sweep costs one fetch a minute rather than one per path.
 const ERROR_PAGE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+use m6_core::watcher::{Changed, ConfigReloader, Seen};
 use m6_http_lib::auth::PublicKey;
 use m6_http_lib::h2c_client::H2cClientPool;
 use m6_http_lib::h2s_client::H2sTlsClientPool;
-use m6_http_lib::http11::{make_tls_server_config, H2cListener, Http11Listener, RequestOutcome};
+use m6_http_lib::http11::{
+    load_tls_material, make_tls_server_config, H2cListener, Http11Listener, RequestOutcome,
+};
 use m6_http_lib::poller::{Poller, Token, WakeReader, WakeWriter};
 use m6_http_lib::pool::{self, PoolManager};
 use m6_http_lib::router::{self, RouteTable};
@@ -75,6 +78,41 @@ const TOKEN_H2C: Token = Token(3);
 const TOKEN_H2C_CLIENT: Token = Token(4);
 const TOKEN_H2S_CLIENT: Token = Token(5);
 const TOKEN_WAKE: Token = Token(6);
+const TOKEN_CONFIG: Token = Token(7);
+/// Time given to a backend to finish a reload after it has seen the change.
+///
+/// A backend under `ConfigReloader` reloads at once on the first change, or up
+/// to `RELOAD_DEBOUNCE` later when a second report is held, or up to
+/// `RELOAD_POLL` later when only the once-a-second poll finds the change. The
+/// reload itself then takes time. This margin is added to each of those.
+const CACHE_RELOAD_MARGIN: std::time::Duration = std::time::Duration::from_millis(80);
+
+/// The two later clears after a `site.toml` reload, measured from the end of
+/// the reload.
+///
+/// A backend that reloads after m6-http can answer a request in the gap with
+/// the old page, and that response is cached. m6-http clears at once, then
+/// again once a debounced report has reloaded the backend, then again once the
+/// poll would have found the change. Each delay derives from m6-core's
+/// constants, so it follows them if they change. The cost is one extra cache
+/// miss per page about a second after a content change, and none on the hit
+/// path. A second `site.toml` change re-arms both.
+const CACHE_LATER_CLEARS: [(std::time::Duration, &str); 2] = [
+    (
+        std::time::Duration::from_millis(
+            m6_core::watcher::RELOAD_DEBOUNCE.as_millis() as u64
+                + CACHE_RELOAD_MARGIN.as_millis() as u64,
+        ),
+        "config reload: cache cleared again after the settle window",
+    ),
+    (
+        std::time::Duration::from_millis(
+            m6_core::watcher::RELOAD_POLL.as_millis() as u64
+                + CACHE_RELOAD_MARGIN.as_millis() as u64,
+        ),
+        "config reload: cache cleared a third time after the poll interval",
+    ),
+];
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
 // ── Shutdown flags ───────────────────────────────────────────────────────────
@@ -166,8 +204,9 @@ struct ServerState {
     h2s_pool: H2sTlsClientPool,
     /// Per-IP request throttle — general traffic, ahead of cache/routing.
     rate_limiter: RateLimiter,
-    /// Interface class of the public TLS/QUIC listener, and of the h2c
-    /// listener, computed once at startup from their bind addresses.
+    /// Interface class of the TLS/QUIC listener (always external), and of the
+    /// h2c listener (internal when `[server] internal_binds` names it),
+    /// computed once at startup.
     ///
     /// Precomputed rather than derived per request: classification parses an
     /// address, and this sits on the hot path for every single request.
@@ -176,10 +215,10 @@ struct ServerState {
     /// One rendered error document per status, held locally.
     ///
     /// A cache node routes `/_errors` to the origin, so before this every
-    /// route miss dispatched a fetch across the WireGuard link -- ~207ms from
-    /// edge-b, ~282ms from edge-a -- to render a page that is byte-identical
-    /// every time. Measured 2026-09-09: four requests to nonexistent paths on
-    /// edge-b each took 0.86-1.07s, with no improvement on repeat.
+    /// route miss dispatched a fetch across the private link to render a page
+    /// that is byte-identical every time. Over an intercontinental link that
+    /// fetch is 200-300ms and a request to a nonexistent path took most of a
+    /// second, with no improvement on repeat.
     ///
     /// Caching that response by URL would not have helped. The cache key is
     /// (path, query, encoding), so a wordlist of 647 unique junk paths is 647
@@ -322,6 +361,9 @@ fn seed_cache_warm(state: &mut ServerState) {
 // the shutdown hook writes one byte, the next `wait()` returns immediately
 // whatever timeout it was given, and the loop re-checks the flag. Two file
 // descriptors, created once.
+//
+// SIGUSR1 reopens the analytics log. Core handles it on the same thread, so
+// the epoll loop never sees it.
 
 fn setup_signals(wake: &WakeWriter) -> m6_core::signal::ShutdownHandle {
     // No `socket`: m6-http listens on TCP and UDP, not a unix socket, so there
@@ -402,10 +444,11 @@ fn make_quiche_config(server_config: &config::ServerConfig) -> anyhow::Result<qu
     //
     // A returning visitor sends its request in the FIRST flight, so the response
     // costs zero round trips instead of one. On loopback that saves about a
-    // millisecond and looks unimportant. On the paths this fleet actually serves
-    // it is the single largest latency win available: edge-a and edge-b are
-    // roughly 300ms from the origin origin, and a saved round trip is 300ms that
-    // no amount of local tuning can recover.
+    // millisecond and looks unimportant. For a visitor on a long path it is the
+    // single largest latency win available: at 300ms of round-trip time the
+    // saved round trip is 300ms that no amount of local tuning recovers. This
+    // setting is the QUIC listener that serves VISITORS. A cache node fetching
+    // from its origin goes over h2c on TCP and is not affected by it.
     //
     // For comparison, over TCP the same visitor pays TWO round trips before any
     // application data: one for the TCP handshake and one for TLS. Measured on
@@ -427,9 +470,9 @@ fn make_quiche_config(server_config: &config::ServerConfig) -> anyhow::Result<qu
     // methods" advice: only a FRESH CACHE HIT is served in early data. A replayed
     // cache read re-sends bytes and does nothing else.
     //
-    // "GET is safe" would NOT have been good enough here. This site's analytics
-    // beacon is a fire-and-forget GET (assets/js/nav-timing.js), so a replayed
-    // 0-RTT GET would inflate a page-view counter. m6-http cannot recognise that
+    // "GET is safe" would NOT have been good enough here. An analytics beacon is
+    // commonly a fire-and-forget GET, so a replayed 0-RTT GET would inflate a
+    // page-view counter. m6-http cannot recognise such a
     // route -- it is proxied like any other -- which is the reason the rule is
     // about where the answer comes from rather than about a list of paths.
     //
@@ -514,7 +557,7 @@ fn make_quiche_config(server_config: &config::ServerConfig) -> anyhow::Result<qu
     // 3600-byte budget, and the uncompressed handshake flight was 4082 -- 482 over,
     // so the server sent 3600, stopped, and waited a full round trip for an ACK.
     //
-    // Measured on this deployment's own chain:
+    // Measured on a typical two-certificate chain:
     //
     //     uncompressed  3429 bytes
     //     brotli        2258 bytes  66%
@@ -540,16 +583,19 @@ fn make_quiche_config(server_config: &config::ServerConfig) -> anyhow::Result<qu
 
 /// Everything the event loop polls, owned for its lifetime.
 ///
-/// These five arrived as five separate arguments, which put `event_loop` at
-/// eight. They are not five unrelated values: they are the set of things the
+/// These six arrived as separate arguments, which put `event_loop` at
+/// eight. They are not unrelated values: they are the set of things the
 /// loop waits on, which is why the poller registers every one of them in the
 /// same breath. `tcp`, `h2c` and `watcher` are optional because a node's role
-/// decides whether it has them at all.
+/// decides whether it has them at all. `reloader` watches `site.toml` and the
+/// system config and has a descriptor only when the OS watch could be built;
+/// without one it still polls the two files once a second.
 struct EventLoopIo {
     udp: UdpSocket,
     tcp: Option<Http11Listener>,
     h2c: Option<H2cListener>,
     watcher: Option<FsWatcher>,
+    reloader: ConfigReloader,
     wake_reader: WakeReader,
 }
 
@@ -566,6 +612,7 @@ fn event_loop(
         mut tcp,
         mut h2c,
         mut watcher,
+        mut reloader,
         wake_reader,
     } = io;
     let poller = match Poller::new() {
@@ -590,6 +637,10 @@ fn event_loop(
         if let Some(fd) = w.raw_fd() {
             let _ = poller.add(fd, TOKEN_INOTIFY);
         }
+    }
+
+    if let Some(fd) = reloader.raw_fd() {
+        let _ = poller.add(fd, TOKEN_CONFIG);
     }
 
     // Wake pipe: the shutdown hook writes to it so a blocked `wait()` returns
@@ -617,6 +668,8 @@ fn event_loop(
     // When no filesystem watcher is available (e.g. macOS), rescan backend
     // socket globs every 2 seconds so new workers are picked up automatically.
     let rescan_interval = std::time::Duration::from_secs(2);
+    // When the cache is to be emptied again after a `site.toml` reload.
+    let mut later_clears: [Option<std::time::Instant>; 2] = [None, None];
     let mut last_rescan = std::time::Instant::now()
         .checked_sub(rescan_interval)
         .unwrap_or_else(std::time::Instant::now);
@@ -683,10 +736,11 @@ fn event_loop(
                         h.accept_pending(&poller, TOKEN_H2C);
                     }
                 }
+                TOKEN_CONFIG => reloader.on_readable(std::time::Instant::now()),
                 TOKEN_INOTIFY => {
                     if let Some(ref mut w) = watcher {
                         for event in w.read_events() {
-                            handle_fs_event(&event, state, quiche_config, log_handle);
+                            handle_fs_event(&event, state);
                         }
                     }
                 }
@@ -1241,7 +1295,7 @@ fn event_loop(
                         // gap survived: any check of the h3 path looked fine.
                         let elapsed_ns = start.elapsed().as_nanos() as u64;
                         // h2c is HTTP/2 by definition; the interface class comes
-                        // from its bind address (the WireGuard tunnel here).
+                        // from its bind address (the private backbone here).
                         let chan = Channel::new(HttpVersion::Http2, state.h2c_iface);
                         state.stats.record(elapsed_ns, false, status, chan, backend);
                     }
@@ -1274,7 +1328,7 @@ fn event_loop(
             // above, with its own `drive_all` that returns nothing because there
             // is no handshake to time. h2c is the backbone path from the cache
             // nodes, which carry their own TLS to the visitor and reach the
-            // origin in the clear over WireGuard.
+            // origin in the clear over the private backbone.
         }
 
         // Drive connection timeouts and flush pending sends
@@ -1403,9 +1457,45 @@ fn event_loop(
         // Periodic rescan of backend socket globs to pick up newly started or
         // removed workers. On Linux, inotify also fires per-socket events, but
         // the rescan is a cheap belt-and-suspenders check for any missed events.
-        if last_rescan.elapsed() >= rescan_interval {
+        let now = std::time::Instant::now();
+        if now.duration_since(last_rescan) >= rescan_interval {
             state.pool_manager.rescan_all();
-            last_rescan = std::time::Instant::now();
+            last_rescan = now;
+        }
+
+        // A change to `site.toml` or the system config. One clock read serves
+        // this and the rescan above; `tick` allocates nothing and costs two
+        // comparisons when nothing changed.
+        if let Some(changed) = reloader.tick(now) {
+            let r = handle_config_change(changed, state, quiche_config, tcp.as_mut(), log_handle);
+            if r.cache_cleared {
+                // From the end of the reload, not from before it: a slow
+                // reload must not use up the settle window.
+                let end = std::time::Instant::now();
+                for (slot, (after, _)) in later_clears.iter_mut().zip(CACHE_LATER_CLEARS) {
+                    *slot = Some(end + after);
+                }
+            }
+            if r.tls_failed {
+                let d = reloader.retry(
+                    Changed {
+                        site: false,
+                        process: true,
+                    },
+                    std::time::Instant::now(),
+                );
+                warn!(
+                    retry_s = d.as_secs(),
+                    "TLS reload failed after a process config change; trying again"
+                );
+            }
+        }
+        for (slot, (_, line)) in later_clears.iter_mut().zip(CACHE_LATER_CLEARS) {
+            if slot.is_some_and(|t| now >= t) {
+                state.cache.clear();
+                *slot = None;
+                info!("{line}");
+            }
         }
     }
 
@@ -1858,8 +1948,8 @@ fn handle_h3_request(
     // ── 0-RTT gate B: only a FRESH cache hit is answered in early data ────────
     //
     // Gate A already refused replayable methods. This refuses everything else a
-    // replay could act on, and it is what makes 0-RTT defensible on this site
-    // rather than merely RFC-compliant:
+    // replay could act on, and it is what makes 0-RTT defensible at all rather
+    // than merely RFC-compliant:
     //
     //   - A backend request may have side effects. The analytics beacon is a
     //     fire-and-forget GET, so "the method is safe" does not mean "replaying it
@@ -2375,10 +2465,10 @@ fn handle_request_inner(
     content_encoding: &str,
     state: &mut ServerState,
     is_prefetch: bool,
-    // True when this request arrived on a listener bound to a private address,
-    // meaning one of our own nodes over the backbone rather than a public client.
-    // Granted by the listener, never by a header, so a public client cannot claim
-    // it. Only the error-path guard reads it.
+    // True when this request arrived on the h2c listener and [server]
+    // internal_binds names it, meaning one of our own nodes over the backbone
+    // rather than a public client. Granted by the listener, never by a header, so a public
+    // client cannot claim it. The error-path guard and the metrics gate read it.
     from_internal: bool,
 ) -> RequestOutcome {
     // Prefetch requests are synthetic (no real client, client_ip is a
@@ -2451,11 +2541,11 @@ fn handle_request_inner(
     // ── Health endpoint, ahead of routing/cache/backends ────────────────────
     // Placed here on purpose. Below this point a request touches the router,
     // the cache and then a backend; the whole value of a health check is that
-    // it answers from local state without any of that. Rendering `/` costs
-    // ~6ms of Tera work on the origin and a monitor sending
-    // `Cache-Control: no-cache` pays it on every single check, which makes
-    // the monitor's latency graph a measure of template rendering rather than
-    // of whether the node is up.
+    // it answers from local state without any of that. Rendering a homepage is
+    // milliseconds of template work, and a monitor sending
+    // `Cache-Control: no-cache` pays it on every single check, which makes the
+    // monitor's latency graph a measure of template rendering rather than of
+    // whether the node is up.
     //
     // It sits *after* method validation so a health path still refuses PUT
     // and friends like every other path, rather than becoming a hole in it.
@@ -2494,34 +2584,41 @@ fn handle_request_inner(
     // the split is what keeps the health answer cheap. `snapshot` is passed
     // as a closure and is not called until authorisation passes.
     if state.config.health.enabled && req.path == state.config.health.perf_path {
-        // Pool occupancy is gathered here rather than on `/health`, which
-        // publishes neither. It costs a lock-free read of the pool manager and
-        // happens before the token check, which is fine: it is bounded work,
-        // unlike the reservoir sort in `snapshot`.
-        let pools: Vec<health::PoolHealth> = state
-            .pool_manager
-            .pool_health()
-            .into_iter()
-            .map(|(name, active, total)| health::PoolHealth {
-                name,
-                active,
-                total,
-            })
-            .collect();
-        let outcome = health::PerfReport::build(
-            health::PerfSubject {
-                node: &state.config.node.name,
-                uptime_s: state.started.elapsed().as_secs(),
-                pools,
-                url_backends: state.pool_manager.url_backend_names(),
-                host_path: &state.config.site_dir,
-            },
-            health::PerfAccess {
-                headers: &req.headers,
-                configured_token: state.config.health.metrics_token.as_deref(),
-            },
-            || state.stats.snapshot(),
-        );
+        let outcome = match health::metrics_gate(
+            &state.config.health,
+            state.public_key.as_ref(),
+            &req.headers,
+            client_ip,
+            from_internal,
+        ) {
+            health::Gate::Refused(refused) => refused,
+            health::Gate::Open => {
+                // Pool occupancy is gathered here rather than on `/health`,
+                // which publishes neither, and only after the gate has passed.
+                // It costs a lock-free read of the pool manager, unlike the
+                // reservoir sort in `snapshot`.
+                let pools: Vec<health::PoolHealth> = state
+                    .pool_manager
+                    .pool_health()
+                    .into_iter()
+                    .map(|(name, active, total)| health::PoolHealth {
+                        name,
+                        active,
+                        total,
+                    })
+                    .collect();
+                health::PerfReport::build_authorised(
+                    health::PerfSubject {
+                        node: &state.config.node.name,
+                        uptime_s: state.started.elapsed().as_secs(),
+                        pools,
+                        url_backends: state.pool_manager.url_backend_names(),
+                        host_path: &state.config.site_dir,
+                    },
+                    || state.stats.snapshot(),
+                )
+            }
+        };
         let (code, headers, body) = outcome.into_response();
         // Same treatment as /health above. A 401 here is worth seeing: it
         // means something is probing the metrics endpoint without the token.
@@ -2543,14 +2640,21 @@ fn handle_request_inner(
     // rather than of a header on a cheaper one. Cached, so a polling monitor
     // cannot make the node re-read the log on every scrape.
     if state.config.health.enabled && req.path == state.config.health.traffic_path {
-        let outcome = health::traffic(
-            &state.config.node.name,
-            &state.config.analytics.log_path,
-            60,
-            std::time::Duration::from_secs(state.config.health.traffic_cache_s),
+        let outcome = match health::metrics_gate(
+            &state.config.health,
+            state.public_key.as_ref(),
             &req.headers,
-            state.config.health.metrics_token.as_deref(),
-        );
+            client_ip,
+            from_internal,
+        ) {
+            health::Gate::Refused(refused) => refused,
+            health::Gate::Open => health::traffic_authorised(
+                &state.config.node.name,
+                &state.config.analytics.log_path,
+                60,
+                std::time::Duration::from_secs(state.config.health.traffic_cache_s),
+            ),
+        };
         let (code, headers, body) = outcome.into_response();
         analytics::log_monitor(
             state.config.analytics.enabled,
@@ -2573,14 +2677,14 @@ fn handle_request_inner(
     // any caller spoof an arbitrary status/from pair. Refuse it exactly like
     // any other route miss.
     //
-    // UNLESS it arrived on an internal listener. A cache node of this deployment
-    // fetches the error page from the origin over h2c on the WireGuard backbone,
+    // UNLESS it arrived on an internal listener. A cache node fetches the error
+    // page from the origin over h2c on the private backbone,
     // and refusing it there broke custom error pages across a proxy hop entirely:
     // the edge asked, the origin refused it exactly like a stranger, and the edge
     // fell back to the built-in page. Every config was correct and the mechanism
     // was dead, which is worse than unsupported because it looks configured.
     //
-    // `from_internal` is granted by the listener's bind address, never by a header,
+    // `from_internal` is granted by the listener's declaration, never by a header,
     // so a public client cannot claim it -- the same rule that decides whether a
     // forwarded client address is trusted on that listener.
     if error::refuses_custom_error_path(&state.error_mode, &req.path, from_internal) {
@@ -2627,14 +2731,12 @@ fn handle_request_inner(
     // Auth check — only if route has `require`
     if let Some(ref require) = route.require {
         if let Some(ref pk) = state.public_key {
-            let auth_header = m6_core::headers::get(&req.headers[..], "authorization");
-            let cookie_header_owned = auth::combined_cookie_header(&req.headers);
-            let cookie_header = cookie_header_owned.as_deref();
-            let accept_header = m6_core::headers::get(&req.headers[..], "accept");
-
-            match auth::extract_token(auth_header, cookie_header) {
-                None => {
+            match auth::authorise(pk, &req.headers, require) {
+                Err(auth::Refusal::NoToken) => {
                     warn!(path = %req.path, "auth: no token");
+                    let cookie_header_owned = auth::combined_cookie_header(&req.headers);
+                    let cookie_header = cookie_header_owned.as_deref();
+                    let accept_header = m6_core::headers::get(&req.headers[..], "accept");
                     if auth::is_browser_request(accept_header) {
                         let refresh = auth::extract_refresh_cookie(cookie_header);
                         let redirect_url = if refresh.is_some() {
@@ -2653,41 +2755,38 @@ fn handle_request_inner(
                         backend: Some(route.backend.clone()),
                         detail: Some("no token".to_string()),
                     };
-                    let (s, h, b, n) = apply_error_mode(401, req, client_ip, state, Some(&ctx));
+                    let (s, mut h, b, n) = apply_error_mode(401, req, client_ip, state, Some(&ctx));
+                    add_bearer_challenge(&mut h);
                     return RequestOutcome::Ready(s, h, b, n);
                 }
-                Some(token) => match pk.verify(token) {
-                    Err(e) => {
-                        warn!(path = %req.path, error = %e, "auth: token verification failed");
-                        let ctx = error::ErrorContext {
-                            route: Some(route.path.clone()),
-                            backend: Some(route.backend.clone()),
-                            detail: Some(e.to_string()),
-                        };
-                        let (s, h, b, n) = apply_error_mode(401, req, client_ip, state, Some(&ctx));
-                        return RequestOutcome::Ready(s, h, b, n);
-                    }
-                    Ok(claims) => {
-                        if !auth::check_require(&claims, require) {
-                            warn!(
-                                path = %req.path,
-                                require = %require,
-                                "auth: insufficient claims"
-                            );
-                            let ctx = error::ErrorContext {
-                                route: Some(route.path.clone()),
-                                backend: Some(route.backend.clone()),
-                                detail: Some(format!("requires: {require}")),
-                            };
-                            let (s, h, b, n) =
-                                apply_error_mode(403, req, client_ip, state, Some(&ctx));
-                            return RequestOutcome::Ready(s, h, b, n);
-                        }
-                        // Forward verified claims to backend as X-Auth-Claims header
-                        // (base64-encoded JSON so renderers can inspect them).
-                        verified_claims = Some(claims);
-                    }
-                },
+                Err(auth::Refusal::Invalid(e)) => {
+                    warn!(path = %req.path, error = %e, "auth: token verification failed");
+                    let ctx = error::ErrorContext {
+                        route: Some(route.path.clone()),
+                        backend: Some(route.backend.clone()),
+                        detail: Some(e.to_string()),
+                    };
+                    let (s, mut h, b, n) = apply_error_mode(401, req, client_ip, state, Some(&ctx));
+                    add_bearer_challenge(&mut h);
+                    return RequestOutcome::Ready(s, h, b, n);
+                }
+                Err(auth::Refusal::Insufficient) => {
+                    warn!(
+                        path = %req.path,
+                        require = %require,
+                        "auth: insufficient claims"
+                    );
+                    let ctx = error::ErrorContext {
+                        route: Some(route.path.clone()),
+                        backend: Some(route.backend.clone()),
+                        detail: Some(format!("requires: {require}")),
+                    };
+                    let (s, h, b, n) = apply_error_mode(403, req, client_ip, state, Some(&ctx));
+                    return RequestOutcome::Ready(s, h, b, n);
+                }
+                // Forward verified claims to backend as X-Auth-Claims header
+                // (base64-encoded JSON so renderers can inspect them).
+                Ok(claims) => verified_claims = Some(claims),
             }
         }
     }
@@ -3049,6 +3148,18 @@ fn dispatch_custom_error_async(
     Some(RequestOutcome::Pending { rx, ctx })
 }
 
+/// RFC 9110 11.6.1: a 401 names the authentication scheme that would pass.
+/// Keeps a `WWW-Authenticate` a backend already supplied, since the error
+/// path preserves it.
+fn add_bearer_challenge(headers: &mut Vec<(String, String)>) {
+    if !headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("www-authenticate"))
+    {
+        headers.push(("WWW-Authenticate".to_string(), "Bearer".to_string()));
+    }
+}
+
 /// Apply the configured error mode for a given status code.
 ///
 /// For `Custom` mode, performs an internal GET to `<errors.path>?status=N&from=/original-path`.
@@ -3293,9 +3404,8 @@ fn set_vary_accept_encoding(headers: &mut Vec<(String, String)>, backend_compres
 ///
 /// A successful POST/PUT/DELETE means the stored representation of that URI is
 /// now wrong, and nothing invalidated it: the cache kept serving the old copy
-/// until it expired on its own. For this site that is a live concern the
-/// moment the CMS returns — edit a page, and the edge keeps serving the
-/// previous one.
+/// until it expired on its own. That is a live concern for any site with an
+/// editing interface: edit a page, and the edge keeps serving the previous one.
 ///
 /// "Non-error status" is the RFC's condition: a 4xx/5xx means the state change
 /// did not happen, so the cached copy is still correct and must be left alone.
@@ -3795,12 +3905,7 @@ fn flush_all(udp: &UdpSocket, connections: &mut HashMap<Vec<u8>, QuicConn>) {
 
 // ── Filesystem event handling ─────────────────────────────────────────────────
 
-fn handle_fs_event(
-    event: &FsEvent,
-    state: &mut ServerState,
-    quiche_config: &mut quiche::Config,
-    log_handle: &m6_core::log::LogHandle,
-) {
+fn handle_fs_event(event: &FsEvent, state: &mut ServerState) {
     match event.kind {
         FsEventKind::SocketCreated => {
             state.pool_manager.socket_appeared(&event.path);
@@ -3808,77 +3913,218 @@ fn handle_fs_event(
         FsEventKind::SocketDeleted => {
             state.pool_manager.socket_disappeared(&event.path);
         }
-        FsEventKind::SiteTomlChanged => {
-            handle_site_reload(state, log_handle);
+    }
+}
+
+/// What a config reload did that the event loop has to act on.
+#[derive(Default)]
+struct Reloaded {
+    /// The response cache was emptied.
+    cache_cleared: bool,
+    /// A process-config change asked for TLS to be re-read and the rebuild failed.
+    tls_failed: bool,
+}
+
+/// Apply a change to `site.toml`, to the system config, or to both.
+///
+/// A `site.toml` change rebuilds routes, pools, the invalidation map and the
+/// error mode and empties the cache, as it always has. A system-config change
+/// on its own takes only the keys that file owns (`take_process_owned`), keeps
+/// the cache, and re-reads TLS material on HTTP/1.1, HTTP/2 and HTTP/3. A
+/// change to both runs both.
+///
+/// A process-config change re-reads TLS even when the merged load fails: the
+/// touch means new material is on disk, and a `site.toml` that is mid-edit must
+/// not hold a renewal back. The paths in use are those already running.
+fn handle_config_change(
+    changed: Changed,
+    state: &mut ServerState,
+    quiche_config: &mut quiche::Config,
+    mut tcp: Option<&mut Http11Listener>,
+    log_handle: &m6_core::log::LogHandle,
+) -> Reloaded {
+    let start = std::time::Instant::now();
+    let mut out = Reloaded::default();
+
+    let loaded = match config::load(&state.config.site_dir, &state.system_config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(
+                error = %e,
+                site = changed.site,
+                process = changed.process,
+                "config reload: failed, keeping current config"
+            );
+            if changed.process {
+                out.tls_failed = !handle_tls_reload(state, quiche_config, tcp.as_deref_mut());
+            }
+            return out;
         }
-        FsEventKind::TlsCertChanged => {
-            handle_tls_reload(state, quiche_config);
+    };
+
+    let mut new = if changed.site {
+        loaded
+    } else {
+        config::take_process_owned(&state.config, loaded)
+    };
+    for key in config::carry_restart_only(&state.config, &mut new) {
+        warn!("config reload: {key} changed; restart m6-http to apply it");
+    }
+
+    let mut site_items = None;
+    if changed.site {
+        // A reload is the likeliest moment for an inert `cache` key to be
+        // introduced: someone editing site.toml on the node.
+        config::warn_ignored_route_cache_keys(&new);
+        let route_table = match RouteTable::from_config(&new) {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(error = %e, "config reload: route table error, keeping current config");
+                if changed.process {
+                    out.tls_failed = !handle_tls_reload(state, quiche_config, tcp.as_deref_mut());
+                }
+                return out;
+            }
+        };
+        site_items = Some((
+            route_table,
+            PoolManager::from_config(&new.backends),
+            router::build_invalidation_map(&new),
+            ErrorMode::from_config(&new.errors),
+        ));
+    }
+
+    let public_key = reload_public_key(state, &new);
+
+    if let Some((route_table, pools, inv_map, error_mode)) = site_items {
+        state.route_table = route_table;
+        state.pool_manager = pools;
+        state.invalidation_map = inv_map;
+        state.error_mode = error_mode;
+    }
+    state.public_key = public_key;
+    state.config = new;
+    config::warn_health_token(&state.config.health);
+    if changed.site {
+        m6_http_lib::security::configure(&state.config.security);
+        state.cache.clear();
+        out.cache_cleared = true;
+        log_handle.reload(&state.config.log.format, &state.config.log.level);
+    }
+
+    if changed.process {
+        out.tls_failed = !handle_tls_reload(state, quiche_config, tcp);
+    }
+
+    info!(
+        site = changed.site,
+        process = changed.process,
+        cache_cleared = out.cache_cleared,
+        elapsed_us = start.elapsed().as_micros() as u64,
+        "config reload: complete"
+    );
+    out
+}
+
+/// The verify key for `new`, read from its `[auth]` section.
+///
+/// Keeps the running key when the file cannot be read, so a half-written key
+/// does not turn every token away. Returns `None` when `new` has no `[auth]`.
+fn reload_public_key(state: &mut ServerState, new: &config::Config) -> Option<PublicKey> {
+    let auth_cfg = new.auth.as_ref()?;
+    let key_path = config::resolve_path(&new.site_dir, &auth_cfg.public_key);
+    match PublicKey::from_pem_file(&key_path) {
+        Ok(k) => Some(k),
+        Err(e) => {
+            warn!(error = %e, "config reload: auth key load failed, keeping current key");
+            state.public_key.take()
         }
     }
 }
 
-fn handle_site_reload(state: &mut ServerState, log_handle: &m6_core::log::LogHandle) {
-    info!("config reload: site.toml changed");
+/// Rebuild every listener's TLS material, or none of it.
+///
+/// This used to rebuild the quiche configuration alone, so after a renewal
+/// HTTP/3 served the new certificate while HTTP/1.1 and HTTP/2 kept the old one
+/// until the process restarted. One server answered with two different
+/// certificates at the same time, chosen by the protocol the client negotiated,
+/// and the log said `TLS config reloaded`, which was true of the one protocol it
+/// had reloaded. m6 #210.
+///
+/// **Both configurations are built before either is installed.** A reload that
+/// swapped them one at a time would leave the protocols disagreeing whenever the
+/// second build failed, which is the state this function exists to end. On a
+/// failure every protocol keeps the material it already had, and the reload is
+/// tried again after a growing delay and at once on the next touch.
+///
+/// This runs when the system config changes, not when a certificate file does.
+/// A renewal writes the certificate and the key, then touches the system
+/// config, so the pair is complete when it is read. Each build reads the files
+/// itself, a moment apart, so material written between the two reads reaches
+/// one and not the other. A touch that arrives before the key is written fails
+/// the rustls pair check and keeps every protocol where it was, and the retry
+/// settles both on the finished pair. Returns `false` when nothing was
+/// installed.
+fn handle_tls_reload(
+    state: &ServerState,
+    quiche_config: &mut quiche::Config,
+    tcp: Option<&mut Http11Listener>,
+) -> bool {
+    info!("TLS config reload: system config changed");
 
-    match config::load(&state.config.site_dir, &state.system_config_path) {
-        Ok(new_config) => {
-            // A reload is the likeliest moment for an inert `cache` key to be
-            // introduced — someone editing site.toml on the node.
-            config::warn_ignored_route_cache_keys(&new_config);
-            let new_route_table = match RouteTable::from_config(&new_config) {
-                Ok(t) => t,
-                Err(e) => {
-                    warn!(error = %e, "config reload: route table error");
-                    return;
-                }
-            };
-            let new_pools = PoolManager::from_config(&new_config.backends);
-            let new_inv_map = router::build_invalidation_map(&new_config);
-            let new_error_mode = ErrorMode::from_config(&new_config.errors);
-
-            let new_public_key = match &new_config.auth {
-                Some(auth_cfg) => {
-                    let key_path = config::resolve_path(&new_config.site_dir, &auth_cfg.public_key);
-                    match PublicKey::from_pem_file(&key_path) {
-                        Ok(k) => Some(k),
-                        Err(e) => {
-                            warn!(error = %e, "config reload: auth key load failed, keeping current key");
-                            state.public_key.take()
-                        }
-                    }
-                }
-                None => None,
-            };
-
-            state.route_table = new_route_table;
-            state.pool_manager = new_pools;
-            state.invalidation_map = new_inv_map;
-            state.error_mode = new_error_mode;
-            state.public_key = new_public_key;
-            state.config = new_config;
-            m6_http_lib::security::configure(&state.config.security);
-            state.cache.clear();
-
-            log_handle.reload(&state.config.log.format, &state.config.log.level);
-            info!("config reload: complete, cache cleared");
+    // Both are Some outside redirect mode, which runs its own loop and never
+    // reaches here. Erroring keeps a config failure diagnosable instead of a
+    // panic if this ever moves.
+    let (cert_path, key_path) = match (&state.config.server.tls_cert, &state.config.server.tls_key)
+    {
+        (Some(c), Some(k)) => (c, k),
+        _ => {
+            warn!("TLS config reload: no certificate is configured, keeping old config");
+            return false;
         }
+    };
+
+    let material = match load_tls_material(cert_path, key_path) {
+        Ok(m) => m,
         Err(e) => {
-            warn!(error = %e, "config reload: failed, keeping current config");
+            warn!(error = %e, "TLS config reload failed for HTTP/1.1 and HTTP/2, keeping old config on every protocol");
+            return false;
         }
-    }
-}
-
-fn handle_tls_reload(state: &ServerState, quiche_config: &mut quiche::Config) {
-    info!("TLS config reload: cert/key file changed");
-    match make_quiche_config(&state.config.server) {
-        Ok(new_cfg) => {
-            *quiche_config = new_cfg;
-            info!("TLS config reloaded");
-        }
+    };
+    let new_quiche = match make_quiche_config(&state.config.server) {
+        Ok(c) => c,
         Err(e) => {
-            warn!(error = %e, "TLS config reload failed, keeping old config");
+            warn!(error = %e, "TLS config reload failed for HTTP/3, keeping old config on every protocol");
+            return false;
         }
+    };
+
+    // Installed together. Past this point nothing can fail.
+    *quiche_config = new_quiche;
+    let tls_listener_reloaded = match tcp {
+        Some(t) if t.terminates_tls() => {
+            t.replace_tls_config(material.config.clone());
+            true
+        }
+        // A node serving QUIC with no TLS listener is not a configuration this
+        // project runs, and recording still answers for what h3 is serving.
+        Some(_) | None => false,
+    };
+
+    // After the swap, so the reported expiry is the material being served
+    // rather than the material that was read off disk.
+    material.record(cert_path);
+
+    // The line names the protocols it actually replaced. Half of what #210 cost
+    // was a log that said `TLS config reloaded` for a reload that reached one
+    // protocol, so a success line claiming all three on the path that rebuilt
+    // one is the same defect moved a few lines down.
+    if tls_listener_reloaded {
+        info!("TLS config reloaded on HTTP/1.1, HTTP/2 and HTTP/3");
+    } else {
+        warn!("TLS config reloaded on HTTP/3 alone: there is no HTTP/1.1 TLS listener to rebuild");
     }
+    true
 }
 
 // ── CLI ────────────────────────────────────────────────────────────────────────
@@ -3984,6 +4230,12 @@ fn run(args: Vec<String>) -> i32 {
         }
     };
 
+    // Fingerprint both config files before the first read of either, so a
+    // change between that read and the reloader's creation is reported on its
+    // first tick instead of lost.
+    let site_toml = cli.site_dir.join("site.toml");
+    let seen = Seen::read(&site_toml, &cli.system_config);
+
     // Load config before initialising logging so we can read [log] from site.toml.
     let config = match config::load(&cli.site_dir, &cli.system_config) {
         Ok(c) => c,
@@ -4012,6 +4264,10 @@ fn run(args: Vec<String>) -> i32 {
     };
 
     config::warn_system_config_extra_keys(&cli.system_config);
+    config::warn_node_fallback(&cli.system_config);
+    for m in config::misplaced_keys(&cli.site_dir, &cli.system_config) {
+        warn!("{m}");
+    }
     config::warn_health_token(&config.health);
     config::warn_ignored_route_cache_keys(&config);
 
@@ -4120,10 +4376,12 @@ fn run(args: Vec<String>) -> i32 {
     let watcher = match FsWatcher::new(&config) {
         Ok(w) => Some(w),
         Err(e) => {
-            warn!(error = %e, "fs watcher setup failed, hot reload disabled");
+            info!(error = %e, "backend socket watch unavailable; the 2-second rescan finds sockets");
             None
         }
     };
+
+    let reloader = ConfigReloader::new(&site_toml, &cli.system_config, seen);
 
     // Build TLS config for HTTP/1.1 and bind TCP listener on the same port.
     // Both are Some on this path: redirect mode returned above, and every other
@@ -4169,7 +4427,11 @@ fn run(args: Vec<String>) -> i32 {
     };
 
     let h2c_listener = if let Some(ref h2c_bind) = config.server.h2c_bind {
-        match H2cListener::bind(h2c_bind) {
+        let internal_peers = config
+            .server
+            .is_internal(h2c_bind)
+            .then(|| config.server.internal_peers.clone());
+        match H2cListener::bind(h2c_bind, internal_peers) {
             Ok(l) => {
                 info!(bind = %h2c_bind, "H2C (HTTP/2 cleartext) listener started");
                 Some(l)
@@ -4190,18 +4452,27 @@ fn run(args: Vec<String>) -> i32 {
     info!(
         bind = %config.server.bind,
         h2c_bind = ?config.server.h2c_bind,
+        internal_binds = ?config.server.internal_binds,
+        internal_peers = ?config.server.internal_peers,
         site = %config.site.name,
         "m6-http listeners bound"
     );
 
-    // Classified before the struct literal, which moves `config`.
-    let tls_iface = Iface::for_bind(&config.server.bind);
-    let h2c_iface = config
+    // Only the h2c listener can be internal, and only when [server]
+    // internal_binds names it. The TLS and QUIC listener faces clients, so it is
+    // always external. Without an h2c listener the h2c value is never read.
+    // Computed before the struct literal, which moves `config`.
+    let tls_iface = Iface::External;
+    let h2c_iface = if config
         .server
         .h2c_bind
         .as_deref()
-        .map(Iface::for_bind)
-        .unwrap_or(Iface::Internal);
+        .is_some_and(|b| config.server.is_internal(b))
+    {
+        Iface::Internal
+    } else {
+        Iface::External
+    };
     let mut state = ServerState {
         config,
         system_config_path: cli.system_config.clone(),
@@ -4233,6 +4504,7 @@ fn run(args: Vec<String>) -> i32 {
             tcp: tcp_listener,
             h2c: h2c_listener,
             watcher,
+            reloader,
             wake_reader,
         },
         &mut state,
@@ -4267,6 +4539,8 @@ mod www_redirect_tests {
                 tls_key: Some("/tmp/key.pem".to_string()),
                 backend_timeout_secs: 30,
                 h2c_bind: None,
+                internal_binds: Vec::new(),
+                internal_peers: Vec::new(),
                 redirect_bind: None,
                 warm_on_start: false,
                 allowed_methods: vec!["GET".into(), "HEAD".into(), "POST".into()],
@@ -4347,7 +4621,7 @@ mod www_redirect_tests {
         }
     }
 
-    /// `www.` prefixing a *different* domain is not this site's www alias.
+    /// `www.` prefixing a *different* domain is not the configured site's www alias.
     #[test]
     fn www_of_another_domain_is_not_our_alias() {
         let c = cfg("example.com", true);

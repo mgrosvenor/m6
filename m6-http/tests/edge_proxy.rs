@@ -808,7 +808,7 @@ fn test_rtt_simulation() {
         miss_total += t0.elapsed();
     }
     println!("avg cache-miss (no artificial RTT): {:?}", miss_total / 10);
-    println!("Note: in production with 5ms RTT, cache-miss adds ~10ms (TCP round-trip);");
+    println!("Note: over a 5ms link, cache-miss adds ~10ms (TCP round-trip);");
     println!("      cache-hit serves from local Arc<Bytes> in <1ms regardless of RTT.");
 }
 

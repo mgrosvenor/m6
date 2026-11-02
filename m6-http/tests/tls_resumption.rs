@@ -17,7 +17,7 @@
 //! # The tooling trap this file is the answer to
 //!
 //! The defect was first "confirmed" with `openssl s_client -sess_out/-sess_in`
-//! against production, which reported `New` rather than `Reused`. That evidence
+//! against a running server, which reported `New` rather than `Reused`. That evidence
 //! was worthless: macOS ships **LibreSSL 3.3.6** as `/usr/bin/openssl`, whose
 //! TLS 1.3 client-side resumption is incomplete, and the system `python3` links
 //! LibreSSL 2.8.3 which has no TLS 1.3 at all. Both report a full handshake

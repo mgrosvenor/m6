@@ -28,7 +28,7 @@ c++ -std=c++17 -O2 -pthread -o /tmp/ex main.cpp
 Then, from another shell:
 
 ```sh
-curl --unix-socket /tmp/ex.sock http://x/status
+curl --unix-socket /tmp/ex.sock http://localhost/status
 ```
 
 `/`, `/status`, `/health`, `/boom` and anything else (404) are the five routes.

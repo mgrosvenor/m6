@@ -661,8 +661,8 @@ fn malformed_request_lines_are_handled_and_do_not_crash() {
 
 // ── 5. Injection-shaped payloads reaching the application ─────────────────────
 
-/// SQLi/XSS/template-shaped query strings. This site has no database, so the
-/// property under test is not "the query is sanitised" but the one that
+/// SQLi/XSS/template-shaped query strings. A site may have no database at all,
+/// so the property under test is not "the query is sanitised" but the one that
 /// actually matters at this layer: whatever the caller sends must not come back
 /// unescaped in the response head, must not split it, and must not crash the
 /// renderer.

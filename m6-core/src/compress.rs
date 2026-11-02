@@ -105,11 +105,11 @@ mod tests {
 /// A service with no entry in `site.toml` at all is not an error: it may be
 /// reached some other way, or be under test.
 pub fn check_declared_support(
-    site_dir: &std::path::Path,
+    site_toml: &std::path::Path,
     backend_name: &str,
     compresses: bool,
 ) -> Result<(), String> {
-    let declared = match declared_compresses(site_dir, backend_name) {
+    let declared = match declared_compresses(site_toml, backend_name) {
         Some(d) => d,
         None => return Ok(()),
     };
@@ -142,8 +142,8 @@ pub fn check_declared_support(
 /// parse: this function reports what the file says about this service, and
 /// "nothing" is a legitimate answer. Whether the file must exist is the
 /// caller's business.
-fn declared_compresses(site_dir: &std::path::Path, backend_name: &str) -> Option<bool> {
-    let text = std::fs::read_to_string(site_dir.join("site.toml")).ok()?;
+fn declared_compresses(site_toml: &std::path::Path, backend_name: &str) -> Option<bool> {
+    let text = std::fs::read_to_string(site_toml).ok()?;
     let val: toml::Value = text.parse().ok()?;
     let entry = val
         .get("backend")?
@@ -173,9 +173,9 @@ mod declared_support_tests {
     #[test]
     fn agreement_is_silent_in_both_directions() {
         let d = site_with("[[backend]]\nname = \"r\"\ncompresses = true\n");
-        assert!(check_declared_support(d.path(), "r", true).is_ok());
+        assert!(check_declared_support(&d.path().join("site.toml"), "r", true).is_ok());
         let d = site_with("[[backend]]\nname = \"r\"\ncompresses = false\n");
-        assert!(check_declared_support(d.path(), "r", false).is_ok());
+        assert!(check_declared_support(&d.path().join("site.toml"), "r", false).is_ok());
     }
 
     /// The dangerous direction: the edge stops varying, the backend keeps
@@ -184,7 +184,8 @@ mod declared_support_tests {
     #[test]
     fn declared_false_while_compressing_is_refused() {
         let d = site_with("[[backend]]\nname = \"r\"\ncompresses = false\n");
-        let e = check_declared_support(d.path(), "r", true).expect_err("must refuse");
+        let e = check_declared_support(&d.path().join("site.toml"), "r", true)
+            .expect_err("must refuse");
         assert!(e.contains("DOES compress"), "{e}");
         assert!(e.contains("asked for identity"), "{e}");
     }
@@ -192,7 +193,8 @@ mod declared_support_tests {
     #[test]
     fn declared_true_while_not_compressing_is_refused() {
         let d = site_with("[[backend]]\nname = \"r\"\ncompresses = true\n");
-        let e = check_declared_support(d.path(), "r", false).expect_err("must refuse");
+        let e = check_declared_support(&d.path().join("site.toml"), "r", false)
+            .expect_err("must refuse");
         assert!(e.contains("compresses nothing"), "{e}");
     }
 
@@ -201,8 +203,8 @@ mod declared_support_tests {
     #[test]
     fn an_absent_key_means_true() {
         let d = site_with("[[backend]]\nname = \"r\"\nsockets = \"/run/m6/r.sock\"\n");
-        assert!(check_declared_support(d.path(), "r", true).is_ok());
-        assert!(check_declared_support(d.path(), "r", false).is_err());
+        assert!(check_declared_support(&d.path().join("site.toml"), "r", true).is_ok());
+        assert!(check_declared_support(&d.path().join("site.toml"), "r", false).is_err());
     }
 
     /// A service the file says nothing about is not a fault. It may be reached
@@ -210,13 +212,13 @@ mod declared_support_tests {
     #[test]
     fn a_backend_absent_from_site_toml_is_not_a_fault() {
         let d = site_with("[[backend]]\nname = \"other\"\ncompresses = true\n");
-        assert!(check_declared_support(d.path(), "r", true).is_ok());
-        assert!(check_declared_support(d.path(), "r", false).is_ok());
+        assert!(check_declared_support(&d.path().join("site.toml"), "r", true).is_ok());
+        assert!(check_declared_support(&d.path().join("site.toml"), "r", false).is_ok());
     }
 
     #[test]
     fn no_site_toml_at_all_is_not_a_fault() {
         let d = tempfile::tempdir().unwrap();
-        assert!(check_declared_support(d.path(), "r", false).is_ok());
+        assert!(check_declared_support(&d.path().join("site.toml"), "r", false).is_ok());
     }
 }

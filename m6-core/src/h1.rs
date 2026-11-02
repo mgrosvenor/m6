@@ -34,12 +34,12 @@ use std::io::Write;
 
 /// Reduce an absolute-form request target to its path.
 ///
-/// `http://host/a/b?c` becomes `/a/b?c`. Anything already in origin-form,
+/// `http://example.com/a/b?c` becomes `/a/b?c`. Anything already in origin-form,
 /// asterisk-form (`OPTIONS *`) or authority-form (`CONNECT host:port`) is
 /// returned unchanged: only absolute-form carries a scheme.
 ///
 /// A scheme-relative target (`//host/path`) is left alone. It is not
-/// absolute-form, and treating it as one would let `//evil.com/x` be rewritten
+/// absolute-form, and treating it as one would let `//evil.example.com/x` be rewritten
 /// to `/x` -- turning a request the router should refuse into one it serves.
 /// Is this a `Host` field value a server may act on (RFC 9110 4.2, RFC 3986)?
 ///
@@ -309,7 +309,7 @@ fn strip_absolute_form(target: &str) -> &str {
     let after_scheme = &target[scheme_end + 3..];
     match after_scheme.find('/') {
         Some(slash) => &after_scheme[slash..],
-        // `http://host` with no path at all means the origin's root.
+        // `http://example.com` with no path at all means the origin's root.
         None => "/",
     }
 }
@@ -369,7 +369,7 @@ pub fn parse_request(buf: &[u8]) -> ParseResult {
     let raw_path = req.path.unwrap_or("/");
 
     // RFC 9112 3.2.2: a server MUST accept absolute-form
-    // (`GET http://host/path HTTP/1.1`), which is what a request through a
+    // (`GET http://example.com/path HTTP/1.1`), which is what a request through a
     // proxy looks like and what an attacker sends to see whether the origin
     // and the proxy agree about the target.
     //
@@ -883,14 +883,14 @@ mod absolute_form_tests {
 
     /// A scheme-relative target must NOT be treated as absolute-form.
     ///
-    /// `//evil.com/x` has no scheme. Rewriting it to `/x` would turn a request
+    /// `//evil.example.com/x` has no scheme. Rewriting it to `/x` would turn a request
     /// the router should refuse into one it serves, which is the same
     /// open-redirect shape `is_same_origin_path` exists to stop.
     #[test]
     fn scheme_relative_targets_are_not_rewritten() {
-        let r = parse(b"GET //evil.com/x HTTP/1.1\r\nHost: x\r\n\r\n");
+        let r = parse(b"GET //evil.example.com/x HTTP/1.1\r\nHost: x\r\n\r\n");
         assert_eq!(
-            r.path, "//evil.com/x",
+            r.path, "//evil.example.com/x",
             "scheme-relative must survive intact"
         );
     }
@@ -899,9 +899,9 @@ mod absolute_form_tests {
     #[test]
     fn only_a_valid_scheme_triggers_the_rewrite() {
         for target in [
-            "/redirect?to=http://evil.com/x",
+            "/redirect?to=http://evil.example.com/x",
             "/a://b",
-            "/1http://evil.com/x",
+            "/1http://evil.example.com/x",
         ] {
             let raw = format!("GET {target} HTTP/1.1\r\nHost: x\r\n\r\n");
             let r = parse(raw.as_bytes());

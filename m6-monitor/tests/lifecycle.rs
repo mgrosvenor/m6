@@ -12,7 +12,9 @@
 
 use std::process::Command;
 
-use m6_core::testkit::{assert_app_lifecycle, binary};
+use std::time::Duration;
+
+use m6_core::testkit::{assert_app_lifecycle, binary, wait, Service};
 
 /// A config m6-monitor will actually start on.
 ///
@@ -105,4 +107,40 @@ fn check_without_config_fails_loudly() {
         err.contains("usage") || err.contains("config"),
         "the failure should say what was missing\n--- stderr ---\n{err}"
     );
+}
+
+/// The poll interval is read once, so a changed value is named as needing a
+/// restart, and the service keeps running.
+#[test]
+fn a_poll_interval_change_is_named_as_needing_a_restart() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = dir.path().join("monitor.conf");
+    std::fs::write(&config, CONFIG).expect("write config");
+    let sock = dir.path().join("mon.sock");
+
+    let mut svc = Service::spawn(
+        "m6-monitor",
+        Command::new(binary("m6-monitor"))
+            .arg(dir.path())
+            .arg(&config)
+            .env("M6_SOCKET_OVERRIDE", &sock),
+    );
+    svc.wait_for_path(&sock, Duration::from_secs(10));
+    assert!(
+        wait::for_unix(&sock, Duration::from_secs(10)),
+        "m6-monitor never accepted a connection\n{}",
+        svc.output()
+    );
+
+    std::fs::write(&config, format!("poll_interval_s = 45\n{CONFIG}")).expect("rewrite config");
+    let named = wait::until(Duration::from_secs(10), || {
+        svc.output()
+            .contains("poll_interval_s changed; restart m6-monitor to apply it")
+    });
+    assert!(
+        named,
+        "the changed poll_interval_s was not named\n--- output ---\n{}",
+        svc.output()
+    );
+    svc.assert_alive("after a poll_interval_s change");
 }

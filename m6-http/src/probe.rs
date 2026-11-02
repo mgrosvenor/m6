@@ -633,8 +633,8 @@ pub fn zero_rtt_h3(addr: &str, path: &str, method: &str) -> io::Result<ZeroRtt> 
 ///
 /// A duration alone cannot tell a one-round-trip handshake on a slow link from a
 /// two-round-trip handshake on a fast one, and the difference is the only part
-/// that is actionable: an extra round trip is 300ms between edge-a and origin
-/// however fast the CPU is.
+/// that is actionable: an extra round trip is 300ms across an intercontinental
+/// path however fast the CPU is.
 ///
 /// `server_bytes_before_established` is the figure that identifies the QUIC
 /// anti-amplification limit specifically. A server may send at most about three

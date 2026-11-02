@@ -4,14 +4,14 @@ use m6_auth::Db;
 use m6_core::http::{RawRequest, RawResponse};
 // Form parsing, percent coding and cookie lookup are core's. This file had its
 // own of each; `url_decode` in particular was a second copy of the Latin-1
-// defect that reached production through the contact form, and it had to be
+// defect that reached production through a contact form, and it had to be
 // found and fixed twice. That is the argument for consolidating, so they are
 // gone rather than merely correct.
 use m6_core::request::{cookie, parse_form_body, url_encode_path};
 use tracing::{info, warn};
 
 use crate::jwt::{hash_token, now_secs, AccessClaims, RefreshClaims};
-use crate::key_watch::KeyMaterial;
+use crate::keys::KeyMaterial;
 use crate::rate_limit::RateLimiter;
 
 pub struct AppState {
@@ -20,6 +20,11 @@ pub struct AppState {
     pub access_ttl: u64,
     pub refresh_ttl: u64,
     pub issuer: String,
+    /// What the config said at start, kept so a reload can name a change that
+    /// only a restart applies.
+    pub db_path: std::path::PathBuf,
+    pub rate_limit_max_attempts: u32,
+    pub rate_limit_window_secs: u64,
     pub rate_limiter: Mutex<RateLimiter>,
 }
 

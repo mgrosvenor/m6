@@ -63,7 +63,11 @@ fi
 OUT="$(mktemp)"
 trap 'rm -f "$OUT"' EXIT
 
-if cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tee "$OUT" >/dev/null; then
+# Second pass: m6-core with every feature on, because nothing in the workspace
+# turns some of its opt-in features on and so the workspace pass never compiles
+# them. A new feature is covered without an edit here.
+if cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tee "$OUT" >/dev/null &&
+  cargo clippy -p m6-core --all-targets --all-features -- -D warnings 2>&1 | tee -a "$OUT" >/dev/null; then
   echo "clippy: silent on $(uname -s) ($(cargo clippy --version))"
   exit 0
 fi

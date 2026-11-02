@@ -14,7 +14,7 @@ Before this merges into `develop`, all of it has to pass on the build host:
 - [ ] h1, h2, h3 conformance at or above their recorded scores
 - [ ] performance check within its margin
 
-CI runs all of it on this pull request. `M6_BUILD_HOST=root@<box>
+CI runs all of it on this pull request. `M6_BUILD_HOST=user@example.com
 ./tools/build-host-tests.sh` runs the same ground plus the two things a shared
 runner cannot do: the performance check, which needs a quiet machine, and
 conformance against a real h2spec/h3spec install. Run it here first when the
