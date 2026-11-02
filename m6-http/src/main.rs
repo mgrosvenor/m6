@@ -1245,39 +1245,10 @@ fn event_loop(
                     if let RequestOutcome::Ready(status, ref mut headers, _, ref backend) = outcome
                     {
                         set_alt_svc(headers, quic_port);
-                        // /health and /perf are separated inside
-                        // `Stats::record` now, not skipped here. See the
-                        // monitoring block in stats.rs: they are counted
-                        // apart from site traffic rather than discarded, so
-                        // requests_total is still a traffic-stall signal.
-                        // Record the cache MISS.
-                        //
-                        // This was missing, and the omission was invisible
-                        // because of where the only other miss-recording site
-                        // sits: the async URL-backend callback below. A cache
-                        // node's backend is the origin over h2c, which is
-                        // always async, so misses were counted there. The
-                        // ORIGIN's backends are unix sockets that complete
-                        // synchronously inside handle_request and return
-                        // Ready, so that callback never fires and no miss was
-                        // ever recorded on the origin.
-                        //
-                        // The consequence: cache_misses=0, miss_p50_ns=0, and
-                        // cache_hit_rate=1.0000 -- not a hit rate at all, but
-                        // "of the requests that were counted, all were hits",
-                        // because misses were never in the denominator.
-                        // requests_total undercounted by every miss, and
-                        // backend_errors_total could never rise on the origin
-                        // at all, since is_backend_error is only passed here
-                        // and in the async callback. A 500 from m6-html was
-                        // uncountable.
-                        //
-                        // Ready only. A Pending outcome is a URL backend whose
-                        // completion callback records it; recording here too
-                        // would double-count every edge miss.
-                        //
-                        // HTTP/3 already did this correctly, which is why the
-                        // gap survived: any check of the h3 path looked fine.
+                        // Same two notes as the HTTP/1.1 path above: /health and
+                        // /perf are separated inside `Stats::record`, and this
+                        // Ready path records the cache miss itself because the
+                        // async URL-backend callback never runs for it.
                         let elapsed_ns = start.elapsed().as_nanos() as u64;
                         // h2c is HTTP/2 by definition; the interface class comes
                         // from its bind address (the private backbone here).
