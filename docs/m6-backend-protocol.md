@@ -51,14 +51,19 @@ The backend MUST, in this order:
    exit will otherwise cause `bind` to fail with `EADDRINUSE`.
 2. **Bind** the socket.
 3. **Make the socket reachable by the proxy's user.** The proxy's user MUST be
-   able to connect to the socket. The m6 `App` default is `0660`, which works
-   when the proxy and the service share a group. A backend that runs as its own
-   user SHOULD set `0666`, the simplest way to let the proxy connect. A socket
-   the proxy cannot connect to is the single most common cause of a backend
-   that starts cleanly and is never contacted.
+   able to connect to the socket. A backend SHOULD set `0660` and give the
+   socket a group that includes the proxy's user, whether or not the two run as
+   different users. The m6 `App` default is `0660`. A backend MAY set `0666`
+   only when the socket's parent directory restricts access (mode `0750` or
+   `0710`, with the proxy's group). With `0666` and a `0755` directory, any
+   local user on the host can connect to the socket and bypass the edge,
+   including by forging `X-Forwarded-*` headers. The socket is not reachable
+   from the network. A socket the proxy cannot connect to is the single most
+   common cause of a backend that starts cleanly and is never contacted.
 4. **Listen**, with a backlog SHOULD be at least 64.
 
-The backend SHOULD create the parent directory if it does not exist.
+The backend SHOULD create the parent directory if it does not exist, with mode
+`0750` or `0710` and the proxy's group.
 
 ### 1.3 Connection lifetime
 
@@ -66,8 +71,10 @@ The backend SHOULD create the parent directory if it does not exist.
 exactly one request, reads exactly one response, and closes. Every request it
 forwards carries `Connection: close`.
 
-The backend MAY keep the connection open and MAY serve several requests on it.
-The backend MUST handle the proxy closing the connection after each response.
+A backend MAY support persistent connections for clients that ask for them.
+The proxy sends `Connection: close`, and the backend MUST close the connection
+after responding to a request that carries it (RFC 9112 §9.6). The backend MUST
+also handle the proxy closing the connection after each response.
 Pipelining does not occur and MUST NOT be relied on.
 
 A backend MAY handle connections concurrently. See §7.
@@ -448,7 +455,7 @@ the socket disappearing and reappearing is handled by the pool.
 Everything a backend MUST do, as a checklist:
 
 - [ ] Remove stale socket, bind a Unix `SOCK_STREAM` socket matching the glob
-- [ ] Make the socket reachable by the proxy's user: `0660` when the group is shared, `0666` when the users differ
+- [ ] Make the socket reachable by the proxy's user: `0660` with a group that includes it, `0666` only inside a `0750` or `0710` directory
 - [ ] Accept connections and serve requests
 - [ ] Parse an HTTP/1.1 request line and header section
 - [ ] Read exactly `Content-Length` body bytes, if any
@@ -456,7 +463,7 @@ Everything a backend MUST do, as a checklist:
 - [ ] Emit an accurate `Content-Length`
 - [ ] Emit `Content-Type` with a charset on text
 - [ ] Send no body for `HEAD`, `1xx`, `204`, `304`
-- [ ] Close the connection when the proxy closes it
+- [ ] Close the connection after responding to a request with `Connection: close`
 - [ ] On `SIGTERM`: drain, unlink the socket, exit `0`
 
 There is no requirement to implement TLS, HTTP/2, HTTP/3, chunked encoding,

@@ -341,19 +341,12 @@ absent, rather than letting a language go untested.
 Writing the examples found contradictions between normative documents. They are
 recorded here rather than resolved by whichever file was edited last.
 
-### 10.1 Socket mode: 0666 for a separate user, 0660 for a shared group
+### 10.1 Socket mode
 
-`m6-backend-protocol.md` §1.2 step 3 states the requirement: the proxy's user
-MUST be able to connect to the socket. It gives `0666` as the simplest way when
-the backend runs as its own user. The m6 `App` default is `0660`, which works
-when the proxy and the service share a group.
-
-The examples use `0666` so each can run as its own user. The `rust-m6core`
-example sets `socket_mode = "0666"` in its own config to match them, so the
-shared test can assert one value. Core keeps its `0660` default.
-
-**Resolved, owner's decision: the protocol states the requirement and gives
-`0666` as the cross-user method.** The examples keep 0666 and core keeps 0660.
+`m6-backend-protocol.md` §1.2 step 3 states the rule. The examples use `0666`
+because each runs as its own user. The `rust-m6core` example sets
+`socket_mode = "0666"` in its own config so the shared test asserts one value.
+Core keeps its `0660` default.
 
 ### 10.2 A bare 404 has no body
 

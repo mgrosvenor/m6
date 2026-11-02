@@ -57,7 +57,7 @@ Googlebot verifies only under `googlebot.com` and `google.com`. A name under `go
 ### Docs
 
 **`docs/m6-backend-protocol.md` no longer states two MUSTs that the reference `App` does not meet (#200).**
-The proxy's user must be able to connect to the backend socket, with `0666` the method when the backend runs as its own user. A backend may keep a connection open and must handle the proxy closing it after each response. `docs/m6-backend-examples.md` and `docs/m6-app-anatomy.md` now say the same.
+The proxy's user must be able to connect to the backend socket, with `0660` and a shared group preferred and `0666` allowed only inside a restricted directory. A backend may support persistent connections for clients that ask for them, and must close after responding to a request that carries `Connection: close`, which the proxy sends. `docs/m6-backend-examples.md` and `docs/m6-app-anatomy.md` now say the same.
 
 ### Verified
 
