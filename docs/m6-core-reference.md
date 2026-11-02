@@ -695,6 +695,28 @@ Both are `serde(default)`, so a node older than the fields still parses.
 endpoint: the node does the analysis and the log stays put. `LoggingHealth::read()`
 with `QUIET_SECONDS` (40) and `is_blind()` is the silent-log fault.
 `NotableClient`, `HeavyHitter`, `CrawlerReport` are its parts.
+`CrawlerReport` carries `first_seen` and `last_seen`, both `serde(default)`.
+
+### `resolve`
+
+Reverse DNS with a deadline, for checking a claim against its source.
+It runs in a monitor and never in a serving path, because a lookup is a network round trip.
+
+`reverse_confirmed(addr, timeout)` and `reverse_confirmed_default(addr)` resolve the PTR name of an address, then resolve that name forward, and return a `Ptr`:
+
+| `Ptr` | meaning |
+|---|---|
+| `Name(n)` | the PTR name `n` resolves back to the address |
+| `Unconfirmed(n)` | the PTR name `n` exists and its forward lookup completed without the address, a false claim |
+| `None` | the address has no PTR record, unverified |
+| `Failed` | a lookup failed, timed out or found no free thread slot, unverified |
+
+Table 2: the outcomes of a confirmed reverse lookup.
+
+`Ptr::verifies(domain)` matches a name against a domain on a dot boundary, so `example.com.attacker.net` does not match `example.com`.
+`DEFAULT_TIMEOUT` is two seconds and covers both lookups together.
+At most `MAX_LOOKUP_THREADS` (8) lookup threads are alive at once, counting those abandoned at their deadline, and a lookup with no free slot reads `Failed` at once.
+`telemetry::verify_crawler(user_agent, &ptr)` turns a `Ptr` into a `CrawlerVerdict` using the operator's documented method.
 
 ### `host`
 

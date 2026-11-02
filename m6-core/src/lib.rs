@@ -22,6 +22,7 @@ pub mod path;
 pub mod random;
 pub mod render;
 pub mod request;
+pub mod resolve;
 pub mod response;
 pub mod server;
 pub mod signal;

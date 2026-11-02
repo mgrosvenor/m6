@@ -1306,6 +1306,16 @@ pub struct CrawlerReport {
     pub requests: u64,
     pub client_ips: Vec<String>,
     pub paths: Vec<String>,
+    /// When the counted requests began and ended.
+    ///
+    /// `serde(default)` so a node older than these fields stays parseable to
+    /// an aggregator, in the shape `PerfReport::build` already uses. An
+    /// aggregator renders an empty string as "no time reported" rather than
+    /// as the epoch.
+    #[serde(default)]
+    pub first_seen: String,
+    #[serde(default)]
+    pub last_seen: String,
 }
 
 impl TrafficReport {
@@ -1371,6 +1381,8 @@ impl TrafficReport {
                     requests: c.requests,
                     client_ips: c.client_ips.clone(),
                     paths: c.paths.iter().map(|(p, _)| p.clone()).collect(),
+                    first_seen: c.first_seen.clone(),
+                    last_seen: c.last_seen.clone(),
                 })
                 .collect(),
             forged_bot_requests: summary.forged_bot_requests,
