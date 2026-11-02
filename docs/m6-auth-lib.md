@@ -208,7 +208,7 @@ Take from it that create and list work by user, and revoke works by token id.
 |---|---|---|
 | `api_token_create` | `(&self, user_id: &str, username: &str, name: &str, token_hash: &str, expires_at: i64) -> Result<ApiToken>` | inserts the row and returns the new token record |
 | `api_token_list` | `(&self, username: &str) -> Result<Vec<ApiToken>>` | returns a user's tokens, newest first, and `UserNotFound` for an unknown name |
-| `api_token_revoke` | `(&self, token_id: &str) -> Result<()>` | deletes the row and returns `ApiTokenNotFound` when the id is absent, and the token stays valid until `exp` |
+| `api_token_revoke` | `(&self, token_id: &str) -> Result<()>` | deletes the row and returns `ApiTokenNotFound` when the id is absent (see section 5.2) |
 
 **Table 6: the three API-token operations, their signatures and what each one does.**
 `m6-auth-cli` mints the token with the JWT engine, stores its hash through `api_token_create`, and prints the token once.
@@ -345,7 +345,7 @@ Take from it that every foreign key cascades from a user or a group, so a delete
 
 | table | holds | rows removed by |
 |---|---|---|
-| `users` | one row per user, with the bcrypt hash at cost 12, the roles JSON and `created_at` | `user_delete` |
+| `users` | one row per user, with the bcrypt hash, the roles JSON and `created_at` | `user_delete` |
 | `groups` | one row per group | `group_delete` |
 | `memberships` | one row per user in a group, keyed by `(user_id, group_id)` | `user_delete` or `group_delete` |
 | `refresh_tokens` | one row per refresh token, keyed by its hash | `user_delete`, or a revoke call |
@@ -354,8 +354,7 @@ Take from it that every foreign key cascades from a user or a group, so a delete
 **Table 9: the five tables, what each one holds and what removes its rows.**
 The cascade depends on the `foreign_keys` pragma in Table 2.
 
-`users.password` holds a bcrypt hash at cost 12, and `users.roles` holds a JSON array of strings.
-The two `token_hash` columns hold the lowercase hex SHA-256 that `hash_token` returns, and `api_tokens.token_hash` has a UNIQUE constraint so one token cannot be stored twice.
+`api_tokens.token_hash` has a UNIQUE constraint, so one token cannot be stored twice.
 
 Section 8 puts these tables and the operations together in a renderer.
 
