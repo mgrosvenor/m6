@@ -66,6 +66,8 @@ When the thread's signal mask cannot be read, a service now refuses to start ins
 **`docs/m6-http.md` documents m6-http's HTTP/2 denial-of-service behaviour: the Rapid Reset concurrency cap, send-side flow control on the backbone clients, the five-state stream machine and the known gaps (#160).**
 Documentation only. Each claim names the function or test that enforces it.
 
+**The m6-auth-cli reference follows the documentation ruleset, and its token defaults, config keys, key format and exit codes now match the binary (#138).**
+
 ### Verified
 
 - Unit tests with stub resolvers cover a confirmed name, a PTR whose forward lookup returns other addresses, a name with no forward answer, a failed forward lookup, no PTR, a name with no address (EAI_NONAME and EAI_NODATA), a slot free by the time the caller has the result, the per-poll lookup cap, expiry and cache bound, a report that reads stored results and resolves nothing, a resolver that never answers, and the thread bound (eight blocked lookups, then fifty more that return at once and start no thread, then slots free again).
