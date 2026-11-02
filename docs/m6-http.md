@@ -378,17 +378,13 @@ A stream with no credit keeps its unsent bytes in `pending_body` and returns.
 A WINDOW_UPDATE on stream 0 adds to the connection window and calls `pump_all`.
 A WINDOW_UPDATE on a stream adds to that stream's window and calls `pump_stream` for it.
 
-The defect was that `conn_send_window` was incremented and never read.
-The old send loop chunked by the peer's maximum frame size, so the frames were the right size and went out without connection credit.
-An m6 origin advertises a 1 MiB initial window and returns connection credit inside `handle_data`, which hid the defect.
-A strict peer answers FLOW_CONTROL_ERROR or closes the connection when the client overruns its credit.
-Both clients carried the same defect and both now read the window before sending.
+A strict peer answers FLOW_CONTROL_ERROR or closes the connection when a client overruns its credit, so both clients read the connection window before sending.
 
 END_STREAM rides on the frame that drains the body, so the bytes sent always match the advertised `content-length`.
 Skipping an uncredited write would send fewer bytes than promised, and blocking in the loop would stall every other connection the poller drives.
 The remainder is stream state that resumes when credit arrives.
 
-A WINDOW_UPDATE that would push a window above 2^31-1 is a flow-control error, so both clients use `checked_add` and mark the connection dead on overflow.
+A WINDOW_UPDATE that would push a window above 2^31-1 is a flow-control error, so both clients use `checked_add`. An overflow on stream 0 marks the connection dead. An overflow on a stream sends RST_STREAM(FLOW_CONTROL_ERROR) and drops that stream.
 A zero increment on stream 0 is a connection error, and the client marks the connection dead.
 A zero increment on a stream is answered with RST_STREAM(PROTOCOL_ERROR), because RFC 9113 section 6.9 makes it a stream error.
 
@@ -431,7 +427,6 @@ Known gaps below lists the two HTTP/2 limits the server still lacks.
 ### Known gaps
 
 Two HTTP/2 limits are absent from the server today, and Table 6 records each with the m6 issue that tracks it.
-The sections above describe the limits the code enforces, so a reader can treat this list as the remaining known absences.
 
 | Gap | What the code does today | Issue |
 |---|---|---|
@@ -440,8 +435,7 @@ The sections above describe the limits the code enforces, so a reader can treat 
 
 *Table 6: two HTTP/2 limits m6-http does not implement, and the issues that track them. Take from it that a peer gets no advertised header-list bound and no CANCEL or INTERNAL_ERROR from the server, and that the issue numbers are the record of each gap.*
 
-Both gaps are engineering work tracked by the two issues.
-The next section returns to how the process runs the bounds described here.
+The bounds described above plus these two open issues are the HTTP/2 denial-of-service posture of m6-http.
 
 ---
 
