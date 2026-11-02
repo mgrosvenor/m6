@@ -41,7 +41,7 @@ Take from it that every route is literal, so the service has no route configurat
 |---|---|---|---|
 | `POST` | `/auth/login` | checks a password and issues an access token and a refresh token | 302 with cookies for a form client, 200 with JSON for a JSON client |
 | `POST` | `/auth/refresh` | issues a new access token from a refresh token | 302 with a session cookie for a form client, 200 with JSON for a JSON client |
-| `POST` | `/auth/logout` | revokes refresh tokens, and clears cookies on the browser path | 302 for the browser path, 204 for the bearer path |
+| `POST` | `/auth/logout` | clears the browser's cookies, and revokes refresh tokens on the bearer path | 302 for the browser path, 204 for the bearer path |
 | `GET` | `/auth/public-key` | returns the current public key | 200 with a PEM body |
 
 **Table 1: the four routes, what each does, and what success returns.**
@@ -68,10 +68,14 @@ Take from it that every flag is optional and the two positional arguments are re
 | `<site-dir>` | the site root, used to resolve the key paths and the default `site.toml` |
 | `<config-path>` | the service config, normally `configs/m6-auth.conf` |
 | `--log-level <level>` | overrides the configured log level for this run |
-| `--dump-config` | prints the parsed configuration and the routes, then exits |
+| `--dump-config` | prints the core configuration and any routes declared in the config, then exits |
 | `--version` or `-V` | prints the binary name and version, then exits |
 
 **Table 2: the two positional arguments and the three flags.**
+
+For this binary the dump covers the site directory, the config paths, the socket, the thread pool, the server settings and any routes declared in the config.
+It does not include the `[storage]`, `[tokens]`, `[keys]` or `[rate_limit]` sections, or the four routes the service registers.
+It exits 0 before the service validates those sections.
 
 A missing positional argument prints the usage line and exits 2.
 
@@ -106,12 +110,9 @@ Take from it that `[storage]` and `[keys]` are the required sections, and that t
 
 **Table 3: the config keys, their defaults, and the two different path rules.**
 
-The `[storage]` rule and the `[keys]` rule are the pair to read twice.
-One is relative to the config file's directory, and the other is relative to the site directory.
-
 A config at `configs/m6-auth.conf` with `path = "data/auth.db"` opens `<site>/configs/data/auth.db`.
 To put the database at `<site>/data/auth.db`, use `path = "../data/auth.db"`.
-Both rules are in `m6-auth-server/src/config.rs`.
+The two path rules are in the notes column of Table 3, and the code is `m6-auth-server/src/config.rs`.
 
 The `issuer` falls back to `[site] domain` in the `site.toml` that the optional `site_toml` key names.
 When that file has no domain, the fallback is `localhost`.
@@ -163,11 +164,11 @@ A key that fails to load leaves the running pair serving, and core retries the r
 A successful rotation changes the signing key immediately.
 m6-http keeps the public key it loaded, so tokens signed with the new key get 401 until m6-http reloads.
 Touch m6-http's system config after the service config, and m6-http reads the new public key.
-From then on, access tokens signed with the old key get 401, and they expire naturally within `access_ttl`.
+From then on, m6-http refuses an access token signed with the old key at the next request with 401, and a browser sees the error response.
 
 A rotation also invalidates outstanding refresh tokens.
 The service verifies a refresh token's signature with the current key before it checks the SHA-256 hash in the database.
-A token signed with the old key fails at the next refresh, so a rotation ends every existing session at its next refresh.
+A refresh token signed with the old key fails at the next refresh, so the session cannot be renewed.
 
 ### 4.3. Key generation
 
@@ -217,12 +218,9 @@ A request with `application/json` takes the JSON path.
 A request with `application/x-www-form-urlencoded`, or any other content type, takes the form path.
 
 A form login sends `username`, `password` and an optional `next`.
-On success the service answers 302 with two cookies and `Location` set to `next`.
-On a wrong password it answers 302 to `/login?error=invalid&next=<encoded next>`.
-On a blocked address it answers 429 with `Retry-After: 60`.
 
 Table 4 gives the form responses.
-Take from it that a browser sees a redirect for every login outcome, so the login page stays in control.
+Take from it that the two credential outcomes are redirects, and a blocked address gets a 429 that the browser displays.
 
 | condition | status | body or headers |
 |---|---|---|
@@ -236,8 +234,8 @@ The two cookies carry `HttpOnly`, `Secure`, `SameSite=Lax` and a `Max-Age` from 
 
 The session cookie has `Path=/` and `Max-Age=<access_ttl>`.
 The refresh cookie has `Path=/auth/refresh` and `Max-Age=<refresh_ttl>`.
-The `next` value must be a same-origin path: it starts with `/` and does not start with `//` or `/\`.
-The service falls back to `/` when `next` is absent, off-site or malformed.
+The `next` value starts with `/`, and its second byte is neither `/` nor `\`, which is the whole check.
+A value that passes is used as the `Location` header, and the service falls back to `/` when `next` is absent or fails that check.
 
 A *JSON* (JavaScript Object Notation) login sends `{"username": "...", "password": "..."}`.
 On success it answers 200 with the tokens in the body and sets no cookies.
@@ -264,7 +262,7 @@ The access token carries the user's groups and roles as they are at login.
 A browser sends the `refresh` cookie, and a JSON client sends `{"refresh_token": "..."}`.
 
 A browser refresh answers 302.
-On success the `Location` is the `Referer` when that value is a same-origin path, and `/` otherwise.
+On success the `Location` is the `Referer` when that value passes the same two-byte check as `next`, and `/` otherwise.
 The response sets a new session cookie.
 A missing, invalid or expired refresh token answers 302 to `/login`.
 
@@ -288,8 +286,9 @@ Section 6 gives both token shapes.
 
 ### 5.3. Logout
 
-`POST /auth/logout` revokes refresh tokens.
-A browser sends the `refresh` cookie, and the service deletes that token's row, clears both cookies and answers 302 to `/`.
+`POST /auth/logout` clears the browser's cookies, and a bearer request revokes refresh tokens.
+A browser sends no `refresh` cookie to this path, because that cookie's `Path` is `/auth/refresh`.
+The service clears both cookies and answers 302 to `/`, and a browser logout therefore revokes no refresh row, so the refresh token stays valid until its `exp`.
 A JSON client sends `Authorization: Bearer <access token>`, and the service deletes every refresh token for that user and answers 204.
 
 The browser path does not require a valid session.
@@ -297,7 +296,8 @@ The JSON path decodes the access token to find the user.
 An invalid bearer token still gets 204, and the service revokes nothing.
 
 Access tokens stay valid until their `exp`.
-The service keeps no access-token revocation list, so logout stops the next refresh and leaves the current access token alive for its remaining lifetime.
+The service keeps no access-token revocation list.
+The bearer path stops the next refresh by deleting the refresh rows, and the browser path leaves them in place.
 
 ### 5.4. Public key
 
