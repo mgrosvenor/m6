@@ -2587,7 +2587,8 @@ fn backend_name_of(config_path: &std::path::Path) -> String {
 }
 
 /// Whether `site.toml` declares the compression `config` does, for the backend
-/// named `backend_name`. Checked at start and on every reload.
+/// named `backend_name`. Checked at start, on every reload and by
+/// `--dump-config`.
 ///
 /// "Compresses" means at least one MIME type has a non-zero level. The
 /// defaults give text types real levels and images zero, so a service that has
