@@ -226,7 +226,7 @@ fn test_bootstrap_group_member_ls_shows_admin() {
 fn test_full_bootstrap_sequence() {
     let env = TestEnv::new();
 
-    let out = env.run(&[
+    env.run_ok(&[
         "user",
         "add",
         "admin",
@@ -235,13 +235,10 @@ fn test_full_bootstrap_sequence() {
         "--password",
         "secret",
     ]);
-    assert_eq!(out.status.code(), Some(0));
 
-    let out = env.run(&["group", "add", "editors"]);
-    assert_eq!(out.status.code(), Some(0));
+    env.run_ok(&["group", "add", "editors"]);
 
-    let out = env.run(&["group", "member", "add", "editors", "admin"]);
-    assert_eq!(out.status.code(), Some(0));
+    env.run_ok(&["group", "member", "add", "editors", "admin"]);
 
     // user ls --json
     let out = env.run(&["user", "ls", "--json"]);
