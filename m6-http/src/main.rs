@@ -2388,9 +2388,9 @@ fn synth_refresh_request(r: &Refresh) -> forward::HttpRequest {
 /// populating itself, gets a compressed body with nothing saying the body
 /// depends on `Accept-Encoding`. That is the worse of the two orderings.
 ///
-/// The header belongs on all four server paths and on all eleven of
-/// `handle_request_inner`'s `Ready` returns, so it is applied once here rather
-/// than at each site, where a twelfth return would silently miss it.
+/// The header belongs on every server path and every `Ready` return from
+/// `handle_request_inner`, so it is applied once here rather than at each
+/// site, where a new return would silently miss it.
 ///
 /// Applying it *after* the inner call is deliberate. `handle_request_inner`
 /// inserts into the cache itself, so `should_cache` still inspects the exact
