@@ -437,7 +437,7 @@ This section gives the signals, the exit codes and the log lines, beginning with
 ### 11.1. Signals
 
 Table 8 gives the three signals.
-Take from it that the first two signals differ in how much work they finish, and both exit 0.
+Take from it that a first and a second shutdown signal differ in how much work they finish, and both exit 0.
 
 | signal | first receipt | later receipt |
 |---|---|---|
@@ -476,7 +476,6 @@ Take from it that every login attempt is recorded with the address and every fai
 | rate limit exceeded | warn | `ip` |
 | token refresh | info | `user_id` |
 | logout | info | `user_id` for the bearer path |
-| started, shutdown signal received, shutdown complete | info | service name, socket on start |
 
 **Table 10: the log events this service adds to the core lifecycle lines.**
 
