@@ -471,7 +471,7 @@ fn make_quiche_config(server_config: &config::ServerConfig) -> anyhow::Result<qu
     // ── HELD BACK, one line, pending a fix in the quiche fork ─────────────────
     //
     // Everything above and the two gates in `handle_h3_request` are finished and
-    // were verified with `m6-probe-h3 --0rtt /` on a loopback instance: the
+    // were verified with `m6-probe-h3 --0rtt /`: the
     // request went out before the handshake completed, a cached path answered
     // 200 in early data, and an uncached one answered 425.
     //

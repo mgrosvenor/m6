@@ -67,7 +67,7 @@ fn main() -> anyhow::Result<()> {
 /// How often the background poller refreshes the fleet view.
 ///
 /// Every request used to poll the whole fleet itself, which meant load on the
-/// production nodes scaled with how often anyone LOOKED at the monitor, two
+/// nodes scaled with how often anyone LOOKED at the monitor, two
 /// requests moments apart could disagree because they came from different polls,
 /// and a plain `/digest` fetch took 2.9 to 3.6 seconds. A monitoring endpoint
 /// should answer instantly from a recent reading.

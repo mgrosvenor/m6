@@ -638,7 +638,7 @@ run_h3() {
 # is what these probes do. The server was fine. The measurement did not exist.
 # m6 issue #101.
 #
-# `conformance.sh resume` proves the property on every push, so a regression
+# `conformance.sh resume` proves the property on every CI run, so a regression
 # fails the run.
 #
 # Resumption is a latency property, not a nicety: a full handshake costs the
