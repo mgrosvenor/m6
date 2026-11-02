@@ -41,9 +41,8 @@ use std::time::Duration;
 use m6_core::prelude::*;
 
 fn main() -> anyhow::Result<()> {
-    // `m6-monitor --check <config>` prints the hourly health check and exits,
-    // which is what `tools/health-check.py` used to do over ssh. Same code
-    // path as the page, so the two cannot disagree.
+    // `m6-monitor --check <config>` prints the hourly health check and exits.
+    // Same code path as the page, so the two cannot disagree.
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--check") {
         let config = args

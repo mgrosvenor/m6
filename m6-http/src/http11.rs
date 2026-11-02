@@ -8,7 +8,8 @@
 //!
 //!   ```text
 //!   "h2"       → Http2Conn  (multiplexed streams, full H2 framing)
-//!   "http/1.1" → H1 state machine (Handshake→Reading→Writing, Connection: close)
+//!   "http/1.1" → H1 state machine (Reading→Writing, kept alive while
+//!                wants_keep_alive(&req) && served + 1 < MAX_REQUESTS_PER_CONN)
 //!   ```
 //!
 //! - `drive_all()` is called after every epoll wakeup (for any TOKEN_TCP event)
@@ -52,7 +53,7 @@ enum ConnKind {
     /// variant, so inline it sized every stored `Conn` to match, H1 and
     /// mid-handshake ones included. The cost is one allocation per HTTP/2
     /// connection, paid once at ALPN selection rather than per request, and a
-    /// connection here is long-lived. On a 950MB single-core origin holding a
+    /// connection here is long-lived. On a small single-core origin holding a
     /// map of these, the 256 bytes saved on every other entry is the better
     /// side of that trade.
     Http2(Box<Http2Conn>),
@@ -73,15 +74,14 @@ pub struct HandshakeSample {
     /// skips the certificate and the signature, so mixing them gives a figure that
     /// tracks the returning-visitor mix rather than the cost of either.
     ///
-    /// This used to say resumption "happens in production without anything being
-    /// configured for it", on the strength of rustls' default 256-session store.
-    /// That was the assumption that let the defect sit: 256 entries is nothing on
-    /// a node taking hundreds of handshakes an hour, so the store evicted every
-    /// browser before it came back and this field read 0% on the http/2 channel
-    /// across the whole fleet while reading 90% on http/1.1, where the only
-    /// clients were a monitor polling on repeat. `make_tls_server_config` now
-    /// installs a ticketer, which is what makes resumption stateless and this
-    /// number mean something.
+    /// This used to say resumption "happens without anything being configured
+    /// for it", on the strength of rustls' default 256-session store. That was
+    /// the assumption that let the defect sit: 256 entries is nothing on a node
+    /// taking hundreds of handshakes an hour, so the store evicted every browser
+    /// before it came back. Browser traffic then read 0% resumed, while a
+    /// monitor polling on repeat read high on its own channel.
+    /// `make_tls_server_config` now installs a ticketer, which is what makes
+    /// resumption stateless and this number mean something.
     pub resumed: bool,
 }
 
@@ -747,22 +747,21 @@ where
     // lines above the point where the handshake was recorded. A completed,
     // perfectly normal handshake was thrown away.
     //
-    // Measured on staging, 200 sequential handshakes per protocol from
-    // m6-probe-h1/h2/h3 against a client figure of 0.34ms:
+    // A 200-connection probe per protocol, run with m6-probe-h1/h2/h3, shows
+    // the bias:
     //
     //   h1   0 of 200 recorded.       Nothing happens after an h1 handshake, so
     //                                 the close won the race every single time.
-    //   h2  70 of 200, p50 6.14ms.    18x the truth, and WHY is the point: the
-    //                                 only survivors were connections the server
+    //   h2  only a subset recorded.   The survivors were connections the server
     //                                 reached before the close, meaning ones that
     //                                 had already waited an extra event-loop turn.
     //                                 The population was selected for slowness.
-    //   h3 200 of 200, p50 1.00ms.    Correct, because the QUIC path in main.rs
+    //   h3  all 200 recorded.         Correct, because the QUIC path in main.rs
     //                                 stamps at `is_established()` inside the
     //                                 packet handler where nothing can overtake it.
     //
-    // A partial sample set that is also biased is worse than none: h2's 6.14ms
-    // looked plausible and was reported as the node's handshake cost.
+    // A partial sample set that is also biased is worse than none: the h2
+    // median looked plausible and was reported as the node's handshake cost.
     //
     // `handshake_ns.is_none()` guards against re-stamping, since this runs on
     // every wakeup for the connection.
@@ -1297,13 +1296,13 @@ fn build_response(
     // Any upstream copy of a header this function emits itself is dropped
     // here, or the response goes out carrying both.
     //
-    // Found by reading a live HEAD off a raw socket after deploying the HEAD
-    // work: an asset answered with `Content-Length: 16580` from the backend
-    // AND `content-length: 0` from the line below. Two Content-Length fields
-    // with different values is precisely the framing ambiguity this proxy now
-    // refuses to accept *from* a backend (F028) -- it was emitting it. On HTML
-    // the two agreed, so it looked like nothing more than a cosmetic duplicate;
-    // only the asset showed the conflict.
+    // A raw-socket check of a HEAD response caught this: an asset answered
+    // with `Content-Length: 16580` from the backend AND `content-length: 0`
+    // from the line below. Two Content-Length fields with different values is
+    // precisely the framing ambiguity this proxy now refuses to accept *from*
+    // a backend (F028). It was emitting it. On HTML the two agreed, so it
+    // looked like nothing more than a cosmetic duplicate. Only the asset
+    // showed the conflict.
     for (k, v) in headers {
         if k.eq_ignore_ascii_case("content-length") || k.eq_ignore_ascii_case("connection") {
             continue;
@@ -1460,23 +1459,15 @@ pub fn load_tls_material(cert_path: &str, key_path: &str) -> anyhow::Result<TlsM
     //
     // With no ticketer, resumption is STATEFUL: rustls stores the session
     // server-side and hands the client a handle. Every returning client needs
-    // its own entry still to be in a 256-entry cache. origin took 648 handshakes
-    // in one hour, so entries are evicted long before anyone comes back, and
-    // the cache does nothing but cost memory.
+    // its own entry still to be in a 256-entry cache. A busy node takes hundreds
+    // of handshakes an hour, so entries are evicted long before anyone comes
+    // back, and the cache does nothing but cost memory.
     //
-    // What the fleet's own monitor measured, which is the evidence for this:
-    //
-    //     channel               handshakes   resumed
-    //     http/1.1/external     451          90%       origin
-    //     http/2/external       197           0%       origin
-    //     http/2/external       157           0%       edge-a
-    //     http/2/external       165           0%       edge-b
-    //
-    // Those two numbers look contradictory and are not. http/1.1 there is a
-    // handful of distinct clients polling repeatedly -- the build host's monitor
-    // -- so their few entries stay resident and resume. http/2 is browsers: many
-    // distinct clients, 256 slots, evicted long before any of them returns. The
-    // channel that resumes is the one that does not need to.
+    // The two traffic patterns then disagree, and correctly. A monitoring client
+    // that polls on repeat keeps its few entries resident and resumes. Browsers
+    // are many distinct clients against 256 slots, so they are evicted before
+    // any of them returns. The channel that resumes is the one that does not
+    // need to.
     //
     // NOT established by `openssl s_client -sess_out/-sess_in`, which was tried
     // first and reported a full handshake every time. That evidence was
@@ -1511,7 +1502,7 @@ pub fn load_tls_material(cert_path: &str, key_path: &str) -> anyhow::Result<TlsM
     // `ServerSessionMemoryCache::new(n)` is `HashMap::with_capacity(n)` plus
     // `VecDeque::with_capacity(n)` (rustls limited_cache.rs:63), so it allocates
     // up front. 4096 entries is roughly 350KB per config bought for a path that
-    // does not carry anyone who matters, on an origin with 950MB.
+    // does not carry anyone who matters, on a small origin.
 
     Ok(TlsMaterial {
         config: Arc::new(config),
@@ -1726,11 +1717,10 @@ mod response_header_tests {
             .collect()
     }
 
-    /// Found on the live site, not in review: an asset HEAD went out with
-    /// `Content-Length: 16580` from the backend and `content-length: 0` from
-    /// the serialiser. Two Content-Length fields with different values is the
-    /// same framing ambiguity this proxy refuses to accept from a backend
-    /// (F028) -- it was producing it.
+    /// An asset HEAD went out with `Content-Length: 16580` from the backend and
+    /// `content-length: 0` from the serialiser. Two Content-Length fields with
+    /// different values is the same framing ambiguity this proxy refuses to
+    /// accept from a backend (F028). It was producing it.
     #[test]
     fn exactly_one_content_length_even_when_upstream_sent_one() {
         let upstream = vec![
