@@ -92,6 +92,22 @@ impl TestEnv {
         }
         cmd.output().expect("run binary")
     }
+
+    /// Run a setup command and assert that it exited 0.
+    ///
+    /// A setup command that fails silently makes the test fail far from the
+    /// cause, so the message carries the command and its stderr.
+    fn run_ok(&self, args: &[&str]) -> Output {
+        let out = self.run(args);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{:?} failed, stderr: {}",
+            args,
+            stderr(&out)
+        );
+        out
+    }
 }
 
 fn stdout(o: &Output) -> String {
@@ -123,7 +139,7 @@ fn test_bootstrap_user_add() {
 fn test_bootstrap_group_add() {
     let env = TestEnv::new();
     // Need a user first for group member add
-    env.run(&[
+    env.run_ok(&[
         "user",
         "add",
         "admin",
@@ -139,7 +155,7 @@ fn test_bootstrap_group_add() {
 #[test]
 fn test_bootstrap_group_member_add() {
     let env = TestEnv::new();
-    env.run(&[
+    env.run_ok(&[
         "user",
         "add",
         "admin",
@@ -148,7 +164,7 @@ fn test_bootstrap_group_member_add() {
         "--password",
         "secret",
     ]);
-    env.run(&["group", "add", "editors"]);
+    env.run_ok(&["group", "add", "editors"]);
     let out = env.run(&["group", "member", "add", "editors", "admin"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
 }
@@ -156,7 +172,7 @@ fn test_bootstrap_group_member_add() {
 #[test]
 fn test_bootstrap_user_ls_json_contains_admin() {
     let env = TestEnv::new();
-    env.run(&[
+    env.run_ok(&[
         "user",
         "add",
         "admin",
@@ -165,8 +181,8 @@ fn test_bootstrap_user_ls_json_contains_admin() {
         "--password",
         "secret",
     ]);
-    env.run(&["group", "add", "editors"]);
-    env.run(&["group", "member", "add", "editors", "admin"]);
+    env.run_ok(&["group", "add", "editors"]);
+    env.run_ok(&["group", "member", "add", "editors", "admin"]);
 
     let out = env.run(&["user", "ls", "--json"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
@@ -186,7 +202,7 @@ fn test_bootstrap_user_ls_json_contains_admin() {
 #[test]
 fn test_bootstrap_group_member_ls_shows_admin() {
     let env = TestEnv::new();
-    env.run(&[
+    env.run_ok(&[
         "user",
         "add",
         "admin",
@@ -195,8 +211,8 @@ fn test_bootstrap_group_member_ls_shows_admin() {
         "--password",
         "secret",
     ]);
-    env.run(&["group", "add", "editors"]);
-    env.run(&["group", "member", "add", "editors", "admin"]);
+    env.run_ok(&["group", "add", "editors"]);
+    env.run_ok(&["group", "member", "add", "editors", "admin"]);
 
     let out = env.run(&["group", "member", "ls", "editors"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
@@ -247,7 +263,7 @@ fn test_full_bootstrap_sequence() {
 #[test]
 fn test_user_add_duplicate_exits_1() {
     let env = TestEnv::new();
-    env.run(&["user", "add", "alice", "--password", "pass1"]);
+    env.run_ok(&["user", "add", "alice", "--password", "pass1"]);
     let out = env.run(&["user", "add", "alice", "--password", "pass2"]);
     assert_eq!(out.status.code(), Some(1), "stdout: {}", stdout(&out));
     let err = stderr(&out);
@@ -306,8 +322,8 @@ fn test_no_arguments_exits_2() {
 #[test]
 fn test_user_ls_json_is_valid_array() {
     let env = TestEnv::new();
-    env.run(&["user", "add", "alice", "--password", "pw"]);
-    env.run(&["user", "add", "bob", "--password", "pw"]);
+    env.run_ok(&["user", "add", "alice", "--password", "pw"]);
+    env.run_ok(&["user", "add", "bob", "--password", "pw"]);
 
     let out = env.run(&["user", "ls", "--json"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
@@ -321,8 +337,8 @@ fn test_user_ls_json_is_valid_array() {
 #[test]
 fn test_group_ls_json_is_valid_array() {
     let env = TestEnv::new();
-    env.run(&["group", "add", "alpha"]);
-    env.run(&["group", "add", "beta"]);
+    env.run_ok(&["group", "add", "alpha"]);
+    env.run_ok(&["group", "add", "beta"]);
 
     let out = env.run(&["group", "ls", "--json"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
@@ -338,7 +354,7 @@ fn test_group_ls_json_is_valid_array() {
 #[test]
 fn test_user_ls_table_format() {
     let env = TestEnv::new();
-    env.run(&[
+    env.run_ok(&[
         "user",
         "add",
         "alice",
@@ -360,7 +376,7 @@ fn test_user_ls_table_format() {
 #[test]
 fn test_group_ls_table_format() {
     let env = TestEnv::new();
-    env.run(&["group", "add", "mygroup"]);
+    env.run_ok(&["group", "add", "mygroup"]);
 
     let out = env.run(&["group", "ls"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
@@ -374,7 +390,7 @@ fn test_group_ls_table_format() {
 #[test]
 fn test_user_passwd() {
     let env = TestEnv::new();
-    env.run(&["user", "add", "alice", "--password", "old"]);
+    env.run_ok(&["user", "add", "alice", "--password", "old"]);
     let out = env.run(&["user", "passwd", "alice", "--password", "newpass"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
 }
@@ -384,7 +400,7 @@ fn test_user_passwd() {
 #[test]
 fn test_user_roles_set_unset() {
     let env = TestEnv::new();
-    env.run(&["user", "add", "alice", "--role", "user", "--password", "pw"]);
+    env.run_ok(&["user", "add", "alice", "--role", "user", "--password", "pw"]);
 
     // Add admin role
     let out = env.run(&["user", "roles", "alice", "--set", "admin"]);
@@ -427,7 +443,7 @@ fn test_user_roles_set_unset() {
 #[test]
 fn test_group_del() {
     let env = TestEnv::new();
-    env.run(&["group", "add", "tmp"]);
+    env.run_ok(&["group", "add", "tmp"]);
     let out = env.run(&["group", "del", "tmp"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
 
@@ -441,7 +457,7 @@ fn test_group_del() {
 #[test]
 fn test_user_del() {
     let env = TestEnv::new();
-    env.run(&["user", "add", "tmp", "--password", "pw"]);
+    env.run_ok(&["user", "add", "tmp", "--password", "pw"]);
     let out = env.run(&["user", "del", "tmp"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
 
@@ -456,7 +472,7 @@ fn test_user_del() {
 fn test_token_create_prints_jwt() {
     let env = TestEnv::new();
     env.setup_keys();
-    env.run(&["user", "add", "alice", "--password", "pw"]);
+    env.run_ok(&["user", "add", "alice", "--password", "pw"]);
 
     let out = env.run(&["token", "create", "alice", "--name", "ci"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
@@ -482,7 +498,7 @@ fn test_token_create_unknown_user_exits_1() {
 fn test_token_create_missing_keys_exits_1() {
     let env = TestEnv::new();
     // No setup_keys() call — keys dir doesn't exist
-    env.run(&["user", "add", "alice", "--password", "pw"]);
+    env.run_ok(&["user", "add", "alice", "--password", "pw"]);
 
     let out = env.run(&["token", "create", "alice"]);
     assert_eq!(out.status.code(), Some(1), "stdout: {}", stdout(&out));
@@ -498,8 +514,8 @@ fn test_token_create_missing_keys_exits_1() {
 fn test_token_ls_shows_created_token() {
     let env = TestEnv::new();
     env.setup_keys();
-    env.run(&["user", "add", "alice", "--password", "pw"]);
-    env.run(&["token", "create", "alice", "--name", "mytoken"]);
+    env.run_ok(&["user", "add", "alice", "--password", "pw"]);
+    env.run_ok(&["token", "create", "alice", "--name", "mytoken"]);
 
     let out = env.run(&["token", "ls", "alice"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
@@ -511,9 +527,9 @@ fn test_token_ls_shows_created_token() {
 fn test_token_ls_json_is_valid_array() {
     let env = TestEnv::new();
     env.setup_keys();
-    env.run(&["user", "add", "alice", "--password", "pw"]);
-    env.run(&["token", "create", "alice", "--name", "t1"]);
-    env.run(&["token", "create", "alice", "--name", "t2"]);
+    env.run_ok(&["user", "add", "alice", "--password", "pw"]);
+    env.run_ok(&["token", "create", "alice", "--name", "t1"]);
+    env.run_ok(&["token", "create", "alice", "--name", "t2"]);
 
     let out = env.run(&["token", "ls", "alice", "--json"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
@@ -530,8 +546,8 @@ fn test_token_ls_json_is_valid_array() {
 fn test_token_revoke_removes_token() {
     let env = TestEnv::new();
     env.setup_keys();
-    env.run(&["user", "add", "alice", "--password", "pw"]);
-    env.run(&["token", "create", "alice", "--name", "todel"]);
+    env.run_ok(&["user", "add", "alice", "--password", "pw"]);
+    env.run_ok(&["token", "create", "alice", "--name", "todel"]);
 
     // Get the token ID from JSON listing
     let out = env.run(&["token", "ls", "alice", "--json"]);
@@ -568,9 +584,9 @@ fn test_token_revoke_unknown_exits_1() {
 #[test]
 fn test_group_member_del() {
     let env = TestEnv::new();
-    env.run(&["user", "add", "alice", "--password", "pw"]);
-    env.run(&["group", "add", "team"]);
-    env.run(&["group", "member", "add", "team", "alice"]);
+    env.run_ok(&["user", "add", "alice", "--password", "pw"]);
+    env.run_ok(&["group", "add", "team"]);
+    env.run_ok(&["group", "member", "add", "team", "alice"]);
 
     let out = env.run(&["group", "member", "del", "team", "alice"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
