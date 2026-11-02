@@ -61,6 +61,8 @@ When the thread's signal mask cannot be read, a service now refuses to start ins
 
 ### Docs
 
+**`docs/m6-core-reference.md` sections 1 to 5 follow the documentation ruleset, and the module and line counts, the `RouteConfig` fields and the watcher description now match the code (#144).**
+
 **`docs/m6-auth-lib.md` follows the documentation ruleset, and its storage description now matches the code (#139).**
 
 ### Verified
