@@ -1526,9 +1526,8 @@ mod tests {
         }
     }
 
-    /// A PTR name that does not resolve back to the address is a false claim
-    /// for a PTR-documented operator, and is never a pass. Ranges operators
-    /// stay uncheckable.
+    /// A cloud customer's reverse name resolves forward, so it must never
+    /// verify a crawler whose operator publishes its own names.
     #[test]
     fn a_cloud_customer_name_does_not_verify_googlebot() {
         use crate::resolve::Ptr;
@@ -1546,6 +1545,9 @@ mod tests {
         ));
     }
 
+    /// A PTR name that does not resolve back to the address is a false claim
+    /// for a PTR-documented operator, and is never a pass. Ranges operators
+    /// stay uncheckable.
     #[test]
     fn an_unconfirmed_ptr_is_a_forward_mismatch_not_a_pass() {
         use crate::resolve::Ptr;
