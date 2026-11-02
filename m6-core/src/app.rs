@@ -2711,9 +2711,6 @@ fn run_app_with_shutdown(
         }
     };
 
-    // The reload closure reuses this name for its own compress check.
-    let backend_name = backend_name_of(&config_path);
-
     // Init logging: site.toml base → renderer config [log] → CLI --log-level.
     let (format, level) = resolve_log(&site_toml, &config.log, cli_log_level.as_deref());
     let log_handle = crate::log::init(&format, &level).unwrap_or_else(|e| {
@@ -2870,8 +2867,7 @@ fn run_app_with_shutdown(
         }
         let new_config = crate::config::load(&config_path, &site_dir)
             .map_err(|e| format!("Reload failed (config parse error): {e}"))?;
-        check_site_toml(&new_config, &site_dir)
-            .and_then(|_| check_compress_declared(&new_config, &site_toml, &backend_name))
+        validate_startup(&new_config, &site_dir, &config_path)
             .map_err(|msg| format!("Reload refused: {msg}"))?;
         // A `site.toml` that does not parse keeps the current state whether or
         // not `site_toml` names it. At start the default path is tolerant.

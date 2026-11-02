@@ -49,6 +49,8 @@ fn main() {
     println!("the_hook_sees_the_new_config_and_an_error_is_survived ... ok");
     a_failed_hook_leaves_the_previous_state_and_is_retried();
     println!("a_failed_hook_leaves_the_previous_state_and_is_retried ... ok");
+    reload_refuses_a_site_toml_that_disagrees_about_compression();
+    println!("reload_refuses_a_site_toml_that_disagrees_about_compression ... ok");
 }
 
 /// The service: a global state that records the `marker` key of the config it
@@ -219,6 +221,47 @@ fn a_failed_hook_leaves_the_previous_state_and_is_retried() {
     assert!(
         !read_log().contains("request complete"),
         "the level of a failed reload was applied\n{}",
+        read_log()
+    );
+    child.kill().ok();
+    child.wait().ok();
+}
+
+/// A reload refuses a `site.toml` whose `[[backend]] compresses` disagrees
+/// with the service, as start does, and keeps the old state serving. The
+/// service has the default compression, so `compresses = false` is the
+/// disagreement. The backend name is the config file's stem, `hook`.
+fn reload_refuses_a_site_toml_that_disagrees_about_compression() {
+    let (dir, mut child, conf, marker, log) = start(&conf_text("one"));
+    let read_log = || std::fs::read_to_string(&log).unwrap_or_default();
+
+    std::fs::write(
+        dir.path().join("site.toml"),
+        "[[backend]]\nname = \"hook\"\ncompresses = false\n",
+    )
+    .unwrap();
+    assert!(
+        until(Duration::from_secs(10), || read_log()
+            .contains("Reload refused")
+            && read_log().contains("DOES compress")),
+        "a site.toml that fails the compresses check was not refused\n{}",
+        read_log()
+    );
+    assert!(child.try_wait().unwrap().is_none(), "the service exited");
+    assert!(!marker.exists(), "the hook ran for a refused reload");
+
+    // Declaring what the service does is accepted, and the hook runs.
+    std::fs::write(
+        dir.path().join("site.toml"),
+        "[[backend]]\nname = \"hook\"\ncompresses = true\n",
+    )
+    .unwrap();
+    std::fs::write(&conf, conf_text("two")).unwrap();
+    assert!(
+        until(Duration::from_secs(10), || {
+            std::fs::read_to_string(&marker).is_ok_and(|s| s == "two")
+        }),
+        "a corrected site.toml did not reload\n{}",
         read_log()
     );
     child.kill().ok();
