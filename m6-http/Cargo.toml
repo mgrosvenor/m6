@@ -103,7 +103,11 @@ httparse       = "1"
 hpack          = "0.3"
 ahash          = "0.8"
 libc           = "0.2"
-rustls         = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# tls12 and logging reached release builds only through tokio-rustls's default
+# features while the cold-start benchmark was a [[bin]]. Declare them here so
+# the listener keeps the protocol versions and log records it had when
+# tokio-rustls is a dev-dependency. The one crypto provider is ring.
+rustls         = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 # rustls-pki-types rather than rustls-pemfile: that crate is unmaintained
 # (RUSTSEC-2025-0134) and its advisory points at this one, which carries the same
 # PEM code behind the `PemObject` trait. rustls already depends on it, so this is
