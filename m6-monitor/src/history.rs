@@ -2004,6 +2004,9 @@ mod tests {
             requests: 12,
             client_ips: vec!["192.0.2.1".into(), "192.0.2.2".into()],
             paths: vec!["/".into(), "/a".into()],
+            first_seen: "2026-10-01T09:00:00Z".into(),
+            last_seen: "2026-10-01T09:05:00Z".into(),
+            claimed_domain: String::new(),
         }
     }
 

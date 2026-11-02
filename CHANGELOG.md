@@ -13,6 +13,45 @@ Work happens on `develop`.
 
 ---
 
+## Unreleased
+
+**Each crawler sighting on `/traffic` and in the monitor report now carries the time it was first and last seen, and the monitor checks each address behind a sighting against the method the crawler's operator documents. A reverse DNS name counts only when resolving it forward returns the address (#205).**
+
+The new JSON fields are additive.
+`CrawlerReport` gains `first_seen`, `last_seen` (RFC 3339 UTC) and `claimed_domain`, all `serde(default)`, so a node older than these fields still parses and an aggregator newer than a node reads an empty string as "not reported".
+No existing field changes, so no migration is needed.
+
+### Added
+
+**Crawler sightings carry a time and a verdict (#205).**
+The monitor report's crawler section prints `seen: <first> .. <last>` for each sighting, and one line per address (at most three) with one of these outcomes:
+
+| outcome | meaning |
+|---|---|
+| VERIFIED | the address has a PTR name under a domain the operator documents, and that name resolves back to the address |
+| MISMATCH | the PTR name is under no domain the operator documents, or it does not resolve back to the address |
+| UNVERIFIED | no PTR record, the lookup failed or timed out, or the operator publishes address ranges instead of PTR records |
+| no published method | the user agent is in no table, so there is nothing to judge it against |
+
+Table 1: the outcomes of a crawler address check.
+Only MISMATCH calls a claim false. A timeout or a missing record reads UNVERIFIED and never MISMATCH.
+
+**`m6_core::resolve` confirms a PTR name forward and bounds its threads.**
+`reverse_confirmed(addr, timeout)` resolves the PTR name with `getnameinfo`, then resolves that name with `getaddrinfo`, and returns `Ptr::Name` only when the address is among the results.
+A completed forward lookup without the address returns the new `Ptr::Unconfirmed(name)`, and a forward lookup that fails or times out returns `Ptr::Failed`.
+One deadline covers both lookups.
+At most `MAX_LOOKUP_THREADS` (8) lookup threads are alive at once, counting threads abandoned at their deadline.
+A lookup that finds no free slot returns `Ptr::Failed` at once without starting a thread.
+Lookups run in the monitor only, never on the serving path, and add no dependency.
+`telemetry::CrawlerVerdict` gains `ForwardMismatch`, so a `match` over it needs a new arm.
+
+### Verified
+
+- Unit tests with stub resolvers cover a confirmed name, a PTR whose forward lookup returns other addresses, a name with no forward answer, a failed forward lookup, no PTR, a resolver that never answers, and the thread bound (eight blocked lookups, then fifty more that return at once and start no thread, then slots free again).
+- No test uses a live public name.
+
+---
+
 ## 1.15.0 — 2026-10-29
 
 **m6-http reloads its system config, and TLS on HTTP/1.1, HTTP/2 and HTTP/3, when the process config is touched, and keeps its cache while it does. Certificate files are no longer watched, so a renewal must touch the process config after it writes them. m6-auth-server re-reads its keys on reload and refuses a private key that is not the pair of the public key. A `site.toml` change clears the cache again once the backends' settle window has passed and once more after the poll interval, which fixes the stale cached page that 1.14.0 introduced in #244 (#254).**

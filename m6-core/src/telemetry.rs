@@ -515,6 +515,13 @@ pub enum CrawlerVerdict {
     /// No entry in the table. The lookup result is reported without a verdict,
     /// because there is no published expectation to judge it against.
     Unrecognised { resolved: Option<String> },
+    /// The address has a PTR name, and resolving that name forward completed
+    /// without returning the address. The reverse zone is not the operator's,
+    /// so the claim is false whoever the agent says it is.
+    ForwardMismatch {
+        name: Option<&'static str>,
+        resolved: String,
+    },
     /// The address has no PTR record.
     NoPtr { name: Option<&'static str> },
     /// The lookup did not complete. Says nothing about the address.
@@ -555,12 +562,22 @@ pub fn verify_crawler(user_agent: &str, ptr: &crate::resolve::Ptr) -> CrawlerVer
                         }
                     }
                 }
+                // A failed forward lookup arrives as `Failed`, so this is a
+                // completed one that did not return the address.
+                Ptr::Unconfirmed(resolved) => CrawlerVerdict::ForwardMismatch {
+                    name,
+                    resolved: resolved.clone(),
+                },
                 Ptr::None => CrawlerVerdict::NoPtr { name },
                 Ptr::Failed => CrawlerVerdict::LookupFailed { name },
             },
         },
         (None, Ptr::Name(resolved)) => CrawlerVerdict::Unrecognised {
             resolved: Some(resolved.clone()),
+        },
+        (None, Ptr::Unconfirmed(resolved)) => CrawlerVerdict::ForwardMismatch {
+            name: None,
+            resolved: resolved.clone(),
         },
         (None, Ptr::None) => CrawlerVerdict::NoPtr { name: None },
         (None, Ptr::Failed) => CrawlerVerdict::LookupFailed { name: None },
@@ -1522,6 +1539,34 @@ mod tests {
                 "{ptr:?} must be uncheckable rather than judged"
             );
         }
+    }
+
+    /// A PTR name that does not resolve back to the address is a false claim
+    /// for a PTR-documented operator, and is never a pass. Ranges operators
+    /// stay uncheckable.
+    #[test]
+    fn an_unconfirmed_ptr_is_a_forward_mismatch_not_a_pass() {
+        use crate::resolve::Ptr;
+        let ptr = Ptr::Unconfirmed("crawl-66-249-66-1.googlebot.com".into());
+        let g = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
+        assert!(matches!(
+            verify_crawler(g, &ptr),
+            CrawlerVerdict::ForwardMismatch {
+                name: Some("Googlebot"),
+                ..
+            }
+        ));
+        assert!(matches!(
+            verify_crawler("Mozilla/5.0 (NeverHeardOfItBot/1.0)", &ptr),
+            CrawlerVerdict::ForwardMismatch { name: None, .. }
+        ));
+        assert!(matches!(
+            verify_crawler(
+                "Mozilla/5.0 (compatible; ClaudeBot/1.0; +claudebot@anthropic.com)",
+                &ptr
+            ),
+            CrawlerVerdict::NotCheckableByPtr { .. }
+        ));
     }
 
     /// A sighting carries the window of the requests it counted, and a forger

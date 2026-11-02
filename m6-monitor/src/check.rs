@@ -814,14 +814,14 @@ fn verdict_lines(
     c: &m6_core::monitoring::CrawlerReport,
     cache: &mut std::collections::HashMap<String, m6_core::resolve::Ptr>,
 ) -> Vec<String> {
-    use m6_core::resolve::reverse_default;
+    use m6_core::resolve::reverse_confirmed_default;
     use m6_core::telemetry::{verify_crawler, CrawlerVerdict};
 
     let mut out = Vec::new();
     for ip in c.client_ips.iter().take(3) {
         let ptr = cache
             .entry(ip.clone())
-            .or_insert_with(|| reverse_default(ip))
+            .or_insert_with(|| reverse_confirmed_default(ip))
             .clone();
         let line = match verify_crawler(&c.user_agent, &ptr) {
             CrawlerVerdict::Verified { name, resolved } => {
@@ -848,6 +848,14 @@ fn verdict_lines(
             CrawlerVerdict::Unrecognised { resolved } => match resolved {
                 Some(r) => format!("{ip} -> {r}  no published method for this agent"),
                 None => format!("{ip} -> no PTR record  no published method for this agent"),
+            },
+            CrawlerVerdict::ForwardMismatch { name, resolved } => match name {
+                Some(n) => format!(
+                    "{ip} -> {resolved}  MISMATCH: claims {n}, but {resolved} does not resolve back to {ip}"
+                ),
+                None => format!(
+                    "{ip} -> {resolved}  MISMATCH: {resolved} does not resolve back to {ip}"
+                ),
             },
             CrawlerVerdict::NoPtr { name } => match name {
                 Some(n) => format!("{ip} -> no PTR record  UNVERIFIED, claims {n}"),
@@ -1230,6 +1238,31 @@ mod tests {
         );
     }
 
+    /// A forged PTR (the name is right, the forward lookup does not return the
+    /// address) is called a mismatch and says why.
+    #[test]
+    fn a_ptr_that_does_not_resolve_back_is_called_a_mismatch() {
+        use m6_core::resolve::Ptr;
+        let mut cache = std::collections::HashMap::new();
+        cache.insert(
+            "192.0.2.9".to_string(),
+            Ptr::Unconfirmed("crawl-66-249-66-1.googlebot.com".into()),
+        );
+        let out = verdict_lines(
+            &crawler(
+                "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+                &["192.0.2.9"],
+            ),
+            &mut cache,
+        );
+        assert!(out[0].contains("MISMATCH"), "{out:?}");
+        assert!(
+            out[0].contains("does not resolve back to 192.0.2.9"),
+            "{out:?}"
+        );
+        assert!(!out[0].contains("VERIFIED"), "{out:?}");
+    }
+
     /// An agent in no table gets its lookup reported and no verdict, because
     /// there is no published expectation to judge it against. Inventing one is
     /// what produced the regression above.
@@ -1303,6 +1336,7 @@ mod tests {
         let mut t = traffic(LoggingHealth {
             events_total: 1,
             seconds_since_last: Some(1),
+            reopen: None,
         });
         t.crawlers = vec![crawler(
             "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
