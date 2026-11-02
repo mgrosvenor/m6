@@ -54,6 +54,11 @@ An address past the cap, or not yet reached, reads `not looked up yet  UNVERIFIE
 Googlebot verifies only under `googlebot.com` and `google.com`. A name under `googleusercontent.com` does not verify it, because every cloud customer's virtual machine gets a reverse name there that also resolves forward.
 `telemetry::CrawlerVerdict` gains `ForwardMismatch`, so a `match` over it needs a new arm.
 
+### Docs
+
+**`docs/m6-backend-protocol.md` no longer states two MUSTs that the reference `App` does not meet (#200).**
+The proxy's user must be able to connect to the backend socket, with `0666` the method when the backend runs as its own user. A backend may keep a connection open and must handle the proxy closing it after each response. `docs/m6-backend-examples.md` and `docs/m6-app-anatomy.md` now say the same.
+
 ### Verified
 
 - Unit tests with stub resolvers cover a confirmed name, a PTR whose forward lookup returns other addresses, a name with no forward answer, a failed forward lookup, no PTR, a name with no address (EAI_NONAME and EAI_NODATA), a slot free by the time the caller has the result, the per-poll lookup cap, expiry and cache bound, a report that reads stored results and resolves nothing, a resolver that never answers, and the thread bound (eight blocked lookups, then fifty more that return at once and start no thread, then slots free again).
