@@ -129,15 +129,9 @@ m6-auth does not cache user or group data in memory — it queries SQLite on eve
 
 ## Bootstrap workflow
 
-Before starting m6-auth for the first time:
+Before starting m6-auth for the first time, generate the signing keys as [`m6-auth.md` section 4.3](m6-auth.md#43-key-generation) describes, then:
 
 ```bash
-# Generate signing keys
-mkdir -p keys
-openssl ecparam -name prime256v1 -genkey -noout -out keys/auth.pem
-openssl ec -in keys/auth.pem -pubout -out keys/auth.pub
-chmod 600 keys/auth.pem
-
 # Create admin user — database created automatically if absent
 m6-auth-cli configs/m6-auth.conf user add admin --role admin
 

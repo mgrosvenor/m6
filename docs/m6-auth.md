@@ -117,6 +117,9 @@ The `issuer` falls back to `[site] domain` in the `site.toml` that the optional 
 When that file has no domain, the fallback is `localhost`.
 The `site_toml` key is core's, and it defaults to `<site-dir>/site.toml`.
 
+The service reads the database path, the token lifetimes, the issuer and the rate limit once at startup.
+A change to any of them after startup is logged with the text "restart m6-auth-server to apply it", and the running value stays.
+
 A complete config:
 
 ```toml
@@ -166,9 +169,6 @@ A rotation also invalidates outstanding refresh tokens.
 The service verifies a refresh token's signature with the current key before it checks the SHA-256 hash in the database.
 A token signed with the old key fails at the next refresh, so a rotation ends every existing session at its next refresh.
 
-The service reads the database path, the token lifetimes, the issuer and the rate limit once at startup.
-A change to any of them after startup is logged with the text "restart m6-auth-server to apply it", and the running value stays.
-
 ### 4.3. Key generation
 
 An *EC* (elliptic curve) P-256 key produces ES256 tokens, and an *RSA* (Rivest-Shamir-Adleman) key produces RS256 tokens.
@@ -180,6 +180,8 @@ Convert the SEC1 key to PKCS#8 before use, and keep the embedded public key that
 Choose one of the two blocks.
 
 ```sh
+umask 077   # every file below is created readable by the current user only
+
 # EC (ES256), recommended: smaller tokens and faster verification
 openssl ecparam -name prime256v1 -genkey -noout -out auth-sec1.pem
 openssl pkcs8 -topk8 -nocrypt -in auth-sec1.pem -out auth.pem
@@ -190,9 +192,11 @@ rm auth-sec1.pem
 openssl genrsa -out auth.pem 2048
 openssl rsa -in auth.pem -pubout -out auth.pub
 
-chmod 600 auth.pem
+chmod 644 auth.pub   # optional: m6-http may run as another user
 ```
 
+The private key file must be readable by the user the service runs as and by no one else.
+The umask at creation gives that without a window in which the key is world-readable.
 The same recipe is in `m6-auth-cli/tests/integration.rs`, which generates a key pair for the token tests.
 The config's `[keys]` paths name the two files it produces.
 The conversion matters: a PKCS#8 key written directly by LibreSSL's `genpkey` can omit the embedded public key and fail at signing, which is why the test goes through SEC1.
@@ -325,7 +329,9 @@ Take from it that the access token carries the identity, groups and roles, and t
 
 **Table 7: the claims in each token.**
 
-The `type` claim is the marker that keeps a refresh token out of an access-token check.
+The `type` claim marks a refresh token, and no decoder checks its value.
+Each decoder instead requires fields the other kind lacks: the access decoder needs `groups` and `roles`, and the refresh decoder needs `type`.
+m6-http ignores `type`, so a refresh token presented as a bearer token is refused with 403 for having no groups or roles.
 
 The algorithm follows the key: an EC P-256 key gives ES256, and an RSA key gives RS256.
 The `alg` header is set from the key at startup.
@@ -338,108 +344,44 @@ The `iss` claim reaches m6-http as data and does not decide whether a request is
 The access token's groups and roles are a snapshot.
 A role change takes effect at the next login or refresh, and an outstanding access token keeps its old claims until it expires.
 
-The default lifetimes are 900 seconds for an access token and 2,592,000 seconds for a refresh token.
-The refresh token is stored as a SHA-256 hash, and the raw token is never written to the database.
-
 The two token shapes are the contract between this service and every verifier.
 Section 7 gives the verifier in m6-http, and section 8 gives the claims a backend receives.
 
 ## 7. m6-http integration
 
 m6-http verifies access tokens and enforces route `require` rules.
-This section gives the configuration and the five outcomes, beginning with the `[auth]` section that supplies the verification key.
+This section gives the one configuration that points m6-http at this service, and where the rest is specified.
 
 ```toml
 [auth]
-backend    = "m6-auth"              # optional, checked when given, unused by verification
-public_key = "/etc/m6/auth.pub"     # the file m6-http reads at startup
+public_key = "/etc/m6/auth.pub" # the file m6-http reads at startup
 
 [[backend]]
-name    = "m6-auth"
-sockets = "/run/m6/m6-auth-*.sock"
+name = "m6-auth"
+sockets = "/run/m6/m6-auth*.sock"
 
 [[route]]
-path    = "/auth/login"
+path = "/auth/login"
 backend = "m6-auth"
 
 [[route]]
-path    = "/auth/logout"
+path = "/auth/logout"
 backend = "m6-auth"
 
 [[route]]
-path    = "/auth/refresh"
+path = "/auth/refresh"
 backend = "m6-auth"
-
-[[route]]
-path    = "/admin/{page}"
-backend = "m6-html"
-require = "group:editors"
 ```
 
 The `[auth] public_key` file is the public key that matches the service's private key.
-A relative path resolves against the site directory.
-A route with `require` and no `[auth]` stops m6-http at startup.
-`[auth]` in both `site.toml` and the system config is also a startup error.
-
-m6-http reads the token from `Authorization: Bearer <token>` or from the `session` cookie, and the header wins when both are present.
-The check runs only on a route that declares `require`.
-A response on such a route is never cached, because the cache key has no identity.
-
-Table 8 gives the outcomes.
-Take from it that a browser without a token gets a redirect and every other refusal is a status code.
-
-| condition | response |
-|---|---|
-| no token, browser request | 302 to `/auth/refresh` with a `refresh` cookie, otherwise 302 to `/login?next=<path>` |
-| no token, other client | 401 with `WWW-Authenticate: Bearer` |
-| token present, invalid or expired | 401 with `WWW-Authenticate: Bearer` |
-| token valid, claim missing | 403 |
-| token valid, claim present | request forwarded with `X-Auth-Claims` |
-
-**Table 8: the five outcomes of a route with `require`.**
-
-The browser row is the only redirect, and it depends on the `Accept` header containing `text/html`.
-
-`require` takes `group:<name>` or `role:<name>`.
-m6-http checks the `groups` or `roles` claim for that name.
-Any other form denies the request.
-
-The `X-Auth-Claims` header is base64-encoded JSON of the verified claims.
-m6-http removes any inbound `X-Auth-Claims` header before routing, so a client cannot supply its own.
-Section 8 gives the dictionary keys a backend reads from it.
-
-The edge check is local and the header carries the result.
-Section 8 shows what a backend does with that result.
+The token sources, the `require` forms and the five outcomes of a route with `require` are in [`m6-http.md`](m6-http.md) and [`m6-site-toml.md`](m6-site-toml.md).
+The edge check is local, so the header it sets carries the result to a backend, and section 8 shows what a backend does with it.
 
 ## 8. Renderer integration
 
-A backend receives the verified claims in the `X-Auth-Claims` header, and m6 turns them into request-dictionary keys.
-Table 9 gives the keys.
-Take from it that a backend reads a name, an id, a group list and a role list from the same request.
-
-| key | value | source claim |
-|---|---|---|
-| `auth_username` | string | `username`, or `sub` when `username` is absent |
-| `auth_sub` | string | `sub` |
-| `auth_groups` | array of strings | `groups` |
-| `auth_roles` | array of strings | `roles` |
-
-**Table 9: the request-dictionary keys built from verified claims.**
-
-The keys appear only on a route with `require` and a token that passed the check.
-
-A template or a Rust renderer reads the keys like any other dictionary entry:
-
-```rust
-let username = req["auth_username"].as_str().unwrap_or("");
-let is_editor = req["auth_groups"]
-    .as_array()
-    .map(|g| g.iter().any(|v| v.as_str() == Some("editors")))
-    .unwrap_or(false);
-```
-
-The keys are absent on an unauthenticated request and on a route without `require`, even when the request carries a valid token.
-A backend that needs a claim on every request should declare `require` on the route.
+A backend receives the verified claims in the `X-Auth-Claims` header, and m6 turns them into the `auth_*` request-dictionary keys.
+The keys exist only on a route with `require` and a token that passed the check, so a backend that needs a claim on every request declares `require` on the route.
+The key names are in [`m6-render-lib.md`](m6-render-lib.md).
 
 Token verification, the edge check and the backend keys are one chain.
 Section 9 covers the database that holds the users the chain begins with.
@@ -465,16 +407,8 @@ Section 10 covers the one piece of state the service keeps in memory.
 ## 10. Rate limiting
 
 The login route limits failed passwords by client address.
-The default is 5 failures in 900 seconds.
-Table 10 gives the two keys and their defaults.
+Table 3 gives the two `[rate_limit]` keys, and the defaults are 5 failures in 900 seconds.
 Take from it that the throttle is configuration, and a restart clears it.
-
-| key | default | meaning |
-|---|---|---|
-| `[rate_limit] max_attempts` | `5` | failed logins allowed per address per window |
-| `[rate_limit] window_secs` | `900` | length of the window in seconds |
-
-**Table 10: the rate-limit keys.**
 
 `window_secs = 0` makes every count expire at once, which turns the throttle off.
 
@@ -489,7 +423,7 @@ m6-http sets the forwarded header and strips any client-supplied copy.
 A direct caller can set the header, so the service's socket must be reachable only by m6-http.
 
 The counts live in memory.
-A restart forgets them, and a change to either key takes effect at the next restart.
+A restart forgets them, and section 4 gives the restart rule for the two keys.
 The source comment says that brute force slow enough to survive restarts is left to the firewall.
 
 The throttle bounds one route and one address at a time.
@@ -502,11 +436,7 @@ This section gives the signals, the exit codes and the log lines, beginning with
 
 ### 11.1. Signals
 
-The first `SIGTERM` or `SIGINT` stops accepting, drains in-flight requests, removes the socket and exits 0.
-A second signal removes the socket and exits 0 at once.
-`SIGUSR1` reopens the log file and never counts toward shutdown.
-
-Table 11 gives the three signals.
+Table 8 gives the three signals.
 Take from it that the first two signals differ in how much work they finish, and both exit 0.
 
 | signal | first receipt | later receipt |
@@ -514,13 +444,11 @@ Take from it that the first two signals differ in how much work they finish, and
 | `SIGTERM` or `SIGINT` | drain in-flight requests, remove the socket, exit 0 | remove the socket and exit 0 at once |
 | `SIGUSR1` | reopen the log file | reopen it again |
 
-**Table 11: the signals the service handles.**
-
-`SIGUSR1` is the log-rotation signal and does not start a shutdown.
+**Table 8: the signals the service handles.**
 
 ### 11.2. Exit codes
 
-Table 12 gives the exit codes.
+Table 9 gives the exit codes.
 Take from it that a configuration fault fails the start, and a request fault becomes an HTTP status.
 
 | code | meaning |
@@ -529,7 +457,7 @@ Take from it that a configuration fault fails the start, and a request fault bec
 | `1` | runtime error, including a failure to start logging |
 | `2` | configuration or invocation error: a missing argument, a config that does not parse, a key that does not load, a key pair that does not match, a database that cannot be opened, or a socket that cannot be bound |
 
-**Table 12: the process exit codes.**
+**Table 9: the process exit codes.**
 
 A request that fails after startup returns a 4xx or 5xx response, and the process keeps running.
 
@@ -537,12 +465,11 @@ A request that fails after startup returns a 4xx or 5xx response, and the proces
 
 The service writes one line per event to stdout, in JSON by default.
 It logs the startup configuration, the route outcomes, key reloads and the core lifecycle lines.
-Table 13 gives the events.
+Table 10 gives the events.
 Take from it that every login attempt is recorded with the address and every failure with a reason.
 
 | event | level | fields |
 |---|---|---|
-| config loaded | info | `issuer` |
 | signing keys reloaded | info | none |
 | login success | info | `username`, `ip` |
 | login failure | warn | `ip`, `reason` |
@@ -551,12 +478,11 @@ Take from it that every login attempt is recorded with the address and every fai
 | logout | info | `user_id` for the bearer path |
 | started, shutdown signal received, shutdown complete | info | service name, socket on start |
 
-**Table 13: the log events this service adds to the core lifecycle lines.**
+**Table 10: the log events this service adds to the core lifecycle lines.**
 
 The service never logs a password, a token or key material.
 
-A change to `[storage] path`, a token lifetime, the issuer or a rate-limit key is logged at warn level.
-The line says "restart m6-auth-server to apply it", and the running value stays.
+A change to a startup-only value is logged at warn level, and section 4 gives the restart rule.
 
 Signals, exit codes and logs are the process contract.
 Section 12 states what the service does not do.
@@ -583,7 +509,7 @@ The six items above are the scope, and section 13 collects the documents that ow
 The service has four routes, one config file and one SQLite database.
 The rotation steps and the two path rules are in section 4.
 
-Table 14 gives the documents that own what this page leaves out.
+Table 11 gives the documents that own what this page leaves out.
 Take from it that every number and every contract has a file responsible for it.
 
 | document | covers |
@@ -596,7 +522,7 @@ Take from it that every number and every contract has a file responsible for it.
 | [`m6-architecture.md`](m6-architecture.md) | why the edge verifies tokens and why the header is stripped |
 | `m6-auth-server/Cargo.toml` | the crate's dependencies and features |
 
-**Table 14: further reading, and what each document covers.**
+**Table 11: further reading, and what each document covers.**
 
 The first three are the pages a deployment reads beside this one.
 
