@@ -59,6 +59,10 @@ Googlebot verifies only under `googlebot.com` and `google.com`. A name under `go
 **The signal-mask guard fails closed (#178).**
 When the thread's signal mask cannot be read, a service now refuses to start instead of assuming SIGTERM is blocked.
 
+### Docs
+
+**`docs/m6-core-reference.md` sections 1 to 5 follow the documentation ruleset, and the module and line counts, the `RouteConfig` fields and the watcher description now match the code (#144).**
+
 **The build-host gate runs example 05's end-to-end test after its stack is up (#273).**
 The examples unit-test step skips `blog_site_end_to_end`, which needs certificates and the running stack, and the gate runs `cargo test -p render-cms --test integration` once that stack answers, counting a failure into the examples result.
 
