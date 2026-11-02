@@ -54,6 +54,11 @@ An address past the cap, or not yet reached, reads `not looked up yet  UNVERIFIE
 Googlebot verifies only under `googlebot.com` and `google.com`. A name under `googleusercontent.com` does not verify it, because every cloud customer's virtual machine gets a reverse name there that also resolves forward.
 `telemetry::CrawlerVerdict` gains `ForwardMismatch`, so a `match` over it needs a new arm.
 
+### Changed
+
+**m6-auth-server opens one database connection per worker, so login, refresh and logout no longer queue behind a single connection lock (#182).**
+A login held that lock while bcrypt verified the password. `m6_auth::Db::open` now sets the busy timeout before switching to WAL and retries the switch for up to 5 seconds, because SQLite answers busy for that pragma without honouring the timeout when several workers open a new database at once.
+
 ### Verified
 
 - Unit tests with stub resolvers cover a confirmed name, a PTR whose forward lookup returns other addresses, a name with no forward answer, a failed forward lookup, no PTR, a name with no address (EAI_NONAME and EAI_NODATA), a slot free by the time the caller has the result, the per-poll lookup cap, expiry and cache bound, a report that reads stored results and resolves nothing, a resolver that never answers, and the thread bound (eight blocked lookups, then fifty more that return at once and start no thread, then slots free again).
