@@ -1,6 +1,7 @@
 //! The hourly health check, printed.
 //!
-//! This takes everything from the nodes' own HTTP endpoints. It does not log in
+//! Apart from section H's tunnel check, this takes every figure from the
+//! nodes' own HTTP endpoints. It does not log in
 //! to any node or run `journalctl`, `systemctl`, `df` or `curl` there, and it
 //! does not parse an analytics log over the wire. Each figure is a field on
 //! `/perf` or `/traffic`, computed by the node that owns the data.
@@ -387,7 +388,7 @@ pub fn render(d: &Digest, readings: &[NodeReading], verdicts: &Verdicts) -> Stri
         // two builds of one tag apart and reading three identical version
         // strings is exactly what "the fleet agrees" looks like while it
         // does not. Twelve characters of the hash: enough to compare by
-        // eye and the same prefix the estate file and the handover quote.
+        // eye and the prefix an operator's notes would quote.
         //
         // The certificate is on this line too, for the same reason: "how long
         // has this node got" is asked beside "what is it running", and a

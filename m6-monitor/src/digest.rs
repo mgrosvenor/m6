@@ -950,8 +950,8 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
             let detail = reporting
                 .iter()
                 .map(|n| {
-                    // Twelve characters, which is what an operator reading a
-                    // handover or an estate file is looking at. The full value
+                    // Twelve characters, which is what an operator reading their
+                    // own notes is looking at. The full value
                     // is in the JSON digest for anything that wants to compare
                     // exactly.
                     let h = n.hash.as_deref().unwrap_or("unknown");
