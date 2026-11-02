@@ -9,7 +9,10 @@ use std::sync::{Mutex, OnceLock};
 /// The cargo target directory, derived from the running test binary.
 ///
 /// A test binary lives at `<target>/<profile>/deps/<name>-<hash>`, so the
-/// target directory is three levels up. Deriving it this way rather than from
+/// target directory is three levels up. Newer cargo puts it at
+/// `<target>/<profile>/build/<package>/<hash>/out/<name>-<hash>`, so the
+/// nearest ancestor named `deps` or `build` marks the profile directory's
+/// child either way. Deriving it this way rather than from
 /// `CARGO_MANIFEST_DIR` matters for two reasons: `CARGO_MANIFEST_DIR` is the
 /// directory of whichever crate *expanded the macro*, which would be `m6-core`
 /// and not the caller, and it is wrong outright when `CARGO_TARGET_DIR` points
@@ -24,15 +27,24 @@ use std::sync::{Mutex, OnceLock};
 /// about a missing file.
 pub(super) fn target_dir() -> PathBuf {
     let exe = std::env::current_exe().expect("current_exe");
-    let deps = exe.parent().expect("test binary has no parent directory");
-    debug_assert_eq!(deps.file_name().and_then(|s| s.to_str()), Some("deps"));
-    let above_profile = deps
-        .parent()
-        .and_then(Path::parent)
-        .unwrap_or_else(|| panic!("cannot find target/ above {}", exe.display()));
-    strip_triple(above_profile, build_target().as_deref())
+    target_of(&exe, build_target().as_deref())
         .unwrap_or_else(|| panic!("cannot find target/ above {}", exe.display()))
-        .to_path_buf()
+}
+
+/// The target directory above the test binary `exe`, for `target_dir`.
+fn target_of(exe: &Path, triple: Option<&str>) -> Option<PathBuf> {
+    let above_profile = exe
+        .ancestors()
+        .skip(1)
+        .find(|a| {
+            matches!(
+                a.file_name().and_then(|s| s.to_str()),
+                Some("deps" | "build")
+            )
+        })
+        .and_then(Path::parent)
+        .and_then(Path::parent)?;
+    strip_triple(above_profile, triple).map(Path::to_path_buf)
 }
 
 /// The `CARGO_BUILD_TARGET` triple, if one is set and not empty.
@@ -316,6 +328,20 @@ mod tests {
             release_binary(t, Some("x86_64-unknown-linux-gnu"), "x"),
             Path::new("/t/x86_64-unknown-linux-gnu/release/x")
         );
+    }
+
+    #[test]
+    fn the_target_directory_is_found_in_both_cargo_layouts() {
+        let old = Path::new("/t/debug/deps/x-1");
+        let new = Path::new("/t/debug/build/pkg/abc/out/x-1");
+        let triple_new = Path::new("/t/x86_64-unknown-linux-gnu/debug/build/pkg/abc/out/x-1");
+        assert_eq!(target_of(old, None), Some(PathBuf::from("/t")));
+        assert_eq!(target_of(new, None), Some(PathBuf::from("/t")));
+        assert_eq!(
+            target_of(triple_new, Some("x86_64-unknown-linux-gnu")),
+            Some(PathBuf::from("/t"))
+        );
+        assert_eq!(target_of(Path::new("/x"), None), None);
     }
 
     #[test]
