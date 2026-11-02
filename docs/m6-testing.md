@@ -241,10 +241,11 @@ A green run means what it means only if you know which of the four layers ran.
 m6's own tests run anywhere, `m6-core::testkit` is what stops them failing for reasons that are not the code, conformance needs the testers installed, and performance needs quiet.
 Running a tester by hand needs Table 5 first.
 
+The address and leak sanitisers run in their own workflow, `.github/workflows/sanitizer.yml`, on pushes to `develop`, and by hand once the file is on `main`.
+
 Two gaps are open, and neither is a documentation problem:
 
 - **No fuzzing**, anywhere in `check.sh`, `tools/build-host-tests.sh` or CI, in a codebase that hand-writes three protocol parsers.
-  The address and leak sanitisers have their own workflow, `.github/workflows/sanitizer.yml`, on pushes to `develop` and by hand with `--test-threads=1`.
 - **The per-service behaviour lists are issue #165**, because no row had been checked
   against the suites in Table 6 and at least four were wrong.
 

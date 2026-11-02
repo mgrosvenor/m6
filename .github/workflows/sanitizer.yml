@@ -3,25 +3,16 @@ name: Sanitisers
 # The address and leak sanitisers, in a workflow of their own so the required
 # checks in ci.yml are untouched until this job is promoted to one.
 #
-# It runs on pushes to develop and by hand. A pull request does not trigger it
+# It runs on pushes to develop, and by hand once the file is on main. A pull request does not trigger it
 # yet, because a finding in code that predates a pull request would block a
 # merge that did not cause it.
 #
-# The triage rule, from issue #164:
-#   A run that reports a leak or a memory fault in code older than this job is
-#   evidence of a real defect. File one generic m6 issue per finding and add
-#   `continue-on-error: true` to the job with the issue numbers named here.
-#   Fixing those findings is separate work. No finding is fixed in this job.
-#   There is no silent allowance: the job runs without that line until an
-#   issue is on file.
+# The triage rule is beside `continue-on-error` below.
 #
 # A sanitised run that cannot measure must fail, and it must not pass while
 # measuring nothing. CLAUDE.md says this, and issue #166 says what a skip cost
-# the conformance script. A failed nightly install, an absent sanitiser
-# runtime and a rejected flag all fail this job in seconds, before the suite
-# builds. The probe below compiles and runs a trivial program with the same
-# flags as the suite, so the job cannot reach the suite with a sanitiser that
-# is not there.
+# the conformance script. The probe step compiles and runs a trivial program
+# with the suite's flags, so the job cannot reach the suite without a sanitiser.
 #
 # The tests bind fixed loopback ports, so they run with --test-threads=1. The
 # step prints its wall clock time. The first runs decide the 20-minute
@@ -30,9 +21,12 @@ name: Sanitisers
 # fails loudly.
 
 on:
+  pull_request:
+    branches: [develop]
   push:
     branches: [develop]
-  # Manual, for a branch or a re-run without waiting for a push to develop.
+  # By hand, once this file is on main. GitHub only offers a manual run for a
+  # workflow file on the default branch.
   workflow_dispatch:
 
 env:
@@ -48,9 +42,12 @@ jobs:
   sanitizers:
     name: address and leak sanitisers
     runs-on: ubuntu-latest
-    # Triage rule. If a run reports a leak or a memory fault in existing code,
-    # file one generic m6 issue per finding and uncomment the next line with
-    # those issue numbers in this comment. Do not leave it on without them.
+    # Triage rule, from issue #164. A run that reports a leak or a memory fault
+    # in code older than this job is evidence of a real defect. File one generic
+    # m6 issue per finding, then uncomment the next line and name the issue
+    # numbers in this comment. Fixing the findings is separate work, and no
+    # finding is fixed in this job. There is no silent allowance: without an
+    # issue on file the job runs without that line.
     # continue-on-error: true
     steps:
       - uses: actions/checkout@v4
@@ -62,9 +59,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # The runtime is the part most likely to be missing. The nightly
-      # toolchain always exists by the time this step runs, because the step
-      # above fails if it does not. The probe proves the sanitiser runtime
+      # The runtime is the part most likely to be missing. The probe proves it
       # links for this target and loads when the binary starts, which is the
       # difference between a check and a skip.
       - name: The sanitiser runtime is present
@@ -84,8 +79,7 @@ jobs:
           fi
           echo "the sanitiser runtime linked and loaded"
 
-      # The command from issue #164, with the serial flag the tests need. This
-      # is the measurement. Everything above exists to make sure it runs.
+      # The command from issue #164, with the serial flag the tests need.
       - name: Tests under the address and leak sanitisers
         env:
           # Rustdoc compiles each doctest as a separate crate and links the
@@ -93,6 +87,11 @@ jobs:
           # doctest link fails on undefined sanitiser symbols, and cargo test
           # runs doctests even with an explicit host --target.
           RUSTFLAGS: "-Z sanitizer=address,leak"
+          # An explicit target keeps RUSTFLAGS off proc macros and build
+          # scripts, which must stay uninstrumented. The environment variable
+          # rather than --target reaches the cargo that testkit::binary runs
+          # to build the services, so that build gets the same treatment.
+          CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
           RUSTDOCFLAGS: "-Z sanitizer=address,leak"
         run: |
-          time cargo +nightly test --workspace --target x86_64-unknown-linux-gnu -- --test-threads=1
+          time cargo +nightly test --workspace -- --test-threads=1
