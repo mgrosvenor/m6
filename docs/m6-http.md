@@ -314,10 +314,10 @@ m6-http performs TLS negotiation with ALPN `h2` at startup of the first request.
 
 ## HTTP/2 Denial of Service
 
-m6-http bounds the HTTP/2 work a peer can cause in three places.
-A per-connection cap limits how many streams a peer may start, both backbone clients spend only the flow-control credit the peer grants, and the stream state machine decides which frames a peer may send.
-The sections below state each bound, the code that enforces it, and the test that pins it.
-Together they are the denial-of-service posture a reviewer checks before m6-http faces a public port.
+Three HTTP/2 behaviours in m6-http bound specific work: a per-connection cap on streams, send-side flow control on the backbone clients, and the stream state machine.
+The cap limits how many streams a peer may start, both clients spend only the flow-control credit the peer grants, and the state machine decides which frames a peer may send.
+The sections below state each behaviour, the code that enforces it, and the tests that pin it.
+Connection count and the rate of PING and SETTINGS frames are outside these three behaviours.
 
 ### Rapid Reset and the concurrency cap
 
@@ -333,13 +333,12 @@ m6-http answers it with a cap on counted streams, a decay window that holds a ca
 | `RESET_MEMORY` | 128 | Reset stream ids remembered for the slot count and the closed-stream rule |
 | `MAX_REFUSED_STREAK` | 50 | Consecutive REFUSED_STREAM answers before the connection ends |
 
-*Table 3: the four constants that bound a Rapid Reset flood, all in `m6-http/src/http2.rs`. Take from it that a peer may have at most 100 streams counted at once whether it finishes them or cancels them, and that a peer that ignores 50 refusals loses the connection.*
+*Table 3: the four constants that bound a Rapid Reset flood, all in `m6-http/src/http2.rs`. Take from it that a peer may have at most `MAX_CONCURRENT` streams counted at once whether it finishes them or cancels them, and that a peer that ignores `MAX_REFUSED_STREAK` refusals loses the connection.*
 
 The cap counts started streams, because `active_streams` adds the live `streams` map to the client-initiated ids in `recently_reset` that are younger than `RESET_DECAY`.
 `note_reset` records each reset id with its instant and drops the oldest entry at `RESET_MEMORY`.
-`RESET_MEMORY` is 128, above the cap of 100, so a peer cannot evict its own reset records and win back slots.
-Only client-initiated odd stream ids count.
-`resetting_streams_does_not_free_concurrency_slots` opens 100 streams, cancels each one, and checks that the count stays at 100 and that stream 201 is refused.
+`active_streams` counts only the client-initiated odd ids in that record.
+`resetting_streams_does_not_free_concurrency_slots` opens `MAX_CONCURRENT` streams, cancels each one, and checks that the count stays at `MAX_CONCURRENT` and that stream `1 + MAX_CONCURRENT * 2` is refused.
 
 A refusal is recorded as a reset, because the peer's own RST_STREAM is already in flight.
 `handle_headers` sends RST_STREAM with REFUSED_STREAM, then `note_reset` records the id so that the crossing cancel reads as a closed stream, which RFC 9113 section 5.1 tolerates.
@@ -353,7 +352,7 @@ At `MAX_REFUSED_STREAK` the server sends one GOAWAY with ENHANCE_YOUR_CALM and e
 
 Slots come back after the decay window, because a permanent hold would block every new stream on that connection after an ordinary burst of cancellations.
 `reset_slots_are_released_after_the_decay_window` advances a synthetic clock by twice `RESET_DECAY` and checks that the count falls to zero.
-One second stays inside legitimate browser behaviour, because a browser may cancel every stream it has open and it cannot have more than 100 open to begin with.
+`RESET_DECAY` stays inside legitimate browser behaviour, because a browser may cancel every stream it has open and it cannot have more than `MAX_CONCURRENT` open to begin with.
 
 `tools/rapidreset.py` is the raw-socket reproducer that sends the frames a well-behaved client library will not.
 `python3 tools/rapidreset.py [attempts] [host] [h2c-port]` defaults to 200 attempts against an *H2C* (HTTP/2 cleartext) listener on loopback.
@@ -384,7 +383,8 @@ END_STREAM rides on the frame that drains the body, so the bytes sent always mat
 Skipping an uncredited write would send fewer bytes than promised, and blocking in the loop would stall every other connection the poller drives.
 The remainder is stream state that resumes when credit arrives.
 
-A WINDOW_UPDATE that would push a window above 2^31-1 is a flow-control error, so both clients use `checked_add`. An overflow on stream 0 marks the connection dead. An overflow on a stream sends RST_STREAM(FLOW_CONTROL_ERROR) and drops that stream.
+A WINDOW_UPDATE that would push the connection window above 2^31-1 is a flow-control error, so both clients use `checked_add` and mark the connection dead on overflow.
+A WINDOW_UPDATE that would push a stream window above 2^31-1 sends RST_STREAM(FLOW_CONTROL_ERROR) and removes that stream, and the connection stays up.
 A zero increment on stream 0 is a connection error, and the client marks the connection dead.
 A zero increment on a stream is answered with RST_STREAM(PROTOCOL_ERROR), because RFC 9113 section 6.9 makes it a stream error.
 
@@ -396,7 +396,7 @@ h2spec tests m6-http as a server, so it exercises neither backbone client.
 ### The stream state machine
 
 The server tracks each HTTP/2 stream in one of the five live states of RFC 9113 section 5.1.
-`frame_verdict` in `m6-http/src/http2.rs` is one explicit table over `StreamState`, and every arm cites the rule it enforces.
+`frame_verdict` in `m6-http/src/http2.rs` is one explicit table over `StreamState`, with the rule for each arm beside it.
 Table 5 gives the inbound frames each state allows.
 
 | State | How it is entered | Frames the peer may send |
@@ -407,10 +407,10 @@ Table 5 gives the inbound frames each state allows.
 | HalfClosedRemote | The peer sent END_STREAM | WINDOW_UPDATE, RST_STREAM and PRIORITY |
 | Closed | Both sides finished, or a reset ended the stream | WINDOW_UPDATE and RST_STREAM are tolerated. PRIORITY is always allowed. Other frames are STREAM_CLOSED |
 
-*Table 5: the five live HTTP/2 stream states and the inbound frames each allows. Take from it that any frame other than HEADERS or PRIORITY on an idle stream is a connection error, that a frame after a reset is a stream error and a frame after END_STREAM is a connection error, and that WINDOW_UPDATE, RST_STREAM and PRIORITY are tolerated in a closed stream either way.*
+*Table 5: the five live HTTP/2 stream states and the inbound frames each allows. Take from it that any frame other than HEADERS or PRIORITY on an idle stream is a connection error, that a closed stream follows RFC 7540 section 5.1's split, where a frame after a reset is a stream error and a frame after END_STREAM is a connection error, and that WINDOW_UPDATE, RST_STREAM and PRIORITY are tolerated in a closed stream either way.*
 
 Two RFC states are absent on purpose.
-`ReservedLocal` and `ReservedRemote` are commented out in `StreamState`, with the RFC rule kept beside each row, so the code still reads against RFC 9113 section 5.1 line by line.
+`ReservedLocal` and `ReservedRemote` are commented out in `StreamState`, with the RFC rule kept beside each row.
 m6-http does not push, so nothing can enter reserved (local), as m6 issue #93 records.
 A PUSH_PROMISE from a peer is a connection error under RFC 9113 section 8.4, answered at the frame level before any stream object exists, so nothing can enter reserved (remote).
 
@@ -418,15 +418,14 @@ A PUSH_PROMISE from a peer is a connection error under RFC 9113 section 8.4, ans
 `stream_state` returns `Idle` for an id above `last_stream_id` and `Closed` for one at or below it.
 That split tells a frame on a never-opened stream from a frame on a finished stream without an unbounded set of closed ids.
 
-The error class for a closed stream depends on how it closed.
-RFC 9113 section 5.1 makes a frame after RST_STREAM a stream error of type STREAM_CLOSED, and a frame after END_STREAM a connection error of the same type.
-`recently_reset` holds the reset ids so `frame_verdict` can choose the right class, and it is bounded at `RESET_MEMORY`.
+`recently_reset` holds the reset ids so `frame_verdict` can choose the error class Table 5 describes, and it is bounded at `RESET_MEMORY`.
 The state table runs before dispatch, so no handler sees a frame in a state that forbids it.
-Known gaps below lists the two HTTP/2 limits the server still lacks.
+Known gaps below lists the two tracked implementation gaps.
 
 ### Known gaps
 
 Two HTTP/2 limits are absent from the server today, and Table 6 records each with the m6 issue that tracks it.
+The rows state what the code does and leave the fix to the issue.
 
 | Gap | What the code does today | Issue |
 |---|---|---|
@@ -435,7 +434,8 @@ Two HTTP/2 limits are absent from the server today, and Table 6 records each wit
 
 *Table 6: two HTTP/2 limits m6-http does not implement, and the issues that track them. Take from it that a peer gets no advertised header-list bound and no CANCEL or INTERNAL_ERROR from the server, and that the issue numbers are the record of each gap.*
 
-The bounds described above plus these two open issues are the HTTP/2 denial-of-service posture of m6-http.
+Both gaps are engineering work tracked by the two issues.
+Event Loop below describes the single-threaded epoll loop that drives these connections.
 
 ---
 
