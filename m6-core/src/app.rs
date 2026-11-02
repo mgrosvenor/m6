@@ -2453,6 +2453,26 @@ fn parse_invocation(routes: &[(String, RouteMethod)], handlers: &[String]) -> In
     }
 }
 
+/// The configuration refusals start and `--dump-config` share: a named
+/// `site.toml` that is missing, unreadable or not TOML, then a
+/// `[[backend]] compresses` disagreement. Returns the resolved `site.toml`.
+///
+/// Exit 2 is the configuration error code, detected before anything binds
+/// (backend protocol §8.3). A service that starts having disagreed with the
+/// edge about compression serves either fragmented caches or, worse, brotli
+/// to clients that asked for identity, and neither is visible from the
+/// outside until it bites. `--dump-config` runs the same check so a deploy
+/// that validates a config learns what the start would say.
+fn validate_startup(
+    config: &crate::config::RendererConfig,
+    site_dir: &std::path::Path,
+    config_path: &std::path::Path,
+) -> std::result::Result<PathBuf, String> {
+    let site_toml = check_site_toml(config, site_dir)?;
+    check_compress_declared(config, &site_toml, &backend_name_of(config_path))?;
+    Ok(site_toml)
+}
+
 /// Load the config and report how each route would be served. Returns the
 /// process exit code.
 fn dump_config(
@@ -2469,19 +2489,15 @@ fn dump_config(
         }
     };
 
-    // The same refusals the start makes, so a deploy that validates with
-    // --dump-config learns what the start would say.
-    let site_toml = match check_site_toml(&config, site_dir) {
+    // The same start refusals, so a deploy that validates with --dump-config
+    // learns what the start would say.
+    let site_toml = match validate_startup(&config, site_dir, config_path) {
         Ok(path) => path,
         Err(msg) => {
             eprintln!("Config error: {msg}");
             return 2;
         }
     };
-    if let Err(msg) = check_compress_declared(&config, &site_toml, &backend_name_of(config_path)) {
-        eprintln!("Config error: {msg}");
-        return 2;
-    }
 
     println!("site_dir    {}", site_dir.display());
     println!("config      {}", config_path.display());
@@ -2684,27 +2700,19 @@ fn run_app_with_shutdown(
         std::process::exit(2);
     });
 
-    // Before `site_toml_or_exit`, which reads a named `site_toml`: a change
+    // Before `validate_startup`, which reads a named `site_toml`: a change
     // between that read and this fingerprint would otherwise be lost.
     let site_fp = crate::watcher::Fingerprint::of(&config.resolve_site_toml(&site_dir));
-    let site_toml = site_toml_or_exit(&config, &site_dir);
+    let site_toml = match validate_startup(&config, &site_dir, &config_path) {
+        Ok(path) => path,
+        Err(msg) => {
+            eprintln!("Config error: {msg}");
+            std::process::exit(2);
+        }
+    };
 
-    // Does site.toml tell the edge the truth about whether we compress?
-    //
-    // Before logging is up, because it exits 2 and that is a configuration error
-    // detected before binding — the one thing exit 2 means (backend protocol
-    // §8.3). A service that starts having disagreed with the edge about this
-    // serves either fragmented caches or, worse, brotli to clients that asked
-    // for identity, and neither is visible from the outside until it bites.
-    //
-    // The backend name is the config file's stem, which is the same convention
-    // `socket_path_from_config` uses to derive /run/m6/<stem>.sock, so the name
-    // in site.toml's `[[backend]]` and the name here are the same string.
+    // The reload closure reuses this name for its own compress check.
     let backend_name = backend_name_of(&config_path);
-    if let Err(msg) = check_compress_declared(&config, &site_toml, &backend_name) {
-        eprintln!("Config error: {msg}");
-        std::process::exit(2);
-    }
 
     // Init logging: site.toml base → renderer config [log] → CLI --log-level.
     let (format, level) = resolve_log(&site_toml, &config.log, cli_log_level.as_deref());
