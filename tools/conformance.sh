@@ -257,10 +257,9 @@ start_edge() {
   if [[ "$EDGE_UP" == "true" ]]; then
     return 0
   fi
-  # Self-contained: builds its own site, cert and backend. The alternative is
-  # the manual one-time setup in the site HANDOVER, which is fine for a person
-  # and useless in CI, and which was once measured while pointing at a stale
-  # staging binary.
+  # Self-contained: builds its own site, cert and backend. The alternative is a
+  # hand-configured long-running instance, which is fine for a person and
+  # useless in CI, and which was once measured while running a stale binary.
   local site="$WORK/edge-site"
   mkdir -p "$site/public" "$site/configs"
 
