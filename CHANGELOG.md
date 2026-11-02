@@ -54,6 +54,11 @@ An address past the cap, or not yet reached, reads `not looked up yet  UNVERIFIE
 Googlebot verifies only under `googlebot.com` and `google.com`. A name under `googleusercontent.com` does not verify it, because every cloud customer's virtual machine gets a reverse name there that also resolves forward.
 `telemetry::CrawlerVerdict` gains `ForwardMismatch`, so a `match` over it needs a new arm.
 
+### Changed
+
+**m6-http's benchmark dependencies are no longer production dependencies (#188).**
+The cold-start benchmark is now a `[[bench]]` (`cargo bench -p m6-http --bench bench_coldstart -- <flags>`), and `tokio`, `tokio-rustls`, `h2` and `http` moved to dev-dependencies. The `m6-bench-coldstart` binary is gone.
+
 ### Verified
 
 - Unit tests with stub resolvers cover a confirmed name, a PTR whose forward lookup returns other addresses, a name with no forward answer, a failed forward lookup, no PTR, a name with no address (EAI_NONAME and EAI_NODATA), a slot free by the time the caller has the result, the per-poll lookup cap, expiry and cache bound, a report that reads stored results and resolves nothing, a resolver that never answers, and the thread bound (eight blocked lookups, then fifty more that return at once and start no thread, then slots free again).
