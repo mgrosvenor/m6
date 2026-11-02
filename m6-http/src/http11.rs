@@ -78,10 +78,8 @@ pub struct HandshakeSample {
     /// for it", on the strength of rustls' default 256-session store. That was
     /// the assumption that let the defect sit: 256 entries is nothing on a node
     /// taking hundreds of handshakes an hour, so the store evicted every browser
-    /// before it came back. Browser traffic then read 0% resumed, while a
-    /// monitor polling on repeat read high on its own channel.
-    /// `make_tls_server_config` now installs a ticketer, which is what makes
-    /// resumption stateless and this number mean something.
+    /// before it came back. `make_tls_server_config` now installs a ticketer,
+    /// which is what makes resumption stateless and this number mean something.
     pub resumed: bool,
 }
 
