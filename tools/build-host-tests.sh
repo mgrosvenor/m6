@@ -454,6 +454,12 @@ else
     echo "### 05-cms rust end-to-end"
     cargo test -p render-cms --test integration > /tmp/eg-cms-rust.log 2>&1
     rust_rc=$?
+    # A test that cannot start its stack prints SKIP and passes; count it as a failure.
+    if grep -q '^SKIP' /tmp/eg-cms-rust.log; then
+        echo "rust end-to-end skipped:"
+        grep '^SKIP' /tmp/eg-cms-rust.log
+        rust_rc=1
+    fi
     # No "test result:" line is echoed: the report below sums those lines for the
     # unit-test count and takes the last "N passed" as the suite's count.
     echo "rust end-to-end exit status $rust_rc"
