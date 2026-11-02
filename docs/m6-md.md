@@ -19,7 +19,8 @@ The nine sections after this one are:
 9. [Limits](#9-limits)
 10. [Summary](#10-summary)
 
-The source for every claim here is `m6-md/src/main.rs`.
+The command line, the input, the output and the watch loop are in `m6-md/src/main.rs`.
+Table 5 names the sources for the workspace membership and the renderer's params.
 
 ## 2. The command line
 
@@ -218,18 +219,19 @@ m6-md is one command, one directory of Markdown and one JSON file, and a site se
 The command line has two required arguments and four optional flags, the frontmatter has two keys, and the output has five fixed fields.
 Watch mode keeps the file current, and `--touch` is what tells a running site to reload.
 
-Table 5 gives the documents that own what this page leaves out.
+Table 5 gives the sources for what this page leaves out.
 Take from it that every subject here has one owner.
 
-| document | what it owns |
+| source | what it owns |
 |---|---|
-| `m6-md/src/main.rs` | the behaviour this page describes |
-| `m6-md/Cargo.toml` | the crate, its dependencies and its place in the workspace |
+| `m6-md/src/main.rs` | m6-md's command line, input, output and watch behaviour |
+| `Cargo.toml`, `m6-md/Cargo.toml` | the workspace members list, and the crate's dependencies |
+| `m6-core/src/app.rs`, [`m6-render-lib.md`](m6-render-lib.md) | the renderer's static params, read at route build and refreshed on reload |
 | [`m6-user-guide.md`](m6-user-guide.md) | Example 02, the blog that serves this output, with both templates |
 | [`m6-site-toml.md`](m6-site-toml.md) | `[[route]]`, `[[route_group]]` and the renderer `params` key |
 | [`m6-http.md`](m6-http.md) | the cache, and when a change clears it |
 | [`m6-testing.md`](m6-testing.md) | how the workspace's tests run |
 
-**Table 5: the documents that own the code and the surrounding subjects.**
+**Table 5: where the code and the surrounding subjects are written down.**
 
 The tool, its output and the route that serves it are the whole subject, and Table 5 is where the next question goes.
