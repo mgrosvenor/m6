@@ -9,7 +9,7 @@
 /// H3: quiche (one QUIC conn per page load).
 ///
 /// Flags:
-///   --addr HOST:PORT    target  (default 127.0.0.1:8443)
+///   --addr HOST:PORT    target, required (without it the bench prints a note and exits 0)
 ///   --html PATH         HTML page to fetch  (default /)
 ///   --n N               samples per protocol  (default 10000)
 ///   --warmup N          warmup requests before measurement  (default 100)
@@ -43,7 +43,7 @@ struct Args {
 impl Args {
     fn parse() -> Self {
         let mut a = Args {
-            addr: "127.0.0.1:8443".into(),
+            addr: String::new(),
             html: "/".into(),
             n: 10_000,
             warmup: 100,
@@ -57,6 +57,8 @@ impl Args {
         let mut i = 0;
         while i < raw.len() {
             match raw[i].as_str() {
+                // cargo bench passes --bench to every bench binary.
+                "--bench" => {}
                 "--addr" => {
                     i += 1;
                     a.addr = raw[i].clone();
@@ -101,6 +103,12 @@ impl Args {
                 }
             }
             i += 1;
+        }
+        if a.addr.is_empty() {
+            println!(
+                "bench_coldstart measures a running server and needs --addr <host:port>, e.g. cargo bench -p m6-http --bench bench_coldstart -- --addr 127.0.0.1:8443"
+            );
+            std::process::exit(0);
         }
         a
     }
@@ -1130,7 +1138,7 @@ fn main() {
     let args = Args::parse();
 
     println!(
-        "m6-bench-coldstart  target={}  html={}  n={}  warmup={}  skip-verify={}",
+        "bench_coldstart  target={}  html={}  n={}  warmup={}  skip-verify={}",
         args.addr, args.html, args.n, args.warmup, args.skip_verify
     );
     println!("Cold-start: new connection per page load (HTML + all linked assets)");
