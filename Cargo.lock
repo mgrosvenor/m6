@@ -1792,6 +1792,7 @@ dependencies = [
  "bcrypt",
  "hex",
  "jsonwebtoken",
+ "m6-core",
  "rusqlite",
  "serde",
  "serde_json",

@@ -55,6 +55,9 @@ pub enum AuthError {
     #[error("database error: {0}")]
     Db(#[from] rusqlite::Error),
 
+    #[error("opening the database: {0}")]
+    Open(#[from] m6_core::sqlite::SqliteError),
+
     #[error("password hashing error: {0}")]
     Bcrypt(#[from] bcrypt::BcryptError),
 }
@@ -108,31 +111,15 @@ pub struct Db(Connection);
 impl Db {
     /// Open a connection and apply the schema.
     ///
-    /// Every connection to one file uses WAL, so the journal mode is set here
-    /// and nowhere else. Switching a new file to WAL takes a short exclusive
-    /// lock, and SQLite answers `SQLITE_BUSY` for that pragma without waiting
-    /// on the busy timeout. Workers that open one new database at the same
-    /// time therefore retry the switch until one of them has made it or the
-    /// wait runs out.
+    /// The connection comes from `m6_core::sqlite`, in WAL mode with a five
+    /// second busy timeout and foreign keys on. Every connection to one file
+    /// uses WAL, so the journal mode is set there and nowhere else. Workers
+    /// that open one new database at the same time are covered by the retry
+    /// of the WAL switch in that opener.
     pub fn open(path: &Path) -> Result<Self> {
-        let conn = Connection::open(path)?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            match conn.pragma_update(None, "journal_mode", "wal") {
-                Ok(()) => break,
-                Err(rusqlite::Error::SqliteFailure(e, _))
-                    if e.code == rusqlite::ErrorCode::DatabaseBusy
-                        && std::time::Instant::now() < deadline =>
-                {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
-
-        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+        let conn = m6_core::sqlite::OpenOptions::default()
+            .journal(m6_core::sqlite::Journal::Wal)
+            .open(path)?;
         conn.execute_batch(SCHEMA)?;
         Ok(Db(conn))
     }

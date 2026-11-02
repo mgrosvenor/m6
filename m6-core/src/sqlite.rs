@@ -109,7 +109,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub use rusqlite;
 pub use rusqlite::{params, Connection, OptionalExtension, Transaction};
@@ -177,8 +177,13 @@ impl OpenOptions {
     ///
     /// Changing the journal mode needs the file to itself. If another
     /// connection is using the file in WAL mode, a request for a different mode
-    /// fails with `SQLITE_BUSY` once the busy timeout runs out. Open every connection to a file
-    /// with the same [`Journal`].
+    /// fails with `SQLITE_BUSY` once the busy timeout runs out. Open every
+    /// connection to a file with the same [`Journal`].
+    ///
+    /// The switch to [`Journal::Wal`] is retried on `SQLITE_BUSY` for up to the
+    /// busy timeout, because several connections opening one new file at once
+    /// make SQLite refuse the switch without waiting. A read-only file is
+    /// refused before any journal change is tried.
     pub fn open(&self, path: &Path) -> Result<Connection, SqliteError> {
         let conn = Connection::open(path).map_err(|source| SqliteError::Open {
             path: path.to_path_buf(),
@@ -199,8 +204,26 @@ impl OpenOptions {
             Journal::Rollback => "delete",
             Journal::Wal => "wal",
         };
-        let got: String =
-            conn.pragma_update_and_check(None, "journal_mode", wanted, |r| r.get(0))?;
+        // Switching a file to WAL takes a short exclusive lock, and SQLite
+        // answers `SQLITE_BUSY` for that pragma without waiting on the busy
+        // timeout. Connections that open one new file at the same time retry
+        // the switch until one of them has made it or the busy timeout has
+        // passed. Only the switch to WAL retries: a request for another mode
+        // fails when the file is in use, as the doc comment above says.
+        let deadline = Instant::now() + self.busy_timeout;
+        let got: String = loop {
+            match conn.pragma_update_and_check(None, "journal_mode", wanted, |r| r.get(0)) {
+                Ok(got) => break got,
+                Err(rusqlite::Error::SqliteFailure(e, _))
+                    if self.journal == Journal::Wal
+                        && e.code == rusqlite::ErrorCode::DatabaseBusy
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        };
         if !got.eq_ignore_ascii_case(wanted) {
             return Err(SqliteError::JournalMode { wanted, got });
         }
@@ -691,6 +714,37 @@ mod tests {
         match open(&path) {
             Err(SqliteError::ReadOnly(p)) => assert_eq!(p, path),
             other => panic!("expected ReadOnly, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wal_switch_survives_threads_opening_one_new_file_at_once() {
+        const THREADS: usize = 8;
+        // One race is easy to win by luck, so repeat it on fresh files.
+        for round in 0..200 {
+            let (_d, path) = db();
+            let barrier = Arc::new(Barrier::new(THREADS));
+            let handles: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    let path = path.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        OpenOptions::default().journal(Journal::Wal).open(&path)
+                    })
+                })
+                .collect();
+            let conns: Vec<Connection> = handles
+                .into_iter()
+                .map(|h| {
+                    h.join().unwrap().unwrap_or_else(|e| {
+                        panic!("round {round}: a concurrent WAL open failed: {e}")
+                    })
+                })
+                .collect();
+            for c in &conns {
+                assert_eq!(pragma_s(c, "journal_mode"), "wal");
+            }
         }
     }
 
