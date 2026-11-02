@@ -2469,22 +2469,26 @@ fn dump_config(
         }
     };
 
-    // The same refusal the start makes, so a deploy that validates with
+    // The same refusals the start makes, so a deploy that validates with
     // --dump-config learns what the start would say.
-    if let Err(msg) = check_site_toml(&config, site_dir) {
+    let site_toml = match check_site_toml(&config, site_dir) {
+        Ok(path) => path,
+        Err(msg) => {
+            eprintln!("Config error: {msg}");
+            return 2;
+        }
+    };
+    if let Err(msg) = check_compress_declared(&config, &site_toml, &backend_name_of(config_path)) {
         eprintln!("Config error: {msg}");
         return 2;
     }
 
     println!("site_dir    {}", site_dir.display());
     println!("config      {}", config_path.display());
-    {
-        let site_toml = config.resolve_site_toml(site_dir);
-        if site_toml.exists() {
-            println!("site.toml   {}", site_toml.display());
-        } else {
-            println!("site.toml   {} (absent)", site_toml.display());
-        }
+    if site_toml.exists() {
+        println!("site.toml   {}", site_toml.display());
+    } else {
+        println!("site.toml   {} (absent)", site_toml.display());
     }
     println!(
         "socket      {}",
@@ -2565,6 +2569,21 @@ impl From<String> for ReloadError {
     fn from(msg: String) -> Self {
         ReloadError::Failed(msg)
     }
+}
+
+/// The name `site.toml` uses for this service's `[[backend]]`: the config
+/// file's stem, falling back to `m6-default`.
+///
+/// The same convention `socket_path_from_config` uses to derive
+/// `/run/m6/<stem>.sock`, so the name in `site.toml` and the name here are the
+/// same string. Used at start and by `--dump-config` so the two cannot look up
+/// different entries.
+fn backend_name_of(config_path: &std::path::Path) -> String {
+    config_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("m6-default")
+        .to_string()
 }
 
 /// Whether `site.toml` declares the compression `config` does, for the backend
@@ -2680,11 +2699,7 @@ fn run_app_with_shutdown(
     // The backend name is the config file's stem, which is the same convention
     // `socket_path_from_config` uses to derive /run/m6/<stem>.sock, so the name
     // in site.toml's `[[backend]]` and the name here are the same string.
-    let backend_name = config_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("m6-default")
-        .to_string();
+    let backend_name = backend_name_of(&config_path);
     if let Err(msg) = check_compress_declared(&config, &site_toml, &backend_name) {
         eprintln!("Config error: {msg}");
         std::process::exit(2);
@@ -3464,6 +3479,46 @@ mod tests {
         assert!(check_site_toml(&cfg, d.path()).is_ok());
         std::fs::write(d.path().join("site.toml"), "[server\n").unwrap();
         assert!(check_site_toml(&cfg, d.path()).is_ok());
+    }
+
+    #[test]
+    fn dump_config_refuses_a_compresses_disagreement() {
+        // Every MIME type `default_compression` turns on, set to zero, so this
+        // service compresses nothing.
+        const NO_COMPRESSION: &str = concat!(
+            "[compression.\"text/html\"]\nbrotli = 0\ngzip = 0\n",
+            "[compression.\"text/css\"]\nbrotli = 0\ngzip = 0\n",
+            "[compression.\"text/plain\"]\nbrotli = 0\ngzip = 0\n",
+            "[compression.\"application/javascript\"]\nbrotli = 0\ngzip = 0\n",
+            "[compression.\"application/json\"]\nbrotli = 0\ngzip = 0\n",
+            "[compression.\"image/svg+xml\"]\nbrotli = 0\ngzip = 0\n",
+        );
+        let d = tempfile::tempdir().unwrap();
+        let config_path = d.path().join("app.toml");
+        std::fs::write(&config_path, NO_COMPRESSION).unwrap();
+        // The config file's stem is "app", the name the site.toml entry must
+        // use. It declares compression this service does not do.
+        std::fs::write(
+            d.path().join("site.toml"),
+            "[[backend]]\nname = \"app\"\ncompresses = true\n",
+        )
+        .unwrap();
+
+        // The message start prints for this disagreement, so the test can say
+        // --dump-config refuses the same thing rather than only exiting 2.
+        let config = crate::config::load(&config_path, d.path()).unwrap();
+        let site_toml = config.resolve_site_toml(d.path());
+        let start_msg = check_compress_declared(&config, &site_toml, "app").unwrap_err();
+        assert!(
+            start_msg.contains("compresses = true, but this service compresses nothing"),
+            "{start_msg}"
+        );
+
+        assert_eq!(
+            dump_config(d.path(), &config_path, &[], &[]),
+            2,
+            "--dump-config reported the config good, but start exits 2 on it"
+        );
     }
 
     #[test]
