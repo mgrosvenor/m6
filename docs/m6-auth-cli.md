@@ -62,7 +62,6 @@ The argument count is checked next: a call with fewer than three arguments print
 An unknown entity or command also exits 2, after the config file is read and the database is opened.
 
 `--json` on an `ls` command prints JSON in place of the table.
-A flag that a command does not use is accepted and ignored.
 
 The config file named by the first argument is the subject of section 3.
 
@@ -137,7 +136,7 @@ Group commands follow the same pattern, and section 5 gives them.
 
 Six commands create groups, delete them and move users in and out.
 Table 4 gives them.
-Take from it that `group ls` counts the members, and the member commands name a group and a user.
+Take from it that `group ls` counts the members, and only `group member add` and `group member del` take a user.
 
 | command | what it does |
 |---|---|
