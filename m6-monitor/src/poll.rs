@@ -81,7 +81,7 @@ impl NodeReading {
 /// One agent per node, reused for both of that node's requests.
 ///
 /// It was one agent per *request*, which meant a cold TLS handshake for each.
-/// Measured from the build host: 26ms to origin, 603ms to edge-b, 828ms to edge-a, and
+/// A cold handshake over a long path can take hundreds of milliseconds, and
 /// that is the handshake, not the node. Two requests per node paid it twice.
 ///
 /// Not shared across nodes, because ureq pools per host anyway and a shared

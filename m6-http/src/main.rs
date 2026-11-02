@@ -424,16 +424,8 @@ fn make_quiche_config(server_config: &config::ServerConfig) -> anyhow::Result<qu
     // marked temporary from the day it shipped, and certificate compression below is
     // what removes the need for it.
     //
-    // Measured against the staging origin, same probe and path, only compression
-    // changing. The client sends 2467 bytes, so the budget is 3600:
-    //
-    //     no compression    server sent 4081B   stalls at 3600, +5.07ms, 4 datagrams
-    //     brotli            server sent 2859B   no stall, 3 datagrams, 1.16x
-    //
-    // 2859 against 3600 leaves room for a chain that grows, and the handshake now
-    // completes in one round trip while satisfying RFC 9000 8.1 rather than
-    // deviating from it. Both numbers are the whole server flight before the
-    // address is validated, not the certificate alone.
+    // The budget is 3 times the bytes received. A client's opening Initial is
+    // padded to 1200 bytes, so the budget is 3600.
     //
     // The flight is brotli, not zlib, and that is deliberate: see the comment on
     // the zlib registration in the quiche fork. Offering zlib breaks any peer that
@@ -479,10 +471,9 @@ fn make_quiche_config(server_config: &config::ServerConfig) -> anyhow::Result<qu
     // ── HELD BACK, one line, pending a fix in the quiche fork ─────────────────
     //
     // Everything above and the two gates in `handle_h3_request` are finished and
-    // were verified on staging: `m6-probe-h3 --0rtt /` confirmed the request went
-    // out before the handshake completed, a cached path answered 200 in early
-    // data, and an uncached one answered 425. Over a real 5.1ms path it answered
-    // in 6.0-6.7ms where h2 needs roughly 16ms.
+    // were verified with `m6-probe-h3 --0rtt /`: the
+    // request went out before the handshake completed, a cached path answered
+    // 200 in early data, and an uncached one answered 425.
     //
     // It is not enabled because it costs a conformance test, isolated by running
     // the gate with this line in and out while changing nothing else:
@@ -563,10 +554,6 @@ fn make_quiche_config(server_config: &config::ServerConfig) -> anyhow::Result<qu
     //     brotli        2258 bytes  66%
     //     zstd          2308 bytes  67%
     //     zlib          2359 bytes  69%
-    //
-    // Measured end to end on staging: the whole server flight went from 4081 bytes
-    // to 2859 with brotli, a 1222-byte saving, and that is what deletes the
-    // amplification factor override above.
     //
     // Verified against third parties too, which is what proved our client really
     // advertises rather than merely supports: Cloudflare's flight went from 4198 to
@@ -981,8 +968,7 @@ fn event_loop(
                         // Ready, so that callback never fires and no miss was
                         // ever recorded on the origin.
                         //
-                        // Measured consequence on the live origin, every
-                        // window for days: cache_misses=0, miss_p50_ns=0, and
+                        // The consequence: cache_misses=0, miss_p50_ns=0, and
                         // cache_hit_rate=1.0000 -- not a hit rate at all, but
                         // "of the requests that were counted, all were hits",
                         // because misses were never in the denominator.
@@ -1259,40 +1245,10 @@ fn event_loop(
                     if let RequestOutcome::Ready(status, ref mut headers, _, ref backend) = outcome
                     {
                         set_alt_svc(headers, quic_port);
-                        // /health and /perf are separated inside
-                        // `Stats::record` now, not skipped here. See the
-                        // monitoring block in stats.rs: they are counted
-                        // apart from site traffic rather than discarded, so
-                        // requests_total is still a traffic-stall signal.
-                        // Record the cache MISS.
-                        //
-                        // This was missing, and the omission was invisible
-                        // because of where the only other miss-recording site
-                        // sits: the async URL-backend callback below. A cache
-                        // node's backend is the origin over h2c, which is
-                        // always async, so misses were counted there. The
-                        // ORIGIN's backends are unix sockets that complete
-                        // synchronously inside handle_request and return
-                        // Ready, so that callback never fires and no miss was
-                        // ever recorded on the origin.
-                        //
-                        // Measured consequence on the live origin, every
-                        // window for days: cache_misses=0, miss_p50_ns=0, and
-                        // cache_hit_rate=1.0000 -- not a hit rate at all, but
-                        // "of the requests that were counted, all were hits",
-                        // because misses were never in the denominator.
-                        // requests_total undercounted by every miss, and
-                        // backend_errors_total could never rise on the origin
-                        // at all, since is_backend_error is only passed here
-                        // and in the async callback. A 500 from m6-html was
-                        // uncountable.
-                        //
-                        // Ready only. A Pending outcome is a URL backend whose
-                        // completion callback records it; recording here too
-                        // would double-count every edge miss.
-                        //
-                        // HTTP/3 already did this correctly, which is why the
-                        // gap survived: any check of the h3 path looked fine.
+                        // Same two notes as the HTTP/1.1 path above: /health and
+                        // /perf are separated inside `Stats::record`, and this
+                        // Ready path records the cache miss itself because the
+                        // async URL-backend callback never runs for it.
                         let elapsed_ns = start.elapsed().as_nanos() as u64;
                         // h2c is HTTP/2 by definition; the interface class comes
                         // from its bind address (the private backbone here).
@@ -2367,19 +2323,18 @@ fn www_redirect(req: &forward::HttpRequest, config: &config::Config) -> Option<R
 
 /// Build the synthetic GET used for a background cache fill.
 ///
-/// **The `Accept-Encoding` header is load-bearing.** The encoding is also
-/// passed separately to `handle_request` as the cache-key component, so
-/// omitting it here does not produce a miss -- it produces something worse: the
-/// backend, seeing no `Accept-Encoding`, returns an identity body, which is
-/// then stored under the key that promises the *encoded* variant. Every
-/// subsequent hit on that key serves an uncompressed body to a client that
-/// asked for a compressed one.
+/// **The `Accept-Encoding` header must match the cache key.** The encoding is
+/// also passed separately to `handle_request` as the cache-key component, so
+/// omitting it here produces something worse than a miss: the backend, seeing
+/// no `Accept-Encoding`, returns an identity body, which is then stored under
+/// the key that promises the *encoded* variant. Every subsequent hit on that
+/// key serves an uncompressed body to a client that asked for a compressed one.
 ///
-/// That was live: `style.css` was served to browsers at 44KB instead of 7KB
-/// brotli, and it re-poisoned itself every 60s, because each stale-while-
-/// revalidate refresh rewrote the entry with another identity body. Small
-/// assets hid it (identity and compressed sizes are close), so only the
-/// stylesheet showed the damage.
+/// The defect is easy to miss: a large stylesheet was served to browsers at
+/// 44KB instead of 7KB brotli, and it re-poisoned itself every 60s, because
+/// each stale-while-revalidate refresh rewrote the entry with another identity
+/// body. Small assets hid it (identity and compressed sizes are close), so only
+/// the stylesheet showed the damage.
 fn synth_refresh_request(r: &Refresh) -> forward::HttpRequest {
     let headers = if r.enc.is_empty() {
         Vec::new()
@@ -2404,9 +2359,9 @@ fn synth_refresh_request(r: &Refresh) -> forward::HttpRequest {
 /// populating itself, gets a compressed body with nothing saying the body
 /// depends on `Accept-Encoding`. That is the worse of the two orderings.
 ///
-/// The header belongs on all four server paths and on all eleven of
-/// `handle_request_inner`'s `Ready` returns, so it is applied once here rather
-/// than at each site, where a twelfth return would silently miss it.
+/// The header belongs on every server path and every `Ready` return from
+/// `handle_request_inner`, so it is applied once here rather than at each
+/// site, where a new return would silently miss it.
 ///
 /// Applying it *after* the inner call is deliberate. `handle_request_inner`
 /// inserts into the cache itself, so `should_cache` still inspects the exact
@@ -3336,19 +3291,18 @@ fn set_alt_svc(headers: &mut Vec<(String, String)>, quic_port: u16) {
 ///
 /// Same duplication hazard as `set_alt_svc`: a cache node's cached headers are
 /// whatever its own upstream (origin) sent, and origin adds this same header on
-/// its own cache hits — so a cache node replaying a cache hit of its own would
+/// its own cache hits, so a cache node replaying a cache hit of its own would
 /// otherwise double it up. Hence collapsing to one header rather than pushing.
 ///
-/// This merges rather than overwrites, and that distinction is load-bearing.
-/// It previously dropped every existing `Vary` and wrote `Accept-Encoding` in
-/// its place, which was harmless only because it ran solely on the cache-hit
-/// path — where `should_cache` had already refused anything varying on more
-/// than encoding. It is now also called on the miss path, ahead of nothing:
-/// an overwriting version would rewrite a backend's `Vary: Cookie` to
-/// `Vary: Accept-Encoding`, `should_cache` would see a cacheable response, and
-/// one client's private variant would be stored and replayed to everyone.
-/// Preserving the other field names keeps that response uncacheable, which is
-/// the whole reason `should_cache` inspects `Vary` at all.
+/// This merges the field names. It previously dropped every existing `Vary` and
+/// wrote `Accept-Encoding` in its place, which was harmless while it ran solely
+/// on the cache-hit path. It is now also called on the miss path, after
+/// `handle_request_inner` has made the local cache decision. An overwriting
+/// version would send a backend's `Vary: Cookie` to the client as
+/// `Vary: Accept-Encoding`, so a downstream shared cache could store one
+/// client's private variant and replay it to everyone. Preserving the other
+/// field names keeps that response uncacheable downstream, the same rule
+/// `should_cache` applies locally.
 fn set_vary_accept_encoding(headers: &mut Vec<(String, String)>, backend_compresses: bool) {
     // A backend that does not compress has exactly ONE representation, so there
     // is no encoding dimension to vary on and saying otherwise is a promise of
