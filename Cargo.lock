@@ -1825,6 +1825,7 @@ dependencies = [
  "m6-auth",
  "m6-core",
  "nix 0.27.1",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",

@@ -1,7 +1,8 @@
 //! The authentication service.
 //!
-//! An `App` service with one shared value: the database, the signing keys, the
-//! token lifetimes and the rate limiter. Four routes, all literal paths.
+//! An `App` service with two state layers: one database connection per worker
+//! thread, and the signing keys, token lifetimes and rate limiter shared by
+//! all of them. Four routes, all literal paths.
 //!
 //! This file used to be 246 lines of CLI parsing, logging setup, socket bind
 //! and permissions, an accept loop, and a `thread::spawn` per connection. All
@@ -32,7 +33,7 @@ use handlers::AppState;
 use keys::KeyMaterial;
 use rate_limit::RateLimiter;
 
-/// Build the shared state: config, keys, database, rate limiter.
+/// Build the state every worker shares: config, keys, rate limiter.
 ///
 /// Returns `Err` rather than exiting, so `App` reports it the same way it
 /// reports every other startup failure.
@@ -51,7 +52,10 @@ fn build_state(ctx: &AppContext) -> Result<AppState> {
         std::fs::create_dir_all(parent)
             .map_err(|e| Error::Other(anyhow::Error::new(e).context("creating db directory")))?;
     }
-    let db = m6_auth::Db::open(&cfg.db_path)
+    // Opened once here, then dropped: a path that cannot be opened or a
+    // schema that cannot be applied fails startup with a message. Each worker
+    // opens its own connection below.
+    m6_auth::Db::open(&cfg.db_path)
         .map_err(|e| Error::Other(anyhow::anyhow!("opening auth database: {e}")))?;
 
     // Swapped by `reload_state` on a rotation, so a rotation needs no restart.
@@ -60,7 +64,6 @@ fn build_state(ctx: &AppContext) -> Result<AppState> {
     tracing::info!(issuer = %cfg.issuer, "auth config loaded");
 
     Ok(AppState {
-        db: Mutex::new(db),
         keys,
         access_ttl: cfg.access_ttl,
         refresh_ttl: cfg.refresh_ttl,
@@ -73,6 +76,17 @@ fn build_state(ctx: &AppContext) -> Result<AppState> {
             cfg.rate_limit_window_secs,
         )),
     })
+}
+
+/// One database connection for the worker thread that opens it.
+///
+/// `App` calls this once per worker thread, before that thread's first
+/// request. Every connection to one file must use the same journal mode, and
+/// `m6_auth::Db::open` is the one place that sets WAL, the busy timeout and
+/// foreign keys, so every connection goes through it.
+fn open_worker_db(_config: &Map<String, Value>, state: &AppState) -> Result<m6_auth::Db> {
+    m6_auth::Db::open(&state.db_path)
+        .map_err(|e| Error::Other(anyhow::anyhow!("opening auth database: {e}")))
 }
 
 /// Re-read the signing keys when the service's config is touched.
@@ -138,29 +152,38 @@ fn peer_ip(req: &Request) -> String {
 /// security-carrying part of this service (rate limiting, JWT minting, cookie
 /// flags), and a migration is the wrong time to rewrite them. `RawResponse`
 /// lifts into `Response` verbatim.
+///
+/// The route receives the shared state and the worker's own `Db`, in that
+/// order, which is the shape `App::with_state` hands a handler.
 macro_rules! route {
     ($app:expr, $method:ident, $path:literal, $f:expr) => {
-        $app.$method($path, move |req: &Request, state: &AppState| {
-            let f: fn(&Request, &AppState, &str) -> RawResponse = $f;
-            Ok(f(req, state, &peer_ip(req)).into())
-        })
+        $app.$method(
+            $path,
+            move |req: &Request, state: &AppState, db: &mut m6_auth::Db| {
+                let f: fn(&Request, &AppState, &m6_auth::Db, &str) -> RawResponse = $f;
+                Ok(f(req, state, db, &peer_ip(req)).into())
+            },
+        )
     };
 }
 
 fn main() -> anyhow::Result<()> {
-    let app = App::with_global(build_state).on_reload(reload_state);
-    let app = route!(app, route_post, "/auth/login", |req, state, ip| {
-        handlers::dispatch_login(req.raw(), state, ip)
+    let app = App::with_state(build_state, open_worker_db).on_reload(reload_state);
+    let app = route!(app, route_post, "/auth/login", |req, state, db, ip| {
+        handlers::dispatch_login(req.raw(), state, db, ip)
     });
-    let app = route!(app, route_post, "/auth/refresh", |req, state, _ip| {
-        handlers::dispatch_refresh(req.raw(), state)
+    let app = route!(app, route_post, "/auth/refresh", |req, state, db, _ip| {
+        handlers::dispatch_refresh(req.raw(), state, db)
     });
-    let app = route!(app, route_post, "/auth/logout", |req, state, _ip| {
-        handlers::dispatch_logout(req.raw(), state)
+    let app = route!(app, route_post, "/auth/logout", |req, state, db, _ip| {
+        handlers::dispatch_logout(req.raw(), state, db)
     });
-    let app = route!(app, route_get, "/auth/public-key", |_req, state, _ip| {
-        handlers::dispatch_public_key(state)
-    });
+    let app = route!(
+        app,
+        route_get,
+        "/auth/public-key",
+        |_req, state, _db, _ip| { handlers::dispatch_public_key(state) }
+    );
     app.run()?;
     Ok(())
 }

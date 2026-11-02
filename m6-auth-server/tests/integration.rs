@@ -2,6 +2,7 @@ use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
 use m6_core::testkit::{assert_app_lifecycle, binary, wait, Service};
@@ -70,6 +71,10 @@ path = "{}"
 access_ttl  = 900
 refresh_ttl = 2592000
 issuer      = "test.example.com"
+
+[thread_pool]
+size = 4
+queue_size = 32
 
 [keys]
 private_key = "{}"
@@ -785,4 +790,179 @@ fn a_mismatched_key_pair_is_refused_and_the_matching_one_lands_on_retry() {
         "the matching pair never loaded on the retry\n--- output ---\n{}",
         guard.output()
     );
+}
+
+// ─── Database concurrency ────────────────────────────────────────────────────
+
+/// Take the database's write lock until the returned value is dropped.
+///
+/// A login that reaches `refresh_token_store` waits on this. Reads still work,
+/// because `Db::open` puts every connection in WAL mode.
+fn hold_write_lock(db_path: &Path) -> rusqlite::Connection {
+    let conn = rusqlite::Connection::open(db_path).expect("open the database for the write lock");
+    conn.busy_timeout(Duration::from_secs(5))
+        .expect("set the busy timeout");
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .expect("take the database write lock");
+    conn
+}
+
+/// Three logins waiting on a database write must not block a refresh that only
+/// reads.
+///
+/// The write lock is held from outside the service, so the logins cannot
+/// finish while it is held. The refresh must answer anyway. With one
+/// `Mutex<Db>` for the whole service, the refresh queued behind the logins and
+/// the read below timed out.
+#[test]
+fn parallel_logins_do_not_serialise_behind_one_connection() {
+    let env = setup_test_env("db-concurrency");
+    seed_user(&env.site_dir, "alice", "correct_pass");
+    let _guard = spawn_server(&env);
+
+    // One login first, to have a refresh token before any lock is held.
+    let login_body = r#"{"username":"alice","password":"correct_pass"}"#;
+    let resp = http_request_with_body(
+        &env.socket_path,
+        "POST",
+        "/auth/login",
+        "application/json",
+        login_body,
+    );
+    assert_eq!(parse_status(&resp), 200, "the seeding login failed\n{resp}");
+    let body_start = resp.find("\r\n\r\n").map(|i| i + 4).unwrap_or(resp.len());
+    let json: serde_json::Value = serde_json::from_str(&resp[body_start..]).expect("login JSON");
+    let refresh_token = json["refresh_token"]
+        .as_str()
+        .expect("refresh_token in the login response")
+        .to_string();
+
+    let write_lock = hold_write_lock(&env.site_dir.join("data/auth.db"));
+
+    // Three logins at once. Each reaches `refresh_token_store` and waits for
+    // the write lock.
+    let mut logins = Vec::new();
+    for _ in 0..3 {
+        let mut stream = UnixStream::connect(&env.socket_path)
+            .unwrap_or_else(|e| panic!("connect {:?}: {}", env.socket_path, e));
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let request = format!(
+            "POST /auth/login HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            login_body.len(),
+            login_body
+        );
+        stream.write_all(request.as_bytes()).unwrap();
+        logins.push(stream);
+    }
+    // Let the pool dispatch all three and reach the write.
+    std::thread::sleep(Duration::from_millis(300));
+
+    // The overlap assertion. This refresh only reads, so it must answer while
+    // the three logins are still inside their handlers. It needs no wall-clock
+    // threshold: the logins cannot finish until the lock below is dropped, so
+    // the only thing that decides this is whether the refresh waits behind
+    // them.
+    let refresh_body = serde_json::json!({ "refresh_token": refresh_token }).to_string();
+    let refresh_request = format!(
+        "POST /auth/refresh HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        refresh_body.len(),
+        refresh_body
+    );
+    let refresh_resp = http_request(&env.socket_path, &refresh_request);
+    assert_eq!(
+        parse_status(&refresh_resp),
+        200,
+        "a refresh could not read while logins waited on a write\n{refresh_resp}"
+    );
+
+    drop(write_lock);
+
+    for mut stream in logins {
+        let resp = m6_core::testkit::read_one(&mut stream, "POST").expect("read a login response");
+        let resp = String::from_utf8_lossy(&resp).into_owned();
+        assert_eq!(
+            parse_status(&resp),
+            200,
+            "a login failed after the write lock was released\n{resp}"
+        );
+    }
+}
+
+/// Workers open their connections at once on an empty database. The schema
+/// batch runs in every open, so this asserts that every open succeeds, that
+/// the result is one whole schema, and that every connection can use it.
+#[test]
+fn workers_opening_an_empty_database_at_once_produce_one_schema() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let db_path = temp.path().join("auth.db");
+
+    const WORKERS: usize = 8;
+    let barrier = Arc::new(Barrier::new(WORKERS));
+    let handles: Vec<_> = (0..WORKERS)
+        .map(|_| {
+            let path = db_path.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                m6_auth::Db::open(&path)
+            })
+        })
+        .collect();
+
+    let mut dbs = Vec::new();
+    for handle in handles {
+        let db = handle
+            .join()
+            .expect("a worker thread panicked")
+            .expect("a worker could not open an empty database");
+        dbs.push(db);
+    }
+
+    // Every connection sees the one schema: a read succeeds on each.
+    for db in &dbs {
+        assert_eq!(
+            db.user_get("nobody")
+                .expect("read the users table from a worker connection")
+                .map(|u| u.username),
+            None,
+            "a worker connection cannot see the schema"
+        );
+    }
+
+    // A row written through one worker is visible through another.
+    dbs[0]
+        .user_create("alice", "password", &["user"])
+        .expect("create a user through a worker connection");
+    assert_eq!(
+        dbs[WORKERS - 1]
+            .user_get("alice")
+            .expect("read the new user from another worker connection")
+            .map(|u| u.username)
+            .as_deref(),
+        Some("alice")
+    );
+
+    // One schema, whole: exactly the five tables the batch creates, in WAL.
+    let conn =
+        rusqlite::Connection::open(&db_path).expect("open the database for the schema check");
+    let tables: rusqlite::Result<Vec<String>> = {
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .expect("prepare the schema query");
+        let rows = stmt
+            .query_map([], |row| row.get(0))
+            .expect("query the schema");
+        rows.collect()
+    };
+    assert_eq!(
+        tables.expect("read the table names").join(","),
+        "api_tokens,groups,memberships,refresh_tokens,users",
+        "the schema batch did not land once and whole"
+    );
+    let journal_mode: String = conn
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .expect("read the journal mode");
+    assert_eq!(journal_mode, "wal", "a connection is not in WAL mode");
 }
