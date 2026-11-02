@@ -245,7 +245,7 @@ Start m6-auth-server after the database exists.
 [`m6-auth.md`](m6-auth.md) owns the key paths and the rest of the m6-auth-server config.
 
 Example 04 in [`m6-user-guide.md`](m6-user-guide.md) wraps the same steps in a setup script.
-Its key commands write the SEC1 form, so add the `openssl pkcs8` step from section 4.3 of that page.
+Its key commands write the SEC1 form, so add the `openssl pkcs8` step from `m6-auth.md` section 4.3.
 Section 9 names the documents that own the rest.
 
 ## 9. Where to read next
