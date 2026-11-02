@@ -135,7 +135,7 @@ The fields map to the `groups` row, and `members` comes from a join.
 `members` holds usernames, is filled on every read, and is empty for a new group.
 
 Table 4 gives the eight group operations.
-Take from it that a read returns `None` for an absent name, and a membership call names a missing group or user with `GroupNotFound` or `UserNotFound`.
+Take from it that `group_get` returns `None` for an absent name, `group_create` returns `GroupExists` for a taken name, and the calls that name a missing group or user return `GroupNotFound` or `UserNotFound`.
 
 | method | signature | what it does |
 |---|---|---|
