@@ -2,13 +2,11 @@
 
 m6-md converts a directory of Markdown files into one *JSON* (JavaScript Object Notation) document that an m6 route serves as params.
 It is a member of the m6 workspace at `m6-md/`, built by `cargo build --workspace`, and it runs as a command-line tool that writes one file and exits.
-This page covers the command line, the input files, the frontmatter, the output file, watch mode and the route that serves the output.
-The last three sections give the exit codes, the limits and the documents that own the surrounding subjects.
 Where this page and the code disagree, the code is right and this page is a defect.
 
 ## 1. How to read this page
 
-This page describes one binary in four parts: how it is invoked, what it reads, what it writes, and how a site serves the result.
+The page is one binary's reference, and the list below links every section.
 The nine sections after this one are:
 
 2. [The command line](#2-the-command-line)
@@ -21,7 +19,7 @@ The nine sections after this one are:
 9. [Limits](#9-limits)
 10. [Summary](#10-summary)
 
-A reader who needs the behaviour can read `m6-md/src/main.rs`, which is one file and the authority for every claim here.
+The source for every claim here is `m6-md/src/main.rs`.
 
 ## 2. The command line
 
@@ -38,7 +36,7 @@ m6-md <input-dir> --output <file> [--log-level <level>] [--watch] [--touch <path
 | `--output <file>` | yes | Path of the JSON file to write. |
 | `--log-level <level>` | no | Log filter directive, default `info`. An invalid value falls back to `info`. |
 | `--watch` | no | Stay running and regenerate the output on every `.md` change. |
-| `--touch <path>` | no | With `--watch`, touch this file after each successful regeneration. |
+| `--touch <path>` | no | With `--watch`, touch this file after a change triggers a regeneration. |
 | `--version`, `-V` | no | Print the m6-md version and exit 0. |
 
 **Table 1: every command-line argument and flag, whether it is required, and what it does.** The version flag writes no file.
@@ -73,7 +71,7 @@ Take from it that both keys are optional and each has a default taken from the f
 | `title` | string | the file stem with each hyphen replaced by a space | Display title |
 | `date` | string, or a TOML date or datetime | the file's modification time as `YYYY-MM-DD` in *UTC* (Coordinated Universal Time) | Sort key |
 
-**Table 2: the two frontmatter keys m6-md reads, their types and their defaults.** A value of the wrong type is ignored and the default applies.
+**Table 2: the two frontmatter keys m6-md reads, their types and their defaults.**
 
 A value of the wrong type falls back to the default, and the run continues.
 Every other key is converted to a JSON value and copied into the output document: a string stays a string, an array stays an array, a table becomes an object, and a TOML datetime becomes a string.
@@ -93,11 +91,11 @@ Take from it that `path` is the stem with a leading slash, and a site that serve
 |---|---|
 | `stem` | The file name without its extension: `hello-world.md` gives `hello-world` |
 | `path` | `/` followed by the stem: `/hello-world` |
-| `title` | The frontmatter `title`, or the stem with each hyphen replaced by a space |
-| `date` | The frontmatter `date`, or the file's modification time as `YYYY-MM-DD` |
+| `title` | The frontmatter `title`, or the default in Table 2 |
+| `date` | The frontmatter `date`, or the default in Table 2 |
 | `body` | The Markdown after the frontmatter, rendered to *HTML* (HyperText Markup Language) |
 
-**Table 3: the five fields m6-md writes into every document.** Every frontmatter key other than `title` and `date` sits beside them.
+**Table 3: the five fields m6-md writes into every document.**
 
 The array is sorted by `date` descending, compared as text, and two documents with the same date are sorted by `stem` ascending.
 `body` is rendered by comrak with tables, strikethrough, autolinks, task lists, footnotes and emoji shortcodes enabled, and raw HTML in the source passes through.
@@ -136,13 +134,12 @@ The order of the array is the order a site lists its posts in, and section 6 cov
 ## 6. Watch mode
 
 `--watch` keeps m6-md resident and regenerates the output whenever a `.md` file in the input directory changes.
-The first pass runs before the watcher starts, so a site that is already up gets a current file at once.
+The first pass runs once before the watcher starts and writes the output file.
+It does not touch the `--touch` path, so a site that is already up keeps its old params until the next `.md` change or a manual `site.toml` touch.
 
 The watcher covers the input directory itself and reacts to create, modify and remove events on paths that end in `.md`.
 After a relevant event it waits 50 milliseconds and drains the queue, so an editor that deletes and renames a file counts as one change.
 A regeneration that fails is logged and retried on the next change, and the process stays up.
-A regeneration that succeeds touches the path given to `--touch`, which opens that file for writing without truncating it.
-`--touch` acts in watch mode only, after a regeneration, so a single pass touches nothing.
 
 The process shuts down on the first `SIGTERM` or `SIGINT` after a clean stop and exits immediately on a second, with exit code 0 either way.
 Section 7 shows how a running site uses `--touch` to learn that a post changed.
@@ -176,8 +173,8 @@ A template finds its post in the array and answers 404 when the lookup returns n
 `not_found()` makes the render return the not-found result that m6-html turns into a 404.
 The index links each post with `/blog/{{ doc.stem }}`, because `path` carries no `/blog` prefix.
 
-After a regeneration that leaves the cache alone, m6-http serves the previous page until the entry expires or the cache is cleared.
-A `site.toml` change clears the cache, which is why the example runs m6-md with `--touch site.toml`.
+A static params file is read once when m6-html builds its routes, so a running renderer keeps serving the old document array until a reload rebuilds it.
+The example runs m6-md with `--watch --touch site.toml`, so a successful regeneration in the watch loop touches the file, which makes the renderer rebuild.
 [`m6-http.md`](m6-http.md) owns the cache and its clearing rules, and Example 02 in [`m6-user-guide.md`](m6-user-guide.md) is the full site with both templates.
 Section 8 gives the exit codes a run can return.
 
@@ -192,11 +189,10 @@ Take from it that a usage mistake exits 2 and every failure during a run exits 1
 | 1 | A runtime failure: the input directory is missing or is a file, the output path's parent directory is missing, a source file cannot be read, a frontmatter block is malformed, the output cannot be written, or the watcher cannot start |
 | 2 | A usage error: `<input-dir>` or `--output` is missing, a flag has no value, a flag is unknown, or a second positional argument is given |
 
-**Table 4: the three exit codes and the conditions behind each.** A malformed frontmatter block is a runtime failure, so it exits 1.
+**Table 4: the three exit codes and the conditions behind each.**
 
 A malformed frontmatter block stops the run with the file named in the message, and the frontmatter parser adds the position of the error.
 A source file that cannot be read stops the run at that file, and the run writes no output file.
-Errors go to stderr as plain text, and the log on stdout carries the successful steps of the run.
 
 The codes separate a wrong invocation from a failed run, and the message names the file that failed.
 Section 9 lists what m6-md leaves out.
@@ -204,7 +200,6 @@ Section 9 lists what m6-md leaves out.
 ## 9. Limits
 
 Four limits follow from reading one directory and writing one file.
-The list below says what each one means for a site.
 
 - **One directory level.**
   A nested collection needs one m6-md run per directory and one output file per run.
@@ -224,7 +219,7 @@ The command line has two required arguments and four optional flags, the frontma
 Watch mode keeps the file current, and `--touch` is what tells a running site to reload.
 
 Table 5 gives the documents that own what this page leaves out.
-Take from it that the source is the authority and the user guide is the worked example.
+Take from it that every subject here has one owner.
 
 | document | what it owns |
 |---|---|
@@ -235,6 +230,6 @@ Take from it that the source is the authority and the user guide is the worked e
 | [`m6-http.md`](m6-http.md) | the cache, and when a change clears it |
 | [`m6-testing.md`](m6-testing.md) | how the workspace's tests run |
 
-**Table 5: the documents that own the code and the surrounding subjects.** The first two rows are the source this page was checked against.
+**Table 5: the documents that own the code and the surrounding subjects.**
 
-A reader who needs the behaviour can read that one file in full.
+The tool, its output and the route that serves it are the whole subject, and Table 5 is where the next question goes.
