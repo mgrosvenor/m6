@@ -1992,8 +1992,8 @@ fn main() {
     // 2026-09-15. `default_provider()` appears further up in
     // `supported_verify_schemes`, but that builds a provider and drops it; the
     // builder needs the INSTALLED one. m6-http's own main, m6-bench,
-    // m6-bench-coldstart and bench-url-backend all install it here and this one
-    // was simply missed.
+    // the cold-start bench and bench-url-backend all install it here and this
+    // one was simply missed.
     //
     // The consequence was worse than a broken tool. With our own client
     // panicking, handshake timing got measured with h3spec instead -- a

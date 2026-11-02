@@ -19,10 +19,6 @@ name = "m6-bench-detail"
 path = "src/bench_detail.rs"
 
 [[bin]]
-name = "m6-bench-coldstart"
-path = "src/bench_coldstart.rs"
-
-[[bin]]
 name = "bench-url-backend"
 path = "src/bench_url_backend_main.rs"
 
@@ -116,10 +112,6 @@ rustls-pki-types = "1"
 rustls-native-certs = "0.8"
 webpki-roots   = "0.26"
 rand           = "0.8"
-h2             = "0.4"
-tokio          = { version = "1", features = ["rt", "net", "io-util", "macros"] }
-tokio-rustls   = "0.26"
-http           = "1"
 httpdate       = "1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -135,7 +127,17 @@ filetime      = "0.2"
 anyhow        = "1"
 criterion     = { version = "0.5", features = ["html_reports"] }
 rcgen         = "0.13"
+# The cold-start bench is the only user of these four. A [[bin]] cannot use
+# dev-dependencies, so the bench is a [[bench]] and they live here.
+h2             = "0.4"
+tokio          = { version = "1", features = ["rt", "net", "io-util", "macros"] }
+tokio-rustls   = "0.26"
+http           = "1"
 
 [[bench]]
 name    = "critical_path"
+harness = false
+
+[[bench]]
+name    = "bench_coldstart"
 harness = false

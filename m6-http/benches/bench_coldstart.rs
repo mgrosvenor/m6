@@ -1130,7 +1130,7 @@ fn main() {
     let args = Args::parse();
 
     println!(
-        "m6-bench-coldstart  target={}  html={}  n={}  warmup={}  skip-verify={}",
+        "bench_coldstart  target={}  html={}  n={}  warmup={}  skip-verify={}",
         args.addr, args.html, args.n, args.warmup, args.skip_verify
     );
     println!("Cold-start: new connection per page load (HTML + all linked assets)");
