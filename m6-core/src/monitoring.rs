@@ -1316,13 +1316,6 @@ pub struct CrawlerReport {
     pub first_seen: String,
     #[serde(default)]
     pub last_seen: String,
-    /// The domain this user agent says it belongs to, from the URL or address
-    /// it carries. Empty when it names none, which is itself a weaker claim.
-    ///
-    /// Carried rather than re-derived by the aggregator so that the claim and
-    /// the request counts come from the same parse of the same line.
-    #[serde(default)]
-    pub claimed_domain: String,
 }
 
 impl TrafficReport {
@@ -1390,8 +1383,6 @@ impl TrafficReport {
                     paths: c.paths.iter().map(|(p, _)| p.clone()).collect(),
                     first_seen: c.first_seen.clone(),
                     last_seen: c.last_seen.clone(),
-                    claimed_domain: crate::telemetry::claimed_domain(&c.user_agent)
-                        .unwrap_or_default(),
                 })
                 .collect(),
             forged_bot_requests: summary.forged_bot_requests,

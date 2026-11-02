@@ -18,7 +18,7 @@ Work happens on `develop`.
 **Each crawler sighting on `/traffic` and in the monitor report now carries the time it was first and last seen, and the monitor checks each address behind a sighting against the method the crawler's operator documents. A reverse DNS name counts only when resolving it forward returns the address (#205).**
 
 The new JSON fields are additive.
-`CrawlerReport` gains `first_seen`, `last_seen` (RFC 3339 UTC) and `claimed_domain`, all `serde(default)`, so a node older than these fields still parses and an aggregator newer than a node reads an empty string as "not reported".
+`CrawlerReport` gains `first_seen` and `last_seen` (RFC 3339 UTC), both `serde(default)`, so a node older than these fields still parses and an aggregator newer than a node reads an empty string as "not reported".
 No existing field changes, so no migration is needed.
 
 ### Added
@@ -43,11 +43,18 @@ One deadline covers both lookups.
 At most `MAX_LOOKUP_THREADS` (8) lookup threads are alive at once, counting threads abandoned at their deadline.
 A lookup that finds no free slot returns `Ptr::Failed` at once without starting a thread.
 Lookups run in the monitor only, never on the serving path, and add no dependency.
+
+**The monitor's poller makes the lookups, and `/check` only reads them.**
+After each fleet poll the poller looks up at most `MAX_LOOKUPS_PER_POLL` (8) addresses it has no stored result for, before it takes the snapshot's write lock.
+A completed result is kept for one hour and a failed one for five minutes, and at most 512 addresses are kept.
+An address past the cap, or not yet reached, reads `not looked up yet  UNVERIFIED` until a later poll covers it.
+`check::render` takes the stored results as data and resolves nothing, so a resolver that never answers delays the next poll by at most 16 seconds and never a request to `/check`.
+`--check` makes its own lookups under the same cap.
 `telemetry::CrawlerVerdict` gains `ForwardMismatch`, so a `match` over it needs a new arm.
 
 ### Verified
 
-- Unit tests with stub resolvers cover a confirmed name, a PTR whose forward lookup returns other addresses, a name with no forward answer, a failed forward lookup, no PTR, a resolver that never answers, and the thread bound (eight blocked lookups, then fifty more that return at once and start no thread, then slots free again).
+- Unit tests with stub resolvers cover a confirmed name, a PTR whose forward lookup returns other addresses, a name with no forward answer, a failed forward lookup, no PTR, a name with no address (EAI_NONAME and EAI_NODATA), a slot free by the time the caller has the result, the per-poll lookup cap, expiry and cache bound, a report that reads stored results and resolves nothing, a resolver that never answers, and the thread bound (eight blocked lookups, then fifty more that return at once and start no thread, then slots free again).
 - No test uses a live public name.
 
 ---

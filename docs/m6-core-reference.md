@@ -695,7 +695,7 @@ Both are `serde(default)`, so a node older than the fields still parses.
 endpoint: the node does the analysis and the log stays put. `LoggingHealth::read()`
 with `QUIET_SECONDS` (40) and `is_blind()` is the silent-log fault.
 `NotableClient`, `HeavyHitter`, `CrawlerReport` are its parts.
-`CrawlerReport` carries `first_seen`, `last_seen` and `claimed_domain`, all `serde(default)`.
+`CrawlerReport` carries `first_seen` and `last_seen`, both `serde(default)`.
 
 ### `resolve`
 
@@ -714,7 +714,6 @@ It runs in a monitor and never in a serving path, because a lookup is a network 
 Table 2: the outcomes of a confirmed reverse lookup.
 
 `Ptr::verifies(domain)` matches a name against a domain on a dot boundary, so `example.com.attacker.net` does not match `example.com`.
-`reverse(addr, timeout)` is the PTR half alone.
 `DEFAULT_TIMEOUT` is two seconds and covers both lookups together.
 At most `MAX_LOOKUP_THREADS` (8) lookup threads are alive at once, counting those abandoned at their deadline, and a lookup with no free slot reads `Failed` at once.
 `telemetry::verify_crawler(user_agent, &ptr)` turns a `Ptr` into a `CrawlerVerdict` using the operator's documented method.

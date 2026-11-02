@@ -2006,7 +2006,6 @@ mod tests {
             paths: vec!["/".into(), "/a".into()],
             first_seen: "2026-10-01T09:00:00Z".into(),
             last_seen: "2026-10-01T09:05:00Z".into(),
-            claimed_domain: String::new(),
         }
     }
 

@@ -78,6 +78,9 @@ const DEFAULT_POLL_SECS: u64 = 30;
 struct Snapshot {
     digest: digest::Digest,
     readings: Vec<poll::NodeReading>,
+    /// Reverse-lookup results for the crawler addresses in `readings`, made by
+    /// the poller so that a report only reads them.
+    verdicts: check::Verdicts,
     at: std::time::Instant,
     at_utc: String,
 }
@@ -124,27 +127,38 @@ fn build_state(ctx: &AppContext) -> Result<MonitorState> {
     let history_config = history::config_from(ctx.config.get("monitor"), ctx.site_dir)?;
     let (recorder, handle) = history::start(history_config.clone())?;
     let poller_handle = handle.clone();
-    std::thread::spawn(move || loop {
-        match collect_from(&path, Some((&recorder, &poller_handle))) {
-            Ok((digest, readings)) => {
-                let snap = Snapshot {
-                    digest,
-                    readings,
-                    at: std::time::Instant::now(),
-                    at_utc: m6_core::util::now_iso8601(),
-                };
-                match writer.write() {
-                    Ok(mut g) => *g = Some(snap),
-                    Err(e) => tracing::error!(error = %e, "snapshot lock poisoned"),
+    std::thread::spawn(move || {
+        let mut verdicts = check::VerdictCache::new();
+        loop {
+            match collect_from(&path, Some((&recorder, &poller_handle))) {
+                Ok((digest, readings)) => {
+                    // Lookups happen here, before the write lock is taken, so a
+                    // slow resolver delays the next poll and never a request.
+                    let looked_up = verdicts.refresh(
+                        &readings,
+                        std::time::Instant::now(),
+                        &m6_core::resolve::reverse_confirmed_default,
+                    );
+                    let snap = Snapshot {
+                        digest,
+                        readings,
+                        verdicts: looked_up,
+                        at: std::time::Instant::now(),
+                        at_utc: m6_core::util::now_iso8601(),
+                    };
+                    match writer.write() {
+                        Ok(mut g) => *g = Some(snap),
+                        Err(e) => tracing::error!(error = %e, "snapshot lock poisoned"),
+                    }
                 }
+                // The previous snapshot is KEPT on failure, and its age keeps
+                // growing, which every response reports. Replacing it with an error
+                // would throw away the last known good reading; hiding the failure
+                // would present a stale one as current.
+                Err(e) => tracing::warn!(error = %format!("{e:#}"), "fleet poll failed"),
             }
-            // The previous snapshot is KEPT on failure, and its age keeps
-            // growing, which every response reports. Replacing it with an error
-            // would throw away the last known good reading; hiding the failure
-            // would present a stale one as current.
-            Err(e) => tracing::warn!(error = %format!("{e:#}"), "fleet poll failed"),
+            std::thread::sleep(interval);
         }
-        std::thread::sleep(interval);
     });
 
     Ok(MonitorState {
@@ -205,7 +219,13 @@ fn note_restart_only(state: &MonitorState, ctx: &AppContext) -> Result<()> {
 /// Poll the fleet, print the check, exit 1 on faults.
 fn run_check(config_path: &std::path::Path) -> anyhow::Result<()> {
     let (d, readings) = collect_from(config_path, None)?;
-    print!("{}", check::render(&d, &readings));
+    // One run, one cache: the lookups are capped like a poll's.
+    let verdicts = check::VerdictCache::new().refresh(
+        &readings,
+        std::time::Instant::now(),
+        &m6_core::resolve::reverse_confirmed_default,
+    );
+    print!("{}", check::render(&d, &readings, &verdicts));
     if d.level == digest::Level::Fault {
         std::process::exit(1);
     }
@@ -382,7 +402,7 @@ fn check_text(_req: &Request, st: &MonitorState) -> Result<Response> {
     } else {
         out.push_str(&format!("polled {age:.1}s ago ({})\n", snap.at_utc));
     }
-    out.push_str(&check::render(&snap.digest, &snap.readings));
+    out.push_str(&check::render(&snap.digest, &snap.readings, &snap.verdicts));
     Ok(Response::text(&out))
 }
 

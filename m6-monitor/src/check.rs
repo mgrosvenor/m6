@@ -32,8 +32,99 @@ use std::fmt::Write as _;
 use crate::digest::{Digest, Level};
 use crate::poll::NodeReading;
 
-/// Render the check as text.
-pub fn render(d: &Digest, readings: &[NodeReading]) -> String {
+/// Reverse-lookup results by address, read by [`render`].
+pub type Verdicts = std::collections::HashMap<String, m6_core::resolve::Ptr>;
+
+/// The most new addresses looked up in one poll.
+///
+/// Each lookup can take the full two-second deadline, and they run one after
+/// another on the poller thread, so this bounds how long a poll is held up by
+/// a resolver that never answers: 8 x 2 s. An address past the cap reads
+/// "not looked up" in this poll and is tried in the next.
+pub const MAX_LOOKUPS_PER_POLL: usize = 8;
+
+/// How long a completed lookup is kept before the address is looked up again.
+pub const VERDICT_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// How long a failed lookup is kept. Short, because a failure says nothing
+/// about the address, but long enough that a resolver that never answers is
+/// not asked again at every poll.
+pub const FAILED_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The most addresses kept between polls.
+pub const MAX_CACHED_VERDICTS: usize = 512;
+
+/// Lookup results kept across polls, so a report only reads them.
+///
+/// The poller thread calls [`VerdictCache::refresh`] before it takes the
+/// snapshot's write lock. [`render`] never resolves anything, so `/check`
+/// cannot be stalled by a resolver and cannot hold up the poller.
+#[derive(Default)]
+pub struct VerdictCache {
+    entries: std::collections::HashMap<String, (std::time::Instant, m6_core::resolve::Ptr)>,
+}
+
+impl VerdictCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Look up the crawler addresses in `readings` that are not cached or
+    /// have expired, at most [`MAX_LOOKUPS_PER_POLL`] of them, and return the
+    /// results for every address the report will show.
+    pub fn refresh(
+        &mut self,
+        readings: &[NodeReading],
+        now: std::time::Instant,
+        lookup: &dyn Fn(&str) -> m6_core::resolve::Ptr,
+    ) -> Verdicts {
+        use m6_core::resolve::Ptr;
+        self.entries.retain(|_, (expires, _)| *expires > now);
+        let mut looked_up = 0;
+        let mut out = Verdicts::new();
+        for ip in readings
+            .iter()
+            .filter_map(|r| r.traffic.as_ref())
+            .flat_map(|t| t.crawlers.iter())
+            .flat_map(|c| c.client_ips.iter().take(CHECKED_ADDRESSES))
+        {
+            if out.contains_key(ip) {
+                continue;
+            }
+            if !self.entries.contains_key(ip) && looked_up < MAX_LOOKUPS_PER_POLL {
+                looked_up += 1;
+                let ptr = lookup(ip);
+                let ttl = if ptr == Ptr::Failed {
+                    FAILED_TTL
+                } else {
+                    VERDICT_TTL
+                };
+                if self.entries.len() >= MAX_CACHED_VERDICTS {
+                    // Drop the entry closest to expiry.
+                    if let Some(oldest) = self
+                        .entries
+                        .iter()
+                        .min_by_key(|(_, (e, _))| *e)
+                        .map(|(k, _)| k.clone())
+                    {
+                        self.entries.remove(&oldest);
+                    }
+                }
+                self.entries.insert(ip.clone(), (now + ttl, ptr));
+            }
+            if let Some((_, ptr)) = self.entries.get(ip) {
+                out.insert(ip.clone(), ptr.clone());
+            }
+        }
+        out
+    }
+}
+
+/// How many addresses of one sighting the report checks and shows.
+const CHECKED_ADDRESSES: usize = 3;
+
+/// Render the check as text, with the stored lookup results.
+pub fn render(d: &Digest, readings: &[NodeReading], verdicts: &Verdicts) -> String {
     let mut o = String::with_capacity(4096);
     let bar = "=".repeat(74);
 
@@ -506,11 +597,6 @@ pub fn render(d: &Digest, readings: &[NodeReading]) -> String {
         "\nE. CRAWLERS  (reported every run, even a quiet one; a user agent is a claim)"
     );
     let mut any = false;
-    // One lookup per distinct address per run, not per sighting. The same
-    // address commonly appears under one agent on several nodes, and a report
-    // must not multiply its own DNS traffic by the size of the fleet.
-    let mut ptr_cache: std::collections::HashMap<String, m6_core::resolve::Ptr> =
-        std::collections::HashMap::new();
     for r in readings {
         let Some(t) = &r.traffic else { continue };
         if t.forged_bot_requests > 0 {
@@ -532,7 +618,7 @@ pub fn render(d: &Digest, readings: &[NodeReading]) -> String {
         }
         any = true;
         for c in &t.crawlers {
-            let more = if c.client_ips.len() > 3 {
+            let more = if c.client_ips.len() > CHECKED_ADDRESSES {
                 format!(" (+{} more)", c.client_ips.len() - 3)
             } else {
                 String::new()
@@ -555,7 +641,7 @@ pub fn render(d: &Digest, readings: &[NodeReading]) -> String {
             if !c.first_seen.is_empty() {
                 let _ = writeln!(o, "        seen: {} .. {}", c.first_seen, c.last_seen);
             }
-            for line in verdict_lines(c, &mut ptr_cache) {
+            for line in verdict_lines(c, verdicts) {
                 let _ = writeln!(o, "        {line}");
             }
         }
@@ -810,20 +896,18 @@ pub fn render(d: &Digest, readings: &[NodeReading]) -> String {
 /// means we have no expectation to judge against. Reporting any of those as a
 /// forgery would be a confident answer nobody measured, and reporting any as a
 /// pass is the failure this section exists to stop.
-fn verdict_lines(
-    c: &m6_core::monitoring::CrawlerReport,
-    cache: &mut std::collections::HashMap<String, m6_core::resolve::Ptr>,
-) -> Vec<String> {
-    use m6_core::resolve::reverse_confirmed_default;
+fn verdict_lines(c: &m6_core::monitoring::CrawlerReport, verdicts: &Verdicts) -> Vec<String> {
     use m6_core::telemetry::{verify_crawler, CrawlerVerdict};
 
     let mut out = Vec::new();
-    for ip in c.client_ips.iter().take(3) {
-        let ptr = cache
-            .entry(ip.clone())
-            .or_insert_with(|| reverse_confirmed_default(ip))
-            .clone();
-        let line = match verify_crawler(&c.user_agent, &ptr) {
+    for ip in c.client_ips.iter().take(CHECKED_ADDRESSES) {
+        // Nothing here resolves. An address with no stored result was past
+        // the per-poll cap, or the poll has not reached it yet.
+        let Some(ptr) = verdicts.get(ip) else {
+            out.push(format!("{ip} -> not looked up yet  UNVERIFIED"));
+            continue;
+        };
+        let line = match verify_crawler(&c.user_agent, ptr) {
             CrawlerVerdict::Verified { name, resolved } => {
                 format!("{ip} -> {resolved}  VERIFIED as {name}")
             }
@@ -867,10 +951,10 @@ fn verdict_lines(
         };
         out.push(line);
     }
-    if c.client_ips.len() > 3 {
+    if c.client_ips.len() > CHECKED_ADDRESSES {
         out.push(format!(
             "(+{} more address(es) not checked)",
-            c.client_ips.len() - 3
+            c.client_ips.len() - CHECKED_ADDRESSES
         ));
     }
     out
@@ -904,6 +988,11 @@ fn fmt_cert_expiry(secs: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A render with no stored lookup results.
+    pub fn render(d: &Digest, readings: &[NodeReading]) -> String {
+        super::render(d, readings, &Verdicts::new())
+    }
     use m6_core::monitoring::{LoggingHealth, TrafficReport};
 
     fn traffic(logging: LoggingHealth) -> TrafficReport {
@@ -1147,7 +1236,6 @@ mod tests {
             paths: vec!["/robots.txt".into()],
             first_seen: "2026-10-01T09:00:00Z".into(),
             last_seen: "2026-10-01T09:05:00Z".into(),
-            claimed_domain: m6_core::telemetry::claimed_domain(ua).unwrap_or_default(),
         }
     }
 
@@ -1184,7 +1272,7 @@ mod tests {
         for (ua, ptr, name) in cases {
             let mut cache = std::collections::HashMap::new();
             cache.insert("192.0.2.1".to_string(), Ptr::Name(ptr.into()));
-            let out = verdict_lines(&crawler(ua, &["192.0.2.1"]), &mut cache);
+            let out = verdict_lines(&crawler(ua, &["192.0.2.1"]), &cache);
             assert!(
                 out[0].contains("VERIFIED") && out[0].contains(name),
                 "{name} must verify against {ptr}, got {out:?}"
@@ -1204,7 +1292,7 @@ mod tests {
             "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; ClaudeBot/1.0; +claudebot@anthropic.com)",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36; compatible; OAI-SearchBot/1.0; +https://openai.com/searchbot",
         ] {
-            let out = verdict_lines(&crawler(ua, &["192.0.2.1"]), &mut cache);
+            let out = verdict_lines(&crawler(ua, &["192.0.2.1"]), &cache);
             assert!(out[0].contains("UNVERIFIED"), "{out:?}");
             assert!(out[0].contains("published address ranges"), "{out:?}");
             assert!(!out[0].contains("MISMATCH"), "{out:?}");
@@ -1227,7 +1315,7 @@ mod tests {
                 "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
                 &["192.0.2.9"],
             ),
-            &mut cache,
+            &cache,
         );
         assert!(out[0].contains("MISMATCH"), "{out:?}");
         assert!(out[0].contains("vps-1234.cheap-hosting.example"), "{out:?}");
@@ -1252,7 +1340,7 @@ mod tests {
                 "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
                 &["192.0.2.9"],
             ),
-            &mut cache,
+            &cache,
         );
         assert!(out[0].contains("MISMATCH"), "{out:?}");
         assert!(
@@ -1260,6 +1348,104 @@ mod tests {
             "{out:?}"
         );
         assert!(!out[0].contains("VERIFIED"), "{out:?}");
+    }
+
+    fn sighted(ips: &[&str]) -> Vec<NodeReading> {
+        let mut r = reading("origin", None);
+        let mut t = traffic(LoggingHealth {
+            events_total: 1,
+            seconds_since_last: Some(1),
+            reopen: None,
+        });
+        t.crawlers = vec![crawler(
+            "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+            ips,
+        )];
+        r.traffic = Some(t);
+        vec![r]
+    }
+
+    /// The cap: with more new addresses than the cap allows, a poll looks up
+    /// the cap and no more, the rest read as not looked up, and the next poll
+    /// takes the next ones without repeating the first.
+    #[test]
+    fn a_poll_looks_up_at_most_the_cap_and_the_next_poll_continues() {
+        use m6_core::resolve::Ptr;
+        let calls = std::cell::RefCell::new(Vec::<String>::new());
+        let lookup = |ip: &str| {
+            calls.borrow_mut().push(ip.to_string());
+            Ptr::None
+        };
+        // Four sightings of three addresses each: twelve distinct addresses.
+        let mut readings = Vec::new();
+        for n in 0..4 {
+            let ips: Vec<String> = (1..=3).map(|k| format!("192.0.2.{}", n * 3 + k)).collect();
+            let ips: Vec<&str> = ips.iter().map(String::as_str).collect();
+            readings.extend(sighted(&ips));
+        }
+        let mut cache = VerdictCache::new();
+        let now = std::time::Instant::now();
+        let first = cache.refresh(&readings, now, &lookup);
+        assert_eq!(calls.borrow().len(), MAX_LOOKUPS_PER_POLL);
+        assert_eq!(first.len(), MAX_LOOKUPS_PER_POLL);
+        let second = cache.refresh(&readings, now, &lookup);
+        assert_eq!(calls.borrow().len(), 12, "the rest, and no repeats");
+        assert_eq!(second.len(), 12);
+        let mut seen = calls.borrow().clone();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 12, "no address looked up twice");
+    }
+
+    /// A stored result is reused until it expires, a failure expires sooner,
+    /// and the cache never holds more than its bound.
+    #[test]
+    fn stored_results_expire_and_the_cache_is_bounded() {
+        use m6_core::resolve::Ptr;
+        let n = std::cell::Cell::new(0);
+        let lookup = |_: &str| {
+            n.set(n.get() + 1);
+            Ptr::Failed
+        };
+        let readings = sighted(&["192.0.2.1"]);
+        let mut cache = VerdictCache::new();
+        let t0 = std::time::Instant::now();
+        cache.refresh(&readings, t0, &lookup);
+        cache.refresh(&readings, t0 + std::time::Duration::from_secs(60), &lookup);
+        assert_eq!(n.get(), 1, "a failure is kept for FAILED_TTL");
+        cache.refresh(
+            &readings,
+            t0 + FAILED_TTL + std::time::Duration::from_secs(1),
+            &lookup,
+        );
+        assert_eq!(n.get(), 2, "and looked up again after it");
+
+        let mut big = VerdictCache::new();
+        for k in 0..(MAX_CACHED_VERDICTS + 50) {
+            let ip = format!("198.51.{}.{}", k / 200, k % 200 + 1);
+            big.refresh(&sighted(&[ip.as_str()]), t0, &|_| Ptr::None);
+        }
+        assert!(big.entries.len() <= MAX_CACHED_VERDICTS);
+    }
+
+    /// Rendering reads stored results and has no way to look anything up: its
+    /// inputs are data, so `/check` cannot wait on a resolver. An address with
+    /// no stored result reads unverified.
+    #[test]
+    fn render_reads_stored_verdicts_and_never_looks_anything_up() {
+        use m6_core::resolve::Ptr;
+        let readings = sighted(&["192.0.2.1", "192.0.2.2"]);
+        let mut v = Verdicts::new();
+        v.insert(
+            "192.0.2.1".into(),
+            Ptr::Name("crawl-192-0-2-1.googlebot.com".into()),
+        );
+        let out = super::render(&digest(), &readings, &v);
+        assert!(out.contains("VERIFIED"), "{out}");
+        assert!(
+            out.contains("192.0.2.2 -> not looked up yet  UNVERIFIED"),
+            "{out}"
+        );
     }
 
     /// An agent in no table gets its lookup reported and no verdict, because
@@ -1278,7 +1464,7 @@ mod tests {
                 "Mozilla/5.0 (compatible; NeverHeardOfItBot/1.0)",
                 &["192.0.2.1"],
             ),
-            &mut cache,
+            &cache,
         );
         assert!(out[0].contains("no published method"), "{out:?}");
         assert!(!out[0].contains("MISMATCH"), "{out:?}");
@@ -1293,13 +1479,13 @@ mod tests {
         cache.insert("192.0.2.1".to_string(), Ptr::None);
         cache.insert("192.0.2.2".to_string(), Ptr::Failed);
         let ua = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
-        let out = verdict_lines(&crawler(ua, &["192.0.2.1"]), &mut cache);
+        let out = verdict_lines(&crawler(ua, &["192.0.2.1"]), &cache);
         assert!(
             out[0].contains("no PTR record") && out[0].contains("UNVERIFIED"),
             "{out:?}"
         );
         assert!(out[0].contains("Googlebot"), "{out:?}");
-        let out = verdict_lines(&crawler(ua, &["192.0.2.2"]), &mut cache);
+        let out = verdict_lines(&crawler(ua, &["192.0.2.2"]), &cache);
         assert!(
             out[0].contains("lookup failed") && out[0].contains("UNVERIFIED"),
             "{out:?}"
@@ -1320,7 +1506,7 @@ mod tests {
         cache.insert("192.0.2.2".to_string(), Ptr::None);
 
         let c = crawler(ua, &["192.0.2.1", "192.0.2.2", "192.0.2.3", "192.0.2.4"]);
-        let out = verdict_lines(&c, &mut cache);
+        let out = verdict_lines(&c, &cache);
         assert_eq!(out.len(), 4, "three addresses plus the count: {out:?}");
         assert!(out[0].contains("VERIFIED"), "{out:?}");
         assert!(out[1].contains("UNVERIFIED"), "{out:?}");
@@ -1359,7 +1545,7 @@ mod tests {
 /// than no check, because the summary is what gets read.
 #[cfg(test)]
 mod header_check_tests {
-    use super::tests::{digest, hc, reading};
+    use super::tests::{digest, hc, reading, render};
     use super::*;
 
     #[test]
@@ -1449,7 +1635,7 @@ mod header_check_tests {
 
 #[cfg(test)]
 mod tunnel_tests {
-    use super::tests::{digest, reading};
+    use super::tests::{digest, reading, render};
     use super::*;
     use crate::tunnel::{Handshake, Probe, ProbeResult, TunnelReading};
     use std::time::Duration;
@@ -1625,8 +1811,7 @@ mod tunnel_tests {
 
 #[cfg(test)]
 mod history_tests {
-    use super::tests::{digest, reading};
-    use super::*;
+    use super::tests::{digest, reading, render};
     use crate::history::HistoryDigest;
 
     fn history(state: &'static str) -> HistoryDigest {

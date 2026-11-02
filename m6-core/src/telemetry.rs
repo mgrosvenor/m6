@@ -535,93 +535,52 @@ pub enum CrawlerVerdict {
 pub fn verify_crawler(user_agent: &str, ptr: &crate::resolve::Ptr) -> CrawlerVerdict {
     use crate::resolve::Ptr;
 
-    let known = known_crawler(user_agent);
-    let name = known.map(|k| k.name);
-
-    match (known, ptr) {
-        // An operator who publishes ranges tells us nothing by PTR, whether
-        // or not a name came back.
-        (Some(k), p) => match k.verification {
-            CrawlerVerification::PublishedRanges(how) => CrawlerVerdict::NotCheckableByPtr {
+    let Some(k) = known_crawler(user_agent) else {
+        return match ptr {
+            Ptr::Name(r) => CrawlerVerdict::Unrecognised {
+                resolved: Some(r.clone()),
+            },
+            Ptr::Unconfirmed(r) => CrawlerVerdict::ForwardMismatch {
+                name: None,
+                resolved: r.clone(),
+            },
+            Ptr::None => CrawlerVerdict::NoPtr { name: None },
+            Ptr::Failed => CrawlerVerdict::LookupFailed { name: None },
+        };
+    };
+    let name = Some(k.name);
+    // An operator who publishes ranges tells us nothing by PTR, whether or
+    // not a name came back.
+    let expected = match k.verification {
+        CrawlerVerification::PublishedRanges(how) => {
+            return CrawlerVerdict::NotCheckableByPtr {
                 name: k.name,
                 how,
-                resolved: p.name().map(str::to_string),
-            },
-            CrawlerVerification::Ptr(expected) => match p {
-                Ptr::Name(resolved) => {
-                    if expected.iter().any(|d| p.verifies(d)) {
-                        CrawlerVerdict::Verified {
-                            name: k.name,
-                            resolved: resolved.clone(),
-                        }
-                    } else {
-                        CrawlerVerdict::Mismatch {
-                            name: k.name,
-                            resolved: resolved.clone(),
-                            expected,
-                        }
-                    }
-                }
-                // A failed forward lookup arrives as `Failed`, so this is a
-                // completed one that did not return the address.
-                Ptr::Unconfirmed(resolved) => CrawlerVerdict::ForwardMismatch {
-                    name,
-                    resolved: resolved.clone(),
-                },
-                Ptr::None => CrawlerVerdict::NoPtr { name },
-                Ptr::Failed => CrawlerVerdict::LookupFailed { name },
-            },
+                resolved: ptr.name().map(str::to_string),
+            }
+        }
+        CrawlerVerification::Ptr(expected) => expected,
+    };
+    match ptr {
+        Ptr::Name(resolved) if expected.iter().any(|d| ptr.verifies(d)) => {
+            CrawlerVerdict::Verified {
+                name: k.name,
+                resolved: resolved.clone(),
+            }
+        }
+        Ptr::Name(resolved) => CrawlerVerdict::Mismatch {
+            name: k.name,
+            resolved: resolved.clone(),
+            expected,
         },
-        (None, Ptr::Name(resolved)) => CrawlerVerdict::Unrecognised {
-            resolved: Some(resolved.clone()),
-        },
-        (None, Ptr::Unconfirmed(resolved)) => CrawlerVerdict::ForwardMismatch {
-            name: None,
+        // A failed forward lookup arrives as `Failed`, so this is a completed
+        // one that did not return the address.
+        Ptr::Unconfirmed(resolved) => CrawlerVerdict::ForwardMismatch {
+            name,
             resolved: resolved.clone(),
         },
-        (None, Ptr::None) => CrawlerVerdict::NoPtr { name: None },
-        (None, Ptr::Failed) => CrawlerVerdict::LookupFailed { name: None },
-    }
-}
-
-/// The domain a bot user agent says it belongs to, if it says.
-///
-/// Crawler user agents carry their own contact, by convention as a URL or an
-/// email address in parentheses: `(+http://www.example.com/bot.html)` or
-/// `(+bot@example.com)`. That string is the claim, and it is what a reverse
-/// lookup is checked against, so extracting it is the first half of
-/// verification. See [`crate::resolve::Ptr::verifies`] for the second.
-///
-/// Returns the registrable-looking host with any `www.` stripped, because a
-/// crawler's PTR records sit under the bare domain far more often than under
-/// the `www` host its documentation page happens to live on.
-///
-/// `None` when the agent names nothing, which is itself worth reporting: an
-/// agent claiming to be a crawler and giving no way to check is a weaker
-/// claim than one that does.
-pub fn claimed_domain(user_agent: &str) -> Option<String> {
-    // A URL first, then an email. Both appear, and an agent carrying both
-    // puts the URL first in every convention seen.
-    const STOP: [char; 5] = ['/', ')', ' ', ';', ','];
-    let host = match user_agent.find("://") {
-        Some(i) => user_agent[i + 3..].split(STOP).next()?,
-        None => {
-            let i = user_agent.find('@')?;
-            user_agent[i + 1..].split(STOP).next()?
-        }
-    };
-    // Strip a port and any credentials a malformed agent might carry.
-    let host = host.rsplit('@').next()?;
-    let host = host.split(':').next()?;
-    let host = host.trim_end_matches('.').trim().to_ascii_lowercase();
-    let host = host.strip_prefix("www.").unwrap_or(&host).to_string();
-    // A domain needs at least one dot. Anything else is not checkable and
-    // saying so is better than returning something a suffix match would
-    // accept too easily.
-    if host.contains('.') && !host.is_empty() {
-        Some(host)
-    } else {
-        None
+        Ptr::None => CrawlerVerdict::NoPtr { name },
+        Ptr::Failed => CrawlerVerdict::LookupFailed { name },
     }
 }
 
@@ -1083,6 +1042,34 @@ impl TrafficSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The host a user agent names in a URL or an address, for the tests that
+    /// show a documentation URL is not a PTR domain.
+    fn claimed_domain(user_agent: &str) -> Option<String> {
+        // A URL first, then an email. Both appear, and an agent carrying both
+        // puts the URL first in every convention seen.
+        const STOP: [char; 5] = ['/', ')', ' ', ';', ','];
+        let host = match user_agent.find("://") {
+            Some(i) => user_agent[i + 3..].split(STOP).next()?,
+            None => {
+                let i = user_agent.find('@')?;
+                user_agent[i + 1..].split(STOP).next()?
+            }
+        };
+        // Strip a port and any credentials a malformed agent might carry.
+        let host = host.rsplit('@').next()?;
+        let host = host.split(':').next()?;
+        let host = host.trim_end_matches('.').trim().to_ascii_lowercase();
+        let host = host.strip_prefix("www.").unwrap_or(&host).to_string();
+        // A domain needs at least one dot. Anything else is not checkable and
+        // saying so is better than returning something a suffix match would
+        // accept too easily.
+        if host.contains('.') && !host.is_empty() {
+            Some(host)
+        } else {
+            None
+        }
+    }
 
     fn rec(ts: &str, ip: &str, path: &str, status: u16, ua: &str) -> AnalyticsRecord {
         AnalyticsRecord {
