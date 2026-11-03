@@ -1,0 +1,104 @@
+name: Sanitisers
+
+# The address and leak sanitisers, in a workflow of their own so the required
+# checks in ci.yml are untouched until this job is promoted to one.
+#
+# It runs on pushes to `develop` and on pull requests to it. The job is not a
+# required check, so a finding in code that predates a pull request does not
+# block a merge that did not cause it.
+#
+# The triage rule is beside `continue-on-error` below.
+#
+# A sanitised run that cannot measure must fail, and it must not pass while
+# measuring nothing. CLAUDE.md says this, and issue #166 says what a skip cost
+# the conformance script. The probe step compiles and runs a trivial program
+# with the suite's flags, so the job cannot reach the suite without a sanitiser.
+#
+# The tests bind fixed loopback ports, so they run with --test-threads=1. The
+# step prints its wall clock time. The first runs decide the 20-minute
+# promotion budget: under it this job can be promoted to a required check,
+# over it the job stays out of the merge gate and moves to a schedule that
+# fails loudly.
+
+on:
+  pull_request:
+    branches: [develop]
+  push:
+    branches: [develop]
+  # For a re-run or a branch. GitHub offers it only once this file is on the
+  # default branch, `main`.
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # One value each, so the probe and the suite cannot drift apart.
+  SANITISER_FLAGS: "-Z sanitizer=address,leak"
+  SANITISER_TARGET: x86_64-unknown-linux-gnu
+
+# One run per ref, as in ci.yml. A newer push replaces a run that is already
+# superseded.
+concurrency:
+  group: sanitizer-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sanitizers:
+    name: address and leak sanitisers
+    runs-on: ubuntu-latest
+    # Triage rule, from issue #164. A run that reports a leak or a memory fault
+    # in code older than this job is evidence of a real defect. File one generic
+    # m6 issue per finding, then uncomment the next line and name the issue
+    # numbers in this comment. Fixing the findings is separate work, and no
+    # finding is fixed in this job. There is no silent allowance: without an
+    # issue on file the job runs without that line.
+    # continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Nightly toolchain and the Linux target
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: ${{ env.SANITISER_TARGET }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The runtime is the part most likely to be missing. The probe proves it
+      # links for this target and loads when the binary starts, which is the
+      # difference between a check and a skip.
+      - name: The sanitiser runtime is present
+        run: |
+          rustc +nightly --version
+          rustup target list --installed --toolchain nightly
+          probe="$RUNNER_TEMP/sanitizer-probe"
+          printf 'fn main() {}\n' > "$probe.rs"
+          if ! rustc +nightly $SANITISER_FLAGS --target "$SANITISER_TARGET" "$probe.rs" -o "$probe"; then
+            echo "::error::nightly rejected $SANITISER_FLAGS for $SANITISER_TARGET"
+            echo "The sanitiser is unavailable. This job fails rather than pass without it."
+            exit 1
+          fi
+          if ! "$probe"; then
+            echo "::error::the sanitiser runtime did not load"
+            exit 1
+          fi
+          echo "the sanitiser runtime linked and loaded"
+
+      # The command from issue #164, with the serial flag the tests need. Four
+      # off-by-default m6-core features (`multipart`, `email`, `flash`, `csrf`)
+      # are not enabled by any workspace member, so this build does not compile
+      # or instrument that code. `ci.yml` covers it with `-p m6-core
+      # --all-features`, without the sanitiser.
+      - name: Tests under the address and leak sanitisers
+        env:
+          # Rustdoc compiles each doctest as a separate crate and links the
+          # instrumented rlib, so it needs the same flag. Without it the
+          # doctest link fails on undefined sanitiser symbols, and cargo test
+          # runs doctests even with an explicit host --target.
+          RUSTFLAGS: ${{ env.SANITISER_FLAGS }}
+          RUSTDOCFLAGS: ${{ env.SANITISER_FLAGS }}
+          # An explicit target keeps RUSTFLAGS off proc macros and build
+          # scripts, which must stay uninstrumented. The environment variable
+          # rather than --target reaches the cargo that testkit::binary runs
+          # to build the services, so that build gets the same treatment.
+          CARGO_BUILD_TARGET: ${{ env.SANITISER_TARGET }}
+        run: |
+          time cargo +nightly test --workspace -- --test-threads=1

@@ -190,7 +190,7 @@ m6-http's holds a `site/` directory with `site.toml` and a certificate, plus `sy
 
 A per-service list of behaviours used to sit here, about 120 rows over four services, written before the code as a plan.
 No row had ever been checked against the suites above, so a reader took a line like "SIGTERM twice, immediate exit" as a test that runs.
-Three of those rows named a run under the address and leak sanitisers, and **nothing in this repository runs a sanitiser**, which is issue #164.
+Three of those rows named a run under the address and leak sanitisers, and no suite checked them.
 
 **That list is issue #165 now.**
 An unverified specification in `docs/` reads as a statement about what m6 does, and this one was wrong in at least four places.
@@ -241,10 +241,12 @@ A green run means what it means only if you know which of the four layers ran.
 m6's own tests run anywhere, `m6-core::testkit` is what stops them failing for reasons that are not the code, conformance needs the testers installed, and performance needs quiet.
 Running a tester by hand needs Table 5 first.
 
+The address and leak sanitisers run in their own workflow, `.github/workflows/sanitizer.yml`, on pushes to `develop` and on pull requests to it, and by hand once the file is on `main`.
+Its workspace run does not enable four off-by-default m6-core features (`multipart`, `email`, `flash`, `csrf`), so the sanitisers do not instrument that code.
+
 Two gaps are open, and neither is a documentation problem:
 
-- **No sanitiser and no fuzzing**, anywhere in `check.sh`, `tools/build-host-tests.sh` or CI, in a codebase that hand-writes three protocol parsers.
-  Issue #164.
+- **No fuzzing**, anywhere in `check.sh`, `tools/build-host-tests.sh` or CI, in a codebase that hand-writes three protocol parsers.
 - **The per-service behaviour lists are issue #165**, because no row had been checked
   against the suites in Table 6 and at least four were wrong.
 

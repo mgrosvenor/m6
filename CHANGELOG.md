@@ -54,6 +54,9 @@ An address past the cap, or not yet reached, reads `not looked up yet  UNVERIFIE
 Googlebot verifies only under `googlebot.com` and `google.com`. A name under `googleusercontent.com` does not verify it, because every cloud customer's virtual machine gets a reverse name there that also resolves forward.
 `telemetry::CrawlerVerdict` gains `ForwardMismatch`, so a `match` over it needs a new arm.
 
+**CI runs the workspace under the address and leak sanitisers on pushes to `develop`, in a workflow of its own, and fails when the sanitiser is unavailable (#164).**
+A probe compiles and runs a trivial program with the same flags before the suite, so a missing runtime or a rejected flag fails the job in seconds instead of passing while measuring nothing.
+
 ### Fixed
 
 **The signal-mask guard fails closed (#178).**

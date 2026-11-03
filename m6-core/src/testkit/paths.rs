@@ -9,23 +9,70 @@ use std::sync::{Mutex, OnceLock};
 /// The cargo target directory, derived from the running test binary.
 ///
 /// A test binary lives at `<target>/<profile>/deps/<name>-<hash>`, so the
-/// target directory is three levels up. Deriving it this way rather than from
+/// target directory is three levels up. Newer cargo puts it at
+/// `<target>/<profile>/build/<package>/<hash>/out/<name>-<hash>`, so the
+/// nearest ancestor named `deps` or `build` marks the profile directory's
+/// child either way. Deriving it this way rather than from
 /// `CARGO_MANIFEST_DIR` matters for two reasons: `CARGO_MANIFEST_DIR` is the
 /// directory of whichever crate *expanded the macro*, which would be `m6-core`
 /// and not the caller, and it is wrong outright when `CARGO_TARGET_DIR` points
 /// the build somewhere else.
+///
+/// When `CARGO_BUILD_TARGET` names a triple, cargo puts the test binary at
+/// `<target>/<triple>/<profile>/deps/<name>-<hash>`, and the triple directory
+/// is stripped so the result is still the target directory.
 ///
 /// Panics if the executable is not where cargo puts test binaries, because
 /// every caller here would otherwise go on to produce a confusing failure
 /// about a missing file.
 pub(super) fn target_dir() -> PathBuf {
     let exe = std::env::current_exe().expect("current_exe");
-    let deps = exe.parent().expect("test binary has no parent directory");
-    debug_assert_eq!(deps.file_name().and_then(|s| s.to_str()), Some("deps"));
-    deps.parent()
-        .and_then(Path::parent)
+    target_of(&exe, build_target().as_deref())
         .unwrap_or_else(|| panic!("cannot find target/ above {}", exe.display()))
-        .to_path_buf()
+}
+
+/// The target directory above the test binary `exe`, for `target_dir`.
+fn target_of(exe: &Path, triple: Option<&str>) -> Option<PathBuf> {
+    let above_profile = exe
+        .ancestors()
+        .skip(1)
+        .find(|a| {
+            matches!(
+                a.file_name().and_then(|s| s.to_str()),
+                Some("deps" | "build")
+            )
+        })
+        .and_then(Path::parent)
+        .and_then(Path::parent)?;
+    strip_triple(above_profile, triple).map(Path::to_path_buf)
+}
+
+/// The `CARGO_BUILD_TARGET` triple, if one is set and not empty.
+fn build_target() -> Option<String> {
+    std::env::var("CARGO_BUILD_TARGET")
+        .ok()
+        .filter(|t| !t.is_empty())
+}
+
+/// `dir` with a final `<triple>` component removed, when `triple` is set and
+/// is that component. Returns `None` only when the triple matches and there is
+/// no parent to return.
+fn strip_triple<'a>(dir: &'a Path, triple: Option<&str>) -> Option<&'a Path> {
+    match triple {
+        Some(t) if dir.file_name().and_then(|s| s.to_str()) == Some(t) => dir.parent(),
+        _ => Some(dir),
+    }
+}
+
+/// Where `cargo build --release` writes `name` under `target`: with a build
+/// target set it is `<target>/<triple>/release/<name>`, otherwise
+/// `<target>/release/<name>`.
+fn release_binary(target: &Path, triple: Option<&str>, name: &str) -> PathBuf {
+    let mut dir = target.to_path_buf();
+    if let Some(t) = triple {
+        dir.push(t);
+    }
+    dir.join("release").join(name)
 }
 
 /// True for the variables `cargo test` adds to a test process's environment.
@@ -85,7 +132,7 @@ fn build_release(
             "cargo build --release --workspace --bin {name} failed ({status}); its errors are printed above"
         ));
     }
-    let path = target.join("release").join(name);
+    let path = release_binary(target, build_target().as_deref(), name);
     if !path.is_file() {
         return Err(format!(
             "cargo built {name:?} but {} does not exist",
@@ -271,6 +318,41 @@ mod tests {
         let err =
             build_release(&cargo, dir.path(), &dir.path().join("target"), "nosuch").unwrap_err();
         assert!(err.contains("--bin nosuch failed"), "{err}");
+    }
+
+    #[test]
+    fn a_build_target_adds_its_directory_to_the_binary_path() {
+        let t = Path::new("/t");
+        assert_eq!(release_binary(t, None, "x"), Path::new("/t/release/x"));
+        assert_eq!(
+            release_binary(t, Some("x86_64-unknown-linux-gnu"), "x"),
+            Path::new("/t/x86_64-unknown-linux-gnu/release/x")
+        );
+    }
+
+    #[test]
+    fn the_target_directory_is_found_in_both_cargo_layouts() {
+        let old = Path::new("/t/debug/deps/x-1");
+        let new = Path::new("/t/debug/build/pkg/abc/out/x-1");
+        let triple_new = Path::new("/t/x86_64-unknown-linux-gnu/debug/build/pkg/abc/out/x-1");
+        assert_eq!(target_of(old, None), Some(PathBuf::from("/t")));
+        assert_eq!(target_of(new, None), Some(PathBuf::from("/t")));
+        assert_eq!(
+            target_of(triple_new, Some("x86_64-unknown-linux-gnu")),
+            Some(PathBuf::from("/t"))
+        );
+        assert_eq!(target_of(Path::new("/x"), None), None);
+    }
+
+    #[test]
+    fn the_triple_directory_is_stripped_from_the_target_directory() {
+        let d = Path::new("/t/x86_64-unknown-linux-gnu");
+        assert_eq!(strip_triple(d, None), Some(d));
+        assert_eq!(strip_triple(d, Some("other")), Some(d));
+        assert_eq!(
+            strip_triple(d, Some("x86_64-unknown-linux-gnu")),
+            Some(Path::new("/t"))
+        );
     }
 
     #[test]
