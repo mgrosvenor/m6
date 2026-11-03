@@ -1,14 +1,11 @@
 # m6 benchmarks
 
-This page reports m6's benchmark figures with the conditions recorded for each set, and section 11 names the sets where that record is thin.
+This page reports m6's benchmark figures with the conditions recorded for each set, and section 11 names the cases where that record is thin.
 This page is the authority for what a client observes end to end.
 `docs/PERFORMANCE.md` owns what one component costs, and `tools/perf-baseline.txt` owns the numbers a merge is gated on.
 A figure quoted anywhere else without its conditions is wrong, and this page is where the figure is checked.
 
-The page opens with why it was rewritten and with the methodology bug that explains the older claims.
-It then gives the conditions and the end-to-end results, how to read the latency columns, and what the figures leave unclaimed.
-The last four sections cover the criterion microbenchmarks, how to run a comparison that survives a busy machine, the six backend examples, and the summary.
-Section 1 lists the sections.
+The sections below give the evidence for that rule.
 
 ## 1. Contents
 
@@ -30,7 +27,8 @@ Section 2 begins with the 2026-09-06 rewrite, because every later figure depends
 ## 2. Why this file was rewritten (2026-09-06)
 
 An external audit found the published throughput figures not credible, and it was right.
-The README carried two tables that claimed the same conditions, 8 concurrent connections, TLS and a warm cache, with values that cannot both be true.
+The README carried two tables that claimed the same conditions, for *HTTP* (Hypertext Transfer Protocol) versions 1.1, 2 and 3: 8 concurrent connections, *TLS* (Transport Layer Security) and a warm cache.
+Their values cannot both be true.
 Table 1 gives the two tables and the ratio between them.
 
 | protocol | table A | table B | ratio |
@@ -43,11 +41,11 @@ Table 1 gives the two tables and the ratio between them.
 The HTTP/2 row differs by 5.5x, so one of the two tables was wrong and a reader could not tell which.
 
 Both published tables are too high.
-The figures in section 5 are at least 4x below table A on every row, and 58x below it on HTTP/3.
+The figures in section 5 are at least 4x below table A on every row and at least 58x below it on HTTP/3.
 Neither table recorded the commit, the hardware, the payload or the command line, so neither could be checked or repaired.
 Both are deleted.
 
-The explanation is the methodology bug in section 3, which is a property of the harness.
+The commit that deleted the two tables says the methodology bug in section 3 "likely explains the original figures".
 Section 3 gives the bug, and section 5 gives the figures that replaced the deleted tables.
 
 ## 3. The methodology bug: concurrency and co-location
@@ -93,9 +91,10 @@ The commit is the tree that was measured.
 | operating system | Ubuntu 26.04.1, kernel 7.0.0-30-generic |
 | toolchain | rustc 1.98.0, `cargo build --release` |
 | release profile | cargo defaults at the cited commit: `opt-level=3`, `lto=false`, `codegen-units=16`, `panic=unwind` |
-| *TLS* (Transport Layer Security) | rustls, TLS 1.3, self-signed certificate, `--skip-verify` on the client |
+| TLS | rustls, TLS 1.3, self-signed certificate, `--skip-verify` on the client |
 | topology | client and server on the same host, over loopback |
 | concurrency | 2 (section 3) |
+| rate limit | raised for the recorded run and restored afterwards, and the value used was not recorded |
 | latency samples | 2000 per suite |
 | throughput window | 10 s |
 | frequency governor | not exposed on this VM, so frequency scaling is not controlled |
@@ -103,8 +102,12 @@ The commit is the tree that was measured.
 **Table 2: the conditions behind the end-to-end figures.**
 Every row constrains the reading, and a figure from another machine, another build or another concurrency is a different measurement.
 
+The rate-limit row names a condition and cannot give its value.
+A rerun at the code default of 300 requests per minute measures the limiter once the run passes 300 requests, so raise it as the recorded run did and write the value down.
+
 The server under test was m6-http serving a site's real pages, so each payload was a page a site serves.
-The two command lines below rebuild and rerun the measurement:
+The server is built from this workspace, and its configuration and the site's pages are not in this repository, so a rerun needs both.
+The two command lines below rebuild and rerun the client:
 
 ```sh
 cargo build --release --bin m6-bench
@@ -113,17 +116,15 @@ cargo build --release --bin m6-bench
 ```
 
 `m6-bench` also takes `--latency-n`, which defaults to 2000, and `--h2c-addr` for the cleartext listener.
-[`bench.sh`](../bench.sh) builds the binaries it needs, writes a bench site under `/tmp/m6-bench`, and runs every latency, path and throughput suite for each protocol, restarting the servers between suites.
 
 Section 5 reports the figures, and a reader quoting one of them should quote Table 2 with it.
 
 ## 5. End-to-end results
 
 Two consecutive runs are reported in full, so the spread between them is visible.
-Table 3 gives latency and Table 4 gives throughput.
 
 Table 3 gives end-to-end latency in microseconds for six suites.
-Take from it that the HTTP/2 cache hit is the only suite below 1 ms, and that every cache miss costs at least 4 ms.
+Take from it that the two runs agree within 15% on p50, which is the repeatability the rest of the page relies on.
 
 | suite | p50 run 1 | p50 run 2 | p99 run 1 | p99 run 2 |
 |---|---:|---:|---:|---:|
@@ -135,10 +136,10 @@ Take from it that the HTTP/2 cache hit is the only suite below 1 ms, and that ev
 | HTTP/3 cache-miss → m6-html | 4617.0 | 4329.3 | 5844.5 | 5525.9 |
 
 **Table 3: end-to-end latency in microseconds, client-observed, two consecutive runs.**
-The two runs differ by at most 15% on p50, and the p99 column is what a slow request costs.
+The p99 column is what a slow request costs.
 
 Table 4 gives throughput in requests per second from the same two runs.
-Take from it that HTTP/2 carries 3.4x the throughput of HTTP/1.1 and that HTTP/3 is the slowest protocol on a loopback.
+Take from it that the two runs agree within 11% on every row.
 
 | protocol | run 1 | run 2 |
 |---|---:|---:|
@@ -147,7 +148,7 @@ Take from it that HTTP/2 carries 3.4x the throughput of HTTP/1.1 and that HTTP/3
 | HTTP/3 | 1030.3 | 1047.0 |
 
 **Table 4: throughput in requests per second, two consecutive runs.**
-The HTTP/3 row is a property of this loopback setup, and section 6 says what it does not generalise to.
+Section 6 reads the protocol gap, and the HTTP/3 result belongs to this loopback setup.
 
 Section 6 separates the two cache-hit quantities in these two tables.
 
@@ -169,10 +170,10 @@ Four further readings follow from Table 3 and Table 4.
 
 - **A cache miss costs at least 4 ms**, and the backend render dominates it.
 - **HTTP/1.1 cache misses are the slowest suite**, at 4.8 ms to 5.1 ms p50.
-- **HTTP/2 is 2.6x to 3x faster than HTTP/1.1 on latency here**, and 3.4x to 3.6x faster on throughput.
+- **HTTP/2 is 2.6x to 3x faster than HTTP/1.1 on a cache hit here**, 1.2x on a cache miss, and 3.4x to 3.6x faster on throughput.
 - **HTTP/3 is the slowest on throughput**, at 1,030 req/s to 1,047 req/s.
   That is a real result on a loopback, co-located test.
-  QUIC gains its advantage from loss and round-trip time, so the result does not generalise to a real network.
+  *QUIC*, the transport protocol HTTP/3 runs on, gains its advantage from loss and round-trip time, so the result does not generalise to a real network.
 
 Section 7 lists what the page leaves unclaimed, which is the other half of reading a figure correctly.
 
@@ -191,11 +192,11 @@ Four claims are absent on purpose, and each absence is a decision a reader can h
   The internal cache hit is microseconds, and what a visitor experiences over the internet is dominated by round-trip time, in the tens to hundreds of milliseconds.
   Both facts belong together or neither should be quoted.
 
-Section 8 turns to the CPU-only microbenchmarks, which are the one set here that does not involve a network stack.
+Section 8 turns to the *CPU* (central processing unit) microbenchmarks, which are the one set here that does not involve a network stack.
 
 ## 8. Criterion microbenchmarks
 
-Criterion measures *CPU* (central processing unit) cost with no I/O, which makes the medians below the stable figures on the page.
+Criterion measures CPU cost with no I/O (input/output), which makes these medians the stable figures on the page.
 Table 5 gives four of them.
 
 Table 5 gives the median cost of four operations in the cache and the stats recorder.
@@ -220,7 +221,7 @@ Section 9 is about comparing two builds, and the machine dominates that comparis
 A comparison between two builds needs a design that survives the machine, and m6's first design did not.
 Section 9.1 gives the diagnosis, section 9.2 the discarded rule, section 9.3 the rule that replaced it, and sections 9.4 and 9.5 the traps and the developer-machine conditions.
 
-### 9.1. The diagnosis: core scheduling, not the benchmark
+### 9.1. The diagnosis: core scheduling
 
 The `critical_path` benches produced a 19% to 26% spread between consecutive runs of the same commit, while criterion's confidence interval within each run was +/-0.08%.
 A number internally precise and externally scattered is the signature of a per-process constant, so the variance came from the environment.
@@ -284,10 +285,10 @@ Section 9.3 gives the design that cancels the drift.
 
 A comparative number comes from a paired, interleaved run.
 Alternating the two trees round by round puts the drift into both arms equally, so it cancels in the paired difference instead of landing on one side.
+Report the paired difference with a confidence interval.
 
-The rule is one sentence: measure A, then B, many times, alternating, and report a confidence interval on the paired difference.
 [`tools/paired_bench.sh`](../tools/paired_bench.sh) is the harness.
-It builds both trees, waits for the load average to fall below 0.35, then runs the named bench for ten interleaved rounds by default and prints one line per round.
+It builds both trees, waits for the load average to fall below 0.35, then runs the named bench for ten interleaved rounds by default and prints one line per tree per round.
 
 An absolute figure quoted on its own is meaningful only with the host and the date attached, and it is not comparable to one taken on a different machine.
 A figure taken on the laptop must never be compared against a build-host figure, in this page or any other.
@@ -338,10 +339,9 @@ python3 tools/backend-bench.py --duration 5 --workers 2
 
 Everything ran from RAM, staged into `/dev/shm`: the binaries, the payload and the sockets.
 Cold start reads the binary off disk otherwise, and the two Rust examples differ 56.7x in artefact size, so a disk-backed run would charge m6-core for a page cache miss and call it framework overhead.
-A run on macOS is labelled NOT-RAM by the tool and is not comparable.
+A run on macOS is labelled *NOT-RAM* (not in RAM) by the tool and is not comparable.
 There the cold-start column was 400-650 ms for every compiled example and 52 ms for Python, which is first-exec code signing on Apple Silicon.
 
-*RAM* is random access memory, and *NOT-RAM* is the tool's own label for a run staged on disk.
 The client's own cost was measured.
 The generator connected and closed a socket in its own process with no HTTP: 20,475 req/s, p50 44.7 µs.
 Every row's p50 in Table 8 sits above that floor, so the differences between rows are resolvable.
@@ -421,10 +421,11 @@ Section 3 gives the two traps that produce such figures, and section 9 gives the
 The numbers a merge is gated on are different: [`tools/perfcheck.sh`](../tools/perfcheck.sh) measures two render targets against the values recorded in `tools/perf-baseline.txt`, on the build host, with a 20% margin.
 `docs/PERFORMANCE.md` owns what one component costs.
 
-Three sets of figures carry weaker conditions than the rest.
+Five items carry weaker conditions than the rest.
 The criterion medians in section 8 were carried over from an earlier run, and the pair in section 3 is a demonstration with no commit or machine recorded.
-The 2026-09-06 run in section 5 was taken on one 4-vCPU VPS against a site's pages.
-Re-run the medians on the build host before quoting them as current, and read the other two as records of the runs that produced them.
+The 2.2 µs timer and the 0.87 to 0.90 hit rate name no machine or date.
+The 2026-09-06 run in section 5 was taken on one 4-vCPU virtual private server against a site's pages, and the rate-limit value it used was not recorded.
+Re-run the medians on the build host before quoting them as current, and read the rest as records of the runs that produced them.
 
 The page's authority is its conditions, and a reader who quotes the conditions with the figure carries the evidence with it.
 Section 2 records what this page replaced, and that record is the reason the rest of the page is precise about where each figure came from.
