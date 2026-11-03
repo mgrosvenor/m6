@@ -72,6 +72,31 @@ Documentation only. Each claim names the function or test that enforces it.
 
 **`docs/m6-auth-lib.md` follows the documentation ruleset, and its storage description now matches the code (#139).**
 
+**`docs/m6-backend-protocol.md` no longer states two MUSTs that the reference `App` does not meet (#200).**
+The proxy's user must be able to connect to the backend socket, with `0660` and a shared group preferred and `0666` allowed only inside a restricted directory. A backend may support persistent connections for clients that ask for them, and must close after responding to a request that carries `Connection: close`, which the proxy sends. `docs/m6-backend-examples.md` and `docs/m6-app-anatomy.md` now say the same.
+
+**Source comments in m6-http, m6-monitor and `tools/conformance.sh` no longer carry one deployment's hosts or measurements, and the HTTP/1.1 module header states the keep-alive the code implements (#190, #189 in part).**
+Comments only.
+
+**The build-host gate runs example 05's end-to-end test after its stack is up (#273).**
+The examples unit-test step skips `blog_site_end_to_end`, which needs certificates and the running stack, and the gate runs `cargo test -p render-cms --test integration` once that stack answers, counting a failure into the examples result.
+
+### Changed
+
+**The m6-auth-cli integration tests assert that each setup command succeeds, and print its stderr when one does not (#258).**
+A failed setup command used to surface later as an unrelated count assertion.
+
+**m6-auth-server opens one database connection per worker, so login, refresh and logout no longer queue behind a single connection lock (#182).**
+A login held that lock while bcrypt verified the password. A worker opens its connection on first use, and a failed open answers 500 and is tried again on the next request.
+`m6_core::sqlite::OpenOptions::open` now retries the switch to WAL until the busy timeout passes, because SQLite answers busy for that pragma without honouring the timeout when several processes or threads open a new database at once. `m6_auth::Db::open` uses that opener, so it now refuses a read-only file and turns on `recursive_triggers`.
+`m6_auth::AuthError` gains `Open`, so a `match` over it needs a new arm.
+
+**m6-http's benchmark dependencies are no longer production dependencies (#188).**
+The cold-start benchmark is now a `[[bench]]` (`cargo bench -p m6-http --bench bench_coldstart -- --addr <host:port> <flags>`, and without `--addr` it prints a note and exits 0), and `tokio`, `tokio-rustls`, `h2` and `http` moved to dev-dependencies. The `m6-bench-coldstart` binary is gone.
+
+**`--dump-config` runs the compresses agreement check that start runs (#255).**
+A config that disagrees with `site.toml` about compression now makes `--dump-config` exit 2 with `Config error: <msg>`, as start does, instead of passing validation and failing at start.
+
 **The m6-auth-server reference follows the documentation ruleset, and its `next` check, browser logout, key rotation and `--dump-config` descriptions now match the service (#140).**
 
 ### Verified
