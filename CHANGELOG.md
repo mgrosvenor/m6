@@ -97,6 +97,8 @@ The cold-start benchmark is now a `[[bench]]` (`cargo bench -p m6-http --bench b
 **`--dump-config` runs the compresses agreement check that start runs (#255).**
 A config that disagrees with `site.toml` about compression now makes `--dump-config` exit 2 with `Config error: <msg>`, as start does, instead of passing validation and failing at start.
 
+**The m6-auth-server reference follows the documentation ruleset, and its `next` check, browser logout, key rotation and `--dump-config` descriptions now match the service (#140).**
+
 ### Verified
 
 - Unit tests with stub resolvers cover a confirmed name, a PTR whose forward lookup returns other addresses, a name with no forward answer, a failed forward lookup, no PTR, a name with no address (EAI_NONAME and EAI_NODATA), a slot free by the time the caller has the result, the per-poll lookup cap, expiry and cache bound, a report that reads stored results and resolves nothing, a resolver that never answers, and the thread bound (eight blocked lookups, then fifty more that return at once and start no thread, then slots free again).
