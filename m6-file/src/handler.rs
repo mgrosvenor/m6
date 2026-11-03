@@ -75,8 +75,8 @@ fn escapes_site_dir(fs_path: &Path, site_dir: &Path) -> bool {
 ///   no invalidation can reach a browser cache. They stay short so a deploy is
 ///   visible promptly. Raising either one strands visitors on the old file.
 /// - `s-maxage=86400` is honoured ONLY by shared caches (RFC 9111 5.2.2.10).
-///   A browser ignores it. It lengthens just the edge's copy, which
-///   `invalidate-cache.sh` evicts on every deploy.
+///   A browser ignores it. It lengthens just the edge's copy, which a cache
+///   invalidation at deploy time empties.
 fn cache_control_for(query: &str) -> &'static str {
     let versioned = query.split('&').any(|p| p.starts_with("v=") && p.len() > 2);
     if versioned {
@@ -210,7 +210,7 @@ pub fn serve(req: &Request) -> Result<Response> {
     // already its length. That is also the common case for the assets worth
     // caring about, since images are neither compressed nor minified here.
     //
-    // `is_file` is load-bearing and was missing in the first version of this.
+    // The `is_file` check matters and was missing in the first version of this.
     // `std::fs::metadata` succeeds on a directory and reports its size, so
     // `HEAD /assets/css` answered `200` with `Content-Length: 128` while the
     // GET beside it answered 404. The read this block skips is also what used
@@ -237,10 +237,10 @@ pub fn serve(req: &Request) -> Result<Response> {
             debug!(path = %fs_path.display(), "file not found");
             return Ok(Response::not_found());
         };
-        // `lute.min.js` is 3.6MB that used to be read into a `Vec` on every
-        // cache miss to be copied straight out again. A file that changed
-        // between the `stat` and the `open` is handled by the responder rather
-        // than here: short reads fail and overruns are capped, because
+        // One minified JavaScript bundle of 3.6MB used to be read into a `Vec`
+        // on every cache miss to be copied straight out again. A file that
+        // changed between the `stat` and the `open` is handled by the responder
+        // rather than here: short reads fail and overruns are capped, because
         // `Content-Length` is already on the wire by then.
         let mut streamed = Response::stream(200, metadata.len(), file);
         streamed.headers = base.headers;
@@ -881,14 +881,14 @@ mod cache_control_tests {
         );
     }
 
-    /// The load-bearing property of the unversioned directive, stated as its
-    /// own test so the reason survives.
+    /// The property that holds the unversioned directive together, stated as
+    /// its own test so the reason survives.
     ///
-    /// An edge cache can be emptied on deploy; a browser cache cannot be
+    /// An edge cache can be emptied on deploy, and a browser cache cannot be
     /// reached at all. So the long window may only ever appear on `s-maxage`,
     /// which browsers ignore. Raising `max-age` or `stale-while-revalidate` to
-    /// buy the same hit rate would instead strand every visitor on the previous
-    /// file for a day -- that was tried once and rolled back.
+    /// buy the same hit rate would strand every visitor on the previous file
+    /// for a day.
     #[test]
     fn unversioned_lengthens_only_the_edge_never_the_browser() {
         let cc = cache_control_for(&query_of("/assets/css/style.css"));

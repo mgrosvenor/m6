@@ -229,17 +229,16 @@ pub struct HealthReport {
 /// - `version` says which release it claims to be. It is what an operator reads
 ///   and what release notes are written against.
 /// - `hash` says which BUILD it actually is. Rust is not byte-reproducible, so
-///   one tag built twice gives two binaries reporting one version. On
-///   2026-09-20 staging ran one build of `v1.10.0` and production another, every
-///   reading said the fleet agreed, and it was found by running `md5sum` on four
-///   machines.
+///   one tag built twice gives two binaries reporting one version. Two nodes
+///   can then agree on a version and run different bytes, and only the hash
+///   shows it.
 ///
 /// `hash` and not `md5`: the algorithm is how the value is produced, not what it
 /// means, and naming the field after it makes changing it a wire break for every
-/// reader. It IS md5 today, because that is the number the rest of the estate
-/// already compares: `deploy/estate/*.json` records md5, `ops.sh capture` writes
-/// md5, and the promotion gate refuses on md5. A second hash of the same bytes
-/// under another algorithm would give an operator two numbers and answer nothing.
+/// reader. It IS md5 today, because that is the number the surrounding tooling
+/// already compares: a deployment records md5 per node and refuses a promotion
+/// when two nodes disagree. A second hash of the same bytes under another
+/// algorithm would give an operator two numbers and answer nothing.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildId {
     /// The binary's own name, e.g. `"m6-http"`, from its crate at compile time.
@@ -391,10 +390,8 @@ pub struct PerfReport {
     ///
     /// This was a bare `version: String` until 2026-09-20 (#105), and the
     /// version is still in it, unchanged in meaning. What it could not do is
-    /// tell two builds of one tag apart, and that is not a hypothetical: on
-    /// 2026-09-20 staging ran one build of `v1.10.0` and production another,
-    /// every reading said the fleet agreed, and it took `md5sum` on four
-    /// machines to see it.
+    /// tell two builds of one tag apart. Two nodes can report one version and
+    /// run different bytes, and only the hash shows it.
     ///
     /// Why the version alone was already worth having, kept because the argument
     /// still applies to the whole structure: without it the only way to learn
@@ -468,11 +465,11 @@ pub enum PerfOutcome {
     ///
     /// Its own path rather than more fields on `/perf`, for the reason that
     /// split `/health` from `/perf`: the cost profiles differ. `/perf` sorts a
-    /// reservoir in memory; this reads the tail of a 47MB file. Putting the
-    /// expensive one behind a conditional on the cheaper path leaves the
-    /// expensive branch one misconfigured header away from being taken on
-    /// every request, and splitting the paths is what keeps each answer's cost
-    /// a property of the path rather than of the caller.
+    /// reservoir in memory. This reads the tail of a log that can run to tens
+    /// of megabytes. Putting the expensive one behind a conditional on the
+    /// cheaper path leaves the expensive branch one misconfigured header away
+    /// from being taken on every request, and splitting the paths is what keeps
+    /// each answer's cost a property of the path rather than of the caller.
     /// Boxed: `TrafficReport` is far larger than every other variant here, so
     /// carrying it inline made the whole enum that size even when the outcome
     /// was a one-word error.
@@ -829,8 +826,8 @@ mod tests {
         // here rather than against a constant, which would pin whatever the
         // code produced on the day and prove only that it has not changed.
         // This is the property that makes the field worth having: it must equal
-        // `md5sum` of the artefact, which is what deploy/estate/*.json records
-        // and what the promotion gate compares.
+        // `md5sum` of the artefact, which is the number a deployment records
+        // per node and compares before a promotion.
         use md5::{Digest, Md5};
         let exe = std::env::current_exe().expect("a test binary has a path");
         let expected = format!("{:x}", Md5::digest(std::fs::read(&exe).unwrap()));
@@ -1130,8 +1127,8 @@ mod tests {
 /// for things, and whether its logging is alive.
 ///
 /// This is the endpoint that lets a fleet report be assembled without ssh. The
-/// alternative was shipping the analytics log to a central box, and the
-/// numbers say not to: the file is 31MB on origin and 47MB on edge-b, one request is
+/// alternative was shipping the analytics log to a central box, and the size
+/// says not to: a busy node's log runs to tens of megabytes, one request is
 /// about 350 bytes, and the summary a human reads is about 1KB. Roughly
 /// 1000:1. A second copy of the log would also land on a box that is not
 /// backed up, and inherit a retention problem the original already has.
