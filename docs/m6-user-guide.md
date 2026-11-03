@@ -23,7 +23,7 @@ Sections 2 to 12 walk Examples 01 to 11 in order.
 ## 1. Before you start
 
 The examples need two checkouts, one certificate tool and a release build of m6.
-This section installs them and runs the full stack once, so a later failure is a real answer about an example.
+This section installs them and points at the full-stack check, so a later failure is a real answer about an example.
 The release build puts every m6 binary on the path, including `m6-md`, which Example 02 uses.
 
 Rust 1.88 or newer provides the compiler and Cargo.
@@ -49,21 +49,10 @@ m6-http serves the public site over *TLS* (Transport Layer Security), so every s
 Install `mkcert` once, and the local `dev.sh` scripts write a development certificate on first run into the path their system config names.
 When `mkcert` is absent, `dev.sh` uses `openssl` and the browser warns about the self-signed certificate.
 
-Check the install with Example 05, which runs the whole stack:
-
-```sh
-cd examples/05-cms
-./dev.sh        # one terminal
-./test.sh       # another
-```
-
-Example 05 starts m6-http, m6-html, m6-file, m6-md, m6-auth-server and a *CMS* (content management system) renderer.
-`dev.sh` creates the auth keys and the first admin user before it starts the stack.
-`test.sh` prints a pass or fail line for every check and exits non-zero on any failure.
-m6's README records 96 checks, and a working install prints `96 passed  0 failed  (96 checks)`.
-
-A green run means every binary and every example dependency works.
-A failure here is about the install, before the guide asks you to write anything.
+Check the install with Example 05, which runs the whole stack.
+[`README.md`](../README.md) step 4 gives the commands and explains what the check covers.
+A green run there means every binary and every example dependency works.
+A failure there is about the install, before the guide asks you to write anything.
 
 The next section starts from the smallest site: three processes, four config files, templates and data.
 
@@ -81,15 +70,17 @@ m6-http is the only process with a network listener, and it reaches the other tw
 
 ### 2.1. Site directory
 
-Seven entries make the example.
-The list gives each one's job:
-- `site.toml` holds the routes, the backends and the error mode for m6-http.
-- `configs/m6-html.conf` names the template and params for each m6-html route.
-- `configs/m6-file.conf` declares the asset route and its filesystem root.
-- `configs/system-dev.toml` holds the development bind address and the TLS paths.
-- `templates/` holds `base.html`, `home.html`, `page.html` and `error.html`.
-- `assets/style.css` is the stylesheet that `base.html` loads.
-- `data/` holds `site.json` and `about.json`, the params files for the templates.
+Eight entries make the example:
+- `site.toml`
+- `configs/m6-html.conf`
+- `configs/m6-file.conf`
+- `configs/system-dev.toml`
+- `templates/`
+- `assets/style.css`
+- `data/`
+- `dev.sh`
+
+Sections 2.2 to 2.7 explain the config files, the data, the templates, the stylesheet and the runner.
 
 `site.toml` holds what every node shares.
 `configs/system-dev.toml` holds what belongs to this node, and m6-http takes both files with the site directory first.
@@ -140,11 +131,12 @@ backend = "m6-file"
 ```
 
 The `[errors]` block sets `mode = "internal"`, so m6-http generates a small error page itself.
-`verbose_fallback = true` adds the failure detail to that page, which suits development.
+The released example sets `verbose_fallback = true` for development, which adds the request path, the matched route, the backend name and the error detail to that page.
+Set `verbose_fallback = false` in a production `site.toml`, because every internal error page would carry those details to any client.
 Internal mode uses m6-http's own page, and custom mode uses the `/_errors` route.
 
-A `[[route]]` matches one exact path.
-A `[[route_group]]` expands a file glob into one route per file at startup and on each `site.toml` reload, so `assets/**/*` becomes one route per asset.
+A `[[route]]` matches one path pattern, exact or with `{param}` captures.
+A `[[route_group]]` expands `assets/**/*` into one route per asset.
 `{relpath}` in the route group is the path below `assets/`.
 
 ### 2.3. `configs/m6-html.conf`
@@ -177,7 +169,7 @@ cache    = "no-store"
 ### 2.4. `configs/m6-file.conf`
 
 `configs/m6-file.conf` has one route, and m6-file serves every asset through its `files` handler.
-The route uses `{*relpath}` because that wildcard spans the slashes in a nested asset path such as `css/style.css`.
+The route uses `{*relpath}` for a nested asset path such as `css/style.css`.
 
 ```toml
 [[route]]
@@ -250,8 +242,8 @@ It adds a source directory, a generated data file, two routes and two templates.
 
 The blog keeps its posts in Markdown with *TOML* (Tom's Obvious, Minimal Language) frontmatter under `content/posts/`.
 `m6-md` reads that directory and writes `data/posts.json`, a single JSON object with a `documents` array.
-m6-html reads `data/posts.json` as a params file for `/blog` and `/blog/{stem}`.
-m6-html renders the JSON that m6-md produced, and the Markdown conversion happens before the server starts.
+m6-html renders the blog pages from that JSON.
+The Markdown conversion happens before the server starts.
 
 A new or changed post needs a rebuild and a cache invalidation.
 `dev.sh` builds the m6 binaries, then runs `m6-md` in watch mode and touches `site.toml` after each rebuild, which evicts the affected URLs.
@@ -305,7 +297,7 @@ The public address comes from the route, `/blog/{stem}`, and the templates use `
 
 ### 3.4. New routes in `site.toml`
 
-The blog adds two exact routes to `site.toml`.
+The blog adds two routes to `site.toml`, one exact and one parameterised.
 `/blog` renders the index, and `/blog/{stem}` renders one post.
 Both routes point at m6-html, and the asset route group is the only route group in the file.
 
@@ -323,10 +315,10 @@ m6-http matches `/blog/{stem}` and forwards the `stem` capture to m6-html.
 
 ### 3.5. New routes in `configs/m6-html.conf`
 
-m6-html gains two routes, and both load `data/posts.json`.
+m6-html gains two routes, and all three routes load `data/posts.json`, including the existing `/` route.
 The index template loops over `documents`.
 The post template filters the same list by `stem`.
-The `/` route also loads `data/posts.json`, so `home.html` can list the three most recent posts.
+The `/` route uses `documents` for the three most recent posts on the home page.
 
 ```toml
 [[route]]
@@ -360,8 +352,9 @@ It repeats the date descending sort that m6-md already applied, so the page keep
 {% set post = post_list | first %}
 ```
 
-[`m6-md.md`](m6-md.md) owns the frontmatter rules, the watch flags and the output format.
-[`m6-render.md`](m6-render.md) owns the template filters used above.
+[`m6-md.md`](m6-md.md) owns the frontmatter rules, the watch flags, the output format and `not_found()`.
+[`m6-render-lib.md`](m6-render-lib.md) owns the template engine and its built-in keys and m6 filters.
+The `sort`, `reverse`, `filter`, `length` and `first` filters are Tera's standard filters.
 
 Example 02 adds a content pipeline in front of the same three processes.
 Example 03 adds a fourth process, a custom renderer that handles a contact form and sends email.
