@@ -211,8 +211,9 @@ pub fn serve(req: &Request) -> Result<Response> {
     // caring about, since images are neither compressed nor minified here.
     //
     // `std::fs::metadata` succeeds on a directory and reports its size, so
-    // without `is_file` a `HEAD /assets/css` answers `200` with a
-    // `Content-Length` while the GET beside it answers 404.
+    // without `is_file` a directory takes this branch. A `HEAD` then reports a
+    // 200 with that size as `Content-Length`, and a `GET` sends the same head
+    // before the read fails on the directory.
     let minify_this = minification
         .map(|m| m.is_enabled(&mime_base))
         .unwrap_or(false);
