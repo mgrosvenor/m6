@@ -2453,6 +2453,26 @@ fn parse_invocation(routes: &[(String, RouteMethod)], handlers: &[String]) -> In
     }
 }
 
+/// The configuration refusals start and `--dump-config` share: a named
+/// `site.toml` that is missing, unreadable or not TOML, then a
+/// `[[backend]] compresses` disagreement. Returns the resolved `site.toml`.
+///
+/// Exit 2 is the configuration error code, detected before anything binds
+/// (backend protocol §8.3). A service that starts having disagreed with the
+/// edge about compression serves either fragmented caches or, worse, brotli
+/// to clients that asked for identity, and neither is visible from the
+/// outside until it bites. `--dump-config` runs the same check so a deploy
+/// that validates a config learns what the start would say.
+fn validate_startup(
+    config: &crate::config::RendererConfig,
+    site_dir: &std::path::Path,
+    config_path: &std::path::Path,
+) -> std::result::Result<PathBuf, String> {
+    let site_toml = check_site_toml(config, site_dir)?;
+    check_compress_declared(config, &site_toml, &backend_name_of(config_path))?;
+    Ok(site_toml)
+}
+
 /// Load the config and report how each route would be served. Returns the
 /// process exit code.
 fn dump_config(
@@ -2469,22 +2489,22 @@ fn dump_config(
         }
     };
 
-    // The same refusal the start makes, so a deploy that validates with
-    // --dump-config learns what the start would say.
-    if let Err(msg) = check_site_toml(&config, site_dir) {
-        eprintln!("Config error: {msg}");
-        return 2;
-    }
+    // The same start refusals, so a deploy that validates with --dump-config
+    // learns what the start would say.
+    let site_toml = match validate_startup(&config, site_dir, config_path) {
+        Ok(path) => path,
+        Err(msg) => {
+            eprintln!("Config error: {msg}");
+            return 2;
+        }
+    };
 
     println!("site_dir    {}", site_dir.display());
     println!("config      {}", config_path.display());
-    {
-        let site_toml = config.resolve_site_toml(site_dir);
-        if site_toml.exists() {
-            println!("site.toml   {}", site_toml.display());
-        } else {
-            println!("site.toml   {} (absent)", site_toml.display());
-        }
+    if site_toml.exists() {
+        println!("site.toml   {}", site_toml.display());
+    } else {
+        println!("site.toml   {} (absent)", site_toml.display());
     }
     println!(
         "socket      {}",
@@ -2567,8 +2587,24 @@ impl From<String> for ReloadError {
     }
 }
 
+/// The name `site.toml` uses for this service's `[[backend]]`: the config
+/// file's stem, falling back to `m6-default`.
+///
+/// The same convention `socket_path_from_config` uses to derive
+/// `/run/m6/<stem>.sock`, so the name in `site.toml` and the name here are the
+/// same string. Used at start and by `--dump-config` so the two cannot look up
+/// different entries.
+fn backend_name_of(config_path: &std::path::Path) -> String {
+    config_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("m6-default")
+        .to_string()
+}
+
 /// Whether `site.toml` declares the compression `config` does, for the backend
-/// named `backend_name`. Checked at start and on every reload.
+/// named `backend_name`. Checked at start, on every reload and by
+/// `--dump-config`.
 ///
 /// "Compresses" means at least one MIME type has a non-zero level. The
 /// defaults give text types real levels and images zero, so a service that has
@@ -2664,31 +2700,19 @@ fn run_app_with_shutdown(
         std::process::exit(2);
     });
 
-    // Before `site_toml_or_exit`, which reads a named `site_toml`: a change
+    // Before `validate_startup`, which reads a named `site_toml`: a change
     // between that read and this fingerprint would otherwise be lost.
     let site_fp = crate::watcher::Fingerprint::of(&config.resolve_site_toml(&site_dir));
-    let site_toml = site_toml_or_exit(&config, &site_dir);
+    let site_toml = match validate_startup(&config, &site_dir, &config_path) {
+        Ok(path) => path,
+        Err(msg) => {
+            eprintln!("Config error: {msg}");
+            std::process::exit(2);
+        }
+    };
 
-    // Does site.toml tell the edge the truth about whether we compress?
-    //
-    // Before logging is up, because it exits 2 and that is a configuration error
-    // detected before binding — the one thing exit 2 means (backend protocol
-    // §8.3). A service that starts having disagreed with the edge about this
-    // serves either fragmented caches or, worse, brotli to clients that asked
-    // for identity, and neither is visible from the outside until it bites.
-    //
-    // The backend name is the config file's stem, which is the same convention
-    // `socket_path_from_config` uses to derive /run/m6/<stem>.sock, so the name
-    // in site.toml's `[[backend]]` and the name here are the same string.
-    let backend_name = config_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("m6-default")
-        .to_string();
-    if let Err(msg) = check_compress_declared(&config, &site_toml, &backend_name) {
-        eprintln!("Config error: {msg}");
-        std::process::exit(2);
-    }
+    // The reload closure reuses this name for its own compress check.
+    let backend_name = backend_name_of(&config_path);
 
     // Init logging: site.toml base → renderer config [log] → CLI --log-level.
     let (format, level) = resolve_log(&site_toml, &config.log, cli_log_level.as_deref());
@@ -2846,6 +2870,9 @@ fn run_app_with_shutdown(
         }
         let new_config = crate::config::load(&config_path, &site_dir)
             .map_err(|e| format!("Reload failed (config parse error): {e}"))?;
+        // Not `validate_startup`: the `site_toml` key only takes effect on
+        // restart, so the compress check reads the file this service already
+        // has open, not the one the new config names.
         check_site_toml(&new_config, &site_dir)
             .and_then(|_| check_compress_declared(&new_config, &site_toml, &backend_name))
             .map_err(|msg| format!("Reload refused: {msg}"))?;
@@ -3464,6 +3491,46 @@ mod tests {
         assert!(check_site_toml(&cfg, d.path()).is_ok());
         std::fs::write(d.path().join("site.toml"), "[server\n").unwrap();
         assert!(check_site_toml(&cfg, d.path()).is_ok());
+    }
+
+    #[test]
+    fn dump_config_refuses_a_compresses_disagreement() {
+        // Every MIME type `default_compression` turns on, set to zero, so this
+        // service compresses nothing.
+        const NO_COMPRESSION: &str = concat!(
+            "[compression.\"text/html\"]\nbrotli = 0\ngzip = 0\n",
+            "[compression.\"text/css\"]\nbrotli = 0\ngzip = 0\n",
+            "[compression.\"text/plain\"]\nbrotli = 0\ngzip = 0\n",
+            "[compression.\"application/javascript\"]\nbrotli = 0\ngzip = 0\n",
+            "[compression.\"application/json\"]\nbrotli = 0\ngzip = 0\n",
+            "[compression.\"image/svg+xml\"]\nbrotli = 0\ngzip = 0\n",
+        );
+        let d = tempfile::tempdir().unwrap();
+        let config_path = d.path().join("app.toml");
+        std::fs::write(&config_path, NO_COMPRESSION).unwrap();
+        // The config file's stem is "app", the name the site.toml entry must
+        // use. It declares compression this service does not do.
+        std::fs::write(
+            d.path().join("site.toml"),
+            "[[backend]]\nname = \"app\"\ncompresses = true\n",
+        )
+        .unwrap();
+
+        // The message start prints for this disagreement, so the test can say
+        // --dump-config refuses the same thing rather than only exiting 2.
+        let config = crate::config::load(&config_path, d.path()).unwrap();
+        let site_toml = config.resolve_site_toml(d.path());
+        let start_msg = check_compress_declared(&config, &site_toml, "app").unwrap_err();
+        assert!(
+            start_msg.contains("compresses = true, but this service compresses nothing"),
+            "{start_msg}"
+        );
+
+        assert_eq!(
+            dump_config(d.path(), &config_path, &[], &[]),
+            2,
+            "--dump-config reported the config good, but start exits 2 on it"
+        );
     }
 
     #[test]
