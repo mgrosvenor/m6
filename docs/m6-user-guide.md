@@ -1,89 +1,113 @@
-# m6 — User Guide
+# m6 user guide
 
-Eleven examples, each building on the last. Clone the examples repository
-**beside your m6 checkout**, not inside it: the examples' renderer crates reach
-m6 by relative path (`../../../../m6/m6-core`), so the two have to be siblings.
+Eleven examples build one website, from a static page to a global fleet.
+Each example lives in the `m6-examples` repository and adds one capability to the last.
+This guide explains what each example adds and which file does the work.
+Sections 2 to 12 walk Examples 01 to 11 in order.
 
-```bash
-git clone https://github.com/mgrosvenor/m6-examples
-cd m6-examples
-cargo build --release        # the custom renderers used by 03, 04, 05, 07 and 11
-```
+**Contents**
 
-Prerequisites:
+1. [Before you start](#1-before-you-start)
+2. [Example 01, static site](#2-example-01-static-site)
+3. [Example 02, blog](#3-example-02-blog)
+4. [Example 03, contact form](#4-example-03-contact-form)
+5. [Example 04, login and protected pages](#5-example-04-login-and-protected-pages)
+6. [Example 05, CMS blog](#6-example-05-cms-blog)
+7. [Example 06, production with systemd](#7-example-06-production-with-systemd)
+8. [Example 07, dev to production](#8-example-07-dev-to-production)
+9. [Example 08, log viewer](#9-example-08-log-viewer)
+10. [Example 09, global deployment](#10-example-09-global-deployment)
+11. [Example 10, API tokens](#11-example-10-api-tokens)
+12. [Example 11, admin dashboard API](#12-example-11-admin-dashboard-api)
 
-```bash
-# m6's binaries, from source. They are not on crates.io.
-git clone https://github.com/mgrosvenor/m6 && cd m6
+## 1. Before you start
+
+The examples need two checkouts, one certificate tool and a release build of m6.
+This section installs them and runs the full stack once, so a later failure is a real answer about an example.
+The release build puts every m6 binary on the path, including `m6-md`, which Example 02 uses.
+
+Rust 1.88 or newer provides the compiler and Cargo.
+`mkcert` issues a development certificate that a browser trusts.
+`openssl` is the fallback when `mkcert` is absent.
+The two checkouts must sit side by side, because the renderer crates reach m6 through the relative path `../../../../m6/m6-core`.
+
+Build m6 and the examples with these commands:
+
+```sh
+git clone https://github.com/mgrosvenor/m6
+cd m6
 cargo build --release --workspace
 export PATH="$PWD/target/release:$PATH"
 
-# TLS for development, once. m6-http is HTTPS only.
-mkcert -install
+cd ..
+git clone https://github.com/mgrosvenor/m6-examples
+cd m6-examples
+cargo build --release
 ```
 
-Each example's `dev.sh` generates its own certificate into `keys/` on first run,
-so there is nothing to place by hand.
+m6-http serves the public site over *TLS* (Transport Layer Security), so every site needs a certificate.
+Install `mkcert` once, and the local `dev.sh` scripts write a development certificate on first run into the path their system config names.
+When `mkcert` is absent, `dev.sh` uses `openssl` and the browser warns about the self-signed certificate.
 
-Before following the examples, it is worth running the one that uses all of m6 at
-once and checking it:
+Check the install with Example 05, which runs the whole stack:
 
-```bash
+```sh
 cd examples/05-cms
 ./dev.sh        # one terminal
-./test.sh       # another: 96 checks over the whole stack
+./test.sh       # another
 ```
 
-`README.md`'s install section explains what that covers. If it passes, every
-component below is working on your machine.
+Example 05 starts m6-http, m6-html, m6-file, m6-md, m6-auth-server and a *CMS* (content management system) renderer.
+`dev.sh` creates the auth keys and the first admin user before it starts the stack.
+`test.sh` prints a pass or fail line for every check and exits non-zero on any failure.
+m6's README records 96 checks, and a working install prints `96 passed  0 failed  (96 checks)`.
 
----
+A green run means every binary and every example dependency works.
+A failure here is about the install, before the guide asks you to write anything.
 
-## Example 01 — Static Site
+The next section starts from the smallest site: three processes, four config files, templates and data.
 
-`examples/01-static/`
+## 2. Example 01, static site
 
-The base case. Templates, assets, and hand-authored JSON. No build step, no custom renderers. Three processes, one config each.
+Example 01 is the base case: a static site with *HTML* (HyperText Markup Language) templates, one stylesheet and hand-authored *JSON* (JavaScript Object Notation) data, served over *TLS* (Transport Layer Security).
+It runs three processes.
+The example runs directly from the templates, data and configs in its directory.
+The released files are in `examples/01-static/`.
 
-```bash
-cd examples/01-static
-./dev.sh
-# open https://localhost:8443
-```
+m6-http terminates TLS, routes each request and caches the response.
+m6-html renders templates from the JSON data.
+m6-file serves files from `assets/`.
+m6-http is the only process with a network listener, and it reaches the other two over Unix sockets in `/tmp/m6/`.
 
-### Site directory
+### 2.1. Site directory
 
-```
-01-static/
-├── site.toml
-├── configs/
-│   ├── m6-html.conf
-│   └── m6-file.conf
-├── templates/
-│   ├── base.html
-│   ├── home.html
-│   ├── page.html
-│   └── error.html
-├── assets/
-│   └── style.css
-└── data/
-    └── site.json
-```
+Seven entries make the example.
+The list gives each one's job:
+- `site.toml` holds the routes, the backends and the error mode for m6-http.
+- `configs/m6-html.conf` names the template and params for each m6-html route.
+- `configs/m6-file.conf` declares the asset route and its filesystem root.
+- `configs/system-dev.toml` holds the development bind address and the TLS paths.
+- `templates/` holds `base.html`, `home.html`, `page.html` and `error.html`.
+- `assets/style.css` is the stylesheet that `base.html` loads.
+- `data/` holds `site.json` and `about.json`, the params files for the templates.
 
-### `site.toml`
+`site.toml` holds what every node shares.
+`configs/system-dev.toml` holds what belongs to this node, and m6-http takes both files with the site directory first.
+That split is the subject of section 8.
+
+### 2.2. `site.toml`
+
+`site.toml` is the *TOML* (Tom's Obvious, Minimal Language) file that declares the site name, the error mode, the log format, two backends and the routes.
+The `sockets` globs point at `/tmp/m6/`, where the development stack writes its sockets.
 
 ```toml
 [site]
 name   = "My Site"
 domain = "localhost"
 
-[server]
-bind     = "127.0.0.1:8443"
-tls_cert = "../../localhost.pem"
-tls_key  = "../../localhost-key.pem"
-
 [errors]
-mode = "internal"
+mode             = "internal"
+verbose_fallback = true
 
 [log]
 level  = "info"
@@ -91,11 +115,11 @@ format = "text"
 
 [[backend]]
 name    = "m6-html"
-sockets = "/run/m6/m6-html-*.sock"
+sockets = "/tmp/m6/m6-html*.sock"
 
 [[backend]]
 name    = "m6-file"
-sockets = "/run/m6/m6-file-*.sock"
+sockets = "/tmp/m6/m6-file*.sock"
 
 [[route]]
 path    = "/"
@@ -115,7 +139,20 @@ path    = "/assets/{relpath}"
 backend = "m6-file"
 ```
 
-### `configs/m6-html.conf`
+The `[errors]` block sets `mode = "internal"`, so m6-http generates a small error page itself.
+`verbose_fallback = true` adds the failure detail to that page, which suits development.
+Internal mode uses m6-http's own page, and custom mode uses the `/_errors` route.
+
+A `[[route]]` matches one exact path.
+A `[[route_group]]` expands a file glob into one route per file at startup and on each `site.toml` reload, so `assets/**/*` becomes one route per asset.
+`{relpath}` in the route group is the path below `assets/`.
+
+### 2.3. `configs/m6-html.conf`
+
+`configs/m6-html.conf` loads `data/site.json` into every template and gives each route a template and a params list.
+The `/` route renders `templates/home.html` with the global params.
+The `/about` route adds `data/about.json`.
+The `/_errors` route renders `templates/error.html` and sets `cache = "no-store"`, so m6-http never caches the error page.
 
 ```toml
 global_params = ["data/site.json"]
@@ -137,18 +174,30 @@ params   = []
 cache    = "no-store"
 ```
 
-### `configs/m6-file.conf`
+### 2.4. `configs/m6-file.conf`
+
+`configs/m6-file.conf` has one route, and m6-file serves every asset through its `files` handler.
+The route uses `{*relpath}` because that wildcard spans the slashes in a nested asset path such as `css/style.css`.
 
 ```toml
 [[route]]
-path = "/assets/{relpath}"
+path = "/assets/{*relpath}"
+handler = "files"
 root = "assets/"
 ```
 
-### `data/site.json`
+`handler = "files"` is required.
+A route that names an unknown handler stops m6-file at startup with exit code 2.
+
+### 2.5. `data/site.json`
+
+`data/site.json` supplies the three global values that the layout uses: the site name, the tagline and the navigation.
+`base.html` reads `site_name` and `nav`, and `home.html` reads `site_tagline`.
 
 ```json
 {
+  "site_name": "My Site",
+  "site_tagline": "A minimal static site built with m6.",
   "nav": [
     { "label": "Home",  "path": "/" },
     { "label": "About", "path": "/about" }
@@ -156,79 +205,60 @@ root = "assets/"
 }
 ```
 
-### `templates/base.html`
+### 2.6. Templates
 
-```html
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <title>{% block title %}{{ site_name }}{% endblock %}</title>
-  <link rel="stylesheet" href="/assets/style.css">
-</head>
-<body>
-  <nav>
-    {% for item in nav %}
-      <a href="{{ item.path }}">{{ item.label }}</a>
-    {% endfor %}
-  </nav>
-  <main>{% block content %}{% endblock %}</main>
-</body>
-</html>
-```
+`templates/base.html` is the layout for every page.
+It sets the title block, loads `/assets/style.css`, renders `nav` from `data/site.json`, and leaves a `content` block for the page.
+`templates/home.html` fills that block with the tagline and a link to `/about`.
+`templates/page.html` renders `title` and the HTML `body` from `data/about.json`.
 
-### `templates/error.html`
+m6-html builds one params map per request.
+The map holds the global params, the route's params files, the path captures and the query parameters.
+Each query parameter is available under `query` and at the top level.
 
-```html
-{% extends "base.html" %}
-{% block title %}{{ query.status }} · {{ site_name }}{% endblock %}
-{% block content %}
-  <h1>{{ query.status }} — {{ query.reason }}</h1>
-  <p>The page <code>{{ query.path }}</code> could not be found.</p>
-  <a href="/">Return home</a>
-{% endblock %}
-```
+### 2.7. `dev.sh`
 
-### `dev.sh`
+`dev.sh` starts the three processes and stops them together with a trap.
+It sets `M6_SOCKET_OVERRIDE` so each backend writes its socket to `/tmp/m6/`, which matches the `sockets` globs in `site.toml`.
+It also writes the development certificate on first run, waits for both backend sockets, then starts m6-http with `site.toml` and `configs/system-dev.toml`.
 
-```bash
-#!/bin/bash
-set -e
-SITE="$(cd "$(dirname "$0")" && pwd)"
-trap 'kill $(jobs -p) 2>/dev/null' EXIT
+Run it from `examples/01-static` and open `https://localhost:8443`:
 
-m6-html "$SITE" "$SITE/configs/m6-html.conf" &
-m6-file "$SITE" "$SITE/configs/m6-file.conf" &
-m6-http "$SITE" &
-
-echo "Running at https://localhost:8443"
-wait
-```
-
----
-
-## Example 02 — Blog
-
-`examples/02-blog/`
-
-Adds a blog. Markdown source files in `content/posts/` are processed by `m6-md` into a single JSON file at `data/posts.json`. m6-html serves the blog from that file. No per-post JSON files, no `[[route_group]]`.
-
-```bash
-cd examples/02-blog
-cargo install m6-md          # separate project, one-time install
-
-# Generate posts.json from Markdown source, then start the site
-m6-md content/posts/ --output data/posts.json
+```sh
+cd examples/01-static
 ./dev.sh
 ```
 
-To update content, re-run `m6-md content/posts/ --output data/posts.json` then restart or let m6-http pick up the changed file via inotify.
+The script looks for the m6 checkout beside this repository, at `../../../m6`.
+Set `M6` to a different path when the two checkouts are not siblings.
 
-### What's new
+[`m6-site-toml.md`](m6-site-toml.md) owns every config key.
+[`m6-file.md`](m6-file.md) owns the handler and wildcard rules.
+[`m6-render.md`](m6-render.md) owns template rendering.
 
-`content/posts/` contains Markdown source files with TOML frontmatter. m6-md produces `data/posts.json` — a single JSON object with a `documents` array containing every post's metadata and rendered HTML body. m6 has no knowledge of Markdown.
+Example 01 shows the smallest useful site: three processes and four config files.
+Example 02 keeps that stack and adds a Markdown build step, one generated params file and two routes.
 
-### Source file format
+## 3. Example 02, blog
+
+Example 02 adds a blog to the static site.
+`m6-md` converts Markdown files into one *JSON* (JavaScript Object Notation) file, and m6-html renders two pages from it with *HTML* (HyperText Markup Language) templates.
+The example keeps the same three processes and the same site layout.
+It adds a source directory, a generated data file, two routes and two templates.
+
+### 3.1. What is new
+
+The blog keeps its posts in Markdown with *TOML* (Tom's Obvious, Minimal Language) frontmatter under `content/posts/`.
+`m6-md` reads that directory and writes `data/posts.json`, a single JSON object with a `documents` array.
+m6-html reads `data/posts.json` as a params file for `/blog` and `/blog/{stem}`.
+m6-html renders the JSON that m6-md produced, and the Markdown conversion happens before the server starts.
+
+A new or changed post needs a rebuild and a cache invalidation.
+`dev.sh` builds the m6 binaries, then runs `m6-md` in watch mode and touches `site.toml` after each rebuild, which evicts the affected URLs.
+
+### 3.2. Source file format
+
+Each post starts with a TOML frontmatter block between `+++` lines, followed by the Markdown body.
 
 ```
 +++
@@ -241,9 +271,17 @@ tags    = ["rust", "web"]
 Post body in **Markdown**. Tables, footnotes, and strikethrough supported.
 ```
 
-Any frontmatter key beyond `title` and `date` passes through to the JSON as-is.
+`title` and `date` are the two keys that m6-md reads for itself.
+Other keys, such as `summary` and `tags`, pass through to the JSON unchanged.
+A key named `stem`, `path` or `body` is ignored with a warning, because m6-md sets those three fields.
+When `title` is absent, m6-md uses the file stem with hyphens replaced by spaces.
+When `date` is absent, m6-md uses the file's modification time as a `YYYY-MM-DD` date.
+Files whose names start with `_` are skipped, and the directory is read one level deep.
 
-### `data/posts.json` (produced by m6-md)
+### 3.3. `data/posts.json`
+
+`data/posts.json` holds one entry per post, and m6-md sorts the entries by `date` descending.
+The entry below is one post, with the fields that the example discusses.
 
 ```json
 {
@@ -253,7 +291,7 @@ Any frontmatter key beyond `title` and `date` passes through to the JSON as-is.
       "path":    "/hello-world",
       "title":   "Hello World",
       "date":    "2024-01-15",
-      "body":    "<p>Post body in <strong>Markdown</strong>...</p>",
+      "body":    "<p>Post body in <strong>Markdown</strong>. Tables, footnotes, and strikethrough supported.</p>\n",
       "summary": "A brief introduction to the blog.",
       "tags":    ["rust", "web"]
     }
@@ -261,9 +299,15 @@ Any frontmatter key beyond `title` and `date` passes through to the JSON as-is.
 }
 ```
 
-Sorted by `date` descending. `body` is fully rendered HTML.
+`stem` is the filename without `.md`, and `body` is the rendered HTML.
+`path` is `/{stem}`.
+The public address comes from the route, `/blog/{stem}`, and the templates use `stem`.
 
-### New routes in `site.toml`
+### 3.4. New routes in `site.toml`
+
+The blog adds two exact routes to `site.toml`.
+`/blog` renders the index, and `/blog/{stem}` renders one post.
+Both routes point at m6-html, and the asset route group is the only route group in the file.
 
 ```toml
 [[route]]
@@ -275,9 +319,14 @@ path    = "/blog/{stem}"
 backend = "m6-html"
 ```
 
-No `[[route_group]]`. The routes are fixed patterns — m6-html handles any `/blog/{stem}` and looks up the matching post in the params.
+m6-http matches `/blog/{stem}` and forwards the `stem` capture to m6-html.
 
-### New routes in `configs/m6-html.conf`
+### 3.5. New routes in `configs/m6-html.conf`
+
+m6-html gains two routes, and both load `data/posts.json`.
+The index template loops over `documents`.
+The post template filters the same list by `stem`.
+The `/` route also loads `data/posts.json`, so `home.html` can list the three most recent posts.
 
 ```toml
 [[route]]
@@ -291,43 +340,33 @@ template = "templates/post.html"
 params   = ["data/posts.json"]
 ```
 
-Both routes load the same file. The index template iterates `documents`. The post template filters by `stem`.
+### 3.6. `templates/post-index.html`
 
-### `templates/post-index.html`
-
-```html
-{% extends "base.html" %}
-{% block title %}Blog · {{ site_name }}{% endblock %}
-{% block content %}
-  <h1>Blog</h1>
-  {% for doc in documents %}
-    <article>
-      <h2><a href="/blog/{{ doc.stem }}">{{ doc.title }}</a></h2>
-      <time>{{ doc.date }}</time>
-      {% if doc.summary %}<p>{{ doc.summary }}</p>{% endif %}
-    </article>
-  {% endfor %}
-{% endblock %}
-```
-
-### `templates/post.html`
+`templates/post-index.html` renders the list, newest first, and links each title to `/blog/{{ doc.stem }}`.
+It repeats the date descending sort that m6-md already applied, so the page keeps that order when a JSON file is edited by hand.
 
 ```html
-{% extends "base.html" %}
-{% set post = documents | filter(attribute="stem", value=stem) | first %}
-{% block title %}{{ post.title }} · {{ site_name }}{% endblock %}
-{% block content %}
-  <article>
-    <h1>{{ post.title }}</h1>
-    <time>{{ post.date }}</time>
-    {{ post.body | safe }}
-  </article>
-{% endblock %}
+{% for doc in documents | sort(attribute="date") | reverse %}
 ```
 
-`stem` is a built-in key provided by m6-html — the `{stem}` capture from the matched URL.
+### 3.7. `templates/post.html`
 
-## Example 03 — Contact Form
+`templates/post.html` filters `documents` by `stem`, renders the first match, and calls `not_found()` when no post matches.
+`stem` is the `{stem}` capture from the request path, which m6-html adds to the params map.
+
+```html
+{% set post_list = documents | filter(attribute="stem", value=stem) %}
+{% if post_list | length == 0 %}{{ not_found() }}{% endif %}
+{% set post = post_list | first %}
+```
+
+[`m6-md.md`](m6-md.md) owns the frontmatter rules, the watch flags and the output format.
+[`m6-render.md`](m6-render.md) owns the template filters used above.
+
+Example 02 adds a content pipeline in front of the same three processes.
+Example 03 adds a fourth process, a custom renderer that handles a contact form and sends email.
+
+## 4. Example 03, contact form
 
 `examples/03-contact/`
 
@@ -339,7 +378,7 @@ cargo build --release -p render-contact
 ./dev.sh
 ```
 
-### `render-contact/Cargo.toml`
+### 4.1. `render-contact/Cargo.toml`
 
 ```toml
 [package]
@@ -352,7 +391,7 @@ m6-render = { git = "https://github.com/m6/m6", tag = "v0.1.0", features = ["smt
 serde_json = "1"
 ```
 
-### `render-contact/src/main.rs`
+### 4.2. `render-contact/src/main.rs`
 
 ```rust
 use m6_render::prelude::*;
@@ -398,7 +437,7 @@ fn main() -> Result<()> {
 }
 ```
 
-### `configs/render-contact.conf`
+### 4.3. `configs/render-contact.conf`
 
 ```toml
 global_params = ["data/site.json"]
@@ -429,7 +468,7 @@ username = "user@example.com"
 password = "live-smtp-password"
 ```
 
-### `templates/contact.html`
+### 4.4. `templates/contact.html`
 
 ```html
 {% extends "base.html" %}
@@ -449,7 +488,7 @@ password = "live-smtp-password"
 {% endblock %}
 ```
 
-### New in `site.toml`
+### 4.5. New in `site.toml`
 
 ```toml
 [[backend]]
@@ -461,7 +500,7 @@ path    = "/contact"
 backend = "render-contact"
 ```
 
-### Updated `dev.sh`
+### 4.6. Updated `dev.sh`
 
 ```bash
 ./target/release/render-contact "$SITE" "$SITE/configs/render-contact.conf" &
@@ -469,7 +508,7 @@ backend = "render-contact"
 
 ---
 
-## Example 04 — Login and Protected Pages
+## 5. Example 04, login and protected pages
 
 `examples/04-auth/`
 
@@ -482,7 +521,7 @@ cd examples/04-auth
 # login at https://localhost:8443/login
 ```
 
-### Key generation and bootstrap (`setup.sh`)
+### 5.1. Key generation and bootstrap (`setup.sh`)
 
 ```bash
 #!/bin/bash
@@ -502,7 +541,7 @@ m6-auth-cli "$SITE/configs/m6-auth.conf" user add admin --role admin
 echo "Setup complete. Start the server with ./dev.sh"
 ```
 
-### `configs/m6-auth.conf`
+### 5.2. `configs/m6-auth.conf`
 
 ```toml
 [storage]
@@ -518,7 +557,7 @@ private_key = "keys/auth.pem"
 public_key  = "keys/auth.pub"
 ```
 
-### New in `site.toml`
+### 5.3. New in `site.toml`
 
 ```toml
 [auth]
@@ -556,7 +595,7 @@ backend = "m6-html"
 require = "group:members"
 ```
 
-### `templates/login.html`
+### 5.4. `templates/login.html`
 
 ```html
 {% extends "base.html" %}
@@ -590,7 +629,7 @@ The `session` cookie is sent on every request — m6-http verifies it locally. T
 
 **Session expiry:** When the `session` cookie expires, m6-http checks for a `refresh` cookie on the next protected request. If present and valid, new cookies are issued and the user is returned to where they were without seeing a login page. If the refresh token has also expired, the user is redirected to `/login?next=<original-path>`.
 
-### `templates/members.html`
+### 5.5. `templates/members.html`
 
 ```html
 {% extends "base.html" %}
@@ -608,7 +647,7 @@ Logout is a plain form POST — no JavaScript. m6-auth clears both cookies and r
 
 ---
 
-## Example 05 — CMS Blog
+## 6. Example 05, CMS blog
 
 `examples/05-cms/`
 
@@ -625,7 +664,7 @@ cargo build --release -p render-cms
 # Blog at https://localhost:8443/blog (public, cached)
 ```
 
-### Site directory
+### 6.1. Site directory
 
 ```
 05-cms/
@@ -657,7 +696,7 @@ cargo build --release -p render-cms
     └── src/main.rs
 ```
 
-### `site.toml`
+### 6.2. `site.toml`
 
 ```toml
 [site]
@@ -766,7 +805,7 @@ require = "group:editors"
 
 `[[route_group]]` with `content/posts/*.json` handles routing for individual posts. New post files become routable when m6-http reloads after `site.toml` is touched on publish.
 
-### `render-cms/Cargo.toml`
+### 6.3. `render-cms/Cargo.toml`
 
 ```toml
 [package]
@@ -779,7 +818,7 @@ m6-render  = { git = "https://github.com/m6/m6", tag = "v0.1.0", features = ["au
 serde_json = "1"
 ```
 
-### `render-cms/src/main.rs`
+### 6.4. `render-cms/src/main.rs`
 
 ```rust
 use m6_render::prelude::*;
@@ -883,7 +922,7 @@ fn handle_unpublish(req: &Request) -> Result<Response> {
 
 ```
 
-### The publish flow
+### 6.5. The publish flow
 
 1. Editor saves draft → `POST /api/drafts` or `PATCH /api/drafts/{stem}` writes `content/drafts/{stem}.json`
 2. Editor clicks **Publish** → `POST /api/publish/{stem}`:
@@ -895,7 +934,7 @@ fn handle_unpublish(req: &Request) -> Result<Response> {
 4. m6-http: route now live, cache miss → m6-html reads `content/posts/{stem}.json`, renders → m6-http caches
 5. Every subsequent request to `/blog/{stem}`: cache hit — RAM only
 
-### Performance profile
+### 6.6. Performance profile
 
 | Request type | Latency |
 |---|---|
@@ -904,7 +943,7 @@ fn handle_unpublish(req: &Request) -> Result<Response> {
 | CMS dashboard | ~10ms — JWT verified locally, render-cms reads posts directory + drafts directory |
 | Publish | ~5ms — one atomic file write, one inotify event |
 
-### `dev.sh`
+### 6.7. `dev.sh`
 
 ```bash
 #!/bin/bash
@@ -923,7 +962,7 @@ echo "CMS at    https://localhost:8443/cms"
 wait
 ```
 
-## Example 06 — Production with systemd
+## 7. Example 06, production with systemd
 
 `examples/06-systemd/`
 
@@ -933,7 +972,7 @@ The unit files live in `examples/06-systemd/systemd/` and are copied into place 
 
 ---
 
-### Server preparation
+### 7.1. Server preparation
 
 ```bash
 # Create a dedicated user — no login shell, no home directory
@@ -974,7 +1013,7 @@ The touch is what makes m6-http read the new files, and until it runs m6-http ke
 
 ---
 
-### Deploy site directory
+### 7.2. Deploy site directory
 
 ```bash
 # From your development machine
@@ -1019,7 +1058,7 @@ public_key = "/etc/m6/auth.pub"
 
 ---
 
-### Unit files
+### 7.3. Unit files
 
 One unit per process. The units for renderers all follow the same pattern — only `ExecStart` and `Description` differ.
 
@@ -1207,7 +1246,7 @@ WantedBy=multi-user.target
 
 ---
 
-### Install and start
+### 7.4. Install and start
 
 ```bash
 # Copy unit files
@@ -1237,7 +1276,7 @@ Expected output for each unit:
 
 ---
 
-### Verify
+### 7.5. Verify
 
 ```bash
 # Check m6-http is listening
@@ -1264,7 +1303,7 @@ curl -s -o /dev/null -w "%{http_code}" https://example.com/cms
 
 ---
 
-### Logs
+### 7.6. Logs
 
 ```bash
 # Follow all m6 processes together
@@ -1291,7 +1330,7 @@ journalctl -u m6-http --since "2024-01-15 09:00" --until "2024-01-15 10:00"
 
 ---
 
-### Rotating the analytics log
+### 7.7. Rotating the analytics log
 
 `m6-http` writes the analytics log to one file and reopens it when it receives SIGUSR1.
 Rotation renames the file and sends the signal, so no line is lost, and `copytruncate` is not needed.
@@ -1347,7 +1386,7 @@ It skips a rotated file last written before the window, and a `.gz` file larger 
 
 ---
 
-### Monitor history
+### 7.8. Monitor history
 
 `m6-monitor` keeps a history of every poll when `[monitor] history_file` is set, and serves it as JSON Lines.
 We cover the keys, the two endpoints, paging, how to protect them and what the history leaves out.
@@ -1407,7 +1446,7 @@ Channel counters include the monitor's own polls and header checks (issue #107),
 
 ---
 
-### Deploy updates
+### 7.9. Deploy updates
 
 ```bash
 # Code or template changes — rsync and done
@@ -1432,7 +1471,7 @@ certbot renew
 
 ---
 
-### Horizontal scaling
+### 7.10. Horizontal scaling
 
 Add a second m6-html instance to handle more traffic. No config change to m6-http — it detects the new socket automatically.
 
@@ -1477,7 +1516,7 @@ systemctl stop m6-html-2
 
 ---
 
-### Crash recovery
+### 7.11. Crash recovery
 
 systemd restarts failed units automatically with `Restart=on-failure` and `RestartSec=2`. During the brief restart window, m6-http's pool backoff handles missing sockets — requests to affected routes return 503 until the socket reappears.
 
@@ -1496,7 +1535,7 @@ journalctl -u m6-html -f
 
 ---
 
-## Example 07 — Dev to Production
+## 8. Example 07, dev to production
 
 `examples/07-dev-to-production/`
 
@@ -1504,7 +1543,7 @@ The complete workflow for taking a site from local development to a production s
 
 ---
 
-### The split
+### 8.1. The split
 
 **`site.toml` — version controlled, deployed with the site, contains no secrets:**
 
@@ -1599,7 +1638,7 @@ When `secrets_file` points to a file that exists, it is merged in — secrets fi
 
 ---
 
-### Dev script
+### 8.2. Dev script
 
 ```bash
 #!/bin/bash
@@ -1621,7 +1660,7 @@ wait
 
 ---
 
-### First-time server setup
+### 8.3. First-time server setup
 
 ```bash
 # On the server
@@ -1677,7 +1716,7 @@ systemctl start  m6-html m6-file m6-auth render-cms m6-http
 
 ---
 
-### Systemd unit — m6-http
+### 8.4. Systemd unit, m6-http
 
 The only difference from example 06 is `ExecStart` includes the system config path:
 
@@ -1717,7 +1756,7 @@ Renderer units are identical to example 06 — they take only two positional arg
 
 ---
 
-### Deploy
+### 8.5. Deploy
 
 ```bash
 #!/bin/bash
@@ -1750,7 +1789,7 @@ echo "Deployed."
 
 ---
 
-### Dev vs production at a glance
+### 8.6. Dev vs production at a glance
 
 | | Development | Production |
 |---|---|---|
@@ -1767,7 +1806,7 @@ Routes, templates, backends, auth config, and log settings are identical. The sa
 
 ---
 
-### Checking what's in effect
+### 8.7. Checking what's in effect
 
 ```bash
 # See the effective merged config — useful when debugging prod behaviour
@@ -1789,7 +1828,7 @@ m6-http /var/www/my-blog /etc/m6/my-blog.toml --dump-config
 
 ---
 
-### Common mistakes
+### 8.8. Common mistakes
 
 **Forgetting the system config argument:**
 ```bash
@@ -1827,7 +1866,7 @@ ssh user@example.com vim /var/www/my-blog/site.toml
 
 ---
 
-## Example 08 — Log Viewer
+## 9. Example 08, log viewer
 
 `examples/08-logviewer/`
 
@@ -1841,7 +1880,7 @@ cd examples/08-logviewer
 
 ---
 
-## Example 09 — Global Deployment
+## 10. Example 09, global deployment
 
 `examples/09-global-deployment/`
 
@@ -1854,7 +1893,7 @@ cd examples/09-global-deployment
 
 ---
 
-## Example 10 — API Tokens
+## 11. Example 10, API tokens
 
 `examples/10-api-tokens/`
 
@@ -1865,7 +1904,7 @@ cd examples/10-api-tokens
 ./dev.sh
 ```
 
-### When to use API tokens
+### 11.1. When to use API tokens
 
 | | Session cookie | API token |
 |---|---|---|
@@ -1875,7 +1914,7 @@ cd examples/10-api-tokens
 | Issuance | `POST /auth/login` | `m6-auth-cli token create` |
 | Revocation | `POST /auth/logout` | `m6-auth-cli token revoke` |
 
-### Setup
+### 11.2. Setup
 
 ```bash
 # 1. Create a user with the roles your API needs
@@ -1891,7 +1930,7 @@ curl -sk https://localhost:8443/api/data \
      -H "Authorization: Bearer $TOKEN"
 ```
 
-### `site.toml` — protecting an API endpoint
+### 11.3. `site.toml`, protecting an API endpoint
 
 ```toml
 # API endpoint — requires a valid Bearer token with role 'api'
@@ -1903,7 +1942,7 @@ require = "role:api"
 
 `require = "role:api"` works for both session cookies and Bearer tokens. A browser user logged in with the `api` role can also access the route. For endpoints that should be machine-only, use a dedicated role name like `api` and never assign it to regular user accounts.
 
-### Token management
+### 11.4. Token management
 
 ```bash
 # List active tokens for a user
@@ -1920,7 +1959,7 @@ m6-auth-cli configs/m6-auth.conf token revoke 550e8400-e29b-41d4-a716-4466554400
 
 **Revocation note:** `token revoke` removes the token from the database and the listing. Because JWTs are stateless, a revoked token remains cryptographically valid until its `exp` claim. For immediate revocation, use `--ttl-days 1` so tokens expire quickly on their own.
 
-### Template variables in protected routes
+### 11.5. Template variables in protected routes
 
 When a request carries a valid Bearer token, m6-html templates can access the caller's identity via the `auth` object — the same object available after browser login:
 
@@ -1929,7 +1968,7 @@ When a request carries a valid Bearer token, m6-html templates can access the ca
 <p>Roles:  {{ auth.roles | join(sep=", ") }}</p>
 ```
 
-### Functional tests
+### 11.6. Functional tests
 
 `test.sh` in the example directory runs against a live server:
 
@@ -1946,7 +1985,7 @@ Tests cover: public access, 401 on unauthenticated access, token create/list/rev
 
 ---
 
-## Example 11 — Admin Dashboard API
+## 12. Example 11, admin dashboard API
 
 `examples/11-admin-dashboard/`
 
@@ -1963,7 +2002,7 @@ cd examples/11-admin-dashboard
 # open https://localhost:8444/
 ```
 
-### API endpoints
+### 12.1. API endpoints
 
 | Method | Path | Returns |
 |--------|------|---------|
@@ -1980,7 +2019,7 @@ cd examples/11-admin-dashboard
 | `POST` | `/api/admin/cache/flush` | Alias for config/touch |
 | `POST` | `/api/admin/services/{name}/restart` | Send SIGTERM to a service via its PID file |
 
-### JSON blob shapes
+### 12.2. JSON blob shapes
 
 **`GET /api/admin/perf?n=60`**
 ```json
@@ -2092,7 +2131,7 @@ The JSON object is converted back to TOML, validated, and written atomically. Re
 ```
 Sends SIGTERM to the process whose PID is in the service's configured PID file.
 
-### Config: `render-admin.conf`
+### 12.3. Config: `render-admin.conf`
 
 The renderer reads its settings from the m6-render user config dict:
 
@@ -2116,7 +2155,7 @@ name     = "render-admin"
 pid_file = "/tmp/m6/render-admin.pid"
 ```
 
-### Tests
+### 12.4. Tests
 
 44 tests covering all six modules run on every `cargo test`:
 
@@ -2134,7 +2173,7 @@ cargo test -p render-admin
 
 Tests cover: perf log parsing (field completeness, N-limiting), per-route aggregation (hit rate, latency, sample window, sort order), system metrics shape, bench target discovery, async job lifecycle, log tail content, config read/write/touch round-trip, null rejection, and service restart.
 
-### Functional tests
+### 12.5. Functional tests
 
 `test.sh` tests against a live server:
 

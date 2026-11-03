@@ -464,7 +464,7 @@ wait
 
 **Scaling:** start additional instances (e.g. `m6-html-2.service`). The socket `/run/m6/m6-html-2.sock` appears and m6-http adds it to the pool. On Linux it sees the socket at once, from an inotify watch on the directory the backend's `sockets` glob names. On macOS and the BSDs a periodic rescan of the glob picks it up. No config change needed.
 
-**Global deployment:** run m6-http at each edge location. Configure it with a `h2s://` URL backend pointing to the origin. Each edge node caches independently. See [Example 09](docs/m6-user-guide.md#example-09--global-deployment) and the multi-region deployment walkthrough.
+**Global deployment:** run m6-http at each edge location. Configure it with a `h2s://` URL backend pointing to the origin. Each edge node caches independently. See [Example 09](docs/m6-user-guide.md#10-example-09-global-deployment) and the multi-region deployment walkthrough.
 
 ---
 
