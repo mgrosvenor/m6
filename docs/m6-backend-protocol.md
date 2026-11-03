@@ -124,7 +124,7 @@ Take from it that `Host` is the client's value, forwarded unchanged when the cli
 
 **Table 1: the fields every forwarded request carries.**
 Every row is present except `Content-Length`, which is present when the body is non-empty.
-`Host` is client-supplied and needs validation (§2.5).
+`Host` is client-supplied and attacker-controlled (§2.5).
 
 ### 2.3. Headers the proxy can add
 
@@ -167,7 +167,7 @@ The proxy re-emits `Content-Length` from the body it sends, `X-Forwarded-For`, `
 It drops `X-Real-IP` and never re-adds it.
 
 `Host` is the exception.
-The proxy forwards the client's `Host` unchanged and writes one only when the client sent none (§2.2), so a backend treats `Host` as attacker-controlled.
+The proxy forwards the client's `Host` unchanged and writes one only when the client sent none (§2.2), so a backend MUST treat `Host` as attacker-controlled.
 
 The stripping is a security boundary.
 A backend that resolves a repeated field by first match would take a client's forged copy, because the proxy appends its own copy after the client's.
@@ -282,10 +282,12 @@ sockets    = "/run/m6/my-renderer*.sock"
 compresses = false          # default: true
 ```
 
-The proxy uses `compresses` to decide whether to advertise an encoding dimension.
+The proxy uses `compresses` to decide whether to advertise an encoding dimension on a cache miss.
 A backend that does not compress has one representation, so `Vary: Accept-Encoding` would promise variants that can never exist, and every shared cache downstream would fragment its storage on a field that cannot change the body.
-When the backend sent no `Vary` and does not compress, the proxy adds none.
-When the backend sent a `Vary`, the proxy keeps its field names and adds `Accept-Encoding` to them, even when the backend does not compress.
+When the backend sent no `Vary` and does not compress, a cache miss adds none.
+When the backend sent a `Vary`, a cache miss keeps its field names and adds `Accept-Encoding` to them, even when the backend does not compress.
+A cache hit, including a `304` revalidation, adds `Accept-Encoding` to the served `Vary` whatever `compresses` says, because the cache key carries the content coding.
+A `Vary: *` is left unchanged on both paths.
 
 The backend reads the same key and MUST refuse to start when it disagrees with what it can do.
 An `m6-core` service gets this from `m6_core::compress::check_declared_support`, called before binding, and exits `2` per §8.3.
@@ -472,7 +474,7 @@ Everything a backend MUST do:
 - [ ] Declare in `site.toml` whether the service compresses, and refuse to start with exit `2` when the declaration disagrees with what it does (§3.6.1).
 - [ ] If it compresses, send an accurate `Content-Encoding` and honour `Accept-Encoding` (§3.6).
 - [ ] Trust the proxy-owned fields in §2.2 and §2.3 only while the socket is reachable by the proxy alone (§2.5).
-- [ ] Treat `Host` as attacker-controlled and validate it before use (§2.5, §6.2).
+- [ ] Treat `Host` as attacker-controlled (§2.5, §6.2).
 - [ ] Reject or sanitise path traversal before using a request-derived value in a filesystem path (§6.2).
 - [ ] Bound anything derived from the request that it allocates (§6.2).
 - [ ] Refuse to copy a request-derived value into a response field without validating it (§6.3).
