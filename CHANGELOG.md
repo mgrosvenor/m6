@@ -84,6 +84,24 @@ Comments only.
 **The build-host gate runs example 05's end-to-end test after its stack is up (#273).**
 The examples unit-test step skips `blog_site_end_to_end`, which needs certificates and the running stack, and the gate runs `cargo test -p render-cms --test integration` once that stack answers, counting a failure into the examples result.
 
+### Changed
+
+**The m6-auth-cli integration tests assert that each setup command succeeds, and print its stderr when one does not (#258).**
+A failed setup command used to surface later as an unrelated count assertion.
+
+**m6-auth-server opens one database connection per worker, so login, refresh and logout no longer queue behind a single connection lock (#182).**
+A login held that lock while bcrypt verified the password. A worker opens its connection on first use, and a failed open answers 500 and is tried again on the next request.
+`m6_core::sqlite::OpenOptions::open` now retries the switch to WAL until the busy timeout passes, because SQLite answers busy for that pragma without honouring the timeout when several processes or threads open a new database at once. `m6_auth::Db::open` uses that opener, so it now refuses a read-only file and turns on `recursive_triggers`.
+`m6_auth::AuthError` gains `Open`, so a `match` over it needs a new arm.
+
+**m6-http's benchmark dependencies are no longer production dependencies (#188).**
+The cold-start benchmark is now a `[[bench]]` (`cargo bench -p m6-http --bench bench_coldstart -- --addr <host:port> <flags>`, and without `--addr` it prints a note and exits 0), and `tokio`, `tokio-rustls`, `h2` and `http` moved to dev-dependencies. The `m6-bench-coldstart` binary is gone.
+
+**`--dump-config` runs the compresses agreement check that start runs (#255).**
+A config that disagrees with `site.toml` about compression now makes `--dump-config` exit 2 with `Config error: <msg>`, as start does, instead of passing validation and failing at start.
+
+**The m6-auth-server reference follows the documentation ruleset, and its `next` check, browser logout, key rotation and `--dump-config` descriptions now match the service (#140).**
+
 ### Verified
 
 - Unit tests with stub resolvers cover a confirmed name, a PTR whose forward lookup returns other addresses, a name with no forward answer, a failed forward lookup, no PTR, a name with no address (EAI_NONAME and EAI_NODATA), a slot free by the time the caller has the result, the per-poll lookup cap, expiry and cache bound, a report that reads stored results and resolves nothing, a resolver that never answers, and the thread bound (eight blocked lookups, then fifty more that return at once and start no thread, then slots free again).

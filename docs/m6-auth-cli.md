@@ -226,19 +226,10 @@ Section 8 puts the commands in the order a first install needs them.
 ## 8. Bootstrap sequence
 
 A first install needs a signing key pair and one administrator user before m6-auth-server starts.
-The block below creates both against a site whose config sits in `configs/`, and the comments give the reason for each step.
+Generate the key pair as [`m6-auth.md` section 4.3](m6-auth.md#43-key-generation) describes, which also covers the PKCS#8 conversion.
+The block below then creates the administrator against a site whose config sits in `configs/`.
 
 ```sh
-# An elliptic curve P-256 signing key pair.
-# m6-auth reads the PKCS8 form ("BEGIN PRIVATE KEY") and fails on the SEC1
-# form ("BEGIN EC PRIVATE KEY"), so convert the generated key.
-mkdir -p keys
-openssl ecparam -name prime256v1 -genkey -noout -out keys/auth-sec1.pem
-openssl pkcs8 -topk8 -nocrypt -in keys/auth-sec1.pem -out keys/auth.pem
-openssl ec -in keys/auth-sec1.pem -pubout -out keys/auth.pub
-chmod 600 keys/auth.pem
-rm keys/auth-sec1.pem
-
 # The first open creates the database file and its tables.
 m6-auth-cli configs/m6-auth.conf user add admin --role admin
 
@@ -254,7 +245,7 @@ Start m6-auth-server after the database exists.
 [`m6-auth.md`](m6-auth.md) owns the key paths and the rest of the m6-auth-server config.
 
 Example 04 in [`m6-user-guide.md`](m6-user-guide.md) wraps the same steps in a setup script.
-Its key commands write the SEC1 form, so add the `openssl pkcs8` step above.
+Its key commands write the SEC1 form, so add the `openssl pkcs8` step from `m6-auth.md` section 4.3.
 Section 9 names the documents that own the rest.
 
 ## 9. Where to read next
