@@ -47,8 +47,7 @@ sockets = "/run/m6/my-renderer*.sock"
 The backend MUST bind a path matching that glob.
 The glob exists so a pool can have more than one member, with names such as `my-renderer-1.sock` and `my-renderer-2.sock`, one per service instance.
 
-The proxy discovers members by scanning the glob and watching the directory, so a socket that appears joins the pool and a socket that disappears leaves it, with no restart on either side.
-`m6-site-toml.md` owns the `sockets` key and the pool behaviour.
+`m6-site-toml.md` owns the `sockets` key and the pool behaviour, including how a socket joins or leaves the pool.
 
 ### 1.2. Binding sequence
 
@@ -111,7 +110,7 @@ The proxy forwards the target in the encoded form the client sent, so the backen
 ### 2.2. Headers the proxy always sends
 
 Table 1 gives the fields every forwarded request carries.
-Take from it that the proxy sets each value itself, after removing any client copy in §2.5.
+Take from it that `Host` is the client's value, forwarded unchanged when the client sent one, and that every other row is the proxy's statement about the request.
 
 | Field | Value |
 |---|---|
@@ -124,7 +123,8 @@ Take from it that the proxy sets each value itself, after removing any client co
 | `Connection` | `close` |
 
 **Table 1: the fields every forwarded request carries.**
-A backend can rely on every row being present on every request.
+Every row is present except `Content-Length`, which is present when the body is non-empty.
+`Host` is client-supplied and needs validation (§2.5).
 
 ### 2.3. Headers the proxy can add
 
@@ -138,7 +138,7 @@ Take from it that a protected route is the only place the claims field appears.
 **Table 2: the field the proxy adds after routing.**
 The value is encoded, so a backend decodes it before reading any claim.
 
-Every other field is forwarded from the client unchanged, in the order the client sent it, except the hop-by-hop and proxy-owned fields in §2.5.
+Every field not in Table 1 or Table 2 is forwarded from the client unchanged, in the order the client sent it, except the hop-by-hop and proxy-owned fields in §2.5.
 A field named by the client's `Connection` header is also dropped (RFC 9110 §7.6.1).
 
 ### 2.4. Version translation
@@ -160,18 +160,21 @@ te           trailer   proxy-authorization   proxy-connection
 Proxy-owned fields are stripped from client input before routing, on every protocol, and the proxy re-adds the ones it can vouch for:
 
 ```text
-x-auth-claims   x-forwarded-for   x-forwarded-proto   x-forwarded-host   x-real-ip
+content-length   x-auth-claims   x-forwarded-for   x-forwarded-proto   x-forwarded-host   x-real-ip
 ```
 
-The proxy re-emits `X-Forwarded-For`, `X-Forwarded-Proto` and `X-Forwarded-Host` on every request, and `X-Auth-Claims` on a `require` route.
+The proxy re-emits `Content-Length` from the body it sends, `X-Forwarded-For`, `X-Forwarded-Proto` and `X-Forwarded-Host` on every request, and `X-Auth-Claims` on a `require` route.
 It drops `X-Real-IP` and never re-adds it.
+
+`Host` is the exception.
+The proxy forwards the client's `Host` unchanged and writes one only when the client sent none (§2.2), so a backend treats `Host` as attacker-controlled.
 
 The stripping is a security boundary.
 A backend that resolves a repeated field by first match would take a client's forged copy, because the proxy appends its own copy after the client's.
 Without stripping, any client could assert `{"groups":["admins"]}`.
 A forged `X-Forwarded-For` would defeat per-IP rate limiting by rotating the value.
 
-A value in one of those fields can only have come from the proxy, and MAY be trusted.
+A value in one of the proxy-owned fields can only have come from the proxy, and MAY be trusted.
 That trust holds only while the socket is reachable by the proxy alone (§6.1), so a backend that another path can reach MUST NOT trust them.
 
 ### 2.6. Request body
@@ -182,7 +185,8 @@ The proxy writes entire bodies and never chunked transfer coding, so `Transfer-E
 The backend MUST read exactly `Content-Length` bytes.
 A read beyond that waits for bytes that will never arrive, until the proxy's timeout expires.
 
-Those are the fields a backend parses, and the only ones it can trust.
+Those are the fields a backend parses.
+It MAY trust the proxy-owned values in §2.2 and §2.3 only while §2.5 holds, with `Host` excepted.
 Section 3 gives the response it writes.
 
 ## 3. The response
@@ -280,7 +284,8 @@ compresses = false          # default: true
 
 The proxy uses `compresses` to decide whether to advertise an encoding dimension.
 A backend that does not compress has one representation, so `Vary: Accept-Encoding` would promise variants that can never exist, and every shared cache downstream would fragment its storage on a field that cannot change the body.
-The proxy leaves a `Vary` the backend sent itself alone.
+When the backend sent no `Vary` and does not compress, the proxy adds none.
+When the backend sent a `Vary`, the proxy keeps its field names and adds `Accept-Encoding` to them, even when the backend does not compress.
 
 The backend reads the same key and MUST refuse to start when it disagrees with what it can do.
 An `m6-core` service gets this from `m6_core::compress::check_declared_support`, called before binding, and exits `2` per §8.3.
@@ -309,7 +314,7 @@ The proxy passes a status below `400` through, and it handles a status of `400` 
 This section gives that split and the rule for a path a backend does not serve.
 
 Table 4 gives the treatment by range.
-Take from it that the status is always the backend's and the body of an error is the proxy's.
+Take from it that the status is always the backend's, and that the proxy replaces the body of an error it did not store in the cache.
 
 | Range | Proxy behaviour |
 |---|---|
@@ -318,7 +323,8 @@ Take from it that the status is always the backend's and the body of an error is
 | below `400` | Passed through |
 
 **Table 4: status ranges and how the proxy handles each.**
-`m6-site-toml.md` gives the `[errors]` values, and no value delivers the backend's own error body to the client.
+`m6-site-toml.md` gives the `[errors]` values.
+A cacheable error response, such as a `404` marked `Cache-Control: public`, is stored before the error mode runs, so a later cache hit can serve the backend's own error body.
 
 A backend SHOULD return `404` for a path it does not serve, so the status is honest to caches and crawlers.
 A `200` with an error page hides a missing resource from both.
@@ -343,7 +349,6 @@ Take from it that every transport-level failure reaches the client as a `502`, w
 | Framing violation (§3.2) | `502` |
 | Response exceeds 128 MiB | `502` |
 | Connection closed before a complete response | `502` |
-| Backend returns `4xx` or `5xx` | The status reaches the client and the body is replaced according to `[errors] mode` (§4) |
 
 **Table 5: backend conditions and the response the proxy sends.**
 A slow backend and a refused connection produce the same `502`, so a client cannot tell them apart.
@@ -356,7 +361,7 @@ Section 6 gives the security rules that keep the socket trustworthy.
 
 ## 6. Security requirements
 
-Two boundaries keep the protocol safe: the socket is reachable only by the proxy, and every request field outside §2.2 and §2.3 is attacker-controlled.
+Two boundaries keep the protocol safe: the socket is reachable only by the proxy, and every request value is attacker-controlled unless the proxy owns it (§2.5).
 This section gives both boundaries and the header-injection rule that follows.
 
 ### 6.1. Trust boundary
@@ -366,7 +371,8 @@ The permissions on the socket's directory are the mechanism, and everything in �
 
 ### 6.2. Untrusted input
 
-Everything in a request except the fields in §2.2 and §2.3 is attacker-controlled: the request target, the query string, and every client-supplied field.
+Every field in a request is attacker-controlled except the proxy-owned fields in §2.2 and §2.3.
+`Host` is client-supplied, so it stays in the untrusted set.
 
 A backend MUST:
 
@@ -386,27 +392,22 @@ Section 7 gives the concurrency the socket supports.
 
 ## 7. Concurrency
 
-A backend is required to accept work while it is busy, and the proxy's pool decides which member gets the next connection.
-This section gives the pool's rule, the reference concurrency model and the way a pool grows.
-
-The proxy picks the member with the fewest in-flight connections.
+A backend is required to accept work while it is busy.
+This section gives the concurrency model a member needs.
 
 A backend MUST be able to accept a new connection while it is handling another.
 It MAY use threads, processes or an event loop.
 
-The reference model, given in `m6-architecture.md` §7.1, is a fixed thread pool with a bounded queue: the pool size defaults to the *CPU* (central processing unit) count, the queue depth to eight times the pool size, and a full queue answers `503` at once.
-Returning `503` under overload is correct behaviour, because it is how backpressure reaches the proxy.
+The reference model, given in `m6-architecture.md` §7.1, is a fixed thread pool with a bounded queue.
+A full queue answers `503`, which is how backpressure reaches the proxy.
 
-A pool scales by adding members, with more sockets and more service instances.
-One process keeps its fixed pool.
-
-That is the concurrency a member provides and the way a pool grows.
+That is the concurrency a member provides.
 Section 8 gives the lifecycle that puts a member in the pool and takes it out.
 
 ## 8. Lifecycle
 
-A member joins the pool when its socket appears and leaves when the socket goes.
-This section gives startup, shutdown, exit codes and the reload that happens without leaving the pool at all.
+A member's lifecycle is four events: startup, shutdown, exit and reload.
+This section gives all four.
 
 ### 8.1. Startup
 
@@ -445,27 +446,38 @@ A backend MAY watch `site.toml` and its own configuration file and reload withou
 This step is OPTIONAL.
 A restart is a valid implementation, because the pool handles the socket disappearing and reappearing.
 
-Those are the four points at which a member enters or leaves service.
+Those are the four events in a member's lifecycle.
 Section 9 collects every MUST into one checklist.
 
 ## 9. Minimum viable backend
 
-A backend that meets this checklist satisfies the contract.
-This section collects every MUST in the document and names the work the proxy keeps for itself.
+A backend that meets every item here satisfies every MUST in this version of the contract.
+This section collects every MUST a backend implements, with the section that states it.
 
 Everything a backend MUST do:
 
-- [ ] Remove the stale socket and bind a Unix `SOCK_STREAM` socket matching the glob.
-- [ ] Make the socket reachable by the proxy's user, with `0660` and a trusted group or `0666` behind a trusted directory.
-- [ ] Accept connections and serve requests.
-- [ ] Parse an HTTP/1.1 request line and header section.
-- [ ] Read exactly `Content-Length` body bytes, if any.
-- [ ] Emit an `HTTP/1.1` status line.
-- [ ] Emit an accurate `Content-Length`.
-- [ ] Emit `Content-Type` with a charset on text.
-- [ ] Send no body for `HEAD`, `1xx`, `204` or `304`.
-- [ ] Close the connection after responding to a request with `Connection: close`.
-- [ ] On `SIGTERM`, drain, unlink the socket and exit `0`.
+- [ ] Remove the stale socket and bind a Unix `SOCK_STREAM` socket matching the glob (§1.2).
+- [ ] Make the socket reachable by the proxy's user, with `0660` and a trusted group or `0666` behind a trusted directory (§1.2).
+- [ ] Listen with a backlog of at least 64 (§1.2).
+- [ ] Keep the socket reachable only by the proxy (§6.1).
+- [ ] Accept a new connection while it is handling another, and serve requests (§1.3, §7).
+- [ ] Parse an HTTP/1.1 request line and header section (§2.1).
+- [ ] Treat the request target as bytes until validated, then decode it and treat the result as untrusted (§2.1, §6.2).
+- [ ] Read exactly `Content-Length` body bytes, if any (§2.6).
+- [ ] Emit an `HTTP/1.1` status line (§3.1).
+- [ ] Frame the response with `Content-Length`, with a correctly chunked body and a terminated trailer section, or by closing the connection (§3.2).
+- [ ] Emit `Content-Type` with a charset on text (§3.4).
+- [ ] Send no body for `HEAD`, `1xx`, `204` or `304` (§3.3).
+- [ ] Close the connection after responding to a request with `Connection: close`, handle the proxy closing it after each response, and do not rely on pipelining (§1.3).
+- [ ] Declare in `site.toml` whether the service compresses, and refuse to start with exit `2` when the declaration disagrees with what it does (§3.6.1).
+- [ ] If it compresses, send an accurate `Content-Encoding` and honour `Accept-Encoding` (§3.6).
+- [ ] Trust the proxy-owned fields in §2.2 and §2.3 only while the socket is reachable by the proxy alone (§2.5).
+- [ ] Treat `Host` as attacker-controlled and validate it before use (§2.5, §6.2).
+- [ ] Reject or sanitise path traversal before using a request-derived value in a filesystem path (§6.2).
+- [ ] Bound anything derived from the request that it allocates (§6.2).
+- [ ] Refuse to copy a request-derived value into a response field without validating it (§6.3).
+- [ ] On `SIGTERM` or `SIGINT`, stop accepting, drain, unlink the socket and exit `0` (§8.2).
+- [ ] Exit immediately on a second `SIGTERM` or `SIGINT` (§8.2).
 
 There is no requirement to implement TLS, HTTP/2, HTTP/3, chunked encoding, caching, authentication or connection reuse.
 The proxy terminates TLS and the newer protocols, caches responses and verifies tokens.
@@ -474,5 +486,5 @@ Compression is the exception: §3.6 makes it the backend's job, and `m6-http` ha
 The checklist is small enough to implement from scratch in any language.
 `m6-backend-examples.md` gives six reference implementations, all written against this document.
 
-A backend that binds one socket, answers each HTTP/1.1 request with correct framing and drains on `SIGTERM` satisfies this version of the contract.
+A backend that meets these items serves the contract this version defines, whatever language it is written in.
 A later version adds to it without breaking what this version promises.
