@@ -388,15 +388,10 @@ pub struct PerfReport {
     pub node: String,
     /// What this node is running: name, version and build hash.
     ///
-    /// This was a bare `version: String` until 2026-09-20 (#105), and the
-    /// version is still in it, unchanged in meaning. What it could not do is
-    /// tell two builds of one tag apart. Two nodes can report one version and
-    /// run different bytes, and only the hash shows it.
-    ///
-    /// Why the version alone was already worth having, kept because the argument
-    /// still applies to the whole structure: without it the only way to learn
-    /// what a node runs was to ssh in and ask the binary, so "every node runs the
-    /// pinned release" was an invariant nothing could check. Four written records
+    /// [`BuildId`] says why the three fields differ and why the hash is md5.
+    /// The version stays because without one the only way to learn what a node
+    /// runs was to ssh in and ask the binary, so "every node runs the pinned
+    /// release" was an invariant nothing could check. Four written records
     /// can disagree about one fleet with none of them matching it: a deploy
     /// repository pinning one tag, its captured config naming that tag with an
     /// artefact hash matching nothing running, a release log naming an older
@@ -826,8 +821,7 @@ mod tests {
         // here rather than against a constant, which would pin whatever the
         // code produced on the day and prove only that it has not changed.
         // This is the property that makes the field worth having: it must equal
-        // `md5sum` of the artefact, which is the number a deployment records
-        // per node and compares before a promotion.
+        // `md5sum` of the artefact.
         use md5::{Digest, Md5};
         let exe = std::env::current_exe().expect("a test binary has a path");
         let expected = format!("{:x}", Md5::digest(std::fs::read(&exe).unwrap()));
@@ -862,7 +856,7 @@ mod tests {
         assert_ne!(
             a, b,
             "a fleet holding these two is NOT uniform, and comparing versions \
-             alone would call it uniform. That is what happened on 2026-09-20."
+             alone would call it uniform."
         );
     }
 

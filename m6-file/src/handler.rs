@@ -210,11 +210,9 @@ pub fn serve(req: &Request) -> Result<Response> {
     // already its length. That is also the common case for the assets worth
     // caring about, since images are neither compressed nor minified here.
     //
-    // The `is_file` check matters and was missing in the first version of this.
     // `std::fs::metadata` succeeds on a directory and reports its size, so
-    // `HEAD /assets/css` answered `200` with `Content-Length: 128` while the
-    // GET beside it answered 404. The read this block skips is also what used
-    // to reject a non-file, by failing.
+    // without `is_file` a `HEAD /assets/css` answers `200` with a
+    // `Content-Length` while the GET beside it answers 404.
     let minify_this = minification
         .map(|m| m.is_enabled(&mime_base))
         .unwrap_or(false);
@@ -237,11 +235,9 @@ pub fn serve(req: &Request) -> Result<Response> {
             debug!(path = %fs_path.display(), "file not found");
             return Ok(Response::not_found());
         };
-        // One minified JavaScript bundle of 3.6MB used to be read into a `Vec`
-        // on every cache miss to be copied straight out again. A file that
-        // changed between the `stat` and the `open` is handled by the responder
-        // rather than here: short reads fail and overruns are capped, because
-        // `Content-Length` is already on the wire by then.
+        // A file that changed between the `stat` and the `open` is handled by
+        // the responder rather than here: short reads fail and overruns are
+        // capped, because `Content-Length` is already on the wire by then.
         let mut streamed = Response::stream(200, metadata.len(), file);
         streamed.headers = base.headers;
         return Ok(streamed);

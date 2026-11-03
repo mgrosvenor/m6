@@ -266,9 +266,8 @@ pub struct CompiledRoute {
     /// A rendered page has no file of its own to stat, which is why it carried
     /// no `Last-Modified` at all and every `If-Modified-Since` came back 200
     /// with the whole page. It does have inputs, though, and their mtimes are a
-    /// truthful answer: the max over every template (partials are shared, so a
-    /// change to a shared partial genuinely can change any page) and this route's
-    /// own static params files.
+    /// truthful answer: the max over every template and this route's own static
+    /// params files.
     ///
     /// Computed once when the framework state is built, so it costs nothing per
     /// request, and recomputed on reload.
