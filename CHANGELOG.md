@@ -81,6 +81,9 @@ Verified with `l2_query_relpath_cannot_replace_the_path_parameter` and `l2_query
 
 ### Fixed
 
+**`a_burst_of_writes_is_at_most_two_reloads` no longer fails on a busy machine (#299).**
+It wrote the config three times 10 ms apart and expected at most two reloads, but the reloader only merges a write that lands within 20 ms of the last report, so on a loaded runner a late write was rightly reported a third time. The test now spaces its writes 5 ms apart (longer than the service loop takes to wake and reload, so it is unlikely to merge them by itself), times each burst, and judges only one that fitted inside the window, retrying up to five times. Verified on the build host, 20 runs each: 20 passes with four CPU-bound processes running, and 20 failures reporting three reloads with the reloader's hold removed.
+
 **CI runs example 05's integration test after its stack is up (#277).**
 The examples' unit-test step ran `cargo test --workspace` in m6-examples before example 05's `dev.sh` had created the dev certificate and auth database. Since m6-examples #11 that test fails on missing prerequisites instead of skipping, so every pull request failed. The step now skips that test, and the example 05 step runs it once the stack answers, as m6-examples' own CI does.
 Verified by this pull request's own CI run.
