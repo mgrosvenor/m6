@@ -111,6 +111,8 @@ Comments only.
 
 **`docs/m6-backend-examples.md` follows the documentation ruleset, and it now agrees with the backend protocol that compression is the backend's job and matches `docs/BENCHMARKS.md` and `tools/build-host-tests.sh` (#141).**
 
+**`docs/m6-architecture.md` now names `M6_SOCKET_OVERRIDE` as the one environment variable a service reads, and the `socket_path_from_config` doc comment points at that page (#187).**
+
 ### Changed
 
 **The m6-auth-cli integration tests assert that each setup command succeeds, and print its stderr when one does not (#258).**

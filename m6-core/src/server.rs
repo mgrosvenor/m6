@@ -56,6 +56,8 @@ use crate::parse;
 ///
 /// It lives here so the contract is one thing an app inherits rather than four
 /// things an app remembers.
+///
+/// This exception is documented in `docs/m6-architecture.md`.
 pub fn socket_path_from_config(config_path: &Path) -> PathBuf {
     if let Ok(override_path) = std::env::var("M6_SOCKET_OVERRIDE") {
         return PathBuf::from(override_path);
