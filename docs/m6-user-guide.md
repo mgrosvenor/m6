@@ -206,7 +206,7 @@ It sets the title block, loads `/assets/style.css`, renders `nav` from `data/sit
 
 m6-html builds one params map per request.
 The map holds the global params, the route's params files, the path captures and the query parameters.
-Each query parameter is available under `query` and at the top level.
+Each query parameter is available under `query`, and at the top level unless a path capture has the same name.
 
 ### 2.7. `dev.sh`
 

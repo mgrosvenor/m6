@@ -215,7 +215,9 @@ The per-request order is:
 - Path params, each validated.
   A `{*name}` capture may span segments and a `{name}` capture may not.
 - Query params, inserted at top level and as a nested `query` map.
+  A query key with the name of one of the route's path params is only in `query`, so it cannot replace the validated path value.
 - POST form fields, from `application/x-www-form-urlencoded` only.
+  A field with the name of one of the route's path params is dropped, for the same reason.
   A non-empty body of any other type logs a warning.
 - Cookies, as a nested `cookies` map.
 - Built-ins `request_path`, `datetime` and `year`, after the params files so a params file cannot override them.
