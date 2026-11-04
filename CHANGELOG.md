@@ -109,6 +109,8 @@ Comments only.
 
 **docs/POSITIONING.md no longer carries the withdrawn 22.0 µs and 158,323 req/s figures, and its cross-server tables are replaced by a caveated capability comparison (#192, #158).**
 
+**`docs/m6-backend-examples.md` follows the documentation ruleset, and it now agrees with the backend protocol that compression is the backend's job and matches `docs/BENCHMARKS.md` and `tools/build-host-tests.sh` (#141).**
+
 ### Changed
 
 **The m6-auth-cli integration tests assert that each setup command succeeds, and print its stderr when one does not (#258).**
