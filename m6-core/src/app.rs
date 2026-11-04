@@ -4822,7 +4822,7 @@ mod copy_audit {
     }
 
     #[test]
-    #[ignore = "a measurement; needs the site repo beside this one"]
+    #[ignore = "a measurement; set M6_REAL_CONTENT_JSON to a content file"]
     fn every_copy_app_makes_per_request() {
         // As above: a real content file, named by the environment rather than
         // by this repository. See build_dict_against_the_real_content_json.
