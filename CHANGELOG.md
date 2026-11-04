@@ -59,6 +59,10 @@ A probe compiles and runs a trivial program with the same flags before the suite
 
 ### Fixed
 
+**CI runs example 05's integration test after its stack is up (#277).**
+The examples' unit-test step ran `cargo test --workspace` in m6-examples before example 05's `dev.sh` had created the dev certificate and auth database. Since m6-examples #11 that test fails on missing prerequisites instead of skipping, so every pull request failed. The step now skips that test, and the example 05 step runs it once the stack answers, as m6-examples' own CI does.
+Verified by this pull request's own CI run.
+
 **The signal-mask guard fails closed (#178).**
 When the thread's signal mask cannot be read, a service now refuses to start instead of assuming SIGTERM is blocked.
 

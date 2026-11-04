@@ -295,7 +295,10 @@ jobs:
       - name: Examples unit tests
         working-directory: m6-examples
         run: |
-          cargo test --workspace > full.log 2>&1 || true
+          # Example 05's end-to-end test needs the certificate and auth
+          # database that dev.sh creates, and fails without them, so it runs
+          # in the example 05 step below once the stack is up (#277).
+          cargo test --workspace -- --skip blog_site_end_to_end > full.log 2>&1 || true
           grep -E '^test result:' full.log || true
           if grep -q '^failures:' full.log; then
             sed -n '/^failures:/,$p' full.log | head -60
@@ -416,6 +419,7 @@ jobs:
           # only way to tell a broken example from a broken backend. Without this,
           # 33 failures showing 502s said nothing about WHICH service was down.
           ./test.sh || { echo "--- service logs ---"; tail -30 logs/*.log 2>/dev/null; exit 1; }
+          (cd "$GITHUB_WORKSPACE/m6-examples" && cargo test -p render-cms --test integration)
 
       - name: Stop the stack
         if: always()
