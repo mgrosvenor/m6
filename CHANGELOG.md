@@ -66,6 +66,11 @@ A probe compiles and runs a trivial program with the same flags before the suite
 
 ### Security
 
+**HTTP/2 now advertises SETTINGS_MAX_HEADER_LIST_SIZE and refuses a request whose decoded header list is over 64 KiB with a 431 (#162).**
+Only the compressed header block was bounded, at 256 KiB, and HPACK lets one byte stand for a table entry of up to 4096 bytes, so a block under that cap could decode to a far larger header list.
+The list is now counted as RFC 9113 6.5.2 defines it while it is decoded, and a field is kept only while the list is within the limit, so a request keeps at most 64 KiB of header fields, as RFC 9113 6.5.2 counts them, however far its block would decode. It is answered 431 and RST_STREAM on its own stream after it is decoded in full, so the HPACK table stays in step and other streams are unaffected.
+Verified with `a_header_list_over_the_limit_is_answered_431_on_its_stream`, `the_server_settings_advertise_the_header_list_limit` and `an_amplified_block_never_holds_more_than_the_limit_in_memory`, which fail without the change and pass with it (a 6,009-byte block made the old decoder keep 8 MB of fields), and with a request exactly at the limit still served.
+
 **A query key or form field can no longer replace a path parameter, and m6-file serves only the file its route's pattern addresses (#279).**
 Core checked every path parameter for `..` and stray characters, then added each query parameter to the same request dictionary under the same name.
 A request such as `GET /assets/a.css?relpath=../config` therefore reached m6-file with the unchecked query value as `relpath`, and m6-file served the file it named, outside the site directory.
