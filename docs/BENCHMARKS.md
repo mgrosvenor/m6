@@ -1,86 +1,130 @@
 # m6 benchmarks
 
-Every number here is reproducible from the command lines given. If a figure
-appears anywhere else in this repository without the conditions that produced
-it, treat the figure as wrong and this file as authoritative.
+This page reports m6's benchmark figures with the conditions recorded for each set, and section 11 names the cases where that record is thin.
+This page is the authority for what a client observes end to end.
+`docs/PERFORMANCE.md` owns what one component costs, and `tools/perf-baseline.txt` owns the numbers a merge is gated on.
+A figure quoted anywhere else without its conditions is wrong, and this page is where the figure is checked.
 
-## Why this file was rewritten (2026-09-06)
+The sections below give the evidence for that rule.
 
-An external audit found the published throughput figures not credible, and it
-was right. The README carried **two tables claiming the same conditions** ("8
-concurrent connections, TLS, warm cache") with irreconcilable values:
+## 1. Contents
+
+The sections follow the order a reader needs them, from why the page exists to what it does not establish.
+
+2. [Why this file was rewritten (2026-09-06)](#2-why-this-file-was-rewritten-2026-09-06)
+3. [The methodology bug: concurrency and co-location](#3-the-methodology-bug-concurrency-and-co-location)
+4. [Conditions behind the end-to-end figures](#4-conditions-behind-the-end-to-end-figures)
+5. [End-to-end results](#5-end-to-end-results)
+6. [Reading the latency figures](#6-reading-the-latency-figures)
+7. [What these figures do not claim](#7-what-these-figures-do-not-claim)
+8. [Criterion microbenchmarks](#8-criterion-microbenchmarks)
+9. [Where to run a comparative benchmark](#9-where-to-run-a-comparative-benchmark)
+10. [Backend examples, direct to socket](#10-backend-examples-direct-to-socket)
+11. [Summary](#11-summary)
+
+Section 2 begins with the 2026-09-06 rewrite, because every later figure depends on the methodology that rewrite established.
+
+## 2. Why this file was rewritten (2026-09-06)
+
+An external audit found the published throughput figures not credible, and it was right.
+The README carried two tables that claimed the same conditions, for *HTTP* (Hypertext Transfer Protocol) versions 1.1, 2 and 3: 8 concurrent connections, *TLS* (Transport Layer Security) and a warm cache.
+Their values cannot both be true.
+Table 1 gives the two tables and the ratio between them.
 
 | protocol | table A | table B | ratio |
 |---|---:|---:|---:|
-| HTTP/1.1 | 8,840 req/s | 11,857 req/s | 1.3× |
-| HTTP/2 | 28,797 req/s | 158,323 req/s | **5.5×** |
-| HTTP/3 | 61,748 req/s | 77,672 req/s | 1.3× |
+| HTTP/1.1 | 8,840 req/s | 11,857 req/s | 1.3x |
+| HTTP/2 | 28,797 req/s | 158,323 req/s | **5.5x** |
+| HTTP/3 | 61,748 req/s | 77,672 req/s | 1.3x |
 
-At least one was wrong and a reader had no way to tell which. Neither recorded
-the commit, the hardware, the payload, or the command line, so neither could be
-checked. They have been deleted rather than reconciled.
+**Table 1: two published tables that claimed identical conditions, and the ratio between them.**
+The HTTP/2 row differs by 5.5x, so one of the two tables was wrong and a reader could not tell which.
 
-**Measured on real hardware, they are both far too high** — see the results
-below. The most likely explanation is the methodology bug found while
-re-measuring, described next.
+Both published tables are too high.
+The figures in section 5 are at least 4x below table A on every row and at least 58x below it on HTTP/3.
+Neither table recorded the commit, the hardware, the payload or the command line, so neither could be checked or repaired.
+Both are deleted.
 
-## The methodology bug worth knowing about
+The commit that deleted the two tables says the methodology bug in section 3 "likely explains the original figures".
+Section 3 gives the bug, and section 5 gives the figures that replaced the deleted tables.
 
-The harness defaults to `--concurrency 8`. On a 4-core machine the load
-generator and the server **share those cores**, so at concurrency 8 the client
-starves the server it is measuring. The symptom is not a plausible-looking
-lower number; it is instability. Two back-to-back runs of the identical command
-disagreed by **50×** on the same metric:
+## 3. The methodology bug: concurrency and co-location
 
-    cache-hit→m6-file (H2) p50:   89 µs   (run 1)
-                                4199 µs   (run 2)
+The harness default is the bug.
+`m6-bench` defaults to `--concurrency 8`, and on a 4-core machine the load generator and the server share those cores, so at concurrency 8 the client starves the server it is measuring.
 
-At `--concurrency 2`, leaving cores for the server, the same metric reproduces
-within 15% and usually within 7%. **Every number below is at concurrency 2 for
-that reason.** A benchmark that cannot be repeated is not a measurement, and
-co-locating the load generator with the server is the constraint that makes
-this necessary — a separate load-generator host would allow higher concurrency
-and would report higher throughput.
+The symptom is instability.
+Two back-to-back runs of the identical command disagreed by 50x on the same metric:
 
-Two other traps hit during the same session, both of which silently corrupt
-results:
+```text
+cache-hit to m6-file over HTTP/2, p50    89 µs    (run 1)
+                                       4199 µs    (run 2)
+```
 
-- **The rate limiter counts.** The first run was full of `429`s because staging
-  inherits production's `requests_per_min = 1200`. It was measuring the rate
-  limiter, not the server. Raised for the run and restored afterwards.
-- **`/tail/hello.txt` 404s** on a normal site config; that suite is measuring an
-  error path unless the bench backend is running.
+At `--concurrency 2`, which leaves cores for the server, the same metric reproduces within 15%.
+Every figure in sections 4 and 5 is at concurrency 2 for that reason.
 
-## Conditions
+A benchmark that cannot be repeated is noise.
+Co-locating the load generator with the server is the constraint that makes the low concurrency necessary.
+A separate load-generator host would allow higher concurrency and would report higher throughput.
 
-| | |
+Two further traps corrupt a run without saying so.
+
+- **The rate limiter counts.**
+  The first run was full of 429s because the configuration carried a 1,200 requests-per-minute limit.
+  That run measured the rate limiter.
+  The limit was raised for the run and restored afterwards.
+- **`/tail/hello.txt` answers 404** on a normal site configuration, so that suite measures an error path until the bench backend is running.
+
+Both traps produce figures that look like results, and section 4 gives the conditions behind the figures that survived them.
+
+## 4. Conditions behind the end-to-end figures
+
+A figure means nothing without the machine, the build and the topology that produced it.
+Table 2 gives the conditions behind every end-to-end figure in section 5.
+The commit is the tree that was measured.
+
+| condition | value |
 |---|---|
-| commit | `0a68cda` |
-| host | VPS, 4 vCPU Intel Xeon (Skylake, IBRS), 7 GB RAM |
-| OS | Ubuntu 26.04.1, kernel 7.0.0-30-generic |
+| commit | `3204e0f` |
+| host | *VPS* (virtual private server), 4 vCPU Intel Xeon (Skylake, IBRS), 7 GB *RAM* (random access memory) |
+| operating system | Ubuntu 26.04.1, kernel 7.0.0-30-generic |
 | toolchain | rustc 1.98.0, `cargo build --release` |
-| release profile | cargo defaults: `opt-level=3`, `lto=false`, `codegen-units=16`, `panic=unwind` |
-| TLS | rustls, TLS 1.3, self-signed cert, `--skip-verify` on the client |
-| topology | **client and server on the same host, over loopback** |
-| concurrency | 2 (see above) |
+| release profile | cargo defaults at the cited commit: `opt-level=3`, `lto=false`, `codegen-units=16`, `panic=unwind` |
+| TLS | rustls, TLS 1.3, self-signed certificate, `--skip-verify` on the client |
+| topology | client and server on the same host, over loopback |
+| concurrency | 2 (section 3) |
+| rate limit | raised for the recorded run and restored afterwards, and the value used was not recorded |
 | latency samples | 2000 per suite |
 | throughput window | 10 s |
-| CPU governor | not exposed on this VM — frequency scaling is not controlled |
+| frequency governor | not exposed on this VM, so frequency scaling is not controlled |
 
-The server under test was the staging m6-http, serving the real
-example.com content, so the payloads are real pages rather than a synthetic
-fixture.
+**Table 2: the conditions behind the end-to-end figures.**
+Every row constrains the reading, and a figure from another machine, another build or another concurrency is a different measurement.
 
-    cargo build --release --bin m6-bench
-    ./target/release/m6-bench --skip-verify --addr 127.0.0.1:443 \
-        --concurrency 2 --duration 10
+The rate-limit row names a condition and cannot give its value.
+A rerun at the code default of 300 requests per minute measures the limiter once the run passes 300 requests, so raise it as the recorded run did and write the value down.
 
-## Results
+The server under test was m6-http serving a site's real pages, so each payload was a page a site serves.
+The server is built from this workspace, and its configuration and the site's pages are not in this repository, so a rerun needs both.
+The two command lines below rebuild and rerun the client:
 
-Two consecutive runs, both reported, so the spread is visible rather than
-averaged away.
+```sh
+cargo build --release --bin m6-bench
+./target/release/m6-bench --skip-verify --addr 127.0.0.1:443 \
+    --concurrency 2 --duration 10
+```
 
-### Latency, µs (end-to-end, client-observed)
+`m6-bench` also takes `--latency-n`, which defaults to 2000, and `--h2c-addr` for the cleartext listener.
+
+Section 5 reports the figures, and a reader quoting one of them should quote Table 2 with it.
+
+## 5. End-to-end results
+
+Two consecutive runs are reported in full, so the spread between them is visible.
+
+Table 3 gives end-to-end latency in microseconds for six suites.
+Take from it that the two runs agree within 15% on p50, which is the repeatability the rest of the page relies on.
 
 | suite | p50 run 1 | p50 run 2 | p99 run 1 | p99 run 2 |
 |---|---:|---:|---:|---:|
@@ -91,7 +135,11 @@ averaged away.
 | HTTP/3 cache-hit → m6-html | 953.6 | 983.3 | 1344.5 | 1339.5 |
 | HTTP/3 cache-miss → m6-html | 4617.0 | 4329.3 | 5844.5 | 5525.9 |
 
-### Throughput, req/s
+**Table 3: end-to-end latency in microseconds, client-observed, two consecutive runs.**
+The p99 column is what a slow request costs.
+
+Table 4 gives throughput in requests per second from the same two runs.
+Take from it that the two runs agree within 11% on every row.
 
 | protocol | run 1 | run 2 |
 |---|---:|---:|
@@ -99,47 +147,60 @@ averaged away.
 | HTTP/2 | 7154.1 | 6711.2 |
 | HTTP/3 | 1030.3 | 1047.0 |
 
-## Reading these correctly
+**Table 4: throughput in requests per second, two consecutive runs.**
+Section 6 reads the protocol gap, and the HTTP/3 result belongs to this loopback setup.
 
-**The cache-hit latency here is not the same quantity as the "2.2 µs cache hit"
-measured in production, and conflating the two is probably how the original
-figures drifted.**
+Section 6 separates the two cache-hit quantities in these two tables.
 
-- **~230 µs (H2 above)** is end-to-end, client-observed: TLS record processing
-  on both sides, loopback syscalls, the client's own work, and the server's.
-- **~2.2 µs** is m6's internal timer around the cache lookup and response
-  construction, reported by the running server as `hit_p50_ns`.
+## 6. Reading the latency figures
 
-Both are true. The first is what a client experiences on this hardware; the
-second is what the cache costs. Quoting the second as though it were the first
-would be dishonest, and quoting the first as though it were the cache's cost
-understates it by two orders of magnitude.
+Two cache-hit figures are quoted in m6's documentation.
+They measure different things, and quoting one as the other is the error this page exists to prevent.
 
-**A cache miss costs ~4 ms**, dominated by the backend render, not by m6.
+The 225.7 µs HTTP/2 cache hit in Table 3 is end-to-end and client-observed.
+It includes TLS record processing on both sides, loopback syscalls, the client's own work and the server's.
+The 2.2 µs figure is m6's internal timer around the cache lookup and response construction, reported by the running server as `hit_p50_ns`.
 
-**HTTP/2 is roughly 3× faster than HTTP/1.1** here on both latency and
-throughput, which is the one qualitative claim these numbers support well.
-HTTP/3 is the slowest on throughput in this environment; that is a real result
-on a loopback co-located test and should not be generalised to a real network,
-where QUIC's advantages are about loss and RTT rather than raw local
-throughput.
+Both figures are true.
+The first is what a client experiences on this hardware.
+The second is what the cache costs.
+Quoting the 2.2 µs figure as what a client sees understates the client experience by two orders of magnitude, and quoting the 225.7 µs figure as the cache's cost overstates the cache's share by the same factor.
 
-## What is deliberately not claimed
+Four further readings follow from Table 3 and Table 4.
 
-- **No comparison against nginx, H2O or LiteSpeed.** The previous README quoted
-  such comparisons without having run them like-for-like. Numbers taken from
-  other people's blog posts, on other hardware, with other payloads, are not a
-  comparison.
-- **No multi-core scaling figures.** Not measured.
-- **No claim about a real network.** Everything here is loopback.
-- **No "sub-millisecond" marketing claim.** The internal cache hit is
-  microseconds; what a visitor experiences over the internet is dominated by
-  RTT and is tens to hundreds of milliseconds. Both facts belong together or
-  neither should be quoted.
+- **A cache miss costs at least 4 ms**, and the backend render dominates it.
+- **HTTP/1.1 cache misses are the slowest suite**, at 4.8 ms to 5.1 ms p50.
+- **HTTP/2 is 2.6x to 3x faster than HTTP/1.1 on a cache hit here**, 1.2x on a cache miss, and 3.4x to 3.6x faster on throughput.
+- **HTTP/3 is the slowest on throughput**, at 1,030 req/s to 1,047 req/s.
+  That is a real result on a loopback, co-located test.
+  *QUIC*, the transport protocol HTTP/3 runs on, gains its advantage from loss and round-trip time, so the result does not generalise to a real network.
 
-## Criterion microbenchmarks
+Section 7 lists what the page leaves unclaimed, which is the other half of reading a figure correctly.
 
-Pure CPU cost, no I/O, and therefore stable and worth keeping:
+## 7. What these figures do not claim
+
+Four claims are absent on purpose, and each absence is a decision a reader can hold the page to.
+
+- **No comparison against nginx, H2O or LiteSpeed.**
+  The previous README quoted such comparisons without having run them like-for-like.
+  Numbers taken from another project's blog post, on other hardware and with other payloads, are not a comparison.
+- **No multi-core scaling figures.**
+  None were measured.
+- **No claim about a real network.**
+  Every figure here is loopback.
+- **No sub-millisecond visitor claim.**
+  The internal cache hit is microseconds, and what a visitor experiences over the internet is dominated by round-trip time, in the tens to hundreds of milliseconds.
+  Both facts belong together or neither should be quoted.
+
+Section 8 turns to the *CPU* (central processing unit) microbenchmarks, which are the one set here that does not involve a network stack.
+
+## 8. Criterion microbenchmarks
+
+Criterion measures CPU cost with no I/O (input/output), which makes these medians the stable figures on the page.
+Table 5 gives four of them.
+
+Table 5 gives the median cost of four operations in the cache and the stats recorder.
+Take from it that a cache lookup costs tens of nanoseconds and a stats update costs under 1 ns.
 
 | operation | median |
 |---|---:|
@@ -148,154 +209,147 @@ Pure CPU cost, no I/O, and therefore stable and worth keeping:
 | `cache_miss` | 14.7 ns |
 | `stats_record` | 0.9 ns |
 
-These were not re-measured in the 2026-09-06 pass; they are carried over and
-should be re-run on the build host before being quoted as current.
+**Table 5: criterion medians for four cache and stats operations, in nanoseconds.**
 
----
+The 2026-09-06 pass did not re-measure these.
+They are carried over from an earlier run, and they carry no machine and no date, so re-run them on the build host before quoting them as current.
 
-## Where to run them, and why it matters
+Section 9 is about comparing two builds, and the machine dominates that comparison.
 
-**Diagnosed 2026-09-10.** The `critical_path` benches were producing a 19-26%
-spread between consecutive runs of the same commit, while criterion's
-confidence interval *within* each run was +/-0.08%. Internally precise,
-externally scattered: the signature of a per-process constant, not of noise.
+## 9. Where to run a comparative benchmark
 
-Two hypotheses were tested and one was wrong.
+A comparison between two builds needs a design that survives the machine, and m6's first design did not.
+Section 9.1 gives the diagnosis, section 9.2 the discarded rule, section 9.3 the rule that replaced it, and sections 9.4 and 9.5 the traps and the developer-machine conditions.
 
-**Wrong: the hash seed.** `Cache` uses `AHashMap`, and `ahash`'s `RandomState`
-is seeded from the OS once per process, so the same key lands in a different
-bucket every run. Plausible, and false. `Cache::with_fixed_seed_for_bench()`
-pins the seed; the spread was unchanged at 49-62 ns over five runs. The
-constructor was kept anyway, because determinism is worth having, but it fixed
-nothing.
+### 9.1. The diagnosis: core scheduling
 
-**Right: core scheduling on a loaded heterogeneous machine.**
+The `critical_path` benches produced a 19% to 26% spread between consecutive runs of the same commit, while criterion's confidence interval within each run was +/-0.08%.
+A number internally precise and externally scattered is the signature of a per-process constant, so the variance came from the environment.
+Two hypotheses were tested.
 
-| Configuration | Result | Spread |
+**The hash seed was the first, and it was wrong.**
+`Cache` uses `AHashMap`, and `ahash`'s `RandomState` is seeded from the OS once per process, so the same key lands in a different bucket every run.
+`Cache::with_fixed_seed_for_bench()` pins the seed, and the spread was unchanged at 49-62 ns over five runs.
+The constructor was kept because determinism is worth having.
+It fixed nothing.
+
+**Core scheduling on a loaded heterogeneous machine was the second, and it was right.**
+Table 6 gives the two configurations.
+
+| configuration | result | spread |
 |---|---|---|
 | Forced to efficiency cores (`taskpolicy -c background`) | 107.1, 108.0 ns | **+/-1%** |
-| Default QoS, mixed P/E | 49-62 ns | +/-13% |
+| Default quality of service, mixed performance and efficiency cores | 49-62 ns | +/-13% |
 
-The development machine is an Apple M4: **4 performance cores and 6 efficiency
-cores**. Efficiency cores run this workload **2.1x slower**, and pinning to
-them is reproducible to +/-1%. The benchmark was never broken; the scheduling
-was the variable.
+**Table 6: one bench under two core-scheduling configurations on the same machine, in nanoseconds.**
+Pinning to the efficiency cores is reproducible to +/-1% at 2.1x the cost, and the default setting scatters by 13%.
 
-The machine was also not idle when this was noticed. Load average was 89 rising
-to 151 on ten cores, with `spotlightknowledged` at 88.8% CPU and 112 Firefox
-`plugin-container` processes. Under that load macOS migrates a process across
-core classes, and a run lands anywhere between the P-core figure and the E-core
-figure depending on what share it happened to get.
+The development machine is an Apple M4 with 4 performance cores and 6 efficiency cores.
+Efficiency cores run this workload 2.1x slower, and pinning to them is reproducible to +/-1%.
+The benchmark was correct and the scheduling was the variable.
 
-### The rule, as first written, and why it was wrong
+The machine was also loaded when this was noticed.
+Load average was 89 rising to 151 on ten cores.
+Under that load macOS moves a process between core classes, and a run lands anywhere between the performance-core figure and the efficiency-core figure.
 
-It said: *comparative benchmark numbers come from the build host, which is a
-dedicated Linux VM with homogeneous cores, nothing else running, and the same
-OS as production.*
+The general lesson closes the diagnosis.
+A benchmark whose consecutive runs of unchanged code disagree by more than 2% is measuring something other than the code, and it should be diagnosed before it is quoted.
+Here the clue was the gap between the within-run interval, +/-0.08%, and the between-run spread, 13%: whatever varied was fixed for the life of a process and different between processes.
 
-**"Nothing else running" was asserted, not checked, and it is false.**
-Measured 2026-09-11, the build host is running:
+### 9.2. The rule about the build host, and why it was wrong
 
-```
-m6-http-origin  m6-html  m6-file  render-contact  render-analytics
-fail2ban        auditd   snapd
-```
+The rule was first written as a claim about the build host, and the claim was false.
+It said comparative benchmark numbers come from the build host, a dedicated Linux VM with homogeneous cores, nothing else running, and the same operating system as production.
 
-A full m6 stack, a log-scanning daemon and an audit daemon, on **four cores**.
-It is the staging environment as well as the build box. The cores are
-homogeneous, which fixes the P/E problem above, and the machine is busy, which
-replaces it with a different one.
+"Nothing else running" was asserted and not checked.
+Measured on 2026-09-11, the build host runs a full m6 stack, a log-scanning daemon and an audit daemon, on four cores.
+It is the staging environment as well as the build box.
 
-The consequence, measured on the **same tree and the same commit** across two
-passes:
+The cores are homogeneous, which removes the performance and efficiency problem, and the machine is busy, which replaces it with a different one.
+Table 7 gives the consequence: the same tree and the same commit, measured across two passes.
 
 | bench | pass 1 | pass 2 | swing |
-|---|---|---|---|
+|---|---|---:|---:|
 | `h3_header_extract` | 21.961 ns | 20.408 ns | **7.1%** |
 | `full_cache_hit_path` | 320.66 ns | 366.24 ns | **14.2%** |
 
-Criterion's interval *within* each run was well under 1%, so each number looks
-authoritative in isolation. Anything smaller than ~14% measured as "all of A,
-then all of B" on this host is drift, not signal.
+**Table 7: two passes over one unchanged tree on the build host, in nanoseconds.**
+A 14.2% swing on one bench is the size of the drift a comparison has to survive.
 
-### The rule
+Criterion's interval within each run was under 1% on both passes, so each number looks authoritative alone.
+Anything smaller than 14% measured as all of A and then all of B on this host is drift.
 
-**A comparative number comes from a paired, interleaved run, and never from
-measuring all of A and then all of B.** Alternate the two trees round by round
-and report a confidence interval on the *paired difference*. Drift then lands
-in both arms equally and subtracts out, which works on a busy machine and needs
-no infrastructure change. `tools/paired_bench.sh` is the harness.
+Section 9.3 gives the design that cancels the drift.
 
-An absolute number quoted on its own is only meaningful with the host and the
-date attached, and is not comparable to one taken on a different machine. A
-figure taken on the laptop must never be compared against a build-host figure,
-whichever document either of them appears in.
+### 9.3. The rule: paired and interleaved
 
-### Two traps in the harness itself
+A comparative number comes from a paired, interleaved run.
+Alternating the two trees round by round puts the drift into both arms equally, so it cancels in the paired difference instead of landing on one side.
+Report the paired difference with a confidence interval.
 
-**`--sample-size` on the command line is silently ignored.** The bench source
-calls `group.sample_size(100_000)` in nine places, and criterion applies the
-group setting after the CLI config, so the code wins. A run requesting 30
-samples and a 3-second measurement still performs 100,000 samples, which is why
-a sixteen-measurement sweep took two hours rather than five minutes. The flag
-appears on the process command line and does nothing.
+[`tools/paired_bench.sh`](../tools/paired_bench.sh) is the harness.
+It builds both trees, waits for the load average to fall below 0.35, then runs the named bench for ten interleaved rounds by default and prints one line per tree per round.
 
-**Do not run a benchmark against a tree you are still editing**, and check that
-a previous run has actually died before starting another. A first attempt at
-the A/B measured a tree being changed underneath it, and a second competed with
-an orphaned run that had survived being killed from the other end of an SSH
-session; both produced numbers that looked fine.
+An absolute figure quoted on its own is meaningful only with the host and the date attached, and it is not comparable to one taken on a different machine.
+A figure taken on the laptop must never be compared against a build-host figure, in this page or any other.
 
-A developer machine is fine for a quick look, with two conditions:
+Section 9.4 gives two traps in the harness itself, both of which produced figures that looked fine.
 
-1. **Check the load first.** `uptime`. A load average above the core count
-   means the numbers are not comparable to anything.
-2. **If you must compare on a heterogeneous machine, pin the core class.**
+### 9.4. Two traps in the harness itself
+
+**`--sample-size` on the command line is ignored.**
+The bench groups set `group.sample_size` in the source, and criterion applies the group setting after the command-line configuration, so the code wins.
+A run requesting 30 samples and a three-second measurement still performs the count the group set, which is why a sixteen-measurement sweep took two hours instead of five minutes.
+The flag is on the process command line and does nothing.
+
+**Do not benchmark a tree you are still editing.**
+Check that a previous run has died before starting another.
+A first attempt at the A/B measured a tree being changed underneath it, and a second competed with an orphaned run that had survived being killed from the other end of an *SSH* (Secure Shell) session.
+Both produced figures that looked fine.
+
+Section 9.5 gives the conditions under which a developer machine can still be used.
+
+### 9.5. A developer machine, with two conditions
+
+A developer machine is fine for a quick look, with two conditions.
+
+1. **Check the load first.**
+   `uptime`.
+   A load average above the core count means the figures are not comparable to anything.
+2. **Pin the core class if you must compare on a heterogeneous machine.**
    `taskpolicy -c background` gives +/-1% reproducibility on an M-series Mac.
-   The absolute figure is then 2.1x the real one and must never be quoted, but
-   run-to-run comparison is valid, which is what regression detection needs.
+   The absolute figure is then 2.1x the real one and must never be quoted, while the run-to-run comparison is valid, which is what regression detection needs.
 
-### The general lesson
+Both conditions are about the machine, because the benchmark itself is stable.
+Section 10 applies the same discipline to six implementations on Unix sockets.
 
-A benchmark whose consecutive runs of unchanged code disagree by more than a
-percent or two is not measuring the code. Diagnose it before quoting it. The
-tell here was the gap between the within-run interval (+/-0.08%) and the
-between-run spread (+/-13%): whatever varied was fixed for the life of a
-process and different between processes, which pointed at the environment
-rather than at the benchmark or the code.
+## 10. Backend examples, direct to socket
 
----
+The six backend examples under `m6-http/tests/backends/` each implement the same `/status` route, and section 5 of [`m6-backend-examples.md`](m6-backend-examples.md) asks how expensive each implementation of the contract is.
+The measurement runs each one on its Unix socket with no proxy in the path.
 
-## Backend examples, direct to socket (2026-09-13)
+Conditions: commit `3ab8f37`, build host, 4-core Linux 7.0.0-31-generic x86_64, payload 660 bytes.
+The payload is byte-identical across all six and asserted so by `m6-http/tests/backends_contract.rs`.
+Each backend takes 5 seconds of load at concurrency 2, for the reason in section 3: the generator and the server share four cores, and higher concurrency starves the server it is measuring.
 
-`docs/m6-backend-examples.md` §5. Six implementations of the same `/status`
-route, measured on their Unix sockets with no proxy in the path, answering the
-question "how expensive is this implementation of the contract".
+```sh
+cargo build --workspace --release
+python3 tools/backend-bench.py --duration 5 --workers 2
+```
 
-**Conditions.** Commit `cad572f`. Build host, 4-core Linux 7.0.0-31-generic x86_64.
-Payload 660 bytes, byte-identical across all six and asserted so by
-`m6-http/tests/backends_contract.rs`. 5 seconds of load per backend.
-**Concurrency 2**, for the reason this file already documents: the generator and
-the server share four cores and at higher concurrency the client starves the
-server it is measuring.
+Everything ran from RAM, staged into `/dev/shm`: the binaries, the payload and the sockets.
+Cold start reads the binary off disk otherwise, and the two Rust examples differ 56.7x in artefact size, so a disk-backed run would charge m6-core for a page cache miss and call it framework overhead.
+A run on macOS is labelled *NOT-RAM* (not in RAM) by the tool and is not comparable.
+There the cold-start column was 400-650 ms for every compiled example and 52 ms for Python, which is first-exec code signing on Apple Silicon.
 
-    cargo build --workspace --release
-    python3 tools/backend-bench.py --duration 5 --workers 2
+The client's own cost was measured.
+The generator connected and closed a socket in its own process with no HTTP: 20,475 req/s, p50 44.7 µs.
+Every row's p50 in Table 8 sits above that floor, so the differences between rows are resolvable.
 
-**Everything ran from RAM**, staged into `/dev/shm`: binaries, payload and
-sockets. Cold start reads the binary off disk otherwise, and the largest binary
-here is 57x the smallest, so a disk-backed run charges `m6-core` for a page
-cache miss and calls it framework overhead. A run on macOS is labelled NOT-RAM by
-the tool and is not comparable: there the cold-start column was 400-650ms for
-every compiled example and 52ms for Python, which is first-exec code signing on
-Apple Silicon rather than anything about the languages.
+Table 8 gives the six implementations, with *RSS* (resident set size) under load and the cold-start time to the first response.
+Take from it that the two Rust rows are the comparison the section exists for, and that Python answers at 3,513 req/s.
 
-**The client's own cost was measured, not assumed**: connect and close on a
-socket in the generator's own process, no HTTP. 20,475 rps, p50 44.7us. Every
-row below sits above that floor, so the numbers are resolvable rather than
-generator-bound.
-
-| language | rps | p50 us | p99 us | RSS KB | artifact bytes | cold ms |
+| language | req/s | p50 µs | p99 µs | RSS KB | artifact bytes | cold ms |
 |---|---:|---:|---:|---:|---:|---:|
 | c | 23,353 | 155.9 | 401.0 | 2,160 | 21,968 | 3.1 |
 | cpp | 23,088 | 158.2 | 398.2 | 4,224 | 37,856 | 3.3 |
@@ -304,55 +358,74 @@ generator-bound.
 | rust-plain | 28,954 | 63.7 | 138.8 | 2,612 | 554,888 | 2.9 |
 | rust-m6core | 18,297 | 102.2 | 194.9 | 22,992 | 31,468,168 | 19.0 |
 
-Read Python's row as §4 asks: this route is deliberately the shape it is worst
-at, trivial per-request work at a high rate with nothing native to dispatch
-into. It is the floor of what dispatch costs, not a verdict on the language.
+**Table 8: six implementations of the same `/status` route, one 5-second run each, direct to the Unix socket.**
+The cold column is milliseconds to the first successful response.
 
-### What linking m6-core costs
+Read Python's row as section 4 of [`m6-backend-examples.md`](m6-backend-examples.md) asks: this route is the shape Python is worst at, trivial per-request work at a high rate with nothing native to dispatch into.
+The row is the floor of what dispatch costs, and section 5.3 of that page warns against reading it as a language ranking.
 
-This is the comparison the phase exists for, per §5.3: same language, same
-compiler, same payload, same concurrency model, so the delta is the library.
+Section 10.1 gives the comparison the section exists for, Rust against Rust with and without m6-core.
+
+### 10.1. What linking m6-core costs
+
+Same language, same compiler, same payload and the same concurrency model, so the difference is the library.
+Table 9 gives it.
 
 | | rust-plain | rust-m6core | delta |
-|---|---:|---:|---|
-| throughput | 28,954 rps | 18,297 rps | **-36.8%** |
-| p50 | 63.7 us | 102.2 us | **+38.5 us** |
-| p99 | 138.8 us | 194.9 us | +56.1 us |
+|---|---:|---:|---:|
+| throughput | 28,954 req/s | 18,297 req/s | **-36.8%** |
+| p50 | 63.7 µs | 102.2 µs | **+38.5 µs** |
+| p99 | 138.8 µs | 194.9 µs | +56.1 µs |
 | RSS | 2,612 KB | 22,992 KB | 8.8x |
 | artifact | 554,888 B | 31,468,168 B | 56.7x |
 | cold start | 2.9 ms | 19.0 ms | 6.6x |
 
-Reproduced: a second identical run gave -35.6% and +36.0us, within 3% of the
-first.
+**Table 9: the two Rust examples, same payload and same concurrency model, in one run.**
+The delta column is the cost of linking m6-core.
 
-**§5.3 says that if this number is not close to zero, `m6-core` has a problem
-worth knowing about. It is not close to zero.** Roughly 37us per request goes
-somewhere: dictionary building, route matching, the response pipeline and
-logging, on a route whose own work is copying 660 bytes out of memory.
+A second identical run gave -35.6% and +36.0 µs, within 3% of the first.
+Section 5.3 of [`m6-backend-examples.md`](m6-backend-examples.md) says that a delta that is not close to zero is a problem worth knowing about, and this delta is not close to zero.
+It is 37 µs per request, which goes into building the request dictionary, matching the route, running the response pipeline and logging.
 
-Two things that are true at the same time, and neither cancels the other:
+Two things are true at the same time.
 
-- **It is a real cost and the biggest single finding of Phase 8.** A backend
-  answering trivial requests at a high rate pays about a third of its throughput
-  for the convenience, and carries 8.8x the resident memory.
-- **It is measured on the shape that maximises it.** The route does almost
-  nothing, so the framework is nearly the whole cost. Behind the edge cache the
-  hit rate is 0.87 to 0.90 and a hit is served in single-digit microseconds, so
-  most requests never reach a backend at all. This is not "the site is 36%
-  slower".
+- **The cost is real and it is the largest single finding of the backend example comparison.**
+  A backend answering trivial requests at a high rate pays 36.8% of its throughput for the convenience, and carries 8.8x the resident memory.
+- **The cost is measured on the shape that maximises it.**
+  The route's own work is one 660-byte copy, so the framework carries the request.
+  Behind the edge cache the hit rate is 0.87 to 0.90 and a hit is served in single-digit microseconds, so 87% to 90% of requests never reach a backend at all.
+  Read the 36.8% as this route shape's cost.
 
-### The methodology bug this found, in the examples rather than in m6
+Section 10.2 gives the control error that inverted the first version of this result.
 
-The first version of this measurement reported `m6-core` as **72% faster** than
-plain Rust. That was wrong, and the cause was the control rather than the
-subject: `rust-plain` spawned a thread per connection while core answered from a
-fixed pool, so the comparison was pooling against thread-per-connection and not
-library against no library.
+### 10.2. The methodology bug this found in the examples
 
-Protocol §7 names a fixed pool with a bounded queue as the reference model, so
-`rust-plain` was also simply not being a faithful reference. Giving it one took
-it from 17,608 to 46,826 rps at concurrency 4, a 2.7x improvement from the
-concurrency model alone, and inverted the sign of the answer.
+The first version of this measurement reported m6-core as 72% faster than plain Rust, and the cause was the control.
+`rust-plain` spawned a thread per connection while m6-core answered from a fixed pool, so the comparison measured the concurrency model.
 
-**A control that differs from its subject in two ways measures neither.** The
-number above is from a pair that differs only in the library.
+The concurrency section of [`m6-backend-protocol.md`](m6-backend-protocol.md) names a fixed thread pool with a bounded queue as the reference model, so `rust-plain` was not a faithful reference either.
+Giving it one took it from 17,608 to 46,826 req/s at concurrency 4, a 2.7x improvement, and inverted the sign of the answer.
+
+A control that differs from its subject in two ways measures neither.
+The comparison in Table 9 comes from a pair that differs only in the library.
+
+Section 11 closes the page with what a reader should carry away.
+
+## 11. Summary
+
+One figure is evidence only with its conditions, and this page is written so a reader can quote the conditions with the figure.
+
+A figure from a busy machine, a mixed core class or a co-located generator at concurrency 8 describes that machine and that harness.
+Section 3 gives the two traps that produce such figures, and section 9 gives the design that cancels machine drift.
+
+The numbers a merge is gated on are different: [`tools/perfcheck.sh`](../tools/perfcheck.sh) measures two render targets against the values recorded in `tools/perf-baseline.txt`, on the build host, with a 20% margin.
+`docs/PERFORMANCE.md` owns what one component costs.
+
+Five items carry weaker conditions than the rest.
+The criterion medians in section 8 were carried over from an earlier run, and the pair in section 3 is a demonstration with no commit or machine recorded.
+The 2.2 µs timer and the 0.87 to 0.90 hit rate name no machine or date.
+The 2026-09-06 run in section 5 was taken on one 4-vCPU virtual private server against a site's pages, and the rate-limit value it used was not recorded.
+Re-run the medians on the build host before quoting them as current, and read the rest as records of the runs that produced them.
+
+The page's authority is its conditions, and a reader who quotes the conditions with the figure carries the evidence with it.
+Section 2 records what this page replaced, and that record is the reason the rest of the page is precise about where each figure came from.
