@@ -544,6 +544,11 @@ pub fn forward_request_timeout(
     read_response_for(stream, &req.method)
 }
 
+/// The most informational (1xx) responses one fetch will skip before the
+/// backend must send a final one. A bound, so a backend cannot hold a worker by
+/// sending them without end.
+const MAX_INFORMATIONAL: usize = 8;
+
 /// Read an HTTP/1.1 response from a synchronous stream.
 ///
 /// Kept for callers that genuinely cannot know the request method. Prefer
@@ -562,7 +567,9 @@ pub fn read_response<R: Read>(reader: R) -> io::Result<HttpResponse> {
 /// is response splitting, and it is why each of the rules below is a hard
 /// error rather than a best guess.
 ///
-/// - **Responses to HEAD, and 1xx/204/304, never have a body** (F035). The
+/// - **Informational (1xx) responses other than 101 are skipped**, up to
+///   [`MAX_INFORMATIONAL`] of them, and the next head is the response.
+/// - **Responses to HEAD, and 101/204/304, never have a body** (F035). The
 ///   reader previously did not know the method and would block waiting for
 ///   `Content-Length` bytes that a correct backend will never send -- so a
 ///   HEAD to a backend stalled until the read timeout.
@@ -584,39 +591,70 @@ pub fn read_response_for<R: Read>(mut reader: R, request_method: &str) -> io::Re
     // 8 KiB on the stack — sufficient for all normal responses, no heap alloc.
     let mut header_buf = [0u8; 8192];
     let mut n_total = 0usize;
-    let header_end;
+    let mut informational = 0usize;
 
-    loop {
-        let n = reader.read(&mut header_buf[n_total..])?;
-        if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "connection closed before headers complete",
-            ));
+    // An informational (1xx) response is not the answer. RFC 9110 15.2 has the
+    // recipient keep reading until a final status arrives, so a backend that
+    // sends `103 Early Hints` first must not have that taken for the response.
+    // `101 Switching Protocols` is the exception: it is final for this
+    // exchange, and this proxy never asks for an upgrade.
+    //
+    // Bytes read past an informational head belong to the next head, so they
+    // are moved to the front of the buffer rather than discarded.
+    let (header_end, status, reason) = loop {
+        let header_end = loop {
+            if let Some(pos) = find_header_end(&header_buf[..n_total]) {
+                break pos;
+            }
+            if n_total >= header_buf.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "response headers too large",
+                ));
+            }
+            let n = reader.read(&mut header_buf[n_total..])?;
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "connection closed before headers complete",
+                ));
+            }
+            n_total += n;
+        };
+
+        let header_section = std::str::from_utf8(&header_buf[..header_end]).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "response headers not UTF-8")
+        })?;
+        let status_line = header_section
+            .split("\r\n")
+            .next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty response"))?;
+        let (status, reason) = parse_status_line(status_line)?;
+
+        if (100..200).contains(&status) && status != 101 {
+            informational += 1;
+            if informational > MAX_INFORMATIONAL {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "backend sent more than {MAX_INFORMATIONAL} informational responses \
+                         without a final one"
+                    ),
+                ));
+            }
+            let consumed = header_end + 4;
+            header_buf.copy_within(consumed..n_total, 0);
+            n_total -= consumed;
+            continue;
         }
-        n_total += n;
-        if let Some(pos) = find_header_end(&header_buf[..n_total]) {
-            header_end = pos;
-            break;
-        }
-        if n_total >= header_buf.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "response headers too large",
-            ));
-        }
-    }
+        break (header_end, status, reason);
+    };
 
     let header_section = std::str::from_utf8(&header_buf[..header_end])
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "response headers not UTF-8"))?;
-
     let mut lines = header_section.split("\r\n");
-
-    // Status line
-    let status_line = lines
-        .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty response"))?;
-    let (status, reason) = parse_status_line(status_line)?;
+    // The status line was parsed above.
+    lines.next();
 
     let mut headers: Vec<(String, String)> = Vec::with_capacity(16);
     let mut content_length: Option<usize> = None;
@@ -708,7 +746,7 @@ pub fn read_response_for<R: Read>(mut reader: R, request_method: &str) -> io::Re
     let bodyless = request_method.eq_ignore_ascii_case("HEAD")
         || status == 204
         || status == 304
-        || (100..200).contains(&status);
+        || status == 101;
     if bodyless {
         return Ok(HttpResponse {
             status,
@@ -1680,12 +1718,54 @@ mod response_framing_tests {
     /// Same rule, driven by status rather than method (RFC 9112 6.3).
     #[test]
     fn status_codes_that_never_have_a_body() {
-        for status in [204u16, 304, 100, 101] {
+        for status in [204u16, 304, 101] {
             let raw = format!("HTTP/1.1 {status} X\r\nContent-Length: 99\r\n\r\n");
             let r = read_response(raw.as_bytes())
                 .unwrap_or_else(|e| panic!("{status} must not wait for a body: {e}"));
             assert!(r.body.is_empty(), "{status} must have no body");
         }
+    }
+
+    /// A 1xx other than 101 is not the answer: the reader goes on to the next
+    /// head, whichever of those statuses it was.
+    #[test]
+    fn informational_responses_other_than_101_are_skipped() {
+        for status in [100u16, 102, 103, 199] {
+            let raw = format!(
+                "HTTP/1.1 {status} X\r\nContent-Length: 99\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+            );
+            let r = read_response(raw.as_bytes())
+                .unwrap_or_else(|e| panic!("{status} must be skipped: {e}"));
+            assert_eq!((r.status, r.body.as_slice()), (200, &b"ok"[..]), "{status}");
+        }
+    }
+
+    /// The heads can arrive in separate reads, however the socket splits them.
+    /// One byte per read is the worst split, and is deterministic.
+    #[test]
+    fn an_informational_head_split_across_reads_is_skipped() {
+        struct OneByte<'a>(&'a [u8]);
+        impl Read for OneByte<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                let Some((&b, rest)) = self.0.split_first() else {
+                    return Ok(0);
+                };
+                buf[0] = b;
+                self.0 = rest;
+                Ok(1)
+            }
+        }
+        let raw = b"HTTP/1.1 103 Early Hints\r\nLink: </a>; rel=preload\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        let r = read_response(OneByte(raw)).unwrap();
+        assert_eq!((r.status, r.body.as_slice()), (200, &b"ok"[..]));
+    }
+
+    /// A backend that sends only informational responses and then closes has
+    /// given no answer, and that is an error rather than a 1xx result.
+    #[test]
+    fn informational_responses_with_no_final_one_are_an_error() {
+        let raw = b"HTTP/1.1 103 Early Hints\r\n\r\n";
+        assert!(read_response(&raw[..]).is_err());
     }
 
     /// A GET with the same headers still reads its body, so the bodyless rule

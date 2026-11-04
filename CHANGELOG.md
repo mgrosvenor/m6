@@ -69,6 +69,10 @@ Verified with `l2_query_relpath_cannot_replace_the_path_parameter` and `l2_query
 
 ### Fixed
 
+**The edge now skips an informational (1xx) response from a backend and returns the final one (#100).**
+A backend that sent `103 Early Hints` ahead of its answer had the 103 taken for the response, so the fetch failed. The reader now skips any 1xx other than 101 (RFC 9110 15.2) and fails the fetch as a bad gateway after eight of them, so a backend cannot hold a worker by sending them without end.
+Verified by new loopback backend tests, which fail on the old reader and pass now, covering a 103 in its own read, a 103 in the same read as the final response, and the bound at eight and nine.
+
 **CI runs example 05's integration test after its stack is up (#277).**
 The examples' unit-test step ran `cargo test --workspace` in m6-examples before example 05's `dev.sh` had created the dev certificate and auth database. Since m6-examples #11 that test fails on missing prerequisites instead of skipping, so every pull request failed. The step now skips that test, and the example 05 step runs it once the stack answers, as m6-examples' own CI does.
 Verified by this pull request's own CI run.
