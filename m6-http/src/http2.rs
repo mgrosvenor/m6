@@ -4005,22 +4005,28 @@ mod header_list_size_tests {
             .iter()
             .map(|(k, v)| (k.as_slice(), v.as_slice()))
             .collect();
-        let block = hpack::Encoder::new().encode(pairs);
-        let mut chunks = block.chunks(10_000);
-        let mut wire = frame(
-            TYPE_HEADERS,
-            FLAG_END_STREAM,
-            1,
-            chunks.next().expect("block is not empty"),
-        );
-        let rest: Vec<&[u8]> = chunks.collect();
-        for (i, chunk) in rest.iter().enumerate() {
-            let flags = if i + 1 == rest.len() {
-                FLAG_END_HEADERS
+        feed_block(&hpack::Encoder::new().encode(pairs))
+    }
+
+    /// Feed one header block for stream 1, split over HEADERS and CONTINUATION
+    /// frames, and return the connection plus whether the request reached the
+    /// handler. A connection error fails the test: a header list size is only
+    /// ever a stream error.
+    fn feed_block(block: &[u8]) -> (Http2Conn, bool) {
+        let mut wire = Vec::new();
+        let mut chunks = block.chunks(10_000).peekable();
+        let mut first = true;
+        while let Some(chunk) = chunks.next() {
+            let (kind, mut flags) = if first {
+                (TYPE_HEADERS, FLAG_END_STREAM)
             } else {
-                0
+                (TYPE_CONTINUATION, 0)
             };
-            wire.extend(frame(TYPE_CONTINUATION, flags, 1, chunk));
+            if chunks.peek().is_none() {
+                flags |= FLAG_END_HEADERS;
+            }
+            wire.extend(frame(kind, flags, 1, chunk));
+            first = false;
         }
         let mut c = Http2Conn::new();
         c.phase = Phase::Active;
@@ -4089,38 +4095,7 @@ mod header_list_size_tests {
 
     #[test]
     fn an_amplified_block_is_answered_431_and_the_connection_survives() {
-        let block = amplified_block(2_000);
-        let mut wire = Vec::new();
-        let mut chunks = block.chunks(10_000).peekable();
-        let mut first = true;
-        while let Some(chunk) = chunks.next() {
-            let last = chunks.peek().is_none();
-            let (kind, mut flags) = if first {
-                (TYPE_HEADERS, FLAG_END_STREAM)
-            } else {
-                (TYPE_CONTINUATION, 0)
-            };
-            if last {
-                flags |= FLAG_END_HEADERS;
-            }
-            wire.extend(frame(kind, flags, 1, chunk));
-            first = false;
-        }
-        let mut c = Http2Conn::new();
-        c.phase = Phase::Active;
-        c.recv_buf.extend_from_slice(&wire);
-        let mut reached = false;
-        let mut on_request = |_: &HttpRequest, _: &str| -> RequestOutcome {
-            reached = true;
-            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string())
-        };
-        loop {
-            match c.process_frame(&mut on_request, "127.0.0.1") {
-                Ok(true) => continue,
-                Ok(false) => break,
-                Err(e) => panic!("an amplified block must not be a connection error: {e}"),
-            }
-        }
+        let (c, reached) = feed_block(&amplified_block(2_000));
         assert!(!reached, "an oversize list must not reach the handler");
         assert_eq!(status_of_stream_1(&c), "431");
         assert_eq!(c.phase, Phase::Active, "the connection must survive");
