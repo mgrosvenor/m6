@@ -365,6 +365,7 @@ fn default_compression() -> std::collections::HashMap<String, CompressionLevel> 
         "text/css",
         "text/plain",
         "application/javascript",
+        "text/javascript",
         "application/json",
         "image/svg+xml",
     ];
@@ -690,6 +691,29 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn every_minified_type_is_also_compressed_by_default() {
+        let compression = default_compression();
+        let minification = default_minification();
+        let mut missing: Vec<&String> = minification
+            .enabled
+            .keys()
+            .filter(|k| !compression.contains_key(*k))
+            .collect();
+        missing.sort();
+        assert!(
+            missing.is_empty(),
+            "minified but not compressed: {missing:?}"
+        );
+        let mut extra: Vec<&String> = compression
+            .keys()
+            .filter(|k| !minification.enabled.contains_key(*k))
+            .filter(|k| !["image/svg+xml", "text/plain"].contains(&k.as_str()))
+            .collect();
+        extra.sort();
+        assert!(extra.is_empty(), "compressed but not minified: {extra:?}");
+    }
 
     #[test]
     fn restart_only_changes_names_each_key_that_moved() {
