@@ -2,16 +2,20 @@
 
 `site.toml` is the config file every m6 process of a site reads.
 It holds the site identity, the routes, the backends and the log and error settings.
-Section 3 states which key belongs in which file.
-
-This page shows the site directory, a complete two-file example, and the layering and merge rules.
-The per-key reference that follows section 3 lists each key, its type and its default.
+The page states which key belongs in `site.toml` and which belongs in the process config.
 
 ## Contents
 
 1. [Site directory structure](#1-site-directory-structure)
 2. [Complete annotated example](#2-complete-annotated-example)
 3. [Config layering](#3-config-layering)
+4. [Key reference](#4-key-reference)
+5. [Route Matching](#5-route-matching)
+6. [Request Forwarding](#6-request-forwarding)
+7. [Signal Handling](#7-signal-handling)
+8. [Exit Codes](#8-exit-codes)
+9. [Startup Validation](#9-startup-validation)
+10. [Minimal Development Config](#10-minimal-development-config)
 
 ## 1. Site directory structure
 
@@ -195,52 +199,21 @@ ExecStart=/usr/local/bin/m6-http /var/www/my-blog /etc/m6/my-blog.toml
 The system config accepts `[server]`, `[node]`, `[auth]` and three `[health]` keys, `metrics_require`, `metrics_peers` and `metrics_token_file`.
 Everything else comes from `site.toml` unchanged.
 
-`site.toml`, in version control:
-
-```toml
-[site]
-name   = "My Blog"
-domain = "example.com"
-
-[log]
-level  = "info"
-format = "text"
-
-[errors]
-mode = "internal"
-
-# backends and routes, identical in development and production
-```
-
-The system config, on the server and never in the repo:
-
-```toml
-[server]
-bind     = "0.0.0.0:443"
-tls_cert = "/etc/letsencrypt/live/example.com/fullchain.pem"
-tls_key  = "/etc/letsencrypt/live/example.com/privkey.pem"
-
-[auth]
-backend    = "m6-auth"
-public_key = "keys/auth.pub"
-```
-
-The development system config holds the same sections with a loopback bind and checked-in certificate paths.
+Section 2 shows the two files.
+Development and production differ only in the bind address and the certificate paths.
 
 The merge rules, in order:
 
 1. The system config loads after `site.toml`.
 2. Its `[server]` keys win on conflict, and so do its three `[health]` keys.
-3. `[auth]` sits in one file only, and declaring it in both is a startup error.
-4. A relative `[auth] public_key` in the system config resolves against the site directory, as `tls_cert` does.
-5. A relative `[health] metrics_token_file` in the system config resolves against the site directory too.
-6. An absolute path is used as given.
-7. A relative `metrics_token_file` in `site.toml` resolves against the process working directory, so write it as an absolute path there or put it in the system config.
-8. Any other top-level key in the system config is ignored with a warning, and any other `[health]` key there fails to parse.
-9. Validation runs after the merge.
-10. When both arguments name one file, its `[auth]` and `[health]` belong to the site config alone.
-11. A system config edit or touch applies within a second and keeps the cache.
-12. A key read only at start keeps its running value, and the log names it and says to restart.
+3. A relative `[auth] public_key` in the system config resolves against the site directory, as `tls_cert` does.
+4. An absolute path is used as given.
+5. Any other top-level key in the system config is ignored with a warning, and any other `[health]` key there fails to parse.
+6. Validation runs after the merge.
+7. When both arguments name one file, its `[auth]` and `[health]` belong to the site config alone.
+8. A key read only at start keeps its running value, and the log names it and says to restart.
+
+The `[auth]`, `[health]` and `[server]` sections after section 3 state the one-file, `metrics_token_file` and touch-reload rules.
 
 ### 3.2. Renderer secrets
 
@@ -335,14 +308,16 @@ A file at the default path may be absent or invalid, as before.
 `site.toml` is safe to publish.
 `m6-architecture.md` §8.1 states the split that keeps it clean.
 
-### `[site]`
+## 4. Key reference
+
+### 4.1. `[site]`
 
 | Key | Type | Required | Notes |
 |---|---|---|---|
 | `name` | string | yes | Available in templates as `site_name` |
 | `domain` | string | yes | Available in templates as `site_domain` |
 
-### `[server]`
+### 4.2. `[server]`
 
 | Key | Type | Required | Notes |
 |---|---|---|---|
@@ -391,7 +366,7 @@ internal_binds = ["10.0.0.1:8080"]
 internal_peers = ["10.0.0.2", "10.0.0.3"]
 ```
 
-### `[log]`
+### 4.3. `[log]`
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
@@ -400,7 +375,7 @@ internal_peers = ["10.0.0.2", "10.0.0.3"]
 
 All processes log to stdout. `format` applies to all processes that read this config.
 
-### `[errors]`
+### 4.4. `[errors]`
 
 Controls how m6-http handles error responses — both backend failures (no pool instance available) and non-2xx responses returned by backends.
 
@@ -438,7 +413,7 @@ backend = "m6-html"
 
 Error responses are never cached regardless of mode.
 
-### `[auth]`
+### 4.5. `[auth]`
 
 | Key | Type | Required | Notes |
 |---|---|---|---|
@@ -448,7 +423,7 @@ Error responses are never cached regardless of mode.
 `[auth]` may sit in `site.toml` or in the system config, never both.
 A config that only verifies tokens needs `public_key` alone.
 
-### `[health]`
+### 4.6. `[health]`
 
 The monitoring endpoints, answered inside m6-http ahead of routing, the cache and every backend.
 
@@ -496,7 +471,7 @@ metrics_require = "role:monitor"
 metrics_peers   = ["10.0.0.5"]
 ```
 
-### `[[backend]]`
+### 4.7. `[[backend]]`
 
 | Key | Type | Required | Notes |
 |---|---|---|---|
@@ -510,7 +485,7 @@ metrics_peers   = ["10.0.0.5"]
 
 **URL backend:** HTTP version negotiated via ALPN (`https://`). HTTP/1.1 for `http://`. Not load-balanced — single upstream.
 
-### `[[route]]`
+### 4.8. `[[route]]`
 
 | Key | Type | Required | Notes |
 |---|---|---|---|
@@ -518,7 +493,7 @@ metrics_peers   = ["10.0.0.5"]
 | `backend` | string | yes | Name of a declared `[[backend]]` |
 | `require` | string | no | `"group:<name>"` or `"role:<name>"` — JWT must satisfy |
 
-### `[[route_group]]`
+### 4.9. `[[route_group]]`
 
 | Key | Type | Required | Notes |
 |---|---|---|---|
@@ -542,7 +517,7 @@ containing `{`, so a wildcard silently means those files are never pre-warmed.
 Glob is expanded at startup and on `site.toml` reload. New files matching the glob require a `site.toml` reload to become routable — renderers that create new content files (e.g. a CMS publish action) should touch `site.toml` after writing to trigger the reload.
 In an app, `req.touch("site.toml")` touches the file the app reads, which is the one its `site_toml` key names.
 
-### Glob Variables
+### 4.10. Glob Variables
 
 | Variable | Expands to |
 |---|---|
@@ -553,13 +528,13 @@ In an app, `req.touch("site.toml")` touches the file the app reads, which is the
 
 ---
 
-## Route Matching
+## 5. Route Matching
 
 Specificity wins: exact paths beat parameterised, longer beats shorter. First declaration breaks ties among equal-specificity patterns (with a warning logged).
 
 ---
 
-## Request Forwarding
+## 6. Request Forwarding
 
 Complete request forwarded — method, path, query string, all headers, body.
 
@@ -569,7 +544,7 @@ Complete request forwarded — method, path, query string, all headers, body.
 
 ---
 
-## Signal Handling
+## 7. Signal Handling
 
 | Signal | First receipt | Second receipt |
 |---|---|---|
@@ -581,7 +556,7 @@ Renderers clean shutdown: finish current request, close socket, exit 0.
 
 ---
 
-## Exit Codes
+## 8. Exit Codes
 
 | Code | Meaning |
 |---|---|
@@ -591,7 +566,7 @@ Renderers clean shutdown: finish current request, close socket, exit 0.
 
 ---
 
-## Startup Validation
+## 9. Startup Validation
 
 Exit 2 on:
 
@@ -627,7 +602,7 @@ Warnings (not fatal):
 
 ---
 
-## Minimal Development Config
+## 10. Minimal Development Config
 
 ```toml
 [site]
