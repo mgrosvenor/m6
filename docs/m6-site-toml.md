@@ -200,7 +200,7 @@ The system config accepts `[server]`, `[node]`, `[auth]` and three `[health]` ke
 Everything else comes from `site.toml` unchanged.
 
 Section 2 shows the two files.
-Development and production differ only in the bind address and the certificate paths.
+In that example, development and production differ in the bind address and the certificate paths.
 
 The merge rules, in order:
 
