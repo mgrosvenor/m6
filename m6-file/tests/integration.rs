@@ -196,6 +196,28 @@ fn l2_query_relpath_cannot_replace_the_path_parameter() {
 }
 
 #[test]
+fn l2_query_relpath_cannot_choose_a_file_on_a_filename_route() {
+    let (_guard, socket_path) = spawn_server("l2-query-filename");
+
+    // `/content/posts/{stem}/{filename}` captures one segment and no
+    // `relpath`. A query `relpath` naming a file in a subdirectory, which
+    // that route's shape cannot address, must not be what is served.
+    let req = "GET /content/posts/hello/index.html?relpath=drafts/secret.txt HTTP/1.1\r\n\
+               Host: localhost\r\nAccept-Encoding: identity\r\n\r\n";
+    let resp = http_request(&socket_path, req);
+    assert!(
+        !resp.contains("UNPUBLISHED-DRAFT"),
+        "a query relpath chose a file the route does not address: {}",
+        &resp[..resp.len().min(300)]
+    );
+    assert!(
+        resp.contains("200 OK"),
+        "expected the path's own file, got: {}",
+        &resp[..resp.len().min(200)]
+    );
+}
+
+#[test]
 fn l2_relpath_with_subdirectory() {
     let (_guard, socket_path) = spawn_server("l2-subdir");
 

@@ -15,33 +15,54 @@ use crate::compress::{choose_encoding, compress_brotli, compress_gzip, Encoding}
 /// with neither addresses the file `root` names outright, which is how
 /// `/favicon.ico` works.
 ///
-/// Every value taken from the request dictionary is checked again here with
-/// the same rule core applies to path parameters. Core already stops a query
-/// key replacing a path parameter, and this check is the second line: a
-/// value that could leave the site directory gives `None`, which is a 404.
+/// Only names the route's own pattern declares are read: `relpath` from a
+/// `{*relpath}` route, `filename` from a `{filename}` route, and a `root`
+/// placeholder only when the pattern captures it. A query key or form field
+/// with one of those names, on a route that does not declare it, is never
+/// used, so a request cannot choose a file the route's shape does not
+/// address. Each value is then checked with core's path-parameter rule (a
+/// slash only in a `{*name}` capture), and a failure gives `None`, a 404.
+///
+/// A request built without a route (a test, or a caller that never routes)
+/// has no pattern to consult, and reads the dictionary as given.
 fn resolve_fs_path(req: &Request, site_dir: &Path) -> Option<PathBuf> {
-    let mut root = req.route_str("root").unwrap_or("").to_string();
-    if root.contains('{') {
-        for (k, v) in req.dict().iter() {
-            if let Some(s) = v.as_str() {
-                let placeholder = format!("{{{}}}", k);
-                if root.contains(&placeholder) {
-                    m6_core::validate_path_param(s, true).ok()?;
-                    root = root.replace(&placeholder, s);
-                }
-            }
+    let pattern = req.route_pattern();
+    // `Some(wildcard)` when the route captures `name`, `None` when it does not.
+    let capture = |name: &str| -> Option<bool> {
+        match pattern {
+            None => Some(true),
+            Some(p) if p.contains(&format!("{{*{name}}}")) => Some(true),
+            Some(p) if p.contains(&format!("{{{name}}}")) => Some(false),
+            Some(_) => None,
         }
+    };
+    let param = |name: &str| -> Option<Option<&str>> {
+        let Some(wildcard) = capture(name) else {
+            return Some(None);
+        };
+        match req.dict().get(name).and_then(|v| v.as_str()) {
+            Some(v) => {
+                m6_core::validate_path_param(v, wildcard).ok()?;
+                Some(Some(v))
+            }
+            None => Some(None),
+        }
+    };
+
+    let mut root = req.route_str("root").unwrap_or("").to_string();
+    while let Some(open) = root.find('{') {
+        let close = open + root[open..].find('}')?;
+        let name = root[open + 1..close].trim_start_matches('*').to_string();
+        let value = param(&name)??;
+        root.replace_range(open..=close, value);
     }
-    let rel = req
-        .dict()
-        .get("relpath")
-        .or_else(|| req.dict().get("filename"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let rel = match param("relpath")? {
+        Some(v) => v,
+        None => param("filename")?.unwrap_or(""),
+    };
     if rel.is_empty() {
         Some(site_dir.join(&root))
     } else {
-        m6_core::validate_path_param(rel, true).ok()?;
         Some(site_dir.join(&root).join(rel))
     }
 }
