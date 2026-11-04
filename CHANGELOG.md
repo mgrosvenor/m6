@@ -91,6 +91,8 @@ The examples unit-test step skips `blog_site_end_to_end`, which needs certificat
 **Source comments in m6-core and m6-file no longer carry a deployment's names, per-node sizes or deployed versions, and no longer use "load-bearing" (#189, #190).**
 Comments only.
 
+**`docs/m6-backend-protocol.md` now follows the documentation ruleset, and its claims match the code (#142).**
+
 ### Changed
 
 **The m6-auth-cli integration tests assert that each setup command succeeds, and print its stderr when one does not (#258).**
