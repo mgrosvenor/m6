@@ -71,7 +71,8 @@ Verified with `l2_query_relpath_cannot_replace_the_path_parameter` and `l2_query
 
 **JavaScript labelled `text/javascript` is now compressed by default (#186).**
 The default tables disagreed. `text/javascript` was minified but missing from the default compression types, and the `.js` and `.mjs` extensions map to that label, so every script was minified and sent uncompressed. It now gets the same levels as `application/javascript` (brotli 6, gzip 6), and a test keeps the two default tables in step.
-Verified by the new config tests, which fail on the old tables, and by comparing the `Accept-Encoding: br` response size for a script before and after.
+A site that switched compression off by setting brotli and gzip to 0 on each default type, and declares `compresses = false` for its backend, must now set `text/javascript` to 0 as well. Until it does, the service refuses to start or reload with "compresses = false, but this service DOES compress".
+Verified by a request-level test that asks for `text/javascript` with `Accept-Encoding: br` and expects a brotli response, and by a test that the two default tables list the same types. Both fail on the old tables.
 
 **CI runs example 05's integration test after its stack is up (#277).**
 The examples' unit-test step ran `cargo test --workspace` in m6-examples before example 05's `dev.sh` had created the dev certificate and auth database. Since m6-examples #11 that test fails on missing prerequisites instead of skipping, so every pull request failed. The step now skips that test, and the example 05 step runs it once the stack answers, as m6-examples' own CI does.

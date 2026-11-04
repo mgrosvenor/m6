@@ -4333,6 +4333,47 @@ mod config_route_handler_tests {
             .collect()
     }
 
+    /// What a browser sees: a script labelled `text/javascript` comes back
+    /// brotli-compressed under the default config.
+    #[test]
+    fn a_text_javascript_response_is_brotli_compressed_by_default() {
+        let (state, _site_dir) =
+            state_from("[[route]]\npath = \"/app.js\"\nhandler = \"script\"\n");
+        let script: BoxHandler = Box::new(|_req: &Request| {
+            Ok(Response::status(200)
+                .header("Content-Type", "text/javascript; charset=utf-8")
+                .body("function f(a, b) { return a + b; }\n".repeat(50)))
+        });
+        let named = HashMap::from([("script".to_string(), Arc::new(script))]);
+        let raw = RawRequest {
+            version: "HTTP/1.1".to_string(),
+            method: "GET".to_string(),
+            path: "/app.js".to_string(),
+            query: None,
+            headers: vec![
+                ("Host".to_string(), "localhost".to_string()),
+                ("Accept-Encoding".to_string(), "br".to_string()),
+            ],
+            body: vec![],
+        };
+
+        let mut out = Vec::new();
+        {
+            let mut resp = crate::h1::Responder::new(&mut out, "GET", false);
+            handle_request(
+                raw,
+                &mut resp,
+                &std::sync::RwLock::new(state),
+                &HashMap::new(),
+                &named,
+            );
+        }
+        let head_end = out.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        let head = String::from_utf8_lossy(&out[..head_end]).to_ascii_lowercase();
+        assert!(head.starts_with("http/1.1 200"), "{head}");
+        assert!(head.contains("content-encoding: br"), "{head}");
+    }
+
     const FILES: &str = r#"
 [[route]]
 path = "/assets/{*relpath}"

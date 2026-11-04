@@ -716,13 +716,6 @@ mod tests {
     }
 
     #[test]
-    fn text_javascript_gets_non_zero_compression_levels_by_default() {
-        let compression = default_compression();
-        let level = compression.get("text/javascript").expect("a default level");
-        assert_eq!((level.brotli, level.gzip), (6, 6));
-    }
-
-    #[test]
     fn restart_only_changes_names_each_key_that_moved() {
         let site_dir = Path::new("/site");
         let a = RendererConfig::default();
