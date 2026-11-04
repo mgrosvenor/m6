@@ -98,3 +98,13 @@ panic         = "abort"    # no unwind tables. `catch_unwind` here is #[cfg(test
 # stream identifiers. A wrap there is a security bug that presents as a stall.
 # An abort is a denial of service on one connection and is visible.
 overflow-checks = true
+
+# Debug and test builds keep line tables only, and no debug info for
+# dependencies (#303). Every file under a crate's tests/ is its own binary that
+# links every dependency, so full debug info made one checked tree about 16 GB,
+# more than a hosted CI runner's free disk. Backtraces still show file and line.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
