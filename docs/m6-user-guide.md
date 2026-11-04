@@ -737,12 +737,8 @@ Example 05 builds a CMS blog with a publish flow on top of the same auth.
 ## 6. Example 05, CMS blog
 
 Example 05 builds a *CMS* (Content Management System) blog on the auth from Example 04.
-It runs the whole stack: m6-http at the edge, m6-html for templates, m6-file for assets, m6-md for Markdown, m6-auth-server for logins and render-cms for the CMS.
+It adds a custom renderer that owns the CMS, and it is the first example to run the whole stack end to end.
 The public blog is cached at the edge, and the CMS routes are protected and never cached.
-
-Posts have two sources.
-Markdown files under `content/posts/` feed m6-md, which writes `data/posts.json`.
-The CMS writes its own posts as *JSON* (JavaScript Object Notation) files, and the two sources merge into that one index.
 
 Run the example from `examples/05-cms`.
 `setup.sh` generates the signing keys and creates the admin user, then `dev.sh` builds and starts the stack.
@@ -759,16 +755,21 @@ The CMS is at `https://localhost:8443/cms`, and the public blog is at `https://l
 ### 6.1. Site directory
 
 Example 05 adds the CMS renderer, a drafts directory and a test script to the Example 04 layout.
-The new entries are `render-cms/`, `content/drafts/`, `configs/render-cms.conf` and `test.sh`.
+
+- `render-cms/` is the CMS crate
+- `content/drafts/` holds the JSON drafts
+- `configs/render-cms.conf` marks the renderer's routes uncacheable
+- `test.sh` checks the running stack end to end
+
 Everything else carries over: `site.toml`, the other four config files, `templates/`, `assets/`, `content/posts/`, `data/`, `setup.sh` and `dev.sh`.
 
-`content/posts/` holds the Markdown posts, and `content/drafts/` holds the JSON drafts.
+`content/posts/` holds the Markdown sources and the published *JSON* (JavaScript Object Notation) posts, and `content/drafts/` holds the JSON drafts.
 `data/posts.json` is the merged index both sources write into.
 
 ### 6.2. `site.toml`
 
-`site.toml` is the *TOML* (Tom's Obvious, Minimal Language) file that declares the site, the allowed methods, the error mode, the log format, the four backends and the routes.
-Example 05 adds the `render-cms` backend, the CMS routes and the method list to the Example 04 file.
+`site.toml` declares the four backends and the routes, and `configs/system-dev.toml` holds the node's bind address, *TLS* (Transport Layer Security) paths and auth key.
+Example 05 adds the `render-cms` backend, the CMS routes and the method list.
 
 The `render-cms` backend and the routes that reach it:
 
@@ -792,10 +793,9 @@ backend = "render-cms"
 require = "group:editors"
 ```
 
-`require = "group:editors"` makes m6-http verify the *JWT* (JSON Web Token) before forwarding, the same gate Example 04 uses.
 The full CMS route set is `/cms`, `/cms/new`, `/cms/edit/{stem}`, `/api/drafts`, `/api/drafts/{stem}`, `/api/publish/{stem}`, `/api/unpublish/{stem}` and `/api/posts/{stem}`, all behind the `editors` group.
 
-`/blog/{stem}` stays as Example 04 declares it, and the asset route is one `[[route]]` with the explicit wildcard `{*relpath}`, which spans several path segments:
+The public blog and asset routes:
 
 ```toml
 [[route]]
@@ -807,15 +807,14 @@ path    = "/assets/{*relpath}"
 backend = "m6-file"
 ```
 
-render-cms registers PATCH and DELETE routes, so `allowed_methods` lists them, and m6-http answers 405 to any method the list omits:
+render-cms registers PATCH and DELETE routes, so `allowed_methods` names them:
 
 ```toml
 [server]
 allowed_methods = ["GET", "HEAD", "POST", "PATCH", "DELETE"]
 ```
 
-The `[auth]` block lives in `configs/system-dev.toml`, because the public key path is a credential path.
-That file also holds the node's *TLS* (Transport Layer Security) certificate and key paths and its bind address:
+`configs/system-dev.toml` holds the node's own settings:
 
 ```toml
 [server]
@@ -846,11 +845,9 @@ comrak     = { version = "0.21", default-features = false }
 base64     = "0.22"
 ```
 
-The relative path is why the m6 and m6-examples checkouts must sit side by side.
-
 ### 6.4. `render-cms/src/main.rs`
 
-`main` registers the CMS routes as code handlers, and `configs/render-cms.conf` marks each one `cache = "no-store"`.
+`main` registers the CMS routes as code handlers, and `configs/render-cms.conf` marks the routes it lists `cache = "no-store"`.
 The renderer also owns the `/contact` form.
 
 ```rust
@@ -894,17 +891,14 @@ A post that came from Markdown survives every index rebuild, because `update_ind
 ### 6.6. Caching
 
 The edge caches only the public, unauthenticated routes.
-The CMS and contact routes are marked `cache = "no-store"`, so m6-http never caches them.
-The `/login` and `/_errors` routes are also `no-store`.
-
-A touch on `site.toml` clears the cache, so a publish or unpublish is visible on the next request.
-m6-http clears once immediately and twice more after a short delay, so a stale page cannot be re-cached in the gap.
+The CMS routes sit behind `require = "group:editors"`, so m6-http never caches them.
+The contact, `/login` and `/_errors` routes are marked `cache = "no-store"`.
 
 ### 6.7. `dev.sh` and `test.sh`
 
 `dev.sh` builds m6 and render-cms, writes the TLS and auth keys, creates the admin user, generates `data/posts.json` and starts the stack.
-It runs m6-md in watch mode over `content/posts/`, which touches `site.toml` after each rebuild.
-The stack is m6-html, m6-file, m6-auth-server, render-cms and m6-http, plus m6-md in watch mode when it is installed.
+The stack is m6-html, m6-file, m6-auth-server, render-cms and m6-http.
+When m6-md is installed, it also runs in watch mode over `content/posts/` and touches `site.toml` after each rebuild.
 
 `test.sh` checks the running stack over the wire.
 It has 15 sections, numbered 0 to 14, and every check has one expected answer.
@@ -913,6 +907,7 @@ The summary line prints the pass count, the fail count and the total, and the sc
 [`m6-core-reference.md`](m6-core-reference.md) owns the `Request` file helpers and the `App` route methods.
 [`m6-md.md`](m6-md.md) owns the Markdown conversion.
 [`m6-site-toml.md`](m6-site-toml.md) owns the `[[route]]`, `require` and `allowed_methods` keys.
+[`m6-http.md`](m6-http.md) owns the cache and its clearing rules.
 [`m6-auth.md`](m6-auth.md) owns the login, refresh and logout responses.
 
 Example 05 completes the full stack and adds the end-to-end suite that section 1 points to.
