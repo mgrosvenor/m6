@@ -115,6 +115,8 @@ Comments only.
 
 **The user guide's Example 05 (CMS blog) now matches the released example and follows the documentation ruleset (#156).**
 
+**`docs/m6-site-toml.md` part 1 follows the documentation ruleset, and it now says that a secrets file refuses a key set in both files and that `[server]` and `[auth]` belong in the system config (#154).**
+
 ### Changed
 
 **Debug and test builds carry line tables only, and no debug information for dependencies, so a full test build is 3.7 GB instead of 12 GB (#303).**
