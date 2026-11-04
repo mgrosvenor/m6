@@ -736,123 +736,50 @@ Example 05 builds a CMS blog with a publish flow on top of the same auth.
 
 ## 6. Example 05, CMS blog
 
-`examples/05-cms/`
+Example 05 builds a *CMS* (Content Management System) blog on the auth from Example 04.
+It runs the whole stack: m6-http at the edge, m6-html for templates, m6-file for assets, m6-md for Markdown, m6-auth-server for logins and render-cms for the CMS.
+The public blog is cached at the edge, and the CMS routes are protected and never cached.
 
-The full system. A public blog served at maximum speed from RAM cache. An authorised CMS renderer for creating, editing, and publishing posts.
+Posts have two sources.
+Markdown files under `content/posts/` feed m6-md, which writes `data/posts.json`.
+The CMS writes its own posts as *JSON* (JavaScript Object Notation) files, and the two sources merge into that one index.
 
-Published posts are individual JSON files in `content/posts/` — one per post. Drafts live in `content/drafts/` and are never publicly routable. On publish, render-cms writes the post file, updates the index, and touches `site.toml` to trigger a route table reload in m6-http.
+Run the example from `examples/05-cms`.
+`setup.sh` generates the signing keys and creates the admin user, then `dev.sh` builds and starts the stack.
 
-```bash
+```sh
 cd examples/05-cms
-./setup.sh           # keys, first admin user
-cargo build --release -p render-cms
+./setup.sh
 ./dev.sh
-# CMS at https://localhost:8443/cms (login required)
-# Blog at https://localhost:8443/blog (public, cached)
 ```
+
+The CMS is at `https://localhost:8443/cms`, and the public blog is at `https://localhost:8443/blog`.
+`./test.sh` then checks the running stack over the wire.
 
 ### 6.1. Site directory
 
-```
-05-cms/
-├── site.toml
-├── configs/
-│   ├── system-dev.toml
-│   ├── m6-html.conf
-│   ├── m6-file.conf
-│   ├── m6-auth.conf
-│   └── render-cms.conf
-├── templates/
-│   ├── base.html
-│   ├── home.html
-│   ├── post-index.html
-│   ├── post.html
-│   ├── login.html
-│   ├── error.html
-│   └── cms/
-│       ├── dashboard.html
-│       └── editor.html
-├── assets/
-├── content/
-├── data/
-│   ├── posts/       ← published JSON (one file per post, written by CMS on publish)
-│   └── drafts/      ← draft JSON (never publicly routable)
-├── keys/
-└── render-cms/
-    ├── Cargo.toml
-    └── src/main.rs
-```
+Example 05 adds the CMS renderer, a drafts directory and a test script to the Example 04 layout.
+The new entries are `render-cms/`, `content/drafts/`, `configs/render-cms.conf` and `test.sh`.
+Everything else carries over: `site.toml`, the other four config files, `templates/`, `assets/`, `content/posts/`, `data/`, `setup.sh` and `dev.sh`.
+
+`content/posts/` holds the Markdown posts, and `content/drafts/` holds the JSON drafts.
+`data/posts.json` is the merged index both sources write into.
 
 ### 6.2. `site.toml`
 
+`site.toml` is the *TOML* (Tom's Obvious, Minimal Language) file that declares the site, the allowed methods, the error mode, the log format, the four backends and the routes.
+Example 05 adds the `render-cms` backend, the CMS routes and the method list to the Example 04 file.
+
+The `render-cms` backend and the routes that reach it:
+
 ```toml
-[site]
-name   = "My Blog"
-domain = "localhost"
-
-[auth]
-backend    = "m6-auth"
-public_key = "keys/auth.pub"
-
-[[backend]]
-name    = "m6-html"
-sockets = "/run/m6/m6-html-*.sock"
-
-[[backend]]
-name    = "m6-file"
-sockets = "/run/m6/m6-file-*.sock"
-
-[[backend]]
-name    = "m6-auth"
-sockets = "/run/m6/m6-auth-*.sock"
-
 [[backend]]
 name    = "render-cms"
-sockets = "/run/m6/render-cms-*.sock"
-
-# ── Public routes — no auth, fully cached ─────────────────────
+sockets = "/tmp/m6/render-cms*.sock"
 
 [[route]]
-path    = "/"
-backend = "m6-html"
-
-[[route]]
-path    = "/blog"
-backend = "m6-html"
-
-[[route_group]]
-glob    = "content/posts/*.json"
-path    = "/blog/{stem}"
-backend = "m6-html"
-
-[[route_group]]
-glob    = "assets/**/*"
-path    = "/assets/{relpath}"
-backend = "m6-file"
-
-[[route]]
-path    = "/_errors"
-backend = "m6-html"
-
-# ── Auth endpoints — public ────────────────────────────────────
-
-[[route]]
-path    = "/login"
-backend = "m6-html"
-
-[[route]]
-path    = "/auth/login"
-backend = "m6-auth"
-
-[[route]]
-path    = "/auth/logout"
-backend = "m6-auth"
-
-[[route]]
-path    = "/auth/refresh"
-backend = "m6-auth"
-
-# ── CMS — all protected, never cached ─────────────────────────
+path    = "/contact"
+backend = "render-cms"
 
 [[route]]
 path    = "/cms"
@@ -860,39 +787,51 @@ backend = "render-cms"
 require = "group:editors"
 
 [[route]]
-path    = "/cms/edit/{stem}"
-backend = "render-cms"
-require = "group:editors"
-
-[[route]]
-path    = "/cms/new"
-backend = "render-cms"
-require = "group:editors"
-
-[[route]]
-path    = "/api/drafts"
-backend = "render-cms"
-require = "group:editors"
-
-[[route]]
-path    = "/api/drafts/{stem}"
-backend = "render-cms"
-require = "group:editors"
-
-[[route]]
 path    = "/api/publish/{stem}"
-backend = "render-cms"
-require = "group:editors"
-
-[[route]]
-path    = "/api/unpublish/{stem}"
 backend = "render-cms"
 require = "group:editors"
 ```
 
-`[[route_group]]` with `content/posts/*.json` handles routing for individual posts. New post files become routable when m6-http reloads after `site.toml` is touched on publish.
+`require = "group:editors"` makes m6-http verify the *JWT* (JSON Web Token) before forwarding, the same gate Example 04 uses.
+The full CMS route set is `/cms`, `/cms/new`, `/cms/edit/{stem}`, `/api/drafts`, `/api/drafts/{stem}`, `/api/publish/{stem}`, `/api/unpublish/{stem}` and `/api/posts/{stem}`, all behind the `editors` group.
+
+`/blog/{stem}` stays as Example 04 declares it, and the asset route is one `[[route]]` with the explicit wildcard `{*relpath}`, which spans several path segments:
+
+```toml
+[[route]]
+path    = "/blog/{stem}"
+backend = "m6-html"
+
+[[route]]
+path    = "/assets/{*relpath}"
+backend = "m6-file"
+```
+
+render-cms registers PATCH and DELETE routes, so `allowed_methods` lists them, and m6-http answers 405 to any method the list omits:
+
+```toml
+[server]
+allowed_methods = ["GET", "HEAD", "POST", "PATCH", "DELETE"]
+```
+
+The `[auth]` block lives in `configs/system-dev.toml`, because the public key path is a credential path.
+That file also holds the node's *TLS* (Transport Layer Security) certificate and key paths and its bind address:
+
+```toml
+[server]
+bind     = "127.0.0.1:8443"
+tls_cert = "keys/dev.pem"
+tls_key  = "keys/dev-key.pem"
+
+[auth]
+backend    = "m6-auth"
+public_key = "keys/auth.pub"
+```
 
 ### 6.3. `render-cms/Cargo.toml`
+
+`render-cms` is a Rust crate in the m6-examples workspace.
+Its manifest depends on m6-core by the relative path `../../../../m6/m6-core`, on `serde_json` for JSON, on `comrak` to render Markdown to *HTML* (HyperText Markup Language), and on `base64` for the editor transport.
 
 ```toml
 [package]
@@ -901,153 +840,83 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-m6-render  = { git = "https://github.com/m6/m6", tag = "v0.1.0", features = ["auth", "disk"] }
+m6-core    = { path = "../../../../m6/m6-core" }
 serde_json = "1"
+comrak     = { version = "0.21", default-features = false }
+base64     = "0.22"
 ```
+
+The relative path is why the m6 and m6-examples checkouts must sit side by side.
 
 ### 6.4. `render-cms/src/main.rs`
 
-```rust
-use m6_render::prelude::*;
-use serde_json::{json, Value};
-use std::fs;
+`main` registers the CMS routes as code handlers, and `configs/render-cms.conf` marks each one `cache = "no-store"`.
+The renderer also owns the `/contact` form.
 
+```rust
 fn main() -> Result<()> {
-    // render-cms uses JSON files directly — no state needed.
-    // A real CMS would use App::with_state(init_global, init_thread)
-    // to hold a database connection per thread.
     App::new()
-        .route_get("/cms",             handle_dashboard)
-        .route_get("/cms/new",         handle_new)
-        .route_get("/cms/edit/{stem}", handle_edit)
+        .route_get("/contact",               handle_contact_get)
+        .route_post("/contact",              handle_contact_post)
+        .route_get("/cms",                   handle_dashboard)
+        .route_get("/cms/new",               handle_new)
+        .route_get("/cms/edit/{stem}",       handle_edit)
         .route_post("/api/drafts",           handle_create_draft)
         .route_patch("/api/drafts/{stem}",   handle_update_draft)
         .route_post("/api/publish/{stem}",   handle_publish)
         .route_post("/api/unpublish/{stem}", handle_unpublish)
+        .route_delete("/api/drafts/{stem}",  handle_delete_draft)
+        .route_delete("/api/posts/{stem}",   handle_delete_post)
         .run()
 }
-
-fn handle_dashboard(req: &Request) -> Result<Response> {
-    let author    = req["auth_username"].as_str().unwrap_or("");
-    let drafts    = req.list_json("content/drafts/")?;
-    let published = req.list_json("content/posts/")?;
-    Response::render_with("templates/cms/dashboard.html", req, json!({
-        "drafts":    drafts,
-        "published": published,
-        "author":    author,
-    }))
-}
-
-fn handle_new(req: &Request) -> Result<Response> {
-    Response::render_with("templates/cms/editor.html", req, json!({"new": true}))
-}
-
-fn handle_edit(req: &Request) -> Result<Response> {
-    let stem = req["stem"].as_str().ok_or(Error::NotFound)?;
-    let post = req.read_json(&format!("content/drafts/{}.json", stem))
-        .or_else(|_| req.read_json(&format!("content/posts/{}.json", stem)))?;
-    Response::render_with("templates/cms/editor.html", req, post)
-}
-
-fn handle_create_draft(req: &Request) -> Result<Response> {
-    let body: Value = req.body_json()?;
-    let stem  = req["title"].as_str().unwrap_or("untitled").to_slug();
-    let draft = json!({
-        "stem":   stem,
-        "title":  body["title"],
-        "body":   body["body"],
-        "author": req["auth_username"],
-        "date":   today_iso8601(),
-    });
-    req.write_json(&format!("content/drafts/{}.json", stem), &draft)?;
-    Response::json_status(json!({"stem": stem}), 201)
-}
-
-fn handle_update_draft(req: &Request) -> Result<Response> {
-    let stem = req["stem"].as_str().ok_or(Error::NotFound)?;
-    let body: Value = req.body_json()?;
-    let path = format!("content/drafts/{}.json", stem);
-    let mut draft = req.read_json(&path)?;
-    if let Some(t) = body.get("title") { draft["title"] = t.clone(); }
-    if let Some(b) = body.get("body")  { draft["body"]  = b.clone(); }
-    req.write_json(&path, &draft)?;
-    Response::json(json!({"ok": true}))
-}
-
-fn handle_publish(req: &Request) -> Result<Response> {
-    let stem         = req["stem"].as_str().ok_or(Error::NotFound)?;
-    let draft_path   = format!("content/drafts/{}.json", stem);
-    let publish_path = format!("content/posts/{}.json", stem);
-
-    let mut post = req.read_json(&draft_path)?;
-    post["stem"]         = json!(stem);
-    post["path"]         = json!(format!("/blog/{}", stem));
-    post["published_at"] = json!(now_iso8601());
-
-    req.write_json_atomic(&publish_path, &post)?;
-    update_index(req)?;
-    req.touch_site_toml()?;
-    let _ = fs::remove_file(req.site_path(&draft_path));
-
-    Response::json(json!({"published": true, "path": post["path"]}))
-}
-
-fn handle_unpublish(req: &Request) -> Result<Response> {
-    let stem         = req["stem"].as_str().ok_or(Error::NotFound)?;
-    let publish_path = format!("content/posts/{}.json", stem);
-    let draft_path   = format!("content/drafts/{}.json", stem);
-
-    let mut post = req.read_json(&publish_path)?;
-    post["draft"] = json!(true);
-    req.write_json(&draft_path, &post)?;
-    fs::remove_file(req.site_path(&publish_path))?;
-    update_index(req)?;
-    req.touch_site_toml()?;
-
-    Response::json(json!({"unpublished": true}))
-}
-
 ```
+
+The handlers use the file helpers m6-core puts on `Request`.
+`handle_create_draft` writes `content/drafts/{stem}.json`.
+`handle_publish` reads that draft, renders its Markdown body to HTML, writes `content/posts/{stem}.json`, rebuilds the index, touches `site.toml` and deletes the draft.
+`handle_unpublish` moves the post back to `content/drafts/{stem}.json` and rebuilds the index.
+`handle_edit` opens a draft first, then a published CMS post, then a Markdown post from the index, so an editor can edit any post.
 
 ### 6.5. The publish flow
 
-1. Editor saves draft → `POST /api/drafts` or `PATCH /api/drafts/{stem}` writes `content/drafts/{stem}.json`
-2. Editor clicks **Publish** → `POST /api/publish/{stem}`:
-   - render-cms writes `content/posts/{stem}.json` — inotify fires, m6-http evicts `/blog/{stem}` from cache
-   - render-cms writes updated `content/posts/_index.json` — inotify fires, m6-http evicts `/blog`
-   - render-cms touches `site.toml` — m6-http reloads route table, re-expands `[[route_group]]` glob, `/blog/{stem}` route becomes live
-   - render-cms deletes `content/drafts/{stem}.json`
-3. Browser redirects to `/blog/{stem}`
-4. m6-http: route now live, cache miss → m6-html reads `content/posts/{stem}.json`, renders → m6-http caches
-5. Every subsequent request to `/blog/{stem}`: cache hit — RAM only
+A publish moves a draft to the public blog in five steps.
 
-### 6.6. Performance profile
+1. The editor saves a draft, and `POST /api/drafts` or `PATCH /api/drafts/{stem}` writes `content/drafts/{stem}.json`.
+2. The editor publishes, and `POST /api/publish/{stem}` reads that draft.
+3. render-cms renders the Markdown body to HTML, writes `content/posts/{stem}.json` and merges it into `data/posts.json`.
+4. render-cms touches `site.toml`, which makes m6-http reload its routes and clear its cache.
+5. The next request for `/blog/{stem}` is a cache miss, m6-html renders the post from the updated index, and m6-http caches it.
 
-| Request type | Latency |
-|---|---|
-| Public post (cached) | < 1ms — RAM only |
-| Public post (cache miss) | ~5ms — m6-html reads `content/posts/{stem}.json`, renders, caches |
-| CMS dashboard | ~10ms — JWT verified locally, render-cms reads posts directory + drafts directory |
-| Publish | ~5ms — one atomic file write, one inotify event |
+Unpublishing reverses the flow.
+`POST /api/unpublish/{stem}` moves the post back to `content/drafts/{stem}.json`, rebuilds the index and touches `site.toml`.
+A post that came from Markdown survives every index rebuild, because `update_index` keeps the entries the CMS does not own.
 
-### 6.7. `dev.sh`
+### 6.6. Caching
 
-```bash
-#!/bin/bash
-set -e
-SITE="$(cd "$(dirname "$0")" && pwd)"
-trap 'kill $(jobs -p) 2>/dev/null' EXIT
+The edge caches only the public, unauthenticated routes.
+The CMS and contact routes are marked `cache = "no-store"`, so m6-http never caches them.
+The `/login` and `/_errors` routes are also `no-store`.
 
-m6-html    "$SITE" "$SITE/configs/m6-html.conf" &
-m6-file    "$SITE" "$SITE/configs/m6-file.conf" &
-m6-auth    "$SITE" "$SITE/configs/m6-auth.conf" &
-"$SITE/target/release/render-cms" "$SITE" "$SITE/configs/render-cms.conf" &
-m6-http    "$SITE" "$SITE/configs/system-dev.toml" &
+A touch on `site.toml` clears the cache, so a publish or unpublish is visible on the next request.
+m6-http clears once immediately and twice more after a short delay, so a stale page cannot be re-cached in the gap.
 
-echo "Running at https://localhost:8443"
-echo "CMS at    https://localhost:8443/cms"
-wait
-```
+### 6.7. `dev.sh` and `test.sh`
+
+`dev.sh` builds m6 and render-cms, writes the TLS and auth keys, creates the admin user, generates `data/posts.json` and starts the stack.
+It runs m6-md in watch mode over `content/posts/`, which touches `site.toml` after each rebuild.
+The stack is m6-html, m6-file, m6-auth-server, render-cms and m6-http, plus m6-md in watch mode when it is installed.
+
+`test.sh` checks the running stack over the wire.
+It has 15 sections, numbered 0 to 14, and every check has one expected answer.
+The summary line prints the pass count, the fail count and the total, and the script deletes its own draft before it ends.
+
+[`m6-core-reference.md`](m6-core-reference.md) owns the `Request` file helpers and the `App` route methods.
+[`m6-md.md`](m6-md.md) owns the Markdown conversion.
+[`m6-site-toml.md`](m6-site-toml.md) owns the `[[route]]`, `require` and `allowed_methods` keys.
+[`m6-auth.md`](m6-auth.md) owns the login, refresh and logout responses.
+
+Example 05 completes the full stack and adds the end-to-end suite that section 1 points to.
+Example 06 runs the same site under systemd for production.
 
 ## 7. Example 06, production with systemd
 
