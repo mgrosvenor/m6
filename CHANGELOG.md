@@ -88,6 +88,9 @@ Comments only.
 **The build-host gate runs example 05's end-to-end test after its stack is up (#273).**
 The examples unit-test step skips `blog_site_end_to_end`, which needs certificates and the running stack, and the gate runs `cargo test -p render-cms --test integration` once that stack answers, counting a failure into the examples result.
 
+**Source comments in m6-core and m6-file no longer carry a deployment's names, per-node sizes or deployed versions, and no longer use "load-bearing" (#189, #190).**
+Comments only.
+
 ### Changed
 
 **The m6-auth-cli integration tests assert that each setup command succeeds, and print its stderr when one does not (#258).**

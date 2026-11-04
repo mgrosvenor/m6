@@ -1,10 +1,8 @@
 //! What a handler returns.
 //!
 //! A `Response` is a status, headers and a `Body`, where the body is either
-//! bytes or a stream of known length. The distinction is load-bearing: a body
-//! core has not read cannot be minified, compressed or hashed into an ETag,
-//! and making that a flag beside the bytes would leave those three free to run
-//! against bytes that are not there.
+//! bytes or a stream of known length. The `Body` doc says why those two are a
+//! sum type rather than a flag on the bytes.
 //!
 //! `verbatim` marks a response whose representation the handler has already
 //! decided -- it negotiated the coding, compressed, and built a validator
@@ -23,17 +21,18 @@ use crate::request::Request;
 /// What a response's body is.
 ///
 /// A sum type rather than a `Vec<u8>` plus an optional reader, because the
-/// difference is load-bearing rather than incidental: a body core has not read
+/// difference decides what the pipeline can do: a body core has not read
 /// cannot be minified, compressed, or hashed into an ETag, and making that a
 /// flag alongside the bytes would leave three functions free to take the bytes
 /// that are not there. Here they cannot: `as_bytes` returns `None` for a
 /// stream and the transforms have nothing to work on.
 ///
 /// This is what `App` was missing. `m6-file` streams a file straight to the
-/// wire (`send_stream`), and `lute.min.js` alone is 3.6MB that used to be read
-/// into a `Vec` on every cache miss to be copied straight out again. A
-/// migration onto a `Response` that could only hold bytes would have put that
-/// allocation back, on the service that serves every asset on the site.
+/// wire (`send_stream`), and one minified JavaScript bundle of several
+/// megabytes used to be read into a `Vec` on every cache miss to be copied
+/// straight out again. A migration onto a `Response` that could only hold bytes
+/// would have put that allocation back, on the service that serves every asset
+/// on the site.
 pub enum Body {
     /// Bytes already in memory.
     Bytes(Vec<u8>),

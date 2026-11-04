@@ -12,7 +12,7 @@
 //! handful of entries that genuinely differ are allocated per request.
 //!
 //! **Precedence is why this is a type rather than two fields.** `build_dict`
-//! merges twelve sources in a fixed order, and the order is load-bearing:
+//! merges twelve sources in a fixed order, and the order decides the result:
 //! built-in keys go in *after* params files so that a params file cannot
 //! override `year`, `datetime` or `request_path`. Splitting the sources across
 //! two layers preserves that only if the split respects it, so it does:
@@ -163,8 +163,8 @@ mod tests {
         assert_eq!(base().get("year").unwrap(), &json!("1999"));
     }
 
-    /// The precedence that step 8 of `build_dict` calls load-bearing: a params
-    /// file must not be able to override a built-in. Params files are in the
+    /// The precedence that step 8 of `build_dict` depends on: a params file
+    /// must not be able to override a built-in. Params files are in the
     /// base, built-ins in the overlay, so the overlay winning *is* that rule.
     #[test]
     fn a_base_entry_can_never_override_an_overlay_one() {

@@ -88,7 +88,7 @@ mod tests {
         assert_eq!(slugify("Rust is great!"), "rust-is-great");
     }
 
-    /// The missing `Z` is load-bearing. A log timestamp carries sub-second
+    /// The missing `Z` matters. A log timestamp carries sub-second
     /// precision, and `Z` sorts after `.` in ASCII, so a cutoff ending in `Z`
     /// would compare as later than any timestamp in the same second and drop
     /// the first fraction of a second of the window.

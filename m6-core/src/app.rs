@@ -4,7 +4,8 @@
 //! This is the module a service actually uses. `App::new().run()` is a whole
 //! working service, and every other module in core is reached through it. It is
 //! also the longest file here, so this note says how it is laid out and which
-//! parts are load-bearing for reasons that are not visible locally.
+//! parts the rest of the system depends on for reasons that are not visible
+//! locally.
 //!
 //! ```ignore
 //! use m6_core::prelude::*;
@@ -59,8 +60,8 @@
 //! 1,125ns per request, and it is the single largest measured win in the
 //! project. See `docs/PERFORMANCE.md`.
 //!
-//! What is left varies per request, and the order within it is still
-//! load-bearing:
+//! What is left varies per request, and the order within it decides the
+//! result:
 //!
 //! | step | what goes in |
 //! |---|---|
@@ -265,9 +266,8 @@ pub struct CompiledRoute {
     /// A rendered page has no file of its own to stat, which is why it carried
     /// no `Last-Modified` at all and every `If-Modified-Since` came back 200
     /// with the whole page. It does have inputs, though, and their mtimes are a
-    /// truthful answer: the max over every template (partials are shared, so a
-    /// change to `_banner.html` genuinely can change any page) and this route's
-    /// own static params files.
+    /// truthful answer: the max over every template and this route's own static
+    /// params files.
     ///
     /// Computed once when the framework state is built, so it costs nothing per
     /// request, and recomputed on reload.
@@ -631,19 +631,20 @@ impl FrameworkState {
 
         // ── Per-route Last-Modified ─────────────────────────────────────────
         // Rendered HTML had no `Last-Modified`, so a client validating by date
-        // got the entire page back every time -- 52 KB for `/`. m6-html emits an
-        // ETag, so `If-None-Match` already worked; this closes the other half.
+        // got the whole page back on every request, tens of kilobytes at a
+        // time. m6-html emits an ETag, so `If-None-Match` already worked. This
+        // closes the other half.
         //
-        // Templates are pooled deliberately. They include each other
-        // (`_head.html`, `_banner.html`, `_footer.html` are on every page), and
-        // resolving the transitive include set per route would be a lot of
-        // machinery to make one date slightly tighter. Taking the newest
-        // template as every page's floor is honest -- a change to a shared
-        // partial really can change any page -- and errs toward revalidating,
-        // which costs a request rather than serving something stale.
+        // Templates are pooled deliberately. Shared partials are included by
+        // every page, and resolving the transitive include set per route would
+        // be a lot of machinery to make one date slightly tighter. Taking the
+        // newest template as every page's floor is honest, because a change to
+        // a shared partial really can change any page, and it errs toward
+        // revalidating, which costs a request rather than serving something
+        // stale.
         //
-        // Params are per route, which is where the precision actually pays:
-        // editing a publication should not make /capabilities look modified.
+        // Params are per route, which is where the precision pays: editing one
+        // page's content should not make another page look modified.
         let templates_mtime = newest_mtime_under(&site_dir.join("templates"));
         for route in &mut routes {
             // The date is derived from templates and params files, so it is
@@ -1581,7 +1582,9 @@ fn install_shutdown(socket_path: &std::path::Path) -> crate::signal::ShutdownHan
                 .and_then(|s| s.to_str())
                 .map(str::to_owned)
         })
-        .unwrap_or_else(|| "m6-render".to_string());
+        // Used only when `argv[0]` has no file name, so no binary name is
+        // available to report.
+        .unwrap_or_else(|| "m6-app".to_string());
     crate::signal::ShutdownHandle::install(crate::signal::Service::new(name).socket(socket_path))
 }
 
@@ -3965,10 +3968,10 @@ mod tests {
     //
     // They had not compiled since Phase 4. Both built a `RawRequest` with
     // `query: String` and no `version`, which was m6-render's own type before
-    // the shared one replaced it, and `run-tests.sh` runs `cargo test
-    // --workspace` with default features, so `csrf` was never on and nothing
-    // ever tried. This is the bench problem from Phase 0.2 again: code that is
-    // never compiled is not covered by a green test run.
+    // the shared one replaced it, and the workspace test run uses default
+    // features, so `csrf` was never on and nothing ever tried. This is the
+    // bench problem from Phase 0.2 again: code that is never compiled is not
+    // covered by a green test run.
 }
 
 /// Newest mtime of any regular file beneath `dir`, or `None` for a missing or
@@ -4721,8 +4724,8 @@ mod dict_cost {
             return;
         }
 
-        // Exactly what production declares: the same file as the global params
-        // and as the route's params.
+        // A shape an HTML service commonly declares: the same file as the
+        // global params and as the route's params.
         let toml = format!(
             "{}global_params = [\"data/content.json\"]\n\
              [[route]]\npath = \"/\"\ntemplate = \"index.html\"\nparams = [\"data/content.json\"]\n",
@@ -4784,8 +4787,8 @@ mod dict_cost {
 
 #[cfg(test)]
 mod copy_audit {
-    //! Every copy `App` makes per request, measured against the production
-    //! input. `#[ignore]`d: measurements, not assertions.
+    //! Every copy `App` makes per request, measured against a real content
+    //! file. `#[ignore]`d: measurements, not assertions.
     //!
     //! ```sh
     //! cargo test --release -p m6-core copy_audit -- --ignored --nocapture
