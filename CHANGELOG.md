@@ -124,6 +124,8 @@ Comments only.
 
 **`docs/m6-site-toml.md` part 1 follows the documentation ruleset, and it now says that a secrets file refuses a key set in both files and that `[server]` and `[auth]` belong in the system config (#154).**
 
+**CHANGELOG.md's preamble and its 1.15.0, 1.14.0, 1.13.0 and 1.12.1 entries now follow the documentation ruleset (#129).**
+
 ### Changed
 
 **Debug and test builds carry line tables only, and no debug information for dependencies, so a full test build is 3.7 GB instead of 12 GB (#303).**
