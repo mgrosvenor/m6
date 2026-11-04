@@ -609,7 +609,7 @@ Table 11 gives them by area.
 | caching | invalidation is derived from the site's own declarations at startup | the site already says which files a route reads, and a backend that has to announce a change is a backend that can forget to |
 | caching | a rendered page carries a validator derived from its inputs | without one every conditional request returned the whole page, and a rendered page has no file of its own to date |
 | processes | a socket path is derived from the config filename | one convention, so a unit file and a pool glob cannot disagree about where a service listens |
-| processes | two positional arguments, and no environment variables | what a service is doing can be read from the files it was given |
+| processes | two positional arguments, and one environment variable, `M6_SOCKET_OVERRIDE` | the two positional arguments carry the service's configuration, and the named exception relocates only the listening socket and is never set in a deployment (`m6-app-anatomy.md` §4.1). |
 | processes | a connection serves at most 100 requests before closing | persistent connections are the default, and an unbounded one lets one peer hold a slot indefinitely by pipelining |
 | processes | an accepted connection has a read deadline, 30 seconds by default | a peer that connects and says nothing otherwise holds a pool worker until it disconnects, and a handful of those is the whole pool while the service looks healthy |
 | processes | exit 0 clean, 1 runtime error, 2 configuration or usage error before binding | a supervisor can tell a bad config from a crash, which is what lets a deploy validate a new binary and refuse to install |

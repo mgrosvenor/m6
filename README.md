@@ -701,9 +701,12 @@ claiming identical conditions and neither recording a commit, hardware,
 payload or command line. Both were deleted and re-measured, and the measured
 figure in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) is well under either.
 
-There are no comparisons against nginx, LiteSpeed or H2O. The ones published
-here until September 2026 took their figures from elsewhere, on other hardware
-with other payloads, which does not compare anything.
+A caveated architectural comparison against nginx, HAProxy, Envoy, H2O,
+OpenResty, Varnish and Pingora remains in [`docs/POSITIONING.md`](docs/POSITIONING.md),
+with capability columns from each project's own documentation and nothing run
+like-for-like. The numeric throughput figures published here until September
+2026 took their numbers from elsewhere, on other hardware with other payloads,
+which does not compare anything.
 
 **Two different quantities, both true, easily confused:** a cache hit costs
 **~2.2 µs** inside m6 (its own timer, confirmed against a running server), while an
