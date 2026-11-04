@@ -113,6 +113,8 @@ Comments only.
 
 **`docs/m6-architecture.md` now names `M6_SOCKET_OVERRIDE` as the one environment variable a service reads, and the `socket_path_from_config` doc comment points at that page (#187).**
 
+**The user guide's Example 05 (CMS blog) now matches the released example and follows the documentation ruleset (#156).**
+
 ### Changed
 
 **The m6-auth-cli integration tests assert that each setup command succeeds, and print its stderr when one does not (#258).**
