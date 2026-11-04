@@ -113,6 +113,8 @@ Comments only.
 
 **`docs/m6-architecture.md` now names `M6_SOCKET_OVERRIDE` as the one environment variable a service reads, and the `socket_path_from_config` doc comment points at that page (#187).**
 
+**The user guide's Example 05 (CMS blog) now matches the released example and follows the documentation ruleset (#156).**
+
 ### Changed
 
 **Debug and test builds carry line tables only, and no debug information for dependencies, so a full test build is 3.7 GB instead of 12 GB (#303).**
