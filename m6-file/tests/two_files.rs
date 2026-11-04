@@ -302,14 +302,19 @@ fn a_burst_of_writes_is_at_most_two_reloads() {
     // loaded machine three writes can take longer than that, and the reloader
     // then rightly reports the late one as a new change (#299). So each attempt
     // times its own burst and is judged only if it fitted inside the window.
-    // Removing the debounce still fails: every write is then its own report.
+    // The writes are spaced further apart than one reload takes, so without
+    // the debounce each is its own report: written back to back, the service
+    // loop would merge them on its own and the test could not fail.
     const ATTEMPTS: usize = 5;
     let window = m6_core::watcher::RELOAD_DEBOUNCE;
     let r = start("");
     for attempt in 0..ATTEMPTS {
         let before = r.count("Reload complete");
         let t = std::time::Instant::now();
-        for pad in ["# a", "# bb", "# ccc"] {
+        for (i, pad) in ["# a", "# bb", "# ccc"].iter().enumerate() {
+            if i > 0 {
+                std::thread::sleep(Duration::from_millis(5));
+            }
             std::fs::write(r.conf(), conf_body(&format!("{pad}{attempt}"), 2)).unwrap();
         }
         let took = t.elapsed();
@@ -318,8 +323,9 @@ fn a_burst_of_writes_is_at_most_two_reloads() {
             "{}",
             r.svc.output()
         );
-        // Long enough for the held report, and then quiet before the next try.
-        std::thread::sleep(Duration::from_millis(1_500));
+        // A held report comes at most RELOAD_POLL after the first, so this is
+        // a bound taken from the reloader, not a guess.
+        std::thread::sleep(m6_core::watcher::RELOAD_POLL + Duration::from_millis(500));
         if took >= window {
             continue;
         }
