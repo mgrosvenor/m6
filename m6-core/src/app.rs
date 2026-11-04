@@ -906,10 +906,19 @@ impl FrameworkState {
         }
 
         // 5. Query params — inserted at top level AND as a nested `query` map.
+        //
+        // A query or form key never replaces a path parameter at the top
+        // level. The path value was validated in step 4 and the query value
+        // was not, so `/assets/a.css?relpath=../../x` must not reach a
+        // handler as `relpath`. The query value stays readable as
+        // `query.<name>`.
+        let is_path_param = |k: &str| path_params.iter().any(|(p, _)| p == k);
         let mut query_map = Map::new();
         for (k, v) in parse_query_string(raw.query()) {
             query_map.insert(k.clone(), Value::String(v.clone()));
-            dict.insert(k, Value::String(v));
+            if !is_path_param(&k) {
+                dict.insert(k, Value::String(v));
+            }
         }
         dict.insert("query".to_string(), Value::Object(query_map));
 
@@ -929,7 +938,9 @@ impl FrameworkState {
             match raw.content_type() {
                 Some(ct) if ct.contains("application/x-www-form-urlencoded") => {
                     for (k, v) in parse_form_body(&raw.body) {
-                        dict.insert(k, Value::String(v));
+                        if !is_path_param(&k) {
+                            dict.insert(k, Value::String(v));
+                        }
                     }
                 }
                 other => {

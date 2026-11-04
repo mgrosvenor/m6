@@ -173,6 +173,29 @@ fn l2_dotdot_in_url_returns_404() {
 }
 
 #[test]
+fn l2_query_relpath_cannot_replace_the_path_parameter() {
+    let (_guard, socket_path) = spawn_server("l2-query-relpath");
+
+    // The path names a real file, and the query carries a `relpath` that
+    // climbs out of `assets/` to the service's own config. The query key
+    // must not replace the checked path parameter, so the request serves
+    // the file the path names, never the config.
+    let req = "GET /assets/css/main.css?relpath=../m6-file-test.conf HTTP/1.1\r\n\
+               Host: localhost\r\nAccept-Encoding: identity\r\n\r\n";
+    let resp = http_request(&socket_path, req);
+    assert!(
+        !resp.contains("[thread_pool]"),
+        "a query relpath served a file outside the root: {}",
+        &resp[..resp.len().min(300)]
+    );
+    assert!(
+        resp.contains("200 OK"),
+        "expected the path's own file, got: {}",
+        &resp[..resp.len().min(200)]
+    );
+}
+
+#[test]
 fn l2_relpath_with_subdirectory() {
     let (_guard, socket_path) = spawn_server("l2-subdir");
 

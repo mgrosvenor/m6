@@ -14,12 +14,21 @@ use crate::compress::{choose_encoding, compress_brotli, compress_gzip, Encoding}
 /// `{*relpath}` wildcard route or `filename` for a two-parameter one; a route
 /// with neither addresses the file `root` names outright, which is how
 /// `/favicon.ico` works.
-fn resolve_fs_path(req: &Request, site_dir: &Path) -> PathBuf {
+///
+/// Every value taken from the request dictionary is checked again here with
+/// the same rule core applies to path parameters. Core already stops a query
+/// key replacing a path parameter, and this check is the second line: a
+/// value that could leave the site directory gives `None`, which is a 404.
+fn resolve_fs_path(req: &Request, site_dir: &Path) -> Option<PathBuf> {
     let mut root = req.route_str("root").unwrap_or("").to_string();
     if root.contains('{') {
         for (k, v) in req.dict().iter() {
             if let Some(s) = v.as_str() {
-                root = root.replace(&format!("{{{}}}", k), s);
+                let placeholder = format!("{{{}}}", k);
+                if root.contains(&placeholder) {
+                    m6_core::validate_path_param(s, true).ok()?;
+                    root = root.replace(&placeholder, s);
+                }
             }
         }
     }
@@ -30,9 +39,10 @@ fn resolve_fs_path(req: &Request, site_dir: &Path) -> PathBuf {
         .and_then(|v| v.as_str())
         .unwrap_or("");
     if rel.is_empty() {
-        site_dir.join(&root)
+        Some(site_dir.join(&root))
     } else {
-        site_dir.join(&root).join(rel)
+        m6_core::validate_path_param(rel, true).ok()?;
+        Some(site_dir.join(&root).join(rel))
     }
 }
 
@@ -104,7 +114,9 @@ pub fn serve(req: &Request) -> Result<Response> {
     }
 
     let site_dir = req.site_path("");
-    let fs_path = resolve_fs_path(req, &site_dir);
+    let Some(fs_path) = resolve_fs_path(req, &site_dir) else {
+        return Ok(Response::not_found());
+    };
 
     // Fast symlink check: if the path is (or contains) a symlink that escapes
     // site_dir, return 404.  Regular files skip canonicalize entirely.
@@ -807,6 +819,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(wire(&asset_req(dir.path(), "escape", None, &[])).0, 404);
+    }
+
+    /// A `relpath` that climbs out of the root is a 404 even when it reaches
+    /// the handler without core's path check, and a regular file on the
+    /// other side does not change that.
+    #[test]
+    fn a_dotdot_relpath_in_the_dictionary_is_404() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        std::fs::write(dir.path().join("secret"), b"secret").unwrap();
+        assert_eq!(wire(&asset_req(dir.path(), "../secret", None, &[])).0, 404);
     }
 }
 

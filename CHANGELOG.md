@@ -57,6 +57,15 @@ Googlebot verifies only under `googlebot.com` and `google.com`. A name under `go
 **CI runs the workspace under the address and leak sanitisers on pushes to `develop`, in a workflow of its own, and fails when the sanitiser is unavailable (#164).**
 A probe compiles and runs a trivial program with the same flags before the suite, so a missing runtime or a rejected flag fails the job in seconds instead of passing while measuring nothing.
 
+### Security
+
+**A query key or form field can no longer replace a path parameter, so m6-file serves only files under its route's root (#279).**
+Core checks every path parameter for `..` and stray characters, then added each query parameter to the same request dictionary under the same name.
+A request such as `GET /assets/a.css?relpath=../config` therefore reached m6-file with the unchecked query value as `relpath`, and m6-file served the file it named, outside the site directory.
+Core now leaves a path parameter in place when a query key or form field has its name, and the query value stays readable as `query.<name>`.
+m6-file also checks `relpath`, `filename` and every value it puts into `root` with the same rule, and answers 404 when one fails.
+Verified with `l2_query_relpath_cannot_replace_the_path_parameter`, which sends that request over HTTP: it fails on the previous code with `200 OK` and the service's config in the body, and passes now. `a_dotdot_relpath_in_the_dictionary_is_404` covers m6-file's own check.
+
 ### Fixed
 
 **CI runs example 05's integration test after its stack is up (#277).**
