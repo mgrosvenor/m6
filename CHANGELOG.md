@@ -17,24 +17,6 @@ The released versions, newest first:
 - [1.14.0, 2026-10-27](#1140-2026-10-27)
 - [1.13.0, 2026-10-02](#1130-2026-10-02)
 - [1.12.1, 2026-10-02](#1121-2026-10-02)
-- [1.12.0, 2026-09-27](#1120-2026-09-27)
-- [1.11.3, 2026-09-26](#1113-2026-09-26)
-- [1.11.2, 2026-09-26](#1112-2026-09-26)
-- [1.11.1, 2026-09-25](#1111-2026-09-25)
-- [1.11.0, 2026-09-25](#1110-2026-09-25)
-- [1.10.0, 2026-09-19](#1100-2026-09-19)
-- [1.9.0, 2026-09-18](#190-2026-09-18)
-- [1.8.1, 2026-09-18](#181-2026-09-18)
-- [1.8.0, 2026-09-17](#180-2026-09-17)
-- [1.7.0, 2026-09-16](#170-2026-09-16)
-- [1.6.0, 2026-09-16](#160-2026-09-16)
-- [1.5.0, 2026-09-16](#150-2026-09-16)
-- [1.4.0, 2026-09-16](#140-2026-09-16)
-- [1.3.0, 2026-09-16](#130-2026-09-16)
-- [1.2.0, 2026-09-15](#120-2026-09-15)
-- [1.1.0, 2026-09-15](#110-2026-09-15)
-- [1.0.0, 2026-09-14](#100-2026-09-14)
-- [0.2.0 and earlier, 2026-03-15 and before](#020-and-earlier-2026-03-15-and-before)
 
 ---
 
@@ -760,7 +742,7 @@ The second told contributors to write a trailer that was wrong as soon as it was
 Verified by reading the diff: it touches only `CLAUDE.md`, replacing one bullet and deleting one paragraph with its code block.
 No code and no other document changes, and no tests were run.
 
-1.14.0 spans config reload, logging, listeners, metrics, monitoring, m6-core blocks and documentation, and it fixes the TLS reload limitation that 1.13.0 recorded.
+1.14.0 fixes the TLS reload limitation that 1.13.0 recorded, and it clears seven RustSec advisories by moving four dependencies up a patch version.
 
 ---
 
@@ -804,7 +786,6 @@ Dates go through `chrono`, because civil-from-days arithmetic is the mistake `ut
 ### 3. Absence and a measurement must not look alike
 
 Three defects found in review, all in the direction of reading silence as health.
-Table 1 gives the three and what each would have cost.
 
 | defect | consequence |
 |---|---|
