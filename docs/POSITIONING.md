@@ -30,7 +30,8 @@ Table 1 states both.
 
 *Table 1: the two cache-hit figures, and what each measures.* Take from it that 2.2 µs is what the cache costs and 225.7 µs is what a client on the same host sees, so quoting one as the other is the error to avoid.
 
-The two figures were measured on the 4 vCPU virtual private server in `BENCHMARKS.md` Table 2, over loopback, at concurrency 2, with *TLS* (Transport Layer Security) 1.3.
+The 225.7 µs and 259.2 µs figures were measured on the 4 vCPU virtual private server in `BENCHMARKS.md` Table 2, over loopback, at concurrency 2, with *TLS* (Transport Layer Security) 1.3.
+The 2.2 µs figure is m6's internal timer, and `BENCHMARKS.md` records no machine or date for it.
 `BENCHMARKS.md` Table 3 records the latency for all six suites, and Table 4 records the throughput.
 The throughput figures are 7154.1 req/s and 6711.2 req/s for HTTP/2, 2085.1 req/s and 1889.3 req/s for HTTP/1.1, and 1030.3 req/s and 1047.0 req/s for HTTP/3.
 
@@ -80,21 +81,21 @@ Section 5 turns the comparison into where m6 wins and where it does not.
 
 ## 5. Where m6 wins and where it does not
 
-The wins and losses below follow from `BENCHMARKS.md`, and each names the figure it rests on.
+The wins and losses below follow from `BENCHMARKS.md`, and each points to the figure it rests on in section 2.
 
 **Where m6 wins.**
 
 - **HTTP/2 over HTTP/1.1.**
-  HTTP/2 is 2.6x to 3x faster on a cache-hit p50, and 3.4x to 3.6x faster on throughput (`BENCHMARKS.md` section 6).
+  The cache-hit and throughput ratios in section 2 record the margin.
 - **A zero-IPC cache hit.**
-  The 2.2 µs internal cache hit holds no copy, no lock, and no IPC (`BENCHMARKS.md` section 6).
+  The internal cache hit in Table 1 holds no copy, no lock, and no IPC.
 - **A deterministic hot path.**
   One thread means no lock contention and no cross-core cache traffic, so the hot path has no convoy spikes.
 
 **Where m6 does not win.**
 
 - **HTTP/1.1 throughput.**
-  HTTP/1.1 is the slowest of the three on throughput, at 2085.1 req/s and 1889.3 req/s (`BENCHMARKS.md` Table 4).
+  The HTTP/1.1 throughput figures in section 2 are the slowest of the three.
   The HTTP/1.1 path also has a synchronous backend call that blocks the event loop during a cache miss.
 - **Multi-core scale within one instance.**
   One m6-http process uses one core, and nginx, HAProxy and Envoy use multiple cores in one instance.
@@ -105,8 +106,8 @@ Section 6 states what would change these positions.
 
 ## 6. Headroom
 
-The figures in section 2 are the current measurements, and they come from the Linux virtual private server in `BENCHMARKS.md` Table 2.
-`BENCHMARKS.md` records no macOS measurement, so no macOS figure is claimed here.
+The end-to-end figures in section 2 were measured on the Linux virtual private server in `BENCHMARKS.md` Table 2.
+`BENCHMARKS.md` records no macOS end-to-end HTTP figure, so none is claimed here.
 
 Two Linux features would change the HTTP/2 result, and neither is measured.
 Kernel TLS would offload the AES-GCM work that the TLS path performs in userspace.
@@ -118,7 +119,7 @@ Section 7 closes the page.
 ## 7. Summary
 
 m6-http is a single-threaded reverse proxy with an in-process cache and TLS termination in one process.
-That design wins for HTTP/2 cache serving, where the internal cache hit is 2.2 µs and the end-to-end p50 is 225.7 µs to 259.2 µs.
+That design wins for HTTP/2 cache serving, as the cache-hit figures in section 2 show.
 It does not win for HTTP/1.1 throughput or for large files, and it scales by running more instances.
 
 The comparison to other servers is architectural, and every m6 figure on this page is quoted from `docs/BENCHMARKS.md`.
