@@ -420,21 +420,34 @@ That split tells a frame on a never-opened stream from a frame on a finished str
 
 `recently_reset` holds the reset ids so `frame_verdict` can choose the error class Table 5 describes, and it is bounded at `RESET_MEMORY`.
 The state table runs before dispatch, so no handler sees a frame in a state that forbids it.
-Known gaps below lists the two tracked implementation gaps.
+Known gaps below lists the one tracked implementation gap.
+
+### The header list size limit
+
+`send_server_settings` advertises `SETTINGS_MAX_HEADER_LIST_SIZE` (0x6) as 64 KiB, and the server enforces the same value, `MAX_HEADER_LIST_SIZE` in `m6-http/src/http2.rs`.
+The size is counted as RFC 9113 6.5.2 defines it: the length of each name plus the length of each value plus 32 bytes per field, over the decoded fields of one header block.
+
+`MAX_HEADER_BLOCK` bounds only the compressed block, at 256 KiB.
+HPACK lets one byte refer to a dynamic table entry of up to 4096 bytes, so a block under that cap can decode to a header list hundreds of times larger.
+The decoded limit closes that expansion.
+It is a quarter of the compressed cap, and a browser request with its cookies is a few KiB, so a legitimate peer does not reach it.
+
+A block whose decoded list is over the limit is decoded in full, so the connection's HPACK table stays in step with the peer's, and is then answered with a 431 that has no body, followed by RST_STREAM with NO_ERROR (RFC 9113 4.3.1 and 8.1).
+It is a stream error and not a connection error.
+The fault is in one request, and a COMPRESSION_ERROR would end every other stream on the connection.
 
 ### Known gaps
 
-Two HTTP/2 limits are absent from the server today, and Table 6 records each with the m6 issue that tracks it.
-The rows state what the code does and leave the fix to the issue.
+One HTTP/2 limit is absent from the server today, and Table 6 records it with the m6 issue that tracks it.
+The row states what the code does and leaves the fix to the issue.
 
 | Gap | What the code does today | Issue |
 |---|---|---|
-| Maximum header list size | `send_server_settings` advertises `MAX_CONCURRENT_STREAMS`, `INITIAL_WINDOW_SIZE` and `MAX_FRAME_SIZE`. It does not advertise `SETTINGS_MAX_HEADER_LIST_SIZE`. `handle_settings` accepts the peer's value for that setting and ignores it. `MAX_HEADER_BLOCK` still caps one accumulated header block at 256 KiB. | #162 |
 | HTTP/2 error codes | The server sends NO_ERROR, PROTOCOL_ERROR, FLOW_CONTROL_ERROR, STREAM_CLOSED, FRAME_SIZE_ERROR, REFUSED_STREAM, COMPRESSION_ERROR and ENHANCE_YOUR_CALM. It has no path that sends INTERNAL_ERROR, SETTINGS_TIMEOUT, CANCEL, CONNECT_ERROR, INADEQUATE_SECURITY or HTTP_1_1_REQUIRED. The two backbone clients do send CANCEL. | #163 |
 
-*Table 6: two HTTP/2 limits m6-http does not implement, and the issues that track them. Take from it that a peer gets no advertised header-list bound and no CANCEL or INTERNAL_ERROR from the server, and that the issue numbers are the record of each gap.*
+*Table 6: the one HTTP/2 limit m6-http does not implement, and the issue that tracks it. Take from it that the server sends no CANCEL or INTERNAL_ERROR, and that the issue number is the record of the gap.*
 
-Both gaps are engineering work tracked by the two issues.
+The gap is engineering work tracked by the issue.
 Event Loop below describes the single-threaded epoll loop that drives these connections.
 
 ---

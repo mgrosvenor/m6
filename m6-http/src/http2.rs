@@ -51,6 +51,7 @@ const SETTING_ENABLE_PUSH: u16 = 0x2;
 const SETTING_MAX_CONCURRENT_STREAMS: u16 = 0x3;
 const SETTING_INITIAL_WINDOW_SIZE: u16 = 0x4;
 const SETTING_MAX_FRAME_SIZE: u16 = 0x5;
+const SETTING_MAX_HEADER_LIST_SIZE: u16 = 0x6;
 
 const CLIENT_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const FRAME_HDR: usize = 9;
@@ -97,6 +98,25 @@ const MAX_FRAME_SIZE: usize = 16_384;
 /// 256 KiB is generous for real traffic (a large browser request is a few KiB)
 /// and matches the order other servers use.
 const MAX_HEADER_BLOCK: usize = 256 * 1024;
+
+/// The largest decoded header list a peer may send, and the value advertised
+/// as SETTINGS_MAX_HEADER_LIST_SIZE (RFC 9113 6.5.2).
+///
+/// `MAX_HEADER_BLOCK` bounds the compressed block only. HPACK lets one byte
+/// refer to a table entry of up to 4096 bytes, so a block under that cap can
+/// still decode to hundreds of megabytes of header fields (an HPACK bomb). The
+/// size is counted as the RFC defines it: name length plus value length plus
+/// 32 for every field. A block over it is refused with 431 on its own stream
+/// (RFC 9113 4.3.1), after it has been decoded in full so the HPACK table stays
+/// in step with the peer's. It is not a connection error: the fault is in one
+/// request, and COMPRESSION_ERROR would punish every other stream.
+///
+/// 64 KiB is a quarter of the compressed cap, so nothing larger is a plausible
+/// request. A browser request, cookies included, is a few KiB.
+const MAX_HEADER_LIST_SIZE: usize = 64 * 1024;
+
+/// Per-field overhead in the header list size (RFC 9113 6.5.2).
+const HEADER_FIELD_OVERHEAD: usize = 32;
 
 const ERR_NO_ERROR: u32 = 0x0;
 const ERR_PROTOCOL_ERROR: u32 = 0x1;
@@ -1371,7 +1391,11 @@ impl Http2Conn {
             // make one indistinguishable from a legitimate leading field.
             let is_trailers = stream.headers_done;
             let mut block = Vec::new();
-            decode_hpack(dec, &combined, &mut block)?;
+            let list_size = decode_hpack(dec, &combined, &mut block)?;
+            if list_size > MAX_HEADER_LIST_SIZE {
+                self.refuse_oversize_header_list(stream_id);
+                return Ok(());
+            }
             if is_trailers {
                 // RFC 9113 8.1: a request is "a single HEADERS frame, followed
                 // by zero or more CONTINUATION, optionally followed by DATA,
@@ -1457,7 +1481,11 @@ impl Http2Conn {
                 // Can't call decode_hpack with self.hpack_dec while stream borrowed.
                 // Decode into a temp vec and extend.
                 let mut tmp = Vec::new();
-                decode_hpack(dec, &all, &mut tmp)?;
+                let list_size = decode_hpack(dec, &all, &mut tmp)?;
+                if list_size > MAX_HEADER_LIST_SIZE {
+                    self.refuse_oversize_header_list(stream_id);
+                    return Ok(());
+                }
                 stream.headers.extend(tmp);
                 stream.headers_done = true;
             }
@@ -1976,13 +2004,40 @@ impl Http2Conn {
         );
     }
 
+    /// Answer a request whose decoded header list is over `MAX_HEADER_LIST_SIZE`.
+    ///
+    /// A bodiless 431 on the stream, then RST_STREAM(NO_ERROR) so the peer
+    /// stops sending the rest of the request (RFC 9113 8.1). The block has
+    /// already been decoded, so the connection's HPACK table is unaffected.
+    fn refuse_oversize_header_list(&mut self, stream_id: u32) {
+        tracing::debug!(
+            stream_id,
+            "h2: decoded header list exceeds MAX_HEADER_LIST_SIZE"
+        );
+        let block = self.encode_response_headers(431, &[], 0);
+        self.push_frame(
+            TYPE_HEADERS,
+            FLAG_END_HEADERS | FLAG_END_STREAM,
+            stream_id,
+            &block,
+        );
+        self.push_frame(TYPE_RST_STREAM, 0, stream_id, &ERR_NO_ERROR.to_be_bytes());
+        self.streams.remove(&stream_id);
+        self.note_reset(stream_id);
+    }
+
     fn send_server_settings(&mut self) {
-        let mut p = Vec::with_capacity(12);
+        let mut p = Vec::with_capacity(24);
         setting_bytes(&mut p, SETTING_MAX_CONCURRENT_STREAMS, MAX_CONCURRENT);
         setting_bytes(&mut p, SETTING_INITIAL_WINDOW_SIZE, 1_048_576);
         // Advertised so the limit we enforce is the limit a conforming peer
         // sends. Enforcing an unadvertised bound is how interop breaks.
         setting_bytes(&mut p, SETTING_MAX_FRAME_SIZE, MAX_FRAME_SIZE as u32);
+        setting_bytes(
+            &mut p,
+            SETTING_MAX_HEADER_LIST_SIZE,
+            MAX_HEADER_LIST_SIZE as u32,
+        );
         self.push_frame(TYPE_SETTINGS, 0, 0, &p);
     }
 
@@ -2120,15 +2175,17 @@ fn decode_hpack(
     dec: &mut hpack::Decoder<'_>,
     block: &[u8],
     out: &mut Vec<(String, String)>,
-) -> Result<(), &'static str> {
+) -> Result<usize, &'static str> {
     let headers = dec.decode(block).map_err(|_| "HPACK decode error")?;
+    let mut list_size = 0usize;
     for (k, v) in headers {
+        list_size += k.len() + v.len() + HEADER_FIELD_OVERHEAD;
         out.push((
             String::from_utf8_lossy(&k).into_owned(),
             String::from_utf8_lossy(&v).into_owned(),
         ));
     }
-    Ok(())
+    Ok(list_size)
 }
 
 fn is_headersonly(headers: &[(String, String)]) -> bool {
@@ -3901,5 +3958,121 @@ mod server_push_tests {
             sent, 1_000,
             "a stream may not send past its own window before WINDOW_UPDATE"
         );
+    }
+}
+
+/// RFC 9113 6.5.2. The decoded header list is bounded, the bound is advertised,
+/// and a block over it is answered 431 on its own stream.
+#[cfg(test)]
+mod header_list_size_tests {
+    use super::frame_validation_tests::frame;
+    use super::*;
+
+    /// Request headers whose list size (name + value + 32 per field, counted
+    /// as RFC 9113 6.5.2 defines it) is exactly `target`, padded by one custom
+    /// field.
+    fn request_fields(target: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut f: Vec<(Vec<u8>, Vec<u8>)> = vec![
+            (b":method".to_vec(), b"GET".to_vec()),
+            (b":scheme".to_vec(), b"https".to_vec()),
+            (b":path".to_vec(), b"/".to_vec()),
+            (b":authority".to_vec(), b"example.com".to_vec()),
+        ];
+        let used: usize = f
+            .iter()
+            .map(|(k, v)| k.len() + v.len() + HEADER_FIELD_OVERHEAD)
+            .sum();
+        let name = b"x-padding".to_vec();
+        let value_len = target - used - name.len() - HEADER_FIELD_OVERHEAD;
+        f.push((name, vec![b'a'; value_len]));
+        f
+    }
+
+    /// Feed a GET whose decoded list size is `size`, split over HEADERS and
+    /// CONTINUATION frames, and return the connection plus whether the request
+    /// reached the handler.
+    fn send(size: usize) -> (Http2Conn, bool) {
+        let fields = request_fields(size);
+        let pairs: Vec<(&[u8], &[u8])> = fields
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
+        let block = hpack::Encoder::new().encode(pairs);
+        let mut chunks = block.chunks(10_000);
+        let mut wire = frame(
+            TYPE_HEADERS,
+            FLAG_END_STREAM,
+            1,
+            chunks.next().expect("block is not empty"),
+        );
+        let rest: Vec<&[u8]> = chunks.collect();
+        for (i, chunk) in rest.iter().enumerate() {
+            let flags = if i + 1 == rest.len() {
+                FLAG_END_HEADERS
+            } else {
+                0
+            };
+            wire.extend(frame(TYPE_CONTINUATION, flags, 1, chunk));
+        }
+        let mut c = Http2Conn::new();
+        c.phase = Phase::Active;
+        c.recv_buf.extend_from_slice(&wire);
+        let mut reached = false;
+        let mut on_request = |_: &HttpRequest, _: &str| -> RequestOutcome {
+            reached = true;
+            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string())
+        };
+        loop {
+            match c.process_frame(&mut on_request, "127.0.0.1") {
+                Ok(true) => continue,
+                Ok(false) => break,
+                Err(e) => panic!("a header list size must not be a connection error: {e}"),
+            }
+        }
+        (c, reached)
+    }
+
+    fn status_of_stream_1(c: &Http2Conn) -> String {
+        let mut headers = super::stream_state_tests::sent_frames(&c.send_buf, TYPE_HEADERS);
+        let (sid, block) = headers.remove(0);
+        assert_eq!(sid, 1);
+        let decoded = hpack::Decoder::new().decode(&block).expect("valid HPACK");
+        let (_, v) = decoded
+            .into_iter()
+            .find(|(k, _)| k == b":status")
+            .expect("a :status field");
+        String::from_utf8(v).unwrap()
+    }
+
+    #[test]
+    fn a_header_list_at_the_limit_is_served() {
+        let (c, reached) = send(MAX_HEADER_LIST_SIZE);
+        assert!(
+            reached,
+            "a list exactly at the limit must reach the handler"
+        );
+        assert_eq!(status_of_stream_1(&c), "200");
+    }
+
+    #[test]
+    fn a_header_list_over_the_limit_is_answered_431_on_its_stream() {
+        let (c, reached) = send(MAX_HEADER_LIST_SIZE + 1);
+        assert!(!reached, "an oversize list must not reach the handler");
+        assert_eq!(status_of_stream_1(&c), "431");
+        assert_eq!(c.phase, Phase::Active, "the connection must survive");
+        assert!(c.was_reset(1), "the stream is closed with RST_STREAM");
+    }
+
+    #[test]
+    fn the_server_settings_advertise_the_header_list_limit() {
+        let mut c = Http2Conn::new();
+        c.send_server_settings();
+        let settings = super::stream_state_tests::sent_frames(&c.send_buf, TYPE_SETTINGS);
+        let payload = &settings[0].1;
+        let advertised = payload.chunks(6).find_map(|s| {
+            (u16::from_be_bytes([s[0], s[1]]) == SETTING_MAX_HEADER_LIST_SIZE)
+                .then(|| u32::from_be_bytes([s[2], s[3], s[4], s[5]]))
+        });
+        assert_eq!(advertised, Some(MAX_HEADER_LIST_SIZE as u32));
     }
 }
