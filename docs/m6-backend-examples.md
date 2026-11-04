@@ -264,10 +264,10 @@ Through the proxy, every example must:
 - relay `/boom` as a 500 the proxy counts as a backend error
 - arrive uncompressed, because the proxy has no compressor and the examples declare `compresses = false`
 - get no `Vary: Accept-Encoding`, because a non-compressing backend has one representation
-- be cached by the proxy, even though it sends no `Cache-Control`
+- serve two identical requests with the same status and body when it sends no `Cache-Control`, because an uncacheable backend must not break the edge
 
-`X-Forwarded-For`, `X-Forwarded-Host` and `Via` are asserted in `security_regressions.rs`.
-That file checks the forwarded request itself, which is the security-critical layer.
+`X-Forwarded-For` is asserted in `security_regressions.rs`, which checks the forwarded request itself.
+`X-Forwarded-Host` and `Via` are unit-tested in `m6-http/src/forward.rs`.
 
 Because the assertions are shared, adding a language is adding a directory.
 
@@ -359,7 +359,6 @@ So an example's carefully written 404 page is never seen through a proxy, only o
 Section 7 records the status, and whether the proxy should relay the body is the owner's call.
 
 The value `passthrough` is not a valid mode, and `m6-http/src/error.rs` treats any unknown mode as `internal`.
-The first version of the through-proxy test wrote exactly that and spent a while looking like a proxy bug.
 
 ### 10.5. The proxy does not compress: resolved 2026-09-13
 
@@ -402,14 +401,9 @@ A non-Rust backend still serves uncompressed bytes if it chooses not to compress
 Three things are done:
 
 - **The direct-to-socket benchmark of section 5**, done 2026-09-13 in `tools/backend-bench.py`, with results in `docs/BENCHMARKS.md`.
-  Linking `m6-core` costs 36.8% of throughput and +38.5 us p50 on this route, reproduced within 3% across two runs, plus 8.8x resident memory and 56.7x binary size.
-  Section 5.3 says a number that is not close to zero is a problem worth knowing about, and this number is not close to zero.
+  The delta between the two Rust examples is not close to zero, which section 5.3 says is a problem worth knowing about.
   The route is deliberately the shape that maximises framework overhead, and a cache hit never reaches a backend, so the number measures that shape.
-
-  Getting there required fixing the control.
-  The first run reported core as 72% faster, because `rust-plain` spawned a thread per connection while core answered from a fixed pool, so the comparison measured pooling against thread-per-connection.
-  `rust-plain` now uses protocol section 7's reference model, which took it from 17,608 to 46,826 rps.
-- **The through-the-proxy half of section 7**, done 2026-09-13 in `m6-http/tests/backends_through_proxy.rs`: six tests, each example behind a real m6-http over TLS.
+- **The through-the-proxy half of section 7**, done 2026-09-13 in `m6-http/tests/backends_through_proxy.rs`: seven tests, each example behind a real m6-http over TLS.
 - **A README per example**, done 2026-09-13.
   Each directory carries one, saying what that language is for, how to build and run it, and what its measured numbers are.
   The module-level comment in each source file carries the same argument where someone is reading the code.
