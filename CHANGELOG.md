@@ -1,15 +1,40 @@
 # Changelog
 
-What changed in each release, newest first.
+This file records what changed in each m6 release, newest first.
+Each entry says what changed, why it mattered, and how it was verified.
+"Verified" means measured against something running.
 
-Each entry records what changed, why it mattered, and how it was verified.
-"Verified" means measured against a running server, not inferred from the
-source: several defects in this list were invisible in the code and only showed
-up against the deployed artefact.
+Read an entry by its subsections, which repeat the same names across releases: Migration, Added, Changed, Fixed, Removed and Security.
+Version numbers follow the policy under Versions in `CONTRIBUTING.md`.
+`main` holds releases only, and `develop` is where work happens.
 
-The version number follows the policy under Versions in `CONTRIBUTING.md`.
-`main` holds releases only.
-Work happens on `develop`.
+A version heading carries no number.
+The heading is the version, and a number would break the pattern `tag.sh` and CI use to match a release's section.
+
+The released versions, newest first:
+
+- [1.15.0, 2026-10-29](#1150-2026-10-29)
+- [1.14.0, 2026-10-27](#1140-2026-10-27)
+- [1.13.0, 2026-10-02](#1130-2026-10-02)
+- [1.12.1, 2026-10-02](#1121-2026-10-02)
+- [1.12.0, 2026-09-27](#1120-2026-09-27)
+- [1.11.3, 2026-09-26](#1113-2026-09-26)
+- [1.11.2, 2026-09-26](#1112-2026-09-26)
+- [1.11.1, 2026-09-25](#1111-2026-09-25)
+- [1.11.0, 2026-09-25](#1110-2026-09-25)
+- [1.10.0, 2026-09-19](#1100-2026-09-19)
+- [1.9.0, 2026-09-18](#190-2026-09-18)
+- [1.8.1, 2026-09-18](#181-2026-09-18)
+- [1.8.0, 2026-09-17](#180-2026-09-17)
+- [1.7.0, 2026-09-16](#170-2026-09-16)
+- [1.6.0, 2026-09-16](#160-2026-09-16)
+- [1.5.0, 2026-09-16](#150-2026-09-16)
+- [1.4.0, 2026-09-16](#140-2026-09-16)
+- [1.3.0, 2026-09-16](#130-2026-09-16)
+- [1.2.0, 2026-09-15](#120-2026-09-15)
+- [1.1.0, 2026-09-15](#110-2026-09-15)
+- [1.0.0, 2026-09-14](#100-2026-09-14)
+- [0.2.0 and earlier, 2026-03-15 and before](#020-and-earlier-2026-03-15-and-before)
 
 ---
 
@@ -145,19 +170,27 @@ A config that disagrees with `site.toml` about compression now makes `--dump-con
 
 ---
 
-## 1.15.0 — 2026-10-29
+## 1.15.0, 2026-10-29
 
-**m6-http reloads its system config, and TLS on HTTP/1.1, HTTP/2 and HTTP/3, when the process config is touched, and keeps its cache while it does. Certificate files are no longer watched, so a renewal must touch the process config after it writes them. m6-auth-server re-reads its keys on reload and refuses a private key that is not the pair of the public key. A `site.toml` change clears the cache again once the backends' settle window has passed and once more after the poll interval, which fixes the stale cached page that 1.14.0 introduced in #244 (#254).**
+**m6-http reloads its system config, and TLS on HTTP/1.1, HTTP/2 and HTTP/3, when the process config is touched (#254).**
+It keeps its cache while it reloads.
+Certificate files are no longer watched, so a renewal must touch the process config after it writes them.
+m6-auth-server re-reads its keys on reload and refuses a private key that is not the pair of the public key.
+A `site.toml` change clears the cache again once the backends' settle window has passed, and once more after the poll interval.
+That clears the stale cached page that 1.14.0 introduced in #244.
 
-Migration is required for anyone who renews certificates or rotates auth keys. The steps are under Migration below.
+Migration is required for anyone who renews certificates or rotates auth keys.
+The steps are under Migration.
 
 ### Migration
 
 m6-http no longer watches its certificate and key files, and m6-auth-server no longer watches its signing keys.
-Anyone renewing certificates must touch the process config after writing them, for example with a certbot deploy hook that runs `touch /etc/m6/system.toml`.
+Anyone renewing certificates must touch the process config after writing them.
+A certbot deploy hook that runs `touch /etc/m6/system.toml` is one way to do that.
 Until the touch, m6-http keeps serving the previous certificate.
 Rotate an m6-auth-server key by writing both files and then touching its config.
-After an auth key rotation, touch m6-http's system config as well, because m6-http takes the new public key when either of its files is reloaded, and until it reloads new tokens get 401.
+After an auth key rotation, touch m6-http's system config as well.
+m6-http takes the new public key when either of its files is reloaded, and until it reloads new tokens get 401.
 A renewal hook that touches `site.toml` does not reload the certificate and only empties the cache, so touch the process config instead.
 `[analytics] enabled`, `[analytics] log_path` and the `[server]` binds now apply only on a restart.
 In 1.14.0, turning `[analytics] enabled` off took effect on a `site.toml` reload, and now m6-http keeps the running value and warns.
@@ -170,9 +203,12 @@ A change there applied at the next `site.toml` reload, which also emptied the re
 m6-http now runs the same `ConfigReloader` as every `App`, over both files.
 
 A change to `site.toml` rebuilds routes, pools, the invalidation map, the error mode and the security headers, and clears the cache, as before.
-A change to the system config alone takes only the keys that file owns, keeps the cache and re-reads TLS on HTTP/1.1, HTTP/2 and HTTP/3, the `[auth]` key, the `[health]` access keys, the node name, `allowed_methods` and `backend_timeout_secs`.
-The system config alone never replaces routes, so a refused `site.toml` reload cannot leave the config describing one site while the route table serves another.
+A change to the system config alone takes only the keys that file owns.
+It keeps the cache and re-reads TLS on HTTP/1.1, HTTP/2 and HTTP/3, the `[auth]` key, the `[health]` access keys, the node name, `allowed_methods` and `backend_timeout_secs`.
+The system config alone never replaces routes.
+A refused `site.toml` reload therefore cannot leave the config describing one site while the route table serves another.
 A change to both files runs both.
+
 `config reload: complete` now carries `site`, `process`, `cache_cleared` and `elapsed_us`.
 
 The keys m6-http reads only at start keep their running value on a reload and are named.
@@ -180,7 +216,8 @@ They are `[server]` `bind`, `h2c_bind`, `internal_binds`, `internal_peers`, `red
 The log says `config reload: [server].bind changed; restart m6-http to apply it`, and `/perf` and `--dump-config` describe what is running.
 
 **TLS is read when the system config is touched, and the certificate files are not watched (#252).**
-A renewal writes the certificate and the key as two files, so the first event could read a certificate beside the previous key, fail the pair check and wait for another event.
+A renewal writes the certificate and the key as two files.
+The first event could read a certificate beside the previous key, fail the pair check and wait for another event.
 The second watcher, a thread with a self-pipe off Linux, is gone.
 `FsWatcher` now watches only the backend socket directory, on Linux.
 A renewal writes both files, then touches the system config, and m6-http reads both on the touch.
@@ -190,13 +227,16 @@ A system config change reloads TLS even when `site.toml` fails to load, so a `si
 **A `site.toml` reload empties the cache twice more, 100 ms and about 1 s after it ends (#252).**
 A backend that reloads after m6-http can answer a request in the gap with the old page, and m6-http caches it.
 m6-http now clears the cache again 100 ms after the reload ends, for a backend that held the change for the 20 ms window, and once more 1.08 s after it ends, for a backend that found the change only on its once-a-second poll.
-The delays are `RELOAD_DEBOUNCE` and `RELOAD_POLL` from m6-core plus 80 ms for the backend's own reload, and the window starts when the reload ends, so a slow reload does not use it up.
+The delays are `RELOAD_DEBOUNCE` and `RELOAD_POLL` from m6-core plus 80 ms for the backend's own reload.
+The window starts when the reload ends, so a slow reload does not use it up.
 A second change re-arms both.
-It costs one extra cache miss per page about a second after a content change, and nothing on the cache-hit path, where the three cache-hit blocks in `m6-http/src/main.rs` are byte-identical to the previous release.
+It costs one extra cache miss per page about a second after a content change, and nothing on the cache-hit path.
+The three cache-hit blocks in `m6-http/src/main.rs` are byte-identical to the previous release.
 
 **m6-auth-server re-reads its signing keys on reload, and m6-monitor names its restart-only keys (#252).**
 The key-watching thread in m6-auth-server is gone, and with it the `libc` dependency it alone used.
-The service's `on_reload` hook loads the private and public key before it swaps either, so a key that fails to load, or a private key that is not the pair of the public key, leaves the running keys serving and is retried.
+The service's `on_reload` hook loads the private and public key before it swaps either.
+A key that fails to load, or a private key that is not the pair of the public key, leaves the running keys serving and is retried.
 A changed `[storage] path`, token lifetime, issuer or rate limit is named in a warning that says to restart.
 m6-monitor warns when `poll_interval_s`, `[monitor] history_file` or `history_max_mb` changes, because it reads them once at start.
 
@@ -209,20 +249,33 @@ A request in between cached the old page, and a `Cache-Control: public` page sta
 The cache is now cleared twice more, as described above.
 m6-auth-server also refuses a private key that is not the pair of the public key, so a rotation caught between its two writes keeps the running keys and is retried.
 
-### Verified
+### 1. Verified
 
-- `tls_reload`: the certificate moves on HTTP/1.1, HTTP/2 and HTTP/3 after the touch, flat and through a certbot-style symlink. Writing the certificate without a touch changes nothing for 3 s. A broken `site.toml` does not hold a certificate back. A touch before the key is written lands through the retry.
-- `config_reload`: a system config touch keeps the cache and logs `cache_cleared=false`. A `site.toml` change clears it twice. A bind change is named and not applied. A system config change after a refused `site.toml` reload keeps the running routes.
+- `tls_reload`: the certificate moves on HTTP/1.1, HTTP/2 and HTTP/3 after the touch, flat and through a certbot-style symlink.
+  Writing the certificate without a touch changes nothing for 3 s.
+  A broken `site.toml` does not hold a certificate back.
+  A touch before the key is written lands through the retry.
+- `config_reload`: a system config touch keeps the cache and logs `cache_cleared=false`.
+  A `site.toml` change clears it twice.
+  A bind change is named and not applied.
+  A system config change after a refused `site.toml` reload keeps the running routes.
 - `metrics_access`: `[health] metrics_peers` in the system config applies on HTTP/1.1, HTTP/2 and HTTP/3 without a restart, and a rotated `[auth]` key verifies after a touch and not before.
-- `config_reload` with a real `m6-html` backend that holds the change: the new page is served within 500 ms. The second clear comes a full window after a slow reload ends, and a third clear removes a page cached after the second.
-- m6-auth-server: a mismatched key pair is refused and the matching pair lands on the retry. A rotated signing key is served after the config is touched and not before, and a garbage key leaves the old one serving.
+- `config_reload` with a real `m6-html` backend that holds the change: the new page is served within 500 ms.
+  The second clear comes a full window after a slow reload ends, and a third clear removes a page cached after the second.
+- m6-auth-server: a mismatched key pair is refused and the matching pair lands on the retry.
+  A rotated signing key is served after the config is touched and not before, and a garbage key leaves the old one serving.
 - m6-monitor: a changed `poll_interval_s` is named and the service keeps running.
+
+1.15.0 changes how m6-http and m6-auth-server reload, adds one migration for certificate and auth-key renewal, and clears the stale cache that 1.14.0 could leave.
 
 ---
 
-## 1.14.0 — 2026-10-27
+## 1.14.0, 2026-10-27
 
-**Log reopen on SIGUSR1, declared internal listeners that accept only the peers a config names, token-gated metrics, a monitor history and tunnel health, new m6-core blocks including an opt-in SQLite feature and a config reloader, a fleet certificate comparison, the user agents of notable clients, each config key in the file it belongs to, test binaries built from the source under test, and a TLS reload that now replaces the certificate every listener serves, which fixes the limitation 1.13.0 recorded.**
+**1.14.0 adds log reopen on SIGUSR1, declared internal listeners that accept only the peers a config names, token-gated metrics, a monitor history and tunnel health, and new m6-core blocks.**
+Those blocks include an opt-in SQLite feature and a config reloader.
+It also adds a fleet certificate comparison, the user agents of notable clients, each config key in the file it belongs to, and test binaries built from the source under test.
+The TLS reload now replaces the certificate every listener serves, which fixes the limitation 1.13.0 recorded.
 
 ### Changed
 
@@ -276,7 +329,7 @@ Payload change for consumers: a reader of `notable[]` now finds an array under `
 On `heavy_hitters[]`, `user_agents` is still the count under that wire name, because an aggregator reads `/traffic` from nodes on other versions.
 Only the Rust field was renamed, from `HeavyHitter.user_agents` to `HeavyHitter.distinct_user_agents`, with `serde(rename = "user_agents")`.
 A test parses an older payload and checks that the count still goes out under the old name.
-A heavy hitter carries the count and no sample, because it is merely loud and the loudest source on a node is often the monitor's own polling.
+A heavy hitter carries the count and no sample, because its only signal is the count, and the loudest source on a node is often the monitor's own polling.
 
 The sample is capped by `m6_core::telemetry::USER_AGENTS_KEPT` (4 agents) and `USER_AGENT_MAX_CHARS` (160 characters).
 A longer agent ends in `USER_AGENT_TRUNCATED` (`...`).
@@ -373,6 +426,7 @@ The first change after quiet is reported at once.
 A change that arrives within 20 ms of a report is held and reported once more when the burst has settled, no later than a second after the window opened.
 A write that replaces the file in one step is one reload with no delay and a burst of writes is at most two.
 A write that truncates the file first can report twice.
+
 A file seen at length 0 is skipped with a warning, and the write that fills it reloads.
 Reporting at once matters when an edge clears its cache on the same change, because a backend that reloads late would otherwise leave a stale page cached.
 A touch alone reloads.
@@ -459,39 +513,31 @@ Conformance and performance were left to CI and the build host.
 
 ### Security
 
-**Four dependencies moved up a patch version to clear seven RustSec advisories
-(#230).** rustls 0.23.45 to 0.23.46, rustls-webpki 0.103.15 to 0.103.16, tokio
-1.53.1 to 1.53.3, and webpki-roots 1.0.9 to 1.0.10. This clears
-RUSTSEC-2026-0346, -0347, -0348, -0349, -0381, -0382 and -0386, which had turned
-CI's `cargo deny` job red on every open pull request. Only `Cargo.lock` changes,
-and no `Cargo.toml` requirement moved.
+**Four dependencies moved up a patch version to clear seven RustSec advisories (#230).**
+The moves are rustls 0.23.45 to 0.23.46, rustls-webpki 0.103.15 to 0.103.16, tokio 1.53.1 to 1.53.3, and webpki-roots 1.0.9 to 1.0.10.
+This clears RUSTSEC-2026-0346, -0347, -0348, -0349, -0381, -0382 and -0386, which had turned CI's `cargo deny` job red on every open pull request.
+Only `Cargo.lock` changes, and no `Cargo.toml` requirement moved.
 
-Verified: `cargo deny check` passes, and the release build has no warnings. The
-workspace tests pass with 0 failures, h3 and QUIC included.
+Verified: `cargo deny check` passes, and the release build has no warnings.
+The workspace tests pass with 0 failures, h3 and QUIC included.
 
 ### Added
 
-**Small APIs can now return the rows for a time range as JSON Lines, a page at a
-time (#225).** Three additions to m6-core. `m6_core::net` has `is_private_ip` and
-`bind_ip`, one definition of a private address. `m6_core::time_range` reads
-required `from` and `to` query keys as RFC 3339 UTC times for a half-open range
-`[from, to)`, with a longest span (31 days unless the service asks for another)
-and a 400 that says what to fix without repeating what the client sent.
-`m6_core::ndjson` gains `Page`, which a service fills with rows until it says
-`Full`. The service then sends the key of the next row as a `Cursor`, and the
-response carries it in a `Link: <...>; rel="next"` header. `PageLimits` default
-to 4 MiB and 10,000 rows and cannot exceed 64 MiB, half of the 128 MiB that
-m6-http will buffer from a backend. A test in m6-http keeps that true.
+**Small APIs can now return the rows for a time range as JSON Lines, a page at a time (#225).**
+Three additions to m6-core.
+`m6_core::net` has `is_private_ip` and `bind_ip`, one definition of a private address.
+`m6_core::time_range` reads required `from` and `to` query keys as RFC 3339 UTC times for a half-open range `[from, to)`, with a longest span (31 days unless the service asks for another) and a 400 that says what to fix without repeating what the client sent.
+`m6_core::ndjson` gains `Page`, which a service fills with rows until it says `Full`.
+The service then sends the key of the next row as a `Cursor`, and the response carries it in a `Link: <...>; rel="next"` header.
+`PageLimits` default to 4 MiB and 10,000 rows and cannot exceed 64 MiB, half of the 128 MiB that m6-http will buffer from a backend.
+A test in m6-http keeps that true.
 
-Why: a website that serves a log or a report for a period needs the same
-decisions each time: the time format, whether the end is included, how long a
-range may be, how big a response may be, and how a client asks for the rest.
-These are now made once, in m6-core.
+Why: a website that serves a log or a report for a period needs the same decisions each time.
+Those decisions are the time format, whether the end is included, how long a range may be, how big a response may be, and how a client asks for the rest.
+They are now made once, in m6-core.
 
-Verified: `cargo fmt --check` and `cargo clippy --workspace --all-targets -- -D
-warnings` pass with no warnings, and `cargo test --workspace` passes with 0
-failures. This was run against unit tests only, and no page was served from a
-running m6-http.
+Verified: `cargo fmt --check` and `cargo clippy --workspace --all-targets -- -D warnings` pass with no warnings, and `cargo test --workspace` passes with 0 failures.
+This was run against unit tests only, and no page was served from a running m6-http.
 
 **m6-core has an opt-in `sqlite` feature (#227).**
 A service that wants one SQLite file can enable `sqlite` on m6-core and link nothing else, because the feature re-exports `rusqlite` in the prelude.
@@ -526,8 +572,7 @@ The doctests pass with the feature on.
 `cargo build --workspace --release`, `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `./tools/clippy.sh` and `cargo test --workspace` all pass with no warnings.
 This was run on unit and file-backed tests only, and no request-path code changed.
 
-**m6-monitor reports each node's tunnel round trip and WireGuard handshake age
-(#226).**
+**m6-monitor reports each node's tunnel round trip and WireGuard handshake age (#226).**
 For each node that has a `tunnel` configured, the monitor host times up to three TCP connects to the node's tunnel address and reads the age of that peer's latest WireGuard handshake.
 Both appear in `/check` section H, in `/digest` as `nodes[].tunnel` (`rtt_ms`, `rtt_samples_ms`, `probe`, `probe_error`, `handshake`, `handshake_age_s`, `handshake_detail`) and as a tunnel column on the HTML page.
 `/digest` also carries `handshake_file_age_s` once for the monitor, and `thresholds.tunnel_handshake_age_s`.
@@ -573,23 +618,20 @@ The poller and this check read the same top-level `poll_interval_s` through one 
 WireGuard rekeys every 120 seconds only while traffic flows, and the probe each poll is that traffic.
 The 180 seconds also has to hold the period of the timer that writes the handshakes file.
 The monitor does not know that period, so it must fit inside the 180 seconds.
+
 Each `[[monitor.nodes]]` takes `tunnel = { address = "<ip>:<port>", public_key = "<peer public key>" }`, where the address must be an IP literal and a port, and a name or a bad value is a config error.
 A node with no tunnel is reported as not configured.
 
 The HTML page escapes node name, role, status, findings and the tunnel column with `m6_core::util::html_escape`.
 That function escapes `&`, `<`, `>` and `"`, and the m6-http error page now calls it in place of a private copy.
 
-**`m6-core::wireguard`**, a new module. `Handshakes::parse_latest_handshakes`,
-`from_file`, `find` and `PeerHandshake` read the `latest-handshakes` output. A
-time of 0 means the peer never completed a handshake, a missing file is
-`Ok(None)`, and a malformed line is an error naming the line.
-`docs/m6-core-reference.md` (component index and module section) and the
-`m6-monitor` row of Table 7 in `docs/m6-architecture.md` describe both.
+**`m6-core::wireguard`**, a new module.
+`Handshakes::parse_latest_handshakes`, `from_file`, `find` and `PeerHandshake` read the `latest-handshakes` output.
+A time of 0 means the peer never completed a handshake, a missing file is `Ok(None)`, and a malformed line is an error naming the line.
+`docs/m6-core-reference.md` (component index and module section) and the `m6-monitor` row of Table 7 in `docs/m6-architecture.md` describe both.
 
-Verified: `cargo test -p m6-monitor -p m6-core` passes for the wireguard tests
-(7), the m6-monitor unit tests (87) and the m6-monitor integration tests that
-include the loopback tunnel probe, with 0 failures and no warnings. Not run
-locally: conformance and the MSRV build, which CI covers.
+Verified: `cargo test -p m6-monitor -p m6-core` passes for the wireguard tests (7), the m6-monitor unit tests (87) and the m6-monitor integration tests that include the loopback tunnel probe, with 0 failures and no warnings.
+Not run locally: conformance and the MSRV build, which CI covers.
 
 **m6-monitor warns when the nodes of a fleet serve different certificates (#218, closes #216).**
 The monitor judged each node's certificate against a threshold and never compared the nodes with each other.
@@ -692,11 +734,11 @@ Why not the periodic stats log: it lives in each node's journal, which is capped
 Channel counters include the monitor's own polls and header checks (#107), and `monitor_requests` says how many.
 
 Verified: unit tests cover the schema, the transaction, the cap, the crawler tiling, the cursor and the exact keys of both line shapes.
-They also cover unique long user agents across many windows staying under the cap, the per-window caps, one snapshot per page with a prune tried between statements, a page that fills in the middle of a chunk, the plans of the child queries, the two prune states and the file modes.
+They also cover unique long user agents across windows staying under the cap, the per-window caps, one snapshot per page with a prune tried between statements, a page that fills in the middle of a chunk, the plans of the child queries, the two prune states and the file modes.
 Integration tests run the real binary with an unreachable node.
 They check both endpoints on the socket, the 400 and 503 answers, a failed open, a file newer than the binary, a clean shutdown and that the process listens on no TCP port.
 
-### Docs
+### 1. Docs
 
 **README: five passages that explained why the README says what it says were cut (#215, closes #214).**
 Each passage explained its own reasoning or assessed the README, or stated a point twice by contrasting it with its opposite.
@@ -707,71 +749,62 @@ No figure, score or claim changed, and the audit result and the conformance coun
 Verified by reading the merged diff, which changes only the README.
 No code changed and no tests were run.
 
-**Two contributor rules in CLAUDE.md corrected (#223).** The rule that a change
-to layout, copy or rendering needs individual approval now applies only to
-changes a visitor can reach. A page no visitor can reach, such as m6-monitor's
-own page on its private socket, does not need that approval. The rule that every
-commit ends with a fixed `Co-Authored-By` line is removed, because the line
-named one model version and went stale each time the model changed.
+**Two contributor rules in CLAUDE.md corrected (#223).**
+The rule that a change to layout, copy or rendering needs individual approval now applies only to changes a visitor can reach.
+A page no visitor can reach, such as m6-monitor's own page on its private socket, does not need that approval.
+The rule that every commit ends with a fixed `Co-Authored-By` line is removed, because the line named one model version and went stale each time the model changed.
 
-The first rule, read literally, asked for sign-off on every page m6 renders,
-including operator pages that only the operator's own tools can open. The second
-told contributors to write a trailer that was wrong as soon as it was written.
+The first rule, read literally, asked for sign-off on every page m6 renders, including operator pages that only the operator's own tools can open.
+The second told contributors to write a trailer that was wrong as soon as it was written.
 
-Verified by reading the diff: it touches only `CLAUDE.md`, replacing one bullet
-and deleting one paragraph with its code block. No code and no other document
-changes, and no tests were run.
+Verified by reading the diff: it touches only `CLAUDE.md`, replacing one bullet and deleting one paragraph with its code block.
+No code and no other document changes, and no tests were run.
+
+1.14.0 spans config reload, logging, listeners, metrics, monitoring, m6-core blocks and documentation, and it fixes the TLS reload limitation that 1.13.0 recorded.
 
 ---
 
-## 1.13.0 — 2026-10-02
+## 1.13.0, 2026-10-02
 
 **A server that terminates TLS now says how long its certificate has left.**
 
-Certificate renewal is done by an *ACME* (Automatic Certificate Management Environment)
-client outside m6, on a timer, and the documented failure mode of that arrangement is
-silence: the renewal fails, the timer keeps firing and keeps failing, nothing looks, and
-the first signal is the server refusing connections on the day the certificate expires.
+Certificate renewal is done by an *ACME* (Automatic Certificate Management Environment) client outside m6, on a timer.
+The documented failure mode of that arrangement is silence.
+The renewal fails, the timer keeps firing and keeps failing, nothing looks, and the first signal is the server refusing connections on the day the certificate expires.
 A server already holds the answer, so it is the cheapest place to ask.
 
 ### Added
 
-**`m6-core::tls`**, a new module. `not_after_unix(der)` reads `notAfter` out of a DER
-certificate. `record_loaded(chain)` stores what a server loaded and returns what it could
-not read. `loaded()` reports the chain as `TlsCertificate`, leaf first, each carrying
-`depth`, `not_after_unix` and `expires_in_seconds`. `unreadable()` counts what failed.
+**`m6-core::tls`**, a new module.
+`not_after_unix(der)` reads `notAfter` out of a DER certificate.
+`record_loaded(chain)` stores what a server loaded and returns what it could not read.
+`loaded()` reports the chain as `TlsCertificate`, leaf first, each carrying `depth`, `not_after_unix` and `expires_in_seconds`.
+`unreadable()` counts what failed.
 
-**`PerfReport.tls` and `PerfReport.tls_unreadable`** on `/perf`, both `serde(default)` so
-an older node stays parseable to an aggregator rather than making the whole payload
-unreadable.
+**`PerfReport.tls` and `PerfReport.tls_unreadable`** on `/perf`, both `serde(default)`, so an older node stays parseable to an aggregator and the whole payload stays readable.
 
-**m6-monitor prints days remaining** on the per-node line beside the version and build,
-and warns below `Thresholds::cert_expiry_days`, default 21. That default is about renewal
-attempts rather than the certificate: a client on a 90-day certificate starts renewing at
-30 days and retries daily, so 21 means renewal has failed about nine times before anyone
-is told. A threshold inside the renewal window fires on the first transient failure and
-gets ignored, and an ignored warning is the same as no warning.
+**m6-monitor prints days remaining** on the per-node line beside the version and build, and warns below `Thresholds::cert_expiry_days`, default 21.
+That default tracks renewal attempts.
+A client on a 90-day certificate starts renewing at 30 days and retries daily, so 21 means renewal has failed about nine times before anyone is told.
+A threshold inside the renewal window fires on the first transient failure and gets ignored, and an ignored warning is the same as no warning.
 
-### It reports the loaded material, never a file
+### 1. It reports the loaded material
 
-A path on disk and the certificate a running process is serving are different facts, and
-a renewal that wrote a new file without reloading the server is exactly where they
-disagree. `loaded()` opens nothing, so polling a monitoring endpoint cannot be made to do
-disk work.
+A path on disk and the certificate a running process is serving are different facts.
+A renewal that wrote a new file without reloading the server is exactly where they disagree.
+`loaded()` opens nothing, so polling a monitoring endpoint cannot be made to do disk work.
 
-### The parse is written out rather than imported
+### 2. The parse is written out
 
-`rustls` parses no validity from `CertificateDer` and `rustls-webpki` keeps its own parse
-private, so one integer field meant either eight crates of general ASN.1 or a walk over a
-known shape. `notAfter` sits at a fixed structural position in every X.509 certificate, so
-the walk steps over six elements by length and reads the seventh. Every length is checked
-against the buffer, and a test runs every truncation of a real certificate through it.
-Dates go through `chrono`, because civil-from-days arithmetic is the mistake
-`util::iso_date_from` already records.
+`rustls` parses no validity from `CertificateDer` and `rustls-webpki` keeps its own parse private, so one integer field meant either eight crates of general ASN.1 or a walk over a known shape.
+`notAfter` sits at a fixed structural position in every X.509 certificate, so the walk steps over six elements by length and reads the seventh.
+Every length is checked against the buffer, and a test runs every truncation of a real certificate through it.
+Dates go through `chrono`, because civil-from-days arithmetic is the mistake `util::iso_date_from` already records.
 
-### Absence and a measurement must not look alike
+### 3. Absence and a measurement must not look alike
 
 Three defects found in review, all in the direction of reading silence as health.
+Table 1 gives the three and what each would have cost.
 
 | defect | consequence |
 |---|---|
@@ -779,97 +812,87 @@ Three defects found in review, all in the direction of reading silence as health
 | `min()` over a partially-read chain | an unreadable leaf plus a multi-year intermediate gave a long number, every threshold passed, and the digest said ALL CLEAR while nothing knew when the served leaf expired |
 | gating the check on an `https://` poll URL | a node polled over the backbone in plaintext serves TLS publicly and reports its chain, and every arm was skipped |
 
-**Table 1: what review caught before release, and what each would have cost.** Take from
-it that a check written to notice an absence can itself read absence as health.
+**Table 1: what review caught before release, and what each would have cost.**
+Take from it that a check written to notice an absence can itself read absence as health.
 
-### Known limitation, recorded rather than hidden
+### 4. Known limitation
 
-`handle_tls_reload` rebuilds the quiche configuration alone, so after a renewal HTTP/3
-serves the new certificate while rustls keeps the old one, and nothing re-records. The
-number reported is therefore correct for HTTP/1.1 and HTTP/2 and stale for HTTP/3. That is
-a server defect rather than a reporting one and is **m6 #210**. Earlier drafts of this
-module's documentation claimed a reload re-records; no caller does, and the documents now
-say so.
+`handle_tls_reload` rebuilds the quiche configuration alone, so after a renewal HTTP/3 serves the new certificate while rustls keeps the old one, and nothing re-records.
+The number reported is therefore correct for HTTP/1.1 and HTTP/2 and stale for HTTP/3.
+That is a server defect and is **m6 #210**.
+Earlier drafts of this module's documentation claimed a reload re-records.
+No caller does, and the documents now say so.
 
-### Verified
+### 5. Verified
 
-`cargo test --workspace` with the new tests, clippy silent, zero compiler warnings,
-`cargo fmt` clean, the examples workspace building with clippy silent, and CI green on
-h1, h2 and h3 conformance, cargo-deny and the MSRV check. The parse is tested against
-rcgen-generated certificates rather than a fixture that would expire: a future expiry read
-back exactly, an expired one reading negative, a v1 certificate with no version field, an
-impossible date, DER's forbidden indefinite length, and every truncation of a real
-certificate.
+`cargo test --workspace` with the new tests, clippy silent, zero compiler warnings, `cargo fmt` clean, the examples workspace building with clippy silent, and CI green on h1, h2 and h3 conformance, cargo-deny and the MSRV check.
+The parse is tested against rcgen-generated certificates.
+The tests cover a future expiry read back exactly, an expired one reading negative, a v1 certificate with no version field, an impossible date, DER's forbidden indefinite length, and every truncation of a real certificate.
+
+1.13.0 adds TLS certificate expiry reporting, and it records one known limitation that 1.14.0 later fixes.
 
 ---
 
-## 1.12.1 — 2026-10-02
+## 1.12.1, 2026-10-02
 
-**A documentation and comment release. No behaviour changes to any shipped binary.**
+**A documentation and comment release.**
+No behaviour changes to any shipped binary.
 
-RULE ZERO says nothing about one particular deployment belongs in this repository,
-in code, tests, comments, docs or the changelog. This removes what was still there,
-and corrects three comments that a previous pass made wrong while removing other
-things.
+RULE ZERO says nothing about one particular deployment belongs in this repository, in code, tests, comments, docs or the changelog.
+This release removes what was still there.
+It also corrects three comments that a previous pass made wrong while removing other things.
 
 ### Removed
 
-One deployment's node names, in both source and prose. A credentials file path and
-the DNS provider it belonged to, used as a worked example. A hosting provider,
-named in the benchmark host table with the machine's specification, in a deployment
-walkthrough and in a README pointer. A visitor's address and session identifier,
-carried in a test fixture captured from a live log. A firewall rule copied verbatim
-from a running ruleset, counters included. An ssh port, which appeared only as a
-worked example and therefore only ever recorded that its author deviates from the
-default. Twenty-odd comments asserting measurements taken against one private
-instance, which no reader can reproduce and which are therefore assertions rather
-than evidence.
+One deployment's node names, in both source and prose.
+A credentials file path and the DNS provider it belonged to, used as a worked example.
+A hosting provider, named in the benchmark host table with the machine's specification, in a deployment walkthrough and in a README pointer.
+A visitor's address and session identifier, carried in a test fixture captured from a live log.
+A firewall rule copied verbatim from a running ruleset, counters included.
+An ssh port, which appeared only as a worked example and therefore only ever recorded that its author deviates from the default.
+Twenty-odd comments asserting measurements taken against one private instance, which no reader can reproduce, so they are assertions.
 
-Addresses that had to stay addresses, such as a client address in a log fixture,
-are now RFC 5737 documentation ranges.
+Addresses that had to stay addresses, such as a client address in a log fixture, are now RFC 5737 documentation ranges.
 
 ### Changed
 
-**One host, everywhere.** `user@example.com` is the only ssh and rsync target,
-replacing five competing conventions. `example.com` and its subdomains are the only
-http, https, h2c and h2s hosts.
+**One host, everywhere.**
+`user@example.com` is the only ssh and rsync target, replacing five competing conventions.
+`example.com` and its subdomains are the only http, https, h2c and h2s hosts.
 
-**"WireGuard" is now "private backbone",** in 16 places across 9 files. The
-transport between nodes is the operator's choice. m6 requires only that the
-listener is on a private address.
+**"WireGuard" is now "private backbone",** in 16 places across 9 files.
+The transport between nodes is the operator's choice.
+m6 requires only that the listener is on a private address.
 
-**`M6_BUILD_ROOT` defaults to `m6-build`,** relative to the login directory, rather
-than a path only a root login can write.
+**`M6_BUILD_ROOT` defaults to `m6-build`,** relative to the login directory, so a normal login can write it.
 
 ### Fixed
 
-Three comments that an earlier pass rewrote into something incorrect, which is
-worse than the unverifiable claim each replaced:
+Three comments that an earlier pass rewrote into something incorrect.
+An incorrect comment is worse than the unverifiable claim it replaced.
 
-- The 0-RTT comment credited QUIC early data for the cache-to-origin hop. That hop
-  is h2c over TCP. The setting configures the listener that serves visitors.
-- Two comments claimed a table was reproducible with one `curl -H`. The column
-  described is what the replaced implementation produced, so following the
-  instruction contradicts the table.
-- A dated narrative kept its date and swapped only its address, leaving a comment
-  asserting that a documentation address made a real request on a real day.
+- The 0-RTT comment credited QUIC early data for the cache-to-origin hop.
+  That hop is h2c over TCP.
+  The setting configures the listener that serves visitors.
+- Two comments claimed a table was reproducible with one `curl -H`.
+  The column described is what the replaced implementation produced, so following the instruction contradicts the table.
+- A dated narrative kept its date and swapped only its address, leaving a comment asserting that a documentation address made a real request on a real day.
 
-### Verified
+### 1. Verified
 
-`cargo test --workspace` 1150 passed and 0 failed, clippy silent, zero compiler
-warnings, `cargo fmt` clean, `shellcheck -S warning` clean, and the examples
-workspace builds with clippy silent against this tree. CI passed h1, h2 and h3
-conformance, the examples suite, cargo-deny and the MSRV check.
+`cargo test --workspace` 1150 passed and 0 failed, clippy silent, zero compiler warnings, `cargo fmt` clean, `shellcheck -S warning` clean, and the examples workspace builds with clippy silent against this tree.
+CI passed h1, h2 and h3 conformance, the examples suite, cargo-deny and the MSRV check.
 
-### What this release does not do
+### 2. What this release does not do
 
-**The history is untouched.** Every string removed here remains reachable in any
-clone, and removing it from the working tree does not retract it. That is a
-separate decision about a published repository.
+**The history is untouched.**
+Every string removed here remains reachable in any clone, and removing it from the working tree does not retract it.
+That is a separate decision about a published repository.
 
-**The default is still wrong.** The full checks still want a remote Linux host,
-which is #207, and is why a contributor's connection settings were in this
-repository to be removed in the first place.
+**The default is still wrong.**
+The full checks still want a remote Linux host, which is #207, and is why a contributor's connection settings were in this repository to be removed in the first place.
+
+1.12.1 removes deployment-specific details and corrects three comments, and it changes no shipped behaviour.
 
 ---
 
