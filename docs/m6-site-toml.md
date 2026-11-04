@@ -1,10 +1,22 @@
-# m6 — `site.toml` Reference
+# site.toml reference
 
-Single config file read by m6-http and all renderers. All paths relative to the site directory unless noted.
+`site.toml` is the config file every m6 process of a site reads for the state the whole site shares.
+It holds the site identity, the routes, the backends and the log and error settings.
+Section 3 states which key belongs in which file.
 
----
+This page shows the site directory, a complete two-file example, and the layering and merge rules.
+The per-key reference that follows section 3 lists each key, its type and its default.
 
-## Site Directory Structure
+## Contents
+
+1. [Site directory structure](#1-site-directory-structure)
+2. [Complete annotated example](#2-complete-annotated-example)
+3. [Config layering](#3-config-layering)
+
+## 1. Site directory structure
+
+The site directory holds one `site.toml` and the files each process needs.
+Figure 1 gives the shape.
 
 ```
 my-site/
@@ -19,30 +31,33 @@ my-site/
 └── data/
 ```
 
-No binaries. No `logs/` directory. Processes log to stdout.
+**Figure 1: the site directory.**
+`site.toml` sits at the top, and `configs/` holds each renderer's own config.
 
----
+No binaries and no `logs/` directory belong here.
+Every process logs to stdout, so the directory holds data and config only.
 
-## Complete Annotated Example
+## 2. Complete annotated example
+
+A complete site is two files.
+The first is `site.toml`, which every process reads for the state the whole site shares.
+The second is the system config, which m6-http reads for this node's own state.
+
+`site.toml`:
 
 ```toml
 [site]
-name   = "Jane Smith"
+name   = "My Blog"
 domain = "example.com"
 
-[server]
-bind     = "0.0.0.0:443"
-tls_cert = "/etc/letsencrypt/live/example.com/fullchain.pem"
-tls_key  = "/etc/letsencrypt/live/example.com/privkey.pem"
-
 [log]
-level  = "info"    # "debug" | "info" | "warn" | "error"
-format = "json"    # "json" | "text"
+level  = "info"     # "debug" | "info" | "warn" | "error"
+format = "json"     # "json" | "text"
 
 [errors]
-mode = "status"    # "status" | "custom" | "internal"
+mode = "status"     # "status" | "custom" | "internal"
 
-# ── Backend pools ─────────────────────────────────────────────
+# Backend pools
 
 [[backend]]
 name    = "m6-html"
@@ -60,18 +75,12 @@ sockets = "/run/m6/m6-auth-*.sock"
 name    = "render-contact"
 sockets = "/run/m6/render-contact-*.sock"
 
-# URL backend — remote HTTP/S server, not managed by systemd
+# A remote backend over HTTP or HTTPS
 [[backend]]
 name = "remote-api"
 url  = "https://api.example.com"
 
-# ── Auth ──────────────────────────────────────────────────────
-
-[auth]
-backend    = "m6-auth"           # backend name declared above
-public_key = "/etc/m6/auth.pub"  # m6-auth's public key for local JWT verification
-
-# ── Routes ───────────────────────────────────────────────────
+# Routes
 
 [[route]]
 path    = "/"
@@ -98,13 +107,13 @@ backend = "m6-html"
 path    = "/contact"
 backend = "render-contact"
 
-# Protected route — JWT must satisfy group membership
+# A protected route: the token must satisfy the group claim
 [[route]]
 path    = "/admin/{page}"
 backend = "m6-html"
 require = "group:editors"
 
-# Auth endpoints — handled by m6-auth directly
+# Auth endpoints, served by m6-auth itself
 [[route]]
 path    = "/auth/login"
 backend = "m6-auth"
@@ -141,68 +150,60 @@ path    = "/api/{rest}"
 backend = "remote-api"
 ```
 
----
+The system config:
 
-## Config Layering
+```toml
+[server]
+bind     = "0.0.0.0:443"
+tls_cert = "/etc/letsencrypt/live/example.com/fullchain.pem"
+tls_key  = "/etc/letsencrypt/live/example.com/privkey.pem"
 
-`site.toml` travels with the site — version controlled, deployed via rsync. It contains no secrets and no environment-specific values. It can be public.
+[auth]
+backend    = "m6-auth"           # the backend declared above
+public_key = "/etc/m6/auth.pub"  # m6-auth's public key, used to verify tokens locally
+```
 
-Server-specific values (`[server]` bind address, TLS cert paths) live in a system config — a required second argument to m6-http. Renderer secrets (SMTP credentials etc.) are referenced via a `secrets_file` key in the renderer config.
+The example keeps node state out of `site.toml`.
+The bind address, the certificate and key, and the `[auth]` section are node state, so the system config holds them.
+Section 3 states the split rule.
 
-Every m6 process reads two config files.
-`site.toml` holds the state every process of the site shares.
-The process config holds that process's own state, which means node identity, binds, certificates, credential paths and per-node security.
-For m6-http the process config is the system config.
-For an app it is the app's own config.
+## 3. Config layering
 
-### m6-http system config
+Every m6 process reads two files.
+`site.toml` holds the state every process of the site shares, and it can be public.
+The process config holds that process's own state, which is node identity, binds, certificates, credential paths and per-node security.
+For m6-http the process config is the system config, the required second argument.
+For a renderer it is the app config.
+
+### 3.1. m6-http system config
+
+m6-http takes two arguments, the site directory and the system config.
 
 ```
 m6-http <site-dir> <system-config>
 ```
 
-The second argument is required. In development it points to a checked-in dev system config. In production the systemd unit points to `/etc/m6/my-blog.toml`.
+The second argument is required.
+In development it names a checked-in dev system config.
+In production the service unit names the server copy.
 
-```ini
-# Development dev.sh
+```sh
+# Development script
 m6-http "$SITE" "$SITE/configs/m6-http-dev.toml"
 
-# Production systemd unit
+# Production service unit
 ExecStart=/usr/local/bin/m6-http /var/www/my-blog /etc/m6/my-blog.toml
 ```
 
-The system config may contain `[server]`, `[node]`, `[auth]` and three `[health]` keys, `metrics_require`, `metrics_peers` and `metrics_token_file`.
-Everything else (routes, backends, site identity, log level) comes from `site.toml` unchanged.
+The system config accepts `[server]`, `[node]`, `[auth]` and three `[health]` keys, `metrics_require`, `metrics_peers` and `metrics_token_file`.
+Everything else comes from `site.toml` unchanged.
 
-**Merge semantics:** system config is loaded after `site.toml`.
-Its `[server]` keys win on conflict, and so do its three `[health]` keys.
-`[auth]` must be declared in one file only, and declaring it in both is a startup error.
-A relative `[auth] public_key` in the system config resolves against the site directory, as `tls_cert` does.
-A relative `[health] metrics_token_file` in the system config resolves against the site directory too.
-An absolute path is used as given.
-A relative `metrics_token_file` in `site.toml` resolves against the working directory of the process, so write it as an absolute path there or put it in the system config.
-Any other key in the system config is ignored with a warning, and any other `[health]` key there fails to parse.
-Validation runs after merge.
-When both arguments name the same file, as a development script may do, its `[auth]` and `[health]` belong to the site config alone.
-A system config edit or touch applies within a second and does not clear the cache.
-A key that is read only at start keeps its running value, and the log names it and says to restart.
-
-**`site.toml` — in version control:**
+`site.toml`, in version control:
 
 ```toml
 [site]
 name   = "My Blog"
 domain = "example.com"
-
-[server]
-# Development values — overridden by system config in production
-bind     = "127.0.0.1:8443"
-tls_cert = "../../localhost.pem"
-tls_key  = "../../localhost-key.pem"
-
-[auth]
-backend    = "m6-auth"
-public_key = "keys/auth.pub"
 
 [log]
 level  = "info"
@@ -211,27 +212,54 @@ format = "text"
 [errors]
 mode = "internal"
 
-# backends, routes — identical in dev and production
+# backends and routes, identical in development and production
 ```
 
-**`/etc/m6/my-blog.toml` — on the server, never in the repo:**
+The system config, on the server and never in the repo:
 
 ```toml
 [server]
 bind     = "0.0.0.0:443"
 tls_cert = "/etc/letsencrypt/live/example.com/fullchain.pem"
 tls_key  = "/etc/letsencrypt/live/example.com/privkey.pem"
+
+[auth]
+backend    = "m6-auth"
+public_key = "keys/auth.pub"
 ```
 
-Only the sections listed above. Nothing else.
+The development system config holds the same sections with a loopback bind and checked-in certificate paths.
 
-### Renderer secrets
+The merge rules, in order:
 
-Renderer configs declare `secrets_file` pointing to a TOML file outside the site directory. The secrets file is merged into the renderer config — secrets file wins on conflict. The key is optional: absent in development, present in production.
+1. The system config loads after `site.toml`.
+2. Its `[server]` keys win on conflict, and so do its three `[health]` keys.
+3. `[auth]` sits in one file only, and declaring it in both is a startup error.
+4. A relative `[auth] public_key` in the system config resolves against the site directory, as `tls_cert` does.
+5. A relative `[health] metrics_token_file` in the system config resolves against the site directory too.
+6. An absolute path is used as given.
+7. A relative `metrics_token_file` in `site.toml` resolves against the process working directory, so write it as an absolute path there or put it in the system config.
+8. Any other top-level key in the system config is ignored with a warning, and any other `[health]` key there fails to parse.
+9. Validation runs after the merge.
+10. When both arguments name one file, its `[auth]` and `[health]` belong to the site config alone.
+11. A system config edit or touch applies within a second and keeps the cache.
+12. A key read only at start keeps its running value, and the log names it and says to restart.
+
+### 3.2. Renderer secrets
+
+A renderer config may declare `secrets_file`, a path to a TOML file that sits outside the site directory.
+The secrets file holds the values the repo must not carry, such as mail credentials.
+
+The merge rule is one owner per key.
+A key set in both the config and the secrets file is refused at start, and the error names both files.
+A key set only in the secrets file is added to the merged config.
+A key set only in the config stays as written.
+`secrets_file` is optional, and an absent secrets file is ignored.
+
+The config, in version control:
 
 ```toml
-# configs/render-contact.conf — in version control
-secrets_file = "/etc/m6/contact-secrets.toml"   # silently ignored if file absent
+secrets_file = "/etc/m6/contact-secrets.toml"
 
 global_params = ["data/site.json"]
 
@@ -242,39 +270,26 @@ params   = []
 cache    = "no-store"
 
 [smtp]
-# Non-secret values — safe in version control
-host = "localhost"
-port = 1025
-# Development fallback values when secrets_file absent:
-from     = "dev@localhost"
-to       = "dev@localhost"
-username = ""
-password = ""
+host = "smtp.provider.example"
+port = 587
 ```
+
+The secrets file, on the server and never in the repo:
 
 ```toml
-# /etc/m6/contact-secrets.toml — on the server, never in the repo
 [smtp]
-host     = "smtp.postmarkapp.com"
-port     = 587
-username = "live-api-token"
-password = "live-api-token"
-from     = "noreply@example.com"
-to       = "owner@example.com"
+username = "mail-user"
+password = "mail-password"
 ```
 
-`secrets_file` applies only to renderer configs. `site.toml` has no secrets.
+`secrets_file` applies to renderer configs only.
+`site.toml` has no secrets.
 
-### What belongs where
+### 3.3. What belongs where
 
-The rule: a key that every node of the site shares belongs in `site.toml`.
-A key that describes one node belongs in the process config.
-m6-http accepts most of these keys in either file, and the system config wins.
-It cannot tell a deliberate override from a mistake, so at start it logs a warning for each key that sits in the file it does not belong to.
-The warning names the key and the file it belongs in.
-The warning is silent when both arguments name one file.
-A `[node]` in `site.toml` is never read, so it is warned about too.
-A system config with no `[node]` logs a warning that the node name falls back to `[site].name`.
+The rule is that `site.toml` holds the state every node shares, and the process config holds the state of one node.
+Table 1 gives the file for each key.
+Take from it that `site.toml` holds only site-wide state and the process config holds only node state.
 
 | Setting | File it belongs in | Reason |
 |---|---|---|
@@ -287,20 +302,28 @@ A system config with no `[node]` logs a warning that the node name falls back to
 | `[health]` metrics_token_file | System config | A credential path. A relative path resolves against the site directory |
 | `[health]` enabled, path, perf_path, traffic_path, traffic_cache_s | `site.toml` | The endpoint layout every node and the monitor share |
 | `[log]`, `[analytics]`, `[rate_limit]`, `[errors]`, `[security]` | `site.toml` | Identical on every node |
-| `[[backend]]`, `[[route]]`, `[[route_group]]` | `site.toml` | Identical in dev and production |
+| `[[backend]]`, `[[route]]`, `[[route_group]]` | `site.toml` | Identical in development and production |
 | App `[thread_pool]`, `[params_cache]`, `[server]`, `[compression]`, `[minification]`, `[[route]]`, `global_params` | App config | The app's own state |
 | App `[log]` | Both | `site.toml` sets the site default and the app config overrides it |
-| App `site_toml` | App config | Says where `site.toml` is |
-| SMTP credentials | `secrets_file` → `/etc/m6/*.toml` | Secret, must not be in repo |
+| App `site_toml` | App config | Names where `site.toml` is |
+| Mail credentials | `secrets_file` | Secret, held outside the repo |
 
+**Table 1: which file owns each key.**
+A node key in `site.toml` works, because the system config would have won, but m6-http logs a warning at start.
+
+m6-http accepts most of these keys in either file, and the system config wins.
+A misplaced key works, so m6-http logs a warning at start naming the key and the file it belongs in.
+The warning is silent when both arguments name one file.
+A `[node]` in `site.toml` is never read, so it is warned about too.
+A system config with no `[node]` logs a warning that the node name falls back to `[site].name`.
 A secrets file is part of its process config.
 
-### Where an app finds `site.toml`
+### 3.4. Where an app finds `site.toml`
 
 An app reads `<site_dir>/site.toml` unless its config sets the reserved key `site_toml`.
 A relative value resolves against `site_dir`.
 An absolute value is used as given.
-An app that has its own root under `apps/` sets it to reach the `site.toml` at the top of the tree.
+An app with its own root under `apps/` sets `site_toml` to reach the file at the top of the tree.
 
 ```toml
 # apps/file/m6-file.conf
@@ -311,10 +334,10 @@ A named file that does not exist, cannot be read or is not valid TOML stops the 
 A file at the default path may be absent or invalid, as before.
 `--dump-config` prints the resolved path on a `site.toml` line.
 
-### `site.toml` is clean
+### 3.5. `site.toml` is clean
 
-With `[server]` in the system config and credentials in secrets files, `site.toml` contains no passwords, no cert paths, no environment-specific values. It is safe to publish. The repo can be public.
-
+With `[server]` in the system config and credentials in secrets files, `site.toml` holds no passwords, no certificate paths and no environment-specific values.
+It is safe to publish, so the repo can be public.
 
 ### `[site]`
 
