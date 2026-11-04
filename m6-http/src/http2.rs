@@ -2176,15 +2176,23 @@ fn decode_hpack(
     block: &[u8],
     out: &mut Vec<(String, String)>,
 ) -> Result<usize, &'static str> {
-    let headers = dec.decode(block).map_err(|_| "HPACK decode error")?;
+    // Counted as each field is decoded, and a field is kept only while the
+    // list is within the limit. A small block of one-byte references to a
+    // large table entry decodes to far more than it weighs, so building the
+    // whole list before checking its size let one request cost gigabytes.
+    // The rest of an oversize block is still decoded, so the HPACK table stays
+    // in step with the peer.
     let mut list_size = 0usize;
-    for (k, v) in headers {
-        list_size += k.len() + v.len() + HEADER_FIELD_OVERHEAD;
-        out.push((
-            String::from_utf8_lossy(&k).into_owned(),
-            String::from_utf8_lossy(&v).into_owned(),
-        ));
-    }
+    dec.decode_with_cb(block, |k, v| {
+        list_size = list_size.saturating_add(k.len() + v.len() + HEADER_FIELD_OVERHEAD);
+        if list_size <= MAX_HEADER_LIST_SIZE {
+            out.push((
+                String::from_utf8_lossy(&k).into_owned(),
+                String::from_utf8_lossy(&v).into_owned(),
+            ));
+        }
+    })
+    .map_err(|_| "HPACK decode error")?;
     Ok(list_size)
 }
 
@@ -4042,6 +4050,80 @@ mod header_list_size_tests {
             .find(|(k, _)| k == b":status")
             .expect("a :status field");
         String::from_utf8(v).unwrap()
+    }
+
+    /// One large literal into the dynamic table, then a run of one-byte
+    /// references to it: a block of a few kilobytes that decodes to megabytes.
+    fn amplified_block(refs: usize) -> Vec<u8> {
+        // :method GET, :scheme https, :path / (static table entries 2, 7, 4).
+        let mut b = vec![0x82, 0x87, 0x84];
+        // Literal with incremental indexing, new name "x", a 4000-byte value:
+        // 0x40, name length 1, "x", value length 4000 as a 7-bit prefix integer.
+        b.extend([0x40, 0x01, b'x', 0x7f, 0xa1, 0x1e]);
+        b.extend(std::iter::repeat_n(b'a', 4000));
+        // 0xbe is "indexed field 62": the newest dynamic entry, the one above.
+        b.extend(std::iter::repeat_n(0xbe, refs));
+        b
+    }
+
+    #[test]
+    fn an_amplified_block_never_holds_more_than_the_limit_in_memory() {
+        let block = amplified_block(2_000);
+        let mut dec = hpack::Decoder::new();
+        let mut out = Vec::new();
+        let size = decode_hpack(&mut dec, &block, &mut out).expect("a valid block");
+        assert!(
+            size > 2_000 * 4_000,
+            "the true size is still counted: {size}"
+        );
+        let held: usize = out
+            .iter()
+            .map(|(k, v)| k.len() + v.len() + HEADER_FIELD_OVERHEAD)
+            .sum();
+        assert!(
+            held <= MAX_HEADER_LIST_SIZE,
+            "decoding kept {held} bytes of fields for a {}-byte block",
+            block.len()
+        );
+    }
+
+    #[test]
+    fn an_amplified_block_is_answered_431_and_the_connection_survives() {
+        let block = amplified_block(2_000);
+        let mut wire = Vec::new();
+        let mut chunks = block.chunks(10_000).peekable();
+        let mut first = true;
+        while let Some(chunk) = chunks.next() {
+            let last = chunks.peek().is_none();
+            let (kind, mut flags) = if first {
+                (TYPE_HEADERS, FLAG_END_STREAM)
+            } else {
+                (TYPE_CONTINUATION, 0)
+            };
+            if last {
+                flags |= FLAG_END_HEADERS;
+            }
+            wire.extend(frame(kind, flags, 1, chunk));
+            first = false;
+        }
+        let mut c = Http2Conn::new();
+        c.phase = Phase::Active;
+        c.recv_buf.extend_from_slice(&wire);
+        let mut reached = false;
+        let mut on_request = |_: &HttpRequest, _: &str| -> RequestOutcome {
+            reached = true;
+            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string())
+        };
+        loop {
+            match c.process_frame(&mut on_request, "127.0.0.1") {
+                Ok(true) => continue,
+                Ok(false) => break,
+                Err(e) => panic!("an amplified block must not be a connection error: {e}"),
+            }
+        }
+        assert!(!reached, "an oversize list must not reach the handler");
+        assert_eq!(status_of_stream_1(&c), "431");
+        assert_eq!(c.phase, Phase::Active, "the connection must survive");
     }
 
     #[test]
