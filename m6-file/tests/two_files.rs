@@ -302,9 +302,10 @@ fn a_burst_of_writes_is_at_most_two_reloads() {
     // loaded machine three writes can take longer than that, and the reloader
     // then rightly reports the late one as a new change (#299). So each attempt
     // times its own burst and is judged only if it fitted inside the window.
-    // The writes are spaced further apart than one reload takes, so without
-    // the debounce each is its own report: written back to back, the service
-    // loop would merge them on its own and the test could not fail.
+    // The writes are spaced further apart than the service loop takes to
+    // wake and reload, so a reloader that does not hold changes reports each
+    // write: written back to back, the loop would usually merge them on its
+    // own and the test could not fail.
     const ATTEMPTS: usize = 5;
     let window = m6_core::watcher::RELOAD_DEBOUNCE;
     let r = start("");
