@@ -107,6 +107,8 @@ Comments only.
 
 **The user guide's Examples 03 and 04 now match the released examples and follow the documentation ruleset (#156).**
 
+**docs/POSITIONING.md no longer carries the withdrawn 22.0 µs and 158,323 req/s figures, and its cross-server tables are replaced by a caveated capability comparison (#192, #158).**
+
 ### Changed
 
 **The m6-auth-cli integration tests assert that each setup command succeeds, and print its stderr when one does not (#258).**
