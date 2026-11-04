@@ -1,6 +1,6 @@
 # site.toml reference
 
-`site.toml` is the config file every m6 process of a site reads for the state the whole site shares.
+`site.toml` is the config file every m6 process of a site reads.
 It holds the site identity, the routes, the backends and the log and error settings.
 Section 3 states which key belongs in which file.
 
@@ -163,17 +163,14 @@ backend    = "m6-auth"           # the backend declared above
 public_key = "/etc/m6/auth.pub"  # m6-auth's public key, used to verify tokens locally
 ```
 
-The example keeps node state out of `site.toml`.
-The bind address, the certificate and key, and the `[auth]` section are node state, so the system config holds them.
-Section 3 states the split rule.
+The example keeps the bind address, the certificate and key, and the `[auth]` section in the system config.
+Section 3 states how the two files merge at start.
 
 ## 3. Config layering
 
-Every m6 process reads two files.
-`site.toml` holds the state every process of the site shares, and it can be public.
-The process config holds that process's own state, which is node identity, binds, certificates, credential paths and per-node security.
-For m6-http the process config is the system config, the required second argument.
-For a renderer it is the app config.
+Each m6 process reads `site.toml` and its own process config.
+For m6-http the process config is the system config, and for a renderer it is the app config.
+`m6-architecture.md` §8 gives the reason for the split.
 
 ### 3.1. m6-http system config
 
@@ -288,8 +285,8 @@ password = "mail-password"
 ### 3.3. What belongs where
 
 The rule is that `site.toml` holds the state every node shares, and the process config holds the state of one node.
-Table 1 gives the file for each key.
-Take from it that `site.toml` holds only site-wide state and the process config holds only node state.
+Table 1 maps each key to its file and names the reason.
+Take from it that App `[log]` is the one key with two homes, and every other key has one.
 
 | Setting | File it belongs in | Reason |
 |---|---|---|
@@ -309,7 +306,6 @@ Take from it that `site.toml` holds only site-wide state and the process config 
 | Mail credentials | `secrets_file` | Secret, held outside the repo |
 
 **Table 1: which file owns each key.**
-A node key in `site.toml` works, because the system config would have won, but m6-http logs a warning at start.
 
 m6-http accepts most of these keys in either file, and the system config wins.
 A misplaced key works, so m6-http logs a warning at start naming the key and the file it belongs in.
@@ -336,8 +332,8 @@ A file at the default path may be absent or invalid, as before.
 
 ### 3.5. `site.toml` is clean
 
-With `[server]` in the system config and credentials in secrets files, `site.toml` holds no passwords, no certificate paths and no environment-specific values.
-It is safe to publish, so the repo can be public.
+`site.toml` is safe to publish.
+`m6-architecture.md` §8.1 states the split that keeps it clean.
 
 ### `[site]`
 
