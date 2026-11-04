@@ -3090,32 +3090,32 @@ fn handle_request<W: std::io::Write>(
 ) {
     let start = std::time::Instant::now();
 
-    // Take the read lock once per request, to copy out what the request needs
-    // and to build its dictionary, then release it. A hot reload waits for the
-    // write lock, so nothing slow runs while this one is held: the handler and
-    // the template render both run after it is released.
+    // The framework read lock is taken once per request, and the guard is
+    // dropped before the handler runs, the template renders or anything is
+    // written to the client. A reload waits for the write lock, and std's
+    // `RwLock` stops granting new readers once a writer is waiting, so work
+    // done under this guard delays every request that arrives after a reload
+    // starts, and the old state is dropped by the reload, not by a request.
     //
-    // What leaves the lock is shared, not copied. The pipeline below runs
-    // outside the lock and needs the compression and minification settings
-    // and the renderer. They are replaced whole at a reload, so an `Arc` clone
-    // is the honest way to carry them out: a few refcount bumps instead of
-    // deep-copying two `HashMap`s and a `PathBuf` per request. A request that
-    // started before a reload finishes against the renderer it began with.
-    let (routes, site_dir, config, renderer) = {
+    // Under the guard: copy out the `Arc`s the rest of the request needs (a
+    // refcount bump each, not a copy of two `HashMap`s and a `PathBuf`), match
+    // the route against the shared table, and build the dictionary, which
+    // reads a params file on a cache miss. A request that started before a
+    // reload finishes against the renderer and config it began with.
+    let (routes, site_dir, config, renderer);
+    let matched = {
         let fs_r = fs.read().unwrap();
-        (
-            Arc::clone(&fs_r.routes),
-            Arc::clone(&fs_r.site_dir),
-            Arc::clone(&fs_r.config),
-            Arc::clone(&fs_r.renderer),
-        )
+        routes = Arc::clone(&fs_r.routes);
+        site_dir = Arc::clone(&fs_r.site_dir);
+        config = Arc::clone(&fs_r.config);
+        renderer = Arc::clone(&fs_r.renderer);
+        find_route(raw.path(), raw.method(), &routes).map(|(route, path_params)| {
+            let dict = fs_r.build_dict(&raw, route, &path_params);
+            (route, dict)
+        })
     };
     let compression = &config.compression;
     let minification = &config.minification;
-
-    // Routing happens outside the lock, against the shared route table. Inside
-    // it, the matched route would have to be cloned purely to outlive the guard.
-    let route_match = find_route(raw.path(), raw.method(), &routes);
 
     // Populated from `dict["csrf_token"]` inside the matched-route arm below
     // (when the csrf feature is on) so the cookie set further down uses the
@@ -3125,17 +3125,13 @@ fn handle_request<W: std::io::Write>(
     #[cfg(feature = "csrf")]
     let mut csrf_token_for_cookie: Option<String> = None;
 
-    let (mut resp, raw) = match route_match {
+    let (mut resp, raw) = match matched {
         None => {
             warn!(path = raw.path(), "unmatched path");
             (Response::not_found(), raw)
         }
-        Some((route, path_params)) => {
-            let route: &CompiledRoute = route;
-            // Build the request dict. The read lock is held for this call
-            // only: it reads the params file on a cache miss, and the guard is
-            // a temporary that is dropped at the end of the statement.
-            let dict = match fs.read().unwrap().build_dict(&raw, route, &path_params) {
+        Some((route, dict)) => {
+            let dict = match dict {
                 Ok(d) => d,
                 Err(e) => {
                     let r = error_to_response(&e);
@@ -4423,32 +4419,58 @@ tail = false
         }
     }
 
-    /// A hot reload takes the write lock. It is granted while a request is
-    /// still inside the template renderer, and that request is still answered.
-    #[test]
-    fn a_reload_is_not_held_up_by_a_template_render() {
-        use std::sync::{mpsc, RwLock};
-        use std::time::Duration;
+    /// A renderer that answers with a fixed body.
+    struct FixedRenderer(&'static str);
 
-        let (started_tx, started_rx) = mpsc::sync_channel(1);
-        let (release_tx, release_rx) = mpsc::channel();
-        let factory = BlockedFactory(Mutex::new(Some(BlockedRenderer {
-            started: started_tx,
-            release: Mutex::new(release_rx),
-        })));
+    impl Renderer for FixedRenderer {
+        fn render(&self, _template: &str, _ctx: &Dict) -> std::result::Result<String, RenderError> {
+            Ok(self.0.to_string())
+        }
+    }
 
-        let site_dir = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir(site_dir.path().join("templates")).unwrap();
+    struct FixedFactory(&'static str);
+
+    impl RendererFactory for FixedFactory {
+        fn build(
+            &self,
+            _site_dir: &std::path::Path,
+            _template_paths: &[String],
+        ) -> anyhow::Result<Box<dyn Renderer>> {
+            Ok(Box::new(FixedRenderer(self.0)))
+        }
+    }
+
+    fn template_state(site_dir: &std::path::Path, factory: &dyn RendererFactory) -> FrameworkState {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         write!(
             f,
             "[[route]]\npath = \"/\"\ntemplate = \"templates/home.html\"\n"
         )
         .unwrap();
-        let cfg = crate::config::load(f.path(), site_dir.path()).unwrap();
-        let state =
-            FrameworkState::build(cfg, site_dir.path().to_path_buf(), &[], &factory).unwrap();
-        let fs = Arc::new(RwLock::new(state));
+        let cfg = crate::config::load(f.path(), site_dir).unwrap();
+        FrameworkState::build(cfg, site_dir.to_path_buf(), &[], factory).unwrap()
+    }
+
+    /// A reload swaps the state while a request is still inside the template
+    /// renderer. The swap is not held up by that request, and the request is
+    /// answered by the renderer it started with, not the one the reload
+    /// installed.
+    #[test]
+    fn a_reload_swaps_the_state_while_a_request_finishes_on_the_old_renderer() {
+        use std::sync::{mpsc, RwLock};
+        use std::time::Duration;
+
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::channel();
+        let old = BlockedFactory(Mutex::new(Some(BlockedRenderer {
+            started: started_tx,
+            release: Mutex::new(release_rx),
+        })));
+
+        let site_dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(site_dir.path().join("templates")).unwrap();
+        let fs = Arc::new(RwLock::new(template_state(site_dir.path(), &old)));
+        let reloaded = template_state(site_dir.path(), &FixedFactory("new"));
 
         let request = {
             let fs = Arc::clone(&fs);
@@ -4471,23 +4493,30 @@ tail = false
             .recv_timeout(Duration::from_secs(10))
             .expect("the request should reach the renderer");
 
-        // The request is blocked in the renderer. The write lock must come
+        // The request is blocked in the old renderer. The swap must complete
         // anyway, and the renderer is not released until it has.
-        let (reloaded_tx, reloaded_rx) = mpsc::channel();
+        let (swapped_tx, swapped_rx) = mpsc::channel();
         let reload = {
             let fs = Arc::clone(&fs);
             std::thread::spawn(move || {
-                drop(fs.write().unwrap());
-                reloaded_tx.send(()).ok();
+                *fs.write().unwrap() = reloaded;
+                swapped_tx.send(()).ok();
             })
         };
-        let granted = reloaded_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+        let swapped = swapped_rx.recv_timeout(Duration::from_secs(5)).is_ok();
         release_tx.send(()).unwrap();
         reload.join().unwrap();
-        let out = request.join().unwrap();
+        let out = String::from_utf8_lossy(&request.join().unwrap()).into_owned();
 
-        assert!(granted, "the write lock waited for the render to finish");
-        assert!(String::from_utf8_lossy(&out).contains("rendered"));
+        assert!(swapped, "the reload waited for the render to finish");
+        assert!(
+            out.contains("rendered"),
+            "the request was answered with: {out}"
+        );
+        assert!(
+            !out.contains("new"),
+            "the request used the reloaded renderer: {out}"
+        );
     }
 
     /// A handler name with no code behind it has no defensible reading, so it

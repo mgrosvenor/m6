@@ -123,9 +123,9 @@ A config that disagrees with `site.toml` about compression now makes `--dump-con
 
 **The m6-auth-server reference follows the documentation ruleset, and its `next` check, browser logout, key rotation and `--dump-config` descriptions now match the service (#140).**
 
-**A request holds the framework read lock only while it builds its dictionary, so a hot reload no longer waits for a handler or a template render (#183).**
-The lock was held through the handler and the render, and the render could take as long as the template needed. The renderer is now an `Arc` that the request copies out with the lock's other shared state, and `render_response` takes the renderer instead of the framework state.
-A test blocks a request inside the renderer and asserts the write lock is granted while it is blocked. It fails on the old code and passes on the new.
+**A request takes the framework read lock once and releases it before the handler runs or the template renders, so a hot reload no longer queues requests behind a render (#183).**
+The lock used to be taken twice and held through the handler and the render. std's `RwLock` stops granting new readers once a writer is waiting, so a reload made every new request wait for the longest render in flight, and the reload itself dropped the old renderer while holding the write lock. Now the lock covers only copying out the shared state, routing and building the dictionary, and the renderer is an `Arc` the request carries out with it.
+A test blocks a request inside the renderer, swaps in a state with another renderer, and asserts the swap completes while the request is blocked and that the request is answered by the renderer it started with. It fails on the old locking and passes on the new.
 
 ### Verified
 
