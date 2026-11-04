@@ -105,6 +105,8 @@ Comments only.
 
 **The user guide's install section, Example 01 and Example 02 now match the released examples and follow the documentation ruleset (#156).**
 
+**The user guide's Examples 03 and 04 now match the released examples and follow the documentation ruleset (#156).**
+
 ### Changed
 
 **The m6-auth-cli integration tests assert that each setup command succeeds, and print its stderr when one does not (#258).**
