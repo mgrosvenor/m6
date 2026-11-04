@@ -68,7 +68,7 @@ Compresses per `Accept-Encoding`. Brotli and gzip. Configurable per MIME type:
 "image/jpeg"             = { brotli = 0, gzip = 0 }
 ```
 
-Defaults — compressed: `text/html`, `text/css`, `application/javascript`, `image/svg+xml`, `text/plain`. Not compressed: fonts, images, PDF, everything else.
+Defaults — compressed: `text/html`, `text/css`, `application/javascript`, `text/javascript`, `application/json`, `image/svg+xml`, `text/plain`. Not compressed: fonts, images, PDF, everything else.
 
 ### Logging
 

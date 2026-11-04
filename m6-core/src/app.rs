@@ -3516,6 +3516,7 @@ mod tests {
             "[compression.\"text/css\"]\nbrotli = 0\ngzip = 0\n",
             "[compression.\"text/plain\"]\nbrotli = 0\ngzip = 0\n",
             "[compression.\"application/javascript\"]\nbrotli = 0\ngzip = 0\n",
+            "[compression.\"text/javascript\"]\nbrotli = 0\ngzip = 0\n",
             "[compression.\"application/json\"]\nbrotli = 0\ngzip = 0\n",
             "[compression.\"image/svg+xml\"]\nbrotli = 0\ngzip = 0\n",
         );
