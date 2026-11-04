@@ -363,8 +363,7 @@ Example 03 adds a fourth process, a custom renderer that handles a contact form 
 
 Example 03 adds a contact form to the blog.
 A fourth process, `render-contact`, renders the form and sends the submitted message as *SMTP* (Simple Mail Transfer Protocol) email.
-The example keeps the three processes from Example 02 and adds one crate, one backend, one route and one template.
-Sections 4.1 to 4.6 walk those additions in order.
+The example shows the shape of a custom renderer: a small Rust crate that owns one route end to end.
 
 Run the example from `examples/03-contact`.
 The workspace build in section 1 already built `render-contact`, so `dev.sh` starts it directly.
@@ -497,9 +496,7 @@ to       = "owner@example.com"
 The `[smtp]` values are development defaults.
 In production they move to the file named by `secrets_file`, and the `[smtp]` section is removed from this file.
 
-Each key has exactly one owner.
-Set the same key in both files and the renderer refuses to start, naming the key.
-The secrets file supplies values this file does not set, and a missing secrets file is ignored, so the example runs with no setup.
+A key set in both files is refused at startup, and a missing secrets file is ignored, so the example runs with no setup.
 
 ### 4.4. `templates/contact.html`
 
@@ -533,7 +530,7 @@ Otherwise it shows the form, which posts the three fields back to `/contact`.
 {% endblock %}
 ```
 
-The three field names, `name`, `email` and `message`, are the three that `handle_post` reads.
+The form's field names match the ones `handle_post` reads.
 `extends` names `templates/base.html`, the layout every page shares.
 
 ### 4.5. New in `site.toml`
@@ -566,7 +563,7 @@ M6_SOCKET_OVERRIDE=/tmp/m6/render-contact.sock \
 `$EXAMPLES` is the m6-examples checkout root.
 
 [`m6-render.md`](m6-render.md) owns the custom renderer guide.
-[`m6-render-lib.md`](m6-render-lib.md) owns the renderer config keys and `init_global`.
+[`m6-render-lib.md`](m6-render-lib.md) owns the renderer config keys, including `secrets_file`, and `init_global`.
 [`m6-site-toml.md`](m6-site-toml.md) owns the `[[backend]]` and `[[route]]` keys.
 
 Example 03 adds one custom renderer and one form route.
@@ -576,8 +573,7 @@ Example 04 adds login and protects a members page behind it.
 
 Example 04 adds authentication to the contact-form site.
 The `m6-auth` service verifies logins and issues *JWT* (JSON Web Token) tokens, and `m6-http` enforces access to protected routes.
-The example keeps the renderer from Example 03 and adds one service, one setup script, two templates and several routes.
-Sections 5.1 to 5.5 walk those additions in order.
+The example shows the division of work: one service issues the tokens, and `m6-http` enforces the routes.
 
 Run the example from `examples/04-auth`.
 `setup.sh` generates the signing keys and creates the admin user, then `dev.sh` starts the stack.
@@ -647,8 +643,6 @@ backend    = "m6-auth"
 public_key = "keys/auth.pub"
 ```
 
-`backend` names the auth service, and `public_key` is the file `m6-http` uses to verify tokens locally.
-
 The backend and routes live in `site.toml`:
 
 ```toml
@@ -683,14 +677,12 @@ backend = "m6-html"
 require = "group:members"
 ```
 
-`/login` renders the login form from `m6-html`, and the three `/auth/` routes reach the auth service.
-`require = "group:members"` restricts `/members` and `/members/{page}` to users in the members group.
-`m6-http` checks that group against the token on every request.
+`/login` renders the login form from `m6-html`, the three `/auth/` routes reach the auth service, and the two `/members` routes are the protected pages.
 
 ### 5.4. `templates/login.html`
 
 `templates/login.html` renders the login form and the failure message.
-The hidden `next` field carries the page the user came from, and `m6-auth` uses it for the redirect after login.
+The hidden `next` field carries the page the user came from.
 
 ```html
 {% extends "templates/base.html" %}
@@ -715,25 +707,7 @@ The hidden `next` field carries the page the user came from, and `m6-auth` uses 
 {% endblock %}
 ```
 
-`POST /auth/login` accepts the form and verifies the credentials.
-On success it sets the two cookies and redirects to `next`.
-On failure it redirects to `/login?error=invalid` with the same `next` value.
-`next` must be a same-origin path, and any other value falls back to `/`.
-
-The two cookies:
-
-```text
-Set-Cookie: session=<access-token>; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=900
-Set-Cookie: refresh=<refresh-token>; HttpOnly; Secure; SameSite=Lax; Path=/auth/refresh; Max-Age=2592000
-```
-
-The session cookie has `Path=/`, so the browser sends it on every request, and `m6-http` verifies it locally against `public_key`.
-The refresh cookie has `Path=/auth/refresh`, so the browser sends it only to the refresh route.
-Both cookies carry `HttpOnly`, `Secure` and `SameSite=Lax`.
-
-`POST /auth/refresh` issues a new session cookie from the refresh cookie and leaves the refresh cookie in place.
-The browser is sent to the `Referer` when that is a same-origin path, and to `/` otherwise.
-A missing or expired refresh cookie is sent to `/login`.
+The form posts to `/auth/login`, where `m6-auth` verifies the credentials and sets the session and refresh cookies.
 
 ### 5.5. `templates/members.html`
 
@@ -751,10 +725,9 @@ A missing or expired refresh cookie is sent to `/login`.
 {% endblock %}
 ```
 
-`POST /auth/logout` clears both cookies and redirects to `/`.
-The auth flow is server-side: the browser sends the cookies, and `m6-http` and `m6-auth-server` do the work.
+The form posts to `/auth/logout`.
 
-[`m6-auth.md`](m6-auth.md) owns the login, refresh and logout responses.
+[`m6-auth.md`](m6-auth.md) owns the login, refresh and logout responses and the cookie attributes.
 [`m6-auth-cli.md`](m6-auth-cli.md) owns the `user add` and group commands.
 [`m6-site-toml.md`](m6-site-toml.md) owns the `[auth]` and `require` keys.
 
