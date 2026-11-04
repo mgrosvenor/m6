@@ -361,17 +361,23 @@ Example 03 adds a fourth process, a custom renderer that handles a contact form 
 
 ## 4. Example 03, contact form
 
-`examples/03-contact/`
+Example 03 adds a contact form to the blog.
+A fourth process, `render-contact`, renders the form and sends the submitted message as *SMTP* (Simple Mail Transfer Protocol) email.
+The example shows the shape of a custom renderer: a small Rust crate that owns one route end to end.
 
-Adds `render-contact` — a custom renderer that handles GET (renders the form) and POST (sends email via SMTP).
+Run the example from `examples/03-contact`.
+The workspace build in section 1 already built `render-contact`, so `dev.sh` starts it directly.
 
-```bash
+```sh
 cd examples/03-contact
-cargo build --release -p render-contact
 ./dev.sh
 ```
 
 ### 4.1. `render-contact/Cargo.toml`
+
+`render-contact` is a Rust crate in the m6-examples workspace.
+Its manifest depends on m6-core by the relative path `../../../../m6/m6-core`, with the `email` feature that re-exports the *SMTP* transport.
+`lettre` supplies the transport itself, and `anyhow` and `serde_json` handle errors and JSON.
 
 ```toml
 [package]
@@ -380,44 +386,74 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-m6-render = { git = "https://github.com/m6/m6", tag = "v0.1.0", features = ["smtp"] }
+m6-core    = { path = "../../../../m6/m6-core", features = ["email"] }
+lettre     = { version = "0.11", features = ["smtp-transport", "native-tls"] }
+anyhow     = "1"
 serde_json = "1"
 ```
 
+The relative path is why the m6 and m6-examples checkouts must sit side by side.
+
 ### 4.2. `render-contact/src/main.rs`
 
-```rust
-use m6_render::prelude::*;
+`main.rs` has two functions plus `main`.
+`init_global` builds the *SMTP* transport from the config.
+`handle_post` reads the form and sends the message.
+`main` registers both and runs the service.
 
-// Shared — SmtpTransport is Send+Sync, no locking needed
+```rust
+use lettre::transport::smtp::authentication::Credentials;
+use m6_core::prelude::*;
+
 struct Global {
     mailer: SmtpTransport,
+    from:   String,
+    to:     String,
 }
 
-fn init_global(config: &Map<String, Value>) -> Result<Global> {
-    Ok(Global {
-        mailer: SmtpTransport::builder(config["smtp"]["host"].as_str()?)
-            .port(config["smtp"]["port"].as_u64()? as u16)
-            .credentials(
-                config["smtp"]["username"].as_str()?,
-                config["smtp"]["password"].as_str()?,
-            )
-            .build()?,
-    })
+fn init_global(ctx: &AppContext) -> Result<Global> {
+    let config = ctx.config;
+    let host = config["smtp"]["host"].as_str()
+        .ok_or_else(|| Error::Other(anyhow::anyhow!("smtp.host missing")))?;
+    let port = config["smtp"]["port"].as_u64()
+        .ok_or_else(|| Error::Other(anyhow::anyhow!("smtp.port missing")))? as u16;
+    let username = config["smtp"]["username"].as_str()
+        .ok_or_else(|| Error::Other(anyhow::anyhow!("smtp.username missing")))?;
+    let password = config["smtp"]["password"].as_str()
+        .ok_or_else(|| Error::Other(anyhow::anyhow!("smtp.password missing")))?;
+    let from = config["smtp"]["from"].as_str()
+        .ok_or_else(|| Error::Other(anyhow::anyhow!("smtp.from missing")))?.to_string();
+    let to = config["smtp"]["to"].as_str()
+        .ok_or_else(|| Error::Other(anyhow::anyhow!("smtp.to missing")))?.to_string();
+
+    let creds = Credentials::new(username.to_string(), password.to_string());
+    let mailer = SmtpTransport::relay(host)
+        .map_err(|e| Error::Other(e.into()))?
+        .port(port)
+        .credentials(creds)
+        .build();
+
+    Ok(Global { mailer, from, to })
 }
 
-fn handle_post(req: &Request, global: &Global, _local: &mut ()) -> Result<Response> {
+fn handle_post(req: &Request, global: &Global) -> Result<Response> {
     let name    = req.field("name")?;
     let email   = req.field("email")?;
     let message = req.field("message")?;
 
-    global.mailer.send(
-        Message::builder()
-            .from(req["smtp"]["from"].as_str()?.parse()?)
-            .to(req["smtp"]["to"].as_str()?.parse()?)
-            .subject(format!("Contact from {}", name))
-            .body(format!("From: {} <{}>\n\n{}", name, email, message))?,
-    )?;
+    let from_addr: lettre::Address = global.from.parse()
+        .map_err(|e: lettre::address::AddressError| Error::Other(anyhow::anyhow!("{e}")))?;
+    let to_addr: lettre::Address = global.to.parse()
+        .map_err(|e: lettre::address::AddressError| Error::Other(anyhow::anyhow!("{e}")))?;
+
+    let msg = Message::builder()
+        .from(lettre::message::Mailbox::new(None, from_addr))
+        .to(lettre::message::Mailbox::new(None, to_addr))
+        .subject(format!("Contact from {}", name))
+        .body(format!("From: {} <{}>\n\n{}", name, email, message))
+        .map_err(|e| Error::Other(anyhow::anyhow!("{e}")))?;
+
+    global.mailer.send(&msg).map_err(|e| Error::Other(e.into()))?;
 
     Response::render_with("templates/contact.html", req, json!({"sent": true, "name": name}))
 }
@@ -425,12 +461,18 @@ fn handle_post(req: &Request, global: &Global, _local: &mut ()) -> Result<Respon
 fn main() -> Result<()> {
     App::with_global(init_global)
         .route_post("/contact", handle_post)
-        // GET /contact served by framework default (template render from config)
         .run()
 }
 ```
 
+`init_global` runs once at startup, and `App::with_global` shares its result across requests.
+`handle_post` reads three fields, `name`, `email` and `message`, sends them, then renders the template again with `sent` set.
+The route's template in the config serves a GET to `/contact`, so the form appears on first visit.
+
 ### 4.3. `configs/render-contact.conf`
+
+`render-contact.conf` loads `data/site.json` into every template, names the secrets file and declares the one route.
+The route renders `templates/contact.html` with `cache = "no-store"`, so m6-http never caches the form or its response.
 
 ```toml
 global_params = ["data/site.json"]
@@ -442,7 +484,6 @@ template = "templates/contact.html"
 params   = []
 cache    = "no-store"
 
-# Development defaults — overridden by secrets_file in production
 [smtp]
 host     = "localhost"
 port     = 1025
@@ -452,89 +493,124 @@ from     = "noreply@example.com"
 to       = "owner@example.com"
 ```
 
-```toml
-# /etc/m6/render-contact.toml  (production secrets, not in version control)
-[smtp]
-host     = "smtp.example.com"
-port     = 587
-username = "user@example.com"
-password = "live-smtp-password"
-```
+The `[smtp]` values are development defaults.
+In production they move to the file named by `secrets_file`, and the `[smtp]` section is removed from this file.
+
+A key set in both files is refused at startup, and a missing secrets file is ignored, so the example runs with no setup.
 
 ### 4.4. `templates/contact.html`
 
+`templates/contact.html` shows one of two states.
+When `sent` is true it shows a thank-you message.
+Otherwise it shows the form, which posts the three fields back to `/contact`.
+
 ```html
-{% extends "base.html" %}
+{% extends "templates/base.html" %}
 {% block title %}Contact · {{ site_name }}{% endblock %}
 {% block content %}
-  <h1>Contact</h1>
-  {% if sent %}
-    <p>Message sent. Thanks, {{ name }}!</p>
-  {% else %}
-    <form method="post" action="/contact">
-      <label>Name <input type="text" name="name" required></label>
-      <label>Email <input type="email" name="email" required></label>
-      <label>Message <textarea name="message" required></textarea></label>
-      <button type="submit">Send</button>
-    </form>
-  {% endif %}
+  <div class="form-card">
+    <h1>Contact</h1>
+    {% if sent %}
+      <p>Message sent. Thanks, <strong>{{ name }}</strong>!</p>
+    {% else %}
+      <form method="post" action="/contact">
+        <label>Name
+          <input type="text" name="name" required autofocus>
+        </label>
+        <label>Email
+          <input type="email" name="email" required>
+        </label>
+        <label>Message
+          <textarea name="message" required></textarea>
+        </label>
+        <button type="submit">Send message</button>
+      </form>
+    {% endif %}
+  </div>
 {% endblock %}
 ```
 
+The form's field names match the ones `handle_post` reads.
+`extends` names `templates/base.html`, the layout every page shares.
+
 ### 4.5. New in `site.toml`
+
+`site.toml` gains one backend and one route.
+The backend names the `render-contact` process and its socket, and the route sends `/contact` to it.
 
 ```toml
 [[backend]]
 name    = "render-contact"
-sockets = "/run/m6/render-contact-*.sock"
+sockets = "/tmp/m6/render-contact.sock"
 
 [[route]]
 path    = "/contact"
 backend = "render-contact"
 ```
 
+The `sockets` value is one exact path, because the example runs one copy of the renderer.
+
 ### 4.6. Updated `dev.sh`
 
-```bash
-./target/release/render-contact "$SITE" "$SITE/configs/render-contact.conf" &
+`dev.sh` starts the renderer beside the other processes.
+`M6_SOCKET_OVERRIDE` points the renderer's socket at the path `site.toml` names, and the command uses the binary from the workspace build.
+
+```sh
+M6_SOCKET_OVERRIDE=/tmp/m6/render-contact.sock \
+    "$EXAMPLES/target/release/render-contact" "$SITE" "$SITE/configs/render-contact.conf" &
 ```
 
----
+`$EXAMPLES` is the m6-examples checkout root.
+
+[`m6-render.md`](m6-render.md) owns the custom renderer guide.
+[`m6-render-lib.md`](m6-render-lib.md) owns the renderer config keys, including `secrets_file`, and `init_global`.
+[`m6-site-toml.md`](m6-site-toml.md) owns the `[[backend]]` and `[[route]]` keys.
+
+Example 03 adds one custom renderer and one form route.
+Example 04 adds login and protects a members page behind it.
 
 ## 5. Example 04, login and protected pages
 
-`examples/04-auth/`
+Example 04 adds authentication to the contact-form site.
+The `m6-auth` service verifies logins and issues *JWT* (JSON Web Token) tokens, and `m6-http` enforces access to protected routes.
+The example shows the division of work: one service issues the tokens, and `m6-http` enforces the routes.
 
-Adds m6-auth. Members-only pages behind login. The JWT is stored in an HttpOnly cookie — the browser sends it automatically on every request, JavaScript cannot read it.
+Run the example from `examples/04-auth`.
+`setup.sh` generates the signing keys and creates the admin user, then `dev.sh` starts the stack.
 
-```bash
+```sh
 cd examples/04-auth
-./setup.sh   # generates keys, creates first admin user
+./setup.sh
 ./dev.sh
-# login at https://localhost:8443/login
 ```
 
+Open `https://localhost:8443/login` and log in as `admin` with password `admin`.
+
 ### 5.1. Key generation and bootstrap (`setup.sh`)
+
+`setup.sh` generates the signing key pair and creates the first admin user.
+The keys are *PKCS#8* (Public-Key Cryptography Standards #8), the format `m6-auth-server` accepts.
 
 ```bash
 #!/bin/bash
 set -e
 SITE="$(cd "$(dirname "$0")" && pwd)"
 
-# Generate signing keys
 mkdir -p "$SITE/keys"
-openssl ecparam -name prime256v1 -genkey -noout -out "$SITE/keys/auth.pem"
-openssl ec -in "$SITE/keys/auth.pem" -pubout -out "$SITE/keys/auth.pub"
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -pkeyopt ec_param_enc:named_curve -out "$SITE/keys/auth.pem"
+openssl pkey -in "$SITE/keys/auth.pem" -pubout -out "$SITE/keys/auth.pub"
 chmod 600 "$SITE/keys/auth.pem"
-echo "Keys generated."
 
-# Create first admin user — database created automatically if absent
-m6-auth-cli "$SITE/configs/m6-auth.conf" user add admin --role admin
-
-echo "Setup complete. Start the server with ./dev.sh"
+m6-auth-cli "$SITE/configs/m6-auth.conf" user add admin --role admin --password admin
 ```
 
+`openssl genpkey` writes the PKCS#8 private key, and `ec_param_enc:named_curve` keeps the named curve form the token signer accepts.
+`chmod 600` makes the private key readable by its owner only.
+`user add admin --role admin --password admin` creates the admin user with the role `admin` and the password `admin`, and it creates the auth database on first run.
+
 ### 5.2. `configs/m6-auth.conf`
+
+`m6-auth.conf` configures the auth service: the database path, the two token lifetimes, the issuer and the key paths.
 
 ```toml
 [storage]
@@ -550,16 +626,29 @@ private_key = "keys/auth.pem"
 public_key  = "keys/auth.pub"
 ```
 
-### 5.3. New in `site.toml`
+`access_ttl` sets the access token lifetime to 900 seconds, and `refresh_ttl` sets the refresh token lifetime to 2592000 seconds.
+`issuer` sets the `iss` claim the service writes into tokens, and the two key paths name the files `setup.sh` generated.
+
+### 5.3. New config
+
+Example 04 changes two config files.
+The system config gains the `[auth]` block that points `m6-http` at the auth service and its public key.
+`site.toml` gains the `m6-auth` backend and the login, logout, refresh and members routes.
+
+The `[auth]` block lives in `configs/system-dev.toml`, the system config `m6-http` reads:
 
 ```toml
 [auth]
 backend    = "m6-auth"
 public_key = "keys/auth.pub"
+```
 
+The backend and routes live in `site.toml`:
+
+```toml
 [[backend]]
 name    = "m6-auth"
-sockets = "/run/m6/m6-auth-*.sock"
+sockets = "/tmp/m6/m6-auth*.sock"
 
 [[route]]
 path    = "/login"
@@ -588,44 +677,44 @@ backend = "m6-html"
 require = "group:members"
 ```
 
+`/login` renders the login form from `m6-html`, the three `/auth/` routes reach the auth service, and the two `/members` routes are the protected pages.
+
 ### 5.4. `templates/login.html`
 
+`templates/login.html` renders the login form and the failure message.
+The hidden `next` field carries the page the user came from.
+
 ```html
-{% extends "base.html" %}
+{% extends "templates/base.html" %}
 {% block title %}Login · {{ site_name }}{% endblock %}
 {% block content %}
-  <h1>Login</h1>
-  {% if query.error %}
-    <p class="error">Invalid username or password.</p>
-  {% endif %}
-  <form method="post" action="/auth/login">
-    <input type="hidden" name="next" value="{{ query.next }}">
-    <label>Username <input type="text" name="username" required autofocus></label>
-    <label>Password <input type="password" name="password" required></label>
-    <button type="submit">Login</button>
-  </form>
+  <div class="form-card">
+    <h1>Login</h1>
+    {% if query.error is defined and query.error %}
+      <p class="error">Invalid username or password.</p>
+    {% endif %}
+    <form method="post" action="/auth/login">
+      <input type="hidden" name="next" value="{{ query.next | default(value='') }}">
+      <label>Username
+        <input type="text" name="username" required autofocus>
+      </label>
+      <label>Password
+        <input type="password" name="password" required>
+      </label>
+      <button type="submit">Login</button>
+    </form>
+  </div>
 {% endblock %}
 ```
 
-The hidden `next` field carries the original destination through the form POST. m6-auth validates that `next` is a relative path before redirecting — no client-side validation needed.
-
-m6-auth handles `POST /auth/login` (form-encoded), verifies credentials, and either:
-- **Success** → sets two HttpOnly cookies and `302` to `next`
-- **Failure** → `302` back to `/login?error=invalid&next=<next>`
-
-```
-Set-Cookie: session=<access_token>;  HttpOnly; Secure; SameSite=Strict; Path=/;             Max-Age=900
-Set-Cookie: refresh=<refresh_token>; HttpOnly; Secure; SameSite=Strict; Path=/auth/refresh; Max-Age=2592000
-```
-
-The `session` cookie is sent on every request — m6-http verifies it locally. The `refresh` cookie is sent only to `POST /auth/refresh` due to its restricted `Path`. No JavaScript involved anywhere in the auth flow.
-
-**Session expiry:** When the `session` cookie expires, m6-http checks for a `refresh` cookie on the next protected request. If present and valid, new cookies are issued and the user is returned to where they were without seeing a login page. If the refresh token has also expired, the user is redirected to `/login?next=<original-path>`.
+The form posts to `/auth/login`, where `m6-auth` verifies the credentials and sets the session and refresh cookies.
 
 ### 5.5. `templates/members.html`
 
+`templates/members.html` is the protected page, and its only action is the logout form.
+
 ```html
-{% extends "base.html" %}
+{% extends "templates/base.html" %}
 {% block title %}Members · {{ site_name }}{% endblock %}
 {% block content %}
   <h1>Members Area</h1>
@@ -636,129 +725,62 @@ The `session` cookie is sent on every request — m6-http verifies it locally. T
 {% endblock %}
 ```
 
-Logout is a plain form POST — no JavaScript. m6-auth clears both cookies and redirects to `/`.
+The form posts to `/auth/logout`.
 
----
+[`m6-auth.md`](m6-auth.md) owns the login, refresh and logout responses and the cookie attributes.
+[`m6-auth-cli.md`](m6-auth-cli.md) owns the `user add` and group commands.
+[`m6-site-toml.md`](m6-site-toml.md) owns the `[auth]` and `require` keys.
+
+Example 04 adds login and one protected page.
+Example 05 builds a CMS blog with a publish flow on top of the same auth.
 
 ## 6. Example 05, CMS blog
 
-`examples/05-cms/`
+Example 05 builds a *CMS* (Content Management System) blog on the auth from Example 04.
+It adds a custom renderer that owns the CMS, and it is the first example to run the whole stack end to end.
+The public blog is cached at the edge, and the CMS routes are protected and never cached.
 
-The full system. A public blog served at maximum speed from RAM cache. An authorised CMS renderer for creating, editing, and publishing posts.
+Run the example from `examples/05-cms`.
+`setup.sh` generates the signing keys and creates the admin user, then `dev.sh` builds and starts the stack.
 
-Published posts are individual JSON files in `content/posts/` — one per post. Drafts live in `content/drafts/` and are never publicly routable. On publish, render-cms writes the post file, updates the index, and touches `site.toml` to trigger a route table reload in m6-http.
-
-```bash
+```sh
 cd examples/05-cms
-./setup.sh           # keys, first admin user
-cargo build --release -p render-cms
+./setup.sh
 ./dev.sh
-# CMS at https://localhost:8443/cms (login required)
-# Blog at https://localhost:8443/blog (public, cached)
 ```
+
+The CMS is at `https://localhost:8443/cms`, and the public blog is at `https://localhost:8443/blog`.
+`./test.sh` then checks the running stack over the wire.
 
 ### 6.1. Site directory
 
-```
-05-cms/
-├── site.toml
-├── configs/
-│   ├── system-dev.toml
-│   ├── m6-html.conf
-│   ├── m6-file.conf
-│   ├── m6-auth.conf
-│   └── render-cms.conf
-├── templates/
-│   ├── base.html
-│   ├── home.html
-│   ├── post-index.html
-│   ├── post.html
-│   ├── login.html
-│   ├── error.html
-│   └── cms/
-│       ├── dashboard.html
-│       └── editor.html
-├── assets/
-├── content/
-├── data/
-│   ├── posts/       ← published JSON (one file per post, written by CMS on publish)
-│   └── drafts/      ← draft JSON (never publicly routable)
-├── keys/
-└── render-cms/
-    ├── Cargo.toml
-    └── src/main.rs
-```
+Example 05 adds the CMS renderer, a drafts directory and a test script to the Example 04 layout.
+
+- `render-cms/` is the CMS crate
+- `content/drafts/` holds the JSON drafts
+- `configs/render-cms.conf` marks the renderer's routes uncacheable
+- `test.sh` checks the running stack end to end
+
+Everything else carries over: `site.toml`, the other four config files, `templates/`, `assets/`, `content/posts/`, `data/`, `setup.sh` and `dev.sh`.
+
+`content/posts/` holds the Markdown sources and the published *JSON* (JavaScript Object Notation) posts, and `content/drafts/` holds the JSON drafts.
+`data/posts.json` is the merged index both sources write into.
 
 ### 6.2. `site.toml`
 
+`site.toml` declares the four backends and the routes, and `configs/system-dev.toml` holds the node's bind address, *TLS* (Transport Layer Security) paths and auth key.
+Example 05 adds the `render-cms` backend, the CMS routes and the method list.
+
+The `render-cms` backend and the routes that reach it:
+
 ```toml
-[site]
-name   = "My Blog"
-domain = "localhost"
-
-[auth]
-backend    = "m6-auth"
-public_key = "keys/auth.pub"
-
-[[backend]]
-name    = "m6-html"
-sockets = "/run/m6/m6-html-*.sock"
-
-[[backend]]
-name    = "m6-file"
-sockets = "/run/m6/m6-file-*.sock"
-
-[[backend]]
-name    = "m6-auth"
-sockets = "/run/m6/m6-auth-*.sock"
-
 [[backend]]
 name    = "render-cms"
-sockets = "/run/m6/render-cms-*.sock"
-
-# ── Public routes — no auth, fully cached ─────────────────────
+sockets = "/tmp/m6/render-cms*.sock"
 
 [[route]]
-path    = "/"
-backend = "m6-html"
-
-[[route]]
-path    = "/blog"
-backend = "m6-html"
-
-[[route_group]]
-glob    = "content/posts/*.json"
-path    = "/blog/{stem}"
-backend = "m6-html"
-
-[[route_group]]
-glob    = "assets/**/*"
-path    = "/assets/{relpath}"
-backend = "m6-file"
-
-[[route]]
-path    = "/_errors"
-backend = "m6-html"
-
-# ── Auth endpoints — public ────────────────────────────────────
-
-[[route]]
-path    = "/login"
-backend = "m6-html"
-
-[[route]]
-path    = "/auth/login"
-backend = "m6-auth"
-
-[[route]]
-path    = "/auth/logout"
-backend = "m6-auth"
-
-[[route]]
-path    = "/auth/refresh"
-backend = "m6-auth"
-
-# ── CMS — all protected, never cached ─────────────────────────
+path    = "/contact"
+backend = "render-cms"
 
 [[route]]
 path    = "/cms"
@@ -766,39 +788,49 @@ backend = "render-cms"
 require = "group:editors"
 
 [[route]]
-path    = "/cms/edit/{stem}"
-backend = "render-cms"
-require = "group:editors"
-
-[[route]]
-path    = "/cms/new"
-backend = "render-cms"
-require = "group:editors"
-
-[[route]]
-path    = "/api/drafts"
-backend = "render-cms"
-require = "group:editors"
-
-[[route]]
-path    = "/api/drafts/{stem}"
-backend = "render-cms"
-require = "group:editors"
-
-[[route]]
 path    = "/api/publish/{stem}"
-backend = "render-cms"
-require = "group:editors"
-
-[[route]]
-path    = "/api/unpublish/{stem}"
 backend = "render-cms"
 require = "group:editors"
 ```
 
-`[[route_group]]` with `content/posts/*.json` handles routing for individual posts. New post files become routable when m6-http reloads after `site.toml` is touched on publish.
+The full CMS route set is `/cms`, `/cms/new`, `/cms/edit/{stem}`, `/api/drafts`, `/api/drafts/{stem}`, `/api/publish/{stem}`, `/api/unpublish/{stem}` and `/api/posts/{stem}`, all behind the `editors` group.
+
+The public blog and asset routes:
+
+```toml
+[[route]]
+path    = "/blog/{stem}"
+backend = "m6-html"
+
+[[route]]
+path    = "/assets/{*relpath}"
+backend = "m6-file"
+```
+
+render-cms registers PATCH and DELETE routes, so `allowed_methods` names them:
+
+```toml
+[server]
+allowed_methods = ["GET", "HEAD", "POST", "PATCH", "DELETE"]
+```
+
+`configs/system-dev.toml` holds the node's own settings:
+
+```toml
+[server]
+bind     = "127.0.0.1:8443"
+tls_cert = "keys/dev.pem"
+tls_key  = "keys/dev-key.pem"
+
+[auth]
+backend    = "m6-auth"
+public_key = "keys/auth.pub"
+```
 
 ### 6.3. `render-cms/Cargo.toml`
+
+`render-cms` is a Rust crate in the m6-examples workspace.
+Its manifest depends on m6-core by the relative path `../../../../m6/m6-core`, on `serde_json` for JSON, on `comrak` to render Markdown to *HTML* (HyperText Markup Language), and on `base64` for the editor transport.
 
 ```toml
 [package]
@@ -807,153 +839,79 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-m6-render  = { git = "https://github.com/m6/m6", tag = "v0.1.0", features = ["auth", "disk"] }
+m6-core    = { path = "../../../../m6/m6-core" }
 serde_json = "1"
+comrak     = { version = "0.21", default-features = false }
+base64     = "0.22"
 ```
 
 ### 6.4. `render-cms/src/main.rs`
 
-```rust
-use m6_render::prelude::*;
-use serde_json::{json, Value};
-use std::fs;
+`main` registers the CMS routes as code handlers, and `configs/render-cms.conf` marks the routes it lists `cache = "no-store"`.
+The renderer also owns the `/contact` form.
 
+```rust
 fn main() -> Result<()> {
-    // render-cms uses JSON files directly — no state needed.
-    // A real CMS would use App::with_state(init_global, init_thread)
-    // to hold a database connection per thread.
     App::new()
-        .route_get("/cms",             handle_dashboard)
-        .route_get("/cms/new",         handle_new)
-        .route_get("/cms/edit/{stem}", handle_edit)
+        .route_get("/contact",               handle_contact_get)
+        .route_post("/contact",              handle_contact_post)
+        .route_get("/cms",                   handle_dashboard)
+        .route_get("/cms/new",               handle_new)
+        .route_get("/cms/edit/{stem}",       handle_edit)
         .route_post("/api/drafts",           handle_create_draft)
         .route_patch("/api/drafts/{stem}",   handle_update_draft)
         .route_post("/api/publish/{stem}",   handle_publish)
         .route_post("/api/unpublish/{stem}", handle_unpublish)
+        .route_delete("/api/drafts/{stem}",  handle_delete_draft)
+        .route_delete("/api/posts/{stem}",   handle_delete_post)
         .run()
 }
-
-fn handle_dashboard(req: &Request) -> Result<Response> {
-    let author    = req["auth_username"].as_str().unwrap_or("");
-    let drafts    = req.list_json("content/drafts/")?;
-    let published = req.list_json("content/posts/")?;
-    Response::render_with("templates/cms/dashboard.html", req, json!({
-        "drafts":    drafts,
-        "published": published,
-        "author":    author,
-    }))
-}
-
-fn handle_new(req: &Request) -> Result<Response> {
-    Response::render_with("templates/cms/editor.html", req, json!({"new": true}))
-}
-
-fn handle_edit(req: &Request) -> Result<Response> {
-    let stem = req["stem"].as_str().ok_or(Error::NotFound)?;
-    let post = req.read_json(&format!("content/drafts/{}.json", stem))
-        .or_else(|_| req.read_json(&format!("content/posts/{}.json", stem)))?;
-    Response::render_with("templates/cms/editor.html", req, post)
-}
-
-fn handle_create_draft(req: &Request) -> Result<Response> {
-    let body: Value = req.body_json()?;
-    let stem  = req["title"].as_str().unwrap_or("untitled").to_slug();
-    let draft = json!({
-        "stem":   stem,
-        "title":  body["title"],
-        "body":   body["body"],
-        "author": req["auth_username"],
-        "date":   today_iso8601(),
-    });
-    req.write_json(&format!("content/drafts/{}.json", stem), &draft)?;
-    Response::json_status(json!({"stem": stem}), 201)
-}
-
-fn handle_update_draft(req: &Request) -> Result<Response> {
-    let stem = req["stem"].as_str().ok_or(Error::NotFound)?;
-    let body: Value = req.body_json()?;
-    let path = format!("content/drafts/{}.json", stem);
-    let mut draft = req.read_json(&path)?;
-    if let Some(t) = body.get("title") { draft["title"] = t.clone(); }
-    if let Some(b) = body.get("body")  { draft["body"]  = b.clone(); }
-    req.write_json(&path, &draft)?;
-    Response::json(json!({"ok": true}))
-}
-
-fn handle_publish(req: &Request) -> Result<Response> {
-    let stem         = req["stem"].as_str().ok_or(Error::NotFound)?;
-    let draft_path   = format!("content/drafts/{}.json", stem);
-    let publish_path = format!("content/posts/{}.json", stem);
-
-    let mut post = req.read_json(&draft_path)?;
-    post["stem"]         = json!(stem);
-    post["path"]         = json!(format!("/blog/{}", stem));
-    post["published_at"] = json!(now_iso8601());
-
-    req.write_json_atomic(&publish_path, &post)?;
-    update_index(req)?;
-    req.touch_site_toml()?;
-    let _ = fs::remove_file(req.site_path(&draft_path));
-
-    Response::json(json!({"published": true, "path": post["path"]}))
-}
-
-fn handle_unpublish(req: &Request) -> Result<Response> {
-    let stem         = req["stem"].as_str().ok_or(Error::NotFound)?;
-    let publish_path = format!("content/posts/{}.json", stem);
-    let draft_path   = format!("content/drafts/{}.json", stem);
-
-    let mut post = req.read_json(&publish_path)?;
-    post["draft"] = json!(true);
-    req.write_json(&draft_path, &post)?;
-    fs::remove_file(req.site_path(&publish_path))?;
-    update_index(req)?;
-    req.touch_site_toml()?;
-
-    Response::json(json!({"unpublished": true}))
-}
-
 ```
+
+The handlers use the file helpers m6-core puts on `Request`.
+`handle_create_draft` writes `content/drafts/{stem}.json`.
+`handle_publish` reads that draft, renders its Markdown body to HTML, writes `content/posts/{stem}.json`, rebuilds the index, touches `site.toml` and deletes the draft.
+`handle_unpublish` moves the post back to `content/drafts/{stem}.json` and rebuilds the index.
+`handle_edit` opens a draft first, then a published CMS post, then a Markdown post from the index, so an editor can edit any post.
 
 ### 6.5. The publish flow
 
-1. Editor saves draft → `POST /api/drafts` or `PATCH /api/drafts/{stem}` writes `content/drafts/{stem}.json`
-2. Editor clicks **Publish** → `POST /api/publish/{stem}`:
-   - render-cms writes `content/posts/{stem}.json` — inotify fires, m6-http evicts `/blog/{stem}` from cache
-   - render-cms writes updated `content/posts/_index.json` — inotify fires, m6-http evicts `/blog`
-   - render-cms touches `site.toml` — m6-http reloads route table, re-expands `[[route_group]]` glob, `/blog/{stem}` route becomes live
-   - render-cms deletes `content/drafts/{stem}.json`
-3. Browser redirects to `/blog/{stem}`
-4. m6-http: route now live, cache miss → m6-html reads `content/posts/{stem}.json`, renders → m6-http caches
-5. Every subsequent request to `/blog/{stem}`: cache hit — RAM only
+A publish moves a draft to the public blog in five steps.
 
-### 6.6. Performance profile
+1. The editor saves a draft, and `POST /api/drafts` or `PATCH /api/drafts/{stem}` writes `content/drafts/{stem}.json`.
+2. The editor publishes, and `POST /api/publish/{stem}` reads that draft.
+3. render-cms renders the Markdown body to HTML, writes `content/posts/{stem}.json` and merges it into `data/posts.json`.
+4. render-cms touches `site.toml`, which makes m6-http reload its routes and clear its cache.
+5. The next request for `/blog/{stem}` is a cache miss, m6-html renders the post from the updated index, and m6-http caches it.
 
-| Request type | Latency |
-|---|---|
-| Public post (cached) | < 1ms — RAM only |
-| Public post (cache miss) | ~5ms — m6-html reads `content/posts/{stem}.json`, renders, caches |
-| CMS dashboard | ~10ms — JWT verified locally, render-cms reads posts directory + drafts directory |
-| Publish | ~5ms — one atomic file write, one inotify event |
+Unpublishing reverses the flow.
+`POST /api/unpublish/{stem}` moves the post back to `content/drafts/{stem}.json`, rebuilds the index and touches `site.toml`.
+A post that came from Markdown survives every index rebuild, because `update_index` keeps the entries the CMS does not own.
 
-### 6.7. `dev.sh`
+### 6.6. Caching
 
-```bash
-#!/bin/bash
-set -e
-SITE="$(cd "$(dirname "$0")" && pwd)"
-trap 'kill $(jobs -p) 2>/dev/null' EXIT
+The edge caches only the public, unauthenticated routes.
+The CMS routes sit behind `require = "group:editors"`, so m6-http never caches them.
+The contact, `/login` and `/_errors` routes are marked `cache = "no-store"`.
 
-m6-html    "$SITE" "$SITE/configs/m6-html.conf" &
-m6-file    "$SITE" "$SITE/configs/m6-file.conf" &
-m6-auth    "$SITE" "$SITE/configs/m6-auth.conf" &
-"$SITE/target/release/render-cms" "$SITE" "$SITE/configs/render-cms.conf" &
-m6-http    "$SITE" "$SITE/configs/system-dev.toml" &
+### 6.7. `dev.sh` and `test.sh`
 
-echo "Running at https://localhost:8443"
-echo "CMS at    https://localhost:8443/cms"
-wait
-```
+`dev.sh` builds m6 and render-cms, writes the TLS and auth keys, creates the admin user, generates `data/posts.json` and starts the stack.
+The stack is m6-html, m6-file, m6-auth-server, render-cms and m6-http.
+When m6-md is installed, it also runs in watch mode over `content/posts/` and touches `site.toml` after each rebuild.
+
+`test.sh` checks the running stack over the wire.
+It has 15 sections, numbered 0 to 14, and every check has one expected answer.
+The summary line prints the pass count, the fail count and the total, and the script deletes its own draft before it ends.
+
+[`m6-core-reference.md`](m6-core-reference.md) owns the `Request` file helpers and the `App` route methods.
+[`m6-md.md`](m6-md.md) owns the Markdown conversion.
+[`m6-site-toml.md`](m6-site-toml.md) owns the `[[route]]`, `require` and `allowed_methods` keys.
+[`m6-http.md`](m6-http.md) owns the cache and its clearing rules.
+[`m6-auth.md`](m6-auth.md) owns the login, refresh and logout responses.
+
+Example 05 completes the full stack and adds the end-to-end suite that section 1 points to.
+Example 06 runs the same site under systemd for production.
 
 ## 7. Example 06, production with systemd
 

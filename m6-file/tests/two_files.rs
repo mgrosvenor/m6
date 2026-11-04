@@ -298,15 +298,47 @@ fn a_touch_alone_reloads() {
 
 #[test]
 fn a_burst_of_writes_is_at_most_two_reloads() {
+    // A burst is writes that land within RELOAD_DEBOUNCE of each other. On a
+    // loaded machine three writes can take longer than that, and the reloader
+    // then rightly reports the late one as a new change (#299). So each attempt
+    // times its own burst and is judged only if it fitted inside the window.
+    // The writes are spaced further apart than the service loop takes to
+    // wake and reload, so a reloader that does not hold changes reports each
+    // write: written back to back, the loop would usually merge them on its
+    // own and the test could not fail.
+    const ATTEMPTS: usize = 5;
+    let window = m6_core::watcher::RELOAD_DEBOUNCE;
     let r = start("");
-    for pad in ["", "# a", "# bb"] {
-        std::fs::write(r.conf(), conf_body(pad, 2)).unwrap();
-        std::thread::sleep(Duration::from_millis(10));
+    for attempt in 0..ATTEMPTS {
+        let before = r.count("Reload complete");
+        let t = std::time::Instant::now();
+        for (i, pad) in ["# a", "# bb", "# ccc"].iter().enumerate() {
+            if i > 0 {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            std::fs::write(r.conf(), conf_body(&format!("{pad}{attempt}"), 2)).unwrap();
+        }
+        let took = t.elapsed();
+        assert!(
+            wait_for(&r, "Reload complete", before + 1),
+            "{}",
+            r.svc.output()
+        );
+        // A held report comes at most RELOAD_POLL after the first, so this is
+        // a bound taken from the reloader, not a guess.
+        std::thread::sleep(m6_core::watcher::RELOAD_POLL + Duration::from_millis(500));
+        if took >= window {
+            continue;
+        }
+        let n = r.count("Reload complete") - before;
+        assert!(
+            (1..=2).contains(&n),
+            "{n} reloads for a burst of {took:?}\n{}",
+            r.svc.output()
+        );
+        return;
     }
-    assert!(wait_for(&r, "Reload complete", 1), "{}", r.svc.output());
-    std::thread::sleep(Duration::from_millis(1_500));
-    let n = r.count("Reload complete");
-    assert!((1..=2).contains(&n), "{n} reloads\n{}", r.svc.output());
+    panic!("no burst of three writes fitted inside {window:?} in {ATTEMPTS} attempts");
 }
 
 #[test]
