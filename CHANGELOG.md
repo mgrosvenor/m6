@@ -115,6 +115,9 @@ Comments only.
 
 ### Changed
 
+**Debug and test builds carry line tables only, and no debug information for dependencies, so a full test build is 3.7 GB instead of 12 GB (#303).**
+Every file under a crate's `tests/` is its own binary, and each linked every dependency with full debug information. A full check filled about 16 GB, more than a hosted CI runner's free disk, and CI jobs died mid-build. Measured on the build host on one commit with `cargo test --workspace --no-run`: `target/debug` went from 12 GB to 3.7 GB and the build from 411 s to 282 s. Backtraces still show file and line.
+
 **The m6-auth-cli integration tests assert that each setup command succeeds, and print its stderr when one does not (#258).**
 A failed setup command used to surface later as an unrelated count assertion.
 
