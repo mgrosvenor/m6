@@ -95,7 +95,7 @@ The wins and losses below follow from `BENCHMARKS.md`, and each points to the fi
 **Where m6 does not win.**
 
 - **HTTP/1.1 throughput.**
-  The HTTP/1.1 throughput figures in section 2 are the slowest of the three.
+  The HTTP/1.1 throughput figures in section 2 trail the HTTP/2 figures.
   The HTTP/1.1 path also has a synchronous backend call that blocks the event loop during a cache miss.
 - **Multi-core scale within one instance.**
   One m6-http process uses one core, and nginx, HAProxy and Envoy use multiple cores in one instance.
