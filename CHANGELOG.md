@@ -57,6 +57,16 @@ Googlebot verifies only under `googlebot.com` and `google.com`. A name under `go
 **CI runs the workspace under the address and leak sanitisers on pushes to `develop`, in a workflow of its own, and fails when the sanitiser is unavailable (#164).**
 A probe compiles and runs a trivial program with the same flags before the suite, so a missing runtime or a rejected flag fails the job in seconds instead of passing while measuring nothing.
 
+### Security
+
+**A query key or form field can no longer replace a path parameter, and m6-file serves only the file its route's pattern addresses (#279).**
+Core checked every path parameter for `..` and stray characters, then added each query parameter to the same request dictionary under the same name.
+A request such as `GET /assets/a.css?relpath=../config` therefore reached m6-file with the unchecked query value as `relpath`, and m6-file served the file it named, outside the site directory.
+Core now leaves a path parameter in place when a query key or form field has its name.
+**Behaviour change:** a template that read a query value under a path parameter's name now gets the path value, and reads the query value as `query.<name>`.
+m6-file now reads `relpath`, `filename` and each `root` placeholder only when the route's pattern captures that name, and checks each with core's path-parameter rule (a slash only in a `{*name}` capture). A name the pattern does not capture is never taken from the query, so `?relpath=` on a `{filename}` route cannot pick a file in a subdirectory, and a `root` placeholder the pattern does not capture is a 404.
+Verified with `l2_query_relpath_cannot_replace_the_path_parameter` and `l2_query_relpath_cannot_choose_a_file_on_a_filename_route`, which send those requests over HTTP. The first fails on the previous code with `200 OK` and the service's config in the body. `a_dotdot_relpath_in_the_dictionary_is_404` covers m6-file's own check.
+
 ### Fixed
 
 **CI runs example 05's integration test after its stack is up (#277).**
