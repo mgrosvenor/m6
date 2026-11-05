@@ -106,15 +106,36 @@ LOG=/tmp/m6-build-host-tests.log
 EXAMPLES_LOG=/tmp/m6-build-host-examples.log
 
 # Copy one file back from the build host to the laptop checkout, so a record the
-# build host wrote becomes part of the commit. rsync handles a local source and
-# destination, so a local directory can stand in for the build host in a test.
-# Source and destination are the arguments, so the transport is the only thing
-# this knows about.
+# build host wrote becomes part of the commit. The file is append-only, so the
+# records are merged rather than overwritten: the laptop's lines are kept and the
+# build host's lines that the laptop does not already hold are appended. The build
+# host is not backed up, so a recreated host that holds only one fresh record must
+# not overwrite the committed history with it.
 copy_back() {
     local src="$1"
     local dst="$2"
+    local fetched
+    fetched="$(mktemp "${TMPDIR:-/tmp}/m6-perf-history.XXXXXX")" \
+        || die "cannot make a temp file for $src"
     # shellcheck disable=SC2086
-    rsync -az -e "ssh $SSH_OPTS" "$src" "$dst" || die "cannot copy $src back to $dst"
+    rsync -az -e "ssh $SSH_OPTS" "$src" "$fetched" \
+        || { rm -f "$fetched"; die "cannot copy $src back to $dst"; }
+    if [[ ! -s "$fetched" ]]; then
+        rm -f "$fetched"
+        die "cannot copy $src back to $dst: the file is empty"
+    fi
+    if [[ ! -f "$dst" ]]; then
+        mv "$fetched" "$dst"
+        return 0
+    fi
+    # Append only the build host's lines the laptop does not already hold, so a
+    # recreated build host cannot shorten the committed history.
+    {
+        cat "$dst"
+        awk 'NR==FNR { seen[$0]=1; next } !seen[$0]++' "$dst" "$fetched"
+    } > "$dst.merged"
+    mv "$dst.merged" "$dst"
+    rm -f "$fetched"
 }
 
 # ── Where the examples are ───────────────────────────────────────────────────
@@ -290,7 +311,7 @@ REMOTE
 # perfcheck appended one record to tools/perf-history.jsonl on the build host,
 # the only place it runs. The sync above excludes that file so --delete keeps it,
 # but nothing copied it back, so the committed history never gained a record.
-# Copy it back now, pass or fail, because a run that failed is the one a later
+# Merge it back now, pass or fail, because a run that failed is the one a later
 # reader most wants the conditions for.
 copy_back "$BUILD_HOST:$BUILD_ROOT/m6/tools/perf-history.jsonl" "$ROOT/tools/perf-history.jsonl"
 info "commit tools/perf-history.jsonl; the next run refuses a dirty tree until you do"
