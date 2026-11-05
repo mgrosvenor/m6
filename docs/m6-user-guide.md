@@ -19,6 +19,7 @@ Sections 2 to 12 walk Examples 01 to 11 in order.
 10. [Example 09, global deployment](#10-example-09-global-deployment)
 11. [Example 10, API tokens](#11-example-10-api-tokens)
 12. [Example 11, admin dashboard API](#12-example-11-admin-dashboard-api)
+13. [Summary](#13-summary)
 
 ## 1. Before you start
 
@@ -1693,9 +1694,9 @@ Example 08 adds a log viewer that tails the JSON logs in the browser.
 
 ## 9. Example 08, log viewer
 
-`examples/08-logviewer/`
-
-A real-time log viewer built into the site. m6-http writes JSON-format logs to disk. A browser UI polls a tail endpoint served by m6-file and renders incoming lines with filtering and search. Demonstrates `format = "json"` logging and m6-file's byte-range tail mode.
+Example 08 adds a real-time log viewer to the site.
+m6-http writes JSON logs, m6-file serves them from a byte offset, and a browser page polls and renders the new lines.
+The example demonstrates `format = "json"` logging and m6-file's tail mode.
 
 ```bash
 cd examples/08-logviewer
@@ -1703,90 +1704,127 @@ cd examples/08-logviewer
 # open https://localhost:8443/logs
 ```
 
----
+The stack is three processes: m6-http, m6-html and m6-file.
+`dev.sh` redirects each process's output to its own file under `logs/`, so the viewer has one file per process.
+
+`site.toml` sets `format = "json"` and `level = "debug"`, and routes `/logs/tail/{relpath}` straight to m6-file.
+A direct route, not a `route_group`, so m6-http forwards the request without requiring the log files to exist at startup.
+
+`configs/m6-file.conf` turns on tail mode for the log files:
+
+```toml
+[[route]]
+path = "/logs/tail/{*relpath}"
+handler = "files"
+root = "logs/"
+tail = true
+```
+
+The browser polls `GET /logs/tail/<name>.log?offset=N`.
+m6-file returns the bytes from that offset and the `X-Log-End` header, which the client reads for the next offset.
+The route is marked uncacheable.
+
+[`m6-file.md`](m6-file.md) owns the tail handler and its headers.
+[`m6-site-toml.md`](m6-site-toml.md) owns `format` and `level`.
 
 ## 10. Example 09, global deployment
 
-`examples/09-global-deployment/`
-
-A multi-region deployment: an origin node runs the full m6 stack, and multiple cache nodes around the world run m6-http in pure proxy mode. A private mesh network connects all nodes. Cache invalidation propagates from origin to all cache nodes on publish. Demonstrates horizontal scale-out across regions without a CDN.
+Example 09 is a multi-node deployment: one origin runs the full stack, and cache nodes around it run m6-http in pure proxy mode.
+A private *WireGuard* mesh connects the nodes, and cache invalidation propagates from the origin to every cache node on publish.
 
 ```bash
 cd examples/09-global-deployment
 # See setup-origin.sh and setup-cache-node.sh
 ```
 
----
+The origin serves the Example 07 site and answers the public domain.
+Each cache node runs only m6-http, pointing at the origin over the mesh, and caches responses independently.
+`setup-origin.sh` provisions the origin and `setup-cache-node.sh` provisions a cache node, both writing a system config, the WireGuard interface and the systemd unit.
+`deploy.sh` syncs content to the origin and, with `--all --invalidate`, to the cache nodes, then touches `site.toml` on each node to flush its cache.
+
+The example uses its own node names and addresses, held in `deploy.toml`, which is a local file never committed.
+The configs under `configs/` and the `wireguard/` files are the node-specific settings.
 
 ## 11. Example 10, API tokens
 
-`examples/10-api-tokens/`
-
-Adds long-lived API tokens for scripts and services. Unlike session cookies (15-minute TTL, browser only), an API token is a JWT passed as `Authorization: Bearer <token>` and can be valid for days or months. m6-http verifies Bearer tokens the same way it verifies session cookies — same EC key, same `require` rules. No special server configuration is needed.
+Example 10 adds long-lived API tokens for scripts and services.
+A token is a *JWT* (JSON Web Token) passed as `Authorization: Bearer <token>`, and m6-http verifies it with the same key and the same `require` rules as a session cookie.
 
 ```bash
 cd examples/10-api-tokens
+./setup.sh
 ./dev.sh
 ```
 
+`setup.sh` creates the `api` user with the `api` and `user` roles.
+
 ### 11.1. When to use API tokens
+
+Table 3 compares a session cookie with an API token.
+Take from it that the token is the machine-friendly form of the same credential.
 
 | | Session cookie | API token |
 |---|---|---|
-| Caller | Browser | Script / service / CI |
-| Lifetime | 15 min (refreshes to 30 days) | Configurable (default 30 days) |
+| Caller | Browser | Script, service or *CI* (continuous integration) |
+| Lifetime | 15 minutes, refreshes to 30 days | Configurable, default 365 days |
 | Transport | `Cookie: session=...` | `Authorization: Bearer ...` |
 | Issuance | `POST /auth/login` | `m6-auth-cli token create` |
 | Revocation | `POST /auth/logout` | `m6-auth-cli token revoke` |
 
+**Table 3: session cookie versus API token.**
+Both are signed with the same *EC* (Elliptic Curve) key, and `require` accepts either.
+
 ### 11.2. Setup
 
+Create a user, issue a token, then use it:
+
 ```bash
-# 1. Create a user with the roles your API needs
 m6-auth-cli configs/m6-auth.conf user add api --role api --role user --password secret
 
-# 2. Issue a token
 TOKEN=$(m6-auth-cli configs/m6-auth.conf token create api --name ci-pipeline --ttl-days 30)
 echo "$TOKEN"
 # eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9...
 
-# 3. Use it
 curl -sk https://localhost:8443/api/data \
      -H "Authorization: Bearer $TOKEN"
 ```
 
+The default token lifetime is 365 days, and `--ttl-days` shortens it.
+`--name` defaults to `api-token`.
+
 ### 11.3. `site.toml`, protecting an API endpoint
 
+One `require` key protects an endpoint for both session cookies and Bearer tokens:
+
 ```toml
-# API endpoint — requires a valid Bearer token with role 'api'
 [[route]]
 path    = "/api/data"
 backend = "m6-html"
 require = "role:api"
 ```
 
-`require = "role:api"` works for both session cookies and Bearer tokens. A browser user logged in with the `api` role can also access the route. For endpoints that should be machine-only, use a dedicated role name like `api` and never assign it to regular user accounts.
+A browser user with the `api` role can also reach the route.
+For a machine-only endpoint, use a dedicated role and never assign it to a login account.
 
 ### 11.4. Token management
 
 ```bash
-# List active tokens for a user
 m6-auth-cli configs/m6-auth.conf token ls api
-# NAME            ID                                    CREATED     EXPIRES
-# ci-pipeline     550e8400-e29b-41d4-a716-446655440000  2026-03-21  2026-04-20
+# ID                                    NAME          CREATED     EXPIRES
+# 550e8400-e29b-41d4-a716-446655440000  ci-pipeline   2026-03-21  2026-04-20
 
-# List as JSON
 m6-auth-cli configs/m6-auth.conf token ls api --json
 
-# Revoke by ID
 m6-auth-cli configs/m6-auth.conf token revoke 550e8400-e29b-41d4-a716-446655440000
 ```
 
-**Revocation note:** `token revoke` removes the token from the database and the listing. Because JWTs are stateless, a revoked token remains cryptographically valid until its `exp` claim. For immediate revocation, use `--ttl-days 1` so tokens expire quickly on their own.
+`token revoke` removes the token from the database and the listing.
+The *JWT* itself stays cryptographically valid until its `exp` claim, because verification is stateless.
+For immediate revocation, use a short `--ttl-days`.
 
 ### 11.5. Template variables in protected routes
 
-When a request carries a valid Bearer token, m6-html templates can access the caller's identity via the `auth` object — the same object available after browser login:
+A request with a valid Bearer token gives m6-html templates the same `auth` object as a browser login:
 
 ```html
 <p>Caller: {{ auth.username }}</p>
@@ -1795,30 +1833,20 @@ When a request carries a valid Bearer token, m6-html templates can access the ca
 
 ### 11.6. Functional tests
 
-`test.sh` in the example directory runs against a live server:
+`test.sh` runs against a started stack:
 
 ```bash
-# In one terminal
-./dev.sh
-
-# In another
-./test.sh
+./dev.sh    # one terminal
+./test.sh   # another
 ```
 
-Tests cover: public access, 401 on unauthenticated access, token create/list/revoke, role enforcement, and custom error pages.
-
-
----
+The checks cover public access, a 401 without a token, token create, list and revoke, role enforcement and the error page.
 
 ## 12. Example 11, admin dashboard API
 
-`examples/11-admin-dashboard/`
-
-A self-hosting management API and AJAJ dashboard for m6 sites. All endpoints return a single JSON blob — one blob per "tab". Built as a custom renderer (`render-admin`) using `App::with_global`.
-
-All `/api/admin/*` routes are protected by `require = "role:admin"` in `site.toml`. Only requests carrying a valid Bearer token (or session cookie) with the `admin` role are accepted.
-
-The static AJAJ dashboard (`public/index.html`) is served by `m6-file` at `https://localhost:8444/`. It uses skeleton-loading (shimmer placeholders animate immediately; AJAX fills in real data) and auto-refreshes every 10 seconds. Six tabs: Perf, System, Bench, Logs, Routes, Config.
+Example 11 is a self-hosting management API and dashboard for an m6 site.
+It is a custom renderer, `render-admin`, built on `App::with_global`.
+Every `/api/admin/*` route is protected by `require = "role:admin"`.
 
 ```bash
 cd examples/11-admin-dashboard
@@ -1827,143 +1855,57 @@ cd examples/11-admin-dashboard
 # open https://localhost:8444/
 ```
 
+The dashboard is served by m6-file at `https://localhost:8444/` and refreshes every 10 seconds.
+It has six tabs: Perf, System, Bench, Logs, Routes and Config.
+
 ### 12.1. API endpoints
 
+Table 4 lists the endpoints the renderer registers.
+Take from it that the first twelve manage the dashboard tabs, and the last five report backend and m6-http statistics.
+
 | Method | Path | Returns |
-|--------|------|---------|
-| `GET` | `/api/admin/perf` | Last N "periodic stats" entries from m6-http log |
-| `GET` | `/api/admin/routes` | Per-route request counts, cache rates, avg latency |
-| `GET` | `/api/admin/system` | CPU%, RAM, disk usage, uptime |
-| `GET` | `/api/admin/bench` | Bench targets taken from the `[server].bind` in the system config |
-| `POST` | `/api/admin/bench` | Start a bench job → `{ "job_id": "..." }` |
-| `GET` | `/api/admin/bench/{id}` | Poll job status and output |
-| `GET` | `/api/admin/logs` | Last N log lines as JSON array |
-| `GET` | `/api/admin/config` | site.toml parsed as a JSON object |
+|---|---|---|
+| `GET` | `/api/admin/perf` | Last N periodic stats entries |
+| `GET` | `/api/admin/routes` | Per-route request counts, cache rates and latency |
+| `GET` | `/api/admin/system` | CPU, memory, disks and uptime |
+| `GET` | `/api/admin/bench` | Bench targets from the system config bind |
+| `POST` | `/api/admin/bench` | Start a bench job, returning a job id |
+| `GET` | `/api/admin/bench/{id}` | Poll a bench job |
+| `GET` | `/api/admin/logs` | Last N log lines |
+| `GET` | `/api/admin/config` | site.toml as a JSON object |
 | `PUT` | `/api/admin/config` | Write site.toml from a JSON object |
-| `POST` | `/api/admin/config/touch` | Touch site.toml → triggers m6-http hot reload |
-| `POST` | `/api/admin/cache/flush` | Alias for config/touch |
+| `POST` | `/api/admin/config/touch` | Touch site.toml to reload |
+| `POST` | `/api/admin/cache/flush` | Alias for config touch |
 | `POST` | `/api/admin/services/{name}/restart` | Send SIGTERM to a service via its PID file |
+| `GET` | `/api/admin/backends` | Backend topology and the system config bind |
+| `GET` | `/api/admin/backends/{name}/sample` | One backend's stats over the sample window |
+| `GET` | `/api/admin/backends/{name}/alltime` | One backend's stats over all time |
+| `GET` | `/api/admin/m6http/sample` | m6-http's own stats over the sample window |
+| `GET` | `/api/admin/m6http/alltime` | m6-http's own stats over all time |
+
+**Table 4: the seventeen `/api/admin` endpoints.**
+`site.toml` must declare `allowed_methods` with `PUT`, or the edge answers `PUT /api/admin/config` with a 405.
 
 ### 12.2. JSON blob shapes
 
-**`GET /api/admin/perf?n=60`**
-```json
-{
-  "history": [
-    {
-      "ts": "2026-03-22T10:00:00Z",
-      "rps_avg": 120, "rps_peak": 340,
-      "latency_p50_us": 480, "latency_p99_us": 1900,
-      "cache_hits": 85, "cache_misses": 15, "cache_hit_rate": 0.85,
-      "backend_errors": 0, "pool_members": 4
-    }
-  ]
-}
-```
-Each entry is one "periodic stats" log event (emitted every 10 s by m6-http). Pass `?n=N` to limit history length.
-
-**`GET /api/admin/system`**
-```json
-{
-  "uptime_secs": 86400,
-  "cpu_usage_pct": 14.2,
-  "memory": { "used_bytes": 512000000, "total_bytes": 8000000000, "used_pct": 6.4 },
-  "disks": [
-    { "mount": "/", "used_bytes": 10000000000, "total_bytes": 50000000000, "used_pct": 20.0 }
-  ]
-}
-```
-
-**`GET /api/admin/bench`**
-```json
-{
-  "targets": [
-    { "id": "h1",  "label": "HTTP/1.1 127.0.0.1:8444", "addr": "127.0.0.1:8444", "proto": "h1" },
-    { "id": "h2",  "label": "HTTP/2   127.0.0.1:8444", "addr": "127.0.0.1:8444", "proto": "h2" },
-    { "id": "h3",  "label": "HTTP/3   127.0.0.1:8444", "addr": "127.0.0.1:8444", "proto": "h3" },
-    { "id": "all", "label": "All      127.0.0.1:8444", "addr": "127.0.0.1:8444", "proto": "all" }
-  ]
-}
-```
-Targets are taken from the `[server].bind` in the system config, the file render-admin's `system_toml` key names (`configs/system-dev.toml` in this example). With no bind there, the list is empty and `/api/admin/backends` reports `"bind": null`.
-
-**`POST /api/admin/bench`**
-```json
-// Request body:
-{ "addr": "127.0.0.1:8444", "proto": "h1", "duration_secs": 10, "concurrency": 50 }
-
-// Response:
-{ "job_id": "550e8400-e29b-41d4-a716-446655440000" }
-```
-
-**`GET /api/admin/bench/{id}`**
-```json
-{
-  "id": "550e8400-e29b-41d4-a716-446655440000",
-  "target": "127.0.0.1:8444 (h1)",
-  "status": "done",
-  "output": "Requests/sec: 42000\nLatency p50: 0.4ms ...",
-  "started_at": 1742641200,
-  "finished_at": 1742641210
-}
-```
-`status` is `"running"`, `"done"`, or `"failed"`.
-
-**`GET /api/admin/routes?n=10000`**
-```json
-{
-  "sample_requests": 8234,
-  "sample_window_secs": 600,
-  "routes": [
-    { "path": "/", "requests": 4100, "cache_hits": 3900, "cache_misses": 200, "hit_rate": 0.951, "avg_latency_us": 120 },
-    { "path": "/blog", "requests": 2800, "cache_hits": 2650, "cache_misses": 150, "hit_rate": 0.946, "avg_latency_us": 180 }
-  ]
-}
-```
-Routes are sorted by request count descending. Pass `?n=N` to limit the sample window (number of "request complete" log entries examined). `sample_window_secs` is the approximate wall-clock span covered; `null` if timestamps are absent in the log.
-
-**`GET /api/admin/logs?n=100`**
-```json
-{ "lines": ["log line 1", "log line 2", ...], "total_lines": 5432 }
-```
-
-**`GET /api/admin/config`**
-```json
-{
-  "path": "/path/to/site.toml",
-  "config": {
-    "server": { "bind": "127.0.0.1:8444", "tls_cert": "...", "tls_key": "..." },
-    "backend": [{ "name": "render-admin", "socket": "/tmp/m6/render-admin.sock" }],
-    "route": [{ "path": "/api/admin/*", "backend": "render-admin", "require": "role:admin" }]
-  }
-}
-```
-The full site.toml is parsed and returned as a JSON object. All TOML types (strings, integers, arrays, nested tables) are preserved.
-
-**`PUT /api/admin/config`**
-```json
-// Request body: the "config" object from GET, with your modifications
-{
-  "server": { "bind": "127.0.0.1:8444", ... },
-  "route": [...]
-}
-```
-The JSON object is converted back to TOML, validated, and written atomically. Returns `{ "ok": true }` on success or `{ "error": "..." }` on validation failure. The original file is never modified if validation fails.
-
-**`POST /api/admin/services/{name}/restart`**
-```json
-{ "ok": true, "pid": 12345 }
-```
-Sends SIGTERM to the process whose PID is in the service's configured PID file.
+The endpoints return a single JSON blob each.
+`GET /api/admin/perf?n=60` returns the recent periodic stats entries, and `GET /api/admin/system` returns the host figures.
+`GET /api/admin/bench` lists the targets taken from the `[server] bind` in the system config, one per protocol.
+`POST /api/admin/bench` starts a job and `GET /api/admin/bench/{id}` polls it.
+`GET /api/admin/routes?n=10000` samples the request-complete log and returns per-route counts and hit rates, sorted by request count.
+`GET /api/admin/logs?n=100` returns the last log lines.
+`GET /api/admin/config` returns site.toml parsed as JSON, and `PUT` writes it back after validation, atomically.
+`POST /api/admin/services/{name}/restart` sends SIGTERM to the process whose PID is in the configured PID file.
 
 ### 12.3. Config: `render-admin.conf`
 
-The renderer reads its settings from the m6-render user config dict:
+The renderer reads its settings from its config:
 
 ```toml
 socket           = "/tmp/m6/render-admin.sock"
 log_file         = "/tmp/m6/m6-http-admin.log"
 site_toml        = "site.toml"
+system_toml      = "configs/system-dev.toml"
 perf_history     = 60
 routes_sample    = 10000
 log_tail_default = 100
@@ -1980,34 +1922,35 @@ name     = "render-admin"
 pid_file = "/tmp/m6/render-admin.pid"
 ```
 
+`system_toml` names the system config whose `[server] bind` supplies the bench targets.
+The `[[services]]` list names the processes the restart endpoint can signal.
+
 ### 12.4. Tests
 
-44 tests covering all six modules run on every `cargo test`:
-
-```bash
-cargo test -p render-admin
-
-# Output:
-# running 44 tests
-# test bench_tests::targets_discovered_from_site_toml ... ok
-# test routes_tests::aggregates_per_path ... ok
-# test ops_tests::config_write_json_blob_round_trips ... ok
-# ... (44 total)
-# test result: ok. 44 passed; 0 failed
-```
-
-Tests cover: perf log parsing (field completeness, N-limiting), per-route aggregation (hit rate, latency, sample window, sort order), system metrics shape, bench target discovery, async job lifecycle, log tail content, config read/write/touch round-trip, null rejection, and service restart.
+`cargo test -p render-admin` runs the unit and integration suites for the five modules, `bench`, `logs`, `ops`, `perf` and `system`.
+They cover perf log parsing, per-route aggregation, system metrics shape, bench target discovery, the job lifecycle, log tail content, config read and write round-trips, and service restart.
 
 ### 12.5. Functional tests
 
-`test.sh` tests against a live server:
+`test.sh` runs against a started stack:
 
 ```bash
-# Terminal 1
-./dev.sh
-
-# Terminal 2
-./test.sh
+./dev.sh    # one terminal
+./test.sh   # another
 ```
 
-Tests: unauthenticated 401, all GET endpoints return correct JSON keys, config touch/flush returns 200, unknown service returns 404.
+The checks cover a 401 without a token, the JSON keys of each endpoint, config touch and flush, and an unknown service returning 404.
+
+## 13. Summary
+
+The guide walked eleven examples, from a static page to a global fleet.
+Each example adds one capability to the last, and each runs from its own directory in `m6-examples`.
+Example 05 is the first to run the whole stack, and its end-to-end suite is the check that the install works.
+
+A reader who wants the config keys, the core components or the service internals goes to the owning documents:
+
+- [`m6-site-toml.md`](m6-site-toml.md) owns every config key and the split between `site.toml` and the system config.
+- [`m6-core-reference.md`](m6-core-reference.md) owns the components a renderer links.
+- [`m6-http.md`](m6-http.md) owns the cache and its clearing rules.
+- [`m6-auth.md`](m6-auth.md) and [`m6-auth-cli.md`](m6-auth-cli.md) own login, tokens and the CLI.
+- [`m6-file.md`](m6-file.md), [`m6-render.md`](m6-render.md) and [`m6-render-lib.md`](m6-render-lib.md) own the file handler and the renderer.
