@@ -64,7 +64,7 @@ Each `[[backend]]` with `sockets` is a pool. m6-http discovers pool members by w
 3. **Route match** — forward to backend pool
 4. **No match** — 404 per `[errors] mode`
 
-Route matching: specificity wins. Exact before parameterised. Longer before shorter.
+Route matching: a fixed path beats a pattern. Two patterns that can match one path are a configuration error at load, and `--dump-config` fails the same way (see `m6-site-toml.md`, Route Matching).
 
 ---
 

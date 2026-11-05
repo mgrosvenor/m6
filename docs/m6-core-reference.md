@@ -198,9 +198,13 @@ Both return `Result`, so a service that cannot build its state fails at startup,
 `.on_destroy(...)` gives the global a teardown hook and `.on_destroy_thread(...)` gives the thread value one.
 `.on_reload(...)` runs after a reload has built and checked the new state, before that state and log level are installed, so a hook that returns `Err` keeps the previous configuration serving.
 
-Routing: `compile_pattern` turns `/blog/{stem}` into `Vec<Segment>`, `route_specificity` scores a compiled route so a literal beats a parameter, and `match_route` returns `PathParams` as a `Vec<(String, String)>` because order is meaningful and duplicates are possible.
+Routing: `compile_pattern` turns `/blog/{stem}` into `Vec<Segment>`, `match_route` returns `PathParams` as a `Vec<(String, String)>` because order is meaningful and duplicates are possible.
 `find_route` picks the winner.
-Route matching existed three times before this, twice hand-rolled with different specificity rules, so the same route table could resolve differently in two services.
+`RouteTable` indexes the compiled routes: a fixed route is one hash lookup on its path, and `find_route` tries the pattern routes only when no fixed route answers.
+`check_route_conflicts` runs once when a config loads and refuses what would need a tie-break: two fixed routes on one path, or two patterns that can both match some path, where the same request method reaches both.
+`Methods` is the set of methods a route answers, so a conflict needs the sets to meet and `find_route` tests one bit.
+m6-http builds `RouteDecl`s from `site.toml` and calls the same check.
+Route matching existed three times before this, twice hand-rolled with different precedence rules, so the same route table could resolve differently in two services.
 
 The thread pool: `ThreadPool::new(size, queue_size)`, or `new_with_exit(size, queue_size, on_thread_exit)` to run a callback when each worker thread ends.
 `submit` returns `false` when the queue is full, which is how the loop sheds load with a 503 instead of growing a backlog.

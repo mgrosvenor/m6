@@ -530,7 +530,7 @@ In an app, `req.touch("site.toml")` touches the file the app reads, which is the
 
 ## 5. Route Matching
 
-Specificity wins: exact paths beat parameterised, longer beats shorter. First declaration breaks ties among equal-specificity patterns (with a warning logged).
+A fixed route (every segment a literal) beats a pattern route (any `{param}` or `{*rest}`). Two fixed routes with the same path, and two pattern routes that can both match some path (`/blog/{slug}` with `/blog/{name}`, `/blog/{slug}` with `/blog/{*rest}`, `/{lang}/about` with `/blog/{slug}`), are a configuration error: the edge refuses to start, and `--dump-config` fails the same way. The edge applies the same rule as the services, so a `site.toml` route table and a backend's own route table are refused by the same test. A `[[route]]` here names no methods, so it answers every method.
 
 ---
 

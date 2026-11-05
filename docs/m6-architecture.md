@@ -597,8 +597,8 @@ Table 11 gives them by area.
 
 | area | decision | why |
 |---|---|---|
-| routing | most specific route wins, decided when a route is compiled | the answer must not depend on the order of blocks in a file somebody edits later |
-| routing | a literal beats a parameter, a parameter beats a wildcard | adding a catch-all would otherwise quietly capture traffic from the exact routes beside it |
+| routing | a fixed route beats a pattern, and two routes a request could both reach are a config error at load | the answer must not depend on the order of blocks in a file somebody edits later, and a request then needs no tie-break |
+| routing | a route lists the methods it answers, and no list means every method | a code POST handler and a config GET page can share a path |
 | routing | `{*name}` spans segments and is legal only last | a wildcard in the middle has no single correct split, and making the last parameter implicitly greedy would change the meaning of every route already written |
 | routing | a route naming a handler no code registered is fatal at startup and refused on reload | a route that 404s while the config says it should serve is an outage that looks like a missing page |
 | routing | the same parameter syntax in `site.toml` and in a backend's config | one syntax to learn, and one matcher to be correct |

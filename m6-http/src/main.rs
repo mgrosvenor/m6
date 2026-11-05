@@ -4233,6 +4233,11 @@ fn run(args: Vec<String>) -> i32 {
     // to it, and a redirect config that started a listener instead of printing
     // would hold :80 on the very node the deploy was still checking.
     if cli.dump_config {
+        // Start refuses a route table that does not build, so the dump does.
+        if let Err(e) = RouteTable::from_config(&config) {
+            eprintln!("route table error: {}", e);
+            return 2;
+        }
         match serde_json::to_string_pretty(&config) {
             Ok(s) => {
                 println!("{}", s);

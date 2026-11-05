@@ -2,8 +2,8 @@
 //!
 //! Route matching is implemented twice. The edge maps a request path to a
 //! backend with the `matchit` crate (`m6_http_lib::router`), and `m6-core` maps
-//! a request path to a template or a handler with its own compiled segments and
-//! specificity score (`m6_core::app`).
+//! a request path to a template or a handler with its own compiled segments
+//! and fixed-then-pattern lookup (`m6_core::app`).
 //!
 //! A site author writes the same pattern vocabulary in both places: `site.toml`
 //! names `/blog/{stem}` and a backend's own config names `/blog/{stem}` too. So
@@ -19,37 +19,40 @@
 
 use std::sync::Arc;
 
-use m6_core::app::{compile_pattern, route_specificity, CompiledRoute, RouteMethod};
+use m6_core::app::{
+    check_route_conflicts, compile_pattern, CompiledRoute, Methods, RouteDecl,
+    RouteTable as CoreTable,
+};
 use m6_http_lib::router::RouteTable;
 use serde_json::Map;
 
 /// A core route table from patterns alone, which is what the edge's table is.
-fn core_routes(patterns: &[&str]) -> Vec<CompiledRoute> {
-    patterns
-        .iter()
-        .map(|p| {
-            let segments = compile_pattern(p);
-            let specificity = route_specificity(&segments);
-            CompiledRoute {
-                pattern: (*p).to_string(),
-                method: RouteMethod::Any,
-                segments,
-                template: Some("t.html".to_string()),
-                params_files: vec![],
-                status: 200,
-                cache: "public".to_string(),
-                headers: vec![],
-                specificity,
-                last_modified: None,
-                handler: None,
-                settings: Arc::new(Map::new()),
-                base_dict: Arc::new(Map::new()),
-            }
-        })
-        .collect()
+fn core_routes(patterns: &[&str]) -> CoreTable {
+    CoreTable::new(
+        patterns
+            .iter()
+            .map(|p| {
+                let segments = compile_pattern(p);
+                CompiledRoute {
+                    pattern: (*p).to_string(),
+                    methods: Methods::ANY,
+                    segments,
+                    template: Some("t.html".to_string()),
+                    params_files: vec![],
+                    status: 200,
+                    cache: "public".to_string(),
+                    headers: vec![],
+                    last_modified: None,
+                    handler: None,
+                    settings: Arc::new(Map::new()),
+                    base_dict: Arc::new(Map::new()),
+                }
+            })
+            .collect(),
+    )
 }
 
-fn core_winner<'a>(routes: &'a [CompiledRoute], path: &str) -> Option<&'a str> {
+fn core_winner<'a>(routes: &'a CoreTable, path: &str) -> Option<&'a str> {
     m6_core::app::find_route(path, "GET", routes).map(|(r, _)| r.pattern.as_str())
 }
 
@@ -123,8 +126,8 @@ fn the_two_matchers_agree_on_what_sites_actually_write() {
 
 /// Precedence, where the two use different mechanisms and reach the same answer.
 ///
-/// The edge uses `matchit`'s radix priority. Core scores segment count times
-/// two, plus one per literal, minus one per wildcard. A literal has to beat a
+/// The edge uses `matchit`'s radix priority. Core looks a fixed route up by its
+/// path and tries the patterns only after that. A literal has to beat a
 /// parameter in both, and it does.
 #[test]
 fn the_two_matchers_agree_that_a_literal_beats_a_parameter() {
@@ -189,35 +192,26 @@ fn core_collapses_empty_path_segments_and_the_edge_does_not() {
     }
 }
 
-/// **Pinned divergence, issue #177: a pattern pair one side refuses.**
+/// Both matchers refuse a parameter beside a catch-all in the same position.
 ///
-/// `matchit` treats a parameter and a catch-all in the same position as a
-/// conflict and refuses to build the table, so a `site.toml` naming both fails
-/// at startup. Core accepts the pair and resolves it by specificity, where a
-/// parameter outscores a wildcard.
-///
-/// Failing closed at startup is the better of the two behaviours, which is why
-/// #177 resolves toward the edge rather than away from it.
+/// `matchit` refuses to build the table, so a `site.toml` naming both fails at
+/// startup. Core's load check refuses the same pair, because both patterns
+/// match `/assets/one.css`. The wrong outcome: one side starts and the other
+/// does not, so a pattern pair valid for a service is invalid at the edge.
 #[test]
-fn the_edge_refuses_a_parameter_beside_a_catch_all_and_core_accepts_it() {
+fn both_matchers_refuse_a_parameter_beside_a_catch_all() {
     let patterns = &["/assets/{name}", "/assets/{*rest}"];
 
-    // Core resolves the pair: the parameter is more specific than the wildcard.
-    let routes = core_routes(patterns);
-    assert_eq!(
-        core_winner(&routes, "/assets/one.css"),
-        Some("/assets/{name}"),
-        "core resolves a parameter beside a catch-all by specificity"
-    );
-    assert_eq!(
-        core_winner(&routes, "/assets/deep/two.css"),
-        Some("/assets/{*rest}"),
-        "core falls through to the catch-all for a multi-segment tail"
-    );
+    let decls: Vec<RouteDecl> = patterns
+        .iter()
+        .map(|p| RouteDecl::new("test", p, Methods::ANY))
+        .collect();
+    let refusal = check_route_conflicts(&decls).expect_err("core must refuse the pair");
+    assert!(refusal.to_string().contains("GET /assets/x"), "{refusal}");
 
-    // The edge refuses the table outright. `for_bench` panics on the conflict,
-    // so the refusal is observed rather than described. The hook is silenced
-    // because a deliberate panic should not print a backtrace into a passing run.
+    // `for_bench` panics on the conflict, so the refusal is observed rather
+    // than described. The hook is silenced because a deliberate panic should
+    // not print a backtrace into a passing run.
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
     let built = std::panic::catch_unwind(|| edge_table(patterns));

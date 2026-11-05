@@ -147,6 +147,19 @@ Comments only.
 
 ### Changed
 
+**A fixed route beats a pattern route, and two routes that a request could both reach are now a configuration error, in the services and at the edge (#289).**
+A route is fixed when every segment is a literal and a pattern when it has a `{param}` or a `{*rest}`. Specificity scoring is gone. Two fixed routes on one path, and two patterns that can both match some path (`/blog/{slug}` with `/blog/{name}`, with `/blog/{*rest}`, or `/{lang}/about` with `/blog/{slug}`), fail the load when a request method reaches both. A service refuses to start with exit 2, a reload is refused and the running routes keep serving, and `--dump-config` fails the same way. The edge applies the same rule to `site.toml` routes. Before, the first declared route answered a tie and the other could never be reached.
+A fixed route is now found by one hash lookup and the patterns are tried only when no fixed route answers, so a request has no tie-break to resolve.
+Migration: the error reads `routes "/blog/{slug}" ([[route]] number 1) and "/blog/{name}" ([[route]] number 2) can both answer GET /blog/x; remove one, give one explicit methods, or make one a fixed path`. Remove one of the two routes, give one a `methods` list the other does not share, or replace a parameter with the literal it was standing in for. The layout of a code `route_post("/contact")` beside a config `[[route]]` for `/contact` now needs `methods = ["GET"]` on the config route, because a route with no `methods` also answers `POST`.
+Verified by unit tests of the rule (each fails when its part of the check is removed or made too eager), by m6-html and m6-file refusing to start, `--dump-config` refusing, an m6-file reload into a conflicting config being refused while the old routes keep answering, and an m6-http load refusal.
+
+**A route's `methods` list is exactly the methods it answers, and an unknown method name fails the load (#336).**
+A list of two or more methods, or one unrecognised name, used to make the route answer every method. `methods = ["GET", "POST"]` now answers `GET`, `HEAD` and `POST` only, and a name other than `GET`, `POST`, `PUT`, `PATCH` or `DELETE`, or an empty list, is refused naming the route and the value.
+Migration: a route that relied on the widening needs its list to name every method it should answer, or no `methods` key.
+
+**m6-http `--dump-config` builds the route table as start does, so a route table start refuses fails the dump with exit 2 (#337).**
+A test fails when the dump path stops building the table.
+
 **Debug and test builds carry line tables only, and no debug information for dependencies, so a full test build is 3.7 GB instead of 12 GB (#303).**
 Every file under a crate's `tests/` is its own binary, and each linked every dependency with full debug information. A full check filled about 16 GB, more than a hosted CI runner's free disk, and CI jobs died mid-build. Measured on the build host on one commit with `cargo test --workspace --no-run`: `target/debug` went from 12 GB to 3.7 GB and the build from 411 s to 282 s. Backtraces still show file and line.
 
@@ -179,8 +192,8 @@ They fail if a change to argument parsing or the config merge turns a clear exit
 **Tests now cover the shutdown signals every service shares (#288).**
 They fail if a second SIGTERM stops forcing exit during a drain, if SIGINT leaves the graceful path, or if a request in flight at SIGTERM is cut off.
 
-**Tests now cover the route tie-break, params precedence, the query and path-parameter clash, and a route status reaching the response (#289, #290, #291, #292).**
-They fail if equal routes stop resolving to the first declaration, if a global params key beats a route key, if a changed params file is missed after a restart, if a query key replaces a path parameter, or if a route status is dropped.
+**Tests now cover params precedence, the query and path-parameter clash, and a route status reaching the response (#290, #291, #292).**
+They fail if a global params key beats a route key, if a changed params file is missed after a restart, if a query key replaces a path parameter, or if a route status is dropped.
 
 **Tests now cover the auth path (#295, #296).**
 They fail if a public route runs auth code with or without a token or from the cache, or if a browser stops being redirected to `/login?next=<path>` or `/auth/refresh` while an API client gets 401.

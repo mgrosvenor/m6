@@ -331,7 +331,7 @@ Table 6 gives the keys a `[[route]]` may carry.
 | `params` | JSON files merged into this route's request dictionary. A path holding `{placeholder}` resolves per request |
 | `status` | the status a template route answers with, default 200 |
 | `cache` | `public` or `no-store`. A handler route defaults to `no-store` and a template route to `public` |
-| `methods` | the methods this route answers |
+| `methods` | exactly the methods this route answers, `GET` also answering `HEAD`. Omitted, it answers every method. An unknown name fails the load |
 | `headers` | extra response headers, as `[[key, value]]` pairs |
 | anything else | kept verbatim and read by the handler through `Request::route_setting` |
 
