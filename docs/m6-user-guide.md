@@ -915,59 +915,67 @@ Example 06 runs the same site under systemd for production.
 
 ## 7. Example 06, production with systemd
 
-`examples/06-systemd/`
-
-Takes the CMS blog from example 05 and runs it properly under systemd. Every process is a systemd unit. Ordering, restart policy, log capture, socket directory permissions, deploy workflow, and horizontal scaling are all covered.
-
-The unit files live in `examples/06-systemd/systemd/` and are copied into place during setup.
-
----
+Example 06 runs the Example 05 CMS blog under systemd, one unit per process.
+The example holds only the five unit files in `examples/06-systemd/systemd/`.
+It reuses the Example 05 site directory, with a production `site.toml` and a production system config written on the server.
+This section prepares the server, deploys the site directory and writes the five units.
+Sections 7.4 to 7.11 install them, verify the stack and cover logs, scaling and recovery.
 
 ### 7.1. Server preparation
 
+The server needs a dedicated user, a site directory, the auth signing keys and a *TLS* (Transport Layer Security) certificate.
+Create the user and the two directories first:
+
 ```bash
-# Create a dedicated user — no login shell, no home directory
 useradd --system --no-create-home --shell /usr/sbin/nologin m6
 
-# Site directory — owned by m6 user
 mkdir -p /var/www/my-blog
 chown m6:m6 /var/www/my-blog
 
-# Runtime directory for Unix sockets
-# systemd will create /run/m6 and set ownership automatically
-# via RuntimeDirectory= in each unit (see below)
-
-# Auth keys — readable by m6 user only
 mkdir -p /etc/m6
-openssl ecparam -name prime256v1 -genkey -noout -out /etc/m6/auth.pem
-openssl ec -in /etc/m6/auth.pem -pubout -out /etc/m6/auth.pub
+```
+
+Generate the auth keys with `openssl genpkey`.
+It writes the *PKCS#8* (Public-Key Cryptography Standards #8) form that m6-auth-server accepts.
+`openssl ecparam -genkey` writes the *SEC1* form, which m6-auth-server refuses, so do not use it.
+`ec_param_enc:named_curve` keeps the named curve form the token signer accepts.
+
+```bash
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -pkeyopt ec_param_enc:named_curve -out /etc/m6/auth.pem
+openssl pkey -in /etc/m6/auth.pem -pubout -out /etc/m6/auth.pub
 chown m6:m6 /etc/m6/auth.pem /etc/m6/auth.pub
 chmod 600   /etc/m6/auth.pem
+```
 
-# TLS certificate (example uses certbot/Let's Encrypt)
+Obtain the certificate with certbot.
+The two paths it writes are the ones the production system config names.
+
+```bash
 certbot certonly --standalone -d example.com
-# Outputs /etc/letsencrypt/live/example.com/fullchain.pem
-#         /etc/letsencrypt/live/example.com/privkey.pem
-# m6-http reads these directly — add m6 to the ssl-cert group or adjust permissions
 ```
 
 m6-http does not watch the certificate files, so a renewal has to touch the system config after it writes them.
-This hook does it, and certbot runs it after each renewal:
+This deploy hook does that, and certbot runs it after each renewal:
 
 ```sh
-# /etc/letsencrypt/renewal-hooks/deploy/m6-touch.sh, mode 0755
 #!/bin/sh
+# /etc/letsencrypt/renewal-hooks/deploy/m6-touch.sh, mode 0755
 touch /etc/m6/my-blog.toml
 ```
 
-The touch is what makes m6-http read the new files, and until it runs m6-http keeps serving the previous certificate.
-
----
+The touch makes m6-http read the new files.
+Until it runs, m6-http keeps serving the previous certificate.
 
 ### 7.2. Deploy site directory
 
+Deploy the Example 05 site directory with rsync, then fix ownership.
+Three paths stay on the server and are excluded from the sync:
+
+- `content/drafts/`, managed by the CMS renderer
+- `data/auth.db`, the persistent server-side login state
+- `keys/`, already present under `/etc/m6/` on the server
+
 ```bash
-# From your development machine
 rsync -av --delete \
   --exclude 'content/drafts/' \
   --exclude 'data/auth.db' \
@@ -975,51 +983,43 @@ rsync -av --delete \
   examples/05-cms/ \
   user@example.com:/var/www/my-blog/
 
-# content/posts/ excluded — managed by the CMS renderer on the server
-# auth.db excluded — persistent server-side state
-# keys/ excluded — already in /etc/m6/ on the server
-
-# On the server, fix ownership after rsync
 chown -R m6:m6 /var/www/my-blog
 ```
 
-Production `site.toml` differs from development in three places: `bind`, `tls_cert`, `tls_key`.
-
-`/var/www/my-blog/site.toml`:
+The production `site.toml` differs from Example 05 in two places.
+`domain` names the public site, and the backend `sockets` globs move from `/tmp/m6/` to `/run/m6/`, where a renderer writes its socket when no `M6_SOCKET_OVERRIDE` is set.
+The `[server]` bind and certificate paths, and `[auth]`, do not move into `site.toml`.
+They live in the system config `/etc/m6/my-blog.toml`, which the m6-http unit in section 7.3 names.
 
 ```toml
 [site]
 name   = "My Blog"
 domain = "example.com"
 
-[server]
-bind     = "0.0.0.0:443"
-tls_cert = "/etc/letsencrypt/live/example.com/fullchain.pem"
-tls_key  = "/etc/letsencrypt/live/example.com/privkey.pem"
-
 [errors]
 mode = "internal"
 
-[auth]
-backend    = "m6-auth"
-public_key = "/etc/m6/auth.pub"
+[[backend]]
+name    = "m6-html"
+sockets = "/run/m6/m6-html*.sock"
 
-# backends and routes identical to example 05
+# ... the remaining backends and routes as in Example 05, with sockets under /run/m6/
 ```
 
----
+[`m6-site-toml.md`](m6-site-toml.md) section 3 owns the split between `site.toml` and the system config.
 
 ### 7.3. Unit files
 
-One unit per process. The units for renderers all follow the same pattern — only `ExecStart` and `Description` differ.
+One unit per process, five in total.
+The four backend units (m6-html, m6-file, m6-auth, render-cms) follow one pattern and differ in `Description`, `ExecStart`, `ReadWritePaths` and `ReadOnlyPaths`.
+m6-http's unit names the system config as its second argument and adds `AmbientCapabilities` to bind port 443.
 
-**`/etc/systemd/system/m6-html.service`**
+`/etc/systemd/system/m6-html.service`:
 
 ```ini
 [Unit]
 Description=m6-html renderer
-Documentation=https://github.com/m6/m6
-# Start after network is up but before m6-http
+Documentation=https://github.com/mgrosvenor/m6
 After=network.target
 
 [Service]
@@ -1027,7 +1027,6 @@ Type=simple
 User=m6
 Group=m6
 
-# Creates /run/m6/ with correct ownership on start, removes on stop
 RuntimeDirectory=m6
 RuntimeDirectoryMode=0750
 
@@ -1035,16 +1034,13 @@ ExecStart=/usr/local/bin/m6-html \
     /var/www/my-blog \
     /var/www/my-blog/configs/m6-html.conf
 
-# Restart on any non-clean exit — covers crashes and OOM kills
 Restart=on-failure
 RestartSec=2
 
-# All output goes to journald
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=m6-html
 
-# Hardening
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
@@ -1055,7 +1051,7 @@ ReadOnlyPaths=/var/www/my-blog /etc/m6
 WantedBy=multi-user.target
 ```
 
-**`/etc/systemd/system/m6-file.service`**
+`/etc/systemd/system/m6-file.service`:
 
 ```ini
 [Unit]
@@ -1088,7 +1084,7 @@ ReadOnlyPaths=/var/www/my-blog
 WantedBy=multi-user.target
 ```
 
-**`/etc/systemd/system/m6-auth.service`**
+`/etc/systemd/system/m6-auth.service`:
 
 ```ini
 [Unit]
@@ -1121,9 +1117,9 @@ ReadOnlyPaths=/var/www/my-blog /etc/m6
 WantedBy=multi-user.target
 ```
 
-Note `ReadWritePaths` includes `/var/www/my-blog/data` — m6-auth writes the SQLite database there.
+m6-auth writes its *SQLite* database under `data/`, which is why its `ReadWritePaths` adds `/var/www/my-blog/data`.
 
-**`/etc/systemd/system/render-cms.service`**
+`/etc/systemd/system/render-cms.service`:
 
 ```ini
 [Unit]
@@ -1156,14 +1152,14 @@ ReadOnlyPaths=/var/www/my-blog /etc/m6
 WantedBy=multi-user.target
 ```
 
-The `render-cms` binary lives in `/var/www/my-blog/bin/` — deployed alongside the site.
+The render-cms binary lives in `/var/www/my-blog/bin/`, deployed beside the site.
 
-**`/etc/systemd/system/m6-http.service`**
+`/etc/systemd/system/m6-http.service`:
 
 ```ini
 [Unit]
 Description=m6-http reverse proxy and cache
-Documentation=https://github.com/m6/m6
+Documentation=https://github.com/mgrosvenor/m6
 After=network.target m6-html.service m6-file.service m6-auth.service render-cms.service
 
 [Service]
@@ -1173,7 +1169,7 @@ Group=m6
 RuntimeDirectory=m6
 RuntimeDirectoryMode=0750
 
-ExecStart=/usr/local/bin/m6-http /var/www/my-blog
+ExecStart=/usr/local/bin/m6-http /var/www/my-blog /etc/m6/my-blog.toml
 
 Restart=on-failure
 RestartSec=2
@@ -1181,7 +1177,6 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=m6-http
 
-# Bind to port 443 — requires capability or use authbind/setcap
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 ProtectSystem=strict
@@ -1193,9 +1188,11 @@ ReadOnlyPaths=/var/www/my-blog /etc/letsencrypt /etc/m6
 WantedBy=multi-user.target
 ```
 
-`After=` expresses preference, not a hard dependency — m6-http starts after renderers but will handle unreachable backends gracefully if one hasn't started yet. The socket pool's backoff mechanism handles the brief window between m6-http binding and all renderers being ready.
+`AmbientCapabilities=CAP_NET_BIND_SERVICE` lets the unprivileged `m6` user bind port 443.
+`After=` is an ordering hint, not a hard dependency.
+m6-http starts after the backends and answers a route whose backend socket is not ready yet with a 503 until the socket appears.
 
----
+Section 7.4 installs these units and starts the stack.
 
 ### 7.4. Install and start
 
