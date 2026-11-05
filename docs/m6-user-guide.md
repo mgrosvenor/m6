@@ -1471,188 +1471,150 @@ Example 07 makes the development and production split explicit, with one `site.t
 
 ## 8. Example 07, dev to production
 
-`examples/07-dev-to-production/`
-
-The complete workflow for taking a site from local development to a production server. The same site directory runs in both environments — the system config provides the three keys that differ.
-
----
+Example 07 is the Example 05 CMS blog with the development and production split made explicit.
+One `site.toml` holds what every node shares, and a system config holds what each node owns.
+The same site directory runs in both environments.
+This section walks the split, the dev script, the first-time server setup, the deploy script and the common mistakes.
 
 ### 8.1. The split
 
-**`site.toml` — version controlled, deployed with the site, contains no secrets:**
+`site.toml` holds the site identity, the method list, the log and error settings, the four backends and every route.
+It carries no node address, no certificate path and no credential:
 
 ```toml
 [site]
-name   = "My Blog"
-domain = "example.com"
+name   = "My Site"
+domain = "localhost"
 
 [server]
-# Development values — system config overrides these in production
-bind     = "127.0.0.1:8443"
-tls_cert = "../../localhost.pem"
-tls_key  = "../../localhost-key.pem"
+allowed_methods = ["GET", "HEAD", "POST", "PATCH"]
 
-[auth]
-backend    = "m6-auth"
-public_key = "keys/auth.pub"
+[errors]
+mode             = "internal"
+verbose_fallback = true
 
 [log]
 level  = "info"
 format = "text"
 
-[errors]
-mode = "internal"
-
-# All backends and routes — identical in dev and production
 [[backend]]
 name    = "m6-html"
-sockets = "/run/m6/m6-html-*.sock"
-# ... (full backend and route table as in example 05)
+sockets = "/tmp/m6/m6-html*.sock"
+
+[[backend]]
+name    = "m6-file"
+sockets = "/tmp/m6/m6-file*.sock"
+
+[[backend]]
+name    = "m6-auth"
+sockets = "/tmp/m6/m6-auth*.sock"
+
+[[backend]]
+name    = "render-cms"
+sockets = "/tmp/m6/render-cms-prod*.sock"
+
+# ... the public, auth and CMS routes as in Example 05
 ```
 
-**`configs/system-dev.toml` — development system config, version controlled:**
+The development system config `configs/system-dev.toml` holds the node's bind address, certificate paths and auth key:
 
 ```toml
-# The three keys that differ in development.
-# Committed to the repo — contains no secrets.
 [server]
 bind     = "127.0.0.1:8443"
-tls_cert = "../../localhost.pem"
-tls_key  = "../../localhost-key.pem"
+tls_cert = "keys/dev.pem"
+tls_key  = "keys/dev-key.pem"
+
+[auth]
+backend    = "m6-auth"
+public_key = "keys/auth.pub"
 ```
 
-**`/etc/m6/my-blog.toml` — production system config, on the server only:**
+The production system config `/etc/m6/my-blog.toml` holds the same two sections with the server's values:
 
 ```toml
 [server]
 bind     = "0.0.0.0:443"
 tls_cert = "/etc/letsencrypt/live/example.com/fullchain.pem"
 tls_key  = "/etc/letsencrypt/live/example.com/privkey.pem"
+
+[auth]
+backend    = "m6-auth"
+public_key = "/etc/m6/auth.pub"
 ```
 
-Only `[server]`. Nothing else.
-
-**`configs/render-contact.conf` — version controlled, uses local mock values:**
-
-```toml
-secrets_file = "/etc/m6/contact-secrets.toml"
-# On dev machines /etc/m6/contact-secrets.toml doesn't exist
-# — silently ignored, [smtp] values below are used directly.
-
-global_params = ["data/site.json"]
-
-[[route]]
-path     = "/contact"
-template = "templates/contact.html"
-params   = []
-cache    = "no-store"
-
-[smtp]
-host     = "localhost"
-port     = 1025
-username = ""
-password = ""
-from     = "dev@localhost"
-to       = "dev@localhost"
-```
-
-**`/etc/m6/contact-secrets.toml` — on the server only:**
-
-```toml
-[smtp]
-host     = "smtp.postmarkapp.com"
-port     = 587
-username = "live-api-token"
-password = "live-api-token"
-from     = "noreply@example.com"
-to       = "owner@example.com"
-```
-
-When `secrets_file` points to a file that exists, it is merged in — secrets file wins on conflict. When the file is absent (on any dev machine), it is silently ignored and the `[smtp]` block provides values directly. The path itself is not secret and is safe to commit.
-
----
+The split is one rule: `site.toml` holds the state every node shares, and the system config holds the state of one node.
+`[server]` bind and certificate paths, and `[auth]`, belong in the system config.
+A key declared in both files for `[auth]` is a startup error, exit 2.
+[`m6-site-toml.md`](m6-site-toml.md) section 3 owns the full split and its merge rules.
 
 ### 8.2. Dev script
 
-```bash
-#!/bin/bash
-set -e
-SITE="$(cd "$(dirname "$0")" && pwd)"
-trap 'kill $(jobs -p) 2>/dev/null' EXIT
+`dev.sh` builds the binaries, generates the development certificate and auth keys, creates the admin user and the editors group, runs `m6-md` over `content/posts/`, then starts the stack.
+It sets `M6_SOCKET_OVERRIDE` for each backend so the sockets land in `/tmp/m6/`, where `site.toml` names them.
+It starts m6-http last with the dev system config:
 
-m6-html "$SITE" "$SITE/configs/m6-html.conf" &
-m6-file "$SITE" "$SITE/configs/m6-file.conf" &
-m6-auth "$SITE" "$SITE/configs/m6-auth.conf" &
-"$SITE/target/release/render-cms" "$SITE" "$SITE/configs/render-cms.conf" &
+```sh
+M6_SOCKET_OVERRIDE=/tmp/m6/m6-html.sock \
+    m6-html "$SITE" "$SITE/configs/m6-html.conf" &
 
-# Second argument always required — use checked-in dev system config
+M6_SOCKET_OVERRIDE=/tmp/m6/m6-auth.sock \
+    m6-auth-server "$SITE" "$SITE/configs/m6-auth.conf" &
+
+M6_SOCKET_OVERRIDE=/tmp/m6/render-cms-prod.sock \
+    "$EXAMPLES/target/release/render-cms-prod" "$SITE" "$SITE/configs/render-cms.conf" &
+
 m6-http "$SITE" "$SITE/configs/system-dev.toml" &
-
-echo "Running at https://localhost:8443"
-wait
 ```
 
----
+The custom renderer crate is named `render-cms-prod`, so its binary and socket carry that name.
+Run it from `examples/07-dev-to-production` and open `https://localhost:8443`.
 
 ### 8.3. First-time server setup
 
-```bash
-# On the server
+On the server, create the user, the site directory and the auth keys, then write the production system config:
 
-# Create system user
+```bash
 useradd --system --no-create-home --shell /usr/sbin/nologin m6
 
-# Create site directory
 mkdir -p /var/www/my-blog
 chown m6:m6 /var/www/my-blog
 
-# Generate production auth keys
 mkdir -p /etc/m6
-openssl ecparam -name prime256v1 -genkey -noout -out /etc/m6/auth.pem
-openssl ec -in /etc/m6/auth.pem -pubout -out /etc/m6/auth.pub
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -pkeyopt ec_param_enc:named_curve -out /etc/m6/auth.pem
+openssl pkey -in /etc/m6/auth.pem -pubout -out /etc/m6/auth.pub
 chown m6:m6 /etc/m6/auth.pem /etc/m6/auth.pub
-chmod 600 /etc/m6/auth.pem
+chmod 600   /etc/m6/auth.pem
 
-# Create production system config
 cat > /etc/m6/my-blog.toml << 'TOML'
 [server]
 bind     = "0.0.0.0:443"
 tls_cert = "/etc/letsencrypt/live/example.com/fullchain.pem"
 tls_key  = "/etc/letsencrypt/live/example.com/privkey.pem"
+
+[auth]
+backend    = "m6-auth"
+public_key = "/etc/m6/auth.pub"
 TOML
 chown root:m6 /etc/m6/my-blog.toml
 chmod 640 /etc/m6/my-blog.toml
 
-# Create SMTP secrets
-cat > /etc/m6/contact-secrets.toml << 'TOML'
-[smtp]
-host     = "smtp.postmarkapp.com"
-port     = 587
-username = "live-api-token"
-password = "live-api-token"
-from     = "noreply@example.com"
-to       = "owner@example.com"
-TOML
-chown root:m6 /etc/m6/contact-secrets.toml
-chmod 640 /etc/m6/contact-secrets.toml
-
-# Obtain TLS certificate
 certbot certonly --standalone -d example.com
 
-# Install systemd units
 cp examples/07-dev-to-production/systemd/*.service /etc/systemd/system/
 systemctl daemon-reload
+```
 
-# Deploy site (see deploy.sh below), then:
+Deploy the site with `deploy.sh`, then enable and start the units:
+
+```bash
 systemctl enable m6-html m6-file m6-auth render-cms m6-http
 systemctl start  m6-html m6-file m6-auth render-cms m6-http
 ```
 
----
-
 ### 8.4. Systemd unit, m6-http
 
-The only difference from example 06 is `ExecStart` includes the system config path:
+The m6-http unit differs from Example 06 only in that `ExecStart` names the production system config as its second argument.
+The renderer units are identical to Example 06 and take two positional arguments each.
 
 ```ini
 [Unit]
@@ -1686,15 +1648,14 @@ ReadOnlyPaths=/var/www/my-blog /etc/letsencrypt /etc/m6
 WantedBy=multi-user.target
 ```
 
-Renderer units are identical to example 06 — they take only two positional args and use `secrets_file` for credentials rather than a system config argument.
-
----
-
 ### 8.5. Deploy
+
+`deploy.sh` runs from the development machine and syncs the site directory to the server.
+The `--binary` flag rebuilds render-cms, deploys the binary and restarts only that unit.
 
 ```bash
 #!/bin/bash
-# deploy.sh — run from development machine
+# deploy.sh, run from the development machine
 set -e
 
 SERVER="user@example.com"
@@ -1721,84 +1682,52 @@ echo "Deployed."
 # m6-http detects site.toml change via inotify and reloads routing
 ```
 
----
-
 ### 8.6. Dev vs production at a glance
 
-| | Development | Production |
+Table 2 maps each setting to its two values.
+Take from it that the two environments differ only in the system config and the process manager.
+
+| Setting | Development | Production |
 |---|---|---|
-| `m6-http` invocation | `m6-http $SITE $SITE/configs/system-dev.toml` | `m6-http /var/www/my-blog /etc/m6/my-blog.toml` |
+| m6-http invocation | `m6-http $SITE configs/system-dev.toml` | `m6-http /var/www/my-blog /etc/m6/my-blog.toml` |
 | `[server] bind` | `127.0.0.1:8443` | `0.0.0.0:443` |
-| `[server] tls_cert` | `localhost.pem` (mkcert) | `/etc/letsencrypt/...` |
-| SMTP | `localhost:1025` (mock) | `smtp.postmarkapp.com:587` |
-| SMTP credentials | inline in renderer config | `/etc/m6/contact-secrets.toml` via `secrets_file` |
-| System config | `configs/system-dev.toml` (in repo) | `/etc/m6/my-blog.toml` (on server) |
+| `[server] tls_cert` | `keys/dev.pem` | `/etc/letsencrypt/live/example.com/fullchain.pem` |
+| `[auth] public_key` | `keys/auth.pub` | `/etc/m6/auth.pub` |
+| System config | `configs/system-dev.toml`, in the repo | `/etc/m6/my-blog.toml`, on the server |
 | Process manager | `dev.sh` | systemd |
 | Logs | terminal stdout | journald |
 
-Routes, templates, backends, auth config, and log settings are identical. The same `site.toml` runs in both environments.
+**Table 2: development and production, key by key.**
+The site directory, the routes and the backends are identical in both environments.
 
----
+### 8.7. Checking what is in effect
 
-### 8.7. Checking what's in effect
+`--dump-config` prints the merged config, which is the fastest way to see what a production run actually uses:
 
 ```bash
-# See the effective merged config — useful when debugging prod behaviour
 m6-http /var/www/my-blog /etc/m6/my-blog.toml --dump-config
-
-# Output shows [server] values from /etc/m6/my-blog.toml,
-# everything else from site.toml:
-#
-# [server]
-# bind     = "0.0.0.0:443"
-# tls_cert = "/etc/letsencrypt/live/example.com/fullchain.pem"
-# tls_key  = "/etc/letsencrypt/live/example.com/privkey.pem"
-#
-# [site]
-# name   = "My Blog"
-# domain = "example.com"
-# ...
 ```
 
----
+The output shows the `[server]` values from the system config and everything else from `site.toml`.
+The system config wins where the two files set the same key.
 
 ### 8.8. Common mistakes
 
-**Forgetting the system config argument:**
-```bash
-m6-http /var/www/my-blog
-# Exit 2 — second argument required
-```
+Four mistakes come up, each with its fix:
 
-**Putting secrets in renderer config instead of secrets_file:**
-```toml
-# Wrong — committed to repo, visible to anyone who can clone
-[smtp]
-password = "live-api-token"   # in configs/render-contact.conf
+- **Forgetting the system config argument.**
+  `m6-http /var/www/my-blog` exits 2, because the second argument is required.
+- **Putting node values in `site.toml`.**
+  `bind`, the certificate paths and `[auth]` belong in the system config.
+  A key in both files is refused at start.
+- **Deploying over server-managed state.**
+  Sync with the `content/drafts/`, `data/auth.db` and `keys/` exclusions, and never overwrite `data/posts.json`.
+- **Editing `site.toml` on the server.**
+  The next deploy overwrites it.
+  Edit locally, deploy, and keep server-specific overrides in `/etc/m6/my-blog.toml`.
 
-# Right — in /etc/m6/contact-secrets.toml, referenced by secrets_file
-```
-
-**Deploying over `data/posts.json` — wipes published posts:**
-```bash
-# Wrong
-rsync -av ./ user@example.com:/var/www/my-blog/
-
-# Right — always exclude server-managed state
-rsync -av --exclude 'content/drafts/' --exclude 'data/posts.json' --exclude 'data/auth.db' \
-  ./ user@example.com:/var/www/my-blog/
-```
-
-**Editing `site.toml` on the server directly:**
-```bash
-# Wrong — next deploy overwrites it
-ssh user@example.com vim /var/www/my-blog/site.toml
-
-# Right — edit locally and deploy
-# Server-specific overrides belong in /etc/m6/my-blog.toml
-```
-
----
+Example 07 makes the shared and node-owned state explicit.
+Example 08 adds a log viewer that tails the JSON logs in the browser.
 
 ## 9. Example 08, log viewer
 
