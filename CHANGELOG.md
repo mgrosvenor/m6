@@ -26,6 +26,14 @@ The released versions, newest first:
 - [1.9.0, 2026-09-18](#190-2026-09-18)
 - [1.8.1, 2026-09-18](#181-2026-09-18)
 - [1.8.0, 2026-09-17](#180-2026-09-17)
+- [1.7.0, 2026-09-16](#170-2026-09-16)
+- [1.6.0, 2026-09-16](#160-2026-09-16)
+- [1.5.0, 2026-09-16](#150-2026-09-16)
+- [1.4.0, 2026-09-16](#140-2026-09-16)
+- [1.3.0, 2026-09-16](#130-2026-09-16)
+- [1.2.0, 2026-09-15](#120-2026-09-15)
+- [1.1.0, 2026-09-15](#110-2026-09-15)
+- [1.0.0, 2026-09-14](#100-2026-09-14)
 
 ---
 
@@ -1557,102 +1565,89 @@ Roll 1.8.0 out, then turn it on, then retire the script and its timer.
 
 ---
 
-## 1.7.0 — 2026-09-16
+## 1.7.0, 2026-09-16
+
+**Custom error pages now work across a proxy hop.**
+1.6.0 recorded the gap, and this release closes it.
 
 ### Fixed
 
-**Custom error pages work across a proxy hop.** 1.6.0 recorded this as a limitation;
-this fixes it.
+**m6-http refused every external request to its configured `errors.path`, for a sound reason, and it refused its own cache nodes on the same rule.**
+The page is fetched with the status and the original path appended to its URL, so a public caller allowed to request it directly could supply its own and have a deployment's template render them.
 
-m6-http refused every external request to its configured `errors.path`, for a sound
-reason: the page is fetched with the status and the original path appended to its URL,
-so a public caller allowed to request it directly could supply its own and have a
-deployment's template render them.
+It refused a deployment's own cache nodes on the same rule.
+A cache node holds no content, so when a path matches nothing it fetches the error page from the origin over h2c on the private backbone.
+The origin refused it exactly like a stranger, the node fell back to m6-http's built-in page, and that is what visitors saw at the edge.
 
-It refused a deployment's own cache nodes on the same rule. A cache node holds no
-content, so when a path matches nothing it fetches the error page from the origin over
-h2c on the private backbone. The origin refused it exactly like a stranger, the node
-fell back to m6-http's built-in page, and that is what visitors saw at the edge.
+**Every layer of config was correct.**
+Both site configs set `mode = "custom"`, both routed the error path to the HTML backend, and that backend returned 200 with the branded page when asked directly over its socket.
+The mechanism was configured, deployed and dead, which is worse than unsupported because it looks like it works.
+The origin looked healthy for an unrelated reason: a missing path there matches a route to the backend and never reaches the error machinery at all.
 
-**Every layer of config was correct.** Both site configs set `mode = "custom"`, both
-routed the error path to the HTML backend, and that backend returned 200 with the
-branded page when asked directly over its socket. The mechanism was configured,
-deployed and dead, which is worse than unsupported because it looks like it works. The
-origin looked healthy for an unrelated reason: a missing path there matches a route to
-the backend and never reaches the error machinery at all.
+The origin always had the information needed.
+`Iface::for_bind` classifies a private bind as internal, and the h2c listener is granted `ForwardedTrust::Backbone` on exactly that basis, its own comment reading "granted by the listener, never by a header".
+That fact never reached the decision.
+It does now, threaded to the handler and read only by this guard, so a public client still cannot claim it.
 
-The origin always had the information needed. `Iface::for_bind` classifies a private
-bind as internal, and the h2c listener is granted `ForwardedTrust::Backbone` on exactly
-that basis, its own comment reading "granted by the listener, never by a header". That
-fact simply never reached the decision. It does now, threaded to the handler and read
-only by this guard, so a public client still cannot claim it.
+The decision is a pure function and not an inline condition, because no test drives an h2c listener end to end and this needed to be testable.
+Three tests cover it: a public request refused and an internal one allowed, ordinary paths untouched on either listener, and no firing at all when no custom page is configured.
 
-The decision is a pure function rather than an inline condition, because no test drives
-an h2c listener end to end and this needed to be testable. Three tests cover it: a
-public request refused and an internal one allowed, ordinary paths untouched on either
-listener, and no firing at all when no custom page is configured.
+A deployment that worked around this by serving the same template at a second routable path no longer needs to.
 
-A deployment that worked around this by serving the same template at a second
-routable path no longer needs to.
+1.7.0 makes custom error pages work across a proxy hop, and it leaves a public caller still unable to claim the internal trust.
 
-## 1.6.0 — 2026-09-16
+---
 
-### Security
+## 1.6.0, 2026-09-16
 
 **The production error page no longer names the software serving it.**
 
-`internal_error_html` in non-verbose mode, which is what production uses, rendered:
+### Security
+
+**`internal_error_html` in non-verbose mode, which is what production uses, rendered the server's name.**
 
 ```html
 <body><h1>404 Not Found</h1><p>m6-http</p></body>
 ```
 
-Verbose mode puts a description of the status in that paragraph, which is useful to a
-developer reading it. Production put the name of the server software there, which tells
-a visitor nothing and tells a scanner what is serving.
+Verbose mode puts a description of the status in that paragraph, which is useful to a developer reading it.
+Production put the name of the server software there, which tells a visitor nothing and tells a scanner what is serving.
 
-Found on a live fleet, and only on part of it. An origin never shows this page, because
-a missing path there is routed to a backend that renders the site's own. A cache node
-has no route matching an arbitrary path, so this page answered every probe for
-`/.env`, `/wp-admin` and the rest, naming the software that refused them.
+Found on a live fleet, and only on part of it.
+An origin never shows this page, because a missing path there is routed to a backend that renders the site's own.
+A cache node has no route matching an arbitrary path, so this page answered every probe for `/.env`, `/wp-admin` and the rest, naming the software that refused them.
 
-**The existing test on this body passed throughout.** It asserted only what the body
-should contain and never what it should not, and a page can be right about the status
-and still say too much. Both halves are asserted now, across four statuses, plus a
-second test holding verbose mode to still carrying its detail so the fix cannot be made
-by gutting that instead.
+**The existing test on this body passed throughout.**
+It asserted only what the body should contain and never what it should not, and a page can be right about the status and still say too much.
+Both halves are asserted now, across four statuses, plus a second test holding verbose mode to still carrying its detail so the fix cannot be made by gutting that instead.
 
-This is the generic default. A deployment that wants a branded page configures
-`[errors] mode = "custom"`; this is what answers when that is absent, or when its fetch
-fails, which is exactly the case where an origin is unreachable and an edge has nothing
-else to serve.
+This is the generic default.
+A deployment that wants a branded page configures `[errors] mode = "custom"`, and this is what answers when that is absent, or when its fetch fails, which is exactly the case where an origin is unreachable and an edge has nothing else to serve.
 
-### Note for anyone using custom error pages behind a cache
+### 1. Note for anyone using custom error pages behind a cache
 
-m6-http refuses every external request to its own `errors.path`, correctly: a caller
-could otherwise supply its own `status` and `from` and have them rendered. It cannot,
-however, distinguish a spoofing stranger from a downstream cache node of the same
-deployment fetching the page it was told to fetch. **So `mode = "custom"` does not work
-across a proxy hop**: the edge asks, the origin refuses it like any stranger, and the
-edge falls back to this page.
+m6-http refuses every external request to its own `errors.path`, correctly: a caller could otherwise supply its own `status` and `from` and have them rendered.
+It cannot, however, distinguish a spoofing stranger from a downstream cache node of the same deployment fetching the page it was told to fetch.
+So `mode = "custom"` does not work across a proxy hop: the edge asks, the origin refuses it like any stranger, and the edge falls back to this page.
 
-Nothing in m6 changes here, because the workaround is a deployment's to make: serve the
-same error template at a second, normally-routable path and point the edge's
-`errors.path` at that. Whether m6 should grant the backbone listener an exception is
-open; the trust concept already exists as `ForwardedTrust::Backbone`, but it is not
-threaded to where the refusal happens.
+Nothing in m6 changes here, because the workaround is a deployment's to make.
+Serve the same error template at a second, normally-routable path and point the edge's `errors.path` at that.
+Whether m6 should grant the backbone listener an exception is open.
+The trust concept already exists as `ForwardedTrust::Backbone`, but it is not threaded to where the refusal happens.
 
-## 1.5.0 — 2026-09-16
+1.6.0 stops the generic error page from naming m6, and it records the custom-page limitation that 1.7.0 then fixes.
+
+---
+
+## 1.5.0, 2026-09-16
+
+**1.4.0 made the HTTP/3 handshake slower on short paths than no certificate compression at all.**
+This release caches the compressed chain, and it makes `/perf` report the running release so the monitor can flag drift.
 
 ### Fixed
 
-**1.4.0 made the HTTP/3 handshake slower on short paths than having no certificate
-compression at all.** This fixes it, and the defect is worth describing because the
-code looked obviously correct.
-
-BoringSSL calls a certificate compressor on **every full handshake**. A certificate
-chain does not change while the process runs, so the same bytes were recompressed per
-connection, and brotli at quality 11 is expensive:
+**BoringSSL calls a certificate compressor on every full handshake.**
+A certificate chain does not change while the process runs, so the same bytes were recompressed per connection, and brotli at quality 11 is expensive:
 
 | | cost on a 3.4 KB chain |
 |---|---|
@@ -1661,8 +1656,11 @@ connection, and brotli at quality 11 is expensive:
 | brotli q4 | 1.113 ms |
 | zlib L9 | 0.137 ms |
 
-Quality 11 was chosen for the best ratio without anyone measuring what it cost. End to
-end, h3 handshake p50 against a 4.9 ms path:
+**Table 1: the cost of compressing a 3.4 KB chain at four settings.**
+Take from it that brotli q11 costs many times the zlib alternative.
+
+Quality 11 was chosen for the best ratio without anyone measuring what it cost.
+End to end, the h3 handshake p50 against a 4.9 ms path:
 
 | | p50 | flight |
 |---|---|---|
@@ -1671,159 +1669,135 @@ end, h3 handshake p50 against a 4.9 ms path:
 | brotli q11, per handshake (1.4.0) | **14.6 ms** | 2859 B |
 | **brotli q11, cached (1.5.0)** | **6.8 ms** | 2858 B |
 
+**Table 2: the h3 handshake p50 and flight size under four schemes.**
+Take from it that caching the compressed chain turns the slowest option into the fastest.
+
 A kilobyte saved is worth nothing against ten milliseconds of CPU.
 
-**On a long path this was invisible.** At 211 ms and 308 ms of round-trip time the
-handshake measured 1.00 and 1.05 round trips after the 1.4.0 deploy, because a round
-trip hides ten milliseconds completely. On a 5 ms path from a single-core VM it was
-the whole cost: 9.5 ms under 1.3.0, 14.6 ms under 1.4.0. It was found by measuring a
-running server after the rollout, not by any gate. Neither CI nor conformance measures
-handshake CPU on a short path.
+On a long path this was invisible.
+At 211 ms and 308 ms of round-trip time the handshake measured 1.00 and 1.05 round trips after the 1.4.0 deploy, because a round trip hides ten milliseconds completely.
+On a 5 ms path from a single-core VM it was the whole cost: 9.5 ms under 1.3.0, 14.6 ms under 1.4.0.
+It was found by measuring a running server after the rollout, and not by any gate.
+Neither CI nor conformance measures handshake CPU on a short path.
 
-The compressed chain is now cached for the life of the process, keyed by the
-uncompressed bytes so a collision cannot serve one host's chain in place of another's,
-bounded at 8 entries, and a failure is not cached so a transient one does not persist.
-The compressor runs outside the lock: holding a lock across an 8 ms compression would
-serialise every concurrent handshake behind it. Quality 11 is kept, because the cache
-makes it a one-off per chain and the ratio is the reason to prefer brotli at all.
+The compressed chain is now cached for the life of the process, keyed by the uncompressed bytes so a collision cannot serve one host's chain in place of another's, bounded at 8 entries, and a failure is not cached so a transient one does not persist.
+The compressor runs outside the lock: holding a lock across an 8 ms compression would serialise every concurrent handshake behind it.
+Quality 11 is kept, because the cache makes it a one-off per chain and the ratio is the reason to prefer brotli at all.
 
 ### Changed
 
 **`/perf` reports the running release, and m6-monitor flags fleet drift.**
 
-`/perf` published node, uptime, pools, backends, metrics and host, and no version, so
-the only way to learn what a node was running was to ssh in and ask the binary. "Every
-node runs the release we think it does" was an invariant nothing could check remotely.
+`/perf` published node, uptime, pools, backends, metrics and host, and no version, so the only way to learn what a node was running was to ssh in and ask the binary.
+"Every node runs the release we think it does" was an invariant nothing could check remotely.
 
-On 2026-09-16 four written records disagreed about the deployment fleet and none of
-them matched it: a deploy repository pinning one tag, its captured config naming
-that tag with an artefact hash matching nothing running, a release log naming an
-older tag as the newest deploy, and every node serving a fourth. No node has to be
-faulty for that. Nothing can observe the truth, so the records rot quietly.
+On 2026-09-16 four written records disagreed about the deployment fleet and none of them matched it: a deploy repository pinning one tag, its captured config naming that tag with an artefact hash matching nothing running, a release log naming an older tag as the newest deploy, and every node serving a fourth.
+No node has to be faulty for that.
+Nothing can observe the truth, so the records rot quietly.
 
-The monitor now prints the version per node and raises a warning when the reporting
-nodes disagree, naming each. **A node that cannot report its version counts as drift,
-not as agreement**: two nodes agreeing while a third is silent is not a uniform fleet,
-it is an unknown one, and calling it uniform is the failure this exists to remove.
+The monitor now prints the version per node and raises a warning when the reporting nodes disagree, naming each.
+A node that cannot report its version counts as drift, and not as agreement: two nodes agreeing while a third is silent is not a uniform fleet, it is an unknown one, and calling it uniform is the failure this exists to remove.
 
-The field is `serde(default)`, so a node older than this change deserialises to an
-empty string instead of making the payload unparseable, and renders as "unknown (node
-too old to report it)". The fleet is upgraded one node at a time, and an aggregator
-that cannot read an older node learns nothing about the node it most needs to ask
-about.
+The field is `serde(default)`, so a node older than this change deserialises to an empty string instead of making the payload unparseable, and renders as "unknown (node too old to report it)".
+The fleet is upgraded one node at a time, and an aggregator that cannot read an older node learns nothing about the node it most needs to ask about.
 
-**This reverses a documented decision.** `monitoring.rs` said "No version or build
-string is exposed by either endpoint, at any tier: that only tells a scanner which
-vulnerabilities are worth trying." That argument is about an anonymous reader, and
-`/perf` has none: with no token configured it is a 404, and with one it is a 401
-without the credential. Anyone holding the perf token already reads live latency
-percentiles and error counters, which is a far better attack signal than a version
-string. `/health` is unauthenticated and still exposes nothing, so the public surface
-is unchanged. The reasoning is recorded in the module docs, not only in a commit.
+**This reverses a documented decision.**
+`monitoring.rs` said "No version or build string is exposed by either endpoint, at any tier: that only tells a scanner which vulnerabilities are worth trying."
+That argument is about an anonymous reader, and `/perf` has none: with no token configured it is a 404, and with one it is a 401 without the credential.
+Anyone holding the perf token already reads live latency percentiles and error counters, which is a far better attack signal than a version string.
+`/health` is unauthenticated and still exposes nothing, so the public surface is unchanged.
+The reasoning is recorded in the module docs, and not only in a commit.
 
-### Note
+### 1. Note
 
-The quiche fork is at `efff6235` on branch `m6-cert-compression`. Its own suite passes
-at 1126 + 45 tests, zero warnings and clippy silent in both the default and
-`cert-compression-zstd` configurations.
+The quiche fork is at `efff6235` on branch `m6-cert-compression`.
+Its own suite passes at 1126 + 45 tests, zero warnings and clippy silent in both the default and `cert-compression-zstd` configurations.
 
-## 1.4.0 — 2026-09-16
+1.5.0 caches certificate compression and adds release and drift reporting, and it records the quiche fork revision.
 
-### Performance
+---
 
-**The certificate chain no longer costs a round trip, and the spec deviation that
-hid that is gone.**
+## 1.4.0, 2026-09-16
 
-A QUIC server may send only three times what it has received before it has validated
-the client's address (RFC 9000 8.1). A 1200-byte client Initial gives a 3600-byte
-budget, and m6's uncompressed handshake flight was 4081 bytes: the server sent 3600,
-stopped, and waited a full round trip for an ACK before it could finish. 1.2.0 and
-1.3.0 covered that with `set_max_amplification_factor(4)`, a deliberate deviation
-marked temporary from the day it shipped.
+**The certificate chain no longer costs a round trip, and the spec deviation that hid that is gone.**
 
-Certificate compression (RFC 8879) removes the need for it. Measured against the
-staging origin, same probe and path, only compression changing:
+### 1. Performance
+
+A QUIC server may send only three times what it has received before it has validated the client's address (RFC 9000 8.1).
+A 1200-byte client Initial gives a 3600-byte budget, and m6's uncompressed handshake flight was 4081 bytes: the server sent 3600, stopped, and waited a full round trip for an ACK before it could finish.
+1.2.0 and 1.3.0 covered that with `set_max_amplification_factor(4)`, a deliberate deviation marked temporary from the day it shipped.
+
+Certificate compression (RFC 8879) removes the need for it.
+Measured against the staging origin, same probe and path, only compression changing:
 
 | | server flight | datagrams | handshake |
 |---|---|---|---|
 | no compression | 4081 B | 4 | stalls at 3600, +5.07 ms |
 | brotli | **2859 B** | 3 | no stall, 1.16x |
 
-2859 against a 3600 budget, so the flight fits at the **conforming factor of 3** with
-headroom for a chain that grows. On an intercontinental path, where a round trip is
-270 to 300 ms, that round trip was the single largest avoidable cost in setting up
-a new connection.
+**Table 1: the server flight and handshake with and without brotli compression.**
+Take from it that compression brings the flight under the 3600-byte budget.
 
-### zlib is accepted, never offered
+2859 against a 3600 budget, so the flight fits at the **conforming factor of 3** with headroom for a chain that grows.
+On an intercontinental path, where a round trip is 270 to 300 ms, that round trip was the single largest avoidable cost in setting up a new connection.
 
-m6 compresses with brotli, and with zstd where that feature is built. It accepts all
-three as a client and offers **zlib to nobody**, which needs explaining because it
-looks like missing support and is not.
+### 2. zlib is accepted, never offered
 
-Offering zlib broke h3spec: 38 of 49 tests failed with `TLSDecryptError "cannot
-verify CertificateVerify"`. Not a codec defect. m6's zlib output is ordinary
-RFC 1950 and libz round-trips it byte-identically.
+m6 compresses with brotli, and with zstd where that feature is built.
+It accepts all three as a client and offers **zlib to nobody**, which needs explaining because it looks like missing support and is not.
 
-hs-tls, which h3spec is built on, decodes a CompressedCertificate into a certificate
-chain and then reconstructs the wire bytes by **re-compressing** at zlib's default
-level (`tls/Network/TLS/Packet13.hs`):
+Offering zlib broke h3spec: 38 of 49 tests failed with `TLSDecryptError "cannot verify CertificateVerify"`.
+It is not a codec defect.
+m6's zlib output is ordinary RFC 1950 and libz round-trips it byte-identically.
+
+hs-tls, which h3spec is built on, decodes a CompressedCertificate into a certificate chain and then reconstructs the wire bytes by **re-compressing** at zlib's default level (`tls/Network/TLS/Packet13.hs`):
 
 ```haskell
 putOpaque24 $ BL.toStrict $ compress $ BL.fromStrict bs
 ```
 
-A TLS 1.3 transcript is the handshake messages as transmitted, so a reconstruction
-only agrees when both ends run a byte-identical compressor at identical settings. m6
-compresses at level 9 with miniz_oxide, so the transcript hashes differ and the peer
-rejects m6's CertificateVerify.
+A TLS 1.3 transcript is the handshake messages as transmitted, so a reconstruction only agrees when both ends run a byte-identical compressor at identical settings.
+m6 compresses at level 9 with miniz_oxide, so the transcript hashes differ and the peer rejects m6's CertificateVerify.
 
-zlib is also the only algorithm hs-tls implements, so offering it is precisely what
-selects it for the clients that cannot handle it. Declining it costs them nothing:
-they advertise nothing m6 compresses with, so they receive a plain chain and
-handshake normally. Brotli compresses m6's own chain better than zlib did anyway,
-2859 bytes against 2962.
+zlib is also the only algorithm hs-tls implements, so offering it is precisely what selects it for the clients that cannot handle it.
+Declining it costs them nothing: they advertise nothing m6 compresses with, so they receive a plain chain and handshake normally.
+Brotli compresses m6's own chain better than zlib did anyway, 2859 bytes against 2962.
 
-The failure is independent of certificate size. Three self-signed certificates of
-615 B, 1151 B and 1846 B on disk (EC P-256, RSA-2048, RSA-4096) all fail identically,
-so it is not a fragmentation or flight-size effect.
+The failure is independent of certificate size.
+Three self-signed certificates of 615 B, 1151 B and 1846 B on disk (EC P-256, RSA-2048, RSA-4096) all fail identically, so it is not a fragmentation or flight-size effect.
 
 ### Fixed
 
-**The conformance harness reused an expired certificate, and reported it as a
-protocol regression.** `start_edge` generated its self-signed certificate only when
-the file was absent, never when it had expired, and `$WORK` is a fixed path under
-/tmp that survives between runs. A `-days 2` certificate created on Sep 11 was still
-in use on Sep 15: every handshake failed with `TlsFail`, and h3 scored 11/49 against
-a floor of 47.
+**The conformance harness reused an expired certificate, and reported it as a protocol regression.**
+`start_edge` generated its self-signed certificate only when the file was absent, never when it had expired, and `$WORK` is a fixed path under `/tmp` that survives between runs.
+A `-days 2` certificate created on Sep 11 was still in use on Sep 15: every handshake failed with `TlsFail`, and h3 scored 11/49 against a floor of 47.
 
 That is indistinguishable from a broken server if you read only the summary line.
-Several certificate-compression and amplification measurements were taken against it
-and misread before the certificate itself was checked, and five consecutive source
-changes produced an identical score without that being recognised as the signal it
-was.
+Several certificate-compression and amplification measurements were taken against it and misread before the certificate itself was checked, and five consecutive source changes produced an identical score without that being recognised as the signal it was.
 
-The certificate is now regenerated when it is missing **or** within an hour of
-expiry. Note the direction of this defect: an expired fixture can only cause a false
-FAIL, never a false PASS, so no previously recorded score was inflated by it.
+The certificate is now regenerated when it is missing **or** within an hour of expiry.
+Note the direction of this defect: an expired fixture can only cause a false FAIL, never a false PASS, so no previously recorded score was inflated by it.
 
 ### Changed
 
-The quiche fork is at `bdf00278`, on branch `m6-cert-compression`. It adds RFC 8879
-compression and decompression for zlib, brotli and zstd, with zlib registered for
-decompression only. Its own suite passes unchanged at 1123 + 45 tests, zero warnings
-and clippy silent in both the default and `cert-compression-zstd` configurations.
+The quiche fork is at `bdf00278`, on branch `m6-cert-compression`.
+It adds RFC 8879 compression and decompression for zlib, brotli and zstd, with zlib registered for decompression only.
+Its own suite passes unchanged at 1123 + 45 tests, zero warnings and clippy silent in both the default and `cert-compression-zstd` configurations.
 
-`zstd` remains behind a feature flag: it is the only one of the three with no pure
-Rust compressor, and it saves about 50 bytes less than brotli on a real chain. Not a
-trade worth inheriting silently.
+`zstd` remains behind a feature flag: it is the only one of the three with no pure Rust compressor, and it saves about 50 bytes less than brotli on a real chain.
+It is not a trade worth inheriting silently.
 
-## 1.3.0 — 2026-09-16
+1.4.0 compresses the certificate chain, declines to offer zlib, and fixes the conformance harness's expired certificate.
 
-### Performance
+---
 
-**HTTP/3 0-RTT is enabled.** A returning visitor's request rides in the first
-flight, so a complete response costs one round trip instead of a handshake plus a
-round trip.
+## 1.3.0, 2026-09-16
+
+**HTTP/3 0-RTT is enabled, backend errors name their backend, and the quiche pin is reachable.**
+
+### 1. Performance
+
+**A returning visitor's request rides in the first flight**, so a complete response costs one round trip instead of a handshake plus a round trip.
 
 Measured from a laptop against a 4.92 ms path:
 
@@ -1832,35 +1806,31 @@ Measured from a laptop against a 4.92 ms path:
 | cold, first packet to first response | 23.1 ms | 15.1 ms | 13.0 ms | **6.4 ms** |
 | warm, time to first byte | 10.24 ms | 5.00 ms | 5.02 ms | 5.00 ms |
 
-6.4 ms against a 4.92 ms round trip is **1.3 RTT**, within 0.3 RTT of the floor: no
-HTTP response can beat one round trip, because the request has to arrive and the
-answer has to come back. Against h2 a returning visitor is **2.4x faster** to a
-first response.
+**Table 1: cold and warm response times per protocol, with and without 0-RTT.**
+Take from it that 0-RTT halves the cold h3 time.
 
-The h1 and h3 cold figures are `m6-bench-detail` phase measurements, n=30 for
-per-request phases and n=1 for connection setup, which that tool records only from
-its first post-warmup connection. The 0-RTT figure is n=4 from `m6-probe-h3 --0rtt`
-(6.38, 6.41, 6.49, 6.53 ms).
+6.4 ms against a 4.92 ms round trip is **1.3 RTT**, within 0.3 RTT of the floor: no HTTP response can beat one round trip, because the request has to arrive and the answer has to come back.
+Against h2 a returning visitor is **2.4x faster** to a first response.
 
-**The replay gates are unchanged and still strict.** In early data m6 serves only a
-FRESH cache hit and answers 425 Too Early to everything else — not merely RFC 8470's
-"idempotent methods". This site's analytics beacon is a fire-and-forget GET, so
-"GET is safe" would not have been enough, and a stale hit queues a background
-refresh, which is a write.
+The h1 and h3 cold figures are `m6-bench-detail` phase measurements, n=30 for per-request phases and n=1 for connection setup, which that tool records only from its first post-warmup connection.
+The 0-RTT figure is n=4 from `m6-probe-h3 --0rtt` (6.38, 6.41, 6.49, 6.53 ms).
+
+**The replay gates are unchanged and still strict.**
+In early data m6 serves only a FRESH cache hit and answers 425 Too Early to everything else, and not merely RFC 8470's "idempotent methods".
+This site's analytics beacon is a fire-and-forget GET, so "GET is safe" would not have been enough, and a stale hit queues a background refresh, which is a write.
 
 ### Fixed
 
-**Enabling 0-RTT used to cost a conformance test. It no longer does**, and the
-failure was in three different places before it was found.
+**Enabling 0-RTT used to cost a conformance test.**
+It no longer does, and the failure was in three different places before it was found.
 
-h3spec's `MUST send PROTOCOL_VIOLATION if CRYPTO in 0-RTT is received [TLS 8.3]`
-took h3 from 47/49 to 46/49 whenever early data was enabled. Three fixes in the
-quiche fork, of which the first two were in the wrong place:
+h3spec's `MUST send PROTOCOL_VIOLATION if CRYPTO in 0-RTT is received [TLS 8.3]` took h3 from 47/49 to 46/49 whenever early data was enabled.
+Three fixes in the quiche fork, of which the first two were in the wrong place:
 
-1. **A guard on the CRYPTO frame** in `process_frame`. Correct per RFC 9001 §8.3 and
-   it changed the score not at all. h3spec sends its 0-RTT packet during a FRESH
-   handshake with no resumption, so there is no 0-RTT read key, so the packet is
-   buffered as undecryptable and its frames are never parsed. Its own qlog:
+1. **A guard on the CRYPTO frame** in `process_frame`.
+   Correct per RFC 9001 §8.3, and it changed the score not at all.
+   h3spec sends its 0-RTT packet during a FRESH handshake with no resumption, so there is no 0-RTT read key, so the packet is buffered as undecryptable and its frames are never parsed.
+   Its own qlog:
 
    ```
    1. initial: [crypto, padding]
@@ -1869,79 +1839,69 @@ quiche fork, of which the first two were in the wrong place:
    4. initial: [ack, crypto, padding]
    ```
 
-   A check on frame CONTENTS cannot fire for that, by anyone. Kept regardless: it is
-   correct for a genuinely resumed connection, where the frame is readable.
+   A check on frame CONTENTS cannot fire for that, by anyone.
+   Kept regardless: it is correct for a genuinely resumed connection, where the frame is readable.
 
-2. **Reject on the packet TYPE**, before decryption. A server holding handshake keys
-   but no 0-RTT key knows no PSK was accepted, so the peer sent 0-RTT it was never
-   entitled to send. This detected the violation — m6-http logged
-   `conn.recv error: InvalidPacket` — and h3spec still failed.
+2. **Reject on the packet TYPE**, before decryption.
+   A server holding handshake keys but no 0-RTT key knows no PSK was accepted, so the peer sent 0-RTT it was never entitled to send.
+   This detected the violation, m6-http logged `conn.recv error: InvalidPacket`, and h3spec still failed.
 
-3. **The CONNECTION_CLOSE was going where the client could not read it.** quiche put
-   it in a Handshake packet, and a client derives its handshake keys from the
-   server's flight, which had not been sent. The client's qlog showed it received
-   only an Initial carrying an ACK: no close, no server CRYPTO at all.
-   `write_pkt_type` preferred an Initial close only when `recv_count == 0`, a
-   first-flight case; here it was non-zero. Now keyed on whether the server has ever
-   sent a Handshake packet, which is the fact that decides whether the peer could
-   hold the keys.
+3. **The CONNECTION_CLOSE was going where the client could not read it.**
+   quiche put it in a Handshake packet, and a client derives its handshake keys from the server's flight, which had not been sent.
+   The client's qlog showed it received only an Initial carrying an ACK: no close, no server CRYPTO at all.
+   `write_pkt_type` preferred an Initial close only when `recv_count == 0`, a first-flight case.
+   Here it was non-zero.
+   It is now keyed on whether the server has ever sent a Handshake packet, which is the fact that decides whether the peer could hold the keys.
 
-   A first version preferred Initial whenever the handshake was unconfirmed, and
-   quiche's own `app_close_by_server_during_handshake_not_established` caught it:
-   there the client IS established and has discarded its Initial keys, so Initial is
-   the unreadable one.
+   A first version preferred Initial whenever the handshake was unconfirmed, and quiche's own `app_close_by_server_during_handshake_not_established` caught it: there the client IS established and has discarded its Initial keys, so Initial is the unreadable one.
 
-**Backend errors name the backend.** The monitor reported a single total, "3 backend
-errors since start", leaving the operator to guess the service. The guess that
-matters is render-contact: a contact submission whose SMTP send fails returns 500
-and is counted nowhere else, so an anonymous total is the difference between seeing
-silent mail loss and not seeing it.
+**Backend errors name the backend.**
+The monitor reported a single total, "3 backend errors since start", leaving the operator to guess the service.
+The guess that matters is render-contact: a contact submission whose SMTP send fails returns 500 and is counted nowhere else, so an anonymous total is the difference between seeing silent mail loss and not seeing it.
 
-m6-http already knew which backend errored — `Stats::record` takes the name and uses
-it to decide whether an error counts at all — and then discarded it. Now kept per
-backend, on `/perf`, rendered worst-first:
+m6-http already knew which backend errored, `Stats::record` takes the name and uses it to decide whether an error counts at all, and then discarded it.
+It is now kept per backend, on `/perf`, rendered worst-first:
 
 ```
 3 backend errors since start: render-contact 5, m6-html 2
 ```
 
-The new field is `serde(default)`, so a node older than this reports "node too old
-to attribute them" rather than nothing, which is the same rule this codebase uses
-for absent sample counts.
+The new field is `serde(default)`, so a node older than this reports "node too old to attribute them" and not nothing, which is the same rule this codebase uses for absent sample counts.
 
 ### Security
 
-**The pinned quiche revision was unreferenced.** 1.2.0 pinned
-`916a5a25`, which sat on no branch and no tag in the fork and was reachable only by
-raw SHA. GitHub garbage-collects unreferenced objects; when that happened every
-build would have failed, CI included, and the commit would have been unrecoverable.
-Now referenced by both a branch and a tag, `m6-pinned-1.2.0`.
+**The pinned quiche revision was unreferenced.**
+1.2.0 pinned `916a5a25`, which sat on no branch and no tag in the fork and was reachable only by raw SHA.
+GitHub garbage-collects unreferenced objects.
+When that happened every build would have failed, CI included, and the commit would have been unrecoverable.
+It is now referenced by both a branch and a tag, `m6-pinned-1.2.0`.
 
-The fork is now at `4bbba71e`. Its own suite passes unchanged at 1123 + 45 tests.
-
-### Changed
-
-`tools/build-host-tests.sh` reports build-host disk usage and, above 80%, prints the
-command that reclaims it. `cargo test --workspace` fills `target/debug` and cargo
-never garbage-collects it: the build host sat at 73% with **65G** of debug artefacts
-across 5023 dependency files and 2311 fingerprint directories, against 6G of release
-trees that deploys actually use. Clearing it took 104G used down to 37G.
-
-Reported rather than deleted automatically. A gate that quietly removes 65G of build
-cache makes the next run slow for reasons the operator did not choose.
-
-## 1.2.0 — 2026-09-15
+The fork is now at `4bbba71e`.
+Its own suite passes unchanged at 1123 + 45 tests.
 
 ### Changed
 
-**m6-monitor polls on a schedule and serves the report over HTTP.**
+`tools/build-host-tests.sh` reports build-host disk usage and, above 80%, prints the command that reclaims it.
+`cargo test --workspace` fills `target/debug` and cargo never garbage-collects it: the build host sat at 73% with **65G** of debug artefacts across 5023 dependency files and 2311 fingerprint directories, against 6G of release trees that deploys actually use.
+Clearing it took 104G used down to 37G.
 
-Every request used to poll the whole fleet itself: `page` and `digest_json` each
-called `collect_from` directly, with no background loop and no cached state. So
-load on the production nodes scaled with how often anyone LOOKED at the monitor,
-two requests moments apart could disagree because they came from different polls,
-and every request paid the full poll latency. Measured over an ssh-forwarded unix
-socket:
+It is reported and not deleted automatically.
+A gate that quietly removes 65G of build cache makes the next run slow for reasons the operator did not choose.
+
+1.3.0 enables 0-RTT, names the backend behind each error, and makes the quiche pin survive garbage collection.
+
+---
+
+## 1.2.0, 2026-09-15
+
+**m6-monitor polls on a schedule and serves the report over HTTP**, and `GET /check` returns the whole health report as text.
+
+### Changed
+
+**Every request used to poll the whole fleet itself.**
+`page` and `digest_json` each called `collect_from` directly, with no background loop and no cached state.
+So load on the production nodes scaled with how often anyone LOOKED at the monitor, two requests moments apart could disagree because they came from different polls, and every request paid the full poll latency.
+Measured over an ssh-forwarded unix socket:
 
 | endpoint | before | after |
 |---|---|---|
@@ -1949,440 +1909,313 @@ socket:
 | `/` | 2.86 s | **0.013 s** |
 | `/check` | **404** | **200, 0.011 s** |
 
-A thread spawned at startup now refreshes a shared snapshot every
-`poll_interval_s` (default 30). All three routes read it and none of them polls.
+**Table 1: monitor endpoint latency before and after the change.**
+Take from it that reading a cached snapshot is orders of magnitude faster than polling.
+
+A thread spawned at startup now refreshes a shared snapshot every `poll_interval_s` (default 30).
+All three routes read it, and none of them polls.
 
 ### Added
 
-**`GET /check` returns the whole A-to-G health report as text.** `check::render`
-produced it already and was reachable only through the one-shot `--check` CLI,
-which is the only reason that flag existed. The health check is now one fetch over
-a forwarded socket, with no ssh to any node:
+**`GET /check` returns the whole A-to-G health report as text.**
+`check::render` produced it already and was reachable only through the one-shot `--check` CLI, which is the only reason that flag existed.
+The health check is now one fetch over a forwarded socket, with no ssh to any node:
 
 ```sh
 ssh -fN -L /tmp/m6mon.sock:/run/m6/m6-monitor.sock user@example.com
 curl --unix-socket /tmp/m6mon.sock http://localhost/check
 ```
 
-**Every response states the age of its reading.** `/check` prints
-`polled 25.3s ago (...)` as its FIRST line so it cannot be read past, and a
-snapshot older than three intervals prints a STALE banner saying the poller is
-failing and the figures are not current. `/digest` carries `snapshot_age_s`,
-`snapshot_at`, `poll_interval_s` and `stale`.
+**Every response states the age of its reading.**
+`/check` prints `polled 25.3s ago (...)` as its FIRST line so it cannot be read past, and a snapshot older than three intervals prints a STALE banner saying the poller is failing and the figures are not current.
+`/digest` carries `snapshot_age_s`, `snapshot_at`, `poll_interval_s` and `stale`.
 
-A monitor serving an old reading without saying so is worse than one that is
-plainly down, because it looks like current information. Before the first poll
-completes both return 503 and say so rather than serving zeroes: "not measured
-yet" and "measured as zero" are different claims, which is the same distinction
-this codebase makes for handshake sample counts. A failed poll KEEPS the previous
-snapshot and lets its age grow, rather than discarding the last known good reading
-or presenting it as current.
+A monitor serving an old reading without saying so is worse than one that is plainly down, because it looks like current information.
+Before the first poll completes both return 503 and say so, and not serving zeroes: "not measured yet" and "measured as zero" are different claims, which is the same distinction this codebase makes for handshake sample counts.
+A failed poll KEEPS the previous snapshot and lets its age grow, and it does not discard the last known good reading or present it as current.
 
 ### Fixed
 
-**`m6-probe-h3` made the server it measured log errors.** `quic_handshake_shape`
-set a unidirectional stream limit but granted no `initial_max_stream_data_uni`
-credit, which defaults to 0. The server could open its h3 control and QPACK
-streams but not write SETTINGS on them, so
-`h3::Connection::with_transport` failed and m6-http logged
-`h3 init error: TransportError(StreamLimit)` for every probe connection.
+**`m6-probe-h3` made the server it measured log errors.**
+`quic_handshake_shape` set a unidirectional stream limit but granted no `initial_max_stream_data_uni` credit, which defaults to 0.
+The server could open its h3 control and QPACK streams but not write SETTINGS on them, so `h3::Connection::with_transport` failed and m6-http logged `h3 init error: TransportError(StreamLimit)` for every probe connection.
 
-Probing production wrote 18 such warnings into origin's journal and 4 each into edge-a's
-and edge-b's, which then surfaced in a health check as an unexplained new error on two
-nodes. Seven-day totals confirmed no real client had ever triggered it.
+Probing production wrote 18 such warnings into origin's journal and 4 each into edge-a's and edge-b's, which then surfaced in a health check as an unexplained new error on two nodes.
+Seven-day totals confirmed no real client had ever triggered it.
 
-The handshake figures were unaffected, because QUIC establishment completes before
-h3 is set up. But a measuring tool that makes the thing it measures log errors is
-not read-only, and nobody reading those journals could have known the cause was the
-probe. Verified: 4 errors before the fix, 0 after. Setting the stream limit alone
-changed nothing, which is how the real cause was found.
+The handshake figures were unaffected, because QUIC establishment completes before h3 is set up.
+But a measuring tool that makes the thing it measures log errors is not read-only, and nobody reading those journals could have known the cause was the probe.
+Verified: 4 errors before the fix, 0 after.
+Setting the stream limit alone changed nothing, which is how the real cause was found.
 
-**The config path comes from `AppContext.config_path`** rather than
-`std::env::args().nth(2)`, which quietly assumed an argument position.
+**The config path comes from `AppContext.config_path`**, and not from `std::env::args().nth(2)`, which quietly assumed an argument position.
 
-### Note
+### 1. Note
 
-`m6-monitor --check <config>` still works and does the same render, but re-polls
-the fleet to do it. It should go once `/check` has been the normal route for a
-release. `--help` does not list it: the usage string is generated by core's `App`
-and a service cannot declare its own flags, recorded in issue #32.
+`m6-monitor --check <config>` still works and does the same render, but re-polls the fleet to do it.
+It should go once `/check` has been the normal route for a release.
+`--help` does not list it: the usage string is generated by core's `App`, and a service cannot declare its own flags, recorded in issue #32.
 
-## 1.1.0 — 2026-09-15
+1.2.0 makes the monitor serve a cached snapshot, and it adds the `/check` endpoint and the age-of-reading fields.
 
-### Performance
+---
 
-**The HTTP/3 handshake took two round trips and now takes one.** Staging went
-from ~12.5 ms to ~6.8 ms on a 5 ms path.
+## 1.1.0, 2026-09-15
 
-A QUIC server may send only `factor x bytes received` before it has validated the
-client's address, to stop it being used as a reflection amplifier (RFC 9000 §8.1).
-A client's opening Initial is padded to 1200 bytes, so at quiche's default factor
-of 3 the budget is 3600. m6-http's handshake flight is 4082 bytes, nearly all
-certificate chain, so quiche sent 3600, stopped with 482 bytes owed, and waited a
-full round trip for the client's ACK. Measured against a 4.85 ms RTT:
+**The HTTP/3 handshake goes from two round trips to one, and `/perf` gains per-channel handshake timing, three probe clients and real latency.**
+
+### 1. Performance
+
+**The HTTP/3 handshake took two round trips and now takes one.**
+Staging went from ~12.5 ms to ~6.8 ms on a 5 ms path.
+
+A QUIC server may send only `factor x bytes received` before it has validated the client's address, to stop it being used as a reflection amplifier (RFC 9000 §8.1).
+A client's opening Initial is padded to 1200 bytes, so at quiche's default factor of 3 the budget is 3600.
+m6-http's handshake flight is 4082 bytes, nearly all certificate chain, so quiche sent 3600, stopped with 482 bytes owed, and waited a full round trip for the client's ACK.
+Measured against a 4.85 ms RTT:
 
 ```
 +7.240ms  server 3600B   3.00x   <- stops dead, 482 bytes still owed
 +12.221ms server 4082B           <- one full round trip later
 ```
 
-`cfg.set_max_amplification_factor(4)` raises the budget to 4800 and the flight
-goes out in one piece. **Conformance is unchanged at 47/49**, measured either side
-of the change rather than assumed: h3spec does not test this limit.
+`cfg.set_max_amplification_factor(4)` raises the budget to 4800 and the flight goes out in one piece.
+**Conformance is unchanged at 47/49**, measured either side of the change and not assumed: h3spec does not test this limit.
 
-**This is deliberately temporary and marked as such in the source.** RFC 9000
-§8.1 says MUST NOT exceed 3. It is accepted because 3x and 4x are the same
-practical outcome for a reflection amplifier — DNS gives around 50x, NTP monlist
-500x, memcached 50,000x, and at either factor the attacker burns a third or a
-quarter of the attack on their own upstream. The line is deleted when certificate
-compression lands (issue #28), which measurement shows is sufficient: zlib takes
-the chain from 3400 to 2345 bytes, saving 1055 where 482 is needed.
+**This is deliberately temporary and marked as such in the source.**
+RFC 9000 §8.1 says MUST NOT exceed 3.
+It is accepted because 3x and 4x are the same practical outcome for a reflection amplifier: DNS gives around 50x, NTP monlist 500x, memcached 50,000x, and at either factor the attacker burns a third or a quarter of the attack on their own upstream.
+The line is deleted when certificate compression lands (issue #28), which measurement shows is sufficient: zlib takes the chain from 3400 to 2345 bytes, saving 1055 where 482 is needed.
 
-This is also the ordinary case rather than anything unusual about one deployment.
-Fastly's study measured 40-44% of uncompressed chains exceeding the budget, and
-compression taking that to 1-9%.
+This is the ordinary case, and not anything unusual about one deployment.
+Fastly's study measured 40-44% of uncompressed chains exceeding the budget, and compression taking that to 1-9%.
 
 ### Added
 
-**Per-channel handshake timing on `/perf`, for h1, h2 and h3, split by
-resumption.** Never summed on either axis, because neither axis is the same
-measurement:
+**Per-channel handshake timing on `/perf`, for h1, h2 and h3, split by resumption.**
+It is never summed on either axis, because neither axis is the same measurement:
 
-- h1 and h2 are the rustls handshake and EXCLUDE the TCP round trip, which
-  finished before rustls saw the socket. h3 is the QUIC handshake and INCLUDES its
-  equivalent, because QUIC folds transport and crypto together.
-- a resumed handshake skips the certificate and the signature. rustls with the
-  `std` feature defaults to a 256-session store, so resumption is already
-  happening without anything being configured for it, and blending the two gives a
-  figure that moves with the returning-visitor mix while neither cost changes.
+- h1 and h2 are the rustls handshake and EXCLUDE the TCP round trip, which finished before rustls saw the socket.
+  h3 is the QUIC handshake and INCLUDES its equivalent, because QUIC folds transport and crypto together.
+- a resumed handshake skips the certificate and the signature.
+  rustls with the `std` feature defaults to a 256-session store, so resumption is already happening without anything being configured for it, and blending the two gives a figure that moves with the returning-visitor mix while neither cost changes.
 
-Each of the four groups carries windowed percentiles plus a lifetime count, mean,
-min and max that the reservoir cannot discard. The per-channel reservoir is now
-1024, up from 512.
+Each of the four groups carries windowed percentiles plus a lifetime count, mean, min and max that the reservoir cannot discard.
+The per-channel reservoir is now 1024, up from 512.
 
-**Three single-purpose probe clients**: `m6-probe-h1`, `m6-probe-h2`,
-`m6-probe-h3`. One protocol each, one handshake per connection, strictly
-sequential, no requests and no charts. They exist because a figure the server
-reports about itself has to be checkable against something. `m6-probe-h3` also
-reports handshake shape — client flights, server datagrams, and a per-packet
-timeline with the live amplification ratio — which is what identified the round
-trip above.
+**Three single-purpose probe clients**: `m6-probe-h1`, `m6-probe-h2`, `m6-probe-h3`.
+One protocol each, one handshake per connection, strictly sequential, no requests and no charts.
+They exist because a figure the server reports about itself has to be checkable against something.
+`m6-probe-h3` also reports handshake shape, client flights, server datagrams, and a per-packet timeline with the live amplification ratio, which is what identified the round trip above.
 
-**m6-monitor renders three sections it previously could not**: firewall blocks,
-cache-header assertions taken from the deployment's own declaration rather than
-duplicated in the monitor, and connection setup per channel. `header_faults` folds
-into the verdict, so a wrong cache policy can no longer print ALL CLEAR.
+**m6-monitor renders three sections it previously could not**: firewall blocks, cache-header assertions taken from the deployment's own declaration and not duplicated in the monitor, and connection setup per channel.
+`header_faults` folds into the verdict, so a wrong cache policy can no longer print ALL CLEAR.
 
 ### Fixed
 
 **A completed TLS handshake was discarded if the client closed immediately.**
-`advance_tls` returns `Err` on EOF, and a client that finishes its handshake and
-closes at once sends the final flight and the FIN together, so one call completed
-the handshake, hit EOF, took the error path, replaced `conn.kind` and returned
-about forty lines above where the handshake was recorded.
+`advance_tls` returns `Err` on EOF, and a client that finishes its handshake and closes at once sends the final flight and the FIN together, so one call completed the handshake, hit EOF, took the error path, replaced `conn.kind` and returned about forty lines above where the handshake was recorded.
 
-Measured with 200 sequential handshakes per protocol against a client figure of
-0.34 ms: **h1 recorded 0 of 200**, because nothing happens after an h1 handshake
-so the close won every time, and the channel did not appear on `/perf` at all.
-**h2 recorded 70 of 200 at a p50 of 6.14 ms**, because the only survivors were
-connections the server reached before the close — that is, ones that had already
-waited an extra event-loop turn. The surviving population was selected for
-slowness, so the figure read 18x the truth and looked plausible. h3 was unaffected,
-recording 200 of 200 correctly, because the QUIC path stamps inside the packet
-handler.
+Measured with 200 sequential handshakes per protocol against a client figure of 0.34 ms: **h1 recorded 0 of 200**, because nothing happens after an h1 handshake so the close won every time, and the channel did not appear on `/perf` at all.
+**h2 recorded 70 of 200 at a p50 of 6.14 ms**, because the only survivors were connections the server reached before the close, the ones that had already waited an extra event-loop turn.
+The surviving population was selected for slowness, so the figure read 18x the truth and looked plausible.
+h3 was unaffected, recording 200 of 200 correctly, because the QUIC path stamps inside the packet handler.
 
-**`m6-bench-detail` panicked before measuring anything.** m6-http builds rustls
-with `default-features = false`, so no process-level `CryptoProvider` is installed
-automatically and the first `ClientConfig::builder()` panicked. Every other binary
-in the crate installs it in `main`; this one built a provider inside a verifier
-method and dropped the result. Its h1 config also offered no ALPN, so it measured
-whichever channel the server fell back to, and its chart directory was never
-created, making every SVG write fail while the run still exited 0.
+**`m6-bench-detail` panicked before measuring anything.**
+m6-http builds rustls with `default-features = false`, so no process-level `CryptoProvider` is installed automatically and the first `ClientConfig::builder()` panicked.
+Every other binary in the crate installs it in `main`, and this one built a provider inside a verifier method and dropped the result.
+Its h1 config also offered no ALPN, so it measured whichever channel the server fell back to, and its chart directory was never created, making every SVG write fail while the run still exited 0.
 
 ### Security
 
 **rustls 0.23.44 → 0.23.45, for RUSTSEC-2026-0285.**
 
-**rustls 0.23.44 → 0.23.45, for RUSTSEC-2026-0285.**
-
-rustls accepted TLS 1.3 handshake messages sent at the wrong encryption level
-when they followed a key-changing message in the same record: a plaintext
-`EncryptedExtensions` packed into the same record as the `ServerHello`, for
-example. RFC 8446 §5.1 requires that handshake messages do not span key changes
-and that the connection is terminated with `unexpected_message` if they do.
+rustls accepted TLS 1.3 handshake messages sent at the wrong encryption level when they followed a key-changing message in the same record: a plaintext `EncryptedExtensions` packed into the same record as the `ServerHello`, for example.
+RFC 8446 §5.1 requires that handshake messages do not span key changes and that the connection is terminated with `unexpected_message` if they do.
 Functionally the same bug as Go's GO-2026-4340 (CVE-2025-61730).
 
-`CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N`, category crypto-failure. The
-advisory is explicit that the handshake transcript is still authenticated, so a
-network-position attacker cannot use this to alter or complete a handshake; the
-practical effect is that a peer could send handshake messages that should have
-been encrypted in plaintext without rustls rejecting the connection. A
-protocol-strictness failure rather than a break in authentication. m6-http
-terminates TLS, so it is fixed rather than deferred to the next release.
+`CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N`, category crypto-failure.
+The advisory is explicit that the handshake transcript is still authenticated, so a network-position attacker cannot use this to alter or complete a handshake, and the practical effect is that a peer could send handshake messages that should have been encrypted in plaintext without rustls rejecting the connection.
+A protocol-strictness failure and not a break in authentication.
+m6-http terminates TLS, so it is fixed and not deferred to the next release.
 
-`Cargo.lock` only: the declared constraint was already `"0.23"`. Three edges
-move rather than one, and `cargo update --dry-run` reporting "Locking 1 package"
-undersells it — `cssparser-macros → syn` goes 3.0.5 to 2.0.119 and
-`tempfile → getrandom` goes 0.4.3 to 0.3.4. Both are cargo re-resolving onto
-versions **already present in the lockfile** rather than new dependencies, both
-are build-time graphs, and pointing `cssparser-macros` at the syn 2 the rest of
-the tree already uses reduces duplication.
+`Cargo.lock` only: the declared constraint was already `"0.23"`.
+Three edges move and not one, and `cargo update --dry-run` reporting "Locking 1 package" undersells it: `cssparser-macros → syn` goes 3.0.5 to 2.0.119 and `tempfile → getrandom` goes 0.4.3 to 0.3.4.
+Both are cargo re-resolving onto versions already present in the lockfile and not new dependencies, both are build-time graphs, and pointing `cssparser-macros` at the syn 2 the rest of the tree already uses reduces duplication.
 
-Verified against a real handshake rather than a successful build, since the
-change is a TLS library: TLS 1.3 negotiating `AEAD-CHACHA20-POLY1305-SHA256`
-with verify 0, TLS 1.2 negotiating `ECDHE-RSA-CHACHA20-POLY1305`, ALPN h2 and
-h1 both answering 200.
+Verified against a real handshake and not a successful build, since the change is a TLS library: TLS 1.3 negotiating `AEAD-CHACHA20-POLY1305-SHA256` with verify 0, TLS 1.2 negotiating `ECDHE-RSA-CHACHA20-POLY1305`, ALPN h2 and h1 both answering 200.
 
 ### Changed
 
-**A secrets file supplies values; it no longer overrides them.** A key set in
-both a config and its `secrets_file` is now an error at load, naming every
-clashing key and both paths. It used to merge with "src wins on conflict",
-silently, so a config file could state a value that was not the one in use.
+**A secrets file supplies values, and it no longer overrides them.**
+A key set in both a config and its `secrets_file` is now an error at load, naming every clashing key and both paths.
+It used to merge with "src wins on conflict", silently, so a config file could state a value that was not the one in use.
 
-That is not hypothetical. A deployed renderer config read `host = "localhost"`,
-`port = 1025` and a `from` address, and all of them were inert because the
-secrets file set them too: the service was relaying through a real provider and
-sending as a different domain. An audit read the deployed config and drew the
-wrong conclusion. A file that is overridden looks exactly like a file that is
-correct when you are holding one file.
+That is not hypothetical.
+A deployed renderer config read `host = "localhost"`, `port = 1025` and a `from` address, and all of them were inert because the secrets file set them too: the service was relaying through a real provider and sending as a different domain.
+An audit read the deployed config and drew the wrong conclusion.
+A file that is overridden looks exactly like a file that is correct when you are holding one file.
 
-Tables are still descended into, so two files contributing DIFFERENT keys to one
-section is unaffected -- that is what a secrets file is for. A clash is one value
-claimed twice. An empty string counts as a value, because `username = ""` beside
-a real username is exactly how a config comes to look as though it holds
-credentials.
+Tables are still descended into, so two files contributing DIFFERENT keys to one section is unaffected, and that is what a secrets file is for.
+A clash is one value claimed twice.
+An empty string counts as a value, because `username = ""` beside a real username is exactly how a config comes to look as though it holds credentials.
 
-**This is a breaking change for any deployment whose two files overlap.** The
-service will refuse to start and say which keys. The fix is to give each key one
-owner: secrets in the secrets file, everything else in the config. If the config
-held a deliberately broken placeholder so that a missing secrets file would fail
-loudly, delete it -- an absent required key already fails loudly and names
-itself, which a present-but-wrong value does not.
+**This is a breaking change for any deployment whose two files overlap.**
+The service will refuse to start and say which keys.
+The fix is to give each key one owner: secrets in the secrets file, everything else in the config.
+If the config held a deliberately broken placeholder so that a missing secrets file would fail loudly, delete it, because an absent required key already fails loudly and names itself, which a present-but-wrong value does not.
 
 ### Fixed
 
-**No email address is published in `SECURITY.md`.** GitHub renders that file on
-the repository front page, so an address in it is an address scrapers read. It
-now points at GitHub private vulnerability reporting, which is the better channel
-anyway because it threads and takes attachments, and at a contact form.
+**No email address is published in `SECURITY.md`.**
+GitHub renders that file on the repository front page, so an address in it is an address scrapers read.
+It now points at GitHub private vulnerability reporting, which is the better channel anyway because it threads and takes attachments, and at a contact form.
 
-`m6-core`'s "this crate names no particular deployment" test grew the second
-domain it had been missing, which is how a personal address survived in that file.
-Its own self-test was checking one entry of the banned list rather than all of
-them, which is why a missing entry was never going to be noticed.
+`m6-core`'s "this crate names no particular deployment" test grew the second domain it had been missing, which is how a personal address survived in that file.
+Its own self-test was checking one entry of the banned list and not all of them, which is why a missing entry was never going to be noticed.
 
 **`/perf` reported no latency at all, on every node, and never had.**
 
-`m6-http`'s aggregate latency reservoirs were cleared by `maybe_emit` every ten
-seconds, and `Stats::snapshot()` -- which is what `/perf` serves -- read those
-same fields. So `/perf` returned the percentiles of whatever fraction of a
-ten-second window happened to be open when it was scraped, and a node taking a
-couple of requests a minute has almost no cache hits in any given ten seconds.
+`m6-http`'s aggregate latency reservoirs were cleared by `maybe_emit` every ten seconds, and `Stats::snapshot()`, which is what `/perf` serves, read those same fields.
+So `/perf` returned the percentiles of whatever fraction of a ten-second window happened to be open when it was scraped, and a node taking a couple of requests a minute has almost no cache hits in any given ten seconds.
 
-Observed on a production origin with ten hours of uptime: `cache_hits_total: 338`
-beside `hit_samples: 0, hit_p50_ns: 0, hit_p99_ns: 0`. m6-monitor correctly reads
-zero samples as "not measured" and publishes `null`, so the fleet digest carried
-**no latency for any node**, while the `periodic stats` log line was printing
-`hit_p50_ns=3878` for the same counter in the same minute.
+Observed on a production origin with ten hours of uptime: `cache_hits_total: 338` beside `hit_samples: 0, hit_p50_ns: 0, hit_p99_ns: 0`.
+m6-monitor correctly reads zero samples as "not measured" and publishes `null`, so the fleet digest carried **no latency for any node**, while the `periodic stats` log line was printing `hit_p50_ns=3878` for the same counter in the same minute.
 
-The per-channel reservoirs were never cleared and held real data throughout,
-which is why this survived: anyone scrolling past the aggregate in `/perf` saw
-plausible per-channel numbers. The aggregate is the only figure m6-monitor reads.
+The per-channel reservoirs were never cleared and held real data throughout, which is why this survived: anyone scrolling past the aggregate in `/perf` saw plausible per-channel numbers.
+The aggregate is the only figure m6-monitor reads.
 
-The reservoirs now run as rings and are never cleared. New `*_window_added`
-counters give the periodic log its own ten-second window, so the operational
-logging is unchanged -- which is the property `snapshot()`'s comment was
-protecting when it declined to reset. Declining to reset was right; also reading
-the window the emitter reset was the defect. One reservoir, no extra memory, no
-extra work on the request path.
+The reservoirs now run as rings and are never cleared.
+New `*_window_added` counters give the periodic log its own ten-second window, so the operational logging is unchanged, which is the property `snapshot()`'s comment was protecting when it declined to reset.
+Declining to reset was right, and also reading the window the emitter reset was the defect.
+One reservoir, no extra memory, no extra work on the request path.
 
-`percentiles_ring` replaces `percentiles`: it reads the newest *n* entries rather
-than `samples[..n]` from the front, which was correct only while the index was
-reset every window. Against a ring that genuinely wraps, reading from the front
-reports the **oldest** samples as current, so the two changes had to land
-together.
+`percentiles_ring` replaces `percentiles`: it reads the newest *n* entries and not `samples[..n]` from the front, which was correct only while the index was reset every window.
+Against a ring that genuinely wraps, reading from the front reports the **oldest** samples as current, so the two changes had to land together.
 
-`snapshot()`'s percentiles now span the most recent up to 4096 samples, **a count
-rather than a period of time**. On a quiet node that reaches back hours and
-blends idle and busy traffic, which matters because this number is load dependent
-(`docs/PERFORMANCE.md` §4). `hit_samples` and `miss_samples` are therefore
-reported beside the percentiles in the periodic log as well, and m6-monitor's
-digest carries `hit_samples` per node so the figure can be read at all.
+`snapshot()`'s percentiles now span the most recent up to 4096 samples, **a count and not a period of time**.
+On a quiet node that reaches back hours and blends idle and busy traffic, which matters because this number is load dependent (`docs/PERFORMANCE.md` §4).
+`hit_samples` and `miss_samples` are therefore reported beside the percentiles in the periodic log as well, and m6-monitor's digest carries `hit_samples` per node so the figure can be read at all.
 
-Verified: six tests in `stats::perf_reservoir_tests`, three of which fail against
-the old reset, checked by reinstating it. End to end against a running 05-cms
-stack, scraped across two emit boundaries with silence between them: 81 samples,
-p50 2,250ns, p99 5,625ns, stable across all three scrapes, where the old code
-returned zeros. The periodic log still reports per-window figures: 39 hits at
-p50 2,208ns in the busy window, zeros in the idle ones either side.
+Verified: six tests in `stats::perf_reservoir_tests`, three of which fail against the old reset, checked by reinstating it.
+End to end against a running 05-cms stack, scraped across two emit boundaries with silence between them: 81 samples, p50 2,250ns, p99 5,625ns, stable across all three scrapes, where the old code returned zeros.
+The periodic log still reports per-window figures: 39 hits at p50 2,208ns in the busy window, zeros in the idle ones either side.
+
+1.1.0 cuts the HTTP/3 handshake to one round trip, and it fixes TLS handshake recording and latency reporting on `/perf`.
 
 ---
 
-## 1.0.0 — 2026-09-14
+## 1.0.0, 2026-09-14
 
-The first release. Everything under this heading was on `develop` unreleased and
-undeployed, some of it for months.
+The first release.
+Everything under this heading was on `develop` unreleased and undeployed, some of it for months.
 
 `docs/PERFORMANCE.md` has the measured performance story by commit.
 
-### What this repository is
+### 1. What this repository is
 
-**m6 is a generic web system: an HTTP edge and a library for writing services
-behind it.** It is not a website. A site built on m6 is a separate repository
-with its own changelog and its own version numbers, and nothing about any
-particular site's content, fleet or deployment schedule belongs in this file.
+**m6 is a generic web system: an HTTP edge and a library for writing services behind it.**
+It is not a website.
+A site built on m6 is a separate repository with its own changelog and its own version numbers, and nothing about any particular site's content, fleet or deployment schedule belongs in this file.
 
-The boundary is the wire contract in `docs/m6-backend-protocol.md`, which is
-version 1 and language agnostic, plus `m6-core` for services that want the Rust
-conveniences. Anything that generalises belongs here; anything true only of one
-deployment does not.
+The boundary is the wire contract in `docs/m6-backend-protocol.md`, which is version 1 and language agnostic, plus `m6-core` for services that want the Rust conveniences.
+Anything that generalises belongs here, and anything true only of one deployment does not.
 
-### What 1.0.0 means here
+### 2. What 1.0.0 means here
 
-It does not mean finished. It means the consolidation work is done, the checks
-are real, and the numbers in this repository are measurements rather than claims.
-The API is stable enough to tag and pin against, which is what
-`m6-backend-protocol.md` version 1 already says about the wire contract.
+It does not mean finished.
+It means the consolidation work is done, the checks are real, and the numbers in this repository are measurements and not claims.
+The API is stable enough to tag and pin against, which is what `m6-backend-protocol.md` version 1 already says about the wire contract.
 
-### The body of work
+### 3. The body of work
 
-- **m6-core is the PHP of m6**, phases 0 to 6: a box of blocks a service is
-  assembled from, and the only crate a service links. `m6-file` and
-  `m6-auth-server` are `App` services now; m6-file lost 969 lines including a
-  second router and a second config parser.
-- **Config-driven routes.** `App::handler(name, f)` plus `handler = "..."` on a
-  route, rebuilt on every reload, so a static file server gains an asset tree by
-  being told about a directory rather than by being recompiled.
-- **Streaming response bodies.** A stream structurally has no bytes for the
-  minifier, compressor or default ETag to touch.
+- **m6-core is the PHP of m6**, phases 0 to 6: a box of blocks a service is assembled from, and the only crate a service links.
+  `m6-file` and `m6-auth-server` are `App` services now, and m6-file lost 969 lines including a second router and a second config parser.
+- **Config-driven routes.** `App::handler(name, f)` plus `handler = "..."` on a route, rebuilt on every reload, so a static file server gains an asset tree by being told about a directory and not by being recompiled.
+- **Streaming response bodies.** A stream structurally has no bytes for the minifier, compressor or default ETag to touch.
 - **Copy elimination.** Core's per-request copying went from ~442us to ~1.58us.
-- **Zero `unsafe` in production code**, down from 390 lines of raw libc in the
-  filesystem watcher.
+- **Zero `unsafe` in production code**, down from 390 lines of raw libc in the filesystem watcher.
 
-### The checks became real
+### 4. The checks became real
 
 This is the half that mattered most, because most of it had never run.
 
-- **h1, h2 and h3 conformance are measured against recorded minimums.** h2 and
-  h3 had no minimum at all and were silently skipped on every run: the only
-  thing running them was a laptop hook on a machine with neither `h2spec` nor
-  `h3spec` installed, and the Linux checks did not run conformance at all. h1
-  32/32 on four targets, h2 146/146, h3 47/49.
-- **A check that cannot measure now fails rather than passing.**
-  `tools/conformance.sh` broke that rule four separate ways and reported success
-  through all of them.
-- **clippy is silent**, `-D warnings`, on both toolchains, and the per-platform
-  ceiling files are deleted. That ceiling turned out to be per-clippy-version:
-  45 findings at 0.1.95 against 123 at 0.1.98 on identical source.
+- **h1, h2 and h3 conformance are measured against recorded minimums.**
+  h2 and h3 had no minimum at all and were silently skipped on every run: the only thing running them was a laptop hook on a machine with neither `h2spec` nor `h3spec` installed, and the Linux checks did not run conformance at all.
+  h1 32/32 on four targets, h2 146/146, h3 47/49.
+- **A check that cannot measure now fails and does not pass.**
+  `tools/conformance.sh` broke that rule four separate ways and reported success through all of them.
+- **clippy is silent**, `-D warnings`, on both toolchains, and the per-platform ceiling files are deleted.
+  That ceiling turned out to be per-clippy-version: 45 findings at 0.1.95 against 123 at 0.1.98 on identical source.
 - **Zero compiler warnings**, release and test builds, checked on Linux.
-- **CI on GitHub Actions** on every push and PR, and `cargo-deny` now runs on the
-  build host too, because a check that lives in one place only is not a check.
-- **Six reference backends** in C, C++, Python, Go, and Rust with and without
-  m6-core, all conforming to the wire contract, with 13 shared tests running them
-  in the build checks. The multi-language promise was written down and never
-  exercised until now.
-- **The examples repository is built by m6's own checks**, and its CMS example's
-  end-to-end suite runs against the binaries those checks just built. Nothing had
-  ever built it. By the time anyone looked it did not compile at all: every
-  renderer crate still pointed at `m6-render`, a crate m6 had deleted, and the
-  binaries left in `target/release` from before the deletion meant running an
-  example still appeared to work.
+- **CI on GitHub Actions** on every push and PR, and `cargo-deny` now runs on the build host too, because a check that lives in one place only is not a check.
+- **Six reference backends** in C, C++, Python, Go, and Rust with and without m6-core, all conforming to the wire contract, with 13 shared tests running them in the build checks.
+  The multi-language promise was written down and never exercised until now.
+- **The examples repository is built by m6's own checks**, and its CMS example's end-to-end suite runs against the binaries those checks just built.
+  Nothing had ever built it.
+  By the time anyone looked it did not compile at all: every renderer crate still pointed at `m6-render`, a crate m6 had deleted, and the binaries left in `target/release` from before the deletion meant running an example still appeared to work.
 
-  Underneath that were five more, each invisible for the same reason. Every asset
-  in every example returned 502, because m6-file became an `App` service and ten
-  configs across the repository were left naming no handler, so the service
-  exited 2 before binding. PATCH and DELETE were refused at the edge by
-  `allowed_methods`, which looks exactly like a missing route. Unpublishing a
-  post in the CMS example answered `{"unpublished": true}` and left the post
-  listed and readable. Starting an example ran `pkill -x m6-http` and killed
-  every other m6 on the machine.
+  Underneath that were five more, each invisible for the same reason.
+  Every asset in every example returned 502, because m6-file became an `App` service and ten configs across the repository were left naming no handler, so the service exited 2 before binding.
+  PATCH and DELETE were refused at the edge by `allowed_methods`, which looks exactly like a missing route.
+  Unpublishing a post in the CMS example answered `{"unpublished": true}` and left the post listed and readable.
+  Starting an example ran `pkill -x m6-http` and killed every other m6 on the machine.
 
-  m6's own checks were passing throughout, and could not have caught any of it:
-  m6 contains no site, and the examples are where its interfaces are actually
-  used. `tools/perfcheck.sh` also measured a deployment's content through a
-  deployment's rendered config, so m6 could not measure itself either; it now
-  renders two pages from the examples, whose content is committed, so the number
-  means the same thing on every machine.
-- **The CMS example's end-to-end suite has no skipped checks**, and 96 rather
-  than 46. The previous version had five that accepted a range of answers, and
-  each one was hiding one of the defects above: the unpublish check read the
-  API's own reply rather than asking the public site, and the auth checks passed
-  on "302 or 401 or 403". It also pinned `--http1.1` for everything, so the
-  example that runs the whole stack never exercised HTTP/2 once.
+  m6's own checks were passing throughout, and could not have caught any of it: m6 contains no site, and the examples are where its interfaces are actually used.
+  `tools/perfcheck.sh` also measured a deployment's content through a deployment's rendered config, so m6 could not measure itself either, and it now renders two pages from the examples, whose content is committed, so the number means the same thing on every machine.
+- **The CMS example's end-to-end suite has no skipped checks**, and 96, up from 46.
+  The previous version had five that accepted a range of answers, and each one was hiding one of the defects above: the unpublish check read the API's own reply and not the public site, and the auth checks passed on "302 or 401 or 403".
+  It also pinned `--http1.1` for everything, so the example that runs the whole stack never exercised HTTP/2 once.
 
-### Protocol fixes in this release
+### 5. Protocol fixes in this release
 
-- **HTTP/2: a received GOAWAY no longer closes the connection**, so the frames
-  behind it are answered instead of meeting a TCP reset. And a WINDOW_UPDATE that
-  overflows a stream we have just answered is still a FLOW_CONTROL_ERROR rather
-  than being dropped. Both were intermittent, both came from discarding state the
-  instant we finished with it, and h2 went from 2 failures in 6 runs to 20 out of
-  20 clean.
-- **h3 37/49 to 47/49.** All twelve failures were upstream in quiche, and the
-  recorded remedy — bump the version — moved the score by zero tests. Ten are
-  cleared by two open upstream pull requests, applied on a fork pinned by
-  revision. The last two are QPACK and are accepted.
-- **Compression is the backend's job, and m6-http is a cache, not a
-  transformer.** The protocol told backends not to compress on the grounds that
-  the proxy would, and the proxy has no compressor: a C, Go or Python backend
-  written from that advice served uncompressed bytes forever.
-  `[[backend]] compresses` is now read by both sides, and a backend refuses to
-  start if it disagrees with what it can actually do.
-- **`touch site.toml` never reloaded anything on Linux.** m6-core's
-  `Request::touch` is the documented way for a renderer to invalidate the edge
-  after writing content, and it used `utimensat(2)`, which reports `IN_ATTRIB`.
-  The inotify mask asked for `IN_CLOSE_WRITE | IN_CREATE | IN_MOVED_TO`, so the
-  event was read and discarded, and the mtime fallback runs only when there is no
-  watcher fd. macOS was fine, because kqueue reports the attribute change, so the
-  defect was invisible where the code was written and live where it runs. Blog
-  publishing was spared only because `m6-md --touch` has its own implementation
-  that opens the file. The watcher now accepts `IN_ATTRIB` and `Request::touch`
-  opens and closes the file as well; either alone is sufficient. Found within the
-  hour after the checks started building the examples on Linux.
-- **A backend's error headers survive the error page.** m6-http replaces a
-  backend's 4xx or 5xx with its own page and threw the backend's whole header
-  block away with it. So a throttled login reached the client as a generic "An
-  unexpected error occurred" with no `Retry-After`, even though m6-auth-server had
-  set one: the throttle worked and was unusable, because the one header saying
-  when to come back was the one discarded. The same substitution dropped
-  `WWW-Authenticate` from a backend 401 and `Allow` from a backend 405, which
-  RFC 9110 11.6.1 and 10.2.1 require. Those four headers now carry over and
-  nothing else does, because the rest describe a body that is no longer being
-  sent.
-- **The login throttle counts failures, not logins.** m6-auth-server incremented
-  on every login request before looking at the credentials, and never cleared the
-  count, so six logins in fifteen minutes locked the IP out whether or not any
-  password was wrong. Counting successes stops no attack, since an attacker with
-  the password does not need six attempts; what it stopped was a person using
-  three devices, and any test suite that logs in repeatedly. The limits move into
-  `[rate_limit] max_attempts` and `window_secs`, defaulting to the previous 5 and
-  900.
-- **Supply chain:** five `cargo-deny` exceptions down to three, each remaining one
-  stating whether it is reachable and how that was checked. `rustls-pemfile` is
-  gone from the tree entirely.
+- **HTTP/2: a received GOAWAY no longer closes the connection**, so the frames behind it are answered and do not meet a TCP reset.
+  A WINDOW_UPDATE that overflows a stream we have just answered is still a FLOW_CONTROL_ERROR and is not dropped.
+  Both were intermittent, both came from discarding state the instant we finished with it, and h2 went from 2 failures in 6 runs to 20 out of 20 clean.
+- **h3 37/49 to 47/49.**
+  All twelve failures were upstream in quiche, and the recorded remedy, bump the version, moved the score by zero tests.
+  Ten are cleared by two open upstream pull requests, applied on a fork pinned by revision.
+  The last two are QPACK and are accepted.
+- **Compression is the backend's job, and m6-http is a cache and not a transformer.**
+  The protocol told backends not to compress on the grounds that the proxy would, and the proxy has no compressor: a C, Go or Python backend written from that advice served uncompressed bytes forever.
+  `[[backend]] compresses` is now read by both sides, and a backend refuses to start if it disagrees with what it can actually do.
+- **`touch site.toml` never reloaded anything on Linux.**
+  m6-core's `Request::touch` is the documented way for a renderer to invalidate the edge after writing content, and it used `utimensat(2)`, which reports `IN_ATTRIB`.
+  The inotify mask asked for `IN_CLOSE_WRITE | IN_CREATE | IN_MOVED_TO`, so the event was read and discarded, and the mtime fallback runs only when there is no watcher fd.
+  macOS was fine, because kqueue reports the attribute change, so the defect was invisible where the code was written and live where it runs.
+  Blog publishing was spared only because `m6-md --touch` has its own implementation that opens the file.
+  The watcher now accepts `IN_ATTRIB` and `Request::touch` opens and closes the file as well, and either alone is sufficient.
+  Found within the hour after the checks started building the examples on Linux.
+- **A backend's error headers survive the error page.**
+  m6-http replaces a backend's 4xx or 5xx with its own page and threw the backend's whole header block away with it.
+  So a throttled login reached the client as a generic "An unexpected error occurred" with no `Retry-After`, even though m6-auth-server had set one: the throttle worked and was unusable, because the one header saying when to come back was the one discarded.
+  The same substitution dropped `WWW-Authenticate` from a backend 401 and `Allow` from a backend 405, which RFC 9110 11.6.1 and 10.2.1 require.
+  Those four headers now carry over and nothing else does, because the rest describe a body that is no longer being sent.
+- **The login throttle counts failures, and not logins.**
+  m6-auth-server incremented on every login request before looking at the credentials, and never cleared the count, so six logins in fifteen minutes locked the IP out whether or not any password was wrong.
+  Counting successes stops no attack, since an attacker with the password does not need six attempts, and what it stopped was a person using three devices, and any test suite that logs in repeatedly.
+  The limits move into `[rate_limit] max_attempts` and `window_secs`, defaulting to the previous 5 and 900.
+- **Supply chain:** five `cargo-deny` exceptions down to three, each remaining one stating whether it is reachable and how that was checked.
+  `rustls-pemfile` is gone from the tree entirely.
 
-### Known, recorded, and not fixed in 1.0.0
+### 6. Known, recorded, and not fixed in 1.0.0
 
-Stated here rather than discovered later:
+Stated here and not discovered later:
 
-- **h3 is 47/49.** The two remaining are QPACK, quiche models neither code, and
-  closing them means writing protocol validation into a forked dependency.
-- **m6-http depends on a fork of quiche**, pinned by revision, carrying two
-  unmerged upstream pull requests. Deliberate, and to be dropped for a tag when
-  upstream releases them.
-- **Linking m6-core costs about 36% of a backend's throughput** and 8.8x its
-  resident memory on a trivial route. Measured, reproduced within 3%, and
-  recorded in `docs/BENCHMARKS.md`. It is measured on the shape that maximises
-  it, and behind the edge cache most requests never reach a backend.
-- **One intermittent test-harness failure**, issue #9: a claimed TCP port
-  occasionally turns out to be in use. Two failures in five full runs, the
-  mechanism identified, the fix not yet written. It affects the test harness, not
-  m6.
-- **`m6-monitor`'s `/traffic` and `/perf` shapes have moved** since anything was
-  built against them, so a consumer written to the older shape will not find
-  `pools` or a `firewall` field. Whether any given deployment runs it is that
-  deployment's business, not this repository's.
+- **h3 is 47/49.**
+  The two remaining are QPACK, quiche models neither code, and closing them means writing protocol validation into a forked dependency.
+- **m6-http depends on a fork of quiche**, pinned by revision, carrying two unmerged upstream pull requests.
+  Deliberate, and to be dropped for a tag when upstream releases them.
+- **Linking m6-core costs about 36% of a backend's throughput** and 8.8x its resident memory on a trivial route.
+  Measured, reproduced within 3%, and recorded in `docs/BENCHMARKS.md`.
+  It is measured on the shape that maximises it, and behind the edge cache most requests never reach a backend.
+- **One intermittent test-harness failure**, issue #9: a claimed TCP port occasionally turns out to be in use.
+  Two failures in five full runs, the mechanism identified, the fix not yet written.
+  It affects the test harness, and not m6.
+- **`m6-monitor`'s `/traffic` and `/perf` shapes have moved** since anything was built against them, so a consumer written to the older shape will not find `pools` or a `firewall` field.
+  Whether any given deployment runs it is that deployment's business, and not this repository's.
+
+1.0.0 is the first release, and it records the work that made the checks real and the gaps that remain.
 
 ---
 
