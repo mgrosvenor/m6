@@ -159,11 +159,10 @@ mod tests {
 
     /// A client that has used up its failure budget is blocked, so the login
     /// path answers 429. After the window elapses the rollover in `is_blocked`
-    /// must unblock it, so the next attempt is answered normally. Removing that
-    /// rollover keeps the client blocked forever, which is the wrong outcome
-    /// this test catches.
+    /// must unblock it again. Removing that rollover keeps the client blocked
+    /// forever, which is the wrong outcome this test catches.
     #[test]
-    fn a_blocked_client_is_answered_normally_after_the_window_rolls_over() {
+    fn a_blocked_client_is_unblocked_after_the_window_rolls_over() {
         let mut rl = RateLimiter::with_limits(1, 60);
         rl.record_failure("192.0.2.1");
         assert!(rl.is_blocked("192.0.2.1"), "the budget must block first");
