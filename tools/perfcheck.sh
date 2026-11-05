@@ -100,6 +100,15 @@ pass() { echo -e "${GREEN}PASS${RESET} $*"; }
 fail() { echo -e "${RED}FAIL${RESET} $*"; }
 info() { echo -e "${YELLOW}----${RESET} $*"; }
 
+# A wall-clock number is only worth anything on an idle host (#344), so this
+# takes the build host to itself through tools/host-lock.sh, or reports NOT
+# MEASURED and fails: a number taken under load is not a result, and no number
+# is not a pass. A caller already holding the host (build-host-tests.sh) has
+# exported M6_HOST_LOCK_HELD=exclusive, and the call returns at once.
+# shellcheck source=tools/host-lock.sh
+. "$HERE/host-lock.sh"
+host_alone || exit 2
+
 mkdir -p "$WORK"
 MEASURED="$WORK/measured.txt"
 RAW="$WORK/raw.txt"
@@ -203,7 +212,7 @@ measure_one() {
   for _ in $(seq 1 "$RUNS"); do
     rm -f "$sock"
     M6_SOCKET_OVERRIDE="$sock" "$bin" "$site" "$conf" --log-level error \
-      > "$WORK/render.log" 2>&1 &
+      > "$WORK/render.log" 2>&1 6<&- 8<&- &
     local pid=$!
     PIDS+=("$pid")
     for _ in $(seq 1 100); do [[ -S "$sock" ]] && break; sleep 0.05; done
