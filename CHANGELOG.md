@@ -191,6 +191,9 @@ They fail if a failed member is picked again before its backoff ends or is never
 **Tests now cover custom error pages from a socket backend (#298).**
 They fail if a backend 404 or 500 loses the fetched page or its status, if a failed page fetch is retried, or if the error path fetches itself.
 
+**The build-host sync no longer deletes `tools/perf-history.jsonl`, and the script merges it back after perfcheck so the committed performance history records every run (#193).**
+The sync ran with `--delete` and erased the file the build host wrote, so the history never entered git. The sync now excludes it and the script appends the records the checkout lacks, so a recreated build host cannot truncate the history. Verified on a build host run: the file survived the sync, gained the new record, and the checkout gained exactly the lines it lacked with no duplicate and no loss.
+
 ### Verified
 
 - Unit tests with stub resolvers cover a confirmed name, a PTR whose forward lookup returns other addresses, a name with no forward answer, a failed forward lookup, no PTR, a name with no address (EAI_NONAME and EAI_NODATA), a slot free by the time the caller has the result, the per-poll lookup cap, expiry and cache bound, a report that reads stored results and resolves nothing, a resolver that never answers, and the thread bound (eight blocked lookups, then fifty more that return at once and start no thread, then slots free again).
