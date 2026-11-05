@@ -379,14 +379,15 @@ fn file_name(p: &Path) -> String {
 /// What `stat` says about a file, followed through a symlink.
 ///
 /// Two fingerprints are equal when the same bytes are in the same file with the
-/// same times. A touch moves `ctime` even when nothing else moves.
+/// same modification time. `ctime` is left out on purpose: a rename over the
+/// file bumps it on the old inode before the name moves, so a `stat` in that gap
+/// sees a change that is not the new file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Fingerprint {
     dev: u64,
     ino: u64,
     len: u64,
     mtime_ns: i128,
-    ctime_ns: i128,
 }
 
 impl Fingerprint {
@@ -399,7 +400,6 @@ impl Fingerprint {
             ino: m.ino(),
             len: m.len(),
             mtime_ns: i128::from(m.mtime()) * 1_000_000_000 + i128::from(m.mtime_nsec()),
-            ctime_ns: i128::from(m.ctime()) * 1_000_000_000 + i128::from(m.ctime_nsec()),
         })
     }
 }
@@ -441,6 +441,9 @@ pub struct ConfigReloader {
     site_name: String,
     process_name: String,
     pending: Changed,
+    /// Files whose last change was found by fingerprint alone, so their event
+    /// has not been read yet.
+    owed: Changed,
     /// When the pending change is to be reported.
     due: Option<Instant>,
     /// When the last report was made. A change within [`RELOAD_DEBOUNCE`] of
@@ -481,6 +484,7 @@ impl ConfigReloader {
             site_name: file_name(site_toml),
             process_name: file_name(process),
             pending: Changed::default(),
+            owed: Changed::default(),
             due: None,
             last_report: None,
             next_poll: Instant::now() + RELOAD_POLL,
@@ -556,6 +560,9 @@ impl ConfigReloader {
     /// Call on every loop iteration. Returns the change when a report is due.
     pub fn tick(&mut self, now: Instant) -> Option<Changed> {
         if now >= self.next_poll {
+            // An event owed for a whole poll interval is not coming, for
+            // instance because the watch was lost.
+            self.owed = Changed::default();
             self.compare(now, Changed::default());
             self.next_poll = now + RELOAD_POLL;
         }
@@ -570,23 +577,46 @@ impl ConfigReloader {
         None
     }
 
+    /// Decide whether one file changed, from its fingerprint and the watcher's
+    /// events, and keep `owed` up to date.
+    ///
+    /// A rename shows in `stat` as soon as the name moves, a moment before its
+    /// event is queued. A compare in that gap sees the change by fingerprint
+    /// alone, and the event then arrives with an equal fingerprint. That event
+    /// is the one already counted, so it is dropped. Any other event names a
+    /// change the fingerprint cannot show.
+    fn settle(moved: bool, named_by_event: bool, owed: &mut bool) -> bool {
+        if moved {
+            *owed = !named_by_event;
+            return true;
+        }
+        if named_by_event && std::mem::take(owed) {
+            return false;
+        }
+        named_by_event
+    }
+
     /// Fingerprint both files and mark each that moved. The new fingerprint is
     /// stored at once, so a file that fails to load is not retried until it is
     /// written again.
     fn compare(&mut self, now: Instant, forced: Changed) {
         let site = Fingerprint::of(&self.site_toml);
         let process = Fingerprint::of(&self.process);
-        let mut hit = false;
-        if forced.site || site != self.seen.site {
+        let site_hit = Self::settle(site != self.seen.site, forced.site, &mut self.owed.site);
+        let process_hit = Self::settle(
+            process != self.seen.process,
+            forced.process,
+            &mut self.owed.process,
+        );
+        if site_hit {
             self.seen.site = site;
             self.pending.site = true;
-            hit = true;
         }
-        if forced.process || process != self.seen.process {
+        if process_hit {
             self.seen.process = process;
             self.pending.process = true;
-            hit = true;
         }
+        let hit = site_hit || process_hit;
         if !hit {
             return;
         }
@@ -874,6 +904,85 @@ mod tests {
         let c = wait_for_change(&mut r, 5_000).expect("a rename is a change");
         assert!(c.site, "{c:?}");
         assert!(!c.process, "{c:?}");
+    }
+
+    /// A rename of the config is one report each, whenever the loop happens to
+    /// wake relative to the rename.
+    #[test]
+    fn each_rename_over_the_config_is_one_report_under_load() {
+        const RENAMES: usize = 300;
+        let (d, site, proc, seen) = pair();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let burners: Vec<_> = (0..8)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        std::hint::spin_loop();
+                    }
+                })
+            })
+            .collect();
+        let mut r = ConfigReloader::new(&site, &proc, seen);
+        let tmp = d.path().join("app.conf.new");
+        let mut extra = Vec::new();
+        for i in 0..RENAMES {
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    put(&tmp, &format!("b = {}\n", "2".repeat(i % 50 + 2)));
+                    std::fs::rename(&tmp, &proc).expect("rename");
+                });
+                assert!(
+                    wait_for_change(&mut r, 5_000).is_some(),
+                    "rename {i} not reported"
+                );
+            });
+            if let Some(c) = wait_for_change(&mut r, 40) {
+                extra.push((i, c));
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for b in burners {
+            b.join().expect("burner");
+        }
+        assert!(extra.is_empty(), "renames reported twice: {extra:?}");
+    }
+
+    /// The poll finds a rename before the loop has read its event, and the
+    /// event must not report the same rename again.
+    #[test]
+    fn an_event_for_a_rename_the_poll_already_found_is_not_a_second_report() {
+        let (d, site, proc, seen) = pair();
+        let mut r = ConfigReloader::new(&site, &proc, seen);
+        let tmp = d.path().join("app.conf.new");
+        put(&tmp, "b = 22222\n");
+        std::fs::rename(&tmp, &proc).expect("rename");
+        let now = Instant::now();
+        r.next_poll_for_test(now);
+        assert!(r.tick(now).is_some(), "the poll missed the rename");
+        let fd = r.raw_fd().unwrap();
+        assert!(crate::server::poll_listener_and_watcher(fd, None, 5_000).listener);
+        r.on_readable(now);
+        let later = now + RELOAD_DEBOUNCE;
+        assert!(
+            r.tick(later).is_none(),
+            "the rename's event reported it a second time"
+        );
+        assert!(r.due.is_none(), "a second report is waiting to be made");
+    }
+
+    /// A change of `ctime` alone is not a change of the file. A rename over the
+    /// config bumps the old inode's `ctime` just before the name moves, and a
+    /// poll that lands there must not report it.
+    #[test]
+    fn a_ctime_only_change_is_not_a_change() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (_d, site, proc, seen) = pair();
+        let mut r = ConfigReloader::polling_only(&site, &proc, seen);
+        std::fs::set_permissions(&proc, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        let now = Instant::now();
+        r.next_poll_for_test(now);
+        assert!(r.tick(now).is_none(), "a chmod was reported as a change");
     }
 
     #[test]

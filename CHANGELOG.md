@@ -81,6 +81,10 @@ Verified with `l2_query_relpath_cannot_replace_the_path_parameter` and `l2_query
 
 ### Fixed
 
+**One rename of a service's config is now one reload, not sometimes two (#300).**
+A rename over the config shows to `stat` a moment before its inotify event is queued, so a poll in that gap reported the change and then the event reported it again, and the old file's `ctime` changes just before the name moves, which a second `stat` read as another change. The reloader now drops an event for a change its fingerprint already reported, and the fingerprint no longer includes `ctime`.
+Verified on the build host: a test that renames over a watched config 300 times under CPU load failed in 17 of 20 runs before the fix and passed in 30 of 30 after.
+
 **`a_burst_of_writes_is_at_most_two_reloads` no longer fails on a busy machine (#299).**
 It wrote the config three times 10 ms apart and expected at most two reloads, but the reloader only merges a write that lands within 20 ms of the last report, so on a loaded runner a late write was rightly reported a third time. The test now spaces its writes 5 ms apart (longer than the service loop takes to wake and reload, so it is unlikely to merge them by itself), times each burst, and judges only one that fitted inside the window, retrying up to five times. Verified on the build host, 20 runs each: 20 passes with four CPU-bound processes running, and 20 failures reporting three reloads with the reloader's hold removed.
 
