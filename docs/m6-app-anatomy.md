@@ -409,7 +409,7 @@ A connection is served until the peer closes it or 100 requests have gone by, an
 A full queue answers 503 immediately, which is how backpressure reaches the edge.
 
 The systemd unit has to supply four things: the two positional arguments, the user and group the socket directory is owned by, `RuntimeDirectory=m6` with `RuntimeDirectoryMode=0750`, and `ReadWritePaths` naming what this service actually writes.
-`m6-user-guide.md`, "Example 06, Production with systemd", carries a complete unit per service and this document does not repeat them.
+`m6-user-guide.md`, "Example 06, production with systemd", carries a complete unit per service and this document does not repeat them.
 
 **`ReadWritePaths` must name only paths that exist.**
 An absent path fails mount namespace setup outright with `226/NAMESPACE` and the unit never starts, so a service claiming `/run/m6` on a node with no socket backends does not come up.
