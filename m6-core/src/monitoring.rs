@@ -196,7 +196,7 @@ pub struct PoolHealth {
 /// It deliberately does not carry `uptime_s`, the name and occupancy of every
 /// socket pool, or the names of the URL backends. That would tell an anonymous
 /// caller the internal service topology (`m6-html`, `m6-file`, `render-contact`,
-/// `render-analytics`), how many workers back each one, when the process last
+/// `render-reports`), how many workers back each one, when the process last
 /// restarted, and, by polling, exactly when a deploy or a crash happened and
 /// whether a pool was losing members. None of that helps a monitor decide up
 /// or down, and all of it helps someone deciding what to aim at. It lives on
