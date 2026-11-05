@@ -291,7 +291,7 @@ A handler is `Fn(&Request) -> Result<Response>`.
 `Response::render(template, req)` renders, and `json`, `text`, `html`, `status`, `redirect`, `not_found`, `forbidden` and `bad_request` cover the rest, with `body`, `header`, `cookie` and `verbatim` as builders over any of them.
 `m6-core-reference.md` §5, "request and response", has the full set.
 
-A service that renders no templates says so, and takes core with `default-features = false` to link no template engine.
+A service that renders no templates says so, and takes core with `default-features = false`, so that built on its own (`cargo build -p`, `cargo install`) it links no template engine.
 
 ```rust
 use m6_core::prelude::*;

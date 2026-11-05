@@ -13,8 +13,9 @@ name = "m6_core"
 # Templating and minification are on by default because core is the box of
 # blocks a service is assembled from, and a service that renders or minifies
 # should get them by depending on core. A service that uses neither takes core
-# with `default-features = false` and links no template engine, Markdown
-# engine or CSS engine.
+# with `default-features = false` and, built on its own (`-p`, `cargo install`),
+# links no template engine, Markdown engine or CSS engine. A workspace build
+# unifies features, and m6-html turns both on there.
 default = ["templates", "minify"]
 # The shared integration-test harness. Off by default so no production binary
 # links it; enable it from a crate's [dev-dependencies] entry.

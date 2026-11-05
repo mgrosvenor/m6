@@ -107,7 +107,8 @@ Take from it that `templates` and `minify` are on by default, seven features pul
 
 `templates` and `minify` are on by default because a feature that hides code from `cargo test --workspace` is how two `csrf` tests stayed broken from Phase 4 to Phase 5.
 `chrono` and `lru` are unconditional dependencies for the same reason.
-A service that uses neither takes core with `default-features = false` and names only the features it uses, and then links no template engine, Markdown engine or CSS engine.
+A service that uses neither takes core with `default-features = false` and names only the features it uses, and then, built on its own (`cargo build -p`, `cargo install`), links no template engine, Markdown engine or CSS engine.
+Cargo unifies features across one build, so in a `cargo build --workspace` `m6-html` turns both features on for every crate.
 `m6-http`, `m6-monitor`, `m6-auth` and `m6-auth-server` do this, and `m6-file` names `minify` alone.
 
 Every off-by-default feature is invisible to `cargo test --workspace`: `testkit`, `multipart`, `flash`, `csrf`, `email`, `http-client` and `sqlite`.
