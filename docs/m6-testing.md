@@ -194,7 +194,7 @@ Three of those rows named a run under the address and leak sanitisers, and no su
 
 **Every row of that list has now been checked against the suites, on issue #165.**
 An unverified specification in `docs/` reads as a statement about what m6 does, so the list stayed on the issue while each row was checked.
-Of its 126 rows, 53 had a test whose assertion was read, 38 described real behaviour that no test checked, 34 no longer described the code, and 1 is the sanitiser gap that #164 tracks.
+Of its 126 rows, 54 had a test whose assertion was read, 38 described real behaviour that no test checked, and 34 no longer described the code.
 The 38 untested behaviours were filed as issues #288 to #298 and #328 to #333, and the tests for #288 to #298 are now in the suites.
 The rows that no longer describe the code are listed on the issue with the reason for each, and are not carried forward.
 
