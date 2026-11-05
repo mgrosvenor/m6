@@ -1121,7 +1121,7 @@ WantedBy=multi-user.target
 ```
 
 m6-auth writes its *SQLite* database under `configs/data/`, which is why its `ReadWritePaths` adds `/var/www/my-blog/configs/data`.
-The database path resolves relative to the config file, in `configs/`, and not relative to the site directory.
+The database path resolves relative to the config file, in `configs/`.
 
 `/etc/systemd/system/render-cms.service`:
 
