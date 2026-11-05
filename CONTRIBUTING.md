@@ -120,7 +120,7 @@ The numbers are taken on the build host and mean nothing on another machine.
 
 A check you add fails when it cannot run.
 It does not print "skipped" and return success.
-[`tools/conformance.sh`](tools/conformance.sh)'s header lists the four ways the conformance script broke this rule.
+[`tools/conformance.sh`](tools/conformance.sh)'s header lists the three ways the conformance script broke this rule.
 
 ## 6. Style
 
