@@ -1237,18 +1237,20 @@ The socket directory lists four sockets, one per backend:
 /run/m6/render-cms.sock
 ```
 
-Then smoke-test the public routes:
+Then smoke-test the public routes, substituting the domain from `site.toml`:
 
 ```bash
-curl -sk -o /dev/null -w "%{http_code}" https://example.com/
+curl -s -o /dev/null -w "%{http_code}" "https://$DOMAIN/"
 # 200
 
-curl -sk -o /dev/null -w "%{http_code}" https://example.com/blog
+curl -s -o /dev/null -w "%{http_code}" "https://$DOMAIN/blog"
 # 200
 
-curl -sk -o /dev/null -w "%{http_code}" https://example.com/cms
+curl -s -o /dev/null -w "%{http_code}" "https://$DOMAIN/cms"
 # 401
 ```
+
+Without `-k`, `curl` verifies the certificate chain, hostname and expiry, so these codes also prove the TLS boundary.
 
 The `/cms` route is protected, so a plain `curl` gets a 401.
 A browser, which sends `Accept: text/html`, gets a 302 to `/login` instead.
@@ -1297,7 +1299,7 @@ This logrotate stanza rotates the file every hour and keeps the last 48 files, t
 `rotate -1` keeps files forever and is not suitable.
 Choose a count that fits the disk at your traffic.
 
-`hourly` takes effect only when logrotate itself runs every hour, and most distributions run it once a day.
+`hourly` takes effect only when logrotate itself runs every hour, and logrotate's default schedule is once a day.
 Run it hourly with a systemd timer override:
 
 ```
@@ -1387,7 +1389,7 @@ Channel counters include the monitor's own polls and header checks (issue #107),
 
 ### 7.9. Deploy updates
 
-Code and template changes are an rsync, and m6-http reloads routing when `site.toml` changes:
+Deploy code and template changes with rsync, and m6-http reloads routing when `site.toml` changes:
 
 ```bash
 rsync -av --delete \
@@ -1450,7 +1452,7 @@ The socket disappears and m6-http removes the instance from the pool with no con
 ### 7.11. Crash recovery
 
 systemd restarts a failed unit with `Restart=on-failure` and `RestartSec=2`.
-During the brief restart window, m6-http's pool backoff handles the missing socket and answers the affected routes with a 503 until the socket reappears.
+During the brief restart window, m6-http's pool backoff handles the missing socket and answers the affected routes with a 502 until the socket reappears.
 
 ```bash
 systemctl kill -s KILL m6-html
