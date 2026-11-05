@@ -100,6 +100,10 @@ impl ConfigWatcher {
         // The cost of including it is a reload on `chmod` or `chown` of a
         // watched file, which a reload is idempotent about, against a silent
         // failure to reload at all.
+        //
+        // Because this event names a `chmod`, the reloader does not need
+        // `ctime` in its fingerprint here. It leaves `ctime` out, since a rename
+        // bumps it on the old inode before the name moves.
         let mask = AddWatchFlags::IN_CLOSE_WRITE
             | AddWatchFlags::IN_CREATE
             | AddWatchFlags::IN_MOVED_TO
@@ -379,15 +383,16 @@ fn file_name(p: &Path) -> String {
 /// What `stat` says about a file, followed through a symlink.
 ///
 /// Two fingerprints are equal when the same bytes are in the same file with the
-/// same modification time. `ctime` is left out on purpose: a rename over the
-/// file bumps it on the old inode before the name moves, so a `stat` in that gap
-/// sees a change that is not the new file.
+/// same times. A touch or a `chmod` moves `ctime` even when nothing else moves.
+/// The reloader leaves `ctime` out where an event names the file, see
+/// [`Fingerprint::without_ctime`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Fingerprint {
     dev: u64,
     ino: u64,
     len: u64,
     mtime_ns: i128,
+    ctime_ns: i128,
 }
 
 impl Fingerprint {
@@ -400,7 +405,18 @@ impl Fingerprint {
             ino: m.ino(),
             len: m.len(),
             mtime_ns: i128::from(m.mtime()) * 1_000_000_000 + i128::from(m.mtime_nsec()),
+            ctime_ns: i128::from(m.ctime()) * 1_000_000_000 + i128::from(m.ctime_nsec()),
         })
+    }
+
+    /// This fingerprint with `ctime` blanked. A rename over a file bumps the old
+    /// inode's `ctime` just before the name moves, so a `stat` in that gap sees
+    /// a change that is not the new file.
+    fn without_ctime(self) -> Fingerprint {
+        Fingerprint {
+            ctime_ns: 0,
+            ..self
+        }
     }
 }
 
@@ -441,9 +457,15 @@ pub struct ConfigReloader {
     site_name: String,
     process_name: String,
     pending: Changed,
-    /// Files whose last change was found by fingerprint alone, so their event
-    /// has not been read yet.
-    owed: Changed,
+    /// For each file whose last change was found by fingerprint alone, when
+    /// that was, because its event has not been read yet.
+    owed_site: Option<Instant>,
+    owed_process: Option<Instant>,
+    /// True when an inotify event names every metadata change of the files,
+    /// so `ctime` is not needed in the comparison. kqueue names no file and a
+    /// reloader with no watcher sees no events, so there `ctime` is the only
+    /// sign of a `chmod`.
+    events_name_files: bool,
     /// When the pending change is to be reported.
     due: Option<Instant>,
     /// When the last report was made. A change within [`RELOAD_DEBOUNCE`] of
@@ -477,6 +499,7 @@ impl ConfigReloader {
         seen: Seen,
     ) -> ConfigReloader {
         ConfigReloader {
+            events_name_files: cfg!(target_os = "linux") && watcher.is_some(),
             watcher,
             site_toml: site_toml.to_path_buf(),
             process: process.to_path_buf(),
@@ -484,7 +507,8 @@ impl ConfigReloader {
             site_name: file_name(site_toml),
             process_name: file_name(process),
             pending: Changed::default(),
-            owed: Changed::default(),
+            owed_site: None,
+            owed_process: None,
             due: None,
             last_report: None,
             next_poll: Instant::now() + RELOAD_POLL,
@@ -560,9 +584,7 @@ impl ConfigReloader {
     /// Call on every loop iteration. Returns the change when a report is due.
     pub fn tick(&mut self, now: Instant) -> Option<Changed> {
         if now >= self.next_poll {
-            // An event owed for a whole poll interval is not coming, for
-            // instance because the watch was lost.
-            self.owed = Changed::default();
+            self.expire_owed(now);
             self.compare(now, Changed::default());
             self.next_poll = now + RELOAD_POLL;
         }
@@ -577,6 +599,25 @@ impl ConfigReloader {
         None
     }
 
+    /// Forget an event owed for a whole poll interval: it is not coming, for
+    /// instance because the watch was lost.
+    fn expire_owed(&mut self, now: Instant) {
+        for owed in [&mut self.owed_site, &mut self.owed_process] {
+            if owed.is_some_and(|since| now >= since + RELOAD_POLL) {
+                *owed = None;
+            }
+        }
+    }
+
+    /// Whether `new` is a different file state from `seen`.
+    fn moved(&self, new: Option<Fingerprint>, seen: Option<Fingerprint>) -> bool {
+        if self.events_name_files {
+            new.map(Fingerprint::without_ctime) != seen.map(Fingerprint::without_ctime)
+        } else {
+            new != seen
+        }
+    }
+
     /// Decide whether one file changed, from its fingerprint and the watcher's
     /// events, and keep `owed` up to date.
     ///
@@ -585,12 +626,12 @@ impl ConfigReloader {
     /// alone, and the event then arrives with an equal fingerprint. That event
     /// is the one already counted, so it is dropped. Any other event names a
     /// change the fingerprint cannot show.
-    fn settle(moved: bool, named_by_event: bool, owed: &mut bool) -> bool {
+    fn settle(moved: bool, named_by_event: bool, owed: &mut Option<Instant>, now: Instant) -> bool {
         if moved {
-            *owed = !named_by_event;
+            *owed = (!named_by_event).then_some(now);
             return true;
         }
-        if named_by_event && std::mem::take(owed) {
+        if named_by_event && owed.take().is_some() {
             return false;
         }
         named_by_event
@@ -602,12 +643,10 @@ impl ConfigReloader {
     fn compare(&mut self, now: Instant, forced: Changed) {
         let site = Fingerprint::of(&self.site_toml);
         let process = Fingerprint::of(&self.process);
-        let site_hit = Self::settle(site != self.seen.site, forced.site, &mut self.owed.site);
-        let process_hit = Self::settle(
-            process != self.seen.process,
-            forced.process,
-            &mut self.owed.process,
-        );
+        let site_moved = self.moved(site, self.seen.site);
+        let process_moved = self.moved(process, self.seen.process);
+        let site_hit = Self::settle(site_moved, forced.site, &mut self.owed_site, now);
+        let process_hit = Self::settle(process_moved, forced.process, &mut self.owed_process, now);
         if site_hit {
             self.seen.site = site;
             self.pending.site = true;
@@ -908,16 +947,23 @@ mod tests {
 
     /// A rename of the config is one report each, whenever the loop happens to
     /// wake relative to the rename.
+    ///
+    /// Ignored in the workspace run because its busy threads starve the other
+    /// timing tests. Run it alone on the build host: `cargo test -p m6-core
+    /// --lib -- --ignored each_rename_over_the_config`.
     #[test]
+    #[ignore = "busy threads starve other timing tests; run alone, see above"]
     fn each_rename_over_the_config_is_one_report_under_load() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
         const RENAMES: usize = 300;
         let (d, site, proc, seen) = pair();
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
         let burners: Vec<_> = (0..8)
             .map(|_| {
                 let stop = stop.clone();
                 std::thread::spawn(move || {
-                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    while !stop.load(Ordering::Relaxed) {
                         std::hint::spin_loop();
                     }
                 })
@@ -941,7 +987,7 @@ mod tests {
                 extra.push((i, c));
             }
         }
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        stop.store(true, Ordering::Relaxed);
         for b in burners {
             b.join().expect("burner");
         }
@@ -971,18 +1017,57 @@ mod tests {
         assert!(r.due.is_none(), "a second report is waiting to be made");
     }
 
-    /// A change of `ctime` alone is not a change of the file. A rename over the
-    /// config bumps the old inode's `ctime` just before the name moves, and a
-    /// poll that lands there must not report it.
+    /// With no event to name a `chmod`, `ctime` is the only sign of it, so a
+    /// poll must report it. kqueue and a reloader with no watcher are this case.
     #[test]
-    fn a_ctime_only_change_is_not_a_change() {
+    fn a_chmod_is_reported_when_no_event_names_the_file() {
         use std::os::unix::fs::PermissionsExt as _;
         let (_d, site, proc, seen) = pair();
         let mut r = ConfigReloader::polling_only(&site, &proc, seen);
         std::fs::set_permissions(&proc, std::fs::Permissions::from_mode(0o600)).expect("chmod");
         let now = Instant::now();
         r.next_poll_for_test(now);
-        assert!(r.tick(now).is_none(), "a chmod was reported as a change");
+        let c = r.tick(now).expect("a chmod was not reported");
+        assert!(c.process && !c.site, "{c:?}");
+    }
+
+    /// Where inotify names the file, a poll that sees only a changed `ctime` has
+    /// seen a rename half done, and the rename's own event reports it. A rename
+    /// bumps the old inode's `ctime` just before the name moves.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_poll_ignores_a_ctime_only_change_where_inotify_names_the_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (_d, site, proc, seen) = pair();
+        let mut r = ConfigReloader::new(&site, &proc, seen);
+        std::fs::set_permissions(&proc, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        let now = Instant::now();
+        r.next_poll_for_test(now);
+        assert!(r.tick(now).is_none(), "a ctime-only change was reported");
+    }
+
+    /// The loop's `tick` finds a rename by fingerprint in the same iteration
+    /// that it read nothing, and the rename's event is read in the next one. The
+    /// poll falling due between the two must not forget the event is owed.
+    #[test]
+    fn a_poll_between_a_found_rename_and_its_event_does_not_forget_the_event() {
+        let (d, site, proc, seen) = pair();
+        let mut r = ConfigReloader::new(&site, &proc, seen);
+        let tmp = d.path().join("app.conf.new");
+        put(&tmp, "b = 22222\n");
+        std::fs::rename(&tmp, &proc).expect("rename");
+        let now = Instant::now();
+        r.compare(now, Changed::default());
+        r.next_poll_for_test(now);
+        assert!(r.tick(now).is_some(), "the rename was not reported");
+        let fd = r.raw_fd().unwrap();
+        assert!(crate::server::poll_listener_and_watcher(fd, None, 5_000).listener);
+        r.on_readable(now);
+        assert!(
+            r.tick(now + RELOAD_DEBOUNCE).is_none(),
+            "the rename's event reported it a second time"
+        );
+        assert!(r.due.is_none(), "a second report is waiting to be made");
     }
 
     #[test]
