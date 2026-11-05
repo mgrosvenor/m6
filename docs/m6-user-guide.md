@@ -1199,24 +1199,17 @@ Section 7.4 installs these units and starts the stack.
 
 ### 7.4. Install and start
 
+Copy the five units into place, reload systemd, then enable and start them together:
+
 ```bash
-# Copy unit files
 cp examples/06-systemd/systemd/*.service /etc/systemd/system/
-
-# Reload systemd
 systemctl daemon-reload
-
-# Enable all units (start on boot)
 systemctl enable m6-html m6-file m6-auth render-cms m6-http
-
-# Start
 systemctl start m6-html m6-file m6-auth render-cms m6-http
-
-# Verify all running
 systemctl status m6-html m6-file m6-auth render-cms m6-http
 ```
 
-Expected output for each unit:
+Each unit reports `active (running)`:
 
 ```
 ● m6-html.service - m6-html renderer
@@ -1225,67 +1218,68 @@ Expected output for each unit:
    Main PID: 12345 (m6-html)
 ```
 
----
-
 ### 7.5. Verify
 
+Check that m6-http is listening and that every backend wrote its socket into `/run/m6/`:
+
 ```bash
-# Check m6-http is listening
 ss -tlnp | grep :443
 
-# Check all sockets appeared in /run/m6/
 ls -la /run/m6/
-# Expected:
-# /run/m6/m6-html.sock
-# /run/m6/m6-file.sock
-# /run/m6/m6-auth.sock
-# /run/m6/render-cms.sock
-
-# Smoke test
-curl -s -o /dev/null -w "%{http_code}" https://example.com/
-# 200
-
-curl -s -o /dev/null -w "%{http_code}" https://example.com/blog
-# 200
-
-curl -s -o /dev/null -w "%{http_code}" https://example.com/cms
-# 302 (redirect to /login)
 ```
 
----
+The socket directory lists four sockets, one per backend:
+
+```
+/run/m6/m6-html.sock
+/run/m6/m6-file.sock
+/run/m6/m6-auth.sock
+/run/m6/render-cms.sock
+```
+
+Then smoke-test the public routes, with `$DOMAIN` set to the domain from `site.toml`:
+
+```bash
+DOMAIN=example.com
+
+curl -s -o /dev/null -w "%{http_code}" "https://$DOMAIN/"
+# 200
+
+curl -s -o /dev/null -w "%{http_code}" "https://$DOMAIN/blog"
+# 200
+
+curl -s -o /dev/null -w "%{http_code}" "https://$DOMAIN/cms"
+# 401
+```
+
+Without `-k`, `curl` verifies the certificate chain, hostname and expiry, so these codes also prove the TLS boundary.
+
+The `/cms` route is protected, so a plain `curl` gets a 401.
+A browser, which sends `Accept: text/html`, gets a 302 to `/login` instead.
+That split is m6-http's own rule for a missing token.
 
 ### 7.6. Logs
 
+Every unit logs to journald, so `journalctl` reads them all:
+
 ```bash
-# Follow all m6 processes together
 journalctl -f -u m6-http -u m6-html -u m6-file -u m6-auth -u render-cms
-
-# One process
 journalctl -u m6-http -f
-
-# JSON output for structured log processing
 journalctl -u m6-http -o cat | jq .
-
-# Last 100 lines
 journalctl -u m6-http -n 100
-
-# Since last boot
 journalctl -u m6-http -b
-
-# Errors only
 journalctl -u m6-http -p err
-
-# Between timestamps
 journalctl -u m6-http --since "2024-01-15 09:00" --until "2024-01-15 10:00"
 ```
 
----
+The `-o cat | jq .` form only parses when `site.toml` sets `format = "json"`.
+Example 05 sets `format = "text"`, so change it to `json` for structured log processing.
 
 ### 7.7. Rotating the analytics log
 
-`m6-http` writes the analytics log to one file and reopens it when it receives SIGUSR1.
-Rotation renames the file and sends the signal, so no line is lost, and `copytruncate` is not needed.
-This logrotate stanza rotates the file every hour and keeps the last 48 files, two days.
+m6-http writes the analytics log to one file and reopens it when it receives SIGUSR1.
+Rotation renames the file and sends that signal, so no line is lost and `copytruncate` is not needed.
+This logrotate stanza rotates the file every hour and keeps the last 48 files, two days:
 
 ```
 /var/www/example/logs/analytics.ndjson {
@@ -1303,12 +1297,12 @@ This logrotate stanza rotates the file every hour and keeps the last 48 files, t
 }
 ```
 
-`rotate` is a finite count because every kept file uses disk, and `/traffic` lists the directory to find the newest rotated file.
+`rotate` is a finite count because every kept file uses disk.
 `rotate -1` keeps files forever and is not suitable.
 Choose a count that fits the disk at your traffic.
 
-`hourly` only takes effect if logrotate itself runs every hour, and distributions run it once a day.
-Run it hourly with a systemd timer override.
+`hourly` takes effect only when logrotate itself runs every hour, and logrotate's default schedule is once a day.
+Run it hourly with a systemd timer override:
 
 ```
 # systemctl edit logrotate.timer
@@ -1319,12 +1313,13 @@ AccuracySec=1m
 ```
 
 On a system that uses cron instead, add `/etc/cron.hourly/logrotate` containing `#!/bin/sh` and `exec /usr/sbin/logrotate /etc/logrotate.conf`, and make it executable.
-Keep the daily run too if other stanzas use `daily`, which is harmless because logrotate skips a file that is not due.
+Keep the daily run too when other stanzas use `daily`.
+logrotate skips a file that is not due, so the double run is harmless.
 
-There is no `create` line, because `m6-http` creates the file itself.
-The wait in `postrotate` is a proof.
+There is no `create` line, because m6-http creates the file itself.
+The wait in `postrotate` proves that reopen happened.
 The log writer cannot write to the renamed file once the new file exists, so the old file is finished before logrotate compresses it.
-If the reopen fails, the wait times out and `postrotate` fails.
+When the reopen fails, the wait times out and `postrotate` fails.
 `--kill-whom=` needs systemd 252 or later, and older systemd spells it `--kill-who=`.
 
 `/perf` reports the last reopen as `logging.reopen`, with the seconds since the last reopen, how many reopens succeeded and failed, and the age of the last failure.
@@ -1335,24 +1330,22 @@ The limit is only as true as the schedule, so set it after logrotate runs hourly
 `/traffic` reads the newest rotated file next to the log when the live file does not cover its window, so its sixty minute window does not shrink just after a rotation.
 It skips a rotated file last written before the window, and a `.gz` file larger than the 24 MB read budget on disk or once decoded.
 
----
-
 ### 7.8. Monitor history
 
-`m6-monitor` keeps a history of every poll when `[monitor] history_file` is set, and serves it as JSON Lines.
-We cover the keys, the two endpoints, paging, how to protect them and what the history leaves out.
+m6-monitor keeps a history of every poll when `[monitor] history_file` is set, and serves it as *JSON Lines* (one JSON object per line).
 Table 1 gives the two keys, which are read once at start.
 
 | key (`[monitor]`) | default | rule |
 |---|---|---|
 | `history_file` | absent, so no history | a non-empty path, relative to the site directory |
-| `history_max_mb` | 256 | 1 to 1048576 |
+| `history_max_mb` | 256 | 1 to 1048576, one MB is 2^20 bytes |
 
 **Table 1: the two `[monitor]` keys that switch the history on and cap it, with their defaults and rules.**
 A change to either needs a restart.
 
 The file holds one row per node per poll, one row per channel and interface, the text of every finding, and once per `/traffic` window the response status counts and crawler sightings of each node.
-When the file passes `history_max_mb`, the oldest polls are deleted until it is 5% under the cap, and nothing expires by age.
+When the file passes `history_max_mb`, the oldest polls are deleted, 256 at a time, until it is 5% under the cap.
+Nothing expires by age.
 One window of one node stores at most 100 crawler sightings, the ones with the most requests, and cuts each user agent to 256 bytes.
 The `/crawlers` key `sightings_dropped` says how many were left out.
 On Unix the monitor creates the directory with mode 0700 and the file with mode 0600, because the file holds client addresses.
@@ -1360,9 +1353,10 @@ A write that fails is a warning on node `monitor` and never stops polling.
 A prune that fails, or a cap that deleting every earlier poll cannot meet, is its own warning, and the poll is still stored.
 To start fresh, stop the service, delete the file and start it again.
 
-`GET /history` and `GET /crawlers` answer on the service's unix socket and nowhere else.
-Both take `from` and `to` as RFC 3339 UTC times, the range `[from, to)` is at most 31 days, and `node` limits the answer to one node.
-A page holds at most 4 MiB and 10,000 rows, and a `Link: <...>; rel="next"` header names the next page until the last one.
+`GET /history` and `GET /crawlers` answer on the service's Unix socket and nowhere else.
+Both take `from` and `to` as *RFC 3339* UTC times, the range `[from, to)` is at most 31 days, and `node` limits the answer to one node.
+A page holds at most 4 MiB and 10,000 rows.
+When more rows match, the response carries a `Link` header with `rel="next"`, and the client follows it until a page has none.
 
 ```
 curl --unix-socket /run/m6/m6-monitor.sock \
@@ -1390,52 +1384,51 @@ require = "role:admin"
 
 The monitor sends `Cache-Control: no-store` on every page itself, so the routes need no `cache` key.
 
-The node's own `periodic stats` log is a 10 second series that sits in the node's journal, which is capped.
+The node's own `periodic stats` log is a 10 second series in the node's journal, which is capped.
 It has no channels, reachability, host figures or tunnel, and it disappears while a node is down.
 Only the history keeps those, and it keeps them through an outage.
 Channel counters include the monitor's own polls and header checks (issue #107), and `monitor_requests` on each node row says how many.
 
----
-
 ### 7.9. Deploy updates
 
+Deploy code and template changes with rsync, and m6-http reloads routing when `site.toml` changes:
+
 ```bash
-# Code or template changes — rsync and done
-# m6-http detects site.toml change via inotify and reloads routing
 rsync -av --delete \
   --exclude 'content/drafts/' \
   --exclude 'data/auth.db' \
   --exclude 'keys/' \
   examples/05-cms/ \
   user@example.com:/var/www/my-blog/
+```
 
-# If render-cms binary changed — rebuild, deploy binary, restart just that unit
+When the render-cms binary changes, rebuild it, deploy it and restart only that unit:
+
+```bash
 cargo build --release -p render-cms
 rsync target/release/render-cms user@example.com:/var/www/my-blog/bin/
 ssh user@example.com systemctl restart render-cms
-# Other units unaffected — m6-http detects render-cms socket reappear and resumes routing
-
-# TLS cert renewal (certbot renews, and its deploy hook touches the system config)
-certbot renew
-# m6-http reads the new certificate when the system config is touched, with no restart
 ```
 
----
+The other units keep running, and m6-http resumes routing to render-cms when its socket reappears.
+For certificate renewal, certbot renews and its deploy hook touches the system config, and m6-http reads the new certificate with no restart:
+
+```bash
+certbot renew
+```
 
 ### 7.10. Horizontal scaling
 
-Add a second m6-html instance to handle more traffic. No config change to m6-http — it detects the new socket automatically.
+Add a second m6-html instance to handle more traffic.
+m6-http detects the new socket with no config change:
 
 ```bash
-# Create a second config (content identical to m6-html.conf)
 cp /var/www/my-blog/configs/m6-html.conf \
    /var/www/my-blog/configs/m6-html-2.conf
 
-# Create the unit by copying and editing ExecStart
 cp /etc/systemd/system/m6-html.service \
    /etc/systemd/system/m6-html-2.service
 
-# Edit the new unit
 sed -i \
   -e 's/Description=m6-html renderer/Description=m6-html renderer (instance 2)/' \
   -e 's/m6-html.conf/m6-html-2.conf/' \
@@ -1445,46 +1438,36 @@ sed -i \
 systemctl daemon-reload
 systemctl enable m6-html-2
 systemctl start m6-html-2
-
-# /run/m6/m6-html-2.sock appears
-# m6-http detects it via inotify — adds to pool within milliseconds
-# Traffic now load-balanced across both instances
-
-# Verify
-ls /run/m6/
-# m6-html.sock  m6-html-2.sock  m6-file.sock  m6-auth.sock  render-cms.sock
-
-journalctl -f -u m6-html -u m6-html-2
 ```
+
+The socket name follows the config stem, so `m6-html-2.conf` writes `/run/m6/m6-html-2.sock`.
+m6-http detects it via inotify and adds it to the pool, then load-balances traffic across both instances.
 
 To scale back down:
 
 ```bash
 systemctl stop m6-html-2
-# Socket disappears — m6-http removes from pool immediately
-# No config change, no m6-http restart
 ```
 
----
+The socket disappears and m6-http removes the instance from the pool with no config change and no restart.
 
 ### 7.11. Crash recovery
 
-systemd restarts failed units automatically with `Restart=on-failure` and `RestartSec=2`. During the brief restart window, m6-http's pool backoff handles missing sockets — requests to affected routes return 503 until the socket reappears.
+systemd restarts a failed unit with `Restart=on-failure` and `RestartSec=2`.
+During the brief restart window, m6-http's pool backoff handles the missing socket and answers the affected routes with a 502 until the socket reappears.
 
 ```bash
-# Simulate a crash
 systemctl kill -s KILL m6-html
-
-# Watch systemd restart it
 journalctl -u m6-html -f
 # ... process exited with status 9 (SIGKILL)
 # ... Starting m6-html renderer...
 # ... m6-html started, listening on /run/m6/m6-html.sock
-
-# m6-http detects socket reappearance via inotify — normal service resumes
 ```
 
----
+m6-http detects the socket reappearance via inotify and normal service resumes.
+
+Example 06 shows the same site running as five supervised units.
+Example 07 makes the development and production split explicit, with one `site.toml` and a system config per environment.
 
 ## 8. Example 07, dev to production
 
