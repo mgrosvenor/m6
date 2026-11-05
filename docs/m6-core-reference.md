@@ -59,14 +59,13 @@ fn main() -> Result<()> {
 ```
 
 The prelude is deliberately small.
-It exports `App` and `AppContext`, `Dict`, `Error` and `Result`, `Request` and `Response`, the three helpers `now_iso8601`, `slugify` and `today_iso8601` from `util`, and `serde_json`'s `json!`, `Map` and `Value`.
+It exports `App` and `AppContext`, `Dict`, `Error` and `Result`, `Request` and `Response`, the three helpers `now_iso8601`, `slugify` and `today_iso8601` from `util`, `NoTemplates`, and `serde_json`'s `json!`, `Map` and `Value`.
 Feature-gated additions appear in it only when the feature is on: `Upload`, `TeraFactory` and `TeraRenderer`, lettre's `Message`, `SmtpTransport` and `Transport`, `ureq`, and `rusqlite`.
 
-A service that renders no templates says so, and stops linking Tera.
+A service that renders no templates says so, and takes core with `default-features = false` to stop linking Tera.
 
 ```rust
 use m6_core::prelude::*;
-use m6_core::render::NoTemplates;
 
 fn main() -> Result<()> {
     App::new()
@@ -89,11 +88,12 @@ Section 2 gives the features that decide which parts compile.
 Features and modules are different axes, and `flash` and `csrf` have no module at all.
 They gate code inside `App` and one method each, `Response::flash` and `Request::verify_csrf`.
 A reader who greps for a `csrf` module finds nothing and wrongly concludes the feature is missing.
-Table 2 gives the eight features.
+Table 2 gives the nine features.
 
 | feature | default | what it adds |
 |---|---|---|
-| `templates` | **on** | `template` module, `TeraFactory`, `TeraRenderer`. Pulls tera and comrak. |
+| `templates` | **on** | `template` module, `TeraFactory`, `TeraRenderer`. Pulls tera and comrak. Without it `App` uses `NoTemplates`. |
+| `minify` | **on** | `minify` module, and the minification step in `App`. Pulls minify-html, which brings a CSS engine, and minify-js. Without it a config that turns minification on fails to load and names this feature. |
 | `testkit` | off | The `testkit` module. Enable from `[dev-dependencies]` only. |
 | `multipart` | off | `multipart` module, `Request::file`. Pulls multer, tokio, bytes, futures-util. |
 | `flash` | off | `Response::flash` and *HMAC* (hash-based message authentication code) signed one-shot messages. Pulls hmac, sha2. |
@@ -102,12 +102,13 @@ Table 2 gives the eight features.
 | `http-client` | off | `ureq` in the prelude. |
 | `sqlite` | off | `sqlite` module: `open`, `open_reader`, `migrate`, `append_only`, `used_bytes`, `prune_oldest`, and `rusqlite` in the prelude. Pulls rusqlite 0.31 with bundled SQLite. |
 
-**Table 2: the eight features, their defaults and what each one compiles.**
-Take from it that only `templates` is on by default, six features pull a dependency and two add code only.
+**Table 2: the nine features, their defaults and what each one compiles.**
+Take from it that `templates` and `minify` are on by default, seven features pull a dependency and two add code only.
 
-`templates` is on by default because a feature that hides code from `cargo test --workspace` is how two `csrf` tests stayed broken from Phase 4 to Phase 5.
+`templates` and `minify` are on by default because a feature that hides code from `cargo test --workspace` is how two `csrf` tests stayed broken from Phase 4 to Phase 5.
 `chrono` and `lru` are unconditional dependencies for the same reason.
-A binary that wants none of it sets `default-features = false`.
+A service that uses neither takes core with `default-features = false` and names only the features it uses, and then links no template engine, Markdown engine or CSS engine.
+`m6-http`, `m6-monitor`, `m6-auth` and `m6-auth-server` do this, and `m6-file` names `minify` alone.
 
 Every off-by-default feature is invisible to `cargo test --workspace`: `testkit`, `multipart`, `flash`, `csrf`, `email`, `http-client` and `sqlite`.
 A *CI* (continuous integration) step builds and tests m6-core with `--all-features` to cover them.
@@ -117,7 +118,7 @@ Section 3 lists the modules those features compile.
 
 ## 3. Component index
 
-Thirty-eight component modules, four of them behind features, grouped by the task that sends a reader to one.
+Thirty-eight component modules, five of them behind features, grouped by the task that sends a reader to one.
 The prelude in section 1 is the thirty-ninth `pub mod` in `lib.rs`, and it re-exports the items the other modules implement.
 Table 3 is the index, and it uses six abbreviations: *HTTP* (Hypertext Transfer Protocol), *RFC* (Request for Comments), *TCP* (Transmission Control Protocol), *JSON* (JavaScript Object Notation), *UTC* (Coordinated Universal Time) and *CSPRNG* (cryptographically secure pseudorandom number generator).
 
@@ -145,7 +146,7 @@ Table 3 is the index, and it uses six abbreviations: *HTTP* (Hypertext Transfer 
 | | `mime` | `mime_from_path` and `should_compress_default`. |
 | | `path` | `validate_path_param`. A security boundary. |
 | **Content** | `compress` | brotli and gzip, compress and decompress. |
-| | `minify` | The four minifiers: markup, JavaScript, stylesheets and JSON. |
+| | `minify` | The four minifiers: markup, JavaScript, stylesheets and JSON. Feature `minify`. |
 | | `util` | `slugify`, `now_iso8601`, `today_iso8601`, `iso8601_minutes_ago` and `html_escape`. |
 | | `random` | `random_hex_token::<N>()`. One CSPRNG token generator, so there is never a third. |
 | **Observability** | `log` | `init`, `init_with_analytics`, `LogHandle` and `LogPulse`. Tracing setup and the liveness pulse. |
@@ -520,7 +521,7 @@ that faces the client directly; behind a proxy the peer is the proxy.
 `compress`: `brotli_compress(data, quality)`, `brotli_decompress`,
 `gzip_compress(data, level)`, `gzip_decompress`.
 
-`minify`: `minify_html(data, minify_inline_js)`, `minify_js`, `minify_css`,
+`minify` (feature `minify`): `minify_html(data, minify_inline_js)`, `minify_js`, `minify_css`,
 `minify_json`.
 
 `util`: `slugify`, `today_iso8601`, `now_iso8601`, `iso8601_minutes_ago`, `html_escape`.

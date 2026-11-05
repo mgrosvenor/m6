@@ -10,7 +10,12 @@ repository.workspace   = true
 name = "m6_core"
 
 [features]
-default = ["templates"]
+# Templating and minification are on by default because core is the box of
+# blocks a service is assembled from, and a service that renders or minifies
+# should get them by depending on core. A service that uses neither takes core
+# with `default-features = false` and links no template engine, Markdown
+# engine or CSS engine.
+default = ["templates", "minify"]
 # The shared integration-test harness. Off by default so no production binary
 # links it; enable it from a crate's [dev-dependencies] entry.
 testkit = []
@@ -19,16 +24,15 @@ testkit = []
 # `multipart` gates the multipart body parser and the streaming types it needs.
 multipart = ["dep:multer", "dep:tokio", "dep:bytes", "dep:futures-util"]
 
-# Tera templating, on by default. m6-core is the box of blocks a service is
-# assembled from, and templating is one of the blocks: a service that renders
-# HTML should get it by depending on core, not by depending on a framework
-# crate that also happens to contain the service loop.
-#
-# On by default rather than off so that `cargo test` compiles it without a
-# flag. A feature that hides code from the default test run is how two csrf
-# tests stayed broken from Phase 4 to Phase 5. A binary that wants none of it
-# sets `default-features = false`.
+# Tera templating, with comrak for Markdown. Without it `App` uses
+# `NoTemplates`, and a route that names a template is a configuration error.
 templates = ["dep:tera", "dep:comrak"]
+
+# The minifiers for HTML, CSS, JavaScript and JSON, run on the response path
+# when the config enables them. minify-html brings a full CSS engine, which a
+# service that never minifies should not link. Without the feature, a config
+# that enables minification fails to load and names it.
+minify    = ["dep:minify-html", "dep:minify-js"]
 flash     = ["dep:hmac", "dep:sha2"]
 csrf      = []
 
@@ -61,8 +65,6 @@ httparse   = "1"
 httpdate   = "1"
 rand       = "0.8"
 libc       = "0.2"
-minify-html = "0.15"
-minify-js   = "0.5"
 brotli      = "6"
 flate2      = "1"
 base64      = "0.22"
@@ -80,6 +82,8 @@ slug        = "0.1"
 # `digest` and adds one crate.
 md-5        = "0.10"
 
+minify-html   = { version = "0.15", optional = true }
+minify-js     = { version = "0.5",  optional = true }
 tera          = { version = "1",    optional = true }
 comrak        = { version = "0.21", optional = true, default-features = false }
 multer        = { version = "3",    optional = true }

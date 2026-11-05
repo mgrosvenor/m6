@@ -12,6 +12,9 @@ pub mod host;
 pub mod http;
 pub mod log;
 pub mod mime;
+/// The HTML, CSS, JavaScript and JSON minifiers. Off by default; see the
+/// `minify` feature in Cargo.toml.
+#[cfg(feature = "minify")]
 pub mod minify;
 pub mod monitoring;
 pub mod ndjson;
@@ -96,7 +99,6 @@ pub use watcher::{Changed, ConfigReloader, ConfigWatcher, Fingerprint, Seen};
 ///
 /// ```rust,no_run
 /// use m6_core::prelude::*;
-/// use m6_core::render::NoTemplates;
 ///
 /// fn main() -> Result<()> {
 ///     App::new()
@@ -109,6 +111,7 @@ pub mod prelude {
     pub use crate::app::{App, AppContext};
     pub use crate::dict::Dict;
     pub use crate::error::{Error, Result};
+    pub use crate::render::NoTemplates;
     pub use crate::request::Request;
     pub use crate::response::Response;
     pub use crate::util::{now_iso8601, slugify, today_iso8601};
