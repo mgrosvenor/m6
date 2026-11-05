@@ -67,15 +67,19 @@ jobs:
     if: github.event_name == 'pull_request' && github.base_ref == 'main'
     runs-on: ubuntu-latest
     steps:
+      # The branch name comes from whoever opened the pull request, so it reaches
+      # the script as data in an environment variable, never pasted into it.
       - name: The head branch must be develop
+        env:
+          HEAD_REF: ${{ github.head_ref }}
         run: |
-          if [ "${{ github.head_ref }}" != "develop" ]; then
+          if [ "$HEAD_REF" != "develop" ]; then
             echo "::error::main takes pull requests from develop only."
-            echo "This pull request is from '${{ github.head_ref }}'."
+            echo "This pull request is from '$HEAD_REF'."
             echo ""
             echo "main is the release line. Merge into develop first, then"
             echo "open develop -> main as the release:"
-            echo "  gh pr create --base develop --head ${{ github.head_ref }}"
+            echo "  gh pr create --base develop --head $HEAD_REF"
             echo "  # merge that, bump the version and write the CHANGELOG entry, then:"
             echo "  gh pr create --base main --head develop --title 'Release X.Y.Z'"
             exit 1
