@@ -1,9 +1,8 @@
 //! A woff2 response is never compressed.
 //!
 //! `font/woff2` is already compressed, so `should_compress_default` does not
-//! list it. Adding it by mistake would waste CPU on every font request and
-//! send a `Content-Encoding` header the client never asked for, with a body
-//! the client cannot decode as a font. No suite requests a woff2 file, so the
+//! list it. Adding it by mistake would re-compress every font response and
+//! waste CPU without shrinking it. No suite requests a woff2 file, so the
 //! mistake would go unnoticed.
 
 use std::io::Write;
