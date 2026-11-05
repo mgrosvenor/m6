@@ -3095,7 +3095,8 @@ fn handle_request<W: std::io::Write>(
     // written to the client. A reload waits for the write lock, and std's
     // `RwLock` stops granting new readers once a writer is waiting, so work
     // done under this guard delays every request that arrives after a reload
-    // starts, and the old state is dropped by the reload, not by a request.
+    // starts. The old renderer and route table are freed by whichever finishes
+    // last: the reload, or the last request still holding their `Arc`s.
     //
     // Under the guard: copy out the `Arc`s the rest of the request needs (a
     // refcount bump each, not a copy of two `HashMap`s and a `PathBuf`), match
