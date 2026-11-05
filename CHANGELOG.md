@@ -183,6 +183,9 @@ They fail if equal routes stop resolving to the first declaration, if a global p
 **Tests now cover the auth path (#295, #296).**
 They fail if a public route runs auth code with or without a token or from the cache, or if a browser stops being redirected to `/login?next=<path>` or `/auth/refresh` while an API client gets 401.
 
+**Tests now cover backend pool failover and rejoin after backoff (#297).**
+They fail if a failed member is picked again before its backoff ends or is never picked again after it.
+
 ### Verified
 
 - Unit tests with stub resolvers cover a confirmed name, a PTR whose forward lookup returns other addresses, a name with no forward answer, a failed forward lookup, no PTR, a name with no address (EAI_NONAME and EAI_NODATA), a slot free by the time the caller has the result, the per-poll lookup cap, expiry and cache bound, a report that reads stored results and resolves nothing, a resolver that never answers, and the thread bound (eight blocked lookups, then fifty more that return at once and start no thread, then slots free again).
