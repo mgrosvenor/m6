@@ -192,11 +192,13 @@ A per-service list of behaviours used to sit here, about 120 rows over four serv
 No row had ever been checked against the suites above, so a reader took a line like "SIGTERM twice, immediate exit" as a test that runs.
 Three of those rows named a run under the address and leak sanitisers, and no suite checked them.
 
-**That list is issue #165 now.**
-An unverified specification in `docs/` reads as a statement about what m6 does, and this one was wrong in at least four places.
-It is kept in full on the issue, and it comes back here row by row as each row is checked against a suite in Table 6.
+**Every row of that list has now been checked against the suites, on issue #165.**
+An unverified specification in `docs/` reads as a statement about what m6 does, so the list stayed on the issue while each row was checked.
+Of its 126 rows, 54 had a test whose assertion was read, 38 described real behaviour that no test checked, and 34 no longer described the code.
+The 38 untested behaviours were filed as issues #288 to #298 and #328 to #333, and the tests for #288 to #298 are now in the suites.
+The rows that no longer describe the code are listed on the issue with the reason for each, and are not carried forward.
 
-Until then, Table 6 is the answer to what checks m6: the suites, and the code in them.
+Table 6 is the answer to what checks m6: the suites, and the code in them.
 
 ## 6. End to end
 
@@ -244,11 +246,9 @@ Running a tester by hand needs Table 5 first.
 The address and leak sanitisers run in their own workflow, `.github/workflows/sanitizer.yml`, on pushes to `develop` and on pull requests to it, and by hand once the file is on `main`.
 Its workspace run does not enable four off-by-default m6-core features (`multipart`, `email`, `flash`, `csrf`), so the sanitisers do not instrument that code.
 
-Two gaps are open, and neither is a documentation problem:
+One gap is open, and it is not a documentation problem:
 
 - **No fuzzing**, anywhere in `check.sh`, `tools/build-host-tests.sh` or CI, in a codebase that hand-writes three protocol parsers.
-- **The per-service behaviour lists are issue #165**, because no row had been checked
-  against the suites in Table 6 and at least four were wrong.
 
 Table 7 gives the documents that own what this one leaves out.
 Take from it that every number omitted here has a file responsible for it.
