@@ -152,4 +152,12 @@ mod tests {
         assert!(!should_compress_default("application/octet-stream"));
         assert!(!should_compress_default("video/mp4"));
     }
+
+    /// A woff2 file is already compressed. Adding `font/woff2` to the
+    /// compress-by-default list would waste CPU on every font request and add
+    /// a `Content-Encoding` header a client did not ask for.
+    #[test]
+    fn test_woff2_not_compressed_by_default() {
+        assert!(!should_compress_default("font/woff2"));
+    }
 }
