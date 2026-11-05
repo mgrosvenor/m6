@@ -99,6 +99,7 @@ impl Default for RateLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn a_fresh_ip_is_not_blocked() {
@@ -154,5 +155,31 @@ mod tests {
         let mut rl = RateLimiter::with_limits(1, 0);
         rl.record_failure("192.0.2.1");
         assert!(!rl.is_blocked("192.0.2.1"));
+    }
+
+    /// A client that has used up its failure budget is blocked, so the login
+    /// path answers 429. After the window elapses the rollover in `is_blocked`
+    /// must unblock it, so the next attempt is answered normally. Removing that
+    /// rollover keeps the client blocked forever, which is the wrong outcome
+    /// this test catches.
+    #[test]
+    fn a_blocked_client_is_answered_normally_after_the_window_rolls_over() {
+        let mut rl = RateLimiter::with_limits(1, 60);
+        rl.record_failure("192.0.2.1");
+        assert!(rl.is_blocked("192.0.2.1"), "the budget must block first");
+
+        // Move the recorded window start into the past instead of sleeping. The
+        // test module sees the private field, and a fixed sleep only works when
+        // the machine is idle.
+        let (_, started) = rl
+            .map
+            .get_mut("192.0.2.1")
+            .expect("the failure is recorded");
+        *started = Instant::now() - Duration::from_secs(61);
+
+        assert!(
+            !rl.is_blocked("192.0.2.1"),
+            "the client stayed blocked after the window rolled over"
+        );
     }
 }
