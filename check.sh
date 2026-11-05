@@ -11,7 +11,8 @@
 #   2. Clippy minimum-score check — BLOCKS the push
 #   3. Unit + integration tests
 #   4. Conformance minimum-score check (h1spec / h2spec / h3spec) — BLOCKS the push
-#   5. Benchmarks (informational — prints criterion output; never blocks the push)
+#   5. Benchmarks: their numbers are informational and never block the push, but
+#      the bench targets must compile, and a build failure blocks it like any other
 #
 # Why benches don't gate:
 #   Sub-microsecond criterion benchmarks on a development machine have ±5-15%

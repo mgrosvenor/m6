@@ -454,8 +454,8 @@ fi
 # Its processes do not inherit the locks, so one that outlives this run cannot
 # hold the host or the ports. While this run lasts it holds the port lock itself,
 # so no other run's tests bind ports beside the stack; a stack left over after a
-# failed run is caught by the 8443 check above on the next run, which a wedged
-# lock would not be.
+# failed run is caught by the 8443 check above on the next examples run, which a
+# wedged lock would not be.
 M6="$M6_DIR" M6_NO_BROWSER=1 ./dev.sh --no-open > $T/eg-cms-dev.log 2>&1 6<&- 7<&- 8<&- &
 DEV_PID=$!
 up=0
