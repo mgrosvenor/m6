@@ -1237,9 +1237,11 @@ The socket directory lists four sockets, one per backend:
 /run/m6/render-cms.sock
 ```
 
-Then smoke-test the public routes, substituting the domain from `site.toml`:
+Then smoke-test the public routes, with `$DOMAIN` set to the domain from `site.toml`:
 
 ```bash
+DOMAIN=example.com
+
 curl -s -o /dev/null -w "%{http_code}" "https://$DOMAIN/"
 # 200
 
