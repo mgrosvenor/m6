@@ -1475,7 +1475,43 @@ type WorkItem = Box<dyn FnOnce() + Send + 'static>;
 
 pub struct ThreadPool {
     queue: std::sync::mpsc::SyncSender<WorkItem>,
-    in_flight: Arc<AtomicUsize>,
+    in_flight: Arc<InFlight>,
+}
+
+/// Work accepted by the pool and not yet finished.
+///
+/// The count is an atomic so the accept path pays one add. The mutex and
+/// condvar are touched only when it reaches zero, to wake a `drain` that is
+/// waiting, so a drain returns the moment the last request ends and the request
+/// path takes no lock.
+struct InFlight {
+    count: AtomicUsize,
+    idle: Mutex<()>,
+    idle_cv: std::sync::Condvar,
+}
+
+impl InFlight {
+    fn begin(&self) {
+        self.count.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn end(&self) {
+        if self.count.fetch_sub(1, Ordering::SeqCst) == 1 {
+            // Taking the lock orders this wake after a drain that has read a
+            // non-zero count and is about to wait, so the wake is never lost.
+            let _held = self.idle.lock().unwrap_or_else(|e| e.into_inner());
+            self.idle_cv.notify_all();
+        }
+    }
+}
+
+/// Lowers the count when dropped, so work that panics still stops counting.
+struct Finish<'a>(&'a InFlight);
+
+impl Drop for Finish<'_> {
+    fn drop(&mut self) {
+        self.0.end();
+    }
 }
 
 impl ThreadPool {
@@ -1492,7 +1528,11 @@ impl ThreadPool {
     ) -> Self {
         let (tx, rx) = std::sync::mpsc::sync_channel::<WorkItem>(queue_size);
         let rx = Arc::new(Mutex::new(rx));
-        let in_flight = Arc::new(AtomicUsize::new(0));
+        let in_flight = Arc::new(InFlight {
+            count: AtomicUsize::new(0),
+            idle: Mutex::new(()),
+            idle_cv: std::sync::Condvar::new(),
+        });
 
         for _ in 0..size {
             let rx = rx.clone();
@@ -1503,9 +1543,8 @@ impl ThreadPool {
                     let work = rx.lock().unwrap().recv();
                     match work {
                         Ok(f) => {
-                            in_flight2.fetch_add(1, Ordering::SeqCst);
+                            let _finish = Finish(&in_flight2);
                             f();
-                            in_flight2.fetch_sub(1, Ordering::SeqCst);
                         }
                         Err(_) => break,
                     }
@@ -1525,7 +1564,21 @@ impl ThreadPool {
 
     /// Submit work. Returns false if the queue is full (→ 503).
     pub fn submit(&self, f: WorkItem) -> bool {
-        self.queue.try_send(f).is_ok()
+        self.enqueue(f)
+    }
+
+    /// Hand `work` to the queue, counting it in flight from the moment it is
+    /// accepted, not from the moment a worker wakes: `drain` must wait for a
+    /// request that is queued, or handed to a worker that has not yet run, as
+    /// well as for one being served. The count rises before the send so a
+    /// worker cannot finish and lower it first.
+    fn enqueue(&self, work: WorkItem) -> bool {
+        self.in_flight.begin();
+        let accepted = self.queue.try_send(work).is_ok();
+        if !accepted {
+            self.in_flight.end();
+        }
+        accepted
     }
 
     /// Try to submit work that takes ownership of a resource.
@@ -1544,25 +1597,33 @@ impl ThreadPool {
             let r = rc.lock().unwrap().take().unwrap();
             f(r);
         });
-        match self.queue.try_send(work) {
-            Ok(()) => Ok(true),
-            Err(_) => {
-                // Queue full — recover resource.
-                let r = resource_cell.lock().unwrap().take().unwrap();
-                Err(r)
-            }
+        if self.enqueue(work) {
+            Ok(true)
+        } else {
+            // Queue full — recover resource.
+            let r = resource_cell.lock().unwrap().take().unwrap();
+            Err(r)
         }
     }
 
-    /// Wait for all in-flight work to complete.
-    pub fn drain(&self) {
-        while self.in_flight.load(Ordering::SeqCst) > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+    /// Wait up to `timeout` for all accepted work to finish. Returns how many
+    /// requests were still unfinished when it gave up, 0 on a clean drain.
+    pub fn drain(&self, timeout: std::time::Duration) -> usize {
+        let held = self
+            .in_flight
+            .idle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _ = self
+            .in_flight
+            .idle_cv
+            .wait_timeout_while(held, timeout, |_| self.in_flight() > 0)
+            .unwrap_or_else(|e| e.into_inner());
+        self.in_flight()
     }
 
     pub fn in_flight(&self) -> usize {
-        self.in_flight.load(Ordering::SeqCst)
+        self.in_flight.count.load(Ordering::SeqCst)
     }
 }
 
@@ -1601,6 +1662,18 @@ fn install_shutdown(socket_path: &std::path::Path) -> crate::signal::ShutdownHan
         // available to report.
         .unwrap_or_else(|| "m6-app".to_string());
     crate::signal::ShutdownHandle::install(crate::signal::Service::new(name).socket(socket_path))
+}
+
+/// Wait for accepted requests, up to `timeout`, then say how many were cut off.
+fn drain_pool(pool: &ThreadPool, timeout: std::time::Duration) {
+    let unfinished = pool.drain(timeout);
+    if unfinished > 0 {
+        warn!(
+            unfinished,
+            timeout_s = timeout.as_secs(),
+            "drain deadline passed with requests still in flight, shutting down anyway"
+        );
+    }
 }
 
 #[inline]
@@ -2533,11 +2606,12 @@ fn dump_config(
         config.thread_pool.size, config.thread_pool.queue_size
     );
     println!(
-        "server      read_timeout={} socket_mode={:04o}",
+        "server      read_timeout={} drain_timeout={}s socket_mode={:04o}",
         config
             .server
             .read_timeout
             .map_or("none".into(), |d| format!("{}s", d.as_secs())),
+        config.server.drain_timeout.as_secs(),
         config.server.socket_mode
     );
     for p in &config.global_params {
@@ -2800,6 +2874,7 @@ fn run_app_with_shutdown(
     // reason: it is applied to a socket at accept time, so a reload cannot
     // retune it without reopening connections that are already being served.
     let read_timeout = framework_state.config.server.read_timeout;
+    let drain_timeout = framework_state.config.server.drain_timeout;
     let socket_mode = framework_state.config.server.socket_mode;
 
     // Wrap state in RwLock so hot reload can atomically swap it while
@@ -2974,7 +3049,7 @@ fn run_app_with_shutdown(
         // Neither fd fired: a timeout, or a signal interrupted the wait.
         if ready.idle && is_shutdown() {
             info!("Shutdown signal received, draining...");
-            pool.drain();
+            drain_pool(&pool, drain_timeout);
             if let Some(f) = on_shutdown_cell.take() {
                 f();
             }
@@ -3048,7 +3123,7 @@ fn run_app_with_shutdown(
         }
 
         if is_shutdown() {
-            pool.drain();
+            drain_pool(&pool, drain_timeout);
             if let Some(f) = on_shutdown_cell.take() {
                 f();
             }
@@ -3686,6 +3761,77 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(100));
         let r = results.lock().unwrap();
         assert_eq!(r.len(), n);
+    }
+
+    /// A request the pool has accepted is in flight at once, whether it is
+    /// running or still queued. The wrong outcome: the count rises only when a
+    /// worker wakes, so a shutdown that drains right after the accept sees
+    /// nothing in flight and exits under the request.
+    #[test]
+    fn accepted_work_is_in_flight_before_a_worker_runs_it() {
+        let pool = ThreadPool::new(1, 2);
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        assert!(pool.submit(Box::new(move || {
+            held.recv().ok();
+        })));
+        assert!(pool.submit(Box::new(|| {})));
+        assert_eq!(pool.in_flight(), 2);
+
+        release.send(()).unwrap();
+        assert_eq!(pool.drain(DRAIN_LONG), 0);
+        assert_eq!(pool.in_flight(), 0);
+    }
+
+    /// Long enough that a test only ever returns from `drain` by being woken, never by the deadline.
+    const DRAIN_LONG: std::time::Duration = std::time::Duration::from_secs(86_400);
+
+    /// `drain` returns when the last request ends, not on a poll interval or
+    /// at its deadline. The wrong outcome: a deploy waits out the deadline (or
+    /// a polling tick) after the work is done. With a one-day deadline,
+    /// returning at all means it was woken by the last item finishing.
+    #[test]
+    fn drain_returns_when_the_last_request_finishes() {
+        // Room in the queue, so the submit succeeds whether or not the worker
+        // has yet reached its first wait for work.
+        let pool = ThreadPool::new(1, 1);
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let (started, running) = std::sync::mpsc::channel::<()>();
+        assert!(pool.submit(Box::new(move || {
+            started.send(()).unwrap();
+            held.recv().ok();
+        })));
+        running.recv().unwrap();
+
+        std::thread::scope(|s| {
+            let drained = s.spawn(|| pool.drain(DRAIN_LONG));
+            release.send(()).unwrap();
+            assert_eq!(drained.join().unwrap(), 0);
+        });
+    }
+
+    /// A request that never finishes cannot hold shutdown past the deadline.
+    /// The wrong outcome: `drain` waits forever and the supervisor kills the
+    /// service mid-response. It reports how many it left behind.
+    #[test]
+    fn drain_gives_up_at_its_deadline_and_counts_what_is_left() {
+        let pool = ThreadPool::new(1, 2);
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        assert!(pool.submit(Box::new(move || {
+            held.recv().ok();
+        })));
+        assert!(pool.submit(Box::new(|| {})));
+
+        assert_eq!(pool.drain(std::time::Duration::from_millis(20)), 2);
+        release.send(()).unwrap();
+        assert_eq!(pool.drain(DRAIN_LONG), 0);
+    }
+
+    /// Work that panics stops counting, so it cannot hold a drain open.
+    #[test]
+    fn work_that_panics_is_no_longer_in_flight() {
+        let pool = ThreadPool::new(1, 1);
+        assert!(pool.submit(Box::new(|| panic!("handler failed"))));
+        assert_eq!(pool.drain(DRAIN_LONG), 0);
     }
 
     #[test]
