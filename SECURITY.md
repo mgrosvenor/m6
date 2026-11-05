@@ -13,7 +13,6 @@ Sections 1 and 2 are the ones a reporter reads first.
 
 ## 1. Reporting a vulnerability
 
-This section is the reporting route.
 Report a vulnerability through GitHub private vulnerability reporting.
 The route is `https://github.com/mgrosvenor/m6/security/advisories/new`.
 Do not file a vulnerability in the public issue tracker.
@@ -28,7 +27,6 @@ GitHub private vulnerability reporting is the only route.
 ## 2. What is in scope
 
 Everything in the m6 workspace is in scope.
-Table 1 lists the crates and what each one does.
 
 | crate | role |
 |---|---|
@@ -69,13 +67,11 @@ A reproducible defect outside them is in scope, whatever it is.
 
 ## 4. Supported versions
 
-The newest release on `main` is supported.
-m6 does not backport fixes to older releases.
+Only the newest release on `main` is supported.
 
 ## 5. How m6 defends itself
 
 m6 already runs defences, so a reporter knows what is covered.
-Table 2 lists them.
 
 | defence | where it runs |
 |---|---|
