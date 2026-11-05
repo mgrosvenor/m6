@@ -22,6 +22,19 @@ M6_TEST_LOCK="${M6_TEST_LOCK:-/var/tmp/m6-test.lock}"
 # How long a measurement waits for an idle host before it reports NOT MEASURED,
 # rather than measuring under load or waiting for ever.
 M6_HOST_IDLE_WAIT="${M6_HOST_IDLE_WAIT:-7200}"
+# The one-minute load average below which a host counts as quiet.
+M6_HOST_IDLE_LOAD="${M6_HOST_IDLE_LOAD:-0.5}"
+
+# The one-minute load average: /proc/loadavg on Linux, else uptime's first
+# figure ("load average: 1.5, ..." on Linux, "load averages: 1.5 ..." on macOS).
+_load1() {
+    if [[ -r /proc/loadavg ]]; then
+        cut -d' ' -f1 /proc/loadavg
+    else
+        uptime | sed -E 's/.*load averages?: *//; s/[ ,].*//'
+    fi
+}
+_host_quiet() { awk -v l="$(_load1)" -v m="$M6_HOST_IDLE_LOAD" 'BEGIN { exit !(l < m) }'; }
 
 _have_flock() { command -v flock >/dev/null 2>&1; }
 
@@ -77,6 +90,19 @@ host_alone() {
     fi
     exec 6<"$M6_HOST_ENTRY_LOCK"
     if flock -w "$M6_HOST_IDLE_WAIT" 6 && flock -w "$M6_HOST_IDLE_WAIT" -x 8; then
+        # The lock keeps out every run that takes it. A process that does not
+        # (an older checkout's gate, anything else on the machine) still loads
+        # the host, so the measurement also waits for the load average to fall
+        # below M6_HOST_IDLE_LOAD before it starts.
+        local waited=0
+        while ! _host_quiet; do
+            if (( waited >= M6_HOST_IDLE_WAIT )); then
+                echo "NOT MEASURED: the host held the lock but stayed busy for ${M6_HOST_IDLE_WAIT}s (load $(_load1), limit ${M6_HOST_IDLE_LOAD})" >&2
+                return 2
+            fi
+            sleep 10
+            waited=$((waited + 10))
+        done
         export M6_HOST_LOCK_HELD=exclusive
         return 0
     fi
