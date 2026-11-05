@@ -755,7 +755,8 @@ pub fn uptime() -> Option<std::time::Duration> {
 mod tests {
     use super::*;
 
-    /// Real output from origin, 2026-09-11.
+    /// A /proc/loadavg line from a lightly loaded host. The running/total pair
+    /// reads one runnable task out of 231, which the parser splits apart.
     #[test]
     fn parses_a_real_loadavg() {
         let l = parse_loadavg("0.13 0.13 0.09 1/231 1250464\n").unwrap();
@@ -766,7 +767,8 @@ mod tests {
         assert_eq!(l.total, 231);
     }
 
-    /// Real output from origin. These are 950MB boxes, so the numbers matter.
+    /// A /proc/meminfo from a small (about 1 GB) Linux host, where MemFree reads
+    /// nearly empty while MemAvailable is healthy. The parser must prefer MemAvailable.
     #[test]
     fn parses_a_real_meminfo_and_prefers_available_over_free() {
         let s = "MemTotal:         973352 kB\n\
@@ -876,7 +878,8 @@ mod tests {
 mod system_tests {
     use super::*;
 
-    /// Real rows from origin, 2026-09-11.
+    /// A /proc/net/dev table with a loopback row and one real interface. The
+    /// loopback row is always busy and must be skipped.
     #[test]
     fn parses_real_net_dev_and_skips_loopback() {
         let s = "Inter-|   Receive                                                |  Transmit\n\
@@ -930,7 +933,8 @@ enp1s0: 2929071615 3102200    0    0    0     0          0         0 3105995619 
         assert_eq!(d[0].name, "vda");
     }
 
-    /// Real PSI output from origin.
+    /// PSI output where "some" pressure is non-zero and "full" pressure is
+    /// zero. The parser must keep the two kinds of pressure apart.
     #[test]
     fn parses_real_pressure() {
         let p = parse_pressure(
@@ -980,8 +984,8 @@ enp1s0: 2929071615 3102200    0    0    0     0          0         0 3105995619 
         assert_eq!(t.tcp_time_wait, 0);
     }
 
-    /// The real limits row from m6-http on origin: a 1024 soft limit against a
-    /// 524288 hard one. The soft limit is what `accept` fails against.
+    /// A limits row with a 1024 soft limit against a 524288 hard one. The soft
+    /// limit is what `accept` fails against.
     #[test]
     fn parses_fd_limits_and_keeps_soft_and_hard_apart() {
         let s = "Limit                     Soft Limit           Hard Limit           Units\n\

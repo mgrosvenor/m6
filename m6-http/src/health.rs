@@ -115,7 +115,7 @@ mod monitoring_exclusion_tests {
             "m6-html",
             "m6-file",
             "render-contact",
-            "render-analytics",
+            "render-reports",
             "origin",
             "method-check",
             "",

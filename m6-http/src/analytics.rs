@@ -5,7 +5,7 @@
 /// Everything here is derived from data already present on the request by
 /// the time m6-http has a response ready to send: it's server-side feature
 /// extraction, not a beacon. UA parsing and geo lookup are deliberately left
-/// to the downstream ingester (render-analytics) so the hot path here stays
+/// to a downstream analytics ingester so the hot path here stays
 /// a handful of string operations, not a database/ruleset lookup.
 use quiche::h3::NameValue as _;
 
@@ -386,15 +386,15 @@ mod tests {
 
     #[test]
     fn test_parse_referer_strips_query_and_scheme() {
-        let (host, path) = parse_referer("https://www.google.com/search?q=example+search&foo=bar");
-        assert_eq!(host, Some("www.google.com".to_string()));
+        let (host, path) = parse_referer("https://www.example.com/search?q=example+search&foo=bar");
+        assert_eq!(host, Some("www.example.com".to_string()));
         assert_eq!(path, Some("/search".to_string()));
     }
 
     #[test]
     fn test_parse_referer_host_only_no_path() {
-        let (host, path) = parse_referer("https://news.ycombinator.com");
-        assert_eq!(host, Some("news.ycombinator.com".to_string()));
+        let (host, path) = parse_referer("https://news.example.org");
+        assert_eq!(host, Some("news.example.org".to_string()));
         assert_eq!(path, None);
     }
 
@@ -408,11 +408,14 @@ mod tests {
     #[test]
     fn test_extract_features_all_present() {
         let headers = vec![
-            ("Referer".to_string(), "https://t.co/abc?x=1".to_string()),
+            (
+                "Referer".to_string(),
+                "https://example.net/abc?x=1".to_string(),
+            ),
             ("User-Agent".to_string(), "Mozilla/5.0 Test".to_string()),
         ];
         let f = extract_features(&headers);
-        assert_eq!(f.referer_host.as_deref(), Some("t.co"));
+        assert_eq!(f.referer_host.as_deref(), Some("example.net"));
         assert_eq!(f.referer_path.as_deref(), Some("/abc"));
         assert_eq!(f.user_agent.as_deref(), Some("Mozilla/5.0 Test"));
     }
