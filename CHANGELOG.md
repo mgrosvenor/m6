@@ -174,6 +174,9 @@ They fail if `font/woff2` is added to the default compress list, which would re-
 **Tests now run the built m6-http binary through its startup argument and system-config errors (#294).**
 They fail if a change to argument parsing or the config merge turns a clear exit 2 into a start with the wrong config.
 
+**Tests now cover the shutdown signals every service shares (#288).**
+They fail if a second SIGTERM stops forcing exit during a drain, if SIGINT leaves the graceful path, or if a request in flight at SIGTERM is cut off.
+
 ### Verified
 
 - Unit tests with stub resolvers cover a confirmed name, a PTR whose forward lookup returns other addresses, a name with no forward answer, a failed forward lookup, no PTR, a name with no address (EAI_NONAME and EAI_NODATA), a slot free by the time the caller has the result, the per-poll lookup cap, expiry and cache bound, a report that reads stored results and resolves nothing, a resolver that never answers, and the thread bound (eight blocked lookups, then fifty more that return at once and start no thread, then slots free again).

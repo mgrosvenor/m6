@@ -124,6 +124,26 @@ impl Service {
         }
     }
 
+    /// Wait for the child to exit, returning its status, or `None` if
+    /// `deadline` passes first.
+    ///
+    /// The non-panicking complement to [`terminate`](Self::terminate): a test
+    /// that has sent a signal by hand (SIGINT, or a second SIGTERM) waits here
+    /// for the status that signal produced. `terminate` sends SIGTERM itself
+    /// and panics when the child does not exit, which is wrong for both of
+    /// those.
+    pub fn wait_for_exit(&mut self, deadline: Instant) -> Option<ExitStatus> {
+        loop {
+            if let Some(status) = self.exited() {
+                return Some(status);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// Everything the child has written to stdout and stderr so far.
     pub fn output(&self) -> String {
         let buf = self.output.lock().unwrap_or_else(|e| e.into_inner());
