@@ -195,6 +195,16 @@ set -uo pipefail
 # not installed" while the binary sat on disk, and the skip was silent.
 export PATH=$PATH:$HOME/.cargo/bin:$HOME/.local/bin:/root/.cargo/bin:/root/.local/bin
 cd "$M6_DIR" || exit 1
+# This run's own files: another gate may be running on this host at the same
+# time, and fixed /tmp paths would let each read the other's logs.
+T="$(mktemp -d)" || exit 1
+trap 'rm -rf -- "$T"' EXIT
+# Several gates share this host (#344). tools/host-lock.sh holds the protocol:
+# this run holds the host shared, the test suite and conformance take the port
+# lock, and perfcheck gets the host to itself.
+# shellcheck source=tools/host-lock.sh
+. ./tools/host-lock.sh || exit 1
+host_enter_shared
 
 echo "### release build"
 cargo build --workspace --release 2>&1 | tail -3
@@ -202,9 +212,9 @@ echo "RELEASE_WARNINGS=$(cargo build --workspace --release 2>&1 | grep -c '^warn
 
 echo "### clippy"
 # `-D warnings`, no ceiling. Prints its own line; CLIPPY_STATUS is what decides.
-./tools/clippy.sh > /tmp/clippy.out 2>&1
+./tools/clippy.sh > $T/clippy.out 2>&1
 echo "CLIPPY_STATUS=$?"
-tail -5 /tmp/clippy.out
+tail -5 $T/clippy.out
 
 echo "### cargo-deny"
 # It used to run only in GitHub Actions, and that cost four hours once: a git
@@ -212,9 +222,9 @@ echo "### cargo-deny"
 # push, and the build-host checks kept reporting that everything passed. A check
 # that lives in one place only is not a check.
 if command -v cargo-deny >/dev/null 2>&1; then
-    cargo deny check > /tmp/deny.out 2>&1
+    cargo deny check > $T/deny.out 2>&1
     echo "DENY_STATUS=$?"
-    tail -4 /tmp/deny.out
+    tail -4 $T/deny.out
 else
     echo "DENY_STATUS=127"
     echo "cargo-deny is NOT INSTALLED here: cargo install cargo-deny --locked"
@@ -243,19 +253,19 @@ export M6_BACKENDS_REQUIRE_ALL=1
 # Captured in full, then reported. Grepping the pipe drops the assertion message,
 # leaving a bare `thread '<name>' panicked at <file>:<line>` with the text that
 # says WHY thrown away.
-cargo test --workspace > /tmp/m6-full.log 2>&1 || true
-grep -E '^test result:' /tmp/m6-full.log || true
+with_port_lock cargo test --workspace > "$T/m6-full.log" 2>&1 || true
+grep -E '^test result:' "$T/m6-full.log" || true
 echo "### failure detail"
-sed -n '/^failures:/,$p' /tmp/m6-full.log | head -60
+sed -n '/^failures:/,$p' "$T/m6-full.log" | head -60
 
 echo "### conformance"
 # WITHOUT --allow-missing-tools, deliberately. This box has all three testers,
 # and an absent one here is a failure rather than a skip. A laptop's pre-push
 # hook may pass that flag and say loudly what it did not test; this has no excuse
 # available to it.
-./tools/conformance.sh > /tmp/conformance.out 2>&1
+with_port_lock ./tools/conformance.sh > "$T/conformance.out" 2>&1
 echo "CONFORMANCE_STATUS=$?"
-tail -14 /tmp/conformance.out
+tail -14 "$T/conformance.out"
 
 echo "### performance"
 # Against the recorded numbers in tools/perf-baseline.txt, taken on this machine.
@@ -265,9 +275,13 @@ echo "### performance"
 # invocation, set from the checkout that synced. The tree up here has no `.git`,
 # so `git rev-parse` finds nothing, and a performance record that cannot name its
 # commit cannot be compared with anything later.
-./tools/perfcheck.sh > /tmp/perf.out 2>&1
-echo "PERF_STATUS=$?"
-grep -E 'render:|PASS|FAIL' /tmp/perf.out | tail -6
+if host_alone; then
+    ./tools/perfcheck.sh > "$T/perf.out" 2>&1
+    echo "PERF_STATUS=$?"
+    grep -E 'render:|PASS|FAIL' "$T/perf.out" | tail -6
+else
+    echo "PERF_STATUS=2"
+fi
 REMOTE
 
 # ── The examples ─────────────────────────────────────────────────────────────
@@ -283,7 +297,21 @@ if [[ -n "$EXAMPLES" ]]; then
         > "$EXAMPLES_LOG" 2>&1 <<'REMOTE_EG' || true
 set -uo pipefail
 export PATH=$PATH:$HOME/.cargo/bin:$HOME/.local/bin:/root/.cargo/bin:/root/.local/bin
+# M6_DIR arrives relative to the login directory (BUILD_ROOT defaults to a
+# relative path), and this half changes directory before it uses it, so it is
+# made absolute first. Without this every example step, and the lock helper
+# below, looked for m6 in a directory that does not exist.
+M6_DIR="$(cd "$M6_DIR" && pwd)" || exit 1
 cd "$EG_DIR" || exit 1
+# This run's own files (see the m6 half above).
+T="$(mktemp -d)" || exit 1
+trap 'rm -rf -- "$T"' EXIT
+# The host lock shared for the whole run (#344, tools/host-lock.sh). The builds
+# and clippy below bind nothing; from the unit tests on, every step binds fixed
+# loopback ports (8443 among them), so the port lock is held from there.
+# shellcheck source=tools/host-lock.sh
+. "$M6_DIR/tools/host-lock.sh" || exit 1
+host_enter_shared
 
 echo "### examples release build"
 cargo build --release 2>&1 | tail -3
@@ -299,18 +327,24 @@ echo "### examples clippy"
 # reported as a stack that never answered. The wasted disk is worth more than a
 # failure that points at the wrong thing.
 CARGO_TARGET_DIR=target/clippy cargo clippy --workspace --all-targets --release 2>&1 \
-    | grep -c '^warning' > /tmp/eg-clippy.count
-echo "EG_CLIPPY_WARNINGS=$(cat /tmp/eg-clippy.count)"
+    | grep -c '^warning' > $T/eg-clippy.count
+echo "EG_CLIPPY_WARNINGS=$(cat $T/eg-clippy.count)"
 CARGO_TARGET_DIR=target/clippy cargo clippy --workspace --all-targets --release 2>&1 \
     | grep '^warning' | head -5
 
+# Everything the remaining steps run is built first, outside the port lock, so
+# the lock covers running and not compiling. The later builds are then no-ops.
+cargo test --workspace --no-run > "$T/eg-testbuild.log" 2>&1 || true
+cargo build --release -p render-cms > /dev/null 2>&1 || true
+(cd "$M6_DIR" && cargo build --workspace --release > /dev/null 2>&1) || true
+port_hold
 echo "### examples unit tests"
 # Not blog_site_end_to_end: it needs certificates and example 05's stack, and
 # fails without them. It runs below, after that stack is up.
-cargo test --workspace -- --skip blog_site_end_to_end > /tmp/eg-tests.log 2>&1
+cargo test --workspace -- --skip blog_site_end_to_end > $T/eg-tests.log 2>&1
 echo "EG_TEST_STATUS=$?"
-grep -E '^test result:' /tmp/eg-tests.log || true
-sed -n '/^failures:/,$p' /tmp/eg-tests.log | head -40
+grep -E '^test result:' $T/eg-tests.log || true
+sed -n '/^failures:/,$p' $T/eg-tests.log | head -40
 
 echo "### development certificates"
 # A fresh checkout has no keys/: they are gitignored, and each example's dev.sh
@@ -422,7 +456,12 @@ if ss -ltnH 'sport = :8443' 2>/dev/null | grep -q .; then
     exit 0
 fi
 
-M6="$M6_DIR" M6_NO_BROWSER=1 ./dev.sh --no-open > /tmp/eg-cms-dev.log 2>&1 &
+# Its processes do not inherit the locks, so one that outlives this run cannot
+# hold the host or the ports. While this run lasts it holds the port lock itself,
+# so no other run's tests bind ports beside the stack; a stack left over after a
+# failed run is caught by the 8443 check above on the next examples run, which a
+# wedged lock would not be.
+M6="$M6_DIR" M6_NO_BROWSER=1 ./dev.sh --no-open > $T/eg-cms-dev.log 2>&1 6<&- 7<&- 8<&- &
 DEV_PID=$!
 up=0
 # 180 seconds. Six services have to bind, and m6-md regenerates posts.json from
@@ -435,7 +474,7 @@ done
 if [ "$up" != "1" ]; then
     echo "EG_CMS_STATUS=1"
     echo "the 05-cms stack never answered in 180s; dev.sh output:"
-    tail -30 /tmp/eg-cms-dev.log
+    tail -30 $T/eg-cms-dev.log
     echo "--- service logs ---"
     tail -20 logs/*.log 2>/dev/null
 # A 200 says something is serving, not that it is the thing under test. Prove it
@@ -446,24 +485,24 @@ elif ! curl -sk --http1.1 https://127.0.0.1:8443/ 2>/dev/null | grep -q 'Recent 
     echo "something answered 200 on 8443 but it is not 05-cms, so nothing here was measured:"
     ss -ltnpH 'sport = :8443' 2>/dev/null | sed 's/^/    /'
 else
-    ./test.sh > /tmp/eg-cms-test.log 2>&1
+    ./test.sh > $T/eg-cms-test.log 2>&1
     cms_rc=$?
-    grep -E 'passed|FAIL' /tmp/eg-cms-test.log | sed 's/\x1b\[[0-9;]*m//g' | tail -25
+    grep -E 'passed|FAIL' $T/eg-cms-test.log | sed 's/\x1b\[[0-9;]*m//g' | tail -25
     # The Rust end-to-end test needs this stack, so it runs here and its
     # failure counts into the same status.
     echo "### 05-cms rust end-to-end"
-    cargo test -p render-cms --test integration > /tmp/eg-cms-rust.log 2>&1
+    cargo test -p render-cms --test integration > $T/eg-cms-rust.log 2>&1
     rust_rc=$?
     # A test that cannot start its stack prints SKIP and passes; count it as a failure.
-    if grep -q '^SKIP' /tmp/eg-cms-rust.log; then
+    if grep -q '^SKIP' $T/eg-cms-rust.log; then
         echo "rust end-to-end skipped:"
-        grep '^SKIP' /tmp/eg-cms-rust.log
+        grep '^SKIP' $T/eg-cms-rust.log
         rust_rc=1
     fi
     # No "test result:" line is echoed: the report below sums those lines for the
     # unit-test count and takes the last "N passed" as the suite's count.
     echo "rust end-to-end exit status $rust_rc"
-    grep -E '^test .* FAILED|panicked' /tmp/eg-cms-rust.log | grep -v '^test result:' | tail -25
+    grep -E '^test .* FAILED|panicked' $T/eg-cms-rust.log | grep -v '^test result:' | tail -25
     if [ "$cms_rc" != "0" ] || [ "$rust_rc" != "0" ]; then
         echo "EG_CMS_STATUS=1"
     else

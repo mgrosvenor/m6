@@ -11,7 +11,8 @@
 #   2. Clippy minimum-score check — BLOCKS the push
 #   3. Unit + integration tests
 #   4. Conformance minimum-score check (h1spec / h2spec / h3spec) — BLOCKS the push
-#   5. Benchmarks (informational — prints criterion output; never blocks the push)
+#   5. Benchmarks: their numbers are informational and never block the push, but
+#      the bench targets must compile, and a build failure blocks it like any other
 #
 # Why benches don't gate:
 #   Sub-microsecond criterion benchmarks on a development machine have ±5-15%
@@ -25,6 +26,14 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
+
+# ── Locks on a shared build host ──────────────────────────────────────────────
+# tools/host-lock.sh holds the protocol (#344): this run holds the host shared,
+# takes the port lock only around the steps that bind ports, and has the host to
+# itself for the benchmarks.
+# shellcheck source=tools/host-lock.sh
+. "$SCRIPT_DIR/tools/host-lock.sh"
+host_enter_shared
 
 # ── Args ──────────────────────────────────────────────────────────────────────
 RUN_BENCH=true
@@ -88,7 +97,11 @@ fi
 # their #[test] fns race for those ports and fail with spurious 502s that
 # have nothing to do with the code under test.
 info "Running correctness tests..."
-if cargo test --workspace --quiet -- --test-threads=1 2>&1; then
+# The test build binds nothing, so it runs before the port lock is taken.
+if ! cargo test --workspace --no-run --quiet 2>&1; then
+  fail "Test build failed: the tests do not compile"
+fi
+if with_port_lock cargo test --workspace --quiet -- --test-threads=1 2>&1; then
   pass "Unit + integration tests (HTTP/1.1 ✓  HTTP/3 ✓)"
 else
   fail "Test suite failed — fix correctness issues before performance check"
@@ -142,7 +155,7 @@ fi
 INCOMPLETE=""
 info "Running conformance (h1spec / h2spec / h3spec)..."
 CONF_OUT="$(mktemp)"
-if ./tools/conformance.sh --allow-missing-tools 2>&1 | tee "$CONF_OUT"; then
+if with_port_lock ./tools/conformance.sh --allow-missing-tools 2>&1 | tee "$CONF_OUT"; then
   if grep -q 'NOT TESTED' "$CONF_OUT"; then
     NOT_TESTED="$(grep -o 'NOT TESTED:.*' "$CONF_OUT" | tail -1)"
     warn "Conformance INCOMPLETE — ${NOT_TESTED:-a tester was absent}"
@@ -162,9 +175,21 @@ if [[ "$RUN_BENCH" == "false" ]]; then
   exit 0
 fi
 
+# A benchmark, and a baseline saved from one, is a measurement: it waits for the
+# host to be idle and holds it so (see the locks at the top). The bench binaries
+# are compiled first, so the host is held for measuring and nothing else.
+if ! cargo bench "${CRITERION_BENCHES[@]}" --no-run --quiet 2>&1; then
+  fail "Benchmark build failed"
+fi
+if ! host_alone; then
+  INCOMPLETE="benchmarks (the host was never idle, so nothing was measured)"
+  summary
+  exit 2
+fi
+
 if [[ "$SAVE_BASELINE" == "true" ]]; then
   info "Saving benchmark baseline '$BASELINE_NAME'..."
-  if cargo bench "${CRITERION_BENCHES[@]}" --quiet -- --save-baseline "$BASELINE_NAME" 2>&1; then
+  if cargo bench "${CRITERION_BENCHES[@]}" --quiet -- --save-baseline "$BASELINE_NAME" 2>&1 6<&- 8<&-; then
     pass "Baseline '$BASELINE_NAME' saved"
   else
     fail "Benchmark run failed during baseline save"
@@ -207,7 +232,7 @@ fi
 
 BENCH_OUT="$(mktemp)"
 # Run benchmarks; capture output but do not fail on non-zero exit.
-cargo bench "${CRITERION_BENCHES[@]}" --quiet $BENCH_ARGS 2>&1 | tee "$BENCH_OUT" || true
+cargo bench "${CRITERION_BENCHES[@]}" --quiet $BENCH_ARGS 2>&1 6<&- 8<&- | tee "$BENCH_OUT" || true
 
 # Surface any criterion-detected regressions as warnings (not failures).
 REGRESSIONS=$(grep "Performance has regressed\." "$BENCH_OUT" | wc -l | tr -d ' ')
