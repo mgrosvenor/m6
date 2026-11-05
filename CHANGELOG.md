@@ -191,8 +191,8 @@ They fail if a failed member is picked again before its backoff ends or is never
 **Tests now cover custom error pages from a socket backend (#298).**
 They fail if a backend 404 or 500 loses the fetched page or its status, if a failed page fetch is retried, or if the error path fetches itself.
 
-**The build-host sync no longer deletes `tools/perf-history.jsonl`, and the script merges it back after perfcheck so the committed performance history records every run (#193).**
-The sync ran with `--delete` and erased the file the build host wrote, so the history never entered git. The sync now excludes it and the script appends the records the checkout lacks, so a recreated build host cannot truncate the history. Verified on a build host run: the file survived the sync, gained the new record, and the checkout gained exactly the lines it lacked with no duplicate and no loss.
+**The build-host sync now keeps `tools/perf-history.jsonl`, and the script brings it back after perfcheck so the committed performance history records every run (#193).**
+The sync used to delete the file the build host wrote, so the history never entered git. The sync now sends the committed history to the host, perfcheck appends its record there, and the script replaces the local file with the result only if the copy is complete and no shorter. The clean-tree guard ignores the file, a copy-back failure fails the run without stopping the examples, and `.gitattributes` merges the file by union so two branches that each add a record do not conflict.
 
 ### Verified
 
