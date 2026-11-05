@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use m6_core::testkit::{binary, claim_port, wait, Service};
+use m6_core::testkit::{binary, claim_port, read_one, wait, Service};
 
 /// A single backend on a unix socket, serving one fixed body.
 ///
@@ -193,12 +193,7 @@ fn get(port: u16, path: &str) -> Result<(u16, String), String> {
         .write_all(req.as_bytes())
         .map_err(|e| e.to_string())?;
     stream.flush().map_err(|e| e.to_string())?;
-    let mut raw = Vec::new();
-    match stream.read_to_end(&mut raw) {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
-        Err(e) => return Err(format!("read: {e}")),
-    }
+    let raw = read_one(&mut stream, "GET").map_err(|e| format!("read: {e}"))?;
     let text = String::from_utf8_lossy(&raw).into_owned();
     let (head, body) = text
         .split_once("\r\n\r\n")
