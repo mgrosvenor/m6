@@ -142,13 +142,17 @@ jobs:
       - name: Test suite
         if: ${{ !cancelled() }}
         run: |
-          cargo test --workspace > full.log 2>&1 || true
+          status=0
+          cargo test --workspace > full.log 2>&1 || status=$?
           grep -E '^test result:' full.log || true
           if grep -q '^failures:' full.log; then
             sed -n '/^failures:/,$p' full.log | head -80
             echo "::error::tests failed"
             exit 1
           fi
+          # A test build that does not compile, or a test binary that aborts,
+          # prints no `failures:` line, so cargo's own status decides as well.
+          [ "$status" -eq 0 ] || { tail -80 full.log; echo "::error::cargo test exited with status $status"; exit 1; }
 
       # Nothing in the workspace turns on some off-by-default core features
       # (`sqlite`, `email`, `multipart`), so `cargo test --workspace` never
@@ -313,13 +317,15 @@ jobs:
           # Example 05's end-to-end test needs the certificate and auth
           # database that dev.sh creates, and fails without them, so it runs
           # in the example 05 step below once the stack is up (#277).
-          cargo test --workspace -- --skip blog_site_end_to_end > full.log 2>&1 || true
+          status=0
+          cargo test --workspace -- --skip blog_site_end_to_end > full.log 2>&1 || status=$?
           grep -E '^test result:' full.log || true
           if grep -q '^failures:' full.log; then
             sed -n '/^failures:/,$p' full.log | head -60
             echo "::error::example tests failed"
             exit 1
           fi
+          [ "$status" -eq 0 ] || { tail -60 full.log; echo "::error::cargo test exited with status $status"; exit 1; }
 
       # m6-file's config schema changed on 2026-09-12 and ten example configs
       # were left naming no handler, so the service exited 2 before binding and
@@ -343,6 +349,7 @@ jobs:
       # untracked keys/ directories. A check that depends on an untracked file is
       # not a check, which is the same lesson the mkcert fallback taught earlier.
       - name: Generate development certificates
+        if: ${{ !cancelled() }}
         working-directory: m6-examples
         run: |
           for d in examples/*/; do
@@ -381,6 +388,7 @@ jobs:
           mkdir -p examples/09-global-deployment/certs
 
       - name: Every example's config parses
+        if: ${{ !cancelled() }}
         working-directory: m6-examples
         run: |
           bad=0 unexplained=0
@@ -416,6 +424,7 @@ jobs:
       # mkcert) and creates the admin user. That is exactly what a new reader gets
       # on step one of the README, and it is checked here rather than assumed.
       - name: Example 05, end to end over the running stack
+        if: ${{ !cancelled() }}
         working-directory: m6-examples/examples/05-cms
         run: |
           M6="$GITHUB_WORKSPACE/m6" M6_NO_BROWSER=1 ./dev.sh --no-open > dev.log 2>&1 &
