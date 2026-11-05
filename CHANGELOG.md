@@ -948,9 +948,6 @@ Turning overflow checks and LTO on made the binaries smaller and the hot paths f
 That is why the missing profile went unnoticed.
 A deployment repository carried the full profile for its own binaries, and every m6 binary it installed carried none.
 
-Table 1 gives the release binary sizes before and after the profile.
-Take from it that every service shrank, and m6-http shrank the most.
-
 | binary | before | after |
 |---|---|---|
 | m6-http | 11.14 MB | **7.08 MB, -36.5%** |
@@ -960,22 +957,18 @@ Take from it that every service shrank, and m6-http shrank the most.
 | m6-html | 30.00 MB | 23.16 MB, -22.8% |
 | m6-auth-server | 33.46 MB | 25.94 MB, -22.5% |
 
-**Table 1: release binary sizes before and after the release profile.**
-The smallest service is the one on every request path.
+**Table 1: release binary sizes before and after the release profile.** Take from it that every service shrank, and m6-http shrank the most.
 
 Binary size is a latency property here.
 A node runs five m6 services at once, and 30 MB of text per service is resident memory and instruction cache the request path competes with.
 m6-http, which is in every request path, lost 36.5%.
-
-Table 2 gives the two recorded request-path figures.
-Take from it that the profile shortened both.
 
 | recorded path | before | after |
 |---|---|---|
 | `render:minimal` | 201827 ns | **174101 ns, -13.7%** |
 | `render:blog-index` | 1784823 ns | **1454253 ns, -18.5%** |
 
-**Table 2: the two recorded paths, before and after the profile.**
+**Table 2: the two recorded paths, before and after the profile.** Take from it that the profile shortened both.
 Both figures are medians over six runs on a quiet 2-core Linux build host, and both recorded minimums in `tools/perf-baseline.txt` moved down with the argument beside them.
 
 **Overflow checks are on in release**, at a few percent that the LTO gain more than covers.
@@ -1026,8 +1019,6 @@ Four of those traps report a conformance failure that is not there, and two of t
 
 `tools/build-host-tests.sh` on a Linux build host, with the profile in place.
 1146 tests passed and 0 failed, zero warnings in release and test builds, clippy silent, cargo-deny clean, h1spec 32/32 on all four targets, h2spec 146/146, h3spec 47/49, TLS resumption green on all three protocols, performance within margin, the examples 58 passed with every config parsing, and example 05's end-to-end suite 98 passed over the running stack.
-
-1.12.0 adds the release profile, which shrinks every binary and shortens the recorded request paths.
 
 ---
 
@@ -1098,8 +1089,6 @@ CI green on all six jobs.
 
 Nothing in this release changes behaviour.
 There is nothing in it for a server to run.
-
-1.11.3 removes deployment-specific material from the repository and makes Rule Zero the first thing a reader sees.
 
 ---
 
@@ -1172,8 +1161,6 @@ CI on the pull request: build/tests/clippy, conformance, examples, MSRV, cargo-d
 
 Recorded as lesson 53.
 
-1.11.2 corrects the release tooling's printed instructions and adds tests for them.
-
 ---
 
 ## 1.11.1, 2026-09-25
@@ -1210,11 +1197,11 @@ No library or binary change, so a deployment has no reason to move to it.
 
 This release is the first thing the new gate ran against, and it passed only because the document it checked named the version.
 
-1.11.1 gates releases on documentation freshness, which is the change that made this release necessary.
-
 ---
 
 ## 1.11.0, 2026-09-25
+
+**`/perf` reports what is running, and TLS session resumption is measured and gated.**
 
 ### Changed
 
@@ -1291,11 +1278,11 @@ Both had always shared one `ClientConfig` across their N connections, so every r
 `probe::resumption_failed` holds the gate's decision, with five unit tests.
 The failing branch cannot be produced against a server that resumes, and a gate whose failure path has never run is a claim.
 
-1.11.0 reports build identity and drift on `/perf`, and it gates and fixes TLS session resumption measurement.
-
 ---
 
 ## 1.10.0, 2026-09-19
+
+**HTTP/2 server push and 103 Early Hints are removed, with the hint extractor.**
 
 ### Removed
 
@@ -1324,8 +1311,6 @@ Kept, deliberately:
 Two HTTP/2 tests that measured outbound DATA framing and the per-stream send window through a pushed stream were converted, and not deleted.
 Both rules (RFC 9113 4.2 and 6.9) govern every response this server writes, so they now exercise an ordinary one.
 Two that tested only server-initiated streams were removed, because nothing can create one.
-
-1.10.0 removes server push and 103 Early Hints, and it keeps the RFC 9113 behaviour that does not depend on them.
 
 ---
 
@@ -1400,11 +1385,11 @@ It was found at 82%, where it failed the merge gate twice without either failure
 One was a Go link dying on ENOSPC, and the other was `render:minimal` reading 31% over its ceiling, which looks exactly like a real regression and is not.
 Stale directories are now swept by age before a new one is made, tested against a tempdir and not the real `/tmp`.
 
-1.9.0 fixes early hints and TLS session resumption, and it stops the backend contract tests from filling `/tmp`.
-
 ---
 
 ## 1.8.1, 2026-09-18
+
+**A prefetched or pushed hint is now stored under the key the request uses.**
 
 ### Fixed
 
@@ -1437,11 +1422,11 @@ A latent defect became reachable the moment the feature it serves started workin
 Verified by a test that pins the trap and not just describes it.
 The two lookup keys are asserted equal, so the next caller meets the requirement to split as a failing assumption, and not as a comment.
 
-1.8.1 fixes a cache-key defect that 1.8.0 made reachable.
-
 ---
 
 ## 1.8.0, 2026-09-17
+
+**m6-http warms its own cache at startup, and this release fixes server push and the hint extractor.**
 
 ### Added
 
@@ -1569,8 +1554,6 @@ It now refuses to start when the port is held, naming the process, and confirms 
 Setting `warm_on_start` needs this release on the node first.
 A 1.7.0 binary does not know the key, and on m6's config rules an unknown key is a config error, so setting it ahead of the rollout buys a failure on every node at once.
 Roll 1.8.0 out, then turn it on, then retire the script and its timer.
-
-1.8.0 adds cache warming and fixes server push framing and the hint extractor, and it removes every `#[allow]` so clippy's zero is real.
 
 ---
 
