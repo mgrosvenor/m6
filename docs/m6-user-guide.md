@@ -1708,7 +1708,9 @@ The stack is three processes: m6-http, m6-html and m6-file.
 `dev.sh` redirects each process's output to its own file under `logs/`, so the viewer has one file per process.
 
 `site.toml` sets `format = "json"` and `level = "debug"`, and routes `/logs/tail/{relpath}` straight to m6-file.
-A direct route, not a `route_group`, so m6-http forwards the request without requiring the log files to exist at startup.
+The route is direct, so m6-http forwards the request without requiring the log files to exist at startup.
+The example leaves the tail route unauthenticated, and `level = "debug"` logs can carry request detail.
+A production deployment protects the route with `require = "role:..."`, the way section 7.8 protects the monitor history.
 
 `configs/m6-file.conf` turns on tail mode for the log files:
 
@@ -1824,11 +1826,11 @@ For immediate revocation, use a short `--ttl-days`.
 
 ### 11.5. Template variables in protected routes
 
-A request with a valid Bearer token gives m6-html templates the same `auth` object as a browser login:
+A request with a valid Bearer token gives m6-html templates the same `auth_username` and `auth_roles` variables as a browser login:
 
 ```html
-<p>Caller: {{ auth.username }}</p>
-<p>Roles:  {{ auth.roles | join(sep=", ") }}</p>
+<p>Caller: {{ auth_username }}</p>
+<p>Roles:  {{ auth_roles | join(sep=", ") }}</p>
 ```
 
 ### 11.6. Functional tests
@@ -1943,14 +1945,6 @@ The checks cover a 401 without a token, the JSON keys of each endpoint, config t
 
 ## 13. Summary
 
-The guide walked eleven examples, from a static page to a global fleet.
-Each example adds one capability to the last, and each runs from its own directory in `m6-examples`.
-Example 05 is the first to run the whole stack, and its end-to-end suite is the check that the install works.
-
-A reader who wants the config keys, the core components or the service internals goes to the owning documents:
-
-- [`m6-site-toml.md`](m6-site-toml.md) owns every config key and the split between `site.toml` and the system config.
-- [`m6-core-reference.md`](m6-core-reference.md) owns the components a renderer links.
-- [`m6-http.md`](m6-http.md) owns the cache and its clearing rules.
-- [`m6-auth.md`](m6-auth.md) and [`m6-auth-cli.md`](m6-auth-cli.md) own login, tokens and the CLI.
-- [`m6-file.md`](m6-file.md), [`m6-render.md`](m6-render.md) and [`m6-render-lib.md`](m6-render-lib.md) own the file handler and the renderer.
+The eleven examples layer one m6 capability onto the last.
+By Example 11 a reader has seen serving, auth, a CMS, a systemd deployment, a multi-node fleet, API tokens and an admin dashboard.
+A reader can now copy the example that matches the next step, and follow the owning document each example points to for the details it leaves out.
