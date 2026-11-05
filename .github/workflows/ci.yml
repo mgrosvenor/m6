@@ -89,10 +89,11 @@ jobs:
   # Every independent check runs even when an earlier one failed
   # (`!cancelled()`), so one push reports every failure at once: a dying test
   # used to skip clippy, and its problems surfaced only on the next push. A
-  # check that needs an earlier step's output (the toolchain, the test build)
-  # runs only if that step succeeded, so one broken step is reported once, not
-  # again by everything after it. Clippy runs second because it is quick and
-  # needs no release build.
+  # check that needs an earlier step's output (the toolchain, compiled tests)
+  # runs only if that output exists, so it is skipped rather than failing again
+  # for the same reason. A warning fails its own step and never skips a check
+  # that needs only the code to compile. Clippy runs second because it is quick
+  # and needs no release build.
   build-and-test:
     name: build, tests, clippy
     runs-on: ubuntu-latest
@@ -136,7 +137,13 @@ jobs:
         id: testbuild
         if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         run: |
-          cargo test --workspace --no-run 2>&1 | tee testbuild.log
+          status=0
+          cargo test --workspace --no-run > testbuild.log 2>&1 || status=$?
+          cat testbuild.log
+          # The suite needs the tests to compile, not to compile without
+          # warnings, so it runs on this output and a warning cannot hide it.
+          [ "$status" -eq 0 ] && echo "compiled=true" >> "$GITHUB_OUTPUT"
+          [ "$status" -eq 0 ] || { echo "::error::the test build failed with status $status"; exit 1; }
           n=$(grep -c '^warning' testbuild.log || true)
           echo "test-build warnings: $n"
           [ "$n" -eq 0 ] || { echo "::error::$n test-build warning(s)"; exit 1; }
@@ -145,7 +152,7 @@ jobs:
       # message and leaves a bare `panicked at <file>:<line>`, which names the
       # place and not the reason.
       - name: Test suite
-        if: ${{ !cancelled() && steps.testbuild.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.testbuild.outputs.compiled == 'true' }}
         run: |
           status=0
           cargo test --workspace > full.log 2>&1 || status=$?
@@ -304,7 +311,12 @@ jobs:
         id: build_examples
         working-directory: m6-examples
         run: |
-          cargo build --release 2>&1 | tee build.log
+          status=0
+          cargo build --release > build.log 2>&1 || status=$?
+          cat build.log
+          # The end-to-end step needs the binaries, not a warning-free build.
+          [ "$status" -eq 0 ] && echo "compiled=true" >> "$GITHUB_OUTPUT"
+          [ "$status" -eq 0 ] || { echo "::error::the examples build failed with status $status"; exit 1; }
           n=$(grep -c '^warning' build.log || true)
           echo "examples release warnings: $n"
           [ "$n" -eq 0 ] || { echo "::error::$n warning(s) building the examples"; exit 1; }
@@ -357,7 +369,7 @@ jobs:
       # not a check, which is the same lesson the mkcert fallback taught earlier.
       - name: Generate development certificates
         id: certs
-        if: ${{ !cancelled() && steps.build_examples.outcome == 'success' }}
+        if: ${{ !cancelled() }}
         working-directory: m6-examples
         run: |
           for d in examples/*/; do
@@ -396,7 +408,7 @@ jobs:
           mkdir -p examples/09-global-deployment/certs
 
       - name: Every example's config parses
-        if: ${{ !cancelled() && steps.build_examples.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.build_m6.outcome == 'success' }}
         working-directory: m6-examples
         run: |
           bad=0 unexplained=0
@@ -432,7 +444,7 @@ jobs:
       # mkcert) and creates the admin user. That is exactly what a new reader gets
       # on step one of the README, and it is checked here rather than assumed.
       - name: Example 05, end to end over the running stack
-        if: ${{ !cancelled() && steps.certs.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.build_examples.outputs.compiled == 'true' && steps.certs.outcome == 'success' }}
         working-directory: m6-examples/examples/05-cms
         run: |
           M6="$GITHUB_WORKSPACE/m6" M6_NO_BROWSER=1 ./dev.sh --no-open > dev.log 2>&1 &
