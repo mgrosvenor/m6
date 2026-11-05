@@ -120,9 +120,9 @@ public_key  = "{}"
 #[test]
 fn missing_private_key_exits_nonzero_names_the_file_and_binds_no_socket() {
     let site = TestSite::new("missing-key");
-    let (_private_pem, public_pem) = generate_test_rsa_keys();
+    // The public key is never read: the missing private key is refused first.
     let public = site.key_dir.path().join("auth.pub");
-    std::fs::write(&public, &public_pem).unwrap();
+    std::fs::write(&public, "unused").unwrap();
     // Named in the config but never written.
     let missing = site.key_dir.path().join("missing-auth.pem");
     site.write_config(&missing, &public, "data/auth.db");
