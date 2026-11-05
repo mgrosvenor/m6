@@ -2,6 +2,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use m6_core::app::{check_route_conflicts, Methods, RouteDecl};
 use matchit::Router as MatchitRouter;
 
 use crate::config::Config;
@@ -83,7 +84,7 @@ pub struct RouteEntry {
 /// Built route table.
 pub struct RouteTable {
     router: MatchitRouter<RouteEntry>,
-    /// Ordered entries for specificity-based selection.
+    /// The explicit routes and expanded route groups, in the order added.
     entries: Vec<RouteEntry>,
     /// Whether *any* route declares `require`.
     ///
@@ -99,6 +100,19 @@ impl RouteTable {
     pub fn from_config(config: &Config) -> anyhow::Result<Self> {
         let mut router = MatchitRouter::new();
         let mut entries = Vec::new();
+
+        // The rule m6-core applies to a service's routes, so the edge and the
+        // services refuse the same configs. An edge route names no methods, so
+        // it answers every method.
+        let declared: Vec<_> = config
+            .routes
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                RouteDecl::new(format!("[[route]] number {}", i + 1), &r.path, Methods::ANY)
+            })
+            .collect();
+        check_route_conflicts(&declared)?;
 
         // Add explicit routes
         for route in &config.routes {
@@ -491,22 +505,39 @@ mod tests {
         assert!(table.at("/other").is_none());
     }
 
-    /// The edge has no equal-specificity tie to resolve: `matchit` refuses to
-    /// build a table in which two patterns could match the same path, so a
-    /// config like `/blog/{slug}` and `/blog/{name}` fails at load here too.
-    /// The wrong outcome: a later `matchit` change that accepts the pair would
-    /// leave one route unreachable with no error.
+    fn conflict(paths: &[&str]) -> Option<String> {
+        let routes = paths.iter().map(|p| make_route(p, "b")).collect();
+        let config = make_config(routes, vec![make_backend("b")]);
+        RouteTable::from_config(&config)
+            .err()
+            .map(|e| e.to_string())
+    }
+
+    /// The edge applies m6-core's rule, so a `site.toml` the services would
+    /// refuse is refused here too. The wrong outcome: the edge starts with two
+    /// patterns that can match one path and answers from whichever `matchit`
+    /// prefers, while a service with the same pair refuses to start.
     #[test]
-    fn test_parameter_routes_that_match_the_same_paths_fail_to_build() {
-        let config = make_config(
-            vec![
-                make_route("/blog/{slug}", "b"),
-                make_route("/blog/{name}", "b"),
-            ],
-            vec![make_backend("b")],
+    fn test_patterns_that_can_match_one_path_fail_to_build() {
+        let e = conflict(&["/blog/{slug}", "/blog/{name}"]).expect("must refuse");
+        assert!(
+            e.contains("\"/blog/{slug}\" ([[route]] number 1)")
+                && e.contains("\"/blog/{name}\" ([[route]] number 2)")
+                && e.contains("can both answer GET /blog/x"),
+            "{e}"
         );
-        let err = RouteTable::from_config(&config).err().expect("must refuse");
-        assert!(err.to_string().contains("/blog/{name}"), "{err}");
+        // Pairs `matchit` would accept and that still share a path.
+        assert!(conflict(&["/{lang}/about", "/blog/{slug}"]).is_some());
+        assert!(conflict(&["/blog/{slug}", "/blog/{*rest}"]).is_some());
+    }
+
+    /// A fixed path beside a pattern, and patterns that share no path, build.
+    /// The wrong outcome: the check refuses the layout every site has.
+    #[test]
+    fn test_fixed_beside_pattern_and_disjoint_patterns_build() {
+        assert_eq!(conflict(&["/blog/latest", "/blog/{slug}"]), None);
+        assert_eq!(conflict(&["/blog/{slug}", "/news/{slug}"]), None);
+        assert_eq!(conflict(&["/a/{x}", "/a/{x}/{y}"]), None);
     }
 
     #[test]

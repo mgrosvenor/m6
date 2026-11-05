@@ -24,18 +24,25 @@
 //!
 //! | part | what it does |
 //! |---|---|
-//! | `compile_pattern`, `route_specificity` | a route string becomes `Vec<Segment>` once, at load |
-//! | `find_route`, `match_route` | most specific match wins, not first declared |
+//! | `compile_pattern`, `check_route_conflicts` | a route string becomes `Vec<Segment>` once, at load, and two routes that could meet are refused |
+//! | `RouteTable`, `find_route`, `match_route` | a fixed route is one hash lookup, else the one pattern route that matches |
 //! | `FrameworkState::build` | everything that can be computed per RELOAD rather than per request |
 //! | `FrameworkState::build_dict` | the per-request dictionary, described below |
 //! | `ThreadPool` | fixed workers over a bounded queue |
 //! | `install_shutdown`, `is_shutdown` | draining rather than dropping in-flight work |
 //!
-//! ## Specificity, not declaration order
+//! ## Fixed routes and patterns, and no tie-break
 //!
-//! `/blog/{stem}` and `/blog/feed` both match `/blog/feed`. The more specific
-//! one wins, decided by `route_specificity` at load time, so the answer does not
-//! depend on the order of `[[route]]` blocks in a file somebody edits later.
+//! A route is fixed when every segment is a literal and a pattern when it has a
+//! `{param}` or `{*rest}`. A fixed route beats a pattern: `/blog/feed` answers
+//! `/blog/feed` even when `/blog/{stem}` is declared. Two fixed routes on one
+//! path, or two patterns that can both match some path, are refused when the
+//! config loads. That leaves at most one candidate for any request, so the
+//! answer cannot depend on the order of `[[route]]` blocks in a file somebody
+//! edits later, and a request needs no tie-break.
+//!
+//! Routes only compete when a request method can reach both, so a code
+//! `POST /contact` and a config `GET /contact` template share a path.
 //! Code-registered routes are compiled ahead of config routes and inherit the
 //! config's `cache` value for the same path, so a handler on a path the config
 //! also names does not silently lose its caching policy.
@@ -225,6 +232,7 @@ fn drain_thread_state() {
 // Route matching
 // ---------------------------------------------------------------------------
 
+/// The one method, or all of them, that a route registered in code answers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouteMethod {
     Any,
@@ -235,21 +243,88 @@ pub enum RouteMethod {
     Delete,
 }
 
-impl RouteMethod {
-    /// Can one request method satisfy both? Only `Any` crosses methods, and
-    /// `Get` answers `HEAD` too, which no other method does.
-    fn overlaps(&self, other: &RouteMethod) -> bool {
-        self == other || *self == RouteMethod::Any || *other == RouteMethod::Any
+/// The set of request methods a route answers, as bits so that one test
+/// decides a request and one `&` decides whether two routes can meet.
+///
+/// `GET` also answers `HEAD`. Any other method a client sends (`OPTIONS`, a
+/// made-up one) is answered only by a route that answers every method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Methods(u8);
+
+impl Methods {
+    const NAMED: [(&'static str, u8); 5] = [
+        ("GET", 1),
+        ("POST", 2),
+        ("PUT", 4),
+        ("PATCH", 8),
+        ("DELETE", 16),
+    ];
+    const OTHER: u8 = 0x80;
+    /// Every method, including the ones m6 has no name for.
+    pub const ANY: Methods = Methods(0xFF);
+
+    fn bit_of_request(method: &str) -> u8 {
+        match method {
+            "GET" | "HEAD" => 1,
+            "POST" => 2,
+            "PUT" => 4,
+            "PATCH" => 8,
+            "DELETE" => 16,
+            _ => Self::OTHER,
+        }
     }
 
-    fn matches(&self, method: &str) -> bool {
-        match self {
-            RouteMethod::Any => true,
-            RouteMethod::Get => method == "GET" || method == "HEAD",
-            RouteMethod::Post => method == "POST",
-            RouteMethod::Put => method == "PUT",
-            RouteMethod::Patch => method == "PATCH",
-            RouteMethod::Delete => method == "DELETE",
+    /// The set a config `methods = [...]` list names, or the first name m6 does
+    /// not support. No list means every method, which is the caller's case.
+    pub fn from_names(names: &[String]) -> std::result::Result<Methods, &str> {
+        let mut bits = 0;
+        for name in names {
+            let (_, bit) = Self::NAMED
+                .iter()
+                .find(|(n, _)| n == name)
+                .ok_or(name.as_str())?;
+            bits |= bit;
+        }
+        Ok(Methods(bits))
+    }
+
+    /// Does a request with this method belong to the set?
+    pub fn contains(self, method: &str) -> bool {
+        self.0 & Self::bit_of_request(method) != 0
+    }
+
+    /// The name of a method in both sets, for an example request, or `None` if
+    /// the sets do not meet.
+    fn shared_name(self, other: Methods) -> Option<&'static str> {
+        let both = self.0 & other.0;
+        Self::NAMED
+            .iter()
+            .find(|(_, bit)| both & bit != 0)
+            .map(|(name, _)| *name)
+            .or((both != 0).then_some("OPTIONS"))
+    }
+
+    /// Key that tells apart the handlers registered in code on one path.
+    fn handler_key(self) -> &'static str {
+        if self == Self::ANY {
+            return "ANY";
+        }
+        Self::NAMED
+            .iter()
+            .find(|(_, bit)| self.0 == *bit)
+            .map_or("SEVERAL", |(name, _)| name)
+    }
+}
+
+impl From<&RouteMethod> for Methods {
+    fn from(m: &RouteMethod) -> Methods {
+        match m {
+            RouteMethod::Any => Methods::ANY,
+            RouteMethod::Get => Methods(1),
+            RouteMethod::Post => Methods(2),
+            RouteMethod::Put => Methods(4),
+            RouteMethod::Patch => Methods(8),
+            RouteMethod::Delete => Methods(16),
         }
     }
 }
@@ -258,15 +333,13 @@ impl RouteMethod {
 #[derive(Debug, Clone)]
 pub struct CompiledRoute {
     pub pattern: String,
-    pub method: RouteMethod,
+    pub methods: Methods,
     pub segments: Vec<Segment>,
     pub template: Option<String>,
     pub params_files: Vec<String>,
     pub status: u16,
     pub cache: String,
     pub headers: Vec<(String, String)>,
-    /// Specificity score: exact > parameterised, longer > shorter.
-    pub specificity: i32,
     /// When this route's rendered output last changed, for `Last-Modified`.
     ///
     /// A rendered page has no file of its own to stat, which is why it carried
@@ -372,22 +445,10 @@ pub fn compile_pattern(pattern: &str) -> Vec<Segment> {
         .collect()
 }
 
-/// How specific a route is. Higher wins when several match.
-///
-/// A wildcard scores *below* a parameter in the same position, so
-/// `/assets/{name}` beats `/assets/{*rest}` for a one-segment tail and
-/// `/assets/style.css` beats both. Without that, adding a catch-all to a config
-/// would quietly capture traffic from the exact routes beside it.
-pub fn route_specificity(segments: &[Segment]) -> i32 {
-    let mut score = (segments.len() as i32) * 2;
-    for seg in segments {
-        match seg {
-            Segment::Literal(_) => score += 1,
-            Segment::Param(_) => {}
-            Segment::Wildcard(_) => score -= 1,
-        }
-    }
-    score
+/// A route is fixed when every segment is a literal. Anything with a `{param}`
+/// or a `{*rest}` is a pattern.
+fn is_fixed(segments: &[Segment]) -> bool {
+    segments.iter().all(|s| matches!(s, Segment::Literal(_)))
 }
 
 /// One path that both patterns match, or `None` if no path does.
@@ -420,60 +481,66 @@ fn shared_path(a: &[Segment], b: &[Segment]) -> Option<String> {
     Some(if path.is_empty() { "/".into() } else { path })
 }
 
-/// Refuse a route table in which two routes would answer the same request with
-/// the same specificity. `find_route` would keep the first declared and the
-/// second could never answer, which is a config mistake an operator should
-/// hear about when the config loads, not discover as a page that never changes.
-///
-/// Runs once per load over the whole table, never per request.
-///
-/// A config `[[route]]` with the same pattern as a code route and neither a
-/// template nor a handler is how a config gives that code route its `cache`
-/// setting (see `FrameworkState::build`), so that pair is not a conflict.
-pub fn check_route_overlaps(
-    code_routes: &[(String, RouteMethod)],
-    config_routes: &[crate::config::RouteConfig],
-) -> anyhow::Result<()> {
-    struct Entry<'a> {
-        origin: String,
-        from_code: bool,
-        pattern: &'a str,
-        method: RouteMethod,
-        segments: Vec<Segment>,
-        declares_code_route: bool,
-    }
-    let code = code_routes.iter().map(|(p, m)| Entry {
-        origin: "code route".to_string(),
-        from_code: true,
-        pattern: p,
-        method: m.clone(),
-        segments: compile_pattern(p),
-        declares_code_route: false,
-    });
-    let config = config_routes.iter().enumerate().map(|(i, rc)| Entry {
-        origin: format!("[[route]] number {}", i + 1),
-        from_code: false,
-        pattern: &rc.path,
-        method: config_route_method(rc),
-        segments: compile_pattern(&rc.path),
-        declares_code_route: rc.template.is_none()
-            && rc.handler.is_none()
-            && code_routes.iter().any(|(p, _)| *p == rc.path),
-    });
-    let entries: Vec<Entry> = code.chain(config).collect();
+/// A route as written, for the load-time conflict check. A service declares
+/// its routes with `[[route]]` and in code, and the edge declares its own, so
+/// each builds these and shares one rule.
+pub struct RouteDecl<'a> {
+    origin: String,
+    pattern: &'a str,
+    methods: Methods,
+    segments: Vec<Segment>,
+    from_code: bool,
+    /// A config `[[route]]` on a code route's own pattern that has neither a
+    /// template nor a handler. It only gives that code route its `cache`.
+    declares_code_route: bool,
+}
 
-    for (i, a) in entries.iter().enumerate() {
-        for b in &entries[i + 1..] {
-            if route_specificity(&a.segments) != route_specificity(&b.segments)
-                || !a.method.overlaps(&b.method)
+impl<'a> RouteDecl<'a> {
+    /// `origin` says where the route was written, for the error, for example
+    /// `[[route]] number 2`.
+    pub fn new(origin: impl Into<String>, pattern: &'a str, methods: Methods) -> Self {
+        RouteDecl {
+            origin: origin.into(),
+            pattern,
+            methods,
+            segments: compile_pattern(pattern),
+            from_code: false,
+            declares_code_route: false,
+        }
+    }
+}
+
+/// Refuse a route table in which two routes could answer one request and m6
+/// could not say which. The rule, with "can answer the same request" meaning
+/// a path both match and a method both accept:
+///
+/// 1. a fixed route beats a pattern route;
+/// 2. two fixed routes with the same path are an error;
+/// 3. two pattern routes that can both match some path are an error.
+///
+/// So at most one pattern route can match a request, and a request needs no
+/// tie-break. Runs once per load over the whole table, never per request.
+pub fn check_route_conflicts(routes: &[RouteDecl]) -> anyhow::Result<()> {
+    for (i, a) in routes.iter().enumerate() {
+        for b in &routes[i + 1..] {
+            let Some(method) = a.methods.shared_name(b.methods) else {
+                continue;
+            };
+            let a_fixed = is_fixed(&a.segments);
+            let b_fixed = is_fixed(&b.segments);
+            if a_fixed != b_fixed
                 || (a.from_code && b.declares_code_route && a.pattern == b.pattern)
             {
                 continue;
             }
-            if let Some(example) = shared_path(&a.segments, &b.segments) {
+            if let Some(path) = shared_path(&a.segments, &b.segments) {
+                let how_to_fix = if a_fixed {
+                    "remove one or give one explicit methods"
+                } else {
+                    "remove one, give one explicit methods, or make one a fixed path"
+                };
                 anyhow::bail!(
-                    "routes \"{}\" ({}) and \"{}\" ({}) match the same paths with equal \
-                     specificity (e.g. \"{example}\"); remove one or make one more specific",
+                    "routes \"{}\" ({}) and \"{}\" ({}) can both answer {method} {path}; {how_to_fix}",
                     a.pattern,
                     a.origin,
                     b.pattern,
@@ -485,33 +552,62 @@ pub fn check_route_overlaps(
     Ok(())
 }
 
-/// The method a config `[[route]]` answers. A list of several methods answers
-/// every method: `RouteMethod` names one or all.
-fn config_route_method(rc: &crate::config::RouteConfig) -> RouteMethod {
-    match rc.methods.as_deref() {
-        Some([only]) => match only.as_str() {
-            "GET" => RouteMethod::Get,
-            "POST" => RouteMethod::Post,
-            "PUT" => RouteMethod::Put,
-            "PATCH" => RouteMethod::Patch,
-            "DELETE" => RouteMethod::Delete,
-            _ => RouteMethod::Any,
-        },
-        _ => RouteMethod::Any,
-    }
+/// The routes a service declares, in the order they are tried: code routes
+/// first, then config routes. Fails on a `methods` list m6 cannot read.
+fn declared_routes<'a>(
+    code_routes: &'a [(String, RouteMethod)],
+    config_routes: &'a [crate::config::RouteConfig],
+) -> anyhow::Result<Vec<RouteDecl<'a>>> {
+    let code = code_routes.iter().map(|(pattern, method)| {
+        let mut decl = RouteDecl::new("code route", pattern, method.into());
+        decl.from_code = true;
+        Ok(decl)
+    });
+    let config = config_routes.iter().enumerate().map(|(i, rc)| {
+        let origin = format!("[[route]] number {}", i + 1);
+        let mut decl = RouteDecl::new(origin, &rc.path, config_route_methods(rc, i)?);
+        decl.declares_code_route = rc.template.is_none()
+            && rc.handler.is_none()
+            && code_routes.iter().any(|(p, _)| *p == rc.path);
+        Ok(decl)
+    });
+    code.chain(config).collect()
 }
 
-/// Stable string key for a `RouteMethod` — used to disambiguate handlers
-/// registered on the same path with different HTTP methods.
+/// Refuse a service's routes if one is unreadable or two can meet. The check
+/// start, reload and `--dump-config` share.
+pub fn check_routes(
+    code_routes: &[(String, RouteMethod)],
+    config_routes: &[crate::config::RouteConfig],
+) -> anyhow::Result<()> {
+    check_route_conflicts(&declared_routes(code_routes, config_routes)?)
+}
+
+/// The methods a config `[[route]]` answers: exactly the ones it lists, or all
+/// of them when it lists none.
+fn config_route_methods(rc: &crate::config::RouteConfig, index: usize) -> anyhow::Result<Methods> {
+    let Some(names) = &rc.methods else {
+        return Ok(Methods::ANY);
+    };
+    anyhow::ensure!(
+        !names.is_empty(),
+        "route \"{}\" ([[route]] number {}) has an empty methods list; leave `methods` out to answer every method",
+        rc.path,
+        index + 1
+    );
+    Methods::from_names(names).map_err(|unknown| {
+        anyhow::anyhow!(
+            "route \"{}\" ([[route]] number {}) lists the unknown method \"{unknown}\"; \
+             the supported methods are GET (which also answers HEAD), POST, PUT, PATCH and DELETE",
+            rc.path,
+            index + 1
+        )
+    })
+}
+
+/// Key that tells apart the handlers registered in code on one path.
 fn route_method_key(m: &RouteMethod) -> &'static str {
-    match m {
-        RouteMethod::Any => "ANY",
-        RouteMethod::Get => "GET",
-        RouteMethod::Post => "POST",
-        RouteMethod::Put => "PUT",
-        RouteMethod::Patch => "PATCH",
-        RouteMethod::Delete => "DELETE",
-    }
+    Methods::from(m).handler_key()
 }
 
 /// Route params: at most a few captures; Vec beats HashMap for small N.
@@ -555,31 +651,99 @@ pub fn match_route(path_segs: &[&str], route: &CompiledRoute) -> Option<PathPara
     Some(params)
 }
 
-/// Find the best matching route for a request.
-/// Path is split once here and shared across all route checks.
+/// The compiled routes, indexed so that a request needs no tie-break.
+///
+/// A fixed route is found by one hash lookup on its path. A request that no
+/// fixed route answers is tried against the pattern routes, of which at most
+/// one can match: `check_route_conflicts` refuses a table where two could.
+#[derive(Debug)]
+pub struct RouteTable {
+    routes: Vec<CompiledRoute>,
+    /// Fixed routes by path without its slashes (`blog/archive`, and `` for
+    /// the root), each with the routes on it in declaration order, because
+    /// routes with disjoint methods share a path.
+    fixed: HashMap<String, Vec<usize>>,
+    patterns: Vec<usize>,
+}
+
+impl RouteTable {
+    pub fn new(routes: Vec<CompiledRoute>) -> Self {
+        let mut fixed: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut patterns = Vec::new();
+        for (i, route) in routes.iter().enumerate() {
+            if is_fixed(&route.segments) {
+                let key = route
+                    .segments
+                    .iter()
+                    .filter_map(|s| match s {
+                        Segment::Literal(l) => Some(l.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("/");
+                fixed.entry(key).or_default().push(i);
+            } else {
+                patterns.push(i);
+            }
+        }
+        RouteTable {
+            routes,
+            fixed,
+            patterns,
+        }
+    }
+
+    pub fn routes(&self) -> &[CompiledRoute] {
+        &self.routes
+    }
+
+    pub fn len(&self) -> usize {
+        self.routes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.routes.is_empty()
+    }
+}
+
+/// Find the route that answers a request: the fixed route on its path if one
+/// accepts the method, otherwise the one pattern route that matches.
 pub fn find_route<'a>(
     path: &str,
     method: &str,
-    routes: &'a [CompiledRoute],
+    table: &'a RouteTable,
 ) -> Option<(&'a CompiledRoute, PathParams)> {
-    // Split path once — reused for every route check.
-    let path_segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    let mut best: Option<(&CompiledRoute, PathParams)> = None;
-
-    for route in routes {
-        if !route.method.matches(method) {
-            continue;
-        }
-        if let Some(params) = match_route(&path_segs, route) {
-            match &best {
-                Some((best_route, _)) if route.specificity <= best_route.specificity => {}
-                _ => {
-                    best = Some((route, params));
-                }
-            }
+    // A path with no doubled slash is already its own key once the outer
+    // slashes go, so the common request allocates nothing for the lookup.
+    let trimmed = path.trim_matches('/');
+    let collapsed;
+    let key = if trimmed.contains("//") {
+        collapsed = trimmed
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("/");
+        collapsed.as_str()
+    } else {
+        trimmed
+    };
+    if let Some(on_path) = table.fixed.get(key) {
+        if let Some(&i) = on_path
+            .iter()
+            .find(|&&i| table.routes[i].methods.contains(method))
+        {
+            return Some((&table.routes[i], PathParams::new()));
         }
     }
-    best
+
+    let path_segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    table.patterns.iter().find_map(|&i| {
+        let route = &table.routes[i];
+        if !route.methods.contains(method) {
+            return None;
+        }
+        match_route(&path_segs, route).map(|params| (route, params))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -647,7 +811,7 @@ struct FrameworkState {
     /// without copying the route it matched. `find_route` returns a borrow, and
     /// owning the table here would mean turning that borrow into an owned
     /// `CompiledRoute` purely to outlive the guard.
-    routes: Arc<Vec<CompiledRoute>>,
+    routes: Arc<RouteTable>,
     /// Test-only. Steps 1 to 3 of the dictionary build are merged once per
     /// reload into `route.base_dict`, so no serving path reads either of these.
     /// `dict_cost` measures per-request assembly against that base, which is
@@ -671,7 +835,7 @@ impl FrameworkState {
         code_routes: &[(String, RouteMethod)],
         renderer_factory: &dyn RendererFactory,
     ) -> anyhow::Result<Self> {
-        check_route_overlaps(code_routes, &config.routes)?;
+        check_routes(code_routes, &config.routes)?;
 
         // Compile routes from config.
         let mut routes = Vec::new();
@@ -681,7 +845,6 @@ impl FrameworkState {
         // The config's [[route]] cache setting for the same path is inherited below.
         for (pattern, method) in code_routes {
             let segs = compile_pattern(pattern);
-            let spec = route_specificity(&segs);
             // Look for a matching config route to inherit its cache setting.
             let cache = config
                 .routes
@@ -691,14 +854,13 @@ impl FrameworkState {
                 .unwrap_or_else(|| "no-store".to_string());
             routes.push(CompiledRoute {
                 pattern: pattern.clone(),
-                method: method.clone(),
+                methods: Methods::from(method),
                 segments: segs,
                 template: None,
                 params_files: vec![],
                 status: 200,
                 cache,
                 headers: vec![],
-                specificity: spec,
                 // A code route renders whatever its handler decides at request
                 // time, so there is no input file whose mtime describes it.
                 last_modified: None,
@@ -712,20 +874,17 @@ impl FrameworkState {
         }
 
         // Add config routes.
-        for rc in &config.routes {
+        for (i, rc) in config.routes.iter().enumerate() {
             let segs = compile_pattern(&rc.path);
-            let spec = route_specificity(&segs);
-            let method = config_route_method(rc);
             routes.push(CompiledRoute {
                 pattern: rc.path.clone(),
-                method,
+                methods: config_route_methods(rc, i)?,
                 segments: segs,
                 template: rc.template.clone(),
                 params_files: rc.params.clone(),
                 status: rc.status,
                 cache: rc.cache.clone(),
                 headers: rc.headers.clone(),
-                specificity: spec,
                 last_modified: None, // filled in below, once templates_mtime is known
                 handler: rc.handler.clone(),
                 settings: Arc::clone(&rc.settings),
@@ -921,7 +1080,7 @@ impl FrameworkState {
         Ok(Self {
             config: Arc::new(config),
             site_dir: Arc::new(site_dir),
-            routes: Arc::new(routes),
+            routes: Arc::new(RouteTable::new(routes)),
             #[cfg(test)]
             global_params_data,
             #[cfg(test)]
@@ -2621,7 +2780,7 @@ fn dump_config(
         }
     };
 
-    if let Err(e) = check_route_overlaps(code_routes, &config.routes) {
+    if let Err(e) = check_routes(code_routes, &config.routes) {
         eprintln!("Config error: {e}");
         return 2;
     }
@@ -2882,7 +3041,11 @@ fn run_app_with_shutdown(
         .iter()
         .map(|(p, _)| p.clone())
         .collect();
-    let missing = unknown_handlers(&framework_state.routes, &named_handlers, &code_patterns);
+    let missing = unknown_handlers(
+        framework_state.routes.routes(),
+        &named_handlers,
+        &code_patterns,
+    );
     if !missing.is_empty() {
         eprintln!(
             "Config error: route names an unregistered handler: {}",
@@ -3025,7 +3188,7 @@ fn run_app_with_shutdown(
             &*renderer,
         )
         .map_err(|e| format!("Reload failed (template/state error): {e}"))?;
-        let missing = unknown_handlers(&new_state.routes, &named_handlers, &code_patterns);
+        let missing = unknown_handlers(new_state.routes.routes(), &named_handlers, &code_patterns);
         if !missing.is_empty() {
             return Err(format!(
                 "Reload refused, route names an unregistered handler: {}",
@@ -3272,7 +3435,7 @@ fn handle_request<W: std::io::Write>(
             // use the template even if a code handler exists for the same pattern
             // — this ensures GET routes handled by config are not shadowed by POST
             // code handlers registered on the same path.
-            let handler_key = format!("{}:{}", route.pattern, route_method_key(&route.method));
+            let handler_key = format!("{}:{}", route.pattern, route.methods.handler_key());
             let mut resp = if let Some(name) = &route.handler {
                 // A config-declared route naming a registered handler. The
                 // lookup cannot miss: `unknown_handlers` refuses a state whose
@@ -3673,14 +3836,13 @@ mod tests {
     fn test_route_matching() {
         let route = CompiledRoute {
             pattern: "/blog/{stem}".to_string(),
-            method: RouteMethod::Any,
+            methods: Methods::ANY,
             segments: compile_pattern("/blog/{stem}"),
             template: None,
             params_files: vec![],
             status: 200,
             cache: "public".to_string(),
             headers: vec![],
-            specificity: 3,
             last_modified: None,
             handler: None,
             settings: Arc::new(Map::new()),
@@ -3704,14 +3866,13 @@ mod tests {
     fn test_no_match_on_different_length() {
         let route = CompiledRoute {
             pattern: "/blog/{stem}".to_string(),
-            method: RouteMethod::Any,
+            methods: Methods::ANY,
             segments: compile_pattern("/blog/{stem}"),
             template: None,
             params_files: vec![],
             status: 200,
             cache: "public".to_string(),
             headers: vec![],
-            specificity: 3,
             last_modified: None,
             handler: None,
             settings: Arc::new(Map::new()),
@@ -3728,14 +3889,13 @@ mod tests {
         let routes = vec![
             CompiledRoute {
                 pattern: "/blog/{stem}".to_string(),
-                method: RouteMethod::Any,
+                methods: Methods::ANY,
                 segments: compile_pattern("/blog/{stem}"),
                 template: None,
                 params_files: vec![],
                 status: 200,
                 cache: "public".to_string(),
                 headers: vec![],
-                specificity: route_specificity(&compile_pattern("/blog/{stem}")),
                 last_modified: None,
                 handler: None,
                 settings: Arc::new(Map::new()),
@@ -3743,14 +3903,13 @@ mod tests {
             },
             CompiledRoute {
                 pattern: "/blog/about".to_string(),
-                method: RouteMethod::Any,
+                methods: Methods::ANY,
                 segments: compile_pattern("/blog/about"),
                 template: None,
                 params_files: vec![],
                 status: 200,
                 cache: "public".to_string(),
                 headers: vec![],
-                specificity: route_specificity(&compile_pattern("/blog/about")),
                 last_modified: None,
                 handler: None,
                 settings: Arc::new(Map::new()),
@@ -3758,14 +3917,15 @@ mod tests {
             },
         ];
 
-        let (matched, _) = find_route("/blog/about", "GET", &routes).unwrap();
+        let table = RouteTable::new(routes);
+        let (matched, _) = find_route("/blog/about", "GET", &table).unwrap();
         assert_eq!(matched.pattern, "/blog/about");
     }
 
     #[test]
     fn test_unmatched_returns_none() {
         let routes: Vec<CompiledRoute> = vec![];
-        assert!(find_route("/anything", "GET", &routes).is_none());
+        assert!(find_route("/anything", "GET", &RouteTable::new(routes)).is_none());
     }
 
     #[test]
@@ -4224,8 +4384,7 @@ mod wildcard_route_tests {
         let segments = compile_pattern(pattern);
         CompiledRoute {
             pattern: pattern.to_string(),
-            method: RouteMethod::Any,
-            specificity: route_specificity(&segments),
+            methods: Methods::ANY,
             segments,
             template: None,
             params_files: Vec::new(),
@@ -4287,18 +4446,6 @@ mod wildcard_route_tests {
             m("/assets/{relpath}", "/assets/main.css"),
             Some(vec![("relpath".to_string(), "main.css".to_string())])
         );
-    }
-
-    /// A literal beats a parameter beats a wildcard for the same path, so
-    /// adding a catch-all to a config does not quietly capture the traffic of
-    /// the exact routes sitting beside it.
-    #[test]
-    fn specificity_orders_literal_above_param_above_wildcard() {
-        let lit = route("/assets/style.css").specificity;
-        let par = route("/assets/{name}").specificity;
-        let wild = route("/assets/{*rest}").specificity;
-        assert!(lit > par, "literal {lit} should beat param {par}");
-        assert!(par > wild, "param {par} should beat wildcard {wild}");
     }
 
     /// The matcher is not the wire. Every test above stops at `match_route`,
@@ -4378,7 +4525,7 @@ mod wildcard_route_tests {
 
         // `..` never survives the matcher, so drive the check directly: these
         // are the values that would reach step 4 if it ever did.
-        let route = &state.routes[0];
+        let route = &state.routes.routes()[0];
         assert!(route.is_wildcard_param("relpath"));
         assert!(!route.is_wildcard_param("stem"));
 
@@ -4499,7 +4646,7 @@ tail = false
     #[test]
     fn a_config_route_can_name_a_handler() {
         let (state, _d) = state_from(FILES);
-        let route = &state.routes[0];
+        let route = &state.routes.routes()[0];
         assert_eq!(route.handler.as_deref(), Some("files"));
         assert_eq!(route.pattern, "/assets/{*relpath}");
     }
@@ -4679,7 +4826,7 @@ tail = false
     fn a_route_naming_an_unregistered_handler_is_refused() {
         let (state, _d) = state_from(FILES);
 
-        let missing = unknown_handlers(&state.routes, &registry(&["uploads"]), &[]);
+        let missing = unknown_handlers(state.routes.routes(), &registry(&["uploads"]), &[]);
         assert_eq!(
             missing,
             vec![("/assets/{*relpath}".to_string(), "files".to_string())]
@@ -4693,7 +4840,7 @@ tail = false
         assert!(described.contains("uploads"), "{described}");
 
         // Registered, and there is nothing to refuse.
-        assert!(unknown_handlers(&state.routes, &registry(&["files"]), &[]).is_empty());
+        assert!(unknown_handlers(state.routes.routes(), &registry(&["files"]), &[]).is_empty());
     }
 
     /// A template route is unaffected by any of this: it names no handler and
@@ -4701,8 +4848,8 @@ tail = false
     #[test]
     fn a_template_route_names_no_handler() {
         let (state, _d) = state_from("[[route]]\npath = \"/\"\ntemplate = \"index.html\"\n");
-        assert!(state.routes[0].handler.is_none());
-        assert!(unknown_handlers(&state.routes, &HashMap::new(), &[]).is_empty());
+        assert!(state.routes.routes()[0].handler.is_none());
+        assert!(unknown_handlers(state.routes.routes(), &HashMap::new(), &[]).is_empty());
     }
 
     /// Core does not know what `root` or `tail` mean, and does not need to.
@@ -4711,7 +4858,7 @@ tail = false
     #[test]
     fn keys_core_does_not_define_are_kept_for_the_handler() {
         let (state, _d) = state_from(FILES);
-        let s = &state.routes[0].settings;
+        let s = &state.routes.routes()[0].settings;
         assert_eq!(s.get("root").unwrap().as_str().unwrap(), "assets/");
         assert!(!s.get("tail").unwrap().as_bool().unwrap());
         for consumed in [
@@ -4730,15 +4877,15 @@ tail = false
     #[test]
     fn a_handler_route_defaults_to_no_store_and_an_explicit_cache_wins() {
         let (state, _d) = state_from(FILES);
-        assert_eq!(state.routes[0].cache, "no-store");
+        assert_eq!(state.routes.routes()[0].cache, "no-store");
 
         let (explicit, _d2) = state_from(
             "[[route]]\npath = \"/a/{*r}\"\nhandler = \"files\"\ncache = \"public, max-age=60\"\n",
         );
-        assert_eq!(explicit.routes[0].cache, "public, max-age=60");
+        assert_eq!(explicit.routes.routes()[0].cache, "public, max-age=60");
 
         let (template, _d3) = state_from("[[route]]\npath = \"/\"\ntemplate = \"index.html\"\n");
-        assert_eq!(template.routes[0].cache, "public");
+        assert_eq!(template.routes.routes()[0].cache, "public");
     }
 
     /// `Last-Modified` is derived from templates and params files, so it
@@ -4749,7 +4896,7 @@ tail = false
     #[test]
     fn a_handler_route_carries_no_last_modified() {
         let (state, _d) = state_from(FILES);
-        assert!(state.routes[0].last_modified.is_none());
+        assert!(state.routes.routes()[0].last_modified.is_none());
     }
 
     /// The handler's side of the contract: it reads its own route's config
@@ -4766,8 +4913,8 @@ tail = false
             headers: vec![],
             body: vec![],
         };
-        let req =
-            Request::new(raw, Map::new(), dir.path().to_path_buf()).with_route(&state.routes[0]);
+        let req = Request::new(raw, Map::new(), dir.path().to_path_buf())
+            .with_route(&state.routes.routes()[0]);
 
         assert_eq!(req.route_pattern(), Some("/assets/{*relpath}"));
         assert_eq!(req.route_str("root"), Some("assets/"));
@@ -5267,7 +5414,7 @@ mod copy_audit {
 }
 
 #[cfg(test)]
-mod route_overlap_tests {
+mod route_rule_tests {
     use super::*;
     use crate::config::RouteConfig;
 
@@ -5285,157 +5432,272 @@ mod route_overlap_tests {
         }
     }
 
-    /// The error `check_route_overlaps` gives for these config routes, or
-    /// `None` if it accepts them.
+    /// The error the load gives for these config routes, or `None` if it
+    /// accepts them.
     fn refusal(paths: &[&str]) -> Option<String> {
         let routes: Vec<_> = paths.iter().map(|p| config_route(p, None)).collect();
-        check_route_overlaps(&[], &routes)
-            .err()
-            .map(|e| e.to_string())
+        check_routes(&[], &routes).err().map(|e| e.to_string())
     }
 
     fn accepted(paths: &[&str]) {
         assert_eq!(refusal(paths), None, "{paths:?} must not conflict");
     }
 
+    fn compiled(pattern: &str, methods: Methods) -> CompiledRoute {
+        CompiledRoute {
+            pattern: pattern.to_string(),
+            methods,
+            segments: compile_pattern(pattern),
+            template: None,
+            params_files: Vec::new(),
+            status: 200,
+            cache: String::new(),
+            headers: Vec::new(),
+            last_modified: None,
+            handler: None,
+            settings: Arc::new(Map::new()),
+            base_dict: Arc::new(Map::new()),
+        }
+    }
+
+    fn answer<'a>(table: &'a RouteTable, method: &str, path: &str) -> Option<&'a str> {
+        find_route(path, method, table).map(|(r, _)| r.pattern.as_str())
+    }
+
+    // ── Which route answers ────────────────────────────────────────────────
+
+    /// The pattern is declared first, so an answer decided by declaration
+    /// order would be the pattern. The wrong outcome: `/blog/about` renders
+    /// the parameter page, and the fixed page is unreachable.
+    #[test]
+    fn a_fixed_route_answers_ahead_of_a_pattern_declared_before_it() {
+        let table = RouteTable::new(vec![
+            compiled("/blog/{slug}", Methods::ANY),
+            compiled("/blog/about", Methods::ANY),
+        ]);
+        assert_eq!(answer(&table, "GET", "/blog/about"), Some("/blog/about"));
+        assert_eq!(answer(&table, "GET", "/blog/other"), Some("/blog/{slug}"));
+        assert_eq!(answer(&table, "GET", "/blog/about/"), Some("/blog/about"));
+        assert_eq!(answer(&table, "GET", "//blog//about"), Some("/blog/about"));
+    }
+
+    /// A fixed route competes only for the methods it answers. The wrong
+    /// outcome: a `POST`-only fixed route hides the pattern from `GET`.
+    #[test]
+    fn a_fixed_route_for_other_methods_leaves_the_pattern_to_answer() {
+        let table = RouteTable::new(vec![
+            compiled("/blog/about", Methods::from(&RouteMethod::Post)),
+            compiled("/blog/{slug}", Methods::ANY),
+        ]);
+        assert_eq!(answer(&table, "POST", "/blog/about"), Some("/blog/about"));
+        assert_eq!(answer(&table, "GET", "/blog/about"), Some("/blog/{slug}"));
+    }
+
+    /// The root is a fixed route with no segments.
+    #[test]
+    fn the_root_is_a_fixed_route() {
+        let table = RouteTable::new(vec![
+            compiled("/{*rest}", Methods::ANY),
+            compiled("/", Methods::ANY),
+        ]);
+        assert_eq!(answer(&table, "GET", "/"), Some("/"));
+        assert_eq!(answer(&table, "GET", "/x/y"), Some("/{*rest}"));
+    }
+
+    /// `methods = ["GET", "POST"]` answers those two and no other. The wrong
+    /// outcome (#336): it answered every method, so `DELETE` ran the handler.
+    #[test]
+    fn a_route_answers_exactly_the_methods_it_lists() {
+        let methods = Methods::from_names(&["GET".to_string(), "POST".to_string()]).unwrap();
+        let table = RouteTable::new(vec![compiled("/comments", methods)]);
+        for answered in ["GET", "HEAD", "POST"] {
+            assert_eq!(answer(&table, answered, "/comments"), Some("/comments"));
+        }
+        for refused in ["PUT", "PATCH", "DELETE", "OPTIONS"] {
+            assert_eq!(answer(&table, refused, "/comments"), None, "{refused}");
+        }
+    }
+
+    /// A route with no `methods` answers everything, including a method m6 has
+    /// no name for.
+    #[test]
+    fn a_route_without_methods_answers_every_method() {
+        let table = RouteTable::new(vec![compiled("/any", Methods::ANY)]);
+        for m in [
+            "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "PURGE",
+        ] {
+            assert_eq!(answer(&table, m, "/any"), Some("/any"), "{m}");
+        }
+    }
+
+    // ── What the load refuses ──────────────────────────────────────────────
+
     /// The bug: two routes for one path, the later one unreachable, and nothing
     /// said. The refusal names both routes as written, where each came from and
-    /// a path both match.
+    /// one request both would answer.
     #[test]
-    fn two_parameter_routes_for_one_path_are_refused_with_both_named() {
+    fn two_patterns_for_one_path_are_refused_with_both_named() {
         assert_eq!(
             refusal(&["/blog/{slug}", "/blog/{name}"]).unwrap(),
             "routes \"/blog/{slug}\" ([[route]] number 1) and \"/blog/{name}\" \
-             ([[route]] number 2) match the same paths with equal specificity \
-             (e.g. \"/blog/x\"); remove one or make one more specific"
+             ([[route]] number 2) can both answer GET /blog/x; remove one, give one \
+             explicit methods, or make one a fixed path"
         );
     }
 
-    /// The same pattern twice is the plainest tie.
+    /// Each pair the rule names as an error.
     #[test]
-    fn the_same_pattern_twice_is_refused() {
-        assert!(refusal(&["/about", "/about"])
-            .unwrap()
-            .contains("\"/about\""));
-        assert!(refusal(&["/", "/"]).unwrap().contains("(e.g. \"/\")"));
+    fn the_pattern_pairs_in_the_rule_are_refused_with_an_example() {
+        for (a, b, example) in [
+            ("/blog/{slug}", "/blog/{*rest}", "GET /blog/x"),
+            ("/{lang}/about", "/blog/{slug}", "GET /blog/about"),
+            ("/{*rest}", "/blog/{slug}", "GET /blog/x"),
+            ("/a/{x}", "/{y}/b", "GET /a/b"),
+        ] {
+            let e = refusal(&[a, b]).unwrap_or_else(|| panic!("{a} with {b} must conflict"));
+            assert!(e.contains(&format!("can both answer {example};")), "{e}");
+        }
     }
 
-    /// Different specificity is the rule working, not a conflict. A check that
-    /// refused every overlap would reject the exact-beats-parameter pair that
-    /// the matcher exists to resolve.
+    /// Two fixed routes on one path.
     #[test]
-    fn overlap_with_different_specificity_is_accepted() {
+    fn two_fixed_routes_on_one_path_are_refused() {
+        let e = refusal(&["/about", "/about"]).unwrap();
+        assert!(
+            e.contains("\"/about\"") && e.contains("answer GET /about"),
+            "{e}"
+        );
+        assert!(
+            e.ends_with("remove one or give one explicit methods"),
+            "{e}"
+        );
+        // Slashes do not make a different path.
+        assert!(refusal(&["/about", "/about/"]).is_some());
+        assert!(refusal(&["/", "/"]).unwrap().contains("GET /;"));
+    }
+
+    /// A fixed route and a pattern that covers it is the rule working, in
+    /// either order. A check that refused every overlap would reject the
+    /// exact-beats-parameter pair the matcher exists to resolve.
+    #[test]
+    fn a_fixed_route_beside_a_pattern_is_accepted() {
         accepted(&["/blog/{slug}", "/blog/latest"]);
-        accepted(&["/assets/{name}", "/assets/{*rest}"]);
-        accepted(&["/a/{x}", "/a/b"]);
+        accepted(&["/blog/latest", "/blog/{slug}"]);
+        accepted(&["/assets/{*rest}", "/assets/style.css"]);
+        accepted(&["/", "/{*rest}"]);
     }
 
-    /// Routes that no path can match both of. A check that compared only the
-    /// segment count would refuse these.
+    /// Patterns no path can match both of. A check that compared only the
+    /// first segment or only the length would refuse these.
     #[test]
-    fn routes_with_disjoint_literals_are_accepted() {
+    fn patterns_that_share_no_path_are_accepted() {
         accepted(&["/blog/{slug}", "/news/{slug}"]);
+        accepted(&["/a/{x}", "/a/{x}/{y}"]);
         accepted(&["/a/{x}/c", "/a/{x}/d"]);
-    }
-
-    /// Without a wildcard, a different number of segments cannot match the
-    /// same path.
-    #[test]
-    fn routes_of_different_lengths_are_accepted() {
-        // Both score 6, so only the segment count tells them apart.
-        accepted(&["/a/b", "/{x}/{y}/{z}"]);
-        accepted(&["/{x}/{y}/{z}", "/a/b"]);
-    }
-
-    /// `/a/{x}` and `/{y}/b` both match `/a/b` and score the same, so they tie
-    /// there even though neither pattern repeats the other.
-    #[test]
-    fn a_literal_and_a_parameter_in_swapped_positions_tie() {
-        let e = refusal(&["/a/{x}", "/{y}/b"]).unwrap();
-        assert!(e.contains("(e.g. \"/a/b\")"), "{e}");
-    }
-
-    /// Equal specificity needs equal scores. Here both match `/a/b/x` but the
-    /// literal count differs, so `find_route` already orders them.
-    #[test]
-    fn overlap_is_judged_only_between_equal_scores() {
-        accepted(&["/a/{x}/{y}", "/a/b/{q}"]);
-        let e = refusal(&["/a/{x}/{y}", "/{p}/b/{q}"]).unwrap();
-        assert!(e.contains("(e.g. \"/a/b/x\")"), "{e}");
-    }
-
-    /// A trailing wildcard matches any longer path, so two wildcard routes of
-    /// the same score under a shared prefix tie, and the example is long
-    /// enough for the longer pattern.
-    #[test]
-    fn two_wildcards_under_one_prefix_are_refused() {
-        let e = refusal(&["/assets/{*rest}", "/assets/{*other}"]).unwrap();
-        assert!(e.contains("(e.g. \"/assets/x\")"), "{e}");
-    }
-
-    /// A wildcard route and a longer parameter route tie when their scores
-    /// match, and the path they share is as long as the longer route.
-    #[test]
-    fn a_wildcard_ties_with_a_route_it_can_reach_past() {
-        // /a/{*r}: 2*2 + 1 - 1 = 4.  /a/{x}/{y}: 2*3 + 1 = 7.  No tie.
-        accepted(&["/a/{*r}", "/a/{x}/{y}"]);
-        // /{*r}: 2 - 1 = 1.  /{x}: 2.  No tie; one is reachable from the other.
-        accepted(&["/{*r}", "/{x}"]);
-        // /a/b/{*r}: 6 + 2 - 1 = 7.  /a/{x}/{y}: 7.  Tie on /a/b/x.
-        let e = refusal(&["/a/b/{*r}", "/a/{x}/{y}"]).unwrap();
-        assert!(e.contains("(e.g. \"/a/b/x\")"), "{e}");
-    }
-
-    /// Two wildcard or wildcard-and-fixed routes of equal score that no path
-    /// can match both of: different literals, or a fixed route shorter than
-    /// the wildcard's own fixed part.
-    #[test]
-    fn wildcard_routes_that_cannot_share_a_path_are_accepted() {
         accepted(&["/a/{*r}", "/b/{*s}"]);
-        // Both score 7. A path for the second has three segments, and the
-        // first needs at least four.
+        // The wildcard needs four segments and the other has three.
         accepted(&["/{a}/{b}/{c}/{*r}", "/x/{y}/{z}"]);
         accepted(&["/x/{y}/{z}", "/{a}/{b}/{c}/{*r}"]);
-        // Both score 7, and `b` is not `c`.
-        accepted(&["/a/b/{*r}", "/a/c/{*s}"]);
     }
 
-    /// Methods that cannot both answer one request do not conflict, which is
-    /// how a GET and a POST share a path. `Any` answers every method, so it
-    /// conflicts with all of them.
+    /// A wildcard reaches past a longer pattern, so the pair shares paths.
+    #[test]
+    fn a_wildcard_and_a_longer_pattern_under_it_are_refused() {
+        let e = refusal(&["/a/{*r}", "/a/{x}/{y}"]).unwrap();
+        assert!(e.contains("GET /a/x/x"), "{e}");
+    }
+
+    /// Routes that no one method can reach together do not compete, which is
+    /// how a `POST` handler and a `GET` page share a path.
     #[test]
     fn routes_conflict_only_if_a_method_is_shared() {
-        let check = |a: Option<&[&str]>, b: Option<&[&str]>| {
-            check_route_overlaps(&[], &[config_route("/f", a), config_route("/f", b)]).is_err()
+        let check = |a: &[&str], b: &[&str]| {
+            check_routes(
+                &[],
+                &[
+                    config_route("/f/{x}", Some(a)),
+                    config_route("/f/{y}", Some(b)),
+                ],
+            )
         };
-        assert!(!check(Some(&["GET"]), Some(&["POST"])));
-        assert!(check(Some(&["GET"]), Some(&["GET"])));
-        assert!(check(Some(&["GET"]), None));
-        assert!(check(None, Some(&["DELETE"])));
+        assert!(check(&["GET"], &["POST"]).is_ok());
+        assert!(check(&["GET", "POST"], &["PUT", "DELETE"]).is_ok());
+        let e = check(&["GET", "POST"], &["POST", "PUT"])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("can both answer POST /f/x;"), "{e}");
+        // No list is every method, so it meets any list.
+        let none = check_routes(
+            &[],
+            &[
+                config_route("/f/{x}", None),
+                config_route("/f/{y}", Some(&["DELETE"])),
+            ],
+        );
+        assert!(none.unwrap_err().to_string().contains("DELETE /f/x"));
     }
 
-    /// Code routes count too, and the error says which kind each one is.
+    /// A code `POST /contact` beside a config `GET /contact` template: the
+    /// layout of a form page. Refused when the template route lists no methods,
+    /// because it then answers `POST` as well.
     #[test]
-    fn a_code_route_and_a_config_route_with_a_template_conflict() {
-        let code = [("/blog/{slug}".to_string(), RouteMethod::Get)];
-        let e = check_route_overlaps(&code, &[config_route("/blog/{name}", None)])
+    fn a_post_code_route_beside_a_get_template_route_is_accepted() {
+        let code = [("/contact".to_string(), RouteMethod::Post)];
+        assert!(check_routes(&code, &[config_route("/contact", Some(&["GET"]))]).is_ok());
+        let e = check_routes(&code, &[config_route("/contact", None)])
             .unwrap_err()
             .to_string();
         assert!(
             e.contains("(code route)") && e.contains("([[route]] number 1)"),
             "{e}"
         );
+        assert!(e.contains("answer POST /contact"), "{e}");
     }
 
-    /// A `[[route]]` with the pattern of a code route and no template or
-    /// handler is how a config sets that code route's cache. Refusing it would
-    /// break every service that does so.
+    /// A config route that names an unknown method is refused naming the route
+    /// and the value, whatever else is wrong with the table. The wrong outcome
+    /// (#336): it answered every method and the typo was never reported.
     #[test]
-    fn a_config_route_that_declares_a_code_route_is_not_a_conflict() {
+    fn an_unknown_method_is_refused_naming_the_route_and_the_value() {
+        for bad in ["HEAD", "GTE", "PURGE"] {
+            let e = check_routes(
+                &[],
+                &[
+                    config_route("/ok", None),
+                    config_route("/typo", Some(&["GET", bad])),
+                ],
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                e.contains("\"/typo\"")
+                    && e.contains("([[route]] number 2)")
+                    && e.contains(&format!("\"{bad}\"")),
+                "{e}"
+            );
+        }
+        let e = check_routes(&[], &[config_route("/none", Some(&[]))])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("\"/none\"") && e.contains("empty methods"),
+            "{e}"
+        );
+    }
+
+    /// A `[[route]]` on a code route's pattern with no template and no handler
+    /// gives that code route its `cache` and is not a conflict. Refusing it
+    /// would break every service that does so.
+    #[test]
+    fn a_config_route_that_only_declares_a_code_route_is_not_a_conflict() {
         let code = [("/api/{id}".to_string(), RouteMethod::Get)];
         let mut declaration = config_route("/api/{id}", None);
         declaration.template = None;
-        assert!(check_route_overlaps(&code, &[declaration]).is_ok());
+        assert!(check_routes(&code, &[declaration.clone()]).is_ok());
+        // With a template it is a second route for the same requests.
+        let mut with_template = declaration;
+        with_template.template = Some("t.html".to_string());
+        assert!(check_routes(&code, &[with_template]).is_err());
     }
 
     /// The check is where `FrameworkState::build` starts, so every load path
@@ -5452,6 +5714,9 @@ mod route_overlap_tests {
         let err = FrameworkState::build(config, PathBuf::from("."), &[], &*default_renderer())
             .err()
             .expect("the conflicting config must not build");
-        assert!(err.to_string().contains("equal specificity"), "{err}");
+        assert!(
+            err.to_string().contains("can both answer GET /blog/x"),
+            "{err}"
+        );
     }
 }

@@ -112,8 +112,8 @@ fn dump_config_refuses_a_site_toml_the_start_would_refuse() {
     assert!(stderr.contains("not valid TOML"), "{stderr}");
 }
 
-/// A second `[[route]]` that answers the same paths as `/assets/{*relpath}` at
-/// the same specificity, so it could never be reached.
+/// A second `[[route]]` pattern that matches the same paths as
+/// `/assets/{*relpath}`, so neither could be said to answer them.
 const OVERLAPPING_ROUTE: &str =
     "[[route]]\npath = \"/assets/{*other}\"\nhandler = \"files\"\nroot = \"assets/\"\n";
 
@@ -124,11 +124,10 @@ fn assert_names_the_overlap(output: &str) {
     for route in ["\"/assets/{*relpath}\"", "\"/assets/{*other}\""] {
         assert!(text.contains(route), "{route} not named in: {text}");
     }
-    assert!(text.contains("equal specificity"), "{text}");
-    assert!(text.contains("(e.g. \"/assets/x\")"), "{text}");
+    assert!(text.contains("can both answer GET /assets/x"), "{text}");
 }
 
-/// Scenario: two routes that answer the same paths at the same specificity.
+/// Scenario: two patterns that can match one path.
 /// The wrong outcome: the service starts and the second route silently never
 /// answers.
 #[test]
@@ -154,6 +153,27 @@ fn a_start_with_overlapping_routes_exits_2_and_names_both() {
         "the service did not refuse and exit 2: {text}"
     );
     assert_names_the_overlap(&text);
+}
+
+/// Scenario: a typo in a route's `methods`. The wrong outcome (#336): the route
+/// answers every method and the typo is never reported. The load must refuse it
+/// and name the route and the value.
+#[test]
+fn dump_config_refuses_an_unknown_method_in_a_route() {
+    let tmp = tree("");
+    let root = tmp.path().join("apps/file");
+    let conf = config(
+        &root,
+        "[[route]]\npath = \"/assets/{*relpath}\"\nhandler = \"files\"\nroot = \"assets/\"\nmethods = [\"GET\", \"GTE\"]\n",
+    );
+
+    let out = run(&root, &conf, Some("--dump-config"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("\"/assets/{*relpath}\"") && stderr.contains("\"GTE\""),
+        "{stderr}"
+    );
 }
 
 /// Scenario: a deploy validates with `--dump-config`. The wrong outcome: it
@@ -313,7 +333,7 @@ fn a_reload_into_overlapping_routes_is_refused_and_the_old_routes_serve() {
     let r = start("");
     std::fs::write(r.conf(), conf_body(OVERLAPPING_ROUTE, 2)).unwrap();
     assert!(
-        wait_for(&r, "equal specificity", 1),
+        wait_for(&r, "can both answer", 1),
         "the overlapping routes were not refused\n{}",
         r.svc.output()
     );

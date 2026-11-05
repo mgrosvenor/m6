@@ -413,11 +413,23 @@ App::with_state(init_global, init_thread)
 
 `App::new()`, `App::with_global()`, `App::with_thread_state()`, and `App::with_state()` are the four entry points. The type system enforces the correct handler signature for each — mismatched signatures are compile errors, not runtime failures.
 
-Routes registered in code take precedence over config routes for the same path. A method-specific registration returns 405 for other methods.
+A route registered in code answers the method it names (`route()` answers every method). A request whose method no route on its path answers gets 404.
 
 ### Route matching
 
-Specificity wins: exact paths beat parameterised, longer beats shorter. Two routes that match the same paths with equal specificity are a configuration error: the service refuses to start (exit 2), `--dump-config` fails, and a reload keeps the running config. The message names both routes and one path they both match, for example `routes "/blog/{slug}" ([[route]] number 1) and "/blog/{name}" ([[route]] number 2) match the same paths with equal specificity (e.g. "/blog/x"); remove one or make one more specific`. A GET route and a POST route on one path do not conflict. Unmatched path → 404.
+A route is fixed when every segment is a literal (`/blog/archive`) and a pattern when it has a `{param}` or a `{*rest}`. For two routes that can answer the same request, meaning a path both match and a method both answer:
+
+1. A fixed route beats a pattern route.
+2. Two fixed routes with the same path are a configuration error.
+3. Two pattern routes that can both match some path are a configuration error, for example `/blog/{slug}` with `/blog/{name}`, `/blog/{slug}` with `/blog/{*rest}`, or `/{lang}/about` with `/blog/{slug}`.
+
+There is no scoring. A fixed route is found by one lookup on its path, and at most one pattern route can match any request, so a request needs no tie-break and the answer does not depend on the order of the `[[route]]` blocks.
+
+A configuration error stops the service at start (exit 2), refuses a reload so the running routes keep serving, and fails `--dump-config`. The message names both routes as written, where each came from and one request both would answer: `routes "/blog/{slug}" ([[route]] number 1) and "/blog/{name}" ([[route]] number 2) can both answer GET /blog/x; remove one, give one explicit methods, or make one a fixed path`.
+
+A route's `methods` list is exactly the methods it answers, and a route with no list answers every method. `GET` also answers `HEAD`. A name m6 does not support, and an empty list, fail the load naming the route. Routes whose methods do not meet never conflict, so a code `route_post("/contact", ...)` beside a config `[[route]]` for `/contact` with `methods = ["GET"]` is valid, and the same config route without `methods` is an error because it also answers `POST`. A config `[[route]]` on a code route's own pattern with no template and no handler only gives that code route its `cache`, and is not a conflict.
+
+Unmatched path → 404.
 
 Path param values are validated before use: alphanumeric, hyphens, and underscores only (plus `.` and `/` for `{relpath}`). No `..` sequences. Invalid values → 400.
 

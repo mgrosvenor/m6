@@ -210,6 +210,50 @@ fn server_in_the_system_config_only_starts_because_validation_runs_after_the_mer
     );
 }
 
+/// Scenario: two `[[route]]` patterns that can match one path, checked with
+/// `--dump-config` before a deploy. The wrong outcome: the dump prints the
+/// config and exits 0, and the start then refuses the same config.
+#[test]
+fn dump_config_refuses_routes_that_can_match_one_path() {
+    let claim = testkit::claim_port();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let site = dir.path().join("site");
+    std::fs::create_dir_all(&site).expect("site dir");
+    write_cert_key(&site);
+    std::fs::write(
+        site.join("site.toml"),
+        "[site]\nname = \"startup-errors\"\ndomain = \"example.com\"\n\n\
+         [[backend]]\nname = \"b\"\nsockets = \"/run/m6/*.sock\"\n\n\
+         [[route]]\npath = \"/blog/{slug}\"\nbackend = \"b\"\n\n\
+         [[route]]\npath = \"/{lang}/about\"\nbackend = \"b\"\n",
+    )
+    .expect("site.toml");
+    let system = dir.path().join("system.toml");
+    std::fs::write(
+        &system,
+        format!(
+            "[node]\nname = \"startup-errors\"\n\n\
+             [server]\nbind = \"{}\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n",
+            claim.addr()
+        ),
+    )
+    .expect("system config");
+
+    let out = run(&[
+        site.as_os_str(),
+        system.as_os_str(),
+        std::ffi::OsStr::new("--dump-config"),
+    ]);
+    let stderr = stderr_of(&out);
+    assert_eq!(exit_code(&out), 2, "stderr: {stderr}");
+    assert!(
+        stderr.contains("\"/blog/{slug}\"")
+            && stderr.contains("\"/{lang}/about\"")
+            && stderr.contains("can both answer GET /blog/about"),
+        "both routes and an example request must be named, got: {stderr}"
+    );
+}
+
 /// Scenario: `--dump-config` with `[server]` only in the system config. Wrong
 /// outcome: the dump omits the merged `[server]` and exits non-zero, so a
 /// deploy cannot validate the merged config before cutting a node over.
