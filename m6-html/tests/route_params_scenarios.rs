@@ -99,7 +99,7 @@ fn http_request(socket_path: &Path, request: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// #289 — the equal-specificity route tie
+// #289: the equal-specificity route tie
 // ---------------------------------------------------------------------------
 
 /// Two routes of equal specificity match one path (`/blog/{slug}` then
