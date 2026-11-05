@@ -1960,7 +1960,7 @@ cd examples/11-admin-dashboard
 | `GET` | `/api/admin/perf` | Last N "periodic stats" entries from m6-http log |
 | `GET` | `/api/admin/routes` | Per-route request counts, cache rates, avg latency |
 | `GET` | `/api/admin/system` | CPU%, RAM, disk usage, uptime |
-| `GET` | `/api/admin/bench` | Bench targets auto-discovered from `site.toml` |
+| `GET` | `/api/admin/bench` | Bench targets taken from the `[server].bind` in the system config |
 | `POST` | `/api/admin/bench` | Start a bench job → `{ "job_id": "..." }` |
 | `GET` | `/api/admin/bench/{id}` | Poll job status and output |
 | `GET` | `/api/admin/logs` | Last N log lines as JSON array |
@@ -2004,19 +2004,19 @@ Each entry is one "periodic stats" log event (emitted every 10 s by m6-http). Pa
 ```json
 {
   "targets": [
-    { "id": "h1",  "label": "HTTP/1.1 127.0.0.1:8443", "addr": "127.0.0.1:8443", "proto": "h1" },
-    { "id": "h2",  "label": "HTTP/2   127.0.0.1:8443", "addr": "127.0.0.1:8443", "proto": "h2" },
-    { "id": "h3",  "label": "HTTP/3   127.0.0.1:8443", "addr": "127.0.0.1:8443", "proto": "h3" },
-    { "id": "all", "label": "All      127.0.0.1:8443", "addr": "127.0.0.1:8443", "proto": "all" }
+    { "id": "h1",  "label": "HTTP/1.1 127.0.0.1:8444", "addr": "127.0.0.1:8444", "proto": "h1" },
+    { "id": "h2",  "label": "HTTP/2   127.0.0.1:8444", "addr": "127.0.0.1:8444", "proto": "h2" },
+    { "id": "h3",  "label": "HTTP/3   127.0.0.1:8444", "addr": "127.0.0.1:8444", "proto": "h3" },
+    { "id": "all", "label": "All      127.0.0.1:8444", "addr": "127.0.0.1:8444", "proto": "all" }
   ]
 }
 ```
-Targets are auto-discovered from `site.toml`'s `[server].bind` address — no manual configuration.
+Targets are taken from the `[server].bind` in the system config, the file render-admin's `system_toml` key names (`configs/system-dev.toml` in this example). With no bind there, the list is empty and `/api/admin/backends` reports `"bind": null`.
 
 **`POST /api/admin/bench`**
 ```json
 // Request body:
-{ "addr": "127.0.0.1:8443", "proto": "h1", "duration_secs": 10, "concurrency": 50 }
+{ "addr": "127.0.0.1:8444", "proto": "h1", "duration_secs": 10, "concurrency": 50 }
 
 // Response:
 { "job_id": "550e8400-e29b-41d4-a716-446655440000" }
@@ -2026,7 +2026,7 @@ Targets are auto-discovered from `site.toml`'s `[server].bind` address — no ma
 ```json
 {
   "id": "550e8400-e29b-41d4-a716-446655440000",
-  "target": "127.0.0.1:8443 (h1)",
+  "target": "127.0.0.1:8444 (h1)",
   "status": "done",
   "output": "Requests/sec: 42000\nLatency p50: 0.4ms ...",
   "started_at": 1742641200,
