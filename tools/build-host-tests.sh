@@ -105,36 +105,27 @@ BUILD_ROOT="${M6_BUILD_ROOT:-m6-build}"
 LOG=/tmp/m6-build-host-tests.log
 EXAMPLES_LOG=/tmp/m6-build-host-examples.log
 
-# Copy one file back from the build host to the laptop checkout, so a record the
-# build host wrote becomes part of the commit. The file is append-only, so the
-# records are merged rather than overwritten: the laptop's lines are kept and the
-# build host's lines that the laptop does not already hold are appended. The build
-# host is not backed up, so a recreated host that holds only one fresh record must
-# not overwrite the committed history with it.
+# Copy tools/perf-history.jsonl back from the build host, so the record perfcheck
+# appended there becomes part of the next commit. The sync sends the checkout's
+# history to the host, so the host's file is the checkout's file plus this run's
+# record and replaces it whole. The new file is written beside the old one and
+# renamed only once it is complete and no shorter, so a failure never leaves a
+# partial history behind.
 copy_back() {
     local src="$1"
     local dst="$2"
-    local fetched
-    fetched="$(mktemp "${TMPDIR:-/tmp}/m6-perf-history.XXXXXX")" \
-        || die "cannot make a temp file for $src"
+    local tmp old=0
+    tmp="$(mktemp "$dst.XXXXXX")" || { echo "cannot make a temp file beside $dst" >&2; return 1; }
+    [[ -f "$dst" ]] && old=$(wc -l < "$dst")
     # shellcheck disable=SC2086
-    rsync -az -e "ssh $SSH_OPTS" "$src" "$fetched" \
-        || { rm -f "$fetched"; die "cannot copy $src back to $dst"; }
-    if [[ ! -s "$fetched" ]]; then
-        rm -f "$fetched"
-        die "cannot copy $src back to $dst: the file is empty"
+    if rsync -az -e "ssh $SSH_OPTS" "$src" "$tmp" \
+        && [[ -s "$tmp" ]] && (( $(wc -l < "$tmp") >= old )); then
+        mv "$tmp" "$dst"
+    else
+        rm -f "$tmp"
+        echo "cannot copy $src back to $dst: the fetch failed or the file is shorter than the $old line(s) held here" >&2
+        return 1
     fi
-    if [[ ! -f "$dst" ]]; then
-        mv "$fetched" "$dst"
-        return 0
-    fi
-    # Append only the build host's lines the laptop does not already hold, so a
-    # recreated build host cannot shorten the committed history. One pass over
-    # both files dedupes across them, so an empty destination still gains every
-    # fetched line.
-    awk '!seen[$0]++' "$dst" "$fetched" > "$dst.merged"
-    mv "$dst.merged" "$dst"
-    rm -f "$fetched"
 }
 
 # ── Where the examples are ───────────────────────────────────────────────────
@@ -161,9 +152,11 @@ fi
 
 # ── The git guard ────────────────────────────────────────────────────────────
 if [[ -z "${M6_ALLOW_DIRTY:-}" ]]; then
-    [[ -z "$(git -C "$ROOT" status --porcelain)" ]] || {
+    # The history file is exempt: the host's copy is regenerated from the checkout
+    # on every sync, so the gate can be rerun before the new record is committed.
+    [[ -z "$(git -C "$ROOT" status --porcelain -- . ':!tools/perf-history.jsonl')" ]] || {
         echo "${RED}ERROR:${RESET} $ROOT has uncommitted changes." >&2
-        git -C "$ROOT" status --short | head -10 >&2
+        git -C "$ROOT" status --short -- . ':!tools/perf-history.jsonl' | head -10 >&2
         echo "  The build host is assumed not to be backed up. Commit first, or" >&2
         echo "  set M6_ALLOW_DIRTY=1." >&2
         exit 1; }
@@ -192,10 +185,7 @@ info "syncing to $BUILD_HOST:$BUILD_ROOT/m6"
 # shellcheck disable=SC2086
 ssh $SSH_OPTS "$BUILD_HOST" "mkdir -p $BUILD_ROOT" || die "cannot reach $BUILD_HOST"
 # shellcheck disable=SC2086
-# tools/perf-history.jsonl is excluded so --delete does not erase the record the
-# build host wrote. The copy-back below brings it into git.
 rsync -az -e "ssh $SSH_OPTS" --delete --exclude 'target/' --exclude '.git/' \
-    --exclude 'tools/perf-history.jsonl' \
     "$ROOT/" "$BUILD_HOST:$BUILD_ROOT/m6/" || die "rsync failed"
 # shellcheck disable=SC2086
 ssh $SSH_OPTS "$BUILD_HOST" \
@@ -218,11 +208,14 @@ fi
 info "m6: release build, warnings, clippy, cargo-deny, tests, conformance"
 # shellcheck disable=SC2086
 # PERF_COMMIT is read here, from the checkout being synced, because the remote
-# tree has no `.git`. PERF_DIRTY is 0 by construction: the clean-tree guard above
+# tree has no `.git`. PERF_DIRTY is 1 when the checkout differs from that commit
+# (possible only under M6_ALLOW_DIRTY), not counting the history file itself.
 # refuses to sync a dirty tree at all.
 PERF_COMMIT="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+PERF_DIRTY=0
+[[ -z "$(git -C "$ROOT" status --porcelain -- . ':!tools/perf-history.jsonl' 2>/dev/null)" ]] || PERF_DIRTY=1
 ssh $SSH_OPTS "$BUILD_HOST" \
-    "M6_DIR=$BUILD_ROOT/m6 M6_PERF_COMMIT=$PERF_COMMIT M6_PERF_DIRTY=0 bash -s" \
+    "M6_DIR=$BUILD_ROOT/m6 M6_PERF_COMMIT=$PERF_COMMIT M6_PERF_DIRTY=$PERF_DIRTY bash -s" \
     > "$LOG" 2>&1 <<'REMOTE' || true
 set -uo pipefail
 # `/root/.local/bin` is where `uv` installs, and h1spec is delivered through
@@ -308,12 +301,16 @@ REMOTE
 # ── Bring the history back ───────────────────────────────────────────────────
 #
 # perfcheck appended one record to tools/perf-history.jsonl on the build host,
-# the only place it runs. The sync above excludes that file so --delete keeps it,
-# but nothing copied it back, so the committed history never gained a record.
-# Merge it back now, pass or fail, because a run that failed is the one a later
-# reader most wants the conditions for.
-copy_back "$BUILD_HOST:$BUILD_ROOT/m6/tools/perf-history.jsonl" "$ROOT/tools/perf-history.jsonl"
-info "commit tools/perf-history.jsonl; the next run refuses a dirty tree until you do"
+# the only place it runs. Bring it back now, pass or fail, because a run that
+# failed is the one a later reader most wants the conditions for. Bookkeeping
+# never blocks the check: a failure is reported and fails the run at the end, but
+# the examples still run.
+COPY_BACK_FAILED=0
+if copy_back "$BUILD_HOST:$BUILD_ROOT/m6/tools/perf-history.jsonl" "$ROOT/tools/perf-history.jsonl"; then
+    info "commit tools/perf-history.jsonl to keep this run's record"
+else
+    COPY_BACK_FAILED=1
+fi
 
 # ── The examples ─────────────────────────────────────────────────────────────
 #
@@ -528,7 +525,7 @@ REMOTE_EG
 fi
 
 # ── Report ───────────────────────────────────────────────────────────────────
-FAILED=0
+FAILED=$COPY_BACK_FAILED
 rw=$(num_after RELEASE_WARNINGS "$LOG");  rw="${rw:-?}"
 tw=$(num_after TESTBUILD_WARNINGS "$LOG"); tw="${tw:-?}"
 cl=$(num_after CLIPPY_STATUS "$LOG");      cl="${cl:-?}"
