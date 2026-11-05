@@ -78,14 +78,12 @@ Run it before opening the pull request when the change could touch either.
 
 ## 4. Releases
 
-A pull request into `main` is the release, and two more checks apply to it.
-CI refuses a work branch aimed straight at `main`, which the `main takes develop only` job enforces.
-`CHANGELOG.md` must have a `## <version>` section that says what changed, why it mattered and how it was verified.
-m6's own documents must still hold, which the release checklist in the pull request template asks for.
-Freshness is judgement, which CI cannot decide.
-
-Docs being up to date is a fundamental part of a release.
-1.11.0 shipped while a document on `main` named the previous release as current, and 1.11.1 had to be cut for documentation alone.
+A pull request into `main` is the release, and four checks apply to it.
+CI enforces three of them.
+The `main takes develop only` job refuses a work branch aimed straight at `main`.
+The `changelog` job checks that `CHANGELOG.md` has a `## <version>` section and that the version is not already tagged.
+The fourth check is judgement, which CI cannot decide.
+m6's own documents must still hold, which is a fundamental part of a release and which the release checklist in the pull request template asks for.
 
 ### 4.1. Versions
 
@@ -122,23 +120,19 @@ The numbers are taken on the build host and mean nothing on another machine.
 
 A check you add fails when it cannot run.
 It does not print "skipped" and return success.
-The conformance script did that in four places and reported PASS through all of them, which left h2 and h3 untested for months.
-[`tools/conformance.sh`](tools/conformance.sh) header lists the four.
+[`tools/conformance.sh`](tools/conformance.sh)'s header lists the four ways the conformance script broke this rule.
 
 ## 6. Style
 
 - Run `cargo fmt --all`.
   CI runs `cargo fmt --all --check` and fails on a difference.
 - Comments explain why, especially why something is not the obvious thing.
-- No em dashes in prose.
-- Plain technical English, and no borrowed management vocabulary.
-- Documentation follows the ruleset R0 to R10 in [`CLAUDE.md`](CLAUDE.md).
+- Prose follows the standing rules and the documentation ruleset R0 to R10, both in [`CLAUDE.md`](CLAUDE.md).
 
 ## 7. Commit messages
 
-Say what changed, why it mattered, and how it was verified.
-"Verified" means measured against something running, not inferred from the source.
-The full rule is in [`CLAUDE.md`](CLAUDE.md).
+Commit messages follow the rule in [`CLAUDE.md`](CLAUDE.md).
+A commit says what changed, why it mattered, and how it was verified.
 
 ## 8. Reporting a bug
 
