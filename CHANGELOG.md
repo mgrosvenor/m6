@@ -143,6 +143,8 @@ Comments only.
 
 **CHANGELOG.md's preamble and its 1.15.0, 1.14.0, 1.13.0 and 1.12.1 entries now follow the documentation ruleset (#129).**
 
+**The user guide's admin dashboard section says the bench targets come from the system config's `[server].bind`, as example 11 now has it (#305).**
+
 ### Changed
 
 **Debug and test builds carry line tables only, and no debug information for dependencies, so a full test build is 3.7 GB instead of 12 GB (#303).**
