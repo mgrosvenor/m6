@@ -81,8 +81,11 @@ Verified with `l2_query_relpath_cannot_replace_the_path_parameter` and `l2_query
 
 ### Fixed
 
-**A shutdown now waits for every request the thread pool has accepted, including one a worker has not yet started (#338).**
-The pool counted a request in flight only after a worker thread woke to run it, so a SIGTERM landing in that gap let `drain` see nothing in flight and the process exit under the request. A queued request was not counted either. The pool now counts a request when it accepts it, with one atomic add on the accept thread. The m6-html shutdown test failed 57 times in 150 runs under CPU load before the change, and its held-request step now confirms the service accepted the request instead of trusting the probe's 503 alone.
+**A shutdown now waits for every request the thread pool has accepted, including one a worker has not yet started, and gives up after `[server] drain_timeout_s` (#338).**
+The pool counted a request in flight only once a worker woke to run it, so a SIGTERM landing in that gap let the drain see nothing in flight and the process exit under the request. A queued request was not counted either. The pool now counts a request when it accepts it, with one atomic add on the accept thread, and a panicking handler stops counting.
+The drain now returns the moment the last request finishes, where it used to poll every 10 ms, and it ends at `drain_timeout_s` (default 30, `0` waits for none) with a warning that counts the requests left, so a full queue of slow clients cannot hold a stop past systemd's 90 s. The key is read at startup, and a reload that changes it logs that a restart is needed.
+The m6-html shutdown test failed 57 times in 150 runs under CPU load before the change and 0 in 200 after. Its held-request step also confirms the service accepted the request, which the probe's 503 alone did not show.
+The test harness's `Service::wait_for_exit` and `terminate` now also wait for the output threads to copy a child's last lines, which a test reading `output()` straight after the exit could miss.
 
 **`a_burst_of_writes_is_at_most_two_reloads` no longer fails on a busy machine (#299).**
 It wrote the config three times 10 ms apart and expected at most two reloads, but the reloader only merges a write that lands within 20 ms of the last report, so on a loaded runner a late write was rightly reported a third time. The test now spaces its writes 5 ms apart (longer than the service loop takes to wake and reload, so it is unlikely to merge them by itself), times each burst, and judges only one that fitted inside the window, retrying up to five times. Verified on the build host, 20 runs each: 20 passes with four CPU-bound processes running, and 20 failures reporting three reloads with the reloader's hold removed.

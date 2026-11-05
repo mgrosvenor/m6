@@ -34,12 +34,16 @@ fn fixtures_dir() -> PathBuf {
         .join("fixtures")
 }
 
-fn config_path() -> PathBuf {
-    fixtures_dir().join("configs").join("m6-html-shutdown.conf")
+fn config_path(name: &str) -> PathBuf {
+    fixtures_dir().join("configs").join(name)
 }
 
 /// Spawn `m6-html` on its own socket and wait until it answers a request.
 fn spawn(id: &str) -> (Server, PathBuf) {
+    spawn_with(id, "m6-html-shutdown.conf")
+}
+
+fn spawn_with(id: &str, config: &str) -> (Server, PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir");
     // Short name: a unix socket path is capped near 104 bytes on macOS.
     let socket_path = dir.path().join(format!("{id}.sock"));
@@ -48,7 +52,7 @@ fn spawn(id: &str) -> (Server, PathBuf) {
         "m6-html",
         Command::new(binary("m6-html"))
             .arg(fixtures_dir())
-            .arg(config_path())
+            .arg(config_path(config))
             .env("M6_SOCKET_OVERRIDE", &socket_path),
     );
     svc.wait_for_path(&socket_path, Duration::from_secs(10));
@@ -301,4 +305,47 @@ fn a_request_in_flight_at_sigterm_receives_its_full_response() {
         "the socket at {} outlived the shutdown",
         socket_path.display()
     );
+}
+
+/// A request that never finishes cannot hold shutdown past `drain_timeout_s`.
+/// The wrong outcome: the drain waits for the stalled request until the
+/// supervisor kills the service mid-response. The service logs how many
+/// requests it left behind, then exits 0 with its socket removed.
+#[test]
+fn a_stalled_request_cannot_hold_shutdown_past_the_drain_deadline() {
+    let (mut server, socket_path) =
+        spawn_with("term-deadline", "m6-html-shutdown-short-drain.conf");
+    let held = hold_open(&socket_path, &mut server.svc);
+
+    server.svc.signal(libc::SIGTERM);
+    wait_for_output(
+        &server.svc,
+        "drain deadline passed",
+        Duration::from_secs(10),
+    );
+    let status = server
+        .svc
+        .wait_for_exit(Instant::now() + Duration::from_secs(10))
+        .unwrap_or_else(|| {
+            panic!(
+                "m6-html did not exit after the drain deadline\n--- output ---\n{}",
+                server.svc.output()
+            )
+        });
+    assert!(
+        status.success(),
+        "shutdown past the drain deadline must exit 0, got {status}\n--- output ---\n{}",
+        server.svc.output()
+    );
+    assert!(
+        server.svc.output().contains("\"unfinished\":1"),
+        "the warning must count the one request left behind\n--- output ---\n{}",
+        server.svc.output()
+    );
+    assert!(
+        !socket_path.exists(),
+        "the socket at {} outlived the shutdown",
+        socket_path.display()
+    );
+    drop(held);
 }
