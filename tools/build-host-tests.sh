@@ -327,6 +327,11 @@ echo "EG_CLIPPY_WARNINGS=$(cat $T/eg-clippy.count)"
 CARGO_TARGET_DIR=target/clippy cargo clippy --workspace --all-targets --release 2>&1 \
     | grep '^warning' | head -5
 
+# Everything the remaining steps run is built first, outside the port lock, so
+# the lock covers running and not compiling. The later builds are then no-ops.
+cargo test --workspace --no-run > "$T/eg-testbuild.log" 2>&1 || true
+cargo build --release -p render-cms > /dev/null 2>&1 || true
+(cd "$M6_DIR" && cargo build --workspace --release > /dev/null 2>&1) || true
 port_hold
 echo "### examples unit tests"
 # Not blog_site_end_to_end: it needs certificates and example 05's stack, and
@@ -447,7 +452,10 @@ if ss -ltnH 'sport = :8443' 2>/dev/null | grep -q .; then
 fi
 
 # Its processes do not inherit the locks, so one that outlives this run cannot
-# hold the host or the ports.
+# hold the host or the ports. While this run lasts it holds the port lock itself,
+# so no other run's tests bind ports beside the stack; a stack left over after a
+# failed run is caught by the 8443 check above on the next run, which a wedged
+# lock would not be.
 M6="$M6_DIR" M6_NO_BROWSER=1 ./dev.sh --no-open > $T/eg-cms-dev.log 2>&1 6<&- 7<&- 8<&- &
 DEV_PID=$!
 up=0

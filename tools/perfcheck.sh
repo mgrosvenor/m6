@@ -212,7 +212,7 @@ measure_one() {
   for _ in $(seq 1 "$RUNS"); do
     rm -f "$sock"
     M6_SOCKET_OVERRIDE="$sock" "$bin" "$site" "$conf" --log-level error \
-      > "$WORK/render.log" 2>&1 &
+      > "$WORK/render.log" 2>&1 6<&- 8<&- &
     local pid=$!
     PIDS+=("$pid")
     for _ in $(seq 1 100); do [[ -S "$sock" ]] && break; sleep 0.05; done

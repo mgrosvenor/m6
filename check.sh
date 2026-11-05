@@ -97,7 +97,9 @@ fi
 # have nothing to do with the code under test.
 info "Running correctness tests..."
 # The test build binds nothing, so it runs before the port lock is taken.
-cargo test --workspace --no-run --quiet
+if ! cargo test --workspace --no-run --quiet 2>&1; then
+  fail "Test build failed: the tests do not compile"
+fi
 if with_port_lock cargo test --workspace --quiet -- --test-threads=1 2>&1; then
   pass "Unit + integration tests (HTTP/1.1 ✓  HTTP/3 ✓)"
 else
@@ -173,7 +175,11 @@ if [[ "$RUN_BENCH" == "false" ]]; then
 fi
 
 # A benchmark, and a baseline saved from one, is a measurement: it waits for the
-# host to be idle and holds it so (see the locks at the top).
+# host to be idle and holds it so (see the locks at the top). The bench binaries
+# are compiled first, so the host is held for measuring and nothing else.
+if ! cargo bench "${CRITERION_BENCHES[@]}" --no-run --quiet 2>&1; then
+  fail "Benchmark build failed"
+fi
 if ! host_alone; then
   INCOMPLETE="benchmarks (the host was never idle, so nothing was measured)"
   summary
@@ -182,7 +188,7 @@ fi
 
 if [[ "$SAVE_BASELINE" == "true" ]]; then
   info "Saving benchmark baseline '$BASELINE_NAME'..."
-  if cargo bench "${CRITERION_BENCHES[@]}" --quiet -- --save-baseline "$BASELINE_NAME" 2>&1; then
+  if cargo bench "${CRITERION_BENCHES[@]}" --quiet -- --save-baseline "$BASELINE_NAME" 2>&1 6<&- 8<&-; then
     pass "Baseline '$BASELINE_NAME' saved"
   else
     fail "Benchmark run failed during baseline save"
@@ -225,7 +231,7 @@ fi
 
 BENCH_OUT="$(mktemp)"
 # Run benchmarks; capture output but do not fail on non-zero exit.
-cargo bench "${CRITERION_BENCHES[@]}" --quiet $BENCH_ARGS 2>&1 | tee "$BENCH_OUT" || true
+cargo bench "${CRITERION_BENCHES[@]}" --quiet $BENCH_ARGS 2>&1 6<&- 8<&- | tee "$BENCH_OUT" || true
 
 # Surface any criterion-detected regressions as warnings (not failures).
 REGRESSIONS=$(grep "Performance has regressed\." "$BENCH_OUT" | wc -l | tr -d ' ')
