@@ -177,6 +177,9 @@ They fail if a change to argument parsing or the config merge turns a clear exit
 **Tests now cover the shutdown signals every service shares (#288).**
 They fail if a second SIGTERM stops forcing exit during a drain, if SIGINT leaves the graceful path, or if a request in flight at SIGTERM is cut off.
 
+**Tests now cover the route tie-break, params precedence, the query and path-parameter clash, and a route status reaching the response (#289, #290, #291, #292).**
+They fail if equal routes stop resolving to the first declaration, if a global params key beats a route key, if a changed params file is missed after a restart, if a query key replaces a path parameter, or if a route status is dropped.
+
 ### Verified
 
 - Unit tests with stub resolvers cover a confirmed name, a PTR whose forward lookup returns other addresses, a name with no forward answer, a failed forward lookup, no PTR, a name with no address (EAI_NONAME and EAI_NODATA), a slot free by the time the caller has the result, the per-poll lookup cap, expiry and cache bound, a report that reads stored results and resolves nothing, a resolver that never answers, and the thread bound (eight blocked lookups, then fifty more that return at once and start no thread, then slots free again).
