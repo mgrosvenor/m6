@@ -82,7 +82,7 @@ Verified with `l2_query_relpath_cannot_replace_the_path_parameter` and `l2_query
 ### Fixed
 
 **One rename of a service's config is now one reload, not sometimes two (#300).**
-A rename over the config shows to `stat` a moment before its inotify event is queued, so a poll in that gap reported the change and then the event reported it again, and on Linux the old file's `ctime` changes just before the name moves, which a second `stat` read as another change. The reloader now drops an event for a change its fingerprint already reported, and on Linux, where an inotify event names a `chmod`, it leaves `ctime` out of the comparison. On kqueue and with no watcher `ctime` stays in, so a `chmod` is still found.
+A rename over the config shows to `stat` a moment before its inotify event is queued, so a poll in that gap reported the change and then the event reported it again, and on Linux the old file's `ctime` changes just before the name moves, which a second `stat` read as another change. The reloader now drops an event for a change its fingerprint already reported, and on Linux, while an inotify watch exists on the directory of every file, it leaves `ctime` out of the comparison. On kqueue, with no watcher, and when a watch could not be added or was lost, `ctime` stays in, so a `chmod` is still found.
 Verified on the build host: a test that renames over a watched config 300 times under CPU load failed in 17 of 20 runs before the fix and passed in 30 of 30 after, and deterministic tests cover each order of poll and event.
 
 **`a_burst_of_writes_is_at_most_two_reloads` no longer fails on a busy machine (#299).**

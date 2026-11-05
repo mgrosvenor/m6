@@ -65,12 +65,17 @@ fn watch_targets(paths: &[&Path], include_files: bool) -> Vec<std::path::PathBuf
 #[cfg(target_os = "linux")]
 pub struct ConfigWatcher {
     inotify: nix::sys::inotify::Inotify,
+    /// True while a watch exists on the directory of every file. A directory
+    /// that could not be watched, or a watch the kernel has dropped, leaves a
+    /// file whose changes no event reports.
+    names_files: bool,
 }
 
 #[cfg(target_os = "linux")]
 impl ConfigWatcher {
     pub fn new(paths: &[&Path]) -> anyhow::Result<Self> {
         use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
+        use std::collections::HashSet;
 
         let inotify = Inotify::init(InitFlags::IN_CLOEXEC | InitFlags::IN_NONBLOCK)
             .map_err(|e| anyhow::anyhow!("inotify_init1 failed: {e}"))?;
@@ -102,20 +107,39 @@ impl ConfigWatcher {
         // failure to reload at all.
         //
         // Because this event names a `chmod`, the reloader does not need
-        // `ctime` in its fingerprint here. It leaves `ctime` out, since a rename
-        // bumps it on the old inode before the name moves.
+        // `ctime` in its fingerprint while every directory is watched. It leaves
+        // `ctime` out, since a rename bumps it on the old inode before the name
+        // moves.
         let mask = AddWatchFlags::IN_CLOSE_WRITE
             | AddWatchFlags::IN_CREATE
             | AddWatchFlags::IN_MOVED_TO
             | AddWatchFlags::IN_ATTRIB;
 
+        let wanted = paths
+            .iter()
+            .filter_map(|p| p.parent())
+            .collect::<HashSet<_>>()
+            .len();
+        let mut watched = 0;
         for dir in watch_targets(paths, false) {
-            if let Err(e) = inotify.add_watch(&dir, mask) {
-                tracing::warn!(dir = %dir.display(), error = %e, "inotify_add_watch failed");
+            match inotify.add_watch(&dir, mask) {
+                Ok(_) => watched += 1,
+                Err(e) => {
+                    tracing::warn!(dir = %dir.display(), error = %e, "inotify_add_watch failed");
+                }
             }
         }
 
-        Ok(ConfigWatcher { inotify })
+        Ok(ConfigWatcher {
+            inotify,
+            names_files: watched == wanted,
+        })
+    }
+
+    /// True while an event names every change to the files, including a
+    /// `chmod`: every directory is watched and no watch has been dropped.
+    pub fn names_files(&self) -> bool {
+        self.names_files
     }
 
     pub fn raw_fd(&self) -> Option<RawFd> {
@@ -130,6 +154,7 @@ impl ConfigWatcher {
     /// Drain pending events, returning for each of `filenames` whether an
     /// event named it.
     pub fn read_matched(&mut self, filenames: &[&str]) -> Vec<bool> {
+        use nix::sys::inotify::AddWatchFlags;
         let mut matched = vec![false; filenames.len()];
         // One `read` per call, so loop until the queue is empty. An empty
         // non-blocking queue is `EAGAIN`, which is the normal way out rather
@@ -139,6 +164,11 @@ impl ConfigWatcher {
                 Ok(events) if events.is_empty() => break,
                 Ok(events) => {
                     for ev in events {
+                        // The kernel sends this when it drops a watch, for
+                        // instance when the watched directory is removed.
+                        if ev.mask.contains(AddWatchFlags::IN_IGNORED) {
+                            self.names_files = false;
+                        }
                         if let Some(name) = ev.name.as_ref().and_then(|n| n.to_str()) {
                             for (i, f) in filenames.iter().enumerate() {
                                 if *f == name {
@@ -241,6 +271,12 @@ impl ConfigWatcher {
         Some(self.kq.as_fd().as_raw_fd())
     }
 
+    /// kqueue reports which descriptor changed, never which file, so no event
+    /// names a `chmod`.
+    pub fn names_files(&self) -> bool {
+        false
+    }
+
     /// Drain pending events. Returns true if there were any.
     ///
     /// The `filenames` argument is ignored on this platform: kqueue reports
@@ -316,6 +352,10 @@ impl ConfigWatcher {
 
     pub fn raw_fd(&self) -> Option<RawFd> {
         None
+    }
+
+    pub fn names_files(&self) -> bool {
+        false
     }
 
     pub fn read_events(&mut self, _filenames: &[&str]) -> bool {
@@ -461,11 +501,6 @@ pub struct ConfigReloader {
     /// that was, because its event has not been read yet.
     owed_site: Option<Instant>,
     owed_process: Option<Instant>,
-    /// True when an inotify event names every metadata change of the files,
-    /// so `ctime` is not needed in the comparison. kqueue names no file and a
-    /// reloader with no watcher sees no events, so there `ctime` is the only
-    /// sign of a `chmod`.
-    events_name_files: bool,
     /// When the pending change is to be reported.
     due: Option<Instant>,
     /// When the last report was made. A change within [`RELOAD_DEBOUNCE`] of
@@ -499,7 +534,6 @@ impl ConfigReloader {
         seen: Seen,
     ) -> ConfigReloader {
         ConfigReloader {
-            events_name_files: cfg!(target_os = "linux") && watcher.is_some(),
             watcher,
             site_toml: site_toml.to_path_buf(),
             process: process.to_path_buf(),
@@ -609,9 +643,19 @@ impl ConfigReloader {
         }
     }
 
+    /// True while the watcher's events name every change to the files.
+    fn watch_names_files(&self) -> bool {
+        self.watcher
+            .as_ref()
+            .is_some_and(ConfigWatcher::names_files)
+    }
+
     /// Whether `new` is a different file state from `seen`.
+    ///
+    /// `ctime` counts only where no event would name a `chmod`: kqueue, a
+    /// reloader with no watcher, and an inotify watch that is missing or lost.
     fn moved(&self, new: Option<Fingerprint>, seen: Option<Fingerprint>) -> bool {
-        if self.events_name_files {
+        if self.watch_names_files() {
             new.map(Fingerprint::without_ctime) != seen.map(Fingerprint::without_ctime)
         } else {
             new != seen
@@ -1017,17 +1061,29 @@ mod tests {
         assert!(r.due.is_none(), "a second report is waiting to be made");
     }
 
+    /// Record that the process config's `ctime` was one tick earlier than it is
+    /// now, as it is when a `chmod` follows a write. Done by hand so the test
+    /// does not depend on the clock the kernel stamps `ctime` from.
+    fn record_an_earlier_ctime(r: &mut ConfigReloader) {
+        let mut fp = r.seen.process.expect("the config was fingerprinted");
+        fp.ctime_ns -= 1;
+        r.seen.process = Some(fp);
+    }
+
+    /// The reloader's poll at `now`, which must find a change if there is one.
+    fn poll_at(r: &mut ConfigReloader, now: Instant) -> Option<Changed> {
+        r.next_poll_for_test(now);
+        r.tick(now)
+    }
+
     /// With no event to name a `chmod`, `ctime` is the only sign of it, so a
     /// poll must report it. kqueue and a reloader with no watcher are this case.
     #[test]
-    fn a_chmod_is_reported_when_no_event_names_the_file() {
-        use std::os::unix::fs::PermissionsExt as _;
+    fn a_changed_ctime_is_reported_when_no_event_names_the_file() {
         let (_d, site, proc, seen) = pair();
         let mut r = ConfigReloader::polling_only(&site, &proc, seen);
-        std::fs::set_permissions(&proc, std::fs::Permissions::from_mode(0o600)).expect("chmod");
-        let now = Instant::now();
-        r.next_poll_for_test(now);
-        let c = r.tick(now).expect("a chmod was not reported");
+        record_an_earlier_ctime(&mut r);
+        let c = poll_at(&mut r, Instant::now()).expect("a changed ctime was not reported");
         assert!(c.process && !c.site, "{c:?}");
     }
 
@@ -1037,13 +1093,68 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_poll_ignores_a_ctime_only_change_where_inotify_names_the_file() {
-        use std::os::unix::fs::PermissionsExt as _;
         let (_d, site, proc, seen) = pair();
         let mut r = ConfigReloader::new(&site, &proc, seen);
-        std::fs::set_permissions(&proc, std::fs::Permissions::from_mode(0o600)).expect("chmod");
-        let now = Instant::now();
-        r.next_poll_for_test(now);
-        assert!(r.tick(now).is_none(), "a ctime-only change was reported");
+        assert!(r.watch_names_files());
+        record_an_earlier_ctime(&mut r);
+        assert!(
+            poll_at(&mut r, Instant::now()).is_none(),
+            "a ctime-only change was reported"
+        );
+    }
+
+    /// A watch that could not be added names nothing, so `ctime` must count.
+    /// Here one of the two files is in a directory that does not exist, the
+    /// case `watch_targets` skips with a warning.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_changed_ctime_is_reported_when_a_watch_could_not_be_added() {
+        let (d, site, proc, seen) = pair();
+        let missing = d.path().join("missing").join("site.toml");
+        let w = ConfigWatcher::new(&[proc.as_path(), missing.as_path()]).expect("watcher");
+        assert!(!w.names_files(), "a directory was not watched");
+        let mut r = ConfigReloader::with_watcher(Some(w), &site, &proc, seen);
+        record_an_earlier_ctime(&mut r);
+        assert!(
+            poll_at(&mut r, Instant::now()).is_some(),
+            "a changed ctime was not reported"
+        );
+    }
+
+    /// A watch the kernel drops, here by removing and recreating the watched
+    /// directory as a deploy that swaps a directory does, names nothing from
+    /// then on, so `ctime` must count again.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_changed_ctime_is_reported_after_the_watch_is_lost() {
+        let d = tempfile::tempdir().expect("tempdir");
+        let dir = d.path().join("config");
+        let (site, proc) = (dir.join("site.toml"), dir.join("app.conf"));
+        let make = || {
+            std::fs::create_dir(&dir).expect("mkdir");
+            put(&site, "a = 1\n");
+            put(&proc, "b = 1\n");
+        };
+        make();
+        let mut r = ConfigReloader::new(&site, &proc, Seen::read(&site, &proc));
+        std::fs::remove_dir_all(&dir).expect("rmdir");
+        make();
+        let fd = r.raw_fd().unwrap();
+        assert!(crate::server::poll_listener_and_watcher(fd, None, 5_000).listener);
+        r.on_readable(Instant::now());
+        assert!(!r.watch_names_files(), "the lost watch was not noticed");
+        // The recreated files are a change in their own right. Take that report,
+        // then judge the ctime alone, outside the settle window.
+        assert!(
+            r.tick(Instant::now()).is_some(),
+            "the swap was not reported"
+        );
+        record_an_earlier_ctime(&mut r);
+        let later = Instant::now() + RELOAD_POLL * 2;
+        assert!(
+            poll_at(&mut r, later).is_some(),
+            "a changed ctime was not reported"
+        );
     }
 
     /// The loop's `tick` finds a rename by fingerprint in the same iteration
