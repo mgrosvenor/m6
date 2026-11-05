@@ -160,6 +160,10 @@ A config that disagrees with `site.toml` about compression now makes `--dump-con
 
 **The m6-auth-server reference follows the documentation ruleset, and its `next` check, browser logout, key rotation and `--dump-config` descriptions now match the service (#140).**
 
+**A request takes the framework read lock once and releases it before the handler runs or the template renders, so a hot reload no longer queues requests behind a render (#183).**
+The lock used to be taken twice and held through the handler and the render. std's `RwLock` stops granting new readers once a writer is waiting, so a reload made every new request wait for the longest render in flight, and the reload itself dropped the old renderer while holding the write lock. Now the lock covers only copying out the shared state, routing and building the dictionary, and the renderer is an `Arc` the request carries out with it.
+A test blocks a request inside the renderer, swaps in a state with another renderer, and asserts the swap completes while the request is blocked and that the request is answered by the renderer it started with. It fails on the old locking and passes on the new.
+
 ### Verified
 
 - Unit tests with stub resolvers cover a confirmed name, a PTR whose forward lookup returns other addresses, a name with no forward answer, a failed forward lookup, no PTR, a name with no address (EAI_NONAME and EAI_NODATA), a slot free by the time the caller has the result, the per-poll lookup cap, expiry and cache bound, a report that reads stored results and resolves nothing, a resolver that never answers, and the thread bound (eight blocked lookups, then fifty more that return at once and start no thread, then slots free again).
