@@ -188,6 +188,9 @@ They fail if a public route runs auth code with or without a token or from the c
 **Tests now cover backend pool failover and rejoin after backoff (#297).**
 They fail if a failed member is picked again before its backoff ends or is never picked again after it.
 
+**Tests now cover custom error pages from a socket backend (#298).**
+They fail if a backend 404 or 500 loses the fetched page or its status, if a failed page fetch is retried, or if the error path fetches itself.
+
 ### Verified
 
 - Unit tests with stub resolvers cover a confirmed name, a PTR whose forward lookup returns other addresses, a name with no forward answer, a failed forward lookup, no PTR, a name with no address (EAI_NONAME and EAI_NODATA), a slot free by the time the caller has the result, the per-poll lookup cap, expiry and cache bound, a report that reads stored results and resolves nothing, a resolver that never answers, and the thread bound (eight blocked lookups, then fifty more that return at once and start no thread, then slots free again).
