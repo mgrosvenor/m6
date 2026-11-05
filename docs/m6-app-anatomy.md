@@ -166,7 +166,7 @@ Table 4 is the reserved set, and a key in it never reaches a template.
 | `[params_cache]` | core | `size`, default 256 entries |
 | `[server]` | core | `read_timeout_s`, default 30, `0` disables. `socket_mode`, an octal string as systemd writes it, default `"0660"` |
 | `[compression]` | core | brotli and gzip levels per MIME type |
-| `[minification]` | core | on or off per MIME type, plus `inline_js` |
+| `[minification]` | core | on or off per MIME type, plus `inline_js`. A build without the `minify` feature refuses a config that turns it on |
 | `[log]` | core | `level`, default `info`. `format`, default `json` |
 | `[[route]]` | core | the configuration route table, §5 |
 | `global_params` | core | JSON files merged into every request dictionary |
@@ -291,10 +291,10 @@ A handler is `Fn(&Request) -> Result<Response>`.
 `Response::render(template, req)` renders, and `json`, `text`, `html`, `status`, `redirect`, `not_found`, `forbidden` and `bad_request` cover the rest, with `body`, `header`, `cookie` and `verbatim` as builders over any of them.
 `m6-core-reference.md` §5, "request and response", has the full set.
 
-A service that renders no templates says so, and then links no template engine.
+A service that renders no templates says so, and takes core with `default-features = false`, so that built on its own (`cargo build -p`, `cargo install`) it links no template engine.
 
 ```rust
-use m6_core::render::NoTemplates;   // at the crate root too, and not in the prelude
+use m6_core::prelude::*;
 
 App::new().renderer(NoTemplates).route_get("/healthz", |_| Ok(Response::text("ok")))
 ```
