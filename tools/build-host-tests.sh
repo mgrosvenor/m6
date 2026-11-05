@@ -105,6 +105,30 @@ BUILD_ROOT="${M6_BUILD_ROOT:-m6-build}"
 LOG=/tmp/m6-build-host-tests.log
 EXAMPLES_LOG=/tmp/m6-build-host-examples.log
 
+# Copy tools/perf-history.jsonl back from the build host, so the record perfcheck
+# appended there becomes part of the next commit. The sync sends the checkout's
+# history to the host, so the host's file is the checkout's file plus this run's
+# record and replaces it whole. The new file is written beside the old one and
+# renamed only if the local file is a byte prefix of it: perfcheck only appends,
+# so anything else means the local history changed during the run (a pull, a
+# branch switch) and replacing it would drop records. A failure never leaves a
+# partial history behind.
+copy_back() {
+    local src="$1"
+    local dst="$2"
+    local tmp
+    tmp="$(mktemp "$dst.XXXXXX")" || { echo "cannot make a temp file beside $dst" >&2; return 1; }
+    # shellcheck disable=SC2086
+    if rsync -az -e "ssh $SSH_OPTS" "$src" "$tmp" && [[ -s "$tmp" ]] \
+        && { [[ ! -s "$dst" ]] || cmp -s "$dst" <(head -c "$(( $(wc -c < "$dst") ))" "$tmp"); }; then
+        mv "$tmp" "$dst"
+    else
+        rm -f "$tmp"
+        echo "cannot copy $src back to $dst: the fetch failed, or the history here is not a prefix of the host's (it changed during the run)" >&2
+        return 1
+    fi
+}
+
 # ── Where the examples are ───────────────────────────────────────────────────
 #
 # The renderer crates reach m6 by relative path (`../../../../m6/m6-core`), which
@@ -129,9 +153,11 @@ fi
 
 # ── The git guard ────────────────────────────────────────────────────────────
 if [[ -z "${M6_ALLOW_DIRTY:-}" ]]; then
-    [[ -z "$(git -C "$ROOT" status --porcelain)" ]] || {
+    # The history file is exempt: the host's copy is regenerated from the checkout
+    # on every sync, so the gate can be rerun before the new record is committed.
+    [[ -z "$(git -C "$ROOT" status --porcelain -- . ':!tools/perf-history.jsonl')" ]] || {
         echo "${RED}ERROR:${RESET} $ROOT has uncommitted changes." >&2
-        git -C "$ROOT" status --short | head -10 >&2
+        git -C "$ROOT" status --short -- . ':!tools/perf-history.jsonl' | head -10 >&2
         echo "  The build host is assumed not to be backed up. Commit first, or" >&2
         echo "  set M6_ALLOW_DIRTY=1." >&2
         exit 1; }
@@ -183,11 +209,13 @@ fi
 info "m6: release build, warnings, clippy, cargo-deny, tests, conformance"
 # shellcheck disable=SC2086
 # PERF_COMMIT is read here, from the checkout being synced, because the remote
-# tree has no `.git`. PERF_DIRTY is 0 by construction: the clean-tree guard above
-# refuses to sync a dirty tree at all.
+# tree has no `.git`. PERF_DIRTY is 1 when the checkout differs from that commit
+# (possible only under M6_ALLOW_DIRTY), not counting the history file itself.
 PERF_COMMIT="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+PERF_DIRTY=0
+[[ -z "$(git -C "$ROOT" status --porcelain -- . ':!tools/perf-history.jsonl' 2>/dev/null)" ]] || PERF_DIRTY=1
 ssh $SSH_OPTS "$BUILD_HOST" \
-    "M6_DIR=$BUILD_ROOT/m6 M6_PERF_COMMIT=$PERF_COMMIT M6_PERF_DIRTY=0 bash -s" \
+    "M6_DIR=$BUILD_ROOT/m6 M6_PERF_COMMIT=$PERF_COMMIT M6_PERF_DIRTY=$PERF_DIRTY bash -s" \
     > "$LOG" 2>&1 <<'REMOTE' || true
 set -uo pipefail
 # `/root/.local/bin` is where `uv` installs, and h1spec is delivered through
@@ -269,6 +297,20 @@ echo "### performance"
 echo "PERF_STATUS=$?"
 grep -E 'render:|PASS|FAIL' /tmp/perf.out | tail -6
 REMOTE
+
+# ── Bring the history back ───────────────────────────────────────────────────
+#
+# perfcheck appended one record to tools/perf-history.jsonl on the build host,
+# the only place it runs. Bring it back now, pass or fail, because a run that
+# failed is the one a later reader most wants the conditions for. Bookkeeping
+# never blocks the check: a failure is reported and fails the run at the end, but
+# the examples still run.
+COPY_BACK_FAILED=0
+if copy_back "$BUILD_HOST:$BUILD_ROOT/m6/tools/perf-history.jsonl" "$ROOT/tools/perf-history.jsonl"; then
+    info "commit tools/perf-history.jsonl to keep this run's record"
+else
+    COPY_BACK_FAILED=1
+fi
 
 # ── The examples ─────────────────────────────────────────────────────────────
 #
@@ -483,7 +525,7 @@ REMOTE_EG
 fi
 
 # ── Report ───────────────────────────────────────────────────────────────────
-FAILED=0
+FAILED=$COPY_BACK_FAILED
 rw=$(num_after RELEASE_WARNINGS "$LOG");  rw="${rw:-?}"
 tw=$(num_after TESTBUILD_WARNINGS "$LOG"); tw="${tw:-?}"
 cl=$(num_after CLIPPY_STATUS "$LOG");      cl="${cl:-?}"
