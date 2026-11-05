@@ -17,6 +17,15 @@ The released versions, newest first:
 - [1.14.0, 2026-10-27](#1140-2026-10-27)
 - [1.13.0, 2026-10-02](#1130-2026-10-02)
 - [1.12.1, 2026-10-02](#1121-2026-10-02)
+- [1.12.0, 2026-09-27](#1120-2026-09-27)
+- [1.11.3, 2026-09-26](#1113-2026-09-26)
+- [1.11.2, 2026-09-26](#1112-2026-09-26)
+- [1.11.1, 2026-09-25](#1111-2026-09-25)
+- [1.11.0, 2026-09-25](#1110-2026-09-25)
+- [1.10.0, 2026-09-19](#1100-2026-09-19)
+- [1.9.0, 2026-09-18](#190-2026-09-18)
+- [1.8.1, 2026-09-18](#181-2026-09-18)
+- [1.8.0, 2026-09-17](#180-2026-09-17)
 
 ---
 
@@ -923,23 +932,21 @@ The full checks still want a remote Linux host, which is #207, and is why a cont
 
 ---
 
-## 1.12.0 — 2026-09-27
+## 1.12.0, 2026-09-27
 
-**m6 had no release profile, and now it has one.** Every release before this took
-cargo's defaults. That is a genuine optimised build, opt-level 3 with debug assertions
-off, and it left LTO off, codegen-units at 16, symbols unstripped and **overflow checks
-disabled**.
+**m6 gained a release profile.**
+Every release before this one used cargo's defaults.
+That default is a real optimised build, opt-level 3 with debug assertions off, and it left *LTO* (link-time optimisation) off, `codegen-units` at 16, symbols unstripped and overflow checks disabled.
 
-Turning them on made the binaries smaller and the hot paths faster at the same time.
+Turning overflow checks and LTO on made the binaries smaller and the hot paths faster at the same time.
 
 ### Changed
 
-**`[profile.release]` in `Cargo.toml`:** `lto = "fat"`, `codegen-units = 1`,
-`strip = "symbols"`, `panic = "abort"`, and `overflow-checks = true`.
+**`[profile.release]` in `Cargo.toml` now sets `lto = "fat"`, `codegen-units = 1`, `strip = "symbols"`, `panic = "abort"` and `overflow-checks = true`.**
 
-`cargo install --git` uses the installed crate's own profile, so a deployment cannot
-supply this from outside. That is why it went unnoticed: a deployment repository had the
-full profile for its own binaries while every m6 binary it installed had none.
+`cargo install --git` uses the installed crate's own profile, so a deployment cannot supply these settings from outside.
+That is why the missing profile went unnoticed.
+A deployment repository carried the full profile for its own binaries, and every m6 binary it installed carried none.
 
 | binary | before | after |
 |---|---|---|
@@ -950,447 +957,378 @@ full profile for its own binaries while every m6 binary it installed had none.
 | m6-html | 30.00 MB | 23.16 MB, -22.8% |
 | m6-auth-server | 33.46 MB | 25.94 MB, -22.5% |
 
-Binary size is a latency property here. A node runs five m6 services at once, and 30 MB
-of text per service is resident memory and instruction cache the request path competes
-with. m6-http, which is in every request path, lost 36.5%.
+**Table 1: release binary sizes before and after the release profile.** Take from it that every service shrank, and m6-http shrank the most.
+
+Binary size is a latency property here.
+A node runs five m6 services at once, and 30 MB of text per service is resident memory and instruction cache the request path competes with.
+m6-http, which is in every request path, lost 36.5%.
 
 | recorded path | before | after |
 |---|---|---|
 | `render:minimal` | 201827 ns | **174101 ns, -13.7%** |
 | `render:blog-index` | 1784823 ns | **1454253 ns, -18.5%** |
 
-Both figures are medians over six runs on a quiet 2-core Linux build host, and both
-recorded minimums in `tools/perf-baseline.txt` moved down with the argument beside them.
+**Table 2: the two recorded paths, before and after the profile.** Take from it that the profile shortened both.
+Both figures are medians over six runs on a quiet 2-core Linux build host, and both recorded minimums in `tools/perf-baseline.txt` moved down with the argument beside them.
 
-**Overflow checks are on in release**, at a few percent that the LTO gain more than
-covers. `CHANGELOG.md`'s F-005 entry is the reason: an external report described the
-HTTP/2 flow-control arithmetic as "wraps and stalls", and its proof of concept panicked
-instead, because an unchecked `+=` on an `i32` is checked in a debug build and not in a
-release one. Every integer a peer can influence in this workspace sits in a hand-written
-protocol parser: window sizes, frame lengths, header list sizes, stream identifiers. A
-wrap there is a security defect that presents as a stall. An abort is one visible
-connection failure.
+**Overflow checks are on in release**, at a few percent that the LTO gain more than covers.
+The F-005 entry in this file is the reason.
+An external report described the HTTP/2 flow-control arithmetic as "wraps and stalls", and its proof of concept panicked instead, because an unchecked `+=` on an `i32` is checked in a debug build and unchecked in a release build.
+Every integer a peer can influence in this workspace sits in a hand-written protocol parser: window sizes, frame lengths, header list sizes, stream identifiers.
+A wrap there is a security defect that presents as a stall.
+An abort is one visible connection failure.
 
 ### Fixed
 
-**`check.sh` said "All checks passed." for a run that tested neither HTTP/2 nor
-HTTP/3.** `tools/conformance.sh` prints "INCOMPLETE, NOT TESTED" and "do not read it as a
-pass", then exits 0, because with `--allow-missing-tools` nothing regressed: it never
-ran. `check.sh` tested only the exit code. Its own comment claimed the summary "refuses
-to say pass", which it did not. The run now ends on "Checks INCOMPLETE: conformance did
-not run in full. This run is not a gate."
+**`check.sh` said "All checks passed." for a run that tested neither HTTP/2 nor HTTP/3.**
+`tools/conformance.sh` prints "INCOMPLETE, NOT TESTED" and "do not read it as a pass", then exits 0, because with `--allow-missing-tools` nothing regressed: it never ran.
+`check.sh` tested only the exit code.
+Its own comment claimed the summary "refuses to say pass", which it did not.
+The run now ends on "Checks INCOMPLETE: conformance did not run in full. This run is not a gate."
 
-**The benchmark comparison aged silently.** `target/criterion` is untracked and
-`cargo clean` erases it. One baseline was found six months old while `check.sh`'s header
-told a reader to investigate any change over 30%, and a documentation-only change printed
-+562% against it. The baseline's age is printed on every run, and past 14 days the
-comparison is dropped.
+**The benchmark comparison aged silently.**
+`target/criterion` is untracked and `cargo clean` erases it.
+One baseline was six months old while `check.sh`'s header told a reader to investigate any change over 30%, and a documentation-only change printed +562% against it.
+The baseline's age is printed on every run, and past 14 days the comparison is dropped.
 
-**`tools/perfcheck.sh` took the minimum while its own header said median.** That
-paragraph had claimed "WHY MEDIAN OF SEVERAL ROUNDS" since it was written. The minimum is
-the best reading a machine ever managed and no request costs that. It takes the median
-now, `--runs N` sets the round count, and every reading is kept.
+**`tools/perfcheck.sh` took the minimum while its own header said median.**
+That paragraph had claimed "WHY MEDIAN OF SEVERAL ROUNDS" since it was written.
+The minimum is the best reading a machine ever managed, and no request costs that.
+It takes the median now, `--runs N` sets the round count, and every reading is kept.
 
-**`tools/build-host-tests.sh` reported the wrong disk.** Its debug-cache check looked at a
-hardcoded path, so a run with `M6_BUILD_ROOT` set elsewhere reported "0 tree(s)" while
-gigabytes sat in the tree it had just built, and its arithmetic summed `du -sh` strings
-like "9.9G" and then discarded the total.
+**`tools/build-host-tests.sh` reported the wrong disk.**
+Its debug-cache check looked at a hardcoded path, so a run with `M6_BUILD_ROOT` set elsewhere reported "0 tree(s)" while gigabytes sat in the tree it had just built.
+Its arithmetic summed `du -sh` strings like "9.9G" and then discarded the total.
 
 ### Added
 
-**`tools/perf-history.jsonl`**, one JSON record per performance run, in git: the commit,
-the toolchain, the CPU model, physical core count, OS, architecture, total memory, the
-load average before **and** after, and per target the median, every raw reading, the
-minimum, the maximum and the spread. A number without the conditions it was taken under
-cannot be compared with anything later. One record showed a 40.9% spread on an idle
-machine, which is why a single reading settles nothing.
+**`tools/perf-history.jsonl`**, one JSON record per performance run, in git.
+A record holds the commit, the toolchain, the CPU model, physical core count, OS, architecture, total memory, the load average before and after, and per target the median, every raw reading, the minimum, the maximum and the spread.
+A number without the conditions it was taken under cannot be compared with anything later.
+One record showed a 40.9% spread on an idle machine, which is why a single reading settles nothing.
 
-It carries no hostname, address or domain.
+The file carries no hostname, address or domain.
 
-**`docs/m6-testing.md`**, rewritten: what checks m6, the commands, the shared test
-harness, and the h2spec and h3spec procedure with its five traps. Four of those traps
-report a conformance failure that is not there, and two of them were not written down
-anywhere before.
+**`docs/m6-testing.md`**, rewritten: what checks m6, the commands, the shared test harness, and the h2spec and h3spec procedure with its five traps.
+Four of those traps report a conformance failure that is not there, and two of them were not written down anywhere before.
 
-**A documentation ruleset, R0 to R10**, stated in `CLAUDE.md` so a contributor who cannot
-read a private skill still has it. `docs/m6-site-layout.md` and `docs/m6-file.md` are
-written to it, the latter having been missing entirely.
+**A documentation ruleset, R0 to R10**, stated in `CLAUDE.md` so a contributor who cannot read a private skill still has it.
+`docs/m6-site-layout.md` and `docs/m6-file.md` are written to it, the latter having been missing entirely.
 
-### Verified
+### 1. Verified
 
-`tools/build-host-tests.sh` on a Linux build host, with the profile in place: 1146 tests
-passed and 0 failed, zero warnings in release and test builds, clippy silent, cargo-deny
-clean, h1spec 32/32 on all four targets, h2spec 146/146, h3spec 47/49, TLS resumption
-green on all three protocols, performance within margin, the examples 58 passed with
-every config parsing, and example 05's end-to-end suite 98 passed over the running stack.
+`tools/build-host-tests.sh` on a Linux build host, with the profile in place.
+1146 tests passed and 0 failed, zero warnings in release and test builds, clippy silent, cargo-deny clean, h1spec 32/32 on all four targets, h2spec 146/146, h3spec 47/49, TLS resumption green on all three protocols, performance within margin, the examples 58 passed with every config parsing, and example 05's end-to-end suite 98 passed over the running stack.
 
 ---
 
-## 1.11.3 — 2026-09-26
+## 1.11.3, 2026-09-26
 
-**m6 is a generic web hosting engine, and this release is what makes the repository
-say so.** Rule Zero, now the first thing in `CLAUDE.md`, above the branch model: m6
-must not in any way be tied to one particular site.
+**m6 is a generic web hosting engine, and this release is what makes the repository say so.**
+Rule Zero now sits first in `CLAUDE.md`, above the branch model.
+m6 must not in any way be tied to one particular site.
 
-This repository is public. One instance of m6 is its author's own site, in a separate
-private repository, and that instance is a user of this software and nothing more.
+This repository is public.
+One instance of m6 is its author's own site, in a separate private repository, and that instance is a user of this software and nothing more.
 
 ### Removed
 
-**Four working documents that belonged to one deployment, not to m6.** `HANDOVER.md`
-and `docs/CONSOLIDATION-TODO.md` stated which of that deployment's machines ran which
-version at which artefact md5, the order they were deployed in, and what was deployed
-as against merely released. Two session-record files went with them, one carrying a
-server's public IP address in older revisions. They are preserved in full, outside
-this repository, by the deployment that owns them.
+**Four working documents that belonged to one deployment.**
+`HANDOVER.md` and `docs/CONSOLIDATION-TODO.md` stated which of that deployment's machines ran which version at which artefact md5, the order they were deployed in, and what was deployed as against merely released.
+Two session-record files went with them, one carrying a server's public IP address in older revisions.
+They are preserved in full, outside this repository, by the deployment that owns them.
 
-**`m6-core/tests/generic_system.rs`, and the reason is the interesting part.** That
-test existed to keep one deployment's identity out of this repository, and it could
-not do the job: a banned list has to spell what it bans, so the file published two
-domains and a private repository's name, split into string fragments purely so the
-test would not match its own source. That hides them from a grep, not from a reader.
-It also only ever read files, so it had nothing to say about the issue tracker, where
-the same material had accumulated while the test passed on every run.
+**`m6-core/tests/generic_system.rs`, and the reason is the interesting part.**
+That test existed to keep one deployment's identity out of this repository, and it could not do the job.
+A banned list has to spell what it bans, so the file published two domains and a private repository's name, split into string fragments purely so the test would not match its own source.
+Splitting the strings hides them from a grep.
+A reader still sees them plainly.
+It also only ever read files, so it had nothing to say about the issue tracker, where the same material had accumulated while the test passed on every run.
 
 The rule it was standing in for is care and judgement, and it is written down instead.
 
 ### Changed
 
-**Node names became role names** throughout the source, the tests and the docs:
-`origin`, `edge-a`, `edge-b`. 113 of them, in test fixtures and in provenance
-comments of the form "real output from <node>".
+**Node names became role names** throughout the source, the tests and the docs: `origin`, `edge-a`, `edge-b`.
+113 of them, in test fixtures and in provenance comments of the form "real output from <node>".
 
-**Artefact hashes and deployment state are out of the changelog, the lessons and the
-HTTP/2 plan.** A release note says what changed in a version of m6. It does not say
-whose machines are running it.
+**Artefact hashes and deployment state are out of the changelog, the lessons and the HTTP/2 plan.**
+A release note says what changed in a version of m6.
+It does not say whose machines are running it.
 
-**`SECURITY.md` takes GitHub private vulnerability reporting only.** It also linked a
-contact form, which was a link to one particular site, so it published which site the
-maintainer runs.
+**`SECURITY.md` takes GitHub private vulnerability reporting only.**
+It also linked a contact form, which was a link to one particular site, so it published which site the maintainer runs.
 
-**`CONTRIBUTING.md` describes m6 by what it is** rather than as "a small HTTP stack
-written for one site", and asks that a bug report be reproducible against something
-the reader can run. That is not a style preference: evidence measured against a
-private production instance cannot be re-run by anyone else, so it is an assertion
-rather than evidence. `m6-examples`, example 05's end-to-end suite, and h2spec or
-h3spec against a loopback instance all serve.
+**`CONTRIBUTING.md` describes m6 by what it is.**
+It no longer calls m6 "a small HTTP stack written for one site".
+It asks that a bug report be reproducible against something the reader can run.
+A measurement against a private production instance cannot be re-run by anyone else, so it is an assertion.
+`m6-examples`, example 05's end-to-end suite, and h2spec or h3spec against a loopback instance all serve as reproducible evidence.
 
 ### Fixed
 
-**The release gate checked a document that is no longer here, so it now checks the
-ones that are.** It required `HANDOVER.md` to mention the version being released.
-That file has left, and a workflow cannot read a private repository, but the rule did
-not leave with it: a release is a claim about what is now true, so the documents that
-state what is true are part of it. m6's own docs go stale in exactly the same way. A
-sweep for this release found `docs/H2-PLAN.md` leading with h3spec 37/49 thirteen days
-after it became 47/49, `CONTRIBUTING.md` describing a clippy ceiling removed on
-2026-09-13, `README.md` saying a decision "gates a 1.0 release" twelve days after 1.0
-was cut, and `CONTRIBUTING.md` telling contributors that `cargo fmt` is not run over
-this tree while CI has run `cargo fmt --all --check` since the day it was formatted.
+**The release gate checked a document that is no longer here, so it now checks the ones that are.**
+It required `HANDOVER.md` to mention the version being released.
+That file has left, and a workflow cannot read a private repository, but the rule did not leave with it.
+A release is a claim about what is now true, so the documents that state what is true are part of it.
+m6's own docs go stale in the same way.
+A sweep for this release found `docs/H2-PLAN.md` leading with h3spec 37/49 thirteen days after it became 47/49, `CONTRIBUTING.md` describing a clippy ceiling removed on 2026-09-13, `README.md` saying a decision "gates a 1.0 release" twelve days after 1.0 was cut, and `CONTRIBUTING.md` telling contributors that `cargo fmt` is not run over this tree while CI has run `cargo fmt --all --check` since the day it was formatted.
 
-Freshness is judgement, so it is a release checklist in the pull request template, at
-the moment the author knows the answer. That is all the previous check ever did: it
-never verified the document was true, only that someone opened it.
+Freshness is judgement, so it is a release checklist in the pull request template, at the moment the author knows the answer.
+That is all the previous check ever did: it never verified the document was true, only that someone opened it.
 
-A mechanical "no document names a script that does not exist" check was written for
-CI and discarded after being measured: 87 findings, roughly 80 of them legitimate,
-because m6's docs reference a deployment's scripts, the examples repository's, and
-scripts a user writes in their own project. A gate at that signal-to-noise gets muted,
-which is how the two real errors in this repository's shell survived for months.
+A mechanical "no document names a script that does not exist" check was written for CI and discarded after being measured.
+It found 87 findings, roughly 80 of them legitimate, because m6's docs reference a deployment's scripts, the examples repository's, and scripts a user writes in their own project.
+A gate at that signal-to-noise gets muted, which is how the two real errors in this repository's shell survived for months.
 
-### Verified
+### 1. Verified
 
-Build host: 1146 passed, 0 failed, 0 warnings on release and test builds, clippy ok,
-conformance h1+h2+h3 ok, performance ok. 1148 before, less the two tests in the
-deleted file. CI green on all six jobs.
+Build host: 1146 passed, 0 failed, 0 warnings on release and test builds, clippy ok, conformance h1+h2+h3 ok, performance ok.
+1148 before, less the two tests in the deleted file.
+CI green on all six jobs.
 
-Nothing in this release changes behaviour. There is nothing in it for a server to run.
+Nothing in this release changes behaviour.
+There is nothing in it for a server to run.
 
-## 1.11.2 — 2026-09-26
+---
 
-Documentation, one CI gate and two tests. **No library or binary change, so there is
-nothing in it for a node to run**, so a deployment has no reason to move to it.
-Whether to pin a release is the deployment's decision, not this repository's, and a
-documentation release is normally not worth pinning.
+## 1.11.2, 2026-09-26
 
-It is a release rather than a commit on `develop` for the reason 1.11.1 exists: `main`
-takes releases only, and `main` is what a fresh clone gets. Everything below is text a
-person reads while doing something, and the reader who most needs it is the one who has
-just cloned the repository.
+**Documentation, one CI gate and two tests.**
+No library or binary change, so there is nothing in it for a node to run, and a deployment has no reason to move to it.
+Whether to pin a release is the deployment's decision, and a documentation release is normally not worth pinning.
+
+It is a release, and not a commit on `develop`, for the reason 1.11.1 exists.
+`main` takes releases only, and `main` is what a fresh clone gets.
+Everything below is text a person reads while doing something, and the reader who most needs it is the one who has just cloned the repository.
 
 ### Fixed
 
-**Both of the pre-push hook's tag refusals told you to run a script deleted twelve days
-earlier.** `./tools/release.sh` went on 2026-09-14 with `tools/merge.sh`, when a pull
-request became the only way into `develop` and the only way from `develop` to `main`.
-The hook's own header records that deletion **ten lines above** the first refusal, and
-its `main` guidance correctly says `./tag.sh`. One short file disagreed with itself.
+**Both of the pre-push hook's tag refusals told you to run a script deleted twelve days earlier.**
+`./tools/release.sh` went on 2026-09-14 with `tools/merge.sh`, when a pull request became the only way into `develop` and the only way from `develop` to `main`.
+The hook's own header records that deletion ten lines above the first refusal, and its `main` guidance correctly says `./tag.sh`.
+One short file disagreed with itself.
 
-The logic was right throughout. What was wrong is the only part anyone reads. Nobody
-reads a hook, they read its refusal, and these two fire while somebody is cutting a
-release and is least inclined to stop and check whether the remedy exists. Following it
-gets `no such file or directory`, from the tool whose whole job is to be believed.
+The logic was right throughout.
+What was wrong is the only part anyone reads.
+Nobody reads a hook, they read its refusal, and these two fire while somebody is cutting a release and is least inclined to stop and check whether the remedy exists.
+Following it gets `no such file or directory`, from the tool whose whole job is to be believed.
 
-The second refusal was worse than merely wrong: it named `tools/release.sh` as the thing
-that sets `M6_RELEASE`, when `./tag.sh` is what sets it. It misdirected on the single
-fact it exists to convey. Both now give the real sequence, and the second says what
-`./tag.sh` checks, which is the argument for using it.
+The second refusal was worse than merely wrong.
+It named `tools/release.sh` as the thing that sets `M6_RELEASE`, when `./tag.sh` is what sets it.
+It misdirected on the single fact it exists to convey.
+Both now give the real sequence, and the second says what `./tag.sh` checks, which is the argument for using it.
 
-**The same deleted script was in two more places, and all four are read at the same
-moment.** `.github/pull_request_template.md` put it in front of the author of every pull
-request. `Cargo.toml`'s own comment, beside the version line, told you to run it after
-bumping, which is the first step of a release. That is the shape: every one of these
-sites is read while cutting a release and at no other time, so being wrong costs nothing
-until it costs something. Issue #118.
+**The same deleted script was in two more places, and all four are read at the same moment.**
+`.github/pull_request_template.md` put it in front of the author of every pull request.
+`Cargo.toml`'s own comment, beside the version line, told you to run it after bumping, which is the first step of a release.
+That is the shape: every one of these sites is read while cutting a release and at no other time, so being wrong costs nothing until it costs something.
+Issue #118.
 
-**`.githooks/pre-push` had never been checked by anything.** CI's shellcheck step found
-`*.sh`, and a git hook does not get an extension, so the one shell file in this
-repository that runs on every developer's machine was the one file excluded. It had an
-unused-variable warning sitting in it. A gate that selects its inputs by file extension
-misses exactly the files that never get one. The `find` now includes `.githooks`: 11
-scripts, clean at warning level.
+**`.githooks/pre-push` had never been checked by anything.**
+CI's shellcheck step found `*.sh`, and a git hook does not get an extension, so the one shell file in this repository that runs on every developer's machine was the one file excluded.
+It had an unused-variable warning sitting in it.
+A gate that selects its inputs by file extension misses exactly the files that never get one.
+The `find` now includes `.githooks`: 11 scripts, clean at warning level.
 
 **Four documents stated things that had stopped being true.**
 
-- `CONTRIBUTING.md` said clippy is held "at or under its recorded count". Clippy has been
-  `-D warnings` with no ceiling since 2026-09-13, and the ceiling was removed precisely
-  because a number in a file reads as an allowance.
+- `CONTRIBUTING.md` said clippy is held "at or under its recorded count".
+  Clippy has been `-D warnings` with no ceiling since 2026-09-13, and the ceiling was removed precisely because a number in a file reads as an allowance.
 - The pull request template said the same thing, to every author.
-- `README.md` closed its structural-question section with "this decision gates a 1.0
-  release", twelve days after 1.0 was cut. The question was answered by taking the
-  second option and building it out: h2spec 146/146, h3spec 47/49, both with floors CI
-  enforces.
-- `docs/H2-PLAN.md` led with h3spec **37/49** and "all 12 remaining failures inside
-  quiche". It has been 47/49 since 2026-09-13, and the two that remain are QPACK stream
-  errors that are a deliberate upstream decision rather than a defect. That is the
-  status line of the document named for any HTTP/2 or HTTP/3 work.
+- `README.md` closed its structural-question section with "this decision gates a 1.0 release", twelve days after 1.0 was cut.
+  The question was answered by taking the second option and building it out: h2spec 146/146, h3spec 47/49, both with floors CI enforces.
+- `docs/H2-PLAN.md` led with h3spec **37/49** and "all 12 remaining failures inside quiche".
+  It has been 47/49 since 2026-09-13, and the two that remain are QPACK stream errors that are a deliberate upstream decision.
+  That is the status line of the document named for any HTTP/2 or HTTP/3 work.
 
 ### Added
 
 **The hook's refusals are tested, because text a program prints is program behaviour.**
 
-- `every_script_offered_as_a_remedy_exists` walks the hook's non-comment lines and the
-  whole pull request template and fails if a path named there is not on disk. Comments
-  are exempt, deliberately, so the header can go on recording what was deleted and why.
-- `a_tag_refusal_names_tag_sh` asserts the positive. Naming no deleted script is not yet
-  naming the right one.
+- `every_script_offered_as_a_remedy_exists` walks the hook's non-comment lines and the whole pull request template and fails if a path named there is not on disk.
+  Comments are exempt, deliberately, so the header can go on recording what was deleted and why.
+- `a_tag_refusal_names_tag_sh` asserts that the refusal names `./tag.sh`.
+  Ruling out deleted scripts falls short of naming the right one.
 
 Both were watched red against the old text before being trusted, each half separately.
 
-### Verified
+### 1. Verified
 
-Build host, against the tree: **1148 passed, 0 failed**, 0 warnings on release and test
-builds, clippy ok, conformance h1+h2+h3 ok, performance ok. 1146 before, so the two new
-tests are the difference. CI on the pull request: build/tests/clippy, conformance,
-examples, MSRV, cargo-deny and shell scripts all pass.
+Build host, against the tree: **1148 passed, 0 failed**, 0 warnings on release and test builds, clippy ok, conformance h1+h2+h3 ok, performance ok.
+1146 before, so the two new tests are the difference.
+CI on the pull request: build/tests/clippy, conformance, examples, MSRV, cargo-deny and shell scripts all pass.
 
 Recorded as lesson 53.
 
-## 1.11.1 — 2026-09-25
+---
+
+## 1.11.1, 2026-09-25
 
 A documentation release, and the reason it had to be a release is the lesson.
 
 ### Fixed
 
 **A working document on `main` stated the previous release as current, for hours.**
-It named a version that had been superseded earlier the same day, in its first
-bullet, on the default branch, in the file a cold reader opens first.
+It named a version that had been superseded earlier the same day, in its first bullet, on the default branch, in the file a cold reader opens first.
 
-The correction existed on `develop` immediately and **could not reach `main`**: a
-docs-only `develop` to `main` pull request fails the "version is not already tagged"
-check, because `v1.11.0` existed. So the stale text was stuck on the default branch
-until some later release happened to carry it, which is why this release exists.
+The correction existed on `develop` immediately and could not reach `main`.
+A docs-only `develop` to `main` pull request fails the "version is not already tagged" check, because `v1.11.0` existed.
+So the stale text was stuck on the default branch until some later release happened to carry it, which is why this release exists.
 
 ### Changed
 
-**A release is now gated on the documentation, not only the changelog.** Owner's
-rule: docs being up to date is a fundamental part of a release, not a follow-up to
-one. A pull request into `main` carries a second requirement beside the changelog
-entry, and the job says both halves out loud: the release says what changed and the
-docs say what is true. `CONTRIBUTING.md` states it beside the other gates.
+**A release is now gated on the documentation, and on the changelog.**
+Owner's rule: docs being up to date is a fundamental part of a release.
+A pull request into `main` carries a second requirement beside the changelog entry, and the job says both halves out loud: the release says what changed and the docs say what is true.
+`CONTRIBUTING.md` states it beside the other gates.
 
-(1.11.2 repointed this at m6's own documents. The file it originally checked was a
-working document belonging to one deployment, and it is no longer in this
-repository.)
+1.11.2 repointed this at m6's own documents.
+The file it originally checked was a working document belonging to one deployment, and it is no longer in this repository.
 
-The check is mechanical on purpose. Nothing inside this repository can know what any
-deployment is running. What it can require is that the document is opened at the
-moment the author knows what is true. A cleverer check would be one that cannot fail
-honestly, and this repository's own trap list is mostly those.
+The check is mechanical on purpose.
+Nothing inside this repository can know what any deployment is running.
+What it can require is that the document is opened at the moment the author knows what is true.
+A cleverer check would be one that cannot fail honestly, and this repository's own trap list is mostly those.
 
-### Nothing for a node to run
+### 1. Nothing for a node to run
 
 No library or binary change, so a deployment has no reason to move to it.
 
-Verified: this release is the first thing the new gate ran against, and it passed only
-because the document it checked named the version.
+This release is the first thing the new gate ran against, and it passed only because the document it checked named the version.
 
-## 1.11.0 — 2026-09-25
+---
+
+## 1.11.0, 2026-09-25
+
+**`/perf` reports what is running, and TLS session resumption is measured and gated.**
 
 ### Changed
 
-**`/perf` reports what is running: name, version and build hash.** Issue #105.
+**`/perf` reports what is running: name, version and build hash.**
+Issue #105.
 `PerfReport`'s `version: String` becomes `build: BuildId { name, version, hash }`.
-The version is unchanged in meaning and moved inside rather than duplicated
-beside it. `serde(default)`, so a node older than this parses to an empty
-`BuildId` and the monitor reads it as unknown rather than as agreement.
+The version is unchanged in meaning and moved inside `BuildId`, and it is not duplicated beside it.
+`serde(default)`, so a node older than this parses to an empty `BuildId` and the monitor reads it as unknown, and not as agreement.
 
-Why. A version string cannot tell two builds of one tag apart. Rust is not
-byte-reproducible, so `v1.10.0` built twice gives different binaries both
-reporting `1.10.0`. On 2026-09-20 staging ran one build of `v1.10.0` and
-production another; every reading an operator had said the fleet agreed, and it
-took `md5sum` on four machines to find. Each part of the identity answers a
-different question: `name` says which binary, because a node runs several and
-"the node is on 1.10.0" has never been one fact; `version` says which release it
-claims to be; `hash` says which build it actually is.
+A version string cannot tell two builds of one tag apart.
+Rust is not byte-reproducible, so `v1.10.0` built twice gives different binaries both reporting `1.10.0`.
+On 2026-09-20 staging ran one build of `v1.10.0` and production another, and every reading an operator had said the fleet agreed, and it took `md5sum` on four machines to find.
+Each part of the identity answers a different question.
+`name` says which binary, because a node runs several and "the node is on 1.10.0" has never been one fact.
+`version` says which release it claims to be.
+`hash` says which build it actually is.
 
-`/health` is unchanged and still publishes exactly `status` and `node`. A bare
-hash was proposed there first and rejected: it is defensible on disclosure
-grounds, since a hash names one build rather than a release and cannot be turned
-back into one when the build is not reproducible and no binaries are published,
-but an opaque number on its own could be a hash of anything. An identity is a
-hash keyed to a name and a version, and those already live on `/perf`.
+`/health` is unchanged and still publishes exactly `status` and `node`.
+A bare hash was proposed there first and rejected.
+It is defensible on disclosure grounds, since a hash names one build and not a release and cannot be turned back into one when the build is not reproducible and no binaries are published.
+An opaque number on its own could be a hash of anything.
+An identity is a hash keyed to a name and a version, and those already live on `/perf`.
 
-The field is `hash` and not `md5` because the algorithm is how the value is
-produced rather than what it means, and naming the field after it would make
-changing it a wire break. It is md5 today, because that is the number the rest
-of the estate already compares.
+The field is `hash` and not `md5` because the algorithm is how the value is produced, and not what it means.
+Naming the field after the algorithm would make changing it a wire break.
+It is md5 today, because a deployment's own tooling already compares that number.
 
-**No existing tool breaks.** `serde(default)` on both sides means a new monitor
-against an old node reads "unknown", and an old monitor against a new node reads
-"unknown" too, rather than failing to parse. Nothing else consumed the field:
-the deployment's `ops.sh` takes the version from `m6-http --version` and
-`perf-report.py` never read it. The only cost of a mixed fleet is a few minutes
-of the monitor saying "unknown" for nodes it has not caught up with.
+**No existing tool breaks.**
+`serde(default)` on both sides means a new monitor against an old node reads "unknown", and an old monitor against a new node reads "unknown" too, and neither fails to parse.
+Nothing else consumed the field.
+The deployment's `ops.sh` takes the version from `m6-http --version`, and `perf-report.py` never read it.
+The only cost of a mixed fleet is a few minutes of the monitor saying "unknown" for nodes it has not caught up with.
 
-Verified: the build hash equals `md5sum` of the running executable, asserted
-against a hash taken in the test rather than a constant; the binary name comes
-from the executable and not from the library's `CARGO_PKG_NAME`, which would
-label every service `m6-core`; and a payload with the field removed still
-parses. Read once at first use and cached, because a deploy replaces the file
-while the process keeps serving the bytes it started with.
+This was verified three ways.
+The build hash equals `md5sum` of the running executable, asserted against a hash taken in the test and not against a constant.
+The binary name comes from the executable and not from the library's `CARGO_PKG_NAME`, which would label every service `m6-core`.
+A payload with the field removed still parses.
+The value is read once at first use and cached, because a deploy replaces the file while the process keeps serving the bytes it started with.
 
-**`m6-monitor` reports build drift.** Section C reads
-`m6-http 1.2.3 build 0123456789ab` per node, and a new fleet finding fires when
-the versions agree and the hashes do not, which is exactly the case a version
-comparison cannot see. Reported separately from version drift and only when
-versions match: different releases have different binaries by construction, so
-naming that as a second fault sends an operator to two places for one problem.
+**`m6-monitor` reports build drift.**
+Section C reads `m6-http 1.2.3 build 0123456789ab` per node, and a new fleet finding fires when the versions agree and the hashes do not, which is exactly the case a version comparison cannot see.
+It is reported separately from version drift and only when versions match.
+Different releases have different binaries by construction, so naming that as a second fault sends an operator to two places for one problem.
 Both new guards were watched go red against the unfixed code.
 
 ### Added
 
 **TLS session resumption is measured, and gated on h1, h2 and h3.**
-`tools/conformance.sh` gains a `resume` stage; CI runs the suite with no flags,
-so it gates every pull request, and `tools/build-host-tests.sh` and the laptop's
-pre-push hook run it too. It is the only conformance stage that needs no
-external tester, which makes it the first real protocol check a laptop run
-performs: h2spec and h3spec are not installed there and every other stage skips.
+`tools/conformance.sh` gains a `resume` stage.
+CI runs the suite with no flags, so it gates every pull request, and `tools/build-host-tests.sh` and the laptop's pre-push hook run it too.
+It is the only conformance stage that needs no external tester, which makes it the first real protocol check a laptop run performs.
+h2spec and h3spec are not installed there, and every other stage skips.
 
-Why it was needed. 1.9.0 installed a session ticketer so browser sessions could
-resume, and nothing anywhere could tell whether it worked. A monitor read 0%
-resumed on `http/2/external` across a whole fleet for a day after the 1.10.0
-deploy, which looks identical whether the ticketer is broken or
-the traffic has no returning connections. Issue #101, closed: the server resumes
-on every protocol, the counter is accurate, and the 0% was the traffic, because
-a browser opens ONE h2 connection per visit and resumption needs a return visit
-inside the ticket's lifetime.
+1.9.0 installed a session ticketer so browser sessions could resume, and nothing anywhere could tell whether it worked.
+A monitor read 0% resumed on `http/2/external` across a whole fleet for a day after the 1.10.0 deploy, which looks identical whether the ticketer is broken or the traffic has no returning connections.
+Issue #101, closed: the server resumes on every protocol, the counter is accurate, and the 0% was the traffic, because a browser opens one h2 connection per visit and resumption needs a return visit inside the ticket's lifetime.
 
-Verified against a running server: 7 of 8 h2 handshakes resumed and 7 of 8 h1,
-with the server's own `resumed` counter incrementing by exactly the number the
-client observed.
+Verified against a running server: 7 of 8 h2 handshakes resumed and 7 of 8 h1, with the server's own `resumed` counter incrementing by exactly the number the client observed.
 
 ### Fixed
 
-**`probe::tls_handshake` never collected the session ticket.** It stopped
-reading the instant `is_handshaking()` went false, and TLS 1.3 sends
-`NewSessionTicket` after Finished as application-phase data, so rustls never
-stored one and the next connection had nothing to offer. The probe therefore
-reported `RESUMPTION: none` against a fleet that resumes correctly, which reads
-as a server defect and was a defect in the measuring tool. It now does one
-bounded `read_tls` after the handshake, outside the timed region so the figure
-stays comparable with the server's own. `docs/LESSONS.md` lesson 50.
+**`probe::tls_handshake` never collected the session ticket.**
+It stopped reading the instant `is_handshaking()` went false, and TLS 1.3 sends `NewSessionTicket` after Finished as application-phase data, so rustls never stored one and the next connection had nothing to offer.
+The probe therefore reported `RESUMPTION: none` against a fleet that resumes correctly, which reads as a server defect and was a defect in the measuring tool.
+It now does one bounded `read_tls` after the handshake, outside the timed region so the figure stays comparable with the server's own.
+`docs/LESSONS.md` lesson 50.
 
 ### Changed
 
-**`m6-probe-h1` and `m6-probe-h2` report full and resumed separately**, and exit
-non-zero when a ticket was offered and never accepted. Both had always shared
-one `ClientConfig` across their N connections, so every run was one full
-handshake plus N-1 attempted resumptions reported as a single distribution,
-while the header claimed the figure was comparable to a `/perf` channel that
-separates them. `--no-resume` reproduces the old behaviour.
+**`m6-probe-h1` and `m6-probe-h2` report full and resumed separately**, and exit non-zero when a ticket was offered and never accepted.
+Both had always shared one `ClientConfig` across their N connections, so every run was one full handshake plus N-1 attempted resumptions reported as a single distribution, while the header claimed the figure was comparable to a `/perf` channel that separates them.
+`--no-resume` reproduces the old behaviour.
 
-`probe::resumption_failed` holds the gate's decision, with five unit tests: the
-failing branch cannot be produced against a server that resumes, and a gate
-whose failure path has never run is a claim.
+`probe::resumption_failed` holds the gate's decision, with five unit tests.
+The failing branch cannot be produced against a server that resumes, and a gate whose failure path has never run is a claim.
 
-## 1.10.0 — 2026-09-19
+---
+
+## 1.10.0, 2026-09-19
+
+**HTTP/2 server push and 103 Early Hints are removed, with the hint extractor.**
 
 ### Removed
 
 **HTTP/2 server push and 103 Early Hints, and with them the hint extractor.**
-Owner's decision. The reasoning is in `README.md` under "Why there is no server
-push or 103 Early Hints", and in issue #93, because the absence is a decision
-and the next person to notice it should find the argument rather than rebuild
-the feature.
+Owner's decision.
+The reasoning is in `README.md` under "Why there is no server push or 103 Early Hints", and in issue #93, because the absence is a decision and the next person to notice it should find the argument instead of rebuilding the feature.
 
-In short: push cannot see the client's cache, so it sends bytes to visitors who
-already have them, and it is gone from Chrome, Firefox and RFC 9113. A 103 fills
-the gap between a request arriving and the response being ready, and a
-cache-first server does not have one: measured on a production fleet, the origin
-answered in about 7ms and an edge hit from memory, so the 103 and the final
-response went out microseconds apart.
+In short, push cannot see the client's cache, so it sends bytes to visitors who already have them, and it is gone from Chrome, Firefox and RFC 9113.
+A 103 fills the gap between a request arriving and the response being ready, and a cache-first server does not have one.
+Measured on a production fleet, the origin answered in about 7ms and an edge hit from memory, so the 103 and the final response went out microseconds apart.
 
-The implementation compounded it. Hints were derived by scanning the response
-body for `href=` and `src=` and filtering on file extension, which cannot tell an
-`<img src>` from an `<a href>`. It preloaded images the page had marked
-`loading=lazy`, a cache node emitted every hint twice (89 `Link` headers for 45
-distinct values), and none of it could be measured because there was no way to
-turn it off.
+The implementation compounded it.
+Hints were derived by scanning the response body for `href=` and `src=` and filtering on file extension, which cannot tell an `<img src>` from an `<a href>`.
+It preloaded images the page had marked `loading=lazy`, a cache node emitted every hint twice (89 `Link` headers for 45 distinct values), and none of it could be measured because there was no way to turn it off.
 
-Gone: `hints.rs`, `CachedResponse.hints`, `H2Response.hints`, the fifth element
-of `RequestOutcome::Ready` and `FinalizedResponse`, the 103 emission on h1, h2
-and h3, the `PUSH_PROMISE` send path, and the one prefetch site that queued
-hinted assets.
+Gone: `hints.rs`, `CachedResponse.hints`, `H2Response.hints`, the fifth element of `RequestOutcome::Ready` and `FinalizedResponse`, the 103 emission on h1, h2 and h3, the `PUSH_PROMISE` send path, and the one prefetch site that queued hinted assets.
 
 Kept, deliberately:
 
-- **Refusing a client `PUSH_PROMISE`.** RFC 9113 8.4 makes it a connection error
-  whether or not this server pushes.
-- **Validating `SETTINGS_ENABLE_PUSH`.** RFC 9113 6.5.2 makes a value other than
-  0 or 1 a connection error. The value is no longer stored, because the answer to
-  "may I push?" is now no regardless of what the client permits.
-- **The prefetch queue.** Four of its five call sites are stale-refresh and route
-  warming, which have nothing to do with hints.
-- **Selective `Link` replacement** in `set_describedby_link`. m6 no longer emits
-  preload links, but a backend or an author may, and discarding someone else's
-  headers would be wrong.
+- **Refusing a client `PUSH_PROMISE`.** RFC 9113 8.4 makes it a connection error whether or not this server pushes.
+- **Validating `SETTINGS_ENABLE_PUSH`.** RFC 9113 6.5.2 makes a value other than 0 or 1 a connection error.
+  The value is no longer stored, because the answer to "may I push?" is now no regardless of what the client permits.
+- **The prefetch queue.** Four of its five call sites are stale-refresh and route warming, which have nothing to do with hints.
+- **Selective `Link` replacement** in `set_describedby_link`. m6 no longer emits preload links, but a backend or an author may, and discarding someone else's headers would be wrong.
 
-Two HTTP/2 tests that measured outbound DATA framing and the per-stream send
-window through a pushed stream were **converted rather than deleted**: both rules
-(RFC 9113 4.2 and 6.9) govern every response this server writes, so they now
-exercise an ordinary one. Two that tested only server-initiated streams were
-removed, because nothing can create one.
+Two HTTP/2 tests that measured outbound DATA framing and the per-stream send window through a pushed stream were converted, and not deleted.
+Both rules (RFC 9113 4.2 and 6.9) govern every response this server writes, so they now exercise an ordinary one.
+Two that tested only server-initiated streams were removed, because nothing can create one.
 
-## 1.9.0 — 2026-09-18
+---
 
-Early hints stop overriding the page, and TLS connections stop paying for a full
-handshake every time. Both were found by measuring a live fleet rather than by
-reading the source, and both had been true for as long as the features existed.
+## 1.9.0, 2026-09-18
+
+Early hints stop overriding the page, and TLS connections stop paying for a full handshake every time.
+Both were found by measuring a live fleet and not by reading the source, and both had been true for as long as the features existed.
 
 ### Fixed
 
-**Every TLS connection did a full handshake, because the server issued session
-tickets and then had nowhere to match them.** `make_tls_server_config` took
-rustls' defaults, and for a public server they are the wrong ones:
+**Every TLS connection did a full handshake, because the server issued session tickets and then had nowhere to match them.**
+`make_tls_server_config` took rustls' defaults, and for a public server they are the wrong ones:
 
     session_storage: ServerSessionMemoryCache::new(256)   server/builder.rs:113
     ticketer:        NeverProducesTickets                 server/builder.rs:116
 
-With no ticketer, TLS 1.3 resumption is **stateful**: the session is held
-server-side and the client gets a handle back, so every returning client needs
-its own entry still to be in a 256-entry cache. What the fleet's own monitor
-measured, in one hour:
+With no ticketer, TLS 1.3 resumption is **stateful**: the session is held server-side and the client gets a handle back, so every returning client needs its own entry still to be in a 256-entry cache.
+What the fleet's own monitor measured, in one hour:
 
 | node | channel | handshakes | resumed |
 |---|---|---:|---:|
@@ -1399,74 +1337,64 @@ measured, in one hour:
 | edge-a | http/2/external | 157 | **0%** |
 | edge-b | http/2/external | 165 | **0%** |
 
-Those look contradictory and are not. HTTP/1.1 there is a handful of clients
-polling on repeat, so their few entries stay resident. HTTP/2 is browsers: many
-distinct clients against 256 slots, evicted long before any of them returns.
-origin took 648 handshakes in that hour. The channel that resumed is the one that
-did not need to; the channel carrying visitors resumed never, and paid two extra
-round trips on every connection. A resumed handshake on that fleet ran **p50
-0.78ms against 207ms** for a full one.
+**Table 1: handshakes and resumptions per node and channel, measured over one hour.**
+Take from it that only the channel with few returning clients resumed.
 
-A `Ticketer` makes resumption stateless, so there is nothing per-client to evict
-and the cache size stops governing whether a browser resumes. `session_storage`
-is deliberately left at 256: TLS 1.3 never reads it once the ticketer exists, and
-`new(n)` allocates `HashMap::with_capacity(n)` plus `VecDeque::with_capacity(n)`
-up front, which is memory bought for a TLS 1.2 session-id path that carries
-scanners rather than visitors.
+Those figures look contradictory, and they agree.
+HTTP/1.1 there is a handful of clients polling on repeat, so their few entries stay resident.
+HTTP/2 is browsers: many distinct clients against 256 slots, evicted long before any of them returns.
+The origin took 648 handshakes in that hour.
+The channel that resumed is the one that did not need to, and the channel carrying visitors resumed never, and paid two extra round trips on every connection.
+A resumed handshake on that fleet ran **p50 0.78ms against 207ms** for a full one.
 
-**Verified with rustls on both ends** (`tests/tls_resumption.rs`), where
-`handshake_kind()` is the protocol's own answer. Not with `openssl s_client`,
-which was tried first and is useless here: macOS ships **LibreSSL 3.3.6** as
-`/usr/bin/openssl`, whose TLS 1.3 client resumption is incomplete, and it reports
-a full handshake even against a server that does resume. That was established by
-running it against a local build that resumes, not assumed.
+A `Ticketer` makes resumption stateless, so there is nothing per-client to evict and the cache size stops governing whether a browser resumes.
+`session_storage` is deliberately left at 256.
+TLS 1.3 never reads it once the ticketer exists, and `new(n)` allocates `HashMap::with_capacity(n)` plus `VecDeque::with_capacity(n)` up front, which is memory bought for a TLS 1.2 session-id path that carries scanners.
 
-**Early hints preloaded images the page had marked `loading=lazy`.** On one live
-site, 17 of 17 lazy images were preloaded anyway: the page said "do not fetch
-this until it is needed", the server said "fetch it now" in the same response,
-and the hint won because it arrived first. Lazy loading on such a page was inert.
-`extract_hints` scanned for `href=`/`src=` and never looked at the rest of the
-enclosing tag. `fetchpriority=low` is honoured too, for the same reason.
+**This was verified with rustls on both ends** (`tests/tls_resumption.rs`), where `handshake_kind()` is the protocol's own answer.
+It was not verified with `openssl s_client`, which was tried first and is useless here.
+macOS ships **LibreSSL 3.3.6** as `/usr/bin/openssl`, whose TLS 1.3 client resumption is incomplete, and it reports a full handshake even against a server that does resume.
+That was established by running it against a local build that resumes, and not assumed.
 
-A server overriding an explicit, standardised author instruction is wrong whether
-or not it is faster, so this is not gated on showing a latency win.
+**Early hints preloaded images the page had marked `loading=lazy`.**
+On one live site, 17 of 17 lazy images were preloaded anyway: the page said "do not fetch this until it is needed", the server said "fetch it now" in the same response, and the hint won because it arrived first.
+Lazy loading on such a page was inert.
+`extract_hints` scanned for `href=`/`src=` and never looked at the rest of the enclosing tag.
+`fetchpriority=low` is honoured too, for the same reason.
 
-Only the enclosing tag is examined, over a bounded window. A document-wide search
-for `loading=lazy` would drop every hint on any page that lazy-loads anything;
-there is a test for exactly that.
+A server overriding an explicit, standardised author instruction is wrong whether or not it is faster, so this is not gated on showing a latency win.
+
+Only the enclosing tag is examined, over a bounded window.
+A document-wide search for `loading=lazy` would drop every hint on any page that lazy-loads anything, and there is a test for exactly that.
 
 ### Changed
 
-**Hints are ordered by what the resource is, not by its directory name.**
-`hints.sort()` was lexicographic over the URL, so on one site
-`/assets/company-logos/` sorted ahead of `/assets/css/` and the render-blocking
-stylesheet was announced 18th, behind 17 logos. Ranking on `preload_as` needs
-nothing about a site's layout, since `as=` is the standard's own statement of a
-resource's role.
+**Hints are ordered by what the resource is, and not by its directory name.**
+`hints.sort()` was lexicographic over the URL, so on one site `/assets/company-logos/` sorted ahead of `/assets/css/` and the render-blocking stylesheet was announced 18th, behind 17 logos.
+Ranking on `preload_as` needs nothing about a site's layout, since `as=` is the standard's own statement of a resource's role.
 
-Stated honestly: browsers assign preload priority from `as=` rather than from
-header order, so this is unlikely to be worth much on its own. It is here because
-ordering by accident is not a decision anyone made.
+Stated honestly: browsers assign preload priority from `as=` and not from header order, so this is unlikely to be worth much on its own.
+It is here because ordering by accident is not a decision anyone made.
 
-### Internal
+### 1. Internal
 
 **`backends_contract` leaked a 95MB scratch directory into `/tmp` on every run.**
-Named by process id and never removed, holding the compiled C, C++ and Go
-backends plus `GOCACHE`. `/tmp` on the build host is a 3.7GB **tmpfs**, which that
-fills in roughly 39 runs, and it did: found at 82%, where it failed the merge gate
-twice without either failure naming a disk. One was a Go link dying on ENOSPC; the
-other was `render:minimal` reading 31% over its ceiling, which looks exactly like
-a real regression and is not. Stale directories are now swept by age before a new
-one is made, tested against a tempdir rather than the real `/tmp`.
+Named by process id and never removed, holding the compiled C, C++ and Go backends plus `GOCACHE`.
+`/tmp` on the build host is a 3.7GB **tmpfs**, which that fills in roughly 39 runs, and it did.
+It was found at 82%, where it failed the merge gate twice without either failure naming a disk.
+One was a Go link dying on ENOSPC, and the other was `render:minimal` reading 31% over its ceiling, which looks exactly like a real regression and is not.
+Stale directories are now swept by age before a new one is made, tested against a tempdir and not the real `/tmp`.
 
-## 1.8.1 — 2026-09-18
+---
+
+## 1.8.1, 2026-09-18
+
+**A prefetched or pushed hint is now stored under the key the request uses.**
 
 ### Fixed
 
-**A prefetched or pushed hint was stored under the unversioned cache key, so an edge
-answered `/a.css` with the immutable `/a.css?v=1` response.** Found on a live fleet
-within minutes of the 1.8.0 rollout, by the deploy's own check that an unversioned asset
-must not be immutable.
+**A prefetched or pushed hint was stored under the unversioned cache key, so an edge answered `/a.css` with the immutable `/a.css?v=1` response.**
+Found on a live fleet within minutes of the 1.8.0 rollout, by the deploy's own check that an unversioned asset must not be immutable.
 
 | asset, requested with no query | edge | origin |
 |---|---|---|
@@ -1474,138 +1402,112 @@ must not be immutable.
 | `/assets/js/nav.js` | `max-age=31536000, immutable` | `max-age=60, s-maxage=86400` |
 | `/assets/icons/logo.svg` | `max-age=31536000, immutable` | `max-age=60, s-maxage=86400` |
 
-`extract_hints` returns URLs as the page wrote them, so a hint carries the page's
-cache-busting query. Three callers passed that whole string as a **path** with **no
-query**: both prefetch queue sites and the HTTP/2 push request. Both key builders strip
-the path at `?` and read the query only from their own argument, so
-`make_lookup_key("/a.css?v=1", None, "")` is byte-identical to
-`make_lookup_key("/a.css", None, "")`. The request that went out still carried `?v=1`,
-so the backend returned the versioned, immutable response, and it was stored where an
-unversioned request finds it.
+**Table 1: what an unversioned request got at the edge and at the origin for three assets.**
+Take from it that the edge cached an immutable answer the origin never sent for that request.
 
-The stripping is deliberate and stays: it stops a stray `?` smuggling one request's
-query into another's key. What was missing is that callers must split first, which
-`hints::split_url` now does in one place for all three.
+`extract_hints` returns URLs as the page wrote them, so a hint carries the page's cache-busting query.
+Three callers passed that whole string as a **path** with **no query**: both prefetch queue sites and the HTTP/2 push request.
+Both key builders strip the path at `?` and read the query only from their own argument, so `make_lookup_key("/a.css?v=1", None, "")` is byte-identical to `make_lookup_key("/a.css", None, "")`.
+The request that went out still carried `?v=1`, so the backend returned the versioned, immutable response, and it was stored where an unversioned request finds it.
 
-**Why it appeared only now.** The prefetch loop is not new. It could not run, because
-`extract_hints` returned an empty list on every page until 1.8.0 fixed it. A latent
-defect became reachable the moment the feature it serves started working.
+The stripping is deliberate and stays.
+It stops a stray `?` smuggling one request's query into another's key.
+What was missing is that callers must split first, which `hints::split_url` now does in one place for all three.
 
-Verified by a test that pins the trap rather than describing it: the two lookup keys are
-asserted equal, so the next caller meets the requirement to split as a failing
-assumption rather than a comment.
+**Why it appeared only now.**
+The prefetch loop is not new.
+It could not run, because `extract_hints` returned an empty list on every page until 1.8.0 fixed it.
+A latent defect became reachable the moment the feature it serves started working.
 
-## 1.8.0 — 2026-09-17
+Verified by a test that pins the trap and not just describes it.
+The two lookup keys are asserted equal, so the next caller meets the requirement to split as a failing assumption, and not as a comment.
+
+---
+
+## 1.8.0, 2026-09-17
+
+**m6-http warms its own cache at startup, and this release fixes server push and the hint extractor.**
 
 ### Added
 
-**`[server] warm_on_start`: m6-http seeds its own cache at startup.** Off by default.
-When on, the server puts one entry per warmable route per encoding into its
-background-fetch queue as it starts.
+**`[server] warm_on_start`: m6-http seeds its own cache at startup.**
+Off by default.
+When on, the server puts one entry per warmable route per encoding into its background-fetch queue as it starts.
 
-This replaces a shell script. The script was copied onto every node, run there by a
-systemd unit, and found the warmable routes by running a regular expression over the
-node's own `site.toml`. The server has that file already parsed. It knows its route
-table, its error path and which routes are no-store, so it is better placed to make the
-decision than anything outside it, and moving the decision here retires a script, a unit
-and a regex TOML parser together.
+This replaces a shell script.
+The script was copied onto every node, run there by a systemd unit, and found the warmable routes by running a regular expression over the node's own `site.toml`.
+The server has that file already parsed.
+It knows its route table, its error path and which routes are no-store, so it is better placed to make the decision than anything outside it, and moving the decision here retires a script, a unit and a regex TOML parser together.
 
 Selection matches what the script did, on better evidence than a regex:
 
 - concrete paths only, because `/assets/{*relpath}` is a pattern and not a URL
-- never the configured error path. A public listener refuses that request by design, so
-  warming it would put a 404 body in the cache
-- nothing marked no-store, because the answer is not cacheable and the fetch is pure
-  cost
+- never the configured error path.
+  A public listener refuses that request by design, so warming it would put a 404 body in the cache
+- nothing marked no-store, because the answer is not cacheable and the fetch is pure cost
 
 One entry per encoding, identity plus gzip plus br, because the cache keys on encoding.
-Warming identity alone leaves a gzip visitor paying for the miss anyway. Identity is the
-empty string, which is how the cache key spells "no content-encoding".
+Warming identity alone leaves a gzip visitor paying for the miss anyway.
+Identity is the empty string, which is how the cache key spells "no content-encoding".
 
-**It queues, it does not fetch.** The queue drains one entry per event-loop iteration
-and is the same mechanism that refreshes stale entries, so warming cannot delay startup,
-cannot block serving, and cannot stampede the origin. A fleet restarting together does
-not all reach across the backbone at once.
+**It queues, and it does not fetch.**
+The queue drains one entry per event-loop iteration and is the same mechanism that refreshes stale entries, so warming cannot delay startup, cannot block serving, and cannot stampede the origin.
+A fleet restarting together does not all reach across the backbone at once.
 
-Off by default, because a server should not do network I/O at boot unless it is asked
-to. The system config wins over the site config: warming is a property of the node, and
-a cache node wants it where a laptop serving the site locally does not.
+Off by default, because a server should not do network I/O at boot unless it is asked to.
+The system config wins over the site config: warming is a property of the node, and a cache node wants it where a laptop serving the site locally does not.
 
-Verified by four tests over the decision, which is a pure function so it can be driven
-without a `ServerState`: a plain route is warmed, a pattern is not, the error page is
-not (and a site with no error page configured has nothing to exclude), and no-store is
-not, including with surrounding whitespace.
+Verified by four tests over the decision, which is a pure function so it can be driven without a `ServerState`: a plain route is warmed, a pattern is not, the error page is not (and a site with no error page configured has nothing to exclude), and no-store is not, including with surrounding whitespace.
 
 ### Fixed
 
 **HTTP/2 server push sent oversized DATA frames and ignored per-stream flow control.**
-A hinted asset between 16 KB and the connection window went out as a single DATA frame,
-which RFC 9113 4.2 requires the peer to treat as a **connection** error of type
-`FRAME_SIZE_ERROR`. One stylesheet took down the connection, for any client that had
-not disabled push.
+A hinted asset between 16 KB and the connection window went out as a single DATA frame, which RFC 9113 4.2 requires the peer to treat as a **connection** error of type `FRAME_SIZE_ERROR`.
+One stylesheet took down the connection, for any client that had not disabled push.
 
-m6 pushes early-hinted assets whenever a client has not sent
-`SETTINGS_ENABLE_PUSH=0`; 103 Early Hints is the fallback for clients that have. The
-push path wrote `PUSH_PROMISE`, `HEADERS` and the whole body directly, debiting only
-the connection window, because it never registered the pushed stream at all. So it
-obeyed neither the peer's `SETTINGS_MAX_FRAME_SIZE` nor the per-stream window that RFC
-9113 6.9 requires, and a client's `RST_STREAM` declining a push was ignored rather than
-seen.
+m6 pushes early-hinted assets whenever a client has not sent `SETTINGS_ENABLE_PUSH=0`.
+103 Early Hints is the fallback for clients that have.
+The push path wrote `PUSH_PROMISE`, `HEADERS` and the whole body directly, debiting only the connection window, because it never registered the pushed stream at all.
+So it obeyed neither the peer's `SETTINGS_MAX_FRAME_SIZE` nor the per-stream window that RFC 9113 6.9 requires, and a client's `RST_STREAM` declining a push was ignored and not seen.
 
-The promised stream is now registered in `reserved (local)` before the promise goes
-out, moves to `half-closed (remote)` when its HEADERS are sent, and its body is
-delivered by the same flow-controlled sender as every ordinary response. Framing, both
-windows and stream reaping are that one path now.
+The promised stream is now registered in `reserved (local)` before the promise goes out, moves to `half-closed (remote)` when its HEADERS are sent, and its body is delivered by the same flow-controlled sender as every ordinary response.
+Framing, both windows and stream reaping are that one path now.
 
-**Who this affected.** Chrome 106 and later disable push, so the overwhelming majority
-of real traffic takes the 103 branch and never reached this. That is also why it
-survived 146/146 HTTP/2 conformance: h2spec does not drive server push with an
-oversized body.
+**Who this affected.**
+Chrome 106 and later disable push, so the overwhelming majority of real traffic takes the 103 branch and never reached this.
+That is also why it survived 146/146 HTTP/2 conformance: h2spec does not drive server push with an oversized body.
 
-**A second defect, found by fixing the first.** Routing pushes through the reaping path
-meant `last_stream_id` could advance to an even, server-initiated id. It is the
-**peer's** high-water mark, used to tell an unopened stream (idle) from a finished one
-(closed), so a client's next legal odd stream would derive `Closed` and be answered
-`STREAM_CLOSED`. It is bumped for client-initiated streams only.
+**A second defect, found by fixing the first.**
+Routing pushes through the reaping path meant `last_stream_id` could advance to an even, server-initiated id.
+It is the **peer's** high-water mark, used to tell an unopened stream (idle) from a finished one (closed), so a client's next legal odd stream would derive `Closed` and be answered `STREAM_CLOSED`.
+It is bumped for client-initiated streams only.
 
-Verified by four tests: DATA is split to the peer's maximum frame size, the per-stream
-window bounds a push, a push does not move the peer's high-water mark, and a client may
-decline a push with `RST_STREAM`.
+Verified by four tests: DATA is split to the peer's maximum frame size, the per-stream window bounds a push, a push does not move the peer's high-water mark, and a client may decline a push with `RST_STREAM`.
 
 **Early hints, and therefore server push, did nothing at all on any site m6 minifies.**
-`hints::extract_hints` matched only quoted HTML attributes: `href="`, `src="`, `href='`
-and `src='`. m6's own minifier strips attribute quotes, so the extractor found nothing
-in the output of the server it ships with. Measured against a live homepage, fetched as
-identity so the body is the real thing: **0 quoted `href="`, 0 quoted `src="`, 182
-unquoted `href=`, 108 unquoted `src=`**.
+`hints::extract_hints` matched only quoted HTML attributes: `href="`, `src="`, `href='` and `src='`.
+m6's own minifier strips attribute quotes, so the extractor found nothing in the output of the server it ships with.
+Measured against a live homepage, fetched as identity so the body is the real thing: **0 quoted `href="`, 0 quoted `src="`, 182 unquoted `href=`, 108 unquoted `src=`**.
 
-Everything downstream was inert: no `Link: rel=preload`, no `103 Early Hints` on h2 or
-h3, no prefetch of hinted assets into the cache, and no server push, whose branch is
-guarded on the hint list being non-empty. A performance feature with tests, a config
-surface and two protocol paths, doing nothing.
+Everything downstream was inert: no `Link: rel=preload`, no `103 Early Hints` on h2 or h3, no prefetch of hinted assets into the cache, and no server push, whose branch is guarded on the hint list being non-empty.
+A performance feature with tests, a config surface and two protocol paths, doing nothing.
 
-HTML5 allows an unquoted attribute value, ending at whitespace or `>`. Both forms are
-read now, and an attribute name must be preceded by whitespace so that `data-href` and
-`xlink:href` are not mistaken for `href`.
+HTML5 allows an unquoted attribute value, ending at whitespace or `>`.
+Both forms are read now, and an attribute name must be preceded by whitespace so that `data-href` and `xlink:href` are not mistaken for `href`.
 
-**A hint now names what the page will actually request.** The URL was emitted with its
-query string removed, so a hint read `/assets/css/style.css` while the page asked for
-`/assets/css/style.css?v=ae331def`. m6 keys the cache on the full path including the
-query, so the preload warmed an entry nothing would ask for and the visitor paid the
-miss anyway. The query is ignored where it should be, which is reading the extension to
-decide the `as=` value, and kept everywhere else.
+**A hint now names what the page will actually request.**
+The URL was emitted with its query string removed, so a hint read `/assets/css/style.css` while the page asked for `/assets/css/style.css?v=ae331def`.
+m6 keys the cache on the full path including the query, so the preload warmed an entry nothing would ask for and the visitor paid the miss anyway.
+The query is ignored where it should be, which is reading the extension to decide the `as=` value, and kept everywhere else.
 
-**The existing tests could not have caught this.** Every one of them wrote its own
-fixture, and every one wrote it with quotes, so they passed against input the server
-never produces. The new test does not write its input: it runs the same `minify_html`
-production runs and asserts on what comes out, with a guard that fails if the minifier
-ever stops stripping quotes and makes the test vacuous.
+**The existing tests could not have caught this.**
+Every one of them wrote its own fixture, and every one wrote it with quotes, so they passed against input the server never produces.
+The new test does not write its input: it runs the same `minify_html` production runs and asserts on what comes out, with a guard that fails if the minifier ever stops stripping quotes and makes the test vacuous.
 
-**Two real defects in the conformance gate, found by running shellcheck for the first
-time.** The repository has 10 shell scripts, several carrying shellcheck disable
-directives, and nothing had ever run shellcheck: not CI, not
-`tools/build-host-tests.sh`. The directives were decoration, and they made the
-repository look linted. First run: 2 errors and 14 warnings.
+**Two real defects in the conformance gate, found by running shellcheck for the first time.**
+The repository has 10 shell scripts, several carrying shellcheck disable directives, and nothing had ever run shellcheck: not CI, not `tools/build-host-tests.sh`.
+The directives were decoration, and they made the repository look linted.
+First run: 2 errors and 14 warnings.
 
 Both errors were in the path that kills the harness's own child processes:
 
@@ -1613,63 +1515,47 @@ Both errors were in the path that kills the harness's own child processes:
 for p in ${PIDS[@]:-}; do kill "$p" 2>/dev/null || true; done
 ```
 
-An unquoted array expansion, so an element containing whitespace re-splits and the loop
-kills the wrong thing or nothing at all. `${PIDS[@]+"${PIDS[@]}"}` is what `:-` was
-reaching for and does not achieve under `set -u`. Seven more findings were `PIDS+=($pid)`,
-the same class one step milder.
+An unquoted array expansion, so an element containing whitespace re-splits and the loop kills the wrong thing or nothing at all.
+`${PIDS[@]+"${PIDS[@]}"}` is what `:-` was reaching for and does not achieve under `set -u`.
+Seven more findings were `PIDS+=($pid)`, the same class one step milder.
 
-`bench.sh` set `SKIP_VERIFY` in two places and read it nowhere, because `BENCH_PASS`
-already carries `--skip-verify` unconditionally. A flag that looks like it does
-something and does not, now removed.
+`bench.sh` set `SKIP_VERIFY` in two places and read it nowhere, because `BENCH_PASS` already carries `--skip-verify` unconditionally.
+A flag that looks like it does something and does not, now removed.
 
-Two SC2034s in `tools/conformance.sh` are annotated rather than deleted. `H2C_PORT` and
-`EDGE_BRIDGE_PORT` are unused as variables, but they are the only record of which ports
-the harness reserves, and deleting them would lose the note that stops something else
-picking a colliding one.
+Two SC2034s in `tools/conformance.sh` are annotated and not deleted.
+`H2C_PORT` and `EDGE_BRIDGE_PORT` are unused as variables, but they are the only record of which ports the harness reserves, and deleting them would lose the note that stops something else picking a colliding one.
 
-**Gated in CI at warning level, not style.** Style is 100+ findings of preference in
-this repository, and a gate that reports preference gets ignored, which is exactly how
-two real errors survived in a repository whose own rule is that a check which cannot
-measure must fail.
+**Gated in CI at warning level, and not style.**
+Style is 100+ findings of preference in this repository, and a gate that reports preference gets ignored, which is exactly how two real errors survived in a repository whose own rule is that a check which cannot measure must fail.
 
-Verified against the running harness rather than the source, because the conformance
-gate is what was edited: h1 32/32 four times, h2 146/146, h3 47/49, every target
-measured.
+Verified against the running harness and not the source, because the conformance gate is what was edited: h1 32/32 four times, h2 146/146, h3 47/49, every target measured.
 
 ### Changed
 
 **Every `#[allow]` in the workspace is gone, and clippy's zero is now real.**
-`tools/clippy.sh` runs `-D warnings` and reported zero. An `#[allow]` in source
-overrides a lint level given on the command line, so that zero was measured over code
-that had been told to stay quiet: 13 attributes hiding 22 findings, two of them blanket
-attributes over a whole binary crate and a whole module.
+`tools/clippy.sh` runs `-D warnings` and reported zero.
+An `#[allow]` in source overrides a lint level given on the command line, so that zero was measured over code that had been told to stay quiet: 13 attributes hiding 22 findings, two of them blanket attributes over a whole binary crate and a whole module.
 
-The push defect above is what one of them was hiding. Its stated reason, that this
-server never pushes, was false, and it explained away the symptom: the `ReservedLocal`
-state was never constructed because the push path bypassed the state machine entirely.
+The push defect above is what one of them was hiding.
+Its stated reason, that this server never pushes, was false, and it explained away the symptom: the `ReservedLocal` state was never constructed because the push path bypassed the state machine entirely.
 
-The rest were a dead subprocess test harness whose helpers returned success when the
-binary was not built, four `too_many_arguments` on functions whose six shared
-parameters became one `analytics::Event`, a `PerfReport::build` that now takes what to
-report on and who is asking, dead fields, unused imports, and one attribute that was
-simply stale.
+The rest were a dead subprocess test harness whose helpers returned success when the binary was not built, four `too_many_arguments` on functions whose six shared parameters became one `analytics::Event`, a `PerfReport::build` that now takes what to report on and who is asking, dead fields, unused imports, and one stale attribute.
 
-No public API of `m6-core` changes. `m6-http`'s internal analytics helpers take an
-`Event` rather than six positional arguments.
+No public API of `m6-core` changes.
+`m6-http`'s internal analytics helpers take an `Event` and not six positional arguments.
 
-**The build host refuses to check the examples when it cannot measure them.** The
-05-cms end-to-end suite binds 127.0.0.1:8443 and waited only for a 200 on that port. A
-staging node on the same box bound to `0.0.0.0:8443` satisfies that probe just as well,
-so the suite could measure a server nobody had changed and report its failures as the
-example's. It now refuses to start when the port is held, naming the process, and
-confirms the answering server is the example before believing 98 assertions about it.
+**The build host refuses to check the examples when it cannot measure them.**
+The 05-cms end-to-end suite binds 127.0.0.1:8443 and waited only for a 200 on that port.
+A staging node on the same box bound to `0.0.0.0:8443` satisfies that probe just as well, so the suite could measure a server nobody had changed and report its failures as the example's.
+It now refuses to start when the port is held, naming the process, and confirms the answering server is the example before believing 98 assertions about it.
 
-### Note for deployments running a warm script
+### 1. Note for deployments running a warm script
 
-Setting `warm_on_start` needs this release on the node first. A 1.7.0 binary does not
-know the key, and on m6's config rules an unknown key is a config error, so setting it
-ahead of the rollout buys a failure on every node at once. Roll 1.8.0 out, then turn it
-on, then retire the script and its timer.
+Setting `warm_on_start` needs this release on the node first.
+A 1.7.0 binary does not know the key, and on m6's config rules an unknown key is a config error, so setting it ahead of the rollout buys a failure on every node at once.
+Roll 1.8.0 out, then turn it on, then retire the script and its timer.
+
+---
 
 ## 1.7.0 — 2026-09-16
 
