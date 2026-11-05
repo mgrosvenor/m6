@@ -1529,27 +1529,18 @@ backend    = "m6-auth"
 public_key = "keys/auth.pub"
 ```
 
-The production system config `/etc/m6/my-blog.toml` holds the same two sections with the server's values:
-
-```toml
-[server]
-bind     = "0.0.0.0:443"
-tls_cert = "/etc/letsencrypt/live/example.com/fullchain.pem"
-tls_key  = "/etc/letsencrypt/live/example.com/privkey.pem"
-
-[auth]
-backend    = "m6-auth"
-public_key = "/etc/m6/auth.pub"
-```
+The production system config `/etc/m6/my-blog.toml` holds the same two sections, with the public bind `0.0.0.0:443`, the two Let's Encrypt paths under `/etc/letsencrypt/live/example.com/`, and the auth public key `/etc/m6/auth.pub`.
+Section 8.3 writes it as a heredoc.
 
 The split is one rule: `site.toml` holds the state every node shares, and the system config holds the state of one node.
-`[server]` bind and certificate paths, and `[auth]`, belong in the system config.
-A key declared in both files for `[auth]` is a startup error, exit 2.
+On a conflict, the system config's `[server]` keys win.
+Declaring `[auth]` in both files is a startup error, exit 2.
 [`m6-site-toml.md`](m6-site-toml.md) section 3 owns the full split and its merge rules.
 
 ### 8.2. Dev script
 
-`dev.sh` builds the binaries, generates the development certificate and auth keys, creates the admin user and the editors group, runs `m6-md` over `content/posts/`, then starts the stack.
+Build the renderer first with `cargo build --release -p render-cms-prod`.
+Then `dev.sh` generates the development certificate and auth keys, creates the admin user and the editors group, runs `m6-md` over `content/posts/`, and starts the pre-built stack.
 It sets `M6_SOCKET_OVERRIDE` for each backend so the sockets land in `/tmp/m6/`, where `site.toml` names them.
 It starts m6-http last with the dev system config:
 
@@ -1613,45 +1604,14 @@ systemctl start  m6-html m6-file m6-auth render-cms m6-http
 
 ### 8.4. Systemd unit, m6-http
 
-The m6-http unit differs from Example 06 only in that `ExecStart` names the production system config as its second argument.
-The renderer units are identical to Example 06 and take two positional arguments each.
-
-```ini
-[Unit]
-Description=m6-http reverse proxy and cache
-After=network.target m6-html.service m6-file.service m6-auth.service render-cms.service
-
-[Service]
-Type=simple
-User=m6
-Group=m6
-RuntimeDirectory=m6
-RuntimeDirectoryMode=0750
-
-ExecStart=/usr/local/bin/m6-http \
-    /var/www/my-blog \
-    /etc/m6/my-blog.toml
-
-Restart=on-failure
-RestartSec=2
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=m6-http
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/run/m6
-ReadOnlyPaths=/var/www/my-blog /etc/letsencrypt /etc/m6
-
-[Install]
-WantedBy=multi-user.target
-```
+The m6-http unit is the same as Example 06's in section 7.3, and the renderer units are identical to Example 06.
+Each takes two positional arguments, the site directory and its config.
 
 ### 8.5. Deploy
 
 `deploy.sh` runs from the development machine and syncs the site directory to the server.
 The `--binary` flag rebuilds render-cms, deploys the binary and restarts only that unit.
+The rsync excludes the server-managed state so `--delete` does not wipe it.
 
 ```bash
 #!/bin/bash
@@ -1663,7 +1623,9 @@ REMOTE_SITE="/var/www/my-blog"
 
 rsync -av --delete \
   --exclude 'content/drafts/' \
-  --exclude 'data/auth.db' \
+  --exclude 'content/posts/' \
+  --exclude 'data/posts.json' \
+  --exclude 'configs/data/auth.db' \
   --exclude 'keys/' \
   --exclude '*.pem' \
   --exclude '*.pub' \
@@ -1673,8 +1635,8 @@ rsync -av --delete \
 ssh "$SERVER" chown -R m6:m6 "$REMOTE_SITE"
 
 if [[ "$1" == "--binary" ]]; then
-  cargo build --release -p render-cms
-  rsync target/release/render-cms "$SERVER:$REMOTE_SITE/bin/"
+  cargo build --release -p render-cms-prod
+  rsync target/release/render-cms-prod "$SERVER:$REMOTE_SITE/bin/render-cms"
   ssh "$SERVER" systemctl restart render-cms
 fi
 
@@ -1709,7 +1671,7 @@ m6-http /var/www/my-blog /etc/m6/my-blog.toml --dump-config
 ```
 
 The output shows the `[server]` values from the system config and everything else from `site.toml`.
-The system config wins where the two files set the same key.
+The merge rule is the one in section 8.1.
 
 ### 8.8. Common mistakes
 
@@ -1719,9 +1681,9 @@ Four mistakes come up, each with its fix:
   `m6-http /var/www/my-blog` exits 2, because the second argument is required.
 - **Putting node values in `site.toml`.**
   `bind`, the certificate paths and `[auth]` belong in the system config.
-  A key in both files is refused at start.
+  The merge rule is the one in section 8.1.
 - **Deploying over server-managed state.**
-  Sync with the `content/drafts/`, `data/auth.db` and `keys/` exclusions, and never overwrite `data/posts.json`.
+  Sync with the exclusions from section 8.5, so `--delete` does not remove `data/posts.json`, `content/posts/` or the auth database.
 - **Editing `site.toml` on the server.**
   The next deploy overwrites it.
   Edit locally, deploy, and keep server-specific overrides in `/etc/m6/my-blog.toml`.
