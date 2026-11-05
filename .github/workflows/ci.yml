@@ -67,28 +67,41 @@ jobs:
     if: github.event_name == 'pull_request' && github.base_ref == 'main'
     runs-on: ubuntu-latest
     steps:
+      # The branch name comes from whoever opened the pull request, so it reaches
+      # the script as data in an environment variable, never pasted into it.
       - name: The head branch must be develop
+        env:
+          HEAD_REF: ${{ github.head_ref }}
         run: |
-          if [ "${{ github.head_ref }}" != "develop" ]; then
+          if [ "$HEAD_REF" != "develop" ]; then
             echo "::error::main takes pull requests from develop only."
-            echo "This pull request is from '${{ github.head_ref }}'."
+            echo "This pull request is from '$HEAD_REF'."
             echo ""
             echo "main is the release line. Merge into develop first, then"
             echo "open develop -> main as the release:"
-            echo "  gh pr create --base develop --head ${{ github.head_ref }}"
+            echo "  gh pr create --base develop --head $HEAD_REF"
             echo "  # merge that, bump the version and write the CHANGELOG entry, then:"
             echo "  gh pr create --base main --head develop --title 'Release X.Y.Z'"
             exit 1
           fi
           echo "head is develop, allowed"
 
+  # Every independent check runs even when an earlier one failed
+  # (`!cancelled()`), so one push reports every failure at once: a dying test
+  # used to skip clippy, and its problems surfaced only on the next push. A
+  # check that needs an earlier step's output (the toolchain, compiled tests)
+  # runs only if that output exists, so it is skipped rather than failing again
+  # for the same reason. A warning fails its own step and never skips a check
+  # that needs only the code to compile. Clippy runs second because it is quick
+  # and needs no release build.
   build-and-test:
     name: build, tests, clippy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - id: toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
 
@@ -102,19 +115,38 @@ jobs:
       - name: Formatting
         run: cargo fmt --all --check
 
+      # Clippy must be silent: `-D warnings`, no ceiling. It went to zero on
+      # 2026-09-13 and is held there the same way rustc warnings are. A new
+      # lint from a toolchain upgrade fails this, which is intended.
+      - name: Clippy, silent
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: ./tools/clippy.sh
+
       # Zero warnings, release and test builds, pre-existing included. This is
       # a standing rule and it is checked on Linux because that is where it
       # runs: three defects have only ever shown up there.
       - name: Release build, zero warnings
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         run: |
-          cargo build --workspace --release 2>&1 | tee build.log
+          status=0
+          cargo build --workspace --release > build.log 2>&1 || status=$?
+          cat build.log
+          [ "$status" -eq 0 ] || { echo "::error::the release build failed with status $status"; exit 1; }
           n=$(grep -c '^warning' build.log || true)
           echo "release warnings: $n"
           [ "$n" -eq 0 ] || { echo "::error::$n release warning(s)"; exit 1; }
 
       - name: Test build, zero warnings
+        id: testbuild
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         run: |
-          cargo test --workspace --no-run 2>&1 | tee testbuild.log
+          status=0
+          cargo test --workspace --no-run > testbuild.log 2>&1 || status=$?
+          cat testbuild.log
+          # The suite needs the tests to compile, not to compile without
+          # warnings, so it runs on this output and a warning cannot hide it.
+          [ "$status" -eq 0 ] && echo "compiled=true" >> "$GITHUB_OUTPUT"
+          [ "$status" -eq 0 ] || { echo "::error::the test build failed with status $status"; exit 1; }
           n=$(grep -c '^warning' testbuild.log || true)
           echo "test-build warnings: $n"
           [ "$n" -eq 0 ] || { echo "::error::$n test-build warning(s)"; exit 1; }
@@ -123,14 +155,19 @@ jobs:
       # message and leaves a bare `panicked at <file>:<line>`, which names the
       # place and not the reason.
       - name: Test suite
+        if: ${{ !cancelled() && steps.testbuild.outputs.compiled == 'true' }}
         run: |
-          cargo test --workspace > full.log 2>&1 || true
+          status=0
+          cargo test --workspace > full.log 2>&1 || status=$?
           grep -E '^test result:' full.log || true
           if grep -q '^failures:' full.log; then
             sed -n '/^failures:/,$p' full.log | head -80
             echo "::error::tests failed"
             exit 1
           fi
+          # A test build that does not compile, or a test binary that aborts,
+          # prints no `failures:` line, so cargo's own status decides as well.
+          [ "$status" -eq 0 ] || { tail -80 full.log; echo "::error::cargo test exited with status $status"; exit 1; }
 
       # Nothing in the workspace turns on some off-by-default core features
       # (`sqlite`, `email`, `multipart`), so `cargo test --workspace` never
@@ -138,6 +175,7 @@ jobs:
       # tests stayed broken), so m6-core is built, warned on and tested here
       # with every feature on, and a new feature is covered without an edit.
       - name: Opt-in core features, zero warnings and tests
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         run: |
           cargo test -p m6-core --lib --all-features --no-run 2>&1 | tee featbuild.log
           n=$(grep -c '^warning' featbuild.log || true)
@@ -151,12 +189,6 @@ jobs:
           grep -E '^test result:' feat.log || true
           if grep -q '^failures:' feat.log; then sed -n '/^failures:/,$p' feat.log | head -80; echo "::error::m6-core --all-features tests failed"; exit 1; fi
           [ "$status" -eq 0 ] || { tail -80 feat.log; echo "::error::m6-core --all-features tests exited with status $status"; exit 1; }
-
-      # Clippy must be silent: `-D warnings`, no ceiling. It went to zero on
-      # 2026-09-13 and is held there the same way rustc warnings are. A new
-      # lint from a toolchain upgrade fails this, which is intended.
-      - name: Clippy, silent
-        run: ./tools/clippy.sh
 
   conformance:
     name: h1, h2, h3 conformance
@@ -270,6 +302,7 @@ jobs:
             m6-examples
 
       - name: Build m6
+        id: build_m6
         working-directory: m6
         run: |
           cargo build --workspace --release
@@ -278,33 +311,48 @@ jobs:
       # Zero warnings and silent clippy, the same standard as m6 itself: a reader
       # copies from these.
       - name: Examples build, zero warnings
+        id: build_examples
         working-directory: m6-examples
         run: |
-          cargo build --release 2>&1 | tee build.log
+          status=0
+          cargo build --release > build.log 2>&1 || status=$?
+          cat build.log
+          # The end-to-end step needs the binaries, not a warning-free build.
+          [ "$status" -eq 0 ] && echo "compiled=true" >> "$GITHUB_OUTPUT"
+          [ "$status" -eq 0 ] || { echo "::error::the examples build failed with status $status"; exit 1; }
           n=$(grep -c '^warning' build.log || true)
           echo "examples release warnings: $n"
           [ "$n" -eq 0 ] || { echo "::error::$n warning(s) building the examples"; exit 1; }
 
       - name: Examples clippy, silent
+        if: ${{ !cancelled() && steps.build_m6.outcome == 'success' }}
         working-directory: m6-examples
         run: |
-          cargo clippy --workspace --all-targets --release 2>&1 | tee clippy.log
+          status=0
+          cargo clippy --workspace --all-targets --release > clippy.log 2>&1 || status=$?
+          cat clippy.log
+          # An error-level lint prints `error:` and no warning, so clippy's own
+          # status decides as well as the warning count.
+          [ "$status" -eq 0 ] || { echo "::error::clippy failed on the examples with status $status"; exit 1; }
           n=$(grep -c '^warning' clippy.log || true)
           [ "$n" -eq 0 ] || { echo "::error::$n clippy finding(s) in the examples"; exit 1; }
 
       - name: Examples unit tests
+        if: ${{ !cancelled() && steps.build_m6.outcome == 'success' }}
         working-directory: m6-examples
         run: |
           # Example 05's end-to-end test needs the certificate and auth
           # database that dev.sh creates, and fails without them, so it runs
           # in the example 05 step below once the stack is up (#277).
-          cargo test --workspace -- --skip blog_site_end_to_end > full.log 2>&1 || true
+          status=0
+          cargo test --workspace -- --skip blog_site_end_to_end > full.log 2>&1 || status=$?
           grep -E '^test result:' full.log || true
           if grep -q '^failures:' full.log; then
             sed -n '/^failures:/,$p' full.log | head -60
             echo "::error::example tests failed"
             exit 1
           fi
+          [ "$status" -eq 0 ] || { tail -60 full.log; echo "::error::cargo test exited with status $status"; exit 1; }
 
       # m6-file's config schema changed on 2026-09-12 and ten example configs
       # were left naming no handler, so the service exited 2 before binding and
@@ -328,6 +376,8 @@ jobs:
       # untracked keys/ directories. A check that depends on an untracked file is
       # not a check, which is the same lesson the mkcert fallback taught earlier.
       - name: Generate development certificates
+        id: certs
+        if: ${{ !cancelled() }}
         working-directory: m6-examples
         run: |
           for d in examples/*/; do
@@ -366,6 +416,7 @@ jobs:
           mkdir -p examples/09-global-deployment/certs
 
       - name: Every example's config parses
+        if: ${{ !cancelled() && steps.build_m6.outcome == 'success' }}
         working-directory: m6-examples
         run: |
           bad=0 unexplained=0
@@ -401,6 +452,7 @@ jobs:
       # mkcert) and creates the admin user. That is exactly what a new reader gets
       # on step one of the README, and it is checked here rather than assumed.
       - name: Example 05, end to end over the running stack
+        if: ${{ !cancelled() && steps.build_examples.outputs.compiled == 'true' && steps.certs.outcome == 'success' }}
         working-directory: m6-examples/examples/05-cms
         run: |
           M6="$GITHUB_WORKSPACE/m6" M6_NO_BROWSER=1 ./dev.sh --no-open > dev.log 2>&1 &
