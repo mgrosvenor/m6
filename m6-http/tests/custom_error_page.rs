@@ -27,7 +27,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use rustls::StreamOwned;
 
@@ -384,22 +384,15 @@ backend = "fixture"
         // 502; once the fixture's socket is in the pool it answers 200. /ok is
         // a plain 200 that does not run the error machinery, so the probe does
         // not pollute the counts the test asserts on.
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            let r = https_get(port, "/ok", Arc::clone(&tls));
-            if r.status == 200 {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "m6-http never served /missing as 404 (backend pool not ready) within 30s; \
-                 last status {} ({}), edge output:\n{}",
-                r.status,
-                r.headers,
-                edge.output()
-            );
-            std::thread::sleep(Duration::from_millis(25));
-        }
+        let ready = m6_core::testkit::wait::until(Duration::from_secs(30), || {
+            https_get(port, "/ok", Arc::clone(&tls)).status == 200
+        });
+        assert!(
+            ready,
+            "m6-http never served /ok as 200 (backend pool not ready) within 30s; \
+             edge output:\n{}",
+            edge.output()
+        );
 
         Stack {
             _edge: edge,
