@@ -195,6 +195,21 @@ set -uo pipefail
 # not installed" while the binary sat on disk, and the skip was silent.
 export PATH=$PATH:$HOME/.cargo/bin:$HOME/.local/bin:/root/.cargo/bin:/root/.local/bin
 cd "$M6_DIR" || exit 1
+# This run's own files: another gate may be running on this host at the same
+# time, and fixed /tmp paths would let each read the other's logs.
+T="$(mktemp -d)" || exit 1
+trap 'rm -rf -- "$T"' EXIT
+# Several gates share this host (#344). Builds and lints run side by side under
+# the host lock held shared; the test suite and conformance bind fixed loopback
+# ports, so they take the port lock; perfcheck needs the host to itself, so the
+# host lock is turned exclusive before it. A run enters through the entry lock,
+# which a waiting measurement holds, so new runs queue behind the measurement.
+exec 6>>/var/tmp/m6-host-entry.lock
+flock 6
+exec 8>>/var/tmp/m6-host.lock
+flock -s 8
+exec 6>&-
+PORT_LOCK=/var/tmp/m6-test.lock
 
 echo "### release build"
 cargo build --workspace --release 2>&1 | tail -3
@@ -202,9 +217,9 @@ echo "RELEASE_WARNINGS=$(cargo build --workspace --release 2>&1 | grep -c '^warn
 
 echo "### clippy"
 # `-D warnings`, no ceiling. Prints its own line; CLIPPY_STATUS is what decides.
-./tools/clippy.sh > /tmp/clippy.out 2>&1
+./tools/clippy.sh > $T/clippy.out 2>&1
 echo "CLIPPY_STATUS=$?"
-tail -5 /tmp/clippy.out
+tail -5 $T/clippy.out
 
 echo "### cargo-deny"
 # It used to run only in GitHub Actions, and that cost four hours once: a git
@@ -212,9 +227,9 @@ echo "### cargo-deny"
 # push, and the build-host checks kept reporting that everything passed. A check
 # that lives in one place only is not a check.
 if command -v cargo-deny >/dev/null 2>&1; then
-    cargo deny check > /tmp/deny.out 2>&1
+    cargo deny check > $T/deny.out 2>&1
     echo "DENY_STATUS=$?"
-    tail -4 /tmp/deny.out
+    tail -4 $T/deny.out
 else
     echo "DENY_STATUS=127"
     echo "cargo-deny is NOT INSTALLED here: cargo install cargo-deny --locked"
@@ -243,19 +258,19 @@ export M6_BACKENDS_REQUIRE_ALL=1
 # Captured in full, then reported. Grepping the pipe drops the assertion message,
 # leaving a bare `thread '<name>' panicked at <file>:<line>` with the text that
 # says WHY thrown away.
-cargo test --workspace > /tmp/m6-full.log 2>&1 || true
-grep -E '^test result:' /tmp/m6-full.log || true
+flock -o "$PORT_LOCK" cargo test --workspace > "$T/m6-full.log" 2>&1 || true
+grep -E '^test result:' "$T/m6-full.log" || true
 echo "### failure detail"
-sed -n '/^failures:/,$p' /tmp/m6-full.log | head -60
+sed -n '/^failures:/,$p' "$T/m6-full.log" | head -60
 
 echo "### conformance"
 # WITHOUT --allow-missing-tools, deliberately. This box has all three testers,
 # and an absent one here is a failure rather than a skip. A laptop's pre-push
 # hook may pass that flag and say loudly what it did not test; this has no excuse
 # available to it.
-./tools/conformance.sh > /tmp/conformance.out 2>&1
+flock -o "$PORT_LOCK" ./tools/conformance.sh > "$T/conformance.out" 2>&1
 echo "CONFORMANCE_STATUS=$?"
-tail -14 /tmp/conformance.out
+tail -14 "$T/conformance.out"
 
 echo "### performance"
 # Against the recorded numbers in tools/perf-baseline.txt, taken on this machine.
@@ -265,9 +280,15 @@ echo "### performance"
 # invocation, set from the checkout that synced. The tree up here has no `.git`,
 # so `git rev-parse` finds nothing, and a performance record that cannot name its
 # commit cannot be compared with anything later.
-./tools/perfcheck.sh > /tmp/perf.out 2>&1
-echo "PERF_STATUS=$?"
-grep -E 'render:|PASS|FAIL' /tmp/perf.out | tail -6
+exec 6>>/var/tmp/m6-host-entry.lock
+if flock -w "${M6_HOST_IDLE_WAIT:-7200}" 6 && flock -w "${M6_HOST_IDLE_WAIT:-7200}" -x 8; then
+    M6_HOST_LOCK_HELD=exclusive ./tools/perfcheck.sh > "$T/perf.out" 2>&1
+    echo "PERF_STATUS=$?"
+    grep -E 'render:|PASS|FAIL' "$T/perf.out" | tail -6
+else
+    echo "PERF_STATUS=2"
+    echo "NOT MEASURED: the host was not idle within ${M6_HOST_IDLE_WAIT:-7200}s (holders: $(fuser /var/tmp/m6-host.lock 2>/dev/null | xargs))"
+fi
 REMOTE
 
 # ── The examples ─────────────────────────────────────────────────────────────
@@ -284,6 +305,18 @@ if [[ -n "$EXAMPLES" ]]; then
 set -uo pipefail
 export PATH=$PATH:$HOME/.cargo/bin:$HOME/.local/bin:/root/.cargo/bin:/root/.local/bin
 cd "$EG_DIR" || exit 1
+# This run's own files (see the m6 half above).
+T="$(mktemp -d)" || exit 1
+trap 'rm -rf -- "$T"' EXIT
+# The examples start stacks on fixed loopback ports, 8443 among them, so this
+# whole run holds the port lock as well as the host lock shared (#344).
+exec 6>>/var/tmp/m6-host-entry.lock
+flock 6
+exec 8>>/var/tmp/m6-host.lock
+flock -s 8
+exec 6>&-
+exec 7>>/var/tmp/m6-test.lock
+flock 7
 
 echo "### examples release build"
 cargo build --release 2>&1 | tail -3
@@ -299,18 +332,18 @@ echo "### examples clippy"
 # reported as a stack that never answered. The wasted disk is worth more than a
 # failure that points at the wrong thing.
 CARGO_TARGET_DIR=target/clippy cargo clippy --workspace --all-targets --release 2>&1 \
-    | grep -c '^warning' > /tmp/eg-clippy.count
-echo "EG_CLIPPY_WARNINGS=$(cat /tmp/eg-clippy.count)"
+    | grep -c '^warning' > $T/eg-clippy.count
+echo "EG_CLIPPY_WARNINGS=$(cat $T/eg-clippy.count)"
 CARGO_TARGET_DIR=target/clippy cargo clippy --workspace --all-targets --release 2>&1 \
     | grep '^warning' | head -5
 
 echo "### examples unit tests"
 # Not blog_site_end_to_end: it needs certificates and example 05's stack, and
 # fails without them. It runs below, after that stack is up.
-cargo test --workspace -- --skip blog_site_end_to_end > /tmp/eg-tests.log 2>&1
+cargo test --workspace -- --skip blog_site_end_to_end > $T/eg-tests.log 2>&1
 echo "EG_TEST_STATUS=$?"
-grep -E '^test result:' /tmp/eg-tests.log || true
-sed -n '/^failures:/,$p' /tmp/eg-tests.log | head -40
+grep -E '^test result:' $T/eg-tests.log || true
+sed -n '/^failures:/,$p' $T/eg-tests.log | head -40
 
 echo "### development certificates"
 # A fresh checkout has no keys/: they are gitignored, and each example's dev.sh
@@ -422,7 +455,7 @@ if ss -ltnH 'sport = :8443' 2>/dev/null | grep -q .; then
     exit 0
 fi
 
-M6="$M6_DIR" M6_NO_BROWSER=1 ./dev.sh --no-open > /tmp/eg-cms-dev.log 2>&1 &
+M6="$M6_DIR" M6_NO_BROWSER=1 ./dev.sh --no-open > $T/eg-cms-dev.log 2>&1 &
 DEV_PID=$!
 up=0
 # 180 seconds. Six services have to bind, and m6-md regenerates posts.json from
@@ -435,7 +468,7 @@ done
 if [ "$up" != "1" ]; then
     echo "EG_CMS_STATUS=1"
     echo "the 05-cms stack never answered in 180s; dev.sh output:"
-    tail -30 /tmp/eg-cms-dev.log
+    tail -30 $T/eg-cms-dev.log
     echo "--- service logs ---"
     tail -20 logs/*.log 2>/dev/null
 # A 200 says something is serving, not that it is the thing under test. Prove it
@@ -446,24 +479,24 @@ elif ! curl -sk --http1.1 https://127.0.0.1:8443/ 2>/dev/null | grep -q 'Recent 
     echo "something answered 200 on 8443 but it is not 05-cms, so nothing here was measured:"
     ss -ltnpH 'sport = :8443' 2>/dev/null | sed 's/^/    /'
 else
-    ./test.sh > /tmp/eg-cms-test.log 2>&1
+    ./test.sh > $T/eg-cms-test.log 2>&1
     cms_rc=$?
-    grep -E 'passed|FAIL' /tmp/eg-cms-test.log | sed 's/\x1b\[[0-9;]*m//g' | tail -25
+    grep -E 'passed|FAIL' $T/eg-cms-test.log | sed 's/\x1b\[[0-9;]*m//g' | tail -25
     # The Rust end-to-end test needs this stack, so it runs here and its
     # failure counts into the same status.
     echo "### 05-cms rust end-to-end"
-    cargo test -p render-cms --test integration > /tmp/eg-cms-rust.log 2>&1
+    cargo test -p render-cms --test integration > $T/eg-cms-rust.log 2>&1
     rust_rc=$?
     # A test that cannot start its stack prints SKIP and passes; count it as a failure.
-    if grep -q '^SKIP' /tmp/eg-cms-rust.log; then
+    if grep -q '^SKIP' $T/eg-cms-rust.log; then
         echo "rust end-to-end skipped:"
-        grep '^SKIP' /tmp/eg-cms-rust.log
+        grep '^SKIP' $T/eg-cms-rust.log
         rust_rc=1
     fi
     # No "test result:" line is echoed: the report below sums those lines for the
     # unit-test count and takes the last "N passed" as the suite's count.
     echo "rust end-to-end exit status $rust_rc"
-    grep -E '^test .* FAILED|panicked' /tmp/eg-cms-rust.log | grep -v '^test result:' | tail -25
+    grep -E '^test .* FAILED|panicked' $T/eg-cms-rust.log | grep -v '^test result:' | tail -25
     if [ "$cms_rc" != "0" ] || [ "$rust_rc" != "0" ]; then
         echo "EG_CMS_STATUS=1"
     else

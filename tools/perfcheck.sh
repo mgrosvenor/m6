@@ -100,6 +100,25 @@ pass() { echo -e "${GREEN}PASS${RESET} $*"; }
 fail() { echo -e "${RED}FAIL${RESET} $*"; }
 info() { echo -e "${YELLOW}----${RESET} $*"; }
 
+# A wall-clock number is only worth anything on an idle host (#344). On a shared
+# build host every build and test holds /var/tmp/m6-host.lock shared; this takes
+# it exclusive, so it waits until nothing else runs and nothing starts until it
+# ends. A caller that already holds it exclusive (tools/build-host-tests.sh) says
+# so with M6_HOST_LOCK_HELD=exclusive. If the host does not go idle in time, the
+# run reports NOT MEASURED and fails: a number taken under load is not a result,
+# and no number is not a pass. Where flock is missing (macOS) nothing is locked.
+HOST_LOCK="${M6_HOST_LOCK:-/var/tmp/m6-host.lock}"
+ENTRY_LOCK="${M6_HOST_ENTRY_LOCK:-/var/tmp/m6-host-entry.lock}"
+if [[ "${M6_HOST_LOCK_HELD:-}" != exclusive ]] && command -v flock >/dev/null 2>&1; then
+    # The entry lock first, held while waiting, so no new run starts meanwhile.
+    exec 6>>"$ENTRY_LOCK"
+    exec 9>>"$HOST_LOCK"
+    if ! { flock -w "${M6_HOST_IDLE_WAIT:-7200}" 6 && flock -w "${M6_HOST_IDLE_WAIT:-7200}" -x 9; }; then
+        echo "NOT MEASURED: the host was not idle within ${M6_HOST_IDLE_WAIT:-7200}s (holders: $(fuser "$HOST_LOCK" 2>/dev/null | xargs))" >&2
+        exit 2
+    fi
+fi
+
 mkdir -p "$WORK"
 MEASURED="$WORK/measured.txt"
 RAW="$WORK/raw.txt"

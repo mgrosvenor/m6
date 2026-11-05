@@ -147,6 +147,9 @@ Comments only.
 
 ### Changed
 
+**`check.sh` and `tools/build-host-tests.sh` share a build host safely: builds and lints run side by side, the test suite and conformance take turns, and a measurement runs only when the host is otherwise idle (#344).**
+Both hold `/var/tmp/m6-host.lock` shared for their run and take `/var/tmp/m6-test.lock` only around the steps that bind fixed loopback ports. The benchmarks in `check.sh` and `tools/perfcheck.sh` take the host lock exclusive, through an entry lock that stops new runs from starting while a measurement waits; a measurement that cannot get an idle host within `M6_HOST_IDLE_WAIT` seconds (default 7200) reports NOT MEASURED and fails instead of measuring under load. The remote half of `build-host-tests.sh` keeps its logs in a directory of its own, so two runs no longer read each other's files. Where `flock` is missing, as on macOS, nothing is locked.
+
 **Debug and test builds carry line tables only, and no debug information for dependencies, so a full test build is 3.7 GB instead of 12 GB (#303).**
 Every file under a crate's `tests/` is its own binary, and each linked every dependency with full debug information. A full check filled about 16 GB, more than a hosted CI runner's free disk, and CI jobs died mid-build. Measured on the build host on one commit with `cargo test --workspace --no-run`: `target/debug` went from 12 GB to 3.7 GB and the build from 411 s to 282 s. Backtraces still show file and line.
 
