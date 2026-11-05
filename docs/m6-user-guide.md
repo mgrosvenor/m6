@@ -915,10 +915,10 @@ Example 06 runs the same site under systemd for production.
 
 ## 7. Example 06, production with systemd
 
-Example 06 runs the Example 05 CMS blog under systemd, one unit per process.
-The example holds only the five unit files in `examples/06-systemd/systemd/`.
+Example 06 runs the Example 05 CMS blog under systemd.
+The example holds only the unit files in `examples/06-systemd/systemd/`.
 It reuses the Example 05 site directory, with a production `site.toml` and a production system config written on the server.
-This section prepares the server, deploys the site directory and writes the five units.
+This section prepares the server, deploys the site directory and writes the units.
 Sections 7.4 to 7.11 install them, verify the stack and cover logs, scaling and recovery.
 
 ### 7.1. Server preparation
@@ -948,7 +948,8 @@ chmod 600   /etc/m6/auth.pem
 ```
 
 Obtain the certificate with certbot.
-The two paths it writes are the ones the production system config names.
+It writes `fullchain.pem` and `privkey.pem` under `/etc/letsencrypt/live/example.com/`, the paths the system config names as `tls_cert` and `tls_key`.
+The unprivileged `m6` user needs read access to the private key, so add it to the `ssl-cert` group or adjust the permissions.
 
 ```bash
 certbot certonly --standalone -d example.com
@@ -972,13 +973,13 @@ Deploy the Example 05 site directory with rsync, then fix ownership.
 Three paths stay on the server and are excluded from the sync:
 
 - `content/drafts/`, managed by the CMS renderer
-- `data/auth.db`, the persistent server-side login state
+- `configs/data/auth.db`, the persistent server-side login state
 - `keys/`, already present under `/etc/m6/` on the server
 
 ```bash
 rsync -av --delete \
   --exclude 'content/drafts/' \
-  --exclude 'data/auth.db' \
+  --exclude 'configs/data/auth.db' \
   --exclude 'keys/' \
   examples/05-cms/ \
   user@example.com:/var/www/my-blog/
@@ -988,13 +989,16 @@ chown -R m6:m6 /var/www/my-blog
 
 The production `site.toml` differs from Example 05 in two places.
 `domain` names the public site, and the backend `sockets` globs move from `/tmp/m6/` to `/run/m6/`, where a renderer writes its socket when no `M6_SOCKET_OVERRIDE` is set.
-The `[server]` bind and certificate paths, and `[auth]`, do not move into `site.toml`.
-They live in the system config `/etc/m6/my-blog.toml`, which the m6-http unit in section 7.3 names.
+The method list stays in `site.toml`.
+The `[server]` bind and certificate paths, and `[auth]`, live in the system config `/etc/m6/my-blog.toml`, which the m6-http unit in section 7.3 names.
 
 ```toml
 [site]
 name   = "My Blog"
 domain = "example.com"
+
+[server]
+allowed_methods = ["GET", "HEAD", "POST", "PATCH", "DELETE"]
 
 [errors]
 mode = "internal"
@@ -1019,7 +1023,6 @@ m6-http's unit names the system config as its second argument and adds `AmbientC
 ```ini
 [Unit]
 Description=m6-html renderer
-Documentation=https://github.com/mgrosvenor/m6
 After=network.target
 
 [Service]
@@ -1098,7 +1101,7 @@ Group=m6
 RuntimeDirectory=m6
 RuntimeDirectoryMode=0750
 
-ExecStart=/usr/local/bin/m6-auth \
+ExecStart=/usr/local/bin/m6-auth-server \
     /var/www/my-blog \
     /var/www/my-blog/configs/m6-auth.conf
 
@@ -1110,14 +1113,15 @@ SyslogIdentifier=m6-auth
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/run/m6 /var/www/my-blog/data
+ReadWritePaths=/run/m6 /var/www/my-blog/configs/data
 ReadOnlyPaths=/var/www/my-blog /etc/m6
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-m6-auth writes its *SQLite* database under `data/`, which is why its `ReadWritePaths` adds `/var/www/my-blog/data`.
+m6-auth writes its *SQLite* database under `configs/data/`, which is why its `ReadWritePaths` adds `/var/www/my-blog/configs/data`.
+The database path resolves relative to the config file, in `configs/`, and not relative to the site directory.
 
 `/etc/systemd/system/render-cms.service`:
 
@@ -1159,7 +1163,6 @@ The render-cms binary lives in `/var/www/my-blog/bin/`, deployed beside the site
 ```ini
 [Unit]
 Description=m6-http reverse proxy and cache
-Documentation=https://github.com/mgrosvenor/m6
 After=network.target m6-html.service m6-file.service m6-auth.service render-cms.service
 
 [Service]
@@ -1189,8 +1192,8 @@ WantedBy=multi-user.target
 ```
 
 `AmbientCapabilities=CAP_NET_BIND_SERVICE` lets the unprivileged `m6` user bind port 443.
-`After=` is an ordering hint, not a hard dependency.
-m6-http starts after the backends and answers a route whose backend socket is not ready yet with a 503 until the socket appears.
+`After=` is an ordering hint only.
+m6-http starts after the backends and answers a route whose backend socket is not ready yet with a 502 until the socket appears.
 
 Section 7.4 installs these units and starts the stack.
 
