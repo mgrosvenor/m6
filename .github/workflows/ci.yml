@@ -128,7 +128,10 @@ jobs:
       - name: Release build, zero warnings
         if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         run: |
-          cargo build --workspace --release 2>&1 | tee build.log
+          status=0
+          cargo build --workspace --release > build.log 2>&1 || status=$?
+          cat build.log
+          [ "$status" -eq 0 ] || { echo "::error::the release build failed with status $status"; exit 1; }
           n=$(grep -c '^warning' build.log || true)
           echo "release warnings: $n"
           [ "$n" -eq 0 ] || { echo "::error::$n release warning(s)"; exit 1; }
@@ -325,7 +328,12 @@ jobs:
         if: ${{ !cancelled() && steps.build_m6.outcome == 'success' }}
         working-directory: m6-examples
         run: |
-          cargo clippy --workspace --all-targets --release 2>&1 | tee clippy.log
+          status=0
+          cargo clippy --workspace --all-targets --release > clippy.log 2>&1 || status=$?
+          cat clippy.log
+          # An error-level lint prints `error:` and no warning, so clippy's own
+          # status decides as well as the warning count.
+          [ "$status" -eq 0 ] || { echo "::error::clippy failed on the examples with status $status"; exit 1; }
           n=$(grep -c '^warning' clippy.log || true)
           [ "$n" -eq 0 ] || { echo "::error::$n clippy finding(s) in the examples"; exit 1; }
 
