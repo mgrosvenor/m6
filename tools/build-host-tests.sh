@@ -203,7 +203,7 @@ trap 'rm -rf -- "$T"' EXIT
 # this run holds the host shared, the test suite and conformance take the port
 # lock, and perfcheck gets the host to itself.
 # shellcheck source=tools/host-lock.sh
-. ./tools/host-lock.sh
+. ./tools/host-lock.sh || exit 1
 host_enter_shared
 
 echo "### release build"
@@ -297,6 +297,11 @@ if [[ -n "$EXAMPLES" ]]; then
         > "$EXAMPLES_LOG" 2>&1 <<'REMOTE_EG' || true
 set -uo pipefail
 export PATH=$PATH:$HOME/.cargo/bin:$HOME/.local/bin:/root/.cargo/bin:/root/.local/bin
+# M6_DIR arrives relative to the login directory (BUILD_ROOT defaults to a
+# relative path), and this half changes directory before it uses it, so it is
+# made absolute first. Without this every example step, and the lock helper
+# below, looked for m6 in a directory that does not exist.
+M6_DIR="$(cd "$M6_DIR" && pwd)" || exit 1
 cd "$EG_DIR" || exit 1
 # This run's own files (see the m6 half above).
 T="$(mktemp -d)" || exit 1
@@ -305,7 +310,7 @@ trap 'rm -rf -- "$T"' EXIT
 # and clippy below bind nothing; from the unit tests on, every step binds fixed
 # loopback ports (8443 among them), so the port lock is held from there.
 # shellcheck source=tools/host-lock.sh
-. "$M6_DIR/tools/host-lock.sh"
+. "$M6_DIR/tools/host-lock.sh" || exit 1
 host_enter_shared
 
 echo "### examples release build"
