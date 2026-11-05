@@ -73,7 +73,8 @@ fn main() -> Result<()> {
             //   same bytes. Serde would be free to order or space them
             //   differently.
             // - verbatim stops core compressing the body, and minifying it in a
-            //   build that has the `minify` feature. This one does not. Spec
+            //   build that has the `minify` feature. A workspace build does,
+            //   through m6-html, even though this crate does not ask for it. Spec
             //   §3.6 says a backend SHOULD NOT compress, because the proxy
             //   negotiates and caches each representation itself. It also keeps
             //   the measurement honest: compressing here and not in the pair

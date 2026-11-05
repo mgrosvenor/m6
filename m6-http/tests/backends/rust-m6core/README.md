@@ -33,7 +33,9 @@ cache most requests never reach a backend at all. Both halves of that are true.
 Three routes are `.verbatim()`: without it core compresses the body, and would
 minify the HTML in a build with the `minify` feature, which is core doing its job
 and wrong for a set of examples meant to be read side by side. This example takes
-core with `default-features = false`, so it links no minifier. See §10.3.
+core with `default-features = false`, so built on its own it links no minifier;
+in a workspace build cargo unifies features and `minify` is on, which is why
+the routes stay verbatim. See §10.3.
 
 ## Run it
 

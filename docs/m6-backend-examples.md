@@ -331,8 +331,8 @@ That is correct for a service returning a document, and wrong for these examples
 
 Protocol section 3.6 makes compression the backend's job, and a backend MAY compress.
 These examples choose not to, and declare `compresses = false`.
-`rust-m6core` takes core with `default-features = false`, so it links no minifier and its core-overhead measurement does not include minification.
-Were it built with the `minify` feature, a minified body would make its `/boom` 167 bytes where the other five send 178.
+`rust-m6core` takes core with `default-features = false`, so built on its own (`cargo build -p m6-example-rust-m6core`) it links no minifier.
+The test suite builds it with `--workspace`, where cargo unifies features and `m6-html` turns `minify` on, and then a minified body would make its `/boom` 167 bytes where the other five send 178.
 
 Both HTML routes and `/status` in that example are therefore `.verbatim()`, which stops compression, and minification in a build that has the `minify` feature.
 `/status` would need it regardless, because identical bytes across six languages is the whole point of that route, and anything that re-encodes could re-space them.
