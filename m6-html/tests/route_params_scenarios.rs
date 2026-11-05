@@ -130,7 +130,7 @@ fn equal_specificity_tie_first_declared_route_answers() {
 }
 
 // ---------------------------------------------------------------------------
-// #290 — params precedence and restart pickup
+// #290: params precedence and restart pickup
 // ---------------------------------------------------------------------------
 
 /// A route params key beats the same global key. `/brand-one` renders
@@ -256,7 +256,7 @@ fn global_params_change_picked_up_after_restart() {
 }
 
 // ---------------------------------------------------------------------------
-// #291 — query keys in templates with the path-parameter clash
+// #291: query keys in templates with the path-parameter clash
 // ---------------------------------------------------------------------------
 
 /// Query keys reach the template, and a key that also names a path parameter
@@ -285,7 +285,7 @@ fn query_keys_render_with_path_param_clash() {
 }
 
 // ---------------------------------------------------------------------------
-// #292 — a route's status reaching the response
+// #292: a route's status reaching the response
 // ---------------------------------------------------------------------------
 
 /// A route with `status = 410` answers 410 with its rendered body. The wrong
