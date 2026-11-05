@@ -81,6 +81,9 @@ Verified with `l2_query_relpath_cannot_replace_the_path_parameter` and `l2_query
 
 ### Fixed
 
+**A shutdown now waits for every request the thread pool has accepted, including one a worker has not yet started (#338).**
+The pool counted a request in flight only after a worker thread woke to run it, so a SIGTERM landing in that gap let `drain` see nothing in flight and the process exit under the request. A queued request was not counted either. The pool now counts a request when it accepts it, with one atomic add on the accept thread. The m6-html shutdown test failed 57 times in 150 runs under CPU load before the change, and its held-request step now confirms the service accepted the request instead of trusting the probe's 503 alone.
+
 **`a_burst_of_writes_is_at_most_two_reloads` no longer fails on a busy machine (#299).**
 It wrote the config three times 10 ms apart and expected at most two reloads, but the reloader only merges a write that lands within 20 ms of the last report, so on a loaded runner a late write was rightly reported a third time. The test now spaces its writes 5 ms apart (longer than the service loop takes to wake and reload, so it is unlikely to merge them by itself), times each burst, and judges only one that fitted inside the window, retrying up to five times. Verified on the build host, 20 runs each: 20 passes with four CPU-bound processes running, and 20 failures reporting three reloads with the reloader's hold removed.
 

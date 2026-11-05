@@ -6,7 +6,7 @@
 //! SIGTERM that fails to force an exit, a SIGINT that does not take the same
 //! graceful path as SIGTERM, and a SIGTERM that cuts off an in-flight response.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -89,36 +89,63 @@ fn http_request(socket: &Path, request: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&resp).into_owned())
 }
 
-/// Open a request whose body is sent only partway, and confirm the worker is
-/// blocked reading it. Returns the held-open stream.
+/// Open a request whose body is sent only partway, and confirm the worker has
+/// accepted it and is blocked reading the body. Returns the held-open stream.
 ///
 /// With one worker and no queue, a probe is answered 503 while the worker is
-/// busy. That 503 is the signal this waits on, rather than a fixed sleep.
+/// busy. The held request connects before the probe and the service accepts in
+/// order, so once any probe is answered the service has already decided the
+/// held request's fate. A refusal (the worker was not yet back waiting for
+/// work) shows as a write that fails or a 503 already readable on the held
+/// stream, and the attempt is repeated. Otherwise the request was accepted and
+/// the first 503 to a probe proves the worker is still on it.
 fn hold_open(socket: &Path, svc: &mut Service) -> UnixStream {
-    let mut held = UnixStream::connect(socket).expect("connect the held request");
-    held.set_read_timeout(Some(Duration::from_secs(10))).ok();
-    held.write_all(
-        b"POST /blog HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\nConnection: close\r\n\r\n",
-    )
-    .expect("write the held request head");
-    held.write_all(b"0123456789")
-        .expect("write the first 10 body bytes");
-
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        if http_request(socket, "GET /blog HTTP/1.1\r\nHost: localhost\r\n\r\n")
-            .is_some_and(|r| r.contains("503"))
-        {
-            return held;
+        let mut held = UnixStream::connect(socket).expect("connect the held request");
+        held.set_read_timeout(Some(Duration::from_secs(10))).ok();
+        let sent = held
+            .write_all(
+                b"POST /blog HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\nConnection: close\r\n\r\n0123456789",
+            )
+            .is_ok();
+
+        let mut refused = !sent;
+        while !refused {
+            let probe = http_request(socket, "GET /blog HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            refused = was_refused(&mut held);
+            if refused {
+                break;
+            }
+            if probe.is_some_and(|r| r.contains("503")) {
+                return held;
+            }
+            svc.assert_alive("while confirming the held request is in flight");
+            assert!(
+                Instant::now() < deadline,
+                "the held request never took the worker\n--- output ---\n{}",
+                svc.output()
+            );
+            std::thread::sleep(Duration::from_millis(25));
         }
-        svc.assert_alive("while confirming the held request is in flight");
         assert!(
             Instant::now() < deadline,
-            "the held request never took the worker\n--- output ---\n{}",
+            "the held request was refused every time\n--- output ---\n{}",
             svc.output()
         );
-        std::thread::sleep(Duration::from_millis(25));
     }
+}
+
+/// True if the service has already answered or closed the held stream, which
+/// it does only to refuse it.
+fn was_refused(held: &mut UnixStream) -> bool {
+    held.set_nonblocking(true).expect("poll the held stream");
+    let refused = !matches!(
+        held.read(&mut [0u8; 1]),
+        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
+    );
+    held.set_nonblocking(false).expect("block the held stream");
+    refused
 }
 
 /// Wait until the child's output contains `marker`, or panic with the output.

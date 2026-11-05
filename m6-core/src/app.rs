@@ -1503,7 +1503,6 @@ impl ThreadPool {
                     let work = rx.lock().unwrap().recv();
                     match work {
                         Ok(f) => {
-                            in_flight2.fetch_add(1, Ordering::SeqCst);
                             f();
                             in_flight2.fetch_sub(1, Ordering::SeqCst);
                         }
@@ -1525,7 +1524,21 @@ impl ThreadPool {
 
     /// Submit work. Returns false if the queue is full (→ 503).
     pub fn submit(&self, f: WorkItem) -> bool {
-        self.queue.try_send(f).is_ok()
+        self.enqueue(f)
+    }
+
+    /// Hand `work` to the queue, counting it in flight from the moment it is
+    /// accepted, not from the moment a worker wakes: `drain` must wait for a
+    /// request that is queued, or handed to a worker that has not yet run, as
+    /// well as for one being served. The count rises before the send so a
+    /// worker cannot finish and lower it first.
+    fn enqueue(&self, work: WorkItem) -> bool {
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        let accepted = self.queue.try_send(work).is_ok();
+        if !accepted {
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        }
+        accepted
     }
 
     /// Try to submit work that takes ownership of a resource.
@@ -1544,17 +1557,16 @@ impl ThreadPool {
             let r = rc.lock().unwrap().take().unwrap();
             f(r);
         });
-        match self.queue.try_send(work) {
-            Ok(()) => Ok(true),
-            Err(_) => {
-                // Queue full — recover resource.
-                let r = resource_cell.lock().unwrap().take().unwrap();
-                Err(r)
-            }
+        if self.enqueue(work) {
+            Ok(true)
+        } else {
+            // Queue full — recover resource.
+            let r = resource_cell.lock().unwrap().take().unwrap();
+            Err(r)
         }
     }
 
-    /// Wait for all in-flight work to complete.
+    /// Wait for all accepted work to complete.
     pub fn drain(&self) {
         while self.in_flight.load(Ordering::SeqCst) > 0 {
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -3686,6 +3698,25 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(100));
         let r = results.lock().unwrap();
         assert_eq!(r.len(), n);
+    }
+
+    /// A request the pool has accepted is in flight at once, whether it is
+    /// running or still queued. The wrong outcome: the count rises only when a
+    /// worker wakes, so a shutdown that drains right after the accept sees
+    /// nothing in flight and exits under the request.
+    #[test]
+    fn accepted_work_is_in_flight_before_a_worker_runs_it() {
+        let pool = ThreadPool::new(1, 2);
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        assert!(pool.submit(Box::new(move || {
+            held.recv().ok();
+        })));
+        assert!(pool.submit(Box::new(|| {})));
+        assert_eq!(pool.in_flight(), 2);
+
+        release.send(()).unwrap();
+        pool.drain();
+        assert_eq!(pool.in_flight(), 0);
     }
 
     #[test]
