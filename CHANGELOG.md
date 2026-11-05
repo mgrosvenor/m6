@@ -89,6 +89,10 @@ The default tables disagreed. `text/javascript` was minified but missing from th
 A site that switched compression off by setting brotli and gzip to 0 on each default type, and declares `compresses = false` for its backend, must now set `text/javascript` to 0 as well. Until it does, the service refuses to start or reload with "compresses = false, but this service DOES compress".
 Verified by a request-level test that asks for `text/javascript` with `Accept-Encoding: br` and expects a brotli response, and by a test that the two default tables list the same types. Both fail on the old tables.
 
+**The edge now skips an informational (1xx) response from a backend and returns the final one (#100).**
+A backend that sent `103 Early Hints` ahead of its answer had the 103 taken for the response, so the fetch failed. The HTTP/1.1 reader and both HTTP/2 backbone clients now drop any 1xx other than 101 (RFC 9110 15.2) and fail the fetch as a bad gateway after eight of them, so a backend cannot hold a worker by sending them without end. Before this, an HTTP/2 client carried a 103's fields into the final response, which the edge could then cache.
+Verified by new loopback backend tests for each reader, which fail before the change and pass after it, covering a 103 ahead of the final response, a head that arrives one byte at a time, and the bound at eight and nine.
+
 **CI runs example 05's integration test after its stack is up (#277).**
 The examples' unit-test step ran `cargo test --workspace` in m6-examples before example 05's `dev.sh` had created the dev certificate and auth database. Since m6-examples #11 that test fails on missing prerequisites instead of skipping, so every pull request failed. The step now skips that test, and the example 05 step runs it once the stack answers, as m6-examples' own CI does.
 Verified by this pull request's own CI run.
@@ -139,6 +143,8 @@ Comments only.
 
 **CHANGELOG.md's preamble and its 1.15.0, 1.14.0, 1.13.0 and 1.12.1 entries now follow the documentation ruleset (#129).**
 
+**The user guide's admin dashboard section says the bench targets come from the system config's `[server].bind`, as example 11 now has it (#305).**
+
 ### Changed
 
 **Debug and test builds carry line tables only, and no debug information for dependencies, so a full test build is 3.7 GB instead of 12 GB (#303).**
@@ -159,6 +165,31 @@ The cold-start benchmark is now a `[[bench]]` (`cargo bench -p m6-http --bench b
 A config that disagrees with `site.toml` about compression now makes `--dump-config` exit 2 with `Config error: <msg>`, as start does, instead of passing validation and failing at start.
 
 **The m6-auth-server reference follows the documentation ruleset, and its `next` check, browser logout, key rotation and `--dump-config` descriptions now match the service (#140).**
+
+**A request takes the framework read lock once and releases it before the handler runs or the template renders, so a hot reload no longer queues requests behind a render (#183).**
+The lock used to be taken twice and held through the handler and the render. std's `RwLock` stops granting new readers once a writer is waiting, so a reload made every new request wait for the longest render in flight, and the reload itself dropped the old renderer while holding the write lock. Now the lock covers only copying out the shared state, routing and building the dictionary, and the renderer is an `Arc` the request carries out with it.
+A test blocks a request inside the renderer, swaps in a state with another renderer, and asserts the swap completes while the request is blocked and that the request is answered by the renderer it started with. It fails on the old locking and passes on the new.
+
+**Tests now cover that a woff2 response is never compressed and is served byte-exact (#293).**
+They fail if `font/woff2` is added to the default compress list, which would re-encode a file that is already compressed.
+
+**Tests now run the built m6-http binary through its startup argument and system-config errors (#294).**
+They fail if a change to argument parsing or the config merge turns a clear exit 2 into a start with the wrong config.
+
+**Tests now cover the shutdown signals every service shares (#288).**
+They fail if a second SIGTERM stops forcing exit during a drain, if SIGINT leaves the graceful path, or if a request in flight at SIGTERM is cut off.
+
+**Tests now cover the route tie-break, params precedence, the query and path-parameter clash, and a route status reaching the response (#289, #290, #291, #292).**
+They fail if equal routes stop resolving to the first declaration, if a global params key beats a route key, if a changed params file is missed after a restart, if a query key replaces a path parameter, or if a route status is dropped.
+
+**Tests now cover the auth path (#295, #296).**
+They fail if a public route runs auth code with or without a token or from the cache, or if a browser stops being redirected to `/login?next=<path>` or `/auth/refresh` while an API client gets 401.
+
+**Tests now cover backend pool failover and rejoin after backoff (#297).**
+They fail if a failed member is picked again before its backoff ends or is never picked again after it.
+
+**Tests now cover custom error pages from a socket backend (#298).**
+They fail if a backend 404 or 500 loses the fetched page or its status, if a failed page fetch is retried, or if the error path fetches itself.
 
 ### Verified
 

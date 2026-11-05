@@ -18,3 +18,4 @@ m6-core       = { path = "../m6-core", features = ["testkit"] }
 tempfile      = "3"
 brotli  = "6"
 flate2  = "1"
+libc    = "0.2"

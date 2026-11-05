@@ -505,4 +505,46 @@ mod tests {
         mgr.socket_disappeared(Path::new("/run/m6/m6-html-1.sock"));
         assert_eq!(mgr.get_pool("m6-html").unwrap().total_count(), 0);
     }
+
+    /// A failed member is skipped while its backoff lasts.
+    ///
+    /// The bug this catches: `pick_member` ignoring the backoff and keeping a
+    /// dead socket in rotation, so a request still lands on the failed member
+    /// and answers 502 instead of shifting to a healthy one.
+    #[test]
+    fn test_pick_member_skips_failed_member_during_backoff() {
+        let mut pool = BackendPool::new("app".to_string(), "/tmp/*.sock".to_string());
+        pool.add_socket(PathBuf::from("/tmp/app-a.sock"));
+        pool.add_socket(PathBuf::from("/tmp/app-b.sock"));
+
+        pool.mark_failed(0);
+
+        assert_eq!(
+            pool.pick_member(),
+            Some(1),
+            "the failed member must be skipped until its backoff ends"
+        );
+    }
+
+    /// A member is picked again once its backoff has ended.
+    ///
+    /// The bug this catches: `pick_member` treating the backoff as permanent,
+    /// so a recovered backend stays out of the pool for good. The backoff is
+    /// rolled forward in place rather than slept through, because a fixed sleep
+    /// is a timing guess.
+    #[test]
+    fn test_pick_member_picks_member_again_after_backoff_ends() {
+        let mut pool = BackendPool::new("app".to_string(), "/tmp/*.sock".to_string());
+        pool.add_socket(PathBuf::from("/tmp/app-a.sock"));
+        pool.add_socket(PathBuf::from("/tmp/app-b.sock"));
+
+        pool.mark_failed(0);
+        pool.members[0].retry_at = Some(Instant::now() - Duration::from_secs(1));
+
+        assert_eq!(
+            pool.pick_member(),
+            Some(0),
+            "the recovered member must be picked again after its backoff ends"
+        );
+    }
 }

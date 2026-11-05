@@ -1916,6 +1916,7 @@ dependencies = [
  "anyhow",
  "brotli 6.0.0",
  "flate2",
+ "libc",
  "m6-core",
  "tempfile",
 ]
