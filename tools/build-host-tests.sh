@@ -129,11 +129,10 @@ copy_back() {
         return 0
     fi
     # Append only the build host's lines the laptop does not already hold, so a
-    # recreated build host cannot shorten the committed history.
-    {
-        cat "$dst"
-        awk 'NR==FNR { seen[$0]=1; next } !seen[$0]++' "$dst" "$fetched"
-    } > "$dst.merged"
+    # recreated build host cannot shorten the committed history. One pass over
+    # both files dedupes across them, so an empty destination still gains every
+    # fetched line.
+    awk '!seen[$0]++' "$dst" "$fetched" > "$dst.merged"
     mv "$dst.merged" "$dst"
     rm -f "$fetched"
 }
