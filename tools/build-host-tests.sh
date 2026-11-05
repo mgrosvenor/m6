@@ -105,6 +105,18 @@ BUILD_ROOT="${M6_BUILD_ROOT:-m6-build}"
 LOG=/tmp/m6-build-host-tests.log
 EXAMPLES_LOG=/tmp/m6-build-host-examples.log
 
+# Copy one file back from the build host to the laptop checkout, so a record the
+# build host wrote becomes part of the commit. rsync handles a local source and
+# destination, so a local directory can stand in for the build host in a test.
+# Source and destination are the arguments, so the transport is the only thing
+# this knows about.
+copy_back() {
+    local src="$1"
+    local dst="$2"
+    # shellcheck disable=SC2086
+    rsync -az -e "ssh $SSH_OPTS" "$src" "$dst" || die "cannot copy $src back to $dst"
+}
+
 # ── Where the examples are ───────────────────────────────────────────────────
 #
 # The renderer crates reach m6 by relative path (`../../../../m6/m6-core`), which
@@ -160,7 +172,10 @@ info "syncing to $BUILD_HOST:$BUILD_ROOT/m6"
 # shellcheck disable=SC2086
 ssh $SSH_OPTS "$BUILD_HOST" "mkdir -p $BUILD_ROOT" || die "cannot reach $BUILD_HOST"
 # shellcheck disable=SC2086
+# tools/perf-history.jsonl is excluded so --delete does not erase the record the
+# build host wrote. The copy-back below brings it into git.
 rsync -az -e "ssh $SSH_OPTS" --delete --exclude 'target/' --exclude '.git/' \
+    --exclude 'tools/perf-history.jsonl' \
     "$ROOT/" "$BUILD_HOST:$BUILD_ROOT/m6/" || die "rsync failed"
 # shellcheck disable=SC2086
 ssh $SSH_OPTS "$BUILD_HOST" \
@@ -269,6 +284,16 @@ echo "### performance"
 echo "PERF_STATUS=$?"
 grep -E 'render:|PASS|FAIL' /tmp/perf.out | tail -6
 REMOTE
+
+# ── Bring the history back ───────────────────────────────────────────────────
+#
+# perfcheck appended one record to tools/perf-history.jsonl on the build host,
+# the only place it runs. The sync above excludes that file so --delete keeps it,
+# but nothing copied it back, so the committed history never gained a record.
+# Copy it back now, pass or fail, because a run that failed is the one a later
+# reader most wants the conditions for.
+copy_back "$BUILD_HOST:$BUILD_ROOT/m6/tools/perf-history.jsonl" "$ROOT/tools/perf-history.jsonl"
+info "commit tools/perf-history.jsonl; the next run refuses a dirty tree until you do"
 
 # ── The examples ─────────────────────────────────────────────────────────────
 #
