@@ -9,9 +9,9 @@
 
 use std::path::Path;
 use std::process::{Command, Output};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use m6_core::testkit::{self, Service};
+use m6_core::testkit::{self, wait, Service};
 
 /// Run the built `m6-http` to completion and return its captured output.
 fn run(args: &[&std::ffi::OsStr]) -> Output {
@@ -51,23 +51,6 @@ fn site_toml_with_server(bind: &str) -> String {
          [server]\nbind = \"{bind}\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n\n\
          [log]\nlevel = \"info\"\nformat = \"plain\"\n"
     )
-}
-
-/// Wait until the service logs `needle`, with a deadline. This waits on the log
-/// line itself, never a fixed sleep.
-fn wait_for_output(svc: &mut Service, needle: &str, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let out = svc.output();
-        if out.contains(needle) {
-            return;
-        }
-        svc.assert_alive(&format!("waiting for the log line {needle:?}"));
-        if Instant::now() >= deadline {
-            panic!("m6-http never logged {needle:?} within {timeout:?}\n--- output ---\n{out}");
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
 }
 
 /// Scenario: m6-http runs with no arguments. Wrong outcome: it starts with some
@@ -168,7 +151,13 @@ fn a_key_outside_the_allowed_tables_warns_naming_the_key_and_the_service_starts(
     let mut svc = Service::spawn("m6-http-extra-key", &mut cmd);
     svc.wait_for_tcp(claim.port(), Duration::from_secs(10));
 
-    wait_for_output(&mut svc, "frobnicate", Duration::from_secs(5));
+    assert!(
+        wait::until(Duration::from_secs(5), || svc
+            .output()
+            .contains("frobnicate")),
+        "m6-http never logged \"frobnicate\"\n--- output ---\n{}",
+        svc.output()
+    );
     let out = svc.output();
     assert!(
         out.contains("ignoring key"),
