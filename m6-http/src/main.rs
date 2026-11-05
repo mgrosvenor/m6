@@ -2686,6 +2686,7 @@ fn handle_request_inner(
     // Auth check — only if route has `require`
     if let Some(ref require) = route.require {
         if let Some(ref pk) = state.public_key {
+            debug!(path = %req.path, "auth check");
             match auth::authorise(pk, &req.headers, require) {
                 Err(auth::Refusal::NoToken) => {
                     warn!(path = %req.path, "auth: no token");

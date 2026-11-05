@@ -517,21 +517,9 @@ mod phase12 {
     }
 
     #[test]
-    fn public_route_no_auth_code_executed() {
-        // The contract: for public routes, zero auth code is executed.
-        // We verify this by checking that extract_token is not called
-        // when no `require` is set. This is a structural test.
-        //
-        // The handle_request function only calls auth code when route.require.is_some().
-        // We verify the behavior indirectly: a request to a public route
-        // with no token should be forwarded (not rejected).
-        //
-        // Since we can't easily test the full stack without a real server,
-        // we test the auth module is not invoked for public routes
-        // by verifying extract_token with no headers returns None.
+    fn extract_token_returns_none_without_an_auth_header_or_session_cookie() {
         let token = extract_token(None, None);
         assert_eq!(token, None);
-        // The caller (handle_request) only calls this if route.require.is_some()
     }
 
     #[test]
