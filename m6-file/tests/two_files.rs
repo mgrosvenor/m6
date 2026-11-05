@@ -112,11 +112,69 @@ fn dump_config_refuses_a_site_toml_the_start_would_refuse() {
     assert!(stderr.contains("not valid TOML"), "{stderr}");
 }
 
+/// A second `[[route]]` that answers the same paths as `/assets/{*relpath}` at
+/// the same specificity, so it could never be reached.
+const OVERLAPPING_ROUTE: &str =
+    "[[route]]\npath = \"/assets/{*other}\"\nhandler = \"files\"\nroot = \"assets/\"\n";
+
+/// Both routes as written, and the reason, so the operator can find the line.
+/// The log is JSON, so quotes arrive escaped; they are unescaped first.
+fn assert_names_the_overlap(output: &str) {
+    let text = &output.replace("\\\"", "\"");
+    for route in ["\"/assets/{*relpath}\"", "\"/assets/{*other}\""] {
+        assert!(text.contains(route), "{route} not named in: {text}");
+    }
+    assert!(text.contains("equal specificity"), "{text}");
+    assert!(text.contains("(e.g. \"/assets/x\")"), "{text}");
+}
+
+/// Scenario: two routes that answer the same paths at the same specificity.
+/// The wrong outcome: the service starts and the second route silently never
+/// answers.
+#[test]
+fn a_start_with_overlapping_routes_exits_2_and_names_both() {
+    let tmp = tree("");
+    let root = tmp.path().join("apps/file");
+    let conf = config(&root, &format!("{ROUTE}\n{OVERLAPPING_ROUTE}"));
+
+    // Spawned, not `run`: a service that wrongly starts never exits, and the
+    // test must fail on the deadline rather than hang.
+    let mut svc = Service::spawn(
+        "m6-file",
+        Command::new(binary("m6-file"))
+            .arg(&root)
+            .arg(&conf)
+            .env("M6_SOCKET_OVERRIDE", root.join("two-files.sock")),
+    );
+    let status = svc.wait_for_exit(Instant::now() + Duration::from_secs(30));
+    let text = svc.output();
+    assert_eq!(
+        status.and_then(|s| s.code()),
+        Some(2),
+        "the service did not refuse and exit 2: {text}"
+    );
+    assert_names_the_overlap(&text);
+}
+
+/// Scenario: a deploy validates with `--dump-config`. The wrong outcome: it
+/// passes a config the start then refuses.
+#[test]
+fn dump_config_refuses_overlapping_routes_as_the_start_does() {
+    let tmp = tree("");
+    let root = tmp.path().join("apps/file");
+    let conf = config(&root, &format!("{ROUTE}\n{OVERLAPPING_ROUTE}"));
+
+    let out = run(&root, &conf, Some("--dump-config"));
+    let text = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert_names_the_overlap(&text);
+}
+
 // ── Reload: a change to either file reloads the service ─────────────────────
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use m6_core::testkit::{wait, Service};
 
@@ -245,6 +303,33 @@ fn a_compress_disagreement_in_a_new_site_toml_is_refused_and_the_old_routes_serv
     assert!(status_of(&r.socket, "/assets/a.txt")
         .unwrap()
         .contains("200"));
+}
+
+/// Scenario: an edit adds a second route that overlaps the first. The wrong
+/// outcome: the reload is installed, or the service stops answering. It must
+/// refuse, say why, keep serving, and still accept the next good edit.
+#[test]
+fn a_reload_into_overlapping_routes_is_refused_and_the_old_routes_serve() {
+    let r = start("");
+    std::fs::write(r.conf(), conf_body(OVERLAPPING_ROUTE, 2)).unwrap();
+    assert!(
+        wait_for(&r, "equal specificity", 1),
+        "the overlapping routes were not refused\n{}",
+        r.svc.output()
+    );
+    assert_names_the_overlap(&r.svc.output());
+    assert_eq!(r.count("Reload complete"), 0, "{}", r.svc.output());
+    assert!(status_of(&r.socket, "/assets/a.txt")
+        .unwrap()
+        .contains("200"));
+
+    // The refusal is not sticky: removing the overlap reloads.
+    std::fs::write(r.conf(), conf_body("", 2)).unwrap();
+    assert!(
+        wait_for(&r, "Reload complete", 1),
+        "the fixed config never reloaded\n{}",
+        r.svc.output()
+    );
 }
 
 #[test]

@@ -147,6 +147,11 @@ Comments only.
 
 ### Changed
 
+**Two routes that match the same paths with equal specificity are now a configuration error, and the service refuses to load such a config (#289).**
+Until now the first declared route answered and the second could never be reached, with nothing logged. The check runs once when a config loads (start, reload and `--dump-config`), never per request, and compares the compiled patterns segment by segment, so `/blog/{slug}` and `/blog/{name}` conflict while `/blog/{slug}` and `/news/{slug}` do not. Two routes that can only answer different methods do not conflict.
+Migration: the error reads `routes "/blog/{slug}" ([[route]] number 1) and "/blog/{name}" ([[route]] number 2) match the same paths with equal specificity (e.g. "/blog/x"); remove one or make one more specific`. Start exits 2, `--dump-config` exits 2, and a reload keeps the running config and logs the same text. Remove one of the two routes, or give one a literal segment where the other has a parameter.
+Verified by unit tests of the overlap rule (including the pairs that must not conflict), by m6-html and m6-file refusing to start, `--dump-config` refusing, and an m6-file reload into an overlapping config being refused while the old routes keep answering. m6-http needed no change: its `matchit` table already fails to build on such a pair, and a test pins that.
+
 **Debug and test builds carry line tables only, and no debug information for dependencies, so a full test build is 3.7 GB instead of 12 GB (#303).**
 Every file under a crate's `tests/` is its own binary, and each linked every dependency with full debug information. A full check filled about 16 GB, more than a hosted CI runner's free disk, and CI jobs died mid-build. Measured on the build host on one commit with `cargo test --workspace --no-run`: `target/debug` went from 12 GB to 3.7 GB and the build from 411 s to 282 s. Backtraces still show file and line.
 
@@ -179,8 +184,8 @@ They fail if a change to argument parsing or the config merge turns a clear exit
 **Tests now cover the shutdown signals every service shares (#288).**
 They fail if a second SIGTERM stops forcing exit during a drain, if SIGINT leaves the graceful path, or if a request in flight at SIGTERM is cut off.
 
-**Tests now cover the route tie-break, params precedence, the query and path-parameter clash, and a route status reaching the response (#289, #290, #291, #292).**
-They fail if equal routes stop resolving to the first declaration, if a global params key beats a route key, if a changed params file is missed after a restart, if a query key replaces a path parameter, or if a route status is dropped.
+**Tests now cover params precedence, the query and path-parameter clash, and a route status reaching the response (#290, #291, #292).**
+They fail if a global params key beats a route key, if a changed params file is missed after a restart, if a query key replaces a path parameter, or if a route status is dropped.
 
 **Tests now cover the auth path (#295, #296).**
 They fail if a public route runs auth code with or without a token or from the cache, or if a browser stops being redirected to `/login?next=<path>` or `/auth/refresh` while an API client gets 401.

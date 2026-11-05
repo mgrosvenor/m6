@@ -417,7 +417,7 @@ Routes registered in code take precedence over config routes for the same path. 
 
 ### Route matching
 
-Specificity wins: exact paths beat parameterised, longer beats shorter. First declaration breaks ties among equal-specificity patterns (warning logged). Unmatched path → 404.
+Specificity wins: exact paths beat parameterised, longer beats shorter. Two routes that match the same paths with equal specificity are a configuration error: the service refuses to start (exit 2), `--dump-config` fails, and a reload keeps the running config. The message names both routes and one path they both match, for example `routes "/blog/{slug}" ([[route]] number 1) and "/blog/{name}" ([[route]] number 2) match the same paths with equal specificity (e.g. "/blog/x"); remove one or make one more specific`. A GET route and a POST route on one path do not conflict. Unmatched path → 404.
 
 Path param values are validated before use: alphanumeric, hyphens, and underscores only (plus `.` and `/` for `{relpath}`). No `..` sequences. Invalid values → 400.
 

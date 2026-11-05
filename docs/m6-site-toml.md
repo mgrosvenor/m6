@@ -530,7 +530,7 @@ In an app, `req.touch("site.toml")` touches the file the app reads, which is the
 
 ## 5. Route Matching
 
-Specificity wins: exact paths beat parameterised, longer beats shorter. First declaration breaks ties among equal-specificity patterns (with a warning logged).
+Specificity wins: exact paths beat parameterised, longer beats shorter. The edge builds its table with `matchit`, which refuses two patterns that match the same paths (`/blog/{slug}` and `/blog/{name}`), so such a `site.toml` fails to load.
 
 ---
 

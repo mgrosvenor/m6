@@ -491,6 +491,24 @@ mod tests {
         assert!(table.at("/other").is_none());
     }
 
+    /// The edge has no equal-specificity tie to resolve: `matchit` refuses to
+    /// build a table in which two patterns could match the same path, so a
+    /// config like `/blog/{slug}` and `/blog/{name}` fails at load here too.
+    /// The wrong outcome: a later `matchit` change that accepts the pair would
+    /// leave one route unreachable with no error.
+    #[test]
+    fn test_parameter_routes_that_match_the_same_paths_fail_to_build() {
+        let config = make_config(
+            vec![
+                make_route("/blog/{slug}", "b"),
+                make_route("/blog/{name}", "b"),
+            ],
+            vec![make_backend("b")],
+        );
+        let err = RouteTable::from_config(&config).err().expect("must refuse");
+        assert!(err.to_string().contains("/blog/{name}"), "{err}");
+    }
+
     #[test]
     fn test_no_match_returns_none() {
         let config = make_config(vec![make_route("/", "b")], vec![make_backend("b")]);

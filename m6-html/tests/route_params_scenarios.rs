@@ -11,7 +11,7 @@ use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use m6_core::testkit::{binary, Service};
 
@@ -103,30 +103,35 @@ fn http_request(socket_path: &Path, request: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Two routes of equal specificity match one path (`/blog/{slug}` then
-/// `/blog/{name}`). The wrong outcome this catches: the tie-break flips so the
-/// later declaration answers, leaving the first route silently unreachable.
+/// `/blog/{name}`). The wrong outcome this catches: `m6-html` starts, one route
+/// is silently unreachable, and the operator is never told. The start must
+/// refuse and name both routes.
 #[test]
-fn equal_specificity_tie_first_declared_route_answers() {
-    let (_guard, socket_path) = spawn_server("tie", &fixtures_dir(), &config_path("tie.conf"));
+fn equal_specificity_tie_refuses_to_start_and_names_both_routes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // Spawned, not `output()`: a service that wrongly starts never exits, and
+    // the test must fail on the deadline rather than hang.
+    let mut svc = Service::spawn(
+        "m6-html",
+        Command::new(binary("m6-html"))
+            .arg(fixtures_dir())
+            .arg(config_path("tie.conf"))
+            .env("M6_SOCKET_OVERRIDE", dir.path().join("tie.sock")),
+    );
+    let status = svc.wait_for_exit(Instant::now() + Duration::from_secs(30));
+    let stderr = svc.output();
 
-    let resp = http_request(
-        &socket_path,
-        "GET /blog/hello HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    assert_eq!(
+        status.and_then(|s| s.code()),
+        Some(2),
+        "the service did not refuse and exit 2: {stderr}"
     );
     assert!(
-        resp.contains("200 OK"),
-        "expected 200, got: {}",
-        &resp[..resp.len().min(300)]
+        stderr.contains("\"/blog/{slug}\"") && stderr.contains("\"/blog/{name}\""),
+        "both routes must be named, got: {stderr}"
     );
-    assert!(
-        resp.contains("FIRST-ROUTE"),
-        "expected the first declared route to answer the tie, got: {}",
-        &resp[..resp.len().min(300)]
-    );
-    assert!(
-        !resp.contains("SECOND-ROUTE"),
-        "the later route answered a tie it must lose"
-    );
+    assert!(stderr.contains("equal specificity"), "{stderr}");
+    assert!(stderr.contains("(e.g. \"/blog/x\")"), "{stderr}");
 }
 
 // ---------------------------------------------------------------------------

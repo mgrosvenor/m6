@@ -236,6 +236,12 @@ pub enum RouteMethod {
 }
 
 impl RouteMethod {
+    /// Can one request method satisfy both? Only `Any` crosses methods, and
+    /// `Get` answers `HEAD` too, which no other method does.
+    fn overlaps(&self, other: &RouteMethod) -> bool {
+        self == other || *self == RouteMethod::Any || *other == RouteMethod::Any
+    }
+
     fn matches(&self, method: &str) -> bool {
         match self {
             RouteMethod::Any => true,
@@ -382,6 +388,117 @@ pub fn route_specificity(segments: &[Segment]) -> i32 {
         }
     }
     score
+}
+
+/// One path that both patterns match, or `None` if no path does.
+///
+/// Mirrors `match_route`: a literal must equal the path segment, a parameter
+/// takes any one segment, a trailing wildcard takes one or more, and without a
+/// wildcard the segment counts must be equal. A wildcard matches whatever the
+/// other pattern has opposite it, so it only ever needs comparing as a
+/// parameter.
+fn shared_path(a: &[Segment], b: &[Segment]) -> Option<String> {
+    let ends_in_wildcard = |s: &[Segment]| matches!(s.last(), Some(Segment::Wildcard(_)));
+    let len = match (ends_in_wildcard(a), ends_in_wildcard(b)) {
+        (false, false) if a.len() == b.len() => a.len(),
+        (false, false) => return None,
+        (true, false) if b.len() >= a.len() => b.len(),
+        (false, true) if a.len() >= b.len() => a.len(),
+        (true, false) | (false, true) => return None,
+        (true, true) => a.len().max(b.len()),
+    };
+    let mut path = String::new();
+    for i in 0..len {
+        let literal = match (a.get(i), b.get(i)) {
+            (Some(Segment::Literal(x)), Some(Segment::Literal(y))) if x != y => return None,
+            (Some(Segment::Literal(x)), _) | (_, Some(Segment::Literal(x))) => x.as_str(),
+            _ => "x",
+        };
+        path.push('/');
+        path.push_str(literal);
+    }
+    Some(if path.is_empty() { "/".into() } else { path })
+}
+
+/// Refuse a route table in which two routes would answer the same request with
+/// the same specificity. `find_route` would keep the first declared and the
+/// second could never answer, which is a config mistake an operator should
+/// hear about when the config loads, not discover as a page that never changes.
+///
+/// Runs once per load over the whole table, never per request.
+///
+/// A config `[[route]]` with the same pattern as a code route and neither a
+/// template nor a handler is how a config gives that code route its `cache`
+/// setting (see `FrameworkState::build`), so that pair is not a conflict.
+pub fn check_route_overlaps(
+    code_routes: &[(String, RouteMethod)],
+    config_routes: &[crate::config::RouteConfig],
+) -> anyhow::Result<()> {
+    struct Entry<'a> {
+        origin: String,
+        from_code: bool,
+        pattern: &'a str,
+        method: RouteMethod,
+        segments: Vec<Segment>,
+        declares_code_route: bool,
+    }
+    let code = code_routes.iter().map(|(p, m)| Entry {
+        origin: "code route".to_string(),
+        from_code: true,
+        pattern: p,
+        method: m.clone(),
+        segments: compile_pattern(p),
+        declares_code_route: false,
+    });
+    let config = config_routes.iter().enumerate().map(|(i, rc)| Entry {
+        origin: format!("[[route]] number {}", i + 1),
+        from_code: false,
+        pattern: &rc.path,
+        method: config_route_method(rc),
+        segments: compile_pattern(&rc.path),
+        declares_code_route: rc.template.is_none()
+            && rc.handler.is_none()
+            && code_routes.iter().any(|(p, _)| *p == rc.path),
+    });
+    let entries: Vec<Entry> = code.chain(config).collect();
+
+    for (i, a) in entries.iter().enumerate() {
+        for b in &entries[i + 1..] {
+            if route_specificity(&a.segments) != route_specificity(&b.segments)
+                || !a.method.overlaps(&b.method)
+                || (a.from_code && b.declares_code_route && a.pattern == b.pattern)
+            {
+                continue;
+            }
+            if let Some(example) = shared_path(&a.segments, &b.segments) {
+                anyhow::bail!(
+                    "routes \"{}\" ({}) and \"{}\" ({}) match the same paths with equal \
+                     specificity (e.g. \"{example}\"); remove one or make one more specific",
+                    a.pattern,
+                    a.origin,
+                    b.pattern,
+                    b.origin
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The method a config `[[route]]` answers. A list of several methods answers
+/// every method: `RouteMethod` names one or all.
+fn config_route_method(rc: &crate::config::RouteConfig) -> RouteMethod {
+    match rc.methods.as_deref() {
+        Some([only]) => match only.as_str() {
+            "GET" => RouteMethod::Get,
+            "POST" => RouteMethod::Post,
+            "PUT" => RouteMethod::Put,
+            "PATCH" => RouteMethod::Patch,
+            "DELETE" => RouteMethod::Delete,
+            _ => RouteMethod::Any,
+        },
+        _ => RouteMethod::Any,
+    }
 }
 
 /// Stable string key for a `RouteMethod` — used to disambiguate handlers
@@ -554,6 +671,8 @@ impl FrameworkState {
         code_routes: &[(String, RouteMethod)],
         renderer_factory: &dyn RendererFactory,
     ) -> anyhow::Result<Self> {
+        check_route_overlaps(code_routes, &config.routes)?;
+
         // Compile routes from config.
         let mut routes = Vec::new();
 
@@ -596,22 +715,7 @@ impl FrameworkState {
         for rc in &config.routes {
             let segs = compile_pattern(&rc.path);
             let spec = route_specificity(&segs);
-            let method = if let Some(methods) = &rc.methods {
-                if methods.len() == 1 {
-                    match methods[0].as_str() {
-                        "GET" => RouteMethod::Get,
-                        "POST" => RouteMethod::Post,
-                        "PUT" => RouteMethod::Put,
-                        "PATCH" => RouteMethod::Patch,
-                        "DELETE" => RouteMethod::Delete,
-                        _ => RouteMethod::Any,
-                    }
-                } else {
-                    RouteMethod::Any
-                }
-            } else {
-                RouteMethod::Any
-            };
+            let method = config_route_method(rc);
             routes.push(CompiledRoute {
                 pattern: rc.path.clone(),
                 method,
@@ -2516,6 +2620,11 @@ fn dump_config(
             return 2;
         }
     };
+
+    if let Err(e) = check_route_overlaps(code_routes, &config.routes) {
+        eprintln!("Config error: {e}");
+        return 2;
+    }
 
     println!("site_dir    {}", site_dir.display());
     println!("config      {}", config_path.display());
@@ -5154,5 +5263,195 @@ mod copy_audit {
             println!("| {what} | {ns} |");
         }
         println!("| **total per request** | **{total}** |");
+    }
+}
+
+#[cfg(test)]
+mod route_overlap_tests {
+    use super::*;
+    use crate::config::RouteConfig;
+
+    fn config_route(path: &str, methods: Option<&[&str]>) -> RouteConfig {
+        RouteConfig {
+            path: path.to_string(),
+            template: Some("t.html".to_string()),
+            params: Vec::new(),
+            status: 200,
+            cache: "public".to_string(),
+            methods: methods.map(|m| m.iter().map(|s| s.to_string()).collect()),
+            headers: Vec::new(),
+            handler: None,
+            settings: Arc::new(Map::new()),
+        }
+    }
+
+    /// The error `check_route_overlaps` gives for these config routes, or
+    /// `None` if it accepts them.
+    fn refusal(paths: &[&str]) -> Option<String> {
+        let routes: Vec<_> = paths.iter().map(|p| config_route(p, None)).collect();
+        check_route_overlaps(&[], &routes)
+            .err()
+            .map(|e| e.to_string())
+    }
+
+    fn accepted(paths: &[&str]) {
+        assert_eq!(refusal(paths), None, "{paths:?} must not conflict");
+    }
+
+    /// The bug: two routes for one path, the later one unreachable, and nothing
+    /// said. The refusal names both routes as written, where each came from and
+    /// a path both match.
+    #[test]
+    fn two_parameter_routes_for_one_path_are_refused_with_both_named() {
+        assert_eq!(
+            refusal(&["/blog/{slug}", "/blog/{name}"]).unwrap(),
+            "routes \"/blog/{slug}\" ([[route]] number 1) and \"/blog/{name}\" \
+             ([[route]] number 2) match the same paths with equal specificity \
+             (e.g. \"/blog/x\"); remove one or make one more specific"
+        );
+    }
+
+    /// The same pattern twice is the plainest tie.
+    #[test]
+    fn the_same_pattern_twice_is_refused() {
+        assert!(refusal(&["/about", "/about"])
+            .unwrap()
+            .contains("\"/about\""));
+        assert!(refusal(&["/", "/"]).unwrap().contains("(e.g. \"/\")"));
+    }
+
+    /// Different specificity is the rule working, not a conflict. A check that
+    /// refused every overlap would reject the exact-beats-parameter pair that
+    /// the matcher exists to resolve.
+    #[test]
+    fn overlap_with_different_specificity_is_accepted() {
+        accepted(&["/blog/{slug}", "/blog/latest"]);
+        accepted(&["/assets/{name}", "/assets/{*rest}"]);
+        accepted(&["/a/{x}", "/a/b"]);
+    }
+
+    /// Routes that no path can match both of. A check that compared only the
+    /// segment count would refuse these.
+    #[test]
+    fn routes_with_disjoint_literals_are_accepted() {
+        accepted(&["/blog/{slug}", "/news/{slug}"]);
+        accepted(&["/a/{x}/c", "/a/{x}/d"]);
+    }
+
+    /// Without a wildcard, a different number of segments cannot match the
+    /// same path.
+    #[test]
+    fn routes_of_different_lengths_are_accepted() {
+        // Both score 6, so only the segment count tells them apart.
+        accepted(&["/a/b", "/{x}/{y}/{z}"]);
+        accepted(&["/{x}/{y}/{z}", "/a/b"]);
+    }
+
+    /// `/a/{x}` and `/{y}/b` both match `/a/b` and score the same, so they tie
+    /// there even though neither pattern repeats the other.
+    #[test]
+    fn a_literal_and_a_parameter_in_swapped_positions_tie() {
+        let e = refusal(&["/a/{x}", "/{y}/b"]).unwrap();
+        assert!(e.contains("(e.g. \"/a/b\")"), "{e}");
+    }
+
+    /// Equal specificity needs equal scores. Here both match `/a/b/x` but the
+    /// literal count differs, so `find_route` already orders them.
+    #[test]
+    fn overlap_is_judged_only_between_equal_scores() {
+        accepted(&["/a/{x}/{y}", "/a/b/{q}"]);
+        let e = refusal(&["/a/{x}/{y}", "/{p}/b/{q}"]).unwrap();
+        assert!(e.contains("(e.g. \"/a/b/x\")"), "{e}");
+    }
+
+    /// A trailing wildcard matches any longer path, so two wildcard routes of
+    /// the same score under a shared prefix tie, and the example is long
+    /// enough for the longer pattern.
+    #[test]
+    fn two_wildcards_under_one_prefix_are_refused() {
+        let e = refusal(&["/assets/{*rest}", "/assets/{*other}"]).unwrap();
+        assert!(e.contains("(e.g. \"/assets/x\")"), "{e}");
+    }
+
+    /// A wildcard route and a longer parameter route tie when their scores
+    /// match, and the path they share is as long as the longer route.
+    #[test]
+    fn a_wildcard_ties_with_a_route_it_can_reach_past() {
+        // /a/{*r}: 2*2 + 1 - 1 = 4.  /a/{x}/{y}: 2*3 + 1 = 7.  No tie.
+        accepted(&["/a/{*r}", "/a/{x}/{y}"]);
+        // /{*r}: 2 - 1 = 1.  /{x}: 2.  No tie; one is reachable from the other.
+        accepted(&["/{*r}", "/{x}"]);
+        // /a/b/{*r}: 6 + 2 - 1 = 7.  /a/{x}/{y}: 7.  Tie on /a/b/x.
+        let e = refusal(&["/a/b/{*r}", "/a/{x}/{y}"]).unwrap();
+        assert!(e.contains("(e.g. \"/a/b/x\")"), "{e}");
+    }
+
+    /// Two wildcard or wildcard-and-fixed routes of equal score that no path
+    /// can match both of: different literals, or a fixed route shorter than
+    /// the wildcard's own fixed part.
+    #[test]
+    fn wildcard_routes_that_cannot_share_a_path_are_accepted() {
+        accepted(&["/a/{*r}", "/b/{*s}"]);
+        // Both score 7. A path for the second has three segments, and the
+        // first needs at least four.
+        accepted(&["/{a}/{b}/{c}/{*r}", "/x/{y}/{z}"]);
+        accepted(&["/x/{y}/{z}", "/{a}/{b}/{c}/{*r}"]);
+        // Both score 7, and `b` is not `c`.
+        accepted(&["/a/b/{*r}", "/a/c/{*s}"]);
+    }
+
+    /// Methods that cannot both answer one request do not conflict, which is
+    /// how a GET and a POST share a path. `Any` answers every method, so it
+    /// conflicts with all of them.
+    #[test]
+    fn routes_conflict_only_if_a_method_is_shared() {
+        let check = |a: Option<&[&str]>, b: Option<&[&str]>| {
+            check_route_overlaps(&[], &[config_route("/f", a), config_route("/f", b)]).is_err()
+        };
+        assert!(!check(Some(&["GET"]), Some(&["POST"])));
+        assert!(check(Some(&["GET"]), Some(&["GET"])));
+        assert!(check(Some(&["GET"]), None));
+        assert!(check(None, Some(&["DELETE"])));
+    }
+
+    /// Code routes count too, and the error says which kind each one is.
+    #[test]
+    fn a_code_route_and_a_config_route_with_a_template_conflict() {
+        let code = [("/blog/{slug}".to_string(), RouteMethod::Get)];
+        let e = check_route_overlaps(&code, &[config_route("/blog/{name}", None)])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("(code route)") && e.contains("([[route]] number 1)"),
+            "{e}"
+        );
+    }
+
+    /// A `[[route]]` with the pattern of a code route and no template or
+    /// handler is how a config sets that code route's cache. Refusing it would
+    /// break every service that does so.
+    #[test]
+    fn a_config_route_that_declares_a_code_route_is_not_a_conflict() {
+        let code = [("/api/{id}".to_string(), RouteMethod::Get)];
+        let mut declaration = config_route("/api/{id}", None);
+        declaration.template = None;
+        assert!(check_route_overlaps(&code, &[declaration]).is_ok());
+    }
+
+    /// The check is where `FrameworkState::build` starts, so every load path
+    /// (start and reload) refuses.
+    #[test]
+    fn building_the_state_refuses_the_conflict() {
+        let config = crate::config::RendererConfig {
+            routes: vec![
+                config_route("/blog/{slug}", None),
+                config_route("/blog/{name}", None),
+            ],
+            ..Default::default()
+        };
+        let err = FrameworkState::build(config, PathBuf::from("."), &[], &*default_renderer())
+            .err()
+            .expect("the conflicting config must not build");
+        assert!(err.to_string().contains("equal specificity"), "{err}");
     }
 }

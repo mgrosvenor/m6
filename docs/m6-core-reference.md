@@ -200,6 +200,7 @@ Both return `Result`, so a service that cannot build its state fails at startup,
 
 Routing: `compile_pattern` turns `/blog/{stem}` into `Vec<Segment>`, `route_specificity` scores a compiled route so a literal beats a parameter, and `match_route` returns `PathParams` as a `Vec<(String, String)>` because order is meaningful and duplicates are possible.
 `find_route` picks the winner.
+`check_route_overlaps` runs once when a config loads and refuses two routes that match a common path with equal specificity, so two routes that can answer one request never tie, except a `[[route]]` that only declares a code route's cache.
 Route matching existed three times before this, twice hand-rolled with different specificity rules, so the same route table could resolve differently in two services.
 
 The thread pool: `ThreadPool::new(size, queue_size)`, or `new_with_exit(size, queue_size, on_thread_exit)` to run a callback when each worker thread ends.
