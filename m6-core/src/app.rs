@@ -3081,6 +3081,32 @@ fn handle_connection(
     }
 }
 
+/// The body minified for `mime`, or `None` when that type is not minified.
+#[cfg(feature = "minify")]
+fn minified(
+    mime: &str,
+    bytes: &[u8],
+    config: &crate::config::MinificationConfig,
+) -> Option<Vec<u8>> {
+    if !config.is_enabled(mime) {
+        return None;
+    }
+    match mime {
+        "text/html" => Some(crate::minify::minify_html(bytes, config.inline_js)),
+        "text/css" => Some(crate::minify::minify_css(bytes)),
+        "application/json" => Some(crate::minify::minify_json(bytes)),
+        "application/javascript" | "text/javascript" => Some(crate::minify::minify_js(bytes)),
+        _ => None,
+    }
+}
+
+/// Without the `minify` feature the config loader has already refused any
+/// config that turns minification on, so there is nothing to do.
+#[cfg(not(feature = "minify"))]
+fn minified(_: &str, _: &[u8], _: &crate::config::MinificationConfig) -> Option<Vec<u8>> {
+    None
+}
+
 fn handle_request<W: std::io::Write>(
     raw: RawRequest,
     stream: &mut crate::h1::Responder<'_, W>,
@@ -3334,21 +3360,8 @@ fn handle_request<W: std::io::Write>(
                     crate::headers::get(&resp.headers[..], "content-type").unwrap_or("");
                 let mime = content_type.split(';').next().unwrap_or("").trim();
 
-                if minification.is_enabled(mime) {
-                    let minified = match mime {
-                        "text/html" => {
-                            Some(crate::minify::minify_html(bytes, minification.inline_js))
-                        }
-                        "text/css" => Some(crate::minify::minify_css(bytes)),
-                        "application/json" => Some(crate::minify::minify_json(bytes)),
-                        "application/javascript" | "text/javascript" => {
-                            Some(crate::minify::minify_js(bytes))
-                        }
-                        _ => None,
-                    };
-                    if let Some(m) = minified {
-                        resp.body = crate::response::Body::Bytes(m);
-                    }
+                if let Some(m) = minified(mime, bytes, minification) {
+                    resp.body = crate::response::Body::Bytes(m);
                 }
             }
         }

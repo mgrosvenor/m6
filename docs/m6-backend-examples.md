@@ -324,16 +324,17 @@ The `rust-m6core` example registers a catch-all `/{*any}` route last, so its 404
 
 This is worth knowing before reading the examples side by side and wondering why one needed an extra route.
 
-### 10.3. Core minifies, and the examples must not
+### 10.3. Core compresses, and the examples must not
 
 Core's pipeline minifies and compresses what a handler returns.
 That is correct for a service returning a document, and wrong for these examples.
 
 Protocol section 3.6 makes compression the backend's job, and a backend MAY compress.
 These examples choose not to, and declare `compresses = false`.
-They also disable minification, because a minified body would make `rust-m6core`'s `/boom` 167 bytes where the other five send 178.
+`rust-m6core` takes core with `default-features = false`, so built on its own (`cargo build -p m6-example-rust-m6core`) it links no minifier.
+The test suite builds it with `--workspace`, where cargo unifies features and `m6-html` turns `minify` on, and then a minified body would make its `/boom` 167 bytes where the other five send 178.
 
-Both HTML routes and `/status` in that example are therefore `.verbatim()`, which stops both minification and compression.
+Both HTML routes and `/status` in that example are therefore `.verbatim()`, which stops compression, and minification in a build that has the `minify` feature.
 `/status` would need it regardless, because identical bytes across six languages is the whole point of that route, and anything that re-encodes could re-space them.
 
 ### 10.4. A backend's 404 body never reaches the client

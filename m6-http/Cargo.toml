@@ -77,7 +77,7 @@ serde_json     = "1"
 toml           = "0.8"
 anyhow         = "1"
 thiserror      = "1"
-m6-core        = { path = "../m6-core" }
+m6-core        = { path = "../m6-core", default-features = false }
 tracing        = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 jsonwebtoken   = "9"
@@ -122,7 +122,7 @@ httpdate       = "1"
 inotify = "0.10"
 
 [dev-dependencies]
-m6-core       = { path = "../m6-core", features = ["testkit"] }
+m6-core       = { path = "../m6-core", default-features = false, features = ["testkit"] }
 tempfile      = "3"
 # Setting a file's mtime is not in std, and the scratch-sweep test has to age a
 # directory to prove the sweep looks at age at all. Already in the lock as a

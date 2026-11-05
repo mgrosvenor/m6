@@ -476,18 +476,7 @@ fn parse_config(tv: toml::Value, _site_dir: &Path) -> anyhow::Result<RendererCon
     }
 
     // --- minification ---
-    let mut minification = default_minification();
-    if let Some(toml::Value::Table(tbl)) = tv.get("minification") {
-        for (key, val) in tbl {
-            if key == "inline_js" {
-                minification.inline_js = val.as_bool().unwrap_or(false);
-            } else {
-                minification
-                    .enabled
-                    .insert(key.clone(), val.as_bool().unwrap_or(false));
-            }
-        }
-    }
+    let minification = parse_minification(tv.get("minification"), cfg!(feature = "minify"))?;
 
     // --- user config (strip framework keys) ---
     let mut user_config = Map::new();
@@ -541,6 +530,39 @@ fn parse_config(tv: toml::Value, _site_dir: &Path) -> anyhow::Result<RendererCon
         log,
         site_toml,
     })
+}
+
+/// Reads `[minification]`. The minifiers are only linked with the `minify`
+/// feature, so without them nothing is on by default and a config that turns
+/// minification on is refused, rather than quietly serving unminified bodies.
+fn parse_minification(
+    table: Option<&toml::Value>,
+    minifiers_linked: bool,
+) -> anyhow::Result<MinificationConfig> {
+    let mut minification = if minifiers_linked {
+        default_minification()
+    } else {
+        MinificationConfig::default()
+    };
+    if let Some(toml::Value::Table(tbl)) = table {
+        for (key, val) in tbl {
+            if key == "inline_js" {
+                minification.inline_js = val.as_bool().unwrap_or(false);
+            } else {
+                minification
+                    .enabled
+                    .insert(key.clone(), val.as_bool().unwrap_or(false));
+            }
+        }
+    }
+    let asked = minification.inline_js || minification.enabled.values().any(|&on| on);
+    if asked && !minifiers_linked {
+        anyhow::bail!(
+            "[minification] turns minification on, but this build of m6-core has no minifiers: \
+             build it with the `minify` feature"
+        );
+    }
+    Ok(minification)
 }
 
 fn parse_routes(val: Option<&toml::Value>) -> anyhow::Result<Vec<RouteConfig>> {
@@ -713,6 +735,36 @@ mod tests {
             .collect();
         extra.sort();
         assert!(extra.is_empty(), "compressed but not minified: {extra:?}");
+    }
+
+    #[test]
+    fn minification_asked_for_without_the_minify_feature_is_refused_by_name() {
+        for body in ["\"text/html\" = true", "inline_js = true"] {
+            let table: toml::Value = toml::from_str(&format!("[minification]\n{body}"))
+                .map(|v: toml::Value| v["minification"].clone())
+                .unwrap();
+            let err = parse_minification(Some(&table), false)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("`minify` feature"), "{body}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_build_without_the_minify_feature_loads_a_config_that_leaves_minification_off() {
+        let none = parse_minification(None, false).unwrap();
+        assert!(!none.is_enabled("text/html"));
+        let off: toml::Value = toml::from_str("\"text/html\" = false\ninline_js = false").unwrap();
+        assert!(!parse_minification(Some(&off), false)
+            .unwrap()
+            .is_enabled("text/html"));
+    }
+
+    #[test]
+    fn a_build_with_the_minify_feature_minifies_by_default() {
+        assert!(parse_minification(None, true)
+            .unwrap()
+            .is_enabled("text/html"));
     }
 
     #[test]
