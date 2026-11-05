@@ -11,7 +11,10 @@ use std::net::TcpStream;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::mpsc;
 
-use crate::forward::{HttpRequest, HttpResponse, HOP_BY_HOP};
+use crate::forward::{
+    apply_response_block, too_many_informational, HttpRequest, HttpResponse, ResponseBlock,
+    HOP_BY_HOP,
+};
 use crate::poller::{Poller, Token};
 
 // ── Frame constants ───────────────────────────────────────────────────────────
@@ -41,6 +44,8 @@ struct H2cStream {
     resp_headers: Vec<(String, String)>,
     resp_body: Vec<u8>,
     headers_done: bool,
+    /// Informational (1xx) header blocks seen so far on this stream.
+    informational: usize,
     tx: mpsc::Sender<io::Result<HttpResponse>>,
     // The request body still owed to the peer, and how much of it has gone out.
     // The body is resumable state rather than a loop because credit arrives
@@ -214,6 +219,7 @@ impl H2cClientConn {
                 resp_headers: vec![],
                 resp_body: vec![],
                 headers_done: false,
+                informational: 0,
                 tx,
                 pending_body: if has_body {
                     req.body.clone()
@@ -476,30 +482,9 @@ impl H2cClientConn {
                     }
 
                     if flags & FLAG_END_HEADERS != 0 {
-                        let block = std::mem::take(&mut self.header_block_acc);
-                        match self.hpack_dec.decode(&block) {
-                            Ok(pairs) => {
-                                if let Some(s) = self.streams.get_mut(&stream_id) {
-                                    for (k, v) in pairs {
-                                        if k == b":status" {
-                                            s.resp_status =
-                                                String::from_utf8_lossy(&v).parse().unwrap_or(0);
-                                        } else {
-                                            s.resp_headers.push((
-                                                String::from_utf8_lossy(&k).into_owned(),
-                                                String::from_utf8_lossy(&v).into_owned(),
-                                            ));
-                                        }
-                                    }
-                                    s.headers_done = true;
-                                }
-                            }
-                            Err(e) => {
-                                self.mark_dead(&format!("h2c: HPACK decode error: {:?}", e));
-                                return;
-                            }
+                        if !self.finish_header_block(stream_id) {
+                            return;
                         }
-                        self.continuation_stream = None;
                     } else {
                         self.continuation_stream = Some(stream_id);
                     }
@@ -512,31 +497,8 @@ impl H2cClientConn {
                 TYPE_CONTINUATION if stream_id > 0 => {
                     self.header_block_acc.extend_from_slice(&payload);
 
-                    if flags & FLAG_END_HEADERS != 0 {
-                        let block = std::mem::take(&mut self.header_block_acc);
-                        match self.hpack_dec.decode(&block) {
-                            Ok(pairs) => {
-                                if let Some(s) = self.streams.get_mut(&stream_id) {
-                                    for (k, v) in pairs {
-                                        if k == b":status" {
-                                            s.resp_status =
-                                                String::from_utf8_lossy(&v).parse().unwrap_or(0);
-                                        } else {
-                                            s.resp_headers.push((
-                                                String::from_utf8_lossy(&k).into_owned(),
-                                                String::from_utf8_lossy(&v).into_owned(),
-                                            ));
-                                        }
-                                    }
-                                    s.headers_done = true;
-                                }
-                            }
-                            Err(e) => {
-                                self.mark_dead(&format!("h2c: HPACK decode error: {:?}", e));
-                                return;
-                            }
-                        }
-                        self.continuation_stream = None;
+                    if flags & FLAG_END_HEADERS != 0 && !self.finish_header_block(stream_id) {
+                        return;
                     }
                 }
 
@@ -674,6 +636,41 @@ impl H2cClientConn {
         if let Some(reason) = eof {
             self.mark_dead(&reason);
         }
+    }
+
+    /// Decode the accumulated header block and apply it to its stream.
+    ///
+    /// Returns false when the connection is dead and the caller must stop.
+    fn finish_header_block(&mut self, stream_id: u32) -> bool {
+        let block = std::mem::take(&mut self.header_block_acc);
+        let pairs = match self.hpack_dec.decode(&block) {
+            Ok(pairs) => pairs,
+            Err(e) => {
+                self.mark_dead(&format!("h2c: HPACK decode error: {:?}", e));
+                return false;
+            }
+        };
+        self.continuation_stream = None;
+        let Some(s) = self.streams.get_mut(&stream_id) else {
+            return true;
+        };
+        match apply_response_block(
+            pairs,
+            &mut s.resp_status,
+            &mut s.resp_headers,
+            &mut s.informational,
+        ) {
+            ResponseBlock::Final => s.headers_done = true,
+            ResponseBlock::Informational => {}
+            ResponseBlock::TooManyInformational => {
+                // Fail this stream only. The connection is healthy.
+                if let Some(s) = self.streams.remove(&stream_id) {
+                    let _ = s.tx.send(Err(too_many_informational()));
+                }
+                self.push_frame(TYPE_RST_STREAM, 0, stream_id, &8u32.to_be_bytes());
+            }
+        }
+        true
     }
 
     /// Complete a stream: remove it and send the response (or an error) on tx.

@@ -549,6 +549,70 @@ pub fn forward_request_timeout(
 /// sending them without end.
 const MAX_INFORMATIONAL: usize = 8;
 
+/// Whether a response status is informational and to be skipped: a 1xx other
+/// than 101, which is final for the exchange.
+fn is_skipped_informational(status: u16) -> bool {
+    (100..200).contains(&status) && status != 101
+}
+
+/// What a decoded HTTP/2 response header block turned out to be.
+pub enum ResponseBlock {
+    /// The final response, or trailers. Its fields are now in the response.
+    Final,
+    /// An informational block, discarded.
+    Informational,
+    /// The block that went past [`MAX_INFORMATIONAL`]. The stream should fail.
+    TooManyInformational,
+}
+
+/// Apply one decoded HTTP/2 response header block to a stream's response.
+///
+/// An informational block (RFC 9110 15.2) is not the answer, so it is dropped
+/// whole: its status and fields must not reach the final response, which the
+/// edge may cache. The HTTP/2 backbone clients share this so they cannot
+/// disagree with the HTTP/1.1 reader or with each other.
+pub fn apply_response_block(
+    pairs: Vec<(Vec<u8>, Vec<u8>)>,
+    status: &mut u16,
+    headers: &mut Vec<(String, String)>,
+    informational: &mut usize,
+) -> ResponseBlock {
+    let block_status = pairs
+        .iter()
+        .find(|(k, _)| k == b":status")
+        .and_then(|(_, v)| String::from_utf8_lossy(v).parse::<u16>().ok());
+    if block_status.is_some_and(is_skipped_informational) {
+        *informational += 1;
+        return if *informational > MAX_INFORMATIONAL {
+            ResponseBlock::TooManyInformational
+        } else {
+            ResponseBlock::Informational
+        };
+    }
+    for (k, v) in pairs {
+        if k == b":status" {
+            *status = String::from_utf8_lossy(&v).parse().unwrap_or(0);
+        } else {
+            headers.push((
+                String::from_utf8_lossy(&k).into_owned(),
+                String::from_utf8_lossy(&v).into_owned(),
+            ));
+        }
+    }
+    ResponseBlock::Final
+}
+
+/// The error for a backend that sent too many informational responses.
+pub fn too_many_informational() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "backend sent more than {MAX_INFORMATIONAL} informational responses \
+             without a final one"
+        ),
+    )
+}
+
 /// Read an HTTP/1.1 response from a synchronous stream.
 ///
 /// Kept for callers that genuinely cannot know the request method. Prefer
@@ -622,25 +686,22 @@ pub fn read_response_for<R: Read>(mut reader: R, request_method: &str) -> io::Re
             n_total += n;
         };
 
-        let header_section = std::str::from_utf8(&header_buf[..header_end]).map_err(|_| {
+        // Only the status line is read here. The whole head is decoded once,
+        // after the loop, for the response that is kept.
+        let head = &header_buf[..header_end];
+        let line_end = head
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .unwrap_or(head.len());
+        let status_line = std::str::from_utf8(&head[..line_end]).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidData, "response headers not UTF-8")
         })?;
-        let status_line = header_section
-            .split("\r\n")
-            .next()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty response"))?;
         let (status, reason) = parse_status_line(status_line)?;
 
-        if (100..200).contains(&status) && status != 101 {
+        if is_skipped_informational(status) {
             informational += 1;
             if informational > MAX_INFORMATIONAL {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "backend sent more than {MAX_INFORMATIONAL} informational responses \
-                         without a final one"
-                    ),
-                ));
+                return Err(too_many_informational());
             }
             let consumed = header_end + 4;
             header_buf.copy_within(consumed..n_total, 0);
@@ -652,9 +713,10 @@ pub fn read_response_for<R: Read>(mut reader: R, request_method: &str) -> io::Re
 
     let header_section = std::str::from_utf8(&header_buf[..header_end])
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "response headers not UTF-8"))?;
-    let mut lines = header_section.split("\r\n");
-    // The status line was parsed above.
-    lines.next();
+    let after_status_line = header_section
+        .split_once("\r\n")
+        .map_or("", |(_, rest)| rest);
+    let lines = after_status_line.split("\r\n");
 
     let mut headers: Vec<(String, String)> = Vec::with_capacity(16);
     let mut content_length: Option<usize> = None;

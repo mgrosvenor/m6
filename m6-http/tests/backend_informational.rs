@@ -77,4 +77,5 @@ fn eight_informational_responses_are_still_accepted() {
 fn nine_informational_responses_fail_the_fetch() {
     let err = fetch(9).expect_err("nine informational responses must fail");
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
+    assert!(err.to_string().contains("informational"), "{err}");
 }
