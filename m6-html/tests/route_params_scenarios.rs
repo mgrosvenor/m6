@@ -75,7 +75,13 @@ fn spawn_server(id: &str, site_dir: &Path, config: &Path) -> (Server, PathBuf) {
         svc.output()
     );
 
-    (Server { _svc: svc, _dir: dir }, socket_path)
+    (
+        Server {
+            _svc: svc,
+            _dir: dir,
+        },
+        socket_path,
+    )
 }
 
 /// Send a raw HTTP/1.1 request and return the full response string.
@@ -224,6 +230,12 @@ fn last_declared_route_params_file_wins() {
 /// A changed global params file is picked up after a restart. `/brand-global`
 /// renders `Global`, then `GlobalUpdated` after the file changes and the service
 /// restarts. The wrong outcome: the stale value survives a restart.
+///
+/// This asserts issue #290's required done-condition rather than an
+/// independently breakable bug. The service reads its global params fresh on
+/// every process start, and a full restart is a new process, so there is no
+/// single-line break that makes the restarted process serve the old value
+/// without adding a disk cache m6 does not have.
 #[test]
 fn global_params_change_picked_up_after_restart() {
     let site = copy_site_to_temp();
