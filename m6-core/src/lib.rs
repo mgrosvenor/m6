@@ -12,7 +12,7 @@ pub mod host;
 pub mod http;
 pub mod log;
 pub mod mime;
-/// The HTML, CSS, JavaScript and JSON minifiers. Off by default; see the
+/// The HTML, CSS, JavaScript and JSON minifiers. On by default; see the
 /// `minify` feature in Cargo.toml.
 #[cfg(feature = "minify")]
 pub mod minify;

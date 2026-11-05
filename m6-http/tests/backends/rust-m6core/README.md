@@ -30,9 +30,10 @@ maximises it, a route whose own work is copying 660 bytes, and behind the edge
 cache most requests never reach a backend at all. Both halves of that are true.
 `docs/BENCHMARKS.md` has the conditions.
 
-Three routes are `.verbatim()`: without it core minifies the HTML, which is core
-doing its job and wrong for a set of examples meant to be read side by side. See
-§10.3.
+Three routes are `.verbatim()`: without it core compresses the body, and would
+minify the HTML in a build with the `minify` feature, which is core doing its job
+and wrong for a set of examples meant to be read side by side. This example takes
+core with `default-features = false`, so it links no minifier. See §10.3.
 
 ## Run it
 

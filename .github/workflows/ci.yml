@@ -158,11 +158,13 @@ jobs:
       # the workspace build unifies features, and m6-html and m6-md take the defaults.
       - name: Core with no features, and services that link no engine
         run: |
-          cargo check -p m6-core --no-default-features 2>&1 | tee nofeat.log
+          set -o pipefail
+          cargo check -p m6-core --no-default-features > nofeat.log 2>&1 || { cat nofeat.log; echo "::error::m6-core does not build with no features"; exit 1; }
           n=$(grep -c '^warning' nofeat.log || true)
-          [ "$n" -eq 0 ] || { echo "::error::$n warning(s) building m6-core with no features"; exit 1; }
+          [ "$n" -eq 0 ] || { cat nofeat.log; echo "::error::$n warning(s) building m6-core with no features"; exit 1; }
           for p in m6-http m6-monitor m6-auth-server m6-auth-cli; do
-            if cargo tree -e normal -p "$p" | grep -E ' (lightningcss|minify-html|minify-js|tera|comrak) v'; then
+            tree=$(cargo tree -e normal -p "$p") || { echo "::error::cargo tree failed for $p"; exit 1; }
+            if grep -E ' (lightningcss|minify-html|minify-js|tera|comrak) v' <<< "$tree"; then
               echo "::error::$p links a template engine or a minifier"; exit 1
             fi
           done

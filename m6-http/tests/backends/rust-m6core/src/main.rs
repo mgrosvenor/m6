@@ -72,7 +72,8 @@ fn main() -> Result<()> {
             //   whole point of this route is that all six examples emit the
             //   same bytes. Serde would be free to order or space them
             //   differently.
-            // - verbatim stops core minifying and compressing the body. Spec
+            // - verbatim stops core compressing the body, and minifying it in a
+            //   build that has the `minify` feature. This one does not. Spec
             //   §3.6 says a backend SHOULD NOT compress, because the proxy
             //   negotiates and caches each representation itself. It also keeps
             //   the measurement honest: compressing here and not in the pair
@@ -87,9 +88,10 @@ fn main() -> Result<()> {
         .route_get("/boom", |_req| {
             // Fails on purpose. The proxy counts 5xx as a backend error and may
             // replace it with a styled error page (spec §4).
-            // `.verbatim()` here too. Without it core minifies the HTML, which
-            // is core doing its job correctly but makes this example's body 167
-            // bytes where the other five send 178. The examples are meant to be
+            // `.verbatim()` here too. Without it core would compress the body,
+            // and minify the HTML in a build with the `minify` feature, which
+            // would make this example's body differ from the other five's 178
+            // bytes (167 when minified). The examples are meant to be
             // readable side by side, so the one that is allowed to differ is
             // /status, and that one differs in nothing at all.
             Ok(Response::status(500)
