@@ -58,6 +58,24 @@ fn watch_targets(paths: &[&Path], include_files: bool) -> Vec<std::path::PathBuf
     targets
 }
 
+/// What the events of one drain say about one file.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Named {
+    /// The name arrived: a rename onto it, or a new file created at it.
+    pub arrived: bool,
+    /// The file was changed in place: written and closed, or its attributes
+    /// set. Also set for every file when the kernel's event queue overflowed,
+    /// because events were lost.
+    pub touched: bool,
+}
+
+impl Named {
+    /// True when any event named the file.
+    pub fn any(self) -> bool {
+        self.arrived || self.touched
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Linux: inotify
 // ─────────────────────────────────────────────────────────────────────────────
@@ -65,17 +83,12 @@ fn watch_targets(paths: &[&Path], include_files: bool) -> Vec<std::path::PathBuf
 #[cfg(target_os = "linux")]
 pub struct ConfigWatcher {
     inotify: nix::sys::inotify::Inotify,
-    /// True while a watch exists on the directory of every file. A directory
-    /// that could not be watched, or a watch the kernel has dropped, leaves a
-    /// file whose changes no event reports.
-    names_files: bool,
 }
 
 #[cfg(target_os = "linux")]
 impl ConfigWatcher {
     pub fn new(paths: &[&Path]) -> anyhow::Result<Self> {
         use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
-        use std::collections::HashSet;
 
         let inotify = Inotify::init(InitFlags::IN_CLOEXEC | InitFlags::IN_NONBLOCK)
             .map_err(|e| anyhow::anyhow!("inotify_init1 failed: {e}"))?;
@@ -105,41 +118,18 @@ impl ConfigWatcher {
         // The cost of including it is a reload on `chmod` or `chown` of a
         // watched file, which a reload is idempotent about, against a silent
         // failure to reload at all.
-        //
-        // Because this event names a `chmod`, the reloader does not need
-        // `ctime` in its fingerprint while every directory is watched. It leaves
-        // `ctime` out, since a rename bumps it on the old inode before the name
-        // moves.
         let mask = AddWatchFlags::IN_CLOSE_WRITE
             | AddWatchFlags::IN_CREATE
             | AddWatchFlags::IN_MOVED_TO
             | AddWatchFlags::IN_ATTRIB;
 
-        let wanted = paths
-            .iter()
-            .filter_map(|p| p.parent())
-            .collect::<HashSet<_>>()
-            .len();
-        let mut watched = 0;
         for dir in watch_targets(paths, false) {
-            match inotify.add_watch(&dir, mask) {
-                Ok(_) => watched += 1,
-                Err(e) => {
-                    tracing::warn!(dir = %dir.display(), error = %e, "inotify_add_watch failed");
-                }
+            if let Err(e) = inotify.add_watch(&dir, mask) {
+                tracing::warn!(dir = %dir.display(), error = %e, "inotify_add_watch failed");
             }
         }
 
-        Ok(ConfigWatcher {
-            inotify,
-            names_files: watched == wanted,
-        })
-    }
-
-    /// True while an event names every change to the files, including a
-    /// `chmod`: every directory is watched and no watch has been dropped.
-    pub fn names_files(&self) -> bool {
-        self.names_files
+        Ok(ConfigWatcher { inotify })
     }
 
     pub fn raw_fd(&self) -> Option<RawFd> {
@@ -148,36 +138,26 @@ impl ConfigWatcher {
 
     /// Drain pending events, returning true if any names a watched file.
     pub fn read_events(&mut self, filenames: &[&str]) -> bool {
-        self.read_matched(filenames).contains(&true)
+        self.read_matched(filenames).iter().any(|n| n.any())
     }
 
-    /// Drain pending events, returning for each of `filenames` whether an
-    /// event named it.
-    pub fn read_matched(&mut self, filenames: &[&str]) -> Vec<bool> {
-        use nix::sys::inotify::AddWatchFlags;
-        let mut matched = vec![false; filenames.len()];
+    /// Drain pending events, returning for each of `filenames` what the events
+    /// said about it.
+    pub fn read_matched(&mut self, filenames: &[&str]) -> Vec<Named> {
+        let mut named = vec![Named::default(); filenames.len()];
         // One `read` per call, so loop until the queue is empty. An empty
         // non-blocking queue is `EAGAIN`, which is the normal way out rather
         // than an error to report.
         loop {
             match self.inotify.read_events() {
                 Ok(events) if events.is_empty() => break,
-                Ok(events) => {
-                    for ev in events {
-                        // The kernel sends this when it drops a watch, for
-                        // instance when the watched directory is removed.
-                        if ev.mask.contains(AddWatchFlags::IN_IGNORED) {
-                            self.names_files = false;
-                        }
-                        if let Some(name) = ev.name.as_ref().and_then(|n| n.to_str()) {
-                            for (i, f) in filenames.iter().enumerate() {
-                                if *f == name {
-                                    matched[i] = true;
-                                }
-                            }
-                        }
-                    }
-                }
+                Ok(events) => fold_events(
+                    &mut named,
+                    filenames,
+                    events
+                        .iter()
+                        .map(|ev| (ev.mask, ev.name.as_ref().and_then(|n| n.to_str()))),
+                ),
                 Err(nix::errno::Errno::EAGAIN) => break,
                 Err(e) => {
                     tracing::warn!(error = %e, "inotify read failed");
@@ -185,7 +165,37 @@ impl ConfigWatcher {
                 }
             }
         }
-        matched
+        named
+    }
+}
+
+/// Fold inotify events into what each of `filenames` was told.
+///
+/// A rename onto a name and a file created at it are an arrival. A write that
+/// is closed and a change of attributes are a touch. An overflow means events
+/// were lost, so every file is treated as touched and the reloader looks at
+/// each one.
+#[cfg(target_os = "linux")]
+fn fold_events<'a>(
+    named: &mut [Named],
+    filenames: &[&str],
+    events: impl IntoIterator<Item = (nix::sys::inotify::AddWatchFlags, Option<&'a str>)>,
+) {
+    use nix::sys::inotify::AddWatchFlags;
+    for (mask, name) in events {
+        if mask.contains(AddWatchFlags::IN_Q_OVERFLOW) {
+            named.iter_mut().for_each(|n| n.touched = true);
+        }
+        let Some(name) = name else { continue };
+        for (n, f) in named.iter_mut().zip(filenames) {
+            if *f == name {
+                if mask.intersects(AddWatchFlags::IN_MOVED_TO | AddWatchFlags::IN_CREATE) {
+                    n.arrived = true;
+                } else {
+                    n.touched = true;
+                }
+            }
+        }
     }
 }
 
@@ -271,12 +281,6 @@ impl ConfigWatcher {
         Some(self.kq.as_fd().as_raw_fd())
     }
 
-    /// kqueue reports which descriptor changed, never which file, so no event
-    /// names a `chmod`.
-    pub fn names_files(&self) -> bool {
-        false
-    }
-
     /// Drain pending events. Returns true if there were any.
     ///
     /// The `filenames` argument is ignored on this platform: kqueue reports
@@ -312,9 +316,9 @@ impl ConfigWatcher {
 
     /// Drain pending events. kqueue does not say which file, so nothing is
     /// reported as named and the caller falls back to its fingerprints.
-    pub fn read_matched(&mut self, filenames: &[&str]) -> Vec<bool> {
+    pub fn read_matched(&mut self, filenames: &[&str]) -> Vec<Named> {
         self.read_events(&[]);
-        vec![false; filenames.len()]
+        vec![Named::default(); filenames.len()]
     }
 }
 
@@ -354,16 +358,12 @@ impl ConfigWatcher {
         None
     }
 
-    pub fn names_files(&self) -> bool {
-        false
-    }
-
     pub fn read_events(&mut self, _filenames: &[&str]) -> bool {
         false
     }
 
-    pub fn read_matched(&mut self, filenames: &[&str]) -> Vec<bool> {
-        vec![false; filenames.len()]
+    pub fn read_matched(&mut self, filenames: &[&str]) -> Vec<Named> {
+        vec![Named::default(); filenames.len()]
     }
 }
 
@@ -424,8 +424,6 @@ fn file_name(p: &Path) -> String {
 ///
 /// Two fingerprints are equal when the same bytes are in the same file with the
 /// same times. A touch or a `chmod` moves `ctime` even when nothing else moves.
-/// The reloader leaves `ctime` out where an event names the file, see
-/// [`Fingerprint::without_ctime`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Fingerprint {
     dev: u64,
@@ -449,14 +447,18 @@ impl Fingerprint {
         })
     }
 
-    /// This fingerprint with `ctime` blanked. A rename over a file bumps the old
-    /// inode's `ctime` just before the name moves, so a `stat` in that gap sees
-    /// a change that is not the new file.
-    fn without_ctime(self) -> Fingerprint {
-        Fingerprint {
-            ctime_ns: 0,
-            ..self
-        }
+    /// True when only `ctime` differs. A rename over a file does this to the old
+    /// inode just before the name moves, so a `stat` in that gap sees a change
+    /// that is not the new file.
+    fn differs_in_ctime_only(self, other: Fingerprint) -> bool {
+        self != other
+            && Fingerprint {
+                ctime_ns: 0,
+                ..self
+            } == Fingerprint {
+                ctime_ns: 0,
+                ..other
+            }
     }
 }
 
@@ -583,17 +585,14 @@ impl ConfigReloader {
         // is equal: with coarse timestamps a same-length rewrite, or two
         // renames that reuse an inode within one tick, leave the fingerprint
         // as it was, and the poll compares only fingerprints.
-        let forced = match self.watcher.as_mut() {
+        let named = match self.watcher.as_mut() {
             Some(w) => {
                 let m = w.read_matched(&[&self.site_name, &self.process_name]);
-                Changed {
-                    site: m[0],
-                    process: m[1],
-                }
+                [m[0], m[1]]
             }
-            None => Changed::default(),
+            None => [Named::default(); 2],
         };
-        self.compare(now, forced);
+        self.compare(now, named);
     }
 
     /// Ask for `changed` to be reported again after a delay, and return the
@@ -619,7 +618,7 @@ impl ConfigReloader {
     pub fn tick(&mut self, now: Instant) -> Option<Changed> {
         if now >= self.next_poll {
             self.expire_owed(now);
-            self.compare(now, Changed::default());
+            self.compare(now, [Named::default(); 2]);
             self.next_poll = now + RELOAD_POLL;
         }
         if self.due.is_some_and(|due| now >= due) {
@@ -643,64 +642,65 @@ impl ConfigReloader {
         }
     }
 
-    /// True while the watcher's events name every change to the files.
-    fn watch_names_files(&self) -> bool {
-        self.watcher
-            .as_ref()
-            .is_some_and(ConfigWatcher::names_files)
-    }
-
-    /// Whether `new` is a different file state from `seen`.
-    ///
-    /// `ctime` counts only where no event would name a `chmod`: kqueue, a
-    /// reloader with no watcher, and an inotify watch that is missing or lost.
-    fn moved(&self, new: Option<Fingerprint>, seen: Option<Fingerprint>) -> bool {
-        if self.watch_names_files() {
-            new.map(Fingerprint::without_ctime) != seen.map(Fingerprint::without_ctime)
-        } else {
-            new != seen
-        }
-    }
-
-    /// Decide whether one file changed, from its fingerprint and the watcher's
-    /// events, and keep `owed` up to date.
+    /// Decide whether one file changed, from its fingerprint and the events of
+    /// this drain, and keep `owed` up to date.
     ///
     /// A rename shows in `stat` as soon as the name moves, a moment before its
-    /// event is queued. A compare in that gap sees the change by fingerprint
-    /// alone, and the event then arrives with an equal fingerprint. That event
-    /// is the one already counted, so it is dropped. Any other event names a
-    /// change the fingerprint cannot show.
-    fn settle(moved: bool, named_by_event: bool, owed: &mut Option<Instant>, now: Instant) -> bool {
-        if moved {
-            *owed = (!named_by_event).then_some(now);
-            return true;
+    /// event is queued. A compare in that gap finds the change by fingerprint
+    /// alone, and the arrival event then comes with an equal fingerprint. That
+    /// one event is the echo of the change already found, so it is dropped. An
+    /// event that touched the file is a change the fingerprint cannot show, so
+    /// it counts even in the same drain as an echo.
+    fn settle(
+        new: Option<Fingerprint>,
+        seen: Option<Fingerprint>,
+        named: Named,
+        owed: &mut Option<Instant>,
+        now: Instant,
+    ) -> Found {
+        if new != seen {
+            *owed = (!named.arrived).then_some(now);
+            let transient = new
+                .zip(seen)
+                .is_some_and(|(new, seen)| new.differs_in_ctime_only(seen));
+            return if transient && !named.any() {
+                Found::Metadata
+            } else {
+                Found::Content
+            };
         }
-        if named_by_event && owed.take().is_some() {
-            return false;
+        let echo = named.arrived && owed.take().is_some();
+        if named.touched || (named.arrived && !echo) {
+            Found::Content
+        } else {
+            Found::Nothing
         }
-        named_by_event
     }
 
     /// Fingerprint both files and mark each that moved. The new fingerprint is
     /// stored at once, so a file that fails to load is not retried until it is
     /// written again.
-    fn compare(&mut self, now: Instant, forced: Changed) {
+    fn compare(&mut self, now: Instant, [site_named, process_named]: [Named; 2]) {
         let site = Fingerprint::of(&self.site_toml);
         let process = Fingerprint::of(&self.process);
-        let site_moved = self.moved(site, self.seen.site);
-        let process_moved = self.moved(process, self.seen.process);
-        let site_hit = Self::settle(site_moved, forced.site, &mut self.owed_site, now);
-        let process_hit = Self::settle(process_moved, forced.process, &mut self.owed_process, now);
-        if site_hit {
+        let site_found = Self::settle(site, self.seen.site, site_named, &mut self.owed_site, now);
+        let process_found = Self::settle(
+            process,
+            self.seen.process,
+            process_named,
+            &mut self.owed_process,
+            now,
+        );
+        if site_found != Found::Nothing {
             self.seen.site = site;
             self.pending.site = true;
         }
-        if process_hit {
+        if process_found != Found::Nothing {
             self.seen.process = process;
             self.pending.process = true;
         }
-        let hit = site_hit || process_hit;
-        if !hit {
+        let found = site_found.max(process_found);
+        if found == Found::Nothing {
             return;
         }
         // One file serving as both: a change to it is a change to both.
@@ -714,7 +714,7 @@ impl ConfigReloader {
         self.failures = 0;
         let held_by_a_change = self.due.is_some() && !self.retrying;
         self.retrying = false;
-        self.due = Some(match self.last_report {
+        let at = match self.last_report {
             // A change inside the window of an earlier report: one more report
             // when the burst settles, and never later than a second after that
             // report.
@@ -723,8 +723,30 @@ impl ConfigReloader {
             }
             // The first change after quiet: report at once.
             _ => now,
+        };
+        self.due = Some(if found == Found::Metadata {
+            // Only `ctime` moved, which is also how a rename looks for an
+            // instant before the name moves. Wait one debounce interval, so the
+            // rename's own change lands first and the two are one report. An
+            // earlier report already due stays.
+            let settled = at.max(now + RELOAD_DEBOUNCE);
+            self.due
+                .filter(|_| held_by_a_change)
+                .map_or(settled, |due| due.min(settled))
+        } else {
+            at
         });
     }
+}
+
+/// What one compare found in a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Found {
+    Nothing,
+    /// Only `ctime` moved, and no event named the file.
+    Metadata,
+    /// The file or an event says it changed.
+    Content,
 }
 
 // ---------------------------------------------------------------------------
@@ -1062,8 +1084,9 @@ mod tests {
     }
 
     /// Record that the process config's `ctime` was one tick earlier than it is
-    /// now, as it is when a `chmod` follows a write. Done by hand so the test
-    /// does not depend on the clock the kernel stamps `ctime` from.
+    /// now, as it is when a `chmod` follows a write, or when a `stat` lands
+    /// between a rename's `ctime` bump and the name moving. Done by hand so the
+    /// test does not depend on the clock the kernel stamps `ctime` from.
     fn record_an_earlier_ctime(r: &mut ConfigReloader) {
         let mut fp = r.seen.process.expect("the config was fingerprinted");
         fp.ctime_ns -= 1;
@@ -1076,90 +1099,86 @@ mod tests {
         r.tick(now)
     }
 
-    /// With no event to name a `chmod`, `ctime` is the only sign of it, so a
-    /// poll must report it. kqueue and a reloader with no watcher are this case.
-    #[test]
-    fn a_changed_ctime_is_reported_when_no_event_names_the_file() {
-        let (_d, site, proc, seen) = pair();
-        let mut r = ConfigReloader::polling_only(&site, &proc, seen);
+    /// A change to `ctime` alone is reported after one debounce interval, with no
+    /// event to say anything. kqueue and a reloader with no watcher are this
+    /// case, and so is the poll of an inotify reloader.
+    fn assert_a_ctime_change_is_reported_after_the_debounce(mut r: ConfigReloader) {
+        let now = Instant::now();
         record_an_earlier_ctime(&mut r);
-        let c = poll_at(&mut r, Instant::now()).expect("a changed ctime was not reported");
+        assert!(poll_at(&mut r, now).is_none(), "reported at once");
+        let c = r
+            .tick(now + RELOAD_DEBOUNCE)
+            .expect("a changed ctime was never reported");
+        assert!(c.process && !c.site, "{c:?}");
+        assert!(
+            r.tick(now + RELOAD_DEBOUNCE * 3).is_none(),
+            "reported twice"
+        );
+    }
+
+    #[test]
+    fn a_changed_ctime_is_reported_when_no_watcher_exists() {
+        let (_d, site, proc, seen) = pair();
+        assert_a_ctime_change_is_reported_after_the_debounce(ConfigReloader::polling_only(
+            &site, &proc, seen,
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_changed_ctime_is_reported_when_inotify_is_watching() {
+        let (_d, site, proc, seen) = pair();
+        assert_a_ctime_change_is_reported_after_the_debounce(ConfigReloader::new(
+            &site, &proc, seen,
+        ));
+    }
+
+    /// A `chmod` that fixes an unreadable config is reported at once when inotify
+    /// names it, through the attribute event and not through the clock.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_chmod_is_reported_at_once_when_inotify_names_it() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (_d, site, proc, seen) = pair();
+        let mut r = ConfigReloader::new(&site, &proc, seen);
+        std::fs::set_permissions(&proc, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        let fd = r.raw_fd().unwrap();
+        assert!(crate::server::poll_listener_and_watcher(fd, None, 5_000).listener);
+        let now = Instant::now();
+        r.on_readable(now);
+        let c = r.tick(now).expect("the chmod was not reported at once");
         assert!(c.process && !c.site, "{c:?}");
     }
 
-    /// Where inotify names the file, a poll that sees only a changed `ctime` has
-    /// seen a rename half done, and the rename's own event reports it. A rename
-    /// bumps the old inode's `ctime` just before the name moves.
+    /// A `stat` that lands after a rename bumped the old inode's `ctime` and
+    /// before the name moved sees a state that is not the new file. It must not
+    /// be reported on its own: the rename that follows is the one report.
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_poll_ignores_a_ctime_only_change_where_inotify_names_the_file() {
-        let (_d, site, proc, seen) = pair();
-        let mut r = ConfigReloader::new(&site, &proc, seen);
-        assert!(r.watch_names_files());
-        record_an_earlier_ctime(&mut r);
-        assert!(
-            poll_at(&mut r, Instant::now()).is_none(),
-            "a ctime-only change was reported"
-        );
-    }
-
-    /// A watch that could not be added names nothing, so `ctime` must count.
-    /// Here one of the two files is in a directory that does not exist, the
-    /// case `watch_targets` skips with a warning.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn a_changed_ctime_is_reported_when_a_watch_could_not_be_added() {
+    fn the_transient_state_of_a_rename_is_not_reported_on_its_own() {
         let (d, site, proc, seen) = pair();
-        let missing = d.path().join("missing").join("site.toml");
-        let w = ConfigWatcher::new(&[proc.as_path(), missing.as_path()]).expect("watcher");
-        assert!(!w.names_files(), "a directory was not watched");
-        let mut r = ConfigReloader::with_watcher(Some(w), &site, &proc, seen);
+        let mut r = ConfigReloader::new(&site, &proc, seen);
+        let now = Instant::now();
         record_an_earlier_ctime(&mut r);
-        assert!(
-            poll_at(&mut r, Instant::now()).is_some(),
-            "a changed ctime was not reported"
-        );
-    }
-
-    /// A watch the kernel drops, here by removing and recreating the watched
-    /// directory as a deploy that swaps a directory does, names nothing from
-    /// then on, so `ctime` must count again.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn a_changed_ctime_is_reported_after_the_watch_is_lost() {
-        let d = tempfile::tempdir().expect("tempdir");
-        let dir = d.path().join("config");
-        let (site, proc) = (dir.join("site.toml"), dir.join("app.conf"));
-        let make = || {
-            std::fs::create_dir(&dir).expect("mkdir");
-            put(&site, "a = 1\n");
-            put(&proc, "b = 1\n");
-        };
-        make();
-        let mut r = ConfigReloader::new(&site, &proc, Seen::read(&site, &proc));
-        std::fs::remove_dir_all(&dir).expect("rmdir");
-        make();
+        assert!(poll_at(&mut r, now).is_none(), "the transient was reported");
+        let tmp = d.path().join("app.conf.new");
+        put(&tmp, "b = 22222\n");
+        std::fs::rename(&tmp, &proc).expect("rename");
         let fd = r.raw_fd().unwrap();
         assert!(crate::server::poll_listener_and_watcher(fd, None, 5_000).listener);
-        r.on_readable(Instant::now());
-        assert!(!r.watch_names_files(), "the lost watch was not noticed");
-        // The recreated files are a change in their own right. Take that report,
-        // then judge the ctime alone, outside the settle window.
+        r.on_readable(now);
+        let c = r.tick(now).expect("the rename was not reported at once");
+        assert!(c.process && !c.site, "{c:?}");
         assert!(
-            r.tick(Instant::now()).is_some(),
-            "the swap was not reported"
+            r.tick(now + RELOAD_DEBOUNCE * 3).is_none(),
+            "reported twice"
         );
-        record_an_earlier_ctime(&mut r);
-        let later = Instant::now() + RELOAD_POLL * 2;
-        assert!(
-            poll_at(&mut r, later).is_some(),
-            "a changed ctime was not reported"
-        );
+        assert!(r.due.is_none(), "a second report is waiting to be made");
     }
 
-    /// The loop's `tick` finds a rename by fingerprint in the same iteration
-    /// that it read nothing, and the rename's event is read in the next one. The
-    /// poll falling due between the two must not forget the event is owed.
+    /// The loop finds a rename by fingerprint in one iteration and reads its
+    /// event in the next, and the poll falls due in between. The poll must not
+    /// forget the event is owed.
     #[test]
     fn a_poll_between_a_found_rename_and_its_event_does_not_forget_the_event() {
         let (d, site, proc, seen) = pair();
@@ -1168,7 +1187,7 @@ mod tests {
         put(&tmp, "b = 22222\n");
         std::fs::rename(&tmp, &proc).expect("rename");
         let now = Instant::now();
-        r.compare(now, Changed::default());
+        r.compare(now, [Named::default(); 2]);
         r.next_poll_for_test(now);
         assert!(r.tick(now).is_some(), "the rename was not reported");
         let fd = r.raw_fd().unwrap();
@@ -1179,6 +1198,110 @@ mod tests {
             "the rename's event reported it a second time"
         );
         assert!(r.due.is_none(), "a second report is waiting to be made");
+    }
+
+    /// A rewrite of the config that reaches the queue before the loop drains it,
+    /// beside the echo of a rename the poll already found, is its own change.
+    /// Coarse timestamps can leave its fingerprint equal, so only the event shows
+    /// it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_rewrite_in_the_same_drain_as_a_rename_echo_is_still_reported() {
+        let (d, site, proc, seen) = pair();
+        let mut r = ConfigReloader::new(&site, &proc, seen);
+        let tmp = d.path().join("app.conf.new");
+        put(&tmp, "b = 22222\n");
+        std::fs::rename(&tmp, &proc).expect("rename");
+        let now = Instant::now();
+        r.compare(now, [Named::default(); 2]);
+        assert!(r.tick(now).is_some(), "the rename was not reported");
+        put(&proc, "b = 33333\n");
+        r.seen = Seen::read(&site, &proc);
+        let fd = r.raw_fd().unwrap();
+        assert!(crate::server::poll_listener_and_watcher(fd, None, 5_000).listener);
+        r.on_readable(now);
+        assert!(
+            r.tick(now + RELOAD_DEBOUNCE).is_some(),
+            "the rewrite was taken for the rename's echo"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn events_are_folded_per_file_by_what_they_say() {
+        use nix::sys::inotify::AddWatchFlags as F;
+        let files = ["site.toml", "app.conf"];
+        let fold = |events: Vec<(F, Option<&str>)>| {
+            let mut named = [Named::default(); 2];
+            fold_events(&mut named, &files, events);
+            named
+        };
+        let n = fold(vec![
+            (F::IN_MOVED_TO, Some("app.conf")),
+            (F::IN_CREATE, Some("other")),
+        ]);
+        assert_eq!(
+            n[1],
+            Named {
+                arrived: true,
+                touched: false
+            }
+        );
+        assert_eq!(n[0], Named::default());
+        let n = fold(vec![
+            (F::IN_ATTRIB, Some("app.conf")),
+            (F::IN_CLOSE_WRITE, Some("site.toml")),
+        ]);
+        assert_eq!(
+            n[1],
+            Named {
+                arrived: false,
+                touched: true
+            }
+        );
+        assert_eq!(
+            n[0],
+            Named {
+                arrived: false,
+                touched: true
+            }
+        );
+    }
+
+    /// Events lost to a full queue could have named either file, so each is
+    /// treated as touched and compared.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_queue_overflow_touches_every_file() {
+        use nix::sys::inotify::AddWatchFlags as F;
+        let mut named = [Named::default(); 2];
+        fold_events(
+            &mut named,
+            &["site.toml", "app.conf"],
+            [(F::IN_Q_OVERFLOW, None)],
+        );
+        assert!(named.iter().all(|n| n.touched && !n.arrived), "{named:?}");
+    }
+
+    /// A touch forced by an overflow is a change even when the fingerprint is
+    /// equal, as any other touch is.
+    #[test]
+    fn a_touched_file_is_a_change_even_when_its_fingerprint_is_equal() {
+        let (_d, site, proc, seen) = pair();
+        let mut r = ConfigReloader::polling_only(&site, &proc, seen);
+        let now = Instant::now();
+        r.compare(
+            now,
+            [
+                Named::default(),
+                Named {
+                    arrived: false,
+                    touched: true,
+                },
+            ],
+        );
+        let c = r.tick(now).expect("a touch was not reported");
+        assert!(c.process && !c.site, "{c:?}");
     }
 
     #[test]

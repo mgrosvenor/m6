@@ -315,10 +315,11 @@ A route that names a template produces a `Response` carrying `template_name` and
 `ConfigReloader::new(site_toml, process, seen)` owns a `ConfigWatcher` on a service's two files and reports which of them changed.
 The loop calls `on_readable(now)` when `raw_fd()` is readable and `tick(now)` on every iteration, and `tick` returns `Some(Changed { site, process })` when a report is due.
 A `Fingerprint` of device, inode, length, mtime and ctime decides which file changed.
-On Linux, while an inotify watch exists on the directory of every file, an event names every change including a `chmod`, so the ctime is left out of the comparison, because a rename over a file bumps it on the old inode before the name moves.
-A directory that could not be watched, or a watch the kernel dropped, puts the ctime back, and so does kqueue and a reloader with no watcher, so a `chmod` is still found.
 On Linux an event that names a file forces a report even when the fingerprint is equal, which catches a same-length rewrite and two renames that reuse an inode.
-An event whose change a fingerprint compare has already reported is not reported again, so one rename is one report.
+An overflow of the inotify queue forces a compare of both files, because events were lost.
+A rename shows in `stat` a moment before its event is queued, so a compare in that gap finds the change by fingerprint alone.
+The arrival event that follows is dropped, and a write or `chmod` event in the same drain still reports.
+A change to ctime alone is reported after one `RELOAD_DEBOUNCE`, because a rename shows that state for an instant before the name moves and the rename's own change then makes one report.
 On kqueue the watcher sees the directory, so an unrelated write beside the config wakes the loop, and the unchanged fingerprints mean no report is made.
 
 The first change after quiet is reported at once.
