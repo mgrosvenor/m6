@@ -27,37 +27,12 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
 # ── Locks on a shared build host ──────────────────────────────────────────────
-# Several gates run side by side on one build host. They may build and lint at
-# the same time. Two test suites or conformance runs may not, because both bind
-# fixed loopback ports. A measurement needs the host to itself, because a
-# wall-clock number taken beside a build measures the build (#344). So this holds
-# the host lock shared for the whole run, takes the port lock only around the
-# steps that bind ports, and takes the host lock exclusive for the benchmarks.
-# A run enters through the entry lock, which a waiting measurement holds, so
-# runs that start while a measurement waits queue behind it instead of starving
-# it. Where flock is missing (macOS), a run has the machine to itself and takes
-# none.
-ENTRY_LOCK="${M6_HOST_ENTRY_LOCK:-/var/tmp/m6-host-entry.lock}"
-HOST_LOCK="${M6_HOST_LOCK:-/var/tmp/m6-host.lock}"
-PORT_LOCK="${M6_TEST_LOCK:-/var/tmp/m6-test.lock}"
-# How long a measurement waits for the host to go idle before it reports that it
-# did not measure, rather than measuring under load or waiting for ever.
-HOST_IDLE_WAIT="${M6_HOST_IDLE_WAIT:-7200}"
-if command -v flock >/dev/null 2>&1; then
-  exec 6>>"$ENTRY_LOCK"
-  flock 6
-  exec 8>>"$HOST_LOCK"
-  flock -s 8
-  exec 6>&-
-  with_port_lock() { flock -o "$PORT_LOCK" "$@"; }
-  host_alone() {
-    exec 6>>"$ENTRY_LOCK"
-    flock -w "$HOST_IDLE_WAIT" 6 && flock -w "$HOST_IDLE_WAIT" -x 8
-  }
-else
-  with_port_lock() { "$@"; }
-  host_alone() { :; }
-fi
+# tools/host-lock.sh holds the protocol (#344): this run holds the host shared,
+# takes the port lock only around the steps that bind ports, and has the host to
+# itself for the benchmarks.
+# shellcheck source=tools/host-lock.sh
+. "$SCRIPT_DIR/tools/host-lock.sh"
+host_enter_shared
 
 # ── Args ──────────────────────────────────────────────────────────────────────
 RUN_BENCH=true
@@ -121,6 +96,8 @@ fi
 # their #[test] fns race for those ports and fail with spurious 502s that
 # have nothing to do with the code under test.
 info "Running correctness tests..."
+# The test build binds nothing, so it runs before the port lock is taken.
+cargo test --workspace --no-run --quiet
 if with_port_lock cargo test --workspace --quiet -- --test-threads=1 2>&1; then
   pass "Unit + integration tests (HTTP/1.1 ✓  HTTP/3 ✓)"
 else
@@ -198,9 +175,9 @@ fi
 # A benchmark, and a baseline saved from one, is a measurement: it waits for the
 # host to be idle and holds it so (see the locks at the top).
 if ! host_alone; then
-  warn "Benchmarks NOT MEASURED: the host was not idle within ${HOST_IDLE_WAIT}s (holders: $(fuser "$HOST_LOCK" 2>/dev/null | xargs))"
+  INCOMPLETE="benchmarks (the host was never idle, so nothing was measured)"
   summary
-  exit 0
+  exit 2
 fi
 
 if [[ "$SAVE_BASELINE" == "true" ]]; then

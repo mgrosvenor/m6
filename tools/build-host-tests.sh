@@ -199,17 +199,12 @@ cd "$M6_DIR" || exit 1
 # time, and fixed /tmp paths would let each read the other's logs.
 T="$(mktemp -d)" || exit 1
 trap 'rm -rf -- "$T"' EXIT
-# Several gates share this host (#344). Builds and lints run side by side under
-# the host lock held shared; the test suite and conformance bind fixed loopback
-# ports, so they take the port lock; perfcheck needs the host to itself, so the
-# host lock is turned exclusive before it. A run enters through the entry lock,
-# which a waiting measurement holds, so new runs queue behind the measurement.
-exec 6>>/var/tmp/m6-host-entry.lock
-flock 6
-exec 8>>/var/tmp/m6-host.lock
-flock -s 8
-exec 6>&-
-PORT_LOCK=/var/tmp/m6-test.lock
+# Several gates share this host (#344). tools/host-lock.sh holds the protocol:
+# this run holds the host shared, the test suite and conformance take the port
+# lock, and perfcheck gets the host to itself.
+# shellcheck source=tools/host-lock.sh
+. ./tools/host-lock.sh
+host_enter_shared
 
 echo "### release build"
 cargo build --workspace --release 2>&1 | tail -3
@@ -258,7 +253,7 @@ export M6_BACKENDS_REQUIRE_ALL=1
 # Captured in full, then reported. Grepping the pipe drops the assertion message,
 # leaving a bare `thread '<name>' panicked at <file>:<line>` with the text that
 # says WHY thrown away.
-flock -o "$PORT_LOCK" cargo test --workspace > "$T/m6-full.log" 2>&1 || true
+with_port_lock cargo test --workspace > "$T/m6-full.log" 2>&1 || true
 grep -E '^test result:' "$T/m6-full.log" || true
 echo "### failure detail"
 sed -n '/^failures:/,$p' "$T/m6-full.log" | head -60
@@ -268,7 +263,7 @@ echo "### conformance"
 # and an absent one here is a failure rather than a skip. A laptop's pre-push
 # hook may pass that flag and say loudly what it did not test; this has no excuse
 # available to it.
-flock -o "$PORT_LOCK" ./tools/conformance.sh > "$T/conformance.out" 2>&1
+with_port_lock ./tools/conformance.sh > "$T/conformance.out" 2>&1
 echo "CONFORMANCE_STATUS=$?"
 tail -14 "$T/conformance.out"
 
@@ -280,14 +275,12 @@ echo "### performance"
 # invocation, set from the checkout that synced. The tree up here has no `.git`,
 # so `git rev-parse` finds nothing, and a performance record that cannot name its
 # commit cannot be compared with anything later.
-exec 6>>/var/tmp/m6-host-entry.lock
-if flock -w "${M6_HOST_IDLE_WAIT:-7200}" 6 && flock -w "${M6_HOST_IDLE_WAIT:-7200}" -x 8; then
-    M6_HOST_LOCK_HELD=exclusive ./tools/perfcheck.sh > "$T/perf.out" 2>&1
+if host_alone; then
+    ./tools/perfcheck.sh > "$T/perf.out" 2>&1
     echo "PERF_STATUS=$?"
     grep -E 'render:|PASS|FAIL' "$T/perf.out" | tail -6
 else
     echo "PERF_STATUS=2"
-    echo "NOT MEASURED: the host was not idle within ${M6_HOST_IDLE_WAIT:-7200}s (holders: $(fuser /var/tmp/m6-host.lock 2>/dev/null | xargs))"
 fi
 REMOTE
 
@@ -308,15 +301,12 @@ cd "$EG_DIR" || exit 1
 # This run's own files (see the m6 half above).
 T="$(mktemp -d)" || exit 1
 trap 'rm -rf -- "$T"' EXIT
-# The examples start stacks on fixed loopback ports, 8443 among them, so this
-# whole run holds the port lock as well as the host lock shared (#344).
-exec 6>>/var/tmp/m6-host-entry.lock
-flock 6
-exec 8>>/var/tmp/m6-host.lock
-flock -s 8
-exec 6>&-
-exec 7>>/var/tmp/m6-test.lock
-flock 7
+# The host lock shared for the whole run (#344, tools/host-lock.sh). The builds
+# and clippy below bind nothing; from the unit tests on, every step binds fixed
+# loopback ports (8443 among them), so the port lock is held from there.
+# shellcheck source=tools/host-lock.sh
+. "$M6_DIR/tools/host-lock.sh"
+host_enter_shared
 
 echo "### examples release build"
 cargo build --release 2>&1 | tail -3
@@ -337,6 +327,7 @@ echo "EG_CLIPPY_WARNINGS=$(cat $T/eg-clippy.count)"
 CARGO_TARGET_DIR=target/clippy cargo clippy --workspace --all-targets --release 2>&1 \
     | grep '^warning' | head -5
 
+port_hold
 echo "### examples unit tests"
 # Not blog_site_end_to_end: it needs certificates and example 05's stack, and
 # fails without them. It runs below, after that stack is up.
@@ -455,7 +446,9 @@ if ss -ltnH 'sport = :8443' 2>/dev/null | grep -q .; then
     exit 0
 fi
 
-M6="$M6_DIR" M6_NO_BROWSER=1 ./dev.sh --no-open > $T/eg-cms-dev.log 2>&1 &
+# Its processes do not inherit the locks, so one that outlives this run cannot
+# hold the host or the ports.
+M6="$M6_DIR" M6_NO_BROWSER=1 ./dev.sh --no-open > $T/eg-cms-dev.log 2>&1 6<&- 7<&- 8<&- &
 DEV_PID=$!
 up=0
 # 180 seconds. Six services have to bind, and m6-md regenerates posts.json from
