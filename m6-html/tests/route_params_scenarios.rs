@@ -59,21 +59,16 @@ fn spawn_server(id: &str, site_dir: &Path, config: &Path) -> (Server, PathBuf) {
     );
     svc.wait_for_path(&socket_path, Duration::from_secs(10));
 
-    let mut ready = false;
-    for _ in 0..200 {
-        if !http_request(&socket_path, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").is_empty() {
-            ready = true;
-            break;
-        }
-        svc.assert_alive("waiting for the first answered request");
-        std::thread::sleep(Duration::from_millis(25));
-    }
+    let ready = m6_core::testkit::wait::until(Duration::from_secs(10), || {
+        !http_request(&socket_path, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").is_empty()
+    });
     assert!(
         ready,
         "m6-html at {} never answered a request\n--- output ---\n{}",
         socket_path.display(),
         svc.output()
     );
+    svc.assert_alive("after the first answered request");
 
     (
         Server {
@@ -101,30 +96,6 @@ fn http_request(socket_path: &Path, request: &str) -> String {
     let response = m6_core::testkit::read_one(&mut stream, request.split(' ').next().unwrap_or(""))
         .unwrap_or_default();
     String::from_utf8_lossy(&response).into_owned()
-}
-
-/// Copy the scenario fixture root into a fresh temp directory, so a test can
-/// rewrite a file (a changed global params file) without dirtying the committed
-/// fixtures.
-fn copy_site_to_temp() -> tempfile::TempDir {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    copy_dir_recursive(&fixtures_dir(), tmp.path()).expect("copy scenario fixtures");
-    tmp
-}
-
-fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-        let to = dst.join(entry.file_name());
-        if ty.is_dir() {
-            copy_dir_recursive(&entry.path(), &to)?;
-        } else {
-            std::fs::copy(entry.path(), &to)?;
-        }
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -238,9 +209,25 @@ fn last_declared_route_params_file_wins() {
 /// without adding a disk cache m6 does not have.
 #[test]
 fn global_params_change_picked_up_after_restart() {
-    let site = copy_site_to_temp();
-    let config = site.path().join("configs").join("params.conf");
+    // Write only the three files this scenario needs into a fresh temp site, so
+    // the global params file can be rewritten without dirtying committed
+    // fixtures. This is the socket_mode.rs shape, not a whole-tree copy.
+    let site = tempfile::tempdir().expect("tempdir");
+    let config = site.path().join("m6-html.conf");
     let global = site.path().join("data").join("site.json");
+    std::fs::create_dir_all(site.path().join("templates")).expect("templates dir");
+    std::fs::create_dir_all(site.path().join("data")).expect("data dir");
+    std::fs::write(
+        &config,
+        "global_params = [\"data/site.json\"]\n\n[[route]]\npath = \"/brand-global\"\ntemplate = \"templates/params.html\"\nparams = []\n",
+    )
+    .expect("write config");
+    std::fs::write(
+        site.path().join("templates").join("params.html"),
+        "{{ brand }}",
+    )
+    .expect("write template");
+    std::fs::write(&global, "{\"brand\": \"Global\"}").expect("write global params");
 
     let (guard, socket_path) = spawn_server("params-restart-1", site.path(), &config);
     let before = http_request(
