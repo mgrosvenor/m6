@@ -147,8 +147,8 @@ Comments only.
 
 ### Changed
 
-**CI runs every check in the build-and-test and examples jobs even after an earlier one fails, and clippy runs second, so one push reports every failure at once (#340).**
-A failing test used to skip clippy and the opt-in feature tests, and their problems surfaced only on the next push. The test steps also fail on cargo's own exit status, so a test build that does not compile or a test binary that aborts can no longer show green. The `main takes develop only` check now reads the pull request's branch name from an environment variable instead of pasting it into its script, where a crafted name could run as a command on the runner.
+**CI runs every independent check in the build-and-test and examples jobs even after an earlier one fails, and clippy runs second, so one push reports every failure at once (#340).**
+A failing test used to skip clippy and the opt-in feature tests, and their problems surfaced only on the next push. A check that needs an earlier step's output (the toolchain, a build, the development certificates) runs only if that step succeeded, so one broken build is reported once. The test steps also fail on cargo's own exit status, so a test build that does not compile or a test binary that aborts can no longer show green. The `main takes develop only` check now reads the pull request's branch name from an environment variable instead of pasting it into its script, where a crafted name could run as a command on the runner.
 
 **Debug and test builds carry line tables only, and no debug information for dependencies, so a full test build is 3.7 GB instead of 12 GB (#303).**
 Every file under a crate's `tests/` is its own binary, and each linked every dependency with full debug information. A full check filled about 16 GB, more than a hosted CI runner's free disk, and CI jobs died mid-build. Measured on the build host on one commit with `cargo test --workspace --no-run`: `target/debug` went from 12 GB to 3.7 GB and the build from 411 s to 282 s. Backtraces still show file and line.

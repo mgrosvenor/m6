@@ -86,17 +86,21 @@ jobs:
           fi
           echo "head is develop, allowed"
 
-  # Every check step runs even when an earlier one failed (`!cancelled()`), so
-  # one push reports every failure at once. A dying test used to skip clippy,
-  # and its problems surfaced only on the next push. Clippy runs second because
-  # it is quick and needs no release build.
+  # Every independent check runs even when an earlier one failed
+  # (`!cancelled()`), so one push reports every failure at once: a dying test
+  # used to skip clippy, and its problems surfaced only on the next push. A
+  # check that needs an earlier step's output (the toolchain, the test build)
+  # runs only if that step succeeded, so one broken step is reported once, not
+  # again by everything after it. Clippy runs second because it is quick and
+  # needs no release build.
   build-and-test:
     name: build, tests, clippy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - id: toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
 
@@ -114,14 +118,14 @@ jobs:
       # 2026-09-13 and is held there the same way rustc warnings are. A new
       # lint from a toolchain upgrade fails this, which is intended.
       - name: Clippy, silent
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         run: ./tools/clippy.sh
 
       # Zero warnings, release and test builds, pre-existing included. This is
       # a standing rule and it is checked on Linux because that is where it
       # runs: three defects have only ever shown up there.
       - name: Release build, zero warnings
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         run: |
           cargo build --workspace --release 2>&1 | tee build.log
           n=$(grep -c '^warning' build.log || true)
@@ -129,7 +133,8 @@ jobs:
           [ "$n" -eq 0 ] || { echo "::error::$n release warning(s)"; exit 1; }
 
       - name: Test build, zero warnings
-        if: ${{ !cancelled() }}
+        id: testbuild
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         run: |
           cargo test --workspace --no-run 2>&1 | tee testbuild.log
           n=$(grep -c '^warning' testbuild.log || true)
@@ -140,7 +145,7 @@ jobs:
       # message and leaves a bare `panicked at <file>:<line>`, which names the
       # place and not the reason.
       - name: Test suite
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.testbuild.outcome == 'success' }}
         run: |
           status=0
           cargo test --workspace > full.log 2>&1 || status=$?
@@ -160,7 +165,7 @@ jobs:
       # tests stayed broken), so m6-core is built, warned on and tested here
       # with every feature on, and a new feature is covered without an edit.
       - name: Opt-in core features, zero warnings and tests
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         run: |
           cargo test -p m6-core --lib --all-features --no-run 2>&1 | tee featbuild.log
           n=$(grep -c '^warning' featbuild.log || true)
@@ -287,6 +292,7 @@ jobs:
             m6-examples
 
       - name: Build m6
+        id: build_m6
         working-directory: m6
         run: |
           cargo build --workspace --release
@@ -295,6 +301,7 @@ jobs:
       # Zero warnings and silent clippy, the same standard as m6 itself: a reader
       # copies from these.
       - name: Examples build, zero warnings
+        id: build_examples
         working-directory: m6-examples
         run: |
           cargo build --release 2>&1 | tee build.log
@@ -303,7 +310,7 @@ jobs:
           [ "$n" -eq 0 ] || { echo "::error::$n warning(s) building the examples"; exit 1; }
 
       - name: Examples clippy, silent
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.build_m6.outcome == 'success' }}
         working-directory: m6-examples
         run: |
           cargo clippy --workspace --all-targets --release 2>&1 | tee clippy.log
@@ -311,7 +318,7 @@ jobs:
           [ "$n" -eq 0 ] || { echo "::error::$n clippy finding(s) in the examples"; exit 1; }
 
       - name: Examples unit tests
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.build_m6.outcome == 'success' }}
         working-directory: m6-examples
         run: |
           # Example 05's end-to-end test needs the certificate and auth
@@ -349,7 +356,8 @@ jobs:
       # untracked keys/ directories. A check that depends on an untracked file is
       # not a check, which is the same lesson the mkcert fallback taught earlier.
       - name: Generate development certificates
-        if: ${{ !cancelled() }}
+        id: certs
+        if: ${{ !cancelled() && steps.build_examples.outcome == 'success' }}
         working-directory: m6-examples
         run: |
           for d in examples/*/; do
@@ -388,7 +396,7 @@ jobs:
           mkdir -p examples/09-global-deployment/certs
 
       - name: Every example's config parses
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.build_examples.outcome == 'success' }}
         working-directory: m6-examples
         run: |
           bad=0 unexplained=0
@@ -424,7 +432,7 @@ jobs:
       # mkcert) and creates the admin user. That is exactly what a new reader gets
       # on step one of the README, and it is checked here rather than assumed.
       - name: Example 05, end to end over the running stack
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.certs.outcome == 'success' }}
         working-directory: m6-examples/examples/05-cms
         run: |
           M6="$GITHUB_WORKSPACE/m6" M6_NO_BROWSER=1 ./dev.sh --no-open > dev.log 2>&1 &
