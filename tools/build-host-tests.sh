@@ -109,21 +109,22 @@ EXAMPLES_LOG=/tmp/m6-build-host-examples.log
 # appended there becomes part of the next commit. The sync sends the checkout's
 # history to the host, so the host's file is the checkout's file plus this run's
 # record and replaces it whole. The new file is written beside the old one and
-# renamed only once it is complete and no shorter, so a failure never leaves a
+# renamed only if the local file is a byte prefix of it: perfcheck only appends,
+# so anything else means the local history changed during the run (a pull, a
+# branch switch) and replacing it would drop records. A failure never leaves a
 # partial history behind.
 copy_back() {
     local src="$1"
     local dst="$2"
-    local tmp old=0
+    local tmp
     tmp="$(mktemp "$dst.XXXXXX")" || { echo "cannot make a temp file beside $dst" >&2; return 1; }
-    [[ -f "$dst" ]] && old=$(wc -l < "$dst")
     # shellcheck disable=SC2086
-    if rsync -az -e "ssh $SSH_OPTS" "$src" "$tmp" \
-        && [[ -s "$tmp" ]] && (( $(wc -l < "$tmp") >= old )); then
+    if rsync -az -e "ssh $SSH_OPTS" "$src" "$tmp" && [[ -s "$tmp" ]] \
+        && { [[ ! -s "$dst" ]] || cmp -s "$dst" <(head -c "$(( $(wc -c < "$dst") ))" "$tmp"); }; then
         mv "$tmp" "$dst"
     else
         rm -f "$tmp"
-        echo "cannot copy $src back to $dst: the fetch failed or the file is shorter than the $old line(s) held here" >&2
+        echo "cannot copy $src back to $dst: the fetch failed, or the history here is not a prefix of the host's (it changed during the run)" >&2
         return 1
     fi
 }
@@ -210,7 +211,6 @@ info "m6: release build, warnings, clippy, cargo-deny, tests, conformance"
 # PERF_COMMIT is read here, from the checkout being synced, because the remote
 # tree has no `.git`. PERF_DIRTY is 1 when the checkout differs from that commit
 # (possible only under M6_ALLOW_DIRTY), not counting the history file itself.
-# refuses to sync a dirty tree at all.
 PERF_COMMIT="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
 PERF_DIRTY=0
 [[ -z "$(git -C "$ROOT" status --porcelain -- . ':!tools/perf-history.jsonl' 2>/dev/null)" ]] || PERF_DIRTY=1

@@ -102,7 +102,7 @@ def dirty():
     """Whether the measured tree had uncommitted changes.
 
     On the build host the answer comes from the machine that synced, because the
-    guard there refuses to sync a dirty tree at all. M6_PERF_DIRTY carries it.
+    synced tree has no .git to ask. M6_PERF_DIRTY carries it.
     """
     env = os.environ.get("M6_PERF_DIRTY")
     if env is not None:
