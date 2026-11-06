@@ -149,6 +149,31 @@ fn hold_open_asking(socket: &Path, svc: &mut Service, connection: &str) -> UnixS
     }
 }
 
+/// Send a keep-alive GET on a new connection and read its response, retrying
+/// while the one worker is still finishing an earlier connection: the fixture
+/// has no queue, so such a connection is refused with 503.
+fn first_request(socket: &Path, svc: &Service) -> (UnixStream, String) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut conn = UnixStream::connect(socket).expect("connect");
+        conn.set_read_timeout(Some(Duration::from_secs(30))).ok();
+        conn.write_all(b"GET /blog HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .expect("send the first request");
+        let first =
+            String::from_utf8_lossy(&read_one(&mut conn, "GET").expect("read the first response"))
+                .to_ascii_lowercase();
+        if !first.starts_with("http/1.1 503") {
+            return (conn, first);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the worker never came free\n--- output ---\n{}",
+            svc.output()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// True if the service has already answered or closed the held stream, which
 /// it does only to refuse it.
 fn was_refused(held: &mut UnixStream) -> bool {
@@ -333,12 +358,7 @@ fn a_request_in_flight_at_sigterm_receives_its_full_response() {
 #[test]
 fn an_idle_keep_alive_connection_does_not_hold_the_drain() {
     let (mut server, socket_path) = spawn("term-keepalive");
-    let mut conn = UnixStream::connect(&socket_path).expect("connect");
-    conn.set_read_timeout(Some(Duration::from_secs(30))).ok();
-    conn.write_all(b"GET /blog HTTP/1.1\r\nHost: localhost\r\n\r\n")
-        .expect("send a request");
-    let first = String::from_utf8_lossy(&read_one(&mut conn, "GET").expect("read the response"))
-        .to_ascii_lowercase();
+    let (mut conn, first) = first_request(&socket_path, &server.svc);
     assert!(
         !first.contains("connection: close"),
         "the response closed the connection, so nothing is left idle to test: {}",
@@ -378,29 +398,46 @@ fn an_idle_keep_alive_connection_does_not_hold_the_drain() {
 #[test]
 fn a_connection_that_has_sent_nothing_does_not_hold_the_drain() {
     // At debug level the service logs "new connection waiting for its first
-    // request" when a fresh connection registers as idle. The readiness probe's
-    // connection logged its own before `spawn` returned, so one more line is
-    // this connection's: the idle path is the one under test.
+    // request" each time a connection reaches the one worker. The fixture has
+    // one worker and no queue, so a connection that arrives while the worker is
+    // still finishing an earlier one is refused with 503 and must be retried.
+    const IDLE_LINE: &str = "new connection waiting for its first request";
     let (mut server, socket_path) = spawn_with_args(
         "term-silent",
         "m6-html-shutdown.conf",
         &["--log-level", "debug"],
     );
-    let before = server
-        .svc
-        .output()
-        .matches("new connection waiting for its first request")
-        .count();
-    let mut conn = UnixStream::connect(&socket_path).expect("connect");
-    conn.set_read_timeout(Some(Duration::from_secs(30))).ok();
+    // Connections that have reached the worker: the readiness probe's.
+    let mut reached = 1;
     let deadline = Instant::now() + Duration::from_secs(10);
-    while server
-        .svc
-        .output()
-        .matches("new connection waiting for its first request")
-        .count()
-        <= before
-    {
+    let mut conn = UnixStream::connect(&socket_path).expect("connect");
+    loop {
+        let probe = http_request(
+            &socket_path,
+            "GET /blog HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        // The one accept loop answered `conn` before the probe, so a refusal
+        // of `conn` is already in its buffer by the time the probe is answered.
+        if was_refused(&mut conn) {
+            conn = UnixStream::connect(&socket_path).expect("reconnect");
+        } else if probe.as_deref().is_some_and(|r| r.contains("503")) {
+            // The worker is busy and `conn` was not refused: the worker has it.
+            break;
+        }
+        if probe.is_some_and(|r| !r.contains("503")) {
+            reached += 1;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the silent connection never took the worker\n--- output ---\n{}",
+            server.svc.output()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    conn.set_read_timeout(Some(Duration::from_secs(30))).ok();
+    // The worker registers a connection as idle before anything else, and
+    // the line for `conn` is the one after every earlier connection's.
+    while server.svc.output().matches(IDLE_LINE).count() <= reached {
         assert!(
             Instant::now() < deadline,
             "the silent connection never registered as idle\n--- output ---\n{}",
@@ -445,20 +482,18 @@ fn a_second_request_arriving_at_sigterm_is_served_in_full() {
         "m6-html-shutdown.conf",
         &["--log-level", "debug"],
     );
-    let mut conn = UnixStream::connect(&socket_path).expect("connect");
-    conn.set_read_timeout(Some(Duration::from_secs(10))).ok();
-    conn.write_all(b"GET /blog HTTP/1.1\r\nHost: localhost\r\n\r\n")
-        .expect("send the first request");
-    read_one(&mut conn, "GET").expect("read the first response");
+    let (mut conn, _) = first_request(&socket_path, &server.svc);
 
     conn.write_all(
         b"POST /blog HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\n0123456789",
     )
     .expect("start the second request");
-    // The second "request arriving": the connection is no longer idle, so
-    // shutdown must wait for this request rather than close it.
+    // The third "request arriving" (the readiness probe's, the first
+    // request's, then this one's; a refused connection never reaches the
+    // worker): the connection is no longer idle, so shutdown must wait for
+    // this request rather than close it.
     let deadline = Instant::now() + Duration::from_secs(10);
-    while server.svc.output().matches("request arriving").count() < 2 {
+    while server.svc.output().matches("request arriving").count() < 3 {
         assert!(
             Instant::now() < deadline,
             "the service never logged the second request arriving\n--- output ---\n{}",

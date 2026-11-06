@@ -297,10 +297,32 @@ pub const MAX_REQUESTS_PER_CONN: u32 = 100;
 /// ends, so it is never closed after being reused.
 static IDLE: std::sync::Mutex<Vec<std::os::fd::RawFd>> = std::sync::Mutex::new(Vec::new());
 
-fn idle_enter(fd: std::os::fd::RawFd, first: bool) -> bool {
+/// How a connection waits for its next request.
+#[derive(Debug, PartialEq)]
+enum Wait {
+    /// Registered as idle: shutdown may close it until a byte arrives.
+    Idle,
+    /// Shutdown has started but a request is already waiting: serve it.
+    Serve,
+    /// Shutdown has started and nothing is waiting: end the connection.
+    Close,
+}
+
+/// Decide how the connection on `fd` waits for a request. Shutdown is passed
+/// in rather than read here so the decision can be tested without the
+/// process-wide flag. Once shutdown has started a connection is never
+/// registered (`close_idle_connections` has run or is running), but one with
+/// a request already waiting is still served: a worker can be handed an
+/// accepted connection and only reach it after the signal, and that request
+/// is work the drain has counted.
+fn idle_enter(fd: std::os::fd::RawFd, first: bool, shutting_down: bool) -> Wait {
     let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-    if crate::signal::is_shutdown() {
-        return false;
+    if shutting_down {
+        return if bytes_waiting(fd) {
+            Wait::Serve
+        } else {
+            Wait::Close
+        };
     }
     idle.push(fd);
     if first {
@@ -308,7 +330,24 @@ fn idle_enter(fd: std::os::fd::RawFd, first: bool) -> bool {
     } else {
         debug!("connection waiting for its next request");
     }
-    true
+    Wait::Idle
+}
+
+/// True if `fd` has at least one byte ready to read, without consuming it or
+/// blocking. Used only once shutdown has started.
+fn bytes_waiting(fd: std::os::fd::RawFd) -> bool {
+    let mut byte = 0u8;
+    // SAFETY: the buffer is one valid byte, and MSG_PEEK | MSG_DONTWAIT
+    // neither consumes it nor blocks. A closed or invalid fd returns -1.
+    let n = unsafe {
+        libc::recv(
+            fd,
+            (&mut byte as *mut u8).cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    n > 0
 }
 
 fn idle_leave(fd: std::os::fd::RawFd) {
@@ -321,6 +360,14 @@ fn idle_leave(fd: std::os::fd::RawFd) {
 /// The stream as the parser sees it while the connection waits for a request:
 /// registered as idle until the first read that returns data, then not. The
 /// parser's own read is the wait, so a request costs no extra system call.
+///
+/// One window remains, by choice: between that first read returning and the
+/// connection leaving the idle set, a shutdown that finds no further bytes
+/// waiting closes it for reading, so a request larger than one read whose
+/// remaining bytes are still in flight is refused rather than drained. It is
+/// a few instructions wide and opens only during a shutdown. Closing it needs
+/// a peek before every request, a system call on the request path, which
+/// latency comes before.
 struct IdleUntilRead<'a, S> {
     inner: &'a mut S,
     fd: std::os::fd::RawFd,
@@ -366,20 +413,9 @@ impl<S> Drop for IdleUntilRead<'_, S> {
 pub fn close_idle_connections() {
     let idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
     for &fd in idle.iter() {
-        let mut byte = 0u8;
-        // SAFETY: fd is a connection still owned by its worker: it leaves this
-        // set, under this lock, before the connection is dropped. The buffer
-        // is one valid byte, and MSG_PEEK | MSG_DONTWAIT neither consumes it
-        // nor blocks.
-        let waiting = unsafe {
-            libc::recv(
-                fd,
-                (&mut byte as *mut u8).cast(),
-                1,
-                libc::MSG_PEEK | libc::MSG_DONTWAIT,
-            )
-        };
-        if waiting <= 0 {
+        if !bytes_waiting(fd) {
+            // SAFETY: fd is a connection still owned by its worker: it leaves
+            // this set, under this lock, before the connection is dropped.
             unsafe { libc::shutdown(fd, libc::SHUT_RD) };
         }
     }
@@ -420,13 +456,15 @@ where
         // its first request as much as any later one. It waits registered as
         // such, so a shutdown can close it at once; once a byte has arrived it
         // is a request being served, and the drain waits for it.
-        if !idle_enter(fd, served == 0) {
-            return Ok(());
-        }
+        let idle = match idle_enter(fd, served == 0, crate::signal::is_shutdown()) {
+            Wait::Idle => true,
+            Wait::Serve => false,
+            Wait::Close => return Ok(()),
+        };
         let parsed = parse::parse_request(&mut IdleUntilRead {
             inner: &mut *stream,
             fd,
-            idle: true,
+            idle,
         });
         let req = match parsed {
             Ok(r) => r,
@@ -510,6 +548,23 @@ pub fn write_error_response<W: std::io::Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A worker can reach an accepted connection only after shutdown has
+    /// started. The wrong outcome: the request already waiting on it is
+    /// dropped unread, and the drain reports a clean finish having lost it.
+    #[test]
+    fn after_shutdown_a_waiting_request_is_served_and_a_silent_connection_closed() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let (mut client, server) = UnixStream::pair().expect("socket pair");
+        assert_eq!(idle_enter(server.as_raw_fd(), true, true), Wait::Close);
+        client
+            .write_all(b"GET / HTTP/1.1\r\n\r\n")
+            .expect("send a request");
+        assert_eq!(idle_enter(server.as_raw_fd(), true, true), Wait::Serve);
+    }
 
     #[test]
     fn test_socket_path_from_config_relative() {
