@@ -314,12 +314,16 @@ A route that names a template produces a `Response` carrying `template_name` and
 
 `ConfigReloader::new(site_toml, process, seen)` owns a `ConfigWatcher` on a service's two files and reports which of them changed.
 The loop calls `on_readable(now)` when `raw_fd()` is readable and `tick(now)` on every iteration, and `tick` returns `Some(Changed { site, process })` when a report is due.
-A `Fingerprint` of device, inode, length, mtime and ctime decides which file changed.
-On Linux an event that names a file forces a report even when the fingerprint is equal, which catches a same-length rewrite and two renames that reuse an inode.
+A `Fingerprint` of a file's bytes (a hash), mode, owner and mtime decides whether it changed.
+The inode and ctime are left out, because a rename over a file bumps ctime on the old inode just before the name moves, and that state has the old bytes and times.
+A file that cannot be read has no hash, so fixing its permissions is a change.
+Events of any kind, an overflow of the inotify queue included, and the poll only trigger a check.
+A check compares each file's fingerprint with the one last reported.
+A file that differs is reported once its fingerprint is the same at two checks `RELOAD_DEBOUNCE` (20 ms) apart, and then the fingerprint is recorded as reported.
+A change to the file during the wait restarts it, and a file that never stops changing is reported `RELOAD_POLL` (one second) after it first differed.
+The first change after quiet is therefore reported 20 ms after it is first seen.
 On kqueue the watcher sees the directory, so an unrelated write beside the config wakes the loop, and the unchanged fingerprints mean no report is made.
 
-The first change after quiet is reported at once.
-A change within `RELOAD_DEBOUNCE` (20 ms) of a report is held and reported once more when the burst settles, capped at `RELOAD_POLL` (one second), so a burst is at most two reports.
 The fingerprints are also compared every `RELOAD_POLL` whatever the watcher says, which finds a lost watch.
 Take a `Seen` from `Seen::read` before the first read of either file so a change in between is reported on the first tick.
 With no watcher the poll alone does the job, there is no thread, and `tick` does not allocate.
