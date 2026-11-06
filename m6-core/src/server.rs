@@ -308,16 +308,17 @@ enum Wait {
     Close,
 }
 
-/// Decide how the connection on `fd` waits for a request. Shutdown is passed
-/// in rather than read here so the decision can be tested without the
-/// process-wide flag. Once shutdown has started a connection is never
+/// Decide how the connection on `fd` waits for a request. `shutting_down` is
+/// read under the idle-set lock, so a connection is either registered before
+/// `close_idle_connections` sweeps the set or sees shutdown here; it is passed
+/// in so the decision can be tested without the process-wide flag. Once shutdown has started a connection is never
 /// registered (`close_idle_connections` has run or is running), but one with
 /// a request already waiting is still served: a worker can be handed an
 /// accepted connection and only reach it after the signal, and that request
 /// is work the drain has counted.
-fn idle_enter(fd: std::os::fd::RawFd, first: bool, shutting_down: bool) -> Wait {
+fn idle_enter(fd: std::os::fd::RawFd, first: bool, shutting_down: impl Fn() -> bool) -> Wait {
     let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-    if shutting_down {
+    if shutting_down() {
         return if bytes_waiting(fd) {
             Wait::Serve
         } else {
@@ -456,7 +457,7 @@ where
         // its first request as much as any later one. It waits registered as
         // such, so a shutdown can close it at once; once a byte has arrived it
         // is a request being served, and the drain waits for it.
-        let idle = match idle_enter(fd, served == 0, crate::signal::is_shutdown()) {
+        let idle = match idle_enter(fd, served == 0, crate::signal::is_shutdown) {
             Wait::Idle => true,
             Wait::Serve => false,
             Wait::Close => return Ok(()),
@@ -559,11 +560,11 @@ mod tests {
         use std::os::unix::net::UnixStream;
 
         let (mut client, server) = UnixStream::pair().expect("socket pair");
-        assert_eq!(idle_enter(server.as_raw_fd(), true, true), Wait::Close);
+        assert_eq!(idle_enter(server.as_raw_fd(), true, || true), Wait::Close);
         client
             .write_all(b"GET / HTTP/1.1\r\n\r\n")
             .expect("send a request");
-        assert_eq!(idle_enter(server.as_raw_fd(), true, true), Wait::Serve);
+        assert_eq!(idle_enter(server.as_raw_fd(), true, || true), Wait::Serve);
     }
 
     #[test]
