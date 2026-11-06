@@ -9,22 +9,12 @@
 
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use m6_core::prelude::*;
+use m6_core::testkit::wait::until;
 
 const CHILD_ENV: &str = "M6_ON_RELOAD_CHILD";
-
-fn until(timeout: Duration, mut ready: impl FnMut() -> bool) -> bool {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if ready() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    ready()
-}
 
 /// A config carrying `marker`.
 fn conf_text(marker: &str) -> String {
@@ -215,9 +205,22 @@ fn a_failed_hook_leaves_the_previous_state_and_is_retried() {
         read_log()
     );
     assert!(read_log().contains("retrying in 1s"), "{}", read_log());
-    // And the debug level of the failed config was not applied.
+    // And the debug level of the failed config was not applied. A request
+    // served at the previous level logs "unmatched path" but not the
+    // debug-only "request complete". The log writer is one ordered queue, so a
+    // second request's "unmatched path" is flushed after any "request
+    // complete" the first request would have emitted: wait for the second, then
+    // assert the first is absent.
     request(dir.path());
-    std::thread::sleep(Duration::from_millis(300));
+    request(dir.path());
+    assert!(
+        until(Duration::from_secs(10), || read_log()
+            .matches("unmatched path")
+            .count()
+            >= 2),
+        "the requests were never served\n{}",
+        read_log()
+    );
     assert!(
         !read_log().contains("request complete"),
         "the level of a failed reload was applied\n{}",
