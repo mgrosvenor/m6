@@ -1104,7 +1104,7 @@ mod tests {
         assert_ne!(a, b, "two connection IDs came out identical");
     }
 
-    /// Pins the flow-control numbers each caller passes to the shared builder.
+    /// Pins the parameters each caller passes to the shared builder.
     ///
     /// quiche's `Config` exposes no getters for its transport parameters, so
     /// the builder's output cannot be read back without driving a connection.
@@ -1114,7 +1114,7 @@ mod tests {
     /// field-to-setter mapping; the smoke check below only proves that it
     /// accepts each caller's parameters, not that it applies them.
     #[test]
-    fn quic_client_params_carry_each_callers_flow_control_numbers() {
+    fn quic_client_params_carry_each_callers_numbers_and_switches() {
         let zero_rtt = zero_rtt_quic_params();
         let handshake = handshake_quic_params();
         let bench = bench_quic_params(false);
