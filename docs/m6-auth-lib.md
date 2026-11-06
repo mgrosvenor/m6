@@ -110,7 +110,7 @@ Take from it that the three reads return `None` for an absent name, and the writ
 | `user_delete` | `(&self, username: &str) -> Result<()>` | deletes the row and returns `UserNotFound` when no row matched, and the foreign keys delete its memberships, refresh-token rows and API-token rows, but not the tokens already issued, which stay valid until `exp` (see section 5.2) |
 | `user_set_password` | `(&self, username: &str, password: &str) -> Result<()>` | replaces the hash with a new one at cost 12 |
 | `user_set_roles` | `(&self, username: &str, roles: &[&str]) -> Result<()>` | replaces the whole role list, and an empty slice clears every role |
-| `user_verify_password` | `(&self, username: &str, password: &str) -> Result<Option<User>>` | returns the user on a matching password, and `None` for a wrong password or an unknown user, and an unknown user returns without running bcrypt, so response time reveals whether a username exists |
+| `user_verify_password` | `(&self, username: &str, password: &str) -> Result<Option<User>>` | returns the user on a matching password, and `None` for a wrong password or an unknown user, and verifies an unknown user against a fixed dummy hash of the same cost, so response time does not reveal whether a username exists |
 
 **Table 3: the eight user operations, their signatures and what each one does.**
 `user_verify_password` is the login primitive, and `m6-auth-server` calls it on `POST /auth/login`.
@@ -270,6 +270,9 @@ pub enum AuthError {
     #[error("api token not found: {0}")]
     ApiTokenNotFound(String),
 
+    #[error("roles column for user {0} is not valid JSON: {1}")]
+    Roles(String, serde_json::Error),
+
     #[error("database error: {0}")]
     Db(#[from] rusqlite::Error),
 
@@ -278,8 +281,8 @@ pub enum AuthError {
 }
 ```
 
-Table 8 gives the seven variants and the calls that return each.
-Take from it that five variants name a row, and the other two wrap a failure from a dependency.
+Table 8 gives the eight variants and the calls that return each.
+Take from it that six variants name a row, and the other two wrap a failure from a dependency.
 
 | variant | meaning | returned by |
 |---|---|---|
@@ -288,11 +291,12 @@ Take from it that five variants name a row, and the other two wrap a failure fro
 | `GroupNotFound` | no group has that name | `group_delete`, a membership call naming an unknown group |
 | `GroupExists` | the group name is taken | `group_create` |
 | `ApiTokenNotFound` | no API token has that id | `api_token_revoke` |
+| `Roles` | a user's `roles` column is not valid JSON | `user_get`, `user_get_by_id`, `user_list`, `group_members`, `user_verify_password` |
 | `Db` | SQLite returned an error | any call that reads or writes |
 | `Bcrypt` | the password hash or check failed | `user_create`, `user_set_password`, `user_verify_password` |
 
-**Table 8: the seven `AuthError` variants, what each one means and which calls return it.**
-The first five are answers about a row, and the last two carry a dependency's own error through `#[from]`.
+**Table 8: the eight `AuthError` variants, what each one means and which calls return it.**
+The first six are answers about a row, and the last two carry a dependency's own error through `#[from]`.
 
 `AuthError` implements `std::error::Error` through `thiserror`, so a caller converts it with one `map_err`, as section 8 does.
 The `Db` and `Bcrypt` variants convert with `?` inside the crate, so a dependency failure needs no wrapping at each call site.
