@@ -9,7 +9,7 @@ use std::io::{Read, Write};
 use std::net::{TcpStream, UdpSocket};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::thread;
 use std::time::Duration;
@@ -480,6 +480,72 @@ fn http2_version_field_is_http2() {
         b"HTTP/2",
         "expected version HTTP/2 in body, got {:?}",
         String::from_utf8_lossy(&body_bytes)
+    );
+}
+
+/// The client address an HTTP/2 over TLS request carries must be the peer that
+/// connected. This test fails if the handler receives any other address, which
+/// would attribute the request to the wrong client.
+#[test]
+fn http2_records_the_peer_client_address() {
+    let tc = generate_test_cert();
+    let (cert_file, key_file) = write_pem_files(&tc);
+    let client_cfg = make_h2_client_config(&tc.cert_der);
+
+    let seen = Arc::new(Mutex::new(String::new()));
+    let seen_in_handler = Arc::clone(&seen);
+
+    let (port, stop) = start_http11_server(
+        cert_file.path().to_str().unwrap(),
+        key_file.path().to_str().unwrap(),
+        move |_req, client_ip| {
+            *seen_in_handler.lock().unwrap() = client_ip.to_string();
+            (
+                200,
+                vec![("content-type".to_string(), "text/plain".to_string())],
+                b"ok".to_vec(),
+                "test".to_string(),
+            )
+        },
+    );
+
+    let stream = TcpStream::connect(format!("127.0.0.1:{}", port)).expect("tcp connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    let server_name = rustls::pki_types::ServerName::try_from("localhost")
+        .unwrap()
+        .to_owned();
+    let mut conn = rustls::ClientConnection::new(client_cfg, server_name).unwrap();
+    let mut stream_ref = &stream;
+    let mut tls = rustls::Stream::new(&mut conn, &mut stream_ref);
+
+    const FLAG_END_STREAM: u8 = 0x1;
+    const FLAG_END_HEADERS: u8 = 0x4;
+    tls.write_all(H2_PREFACE).unwrap();
+    tls.write_all(&h2_frame(0x4, 0x0, 0, &[])).unwrap();
+    tls.write_all(&h2_frame(
+        0x1,
+        FLAG_END_STREAM | FLAG_END_HEADERS,
+        1,
+        H2_REQUEST_HEADERS,
+    ))
+    .unwrap();
+    let goaway_payload = [0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00];
+    tls.write_all(&h2_frame(0x7, 0x0, 0, &goaway_payload))
+        .unwrap();
+    tls.flush().ok();
+
+    let mut raw = Vec::new();
+    let _ = tls.read_to_end(&mut raw);
+
+    stop.store(true, Ordering::Relaxed);
+
+    assert_eq!(
+        *seen.lock().unwrap(),
+        "127.0.0.1",
+        "the HTTP/2 over TLS request must record the connecting peer address as client_ip"
     );
 }
 
