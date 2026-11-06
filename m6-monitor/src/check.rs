@@ -29,7 +29,7 @@
 
 use std::fmt::Write as _;
 
-use crate::digest::{fmt_uptime, Digest, Level};
+use crate::digest::{fmt_uptime, header_check_text, Digest, Level};
 use crate::poll::NodeReading;
 
 /// Reverse-lookup results by address, read by [`render`].
@@ -577,28 +577,19 @@ pub fn render(d: &Digest, readings: &[NodeReading], verdicts: &Verdicts) -> Stri
             for hc in &r.header_checks {
                 if hc.passed() {
                     let _ = writeln!(o, "  {:<5} ok     {} {}", r.name, hc.path, hc.header);
-                } else if let Some(e) = &hc.error {
-                    let _ = writeln!(
-                        o,
-                        "  {:<5} FAULT  {} could not be fetched: {}",
-                        r.name, hc.path, e
-                    );
+                } else if hc.error.is_some() {
+                    let _ = writeln!(o, "  {:<5} FAULT  {}", r.name, header_check_text(hc));
                 } else {
-                    // Absent and wrong are different failures and read
-                    // differently: a missing header is usually a route that lost
-                    // its policy, a wrong one a policy that changed.
-                    let got = hc
-                        .actual
-                        .clone()
-                        .unwrap_or_else(|| "<header absent>".to_string());
                     let code = hc
                         .status
                         .map(|c| format!(" (HTTP {c})"))
                         .unwrap_or_default();
                     let _ = writeln!(
                         o,
-                        "  {:<5} FAULT  {} {} is {:?}, expected {:?}{}",
-                        r.name, hc.path, hc.header, got, hc.expected, code
+                        "  {:<5} FAULT  {}{}",
+                        r.name,
+                        header_check_text(hc),
+                        code
                     );
                 }
             }

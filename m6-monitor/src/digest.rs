@@ -463,13 +463,13 @@ fn quiet_log_findings(node: &str, l: &m6_core::monitoring::LoggingHealth) -> Opt
     })
 }
 
-/// The fault finding for one failing header check, shared by the digest and the
-/// check render so a wrong cache policy reaches the verdict in both.
+/// The fault sentence for one failing header check, in the wording both the
+/// digest finding and the check's F section print.
 ///
-/// The `text` names the path and the two values but not the node: `Finding.node`
-/// carries that, and every verdict prints it as `- {node}: {text}`.
-pub(crate) fn header_check_finding(node: &str, hc: &HeaderCheckResult) -> Finding {
-    let text = if let Some(e) = &hc.error {
+/// Absent and wrong read differently: a missing header is usually a route that
+/// lost its policy, a wrong one a policy that changed.
+pub(crate) fn header_check_text(hc: &HeaderCheckResult) -> String {
+    if let Some(e) = &hc.error {
         format!("{} could not be fetched: {e}", hc.path)
     } else {
         let got = hc
@@ -480,11 +480,19 @@ pub(crate) fn header_check_finding(node: &str, hc: &HeaderCheckResult) -> Findin
             "{} {} is {:?}, expected {:?}",
             hc.path, hc.header, got, hc.expected
         )
-    };
+    }
+}
+
+/// The fault finding for one failing header check, shared by the digest and the
+/// check render so a wrong cache policy reaches the verdict in both.
+///
+/// The `text` names the path and the two values but not the node: `Finding.node`
+/// carries that, and every verdict prints it as `- {node}: {text}`.
+pub(crate) fn header_check_finding(node: &str, hc: &HeaderCheckResult) -> Finding {
     Finding {
         level: Level::Fault,
         node: node.to_string(),
-        text,
+        text: header_check_text(hc),
     }
 }
 
