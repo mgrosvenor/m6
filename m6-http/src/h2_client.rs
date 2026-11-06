@@ -236,25 +236,11 @@ impl<T: Transport> H2Client<T> {
             },
         );
 
-        // Hand the body to the flow-control pump rather than writing it here.
-        //
-        // It used to go out in one chunking loop that consulted only
-        // `peer_max_frame`, so the frames were the right SIZE but were sent
-        // regardless of whether the peer had granted CREDIT for them --
-        // `conn_send_window` was incremented on WINDOW_UPDATE and never read.
-        // RFC 9113 6.9 makes that a connection error at the receiver's
-        // discretion. It never bit because the only peer is m6's own origin,
-        // which advertises a 1 MiB initial window and tops its connection
-        // window up promptly; that is luck, not correctness, and it ends the
-        // moment a backbone client is pointed at a peer that is not m6.
-        //
-        // The loop could not simply skip a write it had no credit for: it would
-        // exit having sent fewer bytes than `content-length` promised, with
-        // END_STREAM on whatever chunk happened to be last. That is the
-        // request-smuggling primitive `validate_request_header_bytes` rejects on
-        // ingress, manufactured on egress. Blocking instead would stall every
-        // other connection this poller drives. So the remainder is kept as
-        // stream state and resumed when credit arrives.
+        // Send the body via the flow-control pump. Credit arrives
+        // asynchronously on WINDOW_UPDATE, so the remainder is kept as stream
+        // state and resumed when credit arrives; blocking instead would stall
+        // every other connection this poller drives, and sending without credit
+        // is a connection error (RFC 9113 6.9).
         self.pump_stream(stream_id);
 
         Ok(rx)
@@ -343,14 +329,10 @@ impl<T: Transport> H2Client<T> {
 
         // ── Read incoming data ────────────────────────────────────────────────
         //
-        // EOF is deferred, not acted on here. `mark_dead` used to run the
-        // instant `read` returned 0, with a `return` that skipped the frame loop
-        // below -- so a peer that sent a complete response and then closed had
-        // that response discarded out of `recv_buf`, and every in-flight stream
-        // was failed with BrokenPipe. Answer-then-close is legal and ordinary
-        // (a backend shutting down, or one that does not hold the connection
-        // open), and the edge turned it into a 502. Parse what already arrived
-        // first; the connection is still dead afterwards.
+        // Defer EOF until the frame loop below has run: a peer may send a
+        // complete response and then close, and answer-then-close is legal.
+        // Parse what already arrived first; the connection is still dead
+        // afterwards.
         let eof = self.transport.fill_recv(&mut self.recv_buf);
 
         // ── Process frames ────────────────────────────────────────────────────
@@ -401,8 +383,7 @@ impl<T: Transport> H2Client<T> {
                         match id {
                             // RFC 9113 6.9.2: a change to INITIAL_WINDOW_SIZE
                             // applies retroactively to every open stream, by
-                            // the delta. Only new streams used to see it,
-                            // because the value was stored and never read.
+                            // the delta.
                             4 if val <= i32::MAX as u32 => {
                                 let delta = val as i32 - self.peer_initial_window;
                                 self.peer_initial_window = val as i32;
@@ -567,8 +548,7 @@ impl<T: Transport> H2Client<T> {
                         return;
                     }
                     // 6.9.1: a window above 2^31-1 is a FLOW_CONTROL_ERROR,
-                    // not a wrap. `+=` on an i32 used to overflow, which
-                    // panics in a debug build.
+                    // not a wrap.
                     match self.conn_send_window.checked_add(inc as i32) {
                         Some(w) => self.conn_send_window = w,
                         None => {
@@ -582,10 +562,8 @@ impl<T: Transport> H2Client<T> {
                     self.pump_all();
                 }
 
-                // Per-stream credit. This arm did not exist: a stream-level
-                // WINDOW_UPDATE fell through to the catch-all and was discarded,
-                // so a peer that granted credit per stream rather than per
-                // connection was never heard.
+                // Per-stream credit: grant it to that stream and resume its
+                // body if it was out of credit.
                 TYPE_WINDOW_UPDATE if stream_id > 0 && payload.len() >= 4 => {
                     let inc = (((payload[0] as u32) << 24)
                         | ((payload[1] as u32) << 16)
@@ -761,6 +739,8 @@ impl<T: Transport> Pool<T> {
         original_host: &str,
         tls: Option<Arc<rustls::ClientConfig>>,
     ) -> io::Result<mpsc::Receiver<io::Result<HttpResponse>>> {
+        let (host, port) = parse_host_port(base_url, T::prefix(), T::default_port())?;
+
         // Check if we need a new connection
         let needs_new = match self.connections.get(base_url) {
             None => true,
@@ -768,13 +748,9 @@ impl<T: Transport> Pool<T> {
         };
 
         if needs_new {
-            let (host, port) = parse_host_port(base_url, T::prefix(), T::default_port())?;
             let new_conn = H2Client::connect(&host, port, tls)?;
             self.connections.insert(base_url.to_string(), new_conn);
         }
-
-        // Get host for :authority header
-        let (host, _) = parse_host_port(base_url, T::prefix(), T::default_port())?;
 
         let conn = self.connections.get_mut(base_url).unwrap();
         conn.dispatch(req, &host, client_ip, original_host)

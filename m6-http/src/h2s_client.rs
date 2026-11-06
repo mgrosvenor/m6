@@ -96,14 +96,11 @@ impl Transport for H2sTransport {
     }
 
     fn flush_send(&mut self, send_buf: &mut Vec<u8>) -> Result<(), String> {
-        // A SHORT write here is normal, not an error. rustls caps its outgoing
-        // plaintext buffer (64 KiB by default) and its `Writer` returns however
-        // much it accepted, or 0 once the buffer is full. `write_all` turns
-        // that 0 into `ErrorKind::WriteZero`, which was reported as a TLS
-        // failure and killed the connection -- so any request whose frames
-        // pushed `send_buf` past the limit died mid-flight. Keep whatever was
-        // not accepted and let the flush below drain the buffer into the
-        // socket; the next `drive()` continues from there.
+        // A short write here is normal, not an error: rustls caps its outgoing
+        // plaintext buffer (64 KiB by default), so its `Writer` accepts as much
+        // as fits and returns 0 once the buffer is full. Keep whatever was not
+        // accepted and let the flush below drain the buffer into the socket;
+        // the next `drive()` continues from there.
         if !send_buf.is_empty() {
             match self.tls_conn.writer().write(send_buf) {
                 // Buffer full. Not an error: the flush below makes room.
