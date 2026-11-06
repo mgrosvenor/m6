@@ -853,15 +853,11 @@ fn a_rotated_auth_key_verifies_after_a_touch() {
 
     std::fs::write(run.fx.dir.path().join("auth-public.pem"), second_public)
         .expect("write the new public key");
-    // The key file is not watched. Poll the absence over a bounded window, so a
-    // watcher that fired anywhere inside the window is caught.
-    let accepted = testkit::wait::until(Duration::from_secs(2), || {
-        run.h1("/perf", &[("Authorization", &auth)]).status == 200
-    });
-    assert!(
-        !accepted,
-        "writing the key file must not reload auth; the new key became trusted"
-    );
+    // The key file is not watched, so writing it changes nothing. This stays a
+    // fixed delay: the verdict is an absence, and m6-http logs nothing when it
+    // correctly ignores a key-file write, so there is no signal to wait on. The
+    // report names the heartbeat line that would remove this sleep.
+    std::thread::sleep(Duration::from_secs(2));
     assert_eq!(
         run.h1("/perf", &[("Authorization", &auth)]).status,
         401,
