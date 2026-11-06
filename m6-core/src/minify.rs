@@ -69,8 +69,14 @@ pub fn minify_css(data: &[u8]) -> Vec<u8> {
                 while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
                     i += 1;
                 }
-                i += 2; // skip closing */
-                last_was_ws = true; // treat comment as whitespace
+                // skip the closing */
+                i += 2;
+                // A comment separates tokens like whitespace does, so emit a
+                // space here, or `red/*c*/blue` merges into one identifier.
+                if !last_was_ws {
+                    out.push(' ');
+                    last_was_ws = true;
+                }
             }
             // Copy quoted strings verbatim, honouring backslash escapes.
             '"' | '\'' => {
@@ -132,6 +138,14 @@ fn copy_url(out: &mut String, chars: &[char], i: &mut usize) {
     while *i < chars.len() {
         match chars[*i] {
             '"' | '\'' => copy_string(out, chars, i),
+            '\\' => {
+                out.push('\\');
+                *i += 1;
+                if *i < chars.len() {
+                    out.push(chars[*i]);
+                    *i += 1;
+                }
+            }
             ')' => {
                 out.push(')');
                 *i += 1;
@@ -228,6 +242,35 @@ mod tests {
         assert!(
             s.contains(r#""a\"  b""#),
             "escaped quote broke the string: {}",
+            s
+        );
+    }
+
+    #[test]
+    fn test_minify_css_preserves_escaped_paren_in_url() {
+        let css = br#"a{background:url(a\)/*b*/c)}"#;
+        let out = minify_css(css);
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(
+            s.contains(r#"url(a\)/*b*/c)"#),
+            "escaped ) ended the url early: {}",
+            s
+        );
+    }
+
+    #[test]
+    fn test_minify_css_comment_still_separates_tokens() {
+        let css = br#"a{color:red/*c*/blue}"#;
+        let out = minify_css(css);
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(
+            s.contains("red blue"),
+            "comment did not separate tokens: {}",
+            s
+        );
+        assert!(
+            !s.contains("redblue"),
+            "tokens merged across a comment: {}",
             s
         );
     }
