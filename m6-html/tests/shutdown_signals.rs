@@ -307,6 +307,68 @@ fn a_request_in_flight_at_sigterm_receives_its_full_response() {
     );
 }
 
+/// Once shutdown starts, a keep-alive connection is answered and closed. The
+/// wrong outcome: a client holding a keep-alive connection open keeps the
+/// drain waiting until the connection idles out, so a stop behind a reverse
+/// proxy that pools connections takes the whole drain deadline.
+#[test]
+fn a_keep_alive_connection_is_closed_once_shutdown_starts() {
+    let (mut server, socket_path) = spawn("term-keepalive");
+    let mut conn = UnixStream::connect(&socket_path).expect("connect");
+    conn.set_read_timeout(Some(Duration::from_secs(10))).ok();
+    let get = b"GET /blog HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+    conn.write_all(get).expect("send the first request");
+    let first =
+        String::from_utf8_lossy(&read_one(&mut conn, "GET").expect("read the first response"))
+            .to_ascii_lowercase();
+    assert!(
+        !first.contains("connection: close"),
+        "the first response already closed the connection, so this test proves nothing: {}",
+        &first[..first.len().min(300)]
+    );
+
+    server.svc.signal(libc::SIGTERM);
+    wait_for_output(
+        &server.svc,
+        "shutdown signal received",
+        Duration::from_secs(5),
+    );
+
+    conn.write_all(get)
+        .expect("send a request on the kept-alive connection");
+    let second =
+        String::from_utf8_lossy(&read_one(&mut conn, "GET").expect("read the second response"))
+            .to_ascii_lowercase();
+    assert!(
+        second.contains("200 ok"),
+        "the request after shutdown began was not answered: {}",
+        &second[..second.len().min(300)]
+    );
+    assert!(
+        second.contains("connection: close"),
+        "a response after shutdown began kept the connection alive: {}",
+        &second[..second.len().min(300)]
+    );
+
+    // Well inside the default 30 s read timeout: the drain did not wait for
+    // the connection to idle out.
+    let status = server
+        .svc
+        .wait_for_exit(Instant::now() + Duration::from_secs(5))
+        .unwrap_or_else(|| {
+            panic!(
+                "m6-html did not exit promptly after closing the connection\n--- output ---\n{}",
+                server.svc.output()
+            )
+        });
+    assert!(
+        status.success(),
+        "exit {status}\n--- output ---\n{}",
+        server.svc.output()
+    );
+}
+
 /// A request that never finishes cannot hold shutdown past `drain_timeout_s`.
 /// The wrong outcome: the drain waits for the stalled request until the
 /// supervisor kills the service mid-response. The service logs how many

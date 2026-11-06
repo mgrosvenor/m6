@@ -333,7 +333,12 @@ where
         };
 
         served += 1;
-        let keep_alive = crate::h1::keep_alive(&req) && served < MAX_REQUESTS_PER_CONN;
+        // Once shutdown starts, every response closes its connection, so a
+        // client holding keep-alive connections open cannot keep the drain
+        // waiting until they idle out.
+        let keep_alive = crate::h1::keep_alive(&req)
+            && served < MAX_REQUESTS_PER_CONN
+            && !crate::signal::is_shutdown();
 
         let mut resp = crate::h1::Responder::new(stream, &req.method, keep_alive);
         handler(req, &mut resp)?;
