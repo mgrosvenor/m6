@@ -151,13 +151,13 @@ pub fn strip_ansi(s: &str) -> String {
 }
 
 fn field(line: &str, key: &str) -> Option<u64> {
-    let pat = format!("{key}=");
-    let start = line.find(&pat)? + pat.len();
-    let rest = &line[start..];
-    let end = rest
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(rest.len());
-    rest[..end].parse().ok()
+    // A field is a whole whitespace-delimited token `key=value`, so a key must
+    // not be read out of a longer key such as `total_requests`.
+    let prefix = format!("{key}=");
+    let value = line
+        .split_whitespace()
+        .find_map(|token| token.strip_prefix(prefix.as_str()))?;
+    value.parse().ok()
 }
 
 impl PeriodicStats {
@@ -1165,6 +1165,15 @@ mod tests {
         let s = PeriodicStats::parse(line).unwrap();
         assert_eq!(s.cache_hits, 76);
         assert_eq!(s.hit_p50_ns, 3455);
+    }
+
+    /// `requests` must not be read out of a `total_requests` field on the same
+    /// line: `requests=` is a substring of `total_requests=`.
+    #[test]
+    fn requests_is_not_read_out_of_total_requests() {
+        let line = "periodic stats total_requests=9 requests=3";
+        let s = PeriodicStats::parse(line).unwrap();
+        assert_eq!(s.requests, 3);
     }
 
     /// The 2026-09-11 incident, reduced.
