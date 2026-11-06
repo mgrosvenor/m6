@@ -642,8 +642,7 @@ fn writing_the_certificate_without_a_touch_changes_nothing() {
     // The certificate and key files are not watched, so installing new material
     // changes nothing until the system config is touched. This stays a fixed
     // delay: the verdict is an absence, and m6-http logs nothing when it
-    // correctly ignores a certificate-file write, so there is no signal to wait
-    // on. The report names the heartbeat line that would remove this sleep.
+    // correctly ignores a certificate-file write, so there is no signal to wait on.
     std::thread::sleep(Duration::from_secs(3));
 
     assert_eq!(
