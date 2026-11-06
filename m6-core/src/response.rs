@@ -490,8 +490,10 @@ impl Response {
                 // Last-Modified off of, but its body is a plain byte string —
                 // a content hash gives conditional-GET (see m6-http's
                 // cache-hit `is_not_modified` check) a real signal to compare
-                // against once this response is cached.
-                if !has("etag") && !bytes.is_empty() {
+                // against once this response is cached. A `no-store` response
+                // is never cached, so no cache will revalidate it: hashing its
+                // body is wasted work.
+                if !has("etag") && !bytes.is_empty() && !cache_control_no_store(&headers) {
                     etag = format!("\"{:x}\"", content_hash(&bytes));
                     hdrs.push(("ETag", etag.as_str()));
                 }
@@ -507,6 +509,20 @@ fn content_hash(body: &[u8]) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     body.hash(&mut hasher);
     hasher.finish()
+}
+
+/// Whether a `Cache-Control` field asks caches not to store the response.
+///
+/// `no-store` is a bare directive token, so matching each comma-separated token
+/// exactly, across every field line, avoids a substring match flagging a
+/// directive named `no-store-extension` and a first-line-only read missing a
+/// second `Cache-Control` line.
+fn cache_control_no_store(headers: &[(String, String)]) -> bool {
+    crate::headers::get_all(headers, "cache-control").any(|value| {
+        value
+            .split(',')
+            .any(|d| d.trim().eq_ignore_ascii_case("no-store"))
+    })
 }
 
 /// Map an `Error` to a `Response` (status only, body set by framework).
@@ -575,6 +591,24 @@ mod body_tests {
         // A byte body still gets one, which is the behaviour that existed
         // before and that m6-http's cache-hit revalidation depends on.
         let (head, _) = send_to_wire(Response::text("abcdef"), "GET");
+        assert!(head.to_lowercase().contains("etag"), "{head}");
+    }
+
+    /// A `no-store` response will not be cached, so no cache will revalidate
+    /// it: hashing the body for an ETag is wasted work. A cacheable response
+    /// still gets one, which a conditional request matches to get a 304.
+    #[test]
+    fn a_no_store_response_is_not_hashed_for_an_etag() {
+        let (head, _) = send_to_wire(
+            Response::text("abcdef").header("Cache-Control", "no-store"),
+            "GET",
+        );
+        assert!(!head.to_lowercase().contains("etag"), "{head}");
+
+        let (head, _) = send_to_wire(
+            Response::text("abcdef").header("Cache-Control", "public, max-age=60"),
+            "GET",
+        );
         assert!(head.to_lowercase().contains("etag"), "{head}");
     }
 
