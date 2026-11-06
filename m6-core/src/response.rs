@@ -513,16 +513,37 @@ fn content_hash(body: &[u8]) -> u64 {
 
 /// Whether a `Cache-Control` field asks caches not to store the response.
 ///
-/// `no-store` is a bare directive token, so matching each comma-separated token
-/// exactly, across every field line, avoids a substring match flagging a
-/// directive named `no-store-extension` and a first-line-only read missing a
-/// second `Cache-Control` line.
+/// Splits each value on commas outside quoted strings, the same way m6-http's
+/// cache parser does, so a quoted value such as `no-cache="a,no-store,b"` stays
+/// one directive and does not read as `no-store`. `no-store` is a bare
+/// directive name, matched exactly and case-insensitively across every field
+/// line.
 fn cache_control_no_store(headers: &[(String, String)]) -> bool {
     crate::headers::get_all(headers, "cache-control").any(|value| {
-        value
-            .split(',')
-            .any(|d| d.trim().eq_ignore_ascii_case("no-store"))
+        let mut in_quotes = false;
+        let mut escaped = false;
+        let mut start = 0;
+        for (i, ch) in value.char_indices() {
+            match ch {
+                '\\' if in_quotes && !escaped => escaped = true,
+                '"' if !escaped => in_quotes = !in_quotes,
+                ',' if !in_quotes => {
+                    if is_no_store_name(&value[start..i]) {
+                        return true;
+                    }
+                    start = i + ch.len_utf8();
+                }
+                _ => escaped = false,
+            }
+        }
+        is_no_store_name(&value[start..])
     })
+}
+
+/// True when a directive's name is `no-store`, the part before its `=`.
+fn is_no_store_name(raw: &str) -> bool {
+    let name = raw.trim().split_once('=').map_or(raw.trim(), |(n, _)| n);
+    name.trim().eq_ignore_ascii_case("no-store")
 }
 
 /// Map an `Error` to a `Response` (status only, body set by framework).
@@ -609,6 +630,17 @@ mod body_tests {
             Response::text("abcdef").header("Cache-Control", "public, max-age=60"),
             "GET",
         );
+        assert!(head.to_lowercase().contains("etag"), "{head}");
+    }
+
+    /// A quoted directive value keeps its comma: `no-cache="a,no-store,b"` is
+    /// one directive named `no-cache`, not a `no-store`, so the response stays
+    /// cacheable and keeps its ETag.
+    #[test]
+    fn a_quoted_value_containing_no_store_is_not_a_no_store_directive() {
+        let r =
+            Response::text("abcdef").header("Cache-Control", "public, no-cache=\"a,no-store,b\"");
+        let (head, _) = send_to_wire(r, "GET");
         assert!(head.to_lowercase().contains("etag"), "{head}");
     }
 
