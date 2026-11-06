@@ -81,13 +81,12 @@ Verified with `l2_query_relpath_cannot_replace_the_path_parameter` and `l2_query
 
 ### Fixed
 
-**A shutdown now waits for every request the thread pool has accepted, including one a worker has not yet started, and gives up after `[server] drain_timeout_s` (#338).**
-The pool counted a request in flight only once a worker woke to run it, so a SIGTERM landing in that gap let the drain see nothing in flight and the process exit under the request. A queued request was not counted either. The pool now counts a request when it accepts it, with one atomic add on the accept thread, and a panicking handler stops counting.
-The drain returns the moment the last request finishes, and it ends at `drain_timeout_s` (default 30, `0` waits for none) with a warning that counts the requests left, so a full queue of slow clients cannot hold a stop past systemd's 90 s. The key is read at startup, and a reload that changes it logs that a restart is needed.
-The m6-html shutdown test failed 57 times in 150 runs under CPU load before the change and 0 in 200 after. Its held-request step also confirms the service accepted the request, which the probe's 503 alone did not show.
+**On SIGTERM or SIGINT a service stops accepting, removes its socket and exits, without waiting for requests in progress (#338).**
+A restart on a deploy cuts off a request that is still running, and that is accepted: the supervisor starts the service again at once.
+Waiting for accepted requests took a request counter, a condition variable, a deadline setting and a shutdown hook, and gained nothing a restart does not already do.
+The m6-html shutdown test now holds a request open at SIGTERM and again at SIGINT, and asserts only that the service exits 0 within five seconds with its socket removed.
 The test harness's `Service::wait_for_exit` and `terminate` now also wait for the output threads to copy a child's last lines, which a test reading `output()` straight after the exit could miss.
-`on_shutdown` runs only when the drain finishes; if the deadline passes with requests still running, the process exits without running it and without dropping what it captured, so global state a handler is still using is not torn down under it, and the shutdown is not logged as clean. An accept error during shutdown still drains.
-Migration: `ThreadPool::drain` takes a timeout and returns how many requests were left and `ServerConfig` has a new public field, `drain_timeout`. Code that calls `drain()` or builds a `ServerConfig` field by field must pass the new value. A service whose `on_shutdown` flushes state should keep its requests inside `drain_timeout_s`, because a stop that hits the deadline skips the hook.
+Migration: `ThreadPool::drain`, `ThreadPool::in_flight`, `ServerConfig::drain_timeout`, `server::DEFAULT_DRAIN_TIMEOUT_SECS`, `[server] drain_timeout_s` and the `on_destroy` registration on `AppWithGlobal` and `AppWithState` are removed, along with the shutdown hook they fed. A caller does nothing: a `drain_timeout_s` key left in a config is ignored, and a service that needs durable state must not depend on a shutdown hook, because none runs.
 
 **`a_burst_of_writes_is_at_most_two_reloads` no longer fails on a busy machine (#299).**
 It wrote the config three times 10 ms apart and expected at most two reloads, but the reloader only merges a write that lands within 20 ms of the last report, so on a loaded runner a late write was rightly reported a third time. The test now spaces its writes 5 ms apart (longer than the service loop takes to wake and reload, so it is unlikely to merge them by itself), times each burst, and judges only one that fitted inside the window, retrying up to five times. Verified on the build host, 20 runs each: 20 passes with four CPU-bound processes running, and 20 failures reporting three reloads with the reloader's hold removed.
@@ -185,7 +184,7 @@ They fail if `font/woff2` is added to the default compress list, which would re-
 They fail if a change to argument parsing or the config merge turns a clear exit 2 into a start with the wrong config.
 
 **Tests now cover the shutdown signals every service shares (#288).**
-They fail if a second SIGTERM stops forcing exit during a drain, if SIGINT leaves the graceful path, or if a request in flight at SIGTERM is cut off.
+They fail if SIGTERM or SIGINT leaves the service running, exits non-zero or leaves the socket behind while a request is in flight.
 
 **Tests now cover the route tie-break, params precedence, the query and path-parameter clash, and a route status reaching the response (#289, #290, #291, #292).**
 They fail if equal routes stop resolving to the first declaration, if a global params key beats a route key, if a changed params file is missed after a restart, if a query key replaces a path parameter, or if a route status is dropped.

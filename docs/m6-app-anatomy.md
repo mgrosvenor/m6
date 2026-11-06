@@ -164,7 +164,7 @@ Table 4 is the reserved set, and a key in it never reaches a template.
 |---|---|---|
 | `[thread_pool]` | core | `size`, default the CPU count. `queue_size`, default eight times the size |
 | `[params_cache]` | core | `size`, default 256 entries |
-| `[server]` | core | `read_timeout_s`, default 30, `0` disables. `drain_timeout_s`, default 30, how long shutdown waits for accepted requests, `0` waits for none. `socket_mode`, an octal string as systemd writes it, default `"0660"` |
+| `[server]` | core | `read_timeout_s`, default 30, `0` disables. `socket_mode`, an octal string as systemd writes it, default `"0660"` |
 | `[compression]` | core | brotli and gzip levels per MIME type |
 | `[minification]` | core | on or off per MIME type, plus `inline_js` |
 | `[log]` | core | `level`, default `info`. `format`, default `json` |
@@ -356,7 +356,7 @@ Four builders differ only in what state a handler receives, and Table 7 gives al
 Take from it that per-thread state is handed to a handler as `&mut` and shared state as `&`, which is the whole difference: a value owned by one worker needs no synchronisation, and a value shared across workers costs one atomic increment per request and no copy.
 
 An initialiser returns `Result`, so a service that cannot build its state exits 2 at startup.
-`on_destroy` and `on_destroy_thread` register the reverse, for state that owns something worth closing.
+`on_destroy_thread` registers the reverse for the thread value, and runs when a worker thread ends. Shutdown does not wait for it.
 `on_reload` re-reads state that the initialiser built from the configuration (§4.2).
 
 **Only the global initialiser receives an `AppContext`.**
@@ -385,10 +385,11 @@ A service that initialised logging before blocking would have a thread with SIGT
 The install asserts the mask is already set and refuses to start otherwise, because a supervisor counts death by the signal it sent as a clean stop and nothing else about that failure is visible.
 `m6-architecture.md` §7.3, "why startup and shutdown belong to core", is the full argument.
 
-The first signal drains and exits 0.
-The drain waits for every accepted request, up to `[server] drain_timeout_s`, then logs how many it left and exits anyway.
-The second exits immediately.
-Both unlink the socket, and a socket left behind keeps a dead member in the edge's backend pool until its next rescan.
+The first signal stops accepting, removes the socket and exits 0.
+It does not wait for a request in progress, so a request cut off by a restart is lost.
+A service that needs state to survive a restart must not depend on a shutdown hook.
+A second signal exits at once.
+A socket left behind keeps a dead member in the edge's backend pool until its next rescan.
 
 ### 6.2 The three lines
 
@@ -402,7 +403,7 @@ Every service logs the same three lines under its own name, and core emits them.
 
 The name is the program's own, from `argv[0]`, and the started line carries the socket.
 Core owning these is what makes searching a journal for `shutdown complete` mean the same thing for every unit.
-The signal line is written before the shutdown flag is published, because the flag is what releases the main thread to drain and exit, and a fast service used to exit with the completion line written and the signal line still queued in the writer.
+The signal line is written before the shutdown flag is published, because the flag is what releases the main thread to exit, and a fast service used to exit with the completion line written and the signal line still queued in the writer.
 
 ### 6.3 Under load and under a supervisor
 
@@ -525,9 +526,9 @@ Table 8 is the whole contract in one place.
 |---|---|
 | a `main` that builds an `App` and calls `run` | the socket, the accept loop, HTTP/1.1, the thread pool and the bounded queue |
 | routes bound in code, handlers registered by name, or neither | route matching, the configuration route table, and hot reload of both |
-| a state initialiser, when it has state | the two state tiers, and the destructor hooks |
+| a state initialiser, when it has state | the two state tiers, and the thread destructor hook |
 | a configuration file whose stem is the service's name | the socket path, the backend name and the reserved keys of Table 4 |
-| a systemd unit naming the two paths and what it writes | signal blocking, the drain, the three log lines and the unlink |
+| a systemd unit naming the two paths and what it writes | signal blocking, the exit on a signal, the three log lines and the unlink |
 | one call to `assert_app_lifecycle` | the assertion behind it |
 
 **Table 8: the division of labour between an app and `m6-core`.**

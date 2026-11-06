@@ -3,16 +3,15 @@
 //! **`block()` must be the first statement of `main`.** The signal mask is
 //! inherited only by threads created after it, and a service's logging writer
 //! is a thread; if it starts first it takes SIGTERM at the default disposition
-//! and the process dies instead of draining. `install_with_hooks` asserts the
+//! and the process dies instead of shutting down. `install_with_hooks` asserts the
 //! mask is set, and that assertion has since caught a real case: the stateful
 //! `App` runners never called `block()`, so SIGTERM handling was quietly wrong
 //! for every service built on them.
 //!
 //! **Log before setting the flag, not after.** The flag is what releases the
-//! main thread, which drains, logs "shutdown complete" and returns from
-//! `main`, and process exit discards whatever is still queued in the writer.
-//! A line logged after the store is racing the whole drain, and on a loaded
-//! machine it loses.
+//! main thread, which logs "shutdown complete" and returns from `main`, and
+//! process exit discards whatever is still queued in the writer. A line logged
+//! after the store is racing the exit, and on a loaded machine it loses.
 //!
 //! A `ShutdownHandle` also self-connects to wake a parked `accept`, and
 //! unlinks the socket on the way out so m6-http does not keep a dead member in
@@ -263,12 +262,12 @@ impl ShutdownHandle {
                     // Log BEFORE publishing the flag, not after.
                     //
                     // The flag is what releases the main thread: it
-                    // sees `is_shutdown()`, drains, logs "shutdown
+                    // sees `is_shutdown()`, logs "shutdown
                     // complete" and returns from `main`, and process
                     // exit discards whatever is still queued in
                     // `tracing_appender`'s non-blocking writer. With
-                    // the store first, this line was racing the entire
-                    // drain, so a fast service could exit with
+                    // the store first, this line was racing the
+                    // exit, so a fast service could exit with
                     // "shutdown complete" written and "shutdown signal
                     // received" lost.
                     //
@@ -317,7 +316,7 @@ impl ShutdownHandle {
 
     /// Finish a graceful shutdown: unlink the socket, log the completion line.
     ///
-    /// Call once, at the end of `main`, after the service loop has drained.
+    /// Call once, at the end of `main`, after the service loop has returned.
     /// Every service says the same thing, so `grep 'shutdown complete'` is a
     /// uniform signal across the fleet rather than a per-app accident.
     pub fn complete(&self) {

@@ -139,7 +139,7 @@ Structured JSON to stdout. Events: startup, request complete (path, status, byte
 
 | Signal | First receipt | Second receipt |
 |---|---|---|
-| `SIGTERM` or `SIGINT` | Finish current request, close socket, exit 0 | Immediate exit |
+| `SIGTERM` or `SIGINT` | Stop accepting, remove the socket, exit 0, without waiting for requests in progress | Immediate exit |
 
 ## Exit codes (both binaries)
 

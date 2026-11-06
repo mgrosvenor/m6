@@ -550,9 +550,8 @@ Complete request forwarded — method, path, query string, all headers, body.
 |---|---|---|
 | `SIGTERM` or `SIGINT` | Clean shutdown | Immediate exit |
 
-m6-http clean shutdown: stop accepting new connections, drain in-flight requests, close, exit 0.
-
-Renderers clean shutdown: finish current request, close socket, exit 0.
+m6-http and the renderers shut down the same way: stop accepting new connections, remove the socket, exit 0.
+Requests in progress are not waited for.
 
 ---
 
