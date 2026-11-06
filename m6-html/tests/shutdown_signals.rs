@@ -44,6 +44,10 @@ fn spawn(id: &str) -> (Server, PathBuf) {
 }
 
 fn spawn_with(id: &str, config: &str) -> (Server, PathBuf) {
+    spawn_with_args(id, config, &[])
+}
+
+fn spawn_with_args(id: &str, config: &str, args: &[&str]) -> (Server, PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir");
     // Short name: a unix socket path is capped near 104 bytes on macOS.
     let socket_path = dir.path().join(format!("{id}.sock"));
@@ -53,6 +57,7 @@ fn spawn_with(id: &str, config: &str) -> (Server, PathBuf) {
         Command::new(binary("m6-html"))
             .arg(fixtures_dir())
             .arg(config_path(config))
+            .args(args)
             .env("M6_SOCKET_OVERRIDE", &socket_path),
     );
     svc.wait_for_path(&socket_path, Duration::from_secs(10));
@@ -363,6 +368,102 @@ fn an_idle_keep_alive_connection_does_not_hold_the_drain() {
     assert!(
         rest.is_empty(),
         "the idle connection received data after shutdown"
+    );
+}
+
+/// A connection that has sent nothing is idle too, so it cannot hold the
+/// drain. The wrong outcome: a proxy's warm pooled connection, or a client
+/// that connected just before the signal, keeps its worker counted as busy
+/// until the read times out, and the stop waits out the whole deadline.
+#[test]
+fn a_connection_that_has_sent_nothing_does_not_hold_the_drain() {
+    let (mut server, socket_path) = spawn("term-silent");
+    let mut conn = UnixStream::connect(&socket_path).expect("connect");
+    conn.set_read_timeout(Some(Duration::from_secs(30))).ok();
+
+    server.svc.signal(libc::SIGTERM);
+    let status = server
+        .svc
+        .wait_for_exit(Instant::now() + Duration::from_secs(5))
+        .unwrap_or_else(|| {
+            panic!(
+                "a connection that sent nothing held the drain\n--- output ---\n{}",
+                server.svc.output()
+            )
+        });
+    assert!(
+        status.success(),
+        "exit {status}\n--- output ---\n{}",
+        server.svc.output()
+    );
+    let mut rest = Vec::new();
+    conn.read_to_end(&mut rest).ok();
+    assert!(
+        rest.is_empty(),
+        "the silent connection received data after shutdown"
+    );
+}
+
+/// A request already arriving on a kept-alive connection when shutdown starts
+/// is served in full. The wrong outcome: the connection still counts as idle
+/// while its next request's body streams in, shutdown closes it for reading,
+/// and a request that cannot safely be retried is cut off.
+#[test]
+fn a_second_request_arriving_at_sigterm_is_served_in_full() {
+    // At debug level the service logs "request arriving" when a request's
+    // first byte is read and the connection stops counting as idle.
+    let (mut server, socket_path) = spawn_with_args(
+        "term-second",
+        "m6-html-shutdown.conf",
+        &["--log-level", "debug"],
+    );
+    let mut conn = UnixStream::connect(&socket_path).expect("connect");
+    conn.set_read_timeout(Some(Duration::from_secs(10))).ok();
+    conn.write_all(b"GET /blog HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .expect("send the first request");
+    read_one(&mut conn, "GET").expect("read the first response");
+
+    conn.write_all(
+        b"POST /blog HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\n0123456789",
+    )
+    .expect("start the second request");
+    // The second "request arriving": the connection is no longer idle, so
+    // shutdown must wait for this request rather than close it.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while server.svc.output().matches("request arriving").count() < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "the service never logged the second request arriving\n--- output ---\n{}",
+            server.svc.output()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    server.svc.signal(libc::SIGTERM);
+    wait_for_output(&server.svc, "draining", Duration::from_secs(5));
+    conn.write_all(&[b'x'; 90])
+        .expect("finish the second request's body");
+    let resp =
+        String::from_utf8_lossy(&read_one(&mut conn, "POST").expect("read the second response"))
+            .into_owned();
+    assert!(
+        resp.contains("200 OK"),
+        "the request arriving at shutdown was cut off: {}",
+        &resp[..resp.len().min(300)]
+    );
+    let status = server
+        .svc
+        .wait_for_exit(Instant::now() + Duration::from_secs(5))
+        .unwrap_or_else(|| {
+            panic!(
+                "m6-html did not exit\n--- output ---\n{}",
+                server.svc.output()
+            )
+        });
+    assert!(
+        status.success(),
+        "exit {status}\n--- output ---\n{}",
+        server.svc.output()
     );
 }
 

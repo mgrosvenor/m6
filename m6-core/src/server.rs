@@ -289,7 +289,7 @@ where
 /// edge uses the same cap.
 pub const MAX_REQUESTS_PER_CONN: u32 = 100;
 
-/// Connections waiting for their next request. A graceful shutdown closes
+/// Connections waiting for a request's first byte. A graceful shutdown closes
 /// them for reading, which wakes each worker blocked on one, so the drain
 /// waits only for requests being served. The lock is held across both the
 /// check of the shutdown flag and the close, so a connection cannot register
@@ -310,6 +310,48 @@ fn idle_leave(fd: std::os::fd::RawFd) {
     let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(i) = idle.iter().position(|&f| f == fd) {
         idle.swap_remove(i);
+    }
+}
+
+/// Block, registered as idle, until a request's first byte can be read.
+/// Returns false when the connection should end without a response: the peer
+/// closed it, it outlived its read timeout with nothing sent (the same two
+/// cases `parse_request` reports as `ConnectionClosed`), or shutdown closed it
+/// or had already started.
+fn wait_for_request(fd: std::os::fd::RawFd) -> std::io::Result<bool> {
+    if !idle_enter(fd) {
+        return Ok(false);
+    }
+    let mut byte = 0u8;
+    let peeked = loop {
+        // SAFETY: fd is the open connection this worker is serving, and the
+        // buffer is one valid byte. MSG_PEEK leaves the byte for the parser.
+        let n = unsafe { libc::recv(fd, (&mut byte as *mut u8).cast(), 1, libc::MSG_PEEK) };
+        if n >= 0 {
+            break Ok(n);
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::Interrupted {
+            break Err(e);
+        }
+    };
+    idle_leave(fd);
+    match peeked {
+        Ok(n) if n > 0 => {
+            // A request is now being served, and the drain will wait for it.
+            debug!("request arriving");
+            Ok(true)
+        }
+        Ok(_) => Ok(false),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -355,18 +397,14 @@ where
     let mut served = 0u32;
     let fd = stream.as_raw_fd();
     loop {
-        // Between requests a kept-alive connection is idle. It registers as
-        // such, so a shutdown can close it at once instead of waiting for it
-        // to time out; one that finds shutdown already under way just ends.
-        let idle = served > 0;
-        if idle && !idle_enter(fd) {
+        // Until the first byte of a request arrives, the connection is idle,
+        // its first request as much as any later one. It waits registered as
+        // such, so a shutdown can close it at once; once a byte has arrived it
+        // is a request being served, and the drain waits for it.
+        if !wait_for_request(fd)? {
             return Ok(());
         }
-        let parsed = parse::parse_request(stream);
-        if idle {
-            idle_leave(fd);
-        }
-        let req = match parsed {
+        let req = match parse::parse_request(stream) {
             Ok(r) => r,
             // An idle persistent connection going away is how this loop is
             // meant to end, not an error to report.
