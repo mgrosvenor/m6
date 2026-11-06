@@ -7,7 +7,7 @@
 
 use serde::Serialize;
 
-use crate::poll::NodeReading;
+use crate::poll::{HeaderCheckResult, NodeReading};
 
 /// Thresholds. Deliberately a value rather than constants, so a deployment can
 /// set its own without patching the binary.
@@ -463,6 +463,47 @@ fn quiet_log_findings(node: &str, l: &m6_core::monitoring::LoggingHealth) -> Opt
     })
 }
 
+/// The fault finding for one failing header check, shared by the digest and the
+/// check render so a wrong cache policy reaches the verdict in both.
+///
+/// The `text` names the path and the two values but not the node: `Finding.node`
+/// carries that, and every verdict prints it as `- {node}: {text}`.
+pub(crate) fn header_check_finding(node: &str, hc: &HeaderCheckResult) -> Finding {
+    let text = if let Some(e) = &hc.error {
+        format!("{} could not be fetched: {e}", hc.path)
+    } else {
+        let got = hc
+            .actual
+            .clone()
+            .unwrap_or_else(|| "<header absent>".to_string());
+        format!(
+            "{} {} is {:?}, expected {:?}",
+            hc.path, hc.header, got, hc.expected
+        )
+    };
+    Finding {
+        level: Level::Fault,
+        node: node.to_string(),
+        text,
+    }
+}
+
+/// Seconds of uptime as "Nd Nh Nm", the one wording the page and the check
+/// share. Minutes only when there are whole minutes, so a node up 42 minutes
+/// reads "42m" and never "0h".
+pub(crate) fn fmt_uptime(secs: u64) -> String {
+    let d = secs / 86_400;
+    let h = (secs % 86_400) / 3_600;
+    let m = (secs % 3_600) / 60;
+    if d > 0 {
+        format!("{d}d {h}h")
+    } else if h > 0 {
+        format!("{h}h {m}m")
+    } else {
+        format!("{m}m")
+    }
+}
+
 pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
     let mut findings = Vec::new();
     let mut nodes = Vec::new();
@@ -876,6 +917,12 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
 
         if let Some(t) = &r.traffic {
             findings.extend(quiet_log_findings(&r.name, &t.logging));
+        }
+
+        for hc in &r.header_checks {
+            if !hc.passed() {
+                findings.push(header_check_finding(&r.name, hc));
+            }
         }
 
         nodes.push(d);
@@ -1561,6 +1608,57 @@ pub(crate) mod tests {
             .expect("a backend-error finding");
         assert!(f.text.contains('3'), "{}", f.text);
         assert!(f.text.contains("too old"), "{}", f.text);
+    }
+
+    /// A failing header check is a digest fault, so the page, the JSON digest
+    /// and the history all carry the same verdict as the text check.
+    #[test]
+    fn a_failing_header_check_is_a_digest_fault() {
+        let mut r = reading("origin", "ok", Some(perf(plain_host(), vec![])));
+        r.header_checks.push(HeaderCheckResult {
+            path: "/capabilities".into(),
+            header: "cache-control".into(),
+            expected: "public, max-age=60".into(),
+            actual: Some("no-store".into()),
+            status: Some(200),
+            error: None,
+        });
+        let d = build(&[r], &Thresholds::default(), now());
+        assert_eq!(d.level, Level::Fault, "{:?}", d.findings);
+        let f = d
+            .findings
+            .iter()
+            .find(|f| f.node == "origin")
+            .expect("a header-check finding");
+        assert!(f.text.contains("expected"), "{}", f.text);
+    }
+
+    /// A passing header check adds no finding, so a declared and satisfied
+    /// assertion stays silent.
+    #[test]
+    fn a_passing_header_check_adds_no_finding() {
+        let mut r = reading("origin", "ok", Some(perf(plain_host(), vec![])));
+        r.header_checks.push(HeaderCheckResult {
+            path: "/capabilities".into(),
+            header: "cache-control".into(),
+            expected: "public, max-age=60".into(),
+            actual: Some("public, max-age=60".into()),
+            status: Some(200),
+            error: None,
+        });
+        let d = build(&[r], &Thresholds::default(), now());
+        assert_eq!(d.level, Level::Ok, "{:?}", d.findings);
+        assert!(d.findings.is_empty(), "{:?}", d.findings);
+    }
+
+    /// One wording for both views: whole days and hours, then minutes only when
+    /// they are the largest remaining unit.
+    #[test]
+    fn uptime_formatting_uses_days_hours_and_minutes() {
+        assert_eq!(fmt_uptime(0), "0m");
+        assert_eq!(fmt_uptime(42 * 60), "42m");
+        assert_eq!(fmt_uptime(2 * 3_600 + 60), "2h 1m");
+        assert_eq!(fmt_uptime(86_400 + 3_600), "1d 1h");
     }
 
     /// A node that did not answer must not be reported as healthy, and must

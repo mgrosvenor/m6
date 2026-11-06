@@ -382,14 +382,29 @@ fn snapshot_digest(st: &MonitorState) -> anyhow::Result<digest::Digest> {
 /// curl --unix-socket /tmp/m6mon.sock http://localhost/check
 /// ```
 fn check_text(_req: &Request, st: &MonitorState) -> Result<Response> {
-    let guard = match st.latest.read() {
-        Ok(g) => g,
-        Err(e) => return Ok(Response::text(&format!("snapshot unreadable: {e}")).with_status(503)),
+    // Clone the digest and readings, then drop the read lock before the render.
+    // A slow text render must not hold up the poller, for the same reason
+    // `snapshot_digest` clones the page's digest.
+    let (digest, readings, verdicts, at_utc, age, stale) = {
+        let guard = match st.latest.read() {
+            Ok(g) => g,
+            Err(e) => {
+                return Ok(Response::text(&format!("snapshot unreadable: {e}")).with_status(503))
+            }
+        };
+        let Some(snap) = guard.as_ref() else {
+            return Ok(Response::text("no fleet poll has completed yet\n").with_status(503));
+        };
+        let (age, stale) = st.age(snap);
+        (
+            snap.digest.clone(),
+            snap.readings.clone(),
+            snap.verdicts.clone(),
+            snap.at_utc.clone(),
+            age,
+            stale,
+        )
     };
-    let Some(snap) = guard.as_ref() else {
-        return Ok(Response::text("no fleet poll has completed yet\n").with_status(503));
-    };
-    let (age, stale) = st.age(snap);
     let mut out = String::new();
     // The age goes FIRST, before any figure, so it cannot be read past.
     if stale {
@@ -399,36 +414,41 @@ fn check_text(_req: &Request, st: &MonitorState) -> Result<Response> {
             st.interval.as_secs()
         ));
     } else {
-        out.push_str(&format!("polled {age:.1}s ago ({})\n", snap.at_utc));
+        out.push_str(&format!("polled {age:.1}s ago ({at_utc})\n"));
     }
-    out.push_str(&check::render(&snap.digest, &snap.readings, &snap.verdicts));
+    out.push_str(&check::render(&digest, &readings, &verdicts));
     Ok(Response::text(&out))
 }
 
 fn digest_json(_req: &Request, st: &MonitorState) -> Result<Response> {
-    let guard = match st.latest.read() {
-        Ok(g) => g,
-        // 503 rather than 500: the monitor is up, the fleet view is not.
-        Err(e) => {
+    // Clone the digest and drop the read lock before serialising, so a slow
+    // JSON build cannot hold up the poller.
+    let (digest, at_utc, age, stale) = {
+        let guard = match st.latest.read() {
+            Ok(g) => g,
+            // 503 rather than 500: the monitor is up, the fleet view is not.
+            Err(e) => {
+                return Ok(Response::json_status(
+                    json!({"error": format!("snapshot unreadable: {e}")}),
+                    503,
+                ))
+            }
+        };
+        let Some(snap) = guard.as_ref() else {
             return Ok(Response::json_status(
-                json!({"error": format!("snapshot unreadable: {e}")}),
+                json!({"error": "no fleet poll has completed yet"}),
                 503,
-            ))
-        }
+            ));
+        };
+        let (age, stale) = st.age(snap);
+        (snap.digest.clone(), snap.at_utc.clone(), age, stale)
     };
-    let Some(snap) = guard.as_ref() else {
-        return Ok(Response::json_status(
-            json!({"error": "no fleet poll has completed yet"}),
-            503,
-        ));
-    };
-    let (age, stale) = st.age(snap);
-    let mut v = serde_json::to_value(&snap.digest).unwrap_or(json!({}));
+    let mut v = serde_json::to_value(&digest).unwrap_or(json!({}));
     // Age is part of the reading, not metadata. A consumer that cannot tell a
     // 3-second-old digest from a 40-minute-old one is guessing.
     if let Some(obj) = v.as_object_mut() {
         obj.insert("snapshot_age_s".into(), json!((age * 10.0).round() / 10.0));
-        obj.insert("snapshot_at".into(), json!(snap.at_utc));
+        obj.insert("snapshot_at".into(), json!(at_utc));
         obj.insert("poll_interval_s".into(), json!(st.interval.as_secs()));
         obj.insert("stale".into(), json!(stale));
     }
@@ -458,19 +478,6 @@ fn page(_req: &Request, st: &MonitorState) -> Result<Response> {
         // anything between us and the reader.
         .header("Cache-Control", "no-store")
         .header("X-Robots-Tag", "noindex, nofollow"))
-}
-
-fn dur(secs: u64) -> String {
-    let d = secs / 86_400;
-    let h = (secs % 86_400) / 3_600;
-    let m = (secs % 3_600) / 60;
-    if d > 0 {
-        format!("{d}d {h}h")
-    } else if h > 0 {
-        format!("{h}h {m}m")
-    } else {
-        format!("{m}m")
-    }
 }
 
 fn bytes(n: u64) -> String {
@@ -591,8 +598,12 @@ fn render(d: &digest::Digest) -> String {
             n.thermal_max_c
                 .map(|c| format!("{c:.0}C"))
                 .unwrap_or_else(|| "-".into()),
-            n.uptime_s.map(dur).unwrap_or_else(|| "-".into()),
-            n.host_uptime_s.map(dur).unwrap_or_else(|| "-".into()),
+            n.uptime_s
+                .map(digest::fmt_uptime)
+                .unwrap_or_else(|| "-".into()),
+            n.host_uptime_s
+                .map(digest::fmt_uptime)
+                .unwrap_or_else(|| "-".into()),
             // The same wording as /check section H.
             match &n.tunnel {
                 Some(t) => m6_core::util::html_escape(&format!(
@@ -676,6 +687,22 @@ mod tests {
             "{html}"
         );
         assert!(html.contains("no tunnel"), "{html}");
+    }
+
+    /// The page's "svc up" column uses the same formatter as the check, so a
+    /// node up 42 minutes reads "42m" on both and never "0h".
+    #[test]
+    fn the_page_uses_the_shared_uptime_formatter() {
+        let mut d = digest::build(&[], &digest::Thresholds::default(), "now".into());
+        let mut n = node_digest("edge-a", None);
+        n.uptime_s = Some(42 * 60);
+        d.nodes = vec![n];
+        let html = render(&d);
+        assert!(
+            html.contains(&format!("<td>{}</td>", digest::fmt_uptime(42 * 60))),
+            "{html}"
+        );
+        assert_eq!(digest::fmt_uptime(42 * 60), "42m");
     }
 
     /// Node name, role and status come from config and from the nodes, and

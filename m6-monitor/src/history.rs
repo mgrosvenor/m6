@@ -489,7 +489,7 @@ fn row(r: &NodeReading, n: &NodeDigest, d: &Digest) -> Row {
         memory_total_bytes: n.memory_total_bytes.map(i),
         disk_used: n.disk_used,
         disk_total_bytes: n.disk_total_bytes.map(i),
-        thermal_max_c: n.thermal_max_c.and_then(|t| t.to_string().parse().ok()),
+        thermal_max_c: n.thermal_max_c.map(|t| t as f64),
         cert_not_after_unix: n.cert_not_after_unix,
         tunnel: n.tunnel.as_ref().map(|t| TunnelRow {
             rtt_ms: t.rtt_ms,

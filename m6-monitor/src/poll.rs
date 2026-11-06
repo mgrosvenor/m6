@@ -322,7 +322,7 @@ pub fn node(
             let sep = if hc.path.contains('?') { '&' } else { '?' };
             format!(
                 "{}{}{}hc={}",
-                n.url,
+                base,
                 hc.path,
                 sep,
                 std::time::SystemTime::now()
@@ -331,7 +331,7 @@ pub fn node(
                     .unwrap_or(0)
             )
         } else {
-            format!("{}{}", n.url, hc.path)
+            format!("{}{}", base, hc.path)
         };
         let (status, actual, error) = head_header(&agent, &url, &hc.header);
         reading.header_checks.push(HeaderCheckResult {
@@ -540,5 +540,45 @@ mod tests {
             r.traffic_error.as_deref(),
             Some("401: token rejected by this node")
         );
+    }
+
+    /// A node whose `url` ends in a slash gets header checks against the same
+    /// base as every other request: `GET /path`, never `GET //path`.
+    #[test]
+    fn a_trailing_slash_url_builds_header_check_urls_without_a_double_slash() {
+        let (port, seen) = serve(4, |path| {
+            if path == "/health" {
+                (200, r#"{"status":"ok","node":"origin"}"#)
+            } else {
+                (404, r#"{"error":"not found"}"#)
+            }
+        });
+        let n = Node {
+            name: "origin".into(),
+            url: format!("http://127.0.0.1:{port}/"),
+            role: "origin".into(),
+            perf_token_file: None,
+            tunnel: None,
+            metrics_over_tunnel: false,
+        };
+        let checks = vec![crate::fleet::HeaderCheck {
+            path: "/capabilities".into(),
+            header: "cache-control".into(),
+            expect: "public, max-age=60".into(),
+            roles: vec![],
+            cache_bust: false,
+        }];
+        let r = node(&n, Some("tok"), Duration::from_secs(5), &checks);
+        let seen = seen.join().unwrap();
+        assert_eq!(seen.len(), 4, "{seen:?}");
+        assert_eq!(seen[0].0, "GET /health HTTP/1.1");
+        assert_eq!(seen[1].0, "GET /perf HTTP/1.1");
+        assert_eq!(seen[2].0, "GET /traffic HTTP/1.1");
+        assert_eq!(seen[3].0, "GET /capabilities HTTP/1.1");
+        assert!(
+            seen.iter().all(|(line, _)| !line.contains("//")),
+            "a request line carries a double slash: {seen:?}"
+        );
+        assert_eq!(r.header_checks.len(), 1);
     }
 }
