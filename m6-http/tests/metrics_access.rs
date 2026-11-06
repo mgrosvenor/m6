@@ -853,7 +853,15 @@ fn a_rotated_auth_key_verifies_after_a_touch() {
 
     std::fs::write(run.fx.dir.path().join("auth-public.pem"), second_public)
         .expect("write the new public key");
-    std::thread::sleep(Duration::from_secs(2));
+    // The key file is not watched. Poll the absence over a bounded window, so a
+    // watcher that fired anywhere inside the window is caught.
+    let accepted = testkit::wait::until(Duration::from_secs(2), || {
+        run.h1("/perf", &[("Authorization", &auth)]).status == 200
+    });
+    assert!(
+        !accepted,
+        "writing the key file must not reload auth; the new key became trusted"
+    );
     assert_eq!(
         run.h1("/perf", &[("Authorization", &auth)]).status,
         401,

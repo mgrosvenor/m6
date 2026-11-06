@@ -340,6 +340,7 @@ struct AnalyticsLine {
     session_new: bool,
     client_ip: String,
     path: String,
+    status: u16,
 }
 
 fn read_analytics_lines(path: &Path) -> Vec<AnalyticsLine> {
@@ -359,6 +360,7 @@ fn read_analytics_lines(path: &Path) -> Vec<AnalyticsLine> {
                 session_new: fields.get("session_new")?.as_bool()?,
                 client_ip: fields.get("client_ip")?.as_str()?.to_string(),
                 path: fields.get("path")?.as_str()?.to_string(),
+                status: fields.get("status")?.as_u64()? as u16,
             })
         })
         .collect()
@@ -450,7 +452,7 @@ impl Server {
             "m6-http never served a backend request\n--- output ---\n{}",
             self.http.borrow().output()
         );
-        std::thread::sleep(Duration::from_millis(250));
+        wait_until_probe_logged(&self.analytics_log, "/public/probe.html");
         std::fs::write(&self.analytics_log, b"").expect("truncate analytics log");
     }
 }
@@ -604,16 +606,35 @@ name = "test-node"
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
-fn request_lines(srv: &Server) -> usize {
-    read_analytics_lines(&srv.analytics_log).len()
+fn wait_for_request_lines(srv: &Server, want: usize) {
+    wait_for_request_lines_at(&srv.analytics_log, want);
 }
 
-fn wait_for_request_lines(srv: &Server, want: usize) {
-    let ok = m6_core::testkit::wait::until(Duration::from_secs(10), || request_lines(srv) >= want);
+fn wait_for_request_lines_at(log: &Path, want: usize) {
+    let ok = m6_core::testkit::wait::until(Duration::from_secs(10), || {
+        read_analytics_lines(log).len() >= want
+    });
     assert!(
         ok,
         "expected {want} request lines, saw {}",
-        request_lines(srv)
+        read_analytics_lines(log).len()
+    );
+}
+
+/// Wait until the analytics writer has flushed the readiness probe's first
+/// successful (200) line for `path`. That line is the last one the readiness
+/// loop enqueues, so its presence means every earlier probe line is flushed
+/// too, and truncating the log after it is safe.
+fn wait_until_probe_logged(log: &Path, path: &str) {
+    let ok = m6_core::testkit::wait::until(Duration::from_secs(10), || {
+        read_analytics_lines(log)
+            .iter()
+            .any(|l| l.path == path && l.status == 200)
+    });
+    assert!(
+        ok,
+        "the readiness probe {path} never logged a 200 line; {} lines so far",
+        read_analytics_lines(log).len()
     );
 }
 
@@ -709,7 +730,7 @@ fn session_cookie_minted_once_and_reused_h1() {
         second.header_values("set-cookie")
     );
 
-    std::thread::sleep(Duration::from_millis(200)); // let the log writer flush
+    wait_for_request_lines(&srv, 2);
     let lines = read_analytics_lines(&srv.analytics_log);
     assert_eq!(
         lines.len(),
@@ -769,7 +790,7 @@ fn session_cookie_minted_once_and_reused_h3() {
         set_cookies2
     );
 
-    std::thread::sleep(Duration::from_millis(200));
+    wait_for_request_lines(&srv, 2);
     let lines = read_analytics_lines(&srv.analytics_log);
     assert_eq!(
         lines.len(),
@@ -812,7 +833,7 @@ fn prefetched_assets_are_not_logged_to_analytics() {
     }
     assert!(prefetch_ran);
 
-    std::thread::sleep(Duration::from_millis(200)); // let the log writer flush
+    wait_for_request_lines(&srv, 21);
 
     // This test's own client also connects via 127.0.0.1 (loopback), so
     // client_ip can't distinguish "the prefetch's synthetic request" from
@@ -856,7 +877,7 @@ fn backend_4xx_is_logged_to_analytics() {
     let missing = srv.get("/public/does-not-exist.txt", &[]);
     assert_eq!(missing.status, 404, "headers:\n{}", missing.headers);
 
-    std::thread::sleep(Duration::from_millis(400));
+    wait_for_request_lines(&srv, 1);
     let lines = read_analytics_lines(&srv.analytics_log);
     assert_eq!(
         lines.len(),
@@ -1022,7 +1043,7 @@ name = "test-node"
         "m6-http never served a backend request\n--- output ---\n{}",
         _http_proc.output()
     );
-    std::thread::sleep(Duration::from_millis(250));
+    wait_until_probe_logged(&analytics_log, "/public/open.txt");
     std::fs::write(&analytics_log, b"").expect("truncate analytics log");
 
     // A 404 on a route with no match — dispatches the custom error page
@@ -1031,7 +1052,7 @@ name = "test-node"
     let missing = https_get(port, "/does-not-exist-anywhere", &[], tls);
     assert_eq!(missing.status, 404, "headers:\n{}", missing.headers);
 
-    std::thread::sleep(Duration::from_millis(400));
+    wait_for_request_lines_at(&analytics_log, 1);
     let lines = read_analytics_lines(&analytics_log);
     assert_eq!(
         lines.len(),
@@ -1125,9 +1146,20 @@ name = "test-node"
             .arg(site.join("system.toml")),
     );
     _http_proc.wait_for_tcp(port, Duration::from_secs(10));
-    std::thread::sleep(Duration::from_millis(1500));
 
     let tls = tls_client_config(&cert_der);
+    // The backend is a dead port, so readiness is the handler answering. Probe
+    // /health, which is logged as "monitor" and never pollutes the request-line
+    // count this test asserts.
+    let ready = m6_core::testkit::wait::until(Duration::from_secs(30), || {
+        https_get(port, "/health", &[], tls.clone()).status != 0
+    });
+    assert!(
+        ready,
+        "m6-http never answered /health\n--- output ---\n{}",
+        _http_proc.output()
+    );
+
     let resp = https_get(port, "/proxy/anything", &[], tls);
     assert!(
         resp.status >= 500,
@@ -1136,7 +1168,7 @@ name = "test-node"
         resp.headers
     );
 
-    std::thread::sleep(Duration::from_millis(400));
+    wait_for_request_lines_at(&analytics_log, 1);
     let lines = read_analytics_lines(&analytics_log);
     assert_eq!(
         lines.len(),
@@ -1341,7 +1373,10 @@ backend = "origin"
         _origin_http_proc.output()
     );
     // The probes are logged like any other request, and this test counts lines.
-    std::thread::sleep(Duration::from_millis(250));
+    // Wait for each node's own 200 probe line, then truncate: that line is the
+    // last the readiness loop enqueued, so nothing is left to leak in after it.
+    wait_until_probe_logged(&origin_analytics_log, "/public/probe.html");
+    wait_until_probe_logged(&edge_analytics_log, "/public/probe.html");
     std::fs::write(&origin_analytics_log, b"").expect("truncate origin log");
     std::fs::write(&edge_analytics_log, b"").expect("truncate edge log");
 
@@ -1370,7 +1405,8 @@ backend = "origin"
         .1
         .to_string();
 
-    std::thread::sleep(Duration::from_millis(400));
+    wait_for_request_lines_at(&origin_analytics_log, 1);
+    wait_for_request_lines_at(&edge_analytics_log, 1);
 
     // Both nodes should have logged their own analytics line for this one
     // request (the whole point of per-node analytics — edge hit/latency
