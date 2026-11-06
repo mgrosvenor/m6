@@ -17,7 +17,7 @@ testkit = []
 
 # Request/response extras, off by default so a binary links only what it uses.
 # `multipart` gates the multipart body parser and the streaming types it needs.
-multipart = ["dep:multer", "dep:tokio", "dep:bytes", "dep:futures-util"]
+multipart = ["dep:multer", "dep:bytes", "dep:futures-util", "dep:futures-executor"]
 
 # Tera templating, on by default. m6-core is the box of blocks a service is
 # assembled from, and templating is one of the blocks: a service that renders
@@ -83,9 +83,11 @@ md-5        = "0.10"
 tera          = { version = "1",    optional = true }
 comrak        = { version = "0.21", optional = true, default-features = false }
 multer        = { version = "3",    optional = true }
-tokio         = { version = "1",    optional = true, features = ["rt", "macros"] }
 bytes         = { version = "1",    optional = true }
 futures-util  = { version = "0.3",  optional = true }
+# Drive multer's async field stream on the current thread without building a
+# tokio runtime per upload.
+futures-executor = { version = "0.3", optional = true }
 lettre        = { version = "0.11", optional = true, features = ["smtp-transport", "native-tls"] }
 ureq          = { version = "2",    optional = true, features = ["json"] }
 hmac          = { version = "0.12", optional = true }
