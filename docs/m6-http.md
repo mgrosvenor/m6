@@ -192,7 +192,7 @@ The cache-hit path is unchanged.
 
 m6-http reloads when `site.toml` or the system config changes, and the two changes cost different amounts.
 One `ConfigReloader` from m6-core watches both files.
-It takes the change from the platform's watcher and, whatever the watcher says, compares the two files' size, times and identity once a second, so a lost watch delays a reload by at most a second.
+It takes the change from the platform's watcher and, whatever the watcher says, compares the two files' bytes, mode, owner and modification time once a second, so a lost watch delays a reload by at most a second.
 Renderers and other processes that change site content signal m6-http by touching `site.toml`.
 Table 1 says what each change reloads.
 

@@ -323,13 +323,18 @@ A route that names a template produces a `Response` carrying `template_name` and
 
 `ConfigReloader::new(site_toml, process, seen)` owns a `ConfigWatcher` on a service's two files and reports which of them changed.
 The loop calls `on_readable(now)` when `raw_fd()` is readable and `tick(now)` on every iteration, and `tick` returns `Some(Changed { site, process })` when a report is due.
-A `Fingerprint` of device, inode, length, mtime and ctime decides which file changed.
-On Linux an event that names a file forces a report even when the fingerprint is equal, which catches a same-length rewrite and two renames that reuse an inode.
-On kqueue the watcher sees the directory, so an unrelated write beside the config wakes the loop, and the unchanged fingerprints mean no report is made.
+A `Fingerprint` of a file's bytes (a hash), mode, owner and mtime decides whether it changed since the last report.
+The file is opened once per check and its times and bytes both come from that handle.
+The inode and ctime are left out, because a rename over a file bumps ctime on the old inode just before the name moves, and that state has the old bytes and times, so it is no change.
+A file that cannot be read has no hash, so fixing its permissions is a change.
+A `touch` forces a reload only when it changes the mtime, so on a filesystem with one-second timestamps a second touch in the same second, with unchanged bytes, is not seen.
+A check runs on any event from the watcher, named or not, and every `RELOAD_POLL` (one second) whatever the watcher says, which finds a lost watch.
+An event that names another entry still asks for a check, so a config reached through a symlink is found when the directory it points into is swapped.
+An unrelated write beside the config costs one check and makes no report.
 
-The first change after quiet is reported at once.
-A change within `RELOAD_DEBOUNCE` (20 ms) of a report is held and reported once more when the burst settles, capped at `RELOAD_POLL` (one second), so a burst is at most two reports.
-The fingerprints are also compared every `RELOAD_POLL` whatever the watcher says, which finds a lost watch.
+The first change after quiet is reported at once, and so is any change more than `RELOAD_DEBOUNCE` (20 ms) after the last report.
+A change within `RELOAD_DEBOUNCE` of a report is held and reported once, 20 ms after the latest change in the burst and never later than `RELOAD_POLL` after that report.
+Writes more than 20 ms apart therefore each reload, and writes closer together than that share one more reload.
 Take a `Seen` from `Seen::read` before the first read of either file so a change in between is reported on the first tick.
 With no watcher the poll alone does the job, there is no thread, and `tick` does not allocate.
 
