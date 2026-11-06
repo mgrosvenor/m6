@@ -164,7 +164,7 @@ Table 4 is the reserved set, and a key in it never reaches a template.
 |---|---|---|
 | `[thread_pool]` | core | `size`, default the CPU count. `queue_size`, default eight times the size |
 | `[params_cache]` | core | `size`, default 256 entries |
-| `[server]` | core | `read_timeout_s`, default 30, `0` disables. `socket_mode`, an octal string as systemd writes it, default `"0660"` |
+| `[server]` | core | `read_timeout_s`, default 30, `0` disables. `drain_timeout_s`, default 30, how long shutdown waits for accepted requests, `0` waits for none. `socket_mode`, an octal string as systemd writes it, default `"0660"` |
 | `[compression]` | core | brotli and gzip levels per MIME type |
 | `[minification]` | core | on or off per MIME type, plus `inline_js` |
 | `[log]` | core | `level`, default `info`. `format`, default `json` |
@@ -386,6 +386,7 @@ The install asserts the mask is already set and refuses to start otherwise, beca
 `m6-architecture.md` §7.3, "why startup and shutdown belong to core", is the full argument.
 
 The first signal drains and exits 0.
+The drain waits for every accepted request, up to `[server] drain_timeout_s`, then logs how many it left and exits anyway.
 The second exits immediately.
 Both unlink the socket, and a socket left behind keeps a dead member in the edge's backend pool until its next rescan.
 

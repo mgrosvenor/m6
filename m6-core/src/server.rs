@@ -77,6 +77,10 @@ pub fn socket_path_from_config(config_path: &Path) -> PathBuf {
 /// [`crate::app::App`] had no timeout at all.
 pub const DEFAULT_READ_TIMEOUT_SECS: u64 = 30;
 
+/// How long shutdown waits for accepted requests. Well inside the 90 s
+/// systemd allows a stop by default, and as long as one read deadline.
+pub const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 30;
+
 /// What one `poll(2)` wait on a listener plus a config watcher returned.
 pub struct PollReady {
     /// The listener has at least one connection waiting to be accepted.

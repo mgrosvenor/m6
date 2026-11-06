@@ -77,6 +77,12 @@ pub struct ServerConfig {
     /// whole pool. Configure `read_timeout_s = 0` to ask for that old
     /// behaviour back deliberately.
     pub read_timeout: Option<std::time::Duration>,
+    /// How long shutdown waits for accepted requests to finish, from
+    /// `drain_timeout_s`. When it passes, the service logs how many were still
+    /// running and exits anyway, so a deploy finishes inside the supervisor's
+    /// own stop timeout instead of being killed mid-response. Zero waits for
+    /// nothing.
+    pub drain_timeout: std::time::Duration,
     /// Mode applied to the unix socket after bind, from `socket_mode`.
     ///
     /// Written the way systemd writes it, as an octal string:
@@ -163,6 +169,9 @@ pub(crate) fn restart_only_changes(
     }
     if old.server.read_timeout != new.server.read_timeout {
         changed.push("server.read_timeout_s");
+    }
+    if old.server.drain_timeout != new.server.drain_timeout {
+        changed.push("server.drain_timeout_s");
     }
     if old.server.socket_mode != new.server.socket_mode {
         changed.push("server.socket_mode");
@@ -413,23 +422,27 @@ fn parse_config(tv: toml::Value, _site_dir: &Path) -> anyhow::Result<RendererCon
     //
     // 30 seconds is not a new number: m6-file and m6-auth-server each picked it
     // by hand for the same reason, so it is the value already in service.
-    let read_timeout_s = match tv.get("server").and_then(|t| t.get("read_timeout_s")) {
-        None => crate::server::DEFAULT_READ_TIMEOUT_SECS as i64,
-        Some(v) => {
-            let n = v.as_integer().ok_or_else(|| {
-                anyhow::anyhow!("[server] read_timeout_s must be an integer, got {v}")
-            })?;
-            if n < 0 {
-                anyhow::bail!("[server] read_timeout_s must not be negative, got {n}");
+    let server_secs = |key: &str, default: u64| -> anyhow::Result<u64> {
+        match tv.get("server").and_then(|t| t.get(key)) {
+            None => Ok(default),
+            Some(v) => {
+                let n = v
+                    .as_integer()
+                    .ok_or_else(|| anyhow::anyhow!("[server] {key} must be an integer, got {v}"))?;
+                u64::try_from(n)
+                    .map_err(|_| anyhow::anyhow!("[server] {key} must not be negative, got {n}"))
             }
-            n
         }
     };
-    let read_timeout = if read_timeout_s == 0 {
-        None
-    } else {
-        Some(std::time::Duration::from_secs(read_timeout_s as u64))
-    };
+    let read_timeout =
+        match server_secs("read_timeout_s", crate::server::DEFAULT_READ_TIMEOUT_SECS)? {
+            0 => None,
+            secs => Some(std::time::Duration::from_secs(secs)),
+        };
+    let drain_timeout = std::time::Duration::from_secs(server_secs(
+        "drain_timeout_s",
+        crate::server::DEFAULT_DRAIN_TIMEOUT_SECS,
+    )?);
 
     // An octal string, as systemd writes it. See `ServerConfig::socket_mode`
     // for why this is not an integer.
@@ -534,6 +547,7 @@ fn parse_config(tv: toml::Value, _site_dir: &Path) -> anyhow::Result<RendererCon
         params_cache: ParamsCacheConfig { size: pc_size },
         server: ServerConfig {
             read_timeout,
+            drain_timeout,
             socket_mode,
         },
         compression,
@@ -725,6 +739,7 @@ mod tests {
         b.thread_pool.size += 1;
         b.thread_pool.queue_size += 1;
         b.server.read_timeout = Some(std::time::Duration::from_secs(9));
+        b.server.drain_timeout = std::time::Duration::from_secs(9);
         b.server.socket_mode = a.server.socket_mode ^ 0o1;
         b.site_toml = Some(PathBuf::from("other.toml"));
         assert_eq!(
@@ -733,6 +748,7 @@ mod tests {
                 "thread_pool.size",
                 "thread_pool.queue_size",
                 "server.read_timeout_s",
+                "server.drain_timeout_s",
                 "server.socket_mode",
                 "site_toml"
             ]
@@ -831,12 +847,15 @@ queue_size = 32
             Some(std::time::Duration::from_secs(30))
         );
         assert_eq!(cfg.server.socket_mode, 0o660);
+        assert_eq!(cfg.server.drain_timeout, std::time::Duration::from_secs(30));
     }
 
     #[test]
     fn server_keys_are_read() {
-        let s = server_cfg("read_timeout_s = 5\nsocket_mode = \"0600\"").unwrap();
+        let s =
+            server_cfg("read_timeout_s = 5\ndrain_timeout_s = 7\nsocket_mode = \"0600\"").unwrap();
         assert_eq!(s.read_timeout, Some(std::time::Duration::from_secs(5)));
+        assert_eq!(s.drain_timeout, std::time::Duration::from_secs(7));
         assert_eq!(s.socket_mode, 0o600);
     }
 
@@ -874,6 +893,8 @@ queue_size = 32
         for body in [
             "read_timeout_s = -1",
             "read_timeout_s = \"30\"",
+            "drain_timeout_s = -1",
+            "drain_timeout_s = \"30\"",
             "socket_mode = 660",
             "socket_mode = \"rw-rw----\"",
             "socket_mode = \"0999\"",
