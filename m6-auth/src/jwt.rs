@@ -98,13 +98,6 @@ impl JwtEngine {
         jsonwebtoken::decode::<AccessClaims>(token, &self.decoding, &validation)
             .map_err(|e| anyhow!("JWT decode error: {}", e))
     }
-
-    pub fn decode_refresh(&self, token: &str) -> Result<TokenData<RefreshClaims>> {
-        let mut validation = Validation::new(self.algo());
-        validation.set_issuer(&[&self.issuer]);
-        jsonwebtoken::decode::<RefreshClaims>(token, &self.decoding, &validation)
-            .map_err(|e| anyhow!("JWT decode error: {}", e))
-    }
 }
 
 /// Hash a JWT string for storage.

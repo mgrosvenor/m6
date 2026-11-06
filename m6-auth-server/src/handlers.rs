@@ -161,10 +161,7 @@ fn handle_login_form(req: &RawRequest, state: &AppState, db: &Db, peer_ip: &str)
 
     let (access_jwt, refresh_jwt) = match finish_login(state, db, &user, peer_ip) {
         Ok(pair) => pair,
-        Err(e) => {
-            warn!(error = %e, "login failed after password check");
-            return internal_error();
-        }
+        Err(resp) => return resp,
     };
 
     let session_cookie = format!(
@@ -215,10 +212,7 @@ fn handle_login_json(req: &RawRequest, state: &AppState, db: &Db, peer_ip: &str)
 
     let (access_jwt, refresh_jwt) = match finish_login(state, db, &user, peer_ip) {
         Ok(pair) => pair,
-        Err(e) => {
-            warn!(error = %e, "login failed after password check");
-            return internal_error();
-        }
+        Err(resp) => return resp,
     };
 
     let resp_body = serde_json::json!({
@@ -423,15 +417,22 @@ fn finish_login(
     db: &Db,
     user: &m6_auth::User,
     peer_ip: &str,
-) -> anyhow::Result<(String, String)> {
+) -> Result<(String, String), RawResponse> {
     note_login_success(state, peer_ip);
 
     let (access_jwt, refresh_jwt) =
-        issue_tokens(state, &user.id, &user.username, &user.groups, &user.roles)?;
+        issue_tokens(state, &user.id, &user.username, &user.groups, &user.roles).map_err(|e| {
+            warn!(error = %e, "failed to issue tokens");
+            internal_error()
+        })?;
 
     let refresh_hash = hash_token(&refresh_jwt);
     let now = now_secs();
-    db.refresh_token_store(&user.id, &refresh_hash, now + state.refresh_ttl as i64)?;
+    db.refresh_token_store(&user.id, &refresh_hash, now + state.refresh_ttl as i64)
+        .map_err(|e| {
+            warn!(error = %e, "failed to store refresh token");
+            internal_error()
+        })?;
 
     info!(username = %user.username, ip = %peer_ip, "login success");
     Ok((access_jwt, refresh_jwt))
