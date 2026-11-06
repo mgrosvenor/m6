@@ -1,19 +1,8 @@
 //! Persistent non-blocking H2S (HTTP/2 over TLS) outbound client.
 //!
-//! One `H2sTlsClientConn` is maintained per backend URL. It is registered with
-//! the epoll/kqueue poller and driven on every event-loop iteration.
-//! Requests are dispatched as new H2 streams; the caller gets an
-//! `mpsc::Receiver` that resolves when the stream completes.
-//!
-//! URL scheme: `h2s://host[:port][/path]` — default port 443.
-//!
-//! The TLS handshake is done synchronously during `connect()` (before
-//! switching the socket to non-blocking mode) so it never stalls the event
-//! loop.  ALPN negotiation is verified — `connect()` returns an error if the
-//! server does not agree on `h2`.  All subsequent I/O uses the rustls
-//! low-level API (`read_tls` / `write_tls`) against the non-blocking socket.
+//! A thin wrapper over the shared [`crate::h2_client`] core with the rustls
+//! transport. One `H2sTlsClientConn` is maintained per backend URL.
 
-use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -22,81 +11,25 @@ use std::sync::Arc;
 
 use rustls::ClientConnection;
 
-use crate::forward::{
-    apply_response_block, too_many_informational, HttpRequest, HttpResponse, ResponseBlock,
-    HOP_BY_HOP,
-};
+use crate::forward::{HttpRequest, HttpResponse};
+use crate::h2_client::{client_init_frame, H2Client, Pool, Transport};
 use crate::poller::{Poller, Token};
 
-// ── Frame constants ───────────────────────────────────────────────────────────
-
-const CLIENT_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-const FRAME_HDR: usize = 9;
-const TYPE_DATA: u8 = 0x0;
-const TYPE_HEADERS: u8 = 0x1;
-const TYPE_RST_STREAM: u8 = 0x3;
-const TYPE_SETTINGS: u8 = 0x4;
-const TYPE_PING: u8 = 0x6;
-const TYPE_GOAWAY: u8 = 0x7;
-const TYPE_WINDOW_UPDATE: u8 = 0x8;
-const TYPE_CONTINUATION: u8 = 0x9;
-const FLAG_END_STREAM: u8 = 0x1;
-const FLAG_END_HEADERS: u8 = 0x4;
-const FLAG_PADDED: u8 = 0x8;
-const FLAG_PRIORITY: u8 = 0x20;
-const FLAG_ACK: u8 = 0x1;
-const DEFAULT_WINDOW: i32 = 65_535;
-const DEFAULT_MAX_FRAME: u32 = 16_384;
-
-// ── H2sStream (private) ────────────────────────────────────────────────────────
-
-struct H2sStream {
-    resp_status: u16,
-    resp_headers: Vec<(String, String)>,
-    resp_body: Vec<u8>,
-    headers_done: bool,
-    /// Informational (1xx) header blocks seen so far on this stream.
-    informational: usize,
-    tx: mpsc::Sender<io::Result<HttpResponse>>,
-    // Resumable request body and per-stream send credit. Same shape and same
-    // reasoning as `h2c_client`; see `pump_stream` there.
-    pending_body: Vec<u8>,
-    body_off: usize,
-    send_window: i32,
-}
-
-// ── H2sTlsClientConn (public) ─────────────────────────────────────────────────
-
-pub struct H2sTlsClientConn {
+/// The TLS transport for `h2s://` backends.
+pub struct H2sTransport {
     tcp: TcpStream,
     tls_conn: ClientConnection,
-    send_buf: Vec<u8>,
-    recv_buf: Vec<u8>,
-    streams: HashMap<u32, H2sStream>,
-    next_stream_id: u32,
-    hpack_enc: hpack::Encoder<'static>,
-    hpack_dec: hpack::Decoder<'static>,
-    header_block_acc: Vec<u8>,
-    continuation_stream: Option<u32>,
-    conn_send_window: i32,
-    peer_initial_window: i32,
-    peer_max_frame: u32,
-    pub is_dead: bool,
-    registered: bool,
 }
 
-impl H2sTlsClientConn {
-    /// Connect to an H2S backend at `host:port`.
-    ///
-    /// Performs the TLS handshake synchronously (verifying ALPN = "h2"),
-    /// sends the client preface + SETTINGS frame, then switches the socket to
-    /// non-blocking mode.  Returns an error if the server does not negotiate
-    /// HTTP/2 via ALPN.
-    pub fn connect(
-        host: &str,
-        port: u16,
-        tls_config: Arc<rustls::ClientConfig>,
-    ) -> io::Result<Self> {
+impl Transport for H2sTransport {
+    fn connect(host: &str, port: u16, tls: Option<Arc<rustls::ClientConfig>>) -> io::Result<Self> {
+        let tls_config = tls.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{}: missing TLS config", Self::prefix()),
+            )
+        })?;
+
         let tcp = TcpStream::connect(format!("{}:{}", host, port))?;
         tcp.set_nodelay(true)?;
 
@@ -104,34 +37,18 @@ impl H2sTlsClientConn {
             rustls::pki_types::ServerName::try_from(host.to_string()).map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!("h2s: invalid server name: {}", host),
+                    format!("{}: invalid server name: {}", Self::prefix(), host),
                 )
             })?;
 
         let conn = ClientConnection::new(tls_config, server_name)
-            .map_err(|e| io::Error::other(format!("h2s: TLS init: {}", e)))?;
+            .map_err(|e| io::Error::other(format!("{}: TLS init: {}", Self::prefix(), e)))?;
 
         // Use StreamOwned for the blocking setup phase (TLS handshake + initial frames).
         let mut tls_stream = rustls::StreamOwned::new(conn, tcp);
 
-        // Build client preface + SETTINGS (INITIAL_WINDOW_SIZE = 1 MiB).
-        let settings_payload: &[u8] = &[
-            0x00, 0x04, // setting id = INITIAL_WINDOW_SIZE (4)
-            0x00, 0x10, 0x00, 0x00, // value = 1_048_576
-        ];
-        let len = settings_payload.len() as u32;
-        let mut init_buf: Vec<u8> = Vec::with_capacity(CLIENT_PREFACE.len() + FRAME_HDR + 6);
-        init_buf.extend_from_slice(CLIENT_PREFACE);
-        init_buf.push((len >> 16) as u8);
-        init_buf.push((len >> 8) as u8);
-        init_buf.push(len as u8);
-        init_buf.push(TYPE_SETTINGS);
-        init_buf.push(0); // flags
-        init_buf.extend_from_slice(&[0, 0, 0, 0]); // stream_id = 0
-        init_buf.extend_from_slice(settings_payload);
-
         // This write triggers the TLS handshake.
-        tls_stream.write_all(&init_buf)?;
+        tls_stream.write_all(&client_init_frame())?;
         tls_stream.flush()?;
 
         // Verify ALPN negotiation.
@@ -143,7 +60,11 @@ impl H2sTlsClientConn {
                 .unwrap_or_else(|| "none".to_string());
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("h2s: server did not negotiate h2 (got: {})", got),
+                format!(
+                    "{}: server did not negotiate h2 (got: {})",
+                    Self::prefix(),
+                    got
+                ),
             ));
         }
 
@@ -151,226 +72,47 @@ impl H2sTlsClientConn {
         tcp.set_nonblocking(true)?;
 
         // Drain any plaintext that arrived during the TLS handshake (e.g. the
-        // server's SETTINGS frame).  It stays in the rustls buffer and will be
+        // server's SETTINGS frame). It stays in the rustls buffer and will be
         // picked up by the first drive() call.
         let _ = tls_conn.process_new_packets();
 
-        Ok(Self {
-            tcp,
-            tls_conn,
-            send_buf: Vec::new(),
-            recv_buf: Vec::new(),
-            streams: HashMap::new(),
-            next_stream_id: 1,
-            hpack_enc: hpack::Encoder::new(),
-            hpack_dec: hpack::Decoder::new(),
-            header_block_acc: Vec::new(),
-            continuation_stream: None,
-            conn_send_window: DEFAULT_WINDOW,
-            peer_initial_window: DEFAULT_WINDOW,
-            peer_max_frame: DEFAULT_MAX_FRAME,
-            is_dead: false,
-            registered: false,
-        })
+        Ok(Self { tcp, tls_conn })
     }
 
-    /// Return the raw file descriptor for this connection.
-    pub fn raw_fd(&self) -> RawFd {
+    fn raw_fd(&self) -> RawFd {
         self.tcp.as_raw_fd()
     }
 
-    /// Dispatch an HTTP request as a new H2 stream.
-    ///
-    /// Returns a receiver that will yield the response when the stream
-    /// completes.  The connection must not be dead.
-    pub fn dispatch(
-        &mut self,
-        req: &HttpRequest,
-        host: &str,
-        client_ip: &str,
-        original_host: &str,
-    ) -> io::Result<mpsc::Receiver<io::Result<HttpResponse>>> {
-        if self.is_dead {
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "h2s: connection dead",
-            ));
-        }
-
-        let stream_id = self.next_stream_id;
-        self.next_stream_id += 2;
-
-        let full_path: String = match &req.query {
-            Some(q) if !q.is_empty() => format!("{}?{}", req.path, q),
-            _ => req.path.clone(),
-        };
-
-        let forwarded: Vec<(Vec<u8>, Vec<u8>)> = req
-            .headers
-            .iter()
-            .filter_map(|(name, value)| {
-                if HOP_BY_HOP.iter().any(|&h| name.eq_ignore_ascii_case(h)) {
-                    return None;
-                }
-                if name.starts_with(':') {
-                    return None;
-                }
-                // The proxy re-emits x-forwarded-* below from the real
-                // connection, and derives content-length from the body it
-                // actually sends. (x-auth-claims is NOT dropped here — by this
-                // point it can only have been set by m6-http after verifying
-                // the JWT; client copies were stripped at ingress.)
-                if crate::forward::is_proxy_emitted_hop_header(name) {
-                    return None;
-                }
-                Some((
-                    name.to_ascii_lowercase().into_bytes(),
-                    value.as_bytes().to_vec(),
-                ))
-            })
-            .collect();
-
-        let mut hdr_list: Vec<(&[u8], &[u8])> = vec![
-            (b":method", req.method.as_bytes()),
-            (b":path", full_path.as_bytes()),
-            // TLS, so the scheme is https.
-            (b":scheme", b"https"),
-            (b":authority", host.as_bytes()),
-            (b"x-forwarded-for", client_ip.as_bytes()),
-            (b"x-forwarded-proto", b"https"),
-            (b"x-forwarded-host", original_host.as_bytes()),
-        ];
-        for (k, v) in &forwarded {
-            hdr_list.push((k.as_slice(), v.as_slice()));
-        }
-
-        let header_block = self.hpack_enc.encode(hdr_list);
-
-        let has_body = !req.body.is_empty();
-        let headers_flags = FLAG_END_HEADERS | if has_body { 0 } else { FLAG_END_STREAM };
-        self.push_frame(TYPE_HEADERS, headers_flags, stream_id, &header_block);
-
-        let (tx, rx) = mpsc::channel();
-        self.streams.insert(
-            stream_id,
-            H2sStream {
-                resp_status: 0,
-                resp_headers: vec![],
-                resp_body: vec![],
-                headers_done: false,
-                informational: 0,
-                tx,
-                pending_body: if has_body {
-                    req.body.clone()
-                } else {
-                    Vec::new()
-                },
-                body_off: 0,
-                send_window: self.peer_initial_window,
-            },
-        );
-
-        // Frame size alone is not permission to send. Same defect and same fix
-        // as `h2c_client` -- the chunking loop honoured SETTINGS_MAX_FRAME_SIZE
-        // but ignored `conn_send_window`, which was incremented on WINDOW_UPDATE
-        // and never read. See the long comment there for why neither skipping
-        // the write nor blocking in the loop is a legal alternative.
-        self.pump_stream(stream_id);
-
-        Ok(rx)
+    fn scheme() -> &'static [u8] {
+        b"https"
     }
 
-    /// Send as much of a stream's pending body as connection and stream credit
-    /// allow, in frames no larger than the peer's SETTINGS_MAX_FRAME_SIZE.
-    ///
-    /// See `h2c_client::pump_stream`. END_STREAM rides on the frame that drains
-    /// the body, so the bytes sent always match the advertised `content-length`.
-    fn pump_stream(&mut self, stream_id: u32) {
-        let max_frame = (self.peer_max_frame as usize).max(1);
-        loop {
-            let (chunk, last) = {
-                let Some(s) = self.streams.get_mut(&stream_id) else {
-                    return;
-                };
-                let remaining = s.pending_body.len() - s.body_off;
-                if remaining == 0 {
-                    return;
-                }
-                let credit = self.conn_send_window.min(s.send_window);
-                if credit <= 0 {
-                    return;
-                }
-                let n = remaining.min(max_frame).min(credit as usize);
-                let start = s.body_off;
-                s.body_off += n;
-                s.send_window -= n as i32;
-                let last = s.body_off == s.pending_body.len();
-                (s.pending_body[start..start + n].to_vec(), last)
-            };
-            self.conn_send_window -= chunk.len() as i32;
-            self.push_frame(
-                TYPE_DATA,
-                if last { FLAG_END_STREAM } else { 0 },
-                stream_id,
-                &chunk,
-            );
-            if last {
-                if let Some(s) = self.streams.get_mut(&stream_id) {
-                    s.pending_body = Vec::new();
-                    s.body_off = 0;
-                }
-                return;
-            }
-        }
+    fn default_port() -> u16 {
+        443
     }
 
-    /// Resume every stream that still owes the peer a body.
-    fn pump_all(&mut self) {
-        let ids: Vec<u32> = self
-            .streams
-            .iter()
-            .filter(|(_, s)| s.body_off < s.pending_body.len())
-            .map(|(id, _)| *id)
-            .collect();
-        for id in ids {
-            self.pump_stream(id);
-        }
+    fn prefix() -> &'static str {
+        "h2s"
     }
 
-    /// Drive I/O: flush send buffer through TLS, read and decrypt incoming
-    /// data, parse H2 frames.
-    ///
-    /// Must be called on every event-loop iteration.
-    pub fn drive(&mut self) {
-        if self.is_dead {
-            return;
-        }
-
-        // ── Write pending H2 frames into the TLS send buffer ─────────────────
-        //
+    fn flush_send(&mut self, send_buf: &mut Vec<u8>) -> Result<(), String> {
         // A SHORT write here is normal, not an error. rustls caps its outgoing
         // plaintext buffer (64 KiB by default) and its `Writer` returns however
         // much it accepted, or 0 once the buffer is full. `write_all` turns
-        // that 0 into `ErrorKind::WriteZero`, which we reported as a TLS
-        // failure and killed the connection over -- so any request whose frames
-        // pushed `send_buf` past the limit died mid-flight. Measured boundary:
-        // a 49,152 byte body went through, 65,535 did not.
-        //
-        // Keep whatever was not accepted and let the TLS flush below drain the
-        // buffer into the socket; the next `drive()` continues from there.
-        // `h2c_client` already does the equivalent for its plain socket.
-        if !self.send_buf.is_empty() {
-            match self.tls_conn.writer().write(&self.send_buf) {
+        // that 0 into `ErrorKind::WriteZero`, which was reported as a TLS
+        // failure and killed the connection -- so any request whose frames
+        // pushed `send_buf` past the limit died mid-flight. Keep whatever was
+        // not accepted and let the flush below drain the buffer into the
+        // socket; the next `drive()` continues from there.
+        if !send_buf.is_empty() {
+            match self.tls_conn.writer().write(send_buf) {
                 // Buffer full. Not an error: the flush below makes room.
                 Ok(0) => {}
                 Ok(n) => {
-                    self.send_buf.drain(..n);
+                    send_buf.drain(..n);
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                Err(e) => {
-                    self.mark_dead(&format!("h2s: TLS writer error: {}", e));
-                    return;
-                }
+                Err(e) => return Err(format!("{}: TLS writer error: {}", Self::prefix(), e)),
             }
         }
 
@@ -383,398 +125,78 @@ impl H2sTlsClientConn {
                 Ok(0) => break,
                 Ok(_) => {}
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e) => {
-                    self.mark_dead(&format!("h2s: TLS send error: {}", e));
-                    return;
-                }
+                Err(e) => return Err(format!("{}: TLS send error: {}", Self::prefix(), e)),
             }
         }
+        Ok(())
+    }
 
-        // ── Drain any plaintext already buffered in rustls ───────────────────
-        // (e.g. server SETTINGS that arrived during the handshake)
+    fn fill_recv(&mut self, recv_buf: &mut Vec<u8>) -> Option<String> {
         let mut tmp = [0u8; 16384];
+
+        // Drain any plaintext already buffered in rustls (e.g. server SETTINGS
+        // that arrived during the handshake).
         loop {
             match self.tls_conn.reader().read(&mut tmp) {
                 Ok(0) => break,
-                Ok(n) => self.recv_buf.extend_from_slice(&tmp[..n]),
+                Ok(n) => recv_buf.extend_from_slice(&tmp[..n]),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(_) => break,
             }
         }
 
-        // ── Read new TLS data from TCP, decrypt into recv_buf ────────────────
-        //
-        // EOF is deferred rather than acted on here, for the same reason as
-        // `h2c_client`: killing the connection the instant `read_tls` returns 0
-        // skipped the frame loop below and discarded any complete response
-        // already decrypted into `recv_buf`, failing the stream with BrokenPipe.
-        // A backend that answers and then closes is ordinary, and the edge
-        // turned it into a 502.
-        let mut eof: Option<String> = None;
         loop {
             match self.tls_conn.read_tls(&mut self.tcp) {
-                Ok(0) => {
-                    eof = Some("h2s: connection closed".to_string());
-                    break;
-                }
+                Ok(0) => return Some(format!("{}: connection closed", Self::prefix())),
                 Ok(_) => match self.tls_conn.process_new_packets() {
                     Ok(_) => loop {
                         match self.tls_conn.reader().read(&mut tmp) {
                             Ok(0) => break,
-                            Ok(n) => self.recv_buf.extend_from_slice(&tmp[..n]),
+                            Ok(n) => recv_buf.extend_from_slice(&tmp[..n]),
                             Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                             Err(_) => break,
                         }
                     },
-                    Err(e) => {
-                        eof = Some(format!("h2s: TLS process error: {}", e));
-                        break;
-                    }
+                    Err(e) => return Some(format!("{}: TLS process error: {}", Self::prefix(), e)),
                 },
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e) => {
-                    eof = Some(format!("h2s: read error: {}", e));
-                    break;
-                }
+                Err(e) => return Some(format!("{}: read error: {}", Self::prefix(), e)),
             }
         }
-
-        // ── Process H2 frames ─────────────────────────────────────────────────
-        loop {
-            if self.recv_buf.len() < FRAME_HDR {
-                break;
-            }
-
-            let length = ((self.recv_buf[0] as usize) << 16)
-                | ((self.recv_buf[1] as usize) << 8)
-                | (self.recv_buf[2] as usize);
-
-            if self.recv_buf.len() < FRAME_HDR + length {
-                break;
-            }
-
-            let ftype = self.recv_buf[3];
-            let flags = self.recv_buf[4];
-            let stream_id = (((self.recv_buf[5] as u32) << 24)
-                | ((self.recv_buf[6] as u32) << 16)
-                | ((self.recv_buf[7] as u32) << 8)
-                | (self.recv_buf[8] as u32))
-                & 0x7fff_ffff;
-
-            let payload = self.recv_buf[FRAME_HDR..FRAME_HDR + length].to_vec();
-            self.recv_buf.drain(..FRAME_HDR + length);
-
-            if let Some(cont_sid) = self.continuation_stream {
-                if ftype != TYPE_CONTINUATION || stream_id != cont_sid {
-                    self.mark_dead("h2s: expected CONTINUATION frame");
-                    return;
-                }
-            }
-
-            match ftype {
-                TYPE_SETTINGS if flags & FLAG_ACK == 0 => {
-                    let mut pos = 0usize;
-                    while pos + 6 <= payload.len() {
-                        let id = ((payload[pos] as u16) << 8) | (payload[pos + 1] as u16);
-                        let val = ((payload[pos + 2] as u32) << 24)
-                            | ((payload[pos + 3] as u32) << 16)
-                            | ((payload[pos + 4] as u32) << 8)
-                            | (payload[pos + 5] as u32);
-                        match id {
-                            // 6.9.2: applies retroactively to open streams.
-                            4 if val <= i32::MAX as u32 => {
-                                let delta = val as i32 - self.peer_initial_window;
-                                self.peer_initial_window = val as i32;
-                                if delta != 0 {
-                                    for s in self.streams.values_mut() {
-                                        s.send_window = s.send_window.saturating_add(delta);
-                                    }
-                                }
-                            }
-                            4 => {
-                                self.mark_dead("h2s: INITIAL_WINDOW_SIZE above 2^31-1");
-                                return;
-                            }
-                            5 if (16_384..=16_777_215).contains(&val) => self.peer_max_frame = val,
-                            _ => {}
-                        }
-                        pos += 6;
-                    }
-                    self.push_frame(TYPE_SETTINGS, FLAG_ACK, 0, &[]);
-                    // A raised window or max frame size may have unblocked
-                    // a body that is mid-flight.
-                    self.pump_all();
-                }
-
-                TYPE_HEADERS if stream_id > 0 => {
-                    let mut pl = payload;
-                    let mut pos = 0usize;
-
-                    if flags & FLAG_PADDED != 0 {
-                        if pl.is_empty() {
-                            self.mark_dead("h2s: padded HEADERS with empty payload");
-                            return;
-                        }
-                        let pad_len = pl[0] as usize;
-                        pos = 1;
-                        if pl.len() < pos + pad_len {
-                            self.mark_dead("h2s: HEADERS pad_len exceeds payload");
-                            return;
-                        }
-                        let new_len = pl.len() - pad_len;
-                        pl.truncate(new_len);
-                    }
-
-                    if flags & FLAG_PRIORITY != 0 {
-                        pos += 5;
-                    }
-
-                    if pos <= pl.len() {
-                        self.header_block_acc.extend_from_slice(&pl[pos..]);
-                    }
-
-                    if flags & FLAG_END_HEADERS != 0 {
-                        if !self.finish_header_block(stream_id) {
-                            return;
-                        }
-                    } else {
-                        self.continuation_stream = Some(stream_id);
-                    }
-
-                    if flags & FLAG_END_STREAM != 0 {
-                        self.complete_stream(stream_id);
-                    }
-                }
-
-                TYPE_CONTINUATION if stream_id > 0 => {
-                    self.header_block_acc.extend_from_slice(&payload);
-
-                    if flags & FLAG_END_HEADERS != 0 && !self.finish_header_block(stream_id) {
-                        return;
-                    }
-                }
-
-                TYPE_DATA if stream_id > 0 => {
-                    let mut pl = payload;
-                    let mut pos = 0usize;
-
-                    if flags & FLAG_PADDED != 0 {
-                        if pl.is_empty() {
-                            self.mark_dead("h2s: padded DATA with empty payload");
-                            return;
-                        }
-                        let pad_len = pl[0] as usize;
-                        pos = 1;
-                        if pl.len() < pos + pad_len {
-                            self.mark_dead("h2s: DATA pad_len exceeds payload");
-                            return;
-                        }
-                        let new_len = pl.len() - pad_len;
-                        pl.truncate(new_len);
-                    }
-
-                    let data = &pl[pos..];
-                    let data_len = data.len();
-
-                    if data_len > 0 {
-                        let inc = (data_len as u32) & 0x7fff_ffff;
-                        let inc_bytes = inc.to_be_bytes();
-                        self.push_frame(TYPE_WINDOW_UPDATE, 0, 0, &inc_bytes);
-                        self.push_frame(TYPE_WINDOW_UPDATE, 0, stream_id, &inc_bytes);
-                    }
-
-                    if let Some(s) = self.streams.get_mut(&stream_id) {
-                        s.resp_body.extend_from_slice(data);
-                    }
-
-                    if flags & FLAG_END_STREAM != 0 {
-                        self.complete_stream(stream_id);
-                    }
-                }
-
-                TYPE_RST_STREAM if stream_id > 0 => {
-                    if let Some(s) = self.streams.remove(&stream_id) {
-                        let _ = s.tx.send(Err(io::Error::new(
-                            io::ErrorKind::BrokenPipe,
-                            "h2s: stream reset by server",
-                        )));
-                    }
-                }
-
-                TYPE_GOAWAY => {
-                    self.mark_dead("h2s: server sent GOAWAY");
-                    return;
-                }
-
-                TYPE_PING if flags & FLAG_ACK == 0 && payload.len() == 8 => {
-                    let ping_payload = payload.clone();
-                    self.push_frame(TYPE_PING, FLAG_ACK, 0, &ping_payload);
-                }
-
-                TYPE_WINDOW_UPDATE if stream_id == 0 && payload.len() >= 4 => {
-                    // Reserved high bit ignored (6.9).
-                    let inc = (((payload[0] as u32) << 24)
-                        | ((payload[1] as u32) << 16)
-                        | ((payload[2] as u32) << 8)
-                        | (payload[3] as u32))
-                        & 0x7FFF_FFFF;
-                    if inc == 0 {
-                        self.mark_dead("h2s: WINDOW_UPDATE increment of 0 on stream 0");
-                        return;
-                    }
-                    // 6.9.1: above 2^31-1 is a FLOW_CONTROL_ERROR, not a
-                    // wrap. `+=` on an i32 panics here in a debug build.
-                    match self.conn_send_window.checked_add(inc as i32) {
-                        Some(w) => self.conn_send_window = w,
-                        None => {
-                            self.mark_dead("h2s: connection send window above 2^31-1");
-                            return;
-                        }
-                    }
-                    self.pump_all();
-                }
-
-                // Per-stream credit. This arm did not exist: a stream-level
-                // WINDOW_UPDATE fell through to the catch-all and was discarded.
-                TYPE_WINDOW_UPDATE if stream_id > 0 && payload.len() >= 4 => {
-                    let inc = (((payload[0] as u32) << 24)
-                        | ((payload[1] as u32) << 16)
-                        | ((payload[2] as u32) << 8)
-                        | (payload[3] as u32))
-                        & 0x7FFF_FFFF;
-                    if inc == 0 {
-                        self.push_frame(
-                            TYPE_RST_STREAM,
-                            0,
-                            stream_id,
-                            &1u32.to_be_bytes(), // PROTOCOL_ERROR
-                        );
-                        self.streams.remove(&stream_id);
-                    } else if let Some(s) = self.streams.get_mut(&stream_id) {
-                        match s.send_window.checked_add(inc as i32) {
-                            Some(w) => {
-                                s.send_window = w;
-                                self.pump_stream(stream_id);
-                            }
-                            None => {
-                                self.push_frame(
-                                    TYPE_RST_STREAM,
-                                    0,
-                                    stream_id,
-                                    &3u32.to_be_bytes(), // FLOW_CONTROL_ERROR
-                                );
-                                self.streams.remove(&stream_id);
-                            }
-                        }
-                    }
-                }
-
-                _ => {}
-            }
-        }
-
-        // Everything already received has now been parsed and delivered, so the
-        // EOF can be honoured. Streams still open genuinely lost their response.
-        if let Some(reason) = eof {
-            self.mark_dead(&reason);
-        }
-    }
-
-    /// Decode the accumulated header block and apply it to its stream.
-    ///
-    /// Returns false when the connection is dead and the caller must stop.
-    fn finish_header_block(&mut self, stream_id: u32) -> bool {
-        let block = std::mem::take(&mut self.header_block_acc);
-        let pairs = match self.hpack_dec.decode(&block) {
-            Ok(pairs) => pairs,
-            Err(e) => {
-                self.mark_dead(&format!("h2s: HPACK decode error: {:?}", e));
-                return false;
-            }
-        };
-        self.continuation_stream = None;
-        let Some(s) = self.streams.get_mut(&stream_id) else {
-            return true;
-        };
-        match apply_response_block(
-            pairs,
-            &mut s.resp_status,
-            &mut s.resp_headers,
-            &mut s.informational,
-        ) {
-            ResponseBlock::Final => s.headers_done = true,
-            ResponseBlock::Informational => {}
-            ResponseBlock::TooManyInformational => {
-                // Fail this stream only. The connection is healthy.
-                if let Some(s) = self.streams.remove(&stream_id) {
-                    let _ = s.tx.send(Err(too_many_informational()));
-                }
-                self.push_frame(TYPE_RST_STREAM, 0, stream_id, &8u32.to_be_bytes());
-            }
-        }
-        true
-    }
-
-    fn complete_stream(&mut self, stream_id: u32) {
-        if let Some(s) = self.streams.remove(&stream_id) {
-            // Answered before we finished sending: cancel rather than leave the
-            // peer waiting on DATA that will never arrive.
-            if s.body_off < s.pending_body.len() {
-                self.push_frame(
-                    TYPE_RST_STREAM,
-                    0,
-                    stream_id,
-                    &8u32.to_be_bytes(), // CANCEL
-                );
-            }
-            if s.headers_done {
-                let _ = s.tx.send(Ok(HttpResponse {
-                    status: s.resp_status,
-                    reason: String::new(),
-                    headers: s.resp_headers,
-                    body: s.resp_body,
-                }));
-            } else {
-                let _ = s.tx.send(Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "h2s: stream ended without headers",
-                )));
-            }
-        }
-    }
-
-    fn mark_dead(&mut self, reason: &str) {
-        self.is_dead = true;
-        let streams = std::mem::take(&mut self.streams);
-        for (_, s) in streams {
-            let _ = s.tx.send(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                reason.to_string(),
-            )));
-        }
-    }
-
-    fn push_frame(&mut self, ftype: u8, flags: u8, stream_id: u32, payload: &[u8]) {
-        let len = payload.len() as u32;
-        self.send_buf.push((len >> 16) as u8);
-        self.send_buf.push((len >> 8) as u8);
-        self.send_buf.push(len as u8);
-        self.send_buf.push(ftype);
-        self.send_buf.push(flags);
-        let sid = stream_id & 0x7fff_ffff;
-        self.send_buf.push((sid >> 24) as u8);
-        self.send_buf.push((sid >> 16) as u8);
-        self.send_buf.push((sid >> 8) as u8);
-        self.send_buf.push(sid as u8);
-        self.send_buf.extend_from_slice(payload);
+        None
     }
 }
 
-// ── H2sTlsClientPool (public) ─────────────────────────────────────────────────
+/// Persistent non-blocking H2S (TLS) connection.
+pub struct H2sTlsClientConn(H2Client<H2sTransport>);
 
-pub struct H2sTlsClientPool {
-    entries: HashMap<String, H2sTlsClientConn>,
+impl std::ops::Deref for H2sTlsClientConn {
+    type Target = H2Client<H2sTransport>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
+
+impl std::ops::DerefMut for H2sTlsClientConn {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl H2sTlsClientConn {
+    /// Connect to an H2S backend at `host:port`.
+    pub fn connect(
+        host: &str,
+        port: u16,
+        tls_config: Arc<rustls::ClientConfig>,
+    ) -> io::Result<Self> {
+        Ok(Self(H2Client::connect(host, port, Some(tls_config))?))
+    }
+}
+
+/// Persistent H2S connection pool, keyed by backend URL.
+pub struct H2sTlsClientPool(Pool<H2sTransport>);
 
 impl Default for H2sTlsClientPool {
     fn default() -> Self {
@@ -784,16 +206,12 @@ impl Default for H2sTlsClientPool {
 
 impl H2sTlsClientPool {
     pub fn new() -> Self {
-        Self {
-            entries: HashMap::new(),
-        }
+        Self(Pool::new())
     }
 
     /// Dispatch a request to the named backend URL.
     ///
-    /// Creates a new connection if none exists or the existing one is dead
-    /// (and all its streams have completed).  `tls_config` must have ALPN
-    /// `h2` — use `pool::build_h2_tls_client_config()`.
+    /// `tls_config` must have ALPN `h2` — use `pool::build_h2_tls_client_config()`.
     pub fn dispatch(
         &mut self,
         base_url: &str,
@@ -802,70 +220,12 @@ impl H2sTlsClientPool {
         original_host: &str,
         tls_config: Arc<rustls::ClientConfig>,
     ) -> io::Result<mpsc::Receiver<io::Result<HttpResponse>>> {
-        let needs_new = match self.entries.get(base_url) {
-            None => true,
-            Some(c) => c.is_dead && c.streams.is_empty(),
-        };
-
-        if needs_new {
-            let (host, port) = parse_h2s_host_port(base_url)?;
-            let new_conn = H2sTlsClientConn::connect(&host, port, tls_config)?;
-            self.entries.insert(base_url.to_string(), new_conn);
-        }
-
-        let (host, _) = parse_h2s_host_port(base_url)?;
-        let conn = self.entries.get_mut(base_url).unwrap();
-        conn.dispatch(req, &host, client_ip, original_host)
+        self.0
+            .dispatch(base_url, req, client_ip, original_host, Some(tls_config))
     }
 
     /// Register new connections with the poller and drive all connections.
-    ///
-    /// Must be called on every event-loop iteration.
     pub fn drive_all(&mut self, poller: &Poller, token: Token) {
-        for conn in self.entries.values_mut() {
-            if !conn.registered {
-                let _ = poller.add(conn.raw_fd(), token);
-                conn.registered = true;
-            }
-            conn.drive();
-        }
-        self.entries
-            .retain(|_, c| !(c.is_dead && c.streams.is_empty()));
+        self.0.drive_all(poller, token);
     }
-}
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-/// Parse `h2s://host:port[/path]` into `(host, port)`.  Default port: 443.
-pub fn parse_h2s_host_port(base_url: &str) -> io::Result<(String, u16)> {
-    let rest = base_url
-        .strip_prefix("h2s://")
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "not an h2s:// URL"))?;
-
-    let authority = match rest.find('/') {
-        Some(idx) => &rest[..idx],
-        None => rest,
-    };
-
-    // IPv6: [::1]:port
-    if let Some(bracket_end) = authority.find(']') {
-        let host = authority[1..bracket_end].to_string();
-        let port =
-            if bracket_end + 1 < authority.len() && authority.as_bytes()[bracket_end + 1] == b':' {
-                authority[bracket_end + 2..].parse::<u16>().map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "invalid port in h2s URL")
-                })?
-            } else {
-                443
-            };
-        return Ok((host, port));
-    }
-
-    if let Some(colon) = authority.rfind(':') {
-        if let Ok(p) = authority[colon + 1..].parse::<u16>() {
-            return Ok((authority[..colon].to_string(), p));
-        }
-    }
-
-    Ok((authority.to_string(), 443))
 }
