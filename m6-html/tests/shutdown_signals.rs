@@ -6,7 +6,7 @@
 //! SIGTERM that fails to force an exit, a SIGINT that does not take the same
 //! graceful path as SIGTERM, and a SIGTERM that cuts off an in-flight response.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -34,12 +34,20 @@ fn fixtures_dir() -> PathBuf {
         .join("fixtures")
 }
 
-fn config_path() -> PathBuf {
-    fixtures_dir().join("configs").join("m6-html-shutdown.conf")
+fn config_path(name: &str) -> PathBuf {
+    fixtures_dir().join("configs").join(name)
 }
 
 /// Spawn `m6-html` on its own socket and wait until it answers a request.
 fn spawn(id: &str) -> (Server, PathBuf) {
+    spawn_with(id, "m6-html-shutdown.conf")
+}
+
+fn spawn_with(id: &str, config: &str) -> (Server, PathBuf) {
+    spawn_with_args(id, config, &[])
+}
+
+fn spawn_with_args(id: &str, config: &str, args: &[&str]) -> (Server, PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir");
     // Short name: a unix socket path is capped near 104 bytes on macOS.
     let socket_path = dir.path().join(format!("{id}.sock"));
@@ -48,7 +56,8 @@ fn spawn(id: &str) -> (Server, PathBuf) {
         "m6-html",
         Command::new(binary("m6-html"))
             .arg(fixtures_dir())
-            .arg(config_path())
+            .arg(config_path(config))
+            .args(args)
             .env("M6_SOCKET_OVERRIDE", &socket_path),
     );
     svc.wait_for_path(&socket_path, Duration::from_secs(10));
@@ -89,36 +98,92 @@ fn http_request(socket: &Path, request: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&resp).into_owned())
 }
 
-/// Open a request whose body is sent only partway, and confirm the worker is
-/// blocked reading it. Returns the held-open stream.
+/// Open a request whose body is sent only partway, and confirm the worker has
+/// accepted it and is blocked reading the body. Returns the held-open stream.
 ///
 /// With one worker and no queue, a probe is answered 503 while the worker is
-/// busy. That 503 is the signal this waits on, rather than a fixed sleep.
+/// busy. The held request connects before the probe and the service accepts in
+/// order, so once any probe is answered the service has already decided the
+/// held request's fate. A refusal (the worker was not yet back waiting for
+/// work) shows as a write that fails or a 503 already readable on the held
+/// stream, and the attempt is repeated. Otherwise the request was accepted and
+/// the first 503 to a probe proves the worker is still on it.
 fn hold_open(socket: &Path, svc: &mut Service) -> UnixStream {
-    let mut held = UnixStream::connect(socket).expect("connect the held request");
-    held.set_read_timeout(Some(Duration::from_secs(10))).ok();
-    held.write_all(
-        b"POST /blog HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\nConnection: close\r\n\r\n",
-    )
-    .expect("write the held request head");
-    held.write_all(b"0123456789")
-        .expect("write the first 10 body bytes");
+    hold_open_asking(socket, svc, "close")
+}
 
+/// `hold_open` with the request's `Connection` header set to `connection`.
+fn hold_open_asking(socket: &Path, svc: &mut Service, connection: &str) -> UnixStream {
+    let head = format!(
+        "POST /blog HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\nConnection: {connection}\r\n\r\n0123456789"
+    );
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        if http_request(socket, "GET /blog HTTP/1.1\r\nHost: localhost\r\n\r\n")
-            .is_some_and(|r| r.contains("503"))
-        {
-            return held;
+        let mut held = UnixStream::connect(socket).expect("connect the held request");
+        held.set_read_timeout(Some(Duration::from_secs(10))).ok();
+        let sent = held.write_all(head.as_bytes()).is_ok();
+
+        let mut refused = !sent;
+        while !refused {
+            let probe = http_request(socket, "GET /blog HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            refused = was_refused(&mut held);
+            if refused {
+                break;
+            }
+            if probe.is_some_and(|r| r.contains("503")) {
+                return held;
+            }
+            svc.assert_alive("while confirming the held request is in flight");
+            assert!(
+                Instant::now() < deadline,
+                "the held request never took the worker\n--- output ---\n{}",
+                svc.output()
+            );
+            std::thread::sleep(Duration::from_millis(25));
         }
-        svc.assert_alive("while confirming the held request is in flight");
         assert!(
             Instant::now() < deadline,
-            "the held request never took the worker\n--- output ---\n{}",
+            "the held request was refused every time\n--- output ---\n{}",
             svc.output()
         );
-        std::thread::sleep(Duration::from_millis(25));
     }
+}
+
+/// Send a keep-alive GET on a new connection and read its response, retrying
+/// while the one worker is still finishing an earlier connection: the fixture
+/// has no queue, so such a connection is refused with 503.
+fn first_request(socket: &Path, svc: &Service) -> (UnixStream, String) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut conn = UnixStream::connect(socket).expect("connect");
+        conn.set_read_timeout(Some(Duration::from_secs(30))).ok();
+        conn.write_all(b"GET /blog HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .expect("send the first request");
+        let first =
+            String::from_utf8_lossy(&read_one(&mut conn, "GET").expect("read the first response"))
+                .to_ascii_lowercase();
+        if !first.starts_with("http/1.1 503") {
+            return (conn, first);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the worker never came free\n--- output ---\n{}",
+            svc.output()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// True if the service has already answered or closed the held stream, which
+/// it does only to refuse it.
+fn was_refused(held: &mut UnixStream) -> bool {
+    held.set_nonblocking(true).expect("poll the held stream");
+    let refused = !matches!(
+        held.read(&mut [0u8; 1]),
+        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
+    );
+    held.set_nonblocking(false).expect("block the held stream");
+    refused
 }
 
 /// Wait until the child's output contains `marker`, or panic with the output.
@@ -217,7 +282,9 @@ fn one_sigint_exits_zero_and_removes_the_socket() {
 #[test]
 fn a_request_in_flight_at_sigterm_receives_its_full_response() {
     let (mut server, socket_path) = spawn("term-inflight");
-    let mut held = hold_open(&socket_path, &mut server.svc);
+    // It asks for keep-alive, so the `Connection: close` checked below is the
+    // service's own decision once shutdown has started.
+    let mut held = hold_open_asking(&socket_path, &mut server.svc, "keep-alive");
 
     server.svc.signal(libc::SIGTERM);
     wait_for_output(
@@ -254,6 +321,13 @@ fn a_request_in_flight_at_sigterm_receives_its_full_response() {
         "the response was cut short; expected post-index content, got: {}",
         &text[..text.len().min(300)]
     );
+    // A request served after shutdown started closes its connection, so the
+    // client does not send another on a connection that is about to go.
+    assert!(
+        text.to_ascii_lowercase().contains("connection: close"),
+        "the response drained at shutdown kept its connection alive: {}",
+        &text[..text.len().min(300)]
+    );
 
     let status = server
         .svc
@@ -274,4 +348,227 @@ fn a_request_in_flight_at_sigterm_receives_its_full_response() {
         "the socket at {} outlived the shutdown",
         socket_path.display()
     );
+}
+
+/// An idle keep-alive connection is closed when shutdown starts, so it cannot
+/// hold the drain. The wrong outcome: a client (a reverse proxy's connection
+/// pool, typically) keeps a connection open between requests, its worker
+/// counts as busy until the read times out, and every graceful stop waits the
+/// whole drain deadline.
+#[test]
+fn an_idle_keep_alive_connection_does_not_hold_the_drain() {
+    let (mut server, socket_path) = spawn("term-keepalive");
+    let (mut conn, first) = first_request(&socket_path, &server.svc);
+    assert!(
+        !first.contains("connection: close"),
+        "the response closed the connection, so nothing is left idle to test: {}",
+        &first[..first.len().min(300)]
+    );
+
+    // The connection now sits idle between requests. Its read timeout is far
+    // longer than the wait below, so only closing it at shutdown lets the
+    // process exit in time.
+    server.svc.signal(libc::SIGTERM);
+    let status = server
+        .svc
+        .wait_for_exit(Instant::now() + Duration::from_secs(5))
+        .unwrap_or_else(|| {
+            panic!(
+                "an idle keep-alive connection held the drain\n--- output ---\n{}",
+                server.svc.output()
+            )
+        });
+    assert!(
+        status.success(),
+        "exit {status}\n--- output ---\n{}",
+        server.svc.output()
+    );
+    let mut rest = Vec::new();
+    conn.read_to_end(&mut rest).ok();
+    assert!(
+        rest.is_empty(),
+        "the idle connection received data after shutdown"
+    );
+}
+
+/// A connection that has sent nothing is idle too, so it cannot hold the
+/// drain. The wrong outcome: a proxy's warm pooled connection, or a client
+/// that connected just before the signal, keeps its worker counted as busy
+/// until the read times out, and the stop waits out the whole deadline.
+#[test]
+fn a_connection_that_has_sent_nothing_does_not_hold_the_drain() {
+    // At debug level the service logs "new connection waiting for its first
+    // request" each time a connection reaches the one worker. The fixture has
+    // one worker and no queue, so a connection that arrives while the worker is
+    // still finishing an earlier one is refused with 503 and must be retried.
+    const IDLE_LINE: &str = "new connection waiting for its first request";
+    let (mut server, socket_path) = spawn_with_args(
+        "term-silent",
+        "m6-html-shutdown.conf",
+        &["--log-level", "debug"],
+    );
+    // Connections that have reached the worker: the readiness probe's.
+    let mut reached = 1;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut conn = UnixStream::connect(&socket_path).expect("connect");
+    loop {
+        let probe = http_request(
+            &socket_path,
+            "GET /blog HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        // The one accept loop answered `conn` before the probe, so a refusal
+        // of `conn` is already in its buffer by the time the probe is answered.
+        if was_refused(&mut conn) {
+            conn = UnixStream::connect(&socket_path).expect("reconnect");
+        } else if probe.as_deref().is_some_and(|r| r.contains("503")) {
+            // The worker is busy and `conn` was not refused: the worker has it.
+            break;
+        }
+        if probe.is_some_and(|r| !r.contains("503")) {
+            reached += 1;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the silent connection never took the worker\n--- output ---\n{}",
+            server.svc.output()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    conn.set_read_timeout(Some(Duration::from_secs(30))).ok();
+    // The worker registers a connection as idle before anything else, and
+    // the line for `conn` is the one after every earlier connection's.
+    while server.svc.output().matches(IDLE_LINE).count() <= reached {
+        assert!(
+            Instant::now() < deadline,
+            "the silent connection never registered as idle\n--- output ---\n{}",
+            server.svc.output()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    server.svc.signal(libc::SIGTERM);
+    let status = server
+        .svc
+        .wait_for_exit(Instant::now() + Duration::from_secs(5))
+        .unwrap_or_else(|| {
+            panic!(
+                "a connection that sent nothing held the drain\n--- output ---\n{}",
+                server.svc.output()
+            )
+        });
+    assert!(
+        status.success(),
+        "exit {status}\n--- output ---\n{}",
+        server.svc.output()
+    );
+    let mut rest = Vec::new();
+    conn.read_to_end(&mut rest).ok();
+    assert!(
+        rest.is_empty(),
+        "the silent connection received data after shutdown"
+    );
+}
+
+/// A request already arriving on a kept-alive connection when shutdown starts
+/// is served in full. The wrong outcome: the connection still counts as idle
+/// while its next request's body streams in, shutdown closes it for reading,
+/// and a request that cannot safely be retried is cut off.
+#[test]
+fn a_second_request_arriving_at_sigterm_is_served_in_full() {
+    // At debug level the service logs "request arriving" when a request's
+    // first byte is read and the connection stops counting as idle.
+    let (mut server, socket_path) = spawn_with_args(
+        "term-second",
+        "m6-html-shutdown.conf",
+        &["--log-level", "debug"],
+    );
+    let (mut conn, _) = first_request(&socket_path, &server.svc);
+
+    conn.write_all(
+        b"POST /blog HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\n0123456789",
+    )
+    .expect("start the second request");
+    // The third "request arriving" (the readiness probe's, the first
+    // request's, then this one's; a refused connection never reaches the
+    // worker): the connection is no longer idle, so shutdown must wait for
+    // this request rather than close it.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while server.svc.output().matches("request arriving").count() < 3 {
+        assert!(
+            Instant::now() < deadline,
+            "the service never logged the second request arriving\n--- output ---\n{}",
+            server.svc.output()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    server.svc.signal(libc::SIGTERM);
+    wait_for_output(&server.svc, "draining", Duration::from_secs(5));
+    conn.write_all(&[b'x'; 90])
+        .expect("finish the second request's body");
+    let resp =
+        String::from_utf8_lossy(&read_one(&mut conn, "POST").expect("read the second response"))
+            .into_owned();
+    assert!(
+        resp.contains("200 OK"),
+        "the request arriving at shutdown was cut off: {}",
+        &resp[..resp.len().min(300)]
+    );
+    let status = server
+        .svc
+        .wait_for_exit(Instant::now() + Duration::from_secs(5))
+        .unwrap_or_else(|| {
+            panic!(
+                "m6-html did not exit\n--- output ---\n{}",
+                server.svc.output()
+            )
+        });
+    assert!(
+        status.success(),
+        "exit {status}\n--- output ---\n{}",
+        server.svc.output()
+    );
+}
+
+/// A request that never finishes cannot hold shutdown past `drain_timeout_s`.
+/// The wrong outcome: the drain waits for the stalled request until the
+/// supervisor kills the service mid-response. The service logs how many
+/// requests it left behind, then exits 0 with its socket removed.
+#[test]
+fn a_stalled_request_cannot_hold_shutdown_past_the_drain_deadline() {
+    let (mut server, socket_path) =
+        spawn_with("term-deadline", "m6-html-shutdown-short-drain.conf");
+    let held = hold_open(&socket_path, &mut server.svc);
+
+    server.svc.signal(libc::SIGTERM);
+    wait_for_output(
+        &server.svc,
+        "drain deadline passed",
+        Duration::from_secs(10),
+    );
+    let status = server
+        .svc
+        .wait_for_exit(Instant::now() + Duration::from_secs(10))
+        .unwrap_or_else(|| {
+            panic!(
+                "m6-html did not exit after the drain deadline\n--- output ---\n{}",
+                server.svc.output()
+            )
+        });
+    assert!(
+        status.success(),
+        "shutdown past the drain deadline must exit 0, got {status}\n--- output ---\n{}",
+        server.svc.output()
+    );
+    assert!(
+        server.svc.output().contains("\"unfinished\":1"),
+        "the warning must count the one request left behind\n--- output ---\n{}",
+        server.svc.output()
+    );
+    assert!(
+        !socket_path.exists(),
+        "the socket at {} outlived the shutdown",
+        socket_path.display()
+    );
+    drop(held);
 }

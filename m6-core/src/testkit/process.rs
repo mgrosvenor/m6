@@ -73,6 +73,17 @@ impl Service {
             .and_then(|c| c.try_wait().ok().flatten())
     }
 
+    /// Wait for the drain threads to copy the last bytes the exited child wrote.
+    ///
+    /// Its pipes are closed once it has exited, so each drain's read returns 0
+    /// and the join is immediate. Without it a test that reads `output()` the
+    /// moment `wait_for_exit` returns can miss the child's final log lines.
+    fn finish_output(&mut self) {
+        for h in self.drains.drain(..) {
+            let _ = h.join();
+        }
+    }
+
     /// Kill the service now rather than at drop, for a test whose subject is
     /// what happens after a backend goes away.
     ///
@@ -109,6 +120,7 @@ impl Service {
         let deadline = Instant::now() + timeout;
         loop {
             if let Some(status) = child.try_wait().ok().flatten() {
+                self.finish_output();
                 return status;
             }
             if Instant::now() >= deadline {
@@ -135,6 +147,7 @@ impl Service {
     pub fn wait_for_exit(&mut self, deadline: Instant) -> Option<ExitStatus> {
         loop {
             if let Some(status) = self.exited() {
+                self.finish_output();
                 return Some(status);
             }
             if Instant::now() >= deadline {
@@ -296,9 +309,7 @@ impl Drop for Service {
         // The child is gone, so its ends of the pipes are closed and each
         // drain thread's read returns 0. Joining here keeps them from
         // outliving the buffer they write into.
-        for h in self.drains.drain(..) {
-            let _ = h.join();
-        }
+        self.finish_output();
     }
 }
 
