@@ -229,7 +229,7 @@ Take from it that the engine picks its algorithm from the key it is given, and t
 |---|---|
 | `JwtEngine::new(private_pem, public_pem, issuer)` | reads a *PEM* (Privacy-Enhanced Mail) key pair and picks `ES256` (*ECDSA*, Elliptic Curve Digital Signature Algorithm, on P-256) for an elliptic-curve private key or `RS256` (*RSA*, Rivest-Shamir-Adleman, with SHA-256) for an RSA one |
 | `encode_access`, `encode_refresh` | sign a token from the matching claims type |
-| `decode_access`, `decode_refresh` | verify the signature, the issuer and `exp`, and return the claims |
+| `decode_access` | verify the signature, the issuer and `exp`, and return the claims |
 | `AccessClaims` | `iss`, `sub` (the user id), `exp`, `iat`, `username`, `groups`, `roles` |
 | `RefreshClaims` | `iss`, `sub`, `exp`, `iat`, `username`, and `type` set to `refresh` |
 | `hash_token(token)` | the lowercase hex SHA-256 (*Secure Hash Algorithm*, 256-bit) of the token string |
@@ -241,7 +241,7 @@ The claims types are the JSON bodies of the tokens, and `hash_token` is what kee
 
 `JwtEngine::new` tries the elliptic-curve parser first and the RSA parser second.
 The private-key error names both attempts, and a public-key error names the type it failed on.
-`decode_access` and `decode_refresh` use the engine's algorithm and issuer and the library's default check of `exp`, so a token from another issuer or an expired token fails.
+`decode_access` uses the engine's algorithm and issuer and the library's default check of `exp`, so a token from another issuer or an expired token fails.
 
 `hash_token` returns a plain SHA-256 digest, which suits a signed token with high entropy.
 
