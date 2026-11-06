@@ -51,11 +51,11 @@ Table 2 lists the checks by the *CI* (continuous integration) job that runs each
 
 | check | CI job |
 |---|---|
-| formatting (`cargo fmt --all --check`) | build, tests, clippy |
-| zero compiler warnings, release and test builds, pre-existing included | build, tests, clippy |
-| the test suite (`cargo test --workspace`) | build, tests, clippy |
-| m6-core with every feature on (`cargo test -p m6-core --lib --all-features` and `--doc --all-features`) | build, tests, clippy |
-| clippy silent (`tools/clippy.sh`) | build, tests, clippy |
+| formatting (`cargo fmt --all --check`) | build and tests |
+| zero compiler warnings, release and test builds, pre-existing included | build and tests |
+| the test suite (`cargo test --workspace`) | build and tests |
+| m6-core with every feature on (`cargo test -p m6-core --lib --all-features` and `--doc --all-features`) | build and tests |
+| clippy silent (`tools/clippy.sh`) | clippy |
 | h1, h2 and h3 conformance at or above the recorded floors (`tools/conformance.sh`) | h1, h2, h3 conformance |
 | dependencies (`cargo deny check`) | advisories, licences, duplicates |
 | shellcheck clean at warning level | shell scripts |
