@@ -228,15 +228,14 @@ A service that compresses where `site.toml` says it does not lets the edge cache
 
 A service reads two files, its own configuration and `site.toml`, and a change to either reloads it.
 One `ConfigReloader` in core watches both.
-It takes the change from the platform's watcher when there is one and, whatever the watcher says, compares the two files' size, times and identity once a second.
+It takes the change from the platform's watcher when there is one and, whatever the watcher says, compares the two files' bytes, mode, owner and modification time once a second.
 A lost watch, a replaced directory or a watcher that stopped reporting therefore delays a reload by at most a second and no longer prevents it.
-The first change after quiet reloads at once.
-A change that arrives within 20 ms of a reload is held and reloads once more when the burst has settled, no later than a second after the window opened.
-A write that replaces the file in one step is therefore one reload with no delay, and a burst of writes is at most two.
-A write that truncates the file first can report twice, because the truncation is seen as a change of its own.
+A change reloads once the file has been the same at two checks 20 ms apart, so the first change after quiet reloads 20 ms after it is first seen.
+A write during that wait restarts it, and a file that never stops changing reloads a second after it first changed.
+A write that replaces the file in one step, and a burst of writes, are each one reload.
 A file seen at length 0 is not loaded: the reload is skipped with a warning and the write that fills the file reloads.
 A touch alone, with no change to the bytes, reloads.
-On Linux an event that names one of the two files is a change even when the file's size and times are unchanged, which coarse filesystem timestamps can cause.
+A rewrite of the same length inside one timestamp tick reloads, because the bytes differ.
 Table 5 says what that reload reaches.
 
 | reloaded on a change to either file | fixed until a restart |
@@ -263,7 +262,7 @@ A file that failed to load is not tried again until it is written again.
 m6-auth-server uses it to re-read its signing keys and m6-monitor uses it to name its restart-only keys.
 Core calls it with the new configuration in the context, after the new state has been built and checked and before it is installed.
 If the hook returns `Err`, core logs it at error level with the delay before the next attempt and keeps the previous routes and log level.
-The reload is tried again after 1 s, then 2 s, 4 s and so on up to 60 s, and at once when either file is written again, so the hook must be safe to run twice on the same configuration.
+The reload is tried again after 1 s, then 2 s, 4 s and so on up to 60 s, and as soon as either file is written again and has settled, so the hook must be safe to run twice on the same configuration.
 A panic in the hook is not caught.
 The release profile aborts on panic, so it ends the process and the service manager restarts it.
 Return `Err` for anything that can be recovered from.

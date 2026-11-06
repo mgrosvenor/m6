@@ -192,7 +192,7 @@ The cache-hit path is unchanged.
 
 m6-http reloads when `site.toml` or the system config changes, and the two changes cost different amounts.
 One `ConfigReloader` from m6-core watches both files.
-It takes the change from the platform's watcher and, whatever the watcher says, compares the two files' size, times and identity once a second, so a lost watch delays a reload by at most a second.
+It takes the change from the platform's watcher and, whatever the watcher says, compares the two files' bytes, mode, owner and modification time once a second, so a lost watch delays a reload by at most a second.
 Renderers and other processes that change site content signal m6-http by touching `site.toml`.
 Table 1 says what each change reloads.
 
@@ -210,7 +210,7 @@ Take from it that only a `site.toml` change empties the cache, and that new key 
 
 The later cache clears cover a backend that reloads after m6-http.
 A request in that gap can fill the cache with the old page.
-The clear 100 ms after the reload ends covers a backend that held the change for its 20 ms window, and the clear 1.08 s after covers a backend that found the change only on its once-a-second poll.
+The clear 100 ms after the reload ends covers a backend that waited its 20 ms settle interval, and the clear 1.08 s after covers a backend that found the change only on its once-a-second poll.
 Each delay is the m6-core constant (`RELOAD_DEBOUNCE`, `RELOAD_POLL`) plus 80 ms for the backend's own reload.
 The cost is one extra cache miss per page about a second after a content change.
 The cache-hit path is unchanged.
