@@ -289,6 +289,41 @@ where
 /// edge uses the same cap.
 pub const MAX_REQUESTS_PER_CONN: u32 = 100;
 
+/// Connections waiting for their next request. A graceful shutdown closes
+/// them for reading, which wakes each worker blocked on one, so the drain
+/// waits only for requests being served. The lock is held across both the
+/// check of the shutdown flag and the close, so a connection cannot register
+/// after the close has run, and an fd leaves the set before its connection
+/// ends, so it is never closed after being reused.
+static IDLE: std::sync::Mutex<Vec<std::os::fd::RawFd>> = std::sync::Mutex::new(Vec::new());
+
+fn idle_enter(fd: std::os::fd::RawFd) -> bool {
+    let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+    if crate::signal::is_shutdown() {
+        return false;
+    }
+    idle.push(fd);
+    true
+}
+
+fn idle_leave(fd: std::os::fd::RawFd) {
+    let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(i) = idle.iter().position(|&f| f == fd) {
+        idle.swap_remove(i);
+    }
+}
+
+/// Close every idle kept-alive connection for reading. Called once shutdown
+/// has started; each blocked worker sees end of input and its connection ends.
+pub fn close_idle_connections() {
+    let idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+    for &fd in idle.iter() {
+        // SAFETY: fd is a connection still owned by its worker: it leaves this
+        // set, under this lock, before the connection is dropped.
+        unsafe { libc::shutdown(fd, libc::SHUT_RD) };
+    }
+}
+
 /// Serve HTTP/1.1 on one accepted connection until it ends.
 ///
 /// **This is the one backend connection loop.** m6-file, m6-html and
@@ -309,7 +344,7 @@ pub const MAX_REQUESTS_PER_CONN: u32 = 100;
 /// is how a smuggled one gets through.
 pub fn serve_connection<S, E, F>(stream: &mut S, mut handler: F) -> Result<(), E>
 where
-    S: std::io::Read + std::io::Write,
+    S: std::io::Read + std::io::Write + std::os::fd::AsRawFd,
     E: From<std::io::Error>,
     // Takes the request by value: this loop has no use for it after the
     // handler returns, and handing it over saves every `App` service a full
@@ -318,8 +353,20 @@ where
     F: FnMut(RawRequest, &mut crate::h1::Responder<'_, S>) -> Result<(), E>,
 {
     let mut served = 0u32;
+    let fd = stream.as_raw_fd();
     loop {
-        let req = match parse::parse_request(stream) {
+        // Between requests a kept-alive connection is idle. It registers as
+        // such, so a shutdown can close it at once instead of waiting for it
+        // to time out; one that finds shutdown already under way just ends.
+        let idle = served > 0;
+        if idle && !idle_enter(fd) {
+            return Ok(());
+        }
+        let parsed = parse::parse_request(stream);
+        if idle {
+            idle_leave(fd);
+        }
+        let req = match parsed {
             Ok(r) => r,
             // An idle persistent connection going away is how this loop is
             // meant to end, not an error to report.
@@ -333,9 +380,7 @@ where
         };
 
         served += 1;
-        // Once shutdown starts, every response closes its connection, so a
-        // client holding keep-alive connections open cannot keep the drain
-        // waiting until they idle out.
+        // A request served after shutdown started closes its connection.
         let keep_alive = crate::h1::keep_alive(&req)
             && served < MAX_REQUESTS_PER_CONN
             && !crate::signal::is_shutdown();

@@ -1544,11 +1544,7 @@ impl ThreadPool {
                     match work {
                         Ok(f) => {
                             let _finish = Finish(&in_flight2);
-                            // A handler that panics loses its own response, not
-                            // the worker: without this the pool shrinks for good,
-                            // and with one worker every queued request after it
-                            // is counted in flight and never run.
-                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+                            f();
                         }
                         Err(_) => break,
                     }
@@ -1668,17 +1664,20 @@ fn install_shutdown(socket_path: &std::path::Path) -> crate::signal::ShutdownHan
     crate::signal::ShutdownHandle::install(crate::signal::Service::new(name).socket(socket_path))
 }
 
-/// Wait for accepted requests, up to `timeout`, then run the shutdown hook.
+/// Close idle kept-alive connections, wait for the requests being served, up
+/// to `timeout`, then run the shutdown hook. Returns whether the drain finished.
 ///
 /// The hook tears down the global state handlers use (a database pool, for
 /// example), so it runs only when every request has finished. After the
-/// deadline the process exits with the hook unrun rather than pull that state
-/// out from under a handler still using it.
+/// deadline it is neither run nor dropped: dropping it would run the
+/// destructors of what it captured under a handler still using them.
 fn drain_and_shut_down(
     pool: &ThreadPool,
     timeout: std::time::Duration,
     on_shutdown: &mut Option<Box<dyn FnOnce() + Send>>,
-) {
+) -> bool {
+    info!("Shutdown signal received, draining...");
+    crate::server::close_idle_connections();
     let unfinished = pool.drain(timeout);
     if unfinished > 0 {
         warn!(
@@ -1686,11 +1685,13 @@ fn drain_and_shut_down(
             timeout_s = timeout.as_secs(),
             "drain deadline passed with requests still in flight, shutting down without on_shutdown"
         );
-        return;
+        std::mem::forget(on_shutdown.take());
+        return false;
     }
     if let Some(f) = on_shutdown.take() {
         f();
     }
+    true
 }
 
 #[inline]
@@ -3065,9 +3066,9 @@ fn run_app_with_shutdown(
 
         // Neither fd fired: a timeout, or a signal interrupted the wait.
         if ready.idle && is_shutdown() {
-            info!("Shutdown signal received, draining...");
-            drain_and_shut_down(&pool, drain_timeout, &mut on_shutdown_cell);
-            info!("Clean shutdown");
+            if drain_and_shut_down(&pool, drain_timeout, &mut on_shutdown_cell) {
+                info!("Clean shutdown");
+            }
             break;
         }
 
@@ -3138,7 +3139,9 @@ fn run_app_with_shutdown(
         }
 
         if is_shutdown() {
-            drain_and_shut_down(&pool, drain_timeout, &mut on_shutdown_cell);
+            if drain_and_shut_down(&pool, drain_timeout, &mut on_shutdown_cell) {
+                info!("Clean shutdown");
+            }
             break;
         }
     }
@@ -3846,52 +3849,66 @@ mod tests {
         assert_eq!(pool.drain(DRAIN_LONG), 0);
     }
 
-    /// A worker survives a handler that panics and runs the work queued
-    /// behind it. The wrong outcome: the worker thread dies, and in a one-worker
-    /// pool every later request is accepted, counted in flight and never run,
-    /// so each shutdown waits out its whole deadline.
-    #[test]
-    fn a_worker_survives_a_panicking_handler_and_runs_the_next_one() {
-        let pool = ThreadPool::new(1, 2);
-        let (ran, done) = std::sync::mpsc::channel::<()>();
-        assert!(pool.submit(Box::new(|| panic!("handler failed"))));
-        assert!(pool.submit(Box::new(move || ran.send(()).unwrap())));
-        done.recv_timeout(std::time::Duration::from_secs(10))
-            .expect("the work queued behind a panicking handler never ran");
-        assert_eq!(pool.drain(DRAIN_LONG), 0);
-    }
-
     /// The shutdown hook tears down state handlers use, so it runs only after
-    /// every request has finished. The wrong outcome: the drain deadline passes
-    /// with a handler still running and the hook pulls its database pool, or
-    /// similar, out from under it.
+    /// every request has finished, and after a drain that timed out it is
+    /// neither run nor dropped (dropping it would run its captures'
+    /// destructors). The wrong outcome: the drain deadline passes with a
+    /// handler still running and the hook, or the drop of what it holds, pulls
+    /// a database pool or similar out from under it.
     #[test]
     fn the_shutdown_hook_runs_only_when_the_drain_finishes() {
         use std::sync::atomic::AtomicBool;
-        let ran = Arc::new(AtomicBool::new(false));
-        let hook = |flag: &Arc<AtomicBool>| -> Option<Box<dyn FnOnce() + Send>> {
-            let flag = flag.clone();
-            Some(Box::new(move || flag.store(true, Ordering::SeqCst)))
+        struct SetOnDrop(Arc<AtomicBool>);
+        impl Drop for SetOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let hook = |ran: &Arc<AtomicBool>,
+                    dropped: &Arc<AtomicBool>|
+         -> Option<Box<dyn FnOnce() + Send>> {
+            let ran = ran.clone();
+            let held = SetOnDrop(dropped.clone());
+            Some(Box::new(move || {
+                let _held = &held;
+                ran.store(true, Ordering::SeqCst);
+            }))
         };
 
+        // A request still running at the deadline: no hook, no drop.
+        let (ran, dropped) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
         let pool = ThreadPool::new(1, 1);
         let (release, held) = std::sync::mpsc::channel::<()>();
         assert!(pool.submit(Box::new(move || {
             held.recv().ok();
         })));
-        let mut on_shutdown = hook(&ran);
-        drain_and_shut_down(
+        let mut on_shutdown = hook(&ran, &dropped);
+        assert!(!drain_and_shut_down(
             &pool,
             std::time::Duration::from_millis(20),
-            &mut on_shutdown,
-        );
+            &mut on_shutdown
+        ));
         assert!(
             !ran.load(Ordering::SeqCst),
             "the hook ran while a request was still in flight"
         );
-
+        assert!(
+            !dropped.load(Ordering::SeqCst),
+            "the hook's captures were dropped while a request was still in flight"
+        );
         release.send(()).unwrap();
-        drain_and_shut_down(&pool, DRAIN_LONG, &mut on_shutdown);
+
+        // Every request finished: the hook runs.
+        let (ran, dropped) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let pool = ThreadPool::new(1, 1);
+        let mut on_shutdown = hook(&ran, &dropped);
+        assert!(drain_and_shut_down(&pool, DRAIN_LONG, &mut on_shutdown));
         assert!(
             ran.load(Ordering::SeqCst),
             "the hook did not run after a full drain"

@@ -104,15 +104,19 @@ fn http_request(socket: &Path, request: &str) -> Option<String> {
 /// stream, and the attempt is repeated. Otherwise the request was accepted and
 /// the first 503 to a probe proves the worker is still on it.
 fn hold_open(socket: &Path, svc: &mut Service) -> UnixStream {
+    hold_open_asking(socket, svc, "close")
+}
+
+/// `hold_open` with the request's `Connection` header set to `connection`.
+fn hold_open_asking(socket: &Path, svc: &mut Service, connection: &str) -> UnixStream {
+    let head = format!(
+        "POST /blog HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\nConnection: {connection}\r\n\r\n0123456789"
+    );
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let mut held = UnixStream::connect(socket).expect("connect the held request");
         held.set_read_timeout(Some(Duration::from_secs(10))).ok();
-        let sent = held
-            .write_all(
-                b"POST /blog HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\nConnection: close\r\n\r\n0123456789",
-            )
-            .is_ok();
+        let sent = held.write_all(head.as_bytes()).is_ok();
 
         let mut refused = !sent;
         while !refused {
@@ -248,7 +252,9 @@ fn one_sigint_exits_zero_and_removes_the_socket() {
 #[test]
 fn a_request_in_flight_at_sigterm_receives_its_full_response() {
     let (mut server, socket_path) = spawn("term-inflight");
-    let mut held = hold_open(&socket_path, &mut server.svc);
+    // It asks for keep-alive, so the `Connection: close` checked below is the
+    // service's own decision once shutdown has started.
+    let mut held = hold_open_asking(&socket_path, &mut server.svc, "keep-alive");
 
     server.svc.signal(libc::SIGTERM);
     wait_for_output(
@@ -285,6 +291,13 @@ fn a_request_in_flight_at_sigterm_receives_its_full_response() {
         "the response was cut short; expected post-index content, got: {}",
         &text[..text.len().min(300)]
     );
+    // A request served after shutdown started closes its connection, so the
+    // client does not send another on a connection that is about to go.
+    assert!(
+        text.to_ascii_lowercase().contains("connection: close"),
+        "the response drained at shutdown kept its connection alive: {}",
+        &text[..text.len().min(300)]
+    );
 
     let status = server
         .svc
@@ -307,58 +320,36 @@ fn a_request_in_flight_at_sigterm_receives_its_full_response() {
     );
 }
 
-/// Once shutdown starts, a keep-alive connection is answered and closed. The
-/// wrong outcome: a client holding a keep-alive connection open keeps the
-/// drain waiting until the connection idles out, so a stop behind a reverse
-/// proxy that pools connections takes the whole drain deadline.
+/// An idle keep-alive connection is closed when shutdown starts, so it cannot
+/// hold the drain. The wrong outcome: a client (a reverse proxy's connection
+/// pool, typically) keeps a connection open between requests, its worker
+/// counts as busy until the read times out, and every graceful stop waits the
+/// whole drain deadline.
 #[test]
-fn a_keep_alive_connection_is_closed_once_shutdown_starts() {
+fn an_idle_keep_alive_connection_does_not_hold_the_drain() {
     let (mut server, socket_path) = spawn("term-keepalive");
     let mut conn = UnixStream::connect(&socket_path).expect("connect");
-    conn.set_read_timeout(Some(Duration::from_secs(10))).ok();
-    let get = b"GET /blog HTTP/1.1\r\nHost: localhost\r\n\r\n";
-
-    conn.write_all(get).expect("send the first request");
-    let first =
-        String::from_utf8_lossy(&read_one(&mut conn, "GET").expect("read the first response"))
-            .to_ascii_lowercase();
+    conn.set_read_timeout(Some(Duration::from_secs(30))).ok();
+    conn.write_all(b"GET /blog HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .expect("send a request");
+    let first = String::from_utf8_lossy(&read_one(&mut conn, "GET").expect("read the response"))
+        .to_ascii_lowercase();
     assert!(
         !first.contains("connection: close"),
-        "the first response already closed the connection, so this test proves nothing: {}",
+        "the response closed the connection, so nothing is left idle to test: {}",
         &first[..first.len().min(300)]
     );
 
+    // The connection now sits idle between requests. Its read timeout is far
+    // longer than the wait below, so only closing it at shutdown lets the
+    // process exit in time.
     server.svc.signal(libc::SIGTERM);
-    wait_for_output(
-        &server.svc,
-        "shutdown signal received",
-        Duration::from_secs(5),
-    );
-
-    conn.write_all(get)
-        .expect("send a request on the kept-alive connection");
-    let second =
-        String::from_utf8_lossy(&read_one(&mut conn, "GET").expect("read the second response"))
-            .to_ascii_lowercase();
-    assert!(
-        second.contains("200 ok"),
-        "the request after shutdown began was not answered: {}",
-        &second[..second.len().min(300)]
-    );
-    assert!(
-        second.contains("connection: close"),
-        "a response after shutdown began kept the connection alive: {}",
-        &second[..second.len().min(300)]
-    );
-
-    // Well inside the default 30 s read timeout: the drain did not wait for
-    // the connection to idle out.
     let status = server
         .svc
         .wait_for_exit(Instant::now() + Duration::from_secs(5))
         .unwrap_or_else(|| {
             panic!(
-                "m6-html did not exit promptly after closing the connection\n--- output ---\n{}",
+                "an idle keep-alive connection held the drain\n--- output ---\n{}",
                 server.svc.output()
             )
         });
@@ -366,6 +357,12 @@ fn a_keep_alive_connection_is_closed_once_shutdown_starts() {
         status.success(),
         "exit {status}\n--- output ---\n{}",
         server.svc.output()
+    );
+    let mut rest = Vec::new();
+    conn.read_to_end(&mut rest).ok();
+    assert!(
+        rest.is_empty(),
+        "the idle connection received data after shutdown"
     );
 }
 
