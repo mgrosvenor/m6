@@ -345,28 +345,19 @@ fn handle_refresh_json(req: &RawRequest, state: &AppState, db: &Db) -> RawRespon
 }
 
 fn do_refresh(state: &AppState, db: &Db, token: &str) -> anyhow::Result<(String, String)> {
-    // Decode and verify signature + expiry — read-lock keys for decode
-    let claims = {
-        let keys = state
-            .keys
-            .read()
-            .map_err(|_| anyhow::anyhow!("keys lock poisoned"))?;
-        keys.jwt.decode_refresh(token)?.claims
-    };
-
-    // Verify hash in database
+    // A refresh token is an opaque secret, verified by its stored hash alone.
+    // The hash row carries revocation (a revoked token has no row) and expiry
+    // (`expires_at`). A JWT signature check against the current key would reject
+    // every token minted before a rotation, because only the current key is held.
+    // See `keys.rs` for the rotation semantics.
     let token_hash = hash_token(token);
-    let stored_user_id = db
+    let user_id = db
         .refresh_token_verify(&token_hash)?
         .ok_or_else(|| anyhow::anyhow!("token not found or expired"))?;
 
-    if stored_user_id != claims.sub {
-        return Err(anyhow::anyhow!("user_id mismatch"));
-    }
-
     // Load user to get fresh groups/roles
     let user = db
-        .user_get_by_id(&claims.sub)?
+        .user_get_by_id(&user_id)?
         .ok_or_else(|| anyhow::anyhow!("user not found"))?;
 
     let now = now_secs();
