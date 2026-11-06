@@ -18,7 +18,7 @@ m6-html is the degenerate case — the trivial renderer with no user state and a
 
 ## Lifecycle
 
-Four functions — two for global state, two for per-thread state. All optional except `init_global` when using state.
+Three functions — one for global state, two for per-thread state. All optional except `init_global` when using state.
 
 **`init_global(config)`** — called once at startup and on every reload. Receives the merged config dictionary. Returns global state shared across all threads. Initialise things designed for concurrent access: SMTP transports, HTTP clients, connection pools, read-only data.
 
@@ -26,9 +26,7 @@ Four functions — two for global state, two for per-thread state. All optional 
 
 **`handle(req, &Global, &mut ThreadLocal)`** — called per request on whichever thread picks it up. `&mut ThreadLocal` gives exclusive mutable access with no locking — the thread owns it entirely.
 
-**`destroy_thread(ThreadLocal)`** — called on each thread before it exits (shutdown or reload). Takes ownership. Finalise prepared statements, flush write buffers, checkpoint WAL.
-
-**`destroy_global(Global)`** — called after all threads have finished their `destroy_thread`. Takes ownership. Disconnect pools, flush shared caches.
+**`destroy_thread(ThreadLocal)`** — called on each thread before it exits on a reload. Shutdown does not wait for it. Takes ownership. Finalise prepared statements, flush write buffers, checkpoint WAL.
 
 ### Full lifecycle sequence
 
@@ -44,7 +42,6 @@ reload:
   stop accepting requests
   in-flight requests finish
   destroy_thread(local) × N
-  destroy_global(global)
   config reloaded
   init_global(new_config)                → new Global
   init_thread(new_config, &Global) × N   → new ThreadLocals
@@ -52,13 +49,11 @@ reload:
 
 shutdown (SIGTERM):
   stop accepting requests
-  in-flight requests finish
-  destroy_thread(local) × N
-  destroy_global(global)
-  exit 0
+  remove the socket
+  exit 0                                 (requests in progress are not waited for)
 ```
 
-`destroy_thread` and `destroy_global` are optional — register via builder, fall back to `Drop` if absent. `init_thread` is optional — threads get `()` as local state if not registered. `init_global` is required when calling `App::with_state`.
+`destroy_thread` is optional — register via builder, fall back to `Drop` if absent. `init_thread` is optional — threads get `()` as local state if not registered. `init_global` is required when calling `App::with_state`.
 
 ### Reload trigger
 
@@ -201,7 +196,7 @@ fn main() -> Result<()> {
 }
 ```
 
-`on_destroy_thread` and `on_destroy` are optional — `Drop` handles cleanup for resources that don't need explicit teardown.
+`on_destroy_thread` is optional — `Drop` handles cleanup for resources that don't need explicit teardown.
 
 The `config` dictionary passed to `init_global` and `init_thread` is the same merged config + secrets dictionary available in every request. The framework makes no distinction between config keys consumed by init and those used by handlers.
 
@@ -392,7 +387,6 @@ App::new()
 
 // Global state only — handlers receive &Request and &Global
 App::with_global(init_global)
-    .on_destroy(destroy_global)
     .route_post("/path", handler)
     .run()
 
@@ -406,7 +400,6 @@ App::with_thread_state(init_thread)
 // Global + per-thread state — handlers receive &Request, &Global, &mut ThreadLocal
 App::with_state(init_global, init_thread)
     .on_destroy_thread(destroy_thread)
-    .on_destroy(destroy_global)
     .route_post("/path", handler)
     .run()
 ```
@@ -616,9 +609,10 @@ User code logs via `tracing::info!`, `tracing::warn!` etc. — captured by the s
 
 | Signal | First receipt | Second receipt |
 |---|---|---|
-| `SIGTERM` or `SIGINT` | Drain queue, finish in-flight requests, `destroy_thread` × N then `destroy_global`, exit 0 | Immediate exit |
+| `SIGTERM` or `SIGINT` | Stop accepting, remove the socket, exit 0 | Immediate exit |
 
-On first signal, the framework stops accepting new connections, waits for in-flight requests to complete, calls `destroy_thread` on each thread then `destroy_global`, then exits 0.
+On first signal, the framework stops accepting new connections, removes the socket and exits 0.
+It does not wait for requests in progress and does not call `destroy_thread`, so a service must not depend on teardown to save state.
 
 ---
 

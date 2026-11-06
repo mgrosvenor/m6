@@ -532,8 +532,9 @@ A content file that could redefine the request path could make a page lie about 
 
 ### 7.3 Why startup and shutdown belong to core
 
-**A service that drops work on SIGTERM turns every deploy into a handful of failed requests.**
-So the first signal drains and exits 0, the second exits immediately, and the sequence is core's.
+**A service stops on SIGTERM by refusing new connections, removing its socket and exiting.**
+It does not wait for requests in progress: the supervisor restarts it on a deploy, and a request cut off by a restart is acceptable.
+So the first signal exits 0, the second exits immediately, and the sequence is core's.
 What a service supplies is data: the name in its lifecycle lines, the socket to unlink on every exit path, and a descriptor to wake a parked loop.
 
 **One sequence exists because several diverged.**
@@ -542,8 +543,8 @@ Core owning the lifecycle lines is what makes searching a journal for a shutdown
 
 **Blocking signals is the first statement of `main`, and this is the one ordering rule in m6 that cannot be relaxed.**
 A thread inherits the signal mask as it stands when the thread is created, and a service's logging writer is a thread.
-A writer started before the mask is set has SIGTERM unblocked, the kernel delivers a process-directed signal there, and the default disposition kills the process instead of draining it.
-A supervisor counts death by the signal it sent as a clean stop, so the only symptoms are a missing log line, requests cut rather than drained, and a socket file left behind for the edge to keep in a pool.
+A writer started before the mask is set has SIGTERM unblocked, the kernel delivers a process-directed signal there, and the default disposition kills the process instead of shutting it down.
+A supervisor counts death by the signal it sent as a clean stop, so the only symptoms are a missing log line, the exit status wrong, and a socket file left behind for the edge to keep in a pool.
 The install asserts the mask is already set and refuses to start otherwise, because nothing else about that failure is visible.
 
 ---

@@ -29,7 +29,7 @@
 //! | `FrameworkState::build` | everything that can be computed per RELOAD rather than per request |
 //! | `FrameworkState::build_dict` | the per-request dictionary, described below |
 //! | `ThreadPool` | fixed workers over a bounded queue |
-//! | `install_shutdown`, `is_shutdown` | draining rather than dropping in-flight work |
+//! | `install_shutdown`, `is_shutdown` | a signal sets the flag the accept loop exits on |
 //!
 //! ## Specificity, not declaration order
 //!
@@ -98,22 +98,18 @@
 //! per process, which is not enforced at runtime because a binary has one `main`
 //! calling one `run()`.
 //!
-//! ## Shutdown drains
+//! ## Shutdown
 //!
-//! `install_shutdown` makes a signal set a flag that `is_shutdown` reports and
-//! the pool's `drain` waits on, rather than the process exiting under whatever
-//! requests happen to be in flight. A service that drops work on SIGTERM turns
-//! every deploy into a handful of failed requests.
+//! `install_shutdown` makes a signal set a flag that `is_shutdown` reports. The
+//! accept loop sees it, stops accepting and returns, the socket file is
+//! removed and the process exits 0. Requests in progress are not waited for.
 
 use std::any::Any;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc, Mutex, OnceLock,
-};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::Context;
 use serde_json::{Map, Value};
@@ -1130,7 +1126,6 @@ fn run_app_global<G: Send + Sync + 'static>(
     raw_routes: Vec<GlobalRawRoute<G>>,
     raw_named: Vec<GlobalRawNamed<G>>,
     init_global: InitGlobal<G>,
-    destroy_global: Destroy<G>,
     on_reload: OnReload<G>,
     renderer: Arc<dyn RendererFactory>,
 ) -> Result<()> {
@@ -1193,20 +1188,6 @@ fn run_app_global<G: Send + Sync + 'static>(
         })
         .collect();
 
-    // Build a type-erased on_shutdown callback that calls destroy_global.
-    let arc_g_destroy = arc_g.clone();
-    let on_shutdown: Option<Box<dyn FnOnce() + Send>> = destroy_global.map(|dg| {
-        // We need to unwrap the Arc<G>. Use Arc::try_unwrap; if other Arcs exist,
-        // fall back to a no-op (shouldn't happen at shutdown — all requests done).
-        let ag = arc_g_destroy;
-        let b: Box<dyn FnOnce() + Send> = Box::new(move || {
-            if let Ok(g) = Arc::try_unwrap(ag) {
-                dg(g);
-            }
-        });
-        b
-    });
-
     let reload_hook = bind_reload_hook(on_reload, &arc_g);
 
     run_app_with_shutdown(
@@ -1217,7 +1198,6 @@ fn run_app_global<G: Send + Sync + 'static>(
         config_path,
         site_dir,
         RunHooks {
-            on_shutdown,
             on_thread_exit: None,
             on_reload: reload_hook,
         },
@@ -1229,15 +1209,13 @@ fn run_app_global<G: Send + Sync + 'static>(
 /// The three optional hooks of a service with global and per-thread state.
 struct StateHooks<G, T> {
     destroy_thread: Destroy<T>,
-    destroy_global: Destroy<G>,
     on_reload: OnReload<G>,
 }
 
-/// What a runner hands the run loop to call at the three points a service can
-/// hook: after a reload, at shutdown, and as each worker thread ends.
+/// What a runner hands the run loop to call at the two points a service can
+/// hook: after a reload, and as each worker thread ends.
 #[derive(Default)]
 struct RunHooks {
-    on_shutdown: Option<Box<dyn FnOnce() + Send>>,
     on_thread_exit: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
     on_reload: Option<ReloadHook>,
 }
@@ -1354,7 +1332,6 @@ fn run_app_state<G: Send + Sync + 'static, T: Any + Send + 'static>(
 ) -> Result<()> {
     let StateHooks {
         destroy_thread,
-        destroy_global,
         on_reload,
     } = hooks;
     // Before anything else, and before `init_global` below, which is allowed
@@ -1437,17 +1414,6 @@ fn run_app_state<G: Send + Sync + 'static, T: Any + Send + 'static>(
         })
         .collect();
 
-    let arc_g_destroy = arc_g.clone();
-    let on_shutdown: Option<Box<dyn FnOnce() + Send>> = destroy_global.map(|dg| {
-        let ag = arc_g_destroy;
-        let b: Box<dyn FnOnce() + Send> = Box::new(move || {
-            if let Ok(g) = Arc::try_unwrap(ag) {
-                dg(g);
-            }
-        });
-        b
-    });
-
     let on_thread_exit: Arc<dyn Fn() + Send + Sync> = Arc::new(drain_thread_state);
 
     run_app_with_shutdown(
@@ -1458,7 +1424,6 @@ fn run_app_state<G: Send + Sync + 'static, T: Any + Send + 'static>(
         config_path,
         site_dir,
         RunHooks {
-            on_shutdown,
             on_thread_exit: Some(on_thread_exit),
             on_reload: bind_reload_hook(on_reload, &arc_g),
         },
@@ -1475,43 +1440,6 @@ type WorkItem = Box<dyn FnOnce() + Send + 'static>;
 
 pub struct ThreadPool {
     queue: std::sync::mpsc::SyncSender<WorkItem>,
-    in_flight: Arc<InFlight>,
-}
-
-/// Work accepted by the pool and not yet finished.
-///
-/// The count is an atomic so the accept path pays one add. The mutex and
-/// condvar are touched only when it reaches zero, to wake a `drain` that is
-/// waiting, so a drain returns the moment the last request ends and the request
-/// path takes no lock.
-struct InFlight {
-    count: AtomicUsize,
-    idle: Mutex<()>,
-    idle_cv: std::sync::Condvar,
-}
-
-impl InFlight {
-    fn begin(&self) {
-        self.count.fetch_add(1, Ordering::SeqCst);
-    }
-
-    fn end(&self) {
-        if self.count.fetch_sub(1, Ordering::SeqCst) == 1 {
-            // Taking the lock orders this wake after a drain that has read a
-            // non-zero count and is about to wait, so the wake is never lost.
-            let _held = self.idle.lock().unwrap_or_else(|e| e.into_inner());
-            self.idle_cv.notify_all();
-        }
-    }
-}
-
-/// Lowers the count when dropped, so work that panics still stops counting.
-struct Finish<'a>(&'a InFlight);
-
-impl Drop for Finish<'_> {
-    fn drop(&mut self) {
-        self.0.end();
-    }
 }
 
 impl ThreadPool {
@@ -1528,24 +1456,15 @@ impl ThreadPool {
     ) -> Self {
         let (tx, rx) = std::sync::mpsc::sync_channel::<WorkItem>(queue_size);
         let rx = Arc::new(Mutex::new(rx));
-        let in_flight = Arc::new(InFlight {
-            count: AtomicUsize::new(0),
-            idle: Mutex::new(()),
-            idle_cv: std::sync::Condvar::new(),
-        });
 
         for _ in 0..size {
             let rx = rx.clone();
-            let in_flight2 = in_flight.clone();
             let on_exit = on_thread_exit.clone();
             std::thread::spawn(move || {
                 loop {
                     let work = rx.lock().unwrap().recv();
                     match work {
-                        Ok(f) => {
-                            let _finish = Finish(&in_flight2);
-                            f();
-                        }
+                        Ok(f) => f(),
                         Err(_) => break,
                     }
                 }
@@ -1556,29 +1475,12 @@ impl ThreadPool {
             });
         }
 
-        Self {
-            queue: tx,
-            in_flight,
-        }
+        Self { queue: tx }
     }
 
     /// Submit work. Returns false if the queue is full (→ 503).
     pub fn submit(&self, f: WorkItem) -> bool {
-        self.enqueue(f)
-    }
-
-    /// Hand `work` to the queue, counting it in flight from the moment it is
-    /// accepted, not from the moment a worker wakes: `drain` must wait for a
-    /// request that is queued, or handed to a worker that has not yet run, as
-    /// well as for one being served. The count rises before the send so a
-    /// worker cannot finish and lower it first.
-    fn enqueue(&self, work: WorkItem) -> bool {
-        self.in_flight.begin();
-        let accepted = self.queue.try_send(work).is_ok();
-        if !accepted {
-            self.in_flight.end();
-        }
-        accepted
+        self.queue.try_send(f).is_ok()
     }
 
     /// Try to submit work that takes ownership of a resource.
@@ -1597,33 +1499,13 @@ impl ThreadPool {
             let r = rc.lock().unwrap().take().unwrap();
             f(r);
         });
-        if self.enqueue(work) {
+        if self.submit(work) {
             Ok(true)
         } else {
             // Queue full — recover resource.
             let r = resource_cell.lock().unwrap().take().unwrap();
             Err(r)
         }
-    }
-
-    /// Wait up to `timeout` for all accepted work to finish. Returns how many
-    /// requests were still unfinished when it gave up, 0 on a clean drain.
-    pub fn drain(&self, timeout: std::time::Duration) -> usize {
-        let held = self
-            .in_flight
-            .idle
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let _ = self
-            .in_flight
-            .idle_cv
-            .wait_timeout_while(held, timeout, |_| self.in_flight() > 0)
-            .unwrap_or_else(|e| e.into_inner());
-        self.in_flight()
-    }
-
-    pub fn in_flight(&self) -> usize {
-        self.in_flight.count.load(Ordering::SeqCst)
     }
 }
 
@@ -1662,35 +1544,6 @@ fn install_shutdown(socket_path: &std::path::Path) -> crate::signal::ShutdownHan
         // available to report.
         .unwrap_or_else(|| "m6-app".to_string());
     crate::signal::ShutdownHandle::install(crate::signal::Service::new(name).socket(socket_path))
-}
-
-/// Close idle kept-alive connections, wait for the requests being served, up
-/// to `timeout`, then run the shutdown hook. Returns whether the drain finished.
-///
-/// The hook tears down the global state handlers use (a database pool, for
-/// example), so it runs only when every request has finished. After the
-/// deadline it is neither run nor dropped: dropping it would run the
-/// destructors of what it captured under a handler still using them.
-fn drain_and_shut_down(
-    pool: &ThreadPool,
-    timeout: std::time::Duration,
-    on_shutdown: &mut Option<Box<dyn FnOnce() + Send>>,
-) -> bool {
-    info!("Shutdown signal received, draining...");
-    let unfinished = pool.drain(timeout);
-    if unfinished > 0 {
-        warn!(
-            unfinished,
-            timeout_s = timeout.as_secs(),
-            "drain deadline passed with requests still in flight, shutting down without on_shutdown"
-        );
-        std::mem::forget(on_shutdown.take());
-        return false;
-    }
-    if let Some(f) = on_shutdown.take() {
-        f();
-    }
-    true
 }
 
 #[inline]
@@ -1971,17 +1824,11 @@ pub struct AppWithGlobal<G: Send + Sync + 'static> {
     raw_routes: Vec<GlobalRawRoute<G>>,
     raw_named: Vec<GlobalRawNamed<G>>,
     init_global: InitGlobal<G>,
-    destroy_global: Destroy<G>,
     on_reload: OnReload<G>,
     renderer: Arc<dyn RendererFactory>,
 }
 
 impl<G: Send + Sync + 'static> AppWithGlobal<G> {
-    pub fn on_destroy(mut self, f: impl Fn(G) + Send + Sync + 'static) -> Self {
-        self.destroy_global = Some(Arc::new(f));
-        self
-    }
-
     /// Re-read state that `init_global` built from the config.
     ///
     /// Called on every reload that has built and checked its new state, with
@@ -2087,7 +1934,6 @@ impl<G: Send + Sync + 'static> AppWithGlobal<G> {
             self.raw_routes,
             self.raw_named,
             self.init_global,
-            self.destroy_global,
             self.on_reload,
             self.renderer,
         )
@@ -2108,7 +1954,6 @@ impl App {
             raw_routes: vec![],
             raw_named: vec![],
             init_global: Arc::new(init_global),
-            destroy_global: None,
             on_reload: None,
             renderer: default_renderer(),
         }
@@ -2136,7 +1981,6 @@ impl App {
             init_global: Arc::new(init_global),
             init_thread: Arc::new(init_thread),
             destroy_thread: None,
-            destroy_global: None,
             on_reload: None,
             renderer: default_renderer(),
         }
@@ -2289,7 +2133,6 @@ pub struct AppWithState<G: Send + Sync + 'static, T: Any + Send + 'static> {
     init_global: InitGlobal<G>,
     init_thread: InitThread<G, T>,
     destroy_thread: Destroy<T>,
-    destroy_global: Destroy<G>,
     on_reload: OnReload<G>,
     renderer: Arc<dyn RendererFactory>,
 }
@@ -2297,11 +2140,6 @@ pub struct AppWithState<G: Send + Sync + 'static, T: Any + Send + 'static> {
 impl<G: Send + Sync + 'static, T: Any + Send + 'static> AppWithState<G, T> {
     pub fn on_destroy_thread(mut self, f: impl Fn(T) + Send + Sync + 'static) -> Self {
         self.destroy_thread = Some(Arc::new(f));
-        self
-    }
-
-    pub fn on_destroy(mut self, f: impl Fn(G) + Send + Sync + 'static) -> Self {
-        self.destroy_global = Some(Arc::new(f));
         self
     }
 
@@ -2400,7 +2238,6 @@ impl<G: Send + Sync + 'static, T: Any + Send + 'static> AppWithState<G, T> {
             self.init_thread,
             StateHooks {
                 destroy_thread: self.destroy_thread,
-                destroy_global: self.destroy_global,
                 on_reload: self.on_reload,
             },
         )
@@ -2623,12 +2460,11 @@ fn dump_config(
         config.thread_pool.size, config.thread_pool.queue_size
     );
     println!(
-        "server      read_timeout={} drain_timeout={}s socket_mode={:04o}",
+        "server      read_timeout={} socket_mode={:04o}",
         config
             .server
             .read_timeout
             .map_or("none".into(), |d| format!("{}s", d.as_secs())),
-        config.server.drain_timeout.as_secs(),
         config.server.socket_mode
     );
     for p in &config.global_params {
@@ -2795,7 +2631,6 @@ fn run_app_with_shutdown(
     renderer: Arc<dyn RendererFactory>,
 ) -> Result<()> {
     let RunHooks {
-        on_shutdown,
         on_thread_exit,
         on_reload,
     } = hooks;
@@ -2891,7 +2726,6 @@ fn run_app_with_shutdown(
     // reason: it is applied to a socket at accept time, so a reload cannot
     // retune it without reopening connections that are already being served.
     let read_timeout = framework_state.config.server.read_timeout;
-    let drain_timeout = framework_state.config.server.drain_timeout;
     let socket_mode = framework_state.config.server.socket_mode;
 
     // Wrap state in RwLock so hot reload can atomically swap it while
@@ -2908,9 +2742,6 @@ fn run_app_with_shutdown(
             .map(|(p, m, h)| (format!("{}:{}", p, route_method_key(&m)), h))
             .collect(),
     );
-
-    // Wrap on_shutdown for call at most once (accept loop is single-threaded).
-    let mut on_shutdown_cell = on_shutdown;
 
     // Bind socket.
     if socket_path.exists() {
@@ -3065,9 +2896,6 @@ fn run_app_with_shutdown(
 
         // Neither fd fired: a timeout, or a signal interrupted the wait.
         if ready.idle && is_shutdown() {
-            if drain_and_shut_down(&pool, drain_timeout, &mut on_shutdown_cell) {
-                info!("Clean shutdown");
-            }
             break;
         }
 
@@ -3128,8 +2956,7 @@ fn run_app_with_shutdown(
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-            // During shutdown an accept error is expected and the block below
-            // drains; leaving the loop here would skip the drain.
+            // During shutdown an accept error is expected.
             Err(e) => {
                 if !is_shutdown() {
                     error!("Accept error: {e}");
@@ -3138,9 +2965,6 @@ fn run_app_with_shutdown(
         }
 
         if is_shutdown() {
-            if drain_and_shut_down(&pool, drain_timeout, &mut on_shutdown_cell) {
-                info!("Clean shutdown");
-            }
             break;
         }
     }
@@ -3790,143 +3614,6 @@ mod tests {
         assert_eq!(r.len(), n);
     }
 
-    /// A request the pool has accepted is in flight at once, whether it is
-    /// running or still queued. The wrong outcome: the count rises only when a
-    /// worker wakes, so a shutdown that drains right after the accept sees
-    /// nothing in flight and exits under the request.
-    #[test]
-    fn accepted_work_is_in_flight_before_a_worker_runs_it() {
-        let pool = ThreadPool::new(1, 2);
-        let (release, held) = std::sync::mpsc::channel::<()>();
-        assert!(pool.submit(Box::new(move || {
-            held.recv().ok();
-        })));
-        assert!(pool.submit(Box::new(|| {})));
-        assert_eq!(pool.in_flight(), 2);
-
-        release.send(()).unwrap();
-        assert_eq!(pool.drain(DRAIN_LONG), 0);
-        assert_eq!(pool.in_flight(), 0);
-    }
-
-    /// Long enough that a test only ever returns from `drain` by being woken, never by the deadline.
-    const DRAIN_LONG: std::time::Duration = std::time::Duration::from_secs(86_400);
-
-    /// `drain` returns when the last request ends, not on a poll interval or
-    /// at its deadline. The wrong outcome: a deploy waits out the deadline (or
-    /// a polling tick) after the work is done. With a one-day deadline,
-    /// returning at all means it was woken by the last item finishing.
-    #[test]
-    fn drain_returns_when_the_last_request_finishes() {
-        // Room in the queue, so the submit succeeds whether or not the worker
-        // has yet reached its first wait for work.
-        let pool = ThreadPool::new(1, 1);
-        let (release, held) = std::sync::mpsc::channel::<()>();
-        let (started, running) = std::sync::mpsc::channel::<()>();
-        assert!(pool.submit(Box::new(move || {
-            started.send(()).unwrap();
-            held.recv().ok();
-        })));
-        running.recv().unwrap();
-
-        std::thread::scope(|s| {
-            let drained = s.spawn(|| pool.drain(DRAIN_LONG));
-            release.send(()).unwrap();
-            assert_eq!(drained.join().unwrap(), 0);
-        });
-    }
-
-    /// A request that never finishes cannot hold shutdown past the deadline.
-    /// The wrong outcome: `drain` waits forever and the supervisor kills the
-    /// service mid-response. It reports how many it left behind.
-    #[test]
-    fn drain_gives_up_at_its_deadline_and_counts_what_is_left() {
-        let pool = ThreadPool::new(1, 2);
-        let (release, held) = std::sync::mpsc::channel::<()>();
-        assert!(pool.submit(Box::new(move || {
-            held.recv().ok();
-        })));
-        assert!(pool.submit(Box::new(|| {})));
-
-        assert_eq!(pool.drain(std::time::Duration::from_millis(20)), 2);
-        release.send(()).unwrap();
-        assert_eq!(pool.drain(DRAIN_LONG), 0);
-    }
-
-    /// Work that panics stops counting, so it cannot hold a drain open.
-    #[test]
-    fn work_that_panics_is_no_longer_in_flight() {
-        let pool = ThreadPool::new(1, 1);
-        assert!(pool.submit(Box::new(|| panic!("handler failed"))));
-        assert_eq!(pool.drain(DRAIN_LONG), 0);
-    }
-
-    /// The shutdown hook tears down state handlers use, so it runs only after
-    /// every request has finished, and after a drain that timed out it is
-    /// neither run nor dropped (dropping it would run its captures'
-    /// destructors). The wrong outcome: the drain deadline passes with a
-    /// handler still running and the hook, or the drop of what it holds, pulls
-    /// a database pool or similar out from under it.
-    #[test]
-    fn the_shutdown_hook_runs_only_when_the_drain_finishes() {
-        use std::sync::atomic::AtomicBool;
-        struct SetOnDrop(Arc<AtomicBool>);
-        impl Drop for SetOnDrop {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::SeqCst);
-            }
-        }
-        let hook = |ran: &Arc<AtomicBool>,
-                    dropped: &Arc<AtomicBool>|
-         -> Option<Box<dyn FnOnce() + Send>> {
-            let ran = ran.clone();
-            let held = SetOnDrop(dropped.clone());
-            Some(Box::new(move || {
-                let _held = &held;
-                ran.store(true, Ordering::SeqCst);
-            }))
-        };
-
-        // A request still running at the deadline: no hook, no drop.
-        let (ran, dropped) = (
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
-        );
-        let pool = ThreadPool::new(1, 1);
-        let (release, held) = std::sync::mpsc::channel::<()>();
-        assert!(pool.submit(Box::new(move || {
-            held.recv().ok();
-        })));
-        let mut on_shutdown = hook(&ran, &dropped);
-        assert!(!drain_and_shut_down(
-            &pool,
-            std::time::Duration::from_millis(20),
-            &mut on_shutdown
-        ));
-        assert!(
-            !ran.load(Ordering::SeqCst),
-            "the hook ran while a request was still in flight"
-        );
-        assert!(
-            !dropped.load(Ordering::SeqCst),
-            "the hook's captures were dropped while a request was still in flight"
-        );
-        release.send(()).unwrap();
-
-        // Every request finished: the hook runs.
-        let (ran, dropped) = (
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
-        );
-        let pool = ThreadPool::new(1, 1);
-        let mut on_shutdown = hook(&ran, &dropped);
-        assert!(drain_and_shut_down(&pool, DRAIN_LONG, &mut on_shutdown));
-        assert!(
-            ran.load(Ordering::SeqCst),
-            "the hook did not run after a full drain"
-        );
-    }
-
     #[test]
     fn test_thread_pool_queue_full_returns_false() {
         let pool = ThreadPool::new(1, 1);
@@ -4091,12 +3778,10 @@ mod tests {
     #[test]
     fn test_app_with_global_builds() {
         // Just verify it compiles and builds without panicking.
-        let _app: AppWithGlobal<u32> = App::with_global(|_ctx| Ok(42u32))
-            .route("/", |_req, g| {
-                assert_eq!(*g, 42);
-                Ok(Response::text("ok"))
-            })
-            .on_destroy(|v| assert_eq!(v, 42));
+        let _app: AppWithGlobal<u32> = App::with_global(|_ctx| Ok(42u32)).route("/", |_req, g| {
+            assert_eq!(*g, 42);
+            Ok(Response::text("ok"))
+        });
         // We don't call .run() — that would need CLI args and a socket.
     }
 
@@ -4135,9 +3820,6 @@ mod tests {
         })
         .on_destroy_thread(|l| {
             let _ = l;
-        })
-        .on_destroy(|g| {
-            let _ = g;
         });
     }
 

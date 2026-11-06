@@ -237,7 +237,7 @@ If the touch arrives first, the pair fails its check, the running certificate st
 
 | Signal | First receipt | Second receipt |
 |---|---|---|
-| `SIGTERM` or `SIGINT` | Stop accepting, drain in-flight, exit 0 | Immediate exit |
+| `SIGTERM` or `SIGINT` | Stop accepting, remove the socket if there is one, exit 0, without waiting for requests in progress | Immediate exit |
 | `SIGUSR1` | Reopen the analytics log file | Same again, and never a step toward exit |
 
 Rotate the analytics file by renaming it and sending `SIGUSR1`.
