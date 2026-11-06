@@ -13,9 +13,10 @@
 //! **What this file asserts is the CURRENT state, including where the two
 //! disagree.** That is deliberate, and it is the same shape as
 //! `m6_core::path`'s reconciliation test: pinning a known divergence means any
-//! change to either matcher shows up here rather than in production. The
-//! divergences are tracked as issue #177, and when core adopts `matchit` the
-//! three pinned cases below become agreements and this file says so instead.
+//! change to either matcher shows up here rather than in production. One
+//! divergence is pinned below, the path normalisation of issue #177. The
+//! parameter-beside-catch-all case is now an agreement: both matchers refuse
+//! the pair, asserted below.
 
 use std::sync::Arc;
 

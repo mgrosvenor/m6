@@ -301,7 +301,6 @@ impl Methods {
             .iter()
             .find(|(_, bit)| both & bit != 0)
             .map(|(name, _)| *name)
-            .or((both != 0).then_some("OPTIONS"))
     }
 
     /// Key that tells apart the handlers registered in code on one path.
