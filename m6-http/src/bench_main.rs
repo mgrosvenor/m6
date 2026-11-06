@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use m6_http_lib::probe;
 use rand::Rng;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::ClientConfig;
@@ -253,12 +254,15 @@ fn parse_http11_status(resp: &[u8]) -> u16 {
 
 // ── Percentile helper ─────────────────────────────────────────────────────────
 
-fn percentile(mut v: Vec<f64>, pct: f64) -> f64 {
+fn percentile(mut v: Vec<f64>, pct: usize) -> f64 {
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
     if v.is_empty() {
         return 0.0;
     }
-    let idx = ((pct / 100.0) * (v.len() as f64 - 1.0)).round() as usize;
+    // Same rule as stats.rs: index (n-1)*pct/100 with integer arithmetic,
+    // truncating. Rounding the same fraction shifts p50 of ten samples from
+    // index 4 to 5, so the bench would disagree with the server's own /perf.
+    let idx = (v.len() - 1) * pct / 100;
     v[idx.min(v.len() - 1)]
 }
 
@@ -1073,21 +1077,7 @@ fn bench_h2c_throughput(addr: &str, duration_s: u64, concurrency: usize) -> anyh
 // ── HTTP/3 helpers ────────────────────────────────────────────────────────────
 
 fn make_quiche_client_config(skip_verify: bool) -> quiche::Config {
-    let mut cfg = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
-    cfg.verify_peer(!skip_verify);
-    cfg.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
-        .unwrap();
-    cfg.set_max_idle_timeout(5000);
-    cfg.set_max_recv_udp_payload_size(1350);
-    cfg.set_max_send_udp_payload_size(1350);
-    cfg.set_initial_max_data(10_000_000);
-    cfg.set_initial_max_stream_data_bidi_local(1_000_000);
-    cfg.set_initial_max_stream_data_bidi_remote(1_000_000);
-    cfg.set_initial_max_stream_data_uni(1_000_000);
-    cfg.set_initial_max_streams_bidi(100);
-    cfg.set_initial_max_streams_uni(100);
-    cfg.set_disable_active_migration(true);
-    cfg
+    probe::bench_quic_client_config(skip_verify).expect("building the QUIC client config")
 }
 
 fn new_scid() -> quiche::ConnectionId<'static> {
@@ -1474,13 +1464,13 @@ struct BenchResult {
 impl BenchResult {
     fn from_latencies(name: impl Into<String>, lats: Vec<f64>) -> Self {
         let count = lats.len();
-        let p0 = percentile(lats.clone(), 0.0);
-        let p1 = percentile(lats.clone(), 1.0);
-        let p25 = percentile(lats.clone(), 25.0);
-        let p50 = percentile(lats.clone(), 50.0);
-        let p75 = percentile(lats.clone(), 75.0);
-        let p99 = percentile(lats.clone(), 99.0);
-        let p100 = percentile(lats.clone(), 100.0);
+        let p0 = percentile(lats.clone(), 0);
+        let p1 = percentile(lats.clone(), 1);
+        let p25 = percentile(lats.clone(), 25);
+        let p50 = percentile(lats.clone(), 50);
+        let p75 = percentile(lats.clone(), 75);
+        let p99 = percentile(lats.clone(), 99);
+        let p100 = percentile(lats.clone(), 100);
         let iqr = p75 - p25;
         let range = p100 - p0;
         let avg = if count > 0 {
@@ -2024,5 +2014,25 @@ fn main() {
     } else {
         println!("One or more benchmarks FAILED.");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bench percentiles must match the server's own `/perf` figures.
+    /// stats.rs (`percentiles_n`) takes index `(n-1)*pct/100` with integer
+    /// arithmetic, truncating. Rounding the same fraction, as this bench did,
+    /// shifts p50 of ten samples from index 4 to 5, which reads as a false
+    /// server regression when the two are compared side by side.
+    #[test]
+    fn percentile_truncates_like_stats_rs() {
+        // Ten sorted samples: 10, 20, ... 100 microseconds.
+        let v: Vec<f64> = (1..=10).map(|x| x as f64 * 10.0).collect();
+        assert_eq!(percentile(v.clone(), 0), 10.0);
+        assert_eq!(percentile(v.clone(), 50), 50.0);
+        assert_eq!(percentile(v.clone(), 99), 90.0);
+        assert_eq!(percentile(v.clone(), 100), 100.0);
     }
 }
