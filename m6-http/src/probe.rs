@@ -1104,12 +1104,17 @@ mod tests {
         assert_ne!(a, b, "two connection IDs came out identical");
     }
 
-    /// The shared QUIC config builder pins each caller's flow-control numbers.
-    /// quiche does not expose getters for its transport parameters, so the
-    /// numbers are asserted at the parameter level, where a drift between the
-    /// four call sites would first appear, and the builder is run for each.
+    /// Pins the flow-control numbers each caller passes to the shared builder.
+    ///
+    /// quiche's `Config` exposes no getters for its transport parameters, so
+    /// the builder's output cannot be read back without driving a connection.
+    /// The values are therefore pinned here, at the parameter layer, which is
+    /// where a drift between the four call sites (the defect this shared
+    /// builder removes) would first appear. The builder is a direct
+    /// field-to-setter mapping; the smoke check below only proves that it
+    /// accepts each caller's parameters, not that it applies them.
     #[test]
-    fn quic_config_builder_pins_each_callers_flow_control() {
+    fn quic_client_params_carry_each_callers_flow_control_numbers() {
         let zero_rtt = zero_rtt_quic_params();
         let handshake = handshake_quic_params();
         let bench = bench_quic_params(false);
@@ -1127,6 +1132,10 @@ mod tests {
         // Early data is the 0-RTT probe's alone.
         assert!(zero_rtt.early_data);
         assert!(!handshake.early_data);
+        // The probes differ on the per-bidi-stream credit; pin both so a
+        // change to either is caught.
+        assert_eq!(zero_rtt.max_stream_data_bidi_local, 1_000_000);
+        assert_eq!(handshake.max_stream_data_bidi_local, 100_000);
 
         // The benches grant a ten-times-larger connection budget and stream
         // count, because they push whole response bodies through many
@@ -1143,7 +1152,8 @@ mod tests {
         assert!(bench.verify_peer);
         assert!(!bench_quic_params(true).verify_peer);
 
-        // The shared builder runs for every caller's parameters.
+        // Smoke check: the builder accepts every caller's parameters without
+        // error. It cannot prove the values are applied, for the reason above.
         assert!(quic_client_config(zero_rtt).is_ok());
         assert!(quic_client_config(handshake).is_ok());
         assert!(quic_client_config(bench).is_ok());
