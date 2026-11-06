@@ -319,12 +319,13 @@ The file is opened once per check and its times and bytes both come from that ha
 The inode and ctime are left out, because a rename over a file bumps ctime on the old inode just before the name moves, and that state has the old bytes and times, so it is no change.
 A file that cannot be read has no hash, so fixing its permissions is a change.
 A `touch` forces a reload only when it changes the mtime, so on a filesystem with one-second timestamps a second touch in the same second, with unchanged bytes, is not seen.
-A check runs when an event names one of the two files, when the inotify queue overflows, and every `RELOAD_POLL` (one second) whatever the watcher says, which finds a lost watch.
-On kqueue the watcher cannot name a file, so any event asks for a check, and an unrelated write beside the config costs one check and makes no report.
+A check runs on any event from the watcher, named or not, and every `RELOAD_POLL` (one second) whatever the watcher says, which finds a lost watch.
+An event that names another entry still asks for a check, so a config reached through a symlink is found when the directory it points into is swapped.
+An unrelated write beside the config costs one check and makes no report.
 
-The first change after quiet is reported at once.
-A change within `RELOAD_DEBOUNCE` (20 ms) of a report is held and reported once more when the burst settles, and never later than `RELOAD_POLL` after that report.
-A burst shorter than a second is therefore at most two reports, and a longer one adds one report for each further second it lasts.
+The first change after quiet is reported at once, and so is any change more than `RELOAD_DEBOUNCE` (20 ms) after the last report.
+A change within `RELOAD_DEBOUNCE` of a report is held and reported once, 20 ms after the latest change in the burst and never later than `RELOAD_POLL` after that report.
+Writes more than 20 ms apart therefore each reload, and writes closer together than that share one more reload.
 Take a `Seen` from `Seen::read` before the first read of either file so a change in between is reported on the first tick.
 With no watcher the poll alone does the job, there is no thread, and `tick` does not allocate.
 

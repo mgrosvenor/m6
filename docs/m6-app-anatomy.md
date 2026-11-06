@@ -230,10 +230,10 @@ A service reads two files, its own configuration and `site.toml`, and a change t
 One `ConfigReloader` in core watches both.
 It takes the change from the platform's watcher when there is one and, whatever the watcher says, compares the two files' bytes, mode, owner and modification time once a second.
 A lost watch, a replaced directory or a watcher that stopped reporting therefore delays a reload by at most a second and no longer prevents it.
-The first change after quiet reloads at once.
-A change that arrives within 20 ms of a reload is held and reloads once more when the burst has settled, no later than a second after the reload.
-A write that replaces the file in one step is therefore one reload with no delay, and a burst shorter than a second is at most two.
-A burst that lasts longer adds one reload for each further second.
+The first change after quiet reloads at once, and so does any change more than 20 ms after the last reload.
+A change that arrives within 20 ms of a reload is held and reloads once, 20 ms after the latest change in the burst and no later than a second after the reload.
+A write that replaces the file in one step is therefore one reload with no delay.
+Writes more than 20 ms apart each reload, and writes closer together than that share one more reload.
 A write that truncates the file first can report twice, because the truncation is seen as a change of its own.
 A file seen at length 0 is not loaded: the reload is skipped with a warning and the write that fills the file reloads.
 A touch alone, with no change to the bytes, reloads when it moves the modification time, so a second touch in the same second on a filesystem with one-second timestamps is not seen.

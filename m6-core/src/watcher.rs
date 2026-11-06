@@ -341,11 +341,14 @@ impl ConfigWatcher {
 
 /// The settle window after a report.
 ///
-/// The first change after quiet is reported at once. A change that arrives
-/// within this window of a report is held and reported once more when the
-/// window of quiet ends, so a burst is at most two reports and a single write
-/// is exactly one. Reporting at once keeps a backend from reloading later than
-/// an edge that cleared its cache on the same change.
+/// The first change after quiet is reported at once, and so is any change that
+/// arrives more than this long after the last report. A change that arrives
+/// within this window of a report is held and reported once, when this long has
+/// passed since the latest change and never later than [`RELOAD_POLL`] after
+/// that report. Writes spaced further apart than the window therefore each
+/// reload, and writes closer together than it share one more reload. Reporting
+/// at once keeps a backend from reloading later than an edge that cleared its
+/// cache on the same change.
 ///
 /// The window is short on purpose. It has to cover a writer that truncates a
 /// file and then writes it, which the first report can land between, and it
@@ -560,16 +563,14 @@ impl ConfigReloader {
 
     /// Call when [`raw_fd`](Self::raw_fd) is readable.
     pub fn on_readable(&mut self, now: Instant) {
-        // Only an event that names one of the two files, or an overflow of the
-        // queue, is worth the opens and reads of a check. A write to another
-        // file in the same directory is not.
-        let named = self.watcher.as_mut().is_some_and(|w| {
-            w.read_matched(&[&self.site_name, &self.process_name])
-                .contains(&true)
-        });
-        if named {
-            self.compare(now);
+        // Any event asks for a check, named or not. A config reached through a
+        // symlink changes under events that name another entry, such as the
+        // directory the link points into, and some events (a dropped watch, an
+        // overflow) name nothing.
+        if let Some(w) = self.watcher.as_mut() {
+            w.read_events(&[&self.site_name, &self.process_name]);
         }
+        self.compare(now);
     }
 
     /// Ask for `changed` to be reported again after a delay, and return the
@@ -1311,24 +1312,34 @@ mod tests {
         assert_eq!(r.tick(now), None);
     }
 
-    /// A write to another file beside the configs does not cost a check. A
-    /// change the events have not yet shown stays unseen until the poll.
+    /// A config reached through a symlink whose target directory is swapped by a
+    /// rename, as a mounted configuration volume is updated, produces events
+    /// that name the directory entry and never the config. The change is still
+    /// reported at once, not at the next poll.
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_write_to_an_unrelated_file_does_not_check() {
-        let (d, site, proc, seen) = pair();
-        let mut r = ConfigReloader::new(&site, &proc, seen);
-        put(&proc, "b = 99999\n");
-        // Take the config's own events away, so only the unrelated write is left.
-        let names = [r.site_name.as_str(), r.process_name.as_str()];
-        assert!(r.watcher.as_mut().unwrap().read_events(&names));
-        put(&d.path().join("other.toml"), "x = 1\n");
+    fn a_symlinked_config_whose_target_is_swapped_is_reported_before_the_poll() {
+        use std::os::unix::fs::symlink;
+        let d = tempfile::tempdir().expect("tempdir");
+        let root = d.path();
+        let (first, second) = (root.join("data1"), root.join("data2"));
+        for (dir, body) in [(&first, "b = 1\n"), (&second, "b = 22222\n")] {
+            std::fs::create_dir(dir).expect("mkdir");
+            put(&dir.join("app.conf"), body);
+        }
+        let (site, proc) = (root.join("site.toml"), root.join("app.conf"));
+        put(&site, "a = 1\n");
+        symlink("data1", root.join("..data")).expect("symlink");
+        symlink("..data/app.conf", &proc).expect("symlink");
+        let mut r = ConfigReloader::new(&site, &proc, Seen::read(&site, &proc));
+        // The swap: a new link renamed over the old one.
+        symlink("data2", root.join("..data_new")).expect("symlink");
+        std::fs::rename(root.join("..data_new"), root.join("..data")).expect("swap");
         let fd = r.raw_fd().unwrap();
         assert!(crate::server::poll_listener_and_watcher(fd, None, 5_000).listener);
         let now = Instant::now();
         r.on_readable(now);
-        assert_eq!(r.tick(now), None, "an unrelated write caused a check");
-        assert_eq!(poll_at(&mut r, Instant::now() + RELOAD_POLL), Some(PROCESS));
+        assert_eq!(r.tick(now), Some(PROCESS), "waited for the poll");
     }
 
     /// Events lost to a full queue could have named either file, so both are
