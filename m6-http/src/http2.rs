@@ -714,8 +714,15 @@ impl Http2Conn {
             return Ok(false);
         }
 
-        let payload: Vec<u8> = self.recv_buf[FRAME_HDR..FRAME_HDR + length].to_vec();
-        self.recv_buf.drain(..FRAME_HDR + length);
+        // Move the receive buffer out of `self` so the payload can be borrowed
+        // as a slice while the frame handlers borrow `self` mutably. The bytes
+        // after this frame go back now; the frame itself is dropped once the
+        // handler has consumed the payload, so a frame's payload is never
+        // copied into an intermediate Vec.
+        let mut frame = std::mem::take(&mut self.recv_buf);
+        let remainder = frame.split_off(FRAME_HDR + length);
+        self.recv_buf = remainder;
+        let payload = &frame[FRAME_HDR..FRAME_HDR + length];
 
         // Is a header block still being assembled? RFC 9113 6.10: a HEADERS
         // frame and the CONTINUATION frames that follow it are "a single
@@ -786,9 +793,9 @@ impl Http2Conn {
         }
 
         match ftype {
-            TYPE_DATA => self.handle_data(stream_id, flags, &payload, on_request, client_ip)?,
+            TYPE_DATA => self.handle_data(stream_id, flags, payload, on_request, client_ip)?,
             TYPE_HEADERS => {
-                self.handle_headers(stream_id, flags, &payload, on_request, client_ip)?
+                self.handle_headers(stream_id, flags, payload, on_request, client_ip)?
             }
             TYPE_PRIORITY => {
                 // RFC 9113 5.3.1: "A stream cannot depend on itself. An
@@ -819,9 +826,9 @@ impl Http2Conn {
                 self.last_stream_id = self.last_stream_id.max(stream_id);
                 self.note_reset(stream_id);
             }
-            TYPE_SETTINGS => self.handle_settings(flags, &payload)?,
+            TYPE_SETTINGS => self.handle_settings(flags, payload)?,
             TYPE_PUSH_PROMISE => return Err("client sent PUSH_PROMISE"),
-            TYPE_PING => self.handle_ping(flags, &payload),
+            TYPE_PING => self.handle_ping(flags, payload),
             TYPE_GOAWAY => {
                 // NOT `phase = GoingAway`. That is our own teardown, and taking
                 // it here meant closing the connection the instant no streams
@@ -836,9 +843,9 @@ impl Http2Conn {
                 // timeout fires. Both already drive us to Done.
                 self.peer_goaway = true;
             }
-            TYPE_WINDOW_UPDATE => self.handle_window_update(stream_id, &payload)?,
+            TYPE_WINDOW_UPDATE => self.handle_window_update(stream_id, payload)?,
             TYPE_CONTINUATION => {
-                self.handle_continuation(stream_id, flags, &payload, on_request, client_ip)?
+                self.handle_continuation(stream_id, flags, payload, on_request, client_ip)?
             }
             _ => {}
         }
@@ -1614,10 +1621,13 @@ impl Http2Conn {
             return;
         }
 
-        // Clone what we need, then drop the immutable borrow.
+        // Take the request out of the stream so the headers and body move
+        // rather than clone. Every path below either removes the stream
+        // (reject) or moves the body into `req` (Ready) / `ctx.req` (Pending),
+        // so the taken fields are never read again.
         let (headers, body) = {
-            let s = &self.streams[&stream_id];
-            (s.headers.clone(), s.body.clone())
+            let s = self.streams.get_mut(&stream_id).unwrap();
+            (std::mem::take(&mut s.headers), std::mem::take(&mut s.body))
         };
 
         // RFC 9113 8.3.1 -- reject a malformed request rather than serving it.
@@ -1871,15 +1881,21 @@ impl Http2Conn {
                     continue 'outer;
                 }
 
-                // Clone the chunk to satisfy the borrow checker.
-                let chunk: Vec<u8> = {
+                // Send the chunk straight from the buffered body. `append_frame`
+                // borrows only `send_buf`, which is disjoint from the `streams`
+                // borrow holding `body`, so the chunk is not cloned.
+                let flags = if is_last { FLAG_END_STREAM } else { 0 };
+                {
                     let s = &self.streams[&stream_id];
                     let body = s.resp_body.as_ref().unwrap();
-                    body[s.resp_sent..s.resp_sent + to_send].to_vec()
-                };
-
-                let flags = if is_last { FLAG_END_STREAM } else { 0 };
-                self.push_frame(TYPE_DATA, flags, stream_id, &chunk);
+                    append_frame(
+                        &mut self.send_buf,
+                        TYPE_DATA,
+                        flags,
+                        stream_id,
+                        &body[s.resp_sent..s.resp_sent + to_send],
+                    );
+                }
 
                 // Debit both windows.
                 self.conn_send_window -= to_send as i32;
@@ -1984,15 +2000,7 @@ impl Http2Conn {
     }
 
     fn push_frame(&mut self, ftype: u8, flags: u8, stream_id: u32, payload: &[u8]) {
-        let len = payload.len();
-        self.send_buf.push((len >> 16) as u8);
-        self.send_buf.push((len >> 8) as u8);
-        self.send_buf.push(len as u8);
-        self.send_buf.push(ftype);
-        self.send_buf.push(flags);
-        self.send_buf
-            .extend_from_slice(&(stream_id & 0x7fff_ffff).to_be_bytes());
-        self.send_buf.extend_from_slice(payload);
+        append_frame(&mut self.send_buf, ftype, flags, stream_id, payload);
     }
 
     fn push_window_update(&mut self, stream_id: u32, inc: u32) {
@@ -2070,6 +2078,28 @@ impl Http2Conn {
 
 fn u24_be(b: &[u8]) -> u32 {
     (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32
+}
+
+/// Append a well-formed H2 frame to `send_buf`.
+///
+/// A free function so a caller can write a frame from a slice borrowed out of
+/// `self.streams` while `send_buf` is borrowed mutably, without the borrow
+/// checker forcing a clone of the payload.
+pub(crate) fn append_frame(
+    send_buf: &mut Vec<u8>,
+    ftype: u8,
+    flags: u8,
+    stream_id: u32,
+    payload: &[u8],
+) {
+    let len = payload.len();
+    send_buf.push((len >> 16) as u8);
+    send_buf.push((len >> 8) as u8);
+    send_buf.push(len as u8);
+    send_buf.push(ftype);
+    send_buf.push(flags);
+    send_buf.extend_from_slice(&(stream_id & 0x7fff_ffff).to_be_bytes());
+    send_buf.extend_from_slice(payload);
 }
 
 fn setting_bytes(buf: &mut Vec<u8>, id: u16, val: u32) {
@@ -2986,6 +3016,45 @@ mod stream_state_tests {
             c.phase,
             Phase::GoingAway,
             "a backwards stream id must GOAWAY"
+        );
+    }
+
+    /// A frame whose bytes arrive across two reads is reassembled: the parser
+    /// waits for the whole frame rather than reading a partial one, and the
+    /// payload is delivered byte-exact.
+    #[test]
+    fn a_frame_larger_than_one_read_is_reassembled() {
+        let mut c = Http2Conn::new();
+        c.phase = Phase::Active;
+        let mut on_request = |_: &HttpRequest, _: &str| -> RequestOutcome {
+            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "t".to_string())
+        };
+
+        // Open the stream first, then deliver a 16 KiB DATA frame in two reads.
+        c.recv_buf.extend_from_slice(&open_stream(1));
+        assert!(
+            matches!(c.process_frame(&mut on_request, "127.0.0.1"), Ok(true)),
+            "the HEADERS frame opens the stream"
+        );
+
+        let body: Vec<u8> = (0..MAX_FRAME_SIZE).map(|i| (i % 251) as u8).collect();
+        let data = frame(TYPE_DATA, 0, 1, &body);
+        let split = data.len() / 2;
+
+        c.recv_buf.extend_from_slice(&data[..split]);
+        assert!(
+            !matches!(c.process_frame(&mut on_request, "127.0.0.1"), Ok(true)),
+            "a partial frame must wait for the rest"
+        );
+
+        c.recv_buf.extend_from_slice(&data[split..]);
+        assert!(
+            matches!(c.process_frame(&mut on_request, "127.0.0.1"), Ok(true)),
+            "the completed frame must be processed"
+        );
+        assert_eq!(
+            c.streams[&1].body, body,
+            "reassembled DATA must be byte-exact"
         );
     }
 }

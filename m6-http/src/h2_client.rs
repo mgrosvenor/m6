@@ -256,7 +256,7 @@ impl<T: Transport> H2Client<T> {
     fn pump_stream(&mut self, stream_id: u32) {
         let max_frame = (self.peer_max_frame as usize).max(1);
         loop {
-            let (chunk, last) = {
+            let (start, n, last) = {
                 let Some(s) = self.streams.get_mut(&stream_id) else {
                     return;
                 };
@@ -276,15 +276,22 @@ impl<T: Transport> H2Client<T> {
                 s.body_off += n;
                 s.send_window -= n as i32;
                 let last = s.body_off == s.pending_body.len();
-                (s.pending_body[start..start + n].to_vec(), last)
+                (start, n, last)
             };
-            self.conn_send_window -= chunk.len() as i32;
-            self.push_frame(
-                TYPE_DATA,
-                if last { FLAG_END_STREAM } else { 0 },
-                stream_id,
-                &chunk,
-            );
+            self.conn_send_window -= n as i32;
+            {
+                // Append straight from the pending body. `append_frame` borrows
+                // only `send_buf`, disjoint from the `streams` borrow holding
+                // `pending_body`, so the chunk is not cloned.
+                let s = self.streams.get(&stream_id).unwrap();
+                crate::http2::append_frame(
+                    &mut self.send_buf,
+                    TYPE_DATA,
+                    if last { FLAG_END_STREAM } else { 0 },
+                    stream_id,
+                    &s.pending_body[start..start + n],
+                );
+            }
             if last {
                 // Release the buffer as soon as it is owed nothing; a 5 MiB
                 // upload should not sit in memory until the response lands.
@@ -357,8 +364,13 @@ impl<T: Transport> H2Client<T> {
                 | (self.recv_buf[8] as u32))
                 & 0x7fff_ffff;
 
-            let payload = self.recv_buf[FRAME_HDR..FRAME_HDR + length].to_vec();
-            self.recv_buf.drain(..FRAME_HDR + length);
+            // Move the receive buffer out of `self` so the payload can be
+            // borrowed as a slice while the frame handlers borrow `self`
+            // mutably. The frame is drained and the remainder put back after
+            // the frame is handled; a connection killed mid-frame never needs
+            // its buffer again.
+            let mut buf = std::mem::take(&mut self.recv_buf);
+            let payload = &buf[FRAME_HDR..FRAME_HDR + length];
 
             // CONTINUATION protocol: if we're accumulating a block and the
             // incoming frame is NOT a CONTINUATION on that stream, that's a
@@ -413,29 +425,28 @@ impl<T: Transport> H2Client<T> {
                 }
 
                 TYPE_HEADERS if stream_id > 0 => {
-                    let mut pl = payload;
-
-                    // Strip PADDED prefix
+                    // Strip PADDED prefix and trailing padding by narrowing the
+                    // slice rather than copying into a mutable Vec.
                     let mut pos = 0usize;
+                    let mut end = payload.len();
                     if flags & FLAG_PADDED != 0 {
-                        if pl.is_empty() {
+                        if payload.is_empty() {
                             self.mark_dead(&format!(
                                 "{}: padded HEADERS with empty payload",
                                 T::prefix()
                             ));
                             return;
                         }
-                        let pad_len = pl[0] as usize;
+                        let pad_len = payload[0] as usize;
                         pos = 1;
-                        if pl.len() < pos + pad_len {
+                        if payload.len() < pos + pad_len {
                             self.mark_dead(&format!(
                                 "{}: HEADERS pad_len exceeds payload",
                                 T::prefix()
                             ));
                             return;
                         }
-                        let new_len = pl.len() - pad_len;
-                        pl.truncate(new_len);
+                        end = payload.len() - pad_len;
                     }
 
                     // Skip PRIORITY fields (5 bytes)
@@ -443,8 +454,8 @@ impl<T: Transport> H2Client<T> {
                         pos += 5;
                     }
 
-                    if pos <= pl.len() {
-                        self.header_block_acc.extend_from_slice(&pl[pos..]);
+                    if pos <= end {
+                        self.header_block_acc.extend_from_slice(&payload[pos..end]);
                     }
 
                     if flags & FLAG_END_HEADERS != 0 {
@@ -461,7 +472,7 @@ impl<T: Transport> H2Client<T> {
                 }
 
                 TYPE_CONTINUATION if stream_id > 0 => {
-                    self.header_block_acc.extend_from_slice(&payload);
+                    self.header_block_acc.extend_from_slice(payload);
 
                     if flags & FLAG_END_HEADERS != 0 && !self.finish_header_block(stream_id) {
                         return;
@@ -469,31 +480,30 @@ impl<T: Transport> H2Client<T> {
                 }
 
                 TYPE_DATA if stream_id > 0 => {
-                    let mut pl = payload;
                     let mut pos = 0usize;
+                    let mut end = payload.len();
 
                     if flags & FLAG_PADDED != 0 {
-                        if pl.is_empty() {
+                        if payload.is_empty() {
                             self.mark_dead(&format!(
                                 "{}: padded DATA with empty payload",
                                 T::prefix()
                             ));
                             return;
                         }
-                        let pad_len = pl[0] as usize;
+                        let pad_len = payload[0] as usize;
                         pos = 1;
-                        if pl.len() < pos + pad_len {
+                        if payload.len() < pos + pad_len {
                             self.mark_dead(&format!(
                                 "{}: DATA pad_len exceeds payload",
                                 T::prefix()
                             ));
                             return;
                         }
-                        let new_len = pl.len() - pad_len;
-                        pl.truncate(new_len);
+                        end = payload.len() - pad_len;
                     }
 
-                    let data = &pl[pos..];
+                    let data = &payload[pos..end];
                     let data_len = data.len();
 
                     if data_len > 0 {
@@ -529,8 +539,7 @@ impl<T: Transport> H2Client<T> {
                 }
 
                 TYPE_PING if flags & FLAG_ACK == 0 && payload.len() == 8 => {
-                    let ping_payload = payload.clone();
-                    self.push_frame(TYPE_PING, FLAG_ACK, 0, &ping_payload);
+                    self.push_frame(TYPE_PING, FLAG_ACK, 0, payload);
                 }
 
                 TYPE_WINDOW_UPDATE if stream_id == 0 && payload.len() >= 4 => {
@@ -603,6 +612,11 @@ impl<T: Transport> H2Client<T> {
                     // Ignore all other frame types
                 }
             }
+
+            // The frame has been consumed; drain it and put the remainder back
+            // so the next iteration reads the following frame.
+            buf.drain(..FRAME_HDR + length);
+            self.recv_buf = buf;
         }
 
         // Now that everything already received has been parsed and delivered,
@@ -693,18 +707,7 @@ impl<T: Transport> H2Client<T> {
 
     /// Append a well-formed H2 frame to `send_buf`.
     fn push_frame(&mut self, ftype: u8, flags: u8, stream_id: u32, payload: &[u8]) {
-        let len = payload.len() as u32;
-        self.send_buf.push((len >> 16) as u8);
-        self.send_buf.push((len >> 8) as u8);
-        self.send_buf.push(len as u8);
-        self.send_buf.push(ftype);
-        self.send_buf.push(flags);
-        let sid = stream_id & 0x7fff_ffff;
-        self.send_buf.push((sid >> 24) as u8);
-        self.send_buf.push((sid >> 16) as u8);
-        self.send_buf.push((sid >> 8) as u8);
-        self.send_buf.push(sid as u8);
-        self.send_buf.extend_from_slice(payload);
+        crate::http2::append_frame(&mut self.send_buf, ftype, flags, stream_id, payload);
     }
 }
 
