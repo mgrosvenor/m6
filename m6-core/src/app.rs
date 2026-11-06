@@ -1677,7 +1677,6 @@ fn drain_and_shut_down(
     on_shutdown: &mut Option<Box<dyn FnOnce() + Send>>,
 ) -> bool {
     info!("Shutdown signal received, draining...");
-    crate::server::close_idle_connections();
     let unfinished = pool.drain(timeout);
     if unfinished > 0 {
         warn!(
