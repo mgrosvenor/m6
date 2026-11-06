@@ -276,13 +276,16 @@ pub enum AuthError {
     #[error("database error: {0}")]
     Db(#[from] rusqlite::Error),
 
+    #[error("opening the database: {0}")]
+    Open(#[from] m6_core::sqlite::SqliteError),
+
     #[error("password hashing error: {0}")]
     Bcrypt(#[from] bcrypt::BcryptError),
 }
 ```
 
-Table 8 gives the eight variants and the calls that return each.
-Take from it that six variants name a row, and the other two wrap a failure from a dependency.
+Table 8 gives the nine variants and the calls that return each.
+Take from it that six variants name a row, and the other three wrap a failure from a dependency.
 
 | variant | meaning | returned by |
 |---|---|---|
@@ -293,13 +296,14 @@ Take from it that six variants name a row, and the other two wrap a failure from
 | `ApiTokenNotFound` | no API token has that id | `api_token_revoke` |
 | `Roles` | a user's `roles` column is not valid JSON | `user_get`, `user_get_by_id`, `user_list`, `group_members`, `user_verify_password` |
 | `Db` | SQLite returned an error | any call that reads or writes |
+| `Open` | opening the database failed | `Db::open` |
 | `Bcrypt` | the password hash or check failed | `user_create`, `user_set_password`, `user_verify_password` |
 
-**Table 8: the eight `AuthError` variants, what each one means and which calls return it.**
-The first six are answers about a row, and the last two carry a dependency's own error through `#[from]`.
+**Table 8: the nine `AuthError` variants, what each one means and which calls return it.**
+The first six are answers about a row, and the last three carry a dependency's own error through `#[from]`.
 
 `AuthError` implements `std::error::Error` through `thiserror`, so a caller converts it with one `map_err`, as section 8 does.
-The `Db` and `Bcrypt` variants convert with `?` inside the crate, so a dependency failure needs no wrapping at each call site.
+The `Db`, `Open` and `Bcrypt` variants convert with `?` inside the crate, so a dependency failure needs no wrapping at each call site.
 The five fallible `jwt` functions return `anyhow::Result`, so a caller that uses both APIs handles `AuthError` from `Db` and `anyhow::Error` from the token engine.
 
 The rows these errors name live in five tables, and section 7 gives them.
