@@ -224,9 +224,13 @@ set -uo pipefail
 export PATH=$PATH:$HOME/.cargo/bin:$HOME/.local/bin:/root/.cargo/bin:/root/.local/bin
 cd "$M6_DIR" || exit 1
 # This run's own files: another gate may be running on this host at the same
-# time, and fixed /tmp paths would let each read the other's logs.
-T="$(mktemp -d)" || exit 1
+# time, and fixed /tmp paths would let each read the other's logs. They sit
+# beside the checkout, not in /tmp, and are the run's TMPDIR: a hardened host
+# mounts /tmp noexec, and rustdoc runs each doctest as a binary built in
+# TMPDIR, so every doctest failed with "Permission denied" there.
+T="$(mktemp -d "$PWD/../tmp.XXXXXX")" || exit 1
 trap 'rm -rf -- "$T"' EXIT
+export TMPDIR="$T"
 # Several gates share this host (#344). tools/host-lock.sh holds the protocol:
 # this run holds the host shared, the test suite and conformance take the port
 # lock, and perfcheck gets the host to itself.
