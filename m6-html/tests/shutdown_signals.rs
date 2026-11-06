@@ -377,9 +377,37 @@ fn an_idle_keep_alive_connection_does_not_hold_the_drain() {
 /// until the read times out, and the stop waits out the whole deadline.
 #[test]
 fn a_connection_that_has_sent_nothing_does_not_hold_the_drain() {
-    let (mut server, socket_path) = spawn("term-silent");
+    // At debug level the service logs "new connection waiting for its first
+    // request" when a fresh connection registers as idle. The readiness probe's
+    // connection logged its own before `spawn` returned, so one more line is
+    // this connection's: the idle path is the one under test.
+    let (mut server, socket_path) = spawn_with_args(
+        "term-silent",
+        "m6-html-shutdown.conf",
+        &["--log-level", "debug"],
+    );
+    let before = server
+        .svc
+        .output()
+        .matches("new connection waiting for its first request")
+        .count();
     let mut conn = UnixStream::connect(&socket_path).expect("connect");
     conn.set_read_timeout(Some(Duration::from_secs(30))).ok();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while server
+        .svc
+        .output()
+        .matches("new connection waiting for its first request")
+        .count()
+        <= before
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the silent connection never registered as idle\n--- output ---\n{}",
+            server.svc.output()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 
     server.svc.signal(libc::SIGTERM);
     let status = server

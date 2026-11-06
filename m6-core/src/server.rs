@@ -297,12 +297,17 @@ pub const MAX_REQUESTS_PER_CONN: u32 = 100;
 /// ends, so it is never closed after being reused.
 static IDLE: std::sync::Mutex<Vec<std::os::fd::RawFd>> = std::sync::Mutex::new(Vec::new());
 
-fn idle_enter(fd: std::os::fd::RawFd) -> bool {
+fn idle_enter(fd: std::os::fd::RawFd, first: bool) -> bool {
     let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
     if crate::signal::is_shutdown() {
         return false;
     }
     idle.push(fd);
+    if first {
+        debug!("new connection waiting for its first request");
+    } else {
+        debug!("connection waiting for its next request");
+    }
     true
 }
 
@@ -313,56 +318,70 @@ fn idle_leave(fd: std::os::fd::RawFd) {
     }
 }
 
-/// Block, registered as idle, until a request's first byte can be read.
-/// Returns false when the connection should end without a response: the peer
-/// closed it, it outlived its read timeout with nothing sent (the same two
-/// cases `parse_request` reports as `ConnectionClosed`), or shutdown closed it
-/// or had already started.
-fn wait_for_request(fd: std::os::fd::RawFd) -> std::io::Result<bool> {
-    if !idle_enter(fd) {
-        return Ok(false);
-    }
-    let mut byte = 0u8;
-    let peeked = loop {
-        // SAFETY: fd is the open connection this worker is serving, and the
-        // buffer is one valid byte. MSG_PEEK leaves the byte for the parser.
-        let n = unsafe { libc::recv(fd, (&mut byte as *mut u8).cast(), 1, libc::MSG_PEEK) };
-        if n >= 0 {
-            break Ok(n);
+/// The stream as the parser sees it while the connection waits for a request:
+/// registered as idle until the first read that returns data, then not. The
+/// parser's own read is the wait, so a request costs no extra system call.
+struct IdleUntilRead<'a, S> {
+    inner: &'a mut S,
+    fd: std::os::fd::RawFd,
+    idle: bool,
+}
+
+impl<S: std::io::Read> std::io::Read for IdleUntilRead<'_, S> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let r = self.inner.read(buf);
+        if self.idle {
+            if matches!(r, Ok(n) if n > 0) {
+                // A request is now being served, and the drain will wait for it.
+                debug!("request arriving");
+            }
+            idle_leave(self.fd);
+            self.idle = false;
         }
-        let e = std::io::Error::last_os_error();
-        if e.kind() != std::io::ErrorKind::Interrupted {
-            break Err(e);
-        }
-    };
-    idle_leave(fd);
-    match peeked {
-        Ok(n) if n > 0 => {
-            // A request is now being served, and the drain will wait for it.
-            debug!("request arriving");
-            Ok(true)
-        }
-        Ok(_) => Ok(false),
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-            ) =>
-        {
-            Ok(false)
-        }
-        Err(e) => Err(e),
+        r
     }
 }
 
-/// Close every idle kept-alive connection for reading. Called once shutdown
-/// has started; each blocked worker sees end of input and its connection ends.
+impl<S: std::io::Write> std::io::Write for IdleUntilRead<'_, S> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<S> Drop for IdleUntilRead<'_, S> {
+    fn drop(&mut self) {
+        if self.idle {
+            idle_leave(self.fd);
+        }
+    }
+}
+
+/// Close for reading every connection still waiting for a request's first
+/// byte. Called once shutdown has started; each worker blocked on one sees end
+/// of input and its connection ends. A connection with bytes already waiting
+/// has a request arriving, and is left for its worker to serve.
 pub fn close_idle_connections() {
     let idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
     for &fd in idle.iter() {
+        let mut byte = 0u8;
         // SAFETY: fd is a connection still owned by its worker: it leaves this
-        // set, under this lock, before the connection is dropped.
-        unsafe { libc::shutdown(fd, libc::SHUT_RD) };
+        // set, under this lock, before the connection is dropped. The buffer
+        // is one valid byte, and MSG_PEEK | MSG_DONTWAIT neither consumes it
+        // nor blocks.
+        let waiting = unsafe {
+            libc::recv(
+                fd,
+                (&mut byte as *mut u8).cast(),
+                1,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        if waiting <= 0 {
+            unsafe { libc::shutdown(fd, libc::SHUT_RD) };
+        }
     }
 }
 
@@ -401,13 +420,19 @@ where
         // its first request as much as any later one. It waits registered as
         // such, so a shutdown can close it at once; once a byte has arrived it
         // is a request being served, and the drain waits for it.
-        if !wait_for_request(fd)? {
+        if !idle_enter(fd, served == 0) {
             return Ok(());
         }
-        let req = match parse::parse_request(stream) {
+        let parsed = parse::parse_request(&mut IdleUntilRead {
+            inner: &mut *stream,
+            fd,
+            idle: true,
+        });
+        let req = match parsed {
             Ok(r) => r,
-            // An idle persistent connection going away is how this loop is
-            // meant to end, not an error to report.
+            // A connection ending before a request arrives (the peer closed
+            // it, it timed out idle, or shutdown closed it) is how this loop
+            // is meant to end, not an error to report.
             Err(crate::parse::ParseError::ConnectionClosed) => return Ok(()),
             Err(e) => {
                 debug!(error = %e, "malformed request");
