@@ -124,7 +124,8 @@ impl ConfigWatcher {
     }
 
     /// Drain pending events, returning for each of `filenames` whether an
-    /// event named it.
+    /// event named it. An overflow of the kernel's queue means events were
+    /// lost, so it names every file.
     pub fn read_matched(&mut self, filenames: &[&str]) -> Vec<bool> {
         let mut matched = vec![false; filenames.len()];
         // One `read` per call, so loop until the queue is empty. An empty
@@ -135,13 +136,8 @@ impl ConfigWatcher {
                 Ok(events) if events.is_empty() => break,
                 Ok(events) => {
                     for ev in events {
-                        if let Some(name) = ev.name.as_ref().and_then(|n| n.to_str()) {
-                            for (i, f) in filenames.iter().enumerate() {
-                                if *f == name {
-                                    matched[i] = true;
-                                }
-                            }
-                        }
+                        let name = ev.name.as_ref().and_then(|n| n.to_str());
+                        note_event(&mut matched, filenames, ev.mask, name);
                     }
                 }
                 Err(nix::errno::Errno::EAGAIN) => break,
@@ -152,6 +148,22 @@ impl ConfigWatcher {
             }
         }
         matched
+    }
+}
+
+/// Record in `matched` which of `filenames` an inotify event names.
+#[cfg(target_os = "linux")]
+fn note_event(
+    matched: &mut [bool],
+    filenames: &[&str],
+    mask: nix::sys::inotify::AddWatchFlags,
+    name: Option<&str>,
+) {
+    if mask.contains(nix::sys::inotify::AddWatchFlags::IN_Q_OVERFLOW) {
+        matched.fill(true);
+    }
+    for (m, f) in matched.iter_mut().zip(filenames) {
+        *m |= name == Some(*f);
     }
 }
 
@@ -270,11 +282,11 @@ impl ConfigWatcher {
         any
     }
 
-    /// Drain pending events. kqueue does not say which file, so nothing is
-    /// reported as named and the caller falls back to its fingerprints.
+    /// Drain pending events. kqueue does not say which file, so every file is
+    /// reported as named when any event arrived, and the caller's fingerprints
+    /// decide which one changed.
     pub fn read_matched(&mut self, filenames: &[&str]) -> Vec<bool> {
-        self.read_events(&[]);
-        vec![false; filenames.len()]
+        vec![self.read_events(&[]); filenames.len()]
     }
 }
 
@@ -327,24 +339,27 @@ impl ConfigWatcher {
 // ConfigReloader: both of a process's files, with a settle window and a poll
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The settle interval.
+/// The settle window after a report.
 ///
-/// A file whose fingerprint differs from the last report is reported once its
-/// fingerprint is the same at two checks one interval apart. A rename, or a
-/// writer that truncates a file and then writes it, is therefore read in its
-/// final state, and a burst of writes is one report. The first change after
-/// quiet is reported this long after it is first seen.
+/// The first change after quiet is reported at once. A change that arrives
+/// within this window of a report is held and reported once more when the
+/// window of quiet ends, so a burst is at most two reports and a single write
+/// is exactly one. Reporting at once keeps a backend from reloading later than
+/// an edge that cleared its cache on the same change.
 ///
-/// The interval is short on purpose. Every held change is time in which an
-/// edge's cache can refill from a backend that has not reloaded.
+/// The window is short on purpose. It has to cover a writer that truncates a
+/// file and then writes it, which the first report can land between, and it
+/// must not hold back a second touch that follows the first by a few tens of
+/// milliseconds, because every held change is time in which an edge's cache can
+/// refill from a backend that has not reloaded.
 pub const RELOAD_DEBOUNCE: Duration = Duration::from_millis(20);
 
 /// How often the reloader compares fingerprints whatever the watcher says, and
-/// the longest a change is held back while the file keeps changing.
+/// the longest a batch of changes is held back.
 ///
 /// A watch that has been lost, a replaced directory, or a kqueue watch left on
 /// an unlinked inode after an atomic rename all stop delivering events. This
-/// poll is two `stat` calls a second and finds the change anyway.
+/// poll is one open and read of each file a second and finds the change anyway.
 pub const RELOAD_POLL: Duration = Duration::from_secs(1);
 
 /// The longest delay before a failed reload is retried.
@@ -393,11 +408,20 @@ pub struct Fingerprint {
 
 impl Fingerprint {
     /// The fingerprint of `path`, or `None` when it does not exist.
+    ///
+    /// The file is opened once, and its metadata and bytes both come from that
+    /// handle, so a rename that lands in between cannot mix the old file's times
+    /// with the new file's bytes. A file that cannot be opened is fingerprinted
+    /// from `stat` with no hash.
     pub fn of(path: &Path) -> Option<Fingerprint> {
         use std::os::unix::fs::MetadataExt;
-        let m = std::fs::metadata(path).ok()?;
+        let file = std::fs::File::open(path).ok();
+        let m = match &file {
+            Some(file) => file.metadata().ok()?,
+            None => std::fs::metadata(path).ok()?,
+        };
         Some(Fingerprint {
-            hash: hash_file(path),
+            hash: file.and_then(hash_reader),
             mode: m.mode(),
             uid: m.uid(),
             gid: m.gid(),
@@ -406,12 +430,11 @@ impl Fingerprint {
     }
 }
 
-/// A hash of the bytes of `path`, or `None` when it cannot be read. Read in
+/// A hash of the bytes of `file`, or `None` when they cannot be read. Read in
 /// chunks from the stack, so a check allocates nothing.
-fn hash_file(path: &Path) -> Option<u64> {
+fn hash_reader(mut file: std::fs::File) -> Option<u64> {
     use std::hash::Hasher;
     use std::io::Read;
-    let mut file = std::fs::File::open(path).ok()?;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     let mut chunk = [0u8; 8192];
     loop {
@@ -445,56 +468,32 @@ impl Seen {
     }
 }
 
-/// A file whose fingerprint differs from the last report, and is settling.
-#[derive(Debug, Clone, Copy)]
-struct Settle {
-    /// The fingerprint at the latest check.
-    fingerprint: Option<Fingerprint>,
-    /// When the file first had that fingerprint.
-    since: Instant,
-    /// When the file first differed from the last report.
-    first: Instant,
-}
-
-impl Settle {
-    /// When the file is reported if it stays as it is.
-    fn due(&self) -> Instant {
-        (self.since + RELOAD_DEBOUNCE).min(self.first + RELOAD_POLL)
-    }
-}
-
 /// Watches `site.toml` and a process's own config and reports which changed.
 ///
-/// A [`ConfigWatcher`] wakes the loop and the poll wakes it once a second, and
-/// each only triggers a check. A check fingerprints both files and compares
-/// them with what was last reported, so the answer is the same on inotify,
-/// kqueue and with no watcher at all, and other files in a shared directory
-/// change nothing. A file that differs is reported once its fingerprint is the
-/// same at two checks [`RELOAD_DEBOUNCE`] apart, or [`RELOAD_POLL`] after it
-/// first differed if it never stops changing. The loop calls
-/// [`on_readable`](Self::on_readable) when [`raw_fd`](Self::raw_fd) is readable
-/// and [`tick`](Self::tick) on every iteration, idle or not. No thread, no
-/// allocation in `tick`.
+/// A [`ConfigWatcher`] wakes the loop. The fingerprints decide what changed, so
+/// the answer is the same on inotify and kqueue and ignores other files in a
+/// shared directory. The loop calls [`on_readable`](Self::on_readable) when
+/// [`raw_fd`](Self::raw_fd) is readable and [`tick`](Self::tick) on every
+/// iteration, idle or not. No thread, no allocation in `tick`.
 pub struct ConfigReloader {
     watcher: Option<ConfigWatcher>,
     site_toml: PathBuf,
     process: PathBuf,
-    /// The fingerprints last reported.
     seen: Seen,
     /// The file names events are matched against.
     site_name: String,
     process_name: String,
-    site_settle: Option<Settle>,
-    process_settle: Option<Settle>,
-    /// Files reported as changed, waiting to be handed out.
     pending: Changed,
-    /// When the next check of a settling file is due.
-    settle_due: Option<Instant>,
+    /// When the pending change is to be reported.
+    due: Option<Instant>,
+    /// When the last report was made. A change within [`RELOAD_DEBOUNCE`] of
+    /// it, or one arriving while a report is still due, is held.
+    last_report: Option<Instant>,
     next_poll: Instant,
     /// Consecutive failed reloads that were asked to be retried.
     failures: u32,
-    /// When a retry that was asked for is due.
-    retry_due: Option<Instant>,
+    /// True while `due` is a retry and not a change.
+    retrying: bool,
 }
 
 impl ConfigReloader {
@@ -524,13 +523,12 @@ impl ConfigReloader {
             seen,
             site_name: file_name(site_toml),
             process_name: file_name(process),
-            site_settle: None,
-            process_settle: None,
             pending: Changed::default(),
-            settle_due: None,
+            due: None,
+            last_report: None,
             next_poll: Instant::now() + RELOAD_POLL,
             failures: 0,
-            retry_due: None,
+            retrying: false,
         }
     }
 
@@ -551,26 +549,27 @@ impl ConfigReloader {
         self.watcher.as_ref().and_then(|w| w.raw_fd())
     }
 
-    /// The `poll(2)` timeout to use, at most `max_ms`: shorter when a check or a
-    /// retry falls due sooner, so it is made on time on an idle loop.
+    /// The `poll(2)` timeout to use, at most `max_ms`: shorter when a held
+    /// report falls due sooner, so it is made on time on an idle loop.
     pub fn timeout_ms(&self, now: Instant, max_ms: u16) -> u16 {
-        let due = [self.settle_due, self.retry_due]
-            .into_iter()
-            .flatten()
-            .min();
-        due.map_or(max_ms, |due| {
+        self.due.map_or(max_ms, |due| {
             let us = due.saturating_duration_since(now).as_micros();
             u16::try_from(us.div_ceil(1000)).map_or(max_ms, |ms| ms.min(max_ms))
         })
     }
 
-    /// Call when [`raw_fd`](Self::raw_fd) is readable. Whatever the events were,
-    /// including an overflow of the kernel's queue, they only ask for a check.
+    /// Call when [`raw_fd`](Self::raw_fd) is readable.
     pub fn on_readable(&mut self, now: Instant) {
-        if let Some(w) = self.watcher.as_mut() {
-            w.read_events(&[&self.site_name, &self.process_name]);
+        // Only an event that names one of the two files, or an overflow of the
+        // queue, is worth the opens and reads of a check. A write to another
+        // file in the same directory is not.
+        let named = self.watcher.as_mut().is_some_and(|w| {
+            w.read_matched(&[&self.site_name, &self.process_name])
+                .contains(&true)
+        });
+        if named {
+            self.compare(now);
         }
-        self.check(now);
     }
 
     /// Ask for `changed` to be reported again after a delay, and return the
@@ -587,86 +586,76 @@ impl ConfigReloader {
         self.failures = self.failures.saturating_add(1);
         self.pending.site |= changed.site;
         self.pending.process |= changed.process;
-        self.retry_due = Some(now + delay);
+        self.due = Some(now + delay);
+        self.retrying = true;
         delay
     }
 
     /// Call on every loop iteration. Returns the change when a report is due.
     pub fn tick(&mut self, now: Instant) -> Option<Changed> {
-        let poll_due = now >= self.next_poll;
-        if poll_due || self.settle_due.is_some_and(|due| now >= due) {
-            self.check(now);
-        }
-        if poll_due {
+        if now >= self.next_poll {
+            self.compare(now);
             self.next_poll = now + RELOAD_POLL;
         }
-        if self.pending.any() && self.retry_due.is_none_or(|due| now >= due) {
-            self.retry_due = None;
+        if self.due.is_some_and(|due| now >= due) {
+            // Every report opens a window. A change inside it is held for one
+            // more report when it settles.
+            self.due = None;
+            self.retrying = false;
+            self.last_report = Some(now);
             return Some(std::mem::take(&mut self.pending));
         }
         None
     }
 
-    /// Fingerprint both files and compare each with what was last reported. A
-    /// file that differs settles, and a file that has settled is reported and
-    /// recorded, so a file that fails to load is not retried until it is written
-    /// again.
-    fn check(&mut self, now: Instant) {
+    /// Fingerprint both files and mark each that differs from the last report.
+    /// The new fingerprint is stored at once, so a file that fails to load is
+    /// not retried until it is written again.
+    fn compare(&mut self, now: Instant) {
         let site = Fingerprint::of(&self.site_toml);
-        let process = Fingerprint::of(&self.process);
-        let site_changed = Self::settle(site, &mut self.seen.site, &mut self.site_settle, now);
-        let process_changed = Self::settle(
-            process,
-            &mut self.seen.process,
-            &mut self.process_settle,
-            now,
-        );
-        self.pending.site |= site_changed;
-        self.pending.process |= process_changed;
-        if site_changed || process_changed {
-            // A real change, not a retry: the backoff starts again.
-            self.failures = 0;
-            self.retry_due = None;
-        }
-        self.settle_due = [self.site_settle, self.process_settle]
-            .into_iter()
-            .flatten()
-            .map(|settle| settle.due())
-            .min();
-    }
-
-    /// True when `current` has settled and is to be reported. Records it as
-    /// reported then. Otherwise keeps track of how long it has been as it is.
-    fn settle(
-        current: Option<Fingerprint>,
-        reported: &mut Option<Fingerprint>,
-        settling: &mut Option<Settle>,
-        now: Instant,
-    ) -> bool {
-        if current == *reported {
-            *settling = None;
-            return false;
-        }
-        let settle = match *settling {
-            Some(s) if s.fingerprint == current => s,
-            Some(s) => Settle {
-                fingerprint: current,
-                since: now,
-                first: s.first,
-            },
-            None => Settle {
-                fingerprint: current,
-                since: now,
-                first: now,
-            },
+        // One file serving as both is fingerprinted once, so a write cannot
+        // reach the two in different states.
+        let same_file = self.site_toml == self.process;
+        let process = if same_file {
+            site
+        } else {
+            Fingerprint::of(&self.process)
         };
-        if now >= settle.due() {
-            *reported = current;
-            *settling = None;
-            return true;
+        let mut hit = false;
+        if site != self.seen.site {
+            self.seen.site = site;
+            self.pending.site = true;
+            hit = true;
         }
-        *settling = Some(settle);
-        false
+        if process != self.seen.process {
+            self.seen.process = process;
+            self.pending.process = true;
+            hit = true;
+        }
+        if !hit {
+            return;
+        }
+        // One file serving as both: a change to it is a change to both.
+        if same_file {
+            self.pending = Changed {
+                site: true,
+                process: true,
+            };
+        }
+        // A real change, not a retry: the backoff starts again.
+        self.failures = 0;
+        let held_by_a_change = self.due.is_some() && !self.retrying;
+        self.retrying = false;
+        self.due = Some(match self.last_report {
+            // A change inside the window of an earlier report: one more report
+            // when the burst settles, and never later than a second after that
+            // report.
+            Some(last) if now < last + RELOAD_DEBOUNCE || held_by_a_change => {
+                (now + RELOAD_DEBOUNCE).min(last + RELOAD_POLL).max(now)
+            }
+            // The first change after quiet: report at once.
+            _ => now,
+        });
     }
 }
 
@@ -909,30 +898,231 @@ mod tests {
         None
     }
 
-    /// Run the reloader's poll at `at`, which fingerprints both files then.
-    fn poll_at(r: &mut ConfigReloader, at: Instant) -> Option<Changed> {
+    #[test]
+    fn a_touch_of_the_process_config_is_reported_as_process() {
+        let (_d, site, proc, seen) = pair();
+        let mut r = ConfigReloader::new(&site, &proc, seen);
+        let now = filetime::FileTime::now();
+        filetime::set_file_times(&proc, now, now).expect("touch");
+        let c = wait_for_change(&mut r, 5_000).expect("a touch is a change");
+        assert!(c.process, "{c:?}");
+        assert!(!c.site, "{c:?}");
+    }
+
+    #[test]
+    fn a_rename_over_site_toml_is_reported_as_site() {
+        let (d, site, proc, seen) = pair();
+        let mut r = ConfigReloader::new(&site, &proc, seen);
+        let tmp = d.path().join("site.toml.new");
+        put(&tmp, "a = 22222\n");
+        std::fs::rename(&tmp, &site).expect("rename");
+        let c = wait_for_change(&mut r, 5_000).expect("a rename is a change");
+        assert!(c.site, "{c:?}");
+        assert!(!c.process, "{c:?}");
+    }
+
+    #[test]
+    fn a_burst_of_writes_is_at_most_two_reloads() {
+        let (_d, site, proc, seen) = pair();
+        let mut r = ConfigReloader::polling_only(&site, &proc, seen);
+        let t0 = Instant::now() + RELOAD_POLL;
+        put(&proc, "b = 12\n");
+        // The first change is reported at once.
+        assert_eq!(
+            r.tick(t0),
+            Some(Changed {
+                site: false,
+                process: true
+            })
+        );
+        put(&proc, "b = 123\n");
+        r.next_poll_for_test(t0 + Duration::from_millis(10));
+        assert_eq!(r.tick(t0 + Duration::from_millis(10)), None);
+        put(&proc, "b = 1234\n");
+        r.next_poll_for_test(t0 + Duration::from_millis(20));
+        assert_eq!(r.tick(t0 + Duration::from_millis(20)), None);
+        // One more when the burst has settled, and then nothing.
+        let c = r.tick(t0 + Duration::from_millis(20) + RELOAD_DEBOUNCE);
+        assert_eq!(
+            c,
+            Some(Changed {
+                site: false,
+                process: true
+            })
+        );
+        assert_eq!(r.tick(t0 + Duration::from_millis(600)), None);
+    }
+
+    #[test]
+    fn the_poll_timeout_shrinks_to_a_held_report() {
+        let (_d, site, proc, seen) = pair();
+        let mut r = ConfigReloader::polling_only(&site, &proc, seen);
+        let t0 = Instant::now() + RELOAD_POLL;
+        assert_eq!(r.timeout_ms(t0, 100), 100, "nothing held");
+        put(&proc, "b = 12\n");
+        assert!(r.tick(t0).is_some());
+        put(&proc, "b = 123\n");
+        let at = t0 + Duration::from_millis(5);
         r.next_poll_for_test(at);
-        r.tick(at)
+        assert_eq!(r.tick(at), None);
+        // Held until `at + RELOAD_DEBOUNCE`, so the loop must wake by then.
+        assert_eq!(r.timeout_ms(at, 100), 20);
+        assert_eq!(r.timeout_ms(at, 10), 10);
     }
 
-    /// Poll at `at`, and again one settle interval later. A change that was
-    /// there at `at` is reported by the second.
-    fn changed_after_settling(r: &mut ConfigReloader, at: Instant) -> Option<Changed> {
-        assert_eq!(poll_at(r, at), None, "reported before it settled");
-        r.tick(at + RELOAD_DEBOUNCE)
+    #[test]
+    fn a_single_write_is_one_reload_with_no_delay() {
+        let (_d, site, proc, seen) = pair();
+        let mut r = ConfigReloader::polling_only(&site, &proc, seen);
+        let t0 = Instant::now() + RELOAD_POLL;
+        put(&site, "a = 12\n");
+        let c = r.tick(t0).expect("reported at once");
+        assert!(c.site && !c.process, "{c:?}");
+        for ms in [50, 100, 150, 400, 900] {
+            r.next_poll_for_test(t0 + Duration::from_millis(ms));
+            assert_eq!(r.tick(t0 + Duration::from_millis(ms)), None, "{ms} ms");
+        }
     }
 
-    /// Only the process config.
-    const PROCESS: Changed = Changed {
-        site: false,
-        process: true,
-    };
+    #[test]
+    fn a_change_soon_after_a_report_is_not_held_for_long() {
+        // A publisher that touches the config twice in quick succession needs
+        // the second reload promptly: an edge clears its cache on each touch,
+        // and a backend that reloads late leaves a stale page cached.
+        let (_d, site, proc, seen) = pair();
+        let mut r = ConfigReloader::polling_only(&site, &proc, seen);
+        let t0 = Instant::now() + RELOAD_POLL;
+        put(&proc, "b = 12\n");
+        assert!(r.tick(t0).is_some());
+        put(&proc, "b = 123\n");
+        let at = t0 + Duration::from_millis(40);
+        r.next_poll_for_test(at);
+        assert!(r.tick(at).is_some(), "a change 40 ms later was held back");
+    }
+
+    #[test]
+    fn retries_back_off_to_a_cap() {
+        let (_d, site, proc, seen) = pair();
+        let mut r = ConfigReloader::polling_only(&site, &proc, seen);
+        put(&proc, "b = 12\n");
+        let mut now = Instant::now() + RELOAD_POLL;
+        let mut c = r.tick(now).expect("reported");
+        let mut delays = Vec::new();
+        for _ in 0..9 {
+            let d = r.retry(c, now);
+            delays.push(d.as_secs());
+            // Not before the delay, then reported.
+            assert_eq!(r.tick(now + d - Duration::from_millis(1)), None);
+            now += d;
+            c = r.tick(now).expect("the retry is reported when due");
+        }
+        assert_eq!(delays, [1, 2, 4, 8, 16, 32, 60, 60, 60]);
+    }
+
+    #[test]
+    fn a_real_write_after_failures_is_reported_at_once_and_resets_the_backoff() {
+        let (_d, site, proc, seen) = pair();
+        let mut r = ConfigReloader::polling_only(&site, &proc, seen);
+        put(&proc, "b = 12\n");
+        let mut now = Instant::now() + RELOAD_POLL;
+        let c = r.tick(now).expect("reported");
+        assert_eq!(r.retry(c, now), Duration::from_secs(1));
+        now += Duration::from_secs(1);
+        let c = r.tick(now).unwrap();
+        assert_eq!(r.retry(c, now), Duration::from_secs(2));
+        // A real write, long before the 2 s retry is due.
+        put(&proc, "b = 123456\n");
+        now += Duration::from_millis(300);
+        r.next_poll_for_test(now);
+        let c = r.tick(now + RELOAD_DEBOUNCE).expect("reported at once");
+        assert!(c.process);
+        // And the next failure starts from one second again.
+        assert_eq!(r.retry(c, now), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_writer_that_never_stops_still_gets_a_change_each_second() {
+        let (_d, site, proc, seen) = pair();
+        let mut r = ConfigReloader::polling_only(&site, &proc, seen);
+        let t0 = Instant::now() + RELOAD_POLL;
+        let mut reported = 0;
+        // A write every 50 ms for just over two seconds, polled every 50 ms, so
+        // the deadline is re-armed before it is ever reached.
+        for i in 0..=45u64 {
+            let now = t0 + Duration::from_millis(50 * i);
+            put(&proc, &format!("b = {}\n", "1".repeat(2 + i as usize)));
+            // The poll runs once a second, so make the loop poll every step.
+            r.next_poll_for_test(now);
+            if r.tick(now).is_some() {
+                reported += 1;
+            }
+        }
+        assert!(
+            reported >= 2,
+            "a writer that never stops starved the reload: {reported}"
+        );
+    }
+
+    #[test]
+    fn another_file_in_the_same_directory_is_not_a_change() {
+        let (d, site, proc, seen) = pair();
+        let mut r = ConfigReloader::new(&site, &proc, seen);
+        put(&d.path().join("other.toml"), "x = 1\n");
+        assert_eq!(wait_for_change(&mut r, 400), None);
+    }
+
+    #[test]
+    fn one_file_for_both_reports_both() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let one = dir.path().join("site.toml");
+        put(&one, "a = 1\n");
+        let seen = Seen::read(&one, &one);
+        let mut r = ConfigReloader::new(&one, &one, seen);
+        put(&one, "a = 22\n");
+        let c = wait_for_change(&mut r, 5_000).expect("change");
+        assert!(c.site && c.process, "{c:?}");
+    }
+
+    #[test]
+    fn the_poll_finds_a_change_with_no_watcher() {
+        let (_d, site, proc, seen) = pair();
+        let mut r = ConfigReloader::polling_only(&site, &proc, seen);
+        assert_eq!(r.raw_fd(), None);
+        put(&proc, "b = 99999\n");
+        let t0 = Instant::now() + RELOAD_POLL;
+        let c = r.tick(t0).expect("the poll saw it");
+        assert!(c.process && !c.site, "{c:?}");
+    }
+
+    #[test]
+    fn a_change_before_the_reloader_existed_is_reported_on_the_first_tick() {
+        let (_d, site, proc, seen) = pair();
+        // Seeded first, then written, then the reloader built: the write is in
+        // the gap a watcher created afterwards would never see.
+        put(&site, "a = 4444\n");
+        let mut r = ConfigReloader::polling_only(&site, &proc, seen);
+        let t0 = Instant::now() + RELOAD_POLL;
+        let c = r.tick(t0).expect("reported");
+        assert!(c.site && !c.process, "{c:?}");
+    }
+
+    #[test]
+    fn a_failed_load_is_not_retried_until_the_next_write() {
+        let (_d, site, proc, seen) = pair();
+        let mut r = ConfigReloader::polling_only(&site, &proc, seen);
+        put(&proc, "b = 5555\n");
+        let t0 = Instant::now() + RELOAD_POLL;
+        assert!(r.tick(t0).is_some());
+        // Nothing written since: the next polls report nothing.
+        assert_eq!(r.tick(t0 + RELOAD_POLL * 2), None);
+        assert_eq!(r.tick(t0 + RELOAD_POLL * 3), None);
+    }
 
     /// A rename of the config is one report each, whenever the loop happens to
     /// wake relative to the rename, on a machine with every core busy.
     ///
     /// Ignored in the workspace run because its busy threads starve the other
-    /// timing tests for about 20 s. Run it alone on the build host: `cargo test
+    /// timing tests for about 40 s. Run it alone on the build host: `cargo test
     /// -p m6-core --lib -- --ignored each_rename_over_the_config`.
     #[test]
     #[ignore = "busy threads starve other timing tests; run alone, see above"]
@@ -978,269 +1168,19 @@ mod tests {
         assert!(extra.is_empty(), "renames reported twice: {extra:?}");
     }
 
-    #[test]
-    fn a_touch_of_the_process_config_is_reported_as_process() {
-        let (_d, site, proc, seen) = pair();
-        let mut r = ConfigReloader::new(&site, &proc, seen);
-        let now = filetime::FileTime::now();
-        filetime::set_file_times(&proc, now, now).expect("touch");
-        let c = wait_for_change(&mut r, 5_000).expect("a touch is a change");
-        assert!(c.process, "{c:?}");
-        assert!(!c.site, "{c:?}");
-    }
-
-    #[test]
-    fn a_rename_over_site_toml_is_reported_as_site() {
-        let (d, site, proc, seen) = pair();
-        let mut r = ConfigReloader::new(&site, &proc, seen);
-        let tmp = d.path().join("site.toml.new");
-        put(&tmp, "a = 22222\n");
-        std::fs::rename(&tmp, &site).expect("rename");
-        let c = wait_for_change(&mut r, 5_000).expect("a rename is a change");
-        assert!(c.site, "{c:?}");
-        assert!(!c.process, "{c:?}");
-    }
-
-    /// The first change after quiet is reported one settle interval after it is
-    /// seen, once, and not again.
-    #[test]
-    fn a_single_write_is_one_report_one_debounce_after_it_is_seen() {
-        let (_d, site, proc, seen) = pair();
-        let mut r = ConfigReloader::polling_only(&site, &proc, seen);
-        let t0 = Instant::now() + RELOAD_POLL;
-        put(&site, "a = 12\n");
-        assert_eq!(poll_at(&mut r, t0), None);
-        assert_eq!(r.timeout_ms(t0, 100), 20, "the loop must wake to settle");
-        assert_eq!(
-            r.tick(t0 + RELOAD_DEBOUNCE - Duration::from_millis(1)),
-            None
-        );
-        let c = r.tick(t0 + RELOAD_DEBOUNCE).expect("reported when settled");
-        assert!(c.site && !c.process, "{c:?}");
-        for ms in [50, 100, 150, 400, 900] {
-            assert_eq!(
-                poll_at(&mut r, t0 + Duration::from_millis(ms)),
-                None,
-                "{ms} ms"
-            );
-        }
-    }
-
-    /// A write that lands while a change is settling restarts the settle, so a
-    /// writer that truncates and then writes is read once, after the write.
-    #[test]
-    fn a_write_during_the_settle_restarts_it() {
-        let (_d, site, proc, seen) = pair();
-        let mut r = ConfigReloader::polling_only(&site, &proc, seen);
-        let t0 = Instant::now() + RELOAD_POLL;
-        put(&proc, "b = 12\n");
-        assert_eq!(poll_at(&mut r, t0), None);
-        let t1 = t0 + Duration::from_millis(10);
-        put(&proc, "b = 123\n");
-        assert_eq!(poll_at(&mut r, t1), None);
-        assert_eq!(
-            r.tick(t0 + RELOAD_DEBOUNCE),
-            None,
-            "the first settle was kept"
-        );
-        assert_eq!(r.tick(t1 + RELOAD_DEBOUNCE), Some(PROCESS));
-    }
-
-    #[test]
-    fn a_burst_of_writes_is_one_report() {
-        let (_d, site, proc, seen) = pair();
-        let mut r = ConfigReloader::polling_only(&site, &proc, seen);
-        let t0 = Instant::now() + RELOAD_POLL;
-        for (i, body) in ["b = 12\n", "b = 123\n", "b = 1234\n"]
-            .into_iter()
-            .enumerate()
-        {
-            put(&proc, body);
-            let at = t0 + Duration::from_millis(10 * i as u64);
-            assert_eq!(poll_at(&mut r, at), None);
-        }
-        let settled = t0 + Duration::from_millis(20) + RELOAD_DEBOUNCE;
-        assert_eq!(r.tick(settled), Some(PROCESS));
-        assert_eq!(r.tick(t0 + Duration::from_millis(600)), None);
-    }
-
-    /// A change that follows a report is reported as soon as it settles, so a
-    /// publisher that touches the config twice gets a reload for each.
-    #[test]
-    fn a_change_soon_after_a_report_is_reported_one_debounce_later() {
-        let (_d, site, proc, seen) = pair();
-        let mut r = ConfigReloader::polling_only(&site, &proc, seen);
-        let t0 = Instant::now() + RELOAD_POLL;
-        put(&proc, "b = 12\n");
-        assert!(changed_after_settling(&mut r, t0).is_some());
-        put(&proc, "b = 123\n");
-        let at = t0 + Duration::from_millis(40);
-        assert!(changed_after_settling(&mut r, at).is_some());
-    }
-
-    #[test]
-    fn retries_back_off_to_a_cap() {
-        let (_d, site, proc, seen) = pair();
-        let mut r = ConfigReloader::polling_only(&site, &proc, seen);
-        put(&proc, "b = 12\n");
-        let t0 = Instant::now() + RELOAD_POLL;
-        let mut c = changed_after_settling(&mut r, t0).expect("reported");
-        let mut now = t0 + RELOAD_DEBOUNCE;
-        let mut delays = Vec::new();
-        for _ in 0..9 {
-            let d = r.retry(c, now);
-            delays.push(d.as_secs());
-            // Not before the delay, then reported.
-            assert_eq!(r.tick(now + d - Duration::from_millis(1)), None);
-            now += d;
-            c = r.tick(now).expect("the retry is reported when due");
-        }
-        assert_eq!(delays, [1, 2, 4, 8, 16, 32, 60, 60, 60]);
-    }
-
-    #[test]
-    fn a_real_write_after_failures_is_reported_once_settled_and_resets_the_backoff() {
-        let (_d, site, proc, seen) = pair();
-        let mut r = ConfigReloader::polling_only(&site, &proc, seen);
-        put(&proc, "b = 12\n");
-        let t0 = Instant::now() + RELOAD_POLL;
-        let c = changed_after_settling(&mut r, t0).expect("reported");
-        let mut now = t0 + RELOAD_DEBOUNCE;
-        assert_eq!(r.retry(c, now), Duration::from_secs(1));
-        now += Duration::from_secs(1);
-        let c = r.tick(now).unwrap();
-        assert_eq!(r.retry(c, now), Duration::from_secs(2));
-        // A real write, long before the 2 s retry is due.
-        put(&proc, "b = 123456\n");
-        now += Duration::from_millis(300);
-        let c = changed_after_settling(&mut r, now).expect("reported once settled");
-        assert!(c.process);
-        // And the next failure starts from one second again.
-        assert_eq!(r.retry(c, now), Duration::from_secs(1));
-    }
-
-    /// A writer that never stops is reported once a second while it goes on,
-    /// not never.
-    #[test]
-    fn a_writer_that_never_stops_still_gets_a_change_each_second() {
-        let (_d, site, proc, seen) = pair();
-        let mut r = ConfigReloader::polling_only(&site, &proc, seen);
-        let t0 = Instant::now() + RELOAD_POLL;
-        let mut reported = 0;
-        // A write every 10 ms for just over two seconds, so the settle is
-        // restarted before it is ever reached.
-        for i in 0..=225u64 {
-            let now = t0 + Duration::from_millis(10 * i);
-            put(&proc, &format!("b = {}\n", "1".repeat(2 + i as usize)));
-            if poll_at(&mut r, now).is_some() {
-                reported += 1;
-            }
-        }
-        assert!(
-            reported >= 2,
-            "a writer that never stops starved the reload: {reported}"
-        );
-    }
-
-    #[test]
-    fn another_file_in_the_same_directory_is_not_a_change() {
-        let (d, site, proc, seen) = pair();
-        let mut r = ConfigReloader::new(&site, &proc, seen);
-        put(&d.path().join("other.toml"), "x = 1\n");
-        assert_eq!(wait_for_change(&mut r, 400), None);
-    }
-
-    #[test]
-    fn one_file_for_both_reports_both() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let one = dir.path().join("site.toml");
-        put(&one, "a = 1\n");
-        let seen = Seen::read(&one, &one);
-        let mut r = ConfigReloader::new(&one, &one, seen);
-        put(&one, "a = 22\n");
-        let c = wait_for_change(&mut r, 5_000).expect("change");
-        assert!(c.site && c.process, "{c:?}");
-    }
-
-    /// Both files changing together are one report that names both, and no
-    /// later report names either.
-    #[test]
-    fn both_files_changing_together_are_reported_once_each() {
-        let (_d, site, proc, seen) = pair();
-        let mut r = ConfigReloader::polling_only(&site, &proc, seen);
-        let t0 = Instant::now() + RELOAD_POLL;
-        put(&site, "a = 22\n");
-        put(&proc, "b = 22\n");
-        let c = changed_after_settling(&mut r, t0).expect("reported");
-        assert!(c.site && c.process, "{c:?}");
-        assert_eq!(poll_at(&mut r, t0 + RELOAD_POLL), None);
-        assert_eq!(poll_at(&mut r, t0 + RELOAD_POLL * 2), None);
-    }
-
-    /// One file settling must not hold back, or cancel, the other.
-    #[test]
-    fn a_change_to_one_file_does_not_restart_the_settle_of_the_other() {
-        let (_d, site, proc, seen) = pair();
-        let mut r = ConfigReloader::polling_only(&site, &proc, seen);
-        let t0 = Instant::now() + RELOAD_POLL;
-        put(&site, "a = 22\n");
-        assert_eq!(poll_at(&mut r, t0), None);
-        let t1 = t0 + Duration::from_millis(10);
-        put(&proc, "b = 22\n");
-        assert_eq!(poll_at(&mut r, t1), None);
-        let c = r.tick(t0 + RELOAD_DEBOUNCE).expect("site settled first");
-        assert!(c.site && !c.process, "{c:?}");
-        let c = r.tick(t1 + RELOAD_DEBOUNCE).expect("process settled next");
-        assert!(c.process && !c.site, "{c:?}");
-    }
-
-    #[test]
-    fn the_poll_finds_a_change_with_no_watcher() {
-        let (_d, site, proc, seen) = pair();
-        let mut r = ConfigReloader::polling_only(&site, &proc, seen);
-        assert_eq!(r.raw_fd(), None);
-        put(&proc, "b = 99999\n");
-        let t0 = Instant::now() + RELOAD_POLL;
-        let c = changed_after_settling(&mut r, t0).expect("the poll saw it");
-        assert_eq!(c, PROCESS);
-    }
-
-    /// A lost watch, a full event queue and a watch that could not be added all
-    /// leave events unread. The poll alone must still find the change.
-    #[test]
-    fn the_poll_finds_a_change_whose_events_are_never_read() {
-        let (_d, site, proc, seen) = pair();
-        let mut r = ConfigReloader::new(&site, &proc, seen);
-        put(&proc, "b = 99999\n");
-        let t0 = Instant::now() + RELOAD_POLL;
-        assert_eq!(changed_after_settling(&mut r, t0), Some(PROCESS));
-    }
-
-    #[test]
-    fn a_change_before_the_reloader_existed_is_reported_once_settled() {
-        let (_d, site, proc, seen) = pair();
-        // Seeded first, then written, then the reloader built: the write is in
-        // the gap a watcher created afterwards would never see.
-        put(&site, "a = 4444\n");
-        let mut r = ConfigReloader::polling_only(&site, &proc, seen);
-        let t0 = Instant::now() + RELOAD_POLL;
-        let c = changed_after_settling(&mut r, t0).expect("reported");
-        assert!(c.site && !c.process, "{c:?}");
-    }
-
-    #[test]
-    fn a_failed_load_is_not_retried_until_the_next_write() {
-        let (_d, site, proc, seen) = pair();
-        let mut r = ConfigReloader::polling_only(&site, &proc, seen);
-        put(&proc, "b = 5555\n");
-        let t0 = Instant::now() + RELOAD_POLL;
-        assert!(changed_after_settling(&mut r, t0).is_some());
-        // Nothing written since: the next polls report nothing.
-        assert_eq!(poll_at(&mut r, t0 + RELOAD_POLL * 2), None);
-        assert_eq!(poll_at(&mut r, t0 + RELOAD_POLL * 3), None);
-    }
-
     // ── what counts as a change ──────────────────────────────────────────
+
+    /// Poll at `at`, which fingerprints both files then.
+    fn poll_at(r: &mut ConfigReloader, at: Instant) -> Option<Changed> {
+        r.next_poll_for_test(at);
+        r.tick(at)
+    }
+
+    /// Only the process config.
+    const PROCESS: Changed = Changed {
+        site: false,
+        process: true,
+    };
 
     fn mtime_of(path: &Path) -> filetime::FileTime {
         filetime::FileTime::from_last_modification_time(&std::fs::metadata(path).expect("stat"))
@@ -1260,11 +1200,11 @@ mod tests {
         std::fs::rename(&tmp, &proc).expect("rename");
         let t0 = Instant::now() + RELOAD_POLL;
         assert_eq!(poll_at(&mut r, t0), None);
-        assert_eq!(r.tick(t0 + RELOAD_DEBOUNCE), None);
+        assert_eq!(poll_at(&mut r, t0 + RELOAD_POLL), None);
     }
 
-    /// The completed rename is the change: once, whichever of the event and the
-    /// poll finds it first.
+    /// The completed rename is the change: once, at once, and the poll that
+    /// follows has nothing to add.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_completed_rename_is_one_report() {
@@ -1277,9 +1217,7 @@ mod tests {
         assert!(crate::server::poll_listener_and_watcher(fd, None, 5_000).listener);
         let now = Instant::now();
         r.on_readable(now);
-        assert_eq!(r.tick(now), None);
-        assert_eq!(r.tick(now + RELOAD_DEBOUNCE), Some(PROCESS));
-        // The poll finds the same file and has nothing to add.
+        assert_eq!(r.tick(now), Some(PROCESS));
         assert_eq!(poll_at(&mut r, now + RELOAD_POLL), None);
         assert_eq!(r.tick(now + RELOAD_POLL * 2), None);
     }
@@ -1293,8 +1231,7 @@ mod tests {
         let mut t = Instant::now() + RELOAD_POLL;
         for mode in [0o000, 0o644] {
             std::fs::set_permissions(&proc, std::fs::Permissions::from_mode(mode)).expect("chmod");
-            let c = changed_after_settling(&mut r, t);
-            assert_eq!(c, Some(PROCESS), "mode {mode:o}");
+            assert_eq!(poll_at(&mut r, t), Some(PROCESS), "mode {mode:o}");
             t += RELOAD_POLL;
         }
     }
@@ -1308,8 +1245,7 @@ mod tests {
         let was = std::fs::metadata(&proc).expect("stat").permissions().mode() & 0o777;
         let now = if was == 0o600 { 0o640 } else { 0o600 };
         std::fs::set_permissions(&proc, std::fs::Permissions::from_mode(now)).expect("chmod");
-        let t0 = Instant::now() + RELOAD_POLL;
-        assert_eq!(changed_after_settling(&mut r, t0), Some(PROCESS));
+        assert_eq!(poll_at(&mut r, Instant::now() + RELOAD_POLL), Some(PROCESS));
     }
 
     /// A rewrite of the same length inside one timestamp tick, which leaves the
@@ -1321,18 +1257,101 @@ mod tests {
         let mtime = mtime_of(&proc);
         put(&proc, "b = 2\n");
         filetime::set_file_mtime(&proc, mtime).expect("mtime");
-        let t0 = Instant::now() + RELOAD_POLL;
-        assert_eq!(changed_after_settling(&mut r, t0), Some(PROCESS));
+        assert_eq!(poll_at(&mut r, Instant::now() + RELOAD_POLL), Some(PROCESS));
     }
 
-    /// `touch` is a change: the documented way to ask for a reload.
+    /// `touch` is a change when it moves the mtime: the documented way to ask for
+    /// a reload.
     #[test]
     fn a_touch_with_the_same_bytes_is_a_change() {
         let (_d, site, proc, seen) = pair();
         let mut r = ConfigReloader::polling_only(&site, &proc, seen);
         let later = filetime::FileTime::from_unix_time(mtime_of(&proc).unix_seconds() + 5, 0);
         filetime::set_file_mtime(&proc, later).expect("touch");
+        assert_eq!(poll_at(&mut r, Instant::now() + RELOAD_POLL), Some(PROCESS));
+    }
+
+    /// Both files changing together are one report that names both, and no
+    /// later report names either.
+    #[test]
+    fn both_files_changing_together_are_reported_once_each() {
+        let (_d, site, proc, seen) = pair();
+        let mut r = ConfigReloader::polling_only(&site, &proc, seen);
         let t0 = Instant::now() + RELOAD_POLL;
-        assert_eq!(changed_after_settling(&mut r, t0), Some(PROCESS));
+        put(&site, "a = 22\n");
+        put(&proc, "b = 22\n");
+        let c = poll_at(&mut r, t0).expect("reported");
+        assert!(c.site && c.process, "{c:?}");
+        assert_eq!(poll_at(&mut r, t0 + RELOAD_POLL), None);
+        assert_eq!(poll_at(&mut r, t0 + RELOAD_POLL * 2), None);
+    }
+
+    /// A lost watch, a full event queue and a watch that could not be added all
+    /// leave events unread. The poll alone must still find the change.
+    #[test]
+    fn the_poll_finds_a_change_whose_events_are_never_read() {
+        let (_d, site, proc, seen) = pair();
+        let mut r = ConfigReloader::new(&site, &proc, seen);
+        put(&proc, "b = 99999\n");
+        assert_eq!(poll_at(&mut r, Instant::now() + RELOAD_POLL), Some(PROCESS));
+    }
+
+    /// An event that names a config file but changes nothing is not a change.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_event_that_changes_nothing_is_not_a_change() {
+        let (_d, site, proc, seen) = pair();
+        let mut r = ConfigReloader::new(&site, &proc, seen);
+        let mtime = mtime_of(&proc);
+        filetime::set_file_times(&proc, mtime, mtime).expect("same times");
+        let fd = r.raw_fd().unwrap();
+        assert!(crate::server::poll_listener_and_watcher(fd, None, 5_000).listener);
+        let now = Instant::now();
+        r.on_readable(now);
+        assert_eq!(r.tick(now), None);
+    }
+
+    /// A write to another file beside the configs does not cost a check. A
+    /// change the events have not yet shown stays unseen until the poll.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_write_to_an_unrelated_file_does_not_check() {
+        let (d, site, proc, seen) = pair();
+        let mut r = ConfigReloader::new(&site, &proc, seen);
+        put(&proc, "b = 99999\n");
+        // Take the config's own events away, so only the unrelated write is left.
+        let names = [r.site_name.as_str(), r.process_name.as_str()];
+        assert!(r.watcher.as_mut().unwrap().read_events(&names));
+        put(&d.path().join("other.toml"), "x = 1\n");
+        let fd = r.raw_fd().unwrap();
+        assert!(crate::server::poll_listener_and_watcher(fd, None, 5_000).listener);
+        let now = Instant::now();
+        r.on_readable(now);
+        assert_eq!(r.tick(now), None, "an unrelated write caused a check");
+        assert_eq!(poll_at(&mut r, Instant::now() + RELOAD_POLL), Some(PROCESS));
+    }
+
+    /// Events lost to a full queue could have named either file, so both are
+    /// checked.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_queue_overflow_names_every_file() {
+        use nix::sys::inotify::AddWatchFlags as F;
+        let mut matched = [false; 2];
+        note_event(
+            &mut matched,
+            &["site.toml", "app.conf"],
+            F::IN_Q_OVERFLOW,
+            None,
+        );
+        assert_eq!(matched, [true, true]);
+        let mut matched = [false; 2];
+        note_event(
+            &mut matched,
+            &["site.toml", "app.conf"],
+            F::IN_MOVED_TO,
+            Some("app.conf"),
+        );
+        assert_eq!(matched, [false, true]);
     }
 }
