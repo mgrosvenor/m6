@@ -83,7 +83,7 @@ Verified with `l2_query_relpath_cannot_replace_the_path_parameter` and `l2_query
 
 **A shutdown now waits for every request the thread pool has accepted, including one a worker has not yet started, and gives up after `[server] drain_timeout_s` (#338).**
 The pool counted a request in flight only once a worker woke to run it, so a SIGTERM landing in that gap let the drain see nothing in flight and the process exit under the request. A queued request was not counted either. The pool now counts a request when it accepts it, with one atomic add on the accept thread, and a panicking handler stops counting.
-The drain now returns the moment the last request finishes, where it used to poll every 10 ms, and it ends at `drain_timeout_s` (default 30, `0` waits for none) with a warning that counts the requests left, so a full queue of slow clients cannot hold a stop past systemd's 90 s. The key is read at startup, and a reload that changes it logs that a restart is needed.
+The drain returns the moment the last request finishes, and it ends at `drain_timeout_s` (default 30, `0` waits for none) with a warning that counts the requests left, so a full queue of slow clients cannot hold a stop past systemd's 90 s. The key is read at startup, and a reload that changes it logs that a restart is needed.
 The m6-html shutdown test failed 57 times in 150 runs under CPU load before the change and 0 in 200 after. Its held-request step also confirms the service accepted the request, which the probe's 503 alone did not show.
 The test harness's `Service::wait_for_exit` and `terminate` now also wait for the output threads to copy a child's last lines, which a test reading `output()` straight after the exit could miss.
 
