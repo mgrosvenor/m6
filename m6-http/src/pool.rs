@@ -91,16 +91,11 @@ impl BackendPool {
     /// Pick the least-connections available member.
     /// Returns index into members.
     fn pick_member(&mut self) -> Option<usize> {
-        let now = Instant::now();
         let mut best: Option<usize> = None;
         let mut best_conns = usize::MAX;
 
         for (i, m) in self.members.iter().enumerate() {
-            let available = match m.retry_at {
-                None => true,
-                Some(t) => now >= t,
-            };
-            if available && m.connections < best_conns {
+            if m.is_available() && m.connections < best_conns {
                 best_conns = m.connections;
                 best = Some(i);
             }
