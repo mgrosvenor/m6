@@ -159,31 +159,13 @@ fn handle_login_form(req: &RawRequest, state: &AppState, db: &Db, peer_ip: &str)
         }
     };
 
-    // The password was right, so this IP's failure count goes away. Without this
-    // a person who mistyped five times and then got it right stayed locked out
-    // for the rest of the window.
-    note_login_success(state, peer_ip);
-
-    // Issue tokens
-    let (access_jwt, refresh_jwt) =
-        match issue_tokens(state, &user.id, &user.username, &user.groups, &user.roles) {
-            Ok(p) => p,
-            Err(e) => {
-                warn!(error = %e, "failed to issue tokens");
-                return internal_error();
-            }
-        };
-
-    // Store refresh token hash
-    let refresh_hash = hash_token(&refresh_jwt);
-    let now = now_secs();
-    if let Err(e) = db.refresh_token_store(&user.id, &refresh_hash, now + state.refresh_ttl as i64)
-    {
-        warn!(error = %e, "failed to store refresh token");
-        return internal_error();
-    }
-
-    info!(username = %user.username, ip = %peer_ip, "login success");
+    let (access_jwt, refresh_jwt) = match finish_login(state, db, &user, peer_ip) {
+        Ok(pair) => pair,
+        Err(e) => {
+            warn!(error = %e, "login failed after password check");
+            return internal_error();
+        }
+    };
 
     let session_cookie = format!(
         "session={}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age={}",
@@ -231,31 +213,13 @@ fn handle_login_json(req: &RawRequest, state: &AppState, db: &Db, peer_ip: &str)
         }
     };
 
-    // The password was right, so this IP's failure count goes away. Without this
-    // a person who mistyped five times and then got it right stayed locked out
-    // for the rest of the window.
-    note_login_success(state, peer_ip);
-
-    // Issue tokens
-    let (access_jwt, refresh_jwt) =
-        match issue_tokens(state, &user.id, &user.username, &user.groups, &user.roles) {
-            Ok(p) => p,
-            Err(e) => {
-                warn!(error = %e, "failed to issue tokens");
-                return internal_error();
-            }
-        };
-
-    // Store refresh token hash
-    let refresh_hash = hash_token(&refresh_jwt);
-    let now = now_secs();
-    if let Err(e) = db.refresh_token_store(&user.id, &refresh_hash, now + state.refresh_ttl as i64)
-    {
-        warn!(error = %e, "failed to store refresh token");
-        return internal_error();
-    }
-
-    info!(username = %user.username, ip = %peer_ip, "login success");
+    let (access_jwt, refresh_jwt) = match finish_login(state, db, &user, peer_ip) {
+        Ok(pair) => pair,
+        Err(e) => {
+            warn!(error = %e, "login failed after password check");
+            return internal_error();
+        }
+    };
 
     let resp_body = serde_json::json!({
         "access_token":  access_jwt,
@@ -450,6 +414,28 @@ fn handle_public_key(state: &AppState) -> RawResponse {
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Complete a login whose password was right: clear the IP's failure count,
+/// issue both tokens, store the refresh hash, and log the success. The form and
+/// JSON handlers share this sequence so the two cannot drift apart.
+fn finish_login(
+    state: &AppState,
+    db: &Db,
+    user: &m6_auth::User,
+    peer_ip: &str,
+) -> anyhow::Result<(String, String)> {
+    note_login_success(state, peer_ip);
+
+    let (access_jwt, refresh_jwt) =
+        issue_tokens(state, &user.id, &user.username, &user.groups, &user.roles)?;
+
+    let refresh_hash = hash_token(&refresh_jwt);
+    let now = now_secs();
+    db.refresh_token_store(&user.id, &refresh_hash, now + state.refresh_ttl as i64)?;
+
+    info!(username = %user.username, ip = %peer_ip, "login success");
+    Ok((access_jwt, refresh_jwt))
+}
 
 fn issue_tokens(
     state: &AppState,
