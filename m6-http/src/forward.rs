@@ -1494,9 +1494,6 @@ mod smuggling_tests {
         }
     }
 
-    /// A header the proxy strips can never reach the backend, so refusing on it
-    /// would reject traffic for no gain. Pinned so the skip list and the check
-    /// cannot drift apart into either a hole or a false refusal.
     /// Only m6-http's own refusal is a refusal. The wrong outcome: an
     /// `InvalidInput` the operating system raises (a zero read timeout, a
     /// socket path too long) passes for one, so a misconfigured backend is
@@ -1510,6 +1507,9 @@ mod smuggling_tests {
         assert!(!is_refusal(&io::Error::from(io::ErrorKind::InvalidInput)));
     }
 
+    /// A header the proxy strips can never reach the backend, so refusing on it
+    /// would reject traffic for no gain. Pinned so the skip list and the check
+    /// cannot drift apart into either a hole or a false refusal.
     #[test]
     fn hop_by_hop_headers_are_not_judged() {
         let mut r = req_with("Connection", "keep-alive\r\nX-Injected: yes");
