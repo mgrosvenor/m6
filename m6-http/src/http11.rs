@@ -44,7 +44,7 @@ pub enum RequestOutcome {
 
 enum ConnKind {
     /// TLS handshake in progress; protocol not yet known.
-    Handshake { client_ip: String, created: Instant },
+    Handshake { created: Instant },
     /// HTTP/1.1 after handshake.
     Http1(H1Conn),
     /// HTTP/2 after handshake.
@@ -98,6 +98,9 @@ struct Conn {
     /// exchange. Stamped at the same moment as `handshake_ns`.
     handshake_resumed: bool,
     stream: TcpStream,
+    /// Client address, captured once at accept. Reading it here avoids a
+    /// `peer_addr()` syscall and a `String` allocation per request-path drive.
+    client_ip: String,
     /// `None` on a plaintext listener. HTTP/2 already carried this
     /// distinction (`H2Io::Tls` / `H2Io::Plain`); this gives HTTP/1.1 the same
     /// one, so `:80` runs this code rather than a second implementation.
@@ -137,7 +140,6 @@ enum H1State {
 
 struct H1Conn {
     state: H1State,
-    client_ip: String,
     /// Reset at the start of each request on a reused connection, so the
     /// timeout below is idle time and not total connection age.
     created: Instant,
@@ -298,15 +300,14 @@ impl Http11Listener {
                         None => None,
                     };
                     poller.add(stream.as_raw_fd(), token).ok();
+                    let client_ip = peer.ip().to_string();
                     let kind = if tls.is_some() {
                         ConnKind::Handshake {
-                            client_ip: peer.ip().to_string(),
                             created: Instant::now(),
                         }
                     } else {
                         ConnKind::Http1(H1Conn {
                             state: H1State::Reading { buf: Vec::new() },
-                            client_ip: peer.ip().to_string(),
                             created: Instant::now(),
                             keep_alive: false,
                             served: 0,
@@ -318,6 +319,7 @@ impl Http11Listener {
                         handshake_h2: false,
                         handshake_resumed: false,
                         stream,
+                        client_ip,
                         tls,
                         kind,
                     });
@@ -704,6 +706,7 @@ where
                 stream: &conn.stream,
             },
             h1,
+            &conn.client_ip,
             on_request,
             on_response,
         );
@@ -714,17 +717,12 @@ where
 
     // HTTP/2: stream and tls are in conn; pass them by reference.
     if let ConnKind::Http2(h2) = &mut conn.kind {
-        let client_ip = conn
-            .stream
-            .peer_addr()
-            .map(|a| a.ip().to_string())
-            .unwrap_or_default();
         h2.drive(
             H2Io::Tls {
                 tls: conn.tls.as_mut().expect("tls path"),
                 stream: &conn.stream,
             },
-            &client_ip,
+            &conn.client_ip,
             on_request,
             on_response,
         );
@@ -783,7 +781,6 @@ where
     if tls_failed {
         conn.kind = ConnKind::Http1(H1Conn {
             state: H1State::Done,
-            client_ip: String::new(),
             created: Instant::now(),
             keep_alive: false,
             served: 0,
@@ -798,14 +795,13 @@ where
     }
 
     // Handshake just completed -- dispatch on ALPN.
-    if let ConnKind::Handshake { client_ip, created } = &conn.kind {
+    if let ConnKind::Handshake { created } = &conn.kind {
         let proto = conn
             .tls
             .as_ref()
             .expect("tls path")
             .alpn_protocol()
             .map(|p| p.to_vec());
-        let client_ip = client_ip.clone();
         // Still needed by the H1 branch below, which carries the accept stamp
         // forward as the connection's own age. The handshake DURATION is no
         // longer taken here: it is stamped above, before the error path can
@@ -822,7 +818,7 @@ where
                     tls: conn.tls.as_mut().expect("tls path"),
                     stream: &conn.stream,
                 },
-                &client_ip,
+                &conn.client_ip,
                 on_request,
                 on_response,
             );
@@ -830,7 +826,6 @@ where
         } else {
             conn.kind = ConnKind::Http1(H1Conn {
                 state: H1State::Reading { buf: Vec::new() },
-                client_ip,
                 created,
                 keep_alive: false,
                 served: 0,
@@ -849,6 +844,7 @@ where
             stream: &conn.stream,
         },
         h1,
+        &conn.client_ip,
         on_request,
         on_response,
     );
@@ -918,8 +914,13 @@ impl H1Io<'_> {
     }
 }
 
-fn drive_h1<F, G>(io: &mut H1Io<'_>, h1: &mut H1Conn, on_request: &mut F, on_response: &mut G)
-where
+fn drive_h1<F, G>(
+    io: &mut H1Io<'_>,
+    h1: &mut H1Conn,
+    client_ip: &str,
+    on_request: &mut F,
+    on_response: &mut G,
+) where
     F: FnMut(&HttpRequest, &str) -> RequestOutcome,
     G: FnMut(
         std::io::Result<HttpResponse>,
@@ -1040,7 +1041,7 @@ where
                         crate::forward::strip_untrusted_inbound(&mut req.headers);
                         h1.keep_alive =
                             wants_keep_alive(&req) && h1.served + 1 < MAX_REQUESTS_PER_CONN;
-                        match on_request(&req, &h1.client_ip) {
+                        match on_request(&req, client_ip) {
                             RequestOutcome::Ready(status, resp_headers, body, _) => {
                                 // No 103 Early Hints here. See issue #93 and the
                                 // note in http2.rs where the h2 version lived.
