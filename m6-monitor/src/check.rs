@@ -29,7 +29,7 @@
 
 use std::fmt::Write as _;
 
-use crate::digest::{Digest, Level};
+use crate::digest::{fmt_uptime, header_check_text, Digest, Level};
 use crate::poll::NodeReading;
 
 /// Reverse-lookup results by address, read by [`render`].
@@ -378,7 +378,7 @@ pub fn render(d: &Digest, readings: &[NodeReading], verdicts: &Verdicts) -> Stri
             n.thermal_max_c
                 .map(|c| format!("{c:.0}C"))
                 .unwrap_or_else(|| "-".into()),
-            n.uptime_s.map(fmt_dur).unwrap_or_else(|| "-".into()),
+            n.uptime_s.map(fmt_uptime).unwrap_or_else(|| "-".into()),
         );
         // What each node runs, on the line with load and disk rather than in a
         // section of its own: the question "is this node the one that is behind"
@@ -563,7 +563,6 @@ pub fn render(d: &Digest, readings: &[NodeReading], verdicts: &Verdicts) -> Stri
     // What to expect is declared by the DEPLOYMENT in the fleet config, not here.
     // A cache policy is a property of a site; m6 is a generic web system and has
     // no business knowing that /capabilities wants max-age=60.
-    let mut header_faults: Vec<String> = Vec::new();
     let any_declared = readings.iter().any(|r| !r.header_checks.is_empty());
     let _ = writeln!(o, "\nF. CACHE HEADERS");
     if !any_declared {
@@ -578,35 +577,20 @@ pub fn render(d: &Digest, readings: &[NodeReading], verdicts: &Verdicts) -> Stri
             for hc in &r.header_checks {
                 if hc.passed() {
                     let _ = writeln!(o, "  {:<5} ok     {} {}", r.name, hc.path, hc.header);
-                } else if let Some(e) = &hc.error {
-                    let _ = writeln!(
-                        o,
-                        "  {:<5} FAULT  {} could not be fetched: {}",
-                        r.name, hc.path, e
-                    );
-                    header_faults
-                        .push(format!("{}: {} could not be fetched: {e}", r.name, hc.path));
+                } else if hc.error.is_some() {
+                    let _ = writeln!(o, "  {:<5} FAULT  {}", r.name, header_check_text(hc));
                 } else {
-                    // Absent and wrong are different failures and read
-                    // differently: a missing header is usually a route that lost
-                    // its policy, a wrong one a policy that changed.
-                    let got = hc
-                        .actual
-                        .clone()
-                        .unwrap_or_else(|| "<header absent>".to_string());
                     let code = hc
                         .status
                         .map(|c| format!(" (HTTP {c})"))
                         .unwrap_or_default();
                     let _ = writeln!(
                         o,
-                        "  {:<5} FAULT  {} {} is {:?}, expected {:?}{}",
-                        r.name, hc.path, hc.header, got, hc.expected, code
+                        "  {:<5} FAULT  {}{}",
+                        r.name,
+                        header_check_text(hc),
+                        code
                     );
-                    header_faults.push(format!(
-                        "{}: {} {} is {:?}, expected {:?}",
-                        r.name, hc.path, hc.header, got, hc.expected
-                    ));
                 }
             }
         }
@@ -879,17 +863,7 @@ pub fn render(d: &Digest, readings: &[NodeReading], verdicts: &Verdicts) -> Stri
             let _ = writeln!(o, "  - {}: {}", f.node, f.text);
         }
     }
-    // Header failures are found HERE rather than in the digest, because the digest
-    // is built from /health and /perf and knows nothing about them. They still
-    // have to reach the verdict: a node serving a page with the wrong cache policy
-    // is not "all clear", and printing that it is would be the report lying.
-    if !header_faults.is_empty() {
-        let _ = writeln!(o, "CACHE HEADER FAULTS ({})", header_faults.len());
-        for f in &header_faults {
-            let _ = writeln!(o, "  - {f}");
-        }
-    }
-    if faults.is_empty() && warns.is_empty() && header_faults.is_empty() {
+    if faults.is_empty() && warns.is_empty() {
         let _ = writeln!(o, "ALL CLEAR on all {} nodes.", d.nodes.len());
     }
     let _ = writeln!(o, "{bar}");
@@ -980,20 +954,10 @@ fn verdict_lines(c: &m6_core::monitoring::CrawlerReport, verdicts: &Verdicts) ->
     out
 }
 
-fn fmt_dur(secs: u64) -> String {
-    let d = secs / 86_400;
-    let h = (secs % 86_400) / 3_600;
-    if d > 0 {
-        format!("{d}d{h}h")
-    } else {
-        format!("{h}h")
-    }
-}
-
 /// Seconds left on a certificate, as days.
 ///
 /// Days because that is the unit renewal is discussed in, and a bare `12d` next
-/// to a build hash is read correctly without a legend. Separate from `fmt_dur`
+/// to a build hash is read correctly without a legend. Separate from `fmt_uptime`
 /// because this number goes negative and that one cannot: an expired
 /// certificate reads `EXPIRED 3d ago`, which is a different sentence from a
 /// small positive number and has to look like one on a line being skimmed.
@@ -1178,6 +1142,29 @@ mod tests {
 
     pub(super) fn digest() -> Digest {
         crate::digest::build(&[], &crate::digest::Thresholds::default(), "now".into())
+    }
+
+    /// A node up minutes, not a whole hour, must read "42m" in the check rather
+    /// than collapsing to "0h". The page and the check share one formatter, and
+    /// this pins the minute-aware wording the check renders.
+    #[test]
+    fn a_node_up_minutes_reads_minutes_in_the_check() {
+        let mut r = reading("origin", None);
+        r.perf = Some(crate::digest::tests::perf(
+            m6_core::host::HostSnapshot {
+                cpus: 1,
+                ..Default::default()
+            },
+            vec![],
+        ));
+        r.perf.as_mut().unwrap().uptime_s = 42 * 60;
+        let d = crate::digest::build(
+            std::slice::from_ref(&r),
+            &crate::digest::Thresholds::default(),
+            "now".into(),
+        );
+        let out = render(&d, std::slice::from_ref(&r));
+        assert!(out.contains("svc up 42m"), "{out}");
     }
 
     /// Part A, without journalctl. A node whose main log has gone quiet is a
@@ -1588,8 +1575,13 @@ mod tests {
 /// than no check, because the summary is what gets read.
 #[cfg(test)]
 mod header_check_tests {
-    use super::tests::{digest, hc, reading, render};
+    use super::tests::{hc, reading, render};
     use super::*;
+
+    fn out(rs: &[NodeReading]) -> String {
+        let d = crate::digest::build(rs, &crate::digest::Thresholds::default(), "now".into());
+        render(&d, rs)
+    }
 
     #[test]
     fn a_passing_check_is_reported_and_stays_all_clear() {
@@ -1599,7 +1591,7 @@ mod header_check_tests {
             "public, max-age=60",
             Some("public, max-age=60"),
         ));
-        let out = render(&digest(), &[r]);
+        let out = out(&[r]);
         assert!(out.contains("F. CACHE HEADERS"), "{out}");
         assert!(out.contains("/capabilities"), "{out}");
         assert!(
@@ -1608,14 +1600,21 @@ mod header_check_tests {
         );
     }
 
-    /// The one that matters. A wrong cache policy must reach the verdict.
+    /// The one that matters. A wrong cache policy must reach the verdict, and
+    /// it reaches it through the digest's shared FAULTS list, not a side list.
     #[test]
     fn a_wrong_header_is_a_fault_and_removes_all_clear() {
         let mut r = reading("origin", None);
         r.header_checks
             .push(hc("/capabilities", "public, max-age=60", Some("no-store")));
-        let out = render(&digest(), &[r]);
-        assert!(out.contains("CACHE HEADER FAULTS"), "{out}");
+        let out = out(&[r]);
+        assert!(out.contains("FAULTS (1)"), "{out}");
+        assert!(
+            out.contains(
+                "- origin: /capabilities cache-control is \"no-store\", expected \"public, max-age=60\""
+            ),
+            "{out}"
+        );
         assert!(
             !out.contains("ALL CLEAR"),
             "a node serving the wrong cache policy is not all clear:\n{out}"
@@ -1631,7 +1630,7 @@ mod header_check_tests {
         let mut r = reading("edge-a", None);
         r.header_checks
             .push(hc("/capabilities", "public, max-age=60", None));
-        let out = render(&digest(), &[r]);
+        let out = out(&[r]);
         assert!(out.contains("<header absent>"), "{out}");
         assert!(!out.contains("ALL CLEAR"), "{out}");
     }
@@ -1644,7 +1643,7 @@ mod header_check_tests {
         c.error = Some("connection refused".into());
         c.status = None;
         r.header_checks.push(c);
-        let out = render(&digest(), &[r]);
+        let out = out(&[r]);
         assert!(out.contains("could not be fetched"), "{out}");
         assert!(!out.contains("ALL CLEAR"), "{out}");
     }
@@ -1652,7 +1651,7 @@ mod header_check_tests {
     /// Nothing configured must not read as everything passing.
     #[test]
     fn no_checks_declared_says_so() {
-        let out = render(&digest(), &[reading("origin", None)]);
+        let out = out(&[reading("origin", None)]);
         assert!(out.contains("F. CACHE HEADERS"), "{out}");
         assert!(out.contains("none declared"), "{out}");
         // And it is not a fault: declaring none is a choice, not a failure.
