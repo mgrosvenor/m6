@@ -98,6 +98,12 @@ Verified with `l2_query_relpath_cannot_replace_the_path_parameter` and `l2_query
 
 ### Fixed
 
+**m6-http refuses an HTTP/2 or HTTP/3 request whose `:path` contains a space or a control byte, as HTTP/1.1 already does, and a request it will not forward no longer counts against a backend.**
+Such a request passed ingress and was refused only when forwarded, after a pool member had been chosen, and the refusal marked that member failed.
+It is now malformed at ingress and its stream is reset, as RFC 9113 8.1.1 and RFC 9114 4.1.2 require.
+A request refused when forwarded, for example one with a CR or LF in a header value, no longer counts against the backend.
+A member's failure count now counts transport failures in a row: a completed exchange clears it, and the backoff is capped before it is computed.
+
 **On SIGTERM or SIGINT a service stops accepting, removes its socket and exits, without waiting for requests in progress (#338).**
 A restart on a deploy cuts off a request that is still running, and that is accepted: the supervisor starts the service again at once.
 Waiting for accepted requests took a request counter, a condition variable, a deadline setting and a shutdown hook, and gained nothing a restart does not already do.

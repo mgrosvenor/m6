@@ -3260,6 +3260,12 @@ fn forward_to_backend(
                         pool.release(member_idx);
                         Ok(resp)
                     }
+                    // m6-http refused the request itself, before connecting:
+                    // the request's fault, not the backend's.
+                    Err(e) if forward::is_refusal(&e) => {
+                        pool.cancel(member_idx);
+                        Err(e.to_string())
+                    }
                     Err(e) => {
                         pool.mark_failed(member_idx);
                         Err(e.to_string())

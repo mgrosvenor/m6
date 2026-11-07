@@ -40,7 +40,10 @@ impl PoolMember {
         let secs = if self.failure_count == 0 {
             1
         } else {
-            (1u64 << (self.failure_count - 1)).min(30)
+            // The exponent is capped before the shift: 2^5 already passes the
+            // 30 s ceiling, and an uncapped shift overflows at the 65th
+            // failure, which a release build turns into an abort.
+            (1u64 << (self.failure_count - 1).min(5)).min(30)
         };
         Duration::from_secs(secs)
     }
@@ -149,12 +152,24 @@ impl BackendPool {
         }
     }
 
-    /// Decrement connection count for a member.
+    /// A request to this member completed: release its connection and clear
+    /// its failures. The count is transport failures in a row (connect, I/O,
+    /// timeout), so any completed exchange clears it, whatever the status: a
+    /// member that answers 503 is reachable.
     pub fn release(&mut self, idx: usize) {
         if let Some(m) = self.members.get_mut(idx) {
             if m.connections > 0 {
                 m.connections -= 1;
             }
+            m.mark_success();
+        }
+    }
+
+    /// Release a connection that never reached the member, because m6-http
+    /// refused the request itself. Says nothing about the member's health.
+    pub fn cancel(&mut self, idx: usize) {
+        if let Some(m) = self.members.get_mut(idx) {
+            m.connections = m.connections.saturating_sub(1);
         }
     }
 
@@ -434,6 +449,52 @@ impl PoolManager {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn a_long_run_of_failures_backs_off_thirty_seconds_and_never_overflows() {
+        // An uncapped shift overflows at the 65th failure; a release build
+        // aborts on it.
+        let mut m = PoolMember::new(PathBuf::from("/tmp/x.sock"));
+        for _ in 0..1000 {
+            m.mark_failed();
+        }
+        assert_eq!(m.backoff_duration(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn a_successful_request_clears_the_member_failures() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("a.sock");
+        let mut pool =
+            BackendPool::new("p".into(), dir.path().join("*.sock").display().to_string());
+        pool.add_socket(sock);
+        let (_, idx) = pool.pick_socket().expect("member");
+        pool.mark_failed(idx);
+        assert_eq!(pool.members[idx].failure_count, 1);
+        pool.members[idx].retry_at = None;
+        let (_, idx) = pool.pick_socket().expect("member again");
+        pool.release(idx);
+        assert_eq!(
+            pool.members[idx].failure_count, 0,
+            "a success must reset the count"
+        );
+        assert!(pool.members[idx].retry_at.is_none());
+    }
+
+    #[test]
+    fn a_request_refused_before_forwarding_leaves_the_member_alone() {
+        // The wrong outcome: m6-http's own refusal backs the member off, so
+        // one malformed request makes a one-member pool answer 502.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut pool =
+            BackendPool::new("p".into(), dir.path().join("*.sock").display().to_string());
+        pool.add_socket(dir.path().join("a.sock"));
+        let (_, idx) = pool.pick_socket().expect("member");
+        pool.cancel(idx);
+        assert_eq!(pool.members[idx].connections, 0);
+        assert_eq!(pool.members[idx].failure_count, 0);
+        assert!(pool.members[idx].retry_at.is_none());
+    }
 
     #[test]
     fn test_empty_pool_returns_error() {
