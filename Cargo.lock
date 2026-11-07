@@ -1063,6 +1063,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92d699e522242e69e3003b94ecc1f960f3a5e015aa7c5d7486e65ad01dd94f5e"
 
 [[package]]
+name = "futures-executor"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "031b47cf1a3c6cc8bc2fc76cd437f521619387907d469316e7c0bc278f1f5432"
+dependencies = [
+ "futures-core",
+ "futures-task",
+ "futures-util",
+]
+
+[[package]]
 name = "futures-io"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1849,6 +1860,7 @@ dependencies = [
  "criterion",
  "filetime",
  "flate2",
+ "futures-executor",
  "futures-util",
  "hmac",
  "httparse",
@@ -1873,7 +1885,6 @@ dependencies = [
  "tera",
  "thiserror 1.0.69",
  "time",
- "tokio",
  "toml",
  "tracing",
  "tracing-appender",
