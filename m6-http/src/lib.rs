@@ -6,6 +6,7 @@ pub mod config;
 pub mod error;
 pub mod fields;
 pub mod forward;
+pub mod h2_client;
 pub mod h2c_client;
 pub mod h2s_client;
 pub mod health;
