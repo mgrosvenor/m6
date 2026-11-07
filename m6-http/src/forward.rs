@@ -342,6 +342,34 @@ pub fn h1_field_name_is_safe(name: &str) -> bool {
         })
 }
 
+/// True when `target`, a request path or query, can be written into an
+/// HTTP/1.1 request line: no space, which ends the target, and no control byte
+/// (RFC 9112 3.2, RFC 3986 2). The one rule for HTTP/2 and HTTP/3 ingress and
+/// for the forwarder.
+pub fn request_target_is_safe(target: &[u8]) -> bool {
+    !target.iter().any(|&b| b <= b' ' || b == 0x7f)
+}
+
+/// A request m6-http refuses to send to a backend, as the error inside the
+/// `io::Error` a forward returns. A refusal is about the request, not the
+/// backend, so a caller must not count it as a backend failure; its own type
+/// keeps it apart from an `InvalidInput` the operating system raises.
+#[derive(Debug)]
+pub struct Refused(pub String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// True when a forward's error is m6-http's own refusal (see [`Refused`]).
+pub fn is_refusal(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<Refused>())
+}
+
 /// Everything this proxy is about to write into a request line or header block.
 ///
 /// Checked in one place, and checked for *every* ingress protocol rather than
@@ -352,14 +380,6 @@ pub fn h1_field_name_is_safe(name: &str) -> bool {
 ///
 /// Returns the offending component's name so a refusal can be logged with
 /// something actionable, rather than a generic "bad request".
-/// True when `target`, a request path or query, can be written into an
-/// HTTP/1.1 request line: no space, which ends the target, and no control byte
-/// (RFC 9112 3.2, RFC 3986 2). The one rule for HTTP/2 and HTTP/3 ingress and
-/// for the forwarder.
-pub fn request_target_is_safe(target: &[u8]) -> bool {
-    !target.iter().any(|&b| b <= b' ' || b == 0x7f)
-}
-
 pub fn check_forwardable(
     req: &HttpRequest,
     client_ip: &str,
@@ -450,7 +470,9 @@ pub fn forward_request_timeout(
     if let Err(what) = check_forwardable(req, client_ip, original_host) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("refusing to forward: unsafe {what} would inject HTTP/1.1 framing"),
+            Refused(format!(
+                "refusing to forward: unsafe {what} would inject HTTP/1.1 framing"
+            )),
         ));
     }
 
@@ -995,7 +1017,9 @@ pub fn forward_url_request(
     if let Err(what) = check_forwardable(req, client_ip, original_host) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("refusing to forward: unsafe {what} would inject HTTP/1.1 framing"),
+            Refused(format!(
+                "refusing to forward: unsafe {what} would inject HTTP/1.1 framing"
+            )),
         ));
     }
 
@@ -1473,6 +1497,19 @@ mod smuggling_tests {
     /// A header the proxy strips can never reach the backend, so refusing on it
     /// would reject traffic for no gain. Pinned so the skip list and the check
     /// cannot drift apart into either a hole or a false refusal.
+    /// Only m6-http's own refusal is a refusal. The wrong outcome: an
+    /// `InvalidInput` the operating system raises (a zero read timeout, a
+    /// socket path too long) passes for one, so a misconfigured backend is
+    /// never backed off.
+    #[test]
+    fn only_a_refusal_is_a_refusal() {
+        let refused = io::Error::new(io::ErrorKind::InvalidInput, Refused("x".into()));
+        assert!(is_refusal(&refused));
+        let os = io::Error::new(io::ErrorKind::InvalidInput, "path too long");
+        assert!(!is_refusal(&os));
+        assert!(!is_refusal(&io::Error::from(io::ErrorKind::InvalidInput)));
+    }
+
     #[test]
     fn hop_by_hop_headers_are_not_judged() {
         let mut r = req_with("Connection", "keep-alive\r\nX-Injected: yes");

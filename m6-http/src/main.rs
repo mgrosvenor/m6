@@ -3195,16 +3195,10 @@ fn forward_to_backend(
                         Ok(resp)
                     }
                     // m6-http refused the request itself, before connecting:
-                    // a client error, not a backend failure.
-                    Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+                    // the request's fault, not the backend's.
+                    Err(e) if forward::is_refusal(&e) => {
                         pool.cancel(member_idx);
-                        warn!(error = %e, "request refused before forwarding");
-                        Ok(forward::HttpResponse {
-                            status: 400,
-                            reason: "Bad Request".to_string(),
-                            headers: vec![],
-                            body: vec![],
-                        })
+                        Err(e.to_string())
                     }
                     Err(e) => {
                         pool.mark_failed(member_idx);

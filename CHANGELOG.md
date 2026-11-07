@@ -19,7 +19,7 @@ releases only; work happens on `develop`. See `CONTRIBUTING.md`.
 **m6-http refuses an HTTP/2 or HTTP/3 request whose `:path` contains a space or a control byte, as HTTP/1.1 already does, and a request it will not forward no longer counts against a backend.**
 Such a request passed ingress and was refused only when forwarded, after a pool member had been chosen, and the refusal marked that member failed.
 It is now malformed at ingress and its stream is reset, as RFC 9113 8.1.1 and RFC 9114 4.1.2 require.
-A request refused when forwarded, for example one with a CR or LF in a header value, now answers 400 and leaves the backend's record untouched.
+A request refused when forwarded, for example one with a CR or LF in a header value, no longer counts against the backend.
 A member's failure count now counts transport failures in a row: a completed exchange clears it, and the backoff is capped before it is computed.
 
 ## 1.13.0 — 2026-10-02
