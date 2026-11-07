@@ -169,6 +169,16 @@ where
         _ => {}
     }
 
+    // :path carries a request target (RFC 9113 8.3.1, RFC 9114 4.3.1), and a
+    // request target has no space and no control byte (RFC 9112 3.2, RFC 3986
+    // 2). HTTP/1.1's request-line parser refuses those bytes before a request
+    // exists; here nothing did, so a target that cannot be forwarded as an
+    // HTTP/1.1 request line reached the backend forwarder and was refused
+    // there instead of at the door.
+    if path_value.is_some_and(|p| p.iter().any(|&b| b <= b' ' || b == 0x7f)) {
+        return Err(":path with a space or control byte");
+    }
+
     // RFC 9113 8.3.1 and RFC 9114 4.3.1, the same sentence in both: if :scheme
     // names a scheme with a mandatory authority component (http and https do),
     // the request MUST carry either :authority or a Host header.
@@ -219,6 +229,30 @@ mod pseudo_header_tests {
         (":path", "/"),
         (":authority", "example.com"),
     ];
+
+    /// A request target with a space or a control byte is refused at the door,
+    /// in the path or the query, as HTTP/1.1's parser refuses it. The wrong
+    /// outcome: it is accepted here and refused only when forwarded, after a
+    /// backend has been chosen. An encoded space is an ordinary target.
+    #[test]
+    fn a_path_with_a_space_or_control_byte_is_refused() {
+        for path in [
+            "/a b",
+            "/?a b",
+            "/?a\rb",
+            "/?a\nb",
+            "/?a\u{0}b",
+            "/?a\tb",
+            "/?a\u{7f}b",
+        ] {
+            let mut req = GOOD.to_vec();
+            req[2] = (":path", path);
+            assert_eq!(bad(&req), ":path with a space or control byte", "{path:?}");
+        }
+        let mut req = GOOD.to_vec();
+        req[2] = (":path", "/a%20b?q=x%20y&r=%0D");
+        ok(&req);
+    }
 
     /// A well-formed request must still pass. Without this the whole module
     /// could "fix" 21 failures by rejecting everything.

@@ -12,6 +12,13 @@ releases only; work happens on `develop`. See `CONTRIBUTING.md`.
 
 ---
 
+## Unreleased
+
+### Fixed
+
+**m6-http refuses an HTTP/2 or HTTP/3 request whose `:path` contains a space or a control byte, as HTTP/1.1 already does, and a request it will not forward no longer counts against a backend.**
+Such a request passed ingress and was refused only when forwarded, after a pool member had been chosen, and the refusal marked that member failed. A pool member's failure count also counted every failure in its lifetime and was never cleared by a success, and the backoff computed from it could overflow after enough failures. Now ingress answers 400, the forward check runs before a member is chosen, a successful request clears the member's count, and the backoff is capped before it is computed.
+
 ## 1.13.0 — 2026-10-02
 
 **A server that terminates TLS now says how long its certificate has left.**

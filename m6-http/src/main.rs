@@ -3180,6 +3180,10 @@ fn forward_to_backend(
 
     let timeout = std::time::Duration::from_secs(state.config.server.backend_timeout_secs);
 
+    // A request m6-http will not forward is refused before a member is chosen,
+    // so the refusal is never counted against the backend.
+    forward::check_forwardable(req, client_ip, original_host)
+        .map_err(|what| format!("refusing to forward: {what}"))?;
     if let Some(pool) = state.pool_manager.get_pool_mut(backend_name) {
         match pool.pick_socket() {
             Ok((socket_path, member_idx)) => {
