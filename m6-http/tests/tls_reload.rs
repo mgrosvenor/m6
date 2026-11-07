@@ -639,8 +639,10 @@ fn writing_the_certificate_without_a_touch_changes_nothing() {
     let h1_tls = || client_trusting_both(&first, &second, &[b"http/1.1"]);
 
     srv.install(&second);
-    // Three fingerprint polls, so a watch that only the poll could miss is
-    // still given every chance to fire.
+    // The certificate and key files are not watched, so installing new material
+    // changes nothing until the system config is touched. This stays a fixed
+    // delay: the verdict is an absence, and m6-http logs nothing when it
+    // correctly ignores a certificate-file write, so there is no signal to wait on.
     std::thread::sleep(Duration::from_secs(3));
 
     assert_eq!(
@@ -704,7 +706,18 @@ fn a_touch_before_the_key_is_written_still_lands() {
 
     std::fs::write(srv.site.join("cert.pem"), &second.cert_pem).expect("write cert");
     srv.touch_system();
-    std::thread::sleep(Duration::from_millis(300));
+    // The touch triggers a reload. Wait for the positive signal that the reload
+    // ran, then assert the mismatched pair was rejected and HTTP/1.1 still
+    // serves the first certificate.
+    let reloaded = m6_core::testkit::wait::until(Duration::from_secs(30), || {
+        srv.proc.output().contains("config reload: complete")
+    });
+    srv.proc.assert_alive("after the touch with a missing key");
+    assert!(
+        reloaded,
+        "the touch never produced a config reload\n--- server output ---\n{}",
+        srv.proc.output()
+    );
     assert_eq!(
         h1_leaf(srv.port, h1_tls()).expect("h1"),
         first.der,

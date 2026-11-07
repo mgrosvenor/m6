@@ -393,8 +393,17 @@ impl Server {
     /// anything reaching the backend pool fails.
     fn kill_backend(&mut self) {
         self.file.kill();
-        // Let m6-http notice the socket has gone (2s rescan interval).
-        std::thread::sleep(Duration::from_millis(2500));
+        // The signal that m6-http has stopped reaching the backend is a cache
+        // miss answering 502. A fresh query string is a miss, because the cache
+        // key includes the query.
+        let ready = m6_core::testkit::wait::until(Duration::from_secs(10), || {
+            https_get(self, "/public/open.txt?kill_backend_probe", &[], self.tls()).status == 502
+        });
+        assert!(
+            ready,
+            "m6-http never answered 502 for a cache miss after the backend was killed\n--- output ---\n{}",
+            self.http.borrow().output()
+        );
     }
 }
 

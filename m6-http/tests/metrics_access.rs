@@ -853,6 +853,9 @@ fn a_rotated_auth_key_verifies_after_a_touch() {
 
     std::fs::write(run.fx.dir.path().join("auth-public.pem"), second_public)
         .expect("write the new public key");
+    // The key file is not watched, so writing it changes nothing. This stays a
+    // fixed delay: the verdict is an absence, and m6-http logs nothing when it
+    // correctly ignores a key-file write, so there is no signal to wait on.
     std::thread::sleep(Duration::from_secs(2));
     assert_eq!(
         run.h1("/perf", &[("Authorization", &auth)]).status,
