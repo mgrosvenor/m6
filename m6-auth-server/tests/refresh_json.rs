@@ -294,15 +294,18 @@ fn valid_json_refresh_returns_a_new_decodable_access_token() {
     );
 }
 
-/// An expired refresh token answers 401 even when it is validly signed and its
-/// hash is still stored. The wrong outcome this catches is a refresh that
-/// issues a new access token for a token whose lifetime has elapsed.
+/// A refresh token whose stored row has expired answers 401. A refresh token is
+/// verified by its stored hash alone, so the row's `expires_at` is where its
+/// lifetime ends (the token's own `exp` is not read: checking it would mean
+/// checking a signature that a key rotation invalidates). The wrong outcome
+/// this catches is a refresh that issues a new access token after the row's
+/// lifetime has elapsed.
 #[test]
 fn expired_refresh_token_json_answers_401() {
     let env = setup_test_env("expired-json-refresh");
     let user = seed_user(&env, "bob", "bobpw");
     let expired = expired_refresh_token(&env, &user.id, &user.username);
-    store_refresh_token(&env, &user.id, &expired, now_secs() + 3600);
+    store_refresh_token(&env, &user.id, &expired, now_secs() - 1);
     let _guard = spawn_server(&env);
 
     let resp = post_refresh_json(&env.socket_path, &expired);
