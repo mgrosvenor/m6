@@ -352,6 +352,14 @@ pub fn h1_field_name_is_safe(name: &str) -> bool {
 ///
 /// Returns the offending component's name so a refusal can be logged with
 /// something actionable, rather than a generic "bad request".
+/// True when `target`, a request path or query, can be written into an
+/// HTTP/1.1 request line: no space, which ends the target, and no control byte
+/// (RFC 9112 3.2, RFC 3986 2). The one rule for HTTP/2 and HTTP/3 ingress and
+/// for the forwarder.
+pub fn request_target_is_safe(target: &[u8]) -> bool {
+    !target.iter().any(|&b| b <= b' ' || b == 0x7f)
+}
+
 pub fn check_forwardable(
     req: &HttpRequest,
     client_ip: &str,
@@ -373,9 +381,7 @@ pub fn check_forwardable(
     ] {
         // A space here ends the request target and makes the remainder look
         // like the HTTP version token.
-        if s.bytes()
-            .any(|b| b == b'\r' || b == b'\n' || b == 0 || b == b' ')
-        {
+        if !request_target_is_safe(s.as_bytes()) {
             return Err(format!("request {label}"));
         }
     }
@@ -1471,6 +1477,16 @@ mod smuggling_tests {
     fn hop_by_hop_headers_are_not_judged() {
         let mut r = req_with("Connection", "keep-alive\r\nX-Injected: yes");
         assert!(check_forwardable(&r, "1.2.3.4", "example.com").is_ok());
+        // A tab or DEL cannot be written into a request line either; the
+        // forwarder and HTTP/2 ingress share one rule for it.
+        for bad in ["/a\tb", "/a\u{7f}b"] {
+            let mut t = r.clone();
+            t.path = bad.to_string();
+            assert!(
+                check_forwardable(&t, "1.2.3.4", "example.com").is_err(),
+                "{bad:?}"
+            );
+        }
         // ...but the same value on a forwarded header still fails.
         r.headers = vec![("X-Real".to_string(), "v\r\nX-Injected: yes".to_string())];
         assert!(check_forwardable(&r, "1.2.3.4", "example.com").is_err());

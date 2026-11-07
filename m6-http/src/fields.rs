@@ -175,7 +175,7 @@ where
     // exists; here nothing did, so a target that cannot be forwarded as an
     // HTTP/1.1 request line reached the backend forwarder and was refused
     // there instead of at the door.
-    if path_value.is_some_and(|p| p.iter().any(|&b| b <= b' ' || b == 0x7f)) {
+    if path_value.is_some_and(|p| !crate::forward::request_target_is_safe(p)) {
         return Err(":path with a space or control byte");
     }
 

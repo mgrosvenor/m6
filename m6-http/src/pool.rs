@@ -157,15 +157,24 @@ impl BackendPool {
         }
     }
 
-    /// Decrement connection count for a member.
-    /// A request to this member succeeded: release its connection and clear
-    /// its failures, so the backoff counts failures in a row, not a lifetime's.
+    /// A request to this member completed: release its connection and clear
+    /// its failures. The count is transport failures in a row (connect, I/O,
+    /// timeout), so any completed exchange clears it, whatever the status: a
+    /// member that answers 503 is reachable.
     pub fn release(&mut self, idx: usize) {
         if let Some(m) = self.members.get_mut(idx) {
             if m.connections > 0 {
                 m.connections -= 1;
             }
             m.mark_success();
+        }
+    }
+
+    /// Release a connection that never reached the member, because m6-http
+    /// refused the request itself. Says nothing about the member's health.
+    pub fn cancel(&mut self, idx: usize) {
+        if let Some(m) = self.members.get_mut(idx) {
+            m.connections = m.connections.saturating_sub(1);
         }
     }
 
@@ -474,6 +483,21 @@ mod tests {
             pool.members[idx].failure_count, 0,
             "a success must reset the count"
         );
+        assert!(pool.members[idx].retry_at.is_none());
+    }
+
+    #[test]
+    fn a_request_refused_before_forwarding_leaves_the_member_alone() {
+        // The wrong outcome: m6-http's own refusal backs the member off, so
+        // one malformed request makes a one-member pool answer 502.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut pool =
+            BackendPool::new("p".into(), dir.path().join("*.sock").display().to_string());
+        pool.add_socket(dir.path().join("a.sock"));
+        let (_, idx) = pool.pick_socket().expect("member");
+        pool.cancel(idx);
+        assert_eq!(pool.members[idx].connections, 0);
+        assert_eq!(pool.members[idx].failure_count, 0);
         assert!(pool.members[idx].retry_at.is_none());
     }
 
