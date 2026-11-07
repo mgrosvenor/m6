@@ -24,7 +24,7 @@ fn html_response(html: String) -> Response {
 }
 
 use m6_core::app::{
-    compile_pattern, find_route, match_route, route_specificity, CompiledRoute, RouteMethod,
+    compile_pattern, find_route, match_route, CompiledRoute, Methods, RouteMethod, RouteTable,
 };
 use m6_core::compress::{brotli_compress, gzip_compress};
 use m6_core::minify::{minify_css, minify_html, minify_js, minify_json};
@@ -213,21 +213,20 @@ const JS_3KB: &[u8] = b"
 /// Minimal Tera template — one variable substitution.
 const MINIMAL_TEMPLATE: &str = "<!doctype html><html><body><h1>{{ title }}</h1></body></html>";
 
-fn make_routes() -> Vec<CompiledRoute> {
+fn make_routes() -> RouteTable {
     let patterns = &[
         ("/", RouteMethod::Any),
         ("/about", RouteMethod::Get),
         ("/blog/{stem}", RouteMethod::Get),
         ("/api/v1/posts/{id}", RouteMethod::Any),
     ];
-    let mut routes: Vec<CompiledRoute> = patterns
+    let routes: Vec<CompiledRoute> = patterns
         .iter()
         .map(|(pat, method)| {
             let segs = compile_pattern(pat);
-            let spec = route_specificity(&segs);
             CompiledRoute {
                 pattern: pat.to_string(),
-                method: method.clone(),
+                methods: Methods::from(method),
                 segments: segs,
                 template: None,
                 params_files: vec![],
@@ -235,15 +234,13 @@ fn make_routes() -> Vec<CompiledRoute> {
                 cache: "public".to_string(),
                 headers: Vec::new(),
                 last_modified: None,
-                specificity: spec,
                 handler: None,
                 settings: std::sync::Arc::new(serde_json::Map::new()),
                 base_dict: std::sync::Arc::new(serde_json::Map::new()),
             }
         })
         .collect();
-    routes.sort_by_key(|r| std::cmp::Reverse(r.specificity));
-    routes
+    RouteTable::new(routes)
 }
 
 // ── Percentile reporter ────────────────────────────────────────────────────────
@@ -318,7 +315,7 @@ fn bench_match_route(c: &mut Criterion) {
     let segs = compile_pattern("/blog/{stem}");
     let route = CompiledRoute {
         pattern: "/blog/{stem}".to_string(),
-        method: RouteMethod::Get,
+        methods: Methods::from(&RouteMethod::Get),
         segments: segs.clone(),
         template: None,
         params_files: vec![],
@@ -326,7 +323,6 @@ fn bench_match_route(c: &mut Criterion) {
         cache: "public".to_string(),
         headers: Vec::new(),
         last_modified: None,
-        specificity: route_specificity(&segs),
         handler: None,
         settings: std::sync::Arc::new(serde_json::Map::new()),
         base_dict: std::sync::Arc::new(serde_json::Map::new()),
@@ -487,29 +483,29 @@ size = 64
         tera.add_template_file(&tmpl_path, Some("templates/page.html"))
             .unwrap();
 
-        let routes: Vec<CompiledRoute> = config
-            .routes
-            .iter()
-            .map(|rc| {
-                let segs = compile_pattern(&rc.path);
-                let spec = route_specificity(&segs);
-                CompiledRoute {
-                    pattern: rc.path.clone(),
-                    method: RouteMethod::Any,
-                    segments: segs,
-                    template: rc.template.clone(),
-                    params_files: rc.params.clone(),
-                    status: rc.status,
-                    cache: rc.cache.clone(),
-                    headers: Vec::new(),
-                    last_modified: None,
-                    specificity: spec,
-                    handler: None,
-                    settings: std::sync::Arc::new(serde_json::Map::new()),
-                    base_dict: std::sync::Arc::new(serde_json::Map::new()),
-                }
-            })
-            .collect();
+        let routes = RouteTable::new(
+            config
+                .routes
+                .iter()
+                .map(|rc| {
+                    let segs = compile_pattern(&rc.path);
+                    CompiledRoute {
+                        pattern: rc.path.clone(),
+                        methods: Methods::ANY,
+                        segments: segs,
+                        template: rc.template.clone(),
+                        params_files: rc.params.clone(),
+                        status: rc.status,
+                        cache: rc.cache.clone(),
+                        headers: Vec::new(),
+                        last_modified: None,
+                        handler: None,
+                        settings: std::sync::Arc::new(serde_json::Map::new()),
+                        base_dict: std::sync::Arc::new(serde_json::Map::new()),
+                    }
+                })
+                .collect(),
+        );
 
         for stream in listener.incoming() {
             let mut stream = match stream {
@@ -710,7 +706,7 @@ fn main() {
         let segs = compile_pattern("/blog/{stem}");
         let route = CompiledRoute {
             pattern: "/blog/{stem}".to_string(),
-            method: RouteMethod::Get,
+            methods: Methods::from(&RouteMethod::Get),
             segments: segs.clone(),
             template: None,
             params_files: vec![],
@@ -718,7 +714,6 @@ fn main() {
             cache: "public".to_string(),
             headers: Vec::new(),
             last_modified: None,
-            specificity: route_specificity(&segs),
             handler: None,
             settings: std::sync::Arc::new(serde_json::Map::new()),
             base_dict: std::sync::Arc::new(serde_json::Map::new()),
@@ -811,29 +806,29 @@ size = 64
             let mut tera = tera::Tera::default();
             tera.add_template_file(&tmpl_path, Some("templates/page.html"))
                 .unwrap();
-            let routes2: Vec<CompiledRoute> = config
-                .routes
-                .iter()
-                .map(|rc| {
-                    let segs = compile_pattern(&rc.path);
-                    let spec = route_specificity(&segs);
-                    CompiledRoute {
-                        pattern: rc.path.clone(),
-                        method: RouteMethod::Any,
-                        segments: segs,
-                        template: rc.template.clone(),
-                        params_files: rc.params.clone(),
-                        status: rc.status,
-                        cache: rc.cache.clone(),
-                        headers: Vec::new(),
-                        last_modified: None,
-                        specificity: spec,
-                        handler: None,
-                        settings: std::sync::Arc::new(serde_json::Map::new()),
-                        base_dict: std::sync::Arc::new(serde_json::Map::new()),
-                    }
-                })
-                .collect();
+            let routes2 = RouteTable::new(
+                config
+                    .routes
+                    .iter()
+                    .map(|rc| {
+                        let segs = compile_pattern(&rc.path);
+                        CompiledRoute {
+                            pattern: rc.path.clone(),
+                            methods: Methods::ANY,
+                            segments: segs,
+                            template: rc.template.clone(),
+                            params_files: rc.params.clone(),
+                            status: rc.status,
+                            cache: rc.cache.clone(),
+                            headers: Vec::new(),
+                            last_modified: None,
+                            handler: None,
+                            settings: std::sync::Arc::new(serde_json::Map::new()),
+                            base_dict: std::sync::Arc::new(serde_json::Map::new()),
+                        }
+                    })
+                    .collect(),
+            );
             for stream in listener.incoming() {
                 let mut stream = match stream {
                     Ok(s) => s,
