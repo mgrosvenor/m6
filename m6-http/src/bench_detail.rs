@@ -21,6 +21,7 @@ use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use m6_http_lib::probe;
 use rand::Rng;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::ClientConfig;
@@ -201,21 +202,7 @@ fn make_tls_config_h2(skip_verify: bool) -> Arc<ClientConfig> {
 }
 
 fn make_quiche_cfg(skip_verify: bool) -> quiche::Config {
-    let mut cfg = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
-    cfg.verify_peer(!skip_verify);
-    cfg.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
-        .unwrap();
-    cfg.set_max_idle_timeout(5000);
-    cfg.set_max_recv_udp_payload_size(1350);
-    cfg.set_max_send_udp_payload_size(1350);
-    cfg.set_initial_max_data(10_000_000);
-    cfg.set_initial_max_stream_data_bidi_local(1_000_000);
-    cfg.set_initial_max_stream_data_bidi_remote(1_000_000);
-    cfg.set_initial_max_stream_data_uni(1_000_000);
-    cfg.set_initial_max_streams_bidi(100);
-    cfg.set_initial_max_streams_uni(100);
-    cfg.set_disable_active_migration(true);
-    cfg
+    probe::bench_quic_client_config(skip_verify).expect("building the QUIC client config")
 }
 
 // ── Shared stats ──────────────────────────────────────────────────────────────
@@ -242,8 +229,10 @@ impl BoxStats {
         assert!(!v.is_empty(), "no samples");
         v.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let n = v.len();
-        let pct = |p: f64| {
-            let idx = ((p / 100.0) * (n as f64 - 1.0)).round() as usize;
+        // Same rule as stats.rs: index (n-1)*pct/100 with integer arithmetic,
+        // truncating. Rounding would shift p50 of ten samples from index 4 to 5.
+        let pct = |p: usize| {
+            let idx = (n - 1) * p / 100;
             v[idx.min(n - 1)]
         };
         let mean = v.iter().sum::<f64>() / n as f64;
@@ -251,11 +240,11 @@ impl BoxStats {
         BoxStats {
             label: label.into(),
             n,
-            p5: pct(5.0),
-            p25: pct(25.0),
-            p50: pct(50.0),
-            p75: pct(75.0),
-            p95: pct(95.0),
+            p5: pct(5),
+            p25: pct(25),
+            p50: pct(50),
+            p75: pct(75),
+            p95: pct(95),
             max: *v.last().unwrap(),
             mean,
             stddev: var.sqrt(),
@@ -2197,5 +2186,25 @@ fn main() {
             }
             Err(e) => eprintln!("H2C fullpage bench error: {e}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Same convention as `bench_main` and `stats.rs`: percentiles truncate
+    /// via `(n-1)*pct/100`, so p50 of ten samples is index 4 (50), not index 5
+    /// (60) as the old rounding gave.
+    #[test]
+    fn boxstats_percentiles_truncate_like_stats_rs() {
+        // Ten sorted samples: 10, 20, ... 100 microseconds.
+        let v: Vec<f64> = (1..=10).map(|x| x as f64 * 10.0).collect();
+        let s = BoxStats::from_samples("test", v);
+        assert_eq!(s.p5, 10.0);
+        assert_eq!(s.p50, 50.0);
+        assert_eq!(s.p75, 70.0);
+        assert_eq!(s.p95, 90.0);
+        assert_eq!(s.max, 100.0);
     }
 }

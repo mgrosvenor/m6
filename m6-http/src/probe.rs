@@ -321,38 +321,144 @@ pub struct ZeroRtt {
     pub status: Option<u16>,
 }
 
-/// A client QUIC config that will offer and use early data.
-fn quic_client_cfg() -> io::Result<quiche::Config> {
+/// The QUIC settings that differ between the probes and the benches.
+///
+/// Every QUIC client in this crate is built from one shared builder and
+/// differs only in these numbers and two feature switches. The probes measure
+/// a handshake, so they grant only the credit h3 needs to open its control
+/// and QPACK streams plus one request stream. The benches push whole response
+/// bodies through many concurrent streams, so they grant a ten-times-larger
+/// connection budget and stream count. Each caller passes its own numbers so
+/// the four call sites cannot drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QuicClientParams {
+    /// Verify the server certificate. The probes always skip, because they
+    /// point at loopback and test hosts whose certificate names an IP; the
+    /// benches skip only when `--skip-verify` is given.
+    verify_peer: bool,
+    /// Offer early data. Only the 0-RTT probe asks for it, because early data
+    /// is the thing that probe exists to measure.
+    early_data: bool,
+    /// Advertise `compress_certificate`. The probes do, because handshake
+    /// flight size is what they measure.
+    cert_compression: bool,
+    /// Initial connection-level flow-control budget.
+    max_data: u64,
+    /// Initial flow-control budget per locally-opened bidirectional stream.
+    max_stream_data_bidi_local: u64,
+    /// Initial flow-control budget per peer-opened bidirectional stream, or
+    /// `None` to leave quiche's default of zero. Only the benches set it.
+    max_stream_data_bidi_remote: Option<u64>,
+    /// Initial flow-control budget per unidirectional stream.
+    max_stream_data_uni: u64,
+    /// Initial count of bidirectional streams.
+    max_streams_bidi: u64,
+    /// Initial count of unidirectional streams.
+    max_streams_uni: u64,
+}
+
+/// Build the client QUIC config shared by the probes and the benches.
+///
+/// Everything that does not differ is set here once: the h3 ALPN, the idle
+/// timeout, the UDP payload size and the disabled active migration. The caller
+/// supplies the flow-control numbers and the two feature switches.
+fn quic_client_config(p: QuicClientParams) -> io::Result<quiche::Config> {
     let mut cfg = quiche::Config::new(quiche::PROTOCOL_VERSION)
         .map_err(|e| io::Error::other(format!("quiche::Config::new: {e}")))?;
-    cfg.verify_peer(false);
+    cfg.verify_peer(p.verify_peer);
     cfg.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
         .map_err(|e| io::Error::other(format!("set_application_protos: {e}")))?;
     cfg.set_max_idle_timeout(5_000);
     cfg.set_max_recv_udp_payload_size(1350);
     cfg.set_max_send_udp_payload_size(1350);
-    cfg.set_initial_max_data(1_000_000);
-    cfg.set_initial_max_stream_data_bidi_local(1_000_000);
-    cfg.set_initial_max_stream_data_uni(100_000);
-    cfg.set_initial_max_streams_bidi(10);
-    cfg.set_initial_max_streams_uni(10);
+    cfg.set_initial_max_data(p.max_data);
+    cfg.set_initial_max_stream_data_bidi_local(p.max_stream_data_bidi_local);
+    if let Some(v) = p.max_stream_data_bidi_remote {
+        cfg.set_initial_max_stream_data_bidi_remote(v);
+    }
+    cfg.set_initial_max_streams_bidi(p.max_streams_bidi);
+    // Unidirectional streams, which h3 needs for its control stream and the
+    // two QPACK streams. The count and the credit go together: with the count
+    // alone a peer may open a stream but is granted zero bytes on it, so it
+    // cannot send the h3 SETTINGS frame and `h3::Connection` fails. With
+    // neither, the limit defaults to zero and quiche logs the failure on the
+    // machine being measured, which is how a probe was once found writing
+    // errors into a healthy server's journal.
+    cfg.set_initial_max_streams_uni(p.max_streams_uni);
+    cfg.set_initial_max_stream_data_uni(p.max_stream_data_uni);
     cfg.set_disable_active_migration(true);
 
-    // Without this the client will not offer early data on the resumed
-    // connection, and the probe would report 0-RTT as not working while the
-    // server was configured perfectly well.
-    cfg.enable_early_data();
+    if p.early_data {
+        // Without this the client will not offer early data on the resumed
+        // connection, and the 0-RTT probe would report the feature as not
+        // working while the server was configured correctly.
+        cfg.enable_early_data();
+    }
 
-    // Advertise `compress_certificate`. Registering decompressors gives the client
-    // the CAPABILITY; this is what puts the extension on the wire. Without it the
-    // server has nothing to negotiate against and sends an uncompressed chain --
-    // which is exactly what the first measurement of RFC 8879 showed, a flight still
-    // 4081 bytes and still stalling at the amplification limit. The probe was
-    // measuring the absence of its own request.
-    if let Err(e) = cfg.enable_cert_compression() {
-        eprintln!("WARNING: client could not enable cert compression: {e:?}");
+    if p.cert_compression {
+        // Advertise `compress_certificate`. Registering decompressors gives
+        // the client the capability, and that is what puts the extension on
+        // the wire. Without it the server has nothing to negotiate against
+        // and sends an uncompressed chain, which is the very thing the probes
+        // exist to detect.
+        if let Err(e) = cfg.enable_cert_compression() {
+            eprintln!("WARNING: client could not enable cert compression: {e:?}");
+        }
     }
     Ok(cfg)
+}
+
+/// The 0-RTT probe's client QUIC config: early data on, probe flow control.
+fn zero_rtt_quic_params() -> QuicClientParams {
+    QuicClientParams {
+        verify_peer: false,
+        early_data: true,
+        cert_compression: true,
+        max_data: 1_000_000,
+        max_stream_data_bidi_local: 1_000_000,
+        max_stream_data_bidi_remote: None,
+        max_stream_data_uni: 100_000,
+        max_streams_bidi: 10,
+        max_streams_uni: 10,
+    }
+}
+
+/// The handshake-shape probe's client QUIC config: early data off, so the
+/// flight being timed is not changed by the probe itself.
+fn handshake_quic_params() -> QuicClientParams {
+    QuicClientParams {
+        verify_peer: false,
+        early_data: false,
+        cert_compression: true,
+        max_data: 1_000_000,
+        max_stream_data_bidi_local: 100_000,
+        max_stream_data_bidi_remote: None,
+        max_stream_data_uni: 100_000,
+        max_streams_bidi: 10,
+        max_streams_uni: 10,
+    }
+}
+
+/// The bench tools' QUIC parameters, shared by `m6-bench` and
+/// `m6-bench-detail`.
+fn bench_quic_params(skip_verify: bool) -> QuicClientParams {
+    QuicClientParams {
+        verify_peer: !skip_verify,
+        early_data: false,
+        cert_compression: false,
+        max_data: 10_000_000,
+        max_stream_data_bidi_local: 1_000_000,
+        max_stream_data_bidi_remote: Some(1_000_000),
+        max_stream_data_uni: 1_000_000,
+        max_streams_bidi: 100,
+        max_streams_uni: 100,
+    }
+}
+
+/// The bench tools' client QUIC config, shared by `m6-bench` and
+/// `m6-bench-detail`.
+pub fn bench_quic_client_config(skip_verify: bool) -> io::Result<quiche::Config> {
+    quic_client_config(bench_quic_params(skip_verify))
 }
 
 /// Split `host:port` into the SNI name and a resolved socket address.
@@ -426,7 +532,7 @@ fn h3_req(method: &str, path: &str, authority: &str) -> Vec<quiche::h3::Header> 
 pub fn zero_rtt_h3(addr: &str, path: &str, method: &str) -> io::Result<ZeroRtt> {
     // ── Connection 1: full handshake, then wait for the ticket ────────────────
     let (udp, peer, local, sni) = quic_socket(addr)?;
-    let mut cfg = quic_client_cfg()?;
+    let mut cfg = quic_client_config(zero_rtt_quic_params())?;
     let mut scid = [0u8; 16];
     getrandom_scid(&mut scid);
     let t0 = Instant::now();
@@ -522,7 +628,7 @@ pub fn zero_rtt_h3(addr: &str, path: &str, method: &str) -> io::Result<ZeroRtt> 
 
     // ── Connection 2: resume, and send in the first flight ────────────────────
     let (udp2, peer2, local2, sni2) = quic_socket(addr)?;
-    let mut cfg2 = quic_client_cfg()?;
+    let mut cfg2 = quic_client_config(zero_rtt_quic_params())?;
     let mut scid2 = [0u8; 16];
     getrandom_scid(&mut scid2);
     let t1 = Instant::now();
@@ -680,46 +786,7 @@ pub struct HandshakeShape {
 pub fn quic_handshake_shape(addr: &str) -> io::Result<HandshakeShape> {
     let (udp, peer, local, sni) = quic_socket(addr)?;
 
-    let mut cfg = quiche::Config::new(quiche::PROTOCOL_VERSION)
-        .map_err(|e| io::Error::other(format!("quiche::Config::new: {e}")))?;
-    cfg.verify_peer(false);
-    cfg.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
-        .map_err(|e| io::Error::other(format!("set_application_protos: {e}")))?;
-    cfg.set_max_idle_timeout(5_000);
-    cfg.set_max_recv_udp_payload_size(1350);
-    cfg.set_max_send_udp_payload_size(1350);
-    cfg.set_initial_max_data(1_000_000);
-    cfg.set_initial_max_stream_data_bidi_local(100_000);
-    cfg.set_initial_max_streams_bidi(10);
-    // Unidirectional streams, which h3 needs for its control stream and the two
-    // QPACK streams. Omitting this leaves the limit at the default of 0, so the
-    // server cannot open them and `h3::Connection::with_transport` fails with
-    // StreamLimit -- which it then LOGS. Probing a running server wrote
-    // `h3 init error: TransportError(StreamLimit)` warnings into its journal,
-    // and they turned up in a health check as an unexplained new error.
-    //
-    // The handshake figure was unaffected, because QUIC establishment completes
-    // before h3 is set up. But a measuring tool that makes the thing it measures
-    // log errors is not read-only, and the next person reading those logs has no
-    // way to know the cause was the probe.
-    cfg.set_initial_max_streams_uni(10);
-    // And credit to WRITE on those streams. The stream limit alone is not enough:
-    // a peer allowed to open a stream but granted zero bytes on it cannot send the
-    // h3 SETTINGS frame, and quiche surfaces the resulting failure from
-    // `h3::Connection::with_transport` as a transport error. Setting the limit
-    // without the credit was the first attempt at this fix and it changed nothing.
-    cfg.set_initial_max_stream_data_uni(100_000);
-    cfg.set_disable_active_migration(true);
-
-    // Advertise `compress_certificate`. Registering decompressors gives the client
-    // the CAPABILITY; this is what puts the extension on the wire. Without it the
-    // server has nothing to negotiate against and sends an uncompressed chain --
-    // which is exactly what the first measurement of RFC 8879 showed, a flight still
-    // 4081 bytes and still stalling at the amplification limit. The probe was
-    // measuring the absence of its own request.
-    if let Err(e) = cfg.enable_cert_compression() {
-        eprintln!("WARNING: client could not enable cert compression: {e:?}");
-    }
+    let mut cfg = quic_client_config(handshake_quic_params())?;
 
     // A fresh connection ID per connection. A reused one would let the server
     // treat the second connection as the first, and the handshake being measured
@@ -1035,6 +1102,61 @@ mod tests {
         getrandom_scid(&mut a);
         getrandom_scid(&mut b);
         assert_ne!(a, b, "two connection IDs came out identical");
+    }
+
+    /// Pins the parameters each caller passes to the shared builder.
+    ///
+    /// quiche's `Config` exposes no getters for its transport parameters, so
+    /// the builder's output cannot be read back without driving a connection.
+    /// The values are therefore pinned here, at the parameter layer, which is
+    /// where a drift between the four call sites (the defect this shared
+    /// builder removes) would first appear. The builder is a direct
+    /// field-to-setter mapping; the smoke check below only proves that it
+    /// accepts each caller's parameters, not that it applies them.
+    #[test]
+    fn quic_client_params_carry_each_callers_numbers_and_switches() {
+        let zero_rtt = zero_rtt_quic_params();
+        let handshake = handshake_quic_params();
+        let bench = bench_quic_params(false);
+
+        // The two probes share one small budget: enough for h3's control and
+        // QPACK streams plus one request stream.
+        for p in [zero_rtt, handshake] {
+            assert_eq!(p.max_data, 1_000_000);
+            assert_eq!(p.max_stream_data_uni, 100_000);
+            assert_eq!(p.max_streams_bidi, 10);
+            assert_eq!(p.max_streams_uni, 10);
+            assert!(p.cert_compression);
+            assert!(!p.verify_peer);
+        }
+        // Early data is the 0-RTT probe's alone.
+        assert!(zero_rtt.early_data);
+        assert!(!handshake.early_data);
+        // The probes differ on the per-bidi-stream credit; pin both so a
+        // change to either is caught.
+        assert_eq!(zero_rtt.max_stream_data_bidi_local, 1_000_000);
+        assert_eq!(handshake.max_stream_data_bidi_local, 100_000);
+
+        // The benches grant a ten-times-larger connection budget and stream
+        // count, because they push whole response bodies through many
+        // concurrent streams.
+        assert_eq!(bench.max_data, 10_000_000);
+        assert_eq!(bench.max_stream_data_bidi_local, 1_000_000);
+        assert_eq!(bench.max_stream_data_bidi_remote, Some(1_000_000));
+        assert_eq!(bench.max_stream_data_uni, 1_000_000);
+        assert_eq!(bench.max_streams_bidi, 100);
+        assert_eq!(bench.max_streams_uni, 100);
+        assert!(!bench.early_data);
+        assert!(!bench.cert_compression);
+        // The bench verifies by default and skips only under --skip-verify.
+        assert!(bench.verify_peer);
+        assert!(!bench_quic_params(true).verify_peer);
+
+        // Smoke check: the builder accepts every caller's parameters without
+        // error. It cannot prove the values are applied, for the reason above.
+        assert!(quic_client_config(zero_rtt).is_ok());
+        assert!(quic_client_config(handshake).is_ok());
+        assert!(quic_client_config(bench).is_ok());
     }
 }
 
