@@ -197,6 +197,35 @@ Migration: a route that relied on the widening needs its list to name every meth
 **m6-http `--dump-config` builds the route table as start does, so a route table start refuses fails the dump with exit 2 (#337).**
 A test fails when the dump path stops building the table.
 
+**A refresh token survives a signing-key rotation, and the login form and the JSON login share one sequence (#332).**
+Refresh tokens were checked against the current signing key, so rotating the key logged every user out at their next refresh. A refresh token is now verified by the hash stored with it, and a revoked or unknown token is still refused.
+
+**m6-auth: a corrupt roles column is an error, and an unknown user costs the same password check as a known one.**
+An unreadable `roles` value used to read as no roles. It is now `AuthError::Roles` with the user named. A login for a user that does not exist runs one bcrypt check against a fixed hash, so the response time no longer tells an attacker which accounts exist. The three hand-written clock reads use `jwt::now_secs()`.
+
+**CSS minification leaves quoted strings and `url(...)` contents unchanged.**
+The minifier removed `/* ... */` and collapsed spaces with no notion of a string, so a `/*` or a run of spaces inside `content: "..."` or `url(...)` was changed. Both are now copied as they are.
+
+**m6-monitor header-check failures reach the digest.**
+A failing header check showed on the check page but never in the digest, its page or its history. It now does, one uptime formatter serves the page and the check, and a header-check URL with a trailing slash is trimmed.
+
+**A `no-store` response is sent without hashing its body for an ETag.**
+`Response::send` skipped nothing: every response paid a full-body SipHash for an ETag, including those whose `Cache-Control` carries `no-store`, which no cache ever revalidates. The check matches the `no-store` token exactly across every `Cache-Control` line and ignores it inside a quoted string, so a cacheable response keeps its ETag and its 304.
+
+**A multipart upload no longer builds a tokio runtime.**
+`parse_upload` built a new single-threaded runtime for every upload. It now drives the parser with `futures_executor::block_on`, and m6-core's `multipart` feature no longer depends on tokio.
+
+**The HTTP/2 paths copy less per request and per frame, and the TLS HTTP/2 path reads the client address once per connection.**
+The dispatched request is moved instead of cloned, frame payloads are borrowed instead of copied, and DATA is sent from a slice. The client address on the TLS HTTP/2 path is taken at accept, not looked up and formatted again on every wakeup. The h2c and h2s backbone clients are now one HTTP/2 client generic over its transport.
+
+**Telemetry reads a field by its exact key.**
+Looking up `requests` matched inside `total_requests=` and read the wrong number. A field now matches only at the start of a token.
+
+**`m6-bench` and `m6-bench-detail` compute percentiles with the rule `/perf` uses, and the four QUIC clients share one configuration.**
+
+**Tests in m6-http and m6-core wait on a signal with a deadline instead of fixed sleeps.**
+Two m6-http negatives keep a short fixed wait, because m6-http emits nothing to wait on for them. m6-core's test suites share one `until` helper.
+
 **Debug and test builds carry line tables only, and no debug information for dependencies, so a full test build is 3.7 GB instead of 12 GB (#303).**
 Every file under a crate's `tests/` is its own binary, and each linked every dependency with full debug information. A full check filled about 16 GB, more than a hosted CI runner's free disk, and CI jobs died mid-build. Measured on the build host on one commit with `cargo test --workspace --no-run`: `target/debug` went from 12 GB to 3.7 GB and the build from 411 s to 282 s. Backtraces still show file and line.
 
