@@ -52,6 +52,9 @@ pub enum AuthError {
     #[error("api token not found: {0}")]
     ApiTokenNotFound(String),
 
+    #[error("roles column for user {0} is not valid JSON: {1}")]
+    Roles(String, serde_json::Error),
+
     #[error("database error: {0}")]
     Db(#[from] rusqlite::Error),
 
@@ -104,6 +107,28 @@ CREATE TABLE IF NOT EXISTS api_tokens (
 
 const BCRYPT_COST: u32 = 12;
 
+/// A fixed cost-12 bcrypt hash, verified on the missing-user path so a login
+/// for a username that does not exist does the same work as one for a user
+/// with the wrong password. Nothing is ever verified against it, so the
+/// plaintext it came from is irrelevant.
+const DUMMY_BCRYPT_HASH: &str = "$2b$12$zAhvXKspUKstZwuwfyLAN.7EmoU2t6AEgKCQyIQqVVKZBLX7lAT6.";
+
+// Count of bcrypt verifications, for the test that both the wrong-password
+// and the missing-user paths run exactly one. Thread-local so parallel tests
+// do not share the count. Present only under `cfg(test)`.
+#[cfg(test)]
+std::thread_local! {
+    static BCRYPT_VERIFIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Verify `password` against `hash`, counting the call under test so the two
+/// login paths can be shown to do equal work.
+fn verify_bcrypt(password: &str, hash: &str) -> Result<bool> {
+    #[cfg(test)]
+    BCRYPT_VERIFIES.with(|count| count.set(count.get() + 1));
+    Ok(bcrypt::verify(password, hash)?)
+}
+
 // ── Db ───────────────────────────────────────────────────────────────────────
 
 pub struct Db(Connection);
@@ -155,7 +180,8 @@ impl Db {
         roles_json: String,
         created_at: i64,
     ) -> Result<User> {
-        let roles: Vec<String> = serde_json::from_str(&roles_json).unwrap_or_default();
+        let roles: Vec<String> =
+            serde_json::from_str(&roles_json).map_err(|e| AuthError::Roles(username.clone(), e))?;
         let groups = self.user_groups_by_id(&id)?;
         Ok(User {
             id,
@@ -181,12 +207,8 @@ impl Db {
 
         let id = Uuid::new_v4().to_string();
         let hash = bcrypt::hash(password, BCRYPT_COST)?;
-        let roles_vec: Vec<&str> = roles.to_vec();
-        let roles_json = serde_json::to_string(&roles_vec).unwrap_or_else(|_| "[]".to_string());
-        let created_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+        let roles_json = serde_json::to_string(&roles).expect("serialising roles cannot fail");
+        let created_at = crate::jwt::now_secs();
 
         self.0.execute(
             "INSERT INTO users (id, username, password, roles, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -293,8 +315,7 @@ impl Db {
     }
 
     pub fn user_set_roles(&self, username: &str, roles: &[&str]) -> Result<()> {
-        let roles_vec: Vec<&str> = roles.to_vec();
-        let roles_json = serde_json::to_string(&roles_vec).unwrap_or_else(|_| "[]".to_string());
+        let roles_json = serde_json::to_string(&roles).expect("serialising roles cannot fail");
         let n = self.0.execute(
             "UPDATE users SET roles = ?1 WHERE username = ?2",
             params![roles_json, username],
@@ -323,14 +344,19 @@ impl Db {
 
         match result {
             Ok((id, uname, hash, roles_json, created_at)) => {
-                let valid = bcrypt::verify(password, &hash)?;
-                if valid {
+                if verify_bcrypt(password, &hash)? {
                     Ok(Some(self.row_to_user(id, uname, roles_json, created_at)?))
                 } else {
                     Ok(None)
                 }
             }
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                // Run a verify against a fixed hash so a missing user costs the
+                // same as a user with the wrong password, and the response time
+                // does not reveal which usernames exist.
+                let _ = verify_bcrypt(password, DUMMY_BCRYPT_HASH)?;
+                Ok(None)
+            }
             Err(e) => Err(AuthError::Db(e)),
         }
     }
@@ -481,10 +507,7 @@ impl Db {
 
     /// Returns the user_id if the token exists and has not expired.
     pub fn refresh_token_verify(&self, token_hash: &str) -> Result<Option<String>> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+        let now = crate::jwt::now_secs();
 
         let result = self.0.query_row(
             "SELECT user_id FROM refresh_tokens WHERE token_hash = ?1 AND expires_at > ?2",
@@ -526,10 +549,7 @@ impl Db {
         expires_at: i64,
     ) -> Result<ApiToken> {
         let id = Uuid::new_v4().to_string();
-        let created_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+        let created_at = crate::jwt::now_secs();
         self.0.execute(
             "INSERT INTO api_tokens (id, user_id, name, token_hash, created_at, expires_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -712,6 +732,19 @@ mod tests {
         assert!(list.iter().any(|u| u.username == "bob"));
     }
 
+    #[test]
+    fn test_corrupted_roles_is_an_error() {
+        let (db, _f) = tmp_db();
+        db.user_create("alice", "pass", &["admin"]).expect("create");
+        db.0.execute(
+            "UPDATE users SET roles = 'not-json' WHERE username = 'alice'",
+            [],
+        )
+        .expect("corrupt roles");
+        let err = db.user_get("alice").expect_err("should fail");
+        assert!(matches!(err, AuthError::Roles(..)));
+    }
+
     // ── user_delete cascade ───────────────────────────────────────────────────
 
     #[test]
@@ -802,6 +835,22 @@ mod tests {
         let (db, _f) = tmp_db();
         let r = db.user_verify_password("nobody", "pass").expect("verify");
         assert!(r.is_none());
+    }
+
+    #[test]
+    fn test_verify_runs_one_bcrypt_verify_on_both_paths() {
+        let (db, _f) = tmp_db();
+        db.user_create("alice", "correct", &[]).expect("create");
+
+        BCRYPT_VERIFIES.with(|count| count.set(0));
+        let wrong = db.user_verify_password("alice", "wrong").expect("verify");
+        assert!(wrong.is_none());
+        assert_eq!(BCRYPT_VERIFIES.with(|count| count.get()), 1);
+
+        BCRYPT_VERIFIES.with(|count| count.set(0));
+        let missing = db.user_verify_password("nobody", "wrong").expect("verify");
+        assert!(missing.is_none());
+        assert_eq!(BCRYPT_VERIFIES.with(|count| count.get()), 1);
     }
 
     // ── Group ops ─────────────────────────────────────────────────────────────
