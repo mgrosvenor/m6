@@ -12,17 +12,7 @@ use std::time::Duration;
 
 use m6_core::monitoring::LoggingHealth;
 use m6_core::signal::{self, Service, ShutdownHandle};
-
-fn until(timeout: Duration, mut ready: impl FnMut() -> bool) -> bool {
-    let deadline = std::time::Instant::now() + timeout;
-    while std::time::Instant::now() < deadline {
-        if ready() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    ready()
-}
+use m6_core::testkit::wait::until;
 
 fn lines(path: &Path) -> Vec<String> {
     std::fs::read_to_string(path)
