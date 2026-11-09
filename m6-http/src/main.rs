@@ -3281,31 +3281,35 @@ fn drive_socket_upstreams(state: &mut ServerState, poller: &Poller) {
             match entry.upstream.drive() {
                 Some(result) => {
                     poller.delete(entry.upstream.raw_fd()).ok();
-                    Some(result)
+                    Some((result, false))
                 }
                 None if entry.upstream.expired(now) => {
                     poller.delete(entry.upstream.raw_fd()).ok();
-                    Some(Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "backend timed out",
-                    )))
+                    Some((
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "backend timed out",
+                        )),
+                        true,
+                    ))
                 }
                 None => None,
             }
         };
 
-        let Some(result) = outcome else {
+        let Some((result, timed_out)) = outcome else {
             idx += 1;
             continue;
         };
 
-        // A refusal cannot reach here: encode_request refused the request
-        // before the upstream was created. Any error is a transport failure.
         let entry = state.socket_upstreams.remove(idx);
         if let Some(pool) = state.pool_manager.get_pool_mut(&entry.backend_name) {
-            if result.is_err() {
+            if timed_out {
+                // A silent member is unhealthy: back it off.
                 pool.mark_failed(entry.member_idx);
             } else {
+                // A member that answered, or that reset or closed in answer to
+                // a request it rejected, is healthy: keep it in rotation.
                 pool.release(entry.member_idx);
             }
         }
