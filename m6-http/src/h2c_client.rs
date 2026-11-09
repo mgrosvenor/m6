@@ -123,6 +123,16 @@ impl H2cClientPool {
         Self(Pool::new())
     }
 
+    /// Ensure a connection exists for `base_url`. Returns whether one was made.
+    pub fn ensure_connection(&mut self, base_url: &str) -> io::Result<bool> {
+        self.0.ensure_connection(base_url, None)
+    }
+
+    /// The connection for `base_url`, to register and set its token.
+    pub fn connection_mut(&mut self, base_url: &str) -> Option<&mut H2Client<H2cTransport>> {
+        self.0.connection_mut(base_url)
+    }
+
     /// Dispatch a request to the named backend URL.
     pub fn dispatch(
         &mut self,
@@ -131,12 +141,16 @@ impl H2cClientPool {
         client_ip: &str,
         original_host: &str,
     ) -> io::Result<mpsc::Receiver<io::Result<HttpResponse>>> {
-        self.0
-            .dispatch(base_url, req, client_ip, original_host, None)
+        self.0.dispatch(base_url, req, client_ip, original_host)
     }
 
-    /// Register new connections with the poll and drive all connections.
-    pub fn drive_all(&mut self, registry: &Registry, token: Token) {
-        self.0.drive_all(registry, token);
+    /// Drive the one connection whose token fired.
+    pub fn drive_one(&mut self, token: Token, registry: &Registry) -> bool {
+        self.0.drive_one(token, registry)
+    }
+
+    /// Deregister and drop the connection under `token`, if any.
+    pub fn remove_by_token(&mut self, token: Token, registry: &Registry) {
+        self.0.remove_by_token(token, registry);
     }
 }

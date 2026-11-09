@@ -104,7 +104,10 @@ pub struct H2Client<T: Transport> {
     peer_initial_window: i32,
     peer_max_frame: u32,
     pub is_dead: bool,
-    registered: bool,
+    /// The `mio` token this connection's descriptor is registered under.
+    token: Token,
+    /// What the poll currently waits for, so `reregister` runs only on change.
+    interest: Interest,
 }
 
 impl<T: Transport> H2Client<T> {
@@ -124,7 +127,8 @@ impl<T: Transport> H2Client<T> {
             peer_initial_window: DEFAULT_WINDOW,
             peer_max_frame: DEFAULT_MAX_FRAME,
             is_dead: false,
-            registered: false,
+            token: Token(usize::MAX),
+            interest: Interest::READABLE,
         }
     }
 
@@ -140,6 +144,31 @@ impl<T: Transport> H2Client<T> {
     /// Return the raw file descriptor for this connection.
     pub fn raw_fd(&self) -> RawFd {
         self.transport.raw_fd()
+    }
+
+    /// The `mio` token this connection is registered under.
+    pub fn token(&self) -> Token {
+        self.token
+    }
+
+    /// Set the token the caller registered this connection under.
+    pub fn set_token(&mut self, token: Token) {
+        self.token = token;
+    }
+
+    /// Set the interest the caller registered this connection with.
+    pub fn set_interest(&mut self, interest: Interest) {
+        self.interest = interest;
+    }
+
+    /// The interest to register next: write readiness while request bytes are
+    /// still owed, read readiness once they are flushed.
+    pub fn interest(&self) -> Interest {
+        if self.send_buf.is_empty() {
+            Interest::READABLE
+        } else {
+            Interest::READABLE | Interest::WRITABLE
+        }
     }
 
     /// Dispatch an HTTP request as a new H2 stream.
@@ -731,53 +760,80 @@ impl<T: Transport> Pool<T> {
         }
     }
 
-    /// Dispatch a request to the named backend URL.
-    ///
-    /// Creates a new connection if none exists or the existing one is dead.
+    /// Ensure a connection exists for `base_url`, creating one if none exists
+    /// or the existing one is dead. Returns whether one was created.
+    pub fn ensure_connection(
+        &mut self,
+        base_url: &str,
+        tls: Option<Arc<rustls::ClientConfig>>,
+    ) -> io::Result<bool> {
+        let (host, port) = parse_host_port(base_url, T::prefix(), T::default_port())?;
+        let needs_new = match self.connections.get(base_url) {
+            None => true,
+            Some(conn) => conn.is_dead && conn.streams.is_empty(),
+        };
+        if needs_new {
+            let new_conn = H2Client::connect(&host, port, tls)?;
+            self.connections.insert(base_url.to_string(), new_conn);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// The connection for `base_url`, to register and set its token.
+    pub fn connection_mut(&mut self, base_url: &str) -> Option<&mut H2Client<T>> {
+        self.connections.get_mut(base_url)
+    }
+
+    /// Dispatch a request on the existing connection.
     pub fn dispatch(
         &mut self,
         base_url: &str,
         req: &HttpRequest,
         client_ip: &str,
         original_host: &str,
-        tls: Option<Arc<rustls::ClientConfig>>,
     ) -> io::Result<mpsc::Receiver<io::Result<HttpResponse>>> {
-        let (host, port) = parse_host_port(base_url, T::prefix(), T::default_port())?;
-
-        // Check if we need a new connection
-        let needs_new = match self.connections.get(base_url) {
-            None => true,
-            Some(conn) => conn.is_dead && conn.streams.is_empty(),
-        };
-
-        if needs_new {
-            let new_conn = H2Client::connect(&host, port, tls)?;
-            self.connections.insert(base_url.to_string(), new_conn);
-        }
-
+        let (host, _) = parse_host_port(base_url, T::prefix(), T::default_port())?;
         let conn = self.connections.get_mut(base_url).unwrap();
         conn.dispatch(req, &host, client_ip, original_host)
     }
 
-    /// Register new connections with the poll and drive all connections.
-    ///
-    /// Must be called on every event-loop iteration.
-    pub fn drive_all(&mut self, registry: &Registry, token: Token) {
-        for conn in self.connections.values_mut() {
-            if !conn.registered {
-                let _ = registry.register(
+    /// Drive the one connection whose token fired. Returns whether it is dead
+    /// with no pending streams, so the caller can free its token and remove it.
+    pub fn drive_one(&mut self, token: Token, registry: &Registry) -> bool {
+        let Some(conn) = self.connections.values_mut().find(|c| c.token() == token) else {
+            return false;
+        };
+        conn.drive();
+        let interest = conn.interest();
+        if interest != conn.interest {
+            registry
+                .reregister(
                     &mut m6_core::mio::unix::SourceFd(&conn.raw_fd()),
-                    token,
-                    Interest::READABLE,
-                );
-                conn.registered = true;
-            }
-            conn.drive();
+                    conn.token(),
+                    interest,
+                )
+                .ok();
+            conn.interest = interest;
         }
+        conn.is_dead && conn.streams.is_empty()
+    }
 
-        // Remove connections that are dead and have no pending streams
-        self.connections
-            .retain(|_, conn| !(conn.is_dead && conn.streams.is_empty()));
+    /// Deregister and drop the connection registered under `token`, if any.
+    pub fn remove_by_token(&mut self, token: Token, registry: &Registry) {
+        let url = self
+            .connections
+            .iter()
+            .find(|(_, c)| c.token() == token)
+            .map(|(k, _)| k.clone());
+        if let Some(url) = url {
+            if let Some(conn) = self.connections.remove(&url) {
+                registry
+                    .deregister(&mut m6_core::mio::unix::SourceFd(&conn.raw_fd()))
+                    .ok();
+            }
+        }
     }
 }
 

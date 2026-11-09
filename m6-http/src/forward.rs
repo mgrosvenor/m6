@@ -1192,6 +1192,16 @@ impl SocketUpstream {
         now >= self.deadline
     }
 
+    /// The interest to register next: write readiness while request bytes are
+    /// still owed, read readiness once they are written.
+    pub fn interest(&self) -> m6_core::mio::Interest {
+        if self.write_offset < self.request.len() {
+            m6_core::mio::Interest::READABLE | m6_core::mio::Interest::WRITABLE
+        } else {
+            m6_core::mio::Interest::READABLE
+        }
+    }
+
     /// Write what is left of the request. A backend may answer before it has
     /// read the whole request (RFC 9110 6.1), so an EPIPE or ECONNRESET keeps
     /// reading: the response is already waiting on the socket.

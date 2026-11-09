@@ -33,15 +33,15 @@
 //! the redirect is what it should always have been: a response code.
 use crate::forward::HttpRequest;
 use crate::http11::{Http11Listener, RequestOutcome};
-use m6_core::event::Signals;
+use m6_core::event::{raise_open_file_limit, Signals, Timeouts};
+use m6_core::mio::unix::SourceFd;
 use m6_core::mio::{Events, Interest, Poll, Token};
 use std::io::ErrorKind;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
-const TOKEN_LISTENER: Token = Token(0);
-const TOKEN_CONN: Token = Token(1);
-const TOKEN_SIGNAL: Token = Token(2);
+const TOKEN_LISTENER: Token = Token(usize::MAX);
+const TOKEN_SIGNAL: Token = Token(usize::MAX - 1);
 const POLL_TIMEOUT_MS: u64 = 1_000;
 
 /// Percent-safe: the request target is echoed back into `Location` verbatim,
@@ -136,29 +136,50 @@ pub fn run(bind: &str) -> anyhow::Result<()> {
     let mut lifecycle = m6_core::signal::Lifecycle::new("m6-http-redirect", None);
     lifecycle.started();
 
-    let mut listener =
-        Http11Listener::bind_plain(bind, crate::http11::DEFAULT_MAX_REQUESTS_PER_CONN)?;
+    let ceiling = raise_open_file_limit()?;
+    let mut listener = Http11Listener::bind_plain(
+        bind,
+        crate::http11::DEFAULT_MAX_REQUESTS_PER_CONN,
+        crate::http11::INITIAL_CONNECTIONS,
+        ceiling,
+    )?;
     let mut signals = Signals::new()?;
     let mut poll = Poll::new()?;
     poll.registry().register(
-        &mut m6_core::mio::unix::SourceFd(&listener.raw_fd()),
+        &mut SourceFd(&listener.raw_fd()),
         TOKEN_LISTENER,
         Interest::READABLE,
     )?;
     poll.registry().register(
-        &mut m6_core::mio::unix::SourceFd(&signals.raw_fd()),
+        &mut SourceFd(&signals.raw_fd()),
         TOKEN_SIGNAL,
         Interest::READABLE,
     )?;
 
+    // The read timeout, as a deadline rather than a per-pass sweep. The
+    // one-second poll cap only bounds the wait until the earliest deadline.
+    let mut read_timeouts = Timeouts::new(
+        crate::http11::INITIAL_CONNECTIONS,
+        Duration::from_secs(crate::http11::READ_TIMEOUT_SECS),
+    );
+    let mut on_request = |_: &mut (), req: &HttpRequest, _: &str| redirect_for(req);
+    // No URL backends here, so no pending response can ever arrive.
+    let mut on_response = |_: &mut (),
+                           _: std::io::Result<crate::forward::HttpResponse>,
+                           _: &crate::forward::PendingUrlContext| {
+        (500, Vec::new(), Vec::new(), String::new())
+    };
+
     info!(bind = %bind, "HTTP->HTTPS redirect listener started");
 
     let mut events = Events::with_capacity(64);
+    let mut accepting = true;
     loop {
-        // The timeout also drives the connection sweep inside `drive_all` when
-        // nothing else is happening, so a stalled client is still reaped on an
-        // otherwise silent listener.
-        match poll.poll(&mut events, Some(Duration::from_millis(POLL_TIMEOUT_MS))) {
+        let now = Instant::now();
+        match poll.poll(
+            &mut events,
+            Some(read_timeouts.timeout(now, Duration::from_millis(POLL_TIMEOUT_MS))),
+        ) {
             Ok(()) => {}
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
             Err(e) => {
@@ -166,10 +187,40 @@ pub fn run(bind: &str) -> anyhow::Result<()> {
                 continue;
             }
         }
+        let now = Instant::now();
 
         for ev in &events {
             match ev.token() {
-                TOKEN_LISTENER => listener.accept_pending(poll.registry(), TOKEN_CONN),
+                TOKEN_LISTENER => loop {
+                    let Some(taken) = listener.take_slot() else {
+                        poll.registry()
+                            .deregister(&mut SourceFd(&listener.raw_fd()))
+                            .ok();
+                        accepting = false;
+                        break;
+                    };
+                    let key = taken.key;
+                    let mut conn = match listener.accept_one() {
+                        Some(c) => c,
+                        None => {
+                            listener.free_slot(key);
+                            break;
+                        }
+                    };
+                    conn.set_token(Token(key));
+                    conn.set_interest(Interest::READABLE);
+                    if let Err(e) = poll.registry().register(
+                        &mut SourceFd(&conn.raw_fd()),
+                        Token(key),
+                        Interest::READABLE,
+                    ) {
+                        warn!(error = %e, "redirect: register connection");
+                        listener.free_slot(key);
+                        continue;
+                    }
+                    read_timeouts.touch(Token(key), now);
+                    *listener.slot_mut(key) = conn;
+                },
                 TOKEN_SIGNAL => {
                     let mut stop = false;
                     while let Some(sig) = signals.read() {
@@ -182,16 +233,38 @@ pub fn run(bind: &str) -> anyhow::Result<()> {
                         return Ok(());
                     }
                 }
-                _ => {}
+                Token(k) => {
+                    let drive = listener.drive_one(
+                        k,
+                        &mut (),
+                        &mut on_request,
+                        &mut on_response,
+                        poll.registry(),
+                    );
+                    if drive.restarted {
+                        read_timeouts.touch(Token(k), now);
+                    }
+                    if drive.done {
+                        listener.close_one(k, poll.registry());
+                        read_timeouts.clear(Token(k));
+                    }
+                }
             }
         }
 
-        listener.drive_all(
-            |req, _client_ip| redirect_for(req),
-            // No URL backends here, so no pending response can ever arrive.
-            |_resp, _ctx| (500, Vec::new(), Vec::new(), String::new()),
-            poll.registry(),
-        );
+        // Close connections idle past the read deadline.
+        while let Some(Token(k)) = read_timeouts.expired(Instant::now()) {
+            listener.close_one(k, poll.registry());
+        }
+        // A slot came free while the table was full: accept again.
+        if !accepting && !listener.is_full() {
+            poll.registry().register(
+                &mut SourceFd(&listener.raw_fd()),
+                TOKEN_LISTENER,
+                Interest::READABLE,
+            )?;
+            accepting = true;
+        }
     }
 }
 

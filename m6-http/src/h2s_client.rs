@@ -213,20 +213,38 @@ impl H2sTlsClientPool {
     /// Dispatch a request to the named backend URL.
     ///
     /// `tls_config` must have ALPN `h2` — use `pool::build_h2_tls_client_config()`.
+    /// Ensure a connection exists for `base_url`. Returns whether one was made.
+    pub fn ensure_connection(
+        &mut self,
+        base_url: &str,
+        tls_config: Arc<rustls::ClientConfig>,
+    ) -> io::Result<bool> {
+        self.0.ensure_connection(base_url, Some(tls_config))
+    }
+
+    /// The connection for `base_url`, to register and set its token.
+    pub fn connection_mut(&mut self, base_url: &str) -> Option<&mut H2Client<H2sTransport>> {
+        self.0.connection_mut(base_url)
+    }
+
+    /// Dispatch a request to the named backend URL.
     pub fn dispatch(
         &mut self,
         base_url: &str,
         req: &HttpRequest,
         client_ip: &str,
         original_host: &str,
-        tls_config: Arc<rustls::ClientConfig>,
     ) -> io::Result<mpsc::Receiver<io::Result<HttpResponse>>> {
-        self.0
-            .dispatch(base_url, req, client_ip, original_host, Some(tls_config))
+        self.0.dispatch(base_url, req, client_ip, original_host)
     }
 
-    /// Register new connections with the poll and drive all connections.
-    pub fn drive_all(&mut self, registry: &Registry, token: Token) {
-        self.0.drive_all(registry, token);
+    /// Drive the one connection whose token fired.
+    pub fn drive_one(&mut self, token: Token, registry: &Registry) -> bool {
+        self.0.drive_one(token, registry)
+    }
+
+    /// Deregister and drop the connection under `token`, if any.
+    pub fn remove_by_token(&mut self, token: Token, registry: &Registry) {
+        self.0.remove_by_token(token, registry);
     }
 }

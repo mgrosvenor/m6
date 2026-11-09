@@ -3,6 +3,7 @@
 // HTTP/3 over QUIC/UDP using quiche (sans-I/O) + single-threaded epoll.
 // Standard POSIX UDP socket + epoll, accelerated transparently by
 // OpenOnload/ExaSock at deployment. No async runtime, no threads.
+#![deny(unsafe_code)]
 
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
@@ -56,38 +57,54 @@ type FinalizedResponse = (u16, Vec<(String, String)>, Vec<u8>, String);
 /// Short enough that a redeployed error page appears promptly, long enough
 /// that a sustained sweep costs one fetch a minute rather than one per path.
 const ERROR_PAGE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
-use m6_core::event::{LoopTrace, Signals};
+use m6_core::event::{raise_open_file_limit, LoopTrace, Signals, Slots, Timeouts};
 use m6_core::mio::unix::SourceFd;
 use m6_core::mio::{Events, Interest, Poll, Token};
 use m6_http_lib::auth::PublicKey;
 use m6_http_lib::h2c_client::H2cClientPool;
 use m6_http_lib::h2s_client::H2sTlsClientPool;
-use m6_http_lib::http11::{make_tls_server_config, H2cListener, Http11Listener, RequestOutcome};
+use m6_http_lib::http11::{
+    make_tls_server_config, H2cAccept, H2cListener, Http11Listener, RequestOutcome,
+    H2_IDLE_TIMEOUT_SECS, INITIAL_CONNECTIONS, MAX_ACCEPTS_PER_WAKE, READ_TIMEOUT_SECS,
+};
 use m6_http_lib::pool::{self, PoolManager};
 use m6_http_lib::router::RouteTable;
 use m6_http_lib::stats::{Channel, Iface, Version as HttpVersion};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-const TOKEN_UDP: Token = Token(0);
-const TOKEN_TCP: Token = Token(2);
-const TOKEN_H2C: Token = Token(3);
-const TOKEN_H2C_CLIENT: Token = Token(4);
-const TOKEN_H2S_CLIENT: Token = Token(5);
-const TOKEN_SIGNAL: Token = Token(6);
-const TOKEN_SOCKET_UPSTREAM: Token = Token(7);
+const TOKEN_UDP: Token = Token(usize::MAX);
+const TOKEN_TLS_LISTENER: Token = Token(usize::MAX - 1);
+const TOKEN_H2C_LISTENER: Token = Token(usize::MAX - 2);
+const TOKEN_SIGNAL: Token = Token(usize::MAX - 3);
 const MAX_DATAGRAM_SIZE: usize = 1350;
+
+/// Who owns a per-descriptor token: the owner and the owner's own slot index.
+#[derive(Clone, Copy)]
+enum Source {
+    /// A freed token, or one not yet assigned.
+    Vacant,
+    TlsConn(usize),
+    H2cConn(usize),
+    /// An outbound h2c or h2s pool connection, found by its token.
+    H2cUpstream,
+    H2sUpstream,
+    SocketUpstream(usize),
+}
 
 /// The [`LoopTrace`] trigger index for an iteration's first event, and the
 /// `timeout` index when none fired. The names are fixed in `event_loop`.
-fn trigger_for(token: Option<Token>) -> usize {
+fn trigger_index(token: Option<Token>, sources: &Slots<Source>) -> usize {
     match token {
-        Some(TOKEN_UDP) => 0,
-        Some(TOKEN_TCP) => 1,
-        Some(TOKEN_H2C) => 2,
-        Some(TOKEN_H2C_CLIENT) | Some(TOKEN_H2S_CLIENT) | Some(TOKEN_SOCKET_UPSTREAM) => 3,
+        Some(TOKEN_UDP) => 3,
+        Some(TOKEN_TLS_LISTENER) | Some(TOKEN_H2C_LISTENER) => 0,
         Some(TOKEN_SIGNAL) => 4,
-        _ => 5,
+        Some(Token(k)) => match sources.get(k) {
+            Source::TlsConn(_) | Source::H2cConn(_) => 1,
+            Source::H2cUpstream | Source::H2sUpstream | Source::SocketUpstream(_) => 2,
+            Source::Vacant => 5,
+        },
+        None => 5,
     }
 }
 
@@ -146,15 +163,27 @@ enum PendingH3Response {
 
 // ── Server state ──────────────────────────────────────────────────────────────
 
-/// All mutable server state — owned by the event loop, no Arc/Mutex needed.
 /// One in-flight socket-backend request the loop drives. The sender's receiver
 /// is parked on the waiting connection (h1, h2 or h3), and the loop sends the
 /// result into it when the upstream completes or expires.
 struct SocketUpstreamEntry {
-    upstream: forward::SocketUpstream,
+    upstream: Option<forward::SocketUpstream>,
     member_idx: usize,
     backend_name: String,
-    tx: std::sync::mpsc::Sender<std::io::Result<forward::HttpResponse>>,
+    tx: Option<std::sync::mpsc::Sender<std::io::Result<forward::HttpResponse>>>,
+    interest: Interest,
+}
+
+impl SocketUpstreamEntry {
+    fn empty() -> SocketUpstreamEntry {
+        SocketUpstreamEntry {
+            upstream: None,
+            member_idx: 0,
+            backend_name: String::new(),
+            tx: None,
+            interest: Interest::READABLE,
+        }
+    }
 }
 
 struct ServerState {
@@ -165,6 +194,9 @@ struct ServerState {
     public_key: Option<PublicKey>,
     error_mode: ErrorMode,
     stats: Stats,
+    /// One `mio` token per descriptor, the single allocator for every
+    /// connection and upstream, mapping a token to its owner.
+    sources: Slots<Source>,
     /// Cache entries queued to be fetched in the background — hint-driven
     /// prefetches and stale-while-revalidate refreshes both land here.
     prefetch_queue: std::collections::VecDeque<Refresh>,
@@ -182,11 +214,21 @@ struct ServerState {
         std::sync::mpsc::Receiver<std::io::Result<forward::HttpResponse>>,
         Box<forward::PendingUrlContext>,
     )>,
-    /// In-flight socket-backend requests, driven once per loop iteration by
-    /// `drive_socket_upstreams`. Each entry carries the non-blocking upstream,
-    /// the pool member it was taken from, the backend name, and the one-shot
-    /// sender whose receiver the h1, h2 or h3 connection parks on.
-    socket_upstreams: Vec<SocketUpstreamEntry>,
+    /// In-flight socket-backend requests, one per slot, driven when their
+    /// descriptor fires. Each entry carries the non-blocking upstream, the pool
+    /// member it was taken from, the backend name, and the one-shot sender
+    /// whose receiver the h1, h2 or h3 connection parks on.
+    socket_upstreams: Slots<SocketUpstreamEntry>,
+    /// Tokens of connections waiting on a backend channel, driven once per
+    /// iteration because a channel has no descriptor that fires. Interim code
+    /// removed by EL-3b (socket and h2 upstreams) and EL-5b (URL upstreams).
+    parked: Vec<Token>,
+    /// The read timeout (handshakes and HTTP/1.1), as deadlines.
+    read_timeouts: Timeouts,
+    /// The HTTP/2 idle timeout, as deadlines.
+    h2_idle_timeouts: Timeouts,
+    /// Socket-backend request deadlines, as deadlines.
+    upstream_timeouts: Timeouts,
     /// Persistent non-blocking H2C outbound client pool.
     h2c_pool: H2cClientPool,
     /// Persistent non-blocking H2S (HTTP/2 over TLS) outbound client pool.
@@ -542,6 +584,567 @@ struct EventLoopIo {
     signals: Signals,
 }
 
+// ── Request dispatch (shared by the TLS and h2c listeners) ──────────────────
+
+/// Handle one parsed request: rate limit, redirect, cache, then the backend.
+/// `h2c` marks the cleartext listener, which is always HTTP/2 and carries the
+/// internal interface class.
+fn on_request_impl(
+    state: &mut ServerState,
+    req: &forward::HttpRequest,
+    client_ip: &str,
+    quic_port: u16,
+    registry: &m6_core::mio::Registry,
+    h2c: bool,
+) -> RequestOutcome {
+    let ua = analytics::header(&req.headers, "user-agent");
+    if let Some(blocked) = check_rate_limit(state, client_ip, &req.path, ua) {
+        return blocked;
+    }
+    if let Some(redirect) = www_redirect(req, &state.config) {
+        return redirect;
+    }
+    let enc_str = m6_core::headers::get(&req.headers[..], "accept-encoding").unwrap_or("");
+    let start = std::time::Instant::now();
+
+    let cacheable = !state.route_table.requires_auth(&req.path)
+        && m6_http_lib::cache::method_may_read_cache(&req.method);
+    let mut key_buf = [0u8; 512];
+    let lookup_key = make_lookup_key(&req.path, req.query.as_deref(), enc_str, &mut key_buf);
+    let req_cc = m6_http_lib::cache::RequestDirectives::parse(&req.headers);
+    let looked_up = if cacheable {
+        state.cache.lookup_with(lookup_key, &req_cc)
+    } else {
+        m6_http_lib::cache::Lookup::Miss
+    };
+    if req_cc.only_if_cached && matches!(looked_up, m6_http_lib::cache::Lookup::Miss) {
+        let mut headers: Vec<(String, String)> = Vec::new();
+        set_date(&mut headers);
+        return RequestOutcome::Ready(504, headers, Vec::new(), "cache".to_string());
+    }
+    let cache_state = if matches!(looked_up, m6_http_lib::cache::Lookup::Stale(..)) {
+        "STALE"
+    } else {
+        "HIT"
+    };
+    if let m6_http_lib::cache::Lookup::Stale(..) = looked_up {
+        state.queue_refresh(Refresh {
+            path: req.path.clone(),
+            query: req.query.clone(),
+            enc: enc_str.to_string(),
+        });
+    }
+    let (version, iface) = if h2c {
+        (HttpVersion::Http2, state.h2c_iface)
+    } else {
+        (HttpVersion::from_wire(&req.version), state.tls_iface)
+    };
+    if let m6_http_lib::cache::Lookup::Fresh(cached, age)
+    | m6_http_lib::cache::Lookup::Stale(cached, age) = looked_up
+    {
+        let elapsed_ns = start.elapsed().as_nanos() as u64;
+        let chan = Channel::new(version, iface);
+        let precond = evaluate_preconditions(&cached.headers, &req.headers, &req.method);
+        state.stats.record(
+            elapsed_ns,
+            true,
+            match precond {
+                Precondition::Failed => 412,
+                Precondition::NotModified => 304,
+                _ => cached.status,
+            },
+            chan,
+            "cache",
+        );
+        if precond == Precondition::Failed {
+            let mut headers: Vec<(String, String)> = Vec::new();
+            set_date(&mut headers);
+            analytics::finish_response(
+                state.config.analytics.enabled,
+                &mut headers,
+                &req.headers,
+                &analytics::Event {
+                    node: &state.config.node.name,
+                    path: &req.path,
+                    status: 412,
+                    cache_state,
+                    client_ip,
+                    latency_ns: Some(elapsed_ns),
+                },
+            );
+            return RequestOutcome::Ready(412, headers, Vec::new(), "cache".to_string());
+        }
+        if precond == Precondition::NotModified {
+            let mut headers = not_modified_headers(&cached.headers);
+            set_vary_accept_encoding(&mut headers, true);
+            set_age(&mut headers, age);
+            set_date(&mut headers);
+            debug!(
+                path = %req.path,
+                status = 304,
+                version = %req.version,
+                backend = "cache",
+                latency_ns = elapsed_ns,
+                cache_hit = true,
+                "request complete"
+            );
+            analytics::finish_response(
+                state.config.analytics.enabled,
+                &mut headers,
+                &req.headers,
+                &analytics::Event {
+                    node: &state.config.node.name,
+                    path: &req.path,
+                    status: 304,
+                    cache_state,
+                    client_ip,
+                    latency_ns: Some(elapsed_ns),
+                },
+            );
+            return RequestOutcome::Ready(304, headers, Vec::new(), "cache".to_string());
+        }
+        let mut headers: Vec<(String, String)> = (*cached.headers).clone();
+        set_alt_svc(&mut headers, quic_port);
+        set_vary_accept_encoding(&mut headers, true);
+        set_age(&mut headers, age);
+        set_describedby_link(&mut headers, &state.config.site.describedby);
+        debug!(
+            path = %req.path,
+            status = cached.status,
+            version = %req.version,
+            backend = "cache",
+            latency_ns = elapsed_ns,
+            cache_hit = true,
+            "request complete"
+        );
+        analytics::finish_response(
+            state.config.analytics.enabled,
+            &mut headers,
+            &req.headers,
+            &analytics::Event {
+                node: &state.config.node.name,
+                path: &req.path,
+                status: cached.status,
+                cache_state,
+                client_ip,
+                latency_ns: Some(elapsed_ns),
+            },
+        );
+        return RequestOutcome::Ready(
+            cached.status,
+            headers,
+            cached.body.to_vec(),
+            "cache".to_string(),
+        );
+    }
+
+    let mut outcome = handle_request(
+        req,
+        client_ip,
+        enc_str,
+        state,
+        false,
+        h2c && state.h2c_iface == Iface::Internal,
+        registry,
+    );
+    if let RequestOutcome::Ready(status, ref mut headers, _, ref backend) = outcome {
+        set_alt_svc(headers, quic_port);
+        let elapsed_ns = start.elapsed().as_nanos() as u64;
+        let chan = Channel::new(version, iface);
+        state.stats.record(elapsed_ns, false, status, chan, backend);
+    }
+    outcome
+}
+
+/// Finalize a URL-backend reply and record it, shared by the two listeners.
+fn on_response_impl(
+    state: &mut ServerState,
+    http_result: std::io::Result<forward::HttpResponse>,
+    ctx: &forward::PendingUrlContext,
+    quic_port: u16,
+    h2c: bool,
+) -> (u16, Vec<(String, String)>, Vec<u8>, String) {
+    let (status, headers, body, backend_name) =
+        finalize_url_response(http_result, ctx, quic_port, state);
+    let elapsed_ns = ctx.start.elapsed().as_nanos() as u64;
+    let (version, iface) = if h2c {
+        (HttpVersion::Http2, state.h2c_iface)
+    } else {
+        (HttpVersion::from_wire(&ctx.req.version), state.tls_iface)
+    };
+    let chan = Channel::new(version, iface);
+    state
+        .stats
+        .record(elapsed_ns, false, status, chan, &ctx.backend_name);
+    debug!(
+        path = %ctx.req.path,
+        status,
+        version = %ctx.req.version,
+        backend = %backend_name,
+        latency_ns = elapsed_ns,
+        cache_hit = false,
+        "request complete (async url backend)"
+    );
+    (status, headers, body, backend_name)
+}
+
+// ── Token and slot helpers ────────────────────────────────────────────────────
+
+/// Take one token from the shared table, growing the three deadline tables to
+/// match when the token table doubles.
+fn take_token(state: &mut ServerState) -> Option<Token> {
+    let taken = state.sources.take()?;
+    if let Some(n) = taken.grew_to {
+        state.read_timeouts.grow(n);
+        state.h2_idle_timeouts.grow(n);
+        state.upstream_timeouts.grow(n);
+    }
+    Some(Token(taken.key))
+}
+
+/// Accept TLS connections until the socket would block or the token table is
+/// full. Returns whether the table is at its ceiling.
+fn accept_tls(
+    tcp: &mut Http11Listener,
+    state: &mut ServerState,
+    registry: &m6_core::mio::Registry,
+    now: Instant,
+) -> bool {
+    loop {
+        let Some(conn) = tcp.accept_one() else {
+            return false;
+        };
+        let Some(token) = take_token(state) else {
+            return true;
+        };
+        let Some(owner) = tcp.take_slot() else {
+            state.sources.free(token.0);
+            return true;
+        };
+        let mut conn = conn;
+        conn.set_token(token);
+        conn.set_interest(Interest::READABLE);
+        if let Err(e) = registry.register(&mut SourceFd(&conn.raw_fd()), token, Interest::READABLE)
+        {
+            warn!(error = %e, "tcp register");
+            tcp.free_slot(owner.key);
+            state.sources.free(token.0);
+            continue;
+        }
+        state.read_timeouts.touch(token, now);
+        *state.sources.get_mut(token.0) = Source::TlsConn(owner.key);
+        *tcp.slot_mut(owner.key) = conn;
+    }
+}
+
+/// Accept h2c connections up to the cap. Returns whether the token table is at
+/// its ceiling and whether the cap was hit (more may be pending).
+fn accept_h2c(
+    h: &mut H2cListener,
+    state: &mut ServerState,
+    registry: &m6_core::mio::Registry,
+    now: Instant,
+) -> (bool, bool) {
+    let mut handled = 0;
+    let mut full = false;
+    while handled < MAX_ACCEPTS_PER_WAKE {
+        if state.sources.is_full() {
+            full = true;
+            break;
+        }
+        match h.accept_one() {
+            H2cAccept::Admitted(mut conn) => {
+                handled += 1;
+                let Some(token) = take_token(state) else {
+                    full = true;
+                    break;
+                };
+                let Some(owner) = h.take_slot() else {
+                    state.sources.free(token.0);
+                    full = true;
+                    break;
+                };
+                conn.set_token(token);
+                conn.set_interest(Interest::READABLE);
+                if let Err(e) =
+                    registry.register(&mut SourceFd(&conn.raw_fd()), token, Interest::READABLE)
+                {
+                    warn!(error = %e, "h2c register");
+                    h.free_slot(owner.key);
+                    state.sources.free(token.0);
+                    continue;
+                }
+                state.h2_idle_timeouts.touch(token, now);
+                *state.sources.get_mut(token.0) = Source::H2cConn(owner.key);
+                *h.slot_mut(owner.key) = conn;
+            }
+            H2cAccept::Refused => handled += 1,
+            H2cAccept::WouldBlock => break,
+        }
+    }
+    (full, !full && handled == MAX_ACCEPTS_PER_WAKE)
+}
+
+/// What one connection turn did, for the parked list and the timeouts.
+enum ConnOutcome {
+    Parked,
+    Active,
+    Closed,
+    /// The token was freed earlier in this batch: skip it.
+    Gone,
+}
+
+/// Drive the connection whose token fired or whose parked slot is being polled.
+fn drive_conn_token(
+    token: Token,
+    state: &mut ServerState,
+    tcp: &mut Option<Http11Listener>,
+    h2c: &mut Option<H2cListener>,
+    registry: &m6_core::mio::Registry,
+    quic_port: u16,
+    now: Instant,
+) -> ConnOutcome {
+    let source = match state.sources.get(token.0) {
+        Source::TlsConn(slot) => (*slot, false),
+        Source::H2cConn(slot) => (*slot, true),
+        _ => return ConnOutcome::Gone,
+    };
+    let (slot, is_h2c) = source;
+    let mut on_request = |state: &mut ServerState, req: &forward::HttpRequest, ip: &str| {
+        on_request_impl(state, req, ip, quic_port, registry, is_h2c)
+    };
+    let mut on_response = |state: &mut ServerState,
+                           r: std::io::Result<forward::HttpResponse>,
+                           ctx: &forward::PendingUrlContext| {
+        on_response_impl(state, r, ctx, quic_port, is_h2c)
+    };
+    let drive = if is_h2c {
+        match h2c.as_mut() {
+            Some(h) => h.drive_one(slot, state, &mut on_request, &mut on_response, registry),
+            None => return ConnOutcome::Closed,
+        }
+    } else {
+        match tcp.as_mut() {
+            Some(t) => t.drive_one(slot, state, &mut on_request, &mut on_response, registry),
+            None => return ConnOutcome::Closed,
+        }
+    };
+    if let Some(hs) = drive.handshake {
+        let v = if hs.is_h2 {
+            HttpVersion::Http2
+        } else {
+            HttpVersion::Http11
+        };
+        state
+            .stats
+            .record_handshake(hs.elapsed_ns, Channel::new(v, state.tls_iface), hs.resumed);
+    }
+    if drive.restarted {
+        state.read_timeouts.touch(token, now);
+    }
+    if drive.moved {
+        state.h2_idle_timeouts.touch(token, now);
+    }
+    if drive.done {
+        close_conn_token(token, state, tcp, h2c, registry);
+        ConnOutcome::Closed
+    } else if drive.parked {
+        ConnOutcome::Parked
+    } else {
+        ConnOutcome::Active
+    }
+}
+
+/// Deregister and free a connection token.
+fn close_conn_token(
+    token: Token,
+    state: &mut ServerState,
+    tcp: &mut Option<Http11Listener>,
+    h2c: &mut Option<H2cListener>,
+    registry: &m6_core::mio::Registry,
+) {
+    if let Source::TlsConn(slot) = *state.sources.get(token.0) {
+        if let Some(t) = tcp.as_mut() {
+            t.close_one(slot, registry);
+        }
+    } else if let Source::H2cConn(slot) = *state.sources.get(token.0) {
+        if let Some(h) = h2c.as_mut() {
+            h.close_one(slot, registry);
+        }
+    }
+    *state.sources.get_mut(token.0) = Source::Vacant;
+    state.sources.free(token.0);
+    state.read_timeouts.clear(token);
+    state.h2_idle_timeouts.clear(token);
+    state.upstream_timeouts.clear(token);
+}
+
+/// Drive the one socket upstream whose descriptor fired.
+fn drive_socket_upstream_one(
+    token: Token,
+    state: &mut ServerState,
+    registry: &m6_core::mio::Registry,
+) {
+    let Source::SocketUpstream(slot) = *state.sources.get(token.0) else {
+        return;
+    };
+    let result = {
+        let entry = state.socket_upstreams.get_mut(slot);
+        let Some(upstream) = entry.upstream.as_mut() else {
+            return;
+        };
+        let interest = upstream.interest();
+        if interest != entry.interest {
+            registry
+                .reregister(&mut SourceFd(&upstream.raw_fd()), token, interest)
+                .ok();
+            entry.interest = interest;
+        }
+        match upstream.drive() {
+            Some(result) => {
+                registry.deregister(&mut SourceFd(&upstream.raw_fd())).ok();
+                Some(result)
+            }
+            None => None,
+        }
+    };
+    let Some(result) = result else {
+        return;
+    };
+    let entry = state.socket_upstreams.get_mut(slot);
+    let member_idx = entry.member_idx;
+    let backend_name = std::mem::take(&mut entry.backend_name);
+    let tx = entry.tx.take();
+    entry.upstream.take();
+    state.socket_upstreams.free(slot);
+    *state.sources.get_mut(token.0) = Source::Vacant;
+    state.sources.free(token.0);
+    state.upstream_timeouts.clear(token);
+    if let Some(pool) = state.pool_manager.get_pool_mut(&backend_name) {
+        if result.is_err() {
+            pool.mark_failed(member_idx);
+        } else {
+            pool.release(member_idx);
+        }
+    }
+    if let Some(tx) = tx {
+        let _ = tx.send(result);
+    }
+}
+
+/// Close the socket upstream whose deadline passed.
+fn expire_socket_upstream(
+    token: Token,
+    state: &mut ServerState,
+    registry: &m6_core::mio::Registry,
+) {
+    let Source::SocketUpstream(slot) = *state.sources.get(token.0) else {
+        return;
+    };
+    let entry = state.socket_upstreams.get_mut(slot);
+    if let Some(upstream) = entry.upstream.take() {
+        registry.deregister(&mut SourceFd(&upstream.raw_fd())).ok();
+    }
+    let member_idx = entry.member_idx;
+    let backend_name = std::mem::take(&mut entry.backend_name);
+    let tx = entry.tx.take();
+    state.socket_upstreams.free(slot);
+    *state.sources.get_mut(token.0) = Source::Vacant;
+    state.sources.free(token.0);
+    if let Some(pool) = state.pool_manager.get_pool_mut(&backend_name) {
+        pool.mark_failed(member_idx);
+    }
+    if let Some(tx) = tx {
+        let _ = tx.send(Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "backend timed out",
+        )));
+    }
+}
+
+/// Ensure an h2c pool connection exists for `url`, registering a new one under
+/// its own token.
+fn ensure_h2c_conn(
+    state: &mut ServerState,
+    url: &str,
+    registry: &m6_core::mio::Registry,
+) -> std::io::Result<()> {
+    if !state.h2c_pool.ensure_connection(url)? {
+        return Ok(());
+    }
+    let token = take_token(state).ok_or_else(|| {
+        std::io::Error::other("no token for h2c upstream")
+    })?;
+    let conn = state.h2c_pool.connection_mut(url).expect("just created");
+    conn.set_token(token);
+    conn.set_interest(Interest::READABLE | Interest::WRITABLE);
+    registry.register(
+        &mut SourceFd(&conn.raw_fd()),
+        token,
+        Interest::READABLE | Interest::WRITABLE,
+    )?;
+    *state.sources.get_mut(token.0) = Source::H2cUpstream;
+    Ok(())
+}
+
+/// Ensure an h2s pool connection exists for `url`, registering a new one under
+/// its own token.
+fn ensure_h2s_conn(
+    state: &mut ServerState,
+    url: &str,
+    tls: std::sync::Arc<rustls::ClientConfig>,
+    registry: &m6_core::mio::Registry,
+) -> std::io::Result<()> {
+    if !state.h2s_pool.ensure_connection(url, tls)? {
+        return Ok(());
+    }
+    let token = take_token(state).ok_or_else(|| {
+        std::io::Error::other("no token for h2s upstream")
+    })?;
+    let conn = state.h2s_pool.connection_mut(url).expect("just created");
+    conn.set_token(token);
+    conn.set_interest(Interest::READABLE | Interest::WRITABLE);
+    registry.register(
+        &mut SourceFd(&conn.raw_fd()),
+        token,
+        Interest::READABLE | Interest::WRITABLE,
+    )?;
+    *state.sources.get_mut(token.0) = Source::H2sUpstream;
+    Ok(())
+}
+
+/// Deregister both listeners so new clients wait in the kernel's backlog.
+fn deregister_listeners(poll: &Poll, tcp: Option<&Http11Listener>, h2c: Option<&H2cListener>) {
+    if let Some(t) = tcp {
+        poll.registry().deregister(&mut SourceFd(&t.raw_fd())).ok();
+    }
+    if let Some(h) = h2c {
+        poll.registry().deregister(&mut SourceFd(&h.raw_fd())).ok();
+    }
+}
+
+/// Re-register both listeners once a token slot has come free.
+fn register_listeners(poll: &Poll, tcp: Option<&Http11Listener>, h2c: Option<&H2cListener>) {
+    if let Some(t) = tcp {
+        poll.registry()
+            .register(
+                &mut SourceFd(&t.raw_fd()),
+                TOKEN_TLS_LISTENER,
+                Interest::READABLE,
+            )
+            .ok();
+    }
+    if let Some(h) = h2c {
+        poll.registry()
+            .register(
+                &mut SourceFd(&h.raw_fd()),
+                TOKEN_H2C_LISTENER,
+                Interest::READABLE,
+            )
+            .ok();
+    }
+}
+
 fn event_loop(
     io: EventLoopIo,
     state: &mut ServerState,
@@ -573,14 +1176,18 @@ fn event_loop(
         return 2;
     }
     if let Some(ref t) = tcp {
-        let _ = poll
-            .registry()
-            .register(&mut SourceFd(&t.raw_fd()), TOKEN_TCP, Interest::READABLE);
+        let _ = poll.registry().register(
+            &mut SourceFd(&t.raw_fd()),
+            TOKEN_TLS_LISTENER,
+            Interest::READABLE,
+        );
     }
     if let Some(ref h) = h2c {
-        let _ = poll
-            .registry()
-            .register(&mut SourceFd(&h.raw_fd()), TOKEN_H2C, Interest::READABLE);
+        let _ = poll.registry().register(
+            &mut SourceFd(&h.raw_fd()),
+            TOKEN_H2C_LISTENER,
+            Interest::READABLE,
+        );
     }
     // Signals arrive on their own descriptor, under the number the wake pipe
     // used to hold.
@@ -597,51 +1204,37 @@ fn event_loop(
     let quic_port = udp.local_addr().map(|a| a.port()).unwrap_or(8443);
 
     let mut connections: HashMap<Vec<u8>, QuicConn> = HashMap::new();
-    // Maps the client's original Initial DCID (may be shorter than MAX_CONN_ID_LEN)
-    // to the 20-byte SCID under which the connection is stored.  Needed because
-    // quiche generates a 16-byte random Initial DCID on the client side, but
-    // Header::from_slice for short-header 1-RTT packets always reads MAX_CONN_ID_LEN
-    // (20) bytes.  Using a fresh 20-byte server SCID ensures all subsequent packets
-    // (Handshake + 1-RTT) carry a 20-byte DCID that matches the stored key.
     let mut conn_id_map: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
     let mut recv_buf = vec![0u8; 65536];
     let mut events = Events::with_capacity(256);
     // Wait time against work time, per kind of event that woke the loop. An
     // iteration with events of several kinds is counted under its first event.
-    let mut trace = LoopTrace::new(&["udp", "tls", "h2c", "upstream", "signal", "timeout"]);
+    let mut trace = LoopTrace::new(&["accept", "conn", "upstream", "udp", "signal", "timeout"]);
     let mut last = std::time::Instant::now();
+    let mut accepting = tcp.is_some() || h2c.is_some();
 
     'run: loop {
-        // Compute the soonest connection timeout
-        // Idle poll cap. Was 100ms originally — every async backend round trip
-        // (every cache-node→origin fetch) was silently paying up to that much
-        // in pure poll latency, since a response arriving mid-wait is only
-        // noticed on the *next* tick. A "0ms only while a dispatch is actually
-        // pending" version was tried and, on measurement, never actually
-        // engaged — the flat cap below was doing all the work both times it
-        // was tested. Rather than ship a conditional that doesn't do what it
-        // claims, this is a flat cap: verified to cut cache-node→origin
-        // latency from ~107ms to ~10-15ms, at the cost of ~100 wakeups/sec/
-        // process at genuine idle (vs ~10/sec at the original 100ms) — a
-        // real, small, quantified trade, not a hidden one.
-        let timeout_ms = connections
+        // The wait is the earliest deadline among the read, h2 idle and socket
+        // upstream timeouts, the QUIC timeout and the accounting tick. It stays
+        // capped at 10 ms until EL-5b removes the cap.
+        let tick = std::time::Duration::from_millis(10);
+        let now0 = std::time::Instant::now();
+        let mut poll_timeout = state.read_timeouts.timeout(now0, tick);
+        poll_timeout = poll_timeout.min(state.h2_idle_timeouts.timeout(now0, tick));
+        poll_timeout = poll_timeout.min(state.upstream_timeouts.timeout(now0, tick));
+        let quic_timeout = connections
             .values()
             .filter_map(|c| c.conn.timeout())
             .min()
-            .map(|d| d.as_millis() as i32)
-            .unwrap_or(100)
-            .min(10);
-
+            .unwrap_or(tick)
+            .min(tick);
+        poll_timeout = poll_timeout.min(quic_timeout);
         // Edge-triggered: a capped accept leaves connections in the kernel
-        // queue that the h2c listener will not be reported for again. Drain
-        // them before waiting, and do not block while they remain.
-        let mut poll_timeout = std::time::Duration::from_millis(timeout_ms as u64);
-        if let Some(h) = h2c.as_mut() {
+        // queue that the h2c listener will not be reported for again, so drain
+        // before waiting, without blocking.
+        if let Some(h) = h2c.as_ref() {
             if h.accept_again() {
-                h.accept_pending(poll.registry(), TOKEN_H2C);
-                if h.accept_again() {
-                    poll_timeout = std::time::Duration::ZERO;
-                }
+                poll_timeout = std::time::Duration::ZERO;
             }
         }
 
@@ -657,11 +1250,9 @@ fn event_loop(
         trace.waited(now - last);
 
         let first_trigger = events.iter().next().map(|ev| ev.token());
+        let first_index = trigger_index(first_trigger, &state.sources);
         for ev in &events {
             match ev.token() {
-                // Shutdown: drain every pending signal before acting. The first
-                // Terminate asks for a graceful stop; a second, read in the same
-                // drain, forces an exit inside `on_signal`.
                 TOKEN_SIGNAL => {
                     let mut stop = false;
                     while let Some(sig) = signals.read() {
@@ -687,587 +1278,104 @@ fn event_loop(
                         },
                     );
                 }
-                TOKEN_TCP => {
-                    if let Some(ref mut t) = tcp {
-                        t.accept_pending(poll.registry(), TOKEN_TCP);
+                TOKEN_TLS_LISTENER => {
+                    if let Some(t) = tcp.as_mut() {
+                        let full = accept_tls(t, state, poll.registry(), now);
+                        if full && accepting {
+                            deregister_listeners(&poll, tcp.as_ref(), h2c.as_ref());
+                            accepting = false;
+                        }
                     }
                 }
-                TOKEN_H2C => {
-                    if let Some(ref mut h) = h2c {
-                        h.accept_pending(poll.registry(), TOKEN_H2C);
+                TOKEN_H2C_LISTENER => {
+                    if let Some(h) = h2c.as_mut() {
+                        let (full, again) = accept_h2c(h, state, poll.registry(), now);
+                        h.set_accept_again(again);
+                        if full && accepting {
+                            deregister_listeners(&poll, tcp.as_ref(), h2c.as_ref());
+                            accepting = false;
+                        }
                     }
                 }
-                _ => {}
+                Token(k) => match *state.sources.get(k) {
+                    Source::TlsConn(_) | Source::H2cConn(_) => {
+                        let outcome = drive_conn_token(
+                            Token(k),
+                            state,
+                            &mut tcp,
+                            &mut h2c,
+                            poll.registry(),
+                            quic_port,
+                            now,
+                        );
+                        if matches!(outcome, ConnOutcome::Parked)
+                            && !state.parked.contains(&Token(k))
+                        {
+                            state.parked.push(Token(k));
+                        }
+                    }
+                    Source::H2cUpstream => {
+                        if state.h2c_pool.drive_one(Token(k), poll.registry()) {
+                            state.h2c_pool.remove_by_token(Token(k), poll.registry());
+                            *state.sources.get_mut(k) = Source::Vacant;
+                            state.sources.free(k);
+                        }
+                    }
+                    Source::H2sUpstream => {
+                        if state.h2s_pool.drive_one(Token(k), poll.registry()) {
+                            state.h2s_pool.remove_by_token(Token(k), poll.registry());
+                            *state.sources.get_mut(k) = Source::Vacant;
+                            state.sources.free(k);
+                        }
+                    }
+                    Source::SocketUpstream(_) => {
+                        drive_socket_upstream_one(Token(k), state, poll.registry());
+                    }
+                    Source::Vacant => {}
+                },
             }
         }
 
-        // Drive socket upstreams and the h2c/h2s client pools BEFORE the server
-        // connections (design H6), so a reply read in this iteration is
-        // collected by its waiting connection in the same iteration.
-        drive_socket_upstreams(state, poll.registry());
-        state.h2c_pool.drive_all(poll.registry(), TOKEN_H2C_CLIENT);
-        state.h2s_pool.drive_all(poll.registry(), TOKEN_H2S_CLIENT);
-
-        // Drive HTTP/1.1 connections. Per-connection fds are registered with TOKEN_TCP
-        // so this also runs on data-ready events, not only on the periodic tick.
-        if let Some(ref mut t) = tcp {
-            // Safety: on_request and on_response are called sequentially, never
-            // concurrently, so the two `&mut state` aliases never overlap.
-            let state_ptr = state as *mut ServerState;
-            let handshakes = t.drive_all(
-                |req, client_ip| {
-                    let state = unsafe { &mut *state_ptr };
-                    let ua = analytics::header(&req.headers, "user-agent");
-                    if let Some(blocked) = check_rate_limit(state, client_ip, &req.path, ua) {
-                        return blocked;
-                    }
-                    // Ahead of the cache lookup below: the key has no host
-                    // component, so a warm apex entry would answer a www
-                    // request and this redirect would never run.
-                    if let Some(redirect) = www_redirect(req, &state.config) {
-                        return redirect;
-                    }
-                    let enc_str =
-                        m6_core::headers::get(&req.headers[..], "accept-encoding").unwrap_or("");
-                    let start = std::time::Instant::now();
-
-                    // ── Cache lookup — check before forwarding to backend ──────────
-                    // Routes with `require` are never served from cache: the
-                    // key has no identity component, so a hit would bypass the
-                    // auth check that runs later in handle_request.
-                    // Method gate as well as auth: only GET and HEAD may be
-                    // answered from cache, so an unsafe or unknown verb can
-                    // never be handed a cached entry.
-                    let cacheable = !state.route_table.requires_auth(&req.path)
-                        && m6_http_lib::cache::method_may_read_cache(&req.method);
-                    let mut key_buf = [0u8; 512];
-                    let lookup_key =
-                        make_lookup_key(&req.path, req.query.as_deref(), enc_str, &mut key_buf);
-                    let req_cc = m6_http_lib::cache::RequestDirectives::parse(&req.headers);
-                    let looked_up = if cacheable {
-                        state.cache.lookup_with(lookup_key, &req_cc)
-                    } else {
-                        m6_http_lib::cache::Lookup::Miss
-                    };
-                    // RFC 9111 5.2.1.7: `only-if-cached` means answer from
-                    // cache or not at all. Going to the backend anyway would
-                    // defeat the one thing the client asked for.
-                    if req_cc.only_if_cached
-                        && matches!(looked_up, m6_http_lib::cache::Lookup::Miss)
-                    {
-                        let mut headers: Vec<(String, String)> = Vec::new();
-                        set_date(&mut headers);
-                        return RequestOutcome::Ready(
-                            504,
-                            headers,
-                            Vec::new(),
-                            "cache".to_string(),
-                        );
-                    }
-                    // Serve stale immediately and refresh behind the request:
-                    // making this visitor wait on an origin round trip is the
-                    // thing the cache exists to avoid. Costs one stale serve.
-                    // A stale serve logs as STALE, not HIT: it is a hit for
-                    // latency purposes but the visitor got the previous
-                    // generation of the content, and that difference has to be
-                    // legible in the logs rather than hidden inside "HIT".
-                    let cache_state = if matches!(looked_up, m6_http_lib::cache::Lookup::Stale(..))
-                    {
-                        "STALE"
-                    } else {
-                        "HIT"
-                    };
-                    if let m6_http_lib::cache::Lookup::Stale(..) = looked_up {
-                        state.queue_refresh(Refresh {
-                            path: req.path.clone(),
-                            query: req.query.clone(),
-                            enc: enc_str.to_string(),
-                        });
-                    }
-                    if let m6_http_lib::cache::Lookup::Fresh(cached, age)
-                    | m6_http_lib::cache::Lookup::Stale(cached, age) = looked_up
-                    {
-                        let elapsed_ns = start.elapsed().as_nanos() as u64;
-                        // Version from the REQUEST, not the listener: h1 and
-                        // h2 share this TLS listener via ALPN.
-                        let chan =
-                            Channel::new(HttpVersion::from_wire(&req.version), state.tls_iface);
-
-                        let precond =
-                            evaluate_preconditions(&cached.headers, &req.headers, &req.method);
-                        // Recorded here, not before the precondition check.
-                        // A conditional request answered 304 (or 412) would
-                        // otherwise be counted as the cached 200, which is the
-                        // opposite of what a response-code breakdown is for --
-                        // revalidation traffic would be invisible.
-                        // `evaluate_preconditions` is pure, so hoisting it is safe.
-                        state.stats.record(
-                            elapsed_ns,
-                            true,
-                            match precond {
-                                Precondition::Failed => 412,
-                                Precondition::NotModified => 304,
-                                _ => cached.status,
-                            },
-                            chan,
-                            "cache",
-                        );
-                        if precond == Precondition::Failed {
-                            // RFC 9110 13.2.2 steps 1-2: the client asserted
-                            // something about the current representation that
-                            // is false (If-Match / If-Unmodified-Since), so the
-                            // request must not be applied and the cached copy
-                            // must not be served in its place.
-                            let mut headers: Vec<(String, String)> = Vec::new();
-                            set_date(&mut headers);
-                            analytics::finish_response(
-                                state.config.analytics.enabled,
-                                &mut headers,
-                                &req.headers,
-                                &analytics::Event {
-                                    node: &state.config.node.name,
-                                    path: &req.path,
-                                    status: 412,
-                                    cache_state,
-                                    client_ip,
-                                    latency_ns: Some(elapsed_ns),
-                                },
-                            );
-                            return RequestOutcome::Ready(
-                                412,
-                                headers,
-                                Vec::new(),
-                                "cache".to_string(),
-                            );
-                        }
-                        if precond == Precondition::NotModified {
-                            let mut headers = not_modified_headers(&cached.headers);
-                            // Vary and Date are applied AFTER the cache insert
-                            // (so `should_cache` sees the backend's own Vary),
-                            // which means the stored headers carry neither and
-                            // `not_modified_headers` has nothing to copy. Add
-                            // them here or the 304 goes out without the
-                            // metadata RFC 9110 15.4.5 requires -- and a client
-                            // updating its stored entry from it would lose the
-                            // knowledge that the response varies by encoding.
-                            set_vary_accept_encoding(&mut headers, true);
-                            set_age(&mut headers, age);
-                            set_date(&mut headers);
-                            debug!(
-                                path = %req.path,
-                                status = 304,
-                                version = %req.version,
-                                backend = "cache",
-                                latency_ns = elapsed_ns,
-                                cache_hit = true,
-                                "request complete"
-                            );
-                            analytics::finish_response(
-                                state.config.analytics.enabled,
-                                &mut headers,
-                                &req.headers,
-                                &analytics::Event {
-                                    node: &state.config.node.name,
-                                    path: &req.path,
-                                    status: 304,
-                                    cache_state,
-                                    client_ip,
-                                    latency_ns: Some(elapsed_ns),
-                                },
-                            );
-                            return RequestOutcome::Ready(
-                                304,
-                                headers,
-                                Vec::new(),
-                                "cache".to_string(),
-                            );
-                        }
-
-                        let mut headers: Vec<(String, String)> = (*cached.headers).clone();
-                        set_alt_svc(&mut headers, quic_port);
-                        set_vary_accept_encoding(&mut headers, true);
-                        set_age(&mut headers, age);
-                        set_describedby_link(&mut headers, &state.config.site.describedby);
-                        debug!(
-                            path = %req.path,
-                            status = cached.status,
-                            version = %req.version,
-                            backend = "cache",
-                            latency_ns = elapsed_ns,
-                            cache_hit = true,
-                            "request complete"
-                        );
-                        analytics::finish_response(
-                            state.config.analytics.enabled,
-                            &mut headers,
-                            &req.headers,
-                            &analytics::Event {
-                                node: &state.config.node.name,
-                                path: &req.path,
-                                status: cached.status,
-                                cache_state,
-                                client_ip,
-                                latency_ns: Some(elapsed_ns),
-                            },
-                        );
-                        return RequestOutcome::Ready(
-                            cached.status,
-                            headers,
-                            cached.body.to_vec(),
-                            "cache".to_string(),
-                        );
-                    } // end cache hit
-
-                    let mut outcome = handle_request(
-                        req,
-                        client_ip,
-                        enc_str,
-                        state,
-                        false, /* from_internal */
-                        false,
-                        poll.registry(),
-                    );
-                    if let RequestOutcome::Ready(status, ref mut headers, _, ref backend) = outcome
-                    {
-                        set_alt_svc(headers, quic_port);
-                        // /health and /perf are separated inside
-                        // `Stats::record` now, not skipped here. See the
-                        // monitoring block in stats.rs: they are counted
-                        // apart from site traffic rather than discarded, so
-                        // requests_total is still a traffic-stall signal.
-                        // Record the cache MISS.
-                        //
-                        // This was missing, and the omission was invisible
-                        // because of where the only other miss-recording site
-                        // sits: the async URL-backend callback below. A cache
-                        // node's backend is the origin over h2c, which is
-                        // always async, so misses were counted there. The
-                        // ORIGIN's backends are unix sockets that complete
-                        // synchronously inside handle_request and return
-                        // Ready, so that callback never fires and no miss was
-                        // ever recorded on the origin.
-                        //
-                        // The consequence: cache_misses=0, miss_p50_ns=0, and
-                        // cache_hit_rate=1.0000 -- not a hit rate at all, but
-                        // "of the requests that were counted, all were hits",
-                        // because misses were never in the denominator.
-                        // requests_total undercounted by every miss, and
-                        // backend_errors_total could never rise on the origin
-                        // at all, since is_backend_error is only passed here
-                        // and in the async callback. A 500 from m6-html was
-                        // uncountable.
-                        //
-                        // Ready only. A Pending outcome is a URL backend whose
-                        // completion callback records it; recording here too
-                        // would double-count every edge miss.
-                        //
-                        // HTTP/3 already did this correctly, which is why the
-                        // gap survived: any check of the h3 path looked fine.
-                        let elapsed_ns = start.elapsed().as_nanos() as u64;
-                        let chan =
-                            Channel::new(HttpVersion::from_wire(&req.version), state.tls_iface);
-                        state.stats.record(elapsed_ns, false, status, chan, backend);
-                    }
-                    outcome
-                },
-                |http_result, ctx| {
-                    let state = unsafe { &mut *state_ptr };
-                    let (status, headers, body, backend_name) =
-                        finalize_url_response(http_result, ctx, quic_port, state);
-                    let elapsed_ns = ctx.start.elapsed().as_nanos() as u64;
-                    let chan =
-                        Channel::new(HttpVersion::from_wire(&ctx.req.version), state.tls_iface);
-                    state
-                        .stats
-                        .record(elapsed_ns, false, status, chan, &ctx.backend_name);
-                    debug!(
-                        path = %ctx.req.path,
-                        status,
-                        version = %ctx.req.version,
-                        backend = %backend_name,
-                        latency_ns = elapsed_ns,
-                        cache_hit = false,
-                        "request complete (async url backend)"
-                    );
-                    (status, headers, body, backend_name)
-                },
+        // Drive the parked connections once each: their reply arrives on a
+        // channel, which has no descriptor that wakes the loop.
+        let mut i = 0;
+        while i < state.parked.len() {
+            let token = state.parked[i];
+            match drive_conn_token(
+                token,
+                state,
+                &mut tcp,
+                &mut h2c,
                 poll.registry(),
-            );
-            // Handshakes completed on this wakeup, attributed by negotiated ALPN.
-            //
-            // Recorded here because this is where the stats live; the listener
-            // returns the samples rather than holding a stats handle of its own.
-            // The interface comes from the listener the connection arrived on, so
-            // a browser handshake and a backbone one land on different channels.
-            for hs in handshakes {
-                let v = if hs.is_h2 {
-                    HttpVersion::Http2
-                } else {
-                    HttpVersion::Http11
-                };
-                state.stats.record_handshake(
-                    hs.elapsed_ns,
-                    Channel::new(v, state.tls_iface),
-                    hs.resumed,
-                );
+                quic_port,
+                now,
+            ) {
+                ConnOutcome::Parked => i += 1,
+                ConnOutcome::Active | ConnOutcome::Closed | ConnOutcome::Gone => {
+                    state.parked.swap_remove(i);
+                }
             }
         }
 
-        // Drive H2C (HTTP/2 cleartext) connections.
-        if let Some(ref mut h) = h2c {
-            let state_ptr2 = state as *mut ServerState;
-            h.drive_all(
-                |req, client_ip| {
-                    let state = unsafe { &mut *state_ptr2 };
-                    let ua = analytics::header(&req.headers, "user-agent");
-                    if let Some(blocked) = check_rate_limit(state, client_ip, &req.path, ua) {
-                        return blocked;
-                    }
-                    // Ahead of the cache lookup below: the key has no host
-                    // component, so a warm apex entry would answer a www
-                    // request and this redirect would never run.
-                    if let Some(redirect) = www_redirect(req, &state.config) {
-                        return redirect;
-                    }
-                    let enc_str =
-                        m6_core::headers::get(&req.headers[..], "accept-encoding").unwrap_or("");
-                    let start = std::time::Instant::now();
-
-                    // ── Cache lookup — check before forwarding to backend ──────────
-                    // Routes with `require` are never served from cache: the
-                    // key has no identity component, so a hit would bypass the
-                    // auth check that runs later in handle_request.
-                    // Method gate as well as auth: only GET and HEAD may be
-                    // answered from cache, so an unsafe or unknown verb can
-                    // never be handed a cached entry.
-                    let cacheable = !state.route_table.requires_auth(&req.path)
-                        && m6_http_lib::cache::method_may_read_cache(&req.method);
-                    let mut key_buf = [0u8; 512];
-                    let lookup_key =
-                        make_lookup_key(&req.path, req.query.as_deref(), enc_str, &mut key_buf);
-                    let req_cc = m6_http_lib::cache::RequestDirectives::parse(&req.headers);
-                    let looked_up = if cacheable {
-                        state.cache.lookup_with(lookup_key, &req_cc)
-                    } else {
-                        m6_http_lib::cache::Lookup::Miss
-                    };
-                    // RFC 9111 5.2.1.7: `only-if-cached` means answer from
-                    // cache or not at all. Going to the backend anyway would
-                    // defeat the one thing the client asked for.
-                    if req_cc.only_if_cached
-                        && matches!(looked_up, m6_http_lib::cache::Lookup::Miss)
-                    {
-                        let mut headers: Vec<(String, String)> = Vec::new();
-                        set_date(&mut headers);
-                        return RequestOutcome::Ready(
-                            504,
-                            headers,
-                            Vec::new(),
-                            "cache".to_string(),
-                        );
-                    }
-                    // Serve stale now, refresh behind the request — see the
-                    // HTTP/1.1 path above for the reasoning.
-                    // A stale serve logs as STALE, not HIT: it is a hit for
-                    // latency purposes but the visitor got the previous
-                    // generation of the content, and that difference has to be
-                    // legible in the logs rather than hidden inside "HIT".
-                    let cache_state = if matches!(looked_up, m6_http_lib::cache::Lookup::Stale(..))
-                    {
-                        "STALE"
-                    } else {
-                        "HIT"
-                    };
-                    if let m6_http_lib::cache::Lookup::Stale(..) = looked_up {
-                        state.queue_refresh(Refresh {
-                            path: req.path.clone(),
-                            query: req.query.clone(),
-                            enc: enc_str.to_string(),
-                        });
-                    }
-                    if let m6_http_lib::cache::Lookup::Fresh(cached, age)
-                    | m6_http_lib::cache::Lookup::Stale(cached, age) = looked_up
-                    {
-                        let elapsed_ns = start.elapsed().as_nanos() as u64;
-                        let chan = Channel::new(HttpVersion::Http2, state.h2c_iface);
-                        // See the TLS path: the status must be the one actually
-                        // sent, so preconditions are evaluated first.
-                        let hit_status = match evaluate_preconditions(
-                            &cached.headers,
-                            &req.headers,
-                            &req.method,
-                        ) {
-                            Precondition::Failed => 412,
-                            Precondition::NotModified => 304,
-                            _ => cached.status,
-                        };
-                        state
-                            .stats
-                            .record(elapsed_ns, true, hit_status, chan, "cache");
-
-                        let precond =
-                            evaluate_preconditions(&cached.headers, &req.headers, &req.method);
-                        if precond == Precondition::Failed {
-                            // RFC 9110 13.2.2 steps 1-2: the client asserted
-                            // something about the current representation that
-                            // is false (If-Match / If-Unmodified-Since), so the
-                            // request must not be applied and the cached copy
-                            // must not be served in its place.
-                            let mut headers: Vec<(String, String)> = Vec::new();
-                            set_date(&mut headers);
-                            analytics::finish_response(
-                                state.config.analytics.enabled,
-                                &mut headers,
-                                &req.headers,
-                                &analytics::Event {
-                                    node: &state.config.node.name,
-                                    path: &req.path,
-                                    status: 412,
-                                    cache_state,
-                                    client_ip,
-                                    latency_ns: Some(elapsed_ns),
-                                },
-                            );
-                            return RequestOutcome::Ready(
-                                412,
-                                headers,
-                                Vec::new(),
-                                "cache".to_string(),
-                            );
-                        }
-                        if precond == Precondition::NotModified {
-                            let mut headers = not_modified_headers(&cached.headers);
-                            // Vary and Date are applied AFTER the cache insert
-                            // (so `should_cache` sees the backend's own Vary),
-                            // which means the stored headers carry neither and
-                            // `not_modified_headers` has nothing to copy. Add
-                            // them here or the 304 goes out without the
-                            // metadata RFC 9110 15.4.5 requires -- and a client
-                            // updating its stored entry from it would lose the
-                            // knowledge that the response varies by encoding.
-                            set_vary_accept_encoding(&mut headers, true);
-                            set_age(&mut headers, age);
-                            set_date(&mut headers);
-                            debug!(
-                                path = %req.path,
-                                status = 304,
-                                version = "HTTP/2",
-                                backend = "cache",
-                                latency_ns = elapsed_ns,
-                                cache_hit = true,
-                                "request complete"
-                            );
-                            analytics::finish_response(
-                                state.config.analytics.enabled,
-                                &mut headers,
-                                &req.headers,
-                                &analytics::Event {
-                                    node: &state.config.node.name,
-                                    path: &req.path,
-                                    status: 304,
-                                    cache_state,
-                                    client_ip,
-                                    latency_ns: Some(elapsed_ns),
-                                },
-                            );
-                            return RequestOutcome::Ready(
-                                304,
-                                headers,
-                                Vec::new(),
-                                "cache".to_string(),
-                            );
-                        }
-
-                        let mut headers: Vec<(String, String)> = (*cached.headers).clone();
-                        set_alt_svc(&mut headers, quic_port);
-                        set_vary_accept_encoding(&mut headers, true);
-                        set_age(&mut headers, age);
-                        set_describedby_link(&mut headers, &state.config.site.describedby);
-                        debug!(
-                            path = %req.path,
-                            status = cached.status,
-                            version = "HTTP/2",
-                            backend = "cache",
-                            latency_ns = elapsed_ns,
-                            cache_hit = true,
-                            "request complete"
-                        );
-                        analytics::finish_response(
-                            state.config.analytics.enabled,
-                            &mut headers,
-                            &req.headers,
-                            &analytics::Event {
-                                node: &state.config.node.name,
-                                path: &req.path,
-                                status: cached.status,
-                                cache_state,
-                                client_ip,
-                                latency_ns: Some(elapsed_ns),
-                            },
-                        );
-                        return RequestOutcome::Ready(
-                            cached.status,
-                            headers,
-                            cached.body.to_vec(),
-                            "cache".to_string(),
-                        );
-                    } // end cache hit
-
-                    let mut outcome = handle_request(
-                        req,
-                        client_ip,
-                        enc_str,
-                        state,
-                        false,
-                        state.h2c_iface == Iface::Internal,
-                        poll.registry(),
-                    );
-                    if let RequestOutcome::Ready(status, ref mut headers, _, ref backend) = outcome
-                    {
-                        set_alt_svc(headers, quic_port);
-                        // Same two notes as the HTTP/1.1 path above: /health and
-                        // /perf are separated inside `Stats::record`, and this
-                        // Ready path records the cache miss itself because the
-                        // async URL-backend callback never runs for it.
-                        let elapsed_ns = start.elapsed().as_nanos() as u64;
-                        // h2c is HTTP/2 by definition; the interface class comes
-                        // from its bind address (the private backbone here).
-                        let chan = Channel::new(HttpVersion::Http2, state.h2c_iface);
-                        state.stats.record(elapsed_ns, false, status, chan, backend);
-                    }
-                    outcome
-                },
-                |http_result, ctx| {
-                    let state = unsafe { &mut *state_ptr2 };
-                    let (status, headers, body, backend_name) =
-                        finalize_url_response(http_result, ctx, quic_port, state);
-                    let elapsed_ns = ctx.start.elapsed().as_nanos() as u64;
-                    let chan = Channel::new(HttpVersion::Http2, state.h2c_iface);
-                    state
-                        .stats
-                        .record(elapsed_ns, false, status, chan, &ctx.backend_name);
-                    debug!(
-                        path = %ctx.req.path,
-                        status,
-                        version = "HTTP/2",
-                        backend = %backend_name,
-                        latency_ns = elapsed_ns,
-                        cache_hit = false,
-                        "request complete (async url backend)"
-                    );
-                    (status, headers, body, backend_name)
-                },
-                poll.registry(),
-            );
-            // No handshake recording here, and that is not an omission. This is
-            // the H2C CLEARTEXT listener -- a different type from the TLS one
-            // above, with its own `drive_all` that returns nothing because there
-            // is no handshake to time. h2c is the backbone path from the cache
-            // nodes, which carry their own TLS to the visitor and reach the
-            // origin in the clear over the private backbone.
+        // Close connections past their read or h2 idle deadline, and socket
+        // upstreams past their backend deadline.
+        while let Some(token) = state.read_timeouts.expired(Instant::now()) {
+            close_conn_token(token, state, &mut tcp, &mut h2c, poll.registry());
+        }
+        while let Some(token) = state.h2_idle_timeouts.expired(Instant::now()) {
+            close_conn_token(token, state, &mut tcp, &mut h2c, poll.registry());
+        }
+        while let Some(token) = state.upstream_timeouts.expired(Instant::now()) {
+            expire_socket_upstream(token, state, poll.registry());
         }
 
-        // Drive connection timeouts and flush pending sends
+        // A slot came free while the token table was full: accept again.
+        if !accepting && !state.sources.is_full() {
+            register_listeners(&poll, tcp.as_ref(), h2c.as_ref());
+            accepting = true;
+        }
+
+        // Drive connection timeouts and flush pending sends.
         flush_all(&udp, &mut connections);
 
         // Poll pending URL-backend responses for H3 streams.
@@ -1275,11 +1383,10 @@ fn event_loop(
             let sids: Vec<u64> = qconn.pending_url.keys().copied().collect();
             for sid in sids {
                 use std::sync::mpsc::TryRecvError;
-                // rx sends io::Result<HttpResponse>, so try_recv() gives Result<io::Result<HttpResponse>, TryRecvError>.
                 let result: Option<std::io::Result<forward::HttpResponse>> =
                     match qconn.pending_url.get(&sid) {
                         Some((rx, _)) => match rx.try_recv() {
-                            Ok(r) => Some(r), // r is already io::Result<HttpResponse>
+                            Ok(r) => Some(r),
                             Err(TryRecvError::Empty) => None,
                             Err(TryRecvError::Disconnected) => Some(Err(std::io::Error::new(
                                 std::io::ErrorKind::BrokenPipe,
@@ -1304,7 +1411,7 @@ fn event_loop(
             }
         }
 
-        // Remove closed/timed-out connections
+        // Remove closed/timed-out connections.
         connections.retain(|_, c| !c.conn.is_closed());
 
         // Emit periodic stats (cheap check every iteration: compares one Instant).
@@ -1316,11 +1423,7 @@ fn event_loop(
             state.stats.set_event_loop(trace.report());
         }
 
-        // Complete any background fetch whose reply has arrived. Runs through
-        // the same finalize_url_response as a real request, so the cache
-        // insert, header handling and hint extraction are identical -- the
-        // only difference is that the response body is discarded, there being
-        // no client to send it to.
+        // Complete any background fetch whose reply has arrived.
         if !state.background_pending.is_empty() {
             use std::sync::mpsc::TryRecvError;
             let mut done: Vec<(
@@ -1332,7 +1435,6 @@ fn event_loop(
                 let got = match state.background_pending[idx].0.try_recv() {
                     Ok(r) => Some(r),
                     Err(TryRecvError::Empty) => None,
-                    // Backend thread died; take the entry so it cannot leak.
                     Err(TryRecvError::Disconnected) => Some(Err(std::io::Error::new(
                         std::io::ErrorKind::BrokenPipe,
                         "url backend thread died",
@@ -1353,17 +1455,10 @@ fn event_loop(
             }
         }
 
-        // Drain one background fetch per loop iteration. Each is a synthetic
-        // GET to a backend, serving two purposes: warming hinted assets into
-        // the cache so they are ready when the browser requests them after a
-        // 103, and refreshing entries that have gone stale (which were served
-        // stale once, so this is what makes the *next* request fresh).
+        // Drain one background fetch per loop iteration.
         if let Some(r) = state.prefetch_queue.pop_front() {
             let mut kbuf = [0u8; 512];
             let lk = make_lookup_key(&r.path, r.query.as_deref(), &r.enc, &mut kbuf);
-            // `get` is fresh-only, so this skips entries some earlier fetch
-            // already refreshed and proceeds for stale ones — which is exactly
-            // the set still needing work.
             if state.cache.get(lk).is_none() {
                 let synth = synth_refresh_request(&r);
                 match handle_request(
@@ -1375,14 +1470,9 @@ fn event_loop(
                     /* from_internal */ false,
                     poll.registry(),
                 ) {
-                    // Ready: answered inline (redirect, error). The reply
-                    // landed directly; nothing to park.
                     RequestOutcome::Ready(..) => {
                         debug!(path = %r.path, enc = %r.enc, "background fetch: cache filled");
                     }
-                    // Backend reply lands later. Park it so the poll below can
-                    // finish it; dropping it here is what made this a no-op on
-                    // cache nodes.
                     RequestOutcome::Pending { rx, ctx } => {
                         if state.background_pending.len() < MAX_REFRESH_QUEUE {
                             state.background_pending.push((rx, ctx));
@@ -1395,14 +1485,11 @@ fn event_loop(
         // The clock read at the end of the work is also the start of the next
         // wait: record the work under the iteration's first trigger, then loop.
         last = std::time::Instant::now();
-        trace.worked(trigger_for(first_trigger), last - now);
+        trace.worked(first_index, last - now);
     }
 
     0
 }
-
-// ── UDP receive + quiche dispatch ─────────────────────────────────────────────
-
 /// The loop context threaded down the h3 request path: the registry, for
 /// registering socket upstreams, and the QUIC port, for the Alt-Svc header.
 struct H3Loop<'a> {
@@ -2409,23 +2496,41 @@ fn launch_socket_upstream(
             return Err(SocketLaunchError::Connect(e));
         }
     };
-    if let Err(e) = registry.register(
-        &mut SourceFd(&upstream.raw_fd()),
-        TOKEN_SOCKET_UPSTREAM,
-        Interest::READABLE,
-    ) {
+    let Some(token) = take_token(state) else {
+        if let Some(pool) = state.pool_manager.get_pool_mut(backend_name) {
+            pool.cancel(member_idx);
+        }
+        return Err(SocketLaunchError::BacklogFull);
+    };
+    let Some(owner) = state.socket_upstreams.take() else {
+        state.sources.free(token.0);
+        if let Some(pool) = state.pool_manager.get_pool_mut(backend_name) {
+            pool.cancel(member_idx);
+        }
+        return Err(SocketLaunchError::BacklogFull);
+    };
+    let interest = upstream.interest();
+    if let Err(e) = registry.register(&mut SourceFd(&upstream.raw_fd()), token, interest) {
+        state.socket_upstreams.free(owner.key);
+        *state.sources.get_mut(token.0) = Source::Vacant;
+        state.sources.free(token.0);
         if let Some(pool) = state.pool_manager.get_pool_mut(backend_name) {
             pool.mark_failed(member_idx);
         }
         return Err(SocketLaunchError::Register(e));
     }
     let (tx, rx) = std::sync::mpsc::channel();
-    state.socket_upstreams.push(SocketUpstreamEntry {
-        upstream,
+    state
+        .upstream_timeouts
+        .touch(token, std::time::Instant::now());
+    *state.sources.get_mut(token.0) = Source::SocketUpstream(owner.key);
+    *state.socket_upstreams.get_mut(owner.key) = SocketUpstreamEntry {
+        upstream: Some(upstream),
         member_idx,
         backend_name: backend_name.to_string(),
-        tx,
-    });
+        tx: Some(tx),
+        interest,
+    };
     Ok(rx)
 }
 
@@ -2796,7 +2901,7 @@ fn handle_request_inner(
     let backend_name = route.backend.clone();
 
     // Check if URL backend — dispatch async.
-    let original_host = origin_host(req, &state.config);
+    let original_host = origin_host(req, &state.config).to_string();
     let timeout = std::time::Duration::from_secs(state.config.server.backend_timeout_secs);
 
     if let Some((url, _tls_config, _)) = state.pool_manager.get_url_info(&backend_name) {
@@ -2816,7 +2921,11 @@ fn handle_request_inner(
 
         let rx = if url.starts_with("h2c://") {
             // Persistent non-blocking H2C client — event-loop managed.
-            match state.h2c_pool.dispatch(&url, req, client_ip, original_host) {
+            match ensure_h2c_conn(state, &url, registry).and_then(|()| {
+                state
+                    .h2c_pool
+                    .dispatch(&url, req, client_ip, &original_host)
+            }) {
                 Ok(rx) => rx,
                 Err(e) => {
                     warn!(backend = %backend_name, error = %e, "h2c dispatch failed");
@@ -2831,10 +2940,11 @@ fn handle_request_inner(
             }
         } else if url.starts_with("h2s://") {
             // Persistent non-blocking H2S (HTTP/2 over TLS) client — event-loop managed.
-            match state
-                .h2s_pool
-                .dispatch(&url, req, client_ip, original_host, _tls_config)
-            {
+            match ensure_h2s_conn(state, &url, _tls_config.clone(), registry).and_then(|()| {
+                state
+                    .h2s_pool
+                    .dispatch(&url, req, client_ip, &original_host)
+            }) {
                 Ok(rx) => rx,
                 Err(e) => {
                     warn!(backend = %backend_name, error = %e, "h2s dispatch failed");
@@ -3069,7 +3179,7 @@ fn dispatch_custom_error_async(
     }
 
     let backend_name = state.route_table.at(&error_path)?.backend.clone();
-    let original_host = origin_host(req, &state.config);
+    let original_host = origin_host(req, &state.config).to_string();
     let timeout = std::time::Duration::from_secs(state.config.server.backend_timeout_secs);
 
     let error_query = format!("status={}&from={}", status, urlencoded(&req.path));
@@ -3100,14 +3210,16 @@ fn dispatch_custom_error_async(
             error_status_override: Some(status),
         };
         let rx = if url.starts_with("h2c://") {
+            ensure_h2c_conn(state, &url, registry).ok()?;
             state
                 .h2c_pool
-                .dispatch(&url, &error_req, client_ip, original_host)
+                .dispatch(&url, &error_req, client_ip, &original_host)
                 .ok()?
         } else if url.starts_with("h2s://") {
+            ensure_h2s_conn(state, &url, tls_config.clone(), registry).ok()?;
             state
                 .h2s_pool
-                .dispatch(&url, &error_req, client_ip, original_host, tls_config)
+                .dispatch(&url, &error_req, client_ip, &original_host)
                 .ok()?
         } else {
             forward::dispatch_url_request(
@@ -3128,7 +3240,7 @@ fn dispatch_custom_error_async(
     // Socket backend: a non-blocking upstream, the same way the socket branch
     // reaches a normal route. Any failure falls back to the synchronous
     // `apply_error_mode`, which handles it identically.
-    let request = forward::encode_request(&error_req, client_ip, original_host).ok()?;
+    let request = forward::encode_request(&error_req, client_ip, &original_host).ok()?;
     let rx =
         launch_socket_upstream(state, registry, request, "GET", &backend_name, timeout).ok()?;
 
@@ -3329,51 +3441,6 @@ fn forward_to_backend(
 /// leaves the poll, its result goes on the entry's channel (where the waiting
 /// h1, h2 or h3 connection collects it in the same iteration), and the pool
 /// member is released or marked failed.
-fn drive_socket_upstreams(state: &mut ServerState, registry: &m6_core::mio::Registry) {
-    let now = std::time::Instant::now();
-    let mut idx = 0;
-    while idx < state.socket_upstreams.len() {
-        let outcome = {
-            let entry = &mut state.socket_upstreams[idx];
-            match entry.upstream.drive() {
-                Some(result) => {
-                    registry
-                        .deregister(&mut SourceFd(&entry.upstream.raw_fd()))
-                        .ok();
-                    Some(result)
-                }
-                None if entry.upstream.expired(now) => {
-                    registry
-                        .deregister(&mut SourceFd(&entry.upstream.raw_fd()))
-                        .ok();
-                    Some(Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "backend timed out",
-                    )))
-                }
-                None => None,
-            }
-        };
-
-        let Some(result) = outcome else {
-            idx += 1;
-            continue;
-        };
-
-        // A refusal cannot reach here: encode_request refused the request
-        // before the upstream was created. Any error is a transport failure.
-        let entry = state.socket_upstreams.remove(idx);
-        if let Some(pool) = state.pool_manager.get_pool_mut(&entry.backend_name) {
-            if result.is_err() {
-                pool.mark_failed(entry.member_idx);
-            } else {
-                pool.release(entry.member_idx);
-            }
-        }
-        let _ = entry.tx.send(result);
-    }
-}
-
 /// Ensure exactly one `alt-svc` header advertising HTTP/3 is present, replacing
 /// any pre-existing one instead of appending a duplicate. A pre-existing entry
 /// shows up whenever the response body already passed through another m6-http
@@ -4384,11 +4451,20 @@ fn run(args: Vec<String>) -> i32 {
             return 2;
         }
     };
+    let ceiling = match raise_open_file_limit() {
+        Ok(c) => c,
+        Err(e) => {
+            error!(error = %e, "raising the open-file limit failed");
+            return 1;
+        }
+    };
     let tcp_listener = match make_tls_server_config(tls_cert, tls_key) {
         Ok(tls_cfg) => match Http11Listener::bind(
             &config.server.bind,
             tls_cfg,
             config.server.max_requests_per_connection,
+            INITIAL_CONNECTIONS,
+            ceiling,
         ) {
             Ok(l) => {
                 info!(bind = %config.server.bind, "HTTP/1.1 over TLS listener started");
@@ -4424,7 +4500,7 @@ fn run(args: Vec<String>) -> i32 {
             .server
             .is_internal(h2c_bind)
             .then(|| config.server.internal_peers.clone());
-        match H2cListener::bind(h2c_bind, internal_peers) {
+        match H2cListener::bind(h2c_bind, internal_peers, INITIAL_CONNECTIONS, ceiling) {
             Ok(l) => {
                 info!(bind = %h2c_bind, "H2C (HTTP/2 cleartext) listener started");
                 Some(l)
@@ -4466,6 +4542,7 @@ fn run(args: Vec<String>) -> i32 {
     } else {
         Iface::External
     };
+    let backend_timeout_secs = config.server.backend_timeout_secs;
     let mut state = ServerState {
         config,
         route_table,
@@ -4474,9 +4551,23 @@ fn run(args: Vec<String>) -> i32 {
         public_key,
         error_mode,
         stats: Stats::new(),
+        sources: Slots::new(INITIAL_CONNECTIONS, ceiling, || Source::Vacant),
         prefetch_queue: std::collections::VecDeque::new(),
         background_pending: Vec::new(),
-        socket_upstreams: Vec::new(),
+        socket_upstreams: Slots::new(INITIAL_CONNECTIONS, ceiling, SocketUpstreamEntry::empty),
+        parked: Vec::with_capacity(INITIAL_CONNECTIONS),
+        read_timeouts: Timeouts::new(
+            INITIAL_CONNECTIONS,
+            std::time::Duration::from_secs(READ_TIMEOUT_SECS),
+        ),
+        h2_idle_timeouts: Timeouts::new(
+            INITIAL_CONNECTIONS,
+            std::time::Duration::from_secs(H2_IDLE_TIMEOUT_SECS),
+        ),
+        upstream_timeouts: Timeouts::new(
+            INITIAL_CONNECTIONS,
+            std::time::Duration::from_secs(backend_timeout_secs),
+        ),
         h2c_pool: H2cClientPool::new(),
         h2s_pool: H2sTlsClientPool::new(),
         tls_iface,

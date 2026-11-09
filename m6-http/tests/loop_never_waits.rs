@@ -55,14 +55,25 @@ struct Backend {
 }
 
 impl Backend {
-    fn start(path: PathBuf, slow_seen: mpsc::Sender<()>, release: Arc<AtomicBool>) -> Backend {
+    fn start(
+        path: PathBuf,
+        slow_seen: mpsc::Sender<()>,
+        large_seen: mpsc::Sender<()>,
+        release: Arc<AtomicBool>,
+    ) -> Backend {
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path).expect("bind backend socket");
         listener
             .set_nonblocking(true)
             .expect("nonblocking listener");
         let stop = Arc::new(AtomicBool::new(false));
-        let handle = spawn_accept(listener, Arc::clone(&stop), Arc::clone(&release), slow_seen);
+        let handle = spawn_accept(
+            listener,
+            Arc::clone(&stop),
+            Arc::clone(&release),
+            slow_seen,
+            large_seen,
+        );
         Backend {
             path,
             stop,
@@ -86,6 +97,7 @@ fn spawn_accept(
     stop: Arc<AtomicBool>,
     release: Arc<AtomicBool>,
     slow_seen: mpsc::Sender<()>,
+    large_seen: mpsc::Sender<()>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         while !stop.load(Ordering::SeqCst) {
@@ -94,7 +106,10 @@ fn spawn_accept(
                     let stop = Arc::clone(&stop);
                     let release = Arc::clone(&release);
                     let slow_seen = slow_seen.clone();
-                    std::thread::spawn(move || serve(stream, &stop, &release, &slow_seen));
+                    let large_seen = large_seen.clone();
+                    std::thread::spawn(move || {
+                        serve(stream, &stop, &release, &slow_seen, &large_seen)
+                    });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(1));
@@ -105,23 +120,27 @@ fn spawn_accept(
     })
 }
 
-/// Read the request head, then answer `/fast` at once or hold `/slow` until
-/// `release`. A held request is also released by `stop`, so dropping the
-/// backend cannot hang the accept loop's worker thread.
+/// Read the request head, then answer `/fast` at once, `/large` with 4 MiB,
+/// `/echo` with the request body length, or hold `/slow` until `release`.
 fn serve(
     mut stream: UnixStream,
     stop: &AtomicBool,
     release: &AtomicBool,
     slow_seen: &mpsc::Sender<()>,
+    large_seen: &mpsc::Sender<()>,
 ) {
-    let mut buf = [0u8; 4096];
+    // The accepted socket inherits the listener's non-blocking flag. Blocking
+    // here so `write_all` of a large body writes it whole rather than stopping
+    // at a full buffer.
+    let _ = stream.set_nonblocking(false);
+    // Read the head byte by byte so the request body stays in the socket for
+    // the `/echo` path to read with `read_exact`.
     let mut got = Vec::new();
+    let mut byte = [0u8; 1];
     while !got.windows(4).any(|w| w == b"\r\n\r\n") {
-        match stream.read(&mut buf) {
+        match stream.read(&mut byte) {
             Ok(0) => return,
-            Ok(n) => got.extend_from_slice(&buf[..n]),
-            // The accepted socket inherits the listener's non-blocking flag on
-            // some platforms, so poll for the request rather than bail.
+            Ok(_) => got.push(byte[0]),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(1));
             }
@@ -138,9 +157,40 @@ fn serve(
             return; // shutdown while still held
         }
         respond(&mut stream, 200, SLOW_BODY, false);
+    } else if head.starts_with("get /large") {
+        respond_bytes(&mut stream, 200, &LARGE_BODY, true);
+        let _ = large_seen.send(());
+    } else if head.starts_with("post /echo") {
+        let len = head
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("content-length:"))
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        let mut body = vec![0u8; len];
+        let _ = stream.read_exact(&mut body);
+        respond(&mut stream, 200, &format!("{}", body.len()), false);
     } else {
         respond(&mut stream, 200, FAST_BODY, true);
     }
+}
+
+/// 4 MiB, served by `/large` for the slow-reader test.
+static LARGE_BODY: [u8; 4 * 1024 * 1024] = [b'x'; 4 * 1024 * 1024];
+
+fn respond_bytes(stream: &mut UnixStream, status: u16, body: &[u8], cache: bool) {
+    let cache_header = if cache {
+        "Cache-Control: public, max-age=60\r\n"
+    } else {
+        ""
+    };
+    let head = format!(
+        "HTTP/1.1 {status} OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\
+         {cache_header}Connection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = stream.write_all(head.as_bytes());
+    let _ = stream.write_all(body);
+    let _ = stream.flush();
 }
 
 fn respond(stream: &mut UnixStream, status: u16, body: &str, cache: bool) {
@@ -392,6 +442,7 @@ struct Fixture {
     service: Service,
     _backends: Vec<Backend>,
     slow_seens: Vec<mpsc::Receiver<()>>,
+    large_seens: Vec<mpsc::Receiver<()>>,
     release: Arc<AtomicBool>,
 }
 
@@ -415,12 +466,15 @@ impl Fixture {
         let pid = std::process::id();
         let mut backends = Vec::new();
         let mut slow_seens = Vec::new();
+        let mut large_seens = Vec::new();
         let release = Arc::new(AtomicBool::new(false));
         for i in 0..n_backends {
             let path = PathBuf::from(format!("/tmp/m6lnw-{pid}-{tag}-{i}.sock"));
             let (tx, rx) = mpsc::channel();
-            backends.push(Backend::start(path, tx, Arc::clone(&release)));
+            let (ltx, lrx) = mpsc::channel();
+            backends.push(Backend::start(path, tx, ltx, Arc::clone(&release)));
             slow_seens.push(rx);
+            large_seens.push(lrx);
         }
         let glob = format!("/tmp/m6lnw-{pid}-{tag}-*.sock");
 
@@ -431,8 +485,12 @@ impl Fixture {
             site_toml(&glob, backend_timeout_secs),
         )
         .expect("site.toml");
-        std::fs::write(site.join("system.toml"), system_toml(port, &cert, &key))
-            .expect("system.toml");
+        std::fs::write(site.join("metrics.token"), "loop-never-waits-token").expect("token");
+        std::fs::write(
+            site.join("system.toml"),
+            system_toml(port, &cert, &key, &site.join("metrics.token")),
+        )
+        .expect("system.toml");
 
         let service = Service::spawn(
             "m6-http",
@@ -450,6 +508,7 @@ impl Fixture {
             service,
             _backends: backends,
             slow_seens,
+            large_seens,
             release,
         }
     }
@@ -462,22 +521,31 @@ impl Fixture {
 fn site_toml(glob: &str, backend_timeout_secs: u64) -> String {
     format!(
         "[site]\nname = \"loop-never-waits\"\ndomain = \"localhost\"\n\n\
-         [server]\nbackend_timeout_secs = {backend_timeout_secs}\n\n\
+         [server]\nbackend_timeout_secs = {backend_timeout_secs}\nmax_requests_per_connection = 10000\n\n\
          [log]\nlevel = \"info\"\nformat = \"text\"\n\n\
          [analytics]\nenabled = false\n\n\
          [rate_limit]\nenabled = false\n\n\
          [[backend]]\nname = \"app\"\nsockets = \"{glob}\"\n\n\
          [[route]]\npath = \"/fast\"\nbackend = \"app\"\n\n\
-         [[route]]\npath = \"/slow\"\nbackend = \"app\"\n"
+         [[route]]\npath = \"/slow\"\nbackend = \"app\"\n\n\
+         [[route]]\npath = \"/large\"\nbackend = \"app\"\n\n\
+         [[route]]\npath = \"/echo\"\nbackend = \"app\"\n"
     )
 }
 
-fn system_toml(port: u16, cert: &std::path::Path, key: &std::path::Path) -> String {
+fn system_toml(
+    port: u16,
+    cert: &std::path::Path,
+    key: &std::path::Path,
+    token: &std::path::Path,
+) -> String {
     format!(
         "[server]\nbind = \"127.0.0.1:{port}\"\ntls_cert = \"{}\"\ntls_key = \"{}\"\n\n\
+         [health]\nmetrics_token_file = \"{}\"\n\n\
          [node]\nname = \"loop-never-waits\"\n",
         cert.display(),
-        key.display()
+        key.display(),
+        token.display(),
     )
 }
 
@@ -647,5 +715,188 @@ fn a_socket_backend_miss_advertises_alt_svc() {
         has,
         "a socket-backend miss must advertise alt-svc\n--- m6-http ---\n{}",
         fx.service.output()
+    );
+}
+
+// ── Keep-alive client and the per-descriptor-token guards ─────────────────────
+
+/// One keep-alive HTTP/1.1-over-TLS connection, reused across requests.
+struct H1KeepAlive {
+    stream: rustls::StreamOwned<rustls::ClientConnection, TcpStream>,
+}
+
+impl H1KeepAlive {
+    fn connect(port: u16) -> H1KeepAlive {
+        probe::install_crypto();
+        let tcp = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        tcp.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("read timeout");
+        let name =
+            rustls::pki_types::ServerName::try_from("127.0.0.1".to_string()).expect("server name");
+        let conn = rustls::ClientConnection::new(probe::tls_config(b"http/1.1"), name)
+            .expect("client conn");
+        H1KeepAlive {
+            stream: rustls::StreamOwned::new(conn, tcp),
+        }
+    }
+
+    fn request(&mut self, path: &str, extra: &[(&str, &str)]) -> (u16, String) {
+        let mut req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n");
+        for (k, v) in extra {
+            req.push_str(&format!("{k}: {v}\r\n"));
+        }
+        req.push_str("\r\n");
+        self.stream.write_all(req.as_bytes()).expect("write");
+        self.stream.flush().expect("flush");
+        let raw = read_one(&mut self.stream, "GET").expect("read one response");
+        parse_h1(&raw).expect("parse response")
+    }
+}
+
+/// The `(name, count)` pairs of the event-loop figures `/perf` reports,
+/// read over the already-open keep-alive connection.
+fn perf_event_loop(conn: &mut H1KeepAlive) -> Vec<(String, u64)> {
+    let (status, body) = conn.request(
+        "/perf",
+        &[("Authorization", "Bearer loop-never-waits-token")],
+    );
+    assert_eq!(status, 200, "/perf answered {status}: {body}");
+    let report: m6_core::monitoring::PerfReport =
+        serde_json::from_str(&body).expect("a perf report");
+    report
+        .metrics
+        .event_loop
+        .into_iter()
+        .map(|t| (t.name, t.count))
+        .collect()
+}
+
+/// One keep-alive connection that sends 100 requests must fire the connection
+/// arm 100 times and the accept arm at most twice: every connection event used
+/// to fire the listener's arm, which then tried a failing accept.
+#[test]
+fn a_connection_event_never_accepts() {
+    let fx = Fixture::start(1, 30, "accept");
+    let mut conn = H1KeepAlive::connect(fx.port());
+    // Warm /fast so the 100 requests below are cache hits.
+    let (warm_status, warm_body) = conn.request("/fast", &[]);
+    assert_eq!(warm_status, 200, "warm /fast: {warm_body}");
+    assert_eq!(warm_body, FAST_BODY);
+    for _ in 0..100 {
+        let (status, body) = conn.request("/fast", &[]);
+        assert_eq!(status, 200, "GET /fast: {body}");
+        assert_eq!(body, FAST_BODY);
+    }
+    // Wait for the accounting tick that copies the loop trace into /perf.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut accept = None;
+    let mut conn_events = None;
+    while Instant::now() < deadline {
+        let loops = perf_event_loop(&mut conn);
+        let a = loops.iter().find(|(n, _)| n == "accept").map(|(_, c)| *c);
+        let c = loops.iter().find(|(n, _)| n == "conn").map(|(_, c)| *c);
+        if let (Some(a), Some(c)) = (a, c) {
+            if c >= 100 {
+                accept = Some(a);
+                conn_events = Some(c);
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let accept = accept.expect("the accept trigger never reported 100 connection events");
+    let conn_events = conn_events.expect("the conn trigger never reached 100");
+    assert!(
+        accept <= 2,
+        "accept fired {accept} times; expected at most 2"
+    );
+    assert!(
+        conn_events >= 100,
+        "conn fired {conn_events} times; expected at least 100"
+    );
+}
+
+/// A 4 MiB response to a client with a 64 KiB receive buffer is resumed by
+/// write readiness, not by a timer, and a cache hit answers while it drains.
+#[test]
+fn a_large_response_to_a_slow_reader_is_resumed_by_write_readiness() {
+    let fx = Fixture::start(1, 30, "large");
+    probe::install_crypto();
+    let tcp = TcpStream::connect(("127.0.0.1", fx.port())).expect("connect");
+    let sock = socket2::SockRef::from(&tcp);
+    sock.set_recv_buffer_size(64 * 1024).expect("recv buffer");
+    tcp.set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("read timeout");
+    let name =
+        rustls::pki_types::ServerName::try_from("127.0.0.1".to_string()).expect("server name");
+    let conn =
+        rustls::ClientConnection::new(probe::tls_config(b"http/1.1"), name).expect("client conn");
+    let mut stream = rustls::StreamOwned::new(conn, tcp);
+    stream
+        .write_all(b"GET /large HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .expect("write");
+    stream.flush().expect("flush");
+    // Wait until the backend has written the whole response, then drain it.
+    let seen = await_slow_seen(&fx.large_seens[0], Instant::now() + Duration::from_secs(5));
+    assert!(seen, "the backend never wrote /large");
+    let mut body = Vec::new();
+    let _ = stream.read_to_end(&mut body);
+    let head_len = body
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|p| p + 4)
+        .unwrap_or(0);
+    assert_eq!(
+        body.len() - head_len,
+        LARGE_BODY.len(),
+        "the 4 MiB body arrived intact (got {} body bytes)",
+        body.len().saturating_sub(head_len)
+    );
+    // While the slow reader drains, a cache hit on a second connection answers
+    // within two seconds.
+    let fast = h1_get(fx.port(), "/fast", Duration::from_secs(2));
+    let (fast_status, fast_body) = match fast {
+        Ok(r) => r,
+        Err(e) => panic!("a cache hit stalled behind the large write: {e}"),
+    };
+    assert_eq!(fast_status, 200, "cache hit: {fast_body}");
+    assert_eq!(fast_body, FAST_BODY);
+}
+
+/// A 1 MiB request body over TLS arrives whole: the turn drains rustls's
+/// plaintext buffer and reads on, rather than stopping at the 16 KiB limit.
+#[test]
+fn a_request_body_larger_than_the_tls_plaintext_buffer_arrives_whole() {
+    let fx = Fixture::start(1, 30, "echo");
+    probe::install_crypto();
+    let tcp = TcpStream::connect(("127.0.0.1", fx.port())).expect("connect");
+    tcp.set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("read timeout");
+    let name =
+        rustls::pki_types::ServerName::try_from("127.0.0.1".to_string()).expect("server name");
+    let conn =
+        rustls::ClientConnection::new(probe::tls_config(b"http/1.1"), name).expect("client conn");
+    let mut stream = rustls::StreamOwned::new(conn, tcp);
+    let body = vec![b'p'; 1024 * 1024];
+    let head = format!(
+        "POST /echo HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).expect("write head");
+    stream.write_all(&body).expect("write body");
+    stream.flush().expect("flush");
+    let raw = match read_one(&mut stream, "POST") {
+        Ok(r) => r,
+        Err(e) => panic!(
+            "read one response: {e}\n--- m6-http ---\n{}",
+            fx.service.output()
+        ),
+    };
+    let (status, echoed) = parse_h1(&raw).expect("parse response");
+    assert_eq!(status, 200, "POST /echo: {echoed}");
+    assert_eq!(
+        echoed.trim(),
+        "1048576",
+        "the backend echoed the full 1 MiB body length"
     );
 }
