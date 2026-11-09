@@ -1858,11 +1858,14 @@ dependencies = [
  "md-5",
  "minify-html",
  "minify-js",
+ "mio 1.2.3",
  "multer",
  "nix 0.31.3",
  "rand",
  "rcgen",
  "rusqlite",
+ "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "sha2",
@@ -2135,6 +2138,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4b18443e9c262bfe8fa82f51666e2642c53393f7e5c27b3e1aeab922cff5b9d8"
 dependencies = [
  "libc",
+ "log 0.4.34",
  "wasi",
  "windows-sys 0.61.2",
 ]

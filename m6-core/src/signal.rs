@@ -85,6 +85,20 @@ fn blocked_here() -> bool {
     mask_ok(SigSet::thread_get_mask())
 }
 
+/// Assert the calling thread blocks the signals, with the reason shared by
+/// [`ShutdownHandle::install`] and [`crate::event::Signals::new`], so the two
+/// refusal messages cannot drift.
+pub(crate) fn require_blocked() {
+    assert!(
+        blocked_here(),
+        "m6_core::signal::block() must be the first statement of main, before \
+         anything spawns a thread. Without it the signal mask is not inherited \
+         by threads that already exist (the tracing-appender writer, for one), \
+         the kernel delivers SIGTERM to one of them, and the process dies at \
+         the default disposition instead of shutting down."
+    );
+}
+
 /// Reopen the log file for [`REOPEN_SIGNAL`] and say what happened.
 fn reopen_on_signal(name: &str) {
     match crate::log::reopen_log_file() {
@@ -182,7 +196,7 @@ fn wake(socket: Option<&Path>, wake_fd: Option<RawFd>) {
         // the shutdown flag on wake and exits without reading it.
         #[expect(
             clippy::disallowed_methods,
-            reason = "the signal thread; removed by EL-2 (m6-http) and EL-6 (App), deleted in EL-12"
+            reason = "App and m6-md only: removed by EL-6d (App) and EL-12 (m6-md)"
         )]
         let _ = std::os::unix::net::UnixStream::connect(path);
     }
@@ -201,6 +215,80 @@ fn finish(svc_name: &str, socket: Option<&Path>, how: &str) {
         let _ = std::fs::remove_file(path);
     }
     tracing::info!("{svc_name} shutdown {how}");
+}
+
+/// The `"<name> started"` line, with the socket when there is one, shared by
+/// [`ShutdownHandle::install`] and [`Lifecycle::started`].
+fn log_started_line(name: &str, socket: Option<&Path>) {
+    match socket {
+        Some(path) => tracing::info!(socket = %path.display(), "{} started", name),
+        None => tracing::info!("{} started", name),
+    }
+}
+
+/// What a loop does after one signal.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Action {
+    Continue,
+    Stop,
+}
+
+/// One termination: log it, force an exit on the second, and say whether to
+/// stop. Shared by [`Lifecycle::on_signal`] and the signal thread, so their log
+/// lines cannot drift.
+fn handle_terminate(name: &str, socket: Option<&Path>, count: u32) -> Action {
+    if count >= 2 {
+        finish(name, socket, "forced");
+        std::process::exit(0);
+    }
+    tracing::info!("{name} shutdown signal received");
+    Action::Stop
+}
+
+/// The signal thread's per-signal decisions, without the thread.
+///
+/// A loop that reads [`crate::event::Signals`] as a descriptor owns one of
+/// these and asks it what each signal means. The first [`crate::event::Signal::Terminate`]
+/// answers [`Action::Stop`]; a second before the loop has ended forces an exit,
+/// exactly as the signal thread did.
+pub struct Lifecycle {
+    name: String,
+    socket: Option<PathBuf>,
+    terminations: u32,
+}
+
+impl Lifecycle {
+    pub fn new(name: impl Into<String>, socket: Option<PathBuf>) -> Lifecycle {
+        Lifecycle {
+            name: name.into(),
+            socket,
+            terminations: 0,
+        }
+    }
+
+    /// `"<name> started"`, as [`ShutdownHandle::install`] logs it.
+    pub fn started(&self) {
+        log_started_line(&self.name, self.socket.as_deref());
+    }
+
+    /// What to do after one signal. [`Action::Stop`] means the loop breaks.
+    pub fn on_signal(&mut self, s: crate::event::Signal) -> Action {
+        match s {
+            crate::event::Signal::ReopenLogs => {
+                reopen_on_signal(&self.name);
+                Action::Continue
+            }
+            crate::event::Signal::Terminate => {
+                self.terminations += 1;
+                handle_terminate(&self.name, self.socket.as_deref(), self.terminations)
+            }
+        }
+    }
+
+    /// Finish a graceful shutdown: unlink the socket, log the completion line.
+    pub fn complete(&self) {
+        finish(&self.name, self.socket.as_deref(), "complete");
+    }
 }
 
 /// Shared shutdown state installed once at process start.
@@ -223,14 +311,7 @@ impl ShutdownHandle {
     /// statement of `main`; this asserts it, because the failure it prevents
     /// is otherwise silent.
     pub fn install(service: Service) -> Self {
-        assert!(
-            blocked_here(),
-            "m6_core::signal::block() must be the first statement of main, before \
-             anything spawns a thread. Without it the signal mask is not inherited \
-             by threads that already exist (the tracing-appender writer, for one), \
-             the kernel delivers SIGTERM to one of them, and the process dies at \
-             the default disposition instead of shutting down."
-        );
+        require_blocked();
         // Idempotent: block() has already run, but a service that installs from
         // a thread other than main still needs the mask set here.
         block();
@@ -247,7 +328,7 @@ impl ShutdownHandle {
         let thread_name = Arc::clone(&name);
         #[expect(
             clippy::disallowed_methods,
-            reason = "the signal thread; removed by EL-2 (m6-http) and EL-6 (App), deleted in EL-12"
+            reason = "App and m6-md only: removed by EL-6d (App) and EL-12 (m6-md)"
         )]
         std::thread::Builder::new()
             .name("m6-signal".into())
@@ -258,18 +339,15 @@ impl ShutdownHandle {
                 let name = &*thread_name;
 
                 while let Ok(sig) = wait_mask.wait() {
-                    // Before `SIGNAL_COUNT`, so a reopen is never a step
+                    // Before the terminate count, so a reopen is never a step
                     // toward a forced exit.
                     if sig == REOPEN_SIGNAL {
                         reopen_on_signal(name);
                         continue;
                     }
                     let count = SIGNAL_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
-                    if count >= 2 {
-                        finish(name, sock, "forced");
-                        std::process::exit(0);
-                    }
-                    // Log BEFORE publishing the flag, not after.
+                    // `handle_terminate` logs "shutdown signal received" BEFORE
+                    // this stores the flag, not after.
                     //
                     // The flag is what releases the main thread: it
                     // sees `is_shutdown()`, logs "shutdown
@@ -296,9 +374,10 @@ impl ShutdownHandle {
                     // cannot observe the flag until this call has
                     // returned, so the line is queued ahead of the
                     // completion line rather than concurrently with it.
-                    tracing::info!("{name} shutdown signal received");
-                    SHUTDOWN_FLAG.store(true, Ordering::SeqCst);
-                    wake(sock, wake_fd);
+                    if handle_terminate(name, sock, count as u32) == Action::Stop {
+                        SHUTDOWN_FLAG.store(true, Ordering::SeqCst);
+                        wake(sock, wake_fd);
+                    }
                 }
             })
             .expect("spawning the signal thread");
@@ -318,10 +397,7 @@ impl ShutdownHandle {
     /// thread pool size, bind address); the lifecycle line is core's, so it
     /// reads the same for every unit.
     fn log_started(&self) {
-        match self.socket.as_deref() {
-            Some(path) => tracing::info!(socket = %path.display(), "{} started", self.name),
-            None => tracing::info!("{} started", self.name),
-        }
+        log_started_line(&self.name, self.socket.as_deref().map(|p| p.as_path()));
     }
 
     /// Finish a graceful shutdown: unlink the socket, log the completion line.
@@ -350,7 +426,7 @@ impl ShutdownHandle {
         while !self.is_shutdown() {
             #[expect(
                 clippy::disallowed_methods,
-                reason = "the signal thread; removed by EL-2 (m6-http) and EL-6 (App), deleted in EL-12"
+                reason = "App and m6-md only: removed by EL-6d (App) and EL-12 (m6-md)"
             )]
             std::thread::sleep(Duration::from_millis(sleep_ms));
             sleep_ms = (sleep_ms * 2).min(100);

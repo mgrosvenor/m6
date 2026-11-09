@@ -1,0 +1,651 @@
+//! The parts a service's own event loop is built from.
+//!
+//! The reactor is `mio`, re-exported as [`crate::mio`]. This module adds only
+//! what `mio` lacks: [`Signals`] (signals as a readable descriptor),
+//! [`Timeouts`] (deadlines that never allocate), [`Slots`] (a connection table
+//! that doubles when full and never shrinks) and [`LoopTrace`] (wait time
+//! against work time per trigger).
+//!
+//! The loop these parts serve follows six rules. Start and stop may block
+//! freely. The loop never blocks. One thread runs the loop. The poll is
+//! edge-triggered, so every turn reads and writes until `WouldBlock`. The loop
+//! allocates nothing (table growth excepted). A service's loop uses no
+//! `unsafe`.
+
+use std::io;
+use std::os::fd::RawFd;
+use std::time::{Duration, Instant};
+
+use mio::Token;
+use nix::sys::signal::{SigSet, Signal as Sig};
+
+// ── Signals ──────────────────────────────────────────────────────────────────
+
+/// A signal the loop cares about.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Signal {
+    /// SIGTERM or SIGINT: stop.
+    Terminate,
+    /// SIGUSR1: reopen the log file.
+    ReopenLogs,
+}
+
+/// SIGTERM, SIGINT and SIGUSR1 as one readable descriptor.
+///
+/// Linux uses `signalfd`, macOS and the BSDs use a kqueue registered for
+/// `EVFILT_SIGNAL`. [`new`](Self::new) blocks the three signals for the process
+/// and asserts [`crate::signal::block`] already ran, because a thread started
+/// before the mask is set takes the signal at its default disposition.
+pub struct Signals {
+    #[cfg(target_os = "linux")]
+    fd: nix::sys::signalfd::SignalFd,
+    #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
+    kq: nix::sys::event::Kqueue,
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "openbsd"
+)))]
+compile_error!("m6 runs on Linux, macOS and the BSDs");
+
+/// The three signals this module owns, as a mask.
+fn managed() -> SigSet {
+    let mut set = SigSet::empty();
+    set.add(Sig::SIGTERM);
+    set.add(Sig::SIGINT);
+    set.add(crate::signal::REOPEN_SIGNAL);
+    set
+}
+
+/// Map a signal number to the loop's two outcomes.
+fn signal_from_signo(signo: i32) -> Option<Signal> {
+    match Sig::try_from(signo).ok()? {
+        Sig::SIGTERM | Sig::SIGINT => Some(Signal::Terminate),
+        Sig::SIGUSR1 => Some(Signal::ReopenLogs),
+        _ => None,
+    }
+}
+
+impl Signals {
+    #[cfg(target_os = "linux")]
+    pub fn new() -> io::Result<Signals> {
+        crate::signal::require_blocked();
+        let set = managed();
+        set.thread_block()?;
+        let fd = nix::sys::signalfd::SignalFd::with_flags(
+            &set,
+            nix::sys::signalfd::SfdFlags::SFD_NONBLOCK | nix::sys::signalfd::SfdFlags::SFD_CLOEXEC,
+        )?;
+        Ok(Signals { fd })
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
+    pub fn new() -> io::Result<Signals> {
+        crate::signal::require_blocked();
+        let set = managed();
+        set.thread_block()?;
+        ignore_default_disposition()?;
+        let kq = nix::sys::event::Kqueue::new()?;
+        for sig in [Sig::SIGTERM, Sig::SIGINT, crate::signal::REOPEN_SIGNAL] {
+            let ev = nix::sys::event::KEvent::new(
+                sig as libc::c_int as libc::uintptr_t,
+                nix::sys::event::EventFilter::EVFILT_SIGNAL,
+                nix::sys::event::EvFlags::EV_ADD | nix::sys::event::EvFlags::EV_ENABLE,
+                nix::sys::event::FilterFlag::empty(),
+                0,
+                0,
+            );
+            kq.kevent(std::slice::from_ref(&ev), &mut [], None)?;
+        }
+        Ok(Signals { kq })
+    }
+
+    /// The readable descriptor, for `mio::unix::SourceFd`. A kqueue descriptor
+    /// is itself readable in `mio`'s kqueue when a signal event is pending.
+    pub fn raw_fd(&self) -> RawFd {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            self.fd.as_raw_fd()
+        }
+        #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
+        {
+            use std::os::fd::{AsFd, AsRawFd};
+            self.kq.as_fd().as_raw_fd()
+        }
+    }
+
+    /// One pending signal, or `None` when there are no more. The caller loops
+    /// until `None`: the descriptor is edge-triggered, so every pending signal
+    /// must be drained on one wake.
+    pub fn read(&mut self) -> Option<Signal> {
+        #[cfg(target_os = "linux")]
+        {
+            let info = self.fd.read_signal().ok()??;
+            signal_from_signo(info.ssi_signo as i32)
+        }
+        #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
+        {
+            let mut out = nix::sys::event::KEvent::new(
+                0,
+                nix::sys::event::EventFilter::EVFILT_SIGNAL,
+                nix::sys::event::EvFlags::empty(),
+                nix::sys::event::FilterFlag::empty(),
+                0,
+                0,
+            );
+            let zero = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            let n = self
+                .kq
+                .kevent(&[], std::slice::from_mut(&mut out), Some(zero))
+                .ok()?;
+            if n == 0 {
+                return None;
+            }
+            signal_from_signo(out.ident() as i32)
+        }
+    }
+}
+
+/// Set the three signals to `SIG_IGN`, so a delivery never runs a handler.
+///
+/// kqueue delivers `EVFILT_SIGNAL` events even while the disposition is
+/// `SIG_IGN`, and ignoring keeps a stray delivery from a thread whose mask is
+/// not set from taking the process down at the default disposition.
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
+#[allow(unsafe_code)] // SIG_IGN installs no handler code, so no signal runs an unsound function pointer.
+fn ignore_default_disposition() -> io::Result<()> {
+    use nix::sys::signal::{SaFlags, SigAction, SigHandler};
+    let action = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
+    for sig in [Sig::SIGTERM, Sig::SIGINT, crate::signal::REOPEN_SIGNAL] {
+        // SAFETY: `SIG_IGN` runs no handler code, so the disposition is the
+        // kernel's own and cannot call back into unsound Rust.
+        unsafe { nix::sys::signal::sigaction(sig, &action)? };
+    }
+    Ok(())
+}
+
+// ── Timeouts ─────────────────────────────────────────────────────────────────
+
+const NONE: usize = usize::MAX;
+
+/// Deadlines for up to `capacity` tokens that all share one duration (an idle
+/// timeout, an upstream timeout). Every slot is allocated at start. Touching a
+/// token moves it to the back of a list kept in deadline order, so setting,
+/// clearing and finding the next expiry are all O(1) and never allocate. A
+/// service with two durations keeps two of these.
+pub struct Timeouts {
+    after: Duration,
+    at: Vec<Option<Instant>>,
+    prev: Vec<usize>,
+    next: Vec<usize>,
+    head: usize,
+    tail: usize,
+}
+
+impl Timeouts {
+    pub fn new(capacity: usize, after: Duration) -> Timeouts {
+        Timeouts {
+            after,
+            at: vec![None; capacity],
+            prev: vec![NONE; capacity],
+            next: vec![NONE; capacity],
+            head: NONE,
+            tail: NONE,
+        }
+    }
+
+    /// Room for `capacity` tokens. Existing deadlines are kept.
+    pub fn grow(&mut self, capacity: usize) {
+        self.at.resize(capacity, None);
+        self.prev.resize(capacity, NONE);
+        self.next.resize(capacity, NONE);
+    }
+
+    /// The token's deadline becomes `now + after`, replacing any earlier one.
+    pub fn touch(&mut self, token: Token, now: Instant) {
+        self.clear(token);
+        let k = token.0;
+        self.at[k] = Some(now + self.after);
+        self.prev[k] = self.tail;
+        self.next[k] = NONE;
+        if self.tail == NONE {
+            self.head = k;
+        } else {
+            self.next[self.tail] = k;
+        }
+        self.tail = k;
+    }
+
+    pub fn clear(&mut self, token: Token) {
+        let k = token.0;
+        if self.at[k].take().is_none() {
+            return;
+        }
+        let (p, n) = (self.prev[k], self.next[k]);
+        if p == NONE {
+            self.head = n;
+        } else {
+            self.next[p] = n;
+        }
+        if n == NONE {
+            self.tail = p;
+        } else {
+            self.prev[n] = p;
+        }
+    }
+
+    /// Time until the earliest deadline, capped at `tick`.
+    pub fn timeout(&self, now: Instant, tick: Duration) -> Duration {
+        match self.head {
+            NONE => tick,
+            k => self.at[k].map_or(tick, |at| at.saturating_duration_since(now).min(tick)),
+        }
+    }
+
+    /// One token whose deadline has passed, removed from the list, or `None`.
+    pub fn expired(&mut self, now: Instant) -> Option<Token> {
+        let k = self.head;
+        if k == NONE || self.at[k].is_none_or(|at| at > now) {
+            return None;
+        }
+        self.clear(Token(k));
+        Some(Token(k))
+    }
+}
+
+// ── Slots ────────────────────────────────────────────────────────────────────
+
+/// A connection table of `T`. `initial` slots are made at once with `make`,
+/// each with its own buffers. The table doubles when full, never shrinks, and
+/// stops at `ceiling`. A slot is not dropped when freed: its buffers stay for
+/// the next connection, and the caller resets its fields.
+pub struct Slots<T> {
+    items: Vec<T>,
+    free: Vec<usize>,
+    ceiling: usize,
+    make: fn() -> T,
+}
+
+/// A slot handed out by [`Slots::take`], with whether the table grew.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Taken {
+    pub key: usize,
+    /// The new length, only when the table doubled to make room.
+    pub grew_to: Option<usize>,
+}
+
+impl<T> Slots<T> {
+    /// `initial` slots made at once with `make`, each with its own buffers.
+    pub fn new(initial: usize, ceiling: usize, make: fn() -> T) -> Slots<T> {
+        Slots {
+            items: (0..initial).map(|_| make()).collect(),
+            free: (0..initial).rev().collect(),
+            ceiling,
+            make,
+        }
+    }
+
+    /// A free slot. Doubles the table (up to `ceiling`) when none is free: the
+    /// one allocation the loop may make. `None` at the ceiling.
+    pub fn take(&mut self) -> Option<Taken> {
+        if self.free.is_empty() {
+            if self.items.len() >= self.ceiling {
+                return None;
+            }
+            let old = self.items.len();
+            let new = (old * 2).min(self.ceiling);
+            self.items.extend((old..new).map(|_| (self.make)()));
+            self.free.reserve_exact(new - self.free.len());
+            self.free.extend((old..new).rev());
+            return Some(Taken {
+                key: self.free.pop()?,
+                grew_to: Some(new),
+            });
+        }
+        Some(Taken {
+            key: self.free.pop()?,
+            grew_to: None,
+        })
+    }
+
+    pub fn free(&mut self, key: usize) {
+        self.free.push(key);
+    }
+
+    pub fn get(&self, key: usize) -> &T {
+        &self.items[key]
+    }
+
+    pub fn get_mut(&mut self, key: usize) -> &mut T {
+        &mut self.items[key]
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    /// Whether the table holds no slots. Only true when `initial` was 0: the
+    /// table never shrinks.
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.free.is_empty() && self.items.len() >= self.ceiling
+    }
+}
+
+// ── Open-file limit ──────────────────────────────────────────────────────────
+
+/// The process's soft open-file limit, raised to the hard limit: the connection
+/// table's ceiling. Start only.
+pub fn raise_open_file_limit() -> io::Result<usize> {
+    use nix::sys::resource::{getrlimit, setrlimit, Resource};
+    let (_, hard) = getrlimit(Resource::RLIMIT_NOFILE)?;
+    setrlimit(Resource::RLIMIT_NOFILE, hard, hard)?;
+    Ok(hard.saturating_sub(16) as usize) // room for the listener, the signal fd, the poll, stdio
+}
+
+// ── LoopTrace ────────────────────────────────────────────────────────────────
+
+/// How many triggers a loop may name.
+const MAX_TRIGGERS: usize = 16;
+/// Samples kept per trigger.
+const RING: usize = 256;
+
+/// The summary of one trigger since the last [`LoopTrace::report`].
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct TriggerReport {
+    pub name: &'static str,
+    pub count: u64,
+    pub wait_min_ns: u64,
+    pub wait_max_ns: u64,
+    pub wait_mean_ns: u64,
+    pub work_min_ns: u64,
+    pub work_max_ns: u64,
+    pub work_mean_ns: u64,
+}
+
+/// Wait time against work time, per trigger, reported on the accounting tick.
+///
+/// `worked` takes a trigger index rather than a name, and `report` returns a
+/// fixed array rather than a `String`, so the loop never allocates and never
+/// compares strings.
+pub struct LoopTrace {
+    triggers: &'static [&'static str],
+    wait_ring: [[u64; RING]; MAX_TRIGGERS],
+    work_ring: [[u64; RING]; MAX_TRIGGERS],
+    ring_idx: [usize; MAX_TRIGGERS],
+    counts: [u64; MAX_TRIGGERS],
+    last_waited_ns: u64,
+    reports: [TriggerReport; MAX_TRIGGERS],
+    report_len: usize,
+}
+
+impl LoopTrace {
+    /// The service's trigger names, fixed at start (at most 16).
+    pub fn new(triggers: &'static [&'static str]) -> LoopTrace {
+        assert!(
+            triggers.len() <= MAX_TRIGGERS,
+            "at most {MAX_TRIGGERS} triggers"
+        );
+        LoopTrace {
+            triggers,
+            wait_ring: [[0; RING]; MAX_TRIGGERS],
+            work_ring: [[0; RING]; MAX_TRIGGERS],
+            ring_idx: [0; MAX_TRIGGERS],
+            counts: [0; MAX_TRIGGERS],
+            last_waited_ns: 0,
+            reports: [TriggerReport {
+                name: "",
+                count: 0,
+                wait_min_ns: 0,
+                wait_max_ns: 0,
+                wait_mean_ns: 0,
+                work_min_ns: 0,
+                work_max_ns: 0,
+                work_mean_ns: 0,
+            }; MAX_TRIGGERS],
+            report_len: 0,
+        }
+    }
+
+    /// How long the last `poll` waited.
+    pub fn waited(&mut self, d: Duration) {
+        self.last_waited_ns = d.as_nanos() as u64;
+    }
+
+    /// How long the work for one trigger took, `trigger` an index into the
+    /// start-time list. Pairs its sample with the most recent `waited`.
+    pub fn worked(&mut self, trigger: usize, d: Duration) {
+        let pos = self.ring_idx[trigger];
+        self.wait_ring[trigger][pos] = self.last_waited_ns;
+        self.work_ring[trigger][pos] = d.as_nanos() as u64;
+        self.ring_idx[trigger] = (pos + 1) % RING;
+        self.counts[trigger] += 1;
+    }
+
+    /// Count, min, max and mean per trigger since the last call, then cleared.
+    pub fn report(&mut self) -> &[TriggerReport] {
+        for t in 0..self.triggers.len() {
+            let count = self.counts[t];
+            let occupied = count.min(RING as u64) as usize;
+            let (mut wmin, mut wmax, mut wsum) = (u64::MAX, 0u64, 0u64);
+            let (mut kmin, mut kmax, mut ksum) = (u64::MAX, 0u64, 0u64);
+            for i in 0..occupied {
+                let w = self.wait_ring[t][i];
+                let k = self.work_ring[t][i];
+                wmin = wmin.min(w);
+                wmax = wmax.max(w);
+                wsum += w;
+                kmin = kmin.min(k);
+                kmax = kmax.max(k);
+                ksum += k;
+            }
+            if occupied == 0 {
+                wmin = 0;
+                wmax = 0;
+                kmin = 0;
+                kmax = 0;
+            }
+            self.reports[t] = TriggerReport {
+                name: self.triggers[t],
+                count,
+                wait_min_ns: wmin,
+                wait_max_ns: wmax,
+                wait_mean_ns: if occupied == 0 {
+                    0
+                } else {
+                    wsum / occupied as u64
+                },
+                work_min_ns: kmin,
+                work_max_ns: kmax,
+                work_mean_ns: if occupied == 0 {
+                    0
+                } else {
+                    ksum / occupied as u64
+                },
+            };
+            self.counts[t] = 0;
+            self.ring_idx[t] = 0;
+        }
+        self.report_len = self.triggers.len();
+        &self.reports[..self.report_len]
+    }
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Timeouts.
+
+    #[test]
+    fn touch_then_expired_in_deadline_order() {
+        let mut t = Timeouts::new(4, Duration::from_secs(10));
+        let now = Instant::now();
+        t.touch(Token(0), now);
+        t.touch(Token(1), now);
+        t.touch(Token(2), now);
+        let later = now + Duration::from_secs(11);
+        assert_eq!(t.expired(later), Some(Token(0)));
+        assert_eq!(t.expired(later), Some(Token(1)));
+        assert_eq!(t.expired(later), Some(Token(2)));
+        assert_eq!(t.expired(later), None);
+    }
+
+    #[test]
+    fn clear_removes_from_the_middle_head_and_tail() {
+        let mut t = Timeouts::new(4, Duration::from_secs(10));
+        let now = Instant::now();
+        let later = now + Duration::from_secs(11);
+
+        t.touch(Token(0), now);
+        t.touch(Token(1), now);
+        t.touch(Token(2), now);
+        t.clear(Token(1)); // the middle
+        assert_eq!(t.expired(later), Some(Token(0)));
+        assert_eq!(t.expired(later), Some(Token(2)));
+        assert_eq!(t.expired(later), None);
+
+        let mut t = Timeouts::new(4, Duration::from_secs(10));
+        t.touch(Token(0), now);
+        t.touch(Token(1), now);
+        t.touch(Token(2), now);
+        t.clear(Token(0)); // the head
+        assert_eq!(t.expired(later), Some(Token(1)));
+        assert_eq!(t.expired(later), Some(Token(2)));
+        assert_eq!(t.expired(later), None);
+
+        let mut t = Timeouts::new(4, Duration::from_secs(10));
+        t.touch(Token(0), now);
+        t.touch(Token(1), now);
+        t.touch(Token(2), now);
+        t.clear(Token(2)); // the tail
+        assert_eq!(t.expired(later), Some(Token(0)));
+        assert_eq!(t.expired(later), Some(Token(1)));
+        assert_eq!(t.expired(later), None);
+    }
+
+    #[test]
+    fn timeout_is_capped_at_the_tick() {
+        let mut t = Timeouts::new(4, Duration::from_secs(100));
+        let now = Instant::now();
+        t.touch(Token(0), now);
+        let tick = Duration::from_secs(1);
+        assert_eq!(t.timeout(now, tick), tick);
+    }
+
+    #[test]
+    fn grow_keeps_existing_deadlines() {
+        let mut t = Timeouts::new(2, Duration::from_secs(10));
+        let now = Instant::now();
+        t.touch(Token(0), now);
+        t.touch(Token(1), now);
+        t.grow(4);
+        t.touch(Token(3), now);
+        let later = now + Duration::from_secs(11);
+        assert_eq!(t.expired(later), Some(Token(0)));
+        assert_eq!(t.expired(later), Some(Token(1)));
+        assert_eq!(t.expired(later), Some(Token(3)));
+        assert_eq!(t.expired(later), None);
+    }
+
+    // Slots.
+
+    #[test]
+    fn take_hands_out_every_initial_slot_then_doubles() {
+        let mut s = Slots::new(2, 8, || 0u8);
+        assert_eq!(s.take().map(|t| t.key), Some(0));
+        assert_eq!(s.take().map(|t| t.key), Some(1));
+        let third = s.take().expect("grows");
+        assert_eq!(third.key, 2);
+        assert_eq!(third.grew_to, Some(4));
+        assert_eq!(s.len(), 4);
+    }
+
+    #[test]
+    fn the_ceiling_stops_growth_and_take_returns_none() {
+        let mut s = Slots::new(2, 2, || 0u8);
+        assert_eq!(s.take().map(|t| t.key), Some(0));
+        assert_eq!(s.take().map(|t| t.key), Some(1));
+        assert_eq!(s.take(), None);
+    }
+
+    #[test]
+    fn a_freed_slot_is_reused_before_growing() {
+        let mut s = Slots::new(2, 8, || 0u8);
+        assert_eq!(s.take().map(|t| t.key), Some(0));
+        assert_eq!(s.take().map(|t| t.key), Some(1));
+        s.free(0);
+        let reused = s.take().expect("reused");
+        assert_eq!(reused.key, 0);
+        assert_eq!(reused.grew_to, None);
+        assert_eq!(s.len(), 2);
+    }
+
+    // LoopTrace.
+
+    #[test]
+    fn the_trace_summarises_and_clears() {
+        let mut trace = LoopTrace::new(&["t"]);
+        trace.waited(Duration::ZERO);
+        trace.worked(0, Duration::from_millis(1));
+        trace.worked(0, Duration::from_millis(2));
+        trace.worked(0, Duration::from_millis(3));
+        let r = trace.report();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].name, "t");
+        assert_eq!(r[0].count, 3);
+        assert_eq!(r[0].work_min_ns, Duration::from_millis(1).as_nanos() as u64);
+        assert_eq!(r[0].work_max_ns, Duration::from_millis(3).as_nanos() as u64);
+        assert_eq!(
+            r[0].work_mean_ns,
+            Duration::from_millis(2).as_nanos() as u64
+        );
+        let r = trace.report();
+        assert_eq!(r[0].count, 0);
+    }
+
+    #[test]
+    fn the_ring_keeps_the_newest_256() {
+        let mut trace = LoopTrace::new(&["t"]);
+        trace.waited(Duration::ZERO);
+        for _ in 0..10 {
+            trace.worked(0, Duration::from_millis(9));
+        }
+        for _ in 0..300 {
+            trace.worked(0, Duration::from_millis(1));
+        }
+        let r = trace.report();
+        assert_eq!(r[0].count, 310);
+        assert_eq!(r[0].work_max_ns, Duration::from_millis(1).as_nanos() as u64);
+        assert_eq!(
+            r[0].work_mean_ns,
+            Duration::from_millis(1).as_nanos() as u64
+        );
+    }
+
+    /// `Signals::new` without `block()` first refuses to start. The mask is
+    /// unblocked first so the assertion is the thing that fails, as
+    /// `signal::installing_without_blocking_first_is_refused` does.
+    #[test]
+    #[should_panic(expected = "must be the first statement of main")]
+    fn signals_new_refuses_an_unblocked_mask() {
+        let mut set = SigSet::empty();
+        set.add(Sig::SIGTERM);
+        set.add(Sig::SIGINT);
+        set.add(crate::signal::REOPEN_SIGNAL);
+        let _ = set.thread_unblock();
+        let _ = Signals::new();
+    }
+}
