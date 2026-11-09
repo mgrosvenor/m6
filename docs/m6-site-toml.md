@@ -204,14 +204,12 @@ In that example, development and production differ in the bind address and the c
 
 The merge rules, in order:
 
-1. The system config loads after `site.toml`.
-2. Its `[server]` keys win on conflict, and so do its three `[health]` keys.
+1. Each key has one file, Table 1 in §3.3.
+2. A key in the other file, an unknown key or section in either file, or a system config with no `[node]` stops m6-http at start with exit 2, and the error names the key and the file it belongs in.
 3. A relative `[auth] public_key` in the system config resolves against the site directory, as `tls_cert` does.
 4. An absolute path is used as given.
-5. Any other top-level key in the system config is ignored with a warning, and any other `[health]` key there fails to parse.
-6. Validation runs after the merge.
-7. When both arguments name one file, its `[auth]` and `[health]` belong to the site config alone.
-8. A key read only at start keeps its running value, and the log names it and says to restart.
+5. Validation runs after both files are read.
+6. When both arguments name one file, every key is read from it, `[node]` included.
 
 The `[auth]`, `[health]` and `[server]` sections after section 3 state the one-file and `metrics_token_file` rules.
 
@@ -434,11 +432,11 @@ The monitoring endpoints, answered inside m6-http ahead of routing, the cache an
 | `perf_path` | string | `"/perf"` | Counters, latency percentiles and host facts |
 | `traffic_path` | string | `"/traffic"` | Summary of the last hour of the analytics log |
 | `traffic_cache_s` | integer | `60` | Seconds a `/traffic` summary is reused |
-| `metrics_token_file` | string | none | The legacy gate. Path to a file holding a bearer string. May also sit in the system config, where it wins and a relative path resolves against the site directory. In `site.toml` a relative path resolves against the working directory, so use an absolute path. Ignored when `metrics_require` is set |
-| `metrics_require` | string | none | `"role:<name>"` or `"group:<name>"`. A token with this claim opens `/perf` and `/traffic`. It comes from the Authorization header or the session cookie, as route `require` reads it |
-| `metrics_peers` | list of strings | none | IP addresses allowed to read `/perf` and `/traffic`. Anyone else gets 404 |
+| `metrics_token_file` | string | none | System config only. The legacy gate. A file holding a bearer string. A file that is missing or empty, or the key set together with `metrics_require`, stops the start with exit 2 |
+| `metrics_require` | string | none | System config only. `"role:<name>"` or `"group:<name>"`. A token with this claim opens `/perf` and `/traffic`. It comes from the Authorization header or the session cookie, as route `require` reads it |
+| `metrics_peers` | list of strings | none | System config only. IP addresses allowed to read `/perf` and `/traffic`. Anyone else gets 404 |
 
-The system config accepts `metrics_require` and `metrics_peers` only.
+The system config accepts `metrics_require`, `metrics_peers` and `metrics_token_file` only.
 
 **Who may read `/perf` and `/traffic`.**
 A request is served only when both rules pass, checked in this order.
@@ -577,6 +575,11 @@ Exit 2 on:
 - `[auth]` declared but `public_key` file not found
 - `[auth]` declared with a `backend` that is not declared in `[[backend]]`
 - `[auth]` declared in both `site.toml` and the system config
+- A key in the file it does not belong to, or a key or section m6-http does not know
+- A system config with no `[node]`
+- `metrics_token_file` missing, empty, or set together with `metrics_require`
+- `--log-level` unrecognised
+- `cache` on a `[[route]]` or `[[route_group]]`
 - `[health] metrics_peers` empty, or an entry that is not an IP address (names are never resolved, ranges and ports are refused)
 - `[health] metrics_peers` entry that is not in a local range
 - `[health] metrics_require` without `[auth]`, or not `role:<name>` or `group:<name>`
