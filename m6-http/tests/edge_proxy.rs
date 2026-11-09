@@ -363,7 +363,7 @@ impl EdgeStack {
         // global system.toml
         let global_sys = base.join("global-system.toml");
         std::fs::write(&global_sys, format!(
-            "[server]\nbind     = \"127.0.0.1:{global_port}\"\ntls_cert = \"{}\"\ntls_key  = \"{}\"\n",
+            "[node]\nname = \"global\"\n\n[server]\nbind     = \"127.0.0.1:{global_port}\"\ntls_cert = \"{}\"\ntls_key  = \"{}\"\n",
             gc_f.path().display(), gk_f.path().display()
         )).unwrap();
 
@@ -373,7 +373,7 @@ impl EdgeStack {
 
         let edge_sys = base.join("edge-system.toml");
         std::fs::write(&edge_sys, format!(
-            "[server]\nbind     = \"127.0.0.1:{edge_port}\"\ntls_cert = \"{}\"\ntls_key  = \"{}\"\n",
+            "[node]\nname = \"edge\"\n\n[server]\nbind     = \"127.0.0.1:{edge_port}\"\ntls_cert = \"{}\"\ntls_key  = \"{}\"\n",
             ec_f.path().display(), ek_f.path().display()
         )).unwrap();
 
