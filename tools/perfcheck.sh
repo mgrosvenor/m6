@@ -248,12 +248,14 @@ else
 fi
 
 # Run a command pinned to one CPU, or unpinned when the run asked for that.
+# `exec` replaces the subshell that `&` and `$()` fork, so `$!` is the command
+# itself and `kill` stops it rather than a now-empty wrapper shell.
 run_pinned() {
   local cpu="$1"; shift
   if (( PINNED == 1 )); then
-    taskset -c "$cpu" "$@"
+    exec taskset -c "$cpu" "$@"
   else
-    "$@"
+    exec "$@"
   fi
 }
 

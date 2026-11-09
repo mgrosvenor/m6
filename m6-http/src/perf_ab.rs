@@ -483,14 +483,16 @@ fn build_record(
         "ts".to_string(),
         serde_json::Value::from(env_str(env, "M6_PERF_TS")),
     );
-    record.insert(
-        "commit".to_string(),
-        serde_json::Value::from(env_str(env, "M6_PERF_COMMIT")),
-    );
-    record.insert(
-        "dirty".to_string(),
-        serde_json::Value::from(env_bool(env, "M6_PERF_DIRTY")),
-    );
+    let commit = env_str(env, "M6_PERF_COMMIT");
+    // Dirtiness is a property of the commit it belongs to, so when the commit
+    // is unknown (git failed outside a git tree) dirtiness is unknown too.
+    let dirty = if commit.is_none() {
+        None
+    } else {
+        env_bool(env, "M6_PERF_DIRTY")
+    };
+    record.insert("commit".to_string(), serde_json::Value::from(commit));
+    record.insert("dirty".to_string(), serde_json::Value::from(dirty));
     record.insert(
         "toolchain".to_string(),
         serde_json::Value::from(env_str(env, "M6_PERF_TOOLCHAIN")),
@@ -618,6 +620,28 @@ mod tests {
         ];
         let env = BTreeMap::new();
         assert_eq!(run(&args, &env), 2);
+    }
+
+    #[test]
+    fn dirty_is_null_when_commit_is_null() {
+        let mut env = BTreeMap::new();
+        env.insert("M6_PERF_DIRTY".to_string(), "0".to_string());
+        let record = build_record(
+            &env,
+            None,
+            None,
+            false,
+            None,
+            None,
+            30,
+            500,
+            3.0,
+            10.0,
+            None,
+            &serde_json::Map::new(),
+        );
+        assert!(record["commit"].is_null());
+        assert!(record["dirty"].is_null());
     }
 
     #[test]
