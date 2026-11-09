@@ -390,6 +390,167 @@ fn t04_login_rate_limited_429() {
     );
 }
 
+/// Append a `[rate_limit]` table with `max_attempts = n` to the test config.
+///
+/// Call it before `spawn_server`. `setup_test_env` writes no `[rate_limit]`
+/// table, so appending one is valid TOML and the server reads it at start.
+fn limit_failures_to(env: &TestEnv, n: u32) {
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&env.config_path)
+        .expect("open the test config for appending");
+    writeln!(file, "\n[rate_limit]\nmax_attempts = {n}").expect("append the rate limit table");
+}
+
+/// Send one wrong JSON login carrying the extra header lines in `forwarded`,
+/// and return its status. `forwarded` is each header line ending in `\r\n`, or
+/// an empty string for none.
+fn failed_login(socket: &Path, forwarded: &str) -> u16 {
+    let body = r#"{"username":"nobody","password":"bad"}"#;
+    let req = format!(
+        "POST /auth/login HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\n\r\n{}",
+        forwarded,
+        body.len(),
+        body,
+    );
+    let resp = http_request(socket, &req);
+    parse_status(&resp)
+}
+
+/// Each forwarded address is its own rate-limit bucket.
+///
+/// Two failures from `192.0.2.10` use that address's budget and the third is
+/// blocked. A second `X-Forwarded-For` address is not blocked. `X-Real-IP` is
+/// read when `X-Forwarded-For` is absent, and `X-Forwarded-For` wins when both
+/// are present.
+#[test]
+fn forwarded_addresses_select_the_rate_limit_bucket() {
+    let env = setup_test_env("rate-limit-bucket");
+    limit_failures_to(&env, 2);
+    let _guard = spawn_server(&env);
+    let socket = &env.socket_path;
+
+    assert_eq!(
+        failed_login(socket, "X-Forwarded-For: 192.0.2.10\r\n"),
+        401,
+        "X-Forwarded-For: 192.0.2.10, first failure, expected 401"
+    );
+    assert_eq!(
+        failed_login(socket, "X-Forwarded-For: 192.0.2.10\r\n"),
+        401,
+        "X-Forwarded-For: 192.0.2.10, second failure, expected 401"
+    );
+    assert_eq!(
+        failed_login(socket, "X-Forwarded-For: 192.0.2.10\r\n"),
+        429,
+        "X-Forwarded-For: 192.0.2.10, third failure, expected 429"
+    );
+    assert_eq!(
+        failed_login(socket, "X-Forwarded-For: 192.0.2.11\r\n"),
+        401,
+        "X-Forwarded-For: 192.0.2.11, a second address is not blocked, expected 401"
+    );
+
+    assert_eq!(
+        failed_login(socket, "X-Real-IP: 192.0.2.12\r\n"),
+        401,
+        "X-Real-IP: 192.0.2.12, first failure, expected 401"
+    );
+    assert_eq!(
+        failed_login(socket, "X-Real-IP: 192.0.2.12\r\n"),
+        401,
+        "X-Real-IP: 192.0.2.12, second failure, expected 401"
+    );
+    assert_eq!(
+        failed_login(socket, "X-Real-IP: 192.0.2.12\r\n"),
+        429,
+        "X-Real-IP: 192.0.2.12, third failure, expected 429"
+    );
+
+    assert_eq!(
+        failed_login(
+            socket,
+            "X-Forwarded-For: 192.0.2.11\r\nX-Real-IP: 192.0.2.10\r\n"
+        ),
+        401,
+        "X-Forwarded-For wins over X-Real-IP: 192.0.2.11 is not blocked, expected 401"
+    );
+}
+
+/// Callers that send neither header count against the one `unix` bucket.
+///
+/// Two failures with no forwarded header use the bucket and a third is
+/// blocked. A forwarded address has its own bucket and is not blocked by them.
+#[test]
+fn requests_without_a_forwarded_address_share_one_bucket() {
+    let env = setup_test_env("rate-limit-unix-bucket");
+    limit_failures_to(&env, 2);
+    let _guard = spawn_server(&env);
+    let socket = &env.socket_path;
+
+    assert_eq!(
+        failed_login(socket, ""),
+        401,
+        "no header, first failure, expected 401"
+    );
+    assert_eq!(
+        failed_login(socket, ""),
+        401,
+        "no header, second failure, expected 401"
+    );
+    assert_eq!(
+        failed_login(socket, ""),
+        429,
+        "no header, third failure, expected 429"
+    );
+    assert_eq!(
+        failed_login(socket, "X-Forwarded-For: 192.0.2.20\r\n"),
+        401,
+        "X-Forwarded-For: 192.0.2.20, a forwarded address is not blocked by the unix bucket, expected 401"
+    );
+}
+
+/// A restart forgets the failure counts, because the counts live in memory.
+///
+/// The 429 before the restart proves the address really was blocked, so the
+/// 401 after it means the count was gone rather than never counted.
+#[test]
+fn a_restart_forgets_the_failure_counts() {
+    let env = setup_test_env("rate-limit-restart");
+    limit_failures_to(&env, 2);
+    let mut svc = spawn_server(&env);
+    let socket = &env.socket_path;
+
+    assert_eq!(
+        failed_login(socket, "X-Forwarded-For: 192.0.2.30\r\n"),
+        401,
+        "X-Forwarded-For: 192.0.2.30, first failure, expected 401"
+    );
+    assert_eq!(
+        failed_login(socket, "X-Forwarded-For: 192.0.2.30\r\n"),
+        401,
+        "X-Forwarded-For: 192.0.2.30, second failure, expected 401"
+    );
+    assert_eq!(
+        failed_login(socket, "X-Forwarded-For: 192.0.2.30\r\n"),
+        429,
+        "X-Forwarded-For: 192.0.2.30, third failure, expected 429"
+    );
+
+    assert!(
+        svc.terminate(Duration::from_secs(10)).success(),
+        "the service did not exit cleanly on SIGTERM\n--- output ---\n{}",
+        svc.output()
+    );
+
+    let _guard = spawn_server(&env);
+    assert_eq!(
+        failed_login(socket, "X-Forwarded-For: 192.0.2.30\r\n"),
+        401,
+        "X-Forwarded-For: 192.0.2.30, after restart, expected 401"
+    );
+}
+
 /// Refresh: valid refresh cookie → 302, new session cookie.
 #[test]
 fn t05_refresh_valid_cookie_302_new_session() {
