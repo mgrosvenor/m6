@@ -31,7 +31,7 @@ Where this document and the code disagree, the code is right and this document i
 ## 1. What an app is
 
 **An m6 app is a Unix socket server that links `m6-core` and nothing else.**
-Core owns the socket, the accept loop, HTTP/1.1, routing, the request dictionary, configuration, hot reload, compression, minification, logging and the shutdown sequence.
+Core owns the socket, the accept loop, HTTP/1.1, routing, the request dictionary, configuration, compression, minification, logging and the shutdown sequence.
 What is left for a service to write is its routes and their bodies.
 
 Every m6 service except the edge is an app in this sense.
@@ -70,7 +70,7 @@ fn main() -> anyhow::Result<()> {
 }
 ```
 
-That serves every HTML page a site has, at every route its configuration declares, with templates, compression, minification and hot reload.
+That serves every HTML page a site has, at every route its configuration declares, with templates, compression and minification.
 Linking `m6-core` is the only thing a new app has to do.
 
 The manifest is the other half of the claim.
@@ -156,7 +156,7 @@ Those paths are decided before the socket exists, which is why §4 comes next: t
 ## 4. The configuration
 
 **Core reserves twelve top-level keys and hands the service everything else.**
-This section gives the reserved keys and their defaults, the name that ties the configuration file to the socket and to `site.toml`, and what a reload changes.
+This section gives the reserved keys and their defaults, the name that ties the configuration file to the socket and to `site.toml`, and what is read at start.
 
 Table 4 is the reserved set, and a key in it never reaches a template.
 
@@ -223,50 +223,6 @@ The name also carries one agreement that core checks at startup.
 `site.toml` declares `[[backend]] compresses` for this name, and a service whose `[compression]` disagrees with that declaration exits 2 with a message saying which way.
 A service that compresses where `site.toml` says it does not lets the edge cache a compressed body and replay it to a client that asked for identity, and the reverse fragments every downstream cache on a header that cannot change the body.
 
-### 4.2 What a reload changes
-
-A service reads two files, its own configuration and `site.toml`, and a change to either reloads it.
-One `ConfigReloader` in core watches both.
-It takes the change from the platform's watcher when there is one and, whatever the watcher says, compares the two files' bytes, mode, owner and modification time once a second.
-A lost watch, a replaced directory or a watcher that stopped reporting therefore delays a reload by at most a second and no longer prevents it.
-The first change after quiet reloads at once, and so does any change more than 20 ms after the last reload.
-A change that arrives within 20 ms of a reload is held and reloads once, 20 ms after the latest change in the burst and no later than a second after the reload.
-A write that replaces the file in one step is therefore one reload with no delay.
-Writes more than 20 ms apart each reload, and writes closer together than that share one more reload.
-A write that truncates the file first can report twice, because the truncation is seen as a change of its own.
-A file seen at length 0 is not loaded: the reload is skipped with a warning and the write that fills the file reloads.
-A touch alone, with no change to the bytes, reloads when it moves the modification time, so a second touch in the same second on a filesystem with one-second timestamps is not seen.
-A rewrite of the same length inside one timestamp tick reloads, because the bytes differ.
-Table 5 says what that reload reaches.
-
-| reloaded on a change to either file | fixed until a restart |
-|---|---|
-| routes, both the code-bound set and the configuration-declared one | `[thread_pool]` size and queue, read once at startup |
-| templates | `[server] read_timeout_s`, applied to a socket at accept time |
-| the base request dictionary: `global_params`, static params files and the service's own keys | `[server] socket_mode`, applied to the socket once after binding |
-| compression and minification levels | `site_toml`, which names the file the watch is built on |
-| the `[log]` level, from the command line, the service's `[log]` or `site.toml`'s `[log]`, in that order | `[log]` format |
-| the `[[backend]] compresses` agreement with `site.toml` | |
-| state built in `init_global`, through `on_reload` | |
-
-**Table 5: what a change to either file reloads, and what needs a restart.**
-Take from it that a reload re-reads both files every time, whichever one changed, because a service has no cache that a rebuild would lose.
-
-A key that needs a restart keeps its running value, and the warning compares the new file with the values the process started with.
-The reload logs `config reload: <key> changed; restart this service to apply it` for each one that differs.
-
-A reload that fails is refused whole.
-A configuration that does not parse, a template that does not build, a route naming an unregistered handler, a `site_toml` that is gone, or a `site.toml` that is not valid TOML whether or not `site_toml` names it, and a `compresses` declaration that disagrees with the service each leave the previous state serving and log the reason, which is what makes a typo in a live configuration recoverable.
-A file that failed to load is not tried again until it is written again.
-
-`AppWithGlobal::on_reload` and `AppWithState::on_reload` register `Fn(&G, &AppContext) -> Result<()>` for state that `init_global` built from the configuration.
-m6-auth-server uses it to re-read its signing keys and m6-monitor uses it to name its restart-only keys.
-Core calls it with the new configuration in the context, after the new state has been built and checked and before it is installed.
-If the hook returns `Err`, core logs it at error level with the delay before the next attempt and keeps the previous routes and log level.
-The reload is tried again after 1 s, then 2 s, 4 s and so on up to 60 s, and at once when either file is written again, so the hook must be safe to run twice on the same configuration.
-A panic in the hook is not caught.
-The release profile aborts on panic, so it ends the process and the service manager restarts it.
-Return `Err` for anything that can be recovered from.
 
 The route table is the part of that configuration a service writes code against, and §5 is how the two meet.
 
@@ -299,7 +255,7 @@ use m6_core::prelude::*;
 App::new().renderer(NoTemplates).route_get("/healthz", |_| Ok(Response::text("ok")))
 ```
 
-The set of code routes is fixed for the life of the process, so a reload cannot add one.
+The set of code routes is fixed for the life of the process.
 
 ### 5.2 Routes declared in configuration
 
@@ -318,10 +274,10 @@ root    = "assets/"
 ```
 
 That is `m6-file` in full, and its `main.rs` is 34 lines of which 24 are a comment.
-Configuration routes are recompiled on every reload, so adding, changing or removing one takes effect without a restart.
-A route naming a handler that was never registered exits 2 at startup and is refused at reload.
+Configuration routes are compiled at start.
+A route naming a handler that was never registered exits 2 at startup.
 
-Table 6 gives the keys a `[[route]]` may carry.
+Table 5 gives the keys a `[[route]]` may carry.
 
 | key | what it does |
 |---|---|
@@ -335,7 +291,7 @@ Table 6 gives the keys a `[[route]]` may carry.
 | `headers` | extra response headers, as `[[key, value]]` pairs |
 | anything else | kept verbatim and read by the handler through `Request::route_setting` |
 
-**Table 6: the eight keys core defines on a `[[route]]`, and what happens to a ninth.**
+**Table 5: the eight keys core defines on a `[[route]]`, and what happens to a ninth.**
 Take from it that the defaults for `cache` depend on the kind of route, because letting a handler route inherit `public` would put computed output in a shared cache by omission, and that core deliberately does not know what `root` means.
 
 Where a route has both a template and a code handler on the same pattern, the template wins.
@@ -343,7 +299,7 @@ That is what stops a POST handler registered in code from shadowing a GET route 
 
 ### 5.3 State
 
-Four builders differ only in what state a handler receives, and Table 7 gives all four.
+Four builders differ only in what state a handler receives, and Table 6 gives all four.
 
 | builder | state | initialiser | handler |
 |---|---|---|---|
@@ -352,12 +308,11 @@ Four builders differ only in what state a handler receives, and Table 7 gives al
 | `App::with_thread_state(init)` | a `T` owned by each worker | `Fn(&Map<String, Value>, &()) -> Result<T>` | `Fn(&Request, &mut T) -> Result<Response>` |
 | `App::with_state(init_g, init_t)` | both | `Fn(&AppContext) -> Result<G>` and `Fn(&Map<String, Value>, &G) -> Result<T>` | `Fn(&Request, &G, &mut T) -> Result<Response>` |
 
-**Table 7: the four builders, with the initialiser and handler signature of each.**
+**Table 6: the four builders, with the initialiser and handler signature of each.**
 Take from it that per-thread state is handed to a handler as `&mut` and shared state as `&`, which is the whole difference: a value owned by one worker needs no synchronisation, and a value shared across workers costs one atomic increment per request and no copy.
 
 An initialiser returns `Result`, so a service that cannot build its state exits 2 at startup.
 `on_destroy_thread` registers the reverse for the thread value, and runs when a worker thread ends. Shutdown does not wait for it.
-`on_reload` re-reads state that the initialiser built from the configuration (§4.2).
 
 **Only the global initialiser receives an `AppContext`.**
 `AppContext` carries the parsed configuration, the site directory, the configuration file's path and the resolved path of `site.toml`, because a configuration that names files has to resolve them against the same roots the rest of the service uses.
@@ -389,7 +344,7 @@ The first signal stops accepting, removes the socket and exits 0.
 It does not wait for a request in progress, so a request cut off by a restart is lost.
 A service that needs state to survive a restart must not depend on a shutdown hook.
 A second signal exits at once.
-A socket left behind keeps a dead member in the edge's backend pool until its next rescan.
+A socket left behind keeps a dead member in the edge's backend pool.
 
 ### 6.2 The three lines
 
@@ -473,7 +428,7 @@ This section lists it, because apps have re-implemented parts of it before.
 - Content-coding negotiation with real q-values, so `br;q=0` is honoured, `*` supplies the quality for anything unnamed, and an explicitly named coding beats `*` in either direction.
 - Conditional requests: `If-Match`, `If-None-Match`, `If-Modified-Since` and `If-Unmodified-Since`, with weak comparison where the specification requires it.
 - brotli and gzip, and HTML, CSS, JSON and JavaScript minification, both configurable per MIME type, with minification before compression.
-- Configuration hot reload on write, without a restart, as §4.2 bounds it.
+- Configuration read once at start, and a change takes a restart.
 - Structured logging, JSON or text, at a level and format fixed for the life of the process.
 - A request dictionary layered over a shared base, assembled in twelve ordered steps.
   The sources are the service's own configuration keys, `global_params`, the route's params files, path parameters, the query string, a form body, cookies, built-ins, forwarded authentication claims, and the flash and *CSRF* (*cross-site request forgery*) values when those features are on.
@@ -520,18 +475,18 @@ That is the last of the contract, and §10 collects it.
 ## 10. Summary
 
 **Everything above is one claim: a new m6 service is its routes and nothing else.**
-Table 8 is the whole contract in one place.
+Table 7 is the whole contract in one place.
 
 | the app supplies | core supplies |
 |---|---|
 | a `main` that builds an `App` and calls `run` | the socket, the accept loop, HTTP/1.1, the thread pool and the bounded queue |
-| routes bound in code, handlers registered by name, or neither | route matching, the configuration route table, and hot reload of both |
+| routes bound in code, handlers registered by name, or neither | route matching and the configuration route table |
 | a state initialiser, when it has state | the two state tiers, and the thread destructor hook |
 | a configuration file whose stem is the service's name | the socket path, the backend name and the reserved keys of Table 4 |
 | a systemd unit naming the two paths and what it writes | signal blocking, the exit on a signal, the three log lines and the unlink |
 | one call to `assert_app_lifecycle` | the assertion behind it |
 
-**Table 8: the division of labour between an app and `m6-core`.**
+**Table 7: the division of labour between an app and `m6-core`.**
 Take from it that the left column is the whole of a new service, and that every row on the right was once written once per service, which `m6-architecture.md` §6.2, "why each thing in core exists exactly once", counts.
 
 Two consequences follow, and both are reasons to stay inside the shape.

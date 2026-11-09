@@ -116,7 +116,7 @@ Section 3 lists the modules those features compile.
 
 ## 3. Component index
 
-Thirty-eight component modules, five of them behind features, grouped by the task that sends a reader to one.
+Thirty-seven component modules, five of them behind features, grouped by the task that sends a reader to one.
 The prelude in section 1 is the thirty-ninth `pub mod` in `lib.rs`, and it re-exports the items the other modules implement.
 Table 3 is the index, and it uses six abbreviations: *HTTP* (Hypertext Transfer Protocol), *RFC* (Request for Comments), *TCP* (Transmission Control Protocol), *JSON* (JavaScript Object Notation), *UTC* (Coordinated Universal Time) and *CSPRNG* (cryptographically secure pseudorandom number generator).
 
@@ -128,7 +128,6 @@ Table 3 is the index, and it uses six abbreviations: *HTTP* (Hypertext Transfer 
 | | `signal` | `block()`, `Service` and `ShutdownHandle`. Signal-safe shutdown, and SIGUSR1 to reopen the log file. |
 | | `render` | The `Renderer` and `RendererFactory` traits, plus `NoTemplates`. The only thing the loop needs from a template engine. |
 | | `template` | The Tera implementation of those traits, and the site filters. Feature `templates`. |
-| | `watcher` | `ConfigWatcher`, inotify on Linux and kqueue on macOS, FreeBSD and OpenBSD, and `ConfigReloader`, which watches a service's two files. |
 | **Request and response** | `dict` | The request dictionary: a shared base plus a per-request overlay. |
 | | `request` | `Request`, the handler's view: the dictionary, body access, file I/O helpers, query and form parsing, and percent-encoding. |
 | | `response` | `Response`, every constructor a handler needs, and `send`. |
@@ -161,7 +160,7 @@ Table 3 is the index, and it uses six abbreviations: *HTTP* (Hypertext Transfer 
 | | `error` | `Error` and `Result`. |
 | | `testkit` | The shared integration harness. Feature `testkit`. |
 
-**Table 3: the 38 component modules, their group and one line on what each holds.**
+**Table 3: the 37 component modules, their group and one line on what each holds.**
 Take from it that the group names the task, and the module name is the string to search for in the section that follows.
 
 The index is the map for the rest of the document.
@@ -169,7 +168,7 @@ Sections 4 and 5 take the two largest groups in turn, and sections 6 to 10 take 
 
 ## 4. Building a service
 
-This section covers the modules that build a service: the `App` builder and its state, the configuration it reads, the socket loop, signal handling, the renderer seam and the config watcher.
+This section covers the modules that build a service: the `App` builder and its state, the configuration it reads, the socket loop, signal handling, the renderer seam.
 It uses *HTTP* (Hypertext Transfer Protocol) for the wire protocol and *TOML* (Tom's Obvious, Minimal Language) for the configuration format.
 
 ### 4.1. `app`
@@ -196,7 +195,6 @@ Both return `Result`, so a service that cannot build its state fails at startup,
 
 `.on_destroy_thread(...)` gives the thread value a teardown hook that runs when a worker thread ends.
 Shutdown does not wait for it, so a service must not rely on it to save state.
-`.on_reload(...)` runs after a reload has built and checked the new state, before that state and log level are installed, so a hook that returns `Err` keeps the previous configuration serving.
 
 Routing: `compile_pattern` turns `/blog/{stem}` into `Vec<Segment>`, `match_route` returns `PathParams` as a `Vec<(String, String)>` because order is meaningful and duplicates are possible.
 `find_route` picks the winner.
@@ -211,7 +209,7 @@ The thread pool: `ThreadPool::new(size, queue_size)`, or `new_with_exit(size, qu
 `try_submit(resource, f)` hands a resource to the work and returns it back when the queue is full.
 
 The request dictionary: `FrameworkState::build_dict` is where the real knowledge lives, and it is **private**, which is the outstanding item on this module, because a service not using `App` cannot reuse any of it.
-Three layers no longer run per request: config keys, global params files and a route's static params files are merged once per reload into `route.base_dict`.
+Three layers no longer run per request: config keys, global params files and a route's static params files are merged once at start into `route.base_dict`.
 The per-request order is:
 
 - Params files whose path holds a `{placeholder}`.
@@ -265,7 +263,7 @@ A `RouteConfig` carries nine fields: `path`, `template`, `params`, `status`, `ca
 
 `[server] read_timeout_s` is the read deadline applied to every accepted connection, defaulting to `server::DEFAULT_READ_TIMEOUT_SECS` (30).
 `0` means no timeout, which is what every `App` service did before the key existed.
-It is read once at startup, like the pool dimensions: it is set on a socket at accept time, so a reload cannot retune connections already being served.
+It is read once at startup, like the pool dimensions: it is set on a socket at accept time.
 
 `[server] socket_mode` is the mode applied to the unix socket after bind, defaulting to `server::DEFAULT_SOCKET_MODE` (`0o660`).
 It is an **octal string**, as systemd writes it, because TOML has no octal literal and `660` as a decimal integer is `0o1224`.
@@ -301,12 +299,12 @@ A service that started that way could lose its shutdown line invisibly, because 
 The thread calls `log::reopen_log_file()` and logs what happened.
 The reopen opens the new file while holding the lock the log writer takes for every line, so once the path exists again no further line can reach the renamed file.
 If the open fails, the old handle stays in place, the process keeps writing to the previous file and an error is logged.
-SIGHUP stays free for a future configuration reload.
+SIGHUP is not handled.
 
 ### 4.5. `render` and `template`
 
 `render` is the seam.
-A route that names a template produces a `Response` carrying `template_name` and `template_dict`, a `Renderer` turns that into bytes, and a `RendererFactory` builds one per reload, shared by every worker.
+A route that names a template produces a `Response` carrying `template_name` and `template_dict`, a `Renderer` turns that into bytes, and a `RendererFactory` builds one at start, shared by every worker.
 `NoTemplates` implements both traits and errors if anything asks it to render, which is how the site renderers that render nothing stopped linking Tera, comrak and pest in order to get a server loop.
 
 `template` is the Tera implementation: `build_tera`, `build_tera_from_paths`, `TeraRenderer`, `TeraFactory` and `NOT_FOUND_SENTINEL`, which is how a template signals a 404 from inside rendering.
@@ -319,38 +317,14 @@ A route that names a template produces a `Response` carrying `template_name` and
 | `date_format(fmt="%B %d, %Y")` | filter | formats a date string, parses RFC 3339 and `%Y-%m-%d`, and returns anything else unchanged |
 | `markdown` | filter | renders Markdown to HTML with comrak |
 | `truncate_words(n=50)` | filter | keeps the first `n` words, default 50, and appends `…` past that |
-| `asset` | filter | returns a content-addressed URL for a file under `assets/`, from a manifest built once per reload |
+| `asset` | filter | returns a content-addressed URL for a file under `assets/`, from a manifest built at start |
 | `img_dims(path=x)` | function | returns the ` width="W" height="H"` attribute pair, nothing when the image has no readable size, and needs `\| safe` because it returns markup |
 | `not_found()` | function | fails the render with the 404 sentinel, so a missing lookup becomes a 404 |
 
 **Table 5: the site template filters and functions.**
-Take from it that `asset` and `img_dims` are computed from tables built once per reload, and that `not_found()` turns a missing lookup into a 404.
+Take from it that `asset` and `img_dims` are computed from tables built at start, and that `not_found()` turns a missing lookup into a 404.
 
-### 4.6. `watcher`
-
-`ConfigWatcher::new(paths)`, `raw_fd()` to fold into an existing `poll(2)` set, and `read_events(filenames)` to drain and report whether anything relevant changed.
-
-`ConfigReloader::new(site_toml, process, seen)` owns a `ConfigWatcher` on a service's two files and reports which of them changed.
-The loop calls `on_readable(now)` when `raw_fd()` is readable and `tick(now)` on every iteration, and `tick` returns `Some(Changed { site, process })` when a report is due.
-A `Fingerprint` of a file's bytes (a hash), mode, owner and mtime decides whether it changed since the last report.
-The file is opened once per check and its times and bytes both come from that handle.
-The inode and ctime are left out, because a rename over a file bumps ctime on the old inode just before the name moves, and that state has the old bytes and times, so it is no change.
-A file that cannot be read has no hash, so fixing its permissions is a change.
-A `touch` forces a reload only when it changes the mtime, so on a filesystem with one-second timestamps a second touch in the same second, with unchanged bytes, is not seen.
-A check runs on any event from the watcher, named or not, and every `RELOAD_POLL` (one second) whatever the watcher says, which finds a lost watch.
-An event that names another entry still asks for a check, so a config reached through a symlink is found when the directory it points into is swapped.
-An unrelated write beside the config costs one check and makes no report.
-
-The first change after quiet is reported at once, and so is any change more than `RELOAD_DEBOUNCE` (20 ms) after the last report.
-A change within `RELOAD_DEBOUNCE` of a report is held and reported once, 20 ms after the latest change in the burst and never later than `RELOAD_POLL` after that report.
-Writes more than 20 ms apart therefore each reload, and writes closer together than that share one more reload.
-Take a `Seen` from `Seen::read` before the first read of either file so a change in between is reported on the first tick.
-With no watcher the poll alone does the job, there is no thread, and `tick` does not allocate.
-
-Three implementations sit behind `cfg`: **inotify on Linux**, kqueue on macOS, FreeBSD and OpenBSD, and a stub elsewhere that never reports a change.
-The Linux path uses `nix::sys::inotify`, which copies each event header into an aligned `MaybeUninit`, so the unaligned read the old hand-written arm risked cannot happen.
-
-Those six modules are a service's own parts: the builder, its configuration, its socket, its signals, its renderer and its reload.
+Those five modules are a service's own parts: the builder, its configuration, its socket, its signals and its renderer.
 Section 5 turns to the objects a handler receives and returns.
 
 ---
@@ -367,7 +341,7 @@ It ends with the rules each helper enforces, and section 6 turns to the parsers 
 `field(name)` reads a form or query field.
 `get(key)` and `Index<&str>` read the dictionary, and `dict()` borrows the whole thing.
 
-File I/O is on `Request` on purpose, relative to the site directory: `site_path(rel)` joins a path to it, and `read_json`, `write_json`, `write_json_atomic`, `list_json` and `touch` read and write there.
+File I/O is on `Request` on purpose, relative to the site directory: `site_path(rel)` joins a path to it, and `read_json`, `write_json`, `write_json_atomic` and `list_json` read and write there.
 `write_bytes` does the same and needs the `multipart` feature.
 The readers and writers refuse a `..` component but not an absolute path, which replaces the site directory, and `site_path` checks nothing, so a handler that builds a path from request input validates it first with `path::validate_path_param`.
 `write_json_atomic` is the one to reach for when a reader may be running.
@@ -600,7 +574,7 @@ must not be append-only.
 ### 8.1. `log`
 
 `init(format, level)` and `init_with_analytics(format, level, analytics_path)`
-return a `LogHandle`, whose `reload(format, level)` re-reads on config change.
+return a `LogHandle`, which holds the log writers for the life of the process.
 `read_site_log_config(site_toml)` and `parse_level(s)` are the config side. `read_site_log_config` takes the path of the file, which `RendererConfig::resolve_site_toml` gives.
 
 `pulse() -> &'static LogPulse` is the liveness signal: `events()` counts, and
@@ -767,7 +741,7 @@ A server already holds the answer, which makes it the cheapest place to ask.
 
 **It reports the loaded material, never a file.**
 A path on disk and the certificate a running process is serving are different
-facts, and a renewal that wrote a new file without reloading the server is
+facts, and a renewal that wrote a new file without restarting the server is
 exactly the case where they disagree.
 `record_loaded` is therefore called by whatever loads the certificate, and
 `loaded()` opens nothing, so polling a monitoring endpoint cannot be made to do
@@ -778,7 +752,7 @@ disk work.
 | a chain, leaf first | `depth` 0 is what an *ACME* client renews, and intermediates expire too. A chain is good until its soonest expiry |
 | `expires_in_seconds` goes negative | how long ago separates a renewal that failed last night from one that stopped running in March |
 | an unreadable certificate is returned, not recorded | rustls accepted it or there would be no server, so refusing to serve is the worse failure. A reported absence lets a monitor say "cannot say" |
-| a later `record_loaded` replaces the earlier one | so a reload corrects it. `m6-http`'s `handle_tls_reload` records after the new material is installed on both the rustls listener and the quiche configuration, so the registry holds what every protocol serves and a failed build leaves the previous chain recorded. Until m6 #210 a reload rebuilt the quiche configuration alone and recorded nothing, so the number was correct for h1 and h2 and stale for h3 |
+| a later `record_loaded` replaces the earlier one | so a load at start corrects it, and the registry holds what every protocol serves |
 
 The last two rows are the ones to keep: an absence and a measured number must
 not look alike, and a stale number is worse than either.
@@ -901,8 +875,6 @@ brochure.
 - **`h1`'s module doc calls `parse.rs` "(deleted)".** The file exists and is on
   the production path of every socket backend. What was deleted is the parser
   that used to be in it; it is now the stream adapter described in §6.
-- **The inotify path in `watcher` had never been compiled** as of 2026-09-11.
-  It is `#[cfg(target_os = "linux")]` and the development machine is a Mac.
 - **A small number of ad-hoc case-insensitive header lookups remain outside
   core**, in `m6-http`: `cache.rs`, `http2.rs`, `redirect.rs`, `security.rs`,
   `main.rs`.

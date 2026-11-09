@@ -170,7 +170,7 @@ Take from it that every suite is named, so a claim about m6's behaviour can be t
 
 | crate | integration suites |
 |---|---|
-| m6-core | `log_reload.rs`, `pre_push_hook.rs`, `version_flag.rs` |
+| m6-core | `pre_push_hook.rs`, `version_flag.rs` |
 | m6-http | `integration.rs`, `integration_tests.rs`, `security_e2e.rs`, `security_regressions.rs`, `robustness.rs`, `edge_proxy.rs`, `analytics_e2e.rs`, `backbone_flow_control.rs`, `backends_contract.rs`, `backends_through_proxy.rs`, `redirect_lifecycle.rs`, `tls_resumption.rs` |
 | m6-html | `integration.rs`, `read_timeout.rs`, `socket_mode.rs` |
 | m6-file | `integration.rs`, `dynamic_routes.rs`, `security_regressions.rs` |

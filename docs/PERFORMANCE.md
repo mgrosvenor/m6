@@ -79,7 +79,7 @@ The only difference on the wire is that the newer build emits `Connection: close
 ### 2.2. Where the 1.15 ms went
 
 The dictionary was assembled from the config file's keys plus the site's content file.
-It was deep-copied six times per request, to produce something identical for every request until the next config reload.
+It was deep-copied six times per request, to produce something identical for every request.
 `m6-core`'s `copy_audit` measures each copy separately, in release, against a real content file of 68 KB and 1,364 nodes.
 
 | copy | removed by | before | after |

@@ -136,7 +136,7 @@ The order of the array is the order a site lists its posts in, and section 6 cov
 
 `--watch` keeps m6-md resident and regenerates the output whenever a `.md` file in the input directory changes.
 The first pass runs once before the watcher starts and writes the output file.
-It does not touch the `--touch` path, so a site that is already up keeps its old params until the next `.md` change or a manual `site.toml` touch.
+It does not touch the `--touch` path, so a site that is already up keeps its old params until the next `.md` change or a restart.
 
 The watcher covers the input directory itself and reacts to create, modify and remove events on paths that end in `.md`.
 After a relevant event it waits 50 milliseconds and drains the queue, so an editor that deletes and renames a file counts as one change.
@@ -174,8 +174,8 @@ A template finds its post in the array and answers 404 when the lookup returns n
 `not_found()` makes the render return the not-found result that m6-html turns into a 404.
 The index links each post with `/blog/{{ doc.stem }}`, because `path` carries no `/blog` prefix.
 
-A static params file is read once when m6-html builds its routes, so a running renderer keeps serving the old document array until a reload rebuilds it.
-The example runs m6-md with `--watch --touch site.toml`, so a successful regeneration in the watch loop touches the file, which makes the renderer rebuild.
+A static params file is read once at start when m6-html builds its routes, so a running renderer keeps serving the old document array until a restart.
+The example runs m6-md with `--watch --touch site.toml`, so a successful regeneration in the watch loop touches the file.
 [`m6-http.md`](m6-http.md) owns the cache and its clearing rules, and Example 02 in [`m6-user-guide.md`](m6-user-guide.md) is the full site with both templates.
 Section 8 gives the exit codes a run can return.
 
@@ -217,7 +217,7 @@ The run has no option for any of them, and section 10 says where the surrounding
 
 m6-md is one command, one directory of Markdown and one JSON file, and a site serves that file through a route.
 The command line has two required arguments and four optional flags, the frontmatter has two keys, and the output has five fixed fields.
-Watch mode keeps the file current, and `--touch` is what tells a running site to reload.
+Watch mode keeps the file current, and a running site reads the output once at start.
 
 Table 5 gives the sources for what this page leaves out.
 Take from it that every subject here has one owner.
@@ -226,7 +226,7 @@ Take from it that every subject here has one owner.
 |---|---|
 | `m6-md/src/main.rs` | m6-md's command line, input, output and watch behaviour |
 | `Cargo.toml`, `m6-md/Cargo.toml` | the workspace members list, and the crate's dependencies |
-| `m6-core/src/app.rs`, [`m6-core-reference.md`](m6-core-reference.md) §4.1 | the renderer's static params, read at route build and refreshed on reload |
+| `m6-core/src/app.rs`, [`m6-core-reference.md`](m6-core-reference.md) §4.1 | the renderer's static params, read at start |
 | [`m6-user-guide.md`](m6-user-guide.md) | Example 02, the blog that serves this output, with both templates |
 | [`m6-site-toml.md`](m6-site-toml.md) | `[[route]]`, `[[route_group]]` and the renderer `params` key |
 | [`m6-http.md`](m6-http.md) | the cache, and when a change clears it |

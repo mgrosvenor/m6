@@ -247,7 +247,7 @@ m6-html renders the blog pages from that JSON.
 The Markdown conversion happens before the server starts.
 
 A new or changed post needs a rebuild and a cache invalidation.
-`dev.sh` builds the m6 binaries, then runs `m6-md` in watch mode and touches `site.toml` after each rebuild, which evicts the affected URLs.
+`dev.sh` builds the m6 binaries, then runs `m6-md` in watch mode to rebuild the params file after each change.
 
 ### 3.2. Source file format
 
@@ -871,7 +871,7 @@ fn main() -> Result<()> {
 
 The handlers use the file helpers m6-core puts on `Request`.
 `handle_create_draft` writes `content/drafts/{stem}.json`.
-`handle_publish` reads that draft, renders its Markdown body to HTML, writes `content/posts/{stem}.json`, rebuilds the index, touches `site.toml` and deletes the draft.
+`handle_publish` reads that draft, renders its Markdown body to HTML, writes `content/posts/{stem}.json`, rebuilds the index and deletes the draft.
 `handle_unpublish` moves the post back to `content/drafts/{stem}.json` and rebuilds the index.
 `handle_edit` opens a draft first, then a published CMS post, then a Markdown post from the index, so an editor can edit any post.
 
@@ -882,11 +882,11 @@ A publish moves a draft to the public blog in five steps.
 1. The editor saves a draft, and `POST /api/drafts` or `PATCH /api/drafts/{stem}` writes `content/drafts/{stem}.json`.
 2. The editor publishes, and `POST /api/publish/{stem}` reads that draft.
 3. render-cms renders the Markdown body to HTML, writes `content/posts/{stem}.json` and merges it into `data/posts.json`.
-4. render-cms touches `site.toml`, which makes m6-http reload its routes and clear its cache.
+4. render-cms restarts, or m6-http restarts, so the change is read at start.
 5. The next request for `/blog/{stem}` is a cache miss, m6-html renders the post from the updated index, and m6-http caches it.
 
 Unpublishing reverses the flow.
-`POST /api/unpublish/{stem}` moves the post back to `content/drafts/{stem}.json`, rebuilds the index and touches `site.toml`.
+`POST /api/unpublish/{stem}` moves the post back to `content/drafts/{stem}.json` and rebuilds the index.
 A post that came from Markdown survives every index rebuild, because `update_index` keeps the entries the CMS does not own.
 
 ### 6.6. Caching
@@ -899,7 +899,7 @@ The contact, `/login` and `/_errors` routes are marked `cache = "no-store"`.
 
 `dev.sh` builds m6 and render-cms, writes the TLS and auth keys, creates the admin user, generates `data/posts.json` and starts the stack.
 The stack is m6-html, m6-file, m6-auth-server, render-cms and m6-http.
-When m6-md is installed, it also runs in watch mode over `content/posts/` and touches `site.toml` after each rebuild.
+When m6-md is installed, it also runs in watch mode over `content/posts/`.
 
 `test.sh` checks the running stack over the wire.
 It has 15 sections, numbered 0 to 14, and every check has one expected answer.
@@ -956,16 +956,16 @@ The unprivileged `m6` user needs read access to the private key, so add it to th
 certbot certonly --standalone -d example.com
 ```
 
-m6-http does not watch the certificate files, so a renewal has to touch the system config after it writes them.
+m6-http reads the certificate files once at start, so a renewal has to restart it after it writes them.
 This deploy hook does that, and certbot runs it after each renewal:
 
 ```sh
 #!/bin/sh
-# /etc/letsencrypt/renewal-hooks/deploy/m6-touch.sh, mode 0755
-touch /etc/m6/my-blog.toml
+# /etc/letsencrypt/renewal-hooks/deploy/m6-restart.sh, mode 0755
+systemctl restart m6-http
 ```
 
-The touch makes m6-http read the new files.
+The restart makes m6-http read the new files.
 Until it runs, m6-http keeps serving the previous certificate.
 
 ### 7.2. Deploy site directory
@@ -1392,7 +1392,7 @@ Channel counters include the monitor's own polls and header checks (issue #107),
 
 ### 7.9. Deploy updates
 
-Deploy code and template changes with rsync, and m6-http reloads routing when `site.toml` changes:
+Deploy code and template changes with rsync, then restart m6-http so it reads the new `site.toml`:
 
 ```bash
 rsync -av --delete \
@@ -1412,7 +1412,7 @@ ssh user@example.com systemctl restart render-cms
 ```
 
 The other units keep running, and m6-http resumes routing to render-cms when its socket reappears.
-For certificate renewal, certbot renews and its deploy hook touches the system config, and m6-http reads the new certificate with no restart:
+For certificate renewal, certbot renews and its deploy hook restarts m6-http, and m6-http reads the new certificate:
 
 ```bash
 certbot renew
@@ -1420,8 +1420,7 @@ certbot renew
 
 ### 7.10. Horizontal scaling
 
-Add a second m6-html instance to handle more traffic.
-m6-http detects the new socket with no config change:
+Add a second m6-html instance to handle more traffic, then restart m6-http so it reads the pool again:
 
 ```bash
 cp /var/www/my-blog/configs/m6-html.conf \
@@ -1442,7 +1441,7 @@ systemctl start m6-html-2
 ```
 
 The socket name follows the config stem, so `m6-html-2.conf` writes `/run/m6/m6-html-2.sock`.
-m6-http detects it via inotify and adds it to the pool, then load-balances traffic across both instances.
+m6-http reads the pool once at start, so restart it to add the instance, then it load-balances traffic across both.
 
 To scale back down:
 
@@ -1450,7 +1449,7 @@ To scale back down:
 systemctl stop m6-html-2
 ```
 
-The socket disappears and m6-http removes the instance from the pool with no config change and no restart.
+The socket disappears and m6-http backs the member off, and it serves again once a listener is bound there.
 
 ### 7.11. Crash recovery
 
@@ -1465,7 +1464,7 @@ journalctl -u m6-html -f
 # ... m6-html started, listening on /run/m6/m6-html.sock
 ```
 
-m6-http detects the socket reappearance via inotify and normal service resumes.
+m6-http serves again once a listener is bound there.
 
 Example 06 shows the same site running as five supervised units.
 Example 07 makes the development and production split explicit, with one `site.toml` and a system config per environment.
@@ -1642,7 +1641,7 @@ if [[ "$1" == "--binary" ]]; then
 fi
 
 echo "Deployed."
-# m6-http detects site.toml change via inotify and reloads routing
+# restart m6-http so it reads the new site.toml
 ```
 
 ### 8.6. Dev vs production at a glance
@@ -1742,7 +1741,7 @@ cd examples/09-global-deployment
 The origin serves the Example 07 site and answers the public domain.
 Each cache node runs only m6-http, pointing at the origin over the mesh, and caches responses independently.
 `setup-origin.sh` provisions the origin and `setup-cache-node.sh` provisions a cache node, both writing a system config, the WireGuard interface and the systemd unit.
-`deploy.sh` syncs content to the origin and, with `--all --invalidate`, to the cache nodes, then touches `site.toml` on each node to flush its cache.
+`deploy.sh` syncs content to the origin and, with `--all --invalidate`, to the cache nodes, then restarts m6-http on each node to flush its cache.
 
 The example uses its own node names and addresses, held in `deploy.toml`, which is a local file never committed.
 The configs under `configs/` and the `wireguard/` files are the node-specific settings.
@@ -1876,8 +1875,8 @@ Take from it that the first twelve manage the dashboard tabs, and the last five 
 | `GET` | `/api/admin/logs` | Last N log lines |
 | `GET` | `/api/admin/config` | site.toml as a JSON object |
 | `PUT` | `/api/admin/config` | Write site.toml from a JSON object |
-| `POST` | `/api/admin/config/touch` | Touch site.toml to reload |
-| `POST` | `/api/admin/cache/flush` | Alias for config touch |
+| `POST` | `/api/admin/config/touch` | Restart m6-http to apply a change |
+| `POST` | `/api/admin/cache/flush` | Restart m6-http to flush the cache |
 | `POST` | `/api/admin/services/{name}/restart` | Send SIGTERM to a service via its PID file |
 | `GET` | `/api/admin/backends` | Backend topology and the system config bind |
 | `GET` | `/api/admin/backends/{name}/sample` | One backend's stats over the sample window |
@@ -1941,7 +1940,7 @@ They cover perf log parsing, per-route aggregation, system metrics shape, bench 
 ./test.sh   # another
 ```
 
-The checks cover a 401 without a token, the JSON keys of each endpoint, config touch and flush, and an unknown service returning 404.
+The checks cover a 401 without a token, the JSON keys of each endpoint, a config restart and a cache flush, and an unknown service returning 404.
 
 ## 13. Summary
 

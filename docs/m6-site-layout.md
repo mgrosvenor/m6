@@ -143,7 +143,7 @@ Neither log says which.
 
 **If you find yourself adding a symbolic link so a glob can see another app's directory, this is the trap.**
 The link works, and its failure mode is silent.
-A reload with the link missing expands the glob against an empty directory, so every route disappears and the reload reports success.
+A start with the link missing expands the glob against an empty directory, so every route disappears.
 Fix the glob instead.
 
 ### 4.2. Prefer a route_group to a wildcard for static assets

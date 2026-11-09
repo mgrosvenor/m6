@@ -408,8 +408,8 @@ Section 8 gives the lifecycle that puts a member in the pool and takes it out.
 
 ## 8. Lifecycle
 
-A member's lifecycle is four events: startup, shutdown, exit and reload.
-This section gives all four.
+A member's lifecycle is three events: startup, shutdown and exit.
+This section gives all three.
 
 ### 8.1. Startup
 
@@ -442,13 +442,7 @@ Take from it that a supervisor learns from the code whether the process ever bou
 **Table 6: the three exit codes.**
 Code `2` means the process failed before binding, so a supervisor can tell a misconfiguration from a crash.
 
-### 8.4. Configuration reload
-
-A backend MAY watch `site.toml` and its own configuration file and reload without restarting.
-This step is OPTIONAL.
-A restart is a valid implementation, because the pool handles the socket disappearing and reappearing.
-
-Those are the four events in a member's lifecycle.
+Those are the three events in a member's lifecycle.
 Section 9 collects every MUST into one checklist.
 
 ## 9. Minimum viable backend

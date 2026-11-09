@@ -192,8 +192,8 @@ root    = "assets/"
 Three facts about that config:
 
 - the pool defaults to the *CPU* (Central Processing Unit) count. A page requesting more assets at once than the pool has threads queues the surplus, which surfaces as "pool empty" backend errors.
-- a route naming a handler the binary does not have is fatal, so the service exits 2 at startup and a reload is refused with the previous routes left serving.
-- routes are rebuilt on every config reload, so an asset tree can be added without a restart.
+- a route naming a handler the binary does not have is fatal, so the service exits 2 at startup.
+- routes come from config, read once at start, so an asset tree is added by editing the config and restarting.
 
 m6-file answers `GET` and `HEAD`, and returns 405 for anything else.
 
