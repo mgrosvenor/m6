@@ -381,7 +381,7 @@ The edge check is local, so the header it sets carries the result to a backend, 
 
 A backend receives the verified claims in the `X-Auth-Claims` header, and m6 turns them into the `auth_*` request-dictionary keys.
 The keys exist only on a route with `require` and a token that passed the check, so a backend that needs a claim on every request declares `require` on the route.
-The key names are in [`m6-render-lib.md`](m6-render-lib.md).
+The key names are in [`m6-core-reference.md`](m6-core-reference.md) §4.1.
 
 Token verification, the edge check and the backend keys are one chain.
 Section 9 covers the database that holds the users the chain begins with.
@@ -517,7 +517,7 @@ Take from it that every number and every contract has a file responsible for it.
 | [`m6-auth-cli.md`](m6-auth-cli.md) | the administrative CLI: users, groups and API tokens |
 | [`m6-site-toml.md`](m6-site-toml.md) | `[auth]`, `[[backend]]`, `[[route]]` and `require` |
 | [`m6-http.md`](m6-http.md) | m6-http internals, including the edge check and the cache |
-| [`m6-render-lib.md`](m6-render-lib.md) | the request dictionary and the renderer API |
+| [`m6-core-reference.md`](m6-core-reference.md) | the request dictionary and the renderer API |
 | [`m6-architecture.md`](m6-architecture.md) | why the edge verifies tokens and why the header is stripped |
 | `m6-auth-server/Cargo.toml` | the crate's dependencies and features |
 
