@@ -2322,6 +2322,64 @@ fn origin_host<'a>(req: &'a forward::HttpRequest, config: &'a config::Config) ->
         .unwrap_or(config.site.domain.as_str())
 }
 
+/// Why a socket-upstream launch failed, so the two callers can answer it their
+/// own way: the main socket branch answers 502 or 503, the custom-error-page
+/// branch falls back to the synchronous `apply_error_mode`.
+enum SocketLaunchError {
+    UnknownBackend,
+    Empty,
+    BacklogFull,
+    Connect(std::io::Error),
+    Register(std::io::Error),
+}
+
+/// Encode already done by the caller; this takes the member, starts the
+/// non-blocking upstream, registers it, and parks it in `socket_upstreams`.
+/// Returns the receiver the caller's connection waits on.
+fn launch_socket_upstream(
+    state: &mut ServerState,
+    poller: &Poller,
+    request: Vec<u8>,
+    method: &str,
+    backend_name: &str,
+    timeout: std::time::Duration,
+) -> Result<std::sync::mpsc::Receiver<std::io::Result<forward::HttpResponse>>, SocketLaunchError> {
+    let (socket_path, member_idx) = match state.pool_manager.get_pool_mut(backend_name) {
+        Some(pool) => pool.take_member().map_err(|_| SocketLaunchError::Empty)?,
+        None => return Err(SocketLaunchError::UnknownBackend),
+    };
+    let deadline = std::time::Instant::now() + timeout;
+    let upstream = match forward::SocketUpstream::start(socket_path, request, method, deadline) {
+        Ok(u) => u,
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            if let Some(pool) = state.pool_manager.get_pool_mut(backend_name) {
+                pool.cancel(member_idx);
+            }
+            return Err(SocketLaunchError::BacklogFull);
+        }
+        Err(e) => {
+            if let Some(pool) = state.pool_manager.get_pool_mut(backend_name) {
+                pool.mark_failed(member_idx);
+            }
+            return Err(SocketLaunchError::Connect(e));
+        }
+    };
+    if let Err(e) = poller.add(upstream.raw_fd(), TOKEN_SOCKET_UPSTREAM) {
+        if let Some(pool) = state.pool_manager.get_pool_mut(backend_name) {
+            pool.mark_failed(member_idx);
+        }
+        return Err(SocketLaunchError::Register(e));
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    state.socket_upstreams.push(SocketUpstreamEntry {
+        upstream,
+        member_idx,
+        backend_name: backend_name.to_string(),
+        tx,
+    });
+    Ok(rx)
+}
+
 fn handle_request_inner(
     req: &forward::HttpRequest,
     client_ip: &str,
@@ -2777,10 +2835,20 @@ fn handle_request_inner(
         }
     };
 
-    let (socket_path, member_idx) = match state.pool_manager.get_pool_mut(&backend_name) {
-        Some(pool) => match pool.take_member() {
-            Ok(taken) => taken,
-            Err(pool::PoolError::Empty) => {
+    let rx =
+        match launch_socket_upstream(state, poller, request, &req.method, &backend_name, timeout) {
+            Ok(rx) => rx,
+            Err(SocketLaunchError::UnknownBackend) => {
+                warn!(backend = %backend_name, "unknown backend");
+                let err_ctx = error::ErrorContext {
+                    route: Some(route.path.clone()),
+                    backend: Some(backend_name.clone()),
+                    detail: Some(format!("unknown backend: {backend_name}")),
+                };
+                let (s, h, b, n) = apply_error_mode(502, req, client_ip, state, Some(&err_ctx));
+                return RequestOutcome::Ready(s, h, b, n);
+            }
+            Err(SocketLaunchError::Empty) => {
                 warn!(backend = %backend_name, "socket pool empty");
                 let err_ctx = error::ErrorContext {
                     route: Some(route.path.clone()),
@@ -2790,69 +2858,41 @@ fn handle_request_inner(
                 let (s, h, b, n) = apply_error_mode(502, req, client_ip, state, Some(&err_ctx));
                 return RequestOutcome::Ready(s, h, b, n);
             }
-        },
-        None => {
-            warn!(backend = %backend_name, "unknown backend");
-            let err_ctx = error::ErrorContext {
-                route: Some(route.path.clone()),
-                backend: Some(backend_name.clone()),
-                detail: Some(format!("unknown backend: {backend_name}")),
-            };
-            let (s, h, b, n) = apply_error_mode(502, req, client_ip, state, Some(&err_ctx));
-            return RequestOutcome::Ready(s, h, b, n);
-        }
-    };
-
-    let deadline = std::time::Instant::now() + timeout;
-    let upstream = match forward::SocketUpstream::start(socket_path, request, &req.method, deadline)
-    {
-        Ok(u) => u,
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-            // The listen backlog is full: the member is alive and busy (E2,
-            // the kernel is the queue). Release the slot without marking it
-            // failed and answer 503.
-            if let Some(pool) = state.pool_manager.get_pool_mut(&backend_name) {
-                pool.cancel(member_idx);
+            Err(SocketLaunchError::BacklogFull) => {
+                // The listen backlog is full: the member is alive and busy (E2,
+                // the kernel is the queue). Release the slot without marking it
+                // failed and answer 503.
+                let err_ctx = error::ErrorContext {
+                    route: Some(route.path.clone()),
+                    backend: Some(backend_name.clone()),
+                    detail: Some("backend listen queue full".to_string()),
+                };
+                let (s, mut h, b, n) = apply_error_mode(503, req, client_ip, state, Some(&err_ctx));
+                h.push(("Retry-After".to_string(), "1".to_string()));
+                return RequestOutcome::Ready(s, h, b, n);
             }
-            let err_ctx = error::ErrorContext {
-                route: Some(route.path.clone()),
-                backend: Some(backend_name.clone()),
-                detail: Some("backend listen queue full".to_string()),
-            };
-            let (s, mut h, b, n) = apply_error_mode(503, req, client_ip, state, Some(&err_ctx));
-            h.push(("Retry-After".to_string(), "1".to_string()));
-            return RequestOutcome::Ready(s, h, b, n);
-        }
-        Err(e) => {
-            warn!(backend = %backend_name, error = %e, "backend error");
-            if let Some(pool) = state.pool_manager.get_pool_mut(&backend_name) {
-                pool.mark_failed(member_idx);
+            Err(SocketLaunchError::Connect(e)) => {
+                warn!(backend = %backend_name, error = %e, "backend error");
+                let err_ctx = error::ErrorContext {
+                    route: Some(route.path.clone()),
+                    backend: Some(backend_name.clone()),
+                    detail: Some(e.to_string()),
+                };
+                let (s, h, b, n) = apply_error_mode(502, req, client_ip, state, Some(&err_ctx));
+                return RequestOutcome::Ready(s, h, b, n);
             }
-            let err_ctx = error::ErrorContext {
-                route: Some(route.path.clone()),
-                backend: Some(backend_name.clone()),
-                detail: Some(e.to_string()),
-            };
-            let (s, h, b, n) = apply_error_mode(502, req, client_ip, state, Some(&err_ctx));
-            return RequestOutcome::Ready(s, h, b, n);
-        }
-    };
-
-    if let Err(e) = poller.add(upstream.raw_fd(), TOKEN_SOCKET_UPSTREAM) {
-        warn!(backend = %backend_name, error = %e, "registering socket upstream");
-        if let Some(pool) = state.pool_manager.get_pool_mut(&backend_name) {
-            pool.mark_failed(member_idx);
-        }
-        let err_ctx = error::ErrorContext {
-            route: Some(route.path.clone()),
-            backend: Some(backend_name.clone()),
-            detail: Some(e.to_string()),
+            Err(SocketLaunchError::Register(e)) => {
+                warn!(backend = %backend_name, error = %e, "registering socket upstream");
+                let err_ctx = error::ErrorContext {
+                    route: Some(route.path.clone()),
+                    backend: Some(backend_name.clone()),
+                    detail: Some(e.to_string()),
+                };
+                let (s, h, b, n) = apply_error_mode(502, req, client_ip, state, Some(&err_ctx));
+                return RequestOutcome::Ready(s, h, b, n);
+            }
         };
-        let (s, h, b, n) = apply_error_mode(502, req, client_ip, state, Some(&err_ctx));
-        return RequestOutcome::Ready(s, h, b, n);
-    }
 
-    let (tx, rx) = std::sync::mpsc::channel();
     let ctx = forward::PendingUrlContext {
         req: req.clone(),
         client_ip: client_ip.to_string(),
@@ -2865,12 +2905,6 @@ fn handle_request_inner(
         start: backend_start,
         error_status_override: None,
     };
-    state.socket_upstreams.push(SocketUpstreamEntry {
-        upstream,
-        member_idx,
-        backend_name,
-        tx,
-    });
     RequestOutcome::Pending {
         rx,
         ctx: Box::new(ctx),
@@ -3039,34 +3073,8 @@ fn dispatch_custom_error_async(
     // reaches a normal route. Any failure falls back to the synchronous
     // `apply_error_mode`, which handles it identically.
     let request = forward::encode_request(&error_req, client_ip, original_host).ok()?;
-    let (upstream, member_idx) = {
-        let pool = state.pool_manager.get_pool_mut(&backend_name)?;
-        let (socket_path, member_idx) = pool.take_member().ok()?;
-        let deadline = std::time::Instant::now() + timeout;
-        match forward::SocketUpstream::start(socket_path, request, "GET", deadline) {
-            Ok(u) => (u, member_idx),
-            Err(e) => {
-                if e.kind() == std::io::ErrorKind::WouldBlock {
-                    pool.cancel(member_idx);
-                } else {
-                    pool.mark_failed(member_idx);
-                }
-                return None;
-            }
-        }
-    };
+    let rx = launch_socket_upstream(state, poller, request, "GET", &backend_name, timeout).ok()?;
 
-    if poller
-        .add(upstream.raw_fd(), TOKEN_SOCKET_UPSTREAM)
-        .is_err()
-    {
-        if let Some(pool) = state.pool_manager.get_pool_mut(&backend_name) {
-            pool.mark_failed(member_idx);
-        }
-        return None;
-    }
-
-    let (tx, rx) = std::sync::mpsc::channel();
     let ctx = forward::PendingUrlContext {
         req: req.clone(),
         client_ip: client_ip.to_string(),
@@ -3079,12 +3087,6 @@ fn dispatch_custom_error_async(
         start: std::time::Instant::now(),
         error_status_override: Some(status),
     };
-    state.socket_upstreams.push(SocketUpstreamEntry {
-        upstream,
-        member_idx,
-        backend_name,
-        tx,
-    });
     Some(RequestOutcome::Pending {
         rx,
         ctx: Box::new(ctx),
@@ -3563,9 +3565,49 @@ fn set_describedby_link(headers: &mut Vec<(String, String)>, target: &str) {
 /// headers preserved), and `finish_response` analytics. This is the body of the
 /// old synchronous socket branch, moved here so a reply the loop drove follows
 /// the identical path.
+/// The internal error page a failed custom-error-page fetch falls back to, for
+/// both the socket and URL override branches. Only the caller's warn label
+/// differs.
+fn error_page_fallback(
+    original_status: u16,
+    ctx: &forward::PendingUrlContext,
+    state: &mut ServerState,
+) -> FinalizedResponse {
+    let req = &ctx.req;
+    let analytics_on = state.config.analytics.enabled && !ctx.is_prefetch;
+    let latency_ns = ctx.start.elapsed().as_nanos() as u64;
+    let reason = error::status_reason(original_status);
+    let body = error::internal_error_html(
+        original_status,
+        reason,
+        state.config.errors.verbose_fallback,
+        &req.path,
+        None,
+    );
+    let mut headers = vec![(
+        "Content-Type".to_string(),
+        "text/html; charset=utf-8".to_string(),
+    )];
+    analytics::finish_response(
+        analytics_on,
+        &mut headers,
+        &req.headers,
+        &analytics::Event {
+            node: &state.config.node.name,
+            path: &req.path,
+            status: original_status,
+            cache_state: "MISS",
+            client_ip: &ctx.client_ip,
+            latency_ns: Some(latency_ns),
+        },
+    );
+    (original_status, headers, body, "error".to_string())
+}
+
 fn complete_socket_response(
     result: std::io::Result<forward::HttpResponse>,
     ctx: &forward::PendingUrlContext,
+    quic_port: u16,
     state: &mut ServerState,
 ) -> FinalizedResponse {
     let req = &ctx.req;
@@ -3612,32 +3654,7 @@ fn complete_socket_response(
             }
             Err(e) => {
                 warn!(backend = %ctx.backend_name, error = %e, "custom error page fetch failed (socket), falling back to internal");
-                let reason = error::status_reason(original_status);
-                let body = error::internal_error_html(
-                    original_status,
-                    reason,
-                    state.config.errors.verbose_fallback,
-                    &req.path,
-                    None,
-                );
-                let mut headers = vec![(
-                    "Content-Type".to_string(),
-                    "text/html; charset=utf-8".to_string(),
-                )];
-                analytics::finish_response(
-                    analytics_enabled,
-                    &mut headers,
-                    &req.headers,
-                    &analytics::Event {
-                        node: &state.config.node.name,
-                        path: &req.path,
-                        status: original_status,
-                        cache_state: "MISS",
-                        client_ip: &ctx.client_ip,
-                        latency_ns: Some(latency_ns),
-                    },
-                );
-                (original_status, headers, body, "error".to_string())
+                error_page_fallback(original_status, ctx, state)
             }
         };
     }
@@ -3687,6 +3704,9 @@ fn complete_socket_response(
         };
         let (s, mut h, b, n) = apply_error_mode(status, req, &ctx.client_ip, state, Some(&err_ctx));
         error::preserve_actionable_headers(&resp_headers, &mut h);
+        // The old socket branch returned Ready and its h1/h2/h3 caller applied
+        // alt-svc, so an error response carried it too.
+        set_alt_svc(&mut h, quic_port);
         let backend_ns = ctx.start.elapsed().as_nanos() as u64;
         analytics::finish_response(
             analytics_enabled,
@@ -3718,6 +3738,7 @@ fn complete_socket_response(
             latency_ns: Some(backend_ns),
         },
     );
+    set_alt_svc(&mut resp_headers, quic_port);
 
     (status, resp_headers, body, backend_name.clone())
 }
@@ -3739,7 +3760,7 @@ fn finalize_url_response(
 ) -> FinalizedResponse {
     let describedby = state.config.site.describedby.clone();
     let mut r = if ctx.kind == forward::PendingKind::Socket {
-        complete_socket_response(http_result, ctx, state)
+        complete_socket_response(http_result, ctx, quic_port, state)
     } else {
         finalize_url_response_inner(http_result, ctx, quic_port, state)
     };
@@ -3825,32 +3846,7 @@ fn finalize_url_response_inner(
             }
             Err(e) => {
                 warn!(backend = %ctx.backend_name, error = %e, "custom error page fetch failed (async), falling back to internal");
-                let reason = error::status_reason(original_status);
-                let body = error::internal_error_html(
-                    original_status,
-                    reason,
-                    state.config.errors.verbose_fallback,
-                    &req.path,
-                    None,
-                );
-                let mut headers = vec![(
-                    "Content-Type".to_string(),
-                    "text/html; charset=utf-8".to_string(),
-                )];
-                analytics::finish_response(
-                    analytics_on,
-                    &mut headers,
-                    &req.headers,
-                    &analytics::Event {
-                        node: &state.config.node.name,
-                        path: &req.path,
-                        status: original_status,
-                        cache_state: "MISS",
-                        client_ip: &ctx.client_ip,
-                        latency_ns: Some(latency_ns),
-                    },
-                );
-                (original_status, headers, body, "error".to_string())
+                error_page_fallback(original_status, ctx, state)
             }
         };
     }

@@ -545,7 +545,10 @@ pub fn encode_request(
 /// Like `forward_request` but with a configurable timeout for the total
 /// backend call (connect + write + read). A `TimedOut` error is returned if
 /// the backend does not respond within the deadline.
-#[expect(clippy::disallowed_methods, reason = "test and tooling path only")]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "test callers and the custom-error-page fetch in apply_error_mode (a blocking forward still runs in the loop on that path); EL-3b makes the error page fetch non-blocking"
+)]
 pub fn forward_request_timeout(
     socket_path: &Path,
     req: &HttpRequest,
@@ -1276,7 +1279,19 @@ impl SocketUpstream {
                         ),
                     )));
                 }
-                self.read_buf.len() >= header_end + 4 + len
+                if self.read_buf.len() >= header_end + 4 + len {
+                    true
+                } else if eof {
+                    // The backend closed before sending the declared body: fail
+                    // now, as the old blocking read_exact did, rather than
+                    // re-driving a closed fd until the deadline.
+                    return Some(Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "connection closed before the body was complete",
+                    )));
+                } else {
+                    false
+                }
             }
             Framing::Chunked => eof || self.read_buf.ends_with(b"0\r\n\r\n"),
             Framing::CloseDelimited => eof,
