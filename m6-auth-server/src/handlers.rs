@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Mutex;
 
 use m6_auth::Db;
 use m6_core::http::{RawRequest, RawResponse};
@@ -21,15 +21,11 @@ use crate::rate_limit::RateLimiter;
 /// hashing a password never holds a lock another request needs. See
 /// `main::WorkerDb`.
 pub struct AppState {
-    pub keys: Arc<RwLock<KeyMaterial>>,
+    pub keys: KeyMaterial,
     pub access_ttl: u64,
     pub refresh_ttl: u64,
     pub issuer: String,
-    /// What the config said at start, kept so a reload can name a change that
-    /// only a restart applies.
     pub db_path: std::path::PathBuf,
-    pub rate_limit_max_attempts: u32,
-    pub rate_limit_window_secs: u64,
     pub rate_limiter: Mutex<RateLimiter>,
 }
 
@@ -329,14 +325,8 @@ fn do_refresh(state: &AppState, db: &Db, token: &str) -> anyhow::Result<(String,
         roles: user.roles.clone(),
     };
 
-    // Read-lock keys for encode
-    let access_jwt = {
-        let keys = state
-            .keys
-            .read()
-            .map_err(|_| anyhow::anyhow!("keys lock poisoned"))?;
-        keys.jwt.encode_access(&access_claims)?
-    };
+    // Read the keys directly: the state is built once at start and shared.
+    let access_jwt = state.keys.jwt.encode_access(&access_claims)?;
     Ok((access_jwt, user.id))
 }
 
@@ -381,11 +371,7 @@ fn handle_logout_api(req: &RawRequest, state: &AppState, db: &Db) -> RawResponse
         let token = auth
             .trim_start_matches("Bearer ")
             .trim_start_matches("bearer ");
-        let decode_result = state
-            .keys
-            .read()
-            .ok()
-            .and_then(|keys| keys.jwt.decode_access(token).ok());
+        let decode_result = state.keys.jwt.decode_access(token).ok();
         if let Some(data) = decode_result {
             let user_id = &data.claims.sub;
             let _ = db.refresh_tokens_revoke_all(user_id);
@@ -398,10 +384,7 @@ fn handle_logout_api(req: &RawRequest, state: &AppState, db: &Db) -> RawResponse
 // ─── GET /auth/public-key ─────────────────────────────────────────────────────
 
 fn handle_public_key(state: &AppState) -> RawResponse {
-    let pem = match state.keys.read() {
-        Ok(keys) => keys.public_key_pem.clone(),
-        Err(_) => return internal_error(),
-    };
+    let pem = state.keys.public_key_pem.clone();
     RawResponse::new(200)
         .content_type("application/x-pem-file")
         .body(pem)
@@ -466,13 +449,8 @@ fn issue_tokens(
         token_type: "refresh".to_string(),
     };
 
-    // Read-lock keys — the watcher may replace the engine during key rotation
-    let keys = state
-        .keys
-        .read()
-        .map_err(|_| anyhow::anyhow!("keys lock poisoned"))?;
-    let access_jwt = keys.jwt.encode_access(&access_claims)?;
-    let refresh_jwt = keys.jwt.encode_refresh(&refresh_claims)?;
+    let access_jwt = state.keys.jwt.encode_access(&access_claims)?;
+    let refresh_jwt = state.keys.jwt.encode_refresh(&refresh_claims)?;
     Ok((access_jwt, refresh_jwt))
 }
 

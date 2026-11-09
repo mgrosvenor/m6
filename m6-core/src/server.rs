@@ -1,8 +1,8 @@
 //! The parts of a service that are not its handlers.
 //!
 //! Binding and owning a unix socket, applying its mode, applying a read
-//! timeout to an accepted connection, waiting on the listener and the config
-//! watcher together, and serving one connection until it ends.
+//! timeout to an accepted connection, waiting on the listener, and serving one
+//! connection until it ends.
 //!
 //! **`serve_connection` is the shared answer to four questions** each service
 //! used to answer for itself and differently: the keep-alive decision, what to
@@ -77,81 +77,24 @@ pub fn socket_path_from_config(config_path: &Path) -> PathBuf {
 /// [`crate::app::App`] had no timeout at all.
 pub const DEFAULT_READ_TIMEOUT_SECS: u64 = 30;
 
-/// What one `poll(2)` wait on a listener plus a config watcher returned.
-pub struct PollReady {
-    /// The listener has at least one connection waiting to be accepted.
-    pub listener: bool,
-    /// The config watcher's fd fired. Its events still need draining, which is
-    /// the caller's job because only the caller knows which filenames matter.
-    pub watcher: bool,
-    /// Neither fd fired: the timeout elapsed, or the call was interrupted.
-    ///
-    /// One flag for two outcomes because every caller treats them the same.
-    /// `EINTR` here is a signal arriving during the wait, and the next thing
-    /// both services do is check the shutdown flag, which is exactly the right
-    /// response to that.
-    pub idle: bool,
-}
-
-/// Wait for a connection or a config change, whichever comes first.
+/// Wait for a connection, or until the timeout elapses.
 ///
-/// **This block was written twice.** `App` and `m6-file` each built a
-/// `BorrowedFd` and a `PollFd` for the listener, branched on whether the
-/// watcher had a usable fd, polled one or two descriptors with a 100 ms
-/// timeout, and unpacked `revents` into a pair of bools. The two copies
-/// differed only in local names and in whether an absent watcher fd was spelled
-/// `Option<RawFd>` or `-1`.
-///
-/// The timeout is what makes an idle service still notice a shutdown promptly,
-/// so it is the caller's to choose rather than baked in here.
-///
-/// What is deliberately *not* here is what the two services do next. One
-/// submits to a bounded thread pool and answers 503 when it is full, the other
-/// sends down a channel to a fixed worker set and counts in-flight requests
-/// itself. Those are two concurrency models, not two copies of one, and
-/// merging them is a separate piece of work, tracked outside this repository.
-pub fn poll_listener_and_watcher(
-    listener_fd: std::os::fd::RawFd,
-    watcher_fd: Option<std::os::fd::RawFd>,
-    timeout_ms: u16,
-) -> PollReady {
+/// Returns true when the listener is readable. The timeout is what makes an
+/// idle service still notice a shutdown promptly, so it is the caller's to
+/// choose rather than baked in here.
+pub fn poll_listener(listener_fd: std::os::fd::RawFd, timeout_ms: u16) -> bool {
     use nix::poll::{poll, PollFd, PollFlags};
     use std::os::fd::BorrowedFd;
 
-    // Safety: both fds are owned by the caller and outlive this call. They are
-    // borrowed rather than owned precisely so that returning does not close
-    // them.
+    // Safety: the fd is owned by the caller and outlives this call. It is
+    // borrowed rather than owned precisely so that returning does not close it.
     let borrowed_listener = unsafe { BorrowedFd::borrow_raw(listener_fd) };
     let mut pfd_listener = PollFd::new(borrowed_listener, PollFlags::POLLIN);
-
-    let fired = |pfd: &PollFd| pfd.revents().is_some_and(|f| f.contains(PollFlags::POLLIN));
-
-    // `PollTimeout` is a distinct type now rather than a bare `i32`, which is
-    // an improvement worth taking: -1 meaning "block forever" and 0 meaning
-    // "return immediately" used to be two magic values in the same integer.
-    // `timeout_ms` is a `u16`, so this conversion is total.
     let timeout = nix::poll::PollTimeout::from(timeout_ms);
-    match watcher_fd {
-        Some(wfd) => {
-            let borrowed_watcher = unsafe { BorrowedFd::borrow_raw(wfd) };
-            let pfd_watcher = PollFd::new(borrowed_watcher, PollFlags::POLLIN);
-            let mut fds = [pfd_listener, pfd_watcher];
-            let result = poll(&mut fds, timeout);
-            PollReady {
-                listener: fired(&fds[0]),
-                watcher: fired(&fds[1]),
-                idle: matches!(result, Ok(0) | Err(_)),
-            }
-        }
-        None => {
-            let result = poll(std::slice::from_mut(&mut pfd_listener), timeout);
-            PollReady {
-                listener: fired(&pfd_listener),
-                watcher: false,
-                idle: matches!(result, Ok(0) | Err(_)),
-            }
-        }
-    }
+    let _ = poll(std::slice::from_mut(&mut pfd_listener), timeout);
+    pfd_listener
+        .revents()
+        .is_some_and(|f| f.contains(PollFlags::POLLIN))
 }
 
 /// Default mode for a service's unix socket.

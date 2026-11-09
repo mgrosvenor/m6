@@ -23,7 +23,7 @@ mod jwt;
 mod keys;
 mod rate_limit;
 
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Mutex;
 
 use m6_core::http::RawResponse;
 use m6_core::prelude::*;
@@ -58,8 +58,8 @@ fn build_state(ctx: &AppContext) -> Result<AppState> {
     m6_auth::Db::open(&cfg.db_path)
         .map_err(|e| Error::Other(anyhow::anyhow!("opening auth database: {e}")))?;
 
-    // Swapped by `reload_state` on a rotation, so a rotation needs no restart.
-    let keys = Arc::new(RwLock::new(key_material));
+    // Loaded once at start. A key rotation is a restart.
+    let keys = key_material;
 
     tracing::info!(issuer = %cfg.issuer, "auth config loaded");
 
@@ -69,8 +69,6 @@ fn build_state(ctx: &AppContext) -> Result<AppState> {
         refresh_ttl: cfg.refresh_ttl,
         issuer: cfg.issuer.clone(),
         db_path: cfg.db_path.clone(),
-        rate_limit_max_attempts: cfg.rate_limit_max_attempts,
-        rate_limit_window_secs: cfg.rate_limit_window_secs,
         rate_limiter: Mutex::new(RateLimiter::with_limits(
             cfg.rate_limit_max_attempts,
             cfg.rate_limit_window_secs,
@@ -113,53 +111,6 @@ fn open_worker_db(_config: &Map<String, Value>, _state: &AppState) -> Result<Wor
     Ok(WorkerDb(None))
 }
 
-/// Re-read the signing keys when the service's config is touched.
-///
-/// A rotation is: write the private key and the public key, then touch the
-/// config. Both files are loaded before anything is swapped, so a bad key
-/// returns `Err`, the running keys stay, and core tries again after a delay
-/// and at once on the next write.
-///
-/// The database path, the token lifetimes, the issuer and the rate limit are
-/// read once at start. A change to any of them is named in a warning that says
-/// to restart.
-fn reload_state(state: &AppState, ctx: &AppContext) -> Result<()> {
-    let cfg = AuthConfig::load(ctx.site_dir, ctx.config_path, ctx.site_toml)
-        .map_err(|e| Error::Other(e.context("loading auth config")))?;
-    let km = KeyMaterial::load(
-        &cfg.private_key_path,
-        &cfg.public_key_path,
-        state.issuer.clone(),
-    )
-    .map_err(|e| Error::Other(e.context("loading key material")))?;
-    *state
-        .keys
-        .write()
-        .map_err(|_| Error::Other(anyhow::anyhow!("the signing key lock is poisoned")))? = km;
-
-    let changed = [
-        ("storage.path", cfg.db_path != state.db_path),
-        ("tokens.access_ttl", cfg.access_ttl != state.access_ttl),
-        ("tokens.refresh_ttl", cfg.refresh_ttl != state.refresh_ttl),
-        ("tokens.issuer", cfg.issuer != state.issuer),
-        (
-            "rate_limit.max_attempts",
-            cfg.rate_limit_max_attempts != state.rate_limit_max_attempts,
-        ),
-        (
-            "rate_limit.window_secs",
-            cfg.rate_limit_window_secs != state.rate_limit_window_secs,
-        ),
-    ];
-    for (key, differs) in changed {
-        if differs {
-            tracing::warn!("config reload: [{key}] changed; restart m6-auth-server to apply it");
-        }
-    }
-    tracing::info!("signing keys reloaded");
-    Ok(())
-}
-
 /// A unix socket has no peer address, so rate limiting keys off what the proxy
 /// forwarded. `"unix"` when nothing did, which buckets every unattributed
 /// request together rather than exempting them.
@@ -196,7 +147,7 @@ macro_rules! route {
 }
 
 fn main() -> anyhow::Result<()> {
-    let app = App::with_state(build_state, open_worker_db).on_reload(reload_state);
+    let app = App::with_state(build_state, open_worker_db);
     let app = route!(app, route_post, "/auth/login", |req, state, db, ip| {
         handlers::dispatch_login(req.raw(), state, db, ip)
     });

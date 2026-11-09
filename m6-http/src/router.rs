@@ -267,7 +267,6 @@ impl RouteTable {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -441,5 +440,4 @@ mod tests {
         let result = expand_glob_vars("/files/{dir}/{filename}", path, "/site/assets/**/*");
         assert_eq!(result, "/files/css/main.css");
     }
-
 }

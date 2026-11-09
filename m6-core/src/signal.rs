@@ -35,7 +35,9 @@ static SIGNAL_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// The signal that makes a process reopen its log file.
 ///
 /// A rotation tool renames the file and sends this signal.
-/// SIGHUP is the usual "reload configuration" signal and also arrives when a terminal closes, so it stays free.
+/// Not SIGHUP: by convention it asks a daemon to re-read its configuration,
+/// which m6 never does (a change takes a restart), and it also arrives when a
+/// terminal closes.
 /// SIGUSR1 is the reopen convention logrotate users already know.
 /// Before this constant existed SIGUSR1 killed every m6 process at the default disposition.
 pub const REOPEN_SIGNAL: Signal = Signal::SIGUSR1;

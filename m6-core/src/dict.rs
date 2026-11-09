@@ -4,11 +4,10 @@
 //! the whole of the service's static configuration into it, per request. On
 //! a content-driven site that is the config file's keys plus its whole
 //! catalogue, tens of kilobytes and thousands of nodes, deep-copied several
-//! times to produce a map that was
-//! identical for every request until the next config reload.
+//! times to produce a map that was identical for every request.
 //!
 //! Nothing in that is per-request. So it is not copied per request: the base
-//! is built once per route per reload and shared behind an `Arc`, and only the
+//! is built once per route at start and shared behind an `Arc`, and only the
 //! handful of entries that genuinely differ are allocated per request.
 //!
 //! **Precedence is why this is a type rather than two fields.** `build_dict`
@@ -17,7 +16,7 @@
 //! override `year`, `datetime` or `request_path`. Splitting the sources across
 //! two layers preserves that only if the split respects it, so it does:
 //!
-//! - **base**, built once per reload: config keys, global params files, and
+//! - **base**, built once at start: config keys, global params files, and
 //!   the route's *static* params files, merged in that order.
 //! - **overlay**, built per request: dynamic params files (those whose path
 //!   holds a `{placeholder}` and so resolve per request), then path params,

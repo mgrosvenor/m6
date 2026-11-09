@@ -698,22 +698,12 @@ fn public_key_body(env: &TestEnv) -> String {
     resp[at..].to_string()
 }
 
-/// Set the modified time of `path` to now, which is all a `touch` does.
-fn touch(path: &Path) {
-    std::fs::File::options()
-        .write(true)
-        .open(path)
-        .expect("open for touch")
-        .set_modified(std::time::SystemTime::now())
-        .expect("set modified time");
-}
-
-/// A rotation is: write both key files, then touch the config. The key files
-/// are not watched, so nothing changes until the touch.
+/// A rotation is: write both key files, then restart the service. The key
+/// files are read once at start.
 #[test]
-fn a_rotated_signing_key_signs_after_the_config_is_touched() {
+fn a_rotated_signing_key_signs_after_a_restart() {
     let env = setup_test_env("rotate");
-    let guard = spawn_server(&env);
+    let mut guard = spawn_server(&env);
     let key_a = public_key_body(&env);
     assert!(key_a.contains("PUBLIC KEY"), "{key_a}");
 
@@ -722,73 +712,57 @@ fn a_rotated_signing_key_signs_after_the_config_is_touched() {
     std::fs::write(env._key_dir.path().join("auth.pem"), &private_b).unwrap();
     std::fs::write(env._key_dir.path().join("auth.pub"), &public_b).unwrap();
 
-    std::thread::sleep(Duration::from_secs(2));
-    assert_eq!(
-        public_key_body(&env),
-        key_a,
-        "writing the key files changed the key without a touch"
-    );
-
-    touch(&env.config_path);
+    // Restart on the same config: the new pair is read at start.
+    let status = guard.terminate(Duration::from_secs(5));
     assert!(
-        wait::until(Duration::from_secs(5), || public_key_body(&env) == public_b),
-        "the new key was not served after the config was touched\n--- output ---\n{}",
-        guard.output()
+        status.success(),
+        "m6-auth-server did not stop cleanly, got {status}"
     );
-}
-
-/// A new key that does not load is refused and the running key stays.
-#[test]
-fn a_bad_new_key_keeps_the_old_one() {
-    let env = setup_test_env("rotate-bad");
     let guard = spawn_server(&env);
-    let key_a = public_key_body(&env);
 
-    std::fs::write(env._key_dir.path().join("auth.pem"), "not a key\n").unwrap();
-    touch(&env.config_path);
-
-    assert!(
-        wait::until(Duration::from_secs(5), || guard
-            .output()
-            .contains("Reload hook failed")),
-        "the failed reload was not reported\n--- output ---\n{}",
-        guard.output()
-    );
     assert_eq!(
         public_key_body(&env),
-        key_a,
-        "a bad key replaced the good one"
+        public_b,
+        "the new key was not served after a restart\n--- output ---\n{}",
+        guard.output()
     );
 }
 
-/// Writing the private key and the public key is two writes, and a touch
-/// between them must not install a mismatched pair.
+/// A private key beside a public key from a different pair is refused at start
+/// with exit 2, so a rotation caught between its two writes never serves.
 #[test]
-fn a_mismatched_key_pair_is_refused_and_the_matching_one_lands_on_retry() {
+fn a_mismatched_key_pair_at_start_exits_2() {
     let env = setup_test_env("rotate-mismatch");
-    let guard = spawn_server(&env);
-    let key_a = public_key_body(&env);
-
-    let (private_b, public_b) = generate_test_rsa_keys();
-    // The new private key beside the old public key.
+    // A fresh private key, while the public key setup_test_env wrote stays
+    // from the first pair, so the two do not match.
+    let (private_b, _public_b) = generate_test_rsa_keys();
     std::fs::write(env._key_dir.path().join("auth.pem"), &private_b).unwrap();
-    touch(&env.config_path);
-    assert!(
-        wait::until(Duration::from_secs(5), || guard
-            .output()
-            .contains("Reload hook failed")),
-        "a mismatched pair was installed\n--- output ---\n{}",
-        guard.output()
-    );
-    assert_eq!(public_key_body(&env), key_a);
 
-    // The second write arrives. No touch: core's retry finds the pair.
-    std::fs::write(env._key_dir.path().join("auth.pub"), &public_b).unwrap();
+    let mut svc = Service::spawn(
+        "m6-auth-server",
+        Command::new(binary("m6-auth-server"))
+            .arg(&env.site_dir)
+            .arg(&env.config_path)
+            .env("M6_SOCKET_OVERRIDE", &env.socket_path),
+    );
+    let status = svc
+        .wait_for_exit(std::time::Instant::now() + Duration::from_secs(10))
+        .unwrap_or_else(|| {
+            panic!(
+                "m6-auth-server did not exit for a mismatched key pair\n--- output ---\n{}",
+                svc.output()
+            )
+        });
+    assert_eq!(
+        status.code(),
+        Some(2),
+        "m6-auth-server should exit 2 for a mismatched key pair\n--- output ---\n{}",
+        svc.output()
+    );
     assert!(
-        wait::until(Duration::from_secs(10), || public_key_body(&env)
-            == public_b),
-        "the matching pair never loaded on the retry\n--- output ---\n{}",
-        guard.output()
+        svc.output().contains("not a pair"),
+        "the error must say the keys are not a pair\n--- output ---\n{}",
+        svc.output()
     );
 }
 

@@ -13,8 +13,8 @@
 //! monitoring endpoints can report it without re-reading a file. The second
 //! half matters as much as the first: a path on disk and the material a running
 //! process is serving are different facts, and reading the file would report
-//! the one nobody asked about. A certificate renewed on disk and never reloaded
-//! is exactly the case an operator needs to see.
+//! the one nobody asked about. A certificate renewed on disk and never
+//! restarted into the server is exactly the case an operator needs to see.
 //!
 //! # Why the parse is written out here
 //!
@@ -207,20 +207,11 @@ fn element(buf: &[u8]) -> Result<(u8, &[u8], &[u8]), CertificateError> {
 
 /// `notAfter` for each certificate the server has loaded, leaf first.
 ///
-/// A `RwLock` rather than a `OnceLock` so a second load can replace the first.
-/// Written once per load and read once per monitoring request, so the lock is
-/// never contended.
+/// Written once at start, when the configuration is installed, and read once
+/// per monitoring request. The `RwLock` keeps the write and read safe.
 ///
-/// **What this holds is the chain every protocol is serving.** A reload writes
-/// it again, and `m6-http`'s `handle_tls_reload` writes it after the new
-/// material is installed on both the rustls listener and the quiche
-/// configuration, so a build that fails leaves the previous chain recorded and
-/// still being served.
+/// **What this holds is the chain every protocol is serving.**
 ///
-/// It was not always so. Until m6 #210 a reload rebuilt the quiche
-/// configuration alone and re-recorded nothing, so after a renewal HTTP/3
-/// served the new certificate, HTTP/1.1 and HTTP/2 served the old one, and the
-/// number here was correct for the second pair and stale for the first.
 /// Each entry is `(depth as loaded, notAfter)`, and an unreadable certificate
 /// leaves a GAP rather than shifting everything after it.
 ///
