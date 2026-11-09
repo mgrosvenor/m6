@@ -88,6 +88,7 @@ public_key  = "{}"
     );
     std::fs::write(&config_path, &config).unwrap();
     std::fs::create_dir_all(site_dir.join("data")).unwrap();
+    std::fs::write(site_dir.join("site.toml"), "").unwrap();
 
     let socket_path = temp.path().join(format!("{id}.sock"));
 

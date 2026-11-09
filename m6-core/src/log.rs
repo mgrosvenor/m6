@@ -624,7 +624,7 @@ pub fn init_with_analytics(
     // Anchor the clock before anything can log, so `seconds_since_last` is
     // measured from process start rather than from the first call.
     let _ = process_start();
-    let lvl = parse_level(level);
+    let lvl = parse_level(level)?;
     let (writer, guard) = tracing_appender::non_blocking(std::io::stdout());
 
     // The level filter is built once and never changes.
@@ -655,38 +655,49 @@ pub fn init_with_analytics(
     })
 }
 
-/// Read `[log]` from the `site.toml` at `site_toml`. Returns `(level, format)`.
-/// Falls back to `("info", "json")` if the file is absent or unparseable.
-pub fn read_site_log_config(site_toml: &Path) -> (String, String) {
-    if let Ok(text) = std::fs::read_to_string(site_toml) {
-        if let Ok(val) = text.parse::<toml::Value>() {
-            let level = val
-                .get("log")
-                .and_then(|l| l.get("level"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("info")
-                .to_string();
-            let format = val
-                .get("log")
-                .and_then(|l| l.get("format"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("json")
-                .to_string();
-            return (level, format);
-        }
-    }
-    ("info".to_string(), "json".to_string())
+/// Read `[log]` from the `site.toml` at `site_toml`. Returns `(level, format)`
+/// on success.
+///
+/// A read or parse failure is an error naming the file, and a `level` or
+/// `format` that is present and not a string is an error naming the key. Absent
+/// keys keep the defaults `"info"` and `"json"`.
+pub fn read_site_log_config(site_toml: &Path) -> anyhow::Result<(String, String)> {
+    let text = std::fs::read_to_string(site_toml)
+        .map_err(|e| anyhow::anyhow!("{} cannot be read: {e}", site_toml.display()))?;
+    let val: toml::Value = text.parse::<toml::Value>().map_err(|e| {
+        anyhow::anyhow!("{} is not valid TOML: {}", site_toml.display(), e.message())
+    })?;
+    let log = val.get("log");
+    let level = match log.and_then(|l| l.get("level")) {
+        Some(v) => v
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("[log] level must be a string, got {v}"))?
+            .to_string(),
+        None => "info".to_string(),
+    };
+    let format = match log.and_then(|l| l.get("format")) {
+        Some(v) => v
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("[log] format must be a string, got {v}"))?
+            .to_string(),
+        None => "json".to_string(),
+    };
+    Ok((level, format))
 }
 
-/// Parse a log level string, defaulting to `Level::INFO` on unrecognised input.
-pub fn parse_level(s: &str) -> Level {
+/// Parse a log level string. Accepts `trace`, `debug`, `info`, `warn` (or
+/// `warning`) and `error`, in any case. Anything else is an error naming the
+/// value.
+pub fn parse_level(s: &str) -> anyhow::Result<Level> {
     match s.to_ascii_lowercase().as_str() {
-        "trace" => Level::TRACE,
-        "debug" => Level::DEBUG,
-        "info" => Level::INFO,
-        "warn" | "warning" => Level::WARN,
-        "error" => Level::ERROR,
-        _ => Level::INFO,
+        "trace" => Ok(Level::TRACE),
+        "debug" => Ok(Level::DEBUG),
+        "info" => Ok(Level::INFO),
+        "warn" | "warning" => Ok(Level::WARN),
+        "error" => Ok(Level::ERROR),
+        _ => Err(anyhow::anyhow!(
+            "unknown log level {s:?}: use trace, debug, info, warn or error"
+        )),
     }
 }
 
@@ -696,17 +707,28 @@ mod tests {
 
     #[test]
     fn test_parse_level_known() {
-        assert_eq!(parse_level("debug"), Level::DEBUG);
-        assert_eq!(parse_level("INFO"), Level::INFO);
-        assert_eq!(parse_level("WARN"), Level::WARN);
-        assert_eq!(parse_level("error"), Level::ERROR);
-        assert_eq!(parse_level("trace"), Level::TRACE);
+        assert_eq!(parse_level("debug").unwrap(), Level::DEBUG);
+        assert_eq!(parse_level("INFO").unwrap(), Level::INFO);
+        assert_eq!(parse_level("WARN").unwrap(), Level::WARN);
+        assert_eq!(parse_level("error").unwrap(), Level::ERROR);
+        assert_eq!(parse_level("trace").unwrap(), Level::TRACE);
+        assert_eq!(parse_level("warning").unwrap(), Level::WARN);
     }
 
     #[test]
-    fn test_parse_level_unknown_defaults_info() {
-        assert_eq!(parse_level(""), Level::INFO);
-        assert_eq!(parse_level("verbose"), Level::INFO);
+    fn an_unknown_level_is_refused_and_named() {
+        let err = parse_level("verbose").unwrap_err().to_string();
+        assert!(err.contains("unknown log level"), "{err}");
+        assert!(err.contains("verbose"), "{err}");
+        assert!(parse_level("").is_err());
+    }
+
+    #[test]
+    fn a_site_toml_that_does_not_parse_is_an_error_for_the_log() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("site.toml");
+        std::fs::write(&f, "[log").unwrap();
+        assert!(read_site_log_config(&f).is_err());
     }
 }
 

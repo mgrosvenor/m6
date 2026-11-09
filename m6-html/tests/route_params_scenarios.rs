@@ -248,6 +248,7 @@ fn global_params_change_picked_up_after_restart() {
     let global = site.path().join("data").join("site.json");
     std::fs::create_dir_all(site.path().join("templates")).expect("templates dir");
     std::fs::create_dir_all(site.path().join("data")).expect("data dir");
+    std::fs::write(site.path().join("site.toml"), "").unwrap();
     std::fs::write(
         &config,
         "global_params = [\"data/site.json\"]\n\n[[route]]\npath = \"/brand-global\"\ntemplate = \"templates/params.html\"\nparams = []\n",

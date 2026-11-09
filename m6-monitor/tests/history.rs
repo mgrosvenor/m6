@@ -49,6 +49,7 @@ fn setup(history: &str) -> Setup {
     let dir = tempfile::tempdir().expect("tempdir");
     let config = dir.path().join("monitor.conf");
     std::fs::write(&config, self::config(history)).expect("write config");
+    std::fs::write(dir.path().join("site.toml"), "").unwrap();
     // Short name: a unix socket path is capped near 104 bytes on macOS.
     let sock = dir.path().join("mon.sock");
     Setup { dir, config, sock }

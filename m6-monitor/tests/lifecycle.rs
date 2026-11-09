@@ -43,6 +43,7 @@ fn lifecycle_is_clean() {
     let dir = tempfile::tempdir().expect("tempdir");
     let config = dir.path().join("monitor.conf");
     std::fs::write(&config, CONFIG).expect("write config");
+    std::fs::write(dir.path().join("site.toml"), "").unwrap();
 
     // Short name: a unix socket path is capped near 104 bytes on macOS and the
     // temp directory already spends most of that.

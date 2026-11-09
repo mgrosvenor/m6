@@ -1782,13 +1782,11 @@ pub fn is_shutdown() -> bool {
 // App builder — no state
 // ---------------------------------------------------------------------------
 
-/// Resolve `site.toml` for `config` and refuse a path that was named but is
-/// not there. Exit 2, the configuration error code, before anything binds.
+/// Resolve `site.toml` for `config` and refuse any path that cannot be read or
+/// parsed. Exit 2, the configuration error code, before anything binds.
 ///
-/// No `site_toml` key means `<site_dir>/site.toml`, which may legitimately be
-/// absent (a service under test). A key that names a file is a statement that
-/// the file exists, so a missing one is a mistake the operator wants to hear
-/// about on the first line.
+/// Every service needs a readable `site.toml`: the default
+/// `<site_dir>/site.toml`, or the path the `site_toml` key names.
 fn site_toml_or_exit(
     config: &crate::config::RendererConfig,
     site_dir: &std::path::Path,
@@ -1804,39 +1802,29 @@ fn site_toml_or_exit(
 
 /// The checking half of [`site_toml_or_exit`].
 ///
-/// A named `site_toml` is read and parsed once here. A directory, a file that
-/// cannot be read and a file that is not valid TOML are all refused, because
-/// the readers of `site.toml` fall back to defaults on any of them and would
-/// hide a disagreement the operator wants to hear about.
+/// Every path is read and parsed once here, the default included. A file that
+/// is missing, cannot be read or is not valid TOML is refused, because the
+/// readers of `site.toml` would otherwise fall back to defaults and hide a
+/// disagreement the operator wants to hear about.
 fn check_site_toml(
     config: &crate::config::RendererConfig,
     site_dir: &std::path::Path,
 ) -> std::result::Result<PathBuf, String> {
     let site_toml = config.resolve_site_toml(site_dir);
-    if config.site_toml.is_none() {
-        return Ok(site_toml);
-    }
+    let src = if config.site_toml.is_some() {
+        format!("site_toml = {}", site_toml.display())
+    } else {
+        format!("site.toml at {}", site_toml.display())
+    };
     let text = match std::fs::read_to_string(&site_toml) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(format!(
-                "site_toml = {} does not exist",
-                site_toml.display()
-            ));
+            return Err(format!("{src} does not exist"));
         }
-        Err(e) => {
-            return Err(format!(
-                "site_toml = {} cannot be read: {e}",
-                site_toml.display()
-            ));
-        }
+        Err(e) => return Err(format!("{src} cannot be read: {e}")),
     };
     if let Err(e) = text.parse::<toml::Table>() {
-        return Err(format!(
-            "site_toml = {} is not valid TOML: {}",
-            site_toml.display(),
-            e.message()
-        ));
+        return Err(format!("{src} is not valid TOML: {}", e.message()));
     }
     Ok(site_toml)
 }
@@ -2569,7 +2557,13 @@ fn parse_invocation(routes: &[(String, RouteMethod)], handlers: &[String]) -> In
         .map(|w| w[1].clone());
 
     if args.iter().any(|a| a == "--dump-config") {
-        std::process::exit(dump_config(&site_dir, &config_path, routes, handlers));
+        std::process::exit(dump_config(
+            &site_dir,
+            &config_path,
+            routes,
+            handlers,
+            cli_log_level.as_deref(),
+        ));
     }
 
     Invocation {
@@ -2606,6 +2600,7 @@ fn dump_config(
     config_path: &std::path::Path,
     code_routes: &[(String, RouteMethod)],
     handlers: &[String],
+    cli_log_level: Option<&str>,
 ) -> i32 {
     let config = match crate::config::load(config_path, site_dir) {
         Ok(c) => c,
@@ -2625,6 +2620,11 @@ fn dump_config(
         }
     };
 
+    if let Err(msg) = resolve_log(&site_toml, &config.log, cli_log_level) {
+        eprintln!("Config error: {msg}");
+        return 2;
+    }
+
     if let Err(e) = check_routes(code_routes, &config.routes) {
         eprintln!("Config error: {e}");
         return 2;
@@ -2632,11 +2632,7 @@ fn dump_config(
 
     println!("site_dir    {}", site_dir.display());
     println!("config      {}", config_path.display());
-    if site_toml.exists() {
-        println!("site.toml   {}", site_toml.display());
-    } else {
-        println!("site.toml   {} (absent)", site_toml.display());
-    }
+    println!("site.toml   {}", site_toml.display());
     println!(
         "socket      {}",
         crate::socket_path_from_config(config_path).display()
@@ -2736,19 +2732,22 @@ fn check_compress_declared(
 /// The log format and level, in order of precedence: the command line, then
 /// the service's `[log]`, then `site.toml`'s `[log]`.
 ///
-/// Read once at start.
+/// Read once at start. The resolved level is parsed here, so an unknown level
+/// is a configuration error before anything binds.
 fn resolve_log(
     site_toml: &std::path::Path,
     config_log: &crate::config::LogConfig,
     cli_log_level: Option<&str>,
-) -> (String, String) {
-    let (site_level, site_format) = crate::log::read_site_log_config(site_toml);
+) -> std::result::Result<(String, String), String> {
+    let (site_level, site_format) =
+        crate::log::read_site_log_config(site_toml).map_err(|e| e.to_string())?;
     let format = config_log.format.clone().unwrap_or(site_format);
     let level = cli_log_level
         .map(str::to_string)
         .or_else(|| config_log.level.clone())
         .unwrap_or(site_level);
-    (format, level)
+    crate::log::parse_level(&level).map_err(|e| e.to_string())?;
+    Ok((format, level))
 }
 
 pub fn run_app(
@@ -2813,7 +2812,13 @@ fn run_app_with_shutdown(
     };
 
     // Init logging: site.toml base → renderer config [log] → CLI --log-level.
-    let (format, level) = resolve_log(&site_toml, &config.log, cli_log_level.as_deref());
+    let (format, level) = match resolve_log(&site_toml, &config.log, cli_log_level.as_deref()) {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("Config error: {msg}");
+            std::process::exit(2);
+        }
+    };
     let log_handle = crate::log::init(&format, &level).unwrap_or_else(|e| {
         eprintln!("logging init error: {e}");
         std::process::exit(1);
@@ -2912,8 +2917,16 @@ fn run_app_with_shutdown(
     });
 
     // Before the shutdown handle below, which self-connects to this socket:
-    // the mode has to be right by the time anything can reach it.
-    crate::server::apply_socket_mode(&socket_path, socket_mode);
+    // the mode has to be right by the time anything can reach it. A socket
+    // with a mode nobody chose is a start failure, so the process stops.
+    if let Err(e) = crate::server::apply_socket_mode(&socket_path, socket_mode) {
+        eprintln!(
+            "Failed to set mode {socket_mode:04o} on socket {}: {e}",
+            socket_path.display()
+        );
+        std::fs::remove_file(&socket_path).ok();
+        std::process::exit(2);
+    }
 
     // After the bind, not before: the wake connects to this socket, so it has
     // to exist by the time a signal can arrive.
@@ -3426,13 +3439,21 @@ mod tests {
     }
 
     #[test]
-    fn unnamed_site_toml_keeps_its_tolerance() {
+    fn a_missing_default_site_toml_is_refused() {
         let d = tempfile::tempdir().unwrap();
         let cfg = config_naming(d.path(), None);
-        // Absent, a directory and invalid TOML at the default path all pass.
-        assert!(check_site_toml(&cfg, d.path()).is_ok());
-        std::fs::write(d.path().join("site.toml"), "[server\n").unwrap();
-        assert!(check_site_toml(&cfg, d.path()).is_ok());
+        let e = check_site_toml(&cfg, d.path()).unwrap_err();
+        assert!(e.contains("site.toml at"), "{e}");
+        assert!(e.contains("does not exist"), "{e}");
+    }
+
+    #[test]
+    fn an_invalid_default_site_toml_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("site.toml"), "[site").unwrap();
+        let cfg = config_naming(d.path(), None);
+        let e = check_site_toml(&cfg, d.path()).unwrap_err();
+        assert!(e.contains("is not valid TOML"), "{e}");
     }
 
     #[test]
@@ -3470,7 +3491,7 @@ mod tests {
         );
 
         assert_eq!(
-            dump_config(d.path(), &config_path, &[], &[]),
+            dump_config(d.path(), &config_path, &[], &[], None),
             2,
             "--dump-config reported the config good, but start exits 2 on it"
         );
