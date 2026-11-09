@@ -193,6 +193,28 @@ fn parse_h1(raw: &[u8]) -> Result<(u16, String), String> {
     Ok((status, body.to_string()))
 }
 
+/// Whether an h1 response head advertises HTTP/3 via `alt-svc`.
+fn h1_has_alt_svc(port: u16, path: &str) -> Result<bool, String> {
+    probe::install_crypto();
+    let tcp = TcpStream::connect(("127.0.0.1", port)).map_err(|e| format!("connect: {e}"))?;
+    tcp.set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|e| e.to_string())?;
+    let name = rustls::pki_types::ServerName::try_from("127.0.0.1".to_string())
+        .map_err(|e| e.to_string())?;
+    let conn = rustls::ClientConnection::new(probe::tls_config(b"http/1.1"), name)
+        .map_err(|e| e.to_string())?;
+    let mut stream = StreamOwned::new(conn, tcp);
+    let req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(req.as_bytes())
+        .map_err(|e| e.to_string())?;
+    stream.flush().map_err(|e| e.to_string())?;
+    let raw = read_one(&mut stream, "GET").map_err(|e| format!("read: {e}"))?;
+    let text = String::from_utf8_lossy(&raw).to_ascii_lowercase();
+    let head = text.split("\r\n\r\n").next().unwrap_or("");
+    Ok(head.contains("alt-svc:"))
+}
+
 /// HTTP/2 over TLS, driven in a loop until the reply arrives or the deadline
 /// passes.
 fn h2_get(port: u16, path: &str, timeout: Duration) -> Result<(u16, String), String> {
@@ -610,6 +632,20 @@ fn a_backend_past_its_timeout_answers_and_frees_the_member() {
     assert!(
         recovered,
         "the member never served /fast after its backoff\n--- m6-http ---\n{}",
+        fx.service.output()
+    );
+}
+
+#[test]
+fn a_socket_backend_miss_advertises_alt_svc() {
+    let fx = Fixture::start(1, 30, "altsvc");
+    // The cache is empty, so this is a miss that runs through the socket
+    // upstream; the pre-EL-1 Ready caller advertised alt-svc, and the miss must
+    // keep doing so.
+    let has = h1_has_alt_svc(fx.port(), "/fast").expect("GET /fast");
+    assert!(
+        has,
+        "a socket-backend miss must advertise alt-svc\n--- m6-http ---\n{}",
         fx.service.output()
     );
 }
