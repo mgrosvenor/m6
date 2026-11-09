@@ -73,6 +73,7 @@ const TOKEN_H2C: Token = Token(3);
 const TOKEN_H2C_CLIENT: Token = Token(4);
 const TOKEN_H2S_CLIENT: Token = Token(5);
 const TOKEN_WAKE: Token = Token(6);
+const TOKEN_SOCKET_UPSTREAM: Token = Token(7);
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
 // ── Shutdown flags ───────────────────────────────────────────────────────────
@@ -87,12 +88,12 @@ struct QuicConn {
     /// Responses awaiting flow-control credit, retried by drain_writable() the
     /// next time each stream reports writable.
     partial_responses: HashMap<u64, PendingH3Response>,
-    /// Pending URL-backend requests for H3 streams. Keyed by H3 stream_id.
+    /// Pending backend requests for H3 streams. Keyed by H3 stream_id.
     pending_url: HashMap<
         u64,
         (
             std::sync::mpsc::Receiver<std::io::Result<forward::HttpResponse>>,
-            forward::PendingUrlContext,
+            Box<forward::PendingUrlContext>,
         ),
     >,
     client_addr: SocketAddr,
@@ -131,6 +132,16 @@ enum PendingH3Response {
 // ── Server state ──────────────────────────────────────────────────────────────
 
 /// All mutable server state — owned by the event loop, no Arc/Mutex needed.
+/// One in-flight socket-backend request the loop drives. The sender's receiver
+/// is parked on the waiting connection (h1, h2 or h3), and the loop sends the
+/// result into it when the upstream completes or expires.
+struct SocketUpstreamEntry {
+    upstream: forward::SocketUpstream,
+    member_idx: usize,
+    backend_name: String,
+    tx: std::sync::mpsc::Sender<std::io::Result<forward::HttpResponse>>,
+}
+
 struct ServerState {
     config: Config,
     route_table: RouteTable,
@@ -142,7 +153,7 @@ struct ServerState {
     /// Cache entries queued to be fetched in the background — hint-driven
     /// prefetches and stale-while-revalidate refreshes both land here.
     prefetch_queue: std::collections::VecDeque<Refresh>,
-    /// Background fetches dispatched to a URL backend and awaiting a reply.
+    /// Background fetches dispatched to a backend and awaiting a reply.
     ///
     /// A real request parks its pending reply on its own connection, which
     /// the event loop then polls. A background fetch has no connection, so
@@ -150,12 +161,17 @@ struct ServerState {
     /// cache node -- whose only backend is origin over h2c, i.e. always the
     /// async path -- every prefetch and every stale-while-revalidate refresh
     /// was dispatched and then silently discarded, so nothing was ever
-    /// refilled. Origin was unaffected, its backends being unix sockets that
-    /// complete synchronously inside handle_request.
+    /// refilled. A socket-backend refresh now returns Pending too and parks
+    /// here until its upstream completes in the loop.
     background_pending: Vec<(
         std::sync::mpsc::Receiver<std::io::Result<forward::HttpResponse>>,
-        forward::PendingUrlContext,
+        Box<forward::PendingUrlContext>,
     )>,
+    /// In-flight socket-backend requests, driven once per loop iteration by
+    /// `drive_socket_upstreams`. Each entry carries the non-blocking upstream,
+    /// the pool member it was taken from, the backend name, and the one-shot
+    /// sender whose receiver the h1, h2 or h3 connection parks on.
+    socket_upstreams: Vec<SocketUpstreamEntry>,
     /// Persistent non-blocking H2C outbound client pool.
     h2c_pool: H2cClientPool,
     /// Persistent non-blocking H2S (HTTP/2 over TLS) outbound client pool.
@@ -639,7 +655,10 @@ fn event_loop(io: EventLoopIo, state: &mut ServerState, quiche_config: &mut quic
                         &mut conn_id_map,
                         quiche_config,
                         state,
-                        quic_port,
+                        &H3Loop {
+                            poller: &poller,
+                            quic_port,
+                        },
                     );
                 }
                 TOKEN_TCP => {
@@ -655,6 +674,13 @@ fn event_loop(io: EventLoopIo, state: &mut ServerState, quiche_config: &mut quic
                 _ => {}
             }
         }
+
+        // Drive socket upstreams and the h2c/h2s client pools BEFORE the server
+        // connections (design H6), so a reply read in this iteration is
+        // collected by its waiting connection in the same iteration.
+        drive_socket_upstreams(state, &poller);
+        state.h2c_pool.drive_all(&poller, TOKEN_H2C_CLIENT);
+        state.h2s_pool.drive_all(&poller, TOKEN_H2S_CLIENT);
 
         // Drive HTTP/1.1 connections. Per-connection fds are registered with TOKEN_TCP
         // so this also runs on data-ready events, not only on the periodic tick.
@@ -867,7 +893,8 @@ fn event_loop(io: EventLoopIo, state: &mut ServerState, quiche_config: &mut quic
                     } // end cache hit
 
                     let mut outcome = handle_request(
-                        req, client_ip, enc_str, state, false, /* from_internal */ false,
+                        req, client_ip, enc_str, state, false, /* from_internal */
+                        false, &poller,
                     );
                     if let RequestOutcome::Ready(status, ref mut headers, _, ref backend) = outcome
                     {
@@ -1162,6 +1189,7 @@ fn event_loop(io: EventLoopIo, state: &mut ServerState, quiche_config: &mut quic
                         state,
                         false,
                         state.h2c_iface == Iface::Internal,
+                        &poller,
                     );
                     if let RequestOutcome::Ready(status, ref mut headers, _, ref backend) = outcome
                     {
@@ -1210,10 +1238,6 @@ fn event_loop(io: EventLoopIo, state: &mut ServerState, quiche_config: &mut quic
 
         // Drive connection timeouts and flush pending sends
         flush_all(&udp, &mut connections);
-
-        // Drive outbound H2C and H2S client connections.
-        state.h2c_pool.drive_all(&poller, TOKEN_H2C_CLIENT);
-        state.h2s_pool.drive_all(&poller, TOKEN_H2S_CLIENT);
 
         // Poll pending URL-backend responses for H3 streams.
         for qconn in connections.values_mut() {
@@ -1266,7 +1290,7 @@ fn event_loop(io: EventLoopIo, state: &mut ServerState, quiche_config: &mut quic
             use std::sync::mpsc::TryRecvError;
             let mut done: Vec<(
                 std::io::Result<forward::HttpResponse>,
-                forward::PendingUrlContext,
+                Box<forward::PendingUrlContext>,
             )> = Vec::new();
             let mut idx = 0;
             while idx < state.background_pending.len() {
@@ -1314,14 +1338,16 @@ fn event_loop(io: EventLoopIo, state: &mut ServerState, quiche_config: &mut quic
                     state,
                     true,
                     /* from_internal */ false,
+                    &poller,
                 ) {
-                    // Socket backend: already completed and inserted inline.
+                    // Ready: answered inline (redirect, error). The reply
+                    // landed directly; nothing to park.
                     RequestOutcome::Ready(..) => {
                         debug!(path = %r.path, enc = %r.enc, "background fetch: cache filled");
                     }
-                    // URL backend: the reply lands later. Park it so the poll
-                    // below can finish it; dropping it here is what made this
-                    // a no-op on cache nodes.
+                    // Backend reply lands later. Park it so the poll below can
+                    // finish it; dropping it here is what made this a no-op on
+                    // cache nodes.
                     RequestOutcome::Pending { rx, ctx } => {
                         if state.background_pending.len() < MAX_REFRESH_QUEUE {
                             state.background_pending.push((rx, ctx));
@@ -1337,6 +1363,13 @@ fn event_loop(io: EventLoopIo, state: &mut ServerState, quiche_config: &mut quic
 
 // ── UDP receive + quiche dispatch ─────────────────────────────────────────────
 
+/// The loop context threaded down the h3 request path: the poller, for
+/// registering socket upstreams, and the QUIC port, for the Alt-Svc header.
+struct H3Loop<'a> {
+    poller: &'a Poller,
+    quic_port: u16,
+}
+
 fn drain_udp(
     udp: &UdpSocket,
     // A slice, not `&mut Vec<u8>`: this never grows or shrinks the buffer, it
@@ -1346,7 +1379,7 @@ fn drain_udp(
     conn_id_map: &mut HashMap<Vec<u8>, Vec<u8>>,
     quiche_config: &mut quiche::Config,
     state: &mut ServerState,
-    quic_port: u16,
+    h3: &H3Loop,
 ) {
     loop {
         let (len, from) = match udp.recv_from(recv_buf) {
@@ -1505,7 +1538,7 @@ fn drain_udp(
 
         // Process H3 events
         if qconn.h3_conn.is_some() {
-            process_h3(qconn, udp, state, quic_port);
+            process_h3(qconn, udp, state, h3);
         }
 
         // Send any pending QUIC packets
@@ -1515,7 +1548,7 @@ fn drain_udp(
 
 // ── H3 event processing ───────────────────────────────────────────────────────
 
-fn process_h3(qconn: &mut QuicConn, _udp: &UdpSocket, state: &mut ServerState, quic_port: u16) {
+fn process_h3(qconn: &mut QuicConn, _udp: &UdpSocket, state: &mut ServerState, h3_loop: &H3Loop) {
     // client_ip is NOT computed here — deferred to cache-miss path in handle_h3_request.
 
     while let Some(h3) = qconn.h3_conn.as_mut() {
@@ -1538,7 +1571,7 @@ fn process_h3(qconn: &mut QuicConn, _udp: &UdpSocket, state: &mut ServerState, q
                 entry.headers_done = true;
                 if !more_frames {
                     // No body — process immediately
-                    handle_h3_request(stream_id, qconn, state, quic_port);
+                    handle_h3_request(stream_id, qconn, state, h3_loop);
                     // After handle_h3_request qconn may be mutated; restart loop
                     continue;
                 }
@@ -1583,7 +1616,7 @@ fn process_h3(qconn: &mut QuicConn, _udp: &UdpSocket, state: &mut ServerState, q
             Ok((stream_id, quiche::h3::Event::Finished)) => {
                 // Body fully received (or no body) — process
                 if qconn.pending.contains_key(&stream_id) {
-                    handle_h3_request(stream_id, qconn, state, quic_port);
+                    handle_h3_request(stream_id, qconn, state, h3_loop);
                     continue;
                 }
             }
@@ -1606,12 +1639,7 @@ fn process_h3(qconn: &mut QuicConn, _udp: &UdpSocket, state: &mut ServerState, q
 
 // ── Request handling ──────────────────────────────────────────────────────────
 
-fn handle_h3_request(
-    stream_id: u64,
-    qconn: &mut QuicConn,
-    state: &mut ServerState,
-    quic_port: u16,
-) {
+fn handle_h3_request(stream_id: u64, qconn: &mut QuicConn, state: &mut ServerState, h3: &H3Loop) {
     let req = match qconn.pending.remove(&stream_id) {
         Some(r) => r,
         None => return,
@@ -1927,7 +1955,7 @@ fn handle_h3_request(
         set_vary_accept_encoding(&mut headers_with_links, true);
         set_age(&mut headers_with_links, age);
         set_describedby_link(&mut headers_with_links, &state.config.site.describedby);
-        set_alt_svc(&mut headers_with_links, quic_port);
+        set_alt_svc(&mut headers_with_links, h3.quic_port);
         if let (Some(sc), true) = (set_cookie, analytics::is_html_response(&headers_with_links)) {
             headers_with_links.push(("Set-Cookie".to_string(), sc));
         }
@@ -1977,11 +2005,12 @@ fn handle_h3_request(
     };
 
     match handle_request(
-        &http_req, &client_ip, enc_str, state, false, /* from_internal */ false,
+        &http_req, &client_ip, enc_str, state, false, /* from_internal */
+        false, h3.poller,
     ) {
         RequestOutcome::Ready(status, mut resp_headers, body, backend_name) => {
             // Add alt-svc header.
-            set_alt_svc(&mut resp_headers, quic_port);
+            set_alt_svc(&mut resp_headers, h3.quic_port);
 
             let elapsed_ns = start.elapsed().as_nanos() as u64;
             // /health and /perf are separated inside `Stats::record`.
@@ -2251,6 +2280,7 @@ fn handle_request(
     state: &mut ServerState,
     is_prefetch: bool,
     from_internal: bool,
+    poller: &Poller,
 ) -> RequestOutcome {
     let describedby = state.config.site.describedby.clone();
     let mut outcome = handle_request_inner(
@@ -2260,6 +2290,7 @@ fn handle_request(
         state,
         is_prefetch,
         from_internal,
+        poller,
     );
     if let RequestOutcome::Ready(status, ref mut headers, _, ref backend) = outcome {
         let compresses = state.config.backend_compresses(backend);
@@ -2302,6 +2333,7 @@ fn handle_request_inner(
     // rather than a public client. Granted by the listener, never by a header, so a public
     // client cannot claim it. The error-path guard and the metrics gate read it.
     from_internal: bool,
+    poller: &Poller,
 ) -> RequestOutcome {
     // Prefetch requests are synthetic (no real client, client_ip is a
     // placeholder) and their response is discarded by the caller — logging
@@ -2549,7 +2581,7 @@ fn handle_request_inner(
             // backend is itself a URL/H2C/H2S backend — every cache node,
             // whose only backend is the origin — dispatch that fetch async
             // and let it resolve through the normal Pending machinery.
-            if let Some(outcome) = dispatch_custom_error_async(404, req, client_ip, state) {
+            if let Some(outcome) = dispatch_custom_error_async(404, req, client_ip, state, poller) {
                 return outcome;
             }
             let (s, h, b, n) = apply_error_mode(404, req, client_ip, state, None);
@@ -2666,6 +2698,8 @@ fn handle_request_inner(
             client_ip: client_ip.to_string(),
             enc: content_encoding.to_string(),
             backend_name: backend_name.clone(),
+            kind: forward::PendingKind::Url,
+            route_path: None,
             cacheable,
             is_prefetch,
             start: std::time::Instant::now(),
@@ -2715,117 +2749,132 @@ fn handle_request_inner(
                 _tls_config,
             )
         };
-        return RequestOutcome::Pending { rx, ctx };
+        return RequestOutcome::Pending {
+            rx,
+            ctx: Box::new(ctx),
+        };
     }
 
-    // Socket backend — synchronous (local, sub-ms).
+    // Socket backend: a non-blocking upstream driven by the loop. The reply
+    // arrives on the entry's channel and is finished by complete_socket_response
+    // (reached from finalize_url_response), which keeps the socket branch's own
+    // completion semantics.
+    let original_host = origin_host(req, &state.config);
+    let timeout = std::time::Duration::from_secs(state.config.server.backend_timeout_secs);
     let backend_start = std::time::Instant::now();
-    let (status, mut resp_headers, body, conn_err) =
-        match forward_to_backend(req, &backend_name, client_ip, state) {
-            Ok(mut http_resp) => {
-                // `request_permits_storage` is the request half of the
-                // decision (RFC 9111 5.2.1.5): a client that sent
-                // `Cache-Control: no-store` must not have its exchange
-                // retained and replayed to anyone else. Request directives
-                // were not parsed at all before this.
-                // Stamp Date BEFORE the cache decision so the STORED entry
-                // carries it. Applying it after the insert (as Vary is) meant
-                // a cache hit replayed headers with no Date at all, and adding
-                // a fresh one on the hit path would be worse: it would claim
-                // the response was generated just now while the Age header
-                // beside it said sixty seconds. Date is the generation time;
-                // it has to be captured at generation.
-                set_date(&mut http_resp.headers);
-                if cacheable
-                    && request_permits_storage(&req.headers)
-                    && should_cache(http_resp.status, &http_resp.headers)
-                {
-                    let key = CacheKey::new(&req.path, req.query.as_deref(), content_encoding);
-                    state.cache.insert(
-                        key,
-                        CachedResponse {
-                            status: http_resp.status,
-                            // strip_set_cookie: at this point in the socket-
-                            // backend path http_resp.headers is the backend's
-                            // (m6-html/m6-file/render-*) raw response, before
-                            // this request's own analytics Set-Cookie is even
-                            // added — so today this is a defensive no-op here.
-                            // Applied anyway (matching the async URL-backend
-                            // insert below, where it isn't a no-op) so cache
-                            // correctness doesn't depend on which code path a
-                            // future Set-Cookie-emitting backend happens to use.
-                            headers: std::sync::Arc::new(strip_set_cookie(&http_resp.headers)),
-                            body: Bytes::from(http_resp.body.clone()),
-                        },
-                    );
-                }
-                (
-                    http_resp.status,
-                    http_resp.headers,
-                    http_resp.body,
-                    None::<String>,
-                )
-            }
-            Err(e) => {
-                warn!(backend = %backend_name, error = %e, "backend error");
-                (502u16, vec![], vec![], Some(e))
-            }
-        };
 
-    // If the response is an error (4xx/5xx) and not already an error response,
-    // apply the error mode: status, internal, or custom.
-    if status >= 400 {
-        let detail = conn_err.unwrap_or_else(|| format!("{backend_name} returned {status}"));
-        let ctx = error::ErrorContext {
+    let request = match forward::encode_request(req, client_ip, original_host) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(backend = %backend_name, error = %e, "backend error");
+            let err_ctx = error::ErrorContext {
+                route: Some(route.path.clone()),
+                backend: Some(backend_name.clone()),
+                detail: Some(e.to_string()),
+            };
+            let (s, h, b, n) = apply_error_mode(502, req, client_ip, state, Some(&err_ctx));
+            return RequestOutcome::Ready(s, h, b, n);
+        }
+    };
+
+    let (socket_path, member_idx) = match state.pool_manager.get_pool_mut(&backend_name) {
+        Some(pool) => match pool.take_member() {
+            Ok(taken) => taken,
+            Err(pool::PoolError::Empty) => {
+                warn!(backend = %backend_name, "socket pool empty");
+                let err_ctx = error::ErrorContext {
+                    route: Some(route.path.clone()),
+                    backend: Some(backend_name.clone()),
+                    detail: Some("pool empty".to_string()),
+                };
+                let (s, h, b, n) = apply_error_mode(502, req, client_ip, state, Some(&err_ctx));
+                return RequestOutcome::Ready(s, h, b, n);
+            }
+        },
+        None => {
+            warn!(backend = %backend_name, "unknown backend");
+            let err_ctx = error::ErrorContext {
+                route: Some(route.path.clone()),
+                backend: Some(backend_name.clone()),
+                detail: Some(format!("unknown backend: {backend_name}")),
+            };
+            let (s, h, b, n) = apply_error_mode(502, req, client_ip, state, Some(&err_ctx));
+            return RequestOutcome::Ready(s, h, b, n);
+        }
+    };
+
+    let deadline = std::time::Instant::now() + timeout;
+    let upstream = match forward::SocketUpstream::start(socket_path, request, &req.method, deadline)
+    {
+        Ok(u) => u,
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            // The listen backlog is full: the member is alive and busy (E2,
+            // the kernel is the queue). Release the slot without marking it
+            // failed and answer 503.
+            if let Some(pool) = state.pool_manager.get_pool_mut(&backend_name) {
+                pool.cancel(member_idx);
+            }
+            let err_ctx = error::ErrorContext {
+                route: Some(route.path.clone()),
+                backend: Some(backend_name.clone()),
+                detail: Some("backend listen queue full".to_string()),
+            };
+            let (s, mut h, b, n) = apply_error_mode(503, req, client_ip, state, Some(&err_ctx));
+            h.push(("Retry-After".to_string(), "1".to_string()));
+            return RequestOutcome::Ready(s, h, b, n);
+        }
+        Err(e) => {
+            warn!(backend = %backend_name, error = %e, "backend error");
+            if let Some(pool) = state.pool_manager.get_pool_mut(&backend_name) {
+                pool.mark_failed(member_idx);
+            }
+            let err_ctx = error::ErrorContext {
+                route: Some(route.path.clone()),
+                backend: Some(backend_name.clone()),
+                detail: Some(e.to_string()),
+            };
+            let (s, h, b, n) = apply_error_mode(502, req, client_ip, state, Some(&err_ctx));
+            return RequestOutcome::Ready(s, h, b, n);
+        }
+    };
+
+    if let Err(e) = poller.add(upstream.raw_fd(), TOKEN_SOCKET_UPSTREAM) {
+        warn!(backend = %backend_name, error = %e, "registering socket upstream");
+        if let Some(pool) = state.pool_manager.get_pool_mut(&backend_name) {
+            pool.mark_failed(member_idx);
+        }
+        let err_ctx = error::ErrorContext {
             route: Some(route.path.clone()),
             backend: Some(backend_name.clone()),
-            detail: Some(detail),
+            detail: Some(e.to_string()),
         };
-        let (s, mut h, b, n) = apply_error_mode(status, req, client_ip, state, Some(&ctx));
-        // The error page replaces the backend's response wholesale, so the
-        // headers that tell the client what to do next have to be carried over
-        // by hand. Without this, a backend's 429 arrived with no `Retry-After`
-        // and a backend's 401 with no `WWW-Authenticate`. See
-        // `error::PRESERVED_ERROR_HEADERS`.
-        error::preserve_actionable_headers(&resp_headers, &mut h);
-        // This early return must not skip analytics for backend-returned
-        // error statuses. Its async sibling (finalize_url_response)
-        // deliberately logs a backend-returned 4xx/5xx and skips only for a
-        // genuine connection failure, and no different reasoning applies here:
-        // a plain backend 404 belongs in analytics like any other request.
-        let backend_ns = backend_start.elapsed().as_nanos() as u64;
-        analytics::finish_response(
-            analytics_enabled,
-            &mut h,
-            &req.headers,
-            &analytics::Event {
-                node: &state.config.node.name,
-                path: &req.path,
-                status: s,
-                cache_state: "MISS",
-                client_ip,
-                latency_ns: Some(backend_ns),
-            },
-        );
+        let (s, h, b, n) = apply_error_mode(502, req, client_ip, state, Some(&err_ctx));
         return RequestOutcome::Ready(s, h, b, n);
     }
 
-    let backend_ns = backend_start.elapsed().as_nanos() as u64;
-    analytics::finish_response(
-        analytics_enabled,
-        &mut resp_headers,
-        &req.headers,
-        &analytics::Event {
-            node: &state.config.node.name,
-            path: &req.path,
-            status,
-            cache_state: "MISS",
-            client_ip,
-            latency_ns: Some(backend_ns),
-        },
-    );
-
-    RequestOutcome::Ready(status, resp_headers, body, backend_name)
+    let (tx, rx) = std::sync::mpsc::channel();
+    let ctx = forward::PendingUrlContext {
+        req: req.clone(),
+        client_ip: client_ip.to_string(),
+        enc: content_encoding.to_string(),
+        backend_name: backend_name.clone(),
+        kind: forward::PendingKind::Socket,
+        route_path: Some(route.path.clone()),
+        cacheable,
+        is_prefetch,
+        start: backend_start,
+        error_status_override: None,
+    };
+    state.socket_upstreams.push(SocketUpstreamEntry {
+        upstream,
+        member_idx,
+        backend_name,
+        tx,
+    });
+    RequestOutcome::Pending {
+        rx,
+        ctx: Box::new(ctx),
+    }
 }
 
 /// Check the per-IP rate limit ahead of everything else (cache lookup,
@@ -2863,21 +2912,22 @@ fn check_rate_limit(
     ))
 }
 
-/// Try to fetch the configured `[errors] mode = "custom"` error page via an
-/// async URL/H2C/H2S backend dispatch, for cases where `apply_error_mode`'s
-/// synchronous `forward_to_backend` can't reach the error backend (it only
-/// knows how to reach Unix-socket pools; a cache node's only backend is the
-/// origin, an H2C URL backend).
+/// Try to fetch the configured `[errors] mode = "custom"` error page without
+/// blocking the loop: a URL/H2C/H2S backend is dispatched to its own thread or
+/// pool, and a socket backend to a non-blocking `SocketUpstream`, both carrying
+/// `error_status_override` so the completion returns the fetched body under the
+/// original failing status.
 ///
 /// Returns `None` when there's no custom error path configured, the request
-/// already targets it (anti-recursion), or its backend turns out to be an
-/// ordinary socket pool anyway — the caller should fall back to the existing
-/// synchronous `apply_error_mode` in every `None` case.
+/// already targets it (anti-recursion), or the error backend cannot be reached
+/// this way -- the caller should fall back to the existing synchronous
+/// `apply_error_mode` in every `None` case.
 fn dispatch_custom_error_async(
     status: u16,
     req: &forward::HttpRequest,
     client_ip: &str,
     state: &mut ServerState,
+    poller: &Poller,
 ) -> Option<RequestOutcome> {
     let error_path = match &state.error_mode {
         ErrorMode::Custom { path } => path.clone(),
@@ -2929,9 +2979,6 @@ fn dispatch_custom_error_async(
     }
 
     let backend_name = state.route_table.at(&error_path)?.backend.clone();
-    let (url, tls_config, _) = state.pool_manager.get_url_info(&backend_name)?;
-    let url = url.to_string();
-
     let original_host = origin_host(req, &state.config);
     let timeout = std::time::Duration::from_secs(state.config.server.backend_timeout_secs);
 
@@ -2945,40 +2992,103 @@ fn dispatch_custom_error_async(
         body: vec![],
     };
 
+    // URL backend: dispatch to its thread or pool, as before.
+    if let Some((url, tls_config, _)) = state.pool_manager.get_url_info(&backend_name) {
+        let url = url.to_string();
+        let ctx = forward::PendingUrlContext {
+            req: req.clone(),
+            client_ip: client_ip.to_string(),
+            enc: String::new(),
+            backend_name: backend_name.clone(),
+            kind: forward::PendingKind::Url,
+            route_path: None,
+            cacheable: false,
+            // A custom-error-page fetch on behalf of a real client, so it is not a
+            // background prefetch and its analytics line must still be written.
+            is_prefetch: false,
+            start: std::time::Instant::now(),
+            error_status_override: Some(status),
+        };
+        let rx = if url.starts_with("h2c://") {
+            state
+                .h2c_pool
+                .dispatch(&url, &error_req, client_ip, original_host)
+                .ok()?
+        } else if url.starts_with("h2s://") {
+            state
+                .h2s_pool
+                .dispatch(&url, &error_req, client_ip, original_host, tls_config)
+                .ok()?
+        } else {
+            forward::dispatch_url_request(
+                url,
+                error_req,
+                client_ip.to_string(),
+                original_host.to_string(),
+                Some(timeout),
+                tls_config,
+            )
+        };
+        return Some(RequestOutcome::Pending {
+            rx,
+            ctx: Box::new(ctx),
+        });
+    }
+
+    // Socket backend: a non-blocking upstream, the same way the socket branch
+    // reaches a normal route. Any failure falls back to the synchronous
+    // `apply_error_mode`, which handles it identically.
+    let request = forward::encode_request(&error_req, client_ip, original_host).ok()?;
+    let (upstream, member_idx) = {
+        let pool = state.pool_manager.get_pool_mut(&backend_name)?;
+        let (socket_path, member_idx) = pool.take_member().ok()?;
+        let deadline = std::time::Instant::now() + timeout;
+        match forward::SocketUpstream::start(socket_path, request, "GET", deadline) {
+            Ok(u) => (u, member_idx),
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::WouldBlock {
+                    pool.cancel(member_idx);
+                } else {
+                    pool.mark_failed(member_idx);
+                }
+                return None;
+            }
+        }
+    };
+
+    if poller
+        .add(upstream.raw_fd(), TOKEN_SOCKET_UPSTREAM)
+        .is_err()
+    {
+        if let Some(pool) = state.pool_manager.get_pool_mut(&backend_name) {
+            pool.mark_failed(member_idx);
+        }
+        return None;
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel();
     let ctx = forward::PendingUrlContext {
         req: req.clone(),
         client_ip: client_ip.to_string(),
         enc: String::new(),
         backend_name: backend_name.clone(),
+        kind: forward::PendingKind::Socket,
+        route_path: None,
         cacheable: false,
-        // A custom-error-page fetch on behalf of a real client, so it is not a
-        // background prefetch and its analytics line must still be written.
         is_prefetch: false,
         start: std::time::Instant::now(),
         error_status_override: Some(status),
     };
-
-    let rx = if url.starts_with("h2c://") {
-        state
-            .h2c_pool
-            .dispatch(&url, &error_req, client_ip, original_host)
-            .ok()?
-    } else if url.starts_with("h2s://") {
-        state
-            .h2s_pool
-            .dispatch(&url, &error_req, client_ip, original_host, tls_config)
-            .ok()?
-    } else {
-        forward::dispatch_url_request(
-            url,
-            error_req,
-            client_ip.to_string(),
-            original_host.to_string(),
-            Some(timeout),
-            tls_config,
-        )
-    };
-    Some(RequestOutcome::Pending { rx, ctx })
+    state.socket_upstreams.push(SocketUpstreamEntry {
+        upstream,
+        member_idx,
+        backend_name,
+        tx,
+    });
+    Some(RequestOutcome::Pending {
+        rx,
+        ctx: Box::new(ctx),
+    })
 }
 
 /// RFC 9110 11.6.1: a 401 names the authentication scheme that would pass.
@@ -3124,10 +3234,10 @@ fn forward_to_backend(
     let timeout = std::time::Duration::from_secs(state.config.server.backend_timeout_secs);
 
     if let Some(pool) = state.pool_manager.get_pool_mut(backend_name) {
-        match pool.pick_socket() {
+        match pool.take_member() {
             Ok((socket_path, member_idx)) => {
                 match forward::forward_request_timeout(
-                    &socket_path,
+                    socket_path,
                     req,
                     client_ip,
                     original_host,
@@ -3150,10 +3260,54 @@ fn forward_to_backend(
                 }
             }
             Err(pool::PoolError::Empty) => Err("pool empty".to_string()),
-            Err(pool::PoolError::ConnectFailed(e)) => Err(e.to_string()),
         }
     } else {
         Err(format!("unknown backend: {}", backend_name))
+    }
+}
+
+/// Drive every in-flight socket upstream once. A finished or expired entry
+/// leaves the poller, its result goes on the entry's channel (where the waiting
+/// h1, h2 or h3 connection collects it in the same iteration), and the pool
+/// member is released or marked failed.
+fn drive_socket_upstreams(state: &mut ServerState, poller: &Poller) {
+    let now = std::time::Instant::now();
+    let mut idx = 0;
+    while idx < state.socket_upstreams.len() {
+        let outcome = {
+            let entry = &mut state.socket_upstreams[idx];
+            match entry.upstream.drive() {
+                Some(result) => {
+                    poller.delete(entry.upstream.raw_fd()).ok();
+                    Some(result)
+                }
+                None if entry.upstream.expired(now) => {
+                    poller.delete(entry.upstream.raw_fd()).ok();
+                    Some(Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "backend timed out",
+                    )))
+                }
+                None => None,
+            }
+        };
+
+        let Some(result) = outcome else {
+            idx += 1;
+            continue;
+        };
+
+        // A refusal cannot reach here: encode_request refused the request
+        // before the upstream was created. Any error is a transport failure.
+        let entry = state.socket_upstreams.remove(idx);
+        if let Some(pool) = state.pool_manager.get_pool_mut(&entry.backend_name) {
+            if result.is_err() {
+                pool.mark_failed(entry.member_idx);
+            } else {
+                pool.release(entry.member_idx);
+            }
+        }
+        let _ = entry.tx.send(result);
     }
 }
 
@@ -3404,14 +3558,179 @@ fn set_describedby_link(headers: &mut Vec<(String, String)>, target: &str) {
     ));
 }
 
-/// Called when a URL-backend I/O thread returns its result.  Handles cache
-/// insertion, alt-svc injection, and error mode application.
+/// Finish a socket-backend reply with the socket branch's own completion
+/// semantics: cache insert, error mode for any status >= 400 (with actionable
+/// headers preserved), and `finish_response` analytics. This is the body of the
+/// old synchronous socket branch, moved here so a reply the loop drove follows
+/// the identical path.
+fn complete_socket_response(
+    result: std::io::Result<forward::HttpResponse>,
+    ctx: &forward::PendingUrlContext,
+    state: &mut ServerState,
+) -> FinalizedResponse {
+    let req = &ctx.req;
+    let backend_name = &ctx.backend_name;
+    let content_encoding = &ctx.enc;
+    let analytics_enabled = state.config.analytics.enabled && !ctx.is_prefetch;
+
+    // A custom-error-page fetch on a socket backend: the fetched body returns
+    // under the ORIGINAL failing status, is held for reuse, and is never
+    // cached. Mirrors finalize_url_response_inner's override branch, but uses
+    // finish_response: a socket backend never sets _m6sid itself.
+    if let Some(original_status) = ctx.error_status_override {
+        let latency_ns = ctx.start.elapsed().as_nanos() as u64;
+        return match result {
+            Ok(http_resp) => {
+                let mut headers = http_resp.headers;
+                state.error_pages.insert(
+                    original_status,
+                    (
+                        std::time::Instant::now(),
+                        headers.clone(),
+                        http_resp.body.clone(),
+                    ),
+                );
+                analytics::finish_response(
+                    analytics_enabled,
+                    &mut headers,
+                    &req.headers,
+                    &analytics::Event {
+                        node: &state.config.node.name,
+                        path: &req.path,
+                        status: original_status,
+                        cache_state: "MISS",
+                        client_ip: &ctx.client_ip,
+                        latency_ns: Some(latency_ns),
+                    },
+                );
+                (
+                    original_status,
+                    headers,
+                    http_resp.body,
+                    "error".to_string(),
+                )
+            }
+            Err(e) => {
+                warn!(backend = %ctx.backend_name, error = %e, "custom error page fetch failed (socket), falling back to internal");
+                let reason = error::status_reason(original_status);
+                let body = error::internal_error_html(
+                    original_status,
+                    reason,
+                    state.config.errors.verbose_fallback,
+                    &req.path,
+                    None,
+                );
+                let mut headers = vec![(
+                    "Content-Type".to_string(),
+                    "text/html; charset=utf-8".to_string(),
+                )];
+                analytics::finish_response(
+                    analytics_enabled,
+                    &mut headers,
+                    &req.headers,
+                    &analytics::Event {
+                        node: &state.config.node.name,
+                        path: &req.path,
+                        status: original_status,
+                        cache_state: "MISS",
+                        client_ip: &ctx.client_ip,
+                        latency_ns: Some(latency_ns),
+                    },
+                );
+                (original_status, headers, body, "error".to_string())
+            }
+        };
+    }
+
+    let (status, mut resp_headers, body, conn_err) = match result {
+        Ok(mut http_resp) => {
+            // Stamp Date BEFORE the cache decision so the stored entry carries
+            // the generation time.
+            set_date(&mut http_resp.headers);
+            if ctx.cacheable
+                && request_permits_storage(&req.headers)
+                && should_cache(http_resp.status, &http_resp.headers)
+            {
+                let key = CacheKey::new(&req.path, req.query.as_deref(), content_encoding);
+                state.cache.insert(
+                    key,
+                    CachedResponse {
+                        status: http_resp.status,
+                        headers: std::sync::Arc::new(strip_set_cookie(&http_resp.headers)),
+                        body: Bytes::from(http_resp.body.clone()),
+                    },
+                );
+            }
+            (
+                http_resp.status,
+                http_resp.headers,
+                http_resp.body,
+                None::<String>,
+            )
+        }
+        Err(e) => {
+            warn!(backend = %backend_name, error = %e, "backend error");
+            (502u16, vec![], vec![], Some(e.to_string()))
+        }
+    };
+
+    // If the response is an error (4xx/5xx), apply the error mode. The error
+    // page replaces the backend's response wholesale, so the actionable headers
+    // carry over by hand (a backend's 429 keeps its Retry-After, a 401 its
+    // WWW-Authenticate).
+    if status >= 400 {
+        let detail = conn_err.unwrap_or_else(|| format!("{backend_name} returned {status}"));
+        let err_ctx = error::ErrorContext {
+            route: ctx.route_path.clone(),
+            backend: Some(backend_name.clone()),
+            detail: Some(detail),
+        };
+        let (s, mut h, b, n) = apply_error_mode(status, req, &ctx.client_ip, state, Some(&err_ctx));
+        error::preserve_actionable_headers(&resp_headers, &mut h);
+        let backend_ns = ctx.start.elapsed().as_nanos() as u64;
+        analytics::finish_response(
+            analytics_enabled,
+            &mut h,
+            &req.headers,
+            &analytics::Event {
+                node: &state.config.node.name,
+                path: &req.path,
+                status: s,
+                cache_state: "MISS",
+                client_ip: &ctx.client_ip,
+                latency_ns: Some(backend_ns),
+            },
+        );
+        return (s, h, b, n);
+    }
+
+    let backend_ns = ctx.start.elapsed().as_nanos() as u64;
+    analytics::finish_response(
+        analytics_enabled,
+        &mut resp_headers,
+        &req.headers,
+        &analytics::Event {
+            node: &state.config.node.name,
+            path: &req.path,
+            status,
+            cache_state: "MISS",
+            client_ip: &ctx.client_ip,
+            latency_ns: Some(backend_ns),
+        },
+    );
+
+    (status, resp_headers, body, backend_name.clone())
+}
+
+/// Called when a pending backend reply arrives, whether from a URL-backend
+/// thread or a socket upstream the loop drove. Handles cache insertion, alt-svc
+/// injection, and error mode application.
 ///
 /// Wrapped for the same reason as `handle_request`: this is the async
 /// completion path, so it never passes through that wrapper, and a response
-/// forwarded from a URL backend needs `Vary: Accept-Encoding` exactly as much
-/// as a synchronous one. Applied after the inner call so `should_cache` still
-/// sees the backend's own `Vary`.
+/// forwarded from a backend needs `Vary: Accept-Encoding` exactly as much as a
+/// synchronous one. Applied after the inner call so `should_cache` still sees
+/// the backend's own `Vary`.
 fn finalize_url_response(
     http_result: std::io::Result<forward::HttpResponse>,
     ctx: &forward::PendingUrlContext,
@@ -3419,7 +3738,11 @@ fn finalize_url_response(
     state: &mut ServerState,
 ) -> FinalizedResponse {
     let describedby = state.config.site.describedby.clone();
-    let mut r = finalize_url_response_inner(http_result, ctx, quic_port, state);
+    let mut r = if ctx.kind == forward::PendingKind::Socket {
+        complete_socket_response(http_result, ctx, state)
+    } else {
+        finalize_url_response_inner(http_result, ctx, quic_port, state)
+    };
     let compresses = state.config.backend_compresses(&r.3);
     set_vary_accept_encoding(&mut r.1, compresses);
     set_date(&mut r.1);
@@ -4095,6 +4418,7 @@ fn run(args: Vec<String>) -> i32 {
         stats: Stats::new(),
         prefetch_queue: std::collections::VecDeque::new(),
         background_pending: Vec::new(),
+        socket_upstreams: Vec::new(),
         h2c_pool: H2cClientPool::new(),
         h2s_pool: H2sTlsClientPool::new(),
         tls_iface,
