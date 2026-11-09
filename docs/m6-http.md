@@ -220,7 +220,7 @@ A reload that fails keeps the running config and logs `config reload: failed, ke
 A system config change still reloads TLS when `site.toml` is mid-edit and fails to load, so a broken `site.toml` does not hold a renewal back.
 
 Some keys are read once, when the listeners bind or the analytics log opens.
-They are `[server]` `bind`, `h2c_bind`, `internal_binds`, `internal_peers`, `redirect_bind` and `warm_on_start`, and `[analytics]` `enabled` and `log_path`.
+They are `[server]` `bind`, `h2c_bind`, `internal_binds`, `internal_peers`, `redirect_bind`, `warm_on_start` and `max_requests_per_connection`, and `[analytics]` `enabled` and `log_path`.
 A change to one keeps the running value and logs `config reload: [server].bind changed; restart m6-http to apply it`, naming the key.
 
 ### Renewing a certificate
