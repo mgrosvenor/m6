@@ -90,7 +90,7 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md).
                          │  - Response cache (path × encoding)          │
                          │  - JWT auth enforcement (local verify)       │
                          │  - Backend pool management (least-conn)      │
-                         │  - Config, certs and pools at start      │
+                         │  - Config, certs and pools at start          │
                          └────┬──────────────┬──────────────┬───────────┘
                               │              │              │
                     Unix socket         Unix socket     URL backend
@@ -448,10 +448,12 @@ public_key = "/run/m6/auth.pub"
 ## Process Management
 
 Each process is started and supervised on its own by the service manager,
-systemd on the production target. Start them in any order: m6-http takes a
-backend into its pool when the socket appears and drops it when the socket
-goes, whether that is a first start, a restart, or a new instance added for
-scale. None of that needs a config change or a restart of m6-http.
+systemd on the production target. Backends must start before m6-http (in
+systemd, `After=` and `Wants=` on the backend units in m6-http's unit),
+because m6-http reads each pool's sockets once at start and a pool whose glob
+matches no socket exits 2. A backend that restarts on the same socket path
+serves again on its next connect, and a new instance joins its pool when
+m6-http restarts.
 
 ```bash
 # Development (shell script, see m6-examples/m6-run-eg)

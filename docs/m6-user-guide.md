@@ -1741,7 +1741,7 @@ cd examples/09-global-deployment
 The origin serves the Example 07 site and answers the public domain.
 Each cache node runs only m6-http, pointing at the origin over the mesh, and caches responses independently.
 `setup-origin.sh` provisions the origin and `setup-cache-node.sh` provisions a cache node, both writing a system config, the WireGuard interface and the systemd unit.
-`deploy.sh` syncs content to the origin and, with `--all --invalidate`, to the cache nodes, then restarts m6-http on each node to flush its cache.
+`deploy.sh` syncs content to the origin and, with `--all --invalidate`, to the cache nodes, then touches `site.toml` on each node.
 
 The example uses its own node names and addresses, held in `deploy.toml`, which is a local file never committed.
 The configs under `configs/` and the `wireguard/` files are the node-specific settings.
@@ -1875,8 +1875,8 @@ Take from it that the first twelve manage the dashboard tabs, and the last five 
 | `GET` | `/api/admin/logs` | Last N log lines |
 | `GET` | `/api/admin/config` | site.toml as a JSON object |
 | `PUT` | `/api/admin/config` | Write site.toml from a JSON object |
-| `POST` | `/api/admin/config/touch` | Restart m6-http to apply a change |
-| `POST` | `/api/admin/cache/flush` | Restart m6-http to flush the cache |
+| `POST` | `/api/admin/config/touch` | Touch site.toml |
+| `POST` | `/api/admin/cache/flush` | Alias for config touch |
 | `POST` | `/api/admin/services/{name}/restart` | Send SIGTERM to a service via its PID file |
 | `GET` | `/api/admin/backends` | Backend topology and the system config bind |
 | `GET` | `/api/admin/backends/{name}/sample` | One backend's stats over the sample window |

@@ -117,7 +117,7 @@ Section 3 lists the modules those features compile.
 ## 3. Component index
 
 Thirty-seven component modules, five of them behind features, grouped by the task that sends a reader to one.
-The prelude in section 1 is the thirty-ninth `pub mod` in `lib.rs`, and it re-exports the items the other modules implement.
+The prelude in section 1 is the thirty-eighth `pub mod` in `lib.rs`, and it re-exports the items the other modules implement.
 Table 3 is the index, and it uses six abbreviations: *HTTP* (Hypertext Transfer Protocol), *RFC* (Request for Comments), *TCP* (Transmission Control Protocol), *JSON* (JavaScript Object Notation), *UTC* (Coordinated Universal Time) and *CSPRNG* (cryptographically secure pseudorandom number generator).
 
 | group | module | what it is |
