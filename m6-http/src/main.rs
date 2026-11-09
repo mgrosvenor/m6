@@ -3281,35 +3281,32 @@ fn drive_socket_upstreams(state: &mut ServerState, poller: &Poller) {
             match entry.upstream.drive() {
                 Some(result) => {
                     poller.delete(entry.upstream.raw_fd()).ok();
-                    Some((result, false))
+                    Some(result)
                 }
                 None if entry.upstream.expired(now) => {
                     poller.delete(entry.upstream.raw_fd()).ok();
-                    Some((
-                        Err(std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            "backend timed out",
-                        )),
-                        true,
-                    ))
+                    Some(Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "backend timed out",
+                    )))
                 }
                 None => None,
             }
         };
 
-        let Some((result, timed_out)) = outcome else {
+        let Some(result) = outcome else {
             idx += 1;
             continue;
         };
 
         let entry = state.socket_upstreams.remove(idx);
         if let Some(pool) = state.pool_manager.get_pool_mut(&entry.backend_name) {
-            if timed_out {
-                // A silent member is unhealthy: back it off.
+            // A reply (including a 4xx rejection the backend wrote before it
+            // reset) releases the member; a reset, close or malformed reply
+            // with no usable answer is a failure and backs the member off.
+            if result.is_err() {
                 pool.mark_failed(entry.member_idx);
             } else {
-                // A member that answered, or that reset or closed in answer to
-                // a request it rejected, is healthy: keep it in rotation.
                 pool.release(entry.member_idx);
             }
         }
