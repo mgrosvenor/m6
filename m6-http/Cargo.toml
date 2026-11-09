@@ -117,6 +117,9 @@ rustls-native-certs = "0.8"
 webpki-roots   = "0.26"
 rand           = "0.8"
 httpdate       = "1"
+# Non-blocking socket connect for the socket-backend upstreams. The same
+# version m6-core already uses, so Cargo.lock gains no new crate.
+socket2        = "0.6"
 
 [dev-dependencies]
 m6-core       = { path = "../m6-core", default-features = false, features = ["testkit"] }

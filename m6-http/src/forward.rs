@@ -1,7 +1,10 @@
-/// HTTP/1.1 request forwarding over Unix sockets (synchronous blocking I/O).
+/// HTTP/1.1 request forwarding over Unix sockets (synchronous blocking I/O),
+/// plus the non-blocking `SocketUpstream` the event loop drives.
 use std::io::{self, Read, Write};
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::time::Instant;
 
 /// Hop-by-hop headers to remove before forwarding.
 pub const HOP_BY_HOP: &[&str] = &[
@@ -457,17 +460,15 @@ pub fn forward_request(
     forward_request_timeout(socket_path, req, client_ip, original_host, None)
 }
 
-/// Like `forward_request` but with a configurable timeout for the total
-/// backend call (connect + write + read). A `TimedOut` error is returned if
-/// the backend does not respond within the deadline.
-#[expect(clippy::disallowed_methods, reason = "test and tooling path only")]
-pub fn forward_request_timeout(
-    socket_path: &Path,
+/// Build the exact HTTP/1.1 request bytes a socket backend receives, refusing
+/// (before any connection) a request that cannot be serialised safely. Shared
+/// by the blocking `forward_request_timeout` and the non-blocking
+/// `SocketUpstream`, so the two write identical bytes.
+pub fn encode_request(
     req: &HttpRequest,
     client_ip: &str,
     original_host: &str,
-    timeout: Option<std::time::Duration>,
-) -> io::Result<HttpResponse> {
+) -> io::Result<Vec<u8>> {
     // Before the connection, not after: a request that cannot be safely
     // serialised must never reach a backend socket at all.
     if let Err(what) = check_forwardable(req, client_ip, original_host) {
@@ -479,14 +480,6 @@ pub fn forward_request_timeout(
         ));
     }
 
-    let mut stream = UnixStream::connect(socket_path)?;
-
-    if let Some(dur) = timeout {
-        stream.set_read_timeout(Some(dur))?;
-        stream.set_write_timeout(Some(dur))?;
-    }
-
-    // Build request bytes
     let mut buf = Vec::with_capacity(8192);
 
     // Write request line
@@ -544,6 +537,29 @@ pub fn forward_request_timeout(
     // Write body
     if !req.body.is_empty() {
         buf.extend_from_slice(&req.body);
+    }
+
+    Ok(buf)
+}
+
+/// Like `forward_request` but with a configurable timeout for the total
+/// backend call (connect + write + read). A `TimedOut` error is returned if
+/// the backend does not respond within the deadline.
+#[expect(clippy::disallowed_methods, reason = "test and tooling path only")]
+pub fn forward_request_timeout(
+    socket_path: &Path,
+    req: &HttpRequest,
+    client_ip: &str,
+    original_host: &str,
+    timeout: Option<std::time::Duration>,
+) -> io::Result<HttpResponse> {
+    let buf = encode_request(req, client_ip, original_host)?;
+
+    let mut stream = UnixStream::connect(socket_path)?;
+
+    if let Some(dur) = timeout {
+        stream.set_read_timeout(Some(dur))?;
+        stream.set_write_timeout(Some(dur))?;
     }
 
     // A backend is allowed to answer before it has read the whole request
@@ -652,6 +668,132 @@ pub fn read_response<R: Read>(reader: R) -> io::Result<HttpResponse> {
     read_response_for(reader, "GET")
 }
 
+/// A response body's framing, decided once from its header section.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Framing {
+    /// No body: a HEAD request, or status 101, 204 or 304.
+    Bodyless,
+    /// `Content-Length: N`.
+    ContentLength(usize),
+    /// `Transfer-Encoding: chunked`.
+    Chunked,
+    /// No framing: read to end of stream.
+    CloseDelimited,
+}
+
+/// A parsed header section and its body framing.
+struct ParsedHead {
+    headers: Vec<(String, String)>,
+    framing: Framing,
+}
+
+/// Parse a complete header section (status line already consumed) and decide
+/// the body framing. Enforces the same rules `read_response_for` has always
+/// enforced, in one place, so the incremental `SocketUpstream` reader and the
+/// blocking reader cannot disagree about where a response ends.
+fn parse_head(head: &str, status: u16, method: &str) -> io::Result<ParsedHead> {
+    let after_status_line = head.split_once("\r\n").map_or("", |(_, rest)| rest);
+    let lines = after_status_line.split("\r\n");
+
+    let mut headers: Vec<(String, String)> = Vec::with_capacity(16);
+    let mut content_length: Option<usize> = None;
+    let mut te_present = false;
+    let mut chunked = false;
+
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        if let Some(colon) = line.find(':') {
+            let name = line[..colon].trim();
+            let value = line[colon + 1..].trim();
+            if name.eq_ignore_ascii_case("content-length") {
+                // A single field may itself carry a comma-separated list, and
+                // the field may repeat. Every value present must agree; if any
+                // differ the framing is ambiguous and the message is refused
+                // rather than resolved by position (F028).
+                for part in value.split(',') {
+                    let part = part.trim();
+                    // `1*DIGIT` (RFC 9110 8.6), checked explicitly rather than
+                    // left to `str::parse`, which accepts a leading `+` -- so
+                    // `Content-Length: +5` was quietly read as 5.
+                    if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("backend sent an invalid Content-Length: {part:?}"),
+                        ));
+                    }
+                    let parsed: usize = part.parse().map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("backend sent an out-of-range Content-Length: {part:?}"),
+                        )
+                    })?;
+                    match content_length {
+                        Some(prev) if prev != parsed => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "backend sent conflicting Content-Length values \
+                                     ({prev} and {parsed}); refusing to guess the framing"
+                                ),
+                            ));
+                        }
+                        _ => content_length = Some(parsed),
+                    }
+                }
+            }
+            if name.eq_ignore_ascii_case("transfer-encoding") {
+                te_present = true;
+                // A list; only the FINAL coding decides the framing
+                // (RFC 9112 6.1). `gzip, chunked` is chunked.
+                if let Some(last) = value.split(',').next_back() {
+                    if last.trim().eq_ignore_ascii_case("chunked") {
+                        chunked = true;
+                    }
+                }
+            }
+            headers.push((name.to_owned(), value.to_owned()));
+        }
+    }
+
+    // Both present: RFC 9112 6.1 forbids sending them together, and a
+    // recipient that picks one is the classic smuggling primitive (F029).
+    if te_present && content_length.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "backend sent both Transfer-Encoding and Content-Length; refusing to guess the framing",
+        ));
+    }
+
+    // Transfer-Encoding present but not ending in `chunked`: the message has no
+    // self-delimiting framing at all (RFC 9112 6.1).
+    if te_present && !chunked {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "backend sent a Transfer-Encoding not ending in chunked; response is unframed",
+        ));
+    }
+
+    // RFC 9112 6.3 rule 1: these responses never have a body, whatever their
+    // headers claim. Checked before any body read, so a HEAD does not block
+    // waiting for bytes a correct backend will never send (F035).
+    let bodyless =
+        method.eq_ignore_ascii_case("HEAD") || status == 204 || status == 304 || status == 101;
+
+    let framing = if bodyless {
+        Framing::Bodyless
+    } else if chunked {
+        Framing::Chunked
+    } else if let Some(len) = content_length {
+        Framing::ContentLength(len)
+    } else {
+        Framing::CloseDelimited
+    };
+
+    Ok(ParsedHead { headers, framing })
+}
+
 /// Read an HTTP/1.1 response, framing it according to RFC 9112 6.3.
 ///
 /// Message framing is the security boundary between this proxy and its
@@ -742,107 +884,13 @@ pub fn read_response_for<R: Read>(mut reader: R, request_method: &str) -> io::Re
 
     let header_section = std::str::from_utf8(&header_buf[..header_end])
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "response headers not UTF-8"))?;
-    let after_status_line = header_section
-        .split_once("\r\n")
-        .map_or("", |(_, rest)| rest);
-    let lines = after_status_line.split("\r\n");
+    let parsed = parse_head(header_section, status, request_method)?;
 
-    let mut headers: Vec<(String, String)> = Vec::with_capacity(16);
-    let mut content_length: Option<usize> = None;
-    let mut te_present = false;
-    let mut chunked = false;
-
-    for line in lines {
-        if line.is_empty() {
-            break;
-        }
-        if let Some(colon) = line.find(':') {
-            let name = line[..colon].trim();
-            let value = line[colon + 1..].trim();
-            if name.eq_ignore_ascii_case("content-length") {
-                // A single field may itself carry a comma-separated list, and
-                // the field may repeat. Every value present must agree; if any
-                // differ the framing is ambiguous and the message is refused
-                // rather than resolved by position (F028).
-                for part in value.split(',') {
-                    let part = part.trim();
-                    // `1*DIGIT` (RFC 9110 8.6), checked explicitly rather than
-                    // left to `str::parse`, which accepts a leading `+` -- so
-                    // `Content-Length: +5` was quietly read as 5. A hop that
-                    // rejects it while this one accepts it is a framing
-                    // disagreement, which is the whole hazard here.
-                    if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("backend sent an invalid Content-Length: {part:?}"),
-                        ));
-                    }
-                    let parsed: usize = part.parse().map_err(|_| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("backend sent an out-of-range Content-Length: {part:?}"),
-                        )
-                    })?;
-                    match content_length {
-                        Some(prev) if prev != parsed => {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!(
-                                    "backend sent conflicting Content-Length values \
-                                     ({prev} and {parsed}); refusing to guess the framing"
-                                ),
-                            ));
-                        }
-                        _ => content_length = Some(parsed),
-                    }
-                }
-            }
-            if name.eq_ignore_ascii_case("transfer-encoding") {
-                te_present = true;
-                // A list; only the FINAL coding decides the framing
-                // (RFC 9112 6.1). `gzip, chunked` is chunked.
-                if let Some(last) = value.split(',').next_back() {
-                    if last.trim().eq_ignore_ascii_case("chunked") {
-                        chunked = true;
-                    }
-                }
-            }
-            headers.push((name.to_owned(), value.to_owned()));
-        }
-    }
-
-    // Both present: RFC 9112 6.1 forbids sending them together, and a
-    // recipient that picks one is the classic smuggling primitive -- the next
-    // hop may pick the other (F029).
-    if te_present && content_length.is_some() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "backend sent both Transfer-Encoding and Content-Length; refusing to guess the framing",
-        ));
-    }
-
-    // Transfer-Encoding present but not ending in `chunked`: the message has no
-    // self-delimiting framing at all. RFC 9112 6.1 says a server MUST NOT do
-    // this; treating it as read-to-EOF would leave the connection unusable.
-    if te_present && !chunked {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "backend sent a Transfer-Encoding not ending in chunked; response is unframed",
-        ));
-    }
-
-    // RFC 9112 6.3 rule 1: these responses never have a body, whatever their
-    // headers claim. Checked before any body read, so a HEAD does not block
-    // waiting for bytes a correct backend will never send (F035).
-    let bodyless = request_method.eq_ignore_ascii_case("HEAD")
-        || status == 204
-        || status == 304
-        || status == 101;
-    if bodyless {
+    if parsed.framing == Framing::Bodyless {
         return Ok(HttpResponse {
             status,
             reason,
-            headers,
+            headers: parsed.headers,
             body: Vec::new(),
         });
     }
@@ -850,47 +898,51 @@ pub fn read_response_for<R: Read>(mut reader: R, request_method: &str) -> io::Re
     // Body bytes that arrived in the same read as the headers — borrow from stack buffer.
     let body_prefix = &header_buf[header_end + 4..n_total];
 
-    let body = if chunked {
-        read_chunked_body(&mut reader, body_prefix.to_vec())?
-    } else if let Some(len) = content_length {
-        // Refuse before allocating, not after: the whole point is that the
-        // allocation is the damage.
-        if len > MAX_BACKEND_BODY {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "backend declared Content-Length {len}, above the {MAX_BACKEND_BODY} limit"
-                ),
-            ));
+    let body = match parsed.framing {
+        Framing::Chunked => read_chunked_body(&mut reader, body_prefix.to_vec())?,
+        Framing::ContentLength(len) => {
+            // Refuse before allocating, not after: the whole point is that the
+            // allocation is the damage.
+            if len > MAX_BACKEND_BODY {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "backend declared Content-Length {len}, above the {MAX_BACKEND_BODY} limit"
+                    ),
+                ));
+            }
+            let mut body = vec![0u8; len];
+            let already = body_prefix.len().min(len);
+            body[..already].copy_from_slice(&body_prefix[..already]);
+            if already < len {
+                reader.read_exact(&mut body[already..])?;
+            }
+            body
         }
-        let mut body = vec![0u8; len];
-        let already = body_prefix.len().min(len);
-        body[..already].copy_from_slice(&body_prefix[..already]);
-        if already < len {
-            reader.read_exact(&mut body[already..])?;
+        Framing::CloseDelimited => {
+            // No declared length: read to EOF, but bounded. `take` caps it without
+            // needing to know the size in advance.
+            let mut body = body_prefix.to_vec();
+            let remaining = MAX_BACKEND_BODY.saturating_sub(body.len());
+            let read =
+                std::io::Read::take(&mut reader, remaining as u64 + 1).read_to_end(&mut body)?;
+            let _ = read;
+            if body.len() > MAX_BACKEND_BODY {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("backend response body exceeded the {MAX_BACKEND_BODY} limit"),
+                ));
+            }
+            body
         }
-        body
-    } else {
-        // No declared length: read to EOF, but bounded. `take` caps it without
-        // needing to know the size in advance.
-        let mut body = body_prefix.to_vec();
-        let remaining = MAX_BACKEND_BODY.saturating_sub(body.len());
-        let read = std::io::Read::take(&mut reader, remaining as u64 + 1).read_to_end(&mut body)?;
-        let _ = read;
-        if body.len() > MAX_BACKEND_BODY {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("backend response body exceeded the {MAX_BACKEND_BODY} limit"),
-            ));
-        }
-        body
+        Framing::Bodyless => unreachable!("handled above"),
     };
 
     Ok(HttpResponse {
         status,
         reason,
         body,
-        headers,
+        headers: parsed.headers,
     })
 }
 
@@ -1041,6 +1093,206 @@ fn find_crlf(buf: &[u8]) -> Option<usize> {
     buf.windows(2).position(|w| w == b"\r\n")
 }
 
+/// Find the final response header end and framing in a growing buffer, skipping
+/// up to [`MAX_INFORMATIONAL`] 1xx responses. Returns `None` when the buffer
+/// does not yet hold the complete final header section, so the caller must
+/// read more.
+fn locate_final_head(buf: &[u8], method: &str) -> io::Result<Option<(usize, Framing)>> {
+    let mut offset = 0usize;
+    let mut informational = 0usize;
+    loop {
+        let Some(rel_end) = find_header_end(&buf[offset..]) else {
+            return Ok(None);
+        };
+        let header_end = offset + rel_end;
+        let head = &buf[offset..header_end];
+        let line_end = head
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .unwrap_or(head.len());
+        let status_line = std::str::from_utf8(&head[..line_end]).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "response headers not UTF-8")
+        })?;
+        let (status, _reason) = parse_status_line(status_line)?;
+
+        if is_skipped_informational(status) {
+            informational += 1;
+            if informational > MAX_INFORMATIONAL {
+                return Err(too_many_informational());
+            }
+            offset = header_end + 4;
+            continue;
+        }
+
+        let header_section = std::str::from_utf8(head).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "response headers not UTF-8")
+        })?;
+        let parsed = parse_head(header_section, status, method)?;
+        return Ok(Some((header_end, parsed.framing)));
+    }
+}
+
+/// One non-blocking HTTP/1.1 request to a Unix-socket backend, driven step by
+/// step by the event loop. This is the interim form approved for EL-1: EL-4
+/// replaces it with the shared `client::Upstream` incremental parser.
+pub struct SocketUpstream {
+    stream: UnixStream,
+    request: Vec<u8>,
+    write_offset: usize,
+    read_buf: Vec<u8>,
+    method: String,
+    deadline: Instant,
+    /// Once the final header section has been read and parsed, its terminating
+    /// `\r\n\r\n` offset and the body framing. `None` until then.
+    completion: Option<(usize, Framing)>,
+}
+
+impl SocketUpstream {
+    /// Make a non-blocking Unix socket, connect it, and write the request. A
+    /// Unix-socket connect completes at once or fails; `WouldBlock` means the
+    /// backend's listen backlog is full, which the caller answers as 503.
+    pub fn start(
+        path: &Path,
+        request: Vec<u8>,
+        method: &str,
+        deadline: Instant,
+    ) -> io::Result<SocketUpstream> {
+        let sock = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
+        sock.set_nonblocking(true)?;
+        sock.connect(&socket2::SockAddr::unix(path)?)?;
+        // socket2's `From<Socket> for UnixStream` needs its `all` feature, so
+        // go through `OwnedFd`, which is always implemented.
+        let stream: UnixStream = std::os::fd::OwnedFd::from(sock).into();
+        let mut upstream = SocketUpstream {
+            stream,
+            request,
+            write_offset: 0,
+            read_buf: Vec::new(),
+            method: method.to_string(),
+            deadline,
+            completion: None,
+        };
+        // Write the request now, while the connect is fresh, so the backend has
+        // the bytes before the loop's next drive. A short request fits in one
+        // write; the rest is written by `drive`.
+        upstream.write_request()?;
+        Ok(upstream)
+    }
+
+    /// The descriptor to register with the poller.
+    pub fn raw_fd(&self) -> std::os::unix::io::RawFd {
+        self.stream.as_raw_fd()
+    }
+
+    /// Whether the backend deadline has passed.
+    pub fn expired(&self, now: Instant) -> bool {
+        now >= self.deadline
+    }
+
+    /// Write what is left of the request. A backend may answer before it has
+    /// read the whole request (RFC 9110 6.1), so an EPIPE or ECONNRESET keeps
+    /// reading: the response is already waiting on the socket.
+    fn write_request(&mut self) -> io::Result<()> {
+        while self.write_offset < self.request.len() {
+            match self.stream.write(&self.request[self.write_offset..]) {
+                Ok(0) => break,
+                Ok(n) => self.write_offset += n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e)
+                    if e.kind() == io::ErrorKind::BrokenPipe
+                        || e.kind() == io::ErrorKind::ConnectionReset =>
+                {
+                    self.write_offset = self.request.len();
+                    break;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    /// Make progress: write what is left of the request, then read until
+    /// `WouldBlock` or end of stream. Returns `Some` when the response is
+    /// complete or failed, `None` when the caller must drive it again.
+    pub fn drive(&mut self) -> Option<io::Result<HttpResponse>> {
+        if let Err(e) = self.write_request() {
+            return Some(Err(e));
+        }
+
+        // Read until WouldBlock or end of stream.
+        let mut eof = false;
+        loop {
+            let mut tmp = [0u8; 8192];
+            match self.stream.read(&mut tmp) {
+                Ok(0) => {
+                    eof = true;
+                    break;
+                }
+                Ok(n) => {
+                    self.read_buf.extend_from_slice(&tmp[..n]);
+                    // Bound the incremental buffer the same way the blocking
+                    // reader bounds a body: a hostile backend must not grow the
+                    // process without limit before the deadline fires.
+                    if self.read_buf.len() > MAX_BACKEND_BODY + 8192 {
+                        return Some(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("backend response exceeded the {MAX_BACKEND_BODY} byte limit"),
+                        )));
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => return Some(Err(e)),
+            }
+        }
+
+        // Locate and parse the final header section, once.
+        if self.completion.is_none() {
+            match locate_final_head(&self.read_buf, &self.method) {
+                Ok(Some(completion)) => self.completion = Some(completion),
+                Ok(None) => {
+                    if eof {
+                        return Some(Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "connection closed before headers complete",
+                        )));
+                    }
+                    return None;
+                }
+                Err(e) => return Some(Err(e)),
+            }
+        }
+
+        let (header_end, framing) = self.completion.unwrap();
+        let complete = match framing {
+            Framing::Bodyless => true,
+            Framing::ContentLength(len) => {
+                // Refuse before growing the buffer: read_response_for applies
+                // the same limit, but only after the whole body has arrived.
+                if len > MAX_BACKEND_BODY {
+                    return Some(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "backend declared Content-Length {len}, above the {MAX_BACKEND_BODY} limit"
+                        ),
+                    )));
+                }
+                self.read_buf.len() >= header_end + 4 + len
+            }
+            Framing::Chunked => eof || self.read_buf.ends_with(b"0\r\n\r\n"),
+            Framing::CloseDelimited => eof,
+        };
+
+        if complete {
+            Some(read_response_for(
+                std::io::Cursor::new(&self.read_buf[..]),
+                &self.method,
+            ))
+        } else {
+            None
+        }
+    }
+}
+
 /// Parse an incoming HTTP/1.1 request from a byte buffer.
 pub fn parse_request(data: &[u8]) -> Result<HttpRequest, String> {
     let mut headers = [httparse::EMPTY_HEADER; 64];
@@ -1106,7 +1358,10 @@ pub fn parse_request(data: &[u8]) -> Result<HttpRequest, String> {
 /// URL backends are not pooled — a new TCP connection is opened for every
 /// request. The `timeout` (if given) is applied as both read and write
 /// timeout on the underlying TCP stream.
-#[expect(clippy::disallowed_methods, reason = "URL backend thread per request; removed by EL-5b")]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "URL backend thread per request; removed by EL-5b"
+)]
 pub fn forward_url_request(
     base_url: &str,
     req: &HttpRequest,
@@ -1170,15 +1425,31 @@ pub fn forward_url_request(
     }
 }
 
-/// Context carried alongside a pending URL-backend receiver so the event loop
-/// can finish processing (cache insertion, hints, error-mode) when the I/O
-/// thread returns.  All fields are cheaply cloneable.
+/// Which backend kind a pending request is waiting on. The event loop finishes
+/// a socket reply with the socket branch's own semantics and a URL reply with
+/// the URL branch's, so the two never share a completion path.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PendingKind {
+    Url,
+    Socket,
+}
+
+/// Context carried alongside a pending backend receiver so the event loop can
+/// finish processing (cache insertion, hints, error-mode) when the reply
+/// arrives, whether that reply came from a URL-backend thread or a socket
+/// upstream the loop drove. All fields are cheaply cloneable.
 #[derive(Clone)]
 pub struct PendingUrlContext {
     pub req: HttpRequest,
     pub client_ip: String,
     pub enc: String,
     pub backend_name: String,
+    /// Which backend kind this pending request is waiting on.
+    pub kind: PendingKind,
+    /// The matched route pattern, carried so the socket completion can build
+    /// the error context `apply_error_mode` expects. `None` for URL backends,
+    /// whose completion already builds `route: None`.
+    pub route_path: Option<String>,
     /// Whether the response may enter the shared cache. False for
     /// `require`-protected routes (the cache key carries no identity, so a
     /// stored entry would later be served to anonymous callers) and for
@@ -1212,7 +1483,10 @@ pub fn dispatch_url_request(
     tls_config: std::sync::Arc<rustls::ClientConfig>,
 ) -> std::sync::mpsc::Receiver<std::io::Result<HttpResponse>> {
     let (tx, rx) = std::sync::mpsc::channel();
-    #[expect(clippy::disallowed_methods, reason = "URL backend thread per request; removed by EL-5b")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "URL backend thread per request; removed by EL-5b"
+    )]
     std::thread::spawn(move || {
         let _ = tx.send(forward_url_request(
             &base_url,

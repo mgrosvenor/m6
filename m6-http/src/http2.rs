@@ -267,10 +267,10 @@ struct H2Stream {
     // Some  = response queued; resp_sent bytes already flushed.
     resp_body: Option<Vec<u8>>,
     resp_sent: usize,
-    /// Pending URL-backend request: set by maybe_dispatch when backend is async.
+    /// Pending backend request: set by maybe_dispatch when backend is async.
     pending_rx: Option<(
         std::sync::mpsc::Receiver<std::io::Result<HttpResponse>>,
-        PendingUrlContext,
+        Box<PendingUrlContext>,
     )>,
 }
 

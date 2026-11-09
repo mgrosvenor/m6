@@ -1,5 +1,5 @@
 /// Backend pool management: socket discovery, least-connections load balancing.
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::config::BackendConfig;
@@ -98,38 +98,13 @@ impl BackendPool {
         best
     }
 
-    /// Synchronous connect used by tests (not async).
-    #[expect(clippy::disallowed_methods, reason = "test-only after this job; removed by EL-1")]
-    pub fn connect(&mut self) -> Result<(std::os::unix::net::UnixStream, usize), PoolError> {
+    /// Take the least-connections available member for an async caller,
+    /// returning its borrowed socket path and index without cloning the path.
+    /// The caller must call `release`, `cancel` or `mark_failed` when done.
+    pub fn take_member(&mut self) -> Result<(&Path, usize), PoolError> {
         let idx = self.pick_member().ok_or(PoolError::Empty)?;
-        let path = self.members[idx].path.clone();
-
-        match std::os::unix::net::UnixStream::connect(&path) {
-            Ok(stream) => {
-                self.members[idx].mark_success();
-                self.members[idx].connections += 1;
-                Ok((stream, idx))
-            }
-            Err(e) => {
-                tracing::warn!(
-                    pool = %self.name,
-                    socket = %path.display(),
-                    error = %e,
-                    "pool: connection failed, backing off"
-                );
-                self.members[idx].mark_failed();
-                Err(PoolError::ConnectFailed(e))
-            }
-        }
-    }
-
-    /// Pick the socket path for the best available member (for async callers).
-    /// Returns (socket_path, member_index). Caller must call release() when done.
-    pub fn pick_socket(&mut self) -> Result<(PathBuf, usize), PoolError> {
-        let idx = self.pick_member().ok_or(PoolError::Empty)?;
-        let path = self.members[idx].path.clone();
         self.members[idx].connections += 1;
-        Ok((path, idx))
+        Ok((&self.members[idx].path, idx))
     }
 
     /// Mark a connection attempt as failed (for async callers).
@@ -196,8 +171,6 @@ impl BackendPool {
 pub enum PoolError {
     #[error("pool is empty")]
     Empty,
-    #[error("connection failed: {0}")]
-    ConnectFailed(std::io::Error),
 }
 
 /// A URL-based backend (remote HTTP/HTTPS upstream).
@@ -424,11 +397,11 @@ mod tests {
         let mut pool =
             BackendPool::new("p".into(), dir.path().join("*.sock").display().to_string());
         pool.add_socket(sock);
-        let (_, idx) = pool.pick_socket().expect("member");
+        let (_, idx) = pool.take_member().expect("member");
         pool.mark_failed(idx);
         assert_eq!(pool.members[idx].failure_count, 1);
         pool.members[idx].retry_at = None;
-        let (_, idx) = pool.pick_socket().expect("member again");
+        let (_, idx) = pool.take_member().expect("member again");
         pool.release(idx);
         assert_eq!(
             pool.members[idx].failure_count, 0,
@@ -445,7 +418,7 @@ mod tests {
         let mut pool =
             BackendPool::new("p".into(), dir.path().join("*.sock").display().to_string());
         pool.add_socket(dir.path().join("a.sock"));
-        let (_, idx) = pool.pick_socket().expect("member");
+        let (_, idx) = pool.take_member().expect("member");
         pool.cancel(idx);
         assert_eq!(pool.members[idx].connections, 0);
         assert_eq!(pool.members[idx].failure_count, 0);
@@ -455,7 +428,7 @@ mod tests {
     #[test]
     fn test_empty_pool_returns_error() {
         let mut pool = BackendPool::new("test".to_string(), "/run/m6/*.sock".to_string());
-        assert!(matches!(pool.connect(), Err(PoolError::Empty)));
+        assert!(matches!(pool.take_member(), Err(PoolError::Empty)));
     }
 
     #[test]

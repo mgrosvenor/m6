@@ -13,7 +13,10 @@
 //! backends. Every wait is on a signal (a backend reporting it received a
 //! request, a response arriving) with a deadline, never a fixed sleep.
 
-#![allow(clippy::disallowed_methods, reason = "test code: threads, sleeps and blocking clients drive the service from outside")]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, UdpSocket};
@@ -37,6 +40,9 @@ use m6_http_lib::probe;
 const FAST_BODY: &str = "fast";
 /// The body a backend returns for a request it holds until released.
 const SLOW_BODY: &str = "slow";
+
+/// One GET: the port, the path and a deadline in, the status and body out.
+type GetFn = fn(u16, &str, Duration) -> Result<(u16, String), String>;
 
 // ── The fake backend ──────────────────────────────────────────────────────────
 
@@ -166,7 +172,9 @@ fn h1_get(port: u16, path: &str, timeout: Duration) -> Result<(u16, String), Str
         .map_err(|e| e.to_string())?;
     let mut stream = StreamOwned::new(conn, tcp);
     let req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
-    stream.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
+    stream
+        .write_all(req.as_bytes())
+        .map_err(|e| e.to_string())?;
     stream.flush().map_err(|e| e.to_string())?;
     let raw = read_one(&mut stream, "GET").map_err(|e| format!("read: {e}"))?;
     parse_h1(&raw)
@@ -347,7 +355,10 @@ fn h3_get(port: u16, path: &str, timeout: Duration) -> Result<(u16, String), Str
         std::thread::sleep(Duration::from_millis(1));
     }
 
-    Ok((status.ok_or("no status received")?, String::from_utf8_lossy(&body).into_owned()))
+    Ok((
+        status.ok_or("no status received")?,
+        String::from_utf8_lossy(&body).into_owned(),
+    ))
 }
 
 // ── The m6-http fixture ───────────────────────────────────────────────────────
@@ -470,17 +481,15 @@ fn await_slow_seen(rx: &mpsc::Receiver<()>, deadline: Instant) -> bool {
 
 /// Run the "a held backend does not delay a cache hit" scenario with one GET
 /// function, shared by the h1, h2 and h3 tests.
-fn held_backend_does_not_delay_a_cache_hit(
-    tag: &str,
-    get: fn(u16, &str, Duration) -> Result<(u16, String), String>,
-) {
+fn held_backend_does_not_delay_a_cache_hit(tag: &str, get: GetFn) {
     let fx = Fixture::start(1, 30, tag);
 
     // Warm /fast: a miss that fills the cache.
-    let (warm_status, warm_body) = get(fx.port(), "/fast", Duration::from_secs(5))
-        .expect("warm /fast");
+    let (warm_status, warm_body) =
+        get(fx.port(), "/fast", Duration::from_secs(5)).expect("warm /fast");
     assert_eq!(
-        warm_status, 200,
+        warm_status,
+        200,
         "warm /fast: {warm_body}\n--- m6-http ---\n{}",
         fx.service.output()
     );
@@ -492,7 +501,11 @@ fn held_backend_does_not_delay_a_cache_hit(
 
     // Wait until the backend reports it received /slow.
     let seen = await_slow_seen(&fx.slow_seens[0], Instant::now() + Duration::from_secs(5));
-    assert!(seen, "the backend never received /slow\n--- m6-http ---\n{}", fx.service.output());
+    assert!(
+        seen,
+        "the backend never received /slow\n--- m6-http ---\n{}",
+        fx.service.output()
+    );
 
     // A cache hit must answer within two seconds while /slow is still held.
     let fast = get(fx.port(), "/fast", Duration::from_secs(2));
@@ -501,7 +514,10 @@ fn held_backend_does_not_delay_a_cache_hit(
         Err(e) => {
             fx.release.store(true, Ordering::SeqCst);
             let _ = slow_handle.join();
-            panic!("a cache hit stalled behind a held backend: {e}\n--- m6-http ---\n{}", fx.service.output());
+            panic!(
+                "a cache hit stalled behind a held backend: {e}\n--- m6-http ---\n{}",
+                fx.service.output()
+            );
         }
     };
     assert_eq!(fast_status, 200, "cache hit: {fast_body}");
@@ -568,9 +584,12 @@ fn a_backend_past_its_timeout_answers_and_frees_the_member() {
     // A one-second deadline: /slow is never released, so it must answer 502.
     let fx = Fixture::start(1, 1, "timeout");
 
-    let (status, body) = h1_get(fx.port(), "/slow", Duration::from_secs(3))
-        .expect("/slow timed out request");
-    assert_eq!(status, 502, "a backend past its timeout must answer 502: {body}");
+    let (status, body) =
+        h1_get(fx.port(), "/slow", Duration::from_secs(3)).expect("/slow timed out request");
+    assert_eq!(
+        status, 502,
+        "a backend past its timeout must answer 502: {body}"
+    );
 
     // The member was backed off for one second; once it recovers, a /fast miss
     // on the same member is served. Poll with a deadline rather than sleep.

@@ -33,10 +33,14 @@ use crate::poller::{Poller, Token};
 pub enum RequestOutcome {
     /// Response is available immediately (cache hit, socket backend, auth error, etc.)
     Ready(u16, Vec<(String, String)>, Vec<u8>, String),
-    /// URL backend I/O dispatched to a thread; poll `rx` with `try_recv()`.
+    /// Backend I/O dispatched; poll `rx` with `try_recv()`.
+    ///
+    /// `ctx` is boxed so the enum stays small: `Pending` is created and consumed
+    /// within one loop iteration, never stored in bulk, while `Ready` is the
+    /// common, allocation-light path.
     Pending {
         rx: std::sync::mpsc::Receiver<std::io::Result<HttpResponse>>,
-        ctx: PendingUrlContext,
+        ctx: Box<PendingUrlContext>,
     },
 }
 
@@ -1030,10 +1034,7 @@ fn drive_h1<F, G>(
                                 continue;
                             }
                             RequestOutcome::Pending { rx, ctx } => {
-                                h1.state = H1State::WaitingBackend {
-                                    rx,
-                                    ctx: Box::new(ctx),
-                                };
+                                h1.state = H1State::WaitingBackend { rx, ctx };
                                 break; // nothing more to do; poll next iteration
                             }
                         }
@@ -1885,7 +1886,10 @@ mod keep_alive_tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::disallowed_methods, reason = "test code: threads, sleeps and blocking clients drive the service from outside")]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
 mod h2c_admit_tests {
     use super::{
         admit, H2cListener, RefusalLog, RefusalSummary, RefusalVerdict, REFUSAL_LOG_MAX_LINES,
