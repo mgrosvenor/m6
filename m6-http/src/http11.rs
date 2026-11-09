@@ -106,9 +106,6 @@ struct Conn {
     /// one, so `:80` runs this code rather than a second implementation.
     tls: Option<ServerConnection>,
     kind: ConnKind,
-    /// `[server] max_requests_per_connection`, from the listener that accepted
-    /// this connection. Handed to the `H1Conn` once the protocol is known.
-    max_requests: u32,
 }
 
 impl Conn {
@@ -336,7 +333,6 @@ impl Http11Listener {
                         client_ip,
                         tls,
                         kind,
-                        max_requests: self.max_requests,
                     });
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -366,7 +362,7 @@ impl Http11Listener {
         // wakeups complete no handshake at all, so the common path here is free.
         let mut handshakes = Vec::new();
         for conn in &mut self.conns {
-            drive_conn(conn, &mut on_request, &mut on_response);
+            drive_conn(conn, self.max_requests, &mut on_request, &mut on_response);
             if let Some(ns) = conn.handshake_ns.take() {
                 handshakes.push(HandshakeSample {
                     elapsed_ns: ns,
@@ -702,7 +698,7 @@ impl H2cListener {
 
 // ── Per-connection driver ─────────────────────────────────────────────────────
 
-fn drive_conn<F, G>(conn: &mut Conn, on_request: &mut F, on_response: &mut G)
+fn drive_conn<F, G>(conn: &mut Conn, max_requests: u32, on_request: &mut F, on_response: &mut G)
 where
     F: FnMut(&HttpRequest, &str) -> RequestOutcome,
     G: FnMut(
@@ -799,7 +795,7 @@ where
             created: Instant::now(),
             keep_alive: false,
             served: 0,
-            max_requests: conn.max_requests,
+            max_requests,
             expect_handled: false,
         });
         return;
@@ -845,7 +841,7 @@ where
                 created,
                 keep_alive: false,
                 served: 0,
-                max_requests: conn.max_requests,
+                max_requests,
                 expect_handled: false,
             });
         }
