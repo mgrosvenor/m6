@@ -358,7 +358,10 @@ pub fn fleet(
     timeout: Duration,
     header_checks: &[crate::fleet::HeaderCheck],
 ) -> Vec<NodeReading> {
-    #[expect(clippy::disallowed_methods, reason = "monitor threads; removed by EL-9")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "monitor threads; removed by EL-9"
+    )]
     std::thread::scope(|scope| {
         let handles: Vec<_> = nodes
             .iter()
@@ -388,7 +391,10 @@ pub fn fleet(
 }
 
 #[cfg(test)]
-#[allow(clippy::disallowed_methods, reason = "test code: threads, sleeps and blocking clients drive the service from outside")]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
 mod tests {
     use super::*;
 

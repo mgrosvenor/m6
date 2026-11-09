@@ -9,7 +9,10 @@
 //! router it measured was m6-file's own, and there is one router now. Core's
 //! is benchmarked in `m6-core/benches/critical_path.rs`.
 
-#![allow(clippy::disallowed_methods, reason = "test code: threads, sleeps and blocking clients drive the service from outside")]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
 
 use criterion::{black_box, criterion_group, Criterion};
 use std::io::Write;

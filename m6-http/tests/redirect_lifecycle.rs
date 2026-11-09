@@ -20,7 +20,10 @@
 //! upstream reports anything. Here it was worse, because the signal did not
 //! even kill it.
 
-#![allow(clippy::disallowed_methods, reason = "test code: threads, sleeps and blocking clients drive the service from outside")]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
 
 use std::io::{Read, Write};
 use std::net::TcpStream;

@@ -141,7 +141,10 @@ pub fn apply_socket_mode(path: &Path, mode: u32) {
 /// missing safety net into an outage.
 pub fn apply_read_timeout(stream: &UnixStream, timeout: Option<std::time::Duration>) {
     let Some(dur) = timeout else { return };
-    #[expect(clippy::disallowed_methods, reason = "the App read timeout; removed by EL-6")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the App read timeout; removed by EL-6"
+    )]
     if let Err(e) = stream.set_read_timeout(Some(dur)) {
         warn!(error = %e, "failed to set read timeout on accepted connection");
     }
@@ -335,7 +338,10 @@ pub fn write_error_response<W: std::io::Write>(
 }
 
 #[cfg(test)]
-#[allow(clippy::disallowed_methods, reason = "test code: threads, sleeps and blocking clients drive the service from outside")]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
 mod tests {
     use super::*;
 
@@ -456,7 +462,10 @@ pub fn bind_tcp_reuseaddr(addr: std::net::SocketAddr) -> std::io::Result<std::ne
 }
 
 #[cfg(test)]
-#[allow(clippy::disallowed_methods, reason = "test code: threads, sleeps and blocking clients drive the service from outside")]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
 mod bind_tests {
     use super::bind_tcp_reuseaddr;
 

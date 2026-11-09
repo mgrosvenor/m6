@@ -130,7 +130,10 @@ fn bounded<T: Send + 'static>(
     // Detached deliberately: see the module header. The handle is dropped, so
     // a thread still inside the resolver at the deadline finishes on its own
     // and its send goes nowhere.
-    #[expect(clippy::disallowed_methods, reason = "reverse DNS helper thread; removed by EL-9")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "reverse DNS helper thread; removed by EL-9"
+    )]
     std::thread::Builder::new()
         .name("m6-resolve".into())
         .spawn(move || {
@@ -141,7 +144,10 @@ fn bounded<T: Send + 'static>(
             let _ = tx.send(result);
         })
         .ok()?;
-    #[expect(clippy::disallowed_methods, reason = "reverse DNS helper thread; removed by EL-9")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "reverse DNS helper thread; removed by EL-9"
+    )]
     rx.recv_timeout(timeout).ok()
 }
 
@@ -429,7 +435,10 @@ fn blocking_forward(name: &str) -> Forward {
 }
 
 #[cfg(test)]
-#[allow(clippy::disallowed_methods, reason = "test code: threads, sleeps and blocking clients drive the service from outside")]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
 mod tests {
     use super::*;
 

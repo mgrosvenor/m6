@@ -7,7 +7,10 @@
 //! templates with the path-parameter clash, and a route's `status` reaching the
 //! response.
 
-#![allow(clippy::disallowed_methods, reason = "test code: threads, sleeps and blocking clients drive the service from outside")]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
 
 use std::io::Write;
 use std::os::unix::net::UnixStream;

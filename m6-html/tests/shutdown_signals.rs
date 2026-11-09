@@ -6,7 +6,10 @@
 //! and exits 0. It does not wait for a request in progress, so each test holds
 //! one open and asserts only the exit status, the time taken and the socket.
 
-#![allow(clippy::disallowed_methods, reason = "test code: threads, sleeps and blocking clients drive the service from outside")]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
 
 use std::io::Write;
 use std::os::unix::net::UnixStream;

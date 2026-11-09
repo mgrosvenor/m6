@@ -219,7 +219,10 @@ impl OpenOptions {
                         && e.code == rusqlite::ErrorCode::DatabaseBusy
                         && Instant::now() < deadline =>
                 {
-                    #[expect(clippy::disallowed_methods, reason = "open at start, before the loop: SQLite does not apply busy_timeout to the WAL switch (owner-approved permanent exception)")]
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "open at start, before the loop: SQLite does not apply busy_timeout to the WAL switch (owner-approved permanent exception)"
+                    )]
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 Err(e) => return Err(e.into()),
@@ -534,7 +537,10 @@ impl From<rusqlite::Error> for crate::Error {
 }
 
 #[cfg(test)]
-#[allow(clippy::disallowed_methods, reason = "test code: threads, sleeps and blocking clients drive the service from outside")]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
 mod tests {
     use super::*;
     use rusqlite::ErrorCode;
