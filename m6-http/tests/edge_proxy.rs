@@ -407,10 +407,8 @@ impl EdgeStack {
         // This was `sleep(300ms)`. Alone that was enough; in a full workspace
         // run it is not remotely — a dozen of these stacks start at once, each
         // spawning four processes, and m6-http would come up with an empty
-        // backend pool. Every request then returned 502, which read as an
-        // assertion failure in whichever test happened to run first. m6-http
-        // also only rescans for backend sockets periodically, so a socket that
-        // appears late is not picked up promptly either.
+        // backend pool and refuse to start. m6-http reads its pool once at
+        // start, so the sockets must exist before it is spawned.
         html_proc.wait_for_path(&html_sock, Duration::from_secs(15));
         file_proc.wait_for_path(&file_sock, Duration::from_secs(15));
 
@@ -440,10 +438,9 @@ impl EdgeStack {
 
         let edge_tls = trusted_client_config(&ec_der);
 
-        // Listening on a port is not the same as being able to serve: the
-        // backend pool is populated by a periodic rescan, so there is a window
-        // where the port accepts and every request 502s. Poll until the stack
-        // actually answers, rather than assuming a fixed delay is enough. This
+        // Listening on a port is not the same as being able to serve: a backend
+        // that has not finished starting answers 502, so poll until the stack
+        // actually answers rather than assuming a fixed delay is enough. This
         // is the difference between a suite that passes alone and one that
         // passes under load.
         let ready_deadline = Instant::now() + Duration::from_secs(20);

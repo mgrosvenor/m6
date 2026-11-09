@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use m6_core::testkit::{binary, wait, Service};
+use m6_core::testkit::{assert_app_lifecycle, binary, wait, Service};
 
 /// A running `m6-file`, its socket, and the directory both live in.
 ///
@@ -767,4 +767,42 @@ fn a_directory_is_404_for_both_methods() {
             );
         }
     }
+}
+
+// ─── Lifecycle ─────────────────────────────────────────────────────────────────
+
+const ASSETS_ROUTE: &str =
+    "[[route]]\npath = \"/assets/{*relpath}\"\nhandler = \"files\"\nroot = \"assets/\"\n";
+
+fn site_with_two_trees() -> tempfile::TempDir {
+    let site = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(site.path().join("assets")).unwrap();
+    std::fs::create_dir_all(site.path().join("files/deep")).unwrap();
+    std::fs::write(site.path().join("assets/a.txt"), b"asset").unwrap();
+    std::fs::write(site.path().join("files/deep/report.txt"), b"report").unwrap();
+    site
+}
+
+fn write_config(path: &Path, routes: &str) {
+    std::fs::write(path, format!("[thread_pool]\nsize = 4\n\n{routes}")).unwrap();
+}
+
+/// The lifecycle contract, which m6-file now gets from the same assertion as
+/// every other `App` service rather than from its own hand-written copy.
+#[test]
+fn lifecycle() {
+    let site = site_with_two_trees();
+    let config = site.path().join("m6-file.conf");
+    write_config(&config, ASSETS_ROUTE);
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("lifecycle.sock");
+
+    assert_app_lifecycle(
+        "m6-file",
+        Command::new(binary("m6-file"))
+            .arg(site.path())
+            .arg(&config)
+            .env("M6_SOCKET_OVERRIDE", &socket),
+        &socket,
+    );
 }

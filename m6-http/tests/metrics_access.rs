@@ -153,6 +153,12 @@ impl Fixture {
 
         let site_dir = d.join("site");
         std::fs::create_dir_all(&site_dir).unwrap();
+        // A socket file with no process listening: the pool's glob matches it,
+        // so m6-http starts, and a connect to it is refused. The pool reads its
+        // glob once at start, so the file must exist before the spawn.
+        let backend_sock = d.join("b-1.sock");
+        let backend_glob = d.join("b-*.sock");
+        let _ = std::os::unix::net::UnixListener::bind(&backend_sock).expect("placeholder socket");
         std::fs::write(
             site_dir.join("site.toml"),
             format!(
@@ -160,9 +166,10 @@ impl Fixture {
                  [errors]\nmode = \"internal\"\n\n\
                  [analytics]\nenabled = false\nlog_path = \"{}\"\n\n\
                  [rate_limit]\nenabled = false\n\n\
-                 [[backend]]\nname = \"b\"\nsockets = \"/nonexistent/b-*.sock\"\n\n\
+                 [[backend]]\nname = \"b\"\nsockets = \"{}\"\n\n\
                  [[route]]\npath = \"/\"\nbackend = \"b\"\n\n{}",
                 d.join("analytics.ndjson").display(),
+                backend_glob.display(),
                 sub(site),
             ),
         )
@@ -204,8 +211,9 @@ impl Fixture {
         cmd
     }
 
-    /// Start m6-http and wait until `/health` answers. The backend socket does
-    /// not exist, so the answer is 503 (degraded): any status proves serving.
+    /// Start m6-http and wait until `/health` answers. The backend socket is a
+    /// placeholder with no listener, so the answer is 503 (degraded): any
+    /// status proves serving.
     fn start(self) -> Running {
         let mut svc = Service::spawn("m6-http-metrics", &mut self.command());
         svc.wait_for_tcp(self.port.port(), Duration::from_secs(10));
@@ -789,87 +797,4 @@ fn a_public_metrics_peer_refuses_to_start() {
     let (code, output) = Fixture::new(&site, "", "").run_until_exit();
     assert_eq!(code, Some(2), "output:\n{output}");
     assert!(output.contains("not in a local range"), "output:\n{output}");
-}
-
-// ── Reload ────────────────────────────────────────────────────────────────────
-
-/// The system config: a verify key, the role gate, and `peer` as the one peer.
-fn system_gate(peer: &str) -> String {
-    format!(
-        "[auth]\npublic_key = \"{{KEY}}\"\n\n\
-         [health]\nmetrics_require = \"role:monitor\"\nmetrics_peers = [\"{peer}\"]\n"
-    )
-}
-
-/// Set the modified time of `path` to now, which is all a `touch` does.
-fn touch(path: &std::path::Path) {
-    std::fs::File::options()
-        .write(true)
-        .open(path)
-        .expect("open for touch")
-        .set_modified(std::time::SystemTime::now())
-        .expect("set modified time");
-}
-
-/// A `[health]` access key in the system config applies when that file changes,
-/// with no `site.toml` change and no restart.
-#[test]
-fn metrics_peers_in_the_system_config_apply_without_a_restart() {
-    let run = Fixture::new("", "", &system_gate("10.0.0.9")).start();
-    let auth = bearer(&run.token(&["monitor"]));
-    for (proto, r) in run.all("/perf", &[("Authorization", &auth)]) {
-        assert_eq!(r.status, 404, "{proto} before the edit: {}", r.text());
-    }
-
-    let before = std::fs::read_to_string(&run.fx.system).expect("read system.toml");
-    std::fs::write(&run.fx.system, before.replace("10.0.0.9", "127.0.0.1"))
-        .expect("rewrite system.toml");
-
-    let opened = testkit::wait::until(Duration::from_secs(3), || {
-        run.h1("/perf", &[("Authorization", &auth)]).status == 200
-    });
-    assert!(
-        opened,
-        "/perf stayed closed after the system config named the peer\n{}",
-        run.svc.output()
-    );
-    for (proto, r) in run.all("/perf", &[("Authorization", &auth)]) {
-        assert_report(proto, &r);
-    }
-}
-
-/// A new verify key is read when the system config is touched, not when the key
-/// file is written.
-#[test]
-fn a_rotated_auth_key_verifies_after_a_touch() {
-    let run = Fixture::new("", "", &system_gate("127.0.0.1")).start();
-    let (second_private, second_public) = keypair();
-    let auth = bearer(&mint(&second_private, &["monitor"], 3600));
-    assert_eq!(
-        run.h1("/perf", &[("Authorization", &auth)]).status,
-        401,
-        "a token from a key the site does not trust"
-    );
-
-    std::fs::write(run.fx.dir.path().join("auth-public.pem"), second_public)
-        .expect("write the new public key");
-    // The key file is not watched, so writing it changes nothing. This stays a
-    // fixed delay: the verdict is an absence, and m6-http logs nothing when it
-    // correctly ignores a key-file write, so there is no signal to wait on.
-    std::thread::sleep(Duration::from_secs(2));
-    assert_eq!(
-        run.h1("/perf", &[("Authorization", &auth)]).status,
-        401,
-        "the key file is not watched, so writing it changes nothing"
-    );
-
-    touch(&run.fx.system);
-    let accepted = testkit::wait::until(Duration::from_secs(3), || {
-        run.h1("/perf", &[("Authorization", &auth)]).status == 200
-    });
-    assert!(
-        accepted,
-        "the new key was not read after the touch\n{}",
-        run.svc.output()
-    );
 }

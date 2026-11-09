@@ -1,13 +1,12 @@
 //! Key-rotation token lifetimes.
 //!
-//! The rotation mechanics (a key is served only after the config is touched, a
-//! bad key is refused, a mismatched pair is refused) are covered in
-//! `integration.rs`. These tests cover what a rotation does to tokens already
-//! issued and to tokens issued afterwards, per `keys.rs`: a refresh token is
-//! verified against the database hash, not re-validated against the current
-//! signing key, so a token minted under the old key stays usable, a token
-//! minted under the new key works at once, and a token under a third key is
-//! rejected.
+//! The rotation mechanics (a key is served only after a restart, a bad key is
+//! refused, a mismatched pair is refused) are covered in `integration.rs`.
+//! These tests cover what a rotation does to tokens already issued and to
+//! tokens issued afterwards, per `keys.rs`: a refresh token is verified against
+//! the database hash, not re-validated against the current signing key, so a
+//! token minted under the old key stays usable, a token minted under the new
+//! key works at once, and a token under a third key is rejected.
 
 use std::io::Write;
 use std::os::unix::net::UnixStream;
@@ -175,24 +174,6 @@ fn parse_status(resp: &str) -> u16 {
         .unwrap_or(0)
 }
 
-/// The body of `GET /auth/public-key`.
-fn public_key_body(env: &TestEnv) -> String {
-    let req = "GET /auth/public-key HTTP/1.1\r\nHost: localhost\r\n\r\n";
-    let resp = http_request(&env.socket_path, req);
-    let at = resp.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
-    resp[at..].to_string()
-}
-
-/// Set the modified time of `path` to now, which is all a `touch` does.
-fn touch(path: &Path) {
-    std::fs::File::options()
-        .write(true)
-        .open(path)
-        .expect("open for touch")
-        .set_modified(std::time::SystemTime::now())
-        .expect("set modified time");
-}
-
 /// Log in over JSON and return `(access_token, refresh_token)`.
 fn login_json(socket_path: &Path, username: &str, password: &str) -> (String, String) {
     let body = serde_json::json!({ "username": username, "password": password }).to_string();
@@ -244,20 +225,19 @@ fn mint_refresh_token(
     engine.encode_refresh(&claims).expect("encode")
 }
 
-/// Rotate the signing key: write both key files, then touch the config, and
-/// wait for the reload to take effect (the public key endpoint serves the new
-/// key). Returns the new public key PEM.
-fn rotate_key(env: &TestEnv, guard: &Service) -> String {
+/// Rotate the signing key: write both key files, restart the service, and
+/// return the new service handle. The public key endpoint then serves the new
+/// key.
+fn rotate_key(env: &TestEnv, mut guard: Service) -> Service {
     let (private_b, public_b) = generate_test_rsa_keys();
     std::fs::write(env._key_dir.path().join("auth.pem"), &private_b).unwrap();
     std::fs::write(env._key_dir.path().join("auth.pub"), &public_b).unwrap();
-    touch(&env.config_path);
+    let status = guard.terminate(Duration::from_secs(5));
     assert!(
-        wait::until(Duration::from_secs(5), || public_key_body(env) == public_b),
-        "the new key was not served after the config was touched\n--- output ---\n{}",
-        guard.output()
+        status.success(),
+        "m6-auth-server did not stop cleanly for a rotation, got {status}"
     );
-    public_b
+    spawn_server(env)
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -275,7 +255,7 @@ fn a_refresh_token_issued_before_rotation_still_refreshes_after_the_key_rotates(
 
     let (_, refresh_a) = login_json(&env.socket_path, "ada", "ada-password");
 
-    let _public_b = rotate_key(&env, &guard);
+    let guard = rotate_key(&env, guard);
 
     let resp = refresh_json(&env.socket_path, &refresh_a);
     assert_eq!(
@@ -286,8 +266,7 @@ fn a_refresh_token_issued_before_rotation_still_refreshes_after_the_key_rotates(
     );
 }
 
-/// A refresh token minted after the rotation refreshes at once, with no further
-/// reload or restart.
+/// A refresh token minted after the rotation refreshes at once.
 ///
 /// The wrong outcome it catches: the service does not actually begin signing
 /// with the new key after the rotation, so a fresh token cannot refresh.
@@ -297,7 +276,7 @@ fn a_refresh_token_issued_after_rotation_refreshes_at_once() {
     seed_user(&env.site_dir, "bee", "bee-password");
     let guard = spawn_server(&env);
 
-    let _public_b = rotate_key(&env, &guard);
+    let guard = rotate_key(&env, guard);
 
     let (_, refresh_b) = login_json(&env.socket_path, "bee", "bee-password");
     let resp = refresh_json(&env.socket_path, &refresh_b);
@@ -320,7 +299,7 @@ fn a_refresh_token_signed_by_a_foreign_key_is_rejected() {
     let user = seed_user(&env.site_dir, "cee", "cee-password");
     let guard = spawn_server(&env);
 
-    let _public_b = rotate_key(&env, &guard);
+    let guard = rotate_key(&env, guard);
 
     let (foreign_private, foreign_public) = generate_test_rsa_keys();
     let foreign_token = mint_refresh_token(&foreign_private, &foreign_public, ISSUER, &user);

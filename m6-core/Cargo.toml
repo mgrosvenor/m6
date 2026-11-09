@@ -60,7 +60,7 @@ thiserror  = "1"
 tracing    = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json"] }
 tracing-appender   = "0.2"
-nix        = { version = "0.31", features = ["signal", "poll", "inotify", "event", "fs"] }
+nix        = { version = "0.31", features = ["signal", "poll", "fs"] }
 socket2    = "0.6"
 httparse   = "1"
 httpdate   = "1"
@@ -69,7 +69,6 @@ libc       = "0.2"
 brotli      = "6"
 flate2      = "1"
 base64      = "0.22"
-filetime    = "0.2"
 chrono      = { version = "0.4", features = ["serde"] }
 lru         = "0.18"
 slug        = "0.1"
@@ -101,6 +100,7 @@ rusqlite      = { version = "0.31", optional = true, features = ["bundled"] }
 
 [dev-dependencies]
 tempfile  = "3"
+filetime  = "0.2"
 criterion = { version = "0.5", features = ["html_reports"] }
 # For `tls`'s tests, which parse real certificates rather than a fixture: a
 # checked-in certificate expires, and a test that starts failing on a date is a
@@ -114,12 +114,6 @@ time      = "0.3"
 # function runs.
 [[test]]
 name    = "log_reopen"
-harness = false
-
-# Its own `main`: an `App` reads its site directory and config path from the
-# process's arguments, so the test re-runs itself as the service.
-[[test]]
-name    = "on_reload"
 harness = false
 
 [[bench]]

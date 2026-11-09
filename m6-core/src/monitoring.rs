@@ -420,7 +420,7 @@ pub struct PerfReport {
     ///
     /// From the loaded material rather than from a file on disk, which is the
     /// whole value of reporting it here: a renewal that wrote a new certificate
-    /// and never reloaded the server leaves the two facts disagreeing, and the
+    /// and never restarted the server leaves the two facts disagreeing, and the
     /// one that matters is what is being served.
     ///
     /// `serde(default)` so a node older than this field stays parseable to an
@@ -1169,10 +1169,10 @@ pub struct TrafficReport {
 
 /// Whether this process's main log layer is still emitting.
 ///
-/// Replaces counting log targets out of `journalctl` over ssh. A config reload
-/// can silence every target except `analytics`, and when it does the process
-/// looks entirely healthy from outside. It does not look healthy from inside,
-/// which is where this is measured.
+/// Replaces counting log targets out of `journalctl` over ssh. A log level set
+/// at start can silence every target except `analytics`, and when it does the
+/// process looks entirely healthy from outside. It does not look healthy from
+/// inside, which is where this is measured.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LoggingHealth {
     pub events_total: u64,

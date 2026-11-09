@@ -232,33 +232,6 @@ impl Http11Listener {
         self.listener.as_raw_fd()
     }
 
-    /// Does this listener terminate TLS at all?
-    ///
-    /// Read before a reload tries to replace the configuration, so a plaintext
-    /// listener is told apart from one whose material is stale.
-    pub fn terminates_tls(&self) -> bool {
-        self.tls_config.is_some()
-    }
-
-    /// Replace the configuration future connections are served under.
-    ///
-    /// Connections already established keep the configuration they handshook
-    /// with, which is the only thing they can do: the keys are in use on a live
-    /// session. So a reload takes effect on the next connection, and a renewal
-    /// reaches a client within one keep-alive.
-    ///
-    /// A plaintext listener is left alone and says so. Turning the `:80`
-    /// listener into a TLS one on a certificate change would take the redirect
-    /// off the air, and a caller reaching here with one has a defect worth
-    /// seeing instead of a silent no-op.
-    pub fn replace_tls_config(&mut self, tls_config: Arc<rustls::ServerConfig>) {
-        if self.tls_config.is_none() {
-            warn!("a plaintext HTTP/1.1 listener was asked to adopt a TLS configuration; ignored");
-            return;
-        }
-        self.tls_config = Some(tls_config);
-    }
-
     pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
         self.listener.local_addr()
     }
@@ -1376,12 +1349,9 @@ fn status_reason(status: u16) -> &'static str {
 /// A TLS server configuration and the certificate chain it was built from.
 ///
 /// The chain is held so the expiry registry is written when a configuration is
-/// PUT IN USE, and not when it is merely built. A reload builds the rustls
-/// configuration and the quiche one and either can fail, so recording during
-/// the build reported the new certificate's expiry while every protocol was
-/// still serving the old one. m6 #210.
-pub struct TlsMaterial {
-    pub config: Arc<rustls::ServerConfig>,
+/// installed, which at startup is the same step that builds it.
+struct TlsMaterial {
+    config: Arc<rustls::ServerConfig>,
     chain: Vec<rustls_pki_types::CertificateDer<'static>>,
 }
 
@@ -1394,7 +1364,7 @@ impl TlsMaterial {
     /// accepted it or there would be no server at all, so the honest outcome is
     /// that the monitor says "cannot say" for that one rather than a number
     /// nobody took.
-    pub fn record(&self, cert_path: &str) {
+    fn record(&self, cert_path: &str) {
         for (depth, e) in m6_core::tls::record_loaded(&self.chain) {
             warn!(
                 cert = cert_path, depth, error = %e,
@@ -1406,11 +1376,9 @@ impl TlsMaterial {
 
 /// Load a certificate and key into a rustls server configuration.
 ///
-/// Records nothing, so a caller that has more than one listener to rebuild can
-/// build them all and record only once every one of them is carrying the new
-/// material. `make_tls_server_config` is this plus the recording, for the
-/// startup path where building and installing are the same step.
-pub fn load_tls_material(cert_path: &str, key_path: &str) -> anyhow::Result<TlsMaterial> {
+/// Records nothing, so `make_tls_server_config` can build the material and
+/// record it in one step.
+fn load_tls_material(cert_path: &str, key_path: &str) -> anyhow::Result<TlsMaterial> {
     // `rustls_pki_types::pem`, not the `rustls-pemfile` crate. That crate is
     // unmaintained (RUSTSEC-2025-0134, archived August 2025) and its own
     // advisory points here: the last release of it was a thin wrapper around
@@ -1436,7 +1404,7 @@ pub fn load_tls_material(cert_path: &str, key_path: &str) -> anyhow::Result<TlsM
     // The chain is kept alongside the configuration so its expiry can be
     // recorded once the configuration is installed, which is what `/perf` must
     // report: reading the file again at report time would answer about the
-    // path, and a renewal that wrote a new certificate without a reload is
+    // path, and a renewal that wrote a new certificate without a restart is
     // exactly the case where the path and the running server disagree. Issue
     // #176, and #210 for why the recording moved out of this function.
     let chain = certs.clone();

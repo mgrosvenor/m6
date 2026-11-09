@@ -19,12 +19,21 @@ use m6_core::testkit;
 fn write_site(dir: &std::path::Path) -> std::path::PathBuf {
     let site = dir.join("site");
     std::fs::create_dir_all(&site).expect("site dir");
+    // A socket file with no process listening: the pool's glob matches it, so
+    // m6-http starts, and a connect is refused. The pool reads its glob once at
+    // start, so the file must exist before the spawn.
+    let sock = dir.join("b-1.sock");
+    let glob = dir.join("b-*.sock");
+    let _ = std::os::unix::net::UnixListener::bind(&sock).expect("placeholder socket");
     std::fs::write(
         site.join("site.toml"),
-        "[site]\nname = \"internal-binds\"\ndomain = \"localhost\"\n\n\
-         [[backend]]\nname = \"b\"\nsockets = \"/nonexistent/b-*.sock\"\n\n\
-         [[route]]\npath = \"/\"\nbackend = \"b\"\n\n\
-         [rate_limit]\nrequests_per_min = 2\n",
+        format!(
+            "[site]\nname = \"internal-binds\"\ndomain = \"localhost\"\n\n\
+             [[backend]]\nname = \"b\"\nsockets = \"{}\"\n\n\
+             [[route]]\npath = \"/\"\nbackend = \"b\"\n\n\
+             [rate_limit]\nrequests_per_min = 2\n",
+            glob.display()
+        ),
     )
     .expect("site.toml");
     site

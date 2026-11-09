@@ -1,9 +1,8 @@
 //! The signing key material.
 //!
-//! Rotation is: write the private key file and the public key file, then touch
-//! the service's config. `main::reload_state` reads both files again and swaps
-//! the result in. The key files are not watched, so a reader never sees one
-//! half of a pair.
+//! Rotation is: write the private key file and the public key file, then
+//! restart the service. The keys are read once at start, and a change takes a
+//! restart.
 //!
 //! Rotation semantics (per spec): m6-auth begins signing with the new key
 //! immediately. Previously issued access tokens expire naturally. Refresh
@@ -12,9 +11,7 @@
 
 use crate::jwt::JwtEngine;
 
-/// The signing key material, replaced as a whole when the config is touched.
-/// Wrapped in `Arc<RwLock<>>` so `reload_state` can swap it while request
-/// threads hold read locks.
+/// The signing key material, loaded once at start.
 pub struct KeyMaterial {
     pub jwt: JwtEngine,
     pub public_key_pem: String,
@@ -54,8 +51,8 @@ impl KeyMaterial {
 ///
 /// Both files parse on their own, so a rotation caught between its two writes
 /// loads a private key beside the previous public key without an error. Every
-/// token signed afterwards would then fail to verify. An `Err` here keeps the
-/// running keys, and core retries the reload with a growing delay.
+/// token signed afterwards would then fail to verify. An `Err` here exits 2 at
+/// start.
 fn check_pair(jwt: &JwtEngine, issuer: &str) -> anyhow::Result<()> {
     let now = crate::jwt::now_secs();
     let claims = crate::jwt::AccessClaims {

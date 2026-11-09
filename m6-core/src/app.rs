@@ -26,7 +26,7 @@
 //! |---|---|
 //! | `compile_pattern`, `check_route_conflicts` | a route string becomes `Vec<Segment>` once, at load, and two routes that could meet are refused |
 //! | `RouteTable`, `find_route`, `match_route` | a fixed route is one hash lookup, else the one pattern route that matches |
-//! | `FrameworkState::build` | everything that can be computed per RELOAD rather than per request |
+//! | `FrameworkState::build` | everything that can be computed at start rather than per request |
 //! | `FrameworkState::build_dict` | the per-request dictionary, described below |
 //! | `ThreadPool` | fixed workers over a bounded queue |
 //! | `install_shutdown`, `is_shutdown` | a signal sets the flag the accept loop exits on |
@@ -62,7 +62,7 @@
 //!
 //! **Steps 1 to 3 left this function because they produced the same map for
 //! every request on a route**: config keys, global params files, and the route's
-//! static params files. They are merged once per reload into `route.base_dict`
+//! static params files. They are merged once at start into `route.base_dict`
 //! and shared behind an `Arc`. That is the difference between 222,708ns and
 //! 1,125ns per request, and it is the single largest measured win in the
 //! project. See `docs/PERFORMANCE.md`.
@@ -173,14 +173,6 @@ type InitThread<G, T> = Arc<dyn Fn(&Map<String, Value>, &G) -> Result<T> + Send 
 /// Tears state down at shutdown. `None` is the common case: most services hold
 /// nothing that needs an explicit drop, and the option is what says so.
 type Destroy<S> = Option<Arc<dyn Fn(S) + Send + Sync>>;
-
-/// Called during a reload, with the new config, before the new routes and log
-/// level are installed. A service's own state built in `init_global` is
-/// reloaded here. `None` is the common case.
-type OnReload<G> = Option<Arc<dyn Fn(&G, &AppContext) -> Result<()> + Send + Sync>>;
-
-/// [`OnReload`] with the global state already bound, as the run loop holds it.
-type ReloadHook = Arc<dyn Fn(&AppContext) -> Result<()> + Send + Sync>;
 
 /// Global thread-init function — set at startup before any threads are created.
 static THREAD_INIT_FN: OnceLock<ThreadInitFn> = OnceLock::new();
@@ -344,7 +336,7 @@ pub struct CompiledRoute {
     /// params files.
     ///
     /// Computed once when the framework state is built, so it costs nothing per
-    /// request, and recomputed on reload.
+    /// request.
     ///
     /// `None` for a route whose params path contains a `{placeholder}`: the
     /// actual file depends on the request, so no honest value exists until one
@@ -362,7 +354,7 @@ pub struct CompiledRoute {
     pub settings: Arc<Map<String, Value>>,
     /// The part of this route's request dictionary that does not vary between
     /// requests: config keys, global params files and this route's static
-    /// params files, merged once per reload in that order.
+    /// params files, merged once at start in that order.
     ///
     /// Shared with every request on this route rather than copied into each
     /// one. A content-driven site puts its whole catalogue here, which runs to
@@ -570,7 +562,7 @@ fn declared_routes<'a>(
 }
 
 /// Refuse a service's routes if one is unreadable or two can meet. The check
-/// start, reload and `--dump-config` share.
+/// start and `--dump-config` share.
 pub fn check_routes(
     code_routes: &[(String, RouteMethod)],
     config_routes: &[crate::config::RouteConfig],
@@ -792,23 +784,21 @@ impl ParamsCache {
 // ---------------------------------------------------------------------------
 
 struct FrameworkState {
-    /// Behind an `Arc` because it is immutable between reloads and every
-    /// request needs to read it. Owned here instead, the two maps a request
-    /// actually wants -- `compression` and `minification` -- have to be
-    /// deep-cloned out from under the read lock, per request, because the
-    /// pipeline uses them after the lock is released. An `Arc` clone is a
-    /// refcount bump and carries the whole config rather than two fields of it.
+    /// Behind an `Arc` because it is immutable for the life of the process and
+    /// every request needs to read it. Owned here instead, the two maps a
+    /// request actually wants -- `compression` and `minification` -- have to be
+    /// deep-cloned out, per request. An `Arc` clone is a refcount bump and
+    /// carries the whole config rather than two fields of it.
     config: Arc<crate::config::RendererConfig>,
     /// Likewise: one `PathBuf` allocation per request, twice, for a path that
-    /// does not change between reloads.
+    /// does not change.
     site_dir: Arc<PathBuf>,
-    /// Shared rather than owned, so a request can route outside the read lock
-    /// without copying the route it matched. `find_route` returns a borrow, and
-    /// owning the table here would mean turning that borrow into an owned
-    /// `CompiledRoute` purely to outlive the guard.
+    /// Shared rather than owned, so a request can route without copying the
+    /// route it matched. `find_route` returns a borrow, and owning the table
+    /// here would mean turning that borrow into an owned `CompiledRoute`.
     routes: Arc<RouteTable>,
-    /// Test-only. Steps 1 to 3 of the dictionary build are merged once per
-    /// reload into `route.base_dict`, so no serving path reads either of these.
+    /// Test-only. Steps 1 to 3 of the dictionary build are merged once at
+    /// start into `route.base_dict`, so no serving path reads either of these.
     /// `dict_cost` measures per-request assembly against that base, which is
     /// what they are kept for. A release build carries neither.
     #[cfg(test)]
@@ -942,8 +932,7 @@ impl FrameworkState {
             .collect();
 
         // Build the renderer. A template syntax error surfaces as an `Err`
-        // here, which the caller turns into exit 2 at startup and into a kept
-        // previous state on a reload.
+        // here, which the caller turns into exit 2 at startup.
         //
         // Whether an empty `template_paths` means "this site has no templates"
         // or "discover them under site_dir" is a question about templates, so
@@ -1091,7 +1080,7 @@ impl FrameworkState {
     ///
     /// **Steps 1 to 3 are not here any more**, because they produced the same
     /// map for every request on a route: config keys, global params files and
-    /// the route's *static* params files. They are merged once per reload into
+    /// the route's *static* params files. They are merged once at start into
     /// `route.base_dict` and shared behind an `Arc`. What is left in this
     /// function is what genuinely varies per request.
     ///
@@ -1388,12 +1377,11 @@ fn run_app_global<G: Send + Sync + 'static>(
     raw_routes: Vec<GlobalRawRoute<G>>,
     raw_named: Vec<GlobalRawNamed<G>>,
     init_global: InitGlobal<G>,
-    on_reload: OnReload<G>,
     renderer: Arc<dyn RendererFactory>,
 ) -> Result<()> {
     // Before anything else, and before `init_global` below, which is allowed
     // to spawn threads and in m6-auth-server's case does: the mask is
-    // inherited only by threads created after this call, so a watcher started
+    // inherited only by threads created after this call, so a thread started
     // during initialisation would otherwise take SIGTERM at its default
     // disposition and kill the process.
     //
@@ -1450,8 +1438,6 @@ fn run_app_global<G: Send + Sync + 'static>(
         })
         .collect();
 
-    let reload_hook = bind_reload_hook(on_reload, &arc_g);
-
     run_app_with_shutdown(
         Handlers {
             routes: code_routes,
@@ -1461,38 +1447,22 @@ fn run_app_global<G: Send + Sync + 'static>(
         site_dir,
         RunHooks {
             on_thread_exit: None,
-            on_reload: reload_hook,
         },
         cli_log_level,
         renderer,
     )
 }
 
-/// The three optional hooks of a service with global and per-thread state.
-struct StateHooks<G, T> {
+/// The hook a service with global and per-thread state can set for worker
+/// thread teardown.
+struct StateHooks<T> {
     destroy_thread: Destroy<T>,
-    on_reload: OnReload<G>,
 }
 
-/// What a runner hands the run loop to call at the two points a service can
-/// hook: after a reload, and as each worker thread ends.
+/// What a runner hands the run loop to call as each worker thread ends.
 #[derive(Default)]
 struct RunHooks {
     on_thread_exit: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
-    on_reload: Option<ReloadHook>,
-}
-
-/// Close a service's `on_reload` over its global state, so the run loop can
-/// call it with only the context.
-fn bind_reload_hook<G: Send + Sync + 'static>(
-    on_reload: OnReload<G>,
-    global: &Arc<G>,
-) -> Option<ReloadHook> {
-    on_reload.map(|f| {
-        let g = global.clone();
-        let hook: ReloadHook = Arc::new(move |ctx: &AppContext| f(&g, ctx));
-        hook
-    })
 }
 
 /// Run with per-thread state only (no global).
@@ -1505,7 +1475,7 @@ fn run_app_thread_state<T: Any + Send + 'static>(
 ) -> Result<()> {
     // Before anything else, and before `init_global` below, which is allowed
     // to spawn threads and in m6-auth-server's case does: the mask is
-    // inherited only by threads created after this call, so a watcher started
+    // inherited only by threads created after this call, so a thread started
     // during initialisation would otherwise take SIGTERM at its default
     // disposition and kill the process.
     //
@@ -1576,7 +1546,6 @@ fn run_app_thread_state<T: Any + Send + 'static>(
         site_dir,
         RunHooks {
             on_thread_exit: Some(on_thread_exit),
-            ..RunHooks::default()
         },
         cli_log_level,
         renderer,
@@ -1590,15 +1559,12 @@ fn run_app_state<G: Send + Sync + 'static, T: Any + Send + 'static>(
     renderer: Arc<dyn RendererFactory>,
     init_global: InitGlobal<G>,
     init_thread: InitThread<G, T>,
-    hooks: StateHooks<G, T>,
+    hooks: StateHooks<T>,
 ) -> Result<()> {
-    let StateHooks {
-        destroy_thread,
-        on_reload,
-    } = hooks;
+    let StateHooks { destroy_thread } = hooks;
     // Before anything else, and before `init_global` below, which is allowed
     // to spawn threads and in m6-auth-server's case does: the mask is
-    // inherited only by threads created after this call, so a watcher started
+    // inherited only by threads created after this call, so a thread started
     // during initialisation would otherwise take SIGTERM at its default
     // disposition and kill the process.
     //
@@ -1687,7 +1653,6 @@ fn run_app_state<G: Send + Sync + 'static, T: Any + Send + 'static>(
         site_dir,
         RunHooks {
             on_thread_exit: Some(on_thread_exit),
-            on_reload: bind_reload_hook(on_reload, &arc_g),
         },
         cli_log_level,
         renderer,
@@ -1950,11 +1915,10 @@ impl App {
     /// Register a handler under a name, for config to route to.
     ///
     /// `route_get("/health", f)` binds code to a path at the call site, so the
-    /// set of routes is fixed for the life of the process and a config reload
-    /// cannot add one. That is correct for a service whose routes are part of
-    /// its code, and wrong for one whose routes are part of its deployment: a
-    /// static file server gains an asset tree by being told about a directory,
-    /// not by being recompiled.
+    /// set of routes is fixed for the life of the process. That is correct for
+    /// a service whose routes are part of its code, and wrong for one whose
+    /// routes are part of its deployment: a static file server gains an asset
+    /// tree by being told about a directory, not by being recompiled.
     ///
     /// This splits the binding in two along the line where the change actually
     /// falls. The handler is code and is registered here, once. The route is
@@ -1967,11 +1931,9 @@ impl App {
     /// root = "assets/"
     /// ```
     ///
-    /// Config routes are recompiled on every reload, so adding, changing or
-    /// removing one of these takes effect without a restart, and the handler
-    /// reads `root` through `Request::route_setting`. A route naming a handler
-    /// that was never registered is a hard error: startup exits 2 and a reload
-    /// is refused with the previous routes left serving.
+    /// Config routes are compiled at start, and the handler reads `root`
+    /// through `Request::route_setting`. A route naming a handler that was
+    /// never registered is a hard error: startup exits 2.
     pub fn handler(
         mut self,
         name: &str,
@@ -2086,35 +2048,10 @@ pub struct AppWithGlobal<G: Send + Sync + 'static> {
     raw_routes: Vec<GlobalRawRoute<G>>,
     raw_named: Vec<GlobalRawNamed<G>>,
     init_global: InitGlobal<G>,
-    on_reload: OnReload<G>,
     renderer: Arc<dyn RendererFactory>,
 }
 
 impl<G: Send + Sync + 'static> AppWithGlobal<G> {
-    /// Re-read state that `init_global` built from the config.
-    ///
-    /// Called on every reload that has built and checked its new state, with
-    /// the global state and a context carrying the new config, before that new
-    /// state and log level are installed. A reload is triggered by a change to
-    /// the service's config or to `site.toml`.
-    ///
-    /// On `Err` the service logs it at error level and keeps serving the
-    /// previous routes and log level. The reload is tried again after 1 s,
-    /// then 2 s, 4 s and so on up to 60 s, and at once when either file is
-    /// written again. The hook has run by then, so it must be safe to run again
-    /// on the same config.
-    ///
-    /// A panic in the hook is not caught. The release profile aborts on panic,
-    /// so it ends the process and the service manager restarts it. Return
-    /// `Err` for anything that can be recovered from.
-    pub fn on_reload(
-        mut self,
-        f: impl Fn(&G, &AppContext) -> Result<()> + Send + Sync + 'static,
-    ) -> Self {
-        self.on_reload = Some(Arc::new(f));
-        self
-    }
-
     /// Register a handler under a name, for config to route to.
     /// See `App::handler`.
     pub fn handler(
@@ -2196,7 +2133,6 @@ impl<G: Send + Sync + 'static> AppWithGlobal<G> {
             self.raw_routes,
             self.raw_named,
             self.init_global,
-            self.on_reload,
             self.renderer,
         )
     }
@@ -2216,7 +2152,6 @@ impl App {
             raw_routes: vec![],
             raw_named: vec![],
             init_global: Arc::new(init_global),
-            on_reload: None,
             renderer: default_renderer(),
         }
     }
@@ -2243,7 +2178,6 @@ impl App {
             init_global: Arc::new(init_global),
             init_thread: Arc::new(init_thread),
             destroy_thread: None,
-            on_reload: None,
             renderer: default_renderer(),
         }
     }
@@ -2395,23 +2329,12 @@ pub struct AppWithState<G: Send + Sync + 'static, T: Any + Send + 'static> {
     init_global: InitGlobal<G>,
     init_thread: InitThread<G, T>,
     destroy_thread: Destroy<T>,
-    on_reload: OnReload<G>,
     renderer: Arc<dyn RendererFactory>,
 }
 
 impl<G: Send + Sync + 'static, T: Any + Send + 'static> AppWithState<G, T> {
     pub fn on_destroy_thread(mut self, f: impl Fn(T) + Send + Sync + 'static) -> Self {
         self.destroy_thread = Some(Arc::new(f));
-        self
-    }
-
-    /// Re-read state that `init_global` built from the config.
-    /// See [`AppWithGlobal::on_reload`].
-    pub fn on_reload(
-        mut self,
-        f: impl Fn(&G, &AppContext) -> Result<()> + Send + Sync + 'static,
-    ) -> Self {
-        self.on_reload = Some(Arc::new(f));
         self
     }
 
@@ -2500,7 +2423,6 @@ impl<G: Send + Sync + 'static, T: Any + Send + 'static> AppWithState<G, T> {
             self.init_thread,
             StateHooks {
                 destroy_thread: self.destroy_thread,
-                on_reload: self.on_reload,
             },
         )
     }
@@ -2517,16 +2439,13 @@ fn file_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
 
 /// Config routes naming a handler that was never registered.
 ///
-/// Returned rather than logged so the two callers can answer differently in
-/// the way each of them should: startup exits 2, and a reload refuses the new
-/// state and keeps serving the old one.
+/// Returned rather than logged so the caller can exit 2 at startup.
 ///
 /// This is deliberately fatal rather than a per-route warning. A misplaced
 /// wildcard is narrowed and warned about because the narrower reading is still
 /// a defensible route; a handler name with no code behind it has no reading at
 /// all, and the alternatives are a route that 404s or one that 500s while the
-/// config plainly says it should serve. Refusing the whole config keeps the
-/// previous one serving, which is the outcome an operator can recover from.
+/// config plainly says it should serve.
 fn unknown_handlers(
     routes: &[CompiledRoute],
     named: &HashMap<String, Arc<BoxHandler>>,
@@ -2781,24 +2700,6 @@ fn dump_config(
     0
 }
 
-/// Why a reload did not happen.
-enum ReloadError {
-    /// A file is mid-write. Nothing to retry: the write that fills it is a
-    /// change of its own.
-    Skipped(String),
-    /// The new config was refused or did not build. The next write reloads.
-    Failed(String),
-    /// `on_reload` returned `Err`. Nothing was changed, and the reload is
-    /// tried again after a growing delay.
-    HookFailed(String),
-}
-
-impl From<String> for ReloadError {
-    fn from(msg: String) -> Self {
-        ReloadError::Failed(msg)
-    }
-}
-
 /// The name `site.toml` uses for this service's `[[backend]]`: the config
 /// file's stem, falling back to `m6-default`.
 ///
@@ -2815,8 +2716,7 @@ fn backend_name_of(config_path: &std::path::Path) -> String {
 }
 
 /// Whether `site.toml` declares the compression `config` does, for the backend
-/// named `backend_name`. Checked at start, on every reload and by
-/// `--dump-config`.
+/// named `backend_name`. Checked at start and by `--dump-config`.
 ///
 /// "Compresses" means at least one MIME type has a non-zero level. The
 /// defaults give text types real levels and images zero, so a service that has
@@ -2836,8 +2736,7 @@ fn check_compress_declared(
 /// The log format and level, in order of precedence: the command line, then
 /// the service's `[log]`, then `site.toml`'s `[log]`.
 ///
-/// Used at start and on every reload. `site.toml` is read each time, which is
-/// how a level moved there reaches a running service.
+/// Read once at start.
 fn resolve_log(
     site_toml: &std::path::Path,
     config_log: &crate::config::LogConfig,
@@ -2897,13 +2796,7 @@ fn run_app_with_shutdown(
     cli_log_level: Option<String>,
     renderer: Arc<dyn RendererFactory>,
 ) -> Result<()> {
-    let RunHooks {
-        on_thread_exit,
-        on_reload,
-    } = hooks;
-    // Fingerprint the process config before the first read of it, so a change
-    // between that read and the reloader's creation is reported, not lost.
-    let process_fp = crate::watcher::Fingerprint::of(&config_path);
+    let RunHooks { on_thread_exit } = hooks;
 
     // Load config.
     let config = crate::config::load(&config_path, &site_dir).unwrap_or_else(|e| {
@@ -2911,9 +2804,6 @@ fn run_app_with_shutdown(
         std::process::exit(2);
     });
 
-    // Before `validate_startup`, which reads a named `site_toml`: a change
-    // between that read and this fingerprint would otherwise be lost.
-    let site_fp = crate::watcher::Fingerprint::of(&config.resolve_site_toml(&site_dir));
     let site_toml = match validate_startup(&config, &site_dir, &config_path) {
         Ok(path) => path,
         Err(msg) => {
@@ -2922,15 +2812,15 @@ fn run_app_with_shutdown(
         }
     };
 
-    // The reload closure reuses this name for its own compress check.
-    let backend_name = backend_name_of(&config_path);
-
     // Init logging: site.toml base → renderer config [log] → CLI --log-level.
     let (format, level) = resolve_log(&site_toml, &config.log, cli_log_level.as_deref());
     let log_handle = crate::log::init(&format, &level).unwrap_or_else(|e| {
         eprintln!("logging init error: {e}");
         std::process::exit(1);
     });
+    // Held for the life of the process: dropping the handle flushes and stops
+    // the log writer.
+    let _log_handle = log_handle;
 
     let socket_path = crate::socket_path_from_config(&config_path);
 
@@ -2952,9 +2842,6 @@ fn run_app_with_shutdown(
     let mut registered_names: Vec<String> = named_handlers.keys().cloned().collect();
     registered_names.sort();
 
-    // What the process started with. The keys a reload cannot apply are
-    // compared with these, not with the last config that was loaded.
-    let startup_config = config.clone();
     let framework_state =
         FrameworkState::build(config, site_dir.clone(), &code_route_signatures, &*renderer)
             .unwrap_or_else(|e| {
@@ -2994,15 +2881,13 @@ fn run_app_with_shutdown(
     let tp_size = framework_state.config.thread_pool.size;
     let tp_queue = framework_state.config.thread_pool.queue_size;
     // Read once at startup, like the pool dimensions above and for the same
-    // reason: it is applied to a socket at accept time, so a reload cannot
-    // retune it without reopening connections that are already being served.
+    // reason: it is applied to a socket at accept time.
     let read_timeout = framework_state.config.server.read_timeout;
     let socket_mode = framework_state.config.server.socket_mode;
 
-    // Wrap state in RwLock so hot reload can atomically swap it while
-    // in-flight requests continue reading the old state via their cloned Arc.
-    let fs: Arc<std::sync::RwLock<FrameworkState>> =
-        Arc::new(std::sync::RwLock::new(framework_state));
+    // Built once at start and shared read-only across the worker threads.
+    // Nothing writes it after start, so it needs no lock.
+    let fs: Arc<FrameworkState> = Arc::new(framework_state);
 
     // Build handler lookup map (pattern:METHOD → handler).
     // Include the method in the key so GET and POST handlers registered on the
@@ -3034,118 +2919,14 @@ fn run_app_with_shutdown(
     // to exist by the time a signal can arrive.
     let shutdown = install_shutdown(&socket_path);
 
-    {
-        let fs_r = fs.read().unwrap();
-        info!(
-            routes = fs_r.routes.len(),
-            threads = tp_size,
-            socket = %socket_path.display(),
-            "routes loaded"
-        );
-    }
-
-    let pool = Arc::new(ThreadPool::new_with_exit(tp_size, tp_queue, on_thread_exit));
-
-    // ── Hot-reload setup ──────────────────────────────────────────────────
-    // One reloader watches both files. Its descriptor is added to the poll(2)
-    // call, so a change is seen within milliseconds when the platform has a
-    // watcher, and within a second by the fingerprint poll when it does not or
-    // when the watch has been lost. It settles for a short debounce, so a
-    // writer that writes several files and then touches the config is one
-    // reload.
-    let mut reloader = crate::watcher::ConfigReloader::new(
-        &site_toml,
-        &config_path,
-        crate::watcher::Seen {
-            site: site_fp,
-            process: process_fp,
-        },
+    info!(
+        routes = fs.routes.len(),
+        threads = tp_size,
+        socket = %socket_path.display(),
+        "routes loaded"
     );
 
-    // One reload, returning the route count or the message to log. The same
-    // refusals as at start: a named `site_toml` that is gone or does not
-    // parse, a compress declaration that disagrees with this service, and a
-    // route naming a handler this binary does not have. Each keeps the old
-    // state serving, so a bad edit of either file is recoverable.
-    let reload = |changed: crate::watcher::Changed| -> std::result::Result<usize, ReloadError> {
-        // A file that a writer has truncated and not yet written is empty. An
-        // empty process config loads with no routes and an empty `site.toml`
-        // resets the log level, so neither is loaded. The write that fills the
-        // file is a change of its own and reloads.
-        for (file, path) in [(changed.process, &config_path), (changed.site, &site_toml)] {
-            if file && std::fs::metadata(path).is_ok_and(|m| m.len() == 0) {
-                return Err(ReloadError::Skipped(format!(
-                    "Reload skipped: {} is empty, keeping the current state",
-                    path.display()
-                )));
-            }
-        }
-        let new_config = crate::config::load(&config_path, &site_dir)
-            .map_err(|e| format!("Reload failed (config parse error): {e}"))?;
-        // Not `validate_startup`: the `site_toml` key only takes effect on
-        // restart, so the compress check reads the file this service already
-        // has open, not the one the new config names.
-        check_site_toml(&new_config, &site_dir)
-            .and_then(|_| check_compress_declared(&new_config, &site_toml, &backend_name))
-            .map_err(|msg| format!("Reload refused: {msg}"))?;
-        // A `site.toml` that does not parse keeps the current state whether or
-        // not `site_toml` names it. At start the default path is tolerant.
-        if let Ok(text) = std::fs::read_to_string(&site_toml) {
-            if let Err(e) = text.parse::<toml::Table>() {
-                return Err(format!(
-                    "Reload refused: {} is not valid TOML: {}",
-                    site_toml.display(),
-                    e.message()
-                )
-                .into());
-            }
-        }
-        let changed_keys =
-            crate::config::restart_only_changes(&startup_config, &new_config, &site_dir);
-        let (format, level) = resolve_log(&site_toml, &new_config.log, cli_log_level.as_deref());
-        let new_state = FrameworkState::build(
-            new_config,
-            site_dir.clone(),
-            &code_route_signatures,
-            &*renderer,
-        )
-        .map_err(|e| format!("Reload failed (template/state error): {e}"))?;
-        let missing = unknown_handlers(new_state.routes.routes(), &named_handlers, &code_patterns);
-        if !missing.is_empty() {
-            return Err(format!(
-                "Reload refused, route names an unregistered handler: {}",
-                describe_unknown(&missing, &registered_names)
-            )
-            .into());
-        }
-        let routes = new_state.routes.len();
-        // The hook runs first, on the new config, and the new state and log
-        // level are installed only when it succeeds. A failed hook therefore
-        // leaves the routes and the level as they were, and the change is
-        // asked for again.
-        if let Some(hook) = &on_reload {
-            let ctx = AppContext {
-                config: &new_state.config.user_config,
-                site_dir: &site_dir,
-                config_path: &config_path,
-                site_toml: &site_toml,
-            };
-            if let Err(e) = hook(&ctx) {
-                return Err(ReloadError::HookFailed(format!(
-                    "Reload hook failed: {e:#}"
-                )));
-            }
-        }
-        *fs.write().unwrap() = new_state;
-        for k in changed_keys {
-            warn!(
-                key = k,
-                "config reload: {k} changed; restart this service to apply it"
-            );
-        }
-        log_handle.reload(&format, &level);
-        Ok(routes)
-    };
+    let pool = Arc::new(ThreadPool::new_with_exit(tp_size, tp_queue, on_thread_exit));
 
     use std::os::unix::io::AsRawFd;
     let listener_fd = listener.as_raw_fd();
@@ -3153,52 +2934,12 @@ fn run_app_with_shutdown(
     loop {
         // ── poll(2) ─────────────────────────────────────────────────────
         // The 100 ms timeout ensures we catch shutdown signals promptly
-        // even when the server is completely idle. It is shorter while the
-        // reloader holds a report, so that report is made on time.
-        let timeout = reloader.timeout_ms(std::time::Instant::now(), 100);
-        let ready =
-            crate::server::poll_listener_and_watcher(listener_fd, reloader.raw_fd(), timeout);
-        let listener_ready = ready.listener;
-        let now = std::time::Instant::now();
+        // even when the server is completely idle.
+        let listener_ready = crate::server::poll_listener(listener_fd, 100);
 
-        if ready.watcher {
-            reloader.on_readable(now);
-        }
-
-        // Neither fd fired: a timeout, or a signal interrupted the wait.
-        if ready.idle && is_shutdown() {
+        // The wait timed out or a signal interrupted it.
+        if !listener_ready && is_shutdown() {
             break;
-        }
-
-        // ── Hot reload ───────────────────────────────────────────────────
-        // Every iteration, idle or not: the debounce deadline and the
-        // fingerprint poll are both decided here.
-        if let Some(changed) = reloader.tick(now) {
-            info!(
-                site = changed.site,
-                process = changed.process,
-                "Config change detected, reloading..."
-            );
-            let reload_start = std::time::Instant::now();
-            match reload(changed) {
-                Err(ReloadError::Skipped(msg)) => warn!("{msg}"),
-                Err(ReloadError::Failed(msg)) => error!("{msg}"),
-                Err(ReloadError::HookFailed(msg)) => {
-                    let delay = reloader.retry(changed, std::time::Instant::now());
-                    error!("{msg}; retrying in {}s", delay.as_secs());
-                }
-                Ok(routes) => {
-                    let elapsed = reload_start.elapsed().as_millis();
-                    info!(
-                        elapsed_ms = elapsed,
-                        routes = routes,
-                        site = changed.site,
-                        process = changed.process,
-                        "Reload complete"
-                    );
-                }
-            }
-            // Don't skip accept — the listener may also be ready.
         }
 
         if !listener_ready {
@@ -3251,7 +2992,7 @@ fn run_app_with_shutdown(
 /// one request per connection.
 fn handle_connection(
     stream: &mut UnixStream,
-    fs: &std::sync::RwLock<FrameworkState>,
+    fs: &FrameworkState,
     code_handlers: &HashMap<String, Arc<BoxHandler>>,
     named_handlers: &HashMap<String, Arc<BoxHandler>>,
 ) {
@@ -3294,37 +3035,23 @@ fn minified(_: &str, _: &[u8], _: &crate::config::MinificationConfig) -> Option<
 fn handle_request<W: std::io::Write>(
     raw: RawRequest,
     stream: &mut crate::h1::Responder<'_, W>,
-    fs: &std::sync::RwLock<FrameworkState>,
+    fs: &FrameworkState,
     code_handlers: &HashMap<String, Arc<BoxHandler>>,
     named_handlers: &HashMap<String, Arc<BoxHandler>>,
 ) {
     let start = std::time::Instant::now();
 
-    // The framework read lock is taken once per request, and the guard is
-    // dropped before the handler runs, the template renders or anything is
-    // written to the client. A reload waits for the write lock, and std's
-    // `RwLock` stops granting new readers once a writer is waiting, so work
-    // done under this guard delays every request that arrives after a reload
-    // starts. The old renderer and route table are freed by whichever finishes
-    // last: the reload, or the last request still holding their `Arc`s.
-    //
-    // Under the guard: copy out the `Arc`s the rest of the request needs (a
-    // refcount bump each, not a copy of two `HashMap`s and a `PathBuf`), match
-    // the route against the shared table, and build the dictionary, which
-    // reads a params file on a cache miss. A request that started before a
-    // reload finishes against the renderer and config it began with.
-    let (routes, site_dir, config, renderer);
+    // The state is built once at start and shared read-only. Under this
+    // borrow: match the route against the shared table and build the
+    // dictionary, which reads a params file on a cache miss.
     let matched = {
-        let fs_r = fs.read().unwrap();
-        routes = Arc::clone(&fs_r.routes);
-        site_dir = Arc::clone(&fs_r.site_dir);
-        config = Arc::clone(&fs_r.config);
-        renderer = Arc::clone(&fs_r.renderer);
-        find_route(raw.path(), raw.method(), &routes).map(|(route, path_params)| {
-            let dict = fs_r.build_dict(&raw, route, &path_params);
+        let routes = &fs.routes;
+        find_route(raw.path(), raw.method(), routes).map(|(route, path_params)| {
+            let dict = fs.build_dict(&raw, route, &path_params);
             (route, dict)
         })
     };
+    let config = &fs.config;
     let compression = &config.compression;
     let minification = &config.minification;
 
@@ -3363,9 +3090,9 @@ fn handle_request<W: std::io::Write>(
             // no use for it after this, and a `Request` owning one used to
             // cost a full copy of the method, path, query, every header and
             // the body, per request.
-            let req = Request::new(raw, dict.clone(), Arc::clone(&site_dir))
+            let req = Request::new(raw, dict.clone(), Arc::clone(&fs.site_dir))
                 .with_route(route)
-                .with_config(Arc::clone(&config));
+                .with_config(Arc::clone(&fs.config));
 
             // Dispatch to code handler or template render.
             // A code handler is only used when the matched route is a code route
@@ -3377,10 +3104,10 @@ fn handle_request<W: std::io::Write>(
             let mut resp = if let Some(name) = &route.handler {
                 // A config-declared route naming a registered handler. The
                 // lookup cannot miss: `unknown_handlers` refuses a state whose
-                // routes name anything absent, at startup and at every reload,
-                // so an absent handler here means that check was bypassed
-                // rather than that config is wrong. Answer 500 and say so,
-                // rather than 404, which would read as "no such page".
+                // routes name anything absent at startup, so an absent handler
+                // here means that check was bypassed rather than that config is
+                // wrong. Answer 500 and say so, rather than 404, which would
+                // read as "no such page".
                 match named_handlers.get(name) {
                     Some(handler) => match handler.call(&req) {
                         Ok(r) => r,
@@ -3415,7 +3142,7 @@ fn handle_request<W: std::io::Write>(
 
             // Render template if needed.
             if resp.template_name.is_some() {
-                match FrameworkState::render_response(&*renderer, &mut resp, &dict) {
+                match FrameworkState::render_response(&*fs.renderer, &mut resp, &dict) {
                     Ok(()) => {}
                     Err(RenderError::NotFound) => {
                         warn!(path = req.path(), "template signalled not_found");
@@ -3909,67 +3636,6 @@ mod tests {
         assert!(
             !(submitted1 && submitted2),
             "both submits succeeded but queue_size=1"
-        );
-    }
-
-    /// Hot-reload: FrameworkState::build succeeds with a fresh config, and the
-    /// RwLock swap is visible to subsequent readers.
-    #[test]
-    fn test_hot_reload_state_swap() {
-        use std::io::Write;
-        use std::sync::RwLock;
-        use tempfile::NamedTempFile;
-
-        let site_dir = tempfile::TempDir::new().unwrap();
-        // Create a minimal templates directory so Tera doesn't scan an
-        // unpredictable system directory (e.g. /tmp with stale root-owned dirs).
-        std::fs::create_dir(site_dir.path().join("templates")).unwrap();
-
-        let mut f = NamedTempFile::new().unwrap();
-        writeln!(f, "site_name = \"v1\"").unwrap();
-
-        let cfg1 = crate::config::load(f.path(), site_dir.path()).unwrap();
-        assert_eq!(cfg1.user_config["site_name"].as_str().unwrap(), "v1");
-
-        let state1 = FrameworkState::build(
-            cfg1,
-            site_dir.path().to_path_buf(),
-            &[],
-            &*default_renderer(),
-        )
-        .unwrap();
-        let fs = Arc::new(RwLock::new(state1));
-
-        // Verify initial state.
-        assert_eq!(
-            fs.read().unwrap().config.user_config["site_name"]
-                .as_str()
-                .unwrap(),
-            "v1"
-        );
-
-        // Write a new config.
-        let mut f2 = NamedTempFile::new().unwrap();
-        writeln!(f2, "site_name = \"v2\"").unwrap();
-
-        let cfg2 = crate::config::load(f2.path(), site_dir.path()).unwrap();
-        let state2 = FrameworkState::build(
-            cfg2,
-            site_dir.path().to_path_buf(),
-            &[],
-            &*default_renderer(),
-        )
-        .unwrap();
-
-        // Atomic swap.
-        *fs.write().unwrap() = state2;
-
-        // New state is visible.
-        assert_eq!(
-            fs.read().unwrap().config.user_config["site_name"]
-                .as_str()
-                .unwrap(),
-            "v2"
         );
     }
 
@@ -4486,7 +4152,7 @@ mod config_route_handler_tests {
     use std::io::Write;
 
     /// Build a `FrameworkState` from TOML written to a temporary file, the way
-    /// the service does at startup and again at every reload.
+    /// the service does at startup.
     fn state_from(toml: &str) -> (FrameworkState, tempfile::TempDir) {
         let site_dir = tempfile::TempDir::new().unwrap();
         std::fs::create_dir(site_dir.path().join("templates")).unwrap();
@@ -4540,13 +4206,7 @@ mod config_route_handler_tests {
         let mut out = Vec::new();
         {
             let mut resp = crate::h1::Responder::new(&mut out, "GET", false);
-            handle_request(
-                raw,
-                &mut resp,
-                &std::sync::RwLock::new(state),
-                &HashMap::new(),
-                &named,
-            );
+            handle_request(raw, &mut resp, &state, &HashMap::new(), &named);
         }
         let head_end = out.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
         let head = String::from_utf8_lossy(&out[..head_end]).to_ascii_lowercase();
@@ -4571,177 +4231,8 @@ tail = false
         assert_eq!(route.pattern, "/assets/{*relpath}");
     }
 
-    /// The point of the whole change, at the level the state owns it: the route
-    /// table is rebuilt from config, so a config that gained a route produces a
-    /// state that serves it, with the same handlers and no restart.
-    ///
-    /// `App` registers code routes once at startup. That is correct for a route
-    /// that is part of the program and wrong for one that is part of the
-    /// deployment, and it was the last thing standing between `m6-file` and
-    /// `App`: its `handle_reload` rebuilds its route table today, so migrating
-    /// as things stood would have quietly removed the ability to add an asset
-    /// tree without restarting the service.
-    #[test]
-    fn a_reload_adds_a_route_that_the_previous_state_did_not_have() {
-        use std::sync::RwLock;
-
-        let (state1, _d) = state_from(FILES);
-        let fs = Arc::new(RwLock::new(state1));
-
-        // Before: nothing answers under /downloads.
-        assert!(find_route("/downloads/report.pdf", "GET", &fs.read().unwrap().routes).is_none());
-
-        let (state2, _d2) = state_from(&format!(
-            "{FILES}\n[[route]]\npath = \"/downloads/{{*relpath}}\"\nhandler = \"files\"\nroot = \"files/\"\n"
-        ));
-        *fs.write().unwrap() = state2;
-
-        // After: it does, and it is bound to the same handler the binary
-        // already had.
-        let guard = fs.read().unwrap();
-        let (route, params) = find_route("/downloads/report.pdf", "GET", &guard.routes)
-            .expect("the reloaded state should serve the new route");
-        assert_eq!(route.handler.as_deref(), Some("files"));
-        assert_eq!(
-            route.settings.get("root").unwrap().as_str().unwrap(),
-            "files/"
-        );
-        assert_eq!(params[0].1, "report.pdf");
-
-        // And the route that was already there is untouched.
-        assert!(find_route("/assets/css/main.css", "GET", &guard.routes).is_some());
-    }
-
-    /// A renderer that reports it has started, then blocks until released.
-    struct BlockedRenderer {
-        started: std::sync::mpsc::SyncSender<()>,
-        release: Mutex<std::sync::mpsc::Receiver<()>>,
-    }
-
-    impl Renderer for BlockedRenderer {
-        fn render(&self, _template: &str, _ctx: &Dict) -> std::result::Result<String, RenderError> {
-            self.started.send(()).ok();
-            self.release.lock().unwrap().recv().ok();
-            Ok("rendered".to_string())
-        }
-    }
-
-    struct BlockedFactory(Mutex<Option<BlockedRenderer>>);
-
-    impl RendererFactory for BlockedFactory {
-        fn build(
-            &self,
-            _site_dir: &std::path::Path,
-            _template_paths: &[String],
-        ) -> anyhow::Result<Box<dyn Renderer>> {
-            Ok(Box::new(self.0.lock().unwrap().take().unwrap()))
-        }
-    }
-
-    /// A renderer that answers with a fixed body.
-    struct FixedRenderer(&'static str);
-
-    impl Renderer for FixedRenderer {
-        fn render(&self, _template: &str, _ctx: &Dict) -> std::result::Result<String, RenderError> {
-            Ok(self.0.to_string())
-        }
-    }
-
-    struct FixedFactory(&'static str);
-
-    impl RendererFactory for FixedFactory {
-        fn build(
-            &self,
-            _site_dir: &std::path::Path,
-            _template_paths: &[String],
-        ) -> anyhow::Result<Box<dyn Renderer>> {
-            Ok(Box::new(FixedRenderer(self.0)))
-        }
-    }
-
-    fn template_state(site_dir: &std::path::Path, factory: &dyn RendererFactory) -> FrameworkState {
-        let mut f = tempfile::NamedTempFile::new().unwrap();
-        write!(
-            f,
-            "[[route]]\npath = \"/\"\ntemplate = \"templates/home.html\"\n"
-        )
-        .unwrap();
-        let cfg = crate::config::load(f.path(), site_dir).unwrap();
-        FrameworkState::build(cfg, site_dir.to_path_buf(), &[], factory).unwrap()
-    }
-
-    /// A reload swaps the state while a request is still inside the template
-    /// renderer. The swap is not held up by that request, and the request is
-    /// answered by the renderer it started with, not the one the reload
-    /// installed.
-    #[test]
-    fn a_reload_swaps_the_state_while_a_request_finishes_on_the_old_renderer() {
-        use std::sync::{mpsc, RwLock};
-        use std::time::Duration;
-
-        let (started_tx, started_rx) = mpsc::sync_channel(1);
-        let (release_tx, release_rx) = mpsc::channel();
-        let old = BlockedFactory(Mutex::new(Some(BlockedRenderer {
-            started: started_tx,
-            release: Mutex::new(release_rx),
-        })));
-
-        let site_dir = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir(site_dir.path().join("templates")).unwrap();
-        let fs = Arc::new(RwLock::new(template_state(site_dir.path(), &old)));
-        let reloaded = template_state(site_dir.path(), &FixedFactory("new"));
-
-        let request = {
-            let fs = Arc::clone(&fs);
-            std::thread::spawn(move || {
-                let raw = RawRequest {
-                    version: "HTTP/1.1".to_string(),
-                    method: "GET".to_string(),
-                    path: "/".to_string(),
-                    query: None,
-                    headers: vec![("Host".to_string(), "localhost".to_string())],
-                    body: vec![],
-                };
-                let mut out: Vec<u8> = Vec::new();
-                let mut responder = crate::h1::Responder::new(&mut out, "GET", false);
-                handle_request(raw, &mut responder, &fs, &HashMap::new(), &HashMap::new());
-                out
-            })
-        };
-        started_rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("the request should reach the renderer");
-
-        // The request is blocked in the old renderer. The swap must complete
-        // anyway, and the renderer is not released until it has.
-        let (swapped_tx, swapped_rx) = mpsc::channel();
-        let reload = {
-            let fs = Arc::clone(&fs);
-            std::thread::spawn(move || {
-                *fs.write().unwrap() = reloaded;
-                swapped_tx.send(()).ok();
-            })
-        };
-        let swapped = swapped_rx.recv_timeout(Duration::from_secs(5)).is_ok();
-        release_tx.send(()).unwrap();
-        reload.join().unwrap();
-        let out = String::from_utf8_lossy(&request.join().unwrap()).into_owned();
-
-        assert!(swapped, "the reload waited for the render to finish");
-        assert!(
-            out.contains("rendered"),
-            "the request was answered with: {out}"
-        );
-        assert!(
-            !out.contains("new"),
-            "the request used the reloaded renderer: {out}"
-        );
-    }
-
     /// A handler name with no code behind it has no defensible reading, so it
-    /// is refused rather than narrowed. The caller decides what that means:
-    /// exit 2 at startup, and at reload a refusal that leaves the previous
-    /// routes serving.
+    /// is refused rather than narrowed. The caller exits 2 at startup.
     #[test]
     fn a_route_naming_an_unregistered_handler_is_refused() {
         let (state, _d) = state_from(FILES);
@@ -4907,7 +4398,7 @@ mod dict_cost {
     //! | **total before the engine runs** | **323,292** |
     //!
     //! None of it varies between requests. It is the config and the content
-    //! file, identical until the next reload, deep-copied three times per page.
+    //! file, read once at start, deep-copied three times per page.
 
     use super::*;
     use std::io::Write;
@@ -5621,7 +5112,7 @@ mod route_rule_tests {
     }
 
     /// The check is where `FrameworkState::build` starts, so every load path
-    /// (start and reload) refuses.
+    /// refuses.
     #[test]
     fn building_the_state_refuses_the_conflict() {
         let config = crate::config::RendererConfig {

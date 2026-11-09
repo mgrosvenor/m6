@@ -33,7 +33,6 @@ pub mod telemetry;
 pub mod time_range;
 pub mod tls;
 pub mod util;
-pub mod watcher;
 pub mod wireguard;
 
 // Behind a feature so it is never compiled into a production binary.
@@ -76,7 +75,6 @@ pub use request::Request;
 pub use response::{Body, Response};
 pub use server::{socket_path_from_config, UnixServer};
 pub use signal::ShutdownHandle;
-pub use watcher::{Changed, ConfigReloader, ConfigWatcher, Fingerprint, Seen};
 
 /// Everything a service normally wants, in one line.
 ///

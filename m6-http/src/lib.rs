@@ -20,4 +20,3 @@ pub mod redirect;
 pub mod router;
 pub mod security;
 pub mod stats;
-pub mod watcher;

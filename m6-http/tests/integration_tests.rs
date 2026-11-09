@@ -1,5 +1,5 @@
 // Integration tests for m6-http: Phases 10-13.
-// Covers: routing, caching, auth enforcement, hot reload.
+// Covers: routing, caching, auth enforcement, config loading.
 
 use std::path::Path;
 
@@ -471,8 +471,8 @@ mod phase11 {
             },
         );
 
-        // Simulate: inotify fires on content/posts/hello-world.json
-        // invalidation map maps that file → /blog/hello-world
+        // Simulate: content/posts/hello-world.json changed, and the invalidation
+        // map maps that file to /blog/hello-world
         // evict the affected cache entry
         cache.evict_path("/blog/hello-world");
         assert!(cache.get(&key).is_none());
@@ -581,54 +581,11 @@ mod phase12 {
     }
 }
 
-// ── Phase 13: Hot Reload ─────────────────────────────────────────────────────
+// ── Config load ───────────────────────────────────────────────────────────────
 
-mod phase13 {
-    use m6_http_lib::pool::{BackendPool, PoolManager};
-    use std::path::{Path, PathBuf};
-
+mod config_load {
     #[test]
-    fn socket_appears_added_to_pool() {
-        let mut mgr = PoolManager::new();
-        mgr.add_pool(BackendPool::new(
-            "m6-html".to_string(),
-            "/run/m6/m6-html-*.sock".to_string(),
-        ));
-
-        let sock = Path::new("/run/m6/m6-html-1.sock");
-        mgr.socket_appeared(sock);
-        assert_eq!(mgr.get_pool("m6-html").unwrap().total_count(), 1);
-    }
-
-    #[test]
-    fn socket_disappears_removed_from_pool() {
-        let mut mgr = PoolManager::new();
-        let mut pool =
-            BackendPool::new("m6-html".to_string(), "/run/m6/m6-html-*.sock".to_string());
-        pool.add_socket(PathBuf::from("/run/m6/m6-html-1.sock"));
-        mgr.add_pool(pool);
-
-        assert_eq!(mgr.get_pool("m6-html").unwrap().total_count(), 1);
-        mgr.socket_disappeared(Path::new("/run/m6/m6-html-1.sock"));
-        assert_eq!(mgr.get_pool("m6-html").unwrap().total_count(), 0);
-    }
-
-    #[test]
-    fn all_sockets_gone_pool_is_empty() {
-        let mut pool =
-            BackendPool::new("m6-html".to_string(), "/run/m6/m6-html-*.sock".to_string());
-        pool.add_socket(PathBuf::from("/run/m6/m6-html-1.sock"));
-        pool.remove_socket(Path::new("/run/m6/m6-html-1.sock"));
-        assert_eq!(pool.total_count(), 0);
-        // Connecting to empty pool returns PoolError::Empty
-        assert!(matches!(
-            pool.connect(),
-            Err(m6_http_lib::pool::PoolError::Empty)
-        ));
-    }
-
-    #[test]
-    fn site_toml_reload_updates_route_table() {
+    fn a_changed_site_toml_loads_into_a_new_route_table() {
         use m6_http_lib::config;
         use m6_http_lib::router::RouteTable;
         use tempfile::TempDir;

@@ -397,8 +397,8 @@ fn register_filters(tera: &mut Tera, site_dir: &Path) {
     //
     // The manifest is built once here, not per render: hashing on every request
     // would put a filesystem read and a hash in the hot path of a cache miss.
-    // It is rebuilt whenever Tera is, which is what a config reload already
-    // does, so a redeployed asset gets a new hash without a restart.
+    // It is rebuilt when Tera is, at start, so a redeployed asset gets a new
+    // hash after a restart.
     let manifest = std::sync::Arc::new(build_asset_manifest(site_dir));
     tera.register_filter(
         "asset",
@@ -789,7 +789,7 @@ impl crate::render::Renderer for TeraRenderer {
     }
 }
 
-/// Builds a `TeraRenderer`, at startup and again on every config reload.
+/// Builds a `TeraRenderer` at startup.
 pub struct TeraFactory;
 
 impl crate::render::RendererFactory for TeraFactory {
