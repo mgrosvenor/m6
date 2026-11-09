@@ -49,7 +49,7 @@ Take from it that every route is literal, so the service has no route configurat
 The method column is part of the contract.
 A `GET` on login, refresh or logout does not match the route.
 
-The service holds the database, the signing keys, the token lifetimes and the rate limiter in one shared state.
+The service shares the signing keys, the token lifetimes and the rate limiter between its worker threads, and each worker thread has its own database connection.
 It does not manage users or groups.
 `m6-auth-cli` (the *CLI*, command-line interface) writes those rows directly, and the service reads them at login and refresh.
 
@@ -390,12 +390,13 @@ Section 9 covers the database that holds the users the chain begins with.
 
 The service stores users, groups, memberships and refresh tokens in *SQLite*.
 The `m6-auth` library owns the schema, the password hashes and every query.
-The service opens one connection at startup through `m6_auth::Db::open`.
+The service opens the database once at startup to check it, then each worker thread opens its own connection through `m6_auth::Db::open` on its first request.
+A worker whose open fails answers that request with 500 and tries again on its next request.
 
 `Db::open` sets *WAL* (write-ahead logging), a 5-second busy timeout and foreign keys.
 WAL lets readers and one writer proceed together.
 A second writer waits up to 5 seconds and then fails.
-The server holds its one connection behind a mutex, so its own requests take turns.
+Each worker has its own connection, so a login that is checking a password holds no lock another request needs.
 
 The database path is the `[storage] path` key, resolved against the config file's directory as section 4 states.
 The service creates the parent directory when it is missing.
@@ -420,11 +421,14 @@ The window starts at the first failure and does not slide on each later failure.
 The service listens on a Unix socket, so it takes the value of `X-Forwarded-For`, then `X-Real-IP`.
 When neither is present, the address is the string `unix`.
 m6-http sets the forwarded header and strips any client-supplied copy.
+m6-http sends exactly one address in it, on HTTP/1.1 and HTTP/2, so behind m6-http the `unix` bucket is never used.
 A direct caller can set the header, so the service's socket must be reachable only by m6-http.
 
 The counts live in memory.
 A restart forgets them, and section 4 gives the restart rule for the two keys.
+The service runs as one process per site, so one count covers every login.
 The source comment says that brute force slow enough to survive restarts is left to the firewall.
+The tests `forwarded_addresses_select_the_rate_limit_bucket`, `requests_without_a_forwarded_address_share_one_bucket` and `a_restart_forgets_the_failure_counts` in `m6-auth-server/tests/integration.rs` pin these limits.
 
 The throttle bounds one route and one address at a time.
 Section 11 covers the process around it.
