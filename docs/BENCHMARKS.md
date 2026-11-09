@@ -2,7 +2,7 @@
 
 This page reports m6's benchmark figures with the conditions recorded for each set, and section 11 names the cases where that record is thin.
 This page is the authority for what a client observes end to end.
-`docs/PERFORMANCE.md` owns what one component costs, and `tools/perf-baseline.txt` owns the numbers a merge is gated on.
+`docs/PERFORMANCE.md` owns what one component costs, and `tools/perfcheck.sh` owns the merge gate.
 A figure quoted anywhere else without its conditions is wrong, and this page is where the figure is checked.
 
 The sections below give the evidence for that rule.
@@ -418,7 +418,7 @@ One figure is evidence only with its conditions, and this page is written so a r
 A figure from a busy machine, a mixed core class or a co-located generator at concurrency 8 describes that machine and that harness.
 Section 3 gives the two traps that produce such figures, and section 9 gives the design that cancels machine drift.
 
-The numbers a merge is gated on are different: [`tools/perfcheck.sh`](../tools/perfcheck.sh) measures two render targets against the values recorded in `tools/perf-baseline.txt`, on the build host, with a 20% margin.
+The merge gate is different: [`tools/perfcheck.sh`](../tools/perfcheck.sh) compares the candidate against a base build in an interleaved, pinned A/B on the build host.
 `docs/PERFORMANCE.md` owns what one component costs.
 
 Five items carry weaker conditions than the rest.

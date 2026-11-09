@@ -138,7 +138,7 @@ M6_BUILD_HOST=user@example.com ./tools/build-host-tests.sh
 | compiler warnings | **zero**, release and test builds, pre-existing included | Linux |
 | clippy | **silent. `-D warnings`, no ceiling**, from 2026-09-13 | `tools/clippy.sh` |
 | h1, h2, h3 conformance | at or above the recorded scores | `tools/conformance.sh` |
-| performance | within margin of the recorded number | `tools/perfcheck.sh` |
+| performance | no consistent slowdown against the base build, interleaved A/B on the build host | `tools/perfcheck.sh` |
 | cargo-deny | advisories, licences and sources | `cargo deny check` |
 | the examples build | zero warnings, clippy silent, their tests pass, every config parses | the `m6-examples` repository |
 | the examples work | example 05's end-to-end suite over the whole running stack | `examples/05-cms/test.sh` |

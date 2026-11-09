@@ -2,7 +2,7 @@
 
 This document records what m6 costs, which change made it cost that, and the conditions each figure was taken under.
 It covers per-component costs inside the server.
-End-to-end figures live in [`BENCHMARKS.md`](BENCHMARKS.md), and the numbers a merge is gated on live in `tools/perf-baseline.txt`.
+End-to-end figures live in [`BENCHMARKS.md`](BENCHMARKS.md), and the merge gate is `tools/perfcheck.sh`, an interleaved A/B whose run records live in `tools/perf-history.jsonl`.
 
 A figure without its conditions is unusable, so every number below carries the machine it came from and the method that produced it.
 Section 1 states the rules the rest of the document follows.
@@ -28,11 +28,11 @@ Sending a reader to the wrong one produces a figure that is accurate and irrelev
 | file | what it answers | authority |
 |---|---|---|
 | [`BENCHMARKS.md`](BENCHMARKS.md) | what a client observes end to end | authoritative for any end-to-end figure |
-| `tools/perf-baseline.txt` | what the merge gate requires, in nanoseconds | authoritative for the gated render targets |
+| `tools/perfcheck.sh` | the merge gate: no consistent slowdown against the base build | authoritative for the gated render targets |
 | this document | what an individual component costs, and which change changed it | authoritative for per-component cost |
 
 **Table 1: where each kind of performance number lives.**
-Take from it that an end-to-end claim belongs in `BENCHMARKS.md` and a gated number in `tools/perf-baseline.txt`, so quoting this document for either is a mistake.
+Take from it that an end-to-end claim belongs in `BENCHMARKS.md` and a gate verdict in `tools/perfcheck.sh`, whose run records live in `tools/perf-history.jsonl`, so quoting this document for either is a mistake.
 
 Four rules govern every figure below.
 They exist because a performance document that breaks them misleads more effectively than no document at all.
@@ -518,6 +518,19 @@ Every figure above can be re-taken, and the commands are next.
 Every measurement in this document can be re-run.
 The commands below are grouped by the section they support.
 
+### 7.1. The render figures the earlier gate recorded
+
+The earlier gate recorded absolute render figures in a baseline file, which this change deletes.
+Table 18 keeps the two dated readings, both taken on the 4-core Linux build host, so they stay recoverable as history.
+
+| date | method | render:minimal median ns | render:blog-index median ns | conditions |
+|---|---:|---:|---:|---|
+| 2026-09-14 | three runs, medians of round minimums | 201827 | 1784823 | load 0.20 |
+| 2026-09-27 | three runs of five rounds, medians | 174101 | 1454253 | load 0.12, after the release profile |
+
+**Table 18: the render figures the earlier gate recorded.**
+Take from it that these were absolute numbers on content that has since changed, so they are history and no longer a gate.
+
 **Per-request copy cost, sections 2.2 and 2.5:**
 
 ```sh
@@ -527,7 +540,7 @@ cargo test --release -p m6-core dict_cost  -- --ignored --nocapture
 
 Both are `#[ignore]`d deliberately.
 A timing assertion fires on a loaded build box against correct code, which is the trap `test_static_file_cache_hit` already fell into once.
-These are measurements and the gate for them is `tools/perfcheck.sh` against `tools/perf-baseline.txt`.
+These are measurements and the gate for them is `tools/perfcheck.sh`, an interleaved A/B against the base build.
 
 **Page render A/B, section 2.1.**
 Build the renderer at the two commits into separate target directories, then alternate: start one on a unix socket against a real site directory and its renderer config, warm it, time 300 requests, kill it, repeat with the other, five rounds.
@@ -565,11 +578,11 @@ A performance document that implies more coverage than it has is how the next re
 |---|---|
 | throughput and concurrency | `m6-file` moved from an unbounded channel and a fixed worker set to `App`'s bounded pool with 503 backpressure, and `m6-auth-server` from a thread per connection to the same pool. Both are better shapes under overload and neither has a number |
 | conformance-side timing | h2spec and h3spec are correctness gates. h3spec must never be used as a load generator, because it deliberately opens stalled and malformed connections, which is what produced the 113 ms figure in section 5.4 |
-| the render figures after the release profile | Table 3 predates the `[profile.release]` change of 2026-09-27, which cut the gated render targets by 13.7% and 18.5%. The current gated numbers are in `tools/perf-baseline.txt`, written by `tools/perfcheck.sh` on the build host |
+| the render figures after the release profile | Table 3 predates the `[profile.release]` change of 2026-09-27, which cut the gated render targets by 13.7% and 18.5%. Those absolute numbers are recorded as history in section 7.1, and the gate now compares the candidate against a base build |
 | magnitude on small hosts | Table 3 is a laptop figure. A single-core VM differs in magnitude, though the direction is a property of the code |
 
-**Table 18: what this document does not cover.**
-Take from it that throughput has no number at all, and that Table 3 is superseded for any gating purpose by `tools/perf-baseline.txt`.
+**Table 19: what this document does not cover.**
+Take from it that throughput has no number at all, and that Table 3 is superseded for any gating purpose by the A/B gate `tools/perfcheck.sh`.
 
 The measured position is that core's per-request copying fell by a factor of 280 and the static file path no longer allocates what it does not send.
 The cache lookup costs 125 ns and is flat, and the QUIC handshake completes in one round trip at a conforming amplification factor.
