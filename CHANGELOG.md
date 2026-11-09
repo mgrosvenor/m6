@@ -2285,7 +2285,7 @@ Stated here and not discovered later:
 
 ## 0.2.0 and earlier, 2026-03-15 and before
 
-**The early releases share one flat list of changes.**
+**The early releases are not split by version.**
 This project kept one flat list of changes until 2026-09-13, when `main` became release-only and versions started to mean something.
 Splitting the entries below across the versions they shipped in would mean guessing.
 A changelog that guesses is worse than one that says it does not know.
@@ -2318,7 +2318,7 @@ It is now split so each status asserts its own rule.
 A 200 carries the header, and a 204 must not.
 A test can pin wrong behaviour just as firmly as right behaviour, and this one did.
 
-Found by reading a 304 off a raw socket against a running server, and not from the source.
+Found by reading a 304 off a raw socket against a running server.
 
 694 workspace tests pass.
 Zero warnings.
@@ -2338,7 +2338,7 @@ The spec cross-checks against `Date`:
 
 Taking the max is conservative in both directions.
 A missing or under-reported Age is corrected upward by Date.
-A clock skewed so Date is in the future yields zero apparent age instead of a negative one, leaving Age to stand.
+A clock skewed so Date is in the future yields zero apparent age, leaving Age to stand.
 
 `response_delay`, the third term in 4.2.3, is deliberately omitted as an approximation.
 Including it means threading each request's start time through all 31 insert sites.
@@ -2381,7 +2381,7 @@ A reload that previously replayed from cache in ~2us now reaches the backend.
 On the origin that is a couple of milliseconds.
 From a cache node it is a round trip to the origin.
 That is what the client asked for, and it is the only way "force refresh" can work at all.
-It is a real change in behaviour for reloads, and not a free correctness win.
+It is a real change in behaviour for reloads.
 
 Twelve tests, covering the parse edge cases (quoted values containing commas, malformed numbers, Pragma precedence) and the behaviour against a live cache.
 
@@ -2394,7 +2394,7 @@ Zero warnings.
 **F012-F014, content negotiation ignored q-values.**
 `choose_encoding` tested `accept_encoding.contains("br")`.
 Substring matching, so `Accept-Encoding: gzip, br;q=0` still matched, and the response went out brotli-encoded to something that had said it could not accept it.
-`q=0` means *not acceptable* (RFC 9110 12.4.2), and not "least preferred".
+`q=0` means *not acceptable* (RFC 9110 12.4.2).
 Preference was ignored too.
 `gzip;q=1.0, br;q=0.1` chose brotli because `br` was tested first.
 
@@ -2409,7 +2409,7 @@ The header is now appended, reporting the protocol the request was RECEIVED on.
 h2/h3 say `2`/`3` even though they leave as HTTP/1.1, because Via describes the hop received.
 An upstream proxy's Via is preserved and extended, never replaced.
 
-The pseudonym is the fixed token `m6`, and not the node hostname.
+The pseudonym is the fixed token `m6`.
 RFC 9110 7.6.3 allows a pseudonym precisely so an intermediary need not disclose its internal naming.
 `origin`/`edge-a`/`edge-b` would hand every client a map of the topology for nothing.
 A test asserts Via leaks none of those names.
@@ -2444,7 +2444,7 @@ Steps 1 and 2 did not exist at all.
 
 `If-Match` correctly uses *strong* comparison, so a weak validator does not authorise a write even though it names the same entity.
 There is a test for that asymmetry specifically.
-An unparseable date is ignored instead of treated as a failure (RFC 9110 13.1.4), or a malformed header would turn every request into a 412.
+An unparseable date is ignored (RFC 9110 13.1.4), or a malformed header would turn every request into a 412.
 
 Wired into all four server paths, with the HTTP/3 site taking the method from its `:method` pseudo-header.
 `is_not_modified` is kept as a wrapper for compatibility but documented as unable to express 412.
@@ -2452,7 +2452,7 @@ Wired into all four server paths, with the HTTP/3 site taking the method from it
 Eleven tests.
 Note two of them initially failed for a reason worth recording.
 The fixtures used weekday names that did not match their dates.
-"Wed, 03 Sep 2026" is a Thursday, `httpdate` rejected them, and the date-based tests were silently exercising the unparseable-date path instead of the one they named.
+"Wed, 03 Sep 2026" is a Thursday, `httpdate` rejected them, and the date-based tests were silently exercising the unparseable-date path.
 
 654 workspace tests pass.
 Zero warnings on Linux and macOS.
@@ -2465,7 +2465,7 @@ On a reused connection that disagreement means the remainder is read as the head
 
 - **F032** the CRLF after each chunk's data is now required.
   It was skipped only `if` it happened to be present, so a chunk whose data was followed by anything else silently resynchronised onto the wrong offset and the rest of the body was parsed as chunk headers.
-- **F033/F034** the trailer section is parsed instead of ignored.
+- **F033/F034** the trailer section is parsed.
   The decoder returned at the zero-size chunk without confirming the message terminated, so a body truncated mid-trailer was indistinguishable from a complete one.
   Trailer field names are validated as tokens, so a malformed line is a parse error.
 
@@ -2490,7 +2490,7 @@ Zero warnings on Linux and macOS.
 
 ## m6-http: stop emitting two Content-Length headers
 
-Found by reading a live HEAD off a raw socket after deploying the response framing work, and not in review or by any test.
+Found by reading a live HEAD off a raw socket after deploying the response framing work.
 
 `build_response` wrote every upstream header verbatim and then appended its own `content-length`.
 On an asset that produced:
@@ -2526,12 +2526,12 @@ Each of these was a way to disagree, so each is now a hard error.
   RFC 9112 6.1 forbids sending both, and a recipient that picks one is the classic smuggling primitive because the next hop may pick the other.
 - **F030** `Transfer-Encoding` is a list and only the final coding frames the message.
   Only a value that was literally `chunked` was recognised, so a valid `gzip, chunked` was treated as unframed and the chunk envelope was returned as though it were the body.
-  A `Transfer-Encoding` not ending in `chunked` now errors instead of falling back to read-to-EOF.
+  A `Transfer-Encoding` not ending in `chunked` now errors.
 - **F031** an unparseable `Content-Length` is refused.
   It became `None` via `.ok()` and fell through to read-to-EOF, silently switching framing mode on malformed input.
-  Digits are now validated explicitly (`1*DIGIT`, RFC 9110 8.6), and not left to `str::parse`, **which accepts a leading `+`**.
-  `Content-Length: +5` had therefore been read as 5.
-  That was caught by the test, and not by reading the code.
+  Digits are now validated explicitly (`1*DIGIT`, RFC 9110 8.6).
+  `str::parse` accepts a leading `+`, so `Content-Length: +5` had been read as 5.
+  That was caught by the test.
 - **F035** responses to HEAD, and 1xx/204/304, are bodyless whatever their headers claim (RFC 9112 6.3).
   The reader did not know the request method and blocked waiting for `Content-Length` bytes a correct backend never sends, so every HEAD to a backend stalled until the read timeout.
   `read_response_for` takes the method, and `read_response` remains for callers that cannot know it.
@@ -2562,8 +2562,8 @@ Here the proxy generates the malformed bytes itself and does so with the backend
 - path and query: no CR, LF, NUL or space
 - `X-Forwarded-For` / `X-Forwarded-Host`, both derived from client-controlled input and written by the proxy itself
 
-Refused, and not sanitised.
-RFC 9113 8.2.1 makes such a message malformed, and silently rewriting a request before handing it to a backend hides an attack instead of stopping it.
+Refused.
+RFC 9113 8.2.1 makes such a message malformed, and silently rewriting a request before handing it to a backend hides an attack.
 Hop-by-hop headers are exempt because they are dropped before serialisation and cannot reach the backend.
 That exemption is pinned by a test so the skip list and the check cannot drift into a hole.
 
@@ -2636,7 +2636,7 @@ m6 has a clock and generated no `Date` on anything.
 A recipient cannot compute a response's age without it, which is why the `Age` header added earlier was not sufficient on its own.
 The two are only useful together.
 
-**Stamped before the cache insert, and not after.**
+**Stamped before the cache insert.**
 This is the part worth recording.
 `Vary` is deliberately applied *after* the insert so `should_cache` sees the backend's own value.
 Copying that pattern for `Date` produced a cache hit whose headers had no `Date` at all.
@@ -2677,13 +2677,13 @@ That is exactly backwards: it carried an explicit expiry and the cache ignored i
 
 Now implemented in the precedence RFC 9111 4.2.1 requires: `s-maxage`, then `max-age`, then `Expires - Date`, then the bounded heuristic.
 
-Measured against the **response's own `Date`**, and not our clock.
+Measured against the **response's own `Date`**.
 Using local time would silently lengthen or shorten the lifetime by however much the two servers' clocks disagree.
 That is a real effect on a cache sitting between two machines.
 A missing `Date` falls back to now.
-An `Expires` at or before `Date` means already stale, and yields zero, and not a duration that would wrap.
+An `Expires` at or before `Date` means already stale, and yields zero.
 
-Five tests, including clock skew (Date and Expires both shifted an hour, and the interval is still honoured), `max-age` outranking `Expires`, a past `Expires`, and unparseable garbage falling back to the heuristic, and not being mistaken for an expiry.
+Five tests, including clock skew (Date and Expires both shifted an hour, and the interval is still honoured), `max-age` outranking `Expires`, a past `Expires`, and unparseable garbage falling back to the heuristic.
 
 601 workspace tests pass across two consecutive runs, zero warnings.
 
@@ -2696,7 +2696,7 @@ Five tests, including clock skew (Date and Expires both shifted an hour, and the
 A response with no explicit lifetime stored with `expires_at = None` and stayed fresh indefinitely.
 That was the deliberate CDN-style model the deploy pipeline relies on.
 Content lives until `invalidate-cache.sh` clears it.
-"Forever" is not a defensible reading of RFC 9111 4.2.2, which permits a *heuristic* freshness lifetime, and not an unbounded one.
+"Forever" is not a defensible reading of RFC 9111 4.2.2, which permits a *heuristic* freshness lifetime.
 An entry whose invalidation was missed for any reason would be served indefinitely.
 
 Bounded at 24 hours.
@@ -2732,7 +2732,7 @@ Its comment says "so callers can retry rather than panic", but no caller retries
 The test now polls with a real request until the server answers.
 
 That is the third instance of the same mistake in this codebase's tests.
-They waited for a proxy for readiness, and not readiness itself.
+They waited for a proxy for readiness.
 
 596 workspace tests pass across three consecutive runs, zero warnings.
 
@@ -2748,15 +2748,15 @@ Two halves, and the second is the one that matters in a chain:
 - **`Age` is now emitted** on every cache-served response, at all three cache-hit sites.
   Verified live: absent on MISS, 3 after three seconds, 8 after eight, exactly one header.
 - **Upstream age carries forward** (F046).
-  RFC 9111 4.2.3 defines age as time since the response was *generated*, and not since this cache happened to store it.
+  RFC 9111 4.2.3 defines age as time since the response was *generated*.
   An entry that arrived already one hop old had its clock reset to zero, so each hop in a chain made the content look fresher than it was.
   The `Age` the origin declared is now folded into the stored entry and added to the time held locally.
 
-The age travels on the `Lookup` result, and not written into the stored headers.
+The age travels on the `Lookup` result.
 The value changes every second, the stored headers are shared behind an `Arc`, and the callers already build an owned header vector to add `Vary`/`alt-svc`.
 This costs nothing on the cache-hit path.
 
-Four tests, including a malformed upstream `Age` being ignored, and not poisoning the calculation.
+Four tests, including a malformed upstream `Age` being ignored.
 
 Still open in this area: `Expires`/`Date`-based freshness (F047), bare `public` being fresh forever (F048), and unsafe-method invalidation (F058).
 
@@ -2823,7 +2823,7 @@ let header_block = &payload[pos..];        // panics when payload.len() < pos
 A HEADERS frame declaring PRIORITY but carrying fewer than the five bytes the priority fields require sliced out of range and aborted.
 Reachable immediately after the connection preface, with no other setup and no valid request.
 
-Verified, and not assumed: restoring the original line makes the new test fail with `range start index 5 out of range for slice of length 0`.
+Verified: restoring the original line makes the new test fail with `range start index 5 out of range for slice of length 0`.
 A first attempt at that verification was itself wrong.
 A partial revert left the new padding bounds-check in place, which also guards the slice, so the test passed and looked vacuous.
 Reverting to the exact original line showed the panic.
@@ -2899,7 +2899,7 @@ The body is excluded, so legitimate LF bytes in a payload are unaffected.
 - **Malformed request lines**: ten shapes including absolute-form, CONNECT and raw control bytes.
 - **Application injection**: SQLi/XSS/template/JNDI-shaped queries, overlong UTF-8, double-encoding, and six path-traversal encodings.
 
-The tests assert properties, and not status codes.
+The tests assert properties.
 They assert no smuggling, no injected header in the response head, no hang and no crash, with a known-good request after every case to prove the server is still healthy.
 A deliberate diagnostic test prints what the server actually returns, so a suite of vacuous passes (every reply empty) cannot masquerade as coverage.
 It shows 400 for every framing abuse, 404 for traversal, and 405 for CONNECT.
@@ -2909,7 +2909,7 @@ It shows 400 for every framing abuse, 404 for traversal, and 405 for CONNECT.
 An empty `Host:` header is answered 200.
 RFC 9112 3.2 requires 400 for a missing or invalid `Host` in HTTP/1.1, and an empty value is invalid.
 Left alone for now because the redirect path validates the host separately and nothing reflects it.
-Recorded, and not silently passed over.
+Recorded.
 
 544 workspace tests pass, zero warnings.
 The robustness suite is 17/17 serially.
@@ -2923,7 +2923,7 @@ m6-html emitted an `ETag`, so `If-None-Match` validated correctly, but there was
 A client or tool validating by date got the entire page back every time.
 `/` is 52 KB, which is exactly the figure the audit reported.
 
-**The hard part was deciding what value is truthful, and not where to put it.**
+**The hard part was deciding what value is truthful.**
 A rendered page has no file of its own to stat.
 It does have inputs, and their mtimes are an honest answer:
 
@@ -2938,8 +2938,8 @@ It does have inputs, and their mtimes are an honest answer:
 Computed once when the framework state is built and recomputed on reload, so it costs nothing per request.
 Emitted only on a success: a validator on a 404 or a 500 invites a client to revalidate an error as though it were content.
 
-**Omitted instead of guessed** in the two cases where no honest value exists.
-A code route decides its handler at request time, and a route whose params path carries a `{placeholder}` resolves per request.
+**Omitted where no honest value exists.**
+A code route, whose handler computes its answer at request time, and a route whose params path carries a `{placeholder}`, which resolves per request.
 RFC 9110 permits omitting the header, and a wrong date is far worse than an absent one.
 
 No change was needed in m6-http.
@@ -2952,7 +2952,7 @@ The directory walk is depth-bounded (8) so a symlink loop under the site directo
 Verified locally: header present on every page, `If-Modified-Since` with the exact value returns 304, with an epoch date returns 200 and the full 16,678 bytes.
 
 **Deploy note:** m6-render is a path dependency of **four** binaries, m6-html, render-contact, render-analytics and render-cms.
-`m6-html` was covered by neither deploy script, and not `deploy-platform.sh` or `deploy.sh --binary`, whose loop is only the three site-repo renderers.
+No deploy script covered `m6-html`: neither `deploy-platform.sh` nor `deploy.sh --binary`, whose loop is only the three site-repo renderers.
 That is the same multi-binary trap that took `/contact` down previously.
 `deploy-platform.sh` now builds, installs and restarts m6-html alongside m6-http and m6-file.
 
@@ -2985,7 +2985,7 @@ That would touch 30+ call sites and would stop HEAD sharing GET's entry.
 HEAD sharing GET's entry is what makes HEAD cheap, and is the shape the audit itself preferred.
 The same property is obtained by construction instead.
 `method_may_read_cache` admits GET and HEAD, `method_may_write_cache` admits GET alone, so the key namespace can only ever hold GET representations and no unsafe method can read or write one.
-Pinned by tests, and not left implicit in a string encoding.
+Pinned by tests.
 
 ### 2. HEAD responses were malformed, not merely bodied
 
@@ -3123,7 +3123,7 @@ A conditional GET returns 304 for the matching coding and 200 for a mismatched o
 
 - Rendered HTML carries no `Last-Modified`, so `If-Modified-Since` never validates and returns the full page.
   Strictly RFC-legal with no modification date available, but it costs a real transfer.
-  Needs a truthful value derived from the render inputs, and not a fabricated one.
+  Needs a truthful value derived from the render inputs.
 - Method confusion and HEAD framing.
   Must be fixed together: today a HEAD wrongly returns a full body, so the entry it stores is byte-identical to a GET entry and the method-less cache key is harmless.
   Fixing the HEAD body alone would store a bodyless response under the shared key and serve the next GET an empty page.
@@ -3131,5 +3131,5 @@ A conditional GET returns 304 for the matching coding and 200 for a mismatched o
 ---
 
 **This file records each m6 release, newest first, and each entry says what changed, why it mattered, and how it was verified.**
-Entries before 1.0.0 sit in one section, `## 0.2.0 and earlier`, because those releases kept one flat list and did not record which change shipped in which version.
+Entries before 1.0.0 sit in one section, `## 0.2.0 and earlier`, for the reason its framing states.
 Later entries carry their version in their heading and repeat the same subsection names, so a reader finds the same facts in the same place across releases.
