@@ -278,11 +278,9 @@ Take from it that App `[log]` is the one key with two homes, and every other key
 
 **Table 1: which file owns each key.**
 
-m6-http accepts most of these keys in either file, and the system config wins.
-A misplaced key works, so m6-http logs a warning at start naming the key and the file it belongs in.
-The warning is silent when both arguments name one file.
-A `[node]` in `site.toml` is never read, so it is warned about too.
-A system config with no `[node]` logs a warning that the node name falls back to `[site].name`.
+m6-http reads each key from its file only.
+A key in the other file stops the start with exit 2, and the error names the key and the file it belongs in.
+The check does not run when both arguments name one file.
 A secrets file is part of its process config.
 
 ### 3.4. Where an app finds `site.toml`
@@ -338,7 +336,7 @@ Only the h2c listener can be internal, so an entry that equals `bind` is refused
 Every entry must be in a local range, which means loopback, private (RFC 1918), link-local, shared (100.64.0.0/10) or IPv6 unique-local.
 Host names are never resolved and a wildcard address such as `0.0.0.0` is refused.
 The list is read at startup, so a change needs a restart.
-The system config wins, and its list replaces the one in `site.toml` as a whole.
+The list is read from the system config only.
 A redirect-mode config ignores the key.
 
 An internal listener accepts a connection only from an address in `internal_peers`, and closes any other before reading a request.
@@ -354,7 +352,7 @@ A new address past that takes the place of the remembered address whose last lin
 When no remembered address qualifies, refusals from the new address are counted.
 Across all addresses it writes at most 32 of those lines in 60 seconds, and refusals past that limit are counted.
 The first refusal after the 60 seconds ends writes one summary line with the counts, the number of distinct counted addresses (up to 1024) and the most recent counted address.
-The list is read at startup, and the system config's list replaces the one in `site.toml` as a whole.
+The list is read at startup, from the system config only.
 
 ```toml
 [server]
@@ -418,7 +416,7 @@ Error responses are never cached regardless of mode.
 | `backend` | string | no | Name of a declared `[[backend]]`. Checked when given. Verification does not use it |
 | `public_key` | string | yes | Path to m6-auth's public key for local JWT verification |
 
-`[auth]` may sit in `site.toml` or in the system config, never both.
+`[auth]` sits in the system config only.
 A config that only verifies tokens needs `public_key` alone.
 
 ### 4.6. `[health]`
@@ -574,7 +572,7 @@ Exit 2 on:
 - `[log] level` unrecognised
 - `[auth]` declared but `public_key` file not found
 - `[auth]` declared with a `backend` that is not declared in `[[backend]]`
-- `[auth]` declared in both `site.toml` and the system config
+- `[auth]` in `site.toml` (it belongs in the system config)
 - A key in the file it does not belong to, or a key or section m6-http does not know
 - A system config with no `[node]`
 - `metrics_token_file` missing, empty, or set together with `metrics_require`

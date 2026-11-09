@@ -661,8 +661,7 @@ pub struct RouteConfig {
     pub backend: String,
     /// Auth requirement e.g. "group:editors" or "role:admin"
     pub require: Option<String>,
-    /// Captured only so `load()` can warn that m6-http ignores it — see
-    /// `warn_ignored_cache_key`. Deliberately not wired to anything.
+    /// Present only so a `cache` key is refused by name, not wired to anything.
     pub cache: Option<String>,
 }
 
@@ -675,7 +674,7 @@ pub struct RouteGroupConfig {
     pub path: String,
     pub backend: String,
     pub require: Option<String>,
-    /// See `RouteConfig::cache` — captured to warn, not to act on.
+    /// See `RouteConfig::cache` — present only to be refused by name.
     pub cache: Option<String>,
 }
 
@@ -732,9 +731,8 @@ struct RawServerSection {
 struct RawSystemToml {
     server: Option<RawServerSection>,
     node: Option<NodeConfig>,
-    /// `[auth]` may live here instead of site.toml (never both), so the
-    /// verify key's path is owned by the same file as the node's other
-    /// credentials.
+    /// `[auth]` lives here, so the verify key's path is owned by the same
+    /// file as the node's other credentials.
     auth: Option<AuthConfig>,
     /// Only the access keys: a node's own credentials and peers belong to the
     /// node, not to the site that is shipped to every node.
@@ -1277,8 +1275,8 @@ const NODE_SERVER_KEYS: &[&str] = &[
 const NODE_HEALTH_KEYS: &[&str] = &["metrics_token_file", "metrics_require", "metrics_peers"];
 /// Whole sections that are node state. They belong in the system config.
 ///
-/// `RawSiteToml` has no `[node]` field, so a `[node]` in `site.toml` is
-/// dropped without a word unless it is named here.
+/// `RawSiteToml` carries `[node]` only for one-file mode. In two-file mode a
+/// `[node]` in `site.toml` is named here so `load` refuses it.
 const NODE_SECTIONS: &[&str] = &["auth", "node"];
 /// Keys that describe how the site's routes are served. They belong in
 /// `site.toml`.
