@@ -35,10 +35,10 @@ pub struct RouteConfig {
     pub headers: Vec<(String, String)>,
     /// Name of a handler registered in code with `App::handler`.
     ///
-    /// This is what makes a route dynamic. A handler is code and cannot appear
-    /// while the process runs; a *route* is config. Naming the binding in
-    /// config puts the half that changes on the side that is read at start, so
-    /// adding an asset tree is a config edit rather than a restart.
+    /// A handler is code and cannot appear while the process runs; a *route*
+    /// is config. Naming the binding in config puts the half that changes on
+    /// the side that is read at start, so adding an asset tree is a config
+    /// edit followed by a restart.
     pub handler: Option<String>,
     /// Keys on this `[[route]]` that core does not define, verbatim.
     ///

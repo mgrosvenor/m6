@@ -3042,21 +3042,16 @@ fn handle_request<W: std::io::Write>(
     let start = std::time::Instant::now();
 
     // The state is built once at start and shared read-only. Under this
-    // borrow: copy out the `Arc`s the rest of the request needs (a refcount
-    // bump each, not a copy of two `HashMap`s and a `PathBuf`), match the
-    // route against the shared table, and build the dictionary, which reads a
-    // params file on a cache miss.
-    let (routes, site_dir, config, renderer);
+    // borrow: match the route against the shared table and build the
+    // dictionary, which reads a params file on a cache miss.
     let matched = {
-        routes = Arc::clone(&fs.routes);
-        site_dir = Arc::clone(&fs.site_dir);
-        config = Arc::clone(&fs.config);
-        renderer = Arc::clone(&fs.renderer);
-        find_route(raw.path(), raw.method(), &routes).map(|(route, path_params)| {
+        let routes = &fs.routes;
+        find_route(raw.path(), raw.method(), routes).map(|(route, path_params)| {
             let dict = fs.build_dict(&raw, route, &path_params);
             (route, dict)
         })
     };
+    let config = &fs.config;
     let compression = &config.compression;
     let minification = &config.minification;
 
@@ -3095,9 +3090,9 @@ fn handle_request<W: std::io::Write>(
             // no use for it after this, and a `Request` owning one used to
             // cost a full copy of the method, path, query, every header and
             // the body, per request.
-            let req = Request::new(raw, dict.clone(), Arc::clone(&site_dir))
+            let req = Request::new(raw, dict.clone(), Arc::clone(&fs.site_dir))
                 .with_route(route)
-                .with_config(Arc::clone(&config));
+                .with_config(Arc::clone(&fs.config));
 
             // Dispatch to code handler or template render.
             // A code handler is only used when the matched route is a code route
@@ -3147,7 +3142,7 @@ fn handle_request<W: std::io::Write>(
 
             // Render template if needed.
             if resp.template_name.is_some() {
-                match FrameworkState::render_response(&*renderer, &mut resp, &dict) {
+                match FrameworkState::render_response(&*fs.renderer, &mut resp, &dict) {
                     Ok(()) => {}
                     Err(RenderError::NotFound) => {
                         warn!(path = req.path(), "template signalled not_found");

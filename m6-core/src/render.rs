@@ -50,7 +50,7 @@ pub trait Renderer: Send + Sync + 'static {
 
 /// Builds a `Renderer` for a site.
 ///
-/// A trait rather than a value because the service loop builds one at start.
+/// A trait rather than a value so a service can name its own engine.
 pub trait RendererFactory: Send + Sync + 'static {
     /// `template_paths` is the set of templates named by config routes,
     /// relative to `site_dir`. Empty means "discover them", which is what a
