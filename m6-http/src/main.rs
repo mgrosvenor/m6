@@ -3360,10 +3360,11 @@ fn drive_socket_upstreams(state: &mut ServerState, registry: &m6_core::mio::Regi
             continue;
         };
 
-        // A refusal cannot reach here: encode_request refused the request
-        // before the upstream was created. Any error is a transport failure.
         let entry = state.socket_upstreams.remove(idx);
         if let Some(pool) = state.pool_manager.get_pool_mut(&entry.backend_name) {
+            // A reply (including a 4xx rejection the backend wrote before it
+            // reset) releases the member; a reset, close or malformed reply
+            // with no usable answer is a failure and backs the member off.
             if result.is_err() {
                 pool.mark_failed(entry.member_idx);
             } else {

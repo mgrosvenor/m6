@@ -1244,6 +1244,18 @@ impl SocketUpstream {
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                // The backend reset or closed while we read. Treat it as end of
+                // stream so the completion check below uses whatever reply is
+                // already buffered: a backend that rejects a request (a 413 for
+                // an oversized header) writes its answer and then resets without
+                // draining the rest, and that answer must reach the client.
+                Err(e)
+                    if e.kind() == io::ErrorKind::ConnectionReset
+                        || e.kind() == io::ErrorKind::BrokenPipe =>
+                {
+                    eof = true;
+                    break;
+                }
                 Err(e) => return Some(Err(e)),
             }
         }
