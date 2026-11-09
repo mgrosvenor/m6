@@ -15,7 +15,9 @@ use std::thread;
 use std::time::Duration;
 
 use m6_http_lib::forward::HttpRequest;
-use m6_http_lib::http11::{make_tls_server_config, Http11Listener, RequestOutcome};
+use m6_http_lib::http11::{
+    make_tls_server_config, Http11Listener, RequestOutcome, DEFAULT_MAX_REQUESTS_PER_CONN,
+};
 use m6_http_lib::poller::{Poller, Token};
 use quiche::h3::NameValue as _;
 
@@ -75,11 +77,24 @@ fn start_http11_server<F>(cert_path: &str, key_path: &str, handler: F) -> (u16, 
 where
     F: Fn(&HttpRequest, &str) -> (u16, Vec<(String, String)>, Vec<u8>, String) + Send + 'static,
 {
+    start_http11_server_limited(cert_path, key_path, DEFAULT_MAX_REQUESTS_PER_CONN, handler)
+}
+
+/// As `start_http11_server`, with `[server] max_requests_per_connection` set.
+fn start_http11_server_limited<F>(
+    cert_path: &str,
+    key_path: &str,
+    max_requests: u32,
+    handler: F,
+) -> (u16, Arc<AtomicBool>)
+where
+    F: Fn(&HttpRequest, &str) -> (u16, Vec<(String, String)>, Vec<u8>, String) + Send + 'static,
+{
     rustls::crypto::ring::default_provider()
         .install_default()
         .ok();
     let tls_cfg = make_tls_server_config(cert_path, key_path).expect("tls config");
-    let mut listener = Http11Listener::bind("127.0.0.1:0", tls_cfg).expect("bind");
+    let mut listener = Http11Listener::bind("127.0.0.1:0", tls_cfg, max_requests).expect("bind");
     let port = listener.local_addr().unwrap().port();
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = Arc::clone(&stop);
@@ -232,6 +247,63 @@ fn http11_connection_close_after_response() {
             .contains("connection: close"),
         "expected Connection: close"
     );
+}
+
+/// Read one response whose body is two bytes (`ok`) from a TLS stream, and
+/// return its headers in lower case. A 204 would not do, because m6-http
+/// closes after a response it cannot frame with a `Content-Length`.
+fn read_response_head<S: Read>(tls: &mut S) -> String {
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        tls.read_exact(&mut byte).expect("read response head");
+        head.push(byte[0]);
+    }
+    let mut body = [0u8; 2];
+    tls.read_exact(&mut body).expect("read response body");
+    String::from_utf8(head)
+        .expect("utf8 head")
+        .to_ascii_lowercase()
+}
+
+#[test]
+fn http11_closes_after_max_requests_per_connection() {
+    let tc = generate_test_cert();
+    let (cert_file, key_file) = write_pem_files(&tc);
+    let client_cfg = make_test_client_config(&tc.cert_der);
+
+    let (port, stop) = start_http11_server_limited(
+        cert_file.path().to_str().unwrap(),
+        key_file.path().to_str().unwrap(),
+        3,
+        |_req, _ip| (200, vec![], b"ok".to_vec(), "test".to_string()),
+    );
+
+    let stream = TcpStream::connect(format!("127.0.0.1:{}", port)).expect("tcp connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let server_name = rustls::pki_types::ServerName::try_from("localhost")
+        .unwrap()
+        .to_owned();
+    let mut conn = rustls::ClientConnection::new(client_cfg, server_name).unwrap();
+    let mut stream_ref = &stream;
+    let mut tls = rustls::Stream::new(&mut conn, &mut stream_ref);
+
+    let request = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    let mut heads = Vec::new();
+    for _ in 0..3 {
+        tls.write_all(request).expect("write request");
+        tls.flush().ok();
+        heads.push(read_response_head(&mut tls));
+    }
+    stop.store(true, Ordering::Relaxed);
+
+    for head in &heads[..2] {
+        assert!(head.starts_with("http/1.1 200"), "head: {head}");
+        assert!(!head.contains("connection: close"), "head: {head}");
+    }
+    assert!(heads[2].contains("connection: close"), "head: {}", heads[2]);
 }
 
 #[test]

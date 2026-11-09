@@ -4004,7 +4004,11 @@ fn run(args: Vec<String>) -> i32 {
         }
     };
     let tcp_listener = match make_tls_server_config(tls_cert, tls_key) {
-        Ok(tls_cfg) => match Http11Listener::bind(&config.server.bind, tls_cfg) {
+        Ok(tls_cfg) => match Http11Listener::bind(
+            &config.server.bind,
+            tls_cfg,
+            config.server.max_requests_per_connection,
+        ) {
             Ok(l) => {
                 info!(bind = %config.server.bind, "HTTP/1.1 over TLS listener started");
                 Some(l)
@@ -4141,6 +4145,7 @@ mod www_redirect_tests {
                 tls_cert: Some("/tmp/cert.pem".to_string()),
                 tls_key: Some("/tmp/key.pem".to_string()),
                 backend_timeout_secs: 30,
+                max_requests_per_connection: 100,
                 h2c_bind: None,
                 internal_binds: Vec::new(),
                 internal_peers: Vec::new(),

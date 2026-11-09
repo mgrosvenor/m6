@@ -82,6 +82,11 @@ Googlebot verifies only under `googlebot.com` and `google.com`. A name under `go
 **CI runs the workspace under the address and leak sanitisers on pushes to `develop`, in a workflow of its own, and fails when the sanitiser is unavailable (#164).**
 A probe compiles and runs a trivial program with the same flags before the suite, so a missing runtime or a rejected flag fails the job in seconds instead of passing while measuring nothing.
 
+**`[server] max_requests_per_connection` sets how many requests one HTTP/1.1 connection serves before m6-http closes it.**
+The default is 100, as before, and 0 is a config error.
+The key is read at start, so a change needs a restart.
+A client that makes more requests than this on one connection reconnects, with a new TLS handshake.
+
 ### Security
 
 **HTTP/2 now advertises SETTINGS_MAX_HEADER_LIST_SIZE and refuses a request whose decoded header list is over 64 KiB with a 431 (#162).**

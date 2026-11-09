@@ -138,7 +138,8 @@ pub fn run(bind: &str) -> anyhow::Result<()> {
     let shutdown =
         m6_core::signal::ShutdownHandle::install(m6_core::signal::Service::new("m6-http-redirect"));
 
-    let mut listener = Http11Listener::bind_plain(bind)?;
+    let mut listener =
+        Http11Listener::bind_plain(bind, crate::http11::DEFAULT_MAX_REQUESTS_PER_CONN)?;
     let poller = Poller::new()?;
     poller.add(listener.raw_fd(), TOKEN_LISTENER)?;
 

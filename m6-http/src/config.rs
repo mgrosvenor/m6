@@ -82,6 +82,19 @@ pub struct ServerConfig {
     /// Timeout in seconds for a backend call (connect + write + read). Default: 30.
     #[serde(default = "default_backend_timeout_secs")]
     pub backend_timeout_secs: u64,
+    /// Most requests served on one HTTP/1.1 keep-alive connection before it is
+    /// closed. Default: 100, `DEFAULT_MAX_REQUESTS_PER_CONN`. 0 is rejected by
+    /// `load`. Read at startup; a change needs a restart.
+    ///
+    /// Legal, and expensive: closing a connection makes the client pay a new
+    /// TCP and TLS handshake. m6-http talks HTTP/1.1 to its own backends, so
+    /// every cache miss pays that cost on a fresh connection. A cap rather
+    /// than unlimited so a connection cannot be held forever. At 100 requests
+    /// a browser's whole page load fits in one connection and a long-running
+    /// client still cycles. A client that makes many requests on one
+    /// connection, such as a benchmark, wants a higher value.
+    #[serde(default = "default_max_requests_per_connection")]
+    pub max_requests_per_connection: u32,
     /// Optional H2C (HTTP/2 cleartext) listener address.
     /// Intended for use over a private backbone between nodes.
     #[serde(default)]
@@ -170,6 +183,10 @@ fn default_allowed_methods() -> Vec<String> {
 
 fn default_backend_timeout_secs() -> u64 {
     30
+}
+
+fn default_max_requests_per_connection() -> u32 {
+    crate::http11::DEFAULT_MAX_REQUESTS_PER_CONN
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -688,6 +705,7 @@ struct RawServerSection {
     tls_cert: Option<String>,
     tls_key: Option<String>,
     backend_timeout_secs: Option<u64>,
+    max_requests_per_connection: Option<u32>,
     h2c_bind: Option<String>,
     internal_binds: Option<Vec<String>>,
     internal_peers: Option<Vec<String>>,
@@ -922,6 +940,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         tls_cert: None,
         tls_key: None,
         backend_timeout_secs: None,
+        max_requests_per_connection: None,
         h2c_bind: None,
         internal_binds: None,
         internal_peers: None,
@@ -934,6 +953,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         tls_cert: None,
         tls_key: None,
         backend_timeout_secs: None,
+        max_requests_per_connection: None,
         h2c_bind: None,
         internal_binds: None,
         internal_peers: None,
@@ -974,6 +994,15 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         .backend_timeout_secs
         .or(site_server.backend_timeout_secs)
         .unwrap_or(30);
+    let max_requests_per_connection = sys_server
+        .max_requests_per_connection
+        .or(site_server.max_requests_per_connection)
+        .unwrap_or(crate::http11::DEFAULT_MAX_REQUESTS_PER_CONN);
+    if max_requests_per_connection == 0 {
+        anyhow::bail!(
+            "config error: [server].max_requests_per_connection must be at least 1, because 0 would close every connection before it served a request"
+        );
+    }
     let h2c_bind = sys_server.h2c_bind.or(site_server.h2c_bind);
     // Nothing is inferred from an address: a listener is internal only when
     // this list names it. A redirector binds nothing the list could name, so a
@@ -1027,6 +1056,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
             .as_ref()
             .map(|p| p.to_string_lossy().into_owned()),
         backend_timeout_secs,
+        max_requests_per_connection,
         h2c_bind,
         internal_binds,
         internal_peers,
@@ -1307,6 +1337,7 @@ const NODE_SERVER_KEYS: &[&str] = &[
     "internal_peers",
     "redirect_bind",
     "warm_on_start",
+    "max_requests_per_connection",
 ];
 /// The fields of `RawSystemHealth`; change both together.
 const NODE_HEALTH_KEYS: &[&str] = &["metrics_token_file", "metrics_require", "metrics_peers"];
@@ -1873,6 +1904,41 @@ sockets = "/run/m6/*.sock"
         setup_minimal(dir.path());
         let cfg = load(dir.path(), &dir.path().join("system.toml")).unwrap();
         assert_eq!(cfg.server.backend_timeout_secs, 30);
+    }
+
+    #[test]
+    fn test_max_requests_per_connection_default() {
+        let dir = make_test_dir();
+        setup_minimal(dir.path());
+        let cfg = load(dir.path(), &dir.path().join("system.toml")).unwrap();
+        assert_eq!(cfg.server.max_requests_per_connection, 100);
+    }
+
+    fn load_with_system_server_line(line: &str) -> anyhow::Result<Config> {
+        let dir = make_test_dir();
+        setup_minimal(dir.path());
+        write_file(
+            dir.path(),
+            "system.toml",
+            &format!(
+                "[server]\nbind = \"127.0.0.1:8443\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n{line}\n"
+            ),
+        );
+        load(dir.path(), &dir.path().join("system.toml"))
+    }
+
+    #[test]
+    fn test_max_requests_per_connection_is_read() {
+        let cfg = load_with_system_server_line("max_requests_per_connection = 10000").unwrap();
+        assert_eq!(cfg.server.max_requests_per_connection, 10_000);
+    }
+
+    #[test]
+    fn test_max_requests_per_connection_zero_is_rejected() {
+        let err = load_with_system_server_line("max_requests_per_connection = 0")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("max_requests_per_connection"), "error: {err}");
     }
 
     #[test]
@@ -2636,6 +2702,7 @@ internal_peers = ["203.0.113.7"]
                 "h2c_bind",
                 "internal_binds",
                 "internal_peers",
+                "max_requests_per_connection",
                 "redirect_bind",
                 "tls_cert",
                 "tls_key",
@@ -2649,7 +2716,7 @@ internal_peers = ["203.0.113.7"]
             ["metrics_peers", "metrics_require", "metrics_token_file"]
         );
         assert_eq!(NODE_SECTIONS, ["auth", "node"]);
-        assert_eq!(all.len(), 10 + 3 + 2);
+        assert_eq!(all.len(), 11 + 3 + 2);
         for (section, key, belongs_in_system) in all {
             let body = match key {
                 Some(k) => format!("[{section}]\n{k} = 1\n"),
