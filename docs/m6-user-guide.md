@@ -1741,7 +1741,7 @@ cd examples/09-global-deployment
 The origin serves the Example 07 site and answers the public domain.
 Each cache node runs only m6-http, pointing at the origin over the mesh, and caches responses independently.
 `setup-origin.sh` provisions the origin and `setup-cache-node.sh` provisions a cache node, both writing a system config, the WireGuard interface and the systemd unit.
-`deploy.sh` syncs content to the origin and, with `--all --invalidate`, to the cache nodes, then restarts m6-http on each node to flush its cache.
+`deploy.sh` syncs content to the origin and, with `--all --invalidate`, to the cache nodes, then restarts m6-http on each node to flush its cache. The example deploy script still touches `site.toml` for `--invalidate`, and a touch no longer reloads m6-http, so a restart is what applies the change.
 
 The example uses its own node names and addresses, held in `deploy.toml`, which is a local file never committed.
 The configs under `configs/` and the `wireguard/` files are the node-specific settings.
@@ -1886,6 +1886,7 @@ Take from it that the first twelve manage the dashboard tabs, and the last five 
 
 **Table 4: the seventeen `/api/admin` endpoints.**
 `site.toml` must declare `allowed_methods` with `PUT`, or the edge answers `PUT /api/admin/config` with a 405.
+The `/api/admin/config/touch` and `/api/admin/cache/flush` endpoints still touch `site.toml` in the example code, and a touch no longer reloads m6-http, so restart m6-http to apply a change.
 
 ### 12.2. JSON blob shapes
 
