@@ -18,9 +18,6 @@ Table 1 gives the two m6-core documents and the job each one does.
 **Table 1: the two m6-core documents and the job each one does.**
 Take from it that a question about why a module exists belongs in the design document, and a question about a function's name or argument belongs here.
 
-`m6-render-lib.md` is superseded.
-It describes a crate that has been deleted, and most of what it described now lives here.
-
 The document follows the shape of a service.
 Sections 1 to 3 cover the ways into the crate, its feature flags and its module list.
 Sections 4 and 5 cover the modules that build a service and the modules that read a request and write a response.
@@ -227,7 +224,7 @@ The per-request order is:
   A non-empty body of any other type logs a warning.
 - Cookies, as a nested `cookies` map.
 - Built-ins `request_path`, `datetime` and `year`, after the params files so a params file cannot override them.
-- Auth claims from `x-auth-claims`.
+- Auth claims from `x-auth-claims`, each present only when its claim is: `auth_username` (claim `username`, else `sub`), `auth_sub`, `auth_groups` and `auth_roles`.
 - Flash message, when the feature is on: verify the HMAC, insert `flash`, and the response path adds the removal cookie.
 - CSRF token, when the feature is on and the dictionary holds none: reuse the `_csrf` cookie or generate one, and insert it.
   A submitted form token stays in place for `verify_csrf` to compare.
@@ -313,6 +310,21 @@ A route that names a template produces a `Response` carrying `template_name` and
 `NoTemplates` implements both traits and errors if anything asks it to render, which is how the site renderers that render nothing stopped linking Tera, comrak and pest in order to get a server loop.
 
 `template` is the Tera implementation: `build_tera`, `build_tera_from_paths`, `TeraRenderer`, `TeraFactory` and `NOT_FOUND_SENTINEL`, which is how a template signals a 404 from inside rendering.
+
+`register_filters` adds the site filters and functions in Table 5 to every Tera instance, beside Tera's own.
+
+| name | kind | what it does |
+|---|---|---|
+| `slugify` | filter | turns `Hello World` into `hello-world` |
+| `date_format(fmt="%B %d, %Y")` | filter | formats a date string, parses RFC 3339 and `%Y-%m-%d`, and returns anything else unchanged |
+| `markdown` | filter | renders Markdown to HTML with comrak |
+| `truncate_words(n=50)` | filter | keeps the first `n` words, default 50, and appends `…` past that |
+| `asset` | filter | returns a content-addressed URL for a file under `assets/`, from a manifest built once per reload |
+| `img_dims(path=x)` | function | returns the ` width="W" height="H"` attribute pair, nothing when the image has no readable size, and needs `\| safe` because it returns markup |
+| `not_found()` | function | fails the render with the 404 sentinel, so a missing lookup becomes a 404 |
+
+**Table 5: the site template filters and functions.**
+Take from it that `asset` and `img_dims` are computed from tables built once per reload, and that `not_found()` turns a missing lookup into a 404.
 
 ### 4.6. `watcher`
 

@@ -3,8 +3,8 @@
 **The contract between `m6-http` and a backend.**
 It is language agnostic and normative: anything that satisfies it is a valid m6 backend, whatever it is written in.
 
-The contract is the primary interface of the platform, and `m6-core` and `m6-render` are conveniences for writing Rust backends against it.
-Neither is required, and neither is allowed to justify a change that would make a non-Rust backend harder to write.
+The contract is the primary interface of the platform, and `m6-core` is a convenience for writing Rust backends against it.
+It is not required, and it is not allowed to justify a change that would make a non-Rust backend harder to write.
 
 **Conformance language.**
 MUST, MUST NOT, SHOULD, SHOULD NOT and MAY are used in the *RFC* (Request for Comments) 2119 sense.
