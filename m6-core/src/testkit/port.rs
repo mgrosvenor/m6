@@ -272,55 +272,41 @@ mod tests {
 
     /// A released port can be claimed again.
     ///
-    /// This used to assert that the marker FILE was gone, which is no longer the
-    /// contract: the `flock` is the claim and the file is left in place on
-    /// purpose, because unlinking it would let a third process create a new inode
-    /// and lock that instead. What has to be true is that the port becomes
-    /// available again, so that is what is asserted.
+    /// The test uses a private claim directory and port 0, so no other test can
+    /// touch the marker. Port 0 always binds, so the bind probe in `try_claim`
+    /// and the bind wait in `Drop` succeed at once, and the only thing the test
+    /// observes is the lock.
     #[test]
     fn dropping_a_claim_releases_the_port() {
-        let port = {
-            let c = claim_port();
-            c.port()
-        };
-        // Re-lockable, which is what "released" means now.
-        let dir = claim_dir();
-        let f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(dir.join(port.to_string()))
-            .expect("open the marker");
-        use std::os::unix::io::AsRawFd;
-        let got = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        assert_eq!(got, 0, "the lock outlived the claim, so the port is stuck");
+        let dir = tempfile::tempdir().expect("a private claim directory");
+        let marker = dir.path().join("claim");
+
+        let claim = try_claim(&marker, 0).expect("an unclaimed marker is claimable");
+        assert!(
+            try_claim(&marker, 0).is_none(),
+            "a second claim was granted while the first was held, so this test cannot see the lock"
+        );
+
+        drop(claim);
+        assert!(
+            try_claim(&marker, 0).is_some(),
+            "the lock outlived the claim, so the port is stuck"
+        );
     }
 
     /// A leaked marker file does not cost a port.
     ///
-    /// A killed run leaves its markers behind: one checkout had 943 of them. Under
-    /// the old design each one made its port unusable for ten minutes and then had
-    /// to be reclaimed, and **the reclaim was the race** -- two processes could both
-    /// unlink and both re-create, and each would believe it owned the port. So the
-    /// property to pin is that an unlocked leftover file is simply claimable.
+    /// The test writes an unlocked marker into a private claim directory, the
+    /// state a killed run leaves behind. `try_claim` must accept the marker,
+    /// because the file is not the claim and a leftover must not cost a port.
     #[test]
     fn a_leftover_marker_file_is_claimable() {
-        let dir = claim_dir();
-        // A file with nobody holding its lock, exactly what a killed run leaves.
-        let port = 29_998u16;
-        let marker = dir.join(port.to_string());
+        let dir = tempfile::tempdir().expect("a private claim directory");
+        let marker = dir.path().join("claim");
         std::fs::write(&marker, b"").expect("write a leftover marker");
 
-        use std::os::unix::io::AsRawFd;
-        let f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&marker)
-            .expect("open");
-        let got = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        assert_eq!(
-            got, 0,
+        assert!(
+            try_claim(&marker, 0).is_some(),
             "a leftover marker file blocked a claim; leaked files must not cost ports"
         );
     }
