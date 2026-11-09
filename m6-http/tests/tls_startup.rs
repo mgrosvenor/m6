@@ -8,6 +8,8 @@
 //! does not match the certificate, stops m6-http with exit 2 rather than
 //! serving on stale material.
 
+#![allow(clippy::disallowed_methods, reason = "test code: threads, sleeps and blocking clients drive the service from outside")]
+
 use std::io::{Read, Write};
 use std::net::{TcpStream, UdpSocket};
 use std::path::Path;

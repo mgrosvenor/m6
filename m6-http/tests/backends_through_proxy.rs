@@ -30,6 +30,8 @@
 //! Same rule as the sibling file, §8: skip with a visible warning on a laptop,
 //! fail under `M6_BACKENDS_REQUIRE_ALL=1`, which `deploy/run-tests.sh` sets.
 
+#![allow(clippy::disallowed_methods, reason = "test code: threads, sleeps and blocking clients drive the service from outside")]
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};

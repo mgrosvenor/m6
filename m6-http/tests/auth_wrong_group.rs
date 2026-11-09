@@ -18,6 +18,8 @@
 //! cargo test -p m6-http --test auth_wrong_group -- --test-threads=1
 //! ```
 
+#![allow(clippy::disallowed_methods, reason = "test code: threads, sleeps and blocking clients drive the service from outside")]
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::Command;

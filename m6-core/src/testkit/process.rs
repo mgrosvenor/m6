@@ -1,5 +1,7 @@
 //! Spawning a real m6 service from a test, and killing it again.
 
+#![allow(clippy::disallowed_methods, reason = "test code: threads, sleeps and blocking clients drive the service from outside")]
+
 use std::io::Read;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};

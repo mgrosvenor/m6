@@ -99,6 +99,7 @@ impl BackendPool {
     }
 
     /// Synchronous connect used by tests (not async).
+    #[expect(clippy::disallowed_methods, reason = "test-only after this job; removed by EL-1")]
     pub fn connect(&mut self) -> Result<(std::os::unix::net::UnixStream, usize), PoolError> {
         let idx = self.pick_member().ok_or(PoolError::Empty)?;
         let path = self.members[idx].path.clone();

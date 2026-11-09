@@ -27,6 +27,8 @@
 //! client from the broken one; the body-content assertion then catches the
 //! failure mode a naive fix would introduce, which is silent truncation.
 
+#![allow(clippy::disallowed_methods, reason = "test code: threads, sleeps and blocking clients drive the service from outside")]
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc;
