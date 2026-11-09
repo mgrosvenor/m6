@@ -6,7 +6,10 @@
 //! below states, in its name and the comment above it, the scenario and the
 //! wrong outcome it catches.
 
-#![allow(clippy::disallowed_methods, reason = "test code: threads, sleeps and blocking clients drive the service from outside")]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
 
 use std::io::Write;
 use std::os::unix::net::UnixStream;

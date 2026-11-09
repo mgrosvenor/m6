@@ -16,7 +16,10 @@
 //! cargo test -p m6-http --test security_e2e -- --test-threads=1
 //! ```
 
-#![allow(clippy::disallowed_methods, reason = "test code: threads, sleeps and blocking clients drive the service from outside")]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, UdpSocket};

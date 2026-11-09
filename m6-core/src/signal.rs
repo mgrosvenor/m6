@@ -180,7 +180,10 @@ fn wake(socket: Option<&Path>, wake_fd: Option<RawFd>) {
         // Return a thread parked in accept(). The connection carries no
         // request and is closed immediately; every m6 accept loop re-checks
         // the shutdown flag on wake and exits without reading it.
-        #[expect(clippy::disallowed_methods, reason = "the signal thread; removed by EL-2 (m6-http) and EL-6 (App), deleted in EL-12")]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the signal thread; removed by EL-2 (m6-http) and EL-6 (App), deleted in EL-12"
+        )]
         let _ = std::os::unix::net::UnixStream::connect(path);
     }
     if let Some(fd) = wake_fd {
@@ -242,7 +245,10 @@ impl ShutdownHandle {
 
         let thread_socket = socket.clone();
         let thread_name = Arc::clone(&name);
-        #[expect(clippy::disallowed_methods, reason = "the signal thread; removed by EL-2 (m6-http) and EL-6 (App), deleted in EL-12")]
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the signal thread; removed by EL-2 (m6-http) and EL-6 (App), deleted in EL-12"
+        )]
         std::thread::Builder::new()
             .name("m6-signal".into())
             .spawn(move || {
@@ -342,7 +348,10 @@ impl ShutdownHandle {
         use std::time::Duration;
         let mut sleep_ms = 1u64;
         while !self.is_shutdown() {
-            #[expect(clippy::disallowed_methods, reason = "the signal thread; removed by EL-2 (m6-http) and EL-6 (App), deleted in EL-12")]
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the signal thread; removed by EL-2 (m6-http) and EL-6 (App), deleted in EL-12"
+            )]
             std::thread::sleep(Duration::from_millis(sleep_ms));
             sleep_ms = (sleep_ms * 2).min(100);
         }

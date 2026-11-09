@@ -76,7 +76,10 @@ pub struct ProbeResult {
 /// `Connected` and the samples are the connects that got through. The sample
 /// count shows a partial loss. Only a poll with no successful connect is
 /// `NoAnswer` or `Failed`. The stream is dropped at once and nothing is sent.
-#[expect(clippy::disallowed_methods, reason = "monitor threads; removed by EL-9")]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "monitor threads; removed by EL-9"
+)]
 pub fn probe(addr: SocketAddr, timeout: Duration) -> ProbeResult {
     probe_with(timeout, |remaining| {
         TcpStream::connect_timeout(&addr, remaining).map(drop)
@@ -255,7 +258,10 @@ pub fn fleet(f: &crate::fleet::Fleet, timeout: Duration) -> Vec<Option<TunnelRea
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let src = &src;
-    #[expect(clippy::disallowed_methods, reason = "monitor threads; removed by EL-9")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "monitor threads; removed by EL-9"
+    )]
     std::thread::scope(|scope| {
         let handles: Vec<_> = f
             .nodes
@@ -301,7 +307,10 @@ pub fn fleet(f: &crate::fleet::Fleet, timeout: Duration) -> Vec<Option<TunnelRea
 }
 
 #[cfg(test)]
-#[allow(clippy::disallowed_methods, reason = "test code: threads, sleeps and blocking clients drive the service from outside")]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
 mod tests {
     use super::*;
     use std::net::TcpListener;

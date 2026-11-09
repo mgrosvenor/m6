@@ -1,4 +1,7 @@
-#![allow(clippy::disallowed_methods, reason = "a load generator, not a service: it measures from outside")]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "a load generator, not a service: it measures from outside"
+)]
 
 /// bench-url-backend — minimal HTTP server for URL-backend benchmarking.
 ///

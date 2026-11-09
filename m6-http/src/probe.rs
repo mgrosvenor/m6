@@ -35,7 +35,10 @@
 //! and crypto together and there is no earlier point to start from. The two are
 //! therefore not the same measurement and must never be averaged together.
 
-#![allow(clippy::disallowed_methods, reason = "a load generator, not a service: it measures from outside")]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "a load generator, not a service: it measures from outside"
+)]
 
 use std::io;
 use std::net::{TcpStream, UdpSocket};

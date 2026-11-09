@@ -8,7 +8,10 @@
 //! token minted under the old key stays usable, a token minted under the new
 //! key works at once, and a token under a third key is rejected.
 
-#![allow(clippy::disallowed_methods, reason = "test code: threads, sleeps and blocking clients drive the service from outside")]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
 
 use std::io::Write;
 use std::os::unix::net::UnixStream;

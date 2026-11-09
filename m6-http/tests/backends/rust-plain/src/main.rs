@@ -42,7 +42,10 @@
 //! Standard library only: `std::os::unix`, `std::net` is not even needed.
 //! `docs/m6-backend-protocol.md` §9 is the checklist this implements.
 
-#![allow(clippy::disallowed_methods, reason = "test code: threads, sleeps and blocking clients drive the service from outside")]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
 
 use std::collections::VecDeque;
 use std::fs;
