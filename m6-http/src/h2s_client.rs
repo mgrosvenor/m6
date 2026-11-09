@@ -234,8 +234,10 @@ impl H2sTlsClientPool {
         req: &HttpRequest,
         client_ip: &str,
         original_host: &str,
+        registry: &Registry,
     ) -> io::Result<mpsc::Receiver<io::Result<HttpResponse>>> {
-        self.0.dispatch(base_url, req, client_ip, original_host)
+        self.0
+            .dispatch(base_url, req, client_ip, original_host, registry)
     }
 
     /// Drive the one connection whose token fired.

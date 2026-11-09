@@ -1266,7 +1266,9 @@ fn drive_h1<S, F, G>(
                         Ok(n) => {
                             buf.extend_from_slice(&tmp[..n]);
                         }
-                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => dry = true,
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            dry = true;
+                        }
                         Err(_) => {
                             h1.state = H1State::Done;
                             return;

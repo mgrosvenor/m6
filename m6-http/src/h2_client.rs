@@ -786,17 +786,31 @@ impl<T: Transport> Pool<T> {
         self.connections.get_mut(base_url)
     }
 
-    /// Dispatch a request on the existing connection.
+    /// Dispatch a request on the existing connection. `registry` lets the call
+    /// ask for write readiness when the request goes into the send buffer.
     pub fn dispatch(
         &mut self,
         base_url: &str,
         req: &HttpRequest,
         client_ip: &str,
         original_host: &str,
+        registry: &Registry,
     ) -> io::Result<mpsc::Receiver<io::Result<HttpResponse>>> {
         let (host, _) = parse_host_port(base_url, T::prefix(), T::default_port())?;
         let conn = self.connections.get_mut(base_url).unwrap();
-        conn.dispatch(req, &host, client_ip, original_host)
+        let rx = conn.dispatch(req, &host, client_ip, original_host)?;
+        let interest = conn.interest();
+        if interest != conn.interest {
+            registry
+                .reregister(
+                    &mut m6_core::mio::unix::SourceFd(&conn.raw_fd()),
+                    conn.token(),
+                    interest,
+                )
+                .ok();
+            conn.interest = interest;
+        }
+        Ok(rx)
     }
 
     /// Drive the one connection whose token fired. Returns whether it is dead

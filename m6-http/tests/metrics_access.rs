@@ -682,11 +682,11 @@ fn perf_reports_the_event_loop() {
         std::thread::sleep(Duration::from_millis(100));
     }
     let event_loop = event_loop.expect("event_loop never populated within the deadline");
-    // The test drives HTTP/1.1 over TLS, so the `tls` trigger has events.
+    // The test drives HTTP/1.1 over TLS, so the `conn` trigger has events.
     let trigger = event_loop
         .iter()
-        .find(|t| t.name == "tls" && t.count > 0)
-        .expect("a tls trigger with events");
+        .find(|t| t.name == "conn" && t.count > 0)
+        .expect("a conn trigger with events");
     assert!(trigger.work_max_ns >= trigger.work_min_ns, "{trigger:?}");
 }
 

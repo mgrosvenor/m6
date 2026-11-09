@@ -2922,7 +2922,7 @@ fn handle_request_inner(
             match ensure_h2c_conn(state, &url, registry).and_then(|()| {
                 state
                     .h2c_pool
-                    .dispatch(&url, req, client_ip, &original_host)
+                    .dispatch(&url, req, client_ip, &original_host, registry)
             }) {
                 Ok(rx) => rx,
                 Err(e) => {
@@ -2941,7 +2941,7 @@ fn handle_request_inner(
             match ensure_h2s_conn(state, &url, _tls_config.clone(), registry).and_then(|()| {
                 state
                     .h2s_pool
-                    .dispatch(&url, req, client_ip, &original_host)
+                    .dispatch(&url, req, client_ip, &original_host, registry)
             }) {
                 Ok(rx) => rx,
                 Err(e) => {
@@ -3211,13 +3211,13 @@ fn dispatch_custom_error_async(
             ensure_h2c_conn(state, &url, registry).ok()?;
             state
                 .h2c_pool
-                .dispatch(&url, &error_req, client_ip, &original_host)
+                .dispatch(&url, &error_req, client_ip, &original_host, registry)
                 .ok()?
         } else if url.starts_with("h2s://") {
             ensure_h2s_conn(state, &url, tls_config.clone(), registry).ok()?;
             state
                 .h2s_pool
-                .dispatch(&url, &error_req, client_ip, &original_host)
+                .dispatch(&url, &error_req, client_ip, &original_host, registry)
                 .ok()?
         } else {
             forward::dispatch_url_request(
