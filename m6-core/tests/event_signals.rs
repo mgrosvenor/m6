@@ -25,9 +25,10 @@ fn sigusr1_and_sigterm_arrive_on_the_descriptor() {
         .register(&mut SourceFd(&signals.raw_fd()), TOKEN, Interest::READABLE)
         .expect("register the signal descriptor");
 
-    // SAFETY: `kill` takes a pid and a signal number and touches no memory.
-    unsafe { libc::kill(libc::getpid(), libc::SIGUSR1) };
-    unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
+    nix::sys::signal::kill(nix::unistd::Pid::this(), nix::sys::signal::Signal::SIGUSR1)
+        .expect("kill SIGUSR1");
+    nix::sys::signal::kill(nix::unistd::Pid::this(), nix::sys::signal::Signal::SIGTERM)
+        .expect("kill SIGTERM");
 
     let mut events = Events::with_capacity(8);
     let mut got = Vec::new();

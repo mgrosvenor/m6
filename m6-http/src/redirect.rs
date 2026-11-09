@@ -171,11 +171,15 @@ pub fn run(bind: &str) -> anyhow::Result<()> {
             match ev.token() {
                 TOKEN_LISTENER => listener.accept_pending(poll.registry(), TOKEN_CONN),
                 TOKEN_SIGNAL => {
+                    let mut stop = false;
                     while let Some(sig) = signals.read() {
                         if lifecycle.on_signal(sig) == m6_core::signal::Action::Stop {
-                            lifecycle.complete();
-                            return Ok(());
+                            stop = true;
                         }
+                    }
+                    if stop {
+                        lifecycle.complete();
+                        return Ok(());
                     }
                 }
                 _ => {}

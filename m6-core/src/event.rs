@@ -327,14 +327,9 @@ impl<T> Slots<T> {
         &mut self.items[key]
     }
 
+    #[allow(clippy::len_without_is_empty)] // the table never shrinks, so it is never empty after construction
     pub fn len(&self) -> usize {
         self.items.len()
-    }
-
-    /// Whether the table holds no slots. Only true when `initial` was 0: the
-    /// table never shrinks.
-    pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
     }
 
     pub fn is_full(&self) -> bool {

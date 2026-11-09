@@ -636,12 +636,12 @@ fn event_loop(
         // queue that the h2c listener will not be reported for again. Drain
         // them before waiting, and do not block while they remain.
         let mut poll_timeout = std::time::Duration::from_millis(timeout_ms as u64);
-        if h2c.as_ref().is_some_and(|h| h.accept_again()) {
-            if let Some(ref mut h) = h2c {
+        if let Some(h) = h2c.as_mut() {
+            if h.accept_again() {
                 h.accept_pending(poll.registry(), TOKEN_H2C);
-            }
-            if h2c.as_ref().is_some_and(|h| h.accept_again()) {
-                poll_timeout = std::time::Duration::ZERO;
+                if h.accept_again() {
+                    poll_timeout = std::time::Duration::ZERO;
+                }
             }
         }
 
@@ -659,13 +659,18 @@ fn event_loop(
         let first_trigger = events.iter().next().map(|ev| ev.token());
         for ev in &events {
             match ev.token() {
-                // Shutdown: drain every pending signal. The first Terminate
-                // breaks the loop; a second before the loop ends forces an exit.
+                // Shutdown: drain every pending signal before acting. The first
+                // Terminate asks for a graceful stop; a second, read in the same
+                // drain, forces an exit inside `on_signal`.
                 TOKEN_SIGNAL => {
+                    let mut stop = false;
                     while let Some(sig) = signals.read() {
                         if lifecycle.on_signal(sig) == m6_core::signal::Action::Stop {
-                            break 'run;
+                            stop = true;
                         }
+                    }
+                    if stop {
+                        break 'run;
                     }
                 }
                 TOKEN_UDP => {

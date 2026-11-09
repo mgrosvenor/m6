@@ -128,9 +128,11 @@ impl Server {
 
     /// SIGTERM, wait for exit 0, and return the whole stderr tail.
     fn tail(mut self) -> String {
-        let pid = self.child.id() as i32;
-        // SAFETY: `kill` takes a pid and a signal number and touches no memory.
-        unsafe { libc::kill(pid, libc::SIGTERM) };
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(self.child.id() as i32),
+            nix::sys::signal::Signal::SIGTERM,
+        )
+        .expect("kill SIGTERM");
         let status = self.child.wait().expect("wait");
         assert_eq!(status.code(), Some(0), "echo exited with {status}");
         if let Some(r) = self.reader.take() {
