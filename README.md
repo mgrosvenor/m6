@@ -317,7 +317,7 @@ Auth service. Issues and verifies JWTs, manages sessions.
 - Four HTTP endpoints: `POST /auth/login`, `POST /auth/refresh`, `POST /auth/logout`, `GET /auth/public-key`
 - RS256 or ES256 JWT signing (EC recommended); access token TTL 15 min, refresh token TTL 30 days
 - Key pair re-read when its config is touched, so a key rotation needs no restart. A key that fails to load, or a private key that is not the pair of the public key, leaves the running keys serving
-- Rate limiting: 5 login attempts / 15 min / IP
+- Rate limiting: 5 failed logins per 15 minutes per client address by default, set in `[rate_limit]`
 - Delegates credential and ACL storage to m6-auth library (SQLite, WAL mode)
 - Never logs passwords, tokens, or key material
 
@@ -628,8 +628,8 @@ deliberately; `tools/conformance-scores.txt` argues that one in full.
 - No explicit timeout on backend calls; a stalled backend blocks one event loop iteration
 
 **m6-auth-server:**
-- Rate-limit state is in-memory per process; resets on restart and is not shared across multiple instances
-- When m6-auth sits behind m6-http, rate limiting falls back to a single "unix" bucket if `X-Forwarded-For` / `X-Real-IP` headers are absent
+- m6-auth-server runs as one process per site, and its login failure counts live in memory. A restart clears them.
+- The client address is the value of `X-Forwarded-For`, then `X-Real-IP`. m6-http always sends `X-Forwarded-For` with one address and strips any copy a client sent. A caller that sends neither header, which can only be something other than m6-http, counts in one shared bucket named `unix`, so its failures block every other such caller.
 
 **Out of scope (by design):**
 - Windows

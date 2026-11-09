@@ -445,8 +445,7 @@ The key is absolute because a per-thread initialiser receives no site directory 
 `m6-auth-server` and `m6-auth-cli` resolve a relative `[storage] path` against the configuration file's directory, so the renderer has to name the same file the server opened.
 `m6-app-anatomy.md` section 5.3 gives the two state tiers and what each initialiser receives.
 
-A shared handle is the other option: `m6-auth-server` keeps one `Db` in a `Mutex` under `App::with_global`, because `Db` is `Send` and not `Sync`.
-A renderer that writes rarely can use the per-worker shape above, which needs no lock.
+`m6-auth-server` uses the per-worker shape too: `App::with_state` gives each worker thread its own `Db`, opened on the thread's first request.
 
 The processes above share one file, and section 9 gives the rules that keep that safe.
 
