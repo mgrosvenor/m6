@@ -449,11 +449,10 @@ public_key = "/run/m6/auth.pub"
 
 Each process is started and supervised on its own by the service manager,
 systemd on the production target. Backends must start before m6-http (in
-systemd, `After=` and `Wants=` on the backend units in m6-http's unit),
-because m6-http reads each pool's sockets once at start and a pool whose glob
-matches no socket exits 2. A backend that restarts on the same socket path
-serves again on its next connect, and a new instance joins its pool when
-m6-http restarts.
+systemd, `After=` on the backend units in m6-http's unit), because m6-http
+reads each pool's sockets once at start and a pool whose glob matches no
+socket exits 2. A backend that restarts on the same socket path serves again
+on its next connect, and a new instance joins its pool when m6-http restarts.
 
 ```bash
 # Development (shell script, see m6-examples/m6-run-eg)

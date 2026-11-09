@@ -279,7 +279,7 @@ And a crashed backend restarts in seconds, which is what makes §4.5 affordable.
 ### 3.4 Why pool membership is discovered rather than declared
 
 **Scaling a backend should not require editing configuration**, and §1.8 makes scaling the answer to load.
-A pool is declared as a socket glob, and membership comes from expanding that glob once at start, so backends must start before m6-http (systemd `After=` and `Wants=` on the backend units), and a new instance joins its pool when m6-http restarts.
+A pool is declared as a socket glob, and membership comes from expanding that glob once at start, so backends must start before m6-http (systemd `After=` on the backend units), and a new instance joins its pool when m6-http restarts.
 An explicit list would mean a config edit to add capacity, which is ceremony in the path of the one operation an operator performs under pressure.
 
 A member whose backend stops is retried into its backoff, and a backend that restarts on the same path serves again on its next connect.
