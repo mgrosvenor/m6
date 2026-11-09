@@ -3,7 +3,7 @@
 //! Design:
 //! - `TcpListener` registered with TOKEN_TCP.
 //! - `accept_pending()` drains new connections, eagerly advances the TLS handshake,
-//!   and registers each fd with the poller.
+//!   and registers each fd with the poll.
 //! - After the TLS handshake, the negotiated ALPN protocol determines the handler:
 //!
 //!   ```text
@@ -25,7 +25,7 @@ use tracing::warn;
 
 use crate::forward::{HttpRequest, HttpResponse, PendingUrlContext};
 use crate::http2::{H2Io, Http2Conn};
-use crate::poller::{Poller, Token};
+use m6_core::mio::{Interest, Registry, Token};
 
 // ── Request outcome ───────────────────────────────────────────────────────────
 
@@ -250,9 +250,9 @@ impl Http11Listener {
         self.listener.local_addr()
     }
 
-    /// Drain pending `accept()` calls; register each new fd with the poller.
+    /// Drain pending `accept()` calls; register each new fd with the poll.
     /// Eagerly starts the TLS handshake so the ServerHello is sent immediately.
-    pub fn accept_pending(&mut self, poller: &Poller, token: Token) {
+    pub fn accept_pending(&mut self, registry: &Registry, token: Token) {
         loop {
             match self.listener.accept() {
                 Ok((stream, peer)) => {
@@ -286,7 +286,13 @@ impl Http11Listener {
                         // is HTTP/1.1 from its first byte.
                         None => None,
                     };
-                    poller.add(stream.as_raw_fd(), token).ok();
+                    registry
+                        .register(
+                            &mut m6_core::mio::unix::SourceFd(&stream.as_raw_fd()),
+                            token,
+                            Interest::READABLE,
+                        )
+                        .ok();
                     let client_ip = peer.ip().to_string();
                     let kind = if tls.is_some() {
                         ConnKind::Handshake {
@@ -326,7 +332,7 @@ impl Http11Listener {
         &mut self,
         mut on_request: F,
         mut on_response: G,
-        poller: &Poller,
+        registry: &Registry,
     ) -> Vec<HandshakeSample>
     where
         F: FnMut(&HttpRequest, &str) -> RequestOutcome,
@@ -350,7 +356,9 @@ impl Http11Listener {
         }
         for conn in &self.conns {
             if conn.is_done() {
-                poller.delete(conn.stream.as_raw_fd()).ok();
+                registry
+                    .deregister(&mut m6_core::mio::unix::SourceFd(&conn.stream.as_raw_fd()))
+                    .ok();
             }
         }
         self.conns.retain(|c| !c.is_done());
@@ -378,12 +386,16 @@ pub struct H2cListener {
     peers: Option<Vec<std::net::IpAddr>>,
     /// Throttles the log line for refused connections, one peer at a time.
     refusals: RefusalLog,
+    /// A capped accept left connections in the kernel queue. mio is
+    /// edge-triggered, so the listener will not be reported again for them:
+    /// the loop reads this and drains before its next wait.
+    accept_again: bool,
 }
 
 /// The most connections one `accept_pending` call handles. A peer that
 /// connects and closes in a loop would otherwise keep the single event loop
 /// in `accept` and starve the other listeners. What is left stays in the
-/// kernel queue and the poller wakes this listener again.
+/// kernel queue and the poll wakes this listener again.
 const MAX_ACCEPTS_PER_WAKE: usize = 64;
 
 /// The fewest seconds between two log lines for one refused peer, and the
@@ -573,6 +585,7 @@ impl H2cListener {
             conns: Vec::new(),
             peers: internal_peers,
             refusals: RefusalLog::new(REFUSAL_LOG_INTERVAL, REFUSAL_LOG_MAX_PEERS),
+            accept_again: false,
         })
     }
 
@@ -584,13 +597,19 @@ impl H2cListener {
         self.listener.local_addr()
     }
 
-    pub fn accept_pending(&mut self, poller: &Poller, token: Token) {
-        self.accept_up_to(poller, token, MAX_ACCEPTS_PER_WAKE);
+    pub fn accept_pending(&mut self, registry: &Registry, token: Token) {
+        let handled = self.accept_up_to(registry, token, MAX_ACCEPTS_PER_WAKE);
+        self.accept_again = handled == MAX_ACCEPTS_PER_WAKE;
+    }
+
+    /// Whether a capped accept left connections in the kernel queue.
+    pub fn accept_again(&self) -> bool {
+        self.accept_again
     }
 
     /// Handle at most `max` pending connections, refused ones included, and
     /// return how many it handled.
-    fn accept_up_to(&mut self, poller: &Poller, token: Token, max: usize) -> usize {
+    fn accept_up_to(&mut self, registry: &Registry, token: Token, max: usize) -> usize {
         let mut handled = 0;
         while handled < max {
             match self.listener.accept() {
@@ -623,7 +642,13 @@ impl H2cListener {
                         continue;
                     }
                     stream.set_nodelay(true).ok();
-                    poller.add(stream.as_raw_fd(), token).ok();
+                    registry
+                        .register(
+                            &mut m6_core::mio::unix::SourceFd(&stream.as_raw_fd()),
+                            token,
+                            Interest::READABLE,
+                        )
+                        .ok();
                     let h2 = match trust {
                         crate::forward::ForwardedTrust::Backbone => {
                             Http2Conn::new().trusting_forwarded_for()
@@ -646,7 +671,7 @@ impl H2cListener {
         handled
     }
 
-    pub fn drive_all<F, G>(&mut self, mut on_request: F, mut on_response: G, poller: &Poller)
+    pub fn drive_all<F, G>(&mut self, mut on_request: F, mut on_response: G, registry: &Registry)
     where
         F: FnMut(&HttpRequest, &str) -> RequestOutcome,
         G: FnMut(
@@ -666,7 +691,9 @@ impl H2cListener {
         }
         for conn in &self.conns {
             if conn.h2.is_done() {
-                poller.delete(conn.stream.as_raw_fd()).ok();
+                registry
+                    .deregister(&mut m6_core::mio::unix::SourceFd(&conn.stream.as_raw_fd()))
+                    .ok();
             }
         }
         self.conns.retain(|c| !c.h2.is_done());
@@ -1194,9 +1221,9 @@ fn advance_tls(tls: &mut ServerConnection, stream: &TcpStream) -> io::Result<()>
             // plaintext via reader(). For any body over ~16 KiB this trips
             // on every advance_tls call. It isn't a real error — stop
             // pumping ciphertext for this round exactly like WouldBlock;
-            // drive_h1 drains the reader right after we return, and the
-            // next poller wakeup (level-triggered — more data is still
-            // sitting in the kernel socket buffer) resumes pumping.
+            // drive_h1 drains the reader right after we return, and the next
+            // iteration drives the connection again (the loop drives every
+            // connection every iteration), so the leftover data is read then.
             Err(e)
                 if e.kind() == io::ErrorKind::Other
                     && e.to_string().contains("received plaintext buffer full") =>
@@ -1908,7 +1935,7 @@ mod h2c_admit_tests {
         REFUSAL_LOG_MAX_PEERS,
     };
     use crate::forward::ForwardedTrust;
-    use crate::poller::{Poller, Token};
+    use m6_core::mio::Token;
     use std::net::{IpAddr, TcpStream};
     use std::time::Instant;
 
@@ -2109,12 +2136,13 @@ mod h2c_admit_tests {
         // 127.0.0.1 is not listed, so every connection is refused.
         let mut l = H2cListener::bind("127.0.0.1:0", Some(vec![ip("10.9.9.9")])).unwrap();
         let addr = l.local_addr().unwrap();
-        let poller = Poller::new().unwrap();
+        let poll = m6_core::mio::Poll::new().unwrap();
+        let registry = poll.registry();
         let clients: Vec<TcpStream> = (0..12).map(|_| TcpStream::connect(addr).unwrap()).collect();
-        assert_eq!(l.accept_up_to(&poller, Token(1), 5), 5);
-        assert_eq!(l.accept_up_to(&poller, Token(1), 5), 5);
-        assert_eq!(l.accept_up_to(&poller, Token(1), 5), 2);
-        assert_eq!(l.accept_up_to(&poller, Token(1), 5), 0);
+        assert_eq!(l.accept_up_to(registry, Token(1), 5), 5);
+        assert_eq!(l.accept_up_to(registry, Token(1), 5), 5);
+        assert_eq!(l.accept_up_to(registry, Token(1), 5), 2);
+        assert_eq!(l.accept_up_to(registry, Token(1), 5), 0);
         drop(clients);
     }
 }

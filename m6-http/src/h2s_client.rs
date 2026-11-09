@@ -13,7 +13,7 @@ use rustls::ClientConnection;
 
 use crate::forward::{HttpRequest, HttpResponse};
 use crate::h2_client::{client_init_frame, H2Client, Pool, Transport};
-use crate::poller::{Poller, Token};
+use m6_core::mio::{Registry, Token};
 
 /// The TLS transport for `h2s://` backends.
 pub struct H2sTransport {
@@ -225,8 +225,8 @@ impl H2sTlsClientPool {
             .dispatch(base_url, req, client_ip, original_host, Some(tls_config))
     }
 
-    /// Register new connections with the poller and drive all connections.
-    pub fn drive_all(&mut self, poller: &Poller, token: Token) {
-        self.0.drive_all(poller, token);
+    /// Register new connections with the poll and drive all connections.
+    pub fn drive_all(&mut self, registry: &Registry, token: Token) {
+        self.0.drive_all(registry, token);
     }
 }

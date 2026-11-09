@@ -16,7 +16,7 @@ use crate::forward::{
     apply_response_block, too_many_informational, HttpRequest, HttpResponse, ResponseBlock,
     HOP_BY_HOP,
 };
-use crate::poller::{Poller, Token};
+use m6_core::mio::{Interest, Registry, Token};
 
 // ── Frame constants ───────────────────────────────────────────────────────────
 
@@ -47,7 +47,7 @@ pub trait Transport: Sized {
     /// Establish the transport and send the client preface + SETTINGS.
     fn connect(host: &str, port: u16, tls: Option<Arc<rustls::ClientConfig>>) -> io::Result<Self>;
 
-    /// The raw file descriptor, for the poller.
+    /// The raw file descriptor, for the poll.
     fn raw_fd(&self) -> RawFd;
 
     /// The `:scheme` value for dispatched requests.
@@ -239,7 +239,7 @@ impl<T: Transport> H2Client<T> {
         // Send the body via the flow-control pump. Credit arrives
         // asynchronously on WINDOW_UPDATE, so the remainder is kept as stream
         // state and resumed when credit arrives; blocking instead would stall
-        // every other connection this poller drives, and sending without credit
+        // every other connection this loop drives, and sending without credit
         // is a connection error (RFC 9113 6.9).
         self.pump_stream(stream_id);
 
@@ -759,13 +759,17 @@ impl<T: Transport> Pool<T> {
         conn.dispatch(req, &host, client_ip, original_host)
     }
 
-    /// Register new connections with the poller and drive all connections.
+    /// Register new connections with the poll and drive all connections.
     ///
     /// Must be called on every event-loop iteration.
-    pub fn drive_all(&mut self, poller: &Poller, token: Token) {
+    pub fn drive_all(&mut self, registry: &Registry, token: Token) {
         for conn in self.connections.values_mut() {
             if !conn.registered {
-                let _ = poller.add(conn.raw_fd(), token);
+                let _ = registry.register(
+                    &mut m6_core::mio::unix::SourceFd(&conn.raw_fd()),
+                    token,
+                    Interest::READABLE,
+                );
                 conn.registered = true;
             }
             conn.drive();

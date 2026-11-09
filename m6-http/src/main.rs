@@ -56,11 +56,13 @@ type FinalizedResponse = (u16, Vec<(String, String)>, Vec<u8>, String);
 /// Short enough that a redeployed error page appears promptly, long enough
 /// that a sustained sweep costs one fetch a minute rather than one per path.
 const ERROR_PAGE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+use m6_core::event::{LoopTrace, Signals};
+use m6_core::mio::unix::SourceFd;
+use m6_core::mio::{Events, Interest, Poll, Token};
 use m6_http_lib::auth::PublicKey;
 use m6_http_lib::h2c_client::H2cClientPool;
 use m6_http_lib::h2s_client::H2sTlsClientPool;
 use m6_http_lib::http11::{make_tls_server_config, H2cListener, Http11Listener, RequestOutcome};
-use m6_http_lib::poller::{Poller, Token, WakeReader, WakeWriter};
 use m6_http_lib::pool::{self, PoolManager};
 use m6_http_lib::router::RouteTable;
 use m6_http_lib::stats::{Channel, Iface, Version as HttpVersion};
@@ -72,9 +74,22 @@ const TOKEN_TCP: Token = Token(2);
 const TOKEN_H2C: Token = Token(3);
 const TOKEN_H2C_CLIENT: Token = Token(4);
 const TOKEN_H2S_CLIENT: Token = Token(5);
-const TOKEN_WAKE: Token = Token(6);
+const TOKEN_SIGNAL: Token = Token(6);
 const TOKEN_SOCKET_UPSTREAM: Token = Token(7);
 const MAX_DATAGRAM_SIZE: usize = 1350;
+
+/// The [`LoopTrace`] trigger index for an iteration's first event, and the
+/// `timeout` index when none fired. The names are fixed in `event_loop`.
+fn trigger_for(token: Option<Token>) -> usize {
+    match token {
+        Some(TOKEN_UDP) => 0,
+        Some(TOKEN_TCP) => 1,
+        Some(TOKEN_H2C) => 2,
+        Some(TOKEN_H2C_CLIENT) | Some(TOKEN_H2S_CLIENT) | Some(TOKEN_SOCKET_UPSTREAM) => 3,
+        Some(TOKEN_SIGNAL) => 4,
+        _ => 5,
+    }
+}
 
 // ── Shutdown flags ───────────────────────────────────────────────────────────
 
@@ -320,35 +335,6 @@ fn seed_cache_warm(state: &mut ServerState) {
     );
 }
 
-// ── Signal handling ───────────────────────────────────────────────────────────
-//
-// One mechanism, shared with every other m6 service: `m6-core` blocks the
-// signals and waits for them on a dedicated thread, so nothing runs in signal
-// context.
-//
-// The epoll loop still needs waking. `epoll_pwait` with a signal mask closes
-// the window between checking the shutdown flag and sleeping, but only on
-// Linux: the kqueue path ignores the mask entirely, so the race it is meant to
-// close stays open on macOS.
-//
-// A self-pipe registered with the poller does the same job on every platform:
-// the shutdown hook writes one byte, the next `wait()` returns immediately
-// whatever timeout it was given, and the loop re-checks the flag. Two file
-// descriptors, created once.
-//
-// SIGUSR1 reopens the analytics log. Core handles it on the same thread, so
-// the epoll loop never sees it.
-
-fn setup_signals(wake: &WakeWriter) -> m6_core::signal::ShutdownHandle {
-    // No `socket`: m6-http listens on TCP and UDP, not a unix socket, so there
-    // is nothing to unlink and nothing to self-connect to. It parks in
-    // epoll/kqueue rather than accept(), which is the one genuine difference
-    // in how an m6 service waits, so it hands core its wake pipe.
-    m6_core::signal::ShutdownHandle::install(
-        m6_core::signal::Service::new("m6-http").wake_fd(wake.as_raw_fd()),
-    )
-}
-
 // ── quiche TLS/QUIC config ────────────────────────────────────────────────────
 
 fn make_quiche_config(server_config: &config::ServerConfig) -> anyhow::Result<quiche::Config> {
@@ -546,49 +532,64 @@ fn make_quiche_config(server_config: &config::ServerConfig) -> anyhow::Result<qu
 ///
 /// These four arrived as separate arguments, which put `event_loop` at
 /// six. They are not unrelated values: they are the set of things the
-/// loop waits on, which is why the poller registers every one of them in the
+/// loop waits on, which is why the poll registers every one of them in the
 /// same breath. `tcp` and `h2c` are optional because a node's role decides
 /// whether it has them at all.
 struct EventLoopIo {
     udp: UdpSocket,
     tcp: Option<Http11Listener>,
     h2c: Option<H2cListener>,
-    wake_reader: WakeReader,
+    signals: Signals,
 }
 
-fn event_loop(io: EventLoopIo, state: &mut ServerState, quiche_config: &mut quiche::Config) -> i32 {
+fn event_loop(
+    io: EventLoopIo,
+    state: &mut ServerState,
+    quiche_config: &mut quiche::Config,
+    lifecycle: &mut m6_core::signal::Lifecycle,
+) -> i32 {
     // Destructured rather than accessed through `io` throughout: the loop body
     // is long and reads better against the names it has always used.
     let EventLoopIo {
         udp,
         mut tcp,
         mut h2c,
-        wake_reader,
+        mut signals,
     } = io;
-    let poller = match Poller::new() {
+    let mut poll = match Poll::new() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("poller init failed: {e}");
+            eprintln!("poll init failed: {e}");
             return 2;
         }
     };
 
-    if let Err(e) = poller.add(udp.as_raw_fd(), TOKEN_UDP) {
-        eprintln!("poller add UDP failed: {e}");
+    if let Err(e) = poll.registry().register(
+        &mut SourceFd(&udp.as_raw_fd()),
+        TOKEN_UDP,
+        Interest::READABLE,
+    ) {
+        eprintln!("poll add UDP failed: {e}");
         return 2;
     }
     if let Some(ref t) = tcp {
-        let _ = poller.add(t.raw_fd(), TOKEN_TCP);
+        let _ = poll
+            .registry()
+            .register(&mut SourceFd(&t.raw_fd()), TOKEN_TCP, Interest::READABLE);
     }
     if let Some(ref h) = h2c {
-        let _ = poller.add(h.raw_fd(), TOKEN_H2C);
+        let _ = poll
+            .registry()
+            .register(&mut SourceFd(&h.raw_fd()), TOKEN_H2C, Interest::READABLE);
     }
-
-    // Wake pipe: the shutdown hook writes to it so a blocked `wait()` returns
-    // at once. Created in `run` before signals were installed, so the first
-    // signal could never arrive with nowhere to write.
-    if let Err(e) = poller.add(wake_reader.as_raw_fd(), TOKEN_WAKE) {
-        error!(error = %e, "registering the shutdown wake pipe");
+    // Signals arrive on their own descriptor, under the number the wake pipe
+    // used to hold.
+    if let Err(e) = poll.registry().register(
+        &mut SourceFd(&signals.raw_fd()),
+        TOKEN_SIGNAL,
+        Interest::READABLE,
+    ) {
+        error!(error = %e, "registering the signal descriptor");
         return 1;
     }
 
@@ -604,9 +605,13 @@ fn event_loop(io: EventLoopIo, state: &mut ServerState, quiche_config: &mut quic
     // (Handshake + 1-RTT) carry a 20-byte DCID that matches the stored key.
     let mut conn_id_map: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
     let mut recv_buf = vec![0u8; 65536];
-    let mut ev_buf = [Token(0); 64];
+    let mut events = Events::with_capacity(256);
+    // Wait time against work time, per kind of event that woke the loop. An
+    // iteration with events of several kinds is counted under its first event.
+    let mut trace = LoopTrace::new(&["udp", "tls", "h2c", "upstream", "signal", "timeout"]);
+    let mut last = std::time::Instant::now();
 
-    loop {
+    'run: loop {
         // Compute the soonest connection timeout
         // Idle poll cap. Was 100ms originally — every async backend round trip
         // (every cache-node→origin fetch) was silently paying up to that much
@@ -627,25 +632,41 @@ fn event_loop(io: EventLoopIo, state: &mut ServerState, quiche_config: &mut quic
             .unwrap_or(100)
             .min(10);
 
-        let n = match poller.wait(&mut ev_buf, timeout_ms) {
-            Ok(n) => n,
-            Err(e) => {
-                error!(error = %e, "poller error");
-                return 1;
+        // Edge-triggered: a capped accept leaves connections in the kernel
+        // queue that the h2c listener will not be reported for again. Drain
+        // them before waiting, and do not block while they remain.
+        let mut poll_timeout = std::time::Duration::from_millis(timeout_ms as u64);
+        if h2c.as_ref().is_some_and(|h| h.accept_again()) {
+            if let Some(ref mut h) = h2c {
+                h.accept_pending(poll.registry(), TOKEN_H2C);
             }
-        };
-
-        if m6_core::signal::is_shutdown() {
-            break;
+            if h2c.as_ref().is_some_and(|h| h.accept_again()) {
+                poll_timeout = std::time::Duration::ZERO;
+            }
         }
 
-        for ev in &ev_buf[..n] {
-            match *ev {
-                // Shutdown poke. Drained so one byte cannot spin the loop; the
-                // flag was already checked above, so there is nothing else to
-                // do here.
-                TOKEN_WAKE => {
-                    wake_reader.drain();
+        match poll.poll(&mut events, Some(poll_timeout)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                error!(error = %e, "poll error");
+                return 1;
+            }
+        }
+        let now = std::time::Instant::now();
+        trace.waited(now - last);
+
+        let first_trigger = events.iter().next().map(|ev| ev.token());
+        for ev in &events {
+            match ev.token() {
+                // Shutdown: drain every pending signal. The first Terminate
+                // breaks the loop; a second before the loop ends forces an exit.
+                TOKEN_SIGNAL => {
+                    while let Some(sig) = signals.read() {
+                        if lifecycle.on_signal(sig) == m6_core::signal::Action::Stop {
+                            break 'run;
+                        }
+                    }
                 }
                 TOKEN_UDP => {
                     drain_udp(
@@ -656,19 +677,19 @@ fn event_loop(io: EventLoopIo, state: &mut ServerState, quiche_config: &mut quic
                         quiche_config,
                         state,
                         &H3Loop {
-                            poller: &poller,
+                            registry: poll.registry(),
                             quic_port,
                         },
                     );
                 }
                 TOKEN_TCP => {
                     if let Some(ref mut t) = tcp {
-                        t.accept_pending(&poller, TOKEN_TCP);
+                        t.accept_pending(poll.registry(), TOKEN_TCP);
                     }
                 }
                 TOKEN_H2C => {
                     if let Some(ref mut h) = h2c {
-                        h.accept_pending(&poller, TOKEN_H2C);
+                        h.accept_pending(poll.registry(), TOKEN_H2C);
                     }
                 }
                 _ => {}
@@ -678,9 +699,9 @@ fn event_loop(io: EventLoopIo, state: &mut ServerState, quiche_config: &mut quic
         // Drive socket upstreams and the h2c/h2s client pools BEFORE the server
         // connections (design H6), so a reply read in this iteration is
         // collected by its waiting connection in the same iteration.
-        drive_socket_upstreams(state, &poller);
-        state.h2c_pool.drive_all(&poller, TOKEN_H2C_CLIENT);
-        state.h2s_pool.drive_all(&poller, TOKEN_H2S_CLIENT);
+        drive_socket_upstreams(state, poll.registry());
+        state.h2c_pool.drive_all(poll.registry(), TOKEN_H2C_CLIENT);
+        state.h2s_pool.drive_all(poll.registry(), TOKEN_H2S_CLIENT);
 
         // Drive HTTP/1.1 connections. Per-connection fds are registered with TOKEN_TCP
         // so this also runs on data-ready events, not only on the periodic tick.
@@ -893,8 +914,13 @@ fn event_loop(io: EventLoopIo, state: &mut ServerState, quiche_config: &mut quic
                     } // end cache hit
 
                     let mut outcome = handle_request(
-                        req, client_ip, enc_str, state, false, /* from_internal */
-                        false, &poller,
+                        req,
+                        client_ip,
+                        enc_str,
+                        state,
+                        false, /* from_internal */
+                        false,
+                        poll.registry(),
                     );
                     if let RequestOutcome::Ready(status, ref mut headers, _, ref backend) = outcome
                     {
@@ -960,7 +986,7 @@ fn event_loop(io: EventLoopIo, state: &mut ServerState, quiche_config: &mut quic
                     );
                     (status, headers, body, backend_name)
                 },
-                &poller,
+                poll.registry(),
             );
             // Handshakes completed on this wakeup, attributed by negotiated ALPN.
             //
@@ -1189,7 +1215,7 @@ fn event_loop(io: EventLoopIo, state: &mut ServerState, quiche_config: &mut quic
                         state,
                         false,
                         state.h2c_iface == Iface::Internal,
-                        &poller,
+                        poll.registry(),
                     );
                     if let RequestOutcome::Ready(status, ref mut headers, _, ref backend) = outcome
                     {
@@ -1226,7 +1252,7 @@ fn event_loop(io: EventLoopIo, state: &mut ServerState, quiche_config: &mut quic
                     );
                     (status, headers, body, backend_name)
                 },
-                &poller,
+                poll.registry(),
             );
             // No handshake recording here, and that is not an omission. This is
             // the H2C CLEARTEXT listener -- a different type from the TLS one
@@ -1276,10 +1302,14 @@ fn event_loop(io: EventLoopIo, state: &mut ServerState, quiche_config: &mut quic
         // Remove closed/timed-out connections
         connections.retain(|_, c| !c.conn.is_closed());
 
-        // Emit periodic stats (cheap check every iteration: compares one Instant)
-        state
+        // Emit periodic stats (cheap check every iteration: compares one Instant).
+        // On the emit, copy the loop trace into the snapshot so `/perf` serves it.
+        if state
             .stats
-            .maybe_emit(state.pool_manager.total_active_members());
+            .maybe_emit(state.pool_manager.total_active_members())
+        {
+            state.stats.set_event_loop(trace.report());
+        }
 
         // Complete any background fetch whose reply has arrived. Runs through
         // the same finalize_url_response as a real request, so the cache
@@ -1338,7 +1368,7 @@ fn event_loop(io: EventLoopIo, state: &mut ServerState, quiche_config: &mut quic
                     state,
                     true,
                     /* from_internal */ false,
-                    &poller,
+                    poll.registry(),
                 ) {
                     // Ready: answered inline (redirect, error). The reply
                     // landed directly; nothing to park.
@@ -1356,6 +1386,11 @@ fn event_loop(io: EventLoopIo, state: &mut ServerState, quiche_config: &mut quic
                 }
             }
         }
+
+        // The clock read at the end of the work is also the start of the next
+        // wait: record the work under the iteration's first trigger, then loop.
+        last = std::time::Instant::now();
+        trace.worked(trigger_for(first_trigger), last - now);
     }
 
     0
@@ -1363,10 +1398,10 @@ fn event_loop(io: EventLoopIo, state: &mut ServerState, quiche_config: &mut quic
 
 // ── UDP receive + quiche dispatch ─────────────────────────────────────────────
 
-/// The loop context threaded down the h3 request path: the poller, for
+/// The loop context threaded down the h3 request path: the registry, for
 /// registering socket upstreams, and the QUIC port, for the Alt-Svc header.
 struct H3Loop<'a> {
-    poller: &'a Poller,
+    registry: &'a m6_core::mio::Registry,
     quic_port: u16,
 }
 
@@ -2005,8 +2040,13 @@ fn handle_h3_request(stream_id: u64, qconn: &mut QuicConn, state: &mut ServerSta
     };
 
     match handle_request(
-        &http_req, &client_ip, enc_str, state, false, /* from_internal */
-        false, h3.poller,
+        &http_req,
+        &client_ip,
+        enc_str,
+        state,
+        false, /* from_internal */
+        false,
+        h3.registry,
     ) {
         RequestOutcome::Ready(status, mut resp_headers, body, backend_name) => {
             // Add alt-svc header.
@@ -2280,7 +2320,7 @@ fn handle_request(
     state: &mut ServerState,
     is_prefetch: bool,
     from_internal: bool,
-    poller: &Poller,
+    registry: &m6_core::mio::Registry,
 ) -> RequestOutcome {
     let describedby = state.config.site.describedby.clone();
     let mut outcome = handle_request_inner(
@@ -2290,7 +2330,7 @@ fn handle_request(
         state,
         is_prefetch,
         from_internal,
-        poller,
+        registry,
     );
     if let RequestOutcome::Ready(status, ref mut headers, _, ref backend) = outcome {
         let compresses = state.config.backend_compresses(backend);
@@ -2338,7 +2378,7 @@ enum SocketLaunchError {
 /// Returns the receiver the caller's connection waits on.
 fn launch_socket_upstream(
     state: &mut ServerState,
-    poller: &Poller,
+    registry: &m6_core::mio::Registry,
     request: Vec<u8>,
     method: &str,
     backend_name: &str,
@@ -2364,7 +2404,11 @@ fn launch_socket_upstream(
             return Err(SocketLaunchError::Connect(e));
         }
     };
-    if let Err(e) = poller.add(upstream.raw_fd(), TOKEN_SOCKET_UPSTREAM) {
+    if let Err(e) = registry.register(
+        &mut SourceFd(&upstream.raw_fd()),
+        TOKEN_SOCKET_UPSTREAM,
+        Interest::READABLE,
+    ) {
         if let Some(pool) = state.pool_manager.get_pool_mut(backend_name) {
             pool.mark_failed(member_idx);
         }
@@ -2391,7 +2435,7 @@ fn handle_request_inner(
     // rather than a public client. Granted by the listener, never by a header, so a public
     // client cannot claim it. The error-path guard and the metrics gate read it.
     from_internal: bool,
-    poller: &Poller,
+    registry: &m6_core::mio::Registry,
 ) -> RequestOutcome {
     // Prefetch requests are synthetic (no real client, client_ip is a
     // placeholder) and their response is discarded by the caller — logging
@@ -2639,7 +2683,8 @@ fn handle_request_inner(
             // backend is itself a URL/H2C/H2S backend — every cache node,
             // whose only backend is the origin — dispatch that fetch async
             // and let it resolve through the normal Pending machinery.
-            if let Some(outcome) = dispatch_custom_error_async(404, req, client_ip, state, poller) {
+            if let Some(outcome) = dispatch_custom_error_async(404, req, client_ip, state, registry)
+            {
                 return outcome;
             }
             let (s, h, b, n) = apply_error_mode(404, req, client_ip, state, None);
@@ -2835,63 +2880,69 @@ fn handle_request_inner(
         }
     };
 
-    let rx =
-        match launch_socket_upstream(state, poller, request, &req.method, &backend_name, timeout) {
-            Ok(rx) => rx,
-            Err(SocketLaunchError::UnknownBackend) => {
-                warn!(backend = %backend_name, "unknown backend");
-                let err_ctx = error::ErrorContext {
-                    route: Some(route.path.clone()),
-                    backend: Some(backend_name.clone()),
-                    detail: Some(format!("unknown backend: {backend_name}")),
-                };
-                let (s, h, b, n) = apply_error_mode(502, req, client_ip, state, Some(&err_ctx));
-                return RequestOutcome::Ready(s, h, b, n);
-            }
-            Err(SocketLaunchError::Empty) => {
-                warn!(backend = %backend_name, "socket pool empty");
-                let err_ctx = error::ErrorContext {
-                    route: Some(route.path.clone()),
-                    backend: Some(backend_name.clone()),
-                    detail: Some("pool empty".to_string()),
-                };
-                let (s, h, b, n) = apply_error_mode(502, req, client_ip, state, Some(&err_ctx));
-                return RequestOutcome::Ready(s, h, b, n);
-            }
-            Err(SocketLaunchError::BacklogFull) => {
-                // The listen backlog is full: the member is alive and busy (E2,
-                // the kernel is the queue). Release the slot without marking it
-                // failed and answer 503.
-                let err_ctx = error::ErrorContext {
-                    route: Some(route.path.clone()),
-                    backend: Some(backend_name.clone()),
-                    detail: Some("backend listen queue full".to_string()),
-                };
-                let (s, mut h, b, n) = apply_error_mode(503, req, client_ip, state, Some(&err_ctx));
-                h.push(("Retry-After".to_string(), "1".to_string()));
-                return RequestOutcome::Ready(s, h, b, n);
-            }
-            Err(SocketLaunchError::Connect(e)) => {
-                warn!(backend = %backend_name, error = %e, "backend error");
-                let err_ctx = error::ErrorContext {
-                    route: Some(route.path.clone()),
-                    backend: Some(backend_name.clone()),
-                    detail: Some(e.to_string()),
-                };
-                let (s, h, b, n) = apply_error_mode(502, req, client_ip, state, Some(&err_ctx));
-                return RequestOutcome::Ready(s, h, b, n);
-            }
-            Err(SocketLaunchError::Register(e)) => {
-                warn!(backend = %backend_name, error = %e, "registering socket upstream");
-                let err_ctx = error::ErrorContext {
-                    route: Some(route.path.clone()),
-                    backend: Some(backend_name.clone()),
-                    detail: Some(e.to_string()),
-                };
-                let (s, h, b, n) = apply_error_mode(502, req, client_ip, state, Some(&err_ctx));
-                return RequestOutcome::Ready(s, h, b, n);
-            }
-        };
+    let rx = match launch_socket_upstream(
+        state,
+        registry,
+        request,
+        &req.method,
+        &backend_name,
+        timeout,
+    ) {
+        Ok(rx) => rx,
+        Err(SocketLaunchError::UnknownBackend) => {
+            warn!(backend = %backend_name, "unknown backend");
+            let err_ctx = error::ErrorContext {
+                route: Some(route.path.clone()),
+                backend: Some(backend_name.clone()),
+                detail: Some(format!("unknown backend: {backend_name}")),
+            };
+            let (s, h, b, n) = apply_error_mode(502, req, client_ip, state, Some(&err_ctx));
+            return RequestOutcome::Ready(s, h, b, n);
+        }
+        Err(SocketLaunchError::Empty) => {
+            warn!(backend = %backend_name, "socket pool empty");
+            let err_ctx = error::ErrorContext {
+                route: Some(route.path.clone()),
+                backend: Some(backend_name.clone()),
+                detail: Some("pool empty".to_string()),
+            };
+            let (s, h, b, n) = apply_error_mode(502, req, client_ip, state, Some(&err_ctx));
+            return RequestOutcome::Ready(s, h, b, n);
+        }
+        Err(SocketLaunchError::BacklogFull) => {
+            // The listen backlog is full: the member is alive and busy (E2,
+            // the kernel is the queue). Release the slot without marking it
+            // failed and answer 503.
+            let err_ctx = error::ErrorContext {
+                route: Some(route.path.clone()),
+                backend: Some(backend_name.clone()),
+                detail: Some("backend listen queue full".to_string()),
+            };
+            let (s, mut h, b, n) = apply_error_mode(503, req, client_ip, state, Some(&err_ctx));
+            h.push(("Retry-After".to_string(), "1".to_string()));
+            return RequestOutcome::Ready(s, h, b, n);
+        }
+        Err(SocketLaunchError::Connect(e)) => {
+            warn!(backend = %backend_name, error = %e, "backend error");
+            let err_ctx = error::ErrorContext {
+                route: Some(route.path.clone()),
+                backend: Some(backend_name.clone()),
+                detail: Some(e.to_string()),
+            };
+            let (s, h, b, n) = apply_error_mode(502, req, client_ip, state, Some(&err_ctx));
+            return RequestOutcome::Ready(s, h, b, n);
+        }
+        Err(SocketLaunchError::Register(e)) => {
+            warn!(backend = %backend_name, error = %e, "registering socket upstream");
+            let err_ctx = error::ErrorContext {
+                route: Some(route.path.clone()),
+                backend: Some(backend_name.clone()),
+                detail: Some(e.to_string()),
+            };
+            let (s, h, b, n) = apply_error_mode(502, req, client_ip, state, Some(&err_ctx));
+            return RequestOutcome::Ready(s, h, b, n);
+        }
+    };
 
     let ctx = forward::PendingUrlContext {
         req: req.clone(),
@@ -2961,7 +3012,7 @@ fn dispatch_custom_error_async(
     req: &forward::HttpRequest,
     client_ip: &str,
     state: &mut ServerState,
-    poller: &Poller,
+    registry: &m6_core::mio::Registry,
 ) -> Option<RequestOutcome> {
     let error_path = match &state.error_mode {
         ErrorMode::Custom { path } => path.clone(),
@@ -3073,7 +3124,8 @@ fn dispatch_custom_error_async(
     // reaches a normal route. Any failure falls back to the synchronous
     // `apply_error_mode`, which handles it identically.
     let request = forward::encode_request(&error_req, client_ip, original_host).ok()?;
-    let rx = launch_socket_upstream(state, poller, request, "GET", &backend_name, timeout).ok()?;
+    let rx =
+        launch_socket_upstream(state, registry, request, "GET", &backend_name, timeout).ok()?;
 
     let ctx = forward::PendingUrlContext {
         req: req.clone(),
@@ -3269,10 +3321,10 @@ fn forward_to_backend(
 }
 
 /// Drive every in-flight socket upstream once. A finished or expired entry
-/// leaves the poller, its result goes on the entry's channel (where the waiting
+/// leaves the poll, its result goes on the entry's channel (where the waiting
 /// h1, h2 or h3 connection collects it in the same iteration), and the pool
 /// member is released or marked failed.
-fn drive_socket_upstreams(state: &mut ServerState, poller: &Poller) {
+fn drive_socket_upstreams(state: &mut ServerState, registry: &m6_core::mio::Registry) {
     let now = std::time::Instant::now();
     let mut idx = 0;
     while idx < state.socket_upstreams.len() {
@@ -3280,11 +3332,15 @@ fn drive_socket_upstreams(state: &mut ServerState, poller: &Poller) {
             let entry = &mut state.socket_upstreams[idx];
             match entry.upstream.drive() {
                 Some(result) => {
-                    poller.delete(entry.upstream.raw_fd()).ok();
+                    registry
+                        .deregister(&mut SourceFd(&entry.upstream.raw_fd()))
+                        .ok();
                     Some(result)
                 }
                 None if entry.upstream.expired(now) => {
-                    poller.delete(entry.upstream.raw_fd()).ok();
+                    registry
+                        .deregister(&mut SourceFd(&entry.upstream.raw_fd()))
+                        .ok();
                     Some(Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         "backend timed out",
@@ -4299,16 +4355,17 @@ fn run(args: Vec<String>) -> i32 {
         return 2;
     }
 
-    // Wake pipe first, then signals: the shutdown hook needs somewhere to
-    // write before a signal can arrive.
-    let (wake_reader, wake_writer) = match Poller::wake_pipe() {
-        Ok(p) => p,
+    // Signals, first so a signal can never arrive with nothing listening. The
+    // mask was blocked as the first statement of `main`.
+    let signals = match Signals::new() {
+        Ok(s) => s,
         Err(e) => {
-            eprintln!("wake pipe init failed: {e}");
+            eprintln!("signal init failed: {e}");
             return 2;
         }
     };
-    let shutdown = setup_signals(&wake_writer);
+    let mut lifecycle = m6_core::signal::Lifecycle::new("m6-http", None);
+    lifecycle.started();
 
     // Build TLS config for HTTP/1.1 and bind TCP listener on the same port.
     // Both are Some on this path: redirect mode returned above, and every other
@@ -4433,12 +4490,13 @@ fn run(args: Vec<String>) -> i32 {
             udp,
             tcp: tcp_listener,
             h2c: h2c_listener,
-            wake_reader,
+            signals,
         },
         &mut state,
         &mut quiche_config,
+        &mut lifecycle,
     );
-    shutdown.complete();
+    lifecycle.complete();
     code
 }
 

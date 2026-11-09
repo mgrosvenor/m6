@@ -33,13 +33,16 @@
 //! the redirect is what it should always have been: a response code.
 use crate::forward::HttpRequest;
 use crate::http11::{Http11Listener, RequestOutcome};
-use crate::poller::{Poller, Token};
+use m6_core::event::Signals;
+use m6_core::mio::{Events, Interest, Poll, Token};
 use std::io::ErrorKind;
+use std::time::Duration;
 use tracing::{info, warn};
 
 const TOKEN_LISTENER: Token = Token(0);
 const TOKEN_CONN: Token = Token(1);
-const POLL_TIMEOUT_MS: i32 = 1_000;
+const TOKEN_SIGNAL: Token = Token(2);
+const POLL_TIMEOUT_MS: u64 = 1_000;
 
 /// Percent-safe: the request target is echoed back into `Location` verbatim,
 /// so anything that could terminate the header or inject one is rejected
@@ -127,49 +130,64 @@ fn redirect_for(req: &HttpRequest) -> RequestOutcome {
 }
 
 pub fn run(bind: &str) -> anyhow::Result<()> {
-    // `main` blocks the shutdown signals as its first statement, which makes
-    // them deliverable only to core's sigwait thread. Redirect mode returned
-    // before ever installing that thread, so SIGTERM was blocked and nothing
-    // was listening for it: the process could not be stopped by anything short
-    // of SIGKILL. Found by a conformance run that could not reclaim its port.
-    //
-    // No wake fd and no socket: this loop parks in `poll` with a one second
-    // timeout and re-checks the flag each time round, so it needs neither.
-    let shutdown =
-        m6_core::signal::ShutdownHandle::install(m6_core::signal::Service::new("m6-http-redirect"));
+    // `main` blocks the shutdown signals as its first statement, and `Signals`
+    // delivers them on a descriptor this loop reads, so SIGTERM is never
+    // blocked with nothing listening for it.
+    let mut lifecycle = m6_core::signal::Lifecycle::new("m6-http-redirect", None);
+    lifecycle.started();
 
     let mut listener =
         Http11Listener::bind_plain(bind, crate::http11::DEFAULT_MAX_REQUESTS_PER_CONN)?;
-    let poller = Poller::new()?;
-    poller.add(listener.raw_fd(), TOKEN_LISTENER)?;
+    let mut signals = Signals::new()?;
+    let mut poll = Poll::new()?;
+    poll.registry().register(
+        &mut m6_core::mio::unix::SourceFd(&listener.raw_fd()),
+        TOKEN_LISTENER,
+        Interest::READABLE,
+    )?;
+    poll.registry().register(
+        &mut m6_core::mio::unix::SourceFd(&signals.raw_fd()),
+        TOKEN_SIGNAL,
+        Interest::READABLE,
+    )?;
 
     info!(bind = %bind, "HTTP->HTTPS redirect listener started");
 
-    let mut ev_buf = [Token(0); 64];
+    let mut events = Events::with_capacity(64);
     loop {
         // The timeout also drives the connection sweep inside `drive_all` when
         // nothing else is happening, so a stalled client is still reaped on an
         // otherwise silent listener.
-        if let Err(e) = poller.wait(&mut ev_buf, POLL_TIMEOUT_MS) {
-            if e.kind() == ErrorKind::Interrupted {
+        match poll.poll(&mut events, Some(Duration::from_millis(POLL_TIMEOUT_MS))) {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => {
+                warn!(error = %e, "redirect: poll error");
                 continue;
             }
-            warn!(error = %e, "redirect: poller error");
-            continue;
         }
 
-        listener.accept_pending(&poller, TOKEN_CONN);
+        for ev in &events {
+            match ev.token() {
+                TOKEN_LISTENER => listener.accept_pending(poll.registry(), TOKEN_CONN),
+                TOKEN_SIGNAL => {
+                    while let Some(sig) = signals.read() {
+                        if lifecycle.on_signal(sig) == m6_core::signal::Action::Stop {
+                            lifecycle.complete();
+                            return Ok(());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
         listener.drive_all(
             |req, _client_ip| redirect_for(req),
             // No URL backends here, so no pending response can ever arrive.
             |_resp, _ctx| (500, Vec::new(), Vec::new(), String::new()),
-            &poller,
+            poll.registry(),
         );
-
-        if m6_core::signal::is_shutdown() {
-            shutdown.complete();
-            return Ok(());
-        }
     }
 }
 

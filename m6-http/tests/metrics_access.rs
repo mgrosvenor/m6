@@ -659,6 +659,38 @@ fn perf_answers_a_listed_peer_with_the_role_over_h1_h2_h3() {
 }
 
 #[test]
+fn perf_reports_the_event_loop() {
+    let run = Fixture::new(&gated(), "", "").start();
+    let auth = bearer(&run.token(&["monitor"]));
+    // A few requests so the loop has work to report on the accounting tick.
+    for _ in 0..3 {
+        assert_eq!(run.h1("/health", &[]).status, 200, "health answers");
+    }
+    // The trace is copied on the accounting tick, once per EMIT_INTERVAL_SECS.
+    // Wait for the field to be non-empty, with a deadline.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut event_loop = None;
+    while Instant::now() < deadline {
+        let r = run.h1("/perf", &[("Authorization", &auth)]);
+        assert_eq!(r.status, 200, "{}", r.text());
+        let parsed: m6_core::monitoring::PerfReport =
+            serde_json::from_slice(&r.body).expect("a report");
+        if !parsed.metrics.event_loop.is_empty() {
+            event_loop = Some(parsed.metrics.event_loop);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let event_loop = event_loop.expect("event_loop never populated within the deadline");
+    // The test drives HTTP/1.1 over TLS, so the `tls` trigger has events.
+    let trigger = event_loop
+        .iter()
+        .find(|t| t.name == "tls" && t.count > 0)
+        .expect("a tls trigger with events");
+    assert!(trigger.work_max_ns >= trigger.work_min_ns, "{trigger:?}");
+}
+
+#[test]
 fn an_unlisted_peer_gets_404_with_a_valid_token_over_h1_h2_h3() {
     let site = format!("{AUTH}\n{}", GATE.replace("127.0.0.1", "10.0.0.9"));
     let run = Fixture::new(&site, "", "").start();

@@ -421,6 +421,9 @@ pub struct Stats {
     pub rps_peak: u64,
     window_start: Instant,
     last_emit: Instant,
+    /// The loop trace, copied on the accounting tick and served by `/perf`.
+    event_loop: [m6_core::event::TriggerReport; 16],
+    event_loop_len: usize,
 }
 
 impl Default for Stats {
@@ -461,6 +464,8 @@ impl Stats {
             rps_peak: 0,
             window_start: now,
             last_emit: now,
+            event_loop: [m6_core::event::TriggerReport::default(); 16],
+            event_loop_len: 0,
         }
     }
 
@@ -571,11 +576,14 @@ impl Stats {
     }
 
     #[inline]
-    pub fn maybe_emit(&mut self, pool_members: usize) {
+    /// Returns true when the periodic line was emitted (once per
+    /// `EMIT_INTERVAL_SECS`), so the caller copies the loop trace on the same
+    /// tick.
+    pub fn maybe_emit(&mut self, pool_members: usize) -> bool {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_emit);
         if elapsed.as_secs() < EMIT_INTERVAL_SECS {
-            return;
+            return false;
         }
 
         let elapsed_secs = elapsed.as_secs_f64().max(0.001);
@@ -664,6 +672,15 @@ impl Stats {
         self.monitor_window_added = 0;
         self.window_start = now;
         self.last_emit = now;
+        true
+    }
+
+    /// Copy the loop trace into the fixed snapshot array, called on the same
+    /// tick as `maybe_emit`. A copy, no allocation.
+    pub fn set_event_loop(&mut self, report: &[m6_core::event::TriggerReport]) {
+        let n = report.len().min(16);
+        self.event_loop[..n].copy_from_slice(&report[..n]);
+        self.event_loop_len = n;
     }
 }
 
@@ -775,6 +792,19 @@ impl Stats {
                         handshake_full: c.handshake_full.snapshot(),
                         handshake_resumed: c.handshake_resumed.snapshot(),
                     }
+                })
+                .collect(),
+            event_loop: self.event_loop[..self.event_loop_len]
+                .iter()
+                .map(|t| m6_core::telemetry::LoopTriggerSnapshot {
+                    name: t.name.to_string(),
+                    count: t.count,
+                    wait_min_ns: t.wait_min_ns,
+                    wait_max_ns: t.wait_max_ns,
+                    wait_mean_ns: t.wait_mean_ns,
+                    work_min_ns: t.work_min_ns,
+                    work_max_ns: t.work_max_ns,
+                    work_mean_ns: t.work_mean_ns,
                 })
                 .collect(),
         }

@@ -1182,7 +1182,7 @@ impl SocketUpstream {
         Ok(upstream)
     }
 
-    /// The descriptor to register with the poller.
+    /// The descriptor to register with the poll.
     pub fn raw_fd(&self) -> std::os::unix::io::RawFd {
         self.stream.as_raw_fd()
     }
