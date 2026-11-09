@@ -227,7 +227,7 @@ Set `M6` to a different path when the two checkouts are not siblings.
 
 [`m6-site-toml.md`](m6-site-toml.md) owns every config key.
 [`m6-file.md`](m6-file.md) owns the handler and wildcard rules.
-[`m6-render.md`](m6-render.md) owns template rendering.
+[`m6-core-reference.md`](m6-core-reference.md) §4.5 owns template rendering.
 
 Example 01 shows the smallest useful site: three processes and four config files.
 Example 02 keeps that stack and adds a Markdown build step, one generated params file and two routes.
@@ -354,7 +354,7 @@ It repeats the date descending sort that m6-md already applied, so the page keep
 ```
 
 [`m6-md.md`](m6-md.md) owns the frontmatter rules, the watch flags, the output format and `not_found()`.
-[`m6-render-lib.md`](m6-render-lib.md) owns the template engine and its built-in keys and m6 filters.
+[`m6-core-reference.md`](m6-core-reference.md) owns the template engine and its m6 filters at §4.5, and the built-in keys at §4.1.
 The `sort`, `reverse`, `filter`, `length` and `first` filters are Tera's standard filters.
 
 Example 02 adds a content pipeline in front of the same three processes.
@@ -563,8 +563,8 @@ M6_SOCKET_OVERRIDE=/tmp/m6/render-contact.sock \
 
 `$EXAMPLES` is the m6-examples checkout root.
 
-[`m6-render.md`](m6-render.md) owns the custom renderer guide.
-[`m6-render-lib.md`](m6-render-lib.md) owns the renderer config keys, including `secrets_file`, and `init_global`.
+[`m6-app-anatomy.md`](m6-app-anatomy.md) owns the custom renderer guide.
+[`m6-app-anatomy.md`](m6-app-anatomy.md) §4 owns the renderer config keys, §5.3 owns `init_global`, and [`m6-site-toml.md`](m6-site-toml.md) §3.2 owns `secrets_file`.
 [`m6-site-toml.md`](m6-site-toml.md) owns the `[[backend]]` and `[[route]]` keys.
 
 Example 03 adds one custom renderer and one form route.

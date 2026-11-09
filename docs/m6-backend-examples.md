@@ -294,7 +294,7 @@ The examples deliberately leave out the following, so the contract stays the onl
   The example demonstrates the contract, and the reader supplies the payload.
   Adding a numerical dependency would make the example about `numpy` and put a wheel build in the gate.
 - **Databases, templating, sessions.**
-  These are application concerns, and `m6-render` is where that story lives for Rust.
+  These are application concerns, and `m6-core`, in [`m6-core-reference.md`](m6-core-reference.md), is where that story lives for Rust.
 - **Performance.**
   These are correctness references, and `m6-file` remains the example of a fast backend.
 - **Node, Ruby, PHP, Java.**
