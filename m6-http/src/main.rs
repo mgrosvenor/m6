@@ -3437,10 +3437,6 @@ fn forward_to_backend(
     }
 }
 
-/// Drive every in-flight socket upstream once. A finished or expired entry
-/// leaves the poll, its result goes on the entry's channel (where the waiting
-/// h1, h2 or h3 connection collects it in the same iteration), and the pool
-/// member is released or marked failed.
 /// Ensure exactly one `alt-svc` header advertising HTTP/3 is present, replacing
 /// any pre-existing one instead of appending a duplicate. A pre-existing entry
 /// shows up whenever the response body already passed through another m6-http
