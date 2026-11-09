@@ -292,3 +292,50 @@ fn dump_config_prints_the_merged_server_from_the_system_file_and_exits_0() {
         "the merged [server] bind must come from the system file, got: {stdout}"
     );
 }
+
+/// Scenario: a `[[backend]]` pool whose socket glob matches no file when
+/// m6-http starts. Wrong outcome: m6-http starts with an empty pool and answers
+/// 502 for the route forever instead of refusing with exit 2.
+#[test]
+fn a_pool_whose_glob_matches_no_socket_exits_2() {
+    let claim = testkit::claim_port();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let site = dir.path().join("site");
+    std::fs::create_dir_all(&site).expect("site dir");
+    write_cert_key(&site);
+    let sockets = dir.path().join("sockets");
+    std::fs::create_dir_all(&sockets).expect("socket dir");
+    std::fs::write(
+        site.join("site.toml"),
+        format!(
+            "[site]\nname = \"startup-errors\"\ndomain = \"example.com\"\n\n\
+             [log]\nlevel = \"info\"\nformat = \"plain\"\n\n\
+             [[backend]]\nname = \"b\"\nsockets = \"{}\"\n\n\
+             [[route]]\npath = \"/\"\nbackend = \"b\"\n",
+            sockets.join("*.sock").display()
+        ),
+    )
+    .expect("site.toml");
+    let system = dir.path().join("system.toml");
+    std::fs::write(
+        &system,
+        format!(
+            "[node]\nname = \"startup-errors\"\n\n\
+             [server]\nbind = \"{}\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n",
+            claim.addr()
+        ),
+    )
+    .expect("system config");
+
+    let out = run(&[site.as_os_str(), system.as_os_str()]);
+    assert_eq!(exit_code(&out), 2, "stderr: {}", stderr_of(&out));
+    let err = stderr_of(&out);
+    assert!(
+        err.contains("matches no socket"),
+        "the error must say the glob matches no socket, got: {err}"
+    );
+    assert!(
+        err.contains('b') && err.contains("[[backend]]"),
+        "the error must name the backend, got: {err}"
+    );
+}

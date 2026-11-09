@@ -9,8 +9,7 @@
 //! points (`http11::build_response`, `http2::encode_response_headers`,
 //! `send_h3_response`) sit below the layer that owns `Config`, and threading
 //! config through three protocol stacks to deliver five constant strings would
-//! be a poor trade. `configure()` is called once at startup and again on each
-//! `site.toml` reload.
+//! be a poor trade. `configure()` is called once at startup.
 
 use std::sync::RwLock;
 
@@ -31,8 +30,7 @@ static HEADERS: RwLock<Resolved> = RwLock::new(Resolved {
     h1_block: String::new(),
 });
 
-/// Install the header set derived from `[security]`. Called at startup and on
-/// config reload.
+/// Install the header set derived from `[security]`. Called at startup.
 pub fn configure(cfg: &crate::config::SecurityConfig) {
     let pairs = cfg.resolved_headers();
     let mut h1_block = String::new();

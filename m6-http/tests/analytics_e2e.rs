@@ -433,11 +433,11 @@ impl Server {
 
     /// Wait until a request actually reaches the backend, then clear the log.
     ///
-    /// Listening on the port is not the same as being able to serve: m6-http
-    /// fills its backend pool from a periodic rescan, so there is a window
-    /// where every request is a 502. This was `sleep(2500)`, a number tuned on
-    /// a fast laptop, and on the slower Linux build box it was not enough:
-    /// five tests here failed with 502 against an empty pool.
+    /// Listening on the port is not the same as being able to serve: a backend
+    /// that has not finished starting answers 502. This was `sleep(2500)`, a
+    /// number tuned on a fast laptop, and on the slower Linux build box it was
+    /// not enough: five tests here failed with 502 against a backend that was
+    /// not ready.
     ///
     /// The probe requests are real, so they are logged. Every test in this file
     /// counts analytics lines and assumes it starts from an empty log, so the
@@ -1358,10 +1358,10 @@ backend = "origin"
     );
     _edge_http_proc.wait_for_tcp(edge_port, Duration::from_secs(10));
 
-    // Both stacks must actually be serving, not merely listening: m6-http
-    // fills its backend pool from a periodic rescan. This was two
-    // `sleep(1500)`s and they were not enough on the Linux build box. Probing
-    // the edge exercises the whole chain, so it covers the origin too.
+    // Both stacks must actually be serving, not merely listening: a backend
+    // that has not finished starting answers 502. This was two `sleep(1500)`s
+    // and they were not enough on the Linux build box. Probing the edge
+    // exercises the whole chain, so it covers the origin too.
     let probe_tls = tls_client_config(&edge_cert_der);
     let ready = m6_core::testkit::wait::until(Duration::from_secs(30), || {
         https_get(edge_port, "/public/probe.html", &[], probe_tls.clone()).status == 200

@@ -374,10 +374,10 @@ impl Server {
 
     /// Wait until a request actually reaches the backend.
     ///
-    /// Listening on the port is not the same as being able to serve: m6-http
-    /// fills its backend pool from a periodic rescan, so there is a window
-    /// where every request is a 502. This was `sleep(2500)`, a number tuned on
-    /// a fast laptop, and it was not enough on the slower Linux build box.
+    /// Listening on the port is not the same as being able to serve: a backend
+    /// that has not finished starting answers 502. This was `sleep(2500)`, a
+    /// number tuned on a fast laptop, and it was not enough on the slower Linux
+    /// build box.
     fn wait_until_serving(&self) {
         let ready = m6_core::testkit::wait::until(Duration::from_secs(30), || {
             https_get(self, "/public/probe.txt", &[], self.tls()).status == 200

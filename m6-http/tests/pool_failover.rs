@@ -29,8 +29,8 @@ use m6_core::testkit::{binary, claim_port, read_one, wait, Service};
 /// `crash` closes the listener but leaves the socket file, the state a
 /// SIGKILLed backend leaves: the pool still sees the member and a connect to it
 /// is refused. `restart` binds a fresh listener and atomically renames it over
-/// the socket path, so the path is never absent and the member is never dropped
-/// from the pool by a rescan.
+/// the socket path, so the member keeps its path and is backed off, then serves
+/// again once a listener is bound there.
 struct Backend {
     path: PathBuf,
     body: String,
@@ -64,8 +64,8 @@ impl Backend {
 
     /// Bind a fresh listener and move it onto the same path atomically.
     fn restart(&mut self) {
-        // The temp path must not match the pool's `*.sock` glob, or a rescan
-        // could add it as a second member. `.tmp` does not match.
+        // The temp path must not match the pool's `*.sock` glob. `.tmp` does
+        // not match.
         let temp = self.path.with_extension("tmp");
         let _ = std::fs::remove_file(&temp);
         let listener = UnixListener::bind(&temp).expect("bind replacement socket");
