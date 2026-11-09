@@ -158,7 +158,7 @@ Section 4.2 covers what a rotation does to tokens already issued.
 ### 4.2. Key rotation
 
 A rotation writes both key files, then restarts the service.
-The service reads both files at start and checks the pair, and a key that fails to load or a pair that does not match exits 2.
+The service reads both files at start and checks the pair, and a key that fails to load exits 2.
 
 A successful rotation changes the signing key immediately after the restart.
 Restart m6-http after m6-auth-server so it reads the new public key.

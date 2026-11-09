@@ -41,10 +41,10 @@ Logs to stdout as structured JSON.
 Each `[[backend]]` with `sockets` is a pool. m6-http finds pool members once at start by expanding the socket glob.
 
 **Pool management:**
-- Socket appears matching glob → added to pool
-- Socket disappears → removed from pool
-- Failed connection → socket removed from active pool temporarily, retried after backoff: 1s, 2s, 4s, max 30s
-- Empty pool → return appropriate status per `[errors] mode`
+- Members are the sockets the glob matches when m6-http starts
+- A pool whose glob matches no socket at start exits 2
+- Failed connection → member backed off, retried after 1s, 2s, 4s, max 30s
+- A backend that restarts on the same socket path serves again after its backoff
 
 **Load balancing:** least-connections across active pool members.
 
@@ -91,14 +91,10 @@ Cache key: `(path, content-encoding)`. Query strings stripped before lookup. Eac
 
 m6-http maintains a map from data files to the URL paths that depend on them. The map is built at startup from two sources:
 
-1. **`[[route_group]]` globs** map each matched file to its corresponding URL path. `content/posts/hello-world.json` → `/blog/hello-world`. Map built at start, which expands the glob against current files.
+1. **`[[route_group]]` globs** map each matched file to its corresponding URL path. `content/posts/hello-world.json` → `/blog/hello-world`, which expands the glob against current files.
 2. **Route `params` files** — each params file declared in renderer configs maps to all routes that reference it. `data/posts.json` → `/blog` and `/blog/{stem}` (all cached stems).
 
-A content change reaches the caches through the site generation ID (`/genid`), not through this map.
-
 The params-file-to-route mapping requires m6-http to read renderer configs at startup to build the full map. This is the only time m6-http reads renderer configs.
-
-Map built once at start.
 
 ### 4xx and 5xx responses are never cached
 
@@ -413,7 +409,6 @@ Single-threaded epoll. No Tokio.
 - No heap allocation on hot path
 - No `unwrap()` or `expect()`
 - No blocking calls in event loop
-- Cache behind `Arc`, swapped atomically — never mutated in place
 - Cache behind `Arc`, shared read-only once built
 - H2C and H2S client pools driven in the event loop alongside TLS/QUIC listeners
 

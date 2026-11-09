@@ -9,7 +9,7 @@
 //!   ```text
 //!   "h2"       → Http2Conn  (multiplexed streams, full H2 framing)
 //!   "http/1.1" → H1 state machine (Reading→Writing, kept alive while
-//!                wants_keep_alive(&req) && served + 1 < MAX_REQUESTS_PER_CONN)
+//!                wants_keep_alive(&req) && served + 1 < max_requests)
 //!   ```
 //!
 //! - `drive_all()` is called after every epoll wakeup (for any TOKEN_TCP event)
@@ -153,6 +153,9 @@ struct H1Conn {
     /// Requests answered on this connection. Bounded so one client cannot
     /// hold a slot indefinitely by pipelining forever.
     served: u32,
+    /// Requests this connection may serve, from `[server]
+    /// max_requests_per_connection`.
+    max_requests: u32,
     /// Whether the current request's `Expect` field has been dealt with.
     /// Answering twice would put a second interim response on the wire.
     expect_handled: bool,
@@ -170,10 +173,9 @@ pub(crate) const READ_TIMEOUT_SECS: u64 = 30;
 /// unaffected, but **m6-http talks HTTP/1.1 to its own backends**, so every
 /// cache miss paid a fresh connect to m6-file or m6-html.
 ///
-/// A cap rather than unlimited so a connection cannot be held forever; at 100
-/// requests a browser's whole page load fits in one connection and a
-/// long-running client still cycles.
-const MAX_REQUESTS_PER_CONN: u32 = 100;
+/// Default for `[server] max_requests_per_connection`, which holds the
+/// rationale for a cap.
+pub const DEFAULT_MAX_REQUESTS_PER_CONN: u32 = 100;
 /// Idle timeout for HTTP/2 connections (reused across many requests).
 pub(crate) const H2_IDLE_TIMEOUT_SECS: u64 = 300;
 /// 20 MiB — above m6-render's own 16 MiB multipart body cap, so oversized
@@ -190,6 +192,8 @@ pub struct Http11Listener {
     /// A browser following an `http://` link speaks HTTP/1.1 and nothing else.
     tls_config: Option<Arc<rustls::ServerConfig>>,
     conns: Vec<Conn>,
+    /// `[server] max_requests_per_connection`, copied into each connection.
+    max_requests: u32,
 }
 
 /// Resolve a `host:port` bind string to one address.
@@ -206,18 +210,23 @@ fn resolve_bind(addr: &str) -> anyhow::Result<std::net::SocketAddr> {
 }
 
 impl Http11Listener {
-    pub fn bind(addr: &str, tls_config: Arc<rustls::ServerConfig>) -> anyhow::Result<Self> {
-        Self::bind_maybe_tls(addr, Some(tls_config))
+    pub fn bind(
+        addr: &str,
+        tls_config: Arc<rustls::ServerConfig>,
+        max_requests: u32,
+    ) -> anyhow::Result<Self> {
+        Self::bind_maybe_tls(addr, Some(tls_config), max_requests)
     }
 
     /// Bind a plaintext HTTP/1.1 listener, for the `:80` half of the pair.
-    pub fn bind_plain(addr: &str) -> anyhow::Result<Self> {
-        Self::bind_maybe_tls(addr, None)
+    pub fn bind_plain(addr: &str, max_requests: u32) -> anyhow::Result<Self> {
+        Self::bind_maybe_tls(addr, None, max_requests)
     }
 
     fn bind_maybe_tls(
         addr: &str,
         tls_config: Option<Arc<rustls::ServerConfig>>,
+        max_requests: u32,
     ) -> anyhow::Result<Self> {
         // SO_REUSEADDR, which `TcpListener::bind` does not set. Without it a
         // restart inside the TIME_WAIT window cannot rebind, and m6-http treats
@@ -229,6 +238,7 @@ impl Http11Listener {
             listener,
             tls_config,
             conns: Vec::new(),
+            max_requests,
         })
     }
 
@@ -288,6 +298,7 @@ impl Http11Listener {
                             created: Instant::now(),
                             keep_alive: false,
                             served: 0,
+                            max_requests: self.max_requests,
                             expect_handled: false,
                         })
                     };
@@ -328,7 +339,7 @@ impl Http11Listener {
         // wakeups complete no handshake at all, so the common path here is free.
         let mut handshakes = Vec::new();
         for conn in &mut self.conns {
-            drive_conn(conn, &mut on_request, &mut on_response);
+            drive_conn(conn, self.max_requests, &mut on_request, &mut on_response);
             if let Some(ns) = conn.handshake_ns.take() {
                 handshakes.push(HandshakeSample {
                     elapsed_ns: ns,
@@ -664,7 +675,7 @@ impl H2cListener {
 
 // ── Per-connection driver ─────────────────────────────────────────────────────
 
-fn drive_conn<F, G>(conn: &mut Conn, on_request: &mut F, on_response: &mut G)
+fn drive_conn<F, G>(conn: &mut Conn, max_requests: u32, on_request: &mut F, on_response: &mut G)
 where
     F: FnMut(&HttpRequest, &str) -> RequestOutcome,
     G: FnMut(
@@ -761,6 +772,7 @@ where
             created: Instant::now(),
             keep_alive: false,
             served: 0,
+            max_requests,
             expect_handled: false,
         });
         return;
@@ -806,6 +818,7 @@ where
                 created,
                 keep_alive: false,
                 served: 0,
+                max_requests,
                 expect_handled: false,
             });
         }
@@ -1016,8 +1029,7 @@ fn drive_h1<F, G>(
                         // moment the call was missing, which is what those
                         // tests are for.
                         crate::forward::strip_untrusted_inbound(&mut req.headers);
-                        h1.keep_alive =
-                            wants_keep_alive(&req) && h1.served + 1 < MAX_REQUESTS_PER_CONN;
+                        h1.keep_alive = wants_keep_alive(&req) && h1.served + 1 < h1.max_requests;
                         match on_request(&req, client_ip) {
                             RequestOutcome::Ready(status, resp_headers, body, _) => {
                                 // No 103 Early Hints here. See issue #93 and the
@@ -1125,7 +1137,7 @@ fn drive_h1<F, G>(
 /// long-lived healthy connection would be reaped mid-request.
 fn finish_response(h1: &mut H1Conn) {
     h1.served = h1.served.saturating_add(1);
-    if h1.keep_alive && h1.served < MAX_REQUESTS_PER_CONN {
+    if h1.keep_alive && h1.served < h1.max_requests {
         h1.state = H1State::Reading { buf: Vec::new() };
         h1.created = Instant::now();
         h1.expect_handled = false;

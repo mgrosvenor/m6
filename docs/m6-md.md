@@ -175,7 +175,7 @@ A template finds its post in the array and answers 404 when the lookup returns n
 The index links each post with `/blog/{{ doc.stem }}`, because `path` carries no `/blog` prefix.
 
 A static params file is read once at start when m6-html builds its routes, so a running renderer keeps serving the old document array until a restart.
-The example runs m6-md with `--watch --touch site.toml`, so a successful regeneration in the watch loop touches the file.
+The example runs m6-md with `--watch --touch site.toml`.
 [`m6-http.md`](m6-http.md) owns the cache and its clearing rules, and Example 02 in [`m6-user-guide.md`](m6-user-guide.md) is the full site with both templates.
 Section 8 gives the exit codes a run can return.
 

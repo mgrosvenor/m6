@@ -289,6 +289,7 @@ mod tests {
                 tls_cert: Some("/tmp/cert.pem".to_string()),
                 tls_key: Some("/tmp/key.pem".to_string()),
                 backend_timeout_secs: 30,
+                max_requests_per_connection: 100,
                 h2c_bind: None,
                 internal_binds: Vec::new(),
                 internal_peers: Vec::new(),
