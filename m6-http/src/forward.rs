@@ -1686,6 +1686,10 @@ pub fn build_response(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
 mod tests {
     use super::*;
 
@@ -1695,6 +1699,62 @@ mod tests {
     #[test]
     fn a_full_ndjson_page_fits_under_the_backend_body_cap() {
         const { assert!(m6_core::ndjson::MAX_PAGE_BYTES < MAX_BACKEND_BODY) };
+    }
+
+    /// A backend that declares a body then closes early must fail at once with
+    /// `UnexpectedEof`, not be re-driven until the 30 s deadline. The blocking
+    /// reader used `read_exact`, which failed immediately; the incremental
+    /// reader must match.
+    #[test]
+    fn a_short_content_length_body_fails_at_once_not_at_the_deadline() {
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("b.sock");
+        let listener = UnixListener::bind(&path).expect("bind");
+        let path2 = path.clone();
+        let backend = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 4096];
+            let mut got = Vec::new();
+            while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+                match s.read(&mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => got.extend_from_slice(&buf[..n]),
+                }
+            }
+            // Declare 100 bytes, send only 5, then close.
+            let resp = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nshort";
+            let _ = s.write_all(resp.as_bytes());
+            let _ = s.flush();
+        });
+
+        let req = b"GET /x HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n".to_vec();
+        let mut up = SocketUpstream::start(
+            &path2,
+            req,
+            "GET",
+            Instant::now() + std::time::Duration::from_secs(30),
+        )
+        .expect("start");
+
+        let started = std::time::Instant::now();
+        let result = loop {
+            if let Some(r) = up.drive() {
+                break r;
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "a short body must not hang the upstream"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        backend.join().expect("backend");
+        let err = result.expect_err("a short body must be an error");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::UnexpectedEof,
+            "a short body must fail with UnexpectedEof: {err}"
+        );
     }
 
     #[test]
