@@ -47,7 +47,8 @@ type GetFn = fn(u16, &str, Duration) -> Result<(u16, String), String>;
 // ── The fake backend ──────────────────────────────────────────────────────────
 
 /// One fake socket backend. `GET /fast` answers at once with a cacheable body;
-/// `GET /slow` signals `slow_seen` and holds until `release` (or shutdown).
+/// `GET /slow` signals `slow_seen` and holds until `release` (or shutdown). A
+/// resetting backend reads the request then closes without replying.
 struct Backend {
     path: PathBuf,
     stop: Arc<AtomicBool>,
@@ -56,13 +57,36 @@ struct Backend {
 
 impl Backend {
     fn start(path: PathBuf, slow_seen: mpsc::Sender<()>, release: Arc<AtomicBool>) -> Backend {
+        Self::spawn(path, slow_seen, release, false)
+    }
+
+    /// A backend that accepts a request and closes without replying, the state a
+    /// backend that resets mid-response leaves.
+    fn start_resetting(path: PathBuf) -> Backend {
+        let (slow_seen, _) = mpsc::channel();
+        let release = Arc::new(AtomicBool::new(false));
+        Self::spawn(path, slow_seen, release, true)
+    }
+
+    fn spawn(
+        path: PathBuf,
+        slow_seen: mpsc::Sender<()>,
+        release: Arc<AtomicBool>,
+        reset: bool,
+    ) -> Backend {
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path).expect("bind backend socket");
         listener
             .set_nonblocking(true)
             .expect("nonblocking listener");
         let stop = Arc::new(AtomicBool::new(false));
-        let handle = spawn_accept(listener, Arc::clone(&stop), Arc::clone(&release), slow_seen);
+        let handle = spawn_accept(
+            listener,
+            Arc::clone(&stop),
+            Arc::clone(&release),
+            slow_seen,
+            reset,
+        );
         Backend {
             path,
             stop,
@@ -86,6 +110,7 @@ fn spawn_accept(
     stop: Arc<AtomicBool>,
     release: Arc<AtomicBool>,
     slow_seen: mpsc::Sender<()>,
+    reset: bool,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         while !stop.load(Ordering::SeqCst) {
@@ -94,7 +119,7 @@ fn spawn_accept(
                     let stop = Arc::clone(&stop);
                     let release = Arc::clone(&release);
                     let slow_seen = slow_seen.clone();
-                    std::thread::spawn(move || serve(stream, &stop, &release, &slow_seen));
+                    std::thread::spawn(move || serve(stream, &stop, &release, &slow_seen, reset));
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(1));
@@ -107,12 +132,14 @@ fn spawn_accept(
 
 /// Read the request head, then answer `/fast` at once or hold `/slow` until
 /// `release`. A held request is also released by `stop`, so dropping the
-/// backend cannot hang the accept loop's worker thread.
+/// backend cannot hang the accept loop's worker thread. A resetting backend
+/// closes without replying.
 fn serve(
     mut stream: UnixStream,
     stop: &AtomicBool,
     release: &AtomicBool,
     slow_seen: &mpsc::Sender<()>,
+    reset: bool,
 ) {
     let mut buf = [0u8; 4096];
     let mut got = Vec::new();
@@ -127,6 +154,9 @@ fn serve(
             }
             Err(_) => return,
         }
+    }
+    if reset {
+        return; // close without replying
     }
     let head = String::from_utf8_lossy(&got).to_ascii_lowercase();
     if head.starts_with("get /slow") {
@@ -648,4 +678,58 @@ fn a_socket_backend_miss_advertises_alt_svc() {
         "a socket-backend miss must advertise alt-svc\n--- m6-http ---\n{}",
         fx.service.output()
     );
+}
+
+#[test]
+fn a_backend_that_resets_mid_response_is_backed_off_and_the_pool_fails_over() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let site = dir.path().to_path_buf();
+    let ck =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+            .expect("certificate");
+    let cert = site.join("cert.pem");
+    let key = site.join("key.pem");
+    std::fs::write(&cert, ck.cert.pem()).expect("cert");
+    std::fs::write(&key, ck.key_pair.serialize_pem()).expect("key");
+
+    let pid = std::process::id();
+    // The glob yields paths in ascending name order, so the resetting member is
+    // member 0 and takes the first request.
+    let reset_path = PathBuf::from(format!("/tmp/m6lnw-{pid}-fover-0.sock"));
+    let healthy_path = PathBuf::from(format!("/tmp/m6lnw-{pid}-fover-1.sock"));
+    let glob = format!("/tmp/m6lnw-{pid}-fover-*.sock");
+    let _reset = Backend::start_resetting(reset_path);
+    let (slow_seen, _slow_rx) = mpsc::channel();
+    let release = Arc::new(AtomicBool::new(false));
+    let _healthy = Backend::start(healthy_path, slow_seen, Arc::clone(&release));
+
+    std::fs::write(site.join("site.toml"), site_toml(&glob, 30)).expect("site.toml");
+    let claim = claim_port();
+    let port = claim.port();
+    std::fs::write(site.join("system.toml"), system_toml(port, &cert, &key)).expect("system.toml");
+
+    let service = Service::spawn(
+        "m6-http",
+        Command::new(binary("m6-http"))
+            .arg(&site)
+            .arg(site.join("system.toml")),
+    );
+    let mut service = service;
+    service.wait_for_tcp(port, Duration::from_secs(20));
+
+    // The first request hits the resetting member and answers 502, and the
+    // member is backed off. The overcorrected form (release on every error)
+    // keeps it in rotation, so this assertion pins the backoff.
+    let (first, _) = h1_get(port, "/fast", Duration::from_secs(5)).expect("first GET");
+    assert_eq!(first, 502, "a resetting backend must answer 502");
+
+    // The next request must be served by the healthy member.
+    let (second, body) = h1_get(port, "/fast", Duration::from_secs(5)).expect("second GET");
+    assert_eq!(
+        second,
+        200,
+        "the pool must fail over to the healthy member, got: {body}\n--- m6-http ---\n{}",
+        service.output()
+    );
+    assert_eq!(body, FAST_BODY);
 }
