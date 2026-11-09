@@ -306,7 +306,8 @@ jobs:
 
   # The perf gate's statistic is tested Rust (m6-http's perf_ab module) and its
   # tests run in the existing build-and-test job. This job checks only that the
-  # C client it relies on builds with no warnings, and measures nothing.
+  # C client it relies on builds with no warnings, that the leftover-server
+  # check matches both arms, and measures nothing.
   perf-tools:
     name: perf tools
     runs-on: ubuntu-latest
@@ -314,6 +315,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: the C client builds with no warnings
         run: cc -O2 -std=c11 -Wall -Wextra -Werror -o /tmp/perf_client tools/perf_client.c
+      - name: the leftover-server check matches both arms
+        run: ./tools/perfcheck-stray-test.sh
 
   examples:
     name: the examples build and work

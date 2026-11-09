@@ -108,6 +108,8 @@ It carries a Migration section in its `CHANGELOG.md` entry, ahead of the list of
 A change is measured against its base by the A/B gate on the build host, which prints the paired difference and its 99% interval per target.
 A consistent slowdown fails the merge.
 
+Each target runs 100 rounds of 500 requests, because a fresh server per round settles at its own speed and more rounds, not more requests, narrow the spread.
+
 Accepting one is `PERFCHECK_ACCEPT_SLOWER="<reason>"`, which is recorded in the history, and the commit message says why.
 
 The figures are taken on the build host and mean nothing on another machine.

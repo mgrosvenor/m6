@@ -57,10 +57,17 @@ HISTORY="${PERFCHECK_HISTORY:-$HERE/perf-history.jsonl}"
 BASE_BIN=""
 CAND_BIN="$ROOT/target/release/m6-html"
 BASE_EXAMPLES=""
-ROUNDS=30
+# 100 rounds, not 30: each round starts a fresh m6-html and each settles at its
+# own speed, so the round medians span a wide range and more requests per round
+# cannot narrow it. More rounds average that out; 100 rounds of 500 requests
+# keeps every CI99 width inside the 10% cap on an A/A.
+ROUNDS=100
 REQUESTS=500
 THRESHOLD=3
 MAX_CI_WIDTH=10
+
+# shellcheck source=tools/perfcheck-stray.sh
+. "$HERE/perfcheck-stray.sh"
 
 usage() {
   cat <<'EOF'
@@ -69,7 +76,7 @@ usage: tools/perfcheck.sh --base-bin PATH [options]
   --base-bin PATH       the base m6-html (required)
   --cand-bin PATH       the candidate m6-html (default target/release/m6-html)
   --base-examples DIR   the examples the base arm renders (default: the candidate's)
-  --rounds N            rounds per target (default 30)
+  --rounds N            rounds per target (default 100)
   --requests N          requests per round (default 500)
   --threshold PCT       slower verdict threshold, percent (default 3)
   --max-ci-width PCT    interval width that marks a run not measured (default 10)
@@ -108,6 +115,12 @@ if [[ ! -x "$BASE_BIN" ]]; then
   usage
   exit 2
 fi
+
+# Both binaries are resolved to absolute paths and used as-is everywhere, so the
+# leftover-server check after the loop matches exactly the processes this run
+# started, not another checkout's servers that share a relative path.
+BASE_BIN="$(resolve_abs "$BASE_BIN")"
+CAND_BIN="$(resolve_abs "$CAND_BIN")"
 
 if ! [[ "$ROUNDS" =~ ^[0-9]+$ ]] || (( ROUNDS < 1 )); then
   echo "perfcheck: --rounds takes a positive integer, got '$ROUNDS'" >&2
@@ -367,11 +380,10 @@ done
 # Each round kills its server and waits for it, so no m6-html from this run
 # should still be alive when the loop finishes. A stray server pins the measured
 # CPU and corrupts every reading, so a run that leaves one behind fails rather
-# than reporting a number. The pattern is the absolute candidate binary path,
-# which only this checkout's server carries, and it must not match the base's
-# relative `target/release/m6-html` or another worker's checkout.
+# than reporting a number. Both the base and candidate binaries are checked, at
+# the absolute paths the run started, so a stray in either arm is caught.
 deadline=$(( SECONDS + 5 ))
-while pgrep -f "$ROOT/target/release/m6-html" >/dev/null 2>&1; do
+while stray_alive "$BASE_BIN" "$CAND_BIN"; do
   if (( SECONDS >= deadline )); then
     echo "NOT MEASURED: m6-html from this run is still alive after the run" >&2
     exit 2
