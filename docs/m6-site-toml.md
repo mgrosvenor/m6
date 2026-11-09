@@ -213,7 +213,7 @@ The merge rules, in order:
 7. When both arguments name one file, its `[auth]` and `[health]` belong to the site config alone.
 8. A key read only at start keeps its running value, and the log names it and says to restart.
 
-The `[auth]`, `[health]` and `[server]` sections after section 3 state the one-file, `metrics_token_file` and touch-reload rules.
+The `[auth]`, `[health]` and `[server]` sections after section 3 state the one-file and `metrics_token_file` rules.
 
 ### 3.2. Renderer secrets
 
@@ -328,9 +328,9 @@ A file at the default path may be absent or invalid, as before.
 | `internal_binds` | list of strings | when `h2c_bind` is set | Set to `h2c_bind`, an `"ip:port"` in a local range, to make the h2c listener internal. `[]` means none |
 | `internal_peers` | list of strings | when `internal_binds` is not empty | IP addresses in a local range. The only peers the internal h2c listener accepts, and a connection from any other address is closed |
 
-The certificate and key files are not watched.
-A renewal writes both, then touches the system config, and m6-http reads them on the touch, on HTTP/1.1, HTTP/2 and HTTP/3.
-Until the touch, m6-http keeps serving the previous certificate.
+The certificate and key files are read once at start.
+A renewal writes both, then restarts m6-http, and m6-http reads them on HTTP/1.1, HTTP/2 and HTTP/3.
+Until the restart, m6-http keeps serving the previous certificate.
 
 An internal listener is one that `internal_binds` names.
 m6-http never infers it from an address.
@@ -476,7 +476,7 @@ metrics_peers   = ["10.0.0.5"]
 | Key | Type | Required | Notes |
 |---|---|---|---|
 | `name` | string | yes | Referenced by `[[route]]` `backend` field |
-| `sockets` | string | one of | Glob — `/run/m6/m6-html-*.sock`. Discovered via inotify. |
+| `sockets` | string | one of | Glob `/run/m6/m6-html-*.sock`. Expanded once at start. |
 | `url` | string | one of | Remote HTTP/S server. Not pool-managed. |
 
 `sockets` and `url` are mutually exclusive.
@@ -514,8 +514,7 @@ backend's `root` wrong and the routes exist while every request 404s. See
 expands into one concrete route per file, and cache warming skips any route path
 containing `{`, so a wildcard silently means those files are never pre-warmed.
 
-Glob is expanded at startup and on `site.toml` reload. New files matching the glob require a `site.toml` reload to become routable — renderers that create new content files (e.g. a CMS publish action) should touch `site.toml` after writing to trigger the reload.
-In an app, `req.touch("site.toml")` touches the file the app reads, which is the one its `site_toml` key names.
+Glob is expanded once at startup. New files matching the glob require a restart of m6-http to become routable.
 
 ### 4.10. Glob Variables
 

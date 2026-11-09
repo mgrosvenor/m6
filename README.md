@@ -18,7 +18,7 @@ cargo build --release --workspace
 export PATH="$PWD/target/release:$PATH"
 ```
 
-Rust 1.88 or newer. Linux is the production target (epoll, inotify); macOS works
+Rust 1.88 or newer. Linux is the production target (epoll). macOS works
 for development.
 
 **2. A development certificate.** m6-http is HTTPS only, so there is no way to
@@ -90,7 +90,7 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md).
                          │  - Response cache (path × encoding)          │
                          │  - JWT auth enforcement (local verify)       │
                          │  - Backend pool management (least-conn)      │
-                         │  - Hot-reload (config + certs + pools)       │
+                         │  - Config, certs and pools at start      │
                          └────┬──────────────┬──────────────┬───────────┘
                               │              │              │
                     Unix socket         Unix socket     URL backend
@@ -106,8 +106,8 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md).
     │ template │       │ files      │     │ JWT issue    │   │             │
     │ renderer │       │ Brotli/    │     │ JWT refresh  │   │ Rust:       │
     │          │       │ gzip       │     │ Login/logout │   │ m6-render   │
-    │ Hot      │       │ Symlink    │     │ Rate limit   │   │ library     │
-    │ reload   │       │ guard      │     │ Key reload   │   │             │
+    │          │       │ Symlink    │     │ Rate limit   │   │ library     │
+    │          │       │ guard      │     │ Key rotation │   │             │
     └────┬─────┘       └────────────┘     └──────┬───────┘   └─────────────┘
          │  m6-render library (Rust)             │  m6-auth library (Rust)
          └───────────────────────────────────────┘
@@ -156,8 +156,8 @@ Reverse proxy, cache, and router. The only process that listens on a public port
 - Response cache keyed by `(path, content-encoding)` — each encoding variant cached independently
 - JWT verified locally with m6-auth's public key — no per-request network hop
 - Backend pools: Unix socket globs (local) or URL backends (`http://`, `https://`, `h2c://`, `h2s://`)
-- inotify watches `/run/m6/` for pool membership changes (new sockets added without config reload)
-- `site.toml` and the system config watched, with no restart. Touch the system config after renewing a certificate, and m6-http keeps its cache
+- Backend sockets are found once at start from each pool's glob, and a change takes a restart
+- `site.toml` and the system config are read once at start. Restart m6-http after renewing a certificate
 - `Cache-Control: public` responses cached; `no-store` / `private` skipped
 - Error pages fetched from configured `[errors] path` backend on 4xx/5xx
 
@@ -221,7 +221,7 @@ Tera template renderer. Handles all HTML routes.
 
 **Architecture (via m6-render library):**
 - Fixed thread pool (default: CPU count) + bounded request queue
-- `FrameworkState` in `Arc<RwLock<...>>`, hot-reloaded atomically when the config or `site.toml` changes (watcher, plus a fingerprint poll every second)
+- `FrameworkState` in `Arc<...>`, built once at start and shared read-only across the worker threads
 - Two-tier state: `Global` (shared, `Arc` clone per request) and `ThreadLocal` (zero sync overhead)
 - JSON params loaded from disk at startup; static params stored as `Arc<Map>` — pointer clone per request, no Map copy
 - Dynamic `{stem}`-keyed params resolved and LRU-cached
@@ -316,7 +316,7 @@ Auth service. Issues and verifies JWTs, manages sessions.
 **Architecture:**
 - Four HTTP endpoints: `POST /auth/login`, `POST /auth/refresh`, `POST /auth/logout`, `GET /auth/public-key`
 - RS256 or ES256 JWT signing (EC recommended); access token TTL 15 min, refresh token TTL 30 days
-- Key pair re-read when its config is touched, so a key rotation needs no restart. A key that fails to load, or a private key that is not the pair of the public key, leaves the running keys serving
+- Key pair read at start, so a key rotation is a restart. A key that fails to load, or a private key that is not the pair of the public key, exits 2
 - Rate limiting: 5 failed logins per 15 minutes per client address by default, set in `[rate_limit]`
 - Delegates credential and ACL storage to m6-auth library (SQLite, WAL mode)
 - Never logs passwords, tokens, or key material
@@ -343,7 +343,7 @@ Framework library for writing custom renderers in Rust. Used by `m6-html` and an
 - Request routing with path parameters (`{id}`, `{relpath}`)
 - `Request` / `Response` / `Error` types
 - Thread pool + bounded queue managed by the framework
-- Hot-reload triggered by a change to the config file or `site.toml`
+- Configuration read once at start, and a change takes a restart
 
 ```rust
 fn main() {
@@ -462,7 +462,7 @@ m6-http         $SITE_DIR $SITE_TOML &
 wait
 ```
 
-**Scaling:** start additional instances (e.g. `m6-html-2.service`). The socket `/run/m6/m6-html-2.sock` appears and m6-http adds it to the pool. On Linux it sees the socket at once, from an inotify watch on the directory the backend's `sockets` glob names. On macOS and the BSDs a periodic rescan of the glob picks it up. No config change needed.
+**Scaling:** start additional instances (e.g. `m6-html-2.service`). m6-http finds each pool's sockets once at start, so a new instance joins its pool when m6-http restarts.
 
 **Global deployment:** run m6-http at each edge location. Configure it with a `h2s://` URL backend pointing to the origin. Each edge node caches independently. See [Example 09](docs/m6-user-guide.md#10-example-09-global-deployment) and the multi-region deployment walkthrough.
 
@@ -494,18 +494,6 @@ Browser                  m6-http                  m6-auth-server
    │                        │ forward X-Auth-Claims      │
    │                        │──────────────────────────► m6-html
 ```
-
----
-
-## Hot Reload
-
-| Component | Trigger | What reloads |
-|-----------|---------|-------------|
-| m6-http | `site.toml` changed | Routes, backends, cache invalidation map. The cache is cleared |
-| m6-http | Socket appears/disappears in `/run/m6/` | Backend pool membership |
-| m6-http | System config changed or touched | TLS context (including QUIC), auth key, `[health]` access keys. The cache is kept |
-| m6-auth-server | Its config changed or touched | Signing keys, re-read from the key files |
-| m6-html | Config file or `site.toml` changed (inotify on Linux, kqueue on macOS, and a fingerprint poll every second) | Templates, routes, params, log level |
 
 ---
 
@@ -753,6 +741,6 @@ All detailed documentation lives in [`docs/`](docs/):
 cargo build --release --workspace
 ```
 
-Requires Rust 1.88+. Production target: Linux (epoll, inotify). macOS supported for development.
+Requires Rust 1.88+. Production target: Linux (epoll). macOS supported for development.
 
 For development TLS: [mkcert](https://github.com/FiloSottile/mkcert).

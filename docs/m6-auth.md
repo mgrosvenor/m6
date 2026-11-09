@@ -152,18 +152,16 @@ An absolute path is used unchanged.
 
 The pair is checked at load.
 The service signs a probe token with the private key and verifies it with the public key.
-A pair that does not match stops startup with exit 2, and on a reload the running pair stays.
+A pair that does not match stops startup with exit 2.
 Section 4.2 covers what a rotation does to tokens already issued.
 
 ### 4.2. Key rotation
 
-A rotation writes both key files, then touches the service config.
-The service reads both files, checks the pair, and swaps the new pair in.
-A key that fails to load leaves the running pair serving, and core retries the reload after a delay and again on the next touch.
+A rotation writes both key files, then restarts the service.
+The service reads both files at start and checks the pair, and a key that fails to load or a pair that does not match exits 2.
 
-A successful rotation changes the signing key immediately.
-m6-http keeps the public key it loaded, so tokens signed with the new key get 401 until m6-http reloads.
-Touch m6-http's system config after the service config, and m6-http reads the new public key.
+A successful rotation changes the signing key immediately after the restart.
+Restart m6-http after m6-auth-server so it reads the new public key.
 From then on, m6-http refuses an access token signed with the old key at the next request with 401, and a browser sees the error response.
 
 A rotation also invalidates outstanding refresh tokens.
@@ -302,7 +300,7 @@ The bearer path stops the next refresh by deleting the refresh rows, and the bro
 ### 5.4. Public key
 
 `GET /auth/public-key` returns the current public key as a PEM body with `Content-Type: application/x-pem-file`.
-The route is unauthenticated, and it serves the key that is loaded, so a rotation changes the body after the service reloads.
+The route is unauthenticated, and it serves the key that is loaded, so a rotation changes the body after the service restarts.
 
 m6-http reads the public key from the file named by `[auth] public_key`.
 It does not call this route, and the route exists for any other client that needs the key without filesystem access.
@@ -468,13 +466,12 @@ A request that fails after startup returns a 4xx or 5xx response, and the proces
 ### 11.3. Logging
 
 The service writes one line per event to stdout, in JSON by default.
-It logs the route outcomes, key reloads and the core lifecycle lines.
+It logs the route outcomes and the core lifecycle lines.
 Table 10 gives the events.
 Take from it that every login attempt is recorded with the address and every failure with a reason.
 
 | event | level | fields |
 |---|---|---|
-| signing keys reloaded | info | none |
 | login success | info | `username`, `ip` |
 | login failure | warn | `ip`, `reason` |
 | rate limit exceeded | warn | `ip` |

@@ -279,10 +279,10 @@ And a crashed backend restarts in seconds, which is what makes §4.5 affordable.
 ### 3.4 Why pool membership is discovered rather than declared
 
 **Scaling a backend should not require editing configuration**, and §1.8 makes scaling the answer to load.
-A pool is declared as a socket glob, and membership comes from rescanning that glob every 2 seconds, so starting another systemd instance adds a member and stopping one removes it.
-An explicit list would mean a config edit and a reload to add capacity, which is ceremony in the path of the one operation an operator performs under pressure.
+A pool is declared as a socket glob, and membership comes from expanding that glob once at start, so backends start before m6-http (systemd `After=`), and a new instance joins its pool when m6-http restarts.
+An explicit list would mean a config edit to add capacity, which is ceremony in the path of the one operation an operator performs under pressure.
 
-The 2-second window is the cost of not watching the socket directory, and it is the honest figure: a new instance is absent from the pool for up to 2 seconds, and a stopped one is retried into its backoff for up to 2 seconds.
+A member whose backend stops is retried into its backoff, and a backend that restarts on the same path serves again on its next connect.
 Requests go to the member holding the fewest connections, which is the only load signal available locally, and a failed member is retried after 1, 2, 4, 8, 16 and then 30 seconds so a restarting backend is not hammered.
 
 ---
@@ -314,7 +314,7 @@ That concentration is what makes §4.4 possible: a rule applied once at the edge
 **A cache hit is a hash map lookup and a write, and an async runtime adds overhead to that.**
 This is §1.1's four rules as an implementation.
 One thread runs the loop and owns every connection's state, so the request path has no cross-thread synchronisation to contend for, and the header scan on the hit path allocates nothing.
-Network descriptors, backend descriptors and the file watcher sit in one readiness set, so there is nothing to coordinate between.
+Network descriptors and backend descriptors sit in one readiness set, so there is nothing to coordinate between.
 
 The trade is stated plainly: a state machine over one loop is harder to write correctly than a thread per request, and far simpler to reason about under load, because there is no interleaving to consider.
 It also produces a tighter tail, because there is no lock convoy and no cross-core cache coherence traffic to spike on.
@@ -396,7 +396,7 @@ The edge holds the auth service's public key and checks the signature, expiry an
 The auth service is contacted only for operations that change state: login, refresh and logout.
 
 Key rotation therefore needs no coordination.
-The signing service starts using a new key immediately, the edge reloads the public key when the file changes, and tokens signed with the old key expire within their lifetime.
+The signing service starts using a new key immediately after a restart, the edge reads the public key when it restarts, and tokens signed with the old key expire within their lifetime.
 Nothing has to be sequenced, because nothing holds a cached decision.
 
 ### 5.3 Why enforcement happens twice
@@ -431,7 +431,7 @@ Table 9 gives the sorts of component core holds, in brief.
 | HTTP semantics | the version-independent rules: conditional requests, content negotiation, repeated header fields, content types with charset |
 | HTTP/1.1 | the one request parser and response writer, and the blocking read adapter over it |
 | Service scaffolding | the socket server, the accept loop, routing, the thread pool, the shutdown sequence |
-| Configuration | parsing and validation, secrets merging, and a pollable file-change descriptor for reload |
+| Configuration | parsing and validation, and secrets merging |
 | Request and response | what a handler receives and returns, the layered request dictionary, cookie construction, multipart bodies |
 | Content | gzip and brotli, HTML, CSS, JSON and JavaScript minification, and the renderer seam with its template implementation behind it |
 | Safety | path parameter validation and traversal refusal, request size caps, cryptographic token generation |
@@ -523,7 +523,7 @@ A service declares which it needs once and the builder's type carries it, so a h
 ### 7.2 Why the request dictionary is layered
 
 **Most of what a template reads is identical for every request, so it is built once and shared.**
-Configuration keys, global parameter files and a route's static parameter files are merged once per reload and shared behind a reference count, and only what genuinely varies is allocated per request.
+Configuration keys, global parameter files and a route's static parameter files are merged once at start and shared behind a reference count, and only what genuinely varies is allocated per request.
 Building the whole map per request meant deep-copying the site's content for every page view, and `PERFORMANCE.md` records what that cost.
 
 **The order within it is a security property.**
@@ -601,7 +601,7 @@ Table 11 gives them by area.
 | routing | a fixed route beats a pattern, and two routes a request could both reach are a config error at load | the answer must not depend on the order of blocks in a file somebody edits later, and a request then needs no tie-break |
 | routing | a route lists the methods it answers, and no list means every method | a code POST handler and a config GET page can share a path |
 | routing | `{*name}` spans segments and is legal only last | a wildcard in the middle has no single correct split, and making the last parameter implicitly greedy would change the meaning of every route already written |
-| routing | a route naming a handler no code registered is fatal at startup and refused on reload | a route that 404s while the config says it should serve is an outage that looks like a missing page |
+| routing | a route naming a handler no code registered is fatal at startup | a route that 404s while the config says it should serve is an outage that looks like a missing page |
 | routing | the same parameter syntax in `site.toml` and in a backend's config | one syntax to learn, and one matcher to be correct |
 | request data | path parameters are validated before use, and a traversal answers 404 while a malformed value answers 400 | answering 400 to a traversal confirms it was recognised as one, which tells the sender their payload reached the router and is worth varying |
 | request data | only `application/x-www-form-urlencoded` bodies are decoded, and any other body on a POST is logged loudly | a client that switched to multipart once produced empty fields everywhere, which looked downstream like a failed check with nothing in any log to say a body had been skipped |

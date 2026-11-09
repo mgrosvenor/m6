@@ -31,15 +31,14 @@ Logs to stdout as structured JSON.
 4. If `[auth]` is declared (in either file, never both), load the public key for local JWT verification. `backend` is optional
 5. Expand `[[route_group]]` globs against site directory — builds route table entries and invalidation map
 6. Read renderer configs to build params-file → URL invalidation map entries
-7. Watch `site.toml` and the system config for reload, and `/run/m6/` for socket discovery
-8. Bind TLS listener; if `h2c_bind` is set, bind H2C (plain-TCP HTTP/2) listener on that address, which is internal when `internal_binds` names it and then accepts only the peers in `internal_peers`
-9. Start epoll event loop
+7. Bind the TLS listener. If `h2c_bind` is set, bind H2C (plain-TCP HTTP/2) listener on that address, which is internal when `internal_binds` names it and then accepts only the peers in `internal_peers`
+8. Start epoll event loop
 
 ---
 
 ## Backend Pools
 
-Each `[[backend]]` with `sockets` is a pool. m6-http discovers pool members by watching the socket glob's directory via inotify.
+Each `[[backend]]` with `sockets` is a pool. m6-http finds pool members once at start by expanding the socket glob.
 
 **Pool management:**
 - Socket appears matching glob → added to pool
@@ -92,14 +91,14 @@ Cache key: `(path, content-encoding)`. Query strings stripped before lookup. Eac
 
 m6-http maintains a map from data files to the URL paths that depend on them. The map is built at startup from two sources:
 
-1. **`[[route_group]]` globs** — each matched file maps to its corresponding URL path. `content/posts/hello-world.json` → `/blog/hello-world`. Map rebuilt on every `site.toml` reload, which re-expands the glob against current files.
+1. **`[[route_group]]` globs** map each matched file to its corresponding URL path. `content/posts/hello-world.json` → `/blog/hello-world`. Map built at start, which expands the glob against current files.
 2. **Route `params` files** — each params file declared in renderer configs maps to all routes that reference it. `data/posts.json` → `/blog` and `/blog/{stem}` (all cached stems).
 
-When inotify fires on a file change, m6-http looks up affected URL paths in the map and evicts those cache entries.
+A content change reaches the caches through the site generation ID (`/genid`), not through this map.
 
 The params-file-to-route mapping requires m6-http to read renderer configs at startup to build the full map. This is the only time m6-http reads renderer configs.
 
-Map rebuilt on `site.toml` reload.
+Map built once at start.
 
 ### 4xx and 5xx responses are never cached
 
@@ -185,51 +184,6 @@ It is never read from a header, so a forged `X-Forwarded-For` does not open the 
 An internal h2c listener believes `X-Forwarded-For`, so it never serves them.
 The cost is one address parse and a scan of a short list, and only on these two paths.
 The cache-hit path is unchanged.
-
----
-
-## Hot Reload
-
-m6-http reloads when `site.toml` or the system config changes, and the two changes cost different amounts.
-One `ConfigReloader` from m6-core watches both files.
-It takes the change from the platform's watcher and, whatever the watcher says, compares the two files' bytes, mode, owner and modification time once a second, so a lost watch delays a reload by at most a second.
-Renderers and other processes that change site content signal m6-http by touching `site.toml`.
-Table 1 says what each change reloads.
-
-| Change | Response |
-|---|---|
-| `site.toml` touched or modified | Reload routing, pools, the invalidation map, the error mode, the security headers, the log level and the auth key. The cache is cleared, and cleared again 100 ms and 1.08 s after the reload ends |
-| System config touched or modified | Reload TLS on HTTP/1.1, HTTP/2 and HTTP/3 from the configured paths, the auth key, the `[health]` access keys, the node name, `allowed_methods` and `backend_timeout_secs`. The cache is kept |
-| Both files in one burst | The union of the two rows |
-| Certificate or key file written | Nothing, until the system config is touched |
-| Socket appears in `/run/m6/` matching a pool glob | Add to pool |
-| Socket disappears from `/run/m6/` | Remove from pool |
-
-**Table 1: what a change to each file or directory reloads in m6-http.**
-Take from it that only a `site.toml` change empties the cache, and that new key material needs a touch of the system config.
-
-The later cache clears cover a backend that reloads after m6-http.
-A request in that gap can fill the cache with the old page.
-The clear 100 ms after the reload ends covers a backend that held the change for its 20 ms window, and the clear 1.08 s after covers a backend that found the change only on its once-a-second poll.
-Each delay is the m6-core constant (`RELOAD_DEBOUNCE`, `RELOAD_POLL`) plus 80 ms for the backend's own reload.
-The cost is one extra cache miss per page about a second after a content change.
-The cache-hit path is unchanged.
-
-A reload logs `config reload: complete` with the fields `site`, `process`, `cache_cleared` and `elapsed_us`.
-A reload that fails keeps the running config and logs `config reload: failed, keeping current config`.
-A system config change still reloads TLS when `site.toml` is mid-edit and fails to load, so a broken `site.toml` does not hold a renewal back.
-
-Some keys are read once, when the listeners bind or the analytics log opens.
-They are `[server]` `bind`, `h2c_bind`, `internal_binds`, `internal_peers`, `redirect_bind` and `warm_on_start`, and `[analytics]` `enabled` and `log_path`.
-A change to one keeps the running value and logs `config reload: [server].bind changed; restart m6-http to apply it`, naming the key.
-
-### Renewing a certificate
-
-A renewal writes the certificate and the key, then touches the system config.
-m6-http does not watch the certificate and key files, so a renewal that omits the touch changes nothing and the previous certificate keeps serving.
-The touch comes after both files are written, so m6-http never reads a certificate beside the previous key.
-If the touch arrives first, the pair fails its check, the running certificate stays, and the reload is tried again after 1 s, then 2 s, 4 s and so on up to 60 s, and at once on the next touch.
-`/perf` reports the `notAfter` of the certificate being served, so a renewal that forgot the touch shows there.
 
 ---
 
@@ -460,7 +414,7 @@ Single-threaded epoll. No Tokio.
 - No `unwrap()` or `expect()`
 - No blocking calls in event loop
 - Cache behind `Arc`, swapped atomically — never mutated in place
-- inotify fd in same epoll set as network fds
+- Cache behind `Arc`, shared read-only once built
 - H2C and H2S client pools driven in the event loop alongside TLS/QUIC listeners
 
 ---
@@ -469,7 +423,7 @@ Single-threaded epoll. No Tokio.
 
 Structured JSON to stdout. journald captures via systemd.
 
-Emitted events: startup, request complete (path, status, backend, latency_us, cache_hit), auth failure (warn), pool change (info), config reload (info), cache eviction (debug).
+Emitted events: startup, request complete (path, status, backend, latency_us, cache_hit), auth failure (warn), pool change (info), cache eviction (debug).
 
 Periodic stats: `requests`, `rps_avg`, `rps_peak`, `latency_p50_us`, `latency_p99_us`, `cache_hits`, `cache_misses`, `cache_hit_rate`, `backend_errors`, `pool_members`.
 
@@ -477,4 +431,4 @@ Periodic stats: `requests`, `rps_avg`, `rps_peak`, `latency_p50_us`, `latency_p9
 
 ## Dependencies
 
-`quinn` (HTTP/3), `rustls` (TLS), `matchit` (routing), `bytes` (zero-copy), `serde`+`toml` (config), `inotify`, `jsonwebtoken` (JWT verification).
+`quinn` (HTTP/3), `rustls` (TLS), `matchit` (routing), `bytes` (zero-copy), `serde`+`toml` (config), `jsonwebtoken` (JWT verification).
