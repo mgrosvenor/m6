@@ -408,9 +408,8 @@ backend = "example"
         )
         .unwrap();
 
-        // Backend first: the socket appearing is what puts it in the pool
-        // (spec §8.1), and starting the edge first would just mean it discovers
-        // the member a moment later.
+        // Backend first: the pool reads its glob once at start, so the socket
+        // must exist before m6-http is spawned.
         let mut backend = backend_command(lang, base, &sock)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())

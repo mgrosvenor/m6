@@ -335,7 +335,7 @@ fn a_pool_whose_glob_matches_no_socket_exits_2() {
         "the error must say the glob matches no socket, got: {err}"
     );
     assert!(
-        err.contains('b') && err.contains("[[backend]]"),
+        err.contains("[[backend]] b:"),
         "the error must name the backend, got: {err}"
     );
 }
