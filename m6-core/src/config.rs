@@ -226,7 +226,6 @@ const FRAMEWORK_KEYS: &[&str] = &[
     "minification",
     "log",
     "errors",
-    "multipart",
     "flash_secret",
     "site_toml",
 ];
@@ -845,6 +844,17 @@ queue_size = 32
         );
         // The key is reserved, so it is not a template variable.
         assert!(!cfg.user_config.contains_key("site_toml"));
+    }
+
+    #[test]
+    fn a_multipart_table_is_an_ordinary_service_key() {
+        let cfg = load_text("site_name = \"x\"\n\n[multipart]\nmax_size_mb = 10\n").unwrap();
+        let multipart = cfg
+            .user_config
+            .get("multipart")
+            .expect("a [multipart] table reaches user_config");
+        assert_eq!(multipart["max_size_mb"].as_i64(), Some(10));
+        assert_eq!(cfg.user_config.get("site_name").unwrap(), "x");
     }
 
     #[test]

@@ -555,12 +555,6 @@ req.write_bytes(&dest, &upload.data)?;
 
 `req.write_bytes(path, data)` is the low-level write primitive — atomic (temp + rename), path validated within site directory.
 
-Max upload size in config:
-```toml
-[multipart]
-max_size_mb = 10
-```
-
 ### `flash`
 
 Post-redirect-get flash messages. Stored in a short-lived cookie signed with HMAC-SHA256. The signing key is a dedicated 32-byte secret in the renderer's `secrets_file` — not the auth key.

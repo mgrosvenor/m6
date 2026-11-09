@@ -155,7 +155,7 @@ Those paths are decided before the socket exists, which is why §4 comes next: t
 
 ## 4. The configuration
 
-**Core reserves thirteen top-level keys and hands the service everything else.**
+**Core reserves twelve top-level keys and hands the service everything else.**
 This section gives the reserved keys and their defaults, the name that ties the configuration file to the socket and to `site.toml`, and what a reload changes.
 
 Table 4 is the reserved set, and a key in it never reaches a template.
@@ -174,9 +174,8 @@ Table 4 is the reserved set, and a key in it never reaches a template.
 | `flash_secret` | core, feature `flash` | the HMAC key for flash cookies. Absent with the feature on is exit 2 |
 | `site_toml` | core | the path of `site.toml`. Absolute as given, relative to `site_dir`, default `<site_dir>/site.toml`. A named file that does not exist, cannot be read or is not valid TOML is exit 2 |
 | `[errors]` | `m6-http`, in `site.toml` | reserved, so it does not reach the request dictionary. The section itself belongs to `site.toml` |
-| `[multipart]` | nothing | reserved and read by no code in this repository. `m6-render-lib.md` documents `max_size_mb` under it and nothing enforces it |
 
-**Table 4: the thirteen reserved keys, who reads each, and its default.**
+**Table 4: the twelve reserved keys, who reads each, and its default.**
 Take from it that every value core reads has a working default, and that `[server]` refuses a value it cannot parse, because a service that started with a deadline nobody chose looks healthy.
 
 Every other top-level key lands in `RendererConfig::user_config` and is readable from the request dictionary.
