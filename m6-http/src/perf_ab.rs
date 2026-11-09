@@ -165,35 +165,6 @@ fn round4(x: f64) -> f64 {
     (x * 10_000.0).round() / 10_000.0
 }
 
-/// A UTC timestamp in ISO 8601 shape: `YYYY-MM-DDTHH:MM:SSZ`.
-fn utc_timestamp() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let days = secs.div_euclid(86_400);
-    let secs_of_day = secs.rem_euclid(86_400);
-    let (hh, mm, ss) = (
-        secs_of_day / 3600,
-        (secs_of_day % 3600) / 60,
-        secs_of_day % 60,
-    );
-
-    // civil_from_days (Howard Hinnant's algorithm), for days since 1970-01-01.
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let mut y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    y += if m <= 2 { 1 } else { 0 };
-
-    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
-}
-
 /// Everything the `m6-perf-ab` binary does, with the environment passed in so
 /// the tests can set it without touching the process environment.
 ///
@@ -283,6 +254,11 @@ pub fn run(args: &[String], env: &BTreeMap<String, String>) -> i32 {
     let mut any_not_measured = false;
     let mut targets_json = serde_json::Map::new();
 
+    if targets.is_empty() {
+        println!("NOT MEASURED: the rounds file held no measurements");
+        any_not_measured = true;
+    }
+
     for (name, rounds_map) in &targets {
         let mut base = Arm {
             readings: Vec::new(),
@@ -321,8 +297,6 @@ pub fn run(args: &[String], env: &BTreeMap<String, String>) -> i32 {
 
         let base_median = median_ns(&base.readings);
         let cand_median = median_ns(&cand.readings);
-        let med_ratio = median_ratio(&ratios);
-        let slower_rounds = ratios.iter().filter(|&&r| r > 1.0).count();
         let mut summary = verdict(&ratios, threshold_pct, max_ci_width_pct);
         if !pinned {
             summary.verdict = Verdict::NotMeasured("the run was not pinned to separate CPUs");
@@ -330,10 +304,10 @@ pub fn run(args: &[String], env: &BTreeMap<String, String>) -> i32 {
             summary.verdict = Verdict::NotMeasured("a round has no base or cand reading");
         }
 
-        let ratio_pct = if med_ratio.is_nan() {
+        let ratio_pct = if summary.median_ratio.is_nan() {
             String::from("n/a")
         } else {
-            format!("{:+.1}%", (med_ratio - 1.0) * 100.0)
+            format!("{:+.1}%", (summary.median_ratio - 1.0) * 100.0)
         };
         let ci_pct = if summary.ci_low.is_nan() || summary.ci_high.is_nan() {
             String::from("n/a")
@@ -349,7 +323,8 @@ pub fn run(args: &[String], env: &BTreeMap<String, String>) -> i32 {
             other => other.to_string(),
         };
         println!(
-            "{name}: base {base_median}ns cand {cand_median}ns ratio {ratio_pct} ci99 {ci_pct} {slower_rounds}/{rounds} slower {table_verdict}"
+            "{name}: base {base_median}ns cand {cand_median}ns ratio {ratio_pct} ci99 {ci_pct} {}/{rounds} slower {table_verdict}",
+            summary.slower_rounds
         );
 
         if summary.verdict == Verdict::Slower {
@@ -376,9 +351,9 @@ pub fn run(args: &[String], env: &BTreeMap<String, String>) -> i32 {
                     "bytes": cand.bytes,
                 },
                 "ratios": ratios.iter().map(|r| round4(*r)).collect::<Vec<f64>>(),
-                "median_ratio": if med_ratio.is_nan() { serde_json::Value::Null } else { serde_json::json!(round4(med_ratio)) },
+                "median_ratio": if summary.median_ratio.is_nan() { serde_json::Value::Null } else { serde_json::json!(round4(summary.median_ratio)) },
                 "ci99": if summary.ci_low.is_nan() { serde_json::json!([serde_json::Value::Null, serde_json::Value::Null]) } else { serde_json::json!([round4(summary.ci_low), round4(summary.ci_high)]) },
-                "slower_rounds": slower_rounds,
+                "slower_rounds": summary.slower_rounds,
                 "verdict": summary.verdict.to_string(),
             }),
         );
@@ -504,7 +479,10 @@ fn build_record(
     );
 
     let mut record = serde_json::Map::new();
-    record.insert("ts".to_string(), serde_json::Value::from(utc_timestamp()));
+    record.insert(
+        "ts".to_string(),
+        serde_json::Value::from(env_str(env, "M6_PERF_TS")),
+    );
     record.insert(
         "commit".to_string(),
         serde_json::Value::from(env_str(env, "M6_PERF_COMMIT")),
@@ -617,6 +595,29 @@ mod tests {
         let ratios = vec![1.10; 9];
         let summary = verdict(&ratios, 3.0, 10.0);
         assert!(matches!(summary.verdict, Verdict::NotMeasured(_)));
+    }
+
+    #[test]
+    fn an_empty_rounds_file_is_not_measured() {
+        let dir = tempfile::tempdir().unwrap();
+        let rounds_path = dir.path().join("rounds.txt");
+        let history_path = dir.path().join("history.jsonl");
+        std::fs::write(&rounds_path, "").unwrap();
+        let args: Vec<String> = vec![
+            rounds_path.to_string_lossy().to_string(),
+            history_path.to_string_lossy().to_string(),
+            "3".to_string(),
+            "10".to_string(),
+            "30".to_string(),
+            "500".to_string(),
+            "0.1".to_string(),
+            "0.2".to_string(),
+            "1".to_string(),
+            "0".to_string(),
+            "3".to_string(),
+        ];
+        let env = BTreeMap::new();
+        assert_eq!(run(&args, &env), 2);
     }
 
     #[test]

@@ -197,7 +197,8 @@ M6_PERF_MEM_KB="$(machine_mem_kb)"
 M6_PERF_OS="$(uname -sr 2>/dev/null)"
 M6_PERF_ARCH="$(uname -m 2>/dev/null)"
 M6_PERF_TOOLCHAIN="$(rustc --version 2>/dev/null)"
-export M6_PERF_CPU M6_PERF_CORES M6_PERF_MEM_KB M6_PERF_OS M6_PERF_ARCH M6_PERF_TOOLCHAIN
+M6_PERF_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+export M6_PERF_CPU M6_PERF_CORES M6_PERF_MEM_KB M6_PERF_OS M6_PERF_ARCH M6_PERF_TOOLCHAIN M6_PERF_TS
 # The commit and dirtiness come from the checkout. build-host-tests.sh sets them
 # first, because the tree it synced to the host has no .git to ask.
 if [[ -z "${M6_PERF_COMMIT:-}" ]]; then
@@ -363,7 +364,13 @@ done
 #
 # m6-perf-ab pairs the arms, decides, prints the table and appends the history
 # record, then this script exits with its status. M6_PERF_COMMIT, M6_PERF_DIRTY
-# and M6_PERF_BASE_COMMIT pass through unchanged.
+# and M6_PERF_BASE_COMMIT pass through unchanged. A check that measured nothing
+# fails here rather than reporting a pass: an empty rounds file means every
+# round failed, and m6-perf-ab must not read that as "no slowdown".
+if [[ ! -s "$ROUNDS_FILE" ]]; then
+  echo "NOT MEASURED: no rounds were measured, the rounds file is empty" >&2
+  exit 2
+fi
 LOAD_AFTER="$(load_now)"
 "$AB_BIN" "$ROUNDS_FILE" "$HISTORY" "$THRESHOLD" "$MAX_CI_WIDTH" "$ROUNDS" "$REQUESTS" \
   "$LOAD_BEFORE" "$LOAD_AFTER" "$PINNED" "$CLIENT_CPU" "$SERVER_CPU"
