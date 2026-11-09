@@ -362,6 +362,23 @@ for ((r = 1; r <= ROUNDS; r++)); do
   done < <(target_rows)
 done
 
+# ── No strays ─────────────────────────────────────────────────────────────────
+#
+# Each round kills its server and waits for it, so no m6-html from this run
+# should still be alive when the loop finishes. A stray server pins the measured
+# CPU and corrupts every reading, so a run that leaves one behind fails rather
+# than reporting a number. The pattern is the absolute candidate binary path,
+# which only this checkout's server carries, and it must not match the base's
+# relative `target/release/m6-html` or another worker's checkout.
+deadline=$(( SECONDS + 5 ))
+while pgrep -f "$ROOT/target/release/m6-html" >/dev/null 2>&1; do
+  if (( SECONDS >= deadline )); then
+    echo "NOT MEASURED: m6-html from this run is still alive after the run" >&2
+    exit 2
+  fi
+  sleep 0.2
+done
+
 # ── The verdict ───────────────────────────────────────────────────────────────
 #
 # m6-perf-ab pairs the arms, decides, prints the table and appends the history
