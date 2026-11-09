@@ -57,18 +57,15 @@
 # are actually used. So they are built here, and their end-to-end test runs
 # against the binaries this script just built.
 #
-# It DOES run the performance check, as of 2026-09-14.
+# It DOES run the performance check, which is an A/B of the candidate against a
+# base build made on this same host in the same run. The base is M6_PERF_BASE
+# when set, otherwise the merge base of HEAD and origin/develop, and on develop
+# itself the commit before HEAD. Both arms render the same committed example
+# bytes in alternating order, each pinned to its own CPU, and the gate fails on
+# a consistent paired slowdown.
 #
-# It used to skip it, on the stated grounds that `tools/perfcheck.sh` measures
-# "rendering real content against a rendered config" and therefore belonged to a
-# deployment. That stopped being true the same day: perfcheck was repointed at the
-# examples, whose content is committed, so it measures m6 against bytes that are
-# the same on every machine.
-#
-# Until this was wired up, the two baselines recorded in perf-baseline.txt had
-# nothing checking them — a recorded number nobody compares against is a number
-# nobody will notice moving. And this is the only place it can run: a wall-clock
-# measurement needs a quiet machine, which a shared CI runner is not.
+# A wall-clock measurement needs a quiet machine, which a shared CI runner is
+# not, so this stays here rather than in CI.
 
 set -uo pipefail
 
@@ -205,6 +202,33 @@ if [[ -n "$EXAMPLES" ]]; then
     ok "examples synced and restamped"
 fi
 
+# ── The performance base ─────────────────────────────────────────────────────
+#
+# The candidate is compared against a build of its base commit made on this same
+# host in the same run, so both arms share the machine, the toolchain and the
+# content. M6_PERF_BASE picks a revision; otherwise the base is the merge base of
+# HEAD and origin/develop, and on develop itself the commit before HEAD.
+if [[ -n "${M6_PERF_BASE:-}" ]]; then
+  PERF_BASE_REF="$M6_PERF_BASE"
+else
+  [[ -n "$(git -C "$ROOT" rev-parse --verify origin/develop 2>/dev/null)" ]] \
+    || die "origin/develop is missing. Fetch it, or set M6_PERF_BASE."
+  PERF_BASE_REF="$(git -C "$ROOT" merge-base HEAD origin/develop)"
+  if [[ "$PERF_BASE_REF" == "$(git -C "$ROOT" rev-parse HEAD)" ]]; then
+    PERF_BASE_REF="HEAD^1"
+  fi
+fi
+PERF_BASE_COMMIT="$(git -C "$ROOT" rev-parse "$PERF_BASE_REF^{commit}")" \
+  || die "cannot resolve the performance base '$PERF_BASE_REF'"
+info "perf base: $PERF_BASE_REF $(git -C "$ROOT" rev-parse --short "$PERF_BASE_COMMIT")"
+
+# Ship the base tree beside the candidate so it can be built on the host.
+# shellcheck disable=SC2086
+git -C "$ROOT" archive --format=tar "$PERF_BASE_COMMIT" \
+  | ssh $SSH_OPTS "$BUILD_HOST" \
+      "rm -rf $BUILD_ROOT/m6-base && mkdir -p $BUILD_ROOT/m6-base && tar -x -C $BUILD_ROOT/m6-base" \
+  || die "cannot ship the performance base"
+
 # ── Run ──────────────────────────────────────────────────────────────────────
 info "m6: release build, warnings, clippy, cargo-deny, tests, conformance"
 # shellcheck disable=SC2086
@@ -215,7 +239,7 @@ PERF_COMMIT="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
 PERF_DIRTY=0
 [[ -z "$(git -C "$ROOT" status --porcelain -- . ':!tools/perf-history.jsonl' 2>/dev/null)" ]] || PERF_DIRTY=1
 ssh $SSH_OPTS "$BUILD_HOST" \
-    "M6_DIR=$BUILD_ROOT/m6 M6_PERF_COMMIT=$PERF_COMMIT M6_PERF_DIRTY=$PERF_DIRTY bash -s" \
+    "M6_DIR=$BUILD_ROOT/m6 M6_PERF_COMMIT=$PERF_COMMIT M6_PERF_DIRTY=$PERF_DIRTY M6_PERF_BASE_COMMIT=$PERF_BASE_COMMIT bash -s" \
     > "$LOG" 2>&1 <<'REMOTE' || true
 set -uo pipefail
 # `/root/.local/bin` is where `uv` installs, and h1spec is delivered through
@@ -241,6 +265,24 @@ host_enter_shared
 echo "### release build"
 cargo build --workspace --release 2>&1 | tail -3
 echo "RELEASE_WARNINGS=$(cargo build --workspace --release 2>&1 | grep -c '^warning' || true)"
+
+echo "### performance base build"
+# The base is built into its own target directory beside the candidate, and
+# skipped when the stamp matches. The stamp, not mtimes: git archive stamps
+# every file with the commit time, so cargo's mtime check would reuse a build
+# of another commit (the same trap the restamp above describes).
+if [ "$(cat ../target-base/BASE_COMMIT 2>/dev/null)" = "$M6_PERF_BASE_COMMIT" ]; then
+    BASE_BUILD_STATUS=0
+    echo "BASE_BUILD_STATUS=$BASE_BUILD_STATUS"
+else
+    (cd ../m6-base && CARGO_TARGET_DIR="$PWD/../target-base" cargo build --release -p m6-html)
+    BASE_BUILD_STATUS=$?
+    echo "BASE_BUILD_STATUS=$BASE_BUILD_STATUS"
+    if [ "$BASE_BUILD_STATUS" = "0" ]; then
+        mkdir -p ../target-base
+        echo "$M6_PERF_BASE_COMMIT" > ../target-base/BASE_COMMIT
+    fi
+fi
 
 echo "### clippy"
 # `-D warnings`, no ceiling. Prints its own line; CLIPPY_STATUS is what decides.
@@ -300,19 +342,23 @@ echo "CONFORMANCE_STATUS=$?"
 tail -14 "$T/conformance.out"
 
 echo "### performance"
-# Against the recorded numbers in tools/perf-baseline.txt, taken on this machine.
-# A run slower than its number by more than the margin fails; a faster one prints
-# the reading and asks for it to be recorded deliberately.
-# M6_PERF_COMMIT and M6_PERF_DIRTY arrive in the environment from the ssh
-# invocation, set from the checkout that synced. The tree up here has no `.git`,
-# so `git rev-parse` finds nothing, and a performance record that cannot name its
-# commit cannot be compared with anything later.
-if host_alone; then
-    ./tools/perfcheck.sh > "$T/perf.out" 2>&1
-    echo "PERF_STATUS=$?"
-    grep -E 'render:|PASS|FAIL' "$T/perf.out" | tail -6
+# An A/B of the candidate against the base built above, both made on this host
+# in this run. M6_PERF_COMMIT, M6_PERF_DIRTY and M6_PERF_BASE_COMMIT arrive in
+# the environment from the ssh invocation, set from the checkout that synced.
+# The tree up here has no .git, so `git rev-parse` finds nothing, and a
+# performance record that cannot name its commit cannot be compared with
+# anything later.
+if [ "$BASE_BUILD_STATUS" = "0" ]; then
+    if host_alone; then
+        ./tools/perfcheck.sh --base-bin "$PWD/../target-base/release/m6-html" > "$T/perf.out" 2>&1
+        echo "PERF_STATUS=$?"
+        grep -E 'render:|PASS|FAIL|NOT MEASURED|ACCEPTED' "$T/perf.out" | tail -8
+    else
+        echo "PERF_STATUS=2"
+    fi
 else
     echo "PERF_STATUS=2"
+    echo "the performance base failed to build, so nothing was measured"
 fi
 REMOTE
 
