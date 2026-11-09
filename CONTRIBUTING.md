@@ -59,11 +59,12 @@ Table 2 lists the checks by the *CI* (continuous integration) job that runs each
 | h1, h2 and h3 conformance at or above the recorded floors (`tools/conformance.sh`) | h1, h2, h3 conformance |
 | dependencies (`cargo deny check`) | advisories, licences, duplicates |
 | shellcheck clean at warning level | shell scripts |
+| the C client builds with no warnings | perf tools |
 | the examples build and work | the examples build and work |
 | the minimum supported Rust version in `Cargo.toml` | minimum supported Rust version |
 
 **Table 2: the checks a merge must pass, and the CI job that runs each one.**
-Take from it that five checks run in one CI job, and the other five each have their own.
+Take from it that four checks run in one CI job, and the other seven each have their own.
 
 The workspace test run does not compile m6-core's off-by-default features, so CI builds and tests m6-core with every feature on.
 The performance check runs on the build host, because it needs a quiet machine.
@@ -102,18 +103,16 @@ Take from it that a release doing two things takes the larger move.
 A change to configuration or behaviour that needs a migration note is a Y change.
 It carries a Migration section in its `CHANGELOG.md` entry, ahead of the list of changes.
 
-### 4.2. Recording a speed change
+### 4.2. A speed change
 
-A change that makes m6 faster records the new number, in the commit that earned it:
+A change is measured against its base by the A/B gate on the build host, which prints the paired difference and its 99% interval per target.
+A consistent slowdown fails the merge.
 
-```sh
-./tools/perfcheck.sh --update
-```
+Each target runs 100 rounds of 500 requests, because a fresh server per round settles at its own speed and more rounds, not more requests, narrow the spread.
 
-A change that makes m6 slower says why in the commit message.
-The performance check refuses the merge until the number is updated deliberately, so accepting a regression is a deliberate decision.
+Accepting one is `PERFCHECK_ACCEPT_SLOWER="<reason>"`, which is recorded in the history, and the commit message says why.
 
-The numbers are taken on the build host and mean nothing on another machine.
+The figures are taken on the build host and mean nothing on another machine.
 [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) explains why and holds the measurements.
 
 ## 5. A check that cannot measure must fail

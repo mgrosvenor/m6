@@ -15,6 +15,10 @@ name = "m6-bench"
 path = "src/bench_main.rs"
 
 [[bin]]
+name = "m6-perf-ab"
+path = "src/perf_ab_main.rs"
+
+[[bin]]
 name = "m6-bench-detail"
 path = "src/bench_detail.rs"
 

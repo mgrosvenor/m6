@@ -22,9 +22,9 @@ name: CI
 #
 # The performance check is still NOT here. A wall-clock measurement on a shared
 # runner measures the runner, not the code. It stays on the build host, which is
-# quiet and is where the recorded numbers in tools/perf-baseline.txt were taken.
-# See CLAUDE.md, "Why the build host and not the laptop" -- the same argument
-# applies twice over to a runner shared with the rest of the world.
+# quiet, where the candidate is compared against a base build in an interleaved
+# A/B. See CLAUDE.md, "Why the build host and not the laptop" -- the same
+# argument applies twice over to a runner shared with the rest of the world.
 
 on:
   pull_request:
@@ -303,6 +303,20 @@ jobs:
           done < <(find . \( -name '*.sh' -o -path './.githooks/*' \) -type f -not -path './target/*' -not -path './.git/*')
           echo "checked $COUNT shell script(s)"
           exit $FAIL
+
+  # The perf gate's statistic is tested Rust (m6-http's perf_ab module) and its
+  # tests run in the existing build-and-test job. This job checks only that the
+  # C client it relies on builds with no warnings, that the leftover-server
+  # check matches both arms, and measures nothing.
+  perf-tools:
+    name: perf tools
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: the C client builds with no warnings
+        run: cc -O2 -std=c11 -Wall -Wextra -Werror -o /tmp/perf_client tools/perf_client.c
+      - name: the leftover-server check matches both arms
+        run: ./tools/perfcheck-stray-test.sh
 
   examples:
     name: the examples build and work
