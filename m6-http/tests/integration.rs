@@ -166,7 +166,7 @@ where
                             }
                             *listener.slot_mut(key) = conn;
                         }
-                    },
+                    }
                     Token(k) => {
                         let drive = listener.drive_one(
                             k,

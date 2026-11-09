@@ -1072,9 +1072,8 @@ fn ensure_h2c_conn(
     if !state.h2c_pool.ensure_connection(url)? {
         return Ok(());
     }
-    let token = take_token(state).ok_or_else(|| {
-        std::io::Error::other("no token for h2c upstream")
-    })?;
+    let token =
+        take_token(state).ok_or_else(|| std::io::Error::other("no token for h2c upstream"))?;
     let conn = state.h2c_pool.connection_mut(url).expect("just created");
     conn.set_token(token);
     conn.set_interest(Interest::READABLE | Interest::WRITABLE);
@@ -1098,9 +1097,8 @@ fn ensure_h2s_conn(
     if !state.h2s_pool.ensure_connection(url, tls)? {
         return Ok(());
     }
-    let token = take_token(state).ok_or_else(|| {
-        std::io::Error::other("no token for h2s upstream")
-    })?;
+    let token =
+        take_token(state).ok_or_else(|| std::io::Error::other("no token for h2s upstream"))?;
     let conn = state.h2s_pool.connection_mut(url).expect("just created");
     conn.set_token(token);
     conn.set_interest(Interest::READABLE | Interest::WRITABLE);
