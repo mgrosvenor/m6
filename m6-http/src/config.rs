@@ -309,7 +309,8 @@ pub struct HealthConfig {
     /// `role:<name>` or `group:<name>`. When set, `/perf` and `/traffic` need
     /// an API token that carries this claim, verified with `[auth] public_key`
     /// exactly as a route `require` is: 401 for no or a bad token, 403 for the
-    /// wrong claim. It wins over `metrics_token_file`.
+    /// wrong claim. Setting it together with `metrics_token_file` stops the start
+    /// with exit 2.
     #[serde(default)]
     pub metrics_require: Option<String>,
     /// The IP addresses allowed to read `/perf` and `/traffic`, as written.
@@ -1284,11 +1285,10 @@ const SITE_SERVER_KEYS: &[&str] = &["backend_timeout_secs", "allowed_methods"];
 
 /// Name every key that sits in the file it does not belong to.
 ///
-/// Both files accept most of these keys and the system config wins, so a
-/// misplaced key works and says nothing. Each message names the key and the
-/// file it belongs in. The rule: `site.toml` holds state every node of the site
-/// shares, and the system config holds this node's own state (binds,
-/// certificates, credential paths, per-node security).
+/// Each message names the key and the file it belongs in, and `load` refuses
+/// the start with exit 2 for any of them. The rule: `site.toml` holds state
+/// every node of the site shares, and the system config holds this node's own
+/// state (binds, certificates, credential paths, per-node security).
 ///
 /// `site` and `system` are the two files already parsed as tables. The caller
 /// runs this only in two-file mode: in one-file mode every key belongs to the
@@ -2518,7 +2518,7 @@ domain = "test.example.com"
     }
 
     #[test]
-    fn every_misplaced_key_warns_in_the_wrong_file_and_not_in_the_right_one() {
+    fn every_misplaced_key_is_reported_in_the_wrong_file_and_not_in_the_right_one() {
         let all = every_placed_key();
         // Every field of `RawServerSection` and `RawSystemHealth` is placed
         // in one list or another. Dropping a key from a list fails here.
