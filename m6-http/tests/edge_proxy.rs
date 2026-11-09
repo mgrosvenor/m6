@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_methods, reason = "test code: threads, sleeps and blocking clients drive the service from outside")]
+
 /// Edge proxy integration tests.
 ///
 /// Validates m6-http in the "edge load-balancer" deployment model:

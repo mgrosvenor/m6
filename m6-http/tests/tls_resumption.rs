@@ -27,6 +27,8 @@
 //! `handshake_kind()` is the protocol's own answer rather than a client's
 //! summary of it. A test that cannot measure must fail, not report reassurance.
 
+#![allow(clippy::disallowed_methods, reason = "test code: threads, sleeps and blocking clients drive the service from outside")]
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;

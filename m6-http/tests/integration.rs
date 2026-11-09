@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_methods, reason = "test code: threads, sleeps and blocking clients drive the service from outside")]
+
 /// Functional integration tests for m6-http protocol handling.
 ///
 /// HTTP/1.1: spins up Http11Listener in-process with a self-signed cert (rcgen),

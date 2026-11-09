@@ -460,6 +460,7 @@ pub fn forward_request(
 /// Like `forward_request` but with a configurable timeout for the total
 /// backend call (connect + write + read). A `TimedOut` error is returned if
 /// the backend does not respond within the deadline.
+#[expect(clippy::disallowed_methods, reason = "test and tooling path only")]
 pub fn forward_request_timeout(
     socket_path: &Path,
     req: &HttpRequest,
@@ -1105,6 +1106,7 @@ pub fn parse_request(data: &[u8]) -> Result<HttpRequest, String> {
 /// URL backends are not pooled — a new TCP connection is opened for every
 /// request. The `timeout` (if given) is applied as both read and write
 /// timeout on the underlying TCP stream.
+#[expect(clippy::disallowed_methods, reason = "URL backend thread per request; removed by EL-5b")]
 pub fn forward_url_request(
     base_url: &str,
     req: &HttpRequest,
@@ -1210,6 +1212,7 @@ pub fn dispatch_url_request(
     tls_config: std::sync::Arc<rustls::ClientConfig>,
 ) -> std::sync::mpsc::Receiver<std::io::Result<HttpResponse>> {
     let (tx, rx) = std::sync::mpsc::channel();
+    #[expect(clippy::disallowed_methods, reason = "URL backend thread per request; removed by EL-5b")]
     std::thread::spawn(move || {
         let _ = tx.send(forward_url_request(
             &base_url,

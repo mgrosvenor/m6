@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_methods, reason = "a load generator, not a service: it measures from outside")]
+
 /// bench-url-backend — minimal HTTP server for URL-backend benchmarking.
 ///
 /// Listens on a TCP port and responds to every GET with a fixed 200 OK body.

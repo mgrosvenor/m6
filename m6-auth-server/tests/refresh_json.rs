@@ -6,6 +6,8 @@
 //! These tests assert what a JSON client sees: a fresh decodable access token,
 //! and 401 for an expired, invalid or revoked refresh token.
 
+#![allow(clippy::disallowed_methods, reason = "test code: threads, sleeps and blocking clients drive the service from outside")]
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;

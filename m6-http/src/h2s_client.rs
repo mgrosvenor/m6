@@ -30,6 +30,7 @@ impl Transport for H2sTransport {
             )
         })?;
 
+        #[expect(clippy::disallowed_methods, reason = "blocking upstream connect; removed by EL-5b")]
         let tcp = TcpStream::connect(format!("{}:{}", host, port))?;
         tcp.set_nodelay(true)?;
 

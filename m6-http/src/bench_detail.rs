@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_methods, reason = "a load generator, not a service: it measures from outside")]
+
 /// m6-bench-detail — per-phase latency breakdown for m6-http.
 ///
 /// Instruments each step of the request lifecycle from connection open to last byte received,

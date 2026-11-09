@@ -13,6 +13,8 @@
 //! requests after that go to the healthy member while the backoff lasts (at
 //! least one second). The test asserts that behaviour rather than changing it.
 
+#![allow(clippy::disallowed_methods, reason = "test code: threads, sleeps and blocking clients drive the service from outside")]
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::os::unix::net::{UnixListener, UnixStream};

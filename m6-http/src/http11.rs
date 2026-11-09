@@ -1897,6 +1897,7 @@ mod keep_alive_tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods, reason = "test code: threads, sleeps and blocking clients drive the service from outside")]
 mod h2c_admit_tests {
     use super::{
         admit, H2cListener, RefusalLog, RefusalSummary, RefusalVerdict, REFUSAL_LOG_MAX_LINES,

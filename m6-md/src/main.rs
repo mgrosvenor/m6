@@ -299,6 +299,7 @@ fn run(args: Vec<String>) -> i32 {
         }
 
         // Block up to 200ms waiting for an event.
+        #[expect(clippy::disallowed_methods, reason = "m6-md watch mode, a build tool, not a service; removed by lane 4 DUP-1")]
         let first = match rx.recv_timeout(std::time::Duration::from_millis(200)) {
             Ok(ev) => ev,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
@@ -314,6 +315,7 @@ fn run(args: Vec<String>) -> i32 {
 
         // Burst-drain: collect any additional events that arrive within 50ms
         // (handles editors that do delete+create / rename swap writes).
+        #[expect(clippy::disallowed_methods, reason = "m6-md watch mode, a build tool, not a service; removed by lane 4 DUP-1")]
         std::thread::sleep(std::time::Duration::from_millis(50));
         drain_channel(&rx);
 
