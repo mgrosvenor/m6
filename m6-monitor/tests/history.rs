@@ -5,6 +5,11 @@
 //! history lost the rows for a dead node would lose them exactly when someone
 //! wants them.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
+
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};

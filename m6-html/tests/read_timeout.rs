@@ -11,6 +11,11 @@
 //! `App` with no timeout: the first hangs until the harness timeout, the second
 //! never gets its request answered.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
+
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};

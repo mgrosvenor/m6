@@ -1,5 +1,10 @@
 //! Claiming a TCP port that no concurrently running test will also use.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
+
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU16, Ordering};

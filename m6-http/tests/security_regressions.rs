@@ -11,6 +11,11 @@
 //! The doc comment on each test describes the original defect, so the reason
 //! the test exists survives the fix.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
+
 use std::io::{Read, Write};
 use std::os::unix::net::UnixListener;
 use std::path::Path;

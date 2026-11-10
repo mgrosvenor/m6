@@ -1,3 +1,8 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "a load generator, not a service: it measures from outside"
+)]
+
 /// m6-bench — loopback latency + throughput benchmark for m6-http.
 ///
 /// Modes (flags can be combined):

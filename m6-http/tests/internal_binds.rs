@@ -6,6 +6,11 @@
 //! a message that names the key, and a declared h2c listener is really internal, shown by whether it
 //! believes a forwarded client address.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
+
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};

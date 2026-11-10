@@ -20,6 +20,11 @@
 //! and "no self-fetch" are asserted on what the backend actually received, not
 //! inferred from a response shape.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::os::unix::net::{UnixListener, UnixStream};

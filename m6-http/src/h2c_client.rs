@@ -23,6 +23,10 @@ impl Transport for H2cTransport {
         port: u16,
         _tls: Option<std::sync::Arc<rustls::ClientConfig>>,
     ) -> io::Result<Self> {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "blocking upstream connect; removed by EL-5b"
+        )]
         let mut stream = TcpStream::connect(format!("{}:{}", host, port))?;
         stream.set_nodelay(true)?;
 

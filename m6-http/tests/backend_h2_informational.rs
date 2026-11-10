@@ -7,6 +7,11 @@
 //! blocks of `103` plus a `link` field, then a `200` with a body, and fetches
 //! through the real client.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{mpsc, Arc};

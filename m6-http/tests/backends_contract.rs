@@ -24,6 +24,11 @@
 //! "regression test that has never failed" trap this project has already hit
 //! once with h2spec and h3spec.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
+
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};

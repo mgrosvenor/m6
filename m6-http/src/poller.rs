@@ -207,6 +207,10 @@ mod imp {
         if registered.is_empty() {
             // Nothing to poll — sleep briefly and return 0
             if timeout_ms > 0 {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "the fallback poller; removed by EL-2"
+                )]
                 std::thread::sleep(std::time::Duration::from_millis(timeout_ms as u64));
             }
             return Ok(0);

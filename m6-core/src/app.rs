@@ -1687,6 +1687,10 @@ impl ThreadPool {
         for _ in 0..size {
             let rx = rx.clone();
             let on_exit = on_thread_exit.clone();
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the App worker pool; removed by EL-6"
+            )]
             std::thread::spawn(move || {
                 loop {
                     let work = rx.lock().unwrap().recv();
@@ -3355,6 +3359,10 @@ fn handle_request<W: std::io::Write>(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
 mod tests {
     use super::*;
 

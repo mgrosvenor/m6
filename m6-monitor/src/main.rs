@@ -121,6 +121,10 @@ fn build_state(ctx: &AppContext) -> Result<MonitorState> {
     let history_config = history::config_from(ctx.config.get("monitor"), ctx.site_dir)?;
     let (recorder, handle) = history::start(history_config.clone())?;
     let poller_handle = handle.clone();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "monitor threads; removed by EL-9"
+    )]
     std::thread::spawn(move || {
         let mut verdicts = check::VerdictCache::new();
         loop {
@@ -151,6 +155,10 @@ fn build_state(ctx: &AppContext) -> Result<MonitorState> {
                 // would present a stale one as current.
                 Err(e) => tracing::warn!(error = %format!("{e:#}"), "fleet poll failed"),
             }
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "monitor threads; removed by EL-9"
+            )]
             std::thread::sleep(interval);
         }
     });

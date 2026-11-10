@@ -4,6 +4,11 @@
 //! Each test runs a loopback backend on a Unix socket and fetches from it
 //! through `forward_request`, the call the edge makes for a cache miss.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
+
 use std::io::{Read, Write};
 use std::os::unix::net::UnixListener;
 use std::path::Path;

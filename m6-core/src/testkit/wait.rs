@@ -5,6 +5,11 @@
 //! and report the child's stderr when the thing being waited for will never
 //! happen because the child is dead.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
+
 use std::net::TcpStream;
 use std::path::Path;
 use std::time::{Duration, Instant};

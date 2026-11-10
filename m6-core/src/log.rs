@@ -691,6 +691,10 @@ pub fn parse_level(s: &str) -> Level {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
 mod tests {
     use super::*;
 
@@ -737,6 +741,10 @@ mod pulse_tests {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
 mod reopen_tests {
     use super::*;
     use std::io::Write;

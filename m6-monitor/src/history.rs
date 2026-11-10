@@ -1362,6 +1362,10 @@ pub fn start(cfg: Option<Config>) -> anyhow::Result<(Recorder, HistoryHandle)> {
 
 fn spawn_writer(rx: Receiver<Batch>, mut w: Writer) -> anyhow::Result<()> {
     let guard = StopGuard(Arc::clone(&w.shared));
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "monitor threads; removed by EL-9"
+    )]
     std::thread::Builder::new()
         .name("m6-monitor-history".into())
         .spawn(move || {

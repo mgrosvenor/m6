@@ -5,6 +5,11 @@
 //! waste CPU without shrinking it. No suite requests a woff2 file, so the
 //! mistake would go unnoticed.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
+
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
