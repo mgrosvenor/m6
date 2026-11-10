@@ -1262,16 +1262,6 @@ fn after_conn_drive(
     }
 }
 
-/// The RFC 9218 priority a request asked for, from its header list.
-fn request_priority<'a>(headers: impl Iterator<Item = (&'a [u8], &'a [u8])>) -> priority::Priority {
-    headers
-        .into_iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case(b"priority"))
-        .map_or_else(priority::Priority::default, |(_, value)| {
-            priority::parse(value)
-        })
-}
-
 /// Write a finished response straight into the waiting stream, in this turn.
 fn write_waiter(
     waiter: Waiter,
@@ -1342,14 +1332,18 @@ fn complete_waiter(
     cx: &mut CompletionCtx<'_>,
 ) {
     let method = &ctx.req.method;
-    let priority = request_priority(
-        ctx.req
-            .headers
-            .iter()
-            .map(|(name, value)| (name.as_bytes(), value.as_bytes())),
-    );
     match finalize_url_response(result, &ctx, cx.quic_port, cx.state, cx.registry) {
         Completion::Ready((status, headers, body, _)) => {
+            let priority = if matches!(waiter, Waiter::H3 { .. }) {
+                priority::from_headers(
+                    ctx.req
+                        .headers
+                        .iter()
+                        .map(|(name, value)| (name.as_bytes(), value.as_bytes())),
+                )
+            } else {
+                priority::Priority::default()
+            };
             write_waiter(waiter, status, headers, body, method, priority, cx);
         }
         Completion::Pending { id, ctx } => {
@@ -2208,7 +2202,7 @@ fn handle_h3_request(
         Some(r) => r,
         None => return,
     };
-    let priority = request_priority(
+    let priority = priority::from_headers(
         req.headers
             .iter()
             .map(|header| (header.name(), header.value())),
