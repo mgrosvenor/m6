@@ -509,8 +509,7 @@ impl Http11Listener {
             ConnKind::Http1(h1) if matches!(h1.state, H1State::WaitingBackend) => h1.keep_alive,
             _ => return drive,
         };
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&build_response(status, headers, &body, method, keep_alive));
+        let buf = build_response(status, headers, &body, method, keep_alive);
         let ConnKind::Http1(h1) = &mut conn.kind else {
             return drive;
         };

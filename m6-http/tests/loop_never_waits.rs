@@ -1282,3 +1282,192 @@ fn a_custom_error_page_from_a_socket_backend_is_served_without_a_blocking_fetch(
     let _ = backend.join();
     let _ = std::fs::remove_file(&sock);
 }
+
+/// A reply that lands after its client was reaped must not be delivered into a
+/// later connection that reused the token. Each `Waiter` carries the
+/// connection's generation, so the stale completion is dropped.
+#[test]
+fn a_reaped_clients_stale_reply_is_not_delivered_to_a_later_connection() {
+    const SECOND_BODY: &str = "second";
+    let dir = tempfile::tempdir().expect("tempdir");
+    let site = dir.path().to_path_buf();
+
+    let ck =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+            .expect("certificate");
+    let cert = site.join("cert.pem");
+    let key = site.join("key.pem");
+    std::fs::write(&cert, ck.cert.pem()).expect("cert");
+    std::fs::write(&key, ck.key_pair.serialize_pem()).expect("key");
+
+    // One socket backend: /slow is held with SLOW_BODY, /slow2 is held with a
+    // distinct body, each reporting its arrival on its own channel.
+    let pid = std::process::id();
+    let sock = PathBuf::from(format!("/tmp/m6lnw-{pid}-stale.sock"));
+    let _ = std::fs::remove_file(&sock);
+    let listener = UnixListener::bind(&sock).expect("bind backend socket");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let (slow_seen_tx, slow_seen_rx) = mpsc::channel();
+    let (slow2_seen_tx, slow2_seen_rx) = mpsc::channel();
+    let release = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let backend = std::thread::spawn({
+        let stop = Arc::clone(&stop);
+        let release = Arc::clone(&release);
+        move || {
+            while !stop.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let stop = Arc::clone(&stop);
+                        let release = Arc::clone(&release);
+                        let slow_seen_tx = slow_seen_tx.clone();
+                        let slow2_seen_tx = slow2_seen_tx.clone();
+                        std::thread::spawn(move || {
+                            let mut stream = stream;
+                            let _ = stream.set_nonblocking(false);
+                            let mut got = Vec::new();
+                            let mut byte = [0u8; 1];
+                            while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+                                match stream.read(&mut byte) {
+                                    Ok(0) => return,
+                                    Ok(_) => got.push(byte[0]),
+                                    Err(_) => return,
+                                }
+                            }
+                            let head = String::from_utf8_lossy(&got).to_ascii_lowercase();
+                            let (seen_tx, body) = if head.starts_with("get /slow2") {
+                                (&slow2_seen_tx, SECOND_BODY)
+                            } else {
+                                (&slow_seen_tx, SLOW_BODY)
+                            };
+                            let _ = seen_tx.send(());
+                            while !release.load(Ordering::SeqCst) && !stop.load(Ordering::SeqCst) {
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                            if !release.load(Ordering::SeqCst) {
+                                return;
+                            }
+                            let resp = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            let _ = stream.write_all(resp.as_bytes());
+                            let _ = stream.flush();
+                        });
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    });
+
+    std::fs::write(
+        site.join("site.toml"),
+        format!(
+            "[site]\nname = \"loop-never-waits\"\ndomain = \"localhost\"\n\n\
+             [server]\nbackend_timeout_secs = 30\nmax_requests_per_connection = 10000\n\n\
+             [log]\nlevel = \"info\"\nformat = \"text\"\n\n\
+             [analytics]\nenabled = false\n\n\
+             [rate_limit]\nenabled = false\n\n\
+             [[backend]]\nname = \"app\"\nsockets = \"{}\"\n\n\
+             [[route]]\npath = \"/slow\"\nbackend = \"app\"\n\n\
+             [[route]]\npath = \"/slow2\"\nbackend = \"app\"\n",
+            sock.display()
+        ),
+    )
+    .expect("site.toml");
+    std::fs::write(site.join("metrics.token"), "loop-never-waits-token").expect("token");
+    let claim = claim_port();
+    let port = claim.port();
+    let _claim = claim;
+    std::fs::write(
+        site.join("system.toml"),
+        system_toml(port, &cert, &key, &site.join("metrics.token")),
+    )
+    .expect("system.toml");
+
+    let mut service = Service::spawn(
+        "m6-http",
+        Command::new(binary("m6-http"))
+            .arg(&site)
+            .arg(site.join("system.toml")),
+    );
+    service.wait_for_tcp(port, Duration::from_secs(20));
+
+    let h2_req = |path: &str| HttpRequest {
+        method: "GET".to_string(),
+        path: path.to_string(),
+        query: None,
+        version: "HTTP/2".to_string(),
+        headers: vec![],
+        body: vec![],
+    };
+
+    // Client A dispatches /slow, then closes while the backend holds it.
+    probe::install_crypto();
+    {
+        let cfg = probe::tls_config(b"h2");
+        let mut a = H2sTlsClientConn::connect("127.0.0.1", port, cfg).expect("client A");
+        a.dispatch(&h2_req("/slow"), "127.0.0.1", "127.0.0.1", "127.0.0.1")
+            .expect("dispatch /slow");
+        a.drive();
+        let seen = await_slow_seen(&slow_seen_rx, Instant::now() + Duration::from_secs(5));
+        assert!(
+            seen,
+            "the backend never received /slow\n--- m6-http ---\n{}",
+            service.output()
+        );
+        // `a` drops: the client closes with its /slow still in flight.
+    }
+
+    // Client B, on the reused token, dispatches /slow2 (also held).
+    let cfg = probe::tls_config(b"h2");
+    let mut b = H2sTlsClientConn::connect("127.0.0.1", port, cfg).expect("client B");
+    let sid = b
+        .dispatch(&h2_req("/slow2"), "127.0.0.1", "127.0.0.1", "127.0.0.1")
+        .expect("dispatch /slow2");
+    b.drive();
+    let seen = await_slow_seen(&slow2_seen_rx, Instant::now() + Duration::from_secs(5));
+    assert!(
+        seen,
+        "the backend never received /slow2\n--- m6-http ---\n{}",
+        service.output()
+    );
+
+    // Release both; client A's stale reply must be dropped and client B must
+    // get its own /slow2 body, never A's /slow body.
+    release.store(true, Ordering::SeqCst);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        b.drive();
+        if let Some(c) = b
+            .drain_completions()
+            .into_iter()
+            .find(|c| c.stream_id == sid)
+        {
+            let r = c.result.expect("client B's response");
+            assert_eq!(r.status, 200);
+            assert_eq!(
+                String::from_utf8_lossy(&r.body),
+                SECOND_BODY,
+                "client B got the wrong body\n--- m6-http ---\n{}",
+                service.output()
+            );
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "client B got no response\n--- m6-http ---\n{}",
+                service.output()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    stop.store(true, Ordering::SeqCst);
+    let _ = backend.join();
+    let _ = std::fs::remove_file(&sock);
+}

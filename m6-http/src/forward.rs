@@ -1494,10 +1494,14 @@ pub enum UpstreamId {
 pub enum Waiter {
     H1 {
         conn: Token,
+        /// The connection's generation, so a reply that lands after the client
+        /// was reaped and its token reused is dropped rather than misdelivered.
+        gen: u64,
     },
     H2 {
         conn: Token,
         stream: u32,
+        gen: u64,
     },
     H3 {
         conn_id: Vec<u8>,

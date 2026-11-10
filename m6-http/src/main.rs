@@ -88,6 +88,34 @@ struct CompletionCtx<'a> {
     now: Instant,
 }
 
+impl<'a> CompletionCtx<'a> {
+    // The one bundle constructor for the completion context; it exists so the
+    // five completion helpers that take `&mut CompletionCtx` stay under
+    // clippy's argument ceiling.
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        state: &'a mut ServerState,
+        tcp: &'a mut Option<Http11Listener>,
+        h2c: &'a mut Option<H2cListener>,
+        registry: &'a m6_core::mio::Registry,
+        quic_port: u16,
+        udp: &'a UdpSocket,
+        connections: &'a mut HashMap<Vec<u8>, QuicConn>,
+        now: Instant,
+    ) -> Self {
+        CompletionCtx {
+            state,
+            tcp,
+            h2c,
+            registry,
+            quic_port,
+            udp,
+            connections,
+            now,
+        }
+    }
+}
+
 /// How long a fetched error document is reused before being re-fetched.
 /// Short enough that a redeployed error page appears promptly, long enough
 /// that a sustained sweep costs one fetch a minute rather than one per path.
@@ -234,6 +262,10 @@ struct ServerState {
     /// One `mio` token per descriptor, the single allocator for every
     /// connection and upstream, mapping a token to its owner.
     sources: Slots<Source>,
+    /// One generation per token key, bumped each time the key is handed out, so
+    /// a `Waiter` that captured an earlier generation can be recognised as
+    /// stale after its connection was reaped and the token reused.
+    generations: Vec<u64>,
     /// Cache entries queued to be fetched in the background — hint-driven
     /// prefetches and stale-while-revalidate refreshes both land here.
     prefetch_queue: std::collections::VecDeque<Refresh>,
@@ -780,15 +812,20 @@ fn on_request_impl(
 
 // ── Token and slot helpers ────────────────────────────────────────────────────
 
-/// Take one token from the shared table, growing the three deadline tables to
-/// match when the token table doubles.
+/// Take one token from the shared table, growing the three deadline tables and
+/// the generation table to match when the token table doubles. Each hand-out
+/// bumps the key's generation, so a `Waiter` that captured an earlier
+/// generation is stale after the key is freed and reused.
 fn take_token(state: &mut ServerState) -> Option<Token> {
     let taken = state.sources.take()?;
     if let Some(n) = taken.grew_to {
         state.read_timeouts.grow(n);
         state.h2_idle_timeouts.grow(n);
         state.upstream_timeouts.grow(n);
+        state.generations.resize(n, 0);
     }
+    let gen = &mut state.generations[taken.key];
+    *gen = gen.wrapping_add(1);
     Some(Token(taken.key))
 }
 
@@ -909,11 +946,13 @@ fn drive_conn_token(
     // in the upstream slot it named.
     let mut pending = std::mem::take(&mut drive.pending);
     for d in pending.drain(..) {
+        let gen = state.generations[token.0];
         let waiter = match d.stream {
-            None => Waiter::H1 { conn: token },
+            None => Waiter::H1 { conn: token, gen },
             Some(stream) => Waiter::H2 {
                 conn: token,
                 stream,
+                gen,
             },
         };
         park(state, d.id, d.ctx, waiter);
@@ -1035,7 +1074,12 @@ fn write_waiter(
     cx: &mut CompletionCtx<'_>,
 ) {
     match waiter {
-        Waiter::H1 { conn } => {
+        Waiter::H1 { conn, gen } => {
+            // A stale waiter whose connection was reaped and whose token was
+            // reused carries an older generation: drop the reply.
+            if cx.state.generations.get(conn.0) != Some(&gen) {
+                return;
+            }
             if let Source::TlsConn(slot) = *cx.state.sources.get(conn.0) {
                 if let Some(t) = cx.tcp {
                     let drive = t.complete_h1(slot, status, &headers, body, method, cx.registry);
@@ -1043,7 +1087,10 @@ fn write_waiter(
                 }
             }
         }
-        Waiter::H2 { conn, stream } => {
+        Waiter::H2 { conn, stream, gen } => {
+            if cx.state.generations.get(conn.0) != Some(&gen) {
+                return;
+            }
             let done = match *cx.state.sources.get(conn.0) {
                 Source::TlsConn(slot) => cx.tcp.as_mut().is_some_and(|t| {
                     t.complete_h2(slot, stream, (status, headers, body), method, cx.registry)
@@ -1084,10 +1131,10 @@ fn complete_waiter(
     waiter: Waiter,
     cx: &mut CompletionCtx<'_>,
 ) {
-    let method = ctx.req.method.clone();
+    let method = &ctx.req.method;
     match finalize_url_response(result, &ctx, cx.quic_port, cx.state, cx.registry) {
         Completion::Ready((status, headers, body, _)) => {
-            write_waiter(waiter, status, headers, body, &method, cx);
+            write_waiter(waiter, status, headers, body, method, cx);
         }
         Completion::Pending { id, ctx } => {
             park(cx.state, id, ctx, waiter);
@@ -1485,16 +1532,16 @@ fn event_loop(
                         let completions = state.h2c_pool.drain_completions();
                         for c in completions {
                             if let (Some(waiter), Some(ctx)) = (c.waiter, c.ctx) {
-                                let mut cx = CompletionCtx {
-                                    state: &mut *state,
-                                    tcp: &mut tcp,
-                                    h2c: &mut h2c,
-                                    registry: poll.registry(),
+                                let mut cx = CompletionCtx::new(
+                                    &mut *state,
+                                    &mut tcp,
+                                    &mut h2c,
+                                    poll.registry(),
                                     quic_port,
-                                    udp: &udp,
-                                    connections: &mut connections,
+                                    &udp,
+                                    &mut connections,
                                     now,
-                                };
+                                );
                                 complete_waiter(c.result, ctx, waiter, &mut cx);
                             }
                         }
@@ -1508,31 +1555,31 @@ fn event_loop(
                         let completions = state.h2s_pool.drain_completions();
                         for c in completions {
                             if let (Some(waiter), Some(ctx)) = (c.waiter, c.ctx) {
-                                let mut cx = CompletionCtx {
-                                    state: &mut *state,
-                                    tcp: &mut tcp,
-                                    h2c: &mut h2c,
-                                    registry: poll.registry(),
+                                let mut cx = CompletionCtx::new(
+                                    &mut *state,
+                                    &mut tcp,
+                                    &mut h2c,
+                                    poll.registry(),
                                     quic_port,
-                                    udp: &udp,
-                                    connections: &mut connections,
+                                    &udp,
+                                    &mut connections,
                                     now,
-                                };
+                                );
                                 complete_waiter(c.result, ctx, waiter, &mut cx);
                             }
                         }
                     }
                     Source::SocketUpstream(_) => {
-                        let mut cx = CompletionCtx {
-                            state: &mut *state,
-                            tcp: &mut tcp,
-                            h2c: &mut h2c,
-                            registry: poll.registry(),
+                        let mut cx = CompletionCtx::new(
+                            &mut *state,
+                            &mut tcp,
+                            &mut h2c,
+                            poll.registry(),
                             quic_port,
-                            udp: &udp,
-                            connections: &mut connections,
+                            &udp,
+                            &mut connections,
                             now,
-                        };
+                        );
                         drive_socket_upstream_one(Token(k), &mut cx);
                     }
                     Source::Vacant => {}
@@ -1549,16 +1596,16 @@ fn event_loop(
             close_conn_token(token, state, &mut tcp, &mut h2c, poll.registry());
         }
         while let Some(token) = state.upstream_timeouts.expired(Instant::now()) {
-            let mut cx = CompletionCtx {
-                state: &mut *state,
-                tcp: &mut tcp,
-                h2c: &mut h2c,
-                registry: poll.registry(),
+            let mut cx = CompletionCtx::new(
+                &mut *state,
+                &mut tcp,
+                &mut h2c,
+                poll.registry(),
                 quic_port,
-                udp: &udp,
-                connections: &mut connections,
+                &udp,
+                &mut connections,
                 now,
-            };
+            );
             expire_socket_upstream(token, &mut cx);
         }
 
@@ -1588,16 +1635,16 @@ fn event_loop(
                 Some(result) => {
                     let entry = state.url_pending.swap_remove(idx);
                     if let (Some(waiter), Some(ctx)) = (entry.waiter, entry.ctx) {
-                        let mut cx = CompletionCtx {
-                            state: &mut *state,
-                            tcp: &mut tcp,
-                            h2c: &mut h2c,
-                            registry: poll.registry(),
+                        let mut cx = CompletionCtx::new(
+                            &mut *state,
+                            &mut tcp,
+                            &mut h2c,
+                            poll.registry(),
                             quic_port,
-                            udp: &udp,
-                            connections: &mut connections,
+                            &udp,
+                            &mut connections,
                             now,
-                        };
+                        );
                         complete_waiter(result, ctx, waiter, &mut cx);
                     }
                 }
@@ -4678,6 +4725,7 @@ fn run(args: Vec<String>) -> i32 {
         error_mode,
         stats: Stats::new(),
         sources: Slots::new(INITIAL_CONNECTIONS, ceiling, || Source::Vacant),
+        generations: vec![0; INITIAL_CONNECTIONS],
         prefetch_queue: std::collections::VecDeque::new(),
         socket_upstreams: Slots::new(INITIAL_CONNECTIONS, ceiling, SocketUpstreamEntry::empty),
         url_pending: Vec::new(),
