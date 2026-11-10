@@ -329,8 +329,6 @@ pub struct Confirm {
     query: Query,
     /// The PTR name, once the reverse step has answered it.
     name: Option<String>,
-    /// The answer, once both steps have completed.
-    result: Option<Ptr>,
 }
 
 impl Confirm {
@@ -341,7 +339,6 @@ impl Confirm {
             ns,
             query: Query::ptr(ip, ns)?,
             name: None,
-            result: None,
         })
     }
 
@@ -350,15 +347,12 @@ impl Confirm {
         self.query.fd()
     }
 
-    /// Move the current step as far as it goes without waiting. `Some` when
-    /// the check is complete, and the same answer on a later call.
+    /// Move the current step as far as it goes without waiting. `Some` once,
+    /// when the check is complete, then `None` on later calls.
     ///
     /// An `Err` is a socket error: the caller records [`Ptr::Failed`] and drops
     /// the confirmation.
     pub fn drive(&mut self) -> io::Result<Option<Ptr>> {
-        if let Some(ptr) = &self.result {
-            return Ok(Some(ptr.clone()));
-        }
         let Some(answer) = self.query.drive()? else {
             return Ok(None);
         };
@@ -396,7 +390,6 @@ impl Confirm {
                 Answer::Failed | Answer::Addrs(_) => Ptr::Failed,
             }
         };
-        self.result = Some(result.clone());
         Ok(Some(result))
     }
 }
