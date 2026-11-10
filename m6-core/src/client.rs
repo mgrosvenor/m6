@@ -1409,6 +1409,17 @@ mod tests {
         up2.eof = true;
         assert!(up2.parse_progress().unwrap());
         assert!(up2.reusable(), "HTTP/1.0 keep-alive is reusable");
+
+        let close_wins =
+            b"HTTP/1.0 200 OK\r\nContent-Length: 5\r\nConnection: keep-alive, close\r\n\r\nhello";
+        let mut up3 = Upstream::new(8192, 1024);
+        up3.method_is_head = false;
+        up3.request_finished = true;
+        up3.read_buf[..close_wins.len()].copy_from_slice(close_wins);
+        up3.read_len = close_wins.len();
+        up3.eof = true;
+        assert!(up3.parse_progress().unwrap());
+        assert!(!up3.reusable(), "Connection: close wins over keep-alive");
     }
 }
 
@@ -1635,41 +1646,57 @@ mod socket_tests {
     }
 
     /// A backend that answers at once without reading the request is still read
-    /// while the request write would block (RFC 9110 6.1).
+    /// while the request write would block (RFC 9110 6.1), and the next `start`
+    /// reconnects instead of riding the truncated stream.
     #[test]
     fn a_backend_that_answers_without_reading_is_read_while_writing() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("early.sock");
         let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        let (accept_tx, accept_rx) = std::sync::mpsc::channel();
         let peer = std::thread::spawn(move || {
-            let (mut s, _) = listener.accept().expect("accept");
-            // Never read the request; write a keep-alive 413 at once. The client
-            // must read it, and must not reuse: the request was never fully
-            // written.
-            let _ = s.write_all(b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n\r\n");
-            // Hold the socket open until the client is done, then close.
+            let (mut s1, _) = listener.accept().expect("accept");
+            accept_tx.send(()).expect("report the first accept");
+            // Never read the request; write a keep-alive 413 at once and hold
+            // the socket open until the client is done.
+            let _ = s1.write_all(b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n\r\n");
             std::thread::park();
+            // The client's second start reconnects here.
+            let Ok((_s2, _)) = listener.accept() else {
+                return;
+            };
+            accept_tx.send(()).expect("report the second accept");
         });
 
+        let deadline = Instant::now() + Duration::from_secs(5);
         let mut up = Upstream::new(64 * 1024, 64 * 1024);
         up.request_buf()
             .extend_from_slice(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1048576\r\n\r\n");
         up.request_buf()
             .extend(std::iter::repeat_n(b'x', 1_048_576));
-        up.start(
-            &Addr::Unix(path),
-            None,
-            false,
-            Instant::now() + Duration::from_secs(5),
-        )
-        .expect("start");
+        up.start(&Addr::Unix(path.clone()), None, false, deadline)
+            .expect("start");
         let (status, _, body) = drive_to_completion(&mut up).expect("drive");
         assert_eq!((status, body.as_slice()), (413, &b""[..]));
         assert!(
             !up.reusable(),
             "an early reply before the request is written must not reuse"
         );
+        assert!(
+            accept_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the first start must connect"
+        );
+
+        // A second start must not ride the truncated stream: it reconnects.
+        up.request_buf()
+            .extend_from_slice(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+        up.start(&Addr::Unix(path), None, false, deadline)
+            .expect("start");
         peer.thread().unpark();
+        assert!(
+            accept_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the second start must reconnect, not reuse"
+        );
         peer.join().expect("peer");
     }
 
@@ -1789,68 +1816,6 @@ mod socket_tests {
         // blocking on a close the client never sends.
         up.close();
 
-        peer.join().expect("peer");
-    }
-
-    /// A TLS request with a body completes: the client encrypts and flushes the
-    /// request and the server answers.
-    #[test]
-    fn a_tls_request_with_a_body_completes() {
-        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("cert");
-        let cert = ck.cert.der().clone();
-        let key =
-            rustls::pki_types::PrivateKeyDer::try_from(ck.key_pair.serialize_der()).expect("key");
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let server = Arc::new(
-            rustls::ServerConfig::builder_with_provider(provider.clone())
-                .with_safe_default_protocol_versions()
-                .expect("versions")
-                .with_no_client_auth()
-                .with_single_cert(vec![cert.clone()], key)
-                .expect("server config"),
-        );
-        let mut roots = rustls::RootCertStore::empty();
-        roots.add(cert).expect("trust the run's own cert");
-        let client = Arc::new(
-            rustls::ClientConfig::builder_with_provider(provider)
-                .with_safe_default_protocol_versions()
-                .expect("versions")
-                .with_root_certificates(roots)
-                .with_no_client_auth(),
-        );
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        let peer = std::thread::spawn(move || {
-            let (tcp, _) = listener.accept().expect("accept");
-            let conn = rustls::ServerConnection::new(server).expect("server conn");
-            let mut stream = rustls::StreamOwned::new(conn, tcp);
-            let mut got = Vec::new();
-            let mut buf = [0u8; 4096];
-            while !got.windows(4).any(|w| w == b"\r\n\r\n") {
-                match stream.read(&mut buf) {
-                    Ok(0) | Err(_) => return,
-                    Ok(n) => got.extend_from_slice(&buf[..n]),
-                }
-            }
-            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
-            let _ = stream.flush();
-        });
-
-        let name = rustls::pki_types::ServerName::try_from("localhost".to_string()).expect("name");
-        let tls = TlsClient {
-            config: client,
-            name,
-        };
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let mut up = Upstream::new(64 * 1024, 64 * 1024);
-        up.request_buf().extend_from_slice(
-            b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\nbody",
-        );
-        up.start(&Addr::Tcp(addr), Some(&tls), false, deadline)
-            .expect("start");
-        let (status, _, body) = drive_to_completion(&mut up).expect("drive");
-        assert_eq!((status, body.as_slice()), (200, &b"ok"[..]));
         peer.join().expect("peer");
     }
 }

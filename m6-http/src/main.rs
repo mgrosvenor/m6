@@ -1350,21 +1350,22 @@ fn drive_socket_upstream_one(token: Token, cx: &mut CompletionCtx<'_>) {
     };
     let entry = cx.state.socket_upstreams.get_mut(slot);
     let member_idx = entry.member_idx;
-    let backend_name = std::mem::take(&mut entry.backend_name);
     let waiter = entry.waiter.take();
     let ctx = entry.ctx.take();
     entry.upstream.close();
-    cx.state.socket_upstreams.free(slot);
-    *cx.state.sources.get_mut(token.0) = Source::Vacant;
-    cx.state.sources.free(token.0);
-    cx.state.upstream_timeouts.clear(token);
-    if let Some(pool) = cx.state.pool_manager.get_pool_mut(&backend_name) {
+    // Release the member using a borrow of the slot's name, before the slot is
+    // freed, so the name buffer survives for the next launch.
+    if let Some(pool) = cx.state.pool_manager.get_pool_mut(&entry.backend_name) {
         if result.is_err() {
             pool.mark_failed(member_idx);
         } else {
             pool.release(member_idx);
         }
     }
+    cx.state.socket_upstreams.free(slot);
+    *cx.state.sources.get_mut(token.0) = Source::Vacant;
+    cx.state.sources.free(token.0);
+    cx.state.upstream_timeouts.clear(token);
     if let (Some(waiter), Some(ctx)) = (waiter, ctx) {
         complete_waiter(result, ctx, waiter, cx);
     }
@@ -1381,15 +1382,16 @@ fn expire_socket_upstream(token: Token, cx: &mut CompletionCtx<'_>) {
         .ok();
     entry.upstream.close();
     let member_idx = entry.member_idx;
-    let backend_name = std::mem::take(&mut entry.backend_name);
     let waiter = entry.waiter.take();
     let ctx = entry.ctx.take();
+    // Release the member using a borrow of the slot's name, before the slot is
+    // freed, so the name buffer survives for the next launch.
+    if let Some(pool) = cx.state.pool_manager.get_pool_mut(&entry.backend_name) {
+        pool.mark_failed(member_idx);
+    }
     cx.state.socket_upstreams.free(slot);
     *cx.state.sources.get_mut(token.0) = Source::Vacant;
     cx.state.sources.free(token.0);
-    if let Some(pool) = cx.state.pool_manager.get_pool_mut(&backend_name) {
-        pool.mark_failed(member_idx);
-    }
     if let (Some(waiter), Some(ctx)) = (waiter, ctx) {
         complete_waiter(
             Err(std::io::Error::new(
@@ -3493,7 +3495,7 @@ fn handle_request_inner(
         req: req.clone(),
         client_ip: client_ip.to_string(),
         enc: content_encoding.to_string(),
-        backend_name: backend_name.clone(),
+        backend_name,
         kind: forward::PendingKind::Socket,
         route_path: Some(route.path.clone()),
         cacheable,

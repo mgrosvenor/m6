@@ -61,7 +61,20 @@ fn a_thousand_plain_requests_allocate_nothing() -> usize {
         up.start(&addr, None, false, deadline).expect("start");
         answer_one(&mut up, &mut server, &response);
     }
-    alloc_count::now() - start
+    let keep_alive = alloc_count::now() - start;
+
+    // A reconnect must also allocate nothing: the slot's address and buffers
+    // are reused. Close the connection, then connect again to the same path.
+    up.close();
+    let start = alloc_count::now();
+    up.request_buf().extend_from_slice(REQUEST);
+    up.start(&addr, None, false, deadline).expect("start");
+    let mut server2 = listener.accept().expect("accept").0;
+    answer_one(&mut up, &mut server2, &response);
+    let reconnect = alloc_count::now() - start;
+    assert_eq!(reconnect, 0, "a reconnect must allocate nothing");
+
+    keep_alive
 }
 
 /// One request on the open connection, on one thread: the client writes, the
